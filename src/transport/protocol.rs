@@ -80,6 +80,41 @@ pub fn parse_listing(stdout: &str) -> Result<Vec<Listed>> {
     Ok(rows)
 }
 
+/// What `spawn.sh` reported.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Spawned {
+    /// The pid of the new nvim, **validated** against the socket it serves.
+    ///
+    /// `None` means the script could not confirm which process owns the socket.
+    /// That is not fatal — the session may be perfectly healthy — but nvmux must
+    /// never send a signal to an unvalidated pid, because pids are reused and
+    /// the number could name something else entirely by now.
+    pub pid: Option<u32>,
+    /// Whether the listen socket appeared before the script gave up waiting.
+    pub socket_appeared: bool,
+}
+
+/// Parse the output of `spawn.sh`.
+pub fn parse_spawn(stdout: &str) -> Result<Spawned> {
+    let mut out = Spawned::default();
+    let mut terminated = false;
+    for line in stdout.lines() {
+        let line = line.trim_end_matches('\r');
+        match line.split_once(' ') {
+            Some(("PID", v)) => out.pid = v.trim().parse().ok().filter(|p| *p > 1),
+            Some(("SOCK", v)) => out.socket_appeared = v.trim() == "ok",
+            _ if line == TERMINATOR => terminated = true,
+            _ => tracing::debug!(line, "ignoring unrecognised line from spawn.sh"),
+        }
+    }
+    if !terminated {
+        return Err(NvmuxError::Session(crate::error::SessionError::NotFound(
+            format!("the spawn command did not complete (no {TERMINATOR} marker)"),
+        )));
+    }
+    Ok(out)
+}
+
 /// Turn parsed rows into sessions, dropping ones whose metadata is unusable.
 ///
 /// A socket with no readable metadata is reported rather than silently hidden:
@@ -210,5 +245,47 @@ mod tests {
     fn carriage_returns_from_a_pty_are_tolerated() {
         let out = "S\tabcdefgh\t1\t{\"id\":\"abcdefgh\",\"name\":\"x\",\"created\":1,\"pid\":2}\r\nNVMUX_END\r\n";
         assert_eq!(parse_listing(out).expect("parse").len(), 1);
+    }
+
+    #[test]
+    fn parses_a_successful_spawn() {
+        let s = parse_spawn("PID 4242\nSOCK ok\nNVMUX_END\n").expect("parse");
+        assert_eq!(s.pid, Some(4242));
+        assert!(s.socket_appeared);
+    }
+
+    #[test]
+    fn an_unvalidated_pid_is_none_not_zero() {
+        // spawn.sh prints an empty PID line when it could not confirm which
+        // process owns the socket. Turning that into 0 (or worse, into a pid we
+        // then signal) is the bug this guards.
+        let s = parse_spawn("PID \nSOCK ok\nNVMUX_END\n").expect("parse");
+        assert_eq!(s.pid, None, "an unconfirmed pid must not become a number");
+
+        for dangerous in ["PID 0\n", "PID 1\n", "PID nonsense\n"] {
+            let s = parse_spawn(&format!("{dangerous}SOCK ok\nNVMUX_END\n")).expect("parse");
+            assert_eq!(
+                s.pid, None,
+                "{dangerous:?} must not yield a signallable pid"
+            );
+        }
+    }
+
+    #[test]
+    fn a_timed_out_socket_is_reported() {
+        let s = parse_spawn("PID 7\nSOCK timeout\nNVMUX_END\n").expect("parse");
+        assert!(!s.socket_appeared);
+    }
+
+    #[test]
+    fn spawn_output_without_a_terminator_is_an_error() {
+        assert!(parse_spawn("PID 4242\nSOCK ok\n").is_err());
+        assert!(parse_spawn("").is_err());
+    }
+
+    #[test]
+    fn shell_noise_around_spawn_output_is_ignored() {
+        let s = parse_spawn("Welcome to Ubuntu\nPID 9\nSOCK ok\nNVMUX_END\n").expect("parse");
+        assert_eq!(s.pid, Some(9));
     }
 }

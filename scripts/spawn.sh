@@ -2,9 +2,15 @@
 # Spawn a detached headless Neovim that survives our disconnection.
 #
 # Usage: sh spawn.sh <runtime_dir> <id>
-# Prints: the pid we backgrounded, as a hint (see the caveat below).
 #
-# POSIX sh only. Wired up in milestone 2.
+# Output:
+#   PID <pid>        the *validated* pid of the new nvim, or empty if we could
+#                    not confirm it (see the safety note below)
+#   SOCK ok|timeout  whether the listen socket appeared
+#   NVMUX_END
+#
+# POSIX sh only -- this runs under whatever /bin/sh the session host has, which
+# on Debian and Ubuntu is dash, not bash.
 
 set -u
 
@@ -16,8 +22,8 @@ log="$dir/$id.log"
 
 # Neovim creates its listen socket with 0777 & ~umask -- it is not 0755 by
 # default. Under a permissive umask the socket would be world-writable, and any
-# local user could then connect and run nvim_command("!sh") as us. The 0700
-# directory is the primary control; this closes the second hole.
+# local user could connect and run nvim_command("!sh") as us. The 0700 directory
+# is the primary control; this closes the second hole.
 umask 077
 mkdir -p "$dir" || exit 1
 chmod 700 "$dir" 2>/dev/null || true
@@ -46,34 +52,62 @@ rm -f "$sock"
 # command to exit. Measured at 12s versus 0.23s.
 if command -v setsid >/dev/null 2>&1; then
   setsid nvim --headless --listen "$sock" </dev/null >>"$log" 2>&1 &
-  pid=$!
+  guess=$!
 else
   nohup nvim --headless --listen "$sock" </dev/null >>"$log" 2>&1 &
-  pid=$!
+  guess=$!
   # Not a POSIX builtin; present in bash and zsh, absent in dash. `nohup` has
   # already done the work, so failure here is fine.
   disown 2>/dev/null || true
 fi
 
-# Wait for the socket to appear so the caller gets a useful error instead of a
-# race. Readiness is a separate question -- nvim answers nvim_get_api_info
-# within milliseconds while the user's init.lua is still sourcing -- so the
-# caller still has to probe with a deferred RPC call before declaring success.
+# Wait for the socket to appear. Readiness is a *separate* question -- nvim
+# answers nvim_get_api_info within milliseconds while the user's init.lua is
+# still sourcing -- so the caller still probes with a deferred RPC call before
+# declaring the session ready.
+sock_state=timeout
 i=0
 while [ "$i" -lt 100 ]; do
   if [ -S "$sock" ]; then
     # Belt and braces alongside the umask above: never trust the caller's mask.
     chmod 600 "$sock" 2>/dev/null || true
+    sock_state=ok
     break
   fi
-  # `sleep 0.05` is not POSIX, but every sh we target accepts it. If it fails,
-  # fall back to a whole second rather than spinning.
+  # `sleep 0.05` is not POSIX, but every sh we target accepts it. If it does
+  # not, fall back to a whole second rather than spinning.
   sleep 0.05 2>/dev/null || sleep 1
   i=$((i + 1))
 done
 
-# A hint only. `$!` is not reliably nvim's pid: setsid execs directly only when
-# the caller is not already a process group leader, and otherwise forks, making
-# $! setsid's pid. nvmux overwrites this with the pid the server reports about
-# itself once it is reachable.
-printf '%s\n' "$pid"
+# Confirm the pid really is the nvim serving *this* socket before reporting it.
+#
+# `$!` is the pid the shell backgrounded, which is not necessarily nvim's:
+# `setsid` execs directly only when the caller is not already a process group
+# leader, and otherwise forks, leaving $! pointing at setsid. That is the safe
+# direction to be wrong in only if we check, because the pid is what a later
+# `kill -KILL` would target -- and pids get reused. An unvalidated pid could
+# name an entirely unrelated process by then.
+#
+# `-o args=` is the POSIX spelling (`-o command=` is a BSD/GNU alias), and `-ww`
+# stops macOS truncating the output to terminal width, which would silently
+# break the match for exactly the long socket paths where it matters.
+pid=''
+if [ -n "$guess" ] && kill -0 "$guess" 2>/dev/null; then
+  if ps -ww -o args= -p "$guess" 2>/dev/null | grep -q -- "$sock"; then
+    pid=$guess
+  fi
+fi
+
+# If the guess did not check out, look for the process actually serving this
+# socket rather than reporting something unsafe to kill.
+if [ -z "$pid" ]; then
+  pid=$(ps -ww -eo pid=,args= 2>/dev/null \
+        | grep -- "--listen $sock" \
+        | grep -v grep \
+        | awk 'NR==1{print $1}')
+fi
+
+printf 'PID %s\n' "$pid"
+printf 'SOCK %s\n' "$sock_state"
+printf 'NVMUX_END\n'

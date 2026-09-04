@@ -1,13 +1,30 @@
 //! Sessions on this machine. No SSH anywhere in this file.
 
-use std::path::PathBuf;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use crate::config;
-use crate::error::{NvmuxError, Result};
-use crate::session::Session;
+use crate::config::{self, SessionPaths};
+use crate::error::{NvmuxError, Result, RpcError, SessionError};
+use crate::ids;
+use crate::rpc;
+use crate::session::{Liveness, Session};
 use crate::shell;
 use crate::transport::exec::{Executor, LocalExecutor};
 use crate::transport::{finish_listing, protocol, Location, Transport};
+
+/// How long to wait for a new session to become *ready*, as distinct from
+/// merely having a socket.
+///
+/// Readiness means a deferred RPC call answered, which cannot happen until the
+/// user's `init.lua` has finished sourcing. A config that clones a plugin on
+/// first run can genuinely take seconds.
+const READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long to let a session shut down gracefully after `qa!` before escalating.
+const QUIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 pub struct LocalTransport {
     location: Location,
@@ -17,15 +34,114 @@ pub struct LocalTransport {
 
 impl LocalTransport {
     pub fn new() -> Result<Self> {
+        Self::with_dir(config::ensure_runtime_dir()?)
+    }
+
+    /// Use an explicit runtime directory instead of the default.
+    ///
+    /// Exists so integration tests can drive a real session lifecycle without
+    /// touching (or racing) the user's actual sessions in `/tmp/nvmux-<uid>`.
+    /// The same security check applies: a test directory is still a directory
+    /// we are about to put a socket in.
+    pub fn with_dir(dir: PathBuf) -> Result<Self> {
+        config::ensure_dir_secure(&dir)?;
         Ok(Self {
             location: Location::Local,
-            dir: config::ensure_runtime_dir()?,
+            dir,
             exec: LocalExecutor,
         })
     }
 
-    pub fn runtime_dir(&self) -> &std::path::Path {
+    pub fn runtime_dir(&self) -> &Path {
         &self.dir
+    }
+
+    fn paths(&self, id: &str) -> Result<SessionPaths> {
+        Ok(SessionPaths::new(&self.dir, id)?)
+    }
+
+    /// Wait until a deferred RPC call answers, or give up.
+    ///
+    /// Deliberately *not* `nvim_get_api_info`: that is answered off the main
+    /// loop and replies within milliseconds while `init.lua` is still running,
+    /// so it would report a session ready before it can do anything.
+    fn wait_until_ready(&self, sock: &Path, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if matches!(rpc::probe(sock), Liveness::Alive) {
+                return true;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        false
+    }
+
+    /// The last few lines of a session's log, for error messages.
+    ///
+    /// This is the first thing anyone wants when a session will not start, so
+    /// it is included in the error rather than left for the user to find.
+    fn log_tail(&self, log: &Path) -> String {
+        let Ok(body) = std::fs::read_to_string(log) else {
+            return "(no log file)".to_string();
+        };
+        let lines: Vec<&str> = body.lines().collect();
+        let start = lines.len().saturating_sub(15);
+        if lines.is_empty() {
+            "(log is empty)".to_string()
+        } else {
+            lines[start..].join("\n")
+        }
+    }
+
+    /// Whether a socket file is safe to delete as stale.
+    ///
+    /// Three conditions, all required:
+    ///
+    /// * the probe says nothing is listening,
+    /// * `lstat` says the path really is a socket, and
+    /// * we own it.
+    ///
+    /// The middle check is not paranoia. On `AF_UNIX`, `connect()` returns
+    /// `ECONNREFUSED` for *any* non-listening inode — a regular file gives it,
+    /// and so does a directory, where a naive unlink would hit `EISDIR`. Reaping
+    /// on the errno alone would delete whatever happened to be sitting at that
+    /// path.
+    fn is_reapable(&self, sock: &Path) -> bool {
+        match std::fs::symlink_metadata(sock) {
+            Ok(meta) => {
+                if !meta.file_type().is_socket() {
+                    tracing::warn!(
+                        path = %sock.display(),
+                        "refusing to reap: not a socket"
+                    );
+                    return false;
+                }
+                if meta.uid() != nix::unistd::geteuid().as_raw() {
+                    tracing::warn!(path = %sock.display(), "refusing to reap: not ours");
+                    return false;
+                }
+                true
+            }
+            // A dangling symlink: lstat succeeds where the probe saw nothing.
+            // Nothing else will ever clean it up, so it goes.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                tracing::warn!(path = %sock.display(), error = %e, "refusing to reap");
+                false
+            }
+        }
+    }
+
+    /// Delete a dead session's files.
+    fn reap(&self, paths: &SessionPaths) {
+        tracing::info!(sock = %paths.sock.display(), "reaping dead session");
+        for p in [&paths.sock, &paths.json, &paths.log] {
+            if let Err(e) = std::fs::remove_file(p) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %p.display(), error = %e, "could not remove");
+                }
+            }
+        }
     }
 }
 
@@ -40,37 +156,205 @@ impl Transport for LocalTransport {
         if !out.ok() {
             tracing::warn!(status = out.status, stderr = %out.stderr, "list.sh failed");
         }
-        let mut sessions = protocol::rows_to_sessions(protocol::parse_listing(&out.stdout)?);
+        let listed = protocol::rows_to_sessions(protocol::parse_listing(&out.stdout)?);
 
-        // The script's `kill -0` result is only a hint. Locally the socket is
-        // right there, so replace it with the real answer: a connect plus an
-        // RPC round trip. This is also what distinguishes a running-but-busy
-        // session from a dead one, which matters because stale cleanup must
-        // never fire on the former.
-        for s in &mut sessions {
-            let paths = config::SessionPaths::new(&self.dir, &s.id)?;
-            s.state.liveness = crate::rpc::probe(&paths.sock);
+        let mut alive = Vec::with_capacity(listed.len());
+        for mut s in listed {
+            let paths = self.paths(&s.id)?;
+
+            // The script's `kill -0` result is only a hint. Locally the socket
+            // is right here, so replace it with the real answer.
+            s.state.liveness = rpc::probe(&paths.sock);
+
+            match s.state.liveness {
+                // Never reap a busy session. A session blocked in `:!make` is
+                // reachable but cannot answer a deferred call, and deleting it
+                // out from under someone mid-build is unforgivable.
+                Liveness::Alive | Liveness::Busy => alive.push(s),
+                Liveness::Dead => {
+                    if self.is_reapable(&paths.sock) {
+                        self.reap(&paths);
+                    } else {
+                        // Something is at that path that we will not delete.
+                        // Hide it from the picker but leave it on disk.
+                        tracing::debug!(id = %s.id, "dead session left in place");
+                    }
+                }
+            }
         }
 
-        finish_listing(sessions)
+        finish_listing(alive)
     }
 
-    fn create_session(&self, _name: &str) -> Result<Session> {
-        Err(NvmuxError::Unimplemented("create_session (milestone 2)"))
+    fn create_session(&self, name: &str) -> Result<Session> {
+        crate::session::validate_name(name)?;
+
+        // Names are display metadata and carry no identity, but two sessions
+        // with the same name in one picker is a usability trap, so it is
+        // refused at the point of creation.
+        if self
+            .list_sessions()?
+            .iter()
+            .any(|s| s.name.eq_ignore_ascii_case(name))
+        {
+            return Err(SessionError::Exists(name.to_string()).into());
+        }
+
+        let id = ids::new_id().map_err(|e| std::io::Error::other(e.to_string()))?;
+        let paths = self.paths(&id)?;
+        let dir = self.dir.to_string_lossy().into_owned();
+
+        tracing::info!(%id, name, "spawning session");
+        let out = self.exec.run_script(shell::SPAWN_SCRIPT, &[&dir, &id])?;
+        let spawned = protocol::parse_spawn(&out.stdout)?;
+
+        if !spawned.socket_appeared || !self.wait_until_ready(&paths.sock, READY_TIMEOUT) {
+            // Clean up rather than leaving a half-created session lying around,
+            // then report the log, which is what anyone debugging this needs.
+            let tail = self.log_tail(&paths.log);
+            if let Some(pid) = spawned.pid {
+                let _ = self
+                    .exec
+                    .run_script(shell::KILL_SCRIPT, &[&dir, &id, &pid.to_string()]);
+            }
+            self.reap(&paths);
+            return Err(SessionError::NotReady {
+                name: name.to_string(),
+                timeout: READY_TIMEOUT,
+                log: paths.log.clone(),
+                log_tail: tail,
+            }
+            .into());
+        }
+
+        let session = Session::new(id, name.to_string(), spawned.pid.unwrap_or(0));
+        session.write_atomic(&paths.json)?;
+
+        // Cheap, and it gives the user a way out that is not `:q`. `command!`
+        // requires an uppercase name — `command! q` is E183 — so the alias
+        // cannot shadow `:q` itself, which is why the README still has to warn
+        // about it. Failure here is not worth failing the create over.
+        if let Ok(mut client) = rpc::Client::connect(&paths.sock, rpc::CONNECT_TIMEOUT) {
+            if let Err(e) = client.command("command! -bar Detach detach") {
+                tracing::debug!(error = %e, "could not install the :Detach alias");
+            }
+        }
+
+        tracing::info!(id = %session.id, name, pid = session.pid, "session ready");
+        Ok(session)
     }
 
-    fn kill_session(&self, _s: &Session, _force: bool) -> Result<()> {
-        Err(NvmuxError::Unimplemented("kill_session (milestone 2)"))
+    fn kill_session(&self, s: &Session, force: bool) -> Result<()> {
+        let paths = self.paths(&s.id)?;
+        let dir = self.dir.to_string_lossy().into_owned();
+
+        // `force` means "kill even with unsaved buffers". It does not mean
+        // "skip straight to SIGKILL": the escalation below always tries the
+        // graceful path first, because that is what lets nvim clean up its own
+        // socket and swap files.
+        if !force {
+            match rpc::Client::connect(&paths.sock, rpc::CONNECT_TIMEOUT) {
+                Ok(mut client) => {
+                    let _ = client.set_timeout(rpc::PROBE_TIMEOUT);
+                    match client.dirty_buffer_count() {
+                        Ok(0) => {}
+                        Ok(count) => {
+                            return Err(SessionError::Dirty {
+                                name: s.name.clone(),
+                                count,
+                            }
+                            .into())
+                        }
+                        // Could not ask. Refusing to kill would strand the
+                        // session; killing silently would risk data. Report it
+                        // and let the caller decide to force.
+                        Err(e) => {
+                            tracing::warn!(id = %s.id, error = %e, "dirty check failed");
+                            return Err(NvmuxError::Rpc(e));
+                        }
+                    }
+                }
+                // Nothing listening: there is nothing to lose. Fall through to
+                // cleaning up the files.
+                Err(e) if e.is_definitely_dead() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        // Graceful first. The server usually closes the socket without
+        // answering, so a reset or a timeout here is success, not failure.
+        if let Ok(mut client) = rpc::Client::connect(&paths.sock, rpc::CONNECT_TIMEOUT) {
+            match client.command("qa!") {
+                Ok(()) => {}
+                Err(e) if e.is_definitely_dead() => {}
+                Err(RpcError::Timeout(_)) => {}
+                Err(e) => tracing::debug!(error = %e, "qa! did not answer cleanly"),
+            }
+        }
+
+        // Give it a moment to go away on its own before escalating.
+        let deadline = Instant::now() + QUIT_TIMEOUT;
+        while Instant::now() < deadline {
+            if rpc::probe(&paths.sock) == Liveness::Dead {
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+
+        // SIGTERM, grace, SIGKILL, then unlink. The script only signals a pid
+        // nvmux validated at spawn time; an unvalidated pid is passed as empty
+        // and the script signals nothing, because pids are reused and the
+        // number could name anything by now.
+        let pid = if s.pid > 1 {
+            s.pid.to_string()
+        } else {
+            String::new()
+        };
+        let out = self
+            .exec
+            .run_script(shell::KILL_SCRIPT, &[&dir, &s.id, &pid])?;
+        if !out.ok() {
+            tracing::warn!(status = out.status, stderr = %out.stderr, "kill.sh failed");
+        }
+
+        // The script removes the files, but a socket the script could not
+        // remove would resurrect the session in the next listing.
+        if paths.sock.exists() && self.is_reapable(&paths.sock) {
+            self.reap(&paths);
+        }
+        tracing::info!(id = %s.id, name = %s.name, "session killed");
+        Ok(())
     }
 
-    fn rename_session(&self, _s: &Session, _new_name: &str) -> Result<()> {
-        Err(NvmuxError::Unimplemented("rename_session (milestone 2)"))
+    fn rename_session(&self, s: &Session, new_name: &str) -> Result<()> {
+        crate::session::validate_name(new_name)?;
+        if self
+            .list_sessions()?
+            .iter()
+            .any(|other| other.id != s.id && other.name.eq_ignore_ascii_case(new_name))
+        {
+            return Err(SessionError::Exists(new_name.to_string()).into());
+        }
+
+        let paths = self.paths(&s.id)?;
+
+        // A metadata edit and nothing more. The socket is never renamed or
+        // moved: its path is the session's identity, and the display name is
+        // only data. Renaming the socket would mean re-listening on a second
+        // address and re-pointing any SSH forward, for no benefit.
+        let bytes = std::fs::read(&paths.json).map_err(NvmuxError::Io)?;
+        let mut session = Session::from_json(&bytes, &paths.json)?;
+        session.name = new_name.to_string();
+        session.write_atomic(&paths.json)?;
+
+        tracing::info!(id = %s.id, from = %s.name, to = new_name, "renamed");
+        Ok(())
     }
 
     fn local_socket_for(&self, s: &Session) -> Result<PathBuf> {
         // Locally this is the identity function: the session socket already is
         // a path on this machine. All the interesting work happens in the SSH
         // implementation, which is exactly why this is the seam.
-        Ok(config::SessionPaths::new(&self.dir, &s.id)?.sock)
+        Ok(self.paths(&s.id)?.sock)
     }
 }
