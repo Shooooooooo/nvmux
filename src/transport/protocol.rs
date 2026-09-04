@@ -131,11 +131,11 @@ pub enum KillOutcome {
     Killed,
     /// There was no such process; the files were removed.
     Absent,
-    /// The pid did not belong to this session, so nothing was signalled and
-    /// nothing was removed.
-    Refused,
     /// It was signalled and is still alive; nothing was removed.
     Orphaned,
+    /// We could not determine what owns the socket, so nothing was signalled
+    /// and nothing was removed.
+    Unknown,
 }
 
 /// Parse the output of `kill.sh`.
@@ -152,8 +152,8 @@ pub fn parse_kill(stdout: &str) -> Result<KillOutcome> {
             outcome = match v.trim() {
                 "killed" => Some(KillOutcome::Killed),
                 "absent" => Some(KillOutcome::Absent),
-                "refused" => Some(KillOutcome::Refused),
                 "orphaned" => Some(KillOutcome::Orphaned),
+                "unknown" => Some(KillOutcome::Unknown),
                 _ => None,
             };
         }
@@ -373,8 +373,8 @@ mod tests {
         for (text, want) in [
             ("killed", KillOutcome::Killed),
             ("absent", KillOutcome::Absent),
-            ("refused", KillOutcome::Refused),
             ("orphaned", KillOutcome::Orphaned),
+            ("unknown", KillOutcome::Unknown),
         ] {
             let out = format!("RESULT {text}\nNVMUX_END\n");
             assert_eq!(parse_kill(&out).expect("parse"), want);

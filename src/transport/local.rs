@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::config::{self, SessionPaths};
-use crate::error::{NvmuxError, Result, RpcError, SessionError};
+use crate::error::{NvmuxError, Result, SessionError};
 use crate::ids;
 use crate::rpc;
 use crate::session::{Liveness, Session};
@@ -23,13 +23,6 @@ use crate::transport::{finish_listing, protocol, Location, Transport};
 /// starting is a perfectly good session. Killing it because it was slow would
 /// destroy work the user can see happening.
 const REACHABLE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long to let a session shut down gracefully after `qa!` before escalating.
-///
-/// Generous on purpose: this is where `VimLeavePre`, ShaDa writes and session
-/// files happen. Cutting it short to feel responsive corrupts exit-time state,
-/// which is the opposite of what a session manager is for.
-const QUIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -262,56 +255,18 @@ impl Transport for LocalTransport {
         let paths = self.paths(&s.id)?;
         let dir = self.dir.to_string_lossy().into_owned();
 
-        // Unconditional. nvmux does not ask the session whether it has unsaved
-        // buffers, so there is no state to consult and no way for the answer to
-        // be wrong, stale, or unobtainable. To leave a session normally, switch
-        // to it and `:q` — in a remote UI that ends the session, because the
-        // editor *is* the session.
+        // Straight to signals. nvmux does not ask the session to quit and does
+        // not consult it about anything: kill means kill. To leave a session
+        // without losing work, switch to it and `:q` — the editor is the
+        // session, so quitting the editor ends it.
         //
-        // Graceful first all the same: `qa!` lets nvim run VimLeavePre, write
-        // its ShaDa file and unlink its own socket. That is about the editor
-        // shutting down cleanly, not about consulting it.
-        if let Ok(mut client) = rpc::Client::connect(&paths.sock, rpc::PROBE_TIMEOUT) {
-            match client.command("qa!") {
-                Ok(()) => {}
-                // The server usually closes the socket without answering, so a
-                // reset or a timeout here is success, not failure.
-                Err(e) if e.is_definitely_dead() => {}
-                Err(RpcError::Timeout(_)) => {}
-                Err(e) => tracing::debug!(error = %e, "qa! did not answer cleanly"),
-            }
-        }
-
-        // Give it a moment to go away on its own before escalating.
-        let deadline = Instant::now() + QUIT_TIMEOUT;
-        while Instant::now() < deadline {
-            if rpc::probe(&paths.sock) == Liveness::Dead {
-                break;
-            }
-            std::thread::sleep(POLL_INTERVAL);
-        }
-
-        // If the graceful path worked, we are done. Judge by whether the session
-        // is actually gone rather than by whether a signal was delivered: `qa!`
-        // never touches the pid, so a stale or recycled pid in the metadata says
-        // nothing about whether the session shut down.
-        let gone = rpc::probe(&paths.sock) == Liveness::Dead;
-        if gone {
-            if paths.sock.exists() && self.is_reapable(&paths.sock) {
-                self.reap(&paths);
-            } else {
-                // nvim unlinks its own socket on a clean exit; sweep the rest.
-                for p in [&paths.json, &paths.log] {
-                    let _ = std::fs::remove_file(p);
-                }
-            }
-            tracing::info!(id = %s.id, name = %s.name, "session exited");
-            return Ok(());
-        }
-
-        // Still there, so escalate. The script only signals a pid it can confirm
-        // still owns this session's socket, and it removes the files only once
-        // the process is genuinely gone.
+        // SIGTERM first, inside the script, so nvim still gets to run
+        // VimLeavePre, write its ShaDa file and unlink its own socket. That is
+        // an orderly shutdown, not a request the session could decline.
+        //
+        // The recorded pid is only a starting guess. The script uses it only if
+        // it still owns this session's socket, and otherwise searches by socket
+        // — pids get reused, and the socket is the identity.
         let pid = if s.pid > 1 {
             s.pid.to_string()
         } else {
@@ -324,11 +279,15 @@ impl Transport for LocalTransport {
             tracing::warn!(status = out.status, stderr = %out.stderr, "kill.sh failed");
         }
 
-        // Reporting success regardless would be the worst outcome available
-        // here: the session would vanish from the picker while its Neovim kept
-        // running, with no socket left for nvmux to ever find, show, or kill.
+        // The script removes files only once the session is genuinely gone, and
+        // reports what it actually managed to do. Claiming success regardless
+        // would be the worst outcome available: the session would vanish from
+        // the picker while its Neovim kept running, with no socket left for
+        // nvmux to ever find, show, or kill again.
         match protocol::parse_kill(&out.stdout)? {
             protocol::KillOutcome::Killed | protocol::KillOutcome::Absent => {
+                // Belt and braces: a socket the script could not remove would
+                // resurrect the session in the next listing.
                 if paths.sock.exists() && self.is_reapable(&paths.sock) {
                     self.reap(&paths);
                 }
@@ -340,10 +299,10 @@ impl Transport for LocalTransport {
                 reason: "it did not exit, even after SIGKILL",
             }
             .into()),
-            protocol::KillOutcome::Refused => Err(SessionError::NotKilled {
+            protocol::KillOutcome::Unknown => Err(SessionError::NotKilled {
                 name: s.name.clone(),
-                reason: "it is still running and the recorded process id no longer \
-                         belongs to it, so nothing was signalled",
+                reason: "its socket is still present but no usable `ps` or /proc is \
+                         available to find the process, so nothing was signalled",
             }
             .into()),
         }

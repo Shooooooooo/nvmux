@@ -459,28 +459,27 @@ fn a_timed_out_call_poisons_the_connection() {
     );
 }
 
-/// `kill.sh` must not remove a session's files unless the session is gone.
+/// A wrong recorded pid must not misdirect the kill.
 ///
-/// Driven as a script rather than through `kill_session`, because the graceful
-/// `qa!` path never uses the pid — so the dangerous case (a stale or recycled
-/// pid, and a session that will not shut down) can only be reached here.
+/// The pid in `<id>.json` was validated when the session was spawned, but that
+/// could have been days ago and pids are reused. So it is treated as a guess:
+/// used only while it still owns this session's socket, and otherwise ignored
+/// in favour of searching by socket, because the socket is the identity.
 ///
-/// Removing the files anyway is the worst available outcome: the session
-/// vanishes from the picker while its Neovim keeps running, and with no socket
-/// in the runtime directory nothing can ever list, probe or kill it again. It
-/// becomes an invisible process holding the user's unsaved work.
+/// The two failures this guards are opposite and both bad — signalling an
+/// innocent process that inherited the number, and failing to kill the session.
 #[test]
-fn kill_sh_does_not_delete_files_for_a_session_it_could_not_kill() {
+fn a_recycled_pid_neither_misfires_nor_blocks_the_kill() {
     require_nvim!();
-    let scratch = Scratch::new("killsh");
+    let scratch = Scratch::new("recycled");
     let t = scratch.transport();
     let session = t.create_session("stubborn").expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
     let json = sock.with_extension("json");
 
     // A live pid that is emphatically not this session — the shape a recycled
-    // pid takes after a reboot or long uptime.
-    let decoy = std::process::Command::new("sleep")
+    // pid takes after a reboot or a long uptime.
+    let mut decoy = std::process::Command::new("sleep")
         .arg("30")
         .spawn()
         .expect("spawn decoy");
@@ -495,23 +494,15 @@ fn kill_sh_does_not_delete_files_for_a_session_it_could_not_kill() {
         .expect("run kill.sh");
     let stdout = String::from_utf8_lossy(&out.stdout);
 
+    // The session is found by its socket and killed, despite the bad pid.
     assert!(
-        stdout.contains("RESULT refused"),
-        "expected a refusal for a pid that does not own the socket, got: {stdout}"
+        stdout.contains("RESULT killed"),
+        "expected the session to be found by socket, got: {stdout}"
     );
-    assert!(
-        sock.exists(),
-        "kill.sh deleted the socket of a session it did not kill"
-    );
-    assert!(
-        json.exists(),
-        "kill.sh deleted the metadata of a session it did not kill"
-    );
-    assert!(
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(session.pid as i32), None).is_ok(),
-        "the real session should be untouched"
-    );
-    // The decoy must not have been signalled either.
+    assert!(!sock.exists(), "the socket should have been cleaned up");
+    assert!(!json.exists(), "the metadata should have been cleaned up");
+
+    // ...and the innocent process was never touched.
     assert!(
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(decoy.id() as i32), None).is_ok(),
         "kill.sh signalled a process that was not the session"
@@ -520,8 +511,36 @@ fn kill_sh_does_not_delete_files_for_a_session_it_could_not_kill() {
         nix::unistd::Pid::from_raw(decoy.id() as i32),
         nix::sys::signal::Signal::SIGKILL,
     );
-    let mut decoy = decoy;
     let _ = decoy.wait();
+}
+
+/// With nothing serving the socket, the leftover files are swept up.
+#[test]
+fn killing_an_already_dead_session_cleans_up_its_files() {
+    require_nvim!();
+    let scratch = Scratch::new("alreadydead");
+    let t = scratch.transport();
+    let session = t.create_session("ghost").expect("create");
+    let sock = t.local_socket_for(&session).expect("socket");
+    let json = sock.with_extension("json");
+
+    // SIGKILL leaves the socket file behind, so the session looks present.
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(session.pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .expect("kill -9");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline
+        && nix::sys::signal::kill(nix::unistd::Pid::from_raw(session.pid as i32), None).is_ok()
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    t.kill_session(&session)
+        .expect("killing a dead session should succeed");
+    assert!(!sock.exists(), "the stale socket should be gone");
+    assert!(!json.exists(), "the orphaned metadata should be gone");
 }
 
 /// A stale pid in the metadata must not stop a normal kill from working.
