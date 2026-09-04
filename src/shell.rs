@@ -1,231 +1,319 @@
-//! POSIX shell quoting.
+//! Shell quoting, and the scripts that run on the session host.
 //!
-//! Every command nvmux runs on a session host is text that some shell will
-//! re-parse, so the quoting here is the difference between "session named
-//! `it's mine`" working and arbitrary command execution. There is exactly one
-//! primitive ([`sq`]) and everything else is built from it.
+//! # Why this needs its own module and real tests
 //!
-//! # Why single quotes, always
+//! Spawning a remote session goes through **two** layers of shell. `ssh host cmd`
+//! joins its arguments with spaces and hands the result to the remote login
+//! shell, which parses it again. A session named `my "project"` therefore has to
+//! survive being quoted, transported, and re-parsed. Getting this wrong is a
+//! command injection, not a cosmetic bug.
 //!
-//! Inside POSIX single quotes *no* character is special — not `$`, not
-//! backslash, not backtick, not newline. The only thing that can't appear is a
-//! single quote itself, which we close, escape, and reopen around. That makes
-//! [`sq`] total: it is correct for every possible byte string, so there is no
-//! "but what about..." case to get wrong later. Double-quote escaping, by
-//! contrast, has to enumerate `$`, `` ` ``, `\`, `!`, and shell-specific extras
-//! — a blocklist, and blocklists rot.
+//! The approach is to never build a command *string* with interpolated values.
+//! Scripts are fixed text delivered on stdin, and every variable part arrives as
+//! a positional argument (`$1`, `$2`, ...) that the remote shell never re-parses.
+//! [`quote`] exists for the one place a value must be embedded in a word — the
+//! argument list handed to `sh -s`.
 
-/// Quote `s` so that a POSIX shell parses it back as exactly one word with
-/// exactly these bytes.
+/// Single-quote a value so a POSIX shell reads it as exactly one literal word.
 ///
-/// The empty string becomes `''` — an unquoted empty string would vanish
-/// entirely and shift every following argument left by one.
-pub fn sq(s: &str) -> String {
-    // Worst case is every byte being a quote, which expands 1 -> 4.
+/// POSIX single quotes have no escape sequences at all, so the only thing that
+/// needs handling is the quote itself: close, insert an escaped quote, reopen.
+pub fn quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'_' | b'-' | b'.' | b'/' | b',' | b':' | b'=' | b'@' | b'+'
+                )
+        })
+    {
+        // Nothing a shell would look at twice; leave it bare so log lines and
+        // error messages stay readable.
+        return s.to_string();
+    }
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            // Close the literal, emit an escaped quote outside it, reopen.
-            out.push_str("'\\''");
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str(r"'\''");
         } else {
-            out.push(ch);
+            out.push(c);
         }
     }
     out.push('\'');
     out
 }
 
-/// Wrap `script` so it runs under the session user's **login** shell.
-///
-/// # Why this is two nested layers and not one
-///
-/// `ssh host <words>` does not run `<words>` directly: sshd joins them with
-/// spaces and feeds the result to the user's shell from `/etc/passwd`. We do
-/// not control what that shell is, and it is not necessarily POSIX — `fish` and
-/// `csh` are both common login shells and neither supports `${VAR:-default}`.
-///
-/// So the outermost layer uses only syntax that is common to sh, bash, zsh,
-/// fish and csh: a command name plus single-quoted words. That gets us into a
-/// known-POSIX `sh`, and only *there* do we expand `$SHELL` and re-exec into
-/// the login shell:
-///
-/// ```text
-/// sh -c 'exec "${SHELL:-/bin/bash}" -l -c '\''<script>'\'''
-/// ```
-///
-/// The login shell (`-l`) is the point of the whole exercise: `ssh host cmd`
-/// gets a non-login, non-interactive shell, which on most setups means the
-/// user's `PATH` additions never run and `nvim` — let alone the language
-/// servers it spawns — is not found.
-///
-/// `exec` avoids leaving a pointless `sh` parked as the parent for the life of
-/// the command.
-pub fn login_shell_command(script: &str) -> String {
-    // Inner layer: POSIX sh expands ${SHELL:-/bin/bash} and hands `script` to
-    // the login shell as a single -c argument.
-    let inner = format!("exec \"${{SHELL:-/bin/bash}}\" -l -c {}", sq(script));
-    // Outer layer: only single-quoted words, so any login shell can parse it.
-    format!("sh -c {}", sq(&inner))
+/// Join arguments into a single shell word list.
+pub fn quote_all<I, S>(args: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter()
+        .map(|a| quote(a.as_ref()))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-/// Render `words` as a single shell-safe command line.
-pub fn join(words: &[&str]) -> String {
-    words.iter().map(|w| sq(w)).collect::<Vec<_>>().join(" ")
+/// Wrap a command so it runs under the user's **login** shell.
+///
+/// `ssh host cmd` gives a non-login, non-interactive shell. On most real setups
+/// that means `nvim` and every language server are not on `$PATH`, because they
+/// were put there by `.zprofile` / `.bash_profile`, which only a login shell
+/// reads. Sessions would fail to spawn with a confusing "command not found".
+///
+/// `$SHELL` is expanded on the *remote* side, so it is the remote user's shell,
+/// with `bash -l` as the fallback when it is unset (cron-like environments, some
+/// container images).
+pub fn login_shell_wrapper(inner: &str) -> String {
+    format!(r#"exec "${{SHELL:-/bin/bash}}" -l -c {}"#, quote(inner))
 }
+
+/// Lists sessions on the host that owns them.
+///
+/// Batch-shaped on purpose: it returns every session in one invocation, with
+/// liveness already decided. Each `ssh` round trip costs ~230 ms even to
+/// localhost, so a per-session API would be unusable remotely while feeling
+/// perfectly fine in local testing.
+pub const LIST_SCRIPT: &str = include_str!("../scripts/list.sh");
+
+/// Spawns a detached headless nvim. Wired up in milestone 2.
+pub const SPAWN_SCRIPT: &str = include_str!("../scripts/spawn.sh");
+
+/// Terminates a session and removes its files. Wired up in milestone 2.
+pub const KILL_SCRIPT: &str = include_str!("../scripts/kill.sh");
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
 
-    #[test]
-    fn sq_wraps_plain_words() {
-        assert_eq!(sq("dotfiles"), "'dotfiles'");
+    /// Ask a real `/bin/sh` what it made of our quoting.
+    ///
+    /// The point of this helper is that the assertions below are not checking
+    /// our idea of shell syntax against itself — they round-trip through the
+    /// actual parser that will see these strings in production.
+    fn sh_echo(word: &str) -> String {
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("printf %s {word}"))
+            .output()
+            .expect("run /bin/sh");
+        assert!(
+            out.status.success(),
+            "sh rejected {word:?}: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).expect("utf8")
     }
 
     #[test]
-    fn sq_preserves_empty_as_a_real_argument() {
-        assert_eq!(sq(""), "''");
+    fn simple_words_are_left_bare() {
+        assert_eq!(quote("dotfiles"), "dotfiles");
+        assert_eq!(quote("api-server"), "api-server");
+        assert_eq!(
+            quote("/tmp/nvmux-501/abcdefgh.sock"),
+            "/tmp/nvmux-501/abcdefgh.sock"
+        );
+        assert_eq!(quote("user@host"), "user@host");
     }
 
     #[test]
-    fn sq_escapes_single_quotes() {
-        assert_eq!(sq("it's"), r#"'it'\''s'"#);
-    }
-
-    #[test]
-    fn sq_neutralizes_shell_metacharacters() {
-        // None of these may survive as syntax.
-        for s in [
-            "a b",
+    fn a_real_shell_recovers_the_original_string() {
+        for original in [
+            "simple",
+            "my project",
+            "it's",
+            r#"say "hi""#,
+            r#"both ' and " quotes"#,
             "$HOME",
-            "`id`",
-            "$(id)",
-            "a;rm -rf /",
+            "$(rm -rf /)",
+            "`whoami`",
+            "a;b",
             "a|b",
             "a&b",
             "a>b",
-            "a\\b",
-            "a\nb",
+            "new\nline",
+            "tab\there",
+            "back\\slash",
             "*",
             "~",
-            "!",
-            "\"",
+            "!history",
+            "日本語",
+            "emoji 🎉",
+            "--not-a-flag",
+            "",
         ] {
-            let quoted = sq(s);
-            assert!(quoted.starts_with('\'') && quoted.ends_with('\''));
-            assert_round_trips(s);
+            assert_eq!(
+                sh_echo(&quote(original)),
+                original,
+                "round trip failed for {original:?} -> {}",
+                quote(original)
+            );
         }
     }
 
-    /// The only assertion that actually matters: hand the quoted form to a real
-    /// `/bin/sh` and check the bytes that come back out.
-    fn assert_round_trips(s: &str) {
+    #[test]
+    fn injection_attempts_stay_inert() {
+        // If quoting were wrong, the subshell would run and the output would
+        // differ from the literal text.
+        let evil = "x$(touch /tmp/nvmux-pwned-$$)y";
+        assert_eq!(sh_echo(&quote(evil)), evil);
+
+        let evil2 = "'; touch /tmp/nvmux-pwned2; echo '";
+        assert_eq!(sh_echo(&quote(evil2)), evil2);
+    }
+
+    #[test]
+    fn quote_all_produces_separable_words() {
+        let joined = quote_all(["one", "two words", "it's three"]);
         let out = Command::new("/bin/sh")
             .arg("-c")
-            .arg(format!("printf %s {}", sq(s)))
+            .arg(format!(r#"for a in {joined}; do printf '[%s]' "$a"; done"#))
             .output()
-            .expect("spawn /bin/sh");
-        assert!(out.status.success(), "sh failed for {s:?}");
+            .expect("run sh");
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
-            s,
-            "round-trip mismatch for {s:?}"
+            "[one][two words][it's three]"
         );
     }
 
+    /// The two-layer case: quoted once for `ssh`'s argv join, then parsed again
+    /// by the remote shell. This is the failure the module docs describe.
     #[test]
-    fn sq_round_trips_through_a_real_shell() {
-        for s in [
-            "",
-            "plain",
-            "with space",
-            "it's",
-            "it's a 'quoted' thing",
-            "'",
-            "''",
-            "'''",
-            r#"quote " and 'quote'"#,
-            "$HOME/`id`/$(uname)",
-            "back\\slash",
-            "new\nline",
-            "tab\there",
-            "unicode: héllo 世界 🚀",
-            "-rf",
-            "--flag=value",
-        ] {
-            assert_round_trips(s);
-        }
-    }
-
-    #[test]
-    fn join_quotes_every_word() {
-        assert_eq!(join(&["nvim", "--listen", "/tmp/a b.sock"]), "'nvim' '--listen' '/tmp/a b.sock'");
-    }
-
-    /// Exercise both nesting layers through a real shell: the outer word-split
-    /// and the inner `-c`. A single mis-escape here shows up as the login shell
-    /// executing fragments of a session name.
-    #[test]
-    fn login_shell_command_survives_both_layers() {
-        for payload in [
-            "plain",
-            "has space",
-            "it's",
-            "nested 'quotes' inside",
-            "$HOME and `id` and $(uname)",
-            "semi;colon && and || pipes",
-            "quote\" and back\\slash",
-        ] {
-            let script = format!("printf %s {}", sq(payload));
-            let cmd = login_shell_command(&script);
-            // Run it the way sshd would: hand the whole line to a shell.
+    fn survives_two_layers_of_shell() {
+        for original in ["my project", r#"a "quoted" name"#, "it's", "$(id)"] {
+            let inner = format!("printf %s {}", quote(original));
+            let outer = login_shell_wrapper(&inner);
+            // `ssh host <args>` joins with spaces; emulate that faithfully.
             let out = Command::new("/bin/sh")
                 .arg("-c")
-                .arg(&cmd)
+                .arg(&outer)
                 .output()
-                .expect("spawn /bin/sh");
+                .expect("run sh");
             assert!(
                 out.status.success(),
-                "login_shell_command failed for {payload:?}: {}",
+                "outer layer failed for {original:?}: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
             assert_eq!(
                 String::from_utf8_lossy(&out.stdout),
-                payload,
-                "payload corrupted through nesting: {payload:?}\ncmd was: {cmd}"
+                original,
+                "two-layer round trip failed for {original:?}\nouter: {outer}"
             );
         }
     }
 
     #[test]
-    fn login_shell_command_uses_a_login_shell() {
-        // -l is what makes the user's PATH additions apply; assert it is there
-        // rather than trusting the format string to stay correct.
-        let cmd = login_shell_command("true");
-        assert!(cmd.contains("-l"), "must request a login shell: {cmd}");
-        assert!(cmd.starts_with("sh -c "), "outer layer must be plain sh: {cmd}");
+    fn login_wrapper_uses_the_users_shell_with_bash_fallback() {
+        let w = login_shell_wrapper("true");
+        assert!(w.contains("${SHELL:-/bin/bash}"), "no fallback in {w}");
+        assert!(w.contains(" -l -c "), "not a login shell in {w}");
+        // $SHELL must be expanded remotely, so it must NOT be single-quoted.
         assert!(
-            cmd.contains("SHELL:-/bin/bash"),
-            "must fall back to bash when $SHELL is unset: {cmd}"
+            !w.contains(r"'${SHELL"),
+            "SHELL was quoted and will not expand: {w}"
         );
     }
 
-    /// Injection guard: a hostile session name must not be able to break out of
-    /// either quoting layer and run a command of its own.
+    /// Strip comments and POSIX character classes so the bashism scan below
+    /// looks only at code.
+    ///
+    /// Both exclusions are load-bearing: `[[:space:]]` is a perfectly portable
+    /// character class that contains `[[` and `]]`, and the word "local"
+    /// appears in prose. Without this the scan rejects correct scripts.
+    fn code_only(script: &str) -> String {
+        script
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .replace("[[:alpha:]]", "")
+            .replace("[[:digit:]]", "")
+            .replace("[[:space:]]", "")
+            .replace("[[:alnum:]]", "")
+    }
+
     #[test]
-    fn login_shell_command_resists_injection() {
-        let hostile = "x'; touch /tmp/nvmux-pwned-$$; echo '";
-        let script = format!("printf %s {}", sq(hostile));
-        let cmd = login_shell_command(&script);
-        let out = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(&cmd)
-            .output()
-            .expect("spawn /bin/sh");
-        assert_eq!(String::from_utf8_lossy(&out.stdout), hostile);
-        // If the payload had escaped, `touch` would have created a file and the
-        // literal text would not have been echoed back verbatim.
+    fn scripts_are_present_and_posix_sh() {
+        for (name, body) in [
+            ("list.sh", LIST_SCRIPT),
+            ("spawn.sh", SPAWN_SCRIPT),
+            ("kill.sh", KILL_SCRIPT),
+        ] {
+            assert!(!body.trim().is_empty(), "{name} is empty");
+            let code = code_only(body);
+            // These run under whatever /bin/sh the session host has, which on
+            // Debian and Ubuntu is dash.
+            //
+            // `sh -n` does not catch most of these: to dash, `[[` is simply an
+            // unknown command name, so it parses fine and fails at runtime.
+            // That is exactly the bug that works on the developer's mac (where
+            // /bin/sh may be bash) and fails on the user's server.
+            for bashism in [
+                "[[ ",
+                " ]]",
+                " == ",
+                "local ",
+                "function ",
+                "$'",
+                "&>",
+                "<<<",
+                "${!",
+                "+=",
+                "echo -e",
+                "read -a",
+            ] {
+                assert!(
+                    !code.contains(bashism),
+                    "{name} contains the bashism {bashism:?}"
+                );
+            }
+        }
+    }
+
+    /// The scan must actually reject bash, or it is decoration.
+    #[test]
+    fn the_bashism_scan_would_catch_a_real_bashism() {
+        let bash = "#!/bin/sh\nif [[ -n \"$x\" ]]; then :; fi\n";
+        let code = code_only(bash);
+        assert!(
+            code.contains("[[ "),
+            "the scan must see code, not just comments"
+        );
+        // ...and must not fire on the portable construct it resembles.
+        let posix = "#!/bin/sh\nsed -n 's/[[:space:]]*//p'\n";
+        assert!(!code_only(posix).contains("[[ "));
+        assert!(!code_only(posix).contains(" ]]"));
+    }
+
+    #[test]
+    fn scripts_pass_shell_syntax_check() {
+        for (name, body) in [
+            ("list.sh", LIST_SCRIPT),
+            ("spawn.sh", SPAWN_SCRIPT),
+            ("kill.sh", KILL_SCRIPT),
+        ] {
+            let out = Command::new("/bin/sh")
+                .arg("-n")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut c| {
+                    use std::io::Write;
+                    c.stdin.take().expect("stdin").write_all(body.as_bytes())?;
+                    c.wait_with_output()
+                })
+                .expect("run sh -n");
+            assert!(
+                out.status.success(),
+                "{name} is not valid sh: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 }
