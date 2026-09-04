@@ -35,6 +35,23 @@ pub fn new_id() -> Result<String> {
     Ok(b32_40(&bytes))
 }
 
+/// Reject anything that is not a well-formed session id.
+///
+/// Ids reach us from two places that are not equally trustworthy: we generate
+/// them, and we read them out of `<id>.json` on disk. The second is why this
+/// exists. An id becomes a *path* — `<dir>/<id>.sock` and its siblings — and
+/// those paths are passed to unlink, to a kill script, and to a socket connect.
+/// An id of `../../elsewhere/precious` escapes the runtime directory entirely.
+///
+/// Sessions are also looked up by id, so a metadata file claiming another
+/// session's id would aim a rename or a kill at the wrong session.
+pub fn is_valid_id(id: &str) -> bool {
+    id.len() == ID_LEN && id.bytes().all(|b| ALPHABET.contains(&b))
+}
+
+/// The length of a session id, in characters and bytes (the alphabet is ASCII).
+pub const ID_LEN: usize = 8;
+
 /// A short, stable, filename-safe token for a host string.
 ///
 /// Used to name the local end of an SSH forward, so that two hosts with a
@@ -89,6 +106,38 @@ mod tests {
         assert_eq!(b32_40(&[0xff; 5]), "77777777");
         // 0b00000_00001_00010_00011_00100_00101_00110_00111
         assert_eq!(b32_40(&[0x00, 0x44, 0x32, 0x14, 0xc7]), "abcdefgh");
+    }
+
+    #[test]
+    fn generated_ids_are_valid() {
+        for _ in 0..256 {
+            assert!(is_valid_id(&new_id().expect("getrandom")));
+        }
+        assert!(is_valid_id(&host_token("myhost")));
+    }
+
+    /// Everything here would become a path if it were accepted.
+    #[test]
+    fn ids_that_would_escape_the_runtime_directory_are_rejected() {
+        for bad in [
+            "",
+            "short",
+            "toolongtobevalid",
+            "../../etc",
+            "..",
+            ".",
+            "/etc/passwd",
+            "abcdefg/",
+            "abcdefg.",
+            "ABCDEFGH", // uppercase is outside the alphabet
+            "abcdefg1", // 0/1/8/9 are not in base32
+            "abcdefg-",
+            "abcd efg",
+            "abcdefg\n",
+            "abcdef\u{0}h",
+        ] {
+            assert!(!is_valid_id(bad), "{bad:?} should be rejected");
+        }
     }
 
     /// If this test ever fails, every live session's forwarded socket path

@@ -380,3 +380,223 @@ fn names_with_shell_metacharacters_survive_a_round_trip() {
         t.kill_session(&session, true).expect("kill");
     }
 }
+
+/// Regression: a session busy in CPU-bound Lua must not be reaped.
+///
+/// The original bug ran `nvim_get_api_info` under a 250ms budget and mapped the
+/// resulting timeout to `Dead`, which made `list_sessions` unlink a live
+/// session's socket. `api_info` is answered off the main loop during `system()`
+/// calls — which is why the `a_busy_session_is_never_reaped` test above passed —
+/// but it is *not* answered during CPU-bound Lua, where it was measured at 3.7s.
+///
+/// So this test uses a busy loop specifically, not `system('sleep')`.
+#[test]
+fn a_session_busy_in_cpu_bound_lua_is_never_reaped() {
+    require_nvim!();
+    let scratch = Scratch::new("cpubusy");
+    let t = scratch.transport();
+
+    let session = t.create_session("compiling").expect("create");
+    let sock = t.local_socket_for(&session).expect("socket");
+    let pid = session.pid;
+
+    // Peg the main loop with real work for longer than any probe budget.
+    let mut client = nvmux::rpc::Client::connect(&sock, Duration::from_secs(2)).expect("connect");
+    std::thread::spawn(move || {
+        let _ = client.command(
+            "call luaeval('(function() local t=os.clock() while os.clock()-t<6 do end return 1 end)()')",
+        );
+    });
+    std::thread::sleep(Duration::from_millis(700));
+
+    let listed = t.list_sessions().expect("list");
+
+    // The process is still alive...
+    let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok();
+    assert!(alive, "precondition: the session should still be running");
+
+    // ...so its socket must still exist and it must still be listed.
+    assert!(
+        sock.exists(),
+        "nvmux deleted the socket of a live session that was merely busy"
+    );
+    assert_eq!(listed.len(), 1, "a busy session must still be listed");
+    assert_ne!(
+        listed[0].state.liveness,
+        Liveness::Dead,
+        "a live session must never be classified Dead"
+    );
+}
+
+/// Regression: a timed-out call must condemn the connection.
+///
+/// rmpv consumes the stream incrementally, so abandoning a read part-way leaves
+/// the tail of that frame in the socket. Without poisoning, the next call
+/// decodes something well-formed out of it and returns it as the answer to a
+/// different question — which for `dirty_buffer_count` would mean a wrong
+/// unsaved-buffer count in a kill prompt, with no error anywhere.
+#[test]
+fn a_timed_out_call_poisons_the_connection() {
+    require_nvim!();
+    let scratch = Scratch::new("poison");
+    let t = scratch.transport();
+    let session = t.create_session("poisoned").expect("create");
+    let sock = t.local_socket_for(&session).expect("socket");
+
+    // Block the editor, then make a call that cannot possibly be answered.
+    let mut blocker = nvmux::rpc::Client::connect(&sock, Duration::from_secs(2)).expect("connect");
+    std::thread::spawn(move || {
+        let _ = blocker.command("call system('sleep 4')");
+    });
+    std::thread::sleep(Duration::from_millis(400));
+
+    let mut client =
+        nvmux::rpc::Client::connect(&sock, Duration::from_millis(300)).expect("connect");
+    let first = client.list_bufs();
+    assert!(first.is_err(), "the call should have timed out");
+
+    // The connection must now refuse to be reused rather than return garbage.
+    let second = client.list_bufs();
+    assert!(
+        second.is_err(),
+        "a poisoned connection returned a value: {second:?}"
+    );
+    let msg = second.expect_err("must fail").to_string();
+    assert!(
+        msg.contains("poisoned"),
+        "expected a poisoned-connection error, got: {msg}"
+    );
+}
+
+/// `kill.sh` must not remove a session's files unless the session is gone.
+///
+/// Driven as a script rather than through `kill_session`, because the graceful
+/// `qa!` path never uses the pid — so the dangerous case (a stale or recycled
+/// pid, and a session that will not shut down) can only be reached here.
+///
+/// Removing the files anyway is the worst available outcome: the session
+/// vanishes from the picker while its Neovim keeps running, and with no socket
+/// in the runtime directory nothing can ever list, probe or kill it again. It
+/// becomes an invisible process holding the user's unsaved work.
+#[test]
+fn kill_sh_does_not_delete_files_for_a_session_it_could_not_kill() {
+    require_nvim!();
+    let scratch = Scratch::new("killsh");
+    let t = scratch.transport();
+    let session = t.create_session("stubborn").expect("create");
+    let sock = t.local_socket_for(&session).expect("socket");
+    let json = sock.with_extension("json");
+
+    // A live pid that is emphatically not this session — the shape a recycled
+    // pid takes after a reboot or long uptime.
+    let decoy = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn decoy");
+
+    let out = std::process::Command::new("/bin/sh")
+        .arg("scripts/kill.sh")
+        .arg(&scratch.0)
+        .arg(&session.id)
+        .arg(decoy.id().to_string())
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run kill.sh");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        stdout.contains("RESULT refused"),
+        "expected a refusal for a pid that does not own the socket, got: {stdout}"
+    );
+    assert!(
+        sock.exists(),
+        "kill.sh deleted the socket of a session it did not kill"
+    );
+    assert!(
+        json.exists(),
+        "kill.sh deleted the metadata of a session it did not kill"
+    );
+    assert!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(session.pid as i32), None).is_ok(),
+        "the real session should be untouched"
+    );
+    // The decoy must not have been signalled either.
+    assert!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(decoy.id() as i32), None).is_ok(),
+        "kill.sh signalled a process that was not the session"
+    );
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(decoy.id() as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+    let mut decoy = decoy;
+    let _ = decoy.wait();
+}
+
+/// A stale pid in the metadata must not stop a normal kill from working.
+///
+/// The graceful `qa!` goes over the socket and never touches the pid, so the
+/// session shuts down cleanly; reporting "could not kill" because a signal was
+/// not delivered would be a false alarm about a session that is now gone.
+#[test]
+fn a_stale_pid_does_not_break_an_otherwise_normal_kill() {
+    require_nvim!();
+    let scratch = Scratch::new("stalepid");
+    let t = scratch.transport();
+    let session = t.create_session("staleish").expect("create");
+    let sock = t.local_socket_for(&session).expect("socket");
+    let json = sock.with_extension("json");
+
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&json).expect("read")).expect("parse");
+    meta["pid"] = serde_json::json!(999_999_u32);
+    std::fs::write(&json, meta.to_string()).expect("write");
+
+    let stale = t
+        .list_sessions()
+        .expect("list")
+        .into_iter()
+        .find(|s| s.id == session.id)
+        .expect("listed");
+
+    t.kill_session(&stale, true)
+        .expect("a graceful kill should still succeed");
+    assert!(t.list_sessions().expect("list").is_empty());
+    assert!(!sock.exists());
+    assert!(!json.exists());
+}
+
+/// A session that exits on its own leaves metadata and an unbounded log behind.
+///
+/// Sessions are discovered through `*.sock`, so once nvim unlinks its own
+/// socket those files are invisible to every later listing and nothing would
+/// ever clean them up.
+#[test]
+fn metadata_left_by_a_self_terminating_session_is_swept_up() {
+    require_nvim!();
+    let scratch = Scratch::new("sweep");
+    let t = scratch.transport();
+
+    let session = t.create_session("selfquit").expect("create");
+    let sock = t.local_socket_for(&session).expect("socket");
+    let json = sock.with_extension("json");
+    let log = sock.with_extension("log");
+
+    // A clean exit: nvim removes its own socket and nothing else.
+    let mut client = nvmux::rpc::Client::connect(&sock, Duration::from_secs(2)).expect("connect");
+    let _ = client.command("qa!");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && sock.exists() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !sock.exists(),
+        "precondition: a clean exit unlinks the socket"
+    );
+    assert!(json.exists(), "precondition: it leaves the metadata behind");
+
+    assert!(t.list_sessions().expect("list").is_empty());
+    assert!(!json.exists(), "orphaned metadata was never cleaned up");
+    assert!(!log.exists(), "the orphaned log was never cleaned up");
+}

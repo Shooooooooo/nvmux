@@ -68,6 +68,13 @@ pub enum PathError {
     #[error("{}: mode is {mode:04o}, refusing to use a directory accessible to other users", .path.display())]
     BadMode { path: PathBuf, mode: u32 },
 
+    /// A session id that is not 8 base32 characters.
+    ///
+    /// Ids become paths, so this is a containment check rather than a
+    /// formatting nicety.
+    #[error("malformed session id {0:?}: expected 8 lowercase base32 characters")]
+    MalformedId(String),
+
     #[error("{}: {source}", .path.display())]
     Io {
         path: PathBuf,
@@ -150,6 +157,14 @@ pub enum SessionError {
         log: PathBuf,
         log_tail: String,
     },
+
+    /// The kill did not take effect, and nvmux left the session's files alone.
+    ///
+    /// Removing them anyway would orphan a running Neovim: with no socket in the
+    /// runtime directory it would never appear in a listing again, and nothing
+    /// could reach it.
+    #[error("could not kill session {name:?}: {reason}")]
+    NotKilled { name: String, reason: &'static str },
 
     #[error("session metadata at {}: {source}", .path.display())]
     Metadata {

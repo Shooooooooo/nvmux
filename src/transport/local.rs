@@ -13,16 +13,23 @@ use crate::shell;
 use crate::transport::exec::{Executor, LocalExecutor};
 use crate::transport::{finish_listing, protocol, Location, Transport};
 
-/// How long to wait for a new session to become *ready*, as distinct from
-/// merely having a socket.
+/// How long to wait for a new session's socket to appear and accept a
+/// connection.
 ///
-/// Readiness means a deferred RPC call answered, which cannot happen until the
-/// user's `init.lua` has finished sourcing. A config that clones a plugin on
-/// first run can genuinely take seconds.
-const READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// This is a *reachability* budget, not a readiness one. It deliberately does
+/// not wait for the editor to finish sourcing `init.lua`: a config that clones
+/// plugins on first run, or runs a slow `system()` call at startup, can take far
+/// longer than any timeout worth having here, and a session that is up but still
+/// starting is a perfectly good session. Killing it because it was slow would
+/// destroy work the user can see happening.
+const REACHABLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long to let a session shut down gracefully after `qa!` before escalating.
-const QUIT_TIMEOUT: Duration = Duration::from_secs(2);
+///
+/// Generous on purpose: this is where `VimLeavePre`, ShaDa writes and session
+/// files happen. Cutting it short to feel responsive corrupts exit-time state,
+/// which is the opposite of what a session manager is for.
+const QUIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -60,16 +67,20 @@ impl LocalTransport {
         Ok(SessionPaths::new(&self.dir, id)?)
     }
 
-    /// Wait until a deferred RPC call answers, or give up.
+    /// Wait until the socket accepts a connection and a real Neovim answers.
     ///
-    /// Deliberately *not* `nvim_get_api_info`: that is answered off the main
-    /// loop and replies within milliseconds while `init.lua` is still running,
-    /// so it would report a session ready before it can do anything.
-    fn wait_until_ready(&self, sock: &Path, timeout: Duration) -> bool {
+    /// Deliberately *not* waiting for a deferred call. `nvim_get_api_info` is
+    /// answered off the main loop, so it proves there is a Neovim behind the
+    /// socket without requiring `init.lua` to have finished — which is the
+    /// distinction that keeps a slow-starting session from being destroyed for
+    /// being slow.
+    fn wait_until_reachable(&self, sock: &Path, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if matches!(rpc::probe(sock), Liveness::Alive) {
-                return true;
+            if let Ok(mut client) = rpc::Client::connect(sock, rpc::PROBE_TIMEOUT) {
+                if client.api_info().is_ok() {
+                    return true;
+                }
             }
             std::thread::sleep(POLL_INTERVAL);
         }
@@ -122,8 +133,11 @@ impl LocalTransport {
                 }
                 true
             }
-            // A dangling symlink: lstat succeeds where the probe saw nothing.
-            // Nothing else will ever clean it up, so it goes.
+            // The path does not exist at all, so there is nothing to reap.
+            //
+            // Note a dangling symlink does NOT arrive here: `symlink_metadata`
+            // succeeds on one, and it is the `is_socket()` check above that
+            // rejects it.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => {
                 tracing::warn!(path = %sock.display(), error = %e, "refusing to reap");
@@ -208,7 +222,7 @@ impl Transport for LocalTransport {
         let out = self.exec.run_script(shell::SPAWN_SCRIPT, &[&dir, &id])?;
         let spawned = protocol::parse_spawn(&out.stdout)?;
 
-        if !spawned.socket_appeared || !self.wait_until_ready(&paths.sock, READY_TIMEOUT) {
+        if !spawned.socket_appeared || !self.wait_until_reachable(&paths.sock, REACHABLE_TIMEOUT) {
             // Clean up rather than leaving a half-created session lying around,
             // then report the log, which is what anyone debugging this needs.
             let tail = self.log_tail(&paths.log);
@@ -220,7 +234,7 @@ impl Transport for LocalTransport {
             self.reap(&paths);
             return Err(SessionError::NotReady {
                 name: name.to_string(),
-                timeout: READY_TIMEOUT,
+                timeout: REACHABLE_TIMEOUT,
                 log: paths.log.clone(),
                 log_tail: tail,
             }
@@ -301,10 +315,27 @@ impl Transport for LocalTransport {
             std::thread::sleep(POLL_INTERVAL);
         }
 
-        // SIGTERM, grace, SIGKILL, then unlink. The script only signals a pid
-        // nvmux validated at spawn time; an unvalidated pid is passed as empty
-        // and the script signals nothing, because pids are reused and the
-        // number could name anything by now.
+        // If the graceful path worked, we are done. Judge by whether the session
+        // is actually gone rather than by whether a signal was delivered: `qa!`
+        // never touches the pid, so a stale or recycled pid in the metadata says
+        // nothing about whether the session shut down.
+        let gone = rpc::probe(&paths.sock) == Liveness::Dead;
+        if gone {
+            if paths.sock.exists() && self.is_reapable(&paths.sock) {
+                self.reap(&paths);
+            } else {
+                // nvim unlinks its own socket on a clean exit; sweep the rest.
+                for p in [&paths.json, &paths.log] {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+            tracing::info!(id = %s.id, name = %s.name, "session exited");
+            return Ok(());
+        }
+
+        // Still there, so escalate. The script only signals a pid it can confirm
+        // still owns this session's socket, and it removes the files only once
+        // the process is genuinely gone.
         let pid = if s.pid > 1 {
             s.pid.to_string()
         } else {
@@ -317,13 +348,29 @@ impl Transport for LocalTransport {
             tracing::warn!(status = out.status, stderr = %out.stderr, "kill.sh failed");
         }
 
-        // The script removes the files, but a socket the script could not
-        // remove would resurrect the session in the next listing.
-        if paths.sock.exists() && self.is_reapable(&paths.sock) {
-            self.reap(&paths);
+        // Reporting success regardless would be the worst outcome available
+        // here: the session would vanish from the picker while its Neovim kept
+        // running, with no socket left for nvmux to ever find, show, or kill.
+        match protocol::parse_kill(&out.stdout)? {
+            protocol::KillOutcome::Killed | protocol::KillOutcome::Absent => {
+                if paths.sock.exists() && self.is_reapable(&paths.sock) {
+                    self.reap(&paths);
+                }
+                tracing::info!(id = %s.id, name = %s.name, "session killed");
+                Ok(())
+            }
+            protocol::KillOutcome::Orphaned => Err(SessionError::NotKilled {
+                name: s.name.clone(),
+                reason: "it did not exit, even after SIGKILL",
+            }
+            .into()),
+            protocol::KillOutcome::Refused => Err(SessionError::NotKilled {
+                name: s.name.clone(),
+                reason: "it is still running and the recorded process id no longer \
+                         belongs to it, so nothing was signalled",
+            }
+            .into()),
         }
-        tracing::info!(id = %s.id, name = %s.name, "session killed");
-        Ok(())
     }
 
     fn rename_session(&self, s: &Session, new_name: &str) -> Result<()> {
@@ -342,7 +389,15 @@ impl Transport for LocalTransport {
         // moved: its path is the session's identity, and the display name is
         // only data. Renaming the socket would mean re-listening on a second
         // address and re-pointing any SSH forward, for no benefit.
-        let bytes = std::fs::read(&paths.json).map_err(NvmuxError::Io)?;
+        let bytes = std::fs::read(&paths.json).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                // The session was killed, or reaped, between the picker
+                // listing it and the rename being confirmed.
+                NvmuxError::Session(SessionError::NotFound(s.name.clone()))
+            } else {
+                NvmuxError::Io(e)
+            }
+        })?;
         let mut session = Session::from_json(&bytes, &paths.json)?;
         session.name = new_name.to_string();
         session.write_atomic(&paths.json)?;

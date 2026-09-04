@@ -73,7 +73,7 @@ use crate::error::Result;
 use crate::rpc;
 use crate::session::Session;
 use crate::transport::Transport;
-use app::{App, Key, Request};
+use app::{App, Dirty, Key, Request};
 
 /// How long to block waiting for input before looping.
 ///
@@ -146,7 +146,10 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal, transport: &dyn Transport) 
                 // Ask the session how much unsaved work it holds so the confirm
                 // can say so. A failure here is not fatal: the prompt simply
                 // does not mention a count.
-                let dirty = find(transport, &id)?.and_then(|s| dirty_count(transport, &s));
+                let dirty = match find(transport, &id)? {
+                    Some(s) => dirty_count(transport, &s),
+                    None => Dirty::Unknown,
+                };
                 app.show_kill_confirm(&id, dirty);
             }
 
@@ -168,11 +171,22 @@ fn find(transport: &dyn Transport, id: &str) -> Result<Option<Session>> {
     Ok(transport.list_sessions()?.into_iter().find(|s| s.id == id))
 }
 
-fn dirty_count(transport: &dyn Transport, session: &Session) -> Option<usize> {
-    let sock = transport.local_socket_for(session).ok()?;
-    let mut client = rpc::Client::connect(&sock, rpc::CONNECT_TIMEOUT).ok()?;
-    client.set_timeout(rpc::PROBE_TIMEOUT).ok()?;
-    client.dirty_buffer_count().ok()
+/// Ask a session how much unsaved work it holds.
+///
+/// Every failure becomes [`Dirty::Unknown`] rather than a zero. A session that
+/// is mid-build cannot answer, and letting that read as "nothing unsaved" would
+/// invite the user to destroy work on the strength of a question we never got
+/// an answer to.
+fn dirty_count(transport: &dyn Transport, session: &Session) -> Dirty {
+    let answer = transport
+        .local_socket_for(session)
+        .ok()
+        .and_then(|sock| rpc::Client::connect(&sock, rpc::PROBE_TIMEOUT).ok())
+        .and_then(|mut client| client.dirty_buffer_count().ok());
+    match answer {
+        Some(n) => Dirty::Count(n),
+        None => Dirty::Unknown,
+    }
 }
 
 /// Collapse an error to something that fits on one line.

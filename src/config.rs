@@ -198,8 +198,17 @@ pub struct SessionPaths {
 }
 
 impl SessionPaths {
-    /// Build the three paths for `id` under `dir`, validating the socket length.
+    /// Build the three paths for `id` under `dir`.
+    ///
+    /// Rejects a malformed id outright. These paths are unlinked, connected to,
+    /// and handed to a kill script, so an id like `../../elsewhere/precious`
+    /// would take all three of those operations outside the runtime directory.
+    /// Defence in depth: the listing already drops malformed ids, but this is
+    /// the single choke point every path goes through.
     pub fn new(dir: &Path, id: &str) -> Result<Self, PathError> {
+        if !crate::ids::is_valid_id(id) {
+            return Err(PathError::MalformedId(id.to_string()));
+        }
         let sock = dir.join(format!("{id}.sock"));
         // Only the socket is length-checked. `.json` and `.log` are opened by
         // path, which is bounded by PATH_MAX (1024+), not by sun_path.

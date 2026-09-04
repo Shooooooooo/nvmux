@@ -98,14 +98,23 @@ pub struct Spawned {
 pub fn parse_spawn(stdout: &str) -> Result<Spawned> {
     let mut out = Spawned::default();
     let mut terminated = false;
+    let mut error = None;
     for line in stdout.lines() {
         let line = line.trim_end_matches('\r');
         match line.split_once(' ') {
             Some(("PID", v)) => out.pid = v.trim().parse().ok().filter(|p| *p > 1),
             Some(("SOCK", v)) => out.socket_appeared = v.trim() == "ok",
+            // The script refuses to spawn into a runtime directory it does not
+            // trust. Surfacing its reason beats reporting a generic timeout.
+            Some(("ERROR", v)) => error = Some(v.trim().to_string()),
             _ if line == TERMINATOR => terminated = true,
             _ => tracing::debug!(line, "ignoring unrecognised line from spawn.sh"),
         }
+    }
+    if let Some(msg) = error {
+        return Err(NvmuxError::Session(crate::error::SessionError::NotFound(
+            msg,
+        )));
     }
     if !terminated {
         return Err(NvmuxError::Session(crate::error::SessionError::NotFound(
@@ -115,6 +124,52 @@ pub fn parse_spawn(stdout: &str) -> Result<Spawned> {
     Ok(out)
 }
 
+/// What `kill.sh` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillOutcome {
+    /// The process is gone and its files were removed.
+    Killed,
+    /// There was no such process; the files were removed.
+    Absent,
+    /// The pid did not belong to this session, so nothing was signalled and
+    /// nothing was removed.
+    Refused,
+    /// It was signalled and is still alive; nothing was removed.
+    Orphaned,
+}
+
+/// Parse the output of `kill.sh`.
+pub fn parse_kill(stdout: &str) -> Result<KillOutcome> {
+    let mut outcome = None;
+    let mut terminated = false;
+    for line in stdout.lines() {
+        let line = line.trim_end_matches('\r');
+        if line == TERMINATOR {
+            terminated = true;
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("RESULT ") {
+            outcome = match v.trim() {
+                "killed" => Some(KillOutcome::Killed),
+                "absent" => Some(KillOutcome::Absent),
+                "refused" => Some(KillOutcome::Refused),
+                "orphaned" => Some(KillOutcome::Orphaned),
+                _ => None,
+            };
+        }
+    }
+    if !terminated {
+        return Err(NvmuxError::Session(crate::error::SessionError::NotFound(
+            format!("the kill command did not complete (no {TERMINATOR} marker)"),
+        )));
+    }
+    outcome.ok_or_else(|| {
+        NvmuxError::Session(crate::error::SessionError::NotFound(
+            "the kill command reported no outcome".to_string(),
+        ))
+    })
+}
+
 /// Turn parsed rows into sessions, dropping ones whose metadata is unusable.
 ///
 /// A socket with no readable metadata is reported rather than silently hidden:
@@ -122,6 +177,16 @@ pub fn parse_spawn(stdout: &str) -> Result<Spawned> {
 /// it. It gets a placeholder name derived from its id.
 pub fn rows_to_sessions(rows: Vec<Listed>) -> Vec<Session> {
     rows.into_iter()
+        .filter(|row| {
+            // The id comes from the socket's own filename, so a malformed one
+            // means something that is not ours is sitting in the runtime
+            // directory. Skip it rather than turning it into a path.
+            let ok = crate::ids::is_valid_id(&row.id);
+            if !ok {
+                tracing::warn!(id = %row.id, "ignoring a file with a malformed session id");
+            }
+            ok
+        })
         .map(|row| {
             let mut session = if row.json.trim().is_empty() {
                 orphan(&row.id)
@@ -134,6 +199,20 @@ pub fn rows_to_sessions(rows: Vec<Listed>) -> Vec<Session> {
                     }
                 }
             };
+
+            // The FILENAME is the identity, not the `id` field inside the file.
+            // Every path nvmux builds — the socket it connects to, the files it
+            // unlinks, the session a kill or rename targets — derives from this,
+            // so trusting the file's contents would let a corrupt or hand-edited
+            // `<id>.json` aim those operations somewhere else entirely.
+            if session.id != row.id {
+                tracing::warn!(
+                    file_id = %session.id,
+                    filename_id = %row.id,
+                    "session metadata claims a different id; using the filename"
+                );
+                session.id = row.id.clone();
+            }
             // The script's hint is the starting point; a real probe overwrites it.
             session.state.liveness = if row.pid_alive {
                 Liveness::Busy
@@ -287,5 +366,57 @@ mod tests {
     fn shell_noise_around_spawn_output_is_ignored() {
         let s = parse_spawn("Welcome to Ubuntu\nPID 9\nSOCK ok\nNVMUX_END\n").expect("parse");
         assert_eq!(s.pid, Some(9));
+    }
+
+    #[test]
+    fn parses_every_kill_outcome() {
+        for (text, want) in [
+            ("killed", KillOutcome::Killed),
+            ("absent", KillOutcome::Absent),
+            ("refused", KillOutcome::Refused),
+            ("orphaned", KillOutcome::Orphaned),
+        ] {
+            let out = format!("RESULT {text}\nNVMUX_END\n");
+            assert_eq!(parse_kill(&out).expect("parse"), want);
+        }
+    }
+
+    #[test]
+    fn kill_output_without_an_outcome_is_an_error() {
+        assert!(parse_kill("NVMUX_END\n").is_err(), "no RESULT line");
+        assert!(parse_kill("RESULT killed\n").is_err(), "no terminator");
+        assert!(parse_kill("RESULT nonsense\nNVMUX_END\n").is_err());
+        assert!(parse_kill("").is_err());
+    }
+
+    /// The filename is the identity; a metadata file claiming another id must
+    /// not be able to redirect a kill or a rename at a different session.
+    #[test]
+    fn a_metadata_file_cannot_claim_another_sessions_id() {
+        let out = format!(
+            "S\tabcdefgh\t1\t{}\nNVMUX_END\n",
+            r#"{"id":"zzzzzzzz","name":"liar","created":1,"pid":2}"#
+        );
+        let sessions = rows_to_sessions(parse_listing(&out).expect("parse"));
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].id, "abcdefgh",
+            "the id must come from the filename, not the file body"
+        );
+    }
+
+    /// An id that would escape the runtime directory must never become a path.
+    #[test]
+    fn malformed_ids_are_dropped_from_the_listing() {
+        for bad in [
+            "../../etc/passwd",
+            "..",
+            "sh0rt",
+            "way-too-long-to-be-an-id",
+        ] {
+            let out = format!("S\t{bad}\t1\t\nNVMUX_END\n");
+            let sessions = rows_to_sessions(parse_listing(&out).expect("parse"));
+            assert!(sessions.is_empty(), "{bad:?} should have been dropped");
+        }
     }
 }

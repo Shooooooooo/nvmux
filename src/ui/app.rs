@@ -148,14 +148,21 @@ impl App {
         }
     }
 
-    /// Show the kill confirmation, mentioning unsaved buffers when there are any.
-    pub fn show_kill_confirm(&mut self, id: &str, dirty: Option<usize>) {
+    /// Show the kill confirmation, saying what is known about unsaved work.
+    ///
+    /// Note the three-way distinction. "No unsaved buffers" and "we could not
+    /// ask" must not look the same: a session busy in a build cannot answer, and
+    /// showing that user the same bare prompt as a clean session invites them to
+    /// destroy unsaved work on the strength of a question nvmux never got an
+    /// answer to.
+    pub fn show_kill_confirm(&mut self, id: &str, dirty: Dirty) {
         let name = self.session_name(id);
         let prompt = match dirty {
             // Singular, because "1 unsaved buffers" reads as a bug.
-            Some(1) => format!("kill {name:?}? 1 unsaved buffer [y/N]"),
-            Some(n) if n > 1 => format!("kill {name:?}? {n} unsaved buffers [y/N]"),
-            _ => format!("kill {name:?}? [y/N]"),
+            Dirty::Count(1) => format!("kill {name:?}? 1 unsaved buffer [y/N]"),
+            Dirty::Count(n) if n > 1 => format!("kill {name:?}? {n} unsaved buffers [y/N]"),
+            Dirty::Count(_) => format!("kill {name:?}? [y/N]"),
+            Dirty::Unknown => format!("kill {name:?}? unsaved state unknown [y/N]"),
         };
         self.mode = Mode::Confirm {
             id: id.to_string(),
@@ -338,6 +345,15 @@ impl App {
             }
         }
     }
+}
+
+/// What is known about a session's unsaved buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dirty {
+    /// The session answered.
+    Count(usize),
+    /// The session could not be asked — busy, unreachable, or mid-shutdown.
+    Unknown,
 }
 
 /// A key press, decoupled from crossterm so the state machine can be tested
@@ -596,7 +612,7 @@ mod tests {
     #[test]
     fn the_confirm_prompt_mentions_unsaved_buffers() {
         let mut a = app(&["dotfiles"]);
-        a.show_kill_confirm("id000000", Some(2));
+        a.show_kill_confirm("id000000", Dirty::Count(2));
         match a.mode() {
             Mode::Confirm { prompt, .. } => {
                 assert_eq!(prompt, r#"kill "dotfiles"? 2 unsaved buffers [y/N]"#)
@@ -604,7 +620,7 @@ mod tests {
             other => panic!("expected Confirm, got {other:?}"),
         }
 
-        a.show_kill_confirm("id000000", Some(1));
+        a.show_kill_confirm("id000000", Dirty::Count(1));
         match a.mode() {
             // Singular, because "1 unsaved buffers" reads as a bug.
             Mode::Confirm { prompt, .. } => {
@@ -613,7 +629,7 @@ mod tests {
             other => panic!("expected Confirm, got {other:?}"),
         }
 
-        a.show_kill_confirm("id000000", Some(0));
+        a.show_kill_confirm("id000000", Dirty::Count(0));
         match a.mode() {
             Mode::Confirm { prompt, .. } => {
                 assert_eq!(prompt, r#"kill "dotfiles"? [y/N]"#)
@@ -634,13 +650,13 @@ mod tests {
             Key::Char(' '),
         ] {
             let mut a = app(&["dotfiles"]);
-            a.show_kill_confirm("id000000", None);
+            a.show_kill_confirm("id000000", Dirty::Unknown);
             assert_eq!(a.on_key(key), Request::None, "{key:?} must not kill");
             assert_eq!(*a.mode(), Mode::Normal);
         }
         for key in [Key::Char('y'), Key::Char('Y')] {
             let mut a = app(&["dotfiles"]);
-            a.show_kill_confirm("id000000", None);
+            a.show_kill_confirm("id000000", Dirty::Unknown);
             assert_eq!(
                 a.on_key(key),
                 Request::Kill("id000000".into()),
@@ -715,5 +731,27 @@ mod tests {
         assert!(a.message().is_some());
         a.on_key(Key::Char('j'));
         assert!(a.message().is_none(), "a stale message must not linger");
+    }
+
+    /// A session that could not be asked must not look like a clean one.
+    #[test]
+    fn an_unanswerable_session_says_so_rather_than_implying_it_is_clean() {
+        let mut a = app(&["dotfiles"]);
+        a.show_kill_confirm("id000000", Dirty::Unknown);
+        let unknown = match a.mode() {
+            Mode::Confirm { prompt, .. } => prompt.clone(),
+            other => panic!("expected Confirm, got {other:?}"),
+        };
+        assert_eq!(unknown, r#"kill "dotfiles"? unsaved state unknown [y/N]"#);
+
+        a.show_kill_confirm("id000000", Dirty::Count(0));
+        let clean = match a.mode() {
+            Mode::Confirm { prompt, .. } => prompt.clone(),
+            other => panic!("expected Confirm, got {other:?}"),
+        };
+        assert_ne!(
+            unknown, clean,
+            "\"could not check\" and \"nothing unsaved\" must not render identically"
+        );
     }
 }

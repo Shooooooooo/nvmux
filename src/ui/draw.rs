@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn the_kill_confirm_names_the_session_and_the_unsaved_count() {
         let mut a = app(&["dotfiles"]);
-        a.show_kill_confirm("id000000", Some(2));
+        a.show_kill_confirm("id000000", super::super::app::Dirty::Count(2));
         let lines = render(&a, 60, 6);
         assert!(
             lines[5].contains(r#"kill "dotfiles"? 2 unsaved buffers [y/N]"#),

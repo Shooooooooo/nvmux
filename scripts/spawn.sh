@@ -25,8 +25,31 @@ log="$dir/$id.log"
 # local user could connect and run nvim_command("!sh") as us. The 0700 directory
 # is the primary control; this closes the second hole.
 umask 077
-mkdir -p "$dir" || exit 1
-chmod 700 "$dir" 2>/dev/null || true
+if [ -d "$dir" ]; then
+  # An existing directory must be OURS and private before we put a socket in
+  # it. Locally nvmux has already checked this, but over ssh this script is the
+  # only check there is, and `mkdir -p` plus a best-effort chmod would happily
+  # accept a directory another user created first. /tmp is world-writable, so
+  # that is not a theoretical concern.
+  #
+  # `find` is used for the ownership test because POSIX `test` has no
+  # "-owned-by-me" operator and `stat` is spelled differently on macOS and Linux.
+  if [ -L "$dir" ] || [ -n "$(find "$dir" -maxdepth 0 ! -user "$(id -u)" 2>/dev/null)" ]; then
+    printf 'ERROR %s\n' "runtime directory $dir is not owned by us"
+    printf 'NVMUX_END\n'
+    exit 1
+  fi
+  if [ -n "$(find "$dir" -maxdepth 0 -perm /077 2>/dev/null)" ]; then
+    printf 'ERROR %s\n' "runtime directory $dir is accessible to other users"
+    printf 'NVMUX_END\n'
+    exit 1
+  fi
+else
+  mkdir -p "$dir" || exit 1
+  # Only ever chmod a directory we just created; silently tightening someone
+  # else's is worse than refusing to use it.
+  chmod 700 "$dir" 2>/dev/null || true
+fi
 
 # MANDATORY. `nvim --listen` refuses to start if *anything* exists at the path
 # -- a live socket, a stale socket, or a plain file -- and all three produce the
@@ -92,18 +115,26 @@ done
 # `-o args=` is the POSIX spelling (`-o command=` is a BSD/GNU alias), and `-ww`
 # stops macOS truncating the output to terminal width, which would silently
 # break the match for exactly the long socket paths where it matters.
+# `grep -F` because the socket path is data, not a pattern: a runtime directory
+# containing `.` or `[` would otherwise make this match the wrong process, or
+# nothing at all.
 pid=''
 if [ -n "$guess" ] && kill -0 "$guess" 2>/dev/null; then
-  if ps -ww -o args= -p "$guess" 2>/dev/null | grep -q -- "$sock"; then
+  if ps -ww -o args= -p "$guess" 2>/dev/null | grep -q -F -- "--listen $sock"; then
     pid=$guess
   fi
 fi
 
 # If the guess did not check out, look for the process actually serving this
 # socket rather than reporting something unsafe to kill.
+#
+# `-A` for "every process", not `-e`: on macOS `-e` means "show the
+# environment", so the scan would silently cover only this terminal's processes
+# and usually find nothing. `-u` restricts it to our own processes, so another
+# user's command line can never be matched.
 if [ -z "$pid" ]; then
-  pid=$(ps -ww -eo pid=,args= 2>/dev/null \
-        | grep -- "--listen $sock" \
+  pid=$(ps -ww -A -u "$(id -u)" -o pid=,args= 2>/dev/null \
+        | grep -F -- "--listen $sock" \
         | grep -v grep \
         | awk 'NR==1{print $1}')
 fi

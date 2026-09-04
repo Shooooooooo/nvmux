@@ -63,4 +63,25 @@ if [ -d "$dir" ]; then
   done
 fi
 
+# Sweep metadata whose socket is gone.
+#
+# A session that exits on its own -- :qa, a crash, SIGTERM -- unlinks its own
+# listen socket but nothing else. Since sessions are discovered through *.sock,
+# such a session becomes invisible from that moment on, and its <id>.json and
+# its unbounded <id>.log would sit in the runtime directory forever with nothing
+# left that would ever look at them again.
+#
+# Safe because the socket is created before the metadata is written: a .json
+# with no .sock always means the session is over, never that it is starting.
+if [ -d "$dir" ]; then
+  for meta in "$dir"/*.json; do
+    [ -e "$meta" ] || continue
+    mid=${meta##*/}
+    mid=${mid%.json}
+    if [ ! -e "$dir/$mid.sock" ]; then
+      rm -f "$meta" "$dir/$mid.log"
+    fi
+  done
+fi
+
 printf 'NVMUX_END\n'
