@@ -124,6 +124,37 @@ pub fn parse_spawn(stdout: &str) -> Result<Spawned> {
     Ok(out)
 }
 
+/// What `probe.sh` reported about a session host.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HostProbe {
+    /// The runtime directory on the host that owns the sessions.
+    pub runtime_dir: String,
+    /// The first line of `nvim --version`, empty if nvim is not on PATH there.
+    pub nvim_banner: String,
+}
+
+/// Parse the output of `probe.sh`.
+pub fn parse_probe(stdout: &str) -> Result<HostProbe> {
+    let mut out = HostProbe::default();
+    let mut terminated = false;
+    for line in stdout.lines() {
+        let line = line.trim_end_matches('\r');
+        if line == TERMINATOR {
+            terminated = true;
+        } else if let Some(v) = line.strip_prefix("DIR ") {
+            out.runtime_dir = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("NVIM ") {
+            out.nvim_banner = v.trim().to_string();
+        }
+    }
+    if !terminated || out.runtime_dir.is_empty() {
+        return Err(NvmuxError::Session(crate::error::SessionError::NotFound(
+            "could not read the remote runtime directory".to_string(),
+        )));
+    }
+    Ok(out)
+}
+
 /// What `kill.sh` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillOutcome {
@@ -418,5 +449,37 @@ mod tests {
             let sessions = rows_to_sessions(parse_listing(&out).expect("parse"));
             assert!(sessions.is_empty(), "{bad:?} should have been dropped");
         }
+    }
+
+    #[test]
+    fn parses_a_host_probe() {
+        let p = parse_probe("DIR /tmp/nvmux-501\nNVIM NVIM v0.11.4\nNVMUX_END\n").expect("parse");
+        assert_eq!(p.runtime_dir, "/tmp/nvmux-501");
+        assert_eq!(p.nvim_banner, "NVIM v0.11.4");
+    }
+
+    #[test]
+    fn a_host_without_nvim_probes_with_an_empty_banner() {
+        let p = parse_probe("DIR /tmp/nvmux-0\nNVIM\nNVMUX_END\n").expect("parse");
+        assert_eq!(p.runtime_dir, "/tmp/nvmux-0");
+        assert!(p.nvim_banner.is_empty());
+    }
+
+    #[test]
+    fn a_login_shell_banner_does_not_confuse_the_probe() {
+        let out = "Welcome to Ubuntu 24.04\n\
+                   Last login: Thu\n\
+                   DIR /tmp/nvmux-1000\n\
+                   NVIM NVIM v0.11.4\n\
+                   NVMUX_END\n";
+        let p = parse_probe(out).expect("parse");
+        assert_eq!(p.runtime_dir, "/tmp/nvmux-1000");
+    }
+
+    #[test]
+    fn an_incomplete_probe_is_an_error() {
+        assert!(parse_probe("DIR /tmp/x\n").is_err(), "no terminator");
+        assert!(parse_probe("NVMUX_END\n").is_err(), "no directory");
+        assert!(parse_probe("").is_err());
     }
 }

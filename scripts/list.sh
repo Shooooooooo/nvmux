@@ -27,6 +27,22 @@ set -u
 
 dir="${1:?usage: list.sh <runtime_dir>}"
 
+# Is any of our processes serving this socket?
+#
+# `-A` for "every process", not `-e`: on macOS `-e` means "show the
+# environment". `-u` keeps the search within our own processes. `grep -F`
+# because the path is data, not a pattern.
+serving() {
+  ps -ww -A -u "$(id -u)" -o args= 2>/dev/null \
+    | grep -v grep \
+    | grep -q -F -- "--listen $1"
+}
+
+# Can we inspect processes at all? If not, "not found" proves nothing.
+can_inspect() {
+  ps -ww -o args= -p $$ >/dev/null 2>&1
+}
+
 # A missing directory is not an error: it means no sessions have been created
 # on this host yet, or a /tmp reaper removed it. Either way, the answer is the
 # empty list, and the terminator still proves the script ran.
@@ -49,14 +65,30 @@ if [ -d "$dir" ]; then
       json=$(tr -d '\n\r\t' < "$json_path")
     fi
 
-    # A cheap prefilter only. The pid is a hint: pids get reused, and this says
-    # nothing about whether nvim is actually serving its socket. nvmux decides
-    # liveness with a real RPC round trip; this just lets the picker grey out
-    # obviously dead rows without paying for a probe per session.
+    # Is a process actually serving this socket?
+    #
+    # Asked by socket rather than by the pid recorded in the metadata: pids get
+    # reused, and the recorded one can be stale, while the socket is the
+    # session's identity. This also works unchanged over ssh, where nvmux
+    # cannot connect to the socket to find out for itself.
+    #
+    # A busy session is still found — the process exists whether or not it is
+    # answering — so this cannot mistake "compiling" for "dead".
     alive=0
-    pid=$(printf '%s' "$json" | sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    if serving "$sock"; then
       alive=1
+    elif can_inspect && [ -S "$sock" ]; then
+      # Nothing is serving it and we can see the process table, so the socket is
+      # stale: nvim unlinks its own socket on a clean exit, and one left behind
+      # means an unclean death. Sweep it.
+      #
+      # Two guards, both required. `can_inspect` because "no process found" is
+      # not evidence when we have no way to look. `-S` because this deletes
+      # files, and a *regular file* that merely happens to be named `<id>.sock`
+      # must never be removed on the strength of "nothing is serving it" —
+      # nothing is serving any ordinary file.
+      rm -f "$sock" "$dir/$id.json" "$dir/$id.log"
+      continue
     fi
 
     printf 'S\t%s\t%s\t%s\n' "$id" "$alive" "$json"

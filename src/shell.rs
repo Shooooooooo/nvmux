@@ -85,6 +85,13 @@ pub const SPAWN_SCRIPT: &str = include_str!("../scripts/spawn.sh");
 /// Terminates a session and removes its files. Wired up in milestone 2.
 pub const KILL_SCRIPT: &str = include_str!("../scripts/kill.sh");
 
+/// Reports a session host's runtime directory and Neovim version at once.
+pub const PROBE_SCRIPT: &str = include_str!("../scripts/probe.sh");
+
+/// Writes `<id>.json` on the session host. Used by the SSH transport, where
+/// Rust cannot reach the file directly.
+pub const WRITE_META_SCRIPT: &str = include_str!("../scripts/write_meta.sh");
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +250,8 @@ mod tests {
             ("list.sh", LIST_SCRIPT),
             ("spawn.sh", SPAWN_SCRIPT),
             ("kill.sh", KILL_SCRIPT),
+            ("probe.sh", PROBE_SCRIPT),
+            ("write_meta.sh", WRITE_META_SCRIPT),
         ] {
             assert!(!body.trim().is_empty(), "{name} is empty");
             let code = code_only(body);
@@ -296,6 +305,8 @@ mod tests {
             ("list.sh", LIST_SCRIPT),
             ("spawn.sh", SPAWN_SCRIPT),
             ("kill.sh", KILL_SCRIPT),
+            ("probe.sh", PROBE_SCRIPT),
+            ("write_meta.sh", WRITE_META_SCRIPT),
         ] {
             let out = Command::new("/bin/sh")
                 .arg("-n")

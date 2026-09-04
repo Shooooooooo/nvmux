@@ -114,8 +114,20 @@ fn errno(e: nix::errno::Errno) -> crate::error::NvmuxError {
 mod tests {
     use super::*;
 
+    /// These tests share process-global state — one SIGWINCH disposition and
+    /// one `WRITE_FD` — so running them concurrently lets one test's `Drop`
+    /// tear down another's subscription mid-assertion. Serialising them is the
+    /// fix; the alternative is a test that fails once every few hundred runs
+    /// and gets dismissed as noise.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn a_resize_signal_becomes_a_readable_fd() {
+        let _guard = serial();
         let winch = Winch::install().expect("install");
 
         unsafe {
@@ -146,6 +158,7 @@ mod tests {
 
     #[test]
     fn several_resizes_coalesce_into_one_drain() {
+        let _guard = serial();
         let winch = Winch::install().expect("install");
         for _ in 0..20 {
             unsafe {
@@ -164,6 +177,7 @@ mod tests {
 
     #[test]
     fn dropping_the_subscription_stops_the_handler() {
+        let _guard = serial();
         let winch = Winch::install().expect("install");
         drop(winch);
         // The handler must not write to the now-closed fd.
