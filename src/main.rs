@@ -4,8 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use nvmux::cli::Cli;
-use nvmux::transport::Location;
-use nvmux::{config, logging, nvim, transport};
+use nvmux::{config, logging, nvim, transport, ui};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -39,25 +38,16 @@ fn run(cli: &Cli) -> Result<()> {
     tracing::debug!(version = %local_nvim, "local nvim");
 
     let transport = transport::open(location.clone())?;
-    let sessions = transport.list_sessions()?;
 
-    // Milestone 1 has no picker yet, so the bare invocation prints what it
-    // found. Milestone 3 replaces this with the ratatui UI; the CLI surface
-    // does not change.
-    println!("nvmux {} — {}", env!("CARGO_PKG_VERSION"), location);
-    println!("neovim {local_nvim}");
-    println!("runtime dir {}", config::runtime_dir().display());
-    println!();
-    if sessions.is_empty() {
-        println!("no sessions");
-    } else {
-        for s in &sessions {
-            println!("  {:<10}  {:<24}  {:?}", s.id, s.name, s.state.liveness);
+    match ui::run(transport.as_ref())? {
+        ui::Outcome::Quit => Ok(()),
+        ui::Outcome::Attach(session) => {
+            // Milestone 4 replaces this with the PTY proxy. Until then, say what
+            // would have happened rather than pretending to attach.
+            let sock = transport.local_socket_for(&session)?;
+            println!("would attach to {:?} ({})", session.name, sock.display());
+            println!("(the PTY proxy arrives in milestone 4)");
+            Ok(())
         }
     }
-
-    if matches!(location, Location::Ssh(_)) {
-        println!("\n(ssh transport arrives in milestone 5)");
-    }
-    Ok(())
 }
