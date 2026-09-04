@@ -53,6 +53,22 @@ if [ -d "$dir" ]; then
 
     id=${sock##*/}
     id=${id%.sock}
+
+    # Only ever look at files whose name is a session id: exactly eight
+    # characters of lowercase base32.
+    #
+    # The runtime directory holds more than sessions. The local end of every
+    # SSH forward lives here too, named `<host_token>-<id>.sock`, and when the
+    # "remote" host is this machine — `nvmux localhost`, which is a perfectly
+    # reasonable thing to do — the remote listing runs in the very same
+    # directory. Without this guard the sweep below finds a forwarded socket,
+    # sees that nothing is `--listen`ing on it, and deletes the live forward of
+    # the session the user is attached to.
+    case "$id" in
+      [a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7]) ;;
+      *) continue ;;
+    esac
+
     json_path="$dir/$id.json"
 
     # A socket with no metadata is an incomplete create or a half-reaped

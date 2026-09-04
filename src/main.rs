@@ -48,25 +48,38 @@ fn run(cli: &Cli) -> Result<()> {
 /// returning to the picker feel free.
 fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     let mut attached: Option<pty::Attachment> = None;
+    let mut message: Option<String> = None;
 
     loop {
-        let chosen = match ui::run(transport)? {
+        let chosen = match ui::run(transport, message.take())? {
             ui::Outcome::Quit => break,
             ui::Outcome::Attach(session) => session,
         };
 
         loop {
-            let attachment = match attached.take() {
+            let opened = match attached.take() {
                 // Same session: resume the client that is already running.
-                Some(a) if a.session_id == chosen.id => a,
+                Some(a) if a.session_id == chosen.id => Ok(a),
                 // A different session was attached; that client is finished
                 // with. Its server keeps running — killing a --remote-ui client
                 // does not kill a --headless --listen server.
                 Some(other) => {
                     other.terminate();
-                    new_attachment(transport, &chosen)?
+                    new_attachment(transport, &chosen)
                 }
-                None => new_attachment(transport, &chosen)?,
+                None => new_attachment(transport, &chosen),
+            };
+
+            // A failed attach must not end the program. A dropped connection,
+            // or a session that died while the picker was open, is something
+            // the user can act on — but only if they are still in the picker to
+            // do it, with the reason on screen.
+            let attachment = match opened {
+                Ok(a) => a,
+                Err(e) => {
+                    message = Some(describe_attach_failure(transport, &e));
+                    break;
+                }
             };
 
             match pty::relay(attachment)? {
@@ -96,12 +109,36 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     Ok(())
 }
 
+/// Explain why an attach failed, in terms of what actually went wrong.
+///
+/// "connection refused" is accurate for a local socket and misleading for a
+/// remote one: through an SSH forward that errno means the *ControlMaster*
+/// died, not the session — ssh accepts first and resets afterwards when the
+/// remote process is the one that has gone. Verified both ways: a dead remote
+/// nvim gives ECONNRESET, a dead master gives ECONNREFUSED.
+fn describe_attach_failure(transport: &dyn transport::Transport, e: &nvmux::NvmuxError) -> String {
+    let remote = matches!(transport.location(), transport::Location::Ssh(_));
+    let host = transport.location().to_string();
+    match e {
+        nvmux::NvmuxError::Rpc(nvmux::error::RpcError::ConnectionRefused(_)) if remote => {
+            format!("the connection to {host} dropped — press enter to retry")
+        }
+        nvmux::NvmuxError::Rpc(nvmux::error::RpcError::Reset) if remote => {
+            format!("that session is no longer running on {host}")
+        }
+        nvmux::NvmuxError::Rpc(rpc) if rpc.is_definitely_dead() => "that session is gone".into(),
+        other => other.to_string().lines().collect::<Vec<_>>().join(" — "),
+    }
+}
+
+/// Returns the crate's own error type rather than `anyhow`, so the caller can
+/// tell a dropped connection from a dead session and say the right thing.
 fn new_attachment(
     transport: &dyn transport::Transport,
     session: &nvmux::session::Session,
-) -> Result<pty::Attachment> {
+) -> nvmux::Result<pty::Attachment> {
     let sock = transport.local_socket_for(session)?;
-    Ok(pty::spawn(&session.id, &sock)?)
+    pty::spawn(&session.id, &sock)
 }
 
 /// A name for a session created with `Ctrl-t c`, which has no prompt to type in.

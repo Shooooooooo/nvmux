@@ -134,6 +134,49 @@ impl SshTransport {
         self.ssh.host()
     }
 
+    /// Remove local forwarded sockets whose session no longer exists.
+    ///
+    /// These are ours and nobody else's: the name is
+    /// `<host_token>-<id>.sock`, so only sessions on *this* host can match, and
+    /// only ids that were not in a listing that succeeded. They otherwise
+    /// accumulate in the runtime directory for every session ever killed, and
+    /// every nvmux run that ended without cancelling its forward.
+    ///
+    /// Deliberately not called when a listing fails: "the host did not answer"
+    /// must never be mistaken for "you have no sessions", or a transient ssh
+    /// hiccup would tear down the forwards of live sessions.
+    fn sweep_orphaned_forwards(&self, live: &[Session]) {
+        let prefix = format!("{}-", self.host_token);
+        let Ok(entries) = std::fs::read_dir(&self.local_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(id) = name
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(".sock"))
+            else {
+                continue;
+            };
+            if live.iter().any(|s| s.id == id) {
+                continue;
+            }
+            // Cancel before unlinking, or the master keeps the forward
+            // registered and a later re-forward becomes a silent no-op that
+            // never recreates the file.
+            if let Ok(remote) = self.remote_sock(id) {
+                self.ssh.cancel(&path, &remote);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+            self.forwarded.lock().map(|mut f| f.remove(id)).ok();
+            tracing::debug!(%id, "removed an orphaned forward");
+        }
+    }
+
     /// Run one of the shared scripts on the remote host.
     ///
     /// A dead master is reported as such rather than as a mysterious failure,
@@ -180,6 +223,7 @@ impl Transport for SshTransport {
             }
         }
         sessions.retain(|s| s.state.liveness != Liveness::Dead);
+        self.sweep_orphaned_forwards(&sessions);
         finish_listing(sessions)
     }
 

@@ -270,3 +270,46 @@ fn an_unreachable_host_fails_with_a_useful_message() {
         "unhelpful error: {err}"
     );
 }
+
+/// A live forward must survive a listing, and a dead one must not.
+///
+/// The sweep that removes orphaned forwards runs against the same runtime
+/// directory the remote listing scans — and when the "remote" host is this
+/// machine, which `nvmux localhost` makes an ordinary case, those are literally
+/// the same directory. A sweep that only asked "is anything serving this
+/// socket?" would find the local end of a live forward, see that no `--listen`
+/// process owns it, and delete the forward out from under an attached session.
+#[test]
+fn a_listing_keeps_live_forwards_and_removes_orphaned_ones() {
+    require_ssh!();
+    let t = SshTransport::new(host()).expect("connect");
+    let name = unique("sweep");
+    let guard = Cleanup(
+        SshTransport::new(host()).expect("connect"),
+        vec![name.clone()],
+    );
+
+    let session = t.create_session(&name).expect("create");
+    let live = t.local_socket_for(&session).expect("forward");
+    assert!(live.exists());
+
+    // An orphan: the local end of a forward for a session that does not exist.
+    let orphan = live.with_file_name(format!("{}-zzzzzzzz.sock", nvmux::ids::host_token(&host())));
+    std::fs::write(&orphan, b"").expect("plant orphan");
+
+    t.list_sessions().expect("list");
+
+    assert!(
+        live.exists(),
+        "a listing deleted the live forward at {}",
+        live.display()
+    );
+    assert!(!orphan.exists(), "the orphaned forward was not cleaned up");
+
+    // ...and the live one still works.
+    let mut client =
+        nvmux::rpc::Client::connect(&live, nvmux::rpc::PROBE_TIMEOUT).expect("still connectable");
+    client.api_info().expect("still usable after a listing");
+
+    drop(guard);
+}

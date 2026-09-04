@@ -251,6 +251,7 @@ impl Ssh {
         if self.is_master_alive() {
             return Ok(());
         }
+        self.clear_stale_control_socket();
         // `-f` backgrounds ssh once authentication is done, so this call blocks
         // for exactly as long as the user needs to touch a key or type a
         // passphrase, and returns when the connection is usable.
@@ -265,6 +266,38 @@ impl Ssh {
             ));
         }
         Ok(())
+    }
+
+    /// Remove a ControlPath left behind by a master that died uncleanly.
+    ///
+    /// A master killed with SIGKILL does not unlink its socket, and starting a
+    /// new one over the corpse does **not** fail — ssh prints
+    /// `ControlSocket ... already exists, disabling multiplexing` and exits
+    /// **0**. So multiplexing is silently off, and every later `-O forward`
+    /// fails with no master, which surfaces as a confusing forwarding error
+    /// rather than the truth. Verified: exit code 0, multiplexing disabled.
+    ///
+    /// Only called once `-O check` has already said nothing is listening, and
+    /// only for a socket we own — the same standard of evidence the session
+    /// reaper uses, for the same reason.
+    fn clear_stale_control_socket(&self) {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let Ok(meta) = std::fs::symlink_metadata(&self.control_path) else {
+            return;
+        };
+        if !meta.file_type().is_socket() {
+            tracing::warn!(
+                path = %self.control_path.display(),
+                "refusing to remove a stale ControlPath that is not a socket"
+            );
+            return;
+        }
+        if meta.uid() != nix::unistd::geteuid().as_raw() {
+            tracing::warn!(path = %self.control_path.display(), "stale ControlPath is not ours");
+            return;
+        }
+        tracing::info!(path = %self.control_path.display(), "removing a stale ControlPath");
+        let _ = std::fs::remove_file(&self.control_path);
     }
 
     /// Point a local socket at a remote one.

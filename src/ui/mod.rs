@@ -81,7 +81,11 @@ use app::{App, Key, Request};
 const TICK: Duration = Duration::from_millis(250);
 
 /// Run the picker until the user attaches or quits.
-pub fn run(transport: &dyn Transport) -> Result<Outcome> {
+///
+/// `message` is shown on the bottom row instead of the hints — how a failed
+/// attach reports itself, since the alternative is exiting the program and
+/// leaving the user with nothing to act on.
+pub fn run(transport: &dyn Transport, message: Option<String>) -> Result<Outcome> {
     // Colour decisions are made per-cell by `draw`, which never sets one. This
     // stops crossterm second-guessing us: its own NO_COLOR handling rewrites
     // SetForegroundColor into a bare `ESC[m`, a full SGR reset that would wipe
@@ -89,15 +93,22 @@ pub fn run(transport: &dyn Transport) -> Result<Outcome> {
     ratatui::crossterm::style::force_color_output(true);
 
     let mut terminal = ratatui::try_init()?;
-    let outcome = run_loop(&mut terminal, transport);
+    let outcome = run_loop(&mut terminal, transport, message);
     // Restore before propagating anything: an error that leaves the terminal in
     // raw mode with no echo is far worse than the error itself.
     ratatui::try_restore()?;
     outcome
 }
 
-fn run_loop(terminal: &mut ratatui::DefaultTerminal, transport: &dyn Transport) -> Result<Outcome> {
+fn run_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    transport: &dyn Transport,
+    message: Option<String>,
+) -> Result<Outcome> {
     let mut app = App::new(transport.list_sessions()?);
+    if let Some(msg) = message {
+        app.set_message(msg);
+    }
 
     loop {
         terminal.draw(|f| draw::draw(f, &app))?;
