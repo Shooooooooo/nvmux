@@ -37,12 +37,7 @@ pub enum Request {
     None,
     Attach(String),
     Create(String),
-    Rename {
-        id: String,
-        name: String,
-    },
-    /// Look up the unsaved-buffer count so the confirm prompt can mention it.
-    CheckDirty(String),
+    Rename { id: String, name: String },
     Kill(String),
     Quit,
 }
@@ -148,25 +143,16 @@ impl App {
         }
     }
 
-    /// Show the kill confirmation, saying what is known about unsaved work.
+    /// Show the kill confirmation.
     ///
-    /// Note the three-way distinction. "No unsaved buffers" and "we could not
-    /// ask" must not look the same: a session busy in a build cannot answer, and
-    /// showing that user the same bare prompt as a clean session invites them to
-    /// destroy unsaved work on the strength of a question nvmux never got an
-    /// answer to.
-    pub fn show_kill_confirm(&mut self, id: &str, dirty: Dirty) {
+    /// Killing is unconditional, so this asks nothing of the session: no RPC,
+    /// no unsaved-buffer count, nothing that could be stale or unobtainable.
+    /// The `[y/N]` is the whole safeguard.
+    fn show_kill_confirm(&mut self, id: &str) {
         let name = self.session_name(id);
-        let prompt = match dirty {
-            // Singular, because "1 unsaved buffers" reads as a bug.
-            Dirty::Count(1) => format!("kill {name:?}? 1 unsaved buffer [y/N]"),
-            Dirty::Count(n) if n > 1 => format!("kill {name:?}? {n} unsaved buffers [y/N]"),
-            Dirty::Count(_) => format!("kill {name:?}? [y/N]"),
-            Dirty::Unknown => format!("kill {name:?}? unsaved state unknown [y/N]"),
-        };
         self.mode = Mode::Confirm {
             id: id.to_string(),
-            prompt,
+            prompt: format!("kill {name:?}? [y/N]"),
         };
     }
 
@@ -224,10 +210,11 @@ impl App {
                 None => Request::None,
             },
             Key::Char('x') => match self.selected_session() {
-                // The caller looks up the unsaved count, then calls
-                // show_kill_confirm. Asking Neovim is I/O, and this type does
-                // not do I/O.
-                Some(s) => Request::CheckDirty(s.id.clone()),
+                Some(s) => {
+                    let id = s.id.clone();
+                    self.show_kill_confirm(&id);
+                    Request::None
+                }
                 None => Request::None,
             },
             Key::Char('/') => {
@@ -345,15 +332,6 @@ impl App {
             }
         }
     }
-}
-
-/// What is known about a session's unsaved buffers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Dirty {
-    /// The session answered.
-    Count(usize),
-    /// The session could not be asked — busy, unreachable, or mid-shutdown.
-    Unknown,
 }
 
 /// A key press, decoupled from crossterm so the state machine can be tested
@@ -598,44 +576,33 @@ mod tests {
         );
     }
 
+    /// `x` opens the confirm immediately and consults nothing.
+    ///
+    /// Killing is unconditional, so there is no unsaved-buffer count to fetch
+    /// and no round trip to the session. That also means the picker cannot
+    /// stall behind a busy session just to draw a prompt.
     #[test]
-    fn kill_asks_for_the_dirty_count_before_confirming() {
+    fn x_opens_the_confirm_without_asking_the_session_anything() {
         let mut a = app(&["dotfiles"]);
         assert_eq!(
             a.on_key(Key::Char('x')),
-            Request::CheckDirty("id000000".into())
+            Request::None,
+            "no I/O should be requested"
         );
-        // Still in Normal mode: the caller has to supply the count first.
-        assert_eq!(*a.mode(), Mode::Normal);
+        match a.mode() {
+            Mode::Confirm { prompt, id } => {
+                assert_eq!(id, "id000000");
+                assert_eq!(prompt, r#"kill "dotfiles"? [y/N]"#);
+            }
+            other => panic!("expected Confirm, got {other:?}"),
+        }
     }
 
     #[test]
-    fn the_confirm_prompt_mentions_unsaved_buffers() {
-        let mut a = app(&["dotfiles"]);
-        a.show_kill_confirm("id000000", Dirty::Count(2));
-        match a.mode() {
-            Mode::Confirm { prompt, .. } => {
-                assert_eq!(prompt, r#"kill "dotfiles"? 2 unsaved buffers [y/N]"#)
-            }
-            other => panic!("expected Confirm, got {other:?}"),
-        }
-
-        a.show_kill_confirm("id000000", Dirty::Count(1));
-        match a.mode() {
-            // Singular, because "1 unsaved buffers" reads as a bug.
-            Mode::Confirm { prompt, .. } => {
-                assert_eq!(prompt, r#"kill "dotfiles"? 1 unsaved buffer [y/N]"#)
-            }
-            other => panic!("expected Confirm, got {other:?}"),
-        }
-
-        a.show_kill_confirm("id000000", Dirty::Count(0));
-        match a.mode() {
-            Mode::Confirm { prompt, .. } => {
-                assert_eq!(prompt, r#"kill "dotfiles"? [y/N]"#)
-            }
-            other => panic!("expected Confirm, got {other:?}"),
-        }
+    fn x_on_an_empty_list_does_nothing() {
+        let mut a = app(&[]);
+        assert_eq!(a.on_key(Key::Char('x')), Request::None);
+        assert_eq!(*a.mode(), Mode::Normal);
     }
 
     /// `[y/N]` means the default is No. Only `y` may destroy a session.
@@ -650,13 +617,13 @@ mod tests {
             Key::Char(' '),
         ] {
             let mut a = app(&["dotfiles"]);
-            a.show_kill_confirm("id000000", Dirty::Unknown);
+            a.on_key(Key::Char('x'));
             assert_eq!(a.on_key(key), Request::None, "{key:?} must not kill");
             assert_eq!(*a.mode(), Mode::Normal);
         }
         for key in [Key::Char('y'), Key::Char('Y')] {
             let mut a = app(&["dotfiles"]);
-            a.show_kill_confirm("id000000", Dirty::Unknown);
+            a.on_key(Key::Char('x'));
             assert_eq!(
                 a.on_key(key),
                 Request::Kill("id000000".into()),
@@ -731,27 +698,5 @@ mod tests {
         assert!(a.message().is_some());
         a.on_key(Key::Char('j'));
         assert!(a.message().is_none(), "a stale message must not linger");
-    }
-
-    /// A session that could not be asked must not look like a clean one.
-    #[test]
-    fn an_unanswerable_session_says_so_rather_than_implying_it_is_clean() {
-        let mut a = app(&["dotfiles"]);
-        a.show_kill_confirm("id000000", Dirty::Unknown);
-        let unknown = match a.mode() {
-            Mode::Confirm { prompt, .. } => prompt.clone(),
-            other => panic!("expected Confirm, got {other:?}"),
-        };
-        assert_eq!(unknown, r#"kill "dotfiles"? unsaved state unknown [y/N]"#);
-
-        a.show_kill_confirm("id000000", Dirty::Count(0));
-        let clean = match a.mode() {
-            Mode::Confirm { prompt, .. } => prompt.clone(),
-            other => panic!("expected Confirm, got {other:?}"),
-        };
-        assert_ne!(
-            unknown, clean,
-            "\"could not check\" and \"nothing unsaved\" must not render identically"
-        );
     }
 }

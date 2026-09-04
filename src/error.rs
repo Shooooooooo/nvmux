@@ -3,7 +3,7 @@
 //! The rule from the design: `anyhow::Result` at boundaries, typed errors where
 //! callers actually branch. Every variant below exists because some caller makes
 //! a decision on it — a stale socket gets reaped, a busy session does not; a
-//! dirty session changes the kill prompt; an old nvim gets a specific message
+//! kill that could not take effect must not delete files; an old nvim gets a
 //! instead of a mysterious connection failure.
 
 use std::path::PathBuf;
@@ -143,11 +143,6 @@ pub enum SessionError {
     /// commands and terminal output, so they are validated at the boundary.
     #[error("invalid session name {name:?}: {reason}")]
     InvalidName { name: String, reason: &'static str },
-
-    /// The session has unsaved buffers. The picker turns this into
-    /// `kill "dotfiles"? 2 unsaved buffers [y/N]` rather than failing.
-    #[error("session {name:?} has {count} unsaved buffer(s)")]
-    Dirty { name: String, count: usize },
 
     /// The socket appeared but nothing ever answered on it.
     #[error("session {name:?} did not become ready within {timeout:?}\n--- tail of {} ---\n{log_tail}", .log.display())]

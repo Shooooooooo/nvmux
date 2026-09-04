@@ -4,10 +4,12 @@
 //!
 //! Four methods, and no more:
 //!
-//! * `nvim_get_api_info`   — reachability and version
-//! * `nvim_list_bufs`      — readiness, and the dirty-buffer check
-//! * `nvim_get_option_value` — the `modified` flag per buffer
-//! * `nvim_command`        — graceful `qa!`
+//! * `nvim_get_api_info` — reachability and version
+//! * `nvim_list_bufs`    — readiness (a *deferred* call; see below)
+//! * `nvim_command`      — graceful `qa!`
+//!
+//! Three, not four. Killing a session is unconditional, so nvmux never asks a
+//! session about its unsaved buffers and `nvim_get_option_value` has no caller.
 //!
 //! There is **no `nvim_ui_attach` anywhere in this crate**, and there must never
 //! be one. nvmux does not render Neovim's UI; `nvim --server ... --remote-ui`
@@ -335,47 +337,6 @@ impl<S: Read + Write> Client<S> {
     pub fn list_uis(&mut self) -> Result<usize, RpcError> {
         let v = self.call("nvim_list_uis", vec![])?;
         Ok(v.as_array().map(|a| a.len()).unwrap_or(0))
-    }
-
-    /// Whether a buffer has unsaved changes.
-    ///
-    /// The handle must be passed back **exactly as received**. See
-    /// [`ext_to_handle`] for why turning it into an integer first is a trap.
-    pub fn buf_modified(&mut self, buf: &Value) -> Result<bool, RpcError> {
-        let opts = Value::Map(vec![(Value::String("buf".into()), buf.clone())]);
-        let v = self.call(
-            "nvim_get_option_value",
-            vec![Value::String("modified".into()), opts],
-        )?;
-        Ok(v.as_bool().unwrap_or(false))
-    }
-
-    /// Count buffers with unsaved changes.
-    ///
-    /// A buffer that disappears between `nvim_list_bufs` and reading its
-    /// `modified` flag is skipped rather than failing the whole count: the
-    /// editor is live and the user may well be closing buffers while we ask.
-    /// Aborting there would turn an ordinary race into "could not check", and
-    /// the kill prompt would stop mentioning unsaved work at exactly the moment
-    /// someone is busy editing.
-    ///
-    /// A transport-level failure (timeout, reset) still propagates — that is a
-    /// genuine "we do not know", and the caller must not read it as zero.
-    pub fn dirty_buffer_count(&mut self) -> Result<usize, RpcError> {
-        let bufs = self.list_bufs()?;
-        let mut n = 0;
-        for b in &bufs {
-            match self.buf_modified(b) {
-                Ok(true) => n += 1,
-                Ok(false) => {}
-                // "Invalid buffer id" and friends: it went away underneath us.
-                Err(RpcError::Nvim(msg)) => {
-                    tracing::debug!(error = %msg, "skipping a buffer that vanished mid-count");
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(n)
     }
 
     /// `nvim_command`. Used for `qa!` and for injecting the `:Detach` alias.

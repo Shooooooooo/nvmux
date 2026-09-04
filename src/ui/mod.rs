@@ -38,8 +38,8 @@
 //! non-sizing, and the `override` flag affects only ext_widgets, never width or
 //! height.
 //!
-//! So: session state in the picker comes from RPC (`nvim_list_bufs`,
-//! `nvim_get_option_value`), and a second UI is never attached to a live session.
+//! So: a second UI is never attached to a live session. Anything the picker
+//! needs to know about a session comes from plain RPC instead.
 //!
 //! # Colour
 //!
@@ -70,10 +70,9 @@ use std::time::Duration;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::error::Result;
-use crate::rpc;
 use crate::session::Session;
 use crate::transport::Transport;
-use app::{App, Dirty, Key, Request};
+use app::{App, Key, Request};
 
 /// How long to block waiting for input before looping.
 ///
@@ -142,22 +141,9 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal, transport: &dyn Transport) 
                 app.set_sessions(transport.list_sessions()?);
             }
 
-            Request::CheckDirty(id) => {
-                // Ask the session how much unsaved work it holds so the confirm
-                // can say so. A failure here is not fatal: the prompt simply
-                // does not mention a count.
-                let dirty = match find(transport, &id)? {
-                    Some(s) => dirty_count(transport, &s),
-                    None => Dirty::Unknown,
-                };
-                app.show_kill_confirm(&id, dirty);
-            }
-
             Request::Kill(id) => {
                 if let Some(session) = find(transport, &id)? {
-                    // Forced: the user has already seen the unsaved count and
-                    // said yes, so re-asking would be the bug.
-                    if let Err(e) = transport.kill_session(&session, true) {
+                    if let Err(e) = transport.kill_session(&session) {
                         app.set_message(one_line(&e));
                     }
                 }
@@ -169,24 +155,6 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal, transport: &dyn Transport) 
 
 fn find(transport: &dyn Transport, id: &str) -> Result<Option<Session>> {
     Ok(transport.list_sessions()?.into_iter().find(|s| s.id == id))
-}
-
-/// Ask a session how much unsaved work it holds.
-///
-/// Every failure becomes [`Dirty::Unknown`] rather than a zero. A session that
-/// is mid-build cannot answer, and letting that read as "nothing unsaved" would
-/// invite the user to destroy work on the strength of a question we never got
-/// an answer to.
-fn dirty_count(transport: &dyn Transport, session: &Session) -> Dirty {
-    let answer = transport
-        .local_socket_for(session)
-        .ok()
-        .and_then(|sock| rpc::Client::connect(&sock, rpc::PROBE_TIMEOUT).ok())
-        .and_then(|mut client| client.dirty_buffer_count().ok());
-    match answer {
-        Some(n) => Dirty::Count(n),
-        None => Dirty::Unknown,
-    }
 }
 
 /// Collapse an error to something that fits on one line.

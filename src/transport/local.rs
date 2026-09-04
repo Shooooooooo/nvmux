@@ -258,48 +258,24 @@ impl Transport for LocalTransport {
         Ok(session)
     }
 
-    fn kill_session(&self, s: &Session, force: bool) -> Result<()> {
+    fn kill_session(&self, s: &Session) -> Result<()> {
         let paths = self.paths(&s.id)?;
         let dir = self.dir.to_string_lossy().into_owned();
 
-        // `force` means "kill even with unsaved buffers". It does not mean
-        // "skip straight to SIGKILL": the escalation below always tries the
-        // graceful path first, because that is what lets nvim clean up its own
-        // socket and swap files.
-        if !force {
-            match rpc::Client::connect(&paths.sock, rpc::CONNECT_TIMEOUT) {
-                Ok(mut client) => {
-                    let _ = client.set_timeout(rpc::PROBE_TIMEOUT);
-                    match client.dirty_buffer_count() {
-                        Ok(0) => {}
-                        Ok(count) => {
-                            return Err(SessionError::Dirty {
-                                name: s.name.clone(),
-                                count,
-                            }
-                            .into())
-                        }
-                        // Could not ask. Refusing to kill would strand the
-                        // session; killing silently would risk data. Report it
-                        // and let the caller decide to force.
-                        Err(e) => {
-                            tracing::warn!(id = %s.id, error = %e, "dirty check failed");
-                            return Err(NvmuxError::Rpc(e));
-                        }
-                    }
-                }
-                // Nothing listening: there is nothing to lose. Fall through to
-                // cleaning up the files.
-                Err(e) if e.is_definitely_dead() => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        // Graceful first. The server usually closes the socket without
-        // answering, so a reset or a timeout here is success, not failure.
-        if let Ok(mut client) = rpc::Client::connect(&paths.sock, rpc::CONNECT_TIMEOUT) {
+        // Unconditional. nvmux does not ask the session whether it has unsaved
+        // buffers, so there is no state to consult and no way for the answer to
+        // be wrong, stale, or unobtainable. To leave a session normally, switch
+        // to it and `:q` — in a remote UI that ends the session, because the
+        // editor *is* the session.
+        //
+        // Graceful first all the same: `qa!` lets nvim run VimLeavePre, write
+        // its ShaDa file and unlink its own socket. That is about the editor
+        // shutting down cleanly, not about consulting it.
+        if let Ok(mut client) = rpc::Client::connect(&paths.sock, rpc::PROBE_TIMEOUT) {
             match client.command("qa!") {
                 Ok(()) => {}
+                // The server usually closes the socket without answering, so a
+                // reset or a timeout here is success, not failure.
                 Err(e) if e.is_definitely_dead() => {}
                 Err(RpcError::Timeout(_)) => {}
                 Err(e) => tracing::debug!(error = %e, "qa! did not answer cleanly"),

@@ -46,7 +46,7 @@ impl Transport for SshTransport {
         ))
     }
 
-    fn kill_session(&self, _s: &Session, _force: bool) -> Result<()> {
+    fn kill_session(&self, _s: &Session) -> Result<()> {
         Err(NvmuxError::Unimplemented("ssh kill_session (milestone 5)"))
     }
 

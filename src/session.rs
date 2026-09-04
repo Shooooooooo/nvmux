@@ -46,8 +46,6 @@ pub enum Liveness {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionState {
     pub liveness: Liveness,
-    /// Number of modified buffers, when known. `None` means not probed.
-    pub dirty_buffers: Option<usize>,
     /// Number of attached UIs, when known.
     pub attached_uis: Option<usize>,
 }
@@ -191,7 +189,7 @@ mod tests {
     fn state_never_reaches_disk() {
         let mut s = Session::new("abcdefgh".into(), "x".into(), 1);
         s.state.liveness = Liveness::Alive;
-        s.state.dirty_buffers = Some(3);
+        s.state.attached_uis = Some(3);
         let json = s.to_json().expect("serialise");
         assert!(!json.contains("state"), "runtime state leaked into {json}");
         assert!(

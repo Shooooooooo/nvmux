@@ -53,6 +53,18 @@
 //!   only *then* leave raw mode; emitting a competing reset corrupts the display.
 //! * `portable-pty` vendors its own `nix`, so never pass a `nix` type across
 //!   that boundary — `MasterPty::get_termios()` returns *its* `Termios`, not ours.
+//!
+//! # `:q` ends the session, and that is intended
+//!
+//! In a `--remote-ui` session `:q` in the last window terminates the *server*,
+//! not just the local view — the editor is the session. That is the documented
+//! way to finish with a session and keep your work: save as usual, then quit as
+//! usual. `Ctrl-t d` is the other exit, and leaves the session running.
+//!
+//! So this is a thing to explain rather than to guard. A `cnoreabbrev` guard
+//! would also be a poor one: it covers bare `:q`, turns `:q!` into a silent
+//! no-op (`bang (!) not supported yet`), and misses `:qa`, `ZZ`, `ZQ`, `:x`,
+//! `:wq` and `<C-w>q` entirely.
 
 /// Placeholder so the module has a shape. Milestone 4 fills this in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

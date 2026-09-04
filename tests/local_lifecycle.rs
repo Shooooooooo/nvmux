@@ -125,7 +125,7 @@ fn create_list_and_kill_a_session() {
         "socket is mode {mode:04o}, reachable by others"
     );
 
-    t.kill_session(&session, false).expect("kill");
+    t.kill_session(&session).expect("kill");
     assert!(
         t.list_sessions().expect("list").is_empty(),
         "kill must remove it"
@@ -213,10 +213,15 @@ fn duplicate_names_are_refused_on_create_and_rename() {
         .expect("self-rename should work");
 }
 
+/// Killing is unconditional: unsaved buffers do not block it and are not
+/// consulted.
+///
+/// The user's route out of a session without losing work is the ordinary editor
+/// one — switch to it and `:q` — not a prompt in the picker.
 #[test]
-fn unsaved_buffers_block_a_kill_until_forced() {
+fn unsaved_buffers_do_not_block_a_kill() {
     require_nvim!();
-    let scratch = Scratch::new("dirty");
+    let scratch = Scratch::new("unsaved");
     let t = scratch.transport();
 
     let session = t.create_session("unsaved").expect("create");
@@ -228,26 +233,12 @@ fn unsaved_buffers_block_a_kill_until_forced() {
     client
         .command("call setline(1, 'unsaved work')")
         .expect("edit");
-
-    let dirty = client.dirty_buffer_count().expect("count");
-    assert_eq!(dirty, 1, "the buffer should register as modified");
     drop(client);
 
-    // A plain kill must refuse and say why.
-    let err = t.kill_session(&session, false).expect_err("must refuse");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("unsaved") && msg.contains('1'),
-        "the error should name the unsaved count: {msg}"
-    );
-    assert!(
-        sock.exists(),
-        "a refused kill must not have killed anything"
-    );
-
-    // Forcing gets through.
-    t.kill_session(&session, true).expect("forced kill");
+    t.kill_session(&session)
+        .expect("kill must not be blocked by unsaved work");
     assert!(t.list_sessions().expect("list").is_empty());
+    assert!(!sock.exists(), "kill must unlink the socket");
 }
 
 #[test]
@@ -377,7 +368,7 @@ fn names_with_shell_metacharacters_survive_a_round_trip() {
             .find(|s| s.id == session.id)
             .unwrap_or_else(|| panic!("{name:?} vanished from the listing"));
         assert_eq!(found.name, name, "name was mangled in transit");
-        t.kill_session(&session, true).expect("kill");
+        t.kill_session(&session).expect("kill");
     }
 }
 
@@ -559,7 +550,7 @@ fn a_stale_pid_does_not_break_an_otherwise_normal_kill() {
         .find(|s| s.id == session.id)
         .expect("listed");
 
-    t.kill_session(&stale, true)
+    t.kill_session(&stale)
         .expect("a graceful kill should still succeed");
     assert!(t.list_sessions().expect("list").is_empty());
     assert!(!sock.exists());

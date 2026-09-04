@@ -26,8 +26,8 @@ use crate::transport::Location;
                   pass a host to manage sessions there. Sessions keep running \
                   after you detach; the editor runs on the session host and all \
                   rendering happens locally.",
-    after_help = "Press Ctrl-t d to detach from a session. Avoid :q -- in a \
-                  remote UI it quits the server, not just your view."
+    after_help = "Ctrl-t d detaches, leaving the session running. \
+                  :q ends the session, because the editor is the session."
 )]
 pub struct Cli {
     /// Host to manage sessions on; passed to ssh verbatim.

@@ -49,7 +49,13 @@ pub trait Transport {
 
     fn create_session(&self, name: &str) -> Result<Session>;
 
-    fn kill_session(&self, s: &Session, force: bool) -> Result<()>;
+    /// Terminate a session.
+    ///
+    /// Unconditional: nvmux does not ask the session about unsaved buffers
+    /// first. Kill means kill. To leave a session normally — saving as you would
+    /// in any editor — switch to it and `:q`, which ends the session because the
+    /// editor is the session.
+    fn kill_session(&self, s: &Session) -> Result<()>;
 
     /// Rename is a metadata edit and nothing more.
     ///
