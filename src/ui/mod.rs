@@ -4,27 +4,30 @@
 //!
 //! The whole screen is a centered list of session names and one dimmed line of
 //! keybind hints on the last row. No borders, no title bar, no status header, no
-//! logo, no metadata columns, no help popup. Prompts (create, rename, kill
-//! confirm, filter) replace the hint line *in place* rather than opening a modal
-//! or a bordered popup.
+//! logo, no metadata columns, no help popup. The picker's own prompts — the
+//! filter and the kill confirm — replace the hint line *in place* rather than
+//! opening a modal or a bordered popup.
 //!
 //! # Two screens, one visual language
 //!
-//! [`prompt`] is the other screen: the full-screen "name the new session" view
-//! that `Ctrl-t c` opens over an attached session. It is a separate screen
-//! rather than a picker mode because it is invoked from a session and not from
-//! the list — routing `Ctrl-t c` through the picker would show the user a list
-//! they did not ask for, and drawing a box over that list is exactly what the
-//! contract above rules out. The contract is unchanged and still governs this
-//! screen; the prompt simply shares its vocabulary — centred content, a
-//! `label: value` line, one dim hint row on the last line, no borders, no
-//! colour.
+//! Naming is the exception, and it is a screen rather than a popup for the same
+//! reason the contract forbids popups. [`prompt`] owns the whole terminal: it is
+//! what `Ctrl-t c` opens over an attached session, and what `c` and `r` open
+//! from the picker. Three ways in, one implementation — the alternative was an
+//! inline create prompt and a full-screen one drifting apart, which is what the
+//! picker used to have.
 //!
-//! What the two screens do *not* share is wording. The picker asks for a name
-//! with `new session:` on a row with the session list still visible above it;
-//! the prompt asks with `new session name:`, because it opens over an editor
-//! with nothing else on screen and has to say what it is for. Same shape, more
-//! words where there is no context to lean on.
+//! The two screens share a vocabulary: centred content, a `label: value` line,
+//! one dim hint row on the last line, no borders, no colour. What the prompt
+//! adds is weight — bold for the label, plain for what you type, dim for the
+//! default — because it covers whatever you were looking at and has to carry
+//! the whole screen on its own. That is also why its labels are wordier than a
+//! hint row would be: `new session name:` and `rename "dotfiles" to:` both name
+//! what is happening, since the list that would have said so is hidden.
+//!
+//! `prompt::run` owns a terminal for `Ctrl-t c`, which arrives with none;
+//! `prompt::run_on` borrows the picker's. Nesting the two would enter the
+//! alternate screen twice and leave it once.
 //!
 //! # There is no preview pane, and there must never be one
 //!
@@ -153,20 +156,22 @@ fn run_loop(
                 app.set_sessions(transport.list_sessions()?);
             }
 
-            Request::Create(name) => match transport.create_session(&name) {
-                // Creating attaches straight away, as specified.
-                Ok(session) => return Ok(Outcome::Attach(session)),
-                Err(e) => {
-                    app.set_message(one_line(&e));
-                    app.set_sessions(transport.list_sessions()?);
+            // Naming happens on the prompt's own screen, driven with the
+            // picker's terminal — see `prompt::run_on`. Failures are reported
+            // there and never come back here, so there is no message to set.
+            Request::NewSession => {
+                if let prompt::Outcome::Created(session) =
+                    prompt::run_on(terminal, transport, prompt::Task::Create)?
+                {
+                    // Creating attaches straight away, as specified.
+                    return Ok(Outcome::Attach(session));
                 }
-            },
+                app.set_sessions(transport.list_sessions()?);
+            }
 
-            Request::Rename { id, name } => {
+            Request::RenameSession(id) => {
                 if let Some(session) = find(transport, &id)? {
-                    if let Err(e) = transport.rename_session(&session, &name) {
-                        app.set_message(one_line(&e));
-                    }
+                    prompt::run_on(terminal, transport, prompt::Task::Rename(&session))?;
                 }
                 app.set_sessions(transport.list_sessions()?);
             }

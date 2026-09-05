@@ -1,10 +1,15 @@
-//! The new-session prompt — a second screen, shown by `Ctrl-t c`.
+//! The naming prompt — the second screen, and the only place a session is named.
 //!
-//! The picker's own create prompt replaces the hint line in place, per the
-//! contract in the parent module. This one owns the whole screen instead,
-//! because what it covers is a live session rather than a list: there is no
-//! hint line to borrow and nothing on screen that should stay visible. It
-//! keeps the picker's visual language all the same — content centred, one dim
+//! Three ways in: `Ctrl-t c` from an attached session, and `c` or `r` from the
+//! picker. `run` owns a terminal for the first, `run_on` borrows one for the
+//! others; a [`Task`] says whether a name is being invented or edited. The
+//! picker used to have its own inline create and rename prompts on the hint
+//! row, which is exactly the duplication that let the two drift apart.
+//!
+//! It owns the whole screen rather than replacing a hint line, per the contract
+//! in the parent module, because what it covers — a live session, or a list — is
+//! not something that should stay half-visible underneath a name being typed. It
+//! keeps the picker's visual language all the same: content centred, one dim
 //! hint row on the last line, no borders, and no colour ever set.
 //!
 //! # Three weights, because there are three kinds of text
@@ -34,6 +39,12 @@
 //! backspaced away before a real name could be typed, which is the whole reason
 //! placeholders exist.
 //!
+//! Renaming inverts that, and the same field serves both: it *starts* pre-filled,
+//! because a rename is an edit of something that already exists rather than a
+//! blank to fill. Clear it and the current name reappears as the default, which
+//! is the truth either way — the default is always what enter would submit if
+//! you typed nothing.
+//!
 //! Being a placeholder is also why the cursor *inverts* its first letter rather
 //! than taking a column in front of it. The cursor marks the insertion point,
 //! and while a default is showing that point is exactly where its first letter
@@ -59,8 +70,21 @@ use crate::transport::Transport;
 pub enum Outcome {
     /// The session that was created. The caller attaches to it.
     Created(Session),
-    /// The user backed out; whatever they came from is still running.
+    /// An existing session was renamed. The caller just relists.
+    Renamed,
+    /// The user backed out; whatever they came from is still there.
     Cancelled,
+}
+
+/// Which name is being asked for.
+///
+/// The two differ in three places and nowhere else: what the label says, what
+/// the field starts as, and what pressing enter finally calls. Everything about
+/// how the screen looks and behaves is shared.
+#[derive(Clone, Copy)]
+pub(super) enum Task<'a> {
+    Create,
+    Rename(&'a Session),
 }
 
 /// What one keypress meant.
@@ -71,44 +95,61 @@ enum Step {
     Cancel,
 }
 
-/// What the field is for, in front of it.
-///
-/// A `label: value` line rather than a bare heading, because this screen opens
-/// over an editor with nothing else on it: it has to say both what is happening
-/// and what to type. The picker's inline create prompt gets away with the
-/// shorter "new session: " — it has the session list right above it.
-const PREFIX: &str = "new session name: ";
-
-/// Three spaces between groups, matching the picker's hint line.
-const HINTS: &str = "⏎ create   esc cancel";
-
 /// What the user has typed, and what enter would do if they typed nothing.
 ///
 /// Split from the terminal so the whole state machine is testable without one,
 /// the same way `App` is split from `draw`.
 struct Prompt {
+    /// What the field is for, in front of it.
+    ///
+    /// A `label: value` line rather than a bare heading, because this screen
+    /// covers whatever you were looking at: it has to say both what is
+    /// happening and what to type. Renaming names the session for the same
+    /// reason — the list it was selected in is no longer on screen.
+    prefix: String,
+    hints: &'static str,
     input: String,
+    /// What enter submits when the field is empty. Creating, that is the next
+    /// free `session N`; renaming, it is the name the session already has, so
+    /// clearing the field and pressing enter keeps it.
     default_name: String,
     message: Option<String>,
 }
 
 impl Prompt {
-    fn new(default_name: String) -> Self {
+    fn create(default_name: String) -> Self {
         Self {
+            prefix: "new session name: ".to_string(),
+            hints: "⏎ create   esc cancel",
             input: String::new(),
             default_name,
             message: None,
         }
     }
 
-    /// Report a rejected name and refresh the default.
+    /// Pre-filled with the current name, as specified — a rename is an edit of
+    /// something that already exists, not a blank field.
+    fn rename(session: &Session) -> Self {
+        Self {
+            prefix: format!("rename {:?} to: ", session.name),
+            hints: "⏎ rename   esc cancel",
+            input: session.name.clone(),
+            default_name: session.name.clone(),
+            message: None,
+        }
+    }
+
+    /// Report a rejected name, optionally moving the default with it.
     ///
     /// What was typed is deliberately kept: a duplicate name is usually one
     /// character away from a good one, and retyping it is not a punishment the
-    /// user earned.
-    fn fail(&mut self, message: String, default_name: String) {
+    /// user earned. `default_name` is refreshed only when creating — a rename's
+    /// default is the name the session already has, and that has not moved.
+    fn fail(&mut self, message: String, default_name: Option<String>) {
         self.message = Some(message);
-        self.default_name = default_name;
+        if let Some(name) = default_name {
+            self.default_name = name;
+        }
     }
 
     fn on_key(&mut self, key: Key) -> Step {
@@ -141,11 +182,11 @@ impl Prompt {
     }
 }
 
-/// Ask for a name, then create the session.
+/// Ask for a name for a new session, owning the terminal while it does.
 ///
-/// Runs its own terminal, entering and leaving the alternate screen exactly as
-/// the picker does — which is what hides the session underneath and puts it
-/// back afterwards.
+/// For `Ctrl-t c`, which arrives from an attached session and so has no
+/// terminal to borrow. Entering and leaving the alternate screen is what hides
+/// the session underneath and puts it back afterwards.
 pub fn run(transport: &dyn Transport) -> Result<Outcome> {
     // Same reasoning as the picker: `draw` never sets a colour, and crossterm's
     // own NO_COLOR handling would rewrite one into a full SGR reset that wipes
@@ -153,15 +194,31 @@ pub fn run(transport: &dyn Transport) -> Result<Outcome> {
     ratatui::crossterm::style::force_color_output(true);
 
     let mut terminal = ratatui::try_init()?;
-    let outcome = run_loop(&mut terminal, transport);
+    let outcome = run_on(&mut terminal, transport, Task::Create);
     // Restore before propagating anything: an error that leaves the terminal in
     // raw mode with no echo is far worse than the error itself.
     ratatui::try_restore()?;
     outcome
 }
 
-fn run_loop(terminal: &mut ratatui::DefaultTerminal, transport: &dyn Transport) -> Result<Outcome> {
-    let mut prompt = Prompt::new(next_free_name(transport)?);
+/// Ask for a name on a terminal the caller already owns — how the picker drives
+/// this screen for `c` and `r`.
+///
+/// Not `run`: initialising a second terminal inside the picker's would enter the
+/// alternate screen twice and leave it once, and the picker would spend the rest
+/// of its life drawing to the main screen with raw mode off. Sharing the
+/// terminal is also what makes the handover invisible — `Terminal::draw` resets
+/// the frame each pass, so this paints over the list and the picker's next draw
+/// puts it back.
+pub(super) fn run_on(
+    terminal: &mut ratatui::DefaultTerminal,
+    transport: &dyn Transport,
+    task: Task,
+) -> Result<Outcome> {
+    let mut prompt = match task {
+        Task::Create => Prompt::create(next_free_name(transport)?),
+        Task::Rename(session) => Prompt::rename(session),
+    };
 
     loop {
         terminal.draw(|f| draw(f, &prompt))?;
@@ -175,19 +232,32 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal, transport: &dyn Transport) 
             _ => continue,
         };
 
-        match prompt.on_key(key) {
-            Step::None => {}
+        let name = match prompt.on_key(key) {
+            Step::None => continue,
             Step::Cancel => return Ok(Outcome::Cancelled),
-            // Names are not validated here. `session::validate_name` and the
-            // transport's duplicate check are the rule; duplicating either one
-            // in the UI is how the two drift apart.
-            Step::Submit(name) => match transport.create_session(&name) {
-                Ok(session) => return Ok(Outcome::Created(session)),
-                Err(e) => {
-                    let refreshed = next_free_name(transport)?;
-                    prompt.fail(super::one_line(&e), refreshed);
-                }
-            },
+            Step::Submit(name) => name,
+        };
+
+        // Names are not validated here. `session::validate_name` and the
+        // transport's duplicate check are the rule; duplicating either one in
+        // the UI is how the two drift apart.
+        let committed = match task {
+            Task::Create => transport.create_session(&name).map(Outcome::Created),
+            Task::Rename(session) => transport
+                .rename_session(session, &name)
+                .map(|_| Outcome::Renamed),
+        };
+
+        match committed {
+            Ok(outcome) => return Ok(outcome),
+            Err(e) => {
+                // A name that was free when the prompt opened may not be now.
+                let refreshed = match task {
+                    Task::Create => Some(next_free_name(transport)?),
+                    Task::Rename(_) => None,
+                };
+                prompt.fail(super::one_line(&e), refreshed);
+            }
         }
     }
 }
@@ -235,7 +305,7 @@ fn draw(frame: &mut Frame, prompt: &Prompt) {
     };
 
     draw_body(frame, prompt, body);
-    draw_hints(frame, bottom);
+    draw_hints(frame, prompt, bottom);
 }
 
 /// Centre the line as it reads the moment the prompt opens, then hold it.
@@ -253,7 +323,7 @@ fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
     }
 
     let height = if prompt.message.is_some() { 2 } else { 1 };
-    let opening = (PREFIX.width() + prompt.default_name.width()) as u16;
+    let opening = (prompt.prefix.width() + prompt.default_name.width()) as u16;
     let anchor = draw::centre(area, opening, height);
     // Everything from the anchor to the right edge is the line's, so a long name
     // has somewhere to go.
@@ -301,8 +371,10 @@ fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
 /// otherwise the default would sit one column right of where typing actually
 /// lands, and the field would visibly jump on the first keystroke.
 fn prompt_line(prompt: &Prompt, width: usize) -> Line<'static> {
-    let label = draw::truncate(PREFIX, width);
-    // One column for the cursor, whether it lands on a letter or on a blank.
+    // The cursor is the only feedback that typing is doing anything, so it gets
+    // a column before the label does — a long rename label on a narrow terminal
+    // would otherwise fill the line and push it off the right edge.
+    let label = draw::truncate(&prompt.prefix, width.saturating_sub(1));
     let room = width.saturating_sub(label.width() + 1);
     let mut spans = vec![Span::styled(
         label,
@@ -346,8 +418,8 @@ fn split_first(s: &str) -> Option<(String, &str)> {
     Some((first.to_string(), &s[first.len_utf8()..]))
 }
 
-fn draw_hints(frame: &mut Frame, area: Rect) {
-    let text = draw::truncate(HINTS, area.width as usize);
+fn draw_hints(frame: &mut Frame, prompt: &Prompt, area: Rect) {
+    let text = draw::truncate(prompt.hints, area.width as usize);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             text,
@@ -387,7 +459,11 @@ mod tests {
     use ratatui::Terminal;
 
     fn prompt() -> Prompt {
-        Prompt::new("session 3".to_string())
+        Prompt::create("session 3".to_string())
+    }
+
+    fn renaming(name: &str) -> Prompt {
+        Prompt::rename(&Session::new("id000000".to_string(), name.to_string(), 100))
     }
 
     fn type_in(p: &mut Prompt, text: &str) {
@@ -543,7 +619,7 @@ mod tests {
         type_in(&mut p, "notes");
         p.fail(
             "a session named \"notes\" already exists".to_string(),
-            "session 4".to_string(),
+            Some("session 4".to_string()),
         );
         assert_eq!(p.input, "notes", "the typed name must survive a rejection");
         assert_eq!(p.default_name, "session 4");
@@ -553,7 +629,7 @@ mod tests {
     #[test]
     fn a_message_is_cleared_by_the_next_keypress() {
         let mut p = prompt();
-        p.fail("nope".to_string(), "session 3".to_string());
+        p.fail("nope".to_string(), Some("session 3".to_string()));
         p.on_key(Key::Char('x'));
         assert!(p.message.is_none());
     }
@@ -651,7 +727,7 @@ mod tests {
     /// type is plain.
     #[test]
     fn the_label_leads_the_cursor_marks_the_field_and_the_default_recedes() {
-        let label = PREFIX.width();
+        let label = "new session name: ".width();
 
         let empty = line_cells(&prompt(), 50, 9);
         assert_eq!(text_of(&empty), "new session name: session 3");
@@ -721,7 +797,7 @@ mod tests {
         type_in(&mut p, "notes");
         p.fail(
             "a session named \"notes\" already exists".to_string(),
-            "session 4".to_string(),
+            Some("session 4".to_string()),
         );
         let lines = render(&p, 50, 9);
         let field = lines
@@ -750,11 +826,97 @@ mod tests {
         let mut typed = prompt();
         type_in(&mut typed, "a-fairly-long-session-name");
         let mut failed = prompt();
-        failed.fail("something went wrong".to_string(), "session 3".to_string());
+        failed.fail(
+            "something went wrong".to_string(),
+            Some("session 3".to_string()),
+        );
 
         for (w, h) in [(1, 1), (2, 1), (1, 2), (0, 0), (80, 1), (3, 3), (10, 2)] {
             for p in [&prompt(), &typed, &failed] {
                 let _ = render(p, w.max(1), h.max(1));
+            }
+        }
+    }
+
+    /// Renaming hides the list the session was selected in, so the label has to
+    /// say which session is being renamed.
+    #[test]
+    fn the_rename_prompt_names_the_session_and_starts_from_its_name() {
+        let p = renaming("dotfiles");
+        let lines = render(&p, 60, 9);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("rename \"dotfiles\" to: dotfiles")),
+            "expected the session named in the label and pre-filled in the field, got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_rename_prompt_says_rename_in_its_hints() {
+        let lines = render(&renaming("dotfiles"), 60, 9);
+        assert!(
+            lines[8].contains("⏎ rename") && lines[8].contains("esc cancel"),
+            "expected rename hints on the last row, got {:?}",
+            lines[8]
+        );
+    }
+
+    /// A pre-filled field has no placeholder to show — until you clear it, at
+    /// which point the current name is exactly what enter would keep.
+    #[test]
+    fn clearing_a_rename_offers_the_current_name_back() {
+        let mut p = renaming("dotfiles");
+        for _ in 0.."dotfiles".len() {
+            p.on_key(Key::Backspace);
+        }
+        assert_eq!(p.input, "");
+
+        let cells = line_cells(&p, 60, 9);
+        let label = "rename \"dotfiles\" to: ".width();
+        assert_eq!(text_of(&cells), "rename \"dotfiles\" to: dotfiles");
+        assert_eq!(
+            cells[label].1,
+            Modifier::REVERSED,
+            "the cursor sits on the offered name's first letter"
+        );
+        assert!(
+            cells[label + 1..].iter().all(|(_, m)| *m == Modifier::DIM),
+            "the offered name recedes like any other default: {cells:?}"
+        );
+
+        assert_eq!(
+            p.on_key(Key::Enter),
+            Step::Submit("dotfiles".to_string()),
+            "enter on a cleared rename keeps the name it had"
+        );
+    }
+
+    /// A rejected rename must not move the default the way a rejected create
+    /// does — the name the session already has has not changed.
+    #[test]
+    fn a_rejected_rename_keeps_offering_the_current_name() {
+        let mut p = renaming("dotfiles");
+        p.fail("a session named \"notes\" already exists".to_string(), None);
+        assert_eq!(p.default_name, "dotfiles");
+    }
+
+    /// However little room is left, the cursor renders: it is the only sign that
+    /// a keystroke landed, and a label long enough to fill the line must not
+    /// push it off the edge.
+    #[test]
+    fn the_cursor_survives_a_label_wider_than_the_terminal() {
+        for w in [1u16, 2, 8, 20, 30] {
+            for p in [
+                &prompt(),
+                &renaming("a-really-long-session-name-here"),
+                &renaming("dotfiles"),
+            ] {
+                let cells = line_cells(p, w, 9);
+                assert!(
+                    cells.iter().any(|(_, m)| m.contains(Modifier::REVERSED)),
+                    "no cursor at {w} columns: {cells:?}"
+                );
             }
         }
     }
@@ -766,7 +928,7 @@ mod tests {
         use ratatui::style::Color;
         let mut p = prompt();
         type_in(&mut p, "notes");
-        p.fail("nope".to_string(), "session 3".to_string());
+        p.fail("nope".to_string(), Some("session 3".to_string()));
 
         let mut terminal = Terminal::new(TestBackend::new(50, 9)).expect("terminal");
         terminal.draw(|f| draw(f, &p)).expect("draw");

@@ -84,8 +84,8 @@ reimplementing it.
 | `j` `k` `↓` `↑` | move (wraps) |
 | `g` `G` | first / last |
 | `Enter` | attach |
-| `c` | create, then attach |
-| `r` | rename |
+| `c` | name a new session, then attach |
+| `r` | rename the selected session |
 | `x` | kill |
 | `/` | filter |
 | `Esc` | clear the filter, or cancel a prompt |
@@ -102,7 +102,8 @@ reimplementing it.
 | `Ctrl-t` `c` | name a new session and attach to it — `Esc` goes back |
 | `Ctrl-t` `Ctrl-t` | send a literal `Ctrl-t` to Neovim |
 
-`Ctrl-t c` hides the session and asks for a name in the middle of the screen:
+`Ctrl-t c` hides the session and asks for a name in the middle of the screen —
+the same prompt `c` and `r` open from the picker:
 
 ```
                     new session name: session 3

@@ -13,15 +13,6 @@ pub enum Mode {
     Normal,
     /// Typing a filter. The list narrows live as the query changes.
     Filter,
-    /// Typing a name for a new session.
-    Create {
-        input: String,
-    },
-    /// Editing an existing session's name, pre-filled with the current one.
-    Rename {
-        input: String,
-        id: String,
-    },
     /// Waiting for y/N on a kill.
     Confirm {
         id: String,
@@ -36,8 +27,11 @@ pub enum Mode {
 pub enum Request {
     None,
     Attach(String),
-    Create(String),
-    Rename { id: String, name: String },
+    /// Ask for a name for a new session. Naming happens on its own screen, so
+    /// the picker only says that it was asked for.
+    NewSession,
+    /// Ask for a new name for this session.
+    RenameSession(String),
     Kill(String),
     Quit,
 }
@@ -165,7 +159,6 @@ impl App {
         match &self.mode {
             Mode::Normal => self.on_key_normal(key),
             Mode::Filter => self.on_key_filter(key),
-            Mode::Create { .. } | Mode::Rename { .. } => self.on_key_input(key),
             Mode::Confirm { .. } => self.on_key_confirm(key),
         }
     }
@@ -192,21 +185,9 @@ impl App {
                 Some(s) => Request::Attach(s.id.clone()),
                 None => Request::None,
             },
-            Key::Char('c') => {
-                self.mode = Mode::Create {
-                    input: String::new(),
-                };
-                Request::None
-            }
+            Key::Char('c') => Request::NewSession,
             Key::Char('r') => match self.selected_session() {
-                Some(s) => {
-                    // Pre-filled with the current name, as specified.
-                    self.mode = Mode::Rename {
-                        input: s.name.clone(),
-                        id: s.id.clone(),
-                    };
-                    Request::None
-                }
+                Some(s) => Request::RenameSession(s.id.clone()),
                 None => Request::None,
             },
             Key::Char('x') => match self.selected_session() {
@@ -267,45 +248,6 @@ impl App {
                 self.filter.clear();
                 self.mode = Mode::Normal;
                 self.clamp_selection();
-                Request::None
-            }
-            Key::CtrlC => Request::Quit,
-            _ => Request::None,
-        }
-    }
-
-    fn on_key_input(&mut self, key: Key) -> Request {
-        let (input, id) = match &mut self.mode {
-            Mode::Create { input } => (input, None),
-            Mode::Rename { input, id } => {
-                let id = id.clone();
-                (input, Some(id))
-            }
-            _ => return Request::None,
-        };
-
-        match key {
-            Key::Char(c) => {
-                input.push(c);
-                Request::None
-            }
-            Key::Backspace => {
-                input.pop();
-                Request::None
-            }
-            Key::Enter => {
-                let text = input.trim().to_string();
-                self.mode = Mode::Normal;
-                if text.is_empty() {
-                    return Request::None;
-                }
-                match id {
-                    Some(id) => Request::Rename { id, name: text },
-                    None => Request::Create(text),
-                }
-            }
-            Key::Esc => {
-                self.mode = Mode::Normal;
                 Request::None
             }
             Key::CtrlC => Request::Quit,
@@ -539,67 +481,32 @@ mod tests {
         assert_eq!(a.filter(), "", "esc in normal mode clears the filter");
     }
 
+    /// Naming a session happens on the prompt's own screen, so the picker's job
+    /// is only to say it was asked for — no mode, no buffer, no name.
     #[test]
-    fn create_prompts_then_requests_creation() {
+    fn c_asks_for_a_new_session() {
         let mut a = app(&[]);
-        a.on_key(Key::Char('c'));
-        assert!(matches!(a.mode(), Mode::Create { .. }));
-        for c in "my-project".chars() {
-            a.on_key(Key::Char(c));
-        }
-        assert_eq!(a.on_key(Key::Enter), Request::Create("my-project".into()));
-        assert_eq!(*a.mode(), Mode::Normal);
+        assert_eq!(a.on_key(Key::Char('c')), Request::NewSession);
+        assert_eq!(*a.mode(), Mode::Normal, "the picker stays where it is");
     }
 
     #[test]
-    fn an_empty_create_is_cancelled_not_submitted() {
-        let mut a = app(&[]);
-        a.on_key(Key::Char('c'));
-        assert_eq!(a.on_key(Key::Enter), Request::None);
-        assert_eq!(*a.mode(), Mode::Normal);
-
-        // ...and neither is one that is only whitespace.
-        a.on_key(Key::Char('c'));
-        a.on_key(Key::Char(' '));
-        assert_eq!(a.on_key(Key::Enter), Request::None);
-    }
-
-    #[test]
-    fn esc_cancels_a_prompt_without_acting() {
-        let mut a = app(&["one"]);
-        a.on_key(Key::Char('c'));
-        for c in "abandoned".chars() {
-            a.on_key(Key::Char(c));
-        }
-        assert_eq!(a.on_key(Key::Esc), Request::None);
-        assert_eq!(*a.mode(), Mode::Normal);
-    }
-
-    #[test]
-    fn rename_is_prefilled_with_the_current_name() {
+    fn r_asks_to_rename_the_selected_session() {
         let mut a = app(&["dotfiles", "notes"]);
-        a.on_key(Key::Char('r'));
-        match a.mode() {
-            Mode::Rename { input, id } => {
-                assert_eq!(input, "dotfiles", "prompt should be pre-filled");
-                assert_eq!(id, "id000000");
-            }
-            other => panic!("expected Rename, got {other:?}"),
-        }
-        // Editing from the pre-filled value.
-        for _ in 0..8 {
-            a.on_key(Key::Backspace);
-        }
-        for c in "config".chars() {
-            a.on_key(Key::Char(c));
-        }
+        a.on_key(Key::Char('j'));
         assert_eq!(
-            a.on_key(Key::Enter),
-            Request::Rename {
-                id: "id000000".into(),
-                name: "config".into()
-            }
+            a.on_key(Key::Char('r')),
+            Request::RenameSession("id000001".into())
         );
+        assert_eq!(*a.mode(), Mode::Normal);
+    }
+
+    /// With nothing selected there is nothing to rename, and `r` must not ask
+    /// the caller to open a prompt for a session that does not exist.
+    #[test]
+    fn r_does_nothing_on_an_empty_list() {
+        let mut a = app(&[]);
+        assert_eq!(a.on_key(Key::Char('r')), Request::None);
     }
 
     /// `x` opens the confirm immediately and consults nothing.
@@ -658,19 +565,21 @@ mod tests {
         }
     }
 
-    /// While a prompt is open, ordinary keys are text, not commands. Typing a
-    /// name containing "x" must not trigger a kill.
+    /// While the filter is open, ordinary keys are text, not commands: a query
+    /// containing "x" must not trigger a kill, and one containing "c" or "r"
+    /// must not open the naming prompt.
+    ///
+    /// Filter is the picker's only text entry now that naming has its own
+    /// screen, so this is where the invariant lives.
     #[test]
-    fn prompt_keys_are_text_not_commands() {
+    fn filter_keys_are_text_not_commands() {
         let mut a = app(&["one"]);
-        a.on_key(Key::Char('c'));
-        for c in "xqrc/".chars() {
+        a.on_key(Key::Char('/'));
+        for c in "xqrc".chars() {
             assert_eq!(a.on_key(Key::Char(c)), Request::None);
         }
-        match a.mode() {
-            Mode::Create { input } => assert_eq!(input, "xqrc/"),
-            other => panic!("expected Create, got {other:?}"),
-        }
+        assert_eq!(a.filter(), "xqrc");
+        assert_eq!(*a.mode(), Mode::Filter);
     }
 
     #[test]
