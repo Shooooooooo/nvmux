@@ -1,13 +1,9 @@
 //! Running a shell script on the host that owns the sessions.
 //!
 //! Local and remote differ in exactly one primitive: how to run a POSIX `sh`
-//! script and collect its stdout. Isolating that here is what lets
-//! [`crate::transport::protocol`] — all the parsing and argument building — be
-//! pure, shared, and heavily unit-tested.
-//!
-//! The scripts themselves are shared *verbatim*: the same file runs as
-//! `sh script dir` locally and as `ssh host 'sh -s <args>'` remotely, with
-//! positional arguments arriving identically on both paths.
+//! script and collect its stdout. Isolating it here keeps
+//! [`crate::transport::protocol`] pure, shared and unit-testable, and lets the
+//! same script file run verbatim on both paths.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -30,13 +26,9 @@ impl Output {
 
 /// Runs scripts somewhere.
 pub trait Executor: Send + Sync {
-    /// Run `script` under `/bin/sh` with `args` as `$1..$n`.
-    ///
-    /// The script is delivered on **stdin**, never interpolated into a command
-    /// string. That is what keeps session names containing quotes, spaces and
-    /// `$(...)` from being a command injection: the remote shell parses the
-    /// script text once and receives every variable part as an already-split
-    /// argument it never re-parses.
+    /// Run `script` under `/bin/sh` with `args` as `$1..$n`, delivered on
+    /// **stdin** and never interpolated into a command string — see
+    /// [`crate::shell`].
     fn run_script(&self, script: &str, args: &[&str]) -> Result<Output>;
 
     /// For error messages only.

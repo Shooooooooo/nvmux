@@ -19,10 +19,8 @@
 
 set -u
 
-# Matches the Rust side's rule exactly: /tmp/nvmux-<uid> on every platform.
-# $XDG_RUNTIME_DIR is deliberately not consulted — on Linux it is destroyed when
-# the user's last login session ends unless lingering is enabled, which would
-# kill the detached sessions nvmux exists to keep alive.
+# Matches the Rust side's rule exactly; see src/config.rs for why
+# $XDG_RUNTIME_DIR is not consulted.
 printf 'DIR /tmp/nvmux-%s\n' "$(id -u)"
 
 if command -v nvim >/dev/null 2>&1; then

@@ -2,23 +2,16 @@
 //!
 //! # Why every session path is short
 //!
-//! A unix domain socket address is a fixed-size `char sun_path[N]` inside
-//! `struct sockaddr_un`. `N` is **104 on macOS** (`xnu bsd/sys/un.h`) and 108 on
-//! Linux (`UNIX_PATH_MAX`, `/usr/include/linux/un.h`). Rust's std rejects with
-//! `if bytes.len() >= addr.sun_path.len()`, so the largest path std will
-//! actually bind or connect is 103 bytes on macOS.
+//! `sun_path` is 104 bytes on macOS and 108 on Linux, and the two halves of
+//! nvmux disagree about what happens past that. Neovim (through libuv)
+//! **silently truncates** — `uv_pipe_bind2` does `if (namelen >
+//! sizeof(saddr.up.path)) namelen = sizeof(saddr.up.path);` and exits 0 — while
+//! Rust refuses the same path outright. The result is a healthy nvim bound to a
+//! truncated path that nvmux can never reach, with no error printed anywhere.
+//! Hence [`MAX_SOCK_PATH`], checked before spawning.
 //!
-//! The failure mode when you exceed it is the reason for [`MAX_SOCK_PATH`]:
-//! Neovim (through libuv) **silently truncates** an overlong path — libuv's
-//! `uv_pipe_bind2` does `if (namelen > sizeof(saddr.up.path)) namelen =
-//! sizeof(saddr.up.path);` and carries on with exit 0 — while Rust refuses the
-//! same path outright. So nvim binds a truncated path, `nvim --server` connects
-//! to the same truncated path and works fine, and nvmux's own Rust client can
-//! never reach it. A healthy session, invisible to its manager, with no error
-//! printed anywhere. We guard before spawning rather than discovering this.
-//!
-//! Note the std error carries `raw_os_error() == None` and `ErrorKind::InvalidInput`;
-//! there is no `ENAMETOOLONG` to detect after the fact.
+//! The std error carries `raw_os_error() == None`, so there is no
+//! `ENAMETOOLONG` to detect after the fact.
 
 use std::fs::DirBuilder;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
@@ -28,32 +21,17 @@ use crate::error::PathError;
 
 /// The runtime directory is always `/tmp/nvmux-<uid>`, on both platforms.
 ///
-/// `$XDG_RUNTIME_DIR` is deliberately **not** consulted, which is a considered
-/// deviation from the freedesktop convention:
-///
-/// * On Linux it is `/run/user/<uid>`, which systemd destroys when the user's
-///   last login session ends unless `loginctl enable-linger` is set. Detached
-///   sessions would silently die at logout — precisely the case nvmux exists to
-///   prevent.
-/// * On macOS it is never set at all, so the fallback is the only path there.
-///
-/// Using it unconditionally means macOS and Linux run the same code path, and
-/// it is the shortest sensible prefix, which the `sun_path` budget likes.
-///
-/// `$TMPDIR` is also not consulted: on macOS it is a ~48 byte
-/// `/var/folders/<2>/<30>/T/` path that differs between login, sudo and
-/// launchd contexts, so nvmux invoked two ways would not find the same sessions.
+/// `$XDG_RUNTIME_DIR` is deliberately **not** consulted: on Linux systemd
+/// destroys it at logout unless `loginctl enable-linger` is set, so detached
+/// sessions would silently die — precisely what nvmux exists to prevent. Nor is
+/// `$TMPDIR`, which on macOS differs between login, sudo and launchd contexts.
 pub const RUNTIME_DIR_PREFIX: &str = "/tmp/nvmux-";
 
 /// Reject socket paths longer than this, in **bytes**.
 ///
-/// The hard limit is 103 (see the module docs). We guard at 100 to keep a small
-/// margin, which costs nothing: the longest path nvmux composes is 44 bytes
-/// even at a pathological uid.
-///
-/// Counted in bytes, not `char`s: a non-ASCII path makes `chars().count()`
-/// diverge from what the kernel measures, and it would break for exactly one
-/// class of user, silently.
+/// The hard limit is 103 (see the module docs); 100 keeps a free margin, since
+/// the longest path nvmux composes is 44 bytes. Counted in bytes, not `char`s:
+/// on a non-ASCII path `chars().count()` diverges from what the kernel measures.
 pub const MAX_SOCK_PATH: usize = 100;
 
 /// Log a warning above this, so budget creep shows up in tests before it
@@ -68,27 +46,21 @@ pub fn runtime_dir() -> PathBuf {
 
 /// Resolve, create if needed, and security-check the runtime directory.
 ///
-/// Call this before every operation that touches the directory. It is cheap and
-/// `/tmp` reapers do delete idle directories: this image's tmpfiles.d says
-/// `D /tmp 1777 root root 30d`, and macOS's periodic daily job cleans entries
-/// after roughly three days.
+/// Call this before every operation that touches the directory: it is cheap, and
+/// `/tmp` reapers do delete idle directories.
 pub fn ensure_runtime_dir() -> Result<PathBuf, PathError> {
     let dir = runtime_dir();
     ensure_dir_secure(&dir)?;
     Ok(dir)
 }
 
-/// The security check, run on the **final component only**.
-///
-/// Deliberately not applied to the path prefix: on macOS `/tmp` is itself a
-/// symlink to `/private/tmp`, so a "reject if any component is a symlink" rule
+/// The security check, run on the **final component only** — on macOS `/tmp` is
+/// itself a symlink to `/private/tmp`, so rejecting any symlinked component
 /// would refuse to start on every Mac.
 ///
-/// This is a code-execution control rather than a privacy nicety. `/tmp` is mode
-/// 1777; the sticky bit stops another user *deleting* our directory but not
-/// *creating* it first with ownership of their choosing. Neovim creates its
-/// listen socket with `0777 & ~umask`, so a socket another user can reach lets
-/// them run `nvim_command("!sh")` as us.
+/// A code-execution control, not a privacy nicety: `/tmp` is mode 1777, so its
+/// sticky bit stops another user *deleting* our directory but not *creating* it
+/// first, and a socket they can reach runs `nvim_command("!sh")` as us.
 pub(crate) fn ensure_dir_secure(dir: &Path) -> Result<(), PathError> {
     let io = |source| PathError::Io {
         path: dir.to_path_buf(),
@@ -96,7 +68,7 @@ pub(crate) fn ensure_dir_secure(dir: &Path) -> Result<(), PathError> {
     };
 
     // Bounded retry: the only way round the loop is losing a create/remove race
-    // with another nvmux, which cannot repeat indefinitely in practice.
+    // with another nvmux.
     for _ in 0..8 {
         // `symlink_metadata`, never `metadata`: a symlink *to* a directory
         // satisfies `create_dir_all` and reports `is_dir() == true` through
@@ -107,16 +79,13 @@ pub(crate) fn ensure_dir_secure(dir: &Path) -> Result<(), PathError> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 match DirBuilder::new().mode(0o700).create(dir) {
                     Ok(()) => {
-                        // `mkdir`'s mode argument is masked by umask: under a
-                        // hostile `umask 0700`, `mkdir(0o700)` yields mode 0000
-                        // and every later open fails with EACCES. Since we know
-                        // we just created this one, forcing the mode is safe.
+                        // `mkdir`'s mode is masked by umask: under a hostile
+                        // `umask 0700` it yields mode 0000 and every later open
+                        // fails with EACCES. Safe to force — we just created it.
                         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
                             .map_err(io)?;
                         continue;
                     }
-                    // Lost the race with another nvmux; go round and validate
-                    // whatever is there now.
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                     Err(e) => return Err(io(e)),
                 }
@@ -152,13 +121,10 @@ pub(crate) fn ensure_dir_secure(dir: &Path) -> Result<(), PathError> {
     )))
 }
 
-/// Restrict the file mode creation mask for this process.
-///
-/// Called before spawning any nvim. Neovim creates its listen socket with
-/// `0777 & ~umask` — measured: umask 000 gives `srwxrwxrwx`, umask 077 gives
-/// `srwx------`. The 0700 directory is the primary control, but a world-writable
-/// socket inside it is one bad `chmod` away from arbitrary code execution, so we
-/// close the hole at both levels.
+/// Restrict the file mode creation mask for this process, before spawning any
+/// nvim. Neovim creates its listen socket with `0777 & ~umask`; the 0700
+/// directory is the primary control, but closing the hole at both levels costs
+/// nothing.
 pub fn restrict_umask() {
     nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
 }
@@ -185,11 +151,8 @@ pub fn check_sock_path(path: &Path) -> Result<(), PathError> {
     Ok(())
 }
 
-/// Paths belonging to one session, in one directory.
-///
-/// Note there is no rename operation here. Renaming a session rewrites the
-/// `name` field inside `<id>.json` and never touches these paths: the socket
-/// path is the session's stable identity and the display name is only data.
+/// Paths belonging to one session, in one directory. There is deliberately no
+/// rename here — see [`crate::transport::Transport::rename_session`].
 #[derive(Debug, Clone)]
 pub struct SessionPaths {
     pub sock: PathBuf,
@@ -198,13 +161,12 @@ pub struct SessionPaths {
 }
 
 impl SessionPaths {
-    /// Build the three paths for `id` under `dir`.
+    /// Build the three paths for `id` under `dir`, rejecting a malformed id.
     ///
-    /// Rejects a malformed id outright. These paths are unlinked, connected to,
-    /// and handed to a kill script, so an id like `../../elsewhere/precious`
-    /// would take all three of those operations outside the runtime directory.
-    /// Defence in depth: the listing already drops malformed ids, but this is
-    /// the single choke point every path goes through.
+    /// These paths are unlinked, connected to and handed to a kill script, so
+    /// `../../elsewhere/precious` would take all three outside the runtime
+    /// directory. The listing already drops malformed ids; this is the choke
+    /// point every path goes through.
     pub fn new(dir: &Path, id: &str) -> Result<Self, PathError> {
         if !crate::ids::is_valid_id(id) {
             return Err(PathError::MalformedId(id.to_string()));
@@ -304,13 +266,12 @@ mod tests {
         }
     }
 
-    /// The budget is measured in bytes because that is what the kernel copies
-    /// into `sun_path`. A char-based check would pass this path and then fail at
-    /// `bind()` for one class of user only.
+    /// Measured in bytes, because that is what the kernel copies into
+    /// `sun_path`. A char-based check would pass this and fail at `bind()`.
     #[test]
     fn budget_is_counted_in_bytes_not_chars() {
         use std::os::unix::ffi::OsStrExt;
-        // 34 three-byte characters: 102 bytes, 34 chars.
+        // 51 two-byte characters: 102 bytes, 51 chars.
         let dir: String = "é".repeat(51);
         let p = PathBuf::from(format!("/{dir}"));
         let bytes = p.as_os_str().as_bytes().len();
@@ -365,9 +326,8 @@ mod tests {
             std::fs::remove_dir_all(&d).ok();
         }
 
-        /// The /tmp symlink attack. `create_dir_all` succeeds on a
-        /// symlink-to-directory and `Metadata::is_dir()` reports true for it;
-        /// only lstat reveals the difference.
+        /// The /tmp symlink attack: `create_dir_all` succeeds on a
+        /// symlink-to-directory and `is_dir()` reports true; only lstat differs.
         #[test]
         fn rejects_a_symlink_to_a_directory() {
             let real = scratch("symlink-target");
@@ -420,10 +380,8 @@ mod tests {
             std::fs::remove_file(&d).ok();
         }
 
-        /// A hostile umask masks mkdir's mode argument: under `umask 0700`,
-        /// `mkdir(0o700)` yields mode 0000 and every later open fails with
-        /// EACCES. Since we know we just created the directory, forcing the
-        /// mode afterwards is both safe and necessary.
+        /// A hostile umask masks mkdir's mode argument, so the mode has to be
+        /// forced afterwards.
         #[test]
         fn survives_a_hostile_umask() {
             let previous = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o700));

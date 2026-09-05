@@ -14,10 +14,9 @@
 //! alongside stdin and the pty master — no extra thread, no shared state, and
 //! nothing for the relay loop to poll for.
 //!
-//! A `sigwait`-based version also works but is ordering-sensitive: every signal
-//! in the waited set must be blocked in *every* thread before any thread waits,
-//! and getting that wrong produces zero deliveries and a silent hang. The
-//! self-pipe has no such hazard.
+//! A `sigwait`-based version is ordering-sensitive — every signal in the waited
+//! set must be blocked in every thread before any thread waits, and getting it
+//! wrong produces zero deliveries and a silent hang. The self-pipe cannot.
 
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicI32, Ordering};

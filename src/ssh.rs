@@ -1,48 +1,16 @@
-//! Driving the `ssh` client. Milestone 5.
+//! Driving the `ssh` client.
 //!
-//! # Why a subprocess and not a Rust SSH library
+//! A subprocess rather than a Rust SSH library, so that `~/.ssh/config`,
+//! `ProxyJump`, agent forwarding and hardware keys all work unmodified. The
+//! `openssh` crate does not cleanly expose `ssh -O forward`, which is the whole
+//! mechanism here.
 //!
-//! nvmux shells out to the system `ssh` so that `~/.ssh/config`, `ProxyJump`,
-//! agent forwarding and hardware keys all work unmodified. Reimplementing that
-//! surface is a project in itself. The `openssh` crate is also unsuitable: it
-//! does not cleanly expose `ssh -O forward`, which is the whole mechanism here.
-//!
-//! # Shape
-//!
-//! One `ControlMaster` per host, reused for everything:
-//!
-//! ```text
-//! ssh -M -N -f -o ControlMaster=yes -o ControlPath=<short> \
-//!     -o ControlPersist=60 -o ExitOnForwardFailure=yes \
-//!     -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-//!     -o StreamLocalBindUnlink=yes <host>
-//! ```
-//!
-//! then per session, onto the *existing* master with no reconnection:
-//!
-//! ```text
-//! ssh -o ControlPath=<ctl> -O forward -L <local_sock>:<remote_sock> <host>
-//! ```
-//!
-//! with `-O cancel` to remove one and `-O check` to test the master.
-//!
-//! # Two things verified the hard way
-//!
-//! * `StreamLocalBindUnlink=yes` must be on the **master** invocation. Setting
-//!   it on the `-O forward` client does nothing, because the master performs the
-//!   bind. Without it: `-O cancel` exits 0 but leaves the local socket file on
-//!   disk, and the next `-O forward` onto that path fails with rc 255 and
-//!   `mux_client_forward: forwarding request failed`. That breaks
-//!   detach-then-reattach, which is the flow this tool exists for. Measured both
-//!   ways. nvmux also unlinks the local path itself before every forward, since
-//!   belt and braces costs one syscall.
-//! * `ssh -O forward` to a *nonexistent* remote socket still exits 0 and creates
-//!   a working local socket. A successful forward is therefore no evidence that
-//!   the remote Neovim is alive; only an RPC round trip through it is.
+//! One `ControlMaster` per host, brought up by [`master_args`]; each session
+//! then adds a unix-socket forward onto that existing master with `-O forward`,
+//! removed with `-O cancel`, tested with `-O check`.
 //!
 //! `ControlPath` is computed by nvmux rather than left to ssh's `%C`/`%h%p%r`
 //! tokens, which expand to unpredictable lengths — see [`crate::config`].
-
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -52,24 +20,19 @@ use crate::shell;
 /// The minimum ssh nvmux supports: 6.7 added unix-socket forwarding.
 pub use crate::nvim::MIN_SSH_VERSION;
 
-/// Options shared by every invocation, master or otherwise.
-///
-/// `BatchMode` is deliberately **not** set: nvmux drives the user's own ssh so
-/// that a passphrase prompt, a hardware key touch, or a 2FA challenge still
-/// works. Those all happen on the master connection, once.
+/// Options shared by every invocation. `BatchMode` is deliberately **not** set:
+/// a passphrase prompt, a hardware key touch or a 2FA challenge must still work.
 fn common(ctl: &Path) -> Vec<String> {
     vec!["-o".into(), format!("ControlPath={}", ctl.display())]
 }
 
 /// Arguments for bringing up the shared master connection.
 ///
-/// `StreamLocalBindUnlink=yes` belongs **here** and nowhere else. The master
-/// performs the bind, so setting it on an `-O forward` client does nothing —
-/// and without it, `-O cancel` leaves the local socket file on disk and the
-/// next forward onto that path fails with rc 255 and
-/// `mux_client_forward: forwarding request failed`. That breaks
-/// detach-then-reattach, which is the flow this tool exists for. Measured both
-/// ways.
+/// `StreamLocalBindUnlink=yes` belongs **here** and nowhere else: the master
+/// performs the bind, so setting it on an `-O forward` client does nothing.
+/// Without it, `-O cancel` leaves the local socket file on disk and the next
+/// forward onto that path fails with rc 255 and `mux_client_forward: forwarding
+/// request failed` — which breaks detach-then-reattach. Measured both ways.
 pub fn master_args(host: &str, ctl: &Path) -> Vec<String> {
     let mut args = vec![
         "-M".into(),
@@ -134,28 +97,17 @@ pub fn exit_args(host: &str, ctl: &Path) -> Vec<String> {
     args
 }
 
-/// Arguments for running a script on the remote host, through a **login** shell.
-///
-/// `ssh host cmd` gives a non-login, non-interactive shell. On most real setups
-/// that means `nvim` and every language server are not on `$PATH`, because they
-/// were put there by `.zprofile` or `.bash_profile`, which only a login shell
-/// reads. Sessions would fail to spawn with a confusing "command not found".
-///
-/// The composed remote command is:
+/// Arguments for running a script on the remote host, through a **login** shell:
 ///
 /// ```text
 /// exec ${SHELL:-/bin/bash} -l -c 'sh -s "$@"' nvmux <args...>
 /// ```
 ///
-/// `$SHELL` expands on the *remote* side, so it is the remote user's shell, with
-/// `bash -l` as the fallback where it is unset. The login shell then runs
-/// `sh -s "$@"`, which reads the script from stdin and receives the arguments as
-/// ordinary positional parameters it never re-parses — so a session name
-/// containing quotes, spaces or `$(...)` is data, not code.
+/// A login shell because `ssh host cmd` does not read `.zprofile`, so `nvim` is
+/// off `$PATH` on most real setups. `$SHELL` expands on the *remote* side.
 ///
-/// Note `-n` must never be added: combined with `sh -s` it silently produces an
-/// *empty* result, because stdin comes from /dev/null and `sh` reads an empty
-/// script and exits 0.
+/// `-n` must never be added: with `sh -s` it silently yields an *empty* result,
+/// because stdin comes from /dev/null and `sh` exits 0.
 pub fn exec_args(host: &str, ctl: &Path, script_args: &[&str]) -> Vec<String> {
     let mut args = common(ctl);
     let remote = format!(
@@ -167,10 +119,8 @@ pub fn exec_args(host: &str, ctl: &Path, script_args: &[&str]) -> Vec<String> {
     args
 }
 
-/// Turn an ssh failure into something a caller can act on.
-///
-/// ssh reports almost everything as exit 255, so the stderr text is the only
-/// signal available.
+/// Turn an ssh failure into something a caller can act on. ssh reports almost
+/// everything as exit 255, so stderr is the only signal available.
 pub fn classify(host: &str, code: i32, stderr: &str) -> SshError {
     let lower = stderr.to_lowercase();
 
@@ -242,19 +192,15 @@ impl Ssh {
             .unwrap_or(false)
     }
 
-    /// Bring up a master connection, or confirm the existing one.
-    ///
-    /// Reusing a live master is what makes per-session forwards cheap: adding
-    /// one costs a round trip on an established connection rather than a fresh
-    /// handshake.
+    /// Bring up a master connection, or confirm the existing one. Reusing a live
+    /// master is what makes per-session forwards cheap.
     pub fn ensure_master(&self) -> Result<(), SshError> {
         if self.is_master_alive() {
             return Ok(());
         }
         self.clear_stale_control_socket();
-        // `-f` backgrounds ssh once authentication is done, so this call blocks
-        // for exactly as long as the user needs to touch a key or type a
-        // passphrase, and returns when the connection is usable.
+        // `-f` backgrounds ssh once authentication is done, so this blocks for
+        // exactly as long as a key touch or passphrase takes.
         let out = self
             .run(&master_args(&self.host, &self.control_path))
             .map_err(|e| spawn_error(e, &self.host))?;
@@ -270,16 +216,13 @@ impl Ssh {
 
     /// Remove a ControlPath left behind by a master that died uncleanly.
     ///
-    /// A master killed with SIGKILL does not unlink its socket, and starting a
-    /// new one over the corpse does **not** fail — ssh prints
-    /// `ControlSocket ... already exists, disabling multiplexing` and exits
-    /// **0**. So multiplexing is silently off, and every later `-O forward`
-    /// fails with no master, which surfaces as a confusing forwarding error
-    /// rather than the truth. Verified: exit code 0, multiplexing disabled.
+    /// A SIGKILLed master does not unlink its socket, and starting a new one
+    /// over the corpse does **not** fail: ssh prints `ControlSocket ... already
+    /// exists, disabling multiplexing` and exits **0**. Multiplexing is then
+    /// silently off and every later `-O forward` fails with no master. Verified.
     ///
-    /// Only called once `-O check` has already said nothing is listening, and
-    /// only for a socket we own — the same standard of evidence the session
-    /// reaper uses, for the same reason.
+    /// Only called once `-O check` has said nothing is listening, and only for
+    /// a socket we own.
     fn clear_stale_control_socket(&self) {
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
         let Ok(meta) = std::fs::symlink_metadata(&self.control_path) else {
@@ -300,28 +243,21 @@ impl Ssh {
         let _ = std::fs::remove_file(&self.control_path);
     }
 
-    /// Point a local socket at a remote one.
-    ///
-    /// Idempotent, which takes more than it looks like. Three things have to be
-    /// true afterwards: the master holds this forward, the local socket file
-    /// exists, and it works.
+    /// Point a local socket at a remote one, idempotently.
     ///
     /// Cancelling first is what makes that hold. If the master already believes
     /// it is forwarding this pair, a second `-O forward` is a **silent no-op**:
-    /// it exits 0 and does not recreate the socket file. So a local socket that
-    /// went missing while the master still had the forward registered — a
-    /// detach that removed the file, a `/tmp` reaper, a crash — would leave a
-    /// forward that reports success and cannot be connected to, and no amount
-    /// of retrying would fix it.
+    /// it exits 0 and does not recreate the socket file. A local socket that
+    /// went missing while the forward was still registered would otherwise leave
+    /// a forward that reports success and cannot be connected to.
     pub fn forward(&self, local: &Path, remote: &Path) -> Result<(), SshError> {
-        // Ignoring the result: cancelling a forward that does not exist fails,
-        // which is exactly the common case and not a problem.
+        // Cancelling a forward that does not exist fails; that is the common
+        // case, not a problem.
         let _ = self.run(&cancel_args(&self.host, &self.control_path, local, remote));
 
-        // Then unlink. `-O cancel` exits 0 without removing the file, and a
-        // forward onto an existing path fails hard. `StreamLocalBindUnlink` on
-        // the master covers this too; doing it here as well costs one syscall
-        // and means a master started by an older nvmux cannot wedge us.
+        // `-O cancel` exits 0 without removing the file, and a forward onto an
+        // existing path fails hard. The master's `StreamLocalBindUnlink` covers
+        // this too, but an older nvmux's master might not have it.
         if let Err(e) = std::fs::remove_file(local) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(path = %local.display(), error = %e, "could not clear local socket");
@@ -352,7 +288,6 @@ impl Ssh {
         let _ = self.run(&exit_args(&self.host, &self.control_path));
     }
 
-    /// Run a script on the remote host and collect its output.
     pub fn run_script(
         &self,
         script: &str,

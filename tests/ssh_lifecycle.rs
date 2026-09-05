@@ -1,22 +1,12 @@
 //! End-to-end tests for the SSH transport, against a real `sshd`.
 //!
-//! These need a host nvmux can actually reach. The host comes from
-//! `$NVMUX_TEST_SSH_HOST`, defaulting to `selftest`; if that host does not
-//! answer, every test here **skips** rather than fails, because a developer
-//! machine has no reason to have one configured.
+//! The host comes from `$NVMUX_TEST_SSH_HOST`, defaulting to `selftest`; where
+//! no such host answers these **skip** rather than fail. The README's
+//! Development section has the `~/.ssh/config` stanza to set one up.
 //!
-//! Set one up like this to run them:
-//!
-//! ```text
-//! Host selftest
-//!   HostName 127.0.0.1
-//!   User <you>
-//!   IdentityFile ~/.ssh/id_ed25519
-//! ```
-//!
-//! Pointing the alias at localhost is not a cheat. It exercises the real ssh
+//! Pointing that alias at localhost is not a cheat: it exercises the real ssh
 //! client, a real ControlMaster, real unix-socket forwarding and a real remote
-//! login shell — everything except network latency.
+//! login shell — everything except latency.
 
 use nvmux::transport::remote::SshTransport;
 use nvmux::transport::Transport;
@@ -86,7 +76,6 @@ fn a_session_created_over_ssh_is_reachable_through_the_forward() {
         "spawn should report a validated remote pid"
     );
 
-    // The seam: a path on THIS machine that speaks to a Neovim on the far side.
     let sock = t.local_socket_for(&session).expect("forward");
     assert!(sock.exists(), "no local socket at {}", sock.display());
     assert!(
@@ -159,7 +148,6 @@ fn a_forward_can_be_torn_down_and_rebuilt() {
     let first = t.local_socket_for(&session).expect("forward");
     assert!(first.exists());
 
-    // Tear the local end down the way a detach does.
     std::fs::remove_file(&first).ok();
 
     // A fresh transport has no memory of the forward, so this exercises the
@@ -293,7 +281,6 @@ fn a_listing_keeps_live_forwards_and_removes_orphaned_ones() {
     let live = t.local_socket_for(&session).expect("forward");
     assert!(live.exists());
 
-    // An orphan: the local end of a forward for a session that does not exist.
     let orphan = live.with_file_name(format!("{}-zzzzzzzz.sock", nvmux::ids::host_token(&host())));
     std::fs::write(&orphan, b"").expect("plant orphan");
 
@@ -306,7 +293,6 @@ fn a_listing_keeps_live_forwards_and_removes_orphaned_ones() {
     );
     assert!(!orphan.exists(), "the orphaned forward was not cleaned up");
 
-    // ...and the live one still works.
     let mut client =
         nvmux::rpc::Client::connect(&live, nvmux::rpc::PROBE_TIMEOUT).expect("still connectable");
     client.api_info().expect("still usable after a listing");

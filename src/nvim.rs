@@ -1,7 +1,5 @@
-//! Finding and version-checking the `nvim` binary.
-//!
-//! Checked up front and reported plainly, because every failure mode here
-//! otherwise surfaces much later as an unexplained connection error.
+//! Finding and version-checking the `nvim` binary, up front, because every
+//! failure here otherwise surfaces later as an unexplained connection error.
 
 use std::process::Command;
 

@@ -1,15 +1,12 @@
-//! End-to-end tests for the local session lifecycle.
+//! End-to-end tests for the local session lifecycle, against real
+//! `nvim --headless` processes — no TUI, no mocks. The failures they exist for
+//! (a session that spawns but is never ready, a stale socket that resurrects a
+//! dead session, a kill that signals the wrong pid) cannot be caught by unit
+//! tests.
 //!
-//! These drive the real [`Transport`] API against real `nvim --headless`
-//! processes — no TUI, no mocks. That is the point: the parts of milestone 2
-//! most likely to break silently (a session that spawns but is never ready, a
-//! stale socket that resurrects a dead session, a kill that signals the wrong
-//! pid) cannot be caught by unit tests.
-//!
-//! Each test gets its own runtime directory so they can run in parallel without
-//! racing, and none of them touch the user's real `/tmp/nvmux-<uid>`.
-//!
-//! They are skipped, not failed, when there is no usable `nvim` on `$PATH`.
+//! Each test gets its own runtime directory, so they run in parallel without
+//! racing and never touch the user's real `/tmp/nvmux-<uid>`. They skip, rather
+//! than fail, when there is no usable `nvim` on `$PATH`.
 
 use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
@@ -44,10 +41,8 @@ impl Drop for Scratch {
         // Kill anything still listening before removing the directory, or
         // stray nvim processes survive the run and pile up across runs.
         //
-        // Signal the recorded pids directly rather than pattern-matching with
-        // `pkill`: the pid in `<id>.json` was validated against its socket at
-        // spawn time, which makes this both precise and immune to any quoting
-        // or metacharacter problem in the path.
+        // Signal the recorded pids directly rather than with `pkill`: the pid
+        // in `<id>.json` was validated against its socket at spawn time.
         if let Ok(entries) = std::fs::read_dir(&self.0) {
             for e in entries.flatten() {
                 let p = e.path();
@@ -114,7 +109,6 @@ fn create_list_and_kill_a_session() {
         "a freshly created session must answer a deferred RPC call"
     );
 
-    // The three files exist, and the socket is not group- or world-accessible.
     let sock = t.local_socket_for(&session).expect("socket path");
     assert!(sock.exists(), "socket missing at {}", sock.display());
     use std::os::unix::fs::PermissionsExt;
@@ -141,9 +135,8 @@ fn the_pid_recorded_is_the_process_serving_the_socket() {
     let session = t.create_session("pidcheck").expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
 
-    // Ask the OS which process actually holds this socket, and require that it
-    // is the pid nvmux would signal. Getting this wrong means SIGKILLing an
-    // unrelated process.
+    // Require that the pid nvmux would signal is the one actually holding this
+    // socket. Getting it wrong means SIGKILLing an unrelated process.
     let out = std::process::Command::new("ps")
         .args(["-ww", "-eo", "pid=,args="])
         .output()
@@ -179,8 +172,7 @@ fn rename_edits_metadata_and_leaves_the_socket_alone() {
     assert_eq!(listed[0].name, "after");
     assert_eq!(listed[0].id, session.id, "rename must not change identity");
 
-    // The whole point of rename-as-metadata-edit: the socket path is stable, so
-    // nothing has to re-listen and no SSH forward has to be rebuilt.
+    // The point of rename-as-metadata-edit: the socket path is stable.
     let sock_after = t.local_socket_for(&listed[0]).expect("socket");
     assert_eq!(sock_before, sock_after, "the socket path must not move");
     assert!(sock_after.exists(), "the socket must still be live");
@@ -213,11 +205,8 @@ fn duplicate_names_are_refused_on_create_and_rename() {
         .expect("self-rename should work");
 }
 
-/// Killing is unconditional: unsaved buffers do not block it and are not
-/// consulted.
-///
-/// The user's route out of a session without losing work is the ordinary editor
-/// one — switch to it and `:q` — not a prompt in the picker.
+/// Killing is unconditional: unsaved buffers neither block it nor are consulted.
+/// The route out without losing work is `:q` in the session itself.
 #[test]
 fn unsaved_buffers_do_not_block_a_kill() {
     require_nvim!();
@@ -227,7 +216,6 @@ fn unsaved_buffers_do_not_block_a_kill() {
     let session = t.create_session("unsaved").expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
 
-    // Make a buffer genuinely modified.
     let mut client = nvmux::rpc::Client::connect(&sock, Duration::from_secs(2)).expect("connect");
     client.command("enew").expect("new buffer");
     client
@@ -350,8 +338,7 @@ fn names_with_shell_metacharacters_survive_a_round_trip() {
     let scratch = Scratch::new("quoting");
     let t = scratch.transport();
 
-    // If quoting were wrong anywhere in the spawn path, these would either fail
-    // to create or come back mangled.
+    // Wrong quoting anywhere in the spawn path would fail or mangle these.
     for name in [
         "my project",
         "it's mine",
@@ -402,11 +389,9 @@ fn a_session_busy_in_cpu_bound_lua_is_never_reaped() {
 
     let listed = t.list_sessions().expect("list");
 
-    // The process is still alive...
     let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok();
     assert!(alive, "precondition: the session should still be running");
 
-    // ...so its socket must still exist and it must still be listed.
     assert!(
         sock.exists(),
         "nvmux deleted the socket of a live session that was merely busy"
@@ -446,7 +431,6 @@ fn a_timed_out_call_poisons_the_connection() {
     let first = client.list_bufs();
     assert!(first.is_err(), "the call should have timed out");
 
-    // The connection must now refuse to be reused rather than return garbage.
     let second = client.list_bufs();
     assert!(
         second.is_err(),
@@ -494,7 +478,6 @@ fn a_recycled_pid_neither_misfires_nor_blocks_the_kill() {
         .expect("run kill.sh");
     let stdout = String::from_utf8_lossy(&out.stdout);
 
-    // The session is found by its socket and killed, despite the bad pid.
     assert!(
         stdout.contains("RESULT killed"),
         "expected the session to be found by socket, got: {stdout}"
@@ -502,7 +485,6 @@ fn a_recycled_pid_neither_misfires_nor_blocks_the_kill() {
     assert!(!sock.exists(), "the socket should have been cleaned up");
     assert!(!json.exists(), "the metadata should have been cleaned up");
 
-    // ...and the innocent process was never touched.
     assert!(
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(decoy.id() as i32), None).is_ok(),
         "kill.sh signalled a process that was not the session"
@@ -524,7 +506,6 @@ fn killing_an_already_dead_session_cleans_up_its_files() {
     let sock = t.local_socket_for(&session).expect("socket");
     let json = sock.with_extension("json");
 
-    // SIGKILL leaves the socket file behind, so the session looks present.
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(session.pid as i32),
         nix::sys::signal::Signal::SIGKILL,
@@ -592,7 +573,6 @@ fn metadata_left_by_a_self_terminating_session_is_swept_up() {
     let json = sock.with_extension("json");
     let log = sock.with_extension("log");
 
-    // A clean exit: nvim removes its own socket and nothing else.
     let mut client = nvmux::rpc::Client::connect(&sock, Duration::from_secs(2)).expect("connect");
     let _ = client.command("qa!");
 

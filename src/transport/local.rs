@@ -14,14 +14,9 @@ use crate::transport::exec::{Executor, LocalExecutor};
 use crate::transport::{finish_listing, protocol, Location, Transport};
 
 /// How long to wait for a new session's socket to appear and accept a
-/// connection.
-///
-/// This is a *reachability* budget, not a readiness one. It deliberately does
-/// not wait for the editor to finish sourcing `init.lua`: a config that clones
-/// plugins on first run, or runs a slow `system()` call at startup, can take far
-/// longer than any timeout worth having here, and a session that is up but still
-/// starting is a perfectly good session. Killing it because it was slow would
-/// destroy work the user can see happening.
+/// connection. A *reachability* budget, not a readiness one: a config that
+/// clones plugins on first run can take far longer than any timeout worth
+/// having here, and a session that is still starting is a good session.
 const REACHABLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -37,12 +32,9 @@ impl LocalTransport {
         Self::with_dir(config::ensure_runtime_dir()?)
     }
 
-    /// Use an explicit runtime directory instead of the default.
-    ///
-    /// Exists so integration tests can drive a real session lifecycle without
-    /// touching (or racing) the user's actual sessions in `/tmp/nvmux-<uid>`.
-    /// The same security check applies: a test directory is still a directory
-    /// we are about to put a socket in.
+    /// Use an explicit runtime directory instead of the default, so integration
+    /// tests do not touch the user's real sessions. The same security check
+    /// applies.
     pub fn with_dir(dir: PathBuf) -> Result<Self> {
         config::ensure_dir_secure(&dir)?;
         Ok(Self {
@@ -61,12 +53,7 @@ impl LocalTransport {
     }
 
     /// Wait until the socket accepts a connection and a real Neovim answers.
-    ///
-    /// Deliberately *not* waiting for a deferred call. `nvim_get_api_info` is
-    /// answered off the main loop, so it proves there is a Neovim behind the
-    /// socket without requiring `init.lua` to have finished — which is the
-    /// distinction that keeps a slow-starting session from being destroyed for
-    /// being slow.
+    /// Deliberately *not* a deferred call — see [`crate::rpc`].
     fn wait_until_reachable(&self, sock: &Path, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -80,10 +67,8 @@ impl LocalTransport {
         false
     }
 
-    /// The last few lines of a session's log, for error messages.
-    ///
-    /// This is the first thing anyone wants when a session will not start, so
-    /// it is included in the error rather than left for the user to find.
+    /// The last few lines of a session's log, included in the error because it
+    /// is the first thing anyone wants when a session will not start.
     fn log_tail(&self, log: &Path) -> String {
         let Ok(body) = std::fs::read_to_string(log) else {
             return "(no log file)".to_string();
@@ -97,19 +82,13 @@ impl LocalTransport {
         }
     }
 
-    /// Whether a socket file is safe to delete as stale.
-    ///
-    /// Three conditions, all required:
-    ///
-    /// * the probe says nothing is listening,
-    /// * `lstat` says the path really is a socket, and
-    /// * we own it.
+    /// Whether a socket file is safe to delete as stale: nothing listening,
+    /// `lstat` says it really is a socket, and we own it.
     ///
     /// The middle check is not paranoia. On `AF_UNIX`, `connect()` returns
-    /// `ECONNREFUSED` for *any* non-listening inode — a regular file gives it,
-    /// and so does a directory, where a naive unlink would hit `EISDIR`. Reaping
-    /// on the errno alone would delete whatever happened to be sitting at that
-    /// path.
+    /// `ECONNREFUSED` for *any* non-listening inode — a regular file does, and
+    /// so does a directory — so reaping on the errno alone would delete whatever
+    /// happened to be sitting at that path.
     fn is_reapable(&self, sock: &Path) -> bool {
         match std::fs::symlink_metadata(sock) {
             Ok(meta) => {
@@ -126,11 +105,9 @@ impl LocalTransport {
                 }
                 true
             }
-            // The path does not exist at all, so there is nothing to reap.
-            //
-            // Note a dangling symlink does NOT arrive here: `symlink_metadata`
-            // succeeds on one, and it is the `is_socket()` check above that
-            // rejects it.
+            // Nothing to reap. A dangling symlink does NOT arrive here:
+            // `symlink_metadata` succeeds on one, and the `is_socket()` check
+            // above is what rejects it.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => {
                 tracing::warn!(path = %sock.display(), error = %e, "refusing to reap");
@@ -169,21 +146,19 @@ impl Transport for LocalTransport {
         for mut s in listed {
             let paths = self.paths(&s.id)?;
 
-            // The script's `kill -0` result is only a hint. Locally the socket
-            // is right here, so replace it with the real answer.
+            // The script's `kill -0` result is only a hint; the socket is right
+            // here, so replace it with the real answer.
             s.state.liveness = rpc::probe(&paths.sock);
 
             match s.state.liveness {
-                // Never reap a busy session. A session blocked in `:!make` is
-                // reachable but cannot answer a deferred call, and deleting it
-                // out from under someone mid-build is unforgivable.
+                // Never reap a busy session: blocked in `:!make` it is
+                // reachable but cannot answer a deferred call.
                 Liveness::Alive | Liveness::Busy => alive.push(s),
                 Liveness::Dead => {
                     if self.is_reapable(&paths.sock) {
                         self.reap(&paths);
                     } else {
-                        // Something is at that path that we will not delete.
-                        // Hide it from the picker but leave it on disk.
+                        // Not ours to delete: hide it, leave it on disk.
                         tracing::debug!(id = %s.id, "dead session left in place");
                     }
                 }
@@ -196,9 +171,8 @@ impl Transport for LocalTransport {
     fn create_session(&self, name: &str) -> Result<Session> {
         crate::session::validate_name(name)?;
 
-        // Names are display metadata and carry no identity, but two sessions
-        // with the same name in one picker is a usability trap, so it is
-        // refused at the point of creation.
+        // Names carry no identity, but two identical ones in a picker is a
+        // usability trap.
         if self
             .list_sessions()?
             .iter()
@@ -216,8 +190,7 @@ impl Transport for LocalTransport {
         let spawned = protocol::parse_spawn(&out.stdout)?;
 
         if !spawned.socket_appeared || !self.wait_until_reachable(&paths.sock, REACHABLE_TIMEOUT) {
-            // Clean up rather than leaving a half-created session lying around,
-            // then report the log, which is what anyone debugging this needs.
+            // Clean up rather than leave a half-created session behind.
             let tail = self.log_tail(&paths.log);
             if let Some(pid) = spawned.pid {
                 let _ = self
@@ -237,10 +210,9 @@ impl Transport for LocalTransport {
         let session = Session::new(id, name.to_string(), spawned.pid.unwrap_or(0));
         session.write_atomic(&paths.json)?;
 
-        // Cheap, and it gives the user a way out that is not `:q`. `command!`
-        // requires an uppercase name — `command! q` is E183 — so the alias
-        // cannot shadow `:q` itself, which is why the README still has to warn
-        // about it. Failure here is not worth failing the create over.
+        // A way out that is not `:q`. `command!` requires an uppercase name
+        // (`command! q` is E183), so this cannot shadow `:q` itself. Failure
+        // here is not worth failing the create over.
         if let Ok(mut client) = rpc::Client::connect(&paths.sock, rpc::CONNECT_TIMEOUT) {
             if let Err(e) = client.command("command! -bar Detach detach") {
                 tracing::debug!(error = %e, "could not install the :Detach alias");
@@ -255,18 +227,10 @@ impl Transport for LocalTransport {
         let paths = self.paths(&s.id)?;
         let dir = self.dir.to_string_lossy().into_owned();
 
-        // Straight to signals. nvmux does not ask the session to quit and does
-        // not consult it about anything: kill means kill. To leave a session
-        // without losing work, switch to it and `:q` — the editor is the
-        // session, so quitting the editor ends it.
-        //
-        // SIGTERM first, inside the script, so nvim still gets to run
-        // VimLeavePre, write its ShaDa file and unlink its own socket. That is
-        // an orderly shutdown, not a request the session could decline.
-        //
-        // The recorded pid is only a starting guess. The script uses it only if
-        // it still owns this session's socket, and otherwise searches by socket
-        // — pids get reused, and the socket is the identity.
+        // Straight to signals — SIGTERM first, inside the script, so nvim still
+        // runs VimLeavePre, writes its ShaDa file and unlinks its own socket.
+        // The recorded pid is only a starting guess: the script uses it only if
+        // it still owns this session's socket, since pids get reused.
         let pid = if s.pid > 1 {
             s.pid.to_string()
         } else {
@@ -279,15 +243,13 @@ impl Transport for LocalTransport {
             tracing::warn!(status = out.status, stderr = %out.stderr, "kill.sh failed");
         }
 
-        // The script removes files only once the session is genuinely gone, and
-        // reports what it actually managed to do. Claiming success regardless
-        // would be the worst outcome available: the session would vanish from
-        // the picker while its Neovim kept running, with no socket left for
-        // nvmux to ever find, show, or kill again.
+        // Files are removed only once the session is genuinely gone. Claiming
+        // success regardless would drop it from the picker while its Neovim kept
+        // running, with no socket left to ever find it by.
         match protocol::parse_kill(&out.stdout)? {
             protocol::KillOutcome::Killed | protocol::KillOutcome::Absent => {
-                // Belt and braces: a socket the script could not remove would
-                // resurrect the session in the next listing.
+                // A socket the script could not remove would resurrect the
+                // session in the next listing.
                 if paths.sock.exists() && self.is_reapable(&paths.sock) {
                     self.reap(&paths);
                 }
@@ -320,10 +282,6 @@ impl Transport for LocalTransport {
 
         let paths = self.paths(&s.id)?;
 
-        // A metadata edit and nothing more. The socket is never renamed or
-        // moved: its path is the session's identity, and the display name is
-        // only data. Renaming the socket would mean re-listening on a second
-        // address and re-pointing any SSH forward, for no benefit.
         let bytes = std::fs::read(&paths.json).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 // The session was killed, or reaped, between the picker
@@ -342,9 +300,8 @@ impl Transport for LocalTransport {
     }
 
     fn local_socket_for(&self, s: &Session) -> Result<PathBuf> {
-        // Locally this is the identity function: the session socket already is
-        // a path on this machine. All the interesting work happens in the SSH
-        // implementation, which is exactly why this is the seam.
+        // Locally the identity function; the SSH implementation is where this
+        // seam earns its keep.
         Ok(self.paths(&s.id)?.sock)
     }
 }

@@ -1,23 +1,18 @@
 //! Shell quoting, and the scripts that run on the session host.
 //!
-//! # Why this needs its own module and real tests
+//! Spawning a remote session crosses **two** layers of shell: `ssh host cmd`
+//! joins its arguments with spaces and the remote login shell parses them again.
+//! Getting this wrong is a command injection, not a cosmetic bug.
 //!
-//! Spawning a remote session goes through **two** layers of shell. `ssh host cmd`
-//! joins its arguments with spaces and hands the result to the remote login
-//! shell, which parses it again. A session named `my "project"` therefore has to
-//! survive being quoted, transported, and re-parsed. Getting this wrong is a
-//! command injection, not a cosmetic bug.
-//!
-//! The approach is to never build a command *string* with interpolated values.
-//! Scripts are fixed text delivered on stdin, and every variable part arrives as
-//! a positional argument (`$1`, `$2`, ...) that the remote shell never re-parses.
-//! [`quote`] exists for the one place a value must be embedded in a word — the
-//! argument list handed to `sh -s`.
+//! So no command *string* is ever built with interpolated values. Scripts are
+//! fixed text delivered on stdin, and every variable part arrives as a
+//! positional argument the remote shell never re-parses. [`quote`] covers the
+//! one place a value must be embedded in a word — the `sh -s` argument list.
 
 /// Single-quote a value so a POSIX shell reads it as exactly one literal word.
 ///
-/// POSIX single quotes have no escape sequences at all, so the only thing that
-/// needs handling is the quote itself: close, insert an escaped quote, reopen.
+/// POSIX single quotes have no escape sequences, so the only case to handle is
+/// the quote itself: close, insert an escaped quote, reopen.
 pub fn quote(s: &str) -> String {
     if !s.is_empty()
         && s.bytes().all(|b| {
@@ -28,8 +23,7 @@ pub fn quote(s: &str) -> String {
                 )
         })
     {
-        // Nothing a shell would look at twice; leave it bare so log lines and
-        // error messages stay readable.
+        // Nothing a shell would look at twice; bare keeps logs readable.
         return s.to_string();
     }
     let mut out = String::with_capacity(s.len() + 2);
@@ -57,32 +51,23 @@ where
         .join(" ")
 }
 
-/// Wrap a command so it runs under the user's **login** shell.
-///
-/// `ssh host cmd` gives a non-login, non-interactive shell. On most real setups
-/// that means `nvim` and every language server are not on `$PATH`, because they
-/// were put there by `.zprofile` / `.bash_profile`, which only a login shell
-/// reads. Sessions would fail to spawn with a confusing "command not found".
-///
-/// `$SHELL` is expanded on the *remote* side, so it is the remote user's shell,
-/// with `bash -l` as the fallback when it is unset (cron-like environments, some
-/// container images).
+/// Wrap a command so it runs under the user's **login** shell — see
+/// [`crate::ssh::exec_args`], which composes the same thing inline.
 pub fn login_shell_wrapper(inner: &str) -> String {
     format!(r#"exec "${{SHELL:-/bin/bash}}" -l -c {}"#, quote(inner))
 }
 
 /// Lists sessions on the host that owns them.
 ///
-/// Batch-shaped on purpose: it returns every session in one invocation, with
-/// liveness already decided. Each `ssh` round trip costs ~230 ms even to
-/// localhost, so a per-session API would be unusable remotely while feeling
-/// perfectly fine in local testing.
+/// Batch-shaped on purpose: every session in one invocation, with liveness
+/// already decided. Each `ssh` round trip costs ~230 ms even to localhost, so a
+/// per-session API would feel fine locally and be unusable over a real link.
 pub const LIST_SCRIPT: &str = include_str!("../scripts/list.sh");
 
-/// Spawns a detached headless nvim. Wired up in milestone 2.
+/// Spawns a detached headless nvim.
 pub const SPAWN_SCRIPT: &str = include_str!("../scripts/spawn.sh");
 
-/// Terminates a session and removes its files. Wired up in milestone 2.
+/// Terminates a session and removes its files.
 pub const KILL_SCRIPT: &str = include_str!("../scripts/kill.sh");
 
 /// Reports a session host's runtime directory and Neovim version at once.
@@ -164,8 +149,7 @@ mod tests {
 
     #[test]
     fn injection_attempts_stay_inert() {
-        // If quoting were wrong, the subshell would run and the output would
-        // differ from the literal text.
+        // If quoting were wrong the subshell would run.
         let evil = "x$(touch /tmp/nvmux-pwned-$$)y";
         assert_eq!(sh_echo(&quote(evil)), evil);
 

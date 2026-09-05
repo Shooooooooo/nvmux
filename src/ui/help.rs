@@ -1,40 +1,24 @@
 //! The key-binding help — a third screen, shown by `Ctrl-t ?`.
 //!
-//! This is a whole screen rather than a popup over the editor, and for a
-//! harder reason than taste. What a popup would sit on top of is Neovim's
-//! screen, and [`crate::pty`] never writes into the child's output, so nothing
-//! can be drawn over the live editor. The one thing nvmux can do is what
-//! `Ctrl-t c` already does: take the terminal the way the prompt takes it,
-//! clear it, draw, and hand the same client back to be repainted on resume. It
-//! keeps the picker's visual language all the same: content centred, one dim
-//! hint row on the last line, no borders, no title, and no colour ever set.
+//! A whole screen rather than a popup for a harder reason than taste: what a
+//! popup would cover is Neovim's screen, and [`crate::pty`] never writes into
+//! the child's output. So this takes the terminal the way the prompt does,
+//! draws, and hands the same client back to repaint on resume.
 //!
-//! # Nothing here knows what a key does
-//!
-//! Every command row comes from [`keys::BINDINGS`], the table
-//! [`keys::Prefix::feed`] itself runs on, so this screen cannot say something
-//! the machine does not do. The two rows that are not commands — `Ctrl-t
-//! Ctrl-t` is a literal, and `Ctrl-t` plus anything else is replayed — are the
-//! machine's `else` branches rather than `Action`s, so they are spelled here
-//! and pinned to the machine by a test. The lone-prefix timeout (a `Ctrl-t`
-//! followed by silence is a literal one) is deliberately not a row: it is not
-//! a keybinding, and the README leaves it out for the same reason.
+//! Every command row comes from [`keys::BINDINGS`], the same table
+//! [`keys::Prefix::feed`] runs on, so this screen cannot claim something the
+//! machine does not do. The two rows that are not commands — `Ctrl-t Ctrl-t` is
+//! a literal, anything else is replayed — are the machine's `else` branches,
+//! spelled here and pinned to it by a test.
 //!
 //! # Why only named keys close it
 //!
-//! `Ctrl-t` reaches this screen as `Key::Char('t')`, because `translate` folds
-//! the control modifier away for everything but `Ctrl-c`, `Ctrl-n` and
-//! `Ctrl-p`. If any key closed the help, a user who read "Ctrl-t d" here and
-//! typed it would close the screen on the `Ctrl-t` and send a bare `d` into
-//! Neovim's normal mode. So `t`, `d` and `c` do nothing here, and only `Esc`,
-//! `q`, `Enter`, `?` and `Ctrl-c` close it. Nothing typed on this screen is
-//! ever forwarded.
-//!
-//! One boundary is shared with the prompt and the picker: keys crossterm has
-//! already parsed when the screen closes never reach Neovim, and are seen by
-//! whichever nvmux screen opens next. Human typing rarely lands two keys in
-//! one read, and the relay reads the terminal directly, so there is no clean
-//! fix from here.
+//! `Ctrl-t` arrives here as `Key::Char('t')`, because `translate` folds the
+//! control modifier away for everything but `Ctrl-c`, `Ctrl-n` and `Ctrl-p`. If
+//! any key closed the help, someone who read "Ctrl-t d" and typed it would
+//! close the screen on the `Ctrl-t` and send a bare `d` into normal mode. So
+//! `t`, `d` and `c` do nothing, and only `Esc`, `q`, `Enter`, `?` and `Ctrl-c`
+//! close it. Nothing typed on this screen is ever forwarded.
 
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::layout::{Alignment, Rect};
@@ -50,12 +34,10 @@ use crate::error::Result;
 use crate::keys::{self, PREFIX_LABEL};
 
 /// Key then action, the picker's hint grammar. `q`, `Enter`, `?` and `Ctrl-c`
-/// also close, unadvertised, the way the picker leaves `g`, `G`, `/` and
-/// `Ctrl-c` off its own hint row.
+/// also close, unadvertised.
 const HINTS: &str = "esc back";
 
-/// Columns between the key column and the description: the same three spaces
-/// that separate groups on the hint line.
+/// Columns between the key column and the description.
 const GAP: usize = 3;
 
 /// One line of the table.
@@ -99,33 +81,25 @@ fn rows() -> Vec<Row> {
 /// key.
 fn on_key(key: Key) -> Step {
     match key {
-        // Ctrl-c closes like esc. Quitting nvmux here would tear the user out
-        // of a live session they only meant to read a key list in.
+        // Closes like esc; quitting here would tear the user out of a live
+        // session they only meant to read a key list in.
         Key::Char('q') | Key::Char('?') | Key::Esc | Key::Enter | Key::CtrlC => Step::Close,
         _ => Step::None,
     }
 }
 
-/// Show the bindings until the user dismisses them.
-///
-/// Runs its own terminal, entering and leaving the alternate screen exactly as
-/// the prompt does, and handing the session back untouched afterwards.
+/// Show the bindings until the user dismisses them, on its own terminal, handing
+/// the session back untouched afterwards.
 pub fn run() -> Result<()> {
-    // Same reasoning as the picker: `draw` never sets a colour, and crossterm's
-    // own NO_COLOR handling would rewrite one into a full SGR reset that wipes
-    // the dim this screen relies on.
+    // See the colour note in the parent module.
     ratatui::crossterm::style::force_color_output(true);
 
     let mut terminal = ratatui::try_init()?;
-    // The session's own alternate screen is still showing, and a second "enter
-    // alternate screen" does not clear it on every terminal: xterm and kitty
-    // treat it as a no-op. ratatui's first draw only paints the cells that
-    // differ from an empty buffer, so without this the table would land in
-    // the middle of the editor's last frame.
+    // A second alternate-screen enter is a no-op on xterm and kitty; see
+    // `ui::run`.
     terminal.clear()?;
     let outcome = run_loop(&mut terminal);
-    // Restore before propagating anything: an error that leaves the terminal in
-    // raw mode with no echo is far worse than the error itself.
+    // Restore before propagating: see `ui::run`.
     ratatui::try_restore()?;
     outcome
 }
@@ -142,7 +116,6 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             // Press only: with the kitty protocol pushed by Neovim, a release
             // would otherwise count as a second keypress.
             Event::Key(k) if k.kind == KeyEventKind::Press => super::translate(k),
-            // A resize just redraws on the next pass.
             _ => continue,
         };
 
@@ -158,8 +131,7 @@ fn draw(frame: &mut Frame, rows: &[Row]) {
         return;
     }
 
-    // The last row is the hint line; everything above it is the table. Same
-    // split as the picker and the prompt, so the three screens line up.
+    // Same split as the picker, so the screens line up.
     let body = Rect {
         height: area.height.saturating_sub(1),
         ..area
@@ -272,17 +244,14 @@ mod tests {
         }
     }
 
-    /// Ctrl-C quits the picker. Doing that here would exit nvmux out from under
-    /// a session the user is still in, so it closes like esc instead.
+    /// Closes like esc, rather than exiting nvmux out from under a live session.
     #[test]
     fn ctrl_c_closes_rather_than_quitting() {
         assert_eq!(on_key(Key::CtrlC), Step::Close);
     }
 
-    /// `Ctrl-t` arrives here as `Key::Char('t')`. If it closed the help, a
-    /// chord typed from this screen would be half-forwarded: the help would
-    /// close on the `Ctrl-t` and the next key would land in Neovim's normal
-    /// mode.
+    /// `Ctrl-t` arrives here as `Key::Char('t')`; if it closed the help, a chord
+    /// typed from this screen would be half-forwarded.
     #[test]
     fn the_prefix_and_its_command_letters_do_nothing_here() {
         for key in [
@@ -381,10 +350,8 @@ mod tests {
         let lines = render(62, 11);
         assert_eq!(lines.len(), 11);
 
-        // The hint line is the last row, and nothing else is on it.
         assert_eq!(lines[10].trim(), HINTS, "hints should be on the last row");
 
-        // Six rows in a 10-row body: centred means rows 2 to 7.
         let occupied: Vec<usize> = lines[..10]
             .iter()
             .enumerate()
@@ -397,7 +364,6 @@ mod tests {
             "table is not vertically centred: {lines:#?}"
         );
 
-        // And horizontally: the gap on the left should match the gap on the right.
         let row = &lines[2];
         let left = row.len() - row.trim_start().len();
         let right = 62 - row.width();
@@ -406,7 +372,6 @@ mod tests {
             "not horizontally centred: {left} left, {right} right, row {row:?}"
         );
 
-        // No borders, no title, no header, no box drawing anywhere.
         for line in &lines {
             for ch in "┌┐└┘─│├┤┬┴┼╭╮╰╯═║".chars() {
                 assert!(!line.contains(ch), "found border char {ch:?} in {line:?}");
@@ -451,7 +416,6 @@ mod tests {
             for line in &lines {
                 assert!(line.width() <= w as usize, "{w}x{h}: overflowed: {line:?}");
             }
-            // The hint stays alone on the last row, and nothing wrapped onto it.
             let last = &lines[h as usize - 1];
             assert_eq!(last.trim(), HINTS, "{w}x{h}: {lines:#?}");
             assert!(
@@ -459,7 +423,6 @@ mod tests {
                 "{w}x{h}: the hint wrapped upward: {lines:#?}"
             );
         }
-        // 20x5 has a four-row body, so four table rows show, cut to the width.
         let lines = render(20, 5);
         let body: Vec<&String> = lines[..4].iter().filter(|l| !l.is_empty()).collect();
         assert_eq!(body.len(), 4, "{lines:#?}");
@@ -472,8 +435,7 @@ mod tests {
         }
     }
 
-    /// Same rule as the picker: no SGR colour, so the screen inherits the
-    /// terminal's palette and is correct under NO_COLOR without testing for it.
+    /// No SGR colour, so the screen is correct under NO_COLOR by construction.
     #[test]
     fn nothing_sets_a_colour() {
         use ratatui::style::Color;
