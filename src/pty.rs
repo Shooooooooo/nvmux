@@ -99,7 +99,10 @@ pub enum Outcome {
     ToPicker,
     /// `Ctrl-t d` — detach and exit, leaving the session running.
     Detached,
-    /// `Ctrl-t c` — create a new session and attach to it.
+    /// `Ctrl-t c` — prompt for a name and create a new session. Like
+    /// [`Outcome::ToPicker`] the child keeps running and comes back alongside
+    /// this, because the prompt can be cancelled and the user put straight back
+    /// where they were.
     CreateNew,
     /// The child exited on its own.
     ChildExited,
@@ -244,11 +247,13 @@ pub fn relay(mut attachment: Attachment) -> Result<(Outcome, Option<Attachment>)
     let outcome = pump(&mut attachment, master_fd, &winch);
 
     match outcome {
-        // Going back to the picker keeps the child, so there is no restore
-        // sequence to wait for; ratatui is about to own the screen anyway.
-        Ok(Outcome::ToPicker) => {
+        // The picker and the new-session prompt both keep the child, so there is
+        // no restore sequence to wait for; ratatui is about to own the screen
+        // anyway. Either one can be backed out of, and resuming a live client is
+        // what makes that free.
+        Ok(held @ (Outcome::ToPicker | Outcome::CreateNew)) => {
             raw.restore();
-            Ok((Outcome::ToPicker, Some(attachment)))
+            Ok((held, Some(attachment)))
         }
         Ok(other) => {
             // Let the child put the terminal back itself. It emits its own full

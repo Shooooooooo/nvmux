@@ -45,13 +45,16 @@ fn run(cli: &Cli) -> Result<()> {
 ///
 /// The attachment is carried across iterations so that `Ctrl-t t` can come back
 /// to the *same* client rather than starting a new one, which is what makes
-/// returning to the picker feel free.
+/// returning to the picker feel free. `Ctrl-t c` rides on the same machinery:
+/// the client survives the prompt, so cancelling it costs nothing either.
 fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     let mut attached: Option<pty::Attachment> = None;
     let mut message: Option<String> = None;
 
     loop {
-        let chosen = match ui::run(transport, message.take())? {
+        // The session the inner loop is about. `Ctrl-t c` moves it to the
+        // session it just created; everything else leaves it alone.
+        let mut current = match ui::run(transport, message.take())? {
             ui::Outcome::Quit => break,
             ui::Outcome::Attach(session) => session,
         };
@@ -59,15 +62,15 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
         loop {
             let opened = match attached.take() {
                 // Same session: resume the client that is already running.
-                Some(a) if a.session_id == chosen.id => Ok(a),
+                Some(a) if a.session_id == current.id => Ok(a),
                 // A different session was attached; that client is finished
                 // with. Its server keeps running — killing a --remote-ui client
                 // does not kill a --headless --listen server.
                 Some(other) => {
                     other.terminate();
-                    new_attachment(transport, &chosen)
+                    new_attachment(transport, &current)
                 }
-                None => new_attachment(transport, &chosen),
+                None => new_attachment(transport, &current),
             };
 
             // A failed attach must not end the program. A dropped connection,
@@ -89,19 +92,17 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 }
                 (pty::Outcome::Detached, _) => return Ok(()),
                 (pty::Outcome::ChildExited, _) => break,
-                (pty::Outcome::CreateNew, _) => {
-                    // Ctrl-t c: straight into a new session without a detour
-                    // through the picker.
-                    match transport.create_session(&next_name(transport)?) {
-                        Ok(session) => {
-                            attached = Some(new_attachment(transport, &session)?);
-                            continue;
-                        }
-                        Err(e) => {
-                            eprintln!("nvmux: {e}");
-                            break;
-                        }
+                (pty::Outcome::CreateNew, held) => {
+                    // Ctrl-t c: name a new session and go straight to it,
+                    // without a detour through the picker. The old client is
+                    // held onto rather than killed, so a cancelled prompt just
+                    // resumes it; naming one instead moves `current`, and the
+                    // match above then retires the old client for us.
+                    attached = held;
+                    if let ui::prompt::Outcome::Created(session) = ui::prompt::run(transport)? {
+                        current = session;
                     }
+                    continue;
                 }
             }
         }
@@ -139,20 +140,4 @@ fn new_attachment(
 ) -> nvmux::Result<pty::Attachment> {
     let sock = transport.local_socket_for(session)?;
     pty::spawn(&session.id, &sock)
-}
-
-/// A name for a session created with `Ctrl-t c`, which has no prompt to type in.
-fn next_name(transport: &dyn transport::Transport) -> Result<String> {
-    let taken: Vec<String> = transport
-        .list_sessions()?
-        .into_iter()
-        .map(|s| s.name.to_lowercase())
-        .collect();
-    for n in 1..1000 {
-        let candidate = format!("session {n}");
-        if !taken.contains(&candidate) {
-            return Ok(candidate);
-        }
-    }
-    Ok("session".to_string())
 }
