@@ -109,6 +109,13 @@ where
     crate::keys::parse_prefix(&s).map_err(serde::de::Error::custom)
 }
 
+/// Ceilings for the numeric knobs. Generous — nobody wants a minute-long fade —
+/// but finite, because every one of these goes into a `sleep` or a `poll`
+/// timeout and an absurd value is a hang, not a slow transition.
+const MAX_FRAMES: usize = 1_000;
+const MAX_DELAY_MS: u64 = 10_000;
+const MAX_TIMEOUT_MS: u64 = 60_000;
+
 impl Settings {
     /// Rules that the deserializer cannot express. Kept minimal: only values that
     /// would misbehave at runtime, not taste.
@@ -116,6 +123,27 @@ impl Settings {
         if self.fade.frames == 0 {
             // `step / frames` would be a division by zero -> NaN coverage.
             return Err("fade.frames must be at least 1".into());
+        }
+        if self.fade.frames > MAX_FRAMES {
+            return Err(format!("fade.frames must be at most {MAX_FRAMES}"));
+        }
+        if self.fade.frame_delay_ms > MAX_DELAY_MS {
+            return Err(format!(
+                "fade.frame_delay_ms must be at most {MAX_DELAY_MS}"
+            ));
+        }
+        if self.fade.hold_ms > MAX_DELAY_MS {
+            return Err(format!("fade.hold_ms must be at most {MAX_DELAY_MS}"));
+        }
+        if self.keys.timeout_ms == 0 {
+            // A zero poll timeout spins the relay at full speed while a prefix
+            // is armed, and a number could never be typed.
+            return Err("keys.timeout_ms must be at least 1".into());
+        }
+        if self.keys.timeout_ms > MAX_TIMEOUT_MS {
+            // Beyond `c_int` this would wrap negative and `poll` would block
+            // forever; well before that it is a prefix that never resolves.
+            return Err(format!("keys.timeout_ms must be at most {MAX_TIMEOUT_MS}"));
         }
         Ok(())
     }
@@ -426,6 +454,38 @@ mod tests {
     fn zero_frames_is_rejected() {
         let err = parse(Path::new("test.toml"), "[fade]\nframes = 0\n").expect_err("invalid");
         assert!(matches!(err, ConfigError::Invalid { .. }), "got {err:?}");
+    }
+
+    /// Every numeric knob feeds a `sleep` or a `poll` timeout, so each has a
+    /// ceiling; the largest values that pass are also pinned so the ceilings
+    /// stay generous.
+    #[test]
+    fn out_of_range_values_are_rejected_with_their_key_named() {
+        let cases = [
+            ("[fade]\nframes = 1001\n", "fade.frames"),
+            ("[fade]\nframe_delay_ms = 10001\n", "fade.frame_delay_ms"),
+            ("[fade]\nhold_ms = 10001\n", "fade.hold_ms"),
+            ("[keys]\ntimeout_ms = 0\n", "keys.timeout_ms"),
+            ("[keys]\ntimeout_ms = 60001\n", "keys.timeout_ms"),
+            // Past `c_int`: the value `poll` would have read as "block forever".
+            ("[keys]\ntimeout_ms = 3000000000\n", "keys.timeout_ms"),
+        ];
+        for (doc, key) in cases {
+            let err = parse(Path::new("test.toml"), doc).expect_err(doc);
+            match err {
+                ConfigError::Invalid { message, .. } => {
+                    assert!(message.contains(key), "{doc:?} -> {message:?}")
+                }
+                other => panic!("{doc:?}: expected Invalid, got {other:?}"),
+            }
+        }
+        for doc in [
+            "[fade]\nframes = 1000\nframe_delay_ms = 10000\nhold_ms = 10000\n",
+            "[keys]\ntimeout_ms = 1\n",
+            "[keys]\ntimeout_ms = 60000\n",
+        ] {
+            parse(Path::new("test.toml"), doc).expect(doc);
+        }
     }
 
     // --- first-run template (pure) -----------------------------------------

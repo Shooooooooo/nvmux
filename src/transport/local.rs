@@ -189,14 +189,21 @@ impl Transport for LocalTransport {
         let spawned = protocol::parse_spawn(&out.stdout)?;
 
         if !spawned.socket_appeared || !self.wait_until_reachable(&paths.sock, REACHABLE_TIMEOUT) {
-            // Clean up rather than leave a half-created session behind.
+            // Clean up rather than leave a half-created session behind — but
+            // through the kill script, which removes the files only once it
+            // has seen the process go. Unlinking the socket here on the
+            // strength of "it did not answer in time" would orphan a Neovim
+            // that was merely slow to start. An empty pid is fine: the script
+            // finds the process by its socket, the pid is only a hint.
             let tail = self.log_tail(&paths.log);
-            if let Some(pid) = spawned.pid {
-                let _ = self
-                    .exec
-                    .run_script(shell::KILL_SCRIPT, &[&dir, &id, &pid.to_string()]);
+            let pid = spawned.pid.map(|p| p.to_string()).unwrap_or_default();
+            match self.exec.run_script(shell::KILL_SCRIPT, &[&dir, &id, &pid]) {
+                Ok(out) => match protocol::parse_kill(&out.stdout) {
+                    Ok(outcome) => tracing::debug!(%id, ?outcome, "cleaned up a failed create"),
+                    Err(e) => tracing::warn!(%id, error = %e, "cleanup after a failed create"),
+                },
+                Err(e) => tracing::warn!(%id, error = %e, "cleanup after a failed create"),
             }
-            self.reap(&paths);
             return Err(SessionError::NotReady {
                 name: name.to_string(),
                 timeout: REACHABLE_TIMEOUT,

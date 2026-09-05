@@ -17,6 +17,10 @@ fn main() -> Result<()> {
     // in `run` — restrict the umask: see `config::restrict_umask`.
     config::restrict_umask();
 
+    // Before any screen is drawn, so a `kill` during the picker — not only
+    // during an attached session — hands back a usable terminal.
+    nvmux::term::install_signal_safety_net();
+
     if let Err(e) = run(&cli) {
         // A plain message, no backtrace: every error here is meant to be
         // actionable on its own.
@@ -82,7 +86,14 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     loop {
         // `<prefix> c` moves this to the session it just created.
         let (mut current, mut highest) = match ui::run(transport, message.take())? {
-            ui::Outcome::Quit => break,
+            ui::Outcome::Quit => {
+                // A client held across `<prefix> t` is retired explicitly; its
+                // `Drop` would do the same, this just says so.
+                if let Some(a) = attached.take() {
+                    a.terminate();
+                }
+                break;
+            }
             ui::Outcome::Attach { session, highest } => (session, highest),
         };
 
@@ -113,7 +124,10 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     attached = held;
                     break;
                 }
-                (pty::Outcome::Detached, _) => return Ok(()),
+                // The session keeps running either way: on `<prefix> d`
+                // because the user asked, on a closed stdin because there is
+                // no terminal left to ask from.
+                (pty::Outcome::Detached | pty::Outcome::StdinClosed, _) => return Ok(()),
                 (pty::Outcome::ChildExited, _) => break,
                 (pty::Outcome::CreateNew, held) => {
                     // Held rather than killed, so a cancelled prompt resumes it.

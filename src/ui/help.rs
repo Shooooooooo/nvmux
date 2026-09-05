@@ -13,11 +13,11 @@
 //!
 //! # Why only named keys close it
 //!
-//! `Ctrl-t` arrives here as `Key::Char('t')`, because `translate` folds the
-//! control modifier away for everything but `Ctrl-c`, `Ctrl-n` and `Ctrl-p`. If
-//! any key closed the help, someone who read "Ctrl-t d" and typed it would
-//! close the screen on the `Ctrl-t` and send a bare `d` into normal mode. So
-//! `t`, `d` and `c` do nothing, and only `Esc`, `q`, `Enter`, `?` and `Ctrl-c`
+//! `<prefix>` arrives here as `Key::Other`, because `translate` turns every
+//! control chord but `Ctrl-c`, `Ctrl-n` and `Ctrl-p` into nothing. If any key
+//! closed the help, someone who read "Ctrl-t d" and typed it would close the
+//! screen on the `Ctrl-t` and send a bare `d` into normal mode. So `t`, `d`,
+//! `c` and `Other` do nothing, and only `Esc`, `q`, `Enter`, `?` and `Ctrl-c`
 //! close it. Nothing typed on this screen is ever forwarded.
 
 use std::borrow::Cow;
@@ -92,9 +92,8 @@ fn rows(prefix: &str) -> Vec<Row> {
 }
 
 /// Named keys only. `t`, `d` and `c` — and therefore `Ctrl-t`, which arrives
-/// as `Key::Char('t')` — are deliberately not here: a chord typed while the
-/// help is open must do nothing, not close the help and forward its second
-/// key.
+/// as `Key::Other` — are deliberately not here: a chord typed while the help
+/// is open must do nothing, not close the help and forward its second key.
 fn on_key(key: Key) -> Step {
     match key {
         // Closes like esc; quitting here would tear the user out of a live
@@ -107,20 +106,11 @@ fn on_key(key: Key) -> Step {
 /// Show the bindings until the user dismisses them, on its own terminal, handing
 /// the session back untouched afterwards.
 pub fn run() -> Result<()> {
-    // See the colour note in the parent module.
-    ratatui::crossterm::style::force_color_output(true);
-
-    let mut terminal = ratatui::try_init()?;
-    // A second alternate-screen enter is a no-op on xterm and kitty; see
-    // `ui::run`.
-    terminal.clear()?;
     // Reached from a session that has already dissolved to black, so start black.
-    if crate::fade::excursions() {
-        crate::fade::prime_black(&mut terminal)?;
-    }
-    let outcome = run_loop(&mut terminal);
-    // Restore before propagating: see `ui::run`.
-    ratatui::try_restore()?;
+    let mut screen = super::Screen::open(crate::fade::excursions())?;
+    let outcome = run_loop(screen.terminal());
+    // Restore before propagating: see `ui::Screen`.
+    screen.close()?;
     outcome
 }
 
@@ -278,8 +268,9 @@ mod tests {
         assert_eq!(on_key(Key::CtrlC), Step::Close);
     }
 
-    /// `Ctrl-t` arrives here as `Key::Char('t')`; if it closed the help, a chord
-    /// typed from this screen would be half-forwarded.
+    /// `<prefix>` arrives here as `Key::Other`, and its command letters as
+    /// themselves; if any of them closed the help, a chord typed from this
+    /// screen would be half-forwarded.
     #[test]
     fn the_prefix_and_its_command_letters_do_nothing_here() {
         for key in [

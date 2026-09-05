@@ -4,8 +4,8 @@
 //! unset, and the terminal is interactive (see the guards there). It takes the
 //! whole screen the way [`crate::ui::help`] does, but reads keys *raw*: the user
 //! presses the actual `Ctrl-<letter>` chord they want, so this is the one place
-//! that must **not** go through `translate`, which folds the CONTROL
-//! modifier away (see the note in [`crate::ui`]). The pressed chord is validated
+//! that must **not** go through `translate`, which discards every chord it does
+//! not bind (see the note in [`crate::ui`]). The pressed chord is validated
 //! by the same [`crate::keys::parse_prefix`] the config file uses, so the rules
 //! and the messages are shared.
 //!
@@ -78,14 +78,10 @@ struct State {
 /// Show the screen until the user confirms or skips. Owns the terminal, like
 /// [`crate::ui::help::run`]; no fade, because nothing has faded to black yet.
 pub fn run() -> Result<Outcome> {
-    // See the colour note in the parent module.
-    ratatui::crossterm::style::force_color_output(true);
-
-    let mut terminal = ratatui::try_init()?;
-    terminal.clear()?;
-    let outcome = run_loop(&mut terminal);
-    // Restore before propagating: see `ui::run`.
-    ratatui::try_restore()?;
+    let mut screen = super::Screen::open(false)?;
+    let outcome = run_loop(screen.terminal());
+    // Restore before propagating: see `ui::Screen`.
+    screen.close()?;
     outcome
 }
 
@@ -100,7 +96,8 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Outcome> {
         if !event::poll(super::TICK)? {
             continue;
         }
-        // Read the RAW event — `translate` would fold the CONTROL modifier away.
+        // Read the RAW event — `translate` discards every chord but the three
+        // it binds, and the whole point here is to see which chord was pressed.
         let (code, ctrl) = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => {
                 (k.code, k.modifiers.contains(KeyModifiers::CONTROL))

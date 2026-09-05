@@ -149,20 +149,11 @@ impl Prompt {
 /// Ask for a name for a new session, owning the terminal while it does — for
 /// `<prefix> c`, which arrives from an attached session with none to borrow.
 pub fn run(transport: &dyn Transport) -> Result<Outcome> {
-    // See the colour note in the parent module.
-    ratatui::crossterm::style::force_color_output(true);
-
-    let mut terminal = ratatui::try_init()?;
-    // A second alternate-screen enter is a no-op on xterm and kitty; see
-    // `ui::run`.
-    terminal.clear()?;
     // Reached from a session that has already dissolved to black, so start black.
-    if crate::fade::excursions() {
-        crate::fade::prime_black(&mut terminal)?;
-    }
-    let outcome = run_on(&mut terminal, transport, Task::Create, true);
-    // Restore before propagating: see `ui::run`.
-    ratatui::try_restore()?;
+    let mut screen = super::Screen::open(crate::fade::excursions())?;
+    let outcome = run_on(screen.terminal(), transport, Task::Create, true);
+    // Restore before propagating: see `ui::Screen`.
+    screen.close()?;
     outcome
 }
 

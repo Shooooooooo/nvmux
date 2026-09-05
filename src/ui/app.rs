@@ -177,7 +177,11 @@ impl App {
     /// genuinely ambiguous one (sessions 1 and 12 both present) waits, and the
     /// caller resolves that with [`App::resolve_pending`].
     fn on_digit(&mut self, d: u32) -> Request {
-        let Some(n) = self.pending.take().map(|p| p.saturating_mul(10) + d) else {
+        let Some(n) = self
+            .pending
+            .take()
+            .map(|p| p.saturating_mul(10).saturating_add(d))
+        else {
             // A session number never starts with 0, so a leading one is not the
             // beginning of anything.
             if d == 0 {

@@ -62,31 +62,89 @@ use app::{App, Key, Request};
 /// behind an idle keyboard.
 const TICK: Duration = Duration::from_millis(250);
 
+/// A ratatui screen that is guaranteed to be given back.
+///
+/// `ratatui::try_init` enables raw mode and enters the alternate screen, and
+/// nothing undoes that on `Drop` — so every `?` between init and restore was a
+/// way to leave the user's shell with no echo. This guard owns the terminal
+/// for one screen; dropping it restores, whatever path led there. The picker,
+/// the prompt, the help and the first-run screen all open through here.
+pub(crate) struct Screen {
+    terminal: ratatui::DefaultTerminal,
+    /// Set by the explicit closes so `Drop` does not restore a second time.
+    closed: bool,
+}
+
+impl Screen {
+    /// Take the terminal. `prime` paints a first black frame before anything
+    /// else happens, for a screen that is entered from black.
+    pub(crate) fn open(prime: bool) -> Result<Self> {
+        // Stops crossterm second-guessing us; see the module docs on colour.
+        ratatui::crossterm::style::force_color_output(true);
+
+        let mut screen = Self {
+            terminal: ratatui::try_init()?,
+            closed: false,
+        };
+        // A second "enter alternate screen" is a no-op on xterm and kitty, and
+        // ratatui's first draw only paints what differs from an empty buffer —
+        // so without this the content lands in the middle of the editor's last
+        // frame. From here on an error restores through `Drop`.
+        screen.terminal.clear()?;
+        if prime {
+            // Before the slow work (a session listing) that precedes the first
+            // real draw, so entering the alternate screen does not flash its
+            // blank buffer.
+            crate::fade::prime_black(&mut screen.terminal)?;
+        }
+        Ok(screen)
+    }
+
+    pub(crate) fn terminal(&mut self) -> &mut ratatui::DefaultTerminal {
+        &mut self.terminal
+    }
+
+    /// Give the terminal back, reporting a failure to do so.
+    pub(crate) fn close(mut self) -> Result<()> {
+        self.closed = true;
+        ratatui::try_restore()?;
+        crate::fade::show_cursor_if_enabled();
+        Ok(())
+    }
+
+    /// Give the terminal back as a black primary screen, for the attach path:
+    /// the client spawn that follows then never flashes the old primary.
+    pub(crate) fn close_to_black(mut self) -> Result<()> {
+        self.closed = true;
+        crate::fade::leave_ratatui_to_black()?;
+        Ok(())
+    }
+}
+
+impl Drop for Screen {
+    fn drop(&mut self) {
+        if !self.closed {
+            // The error path: `restore` reports a failure on stderr and goes
+            // on, which is all that can be done while an error is already in
+            // flight. Show the cursor too, in case a fade had hidden it.
+            ratatui::restore();
+            crate::fade::show_cursor_if_enabled();
+        }
+    }
+}
+
 /// Run the picker until the user attaches or quits. `message` replaces the hint
 /// row — how a failed attach reports itself without exiting the program.
 pub fn run(transport: &dyn Transport, message: Option<String>) -> Result<Outcome> {
-    // Stops crossterm second-guessing us; see the module docs on colour.
-    ratatui::crossterm::style::force_color_output(true);
-
-    let mut terminal = ratatui::try_init()?;
-    // A second "enter alternate screen" is a no-op on xterm and kitty, and
-    // ratatui's first draw only paints what differs from an empty buffer — so
-    // without this the list lands in the middle of the editor's last frame.
-    terminal.clear()?;
-    // Start black, before the session listing that precedes the first real draw,
-    // so entering the alternate screen does not flash its blank buffer.
-    crate::fade::prime_black(&mut terminal)?;
-    let outcome = run_loop(&mut terminal, transport, message);
+    let mut screen = Screen::open(true)?;
+    let outcome = run_loop(screen.terminal(), transport, message);
     // Restore before propagating anything: an error that leaves the terminal in
     // raw mode with no echo is far worse than the error itself. On the attach
     // path, leave straight into a black primary screen so the client spawn that
     // follows never flashes the old primary; otherwise restore as before.
     match &outcome {
-        Ok(Outcome::Attach { .. }) => crate::fade::leave_ratatui_to_black()?,
-        _ => {
-            ratatui::try_restore()?;
-            crate::fade::show_cursor_if_enabled();
-        }
+        Ok(Outcome::Attach { .. }) => screen.close_to_black()?,
+        _ => screen.close()?,
     }
     outcome
 }
@@ -219,11 +277,20 @@ fn one_line(e: &crate::error::NvmuxError) -> String {
     e.to_string().lines().collect::<Vec<_>>().join(" — ")
 }
 
+/// Reduce a crossterm event to the keys the screens understand.
+///
+/// A control chord is either one of the three that are bound (`Ctrl-c`,
+/// `Ctrl-n`, `Ctrl-p`) or nothing at all — never the bare letter. The prefix
+/// is configurable, and someone who reflexively types `<prefix>` on the picker
+/// must not find that `Ctrl-x` opened the kill confirm or `Ctrl-q` quit; nor
+/// should a chord typed on the help screen close it and forward its second key.
 fn translate(k: KeyEvent) -> Key {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     match k.code {
-        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => Key::CtrlC,
-        KeyCode::Char('n') if k.modifiers.contains(KeyModifiers::CONTROL) => Key::CtrlN,
-        KeyCode::Char('p') if k.modifiers.contains(KeyModifiers::CONTROL) => Key::CtrlP,
+        KeyCode::Char('c') if ctrl => Key::CtrlC,
+        KeyCode::Char('n') if ctrl => Key::CtrlN,
+        KeyCode::Char('p') if ctrl => Key::CtrlP,
+        KeyCode::Char(_) if ctrl => Key::Other,
         KeyCode::Char(c) => Key::Char(c),
         KeyCode::Enter => Key::Enter,
         KeyCode::Esc => Key::Esc,
@@ -252,16 +319,19 @@ mod tests {
         );
     }
 
-    /// Ctrl-t gets no key of its own; only Ctrl-c, Ctrl-n and Ctrl-p do.
-    /// `help::on_key` relies on this: `Ctrl-t` typed on the help screen has
-    /// to look like a plain `t`, which that screen ignores, or a chord typed
-    /// there would be half-forwarded.
+    /// Only Ctrl-c, Ctrl-n and Ctrl-p are keys of their own; every other
+    /// chord is nothing. The prefix is one of these (Ctrl-t by default, but
+    /// configurable), and `Ctrl-x`, `Ctrl-q`, `Ctrl-r`, `Ctrl-y` all name
+    /// picker commands as bare letters.
     #[test]
-    fn ctrl_t_arrives_as_a_plain_t() {
-        assert_eq!(
-            translate(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
-            Key::Char('t')
-        );
+    fn other_control_chords_are_ignored_not_folded_to_letters() {
+        for c in ['t', 'x', 'q', 'r', 'y', 'g', 'a', 'd'] {
+            assert_eq!(
+                translate(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)),
+                Key::Other,
+                "Ctrl-{c} must not act as a plain {c}"
+            );
+        }
     }
 
     #[test]
