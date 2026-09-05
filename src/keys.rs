@@ -1,4 +1,4 @@
-//! The `Ctrl-t` prefix state machine.
+//! The `<prefix>` prefix state machine.
 //!
 //! This sits in the stdin half of the PTY proxy and is the *only* thing that
 //! inspects the byte stream on the way to Neovim; the child-to-terminal
@@ -17,10 +17,10 @@
 //!
 //! # Digits
 //!
-//! `C-t 1` through `C-t 9` select a session by its number, and a number may run
+//! `<prefix> 1` through `<prefix> 9` select a session by its number, and a number may run
 //! to several digits. That means a digit after the prefix is *always* a command
-//! and no longer reaches Neovim — `C-t C-t 1` is the way to send it. `0` is the
-//! exception: no session number starts with one, so `C-t 0` replays both bytes
+//! and no longer reaches Neovim — `<prefix> <prefix> 1` is the way to send it. `0` is the
+//! exception: no session number starts with one, so `<prefix> 0` replays both bytes
 //! like any other non-command.
 //!
 //! Multi-digit numbers need a moment to see whether another digit follows, and
@@ -37,21 +37,21 @@ pub const PREFIX: u8 = 0x14;
 pub const PREFIX_LABEL: &str = "Ctrl-t";
 
 /// How long to wait for the second byte of a prefix sequence before deciding
-/// the user meant a literal `Ctrl-t`.
+/// the user meant a literal `<prefix>`.
 pub const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Something the proxy must do instead of forwarding bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// `C-t t` — suspend the relay and show the picker. The child stays alive.
+    /// `<prefix> t` — suspend the relay and show the picker. The child stays alive.
     Picker,
-    /// `C-t d` — terminate the local UI and exit, leaving the server running.
+    /// `<prefix> d` — terminate the local UI and exit, leaving the server running.
     Detach,
-    /// `C-t c` — create a new session and attach to it.
+    /// `<prefix> c` — create a new session and attach to it.
     Create,
-    /// `C-t ?` — show the key bindings. The child stays alive.
+    /// `<prefix> ?` — show the key bindings. The child stays alive.
     Help,
-    /// `C-t <number>` — attach to the session with that number, leaving this
+    /// `<prefix> <number>` — attach to the session with that number, leaving this
     /// one running. The only action with no [`BINDINGS`] row: one row cannot
     /// stand for nine keys, so digits are a rule in [`Prefix::feed`] instead.
     Switch(u32),
@@ -66,7 +66,7 @@ pub enum Step {
     Act(Action),
 }
 
-/// One `C-t` command: the byte that selects it, what it does, and how the help
+/// One `<prefix>` command: the byte that selects it, what it does, and how the help
 /// screen describes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Binding {
@@ -164,7 +164,7 @@ enum State {
     /// Ordinary bytes, passing straight through.
     #[default]
     Idle,
-    /// A `C-t` has been swallowed and we are waiting to see what follows.
+    /// A `<prefix>` has been swallowed and we are waiting to see what follows.
     Armed,
     /// Digits are accumulating into a session number.
     Number(u32),
@@ -214,7 +214,7 @@ impl Prefix {
     }
 
     /// True if the machine is mid-sequence and a [`TIMEOUT`] must be armed —
-    /// either a lone `C-t` or a half-typed number. The caller polls on the
+    /// either a lone `<prefix>` or a half-typed number. The caller polls on the
     /// short timeout while this holds, so a number does not resolve late.
     pub fn is_armed(&self) -> bool {
         self.state != State::Idle
@@ -247,12 +247,12 @@ impl Prefix {
                 State::Armed => {
                     self.state = State::Idle;
                     if b == self.prefix {
-                        // C-t C-t: one literal prefix byte reaches Neovim.
+                        // <prefix> <prefix>: one literal prefix byte reaches Neovim.
                         // Checked before everything else, so no rule and no row
                         // can ever shadow it.
                         pending.push(self.prefix);
                     } else if (b'1'..=b'9').contains(&b) {
-                        // A number never starts with 0, so `C-t 0` falls
+                        // A number never starts with 0, so `<prefix> 0` falls
                         // through to the replay branch below.
                         self.start_number(u32::from(b - b'0'), &mut steps, &mut pending);
                     } else if let Some(action) = command(b) {
@@ -283,8 +283,8 @@ impl Prefix {
                     } else {
                         // The digits already typed were a complete command, and
                         // this byte is simply the next key. Acting and then
-                        // handling `b` afresh is what keeps `C-t 1 x` equivalent
-                        // to `C-t t x`: the command runs, the `x` reaches Neovim,
+                        // handling `b` afresh is what keeps `<prefix> 1 x` equivalent
+                        // to `<prefix> t x`: the command runs, the `x` reaches Neovim,
                         // and no stray prefix byte is injected.
                         self.state = State::Idle;
                         flush(&mut steps, &mut pending);
@@ -317,7 +317,7 @@ impl Prefix {
 
     /// Called when no byte arrived within [`TIMEOUT`] of the machine arming.
     ///
-    /// Resolves a lone `C-t` into a literal one, and a half-typed number into
+    /// Resolves a lone `<prefix>` into a literal one, and a half-typed number into
     /// the session it already names. Idempotent, so a caller that fires its
     /// timer spuriously does no harm.
     pub fn timeout(&mut self) -> Vec<Step> {
@@ -570,7 +570,7 @@ mod tests {
         assert!(!p.is_armed());
     }
 
-    /// `C-t ?` used to be replayed to Neovim as two bytes. This is the way to
+    /// `<prefix> ?` used to be replayed to Neovim as two bytes. This is the way to
     /// still send it, and it must keep working.
     #[test]
     fn a_literal_prefix_then_question_mark_still_reaches_neovim() {
@@ -740,7 +740,7 @@ mod tests {
     }
 
     /// The digits already typed were a complete command; the key after them is
-    /// simply the next key, exactly as it is after `C-t t`.
+    /// simply the next key, exactly as it is after `<prefix> t`.
     #[test]
     fn a_key_after_a_number_ends_it_and_then_reaches_neovim() {
         let mut p = Prefix::new(12);
@@ -774,7 +774,7 @@ mod tests {
         assert_eq!(actions(&steps), vec![Action::Switch(12)]);
     }
 
-    /// This is the documented way to send a digit to Neovim now that `C-t 1` is
+    /// This is the documented way to send a digit to Neovim now that `<prefix> 1` is
     /// a command, so it must keep working.
     #[test]
     fn a_literal_prefix_then_a_digit_still_reaches_neovim() {

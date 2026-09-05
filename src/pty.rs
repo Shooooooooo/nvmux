@@ -51,16 +51,16 @@ const _: () = assert!(MAX_UIS < 16);
 /// How the relay ended. The attachment is handed back separately by [`relay`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// `Ctrl-t t` — show the picker. The child keeps running.
+    /// `<prefix> t` — show the picker. The child keeps running.
     ToPicker,
-    /// `Ctrl-t d` — detach and exit, leaving the session running.
+    /// `<prefix> d` — detach and exit, leaving the session running.
     Detached,
-    /// `Ctrl-t c` — prompt for a name and create a new session. The child keeps
+    /// `<prefix> c` — prompt for a name and create a new session. The child keeps
     /// running, so a cancelled prompt puts the user straight back.
     CreateNew,
-    /// `Ctrl-t ?` — show the key bindings. The child keeps running.
+    /// `<prefix> ?` — show the key bindings. The child keeps running.
     ShowHelp,
-    /// `Ctrl-t <number>` — attach to the session with that number. The child
+    /// `<prefix> <number>` — attach to the session with that number. The child
     /// keeps running, so a number that names nothing puts the user back.
     Switch(u32),
     /// The child exited on its own.

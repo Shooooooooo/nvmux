@@ -5,7 +5,7 @@
 //! [`prompt`] and [`help`] are the other two screens. Both take the whole
 //! terminal rather than drawing over anything, share the same vocabulary
 //! (centred content, one dim hint row, no borders, no colour), and hand the
-//! same client back afterwards. `prompt::run` owns a terminal for `Ctrl-t c`,
+//! same client back afterwards. `prompt::run` owns a terminal for `<prefix> c`,
 //! which arrives with none; `prompt::run_on` borrows the picker's — nesting the
 //! two would enter the alternate screen twice and leave it once.
 //!

@@ -49,14 +49,14 @@ fn run(cli: &Cli) -> Result<()> {
 
 /// Alternate between the picker and an attached session until the user leaves.
 ///
-/// The attachment is carried across iterations, so `Ctrl-t t`, `Ctrl-t c` and
-/// `Ctrl-t ?` come back to the *same* client rather than starting a new one.
+/// The attachment is carried across iterations, so `<prefix> t`, `<prefix> c` and
+/// `<prefix> ?` come back to the *same* client rather than starting a new one.
 fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     let mut attached: Option<pty::Attachment> = None;
     let mut message: Option<String> = None;
 
     loop {
-        // `Ctrl-t c` moves this to the session it just created.
+        // `<prefix> c` moves this to the session it just created.
         let (mut current, mut highest) = match ui::run(transport, message.take())? {
             ui::Outcome::Quit => break,
             ui::Outcome::Attach { session, highest } => (session, highest),

@@ -24,7 +24,7 @@ LOCAL                                     REMOTE
 ┌───────────────────────────────┐         ┌────────────────────────────────┐
 │ nvmux                         │         │ nvim --headless --listen <sock>│
 │  ├─ picker UI (ratatui)       │         │   (detached, survives SSH drop)│
-│  ├─ PTY proxy (Ctrl-t prefix) │         │ nvim --headless --listen <sock>│
+│  ├─ PTY proxy (<prefix>)      │         │ nvim --headless --listen <sock>│
 │  └─ child: nvim --server …    │         │ nvim --headless --listen <sock>│
 │            --remote-ui        │         │                                │
 └───────────────────────────────┘         └────────────────────────────────┘
@@ -84,21 +84,22 @@ reimplementing it.
 
 ### While attached
 
-`Ctrl-t` is the prefix.
+`<prefix>` is the prefix — `Ctrl-t` unless you change it in the
+[config](#configuration).
 
 | Keys | Action |
 |---|---|
-| `Ctrl-t` `d` | detach — leaves the session running, exits nvmux |
-| `Ctrl-t` `t` | back to the picker, session still attached |
-| `Ctrl-t` `1`–`9` | switch straight to that session |
-| `Ctrl-t` `c` | name a new session and attach to it — `Esc` goes back |
-| `Ctrl-t` `?` | show these keys — `Esc` goes back |
-| `Ctrl-t` `Ctrl-t` | send a literal `Ctrl-t` to Neovim |
+| `<prefix>` `d` | detach — leaves the session running, exits nvmux |
+| `<prefix>` `t` | back to the picker, session still attached |
+| `<prefix>` `1`–`9` | switch straight to that session |
+| `<prefix>` `c` | name a new session and attach to it — `Esc` goes back |
+| `<prefix>` `?` | show these keys — `Esc` goes back |
+| `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
 
 Everything else goes to Neovim untouched — including `Ctrl-c`, `Ctrl-z` and
 `Ctrl-s`, which reach the editor as ordinary keys rather than becoming signals
-for nvmux. Digits are the exception: `Ctrl-t 1` is a command now, so
-`Ctrl-t Ctrl-t 1` is how you send that to the editor.
+for nvmux. Digits are the exception: `<prefix> 1` is a command now, so
+`<prefix> <prefix> 1` is how you send that to the editor.
 
 ## Configuration
 
@@ -126,7 +127,7 @@ enabled        = true   # master switch for the dip-to-black transitions.
 frames         = 8      # steps per direction (must be >= 1).
 frame_delay_ms = 12     # milliseconds between frames.
 hold_ms        = 30     # milliseconds held fully black across a hand-off.
-excursions     = true   # also fade the quick Ctrl-t ? / Ctrl-t c screens.
+excursions     = true   # also fade the quick <prefix> ? / <prefix> c screens.
 raw_dissolve   = true   # dissolve an attached session cell by cell, rather
                         # than an instant blackout (cheaper over a slow link).
 
@@ -140,7 +141,7 @@ The prefix must be a `Ctrl-<letter>` chord. `C-m`, `C-j`, `C-i` and `C-h` are
 rejected (they are Enter, newline, Tab and Backspace on the wire); `C-c` and
 `C-z` are allowed, but then that key stops reaching Neovim. `--help` always
 spells the default `Ctrl-t`, since it is printed before the config is read — the
-`Ctrl-t ?` screen shows the key you actually set.
+`<prefix> ?` screen shows the key you actually set.
 
 ## Session numbers
 
@@ -156,7 +157,7 @@ still be meant, which only happens once you have more than nine sessions.
 
 There are two ways out, and they do different things.
 
-**`Ctrl-t d` detaches.** The session keeps running with all its buffers, undo
+**`<prefix> d` detaches.** The session keeps running with all its buffers, undo
 history and jumplist. Reattach later, from this machine or another one.
 
 **`:q` ends the session.** The editor *is* the session, so `:q` in the last

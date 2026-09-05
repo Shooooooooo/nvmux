@@ -32,7 +32,7 @@ pub struct SessionState {
     pub liveness: Liveness,
     /// Number of attached UIs, when known.
     pub attached_uis: Option<usize>,
-    /// The number the picker shows and `Ctrl-t <n>` selects, resolved by
+    /// The number the picker shows and `<prefix> <n>` selects, resolved by
     /// [`crate::transport::finish_listing`] from the stored [`Session::num`].
     ///
     /// Separate from the stored one on purpose. It is dense and duplicate-free

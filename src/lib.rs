@@ -3,7 +3,7 @@
 //! A thin multiplexer: it does not render Neovim's UI. `nvim --server <addr>
 //! --remote-ui` does that, as a child on a PTY whose bytes pass through
 //! untouched. What is left is a picker ([`ui`]) and a PTY proxy ([`pty`]) that
-//! watches stdin for a `Ctrl-t` prefix ([`keys`]).
+//! watches stdin for a `<prefix>` prefix ([`keys`]).
 //!
 //! macOS and Linux only.
 

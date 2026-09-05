@@ -1,6 +1,6 @@
 //! The naming prompt — the only place a session is named.
 //!
-//! Three ways in: `Ctrl-t c` from an attached session, and `c` or `r` from the
+//! Three ways in: `<prefix> c` from an attached session, and `c` or `r` from the
 //! picker. [`run`] owns a terminal for the first, `run_on` borrows one for the
 //! others; a `Task` says whether a name is being invented or edited.
 //!
@@ -147,7 +147,7 @@ impl Prompt {
 }
 
 /// Ask for a name for a new session, owning the terminal while it does — for
-/// `Ctrl-t c`, which arrives from an attached session with none to borrow.
+/// `<prefix> c`, which arrives from an attached session with none to borrow.
 pub fn run(transport: &dyn Transport) -> Result<Outcome> {
     // See the colour note in the parent module.
     ratatui::crossterm::style::force_color_output(true);
@@ -533,7 +533,7 @@ mod tests {
         );
     }
 
-    /// The zero-keystroke path `Ctrl-t c` used to be has to survive: enter on an
+    /// The zero-keystroke path `<prefix> c` used to be has to survive: enter on an
     /// empty field means "whatever the placeholder is showing".
     #[test]
     fn enter_on_an_empty_field_submits_the_default() {

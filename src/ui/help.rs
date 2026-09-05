@@ -1,4 +1,4 @@
-//! The key-binding help — a third screen, shown by `Ctrl-t ?`.
+//! The key-binding help — a third screen, shown by `<prefix> ?`.
 //!
 //! A whole screen rather than a popup for a harder reason than taste: what a
 //! popup would cover is Neovim's screen, and [`crate::pty`] never writes into
@@ -8,7 +8,7 @@
 //! Every command row comes from [`keys::BINDINGS`], the same table
 //! [`keys::Prefix::feed`] runs on, so this screen cannot claim something the
 //! machine does not do. The rows that are not commands — a digit selects a
-//! session, `Ctrl-t Ctrl-t` is a literal, anything else is replayed — are the
+//! session, `<prefix> <prefix>` is a literal, anything else is replayed — are the
 //! machine's other branches, spelled here and pinned to it by a test.
 //!
 //! # Why only named keys close it

@@ -48,7 +48,7 @@ pub const FRAME_DELAY: Duration = Duration::from_millis(12);
 /// client swap or the alt-screen crossing so neither shows through.
 pub const HOLD: Duration = Duration::from_millis(30);
 
-/// Whether the quick `Ctrl-t ?` / `Ctrl-t c` / picker-peek excursions fade too.
+/// Whether the quick `<prefix> ?` / `<prefix> c` / picker-peek excursions fade too.
 /// Off makes those snappier at the cost of consistency.
 pub const EXCURSIONS: bool = true;
 
