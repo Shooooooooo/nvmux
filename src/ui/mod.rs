@@ -179,6 +179,8 @@ fn one_line(e: &crate::error::NvmuxError) -> String {
 fn translate(k: KeyEvent) -> Key {
     match k.code {
         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => Key::CtrlC,
+        KeyCode::Char('n') if k.modifiers.contains(KeyModifiers::CONTROL) => Key::CtrlN,
+        KeyCode::Char('p') if k.modifiers.contains(KeyModifiers::CONTROL) => Key::CtrlP,
         KeyCode::Char(c) => Key::Char(c),
         KeyCode::Enter => Key::Enter,
         KeyCode::Esc => Key::Esc,
@@ -204,6 +206,22 @@ mod tests {
         assert_eq!(
             translate(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
             Key::Char('c')
+        );
+    }
+
+    #[test]
+    fn ctrl_n_and_ctrl_p_are_distinguished_from_plain_letters() {
+        assert_eq!(
+            translate(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+            Key::CtrlN
+        );
+        assert_eq!(
+            translate(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            Key::CtrlP
+        );
+        assert_eq!(
+            translate(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            Key::Char('n')
         );
     }
 

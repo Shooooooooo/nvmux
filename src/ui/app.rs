@@ -172,11 +172,11 @@ impl App {
 
     fn on_key_normal(&mut self, key: Key) -> Request {
         match key {
-            Key::Char('j') | Key::Down => {
+            Key::Char('j') | Key::Down | Key::CtrlN => {
                 self.move_by(1);
                 Request::None
             }
-            Key::Char('k') | Key::Up => {
+            Key::Char('k') | Key::Up | Key::CtrlP => {
                 self.move_by(-1);
                 Request::None
             }
@@ -246,11 +246,11 @@ impl App {
                 self.clamp_selection();
                 Request::None
             }
-            Key::Down => {
+            Key::Down | Key::CtrlN => {
                 self.move_by(1);
                 Request::None
             }
-            Key::Up => {
+            Key::Up | Key::CtrlP => {
                 self.move_by(-1);
                 Request::None
             }
@@ -347,6 +347,10 @@ pub enum Key {
     Home,
     End,
     CtrlC,
+    /// Ctrl-N — the readline-style companion to `j`/Down.
+    CtrlN,
+    /// Ctrl-P — the readline-style companion to `k`/Up.
+    CtrlP,
     Other,
 }
 
@@ -387,6 +391,28 @@ mod tests {
         a.on_key(Key::Down);
         assert_eq!(a.selected_index(), 1);
         a.on_key(Key::Up);
+        assert_eq!(a.selected_index(), 0);
+    }
+
+    #[test]
+    fn ctrl_n_and_ctrl_p_match_jk() {
+        let mut a = app(&["one", "two"]);
+        a.on_key(Key::CtrlN);
+        assert_eq!(a.selected_index(), 1);
+        a.on_key(Key::CtrlP);
+        assert_eq!(a.selected_index(), 0);
+    }
+
+    #[test]
+    fn ctrl_n_and_ctrl_p_move_while_filtering() {
+        // In Filter mode every printable key is query text, so Ctrl-N/P are the
+        // only letters that can still move the cursor.
+        let mut a = app(&["one", "two"]);
+        a.on_key(Key::Char('/'));
+        a.on_key(Key::CtrlN);
+        assert_eq!(a.selected_index(), 1);
+        assert_eq!(a.filter(), "", "the chord should not land in the query");
+        a.on_key(Key::CtrlP);
         assert_eq!(a.selected_index(), 0);
     }
 
