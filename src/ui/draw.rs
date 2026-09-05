@@ -118,8 +118,6 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_bottom(frame: &mut Frame, app: &App, area: Rect) {
     // Prompts replace the hint line in place — never a popup, never a border.
     let (text, dim) = match app.mode() {
-        Mode::Create { input } => (format!("new session: {input}{CURSOR}"), false),
-        Mode::Rename { input, .. } => (format!("rename to: {input}{CURSOR}"), false),
         Mode::Confirm { prompt, .. } => (prompt.clone(), false),
         Mode::Filter => (format!("/{}{CURSOR}", app.filter()), false),
         Mode::Normal => match app.message() {
@@ -321,25 +319,35 @@ mod tests {
         assert!(lines[8].contains("quit"), "hints should still be present");
     }
 
+    /// The picker's own prompts stay on the hint row — no popup, no border, no
+    /// shift in the list above.
+    ///
+    /// Naming is the exception and deliberately so: `c` and `r` hand off to the
+    /// full-screen prompt instead. What is left here — the filter and the kill
+    /// confirm — still owes the contract, so both are checked.
     #[test]
     fn prompts_replace_the_hint_line_in_place() {
-        let mut a = app(&["dotfiles"]);
-        a.on_key(super::super::app::Key::Char('c'));
-        for c in "my-project".chars() {
-            a.on_key(super::super::app::Key::Char(c));
+        for (open_with, typed, expected) in
+            [('/', "dot", "/dot▋"), ('x', "", "kill \"dotfiles\"? [y/N]")]
+        {
+            let mut a = app(&["dotfiles"]);
+            a.on_key(super::super::app::Key::Char(open_with));
+            for c in typed.chars() {
+                a.on_key(super::super::app::Key::Char(c));
+            }
+            let lines = render(&a, 60, 8);
+            assert!(
+                lines[7].contains(expected),
+                "prompt should be on the bottom row: {:?}",
+                lines[7]
+            );
+            assert!(
+                !lines[7].contains("quit"),
+                "hints should be replaced, not appended"
+            );
+            // The list is untouched above it.
+            assert!(lines[..7].iter().any(|l| l.contains("dotfiles")));
         }
-        let lines = render(&a, 60, 8);
-        assert!(
-            lines[7].contains("new session: my-project▋"),
-            "prompt should be on the bottom row: {:?}",
-            lines[7]
-        );
-        assert!(
-            !lines[7].contains("quit"),
-            "hints should be replaced, not appended"
-        );
-        // The list is untouched above it — no popup, no border, no shift.
-        assert!(lines[..7].iter().any(|l| l.contains("dotfiles")));
     }
 
     #[test]
