@@ -1,4 +1,4 @@
-//! The key-binding help — a third screen, shown by `Ctrl-t ?`.
+//! The key-binding help — a third screen, shown by `<prefix> ?`.
 //!
 //! A whole screen rather than a popup for a harder reason than taste: what a
 //! popup would cover is Neovim's screen, and [`crate::pty`] never writes into
@@ -8,7 +8,7 @@
 //! Every command row comes from [`keys::BINDINGS`], the same table
 //! [`keys::Prefix::feed`] runs on, so this screen cannot claim something the
 //! machine does not do. The rows that are not commands — a digit selects a
-//! session, `Ctrl-t Ctrl-t` is a literal, anything else is replayed — are the
+//! session, `<prefix> <prefix>` is a literal, anything else is replayed — are the
 //! machine's other branches, spelled here and pinned to it by a test.
 //!
 //! # Why only named keys close it
@@ -19,6 +19,8 @@
 //! close the screen on the `Ctrl-t` and send a bare `d` into normal mode. So
 //! `t`, `d` and `c` do nothing, and only `Esc`, `q`, `Enter`, `?` and `Ctrl-c`
 //! close it. Nothing typed on this screen is ever forwarded.
+
+use std::borrow::Cow;
 
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::layout::{Alignment, Rect};
@@ -31,7 +33,7 @@ use unicode_width::UnicodeWidthStr;
 use super::app::Key;
 use super::draw;
 use crate::error::Result;
-use crate::keys::{self, PREFIX_LABEL};
+use crate::keys;
 
 /// Key then action, the picker's hint grammar. `q`, `Enter`, `?` and `Ctrl-c`
 /// also close, unadvertised.
@@ -41,10 +43,14 @@ const HINTS: &str = "esc back";
 const GAP: usize = 3;
 
 /// One line of the table.
+///
+/// `what` is a [`Cow`] because most descriptions are the static strings from
+/// [`keys::BINDINGS`], but the two that name the prefix itself are built from the
+/// configured label at runtime.
 #[derive(Debug)]
 struct Row {
     keys: String,
-    what: &'static str,
+    what: Cow<'static, str>,
 }
 
 /// What one keypress meant.
@@ -57,25 +63,30 @@ enum Step {
 /// The command rows from [`keys::BINDINGS`], then the rules that are not
 /// commands: digits select a session, a doubled prefix is a literal, and
 /// anything else is replayed.
-fn rows() -> Vec<Row> {
+///
+/// `prefix` is the label to spell the prefix with — [`keys::PREFIX_LABEL`] by
+/// default, or whatever a remapped prefix reads as (see
+/// [`keys::prefix_label`]) — so every row, and the two descriptions that name
+/// the prefix, follow the key the user actually set.
+fn rows(prefix: &str) -> Vec<Row> {
     let mut rows: Vec<Row> = keys::BINDINGS
         .iter()
         .map(|b| Row {
-            keys: format!("{PREFIX_LABEL} {}", b.key as char),
-            what: b.help,
+            keys: format!("{prefix} {}", b.key as char),
+            what: Cow::Borrowed(b.help),
         })
         .collect();
     rows.push(Row {
-        keys: format!("{PREFIX_LABEL} 1-9"),
-        what: "attach to the session with that number",
+        keys: format!("{prefix} 1-9"),
+        what: Cow::Borrowed("attach to the session with that number"),
     });
     rows.push(Row {
-        keys: format!("{PREFIX_LABEL} {PREFIX_LABEL}"),
-        what: "send a literal Ctrl-t to Neovim",
+        keys: format!("{prefix} {prefix}"),
+        what: Cow::Owned(format!("send a literal {prefix} to Neovim")),
     });
     rows.push(Row {
-        keys: format!("{PREFIX_LABEL} other"),
-        what: "send Ctrl-t and that key to Neovim",
+        keys: format!("{prefix} other"),
+        what: Cow::Owned(format!("send {prefix} and that key to Neovim")),
     });
     rows
 }
@@ -104,7 +115,7 @@ pub fn run() -> Result<()> {
     // `ui::run`.
     terminal.clear()?;
     // Reached from a session that has already dissolved to black, so start black.
-    if crate::fade::EXCURSIONS {
+    if crate::fade::excursions() {
         crate::fade::prime_black(&mut terminal)?;
     }
     let outcome = run_loop(&mut terminal);
@@ -114,8 +125,9 @@ pub fn run() -> Result<()> {
 }
 
 fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
-    let rows = rows();
-    if crate::fade::EXCURSIONS {
+    let label = keys::prefix_label(crate::settings::get().keys.prefix);
+    let rows = rows(&label);
+    if crate::fade::excursions() {
         crate::fade::fade_in_ratatui(terminal, |f| draw(f, &rows))?;
     }
     loop {
@@ -133,7 +145,7 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
 
         if on_key(key) == Step::Close {
             // Dissolve back to black so the resumed session takes over dark.
-            if crate::fade::EXCURSIONS {
+            if crate::fade::excursions() {
                 crate::fade::fade_out_ratatui(terminal, |f| draw(f, &rows))?;
             }
             return Ok(());
@@ -208,14 +220,14 @@ fn draw_hints(frame: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keys::{Prefix, PREFIX};
+    use crate::keys::{Prefix, PREFIX, PREFIX_LABEL};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
     /// Reconstruct the rendered lines, skipping the filler cell that follows a
     /// wide glyph so a CJK name is not reported as three columns per character.
     fn render(w: u16, h: u16) -> Vec<String> {
-        let rows = rows();
+        let rows = rows(PREFIX_LABEL);
         let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
         terminal.draw(|f| draw(f, &rows)).expect("draw");
         let buf = terminal.backend().buffer().clone();
@@ -289,7 +301,7 @@ mod tests {
     /// is which bytes are commands at all, not how long one waits.
     #[test]
     fn every_row_matches_what_the_prefix_machine_does() {
-        let rows = rows();
+        let rows = rows(PREFIX_LABEL);
         for b in 0u8..=255 {
             let acts = Prefix::new(0)
                 .feed(&[PREFIX, b])
@@ -315,7 +327,7 @@ mod tests {
     #[test]
     fn the_digit_row_covers_exactly_one_to_nine() {
         assert!(
-            rows()
+            rows(PREFIX_LABEL)
                 .iter()
                 .any(|r| r.keys == format!("{PREFIX_LABEL} 1-9")),
             "the digit row is missing"
@@ -333,7 +345,7 @@ mod tests {
     #[test]
     fn every_binding_is_listed_with_its_description() {
         let lines = render(80, 24);
-        for (b, row) in keys::BINDINGS.iter().zip(rows()) {
+        for (b, row) in keys::BINDINGS.iter().zip(rows(PREFIX_LABEL)) {
             let line = line_for(&lines, &row);
             assert!(
                 line.contains(b.help),
@@ -373,14 +385,39 @@ mod tests {
         assert!(other.contains("that key"), "got {other:?}");
     }
 
+    /// A remapped prefix relabels every row *and* the two descriptions that name
+    /// the prefix — not just the key column — so the screen never claims a key the
+    /// user did not set.
+    #[test]
+    fn a_remapped_prefix_labels_every_row_and_the_literal_text() {
+        let rows = rows("Ctrl-a");
+        for r in &rows {
+            assert!(
+                r.keys.starts_with("Ctrl-a"),
+                "row {:?} kept the old prefix",
+                r.keys
+            );
+        }
+        let literal = rows
+            .iter()
+            .find(|r| r.keys == "Ctrl-a Ctrl-a")
+            .expect("the literal row");
+        assert_eq!(&*literal.what, "send a literal Ctrl-a to Neovim");
+        let other = rows
+            .iter()
+            .find(|r| r.keys == "Ctrl-a other")
+            .expect("the other row");
+        assert_eq!(&*other.what, "send Ctrl-a and that key to Neovim");
+    }
+
     #[test]
     fn descriptions_line_up_in_one_column() {
         let lines = render(80, 24);
-        let cols: Vec<usize> = rows()
+        let cols: Vec<usize> = rows(PREFIX_LABEL)
             .iter()
             .map(|r| {
                 let line = line_for(&lines, r);
-                let byte = line.find(r.what).expect("description present");
+                let byte = line.find(&*r.what).expect("description present");
                 line[..byte].width()
             })
             .collect();
@@ -431,7 +468,7 @@ mod tests {
 
     #[test]
     fn the_hint_row_is_dim_and_the_table_is_not() {
-        let rows = rows();
+        let rows = rows(PREFIX_LABEL);
         let mut terminal = Terminal::new(TestBackend::new(62, 11)).expect("terminal");
         terminal.draw(|f| draw(f, &rows)).expect("draw");
         let buf = terminal.backend().buffer().clone();
@@ -489,7 +526,7 @@ mod tests {
     #[test]
     fn nothing_sets_a_colour() {
         use ratatui::style::Color;
-        let rows = rows();
+        let rows = rows(PREFIX_LABEL);
         let mut terminal = Terminal::new(TestBackend::new(62, 11)).expect("terminal");
         terminal.draw(|f| draw(f, &rows)).expect("draw");
         let buf = terminal.backend().buffer().clone();

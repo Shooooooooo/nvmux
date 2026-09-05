@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use nvmux::cli::Cli;
-use nvmux::{config, logging, nvim, pty, transport, ui};
+use nvmux::{config, logging, nvim, pty, settings, transport, ui};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -13,7 +13,8 @@ fn main() -> Result<()> {
     let dir = config::ensure_runtime_dir().context("preparing the nvmux runtime directory")?;
     logging::init(&dir)?;
 
-    // Before anything is spawned: see `config::restrict_umask`.
+    // Before anything is spawned — and before a first-run config file is written
+    // in `run` — restrict the umask: see `config::restrict_umask`.
     config::restrict_umask();
 
     if let Err(e) = run(&cli) {
@@ -34,20 +35,52 @@ fn run(cli: &Cli) -> Result<()> {
     let local_nvim = nvim::check_local()?;
     tracing::debug!(version = %local_nvim, "local nvim");
 
+    // Config is a local concern — the prefix machine, the fade and the picker all
+    // run here — so it is established before any transport, `nvmux <host>`
+    // included. On a genuine first run at an interactive terminal this asks for a
+    // prefix and records it; otherwise it loads whatever exists (or the defaults).
+    settings::init(establish_settings()?);
+
     let transport = transport::open(location.clone())?;
     session_loop(transport.as_ref())
 }
 
+/// Decide this run's settings, prompting once on a true first run.
+///
+/// A first run is: no config file at the default path, `$NVMUX_CONFIG` unset, and
+/// an interactive terminal (both stdin and stdout). Anything else — a file
+/// already there, an explicit config, a piped/non-interactive run — just loads
+/// normally. Failing to *write* the chosen config is reported but not fatal: the
+/// prefix still applies this session, and the next run will ask again.
+fn establish_settings() -> Result<settings::Settings> {
+    use std::io::IsTerminal;
+
+    match settings::first_run_target() {
+        Some(path) if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => {
+            match ui::setup::run()? {
+                ui::setup::Outcome::Chosen(prefix) => {
+                    if let Err(e) = settings::write_default(&path, prefix) {
+                        eprintln!("nvmux: could not write {}: {e}", path.display());
+                    }
+                    Ok(settings::with_prefix(prefix))
+                }
+                ui::setup::Outcome::Skipped => Ok(settings::Settings::default()),
+            }
+        }
+        _ => Ok(settings::load()?),
+    }
+}
+
 /// Alternate between the picker and an attached session until the user leaves.
 ///
-/// The attachment is carried across iterations, so `Ctrl-t t`, `Ctrl-t c` and
-/// `Ctrl-t ?` come back to the *same* client rather than starting a new one.
+/// The attachment is carried across iterations, so `<prefix> t`, `<prefix> c` and
+/// `<prefix> ?` come back to the *same* client rather than starting a new one.
 fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     let mut attached: Option<pty::Attachment> = None;
     let mut message: Option<String> = None;
 
     loop {
-        // `Ctrl-t c` moves this to the session it just created.
+        // `<prefix> c` moves this to the session it just created.
         let (mut current, mut highest) = match ui::run(transport, message.take())? {
             ui::Outcome::Quit => break,
             ui::Outcome::Attach { session, highest } => (session, highest),

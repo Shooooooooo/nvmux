@@ -23,8 +23,9 @@
 //! black, and only transiently, on top of a finished frame — never inside
 //! `draw::draw`, so that invariant and its tests stand. The whole effect is
 //! gated on [`enabled`]: with `NO_COLOR` set every entry point is a no-op and the
-//! transitions are exactly what they were before. That gate is also where a
-//! future config file will hook in to tune or disable the fade.
+//! transitions are exactly what they were before. That gate is also where the
+//! config file hooks in to tune or disable the fade (see [`crate::settings`]);
+//! the constants below are its defaults.
 
 use std::io::{self, Write};
 use std::thread;
@@ -47,7 +48,7 @@ pub const FRAME_DELAY: Duration = Duration::from_millis(12);
 /// client swap or the alt-screen crossing so neither shows through.
 pub const HOLD: Duration = Duration::from_millis(30);
 
-/// Whether the quick `Ctrl-t ?` / `Ctrl-t c` / picker-peek excursions fade too.
+/// Whether the quick `<prefix> ?` / `<prefix> c` / picker-peek excursions fade too.
 /// Off makes those snappier at the cost of consistency.
 pub const EXCURSIONS: bool = true;
 
@@ -90,13 +91,30 @@ pub fn cell_is_black(x: u16, y: u16, coverage: f32) -> bool {
 }
 
 /// Whether transitions are animated at all. `false` restores the pre-fade
-/// behaviour exactly, and is the seam a future config file overrides.
+/// behaviour exactly. Two things can turn it off: `fade.enabled = false` in the
+/// config file, or `NO_COLOR`.
 ///
-/// `NO_COLOR` disables it because the effect paints an explicit colour and the
-/// ratatui screens force colour output on (see [`crate::ui`]), so nothing else
-/// would honour the request.
+/// `NO_COLOR` wins over the config because the effect paints an explicit colour
+/// and the ratatui screens force colour output on (see [`crate::ui`]), so
+/// honouring the request means never running the effect, whatever the config says.
 pub fn enabled() -> bool {
-    std::env::var_os("NO_COLOR").is_none()
+    is_enabled(
+        crate::settings::get().fade.enabled,
+        std::env::var_os("NO_COLOR").is_some(),
+    )
+}
+
+/// The gate itself, factored out so the precedence rule is testable without the
+/// process globals [`enabled`] reads.
+fn is_enabled(config_enabled: bool, no_color: bool) -> bool {
+    config_enabled && !no_color
+}
+
+/// Whether the quick excursions — [`crate::ui::help`], the create prompt, a
+/// picker peek — fade too. Config-driven; the [`EXCURSIONS`] constant is its
+/// default.
+pub fn excursions() -> bool {
+    crate::settings::get().fade.excursions
 }
 
 /// Blacken every cell of `area` that is black at `coverage`, in place. Applied to
@@ -147,11 +165,13 @@ where
     if !enabled() {
         return Ok(());
     }
-    for step in (0..=FRAMES).rev() {
-        let coverage = step as f32 / FRAMES as f32;
+    let cfg = crate::settings::get().fade;
+    let delay = Duration::from_millis(cfg.frame_delay_ms);
+    for step in (0..=cfg.frames).rev() {
+        let coverage = step as f32 / cfg.frames as f32;
         draw_overlaid(terminal, &mut draw, coverage)?;
         if step != 0 {
-            thread::sleep(FRAME_DELAY);
+            thread::sleep(delay);
         }
     }
     Ok(())
@@ -166,14 +186,16 @@ where
     if !enabled() {
         return Ok(());
     }
-    for step in 1..=FRAMES {
-        let coverage = step as f32 / FRAMES as f32;
+    let cfg = crate::settings::get().fade;
+    let delay = Duration::from_millis(cfg.frame_delay_ms);
+    for step in 1..=cfg.frames {
+        let coverage = step as f32 / cfg.frames as f32;
         draw_overlaid(terminal, &mut draw, coverage)?;
-        if step != FRAMES {
-            thread::sleep(FRAME_DELAY);
+        if step != cfg.frames {
+            thread::sleep(delay);
         }
     }
-    thread::sleep(HOLD);
+    thread::sleep(Duration::from_millis(cfg.hold_ms));
     Ok(())
 }
 
@@ -265,20 +287,22 @@ pub fn fade_out_raw() -> io::Result<()> {
     if !enabled() {
         return Ok(());
     }
+    let cfg = crate::settings::get().fade;
+    let delay = Duration::from_millis(cfg.frame_delay_ms);
     let mut out = io::stdout().lock();
     out.write_all(HIDE_CURSOR)?;
     out.write_all(SET_BLACK_BG)?;
 
-    if RAW_FADE_DISSOLVE {
+    if cfg.raw_dissolve {
         let mut prev = 0.0f32;
-        for step in 1..=FRAMES {
-            let coverage = step as f32 / FRAMES as f32;
+        for step in 1..=cfg.frames {
+            let coverage = step as f32 / cfg.frames as f32;
             let size = term::terminal_size();
             out.write_all(&delta_frame(size.cols, size.rows, prev, coverage))?;
             out.flush()?;
             prev = coverage;
-            if step != FRAMES {
-                thread::sleep(FRAME_DELAY);
+            if step != cfg.frames {
+                thread::sleep(delay);
             }
         }
     }
@@ -289,7 +313,7 @@ pub fn fade_out_raw() -> io::Result<()> {
     out.write_all(CLEAR_HOME)?;
     out.write_all(SYNC_END)?;
     out.flush()?;
-    thread::sleep(HOLD);
+    thread::sleep(Duration::from_millis(cfg.hold_ms));
     Ok(())
 }
 
@@ -485,5 +509,18 @@ mod tests {
             Some(v) => std::env::set_var("NO_COLOR", v),
             None => std::env::remove_var("NO_COLOR"),
         }
+    }
+
+    /// The gate's precedence, without touching any global: the config can turn
+    /// the effect off, and `NO_COLOR` turns it off even when the config wants it.
+    #[test]
+    fn the_config_toggle_and_no_color_both_gate_the_effect() {
+        assert!(is_enabled(true, false), "on by default");
+        assert!(
+            !is_enabled(true, true),
+            "NO_COLOR wins over an enabled config"
+        );
+        assert!(!is_enabled(false, false), "config can disable it");
+        assert!(!is_enabled(false, true), "off is off");
     }
 }

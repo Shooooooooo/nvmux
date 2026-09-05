@@ -179,7 +179,7 @@ fn rename_edits_metadata_and_leaves_the_socket_alone() {
     assert_eq!(listed[0].state.liveness, Liveness::Alive);
 
     // The number is as much a handle as the id: a rename must not move it, or
-    // `Ctrl-t <n>` would start naming a different session.
+    // `<prefix> <n>` would start naming a different session.
     assert_eq!(
         listed[0].num, session.num,
         "rename must not change the number"

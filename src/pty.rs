@@ -36,7 +36,7 @@ pub use portable_pty::PtySize;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair};
 
 use crate::error::{NvmuxError, Result};
-use crate::keys::{self, Action, Prefix, Step};
+use crate::keys::{Action, Prefix, Step};
 use crate::{rpc, term, winch};
 
 /// Neovim aborts on the seventeenth attached UI rather than returning an error
@@ -51,16 +51,16 @@ const _: () = assert!(MAX_UIS < 16);
 /// How the relay ended. The attachment is handed back separately by [`relay`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// `Ctrl-t t` — show the picker. The child keeps running.
+    /// `<prefix> t` — show the picker. The child keeps running.
     ToPicker,
-    /// `Ctrl-t d` — detach and exit, leaving the session running.
+    /// `<prefix> d` — detach and exit, leaving the session running.
     Detached,
-    /// `Ctrl-t c` — prompt for a name and create a new session. The child keeps
+    /// `<prefix> c` — prompt for a name and create a new session. The child keeps
     /// running, so a cancelled prompt puts the user straight back.
     CreateNew,
-    /// `Ctrl-t ?` — show the key bindings. The child keeps running.
+    /// `<prefix> ?` — show the key bindings. The child keeps running.
     ShowHelp,
-    /// `Ctrl-t <number>` — attach to the session with that number. The child
+    /// `<prefix> <number>` — attach to the session with that number. The child
     /// keeps running, so a number that names nothing puts the user back.
     Switch(u32),
     /// The child exited on its own.
@@ -249,14 +249,14 @@ fn pump(
     highest_session_num: u32,
 ) -> Result<Outcome> {
     let stdin_fd = std::io::stdin().as_raw_fd();
-    let mut prefix = Prefix::new(highest_session_num);
+    let mut prefix = Prefix::with_prefix(highest_session_num, crate::settings::get().keys.prefix);
     let mut buf = [0u8; 8192];
 
     loop {
         // A pending prefix needs its own deadline: a *stopped* child produces
         // no poll activity at all, so an indefinite wait would never notice it.
         let timeout_ms = if prefix.is_armed() {
-            keys::TIMEOUT.as_millis() as libc::c_int
+            crate::settings::get().keys.timeout_ms as libc::c_int
         } else {
             IDLE_POLL_MS
         };

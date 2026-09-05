@@ -5,7 +5,7 @@
 //! [`prompt`] and [`help`] are the other two screens. Both take the whole
 //! terminal rather than drawing over anything, share the same vocabulary
 //! (centred content, one dim hint row, no borders, no colour), and hand the
-//! same client back afterwards. `prompt::run` owns a terminal for `Ctrl-t c`,
+//! same client back afterwards. `prompt::run` owns a terminal for `<prefix> c`,
 //! which arrives with none; `prompt::run_on` borrows the picker's — nesting the
 //! two would enter the alternate screen twice and leave it once.
 //!
@@ -31,6 +31,7 @@ pub mod app;
 pub mod draw;
 pub mod help;
 pub mod prompt;
+pub mod setup;
 
 /// What the picker returned.
 #[derive(Debug, Clone)]
@@ -136,10 +137,9 @@ fn run_loop(
         };
 
         let request = app.on_key(key);
-        deadline = app
-            .pending()
-            .is_some()
-            .then(|| Instant::now() + crate::keys::TIMEOUT);
+        deadline = app.pending().is_some().then(|| {
+            Instant::now() + Duration::from_millis(crate::settings::get().keys.timeout_ms)
+        });
 
         match request {
             Request::None => {}
