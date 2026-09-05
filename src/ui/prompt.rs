@@ -7,6 +7,24 @@
 //! keeps the picker's visual language all the same — content centred, one dim
 //! hint row on the last line, no borders, and no colour ever set.
 //!
+//! # Three weights, because there are three kinds of text
+//!
+//! One line, `label: value`, and every part of it styled for its job:
+//!
+//! ```text
+//!     new session name: session 3
+//!     └─ bold            │ └─ dim
+//!                        └─ the cursor, an inverted cell
+//! ```
+//!
+//! **Bold** leads, because on a screen with nothing else on it the label is the
+//! question being asked. **Plain** is what you type. **Dim** is what you can
+//! ignore — the default and the hint row. An earlier version dimmed the label
+//! too, which flattened all three into one and left nothing on screen to read
+//! first. Modifiers rather than colour, for the reason the parent module gives:
+//! crossterm rewrites a colour into a bare `ESC[m` under `NO_COLOR`, a full SGR
+//! reset that would wipe the bold and dim mid-line.
+//!
 //! # The default name is a placeholder, not a pre-filled value
 //!
 //! Enter on an empty field creates `session 1`, `session 2`, … — the naming
@@ -15,6 +33,12 @@
 //! right now and costs nothing to discard. A pre-filled value would have to be
 //! backspaced away before a real name could be typed, which is the whole reason
 //! placeholders exist.
+//!
+//! Being a placeholder is also why the cursor *inverts* its first letter rather
+//! than taking a column in front of it. The cursor marks the insertion point,
+//! and while a default is showing that point is exactly where its first letter
+//! sits — so the default occupies the same columns your name will, and nothing
+//! shifts when you start typing.
 
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::layout::{Alignment, Rect};
@@ -47,8 +71,13 @@ enum Step {
     Cancel,
 }
 
-/// The label above the field.
-const LABEL: &str = "new session";
+/// What the field is for, in front of it.
+///
+/// A `label: value` line rather than a bare heading, because this screen opens
+/// over an editor with nothing else on it: it has to say both what is happening
+/// and what to type. The picker's inline create prompt gets away with the
+/// shorter "new session: " — it has the session list right above it.
+const PREFIX: &str = "new session name: ";
 
 /// Three spaces between groups, matching the picker's hint line.
 const HINTS: &str = "⏎ create   esc cancel";
@@ -209,59 +238,48 @@ fn draw(frame: &mut Frame, prompt: &Prompt) {
     draw_hints(frame, bottom);
 }
 
-/// The label is the anchor and the field grows rightward from its left edge.
+/// Centre the line as it reads the moment the prompt opens, then hold it.
 ///
-/// Centring the field on its own contents would be truer to "the middle of the
-/// screen", but it would shuffle the line half a cell left on every keystroke.
-/// The label is the one piece of content whose width never changes, so centring
-/// *that* and hanging the field off it puts the prompt in the middle and still
-/// leaves the cursor sitting still while you type.
+/// The anchor deliberately ignores `input`, and that is the whole trick. Sizing
+/// it to the current contents would centre the line perfectly at every instant
+/// and shuffle it half a cell left on every keystroke; anchoring on the prefix
+/// alone would hold still but leave the real line sitting several columns right
+/// of centre. Measuring the *opening* line gets both: centred when you first see
+/// it, and a field whose first column never moves afterwards — which is what
+/// lets the placeholder sit exactly where your first keystroke will land.
 fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
     }
 
-    let height = if prompt.message.is_some() { 3 } else { 2 };
-    let anchor = draw::centre(area, LABEL.width() as u16, height);
-    // Everything from the anchor to the right edge is the field's, so a long
-    // name has somewhere to go.
+    let height = if prompt.message.is_some() { 2 } else { 1 };
+    let opening = (PREFIX.width() + prompt.default_name.width()) as u16;
+    let anchor = draw::centre(area, opening, height);
+    // Everything from the anchor to the right edge is the line's, so a long name
+    // has somewhere to go.
     let width = (area.x + area.width).saturating_sub(anchor.x) as usize;
 
     if anchor.height >= 1 {
-        let dim = Style::default().add_modifier(Modifier::DIM);
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                draw::truncate(LABEL, anchor.width as usize),
-                dim,
-            ))),
+            Paragraph::new(prompt_line(prompt, width)),
             Rect {
+                x: anchor.x,
+                width: width as u16,
                 height: 1,
                 ..anchor
             },
         );
     }
 
-    if anchor.height >= 2 {
-        frame.render_widget(
-            Paragraph::new(input_line(prompt, width)),
-            Rect {
-                x: anchor.x,
-                y: anchor.y + 1,
-                width: width as u16,
-                height: 1,
-            },
-        );
-    }
-
-    // The message is routinely wider than the field, so it gets the full width
+    // The message is routinely wider than the line, so it gets the full width
     // and its own centring rather than hanging off the anchor.
-    if anchor.height >= 3 {
+    if anchor.height >= 2 {
         if let Some(msg) = prompt.message.as_deref() {
             frame.render_widget(
                 Paragraph::new(Line::from(draw::truncate(msg, area.width as usize)))
                     .alignment(Alignment::Center),
                 Rect {
-                    y: anchor.y + 2,
+                    y: anchor.y + 1,
                     height: 1,
                     ..area
                 },
@@ -270,29 +288,62 @@ fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
     }
 }
 
-/// The field: either what was typed, or the dim default behind the cursor.
+/// The whole line: bold label, then either what was typed or the dim default.
 ///
-/// Which of the two is showing is derived from the input being empty rather
-/// than tracked, so backspacing back to nothing brings the placeholder back
-/// with no state to keep in sync.
-fn input_line(prompt: &Prompt, width: usize) -> Line<'static> {
-    let room = width.saturating_sub(draw::CURSOR.width());
+/// Three roles, three weights, and all of it derived from state rather than
+/// tracked — the prefix is constant and `input.is_empty()` decides the rest, so
+/// backspacing to nothing brings the placeholder back with nothing to keep in
+/// sync.
+///
+/// The cursor is one inverted cell and it always marks the insertion point. With
+/// a placeholder showing, that point *is* its first letter, so the cursor
+/// inverts the letter rather than taking a column of its own in front of it —
+/// otherwise the default would sit one column right of where typing actually
+/// lands, and the field would visibly jump on the first keystroke.
+fn prompt_line(prompt: &Prompt, width: usize) -> Line<'static> {
+    let label = draw::truncate(PREFIX, width);
+    // One column for the cursor, whether it lands on a letter or on a blank.
+    let room = width.saturating_sub(label.width() + 1);
+    let mut spans = vec![Span::styled(
+        label,
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
 
-    if prompt.input.is_empty() {
-        Line::from(vec![
-            Span::raw(draw::CURSOR),
-            Span::styled(
-                draw::truncate(&prompt.default_name, room),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        ])
+    // Plain REVERSED, not the picker's REVERSED|BOLD: that pairing means "the
+    // selected row", and a one-cell cursor wants the crisper form.
+    let cursor = Style::default().add_modifier(Modifier::REVERSED);
+
+    // Nothing typed yet, and a default to show it with: the cursor lands on a
+    // character, so it inverts that character.
+    let placeholder = if prompt.input.is_empty() {
+        split_first(&prompt.default_name)
     } else {
-        Line::from(Span::raw(format!(
-            "{}{}",
-            tail(&prompt.input, room),
-            draw::CURSOR
-        )))
+        None
+    };
+
+    match placeholder {
+        Some((first, rest)) => {
+            spans.push(Span::styled(first, cursor));
+            spans.push(Span::styled(
+                draw::truncate(rest, room),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        // Something typed, or no default to sit on: the insertion point is past
+        // the end of the text, so the cursor inverts a blank instead.
+        None => {
+            spans.push(Span::raw(tail(&prompt.input, room)));
+            spans.push(Span::styled(" ", cursor));
+        }
     }
+
+    Line::from(spans)
+}
+
+/// Split off the first character, or `None` if there is not one.
+fn split_first(s: &str) -> Option<(String, &str)> {
+    let first = s.chars().next()?;
+    Some((first.to_string(), &s[first.len_utf8()..]))
 }
 
 fn draw_hints(frame: &mut Frame, area: Rect) {
@@ -369,33 +420,61 @@ mod tests {
             .collect()
     }
 
-    /// The field row as (symbol, is_dim) per cell, trimmed to the part that has
-    /// content. Found by the cursor, which only the field draws.
-    fn field_cells(p: &Prompt, w: u16, h: u16) -> Vec<(String, bool)> {
+    /// One rendered cell: what it shows and how it is styled.
+    ///
+    /// The modifier is the point of most of these tests, and `render` throws it
+    /// away, so the styling assertions go through here instead.
+    type Cell = (String, Modifier);
+
+    /// The whole prompt line, as cells, trimmed to its content.
+    ///
+    /// The row is found by the cursor's inverted cell, which nothing else on the
+    /// screen draws. The right edge is the last cell that either shows something
+    /// or is the cursor — the cursor can be an inverted *blank* trailing what was
+    /// typed, and trimming on symbol alone would throw it away.
+    fn line_cells(p: &Prompt, w: u16, h: u16) -> Vec<Cell> {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
         terminal.draw(|f| draw(f, p)).expect("draw");
         let buf = terminal.backend().buffer().clone();
 
+        let reversed = |x, y| buf[(x, y)].modifier.contains(Modifier::REVERSED);
         let y = (0..buf.area.height)
-            .find(|&y| (0..buf.area.width).any(|x| buf[(x, y)].symbol() == draw::CURSOR))
-            .expect("the field row should be the one holding the cursor");
+            .find(|&y| (0..buf.area.width).any(|x| reversed(x, y)))
+            .expect("the prompt line should be the row holding the cursor");
 
-        let row: Vec<(String, bool)> = (0..buf.area.width)
+        let row: Vec<Cell> = (0..buf.area.width)
             .map(|x| {
                 let cell = &buf[(x, y)];
-                (
-                    cell.symbol().to_string(),
-                    cell.modifier.contains(Modifier::DIM),
-                )
+                (cell.symbol().to_string(), cell.modifier)
             })
             .collect();
 
-        let first = row.iter().position(|(s, _)| s != " ").expect("content");
-        let last = row.iter().rposition(|(s, _)| s != " ").expect("content");
+        let shown = |x: usize| row[x].0 != " " || reversed(x as u16, y);
+        let first = (0..row.len()).find(|&x| shown(x)).expect("content");
+        let last = (0..row.len()).rposition(shown).expect("content");
         row[first..=last].to_vec()
     }
 
-    fn text_of(cells: &[(String, bool)]) -> String {
+    /// The buffer column the field starts in — where the first character you
+    /// type will land, and where the default has to be sitting before you do.
+    fn field_column(p: &Prompt, w: u16, h: u16) -> usize {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        terminal.draw(|f| draw(f, p)).expect("draw");
+        let buf = terminal.backend().buffer().clone();
+
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if buf[(x, y)].modifier.contains(Modifier::REVERSED) {
+                    // The cursor is on the field's first column only while the
+                    // field is empty; once typing starts it trails the text.
+                    return x as usize - p.input.width();
+                }
+            }
+        }
+        panic!("no cursor rendered");
+    }
+
+    fn text_of(cells: &[Cell]) -> String {
         cells.iter().map(|(s, _)| s.as_str()).collect()
     }
 
@@ -507,11 +586,13 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_field_shows_the_default_behind_the_cursor() {
+    fn an_empty_field_shows_the_label_and_the_default() {
         let lines = render(&prompt(), 50, 9);
         assert!(
-            lines.iter().any(|l| l.contains("▋session 3")),
-            "expected the placeholder in the field, got {lines:?}"
+            lines
+                .iter()
+                .any(|l| l.contains("new session name: session 3")),
+            "expected the labelled line with its default, got {lines:?}"
         );
     }
 
@@ -521,8 +602,10 @@ mod tests {
         type_in(&mut p, "my-project");
         let lines = render(&p, 50, 9);
         assert!(
-            lines.iter().any(|l| l.contains("my-project▋")),
-            "expected the typed name with a trailing cursor, got {lines:?}"
+            lines
+                .iter()
+                .any(|l| l.contains("new session name: my-project")),
+            "expected the typed name after the label, got {lines:?}"
         );
         assert!(
             !lines.iter().any(|l| l.contains("session 3")),
@@ -538,33 +621,78 @@ mod tests {
         p.on_key(Key::Backspace);
         let lines = render(&p, 50, 9);
         assert!(
-            lines.iter().any(|l| l.contains("▋session 3")),
+            lines
+                .iter()
+                .any(|l| l.contains("new session name: session 3")),
             "expected the placeholder back, got {lines:?}"
         );
     }
 
-    /// The placeholder has to be visibly *not* input, and dim is the only tool
-    /// available given nothing here sets a colour.
+    /// The bug this layout exists to avoid: if the default starts one column
+    /// over from where typing lands, the field jumps on the first keystroke.
+    ///
+    /// It only holds because the anchor is measured from the *opening* line and
+    /// ignores `input`, so this pins that too.
     #[test]
-    fn the_placeholder_is_dim_and_typed_text_is_not() {
-        let placeholder = field_cells(&prompt(), 50, 9);
-        assert_eq!(text_of(&placeholder), "\u{258b}session 3");
+    fn the_default_sits_where_the_first_keystroke_will_land() {
+        let mut typed = prompt();
+        type_in(&mut typed, "n");
+
+        assert_eq!(
+            field_column(&prompt(), 50, 9),
+            field_column(&typed, 50, 9),
+            "the default and the first typed character must share a column"
+        );
+    }
+
+    /// Four roles on one line, and modifiers are the only way to tell them
+    /// apart given nothing here sets a colour: the label leads in bold, the
+    /// cursor is an inverted cell, the default recedes into dim, and what you
+    /// type is plain.
+    #[test]
+    fn the_label_leads_the_cursor_marks_the_field_and_the_default_recedes() {
+        let label = PREFIX.width();
+
+        let empty = line_cells(&prompt(), 50, 9);
+        assert_eq!(text_of(&empty), "new session name: session 3");
         assert!(
-            !placeholder[0].1,
-            "the cursor is the user's, not part of the placeholder"
+            empty[..label]
+                .iter()
+                .all(|(_, m)| m.contains(Modifier::BOLD)),
+            "the label must be bold: {empty:?}"
+        );
+        assert_eq!(
+            empty[label].1,
+            Modifier::REVERSED,
+            "the cursor inverts the default's first letter and nothing else"
         );
         assert!(
-            placeholder[1..].iter().all(|(_, dim)| *dim),
-            "every placeholder cell must be dim: {placeholder:?}"
+            empty[label + 1..].iter().all(|(_, m)| *m == Modifier::DIM),
+            "the rest of the default must be dim and only dim: {empty:?}"
         );
 
         let mut p = prompt();
         type_in(&mut p, "notes");
-        let typed = field_cells(&p, 50, 9);
-        assert_eq!(text_of(&typed), "notes\u{258b}");
+        let typed = line_cells(&p, 50, 9);
+        assert_eq!(text_of(&typed), "new session name: notes ");
         assert!(
-            typed.iter().all(|(_, dim)| !*dim),
-            "typed text must not be dim: {typed:?}"
+            typed[..label]
+                .iter()
+                .all(|(_, m)| m.contains(Modifier::BOLD)),
+            "the label must stay bold once typing starts: {typed:?}"
+        );
+        assert!(
+            typed[label..label + 5].iter().all(|(_, m)| m.is_empty()),
+            "typed text carries no modifier at all: {typed:?}"
+        );
+        assert_eq!(
+            typed[label + 5].1,
+            Modifier::REVERSED,
+            "the cursor trails what was typed, over a blank"
+        );
+        assert!(
+            typed.iter().all(|(_, m)| !m.contains(Modifier::DIM)),
+            "nothing on a typed line is dim: {typed:?}"
         );
     }
 
@@ -598,7 +726,7 @@ mod tests {
         let lines = render(&p, 50, 9);
         let field = lines
             .iter()
-            .position(|l| l.contains("notes▋"))
+            .position(|l| l.contains("new session name: notes"))
             .expect("the field should still show what was typed");
         assert!(
             lines[field + 1].contains("already exists"),

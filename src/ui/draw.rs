@@ -30,7 +30,7 @@ const MARKER: &str = "▸ ";
 const INDENT: &str = "  ";
 
 /// The prompt cursor.
-pub(super) const CURSOR: &str = "▋";
+const CURSOR: &str = "▋";
 
 /// Only a floor for the degenerate case of every name being empty; the block is
 /// otherwise sized to its content. A minimum wider than the content would push

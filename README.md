@@ -102,10 +102,18 @@ reimplementing it.
 | `Ctrl-t` `c` | name a new session and attach to it — `Esc` goes back |
 | `Ctrl-t` `Ctrl-t` | send a literal `Ctrl-t` to Neovim |
 
-`Ctrl-t c` hides the session and asks for a name in the middle of the screen. The
-next free `session N` is shown dimmed in the field as the default, so pressing
-enter straight away names it that; typing replaces it. A name that is already
-taken is reported in place, with what you typed still there to fix.
+`Ctrl-t c` hides the session and asks for a name in the middle of the screen:
+
+```
+                    new session name: session 3
+                                      ▔▔▔▔▔▔▔▔▔ dimmed default
+```
+
+The next free `session N` sits in the field as a dimmed placeholder, with the
+cursor on its first letter — so it occupies exactly the columns your own name
+will, and pressing enter straight away names the session that. Typing replaces
+it. A name that is already taken is reported in place, with what you typed still
+there to fix.
 
 Everything else goes to Neovim untouched — including `Ctrl-c`, `Ctrl-z` and
 `Ctrl-s`, which reach the editor as ordinary keys rather than becoming signals
