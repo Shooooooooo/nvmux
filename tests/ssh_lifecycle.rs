@@ -1,8 +1,14 @@
 //! End-to-end tests for the SSH transport, against a real `sshd`.
 //!
 //! The host comes from `$NVMUX_TEST_SSH_HOST`, defaulting to `selftest`; where
-//! no such host answers these **skip** rather than fail. The README's
-//! Development section has the `~/.ssh/config` stanza to set one up.
+//! no such host answers these **skip** rather than fail. Set one up with:
+//!
+//! ```text
+//! Host selftest
+//!   HostName 127.0.0.1
+//!   User <you>
+//!   IdentityFile ~/.ssh/id_ed25519
+//! ```
 //!
 //! Pointing that alias at localhost is not a cheat: it exercises the real ssh
 //! client, a real ControlMaster, real unix-socket forwarding and a real remote
