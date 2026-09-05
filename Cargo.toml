@@ -5,6 +5,10 @@ edition = "2021"
 rust-version = "1.88"
 description = "A tmux-style session manager for Neovim"
 license = "MIT"
+repository = "https://github.com/Shooooooooo/nvmux-rs"
+readme = "README.md"
+keywords = ["neovim", "nvim", "session", "tmux", "ssh"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1"
@@ -17,7 +21,10 @@ nix = { version = "0.31", default-features = false, features = [
     "fs", "process", "signal", "term", "user",
 ] }
 portable-pty = "0.9"
-ratatui = "0.30"
+# Only the crossterm backend: the defaults also pull in every widget (the
+# calendar brings the `time` crate) and the layout macros, none of which the
+# picker uses.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 rmpv = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

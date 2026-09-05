@@ -32,6 +32,8 @@ pub enum Request {
     /// Ask for a new name for this session.
     RenameSession(String),
     Kill(String),
+    /// Show the key bindings; help happens on its own screen.
+    Help,
     Quit,
 }
 
@@ -288,6 +290,7 @@ impl App {
                 self.mode = Mode::Filter;
                 Request::None
             }
+            Key::Char('?') => Request::Help,
             Key::Esc => {
                 self.filter.clear();
                 self.clamp_selection();
@@ -482,6 +485,7 @@ mod tests {
     fn q_and_ctrl_c_quit() {
         assert_eq!(app(&["x"]).on_key(Key::Char('q')), Request::Quit);
         assert_eq!(app(&["x"]).on_key(Key::CtrlC), Request::Quit);
+        assert_eq!(app(&["x"]).on_key(Key::Char('?')), Request::Help);
     }
 
     #[test]

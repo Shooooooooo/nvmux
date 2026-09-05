@@ -42,7 +42,10 @@ const MAX_LIST_WIDTH: u16 = 48;
 /// Columns between the number and the name.
 const NUM_GAP: &str = "  ";
 
-const HINTS: &str = "↑↓ move   ⏎ 1-9 attach   c new   r rename   x kill   q quit";
+/// Sixty columns exactly: the widest row that still fits a small terminal
+/// without truncation. `?` is not listed — its screen shows the `<prefix>`
+/// keys, and the README carries the picker's own.
+const HINTS: &str = "↑↓ move  ⏎ attach  c new  r rename  x kill  / filter  q quit";
 const EMPTY: &str = "no sessions — press c to create one";
 
 pub fn draw(frame: &mut Frame, app: &App) {

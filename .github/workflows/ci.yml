@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The integration tests skip when there is no usable nvim. In CI that would
+  # be a silent no-op, so a missing nvim is a failure here. `ssh` is not
+  # listed: the SSH tests need a host that answers, which a runner has not.
+  NVMUX_TEST_REQUIRE: nvim
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install Neovim (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL -o nvim.tar.gz \
+            https://github.com/neovim/neovim/releases/latest/download/nvim-linux-x86_64.tar.gz
+          sudo tar -C /opt -xzf nvim.tar.gz
+          echo /opt/nvim-linux-x86_64/bin >> "$GITHUB_PATH"
+      - name: Install Neovim (macOS)
+        if: runner.os == 'macOS'
+        run: brew install neovim
+      - run: nvim --version | head -1
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  msrv:
+    name: rust-version check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - run: cargo check --all-targets

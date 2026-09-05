@@ -82,6 +82,18 @@ mod tests {
         assert!(Cli::try_parse_from(["nvmux", "a", "b"]).is_err());
     }
 
+    /// `--help` is printed before the config is read, so it spells the
+    /// built-in default; this keeps that spelling tied to the constant.
+    #[test]
+    fn help_names_the_default_prefix() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(
+            help.contains(crate::keys::PREFIX_LABEL),
+            "--help does not mention {}: {help}",
+            crate::keys::PREFIX_LABEL
+        );
+    }
+
     #[test]
     fn version_and_help_exist() {
         let err = Cli::try_parse_from(["nvmux", "--version"]).expect_err("exits");

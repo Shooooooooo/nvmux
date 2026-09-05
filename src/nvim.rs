@@ -221,7 +221,16 @@ mod tests {
     #[test]
     fn agrees_with_the_real_binary() {
         let Ok(out) = Command::new("nvim").arg("--version").output() else {
-            return; // No nvim here; the unit cases above still cover the parser.
+            // No nvim here; the unit cases above still cover the parser. Unless
+            // the environment insists (CI does), in which case its absence is
+            // the bug.
+            let strict = std::env::var("NVMUX_TEST_REQUIRE")
+                .is_ok_and(|v| v.split(',').any(|w| w.trim() == "nvim"));
+            assert!(
+                !strict,
+                "NVMUX_TEST_REQUIRE names nvim but it is not on $PATH"
+            );
+            return;
         };
         let banner = String::from_utf8_lossy(&out.stdout);
         let parsed = parse_version(&banner).expect("real nvim banner must parse");

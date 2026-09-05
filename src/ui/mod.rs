@@ -247,6 +247,8 @@ fn run_loop(
                     refresh(&mut app, &mut highest, transport)?;
                 }
             }
+
+            Request::Help => help::run_on(terminal, false)?,
         }
     };
 

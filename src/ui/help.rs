@@ -107,16 +107,20 @@ fn on_key(key: Key) -> Step {
 pub fn run() -> Result<()> {
     // Reached from a session that has already dissolved to black, so start black.
     let mut screen = super::Screen::open(crate::fade::excursions())?;
-    let outcome = run_loop(screen.terminal());
+    let outcome = run_on(screen.terminal(), true);
     // Restore before propagating: see `ui::Screen`.
     screen.close()?;
     outcome
 }
 
-fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
+/// Show the bindings on a terminal the caller already owns — how the picker
+/// answers `?`. `animate` is whether to dip through black on the way in and
+/// out; from the picker the screen is already up, so it does not.
+pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> Result<()> {
     let label = keys::prefix_label(crate::settings::get().keys.prefix);
     let rows = rows(&label);
-    if crate::fade::excursions() {
+    let animate = animate && crate::fade::excursions();
+    if animate {
         crate::fade::fade_in_ratatui(terminal, |f| draw(f, &rows))?;
     }
     loop {
@@ -134,7 +138,7 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
 
         if on_key(key) == Step::Close {
             // Dissolve back to black so the resumed session takes over dark.
-            if crate::fade::excursions() {
+            if animate {
                 crate::fade::fade_out_ratatui(terminal, |f| draw(f, &rows))?;
             }
             return Ok(());
