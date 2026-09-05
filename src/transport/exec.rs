@@ -1,0 +1,110 @@
+//! Running a shell script on the host that owns the sessions.
+//!
+//! Local and remote differ in exactly one primitive: how to run a POSIX `sh`
+//! script and collect its stdout. Isolating that here is what lets
+//! [`crate::transport::protocol`] — all the parsing and argument building — be
+//! pure, shared, and heavily unit-tested.
+//!
+//! The scripts themselves are shared *verbatim*: the same file runs as
+//! `sh script dir` locally and as `ssh host 'sh -s <args>'` remotely, with
+//! positional arguments arriving identically on both paths.
+
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+use crate::error::{NvmuxError, Result};
+
+/// What a script run produced.
+#[derive(Debug, Clone)]
+pub struct Output {
+    pub stdout: String,
+    pub stderr: String,
+    pub status: i32,
+}
+
+impl Output {
+    pub fn ok(&self) -> bool {
+        self.status == 0
+    }
+}
+
+/// Runs scripts somewhere.
+pub trait Executor: Send + Sync {
+    /// Run `script` under `/bin/sh` with `args` as `$1..$n`.
+    ///
+    /// The script is delivered on **stdin**, never interpolated into a command
+    /// string. That is what keeps session names containing quotes, spaces and
+    /// `$(...)` from being a command injection: the remote shell parses the
+    /// script text once and receives every variable part as an already-split
+    /// argument it never re-parses.
+    fn run_script(&self, script: &str, args: &[&str]) -> Result<Output>;
+
+    /// For error messages only.
+    fn describe(&self) -> &str;
+}
+
+/// Runs scripts on this machine.
+pub struct LocalExecutor;
+
+impl Executor for LocalExecutor {
+    fn run_script(&self, script: &str, args: &[&str]) -> Result<Output> {
+        let mut child = Command::new("/bin/sh")
+            .arg("-s")
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(NvmuxError::Io)?;
+
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("no stdin on /bin/sh"))?
+            .write_all(script.as_bytes())
+            .map_err(NvmuxError::Io)?;
+
+        let out = child.wait_with_output().map_err(NvmuxError::Io)?;
+        Ok(Output {
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            status: out.status.code().unwrap_or(-1),
+        })
+    }
+
+    fn describe(&self) -> &str {
+        "local"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn positional_arguments_arrive_intact() {
+        let out = LocalExecutor
+            .run_script(
+                r#"printf '[%s]' "$1" "$2" "$3""#,
+                &["one", "two words", "it's"],
+            )
+            .expect("run");
+        assert!(out.ok(), "stderr: {}", out.stderr);
+        assert_eq!(out.stdout, "[one][two words][it's]");
+    }
+
+    #[test]
+    fn shell_metacharacters_in_arguments_are_not_evaluated() {
+        let out = LocalExecutor
+            .run_script(r#"printf '%s' "$1""#, &["$(echo pwned)"])
+            .expect("run");
+        assert_eq!(out.stdout, "$(echo pwned)", "argument was re-evaluated");
+    }
+
+    #[test]
+    fn a_failing_script_reports_its_status_not_an_error() {
+        let out = LocalExecutor.run_script("exit 3", &[]).expect("run");
+        assert_eq!(out.status, 3);
+        assert!(!out.ok());
+    }
+}
