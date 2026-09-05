@@ -219,6 +219,17 @@ pub enum ConfigError {
     /// deserializer's (e.g. `fade.frames = 0`, which would divide by zero).
     #[error("{}: {message}", .path.display())]
     Invalid { path: PathBuf, message: String },
+
+    /// The first-run config file could not be written (create the directory, the
+    /// temp file, or the rename). Non-fatal at the call site — nvmux keeps the
+    /// chosen prefix in memory for the session — but typed so the message names
+    /// the path.
+    #[error("{}: {source}", .path.display())]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// The error type crossing the [`crate::transport::Transport`] boundary, plus

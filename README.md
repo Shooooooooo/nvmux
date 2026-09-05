@@ -116,6 +116,12 @@ so a partial file only overrides what it names. A file that exists but does not
 parse, names an unknown key, or fails validation is a startup error, reported
 with its path — a typo is never silently ignored.
 
+**First run.** The first time you start nvmux at a terminal with no config file,
+it asks you to pick a prefix: press the key you want (or `Enter` to keep
+`Ctrl-t`), and nvmux writes the file below for you, so it only ever asks once.
+`Esc` skips and leaves things unset — you'll be asked again next time. This never
+happens for a non-interactive run or when `$NVMUX_CONFIG` is set.
+
 Every value below is its default:
 
 ```toml

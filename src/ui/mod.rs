@@ -31,6 +31,7 @@ pub mod app;
 pub mod draw;
 pub mod help;
 pub mod prompt;
+pub mod setup;
 
 /// What the picker returned.
 #[derive(Debug, Clone)]

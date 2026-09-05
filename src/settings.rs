@@ -29,6 +29,7 @@
 //! developer's real `~/.config/nvmux/config.toml`.
 
 use std::ffi::OsStr;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -205,6 +206,105 @@ fn parse(path: &Path, contents: &str) -> Result<Settings, ConfigError> {
     Ok(settings)
 }
 
+// --- first run ------------------------------------------------------------
+
+/// The path a first-run config should be written to, or `None` when nvmux must
+/// not offer to create one: `$NVMUX_CONFIG` is set (the user owns that file), no
+/// default path can be formed (no `$HOME`/`$XDG_CONFIG_HOME`), or a config
+/// already exists at the default path.
+pub fn first_run_target() -> Option<PathBuf> {
+    let nvmux_config = std::env::var_os("NVMUX_CONFIG");
+    let xdg = std::env::var_os("XDG_CONFIG_HOME");
+    let home = std::env::var_os("HOME");
+    match resolve_config_path(nvmux_config.as_deref(), xdg.as_deref(), home.as_deref()) {
+        ConfigSource::Default(path) if !path.exists() => Some(path),
+        _ => None,
+    }
+}
+
+/// The settings for a session started from the first-run prompt: the chosen
+/// prefix over the built-in defaults.
+pub fn with_prefix(prefix: u8) -> Settings {
+    Settings {
+        keys: KeySettings {
+            prefix,
+            ..KeySettings::default()
+        },
+        ..Settings::default()
+    }
+}
+
+/// The first-run config file body: a commented template that documents every
+/// option but activates only `[keys] prefix`. Recording just the choice means
+/// the file does not pin the other defaults — they keep tracking the code. The
+/// commented values are the current defaults, so the template stays accurate.
+fn render_default_config(prefix: u8) -> String {
+    let f = FadeSettings::default();
+    let k = KeySettings::default();
+    format!(
+        "# nvmux configuration — created on first run.\n\
+         #\n\
+         # Uncomment and edit any line to override its default; delete this file\n\
+         # to start over. See the README for what each option does.\n\
+         #\n\
+         # [fade]\n\
+         # enabled        = {enabled}\n\
+         # frames         = {frames}\n\
+         # frame_delay_ms = {frame_delay}\n\
+         # hold_ms        = {hold}\n\
+         # excursions     = {excursions}\n\
+         # raw_dissolve   = {raw}\n\
+         \n\
+         [keys]\n\
+         prefix     = {prefix:?}\n\
+         # timeout_ms = {timeout}\n",
+        enabled = f.enabled,
+        frames = f.frames,
+        frame_delay = f.frame_delay_ms,
+        hold = f.hold_ms,
+        excursions = f.excursions,
+        raw = f.raw_dissolve,
+        prefix = crate::keys::prefix_label(prefix),
+        timeout = k.timeout_ms,
+    )
+}
+
+/// Write the first-run config to `path`, creating its parent directory.
+///
+/// Atomic (temp file plus `rename` within the directory), matching
+/// [`crate::session::Session::write_atomic`]. The parent is created with a
+/// gentle `DirBuilder`, not `config::ensure_dir_secure`: that is `/tmp`
+/// hardening that would reject a pre-existing `~/.config` at `0755` and does not
+/// create missing parents.
+pub fn write_default(path: &Path, prefix: u8) -> Result<(), ConfigError> {
+    use std::io::Write;
+    let err = |source| ConfigError::Write {
+        path: path.to_path_buf(),
+        source,
+    };
+
+    if let Some(parent) = path.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .map_err(err)?;
+    }
+
+    let contents = render_default_config(prefix);
+    let tmp = path.with_extension(format!("toml.tmp{}", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        err(e)
+    })
+}
+
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
 
 /// Install the loaded settings, once, before anything reads them. `main` is the
@@ -326,6 +426,32 @@ mod tests {
     fn zero_frames_is_rejected() {
         let err = parse(Path::new("test.toml"), "[fade]\nframes = 0\n").expect_err("invalid");
         assert!(matches!(err, ConfigError::Invalid { .. }), "got {err:?}");
+    }
+
+    // --- first-run template (pure) -----------------------------------------
+
+    #[test]
+    fn the_default_config_round_trips_to_the_chosen_prefix() {
+        for byte in [crate::keys::PREFIX, 0x01, 0x02] {
+            let rendered = render_default_config(byte);
+            let s: Settings = toml::from_str(&rendered).expect("valid toml");
+            assert_eq!(s.keys.prefix, byte, "prefix survives the round trip");
+            // Only the prefix is active; everything else stays at the defaults.
+            assert_eq!(s, with_prefix(byte));
+            s.validate().expect("valid");
+        }
+    }
+
+    #[test]
+    fn the_default_config_activates_only_the_prefix() {
+        let rendered = render_default_config(0x01);
+        assert!(
+            rendered.contains("\nprefix     = \"Ctrl-a\"\n"),
+            "the chosen prefix is the one active setting: {rendered:?}"
+        );
+        // The fade block and the timeout are documentation, not active settings.
+        assert!(rendered.contains("# [fade]"));
+        assert!(rendered.contains("# timeout_ms = 500"));
     }
 
     // --- path resolution (pure) --------------------------------------------
@@ -462,6 +588,77 @@ mod tests {
             matches!(load(), Err(ConfigError::Parse { .. })),
             "a typo in the default file must not be silently ignored"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // --- first-run detection + write (touches env; guarded) ----------------
+
+    #[test]
+    fn first_run_target_is_none_when_nvmux_config_is_set() {
+        let _lock = guard();
+        let env = ScrubbedEnv::new();
+        env.set("NVMUX_CONFIG", "/some/explicit.toml");
+        env.set("HOME", "/home/whoever");
+        assert_eq!(first_run_target(), None, "an explicit config is the user's");
+    }
+
+    #[test]
+    fn first_run_target_points_at_the_default_when_absent() {
+        let _lock = guard();
+        let env = ScrubbedEnv::new();
+        let home = scratch("first-run-home");
+        env.set("HOME", &home);
+        let want = home.join(".config").join("nvmux").join("config.toml");
+        assert_eq!(first_run_target(), Some(want));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn first_run_target_is_none_once_a_file_exists() {
+        let _lock = guard();
+        let env = ScrubbedEnv::new();
+        let home = scratch("first-run-existing");
+        let cfg = home.join(".config").join("nvmux");
+        std::fs::create_dir_all(&cfg).expect("mkdir");
+        std::fs::write(cfg.join("config.toml"), "").expect("write");
+        env.set("HOME", &home);
+        assert_eq!(
+            first_run_target(),
+            None,
+            "a present config is not first-run"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn xdg_config_home_wins_for_the_first_run_target() {
+        let _lock = guard();
+        let env = ScrubbedEnv::new();
+        let xdg = scratch("first-run-xdg");
+        let home = scratch("first-run-xdg-home");
+        env.set("XDG_CONFIG_HOME", &xdg);
+        env.set("HOME", &home);
+        assert_eq!(
+            first_run_target(),
+            Some(xdg.join("nvmux").join("config.toml"))
+        );
+        std::fs::remove_dir_all(&xdg).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn write_default_creates_the_dir_and_a_loadable_file() {
+        let _lock = guard();
+        let env = ScrubbedEnv::new();
+        let home = scratch("write-default-home");
+        env.set("HOME", &home);
+
+        let target = first_run_target().expect("a first-run target");
+        write_default(&target, 0x01).expect("write");
+        assert!(target.exists(), "the config file was created");
+        // It is no longer a first-run target, and load() reads the choice back.
+        assert_eq!(first_run_target(), None);
+        assert_eq!(load().expect("load").keys.prefix, 0x01);
         std::fs::remove_dir_all(&home).ok();
     }
 }
