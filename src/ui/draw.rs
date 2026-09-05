@@ -48,7 +48,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
         return;
     }
 
-    // The last row is the hint/prompt line; everything above it is the list.
     let list_area = Rect {
         height: area.height.saturating_sub(1),
         ..area
@@ -70,7 +69,6 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     let visible = app.visible();
 
     if visible.is_empty() {
-        // A single dimmed line, centred, and nothing else.
         let text = truncate(EMPTY, area.width as usize);
         let para = Paragraph::new(Line::from(Span::styled(
             text,
@@ -81,17 +79,14 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // Width fits the longest visible name, plus the marker, within sane bounds.
     let widest = visible.iter().map(|s| s.name.width()).max().unwrap_or(0) as u16;
     let width = (widest + MARKER.width() as u16)
         .clamp(MIN_LIST_WIDTH, MAX_LIST_WIDTH)
         .min(area.width);
 
-    // Height fits the entries, or as many as there is room for.
     let height = (visible.len() as u16).min(area.height);
     let block = centre(area, width, height);
 
-    // Scroll only when the list does not fit, keeping the selection in view.
     let offset = scroll_offset(app.selected_index(), visible.len(), height as usize);
 
     let rows: Vec<Line> = visible
@@ -116,15 +111,13 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_bottom(frame: &mut Frame, app: &App, area: Rect) {
-    // Prompts replace the hint line in place — never a popup, never a border.
     let (text, dim) = match app.mode() {
         Mode::Confirm { prompt, .. } => (prompt.clone(), false),
         Mode::Filter => (format!("/{}{CURSOR}", app.filter()), false),
         Mode::Normal => match app.message() {
             Some(msg) => (msg.to_string(), false),
             None if !app.filter().is_empty() => {
-                // A filter applied from Normal mode is still worth showing, or
-                // the list silently looks shorter than it is.
+                // Or the list silently looks shorter than it is.
                 (format!("/{}", app.filter()), true)
             }
             None => (HINTS.to_string(), true),
@@ -199,12 +192,8 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    /// Reconstruct the rendered lines.
-    ///
-    /// A wide glyph occupies two cells: the symbol lands in the first and the
-    /// second is a filler. Concatenating every cell would therefore report a CJK
-    /// name as three columns per character instead of two, so the filler cell
-    /// following a wide symbol is skipped.
+    /// Reconstruct the rendered lines, skipping the filler cell that follows a
+    /// wide glyph so a CJK name is not reported as three columns per character.
     fn render(app: &App, w: u16, h: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
         terminal.draw(|f| draw(f, app)).expect("draw");
@@ -245,18 +234,15 @@ mod tests {
             11,
         );
 
-        // The hint line is the last row, and nothing else is on it.
         assert!(
             lines[10].contains("attach") && lines[10].contains("quit"),
             "hints should be on the last row, got {:?}",
             lines[10]
         );
 
-        // Exactly the four names appear, and nothing else.
         let content: Vec<&String> = lines[..10].iter().filter(|l| !l.is_empty()).collect();
         assert_eq!(content.len(), 4, "expected 4 rows, got {content:?}");
 
-        // No borders, no title, no header, no box drawing anywhere.
         for line in &lines {
             for ch in "┌┐└┘─│├┤┬┴┼╭╮╰╯═║".chars() {
                 assert!(!line.contains(ch), "found border char {ch:?} in {line:?}");
@@ -275,9 +261,7 @@ mod tests {
         assert!(rows[0].contains("▸ aaa"), "selected row: {:?}", rows[0]);
         assert!(rows[1].contains("  bbb"), "unselected row: {:?}", rows[1]);
 
-        // Names line up in one column, so nothing shifts as the selection
-        // moves. Measured in display columns: "▸" is three bytes but one column,
-        // so byte offsets would differ here even when the layout is correct.
+        // Display columns, not bytes: "▸" is three bytes but one column.
         let col = |l: &str, name: &str| {
             let byte = l.find(name).expect("name present");
             l[..byte].width()
@@ -296,10 +280,8 @@ mod tests {
             .collect();
         assert_eq!(occupied.len(), 2);
 
-        // Two rows in a 20-row list area: centred means rows 9 and 10.
         assert_eq!(occupied, vec![9, 10], "list is not vertically centred");
 
-        // And horizontally: the gap on the left should match the gap on the right.
         let row = &lines[9];
         let left = row.len() - row.trim_start().len();
         let right = 60 - row.width();
@@ -319,12 +301,9 @@ mod tests {
         assert!(lines[8].contains("quit"), "hints should still be present");
     }
 
-    /// The picker's own prompts stay on the hint row — no popup, no border, no
-    /// shift in the list above.
-    ///
-    /// Naming is the exception and deliberately so: `c` and `r` hand off to the
-    /// full-screen prompt instead. What is left here — the filter and the kill
-    /// confirm — still owes the contract, so both are checked.
+    /// The picker's own prompts — the filter and the kill confirm — stay on the
+    /// hint row: no popup, no border, no shift in the list above. Naming is the
+    /// exception, and hands off to the full-screen prompt.
     #[test]
     fn prompts_replace_the_hint_line_in_place() {
         for (open_with, typed, expected) in
@@ -345,7 +324,6 @@ mod tests {
                 !lines[7].contains("quit"),
                 "hints should be replaced, not appended"
             );
-            // The list is untouched above it.
             assert!(lines[..7].iter().any(|l| l.contains("dotfiles")));
         }
     }
@@ -371,7 +349,6 @@ mod tests {
         }
         let lines = render(&a, 60, 6);
         assert!(lines[5].contains("/dot▋"), "got {:?}", lines[5]);
-        // ...and the list really has narrowed.
         assert!(lines[..5].iter().any(|l| l.contains("dotfiles")));
         assert!(!lines[..5].iter().any(|l| l.contains("api-server")));
     }
@@ -380,8 +357,7 @@ mod tests {
     fn a_narrow_terminal_truncates_the_hints_rather_than_wrapping() {
         let lines = render(&app(&["one"]), 20, 5);
         assert_eq!(lines.len(), 5);
-        // The hint line still occupies exactly one row: row 3 must stay part of
-        // the list area, not become spillover from the hints.
+        // Row 3 must stay part of the list area, not spillover from the hints.
         assert!(
             lines[4].width() <= 20,
             "hint row overflowed: {:?}",

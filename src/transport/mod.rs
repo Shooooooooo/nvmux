@@ -18,9 +18,8 @@ use crate::session::Session;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Location {
     Local,
-    /// The string is passed to `ssh` **verbatim**, so `myhost`,
-    /// `user@myhost`, and any `~/.ssh/config` alias all work without nvmux
-    /// needing to understand any of them.
+    /// Passed to `ssh` **verbatim**, so a hostname, `user@host` or any
+    /// `~/.ssh/config` alias works without nvmux understanding it.
     Ssh(String),
 }
 
@@ -40,37 +39,27 @@ impl std::fmt::Display for Location {
 pub trait Transport {
     fn location(&self) -> &Location;
 
-    /// Every session on the host, with liveness already determined.
-    ///
-    /// One call, not one call per session. Each SSH round trip costs roughly
-    /// 230ms even to localhost, so a chatty interface would feel fine in local
-    /// testing and be unusable over a real link.
+    /// Every session on the host, with liveness already determined. One call,
+    /// not one per session — see [`crate::shell::LIST_SCRIPT`].
     fn list_sessions(&self) -> Result<Vec<Session>>;
 
     fn create_session(&self, name: &str) -> Result<Session>;
 
-    /// Terminate a session.
-    ///
-    /// Unconditional: nvmux does not ask the session about unsaved buffers
-    /// first. Kill means kill. To leave a session normally — saving as you would
-    /// in any editor — switch to it and `:q`, which ends the session because the
-    /// editor is the session.
+    /// Terminate a session, unconditionally: nvmux never asks about unsaved
+    /// buffers. The ordinary way out is `:q` in the session itself, which ends
+    /// it because the editor *is* the session.
     fn kill_session(&self, s: &Session) -> Result<()>;
 
-    /// Rename is a metadata edit and nothing more.
-    ///
-    /// The socket is never renamed or moved: its path is the session's stable
-    /// identity, and the display name is only data. Neovim can add listen
-    /// addresses at runtime with `serverstart()`, but managing two paths and two
-    /// SSH forwards per rename buys nothing.
+    /// Rename is a metadata edit and nothing more. The socket is never renamed
+    /// or moved: its path is the session's stable identity and the display name
+    /// is only data, so no SSH forward has to be rebuilt.
     fn rename_session(&self, s: &Session, new_name: &str) -> Result<()>;
 
     /// A socket path on **this** machine that `nvim --server` can use.
     ///
-    /// The single seam that makes remote sessions work: locally it is the
-    /// session socket itself, and over SSH it is the local end of a forward.
-    /// Everything downstream — the RPC client, the `--remote-ui` child — is
-    /// identical in both cases.
+    /// The single seam that makes remote sessions work: locally the session
+    /// socket itself, over SSH the local end of a forward. Everything downstream
+    /// is identical in both cases.
     fn local_socket_for(&self, s: &Session) -> Result<PathBuf>;
 }
 
@@ -84,8 +73,7 @@ pub fn open(location: Location) -> Result<Box<dyn Transport>> {
 
 /// Shared by both transports: turn a listing into sessions, sorted for display.
 pub(crate) fn finish_listing(mut sessions: Vec<Session>) -> Result<Vec<Session>> {
-    // Sorted by name, as specified. `sort_by_key` on a lowercased copy so that
-    // `Api` and `api` do not end up in surprising places.
+    // Case-folded, so `Api` and `api` do not end up in surprising places.
     sessions.sort_by(|a, b| {
         a.name
             .to_lowercase()

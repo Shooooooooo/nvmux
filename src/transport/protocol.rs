@@ -1,12 +1,9 @@
-//! Pure parsing and argument building for the session-host scripts.
+//! Pure parsing and argument building for the session-host scripts. Zero I/O,
+//! so the code most likely to break silently is the code with the heaviest
+//! tests.
 //!
-//! Zero I/O lives here, which is the point: this is the code most likely to
-//! break silently (a changed field order, an empty listing that should have
-//! been an error), so it is the code that gets the heaviest tests.
-//!
-//! If `if self.is_remote()` ever appears in this file, the abstraction has
-//! leaked — that condition belongs inside a script or inside
-//! [`crate::transport::Transport::local_socket_for`].
+//! If `if self.is_remote()` ever appears here the abstraction has leaked — that
+//! belongs in a script or in [`crate::transport::Transport::local_socket_for`].
 
 use crate::error::{NvmuxError, Result};
 use crate::session::{Liveness, Session};
@@ -49,10 +46,8 @@ pub fn parse_listing(stdout: &str) -> Result<Vec<Listed>> {
         let mut fields = line.splitn(4, '\t');
         match fields.next() {
             Some("S") => {}
-            // Anything else is the remote shell talking (a profile that prints a
-            // banner, a warning). Ignore it rather than failing: shells print
-            // things, and refusing to list sessions because of a MOTD would be
-            // maddening.
+            // The remote shell talking — a profile banner, a warning. Refusing
+            // to list sessions because of a MOTD would be maddening.
             _ => {
                 tracing::debug!(line, "ignoring unrecognised line from list.sh");
                 continue;
@@ -84,11 +79,8 @@ pub fn parse_listing(stdout: &str) -> Result<Vec<Listed>> {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Spawned {
     /// The pid of the new nvim, **validated** against the socket it serves.
-    ///
-    /// `None` means the script could not confirm which process owns the socket.
-    /// That is not fatal — the session may be perfectly healthy — but nvmux must
-    /// never send a signal to an unvalidated pid, because pids are reused and
-    /// the number could name something else entirely by now.
+    /// `None` is not fatal, but nvmux must never signal an unvalidated pid:
+    /// pids are reused, and the number could name anything by now.
     pub pid: Option<u32>,
     /// Whether the listen socket appeared before the script gave up waiting.
     pub socket_appeared: bool,
@@ -104,8 +96,7 @@ pub fn parse_spawn(stdout: &str) -> Result<Spawned> {
         match line.split_once(' ') {
             Some(("PID", v)) => out.pid = v.trim().parse().ok().filter(|p| *p > 1),
             Some(("SOCK", v)) => out.socket_appeared = v.trim() == "ok",
-            // The script refuses to spawn into a runtime directory it does not
-            // trust. Surfacing its reason beats reporting a generic timeout.
+            // Surfacing the script's own reason beats a generic timeout.
             Some(("ERROR", v)) => error = Some(v.trim().to_string()),
             _ if line == TERMINATOR => terminated = true,
             _ => tracing::debug!(line, "ignoring unrecognised line from spawn.sh"),
@@ -209,8 +200,7 @@ pub fn parse_kill(stdout: &str) -> Result<KillOutcome> {
 pub fn rows_to_sessions(rows: Vec<Listed>) -> Vec<Session> {
     rows.into_iter()
         .filter(|row| {
-            // The id comes from the socket's own filename, so a malformed one
-            // means something that is not ours is sitting in the runtime
+            // A malformed id means something not ours is in the runtime
             // directory. Skip it rather than turning it into a path.
             let ok = crate::ids::is_valid_id(&row.id);
             if !ok {
@@ -232,10 +222,8 @@ pub fn rows_to_sessions(rows: Vec<Listed>) -> Vec<Session> {
             };
 
             // The FILENAME is the identity, not the `id` field inside the file.
-            // Every path nvmux builds — the socket it connects to, the files it
-            // unlinks, the session a kill or rename targets — derives from this,
-            // so trusting the file's contents would let a corrupt or hand-edited
-            // `<id>.json` aim those operations somewhere else entirely.
+            // Every path nvmux builds derives from it, so trusting the contents
+            // would let a hand-edited `<id>.json` aim a kill somewhere else.
             if session.id != row.id {
                 tracing::warn!(
                     file_id = %session.id,
@@ -244,7 +232,6 @@ pub fn rows_to_sessions(rows: Vec<Listed>) -> Vec<Session> {
                 );
                 session.id = row.id.clone();
             }
-            // The script's hint is the starting point; a real probe overwrites it.
             session.state.liveness = if row.pid_alive {
                 Liveness::Busy
             } else {
@@ -341,8 +328,8 @@ mod tests {
 
     #[test]
     fn names_with_tabs_cannot_break_the_record_format() {
-        // `splitn(4)` means the json field keeps any tabs it contains rather
-        // than shifting later fields. list.sh strips tabs too, belt and braces.
+        // `splitn(4)` keeps tabs inside the json field rather than shifting
+        // later fields. list.sh strips them too.
         let out = listing(
             "S\tabcdefgh\t1\t{\"id\":\"abcdefgh\",\"name\":\"a\tb\",\"created\":1,\"pid\":2}\n",
         );
@@ -366,9 +353,7 @@ mod tests {
 
     #[test]
     fn an_unvalidated_pid_is_none_not_zero() {
-        // spawn.sh prints an empty PID line when it could not confirm which
-        // process owns the socket. Turning that into 0 (or worse, into a pid we
-        // then signal) is the bug this guards.
+        // An empty PID line must not become 0, or a pid we then signal.
         let s = parse_spawn("PID \nSOCK ok\nNVMUX_END\n").expect("parse");
         assert_eq!(s.pid, None, "an unconfirmed pid must not become a number");
 

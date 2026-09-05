@@ -27,8 +27,7 @@ pub enum Mode {
 pub enum Request {
     None,
     Attach(String),
-    /// Ask for a name for a new session. Naming happens on its own screen, so
-    /// the picker only says that it was asked for.
+    /// Ask for a name for a new session; naming happens on its own screen.
     NewSession,
     /// Ask for a new name for this session.
     RenameSession(String),
@@ -57,12 +56,9 @@ impl App {
         }
     }
 
-    /// Replace the session list, keeping the selection on the same session
-    /// where possible.
-    ///
-    /// Selection follows identity rather than position: after a rename the list
-    /// re-sorts, and jumping the highlight to whatever landed at the old index
-    /// would be disorienting.
+    /// Replace the session list, keeping the selection on the same session where
+    /// possible — by identity, not position, so a rename that re-sorts the list
+    /// does not move the highlight to an unrelated row.
     pub fn set_sessions(&mut self, sessions: Vec<Session>) {
         let previously = self.selected_id();
         self.sessions = sessions;
@@ -137,11 +133,8 @@ impl App {
         }
     }
 
-    /// Show the kill confirmation.
-    ///
-    /// Killing is unconditional, so this asks nothing of the session: no RPC,
-    /// no unsaved-buffer count, nothing that could be stale or unobtainable.
-    /// The `[y/N]` is the whole safeguard.
+    /// Show the kill confirmation. Killing is unconditional, so the `[y/N]` is
+    /// the whole safeguard — nothing is asked of the session itself.
     fn show_kill_confirm(&mut self, id: &str) {
         let name = self.session_name(id);
         self.mode = Mode::Confirm {
@@ -152,8 +145,7 @@ impl App {
 
     /// Handle one key. Returns whatever the caller now has to do.
     pub fn on_key(&mut self, key: Key) -> Request {
-        // Any keypress clears a stale message, so it never lingers over an
-        // unrelated action.
+        // A stale message must not linger over an unrelated action.
         self.message = None;
 
         match &self.mode {
@@ -203,7 +195,6 @@ impl App {
                 Request::None
             }
             Key::Esc => {
-                // In Normal mode, Esc's job is to clear an active filter.
                 self.filter.clear();
                 self.clamp_selection();
                 Request::None
@@ -235,8 +226,6 @@ impl App {
                 self.move_by(-1);
                 Request::None
             }
-            // Enter means the same thing everywhere: attach to what is
-            // highlighted. The filter stays applied.
             Key::Enter => {
                 self.mode = Mode::Normal;
                 match self.selected_session() {

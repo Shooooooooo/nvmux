@@ -9,19 +9,16 @@ use nvmux::{config, logging, nvim, pty, transport, ui};
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Everything else depends on this existing and being ours, so it happens
-    // first and its failure is reported plainly.
+    // Everything else depends on this existing and being ours.
     let dir = config::ensure_runtime_dir().context("preparing the nvmux runtime directory")?;
     logging::init(&dir)?;
 
-    // Neovim creates its listen socket with 0777 & ~umask, so a permissive mask
-    // would leave a socket any local user could drive. Set this before anything
-    // is spawned.
+    // Before anything is spawned: see `config::restrict_umask`.
     config::restrict_umask();
 
     if let Err(e) = run(&cli) {
-        // Errors go to stderr as a plain message. No backtrace spew: every error
-        // this program produces is meant to be actionable on its own.
+        // A plain message, no backtrace: every error here is meant to be
+        // actionable on its own.
         eprintln!("nvmux: {e:#}");
         std::process::exit(1);
     }
@@ -32,8 +29,8 @@ fn run(cli: &Cli) -> Result<()> {
     let location = cli.location();
 
     // Checked up front rather than surfacing later as an unexplained connection
-    // failure. The local nvim is the one used as the --remote-ui client; the
-    // remote one is checked by the SSH transport when it connects (milestone 5).
+    // failure. This is the nvim used as the --remote-ui client; the remote one
+    // is checked by the SSH transport when it connects.
     let local_nvim = nvim::check_local()?;
     tracing::debug!(version = %local_nvim, "local nvim");
 
@@ -43,18 +40,14 @@ fn run(cli: &Cli) -> Result<()> {
 
 /// Alternate between the picker and an attached session until the user leaves.
 ///
-/// The attachment is carried across iterations so that `Ctrl-t t` can come back
-/// to the *same* client rather than starting a new one, which is what makes
-/// returning to the picker feel free. `Ctrl-t c` and `Ctrl-t ?` ride on the
-/// same machinery: the client survives the prompt and the help screen, so
-/// backing out of either costs nothing.
+/// The attachment is carried across iterations, so `Ctrl-t t`, `Ctrl-t c` and
+/// `Ctrl-t ?` come back to the *same* client rather than starting a new one.
 fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     let mut attached: Option<pty::Attachment> = None;
     let mut message: Option<String> = None;
 
     loop {
-        // The session the inner loop is about. `Ctrl-t c` moves it to the
-        // session it just created; everything else leaves it alone.
+        // `Ctrl-t c` moves this to the session it just created.
         let mut current = match ui::run(transport, message.take())? {
             ui::Outcome::Quit => break,
             ui::Outcome::Attach(session) => session,
@@ -62,11 +55,9 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
 
         loop {
             let opened = match attached.take() {
-                // Same session: resume the client that is already running.
                 Some(a) if a.session_id == current.id => Ok(a),
-                // A different session was attached; that client is finished
-                // with. Its server keeps running — killing a --remote-ui client
-                // does not kill a --headless --listen server.
+                // Retiring the old client leaves its server running: killing a
+                // --remote-ui client does not kill a --headless --listen server.
                 Some(other) => {
                     other.terminate();
                     new_attachment(transport, &current)
@@ -74,10 +65,8 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 None => new_attachment(transport, &current),
             };
 
-            // A failed attach must not end the program. A dropped connection,
-            // or a session that died while the picker was open, is something
-            // the user can act on — but only if they are still in the picker to
-            // do it, with the reason on screen.
+            // A failed attach must not end the program: the user can only act
+            // on it from the picker, with the reason on screen.
             let attachment = match opened {
                 Ok(a) => a,
                 Err(e) => {
@@ -94,11 +83,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 (pty::Outcome::Detached, _) => return Ok(()),
                 (pty::Outcome::ChildExited, _) => break,
                 (pty::Outcome::CreateNew, held) => {
-                    // Ctrl-t c: name a new session and go straight to it,
-                    // without a detour through the picker. The old client is
-                    // held onto rather than killed, so a cancelled prompt just
-                    // resumes it; naming one instead moves `current`, and the
-                    // match above then retires the old client for us.
+                    // Held rather than killed, so a cancelled prompt resumes it.
                     attached = held;
                     if let ui::prompt::Outcome::Created(session) = ui::prompt::run(transport)? {
                         current = session;
@@ -106,9 +91,6 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     continue;
                 }
                 (pty::Outcome::ShowHelp, held) => {
-                    // Ctrl-t ?: show the bindings, then straight back. The
-                    // client is held for the same reason as Ctrl-t c, and
-                    // `current` is unchanged, so the match above resumes it.
                     attached = held;
                     ui::help::run()?;
                     continue;
@@ -121,11 +103,10 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
 
 /// Explain why an attach failed, in terms of what actually went wrong.
 ///
-/// "connection refused" is accurate for a local socket and misleading for a
-/// remote one: through an SSH forward that errno means the *ControlMaster*
-/// died, not the session — ssh accepts first and resets afterwards when the
-/// remote process is the one that has gone. Verified both ways: a dead remote
-/// nvim gives ECONNRESET, a dead master gives ECONNREFUSED.
+/// Through an SSH forward, ECONNREFUSED means the *ControlMaster* died, not the
+/// session: ssh accepts first and resets afterwards when it is the remote
+/// process that has gone. Verified both ways — a dead remote nvim gives
+/// ECONNRESET, a dead master gives ECONNREFUSED.
 fn describe_attach_failure(transport: &dyn transport::Transport, e: &nvmux::NvmuxError) -> String {
     let remote = matches!(transport.location(), transport::Location::Ssh(_));
     let host = transport.location().to_string();

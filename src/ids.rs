@@ -1,21 +1,16 @@
 //! Session ids and host tokens.
 //!
 //! Ids are short because socket paths are short — see [`crate::config`] for the
-//! byte budget. Eight lowercase base32 characters carry 40 bits, which is
-//! plenty for "don't collide among the handful of sessions one user has open"
-//! and costs 8 bytes of a ~103 byte budget.
+//! byte budget.
 
 use anyhow::Result;
 
-/// RFC 4648 base32, lowercased, no padding.
-///
-/// Lowercase and digit-only-2-through-7 means an id is unambiguous in a
-/// filename, safe in a shell word without quoting, and never looks like a flag.
+/// RFC 4648 base32, lowercased, no padding: unambiguous in a filename, safe in
+/// a shell word without quoting, and never looks like a flag.
 const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
-/// Encode exactly 40 bits (5 bytes) as 8 base32 characters.
-///
-/// 40 bits divides evenly by 5, so there is no padding case to get wrong.
+/// Encode exactly 40 bits (5 bytes) as 8 base32 characters. 40 divides evenly
+/// by 5, so there is no padding case to get wrong.
 fn b32_40(bytes: &[u8; 5]) -> String {
     let n = u64::from(bytes[0]) << 32
         | u64::from(bytes[1]) << 24
@@ -37,14 +32,9 @@ pub fn new_id() -> Result<String> {
 
 /// Reject anything that is not a well-formed session id.
 ///
-/// Ids reach us from two places that are not equally trustworthy: we generate
-/// them, and we read them out of `<id>.json` on disk. The second is why this
-/// exists. An id becomes a *path* — `<dir>/<id>.sock` and its siblings — and
-/// those paths are passed to unlink, to a kill script, and to a socket connect.
-/// An id of `../../elsewhere/precious` escapes the runtime directory entirely.
-///
-/// Sessions are also looked up by id, so a metadata file claiming another
-/// session's id would aim a rename or a kill at the wrong session.
+/// Ids are also read out of `<id>.json` on disk, and an id becomes a *path*
+/// passed to unlink, to a kill script and to a socket connect — so
+/// `../../elsewhere/precious` would escape the runtime directory entirely.
 pub fn is_valid_id(id: &str) -> bool {
     id.len() == ID_LEN && id.bytes().all(|b| ALPHABET.contains(&b))
 }
@@ -52,15 +42,11 @@ pub fn is_valid_id(id: &str) -> bool {
 /// The length of a session id, in characters and bytes (the alphabet is ASCII).
 pub const ID_LEN: usize = 8;
 
-/// A short, stable, filename-safe token for a host string.
+/// A short, stable, filename-safe token for a host string, naming the local end
+/// of an SSH forward.
 ///
-/// Used to name the local end of an SSH forward, so that two hosts with a
-/// same-id session cannot collide on one local socket path.
-///
-/// FNV-1a rather than `DefaultHasher`: `std::collections::hash_map::DefaultHasher`
-/// is explicitly documented as unstable across Rust releases, and this value
-/// determines a filename on disk. A toolchain upgrade must not orphan a live
-/// session's socket.
+/// FNV-1a rather than `DefaultHasher`, which is documented as unstable across
+/// Rust releases: a toolchain upgrade must not orphan a live session's socket.
 pub fn host_token(host: &str) -> String {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x1000_0000_01b3;

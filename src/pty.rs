@@ -1,6 +1,4 @@
-//! The PTY proxy. Milestone 4.
-//!
-//! # The contract
+//! The PTY proxy.
 //!
 //! nvmux runs `nvim --server <local_sock> --remote-ui` as a child on a PTY and
 //! sits in the byte stream between the user's terminal and that child:
@@ -12,59 +10,22 @@
 //!
 //! **The child-to-terminal direction is never parsed, buffered by line, or
 //! rewritten.** That is the entire reason this design works: bracketed paste,
-//! the kitty keyboard protocol, truecolor, undercurl, terminal title sequences,
-//! OSC 52 clipboard and DA1/XTGETTCAP query/response round-trips all function
-//! because the child negotiates directly with the real terminal. Any
-//! "improvement" that inspects this direction breaks a subset of them.
+//! the kitty keyboard protocol, truecolor, undercurl, terminal titles, OSC 52
+//! clipboard and DA1/XTGETTCAP round-trips all function because the child
+//! negotiates directly with the real terminal. Any "improvement" that inspects
+//! this direction breaks a subset of them. There is likewise no
+//! `nvim_ui_attach`, no `grid_line` handling and no grid diffing anywhere in
+//! this crate — `nvim --remote-ui` already is that client.
 //!
-//! nvmux does **not** implement a Neovim UI. There is no `nvim_ui_attach`, no
-//! `grid_line` handling, no highlight table and no grid diffing anywhere in this
-//! crate — that is thousands of lines of the most bug-prone code in this space,
-//! and `nvim --remote-ui` already is that client.
+//! Three hazards that have no other home in the code:
 //!
-//! # Things milestone 4 must get right
-//!
-//! * **Read the real terminal size before spawning.** `PtySize::default()` is
-//!   24x80. Note `crossterm::terminal::size()` returns `(columns, rows)` while
-//!   `PtySize` is `{ rows, cols }` — passing them positionally transposes the
-//!   screen. `window_size()` also gives pixel dimensions, without which sixel
-//!   and kitty image protocols break inside the session.
-//! * **Drop the slave after `spawn_command`**, or the master reader never sees
-//!   EOF and the relay thread hangs forever after the child exits.
 //! * **Take the writer exactly once.** `MasterPty::take_writer()` errors on a
 //!   second call.
-//! * **Never run two readers on the master.** `try_clone_reader()` dups the same
-//!   open file description, so two readers race and split the stream — which in
-//!   a proxy means randomly deleting chunks of the user's screen. Read once and
-//!   tee in userspace if logging is ever wanted.
-//! * **RPC-ping the session before spawning the child.** Against a dead socket
-//!   the client prints `Remote ui failed to start: connection refused` — but
-//!   through an SSH forward that message is empty, after ~165 bytes of escape
-//!   sequences have already hit the terminal.
-//! * **The child's exit code carries no information.** Server killed while
-//!   attached gives 0; nvmux terminating the child to detach gives 1; a failed
-//!   attach gives 1. Drive teardown off the master read result and nvmux's own
-//!   detach state, then probe the socket afterwards to tell "detached" from
-//!   "session ended".
-//! * **Teardown differs by platform.** When the slave closes, the master read
-//!   fails with `EIO` on Linux and returns `Ok(0)` on macOS. Both mean detached.
-//! * **Let the child restore the terminal.** It emits its own
-//!   `...\x1b[?1049l\x1b[23;0;0t\x1b[?25h` on exit. Pass those bytes through and
-//!   only *then* leave raw mode; emitting a competing reset corrupts the display.
+//! * **The child's exit code carries no information.** A server killed while
+//!   attached gives 0; terminating the child to detach gives 1; a failed attach
+//!   gives 1. Teardown is driven off the master read result instead.
 //! * `portable-pty` vendors its own `nix`, so never pass a `nix` type across
 //!   that boundary — `MasterPty::get_termios()` returns *its* `Termios`, not ours.
-//!
-//! # `:q` ends the session, and that is intended
-//!
-//! In a `--remote-ui` session `:q` in the last window terminates the *server*,
-//! not just the local view — the editor is the session. That is the documented
-//! way to finish with a session and keep your work: save as usual, then quit as
-//! usual. `Ctrl-t d` is the other exit, and leaves the session running.
-//!
-//! So this is a thing to explain rather than to guard. A `cnoreabbrev` guard
-//! would also be a poor one: it covers bare `:q`, turns `:q!` into a silent
-//! no-op (`bang (!) not supported yet`), and misses `:qa`, `ZZ`, `ZQ`, `:x`,
-//! `:wq` and `<C-w>q` entirely.
 
 use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
@@ -83,31 +44,21 @@ use crate::{rpc, term, winch};
 /// SIGABRT the whole server and destroy the session. Refuse well before that.
 const MAX_UIS: usize = 8;
 
-// Enforced at compile time, because getting this wrong does not fail a test —
-// it SIGABRTs a user's session. Neovim's own ceiling is `MAX_UI_COUNT == 16`
-// and it is enforced with `abort()`, not an error return.
+// At compile time: getting this wrong does not fail a test, it SIGABRTs a
+// user's session.
 const _: () = assert!(MAX_UIS < 16);
 
-/// How the relay ended.
-///
-/// The attachment itself is handed back separately by [`relay`], so this stays
-/// a plain value the caller can match on without moving anything.
+/// How the relay ended. The attachment is handed back separately by [`relay`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// `Ctrl-t t` — show the picker. The child keeps running and the
-    /// attachment comes back alongside this.
+    /// `Ctrl-t t` — show the picker. The child keeps running.
     ToPicker,
     /// `Ctrl-t d` — detach and exit, leaving the session running.
     Detached,
-    /// `Ctrl-t c` — prompt for a name and create a new session. Like
-    /// [`Outcome::ToPicker`] the child keeps running and comes back alongside
-    /// this, because the prompt can be cancelled and the user put straight back
-    /// where they were.
+    /// `Ctrl-t c` — prompt for a name and create a new session. The child keeps
+    /// running, so a cancelled prompt puts the user straight back.
     CreateNew,
-    /// `Ctrl-t ?` — show the key bindings. Like [`Outcome::ToPicker`] and
-    /// [`Outcome::CreateNew`] the child keeps running and comes back alongside
-    /// this: the help is read, dismissed, and the user put straight back where
-    /// they were.
+    /// `Ctrl-t ?` — show the key bindings. The child keeps running.
     ShowHelp,
     /// The child exited on its own.
     ChildExited,
@@ -115,14 +66,13 @@ pub enum Outcome {
 
 /// A running `--remote-ui` client, and the PTY it is talking through.
 pub struct Attachment {
-    /// Which session this client is attached to, so a re-select can tell
-    /// "the same session" from "a different one".
+    /// Which session this client is attached to.
     pub session_id: String,
     child: Box<dyn Child + Send + Sync>,
     master: Box<dyn MasterPty>,
     writer: Box<dyn Write + Send>,
-    /// True once the child has been sent through a full relay at least once,
-    /// so a resume knows it must force a repaint.
+    /// True once the child has been through a full relay, so a resume knows it
+    /// must force a repaint.
     resumed: bool,
 }
 
@@ -136,11 +86,10 @@ impl std::fmt::Debug for Attachment {
 }
 
 impl Attachment {
-    /// Terminate the client, leaving the session's server running.
-    ///
-    /// Verified: killing an attached `--remote-ui` client — even with SIGKILL —
-    /// does not kill a `--headless --listen` server. The "channel closes, Nvim
-    /// exits" rule is scoped to `--embed`.
+    /// Terminate the client, leaving the session's server running. Verified:
+    /// killing a `--remote-ui` client, even with SIGKILL, does not kill a
+    /// `--headless --listen` server — the "channel closes, Nvim exits" rule is
+    /// scoped to `--embed`.
     pub fn terminate(mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -152,11 +101,9 @@ impl Attachment {
 /// `sock` must already be reachable from *this* machine — locally the session
 /// socket, over SSH the local end of a forward.
 pub fn spawn(session_id: &str, sock: &Path) -> Result<Attachment> {
-    // Ping before spawning anything. Against a dead socket the client prints
-    // "Remote ui failed to start: connection refused" and exits 1 — but through
-    // an SSH forward that message is empty, after ~165 bytes of escape
-    // sequences have already been sprayed at the terminal. Diagnosing it here
-    // means the user gets a sentence instead of a garbled screen.
+    // Ping before spawning anything. Through an SSH forward the client's own
+    // failure message is empty, after ~165 bytes of escape sequences have
+    // already been sprayed at the terminal.
     let mut client = rpc::Client::connect(sock, rpc::PROBE_TIMEOUT)?;
     client.api_info()?;
     let uis = client.list_uis().unwrap_or(0);
@@ -168,9 +115,9 @@ pub fn spawn(session_id: &str, sock: &Path) -> Result<Attachment> {
     }
     drop(client);
 
-    // The size must be right *before* the child starts: PtySize::default() is
-    // 24x80, and a client that starts at the wrong size draws a wrong-shaped
-    // screen until something resizes it.
+    // Right *before* the child starts: `PtySize::default()` is 24x80. Note
+    // `crossterm::size()` is (cols, rows) while `PtySize` is { rows, cols } —
+    // passing them positionally transposes the screen.
     let size = term::terminal_size();
     let pair: PtyPair = portable_pty::native_pty_system()
         .openpty(size)
@@ -180,8 +127,6 @@ pub fn spawn(session_id: &str, sock: &Path) -> Result<Attachment> {
     cmd.arg("--server");
     cmd.arg(sock);
     cmd.arg("--remote-ui");
-    // The child negotiates directly with the real terminal, so it needs to know
-    // what that terminal is. Everything else about its environment is inherited.
     if let Ok(t) = std::env::var("TERM") {
         cmd.env("TERM", t);
     }
@@ -197,9 +142,8 @@ pub fn spawn(session_id: &str, sock: &Path) -> Result<Attachment> {
         .spawn_command(cmd)
         .map_err(|e| NvmuxError::Io(std::io::Error::other(e.to_string())))?;
 
-    // MANDATORY. While this process holds the slave open, the master never sees
-    // EOF, so the relay would hang forever after the child exits instead of
-    // noticing it had gone.
+    // MANDATORY: while this process holds the slave open the master never sees
+    // EOF, so the relay would hang forever after the child exits.
     drop(pair.slave);
 
     let writer = pair
@@ -218,17 +162,15 @@ pub fn spawn(session_id: &str, sock: &Path) -> Result<Attachment> {
 
 /// Relay bytes between the terminal and the child until something interrupts it.
 ///
-/// # Shape
-///
 /// One thread, one `poll` over stdin, the PTY master and the SIGWINCH
-/// self-pipe. That is deliberate rather than incidental:
+/// self-pipe, deliberately rather than incidentally:
 ///
 /// * `try_clone_reader` dups the *same* open file description, so two readers
 ///   race and split the stream — in a proxy that means randomly deleting chunks
-///   of the user's screen, scheduling-dependently. One loop, one reader.
+///   of the user's screen. One loop, one reader.
 /// * A thread parked in a blocking `read(0)` cannot be cancelled, so returning
-///   to the picker would either hang or swallow the first keystroke typed at
-///   it. A `poll` loop just stops polling.
+///   to the picker would hang or swallow the first keystroke. A `poll` loop
+///   just stops polling.
 pub fn relay(mut attachment: Attachment) -> Result<(Outcome, Option<Attachment>)> {
     let master_fd = attachment
         .master
@@ -239,10 +181,8 @@ pub fn relay(mut attachment: Attachment) -> Result<(Outcome, Option<Attachment>)
     term::leave_alt_screen_and_clear();
     let mut raw = term::RawMode::enter()?;
 
-    // On a resume the child has been blocked mid-write with nobody reading it,
-    // and the picker has since drawn over the screen. Throw away whatever it
-    // buffered — it describes a screen that no longer exists — and make it
-    // repaint from scratch.
+    // What the child buffered while blocked mid-write describes a screen the
+    // picker has since drawn over.
     if attachment.resumed {
         discard_pending(master_fd);
         force_repaint(attachment.master.as_ref());
@@ -252,19 +192,13 @@ pub fn relay(mut attachment: Attachment) -> Result<(Outcome, Option<Attachment>)
     let outcome = pump(&mut attachment, master_fd, &winch);
 
     match outcome {
-        // The picker, the new-session prompt and the help screen all keep the
-        // child, so there is no restore sequence to wait for; ratatui is about
-        // to own the screen anyway. Each of them ends back at a live client,
-        // and resuming one is what makes that free.
         Ok(held @ (Outcome::ToPicker | Outcome::CreateNew | Outcome::ShowHelp)) => {
             raw.restore();
             Ok((held, Some(attachment)))
         }
         Ok(other) => {
-            // Let the child put the terminal back itself. It emits its own full
-            // restore sequence on exit, and passing those bytes through is what
-            // keeps the screen correct — emitting a competing reset of our own
-            // corrupts it.
+            // Let the child put the terminal back itself: it emits its own full
+            // restore sequence on exit, and a competing reset would corrupt it.
             if other != Outcome::ChildExited {
                 let _ = attachment.child.kill();
             }
@@ -288,9 +222,8 @@ fn pump(attachment: &mut Attachment, master_fd: RawFd, winch: &winch::Winch) -> 
     let mut buf = [0u8; 8192];
 
     loop {
-        // A pending prefix needs its own deadline. Otherwise the wait is still
-        // bounded, because a *stopped* child produces no poll activity at all —
-        // see `check_child` — and an indefinite wait would never notice it.
+        // A pending prefix needs its own deadline: a *stopped* child produces
+        // no poll activity at all, so an indefinite wait would never notice it.
         let timeout_ms = if prefix.is_armed() {
             keys::TIMEOUT.as_millis() as libc::c_int
         } else {
@@ -307,7 +240,6 @@ fn pump(attachment: &mut Attachment, master_fd: RawFd, winch: &winch::Winch) -> 
             return Err(NvmuxError::Io(err));
         }
         if n == 0 {
-            // Nothing arrived in time, so a lone Ctrl-t was meant literally.
             for step in prefix.timeout() {
                 if let Step::Forward(bytes) = step {
                     attachment.writer.write_all(&bytes)?;
@@ -320,17 +252,14 @@ fn pump(attachment: &mut Attachment, master_fd: RawFd, winch: &winch::Winch) -> 
             continue;
         }
 
-        // The child's output goes first, so the screen is up to date before any
-        // keystroke is acted on.
+        // Output first, so the screen is current before a keystroke is acted on.
         if ready(&fds[1]) {
             match read_fd(master_fd, &mut buf) {
                 // EOF on macOS, EIO on Linux: both mean the slave closed.
                 Ok(0) | Err(_) => return Ok(Outcome::ChildExited),
                 Ok(len) => {
-                    // Byte for byte, unparsed and unbuffered. This is the whole
-                    // reason bracketed paste, the kitty keyboard protocol,
-                    // truecolor, OSC 52 and DA1 round-trips work: the child is
-                    // talking to the real terminal, and nvmux is not in the way.
+                    // Byte for byte, unparsed and unbuffered; see the module
+                    // docs.
                     let mut out = std::io::stdout().lock();
                     out.write_all(&buf[..len])?;
                     out.flush()?;
@@ -340,9 +269,8 @@ fn pump(attachment: &mut Attachment, master_fd: RawFd, winch: &winch::Winch) -> 
 
         if ready(&fds[2]) {
             winch.drain();
-            // Resizing the master is enough: the kernel signals the pty's
-            // foreground group, the client calls try_resize, and the server
-            // follows.
+            // Enough on its own: the kernel signals the pty's foreground group
+            // and the client calls try_resize.
             let _ = attachment.master.resize(term::terminal_size());
         }
 
@@ -351,10 +279,8 @@ fn pump(attachment: &mut Attachment, master_fd: RawFd, winch: &winch::Winch) -> 
                 Ok(0) => return Ok(Outcome::ChildExited),
                 Err(e) => return Err(NvmuxError::Io(e)),
                 Ok(len) => {
-                    // Deliberately NOT logged. This is every keystroke the user
-                    // types into their editor — passwords, tokens, private
-                    // notes. Even at debug level it would write them to a file
-                    // in /tmp that outlives the session.
+                    // Deliberately NOT logged: every keystroke the user types,
+                    // into a /tmp file that outlives the session.
                     for step in prefix.feed(&buf[..len]) {
                         match step {
                             Step::Forward(bytes) => {
@@ -404,19 +330,13 @@ enum ChildState {
 /// so there is no shell underneath to have been returned to, and the suspended
 /// client is not a state anyone can do anything with.
 ///
-/// So a stopped child is continued with `SIGCONT`, rather than the alternative
-/// of tearing the attach down and falling back to the picker. Continuing puts
-/// the user back exactly where they were, which is what pressing a key inside an
-/// editor should do; falling back would silently discard the attach and lose the
-/// screen they were looking at. It also cannot loop: the stop notification is
-/// consumed when it is read, so a client that keeps stopping itself is continued
-/// once per stop rather than spun on.
+/// So a stopped child is continued with `SIGCONT` rather than torn down. It
+/// cannot loop: the stop notification is consumed when read, so a client that
+/// keeps stopping itself is continued once per stop.
 ///
-/// `portable_pty::Child::try_wait` cannot be used for this — it does not pass
-/// `WUNTRACED`, so a stopped child simply reads as "still running". The peek
-/// below uses `WNOWAIT` so that an *exit* status is left in place for
-/// portable-pty's own reaper; only the stop notification is consumed, which does
-/// not reap anything.
+/// `portable_pty::Child::try_wait` cannot be used here — it does not pass
+/// `WUNTRACED`, so a stopped child reads as "still running". The peek below uses
+/// `WNOWAIT` so an *exit* status is left in place for portable-pty's own reaper.
 fn check_child(attachment: &mut Attachment) -> ChildState {
     use nix::sys::signal::{kill, Signal};
     use nix::sys::wait::{waitid, waitpid, Id, WaitPidFlag, WaitStatus};

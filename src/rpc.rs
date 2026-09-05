@@ -1,43 +1,21 @@
 //! A minimal synchronous msgpack-RPC client for Neovim.
 //!
-//! # Scope
-//!
-//! Four methods, and no more:
-//!
-//! * `nvim_get_api_info` — reachability and version
-//! * `nvim_list_bufs`    — readiness (a *deferred* call; see below)
-//! * `nvim_command`      — graceful `qa!`
-//!
-//! Three, not four. Killing a session is unconditional, so nvmux never asks a
-//! session about its unsaved buffers and `nvim_get_option_value` has no caller.
-//!
 //! There is **no `nvim_ui_attach` anywhere in this crate**, and there must never
-//! be one. nvmux does not render Neovim's UI; `nvim --server ... --remote-ui`
-//! does, as a child process. See [`crate::pty`] for why that split matters, and
-//! the note in [`Client::list_uis`] for what attaching a second UI would do to
-//! the session you are editing in.
+//! be one — see [`Client::list_uis`].
 //!
-//! # Why synchronous
-//!
-//! Neovim never pushes unsolicited traffic on a bare RPC channel — only a
-//! channel that has attached a UI or registered for autocmds receives
-//! notifications — so there is nothing to demultiplex in the background and no
-//! reader task to own. A blocking `UnixStream` with a read timeout is the whole
-//! transport, and it works identically on a local socket and on the local end of
-//! an SSH forward.
+//! Synchronous because Neovim never pushes unsolicited traffic on a bare RPC
+//! channel: only one that has attached a UI or registered for autocmds gets
+//! notifications, so there is nothing to demultiplex in the background.
 //!
 //! # Reachable is not the same as ready
 //!
-//! `nvim_get_api_info` is answered off the main loop. It replies in
-//! milliseconds while `init.lua` is still sourcing, and — measured — it still
-//! replies in 3ms while the editor is blocked inside `call system('sleep 3')`,
-//! at which point `nvim_list_bufs` on a *separate connection* times out
-//! completely.
+//! `nvim_get_api_info` is answered off the main loop. Measured, it still replies
+//! in 3ms while the editor is blocked inside `call system('sleep 3')`, at which
+//! point `nvim_list_bufs` on a separate connection times out completely. That
+//! asymmetry drives the whole liveness model:
 //!
-//! That asymmetry drives the whole liveness model:
-//!
-//! * `api_info` answering means the socket has a real Neovim behind it, as
-//!   distinct from an SSH forward that accepts and then resets.
+//! * `api_info` answering means a real Neovim is behind the socket, as distinct
+//!   from an SSH forward that accepts and then resets.
 //! * only a *deferred* call answering means the session is actually serving.
 //! * a deferred call timing out means [`Liveness::Busy`] — the user is running
 //!   a build — and must never be treated as death, or nvmux would reap live
@@ -62,30 +40,23 @@ const NOTIFICATION: u64 = 2;
 /// forward does not stall the picker.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// The read timeout for probes that run behind the picker.
-///
-/// Three seconds rather than one: three of the four methods above block for the
-/// entire duration of any `system()` call in the user's editor, so a one-second
-/// budget would mark healthy sessions dead whenever someone is compiling.
+/// The read timeout for probes that run behind the picker. Three seconds rather
+/// than one: a deferred call blocks for the whole of any `system()` call in the
+/// user's editor, so a shorter budget marks healthy sessions dead.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The read timeout for something the user explicitly asked for.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A connected RPC channel.
-///
-/// Generic over the byte stream so the same code serves a local socket, the
-/// local end of an SSH forward, and an in-memory pipe in tests.
+/// A connected RPC channel, generic over the byte stream so the same code serves
+/// a local socket, the local end of an SSH forward, and a pipe in tests.
 pub struct Client<S: Read + Write> {
     io: BufReader<S>,
     next_msgid: u32,
     /// Once set, every call fails fast. See [`Client::poison`].
     poisoned: Option<String>,
-    /// The read timeout currently set on the stream.
-    ///
-    /// Tracked so a timeout error reports the budget that actually elapsed. A
-    /// hardcoded constant here would misreport a 250ms failure as a 3s one and
-    /// send anyone reading the log looking in the wrong place.
+    /// Tracked so a timeout error reports the budget that actually elapsed,
+    /// rather than misreporting a 250ms failure as a 3s one.
     read_timeout: Duration,
 }
 
@@ -99,18 +70,12 @@ impl<S: Read + Write> std::fmt::Debug for Client<S> {
 }
 
 impl Client<UnixStream> {
-    /// Connect to a session socket.
-    /// `read_timeout` bounds each *reply*, not the connect.
-    ///
-    /// Connecting to a unix socket is effectively instantaneous — the kernel
-    /// either finds a listener or does not — so the meaningful budget is how
-    /// long to wait for Neovim to answer. Passing a connect-sized value here is
-    /// what caused live sessions to be classified dead: see [`probe`].
+    /// Connect to a session socket. `read_timeout` bounds each *reply*, not the
+    /// connect — a unix socket connect either finds a listener or does not.
+    /// Passing a connect-sized value here classified live sessions as dead.
     pub fn connect(path: &Path, read_timeout: Duration) -> Result<Self, RpcError> {
-        // Length is validated before we ever get here, but a caller could hand
-        // us a path from metadata written by an older build, and std's error for
-        // this case is `InvalidInput` with `raw_os_error() == None` — nothing a
-        // caller could match on. Check explicitly so the message is useful.
+        // std's error here is `InvalidInput` with `raw_os_error() == None` —
+        // nothing a caller could match on. Check explicitly for a useful message.
         crate::config::check_sock_path(path).map_err(|e| RpcError::Protocol(e.to_string()))?;
 
         let stream = UnixStream::connect(path).map_err(|e| match e.kind() {
@@ -145,38 +110,24 @@ impl<S: Read + Write> Client<S> {
         }
     }
 
-    /// Mark this connection unusable.
-    ///
-    /// Any timeout or decode failure has to be terminal for the channel. rmpv
-    /// reads from the stream incrementally, so a call that gives up partway
-    /// leaves unconsumed bytes in the socket. The next `read_value` would then
-    /// decode a *well-formed-looking* value out of the tail of the previous
-    /// frame and hand it back as an answer — silently wrong data rather than an
-    /// error. The only safe recovery is to close and reconnect.
+    /// Mark this connection unusable. rmpv reads incrementally, so a call that
+    /// gives up partway leaves bytes in the socket and the next read would
+    /// decode a well-formed-looking value out of the previous frame's tail.
     fn poison(&mut self, why: impl Into<String>) -> RpcError {
         let why = why.into();
         self.poisoned = Some(why.clone());
         RpcError::Protocol(why)
     }
 
-    /// Turn an error into one the connection cannot be used after, when it left
-    /// unread bytes behind.
-    ///
-    /// A timeout is the dangerous case and the easy one to miss. rmpv consumes
-    /// the stream incrementally, so abandoning a read part-way leaves the tail of
-    /// that frame in the socket; the *next* call would then decode something
-    /// well-formed out of it and return it as an answer to a different question.
-    /// `dirty_buffer_count` issues many calls on one connection, so this would
-    /// surface as a wrong unsaved-buffer count rather than as an error.
-    ///
-    /// The error the caller sees is preserved — only the connection is condemned.
+    /// Condemn the connection when an error left unread bytes behind — a
+    /// timeout is the dangerous case and the easy one to miss. The error the
+    /// caller sees is preserved; only the connection is condemned.
     fn poison_if_fatal(&mut self, e: RpcError, method: &str) -> RpcError {
         match &e {
             RpcError::Timeout(_) | RpcError::Protocol(_) => {
                 self.poisoned = Some(format!("{method}: {e}"));
             }
-            // A reset or refused connection is already unusable; nothing to
-            // condemn, and the caller distinguishes these to decide liveness.
+            // Already unusable, and the caller distinguishes these for liveness.
             _ => {}
         }
         e
@@ -192,8 +143,7 @@ impl<S: Read + Write> Client<S> {
         self.next_msgid = self.next_msgid.wrapping_add(1);
 
         // [type, msgid, method, params]. The method must be a msgpack `str`,
-        // not `bin`; rmpv's Value::String encodes as str, which is why the
-        // method name is built this way rather than from bytes.
+        // not `bin` — rmpv's Value::String encodes as str, bytes would not.
         let request = Value::Array(vec![
             Value::from(REQUEST),
             Value::from(msgid),
@@ -209,10 +159,8 @@ impl<S: Read + Write> Client<S> {
             return Err(self.poison_if_fatal(mapped, method));
         }
 
-        // An overall deadline as well as a per-read one. Without it, a peer that
-        // keeps sending frames we skip (notifications, or replies to requests
-        // that already timed out) restarts the per-read budget every time and
-        // this loop never returns.
+        // An overall deadline as well as a per-read one: a peer that keeps
+        // sending frames we skip restarts the per-read budget every time.
         let deadline = std::time::Instant::now() + budget;
 
         loop {
@@ -231,8 +179,6 @@ impl<S: Read + Write> Client<S> {
 
             match self.classify(value, msgid)? {
                 Some(result) => return result.map_err(RpcError::Nvim),
-                // A notification, or a response to a request that timed out
-                // earlier. Skip it and keep reading.
                 None => continue,
             }
         }
@@ -259,8 +205,8 @@ impl<S: Read + Write> Client<S> {
                     .as_u64()
                     .ok_or_else(|| self.poison("response msgid was not an integer"))?;
                 if got != u64::from(want) {
-                    // Not ours. Keep reading rather than mismatching an answer
-                    // to the wrong question.
+                    // Not ours. Keep reading rather than answering the wrong
+                    // question.
                     tracing::debug!(got, want, "skipping a response for another request");
                     return Ok(None);
                 }
@@ -271,8 +217,7 @@ impl<S: Read + Write> Client<S> {
             }
             Some(NOTIFICATION) => Ok(None),
             Some(REQUEST) => {
-                // Neovim asking *us* something. We register no handlers, so
-                // there is nothing to answer; ignoring it is correct.
+                // Neovim asking *us* something. We register no handlers.
                 tracing::debug!("ignoring an inbound request from nvim");
                 Ok(None)
             }
@@ -280,11 +225,9 @@ impl<S: Read + Write> Client<S> {
         }
     }
 
-    /// `nvim_get_api_info` — reachability and version.
-    ///
-    /// Answered off the main loop, so this proves only that a real Neovim is
-    /// behind the socket. It does **not** prove the session is usable; see the
-    /// module docs.
+    /// `nvim_get_api_info` — reachability and version. Answered off the main
+    /// loop, so this does **not** prove the session is usable; see the module
+    /// docs.
     pub fn api_info(&mut self) -> Result<ApiInfo, RpcError> {
         let v = self.call("nvim_get_api_info", vec![])?;
         let arr = v
@@ -328,12 +271,14 @@ impl<S: Read + Write> Client<S> {
             .to_vec())
     }
 
-    /// How many UIs are currently attached.
+    /// How many UIs are currently attached, checked before ever attaching.
+    /// Neovim's `ui_attach_impl` does `if (ui_count == MAX_UI_COUNT) { abort(); }`
+    /// with `MAX_UI_COUNT == 16` — an `abort()`, not an error return, so a
+    /// seventeenth attach SIGABRTs the server and destroys the session.
     ///
-    /// Checked before ever attaching. Neovim's `ui_attach_impl` does
-    /// `if (ui_count == MAX_UI_COUNT) { abort(); }` with `MAX_UI_COUNT == 16` —
-    /// an `abort()`, not an error return, so a seventeenth attach SIGABRTs the
-    /// whole server and destroys the session.
+    /// This is also why nvmux never attaches a second UI to preview a session:
+    /// Neovim sizes the global grid to the per-dimension minimum across every
+    /// attached UI, so a small preview would shrink the grid you are editing in.
     pub fn list_uis(&mut self) -> Result<usize, RpcError> {
         let v = self.call("nvim_list_uis", vec![])?;
         Ok(v.as_array().map(|a| a.len()).unwrap_or(0))
@@ -373,23 +318,20 @@ impl std::fmt::Display for ApiInfo {
 
 /// Decode a Neovim handle (buffer, window, tabpage) into its integer id.
 ///
-/// Neovim encodes these as msgpack **EXT** values, not as plain integers, and
-/// the payload is itself a msgpack-encoded integer rather than a raw byte.
-/// Reading `data[0]` directly appears to work for every handle below 128 and
-/// then silently returns nonsense: buffer 128 decodes as 204, because 0xcc is
-/// the `uint8` marker byte.
+/// Neovim encodes these as msgpack **EXT** values whose payload is itself a
+/// msgpack-encoded integer, not a raw byte. Reading `data[0]` directly appears
+/// to work for every handle below 128 and then silently returns nonsense:
+/// buffer 128 decodes as 204, because 0xcc is the `uint8` marker byte.
 ///
-/// Use this only for display and logging. When passing a handle **back** to
-/// Neovim, send the original [`Value::Ext`] verbatim — the type code is
-/// validated on the way in, and an integer that happens to be 0 means "the
-/// current buffer" and returns a plausible answer for the wrong buffer.
+/// Display and logging only. Pass a handle **back** to Neovim as the original
+/// [`Value::Ext`] verbatim — an integer that happens to be 0 means "the current
+/// buffer" and answers plausibly for the wrong one.
 pub fn ext_to_handle(v: &Value) -> Option<i64> {
     match v {
         Value::Ext(_type_code, data) => rmpv::decode::read_value(&mut &data[..])
             .ok()
             .and_then(|v| v.as_i64()),
-        // Tolerated so tests and any future API change that returns plain
-        // integers keep working.
+        // Tolerated so tests and any future plain-integer API keep working.
         other => other.as_i64(),
     }
 }
@@ -416,36 +358,20 @@ fn map_io(e: std::io::Error, timeout: Duration) -> RpcError {
 
 /// Decide whether a session socket has a live, serving Neovim behind it.
 ///
-/// # The rule that matters
-///
 /// **Only `Dead` causes files to be deleted, so `Dead` must mean "we proved
-/// nothing is listening" — never "we did not get an answer".** Every other
-/// outcome degrades to [`Liveness::Busy`], which is never reaped.
-///
-/// This is not hypothetical caution. An earlier version ran `api_info` under a
-/// 250ms budget and mapped any error to `Dead`, and while `api_info` is answered
-/// off the main loop during `system()` calls, it is *not* answered during
-/// CPU-bound Lua — measured at 3.7s, fifteen times over that budget. A plain
-/// `nvmux` invocation would then unlink the socket of a session that was merely
-/// busy, leaving a running Neovim that nothing could ever reach again.
-///
-/// # Two stages, answering different questions
-///
-/// 1. `api_info` — is there a Neovim here at all? Usually answered even while
-///    the editor is blocked, which is what distinguishes a real server from an
-///    SSH forward that accepts and immediately resets.
-/// 2. `list_bufs` — is it actually serving? Blocks with the main loop, so a
-///    timeout here means busy, not dead.
+/// nothing is listening" — never "we did not get an answer".** Everything else
+/// degrades to [`Liveness::Busy`], which is never reaped. An earlier version
+/// mapped any `api_info` error to `Dead` under a 250ms budget; `api_info` is
+/// *not* answered during CPU-bound Lua, measured at 3.7s, so a plain `nvmux`
+/// invocation unlinked the socket of a session that was merely busy.
 pub fn probe(path: &Path) -> Liveness {
-    // The budget is a *reply* budget, not a connect budget. Connecting to a
-    // unix socket either finds a listener immediately or does not.
     let mut client = match Client::connect(path, PROBE_TIMEOUT) {
         Ok(c) => c,
         Err(e) if e.is_definitely_dead() => return Liveness::Dead,
         Err(e) => {
-            // Anything else — EACCES, too many open files, a path we cannot
-            // even name — says nothing about the session. Under fd exhaustion
-            // the alternative would reap every session at once.
+            // EACCES, too many open files, a path we cannot name: none of it
+            // says anything about the session. Under fd exhaustion the
+            // alternative would reap every session at once.
             tracing::warn!(path = %path.display(), error = %e, "probe inconclusive");
             return Liveness::Busy;
         }

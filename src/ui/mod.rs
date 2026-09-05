@@ -1,88 +1,31 @@
-//! The picker. Milestone 3.
+//! The picker: a centred list of session names and one dim hint line on the
+//! last row. No borders, no popups — the hint line *is* the picker's help, and
+//! the filter and kill confirm replace it in place.
 //!
-//! # The contract
-//!
-//! The whole screen is a centered list of session names and one dimmed line of
-//! keybind hints on the last row. No borders, no title bar, no status header, no
-//! logo, no metadata columns, no help popup — the hint line *is* the picker's
-//! help, and the one help screen there is ([`help`], `Ctrl-t ?`) is a whole
-//! screen of its own, never a box over anything. The picker's own prompts — the
-//! filter and the kill confirm — replace the hint line *in place* rather than
-//! opening a modal or a bordered popup.
-//!
-//! # Three screens, one visual language
-//!
-//! Naming is the exception, and it is a screen rather than a popup for the same
-//! reason the contract forbids popups. [`prompt`] owns the whole terminal: it is
-//! what `Ctrl-t c` opens over an attached session, and what `c` and `r` open
-//! from the picker. Three ways in, one implementation — the alternative was an
-//! inline create prompt and a full-screen one drifting apart, which is what the
-//! picker used to have.
-//!
-//! The screens share a vocabulary: centred content, a `label: value` line, one
-//! dim hint row on the last line, no borders, no colour. What the prompt adds
-//! is weight — bold for the label, plain for what you type, dim for the default
-//! — because it covers whatever you were looking at and has to carry the whole
-//! screen on its own. That is also why its labels are wordier than a hint row
-//! would be: `new session name:` and `rename "dotfiles" to:` both name what is
-//! happening, since the list that would have said so is hidden.
-//!
-//! `prompt::run` owns a terminal for `Ctrl-t c`, which arrives with none;
-//! `prompt::run_on` borrows the picker's. Nesting the two would enter the
-//! alternate screen twice and leave it once.
-//!
-//! [`help`] is the third: the key list `Ctrl-t ?` shows over an attached
-//! session. It is a screen rather than an overlay for a harder reason than
-//! taste. What it would pop up over is Neovim's screen, and [`crate::pty`]
-//! never writes into the child's output — so taking the terminal, clearing it,
-//! and letting the client repaint afterwards is the only overlay nvmux can
-//! draw. Like the prompt it hides the session, draws, and hands the same client
-//! back; it shares the same vocabulary and adds nothing to it.
+//! [`prompt`] and [`help`] are the other two screens. Both take the whole
+//! terminal rather than drawing over anything, share the same vocabulary
+//! (centred content, one dim hint row, no borders, no colour), and hand the
+//! same client back afterwards. `prompt::run` owns a terminal for `Ctrl-t c`,
+//! which arrives with none; `prompt::run_on` borrows the picker's — nesting the
+//! two would enter the alternate screen twice and leave it once.
 //!
 //! # There is no preview pane, and there must never be one
 //!
-//! Beyond wanting a clean screen, there is a hard technical reason. Neovim sizes
-//! the global grid to the per-dimension **minimum** across every attached UI, so
-//! attaching a small second UI to render a preview would shrink the grid of the
-//! session the user is actually editing in, and fire `VimResized`:
-//!
-//! ```text
-//!   src/nvim/ui.c, ui_refresh(), v0.11.4:
-//!       int width = INT_MAX;
-//!       int height = INT_MAX;
-//!       for (size_t i = 0; i < ui_count; i++) {
-//!         RemoteUI *ui = uis[i];
-//!         width = MIN(ui->width, width);
-//!         height = MIN(ui->height, height);
-//!       }
-//!       screen_resize(width, height);
-//! ```
-//!
-//! `ui_refresh()` runs unconditionally at the end of `ui_attach_impl()`.
-//! Confirmed empirically: attaching a 40x10 UI alongside a 120x40 one collapses
-//! the grid to 40x10 for both.
-//!
-//! There is no read-only or observer attach mode that opts out of the size
-//! calculation. None of the `ui_options` (`rgb`, `ext_cmdline`, `ext_popupmenu`,
-//! `ext_tabline`, `ext_wildmenu`, `ext_messages`, `ext_linegrid`,
-//! `ext_multigrid`, `ext_hlstate`, `ext_termcolors`) makes an attachment
-//! non-sizing, and the `override` flag affects only ext_widgets, never width or
-//! height.
-//!
-//! So: a second UI is never attached to a live session. Anything the picker
-//! needs to know about a session comes from plain RPC instead.
+//! Neovim sizes the global grid to the per-dimension **minimum** across every
+//! attached UI (`ui_refresh()`, run unconditionally at the end of
+//! `ui_attach_impl()`), so a small preview UI would shrink the grid of the
+//! session being edited in and fire `VimResized`. Confirmed: attaching a 40x10
+//! UI alongside a 120x40 one collapses both to 40x10. No `ui_option` opts out.
+//! So the picker reads session state over plain RPC and never attaches a second
+//! UI to a live session.
 //!
 //! # Colour
 //!
-//! Use the terminal's default background; set no background colour and hardcode
-//! no palette. Respect `NO_COLOR`.
-//!
-//! Do **not** rely on crossterm's own `NO_COLOR` handling: with `NO_COLOR` set it
-//! turns `SetForegroundColor(c)` into a bare `ESC[m`, which is a full SGR reset
-//! that wipes bold, reverse and dim mid-line. Call
-//! `crossterm::style::force_color_output(true)` once, test the variable
-//! directly, and simply do not set colours when it is present.
-//! `Modifier::REVERSED` alone makes a good `NO_COLOR`-safe selection highlight.
+//! Set no background and hardcode no palette. Do **not** rely on crossterm's
+//! own `NO_COLOR` handling: it turns `SetForegroundColor(c)` into a bare
+//! `ESC[m`, a full SGR reset that wipes bold, reverse and dim mid-line. Call
+//! `force_color_output(true)`, test the variable directly, and set no colours
+//! when it is present.
 
 pub mod app;
 pub mod draw;
@@ -107,30 +50,20 @@ use crate::session::Session;
 use crate::transport::Transport;
 use app::{App, Key, Request};
 
-/// How long to block waiting for input before looping.
-///
-/// A bounded poll rather than an indefinite read so that a resize or a future
-/// background refresh is not stuck behind an idle keyboard.
+/// A bounded poll rather than an indefinite read, so a resize is not stuck
+/// behind an idle keyboard.
 const TICK: Duration = Duration::from_millis(250);
 
-/// Run the picker until the user attaches or quits.
-///
-/// `message` is shown on the bottom row instead of the hints — how a failed
-/// attach reports itself, since the alternative is exiting the program and
-/// leaving the user with nothing to act on.
+/// Run the picker until the user attaches or quits. `message` replaces the hint
+/// row — how a failed attach reports itself without exiting the program.
 pub fn run(transport: &dyn Transport, message: Option<String>) -> Result<Outcome> {
-    // Colour decisions are made per-cell by `draw`, which never sets one. This
-    // stops crossterm second-guessing us: its own NO_COLOR handling rewrites
-    // SetForegroundColor into a bare `ESC[m`, a full SGR reset that would wipe
-    // the bold/reverse/dim the picker relies on.
+    // Stops crossterm second-guessing us; see the module docs on colour.
     ratatui::crossterm::style::force_color_output(true);
 
     let mut terminal = ratatui::try_init()?;
-    // Reached from `Ctrl-t t`, the session's own alternate screen is still
-    // showing, and a second "enter alternate screen" does not clear it on
-    // every terminal: xterm and kitty treat it as a no-op. ratatui's first
-    // draw only paints the cells that differ from an empty buffer, so without
-    // this the list would land in the middle of the editor's last frame.
+    // A second "enter alternate screen" is a no-op on xterm and kitty, and
+    // ratatui's first draw only paints what differs from an empty buffer — so
+    // without this the list lands in the middle of the editor's last frame.
     terminal.clear()?;
     let outcome = run_loop(&mut terminal, transport, message);
     // Restore before propagating anything: an error that leaves the terminal in
@@ -157,7 +90,6 @@ fn run_loop(
         }
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => translate(k),
-            // A resize just redraws on the next pass.
             _ => continue,
         };
 
@@ -173,14 +105,10 @@ fn run_loop(
                 app.set_sessions(transport.list_sessions()?);
             }
 
-            // Naming happens on the prompt's own screen, driven with the
-            // picker's terminal — see `prompt::run_on`. Failures are reported
-            // there and never come back here, so there is no message to set.
             Request::NewSession => {
                 if let prompt::Outcome::Created(session) =
                     prompt::run_on(terminal, transport, prompt::Task::Create)?
                 {
-                    // Creating attaches straight away, as specified.
                     return Ok(Outcome::Attach(session));
                 }
                 app.set_sessions(transport.list_sessions()?);

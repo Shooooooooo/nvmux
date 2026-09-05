@@ -1,20 +1,12 @@
-//! The naming prompt — the second screen, and the only place a session is named.
+//! The naming prompt — the only place a session is named.
 //!
 //! Three ways in: `Ctrl-t c` from an attached session, and `c` or `r` from the
-//! picker. `run` owns a terminal for the first, `run_on` borrows one for the
-//! others; a [`Task`] says whether a name is being invented or edited. The
-//! picker used to have its own inline create and rename prompts on the hint
-//! row, which is exactly the duplication that let the two drift apart.
+//! picker. [`run`] owns a terminal for the first, `run_on` borrows one for the
+//! others; a `Task` says whether a name is being invented or edited.
 //!
 //! It owns the whole screen rather than replacing a hint line, per the contract
-//! in the parent module, because what it covers — a live session, or a list — is
-//! not something that should stay half-visible underneath a name being typed. It
-//! keeps the picker's visual language all the same: content centred, one dim
-//! hint row on the last line, no borders, and no colour ever set.
-//!
-//! # Three weights, because there are three kinds of text
-//!
-//! One line, `label: value`, and every part of it styled for its job:
+//! in the parent module. Three weights carry the three kinds of text — bold for
+//! the label, plain for what you type, dim for the default and the hint row:
 //!
 //! ```text
 //!     new session name: session 3
@@ -22,34 +14,20 @@
 //!                        └─ the cursor, an inverted cell
 //! ```
 //!
-//! **Bold** leads, because on a screen with nothing else on it the label is the
-//! question being asked. **Plain** is what you type. **Dim** is what you can
-//! ignore — the default and the hint row. An earlier version dimmed the label
-//! too, which flattened all three into one and left nothing on screen to read
-//! first. Modifiers rather than colour, for the reason the parent module gives:
-//! crossterm rewrites a colour into a bare `ESC[m` under `NO_COLOR`, a full SGR
-//! reset that would wipe the bold and dim mid-line.
-//!
 //! # The default name is a placeholder, not a pre-filled value
 //!
-//! Enter on an empty field creates `session 1`, `session 2`, … — the naming
-//! `Ctrl-t c` used to apply silently. That default is shown dimmed *inside* the
-//! field rather than named in the hint row, so it reads as what enter will do
-//! right now and costs nothing to discard. A pre-filled value would have to be
-//! backspaced away before a real name could be typed, which is the whole reason
-//! placeholders exist.
+//! Enter on an empty field creates `session 1`, `session 2`, … The default is
+//! shown dimmed *inside* the field, so it reads as what enter will do right now
+//! and costs nothing to discard, rather than needing to be backspaced away.
 //!
-//! Renaming inverts that, and the same field serves both: it *starts* pre-filled,
-//! because a rename is an edit of something that already exists rather than a
-//! blank to fill. Clear it and the current name reappears as the default, which
-//! is the truth either way — the default is always what enter would submit if
-//! you typed nothing.
+//! Renaming inverts that and the same field serves both: it *starts* pre-filled,
+//! because a rename edits something that already exists. Clear it and the
+//! current name reappears as the default — which is the truth either way, since
+//! the default is always what enter would submit if you typed nothing.
 //!
 //! Being a placeholder is also why the cursor *inverts* its first letter rather
-//! than taking a column in front of it. The cursor marks the insertion point,
-//! and while a default is showing that point is exactly where its first letter
-//! sits — so the default occupies the same columns your name will, and nothing
-//! shifts when you start typing.
+//! than taking a column in front of it: the default then occupies exactly the
+//! columns your own name will, and nothing shifts when you start typing.
 
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::layout::{Alignment, Rect};
@@ -68,19 +46,16 @@ use crate::transport::Transport;
 /// What the prompt returned.
 #[derive(Debug)]
 pub enum Outcome {
-    /// The session that was created. The caller attaches to it.
+    /// Created; the caller attaches to it.
     Created(Session),
-    /// An existing session was renamed. The caller just relists.
+    /// Renamed; the caller relists.
     Renamed,
-    /// The user backed out; whatever they came from is still there.
+    /// Backed out.
     Cancelled,
 }
 
-/// Which name is being asked for.
-///
-/// The two differ in three places and nowhere else: what the label says, what
-/// the field starts as, and what pressing enter finally calls. Everything about
-/// how the screen looks and behaves is shared.
+/// Which name is being asked for. The two differ only in the label, what the
+/// field starts as, and what enter finally calls.
 #[derive(Clone, Copy)]
 pub(super) enum Task<'a> {
     Create,
@@ -96,22 +71,16 @@ enum Step {
 }
 
 /// What the user has typed, and what enter would do if they typed nothing.
-///
-/// Split from the terminal so the whole state machine is testable without one,
-/// the same way `App` is split from `draw`.
+/// Split from the terminal so the state machine is testable without one.
 struct Prompt {
-    /// What the field is for, in front of it.
-    ///
-    /// A `label: value` line rather than a bare heading, because this screen
-    /// covers whatever you were looking at: it has to say both what is
-    /// happening and what to type. Renaming names the session for the same
-    /// reason — the list it was selected in is no longer on screen.
+    /// What the field is for, in front of it. A `label: value` line rather than
+    /// a heading, because this screen covers whatever you were looking at and
+    /// has to say both what is happening and what to type.
     prefix: String,
     hints: &'static str,
     input: String,
-    /// What enter submits when the field is empty. Creating, that is the next
-    /// free `session N`; renaming, it is the name the session already has, so
-    /// clearing the field and pressing enter keeps it.
+    /// What enter submits when the field is empty: the next free `session N`
+    /// when creating, the current name when renaming.
     default_name: String,
     message: Option<String>,
 }
@@ -127,8 +96,7 @@ impl Prompt {
         }
     }
 
-    /// Pre-filled with the current name, as specified — a rename is an edit of
-    /// something that already exists, not a blank field.
+    /// Pre-filled: a rename edits something that already exists.
     fn rename(session: &Session) -> Self {
         Self {
             prefix: format!("rename {:?} to: ", session.name),
@@ -139,12 +107,9 @@ impl Prompt {
         }
     }
 
-    /// Report a rejected name, optionally moving the default with it.
-    ///
-    /// What was typed is deliberately kept: a duplicate name is usually one
-    /// character away from a good one, and retyping it is not a punishment the
-    /// user earned. `default_name` is refreshed only when creating — a rename's
-    /// default is the name the session already has, and that has not moved.
+    /// Report a rejected name, keeping what was typed — a duplicate is usually
+    /// one character from a good name. `default_name` is refreshed only when
+    /// creating; a rename's default has not moved.
     fn fail(&mut self, message: String, default_name: Option<String>) {
         self.message = Some(message);
         if let Some(name) = default_name {
@@ -153,8 +118,7 @@ impl Prompt {
     }
 
     fn on_key(&mut self, key: Key) -> Step {
-        // Any keypress clears a stale message, so it never lingers over an
-        // unrelated action.
+        // A stale message must not linger over an unrelated action.
         self.message = None;
 
         match key {
@@ -174,35 +138,26 @@ impl Prompt {
                     text.to_string()
                 })
             }
-            // Ctrl-C quits from the picker, but here it would tear the user out
-            // of a live session they only meant to leave a prompt in.
+            // Not a quit here: it would tear the user out of a live session
+            // they only meant to leave a prompt in.
             Key::Esc | Key::CtrlC => Step::Cancel,
             _ => Step::None,
         }
     }
 }
 
-/// Ask for a name for a new session, owning the terminal while it does.
-///
-/// For `Ctrl-t c`, which arrives from an attached session and so has no
-/// terminal to borrow. Entering and leaving the alternate screen is what hides
-/// the session underneath and puts it back afterwards.
+/// Ask for a name for a new session, owning the terminal while it does — for
+/// `Ctrl-t c`, which arrives from an attached session with none to borrow.
 pub fn run(transport: &dyn Transport) -> Result<Outcome> {
-    // Same reasoning as the picker: `draw` never sets a colour, and crossterm's
-    // own NO_COLOR handling would rewrite one into a full SGR reset that wipes
-    // the dim this screen relies on.
+    // See the colour note in the parent module.
     ratatui::crossterm::style::force_color_output(true);
 
     let mut terminal = ratatui::try_init()?;
-    // The session's own alternate screen is still showing, and a second "enter
-    // alternate screen" does not clear it on every terminal: xterm and kitty
-    // treat it as a no-op. ratatui's first draw only paints the cells that
-    // differ from an empty buffer, so without this the prompt would land in
-    // the middle of the editor's last frame.
+    // A second alternate-screen enter is a no-op on xterm and kitty; see
+    // `ui::run`.
     terminal.clear()?;
     let outcome = run_on(&mut terminal, transport, Task::Create);
-    // Restore before propagating anything: an error that leaves the terminal in
-    // raw mode with no echo is far worse than the error itself.
+    // Restore before propagating: see `ui::run`.
     ratatui::try_restore()?;
     outcome
 }
@@ -210,12 +165,9 @@ pub fn run(transport: &dyn Transport) -> Result<Outcome> {
 /// Ask for a name on a terminal the caller already owns — how the picker drives
 /// this screen for `c` and `r`.
 ///
-/// Not `run`: initialising a second terminal inside the picker's would enter the
-/// alternate screen twice and leave it once, and the picker would spend the rest
-/// of its life drawing to the main screen with raw mode off. Sharing the
-/// terminal is also what makes the handover invisible — `Terminal::draw` resets
-/// the frame each pass, so this paints over the list and the picker's next draw
-/// puts it back.
+/// Not `run`: a second terminal inside the picker's would enter the alternate
+/// screen twice and leave it once. Sharing it also makes the handover
+/// invisible, since `Terminal::draw` resets the frame each pass.
 pub(super) fn run_on(
     terminal: &mut ratatui::DefaultTerminal,
     transport: &dyn Transport,
@@ -234,7 +186,6 @@ pub(super) fn run_on(
         }
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => super::translate(k),
-            // A resize just redraws on the next pass.
             _ => continue,
         };
 
@@ -244,9 +195,8 @@ pub(super) fn run_on(
             Step::Submit(name) => name,
         };
 
-        // Names are not validated here. `session::validate_name` and the
-        // transport's duplicate check are the rule; duplicating either one in
-        // the UI is how the two drift apart.
+        // Not validated here: `session::validate_name` and the transport's
+        // duplicate check are the rule, and a UI copy would drift from them.
         let committed = match task {
             Task::Create => transport.create_session(&name).map(Outcome::Created),
             Task::Rename(session) => transport
@@ -268,11 +218,8 @@ pub(super) fn run_on(
     }
 }
 
-/// The name a session gets when the user just presses enter.
-///
-/// Pure, so the numbering rule is testable without a transport. Compared
-/// case-insensitively because that is how the transports reject duplicates —
-/// offering a default that create would then refuse is worse than no default.
+/// The name a session gets when the user just presses enter. Compared
+/// case-insensitively, because that is how the transports reject duplicates.
 fn next_name(taken: &[String]) -> String {
     for n in 1..1000 {
         let candidate = format!("session {n}");
@@ -298,8 +245,7 @@ fn draw(frame: &mut Frame, prompt: &Prompt) {
         return;
     }
 
-    // The last row is the hint line; everything above it is the prompt. Same
-    // split as the picker, so the two screens line up.
+    // Same split as the picker, so the screens line up.
     let body = Rect {
         height: area.height.saturating_sub(1),
         ..area
@@ -316,13 +262,10 @@ fn draw(frame: &mut Frame, prompt: &Prompt) {
 
 /// Centre the line as it reads the moment the prompt opens, then hold it.
 ///
-/// The anchor deliberately ignores `input`, and that is the whole trick. Sizing
-/// it to the current contents would centre the line perfectly at every instant
-/// and shuffle it half a cell left on every keystroke; anchoring on the prefix
-/// alone would hold still but leave the real line sitting several columns right
-/// of centre. Measuring the *opening* line gets both: centred when you first see
-/// it, and a field whose first column never moves afterwards — which is what
-/// lets the placeholder sit exactly where your first keystroke will land.
+/// The anchor deliberately ignores `input`: sizing it to the current contents
+/// would shuffle the line half a cell on every keystroke, and anchoring on the
+/// prefix alone would leave it right of centre. Measuring the *opening* line
+/// gets both, and keeps the field's first column where the placeholder sits.
 fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -331,8 +274,6 @@ fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
     let height = if prompt.message.is_some() { 2 } else { 1 };
     let opening = (prompt.prefix.width() + prompt.default_name.width()) as u16;
     let anchor = draw::centre(area, opening, height);
-    // Everything from the anchor to the right edge is the line's, so a long name
-    // has somewhere to go.
     let width = (area.x + area.width).saturating_sub(anchor.x) as usize;
 
     if anchor.height >= 1 {
@@ -347,8 +288,8 @@ fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
         );
     }
 
-    // The message is routinely wider than the line, so it gets the full width
-    // and its own centring rather than hanging off the anchor.
+    // Routinely wider than the line, so it gets the full width and its own
+    // centring rather than hanging off the anchor.
     if anchor.height >= 2 {
         if let Some(msg) = prompt.message.as_deref() {
             frame.render_widget(
@@ -365,17 +306,8 @@ fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
 }
 
 /// The whole line: bold label, then either what was typed or the dim default.
-///
-/// Three roles, three weights, and all of it derived from state rather than
-/// tracked — the prefix is constant and `input.is_empty()` decides the rest, so
-/// backspacing to nothing brings the placeholder back with nothing to keep in
-/// sync.
-///
-/// The cursor is one inverted cell and it always marks the insertion point. With
-/// a placeholder showing, that point *is* its first letter, so the cursor
-/// inverts the letter rather than taking a column of its own in front of it —
-/// otherwise the default would sit one column right of where typing actually
-/// lands, and the field would visibly jump on the first keystroke.
+/// Derived from state rather than tracked, so backspacing to nothing brings the
+/// placeholder back with nothing to keep in sync.
 fn prompt_line(prompt: &Prompt, width: usize) -> Line<'static> {
     // The cursor is the only feedback that typing is doing anything, so it gets
     // a column before the label does — a long rename label on a narrow terminal
@@ -391,8 +323,6 @@ fn prompt_line(prompt: &Prompt, width: usize) -> Line<'static> {
     // selected row", and a one-cell cursor wants the crisper form.
     let cursor = Style::default().add_modifier(Modifier::REVERSED);
 
-    // Nothing typed yet, and a default to show it with: the cursor lands on a
-    // character, so it inverts that character.
     let placeholder = if prompt.input.is_empty() {
         split_first(&prompt.default_name)
     } else {
@@ -407,8 +337,6 @@ fn prompt_line(prompt: &Prompt, width: usize) -> Line<'static> {
                 Style::default().add_modifier(Modifier::DIM),
             ));
         }
-        // Something typed, or no default to sit on: the insertion point is past
-        // the end of the text, so the cursor inverts a blank instead.
         None => {
             spans.push(Span::raw(tail(&prompt.input, room)));
             spans.push(Span::styled(" ", cursor));
@@ -418,7 +346,6 @@ fn prompt_line(prompt: &Prompt, width: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Split off the first character, or `None` if there is not one.
 fn split_first(s: &str) -> Option<(String, &str)> {
     let first = s.chars().next()?;
     Some((first.to_string(), &s[first.len_utf8()..]))
@@ -502,18 +429,13 @@ mod tests {
             .collect()
     }
 
-    /// One rendered cell: what it shows and how it is styled.
-    ///
-    /// The modifier is the point of most of these tests, and `render` throws it
-    /// away, so the styling assertions go through here instead.
+    /// One rendered cell. `render` throws the modifier away, and the modifier is
+    /// the point of most of these tests.
     type Cell = (String, Modifier);
 
-    /// The whole prompt line, as cells, trimmed to its content.
-    ///
-    /// The row is found by the cursor's inverted cell, which nothing else on the
-    /// screen draws. The right edge is the last cell that either shows something
-    /// or is the cursor — the cursor can be an inverted *blank* trailing what was
-    /// typed, and trimming on symbol alone would throw it away.
+    /// The whole prompt line, as cells, trimmed to its content. The right edge
+    /// is the last cell that shows something *or* is the cursor — the cursor can
+    /// be an inverted blank, which trimming on symbol alone would discard.
     fn line_cells(p: &Prompt, w: u16, h: u16) -> Vec<Cell> {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
         terminal.draw(|f| draw(f, p)).expect("draw");
@@ -611,8 +533,7 @@ mod tests {
         assert_eq!(p.on_key(Key::Esc), Step::Cancel);
     }
 
-    /// Ctrl-C quits the picker. Doing that here would exit nvmux out from under
-    /// a session the user is still in, so it cancels like esc instead.
+    /// Cancels like esc, rather than exiting nvmux out from under a live session.
     #[test]
     fn ctrl_c_cancels_rather_than_quitting() {
         let mut p = prompt();
@@ -654,8 +575,8 @@ mod tests {
         );
     }
 
-    /// The transports reject duplicates case-insensitively, so a default that
-    /// only differs in case would be offered and then refused.
+    /// Duplicates are rejected case-insensitively, so a default differing only
+    /// in case would be offered and then refused.
     #[test]
     fn the_default_avoids_names_that_differ_only_in_case() {
         assert_eq!(next_name(&["Session 1".to_string()]), "session 2");
@@ -712,9 +633,6 @@ mod tests {
 
     /// The bug this layout exists to avoid: if the default starts one column
     /// over from where typing lands, the field jumps on the first keystroke.
-    ///
-    /// It only holds because the anchor is measured from the *opening* line and
-    /// ignores `input`, so this pins that too.
     #[test]
     fn the_default_sits_where_the_first_keystroke_will_land() {
         let mut typed = prompt();
@@ -727,10 +645,8 @@ mod tests {
         );
     }
 
-    /// Four roles on one line, and modifiers are the only way to tell them
-    /// apart given nothing here sets a colour: the label leads in bold, the
-    /// cursor is an inverted cell, the default recedes into dim, and what you
-    /// type is plain.
+    /// Four roles on one line, told apart by modifier alone since nothing here
+    /// sets a colour.
     #[test]
     fn the_label_leads_the_cursor_marks_the_field_and_the_default_recedes() {
         let label = "new session name: ".width();
@@ -907,9 +823,8 @@ mod tests {
         assert_eq!(p.default_name, "dotfiles");
     }
 
-    /// However little room is left, the cursor renders: it is the only sign that
-    /// a keystroke landed, and a label long enough to fill the line must not
-    /// push it off the edge.
+    /// The cursor is the only sign a keystroke landed, so a label long enough to
+    /// fill the line must not push it off the edge.
     #[test]
     fn the_cursor_survives_a_label_wider_than_the_terminal() {
         for w in [1u16, 2, 8, 20, 30] {
@@ -927,8 +842,7 @@ mod tests {
         }
     }
 
-    /// Same rule as the picker: no SGR colour, so the screen inherits the
-    /// terminal's palette and is correct under NO_COLOR without testing for it.
+    /// No SGR colour, so the screen is correct under NO_COLOR by construction.
     #[test]
     fn nothing_sets_a_colour() {
         use ratatui::style::Color;

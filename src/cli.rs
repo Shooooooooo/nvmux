@@ -1,13 +1,5 @@
-//! The command line.
-//!
-//! Exactly two invocations, and no subcommands:
-//!
-//! ```text
-//! nvmux           manage sessions on this machine
-//! nvmux <host>    manage sessions on <host>
-//! ```
-//!
-//! plus `--version` and `--help`. That is the whole surface for v0.1.
+//! The command line: `nvmux` for this machine, `nvmux <host>` for another.
+//! No subcommands.
 
 use clap::Parser;
 
@@ -78,8 +70,7 @@ mod tests {
 
     #[test]
     fn there_are_no_subcommands() {
-        // The surface is deliberately two invocations. If a subcommand is ever
-        // added, this test is the reminder that it was a decision.
+        // Adding one should be a decision, not an accident.
         assert!(
             Cli::command().get_subcommands().next().is_none(),
             "v0.1 has no subcommands"

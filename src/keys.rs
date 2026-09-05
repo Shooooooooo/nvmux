@@ -1,35 +1,19 @@
 //! The `Ctrl-t` prefix state machine.
 //!
 //! This sits in the stdin half of the PTY proxy and is the *only* thing that
-//! inspects the byte stream on the way to Neovim. The other direction — child
-//! to terminal — is never parsed at all, which is what lets bracketed paste,
-//! the kitty keyboard protocol, truecolor, undercurl, OSC 52 and DA1/XTGETTCAP
-//! round-trips work: the child negotiates directly with the real terminal.
+//! inspects the byte stream on the way to Neovim; the child-to-terminal
+//! direction is never parsed at all — see [`crate::pty`].
 //!
-//! Deliberately pure. Timing is the caller's job (it calls [`Prefix::timeout`]
-//! when its read times out), so the whole table below is unit-testable without
-//! a PTY, a terminal, or a clock.
+//! Deliberately pure: timing is the caller's job, via [`Prefix::timeout`], so
+//! the machine is unit-testable without a PTY, a terminal or a clock.
 //!
-//! | Sequence           | Action                                              |
-//! |--------------------|-----------------------------------------------------|
-//! | `C-t` `t`          | back to the picker; the child keeps running         |
-//! | `C-t` `d`          | detach: kill the local UI, leave the server running |
-//! | `C-t` `c`          | create a new session and attach to it               |
-//! | `C-t` `?`          | show the key bindings; the child keeps running      |
-//! | `C-t` `C-t`        | send one literal `C-t` to Neovim                    |
-//! | `C-t` *other*      | send `C-t` then that byte                           |
-//! | `C-t` then silence | send `C-t`                                          |
+//! [`BINDINGS`] is the one table. [`Prefix::feed`] consults it, the tests
+//! iterate it, and the help screen ([`crate::ui::help`]) renders it, so a
+//! command cannot be added without appearing in the help. The README's "While
+//! attached" table is a prose copy, and it is what can go stale.
 //!
 //! Note what is *not* here: `Ctrl-z` (0x1a) is not special-cased. It is
 //! forwarded like any other byte and Neovim receives it as a key.
-//!
-//! # One table
-//!
-//! The command rows above are prose. The code's copy is [`BINDINGS`]: it is
-//! what [`Prefix::feed`] consults, what the tests iterate, and what the help
-//! screen (`C-t ?`, [`crate::ui::help`]) renders, so a command cannot be added
-//! without appearing in the help. This table, the README's "While attached"
-//! table and `--help` are the prose copies, and they are what can go stale.
 
 /// `Ctrl-t`.
 pub const PREFIX: u8 = 0x14;
@@ -66,10 +50,6 @@ pub enum Step {
 
 /// One `C-t` command: the byte that selects it, what it does, and how the help
 /// screen describes it.
-///
-/// This table is the only place a command exists. [`Prefix::feed`] runs on it,
-/// the tests iterate it, and the help screen renders it, so a command cannot
-/// be added without appearing in the help.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Binding {
     /// The byte typed after the prefix. Printable ASCII, so the help screen
@@ -104,10 +84,8 @@ pub const BINDINGS: &[Binding] = &[
     },
 ];
 
-/// The command a second byte selects, if any.
-///
-/// Linear over a handful of rows; a `match` would be no faster and would be a
-/// second copy of the table.
+/// The command a second byte selects, if any. Linear over a handful of rows; a
+/// `match` would be a second copy of the table.
 pub fn command(byte: u8) -> Option<Action> {
     BINDINGS.iter().find(|b| b.key == byte).map(|b| b.action)
 }
@@ -248,7 +226,6 @@ mod tests {
 
     #[test]
     fn commands_produce_actions_and_no_bytes() {
-        // By value: `Binding` is `Copy`, and a `&u8` cannot sit in a `[u8; 2]`.
         for &Binding { key, action, .. } in BINDINGS {
             let mut p = Prefix::new();
             let steps = p.feed(&[PREFIX, key]);

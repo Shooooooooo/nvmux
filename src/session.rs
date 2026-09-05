@@ -1,18 +1,8 @@
 //! Session identity and on-disk metadata.
 //!
-//! Sessions live on whichever host runs the nvim process, and so does their
-//! metadata: attaching from a second laptop must show the same names. The
-//! layout beside each socket is
-//!
-//! ```text
-//! <runtime_dir>/<id>.sock    nvim's listen socket
-//! <runtime_dir>/<id>.json    {"id","name","created","pid"}
-//! <runtime_dir>/<id>.log     the session's stdout+stderr
-//! ```
-//!
-//! `<id>` is a random token, never the name. Renaming is a metadata edit — the
-//! socket path is the stable identity and the display name is only data. That
-//! avoids managing two socket paths and two SSH forwards per rename.
+//! `<id>.sock`, `<id>.json` and `<id>.log` sit together on whichever host runs
+//! the nvim process, so attaching from a second machine shows the same names.
+//! `<id>` is a random token, never the name.
 
 use std::path::Path;
 
@@ -20,13 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::SessionError;
 
-/// What a liveness probe concluded about a session.
-///
-/// Three states rather than a bool, because "did not answer" and "is not there"
-/// must not be confused. `nvim_list_bufs` blocks for the entire duration of any
-/// `system()` call the user's editor is running — a `:!make` makes a perfectly
-/// healthy session unresponsive for minutes. Reaping on a timeout would delete
-/// live sessions whenever someone is building.
+/// What a liveness probe concluded about a session. Three states rather than a
+/// bool, because "did not answer" and "is not there" must not be confused —
+/// see [`crate::rpc`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Liveness {
     /// Answered a deferred RPC call. Definitely serving.
@@ -39,10 +25,8 @@ pub enum Liveness {
     Dead,
 }
 
-/// Runtime state, discovered by probing rather than read from disk.
-///
-/// Kept out of the JSON entirely: `<id>.json` is exactly the four documented
-/// keys, and this is what the picker needs on top of them.
+/// Runtime state, discovered by probing rather than read from disk. Kept out of
+/// the JSON entirely.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionState {
     pub liveness: Liveness,
@@ -57,18 +41,13 @@ pub struct Session {
     pub id: String,
     /// Display name. Mutable; carries no identity.
     pub name: String,
-    /// Unix epoch seconds.
-    ///
-    /// Seconds-since-epoch rather than RFC3339 so that reading and writing this
-    /// file needs no date library at all — `SystemTime` gives it directly, and
-    /// the only consumer is a sort order and a possible future "created 3h ago".
+    /// Unix epoch seconds, rather than RFC3339, so this file needs no date
+    /// library at all.
     pub created: u64,
-    /// The nvim server's pid, on the host that runs it.
-    ///
-    /// A hint, not an identity. A backgrounded `$!` from the spawn script is not
-    /// reliably nvim's own pid (`setsid` forks when the caller is already a
-    /// process group leader), so this is overwritten with the server's own
-    /// answer once it is reachable, and liveness never rests on it alone —
+    /// The nvim server's pid — a hint, not an identity. `$!` from the spawn
+    /// script is not reliably nvim's own pid, since `setsid` forks when the
+    /// caller is already a process group leader, so this is overwritten with the
+    /// server's own answer once it is reachable. Liveness never rests on it:
     /// pids are reused.
     pub pid: u32,
 
@@ -108,11 +87,9 @@ impl Session {
         })
     }
 
-    /// Write `<id>.json` atomically.
-    ///
-    /// Temp file plus rename, so that a reader listing the directory during a
-    /// rename sees either the old name or the new one, never a half-written
-    /// file. `rename(2)` within one directory is atomic.
+    /// Write `<id>.json` atomically: temp file plus `rename(2)`, which within
+    /// one directory is atomic, so a concurrent listing sees the old name or the
+    /// new one and never a half-written file.
     pub fn write_atomic(&self, path: &Path) -> Result<(), SessionError> {
         use std::io::Write;
         let json = self.to_json()?;

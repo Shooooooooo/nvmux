@@ -9,8 +9,7 @@
 //!
 //! `cfmakeraw` already clears `ISIG` and `IXON`, disables `ICANON`, `ECHO` and
 //! `OPOST`, and sets `VMIN = 1` / `VTIME = 0` — measured, not assumed. The one
-//! genuinely non-redundant step is disabling `VSUSP`, so that even a terminal
-//! whose suspend character is not `Ctrl-z` cannot stop us.
+//! genuinely non-redundant step is disabling `VSUSP`.
 //!
 //! # The failure this module exists to prevent
 //!
@@ -32,11 +31,8 @@ use nix::sys::termios::{self, SetArg, SpecialCharacterIndices, Termios};
 
 use crate::error::Result;
 
-/// A `libc::termios` we can read from a signal handler.
-///
-/// Plain C data with no allocation and no interior pointers, so reading it from
-/// a handler is sound. `OnceLock::get` is an atomic load plus a read of
-/// already-initialised memory, which is safe in this context.
+/// A `libc::termios` we can read from a signal handler: plain C data, and
+/// `OnceLock::get` is an atomic load plus a read of initialised memory.
 struct Saved(libc::termios);
 
 // SAFETY: `libc::termios` is a plain-data struct with no pointers or interior
@@ -69,10 +65,8 @@ extern "C" fn restore_and_reraise(sig: libc::c_int) {
     }
 }
 
-/// Raw mode, restored when this is dropped.
-///
-/// Restoring twice is harmless, so the explicit [`RawMode::restore`] used on the
-/// way out of an attach and the `Drop` on the way out of a panic can both run.
+/// Raw mode, restored when this is dropped. Restoring twice is harmless, so the
+/// explicit [`RawMode::restore`] and the panic-path `Drop` can both run.
 pub struct RawMode {
     saved: Termios,
     restored: bool,
@@ -83,16 +77,12 @@ impl RawMode {
     pub fn enter() -> Result<Self> {
         let saved = termios::tcgetattr(stdin_fd()).map_err(errno)?;
 
-        // Keep a signal-readable copy the first time round. Later attaches
-        // restore to the same original state, so only the first matters.
-        //
-        // Taken with a second, raw `tcgetattr` rather than converting the nix
-        // value. `From<Termios> for libc::termios` hands back a cached inner
-        // struct **without syncing the public fields** — only `tcsetattr` syncs
-        // — so a converted value silently loses anything set through
-        // `control_chars` or the flag fields. Nothing mutates `saved` today, but
-        // the restore this feeds is the one that runs when nvmux is being
-        // killed, and it must not depend on that staying true.
+        // A signal-readable copy, taken the first time round with a second raw
+        // `tcgetattr` rather than by converting the nix value:
+        // `From<Termios> for libc::termios` returns a cached inner struct
+        // **without syncing the public fields** — only `tcsetattr` syncs — so a
+        // converted value silently loses anything set through `control_chars`.
+        // This feeds the restore that runs when nvmux is killed.
         let mut raw_saved = std::mem::MaybeUninit::<libc::termios>::uninit();
         // SAFETY: fd 0 is valid and tcgetattr fully initialises the struct on
         // success.
@@ -104,9 +94,8 @@ impl RawMode {
 
         let mut raw = saved.clone();
         termios::cfmakeraw(&mut raw);
-        // The one thing cfmakeraw does not do. Without it, a terminal whose
-        // VSUSP is not Ctrl-z could still suspend nvmux out from under the
-        // attached editor.
+        // The one thing cfmakeraw does not do: a terminal whose VSUSP is not
+        // Ctrl-z could otherwise suspend nvmux mid-session.
         raw.control_chars[SpecialCharacterIndices::VSUSP as usize] = termios::_POSIX_VDISABLE;
 
         // TCSANOW, not TCSAFLUSH: discarding type-ahead would silently eat

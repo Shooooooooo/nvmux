@@ -1,11 +1,10 @@
 //! Sessions on another host, reached over SSH.
 //!
-//! Everything about how sessions are spawned, listed and killed is shared with
-//! the local transport: the same scripts run on the far side, and the same pure
-//! parsing turns their output into sessions. The only thing that differs is how
-//! a script gets run and how a socket becomes reachable — which is exactly the
-//! seam [`crate::transport::exec::Executor`] and
-//! [`Transport::local_socket_for`] exist to be.
+//! Spawning, listing and killing are shared with the local transport — the same
+//! scripts, the same parsing. Only how a script gets run and how a socket
+//! becomes reachable differ, which is what
+//! [`crate::transport::exec::Executor`] and [`Transport::local_socket_for`] are
+//! for.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -51,17 +50,14 @@ impl SshTransport {
         let local_dir = config::ensure_runtime_dir()?;
         let control_path = config::control_path(&local_dir, &host_token)?;
 
-        // ssh itself must be new enough for unix-socket forwarding, which is
-        // the entire remote transport. Checked before connecting so the error
-        // names the real problem.
+        // Checked before connecting, so the error names the real problem.
         check_local_ssh()?;
 
         let ssh = Ssh::new(host.clone(), control_path);
         ssh.ensure_master()?;
 
         // One round trip for both the runtime directory and the remote Neovim
-        // version. Run through the login shell, which is the point: `ssh host
-        // nvim` finds nothing on most real setups.
+        // version.
         let out = ssh.run_script(shell::PROBE_SCRIPT, &[])?;
         if !out.ok() && out.stdout.trim().is_empty() {
             return Err(NvmuxError::Ssh(crate::ssh::classify(
@@ -105,14 +101,11 @@ impl SshTransport {
         })
     }
 
-    /// The session's socket path **on the remote host**.
-    ///
-    /// Validated against our own length budget rather than trusting ssh's
-    /// check. ssh validates `-L` endpoints against the **local** machine's
-    /// `sun_path` size, because it has not connected yet — so a local Linux
-    /// talking to a remote macOS would accept a 104-byte remote path that then
-    /// fails on the far side, and the reverse would reject a path the remote
-    /// kernel would happily serve.
+    /// The session's socket path **on the remote host**, validated against our
+    /// own budget rather than ssh's: ssh checks `-L` endpoints against the
+    /// *local* `sun_path` size, because it has not connected yet, so a local
+    /// Linux talking to a remote macOS would accept a path that fails on the
+    /// far side.
     fn remote_sock(&self, id: &str) -> Result<PathBuf> {
         if !ids::is_valid_id(id) {
             return Err(crate::error::PathError::MalformedId(id.to_string()).into());
@@ -134,13 +127,8 @@ impl SshTransport {
         self.ssh.host()
     }
 
-    /// Remove local forwarded sockets whose session no longer exists.
-    ///
-    /// These are ours and nobody else's: the name is
-    /// `<host_token>-<id>.sock`, so only sessions on *this* host can match, and
-    /// only ids that were not in a listing that succeeded. They otherwise
-    /// accumulate in the runtime directory for every session ever killed, and
-    /// every nvmux run that ended without cancelling its forward.
+    /// Remove local forwarded sockets whose session no longer exists. The name
+    /// is `<host_token>-<id>.sock`, so only sessions on *this* host can match.
     ///
     /// Deliberately not called when a listing fails: "the host did not answer"
     /// must never be mistaken for "you have no sessions", or a transient ssh
@@ -186,9 +174,8 @@ impl SshTransport {
         if !out.ok() && out.stdout.trim().is_empty() {
             let err = crate::ssh::classify(self.host(), out.status, &out.stderr);
             if matches!(err, SshError::NoMaster(_) | SshError::MasterDied(_)) {
-                // v0.1 does not try to be clever about a master that died
-                // mid-session: report it, drop the forwards we believed in, and
-                // let the caller fall back to the picker.
+                // Report it, drop the forwards we believed in, and let the
+                // caller fall back to the picker.
                 self.forwarded.lock().map(|mut f| f.clear()).ok();
             }
             return Err(err.into());
@@ -206,19 +193,11 @@ impl Transport for SshTransport {
         let out = self.run_script(shell::LIST_SCRIPT, &[&self.remote_dir])?;
         let mut sessions = protocol::rows_to_sessions(protocol::parse_listing(&out.stdout)?);
 
-        // Liveness comes from the remote script, which asks whether a process is
-        // serving each socket. That is a stronger signal than the recorded pid
-        // and it works without a forward per session — which matters, because a
-        // forward per session just to draw the picker would cost a round trip
-        // each and forwards are not free to leave lying around.
-        //
-        // Note connect() through a forward would be worthless anyway: ssh
-        // accepts first and resets afterwards, so it says nothing about whether
-        // the remote nvim is alive.
+        // Liveness comes from the remote script, so drawing the picker needs no
+        // forward per session. connect() through a forward would say nothing
+        // anyway: ssh accepts first and resets afterwards.
         for s in &mut sessions {
             if s.state.liveness == Liveness::Dead {
-                // The remote sweep already removed anything genuinely stale, so
-                // a row that survives with nothing serving it is unusual.
                 tracing::debug!(id = %s.id, "remote session reported not serving");
             }
         }
@@ -265,8 +244,8 @@ impl Transport for SshTransport {
             .into());
         }
 
-        // Confirm the session is really answering, through a forward — which
-        // also proves the forward itself works before the user tries to attach.
+        // Confirm through a forward, which also proves the forward works before
+        // the user tries to attach.
         let local = self.local_sock(&id)?;
         self.ssh.forward(&local, &remote_sock)?;
         self.forwarded.lock().map(|mut f| f.insert(id.clone())).ok();
@@ -305,8 +284,6 @@ impl Transport for SshTransport {
         }
 
         let session = Session::new(id.clone(), name.to_string(), spawned.pid.unwrap_or(0));
-        // The metadata lives with the session, on the host that owns it, so
-        // attaching from a second machine shows the same names.
         let json = session.to_json()?;
         self.run_script(shell::WRITE_META_SCRIPT, &[&self.remote_dir, &id, &json])?;
 
@@ -327,9 +304,7 @@ impl Transport for SshTransport {
         let out = self.run_script(shell::KILL_SCRIPT, &[&self.remote_dir, &s.id, &pid])?;
         let outcome = protocol::parse_kill(&out.stdout)?;
 
-        // Drop the forward regardless of the outcome: a forward to a socket
-        // that may be gone is not worth keeping, and re-attaching would rebuild
-        // it anyway.
+        // Drop the forward regardless: re-attaching would rebuild it anyway.
         if let (Ok(local), Ok(remote)) = (self.local_sock(&s.id), self.remote_sock(&s.id)) {
             self.ssh.cancel(&local, &remote);
         }
@@ -364,8 +339,6 @@ impl Transport for SshTransport {
             return Err(SessionError::Exists(new_name.to_string()).into());
         }
 
-        // A metadata edit, exactly as locally: the socket never moves, so no
-        // forward has to be rebuilt and the session's identity is untouched.
         let mut updated = s.clone();
         updated.name = new_name.to_string();
         let json = updated.to_json()?;
@@ -378,7 +351,6 @@ impl Transport for SshTransport {
         let local = self.local_sock(&s.id)?;
         let remote = self.remote_sock(&s.id)?;
 
-        // Already forwarded and still usable? Then this is free.
         let known = self
             .forwarded
             .lock()
@@ -388,9 +360,8 @@ impl Transport for SshTransport {
             return Ok(local);
         }
 
-        // A forward needs a live master. Checking first turns "the connection
-        // died while you were in the picker" into a sentence rather than a
-        // confusing forwarding failure.
+        // Checking first turns "the connection died while you were in the
+        // picker" into a sentence rather than a forwarding failure.
         if !self.ssh.is_master_alive() {
             self.forwarded.lock().map(|mut f| f.clear()).ok();
             self.ssh.ensure_master()?;

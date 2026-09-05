@@ -1,33 +1,16 @@
-//! Typed errors.
-//!
-//! The rule from the design: `anyhow::Result` at boundaries, typed errors where
-//! callers actually branch. Every variant below exists because some caller makes
-//! a decision on it — a stale socket gets reaped, a busy session does not; a
-//! kill that could not take effect must not delete files; an old nvim gets a
-//! instead of a mysterious connection failure.
+//! Typed errors: `anyhow::Result` at boundaries, these where callers branch.
+//! Every variant exists because some caller makes a decision on it — a stale
+//! socket gets reaped and a busy one does not, a kill that did not take effect
+//! must not delete files.
 
 use std::path::PathBuf;
 
-/// Failures constructing or validating paths.
-///
-/// Separate from `io::Error` because the length rule is ours, not the kernel's,
-/// and because the kernel's version of this error is unusable — see
-/// [`PathError::TooLong`].
+/// Failures constructing or validating paths. Separate from `io::Error` because
+/// the length rule is ours, not the kernel's.
 #[derive(Debug, thiserror::Error)]
 pub enum PathError {
-    /// A composed socket path exceeded the `sun_path` budget.
-    ///
-    /// This must be caught by us, before anyone calls `bind()`. The reason is
-    /// that the two halves of nvmux disagree about overlong paths: nvim (via
-    /// libuv) *silently truncates* — `uv_pipe_bind2` does
-    /// `if (namelen > sizeof(saddr.up.path)) namelen = sizeof(saddr.up.path);`
-    /// with no warning and exit 0 — while Rust's `UnixStream::connect` refuses
-    /// with `InvalidInput`. So an overlong path yields a perfectly healthy nvim
-    /// server that nvmux itself can never connect to, and nothing anywhere
-    /// reports an error.
-    ///
-    /// Note the kernel error carries `raw_os_error() == None`, so there is no
-    /// `ENAMETOOLONG` to match on. Never write `raw_os_error() == Some(ENAMETOOLONG)`.
+    /// A composed socket path exceeded the `sun_path` budget. Must be caught
+    /// before anyone calls `bind()` — see [`crate::config`] for why.
     #[error(
         "unix socket path is {len} bytes, max {max}: {}\n\
          hint: nvmux composes paths under {}. A longer path would be silently \
@@ -40,19 +23,13 @@ pub enum PathError {
         max: usize,
     },
 
-    /// The runtime directory exists but is not a directory.
-    ///
-    /// Checked on the `lstat` result, not `stat`: a *symlink to* a directory
-    /// passes `create_dir_all` and `Metadata::is_dir()`, and that is exactly the
-    /// shape of a `/tmp` symlink attack.
+    /// The runtime directory exists but is not a directory. Checked on `lstat`,
+    /// not `stat` — see [`crate::config`].
     #[error("{}: not a directory (or is a symlink to one, which we refuse)", .0.display())]
     NotADirectory(PathBuf),
 
-    /// Someone else owns our runtime directory.
-    ///
-    /// `/tmp` is mode 1777. The sticky bit stops another user *deleting* our
-    /// directory; it does not stop them *creating* `/tmp/nvmux-<uid>` first,
-    /// with any ownership and mode they like. This check is mandatory.
+    /// Someone else owns our runtime directory. `/tmp` is mode 1777: the sticky
+    /// bit stops another user deleting it, not creating it first.
     #[error("{}: owned by uid {owner}, expected {expected}", .path.display())]
     BadOwner {
         path: PathBuf,
@@ -60,18 +37,13 @@ pub enum PathError {
         expected: u32,
     },
 
-    /// The runtime directory is group- or world-accessible.
-    ///
-    /// This is a code-execution control, not a privacy nicety: nvim creates its
-    /// listen socket with `0777 & ~umask`, so a reachable socket lets any local
-    /// user run `nvim_command("!sh")` as us.
+    /// The runtime directory is group- or world-accessible — a code-execution
+    /// control, not a privacy nicety. See [`crate::config`].
     #[error("{}: mode is {mode:04o}, refusing to use a directory accessible to other users", .path.display())]
     BadMode { path: PathBuf, mode: u32 },
 
-    /// A session id that is not 8 base32 characters.
-    ///
-    /// Ids become paths, so this is a containment check rather than a
-    /// formatting nicety.
+    /// A session id that is not 8 base32 characters. Ids become paths, so this
+    /// is a containment check.
     #[error("malformed session id {0:?}: expected 8 lowercase base32 characters")]
     MalformedId(String),
 
@@ -107,11 +79,9 @@ pub enum RpcError {
     #[error("nvim returned an error: {0}")]
     Nvim(String),
 
-    /// We could not make sense of the bytes on the wire.
-    ///
-    /// Any occurrence of this poisons the connection: rmpv has already consumed
-    /// a partial frame, so the next read would decode garbage from the tail of
-    /// this one. The client closes itself when this happens.
+    /// We could not make sense of the bytes on the wire. This poisons the
+    /// connection: rmpv has already consumed a partial frame, so the next read
+    /// would decode garbage from the tail of this one.
     #[error("malformed msgpack from nvim: {0}")]
     Protocol(String),
 
@@ -120,11 +90,8 @@ pub enum RpcError {
 }
 
 impl RpcError {
-    /// Whether this error means "there is definitely no server here", as opposed
-    /// to "the server did not answer in time".
-    ///
-    /// Reaping a socket on a timeout would delete live sessions whenever the
-    /// user is running a build, so the distinction is load-bearing.
+    /// "There is definitely no server here", as opposed to "it did not answer in
+    /// time". Reaping on a timeout would delete sessions that are merely busy.
     pub fn is_definitely_dead(&self) -> bool {
         matches!(self, RpcError::ConnectionRefused(_) | RpcError::Reset)
     }
@@ -153,11 +120,8 @@ pub enum SessionError {
         log_tail: String,
     },
 
-    /// The kill did not take effect, and nvmux left the session's files alone.
-    ///
-    /// Removing them anyway would orphan a running Neovim: with no socket in the
-    /// runtime directory it would never appear in a listing again, and nothing
-    /// could reach it.
+    /// The kill did not take effect, so the files were left alone. Removing them
+    /// anyway would orphan a running Neovim that nothing could ever reach again.
     #[error("could not kill session {name:?}: {reason}")]
     NotKilled { name: String, reason: &'static str },
 
@@ -169,10 +133,8 @@ pub enum SessionError {
     },
 }
 
-/// Problems with the `nvim` binary itself, on either machine.
-///
-/// These are checked and reported at startup rather than surfacing later as a
-/// mysterious connection failure.
+/// Problems with the `nvim` binary itself, on either machine. Checked at startup
+/// rather than surfacing later as a mysterious connection failure.
 #[derive(Debug, thiserror::Error)]
 pub enum NvimError {
     #[error("{where_}: `nvim` not found on $PATH\nhint: nvmux needs Neovim >= {min} on {where_}")]
@@ -222,10 +184,6 @@ pub enum SshError {
 }
 
 /// The error type crossing the [`crate::transport::Transport`] boundary.
-///
-/// Deliberately declared in full at milestone 1, with most variants unused:
-/// fixing the error surface now is what stops the SSH work at milestone 5 from
-/// reshaping every signature.
 #[derive(Debug, thiserror::Error)]
 pub enum NvmuxError {
     #[error(transparent)]
@@ -241,8 +199,7 @@ pub enum NvmuxError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
-    /// A milestone boundary. Every one of these is a `todo!()` that reports
-    /// itself politely instead of panicking.
+    /// A `todo!()` that reports itself politely instead of panicking.
     #[error("not implemented yet: {0}")]
     Unimplemented(&'static str),
 }
