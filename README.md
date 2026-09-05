@@ -99,8 +99,13 @@ reimplementing it.
 |---|---|
 | `Ctrl-t` `d` | detach — leaves the session running, exits nvmux |
 | `Ctrl-t` `t` | back to the picker, session still attached |
-| `Ctrl-t` `c` | create a new session and attach to it |
+| `Ctrl-t` `c` | name a new session and attach to it — `Esc` goes back |
 | `Ctrl-t` `Ctrl-t` | send a literal `Ctrl-t` to Neovim |
+
+`Ctrl-t c` hides the session and asks for a name in the middle of the screen. The
+next free `session N` is shown dimmed in the field as the default, so pressing
+enter straight away names it that; typing replaces it. A name that is already
+taken is reported in place, with what you typed still there to fix.
 
 Everything else goes to Neovim untouched — including `Ctrl-c`, `Ctrl-z` and
 `Ctrl-s`, which reach the editor as ordinary keys rather than becoming signals

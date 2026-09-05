@@ -30,7 +30,7 @@ const MARKER: &str = "▸ ";
 const INDENT: &str = "  ";
 
 /// The prompt cursor.
-const CURSOR: &str = "▋";
+pub(super) const CURSOR: &str = "▋";
 
 /// Only a floor for the degenerate case of every name being empty; the block is
 /// otherwise sized to its content. A minimum wider than the content would push
@@ -157,7 +157,7 @@ fn scroll_offset(selected: usize, total: usize, height: usize) -> usize {
 }
 
 /// Centre a `width` x `height` block inside `area`, both axes.
-fn centre(area: Rect, width: u16, height: u16) -> Rect {
+pub(super) fn centre(area: Rect, width: u16, height: u16) -> Rect {
     Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -177,7 +177,7 @@ fn centre_vertically(area: Rect, height: u16) -> Rect {
 /// Truncate to a display width, counting grapheme width rather than bytes or
 /// `char`s so CJK names and emoji do not overflow the block they were measured
 /// into.
-fn truncate(s: &str, max: usize) -> String {
+pub(super) fn truncate(s: &str, max: usize) -> String {
     if s.width() <= max {
         return s.to_string();
     }

@@ -8,6 +8,17 @@
 //! confirm, filter) replace the hint line *in place* rather than opening a modal
 //! or a bordered popup.
 //!
+//! # Two screens, one visual language
+//!
+//! [`prompt`] is the other screen: the full-screen "name the new session" view
+//! that `Ctrl-t c` opens over an attached session. It is a separate screen
+//! rather than a picker mode because it is invoked from a session and not from
+//! the list — routing `Ctrl-t c` through the picker would show the user a list
+//! they did not ask for, and drawing a box over that list is exactly what the
+//! contract above rules out. The contract is unchanged and still governs this
+//! screen; the prompt simply shares its vocabulary — centred content, one dim
+//! hint row on the last line, no borders, no colour.
+//!
 //! # There is no preview pane, and there must never be one
 //!
 //! Beyond wanting a clean screen, there is a hard technical reason. Neovim sizes
@@ -55,6 +66,7 @@
 
 pub mod app;
 pub mod draw;
+pub mod prompt;
 
 /// What the picker returned.
 #[derive(Debug, Clone)]
