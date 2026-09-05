@@ -194,6 +194,12 @@ pub fn run(transport: &dyn Transport) -> Result<Outcome> {
     ratatui::crossterm::style::force_color_output(true);
 
     let mut terminal = ratatui::try_init()?;
+    // The session's own alternate screen is still showing, and a second "enter
+    // alternate screen" does not clear it on every terminal: xterm and kitty
+    // treat it as a no-op. ratatui's first draw only paints the cells that
+    // differ from an empty buffer, so without this the prompt would land in
+    // the middle of the editor's last frame.
+    terminal.clear()?;
     let outcome = run_on(&mut terminal, transport, Task::Create);
     // Restore before propagating anything: an error that leaves the terminal in
     // raw mode with no echo is far worse than the error itself.
