@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use nvmux::cli::Cli;
-use nvmux::{config, logging, nvim, pty, transport, ui};
+use nvmux::{config, logging, nvim, pty, settings, transport, ui};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -12,6 +12,15 @@ fn main() -> Result<()> {
     // Everything else depends on this existing and being ours.
     let dir = config::ensure_runtime_dir().context("preparing the nvmux runtime directory")?;
     logging::init(&dir)?;
+
+    // Load the user's config before anything reads a setting. A broken config is
+    // a startup error in the same `nvmux:` shape as `run`'s below — not an
+    // `Error:` backtrace, and never a silent fall back to the defaults.
+    let settings = settings::load().unwrap_or_else(|e| {
+        eprintln!("nvmux: {e}");
+        std::process::exit(1);
+    });
+    settings::init(settings);
 
     // Before anything is spawned: see `config::restrict_umask`.
     config::restrict_umask();

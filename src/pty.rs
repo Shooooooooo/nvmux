@@ -36,7 +36,7 @@ pub use portable_pty::PtySize;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair};
 
 use crate::error::{NvmuxError, Result};
-use crate::keys::{self, Action, Prefix, Step};
+use crate::keys::{Action, Prefix, Step};
 use crate::{rpc, term, winch};
 
 /// Neovim aborts on the seventeenth attached UI rather than returning an error
@@ -249,14 +249,14 @@ fn pump(
     highest_session_num: u32,
 ) -> Result<Outcome> {
     let stdin_fd = std::io::stdin().as_raw_fd();
-    let mut prefix = Prefix::new(highest_session_num);
+    let mut prefix = Prefix::with_prefix(highest_session_num, crate::settings::get().keys.prefix);
     let mut buf = [0u8; 8192];
 
     loop {
         // A pending prefix needs its own deadline: a *stopped* child produces
         // no poll activity at all, so an indefinite wait would never notice it.
         let timeout_ms = if prefix.is_armed() {
-            keys::TIMEOUT.as_millis() as libc::c_int
+            crate::settings::get().keys.timeout_ms as libc::c_int
         } else {
             IDLE_POLL_MS
         };

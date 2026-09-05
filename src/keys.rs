@@ -108,6 +108,52 @@ pub fn command(byte: u8) -> Option<Action> {
     BINDINGS.iter().find(|b| b.key == byte).map(|b| b.action)
 }
 
+/// Parse a human prefix spelling like `"C-t"` or `"Ctrl-a"` into its control
+/// byte. Case-insensitive on both halves; the inverse of [`prefix_label`].
+///
+/// Only a `Ctrl-<letter>` chord is accepted, because the prefix has to be a
+/// single byte the terminal delivers in raw mode, and a control chord is the one
+/// class that is both typable and does not collide with ordinary text. A few of
+/// those bytes are refused: they already mean something else on the wire and
+/// would never reach the machine as a prefix (or, for `C-m`, would clash with
+/// the number-entry terminator [`ENTER`]).
+///
+/// `C-c` and `C-z` are *allowed*, as in tmux: choosing them is the user's
+/// explicit, reversible decision, and it only means that byte stops reaching
+/// Neovim — the machine is unaffected.
+pub fn parse_prefix(s: &str) -> Result<u8, String> {
+    let lower = s.trim().to_ascii_lowercase();
+    let letter = lower
+        .strip_prefix("ctrl-")
+        .or_else(|| lower.strip_prefix("c-"))
+        .ok_or_else(|| format!("prefix {s:?} must look like \"C-t\" or \"Ctrl-a\""))?;
+    let &[b] = letter.as_bytes() else {
+        return Err(format!(
+            "prefix {s:?} must be Ctrl and a single ASCII letter, like \"C-t\""
+        ));
+    };
+    if !b.is_ascii_lowercase() {
+        return Err(format!("prefix {s:?} must be Ctrl and an ASCII letter a-z"));
+    }
+    // 'a' (0x61) -> 0x01 ... 't' (0x74) -> 0x14 ... 'z' (0x7a) -> 0x1a.
+    let byte = b & 0x1f;
+    match byte {
+        0x08 => Err("C-h is Backspace and would never reach the prefix machine".into()),
+        0x09 => Err("C-i is Tab and would never reach the prefix machine".into()),
+        0x0a => Err("C-j is a line feed and would never reach the prefix machine".into()),
+        0x0d => Err("C-m is Enter and would collide with number entry".into()),
+        _ => Ok(byte),
+    }
+}
+
+/// Spell a prefix byte the way people read it: `0x14` -> `"Ctrl-t"`. The inverse
+/// of [`parse_prefix`], used by the runtime help screen and messages so a
+/// remapped prefix is described as the key the user actually set.
+pub fn prefix_label(byte: u8) -> String {
+    // The control byte's letter is the low five bits set back into ASCII.
+    format!("Ctrl-{}", (byte | 0x60) as char)
+}
+
 /// Carriage return, which is what Enter is in raw mode. Ends a number early
 /// rather than waiting out the [`TIMEOUT`].
 const ENTER: u8 = 0x0d;
@@ -125,20 +171,45 @@ enum State {
 }
 
 /// The prefix state machine.
-#[derive(Debug, Default)]
+///
+/// The prefix byte is state, not a global read: the machine stays pure and
+/// clock-free (see the module docs), and the configured key enters through the
+/// constructor rather than a settings lookup buried in [`feed`](Prefix::feed).
+#[derive(Debug)]
 pub struct Prefix {
     state: State,
     /// The highest live session number, used only to decide whether a further
     /// digit could still change the answer. Stale is harmless — see the module
     /// docs.
     highest: u32,
+    /// The byte that arms the machine. [`PREFIX`] by default; a config file can
+    /// remap it (see [`crate::settings`]).
+    prefix: u8,
+}
+
+/// The derive would zero `prefix`; the default machine must arm on [`PREFIX`].
+impl Default for Prefix {
+    fn default() -> Self {
+        Self {
+            state: State::Idle,
+            highest: 0,
+            prefix: PREFIX,
+        }
+    }
 }
 
 impl Prefix {
+    /// A machine armed by the standard [`PREFIX`] (`Ctrl-t`).
     pub fn new(highest: u32) -> Self {
+        Self::with_prefix(highest, PREFIX)
+    }
+
+    /// A machine armed by `prefix`, for a config file that remaps the key.
+    pub fn with_prefix(highest: u32, prefix: u8) -> Self {
         Self {
             state: State::Idle,
             highest,
+            prefix,
         }
     }
 
@@ -166,7 +237,7 @@ impl Prefix {
         for &b in input {
             match self.state {
                 State::Idle => {
-                    if b == PREFIX {
+                    if b == self.prefix {
                         self.state = State::Armed;
                     } else {
                         pending.push(b);
@@ -175,11 +246,11 @@ impl Prefix {
 
                 State::Armed => {
                     self.state = State::Idle;
-                    if b == PREFIX {
+                    if b == self.prefix {
                         // C-t C-t: one literal prefix byte reaches Neovim.
                         // Checked before everything else, so no rule and no row
                         // can ever shadow it.
-                        pending.push(PREFIX);
+                        pending.push(self.prefix);
                     } else if (b'1'..=b'9').contains(&b) {
                         // A number never starts with 0, so `C-t 0` falls
                         // through to the replay branch below.
@@ -190,7 +261,7 @@ impl Prefix {
                     } else {
                         // Not a command, so the user's original keystrokes are
                         // replayed in order and nothing is eaten.
-                        pending.push(PREFIX);
+                        pending.push(self.prefix);
                         pending.push(b);
                     }
                 }
@@ -218,7 +289,7 @@ impl Prefix {
                         self.state = State::Idle;
                         flush(&mut steps, &mut pending);
                         steps.push(Step::Act(Action::Switch(n)));
-                        if b == PREFIX {
+                        if b == self.prefix {
                             self.state = State::Armed;
                         } else {
                             pending.push(b);
@@ -252,7 +323,7 @@ impl Prefix {
     pub fn timeout(&mut self) -> Vec<Step> {
         match std::mem::replace(&mut self.state, State::Idle) {
             State::Idle => Vec::new(),
-            State::Armed => vec![Step::Forward(vec![PREFIX])],
+            State::Armed => vec![Step::Forward(vec![self.prefix])],
             State::Number(n) => vec![Step::Act(Action::Switch(n))],
         }
     }
@@ -747,5 +818,107 @@ mod tests {
     fn the_prefix_label_names_the_prefix_byte() {
         let letter = PREFIX_LABEL.chars().last().expect("a label");
         assert_eq!(letter as u8 & 0x1f, PREFIX);
+    }
+
+    #[test]
+    fn a_prefix_string_parses_to_its_control_byte() {
+        assert_eq!(parse_prefix("C-t"), Ok(PREFIX));
+        assert_eq!(parse_prefix("Ctrl-a"), Ok(0x01));
+        assert_eq!(parse_prefix("C-z"), Ok(0x1a));
+    }
+
+    /// Both halves are case-insensitive, and surrounding space is ignored.
+    #[test]
+    fn a_prefix_string_is_case_insensitive() {
+        assert_eq!(parse_prefix("ctrl-T"), Ok(PREFIX));
+        assert_eq!(parse_prefix("c-A"), Ok(0x01));
+        assert_eq!(parse_prefix("  Ctrl-B  "), Ok(0x02));
+    }
+
+    /// The label and the parser are inverses for every control byte, so what the
+    /// help screen prints round-trips back to the byte the machine matches.
+    #[test]
+    fn the_prefix_string_round_trips() {
+        for byte in 1u8..=26 {
+            // The four bytes that are also Enter/newline/Tab/Backspace are
+            // refused on the way back, by design; they never round-trip.
+            if matches!(byte, 0x08 | 0x09 | 0x0a | 0x0d) {
+                continue;
+            }
+            let label = prefix_label(byte);
+            assert_eq!(parse_prefix(&label), Ok(byte), "for {label}");
+        }
+        assert_eq!(parse_prefix(&prefix_label(PREFIX)), Ok(PREFIX));
+    }
+
+    /// Generalises [`the_prefix_label_names_the_prefix_byte`] beyond the default.
+    #[test]
+    fn the_prefix_label_names_any_control_byte() {
+        assert_eq!(prefix_label(0x01), "Ctrl-a");
+        assert_eq!(prefix_label(PREFIX), "Ctrl-t");
+        assert_eq!(prefix_label(0x1a), "Ctrl-z");
+    }
+
+    #[test]
+    fn a_malformed_prefix_is_rejected() {
+        for s in ["t", "C-1", "C-", "", "hyper-t", "C-ab", "C-é"] {
+            assert!(parse_prefix(s).is_err(), "{s:?} should be rejected");
+        }
+    }
+
+    /// These control bytes are already Enter/newline/Tab/Backspace on the wire,
+    /// so they could never act as a prefix; the parser refuses them by name.
+    #[test]
+    fn prefixes_that_break_the_terminal_are_rejected() {
+        for s in ["C-m", "C-j", "C-i", "C-h"] {
+            assert!(parse_prefix(s).is_err(), "{s:?} should be rejected");
+        }
+    }
+
+    /// Allowed on purpose (tmux does the same): the byte simply stops reaching
+    /// Neovim. Documented, reversible, and harmless to the machine.
+    #[test]
+    fn ctrl_c_and_ctrl_z_are_accepted_as_prefixes() {
+        assert_eq!(parse_prefix("C-c"), Ok(0x03));
+        assert_eq!(parse_prefix("C-z"), Ok(0x1a));
+    }
+
+    /// A remapped machine arms on its own byte, and the old default is then just
+    /// an ordinary key forwarded to Neovim.
+    #[test]
+    fn a_remapped_prefix_arms_on_its_own_byte() {
+        let ctrl_a = 0x01;
+        let mut p = Prefix::with_prefix(0, ctrl_a);
+        let armed = p.feed(&[ctrl_a]);
+        assert!(forwarded(&armed).is_empty(), "the new prefix must be eaten");
+        assert!(p.is_armed());
+
+        let steps = p.feed(b"t");
+        assert_eq!(actions(&steps), vec![Action::Picker]);
+
+        // The former default is no longer special.
+        let mut p = Prefix::with_prefix(0, ctrl_a);
+        let steps = p.feed(&[PREFIX]);
+        assert_eq!(forwarded(&steps), vec![PREFIX]);
+        assert!(!p.is_armed());
+    }
+
+    #[test]
+    fn a_remapped_doubled_prefix_sends_one_literal() {
+        let ctrl_a = 0x01;
+        let mut p = Prefix::with_prefix(0, ctrl_a);
+        let steps = p.feed(&[ctrl_a, ctrl_a]);
+        assert_eq!(forwarded(&steps), vec![ctrl_a]);
+        assert!(!p.is_armed());
+    }
+
+    /// `new` and the derived-less `Default` both arm on the standard prefix, so
+    /// the default machine is unchanged.
+    #[test]
+    fn new_and_default_use_the_standard_prefix() {
+        for mut p in [Prefix::new(0), Prefix::default()] {
+            assert!(p.feed(&[PREFIX]).is_empty());
+            assert!(p.is_armed(), "the standard prefix must arm the machine");
+        }
     }
 }

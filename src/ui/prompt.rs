@@ -157,7 +157,7 @@ pub fn run(transport: &dyn Transport) -> Result<Outcome> {
     // `ui::run`.
     terminal.clear()?;
     // Reached from a session that has already dissolved to black, so start black.
-    if crate::fade::EXCURSIONS {
+    if crate::fade::excursions() {
         crate::fade::prime_black(&mut terminal)?;
     }
     let outcome = run_on(&mut terminal, transport, Task::Create, true);
@@ -185,7 +185,7 @@ pub(super) fn run_on(
 
     // `run` owns the terminal and dips through black; the picker's `c`/`r` do not
     // — they are nested inside the already-faded picker, so `animate` is false.
-    if animate && crate::fade::EXCURSIONS {
+    if animate && crate::fade::excursions() {
         crate::fade::fade_in_ratatui(terminal, |f| draw(f, &prompt))?;
     }
 
@@ -229,7 +229,7 @@ pub(super) fn run_on(
     };
 
     // Dissolve back to black so the resumed session takes over dark.
-    if animate && crate::fade::EXCURSIONS {
+    if animate && crate::fade::excursions() {
         crate::fade::fade_out_ratatui(terminal, |f| draw(f, &prompt))?;
     }
     Ok(outcome)

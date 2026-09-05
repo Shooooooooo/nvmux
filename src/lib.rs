@@ -18,6 +18,7 @@ pub mod nvim;
 pub mod pty;
 pub mod rpc;
 pub mod session;
+pub mod settings;
 pub mod shell;
 pub mod ssh;
 pub mod term;

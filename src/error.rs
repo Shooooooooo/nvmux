@@ -183,7 +183,46 @@ pub enum SshError {
     TooOld { found: String, min: &'static str },
 }
 
-/// The error type crossing the [`crate::transport::Transport`] boundary.
+/// Failures loading the user's configuration file.
+///
+/// A missing file is not an error — nvmux runs on its defaults — so there is no
+/// "not found" variant for the default paths. The one exception is a file named
+/// explicitly by `$NVMUX_CONFIG`: an explicit request for a file that is not
+/// there is a mistake worth reporting, not something to paper over with
+/// defaults. Every variant carries the path so the message can point at it.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    /// `$NVMUX_CONFIG` named a file that does not exist. Only the explicit path
+    /// is fatal when absent; the default paths fall back to the built-in values.
+    #[error("{}: config file not found (named by $NVMUX_CONFIG)", .0.display())]
+    ExplicitMissing(PathBuf),
+
+    /// The file exists but could not be read (permissions, a broken symlink,
+    /// a directory in its place).
+    #[error("{}: {source}", .path.display())]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The file was read but is not valid TOML, names an unknown key, or a value
+    /// (e.g. the prefix string) did not parse. A typo is loud, not silent.
+    #[error("{}: {source}", .path.display())]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+
+    /// The file parsed but a value is out of range — a rule of ours, not the
+    /// deserializer's (e.g. `fade.frames = 0`, which would divide by zero).
+    #[error("{}: {message}", .path.display())]
+    Invalid { path: PathBuf, message: String },
+}
+
+/// The error type crossing the [`crate::transport::Transport`] boundary, plus
+/// the startup failures ([`ConfigError`]) that surface before any transport.
 #[derive(Debug, thiserror::Error)]
 pub enum NvmuxError {
     #[error(transparent)]
@@ -196,6 +235,8 @@ pub enum NvmuxError {
     Nvim(#[from] NvimError),
     #[error(transparent)]
     Ssh(#[from] SshError),
+    #[error(transparent)]
+    Config(#[from] ConfigError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 

@@ -100,6 +100,48 @@ Everything else goes to Neovim untouched — including `Ctrl-c`, `Ctrl-z` and
 for nvmux. Digits are the exception: `Ctrl-t 1` is a command now, so
 `Ctrl-t Ctrl-t 1` is how you send that to the editor.
 
+## Configuration
+
+nvmux needs no configuration and has none by default. If you want to tune the
+transitions or move the prefix key, it reads an optional TOML file, in this
+order:
+
+1. `$NVMUX_CONFIG` — an exact path. If set, it **must** exist.
+2. `$XDG_CONFIG_HOME/nvmux/config.toml`
+3. `$HOME/.config/nvmux/config.toml`
+
+A missing file, an empty file, or any omitted field keeps the built-in default,
+so a partial file only overrides what it names. A file that exists but does not
+parse, names an unknown key, or fails validation is a startup error, reported
+with its path — a typo is never silently ignored.
+
+Every value below is its default:
+
+```toml
+# ~/.config/nvmux/config.toml
+
+[fade]
+enabled        = true   # master switch for the dip-to-black transitions.
+                        # NO_COLOR forces this off regardless of this setting.
+frames         = 8      # steps per direction (must be >= 1).
+frame_delay_ms = 12     # milliseconds between frames.
+hold_ms        = 30     # milliseconds held fully black across a hand-off.
+excursions     = true   # also fade the quick Ctrl-t ? / Ctrl-t c screens.
+raw_dissolve   = true   # dissolve an attached session cell by cell, rather
+                        # than an instant blackout (cheaper over a slow link).
+
+[keys]
+prefix     = "Ctrl-t"   # the prefix key, written like "C-t" or "Ctrl-a"
+                        # (case-insensitive).
+timeout_ms = 500        # how long a lone prefix or a half-typed number waits.
+```
+
+The prefix must be a `Ctrl-<letter>` chord. `C-m`, `C-j`, `C-i` and `C-h` are
+rejected (they are Enter, newline, Tab and Backspace on the wire); `C-c` and
+`C-z` are allowed, but then that key stops reaching Neovim. `--help` always
+spells the default `Ctrl-t`, since it is printed before the config is read — the
+`Ctrl-t ?` screen shows the key you actually set.
+
 ## Session numbers
 
 Every session gets a number when it is created and keeps it for life, so a

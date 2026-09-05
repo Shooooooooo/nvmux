@@ -136,10 +136,9 @@ fn run_loop(
         };
 
         let request = app.on_key(key);
-        deadline = app
-            .pending()
-            .is_some()
-            .then(|| Instant::now() + crate::keys::TIMEOUT);
+        deadline = app.pending().is_some().then(|| {
+            Instant::now() + Duration::from_millis(crate::settings::get().keys.timeout_ms)
+        });
 
         match request {
             Request::None => {}
