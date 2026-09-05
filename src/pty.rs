@@ -30,7 +30,7 @@
 use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub use portable_pty::PtySize;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair};
@@ -65,6 +65,11 @@ pub enum Outcome {
     Switch(u32),
     /// The child exited on its own.
     ChildExited,
+    /// Our own stdin reached EOF: the terminal went away or the input was
+    /// redirected. The child is still running, so this is handled like a
+    /// detach — the session is left alone — rather than like a child exit,
+    /// which would wait on a child that has no reason to leave.
+    StdinClosed,
 }
 
 /// A running `--remote-ui` client, and the PTY it is talking through.
@@ -77,6 +82,8 @@ pub struct Attachment {
     /// True once the child has been through a full relay, so a resume knows it
     /// must force a repaint.
     resumed: bool,
+    /// True once the child has been waited for, so `Drop` does not do it twice.
+    reaped: bool,
 }
 
 impl std::fmt::Debug for Attachment {
@@ -88,14 +95,64 @@ impl std::fmt::Debug for Attachment {
     }
 }
 
+/// How long a signalled client gets to exit before it is killed outright.
+const REAP_TIMEOUT: Duration = Duration::from_secs(2);
+
 impl Attachment {
     /// Terminate the client, leaving the session's server running. Verified:
-    /// killing a `--remote-ui` client, even with SIGKILL, does not kill a
-    /// `--headless --listen` server — the "channel closes, Nvim exits" rule is
-    /// scoped to `--embed`.
-    pub fn terminate(mut self) {
-        let _ = self.child.kill();
+    /// killing a `--remote-ui` client — with SIGHUP, SIGTERM or SIGKILL — does
+    /// not kill a `--headless --listen` server; the "channel closes, Nvim
+    /// exits" rule is scoped to `--embed`.
+    pub fn terminate(self) {
+        // `Drop` does the work, so every path that lets go of a live client —
+        // an explicit terminate, an early `?`, a `break` out of the session
+        // loop — retires it the same way.
+        drop(self);
+    }
+
+    /// Ask the client to exit. `portable-pty` sends SIGHUP, which is what the
+    /// client would get if the terminal itself went away.
+    fn signal(&mut self) {
+        if !self.reaped {
+            let _ = self.child.kill();
+        }
+    }
+
+    /// Wait for the client to be gone, escalating to SIGKILL after
+    /// [`REAP_TIMEOUT`] so a client that ignores SIGHUP cannot hold nvmux —
+    /// and the user's terminal — hostage.
+    fn reap(&mut self) {
+        if self.reaped {
+            return;
+        }
+        self.reaped = true;
+        let deadline = Instant::now() + REAP_TIMEOUT;
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                // Exited, or already reaped by someone else.
+                _ => return,
+            }
+        }
+        if let Some(pid) = self.child.process_id() {
+            tracing::warn!(pid, "the remote-ui client ignored SIGHUP; killing it");
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
         let _ = self.child.wait();
+    }
+}
+
+/// The client must be dead before the PTY writer is dropped: `portable-pty`'s
+/// writer writes a newline and `VEOF` to the master on drop, and a client that
+/// is still attached would deliver both to the editor as keystrokes — an Enter
+/// in insert mode is a new line in the user's buffer. Fields drop after this
+/// runs, so the writer only ever goes out on a pty nobody is reading.
+impl Drop for Attachment {
+    fn drop(&mut self) {
+        self.signal();
+        self.reap();
     }
 }
 
@@ -109,12 +166,17 @@ pub fn spawn(session_id: &str, sock: &Path) -> Result<Attachment> {
     // already been sprayed at the terminal.
     let mut client = rpc::Client::connect(sock, rpc::PROBE_TIMEOUT)?;
     client.api_info()?;
-    let uis = client.list_uis().unwrap_or(0);
+    // Not `unwrap_or(0)`: a server too busy to answer is exactly the one whose
+    // UI count is unknown, and guessing zero is how the seventeenth attach
+    // happens.
+    let uis = client.list_uis()?;
     if uis >= MAX_UIS {
-        return Err(NvmuxError::Session(crate::error::SessionError::NotKilled {
-            name: session_id.to_string(),
-            reason: "it already has too many attached UIs",
-        }));
+        return Err(NvmuxError::Session(
+            crate::error::SessionError::TooManyUis {
+                id: session_id.to_string(),
+                attached: uis,
+            },
+        ));
     }
     drop(client);
 
@@ -126,16 +188,13 @@ pub fn spawn(session_id: &str, sock: &Path) -> Result<Attachment> {
         .openpty(size)
         .map_err(|e| NvmuxError::Io(std::io::Error::other(e.to_string())))?;
 
+    // `CommandBuilder::new` seeds the child's environment from ours, so `TERM`,
+    // `COLORTERM` and everything else the client negotiates with reach it
+    // without being copied by hand.
     let mut cmd = CommandBuilder::new("nvim");
     cmd.arg("--server");
     cmd.arg(sock);
     cmd.arg("--remote-ui");
-    if let Ok(t) = std::env::var("TERM") {
-        cmd.env("TERM", t);
-    }
-    if let Ok(c) = std::env::var("COLORTERM") {
-        cmd.env("COLORTERM", c);
-    }
     if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
     }
@@ -160,6 +219,7 @@ pub fn spawn(session_id: &str, sock: &Path) -> Result<Attachment> {
         master: pair.master,
         writer,
         resumed: false,
+        reaped: false,
     })
 }
 
@@ -220,23 +280,32 @@ pub fn relay(
             drain_until_eof(master_fd);
             crate::fade::black_now();
             raw.restore();
-            let _ = attachment.child.wait();
+            attachment.reap();
             Ok((Outcome::ChildExited, None))
         }
-        Ok(other) => {
-            // `Detached`: leave the session running and let the child put the
-            // terminal back itself — a competing reset (a fade included) would
-            // corrupt its own restore sequence.
-            let _ = attachment.child.kill();
+        Ok(other @ (Outcome::Detached | Outcome::StdinClosed)) => {
+            // Leave the session running and let the child put the terminal
+            // back itself — a competing reset (a fade included) while it is
+            // still writing would corrupt its own restore sequence. Once it is
+            // gone, a final reset is harmless and covers a client that died
+            // before it got that far.
+            attachment.signal();
             drain_until_eof(master_fd);
             raw.restore();
-            let _ = attachment.child.wait();
+            attachment.reap();
+            term::reset_screen();
             Ok((other, None))
         }
         Err(e) => {
-            let _ = attachment.child.kill();
+            // The error is about to be printed to a shell: put the cursor and
+            // the colours back first, or `enter_session_black` above leaves it
+            // on a black screen with no cursor. `attachment` is dropped on the
+            // way out, which retires the client.
+            attachment.signal();
             drain_until_eof(master_fd);
             raw.restore();
+            attachment.reap();
+            term::reset_screen();
             Err(e)
         }
     }
@@ -249,16 +318,26 @@ fn pump(
     highest_session_num: u32,
 ) -> Result<Outcome> {
     let stdin_fd = std::io::stdin().as_raw_fd();
-    let mut prefix = Prefix::with_prefix(highest_session_num, crate::settings::get().keys.prefix);
+    let keys = crate::settings::get().keys;
+    let mut prefix = Prefix::with_prefix(highest_session_num, keys.prefix);
+    let prefix_timeout = Duration::from_millis(keys.timeout_ms);
+    // When a pending prefix or half-typed number must be settled. An instant
+    // rather than a per-poll timeout on purpose: a child that keeps producing
+    // output keeps `poll` returning early, and a timeout that restarted on
+    // every wake-up would never fire while a spinner is running. It is set
+    // when the machine arms and cleared when it settles.
+    let mut deadline: Option<Instant> = None;
     let mut buf = [0u8; 8192];
 
     loop {
-        // A pending prefix needs its own deadline: a *stopped* child produces
-        // no poll activity at all, so an indefinite wait would never notice it.
-        let timeout_ms = if prefix.is_armed() {
-            crate::settings::get().keys.timeout_ms as libc::c_int
-        } else {
-            IDLE_POLL_MS
+        // A stopped child produces no poll activity at all, so even an idle
+        // wait is bounded; an armed prefix shortens it to its own deadline.
+        let timeout_ms = match deadline {
+            Some(d) => {
+                let left = d.saturating_duration_since(Instant::now()).as_millis();
+                left.min(IDLE_POLL_MS as u128) as libc::c_int
+            }
+            None => IDLE_POLL_MS,
         };
 
         let mut fds = [pollfd(stdin_fd), pollfd(master_fd), pollfd(winch.fd())];
@@ -270,33 +349,9 @@ fn pump(
             }
             return Err(NvmuxError::Io(err));
         }
-        if n == 0 {
-            // `timeout` resolves a lone prefix into a literal byte, but also a
-            // half-typed session number into a switch — so the actions it
-            // produces must be acted on, not just the bytes.
-            for step in prefix.timeout() {
-                match step {
-                    Step::Forward(bytes) => {
-                        attachment.writer.write_all(&bytes)?;
-                        attachment.writer.flush()?;
-                    }
-                    Step::Act(Action::Switch(num)) => return Ok(Outcome::Switch(num)),
-                    // `timeout` never produces the others; a `_` here would let
-                    // a future one be dropped as silently as this one was.
-                    Step::Act(Action::Picker) => return Ok(Outcome::ToPicker),
-                    Step::Act(Action::Detach) => return Ok(Outcome::Detached),
-                    Step::Act(Action::Create) => return Ok(Outcome::CreateNew),
-                    Step::Act(Action::Help) => return Ok(Outcome::ShowHelp),
-                }
-            }
-            if check_child(attachment) == ChildState::Gone {
-                return Ok(Outcome::ChildExited);
-            }
-            continue;
-        }
 
         // Output first, so the screen is current before a keystroke is acted on.
-        if ready(&fds[1]) {
+        if n > 0 && ready(&fds[1]) {
             match read_fd(master_fd, &mut buf) {
                 // EOF on macOS, EIO on Linux: both mean the slave closed.
                 Ok(0) | Err(_) => return Ok(Outcome::ChildExited),
@@ -310,45 +365,74 @@ fn pump(
             }
         }
 
-        if ready(&fds[2]) {
+        if n > 0 && ready(&fds[2]) {
             winch.drain();
             // Enough on its own: the kernel signals the pty's foreground group
             // and the client calls try_resize.
             let _ = attachment.master.resize(term::terminal_size());
         }
 
-        if ready(&fds[0]) {
+        // Settle a pending sequence before reading anything new, so a key that
+        // arrives just after the deadline is not swallowed as a command.
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            deadline = None;
+            // `timeout` resolves a lone prefix into a literal byte, but also a
+            // half-typed session number into a switch — so the actions it
+            // produces must be acted on, not just the bytes.
+            for step in prefix.timeout() {
+                if let Some(outcome) = act(&mut attachment.writer, step)? {
+                    return Ok(outcome);
+                }
+            }
+        }
+
+        if n > 0 && ready(&fds[0]) {
             match read_fd(stdin_fd, &mut buf) {
-                Ok(0) => return Ok(Outcome::ChildExited),
+                Ok(0) => return Ok(Outcome::StdinClosed),
                 Err(e) => return Err(NvmuxError::Io(e)),
                 Ok(len) => {
                     // Deliberately NOT logged: every keystroke the user types,
                     // into a /tmp file that outlives the session.
                     for step in prefix.feed(&buf[..len]) {
-                        match step {
-                            Step::Forward(bytes) => {
-                                attachment.writer.write_all(&bytes)?;
-                                attachment.writer.flush()?;
-                            }
-                            Step::Act(Action::Picker) => return Ok(Outcome::ToPicker),
-                            Step::Act(Action::Detach) => {
-                                tracing::debug!("detach action");
-                                return Ok(Outcome::Detached);
-                            }
-                            Step::Act(Action::Create) => return Ok(Outcome::CreateNew),
-                            Step::Act(Action::Help) => return Ok(Outcome::ShowHelp),
-                            Step::Act(Action::Switch(n)) => return Ok(Outcome::Switch(n)),
+                        if let Some(outcome) = act(&mut attachment.writer, step)? {
+                            return Ok(outcome);
                         }
                     }
+                    // Every keystroke restarts the clock, so a number typed at
+                    // a human pace is one number.
+                    deadline = prefix.is_armed().then(|| Instant::now() + prefix_timeout);
                 }
             }
         }
 
-        // Checked last so any final output above has already been relayed.
-        if check_child(attachment) == ChildState::Gone {
+        // Only on an idle tick: a child that exits is noticed through its pty
+        // above, so this exists for the one that *stopped*, and a `waitid` per
+        // keystroke would buy nothing.
+        if n == 0 && check_child(attachment) == ChildState::Gone {
             return Ok(Outcome::ChildExited);
         }
     }
+}
+
+/// Carry out one instruction from the prefix machine: forward bytes to the
+/// child, or turn a command into the [`Outcome`] that ends the relay.
+///
+/// Exhaustive on purpose — no `_` arm — so a new [`Action`] cannot be dropped
+/// silently. The timeout and the feed path both come through here, which is
+/// what stops them drifting apart.
+fn act(writer: &mut dyn Write, step: Step) -> Result<Option<Outcome>> {
+    Ok(match step {
+        Step::Forward(bytes) => {
+            writer.write_all(&bytes)?;
+            writer.flush()?;
+            None
+        }
+        Step::Act(Action::Picker) => Some(Outcome::ToPicker),
+        Step::Act(Action::Detach) => Some(Outcome::Detached),
+        Step::Act(Action::Create) => Some(Outcome::CreateNew),
+        Step::Act(Action::Help) => Some(Outcome::ShowHelp),
+        Step::Act(Action::Switch(num)) => Some(Outcome::Switch(num)),
+    })
 }
 
 /// How often to look at an otherwise-idle child.
@@ -522,5 +606,46 @@ mod tests {
             !ready(&mk(libc::POLLOUT)),
             "writability alone is not what this loop waits for"
         );
+    }
+
+    #[test]
+    fn forwarded_bytes_reach_the_writer_and_end_nothing() {
+        let mut out = Vec::new();
+        let r = act(&mut out, Step::Forward(b"hello".to_vec())).expect("write");
+        assert_eq!(r, None);
+        assert_eq!(out, b"hello");
+    }
+
+    #[test]
+    fn every_action_maps_to_its_outcome() {
+        let mut out = Vec::new();
+        let cases = [
+            (Action::Picker, Outcome::ToPicker),
+            (Action::Detach, Outcome::Detached),
+            (Action::Create, Outcome::CreateNew),
+            (Action::Help, Outcome::ShowHelp),
+            (Action::Switch(7), Outcome::Switch(7)),
+        ];
+        for (action, want) in cases {
+            let got = act(&mut out, Step::Act(action)).expect("no io");
+            assert_eq!(got, Some(want), "{action:?}");
+        }
+        assert!(out.is_empty(), "a command writes nothing to the child");
+    }
+
+    /// A write failure is the relay's error, not something to swallow: the
+    /// child is gone and the loop must end.
+    #[test]
+    fn a_failed_forward_is_an_error() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("gone"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(act(&mut Broken, Step::Forward(b"x".to_vec())).is_err());
     }
 }

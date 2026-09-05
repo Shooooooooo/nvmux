@@ -32,6 +32,8 @@ pub enum Request {
     /// Ask for a new name for this session.
     RenameSession(String),
     Kill(String),
+    /// Show the key bindings; help happens on its own screen.
+    Help,
     Quit,
 }
 
@@ -103,6 +105,13 @@ impl App {
             .iter()
             .filter(|s| s.name.to_lowercase().contains(&needle))
             .collect()
+    }
+
+    /// The session with this id, from the list the picker is showing. What a
+    /// [`Request`] carrying an id resolves against, so acting on a row costs no
+    /// round trip beyond the action itself.
+    pub fn session(&self, id: &str) -> Option<&Session> {
+        self.sessions.iter().find(|s| s.id == id)
     }
 
     pub fn selected_index(&self) -> usize {
@@ -177,7 +186,11 @@ impl App {
     /// genuinely ambiguous one (sessions 1 and 12 both present) waits, and the
     /// caller resolves that with [`App::resolve_pending`].
     fn on_digit(&mut self, d: u32) -> Request {
-        let Some(n) = self.pending.take().map(|p| p.saturating_mul(10) + d) else {
+        let Some(n) = self
+            .pending
+            .take()
+            .map(|p| p.saturating_mul(10).saturating_add(d))
+        else {
             // A session number never starts with 0, so a leading one is not the
             // beginning of anything.
             if d == 0 {
@@ -277,6 +290,7 @@ impl App {
                 self.mode = Mode::Filter;
                 Request::None
             }
+            Key::Char('?') => Request::Help,
             Key::Esc => {
                 self.filter.clear();
                 self.clamp_selection();
@@ -471,6 +485,7 @@ mod tests {
     fn q_and_ctrl_c_quit() {
         assert_eq!(app(&["x"]).on_key(Key::Char('q')), Request::Quit);
         assert_eq!(app(&["x"]).on_key(Key::CtrlC), Request::Quit);
+        assert_eq!(app(&["x"]).on_key(Key::Char('?')), Request::Help);
     }
 
     #[test]

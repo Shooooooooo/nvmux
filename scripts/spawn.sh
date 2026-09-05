@@ -24,23 +24,39 @@ log="$dir/$id.log"
 # umask it would be world-writable. The 0700 directory is the primary control;
 # this closes the second hole.
 umask 077
-if [ -d "$dir" ]; then
+
+refuse() {
+  printf 'ERROR %s\n' "$1"
+  printf 'NVMUX_END\n'
+  exit 1
+}
+
+if [ -e "$dir" ] || [ -L "$dir" ]; then
   # An existing directory must be OURS and private. Over ssh this script is the
   # only check there is, and /tmp is world-writable, so another user could have
   # created it first.
   #
-  # `find` for the ownership test: POSIX `test` has no "-owned-by-me" operator
-  # and `stat` is spelled differently on macOS and Linux.
-  if [ -L "$dir" ] || [ -n "$(find "$dir" -maxdepth 0 ! -user "$(id -u)" 2>/dev/null)" ]; then
-    printf 'ERROR %s\n' "runtime directory $dir is not owned by us"
-    printf 'NVMUX_END\n'
-    exit 1
-  fi
-  if [ -n "$(find "$dir" -maxdepth 0 -perm /077 2>/dev/null)" ]; then
-    printf 'ERROR %s\n' "runtime directory $dir is accessible to other users"
-    printf 'NVMUX_END\n'
-    exit 1
-  fi
+  # `ls -ldn` for both tests: POSIX `test` has no "-owned-by-me" operator,
+  # `stat` is spelled differently on macOS and Linux, and `find -perm /mode`
+  # (GNU) and `-perm +mode` (BSD) are not both accepted anywhere. `-n` gives
+  # the owner as a uid, so it compares with `id -u` without a name lookup. A
+  # check that cannot be made fails CLOSED: an empty answer is a refusal, not
+  # a pass.
+  info=$(ls -ldn "$dir" 2>/dev/null)
+  [ -n "$info" ] || refuse "could not inspect runtime directory $dir"
+  mode=$(printf '%s\n' "$info" | cut -c1-10)
+  owner=$(printf '%s\n' "$info" | awk '{print $3}')
+  case "$mode" in
+    d*) ;;
+    *) refuse "runtime directory $dir is not a directory (or is a symlink)" ;;
+  esac
+  [ "$owner" = "$(id -u)" ] || refuse "runtime directory $dir is not owned by us"
+  # Columns 5-10 are the group and other permissions; anything but dashes there
+  # is a bit we would never have set.
+  case "$(printf '%s\n' "$mode" | cut -c5-10)" in
+    ------) ;;
+    *) refuse "runtime directory $dir is accessible to other users" ;;
+  esac
 else
   mkdir -p "$dir" || exit 1
   # Only a directory we just created; tightening someone else's is worse than

@@ -45,8 +45,13 @@ pub const ID_LEN: usize = 8;
 /// A short, stable, filename-safe token for a host string, naming the local end
 /// of an SSH forward.
 ///
-/// FNV-1a rather than `DefaultHasher`, which is documented as unstable across
-/// Rust releases: a toolchain upgrade must not orphan a live session's socket.
+/// A fixed hash rather than `DefaultHasher`, which is documented as unstable
+/// across Rust releases: a toolchain upgrade must not orphan a live session's
+/// socket. The shape is FNV-1a's (xor, then multiply, over the bytes), with
+/// FNV's 64-bit offset basis — but the multiplier is **not** the FNV-64 prime
+/// (`0x100000001b3`): it has an extra nibble, and has had since the first
+/// release. It is not being corrected, because every forwarded socket name on
+/// disk depends on it; `host_token_is_stable_forever` pins the values.
 pub fn host_token(host: &str) -> String {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x1000_0000_01b3;

@@ -2,7 +2,6 @@
 
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use crate::config::{self, SessionPaths};
 use crate::error::{NvmuxError, Result, SessionError};
@@ -11,15 +10,10 @@ use crate::rpc;
 use crate::session::{Liveness, Session};
 use crate::shell;
 use crate::transport::exec::{Executor, LocalExecutor};
-use crate::transport::{finish_listing, protocol, Location, Transport};
-
-/// How long to wait for a new session's socket to appear and accept a
-/// connection. A *reachability* budget, not a readiness one: a config that
-/// clones plugins on first run can take far longer than any timeout worth
-/// having here, and a session that is still starting is a good session.
-const REACHABLE_TIMEOUT: Duration = Duration::from_secs(5);
-
-const POLL_INTERVAL: Duration = Duration::from_millis(25);
+use crate::transport::{
+    ensure_name_free, finish_listing, install_detach_alias, kill_outcome, protocol,
+    wait_until_reachable, Location, Transport, REACHABLE_TIMEOUT,
+};
 
 pub struct LocalTransport {
     location: Location,
@@ -50,21 +44,6 @@ impl LocalTransport {
 
     fn paths(&self, id: &str) -> Result<SessionPaths> {
         Ok(SessionPaths::new(&self.dir, id)?)
-    }
-
-    /// Wait until the socket accepts a connection and a real Neovim answers.
-    /// Deliberately *not* a deferred call — see [`crate::rpc`].
-    fn wait_until_reachable(&self, sock: &Path, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if let Ok(mut client) = rpc::Client::connect(sock, rpc::PROBE_TIMEOUT) {
-                if client.api_info().is_ok() {
-                    return true;
-                }
-            }
-            std::thread::sleep(POLL_INTERVAL);
-        }
-        false
     }
 
     /// The last few lines of a session's log, included in the error because it
@@ -171,13 +150,10 @@ impl Transport for LocalTransport {
     fn create_session(&self, name: &str) -> Result<Session> {
         crate::session::validate_name(name)?;
 
-        // Names carry no identity, but two identical ones in a picker is a
-        // usability trap. The listing is also what the new session's number is
-        // allocated from, so numbering costs no extra work here.
+        // The listing is also what the new session's number is allocated
+        // from, so numbering costs no extra work here.
         let existing = self.list_sessions()?;
-        if existing.iter().any(|s| s.name.eq_ignore_ascii_case(name)) {
-            return Err(SessionError::Exists(name.to_string()).into());
-        }
+        ensure_name_free(&existing, name, None)?;
         let num = crate::transport::next_free_num(&existing);
 
         let id = ids::new_id().map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -188,15 +164,22 @@ impl Transport for LocalTransport {
         let out = self.exec.run_script(shell::SPAWN_SCRIPT, &[&dir, &id])?;
         let spawned = protocol::parse_spawn(&out.stdout)?;
 
-        if !spawned.socket_appeared || !self.wait_until_reachable(&paths.sock, REACHABLE_TIMEOUT) {
-            // Clean up rather than leave a half-created session behind.
+        if !spawned.socket_appeared || !wait_until_reachable(&paths.sock, REACHABLE_TIMEOUT) {
+            // Clean up rather than leave a half-created session behind — but
+            // through the kill script, which removes the files only once it
+            // has seen the process go. Unlinking the socket here on the
+            // strength of "it did not answer in time" would orphan a Neovim
+            // that was merely slow to start. An empty pid is fine: the script
+            // finds the process by its socket, the pid is only a hint.
             let tail = self.log_tail(&paths.log);
-            if let Some(pid) = spawned.pid {
-                let _ = self
-                    .exec
-                    .run_script(shell::KILL_SCRIPT, &[&dir, &id, &pid.to_string()]);
+            let pid = spawned.pid.map(|p| p.to_string()).unwrap_or_default();
+            match self.exec.run_script(shell::KILL_SCRIPT, &[&dir, &id, &pid]) {
+                Ok(out) => match protocol::parse_kill(&out.stdout) {
+                    Ok(outcome) => tracing::debug!(%id, ?outcome, "cleaned up a failed create"),
+                    Err(e) => tracing::warn!(%id, error = %e, "cleanup after a failed create"),
+                },
+                Err(e) => tracing::warn!(%id, error = %e, "cleanup after a failed create"),
             }
-            self.reap(&paths);
             return Err(SessionError::NotReady {
                 name: name.to_string(),
                 timeout: REACHABLE_TIMEOUT,
@@ -212,14 +195,7 @@ impl Transport for LocalTransport {
         // resolved number a listing would have.
         session.state.num = num;
 
-        // A way out that is not `:q`. `command!` requires an uppercase name
-        // (`command! q` is E183), so this cannot shadow `:q` itself. Failure
-        // here is not worth failing the create over.
-        if let Ok(mut client) = rpc::Client::connect(&paths.sock, rpc::CONNECT_TIMEOUT) {
-            if let Err(e) = client.command("command! -bar Detach detach") {
-                tracing::debug!(error = %e, "could not install the :Detach alias");
-            }
-        }
+        install_detach_alias(&paths.sock);
 
         tracing::info!(id = %session.id, name, pid = session.pid, "session ready");
         Ok(session)
@@ -245,42 +221,21 @@ impl Transport for LocalTransport {
             tracing::warn!(status = out.status, stderr = %out.stderr, "kill.sh failed");
         }
 
-        // Files are removed only once the session is genuinely gone. Claiming
-        // success regardless would drop it from the picker while its Neovim kept
-        // running, with no socket left to ever find it by.
-        match protocol::parse_kill(&out.stdout)? {
-            protocol::KillOutcome::Killed | protocol::KillOutcome::Absent => {
-                // A socket the script could not remove would resurrect the
-                // session in the next listing.
-                if paths.sock.exists() && self.is_reapable(&paths.sock) {
-                    self.reap(&paths);
-                }
-                tracing::info!(id = %s.id, name = %s.name, "session killed");
-                Ok(())
-            }
-            protocol::KillOutcome::Orphaned => Err(SessionError::NotKilled {
-                name: s.name.clone(),
-                reason: "it did not exit, even after SIGKILL",
-            }
-            .into()),
-            protocol::KillOutcome::Unknown => Err(SessionError::NotKilled {
-                name: s.name.clone(),
-                reason: "its socket is still present but no usable `ps` or /proc is \
-                         available to find the process, so nothing was signalled",
-            }
-            .into()),
+        // Files are removed only once the session is genuinely gone; see
+        // `kill_outcome`.
+        kill_outcome(protocol::parse_kill(&out.stdout)?, &s.name)?;
+        // A socket the script could not remove would resurrect the session in
+        // the next listing.
+        if paths.sock.exists() && self.is_reapable(&paths.sock) {
+            self.reap(&paths);
         }
+        tracing::info!(id = %s.id, name = %s.name, "session killed");
+        Ok(())
     }
 
     fn rename_session(&self, s: &Session, new_name: &str) -> Result<()> {
         crate::session::validate_name(new_name)?;
-        if self
-            .list_sessions()?
-            .iter()
-            .any(|other| other.id != s.id && other.name.eq_ignore_ascii_case(new_name))
-        {
-            return Err(SessionError::Exists(new_name.to_string()).into());
-        }
+        ensure_name_free(&self.list_sessions()?, new_name, Some(&s.id))?;
 
         let paths = self.paths(&s.id)?;
 

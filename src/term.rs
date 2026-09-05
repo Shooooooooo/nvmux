@@ -59,12 +59,11 @@ extern "C" fn restore_and_reraise(sig: libc::c_int) {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved.0);
         }
     }
-    // Undo a fade that may have been mid-flight: reset SGR, show the cursor, and
-    // close any open synchronized-update span, so a signal during a transition
-    // does not hand the shell back a black screen with a hidden cursor. A single
-    // fixed-string `write` is async-signal-safe, like the `tcsetattr` above, and
-    // is harmless when no fade was running. See `crate::fade`.
-    const RESET: &[u8] = b"\x1b[0m\x1b[?25h\x1b[?2026l";
+    // Undo whatever screen state was mid-flight — the picker's alternate
+    // screen, or a fade — so a signal does not hand the shell back a blank or
+    // black screen with a hidden cursor. A single fixed-string `write` is
+    // async-signal-safe, like the `tcsetattr` above, and is harmless when
+    // nothing was in progress.
     unsafe {
         libc::write(libc::STDOUT_FILENO, RESET.as_ptr().cast(), RESET.len());
     }
@@ -72,6 +71,44 @@ extern "C" fn restore_and_reraise(sig: libc::c_int) {
         libc::signal(sig, libc::SIG_DFL);
         libc::raise(sig);
     }
+}
+
+/// The screen-state reset: close any open synchronized-update span, leave the
+/// alternate screen (a no-op when not in it), reset SGR and show the cursor.
+/// One fixed string so the signal handler can write it, and so the ordinary
+/// error paths put the screen back exactly the way a signal would.
+const RESET: &[u8] = b"\x1b[?2026l\x1b[?1049l\x1b[0m\x1b[?25h";
+
+/// Put the screen back to a state a shell can be used in: cursor visible,
+/// colours reset, primary screen. For the paths that end at a shell prompt
+/// with a message — an attach that failed, a detach — where the last thing
+/// drawn may have been a fade's black frame with the cursor hidden.
+pub fn reset_screen() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(RESET);
+    let _ = out.flush();
+}
+
+/// Install the restore-on-signal safety net for the whole run.
+///
+/// Called once from `main`, before any screen is drawn: the picker runs in raw
+/// mode and the alternate screen for as long as the user is choosing, and a
+/// `kill` during that time would otherwise leave the terminal that way. The
+/// termios saved here is the shell's, taken before anything changed it, which
+/// is the one every later restore should return to. [`RawMode::enter`] also
+/// calls this, for callers (tests, other embedders) that never went through
+/// `main`.
+pub fn install_signal_safety_net() {
+    let mut raw_saved = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: fd 0 is valid and tcgetattr fully initialises the struct on
+    // success. On a non-terminal stdin it fails, and there is nothing to save.
+    let got = unsafe { libc::tcgetattr(libc::STDIN_FILENO, raw_saved.as_mut_ptr()) };
+    if got == 0 {
+        // First writer wins: the earliest snapshot is the shell's own mode.
+        let _ = SAVED.set(Saved(unsafe { raw_saved.assume_init() }));
+    }
+    install_signal_handlers();
 }
 
 /// Raw mode, restored when this is dropped. Restoring twice is harmless, so the
@@ -86,20 +123,13 @@ impl RawMode {
     pub fn enter() -> Result<Self> {
         let saved = termios::tcgetattr(stdin_fd()).map_err(errno)?;
 
-        // A signal-readable copy, taken the first time round with a second raw
-        // `tcgetattr` rather than by converting the nix value:
-        // `From<Termios> for libc::termios` returns a cached inner struct
-        // **without syncing the public fields** — only `tcsetattr` syncs — so a
-        // converted value silently loses anything set through `control_chars`.
-        // This feeds the restore that runs when nvmux is killed.
-        let mut raw_saved = std::mem::MaybeUninit::<libc::termios>::uninit();
-        // SAFETY: fd 0 is valid and tcgetattr fully initialises the struct on
-        // success.
-        let got = unsafe { libc::tcgetattr(libc::STDIN_FILENO, raw_saved.as_mut_ptr()) };
-        if got == 0 {
-            let _ = SAVED.set(Saved(unsafe { raw_saved.assume_init() }));
-        }
-        install_signal_handlers();
+        // The signal-readable copy is taken with a raw `tcgetattr` rather than
+        // by converting the nix value: `From<Termios> for libc::termios`
+        // returns a cached inner struct **without syncing the public fields**
+        // — only `tcsetattr` syncs — so a converted value silently loses
+        // anything set through `control_chars`. A no-op when `main` already
+        // did this at startup, which is the normal case.
+        install_signal_safety_net();
 
         let mut raw = saved.clone();
         termios::cfmakeraw(&mut raw);

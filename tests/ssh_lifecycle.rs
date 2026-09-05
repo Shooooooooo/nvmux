@@ -12,8 +12,13 @@
 //!
 //! Pointing that alias at localhost is not a cheat: it exercises the real ssh
 //! client, a real ControlMaster, real unix-socket forwarding and a real remote
-//! login shell — everything except latency.
+//! login shell — everything except latency. `$NVMUX_TEST_REQUIRE=ssh` turns
+//! the skip into a failure.
 
+#[macro_use]
+mod common;
+
+use common::unique;
 use nvmux::transport::remote::SshTransport;
 use nvmux::transport::Transport;
 
@@ -40,16 +45,12 @@ fn reachable() -> bool {
 
 macro_rules! require_ssh {
     () => {
-        if !reachable() {
-            eprintln!("skipping: {} is not reachable over ssh", host());
-            return;
-        }
+        require!(
+            "ssh",
+            reachable(),
+            format!("{} is not reachable over ssh", host())
+        );
     };
-}
-
-/// Names every test session distinctly, so a failed run cannot poison the next.
-fn unique(tag: &str) -> String {
-    format!("it-{tag}-{}", std::process::id())
 }
 
 /// Removes every session this test file created, whatever happened.
@@ -207,6 +208,12 @@ fn killing_a_remote_session_removes_it_and_its_forward() {
     require_ssh!();
     let t = SshTransport::new(host()).expect("connect");
     let name = unique("kill");
+    // Even the kill test needs a guard: if the kill under test fails, the
+    // session would otherwise outlive the run on the remote host.
+    let _cleanup = Cleanup(
+        SshTransport::new(host()).expect("connect"),
+        vec![name.clone()],
+    );
 
     let session = t.create_session(&name).expect("create");
     let sock = t.local_socket_for(&session).expect("forward");

@@ -51,16 +51,13 @@ impl Winch {
     pub fn install() -> Result<Self> {
         let (read, write) = nix::unistd::pipe().map_err(errno)?;
 
-        // Non-blocking write end: a signal handler must never block, and if the
-        // pipe has filled there is already an unread resize notification.
-        let flags = nix::fcntl::OFlag::from_bits_truncate(
-            nix::fcntl::fcntl(&write, nix::fcntl::F_GETFL).map_err(errno)?,
-        );
-        nix::fcntl::fcntl(
-            &write,
-            nix::fcntl::F_SETFL(flags | nix::fcntl::OFlag::O_NONBLOCK),
-        )
-        .map_err(errno)?;
+        // Both ends non-blocking. The write end because a signal handler must
+        // never block, and if the pipe has filled there is already an unread
+        // resize notification. The read end because `drain` reads until the
+        // pipe is empty, and a blocking read on an empty pipe would park the
+        // whole relay until the *next* resize — see `drain`.
+        set_nonblocking(&write)?;
+        set_nonblocking(&read)?;
 
         WRITE_FD.store(write.as_raw_fd(), Ordering::Relaxed);
         // SAFETY: the handler performs a single `write(2)` and nothing else.
@@ -83,15 +80,32 @@ impl Winch {
     /// Several resizes can coalesce into one wake-up, which is fine: the caller
     /// reads the terminal's *current* size afterwards, so intermediate sizes
     /// were never interesting.
+    ///
+    /// Reads until the pipe reports empty (`EAGAIN`), which is why the read end
+    /// is non-blocking: with a blocking read, a burst of exactly one buffer's
+    /// worth of notifications would leave the loop parked in `read` with the
+    /// pipe empty, and the relay would stop forwarding until another resize.
     pub fn drain(&self) {
         let mut buf = [0u8; 64];
         loop {
             match nix::unistd::read(&self.read, &mut buf) {
-                Ok(n) if n == buf.len() => continue,
+                Ok(n) if n > 0 => continue,
                 _ => return,
             }
         }
     }
+}
+
+fn set_nonblocking(fd: &OwnedFd) -> Result<()> {
+    let flags = nix::fcntl::OFlag::from_bits_truncate(
+        nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL).map_err(errno)?,
+    );
+    nix::fcntl::fcntl(
+        fd,
+        nix::fcntl::F_SETFL(flags | nix::fcntl::OFlag::O_NONBLOCK),
+    )
+    .map_err(errno)?;
+    Ok(())
 }
 
 impl Drop for Winch {
@@ -172,6 +186,33 @@ mod tests {
         }];
         let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, 50) };
         assert_eq!(n, 0, "drain should consume every pending notification");
+    }
+
+    /// A burst that fills `drain`'s buffer exactly must not park the relay.
+    ///
+    /// With a blocking read end, 64 pending bytes are read in one call, the
+    /// loop continues, and the next read blocks on an empty pipe until the
+    /// next resize. 65 covers the "one more than a buffer" case too.
+    #[test]
+    fn a_burst_that_fills_the_drain_buffer_does_not_block() {
+        let _guard = serial();
+        for count in [64, 65, 128] {
+            let winch = Winch::install().expect("install");
+            for _ in 0..count {
+                unsafe {
+                    libc::raise(libc::SIGWINCH);
+                }
+            }
+            // Would hang here before the read end was made non-blocking.
+            winch.drain();
+            let mut fds = [libc::pollfd {
+                fd: winch.fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, 50) };
+            assert_eq!(n, 0, "drain left the pipe readable after {count} signals");
+        }
     }
 
     #[test]

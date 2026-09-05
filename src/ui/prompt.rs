@@ -149,20 +149,11 @@ impl Prompt {
 /// Ask for a name for a new session, owning the terminal while it does — for
 /// `<prefix> c`, which arrives from an attached session with none to borrow.
 pub fn run(transport: &dyn Transport) -> Result<Outcome> {
-    // See the colour note in the parent module.
-    ratatui::crossterm::style::force_color_output(true);
-
-    let mut terminal = ratatui::try_init()?;
-    // A second alternate-screen enter is a no-op on xterm and kitty; see
-    // `ui::run`.
-    terminal.clear()?;
     // Reached from a session that has already dissolved to black, so start black.
-    if crate::fade::excursions() {
-        crate::fade::prime_black(&mut terminal)?;
-    }
-    let outcome = run_on(&mut terminal, transport, Task::Create, true);
-    // Restore before propagating: see `ui::run`.
-    ratatui::try_restore()?;
+    let mut screen = super::Screen::open(crate::fade::excursions())?;
+    let outcome = run_on(screen.terminal(), transport, Task::Create, true);
+    // Restore before propagating: see `ui::Screen`.
+    screen.close()?;
     outcome
 }
 
@@ -262,19 +253,10 @@ fn draw(frame: &mut Frame, prompt: &Prompt) {
         return;
     }
 
-    // Same split as the picker, so the screens line up.
-    let body = Rect {
-        height: area.height.saturating_sub(1),
-        ..area
-    };
-    let bottom = Rect {
-        y: area.y + area.height - 1,
-        height: 1,
-        ..area
-    };
+    let (body, bottom) = draw::split_hint_row(area);
 
     draw_body(frame, prompt, body);
-    draw_hints(frame, prompt, bottom);
+    draw::draw_hint_row(frame, bottom, prompt.hints, true);
 }
 
 /// Centre the line as it reads the moment the prompt opens, then hold it.
@@ -368,18 +350,6 @@ fn split_first(s: &str) -> Option<(String, &str)> {
     Some((first.to_string(), &s[first.len_utf8()..]))
 }
 
-fn draw_hints(frame: &mut Frame, prompt: &Prompt, area: Rect) {
-    let text = draw::truncate(prompt.hints, area.width as usize);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            text,
-            Style::default().add_modifier(Modifier::DIM),
-        )))
-        .alignment(Alignment::Center),
-        area,
-    );
-}
-
 /// Keep the *end* of `s` within `max` display columns.
 ///
 /// The opposite choice from `draw::truncate`, and for a reason: a field has to
@@ -427,28 +397,8 @@ mod tests {
         }
     }
 
-    /// Reconstruct the rendered lines, skipping the filler cell that follows a
-    /// wide glyph so a CJK name is not reported as three columns per character.
     fn render(p: &Prompt, w: u16, h: u16) -> Vec<String> {
-        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
-        terminal.draw(|f| draw(f, p)).expect("draw");
-        let buf = terminal.backend().buffer().clone();
-        (0..buf.area.height)
-            .map(|y| {
-                let mut line = String::new();
-                let mut skip = 0u16;
-                for x in 0..buf.area.width {
-                    if skip > 0 {
-                        skip -= 1;
-                        continue;
-                    }
-                    let sym = buf[(x, y)].symbol();
-                    skip = sym.width().saturating_sub(1) as u16;
-                    line.push_str(sym);
-                }
-                line.trim_end().to_string()
-            })
-            .collect()
+        super::super::test_support::render(w, h, |f| draw(f, p))
     }
 
     /// One rendered cell. `render` throws the modifier away, and the modifier is
@@ -867,28 +817,9 @@ mod tests {
     /// No SGR colour, so the screen is correct under NO_COLOR by construction.
     #[test]
     fn nothing_sets_a_colour() {
-        use ratatui::style::Color;
         let mut p = prompt();
         type_in(&mut p, "notes");
         p.fail("nope".to_string(), Some("session 3".to_string()));
-
-        let mut terminal = Terminal::new(TestBackend::new(50, 9)).expect("terminal");
-        terminal.draw(|f| draw(f, &p)).expect("draw");
-        let buf = terminal.backend().buffer().clone();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                let cell = &buf[(x, y)];
-                assert_eq!(
-                    cell.fg,
-                    Color::Reset,
-                    "cell ({x},{y}) set a foreground colour"
-                );
-                assert_eq!(
-                    cell.bg,
-                    Color::Reset,
-                    "cell ({x},{y}) set a background colour"
-                );
-            }
-        }
+        super::super::test_support::assert_no_colour(50, 9, |f| draw(f, &p));
     }
 }

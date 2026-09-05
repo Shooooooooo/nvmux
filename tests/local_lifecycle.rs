@@ -6,7 +6,11 @@
 //!
 //! Each test gets its own runtime directory, so they run in parallel without
 //! racing and never touch the user's real `/tmp/nvmux-<uid>`. They skip, rather
-//! than fail, when there is no usable `nvim` on `$PATH`.
+//! than fail, when there is no usable `nvim` on `$PATH` — unless
+//! `$NVMUX_TEST_REQUIRE` names `nvim`, which is how CI keeps them honest.
+
+#[macro_use]
+mod common;
 
 use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
@@ -77,10 +81,7 @@ fn nvim_available() -> bool {
 
 macro_rules! require_nvim {
     () => {
-        if !nvim_available() {
-            eprintln!("skipping: no usable nvim on $PATH");
-            return;
-        }
+        require!("nvim", nvim_available(), "no usable nvim on $PATH");
     };
 }
 

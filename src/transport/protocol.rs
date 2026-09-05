@@ -192,6 +192,22 @@ pub fn parse_kill(stdout: &str) -> Result<KillOutcome> {
     })
 }
 
+/// Parse the output of a script that reports nothing but that it ran
+/// (`write_meta.sh`). The terminator is the whole message: without it a remote
+/// write that silently did nothing would be reported as success — the same
+/// hazard [`parse_listing`] guards against.
+pub fn parse_end(stdout: &str, what: &str) -> Result<()> {
+    let terminated = stdout
+        .lines()
+        .any(|line| line.trim_end_matches('\r') == TERMINATOR);
+    if !terminated {
+        return Err(NvmuxError::Session(crate::error::SessionError::NotFound(
+            format!("the {what} command did not complete (no {TERMINATOR} marker)"),
+        )));
+    }
+    Ok(())
+}
+
 /// Turn parsed rows into sessions, dropping ones whose metadata is unusable.
 ///
 /// A socket with no readable metadata is reported rather than silently hidden:
@@ -256,6 +272,20 @@ mod tests {
 
     fn listing(body: &str) -> String {
         format!("{body}NVMUX_END\n")
+    }
+
+    #[test]
+    fn a_bare_terminator_means_the_write_ran() {
+        parse_end("NVMUX_END\n", "metadata write").expect("ran");
+        parse_end("Welcome to Ubuntu\nNVMUX_END\r\n", "metadata write").expect("noise is fine");
+    }
+
+    #[test]
+    fn a_missing_terminator_is_a_failed_write_not_a_success() {
+        for out in ["", "\n", "some banner\n"] {
+            let err = parse_end(out, "metadata write").expect_err(out);
+            assert!(err.to_string().contains("metadata write"), "{err}");
+        }
     }
 
     #[test]

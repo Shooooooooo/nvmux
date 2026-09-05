@@ -11,7 +11,7 @@ while every keystroke and every pixel of rendering happens on your own terminal.
                       3  scratch                              
                       4  notes                                
                                                               
-   ↑↓ move   ⏎ 1-9 attach   c new   r rename   x kill   q quit
+   ↑↓ move  ⏎ attach  c new  r rename  x kill  / filter  q quit
 ```
 
 nvmux is a **thin multiplexer**: it does not render Neovim's UI. Neovim already
@@ -38,11 +38,12 @@ LOCAL                                     REMOTE
 
 | Where | Needs |
 |---|---|
-| Local | `nvim` >= 0.11, `ssh` >= 6.7 |
+| Local | `nvim` >= 0.11, and `ssh` >= 6.7 for `nvmux <host>` |
 | Remote | `nvim` >= 0.11 |
 
 0.11 is where `:detach` and `:connect` landed; 6.7 is where ssh gained
-unix-socket forwarding. Both are checked at startup and reported plainly.
+unix-socket forwarding. Both are checked at startup and reported plainly; `ssh`
+is only needed, and only checked, when a host is given.
 
 macOS and Linux only.
 
@@ -71,16 +72,21 @@ reimplementing it.
 
 | Key | Action |
 |---|---|
-| `j` `k` `↓` `↑` | move (wraps) |
-| `g` `G` | first / last |
-| `1`–`9` | attach to that session |
-| `Enter` | attach |
+| `j` `k` `↓` `↑` `Ctrl-n` `Ctrl-p` | move (wraps) |
+| `g` `G` `Home` `End` | first / last |
+| `1`, `2`, … `12` | attach to the session with that number |
+| `Enter` | attach (or end a number early) |
 | `c` | name a new session, then attach |
 | `r` | rename the selected session |
 | `x` | kill |
 | `/` | filter |
+| `?` | show the `<prefix>` keys |
 | `Esc` | clear the filter, or cancel a prompt |
 | `q` `Ctrl-c` | quit |
+
+A session name is at most 64 bytes, has no leading or trailing whitespace and
+no control characters, and must not be in use — compared without regard to
+case. Pressing `Enter` on an empty name prompt takes the suggested `session N`.
 
 ### While attached
 
@@ -148,6 +154,14 @@ rejected (they are Enter, newline, Tab and Backspace on the wire); `C-c` and
 `C-z` are allowed, but then that key stops reaching Neovim. `--help` always
 spells the default `Ctrl-t`, since it is printed before the config is read — the
 `<prefix> ?` screen shows the key you actually set.
+
+## Logs
+
+Everything nvmux runs lives under `/tmp/nvmux-<uid>` (the same rule on both
+ends, so a session's files stay in one place across logouts); nvmux's own log
+is `nvmux.log` there, and each session's server output is `<id>.log`. The
+verbosity comes from `$NVMUX_LOG`, in `RUST_LOG` syntax, and defaults to
+warnings only. Keystrokes are never logged.
 
 ## Session numbers
 

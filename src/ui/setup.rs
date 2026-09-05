@@ -4,8 +4,8 @@
 //! unset, and the terminal is interactive (see the guards there). It takes the
 //! whole screen the way [`crate::ui::help`] does, but reads keys *raw*: the user
 //! presses the actual `Ctrl-<letter>` chord they want, so this is the one place
-//! that must **not** go through `translate`, which folds the CONTROL
-//! modifier away (see the note in [`crate::ui`]). The pressed chord is validated
+//! that must **not** go through `translate`, which discards every chord it does
+//! not bind (see the note in [`crate::ui`]). The pressed chord is validated
 //! by the same [`crate::keys::parse_prefix`] the config file uses, so the rules
 //! and the messages are shared.
 //!
@@ -14,7 +14,7 @@
 //! nvmux — `C-c`/`C-z` are still selectable as prefixes by editing the config.
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -78,14 +78,10 @@ struct State {
 /// Show the screen until the user confirms or skips. Owns the terminal, like
 /// [`crate::ui::help::run`]; no fade, because nothing has faded to black yet.
 pub fn run() -> Result<Outcome> {
-    // See the colour note in the parent module.
-    ratatui::crossterm::style::force_color_output(true);
-
-    let mut terminal = ratatui::try_init()?;
-    terminal.clear()?;
-    let outcome = run_loop(&mut terminal);
-    // Restore before propagating: see `ui::run`.
-    ratatui::try_restore()?;
+    let mut screen = super::Screen::open(false)?;
+    let outcome = run_loop(screen.terminal());
+    // Restore before propagating: see `ui::Screen`.
+    screen.close()?;
     outcome
 }
 
@@ -100,7 +96,8 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Outcome> {
         if !event::poll(super::TICK)? {
             continue;
         }
-        // Read the RAW event — `translate` would fold the CONTROL modifier away.
+        // Read the RAW event — `translate` discards every chord but the three
+        // it binds, and the whole point here is to see which chord was pressed.
         let (code, ctrl) = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => {
                 (k.code, k.modifiers.contains(KeyModifiers::CONTROL))
@@ -132,19 +129,15 @@ fn draw(frame: &mut Frame, state: &State) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    // Same split as the picker/help: body above, one dim hint row at the bottom.
-    let body = Rect {
-        height: area.height.saturating_sub(1),
-        ..area
-    };
-    let bottom = Rect {
-        y: area.y + area.height - 1,
-        height: 1,
-        ..area
-    };
+    let (body, bottom) = draw::split_hint_row(area);
 
     draw_body(frame, state, body);
-    draw_hints(frame, state, bottom);
+    let hint = if state.selected.is_some() {
+        "⏎ confirm   esc skip"
+    } else {
+        "⏎ keep   esc skip"
+    };
+    draw::draw_hint_row(frame, bottom, hint, true);
 }
 
 fn draw_body(frame: &mut Frame, state: &State, area: Rect) {
@@ -177,23 +170,6 @@ fn draw_body(frame: &mut Frame, state: &State, area: Rect) {
     let width = lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
     let block = draw::centre(area, width, lines.len() as u16);
     frame.render_widget(Paragraph::new(lines), block);
-}
-
-fn draw_hints(frame: &mut Frame, state: &State, area: Rect) {
-    let hint = if state.selected.is_some() {
-        "⏎ confirm   esc skip"
-    } else {
-        "⏎ keep   esc skip"
-    };
-    let text = draw::truncate(hint, area.width as usize);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            text,
-            Style::default().add_modifier(Modifier::DIM),
-        )))
-        .alignment(Alignment::Center),
-        area,
-    );
 }
 
 #[cfg(test)]

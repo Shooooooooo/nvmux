@@ -17,6 +17,10 @@ fn main() -> Result<()> {
     // in `run` — restrict the umask: see `config::restrict_umask`.
     config::restrict_umask();
 
+    // Before any screen is drawn, so a `kill` during the picker — not only
+    // during an attached session — hands back a usable terminal.
+    nvmux::term::install_signal_safety_net();
+
     if let Err(e) = run(&cli) {
         // A plain message, no backtrace: every error here is meant to be
         // actionable on its own.
@@ -82,7 +86,14 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     loop {
         // `<prefix> c` moves this to the session it just created.
         let (mut current, mut highest) = match ui::run(transport, message.take())? {
-            ui::Outcome::Quit => break,
+            ui::Outcome::Quit => {
+                // A client held across `<prefix> t` is retired explicitly; its
+                // `Drop` would do the same, this just says so.
+                if let Some(a) = attached.take() {
+                    a.terminate();
+                }
+                break;
+            }
             ui::Outcome::Attach { session, highest } => (session, highest),
         };
 
@@ -103,7 +114,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             let attachment = match opened {
                 Ok(a) => a,
                 Err(e) => {
-                    message = Some(describe_attach_failure(transport, &e));
+                    message = Some(describe_attach_failure(transport.location(), &e));
                     break;
                 }
             };
@@ -113,7 +124,10 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     attached = held;
                     break;
                 }
-                (pty::Outcome::Detached, _) => return Ok(()),
+                // The session keeps running either way: on `<prefix> d`
+                // because the user asked, on a closed stdin because there is
+                // no terminal left to ask from.
+                (pty::Outcome::Detached | pty::Outcome::StdinClosed, _) => return Ok(()),
                 (pty::Outcome::ChildExited, _) => break,
                 (pty::Outcome::CreateNew, held) => {
                     // Held rather than killed, so a cancelled prompt resumes it.
@@ -158,9 +172,9 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
 /// session: ssh accepts first and resets afterwards when it is the remote
 /// process that has gone. Verified both ways — a dead remote nvim gives
 /// ECONNRESET, a dead master gives ECONNREFUSED.
-fn describe_attach_failure(transport: &dyn transport::Transport, e: &nvmux::NvmuxError) -> String {
-    let remote = matches!(transport.location(), transport::Location::Ssh(_));
-    let host = transport.location().to_string();
+fn describe_attach_failure(location: &transport::Location, e: &nvmux::NvmuxError) -> String {
+    let remote = matches!(location, transport::Location::Ssh(_));
+    let host = location.to_string();
     match e {
         nvmux::NvmuxError::Rpc(nvmux::error::RpcError::ConnectionRefused(_)) if remote => {
             format!("the connection to {host} dropped — press enter to retry")
@@ -181,4 +195,58 @@ fn new_attachment(
 ) -> nvmux::Result<pty::Attachment> {
     let sock = transport.local_socket_for(session)?;
     pty::spawn(&session.id, &sock)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nvmux::error::RpcError;
+    use nvmux::NvmuxError;
+    use transport::Location;
+
+    fn refused() -> NvmuxError {
+        NvmuxError::Rpc(RpcError::ConnectionRefused("x.sock".into()))
+    }
+
+    /// Through a forward, "refused" is the master, not the session.
+    #[test]
+    fn a_refused_forward_blames_the_connection_not_the_session() {
+        let msg = describe_attach_failure(&Location::Ssh("myhost".into()), &refused());
+        assert!(msg.contains("myhost"), "{msg}");
+        assert!(msg.contains("dropped"), "{msg}");
+        assert!(msg.contains("retry"), "{msg}");
+    }
+
+    #[test]
+    fn a_reset_forward_means_the_remote_session_is_gone() {
+        let msg = describe_attach_failure(
+            &Location::Ssh("myhost".into()),
+            &NvmuxError::Rpc(RpcError::Reset),
+        );
+        assert!(msg.contains("no longer running on myhost"), "{msg}");
+    }
+
+    /// Locally the same errno means the session itself.
+    #[test]
+    fn a_refused_local_socket_means_the_session_is_gone() {
+        let msg = describe_attach_failure(&Location::Local, &refused());
+        assert_eq!(msg, "that session is gone");
+    }
+
+    /// The hint row is one row: any other error is flattened onto it.
+    #[test]
+    fn other_errors_are_flattened_to_one_line() {
+        let e = NvmuxError::Session(nvmux::error::SessionError::NotReady {
+            name: "x".into(),
+            timeout: std::time::Duration::from_secs(1),
+            log: "x.log".into(),
+            log_tail: "line one\nline two".into(),
+        });
+        let msg = describe_attach_failure(&Location::Local, &e);
+        assert!(!msg.contains('\n'), "{msg:?}");
+        assert!(
+            msg.contains("line one") && msg.contains("line two"),
+            "{msg:?}"
+        );
+    }
 }

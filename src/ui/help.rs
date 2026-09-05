@@ -13,19 +13,18 @@
 //!
 //! # Why only named keys close it
 //!
-//! `Ctrl-t` arrives here as `Key::Char('t')`, because `translate` folds the
-//! control modifier away for everything but `Ctrl-c`, `Ctrl-n` and `Ctrl-p`. If
-//! any key closed the help, someone who read "Ctrl-t d" and typed it would
-//! close the screen on the `Ctrl-t` and send a bare `d` into normal mode. So
-//! `t`, `d` and `c` do nothing, and only `Esc`, `q`, `Enter`, `?` and `Ctrl-c`
+//! `<prefix>` arrives here as `Key::Other`, because `translate` turns every
+//! control chord but `Ctrl-c`, `Ctrl-n` and `Ctrl-p` into nothing. If any key
+//! closed the help, someone who read "Ctrl-t d" and typed it would close the
+//! screen on the `Ctrl-t` and send a bare `d` into normal mode. So `t`, `d`,
+//! `c` and `Other` do nothing, and only `Esc`, `q`, `Enter`, `?` and `Ctrl-c`
 //! close it. Nothing typed on this screen is ever forwarded.
 
 use std::borrow::Cow;
 
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
-use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::layout::Rect;
+use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
@@ -92,9 +91,8 @@ fn rows(prefix: &str) -> Vec<Row> {
 }
 
 /// Named keys only. `t`, `d` and `c` — and therefore `Ctrl-t`, which arrives
-/// as `Key::Char('t')` — are deliberately not here: a chord typed while the
-/// help is open must do nothing, not close the help and forward its second
-/// key.
+/// as `Key::Other` — are deliberately not here: a chord typed while the help
+/// is open must do nothing, not close the help and forward its second key.
 fn on_key(key: Key) -> Step {
     match key {
         // Closes like esc; quitting here would tear the user out of a live
@@ -107,27 +105,22 @@ fn on_key(key: Key) -> Step {
 /// Show the bindings until the user dismisses them, on its own terminal, handing
 /// the session back untouched afterwards.
 pub fn run() -> Result<()> {
-    // See the colour note in the parent module.
-    ratatui::crossterm::style::force_color_output(true);
-
-    let mut terminal = ratatui::try_init()?;
-    // A second alternate-screen enter is a no-op on xterm and kitty; see
-    // `ui::run`.
-    terminal.clear()?;
     // Reached from a session that has already dissolved to black, so start black.
-    if crate::fade::excursions() {
-        crate::fade::prime_black(&mut terminal)?;
-    }
-    let outcome = run_loop(&mut terminal);
-    // Restore before propagating: see `ui::run`.
-    ratatui::try_restore()?;
+    let mut screen = super::Screen::open(crate::fade::excursions())?;
+    let outcome = run_on(screen.terminal(), true);
+    // Restore before propagating: see `ui::Screen`.
+    screen.close()?;
     outcome
 }
 
-fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
+/// Show the bindings on a terminal the caller already owns — how the picker
+/// answers `?`. `animate` is whether to dip through black on the way in and
+/// out; from the picker the screen is already up, so it does not.
+pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> Result<()> {
     let label = keys::prefix_label(crate::settings::get().keys.prefix);
     let rows = rows(&label);
-    if crate::fade::excursions() {
+    let animate = animate && crate::fade::excursions();
+    if animate {
         crate::fade::fade_in_ratatui(terminal, |f| draw(f, &rows))?;
     }
     loop {
@@ -145,7 +138,7 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
 
         if on_key(key) == Step::Close {
             // Dissolve back to black so the resumed session takes over dark.
-            if crate::fade::excursions() {
+            if animate {
                 crate::fade::fade_out_ratatui(terminal, |f| draw(f, &rows))?;
             }
             return Ok(());
@@ -159,19 +152,10 @@ fn draw(frame: &mut Frame, rows: &[Row]) {
         return;
     }
 
-    // Same split as the picker, so the screens line up.
-    let body = Rect {
-        height: area.height.saturating_sub(1),
-        ..area
-    };
-    let bottom = Rect {
-        y: area.y + area.height - 1,
-        height: 1,
-        ..area
-    };
+    let (body, bottom) = draw::split_hint_row(area);
 
     draw_table(frame, rows, body);
-    draw_hints(frame, bottom);
+    draw::draw_hint_row(frame, bottom, HINTS, true);
 }
 
 /// One left-aligned block, centred on both axes.
@@ -205,48 +189,17 @@ fn draw_table(frame: &mut Frame, rows: &[Row], area: Rect) {
     frame.render_widget(Paragraph::new(lines), block);
 }
 
-fn draw_hints(frame: &mut Frame, area: Rect) {
-    let text = draw::truncate(HINTS, area.width as usize);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            text,
-            Style::default().add_modifier(Modifier::DIM),
-        )))
-        .alignment(Alignment::Center),
-        area,
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::keys::{Prefix, PREFIX, PREFIX_LABEL};
     use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
     use ratatui::Terminal;
 
-    /// Reconstruct the rendered lines, skipping the filler cell that follows a
-    /// wide glyph so a CJK name is not reported as three columns per character.
     fn render(w: u16, h: u16) -> Vec<String> {
         let rows = rows(PREFIX_LABEL);
-        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
-        terminal.draw(|f| draw(f, &rows)).expect("draw");
-        let buf = terminal.backend().buffer().clone();
-        (0..buf.area.height)
-            .map(|y| {
-                let mut line = String::new();
-                let mut skip = 0u16;
-                for x in 0..buf.area.width {
-                    if skip > 0 {
-                        skip -= 1;
-                        continue;
-                    }
-                    let sym = buf[(x, y)].symbol();
-                    skip = sym.width().saturating_sub(1) as u16;
-                    line.push_str(sym);
-                }
-                line.trim_end().to_string()
-            })
-            .collect()
+        super::super::test_support::render(w, h, |f| draw(f, &rows))
     }
 
     /// The line a row was drawn on. Matched on the *start* of the line rather
@@ -278,8 +231,9 @@ mod tests {
         assert_eq!(on_key(Key::CtrlC), Step::Close);
     }
 
-    /// `Ctrl-t` arrives here as `Key::Char('t')`; if it closed the help, a chord
-    /// typed from this screen would be half-forwarded.
+    /// `<prefix>` arrives here as `Key::Other`, and its command letters as
+    /// themselves; if any of them closed the help, a chord typed from this
+    /// screen would be half-forwarded.
     #[test]
     fn the_prefix_and_its_command_letters_do_nothing_here() {
         for key in [
@@ -525,25 +479,7 @@ mod tests {
     /// No SGR colour, so the screen is correct under NO_COLOR by construction.
     #[test]
     fn nothing_sets_a_colour() {
-        use ratatui::style::Color;
         let rows = rows(PREFIX_LABEL);
-        let mut terminal = Terminal::new(TestBackend::new(62, 11)).expect("terminal");
-        terminal.draw(|f| draw(f, &rows)).expect("draw");
-        let buf = terminal.backend().buffer().clone();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                let cell = &buf[(x, y)];
-                assert_eq!(
-                    cell.fg,
-                    Color::Reset,
-                    "cell ({x},{y}) set a foreground colour"
-                );
-                assert_eq!(
-                    cell.bg,
-                    Color::Reset,
-                    "cell ({x},{y}) set a background colour"
-                );
-            }
-        }
+        super::super::test_support::assert_no_colour(62, 11, |f| draw(f, &rows));
     }
 }

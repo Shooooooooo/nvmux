@@ -227,12 +227,7 @@ pub fn leave_ratatui_to_black() -> io::Result<()> {
     write_all(SYNC_BEGIN)?;
     // Errors still propagate; the sync span is closed on the way out either way.
     let restored = ratatui::try_restore();
-    let mut out = io::stdout().lock();
-    out.write_all(HIDE_CURSOR)?;
-    out.write_all(SET_BLACK_BG)?;
-    out.write_all(CLEAR_HOME)?;
-    out.write_all(SYNC_END)?;
-    out.flush()?;
+    fill_black(&mut io::stdout().lock())?;
     restored
 }
 
@@ -253,11 +248,7 @@ pub fn enter_session_black() {
     // ?1049l leaves the alternate screen; then hide the cursor and clear to
     // black so the session starts from a known, dark state.
     let _ = out.write_all(b"\x1b[?1049l");
-    let _ = out.write_all(HIDE_CURSOR);
-    let _ = out.write_all(SET_BLACK_BG);
-    let _ = out.write_all(CLEAR_HOME);
-    let _ = out.write_all(SYNC_END);
-    let _ = out.flush();
+    let _ = fill_black(&mut out);
 }
 
 /// Instantly black the current (primary) screen. Used when a child has already
@@ -269,11 +260,19 @@ pub fn black_now() {
     }
     let mut out = io::stdout().lock();
     let _ = out.write_all(SYNC_BEGIN);
-    let _ = out.write_all(HIDE_CURSOR);
-    let _ = out.write_all(SET_BLACK_BG);
-    let _ = out.write_all(CLEAR_HOME);
-    let _ = out.write_all(SYNC_END);
-    let _ = out.flush();
+    let _ = fill_black(&mut out);
+}
+
+/// The black-primary batch every hand-off ends on: hide the cursor, set the
+/// black background, clear to it, and close the synchronized update the caller
+/// opened. One place, so the picker's dip and a session's dip are the same
+/// bytes.
+fn fill_black(out: &mut impl Write) -> io::Result<()> {
+    out.write_all(HIDE_CURSOR)?;
+    out.write_all(SET_BLACK_BG)?;
+    out.write_all(CLEAR_HOME)?;
+    out.write_all(SYNC_END)?;
+    out.flush()
 }
 
 /// Dissolve the raw session screen out to black, then hold [`HOLD`].

@@ -125,6 +125,12 @@ pub enum SessionError {
     #[error("could not kill session {name:?}: {reason}")]
     NotKilled { name: String, reason: &'static str },
 
+    /// Refused before attaching: Neovim aborts — not errors — on its
+    /// seventeenth UI, and nvmux stops well short of that. See
+    /// [`crate::pty`].
+    #[error("session {id} already has {attached} attached UIs; detach one before attaching again")]
+    TooManyUis { id: String, attached: usize },
+
     #[error("session metadata at {}: {source}", .path.display())]
     Metadata {
         path: PathBuf,
@@ -250,10 +256,6 @@ pub enum NvmuxError {
     Config(#[from] ConfigError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-
-    /// A `todo!()` that reports itself politely instead of panicking.
-    #[error("not implemented yet: {0}")]
-    Unimplemented(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, NvmuxError>;

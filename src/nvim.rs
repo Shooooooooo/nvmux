@@ -54,23 +54,13 @@ impl std::fmt::Display for Version {
 /// keys on a byte offset and never anchors the tail.
 pub fn parse_version(banner: &str) -> Option<Version> {
     let line = banner.lines().next()?.trim();
-    let token = line
-        .split_whitespace()
-        .find(|t| {
-            let t = t.strip_prefix('v').unwrap_or(t);
-            t.chars().next().is_some_and(|c| c.is_ascii_digit())
-        })?
-        .strip_prefix("NVIM")
-        .unwrap_or_else(|| {
-            line.split_whitespace()
-                .find(|t| {
-                    let t = t.strip_prefix('v').unwrap_or(t);
-                    t.chars().next().is_some_and(|c| c.is_ascii_digit())
-                })
-                .unwrap_or("")
-        });
+    // The first word that looks like a version: `v0.11.4`, `0.11.4`.
+    let token = line.split_whitespace().find(|t| {
+        let t = t.strip_prefix('v').unwrap_or(t);
+        t.chars().next().is_some_and(|c| c.is_ascii_digit())
+    })?;
 
-    let token = token.trim().strip_prefix('v').unwrap_or(token.trim());
+    let token = token.strip_prefix('v').unwrap_or(token);
     // Build metadata after '+' is never semantically meaningful to us.
     let (core, _build) = token.split_once('+').unwrap_or((token, ""));
     let (numbers, prerelease) = match core.split_once('-') {
@@ -231,7 +221,16 @@ mod tests {
     #[test]
     fn agrees_with_the_real_binary() {
         let Ok(out) = Command::new("nvim").arg("--version").output() else {
-            return; // No nvim here; the unit cases above still cover the parser.
+            // No nvim here; the unit cases above still cover the parser. Unless
+            // the environment insists (CI does), in which case its absence is
+            // the bug.
+            let strict = std::env::var("NVMUX_TEST_REQUIRE")
+                .is_ok_and(|v| v.split(',').any(|w| w.trim() == "nvim"));
+            assert!(
+                !strict,
+                "NVMUX_TEST_REQUIRE names nvim but it is not on $PATH"
+            );
+            return;
         };
         let banner = String::from_utf8_lossy(&out.stdout);
         let parsed = parse_version(&banner).expect("real nvim banner must parse");
