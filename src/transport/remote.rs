@@ -208,13 +208,13 @@ impl Transport for SshTransport {
 
     fn create_session(&self, name: &str) -> Result<Session> {
         crate::session::validate_name(name)?;
-        if self
-            .list_sessions()?
-            .iter()
-            .any(|s| s.name.eq_ignore_ascii_case(name))
-        {
+        // The listing doubles as the source of the new session's number; see the
+        // local transport.
+        let existing = self.list_sessions()?;
+        if existing.iter().any(|s| s.name.eq_ignore_ascii_case(name)) {
             return Err(SessionError::Exists(name.to_string()).into());
         }
+        let num = crate::transport::next_free_num(&existing);
 
         let id = ids::new_id().map_err(|e| std::io::Error::other(e.to_string()))?;
         // Check the length before spawning, not after: an overlong path makes
@@ -283,9 +283,11 @@ impl Transport for SshTransport {
             .into());
         }
 
-        let session = Session::new(id.clone(), name.to_string(), spawned.pid.unwrap_or(0));
+        let mut session = Session::new(id.clone(), name.to_string(), spawned.pid.unwrap_or(0), num);
         let json = session.to_json()?;
         self.run_script(shell::WRITE_META_SCRIPT, &[&self.remote_dir, &id, &json])?;
+        // See the local transport: the caller attaches without re-listing.
+        session.state.num = num;
 
         if let Ok(mut client) = crate::rpc::Client::connect(&local, crate::rpc::CONNECT_TIMEOUT) {
             let _ = client.command("command! -bar Detach detach");

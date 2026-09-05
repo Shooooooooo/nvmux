@@ -32,6 +32,16 @@ pub struct SessionState {
     pub liveness: Liveness,
     /// Number of attached UIs, when known.
     pub attached_uis: Option<usize>,
+    /// The number the picker shows and `Ctrl-t <n>` selects, resolved by
+    /// [`crate::transport::finish_listing`] from the stored [`Session::num`].
+    ///
+    /// Separate from the stored one on purpose. It is dense and duplicate-free
+    /// across one listing — legacy metadata and orphans have no stored number,
+    /// and two clients creating at once can store the same one — and it must
+    /// never reach disk. `SshTransport::rename_session` writes an in-memory
+    /// session straight back through `write_meta.sh`, so a derived number kept
+    /// in `Session::num` would be silently persisted by a rename.
+    pub num: u32,
 }
 
 /// A session, as listed by a [`crate::transport::Transport`].
@@ -50,20 +60,27 @@ pub struct Session {
     /// server's own answer once it is reachable. Liveness never rests on it:
     /// pids are reused.
     pub pid: u32,
+    /// The session's number, assigned once at creation and kept for life, so a
+    /// number a user memorised keeps naming the same session. `0` means
+    /// unnumbered: metadata written before numbering existed, and orphans.
+    /// [`crate::transport::finish_listing`] resolves that into `state.num`.
+    #[serde(default)]
+    pub num: u32,
 
     /// Probe results. Never serialised: the on-disk shape stays exactly the
-    /// four keys above.
+    /// five keys above.
     #[serde(skip)]
     pub state: SessionState,
 }
 
 impl Session {
-    pub fn new(id: String, name: String, pid: u32) -> Self {
+    pub fn new(id: String, name: String, pid: u32, num: u32) -> Self {
         Self {
             id,
             name,
             created: now_secs(),
             pid,
+            num,
             state: SessionState::default(),
         }
     }
@@ -152,19 +169,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn json_has_exactly_the_four_documented_keys() {
-        let s = Session::new("abcdefgh".into(), "dotfiles".into(), 4242);
+    fn json_has_exactly_the_five_documented_keys() {
+        let s = Session::new("abcdefgh".into(), "dotfiles".into(), 4242, 3);
         let v: serde_json::Value =
             serde_json::from_str(&s.to_json().expect("serialise")).expect("json");
         let obj = v.as_object().expect("object");
         let mut keys: Vec<_> = obj.keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["created", "id", "name", "pid"]);
+        assert_eq!(keys, ["created", "id", "name", "num", "pid"]);
+    }
+
+    /// The resolved number is display state, and a rename over ssh writes an
+    /// in-memory session straight back to disk — so it must not serialise.
+    #[test]
+    fn the_resolved_number_never_reaches_disk() {
+        let mut s = Session::new("abcdefgh".into(), "x".into(), 1, 2);
+        s.state.num = 9;
+        let v: serde_json::Value =
+            serde_json::from_str(&s.to_json().expect("serialise")).expect("json");
+        assert_eq!(v["num"], 2, "the stored number is what is written");
     }
 
     #[test]
     fn state_never_reaches_disk() {
-        let mut s = Session::new("abcdefgh".into(), "x".into(), 1);
+        let mut s = Session::new("abcdefgh".into(), "x".into(), 1, 1);
         s.state.liveness = Liveness::Alive;
         s.state.attached_uis = Some(3);
         let json = s.to_json().expect("serialise");
@@ -177,13 +205,14 @@ mod tests {
 
     #[test]
     fn round_trips_through_json() {
-        let s = Session::new("abcdefgh".into(), "api server".into(), 99);
+        let s = Session::new("abcdefgh".into(), "api server".into(), 99, 7);
         let json = s.to_json().expect("serialise");
         let back = Session::from_json(json.as_bytes(), Path::new("x.json")).expect("parse");
         assert_eq!(back.id, s.id);
         assert_eq!(back.name, s.name);
         assert_eq!(back.created, s.created);
         assert_eq!(back.pid, s.pid);
+        assert_eq!(back.num, s.num);
         // A freshly parsed session has been probed by nobody.
         assert_eq!(back.state, SessionState::default());
     }
@@ -195,6 +224,8 @@ mod tests {
         assert_eq!(s.name, "scratch");
         assert_eq!(s.created, 1_700_000_000);
         assert_eq!(s.pid, 1234);
+        // Written before numbering existed: unnumbered, not a parse failure.
+        assert_eq!(s.num, 0);
     }
 
     #[test]
@@ -227,7 +258,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nvmux-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         let path = dir.join("abcdefgh.json");
-        let s = Session::new("abcdefgh".into(), "x".into(), 7);
+        let s = Session::new("abcdefgh".into(), "x".into(), 7, 1);
         s.write_atomic(&path).expect("write");
 
         let bytes = std::fs::read(&path).expect("read back");

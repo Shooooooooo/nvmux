@@ -36,12 +36,19 @@ pub mod prompt;
 #[derive(Debug, Clone)]
 pub enum Outcome {
     /// Attach to this session.
-    Attach(Session),
+    Attach {
+        session: Session,
+        /// The highest session number in the listing the picker was showing.
+        /// Carried out rather than re-listed because the prefix machine needs
+        /// it to know when a digit can be acted on without waiting, and over
+        /// SSH a listing is a script execution.
+        highest: u32,
+    },
     /// The user quit.
     Quit,
 }
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -77,15 +84,36 @@ fn run_loop(
     transport: &dyn Transport,
     message: Option<String>,
 ) -> Result<Outcome> {
-    let mut app = App::new(transport.list_sessions()?);
+    let mut sessions = transport.list_sessions()?;
+    let mut highest = highest_num(&sessions);
+    let mut app = App::new(std::mem::take(&mut sessions));
     if let Some(msg) = message {
         app.set_message(msg);
     }
+
+    // When a half-typed session number must be settled. `App` decides every
+    // unambiguous digit on its own, so this is only ever set when one number is
+    // a prefix of another — sessions 1 and 12 both present.
+    let mut deadline: Option<Instant> = None;
 
     loop {
         terminal.draw(|f| draw::draw(f, &app))?;
 
         if !event::poll(TICK)? {
+            // The clock lives here rather than in `App`, which stays pure —
+            // the same split `pty::pump` uses for `keys::Prefix`.
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                deadline = None;
+                if let Request::Attach(id) = app.resolve_pending() {
+                    match find(transport, &id)? {
+                        Some(session) => return Ok(Outcome::Attach { session, highest }),
+                        None => {
+                            app.set_message("that session is gone");
+                            refresh(&mut app, &mut highest, transport)?;
+                        }
+                    }
+                }
+            }
             continue;
         }
         let key = match event::read()? {
@@ -93,32 +121,44 @@ fn run_loop(
             _ => continue,
         };
 
-        match app.on_key(key) {
+        let request = app.on_key(key);
+        deadline = app
+            .pending()
+            .is_some()
+            .then(|| Instant::now() + crate::keys::TIMEOUT);
+
+        match request {
             Request::None => {}
             Request::Quit => return Ok(Outcome::Quit),
 
             Request::Attach(id) => {
                 if let Some(session) = find(transport, &id)? {
-                    return Ok(Outcome::Attach(session));
+                    return Ok(Outcome::Attach { session, highest });
                 }
                 app.set_message("that session is gone");
-                app.set_sessions(transport.list_sessions()?);
+                refresh(&mut app, &mut highest, transport)?;
             }
 
             Request::NewSession => {
                 if let prompt::Outcome::Created(session) =
                     prompt::run_on(terminal, transport, prompt::Task::Create)?
                 {
-                    return Ok(Outcome::Attach(session));
+                    // The new session is the highest by construction when it
+                    // appends, but it may have refilled a gap — so take the
+                    // larger of the two rather than assuming.
+                    return Ok(Outcome::Attach {
+                        highest: highest.max(session.state.num),
+                        session,
+                    });
                 }
-                app.set_sessions(transport.list_sessions()?);
+                refresh(&mut app, &mut highest, transport)?;
             }
 
             Request::RenameSession(id) => {
                 if let Some(session) = find(transport, &id)? {
                     prompt::run_on(terminal, transport, prompt::Task::Rename(&session))?;
                 }
-                app.set_sessions(transport.list_sessions()?);
+                refresh(&mut app, &mut highest, transport)?;
             }
 
             Request::Kill(id) => {
@@ -127,10 +167,23 @@ fn run_loop(
                         app.set_message(one_line(&e));
                     }
                 }
-                app.set_sessions(transport.list_sessions()?);
+                refresh(&mut app, &mut highest, transport)?;
             }
         }
     }
+}
+
+/// Re-list, keeping the highest number in step with what is on screen.
+fn refresh(app: &mut App, highest: &mut u32, transport: &dyn Transport) -> Result<()> {
+    let sessions = transport.list_sessions()?;
+    *highest = highest_num(&sessions);
+    app.set_sessions(sessions);
+    Ok(())
+}
+
+/// The largest resolved session number in a listing, or 0 for none.
+pub fn highest_num(sessions: &[Session]) -> u32 {
+    sessions.iter().map(|s| s.state.num).max().unwrap_or(0)
 }
 
 fn find(transport: &dyn Transport, id: &str) -> Result<Option<Session>> {

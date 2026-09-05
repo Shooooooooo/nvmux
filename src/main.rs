@@ -48,9 +48,9 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
 
     loop {
         // `Ctrl-t c` moves this to the session it just created.
-        let mut current = match ui::run(transport, message.take())? {
+        let (mut current, mut highest) = match ui::run(transport, message.take())? {
             ui::Outcome::Quit => break,
-            ui::Outcome::Attach(session) => session,
+            ui::Outcome::Attach { session, highest } => (session, highest),
         };
 
         loop {
@@ -75,7 +75,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 }
             };
 
-            match pty::relay(attachment)? {
+            match pty::relay(attachment, highest)? {
                 (pty::Outcome::ToPicker, held) => {
                     attached = held;
                     break;
@@ -86,6 +86,10 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     // Held rather than killed, so a cancelled prompt resumes it.
                     attached = held;
                     if let ui::prompt::Outcome::Created(session) = ui::prompt::run(transport)? {
+                        // A new session can be numbered above anything the
+                        // relay was told about, and the hint decides how long a
+                        // digit waits.
+                        highest = highest.max(session.state.num);
                         current = session;
                     }
                     continue;
@@ -93,6 +97,20 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 (pty::Outcome::ShowHelp, held) => {
                     attached = held;
                     ui::help::run()?;
+                    continue;
+                }
+                (pty::Outcome::Switch(num), held) => {
+                    // Held rather than killed, so a number that names nothing
+                    // puts the user straight back where they were.
+                    attached = held;
+                    let sessions = transport.list_sessions()?;
+                    highest = ui::highest_num(&sessions);
+                    match sessions.into_iter().find(|s| s.state.num == num) {
+                        // The loop above retires the old client and attaches the
+                        // new one; an unchanged id reuses the client as it is.
+                        Some(session) => current = session,
+                        None => tracing::debug!(num, "no session with that number"),
+                    }
                     continue;
                 }
             }

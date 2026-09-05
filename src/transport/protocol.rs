@@ -243,7 +243,9 @@ pub fn rows_to_sessions(rows: Vec<Listed>) -> Vec<Session> {
 }
 
 fn orphan(id: &str) -> Session {
-    let mut s = Session::new(id.to_string(), format!("<orphan {id}>"), 0);
+    // Unnumbered: `finish_listing` gives it a display number, so a broken
+    // session is still something the user can select and kill.
+    let mut s = Session::new(id.to_string(), format!("<orphan {id}>"), 0, 0);
     s.created = 0;
     s
 }
