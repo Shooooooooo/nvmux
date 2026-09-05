@@ -172,14 +172,13 @@ impl Transport for LocalTransport {
         crate::session::validate_name(name)?;
 
         // Names carry no identity, but two identical ones in a picker is a
-        // usability trap.
-        if self
-            .list_sessions()?
-            .iter()
-            .any(|s| s.name.eq_ignore_ascii_case(name))
-        {
+        // usability trap. The listing is also what the new session's number is
+        // allocated from, so numbering costs no extra work here.
+        let existing = self.list_sessions()?;
+        if existing.iter().any(|s| s.name.eq_ignore_ascii_case(name)) {
             return Err(SessionError::Exists(name.to_string()).into());
         }
+        let num = crate::transport::next_free_num(&existing);
 
         let id = ids::new_id().map_err(|e| std::io::Error::other(e.to_string()))?;
         let paths = self.paths(&id)?;
@@ -207,8 +206,11 @@ impl Transport for LocalTransport {
             .into());
         }
 
-        let session = Session::new(id, name.to_string(), spawned.pid.unwrap_or(0));
+        let mut session = Session::new(id, name.to_string(), spawned.pid.unwrap_or(0), num);
         session.write_atomic(&paths.json)?;
+        // The caller attaches to this without re-listing, so give it the same
+        // resolved number a listing would have.
+        session.state.num = num;
 
         // A way out that is not `:q`. `command!` requires an uppercase name
         // (`command! q` is E183), so this cannot shadow `:q` itself. Failure

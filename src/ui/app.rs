@@ -43,6 +43,9 @@ pub struct App {
     mode: Mode,
     /// A transient message shown where the hints normally are.
     message: Option<String>,
+    /// Digits typed so far towards a session number, when more digits could
+    /// still change which session is meant. See [`App::on_digit`].
+    pending: Option<u32>,
 }
 
 impl App {
@@ -53,6 +56,7 @@ impl App {
             selected: 0,
             mode: Mode::Normal,
             message: None,
+            pending: None,
         }
     }
 
@@ -77,6 +81,12 @@ impl App {
 
     pub fn message(&self) -> Option<&str> {
         self.message.as_deref()
+    }
+
+    /// The half-typed session number, if one is waiting for another digit. The
+    /// hint row shows it so the state is never invisible.
+    pub fn pending(&self) -> Option<u32> {
+        self.pending
     }
 
     pub fn set_message(&mut self, msg: impl Into<String>) {
@@ -155,8 +165,81 @@ impl App {
         }
     }
 
+    /// Handle a digit typed in the picker.
+    ///
+    /// The numbers are resolved against the *visible* list, not the whole one:
+    /// a filter can still be applied in normal mode, and a number belonging to a
+    /// row the filter has hidden must not silently attach. You can press what
+    /// you can see.
+    ///
+    /// Because `App` holds the sessions, most keystrokes need no timer at all —
+    /// a digit that no longer number could extend is acted on at once. Only a
+    /// genuinely ambiguous one (sessions 1 and 12 both present) waits, and the
+    /// caller resolves that with [`App::resolve_pending`].
+    fn on_digit(&mut self, d: u32) -> Request {
+        let Some(n) = self.pending.take().map(|p| p.saturating_mul(10) + d) else {
+            // A session number never starts with 0, so a leading one is not the
+            // beginning of anything.
+            if d == 0 {
+                return Request::None;
+            }
+            return self.select_number(d);
+        };
+        self.select_number(n)
+    }
+
+    fn select_number(&mut self, n: u32) -> Request {
+        let exact = self
+            .visible()
+            .into_iter()
+            .find(|s| s.state.num == n)
+            .map(|s| s.id.clone());
+        // Could another digit still name a different session?
+        let extendable = self
+            .visible()
+            .iter()
+            .any(|s| s.state.num > n && s.state.num / 10 == n);
+
+        match (exact, extendable) {
+            // Ambiguous: 1 is a session but so is 12. Only this waits.
+            (Some(_), true) => {
+                self.pending = Some(n);
+                Request::None
+            }
+            (Some(id), false) => Request::Attach(id),
+            (None, true) => {
+                self.pending = Some(n);
+                Request::None
+            }
+            (None, false) => {
+                self.set_message(format!("no session {n}"));
+                Request::None
+            }
+        }
+    }
+
+    /// Called by the driver once [`crate::keys::TIMEOUT`] has passed with a
+    /// number half-typed: settle for the session it already names.
+    pub fn resolve_pending(&mut self) -> Request {
+        match self.pending.take() {
+            Some(n) => self
+                .visible()
+                .into_iter()
+                .find(|s| s.state.num == n)
+                .map(|s| Request::Attach(s.id.clone()))
+                .unwrap_or(Request::None),
+            None => Request::None,
+        }
+    }
+
     fn on_key_normal(&mut self, key: Key) -> Request {
+        // Any key that is not a digit ends a half-typed number rather than
+        // letting it linger into an unrelated keystroke.
+        if !matches!(key, Key::Char('0'..='9')) {
+            self.pending = None;
+        }
         match key {
+            Key::Char(c @ '0'..='9') => self.on_digit(u32::from(c) - u32::from('0')),
             Key::Char('j') | Key::Down | Key::CtrlN => {
                 self.move_by(1);
                 Request::None
@@ -294,7 +377,13 @@ mod tests {
             names
                 .iter()
                 .enumerate()
-                .map(|(i, n)| Session::new(format!("id{i:06}"), n.to_string(), 100 + i as u32))
+                .map(|(i, n)| {
+                    let num = i as u32 + 1;
+                    let mut s =
+                        Session::new(format!("id{i:06}"), n.to_string(), 100 + i as u32, num);
+                    s.state.num = num;
+                    s
+                })
                 .collect(),
         )
     }
@@ -571,21 +660,187 @@ mod tests {
         assert_eq!(*a.mode(), Mode::Filter);
     }
 
+    /// One session, numbered as a listing would have numbered it.
+    fn session(id: &str, name: &str, num: u32) -> Session {
+        let mut s = Session::new(id.to_string(), name.to_string(), 100, num);
+        s.state.num = num;
+        s
+    }
+
+    #[test]
+    fn a_digit_attaches_to_the_session_with_that_number() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        assert_eq!(
+            a.on_key(Key::Char('2')),
+            Request::Attach("id000001".into()),
+            "one keystroke, no Enter"
+        );
+        assert_eq!(a.pending(), None);
+    }
+
+    /// Nine or fewer sessions means no digit can be extended, so none of them
+    /// ever waits.
+    #[test]
+    fn every_digit_resolves_at_once_when_no_number_can_be_extended() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        for (key, id) in [('1', "id000000"), ('2', "id000001"), ('3', "id000002")] {
+            assert_eq!(a.on_key(Key::Char(key)), Request::Attach(id.into()));
+            assert_eq!(a.pending(), None, "{key} should not have waited");
+        }
+    }
+
+    #[test]
+    fn a_digit_naming_no_session_reports_instead_of_attaching() {
+        let mut a = app(&["aaa", "bbb"]);
+        assert_eq!(a.on_key(Key::Char('7')), Request::None);
+        assert_eq!(a.message(), Some("no session 7"));
+        assert_eq!(a.pending(), None);
+    }
+
+    /// A number never starts with zero.
+    #[test]
+    fn zero_does_nothing_on_its_own() {
+        let mut a = app(&["aaa", "bbb"]);
+        assert_eq!(a.on_key(Key::Char('0')), Request::None);
+        assert_eq!(a.pending(), None);
+        assert_eq!(a.message(), None, "it is a no-op, not an error");
+    }
+
+    #[test]
+    fn two_digits_reach_a_session_past_the_ninth() {
+        let names: Vec<String> = (0..12).map(|i| format!("s{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut a = app(&refs);
+
+        // 1 is ambiguous while 10, 11 and 12 exist, so it waits.
+        assert_eq!(a.on_key(Key::Char('1')), Request::None);
+        assert_eq!(a.pending(), Some(1));
+
+        assert_eq!(
+            a.on_key(Key::Char('2')),
+            Request::Attach("id000011".into()),
+            "12 is the twelfth session"
+        );
+        assert_eq!(a.pending(), None);
+    }
+
+    /// The ambiguous case is the only one that waits, and the caller settles it.
+    #[test]
+    fn a_half_typed_number_settles_on_the_session_it_already_names() {
+        let names: Vec<String> = (0..12).map(|i| format!("s{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut a = app(&refs);
+
+        a.on_key(Key::Char('1'));
+        assert_eq!(a.pending(), Some(1));
+        assert_eq!(a.resolve_pending(), Request::Attach("id000000".into()));
+        assert_eq!(a.pending(), None);
+        assert_eq!(a.resolve_pending(), Request::None, "idempotent");
+    }
+
+    /// `11` shares its first digit with 1, 10 and 12, so the first keystroke
+    /// cannot decide anything and the second one settles it.
+    #[test]
+    fn a_repeated_digit_reaches_the_session_it_spells() {
+        let names: Vec<String> = (0..12).map(|i| format!("s{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut a = app(&refs);
+        assert_eq!(a.on_key(Key::Char('1')), Request::None);
+        assert_eq!(a.on_key(Key::Char('1')), Request::Attach("id000010".into()));
+    }
+
+    #[test]
+    fn any_other_key_abandons_a_half_typed_number() {
+        let names: Vec<String> = (0..12).map(|i| format!("s{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut a = app(&refs);
+
+        a.on_key(Key::Char('1'));
+        assert_eq!(a.pending(), Some(1));
+        a.on_key(Key::Char('j'));
+        assert_eq!(a.pending(), None, "a movement key ends the number");
+
+        a.on_key(Key::Char('1'));
+        a.on_key(Key::Esc);
+        assert_eq!(a.pending(), None, "esc ends it too");
+    }
+
+    /// Numbers address the rows on screen. A session the filter has hidden must
+    /// not be reachable by a keystroke that names nothing visible.
+    #[test]
+    fn a_digit_only_reaches_a_session_the_filter_still_shows() {
+        let mut a = app(&["alpha", "beta", "gamma"]);
+        a.on_key(Key::Char('/'));
+        for c in "beta".chars() {
+            a.on_key(Key::Char(c));
+        }
+        a.on_key(Key::Enter); // back to normal mode, filter still applied
+
+        // Only "beta" is visible, and it is number 2.
+        assert_eq!(a.on_key(Key::Char('2')), Request::Attach("id000001".into()));
+
+        let mut a = app(&["alpha", "beta", "gamma"]);
+        a.on_key(Key::Char('/'));
+        for c in "beta".chars() {
+            a.on_key(Key::Char(c));
+        }
+        a.on_key(Key::Enter);
+        assert_eq!(
+            a.on_key(Key::Char('1')),
+            Request::None,
+            "alpha is filtered out, so 1 names nothing on screen"
+        );
+        assert_eq!(a.message(), Some("no session 1"));
+    }
+
+    #[test]
+    fn digits_are_filter_text_not_commands_while_filtering() {
+        let mut a = app(&["log1", "log2", "other"]);
+        a.on_key(Key::Char('/'));
+        assert_eq!(a.on_key(Key::Char('1')), Request::None);
+        assert_eq!(a.filter(), "1", "the digit typed into the query");
+        assert_eq!(a.visible().len(), 1);
+        assert_eq!(a.visible()[0].name, "log1");
+    }
+
+    #[test]
+    fn digits_still_decline_a_kill_confirmation() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.on_key(Key::Char('x'));
+        assert!(matches!(a.mode(), Mode::Confirm { .. }));
+        assert_eq!(a.on_key(Key::Char('1')), Request::None);
+        assert_eq!(a.mode(), &Mode::Normal, "anything but y declines");
+    }
+
     #[test]
     fn selection_follows_the_session_not_the_index() {
         let mut a = app(&["aaa", "bbb", "ccc"]);
         a.on_key(Key::Char('j')); // on "bbb"
         assert_eq!(a.selected_session().expect("selected").name, "bbb");
 
-        // "bbb" is renamed to "zzz" and the list re-sorts; the highlight should
-        // travel with it rather than staying on row 1.
-        let mut renamed: Vec<Session> = vec![
-            Session::new("id000000".into(), "aaa".into(), 100),
-            Session::new("id000002".into(), "ccc".into(), 102),
-            Session::new("id000001".into(), "zzz".into(), 101),
-        ];
-        renamed.sort_by(|x, y| x.name.cmp(&y.name));
-        a.set_sessions(renamed);
+        // "aaa" is killed and something else takes its number, so "bbb" moves
+        // to row 0; the highlight should travel with it rather than staying put.
+        a.set_sessions(vec![
+            session("id000001", "bbb", 1),
+            session("id000002", "ccc", 2),
+        ]);
+        assert_eq!(a.selected_index(), 0, "it moved up with the session");
+        assert_eq!(a.selected_session().expect("selected").id, "id000001");
+        assert_eq!(a.selected_session().expect("selected").name, "bbb");
+    }
+
+    /// A rename no longer reorders the list — sorting is by number — but the
+    /// selection must still be anchored to the session rather than the row.
+    #[test]
+    fn selection_follows_a_renamed_session() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char('j')); // on "bbb"
+
+        a.set_sessions(vec![
+            session("id000000", "aaa", 1),
+            session("id000001", "zzz", 2),
+            session("id000002", "ccc", 3),
+        ]);
         assert_eq!(a.selected_session().expect("selected").id, "id000001");
         assert_eq!(a.selected_session().expect("selected").name, "zzz");
     }
@@ -595,8 +850,8 @@ mod tests {
         let mut a = app(&["aaa", "bbb", "ccc"]);
         a.on_key(Key::Char('G')); // "ccc"
         a.set_sessions(vec![
-            Session::new("id000000".into(), "aaa".into(), 100),
-            Session::new("id000001".into(), "bbb".into(), 101),
+            session("id000000", "aaa", 1),
+            session("id000001", "bbb", 2),
         ]);
         assert!(
             a.selected_index() < 2,

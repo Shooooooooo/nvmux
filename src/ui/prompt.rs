@@ -396,7 +396,12 @@ mod tests {
     }
 
     fn renaming(name: &str) -> Prompt {
-        Prompt::rename(&Session::new("id000000".to_string(), name.to_string(), 100))
+        Prompt::rename(&Session::new(
+            "id000000".to_string(),
+            name.to_string(),
+            100,
+            1,
+        ))
     }
 
     fn type_in(p: &mut Prompt, text: &str) {

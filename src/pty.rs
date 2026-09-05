@@ -60,6 +60,9 @@ pub enum Outcome {
     CreateNew,
     /// `Ctrl-t ?` — show the key bindings. The child keeps running.
     ShowHelp,
+    /// `Ctrl-t <number>` — attach to the session with that number. The child
+    /// keeps running, so a number that names nothing puts the user back.
+    Switch(u32),
     /// The child exited on its own.
     ChildExited,
 }
@@ -171,7 +174,10 @@ pub fn spawn(session_id: &str, sock: &Path) -> Result<Attachment> {
 /// * A thread parked in a blocking `read(0)` cannot be cancelled, so returning
 ///   to the picker would hang or swallow the first keystroke. A `poll` loop
 ///   just stops polling.
-pub fn relay(mut attachment: Attachment) -> Result<(Outcome, Option<Attachment>)> {
+pub fn relay(
+    mut attachment: Attachment,
+    highest_session_num: u32,
+) -> Result<(Outcome, Option<Attachment>)> {
     let master_fd = attachment
         .master
         .as_raw_fd()
@@ -189,10 +195,13 @@ pub fn relay(mut attachment: Attachment) -> Result<(Outcome, Option<Attachment>)
     }
     attachment.resumed = true;
 
-    let outcome = pump(&mut attachment, master_fd, &winch);
+    let outcome = pump(&mut attachment, master_fd, &winch, highest_session_num);
 
     match outcome {
-        Ok(held @ (Outcome::ToPicker | Outcome::CreateNew | Outcome::ShowHelp)) => {
+        Ok(
+            held
+            @ (Outcome::ToPicker | Outcome::CreateNew | Outcome::ShowHelp | Outcome::Switch(_)),
+        ) => {
             raw.restore();
             Ok((held, Some(attachment)))
         }
@@ -216,9 +225,14 @@ pub fn relay(mut attachment: Attachment) -> Result<(Outcome, Option<Attachment>)
     }
 }
 
-fn pump(attachment: &mut Attachment, master_fd: RawFd, winch: &winch::Winch) -> Result<Outcome> {
+fn pump(
+    attachment: &mut Attachment,
+    master_fd: RawFd,
+    winch: &winch::Winch,
+    highest_session_num: u32,
+) -> Result<Outcome> {
     let stdin_fd = std::io::stdin().as_raw_fd();
-    let mut prefix = Prefix::new();
+    let mut prefix = Prefix::new(highest_session_num);
     let mut buf = [0u8; 8192];
 
     loop {
@@ -240,10 +254,22 @@ fn pump(attachment: &mut Attachment, master_fd: RawFd, winch: &winch::Winch) -> 
             return Err(NvmuxError::Io(err));
         }
         if n == 0 {
+            // `timeout` resolves a lone prefix into a literal byte, but also a
+            // half-typed session number into a switch — so the actions it
+            // produces must be acted on, not just the bytes.
             for step in prefix.timeout() {
-                if let Step::Forward(bytes) = step {
-                    attachment.writer.write_all(&bytes)?;
-                    attachment.writer.flush()?;
+                match step {
+                    Step::Forward(bytes) => {
+                        attachment.writer.write_all(&bytes)?;
+                        attachment.writer.flush()?;
+                    }
+                    Step::Act(Action::Switch(num)) => return Ok(Outcome::Switch(num)),
+                    // `timeout` never produces the others; a `_` here would let
+                    // a future one be dropped as silently as this one was.
+                    Step::Act(Action::Picker) => return Ok(Outcome::ToPicker),
+                    Step::Act(Action::Detach) => return Ok(Outcome::Detached),
+                    Step::Act(Action::Create) => return Ok(Outcome::CreateNew),
+                    Step::Act(Action::Help) => return Ok(Outcome::ShowHelp),
                 }
             }
             if check_child(attachment) == ChildState::Gone {
@@ -294,6 +320,7 @@ fn pump(attachment: &mut Attachment, master_fd: RawFd, winch: &winch::Winch) -> 
                             }
                             Step::Act(Action::Create) => return Ok(Outcome::CreateNew),
                             Step::Act(Action::Help) => return Ok(Outcome::ShowHelp),
+                            Step::Act(Action::Switch(n)) => return Ok(Outcome::Switch(n)),
                         }
                     }
                 }

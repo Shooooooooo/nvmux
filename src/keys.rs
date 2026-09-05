@@ -14,6 +14,20 @@
 //!
 //! Note what is *not* here: `Ctrl-z` (0x1a) is not special-cased. It is
 //! forwarded like any other byte and Neovim receives it as a key.
+//!
+//! # Digits
+//!
+//! `C-t 1` through `C-t 9` select a session by its number, and a number may run
+//! to several digits. That means a digit after the prefix is *always* a command
+//! and no longer reaches Neovim — `C-t C-t 1` is the way to send it. `0` is the
+//! exception: no session number starts with one, so `C-t 0` replays both bytes
+//! like any other non-command.
+//!
+//! Multi-digit numbers need a moment to see whether another digit follows, and
+//! [`Prefix::new`] takes the highest live session number so that moment is only
+//! ever spent when it could change the answer. With nine or fewer sessions a
+//! single digit acts at once. The hint is a latency optimisation and nothing
+//! more: whether a session actually exists is settled by the caller.
 
 /// `Ctrl-t`.
 pub const PREFIX: u8 = 0x14;
@@ -37,6 +51,10 @@ pub enum Action {
     Create,
     /// `C-t ?` — show the key bindings. The child stays alive.
     Help,
+    /// `C-t <number>` — attach to the session with that number, leaving this
+    /// one running. The only action with no [`BINDINGS`] row: one row cannot
+    /// stand for nine keys, so digits are a rule in [`Prefix::feed`] instead.
+    Switch(u32),
 }
 
 /// One instruction from the machine, in order.
@@ -90,22 +108,51 @@ pub fn command(byte: u8) -> Option<Action> {
     BINDINGS.iter().find(|b| b.key == byte).map(|b| b.action)
 }
 
+/// Carriage return, which is what Enter is in raw mode. Ends a number early
+/// rather than waiting out the [`TIMEOUT`].
+const ENTER: u8 = 0x0d;
+
+/// Where the machine is between keystrokes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum State {
+    /// Ordinary bytes, passing straight through.
+    #[default]
+    Idle,
+    /// A `C-t` has been swallowed and we are waiting to see what follows.
+    Armed,
+    /// Digits are accumulating into a session number.
+    Number(u32),
+}
+
 /// The prefix state machine.
 #[derive(Debug, Default)]
 pub struct Prefix {
-    /// True between seeing `C-t` and resolving what follows it.
-    armed: bool,
+    state: State,
+    /// The highest live session number, used only to decide whether a further
+    /// digit could still change the answer. Stale is harmless — see the module
+    /// docs.
+    highest: u32,
 }
 
 impl Prefix {
-    pub fn new() -> Self {
-        Self { armed: false }
+    pub fn new(highest: u32) -> Self {
+        Self {
+            state: State::Idle,
+            highest,
+        }
     }
 
-    /// True if a prefix byte has been swallowed and we are waiting to see what
-    /// follows. The caller uses this to decide whether to arm a [`TIMEOUT`].
+    /// True if the machine is mid-sequence and a [`TIMEOUT`] must be armed —
+    /// either a lone `C-t` or a half-typed number. The caller polls on the
+    /// short timeout while this holds, so a number does not resolve late.
     pub fn is_armed(&self) -> bool {
-        self.armed
+        self.state != State::Idle
+    }
+
+    /// Whether another digit could still extend `n` into a live session number.
+    /// `checked_mul` because a held-down digit key would otherwise overflow.
+    fn can_extend(&self, n: u32) -> bool {
+        n.checked_mul(10).is_some_and(|wider| wider <= self.highest)
     }
 
     /// Feed a chunk of bytes read from the user's terminal.
@@ -117,25 +164,67 @@ impl Prefix {
         let mut pending: Vec<u8> = Vec::new();
 
         for &b in input {
-            if self.armed {
-                self.armed = false;
-                if b == PREFIX {
-                    // C-t C-t: one literal prefix byte reaches Neovim. Checked
-                    // before the table, so no row can ever shadow it.
-                    pending.push(PREFIX);
-                } else if let Some(action) = command(b) {
-                    flush(&mut steps, &mut pending);
-                    steps.push(Step::Act(action));
-                } else {
-                    // Anything else was not a command, so the user's original
-                    // keystrokes are replayed in order and nothing is eaten.
-                    pending.push(PREFIX);
-                    pending.push(b);
+            match self.state {
+                State::Idle => {
+                    if b == PREFIX {
+                        self.state = State::Armed;
+                    } else {
+                        pending.push(b);
+                    }
                 }
-            } else if b == PREFIX {
-                self.armed = true;
-            } else {
-                pending.push(b);
+
+                State::Armed => {
+                    self.state = State::Idle;
+                    if b == PREFIX {
+                        // C-t C-t: one literal prefix byte reaches Neovim.
+                        // Checked before everything else, so no rule and no row
+                        // can ever shadow it.
+                        pending.push(PREFIX);
+                    } else if (b'1'..=b'9').contains(&b) {
+                        // A number never starts with 0, so `C-t 0` falls
+                        // through to the replay branch below.
+                        self.start_number(u32::from(b - b'0'), &mut steps, &mut pending);
+                    } else if let Some(action) = command(b) {
+                        flush(&mut steps, &mut pending);
+                        steps.push(Step::Act(action));
+                    } else {
+                        // Not a command, so the user's original keystrokes are
+                        // replayed in order and nothing is eaten.
+                        pending.push(PREFIX);
+                        pending.push(b);
+                    }
+                }
+
+                State::Number(n) => {
+                    if b.is_ascii_digit() {
+                        self.state = State::Idle;
+                        // Saturating throughout: a held-down digit key must
+                        // neither panic nor wrap a huge number back around onto
+                        // a live one.
+                        let wider = n.saturating_mul(10).saturating_add(u32::from(b - b'0'));
+                        self.start_number(wider, &mut steps, &mut pending);
+                    } else if b == ENTER {
+                        // An explicit "that is the whole number", so a user who
+                        // knows the id never waits out the timeout.
+                        self.state = State::Idle;
+                        flush(&mut steps, &mut pending);
+                        steps.push(Step::Act(Action::Switch(n)));
+                    } else {
+                        // The digits already typed were a complete command, and
+                        // this byte is simply the next key. Acting and then
+                        // handling `b` afresh is what keeps `C-t 1 x` equivalent
+                        // to `C-t t x`: the command runs, the `x` reaches Neovim,
+                        // and no stray prefix byte is injected.
+                        self.state = State::Idle;
+                        flush(&mut steps, &mut pending);
+                        steps.push(Step::Act(Action::Switch(n)));
+                        if b == PREFIX {
+                            self.state = State::Armed;
+                        } else {
+                            pending.push(b);
+                        }
+                    }
+                }
             }
         }
 
@@ -143,16 +232,28 @@ impl Prefix {
         steps
     }
 
-    /// Called when no byte arrived within [`TIMEOUT`] of arming.
-    ///
-    /// Resolves a lone `C-t` into a literal one. Idempotent, so a caller that
-    /// fires its timer spuriously does no harm.
-    pub fn timeout(&mut self) -> Vec<Step> {
-        if self.armed {
-            self.armed = false;
-            vec![Step::Forward(vec![PREFIX])]
+    /// Begin, or extend, a session number: wait for another digit only when one
+    /// could still change which session is meant.
+    fn start_number(&mut self, n: u32, steps: &mut Vec<Step>, pending: &mut Vec<u8>) {
+        if self.can_extend(n) {
+            self.state = State::Number(n);
         } else {
-            Vec::new()
+            self.state = State::Idle;
+            flush(steps, pending);
+            steps.push(Step::Act(Action::Switch(n)));
+        }
+    }
+
+    /// Called when no byte arrived within [`TIMEOUT`] of the machine arming.
+    ///
+    /// Resolves a lone `C-t` into a literal one, and a half-typed number into
+    /// the session it already names. Idempotent, so a caller that fires its
+    /// timer spuriously does no harm.
+    pub fn timeout(&mut self) -> Vec<Step> {
+        match std::mem::replace(&mut self.state, State::Idle) {
+            State::Idle => Vec::new(),
+            State::Armed => vec![Step::Forward(vec![PREFIX])],
+            State::Number(n) => vec![Step::Act(Action::Switch(n))],
         }
     }
 }
@@ -191,7 +292,7 @@ mod tests {
 
     #[test]
     fn ordinary_bytes_pass_through_untouched() {
-        let mut p = Prefix::new();
+        let mut p = Prefix::new(0);
         let steps = p.feed(b"hello world");
         assert_eq!(forwarded(&steps), b"hello world");
         assert!(actions(&steps).is_empty());
@@ -200,14 +301,14 @@ mod tests {
 
     #[test]
     fn a_run_of_bytes_is_one_write() {
-        let mut p = Prefix::new();
+        let mut p = Prefix::new(0);
         let steps = p.feed(b"abcdef");
         assert_eq!(steps.len(), 1, "should coalesce: {steps:?}");
     }
 
     #[test]
     fn prefix_alone_is_swallowed_and_arms() {
-        let mut p = Prefix::new();
+        let mut p = Prefix::new(0);
         let steps = p.feed(&[PREFIX]);
         assert!(
             forwarded(&steps).is_empty(),
@@ -218,7 +319,7 @@ mod tests {
 
     #[test]
     fn doubled_prefix_sends_one_literal() {
-        let mut p = Prefix::new();
+        let mut p = Prefix::new(0);
         let steps = p.feed(&[PREFIX, PREFIX]);
         assert_eq!(forwarded(&steps), vec![PREFIX]);
         assert!(!p.is_armed());
@@ -227,7 +328,7 @@ mod tests {
     #[test]
     fn commands_produce_actions_and_no_bytes() {
         for &Binding { key, action, .. } in BINDINGS {
-            let mut p = Prefix::new();
+            let mut p = Prefix::new(0);
             let steps = p.feed(&[PREFIX, key]);
             assert_eq!(actions(&steps), vec![action], "for {:?}", key as char);
             assert!(
@@ -245,7 +346,7 @@ mod tests {
             command(b'x').is_none(),
             "this test needs a byte that is not a command"
         );
-        let mut p = Prefix::new();
+        let mut p = Prefix::new(0);
         let steps = p.feed(&[PREFIX, b'x']);
         assert_eq!(forwarded(&steps), vec![PREFIX, b'x']);
         assert!(actions(&steps).is_empty());
@@ -253,7 +354,7 @@ mod tests {
 
     #[test]
     fn timeout_resolves_a_lone_prefix_to_a_literal() {
-        let mut p = Prefix::new();
+        let mut p = Prefix::new(0);
         p.feed(&[PREFIX]);
         assert!(p.is_armed());
         assert_eq!(forwarded(&p.timeout()), vec![PREFIX]);
@@ -262,7 +363,7 @@ mod tests {
 
     #[test]
     fn timeout_when_not_armed_does_nothing() {
-        let mut p = Prefix::new();
+        let mut p = Prefix::new(0);
         assert!(p.timeout().is_empty());
         // Idempotent: a spurious second timer must not inject a stray byte.
         p.feed(&[PREFIX]);
@@ -275,7 +376,7 @@ mod tests {
     /// not an edge case.
     #[test]
     fn state_survives_a_chunk_boundary() {
-        let mut p = Prefix::new();
+        let mut p = Prefix::new(0);
         let first = p.feed(b"ab\x14");
         assert_eq!(forwarded(&first), b"ab");
         assert!(p.is_armed());
@@ -289,7 +390,7 @@ mod tests {
     fn ctrl_z_is_not_special() {
         // 0x1a must reach Neovim as an ordinary key. Whether the server then
         // emits a `suspend` UI event is the child TUI's business, not ours.
-        let mut p = Prefix::new();
+        let mut p = Prefix::new(0);
         let steps = p.feed(&[0x1a]);
         assert_eq!(forwarded(&steps), vec![0x1a]);
         assert!(actions(&steps).is_empty());
@@ -299,14 +400,14 @@ mod tests {
     fn ctrl_c_and_ctrl_s_are_not_special() {
         // These only reach us as bytes because the terminal is in raw mode with
         // ISIG off and IXON cleared; the machine itself must not intercept them.
-        let mut p = Prefix::new();
+        let mut p = Prefix::new(0);
         let steps = p.feed(&[0x03, 0x13, 0x1c]);
         assert_eq!(forwarded(&steps), vec![0x03, 0x13, 0x1c]);
     }
 
     #[test]
     fn escape_sequences_are_never_parsed() {
-        let mut p = Prefix::new();
+        let mut p = Prefix::new(0);
         // A bracketed paste wrapper plus a kitty keyboard query.
         let raw = b"\x1b[200~pasted\x1b[201~\x1b[?u";
         let steps = p.feed(raw);
@@ -315,7 +416,7 @@ mod tests {
 
     #[test]
     fn a_prefix_inside_a_larger_chunk_splits_correctly() {
-        let mut p = Prefix::new();
+        let mut p = Prefix::new(0);
         let steps = p.feed(b"before\x14tafter");
         assert_eq!(forwarded(&steps), b"beforeafter");
         assert_eq!(actions(&steps), vec![Action::Picker]);
@@ -327,7 +428,7 @@ mod tests {
 
     #[test]
     fn several_commands_in_one_chunk() {
-        let mut p = Prefix::new();
+        let mut p = Prefix::new(0);
         // Literal bytes on purpose: this is what pins each letter to its
         // action, independently of what `BINDINGS` says.
         let steps = p.feed(b"\x14t\x14d\x14c\x14?");
@@ -340,7 +441,7 @@ mod tests {
 
     #[test]
     fn triple_prefix_is_a_literal_then_arms_again() {
-        let mut p = Prefix::new();
+        let mut p = Prefix::new(0);
         let steps = p.feed(&[PREFIX, PREFIX, PREFIX]);
         assert_eq!(forwarded(&steps), vec![PREFIX]);
         assert!(p.is_armed(), "the third byte should re-arm");
@@ -348,7 +449,7 @@ mod tests {
 
     #[test]
     fn empty_input_is_a_no_op() {
-        let mut p = Prefix::new();
+        let mut p = Prefix::new(0);
         assert!(p.feed(b"").is_empty());
         p.feed(&[PREFIX]);
         assert!(p.feed(b"").is_empty());
@@ -356,14 +457,25 @@ mod tests {
     }
 
     /// Every byte that is not a command must survive a prefix unchanged.
+    ///
+    /// With no sessions known, every digit resolves at once, so nothing here is
+    /// left mid-sequence.
     #[test]
     fn exhaustive_second_byte_table() {
         for b in 0u8..=255 {
-            let mut p = Prefix::new();
+            let mut p = Prefix::new(0);
             let steps = p.feed(&[PREFIX, b]);
-            // Same order as `feed`: the literal rule first, then the table.
+            // Same order as `feed`: the literal rule, then digits, then the table.
             if b == PREFIX {
                 assert_eq!(forwarded(&steps), vec![PREFIX]);
+            } else if (b'1'..=b'9').contains(&b) {
+                assert_eq!(
+                    actions(&steps),
+                    vec![Action::Switch(u32::from(b - b'0'))],
+                    "digit {:?} should select a session",
+                    b as char
+                );
+                assert!(forwarded(&steps).is_empty(), "byte {b:#04x} leaked bytes");
             } else if let Some(action) = command(b) {
                 assert_eq!(actions(&steps), vec![action], "byte {b:#04x} should act");
                 assert!(forwarded(&steps).is_empty(), "byte {b:#04x} leaked bytes");
@@ -380,7 +492,7 @@ mod tests {
 
     #[test]
     fn question_mark_after_the_prefix_is_help_not_a_replayed_byte() {
-        let mut p = Prefix::new();
+        let mut p = Prefix::new(0);
         let steps = p.feed(&[PREFIX, b'?']);
         assert_eq!(actions(&steps), vec![Action::Help]);
         assert!(forwarded(&steps).is_empty());
@@ -391,7 +503,7 @@ mod tests {
     /// still send it, and it must keep working.
     #[test]
     fn a_literal_prefix_then_question_mark_still_reaches_neovim() {
-        let mut p = Prefix::new();
+        let mut p = Prefix::new(0);
         let steps = p.feed(&[PREFIX, PREFIX, b'?']);
         assert_eq!(forwarded(&steps), vec![PREFIX, b'?']);
         assert!(actions(&steps).is_empty());
@@ -400,12 +512,18 @@ mod tests {
     /// Rust cannot enumerate an enum, so the list is kept here by hand. The
     /// `match` is exhaustive on purpose: a new variant fails to compile until
     /// it is added to the list, and then the count fails until it has a row.
+    ///
+    /// `Switch` is the one deliberate exception, asserted below rather than
+    /// waived: a single row cannot stand for nine keys, so digits are a rule in
+    /// `feed` and a literal row on the help screen.
     #[test]
     fn the_table_binds_every_action_exactly_once() {
         let all = [Action::Picker, Action::Detach, Action::Create, Action::Help];
         for action in all {
             match action {
                 Action::Picker | Action::Detach | Action::Create | Action::Help => {}
+                // Not in `all`: it carries a number, so it has no fixed key.
+                Action::Switch(_) => unreachable!("Switch is not a table action"),
             }
             assert_eq!(
                 BINDINGS.iter().filter(|b| b.action == action).count(),
@@ -418,6 +536,25 @@ mod tests {
             all.len(),
             "a new command needs a row here and above"
         );
+        assert!(
+            !BINDINGS
+                .iter()
+                .any(|b| matches!(b.action, Action::Switch(_))),
+            "Switch is a rule in `feed`, not a row"
+        );
+    }
+
+    /// No row may claim a digit either, or the help screen would promise a key
+    /// the digit rule has already taken.
+    #[test]
+    fn no_command_key_is_a_digit() {
+        for b in BINDINGS {
+            assert!(
+                !b.key.is_ascii_digit(),
+                "{:?} collides with the session-number rule",
+                b.key as char
+            );
+        }
     }
 
     #[test]
@@ -447,6 +584,160 @@ mod tests {
                 b.key as char
             );
         }
+    }
+
+    #[test]
+    fn a_single_digit_selects_a_session_without_waiting() {
+        // Nine sessions: no second digit could name a different one, so the
+        // common case costs nothing.
+        let mut p = Prefix::new(9);
+        let steps = p.feed(&[PREFIX, b'3']);
+        assert_eq!(actions(&steps), vec![Action::Switch(3)]);
+        assert!(
+            forwarded(&steps).is_empty(),
+            "the digit must not reach nvim"
+        );
+        assert!(!p.is_armed(), "nothing should still be pending");
+    }
+
+    #[test]
+    fn several_digits_make_one_number() {
+        let mut p = Prefix::new(30);
+        let steps = p.feed(&[PREFIX, b'1', b'2']);
+        assert_eq!(actions(&steps), vec![Action::Switch(12)]);
+        assert!(forwarded(&steps).is_empty());
+        assert!(!p.is_armed());
+    }
+
+    /// The wait exists only while another digit could still change the answer.
+    #[test]
+    fn a_digit_waits_only_while_a_longer_number_is_possible() {
+        let mut p = Prefix::new(12);
+        assert!(
+            p.feed(&[PREFIX, b'1']).is_empty(),
+            "1 could still become 12"
+        );
+        assert!(p.is_armed(), "the caller must arm a timeout");
+
+        let mut p = Prefix::new(12);
+        let steps = p.feed(&[PREFIX, b'2']);
+        assert_eq!(
+            actions(&steps),
+            vec![Action::Switch(2)],
+            "20 is past the end, so 2 is already the whole answer"
+        );
+        assert!(!p.is_armed());
+    }
+
+    #[test]
+    fn a_half_typed_number_resolves_on_the_timeout() {
+        let mut p = Prefix::new(12);
+        p.feed(&[PREFIX, b'1']);
+        assert_eq!(actions(&p.timeout()), vec![Action::Switch(1)]);
+        assert!(!p.is_armed());
+        // Idempotent, like the lone-prefix case.
+        assert!(p.timeout().is_empty());
+    }
+
+    #[test]
+    fn enter_ends_a_number_early() {
+        let mut p = Prefix::new(12);
+        p.feed(&[PREFIX, b'1']);
+        let steps = p.feed(&[ENTER]);
+        assert_eq!(actions(&steps), vec![Action::Switch(1)]);
+        assert!(
+            forwarded(&steps).is_empty(),
+            "the terminator must not reach nvim"
+        );
+    }
+
+    /// A number never starts with zero, so this is not a command at all.
+    #[test]
+    fn a_leading_zero_is_replayed_like_any_other_non_command() {
+        let mut p = Prefix::new(30);
+        let steps = p.feed(&[PREFIX, b'0']);
+        assert_eq!(forwarded(&steps), vec![PREFIX, b'0']);
+        assert!(actions(&steps).is_empty());
+        assert!(!p.is_armed());
+    }
+
+    #[test]
+    fn zero_is_still_a_digit_inside_a_number() {
+        let mut p = Prefix::new(30);
+        let steps = p.feed(&[PREFIX, b'1', b'0']);
+        assert_eq!(actions(&steps), vec![Action::Switch(10)]);
+    }
+
+    /// The digits already typed were a complete command; the key after them is
+    /// simply the next key, exactly as it is after `C-t t`.
+    #[test]
+    fn a_key_after_a_number_ends_it_and_then_reaches_neovim() {
+        let mut p = Prefix::new(12);
+        let steps = p.feed(&[PREFIX, b'1', b'x']);
+        assert_eq!(actions(&steps), vec![Action::Switch(1)]);
+        assert_eq!(
+            forwarded(&steps),
+            vec![b'x'],
+            "no stray prefix byte may be injected"
+        );
+        assert!(!p.is_armed());
+    }
+
+    #[test]
+    fn a_prefix_after_a_number_ends_it_and_arms_again() {
+        let mut p = Prefix::new(12);
+        let steps = p.feed(&[PREFIX, b'1', PREFIX]);
+        assert_eq!(actions(&steps), vec![Action::Switch(1)]);
+        assert!(forwarded(&steps).is_empty());
+        assert!(p.is_armed(), "the second prefix should arm");
+    }
+
+    /// The prefix may end one `read()` and the digits begin the next, at any
+    /// point in the sequence.
+    #[test]
+    fn a_number_survives_a_chunk_boundary() {
+        let mut p = Prefix::new(30);
+        assert!(p.feed(&[PREFIX]).is_empty());
+        assert!(p.feed(b"1").is_empty(), "1 could still become 12");
+        let steps = p.feed(b"2");
+        assert_eq!(actions(&steps), vec![Action::Switch(12)]);
+    }
+
+    /// This is the documented way to send a digit to Neovim now that `C-t 1` is
+    /// a command, so it must keep working.
+    #[test]
+    fn a_literal_prefix_then_a_digit_still_reaches_neovim() {
+        let mut p = Prefix::new(9);
+        let steps = p.feed(&[PREFIX, PREFIX, b'1']);
+        assert_eq!(forwarded(&steps), vec![PREFIX, b'1']);
+        assert!(actions(&steps).is_empty());
+    }
+
+    /// Ordinary typing contains digits. They must only ever be a command
+    /// directly after the prefix.
+    #[test]
+    fn digits_in_ordinary_input_are_not_commands() {
+        let mut p = Prefix::new(30);
+        let steps = p.feed(b"buffer 12 line 30");
+        assert_eq!(forwarded(&steps), b"buffer 12 line 30");
+        assert!(actions(&steps).is_empty());
+        assert!(!p.is_armed());
+    }
+
+    /// A held-down digit key must not wrap around into a live session number.
+    #[test]
+    fn an_absurdly_long_number_does_not_overflow() {
+        let mut p = Prefix::new(u32::MAX);
+        let steps = p.feed(&[PREFIX]);
+        assert!(steps.is_empty());
+        let steps = p.feed(&[b'9'; 64]);
+        // Whatever it settles on, it must be a switch and not a panic.
+        assert!(
+            actions(&steps)
+                .iter()
+                .all(|a| matches!(a, Action::Switch(_))),
+            "unexpected actions: {steps:?}"
+        );
     }
 
     /// The label is what the help screen and the README print; the byte is

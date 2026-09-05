@@ -177,6 +177,102 @@ fn rename_edits_metadata_and_leaves_the_socket_alone() {
     assert_eq!(sock_before, sock_after, "the socket path must not move");
     assert!(sock_after.exists(), "the socket must still be live");
     assert_eq!(listed[0].state.liveness, Liveness::Alive);
+
+    // The number is as much a handle as the id: a rename must not move it, or
+    // `Ctrl-t <n>` would start naming a different session.
+    assert_eq!(
+        listed[0].num, session.num,
+        "rename must not change the number"
+    );
+    assert_eq!(listed[0].state.num, session.num);
+}
+
+/// Numbers are assigned once and kept, and a killed session's number is handed
+/// out again so the list stays dense and single-digit for as long as possible.
+#[test]
+fn session_numbers_are_stable_and_a_freed_one_is_reused() {
+    require_nvim!();
+    let scratch = Scratch::new("numbers");
+    let t = scratch.transport();
+
+    let first = t.create_session("first").expect("create");
+    let second = t.create_session("second").expect("create");
+    let third = t.create_session("third").expect("create");
+    assert_eq!(
+        (first.num, second.num, third.num),
+        (1, 2, 3),
+        "numbering starts at 1 and counts up"
+    );
+
+    t.kill_session(&second).expect("kill");
+
+    // The survivors keep the numbers they were given: killing 2 must not
+    // renumber 3 down to 2.
+    let listed = t.list_sessions().expect("list");
+    let numbered: Vec<(String, u32)> = listed
+        .iter()
+        .map(|s| (s.name.clone(), s.state.num))
+        .collect();
+    assert_eq!(
+        numbered,
+        vec![("first".to_string(), 1), ("third".to_string(), 3)],
+        "the gap is left where the killed session was"
+    );
+
+    // And the next create refills the hole rather than climbing to 4.
+    let fourth = t.create_session("fourth").expect("create");
+    assert_eq!(fourth.num, 2, "the freed number is handed out again");
+
+    let listed = t.list_sessions().expect("list");
+    let nums: Vec<u32> = listed.iter().map(|s| s.state.num).collect();
+    assert_eq!(nums, vec![1, 2, 3], "the list reads in number order");
+}
+
+/// The number has to survive the round trip through `<id>.json`, which is the
+/// only thing a second nvmux on another machine ever sees.
+#[test]
+fn a_number_survives_the_metadata_round_trip() {
+    require_nvim!();
+    let scratch = Scratch::new("num-roundtrip");
+    let t = scratch.transport();
+
+    let session = t.create_session("only").expect("create");
+    let raw = std::fs::read_to_string(scratch.0.join(format!("{}.json", session.id)))
+        .expect("read metadata");
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("json");
+    assert_eq!(
+        v.get("num").and_then(serde_json::Value::as_u64),
+        Some(u64::from(session.num)),
+        "the number must be on disk, not just in memory: {raw}"
+    );
+
+    assert_eq!(t.list_sessions().expect("list")[0].num, session.num);
+}
+
+/// Metadata written before numbering existed has no `num` key at all. It must
+/// still list, and still be reachable by keystroke.
+#[test]
+fn metadata_without_a_number_still_lists_and_gets_one() {
+    require_nvim!();
+    let scratch = Scratch::new("num-legacy");
+    let t = scratch.transport();
+
+    let session = t.create_session("legacy").expect("create");
+    let path = scratch.0.join(format!("{}.json", session.id));
+
+    // Rewrite it the way an older nvmux would have.
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+    v.as_object_mut().expect("object").remove("num");
+    std::fs::write(&path, serde_json::to_string(&v).expect("serialise")).expect("write");
+
+    let listed = t.list_sessions().expect("list");
+    assert_eq!(listed.len(), 1, "an unnumbered session must still list");
+    assert_eq!(listed[0].num, 0, "still unnumbered on disk");
+    assert_eq!(
+        listed[0].state.num, 1,
+        "but given a number to display and press"
+    );
 }
 
 #[test]

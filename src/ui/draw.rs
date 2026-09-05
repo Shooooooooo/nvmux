@@ -39,7 +39,10 @@ const CURSOR: &str = "▋";
 const MIN_LIST_WIDTH: u16 = 4;
 const MAX_LIST_WIDTH: u16 = 48;
 
-const HINTS: &str = "↑↓ move   ⏎ attach   c new   r rename   x kill   q quit";
+/// Columns between the number and the name.
+const NUM_GAP: &str = "  ";
+
+const HINTS: &str = "↑↓ move   ⏎ 1-9 attach   c new   r rename   x kill   q quit";
 const EMPTY: &str = "no sessions — press c to create one";
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -80,7 +83,14 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let widest = visible.iter().map(|s| s.name.width()).max().unwrap_or(0) as u16;
-    let width = (widest + MARKER.width() as u16)
+    // Right-aligned in a column as wide as the longest number, so the names stay
+    // in one column once the list runs past nine.
+    let num_width = visible
+        .iter()
+        .map(|s| s.state.num.to_string().len())
+        .max()
+        .unwrap_or(1);
+    let width = (widest + MARKER.width() as u16 + num_width as u16 + NUM_GAP.width() as u16)
         .clamp(MIN_LIST_WIDTH, MAX_LIST_WIDTH)
         .min(area.width);
 
@@ -102,7 +112,13 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::default()
             };
-            let text = truncate(&format!("{prefix}{}", session.name), block.width as usize);
+            let text = truncate(
+                &format!(
+                    "{prefix}{:>num_width$}{NUM_GAP}{}",
+                    session.state.num, session.name
+                ),
+                block.width as usize,
+            );
             Line::from(Span::styled(text, style))
         })
         .collect();
@@ -116,11 +132,16 @@ fn draw_bottom(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Filter => (format!("/{}{CURSOR}", app.filter()), false),
         Mode::Normal => match app.message() {
             Some(msg) => (msg.to_string(), false),
-            None if !app.filter().is_empty() => {
-                // Or the list silently looks shorter than it is.
-                (format!("/{}", app.filter()), true)
-            }
-            None => (HINTS.to_string(), true),
+            // A number waiting on another digit; without this the picker would
+            // look like it had ignored the keystroke.
+            None => match app.pending() {
+                Some(n) => (format!("#{n}{CURSOR}"), false),
+                None if !app.filter().is_empty() => {
+                    // Or the list silently looks shorter than it is.
+                    (format!("/{}", app.filter()), true)
+                }
+                None => (HINTS.to_string(), true),
+            },
         },
     };
 
@@ -216,12 +237,20 @@ mod tests {
             .collect()
     }
 
+    /// Numbered the way `finish_listing` would have: these `App`s are built
+    /// directly, so nothing else would set the resolved number.
     fn app(names: &[&str]) -> App {
         App::new(
             names
                 .iter()
                 .enumerate()
-                .map(|(i, n)| Session::new(format!("id{i:06}"), n.to_string(), 100 + i as u32))
+                .map(|(i, n)| {
+                    let num = i as u32 + 1;
+                    let mut s =
+                        Session::new(format!("id{i:06}"), n.to_string(), 100 + i as u32, num);
+                    s.state.num = num;
+                    s
+                })
                 .collect(),
         )
     }
@@ -258,8 +287,12 @@ mod tests {
             .filter(|l| l.contains("aa") || l.contains("bb"))
             .collect();
         assert_eq!(rows.len(), 2);
-        assert!(rows[0].contains("▸ aaa"), "selected row: {:?}", rows[0]);
-        assert!(rows[1].contains("  bbb"), "unselected row: {:?}", rows[1]);
+        assert!(rows[0].contains("▸ 1  aaa"), "selected row: {:?}", rows[0]);
+        assert!(
+            rows[1].contains("  2  bbb"),
+            "unselected row: {:?}",
+            rows[1]
+        );
 
         // Display columns, not bytes: "▸" is three bytes but one column.
         let col = |l: &str, name: &str| {
@@ -288,6 +321,49 @@ mod tests {
         assert!(
             left.abs_diff(right) <= 2,
             "not horizontally centred: {left} left, {right} right, row {row:?}"
+        );
+    }
+
+    #[test]
+    fn every_row_carries_its_session_number() {
+        let lines = render(&app(&["api-server", "dotfiles", "notes"]), 40, 6);
+        for want in ["▸ 1  api-server", "  2  dotfiles", "  3  notes"] {
+            assert!(
+                lines.iter().any(|l| l.contains(want)),
+                "missing {want:?} in {lines:#?}"
+            );
+        }
+    }
+
+    /// The block is sized to fit the number column, or the names it was
+    /// measured for would be truncated by exactly the width of the number.
+    #[test]
+    fn the_list_block_grows_to_fit_the_number_column() {
+        let lines = render(&app(&["exactly-this-long"]), 40, 6);
+        let row = lines
+            .iter()
+            .find(|l| l.contains("exactly"))
+            .expect("the row");
+        assert!(
+            row.contains("▸ 1  exactly-this-long"),
+            "the name was truncated to make room: {row:?}"
+        );
+    }
+
+    /// A half-typed number is shown, or the picker looks like it swallowed the
+    /// keystroke.
+    #[test]
+    fn a_pending_number_is_shown_on_the_hint_row() {
+        let names: Vec<String> = (0..12).map(|i| format!("s{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut a = app(&refs);
+        a.on_key(super::super::app::Key::Char('1'));
+
+        let lines = render(&a, 40, 14);
+        assert!(
+            lines[13].contains("#1"),
+            "the pending number is not on the hint row: {:?}",
+            lines[13]
         );
     }
 
@@ -402,8 +478,21 @@ mod tests {
 
         let lines = render(&a, 40, 10);
         assert!(
-            lines.iter().any(|l| l.contains("▸ session-29")),
+            lines.iter().any(|l| l.contains("▸ 30  session-29")),
             "the selection scrolled out of view: {lines:#?}"
+        );
+        // Thirty sessions means two-digit numbers. Whatever is on screen, the
+        // names line up in one column: the marker and the number column are
+        // both fixed width, so nothing shifts as the selection moves.
+        let name_columns: Vec<usize> = lines
+            .iter()
+            .filter(|l| l.contains("session-"))
+            .map(|l| l[..l.find("session-").expect("a name")].width())
+            .collect();
+        assert_eq!(name_columns.len(), 9, "expected a full window: {lines:#?}");
+        assert!(
+            name_columns.windows(2).all(|w| w[0] == w[1]),
+            "names are not in one column: {lines:#?}"
         );
     }
 

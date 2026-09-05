@@ -6,12 +6,12 @@ while every keystroke and every pixel of rendering happens on your own terminal.
 
 ```
                                                               
-                        api-server                            
-                      ▸ dotfiles                              
-                        scratch                               
-                        notes                                 
+                      1  api-server                           
+                    ▸ 2  dotfiles                             
+                      3  scratch                              
+                      4  notes                                
                                                               
-  ↑↓ move   ⏎ attach   c new   r rename   x kill   q quit     
+   ↑↓ move   ⏎ 1-9 attach   c new   r rename   x kill   q quit
 ```
 
 nvmux is a **thin multiplexer**: it does not render Neovim's UI. Neovim already
@@ -73,6 +73,7 @@ reimplementing it.
 |---|---|
 | `j` `k` `↓` `↑` | move (wraps) |
 | `g` `G` | first / last |
+| `1`–`9` | attach to that session |
 | `Enter` | attach |
 | `c` | name a new session, then attach |
 | `r` | rename the selected session |
@@ -89,13 +90,25 @@ reimplementing it.
 |---|---|
 | `Ctrl-t` `d` | detach — leaves the session running, exits nvmux |
 | `Ctrl-t` `t` | back to the picker, session still attached |
+| `Ctrl-t` `1`–`9` | switch straight to that session |
 | `Ctrl-t` `c` | name a new session and attach to it — `Esc` goes back |
 | `Ctrl-t` `?` | show these keys — `Esc` goes back |
 | `Ctrl-t` `Ctrl-t` | send a literal `Ctrl-t` to Neovim |
 
 Everything else goes to Neovim untouched — including `Ctrl-c`, `Ctrl-z` and
 `Ctrl-s`, which reach the editor as ordinary keys rather than becoming signals
-for nvmux.
+for nvmux. Digits are the exception: `Ctrl-t 1` is a command now, so
+`Ctrl-t Ctrl-t 1` is how you send that to the editor.
+
+## Session numbers
+
+Every session gets a number when it is created and keeps it for life, so a
+number you have learned goes on meaning the same session. They start at 1 and
+fill gaps: kill session 3 and the next one you create becomes 3 again.
+
+Numbers longer than one digit work by typing the digits together — `12` for the
+twelfth session. A single digit acts immediately unless a longer number could
+still be meant, which only happens once you have more than nine sessions.
 
 ## Leaving a session
 

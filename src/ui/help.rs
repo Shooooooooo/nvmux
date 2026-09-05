@@ -7,9 +7,9 @@
 //!
 //! Every command row comes from [`keys::BINDINGS`], the same table
 //! [`keys::Prefix::feed`] runs on, so this screen cannot claim something the
-//! machine does not do. The two rows that are not commands — `Ctrl-t Ctrl-t` is
-//! a literal, anything else is replayed — are the machine's `else` branches,
-//! spelled here and pinned to it by a test.
+//! machine does not do. The rows that are not commands — a digit selects a
+//! session, `Ctrl-t Ctrl-t` is a literal, anything else is replayed — are the
+//! machine's other branches, spelled here and pinned to it by a test.
 //!
 //! # Why only named keys close it
 //!
@@ -54,8 +54,9 @@ enum Step {
     Close,
 }
 
-/// The command rows from [`keys::BINDINGS`], then the two rules that are not
-/// commands.
+/// The command rows from [`keys::BINDINGS`], then the rules that are not
+/// commands: digits select a session, a doubled prefix is a literal, and
+/// anything else is replayed.
 fn rows() -> Vec<Row> {
     let mut rows: Vec<Row> = keys::BINDINGS
         .iter()
@@ -64,6 +65,10 @@ fn rows() -> Vec<Row> {
             what: b.help,
         })
         .collect();
+    rows.push(Row {
+        keys: format!("{PREFIX_LABEL} 1-9"),
+        what: "attach to the session with that number",
+    });
     rows.push(Row {
         keys: format!("{PREFIX_LABEL} {PREFIX_LABEL}"),
         what: "send a literal Ctrl-t to Neovim",
@@ -268,23 +273,49 @@ mod tests {
 
     /// The rendered rows are checked against what the machine actually does,
     /// not against the table both of them read.
+    ///
+    /// `highest` is 0 so every digit resolves on the spot; what is being checked
+    /// is which bytes are commands at all, not how long one waits.
     #[test]
     fn every_row_matches_what_the_prefix_machine_does() {
         let rows = rows();
         for b in 0u8..=255 {
-            let acts = Prefix::new()
+            let acts = Prefix::new(0)
                 .feed(&[PREFIX, b])
                 .iter()
                 .any(|s| matches!(s, keys::Step::Act(_)));
             // Equality, not `starts_with`: `o` would otherwise match the
-            // `Ctrl-t other` row.
-            let listed = rows
-                .iter()
-                .any(|r| r.keys == format!("{PREFIX_LABEL} {}", b as char));
+            // `Ctrl-t other` row. Digits are the one range row, so they are
+            // looked up as the range rather than as themselves.
+            let listed = if b.is_ascii_digit() {
+                acts && rows.iter().any(|r| r.keys == format!("{PREFIX_LABEL} 1-9"))
+            } else {
+                rows.iter()
+                    .any(|r| r.keys == format!("{PREFIX_LABEL} {}", b as char))
+            };
             assert_eq!(
                 acts, listed,
                 "byte {b:#04x}: the machine acts = {acts}, the help lists it = {listed}"
             );
+        }
+    }
+
+    /// The range row is a promise about nine specific bytes; check them.
+    #[test]
+    fn the_digit_row_covers_exactly_one_to_nine() {
+        assert!(
+            rows()
+                .iter()
+                .any(|r| r.keys == format!("{PREFIX_LABEL} 1-9")),
+            "the digit row is missing"
+        );
+        for b in b'0'..=b'9' {
+            let acts = Prefix::new(0)
+                .feed(&[PREFIX, b])
+                .iter()
+                .any(|s| matches!(s, keys::Step::Act(_)));
+            // Zero is excluded on purpose: no session number begins with one.
+            assert_eq!(acts, b != b'0', "byte {:?}", b as char);
         }
     }
 
@@ -313,17 +344,20 @@ mod tests {
             .iter()
             .map(|b| format!("{PREFIX_LABEL} {}", b.key as char))
             .collect();
-        assert_eq!(body.len(), want.len() + 2, "body rows: {body:#?}");
+        assert_eq!(body.len(), want.len() + 3, "body rows: {body:#?}");
         for (line, key) in body.iter().zip(&want) {
             assert!(
                 line.starts_with(key.as_str()),
                 "expected {key:?} at the start of {line:?}"
             );
         }
-        let literal = body[want.len()];
+        let digits = body[want.len()];
+        assert!(digits.starts_with("Ctrl-t 1-9"), "got {digits:?}");
+        assert!(digits.contains("number"), "got {digits:?}");
+        let literal = body[want.len() + 1];
         assert!(literal.starts_with("Ctrl-t Ctrl-t"), "got {literal:?}");
         assert!(literal.contains("literal"), "got {literal:?}");
-        let other = body[want.len() + 1];
+        let other = body[want.len() + 2];
         assert!(other.starts_with("Ctrl-t other"), "got {other:?}");
         assert!(other.contains("that key"), "got {other:?}");
     }
@@ -360,11 +394,16 @@ mod tests {
             .collect();
         assert_eq!(
             occupied,
-            vec![2, 3, 4, 5, 6, 7],
+            vec![1, 2, 3, 4, 5, 6, 7],
             "table is not vertically centred: {lines:#?}"
         );
 
-        let row = &lines[2];
+        // The widest row is the one that defines the block; a shorter one has
+        // slack on the right by construction.
+        let row = lines[..10]
+            .iter()
+            .max_by_key(|l| l.width())
+            .expect("a table row");
         let left = row.len() - row.trim_start().len();
         let right = 62 - row.width();
         assert!(
