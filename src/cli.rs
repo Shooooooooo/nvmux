@@ -27,6 +27,7 @@ use crate::transport::Location;
                   after you detach; the editor runs on the session host and all \
                   rendering happens locally.",
     after_help = "Ctrl-t d detaches, leaving the session running. \
+                  Ctrl-t ? lists the keys. \
                   :q ends the session, because the editor is the session."
 )]
 pub struct Cli {

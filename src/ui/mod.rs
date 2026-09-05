@@ -4,11 +4,13 @@
 //!
 //! The whole screen is a centered list of session names and one dimmed line of
 //! keybind hints on the last row. No borders, no title bar, no status header, no
-//! logo, no metadata columns, no help popup. The picker's own prompts — the
+//! logo, no metadata columns, no help popup — the hint line *is* the picker's
+//! help, and the one help screen there is ([`help`], `Ctrl-t ?`) is a whole
+//! screen of its own, never a box over anything. The picker's own prompts — the
 //! filter and the kill confirm — replace the hint line *in place* rather than
 //! opening a modal or a bordered popup.
 //!
-//! # Two screens, one visual language
+//! # Three screens, one visual language
 //!
 //! Naming is the exception, and it is a screen rather than a popup for the same
 //! reason the contract forbids popups. [`prompt`] owns the whole terminal: it is
@@ -17,17 +19,25 @@
 //! inline create prompt and a full-screen one drifting apart, which is what the
 //! picker used to have.
 //!
-//! The two screens share a vocabulary: centred content, a `label: value` line,
-//! one dim hint row on the last line, no borders, no colour. What the prompt
-//! adds is weight — bold for the label, plain for what you type, dim for the
-//! default — because it covers whatever you were looking at and has to carry
-//! the whole screen on its own. That is also why its labels are wordier than a
-//! hint row would be: `new session name:` and `rename "dotfiles" to:` both name
-//! what is happening, since the list that would have said so is hidden.
+//! The screens share a vocabulary: centred content, a `label: value` line, one
+//! dim hint row on the last line, no borders, no colour. What the prompt adds
+//! is weight — bold for the label, plain for what you type, dim for the default
+//! — because it covers whatever you were looking at and has to carry the whole
+//! screen on its own. That is also why its labels are wordier than a hint row
+//! would be: `new session name:` and `rename "dotfiles" to:` both name what is
+//! happening, since the list that would have said so is hidden.
 //!
 //! `prompt::run` owns a terminal for `Ctrl-t c`, which arrives with none;
 //! `prompt::run_on` borrows the picker's. Nesting the two would enter the
 //! alternate screen twice and leave it once.
+//!
+//! [`help`] is the third: the key list `Ctrl-t ?` shows over an attached
+//! session. It is a screen rather than an overlay for a harder reason than
+//! taste. What it would pop up over is Neovim's screen, and [`crate::pty`]
+//! never writes into the child's output — so taking the terminal, clearing it,
+//! and letting the client repaint afterwards is the only overlay nvmux can
+//! draw. Like the prompt it hides the session, draws, and hands the same client
+//! back; it shares the same vocabulary and adds nothing to it.
 //!
 //! # There is no preview pane, and there must never be one
 //!
@@ -76,6 +86,7 @@
 
 pub mod app;
 pub mod draw;
+pub mod help;
 pub mod prompt;
 
 /// What the picker returned.
@@ -230,6 +241,18 @@ mod tests {
         assert_eq!(
             translate(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
             Key::Char('c')
+        );
+    }
+
+    /// Ctrl-t gets no key of its own; only Ctrl-c, Ctrl-n and Ctrl-p do.
+    /// `help::on_key` relies on this: `Ctrl-t` typed on the help screen has
+    /// to look like a plain `t`, which that screen ignores, or a chord typed
+    /// there would be half-forwarded.
+    #[test]
+    fn ctrl_t_arrives_as_a_plain_t() {
+        assert_eq!(
+            translate(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+            Key::Char('t')
         );
     }
 

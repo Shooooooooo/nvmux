@@ -100,6 +100,7 @@ reimplementing it.
 | `Ctrl-t` `d` | detach — leaves the session running, exits nvmux |
 | `Ctrl-t` `t` | back to the picker, session still attached |
 | `Ctrl-t` `c` | name a new session and attach to it — `Esc` goes back |
+| `Ctrl-t` `?` | show these keys — `Esc` goes back |
 | `Ctrl-t` `Ctrl-t` | send a literal `Ctrl-t` to Neovim |
 
 `Ctrl-t c` hides the session and asks for a name in the middle of the screen —
@@ -115,6 +116,12 @@ cursor on its first letter — so it occupies exactly the columns your own name
 will, and pressing enter straight away names the session that. Typing replaces
 it. A name that is already taken is reported in place, with what you typed still
 there to fix.
+
+`Ctrl-t ?` hides the session and lists these keys in the middle of the screen;
+`Esc`, `q`, `Enter`, `?` or `Ctrl-c` puts the session back exactly where it was.
+Other keys do nothing while the help is open — go back first, then press the
+chord. If you had a `<C-t>?` mapping in Neovim, `Ctrl-t Ctrl-t ?` still reaches
+it.
 
 Everything else goes to Neovim untouched — including `Ctrl-c`, `Ctrl-z` and
 `Ctrl-s`, which reach the editor as ordinary keys rather than becoming signals

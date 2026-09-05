@@ -104,6 +104,11 @@ pub enum Outcome {
     /// this, because the prompt can be cancelled and the user put straight back
     /// where they were.
     CreateNew,
+    /// `Ctrl-t ?` — show the key bindings. Like [`Outcome::ToPicker`] and
+    /// [`Outcome::CreateNew`] the child keeps running and comes back alongside
+    /// this: the help is read, dismissed, and the user put straight back where
+    /// they were.
+    ShowHelp,
     /// The child exited on its own.
     ChildExited,
 }
@@ -247,11 +252,11 @@ pub fn relay(mut attachment: Attachment) -> Result<(Outcome, Option<Attachment>)
     let outcome = pump(&mut attachment, master_fd, &winch);
 
     match outcome {
-        // The picker and the new-session prompt both keep the child, so there is
-        // no restore sequence to wait for; ratatui is about to own the screen
-        // anyway. Either one can be backed out of, and resuming a live client is
-        // what makes that free.
-        Ok(held @ (Outcome::ToPicker | Outcome::CreateNew)) => {
+        // The picker, the new-session prompt and the help screen all keep the
+        // child, so there is no restore sequence to wait for; ratatui is about
+        // to own the screen anyway. Each of them ends back at a live client,
+        // and resuming one is what makes that free.
+        Ok(held @ (Outcome::ToPicker | Outcome::CreateNew | Outcome::ShowHelp)) => {
             raw.restore();
             Ok((held, Some(attachment)))
         }
@@ -362,6 +367,7 @@ fn pump(attachment: &mut Attachment, master_fd: RawFd, winch: &winch::Winch) -> 
                                 return Ok(Outcome::Detached);
                             }
                             Step::Act(Action::Create) => return Ok(Outcome::CreateNew),
+                            Step::Act(Action::Help) => return Ok(Outcome::ShowHelp),
                         }
                     }
                 }

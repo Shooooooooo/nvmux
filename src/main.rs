@@ -45,8 +45,9 @@ fn run(cli: &Cli) -> Result<()> {
 ///
 /// The attachment is carried across iterations so that `Ctrl-t t` can come back
 /// to the *same* client rather than starting a new one, which is what makes
-/// returning to the picker feel free. `Ctrl-t c` rides on the same machinery:
-/// the client survives the prompt, so cancelling it costs nothing either.
+/// returning to the picker feel free. `Ctrl-t c` and `Ctrl-t ?` ride on the
+/// same machinery: the client survives the prompt and the help screen, so
+/// backing out of either costs nothing.
 fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     let mut attached: Option<pty::Attachment> = None;
     let mut message: Option<String> = None;
@@ -102,6 +103,14 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     if let ui::prompt::Outcome::Created(session) = ui::prompt::run(transport)? {
                         current = session;
                     }
+                    continue;
+                }
+                (pty::Outcome::ShowHelp, held) => {
+                    // Ctrl-t ?: show the bindings, then straight back. The
+                    // client is held for the same reason as Ctrl-t c, and
+                    // `current` is unchanged, so the match above resumes it.
+                    attached = held;
+                    ui::help::run()?;
                     continue;
                 }
             }

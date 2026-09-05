@@ -15,15 +15,28 @@
 //! | `C-t` `t`          | back to the picker; the child keeps running         |
 //! | `C-t` `d`          | detach: kill the local UI, leave the server running |
 //! | `C-t` `c`          | create a new session and attach to it               |
+//! | `C-t` `?`          | show the key bindings; the child keeps running      |
 //! | `C-t` `C-t`        | send one literal `C-t` to Neovim                    |
 //! | `C-t` *other*      | send `C-t` then that byte                           |
 //! | `C-t` then silence | send `C-t`                                          |
 //!
 //! Note what is *not* here: `Ctrl-z` (0x1a) is not special-cased. It is
 //! forwarded like any other byte and Neovim receives it as a key.
+//!
+//! # One table
+//!
+//! The command rows above are prose. The code's copy is [`BINDINGS`]: it is
+//! what [`Prefix::feed`] consults, what the tests iterate, and what the help
+//! screen (`C-t ?`, [`crate::ui::help`]) renders, so a command cannot be added
+//! without appearing in the help. This table, the README's "While attached"
+//! table and `--help` are the prose copies, and they are what can go stale.
 
 /// `Ctrl-t`.
 pub const PREFIX: u8 = 0x14;
+
+/// How the prefix is spelled for people: on the help screen, in the README and
+/// in `--help`. A test ties it to [`PREFIX`].
+pub const PREFIX_LABEL: &str = "Ctrl-t";
 
 /// How long to wait for the second byte of a prefix sequence before deciding
 /// the user meant a literal `Ctrl-t`.
@@ -38,6 +51,8 @@ pub enum Action {
     Detach,
     /// `C-t c` — create a new session and attach to it.
     Create,
+    /// `C-t ?` — show the key bindings. The child stays alive.
+    Help,
 }
 
 /// One instruction from the machine, in order.
@@ -47,6 +62,54 @@ pub enum Step {
     Forward(Vec<u8>),
     /// Do this.
     Act(Action),
+}
+
+/// One `C-t` command: the byte that selects it, what it does, and how the help
+/// screen describes it.
+///
+/// This table is the only place a command exists. [`Prefix::feed`] runs on it,
+/// the tests iterate it, and the help screen renders it, so a command cannot
+/// be added without appearing in the help.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Binding {
+    /// The byte typed after the prefix. Printable ASCII, so the help screen
+    /// can show it as itself.
+    pub key: u8,
+    pub action: Action,
+    /// One line, in terms of what happens to the user.
+    pub help: &'static str,
+}
+
+/// Every command, in the order the help screen lists them.
+pub const BINDINGS: &[Binding] = &[
+    Binding {
+        key: b't',
+        action: Action::Picker,
+        help: "back to the picker, session still attached",
+    },
+    Binding {
+        key: b'd',
+        action: Action::Detach,
+        help: "detach and exit, session still running",
+    },
+    Binding {
+        key: b'c',
+        action: Action::Create,
+        help: "name a new session and attach to it",
+    },
+    Binding {
+        key: b'?',
+        action: Action::Help,
+        help: "show this help",
+    },
+];
+
+/// The command a second byte selects, if any.
+///
+/// Linear over a handful of rows; a `match` would be no faster and would be a
+/// second copy of the table.
+pub fn command(byte: u8) -> Option<Action> {
+    BINDINGS.iter().find(|b| b.key == byte).map(|b| b.action)
 }
 
 /// The prefix state machine.
@@ -78,27 +141,18 @@ impl Prefix {
         for &b in input {
             if self.armed {
                 self.armed = false;
-                match b {
-                    // C-t C-t: one literal prefix byte reaches Neovim.
-                    PREFIX => pending.push(PREFIX),
-                    b't' => {
-                        flush(&mut steps, &mut pending);
-                        steps.push(Step::Act(Action::Picker));
-                    }
-                    b'd' => {
-                        flush(&mut steps, &mut pending);
-                        steps.push(Step::Act(Action::Detach));
-                    }
-                    b'c' => {
-                        flush(&mut steps, &mut pending);
-                        steps.push(Step::Act(Action::Create));
-                    }
+                if b == PREFIX {
+                    // C-t C-t: one literal prefix byte reaches Neovim. Checked
+                    // before the table, so no row can ever shadow it.
+                    pending.push(PREFIX);
+                } else if let Some(action) = command(b) {
+                    flush(&mut steps, &mut pending);
+                    steps.push(Step::Act(action));
+                } else {
                     // Anything else was not a command, so the user's original
                     // keystrokes are replayed in order and nothing is eaten.
-                    other => {
-                        pending.push(PREFIX);
-                        pending.push(other);
-                    }
+                    pending.push(PREFIX);
+                    pending.push(b);
                 }
             } else if b == PREFIX {
                 self.armed = true;
@@ -194,18 +248,15 @@ mod tests {
 
     #[test]
     fn commands_produce_actions_and_no_bytes() {
-        for (byte, want) in [
-            (b't', Action::Picker),
-            (b'd', Action::Detach),
-            (b'c', Action::Create),
-        ] {
+        // By value: `Binding` is `Copy`, and a `&u8` cannot sit in a `[u8; 2]`.
+        for &Binding { key, action, .. } in BINDINGS {
             let mut p = Prefix::new();
-            let steps = p.feed(&[PREFIX, byte]);
-            assert_eq!(actions(&steps), vec![want], "for {:?}", byte as char);
+            let steps = p.feed(&[PREFIX, key]);
+            assert_eq!(actions(&steps), vec![action], "for {:?}", key as char);
             assert!(
                 forwarded(&steps).is_empty(),
                 "command bytes must not reach nvim: {:?}",
-                byte as char
+                key as char
             );
             assert!(!p.is_armed());
         }
@@ -213,6 +264,10 @@ mod tests {
 
     #[test]
     fn unknown_command_replays_both_bytes_in_order() {
+        assert!(
+            command(b'x').is_none(),
+            "this test needs a byte that is not a command"
+        );
         let mut p = Prefix::new();
         let steps = p.feed(&[PREFIX, b'x']);
         assert_eq!(forwarded(&steps), vec![PREFIX, b'x']);
@@ -296,10 +351,12 @@ mod tests {
     #[test]
     fn several_commands_in_one_chunk() {
         let mut p = Prefix::new();
-        let steps = p.feed(b"\x14t\x14d\x14c");
+        // Literal bytes on purpose: this is what pins each letter to its
+        // action, independently of what `BINDINGS` says.
+        let steps = p.feed(b"\x14t\x14d\x14c\x14?");
         assert_eq!(
             actions(&steps),
-            vec![Action::Picker, Action::Detach, Action::Create]
+            vec![Action::Picker, Action::Detach, Action::Create, Action::Help]
         );
         assert!(forwarded(&steps).is_empty());
     }
@@ -327,19 +384,100 @@ mod tests {
         for b in 0u8..=255 {
             let mut p = Prefix::new();
             let steps = p.feed(&[PREFIX, b]);
-            match b {
-                b't' | b'd' | b'c' => {
-                    assert_eq!(actions(&steps).len(), 1, "byte {b:#04x} should act");
-                    assert!(forwarded(&steps).is_empty(), "byte {b:#04x} leaked bytes");
-                }
-                PREFIX => assert_eq!(forwarded(&steps), vec![PREFIX]),
-                _ => assert_eq!(
+            // Same order as `feed`: the literal rule first, then the table.
+            if b == PREFIX {
+                assert_eq!(forwarded(&steps), vec![PREFIX]);
+            } else if let Some(action) = command(b) {
+                assert_eq!(actions(&steps), vec![action], "byte {b:#04x} should act");
+                assert!(forwarded(&steps).is_empty(), "byte {b:#04x} leaked bytes");
+            } else {
+                assert_eq!(
                     forwarded(&steps),
                     vec![PREFIX, b],
                     "byte {b:#04x} must be replayed after the prefix"
-                ),
+                );
             }
             assert!(!p.is_armed(), "byte {b:#04x} left the machine armed");
         }
+    }
+
+    #[test]
+    fn question_mark_after_the_prefix_is_help_not_a_replayed_byte() {
+        let mut p = Prefix::new();
+        let steps = p.feed(&[PREFIX, b'?']);
+        assert_eq!(actions(&steps), vec![Action::Help]);
+        assert!(forwarded(&steps).is_empty());
+        assert!(!p.is_armed());
+    }
+
+    /// `C-t ?` used to be replayed to Neovim as two bytes. This is the way to
+    /// still send it, and it must keep working.
+    #[test]
+    fn a_literal_prefix_then_question_mark_still_reaches_neovim() {
+        let mut p = Prefix::new();
+        let steps = p.feed(&[PREFIX, PREFIX, b'?']);
+        assert_eq!(forwarded(&steps), vec![PREFIX, b'?']);
+        assert!(actions(&steps).is_empty());
+    }
+
+    /// Rust cannot enumerate an enum, so the list is kept here by hand. The
+    /// `match` is exhaustive on purpose: a new variant fails to compile until
+    /// it is added to the list, and then the count fails until it has a row.
+    #[test]
+    fn the_table_binds_every_action_exactly_once() {
+        let all = [Action::Picker, Action::Detach, Action::Create, Action::Help];
+        for action in all {
+            match action {
+                Action::Picker | Action::Detach | Action::Create | Action::Help => {}
+            }
+            assert_eq!(
+                BINDINGS.iter().filter(|b| b.action == action).count(),
+                1,
+                "{action:?} must have exactly one key"
+            );
+        }
+        assert_eq!(
+            BINDINGS.len(),
+            all.len(),
+            "a new command needs a row here and above"
+        );
+    }
+
+    #[test]
+    fn command_keys_are_distinct_printable_and_never_the_prefix() {
+        for (i, a) in BINDINGS.iter().enumerate() {
+            assert!(
+                a.key.is_ascii_graphic(),
+                "byte {:#04x} cannot be shown on the help screen",
+                a.key
+            );
+            // The literal rule runs before the table, so a PREFIX row would be
+            // a help-screen lie that never fires.
+            assert_ne!(a.key, PREFIX);
+            for b in &BINDINGS[i + 1..] {
+                assert_ne!(a.key, b.key, "two commands share {:?}", a.key as char);
+            }
+        }
+    }
+
+    #[test]
+    fn every_binding_has_a_one_line_description() {
+        for b in BINDINGS {
+            assert!(!b.help.is_empty(), "{:?} has no description", b.key as char);
+            assert!(
+                !b.help.contains('\n'),
+                "{:?} has a multi-line description",
+                b.key as char
+            );
+        }
+    }
+
+    /// The label is what the help screen and the README print; the byte is
+    /// what the machine matches. Derive one from the other so they cannot
+    /// disagree.
+    #[test]
+    fn the_prefix_label_names_the_prefix_byte() {
+        let letter = PREFIX_LABEL.chars().last().expect("a label");
+        assert_eq!(letter as u8 & 0x1f, PREFIX);
     }
 }
