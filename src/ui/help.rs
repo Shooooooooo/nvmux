@@ -23,9 +23,8 @@
 use std::borrow::Cow;
 
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
-use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::layout::Rect;
+use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
@@ -149,19 +148,10 @@ fn draw(frame: &mut Frame, rows: &[Row]) {
         return;
     }
 
-    // Same split as the picker, so the screens line up.
-    let body = Rect {
-        height: area.height.saturating_sub(1),
-        ..area
-    };
-    let bottom = Rect {
-        y: area.y + area.height - 1,
-        height: 1,
-        ..area
-    };
+    let (body, bottom) = draw::split_hint_row(area);
 
     draw_table(frame, rows, body);
-    draw_hints(frame, bottom);
+    draw::draw_hint_row(frame, bottom, HINTS, true);
 }
 
 /// One left-aligned block, centred on both axes.
@@ -195,48 +185,17 @@ fn draw_table(frame: &mut Frame, rows: &[Row], area: Rect) {
     frame.render_widget(Paragraph::new(lines), block);
 }
 
-fn draw_hints(frame: &mut Frame, area: Rect) {
-    let text = draw::truncate(HINTS, area.width as usize);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            text,
-            Style::default().add_modifier(Modifier::DIM),
-        )))
-        .alignment(Alignment::Center),
-        area,
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::keys::{Prefix, PREFIX, PREFIX_LABEL};
     use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
     use ratatui::Terminal;
 
-    /// Reconstruct the rendered lines, skipping the filler cell that follows a
-    /// wide glyph so a CJK name is not reported as three columns per character.
     fn render(w: u16, h: u16) -> Vec<String> {
         let rows = rows(PREFIX_LABEL);
-        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
-        terminal.draw(|f| draw(f, &rows)).expect("draw");
-        let buf = terminal.backend().buffer().clone();
-        (0..buf.area.height)
-            .map(|y| {
-                let mut line = String::new();
-                let mut skip = 0u16;
-                for x in 0..buf.area.width {
-                    if skip > 0 {
-                        skip -= 1;
-                        continue;
-                    }
-                    let sym = buf[(x, y)].symbol();
-                    skip = sym.width().saturating_sub(1) as u16;
-                    line.push_str(sym);
-                }
-                line.trim_end().to_string()
-            })
-            .collect()
+        super::super::test_support::render(w, h, |f| draw(f, &rows))
     }
 
     /// The line a row was drawn on. Matched on the *start* of the line rather
@@ -516,25 +475,7 @@ mod tests {
     /// No SGR colour, so the screen is correct under NO_COLOR by construction.
     #[test]
     fn nothing_sets_a_colour() {
-        use ratatui::style::Color;
         let rows = rows(PREFIX_LABEL);
-        let mut terminal = Terminal::new(TestBackend::new(62, 11)).expect("terminal");
-        terminal.draw(|f| draw(f, &rows)).expect("draw");
-        let buf = terminal.backend().buffer().clone();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                let cell = &buf[(x, y)];
-                assert_eq!(
-                    cell.fg,
-                    Color::Reset,
-                    "cell ({x},{y}) set a foreground colour"
-                );
-                assert_eq!(
-                    cell.bg,
-                    Color::Reset,
-                    "cell ({x},{y}) set a background colour"
-                );
-            }
-        }
+        super::super::test_support::assert_no_colour(62, 11, |f| draw(f, &rows));
     }
 }

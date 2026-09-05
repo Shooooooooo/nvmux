@@ -45,9 +45,6 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 /// user's editor, so a shorter budget marks healthy sessions dead.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The read timeout for something the user explicitly asked for.
-pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// A connected RPC channel, generic over the byte stream so the same code serves
 /// a local socket, the local end of an SSH forward, and a pipe in tests.
 pub struct Client<S: Read + Write> {
@@ -90,13 +87,6 @@ impl Client<UnixStream> {
         let mut client = Self::new(stream);
         client.read_timeout = read_timeout;
         Ok(client)
-    }
-
-    /// Change the read timeout on an established connection.
-    pub fn set_timeout(&mut self, timeout: Duration) -> Result<(), RpcError> {
-        self.io.get_ref().set_read_timeout(Some(timeout))?;
-        self.read_timeout = timeout;
-        Ok(())
     }
 }
 
@@ -326,6 +316,10 @@ impl std::fmt::Display for ApiInfo {
 /// Display and logging only. Pass a handle **back** to Neovim as the original
 /// [`Value::Ext`] verbatim — an integer that happens to be 0 means "the current
 /// buffer" and answers plausibly for the wrong one.
+///
+/// nvmux makes no handle-based calls today, so this lives with its test as the
+/// reference for whoever adds one.
+#[cfg(test)]
 pub fn ext_to_handle(v: &Value) -> Option<i64> {
     match v {
         Value::Ext(_type_code, data) => rmpv::decode::read_value(&mut &data[..])

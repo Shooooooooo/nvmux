@@ -30,8 +30,6 @@ pub enum Liveness {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionState {
     pub liveness: Liveness,
-    /// Number of attached UIs, when known.
-    pub attached_uis: Option<usize>,
     /// The number the picker shows and `<prefix> <n>` selects, resolved by
     /// [`crate::transport::finish_listing`] from the stored [`Session::num`].
     ///
@@ -83,10 +81,6 @@ impl Session {
             num,
             state: SessionState::default(),
         }
-    }
-
-    pub fn is_alive(&self) -> bool {
-        matches!(self.state.liveness, Liveness::Alive | Liveness::Busy)
     }
 
     /// Parse `<id>.json` contents.
@@ -150,11 +144,26 @@ pub fn validate_name(name: &str) -> Result<(), SessionError> {
         return invalid("must not start or end with whitespace");
     }
     // Control characters would corrupt the picker's rendering and could smuggle
-    // escape sequences into the terminal via a session listing.
-    if name.chars().any(|c| c.is_control()) {
-        return invalid("must not contain control characters");
+    // escape sequences into the terminal via a session listing; the invisible
+    // formatting characters can reorder or hide what the listing shows.
+    if name.chars().any(is_unrenderable) {
+        return invalid("must not contain control or invisible formatting characters");
     }
     Ok(())
+}
+
+/// A character that a session listing cannot show honestly: a control
+/// character, or one of the zero-width and bidirectional-formatting characters
+/// that change how the *surrounding* text reads without occupying a cell.
+fn is_unrenderable(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'..='\u{200F}' // zero-width space/joiners, LRM, RLM
+            | '\u{202A}'..='\u{202E}' // bidi embeddings and overrides
+            | '\u{2066}'..='\u{2069}' // bidi isolates
+            | '\u{FEFF}' // zero-width no-break space
+        )
 }
 
 fn now_secs() -> u64 {
@@ -194,7 +203,7 @@ mod tests {
     fn state_never_reaches_disk() {
         let mut s = Session::new("abcdefgh".into(), "x".into(), 1, 1);
         s.state.liveness = Liveness::Alive;
-        s.state.attached_uis = Some(3);
+        s.state.num = 3;
         let json = s.to_json().expect("serialise");
         assert!(!json.contains("state"), "runtime state leaked into {json}");
         assert!(
@@ -251,6 +260,12 @@ mod tests {
         assert!(validate_name("two\nlines").is_err());
         assert!(validate_name("esc\x1b[31m").is_err());
         assert!(validate_name(&"x".repeat(65)).is_err());
+        // Invisible formatting: a right-to-left override reverses how the
+        // rest of the row reads, a zero-width space hides a word boundary.
+        assert!(validate_name("abc\u{202E}def").is_err());
+        assert!(validate_name("abc\u{200B}def").is_err());
+        assert!(validate_name("\u{FEFF}abc").is_err());
+        assert!(validate_name("abc\u{2066}def").is_err());
     }
 
     #[test]

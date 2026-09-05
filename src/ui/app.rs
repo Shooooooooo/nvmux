@@ -105,6 +105,13 @@ impl App {
             .collect()
     }
 
+    /// The session with this id, from the list the picker is showing. What a
+    /// [`Request`] carrying an id resolves against, so acting on a row costs no
+    /// round trip beyond the action itself.
+    pub fn session(&self, id: &str) -> Option<&Session> {
+        self.sessions.iter().find(|s| s.id == id)
+    }
+
     pub fn selected_index(&self) -> usize {
         self.selected
     }

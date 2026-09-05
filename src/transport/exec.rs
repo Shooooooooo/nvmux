@@ -30,9 +30,6 @@ pub trait Executor: Send + Sync {
     /// **stdin** and never interpolated into a command string — see
     /// [`crate::shell`].
     fn run_script(&self, script: &str, args: &[&str]) -> Result<Output>;
-
-    /// For error messages only.
-    fn describe(&self) -> &str;
 }
 
 /// Runs scripts on this machine.
@@ -62,10 +59,6 @@ impl Executor for LocalExecutor {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             status: out.status.code().unwrap_or(-1),
         })
-    }
-
-    fn describe(&self) -> &str {
-        "local"
     }
 }
 

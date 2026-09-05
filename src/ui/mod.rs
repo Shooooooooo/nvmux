@@ -32,6 +32,8 @@ pub mod draw;
 pub mod help;
 pub mod prompt;
 pub mod setup;
+#[cfg(test)]
+mod test_support;
 
 /// What the picker returned.
 #[derive(Debug, Clone)]
@@ -178,12 +180,8 @@ fn run_loop(
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 deadline = None;
                 if let Request::Attach(id) = app.resolve_pending() {
-                    match find(transport, &id)? {
-                        Some(session) => break 'ui Outcome::Attach { session, highest },
-                        None => {
-                            app.set_message("that session is gone");
-                            refresh(&mut app, &mut highest, transport)?;
-                        }
+                    if let Some(session) = app.session(&id).cloned() {
+                        break 'ui Outcome::Attach { session, highest };
                     }
                 }
             }
@@ -199,47 +197,55 @@ fn run_loop(
             Instant::now() + Duration::from_millis(crate::settings::get().keys.timeout_ms)
         });
 
+        // Every request names a row the picker is showing, so it is resolved
+        // against the list in hand rather than a fresh listing: over SSH each
+        // listing is a script run (~230 ms), and the action itself finds out
+        // soon enough if the session has gone in the meantime — an attach
+        // pings before spawning, a kill reports "absent", a rename reports
+        // "not found". The list is re-read only after something changed it.
         match request {
             Request::None => {}
             Request::Quit => break 'ui Outcome::Quit,
 
             Request::Attach(id) => {
-                if let Some(session) = find(transport, &id)? {
+                if let Some(session) = app.session(&id).cloned() {
                     break 'ui Outcome::Attach { session, highest };
                 }
-                app.set_message("that session is gone");
-                refresh(&mut app, &mut highest, transport)?;
             }
 
             Request::NewSession => {
-                if let prompt::Outcome::Created(session) =
-                    prompt::run_on(terminal, transport, prompt::Task::Create, false)?
-                {
-                    // The new session is the highest by construction when it
-                    // appends, but it may have refilled a gap — so take the
-                    // larger of the two rather than assuming.
-                    break 'ui Outcome::Attach {
-                        highest: highest.max(session.state.num),
-                        session,
-                    };
+                match prompt::run_on(terminal, transport, prompt::Task::Create, false)? {
+                    prompt::Outcome::Created(session) => {
+                        // The new session is the highest by construction when
+                        // it appends, but it may have refilled a gap — so take
+                        // the larger of the two rather than assuming.
+                        break 'ui Outcome::Attach {
+                            highest: highest.max(session.state.num),
+                            session,
+                        };
+                    }
+                    prompt::Outcome::Cancelled => {}
+                    prompt::Outcome::Renamed => refresh(&mut app, &mut highest, transport)?,
                 }
-                refresh(&mut app, &mut highest, transport)?;
             }
 
             Request::RenameSession(id) => {
-                if let Some(session) = find(transport, &id)? {
-                    prompt::run_on(terminal, transport, prompt::Task::Rename(&session), false)?;
+                if let Some(session) = app.session(&id).cloned() {
+                    let outcome =
+                        prompt::run_on(terminal, transport, prompt::Task::Rename(&session), false)?;
+                    if !matches!(outcome, prompt::Outcome::Cancelled) {
+                        refresh(&mut app, &mut highest, transport)?;
+                    }
                 }
-                refresh(&mut app, &mut highest, transport)?;
             }
 
             Request::Kill(id) => {
-                if let Some(session) = find(transport, &id)? {
+                if let Some(session) = app.session(&id).cloned() {
                     if let Err(e) = transport.kill_session(&session) {
                         app.set_message(one_line(&e));
                     }
+                    refresh(&mut app, &mut highest, transport)?;
                 }
-                refresh(&mut app, &mut highest, transport)?;
             }
         }
     };
@@ -263,10 +269,6 @@ fn refresh(app: &mut App, highest: &mut u32, transport: &dyn Transport) -> Resul
 /// The largest resolved session number in a listing, or 0 for none.
 pub fn highest_num(sessions: &[Session]) -> u32 {
     sessions.iter().map(|s| s.state.num).max().unwrap_or(0)
-}
-
-fn find(transport: &dyn Transport, id: &str) -> Result<Option<Session>> {
-    Ok(transport.list_sessions()?.into_iter().find(|s| s.id == id))
 }
 
 /// Collapse an error to something that fits on one line.
@@ -362,7 +364,16 @@ mod tests {
 
     #[test]
     fn errors_are_flattened_to_one_line() {
-        let e = crate::error::NvmuxError::Unimplemented("a\nmultiline\nthing");
+        let e = crate::error::NvmuxError::Session(crate::error::SessionError::NotReady {
+            name: "x".into(),
+            timeout: Duration::from_secs(1),
+            log: "x.log".into(),
+            log_tail: "a\nmultiline\nthing".into(),
+        });
+        assert!(
+            e.to_string().contains('\n'),
+            "the fixture must be multi-line"
+        );
         assert!(!one_line(&e).contains('\n'));
     }
 }

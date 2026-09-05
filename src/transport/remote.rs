@@ -17,7 +17,10 @@ use crate::nvim;
 use crate::session::{Liveness, Session};
 use crate::shell;
 use crate::ssh::Ssh;
-use crate::transport::{finish_listing, protocol, Location, Transport};
+use crate::transport::{
+    ensure_name_free, finish_listing, install_detach_alias, kill_outcome, protocol,
+    wait_until_reachable, Location, Transport, REACHABLE_TIMEOUT,
+};
 
 pub struct SshTransport {
     location: Location,
@@ -211,9 +214,7 @@ impl Transport for SshTransport {
         // The listing doubles as the source of the new session's number; see the
         // local transport.
         let existing = self.list_sessions()?;
-        if existing.iter().any(|s| s.name.eq_ignore_ascii_case(name)) {
-            return Err(SessionError::Exists(name.to_string()).into());
-        }
+        ensure_name_free(&existing, name, None)?;
         let num = crate::transport::next_free_num(&existing);
 
         let id = ids::new_id().map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -237,7 +238,7 @@ impl Transport for SshTransport {
             );
             return Err(SessionError::NotReady {
                 name: name.to_string(),
-                timeout: std::time::Duration::from_secs(5),
+                timeout: REACHABLE_TIMEOUT,
                 log: PathBuf::from(format!("{}:{}/{}.log", self.host(), self.remote_dir, id)),
                 log_tail: out.stderr.trim().to_string(),
             }
@@ -250,18 +251,7 @@ impl Transport for SshTransport {
         self.ssh.forward(&local, &remote_sock)?;
         self.forwarded.lock().map(|mut f| f.insert(id.clone())).ok();
 
-        let mut reachable = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if let Ok(mut c) = crate::rpc::Client::connect(&local, crate::rpc::PROBE_TIMEOUT) {
-                if c.api_info().is_ok() {
-                    reachable = true;
-                    break;
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        if !reachable {
+        if !wait_until_reachable(&local, REACHABLE_TIMEOUT) {
             // A forward succeeding proves nothing: `ssh -O forward` to a
             // nonexistent remote socket still exits 0 and creates a working
             // local socket.
@@ -276,7 +266,7 @@ impl Transport for SshTransport {
             );
             return Err(SessionError::NotReady {
                 name: name.to_string(),
-                timeout: std::time::Duration::from_secs(5),
+                timeout: REACHABLE_TIMEOUT,
                 log: PathBuf::from(format!("{}:{}/{}.log", self.host(), self.remote_dir, id)),
                 log_tail: "the session never answered through the forward".into(),
             }
@@ -285,13 +275,12 @@ impl Transport for SshTransport {
 
         let mut session = Session::new(id.clone(), name.to_string(), spawned.pid.unwrap_or(0), num);
         let json = session.to_json()?;
-        self.run_script(shell::WRITE_META_SCRIPT, &[&self.remote_dir, &id, &json])?;
+        let out = self.run_script(shell::WRITE_META_SCRIPT, &[&self.remote_dir, &id, &json])?;
+        protocol::parse_end(&out.stdout, "metadata write")?;
         // See the local transport: the caller attaches without re-listing.
         session.state.num = num;
 
-        if let Ok(mut client) = crate::rpc::Client::connect(&local, crate::rpc::CONNECT_TIMEOUT) {
-            let _ = client.command("command! -bar Detach detach");
-        }
+        install_detach_alias(&local);
 
         tracing::info!(host = %self.host(), id = %session.id, name, "remote session ready");
         Ok(session)
@@ -312,39 +301,25 @@ impl Transport for SshTransport {
         }
         self.forwarded.lock().map(|mut f| f.remove(&s.id)).ok();
 
-        match outcome {
-            protocol::KillOutcome::Killed | protocol::KillOutcome::Absent => {
-                tracing::info!(host = %self.host(), id = %s.id, "remote session killed");
-                Ok(())
-            }
-            protocol::KillOutcome::Orphaned => Err(SessionError::NotKilled {
-                name: s.name.clone(),
-                reason: "it did not exit, even after SIGKILL",
-            }
-            .into()),
-            protocol::KillOutcome::Unknown => Err(SessionError::NotKilled {
-                name: s.name.clone(),
-                reason: "its socket is still present but the host has no usable \
-                         `ps` or /proc to find the process, so nothing was signalled",
-            }
-            .into()),
-        }
+        kill_outcome(outcome, &s.name)?;
+        tracing::info!(host = %self.host(), id = %s.id, "remote session killed");
+        Ok(())
     }
 
+    /// Writes the record the picker holds, with the name changed, rather than
+    /// re-reading the remote file first: that would be another round trip, and
+    /// the only field a rename may change is the name. A session killed
+    /// between the listing and the confirm gets its metadata rewritten, which
+    /// the next listing's sweep removes again, since its socket is gone.
     fn rename_session(&self, s: &Session, new_name: &str) -> Result<()> {
         crate::session::validate_name(new_name)?;
-        if self
-            .list_sessions()?
-            .iter()
-            .any(|other| other.id != s.id && other.name.eq_ignore_ascii_case(new_name))
-        {
-            return Err(SessionError::Exists(new_name.to_string()).into());
-        }
+        ensure_name_free(&self.list_sessions()?, new_name, Some(&s.id))?;
 
         let mut updated = s.clone();
         updated.name = new_name.to_string();
         let json = updated.to_json()?;
-        self.run_script(shell::WRITE_META_SCRIPT, &[&self.remote_dir, &s.id, &json])?;
+        let out = self.run_script(shell::WRITE_META_SCRIPT, &[&self.remote_dir, &s.id, &json])?;
+        protocol::parse_end(&out.stdout, "metadata write")?;
         tracing::info!(host = %self.host(), id = %s.id, to = new_name, "renamed");
         Ok(())
     }

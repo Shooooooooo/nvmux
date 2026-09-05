@@ -256,10 +256,6 @@ pub enum NvmuxError {
     Config(#[from] ConfigError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-
-    /// A `todo!()` that reports itself politely instead of panicking.
-    #[error("not implemented yet: {0}")]
-    Unimplemented(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, NvmuxError>;

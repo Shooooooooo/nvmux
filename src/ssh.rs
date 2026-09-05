@@ -90,29 +90,24 @@ pub fn cancel_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<S
     args
 }
 
-/// Shut the master down.
-pub fn exit_args(host: &str, ctl: &Path) -> Vec<String> {
-    let mut args = common(ctl);
-    args.extend(["-O".into(), "exit".into(), host.to_string()]);
-    args
-}
-
 /// Arguments for running a script on the remote host, through a **login** shell:
 ///
 /// ```text
-/// exec ${SHELL:-/bin/bash} -l -c 'sh -s "$@"' nvmux <args...>
+/// exec "${SHELL:-/bin/bash}" -l -c 'sh -s "$@"' nvmux <args...>
 /// ```
 ///
 /// A login shell because `ssh host cmd` does not read `.zprofile`, so `nvim` is
-/// off `$PATH` on most real setups. `$SHELL` expands on the *remote* side.
+/// off `$PATH` on most real setups. `$SHELL` expands on the *remote* side —
+/// [`shell::login_shell_wrapper`] is the one place that spells this, so the
+/// tested form and the shipped form are the same string.
 ///
 /// `-n` must never be added: with `sh -s` it silently yields an *empty* result,
 /// because stdin comes from /dev/null and `sh` exits 0.
 pub fn exec_args(host: &str, ctl: &Path, script_args: &[&str]) -> Vec<String> {
     let mut args = common(ctl);
     let remote = format!(
-        "exec ${{SHELL:-/bin/bash}} -l -c {} nvmux {}",
-        shell::quote(r#"sh -s "$@""#),
+        "{} nvmux {}",
+        shell::login_shell_wrapper(r#"sh -s "$@""#),
         shell::quote_all(script_args)
     );
     args.extend([host.to_string(), remote]);
@@ -169,10 +164,6 @@ impl Ssh {
 
     pub fn host(&self) -> &str {
         &self.host
-    }
-
-    pub fn control_path(&self) -> &Path {
-        &self.control_path
     }
 
     fn run(&self, args: &[String]) -> std::io::Result<std::process::Output> {
@@ -282,10 +273,6 @@ impl Ssh {
         let _ = self.run(&cancel_args(&self.host, &self.control_path, local, remote));
         // `-O cancel` returns 0 without removing the file.
         let _ = std::fs::remove_file(local);
-    }
-
-    pub fn exit_master(&self) {
-        let _ = self.run(&exit_args(&self.host, &self.control_path));
     }
 
     pub fn run_script(
@@ -419,8 +406,13 @@ mod tests {
             remote.contains("sh -s"),
             "script must arrive on stdin: {remote}"
         );
-        // $SHELL must expand remotely, so it must not be single-quoted.
+        // $SHELL must expand remotely, so it must not be single-quoted — but it
+        // must be double-quoted, or a value with a space word-splits there.
         assert!(!remote.contains("'${SHELL"), "SHELL was quoted: {remote}");
+        assert!(
+            remote.contains(r#""${SHELL:-/bin/bash}""#),
+            "SHELL must be double-quoted: {remote}"
+        );
     }
 
     /// `-n` plus `sh -s` silently yields an empty result rather than an error.

@@ -14,7 +14,7 @@
 //! nvmux — `C-c`/`C-z` are still selectable as prefixes by editing the config.
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -129,19 +129,15 @@ fn draw(frame: &mut Frame, state: &State) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    // Same split as the picker/help: body above, one dim hint row at the bottom.
-    let body = Rect {
-        height: area.height.saturating_sub(1),
-        ..area
-    };
-    let bottom = Rect {
-        y: area.y + area.height - 1,
-        height: 1,
-        ..area
-    };
+    let (body, bottom) = draw::split_hint_row(area);
 
     draw_body(frame, state, body);
-    draw_hints(frame, state, bottom);
+    let hint = if state.selected.is_some() {
+        "⏎ confirm   esc skip"
+    } else {
+        "⏎ keep   esc skip"
+    };
+    draw::draw_hint_row(frame, bottom, hint, true);
 }
 
 fn draw_body(frame: &mut Frame, state: &State, area: Rect) {
@@ -174,23 +170,6 @@ fn draw_body(frame: &mut Frame, state: &State, area: Rect) {
     let width = lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
     let block = draw::centre(area, width, lines.len() as u16);
     frame.render_widget(Paragraph::new(lines), block);
-}
-
-fn draw_hints(frame: &mut Frame, state: &State, area: Rect) {
-    let hint = if state.selected.is_some() {
-        "⏎ confirm   esc skip"
-    } else {
-        "⏎ keep   esc skip"
-    };
-    let text = draw::truncate(hint, area.width as usize);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            text,
-            Style::default().add_modifier(Modifier::DIM),
-        )))
-        .alignment(Alignment::Center),
-        area,
-    );
 }
 
 #[cfg(test)]

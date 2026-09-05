@@ -9,9 +9,11 @@ pub mod local;
 pub mod protocol;
 pub mod remote;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use crate::error::{NvmuxError, Result};
+use crate::error::{NvmuxError, Result, SessionError};
+use crate::rpc;
 use crate::session::Session;
 
 /// Where a set of sessions lives.
@@ -68,6 +70,83 @@ pub fn open(location: Location) -> Result<Box<dyn Transport>> {
     match location {
         Location::Local => Ok(Box::new(local::LocalTransport::new()?)),
         Location::Ssh(host) => Ok(Box::new(remote::SshTransport::new(host)?)),
+    }
+}
+
+// --- shared between the two transports -------------------------------------
+
+/// How long to wait for a new session's socket to appear and accept a
+/// connection. A *reachability* budget, not a readiness one: a config that
+/// clones plugins on first run can take far longer than any timeout worth
+/// having here, and a session that is still starting is a good session.
+pub(crate) const REACHABLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+const REACHABLE_POLL: Duration = Duration::from_millis(25);
+
+/// Wait until the socket accepts a connection and a real Neovim answers.
+/// Deliberately *not* a deferred call — see [`crate::rpc`]. Over SSH `sock` is
+/// the local end of the forward, which also proves the forward works.
+pub(crate) fn wait_until_reachable(sock: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(mut client) = rpc::Client::connect(sock, rpc::PROBE_TIMEOUT) {
+            if client.api_info().is_ok() {
+                return true;
+            }
+        }
+        std::thread::sleep(REACHABLE_POLL);
+    }
+    false
+}
+
+/// Names carry no identity, but two identical ones in a picker is a usability
+/// trap, so a name is refused if another session already has it — compared
+/// case-insensitively. `except` is the session being renamed, which may of
+/// course keep its own name.
+pub(crate) fn ensure_name_free(
+    existing: &[Session],
+    name: &str,
+    except: Option<&str>,
+) -> Result<()> {
+    let taken = existing
+        .iter()
+        .any(|s| except != Some(s.id.as_str()) && s.name.eq_ignore_ascii_case(name));
+    if taken {
+        return Err(SessionError::Exists(name.to_string()).into());
+    }
+    Ok(())
+}
+
+/// What a kill script outcome means for the caller. Files are removed by the
+/// script only once the session is genuinely gone; claiming success on the
+/// other outcomes would drop it from the picker while its Neovim kept running,
+/// with no socket left to ever find it by.
+pub(crate) fn kill_outcome(outcome: protocol::KillOutcome, name: &str) -> Result<()> {
+    use protocol::KillOutcome;
+    match outcome {
+        KillOutcome::Killed | KillOutcome::Absent => Ok(()),
+        KillOutcome::Orphaned => Err(SessionError::NotKilled {
+            name: name.to_string(),
+            reason: "it did not exit, even after SIGKILL",
+        }
+        .into()),
+        KillOutcome::Unknown => Err(SessionError::NotKilled {
+            name: name.to_string(),
+            reason: "its socket is still present but no usable `ps` or /proc was \
+                     available to find the process, so nothing was signalled",
+        }
+        .into()),
+    }
+}
+
+/// Give a new session a way out that is not `:q`. `command!` requires an
+/// uppercase name (`command! q` is E183), so this cannot shadow `:q` itself.
+/// Failure is not worth failing the create over.
+pub(crate) fn install_detach_alias(sock: &Path) {
+    if let Ok(mut client) = rpc::Client::connect(sock, rpc::CONNECT_TIMEOUT) {
+        if let Err(e) = client.command("command! -bar Detach detach") {
+            tracing::debug!(error = %e, "could not install the :Detach alias");
+        }
     }
 }
 
@@ -137,6 +216,31 @@ impl From<NvmuxError> for std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_taken_name_is_refused_case_insensitively_except_for_its_own_session() {
+        let existing = vec![session("aaa", 1, 1), session("bbb", 2, 2)];
+        assert!(ensure_name_free(&existing, "name-aaa", None).is_err());
+        assert!(ensure_name_free(&existing, "NAME-AAA", None).is_err());
+        assert!(ensure_name_free(&existing, "name-ccc", None).is_ok());
+        // A rename to its own name (or its own name in another case) is fine.
+        assert!(ensure_name_free(&existing, "Name-aaa", Some("aaa")).is_ok());
+        assert!(ensure_name_free(&existing, "name-bbb", Some("aaa")).is_err());
+    }
+
+    #[test]
+    fn only_killed_and_absent_count_as_killed() {
+        use protocol::KillOutcome::*;
+        assert!(kill_outcome(Killed, "x").is_ok());
+        assert!(kill_outcome(Absent, "x").is_ok());
+        for outcome in [Orphaned, Unknown] {
+            let err = kill_outcome(outcome, "x").expect_err("not killed");
+            assert!(matches!(
+                err,
+                NvmuxError::Session(SessionError::NotKilled { .. })
+            ));
+        }
+    }
 
     /// `created` is what orders the unnumbered ones, so it is set explicitly.
     fn session(id: &str, num: u32, created: u64) -> Session {

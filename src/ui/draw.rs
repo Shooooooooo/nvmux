@@ -50,8 +50,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if area.height == 0 || area.width == 0 {
         return;
     }
+    let (list_area, bottom) = split_hint_row(area);
+    draw_list(frame, app, list_area);
+    draw_bottom(frame, app, bottom);
+}
 
-    let list_area = Rect {
+/// The layout every screen shares: the body above, one hint row on the last
+/// line. Same split everywhere, so the screens line up across a transition.
+pub(super) fn split_hint_row(area: Rect) -> (Rect, Rect) {
+    let body = Rect {
         height: area.height.saturating_sub(1),
         ..area
     };
@@ -60,9 +67,22 @@ pub fn draw(frame: &mut Frame, app: &App) {
         height: 1,
         ..area
     };
+    (body, bottom)
+}
 
-    draw_list(frame, app, list_area);
-    draw_bottom(frame, app, bottom);
+/// The one-row line at the bottom of every screen: centred, truncated rather
+/// than wrapped (the row owns exactly one line, and wrapping would push the
+/// body up and make the layout jump), dim when it is a hint rather than
+/// something the user is being told.
+pub(super) fn draw_hint_row(frame: &mut Frame, area: Rect, text: &str, dim: bool) {
+    let text = truncate(text, area.width as usize);
+    let style = if dim {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default()
+    };
+    let para = Paragraph::new(Line::from(Span::styled(text, style))).alignment(Alignment::Center);
+    frame.render_widget(para, area);
 }
 
 fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
@@ -145,16 +165,7 @@ fn draw_bottom(frame: &mut Frame, app: &App, area: Rect) {
         },
     };
 
-    // Truncate rather than wrap: the hint line owns exactly one row, and
-    // wrapping would push the list up and make the layout jump.
-    let text = truncate(&text, area.width as usize);
-    let style = if dim {
-        Style::default().add_modifier(Modifier::DIM)
-    } else {
-        Style::default()
-    };
-    let para = Paragraph::new(Line::from(Span::styled(text, style))).alignment(Alignment::Center);
-    frame.render_widget(para, area);
+    draw_hint_row(frame, area, &text, dim);
 }
 
 /// Keep `selected` visible within a window of `height` rows.
@@ -213,28 +224,8 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    /// Reconstruct the rendered lines, skipping the filler cell that follows a
-    /// wide glyph so a CJK name is not reported as three columns per character.
     fn render(app: &App, w: u16, h: u16) -> Vec<String> {
-        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
-        terminal.draw(|f| draw(f, app)).expect("draw");
-        let buf = terminal.backend().buffer().clone();
-        (0..buf.area.height)
-            .map(|y| {
-                let mut line = String::new();
-                let mut skip = 0u16;
-                for x in 0..buf.area.width {
-                    if skip > 0 {
-                        skip -= 1;
-                        continue;
-                    }
-                    let sym = buf[(x, y)].symbol();
-                    skip = sym.width().saturating_sub(1) as u16;
-                    line.push_str(sym);
-                }
-                line.trim_end().to_string()
-            })
-            .collect()
+        super::super::test_support::render(w, h, |f| draw(f, app))
     }
 
     /// Numbered the way `finish_listing` would have: these `App`s are built
@@ -520,27 +511,9 @@ mod tests {
     /// test for it.
     #[test]
     fn nothing_sets_a_colour() {
-        use ratatui::style::Color;
         let mut a = app(&["one", "two", "three"]);
         a.on_key(super::super::app::Key::Char('j'));
-        let mut terminal = Terminal::new(TestBackend::new(50, 8)).expect("terminal");
-        terminal.draw(|f| draw(f, &a)).expect("draw");
-        let buf = terminal.backend().buffer().clone();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                let cell = &buf[(x, y)];
-                assert_eq!(
-                    cell.fg,
-                    Color::Reset,
-                    "cell ({x},{y}) set a foreground colour"
-                );
-                assert_eq!(
-                    cell.bg,
-                    Color::Reset,
-                    "cell ({x},{y}) set a background colour"
-                );
-            }
-        }
+        super::super::test_support::assert_no_colour(50, 8, |f| draw(f, &a));
     }
 
     #[test]

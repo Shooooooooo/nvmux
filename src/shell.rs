@@ -51,8 +51,10 @@ where
         .join(" ")
 }
 
-/// Wrap a command so it runs under the user's **login** shell — see
-/// [`crate::ssh::exec_args`], which composes the same thing inline.
+/// Wrap a command so it runs under the user's **login** shell. Used by
+/// [`crate::ssh::exec_args`] for every remote script run. `$SHELL` is
+/// double-quoted so a value containing a space stays one word, and expands on
+/// the remote side because the whole string travels as ssh's command.
 pub fn login_shell_wrapper(inner: &str) -> String {
     format!(r#"exec "${{SHELL:-/bin/bash}}" -l -c {}"#, quote(inner))
 }
@@ -246,6 +248,10 @@ mod tests {
             // unknown command name, so it parses fine and fails at runtime.
             // That is exactly the bug that works on the developer's mac (where
             // /bin/sh may be bash) and fails on the user's server.
+            // The last three are GNU/BSD `find` extensions rather than
+            // bashisms, caught here for the same reason: `-perm /mode` is
+            // GNU-only and `-perm +mode` is BSD-only, and either one makes a
+            // permission check silently pass on the other platform.
             for bashism in [
                 "[[ ",
                 " ]]",
@@ -259,6 +265,9 @@ mod tests {
                 "+=",
                 "echo -e",
                 "read -a",
+                "-perm /",
+                "-perm +",
+                "-maxdepth",
             ] {
                 assert!(
                     !code.contains(bashism),

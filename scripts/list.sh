@@ -23,10 +23,19 @@ set -u
 
 dir="${1:?usage: list.sh <runtime_dir>}"
 
-# Is any of our processes serving this socket? `-A` not `-e`: on macOS `-e`
-# means "show the environment". `grep -F` because the path is data, not a
-# pattern.
+# Is any process serving this socket? /proc first, so this works on a Linux
+# box with no ps at all and answers the same way kill.sh's cmdline() does; ps
+# otherwise. `-A` not `-e`: on macOS `-e` means "show the environment". `grep
+# -F` because the path is data, not a pattern.
 serving() {
+  if [ -r /proc/self/cmdline ]; then
+    for c in /proc/[0-9]*/cmdline; do
+      if tr '\0' ' ' < "$c" 2>/dev/null | grep -q -F -- "--listen $1"; then
+        return 0
+      fi
+    done
+    return 1
+  fi
   ps -ww -A -u "$(id -u)" -o args= 2>/dev/null \
     | grep -v grep \
     | grep -q -F -- "--listen $1"
@@ -34,6 +43,7 @@ serving() {
 
 # Can we inspect processes at all? If not, "not found" proves nothing.
 can_inspect() {
+  [ -r /proc/self/cmdline ] && return 0
   ps -ww -o args= -p $$ >/dev/null 2>&1
 }
 
@@ -101,6 +111,12 @@ if [ -d "$dir" ]; then
     [ -e "$meta" ] || continue
     mid=${meta##*/}
     mid=${mid%.json}
+    # Session ids only, as above: nothing else in this directory is ours to
+    # delete.
+    case "$mid" in
+      [a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7]) ;;
+      *) continue ;;
+    esac
     if [ ! -e "$dir/$mid.sock" ]; then
       rm -f "$meta" "$dir/$mid.log"
     fi
