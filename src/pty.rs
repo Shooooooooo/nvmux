@@ -184,7 +184,10 @@ pub fn relay(
         .ok_or_else(|| NvmuxError::Io(std::io::Error::other("pty master has no fd")))?;
 
     let winch = winch::Winch::install()?;
-    term::leave_alt_screen_and_clear();
+    // Leave the alternate screen into a black primary, so the session starts
+    // from the dark screen the outgoing screen dissolved to (or, from the
+    // picker, so the client spawn never flashes the old primary).
+    crate::fade::enter_session_black();
     let mut raw = term::RawMode::enter()?;
 
     // What the child buffered while blocked mid-write describes a screen the
@@ -202,15 +205,29 @@ pub fn relay(
             held
             @ (Outcome::ToPicker | Outcome::CreateNew | Outcome::ShowHelp | Outcome::Switch(_)),
         ) => {
+            // Dissolve the session to black before restoring, so the picker or
+            // the next session takes over from a dark screen rather than a cut.
+            // A failed fade must not skip the restore below, so its error is
+            // dropped rather than propagated.
+            let _ = crate::fade::fade_out_raw();
             raw.restore();
             Ok((held, Some(attachment)))
         }
+        Ok(Outcome::ChildExited) => {
+            // The child is gone and has emitted its own restore, so there is no
+            // live frame to dissolve — black the screen at once (any dissolve
+            // would race the child's teardown), then let the picker fade up.
+            drain_until_eof(master_fd);
+            crate::fade::black_now();
+            raw.restore();
+            let _ = attachment.child.wait();
+            Ok((Outcome::ChildExited, None))
+        }
         Ok(other) => {
-            // Let the child put the terminal back itself: it emits its own full
-            // restore sequence on exit, and a competing reset would corrupt it.
-            if other != Outcome::ChildExited {
-                let _ = attachment.child.kill();
-            }
+            // `Detached`: leave the session running and let the child put the
+            // terminal back itself — a competing reset (a fade included) would
+            // corrupt its own restore sequence.
+            let _ = attachment.child.kill();
             drain_until_eof(master_fd);
             raw.restore();
             let _ = attachment.child.wait();

@@ -59,6 +59,15 @@ extern "C" fn restore_and_reraise(sig: libc::c_int) {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved.0);
         }
     }
+    // Undo a fade that may have been mid-flight: reset SGR, show the cursor, and
+    // close any open synchronized-update span, so a signal during a transition
+    // does not hand the shell back a black screen with a hidden cursor. A single
+    // fixed-string `write` is async-signal-safe, like the `tcsetattr` above, and
+    // is harmless when no fade was running. See `crate::fade`.
+    const RESET: &[u8] = b"\x1b[0m\x1b[?25h\x1b[?2026l";
+    unsafe {
+        libc::write(libc::STDOUT_FILENO, RESET.as_ptr().cast(), RESET.len());
+    }
     unsafe {
         libc::signal(sig, libc::SIG_DFL);
         libc::raise(sig);

@@ -72,10 +72,21 @@ pub fn run(transport: &dyn Transport, message: Option<String>) -> Result<Outcome
     // ratatui's first draw only paints what differs from an empty buffer — so
     // without this the list lands in the middle of the editor's last frame.
     terminal.clear()?;
+    // Start black, before the session listing that precedes the first real draw,
+    // so entering the alternate screen does not flash its blank buffer.
+    crate::fade::prime_black(&mut terminal)?;
     let outcome = run_loop(&mut terminal, transport, message);
     // Restore before propagating anything: an error that leaves the terminal in
-    // raw mode with no echo is far worse than the error itself.
-    ratatui::try_restore()?;
+    // raw mode with no echo is far worse than the error itself. On the attach
+    // path, leave straight into a black primary screen so the client spawn that
+    // follows never flashes the old primary; otherwise restore as before.
+    match &outcome {
+        Ok(Outcome::Attach { .. }) => crate::fade::leave_ratatui_to_black()?,
+        _ => {
+            ratatui::try_restore()?;
+            crate::fade::show_cursor_if_enabled();
+        }
+    }
     outcome
 }
 
@@ -91,12 +102,15 @@ fn run_loop(
         app.set_message(msg);
     }
 
+    // Dissolve the picker up from the primed black before taking any input.
+    crate::fade::fade_in_ratatui(terminal, |f| draw::draw(f, &app))?;
+
     // When a half-typed session number must be settled. `App` decides every
     // unambiguous digit on its own, so this is only ever set when one number is
     // a prefix of another — sessions 1 and 12 both present.
     let mut deadline: Option<Instant> = None;
 
-    loop {
+    let outcome = 'ui: loop {
         terminal.draw(|f| draw::draw(f, &app))?;
 
         if !event::poll(TICK)? {
@@ -106,7 +120,7 @@ fn run_loop(
                 deadline = None;
                 if let Request::Attach(id) = app.resolve_pending() {
                     match find(transport, &id)? {
-                        Some(session) => return Ok(Outcome::Attach { session, highest }),
+                        Some(session) => break 'ui Outcome::Attach { session, highest },
                         None => {
                             app.set_message("that session is gone");
                             refresh(&mut app, &mut highest, transport)?;
@@ -129,11 +143,11 @@ fn run_loop(
 
         match request {
             Request::None => {}
-            Request::Quit => return Ok(Outcome::Quit),
+            Request::Quit => break 'ui Outcome::Quit,
 
             Request::Attach(id) => {
                 if let Some(session) = find(transport, &id)? {
-                    return Ok(Outcome::Attach { session, highest });
+                    break 'ui Outcome::Attach { session, highest };
                 }
                 app.set_message("that session is gone");
                 refresh(&mut app, &mut highest, transport)?;
@@ -141,22 +155,22 @@ fn run_loop(
 
             Request::NewSession => {
                 if let prompt::Outcome::Created(session) =
-                    prompt::run_on(terminal, transport, prompt::Task::Create)?
+                    prompt::run_on(terminal, transport, prompt::Task::Create, false)?
                 {
                     // The new session is the highest by construction when it
                     // appends, but it may have refilled a gap — so take the
                     // larger of the two rather than assuming.
-                    return Ok(Outcome::Attach {
+                    break 'ui Outcome::Attach {
                         highest: highest.max(session.state.num),
                         session,
-                    });
+                    };
                 }
                 refresh(&mut app, &mut highest, transport)?;
             }
 
             Request::RenameSession(id) => {
                 if let Some(session) = find(transport, &id)? {
-                    prompt::run_on(terminal, transport, prompt::Task::Rename(&session))?;
+                    prompt::run_on(terminal, transport, prompt::Task::Rename(&session), false)?;
                 }
                 refresh(&mut app, &mut highest, transport)?;
             }
@@ -170,7 +184,14 @@ fn run_loop(
                 refresh(&mut app, &mut highest, transport)?;
             }
         }
+    };
+
+    // Dissolve the picker out to black before handing off to the session; on
+    // quit there is no next screen to bridge to, so leave it be.
+    if matches!(outcome, Outcome::Attach { .. }) {
+        crate::fade::fade_out_ratatui(terminal, |f| draw::draw(f, &app))?;
     }
+    Ok(outcome)
 }
 
 /// Re-list, keeping the highest number in step with what is on screen.

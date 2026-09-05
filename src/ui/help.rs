@@ -103,6 +103,10 @@ pub fn run() -> Result<()> {
     // A second alternate-screen enter is a no-op on xterm and kitty; see
     // `ui::run`.
     terminal.clear()?;
+    // Reached from a session that has already dissolved to black, so start black.
+    if crate::fade::EXCURSIONS {
+        crate::fade::prime_black(&mut terminal)?;
+    }
     let outcome = run_loop(&mut terminal);
     // Restore before propagating: see `ui::run`.
     ratatui::try_restore()?;
@@ -111,6 +115,9 @@ pub fn run() -> Result<()> {
 
 fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     let rows = rows();
+    if crate::fade::EXCURSIONS {
+        crate::fade::fade_in_ratatui(terminal, |f| draw(f, &rows))?;
+    }
     loop {
         terminal.draw(|f| draw(f, &rows))?;
 
@@ -125,6 +132,10 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         };
 
         if on_key(key) == Step::Close {
+            // Dissolve back to black so the resumed session takes over dark.
+            if crate::fade::EXCURSIONS {
+                crate::fade::fade_out_ratatui(terminal, |f| draw(f, &rows))?;
+            }
             return Ok(());
         }
     }
