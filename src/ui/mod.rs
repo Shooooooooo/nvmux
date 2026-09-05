@@ -16,8 +16,15 @@
 //! the list — routing `Ctrl-t c` through the picker would show the user a list
 //! they did not ask for, and drawing a box over that list is exactly what the
 //! contract above rules out. The contract is unchanged and still governs this
-//! screen; the prompt simply shares its vocabulary — centred content, one dim
-//! hint row on the last line, no borders, no colour.
+//! screen; the prompt simply shares its vocabulary — centred content, a
+//! `label: value` line, one dim hint row on the last line, no borders, no
+//! colour.
+//!
+//! What the two screens do *not* share is wording. The picker asks for a name
+//! with `new session:` on a row with the session list still visible above it;
+//! the prompt asks with `new session name:`, because it opens over an editor
+//! with nothing else on screen and has to say what it is for. Same shape, more
+//! words where there is no context to lean on.
 //!
 //! # There is no preview pane, and there must never be one
 //!
