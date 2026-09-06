@@ -57,21 +57,14 @@ impl SshTransport {
         let control_path = paths::control_path(&local_dir, &host_token)?;
 
         // Checked before connecting, so the error names the real problem.
-        check_local_ssh()?;
+        crate::ssh::check_local()?;
 
         let ssh = Ssh::new(host.clone(), control_path);
         ssh.ensure_master()?;
 
         // One round trip for both the runtime directory and the remote Neovim
         // version.
-        let out = ssh.run_script(shell::PROBE_SCRIPT, &[])?;
-        if !out.ok() && out.stdout.trim().is_empty() {
-            return Err(NvmuxError::Ssh(crate::ssh::classify(
-                &host,
-                out.status,
-                &out.stderr,
-            )));
-        }
+        let out = checked_script(&ssh, shell::PROBE_SCRIPT, &[])?;
         let probe = protocol::parse_probe(&out.stdout)?;
 
         if probe.nvim_banner.is_empty() {
@@ -176,18 +169,33 @@ impl SshTransport {
     /// A dead master is reported as such rather than as a mysterious failure,
     /// because it is the one condition the user can do something about.
     fn run_script(&self, script: &str, args: &[&str]) -> Result<crate::proc::Output> {
-        let out = self.ssh.run_script(script, args)?;
-        if !out.ok() && out.stdout.trim().is_empty() {
-            let err = crate::ssh::classify(self.host(), out.status, &out.stderr);
+        let out = checked_script(&self.ssh, script, args).map_err(|err| {
             if matches!(err, SshError::NoMaster(_) | SshError::MasterDied(_)) {
                 // Report it, drop the forwards we believed in, and let the
                 // caller fall back to the picker.
                 self.forwarded.lock().map(|mut f| f.clear()).ok();
             }
-            return Err(err.into());
-        }
+            err
+        })?;
         Ok(out)
     }
+}
+
+/// Run a script and insist it actually ran.
+///
+/// A nonzero exit with nothing on stdout is ssh itself failing, not the script
+/// reporting something: the script would have printed its terminator. Used by
+/// `SshTransport::new` too, before there is a `self` to call the method on.
+fn checked_script(
+    ssh: &Ssh,
+    script: &str,
+    args: &[&str],
+) -> std::result::Result<crate::proc::Output, SshError> {
+    let out = ssh.run_script(script, args)?;
+    if !out.ok() && out.stdout.trim().is_empty() {
+        return Err(crate::ssh::classify(ssh.host(), out.status, &out.stderr));
+    }
+    Ok(out)
 }
 
 impl Transport for SshTransport {
@@ -209,7 +217,7 @@ impl Transport for SshTransport {
         }
         sessions.retain(|s| s.state.liveness != Liveness::Dead);
         self.sweep_orphaned_forwards(&sessions);
-        finish_listing(sessions)
+        Ok(finish_listing(sessions))
     }
 
     fn create_session(&self, name: &str) -> Result<Session> {
@@ -332,30 +340,5 @@ impl Transport for SshTransport {
             .map(|mut f| f.insert(s.id.clone()))
             .ok();
         Ok(local)
-    }
-}
-
-/// Refuse early if the local ssh cannot forward unix sockets at all.
-fn check_local_ssh() -> Result<()> {
-    let out = std::process::Command::new("ssh")
-        .arg("-V")
-        .output()
-        .map_err(|_| SshError::NotFound)?;
-    // `ssh -V` writes to stderr.
-    let banner = if out.stderr.is_empty() {
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    } else {
-        String::from_utf8_lossy(&out.stderr).into_owned()
-    };
-    match nvim::parse_ssh_version(&banner) {
-        Some(v) if v >= (6, 7) => Ok(()),
-        Some((major, minor)) => Err(SshError::TooOld {
-            found: format!("{major}.{minor}"),
-            min: crate::ssh::MIN_SSH_VERSION,
-        }
-        .into()),
-        // An unrecognised banner is not worth refusing over — plenty of forks
-        // exist, and the forward itself will fail clearly enough.
-        None => Ok(()),
     }
 }

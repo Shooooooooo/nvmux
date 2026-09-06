@@ -199,7 +199,7 @@ pub(crate) fn install_detach_alias(sock: &Path) {
 /// duplicate — are covered in memory. A read path that wrote would cost an SSH
 /// round trip per listing, and would persist a derived number as if it had been
 /// assigned.
-pub(crate) fn finish_listing(mut sessions: Vec<Session>) -> Result<Vec<Session>> {
+pub(crate) fn finish_listing(mut sessions: Vec<Session>) -> Vec<Session> {
     // Stored number first, so the sessions with a claim on a number get to keep
     // it; `created` then `id` puts the unnumbered ones in a stable order rather
     // than whatever the directory happened to yield.
@@ -222,7 +222,7 @@ pub(crate) fn finish_listing(mut sessions: Vec<Session>) -> Result<Vec<Session>>
     }
 
     sessions.sort_by_key(|s| s.state.num);
-    Ok(sessions)
+    sessions
 }
 
 /// The number to give a session being created now: the smallest not already on
@@ -282,8 +282,7 @@ mod tests {
             session("aaaaaaaa", 1, 1),
             session("bbbbbbbb", 2, 2),
             session("cccccccc", 3, 3),
-        ])
-        .expect("listing");
+        ]);
 
         let (id, num) = plan_create(&all, "fresh").expect("planned");
         assert_eq!(num, 4);
@@ -329,7 +328,6 @@ mod tests {
 
     fn resolved(sessions: Vec<Session>) -> Vec<(String, u32)> {
         finish_listing(sessions)
-            .expect("listing")
             .into_iter()
             .map(|s| (s.id, s.state.num))
             .collect()
@@ -405,20 +403,18 @@ mod tests {
 
     #[test]
     fn an_empty_listing_is_not_a_problem() {
-        assert!(finish_listing(vec![]).expect("listing").is_empty());
+        assert!(finish_listing(vec![]).is_empty());
     }
 
     #[test]
     fn the_next_free_number_starts_at_one_and_fills_gaps() {
         assert_eq!(next_free_num(&[]), 1, "sessions are numbered from 1");
 
-        let listed =
-            finish_listing(vec![session("aaa", 1, 1), session("bbb", 2, 2)]).expect("listing");
+        let listed = finish_listing(vec![session("aaa", 1, 1), session("bbb", 2, 2)]);
         assert_eq!(next_free_num(&listed), 3, "appends when there is no gap");
 
         // What killing the middle session leaves behind.
-        let listed =
-            finish_listing(vec![session("aaa", 1, 1), session("ccc", 3, 3)]).expect("listing");
+        let listed = finish_listing(vec![session("aaa", 1, 1), session("ccc", 3, 3)]);
         assert_eq!(next_free_num(&listed), 2, "refills the hole");
     }
 
@@ -426,8 +422,7 @@ mod tests {
     /// have 3 taken out from under it.
     #[test]
     fn the_next_free_number_respects_numbers_that_were_only_resolved() {
-        let listed =
-            finish_listing(vec![session("aaa", 0, 1), session("bbb", 0, 2)]).expect("listing");
+        let listed = finish_listing(vec![session("aaa", 0, 1), session("bbb", 0, 2)]);
         assert_eq!(listed[0].num, 0, "still unnumbered on disk");
         assert_eq!(next_free_num(&listed), 3);
     }

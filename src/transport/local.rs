@@ -17,6 +17,8 @@ use crate::transport::{
 pub struct LocalTransport {
     location: Location,
     dir: PathBuf,
+    /// `dir` as the scripts take it. Built once; every script run needs it.
+    dir_arg: String,
 }
 
 impl LocalTransport {
@@ -30,6 +32,7 @@ impl LocalTransport {
     pub fn with_dir(dir: PathBuf) -> Result<Self> {
         paths::ensure_dir_secure(&dir)?;
         Ok(Self {
+            dir_arg: dir.to_string_lossy().into_owned(),
             location: Location::Local,
             dir,
         })
@@ -107,8 +110,7 @@ impl Transport for LocalTransport {
     }
 
     fn list_sessions(&self) -> Result<Vec<Session>> {
-        let dir = self.dir.to_string_lossy().into_owned();
-        let out = proc::run_local(shell::LIST_SCRIPT, &[&dir])?;
+        let out = proc::run_local(shell::LIST_SCRIPT, &[&self.dir_arg])?;
         if !out.ok() {
             tracing::warn!(status = out.status, stderr = %out.stderr, "list.sh failed");
         }
@@ -137,7 +139,7 @@ impl Transport for LocalTransport {
             }
         }
 
-        finish_listing(alive)
+        Ok(finish_listing(alive))
     }
 
     fn create_session(&self, name: &str) -> Result<Session> {
@@ -145,10 +147,9 @@ impl Transport for LocalTransport {
         // from, so numbering costs no extra work here.
         let (id, num) = plan_create(&self.list_sessions()?, name)?;
         let paths = self.paths(&id)?;
-        let dir = self.dir.to_string_lossy().into_owned();
 
         tracing::info!(%id, name, "spawning session");
-        let out = proc::run_local(shell::SPAWN_SCRIPT, &[&dir, &id])?;
+        let out = proc::run_local(shell::SPAWN_SCRIPT, &[&self.dir_arg, &id])?;
         let spawned = protocol::parse_spawn(&out.stdout)?;
 
         if !spawned.socket_appeared || !wait_until_reachable(&paths.sock, REACHABLE_TIMEOUT) {
@@ -160,7 +161,7 @@ impl Transport for LocalTransport {
             // finds the process by its socket, the pid is only a hint.
             let tail = self.log_tail(&paths.log);
             let pid = opt_pid_arg(spawned.pid);
-            match proc::run_local(shell::KILL_SCRIPT, &[&dir, &id, &pid]) {
+            match proc::run_local(shell::KILL_SCRIPT, &[&self.dir_arg, &id, &pid]) {
                 Ok(out) => match protocol::parse_kill(&out.stdout) {
                     Ok(outcome) => tracing::debug!(%id, ?outcome, "cleaned up a failed create"),
                     Err(e) => tracing::warn!(%id, error = %e, "cleanup after a failed create"),
@@ -190,14 +191,13 @@ impl Transport for LocalTransport {
 
     fn kill_session(&self, s: &Session) -> Result<()> {
         let paths = self.paths(&s.id)?;
-        let dir = self.dir.to_string_lossy().into_owned();
 
         // Straight to signals — SIGTERM first, inside the script, so nvim still
         // runs VimLeavePre, writes its ShaDa file and unlinks its own socket.
         // The recorded pid is only a starting guess: the script uses it only if
         // it still owns this session's socket, since pids get reused.
         let pid = pid_arg(s.pid);
-        let out = proc::run_local(shell::KILL_SCRIPT, &[&dir, &s.id, &pid])?;
+        let out = proc::run_local(shell::KILL_SCRIPT, &[&self.dir_arg, &s.id, &pid])?;
         if !out.ok() {
             tracing::warn!(status = out.status, stderr = %out.stderr, "kill.sh failed");
         }
