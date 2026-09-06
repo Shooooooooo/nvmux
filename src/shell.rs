@@ -59,25 +59,41 @@ pub fn login_shell_wrapper(inner: &str) -> String {
     format!(r#"exec "${{SHELL:-/bin/bash}}" -l -c {}"#, quote(inner))
 }
 
+/// Prepended to every script below, so what reaches the session host is one
+/// self-contained program on stdin. A script run straight from a checkout
+/// sources the same file instead — see `scripts/_prelude.sh`.
+macro_rules! script {
+    ($file:literal) => {
+        concat!(include_str!("../scripts/_prelude.sh"), include_str!($file))
+    };
+}
+
 /// Lists sessions on the host that owns them.
 ///
 /// Batch-shaped on purpose: every session in one invocation, with liveness
 /// already decided. Each `ssh` round trip costs ~230 ms even to localhost, so a
 /// per-session API would feel fine locally and be unusable over a real link.
-pub const LIST_SCRIPT: &str = include_str!("../scripts/list.sh");
+pub const LIST_SCRIPT: &str = script!("../scripts/list.sh");
 
-/// Spawns a detached headless nvim.
-pub const SPAWN_SCRIPT: &str = include_str!("../scripts/spawn.sh");
+pub const SPAWN_SCRIPT: &str = script!("../scripts/spawn.sh");
 
-/// Terminates a session and removes its files.
-pub const KILL_SCRIPT: &str = include_str!("../scripts/kill.sh");
+pub const KILL_SCRIPT: &str = script!("../scripts/kill.sh");
 
-/// Reports a session host's runtime directory and Neovim version at once.
-pub const PROBE_SCRIPT: &str = include_str!("../scripts/probe.sh");
+pub const PROBE_SCRIPT: &str = script!("../scripts/probe.sh");
 
 /// Writes `<id>.json` on the session host. Used by the SSH transport, where
 /// Rust cannot reach the file directly.
-pub const WRITE_META_SCRIPT: &str = include_str!("../scripts/write_meta.sh");
+pub const WRITE_META_SCRIPT: &str = script!("../scripts/write_meta.sh");
+
+/// Every script, for the tests that check all of them the same way.
+#[cfg(test)]
+const SCRIPTS: &[(&str, &str)] = &[
+    ("list.sh", LIST_SCRIPT),
+    ("spawn.sh", SPAWN_SCRIPT),
+    ("kill.sh", KILL_SCRIPT),
+    ("probe.sh", PROBE_SCRIPT),
+    ("write_meta.sh", WRITE_META_SCRIPT),
+];
 
 #[cfg(test)]
 mod tests {
@@ -230,15 +246,58 @@ mod tests {
             .replace("[[:alnum:]]", "")
     }
 
+    /// Every shipped script carries the prelude, and carries it once: a script
+    /// delivered without it would die on the first `finish` with "not found".
+    #[test]
+    fn every_script_ships_with_exactly_one_prelude() {
+        for &(name, body) in SCRIPTS {
+            assert_eq!(
+                body.matches("NVMUX_PRELUDE=1").count(),
+                1,
+                "{name} should carry the prelude exactly once"
+            );
+            assert!(
+                body.contains("finish()"),
+                "{name} is missing the prelude's helpers"
+            );
+        }
+    }
+
+    /// The guard the prelude sets is what stops a prepended script sourcing it
+    /// a second time — and what lets the same file still run from a checkout.
+    #[test]
+    fn a_prepended_script_does_not_source_the_prelude_again() {
+        let out = Command::new("/bin/sh")
+            .arg("-s")
+            .arg("/nonexistent-runtime-dir")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                c.stdin
+                    .take()
+                    .expect("stdin")
+                    .write_all(LIST_SCRIPT.as_bytes())?;
+                c.wait_with_output()
+            })
+            .expect("run list.sh");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("_prelude.sh"),
+            "a prepended script tried to source the prelude: {stderr}"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("NVMUX_END"),
+            "stdout: {:?} stderr: {stderr}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
     #[test]
     fn scripts_are_present_and_posix_sh() {
-        for (name, body) in [
-            ("list.sh", LIST_SCRIPT),
-            ("spawn.sh", SPAWN_SCRIPT),
-            ("kill.sh", KILL_SCRIPT),
-            ("probe.sh", PROBE_SCRIPT),
-            ("write_meta.sh", WRITE_META_SCRIPT),
-        ] {
+        for &(name, body) in SCRIPTS {
             assert!(!body.trim().is_empty(), "{name} is empty");
             let code = code_only(body);
             // These run under whatever /bin/sh the session host has, which on
@@ -294,13 +353,7 @@ mod tests {
 
     #[test]
     fn scripts_pass_shell_syntax_check() {
-        for (name, body) in [
-            ("list.sh", LIST_SCRIPT),
-            ("spawn.sh", SPAWN_SCRIPT),
-            ("kill.sh", KILL_SCRIPT),
-            ("probe.sh", PROBE_SCRIPT),
-            ("write_meta.sh", WRITE_META_SCRIPT),
-        ] {
+        for &(name, body) in SCRIPTS {
             let out = Command::new("/bin/sh")
                 .arg("-n")
                 .stdin(std::process::Stdio::piped())

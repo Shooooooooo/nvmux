@@ -9,43 +9,11 @@
 #
 # followed by a literal NVMUX_END line.
 #
-# The terminator is load-bearing. `ssh -n` with `sh -s` silently produces an
-# *empty* result — stdin is /dev/null, sh reads an empty script and exits 0 —
-# which is otherwise indistinguishable from "this host has no sessions". The
-# parser treats a missing NVMUX_END as an error.
-#
 # Batch-shaped: one invocation returns every session, because each ssh round
 # trip costs roughly 230ms even to localhost.
-#
-# POSIX sh only -- /bin/sh is dash on Debian and Ubuntu, not bash.
-
-set -u
+[ -n "${NVMUX_PRELUDE:-}" ] || . "$(dirname -- "$0")/_prelude.sh"
 
 dir="${1:?usage: list.sh <runtime_dir>}"
-
-# Is any process serving this socket? /proc first, so this works on a Linux
-# box with no ps at all and answers the same way kill.sh's cmdline() does; ps
-# otherwise. `-A` not `-e`: on macOS `-e` means "show the environment". `grep
-# -F` because the path is data, not a pattern.
-serving() {
-  if [ -r /proc/self/cmdline ]; then
-    for c in /proc/[0-9]*/cmdline; do
-      if tr '\0' ' ' < "$c" 2>/dev/null | grep -q -F -- "--listen $1"; then
-        return 0
-      fi
-    done
-    return 1
-  fi
-  ps -ww -A -u "$(id -u)" -o args= 2>/dev/null \
-    | grep -v grep \
-    | grep -q -F -- "--listen $1"
-}
-
-# Can we inspect processes at all? If not, "not found" proves nothing.
-can_inspect() {
-  [ -r /proc/self/cmdline ] && return 0
-  ps -ww -o args= -p $$ >/dev/null 2>&1
-}
 
 # A missing directory is not an error: the answer is the empty list, and the
 # terminator still proves the script ran.
@@ -57,17 +25,12 @@ if [ -d "$dir" ]; then
     id=${sock##*/}
     id=${id%.sock}
 
-    # Session ids only: eight characters of lowercase base32.
-    #
     # The local end of every SSH forward also lives here, named
     # `<host_token>-<id>.sock`, and under `nvmux localhost` the remote listing
     # runs in this very directory. Without this guard the sweep below finds a
     # forwarded socket, sees nothing `--listen`ing on it, and deletes the live
     # forward of the session the user is attached to.
-    case "$id" in
-      [a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7]) ;;
-      *) continue ;;
-    esac
+    is_session_id "$id" || continue
 
     json_path="$dir/$id.json"
 
@@ -93,7 +56,7 @@ if [ -d "$dir" ]; then
       # not evidence when we cannot look. `-S` because this deletes files, and
       # nothing is "serving" an ordinary file that happens to be named
       # `<id>.sock` either.
-      rm -f "$sock" "$dir/$id.json" "$dir/$id.log"
+      purge "$dir" "$id"
       continue
     fi
 
@@ -111,16 +74,11 @@ if [ -d "$dir" ]; then
     [ -e "$meta" ] || continue
     mid=${meta##*/}
     mid=${mid%.json}
-    # Session ids only, as above: nothing else in this directory is ours to
-    # delete.
-    case "$mid" in
-      [a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7]) ;;
-      *) continue ;;
-    esac
+    is_session_id "$mid" || continue
     if [ ! -e "$dir/$mid.sock" ]; then
       rm -f "$meta" "$dir/$mid.log"
     fi
   done
 fi
 
-printf 'NVMUX_END\n'
+finish

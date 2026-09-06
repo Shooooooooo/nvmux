@@ -10,7 +10,7 @@
 # reach it. The JSON arrives as a positional parameter and is never re-parsed,
 # so a name containing quotes, spaces or $(...) is data, not code.
 
-set -u
+[ -n "${NVMUX_PRELUDE:-}" ] || . "$(dirname -- "$0")/_prelude.sh"
 
 dir="${1:?usage: write_meta.sh <runtime_dir> <id> <json>}"
 id="${2:?usage: write_meta.sh <runtime_dir> <id> <json>}"
@@ -25,4 +25,4 @@ tmp="$dir/$id.json.tmp$$"
 printf '%s\n' "$json" > "$tmp" || exit 1
 mv -f "$tmp" "$dir/$id.json" || { rm -f "$tmp"; exit 1; }
 
-printf 'NVMUX_END\n'
+finish

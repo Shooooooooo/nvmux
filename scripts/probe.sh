@@ -15,9 +15,7 @@
 # rather than assuming: `ssh host nvim` finds nothing on most real setups,
 # because nvim was put on $PATH by .zprofile or .bash_profile.
 #
-# POSIX sh only.
-
-set -u
+[ -n "${NVMUX_PRELUDE:-}" ] || . "$(dirname -- "$0")/_prelude.sh"
 
 # Matches the Rust side's rule exactly; see src/paths.rs for why
 # $XDG_RUNTIME_DIR is not consulted.
@@ -29,4 +27,4 @@ else
   printf 'NVIM\n'
 fi
 
-printf 'NVMUX_END\n'
+finish

@@ -588,6 +588,85 @@ fn killing_an_already_dead_session_cleans_up_its_files() {
     assert!(!json.exists(), "the orphaned metadata should be gone");
 }
 
+/// A host with `/proc` but no `ps` must still be able to kill a session.
+///
+/// `list.sh` always had a `/proc` path; `kill.sh` and `spawn.sh` did not, and
+/// looked the session up with `ps` alone. On a minimal container — `/proc`
+/// mounted, procps not installed — `kill.sh` therefore found nothing, reported
+/// `absent`, deleted the socket and left nvim running with no socket left for
+/// any listing to find it by. Exactly the orphan its own comments forbid.
+///
+/// Linux only: the fallback being tested is the `/proc` one.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_session_can_be_killed_on_a_host_with_proc_but_no_ps() {
+    require_nvim!();
+    if !std::path::Path::new("/proc/self/cmdline").exists() {
+        eprintln!("skipping: no /proc");
+        return;
+    }
+    let scratch = Scratch::new("nops");
+    let t = scratch.transport();
+    let session = t.create_session("noprocps").expect("create");
+    let sock = t.local_socket_for(&session).expect("socket");
+
+    // A PATH with everything the script needs except `ps`.
+    let bin = scratch.0.join("bin");
+    std::fs::create_dir_all(&bin).expect("bin");
+    for tool in [
+        "sh", "tr", "grep", "awk", "rm", "sleep", "kill", "id", "printf", "cut", "dirname",
+    ] {
+        if let Ok(real) = which(tool) {
+            let _ = std::os::unix::fs::symlink(real, bin.join(tool));
+        }
+    }
+
+    let out = std::process::Command::new(bin.join("sh"))
+        .arg("-s")
+        .arg(&scratch.0)
+        .arg(&session.id)
+        .arg("")
+        .env_clear()
+        .env("PATH", &bin)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut c| {
+            use std::io::Write;
+            c.stdin
+                .take()
+                .expect("stdin")
+                .write_all(nvmux::shell::KILL_SCRIPT.as_bytes())?;
+            c.wait_with_output()
+        })
+        .expect("run kill.sh");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("RESULT killed"),
+        "without ps the session must still be found by /proc, got: {stdout} \
+         stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(3), || !common::alive(session.pid)),
+        "the session should have been signalled, not just reported gone"
+    );
+    assert!(!sock.exists(), "the socket should have been removed");
+}
+
+/// The first `tool` on `$PATH`, so the sandbox above can link real binaries.
+#[cfg(target_os = "linux")]
+fn which(tool: &str) -> Result<PathBuf, ()> {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .map(|d| d.join(tool))
+        .find(|c| c.is_file())
+        .ok_or(())
+}
+
 /// A stale pid in the metadata must not stop a normal kill from working.
 ///
 /// The graceful `qa!` goes over the socket and never touches the pid, so the
