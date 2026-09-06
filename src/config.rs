@@ -21,7 +21,7 @@
 //!
 //! # Loading
 //!
-//! [`load`] resolves the file (see [`resolve_config_path`]), reads and validates
+//! [`load`] resolves the file (see `resolve_config_path`), reads and validates
 //! it, and returns a [`Settings`]. `main` calls it once and hands the result to
 //! [`init`]; everything else reads the process-global through [`get`]. `get`
 //! falls back to [`Settings::default`] when nothing has been initialised, so a
@@ -53,7 +53,7 @@ pub struct FadeSettings {
     /// Master switch. `NO_COLOR` still forces the effect off regardless — see
     /// [`crate::fade::enabled`].
     pub enabled: bool,
-    /// Steps per direction; must be at least 1 (see [`Settings::validate`]).
+    /// Steps per direction; must be at least 1 (see `Settings::validate`).
     pub frames: usize,
     pub frame_delay_ms: u64,
     pub hold_ms: u64,

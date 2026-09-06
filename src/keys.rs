@@ -116,7 +116,7 @@ pub fn command(byte: u8) -> Option<Action> {
 /// class that is both typable and does not collide with ordinary text. A few of
 /// those bytes are refused: they already mean something else on the wire and
 /// would never reach the machine as a prefix (or, for `C-m`, would clash with
-/// the number-entry terminator [`ENTER`]).
+/// the number-entry terminator `ENTER`).
 ///
 /// `C-c` and `C-z` are *allowed*, as in tmux: choosing them is the user's
 /// explicit, reversible decision, and it only means that byte stops reaching

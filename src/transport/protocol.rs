@@ -5,11 +5,40 @@
 //! If `if self.is_remote()` ever appears here the abstraction has leaked — that
 //! belongs in a script or in [`crate::transport::Transport::local_socket_for`].
 
-use crate::error::{NvmuxError, Result};
+use crate::error::{NvmuxError, Result, SessionError};
 use crate::session::{Liveness, Session};
 
 /// The sentinel `list.sh` prints after the last record.
 const TERMINATOR: &str = "NVMUX_END";
+
+/// A script did not run, or refused. Rendered bare — see
+/// [`SessionError::ScriptFailed`].
+fn script_failed(message: impl Into<String>) -> NvmuxError {
+    NvmuxError::Session(SessionError::ScriptFailed(message.into()))
+}
+
+/// Every script ends with a `NVMUX_END` sentinel; without it the run produced
+/// nothing.
+///
+/// # Why a missing terminator is an error
+///
+/// `ssh -n` combined with `sh -s` produces a silently **empty** result: stdin
+/// comes from `/dev/null`, `sh` reads an empty script and exits 0. Without the
+/// sentinel that is indistinguishable from a successful run that had nothing to
+/// say — for `list.sh`, from "this host has no sessions" — and the picker would
+/// show an empty list instead of reporting a broken connection.
+pub fn require_terminator(stdout: &str, what: &str) -> Result<()> {
+    if stdout
+        .lines()
+        .any(|line| line.trim_end_matches('\r') == TERMINATOR)
+    {
+        return Ok(());
+    }
+    Err(script_failed(format!(
+        "the {what} did not complete (no {TERMINATOR} marker). \
+         It may not have run at all."
+    )))
+}
 
 /// One row as the script reported it, before liveness is probed properly.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,24 +52,13 @@ pub struct Listed {
 }
 
 /// Parse the output of `list.sh`.
-///
-/// # Why a missing terminator is an error
-///
-/// `ssh -n` combined with `sh -s` produces a silently **empty** result: stdin
-/// comes from `/dev/null`, `sh` reads an empty script and exits 0. Without the
-/// sentinel that is indistinguishable from "this host has no sessions", and the
-/// picker would show an empty list instead of reporting a broken connection.
 pub fn parse_listing(stdout: &str) -> Result<Vec<Listed>> {
+    require_terminator(stdout, "session listing")?;
     let mut rows = Vec::new();
-    let mut terminated = false;
 
     for line in stdout.lines() {
         let line = line.trim_end_matches('\r');
-        if line == TERMINATOR {
-            terminated = true;
-            continue;
-        }
-        if line.is_empty() {
+        if line.is_empty() || line == TERMINATOR {
             continue;
         }
         let mut fields = line.splitn(4, '\t');
@@ -64,14 +82,6 @@ pub fn parse_listing(stdout: &str) -> Result<Vec<Listed>> {
         });
     }
 
-    if !terminated {
-        return Err(NvmuxError::Session(crate::error::SessionError::NotFound(
-            format!(
-                "the session listing did not complete (no {TERMINATOR} marker). \
-                 The command may not have run at all."
-            ),
-        )));
-    }
     Ok(rows)
 }
 
@@ -89,7 +99,6 @@ pub struct Spawned {
 /// Parse the output of `spawn.sh`.
 pub fn parse_spawn(stdout: &str) -> Result<Spawned> {
     let mut out = Spawned::default();
-    let mut terminated = false;
     let mut error = None;
     for line in stdout.lines() {
         let line = line.trim_end_matches('\r');
@@ -98,20 +107,16 @@ pub fn parse_spawn(stdout: &str) -> Result<Spawned> {
             Some(("SOCK", v)) => out.socket_appeared = v.trim() == "ok",
             // Surfacing the script's own reason beats a generic timeout.
             Some(("ERROR", v)) => error = Some(v.trim().to_string()),
-            _ if line == TERMINATOR => terminated = true,
+            _ if line == TERMINATOR => {}
             _ => tracing::debug!(line, "ignoring unrecognised line from spawn.sh"),
         }
     }
+    // The script's own reason first: it is more specific than "did not
+    // complete", and it survives a pipe that was cut before the terminator.
     if let Some(msg) = error {
-        return Err(NvmuxError::Session(crate::error::SessionError::NotFound(
-            msg,
-        )));
+        return Err(script_failed(msg));
     }
-    if !terminated {
-        return Err(NvmuxError::Session(crate::error::SessionError::NotFound(
-            format!("the spawn command did not complete (no {TERMINATOR} marker)"),
-        )));
-    }
+    require_terminator(stdout, "spawn command")?;
     Ok(out)
 }
 
@@ -126,22 +131,18 @@ pub struct HostProbe {
 
 /// Parse the output of `probe.sh`.
 pub fn parse_probe(stdout: &str) -> Result<HostProbe> {
+    require_terminator(stdout, "probe")?;
     let mut out = HostProbe::default();
-    let mut terminated = false;
     for line in stdout.lines() {
         let line = line.trim_end_matches('\r');
-        if line == TERMINATOR {
-            terminated = true;
-        } else if let Some(v) = line.strip_prefix("DIR ") {
+        if let Some(v) = line.strip_prefix("DIR ") {
             out.runtime_dir = v.trim().to_string();
         } else if let Some(v) = line.strip_prefix("NVIM ") {
             out.nvim_banner = v.trim().to_string();
         }
     }
-    if !terminated || out.runtime_dir.is_empty() {
-        return Err(NvmuxError::Session(crate::error::SessionError::NotFound(
-            "could not read the remote runtime directory".to_string(),
-        )));
+    if out.runtime_dir.is_empty() {
+        return Err(script_failed("could not read the remote runtime directory"));
     }
     Ok(out)
 }
@@ -162,15 +163,10 @@ pub enum KillOutcome {
 
 /// Parse the output of `kill.sh`.
 pub fn parse_kill(stdout: &str) -> Result<KillOutcome> {
+    require_terminator(stdout, "kill command")?;
     let mut outcome = None;
-    let mut terminated = false;
     for line in stdout.lines() {
-        let line = line.trim_end_matches('\r');
-        if line == TERMINATOR {
-            terminated = true;
-            continue;
-        }
-        if let Some(v) = line.strip_prefix("RESULT ") {
+        if let Some(v) = line.trim_end_matches('\r').strip_prefix("RESULT ") {
             outcome = match v.trim() {
                 "killed" => Some(KillOutcome::Killed),
                 "absent" => Some(KillOutcome::Absent),
@@ -180,32 +176,7 @@ pub fn parse_kill(stdout: &str) -> Result<KillOutcome> {
             };
         }
     }
-    if !terminated {
-        return Err(NvmuxError::Session(crate::error::SessionError::NotFound(
-            format!("the kill command did not complete (no {TERMINATOR} marker)"),
-        )));
-    }
-    outcome.ok_or_else(|| {
-        NvmuxError::Session(crate::error::SessionError::NotFound(
-            "the kill command reported no outcome".to_string(),
-        ))
-    })
-}
-
-/// Parse the output of a script that reports nothing but that it ran
-/// (`write_meta.sh`). The terminator is the whole message: without it a remote
-/// write that silently did nothing would be reported as success — the same
-/// hazard [`parse_listing`] guards against.
-pub fn parse_end(stdout: &str, what: &str) -> Result<()> {
-    let terminated = stdout
-        .lines()
-        .any(|line| line.trim_end_matches('\r') == TERMINATOR);
-    if !terminated {
-        return Err(NvmuxError::Session(crate::error::SessionError::NotFound(
-            format!("the {what} command did not complete (no {TERMINATOR} marker)"),
-        )));
-    }
-    Ok(())
+    outcome.ok_or_else(|| script_failed("the kill command reported no outcome"))
 }
 
 /// Turn parsed rows into sessions, dropping ones whose metadata is unusable.
@@ -276,14 +247,15 @@ mod tests {
 
     #[test]
     fn a_bare_terminator_means_the_write_ran() {
-        parse_end("NVMUX_END\n", "metadata write").expect("ran");
-        parse_end("Welcome to Ubuntu\nNVMUX_END\r\n", "metadata write").expect("noise is fine");
+        require_terminator("NVMUX_END\n", "metadata write").expect("ran");
+        require_terminator("Welcome to Ubuntu\nNVMUX_END\r\n", "metadata write")
+            .expect("noise is fine");
     }
 
     #[test]
     fn a_missing_terminator_is_a_failed_write_not_a_success() {
         for out in ["", "\n", "some banner\n"] {
-            let err = parse_end(out, "metadata write").expect_err(out);
+            let err = require_terminator(out, "metadata write").expect_err(out);
             assert!(err.to_string().contains("metadata write"), "{err}");
         }
     }
@@ -402,6 +374,34 @@ mod tests {
     fn a_timed_out_socket_is_reported() {
         let s = parse_spawn("PID 7\nSOCK timeout\nNVMUX_END\n").expect("parse");
         assert!(!s.socket_appeared);
+    }
+
+    /// `spawn.sh` refuses on a bad runtime directory and says why. That reason
+    /// must reach the user as itself: it used to be wrapped in
+    /// `SessionError::NotFound`, which renders `no session named {0:?}`, so a
+    /// permissions problem printed as `nvmux: no session named "runtime
+    /// directory /tmp/nvmux-1000 is not owned by us"`.
+    #[test]
+    fn a_refusal_from_the_script_is_reported_in_the_scripts_own_words() {
+        let err =
+            parse_spawn("ERROR runtime directory /tmp/nvmux-1000 is not owned by us\nNVMUX_END\n")
+                .expect_err("a refusal is not a spawn");
+        assert_eq!(
+            err.to_string(),
+            "runtime directory /tmp/nvmux-1000 is not owned by us"
+        );
+    }
+
+    /// The script's own reason beats "did not complete", and survives a pipe
+    /// that was cut before the terminator.
+    #[test]
+    fn a_refusal_outranks_a_missing_terminator() {
+        let err = parse_spawn("ERROR could not inspect runtime directory /tmp/x\n")
+            .expect_err("a refusal is not a spawn");
+        assert_eq!(
+            err.to_string(),
+            "could not inspect runtime directory /tmp/x"
+        );
     }
 
     #[test]

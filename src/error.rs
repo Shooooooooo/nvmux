@@ -106,6 +106,13 @@ pub enum SessionError {
     #[error("a session named {0:?} already exists")]
     Exists(String),
 
+    /// A session-host script did not run, or reported its own refusal. The
+    /// message is the script's, and is rendered bare: wrapping it in a sentence
+    /// of ours produced things like `no session named "runtime directory
+    /// /tmp/nvmux-1000 is not owned by us"`.
+    #[error("{0}")]
+    ScriptFailed(String),
+
     /// Session names are display metadata, but they still end up in shell
     /// commands and terminal output, so they are validated at the boundary.
     #[error("invalid session name {name:?}: {reason}")]

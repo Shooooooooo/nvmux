@@ -277,7 +277,7 @@ impl Transport for SshTransport {
         let mut session = Session::new(id.clone(), name.to_string(), spawned.pid.unwrap_or(0), num);
         let json = session.to_json()?;
         let out = self.run_script(shell::WRITE_META_SCRIPT, &[&self.remote_dir, &id, &json])?;
-        protocol::parse_end(&out.stdout, "metadata write")?;
+        protocol::require_terminator(&out.stdout, "metadata write")?;
         // See the local transport: the caller attaches without re-listing.
         session.state.num = num;
 
@@ -320,7 +320,7 @@ impl Transport for SshTransport {
         updated.name = new_name.to_string();
         let json = updated.to_json()?;
         let out = self.run_script(shell::WRITE_META_SCRIPT, &[&self.remote_dir, &s.id, &json])?;
-        protocol::parse_end(&out.stdout, "metadata write")?;
+        protocol::require_terminator(&out.stdout, "metadata write")?;
         tracing::info!(host = %self.host(), id = %s.id, to = new_name, "renamed");
         Ok(())
     }
