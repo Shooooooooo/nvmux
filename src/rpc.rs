@@ -80,6 +80,14 @@ impl Client<UnixStream> {
                 RpcError::ConnectionRefused(path.to_path_buf())
             }
             std::io::ErrorKind::NotFound => RpcError::ConnectionRefused(path.to_path_buf()),
+            // A regular file (or directory) sitting at the path. Linux reports
+            // that as ECONNREFUSED; macOS and the BSDs say ENOTSOCK. Either
+            // way nothing can be listening on a non-socket inode, so it is as
+            // dead as a missing one. Whether the file may be *deleted* is a
+            // separate question the reaper answers with `lstat`.
+            _ if e.raw_os_error() == Some(libc::ENOTSOCK) => {
+                RpcError::ConnectionRefused(path.to_path_buf())
+            }
             _ => RpcError::Io(e),
         })?;
         stream.set_read_timeout(Some(read_timeout))?;
@@ -467,6 +475,18 @@ mod tests {
     #[test]
     fn probing_a_missing_socket_is_dead_not_busy() {
         assert_eq!(probe(Path::new("/tmp/nvmux-nope.sock")), Liveness::Dead);
+    }
+
+    /// `connect()` on a regular file fails with ECONNREFUSED on Linux and
+    /// ENOTSOCK on macOS. Both mean "nothing is listening": reporting `Busy`
+    /// instead would list the file as a session.
+    #[test]
+    fn probing_a_regular_file_is_dead_not_busy() {
+        let path = std::env::temp_dir().join(format!("nvmux-notasock-{}.sock", std::process::id()));
+        std::fs::write(&path, b"not a socket").expect("write");
+        let liveness = probe(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(liveness, Liveness::Dead);
     }
 
     #[test]
