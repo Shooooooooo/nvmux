@@ -10,7 +10,7 @@ use crate::error::NvimError;
 /// 0.11 specifically because that is where `:detach` and `:connect` landed,
 /// which is what makes a session survive its UI going away.
 pub const MIN_VERSION: &str = "0.11";
-const MIN: (u64, u64) = (0, 11);
+pub(crate) const MIN: (u64, u64) = (0, 11);
 
 /// A parsed `nvim --version` banner.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -57,6 +57,7 @@ pub struct Client<S: Read + Write> {
     read_timeout: Duration,
 }
 
+/// Needed by `Result::expect_err` in the tests; `Client` is never logged.
 impl<S: Read + Write> std::fmt::Debug for Client<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Client")
@@ -231,10 +232,12 @@ impl<S: Read + Write> Client<S> {
         let arr = v
             .as_array()
             .ok_or_else(|| RpcError::Protocol("api_info was not an array".into()))?;
-        let channel = arr
-            .first()
-            .and_then(Value::as_u64)
-            .ok_or_else(|| RpcError::Protocol("api_info had no channel id".into()))?;
+        // Element 0 is our channel id, which nvmux never uses. Requiring it to be
+        // an integer anyway is what makes a non-nvim peer fail here, cleanly,
+        // rather than somewhere further downstream.
+        if arr.first().and_then(Value::as_u64).is_none() {
+            return Err(RpcError::Protocol("api_info had no channel id".into()));
+        }
         let meta = arr
             .get(1)
             .and_then(Value::as_map)
@@ -253,11 +256,9 @@ impl<S: Read + Write> Client<S> {
         };
 
         Ok(ApiInfo {
-            channel,
             major: field("major").unwrap_or(0),
             minor: field("minor").unwrap_or(0),
             patch: field("patch").unwrap_or(0),
-            api_level: field("api_level").unwrap_or(0),
         })
     }
 
@@ -292,19 +293,16 @@ impl<S: Read + Write> Client<S> {
 /// The parts of `nvim_get_api_info`'s version map that nvmux uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApiInfo {
-    /// Our channel id on this connection.
-    pub channel: u64,
     pub major: u64,
     pub minor: u64,
     pub patch: u64,
-    /// Gates features far more precisely than the version triple does.
-    pub api_level: u64,
 }
 
 impl ApiInfo {
-    /// nvmux needs 0.11: that is where `:detach` and `:connect` landed.
+    /// The same gate [`crate::nvim::Version::is_supported`] applies to a
+    /// `--version` banner, sourced from the one constant so the two cannot drift.
     pub fn is_supported(&self) -> bool {
-        (self.major, self.minor) >= (0, 11)
+        (self.major, self.minor) >= crate::nvim::MIN
     }
 }
 
@@ -440,11 +438,9 @@ mod tests {
     #[test]
     fn version_gate_matches_the_documented_minimum() {
         let at = |major, minor| ApiInfo {
-            channel: 1,
             major,
             minor,
             patch: 0,
-            api_level: 0,
         };
         assert!(!at(0, 9).is_supported());
         assert!(!at(0, 10).is_supported());

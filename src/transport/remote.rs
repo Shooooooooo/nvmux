@@ -38,6 +38,7 @@ pub struct SshTransport {
     forwarded: Mutex<HashSet<String>>,
 }
 
+/// Needed by `Result::expect_err` in the SSH tests; never logged.
 impl std::fmt::Debug for SshTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SshTransport")

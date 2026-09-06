@@ -38,10 +38,6 @@ impl LocalTransport {
         })
     }
 
-    pub fn runtime_dir(&self) -> &Path {
-        &self.dir
-    }
-
     fn paths(&self, id: &str) -> Result<SessionPaths> {
         Ok(SessionPaths::new(&self.dir, id)?)
     }

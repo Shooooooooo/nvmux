@@ -12,7 +12,7 @@ pub mod remote;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::error::{NvmuxError, Result, SessionError};
+use crate::error::{Result, SessionError};
 use crate::rpc;
 use crate::session::Session;
 
@@ -207,15 +207,10 @@ fn smallest_free(taken: &[u32]) -> u32 {
         .expect("u32 is not exhausted")
 }
 
-impl From<NvmuxError> for std::io::Error {
-    fn from(e: NvmuxError) -> Self {
-        std::io::Error::other(e.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::NvmuxError;
 
     #[test]
     fn a_taken_name_is_refused_case_insensitively_except_for_its_own_session() {
