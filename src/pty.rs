@@ -467,7 +467,7 @@ enum ChildState {
 /// `WNOWAIT` so an *exit* status is left in place for portable-pty's own reaper.
 fn check_child(attachment: &mut Attachment) -> ChildState {
     use nix::sys::signal::{kill, Signal};
-    use nix::sys::wait::{waitid, waitpid, Id, WaitPidFlag, WaitStatus};
+    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
     use nix::unistd::Pid;
 
     let Some(raw) = attachment.child.process_id() else {
@@ -475,28 +475,62 @@ fn check_child(attachment: &mut Attachment) -> ChildState {
     };
     let pid = Pid::from_raw(raw as i32);
 
-    // `waitid`, not `waitpid`. WNOWAIT is only valid for waitid(2): Linux's
-    // wait4 rejects the flag outright with EINVAL, so the waitpid spelling of
-    // this peek silently never reports anything and a stopped client would sit
-    // frozen forever. (Measured — it returned EINVAL on every poll.)
-    let peek =
-        WaitPidFlag::WNOHANG | WaitPidFlag::WEXITED | WaitPidFlag::WSTOPPED | WaitPidFlag::WNOWAIT;
-
-    match waitid(Id::Pid(pid), peek) {
-        Ok(WaitStatus::Stopped(_, sig)) => {
+    match peek_child(pid) {
+        Peek::Stopped => {
             // Consume just the stop notification, which does not reap the
             // process, then wake it up. Without consuming it, the peek would
             // report the same stop on every poll and SIGCONT would be sent
             // repeatedly.
-            let _ = waitpid(pid, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED));
+            let sig = match waitpid(pid, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED)) {
+                Ok(WaitStatus::Stopped(_, sig)) => Some(sig),
+                _ => None,
+            };
             tracing::info!(?sig, "the remote-ui client stopped; continuing it");
             let _ = kill(pid, Signal::SIGCONT);
             ChildState::Running
         }
-        Ok(WaitStatus::Exited(..)) | Ok(WaitStatus::Signaled(..)) => ChildState::Gone,
-        // Already reaped by someone else, which also means it is gone.
-        Err(nix::errno::Errno::ECHILD) => ChildState::Gone,
-        _ => ChildState::Running,
+        Peek::Gone => ChildState::Gone,
+        Peek::Running => ChildState::Running,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Peek {
+    Running,
+    Stopped,
+    Gone,
+}
+
+/// Look at a child's state without changing it.
+///
+/// `waitid`, not `waitpid`. WNOWAIT is only valid for waitid(2): Linux's
+/// wait4 rejects the flag outright with EINVAL, so the waitpid spelling of
+/// this peek silently never reports anything and a stopped client would sit
+/// frozen forever. (Measured — it returned EINVAL on every poll.)
+///
+/// Called through `libc` rather than `nix`: nix binds `waitid` only on Linux
+/// and FreeBSD, but the call itself is POSIX and macOS has it too.
+fn peek_child(pid: nix::unistd::Pid) -> Peek {
+    // WNOHANG with nothing to report succeeds and leaves `si_signo` (and
+    // `si_pid`) zero, which is only distinguishable if the struct starts out
+    // zeroed.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let flags = libc::WNOHANG | libc::WEXITED | libc::WSTOPPED | libc::WNOWAIT;
+    let rc = unsafe { libc::waitid(libc::P_PID, pid.as_raw() as libc::id_t, &mut info, flags) };
+    if rc < 0 {
+        return match nix::errno::Errno::last() {
+            // Already reaped by someone else, which also means it is gone.
+            nix::errno::Errno::ECHILD => Peek::Gone,
+            _ => Peek::Running,
+        };
+    }
+    if info.si_signo == 0 {
+        return Peek::Running;
+    }
+    match info.si_code {
+        libc::CLD_STOPPED | libc::CLD_TRAPPED => Peek::Stopped,
+        libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED => Peek::Gone,
+        _ => Peek::Running,
     }
 }
 
@@ -631,6 +665,69 @@ mod tests {
             assert_eq!(got, Some(want), "{action:?}");
         }
         assert!(out.is_empty(), "a command writes nothing to the child");
+    }
+
+    /// The peek sees a stop, leaves it in place, and sees an exit without
+    /// reaping it. Runs against a real child because `waitid` is what differs
+    /// between platforms: nix does not bind it on macOS, so it goes through
+    /// `libc`, and the flag and `si_code` handling has to hold on both.
+    #[test]
+    fn peek_reports_stopped_and_gone_without_consuming_either() {
+        use nix::sys::signal::{kill, Signal};
+        use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+        use nix::unistd::Pid;
+
+        /// Kill and reap the child however the test ends.
+        struct Guard(std::process::Child);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        // Poll until the child reaches `want`: signals are delivered
+        // asynchronously, so the state is not visible on the first look.
+        fn settle(pid: Pid, want: Peek) -> Peek {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let got = peek_child(pid);
+                if got == want || Instant::now() > deadline {
+                    return got;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let mut guard = Guard(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep"),
+        );
+        let pid = Pid::from_raw(guard.0.id() as i32);
+        assert_eq!(peek_child(pid), Peek::Running);
+
+        kill(pid, Signal::SIGSTOP).expect("stop");
+        assert_eq!(settle(pid, Peek::Stopped), Peek::Stopped);
+        // WNOWAIT: the notification is still there for the next look.
+        assert_eq!(peek_child(pid), Peek::Stopped);
+
+        // What `check_child` does with a stop: consume it, then continue.
+        assert!(matches!(
+            waitpid(pid, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED)),
+            Ok(WaitStatus::Stopped(_, Signal::SIGSTOP))
+        ));
+        kill(pid, Signal::SIGCONT).expect("continue");
+        assert_eq!(settle(pid, Peek::Running), Peek::Running);
+
+        kill(pid, Signal::SIGKILL).expect("kill");
+        assert_eq!(settle(pid, Peek::Gone), Peek::Gone);
+        // Not reaped by the peek: the owner's `wait` still gets the status.
+        let status = guard.0.wait().expect("reap");
+        assert!(!status.success());
+        // And once it is reaped, ECHILD reads as gone too.
+        assert_eq!(peek_child(pid), Peek::Gone);
     }
 
     /// A write failure is the relay's error, not something to swallow: the
