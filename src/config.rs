@@ -1,11 +1,11 @@
 //! The user's configuration file.
 //!
 //! nvmux runs with no configuration at all; this module is how it *optionally*
-//! reads one. The governing idea is that a config file only ever *overrides* —
-//! every default is sourced from the very [`const`](crate::fade::FRAMES) the
-//! hard-wired code used, so an absent file, an empty file, and an omitted field
-//! all reproduce the built-in behaviour byte for byte (see [`FadeSettings`] /
-//! [`KeySettings`] `Default`).
+//! reads one. The governing idea is that a config file only ever *overrides*:
+//! an absent file, an empty file and an omitted field all reproduce the
+//! built-in behaviour byte for byte, because they all resolve through
+//! [`FadeSettings`] / [`KeySettings`] `Default` — which is where each default
+//! is written down, once.
 //!
 //! # Strict, and loud
 //!
@@ -54,10 +54,20 @@ pub struct FadeSettings {
     /// [`crate::fade::enabled`].
     pub enabled: bool,
     /// Steps per direction; must be at least 1 (see `Settings::validate`).
+    /// Eight is enough to read as motion without dragging.
     pub frames: usize,
+    /// Delay between frames; `frames * frame_delay_ms` is one direction's
+    /// duration.
     pub frame_delay_ms: u64,
+    /// How long the screen is held fully black across a hand-off, covering the
+    /// client swap or the alt-screen crossing so neither shows through.
     pub hold_ms: u64,
+    /// Whether the quick `<prefix> ?` / `<prefix> c` / picker-peek excursions
+    /// fade too. Off makes those snappier at the cost of consistency.
     pub excursions: bool,
+    /// Dissolve the raw session out to black cell by cell. Off makes the raw
+    /// path an instant blackout instead — cheaper over a slow link, but a hard
+    /// cut.
     pub raw_dissolve: bool,
 }
 
@@ -69,22 +79,25 @@ pub struct KeySettings {
     /// control byte by [`crate::keys::parse_prefix`].
     #[serde(deserialize_with = "de_prefix")]
     pub prefix: u8,
+    /// How long to wait for the second byte of a prefix sequence before
+    /// deciding the user meant a literal `<prefix>`, and how long a half-typed
+    /// session number waits for another digit.
     pub timeout_ms: u64,
 }
 
-// The defaults are the current constants, so `Settings::default()` — which the
-// container `#[serde(default)]` uses for every missing field — is exactly
-// today's behaviour.
+// These are the built-in behaviour. `#[serde(default)]` on the containers means
+// an absent file, an empty file and an omitted field all land here, so this is
+// the one place a default is written down.
 
 impl Default for FadeSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            frames: crate::fade::FRAMES,
-            frame_delay_ms: crate::fade::FRAME_DELAY.as_millis() as u64,
-            hold_ms: crate::fade::HOLD.as_millis() as u64,
-            excursions: crate::fade::EXCURSIONS,
-            raw_dissolve: crate::fade::RAW_FADE_DISSOLVE,
+            frames: 8,
+            frame_delay_ms: 12,
+            hold_ms: 30,
+            excursions: true,
+            raw_dissolve: true,
         }
     }
 }
@@ -92,8 +105,11 @@ impl Default for FadeSettings {
 impl Default for KeySettings {
     fn default() -> Self {
         Self {
+            // Not a literal: `keys::PREFIX` is read directly by the first-run
+            // screen and by `--help`, which are printed before any config is
+            // loaded, so it has to exist on its own.
             prefix: crate::keys::PREFIX,
-            timeout_ms: crate::keys::TIMEOUT.as_millis() as u64,
+            timeout_ms: 500,
         }
     }
 }
@@ -357,22 +373,16 @@ mod tests {
 
     // --- defaults / parsing (pure) -----------------------------------------
 
+    /// The one default that is not written here: `keys::PREFIX` exists on its
+    /// own because `--help` and the first-run screen are printed before any
+    /// config is read. The two must agree.
+    ///
+    /// Every other default is pinned by
+    /// `a_full_document_at_the_defaults_round_trips`, which spells each value
+    /// out in TOML and asserts the result equals `Settings::default()`.
     #[test]
-    fn defaults_match_the_current_constants() {
-        let f = FadeSettings::default();
-        assert!(f.enabled);
-        assert_eq!(f.frames, crate::fade::FRAMES);
-        assert_eq!(
-            f.frame_delay_ms,
-            crate::fade::FRAME_DELAY.as_millis() as u64
-        );
-        assert_eq!(f.hold_ms, crate::fade::HOLD.as_millis() as u64);
-        assert_eq!(f.excursions, crate::fade::EXCURSIONS);
-        assert_eq!(f.raw_dissolve, crate::fade::RAW_FADE_DISSOLVE);
-
-        let k = KeySettings::default();
-        assert_eq!(k.prefix, crate::keys::PREFIX);
-        assert_eq!(k.timeout_ms, crate::keys::TIMEOUT.as_millis() as u64);
+    fn the_default_prefix_is_the_one_the_key_machine_uses() {
+        assert_eq!(KeySettings::default().prefix, crate::keys::PREFIX);
     }
 
     #[test]

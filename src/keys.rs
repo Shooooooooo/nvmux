@@ -36,10 +36,6 @@ pub const PREFIX: u8 = 0x14;
 /// in `--help`. A test ties it to [`PREFIX`].
 pub const PREFIX_LABEL: &str = "Ctrl-t";
 
-/// How long to wait for the second byte of a prefix sequence before deciding
-/// the user meant a literal `<prefix>`.
-pub const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
-
 /// Something the proxy must do instead of forwarding bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -155,7 +151,7 @@ pub fn prefix_label(byte: u8) -> String {
 }
 
 /// Carriage return, which is what Enter is in raw mode. Ends a number early
-/// rather than waiting out the [`TIMEOUT`].
+/// rather than waiting out `keys.timeout_ms`.
 const ENTER: u8 = 0x0d;
 
 /// Where the machine is between keystrokes.
@@ -213,7 +209,7 @@ impl Prefix {
         }
     }
 
-    /// True if the machine is mid-sequence and a [`TIMEOUT`] must be armed —
+    /// True if the machine is mid-sequence and a timeout must be armed —
     /// either a lone `<prefix>` or a half-typed number. The caller polls on the
     /// short timeout while this holds, so a number does not resolve late.
     pub fn is_armed(&self) -> bool {
@@ -315,7 +311,7 @@ impl Prefix {
         }
     }
 
-    /// Called when no byte arrived within [`TIMEOUT`] of the machine arming.
+    /// Called when no byte arrived within `keys.timeout_ms` of the machine arming.
     ///
     /// Resolves a lone `<prefix>` into a literal one, and a half-typed number into
     /// the session it already names. Idempotent, so a caller that fires its

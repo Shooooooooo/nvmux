@@ -231,7 +231,7 @@ impl App {
         }
     }
 
-    /// Called by the driver once [`crate::keys::TIMEOUT`] has passed with a
+    /// Called by the driver once `keys.timeout_ms` has passed with a
     /// number half-typed: settle for the session it already names.
     pub fn resolve_pending(&mut self) -> Request {
         match self.pending.take() {

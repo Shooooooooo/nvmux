@@ -38,24 +38,6 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::term;
 
-/// Steps per direction. Eight is enough to read as motion without dragging.
-pub const FRAMES: usize = 8;
-
-/// Delay between frames — `FRAMES * FRAME_DELAY` is one direction's duration.
-pub const FRAME_DELAY: Duration = Duration::from_millis(12);
-
-/// How long the screen is held fully black across a hand-off, covering the
-/// client swap or the alt-screen crossing so neither shows through.
-pub const HOLD: Duration = Duration::from_millis(30);
-
-/// Whether the quick `<prefix> ?` / `<prefix> c` / picker-peek excursions fade too.
-/// Off makes those snappier at the cost of consistency.
-pub const EXCURSIONS: bool = true;
-
-/// Dissolve the raw session out to black cell by cell. Off makes the raw path an
-/// instant blackout instead — cheaper over a slow link, but a hard cut.
-pub const RAW_FADE_DISSOLVE: bool = true;
-
 /// Pure black, written the same way on both paths (truecolor `48;2;0;0;0`) so the
 /// picker's dip and a session's dip are the same shade.
 const BLACK: Color = Color::Rgb(0, 0, 0);
@@ -111,7 +93,7 @@ fn is_enabled(config_enabled: bool, no_color: bool) -> bool {
 }
 
 /// Whether the quick excursions — [`crate::ui::help`], the create prompt, a
-/// picker peek — fade too. Config-driven; the [`EXCURSIONS`] constant is its
+/// picker peek — fade too. Config-driven; `fade.excursions` is its
 /// default.
 pub fn excursions() -> bool {
     crate::config::get().fade.excursions
@@ -178,7 +160,7 @@ where
 }
 
 /// Dissolve a ratatui screen out to black, ending fully black and held for
-/// [`HOLD`] so the hand-off that follows never flashes the old content.
+/// `fade.hold_ms` so the hand-off that follows never flashes the old content.
 pub fn fade_out_ratatui<F>(terminal: &mut DefaultTerminal, mut draw: F) -> io::Result<()>
 where
     F: FnMut(&mut Frame),
@@ -275,7 +257,7 @@ fn fill_black(out: &mut impl Write) -> io::Result<()> {
     out.flush()
 }
 
-/// Dissolve the raw session screen out to black, then hold [`HOLD`].
+/// Dissolve the raw session screen out to black, then hold `fade.hold_ms`.
 ///
 /// Writes only the cells that turn black on each frame (a delta — the threshold
 /// is monotonic, so each cell is written once across the whole dissolve),
@@ -461,10 +443,11 @@ mod tests {
     #[test]
     fn dissolve_frames_black_each_cell_exactly_once() {
         let (w, h) = (40u16, 12u16);
+        let frames = crate::config::FadeSettings::default().frames;
         let mut counts = vec![0u32; (w as usize) * (h as usize)];
         let mut prev = 0.0f32;
-        for step in 1..=FRAMES {
-            let cur = step as f32 / FRAMES as f32;
+        for step in 1..=frames {
+            let cur = step as f32 / frames as f32;
             for y in 0..h {
                 for x in 0..w {
                     let t = threshold(x, y);
