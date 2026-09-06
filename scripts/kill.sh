@@ -17,28 +17,13 @@
 # There is no graceful RPC step: nvmux terminates a session rather than asking
 # it to quit. SIGTERM first, so nvim runs VimLeavePre, writes its ShaDa file and
 # unlinks its own socket; SIGKILL if it will not go.
-#
-# POSIX sh only.
-
-set -u
+[ -n "${NVMUX_PRELUDE:-}" ] || . "$(dirname -- "$0")/_prelude.sh"
 
 dir="${1:?usage: kill.sh <runtime_dir> <id> <pid>}"
 id="${2:?usage: kill.sh <runtime_dir> <id> <pid>}"
 pid="${3:-}"
 
 sock="$dir/$id.sock"
-
-# The command line of a pid, or empty if we cannot find out. /proc first so this
-# works on a Linux box with no ps at all; `-ww` stops macOS truncating to
-# terminal width, which would break the match for exactly the long socket paths
-# where identity matters most.
-cmdline() {
-  if [ -r "/proc/$1/cmdline" ]; then
-    tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null
-  else
-    ps -ww -o args= -p "$1" 2>/dev/null
-  fi
-}
 
 # Is this pid the nvim serving THIS session's socket? `grep -F` because the path
 # is data, not a pattern.
@@ -64,26 +49,25 @@ gone() {
   is_zombie "$1"
 }
 
-# Can we inspect processes at all? If not, "no process found" is not evidence.
-can_inspect() {
-  [ -r "/proc/$$/cmdline" ] && return 0
-  ps -ww -o args= -p $$ >/dev/null 2>&1
+# Poll for up to $2 tenths of a second. `sleep 0.1` is not POSIX, so fall back
+# to a whole second where it is rejected.
+wait_gone() {
+  i=0
+  while [ "$i" -lt "$2" ]; do
+    gone "$1" && return 0
+    sleep 0.1 2>/dev/null || sleep 1
+    i=$((i + 1))
+  done
+  gone "$1"
 }
 
-# Find whatever is serving this socket. The recorded pid is only a starting
-# guess -- it was validated at spawn time, but pids are reused -- so it is used
-# only if it still owns this socket. The socket, not the pid, is the identity.
-#
-# `-A` not `-e`: on macOS `-e` means "show the environment". `-u` keeps the
-# search inside our own processes.
+# The recorded pid is only a starting guess -- it was validated at spawn time,
+# but pids are reused -- so it is used only if it still owns this socket.
 target=''
 if [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null && ! gone "$pid" && owns_socket "$pid"; then
   target=$pid
 else
-  target=$(ps -ww -A -u "$(id -u)" -o pid=,args= 2>/dev/null \
-           | grep -F -- "--listen $sock" \
-           | grep -v grep \
-           | awk 'NR==1{print $1}')
+  target=$(serving_pid "$sock")
 fi
 
 if [ -n "$target" ]; then
@@ -93,21 +77,9 @@ if [ -n "$target" ]; then
 
   # Generous: this is where VimLeavePre and ShaDa writes happen, and cutting it
   # short to feel responsive corrupts exit-time state.
-  i=0
-  while [ "$i" -lt 100 ]; do
-    gone "$target" && break
-    sleep 0.1 2>/dev/null || sleep 1
-    i=$((i + 1))
-  done
-
-  if ! gone "$target"; then
+  if ! wait_gone "$target" 100; then
     kill -KILL "$target" 2>/dev/null
-    i=0
-    while [ "$i" -lt 20 ]; do
-      gone "$target" && break
-      sleep 0.1 2>/dev/null || sleep 1
-      i=$((i + 1))
-    done
+    wait_gone "$target" 20
   fi
 
   if gone "$target"; then
@@ -126,8 +98,8 @@ fi
 # Only once the session is genuinely gone: deleting while nvim still runs
 # orphans it permanently, with no socket left for any listing to find.
 if [ "$result" = killed ] || [ "$result" = absent ]; then
-  rm -f "$sock" "$dir/$id.json" "$dir/$id.log"
+  purge "$dir" "$id"
 fi
 
 printf 'RESULT %s\n' "$result"
-printf 'NVMUX_END\n'
+finish

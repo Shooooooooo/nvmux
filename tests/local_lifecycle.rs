@@ -238,13 +238,11 @@ fn a_number_survives_the_metadata_round_trip() {
     let t = scratch.transport();
 
     let session = t.create_session("only").expect("create");
-    let raw = std::fs::read_to_string(scratch.0.join(format!("{}.json", session.id)))
-        .expect("read metadata");
-    let v: serde_json::Value = serde_json::from_str(&raw).expect("json");
+    let v = common::read_meta(&scratch.0.join(format!("{}.json", session.id)));
     assert_eq!(
         v.get("num").and_then(serde_json::Value::as_u64),
         Some(u64::from(session.num)),
-        "the number must be on disk, not just in memory: {raw}"
+        "the number must be on disk, not just in memory: {v}"
     );
 
     assert_eq!(t.list_sessions().expect("list")[0].num, session.num);
@@ -262,10 +260,9 @@ fn metadata_without_a_number_still_lists_and_gets_one() {
     let path = scratch.0.join(format!("{}.json", session.id));
 
     // Rewrite it the way an older nvmux would have.
-    let mut v: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+    let mut v = common::read_meta(&path);
     v.as_object_mut().expect("object").remove("num");
-    std::fs::write(&path, serde_json::to_string(&v).expect("serialise")).expect("write");
+    common::write_meta(&path, &v);
 
     let listed = t.list_sessions().expect("list");
     assert_eq!(listed.len(), 1, "an unnumbered session must still list");
@@ -336,18 +333,7 @@ fn a_dead_session_is_reaped_from_the_listing() {
     let sock = t.local_socket_for(&session).expect("socket");
     let json = sock.with_extension("json");
 
-    // SIGKILL leaves the socket file behind — that is what makes stale cleanup
-    // necessary rather than theoretical.
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(session.pid as i32),
-        nix::sys::signal::Signal::SIGKILL,
-    )
-    .expect("kill -9");
-
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline && !sock.exists() {
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    common::sigkill_and_wait(session.pid);
     assert!(
         sock.exists(),
         "precondition: SIGKILL should leave a stale socket"
@@ -413,11 +399,7 @@ fn a_busy_session_is_never_reaped() {
 
     // Block the editor's main loop the way `:!make` would. `system()` does not
     // pump the event loop, so deferred RPC calls stop answering entirely.
-    let mut client = nvmux::rpc::Client::connect(&sock, Duration::from_secs(2)).expect("connect");
-    std::thread::spawn(move || {
-        let _ = client.command("call system('sleep 8')");
-    });
-    std::thread::sleep(Duration::from_millis(500));
+    common::block_editor(&sock, "call system('sleep 8')", Duration::from_millis(500));
 
     let listed = t.list_sessions().expect("list");
     assert_eq!(listed.len(), 1, "a busy session must still be listed");
@@ -476,18 +458,18 @@ fn a_session_busy_in_cpu_bound_lua_is_never_reaped() {
     let pid = session.pid;
 
     // Peg the main loop with real work for longer than any probe budget.
-    let mut client = nvmux::rpc::Client::connect(&sock, Duration::from_secs(2)).expect("connect");
-    std::thread::spawn(move || {
-        let _ = client.command(
-            "call luaeval('(function() local t=os.clock() while os.clock()-t<6 do end return 1 end)()')",
-        );
-    });
-    std::thread::sleep(Duration::from_millis(700));
+    common::block_editor(
+        &sock,
+        "call luaeval('(function() local t=os.clock() while os.clock()-t<6 do end return 1 end)()')",
+        Duration::from_millis(700),
+    );
 
     let listed = t.list_sessions().expect("list");
 
-    let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok();
-    assert!(alive, "precondition: the session should still be running");
+    assert!(
+        common::alive(pid),
+        "precondition: the session should still be running"
+    );
 
     assert!(
         sock.exists(),
@@ -517,11 +499,7 @@ fn a_timed_out_call_poisons_the_connection() {
     let sock = t.local_socket_for(&session).expect("socket");
 
     // Block the editor, then make a call that cannot possibly be answered.
-    let mut blocker = nvmux::rpc::Client::connect(&sock, Duration::from_secs(2)).expect("connect");
-    std::thread::spawn(move || {
-        let _ = blocker.command("call system('sleep 4')");
-    });
-    std::thread::sleep(Duration::from_millis(400));
+    common::block_editor(&sock, "call system('sleep 4')", Duration::from_millis(400));
 
     let mut client =
         nvmux::rpc::Client::connect(&sock, Duration::from_millis(300)).expect("connect");
@@ -565,15 +543,17 @@ fn a_recycled_pid_neither_misfires_nor_blocks_the_kill() {
         .spawn()
         .expect("spawn decoy");
 
-    let out = std::process::Command::new("/bin/sh")
-        .arg("scripts/kill.sh")
-        .arg(&scratch.0)
-        .arg(&session.id)
-        .arg(decoy.id().to_string())
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .expect("run kill.sh");
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The embedded script, not the file on disk: this is the copy that ships.
+    let out = nvmux::proc::run_local(
+        nvmux::shell::KILL_SCRIPT,
+        &[
+            &scratch.0.to_string_lossy(),
+            &session.id,
+            &decoy.id().to_string(),
+        ],
+    )
+    .expect("run kill.sh");
+    let stdout = out.stdout;
 
     assert!(
         stdout.contains("RESULT killed"),
@@ -583,13 +563,10 @@ fn a_recycled_pid_neither_misfires_nor_blocks_the_kill() {
     assert!(!json.exists(), "the metadata should have been cleaned up");
 
     assert!(
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(decoy.id() as i32), None).is_ok(),
+        common::alive(decoy.id()),
         "kill.sh signalled a process that was not the session"
     );
-    let _ = nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(decoy.id() as i32),
-        nix::sys::signal::Signal::SIGKILL,
-    );
+    let _ = decoy.kill();
     let _ = decoy.wait();
 }
 
@@ -603,22 +580,91 @@ fn killing_an_already_dead_session_cleans_up_its_files() {
     let sock = t.local_socket_for(&session).expect("socket");
     let json = sock.with_extension("json");
 
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(session.pid as i32),
-        nix::sys::signal::Signal::SIGKILL,
-    )
-    .expect("kill -9");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline
-        && nix::sys::signal::kill(nix::unistd::Pid::from_raw(session.pid as i32), None).is_ok()
-    {
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    common::sigkill_and_wait(session.pid);
 
     t.kill_session(&session)
         .expect("killing a dead session should succeed");
     assert!(!sock.exists(), "the stale socket should be gone");
     assert!(!json.exists(), "the orphaned metadata should be gone");
+}
+
+/// A host with `/proc` but no `ps` must still be able to kill a session.
+///
+/// `list.sh` always had a `/proc` path; `kill.sh` and `spawn.sh` did not, and
+/// looked the session up with `ps` alone. On a minimal container — `/proc`
+/// mounted, procps not installed — `kill.sh` therefore found nothing, reported
+/// `absent`, deleted the socket and left nvim running with no socket left for
+/// any listing to find it by. Exactly the orphan its own comments forbid.
+///
+/// Linux only: the fallback being tested is the `/proc` one.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_session_can_be_killed_on_a_host_with_proc_but_no_ps() {
+    require_nvim!();
+    if !std::path::Path::new("/proc/self/cmdline").exists() {
+        eprintln!("skipping: no /proc");
+        return;
+    }
+    let scratch = Scratch::new("nops");
+    let t = scratch.transport();
+    let session = t.create_session("noprocps").expect("create");
+    let sock = t.local_socket_for(&session).expect("socket");
+
+    // A PATH with everything the script needs except `ps`.
+    let bin = scratch.0.join("bin");
+    std::fs::create_dir_all(&bin).expect("bin");
+    for tool in [
+        "sh", "tr", "grep", "awk", "rm", "sleep", "kill", "id", "printf", "cut", "dirname",
+    ] {
+        if let Ok(real) = which(tool) {
+            let _ = std::os::unix::fs::symlink(real, bin.join(tool));
+        }
+    }
+
+    let out = std::process::Command::new(bin.join("sh"))
+        .arg("-s")
+        .arg(&scratch.0)
+        .arg(&session.id)
+        .arg("")
+        .env_clear()
+        .env("PATH", &bin)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut c| {
+            use std::io::Write;
+            c.stdin
+                .take()
+                .expect("stdin")
+                .write_all(nvmux::shell::KILL_SCRIPT.as_bytes())?;
+            c.wait_with_output()
+        })
+        .expect("run kill.sh");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("RESULT killed"),
+        "without ps the session must still be found by /proc, got: {stdout} \
+         stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(3), || !common::alive(session.pid)),
+        "the session should have been signalled, not just reported gone"
+    );
+    assert!(!sock.exists(), "the socket should have been removed");
+}
+
+/// The first `tool` on `$PATH`, so the sandbox above can link real binaries.
+#[cfg(target_os = "linux")]
+fn which(tool: &str) -> Result<PathBuf, ()> {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .map(|d| d.join(tool))
+        .find(|c| c.is_file())
+        .ok_or(())
 }
 
 /// A stale pid in the metadata must not stop a normal kill from working.
@@ -635,17 +681,11 @@ fn a_stale_pid_does_not_break_an_otherwise_normal_kill() {
     let sock = t.local_socket_for(&session).expect("socket");
     let json = sock.with_extension("json");
 
-    let mut meta: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&json).expect("read")).expect("parse");
+    let mut meta = common::read_meta(&json);
     meta["pid"] = serde_json::json!(999_999_u32);
-    std::fs::write(&json, meta.to_string()).expect("write");
+    common::write_meta(&json, &meta);
 
-    let stale = t
-        .list_sessions()
-        .expect("list")
-        .into_iter()
-        .find(|s| s.id == session.id)
-        .expect("listed");
+    let stale = common::find_by_id(&t, &session.id).expect("listed");
 
     t.kill_session(&stale)
         .expect("a graceful kill should still succeed");

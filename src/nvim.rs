@@ -10,7 +10,7 @@ use crate::error::NvimError;
 /// 0.11 specifically because that is where `:detach` and `:connect` landed,
 /// which is what makes a session survive its UI going away.
 pub const MIN_VERSION: &str = "0.11";
-const MIN: (u64, u64) = (0, 11);
+pub(crate) const MIN: (u64, u64) = (0, 11);
 
 /// A parsed `nvim --version` banner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,26 +112,6 @@ pub fn check_local() -> Result<Version, NvimError> {
     Ok(version)
 }
 
-/// The minimum `ssh` nvmux supports.
-///
-/// 6.7 is where unix-domain socket forwarding (`-L <local_sock>:<remote_sock>`)
-/// was added, which is the entire remote transport.
-pub const MIN_SSH_VERSION: &str = "6.7";
-
-/// Parse the version out of `ssh -V` output, e.g. `OpenSSH_9.6p1 Ubuntu-3...`.
-pub fn parse_ssh_version(banner: &str) -> Option<(u64, u64)> {
-    let token = banner.split_whitespace().next()?;
-    let rest = token.strip_prefix("OpenSSH_")?;
-    let numeric: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
-    let mut parts = numeric.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next().and_then(|m| m.parse().ok()).unwrap_or(0);
-    Some((major, minor))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,20 +181,6 @@ mod tests {
     fn display_round_trips() {
         assert_eq!(v(0, 11, 4, None).to_string(), "0.11.4");
         assert_eq!(v(0, 13, 0, Some("dev-1511")).to_string(), "0.13.0-dev-1511");
-    }
-
-    #[test]
-    fn parses_ssh_banners() {
-        assert_eq!(
-            parse_ssh_version("OpenSSH_9.6p1 Ubuntu-3ubuntu13.19, OpenSSL 3.0.13"),
-            Some((9, 6))
-        );
-        assert_eq!(
-            parse_ssh_version("OpenSSH_9.0p1, LibreSSL 3.3.6"),
-            Some((9, 0))
-        );
-        assert_eq!(parse_ssh_version("OpenSSH_6.7p1"), Some((6, 7)));
-        assert_eq!(parse_ssh_version("something else"), None);
     }
 
     /// Runs against whatever nvim is actually installed, when there is one.

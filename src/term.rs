@@ -121,7 +121,7 @@ pub struct RawMode {
 impl RawMode {
     /// Put the terminal into raw mode with signals disabled.
     pub fn enter() -> Result<Self> {
-        let saved = termios::tcgetattr(stdin_fd()).map_err(errno)?;
+        let saved = termios::tcgetattr(stdin_fd())?;
 
         // The signal-readable copy is taken with a raw `tcgetattr` rather than
         // by converting the nix value: `From<Termios> for libc::termios`
@@ -139,7 +139,7 @@ impl RawMode {
 
         // TCSANOW, not TCSAFLUSH: discarding type-ahead would silently eat
         // keystrokes someone typed while the session was still starting.
-        termios::tcsetattr(stdin_fd(), SetArg::TCSANOW, &raw).map_err(errno)?;
+        termios::tcsetattr(stdin_fd(), SetArg::TCSANOW, &raw)?;
 
         Ok(Self {
             saved,
@@ -180,10 +180,6 @@ fn install_signal_handlers() {
             }
         }
     });
-}
-
-fn errno(e: nix::errno::Errno) -> crate::error::NvmuxError {
-    crate::error::NvmuxError::Io(std::io::Error::from(e))
 }
 
 /// The terminal's current size, as a PTY size.

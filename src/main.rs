@@ -4,18 +4,18 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use nvmux::cli::Cli;
-use nvmux::{config, logging, nvim, pty, settings, transport, ui};
+use nvmux::{config, logging, nvim, paths, pty, transport, ui};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Everything else depends on this existing and being ours.
-    let dir = config::ensure_runtime_dir().context("preparing the nvmux runtime directory")?;
+    let dir = paths::ensure_runtime_dir().context("preparing the nvmux runtime directory")?;
     logging::init(&dir)?;
 
     // Before anything is spawned — and before a first-run config file is written
-    // in `run` — restrict the umask: see `config::restrict_umask`.
-    config::restrict_umask();
+    // in `run` — restrict the umask: see `paths::restrict_umask`.
+    paths::restrict_umask();
 
     // Before any screen is drawn, so a `kill` during the picker — not only
     // during an attached session — hands back a usable terminal.
@@ -43,7 +43,7 @@ fn run(cli: &Cli) -> Result<()> {
     // run here — so it is established before any transport, `nvmux <host>`
     // included. On a genuine first run at an interactive terminal this asks for a
     // prefix and records it; otherwise it loads whatever exists (or the defaults).
-    settings::init(establish_settings()?);
+    config::init(establish_settings()?);
 
     let transport = transport::open(location.clone())?;
     session_loop(transport.as_ref())
@@ -56,22 +56,22 @@ fn run(cli: &Cli) -> Result<()> {
 /// already there, an explicit config, a piped/non-interactive run — just loads
 /// normally. Failing to *write* the chosen config is reported but not fatal: the
 /// prefix still applies this session, and the next run will ask again.
-fn establish_settings() -> Result<settings::Settings> {
+fn establish_settings() -> Result<config::Settings> {
     use std::io::IsTerminal;
 
-    match settings::first_run_target() {
+    match config::first_run_target() {
         Some(path) if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => {
             match ui::setup::run()? {
                 ui::setup::Outcome::Chosen(prefix) => {
-                    if let Err(e) = settings::write_default(&path, prefix) {
+                    if let Err(e) = config::write_default(&path, prefix) {
                         eprintln!("nvmux: could not write {}: {e}", path.display());
                     }
-                    Ok(settings::with_prefix(prefix))
+                    Ok(config::with_prefix(prefix))
                 }
-                ui::setup::Outcome::Skipped => Ok(settings::Settings::default()),
+                ui::setup::Outcome::Skipped => Ok(config::Settings::default()),
             }
         }
-        _ => Ok(settings::load()?),
+        _ => Ok(config::load()?),
     }
 }
 

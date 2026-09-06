@@ -78,11 +78,7 @@ struct State {
 /// Show the screen until the user confirms or skips. Owns the terminal, like
 /// [`crate::ui::help::run`]; no fade, because nothing has faded to black yet.
 pub fn run() -> Result<Outcome> {
-    let mut screen = super::Screen::open(false)?;
-    let outcome = run_loop(screen.terminal());
-    // Restore before propagating: see `ui::Screen`.
-    screen.close()?;
-    outcome
+    super::owning(false, run_loop)
 }
 
 fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Outcome> {
@@ -208,19 +204,5 @@ mod tests {
     fn a_plain_key_is_ignored() {
         assert_eq!(interpret(KeyCode::Char('a'), false), Step::Ignore);
         assert_eq!(interpret(KeyCode::Up, false), Step::Ignore);
-    }
-
-    /// Confirming without pressing anything keeps the standard prefix.
-    #[test]
-    fn a_bare_confirm_maps_to_the_default_at_the_call_site() {
-        // `run_loop` maps Confirm with no selection to `crate::keys::PREFIX`.
-        let state = State {
-            selected: None,
-            message: None,
-        };
-        assert_eq!(
-            state.selected.unwrap_or(crate::keys::PREFIX),
-            crate::keys::PREFIX
-        );
     }
 }

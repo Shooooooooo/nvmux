@@ -49,7 +49,7 @@ pub struct Winch {
 
 impl Winch {
     pub fn install() -> Result<Self> {
-        let (read, write) = nix::unistd::pipe().map_err(errno)?;
+        let (read, write) = nix::unistd::pipe()?;
 
         // Both ends non-blocking. The write end because a signal handler must
         // never block, and if the pipe has filled there is already an unread
@@ -97,14 +97,11 @@ impl Winch {
 }
 
 fn set_nonblocking(fd: &OwnedFd) -> Result<()> {
-    let flags = nix::fcntl::OFlag::from_bits_truncate(
-        nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL).map_err(errno)?,
-    );
+    let flags = nix::fcntl::OFlag::from_bits_truncate(nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL)?);
     nix::fcntl::fcntl(
         fd,
         nix::fcntl::F_SETFL(flags | nix::fcntl::OFlag::O_NONBLOCK),
-    )
-    .map_err(errno)?;
+    )?;
     Ok(())
 }
 
@@ -117,10 +114,6 @@ impl Drop for Winch {
             libc::signal(libc::SIGWINCH, libc::SIG_DFL);
         }
     }
-}
-
-fn errno(e: nix::errno::Errno) -> crate::error::NvmuxError {
-    crate::error::NvmuxError::Io(std::io::Error::from(e))
 }
 
 #[cfg(test)]

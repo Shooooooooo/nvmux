@@ -10,12 +10,12 @@ use std::path::PathBuf;
 #[derive(Debug, thiserror::Error)]
 pub enum PathError {
     /// A composed socket path exceeded the `sun_path` budget. Must be caught
-    /// before anyone calls `bind()` — see [`crate::config`] for why.
+    /// before anyone calls `bind()` — see [`crate::paths`] for why.
     #[error(
         "unix socket path is {len} bytes, max {max}: {}\n\
          hint: nvmux composes paths under {}. A longer path would be silently \
          truncated by Neovim, leaving a session nvmux could never reach.",
-        .path.display(), crate::config::RUNTIME_DIR_PREFIX
+        .path.display(), crate::paths::RUNTIME_DIR_PREFIX
     )]
     TooLong {
         path: PathBuf,
@@ -24,7 +24,7 @@ pub enum PathError {
     },
 
     /// The runtime directory exists but is not a directory. Checked on `lstat`,
-    /// not `stat` — see [`crate::config`].
+    /// not `stat` — see [`crate::paths`].
     #[error("{}: not a directory (or is a symlink to one, which we refuse)", .0.display())]
     NotADirectory(PathBuf),
 
@@ -38,7 +38,7 @@ pub enum PathError {
     },
 
     /// The runtime directory is group- or world-accessible — a code-execution
-    /// control, not a privacy nicety. See [`crate::config`].
+    /// control, not a privacy nicety. See [`crate::paths`].
     #[error("{}: mode is {mode:04o}, refusing to use a directory accessible to other users", .path.display())]
     BadMode { path: PathBuf, mode: u32 },
 
@@ -105,6 +105,13 @@ pub enum SessionError {
 
     #[error("a session named {0:?} already exists")]
     Exists(String),
+
+    /// A session-host script did not run, or reported its own refusal. The
+    /// message is the script's, and is rendered bare: wrapping it in a sentence
+    /// of ours produced things like `no session named "runtime directory
+    /// /tmp/nvmux-1000 is not owned by us"`.
+    #[error("{0}")]
+    ScriptFailed(String),
 
     /// Session names are display metadata, but they still end up in shell
     /// commands and terminal output, so they are validated at the boundary.
@@ -259,3 +266,10 @@ pub enum NvmuxError {
 }
 
 pub type Result<T> = std::result::Result<T, NvmuxError>;
+
+/// `nix` calls surface `Errno`; every one of them is an I/O failure to us.
+impl From<nix::errno::Errno> for NvmuxError {
+    fn from(e: nix::errno::Errno) -> Self {
+        NvmuxError::Io(std::io::Error::from(e))
+    }
+}

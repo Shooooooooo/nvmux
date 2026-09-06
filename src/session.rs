@@ -31,7 +31,7 @@ pub enum Liveness {
 pub struct SessionState {
     pub liveness: Liveness,
     /// The number the picker shows and `<prefix> <n>` selects, resolved by
-    /// [`crate::transport::finish_listing`] from the stored [`Session::num`].
+    /// `transport::finish_listing` from the stored [`Session::num`].
     ///
     /// Separate from the stored one on purpose. It is dense and duplicate-free
     /// across one listing — legacy metadata and orphans have no stored number,
@@ -61,7 +61,7 @@ pub struct Session {
     /// The session's number, assigned once at creation and kept for life, so a
     /// number a user memorised keeps naming the same session. `0` means
     /// unnumbered: metadata written before numbering existed, and orphans.
-    /// [`crate::transport::finish_listing`] resolves that into `state.num`.
+    /// `transport::finish_listing` resolves that into `state.num`.
     #[serde(default)]
     pub num: u32,
 

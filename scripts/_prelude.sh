@@ -1,0 +1,86 @@
+#!/bin/sh
+# Helpers shared by the nvmux session-host scripts.
+#
+# Prepended to each script by src/shell.rs, so what runs on the session host is
+# one self-contained program delivered on stdin. Running a script straight from
+# a checkout still works — each one sources this file when the marker below is
+# unset, which is the case exactly when it was not prepended:
+#
+#   sh scripts/list.sh /tmp/nvmux-$(id -u)
+#
+# POSIX sh only -- /bin/sh is dash on Debian and Ubuntu, not bash.
+NVMUX_PRELUDE=1
+
+set -u
+
+# Every script ends with this line, and its absence is an error on the Rust
+# side. `ssh -n` combined with `sh -s` silently produces an *empty* result --
+# stdin is /dev/null, sh reads an empty script and exits 0 -- which is otherwise
+# indistinguishable from a script that ran and had nothing to say.
+finish() {
+  printf 'NVMUX_END\n'
+}
+
+# The command line of a pid, or empty if we cannot find out. /proc first so this
+# works on a Linux box with no ps at all; `-ww` stops macOS truncating to
+# terminal width, which would break the match for exactly the long socket paths
+# where identity matters most.
+cmdline() {
+  if [ -r "/proc/$1/cmdline" ]; then
+    tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null
+  else
+    ps -ww -o args= -p "$1" 2>/dev/null
+  fi
+}
+
+# The pid serving this socket, or nothing. The socket, not the pid, is a
+# session's identity: pids are reused, paths are not.
+#
+# /proc first, for the same reason as cmdline(). `-A` not `-e`: on macOS `-e`
+# means "show the environment". `grep -F` because the path is data, not a
+# pattern. Callers test for empty output rather than the exit status, since the
+# `awk` below succeeds whether or not it matched.
+serving_pid() {
+  if [ -r /proc/self/cmdline ]; then
+    for c in /proc/[0-9]*/cmdline; do
+      if tr '\0' ' ' < "$c" 2>/dev/null | grep -q -F -- "--listen $1"; then
+        c=${c#/proc/}
+        printf '%s\n' "${c%/cmdline}"
+        return 0
+      fi
+    done
+    return 1
+  fi
+  ps -ww -A -u "$(id -u)" -o pid=,args= 2>/dev/null \
+    | grep -F -- "--listen $1" \
+    | grep -v grep \
+    | awk 'NR==1{print $1}'
+}
+
+# Is anything serving this socket?
+serving() {
+  [ -n "$(serving_pid "$1")" ]
+}
+
+# Can we inspect processes at all? If not, "nothing found" proves nothing, and
+# every caller has to fail closed rather than delete or report absence.
+can_inspect() {
+  [ -r /proc/self/cmdline ] && return 0
+  ps -ww -o args= -p $$ >/dev/null 2>&1
+}
+
+# Session ids only: 8 lowercase RFC 4648 base32 characters. Nothing else in the
+# runtime directory is ours to touch, and an id becomes a path.
+is_session_id() {
+  case "$1" in
+    [a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Remove a session's three files. Only ever called once the session is known to
+# be gone: deleting while nvim still runs orphans it permanently, with no socket
+# left for any listing to find.
+purge() {
+  rm -f "$1/$2.sock" "$1/$2.json" "$1/$2.log"
+}

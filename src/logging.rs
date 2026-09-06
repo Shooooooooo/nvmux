@@ -13,7 +13,7 @@ use tracing_subscriber::EnvFilter;
 /// Start logging to `<dir>/nvmux.log`. Verbosity comes from `$NVMUX_LOG`, same
 /// syntax as `RUST_LOG`, defaulting to warnings only.
 pub fn init(dir: &Path) -> Result<()> {
-    let path = crate::config::client_log(dir);
+    let path = crate::paths::client_log(dir);
     let file = OpenOptions::new()
         .create(true)
         .append(true)

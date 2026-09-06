@@ -1,9 +1,9 @@
 //! Session ids and host tokens.
 //!
-//! Ids are short because socket paths are short — see [`crate::config`] for the
+//! Ids are short because socket paths are short — see [`crate::paths`] for the
 //! byte budget.
 
-use anyhow::Result;
+use crate::error::Result;
 
 /// RFC 4648 base32, lowercased, no padding: unambiguous in a filename, safe in
 /// a shell word without quoting, and never looks like a flag.
@@ -26,7 +26,7 @@ fn b32_40(bytes: &[u8; 5]) -> String {
 /// A fresh random session id.
 pub fn new_id() -> Result<String> {
     let mut bytes = [0u8; 5];
-    getrandom::fill(&mut bytes)?;
+    getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
     Ok(b32_40(&bytes))
 }
 

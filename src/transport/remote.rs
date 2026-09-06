@@ -1,25 +1,27 @@
 //! Sessions on another host, reached over SSH.
 //!
 //! Spawning, listing and killing are shared with the local transport — the same
-//! scripts, the same parsing. Only how a script gets run and how a socket
-//! becomes reachable differ, which is what
-//! [`crate::transport::exec::Executor`] and [`Transport::local_socket_for`] are
-//! for.
+//! scripts from [`crate::shell`], the same parsing in
+//! [`crate::transport::protocol`]. Only two things differ: how a script gets
+//! run, and how a session's socket becomes reachable from this machine. The
+//! first is [`Ssh::run_script`] here against [`crate::proc::run_local`] there;
+//! the second is [`Transport::local_socket_for`], which is the seam that makes
+//! everything downstream identical in both cases.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use crate::config;
 use crate::error::{NvimError, NvmuxError, Result, SessionError, SshError};
 use crate::ids;
 use crate::nvim;
+use crate::paths;
 use crate::session::{Liveness, Session};
 use crate::shell;
 use crate::ssh::Ssh;
 use crate::transport::{
-    ensure_name_free, finish_listing, install_detach_alias, kill_outcome, protocol,
-    wait_until_reachable, Location, Transport, REACHABLE_TIMEOUT,
+    finish_listing, install_detach_alias, kill_outcome, opt_pid_arg, pid_arg, plan_create,
+    plan_rename, protocol, wait_until_reachable, Location, Transport, REACHABLE_TIMEOUT,
 };
 
 pub struct SshTransport {
@@ -38,6 +40,7 @@ pub struct SshTransport {
     forwarded: Mutex<HashSet<String>>,
 }
 
+/// Needed by `Result::expect_err` in the SSH tests; never logged.
 impl std::fmt::Debug for SshTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SshTransport")
@@ -50,25 +53,18 @@ impl std::fmt::Debug for SshTransport {
 impl SshTransport {
     pub fn new(host: String) -> Result<Self> {
         let host_token = ids::host_token(&host);
-        let local_dir = config::ensure_runtime_dir()?;
-        let control_path = config::control_path(&local_dir, &host_token)?;
+        let local_dir = paths::ensure_runtime_dir()?;
+        let control_path = paths::control_path(&local_dir, &host_token)?;
 
         // Checked before connecting, so the error names the real problem.
-        check_local_ssh()?;
+        crate::ssh::check_local()?;
 
         let ssh = Ssh::new(host.clone(), control_path);
         ssh.ensure_master()?;
 
         // One round trip for both the runtime directory and the remote Neovim
         // version.
-        let out = ssh.run_script(shell::PROBE_SCRIPT, &[])?;
-        if !out.ok() && out.stdout.trim().is_empty() {
-            return Err(NvmuxError::Ssh(crate::ssh::classify(
-                &host,
-                out.status,
-                &out.stderr,
-            )));
-        }
+        let out = checked_script(&ssh, shell::PROBE_SCRIPT, &[])?;
         let probe = protocol::parse_probe(&out.stdout)?;
 
         if probe.nvim_banner.is_empty() {
@@ -114,12 +110,12 @@ impl SshTransport {
             return Err(crate::error::PathError::MalformedId(id.to_string()).into());
         }
         let p = PathBuf::from(format!("{}/{}.sock", self.remote_dir, id));
-        config::check_sock_path(&p)?;
+        paths::check_sock_path(&p)?;
         Ok(p)
     }
 
     fn local_sock(&self, id: &str) -> Result<PathBuf> {
-        Ok(config::forwarded_sock(
+        Ok(paths::forwarded_sock(
             &self.local_dir,
             &self.host_token,
             id,
@@ -172,19 +168,34 @@ impl SshTransport {
     ///
     /// A dead master is reported as such rather than as a mysterious failure,
     /// because it is the one condition the user can do something about.
-    fn run_script(&self, script: &str, args: &[&str]) -> Result<crate::transport::exec::Output> {
-        let out = self.ssh.run_script(script, args)?;
-        if !out.ok() && out.stdout.trim().is_empty() {
-            let err = crate::ssh::classify(self.host(), out.status, &out.stderr);
+    fn run_script(&self, script: &str, args: &[&str]) -> Result<crate::proc::Output> {
+        let out = checked_script(&self.ssh, script, args).map_err(|err| {
             if matches!(err, SshError::NoMaster(_) | SshError::MasterDied(_)) {
                 // Report it, drop the forwards we believed in, and let the
                 // caller fall back to the picker.
                 self.forwarded.lock().map(|mut f| f.clear()).ok();
             }
-            return Err(err.into());
-        }
+            err
+        })?;
         Ok(out)
     }
+}
+
+/// Run a script and insist it actually ran.
+///
+/// A nonzero exit with nothing on stdout is ssh itself failing, not the script
+/// reporting something: the script would have printed its terminator. Used by
+/// `SshTransport::new` too, before there is a `self` to call the method on.
+fn checked_script(
+    ssh: &Ssh,
+    script: &str,
+    args: &[&str],
+) -> std::result::Result<crate::proc::Output, SshError> {
+    let out = ssh.run_script(script, args)?;
+    if !out.ok() && out.stdout.trim().is_empty() {
+        return Err(crate::ssh::classify(ssh.host(), out.status, &out.stderr));
+    }
+    Ok(out)
 }
 
 impl Transport for SshTransport {
@@ -206,18 +217,13 @@ impl Transport for SshTransport {
         }
         sessions.retain(|s| s.state.liveness != Liveness::Dead);
         self.sweep_orphaned_forwards(&sessions);
-        finish_listing(sessions)
+        Ok(finish_listing(sessions))
     }
 
     fn create_session(&self, name: &str) -> Result<Session> {
-        crate::session::validate_name(name)?;
         // The listing doubles as the source of the new session's number; see the
         // local transport.
-        let existing = self.list_sessions()?;
-        ensure_name_free(&existing, name, None)?;
-        let num = crate::transport::next_free_num(&existing);
-
-        let id = ids::new_id().map_err(|e| std::io::Error::other(e.to_string()))?;
+        let (id, num) = plan_create(&self.list_sessions()?, name)?;
         // Check the length before spawning, not after: an overlong path makes
         // Neovim silently truncate and bind somewhere we could never reach.
         let remote_sock = self.remote_sock(&id)?;
@@ -227,22 +233,23 @@ impl Transport for SshTransport {
         let out = self.run_script(shell::SPAWN_SCRIPT, &[&self.remote_dir, &id])?;
         let spawned = protocol::parse_spawn(&out.stdout)?;
 
-        if !spawned.socket_appeared {
-            let _ = self.run_script(
-                shell::KILL_SCRIPT,
-                &[
-                    &self.remote_dir,
-                    &id,
-                    &spawned.pid.map(|p| p.to_string()).unwrap_or_default(),
-                ],
-            );
-            return Err(SessionError::NotReady {
+        // Both ways out of a half-created session: terminate the remote nvim
+        // (the script removes its files only once it has seen the process go)
+        // and report why, naming the remote log rather than a local path.
+        let abandon = |log_tail: String| -> NvmuxError {
+            let pid = opt_pid_arg(spawned.pid);
+            let _ = self.run_script(shell::KILL_SCRIPT, &[&self.remote_dir, &id, &pid]);
+            SessionError::NotReady {
                 name: name.to_string(),
                 timeout: REACHABLE_TIMEOUT,
                 log: PathBuf::from(format!("{}:{}/{}.log", self.host(), self.remote_dir, id)),
-                log_tail: out.stderr.trim().to_string(),
+                log_tail,
             }
-            .into());
+            .into()
+        };
+
+        if !spawned.socket_appeared {
+            return Err(abandon(out.stderr.trim().to_string()));
         }
 
         // Confirm through a forward, which also proves the forward works before
@@ -256,27 +263,15 @@ impl Transport for SshTransport {
             // nonexistent remote socket still exits 0 and creates a working
             // local socket.
             self.ssh.cancel(&local, &remote_sock);
-            let _ = self.run_script(
-                shell::KILL_SCRIPT,
-                &[
-                    &self.remote_dir,
-                    &id,
-                    &spawned.pid.map(|p| p.to_string()).unwrap_or_default(),
-                ],
-            );
-            return Err(SessionError::NotReady {
-                name: name.to_string(),
-                timeout: REACHABLE_TIMEOUT,
-                log: PathBuf::from(format!("{}:{}/{}.log", self.host(), self.remote_dir, id)),
-                log_tail: "the session never answered through the forward".into(),
-            }
-            .into());
+            return Err(abandon(
+                "the session never answered through the forward".into(),
+            ));
         }
 
         let mut session = Session::new(id.clone(), name.to_string(), spawned.pid.unwrap_or(0), num);
         let json = session.to_json()?;
         let out = self.run_script(shell::WRITE_META_SCRIPT, &[&self.remote_dir, &id, &json])?;
-        protocol::parse_end(&out.stdout, "metadata write")?;
+        protocol::require_terminator(&out.stdout, "metadata write")?;
         // See the local transport: the caller attaches without re-listing.
         session.state.num = num;
 
@@ -287,11 +282,7 @@ impl Transport for SshTransport {
     }
 
     fn kill_session(&self, s: &Session) -> Result<()> {
-        let pid = if s.pid > 1 {
-            s.pid.to_string()
-        } else {
-            String::new()
-        };
+        let pid = pid_arg(s.pid);
         let out = self.run_script(shell::KILL_SCRIPT, &[&self.remote_dir, &s.id, &pid])?;
         let outcome = protocol::parse_kill(&out.stdout)?;
 
@@ -312,14 +303,13 @@ impl Transport for SshTransport {
     /// between the listing and the confirm gets its metadata rewritten, which
     /// the next listing's sweep removes again, since its socket is gone.
     fn rename_session(&self, s: &Session, new_name: &str) -> Result<()> {
-        crate::session::validate_name(new_name)?;
-        ensure_name_free(&self.list_sessions()?, new_name, Some(&s.id))?;
+        plan_rename(&self.list_sessions()?, new_name, &s.id)?;
 
         let mut updated = s.clone();
         updated.name = new_name.to_string();
         let json = updated.to_json()?;
         let out = self.run_script(shell::WRITE_META_SCRIPT, &[&self.remote_dir, &s.id, &json])?;
-        protocol::parse_end(&out.stdout, "metadata write")?;
+        protocol::require_terminator(&out.stdout, "metadata write")?;
         tracing::info!(host = %self.host(), id = %s.id, to = new_name, "renamed");
         Ok(())
     }
@@ -350,30 +340,5 @@ impl Transport for SshTransport {
             .map(|mut f| f.insert(s.id.clone()))
             .ok();
         Ok(local)
-    }
-}
-
-/// Refuse early if the local ssh cannot forward unix sockets at all.
-fn check_local_ssh() -> Result<()> {
-    let out = std::process::Command::new("ssh")
-        .arg("-V")
-        .output()
-        .map_err(|_| SshError::NotFound)?;
-    // `ssh -V` writes to stderr.
-    let banner = if out.stderr.is_empty() {
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    } else {
-        String::from_utf8_lossy(&out.stderr).into_owned()
-    };
-    match nvim::parse_ssh_version(&banner) {
-        Some(v) if v >= (6, 7) => Ok(()),
-        Some((major, minor)) => Err(SshError::TooOld {
-            found: format!("{major}.{minor}"),
-            min: crate::ssh::MIN_SSH_VERSION,
-        }
-        .into()),
-        // An unrecognised banner is not worth refusing over — plenty of forks
-        // exist, and the forward itself will fail clearly enough.
-        None => Ok(()),
     }
 }

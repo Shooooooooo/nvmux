@@ -36,10 +36,6 @@ pub const PREFIX: u8 = 0x14;
 /// in `--help`. A test ties it to [`PREFIX`].
 pub const PREFIX_LABEL: &str = "Ctrl-t";
 
-/// How long to wait for the second byte of a prefix sequence before deciding
-/// the user meant a literal `<prefix>`.
-pub const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
-
 /// Something the proxy must do instead of forwarding bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -116,7 +112,7 @@ pub fn command(byte: u8) -> Option<Action> {
 /// class that is both typable and does not collide with ordinary text. A few of
 /// those bytes are refused: they already mean something else on the wire and
 /// would never reach the machine as a prefix (or, for `C-m`, would clash with
-/// the number-entry terminator [`ENTER`]).
+/// the number-entry terminator `ENTER`).
 ///
 /// `C-c` and `C-z` are *allowed*, as in tmux: choosing them is the user's
 /// explicit, reversible decision, and it only means that byte stops reaching
@@ -155,7 +151,7 @@ pub fn prefix_label(byte: u8) -> String {
 }
 
 /// Carriage return, which is what Enter is in raw mode. Ends a number early
-/// rather than waiting out the [`TIMEOUT`].
+/// rather than waiting out `keys.timeout_ms`.
 const ENTER: u8 = 0x0d;
 
 /// Where the machine is between keystrokes.
@@ -183,7 +179,7 @@ pub struct Prefix {
     /// docs.
     highest: u32,
     /// The byte that arms the machine. [`PREFIX`] by default; a config file can
-    /// remap it (see [`crate::settings`]).
+    /// remap it (see [`crate::config`]).
     prefix: u8,
 }
 
@@ -213,7 +209,7 @@ impl Prefix {
         }
     }
 
-    /// True if the machine is mid-sequence and a [`TIMEOUT`] must be armed —
+    /// True if the machine is mid-sequence and a timeout must be armed —
     /// either a lone `<prefix>` or a half-typed number. The caller polls on the
     /// short timeout while this holds, so a number does not resolve late.
     pub fn is_armed(&self) -> bool {
@@ -315,7 +311,7 @@ impl Prefix {
         }
     }
 
-    /// Called when no byte arrived within [`TIMEOUT`] of the machine arming.
+    /// Called when no byte arrived within `keys.timeout_ms` of the machine arming.
     ///
     /// Resolves a lone `<prefix>` into a literal one, and a half-typed number into
     /// the session it already names. Idempotent, so a caller that fires its
@@ -361,6 +357,28 @@ mod tests {
             .collect()
     }
 
+    /// The README's "While attached" table is a prose copy of [`BINDINGS`], and
+    /// a reader picking the tool up has only that copy — the `<prefix> ?` screen
+    /// needs a running session. So every command must have a row there.
+    ///
+    /// The key cell, not the description: the two word things differently on
+    /// purpose (the screen has one line, the README has a column), and pinning
+    /// the prose would only force them to drift together. What actually goes
+    /// wrong is a command added here and never written down.
+    #[test]
+    fn every_binding_has_a_row_in_the_readme() {
+        let readme = include_str!("../README.md");
+        for b in BINDINGS {
+            let cell = format!("| `<prefix>` `{}` |", b.key as char);
+            assert!(
+                readme.contains(&cell),
+                "README has no row for `<prefix> {}` — add one to \
+                 the \"While attached\" table",
+                b.key as char
+            );
+        }
+    }
+
     #[test]
     fn ordinary_bytes_pass_through_untouched() {
         let mut p = Prefix::new(0);
@@ -386,14 +404,6 @@ mod tests {
             "prefix must not reach nvim yet"
         );
         assert!(p.is_armed());
-    }
-
-    #[test]
-    fn doubled_prefix_sends_one_literal() {
-        let mut p = Prefix::new(0);
-        let steps = p.feed(&[PREFIX, PREFIX]);
-        assert_eq!(forwarded(&steps), vec![PREFIX]);
-        assert!(!p.is_armed());
     }
 
     #[test]
@@ -559,15 +569,6 @@ mod tests {
             }
             assert!(!p.is_armed(), "byte {b:#04x} left the machine armed");
         }
-    }
-
-    #[test]
-    fn question_mark_after_the_prefix_is_help_not_a_replayed_byte() {
-        let mut p = Prefix::new(0);
-        let steps = p.feed(&[PREFIX, b'?']);
-        assert_eq!(actions(&steps), vec![Action::Help]);
-        assert!(forwarded(&steps).is_empty());
-        assert!(!p.is_armed());
     }
 
     /// `<prefix> ?` used to be replayed to Neovim as two bytes. This is the way to

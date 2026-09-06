@@ -4,7 +4,6 @@
 //! against [`Transport`] and does not know whether the sessions it is listing
 //! live on this machine or on the far end of an SSH connection.
 
-pub mod exec;
 pub mod local;
 pub mod protocol;
 pub mod remote;
@@ -12,7 +11,7 @@ pub mod remote;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::error::{NvmuxError, Result, SessionError};
+use crate::error::{Result, SessionError};
 use crate::rpc;
 use crate::session::Session;
 
@@ -117,6 +116,43 @@ pub(crate) fn ensure_name_free(
     Ok(())
 }
 
+/// Everything a create needs decided before anything is spawned: the name is
+/// legal and free, the new session has an id and a number.
+///
+/// Pure, and shared by both transports. The listing it works from is **not**
+/// taken here: fetching one is where local and remote differ (one reaps dead
+/// sessions, the other sweeps orphaned forwards), so each caller passes its own.
+pub(crate) fn plan_create(existing: &[Session], name: &str) -> Result<(String, u32)> {
+    crate::session::validate_name(name)?;
+    ensure_name_free(existing, name, None)?;
+    let num = next_free_num(existing);
+    Ok((crate::ids::new_id()?, num))
+}
+
+/// The same checks for a rename, which allocates nothing.
+pub(crate) fn plan_rename(existing: &[Session], new_name: &str, id: &str) -> Result<()> {
+    crate::session::validate_name(new_name)?;
+    ensure_name_free(existing, new_name, Some(id))
+}
+
+/// The `<pid>` argument `kill.sh` takes.
+///
+/// Empty unless the recorded pid is worth signalling: 0 is "unknown" and 1 is
+/// init. The script finds the process by its socket anyway, so the pid is only
+/// ever a hint, and a wrong one must not become a signal to something else.
+pub(crate) fn pid_arg(pid: u32) -> String {
+    if pid > 1 {
+        pid.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// The same argument, from what `spawn.sh` reported.
+pub(crate) fn opt_pid_arg(pid: Option<u32>) -> String {
+    pid.map(pid_arg).unwrap_or_default()
+}
+
 /// What a kill script outcome means for the caller. Files are removed by the
 /// script only once the session is genuinely gone; claiming success on the
 /// other outcomes would drop it from the picker while its Neovim kept running,
@@ -163,7 +199,7 @@ pub(crate) fn install_detach_alias(sock: &Path) {
 /// duplicate — are covered in memory. A read path that wrote would cost an SSH
 /// round trip per listing, and would persist a derived number as if it had been
 /// assigned.
-pub(crate) fn finish_listing(mut sessions: Vec<Session>) -> Result<Vec<Session>> {
+pub(crate) fn finish_listing(mut sessions: Vec<Session>) -> Vec<Session> {
     // Stored number first, so the sessions with a claim on a number get to keep
     // it; `created` then `id` puts the unnumbered ones in a stable order rather
     // than whatever the directory happened to yield.
@@ -186,7 +222,7 @@ pub(crate) fn finish_listing(mut sessions: Vec<Session>) -> Result<Vec<Session>>
     }
 
     sessions.sort_by_key(|s| s.state.num);
-    Ok(sessions)
+    sessions
 }
 
 /// The number to give a session being created now: the smallest not already on
@@ -207,15 +243,10 @@ fn smallest_free(taken: &[u32]) -> u32 {
         .expect("u32 is not exhausted")
 }
 
-impl From<NvmuxError> for std::io::Error {
-    fn from(e: NvmuxError) -> Self {
-        std::io::Error::other(e.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::NvmuxError;
 
     #[test]
     fn a_taken_name_is_refused_case_insensitively_except_for_its_own_session() {
@@ -226,6 +257,52 @@ mod tests {
         // A rename to its own name (or its own name in another case) is fine.
         assert!(ensure_name_free(&existing, "Name-aaa", Some("aaa")).is_ok());
         assert!(ensure_name_free(&existing, "name-bbb", Some("aaa")).is_err());
+    }
+
+    #[test]
+    fn a_create_is_refused_before_anything_is_spawned_if_the_name_is_taken() {
+        let existing = vec![session("aaaaaaaa", 1, 1)];
+        let mut taken = existing.clone();
+        taken[0].name = "notes".into();
+        let err = plan_create(&taken, "NOTES").expect_err("case-insensitively taken");
+        assert!(matches!(
+            err,
+            NvmuxError::Session(SessionError::Exists(ref n)) if n == "NOTES"
+        ));
+        assert!(plan_create(&taken, "").is_err(), "an empty name is invalid");
+    }
+
+    /// Killing 2 and creating again refills the hole rather than climbing.
+    ///
+    /// The listing goes through `finish_listing` first, as a real create's
+    /// does: numbering reads the *resolved* number, not the stored one.
+    #[test]
+    fn a_create_takes_the_smallest_free_number() {
+        let all = finish_listing(vec![
+            session("aaaaaaaa", 1, 1),
+            session("bbbbbbbb", 2, 2),
+            session("cccccccc", 3, 3),
+        ]);
+
+        let (id, num) = plan_create(&all, "fresh").expect("planned");
+        assert_eq!(num, 4);
+        assert!(crate::ids::is_valid_id(&id), "{id:?}");
+
+        let gapped: Vec<_> = all.into_iter().filter(|s| s.state.num != 2).collect();
+        let (_, num) = plan_create(&gapped, "fresh").expect("planned");
+        assert_eq!(num, 2, "the freed number is reused");
+    }
+
+    /// `kill.sh` finds the process by its socket; a pid of 0 or 1 is never a
+    /// hint worth passing, and 1 would name init.
+    #[test]
+    fn only_a_signallable_pid_is_passed_to_the_kill_script() {
+        assert_eq!(pid_arg(0), "");
+        assert_eq!(pid_arg(1), "");
+        assert_eq!(pid_arg(4242), "4242");
+        assert_eq!(opt_pid_arg(None), "");
+        assert_eq!(opt_pid_arg(Some(1)), "");
+        assert_eq!(opt_pid_arg(Some(4242)), "4242");
     }
 
     #[test]
@@ -251,7 +328,6 @@ mod tests {
 
     fn resolved(sessions: Vec<Session>) -> Vec<(String, u32)> {
         finish_listing(sessions)
-            .expect("listing")
             .into_iter()
             .map(|s| (s.id, s.state.num))
             .collect()
@@ -327,20 +403,18 @@ mod tests {
 
     #[test]
     fn an_empty_listing_is_not_a_problem() {
-        assert!(finish_listing(vec![]).expect("listing").is_empty());
+        assert!(finish_listing(vec![]).is_empty());
     }
 
     #[test]
     fn the_next_free_number_starts_at_one_and_fills_gaps() {
         assert_eq!(next_free_num(&[]), 1, "sessions are numbered from 1");
 
-        let listed =
-            finish_listing(vec![session("aaa", 1, 1), session("bbb", 2, 2)]).expect("listing");
+        let listed = finish_listing(vec![session("aaa", 1, 1), session("bbb", 2, 2)]);
         assert_eq!(next_free_num(&listed), 3, "appends when there is no gap");
 
         // What killing the middle session leaves behind.
-        let listed =
-            finish_listing(vec![session("aaa", 1, 1), session("ccc", 3, 3)]).expect("listing");
+        let listed = finish_listing(vec![session("aaa", 1, 1), session("ccc", 3, 3)]);
         assert_eq!(next_free_num(&listed), 2, "refills the hole");
     }
 
@@ -348,8 +422,7 @@ mod tests {
     /// have 3 taken out from under it.
     #[test]
     fn the_next_free_number_respects_numbers_that_were_only_resolved() {
-        let listed =
-            finish_listing(vec![session("aaa", 0, 1), session("bbb", 0, 2)]).expect("listing");
+        let listed = finish_listing(vec![session("aaa", 0, 1), session("bbb", 0, 2)]);
         assert_eq!(listed[0].num, 0, "still unnumbered on disk");
         assert_eq!(next_free_num(&listed), 3);
     }

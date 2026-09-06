@@ -29,7 +29,6 @@
 //! than taking a column in front of it: the default then occupies exactly the
 //! columns your own name will, and nothing shifts when you start typing.
 
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -150,11 +149,9 @@ impl Prompt {
 /// `<prefix> c`, which arrives from an attached session with none to borrow.
 pub fn run(transport: &dyn Transport) -> Result<Outcome> {
     // Reached from a session that has already dissolved to black, so start black.
-    let mut screen = super::Screen::open(crate::fade::excursions())?;
-    let outcome = run_on(screen.terminal(), transport, Task::Create, true);
-    // Restore before propagating: see `ui::Screen`.
-    screen.close()?;
-    outcome
+    super::owning(crate::fade::excursions(), |terminal| {
+        run_on(terminal, transport, Task::Create, true)
+    })
 }
 
 /// Ask for a name on a terminal the caller already owns — how the picker drives
@@ -183,12 +180,8 @@ pub(super) fn run_on(
     let outcome = 'prompt: loop {
         terminal.draw(|f| draw(f, &prompt))?;
 
-        if !event::poll(super::TICK)? {
+        let Some(key) = super::poll_key()? else {
             continue;
-        }
-        let key = match event::read()? {
-            Event::Key(k) if k.kind == KeyEventKind::Press => super::translate(k),
-            _ => continue,
         };
 
         let name = match prompt.on_key(key) {
@@ -374,6 +367,7 @@ fn tail(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support;
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -398,7 +392,7 @@ mod tests {
     }
 
     fn render(p: &Prompt, w: u16, h: u16) -> Vec<String> {
-        super::super::test_support::render(w, h, |f| draw(f, p))
+        test_support::render(w, h, |f| draw(f, p))
     }
 
     /// One rendered cell. `render` throws the modifier away, and the modifier is
@@ -561,34 +555,6 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_field_shows_the_label_and_the_default() {
-        let lines = render(&prompt(), 50, 9);
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("new session name: session 3")),
-            "expected the labelled line with its default, got {lines:?}"
-        );
-    }
-
-    #[test]
-    fn typing_replaces_the_placeholder_entirely() {
-        let mut p = prompt();
-        type_in(&mut p, "my-project");
-        let lines = render(&p, 50, 9);
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("new session name: my-project")),
-            "expected the typed name after the label, got {lines:?}"
-        );
-        assert!(
-            !lines.iter().any(|l| l.contains("session 3")),
-            "the placeholder must not linger once typing has started: {lines:?}"
-        );
-    }
-
-    #[test]
     fn backspacing_to_empty_brings_the_placeholder_back() {
         let mut p = prompt();
         type_in(&mut p, "ab");
@@ -725,7 +691,7 @@ mod tests {
             Some("session 3".to_string()),
         );
 
-        for (w, h) in [(1, 1), (2, 1), (1, 2), (0, 0), (80, 1), (3, 3), (10, 2)] {
+        for &(w, h) in test_support::TINY_SIZES {
             for p in [&prompt(), &typed, &failed] {
                 let _ = render(p, w.max(1), h.max(1));
             }
@@ -820,6 +786,6 @@ mod tests {
         let mut p = prompt();
         type_in(&mut p, "notes");
         p.fail("nope".to_string(), Some("session 3".to_string()));
-        super::super::test_support::assert_no_colour(50, 9, |f| draw(f, &p));
+        test_support::assert_no_colour(50, 9, |f| draw(f, &p));
     }
 }

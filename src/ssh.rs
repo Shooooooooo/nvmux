@@ -10,15 +10,60 @@
 //! removed with `-O cancel`, tested with `-O check`.
 //!
 //! `ControlPath` is computed by nvmux rather than left to ssh's `%C`/`%h%p%r`
-//! tokens, which expand to unpredictable lengths — see [`crate::config`].
+//! tokens, which expand to unpredictable lengths — see [`crate::paths`].
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::error::SshError;
+use crate::proc;
 use crate::shell;
 
-/// The minimum ssh nvmux supports: 6.7 added unix-socket forwarding.
-pub use crate::nvim::MIN_SSH_VERSION;
+/// The minimum `ssh` nvmux supports.
+///
+/// 6.7 is where unix-domain socket forwarding (`-L <local_sock>:<remote_sock>`)
+/// was added, which is the entire remote transport. `MIN_SSH` is the same
+/// version as a tuple; a test ties the two together.
+pub const MIN_SSH_VERSION: &str = "6.7";
+const MIN_SSH: (u64, u64) = (6, 7);
+
+/// Parse the version out of `ssh -V` output, e.g. `OpenSSH_9.6p1 Ubuntu-3...`.
+pub fn parse_ssh_version(banner: &str) -> Option<(u64, u64)> {
+    let token = banner.split_whitespace().next()?;
+    let rest = token.strip_prefix("OpenSSH_")?;
+    let numeric: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let mut parts = numeric.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().and_then(|m| m.parse().ok()).unwrap_or(0);
+    Some((major, minor))
+}
+
+/// Refuse early if the local `ssh` is missing or too old, so the error names
+/// the real problem rather than surfacing later as a failed forward.
+pub fn check_local() -> Result<(), SshError> {
+    let out = Command::new("ssh")
+        .arg("-V")
+        .output()
+        .map_err(|_| SshError::NotFound)?;
+    // `ssh -V` writes to stderr.
+    let banner = if out.stderr.is_empty() {
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    } else {
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    match parse_ssh_version(&banner) {
+        Some(v) if v >= MIN_SSH => Ok(()),
+        Some((major, minor)) => Err(SshError::TooOld {
+            found: format!("{major}.{minor}"),
+            min: MIN_SSH_VERSION,
+        }),
+        // An unrecognised banner is not worth refusing over — plenty of forks
+        // exist, and the forward itself will fail clearly enough.
+        None => Ok(()),
+    }
+}
 
 /// Options shared by every invocation. `BatchMode` is deliberately **not** set:
 /// a passphrase prompt, a hardware key touch or a 2FA challenge must still work.
@@ -64,12 +109,12 @@ pub fn check_args(host: &str, ctl: &Path) -> Vec<String> {
     args
 }
 
-/// Add a unix-socket forward to the existing master, without reconnecting.
-pub fn forward_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<String> {
+/// `ssh -O <op> -L <local>:<remote> <host>` against the running master.
+fn forward_op(op: &str, host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<String> {
     let mut args = common(ctl);
     args.extend([
         "-O".into(),
-        "forward".into(),
+        op.to_string(),
         "-L".into(),
         format!("{}:{}", local.display(), remote.display()),
         host.to_string(),
@@ -77,17 +122,14 @@ pub fn forward_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<
     args
 }
 
+/// Add a unix-socket forward to the existing master, without reconnecting.
+pub fn forward_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<String> {
+    forward_op("forward", host, ctl, local, remote)
+}
+
 /// Remove a forward.
 pub fn cancel_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<String> {
-    let mut args = common(ctl);
-    args.extend([
-        "-O".into(),
-        "cancel".into(),
-        "-L".into(),
-        format!("{}:{}", local.display(), remote.display()),
-        host.to_string(),
-    ]);
-    args
+    forward_op("cancel", host, ctl, local, remote)
 }
 
 /// Arguments for running a script on the remote host, through a **login** shell:
@@ -275,42 +317,13 @@ impl Ssh {
         let _ = std::fs::remove_file(local);
     }
 
-    pub fn run_script(
-        &self,
-        script: &str,
-        args: &[&str],
-    ) -> Result<crate::transport::exec::Output, SshError> {
-        use std::io::Write;
-
+    /// The script goes over stdin, never interpolated into the command line.
+    pub fn run_script(&self, script: &str, args: &[&str]) -> Result<proc::Output, SshError> {
         let argv = exec_args(&self.host, &self.control_path, args);
         tracing::debug!(args = ?argv, "ssh exec");
-        let mut child = Command::new("ssh")
-            .args(&argv)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| spawn_error(e, &self.host))?;
-
-        // The script goes over stdin, never interpolated into the command line.
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| SshError::Failed {
-                code: -1,
-                stderr: "no stdin on ssh".into(),
-            })?
-            .write_all(script.as_bytes())
-            .map_err(|e| spawn_error(e, &self.host))?;
-
-        let out = child
-            .wait_with_output()
-            .map_err(|e| spawn_error(e, &self.host))?;
-        Ok(crate::transport::exec::Output {
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            status: out.status.code().unwrap_or(-1),
-        })
+        let mut cmd = Command::new("ssh");
+        cmd.args(&argv);
+        proc::run_feeding_stdin(&mut cmd, script).map_err(|e| spawn_error(e, &self.host))
     }
 }
 
@@ -328,6 +341,29 @@ fn spawn_error(e: std::io::Error, host: &str) -> SshError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The advertised minimum and the one the check actually applies must be
+    /// the same version; they used to live in different modules.
+    #[test]
+    fn the_minimum_ssh_version_is_spelled_once() {
+        assert_eq!(
+            parse_ssh_version(&format!("OpenSSH_{MIN_SSH_VERSION}p1")),
+            Some(MIN_SSH)
+        );
+    }
+    #[test]
+    fn parses_ssh_banners() {
+        assert_eq!(
+            parse_ssh_version("OpenSSH_9.6p1 Ubuntu-3ubuntu13.19, OpenSSL 3.0.13"),
+            Some((9, 6))
+        );
+        assert_eq!(
+            parse_ssh_version("OpenSSH_9.0p1, LibreSSL 3.3.6"),
+            Some((9, 0))
+        );
+        assert_eq!(parse_ssh_version("OpenSSH_6.7p1"), Some((6, 7)));
+        assert_eq!(parse_ssh_version("something else"), None);
+    }
 
     const CTL: &str = "/tmp/nvmux-501/cm-abcdefgh";
 

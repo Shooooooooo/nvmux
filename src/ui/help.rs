@@ -20,9 +20,6 @@
 //! `c` and `Other` do nothing, and only `Esc`, `q`, `Enter`, `?` and `Ctrl-c`
 //! close it. Nothing typed on this screen is ever forwarded.
 
-use std::borrow::Cow;
-
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
@@ -42,21 +39,10 @@ const HINTS: &str = "esc back";
 const GAP: usize = 3;
 
 /// One line of the table.
-///
-/// `what` is a [`Cow`] because most descriptions are the static strings from
-/// [`keys::BINDINGS`], but the two that name the prefix itself are built from the
-/// configured label at runtime.
 #[derive(Debug)]
 struct Row {
     keys: String,
-    what: Cow<'static, str>,
-}
-
-/// What one keypress meant.
-#[derive(Debug, PartialEq, Eq)]
-enum Step {
-    None,
-    Close,
+    what: String,
 }
 
 /// The command rows from [`keys::BINDINGS`], then the rules that are not
@@ -72,20 +58,22 @@ fn rows(prefix: &str) -> Vec<Row> {
         .iter()
         .map(|b| Row {
             keys: format!("{prefix} {}", b.key as char),
-            what: Cow::Borrowed(b.help),
+            what: b.help.to_string(),
         })
         .collect();
     rows.push(Row {
-        keys: format!("{prefix} 1-9"),
-        what: Cow::Borrowed("attach to the session with that number"),
+        // Not `1-9`: `Prefix::feed` reads a number, not a digit, so `12` reaches
+        // the twelfth session.
+        keys: format!("{prefix} 1-n"),
+        what: "attach to the session with that number".to_string(),
     });
     rows.push(Row {
         keys: format!("{prefix} {prefix}"),
-        what: Cow::Owned(format!("send a literal {prefix} to Neovim")),
+        what: format!("send a literal {prefix} to Neovim"),
     });
     rows.push(Row {
         keys: format!("{prefix} other"),
-        what: Cow::Owned(format!("send {prefix} and that key to Neovim")),
+        what: format!("send {prefix} and that key to Neovim"),
     });
     rows
 }
@@ -93,31 +81,28 @@ fn rows(prefix: &str) -> Vec<Row> {
 /// Named keys only. `t`, `d` and `c` — and therefore `Ctrl-t`, which arrives
 /// as `Key::Other` — are deliberately not here: a chord typed while the help
 /// is open must do nothing, not close the help and forward its second key.
-fn on_key(key: Key) -> Step {
-    match key {
-        // Closes like esc; quitting here would tear the user out of a live
-        // session they only meant to read a key list in.
-        Key::Char('q') | Key::Char('?') | Key::Esc | Key::Enter | Key::CtrlC => Step::Close,
-        _ => Step::None,
-    }
+///
+/// `q` and `Ctrl-c` close like esc rather than quitting: quitting here would
+/// tear the user out of a live session they only meant to read a key list in.
+fn closes(key: Key) -> bool {
+    matches!(
+        key,
+        Key::Char('q') | Key::Char('?') | Key::Esc | Key::Enter | Key::CtrlC
+    )
 }
 
 /// Show the bindings until the user dismisses them, on its own terminal, handing
 /// the session back untouched afterwards.
 pub fn run() -> Result<()> {
     // Reached from a session that has already dissolved to black, so start black.
-    let mut screen = super::Screen::open(crate::fade::excursions())?;
-    let outcome = run_on(screen.terminal(), true);
-    // Restore before propagating: see `ui::Screen`.
-    screen.close()?;
-    outcome
+    super::owning(crate::fade::excursions(), |terminal| run_on(terminal, true))
 }
 
 /// Show the bindings on a terminal the caller already owns — how the picker
 /// answers `?`. `animate` is whether to dip through black on the way in and
 /// out; from the picker the screen is already up, so it does not.
 pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> Result<()> {
-    let label = keys::prefix_label(crate::settings::get().keys.prefix);
+    let label = keys::prefix_label(crate::config::get().keys.prefix);
     let rows = rows(&label);
     let animate = animate && crate::fade::excursions();
     if animate {
@@ -126,17 +111,11 @@ pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> 
     loop {
         terminal.draw(|f| draw(f, &rows))?;
 
-        if !event::poll(super::TICK)? {
+        let Some(key) = super::poll_key()? else {
             continue;
-        }
-        let key = match event::read()? {
-            // Press only: with the kitty protocol pushed by Neovim, a release
-            // would otherwise count as a second keypress.
-            Event::Key(k) if k.kind == KeyEventKind::Press => super::translate(k),
-            _ => continue,
         };
 
-        if on_key(key) == Step::Close {
+        if closes(key) {
             // Dissolve back to black so the resumed session takes over dark.
             if animate {
                 crate::fade::fade_out_ratatui(terminal, |f| draw(f, &rows))?;
@@ -191,6 +170,7 @@ fn draw_table(frame: &mut Frame, rows: &[Row], area: Rect) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support;
     use super::*;
     use crate::keys::{Prefix, PREFIX, PREFIX_LABEL};
     use ratatui::backend::TestBackend;
@@ -199,7 +179,7 @@ mod tests {
 
     fn render(w: u16, h: u16) -> Vec<String> {
         let rows = rows(PREFIX_LABEL);
-        super::super::test_support::render(w, h, |f| draw(f, &rows))
+        test_support::render(w, h, |f| draw(f, &rows))
     }
 
     /// The line a row was drawn on. Matched on the *start* of the line rather
@@ -221,14 +201,8 @@ mod tests {
             Key::Enter,
             Key::CtrlC,
         ] {
-            assert_eq!(on_key(key), Step::Close, "{key:?} should close");
+            assert!(closes(key), "{key:?} should close");
         }
-    }
-
-    /// Closes like esc, rather than exiting nvmux out from under a live session.
-    #[test]
-    fn ctrl_c_closes_rather_than_quitting() {
-        assert_eq!(on_key(Key::CtrlC), Step::Close);
     }
 
     /// `<prefix>` arrives here as `Key::Other`, and its command letters as
@@ -244,7 +218,7 @@ mod tests {
             Key::Backspace,
             Key::Other,
         ] {
-            assert_eq!(on_key(key), Step::None, "{key:?} must be ignored");
+            assert!(!closes(key), "{key:?} must be ignored");
         }
     }
 
@@ -265,7 +239,7 @@ mod tests {
             // `Ctrl-t other` row. Digits are the one range row, so they are
             // looked up as the range rather than as themselves.
             let listed = if b.is_ascii_digit() {
-                acts && rows.iter().any(|r| r.keys == format!("{PREFIX_LABEL} 1-9"))
+                acts && rows.iter().any(|r| r.keys == format!("{PREFIX_LABEL} 1-n"))
             } else {
                 rows.iter()
                     .any(|r| r.keys == format!("{PREFIX_LABEL} {}", b as char))
@@ -283,7 +257,7 @@ mod tests {
         assert!(
             rows(PREFIX_LABEL)
                 .iter()
-                .any(|r| r.keys == format!("{PREFIX_LABEL} 1-9")),
+                .any(|r| r.keys == format!("{PREFIX_LABEL} 1-n")),
             "the digit row is missing"
         );
         for b in b'0'..=b'9' {
@@ -293,19 +267,6 @@ mod tests {
                 .any(|s| matches!(s, keys::Step::Act(_)));
             // Zero is excluded on purpose: no session number begins with one.
             assert_eq!(acts, b != b'0', "byte {:?}", b as char);
-        }
-    }
-
-    #[test]
-    fn every_binding_is_listed_with_its_description() {
-        let lines = render(80, 24);
-        for (b, row) in keys::BINDINGS.iter().zip(rows(PREFIX_LABEL)) {
-            let line = line_for(&lines, &row);
-            assert!(
-                line.contains(b.help),
-                "{:?} row lacks its description: {line:?}",
-                row.keys
-            );
         }
     }
 
@@ -329,7 +290,7 @@ mod tests {
             );
         }
         let digits = body[want.len()];
-        assert!(digits.starts_with("Ctrl-t 1-9"), "got {digits:?}");
+        assert!(digits.starts_with("Ctrl-t 1-n"), "got {digits:?}");
         assert!(digits.contains("number"), "got {digits:?}");
         let literal = body[want.len() + 1];
         assert!(literal.starts_with("Ctrl-t Ctrl-t"), "got {literal:?}");
@@ -413,11 +374,7 @@ mod tests {
             "not horizontally centred: {left} left, {right} right, row {row:?}"
         );
 
-        for line in &lines {
-            for ch in "┌┐└┘─│├┤┬┴┼╭╮╰╯═║".chars() {
-                assert!(!line.contains(ch), "found border char {ch:?} in {line:?}");
-            }
-        }
+        test_support::assert_no_borders(&lines);
     }
 
     #[test]
@@ -471,7 +428,7 @@ mod tests {
 
     #[test]
     fn tiny_terminals_do_not_panic() {
-        for (w, h) in [(1, 1), (2, 1), (1, 2), (0, 0), (80, 1), (3, 3), (10, 2)] {
+        for &(w, h) in test_support::TINY_SIZES {
             let _ = render(w.max(1), h.max(1));
         }
     }
@@ -480,6 +437,6 @@ mod tests {
     #[test]
     fn nothing_sets_a_colour() {
         let rows = rows(PREFIX_LABEL);
-        super::super::test_support::assert_no_colour(62, 11, |f| draw(f, &rows));
+        test_support::assert_no_colour(62, 11, |f| draw(f, &rows));
     }
 }

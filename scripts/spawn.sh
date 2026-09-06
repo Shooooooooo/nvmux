@@ -9,10 +9,7 @@
 #   SOCK ok|timeout  whether the listen socket appeared
 #   NVMUX_END
 #
-# POSIX sh only -- this runs under whatever /bin/sh the session host has, which
-# on Debian and Ubuntu is dash, not bash.
-
-set -u
+[ -n "${NVMUX_PRELUDE:-}" ] || . "$(dirname -- "$0")/_prelude.sh"
 
 dir="${1:?usage: spawn.sh <runtime_dir> <id>}"
 id="${2:?usage: spawn.sh <runtime_dir> <id>}"
@@ -27,7 +24,7 @@ umask 077
 
 refuse() {
   printf 'ERROR %s\n' "$1"
-  printf 'NVMUX_END\n'
+  finish
   exit 1
 }
 
@@ -109,26 +106,19 @@ done
 # caller is not already a process group leader, and otherwise forks, leaving $!
 # pointing at setsid. The pid is what a later `kill -KILL` targets, and pids get
 # reused, so an unvalidated one could name an unrelated process.
-#
-# `-o args=` is the POSIX spelling, `-ww` stops macOS truncating to terminal
-# width, and `grep -F` because the socket path is data, not a pattern.
 pid=''
 if [ -n "$guess" ] && kill -0 "$guess" 2>/dev/null; then
-  if ps -ww -o args= -p "$guess" 2>/dev/null | grep -q -F -- "--listen $sock"; then
+  if cmdline "$guess" | grep -q -F -- "--listen $sock"; then
     pid=$guess
   fi
 fi
 
 # If the guess did not check out, find the process actually serving this socket
-# rather than report something unsafe to kill. `-A` not `-e`: on macOS `-e`
-# means "show the environment". `-u` restricts it to our own processes.
+# rather than report something unsafe to kill.
 if [ -z "$pid" ]; then
-  pid=$(ps -ww -A -u "$(id -u)" -o pid=,args= 2>/dev/null \
-        | grep -F -- "--listen $sock" \
-        | grep -v grep \
-        | awk 'NR==1{print $1}')
+  pid=$(serving_pid "$sock")
 fi
 
 printf 'PID %s\n' "$pid"
 printf 'SOCK %s\n' "$sock_state"
-printf 'NVMUX_END\n'
+finish

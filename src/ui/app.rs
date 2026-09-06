@@ -122,16 +122,18 @@ impl App {
         self.visible().get(self.selected).copied()
     }
 
+    /// A request naming whatever is selected, or nothing when the list is empty
+    /// — every key that acts on a row has to answer for both.
+    fn on_selection(&self, request: impl FnOnce(String) -> Request) -> Request {
+        self.selected_id().map_or(Request::None, request)
+    }
+
     fn selected_id(&self) -> Option<String> {
         self.selected_session().map(|s| s.id.clone())
     }
 
     fn session_name(&self, id: &str) -> String {
-        self.sessions
-            .iter()
-            .find(|s| s.id == id)
-            .map(|s| s.name.clone())
-            .unwrap_or_default()
+        self.session(id).map(|s| s.name.clone()).unwrap_or_default()
     }
 
     /// Move the selection, wrapping at both ends.
@@ -231,7 +233,7 @@ impl App {
         }
     }
 
-    /// Called by the driver once [`crate::keys::TIMEOUT`] has passed with a
+    /// Called by the driver once `keys.timeout_ms` has passed with a
     /// number half-typed: settle for the session it already names.
     pub fn resolve_pending(&mut self) -> Request {
         match self.pending.take() {
@@ -269,23 +271,15 @@ impl App {
                 self.selected = self.visible().len().saturating_sub(1);
                 Request::None
             }
-            Key::Enter => match self.selected_session() {
-                Some(s) => Request::Attach(s.id.clone()),
-                None => Request::None,
-            },
+            Key::Enter => self.on_selection(Request::Attach),
             Key::Char('c') => Request::NewSession,
-            Key::Char('r') => match self.selected_session() {
-                Some(s) => Request::RenameSession(s.id.clone()),
-                None => Request::None,
-            },
-            Key::Char('x') => match self.selected_session() {
-                Some(s) => {
-                    let id = s.id.clone();
+            Key::Char('r') => self.on_selection(Request::RenameSession),
+            Key::Char('x') => {
+                if let Some(id) = self.selected_id() {
                     self.show_kill_confirm(&id);
-                    Request::None
                 }
-                None => Request::None,
-            },
+                Request::None
+            }
             Key::Char('/') => {
                 self.mode = Mode::Filter;
                 Request::None
@@ -325,10 +319,7 @@ impl App {
             }
             Key::Enter => {
                 self.mode = Mode::Normal;
-                match self.selected_session() {
-                    Some(s) => Request::Attach(s.id.clone()),
-                    None => Request::None,
-                }
+                self.on_selection(Request::Attach)
             }
             Key::Esc => {
                 self.filter.clear();
@@ -406,35 +397,27 @@ mod tests {
         app.visible().iter().map(|s| s.name.clone()).collect()
     }
 
+    /// The three ways to move are one behaviour, wrapping included — previously
+    /// only `j`/`k` was checked for the wrap.
     #[test]
-    fn movement_wraps_in_both_directions() {
-        let mut a = app(&["one", "two", "three"]);
-        assert_eq!(a.selected_index(), 0);
-        a.on_key(Key::Char('j'));
-        a.on_key(Key::Char('j'));
-        assert_eq!(a.selected_index(), 2);
-        a.on_key(Key::Char('j'));
-        assert_eq!(a.selected_index(), 0, "should wrap forwards");
-        a.on_key(Key::Char('k'));
-        assert_eq!(a.selected_index(), 2, "should wrap backwards");
-    }
-
-    #[test]
-    fn arrows_match_jk() {
-        let mut a = app(&["one", "two"]);
-        a.on_key(Key::Down);
-        assert_eq!(a.selected_index(), 1);
-        a.on_key(Key::Up);
-        assert_eq!(a.selected_index(), 0);
-    }
-
-    #[test]
-    fn ctrl_n_and_ctrl_p_match_jk() {
-        let mut a = app(&["one", "two"]);
-        a.on_key(Key::CtrlN);
-        assert_eq!(a.selected_index(), 1);
-        a.on_key(Key::CtrlP);
-        assert_eq!(a.selected_index(), 0);
+    fn every_movement_key_moves_and_wraps_in_both_directions() {
+        for (down, up) in [
+            (Key::Char('j'), Key::Char('k')),
+            (Key::Down, Key::Up),
+            (Key::CtrlN, Key::CtrlP),
+        ] {
+            let mut a = app(&["one", "two", "three"]);
+            assert_eq!(a.selected_index(), 0);
+            a.on_key(down);
+            a.on_key(down);
+            assert_eq!(a.selected_index(), 2, "{down:?} should move down");
+            a.on_key(down);
+            assert_eq!(a.selected_index(), 0, "{down:?} should wrap forwards");
+            a.on_key(up);
+            assert_eq!(a.selected_index(), 2, "{up:?} should wrap backwards");
+            a.on_key(up);
+            assert_eq!(a.selected_index(), 1, "{up:?} should move up");
+        }
     }
 
     #[test]

@@ -54,13 +54,27 @@ macro_rules! require_ssh {
 }
 
 /// Removes every session this test file created, whatever happened.
-struct Cleanup(SshTransport, Vec<String>);
+///
+/// The transport is built in `drop`, not held: one of these guards exists per
+/// test, and connecting up front cost a second full ssh connect and probe per
+/// test for a cleanup that usually has nothing to do.
+struct Cleanup(Vec<String>);
+
+impl Cleanup {
+    fn of<S: AsRef<str>>(names: impl IntoIterator<Item = S>) -> Self {
+        Self(names.into_iter().map(|n| n.as_ref().to_string()).collect())
+    }
+}
+
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        if let Ok(sessions) = self.0.list_sessions() {
+        let Ok(t) = SshTransport::new(host()) else {
+            return;
+        };
+        if let Ok(sessions) = t.list_sessions() {
             for s in sessions {
-                if self.1.iter().any(|n| s.name.starts_with(n.as_str())) {
-                    let _ = self.0.kill_session(&s);
+                if self.0.iter().any(|n| s.name.starts_with(n.as_str())) {
+                    let _ = t.kill_session(&s);
                 }
             }
         }
@@ -72,10 +86,7 @@ fn a_session_created_over_ssh_is_reachable_through_the_forward() {
     require_ssh!();
     let t = SshTransport::new(host()).expect("connect");
     let name = unique("reach");
-    let guard = Cleanup(
-        SshTransport::new(host()).expect("connect"),
-        vec![name.clone()],
-    );
+    let _guard = Cleanup::of([&name]);
 
     let session = t.create_session(&name).expect("create");
     assert!(
@@ -104,18 +115,13 @@ fn a_session_created_over_ssh_is_reachable_through_the_forward() {
     client
         .list_bufs()
         .expect("deferred call through the forward");
-
-    drop(guard);
 }
 
 #[test]
 fn a_remote_session_outlives_the_transport_that_made_it() {
     require_ssh!();
     let name = unique("outlive");
-    let guard = Cleanup(
-        SshTransport::new(host()).expect("connect"),
-        vec![name.clone()],
-    );
+    let _guard = Cleanup::of([&name]);
 
     let id = {
         let t = SshTransport::new(host()).expect("connect");
@@ -126,15 +132,8 @@ fn a_remote_session_outlives_the_transport_that_made_it() {
     // A completely fresh transport must find it, which is the whole point of
     // keeping the metadata on the session host.
     let t2 = SshTransport::new(host()).expect("reconnect");
-    let found = t2
-        .list_sessions()
-        .expect("list")
-        .into_iter()
-        .find(|s| s.id == id)
-        .expect("the session should have survived");
+    let found = common::find_by_id(&t2, &id).expect("the session should have survived");
     assert_eq!(found.name, name);
-
-    drop(guard);
 }
 
 /// Detach and re-attach is the flow this tool exists for, and the one that
@@ -146,10 +145,7 @@ fn a_forward_can_be_torn_down_and_rebuilt() {
     require_ssh!();
     let t = SshTransport::new(host()).expect("connect");
     let name = unique("reforward");
-    let guard = Cleanup(
-        SshTransport::new(host()).expect("connect"),
-        vec![name.clone()],
-    );
+    let _guard = Cleanup::of([&name]);
 
     let session = t.create_session(&name).expect("create");
     let first = t.local_socket_for(&session).expect("forward");
@@ -167,8 +163,6 @@ fn a_forward_can_be_torn_down_and_rebuilt() {
     let mut client =
         nvmux::rpc::Client::connect(&again, nvmux::rpc::PROBE_TIMEOUT).expect("connect");
     client.api_info().expect("usable after re-forward");
-
-    drop(guard);
 }
 
 #[test]
@@ -176,10 +170,7 @@ fn renaming_a_remote_session_moves_no_socket() {
     require_ssh!();
     let t = SshTransport::new(host()).expect("connect");
     let name = unique("rename");
-    let guard = Cleanup(
-        SshTransport::new(host()).expect("connect"),
-        vec![name.clone(), format!("{name}-after")],
-    );
+    let _guard = Cleanup::of([name.clone(), format!("{name}-after")]);
 
     let session = t.create_session(&name).expect("create");
     let before = t.local_socket_for(&session).expect("forward");
@@ -187,20 +178,13 @@ fn renaming_a_remote_session_moves_no_socket() {
     let after_name = format!("{name}-after");
     t.rename_session(&session, &after_name).expect("rename");
 
-    let listed = t
-        .list_sessions()
-        .expect("list")
-        .into_iter()
-        .find(|s| s.id == session.id)
-        .expect("still listed");
+    let listed = common::find_by_id(&t, &session.id).expect("still listed");
     assert_eq!(listed.name, after_name);
     assert_eq!(
         t.local_socket_for(&listed).expect("forward"),
         before,
         "a rename must not move the socket, or every forward would have to be rebuilt"
     );
-
-    drop(guard);
 }
 
 #[test]
@@ -210,10 +194,7 @@ fn killing_a_remote_session_removes_it_and_its_forward() {
     let name = unique("kill");
     // Even the kill test needs a guard: if the kill under test fails, the
     // session would otherwise outlive the run on the remote host.
-    let _cleanup = Cleanup(
-        SshTransport::new(host()).expect("connect"),
-        vec![name.clone()],
-    );
+    let _guard = Cleanup::of([&name]);
 
     let session = t.create_session(&name).expect("create");
     let sock = t.local_socket_for(&session).expect("forward");
@@ -241,24 +222,14 @@ fn remote_names_with_shell_metacharacters_survive() {
     // Two layers of shell stand between here and the remote file: ssh joins its
     // arguments and the remote login shell parses them again.
     let name = format!("{} $(id) 'q' \"d\"", unique("quote"));
-    let guard = Cleanup(
-        SshTransport::new(host()).expect("connect"),
-        vec![unique("quote")],
-    );
+    let _guard = Cleanup::of([unique("quote")]);
 
     let session = t.create_session(&name).expect("create");
-    let found = t
-        .list_sessions()
-        .expect("list")
-        .into_iter()
-        .find(|s| s.id == session.id)
-        .expect("listed");
+    let found = common::find_by_id(&t, &session.id).expect("listed");
     assert_eq!(
         found.name, name,
         "the name was mangled or evaluated in transit"
     );
-
-    drop(guard);
 }
 
 #[test]
@@ -285,10 +256,7 @@ fn a_listing_keeps_live_forwards_and_removes_orphaned_ones() {
     require_ssh!();
     let t = SshTransport::new(host()).expect("connect");
     let name = unique("sweep");
-    let guard = Cleanup(
-        SshTransport::new(host()).expect("connect"),
-        vec![name.clone()],
-    );
+    let _guard = Cleanup::of([&name]);
 
     let session = t.create_session(&name).expect("create");
     let live = t.local_socket_for(&session).expect("forward");
@@ -309,6 +277,4 @@ fn a_listing_keeps_live_forwards_and_removes_orphaned_ones() {
     let mut client =
         nvmux::rpc::Client::connect(&live, nvmux::rpc::PROBE_TIMEOUT).expect("still connectable");
     client.api_info().expect("still usable after a listing");
-
-    drop(guard);
 }

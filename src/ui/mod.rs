@@ -135,6 +135,43 @@ impl Drop for Screen {
     }
 }
 
+/// Take the terminal for one screen, run `f` on it, and give it back.
+///
+/// The restore happens before the outcome propagates: an error that leaves the
+/// terminal in raw mode with no echo is far worse than the error itself. `prime`
+/// paints a first black frame, for a screen entered from black.
+///
+/// [`run`] does not use this — the picker's attach path leaves through
+/// [`Screen::close_to_black`] instead.
+pub(crate) fn owning<T>(
+    prime: bool,
+    f: impl FnOnce(&mut ratatui::DefaultTerminal) -> Result<T>,
+) -> Result<T> {
+    let mut screen = Screen::open(prime)?;
+    let outcome = f(screen.terminal());
+    screen.close()?;
+    outcome
+}
+
+/// Wait up to [`TICK`] for a keypress the screens understand.
+///
+/// `Ok(None)` means nothing happened and the caller should loop — either the
+/// poll timed out or the event was not a key press. Press only: with the kitty
+/// protocol pushed by Neovim, a release would otherwise count as a second
+/// keypress.
+///
+/// [`setup`] deliberately does not use this: it needs the raw chord, since
+/// [`translate`] discards every control chord but the three the picker binds.
+pub(crate) fn poll_key() -> Result<Option<Key>> {
+    if !event::poll(TICK)? {
+        return Ok(None);
+    }
+    Ok(match event::read()? {
+        Event::Key(k) if k.kind == KeyEventKind::Press => Some(translate(k)),
+        _ => None,
+    })
+}
+
 /// Run the picker until the user attaches or quits. `message` replaces the hint
 /// row — how a failed attach reports itself without exiting the program.
 pub fn run(transport: &dyn Transport, message: Option<String>) -> Result<Outcome> {
@@ -193,9 +230,10 @@ fn run_loop(
         };
 
         let request = app.on_key(key);
-        deadline = app.pending().is_some().then(|| {
-            Instant::now() + Duration::from_millis(crate::settings::get().keys.timeout_ms)
-        });
+        deadline = app
+            .pending()
+            .is_some()
+            .then(|| Instant::now() + Duration::from_millis(crate::config::get().keys.timeout_ms));
 
         // Every request names a row the picker is showing, so it is resolved
         // against the list in hand rather than a fresh listing: over SSH each
@@ -311,16 +349,29 @@ fn translate(k: KeyEvent) -> Key {
 mod tests {
     use super::*;
 
+    /// The three bound chords are the only ones that survive as chords; a
+    /// chord must never arrive as its bare letter (see `translate`).
     #[test]
-    fn ctrl_c_is_distinguished_from_a_plain_c() {
-        assert_eq!(
-            translate(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            Key::CtrlC
-        );
-        assert_eq!(
-            translate(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
-            Key::Char('c')
-        );
+    fn the_bound_chords_are_distinguished_from_their_plain_letters() {
+        for (c, ctrl, want) in [
+            ('c', true, Key::CtrlC),
+            ('c', false, Key::Char('c')),
+            ('n', true, Key::CtrlN),
+            ('n', false, Key::Char('n')),
+            ('p', true, Key::CtrlP),
+            ('p', false, Key::Char('p')),
+        ] {
+            let mods = if ctrl {
+                KeyModifiers::CONTROL
+            } else {
+                KeyModifiers::NONE
+            };
+            assert_eq!(
+                translate(KeyEvent::new(KeyCode::Char(c), mods)),
+                want,
+                "{c:?} with ctrl={ctrl}"
+            );
+        }
     }
 
     /// Only Ctrl-c, Ctrl-n and Ctrl-p are keys of their own; every other
@@ -336,22 +387,6 @@ mod tests {
                 "Ctrl-{c} must not act as a plain {c}"
             );
         }
-    }
-
-    #[test]
-    fn ctrl_n_and_ctrl_p_are_distinguished_from_plain_letters() {
-        assert_eq!(
-            translate(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
-            Key::CtrlN
-        );
-        assert_eq!(
-            translate(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
-            Key::CtrlP
-        );
-        assert_eq!(
-            translate(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
-            Key::Char('n')
-        );
     }
 
     #[test]
