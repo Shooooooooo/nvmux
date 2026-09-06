@@ -367,6 +367,7 @@ fn tail(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support;
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -391,7 +392,7 @@ mod tests {
     }
 
     fn render(p: &Prompt, w: u16, h: u16) -> Vec<String> {
-        super::super::test_support::render(w, h, |f| draw(f, p))
+        test_support::render(w, h, |f| draw(f, p))
     }
 
     /// One rendered cell. `render` throws the modifier away, and the modifier is
@@ -718,7 +719,7 @@ mod tests {
             Some("session 3".to_string()),
         );
 
-        for (w, h) in [(1, 1), (2, 1), (1, 2), (0, 0), (80, 1), (3, 3), (10, 2)] {
+        for &(w, h) in test_support::TINY_SIZES {
             for p in [&prompt(), &typed, &failed] {
                 let _ = render(p, w.max(1), h.max(1));
             }
@@ -813,6 +814,6 @@ mod tests {
         let mut p = prompt();
         type_in(&mut p, "notes");
         p.fail("nope".to_string(), Some("session 3".to_string()));
-        super::super::test_support::assert_no_colour(50, 9, |f| draw(f, &p));
+        test_support::assert_no_colour(50, 9, |f| draw(f, &p));
     }
 }

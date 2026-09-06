@@ -222,13 +222,14 @@ pub(super) fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support;
     use super::*;
     use crate::session::Session;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
     fn render(app: &App, w: u16, h: u16) -> Vec<String> {
-        super::super::test_support::render(w, h, |f| draw(f, app))
+        test_support::render(w, h, |f| draw(f, app))
     }
 
     /// Numbered the way `finish_listing` would have: these `App`s are built
@@ -266,11 +267,7 @@ mod tests {
         let content: Vec<&String> = lines[..10].iter().filter(|l| !l.is_empty()).collect();
         assert_eq!(content.len(), 4, "expected 4 rows, got {content:?}");
 
-        for line in &lines {
-            for ch in "┌┐└┘─│├┤┬┴┼╭╮╰╯═║".chars() {
-                assert!(!line.contains(ch), "found border char {ch:?} in {line:?}");
-            }
-        }
+        test_support::assert_no_borders(&lines);
     }
 
     #[test]
@@ -503,7 +500,7 @@ mod tests {
 
     #[test]
     fn tiny_terminals_do_not_panic() {
-        for (w, h) in [(1, 1), (2, 1), (1, 2), (0, 0), (80, 1), (3, 3)] {
+        for &(w, h) in test_support::TINY_SIZES {
             let _ = render(&app(&["one", "two"]), w.max(1), h.max(1));
             let _ = render(&app(&[]), w.max(1), h.max(1));
         }
@@ -516,7 +513,7 @@ mod tests {
     fn nothing_sets_a_colour() {
         let mut a = app(&["one", "two", "three"]);
         a.on_key(super::super::app::Key::Char('j'));
-        super::super::test_support::assert_no_colour(50, 8, |f| draw(f, &a));
+        test_support::assert_no_colour(50, 8, |f| draw(f, &a));
     }
 
     #[test]

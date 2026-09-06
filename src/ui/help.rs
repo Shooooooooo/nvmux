@@ -168,6 +168,7 @@ fn draw_table(frame: &mut Frame, rows: &[Row], area: Rect) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support;
     use super::*;
     use crate::keys::{Prefix, PREFIX, PREFIX_LABEL};
     use ratatui::backend::TestBackend;
@@ -176,7 +177,7 @@ mod tests {
 
     fn render(w: u16, h: u16) -> Vec<String> {
         let rows = rows(PREFIX_LABEL);
-        super::super::test_support::render(w, h, |f| draw(f, &rows))
+        test_support::render(w, h, |f| draw(f, &rows))
     }
 
     /// The line a row was drawn on. Matched on the *start* of the line rather
@@ -390,11 +391,7 @@ mod tests {
             "not horizontally centred: {left} left, {right} right, row {row:?}"
         );
 
-        for line in &lines {
-            for ch in "┌┐└┘─│├┤┬┴┼╭╮╰╯═║".chars() {
-                assert!(!line.contains(ch), "found border char {ch:?} in {line:?}");
-            }
-        }
+        test_support::assert_no_borders(&lines);
     }
 
     #[test]
@@ -448,7 +445,7 @@ mod tests {
 
     #[test]
     fn tiny_terminals_do_not_panic() {
-        for (w, h) in [(1, 1), (2, 1), (1, 2), (0, 0), (80, 1), (3, 3), (10, 2)] {
+        for &(w, h) in test_support::TINY_SIZES {
             let _ = render(w.max(1), h.max(1));
         }
     }
@@ -457,6 +454,6 @@ mod tests {
     #[test]
     fn nothing_sets_a_colour() {
         let rows = rows(PREFIX_LABEL);
-        super::super::test_support::assert_no_colour(62, 11, |f| draw(f, &rows));
+        test_support::assert_no_colour(62, 11, |f| draw(f, &rows));
     }
 }
