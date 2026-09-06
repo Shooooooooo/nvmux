@@ -24,7 +24,7 @@
 //! `draw::draw`, so that invariant and its tests stand. The whole effect is
 //! gated on [`enabled`]: with `NO_COLOR` set every entry point is a no-op and the
 //! transitions are exactly what they were before. That gate is also where the
-//! config file hooks in to tune or disable the fade (see [`crate::settings`]);
+//! config file hooks in to tune or disable the fade (see [`crate::config`]);
 //! the constants below are its defaults.
 
 use std::io::{self, Write};
@@ -99,7 +99,7 @@ pub fn cell_is_black(x: u16, y: u16, coverage: f32) -> bool {
 /// honouring the request means never running the effect, whatever the config says.
 pub fn enabled() -> bool {
     is_enabled(
-        crate::settings::get().fade.enabled,
+        crate::config::get().fade.enabled,
         std::env::var_os("NO_COLOR").is_some(),
     )
 }
@@ -114,7 +114,7 @@ fn is_enabled(config_enabled: bool, no_color: bool) -> bool {
 /// picker peek — fade too. Config-driven; the [`EXCURSIONS`] constant is its
 /// default.
 pub fn excursions() -> bool {
-    crate::settings::get().fade.excursions
+    crate::config::get().fade.excursions
 }
 
 /// Blacken every cell of `area` that is black at `coverage`, in place. Applied to
@@ -165,7 +165,7 @@ where
     if !enabled() {
         return Ok(());
     }
-    let cfg = crate::settings::get().fade;
+    let cfg = crate::config::get().fade;
     let delay = Duration::from_millis(cfg.frame_delay_ms);
     for step in (0..=cfg.frames).rev() {
         let coverage = step as f32 / cfg.frames as f32;
@@ -186,7 +186,7 @@ where
     if !enabled() {
         return Ok(());
     }
-    let cfg = crate::settings::get().fade;
+    let cfg = crate::config::get().fade;
     let delay = Duration::from_millis(cfg.frame_delay_ms);
     for step in 1..=cfg.frames {
         let coverage = step as f32 / cfg.frames as f32;
@@ -286,7 +286,7 @@ pub fn fade_out_raw() -> io::Result<()> {
     if !enabled() {
         return Ok(());
     }
-    let cfg = crate::settings::get().fade;
+    let cfg = crate::config::get().fade;
     let delay = Duration::from_millis(cfg.frame_delay_ms);
     let mut out = io::stdout().lock();
     out.write_all(HIDE_CURSOR)?;

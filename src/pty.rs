@@ -318,7 +318,7 @@ fn pump(
     highest_session_num: u32,
 ) -> Result<Outcome> {
     let stdin_fd = std::io::stdin().as_raw_fd();
-    let keys = crate::settings::get().keys;
+    let keys = crate::config::get().keys;
     let mut prefix = Prefix::with_prefix(highest_session_num, keys.prefix);
     let prefix_timeout = Duration::from_millis(keys.timeout_ms);
     // When a pending prefix or half-typed number must be settled. An instant

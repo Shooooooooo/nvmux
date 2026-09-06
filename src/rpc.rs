@@ -73,7 +73,7 @@ impl Client<UnixStream> {
     pub fn connect(path: &Path, read_timeout: Duration) -> Result<Self, RpcError> {
         // std's error here is `InvalidInput` with `raw_os_error() == None` —
         // nothing a caller could match on. Check explicitly for a useful message.
-        crate::config::check_sock_path(path).map_err(|e| RpcError::Protocol(e.to_string()))?;
+        crate::paths::check_sock_path(path).map_err(|e| RpcError::Protocol(e.to_string()))?;
 
         let stream = UnixStream::connect(path).map_err(|e| match e.kind() {
             std::io::ErrorKind::ConnectionRefused => {

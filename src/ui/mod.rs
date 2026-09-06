@@ -193,9 +193,10 @@ fn run_loop(
         };
 
         let request = app.on_key(key);
-        deadline = app.pending().is_some().then(|| {
-            Instant::now() + Duration::from_millis(crate::settings::get().keys.timeout_ms)
-        });
+        deadline = app
+            .pending()
+            .is_some()
+            .then(|| Instant::now() + Duration::from_millis(crate::config::get().keys.timeout_ms));
 
         // Every request names a row the picker is showing, so it is resolved
         // against the list in hand rather than a fresh listing: over SSH each

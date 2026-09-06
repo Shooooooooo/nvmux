@@ -183,7 +183,7 @@ pub struct Prefix {
     /// docs.
     highest: u32,
     /// The byte that arms the machine. [`PREFIX`] by default; a config file can
-    /// remap it (see [`crate::settings`]).
+    /// remap it (see [`crate::config`]).
     prefix: u8,
 }
 

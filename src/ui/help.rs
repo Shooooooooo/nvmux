@@ -117,7 +117,7 @@ pub fn run() -> Result<()> {
 /// answers `?`. `animate` is whether to dip through black on the way in and
 /// out; from the picker the screen is already up, so it does not.
 pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> Result<()> {
-    let label = keys::prefix_label(crate::settings::get().keys.prefix);
+    let label = keys::prefix_label(crate::config::get().keys.prefix);
     let rows = rows(&label);
     let animate = animate && crate::fade::excursions();
     if animate {

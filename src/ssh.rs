@@ -10,7 +10,7 @@
 //! removed with `-O cancel`, tested with `-O check`.
 //!
 //! `ControlPath` is computed by nvmux rather than left to ssh's `%C`/`%h%p%r`
-//! tokens, which expand to unpredictable lengths — see [`crate::config`].
+//! tokens, which expand to unpredictable lengths — see [`crate::paths`].
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 

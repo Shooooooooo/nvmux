@@ -3,9 +3,9 @@
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
-use crate::config::{self, SessionPaths};
 use crate::error::{NvmuxError, Result, SessionError};
 use crate::ids;
+use crate::paths::{self, SessionPaths};
 use crate::rpc;
 use crate::session::{Liveness, Session};
 use crate::shell;
@@ -23,14 +23,14 @@ pub struct LocalTransport {
 
 impl LocalTransport {
     pub fn new() -> Result<Self> {
-        Self::with_dir(config::ensure_runtime_dir()?)
+        Self::with_dir(paths::ensure_runtime_dir()?)
     }
 
     /// Use an explicit runtime directory instead of the default, so integration
     /// tests do not touch the user's real sessions. The same security check
     /// applies.
     pub fn with_dir(dir: PathBuf) -> Result<Self> {
-        config::ensure_dir_secure(&dir)?;
+        paths::ensure_dir_secure(&dir)?;
         Ok(Self {
             location: Location::Local,
             dir,

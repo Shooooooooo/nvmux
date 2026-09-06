@@ -1,6 +1,6 @@
 //! Session ids and host tokens.
 //!
-//! Ids are short because socket paths are short — see [`crate::config`] for the
+//! Ids are short because socket paths are short — see [`crate::paths`] for the
 //! byte budget.
 
 use anyhow::Result;

@@ -10,10 +10,10 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use crate::config;
 use crate::error::{NvimError, NvmuxError, Result, SessionError, SshError};
 use crate::ids;
 use crate::nvim;
+use crate::paths;
 use crate::session::{Liveness, Session};
 use crate::shell;
 use crate::ssh::Ssh;
@@ -50,8 +50,8 @@ impl std::fmt::Debug for SshTransport {
 impl SshTransport {
     pub fn new(host: String) -> Result<Self> {
         let host_token = ids::host_token(&host);
-        let local_dir = config::ensure_runtime_dir()?;
-        let control_path = config::control_path(&local_dir, &host_token)?;
+        let local_dir = paths::ensure_runtime_dir()?;
+        let control_path = paths::control_path(&local_dir, &host_token)?;
 
         // Checked before connecting, so the error names the real problem.
         check_local_ssh()?;
@@ -114,12 +114,12 @@ impl SshTransport {
             return Err(crate::error::PathError::MalformedId(id.to_string()).into());
         }
         let p = PathBuf::from(format!("{}/{}.sock", self.remote_dir, id));
-        config::check_sock_path(&p)?;
+        paths::check_sock_path(&p)?;
         Ok(p)
     }
 
     fn local_sock(&self, id: &str) -> Result<PathBuf> {
-        Ok(config::forwarded_sock(
+        Ok(paths::forwarded_sock(
             &self.local_dir,
             &self.host_token,
             id,

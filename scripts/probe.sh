@@ -19,7 +19,7 @@
 
 set -u
 
-# Matches the Rust side's rule exactly; see src/config.rs for why
+# Matches the Rust side's rule exactly; see src/paths.rs for why
 # $XDG_RUNTIME_DIR is not consulted.
 printf 'DIR /tmp/nvmux-%s\n' "$(id -u)"
 
