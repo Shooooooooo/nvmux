@@ -266,3 +266,10 @@ pub enum NvmuxError {
 }
 
 pub type Result<T> = std::result::Result<T, NvmuxError>;
+
+/// `nix` calls surface `Errno`; every one of them is an I/O failure to us.
+impl From<nix::errno::Errno> for NvmuxError {
+    fn from(e: nix::errno::Errno) -> Self {
+        NvmuxError::Io(std::io::Error::from(e))
+    }
+}
