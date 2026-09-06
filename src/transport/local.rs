@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 use crate::error::{NvmuxError, Result, SessionError};
 use crate::ids;
 use crate::paths::{self, SessionPaths};
+use crate::proc;
 use crate::rpc;
 use crate::session::{Liveness, Session};
 use crate::shell;
-use crate::transport::exec::{Executor, LocalExecutor};
 use crate::transport::{
     ensure_name_free, finish_listing, install_detach_alias, kill_outcome, protocol,
     wait_until_reachable, Location, Transport, REACHABLE_TIMEOUT,
@@ -18,7 +18,6 @@ use crate::transport::{
 pub struct LocalTransport {
     location: Location,
     dir: PathBuf,
-    exec: LocalExecutor,
 }
 
 impl LocalTransport {
@@ -34,7 +33,6 @@ impl LocalTransport {
         Ok(Self {
             location: Location::Local,
             dir,
-            exec: LocalExecutor,
         })
     }
 
@@ -111,7 +109,7 @@ impl Transport for LocalTransport {
 
     fn list_sessions(&self) -> Result<Vec<Session>> {
         let dir = self.dir.to_string_lossy().into_owned();
-        let out = self.exec.run_script(shell::LIST_SCRIPT, &[&dir])?;
+        let out = proc::run_local(shell::LIST_SCRIPT, &[&dir])?;
         if !out.ok() {
             tracing::warn!(status = out.status, stderr = %out.stderr, "list.sh failed");
         }
@@ -157,7 +155,7 @@ impl Transport for LocalTransport {
         let dir = self.dir.to_string_lossy().into_owned();
 
         tracing::info!(%id, name, "spawning session");
-        let out = self.exec.run_script(shell::SPAWN_SCRIPT, &[&dir, &id])?;
+        let out = proc::run_local(shell::SPAWN_SCRIPT, &[&dir, &id])?;
         let spawned = protocol::parse_spawn(&out.stdout)?;
 
         if !spawned.socket_appeared || !wait_until_reachable(&paths.sock, REACHABLE_TIMEOUT) {
@@ -169,7 +167,7 @@ impl Transport for LocalTransport {
             // finds the process by its socket, the pid is only a hint.
             let tail = self.log_tail(&paths.log);
             let pid = spawned.pid.map(|p| p.to_string()).unwrap_or_default();
-            match self.exec.run_script(shell::KILL_SCRIPT, &[&dir, &id, &pid]) {
+            match proc::run_local(shell::KILL_SCRIPT, &[&dir, &id, &pid]) {
                 Ok(out) => match protocol::parse_kill(&out.stdout) {
                     Ok(outcome) => tracing::debug!(%id, ?outcome, "cleaned up a failed create"),
                     Err(e) => tracing::warn!(%id, error = %e, "cleanup after a failed create"),
@@ -210,9 +208,7 @@ impl Transport for LocalTransport {
         } else {
             String::new()
         };
-        let out = self
-            .exec
-            .run_script(shell::KILL_SCRIPT, &[&dir, &s.id, &pid])?;
+        let out = proc::run_local(shell::KILL_SCRIPT, &[&dir, &s.id, &pid])?;
         if !out.ok() {
             tracing::warn!(status = out.status, stderr = %out.stderr, "kill.sh failed");
         }

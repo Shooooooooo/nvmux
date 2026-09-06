@@ -16,6 +16,7 @@ pub mod keys;
 pub mod logging;
 pub mod nvim;
 pub mod paths;
+pub mod proc;
 pub mod pty;
 pub mod rpc;
 pub mod session;

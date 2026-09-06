@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::error::SshError;
+use crate::proc;
 use crate::shell;
 
 /// The minimum ssh nvmux supports: 6.7 added unix-socket forwarding.
@@ -275,42 +276,13 @@ impl Ssh {
         let _ = std::fs::remove_file(local);
     }
 
-    pub fn run_script(
-        &self,
-        script: &str,
-        args: &[&str],
-    ) -> Result<crate::transport::exec::Output, SshError> {
-        use std::io::Write;
-
+    /// The script goes over stdin, never interpolated into the command line.
+    pub fn run_script(&self, script: &str, args: &[&str]) -> Result<proc::Output, SshError> {
         let argv = exec_args(&self.host, &self.control_path, args);
         tracing::debug!(args = ?argv, "ssh exec");
-        let mut child = Command::new("ssh")
-            .args(&argv)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| spawn_error(e, &self.host))?;
-
-        // The script goes over stdin, never interpolated into the command line.
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| SshError::Failed {
-                code: -1,
-                stderr: "no stdin on ssh".into(),
-            })?
-            .write_all(script.as_bytes())
-            .map_err(|e| spawn_error(e, &self.host))?;
-
-        let out = child
-            .wait_with_output()
-            .map_err(|e| spawn_error(e, &self.host))?;
-        Ok(crate::transport::exec::Output {
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            status: out.status.code().unwrap_or(-1),
-        })
+        let mut cmd = Command::new("ssh");
+        cmd.args(&argv);
+        proc::run_feeding_stdin(&mut cmd, script).map_err(|e| spawn_error(e, &self.host))
     }
 }
 

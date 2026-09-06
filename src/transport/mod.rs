@@ -4,7 +4,6 @@
 //! against [`Transport`] and does not know whether the sessions it is listing
 //! live on this machine or on the far end of an SSH connection.
 
-pub mod exec;
 pub mod local;
 pub mod protocol;
 pub mod remote;

@@ -1,10 +1,12 @@
 //! Sessions on another host, reached over SSH.
 //!
 //! Spawning, listing and killing are shared with the local transport — the same
-//! scripts, the same parsing. Only how a script gets run and how a socket
-//! becomes reachable differ, which is what
-//! [`crate::transport::exec::Executor`] and [`Transport::local_socket_for`] are
-//! for.
+//! scripts from [`crate::shell`], the same parsing in
+//! [`crate::transport::protocol`]. Only two things differ: how a script gets
+//! run, and how a session's socket becomes reachable from this machine. The
+//! first is [`Ssh::run_script`] here against [`crate::proc::run_local`] there;
+//! the second is [`Transport::local_socket_for`], which is the seam that makes
+//! everything downstream identical in both cases.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -173,7 +175,7 @@ impl SshTransport {
     ///
     /// A dead master is reported as such rather than as a mysterious failure,
     /// because it is the one condition the user can do something about.
-    fn run_script(&self, script: &str, args: &[&str]) -> Result<crate::transport::exec::Output> {
+    fn run_script(&self, script: &str, args: &[&str]) -> Result<crate::proc::Output> {
         let out = self.ssh.run_script(script, args)?;
         if !out.ok() && out.stdout.trim().is_empty() {
             let err = crate::ssh::classify(self.host(), out.status, &out.stderr);
