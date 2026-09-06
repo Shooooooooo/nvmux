@@ -349,16 +349,29 @@ fn translate(k: KeyEvent) -> Key {
 mod tests {
     use super::*;
 
+    /// The three bound chords are the only ones that survive as chords; a
+    /// chord must never arrive as its bare letter (see `translate`).
     #[test]
-    fn ctrl_c_is_distinguished_from_a_plain_c() {
-        assert_eq!(
-            translate(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            Key::CtrlC
-        );
-        assert_eq!(
-            translate(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
-            Key::Char('c')
-        );
+    fn the_bound_chords_are_distinguished_from_their_plain_letters() {
+        for (c, ctrl, want) in [
+            ('c', true, Key::CtrlC),
+            ('c', false, Key::Char('c')),
+            ('n', true, Key::CtrlN),
+            ('n', false, Key::Char('n')),
+            ('p', true, Key::CtrlP),
+            ('p', false, Key::Char('p')),
+        ] {
+            let mods = if ctrl {
+                KeyModifiers::CONTROL
+            } else {
+                KeyModifiers::NONE
+            };
+            assert_eq!(
+                translate(KeyEvent::new(KeyCode::Char(c), mods)),
+                want,
+                "{c:?} with ctrl={ctrl}"
+            );
+        }
     }
 
     /// Only Ctrl-c, Ctrl-n and Ctrl-p are keys of their own; every other
@@ -374,22 +387,6 @@ mod tests {
                 "Ctrl-{c} must not act as a plain {c}"
             );
         }
-    }
-
-    #[test]
-    fn ctrl_n_and_ctrl_p_are_distinguished_from_plain_letters() {
-        assert_eq!(
-            translate(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
-            Key::CtrlN
-        );
-        assert_eq!(
-            translate(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
-            Key::CtrlP
-        );
-        assert_eq!(
-            translate(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
-            Key::Char('n')
-        );
     }
 
     #[test]

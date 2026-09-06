@@ -205,18 +205,4 @@ mod tests {
         assert_eq!(interpret(KeyCode::Char('a'), false), Step::Ignore);
         assert_eq!(interpret(KeyCode::Up, false), Step::Ignore);
     }
-
-    /// Confirming without pressing anything keeps the standard prefix.
-    #[test]
-    fn a_bare_confirm_maps_to_the_default_at_the_call_site() {
-        // `run_loop` maps Confirm with no selection to `crate::keys::PREFIX`.
-        let state = State {
-            selected: None,
-            message: None,
-        };
-        assert_eq!(
-            state.selected.unwrap_or(crate::keys::PREFIX),
-            crate::keys::PREFIX
-        );
-    }
 }

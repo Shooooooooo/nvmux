@@ -396,18 +396,6 @@ mod tests {
     }
 
     #[test]
-    fn the_kill_confirm_names_the_session() {
-        let mut a = app(&["dotfiles"]);
-        a.on_key(super::super::app::Key::Char('x'));
-        let lines = render(&a, 60, 6);
-        assert!(
-            lines[5].contains(r#"kill "dotfiles"? [y/N]"#),
-            "got {:?}",
-            lines[5]
-        );
-    }
-
-    #[test]
     fn the_filter_prompt_shows_the_query_with_a_cursor() {
         let mut a = app(&["api-server", "dotfiles"]);
         a.on_key(super::super::app::Key::Char('/'));

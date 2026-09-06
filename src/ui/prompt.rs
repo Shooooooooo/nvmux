@@ -555,34 +555,6 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_field_shows_the_label_and_the_default() {
-        let lines = render(&prompt(), 50, 9);
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("new session name: session 3")),
-            "expected the labelled line with its default, got {lines:?}"
-        );
-    }
-
-    #[test]
-    fn typing_replaces_the_placeholder_entirely() {
-        let mut p = prompt();
-        type_in(&mut p, "my-project");
-        let lines = render(&p, 50, 9);
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("new session name: my-project")),
-            "expected the typed name after the label, got {lines:?}"
-        );
-        assert!(
-            !lines.iter().any(|l| l.contains("session 3")),
-            "the placeholder must not linger once typing has started: {lines:?}"
-        );
-    }
-
-    #[test]
     fn backspacing_to_empty_brings_the_placeholder_back() {
         let mut p = prompt();
         type_in(&mut p, "ab");

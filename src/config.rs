@@ -440,24 +440,22 @@ mod tests {
         assert_eq!(s.keys.prefix, 0x01);
     }
 
+    /// A config file is edited by hand, so a typo is likely and silence is the
+    /// wrong response — an unknown table, an unknown key in either table, and an
+    /// unparseable value all have to be refused rather than ignored.
     #[test]
-    fn an_unknown_top_level_table_is_rejected() {
-        assert!(toml::from_str::<Settings>("[colours]\nx = 1\n").is_err());
-    }
-
-    #[test]
-    fn an_unknown_fade_key_is_rejected() {
-        assert!(toml::from_str::<Settings>("[fade]\nframe = 4\n").is_err());
-    }
-
-    #[test]
-    fn an_unknown_keys_key_is_rejected() {
-        assert!(toml::from_str::<Settings>("[keys]\nprefx = \"C-a\"\n").is_err());
-    }
-
-    #[test]
-    fn a_bad_prefix_string_is_a_parse_error() {
-        assert!(toml::from_str::<Settings>("[keys]\nprefix = \"nope\"\n").is_err());
+    fn a_typo_is_never_silently_ignored() {
+        for (what, doc) in [
+            ("an unknown top-level table", "[colours]\nx = 1\n"),
+            ("an unknown fade key", "[fade]\nframe = 4\n"),
+            ("an unknown keys key", "[keys]\nprefx = \"C-a\"\n"),
+            ("an unparseable prefix", "[keys]\nprefix = \"nope\"\n"),
+        ] {
+            assert!(
+                toml::from_str::<Settings>(doc).is_err(),
+                "{what} should be rejected: {doc:?}"
+            );
+        }
     }
 
     #[test]

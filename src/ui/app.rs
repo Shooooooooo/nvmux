@@ -397,35 +397,27 @@ mod tests {
         app.visible().iter().map(|s| s.name.clone()).collect()
     }
 
+    /// The three ways to move are one behaviour, wrapping included — previously
+    /// only `j`/`k` was checked for the wrap.
     #[test]
-    fn movement_wraps_in_both_directions() {
-        let mut a = app(&["one", "two", "three"]);
-        assert_eq!(a.selected_index(), 0);
-        a.on_key(Key::Char('j'));
-        a.on_key(Key::Char('j'));
-        assert_eq!(a.selected_index(), 2);
-        a.on_key(Key::Char('j'));
-        assert_eq!(a.selected_index(), 0, "should wrap forwards");
-        a.on_key(Key::Char('k'));
-        assert_eq!(a.selected_index(), 2, "should wrap backwards");
-    }
-
-    #[test]
-    fn arrows_match_jk() {
-        let mut a = app(&["one", "two"]);
-        a.on_key(Key::Down);
-        assert_eq!(a.selected_index(), 1);
-        a.on_key(Key::Up);
-        assert_eq!(a.selected_index(), 0);
-    }
-
-    #[test]
-    fn ctrl_n_and_ctrl_p_match_jk() {
-        let mut a = app(&["one", "two"]);
-        a.on_key(Key::CtrlN);
-        assert_eq!(a.selected_index(), 1);
-        a.on_key(Key::CtrlP);
-        assert_eq!(a.selected_index(), 0);
+    fn every_movement_key_moves_and_wraps_in_both_directions() {
+        for (down, up) in [
+            (Key::Char('j'), Key::Char('k')),
+            (Key::Down, Key::Up),
+            (Key::CtrlN, Key::CtrlP),
+        ] {
+            let mut a = app(&["one", "two", "three"]);
+            assert_eq!(a.selected_index(), 0);
+            a.on_key(down);
+            a.on_key(down);
+            assert_eq!(a.selected_index(), 2, "{down:?} should move down");
+            a.on_key(down);
+            assert_eq!(a.selected_index(), 0, "{down:?} should wrap forwards");
+            a.on_key(up);
+            assert_eq!(a.selected_index(), 2, "{up:?} should wrap backwards");
+            a.on_key(up);
+            assert_eq!(a.selected_index(), 1, "{up:?} should move up");
+        }
     }
 
     #[test]

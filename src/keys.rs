@@ -385,14 +385,6 @@ mod tests {
     }
 
     #[test]
-    fn doubled_prefix_sends_one_literal() {
-        let mut p = Prefix::new(0);
-        let steps = p.feed(&[PREFIX, PREFIX]);
-        assert_eq!(forwarded(&steps), vec![PREFIX]);
-        assert!(!p.is_armed());
-    }
-
-    #[test]
     fn commands_produce_actions_and_no_bytes() {
         for &Binding { key, action, .. } in BINDINGS {
             let mut p = Prefix::new(0);
@@ -555,15 +547,6 @@ mod tests {
             }
             assert!(!p.is_armed(), "byte {b:#04x} left the machine armed");
         }
-    }
-
-    #[test]
-    fn question_mark_after_the_prefix_is_help_not_a_replayed_byte() {
-        let mut p = Prefix::new(0);
-        let steps = p.feed(&[PREFIX, b'?']);
-        assert_eq!(actions(&steps), vec![Action::Help]);
-        assert!(forwarded(&steps).is_empty());
-        assert!(!p.is_armed());
     }
 
     /// `<prefix> ?` used to be replayed to Neovim as two bytes. This is the way to

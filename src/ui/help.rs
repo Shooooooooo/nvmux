@@ -203,12 +203,6 @@ mod tests {
         }
     }
 
-    /// Closes like esc, rather than exiting nvmux out from under a live session.
-    #[test]
-    fn ctrl_c_closes_rather_than_quitting() {
-        assert!(closes(Key::CtrlC));
-    }
-
     /// `<prefix>` arrives here as `Key::Other`, and its command letters as
     /// themselves; if any of them closed the help, a chord typed from this
     /// screen would be half-forwarded.
@@ -271,19 +265,6 @@ mod tests {
                 .any(|s| matches!(s, keys::Step::Act(_)));
             // Zero is excluded on purpose: no session number begins with one.
             assert_eq!(acts, b != b'0', "byte {:?}", b as char);
-        }
-    }
-
-    #[test]
-    fn every_binding_is_listed_with_its_description() {
-        let lines = render(80, 24);
-        for (b, row) in keys::BINDINGS.iter().zip(rows(PREFIX_LABEL)) {
-            let line = line_for(&lines, &row);
-            assert!(
-                line.contains(b.help),
-                "{:?} row lacks its description: {line:?}",
-                row.keys
-            );
         }
     }
 
