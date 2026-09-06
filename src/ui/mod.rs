@@ -135,6 +135,43 @@ impl Drop for Screen {
     }
 }
 
+/// Take the terminal for one screen, run `f` on it, and give it back.
+///
+/// The restore happens before the outcome propagates: an error that leaves the
+/// terminal in raw mode with no echo is far worse than the error itself. `prime`
+/// paints a first black frame, for a screen entered from black.
+///
+/// [`run`] does not use this — the picker's attach path leaves through
+/// [`Screen::close_to_black`] instead.
+pub(crate) fn owning<T>(
+    prime: bool,
+    f: impl FnOnce(&mut ratatui::DefaultTerminal) -> Result<T>,
+) -> Result<T> {
+    let mut screen = Screen::open(prime)?;
+    let outcome = f(screen.terminal());
+    screen.close()?;
+    outcome
+}
+
+/// Wait up to [`TICK`] for a keypress the screens understand.
+///
+/// `Ok(None)` means nothing happened and the caller should loop — either the
+/// poll timed out or the event was not a key press. Press only: with the kitty
+/// protocol pushed by Neovim, a release would otherwise count as a second
+/// keypress.
+///
+/// [`setup`] deliberately does not use this: it needs the raw chord, since
+/// [`translate`] discards every control chord but the three the picker binds.
+pub(crate) fn poll_key() -> Result<Option<Key>> {
+    if !event::poll(TICK)? {
+        return Ok(None);
+    }
+    Ok(match event::read()? {
+        Event::Key(k) if k.kind == KeyEventKind::Press => Some(translate(k)),
+        _ => None,
+    })
+}
+
 /// Run the picker until the user attaches or quits. `message` replaces the hint
 /// row — how a failed attach reports itself without exiting the program.
 pub fn run(transport: &dyn Transport, message: Option<String>) -> Result<Outcome> {

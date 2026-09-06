@@ -122,16 +122,18 @@ impl App {
         self.visible().get(self.selected).copied()
     }
 
+    /// A request naming whatever is selected, or nothing when the list is empty
+    /// — every key that acts on a row has to answer for both.
+    fn on_selection(&self, request: impl FnOnce(String) -> Request) -> Request {
+        self.selected_id().map_or(Request::None, request)
+    }
+
     fn selected_id(&self) -> Option<String> {
         self.selected_session().map(|s| s.id.clone())
     }
 
     fn session_name(&self, id: &str) -> String {
-        self.sessions
-            .iter()
-            .find(|s| s.id == id)
-            .map(|s| s.name.clone())
-            .unwrap_or_default()
+        self.session(id).map(|s| s.name.clone()).unwrap_or_default()
     }
 
     /// Move the selection, wrapping at both ends.
@@ -269,23 +271,15 @@ impl App {
                 self.selected = self.visible().len().saturating_sub(1);
                 Request::None
             }
-            Key::Enter => match self.selected_session() {
-                Some(s) => Request::Attach(s.id.clone()),
-                None => Request::None,
-            },
+            Key::Enter => self.on_selection(Request::Attach),
             Key::Char('c') => Request::NewSession,
-            Key::Char('r') => match self.selected_session() {
-                Some(s) => Request::RenameSession(s.id.clone()),
-                None => Request::None,
-            },
-            Key::Char('x') => match self.selected_session() {
-                Some(s) => {
-                    let id = s.id.clone();
+            Key::Char('r') => self.on_selection(Request::RenameSession),
+            Key::Char('x') => {
+                if let Some(id) = self.selected_id() {
                     self.show_kill_confirm(&id);
-                    Request::None
                 }
-                None => Request::None,
-            },
+                Request::None
+            }
             Key::Char('/') => {
                 self.mode = Mode::Filter;
                 Request::None
@@ -325,10 +319,7 @@ impl App {
             }
             Key::Enter => {
                 self.mode = Mode::Normal;
-                match self.selected_session() {
-                    Some(s) => Request::Attach(s.id.clone()),
-                    None => Request::None,
-                }
+                self.on_selection(Request::Attach)
             }
             Key::Esc => {
                 self.filter.clear();

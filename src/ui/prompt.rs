@@ -29,7 +29,6 @@
 //! than taking a column in front of it: the default then occupies exactly the
 //! columns your own name will, and nothing shifts when you start typing.
 
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -150,11 +149,9 @@ impl Prompt {
 /// `<prefix> c`, which arrives from an attached session with none to borrow.
 pub fn run(transport: &dyn Transport) -> Result<Outcome> {
     // Reached from a session that has already dissolved to black, so start black.
-    let mut screen = super::Screen::open(crate::fade::excursions())?;
-    let outcome = run_on(screen.terminal(), transport, Task::Create, true);
-    // Restore before propagating: see `ui::Screen`.
-    screen.close()?;
-    outcome
+    super::owning(crate::fade::excursions(), |terminal| {
+        run_on(terminal, transport, Task::Create, true)
+    })
 }
 
 /// Ask for a name on a terminal the caller already owns — how the picker drives
@@ -183,12 +180,8 @@ pub(super) fn run_on(
     let outcome = 'prompt: loop {
         terminal.draw(|f| draw(f, &prompt))?;
 
-        if !event::poll(super::TICK)? {
+        let Some(key) = super::poll_key()? else {
             continue;
-        }
-        let key = match event::read()? {
-            Event::Key(k) if k.kind == KeyEventKind::Press => super::translate(k),
-            _ => continue,
         };
 
         let name = match prompt.on_key(key) {

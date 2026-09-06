@@ -20,9 +20,6 @@
 //! `c` and `Other` do nothing, and only `Esc`, `q`, `Enter`, `?` and `Ctrl-c`
 //! close it. Nothing typed on this screen is ever forwarded.
 
-use std::borrow::Cow;
-
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
@@ -42,21 +39,10 @@ const HINTS: &str = "esc back";
 const GAP: usize = 3;
 
 /// One line of the table.
-///
-/// `what` is a [`Cow`] because most descriptions are the static strings from
-/// [`keys::BINDINGS`], but the two that name the prefix itself are built from the
-/// configured label at runtime.
 #[derive(Debug)]
 struct Row {
     keys: String,
-    what: Cow<'static, str>,
-}
-
-/// What one keypress meant.
-#[derive(Debug, PartialEq, Eq)]
-enum Step {
-    None,
-    Close,
+    what: String,
 }
 
 /// The command rows from [`keys::BINDINGS`], then the rules that are not
@@ -72,20 +58,20 @@ fn rows(prefix: &str) -> Vec<Row> {
         .iter()
         .map(|b| Row {
             keys: format!("{prefix} {}", b.key as char),
-            what: Cow::Borrowed(b.help),
+            what: b.help.to_string(),
         })
         .collect();
     rows.push(Row {
         keys: format!("{prefix} 1-9"),
-        what: Cow::Borrowed("attach to the session with that number"),
+        what: "attach to the session with that number".to_string(),
     });
     rows.push(Row {
         keys: format!("{prefix} {prefix}"),
-        what: Cow::Owned(format!("send a literal {prefix} to Neovim")),
+        what: format!("send a literal {prefix} to Neovim"),
     });
     rows.push(Row {
         keys: format!("{prefix} other"),
-        what: Cow::Owned(format!("send {prefix} and that key to Neovim")),
+        what: format!("send {prefix} and that key to Neovim"),
     });
     rows
 }
@@ -93,24 +79,21 @@ fn rows(prefix: &str) -> Vec<Row> {
 /// Named keys only. `t`, `d` and `c` — and therefore `Ctrl-t`, which arrives
 /// as `Key::Other` — are deliberately not here: a chord typed while the help
 /// is open must do nothing, not close the help and forward its second key.
-fn on_key(key: Key) -> Step {
-    match key {
-        // Closes like esc; quitting here would tear the user out of a live
-        // session they only meant to read a key list in.
-        Key::Char('q') | Key::Char('?') | Key::Esc | Key::Enter | Key::CtrlC => Step::Close,
-        _ => Step::None,
-    }
+///
+/// `q` and `Ctrl-c` close like esc rather than quitting: quitting here would
+/// tear the user out of a live session they only meant to read a key list in.
+fn closes(key: Key) -> bool {
+    matches!(
+        key,
+        Key::Char('q') | Key::Char('?') | Key::Esc | Key::Enter | Key::CtrlC
+    )
 }
 
 /// Show the bindings until the user dismisses them, on its own terminal, handing
 /// the session back untouched afterwards.
 pub fn run() -> Result<()> {
     // Reached from a session that has already dissolved to black, so start black.
-    let mut screen = super::Screen::open(crate::fade::excursions())?;
-    let outcome = run_on(screen.terminal(), true);
-    // Restore before propagating: see `ui::Screen`.
-    screen.close()?;
-    outcome
+    super::owning(crate::fade::excursions(), |terminal| run_on(terminal, true))
 }
 
 /// Show the bindings on a terminal the caller already owns — how the picker
@@ -126,17 +109,11 @@ pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> 
     loop {
         terminal.draw(|f| draw(f, &rows))?;
 
-        if !event::poll(super::TICK)? {
+        let Some(key) = super::poll_key()? else {
             continue;
-        }
-        let key = match event::read()? {
-            // Press only: with the kitty protocol pushed by Neovim, a release
-            // would otherwise count as a second keypress.
-            Event::Key(k) if k.kind == KeyEventKind::Press => super::translate(k),
-            _ => continue,
         };
 
-        if on_key(key) == Step::Close {
+        if closes(key) {
             // Dissolve back to black so the resumed session takes over dark.
             if animate {
                 crate::fade::fade_out_ratatui(terminal, |f| draw(f, &rows))?;
@@ -221,14 +198,14 @@ mod tests {
             Key::Enter,
             Key::CtrlC,
         ] {
-            assert_eq!(on_key(key), Step::Close, "{key:?} should close");
+            assert!(closes(key), "{key:?} should close");
         }
     }
 
     /// Closes like esc, rather than exiting nvmux out from under a live session.
     #[test]
     fn ctrl_c_closes_rather_than_quitting() {
-        assert_eq!(on_key(Key::CtrlC), Step::Close);
+        assert!(closes(Key::CtrlC));
     }
 
     /// `<prefix>` arrives here as `Key::Other`, and its command letters as
@@ -244,7 +221,7 @@ mod tests {
             Key::Backspace,
             Key::Other,
         ] {
-            assert_eq!(on_key(key), Step::None, "{key:?} must be ignored");
+            assert!(!closes(key), "{key:?} must be ignored");
         }
     }
 
