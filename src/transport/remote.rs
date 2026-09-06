@@ -20,8 +20,8 @@ use crate::session::{Liveness, Session};
 use crate::shell;
 use crate::ssh::Ssh;
 use crate::transport::{
-    ensure_name_free, finish_listing, install_detach_alias, kill_outcome, protocol,
-    wait_until_reachable, Location, Transport, REACHABLE_TIMEOUT,
+    finish_listing, install_detach_alias, kill_outcome, opt_pid_arg, pid_arg, plan_create,
+    plan_rename, protocol, wait_until_reachable, Location, Transport, REACHABLE_TIMEOUT,
 };
 
 pub struct SshTransport {
@@ -213,14 +213,9 @@ impl Transport for SshTransport {
     }
 
     fn create_session(&self, name: &str) -> Result<Session> {
-        crate::session::validate_name(name)?;
         // The listing doubles as the source of the new session's number; see the
         // local transport.
-        let existing = self.list_sessions()?;
-        ensure_name_free(&existing, name, None)?;
-        let num = crate::transport::next_free_num(&existing);
-
-        let id = ids::new_id().map_err(|e| std::io::Error::other(e.to_string()))?;
+        let (id, num) = plan_create(&self.list_sessions()?, name)?;
         // Check the length before spawning, not after: an overlong path makes
         // Neovim silently truncate and bind somewhere we could never reach.
         let remote_sock = self.remote_sock(&id)?;
@@ -230,22 +225,23 @@ impl Transport for SshTransport {
         let out = self.run_script(shell::SPAWN_SCRIPT, &[&self.remote_dir, &id])?;
         let spawned = protocol::parse_spawn(&out.stdout)?;
 
-        if !spawned.socket_appeared {
-            let _ = self.run_script(
-                shell::KILL_SCRIPT,
-                &[
-                    &self.remote_dir,
-                    &id,
-                    &spawned.pid.map(|p| p.to_string()).unwrap_or_default(),
-                ],
-            );
-            return Err(SessionError::NotReady {
+        // Both ways out of a half-created session: terminate the remote nvim
+        // (the script removes its files only once it has seen the process go)
+        // and report why, naming the remote log rather than a local path.
+        let abandon = |log_tail: String| -> NvmuxError {
+            let pid = opt_pid_arg(spawned.pid);
+            let _ = self.run_script(shell::KILL_SCRIPT, &[&self.remote_dir, &id, &pid]);
+            SessionError::NotReady {
                 name: name.to_string(),
                 timeout: REACHABLE_TIMEOUT,
                 log: PathBuf::from(format!("{}:{}/{}.log", self.host(), self.remote_dir, id)),
-                log_tail: out.stderr.trim().to_string(),
+                log_tail,
             }
-            .into());
+            .into()
+        };
+
+        if !spawned.socket_appeared {
+            return Err(abandon(out.stderr.trim().to_string()));
         }
 
         // Confirm through a forward, which also proves the forward works before
@@ -259,21 +255,9 @@ impl Transport for SshTransport {
             // nonexistent remote socket still exits 0 and creates a working
             // local socket.
             self.ssh.cancel(&local, &remote_sock);
-            let _ = self.run_script(
-                shell::KILL_SCRIPT,
-                &[
-                    &self.remote_dir,
-                    &id,
-                    &spawned.pid.map(|p| p.to_string()).unwrap_or_default(),
-                ],
-            );
-            return Err(SessionError::NotReady {
-                name: name.to_string(),
-                timeout: REACHABLE_TIMEOUT,
-                log: PathBuf::from(format!("{}:{}/{}.log", self.host(), self.remote_dir, id)),
-                log_tail: "the session never answered through the forward".into(),
-            }
-            .into());
+            return Err(abandon(
+                "the session never answered through the forward".into(),
+            ));
         }
 
         let mut session = Session::new(id.clone(), name.to_string(), spawned.pid.unwrap_or(0), num);
@@ -290,11 +274,7 @@ impl Transport for SshTransport {
     }
 
     fn kill_session(&self, s: &Session) -> Result<()> {
-        let pid = if s.pid > 1 {
-            s.pid.to_string()
-        } else {
-            String::new()
-        };
+        let pid = pid_arg(s.pid);
         let out = self.run_script(shell::KILL_SCRIPT, &[&self.remote_dir, &s.id, &pid])?;
         let outcome = protocol::parse_kill(&out.stdout)?;
 
@@ -315,8 +295,7 @@ impl Transport for SshTransport {
     /// between the listing and the confirm gets its metadata rewritten, which
     /// the next listing's sweep removes again, since its socket is gone.
     fn rename_session(&self, s: &Session, new_name: &str) -> Result<()> {
-        crate::session::validate_name(new_name)?;
-        ensure_name_free(&self.list_sessions()?, new_name, Some(&s.id))?;
+        plan_rename(&self.list_sessions()?, new_name, &s.id)?;
 
         let mut updated = s.clone();
         updated.name = new_name.to_string();

@@ -4,15 +4,14 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use crate::error::{NvmuxError, Result, SessionError};
-use crate::ids;
 use crate::paths::{self, SessionPaths};
 use crate::proc;
 use crate::rpc;
 use crate::session::{Liveness, Session};
 use crate::shell;
 use crate::transport::{
-    ensure_name_free, finish_listing, install_detach_alias, kill_outcome, protocol,
-    wait_until_reachable, Location, Transport, REACHABLE_TIMEOUT,
+    finish_listing, install_detach_alias, kill_outcome, opt_pid_arg, pid_arg, plan_create,
+    plan_rename, protocol, wait_until_reachable, Location, Transport, REACHABLE_TIMEOUT,
 };
 
 pub struct LocalTransport {
@@ -142,15 +141,9 @@ impl Transport for LocalTransport {
     }
 
     fn create_session(&self, name: &str) -> Result<Session> {
-        crate::session::validate_name(name)?;
-
         // The listing is also what the new session's number is allocated
         // from, so numbering costs no extra work here.
-        let existing = self.list_sessions()?;
-        ensure_name_free(&existing, name, None)?;
-        let num = crate::transport::next_free_num(&existing);
-
-        let id = ids::new_id().map_err(|e| std::io::Error::other(e.to_string()))?;
+        let (id, num) = plan_create(&self.list_sessions()?, name)?;
         let paths = self.paths(&id)?;
         let dir = self.dir.to_string_lossy().into_owned();
 
@@ -166,7 +159,7 @@ impl Transport for LocalTransport {
             // that was merely slow to start. An empty pid is fine: the script
             // finds the process by its socket, the pid is only a hint.
             let tail = self.log_tail(&paths.log);
-            let pid = spawned.pid.map(|p| p.to_string()).unwrap_or_default();
+            let pid = opt_pid_arg(spawned.pid);
             match proc::run_local(shell::KILL_SCRIPT, &[&dir, &id, &pid]) {
                 Ok(out) => match protocol::parse_kill(&out.stdout) {
                     Ok(outcome) => tracing::debug!(%id, ?outcome, "cleaned up a failed create"),
@@ -203,11 +196,7 @@ impl Transport for LocalTransport {
         // runs VimLeavePre, writes its ShaDa file and unlinks its own socket.
         // The recorded pid is only a starting guess: the script uses it only if
         // it still owns this session's socket, since pids get reused.
-        let pid = if s.pid > 1 {
-            s.pid.to_string()
-        } else {
-            String::new()
-        };
+        let pid = pid_arg(s.pid);
         let out = proc::run_local(shell::KILL_SCRIPT, &[&dir, &s.id, &pid])?;
         if !out.ok() {
             tracing::warn!(status = out.status, stderr = %out.stderr, "kill.sh failed");
@@ -226,8 +215,7 @@ impl Transport for LocalTransport {
     }
 
     fn rename_session(&self, s: &Session, new_name: &str) -> Result<()> {
-        crate::session::validate_name(new_name)?;
-        ensure_name_free(&self.list_sessions()?, new_name, Some(&s.id))?;
+        plan_rename(&self.list_sessions()?, new_name, &s.id)?;
 
         let paths = self.paths(&s.id)?;
 
