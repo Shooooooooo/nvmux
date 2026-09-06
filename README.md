@@ -20,18 +20,15 @@ untouched — which is why bracketed paste, the kitty keyboard protocol,
 truecolor, OSC 52 clipboard and DA1/XTGETTCAP round-trips all just work.
 
 ```
-LOCAL                                     REMOTE
-┌───────────────────────────────┐         ┌────────────────────────────────┐
-│ nvmux                         │         │ nvim --headless --listen <sock>│
-│  ├─ picker UI (ratatui)       │         │   (detached, survives SSH drop)│
-│  ├─ PTY proxy (<prefix>)      │         │ nvim --headless --listen <sock>│
-│  └─ child: nvim --server …    │         │ nvim --headless --listen <sock>│
-│            --remote-ui        │         │                                │
-└───────────────────────────────┘         └────────────────────────────────┘
-         │                                            ▲
-         │  one persistent ssh master (ControlMaster/ControlPersist);
-         │  `ssh -O forward` adds a unix-socket forward per session
-         └──────────────────── SSH ───────────────────┘
+LOCAL                                    REMOTE
+nvmux                                    nvim --headless --listen <sock>
+ ├─ picker UI (ratatui)                  nvim --headless --listen <sock>
+ ├─ PTY proxy (watches for <prefix>)     nvim --headless --listen <sock>
+ └─ child: nvim --server … --remote-ui     (detached, survive an SSH drop)
+      │                                             ▲
+      └──── one persistent ssh master ──────────────┘
+            (ControlMaster/ControlPersist), plus one
+            `ssh -O forward` unix-socket forward per session
 ```
 
 ## Requirements
@@ -43,9 +40,7 @@ LOCAL                                     REMOTE
 
 0.11 is where `:detach` and `:connect` landed; 6.7 is where ssh gained
 unix-socket forwarding. Both are checked at startup and reported plainly; `ssh`
-is only needed, and only checked, when a host is given.
-
-macOS and Linux only.
+is only needed, and only checked, when a host is given. macOS and Linux only.
 
 ## Install
 
@@ -88,16 +83,22 @@ A session name is at most 64 bytes, has no leading or trailing whitespace and
 no control characters, and must not be in use — compared without regard to
 case. Pressing `Enter` on an empty name prompt takes the suggested `session N`.
 
+**Numbers are for life.** A session keeps the number it was created with, so a
+number you have learned goes on meaning the same session. They start at 1 and
+fill gaps: kill session 3 and the next one you create becomes 3 again. Type the
+digits together for a number past 9 — `12` for the twelfth. A single digit acts
+immediately unless a longer number could still be meant, which only happens
+once you have more than nine sessions.
+
 ### While attached
 
-`<prefix>` is the prefix — `Ctrl-t` unless you change it in the
-[config](#configuration).
+`<prefix>` is `Ctrl-t` unless you change it in the [config](#configuration).
 
 | Keys | Action |
 |---|---|
 | `<prefix>` `d` | detach — leaves the session running, exits nvmux |
 | `<prefix>` `t` | back to the picker, session still attached |
-| `<prefix>` `1`–`9` | switch straight to that session |
+| `<prefix>` `1`, `2`, … `12` | switch straight to that session |
 | `<prefix>` `c` | name a new session and attach to it — `Esc` goes back |
 | `<prefix>` `?` | show these keys — `Esc` goes back |
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
@@ -107,11 +108,26 @@ Everything else goes to Neovim untouched — including `Ctrl-c`, `Ctrl-z` and
 for nvmux. Digits are the exception: `<prefix> 1` is a command now, so
 `<prefix> <prefix> 1` is how you send that to the editor.
 
+### Leaving a session
+
+Three ways out, and they do different things.
+
+- **`<prefix> d` detaches.** The session keeps running with all its buffers,
+  undo history and jumplist; reattach later, from this machine or another one.
+  Each session also gets a `:Detach` alias for `:detach`.
+- **`:q` ends the session.** The editor *is* the session, so `:q` in the last
+  window terminates the server, not just your view — as do `:qa`, `ZZ`, `ZQ`,
+  `:x`, `:wq` and `<C-w>q`. That is the ordinary way to finish and keep your
+  work: save as usual, then quit as usual. If you expected `:q` to close only
+  your local view, that is the one thing to unlearn.
+- **`x` in the picker kills, unconditionally.** It asks `kill "name"? [y/N]`
+  and then kills, without asking the session about unsaved buffers. Use `:q`
+  for the editor's own save prompts.
+
 ## Configuration
 
-nvmux needs no configuration and has none by default. If you want to tune the
-transitions or move the prefix key, it reads an optional TOML file, in this
-order:
+nvmux needs no configuration and has none by default. To tune the transitions
+or move the prefix key, it reads an optional TOML file, in this order:
 
 1. `$NVMUX_CONFIG` — an exact path. If set, it **must** exist.
 2. `$XDG_CONFIG_HOME/nvmux/config.toml`
@@ -162,31 +178,3 @@ ends, so a session's files stay in one place across logouts); nvmux's own log
 is `nvmux.log` there, and each session's server output is `<id>.log`. The
 verbosity comes from `$NVMUX_LOG`, in `RUST_LOG` syntax, and defaults to
 warnings only. Keystrokes are never logged.
-
-## Session numbers
-
-Every session gets a number when it is created and keeps it for life, so a
-number you have learned goes on meaning the same session. They start at 1 and
-fill gaps: kill session 3 and the next one you create becomes 3 again.
-
-Numbers longer than one digit work by typing the digits together — `12` for the
-twelfth session. A single digit acts immediately unless a longer number could
-still be meant, which only happens once you have more than nine sessions.
-
-## Leaving a session
-
-There are two ways out, and they do different things.
-
-**`<prefix> d` detaches.** The session keeps running with all its buffers, undo
-history and jumplist. Reattach later, from this machine or another one.
-
-**`:q` ends the session.** The editor *is* the session, so `:q` in the last
-window terminates the server, not just your view — as do `:qa`, `ZZ`, `ZQ`,
-`:x`, `:wq` and `<C-w>q`. That is the ordinary way to finish with a session and
-keep your work: save as usual, then quit as usual. If you expected `:q` to close
-only your local view, that is the one thing to unlearn. Each session also gets a
-`:Detach` alias for `:detach`, if you would rather type that than the prefix.
-
-**Killing is unconditional.** `x` asks `kill "name"? [y/N]` and then kills — it
-does not ask the session about unsaved buffers. Use `:q` for the editor's own
-save prompts.

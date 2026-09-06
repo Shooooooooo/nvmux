@@ -62,7 +62,9 @@ fn rows(prefix: &str) -> Vec<Row> {
         })
         .collect();
     rows.push(Row {
-        keys: format!("{prefix} 1-9"),
+        // Not `1-9`: `Prefix::feed` reads a number, not a digit, so `12` reaches
+        // the twelfth session.
+        keys: format!("{prefix} 1-n"),
         what: "attach to the session with that number".to_string(),
     });
     rows.push(Row {
@@ -237,7 +239,7 @@ mod tests {
             // `Ctrl-t other` row. Digits are the one range row, so they are
             // looked up as the range rather than as themselves.
             let listed = if b.is_ascii_digit() {
-                acts && rows.iter().any(|r| r.keys == format!("{PREFIX_LABEL} 1-9"))
+                acts && rows.iter().any(|r| r.keys == format!("{PREFIX_LABEL} 1-n"))
             } else {
                 rows.iter()
                     .any(|r| r.keys == format!("{PREFIX_LABEL} {}", b as char))
@@ -255,7 +257,7 @@ mod tests {
         assert!(
             rows(PREFIX_LABEL)
                 .iter()
-                .any(|r| r.keys == format!("{PREFIX_LABEL} 1-9")),
+                .any(|r| r.keys == format!("{PREFIX_LABEL} 1-n")),
             "the digit row is missing"
         );
         for b in b'0'..=b'9' {
@@ -288,7 +290,7 @@ mod tests {
             );
         }
         let digits = body[want.len()];
-        assert!(digits.starts_with("Ctrl-t 1-9"), "got {digits:?}");
+        assert!(digits.starts_with("Ctrl-t 1-n"), "got {digits:?}");
         assert!(digits.contains("number"), "got {digits:?}");
         let literal = body[want.len() + 1];
         assert!(literal.starts_with("Ctrl-t Ctrl-t"), "got {literal:?}");

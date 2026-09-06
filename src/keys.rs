@@ -357,6 +357,28 @@ mod tests {
             .collect()
     }
 
+    /// The README's "While attached" table is a prose copy of [`BINDINGS`], and
+    /// a reader picking the tool up has only that copy — the `<prefix> ?` screen
+    /// needs a running session. So every command must have a row there.
+    ///
+    /// The key cell, not the description: the two word things differently on
+    /// purpose (the screen has one line, the README has a column), and pinning
+    /// the prose would only force them to drift together. What actually goes
+    /// wrong is a command added here and never written down.
+    #[test]
+    fn every_binding_has_a_row_in_the_readme() {
+        let readme = include_str!("../README.md");
+        for b in BINDINGS {
+            let cell = format!("| `<prefix>` `{}` |", b.key as char);
+            assert!(
+                readme.contains(&cell),
+                "README has no row for `<prefix> {}` — add one to \
+                 the \"While attached\" table",
+                b.key as char
+            );
+        }
+    }
+
     #[test]
     fn ordinary_bytes_pass_through_untouched() {
         let mut p = Prefix::new(0);

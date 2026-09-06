@@ -36,7 +36,10 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install neovim
       - run: nvim --version | head -1
+      # rustfmt's output does not vary by platform; clippy's findings do
+      # (see the cfg-divergent waitid in src/pty.rs), so that stays on both.
       - run: cargo fmt --check
+        if: runner.os == 'Linux'
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
