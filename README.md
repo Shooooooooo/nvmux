@@ -35,12 +35,12 @@ nvmux                                    nvim --headless --listen <sock>
 
 | Where | Needs |
 |---|---|
-| Local | `nvim` >= 0.11, and `ssh` >= 6.7 for `nvmux <host>` |
+| Local | `nvim` >= 0.11, and `ssh` for `nvmux <host>` |
 | Remote | `nvim` >= 0.11 |
 
-0.11 is where `:detach` and `:connect` landed; 6.7 is where ssh gained
-unix-socket forwarding. Both are checked at startup and reported plainly; `ssh`
-is only needed, and only checked, when a host is given. macOS and Linux only.
+0.11 is where `:detach` and `:connect` landed; it is checked at startup on both
+ends and reported plainly. `ssh` is only needed, and only checked, when a host
+is given. macOS and Linux only.
 
 ## Install
 
@@ -126,50 +126,27 @@ Three ways out, and they do different things.
 
 ## Configuration
 
-nvmux needs no configuration and has none by default. To tune the transitions
-or move the prefix key, it reads an optional TOML file, in this order:
-
-1. `$NVMUX_CONFIG` — an exact path. If set, it **must** exist.
-2. `$XDG_CONFIG_HOME/nvmux/config.toml`
-3. `$HOME/.config/nvmux/config.toml`
-
-A missing file, an empty file, or any omitted field keeps the built-in default,
-so a partial file only overrides what it names. A file that exists but does not
-parse, names an unknown key, or fails validation is a startup error, reported
-with its path — a typo is never silently ignored.
-
-**First run.** The first time you start nvmux at a terminal with no config file,
-it asks you to pick a prefix: press the key you want (or `Enter` to keep
-`Ctrl-t`), and nvmux writes the file below for you, so it only ever asks once.
-`Esc` skips and leaves things unset — you'll be asked again next time. This never
-happens for a non-interactive run or when `$NVMUX_CONFIG` is set.
+nvmux needs no configuration. To move the prefix key or tune the transitions, it
+reads an optional TOML file — `$NVMUX_CONFIG` if set, else
+`$XDG_CONFIG_HOME/nvmux/config.toml`, else `~/.config/nvmux/config.toml`. Any
+omitted field keeps its default; an unknown key or a bad value is a startup
+error.
 
 Every value below is its default:
 
 ```toml
-# ~/.config/nvmux/config.toml
-
 [fade]
-enabled        = true   # master switch for the dip-to-black transitions.
-                        # NO_COLOR forces this off regardless of this setting.
-frames         = 8      # steps per direction (must be >= 1).
-frame_delay_ms = 12     # milliseconds between frames.
-hold_ms        = 30     # milliseconds held fully black across a hand-off.
-excursions     = true   # also fade the quick <prefix> ? / <prefix> c screens.
-raw_dissolve   = true   # dissolve an attached session cell by cell, rather
-                        # than an instant blackout (cheaper over a slow link).
+enabled        = true   # dip-to-black transitions (NO_COLOR forces off)
+frames         = 8
+frame_delay_ms = 12
+hold_ms        = 30
+excursions     = true   # fade the <prefix> ? / <prefix> c screens too
+raw_dissolve   = true   # dissolve cell by cell, not an instant blackout
 
 [keys]
-prefix     = "Ctrl-t"   # the prefix key, written like "C-t" or "Ctrl-a"
-                        # (case-insensitive).
-timeout_ms = 500        # how long a lone prefix or a half-typed number waits.
+prefix     = "Ctrl-t"   # a Ctrl-<letter> chord
+timeout_ms = 500        # how long a lone prefix or half-typed number waits
 ```
-
-The prefix must be a `Ctrl-<letter>` chord. `C-m`, `C-j`, `C-i` and `C-h` are
-rejected (they are Enter, newline, Tab and Backspace on the wire); `C-c` and
-`C-z` are allowed, but then that key stops reaching Neovim. `--help` always
-spells the default `Ctrl-t`, since it is printed before the config is read — the
-`<prefix> ?` screen shows the key you actually set.
 
 ## Logs
 
