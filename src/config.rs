@@ -4,8 +4,8 @@
 //! reads one. The governing idea is that a config file only ever *overrides*:
 //! an absent file, an empty file and an omitted field all reproduce the
 //! built-in behaviour byte for byte, because they all resolve through
-//! [`FadeSettings`] / [`KeySettings`] `Default` — which is where each default
-//! is written down, once.
+//! [`KeySettings`] `Default` — which is where each default is written down,
+//! once.
 //!
 //! # Strict, and loud
 //!
@@ -37,38 +37,12 @@ use serde::Deserialize;
 
 use crate::error::ConfigError;
 
-/// The whole configuration. Every field has a table of its own so the file reads
-/// as `[fade]` / `[keys]` sections.
+/// The whole configuration. Each field is a table of its own, so the file reads
+/// as `[keys]`-style sections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
-    pub fade: FadeSettings,
     pub keys: KeySettings,
-}
-
-/// The dip-to-black transition knobs (see [`crate::fade`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct FadeSettings {
-    /// Master switch. `NO_COLOR` still forces the effect off regardless — see
-    /// [`crate::fade::enabled`].
-    pub enabled: bool,
-    /// Steps per direction; must be at least 1 (see `Settings::validate`).
-    /// Eight is enough to read as motion without dragging.
-    pub frames: usize,
-    /// Delay between frames; `frames * frame_delay_ms` is one direction's
-    /// duration.
-    pub frame_delay_ms: u64,
-    /// How long the screen is held fully black across a hand-off, covering the
-    /// client swap or the alt-screen crossing so neither shows through.
-    pub hold_ms: u64,
-    /// Whether the quick `<prefix> ?` / `<prefix> c` / picker-peek excursions
-    /// fade too. Off makes those snappier at the cost of consistency.
-    pub excursions: bool,
-    /// Dissolve the raw session out to black cell by cell. Off makes the raw
-    /// path an instant blackout instead — cheaper over a slow link, but a hard
-    /// cut.
-    pub raw_dissolve: bool,
 }
 
 /// The prefix key and how long a half-typed sequence waits (see [`crate::keys`]).
@@ -88,19 +62,6 @@ pub struct KeySettings {
 // These are the built-in behaviour. `#[serde(default)]` on the containers means
 // an absent file, an empty file and an omitted field all land here, so this is
 // the one place a default is written down.
-
-impl Default for FadeSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            frames: 8,
-            frame_delay_ms: 12,
-            hold_ms: 30,
-            excursions: true,
-            raw_dissolve: true,
-        }
-    }
-}
 
 impl Default for KeySettings {
     fn default() -> Self {
@@ -125,32 +86,14 @@ where
     crate::keys::parse_prefix(&s).map_err(serde::de::Error::custom)
 }
 
-/// Ceilings for the numeric knobs. Generous — nobody wants a minute-long fade —
-/// but finite, because every one of these goes into a `sleep` or a `poll`
-/// timeout and an absurd value is a hang, not a slow transition.
-const MAX_FRAMES: usize = 1_000;
-const MAX_DELAY_MS: u64 = 10_000;
+/// Ceiling for `keys.timeout_ms`. Generous but finite: the value goes into a
+/// `poll` timeout as a `c_int`, and an absurd one is a hang, not a long wait.
 const MAX_TIMEOUT_MS: u64 = 60_000;
 
 impl Settings {
     /// Rules that the deserializer cannot express. Kept minimal: only values that
     /// would misbehave at runtime, not taste.
     fn validate(&self) -> Result<(), String> {
-        if self.fade.frames == 0 {
-            // `step / frames` would be a division by zero -> NaN coverage.
-            return Err("fade.frames must be at least 1".into());
-        }
-        if self.fade.frames > MAX_FRAMES {
-            return Err(format!("fade.frames must be at most {MAX_FRAMES}"));
-        }
-        if self.fade.frame_delay_ms > MAX_DELAY_MS {
-            return Err(format!(
-                "fade.frame_delay_ms must be at most {MAX_DELAY_MS}"
-            ));
-        }
-        if self.fade.hold_ms > MAX_DELAY_MS {
-            return Err(format!("fade.hold_ms must be at most {MAX_DELAY_MS}"));
-        }
         if self.keys.timeout_ms == 0 {
             // A zero poll timeout spins the relay at full speed while a prefix
             // is armed, and a number could never be typed.
@@ -274,7 +217,6 @@ pub fn with_prefix(prefix: u8) -> Settings {
             prefix,
             ..KeySettings::default()
         },
-        ..Settings::default()
     }
 }
 
@@ -283,31 +225,16 @@ pub fn with_prefix(prefix: u8) -> Settings {
 /// the file does not pin the other defaults — they keep tracking the code. The
 /// commented values are the current defaults, so the template stays accurate.
 fn render_default_config(prefix: u8) -> String {
-    let f = FadeSettings::default();
     let k = KeySettings::default();
     format!(
         "# nvmux configuration — created on first run.\n\
          #\n\
          # Uncomment and edit any line to override its default; delete this file\n\
          # to start over. See the README for what each option does.\n\
-         #\n\
-         # [fade]\n\
-         # enabled        = {enabled}\n\
-         # frames         = {frames}\n\
-         # frame_delay_ms = {frame_delay}\n\
-         # hold_ms        = {hold}\n\
-         # excursions     = {excursions}\n\
-         # raw_dissolve   = {raw}\n\
          \n\
          [keys]\n\
          prefix     = {prefix:?}\n\
          # timeout_ms = {timeout}\n",
-        enabled = f.enabled,
-        frames = f.frames,
-        frame_delay = f.frame_delay_ms,
-        hold = f.hold_ms,
-        excursions = f.excursions,
-        raw = f.raw_dissolve,
         prefix = crate::keys::prefix_label(prefix),
         timeout = k.timeout_ms,
     )
@@ -394,13 +321,6 @@ mod tests {
     #[test]
     fn a_full_document_at_the_defaults_round_trips() {
         let doc = "\
-            [fade]\n\
-            enabled = true\n\
-            frames = 8\n\
-            frame_delay_ms = 12\n\
-            hold_ms = 30\n\
-            excursions = true\n\
-            raw_dissolve = true\n\
             [keys]\n\
             prefix = \"Ctrl-t\"\n\
             timeout_ms = 500\n";
@@ -409,29 +329,10 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_fade_table_keeps_the_other_fade_defaults() {
-        let s: Settings = toml::from_str("[fade]\nframes = 4\n").expect("valid");
-        assert_eq!(s.fade.frames, 4);
-        assert_eq!(
-            s.fade.frame_delay_ms,
-            FadeSettings::default().frame_delay_ms
-        );
-        assert_eq!(s.fade.excursions, FadeSettings::default().excursions);
-        assert_eq!(s.keys, KeySettings::default());
-    }
-
-    #[test]
-    fn a_partial_keys_table_keeps_fade_defaults() {
+    fn a_partial_keys_table_keeps_the_other_keys_defaults() {
         let s: Settings = toml::from_str("[keys]\ntimeout_ms = 250\n").expect("valid");
         assert_eq!(s.keys.timeout_ms, 250);
         assert_eq!(s.keys.prefix, KeySettings::default().prefix);
-        assert_eq!(s.fade, FadeSettings::default());
-    }
-
-    #[test]
-    fn fade_enabled_false_parses() {
-        let s: Settings = toml::from_str("[fade]\nenabled = false\n").expect("valid");
-        assert!(!s.fade.enabled);
     }
 
     #[test]
@@ -441,13 +342,12 @@ mod tests {
     }
 
     /// A config file is edited by hand, so a typo is likely and silence is the
-    /// wrong response — an unknown table, an unknown key in either table, and an
-    /// unparseable value all have to be refused rather than ignored.
+    /// wrong response — an unknown table, an unknown key in the `[keys]` table,
+    /// and an unparseable value all have to be refused rather than ignored.
     #[test]
     fn a_typo_is_never_silently_ignored() {
         for (what, doc) in [
             ("an unknown top-level table", "[colours]\nx = 1\n"),
-            ("an unknown fade key", "[fade]\nframe = 4\n"),
             ("an unknown keys key", "[keys]\nprefx = \"C-a\"\n"),
             ("an unparseable prefix", "[keys]\nprefix = \"nope\"\n"),
         ] {
@@ -458,21 +358,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn zero_frames_is_rejected() {
-        let err = parse(Path::new("test.toml"), "[fade]\nframes = 0\n").expect_err("invalid");
-        assert!(matches!(err, ConfigError::Invalid { .. }), "got {err:?}");
-    }
-
-    /// Every numeric knob feeds a `sleep` or a `poll` timeout, so each has a
-    /// ceiling; the largest values that pass are also pinned so the ceilings
-    /// stay generous.
+    /// The timeout feeds a `poll` call, so it has a floor and a ceiling; the
+    /// extreme values that pass are also pinned so the bounds stay generous.
     #[test]
     fn out_of_range_values_are_rejected_with_their_key_named() {
         let cases = [
-            ("[fade]\nframes = 1001\n", "fade.frames"),
-            ("[fade]\nframe_delay_ms = 10001\n", "fade.frame_delay_ms"),
-            ("[fade]\nhold_ms = 10001\n", "fade.hold_ms"),
             ("[keys]\ntimeout_ms = 0\n", "keys.timeout_ms"),
             ("[keys]\ntimeout_ms = 60001\n", "keys.timeout_ms"),
             // Past `c_int`: the value `poll` would have read as "block forever".
@@ -487,11 +377,7 @@ mod tests {
                 other => panic!("{doc:?}: expected Invalid, got {other:?}"),
             }
         }
-        for doc in [
-            "[fade]\nframes = 1000\nframe_delay_ms = 10000\nhold_ms = 10000\n",
-            "[keys]\ntimeout_ms = 1\n",
-            "[keys]\ntimeout_ms = 60000\n",
-        ] {
+        for doc in ["[keys]\ntimeout_ms = 1\n", "[keys]\ntimeout_ms = 60000\n"] {
             parse(Path::new("test.toml"), doc).expect(doc);
         }
     }
@@ -517,8 +403,7 @@ mod tests {
             rendered.contains("\nprefix     = \"Ctrl-a\"\n"),
             "the chosen prefix is the one active setting: {rendered:?}"
         );
-        // The fade block and the timeout are documentation, not active settings.
-        assert!(rendered.contains("# [fade]"));
+        // The timeout is documentation, not an active setting.
         assert!(rendered.contains("# timeout_ms = 500"));
     }
 
@@ -559,8 +444,7 @@ mod tests {
 
     /// `load` reads `HOME`/`XDG_CONFIG_HOME`/`NVMUX_CONFIG`, which are
     /// process-global. No other test in the crate touches them, so this guard
-    /// only serialises these tests against each other. (Same shape as the
-    /// `NO_COLOR` guard in `fade`.)
+    /// only serialises these tests against each other.
     static ENV_GUARD: Mutex<()> = Mutex::new(());
 
     /// Unset the three vars for the duration of a test, restoring them on drop
@@ -625,10 +509,10 @@ mod tests {
         let env = ScrubbedEnv::new();
         let dir = scratch("explicit");
         let file = dir.join("custom.toml");
-        std::fs::write(&file, "[fade]\nframes = 3\n").expect("write");
+        std::fs::write(&file, "[keys]\ntimeout_ms = 250\n").expect("write");
         env.set("NVMUX_CONFIG", &file);
 
-        assert_eq!(load().expect("valid").fade.frames, 3);
+        assert_eq!(load().expect("valid").keys.timeout_ms, 250);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -649,7 +533,7 @@ mod tests {
         let home = scratch("malformed-home");
         let cfg = home.join(".config").join("nvmux");
         std::fs::create_dir_all(&cfg).expect("mkdir");
-        std::fs::write(cfg.join("config.toml"), "[fade]\nframe = 4\n").expect("write");
+        std::fs::write(cfg.join("config.toml"), "[keys]\nprefx = \"C-a\"\n").expect("write");
         env.set("HOME", &home);
 
         assert!(

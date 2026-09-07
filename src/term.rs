@@ -60,8 +60,8 @@ extern "C" fn restore_and_reraise(sig: libc::c_int) {
         }
     }
     // Undo whatever screen state was mid-flight — the picker's alternate
-    // screen, or a fade — so a signal does not hand the shell back a blank or
-    // black screen with a hidden cursor. A single fixed-string `write` is
+    // screen, a hidden cursor — so a signal does not hand the shell back a
+    // blank screen with no cursor. A single fixed-string `write` is
     // async-signal-safe, like the `tcsetattr` above, and is harmless when
     // nothing was in progress.
     unsafe {
@@ -73,7 +73,8 @@ extern "C" fn restore_and_reraise(sig: libc::c_int) {
     }
 }
 
-/// The screen-state reset: close any open synchronized-update span, leave the
+/// The screen-state reset: close any open synchronized-update span (Neovim
+/// draws inside one, and a client cut off mid-frame leaves it open), leave the
 /// alternate screen (a no-op when not in it), reset SGR and show the cursor.
 /// One fixed string so the signal handler can write it, and so the ordinary
 /// error paths put the screen back exactly the way a signal would.
@@ -82,7 +83,7 @@ const RESET: &[u8] = b"\x1b[?2026l\x1b[?1049l\x1b[0m\x1b[?25h";
 /// Put the screen back to a state a shell can be used in: cursor visible,
 /// colours reset, primary screen. For the paths that end at a shell prompt
 /// with a message — an attach that failed, a detach — where the last thing
-/// drawn may have been a fade's black frame with the cursor hidden.
+/// drawn may have been the client's, mid-frame, with the cursor hidden.
 pub fn reset_screen() {
     use std::io::Write;
     let mut out = std::io::stdout();

@@ -94,20 +94,14 @@ fn closes(key: Key) -> bool {
 /// Show the bindings until the user dismisses them, on its own terminal, handing
 /// the session back untouched afterwards.
 pub fn run() -> Result<()> {
-    // Reached from a session that has already dissolved to black, so start black.
-    super::owning(crate::fade::excursions(), |terminal| run_on(terminal, true))
+    super::owning(run_on)
 }
 
 /// Show the bindings on a terminal the caller already owns — how the picker
-/// answers `?`. `animate` is whether to dip through black on the way in and
-/// out; from the picker the screen is already up, so it does not.
-pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> Result<()> {
+/// answers `?`.
+pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     let label = keys::prefix_label(crate::config::get().keys.prefix);
     let rows = rows(&label);
-    let animate = animate && crate::fade::excursions();
-    if animate {
-        crate::fade::fade_in_ratatui(terminal, |f| draw(f, &rows))?;
-    }
     loop {
         terminal.draw(|f| draw(f, &rows))?;
 
@@ -116,10 +110,6 @@ pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> 
         };
 
         if closes(key) {
-            // Dissolve back to black so the resumed session takes over dark.
-            if animate {
-                crate::fade::fade_out_ratatui(terminal, |f| draw(f, &rows))?;
-            }
             return Ok(());
         }
     }
