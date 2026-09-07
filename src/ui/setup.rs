@@ -76,9 +76,9 @@ struct State {
 }
 
 /// Show the screen until the user confirms or skips. Owns the terminal, like
-/// [`crate::ui::help::run`]; no fade, because nothing has faded to black yet.
+/// [`crate::ui::help::run`].
 pub fn run() -> Result<Outcome> {
-    super::owning(false, run_loop)
+    super::owning(run_loop)
 }
 
 fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Outcome> {

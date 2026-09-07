@@ -244,10 +244,7 @@ pub fn relay(
         .ok_or_else(|| NvmuxError::Io(std::io::Error::other("pty master has no fd")))?;
 
     let winch = winch::Winch::install()?;
-    // Leave the alternate screen into a black primary, so the session starts
-    // from the dark screen the outgoing screen dissolved to (or, from the
-    // picker, so the client spawn never flashes the old primary).
-    crate::fade::enter_session_black();
+    term::leave_alt_screen_and_clear();
     let mut raw = term::RawMode::enter()?;
 
     // What the child buffered while blocked mid-write describes a screen the
@@ -265,30 +262,22 @@ pub fn relay(
             held
             @ (Outcome::ToPicker | Outcome::CreateNew | Outcome::ShowHelp | Outcome::Switch(_)),
         ) => {
-            // Dissolve the session to black before restoring, so the picker or
-            // the next session takes over from a dark screen rather than a cut.
-            // A failed fade must not skip the restore below, so its error is
-            // dropped rather than propagated.
-            let _ = crate::fade::fade_out_raw();
             raw.restore();
             Ok((held, Some(attachment)))
         }
         Ok(Outcome::ChildExited) => {
-            // The child is gone and has emitted its own restore, so there is no
-            // live frame to dissolve — black the screen at once (any dissolve
-            // would race the child's teardown), then let the picker fade up.
+            // The child is gone and has emitted its own restore; relay the rest
+            // of it, then hand back to the picker.
             drain_until_eof(master_fd);
-            crate::fade::black_now();
             raw.restore();
             attachment.reap();
             Ok((Outcome::ChildExited, None))
         }
         Ok(other @ (Outcome::Detached | Outcome::StdinClosed)) => {
             // Leave the session running and let the child put the terminal
-            // back itself — a competing reset (a fade included) while it is
-            // still writing would corrupt its own restore sequence. Once it is
-            // gone, a final reset is harmless and covers a client that died
-            // before it got that far.
+            // back itself — a competing reset while it is still writing would
+            // corrupt its own restore sequence. Once it is gone, a final reset
+            // is harmless and covers a client that died before it got that far.
             attachment.signal();
             drain_until_eof(master_fd);
             raw.restore();
@@ -298,9 +287,9 @@ pub fn relay(
         }
         Err(e) => {
             // The error is about to be printed to a shell: put the cursor and
-            // the colours back first, or `enter_session_black` above leaves it
-            // on a black screen with no cursor. `attachment` is dropped on the
-            // way out, which retires the client.
+            // the colours back first, in case the client died mid-frame with
+            // the cursor hidden or an SGR attribute set. `attachment` is
+            // dropped on the way out, which retires the client.
             attachment.signal();
             drain_until_eof(master_fd);
             raw.restore();

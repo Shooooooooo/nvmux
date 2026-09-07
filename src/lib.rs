@@ -10,7 +10,6 @@
 pub mod cli;
 pub mod config;
 pub mod error;
-pub mod fade;
 pub mod ids;
 pub mod keys;
 pub mod logging;

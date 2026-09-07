@@ -73,14 +73,13 @@ const TICK: Duration = Duration::from_millis(250);
 /// the prompt, the help and the first-run screen all open through here.
 pub(crate) struct Screen {
     terminal: ratatui::DefaultTerminal,
-    /// Set by the explicit closes so `Drop` does not restore a second time.
+    /// Set by the explicit close so `Drop` does not restore a second time.
     closed: bool,
 }
 
 impl Screen {
-    /// Take the terminal. `prime` paints a first black frame before anything
-    /// else happens, for a screen that is entered from black.
-    pub(crate) fn open(prime: bool) -> Result<Self> {
+    /// Take the terminal.
+    pub(crate) fn open() -> Result<Self> {
         // Stops crossterm second-guessing us; see the module docs on colour.
         ratatui::crossterm::style::force_color_output(true);
 
@@ -93,12 +92,6 @@ impl Screen {
         // so without this the content lands in the middle of the editor's last
         // frame. From here on an error restores through `Drop`.
         screen.terminal.clear()?;
-        if prime {
-            // Before the slow work (a session listing) that precedes the first
-            // real draw, so entering the alternate screen does not flash its
-            // blank buffer.
-            crate::fade::prime_black(&mut screen.terminal)?;
-        }
         Ok(screen)
     }
 
@@ -110,15 +103,6 @@ impl Screen {
     pub(crate) fn close(mut self) -> Result<()> {
         self.closed = true;
         ratatui::try_restore()?;
-        crate::fade::show_cursor_if_enabled();
-        Ok(())
-    }
-
-    /// Give the terminal back as a black primary screen, for the attach path:
-    /// the client spawn that follows then never flashes the old primary.
-    pub(crate) fn close_to_black(mut self) -> Result<()> {
-        self.closed = true;
-        crate::fade::leave_ratatui_to_black()?;
         Ok(())
     }
 }
@@ -128,9 +112,8 @@ impl Drop for Screen {
         if !self.closed {
             // The error path: `restore` reports a failure on stderr and goes
             // on, which is all that can be done while an error is already in
-            // flight. Show the cursor too, in case a fade had hidden it.
+            // flight.
             ratatui::restore();
-            crate::fade::show_cursor_if_enabled();
         }
     }
 }
@@ -138,16 +121,9 @@ impl Drop for Screen {
 /// Take the terminal for one screen, run `f` on it, and give it back.
 ///
 /// The restore happens before the outcome propagates: an error that leaves the
-/// terminal in raw mode with no echo is far worse than the error itself. `prime`
-/// paints a first black frame, for a screen entered from black.
-///
-/// [`run`] does not use this — the picker's attach path leaves through
-/// [`Screen::close_to_black`] instead.
-pub(crate) fn owning<T>(
-    prime: bool,
-    f: impl FnOnce(&mut ratatui::DefaultTerminal) -> Result<T>,
-) -> Result<T> {
-    let mut screen = Screen::open(prime)?;
+/// terminal in raw mode with no echo is far worse than the error itself.
+pub(crate) fn owning<T>(f: impl FnOnce(&mut ratatui::DefaultTerminal) -> Result<T>) -> Result<T> {
+    let mut screen = Screen::open()?;
     let outcome = f(screen.terminal());
     screen.close()?;
     outcome
@@ -175,17 +151,7 @@ pub(crate) fn poll_key() -> Result<Option<Key>> {
 /// Run the picker until the user attaches or quits. `message` replaces the hint
 /// row — how a failed attach reports itself without exiting the program.
 pub fn run(transport: &dyn Transport, message: Option<String>) -> Result<Outcome> {
-    let mut screen = Screen::open(true)?;
-    let outcome = run_loop(screen.terminal(), transport, message);
-    // Restore before propagating anything: an error that leaves the terminal in
-    // raw mode with no echo is far worse than the error itself. On the attach
-    // path, leave straight into a black primary screen so the client spawn that
-    // follows never flashes the old primary; otherwise restore as before.
-    match &outcome {
-        Ok(Outcome::Attach { .. }) => screen.close_to_black()?,
-        _ => screen.close()?,
-    }
-    outcome
+    owning(|terminal| run_loop(terminal, transport, message))
 }
 
 fn run_loop(
@@ -200,15 +166,12 @@ fn run_loop(
         app.set_message(msg);
     }
 
-    // Dissolve the picker up from the primed black before taking any input.
-    crate::fade::fade_in_ratatui(terminal, |f| draw::draw(f, &app))?;
-
     // When a half-typed session number must be settled. `App` decides every
     // unambiguous digit on its own, so this is only ever set when one number is
     // a prefix of another — sessions 1 and 12 both present.
     let mut deadline: Option<Instant> = None;
 
-    let outcome = 'ui: loop {
+    loop {
         terminal.draw(|f| draw::draw(f, &app))?;
 
         if !event::poll(TICK)? {
@@ -218,7 +181,7 @@ fn run_loop(
                 deadline = None;
                 if let Request::Attach(id) = app.resolve_pending() {
                     if let Some(session) = app.session(&id).cloned() {
-                        break 'ui Outcome::Attach { session, highest };
+                        return Ok(Outcome::Attach { session, highest });
                     }
                 }
             }
@@ -243,24 +206,24 @@ fn run_loop(
         // "not found". The list is re-read only after something changed it.
         match request {
             Request::None => {}
-            Request::Quit => break 'ui Outcome::Quit,
+            Request::Quit => return Ok(Outcome::Quit),
 
             Request::Attach(id) => {
                 if let Some(session) = app.session(&id).cloned() {
-                    break 'ui Outcome::Attach { session, highest };
+                    return Ok(Outcome::Attach { session, highest });
                 }
             }
 
             Request::NewSession => {
-                match prompt::run_on(terminal, transport, prompt::Task::Create, false)? {
+                match prompt::run_on(terminal, transport, prompt::Task::Create)? {
                     prompt::Outcome::Created(session) => {
                         // The new session is the highest by construction when
                         // it appends, but it may have refilled a gap — so take
                         // the larger of the two rather than assuming.
-                        break 'ui Outcome::Attach {
+                        return Ok(Outcome::Attach {
                             highest: highest.max(session.state.num),
                             session,
-                        };
+                        });
                     }
                     prompt::Outcome::Cancelled => {}
                     prompt::Outcome::Renamed => refresh(&mut app, &mut highest, transport)?,
@@ -270,7 +233,7 @@ fn run_loop(
             Request::RenameSession(id) => {
                 if let Some(session) = app.session(&id).cloned() {
                     let outcome =
-                        prompt::run_on(terminal, transport, prompt::Task::Rename(&session), false)?;
+                        prompt::run_on(terminal, transport, prompt::Task::Rename(&session))?;
                     if !matches!(outcome, prompt::Outcome::Cancelled) {
                         refresh(&mut app, &mut highest, transport)?;
                     }
@@ -286,16 +249,9 @@ fn run_loop(
                 }
             }
 
-            Request::Help => help::run_on(terminal, false)?,
+            Request::Help => help::run_on(terminal)?,
         }
-    };
-
-    // Dissolve the picker out to black before handing off to the session; on
-    // quit there is no next screen to bridge to, so leave it be.
-    if matches!(outcome, Outcome::Attach { .. }) {
-        crate::fade::fade_out_ratatui(terminal, |f| draw::draw(f, &app))?;
     }
-    Ok(outcome)
 }
 
 /// Re-list, keeping the highest number in step with what is on screen.

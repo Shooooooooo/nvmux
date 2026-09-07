@@ -229,7 +229,7 @@ pub enum ConfigError {
     },
 
     /// The file parsed but a value is out of range — a rule of ours, not the
-    /// deserializer's (e.g. `fade.frames = 0`, which would divide by zero).
+    /// deserializer's (e.g. `keys.timeout_ms = 0`, which would spin the relay).
     #[error("{}: {message}", .path.display())]
     Invalid { path: PathBuf, message: String },
 

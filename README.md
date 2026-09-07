@@ -126,8 +126,8 @@ Three ways out, and they do different things.
 
 ## Configuration
 
-nvmux needs no configuration. To move the prefix key or tune the transitions, it
-reads an optional TOML file — `$NVMUX_CONFIG` if set, else
+nvmux needs no configuration. To move the prefix key or change how long it
+waits, it reads an optional TOML file — `$NVMUX_CONFIG` if set, else
 `$XDG_CONFIG_HOME/nvmux/config.toml`, else `~/.config/nvmux/config.toml`. Any
 omitted field keeps its default; an unknown key or a bad value is a startup
 error.
@@ -135,14 +135,6 @@ error.
 Every value below is its default:
 
 ```toml
-[fade]
-enabled        = true   # dip-to-black transitions (NO_COLOR forces off)
-frames         = 8
-frame_delay_ms = 12
-hold_ms        = 30
-excursions     = true   # fade the <prefix> ? / <prefix> c screens too
-raw_dissolve   = true   # dissolve cell by cell, not an instant blackout
-
 [keys]
 prefix     = "Ctrl-t"   # a Ctrl-<letter> chord
 timeout_ms = 500        # how long a lone prefix or half-typed number waits

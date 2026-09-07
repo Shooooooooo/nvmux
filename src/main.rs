@@ -39,8 +39,8 @@ fn run(cli: &Cli) -> Result<()> {
     let local_nvim = nvim::check_local()?;
     tracing::debug!(version = %local_nvim, "local nvim");
 
-    // Config is a local concern — the prefix machine, the fade and the picker all
-    // run here — so it is established before any transport, `nvmux <host>`
+    // Config is a local concern — the prefix machine and the picker both run
+    // here — so it is established before any transport, `nvmux <host>`
     // included. On a genuine first run at an interactive terminal this asks for a
     // prefix and records it; otherwise it loads whatever exists (or the defaults).
     config::init(establish_settings()?);

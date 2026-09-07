@@ -148,10 +148,7 @@ impl Prompt {
 /// Ask for a name for a new session, owning the terminal while it does — for
 /// `<prefix> c`, which arrives from an attached session with none to borrow.
 pub fn run(transport: &dyn Transport) -> Result<Outcome> {
-    // Reached from a session that has already dissolved to black, so start black.
-    super::owning(crate::fade::excursions(), |terminal| {
-        run_on(terminal, transport, Task::Create, true)
-    })
+    super::owning(|terminal| run_on(terminal, transport, Task::Create))
 }
 
 /// Ask for a name on a terminal the caller already owns — how the picker drives
@@ -164,20 +161,13 @@ pub(super) fn run_on(
     terminal: &mut ratatui::DefaultTerminal,
     transport: &dyn Transport,
     task: Task,
-    animate: bool,
 ) -> Result<Outcome> {
     let mut prompt = match task {
         Task::Create => Prompt::create(next_free_name(transport)?),
         Task::Rename(session) => Prompt::rename(session),
     };
 
-    // `run` owns the terminal and dips through black; the picker's `c`/`r` do not
-    // — they are nested inside the already-faded picker, so `animate` is false.
-    if animate && crate::fade::excursions() {
-        crate::fade::fade_in_ratatui(terminal, |f| draw(f, &prompt))?;
-    }
-
-    let outcome = 'prompt: loop {
+    loop {
         terminal.draw(|f| draw(f, &prompt))?;
 
         let Some(key) = super::poll_key()? else {
@@ -186,7 +176,7 @@ pub(super) fn run_on(
 
         let name = match prompt.on_key(key) {
             Step::None => continue,
-            Step::Cancel => break 'prompt Outcome::Cancelled,
+            Step::Cancel => return Ok(Outcome::Cancelled),
             Step::Submit(name) => name,
         };
 
@@ -200,7 +190,7 @@ pub(super) fn run_on(
         };
 
         match committed {
-            Ok(outcome) => break 'prompt outcome,
+            Ok(outcome) => return Ok(outcome),
             Err(e) => {
                 // A name that was free when the prompt opened may not be now.
                 let refreshed = match task {
@@ -210,13 +200,7 @@ pub(super) fn run_on(
                 prompt.fail(super::one_line(&e), refreshed);
             }
         }
-    };
-
-    // Dissolve back to black so the resumed session takes over dark.
-    if animate && crate::fade::excursions() {
-        crate::fade::fade_out_ratatui(terminal, |f| draw(f, &prompt))?;
     }
-    Ok(outcome)
 }
 
 /// The name a session gets when the user just presses enter. Compared
