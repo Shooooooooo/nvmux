@@ -13,7 +13,6 @@
 mod common;
 
 use std::os::unix::fs::DirBuilderExt;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use common::Scratch;
@@ -593,7 +592,7 @@ fn a_session_can_be_killed_on_a_host_with_proc_but_no_ps() {
 
 /// The first `tool` on `$PATH`, so the sandbox above can link real binaries.
 #[cfg(target_os = "linux")]
-fn which(tool: &str) -> Result<PathBuf, ()> {
+fn which(tool: &str) -> Result<std::path::PathBuf, ()> {
     std::env::var_os("PATH")
         .into_iter()
         .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
