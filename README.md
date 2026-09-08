@@ -152,14 +152,29 @@ one listing serves a whole directory, so a path costs about one round trip per
 | `<prefix>` `d` | detach — leaves the session running, exits nvmux |
 | `<prefix>` `Space` | back to the picker, session still attached |
 | `<prefix>` `1`, `2`, … `12` | switch straight to that session |
+| `<prefix>` `n` | next session by number — wraps at the end |
+| `<prefix>` `p` | previous session by number — wraps at the start |
 | `<prefix>` `c` | set up a new session and attach to it — `Esc` goes back |
 | `<prefix>` `?` | show these keys — `Esc` goes back |
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
 
+`<prefix> n` and `<prefix> p` walk the numbers in the order the picker lists
+them, wrapping at both ends, so you can step through every session without
+knowing a single number. One killed from somewhere else is simply skipped: you
+land on the nearest number that is still there.
+
+Landing somewhere new says so: the session's number and name appear for a
+moment, then go. That happens whenever the session *changes* — a pick from the
+picker, `<prefix> 3`, `<prefix> n`, or a `<prefix> c` that created something —
+and never after `<prefix> Space` or `<prefix> ?`, which bring you back to the
+session you were already in. See [the config](#how-a-change-of-session-announces-itself)
+for the three ways it can be drawn, and for turning it off.
+
 Everything else goes to Neovim untouched — including `Ctrl-c`, `Ctrl-z` and
 `Ctrl-s`, which reach the editor as ordinary keys rather than becoming signals
-for nvmux. Digits are the exception: `<prefix> 1` is a command now, so
-`<prefix> <prefix> 1` is how you send that to the editor.
+for nvmux. Digits, `n` and `p` are the exceptions: `<prefix> 1`, `<prefix> n`
+and `<prefix> p` are commands now, so `<prefix> <prefix> n` is how you send one
+of those to the editor.
 
 The prefix is recognised however your terminal spells it. Neovim asks every
 terminal for the kitty keyboard protocol (or xterm's `modifyOtherKeys`), and
@@ -210,6 +225,10 @@ timeout_ms = 500            # how long a lone prefix or half-typed number waits
 
 [session]
 command = "nvim --headless --listen {sock}"   # what a new session starts
+
+[popup]
+style       = "overlay"     # how a change of session announces itself
+duration_ms = 1200          # how long the notice stays — not used by "echo"
 ```
 
 ### The command a session runs
@@ -235,6 +254,28 @@ command = "nvim --clean --headless --listen {sock}"
 Neovim's version is checked as `nvim` on your `$PATH`, which is not necessarily
 the binary a custom command runs. A command that names nothing is reported as
 soon as the session is created, not after a timeout.
+
+### How a change of session announces itself
+
+`popup.style` picks between three genuinely different mechanisms, or none of
+them. They differ because while a session is attached nvmux owns no cells at
+all — Neovim draws the screen and nvmux passes the bytes through:
+
+- `overlay` — nvmux draws the box itself, over whatever is on screen. Nothing in
+  the editor is touched, and it is the only one that still says something when
+  the editor is wedged. It is also the only one that writes into the stream
+  between Neovim and your terminal, so a repaint can cover it early.
+- `float` — the session's own Neovim opens a small floating window and closes it
+  on its own timer. Never torn and never covered, at the cost of nvmux putting a
+  scratch buffer and a window inside your editor.
+- `echo` — one line on the message row, with no `:messages` trace. The least
+  intrusive by far. It stays until the editor writes over it, so `duration_ms`
+  does not apply.
+- `off` — nothing.
+
+`$NVMUX_POPUP` overrides `style` for one run, so the three can be compared
+without editing this file. It is a switch rather than configuration: an
+unrecognised value is warned about and ignored, where the file would refuse it.
 
 ### What nvmux remembers
 

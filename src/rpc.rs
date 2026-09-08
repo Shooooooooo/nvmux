@@ -341,6 +341,32 @@ impl<S: Read + Write> Client<S> {
         self.call("nvim_input", vec![Value::String(keys.into())])?;
         Ok(())
     }
+
+    /// Send a notification — `[2, method, params]`, with no msgid and no reply.
+    ///
+    /// Fire-and-forget on purpose. The one caller is [`crate::announce`], which
+    /// tells the editor to show a session name: an attach must never wait on an
+    /// editor that is busy, and there is no answer worth having. A request would
+    /// block against exactly the sessions that are doing something — see the
+    /// module docs on why "reachable" is not "ready".
+    ///
+    /// Nothing is read afterwards, so this cannot leave a half-decoded frame
+    /// behind and does not poison the connection; a write failure is the only
+    /// way it can fail, and it is reported rather than swallowed.
+    pub fn notify(&mut self, method: &str, params: Vec<Value>) -> Result<(), RpcError> {
+        if let Some(why) = &self.poisoned {
+            return Err(RpcError::Protocol(format!("connection poisoned: {why}")));
+        }
+        let notification = Value::Array(vec![
+            Value::from(NOTIFICATION),
+            Value::String(method.into()),
+            Value::Array(params),
+        ]);
+        rmpv::encode::write_value(self.io.get_mut(), &notification)
+            .map_err(|e| self.poison(format!("encoding {method}: {e}")))?;
+        let budget = self.read_timeout;
+        self.io.get_mut().flush().map_err(|e| map_io(e, budget))
+    }
 }
 
 /// What `nvim_get_mode` reported.
@@ -548,6 +574,57 @@ mod tests {
     #[test]
     fn plain_integers_still_decode() {
         assert_eq!(ext_to_handle(&Value::from(7)), Some(7));
+    }
+
+    /// A socket that keeps what was written to it and never answers, so a
+    /// notification can be inspected without a Neovim on the other end.
+    #[derive(Clone, Default)]
+    struct Recorder(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl Read for Recorder {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for Recorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A notification is `[2, method, params]` — three elements and no msgid.
+    /// Sending a *request* shape here would leave a reply in the socket that
+    /// nobody ever reads, and the next call would decode it as its own.
+    #[test]
+    fn a_notification_carries_no_msgid_and_waits_for_nothing() {
+        let tape = Recorder::default();
+        let mut client = Client::new(tape.clone());
+        client
+            .notify("nvim_echo", vec![Value::String("hi".into())])
+            .expect("written");
+
+        let written = tape.0.borrow().clone();
+        let frame = rmpv::decode::read_value(&mut &written[..]).expect("one frame");
+        let arr = frame.as_array().expect("array");
+        assert_eq!(arr.len(), 3, "a notification has three elements: {arr:?}");
+        assert_eq!(arr[0].as_u64(), Some(NOTIFICATION));
+        assert_eq!(arr[1].as_str(), Some("nvim_echo"));
+        assert_eq!(arr[2].as_array().map(Vec::len), Some(1));
+    }
+
+    /// The socket answers nothing, so a *request* would hang out its whole
+    /// budget. That is the difference the announcement path depends on.
+    #[test]
+    fn a_notification_returns_against_a_socket_that_never_answers() {
+        let mut client = Client::new(Recorder::default());
+        client
+            .notify("nvim_exec_lua", vec![])
+            .expect("returns at once");
     }
 
     #[test]

@@ -3,8 +3,8 @@
 //! nvmux runs with no configuration at all; this module is how it *optionally*
 //! reads one. The governing idea is that a config file only ever *overrides*:
 //! an absent file, an empty file and an omitted field all reproduce the
-//! built-in behaviour byte for byte, because they all resolve through
-//! [`KeySettings`] `Default` — which is where each default is written down,
+//! built-in behaviour byte for byte, because they all resolve through the
+//! per-table `Default` impls — which is where each default is written down,
 //! once.
 //!
 //! # Strict, and loud
@@ -47,6 +47,7 @@ use crate::error::ConfigError;
 pub struct Settings {
     pub keys: KeySettings,
     pub session: SessionSettings,
+    pub popup: PopupSettings,
 }
 
 /// The prefix key and how long a half-typed sequence waits (see [`crate::keys`]).
@@ -99,6 +100,47 @@ impl Default for SessionSettings {
     }
 }
 
+/// How an attach says which session it just put you on, and for how long (see
+/// [`crate::announce`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PopupSettings {
+    #[serde(deserialize_with = "de_popup_style")]
+    pub style: PopupStyle,
+    /// How long the announcement stays up. Ignored by [`PopupStyle::Echo`],
+    /// which Neovim clears on its own at the next redraw.
+    pub duration_ms: u64,
+}
+
+/// Which of the three mechanisms draws the announcement.
+///
+/// They exist side by side because nvmux does not own the screen while a
+/// session is attached, so there is no one obviously right answer — see the
+/// module docs of [`crate::announce`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PopupStyle {
+    /// nvmux draws a box over the session's screen itself.
+    #[default]
+    Overlay,
+    /// Neovim opens a floating window and closes it on its own timer.
+    Float,
+    /// Neovim prints one line on the message row.
+    Echo,
+    /// Say nothing.
+    Off,
+}
+
+impl Default for PopupSettings {
+    fn default() -> Self {
+        Self {
+            style: PopupStyle::default(),
+            // Long enough to read a name without looking for it, short enough
+            // that it is gone before the first keystroke of real work lands.
+            duration_ms: 1200,
+        }
+    }
+}
+
 /// The prefix comes in as a human string; delegate to the one parser so the file
 /// and any other caller agree, and fold its message into serde's error (which
 /// TOML then reports with the offending span).
@@ -110,9 +152,63 @@ where
     crate::keys::parse_prefix(&s).map_err(serde::de::Error::custom)
 }
 
-/// Ceiling for `keys.timeout_ms`. Generous but finite: the value goes into a
-/// `poll` timeout as a `c_int`, and an absurd one is a hang, not a long wait.
+/// Ceiling for `keys.timeout_ms` and `popup.duration_ms`. Generous but finite:
+/// both go into a `poll` timeout as a `c_int`, and an absurd one is a hang, not
+/// a long wait.
 const MAX_TIMEOUT_MS: u64 = 60_000;
+
+impl PopupStyle {
+    /// Hand-listed, because Rust cannot enumerate an enum. The exhaustive match
+    /// in [`as_str`](Self::as_str) fails to compile when a variant is added, and
+    /// the round-trip test then fails until it is listed here too.
+    pub const ALL: &'static [PopupStyle] = &[
+        PopupStyle::Overlay,
+        PopupStyle::Float,
+        PopupStyle::Echo,
+        PopupStyle::Off,
+    ];
+
+    /// The spelling the config file and `$NVMUX_POPUP` both use, so the
+    /// first-run template cannot drift from what will parse.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PopupStyle::Overlay => "overlay",
+            PopupStyle::Float => "float",
+            PopupStyle::Echo => "echo",
+            PopupStyle::Off => "off",
+        }
+    }
+
+    /// The one parser, so the file and the environment variable accept exactly
+    /// the same words. Trimmed and case-insensitive, like
+    /// [`crate::keys::parse_prefix`]; the error names every value that works,
+    /// because a reader who got it wrong is guessing.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let want = s.trim().to_ascii_lowercase();
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|style| style.as_str() == want)
+            .ok_or_else(|| {
+                let names: Vec<String> = Self::ALL
+                    .iter()
+                    .map(|s| format!("{:?}", s.as_str()))
+                    .collect();
+                format!("popup.style {s:?} must be one of {}", names.join(", "))
+            })
+    }
+}
+
+/// The style comes in as a human string; delegate to the one parser, exactly as
+/// `de_prefix` does, and fold its message into serde's error so TOML reports it
+/// with the offending span.
+fn de_popup_style<'de, D>(deserializer: D) -> Result<PopupStyle, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    PopupStyle::parse(&s).map_err(serde::de::Error::custom)
+}
 
 impl Settings {
     /// Rules that the deserializer cannot express. Kept minimal: only values that
@@ -127,6 +223,22 @@ impl Settings {
             // Beyond `c_int` this would wrap negative and `poll` would block
             // forever; well before that it is a prefix that never resolves.
             return Err(format!("keys.timeout_ms must be at most {MAX_TIMEOUT_MS}"));
+        }
+        if self.popup.duration_ms == 0 {
+            // Zero is not "off" — `style = "off"` is. A zero-length overlay
+            // would be painted and erased on the same pass, which is a repaint
+            // for nothing.
+            return Err(
+                "popup.duration_ms must be at least 1; use style = \"off\" to \
+                        turn the popup off"
+                    .into(),
+            );
+        }
+        if self.popup.duration_ms > MAX_TIMEOUT_MS {
+            // It bounds a `poll` wait, exactly as `keys.timeout_ms` does.
+            return Err(format!(
+                "popup.duration_ms must be at most {MAX_TIMEOUT_MS}"
+            ));
         }
         // Refused at startup rather than at the prompt: a command that can never
         // spawn a session is a broken config, and the file is where it is fixed.
@@ -263,6 +375,7 @@ pub fn with_prefix(prefix: u8) -> Settings {
 fn render_default_config(prefix: u8) -> String {
     let k = KeySettings::default();
     let s = SessionSettings::default();
+    let p = PopupSettings::default();
     format!(
         "# nvmux configuration — created on first run.\n\
          #\n\
@@ -275,10 +388,16 @@ fn render_default_config(prefix: u8) -> String {
          \n\
          [session]\n\
          # {{sock}} becomes the session's socket; it is what nvmux finds it by.\n\
-         # command = {command:?}\n",
+         # command = {command:?}\n\
+         \n\
+         [popup]\n\
+         # style       = {style:?}   # \"overlay\", \"float\", \"echo\" or \"off\"\n\
+         # duration_ms = {duration}\n",
         prefix = crate::keys::prefix_label(prefix),
         timeout = k.timeout_ms,
         command = s.command,
+        style = p.style.as_str(),
+        duration = p.duration_ms,
     )
 }
 
@@ -335,6 +454,43 @@ pub fn get() -> &'static Settings {
     SETTINGS.get_or_init(Settings::default)
 }
 
+/// The popup settings in force: the file, with `$NVMUX_POPUP` overriding the
+/// style.
+///
+/// The three styles exist to be compared (see [`crate::announce`]), and
+/// comparing them by editing a TOML file between runs is worse than typing
+/// `NVMUX_POPUP=overlay nvmux`. The style only: a `NVMUX_POPUP=float:2000`
+/// grammar would be a config file with extra steps.
+pub fn popup() -> PopupSettings {
+    PopupSettings {
+        style: style_in_force(
+            get().popup.style,
+            std::env::var_os("NVMUX_POPUP").as_deref(),
+        ),
+        ..get().popup
+    }
+}
+
+/// The precedence rule on its own, so it can be tested without the process
+/// globals [`popup`] reads.
+///
+/// A value that does not parse is warned about and ignored rather than fatal.
+/// The *file* is strict and loud — that is this module's doctrine — but this is
+/// a switch someone types at a shell prompt, and a typo in it must not stop
+/// nvmux starting.
+fn style_in_force(configured: PopupStyle, env: Option<&OsStr>) -> PopupStyle {
+    let Some(raw) = nonempty(env).and_then(OsStr::to_str) else {
+        return configured;
+    };
+    match PopupStyle::parse(raw) {
+        Ok(style) => style,
+        Err(message) => {
+            tracing::warn!(%message, "ignoring $NVMUX_POPUP");
+            configured
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,7 +523,10 @@ mod tests {
             prefix = \"Ctrl-Space\"\n\
             timeout_ms = 500\n\
             [session]\n\
-            command = \"nvim --headless --listen {sock}\"\n";
+            command = \"nvim --headless --listen {sock}\"\n\
+            [popup]\n\
+            style = \"overlay\"\n\
+            duration_ms = 1200\n";
         let s: Settings = toml::from_str(doc).expect("valid");
         assert_eq!(s, Settings::default());
     }
@@ -388,6 +547,30 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_popup_table_keeps_the_other_popup_defaults() {
+        let s: Settings = toml::from_str("[popup]\nstyle = \"float\"\n").expect("valid");
+        assert_eq!(s.popup.style, PopupStyle::Float);
+        assert_eq!(s.popup.duration_ms, PopupSettings::default().duration_ms);
+    }
+
+    /// Every style the file may name must parse, and its spelling must be the
+    /// one the first-run template writes — the template is generated from
+    /// `as_str`, so a mismatch would be a file nvmux itself could not read.
+    #[test]
+    fn every_popup_style_parses_under_the_name_the_template_writes() {
+        for style in [
+            PopupStyle::Overlay,
+            PopupStyle::Float,
+            PopupStyle::Echo,
+            PopupStyle::Off,
+        ] {
+            let doc = format!("[popup]\nstyle = \"{}\"\n", style.as_str());
+            let s: Settings = toml::from_str(&doc).unwrap_or_else(|e| panic!("{doc:?}: {e}"));
+            assert_eq!(s.popup.style, style);
+        }
+    }
+
+    #[test]
     fn a_partial_keys_table_keeps_the_other_keys_defaults() {
         let s: Settings = toml::from_str("[keys]\ntimeout_ms = 250\n").expect("valid");
         assert_eq!(s.keys.timeout_ms, 250);
@@ -400,6 +583,54 @@ mod tests {
         assert_eq!(s.keys.prefix, 0x01);
     }
 
+    /// The file and `$NVMUX_POPUP` must accept exactly the same words, and the
+    /// first-run template is generated from `as_str` — a mismatch would be a
+    /// file nvmux itself could not read back.
+    #[test]
+    fn every_popup_style_round_trips_through_its_one_spelling() {
+        for &style in PopupStyle::ALL {
+            assert_eq!(PopupStyle::parse(style.as_str()), Ok(style));
+            let doc = format!("[popup]\nstyle = \"{}\"\n", style.as_str());
+            let s: Settings = toml::from_str(&doc).unwrap_or_else(|e| panic!("{doc:?}: {e}"));
+            assert_eq!(s.popup.style, style);
+        }
+        // Trimmed and case-insensitive, like the prefix parser.
+        assert_eq!(PopupStyle::parse("  FLOAT "), Ok(PopupStyle::Float));
+    }
+
+    /// A reader who got the spelling wrong is guessing; the error has to stop
+    /// them guessing again.
+    #[test]
+    fn an_unknown_popup_style_names_the_ones_that_exist() {
+        let err = PopupStyle::parse("toast").expect_err("not a style");
+        for style in PopupStyle::ALL {
+            assert!(err.contains(style.as_str()), "{err:?} omits {style:?}");
+        }
+    }
+
+    /// The switch that makes the three styles comparable without editing a
+    /// file. A typo in it must not stop nvmux starting — unlike the file, which
+    /// is strict on purpose.
+    #[test]
+    fn the_environment_overrides_the_configured_style_but_a_typo_does_not() {
+        let configured = PopupStyle::Overlay;
+        assert_eq!(style_in_force(configured, None), configured);
+        assert_eq!(style_in_force(configured, Some(OsStr::new(""))), configured);
+        assert_eq!(
+            style_in_force(configured, Some(OsStr::new("float"))),
+            PopupStyle::Float
+        );
+        assert_eq!(
+            style_in_force(configured, Some(OsStr::new("off"))),
+            PopupStyle::Off
+        );
+        assert_eq!(
+            style_in_force(configured, Some(OsStr::new("flaot"))),
+            configured,
+            "an unreadable value falls back rather than failing"
+        );
+    }
+
     /// A config file is edited by hand, so a typo is likely and silence is the
     /// wrong response — an unknown table, an unknown key in the `[keys]` table,
     /// and an unparseable value all have to be refused rather than ignored.
@@ -410,6 +641,8 @@ mod tests {
             ("an unknown keys key", "[keys]\nprefx = \"C-a\"\n"),
             ("an unparseable prefix", "[keys]\nprefix = \"nope\"\n"),
             ("an unknown session key", "[session]\ncmd = \"nvim\"\n"),
+            ("an unknown popup key", "[popup]\nstlye = \"float\"\n"),
+            ("a style nobody implements", "[popup]\nstyle = \"toast\"\n"),
         ] {
             assert!(
                 toml::from_str::<Settings>(doc).is_err(),
@@ -427,6 +660,8 @@ mod tests {
             ("[keys]\ntimeout_ms = 60001\n", "keys.timeout_ms"),
             // Past `c_int`: the value `poll` would have read as "block forever".
             ("[keys]\ntimeout_ms = 3000000000\n", "keys.timeout_ms"),
+            ("[popup]\nduration_ms = 0\n", "popup.duration_ms"),
+            ("[popup]\nduration_ms = 60001\n", "popup.duration_ms"),
         ];
         for (doc, key) in cases {
             let err = parse(Path::new("test.toml"), doc).expect_err(doc);
@@ -437,7 +672,12 @@ mod tests {
                 other => panic!("{doc:?}: expected Invalid, got {other:?}"),
             }
         }
-        for doc in ["[keys]\ntimeout_ms = 1\n", "[keys]\ntimeout_ms = 60000\n"] {
+        for doc in [
+            "[keys]\ntimeout_ms = 1\n",
+            "[keys]\ntimeout_ms = 60000\n",
+            "[popup]\nduration_ms = 1\n",
+            "[popup]\nduration_ms = 60000\n",
+        ] {
             parse(Path::new("test.toml"), doc).expect(doc);
         }
     }
@@ -485,12 +725,15 @@ mod tests {
             rendered.contains("\nprefix     = \"Ctrl-a\"\n"),
             "the chosen prefix is the one active setting: {rendered:?}"
         );
-        // The timeout and the command are documentation, not active settings.
+        // The timeout, the command and the popup are documentation, not active
+        // settings.
         assert!(rendered.contains("# timeout_ms = 500"));
         assert!(
             rendered.contains("# command = \"nvim --headless --listen {sock}\""),
             "the template must document the command: {rendered:?}"
         );
+        assert!(rendered.contains("# style       = \"overlay\""));
+        assert!(rendered.contains("# duration_ms = 1200"));
     }
 
     // --- path resolution (pure) --------------------------------------------

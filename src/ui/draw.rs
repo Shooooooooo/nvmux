@@ -49,8 +49,10 @@ const CURSOR: &str = "▋";
 const MIN_LIST_WIDTH: u16 = 4;
 const MAX_LIST_WIDTH: u16 = 48;
 
-/// Columns between the number and the name.
-const NUM_GAP: &str = "  ";
+/// Columns between the number and the name. Not private: the attach-time
+/// announcement spells a session the same way the picker's rows do, and two
+/// copies of this would drift.
+pub(crate) const NUM_GAP: &str = "  ";
 
 /// Sixty-nine columns, and it used to be sixty exactly — the widest row that
 /// still fits a small terminal without truncation. `␣ order` is what that budget
@@ -257,7 +259,7 @@ fn centre_vertically(area: Rect, height: u16) -> Rect {
 /// Truncate to a display width, counting grapheme width rather than bytes or
 /// `char`s so CJK names and emoji do not overflow the block they were measured
 /// into.
-pub(super) fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.width() <= max {
         return s.to_string();
     }

@@ -17,6 +17,13 @@
 //! `nvim_ui_attach`, no `grid_line` handling and no grid diffing anywhere in
 //! this crate — `nvim --remote-ui` already is that client.
 //!
+//! The one thing that ever *joins* this direction is the attach notice, and
+//! only under `popup.style = "overlay"` (see [`crate::announce`]): a box, drawn
+//! once the child has been quiet long enough that it cannot be mid-sequence.
+//! Even then nothing is parsed — the safe moment is found with a clock, not a
+//! decoder — and the other styles have the editor draw the notice, so nothing
+//! is interleaved at all.
+//!
 //! Three hazards that have no other home in the code:
 //!
 //! * **Take the writer exactly once.** `MasterPty::take_writer()` errors on a
@@ -37,7 +44,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair};
 
 use crate::error::{NvmuxError, Result};
 use crate::keys::{Action, Prefix, Step, Wait};
-use crate::{rpc, term, winch};
+use crate::{announce, rpc, term, winch};
 
 /// Neovim aborts on the seventeenth attached UI rather than returning an error
 /// (`src/nvim/ui.c`: `if (ui_count == MAX_UI_COUNT) { abort(); }`), which would
@@ -60,9 +67,10 @@ pub enum Outcome {
     CreateNew,
     /// `<prefix> ?` — show the key bindings. The child keeps running.
     ShowHelp,
-    /// `<prefix> <number>` — attach to the session with that number. The child
-    /// keeps running, so a number that names nothing puts the user back.
-    Switch(u32),
+    /// `<prefix> <number>`, `<prefix> n` or `<prefix> p` — attach to the session
+    /// this names. The child keeps running, so a switch that names nothing puts
+    /// the user straight back.
+    Switch(Target),
     /// The child exited on its own.
     ChildExited,
     /// Our own stdin reached EOF: the terminal went away or the input was
@@ -76,12 +84,25 @@ impl Outcome {
     /// Whether this leads from one relay straight into the next, with no
     /// [`crate::ui`] screen in between to clear the outgoing frame on the way.
     ///
-    /// Only `<prefix> <number>` does. `ToPicker`, `CreateNew` and `ShowHelp` all
-    /// open a screen, and a screen clears as it opens; the rest end the relay
-    /// for good.
+    /// Only a switch does — by number or by step. `ToPicker`, `CreateNew` and
+    /// `ShowHelp` all open a screen, and a screen clears as it opens; the rest
+    /// end the relay for good.
     fn leads_straight_into_another_relay(self) -> bool {
         matches!(self, Outcome::Switch(_))
     }
+}
+
+/// Which session a `<prefix>` switch named: one by its number, or the one next
+/// to this one in the picker's order.
+///
+/// One outcome carrying which, rather than two outcomes, so the answer stays a
+/// value from the keypress all the way to the lookup instead of being spelled
+/// out again at every hand-off. Either can name nothing — a number nobody has,
+/// an empty listing — and that is the session loop's to settle, not the relay's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    Number(u32),
+    Step(crate::keys::Direction),
 }
 
 /// A running `--remote-ui` client, and the PTY it is talking through.
@@ -92,6 +113,11 @@ pub struct Attachment {
     /// own, over SSH the local end of the forward — so a resume can ask the
     /// server a question without going back through the transport.
     sock: PathBuf,
+    /// What to announce when this client first takes the terminal, and `None`
+    /// once it has. `spawn` runs exactly when the attached session changed —
+    /// `session_loop` reuses the client otherwise — so this being `Some` *is*
+    /// the "the session changed" test, with no flag threaded through anything.
+    announce: Option<String>,
     child: Box<dyn Child + Send + Sync>,
     master: Box<dyn MasterPty>,
     writer: Box<dyn Write + Send>,
@@ -227,7 +253,11 @@ impl Drop for Attachment {
 ///
 /// `sock` must already be reachable from *this* machine — locally the session
 /// socket, over SSH the local end of a forward.
-pub fn spawn(session_id: &str, sock: &Path) -> Result<Attachment> {
+///
+/// `announce` is what the first relay says the session is (see
+/// [`crate::announce::label`]). Not an `Option`: every spawn is a change of
+/// session, and making that unrepresentable is the point.
+pub fn spawn(session_id: &str, sock: &Path, announce: &str) -> Result<Attachment> {
     // Reach the server before spawning anything. Through an SSH forward the
     // client's own failure message is empty, after ~165 bytes of escape
     // sequences have already been sprayed at the terminal, so the check has to
@@ -324,6 +354,7 @@ pub fn spawn(session_id: &str, sock: &Path) -> Result<Attachment> {
     Ok(Attachment {
         session_id: session_id.to_string(),
         sock: sock.to_path_buf(),
+        announce: Some(announce.to_string()),
         child,
         master: pair.master,
         writer,
@@ -365,11 +396,21 @@ pub fn relay(
     // picker has since drawn over.
     if attachment.resumed {
         discard_pending(master_fd);
-        repaint(attachment.master.as_ref(), &attachment.sock);
+        repaint(attachment.master.as_ref(), &attachment.sock, EndPrompt::Yes);
     }
     attachment.resumed = true;
 
-    let outcome = pump(&mut attachment, master_fd, &winch, highest_session_num);
+    // Taken, not copied: `<prefix> Space` and `<prefix> ?` come back to this same
+    // client, and a session you never left has nothing to announce.
+    let popup = announce::Popup::arm(attachment.announce.take(), Instant::now());
+
+    let outcome = pump(
+        &mut attachment,
+        master_fd,
+        &winch,
+        highest_session_num,
+        popup,
+    );
 
     match outcome {
         Ok(
@@ -427,6 +468,7 @@ fn pump(
     master_fd: RawFd,
     winch: &winch::Winch,
     highest_session_num: u32,
+    mut popup: Option<announce::Popup>,
 ) -> Result<Outcome> {
     let stdin_fd = std::io::stdin().as_raw_fd();
     let keys = crate::config::get().keys;
@@ -441,9 +483,19 @@ fn pump(
     let mut buf = [0u8; 8192];
 
     loop {
+        // The attach notice has a clock of its own — a lull to wait out, and a
+        // life to end — and it is folded in here so both are honoured by the
+        // same `poll`. Absolute on both sides, for the reason above.
+        let next = match (deadline, popup.as_ref()) {
+            (Some(d), Some(p)) => Some(d.min(p.wake_at(Instant::now()))),
+            (Some(d), None) => Some(d),
+            (None, Some(p)) => Some(p.wake_at(Instant::now())),
+            (None, None) => None,
+        };
+
         // A stopped child produces no poll activity at all, so even an idle
         // wait is bounded; an armed prefix shortens it to its own deadline.
-        let timeout_ms = match deadline {
+        let timeout_ms = match next {
             Some(d) => {
                 // Rounded up, not down: rounded down, the last fraction of a
                 // millisecond before every deadline would be spent in
@@ -466,7 +518,8 @@ fn pump(
         }
 
         // Output first, so the screen is current before a keystroke is acted on.
-        if n > 0 && ready(&fds[1]) {
+        let child_spoke = n > 0 && ready(&fds[1]);
+        if child_spoke {
             match read_fd(master_fd, &mut buf) {
                 // EOF on macOS, EIO on Linux: both mean the slave closed.
                 Ok(0) | Err(_) => return Ok(Outcome::ChildExited),
@@ -485,6 +538,35 @@ fn pump(
             // Enough on its own: the kernel signals the pty's foreground group
             // and the client calls try_resize.
             let _ = attachment.master.resize(term::terminal_size());
+        }
+
+        // After the frame it sits on and before any keystroke is acted on. The
+        // size is read here rather than once outside the loop, so a resize
+        // between the drawing and the erasing is seen by both.
+        if let Some(p) = popup.as_mut() {
+            let act = p.step(
+                Instant::now(),
+                child_spoke,
+                &attachment.sock,
+                term::terminal_size(),
+            );
+            match act {
+                announce::Act::Idle => {}
+                announce::Act::Paint(bytes) => {
+                    let mut out = std::io::stdout().lock();
+                    out.write_all(&bytes)?;
+                    out.flush()?;
+                }
+                announce::Act::Erase => {
+                    // The same repaint a resume asks for, and for the same
+                    // reason: the cells the box covered are the server's, and
+                    // only the server can say what was under them. Not the same
+                    // licence, though — see [`EndPrompt`].
+                    repaint(attachment.master.as_ref(), &attachment.sock, EndPrompt::No);
+                    popup = None;
+                }
+                announce::Act::Done => popup = None,
+            }
         }
 
         // Settle a pending prefix or number before reading anything new, so a
@@ -559,7 +641,8 @@ fn act(writer: &mut dyn Write, step: Step) -> Result<Option<Outcome>> {
         Step::Act(Action::Detach) => Some(Outcome::Detached),
         Step::Act(Action::Create) => Some(Outcome::CreateNew),
         Step::Act(Action::Help) => Some(Outcome::ShowHelp),
-        Step::Act(Action::Switch(num)) => Some(Outcome::Switch(num)),
+        Step::Act(Action::Switch(num)) => Some(Outcome::Switch(Target::Number(num))),
+        Step::Act(Action::Cycle(dir)) => Some(Outcome::Switch(Target::Step(dir))),
     })
 }
 
@@ -753,12 +836,29 @@ fn drain_until_eof(fd: RawFd) {
 /// where the client learns its size from. A no-op when nothing changed, and
 /// a resize the client acts on when it did — one more repaint in that case,
 /// which is rare enough not to matter.
-fn repaint(master: &dyn MasterPty, sock: &Path) {
+fn repaint(master: &dyn MasterPty, sock: &Path, prompt: EndPrompt) {
     let size = term::terminal_size();
     let _ = master.resize(size);
-    if !repaint_through_server(sock) {
+    if !repaint_through_server(sock, prompt) {
         nudge(master, size);
     }
+}
+
+/// Whether a repaint may end a hit-enter prompt to get itself served.
+///
+/// A resume may: the screen it is coming back to is blank, the prompt was
+/// painted over by whatever nvmux drew, and the user has no way to answer one
+/// they cannot see.
+///
+/// Taking an attach notice off the screen may not. The prompt would be one the
+/// user is looking at right now — a startup error, most likely — and a notice
+/// that says which session you are in is never worth answering somebody's
+/// editor for. A [`nudge`] stands in, and where that does not reach (a terminal
+/// with in-band resize reports) the box simply waits for the prompt to end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndPrompt {
+    Yes,
+    No,
 }
 
 /// Shrink the pty by a row and put it back, so the client asks the server for
@@ -797,9 +897,11 @@ const RESUME_TIMEOUT: Duration = Duration::from_secs(1);
 /// resize would sit there and the terminal would stay blank until a key ended
 /// the prompt — the key the user would have to press blind, and which then
 /// also runs as a command unless it is one of the few the prompt consumes. So
-/// that prompt is ended first, with the `<CR>` it consumes (a fast call,
-/// delivered at once). Any other state that is waiting for a key is left
-/// alone: `<CR>` would scroll the more-prompt or complete a pending operator.
+/// that prompt is ended first — where `prompt` allows it, which a resume does
+/// and taking an attach notice off the screen does not — with the `<CR>` it
+/// consumes (a fast call, delivered at once). Any other state that is waiting
+/// for a key is left alone: `<CR>` would scroll the more-prompt or complete a
+/// pending operator.
 /// Then `:mode`, which clears the grid and redraws it — `:redraw!` does not
 /// clear, and a redraw of an unchanged grid sends the client nothing.
 ///
@@ -811,7 +913,7 @@ const RESUME_TIMEOUT: Duration = Duration::from_secs(1);
 /// attached UI; `:messages` keeps it. The reply is waited for so the relay
 /// does not start over a repaint in flight; a reply that is late rather than
 /// missing still repaints, a moment after the nudge that stands in for it.
-fn repaint_through_server(sock: &Path) -> bool {
+fn repaint_through_server(sock: &Path, prompt: EndPrompt) -> bool {
     let mut client = match rpc::Client::connect(sock, RESUME_TIMEOUT) {
         Ok(c) => c,
         Err(e) => {
@@ -826,7 +928,7 @@ fn repaint_through_server(sock: &Path) -> bool {
             return false;
         }
     };
-    if mode.blocking && !mode.at_hit_enter() {
+    if mode.blocking && !(mode.at_hit_enter() && prompt == EndPrompt::Yes) {
         tracing::debug!(
             mode = %mode.mode,
             "resume: the server is waiting for a key nvmux must not type; nudge only"
@@ -855,6 +957,7 @@ mod tests {
     use nix::unistd::Pid;
 
     use super::*;
+    use crate::keys::Direction;
 
     /// Poll until the child reaches `want`: signals are delivered
     /// asynchronously, so the state is not visible on the first look. Returns
@@ -891,6 +994,7 @@ mod tests {
         Attachment {
             session_id: "id000000".to_string(),
             sock: PathBuf::from("/nvmux-test-never-read.sock"),
+            announce: None,
             child,
             master: pair.master,
             writer,
@@ -986,7 +1090,15 @@ mod tests {
             (Action::Detach, Outcome::Detached),
             (Action::Create, Outcome::CreateNew),
             (Action::Help, Outcome::ShowHelp),
-            (Action::Switch(7), Outcome::Switch(7)),
+            (Action::Switch(7), Outcome::Switch(Target::Number(7))),
+            (
+                Action::Cycle(Direction::Next),
+                Outcome::Switch(Target::Step(Direction::Next)),
+            ),
+            (
+                Action::Cycle(Direction::Prev),
+                Outcome::Switch(Target::Step(Direction::Prev)),
+            ),
         ];
         for (action, want) in cases {
             let got = act(&mut out, Step::Act(action)).expect("no io");
@@ -1001,8 +1113,10 @@ mod tests {
     /// outcomes: too narrow leaves the old session on screen through the
     /// spawn, too wide clears a screen that is about to draw anyway.
     #[test]
-    fn only_a_number_switch_reaches_the_next_session_without_a_screen() {
-        assert!(Outcome::Switch(3).leads_straight_into_another_relay());
+    fn only_a_switch_reaches_the_next_session_without_a_screen() {
+        for target in [Target::Number(3), Target::Step(Direction::Next)] {
+            assert!(Outcome::Switch(target).leads_straight_into_another_relay());
+        }
         for other in [
             Outcome::ToPicker,
             Outcome::CreateNew,
@@ -1125,6 +1239,41 @@ mod tests {
         })
     }
 
+    /// A resume may end a hit-enter prompt to get its screen back; taking an
+    /// attach notice off the screen may not.
+    ///
+    /// The prompt in that case is one the user is looking at right now — a
+    /// startup error, most likely, since the notice is up for a second either
+    /// side of an attach — and answering somebody's editor is far too much to
+    /// pay for tidying a notice away. Without the gate the two paths share one
+    /// `<CR>`, and nothing about the call sequence would look wrong.
+    #[test]
+    fn only_a_resume_ends_a_hit_enter_prompt_to_repaint() {
+        for (tag, prompt, want) in [
+            (
+                "promptyes",
+                EndPrompt::Yes,
+                &["nvim_get_mode", "nvim_input(<CR>)", "nvim_command"][..],
+            ),
+            ("promptno", EndPrompt::No, &["nvim_get_mode"][..]),
+        ] {
+            let sock = temp_sock(tag);
+            let server = recording_server(&sock, "r", true);
+            let repainted = repaint_through_server(&sock, prompt);
+            assert_eq!(
+                repainted,
+                prompt == EndPrompt::Yes,
+                "{prompt:?} at a hit-enter prompt"
+            );
+            assert_eq!(
+                server.join().expect("the server thread"),
+                want,
+                "{prompt:?} asked the wrong things at a hit-enter prompt"
+            );
+            let _ = std::fs::remove_file(&sock);
+        }
+    }
+
     /// The attach probe's call sequence, which is the whole of what a change to it
     /// can break: the mode first — a fast call, answered even at a prompt — then
     /// a `<CR>` for the one prompt that key ends, then the deferred UI count.
@@ -1152,7 +1301,7 @@ mod tests {
             // `nvim`, which this machine may not have, and either way the probe
             // has already been made. Bound to `_` so an attachment, if one comes
             // back, is retired at once.
-            let _ = spawn("probe", &sock);
+            let _ = spawn("probe", &sock, "1  probe");
             assert_eq!(
                 server.join().expect("the server thread"),
                 want,

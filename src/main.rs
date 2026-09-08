@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use nvmux::cli::Cli;
-use nvmux::{config, logging, nested, nvim, paths, pty, transport, ui};
+use nvmux::{announce, config, logging, nested, nvim, paths, pty, transport, ui};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -170,10 +170,16 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     ui::help::run()?;
                     continue;
                 }
-                (pty::Outcome::Switch(num), held) => {
-                    // Held rather than killed, so a number that names nothing
-                    // puts the user straight back where they were.
+                (pty::Outcome::Switch(target), held) => {
+                    // Held rather than killed, so a number that names nothing —
+                    // or a cycle with nowhere to go — puts the user straight
+                    // back where they were.
                     attached = held;
+                    // Re-listed rather than reused: `n` and `p` walk what is
+                    // live now, and the digit hint has to follow the same
+                    // listing or the next number typed would resolve against a
+                    // stale one.
+                    //
                     // A failed listing goes back to the picker like a failed
                     // attach, and for a second reason besides: this is the one
                     // path from one relay straight into another, so the screen
@@ -189,11 +195,20 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                         }
                     };
                     highest = ui::highest_num(&sessions);
-                    match sessions.into_iter().find(|s| s.state.num == num) {
+                    // Exhaustive, no `_` arm, for the reason `pty::act` is:
+                    // a new way to name a session must not be able to arrive
+                    // here and do nothing.
+                    let picked = match target {
+                        pty::Target::Number(num) => sessions.iter().find(|s| s.state.num == num),
+                        pty::Target::Step(dir) => {
+                            transport::neighbour(&sessions, current.state.num, dir)
+                        }
+                    };
+                    match picked {
                         // The loop above retires the old client and attaches the
                         // new one; an unchanged id reuses the client as it is.
-                        Some(session) => current = session,
-                        None => tracing::debug!(num, "no session with that number"),
+                        Some(session) => current = session.clone(),
+                        None => tracing::debug!(?target, "nothing to switch to"),
                     }
                     continue;
                 }
@@ -260,7 +275,10 @@ fn new_attachment(
     session: &nvmux::session::Session,
 ) -> nvmux::Result<pty::Attachment> {
     let sock = transport.local_socket_for(session)?;
-    pty::spawn(&session.id, &sock)
+    // Every spawn is a change of session — the loop above reuses the client
+    // otherwise — so the notice is unconditional here and one-shot there.
+    let notice = announce::label(session.state.num, &session.name);
+    pty::spawn(&session.id, &sock, &notice)
 }
 
 #[cfg(test)]

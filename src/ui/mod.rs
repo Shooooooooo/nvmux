@@ -42,7 +42,7 @@ pub mod help;
 pub mod prompt;
 pub mod setup;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 /// What the picker returned.
 #[derive(Debug, Clone)]

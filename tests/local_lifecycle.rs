@@ -869,7 +869,7 @@ fn a_fresh_attach_to_a_session_at_a_hit_enter_prompt_ends_it_and_attaches() {
     let _ui = common::HitEnter::open(&sock);
 
     let started = Instant::now();
-    let attachment = nvmux::pty::spawn(&session.id, &sock).expect("attach");
+    let attachment = nvmux::pty::spawn(&session.id, &sock, "1  prompted").expect("attach");
     let took = started.elapsed();
     assert!(
         took < Duration::from_secs(2),
