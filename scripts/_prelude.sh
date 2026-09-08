@@ -36,11 +36,28 @@ cmdline() {
 # The pid serving this socket, or nothing. The socket, not the pid, is a
 # session's identity: pids are reused, paths are not.
 #
-# /proc first, for the same reason as cmdline(). `-A` not `-e`: on macOS `-e`
-# means "show the environment". `grep -F` because the path is data, not a
-# pattern. Callers test for empty output rather than the exit status, since the
-# `awk` below succeeds whether or not it matched.
+# `ps` first, not `/proc`: `ps` reads every process's command line in one call,
+# in C. The obvious `/proc` translation — loop over `/proc/[0-9]*/cmdline`,
+# `tr` and `grep` each one — instead forks two processes per entry in
+# `/proc`, so listing sessions on a box with a thousand processes (a shared
+# host, not even an unusual one) means two thousand-odd forks to answer "is
+# anything listening on this socket", multiple seconds before the picker's
+# first frame. `/proc` remains the fallback for the one case `ps` cannot
+# cover — a minimal container with `/proc` mounted and no `ps` installed —
+# where the process count is typically small enough that the per-entry forking
+# does not hurt. `-A` not `-e`: on macOS `-e` means "show the environment".
+# `grep -F` because the path is data, not a pattern. Callers test for empty
+# output rather than the exit status, since the `awk` below succeeds whether
+# or not it matched.
 serving_pid() {
+  if command -v ps >/dev/null 2>&1; then
+    ps -ww -A -u "$(id -u)" -o pid=,args= 2>/dev/null \
+      | grep -F -- "--listen $1" \
+      | grep -v grep \
+      | awk 'NR==1{print $1}'
+    return
+  fi
+
   if [ -r /proc/self/cmdline ]; then
     for c in /proc/[0-9]*/cmdline; do
       if tr '\0' ' ' < "$c" 2>/dev/null | grep -q -F -- "--listen $1"; then
@@ -51,10 +68,6 @@ serving_pid() {
     done
     return 1
   fi
-  ps -ww -A -u "$(id -u)" -o pid=,args= 2>/dev/null \
-    | grep -F -- "--listen $1" \
-    | grep -v grep \
-    | awk 'NR==1{print $1}'
 }
 
 # Is anything serving this socket?
