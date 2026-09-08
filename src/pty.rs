@@ -36,7 +36,7 @@ pub use portable_pty::PtySize;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair};
 
 use crate::error::{NvmuxError, Result};
-use crate::keys::{Action, Prefix, Step};
+use crate::keys::{Action, Prefix, Step, Wait};
 use crate::{rpc, term, winch};
 
 /// Neovim aborts on the seventeenth attached UI rather than returning an error
@@ -310,11 +310,11 @@ fn pump(
     let keys = crate::config::get().keys;
     let mut prefix = Prefix::with_prefix(highest_session_num, keys.prefix);
     let prefix_timeout = Duration::from_millis(keys.timeout_ms);
-    // When a pending prefix or half-typed number must be settled. An instant
-    // rather than a per-poll timeout on purpose: a child that keeps producing
-    // output keeps `poll` returning early, and a timeout that restarted on
-    // every wake-up would never fire while a spinner is running. It is set
-    // when the machine arms and cleared when it settles.
+    // When a pending prefix, half-typed number or cut-off escape sequence must
+    // be settled. An instant rather than a per-poll timeout on purpose: a child
+    // that keeps producing output keeps `poll` returning early, and a timeout
+    // that restarted on every wake-up would never fire while a spinner is
+    // running. It is set when the machine arms and cleared when it settles.
     let mut deadline: Option<Instant> = None;
     let mut buf = [0u8; 8192];
 
@@ -323,8 +323,12 @@ fn pump(
         // wait is bounded; an armed prefix shortens it to its own deadline.
         let timeout_ms = match deadline {
             Some(d) => {
-                let left = d.saturating_duration_since(Instant::now()).as_millis();
-                left.min(IDLE_POLL_MS as u128) as libc::c_int
+                // Rounded up, not down: rounded down, the last fraction of a
+                // millisecond before every deadline would be spent in
+                // `poll` calls that return at once.
+                let left = d.saturating_duration_since(Instant::now());
+                let ms = left.as_micros().div_ceil(1000);
+                ms.min(IDLE_POLL_MS as u128) as libc::c_int
             }
             None => IDLE_POLL_MS,
         };
@@ -361,11 +365,18 @@ fn pump(
             let _ = attachment.master.resize(term::terminal_size());
         }
 
-        // Settle a pending sequence before reading anything new, so a key that
-        // arrives just after the deadline is not swallowed as a command.
-        if deadline.is_some_and(|d| Instant::now() >= d) {
+        // Settle a pending prefix or number before reading anything new, so a
+        // key that arrives just after the deadline is not swallowed as a
+        // command. A cut-off escape sequence is the other way round: input
+        // already waiting is the rest of it, or the key that decides it, and
+        // must be read first — the screen write above can outlast the short
+        // wait, and settling then would break a sequence whose remainder had
+        // already arrived.
+        let stdin_ready = n > 0 && ready(&fds[0]);
+        let overdue = deadline.is_some_and(|d| Instant::now() >= d);
+        if overdue && !(stdin_ready && prefix.wait() == Some(Wait::Sequence)) {
             deadline = None;
-            // `timeout` resolves a lone prefix into a literal byte, but also a
+            // `timeout` resolves a lone prefix into a literal one, but also a
             // half-typed session number into a switch — so the actions it
             // produces must be acted on, not just the bytes.
             for step in prefix.timeout() {
@@ -375,7 +386,7 @@ fn pump(
             }
         }
 
-        if n > 0 && ready(&fds[0]) {
+        if stdin_ready {
             match read_fd(stdin_fd, &mut buf) {
                 Ok(0) => return Ok(Outcome::StdinClosed),
                 Err(e) => return Err(NvmuxError::Io(e)),
@@ -389,7 +400,13 @@ fn pump(
                     }
                     // Every keystroke restarts the clock, so a number typed at
                     // a human pace is one number.
-                    deadline = prefix.is_armed().then(|| Instant::now() + prefix_timeout);
+                    deadline = prefix.wait().map(|wait| {
+                        Instant::now()
+                            + match wait {
+                                Wait::Command => prefix_timeout,
+                                Wait::Sequence => SEQUENCE_TIMEOUT,
+                            }
+                    });
                 }
             }
         }
@@ -423,6 +440,16 @@ fn act(writer: &mut dyn Write, step: Step) -> Result<Option<Outcome>> {
         Step::Act(Action::Switch(num)) => Some(Outcome::Switch(num)),
     })
 }
+
+/// How long an escape sequence cut short by the end of a read waits for the
+/// rest of itself, before being passed on as it stands.
+///
+/// The bytes of one key are split only by a buffer boundary, so this is
+/// machine time, not human time, and it should be short: in a terminal that
+/// still sends the Escape key as a bare `ESC`, every `Esc` is held for exactly
+/// this long before Neovim sees it. tmux's `escape-time`, which is the same
+/// wait in the same place, defaults to 10 ms.
+const SEQUENCE_TIMEOUT: Duration = Duration::from_millis(10);
 
 /// How often to look at an otherwise-idle child.
 ///

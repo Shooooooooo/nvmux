@@ -1,6 +1,6 @@
 //! Shared by the integration test files.
 //!
-//! Both suites need something the machine may not have — a usable `nvim`, an
+//! The suites need something the machine may not have — a usable `nvim`, an
 //! ssh host that answers — and skip rather than fail without it, so a laptop
 //! without one still runs the rest. In CI a skip is a silent no-op, which is
 //! why `$NVMUX_TEST_REQUIRE` exists: a comma-separated list of what must be
@@ -8,13 +8,14 @@
 
 #![allow(dead_code)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 use nvmux::rpc::Client;
 use nvmux::session::Session;
+use nvmux::transport::local::LocalTransport;
 use nvmux::transport::Transport;
 
 /// Whether `$NVMUX_TEST_REQUIRE` names this requirement.
@@ -37,6 +38,78 @@ macro_rules! require {
             return;
         }
     };
+}
+
+/// Skip rather than fail where Neovim is missing or too old.
+pub fn nvim_available() -> bool {
+    match std::process::Command::new("nvim").arg("--version").output() {
+        Ok(out) => nvmux::nvim::parse_version(&String::from_utf8_lossy(&out.stdout))
+            .is_some_and(|v| v.is_supported()),
+        Err(_) => false,
+    }
+}
+
+#[macro_export]
+macro_rules! require_nvim {
+    () => {
+        $crate::require!(
+            "nvim",
+            $crate::common::nvim_available(),
+            "no usable nvim on $PATH"
+        );
+    };
+}
+
+/// A scratch runtime directory, removed when the guard drops. Each test gets
+/// its own, so tests run in parallel without racing and never touch the
+/// user's real `/tmp/nvmux-<uid>`.
+pub struct Scratch(pub PathBuf);
+
+impl Scratch {
+    pub fn new(tag: &str) -> Self {
+        // A plain counter, not `ThreadId`, whose Debug form is `ThreadId(2)`.
+        // Parentheses are regex metacharacters, so a directory named that way
+        // cannot be matched literally by anything pattern-based later.
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("nvmux-it-{}-{tag}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Self(dir)
+    }
+
+    pub fn transport(&self) -> LocalTransport {
+        LocalTransport::with_dir(self.0.clone()).expect("build transport")
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // Kill anything still listening before removing the directory, or
+        // stray nvim processes survive the run and pile up across runs.
+        //
+        // Signal the recorded pids directly rather than with `pkill`: the pid
+        // in `<id>.json` was validated against its socket at spawn time.
+        if let Ok(entries) = std::fs::read_dir(&self.0) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().is_none_or(|x| x != "json") {
+                    continue;
+                }
+                let pid = std::fs::read_to_string(&p)
+                    .ok()
+                    .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+                    .and_then(|v| v.get("pid").and_then(serde_json::Value::as_i64))
+                    .filter(|pid| *pid > 1);
+                if let Some(pid) = pid {
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(pid as i32),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Names every test session distinctly, so a failed run cannot poison the next.
