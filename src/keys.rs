@@ -15,6 +15,33 @@
 //! Note what is *not* here: `Ctrl-z` (0x1a) is not special-cased. It is
 //! forwarded like any other byte and Neovim receives it as a key.
 //!
+//! # How the prefix is spelled
+//!
+//! The prefix is a `Ctrl-<letter>` chord, and a terminal has three ways of
+//! spelling one: the control byte, or — once Neovim's TUI has asked it for the
+//! kitty keyboard protocol or xterm's `modifyOtherKeys`, which it does at every
+//! start — an escape sequence. [`crate::keyseq`] knows the spellings; the
+//! machine treats all of them as the same key, so the prefix works in Windows
+//! Terminal, kitty, Ghostty, WezTerm or xterm exactly as it does in a terminal
+//! that speaks neither protocol.
+//!
+//! Two consequences. A sequence can be cut in two by the end of a `read()`, so
+//! an unfinished one is held back until the rest arrives, or until the caller's
+//! short [`Wait::Sequence`] passes and it is passed on as it stands — which is
+//! how a bare `Esc`, in a terminal that still sends one, reaches Neovim. And
+//! whatever spelled the prefix is what a literal `<prefix>` replays: a terminal
+//! that sent a sequence gets its sequence back, byte for byte, never a control
+//! byte it did not send.
+//!
+//! Not everything on stdin is a keystroke. A terminal asked for key-release
+//! reports (Neovim 0.12 asks) sends one for every key, the prefix included;
+//! and the terminal answers the editor's queries on the same stream, at every
+//! start and resume. Neither is the next key: both change nothing and go
+//! through as they came — except the release of the prefix itself while its
+//! press is still held back, which stays with that press and shares its fate.
+//! Neovim only ever sees the input in its original order, less what the
+//! machine consumed.
+//!
 //! # Digits
 //!
 //! `<prefix> 1` through `<prefix> 9` select a session by its number, and a number may run
@@ -28,6 +55,8 @@
 //! ever spent when it could change the answer. With nine or fewer sessions a
 //! single digit acts at once. The hint is a latency optimisation and nothing
 //! more: whether a session actually exists is settled by the caller.
+
+use crate::keyseq::{self, Sequence, ESC};
 
 /// `Ctrl-t`.
 pub const PREFIX: u8 = 0x14;
@@ -146,8 +175,14 @@ pub fn parse_prefix(s: &str) -> Result<u8, String> {
 /// of [`parse_prefix`], used by the runtime help screen and messages so a
 /// remapped prefix is described as the key the user actually set.
 pub fn prefix_label(byte: u8) -> String {
-    // The control byte's letter is the low five bits set back into ASCII.
-    format!("Ctrl-{}", (byte | 0x60) as char)
+    format!("Ctrl-{}", prefix_letter(byte) as char)
+}
+
+/// The letter of a `Ctrl-<letter>` control byte: its low five bits set back
+/// into ASCII, so `0x14` is `'t'`. This is the key code a terminal reports the
+/// chord under, see [`crate::keyseq`].
+pub fn prefix_letter(byte: u8) -> u8 {
+    byte | 0x60
 }
 
 /// Carriage return, which is what Enter is in raw mode. Ends a number early
@@ -166,6 +201,20 @@ enum State {
     Number(u32),
 }
 
+/// What the caller must put a clock on, if anything. See [`Prefix::wait`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wait {
+    /// A lone `<prefix>` or a half-typed number: give the user
+    /// `keys.timeout_ms` to finish it.
+    Command,
+    /// An escape sequence the last read cut short: give the rest of it a
+    /// moment to arrive. Machine time, not human time — the bytes of one key
+    /// are only ever split by a buffer boundary — so this wait should be
+    /// short: a bare `Esc` in a terminal that still sends one is held for
+    /// exactly this long.
+    Sequence,
+}
+
 /// The prefix state machine.
 ///
 /// The prefix byte is state, not a global read: the machine stays pure and
@@ -181,16 +230,21 @@ pub struct Prefix {
     /// The byte that arms the machine. [`PREFIX`] by default; a config file can
     /// remap it (see [`crate::config`]).
     prefix: u8,
+    /// The bytes that armed the machine — the control byte, or the sequence a
+    /// terminal sent instead of it, and that key's release report if one has
+    /// arrived since — replayed verbatim when the prefix turns out to be meant
+    /// literally. Empty unless [`State::Armed`].
+    armed: Vec<u8>,
+    /// An escape sequence still being read. It could yet spell the prefix, so
+    /// it is held back until it is complete or clearly something else; empty
+    /// between sequences.
+    seq: Vec<u8>,
 }
 
 /// The derive would zero `prefix`; the default machine must arm on [`PREFIX`].
 impl Default for Prefix {
     fn default() -> Self {
-        Self {
-            state: State::Idle,
-            highest: 0,
-            prefix: PREFIX,
-        }
+        Self::new(0)
     }
 }
 
@@ -206,14 +260,34 @@ impl Prefix {
             state: State::Idle,
             highest,
             prefix,
+            armed: Vec::new(),
+            seq: Vec::new(),
         }
     }
 
     /// True if the machine is mid-sequence and a timeout must be armed —
-    /// either a lone `<prefix>` or a half-typed number. The caller polls on the
-    /// short timeout while this holds, so a number does not resolve late.
+    /// a lone `<prefix>`, a half-typed number or an unfinished escape
+    /// sequence. [`wait`](Self::wait) says which.
     pub fn is_armed(&self) -> bool {
-        self.state != State::Idle
+        self.wait().is_some()
+    }
+
+    /// What the caller must time, if anything. The caller polls on that wait
+    /// while this is `Some`, and calls [`timeout`](Self::timeout) when it
+    /// passes, so a number does not resolve late and a cut-off sequence does
+    /// not hang.
+    ///
+    /// An unfinished sequence takes precedence: settling it settles whatever
+    /// else was pending too, since it was the key after the prefix or the
+    /// number.
+    pub fn wait(&self) -> Option<Wait> {
+        if !self.seq.is_empty() {
+            Some(Wait::Sequence)
+        } else if self.state != State::Idle {
+            Some(Wait::Command)
+        } else {
+            None
+        }
     }
 
     /// Whether another digit could still extend `n` into a live session number.
@@ -229,74 +303,163 @@ impl Prefix {
     pub fn feed(&mut self, input: &[u8]) -> Vec<Step> {
         let mut steps = Vec::new();
         let mut pending: Vec<u8> = Vec::new();
-
         for &b in input {
-            match self.state {
-                State::Idle => {
-                    if b == self.prefix {
-                        self.state = State::Armed;
+            self.byte(b, &mut steps, &mut pending);
+        }
+        flush(&mut steps, &mut pending);
+        steps
+    }
+
+    /// One byte, in whatever state the machine is in.
+    fn byte(&mut self, b: u8, steps: &mut Vec<Step>, pending: &mut Vec<u8>) {
+        if !self.seq.is_empty() {
+            self.seq.push(b);
+            match keyseq::classify(&self.seq, prefix_letter(self.prefix)) {
+                Sequence::Partial => {}
+                Sequence::Prefix => {
+                    let bytes = std::mem::take(&mut self.seq);
+                    self.prefix_key(bytes, steps, pending);
+                }
+                Sequence::Release(code) => {
+                    // Releasing a key is not pressing one: no state changes,
+                    // and Neovim gets the report as it was sent. The one
+                    // exception is the release of the prefix while its press
+                    // is still held back: it stays with that press, so Neovim
+                    // sees the two in order for a literal and neither for a
+                    // command, never a release before its press.
+                    let mut report = std::mem::take(&mut self.seq);
+                    if self.state == State::Armed && code == u32::from(prefix_letter(self.prefix)) {
+                        self.armed.append(&mut report);
                     } else {
-                        pending.push(b);
+                        pending.append(&mut report);
                     }
                 }
-
-                State::Armed => {
-                    self.state = State::Idle;
-                    if b == self.prefix {
-                        // <prefix> <prefix>: one literal prefix byte reaches Neovim.
-                        // Checked before everything else, so no rule and no row
-                        // can ever shadow it.
-                        pending.push(self.prefix);
-                    } else if (b'1'..=b'9').contains(&b) {
-                        // A number never starts with 0, so `<prefix> 0` falls
-                        // through to the replay branch below.
-                        self.start_number(u32::from(b - b'0'), &mut steps, &mut pending);
-                    } else if let Some(action) = command(b) {
-                        flush(&mut steps, &mut pending);
-                        steps.push(Step::Act(action));
-                    } else {
-                        // Not a command, so the user's original keystrokes are
-                        // replayed in order and nothing is eaten.
-                        pending.push(self.prefix);
-                        pending.push(b);
-                    }
+                Sequence::Reply => {
+                    // The terminal answering the editor, not the user typing:
+                    // no state changes, and the answer goes through as it
+                    // came — even between a prefix and its command.
+                    pending.append(&mut self.seq);
                 }
-
-                State::Number(n) => {
-                    if b.is_ascii_digit() {
-                        self.state = State::Idle;
-                        // Saturating throughout: a held-down digit key must
-                        // neither panic nor wrap a huge number back around onto
-                        // a live one.
-                        let wider = n.saturating_mul(10).saturating_add(u32::from(b - b'0'));
-                        self.start_number(wider, &mut steps, &mut pending);
-                    } else if b == ENTER {
-                        // An explicit "that is the whole number", so a user who
-                        // knows the id never waits out the timeout.
-                        self.state = State::Idle;
-                        flush(&mut steps, &mut pending);
-                        steps.push(Step::Act(Action::Switch(n)));
-                    } else {
-                        // The digits already typed were a complete command, and
-                        // this byte is simply the next key. Acting and then
-                        // handling `b` afresh is what keeps `<prefix> 1 x` equivalent
-                        // to `<prefix> t x`: the command runs, the `x` reaches Neovim,
-                        // and no stray prefix byte is injected.
-                        self.state = State::Idle;
-                        flush(&mut steps, &mut pending);
-                        steps.push(Step::Act(Action::Switch(n)));
-                        if b == self.prefix {
-                            self.state = State::Armed;
-                        } else {
-                            pending.push(b);
-                        }
+                Sequence::Other(n) => {
+                    let mut key = std::mem::take(&mut self.seq);
+                    let rest = key.split_off(n);
+                    self.other_key(key, steps, pending);
+                    // What followed the key is input in its own right — it
+                    // may even be the prefix byte, or the start of another
+                    // sequence.
+                    for r in rest {
+                        self.byte(r, steps, pending);
                     }
                 }
             }
+        } else if b == ESC {
+            self.seq.push(b);
+        } else if b == self.prefix {
+            self.prefix_key(vec![b], steps, pending);
+        } else {
+            self.plain_byte(b, steps, pending);
         }
+    }
 
-        flush(&mut steps, &mut pending);
-        steps
+    /// The prefix, spelled as `bytes`.
+    fn prefix_key(&mut self, bytes: Vec<u8>, steps: &mut Vec<Step>, pending: &mut Vec<u8>) {
+        match self.state {
+            State::Idle => {
+                self.state = State::Armed;
+                self.armed = bytes;
+            }
+            State::Armed => {
+                // <prefix> <prefix>: one literal prefix reaches Neovim — the
+                // one that was held back, in the terminal's own spelling.
+                // Checked before everything else, so no rule and no row can
+                // ever shadow it.
+                self.state = State::Idle;
+                pending.append(&mut self.armed);
+            }
+            State::Number(n) => {
+                // The digits already typed were a complete command, and this
+                // prefix starts the next one.
+                self.state = State::Idle;
+                flush(steps, pending);
+                steps.push(Step::Act(Action::Switch(n)));
+                self.state = State::Armed;
+                self.armed = bytes;
+            }
+        }
+    }
+
+    /// A whole key that is not the prefix, arriving as an escape sequence —
+    /// or a sequence that turned out to be no key at all. Handled like any
+    /// other non-command: the machine's pending business is settled and the
+    /// bytes go through unchanged.
+    fn other_key(&mut self, bytes: Vec<u8>, steps: &mut Vec<Step>, pending: &mut Vec<u8>) {
+        match self.state {
+            State::Idle => {}
+            State::Armed => {
+                // Not a command, so the user's original keystrokes are
+                // replayed in order and nothing is eaten.
+                self.state = State::Idle;
+                pending.append(&mut self.armed);
+            }
+            State::Number(n) => {
+                self.state = State::Idle;
+                flush(steps, pending);
+                steps.push(Step::Act(Action::Switch(n)));
+            }
+        }
+        pending.extend(bytes);
+    }
+
+    /// An ordinary byte: neither the prefix nor part of an escape sequence.
+    fn plain_byte(&mut self, b: u8, steps: &mut Vec<Step>, pending: &mut Vec<u8>) {
+        match self.state {
+            State::Idle => pending.push(b),
+
+            State::Armed => {
+                self.state = State::Idle;
+                let mut armed = std::mem::take(&mut self.armed);
+                if (b'1'..=b'9').contains(&b) {
+                    // A number never starts with 0, so `<prefix> 0` falls
+                    // through to the replay branch below.
+                    self.start_number(u32::from(b - b'0'), steps, pending);
+                } else if let Some(action) = command(b) {
+                    flush(steps, pending);
+                    steps.push(Step::Act(action));
+                } else {
+                    // Not a command, so the user's original keystrokes are
+                    // replayed in order and nothing is eaten.
+                    pending.append(&mut armed);
+                    pending.push(b);
+                }
+            }
+
+            State::Number(n) => {
+                if b.is_ascii_digit() {
+                    self.state = State::Idle;
+                    // Saturating throughout: a held-down digit key must
+                    // neither panic nor wrap a huge number back around onto
+                    // a live one.
+                    let wider = n.saturating_mul(10).saturating_add(u32::from(b - b'0'));
+                    self.start_number(wider, steps, pending);
+                } else if b == ENTER {
+                    // An explicit "that is the whole number", so a user who
+                    // knows the id never waits out the timeout.
+                    self.state = State::Idle;
+                    flush(steps, pending);
+                    steps.push(Step::Act(Action::Switch(n)));
+                } else {
+                    // The digits already typed were a complete command, and
+                    // this byte is simply the next key. Acting and then
+                    // handling `b` afresh is what keeps `<prefix> 1 x` equivalent
+                    // to `<prefix> t x`: the command runs, the `x` reaches Neovim,
+                    // and no stray prefix byte is injected.
+                    self.state = State::Idle;
+                    flush(steps, pending);
+                    steps.push(Step::Act(Action::Switch(n)));
+                    pending.push(b);
+                }
+            }
+        }
     }
 
     /// Begin, or extend, a session number: wait for another digit only when one
@@ -311,17 +474,30 @@ impl Prefix {
         }
     }
 
-    /// Called when no byte arrived within `keys.timeout_ms` of the machine arming.
+    /// Called when the [`wait`](Self::wait) the machine asked for has passed
+    /// with no further byte.
     ///
-    /// Resolves a lone `<prefix>` into a literal one, and a half-typed number into
-    /// the session it already names. Idempotent, so a caller that fires its
-    /// timer spuriously does no harm.
+    /// Resolves a lone `<prefix>` into a literal one, a half-typed number into
+    /// the session it already names, and a cut-off escape sequence into the
+    /// bytes it was — which, as the key after a prefix or a number, settles
+    /// those too. Idempotent, so a caller that fires its timer spuriously does
+    /// no harm.
     pub fn timeout(&mut self) -> Vec<Step> {
-        match std::mem::replace(&mut self.state, State::Idle) {
-            State::Idle => Vec::new(),
-            State::Armed => vec![Step::Forward(vec![self.prefix])],
-            State::Number(n) => vec![Step::Act(Action::Switch(n))],
+        let mut steps = Vec::new();
+        let mut pending = Vec::new();
+        if !self.seq.is_empty() {
+            // The rest never came: whatever it was, it was not the prefix.
+            let held = std::mem::take(&mut self.seq);
+            self.other_key(held, &mut steps, &mut pending);
+        } else {
+            match std::mem::replace(&mut self.state, State::Idle) {
+                State::Idle => {}
+                State::Armed => pending.append(&mut self.armed),
+                State::Number(n) => steps.push(Step::Act(Action::Switch(n))),
+            }
         }
+        flush(&mut steps, &mut pending);
+        steps
     }
 }
 
@@ -486,13 +662,412 @@ mod tests {
         assert_eq!(forwarded(&steps), vec![0x03, 0x13, 0x1c]);
     }
 
+    /// Sequences are looked at — that is how an encoded prefix is found — but
+    /// everything that is not the prefix goes through byte for byte, and none
+    /// of it leaves the machine waiting once the sequence is whole.
     #[test]
-    fn escape_sequences_are_never_parsed() {
+    fn other_escape_sequences_pass_through_untouched() {
         let mut p = Prefix::new(0);
-        // A bracketed paste wrapper plus a kitty keyboard query.
-        let raw = b"\x1b[200~pasted\x1b[201~\x1b[?u";
+        // A bracketed paste wrapper, the terminal's reply to the kitty
+        // keyboard query, arrows, a control chord in legacy form, F5, a mouse
+        // report, a focus event, and Ctrl-d spelled the kitty way.
+        let raw = b"\x1b[200~pasted\x1b[201~\x1b[?0u\x1b[A\x1b[1;5A\x1b[15~\x1b[<35;10;20M\x1b[I\x1b[100;5u";
         let steps = p.feed(raw);
         assert_eq!(forwarded(&steps), raw);
+        assert!(actions(&steps).is_empty());
+        assert_eq!(p.wait(), None, "nothing should be held: {steps:?}");
+    }
+
+    // The prefix spelled the way a terminal in an extended keyboard mode
+    // spells it — see `keyseq` for the grammar; these pin the machine's use
+    // of it.
+
+    /// `Ctrl-t` as the kitty keyboard protocol and xterm's `modifyOtherKeys`
+    /// send it. This is the bug that motivated `keyseq`: Windows Terminal 1.25
+    /// speaks the first, Neovim asks for it, and `<prefix> d` reached the
+    /// editor as a tag-stack pop and a pending delete.
+    const KITTY: &[u8] = b"\x1b[116;5u";
+    const XTERM: &[u8] = b"\x1b[27;5;116~";
+
+    #[test]
+    fn an_encoded_prefix_arms_and_its_command_acts() {
+        for spelling in [
+            KITTY,
+            XTERM,
+            b"\x1b[116;5:1u",
+            b"\x1b[116;5:2u",
+            b"\x1b[116;133u",
+        ] {
+            let mut p = Prefix::new(0);
+            let steps = p.feed(spelling);
+            assert!(
+                steps.is_empty(),
+                "{spelling:?} must be swallowed, got {steps:?}"
+            );
+            assert_eq!(p.wait(), Some(Wait::Command), "{spelling:?} must arm");
+
+            let steps = p.feed(b"d");
+            assert_eq!(actions(&steps), vec![Action::Detach], "{spelling:?}");
+            assert!(forwarded(&steps).is_empty(), "{spelling:?}");
+            assert!(!p.is_armed());
+        }
+    }
+
+    /// Both spellings in one read, with the command and ordinary text around
+    /// them, in the right order.
+    #[test]
+    fn an_encoded_prefix_inside_a_larger_chunk_splits_correctly() {
+        let mut p = Prefix::new(0);
+        let mut input = b"before".to_vec();
+        input.extend_from_slice(KITTY);
+        input.extend_from_slice(b"tmiddle");
+        input.extend_from_slice(XTERM);
+        input.extend_from_slice(b"dafter");
+        let steps = p.feed(&input);
+        assert_eq!(
+            steps,
+            vec![
+                Step::Forward(b"before".to_vec()),
+                Step::Act(Action::Picker),
+                Step::Forward(b"middle".to_vec()),
+                Step::Act(Action::Detach),
+                Step::Forward(b"after".to_vec()),
+            ]
+        );
+    }
+
+    /// A read can end anywhere inside the sequence — including right after
+    /// the `ESC`, which is also what a bare Escape key looks like. Every
+    /// split must still find the prefix.
+    #[test]
+    fn an_encoded_prefix_survives_a_chunk_boundary_at_every_byte() {
+        for spelling in [KITTY, XTERM] {
+            for cut in 1..spelling.len() {
+                let mut p = Prefix::new(0);
+                let first = p.feed(&spelling[..cut]);
+                assert!(first.is_empty(), "cut at {cut}: {first:?}");
+                assert_eq!(
+                    p.wait(),
+                    Some(Wait::Sequence),
+                    "cut at {cut}: the rest must be waited for, briefly"
+                );
+                let second = p.feed(&spelling[cut..]);
+                assert!(second.is_empty(), "cut at {cut}: {second:?}");
+                assert_eq!(p.wait(), Some(Wait::Command), "cut at {cut}");
+
+                let steps = p.feed(b"t");
+                assert_eq!(actions(&steps), vec![Action::Picker], "cut at {cut}");
+            }
+        }
+    }
+
+    /// The literal is what the terminal sent, not the control byte: a terminal
+    /// that spells the chord as a sequence gets its sequence back.
+    #[test]
+    fn a_doubled_encoded_prefix_replays_the_terminal_s_own_spelling() {
+        let mut p = Prefix::new(0);
+        let mut both = KITTY.to_vec();
+        both.extend_from_slice(KITTY);
+        let steps = p.feed(&both);
+        assert_eq!(forwarded(&steps), KITTY);
+        assert!(actions(&steps).is_empty());
+        assert!(!p.is_armed());
+
+        // Mixed spellings are the same key: the first one is what is replayed.
+        let mut p = Prefix::new(0);
+        let mut mixed = XTERM.to_vec();
+        mixed.push(PREFIX);
+        assert_eq!(forwarded(&p.feed(&mixed)), XTERM);
+        let mut p = Prefix::new(0);
+        let mut mixed = vec![PREFIX];
+        mixed.extend_from_slice(KITTY);
+        assert_eq!(forwarded(&p.feed(&mixed)), vec![PREFIX]);
+    }
+
+    #[test]
+    fn an_encoded_prefix_alone_is_replayed_on_the_timeout() {
+        let mut p = Prefix::new(0);
+        p.feed(KITTY);
+        assert_eq!(forwarded(&p.timeout()), KITTY);
+        assert!(!p.is_armed());
+        assert!(p.timeout().is_empty(), "idempotent");
+    }
+
+    /// The key after an encoded prefix is not a command: both are replayed,
+    /// each in the spelling it arrived in.
+    #[test]
+    fn an_encoded_prefix_then_another_key_replays_both() {
+        // A plain letter, and a key that is itself a sequence (Escape, as the
+        // kitty protocol spells it).
+        for other in [&b"x"[..], b"\x1b[27u", b"\x1b[100;5u"] {
+            let mut p = Prefix::new(0);
+            let mut input = KITTY.to_vec();
+            input.extend_from_slice(other);
+            let steps = p.feed(&input);
+            let mut want = KITTY.to_vec();
+            want.extend_from_slice(other);
+            assert_eq!(forwarded(&steps), want, "after {other:?}");
+            assert!(actions(&steps).is_empty());
+            assert!(!p.is_armed());
+        }
+    }
+
+    /// The other direction: a byte prefix followed by a sequence that is not
+    /// a command (an arrow) replays both, and `<prefix> <sequence-prefix>` is
+    /// still a literal.
+    #[test]
+    fn a_byte_prefix_then_a_sequence_is_handled_like_any_other_key() {
+        let mut p = Prefix::new(0);
+        let steps = p.feed(b"\x14\x1b[A");
+        assert_eq!(forwarded(&steps), b"\x14\x1b[A");
+        assert!(!p.is_armed());
+
+        let mut p = Prefix::new(0);
+        let mut input = vec![PREFIX];
+        input.extend_from_slice(KITTY);
+        assert_eq!(forwarded(&p.feed(&input)), vec![PREFIX]);
+        assert!(!p.is_armed());
+    }
+
+    /// A terminal asked for release events reports one for every key,
+    /// including the prefix just swallowed. None of them is a keystroke:
+    /// they go through, and the machine stays where it was.
+    #[test]
+    fn key_release_reports_are_transparent_in_every_state() {
+        let release_prefix = b"\x1b[116;5:3u";
+        let release_d = b"\x1b[100;1:3u";
+        let release_one = b"\x1b[49;1:3u";
+
+        // Idle.
+        let mut p = Prefix::new(12);
+        assert_eq!(forwarded(&p.feed(release_prefix)), release_prefix);
+        assert!(!p.is_armed());
+
+        // Armed: the prefix's own release must not count as the next key —
+        // nor reach Neovim ahead of the press it belongs to, which is still
+        // held back; another key's release goes straight through.
+        let mut p = Prefix::new(12);
+        p.feed(KITTY);
+        assert!(p.feed(release_prefix).is_empty(), "held with its press");
+        assert_eq!(p.wait(), Some(Wait::Command), "still armed");
+        assert_eq!(forwarded(&p.feed(release_d)), release_d);
+        assert_eq!(p.wait(), Some(Wait::Command), "still armed");
+        let steps = p.feed(b"d");
+        assert_eq!(actions(&steps), vec![Action::Detach]);
+        assert!(forwarded(&steps).is_empty(), "a command drops both");
+
+        // Number: releasing the `1` must not end the number.
+        let mut p = Prefix::new(12);
+        p.feed(KITTY);
+        p.feed(b"1");
+        let steps = p.feed(release_one);
+        assert_eq!(forwarded(&steps), release_one);
+        assert_eq!(p.wait(), Some(Wait::Command), "still a number");
+        assert_eq!(actions(&p.feed(b"2")), vec![Action::Switch(12)]);
+    }
+
+    /// The editor queries the terminal at every start and resume, and the
+    /// answer can land between a prefix and its command — as it does when a
+    /// prefix is typed the moment the client comes up. An answer is not a key.
+    #[test]
+    fn a_terminal_reply_between_the_prefix_and_its_command_is_not_a_key() {
+        let da1 = b"\x1b[?62;22c";
+        let mut p = Prefix::new(12);
+        p.feed(KITTY);
+        assert_eq!(forwarded(&p.feed(da1)), da1, "the answer goes through");
+        assert_eq!(p.wait(), Some(Wait::Command), "still armed");
+        assert_eq!(actions(&p.feed(b"d")), vec![Action::Detach]);
+
+        let mut p = Prefix::new(12);
+        p.feed(b"\x141");
+        assert_eq!(forwarded(&p.feed(b"\x1b[?0u")), b"\x1b[?0u");
+        assert_eq!(p.wait(), Some(Wait::Command), "still a number");
+        assert_eq!(actions(&p.feed(b"2")), vec![Action::Switch(12)]);
+    }
+
+    /// The press and the release of a literal prefix reach Neovim in the
+    /// order they were typed, whether the literal comes from a doubled
+    /// prefix or from the wait passing.
+    #[test]
+    fn a_literal_prefix_replays_its_press_and_release_in_order() {
+        let release = b"\x1b[116;1:3u";
+        let mut both = KITTY.to_vec();
+        both.extend_from_slice(release);
+
+        let mut p = Prefix::new(0);
+        p.feed(KITTY);
+        p.feed(release);
+        assert_eq!(forwarded(&p.feed(KITTY)), both);
+        assert!(!p.is_armed());
+
+        let mut p = Prefix::new(0);
+        p.feed(KITTY);
+        p.feed(release);
+        assert_eq!(forwarded(&p.timeout()), both);
+        assert!(!p.is_armed());
+    }
+
+    /// Holding the key down repeats it, and a repeat is a press: the first
+    /// repeat makes a literal, the next arms again — as a held-down control
+    /// byte does in a terminal without the protocol.
+    #[test]
+    fn a_held_down_encoded_prefix_alternates_like_a_held_down_byte() {
+        let repeat = b"\x1b[116;5:2u";
+        let mut p = Prefix::new(0);
+        let mut input = KITTY.to_vec();
+        input.extend_from_slice(repeat);
+        input.extend_from_slice(repeat);
+        let steps = p.feed(&input);
+        assert_eq!(
+            forwarded(&steps),
+            KITTY,
+            "one literal, in the press's spelling"
+        );
+        assert!(actions(&steps).is_empty());
+        assert_eq!(p.wait(), Some(Wait::Command), "the third press arms again");
+
+        let mut p = Prefix::new(0);
+        assert_eq!(forwarded(&p.feed(&[PREFIX, PREFIX, PREFIX])), vec![PREFIX]);
+        assert!(p.is_armed());
+    }
+
+    /// An encoded prefix after a half-typed number ends the number and arms
+    /// again, exactly as the byte does.
+    #[test]
+    fn an_encoded_prefix_after_a_number_ends_it_and_arms_again() {
+        let mut p = Prefix::new(12);
+        p.feed(b"\x14" as &[u8]);
+        p.feed(b"1");
+        let steps = p.feed(KITTY);
+        assert_eq!(actions(&steps), vec![Action::Switch(1)]);
+        assert!(forwarded(&steps).is_empty());
+        assert_eq!(p.wait(), Some(Wait::Command));
+        assert_eq!(actions(&p.feed(b"t")), vec![Action::Picker]);
+    }
+
+    /// The wait for the rest of a sequence is the short one, and it wins over
+    /// the command wait: settling the sequence settles the command too.
+    #[test]
+    fn a_cut_off_sequence_asks_for_the_short_wait_in_every_state() {
+        // Idle: a bare ESC, which in a terminal without the protocol is the
+        // Escape key. It is held, then goes through as it stands.
+        let mut p = Prefix::new(12);
+        assert!(p.feed(b"\x1b").is_empty());
+        assert_eq!(p.wait(), Some(Wait::Sequence));
+        assert_eq!(forwarded(&p.timeout()), b"\x1b");
+        assert!(!p.is_armed());
+
+        // Armed: it was the key after the prefix, so both are replayed.
+        let mut p = Prefix::new(12);
+        p.feed(KITTY);
+        assert_eq!(p.wait(), Some(Wait::Command));
+        p.feed(b"\x1b[1");
+        assert_eq!(p.wait(), Some(Wait::Sequence));
+        let mut want = KITTY.to_vec();
+        want.extend_from_slice(b"\x1b[1");
+        assert_eq!(forwarded(&p.timeout()), want);
+        assert!(!p.is_armed());
+
+        // Number: the digits were the whole command, and the sequence follows.
+        let mut p = Prefix::new(12);
+        p.feed(b"\x141");
+        p.feed(b"\x1b");
+        assert_eq!(p.wait(), Some(Wait::Sequence));
+        let steps = p.timeout();
+        assert_eq!(actions(&steps), vec![Action::Switch(1)]);
+        assert_eq!(forwarded(&steps), b"\x1b");
+        assert!(!p.is_armed());
+    }
+
+    /// A held `ESC` followed by something that cannot continue it: the `ESC`
+    /// was the Escape key, and the next byte is the next key — which may be
+    /// the prefix.
+    #[test]
+    fn an_escape_then_an_unrelated_byte_forwards_the_escape_and_goes_on() {
+        let mut p = Prefix::new(0);
+        assert!(p.feed(b"\x1b").is_empty());
+        let steps = p.feed(b":");
+        assert_eq!(forwarded(&steps), b"\x1b:");
+        assert!(!p.is_armed());
+
+        let mut p = Prefix::new(0);
+        assert!(p.feed(b"\x1b").is_empty());
+        let steps = p.feed(&[PREFIX]);
+        assert_eq!(forwarded(&steps), b"\x1b", "the ESC goes through");
+        assert_eq!(p.wait(), Some(Wait::Command), "and the prefix byte arms");
+
+        // A broken sequence, then the prefix byte: the prefix still arms.
+        let mut p = Prefix::new(0);
+        let steps = p.feed(b"\x1b[11\x14");
+        assert_eq!(forwarded(&steps), b"\x1b[11");
+        assert!(p.is_armed());
+        assert_eq!(actions(&p.feed(b"d")), vec![Action::Detach]);
+    }
+
+    /// Only the exact chord: `Ctrl-Shift-t`, `Ctrl-d`, and a key with an
+    /// extra modifier all go through untouched.
+    #[test]
+    fn a_different_chord_in_the_same_spelling_is_not_the_prefix() {
+        for seq in [
+            &b"\x1b[116;6u"[..],
+            b"\x1b[100;5u",
+            b"\x1b[116;7u",
+            b"\x1b[27;6;116~",
+        ] {
+            let mut p = Prefix::new(0);
+            let mut input = seq.to_vec();
+            input.push(b'd');
+            let steps = p.feed(&input);
+            assert_eq!(forwarded(&steps), input, "{seq:?}");
+            assert!(actions(&steps).is_empty(), "{seq:?}");
+            assert!(!p.is_armed(), "{seq:?}");
+        }
+    }
+
+    /// A remapped prefix is recognised under its own letter's code, and the
+    /// default's code is then just another key.
+    #[test]
+    fn a_remapped_prefix_is_recognised_in_every_spelling() {
+        let ctrl_a = 0x01;
+        for spelling in [&[ctrl_a][..], b"\x1b[97;5u", b"\x1b[27;5;97~"] {
+            let mut p = Prefix::with_prefix(0, ctrl_a);
+            assert!(p.feed(spelling).is_empty(), "{spelling:?}");
+            assert_eq!(actions(&p.feed(b"d")), vec![Action::Detach], "{spelling:?}");
+        }
+        let mut p = Prefix::with_prefix(0, ctrl_a);
+        assert_eq!(forwarded(&p.feed(KITTY)), KITTY);
+        assert!(!p.is_armed());
+    }
+
+    /// The letter a terminal reports the chord under is the one the label
+    /// shows, for every prefix the parser accepts.
+    #[test]
+    fn the_prefix_letter_is_the_label_s_letter() {
+        for byte in 1u8..=26 {
+            let label = prefix_label(byte);
+            assert_eq!(
+                label.as_bytes().last().copied(),
+                Some(prefix_letter(byte)),
+                "for {label}"
+            );
+            assert!(prefix_letter(byte).is_ascii_lowercase());
+        }
+    }
+
+    /// A pasted burst never arms the machine on its way through, and never
+    /// leaves anything held once it is whole.
+    #[test]
+    fn a_large_paste_full_of_sequences_is_forwarded_whole() {
+        let mut p = Prefix::new(30);
+        let mut paste = b"\x1b[200~".to_vec();
+        for _ in 0..500 {
+            paste.extend_from_slice(b"line 12 \x1b[A\x1b[31mred\x1b[0m\n");
+        }
+        paste.extend_from_slice(b"\x1b[201~");
+        let steps = p.feed(&paste);
+        assert_eq!(forwarded(&steps), paste);
+        assert!(actions(&steps).is_empty());
+        assert!(!p.is_armed());
     }
 
     #[test]
@@ -540,7 +1115,8 @@ mod tests {
     /// Every byte that is not a command must survive a prefix unchanged.
     ///
     /// With no sessions known, every digit resolves at once, so nothing here is
-    /// left mid-sequence.
+    /// left mid-sequence — except `ESC`, which could be the start of another
+    /// spelling of the prefix and is held until the wait passes.
     #[test]
     fn exhaustive_second_byte_table() {
         for b in 0u8..=255 {
@@ -549,6 +1125,14 @@ mod tests {
             // Same order as `feed`: the literal rule, then digits, then the table.
             if b == PREFIX {
                 assert_eq!(forwarded(&steps), vec![PREFIX]);
+            } else if b == ESC {
+                assert!(steps.is_empty(), "a bare ESC is held, not replayed yet");
+                assert_eq!(p.wait(), Some(Wait::Sequence));
+                assert_eq!(
+                    forwarded(&p.timeout()),
+                    vec![PREFIX, ESC],
+                    "the wait passing replays both, in order"
+                );
             } else if (b'1'..=b'9').contains(&b) {
                 assert_eq!(
                     actions(&steps),
