@@ -1,9 +1,15 @@
 //! Shared helpers for the screen tests, which all render to a `TestBackend`
-//! and assert on the result the same way.
+//! and assert on the result the same way. [`emitted`] is the exception: one
+//! property of the screens is only visible in the escape stream, so it renders
+//! through the same crossterm backend the binary uses.
 
-use ratatui::backend::TestBackend;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use ratatui::backend::{CrosstermBackend, TestBackend};
+use ratatui::layout::Rect;
 use ratatui::style::Color;
-use ratatui::{Frame, Terminal};
+use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthStr;
 
 /// Reconstruct the rendered lines, skipping the filler cell that follows a
@@ -29,6 +35,45 @@ pub(super) fn render(w: u16, h: u16, mut draw: impl FnMut(&mut Frame)) -> Vec<St
             line.trim_end().to_string()
         })
         .collect()
+}
+
+/// The bytes a screen writes to a terminal, through the same crossterm backend
+/// the binary uses. [`render`] asserts what a screen *means*; this is for what
+/// it actually puts on the wire.
+///
+/// A fixed viewport rather than [`Terminal::new`], which asks the real terminal
+/// for its size and fails under `cargo test`.
+pub(super) fn emitted(w: u16, h: u16, mut draw: impl FnMut(&mut Frame)) -> String {
+    /// A writer that keeps what was written, since ratatui's backend does not
+    /// hand its own back on this version.
+    #[derive(Clone)]
+    struct Tap(Rc<RefCell<Vec<u8>>>);
+
+    impl std::io::Write for Tap {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // What `Screen::open` does, so the stream is the one the binary produces.
+    ratatui::crossterm::style::force_color_output(true);
+
+    let tap = Tap(Rc::new(RefCell::new(Vec::new())));
+    let mut terminal = Terminal::with_options(
+        CrosstermBackend::new(tap.clone()),
+        TerminalOptions {
+            viewport: Viewport::Fixed(Rect::new(0, 0, w, h)),
+        },
+    )
+    .expect("terminal");
+    terminal.draw(|f| draw(f)).expect("draw");
+
+    let bytes = tap.0.borrow().clone();
+    String::from_utf8(bytes).expect("the screens write UTF-8")
 }
 
 /// No screen may emit an SGR colour: each inherits the terminal's palette and

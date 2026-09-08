@@ -26,6 +26,14 @@
 //! `ESC[m`, a full SGR reset that wipes bold, reverse and dim mid-line. Call
 //! `force_color_output(true)`, test the variable directly, and set no colours
 //! when it is present.
+//!
+//! Inheriting the palette has a cost the screens have to pay themselves.
+//! Setting no colours means ratatui writes no SGR before its content, so a
+//! screen is painted in whatever attributes the terminal was already in — and
+//! coming back from a session, that is whatever the editor happened to be
+//! drawing when the relay stopped. [`Screen::open`] therefore drops the
+//! inherited attributes first, which is the one place that can: every screen is
+//! taken through it.
 
 pub mod app;
 pub mod draw;
@@ -82,6 +90,12 @@ impl Screen {
     pub(crate) fn open() -> Result<Self> {
         // Stops crossterm second-guessing us; see the module docs on colour.
         ratatui::crossterm::style::force_color_output(true);
+
+        // Before the alternate screen and before the clear below, because both
+        // erase with the *current* background colour, and the screen this takes
+        // over from may be a Neovim client stopped mid-frame. See the module
+        // docs on colour, and `term::reset_inherited_attributes`.
+        crate::term::reset_inherited_attributes();
 
         let mut screen = Self {
             terminal: ratatui::try_init()?,
@@ -352,6 +366,42 @@ mod tests {
         assert_eq!(
             translate(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT)),
             Key::Char('G')
+        );
+    }
+
+    /// Why [`Screen::open`] drops the inherited attributes before it draws.
+    ///
+    /// The screens set no colours on purpose, so ratatui's crossterm backend —
+    /// which tracks fg and bg from `Color::Reset` and writes SGR only on a
+    /// difference — emits nothing that would clear an attribute until the whole
+    /// frame has been painted, and never writes a blank cell at all. Whatever
+    /// the terminal was already in is what the screen is drawn in: coming back
+    /// from a session, the editor's own colours, mid-frame.
+    ///
+    /// If ratatui ever leads a frame with a reset of its own this fails and the
+    /// call in `Screen::open` can be revisited — the point of asserting it
+    /// rather than merely writing it down.
+    #[test]
+    fn a_screen_paints_before_it_clears_anything() {
+        let emitted = test_support::emitted(48, 6, |f| draw::draw(f, &App::new(Vec::new())));
+        let content = emitted
+            .find("no sessions")
+            .expect("the empty-list line is the screen's first content");
+
+        for clear in [
+            "\x1b[0m", "\x1b[m", "\x1b[39m", "\x1b[49m", "\x1b[22m", "\x1b[27m",
+        ] {
+            assert!(
+                !emitted[..content].contains(clear),
+                "{clear:?} before the first glyph: the screen no longer inherits \
+                 the terminal's attributes, so term::reset_inherited_attributes \
+                 may be redundant"
+            );
+        }
+        assert!(
+            emitted.rfind("\x1b[0m").is_some_and(|at| at > content),
+            "the only SGR reset in a frame comes after its content, which is \
+             too late to undo anything inherited"
         );
     }
 
