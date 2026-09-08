@@ -67,6 +67,16 @@ fi
 # std::fs cannot unlink over ssh.
 rm -f "$sock"
 
+# The nested-launch marker. Exported here it reaches the editor and every job
+# the editor starts -- a `:terminal` shell included, which is exactly where
+# someone would type `nvmux` again. src/nested.rs is what reads it.
+#
+# Here rather than over RPC once the session answers, which would reach both
+# transports just as well: this is in place before nvim's first line runs, it
+# cannot quietly fail the way a best-effort post-spawn call does, and it does
+# not build a command out of a path -- see src/shell.rs on why that matters.
+export NVMUX="$sock"
+
 # Detach from the ssh session's process group, which the kernel SIGHUPs when the
 # connection closes. `setsid` is cleanest but is util-linux and does not exist
 # on macOS, so probe for it and fall back to `nohup`.

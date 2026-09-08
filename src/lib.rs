@@ -15,6 +15,7 @@ pub mod ids;
 pub mod keys;
 pub mod keyseq;
 pub mod logging;
+pub mod nested;
 pub mod nvim;
 pub mod paths;
 pub mod proc;

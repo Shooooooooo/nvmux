@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use nvmux::cli::Cli;
-use nvmux::{config, logging, nvim, paths, pty, transport, ui};
+use nvmux::{config, logging, nested, nvim, paths, pty, transport, ui};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -31,6 +31,11 @@ fn main() -> Result<()> {
 }
 
 fn run(cli: &Cli) -> Result<()> {
+    // Before the version check, before the config, and before any first-run
+    // prompt: a second nvmux inside a session cannot work, and the less it has
+    // done by the time it says so the better.
+    nested::check()?;
+
     let location = cli.location();
 
     // Checked up front rather than surfacing later as an unexplained connection
