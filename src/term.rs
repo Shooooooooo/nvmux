@@ -73,11 +73,17 @@ extern "C" fn restore_and_reraise(sig: libc::c_int) {
     }
 }
 
-/// The screen-state reset: close any open synchronized-update span (Neovim
-/// draws inside one, and a client cut off mid-frame leaves it open), leave the
-/// alternate screen (a no-op when not in it), reset SGR and show the cursor.
-/// One fixed string so the signal handler can write it, and so the ordinary
-/// error paths put the screen back exactly the way a signal would.
+/// What a client cut off mid-frame leaves behind, and nothing else: an open
+/// synchronized-update span (Neovim draws inside one) and whatever SGR
+/// attributes were in force on the cell it had reached. Both are terminal-wide
+/// state rather than per-screen-buffer, so they outlive the client's screen and
+/// go on describing whatever nvmux draws next.
+const INHERITED: &[u8] = b"\x1b[?2026l\x1b[0m";
+
+/// The screen-state reset: [`INHERITED`], plus leaving the alternate screen (a
+/// no-op when not in it) and showing the cursor. One fixed string so the signal
+/// handler can write it, and so the ordinary error paths put the screen back
+/// exactly the way a signal would.
 const RESET: &[u8] = b"\x1b[?2026l\x1b[?1049l\x1b[0m\x1b[?25h";
 
 /// Put the screen back to a state a shell can be used in: cursor visible,
@@ -88,6 +94,32 @@ pub fn reset_screen() {
     use std::io::Write;
     let mut out = std::io::stdout();
     let _ = out.write_all(RESET);
+    let _ = out.flush();
+}
+
+/// Drop the state inherited from a client cut off mid-frame, without saying
+/// anything about whose screen it is.
+///
+/// For the paths that end at another nvmux screen rather than at a shell:
+/// `<prefix> t`, `<prefix> c` and `<prefix> ?` all stop the relay mid-stream
+/// and leave the client running, so nothing emits the restore sequence
+/// [`reset_screen`] relies on.
+///
+/// The picker cannot paint over the leftovers by itself, because it sets no
+/// colours: every cell it draws is `Color::Reset` and every distinction is a
+/// modifier, which is what makes it inherit the terminal's palette on purpose.
+/// Measured against ratatui 0.30's crossterm backend: `draw` tracks fg and bg
+/// from `Color::Reset` and emits SGR only on a difference, so a screen of
+/// default cells writes none at all — and it skips blank cells entirely, so the
+/// background is whatever the last erase painted. The editor's last attributes
+/// are then the picker's, which is the bug this prevents.
+///
+/// Must run before the alternate screen is entered and before the clear: both
+/// erase with the *current* background colour.
+pub fn reset_inherited_attributes() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(INHERITED);
     let _ = out.flush();
 }
 
@@ -215,6 +247,10 @@ pub fn terminal_size() -> crate::pty::PtySize {
 pub fn leave_alt_screen_and_clear() {
     use std::io::Write;
     let mut out = std::io::stdout();
+    // First, because the clear below erases with the *current* background
+    // colour: `<prefix> 1` goes straight from one session to another, with no
+    // screen in between to have dropped the outgoing client's attributes.
+    let _ = out.write_all(INHERITED);
     // ?1049l leaves the alternate screen, then clear + home so the session
     // starts from a known state.
     let _ = out.write_all(b"\x1b[?1049l\x1b[2J\x1b[H");
@@ -224,6 +260,28 @@ pub fn leave_alt_screen_and_clear() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// The two resets must go on agreeing about what a cut-off client leaves
+    /// behind. They are written out separately because the signal handler needs
+    /// `RESET` to be one fixed string it can `write`, so nothing but this stops
+    /// them drifting apart.
+    #[test]
+    fn the_inherited_reset_is_the_part_of_reset_that_says_nothing_about_the_screen() {
+        for undo in [&b"\x1b[?2026l"[..], &b"\x1b[0m"[..]] {
+            assert!(contains(INHERITED, undo), "INHERITED dropped {undo:?}");
+            assert!(contains(RESET, undo), "RESET dropped {undo:?}");
+        }
+        // And only those two. Leaving the alternate screen would show the shell
+        // for a frame before the picker enters it again, and showing the cursor
+        // would undo the hide the screen about to be drawn does for itself.
+        assert_eq!(INHERITED, b"\x1b[?2026l\x1b[0m");
+        assert!(!contains(INHERITED, b"\x1b[?1049l"));
+        assert!(!contains(INHERITED, b"\x1b[?25h"));
+    }
 
     /// The distinction the module docs rest on: `cfmakeraw` already does most of
     /// what the design calls for, and `VSUSP` is the part it does not.
