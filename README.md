@@ -115,6 +115,15 @@ then sends `Ctrl-t` as an escape sequence rather than a control byte. nvmux
 treats both as the prefix, and a literal `<prefix> <prefix>` replays whichever
 the terminal sent.
 
+nvmux will not start inside a session. Run it in a `:terminal` there and it
+says `already inside an nvmux session` and stops — the outer proxy sees every
+`<prefix>` first, so an inner nvmux could be neither detached from nor left.
+`<prefix> t` is the way to the picker, `<prefix> c` the way to a new session.
+If you do want a second one anyway — to manage another host's sessions, say —
+`NVMUX= nvmux <host>` runs it, with the prefix belonging to the outer session
+throughout. (`$NVMUX` is the session socket, exported by the editor; it is what
+nvmux checks for.)
+
 ### Leaving a session
 
 Three ways out, and they do different things.

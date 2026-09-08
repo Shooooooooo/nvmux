@@ -263,6 +263,18 @@ mod tests {
         }
     }
 
+    /// `scripts/spawn.sh` writes the nested-launch marker and `crate::nested`
+    /// reads it. Two files, one name: renaming it on either side would stop
+    /// every nested launch being caught, and nothing else would fail.
+    #[test]
+    fn the_spawn_script_exports_the_marker_the_guard_reads() {
+        let export = format!("export {}=", crate::nested::MARKER);
+        assert!(
+            SPAWN_SCRIPT.contains(&export),
+            "spawn.sh must `{export}...` for the guard to find anything"
+        );
+    }
+
     /// The guard the prelude sets is what stops a prepended script sourcing it
     /// a second time — and what lets the same file still run from a checkout.
     #[test]
