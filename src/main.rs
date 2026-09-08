@@ -150,7 +150,19 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     // Held rather than killed, so a number that names nothing
                     // puts the user straight back where they were.
                     attached = held;
-                    let sessions = transport.list_sessions()?;
+                    // A failed listing goes back to the picker like a failed
+                    // attach, and for a second reason besides: this is the one
+                    // path from one relay straight into another, with no
+                    // `ui::Screen` in between to leave the alternate screen —
+                    // see the held branch of `pty::relay`. An error propagating
+                    // from here would be printed where nobody could read it.
+                    let sessions = match transport.list_sessions() {
+                        Ok(sessions) => sessions,
+                        Err(e) => {
+                            message = Some(describe_listing_failure(&e));
+                            break;
+                        }
+                    };
                     highest = ui::highest_num(&sessions);
                     match sessions.into_iter().find(|s| s.state.num == num) {
                         // The loop above retires the old client and attaches the
@@ -183,8 +195,26 @@ fn describe_attach_failure(location: &transport::Location, e: &nvmux::NvmuxError
             format!("that session is no longer running on {host}")
         }
         nvmux::NvmuxError::Rpc(rpc) if rpc.is_definitely_dead() => "that session is gone".into(),
-        other => other.to_string().lines().collect::<Vec<_>>().join(" — "),
+        other => one_line(other),
     }
+}
+
+/// Explain why a switch could not find out what to switch to.
+///
+/// Unlike an attach this is a listing, and the errors it raises already name the
+/// host where they have one (`ssh: the connection to myhost died`). What none of
+/// them says is what nvmux was attempting — a script's refusal is rendered bare,
+/// on purpose — and on the hint row there is nothing else to say it.
+fn describe_listing_failure(e: &nvmux::NvmuxError) -> String {
+    format!("could not list sessions: {}", one_line(e))
+}
+
+/// Collapse an error to something that fits on one line.
+///
+/// The hint row it lands on is exactly one row; a multi-line error would be
+/// truncated at the first newline and lose the part that explains itself.
+fn one_line(e: &nvmux::NvmuxError) -> String {
+    e.to_string().lines().collect::<Vec<_>>().join(" — ")
 }
 
 /// Returns the crate's own error type rather than `anyhow`, so the caller can
@@ -200,7 +230,7 @@ fn new_attachment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nvmux::error::RpcError;
+    use nvmux::error::{RpcError, SessionError, SshError};
     use nvmux::NvmuxError;
     use transport::Location;
 
@@ -236,13 +266,52 @@ mod tests {
     /// The hint row is one row: any other error is flattened onto it.
     #[test]
     fn other_errors_are_flattened_to_one_line() {
-        let e = NvmuxError::Session(nvmux::error::SessionError::NotReady {
+        let e = NvmuxError::Session(SessionError::NotReady {
             name: "x".into(),
             timeout: std::time::Duration::from_secs(1),
             log: "x.log".into(),
             log_tail: "line one\nline two".into(),
         });
         let msg = describe_attach_failure(&Location::Local, &e);
+        assert!(!msg.contains('\n'), "{msg:?}");
+        assert!(
+            msg.contains("line one") && msg.contains("line two"),
+            "{msg:?}"
+        );
+    }
+
+    /// A listing failure reaches the picker with no other context around it, so
+    /// the message has to say what was being attempted as well as what failed.
+    #[test]
+    fn a_failed_listing_says_what_nvmux_was_doing() {
+        let e = NvmuxError::Ssh(SshError::MasterDied("myhost".into()));
+        let msg = describe_listing_failure(&e);
+        assert!(msg.contains("list sessions"), "{msg}");
+        assert!(msg.contains("myhost"), "{msg}");
+    }
+
+    /// A script's refusal is rendered bare on purpose, so on its own it reads as
+    /// a statement about nothing in particular. The prefix is what anchors it.
+    #[test]
+    fn a_bare_script_failure_is_not_left_to_speak_for_itself() {
+        let e = NvmuxError::Session(SessionError::ScriptFailed(
+            "runtime directory /tmp/nvmux-1000 is not owned by us".into(),
+        ));
+        let msg = describe_listing_failure(&e);
+        assert!(msg.contains("could not list sessions"), "{msg}");
+        assert!(msg.contains("is not owned by us"), "{msg}");
+    }
+
+    /// The hint row is one row here too.
+    #[test]
+    fn a_multi_line_listing_failure_is_flattened_to_one_line() {
+        let e = NvmuxError::Session(SessionError::NotReady {
+            name: "x".into(),
+            timeout: std::time::Duration::from_secs(1),
+            log: "x.log".into(),
+            log_tail: "line one\nline two".into(),
+        });
+        let msg = describe_listing_failure(&e);
         assert!(!msg.contains('\n'), "{msg:?}");
         assert!(
             msg.contains("line one") && msg.contains("line two"),
