@@ -87,10 +87,14 @@ fn establish_settings() -> Result<config::Settings> {
 fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     let mut attached: Option<pty::Attachment> = None;
     let mut message: Option<String> = None;
+    // The session the last trip through the picker led to, so the next one
+    // opens with the cursor on it rather than on the first row.
+    let mut focus: Option<String> = None;
 
     loop {
         // `<prefix> c` moves this to the session it just created.
-        let (mut current, mut highest) = match ui::run(transport, message.take())? {
+        let (mut current, mut highest) = match ui::run(transport, message.take(), focus.as_deref())?
+        {
             ui::Outcome::Quit => {
                 // A client held across `<prefix> Space` is retired explicitly; its
                 // `Drop` would do the same, this just says so.
@@ -180,6 +184,11 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 }
             }
         }
+
+        // Every way out of the relay loop leads back to the picker, and every
+        // one of them was showing `current` — including the failures, where the
+        // cursor lands on the row the message on the hint line is about.
+        focus = Some(current.id.clone());
     }
     Ok(())
 }
