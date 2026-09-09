@@ -5,13 +5,13 @@ them, detach, and come back later — with the editor running on a remote host
 while every keystroke and every pixel of rendering happens on your own terminal.
 
 ```
-                                                              
-                      1  api-server                           
-                    ▸ 2  dotfiles                             
-                      3  scratch                              
-                      4  notes                                
-                                                              
-   ↑↓ move  ⏎ attach  c new  r rename  x kill  / filter  q quit
+                                                                       
+                              1  api-server                            
+                            ▸ 2  dotfiles                              
+                              3  scratch                               
+                              4  notes                                 
+                                                                       
+ ↑↓ move  ⏎ attach  c new  r rename  x kill  ␣ order  / filter  q quit 
 ```
 
 nvmux is a **thin multiplexer**: it does not render Neovim's UI. Neovim already

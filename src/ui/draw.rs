@@ -52,10 +52,24 @@ const MAX_LIST_WIDTH: u16 = 48;
 /// Columns between the number and the name.
 const NUM_GAP: &str = "  ";
 
-/// Sixty columns exactly: the widest row that still fits a small terminal
-/// without truncation. `?` is not listed — its screen shows the `<prefix>`
-/// keys, and the README carries the picker's own.
-const HINTS: &str = "↑↓ move  ⏎ attach  c new  r rename  x kill  / filter  q quit";
+/// Sixty-nine columns, and it used to be sixty exactly — the widest row that
+/// still fits a small terminal without truncation. `␣ order` is what that budget
+/// was spent on: reordering is the one picker command nobody would find unaided,
+/// since it leaves no trace on screen until it is used and `?` shows the
+/// `<prefix>` keys rather than these.
+///
+/// So below sixty-nine columns this row now truncates from the right, where
+/// before it never did. `q quit` is therefore the first entry to go, which is
+/// the order to want: quitting is the one thing every user of a full-screen
+/// program tries unprompted, and `Ctrl-c` quits as well.
+///
+/// The space bar is `␣` rather than the `Space` that [`crate::keys::key_label`]
+/// spells it everywhere else, because this row is uniformly lowercase (`esc`,
+/// never `Esc`) and a glyph is neither — the same reason `⏎` and `↑↓` stand for
+/// Enter and the arrows here and are written out in the README.
+///
+/// `?` is still not listed, for the reason above.
+const HINTS: &str = "↑↓ move  ⏎ attach  c new  r rename  x kill  ␣ order  / filter  q quit";
 const EMPTY: &str = "no sessions — press c to create one";
 
 /// What the hint row says while a session is in flight. Undimmed, like the
@@ -292,9 +306,12 @@ mod tests {
 
     #[test]
     fn the_whole_screen_is_a_centred_list_and_one_hint_line() {
+        // Seventy columns because `HINTS` is sixty-nine: narrower and the row
+        // is truncated, and "the hints are on the last row" would be asserted
+        // against whatever happened to survive.
         let lines = render(
             &app(&["api-server", "dotfiles", "scratch", "notes"]),
-            62,
+            70,
             11,
         );
 
@@ -487,7 +504,7 @@ mod tests {
 
     #[test]
     fn the_empty_state_is_one_dimmed_line_with_hints_still_below() {
-        let lines = render(&app(&[]), 60, 9);
+        let lines = render(&app(&[]), 70, 9);
         let content: Vec<&String> = lines[..8].iter().filter(|l| !l.is_empty()).collect();
         assert_eq!(content.len(), 1, "expected one line, got {content:?}");
         assert!(content[0].contains("no sessions"), "got {:?}", content[0]);
@@ -508,7 +525,10 @@ mod tests {
             for c in typed.chars() {
                 a.on_key(super::super::app::Key::Char(c));
             }
-            let lines = render(&a, 60, 8);
+            // Wide enough for the whole of `HINTS`: at sixty columns `quit` no
+            // longer fits either, and the assertion below would pass whether or
+            // not the prompt had replaced anything.
+            let lines = render(&a, 70, 8);
             assert!(
                 lines[7].contains(expected),
                 "prompt should be on the bottom row: {:?}",
@@ -533,6 +553,36 @@ mod tests {
         assert!(lines[5].contains("/dot▋"), "got {:?}", lines[5]);
         assert!(lines[..5].iter().any(|l| l.contains("dotfiles")));
         assert!(!lines[..5].iter().any(|l| l.contains("api-server")));
+    }
+
+    /// `HINTS` no longer fits every terminal, so which entry goes first is a
+    /// decision rather than an accident. `q quit` is the one to lose: it is what
+    /// every user of a full-screen program tries unprompted, and `Ctrl-c` quits
+    /// as well — whereas `␣ order` is the entry the row grew to carry.
+    #[test]
+    fn the_hint_row_gives_up_quit_first_when_it_does_not_fit() {
+        let lines = render(&app(&["one"]), 62, 6);
+        let row = &lines[5];
+        assert!(row.contains("order"), "the new entry was cut: {row:?}");
+        assert!(row.contains("attach"), "{row:?}");
+        assert!(
+            !row.contains("quit"),
+            "something else was cut first: {row:?}"
+        );
+        assert!(row.width() <= 62, "the row overflowed: {row:?}");
+    }
+
+    /// The README's picture of the picker reproduces this row byte for byte, and
+    /// nothing else ties the two together — so without this the art quietly
+    /// describes a program that no longer exists. `keys.rs` pins its own README
+    /// table the same way.
+    #[test]
+    fn the_readme_shows_the_hint_row_the_picker_actually_prints() {
+        assert!(
+            include_str!("../../README.md").contains(HINTS),
+            "the README's picker art is stale — it should carry this row \
+             verbatim:\n{HINTS}"
+        );
     }
 
     #[test]
