@@ -92,7 +92,7 @@ once you have more than nine sessions.
 
 ### While attached
 
-`<prefix>` is `Ctrl-t` unless you change it in the [config](#configuration).
+`<prefix>` is `Ctrl-Space` unless you change it in the [config](#configuration).
 
 | Keys | Action |
 |---|---|
@@ -111,7 +111,7 @@ for nvmux. Digits are the exception: `<prefix> 1` is a command now, so
 The prefix is recognised however your terminal spells it. Neovim asks every
 terminal for the kitty keyboard protocol (or xterm's `modifyOtherKeys`), and
 one that has it — Windows Terminal from 1.25, kitty, Ghostty, WezTerm, xterm —
-then sends `Ctrl-t` as an escape sequence rather than a control byte. nvmux
+then sends `Ctrl-Space` as an escape sequence rather than the byte `NUL`. nvmux
 treats both as the prefix, and a literal `<prefix> <prefix>` replays whichever
 the terminal sent.
 
@@ -152,8 +152,8 @@ Every value below is its default:
 
 ```toml
 [keys]
-prefix     = "Ctrl-t"   # a Ctrl-<letter> chord
-timeout_ms = 500        # how long a lone prefix or half-typed number waits
+prefix     = "Ctrl-Space"   # Ctrl-Space, or a Ctrl-<letter> chord
+timeout_ms = 500            # how long a lone prefix or half-typed number waits
 ```
 
 ## Logs

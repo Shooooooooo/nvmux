@@ -3,11 +3,11 @@
 //! Shown by the binary only when no config file exists, `$NVMUX_CONFIG` is
 //! unset, and the terminal is interactive (see the guards there). It takes the
 //! whole screen the way [`crate::ui::help`] does, but reads keys *raw*: the user
-//! presses the actual `Ctrl-<letter>` chord they want, so this is the one place
-//! that must **not** go through `translate`, which discards every chord it does
-//! not bind (see the note in [`crate::ui`]). The pressed chord is validated
-//! by the same [`crate::keys::parse_prefix`] the config file uses, so the rules
-//! and the messages are shared.
+//! presses the actual `Ctrl` chord they want, so this is the one place that
+//! must **not** go through `translate`, which discards every chord it does not
+//! bind (see the note in [`crate::ui`]). The pressed chord is validated by the
+//! same [`crate::keys::parse_prefix`] the config file uses, so the rules and
+//! the messages are shared.
 //!
 //! `Enter` keeps whatever is shown (the default until a key is pressed); `Esc`
 //! and `Ctrl-c` skip. `Ctrl-c` is reserved for skipping, as everywhere else in
@@ -50,15 +50,23 @@ enum Step {
 
 /// Decide what a keypress means. `ctrl` is whether the CONTROL modifier was held
 /// on the raw event.
+///
+/// The chord is spelled the way the config file spells it and handed to the one
+/// validator, so the screen and the file agree — which is why the space bar is
+/// named rather than sent as itself: `Ctrl-Space` is the default prefix, and
+/// `"Ctrl- "` is not a spelling [`crate::keys::parse_prefix`] knows.
 fn interpret(code: KeyCode, ctrl: bool) -> Step {
     match code {
         KeyCode::Enter => Step::Confirm,
         KeyCode::Esc => Step::Skip,
         // Reserved for skipping, like Ctrl-c on every other nvmux screen.
         KeyCode::Char('c') if ctrl => Step::Skip,
-        // The one validator, so the screen and the config file agree.
         KeyCode::Char(c) if ctrl => {
-            match crate::keys::parse_prefix(&format!("Ctrl-{}", c.to_ascii_lowercase())) {
+            let key = match c {
+                ' ' => "Space".to_string(),
+                c => c.to_ascii_lowercase().to_string(),
+            };
+            match crate::keys::parse_prefix(&format!("Ctrl-{key}")) {
                 Ok(byte) => Step::Choose(byte),
                 Err(message) => Step::Reject(message),
             }
@@ -114,7 +122,7 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Outcome> {
             }
             Step::Skip => return Ok(Outcome::Skipped),
             Step::Ignore => {
-                state.message = Some("press a Ctrl-<letter> key, e.g. Ctrl-a".to_string())
+                state.message = Some("press a Ctrl key, e.g. Ctrl-a or Ctrl-Space".to_string())
             }
         }
     }
@@ -178,6 +186,19 @@ mod tests {
         assert_eq!(interpret(KeyCode::Char('t'), true), Step::Choose(0x14));
         // Case-insensitive, like the config parser.
         assert_eq!(interpret(KeyCode::Char('A'), true), Step::Choose(0x01));
+    }
+
+    /// The default prefix has to be choosable by pressing it. crossterm reports
+    /// the chord as a space with CONTROL — from the byte `NUL` or from either
+    /// keyboard protocol — and it must not reach the parser as `"Ctrl- "`.
+    #[test]
+    fn ctrl_space_is_chosen_as_the_default_prefix() {
+        assert_eq!(
+            interpret(KeyCode::Char(' '), true),
+            Step::Choose(crate::keys::PREFIX)
+        );
+        // Without Ctrl it is just the space bar, and nothing to choose.
+        assert_eq!(interpret(KeyCode::Char(' '), false), Step::Ignore);
     }
 
     #[test]

@@ -17,13 +17,13 @@
 //!
 //! # How the prefix is spelled
 //!
-//! The prefix is a `Ctrl-<letter>` chord, and a terminal has three ways of
-//! spelling one: the control byte, or — once Neovim's TUI has asked it for the
-//! kitty keyboard protocol or xterm's `modifyOtherKeys`, which it does at every
-//! start — an escape sequence. [`crate::keyseq`] knows the spellings; the
-//! machine treats all of them as the same key, so the prefix works in Windows
-//! Terminal, kitty, Ghostty, WezTerm or xterm exactly as it does in a terminal
-//! that speaks neither protocol.
+//! The prefix is a `Ctrl` chord, and a terminal has three ways of spelling one:
+//! the control byte — `NUL` for the default `Ctrl-Space` — or, once Neovim's
+//! TUI has asked it for the kitty keyboard protocol or xterm's
+//! `modifyOtherKeys`, which it does at every start, an escape sequence.
+//! [`crate::keyseq`] knows the spellings; the machine treats all of them as the
+//! same key, so the prefix works in Windows Terminal, kitty, Ghostty, WezTerm or
+//! xterm exactly as it does in a terminal that speaks neither protocol.
 //!
 //! Two consequences. A sequence can be cut in two by the end of a `read()`, so
 //! an unfinished one is held back until the rest arrives, or until the caller's
@@ -58,12 +58,20 @@
 
 use crate::keyseq::{self, Sequence, ESC};
 
-/// `Ctrl-t`.
-pub const PREFIX: u8 = 0x14;
+/// The byte `Ctrl-Space` sends: `NUL`. The one chord in the prefix's class
+/// that is not a `Ctrl-<letter>`, so it is also the one whose label and key
+/// code do not follow from a letter — see [`prefix_label`] and [`prefix_code`].
+const CTRL_SPACE: u8 = 0x00;
+
+/// What `Ctrl-Space` is called, in a config file and on the help screen.
+const SPACE_NAME: &str = "Space";
+
+/// `Ctrl-Space`.
+pub const PREFIX: u8 = CTRL_SPACE;
 
 /// How the prefix is spelled for people: on the help screen, in the README and
 /// in `--help`. A test ties it to [`PREFIX`].
-pub const PREFIX_LABEL: &str = "Ctrl-t";
+pub const PREFIX_LABEL: &str = "Ctrl-Space";
 
 /// Something the proxy must do instead of forwarding bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,32 +141,40 @@ pub fn command(byte: u8) -> Option<Action> {
     BINDINGS.iter().find(|b| b.key == byte).map(|b| b.action)
 }
 
-/// Parse a human prefix spelling like `"C-t"` or `"Ctrl-a"` into its control
-/// byte. Case-insensitive on both halves; the inverse of [`prefix_label`].
+/// Parse a human prefix spelling like `"C-Space"`, `"C-t"` or `"Ctrl-a"` into
+/// its control byte. Case-insensitive on both halves; the inverse of
+/// [`prefix_label`].
 ///
-/// Only a `Ctrl-<letter>` chord is accepted, because the prefix has to be a
-/// single byte the terminal delivers in raw mode, and a control chord is the one
-/// class that is both typable and does not collide with ordinary text. A few of
-/// those bytes are refused: they already mean something else on the wire and
-/// would never reach the machine as a prefix (or, for `C-m`, would clash with
-/// the number-entry terminator `ENTER`).
+/// Only a `Ctrl-<letter>` chord or `Ctrl-Space` is accepted, because the prefix
+/// has to be a single byte the terminal delivers in raw mode, and a control
+/// chord is the one class that is both typable and does not collide with
+/// ordinary text. `Ctrl-Space` is that class's one non-letter member, and it
+/// sends `NUL` — a byte no ordinary text contains. A few of the letters are
+/// refused: they already mean something else on the wire and would never reach
+/// the machine as a prefix (or, for `C-m`, would clash with the number-entry
+/// terminator `ENTER`).
 ///
 /// `C-c` and `C-z` are *allowed*, as in tmux: choosing them is the user's
 /// explicit, reversible decision, and it only means that byte stops reaching
 /// Neovim — the machine is unaffected.
 pub fn parse_prefix(s: &str) -> Result<u8, String> {
     let lower = s.trim().to_ascii_lowercase();
-    let letter = lower
+    let key = lower
         .strip_prefix("ctrl-")
         .or_else(|| lower.strip_prefix("c-"))
-        .ok_or_else(|| format!("prefix {s:?} must look like \"C-t\" or \"Ctrl-a\""))?;
-    let &[b] = letter.as_bytes() else {
+        .ok_or_else(|| format!("prefix {s:?} must look like \"C-Space\" or \"Ctrl-a\""))?;
+    if key.eq_ignore_ascii_case(SPACE_NAME) {
+        return Ok(CTRL_SPACE);
+    }
+    let &[b] = key.as_bytes() else {
         return Err(format!(
-            "prefix {s:?} must be Ctrl and a single ASCII letter, like \"C-t\""
+            "prefix {s:?} must be Ctrl and a single ASCII letter, like \"C-t\", or \"C-Space\""
         ));
     };
     if !b.is_ascii_lowercase() {
-        return Err(format!("prefix {s:?} must be Ctrl and an ASCII letter a-z"));
+        return Err(format!(
+            "prefix {s:?} must be Ctrl and an ASCII letter a-z, or Space"
+        ));
     }
     // 'a' (0x61) -> 0x01 ... 't' (0x74) -> 0x14 ... 'z' (0x7a) -> 0x1a.
     let byte = b & 0x1f;
@@ -171,18 +187,28 @@ pub fn parse_prefix(s: &str) -> Result<u8, String> {
     }
 }
 
-/// Spell a prefix byte the way people read it: `0x14` -> `"Ctrl-t"`. The inverse
-/// of [`parse_prefix`], used by the runtime help screen and messages so a
-/// remapped prefix is described as the key the user actually set.
+/// Spell a prefix byte the way people read it: `0x00` -> `"Ctrl-Space"`,
+/// `0x14` -> `"Ctrl-t"`. The inverse of [`parse_prefix`], used by the runtime
+/// help screen and messages so a remapped prefix is described as the key the
+/// user actually set.
 pub fn prefix_label(byte: u8) -> String {
-    format!("Ctrl-{}", prefix_letter(byte) as char)
+    if byte == CTRL_SPACE {
+        format!("Ctrl-{SPACE_NAME}")
+    } else {
+        format!("Ctrl-{}", prefix_code(byte) as char)
+    }
 }
 
-/// The letter of a `Ctrl-<letter>` control byte: its low five bits set back
-/// into ASCII, so `0x14` is `'t'`. This is the key code a terminal reports the
-/// chord under, see [`crate::keyseq`].
-pub fn prefix_letter(byte: u8) -> u8 {
-    byte | 0x60
+/// The key code a terminal reports the prefix chord under, see
+/// [`crate::keyseq`]: the letter of a `Ctrl-<letter>` control byte, its low
+/// five bits set back into ASCII, so `0x14` is `'t'`; and for `Ctrl-Space`,
+/// whose byte is `NUL`, the space bar's own code.
+pub fn prefix_code(byte: u8) -> u8 {
+    if byte == CTRL_SPACE {
+        b' '
+    } else {
+        byte | 0x60
+    }
 }
 
 /// Carriage return, which is what Enter is in raw mode. Ends a number early
@@ -249,7 +275,7 @@ impl Default for Prefix {
 }
 
 impl Prefix {
-    /// A machine armed by the standard [`PREFIX`] (`Ctrl-t`).
+    /// A machine armed by the standard [`PREFIX`] (`Ctrl-Space`).
     pub fn new(highest: u32) -> Self {
         Self::with_prefix(highest, PREFIX)
     }
@@ -314,7 +340,7 @@ impl Prefix {
     fn byte(&mut self, b: u8, steps: &mut Vec<Step>, pending: &mut Vec<u8>) {
         if !self.seq.is_empty() {
             self.seq.push(b);
-            match keyseq::classify(&self.seq, prefix_letter(self.prefix)) {
+            match keyseq::classify(&self.seq, prefix_code(self.prefix)) {
                 Sequence::Partial => {}
                 Sequence::Prefix => {
                     let bytes = std::mem::take(&mut self.seq);
@@ -328,7 +354,7 @@ impl Prefix {
                     // sees the two in order for a literal and neither for a
                     // command, never a release before its press.
                     let mut report = std::mem::take(&mut self.seq);
-                    if self.state == State::Armed && code == u32::from(prefix_letter(self.prefix)) {
+                    if self.state == State::Armed && code == u32::from(prefix_code(self.prefix)) {
                         self.armed.append(&mut report);
                     } else {
                         pending.append(&mut report);
@@ -634,7 +660,7 @@ mod tests {
     #[test]
     fn state_survives_a_chunk_boundary() {
         let mut p = Prefix::new(0);
-        let first = p.feed(b"ab\x14");
+        let first = p.feed(b"ab\x00");
         assert_eq!(forwarded(&first), b"ab");
         assert!(p.is_armed());
 
@@ -682,21 +708,21 @@ mod tests {
     // spells it — see `keyseq` for the grammar; these pin the machine's use
     // of it.
 
-    /// `Ctrl-t` as the kitty keyboard protocol and xterm's `modifyOtherKeys`
-    /// send it. This is the bug that motivated `keyseq`: Windows Terminal 1.25
-    /// speaks the first, Neovim asks for it, and `<prefix> d` reached the
-    /// editor as a tag-stack pop and a pending delete.
-    const KITTY: &[u8] = b"\x1b[116;5u";
-    const XTERM: &[u8] = b"\x1b[27;5;116~";
+    /// `Ctrl-Space` as the kitty keyboard protocol and xterm's
+    /// `modifyOtherKeys` send it. This is the bug that motivated `keyseq`:
+    /// Windows Terminal 1.25 speaks the first, Neovim asks for it, and
+    /// `<prefix> d` reached the editor as the prefix and a pending delete.
+    const KITTY: &[u8] = b"\x1b[32;5u";
+    const XTERM: &[u8] = b"\x1b[27;5;32~";
 
     #[test]
     fn an_encoded_prefix_arms_and_its_command_acts() {
         for spelling in [
             KITTY,
             XTERM,
-            b"\x1b[116;5:1u",
-            b"\x1b[116;5:2u",
-            b"\x1b[116;133u",
+            b"\x1b[32;5:1u",
+            b"\x1b[32;5:2u",
+            b"\x1b[32;133u",
         ] {
             let mut p = Prefix::new(0);
             let steps = p.feed(spelling);
@@ -818,8 +844,8 @@ mod tests {
     #[test]
     fn a_byte_prefix_then_a_sequence_is_handled_like_any_other_key() {
         let mut p = Prefix::new(0);
-        let steps = p.feed(b"\x14\x1b[A");
-        assert_eq!(forwarded(&steps), b"\x14\x1b[A");
+        let steps = p.feed(b"\x00\x1b[A");
+        assert_eq!(forwarded(&steps), b"\x00\x1b[A");
         assert!(!p.is_armed());
 
         let mut p = Prefix::new(0);
@@ -834,7 +860,7 @@ mod tests {
     /// they go through, and the machine stays where it was.
     #[test]
     fn key_release_reports_are_transparent_in_every_state() {
-        let release_prefix = b"\x1b[116;5:3u";
+        let release_prefix = b"\x1b[32;5:3u";
         let release_d = b"\x1b[100;1:3u";
         let release_one = b"\x1b[49;1:3u";
 
@@ -879,7 +905,7 @@ mod tests {
         assert_eq!(actions(&p.feed(b"d")), vec![Action::Detach]);
 
         let mut p = Prefix::new(12);
-        p.feed(b"\x141");
+        p.feed(&[PREFIX, b'1']);
         assert_eq!(forwarded(&p.feed(b"\x1b[?0u")), b"\x1b[?0u");
         assert_eq!(p.wait(), Some(Wait::Command), "still a number");
         assert_eq!(actions(&p.feed(b"2")), vec![Action::Switch(12)]);
@@ -890,7 +916,7 @@ mod tests {
     /// prefix or from the wait passing.
     #[test]
     fn a_literal_prefix_replays_its_press_and_release_in_order() {
-        let release = b"\x1b[116;1:3u";
+        let release = b"\x1b[32;1:3u";
         let mut both = KITTY.to_vec();
         both.extend_from_slice(release);
 
@@ -912,7 +938,7 @@ mod tests {
     /// byte does in a terminal without the protocol.
     #[test]
     fn a_held_down_encoded_prefix_alternates_like_a_held_down_byte() {
-        let repeat = b"\x1b[116;5:2u";
+        let repeat = b"\x1b[32;5:2u";
         let mut p = Prefix::new(0);
         let mut input = KITTY.to_vec();
         input.extend_from_slice(repeat);
@@ -936,7 +962,7 @@ mod tests {
     #[test]
     fn an_encoded_prefix_after_a_number_ends_it_and_arms_again() {
         let mut p = Prefix::new(12);
-        p.feed(b"\x14" as &[u8]);
+        p.feed(&[PREFIX]);
         p.feed(b"1");
         let steps = p.feed(KITTY);
         assert_eq!(actions(&steps), vec![Action::Switch(1)]);
@@ -970,7 +996,7 @@ mod tests {
 
         // Number: the digits were the whole command, and the sequence follows.
         let mut p = Prefix::new(12);
-        p.feed(b"\x141");
+        p.feed(&[PREFIX, b'1']);
         p.feed(b"\x1b");
         assert_eq!(p.wait(), Some(Wait::Sequence));
         let steps = p.timeout();
@@ -998,21 +1024,21 @@ mod tests {
 
         // A broken sequence, then the prefix byte: the prefix still arms.
         let mut p = Prefix::new(0);
-        let steps = p.feed(b"\x1b[11\x14");
+        let steps = p.feed(b"\x1b[11\x00");
         assert_eq!(forwarded(&steps), b"\x1b[11");
         assert!(p.is_armed());
         assert_eq!(actions(&p.feed(b"d")), vec![Action::Detach]);
     }
 
-    /// Only the exact chord: `Ctrl-Shift-t`, `Ctrl-d`, and a key with an
+    /// Only the exact chord: `Ctrl-Shift-Space`, `Ctrl-d`, and a key with an
     /// extra modifier all go through untouched.
     #[test]
     fn a_different_chord_in_the_same_spelling_is_not_the_prefix() {
         for seq in [
-            &b"\x1b[116;6u"[..],
+            &b"\x1b[32;6u"[..],
             b"\x1b[100;5u",
-            b"\x1b[116;7u",
-            b"\x1b[27;6;116~",
+            b"\x1b[32;7u",
+            b"\x1b[27;6;32~",
         ] {
             let mut p = Prefix::new(0);
             let mut input = seq.to_vec();
@@ -1039,19 +1065,23 @@ mod tests {
         assert!(!p.is_armed());
     }
 
-    /// The letter a terminal reports the chord under is the one the label
-    /// shows, for every prefix the parser accepts.
+    /// The key a terminal reports the chord under is the one the label names,
+    /// for every prefix the parser accepts.
     #[test]
-    fn the_prefix_letter_is_the_label_s_letter() {
+    fn the_prefix_code_is_the_key_the_label_names() {
         for byte in 1u8..=26 {
             let label = prefix_label(byte);
             assert_eq!(
                 label.as_bytes().last().copied(),
-                Some(prefix_letter(byte)),
+                Some(prefix_code(byte)),
                 "for {label}"
             );
-            assert!(prefix_letter(byte).is_ascii_lowercase());
+            assert!(prefix_code(byte).is_ascii_lowercase());
         }
+        // The one prefix that is not a letter: the label spells the key out,
+        // and the terminal reports it under the space bar's own code.
+        assert_eq!(prefix_label(CTRL_SPACE), "Ctrl-Space");
+        assert_eq!(prefix_code(CTRL_SPACE), b' ');
     }
 
     /// A pasted burst never arms the machine on its way through, and never
@@ -1073,7 +1103,7 @@ mod tests {
     #[test]
     fn a_prefix_inside_a_larger_chunk_splits_correctly() {
         let mut p = Prefix::new(0);
-        let steps = p.feed(b"before\x14tafter");
+        let steps = p.feed(b"before\x00tafter");
         assert_eq!(forwarded(&steps), b"beforeafter");
         assert_eq!(actions(&steps), vec![Action::Picker]);
         // Ordering matters: the bytes before the command must be written first.
@@ -1087,7 +1117,7 @@ mod tests {
         let mut p = Prefix::new(0);
         // Literal bytes on purpose: this is what pins each letter to its
         // action, independently of what `BINDINGS` says.
-        let steps = p.feed(b"\x14t\x14d\x14c\x14?");
+        let steps = p.feed(b"\x00t\x00d\x00c\x00?");
         assert_eq!(
             actions(&steps),
             vec![Action::Picker, Action::Detach, Action::Create, Action::Help]
@@ -1397,17 +1427,18 @@ mod tests {
     }
 
     /// The label is what the help screen and the README print; the byte is
-    /// what the machine matches. Derive one from the other so they cannot
-    /// disagree.
+    /// what the machine matches. Tie the two together so they cannot disagree,
+    /// in both directions.
     #[test]
     fn the_prefix_label_names_the_prefix_byte() {
-        let letter = PREFIX_LABEL.chars().last().expect("a label");
-        assert_eq!(letter as u8 & 0x1f, PREFIX);
+        assert_eq!(prefix_label(PREFIX), PREFIX_LABEL);
+        assert_eq!(parse_prefix(PREFIX_LABEL), Ok(PREFIX));
     }
 
     #[test]
     fn a_prefix_string_parses_to_its_control_byte() {
-        assert_eq!(parse_prefix("C-t"), Ok(PREFIX));
+        assert_eq!(parse_prefix("C-Space"), Ok(PREFIX));
+        assert_eq!(parse_prefix("C-t"), Ok(0x14));
         assert_eq!(parse_prefix("Ctrl-a"), Ok(0x01));
         assert_eq!(parse_prefix("C-z"), Ok(0x1a));
     }
@@ -1415,9 +1446,10 @@ mod tests {
     /// Both halves are case-insensitive, and surrounding space is ignored.
     #[test]
     fn a_prefix_string_is_case_insensitive() {
-        assert_eq!(parse_prefix("ctrl-T"), Ok(PREFIX));
+        assert_eq!(parse_prefix("ctrl-T"), Ok(0x14));
         assert_eq!(parse_prefix("c-A"), Ok(0x01));
         assert_eq!(parse_prefix("  Ctrl-B  "), Ok(0x02));
+        assert_eq!(parse_prefix("  c-sPaCe  "), Ok(CTRL_SPACE));
     }
 
     /// The label and the parser are inverses for every control byte, so what the
@@ -1433,20 +1465,24 @@ mod tests {
             let label = prefix_label(byte);
             assert_eq!(parse_prefix(&label), Ok(byte), "for {label}");
         }
-        assert_eq!(parse_prefix(&prefix_label(PREFIX)), Ok(PREFIX));
+        // And the one label that is a name rather than a letter.
+        assert_eq!(parse_prefix(&prefix_label(CTRL_SPACE)), Ok(CTRL_SPACE));
     }
 
     /// Generalises [`the_prefix_label_names_the_prefix_byte`] beyond the default.
     #[test]
     fn the_prefix_label_names_any_control_byte() {
         assert_eq!(prefix_label(0x01), "Ctrl-a");
-        assert_eq!(prefix_label(PREFIX), "Ctrl-t");
+        assert_eq!(prefix_label(0x14), "Ctrl-t");
         assert_eq!(prefix_label(0x1a), "Ctrl-z");
+        assert_eq!(prefix_label(CTRL_SPACE), "Ctrl-Space");
     }
 
     #[test]
     fn a_malformed_prefix_is_rejected() {
-        for s in ["t", "C-1", "C-", "", "hyper-t", "C-ab", "C-é"] {
+        for s in [
+            "t", "C-1", "C-", "", "hyper-t", "C-ab", "C-é", "Space", "C-spa",
+        ] {
             assert!(parse_prefix(s).is_err(), "{s:?} should be rejected");
         }
     }

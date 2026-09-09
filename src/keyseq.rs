@@ -1,8 +1,8 @@
 //! How a terminal spells a key as an escape sequence, and whether that key is
 //! the prefix.
 //!
-//! In its plainest form a `Ctrl-<letter>` chord is one control byte, and for a
-//! long time that was the only spelling [`crate::keys`] had to know. But
+//! In its plainest form a `Ctrl` chord is one control byte, and for a long
+//! time that was the only spelling [`crate::keys`] had to know. But
 //! Neovim's TUI asks every terminal for a richer keyboard encoding when it
 //! starts: the kitty keyboard protocol where the terminal answers its
 //! `CSI ? u` query (`CSI > 1 u`; `CSI > 3 u` from Neovim 0.12, which asks for
@@ -13,16 +13,19 @@
 //! [`crate::pty`]), the terminal's spelling is what arrives on nvmux's stdin:
 //!
 //! ```text
-//! Ctrl-t, legacy:            0x14
-//! Ctrl-t, kitty protocol:    ESC [ 116 ; 5 u        116 = 't', 5 = 1 + ctrl
-//! Ctrl-t, modifyOtherKeys:   ESC [ 27 ; 5 ; 116 ~
+//! Ctrl-Space, legacy:          0x00
+//! Ctrl-Space, kitty protocol:  ESC [ 32 ; 5 u       32 = ' ', 5 = 1 + ctrl
+//! Ctrl-Space, modifyOtherKeys: ESC [ 27 ; 5 ; 32 ~
 //! ```
+//!
+//! A remapped `Ctrl-<letter>` prefix is spelled the same three ways under its
+//! own code: `Ctrl-t` is `0x14`, `ESC [ 116 ; 5 u`, `ESC [ 27 ; 5 ; 116 ~`.
 //!
 //! Windows Terminal (from 1.25), kitty, Ghostty, foot, Alacritty, iTerm2 and
 //! Rio all speak the first; xterm, and WezTerm unless `enable_kitty_keyboard`
 //! is set, the second; and a terminal that speaks neither keeps sending the
 //! byte. The prefix machine has to accept all three, or `<prefix> d` reaches
-//! the editor as `Ctrl-t d` — a tag-stack pop and a pending delete.
+//! the editor as the prefix chord and a pending delete.
 //!
 //! [`classify`] is deliberately narrow. It decides whether a sequence *is the
 //! prefix* (pressed or held down); whether it reports a key being *released* —
@@ -42,14 +45,15 @@
 //! # The kitty form
 //!
 //! `CSI key[:shifted[:base]] ; modifiers[:event] [; text] u`. `key` is the
-//! unshifted codepoint, always lowercase for a letter; `modifiers` is one plus
-//! a bitmask (shift 1, alt 2, ctrl 4, super 8, hyper 16, meta 32, caps lock 64,
-//! num lock 128); `event` is 1 for a press, 2 for a repeat and 3 for a release,
+//! unshifted codepoint — 32 for the space bar, and always lowercase for a
+//! letter; `modifiers` is one plus a bitmask (shift 1, alt 2, ctrl 4, super 8,
+//! hyper 16, meta 32, caps lock 64, num lock 128); `event` is 1 for a press,
+//! 2 for a repeat and 3 for a release,
 //! and is omitted for a press. The protocol withholds the lock bits only from
 //! keys that produce text, and a chord produces none, so a terminal with Caps
 //! Lock on may well report them; they carry no meaning for the chord, so they
 //! are ignored rather than refused. Any other modifier bit makes it a
-//! different chord: `Ctrl-Shift-t` is not the prefix.
+//! different chord: `Ctrl-Shift-Space` is not the prefix.
 //!
 //! # The xterm form
 //!
@@ -89,14 +93,15 @@ pub enum Sequence {
     Other(usize),
 }
 
-/// Classify `seq`, which must start with [`ESC`], as a spelling of
-/// `Ctrl-<letter>`.
+/// Classify `seq`, which must start with [`ESC`], as a spelling of the `Ctrl`
+/// chord a terminal reports under the key code `code` — see
+/// [`crate::keys::prefix_code`].
 ///
 /// Meant to be called again after every byte: the answer for a prefix of a
 /// sequence is [`Sequence::Partial`] until the byte that decides it arrives, and
 /// a decision never changes with more bytes because the decided sequence is
 /// consumed.
-pub fn classify(seq: &[u8], letter: u8) -> Sequence {
+pub fn classify(seq: &[u8], code: u8) -> Sequence {
     debug_assert_eq!(seq.first(), Some(&ESC), "not an escape sequence");
     match seq.get(1) {
         None => return Sequence::Partial,
@@ -117,7 +122,7 @@ pub fn classify(seq: &[u8], letter: u8) -> Sequence {
             // whatever it says.
             0x40..=0x7e if reply => return Sequence::Reply,
             0x40..=0x7e => {
-                return complete(&seq[2..i], b, letter).unwrap_or(Sequence::Other(i + 1));
+                return complete(&seq[2..i], b, code).unwrap_or(Sequence::Other(i + 1));
             }
             b'?' | b'>' | b'=' if i == 2 => {}
             b'0'..=b'9' => {}
@@ -144,19 +149,19 @@ pub fn classify(seq: &[u8], letter: u8) -> Sequence {
 
 /// Decide a complete sequence: `params` is everything between `ESC [` and the
 /// final byte. `None` means it is some other key or none.
-fn complete(params: &[u8], fin: u8, letter: u8) -> Option<Sequence> {
+fn complete(params: &[u8], fin: u8, code: u8) -> Option<Sequence> {
     match fin {
-        b'u' => kitty(params, letter),
-        b'~' => xterm(params, letter),
+        b'u' => kitty(params, code),
+        b'~' => xterm(params, code),
         _ => None,
     }
 }
 
 /// `key[:shifted[:base]] ; modifiers[:event] [; text]`.
-fn kitty(params: &[u8], letter: u8) -> Option<Sequence> {
+fn kitty(params: &[u8], code: u8) -> Option<Sequence> {
     let mut fields = params.split(|&b| b == b';');
     let key = fields.next()?;
-    let code = number(subfield(key, 0)?)?;
+    let reported = number(subfield(key, 0)?)?;
     let (modifiers, event) = match fields.next() {
         None => (1, 1),
         Some(f) => {
@@ -169,23 +174,23 @@ fn kitty(params: &[u8], letter: u8) -> Option<Sequence> {
         }
     };
     match event {
-        3 => Some(Sequence::Release(code)),
-        1 | 2 => (code == u32::from(letter) && ctrl_only(modifiers)).then_some(Sequence::Prefix),
+        3 => Some(Sequence::Release(reported)),
+        1 | 2 => (reported == u32::from(code) && ctrl_only(modifiers)).then_some(Sequence::Prefix),
         _ => None,
     }
 }
 
 /// `27 ; modifiers ; key`.
-fn xterm(params: &[u8], letter: u8) -> Option<Sequence> {
+fn xterm(params: &[u8], code: u8) -> Option<Sequence> {
     let mut fields = params
         .split(|&b| b == b';')
         .map(|f| subfield(f, 0).and_then(number));
-    let (Some(Some(27)), Some(Some(modifiers)), Some(Some(code))) =
+    let (Some(Some(27)), Some(Some(modifiers)), Some(Some(reported))) =
         (fields.next(), fields.next(), fields.next())
     else {
         return None;
     };
-    (code == u32::from(letter) && ctrl_only(modifiers)).then_some(Sequence::Prefix)
+    (reported == u32::from(code) && ctrl_only(modifiers)).then_some(Sequence::Prefix)
 }
 
 /// The `n`th colon-separated part of a field.
@@ -213,6 +218,8 @@ fn ctrl_only(modifiers: u32) -> bool {
 mod tests {
     use super::*;
 
+    /// The default prefix's key code; `T` is a remapped `Ctrl-t`'s.
+    const SPACE: u8 = b' ';
     const T: u8 = b't';
 
     /// Every proper prefix of a spelling is undecided, and the whole of it is
@@ -221,23 +228,23 @@ mod tests {
     #[test]
     fn a_spelling_is_partial_until_its_last_byte() {
         for whole in [
-            &b"\x1b[116;5u"[..],
-            b"\x1b[116;5:1u",
-            b"\x1b[116;5:2u",
-            b"\x1b[116:84;5u",
-            b"\x1b[116;133u",
-            b"\x1b[27;5;116~",
+            &b"\x1b[32;5u"[..],
+            b"\x1b[32;5:1u",
+            b"\x1b[32;5:2u",
+            b"\x1b[32:32;5u",
+            b"\x1b[32;133u",
+            b"\x1b[27;5;32~",
         ] {
             for n in 1..whole.len() {
                 assert_eq!(
-                    classify(&whole[..n], T),
+                    classify(&whole[..n], SPACE),
                     Sequence::Partial,
                     "{:?} cut after {n} bytes",
                     String::from_utf8_lossy(whole)
                 );
             }
             assert_eq!(
-                classify(whole, T),
+                classify(whole, SPACE),
                 Sequence::Prefix,
                 "{:?}",
                 String::from_utf8_lossy(whole)
@@ -251,18 +258,18 @@ mod tests {
     fn only_ctrl_and_the_lock_keys_spell_the_prefix() {
         for m in 1u32..=256 {
             let bits = m - 1;
-            let seq = format!("\x1b[116;{m}u");
-            let got = classify(seq.as_bytes(), T);
+            let seq = format!("\x1b[32;{m}u");
+            let got = classify(seq.as_bytes(), SPACE);
             if bits & !(CAPS_LOCK | NUM_LOCK) == CTRL {
                 assert_eq!(got, Sequence::Prefix, "modifiers {m}");
             } else {
                 assert_eq!(got, Sequence::Other(seq.len()), "modifiers {m}");
             }
         }
-        assert_eq!(classify(b"\x1b[116u", T), Sequence::Other(6));
-        // Ctrl-Shift-t, Ctrl-Alt-t, Ctrl-Super-t: not the prefix.
-        for seq in [&b"\x1b[116;6u"[..], b"\x1b[116;7u", b"\x1b[116;13u"] {
-            assert_eq!(classify(seq, T), Sequence::Other(seq.len()));
+        assert_eq!(classify(b"\x1b[32u", SPACE), Sequence::Other(5));
+        // Ctrl-Shift-Space, Ctrl-Alt-Space, Ctrl-Super-Space: not the prefix.
+        for seq in [&b"\x1b[32;6u"[..], b"\x1b[32;7u", b"\x1b[32;13u"] {
+            assert_eq!(classify(seq, SPACE), Sequence::Other(seq.len()));
         }
     }
 
@@ -270,43 +277,45 @@ mod tests {
     /// key's, an unmodified letter's — and it says which key.
     #[test]
     fn a_release_event_names_its_key() {
-        assert_eq!(classify(b"\x1b[116;5:3u", T), Sequence::Release(116));
-        assert_eq!(classify(b"\x1b[116;1:3u", T), Sequence::Release(116));
-        assert_eq!(classify(b"\x1b[100;1:3u", T), Sequence::Release(100));
-        assert_eq!(classify(b"\x1b[27;1:3u", T), Sequence::Release(27));
+        assert_eq!(classify(b"\x1b[32;5:3u", SPACE), Sequence::Release(32));
+        assert_eq!(classify(b"\x1b[32;1:3u", SPACE), Sequence::Release(32));
+        assert_eq!(classify(b"\x1b[100;1:3u", SPACE), Sequence::Release(100));
+        assert_eq!(classify(b"\x1b[27;1:3u", SPACE), Sequence::Release(27));
         // An event type that is neither press, repeat nor release is nothing.
-        assert_eq!(classify(b"\x1b[116;5:4u", T), Sequence::Other(10));
+        assert_eq!(classify(b"\x1b[32;5:4u", SPACE), Sequence::Other(9));
     }
 
     #[test]
-    fn another_letter_is_another_key() {
-        // Ctrl-d, Ctrl-T (uppercase code: not what the protocol sends), Escape,
-        // Ctrl-Escape.
+    fn another_key_is_another_key() {
+        // Ctrl-d, Ctrl-t, Escape, Ctrl-Escape.
         for seq in [
             &b"\x1b[100;5u"[..],
-            b"\x1b[84;5u",
+            b"\x1b[116;5u",
             b"\x1b[27u",
             b"\x1b[27;5u",
         ] {
-            assert_eq!(classify(seq, T), Sequence::Other(seq.len()), "{seq:?}");
+            assert_eq!(classify(seq, SPACE), Sequence::Other(seq.len()), "{seq:?}");
         }
-        // And the prefix letter follows the machine's prefix, not the default.
-        assert_eq!(classify(b"\x1b[97;5u", b'a'), Sequence::Prefix);
-        assert_eq!(classify(b"\x1b[27;5;97~", b'a'), Sequence::Prefix);
-        assert_eq!(classify(b"\x1b[116;5u", b'a'), Sequence::Other(8));
+        // And the code follows the machine's prefix, not the default: for a
+        // remapped Ctrl-t the letter's code is the prefix and Space's is not.
+        assert_eq!(classify(b"\x1b[116;5u", T), Sequence::Prefix);
+        assert_eq!(classify(b"\x1b[27;5;116~", T), Sequence::Prefix);
+        assert_eq!(classify(b"\x1b[32;5u", T), Sequence::Other(7));
+        // An uppercase code is not what the protocol sends for the chord.
+        assert_eq!(classify(b"\x1b[84;5u", T), Sequence::Other(7));
     }
 
     #[test]
     fn the_xterm_form_needs_all_three_numbers_in_order() {
-        assert_eq!(classify(b"\x1b[27;5;116~", T), Sequence::Prefix);
+        assert_eq!(classify(b"\x1b[27;5;32~", SPACE), Sequence::Prefix);
         for seq in [
             &b"\x1b[27;5~"[..],
-            b"\x1b[116;5;27~",
-            b"\x1b[27;6;116~",
-            b"\x1b[28;5;116~",
-            b"\x1b[27;5;116u",
+            b"\x1b[32;5;27~",
+            b"\x1b[27;6;32~",
+            b"\x1b[28;5;32~",
+            b"\x1b[27;5;32u",
         ] {
-            assert_eq!(classify(seq, T), Sequence::Other(seq.len()), "{seq:?}");
+            assert_eq!(classify(seq, SPACE), Sequence::Other(seq.len()), "{seq:?}");
         }
     }
 
@@ -316,9 +325,9 @@ mod tests {
     /// go through byte by byte — and that byte is handled on its own.
     #[test]
     fn an_escape_followed_by_anything_but_a_bracket_stands_alone() {
-        assert_eq!(classify(b"\x1b", T), Sequence::Partial);
-        for b in [b'x', b':', 0x14, ESC, b'O', 0x7f, 0xc3] {
-            assert_eq!(classify(&[ESC, b], T), Sequence::Other(1), "{b:#04x}");
+        assert_eq!(classify(b"\x1b", SPACE), Sequence::Partial);
+        for b in [b'x', b':', 0x00, ESC, b'O', 0x7f, 0xc3] {
+            assert_eq!(classify(&[ESC, b], SPACE), Sequence::Other(1), "{b:#04x}");
         }
     }
 
@@ -329,18 +338,18 @@ mod tests {
     #[test]
     fn other_sequences_are_decided_as_soon_as_they_can_be() {
         for (seq, unit) in [
-            (&b"\x1b[A"[..], 3),       // up
-            (b"\x1b[1;5A", 6),         // ctrl-up
-            (b"\x1b[200~", 6),         // bracketed paste begins
-            (b"\x1b[15~", 5),          // F5
-            (b"\x1b[I", 3),            // focus in
-            (b"\x1b[27;5;116;9u", 13), // nonsense
-            (b"\x1b[<35;10;20M", 3),   // a mouse report
-            (b"\x1b[;", 3),            // a separator first
-            (b"\x1b[1 q", 4),          // an intermediate byte
+            (&b"\x1b[A"[..], 3),      // up
+            (b"\x1b[1;5A", 6),        // ctrl-up
+            (b"\x1b[200~", 6),        // bracketed paste begins
+            (b"\x1b[15~", 5),         // F5
+            (b"\x1b[I", 3),           // focus in
+            (b"\x1b[27;5;32;9u", 12), // nonsense
+            (b"\x1b[<35;10;20M", 3),  // a mouse report
+            (b"\x1b[;", 3),           // a separator first
+            (b"\x1b[1 q", 4),         // an intermediate byte
         ] {
             assert_eq!(
-                classify(seq, T),
+                classify(seq, SPACE),
                 Sequence::Other(unit),
                 "{:?}",
                 String::from_utf8_lossy(seq)
@@ -363,39 +372,39 @@ mod tests {
         ] {
             for n in 1..reply.len() {
                 assert_eq!(
-                    classify(&reply[..n], T),
+                    classify(&reply[..n], SPACE),
                     Sequence::Partial,
                     "{:?} cut after {n} bytes",
                     String::from_utf8_lossy(reply)
                 );
             }
             assert_eq!(
-                classify(reply, T),
+                classify(reply, SPACE),
                 Sequence::Reply,
                 "{:?}",
                 String::from_utf8_lossy(reply)
             );
         }
         // A control byte still ends a reply early, like any sequence.
-        assert_eq!(classify(b"\x1b[?6\x14", T), Sequence::Other(4));
+        assert_eq!(classify(b"\x1b[?6\x14", SPACE), Sequence::Other(4));
     }
 
     /// A control byte in the middle ends the sequence before itself: the
     /// prefix byte typed after a broken sequence must still be the prefix.
     #[test]
     fn a_byte_that_cannot_belong_ends_the_sequence_before_itself() {
-        assert_eq!(classify(b"\x1b[11\x14", T), Sequence::Other(4));
-        assert_eq!(classify(b"\x1b[116;5\x1b", T), Sequence::Other(7));
-        assert_eq!(classify(b"\x1b[\x7f", T), Sequence::Other(2));
+        assert_eq!(classify(b"\x1b[11\x00", SPACE), Sequence::Other(4));
+        assert_eq!(classify(b"\x1b[32;5\x1b", SPACE), Sequence::Other(6));
+        assert_eq!(classify(b"\x1b[\x7f", SPACE), Sequence::Other(2));
     }
 
     #[test]
     fn a_sequence_that_never_ends_is_given_up_on() {
         let mut seq = b"\x1b[".to_vec();
         seq.extend(std::iter::repeat_n(b'1', MAX_LEN));
-        assert_eq!(classify(&seq, T), Sequence::Other(seq.len()));
+        assert_eq!(classify(&seq, SPACE), Sequence::Other(seq.len()));
         // But it takes the whole allowance to get there.
-        assert_eq!(classify(&seq[..MAX_LEN - 1], T), Sequence::Partial);
+        assert_eq!(classify(&seq[..MAX_LEN - 1], SPACE), Sequence::Partial);
     }
 
     #[test]
@@ -405,6 +414,6 @@ mod tests {
         assert_eq!(number(b"1a"), None);
         assert_eq!(number(b"4294967295"), None, "ten digits is too many");
         // An absurd modifier number must not panic or wrap into Ctrl.
-        assert_eq!(classify(b"\x1b[116;999999999u", T), Sequence::Other(16));
+        assert_eq!(classify(b"\x1b[32;999999999u", SPACE), Sequence::Other(15));
     }
 }

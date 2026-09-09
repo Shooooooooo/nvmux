@@ -4,11 +4,11 @@
 //! The client asks the terminal for the kitty keyboard protocol when it
 //! starts, or failing that for xterm's `modifyOtherKeys`, and nvmux relays
 //! that negotiation untouched — so a terminal that grants the first (Windows
-//! Terminal from 1.25, kitty, Ghostty, ...) then sends `Ctrl-t` as
-//! `CSI 116 ; 5 u`, and one that grants the second (xterm, WezTerm) as
-//! `CSI 27 ; 5 ; 116 ~`, instead of the byte 0x14. Until `keyseq`, either
-//! went straight through to the editor: `<prefix> d` was a tag-stack pop
-//! (`E73: Tag stack empty`) and a pending delete, and nobody could detach.
+//! Terminal from 1.25, kitty, Ghostty, ...) then sends `Ctrl-Space` as
+//! `CSI 32 ; 5 u`, and one that grants the second (xterm, WezTerm) as
+//! `CSI 27 ; 5 ; 32 ~`, instead of the byte `NUL`. Until `keyseq`, either
+//! went straight through to the editor: `<prefix> d` reached it as the chord
+//! and a pending delete, and nobody could detach.
 //!
 //! The relay talks to its terminal on fds 0 and 1, so it has to run in a
 //! process of its own. Each test spawns this very test binary again, on a pty,
@@ -311,12 +311,15 @@ fn detaches_with(tag: &str, protocol: Protocol, prefix: &[u8]) {
     if flags & 2 != 0 {
         // A client that asked for release reports gets one for the prefix,
         // which must not count as its command.
-        term.type_bytes(b"\x1b[116;5:3u");
+        term.type_bytes(b"\x1b[32;5:3u");
     }
     // A human gap, well past the sequence wait.
     term.pump_until(Duration::from_millis(150), |_| false);
     term.type_bytes(b"d");
 
+    // The detach is the whole signal, and a leak has nowhere else to show: a
+    // prefix that reached the editor would leave `d` pending there as an
+    // operator — silent on screen — and no detach would ever happen.
     let code = term.exit_code(Duration::from_secs(10));
     assert_eq!(
         code,
@@ -324,36 +327,31 @@ fn detaches_with(tag: &str, protocol: Protocol, prefix: &[u8]) {
         "expected a detach (exit 0) after {prefix:?} d; the child {}; output since the push: {}",
         match code {
             Some(c) => format!("exited with {c}"),
-            None => "is still attached".to_string(),
+            None => "is still attached (the prefix reached the editor?)".to_string(),
         },
-        term.since(mark)
-    );
-    assert!(
-        find(&term.output[mark..], b"E73").is_none(),
-        "the prefix reached the editor as Ctrl-t: {}",
         term.since(mark)
     );
 }
 
 /// The bug as reported: Windows Terminal 1.25 with the kitty keyboard
-/// protocol, where the prefix arrives as `CSI 116 ; 5 u`.
+/// protocol, where the prefix arrives as `CSI 32 ; 5 u`.
 #[test]
 fn a_kitty_encoded_prefix_detaches_through_a_real_client() {
-    detaches_with("kitty", Protocol::Kitty, b"\x1b[116;5u");
+    detaches_with("kitty", Protocol::Kitty, b"\x1b[32;5u");
 }
 
 /// A terminal without the kitty protocol, where the client falls back to
-/// `modifyOtherKeys` and the prefix arrives as `CSI 27 ; 5 ; 116 ~`.
+/// `modifyOtherKeys` and the prefix arrives as `CSI 27 ; 5 ; 32 ~`.
 #[test]
 fn an_xterm_encoded_prefix_detaches_through_a_real_client() {
-    detaches_with("xterm", Protocol::Xterm, b"\x1b[27;5;116~");
+    detaches_with("xterm", Protocol::Xterm, b"\x1b[27;5;32~");
 }
 
 /// And the control byte still works, in a terminal that speaks the protocol
 /// too: Neovim accepts both, and so must the machine.
 #[test]
 fn the_control_byte_still_detaches_through_a_real_client() {
-    detaches_with("byte", Protocol::Kitty, b"\x14");
+    detaches_with("byte", Protocol::Kitty, b"\x00");
 }
 
 #[test]

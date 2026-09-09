@@ -49,8 +49,8 @@ pub struct Settings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KeySettings {
-    /// The prefix, written as `"C-t"` / `"Ctrl-a"` in the file and parsed to its
-    /// control byte by [`crate::keys::parse_prefix`].
+    /// The prefix, written as `"C-Space"` / `"Ctrl-a"` in the file and parsed
+    /// to its control byte by [`crate::keys::parse_prefix`].
     #[serde(deserialize_with = "de_prefix")]
     pub prefix: u8,
     /// How long to wait for the second byte of a prefix sequence before
@@ -322,7 +322,7 @@ mod tests {
     fn a_full_document_at_the_defaults_round_trips() {
         let doc = "\
             [keys]\n\
-            prefix = \"Ctrl-t\"\n\
+            prefix = \"Ctrl-Space\"\n\
             timeout_ms = 500\n";
         let s: Settings = toml::from_str(doc).expect("valid");
         assert_eq!(s, Settings::default());
