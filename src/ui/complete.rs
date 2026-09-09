@@ -48,6 +48,9 @@
 
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
+
 use crate::dirs::{self, DirSource};
 use crate::transport::protocol::Listing;
 
@@ -61,7 +64,6 @@ const CACHE: usize = 16;
 struct Request {
     seq: u64,
     dir: String,
-    prefix: String,
 }
 
 /// What the host said, and which question it answers.
@@ -69,15 +71,14 @@ struct Request {
 struct Reply {
     seq: u64,
     dir: String,
-    prefix: String,
     listing: Listing,
 }
 
-/// A listing kept for later.
+/// A listing kept for later. Keyed by directory alone: it holds every child,
+/// so it answers every query anyone could type inside that directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Cached {
     dir: String,
-    prefix: String,
     listing: Listing,
 }
 
@@ -85,7 +86,6 @@ struct Cached {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Shown {
     dir: String,
-    prefix: String,
     names: Vec<String>,
     truncated: bool,
 }
@@ -104,6 +104,10 @@ pub struct Completer {
     awaiting: bool,
     cache: Vec<Cached>,
     shown: Shown,
+    /// Scratch buffers for the scorer, reused across queries. `Matcher` is
+    /// stateful for that reason and scoring takes `&mut`, which is why ranking
+    /// lives here beside the names rather than in the prompt.
+    matcher: Matcher,
 }
 
 impl Completer {
@@ -129,28 +133,31 @@ impl Completer {
             awaiting: false,
             cache: Vec::new(),
             shown: Shown::default(),
+            matcher: Matcher::new(Config::DEFAULT),
         }
     }
 
     /// What has been typed has changed. Never blocks, never does I/O.
     pub fn ask(&mut self, input: &str) {
-        let Some((dir, prefix)) = dirs::split(input) else {
+        let Some((dir, _query)) = dirs::split(input) else {
             // Nothing to list: no `/` in what has been typed, and a working
             // directory is absolute, so there is no relative one to resolve.
             self.shown = Shown::default();
             self.awaiting = false;
             return;
         };
-        if self.shown.dir == dir && self.shown.prefix == prefix && !self.awaiting {
+        // Only the directory is a question for the host. Everything after the
+        // last `/` is a query, and this side answers those from what it already
+        // holds — which is why typing inside a directory costs nothing at all.
+        if self.shown.dir == dir && !self.awaiting {
             return;
         }
-        if self.take_from_cache(dir, prefix) {
+        if self.take_from_cache(dir) {
             return;
         }
 
         self.shown = Shown {
             dir: dir.to_string(),
-            prefix: prefix.to_string(),
             ..Shown::default()
         };
         self.seq += 1;
@@ -158,7 +165,6 @@ impl Completer {
         let request = Request {
             seq: self.seq,
             dir: dir.to_string(),
-            prefix: prefix.to_string(),
         };
         // An unbounded channel: this cannot block, and a closed one means the
         // worker is gone, which costs completions and nothing else.
@@ -176,25 +182,21 @@ impl Completer {
             match self.rx.try_recv() {
                 Ok(reply) => {
                     let current = reply.seq == self.seq;
-                    self.remember(
-                        reply.dir.clone(),
-                        reply.prefix.clone(),
-                        reply.listing.clone(),
-                    );
+                    self.remember(reply.dir.clone(), reply.listing.clone());
                     if current {
                         self.shown = Shown {
                             dir: reply.dir,
-                            prefix: reply.prefix,
                             names: reply.listing.names,
                             truncated: reply.listing.truncated,
                         };
                         self.awaiting = false;
                         changed = true;
                     } else if self.awaiting {
-                        // An answer to an older question can still settle the
-                        // current one: `/home/you` listed for `p` answers `pr`.
-                        let (dir, prefix) = (self.shown.dir.clone(), self.shown.prefix.clone());
-                        changed |= self.take_from_cache(&dir, &prefix);
+                        // An answer to a question that has moved on can still
+                        // settle the current one, when both are about the same
+                        // directory — which is now the only thing a question is.
+                        let dir = self.shown.dir.clone();
+                        changed |= self.take_from_cache(&dir);
                     }
                 }
                 Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => return changed,
@@ -208,34 +210,62 @@ impl Completer {
         self.awaiting
     }
 
-    /// The dim text after the cursor: as much of the completion as is certain.
-    ///
-    /// The longest prefix every candidate shares, minus what has been typed. A
-    /// single candidate is certain to its end, and gains a `/` so the next
-    /// component can be typed without reaching for one.
-    pub fn ghost(&self) -> String {
-        let names = &self.shown.names;
-        let Some(first) = names.first() else {
-            return String::new();
-        };
-        let shared = if names.len() == 1 {
-            format!("{first}/")
-        } else {
-            common_prefix(names)
-        };
-        // `strip_prefix` rather than slicing at the prefix's length: every
-        // candidate *should* start with what was typed, because the host
-        // matched them that way, but this reads a remote host's output and a
-        // wrong answer must be nothing to show rather than a panic mid-glyph.
-        shared
-            .strip_prefix(self.shown.prefix.as_str())
-            .unwrap_or("")
-            .to_string()
+    /// Every child of the directory being completed, unranked and unfiltered,
+    /// in the host's order. What [`Completer::matches`] scores.
+    pub fn names(&self) -> &[String] {
+        &self.shown.names
     }
 
-    /// The alternatives, for the row under the fields.
-    pub fn candidates(&self) -> &[String] {
-        &self.shown.names
+    /// The directories `query` could mean, best first.
+    ///
+    /// Fuzzy, so `nvmx` finds `nvmux-rs` — the whole reason the host stopped
+    /// filtering. An empty query is every child in the host's order, which is
+    /// what a freshly typed `/` shows.
+    ///
+    /// Dotted directories are hidden until the query asks for one. That rule
+    /// used to come free from the shell's globbing, where `*` skips a leading
+    /// dot and `.*` does not; it is spelled out here because there is no glob
+    /// left to carry it, and it is worth keeping because a home directory is
+    /// mostly dotted and none of it is what anyone is looking for.
+    ///
+    /// Ties are broken by the host's order rather than left to the sort, so a
+    /// list of equally good matches does not shuffle as the query grows.
+    pub fn matches(&mut self, query: &str) -> Vec<String> {
+        let wants_dotted = query.contains('.');
+        let visible = |name: &String| wants_dotted || !name.starts_with('.');
+
+        if query.is_empty() {
+            return self
+                .shown
+                .names
+                .iter()
+                .filter(|n| visible(n))
+                .cloned()
+                .collect();
+        }
+
+        let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+        let mut buf = Vec::new();
+        let mut scored: Vec<(u32, usize, &String)> = self
+            .shown
+            .names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| visible(name))
+            .filter_map(|(i, name)| {
+                let score = pattern.score(Utf32Str::new(name, &mut buf), &mut self.matcher)?;
+                Some((score, i, name))
+            })
+            .collect();
+
+        // Best score first; the host's order within a score. Sorted explicitly
+        // rather than through `Pattern::match_list`, whose tie order is its own
+        // business and not something a screen should inherit.
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored
+            .into_iter()
+            .map(|(_, _, name)| name.clone())
+            .collect()
     }
 
     /// The host stopped short of listing everything. Shown, so a row that is
@@ -245,93 +275,31 @@ impl Completer {
     }
 
     /// Answer from a listing already in hand, if one covers this question.
-    fn take_from_cache(&mut self, dir: &str, prefix: &str) -> bool {
-        let Some(listing) = from_cache(&self.cache, dir, prefix) else {
+    fn take_from_cache(&mut self, dir: &str) -> bool {
+        let Some(cached) = self.cache.iter().find(|c| c.dir == dir) else {
             return false;
         };
         self.shown = Shown {
             dir: dir.to_string(),
-            prefix: prefix.to_string(),
-            names: listing.names,
-            truncated: listing.truncated,
+            names: cached.listing.names.clone(),
+            truncated: cached.listing.truncated,
         };
         self.awaiting = false;
         true
     }
 
-    fn remember(&mut self, dir: String, prefix: String, listing: Listing) {
-        self.cache.retain(|c| c.dir != dir || c.prefix != prefix);
-        self.cache.insert(
-            0,
-            Cached {
-                dir,
-                prefix,
-                listing,
-            },
-        );
+    fn remember(&mut self, dir: String, listing: Listing) {
+        self.cache.retain(|c| c.dir != dir);
+        self.cache.insert(0, Cached { dir, listing });
         self.cache.truncate(CACHE);
     }
-}
-
-/// The longest listing already held that answers this question.
-///
-/// A listing of `dir` for some prefix of `prefix` contains every name `prefix`
-/// could match, so filtering it is a complete answer — unless it was truncated,
-/// in which case it is only part of one and what it left out may be exactly what
-/// was wanted. A truncated listing therefore answers its own prefix and nothing
-/// longer.
-///
-/// Longest first, so the least filtering is done and, more to the point, so a
-/// truncated exact match is preferred to a shorter complete one that would have
-/// to be narrowed.
-fn from_cache(cache: &[Cached], dir: &str, prefix: &str) -> Option<Listing> {
-    cache
-        .iter()
-        .filter(|c| c.dir == dir && prefix.starts_with(&c.prefix))
-        .filter(|c| !c.listing.truncated || c.prefix == prefix)
-        .max_by_key(|c| c.prefix.len())
-        .map(|c| Listing {
-            names: c
-                .listing
-                .names
-                .iter()
-                .filter(|n| n.starts_with(prefix))
-                .cloned()
-                .collect(),
-            truncated: c.listing.truncated,
-        })
-}
-
-/// The longest prefix every name shares, cut to a character boundary so it can
-/// never split a multi-byte glyph.
-fn common_prefix(names: &[String]) -> String {
-    let Some(first) = names.first() else {
-        return String::new();
-    };
-    let mut end = first.len();
-    for name in &names[1..] {
-        end = end.min(
-            first
-                .bytes()
-                .zip(name.bytes())
-                .take_while(|(a, b)| a == b)
-                .count(),
-        );
-    }
-    // Bytes agreeing is not characters agreeing: `é` and `ê` share their first
-    // byte. Backing off to a boundary before slicing is what keeps this from
-    // panicking on a directory named in anything but ASCII.
-    while end > 0 && !first.is_char_boundary(end) {
-        end -= 1;
-    }
-    first[..end].to_string()
 }
 
 /// The worker: one listing at a time, always the newest question asked.
 fn serve(source: &DirSource, rx: &Receiver<Request>, tx: &Sender<Reply>) {
     while let Ok(first) = rx.recv() {
         let request = newest(first, rx);
-        let listing = match source.children(&request.dir, &request.prefix) {
+        let listing = match source.children(&request.dir) {
             Ok(listing) => listing,
             // A host that cannot answer costs completions, not a session. The
             // empty listing is also the honest answer for the commonest cause:
@@ -344,7 +312,6 @@ fn serve(source: &DirSource, rx: &Receiver<Request>, tx: &Sender<Reply>) {
         let reply = Reply {
             seq: request.seq,
             dir: request.dir,
-            prefix: request.prefix,
             listing,
         };
         // A closed channel means the prompt is gone; so is the reason to keep
@@ -376,16 +343,9 @@ mod tests {
         }
     }
 
-    fn truncated(names: &[&str]) -> Listing {
-        Listing {
-            truncated: true,
-            ..listing(names)
-        }
-    }
-
-    /// A completer with no worker behind it: the test *is* the worker, so it
-    /// can answer late, out of order, or not at all, and can see exactly which
-    /// questions were asked. No thread, no filesystem, no ssh.
+    /// A completer with no worker behind it: the test *is* the worker, so it can
+    /// answer late, out of order, or not at all, and can see exactly which
+    /// directories were asked about. No thread, no filesystem, no ssh.
     fn detached() -> (Completer, Receiver<Request>, Sender<Reply>) {
         let (ask_tx, ask_rx) = mpsc::channel();
         let (reply_tx, reply_rx) = mpsc::channel();
@@ -396,48 +356,50 @@ mod tests {
             awaiting: false,
             cache: Vec::new(),
             shown: Shown::default(),
+            matcher: Matcher::new(Config::DEFAULT),
         };
         (c, ask_rx, reply_tx)
     }
 
-    fn asked(rx: &Receiver<Request>) -> Vec<(String, String)> {
+    fn asked(rx: &Receiver<Request>) -> Vec<String> {
         let mut out = Vec::new();
         while let Ok(r) = rx.try_recv() {
-            out.push((r.dir, r.prefix));
+            out.push(r.dir);
         }
         out
     }
 
     /// Answer the question currently being asked, as a worker would.
-    ///
-    /// Taken from the completer rather than from the channel, so a test may
-    /// inspect what was asked first without that counting as having served it.
     fn answer(c: &mut Completer, rx: &Receiver<Request>, tx: &Sender<Reply>, l: Listing) {
         while rx.try_recv().is_ok() {}
         assert!(c.waiting(), "nothing was outstanding to answer");
         tx.send(Reply {
             seq: c.seq,
             dir: c.shown.dir.clone(),
-            prefix: c.shown.prefix.clone(),
             listing: l,
         })
         .expect("send");
         c.poll();
     }
 
-    /// The whole point: a keystroke does no I/O and does not wait. All `ask`
-    /// may do is look in memory and post a question.
+    /// A completer already holding one directory's children, which is the state
+    /// every matching test below wants.
+    fn holding(dir: &str, names: &[&str]) -> Completer {
+        let (mut c, ask_rx, reply_tx) = detached();
+        c.ask(&format!("{dir}/"));
+        answer(&mut c, &ask_rx, &reply_tx, listing(names));
+        c
+    }
+
+    /// The whole point: a keystroke does no I/O and does not wait. All `ask` may
+    /// do is look in memory and post a question.
     #[test]
     fn asking_posts_a_question_and_shows_nothing_until_it_is_answered() {
         let (mut c, ask_rx, reply_tx) = detached();
         c.ask("/home/you/pro");
-        assert_eq!(
-            asked(&ask_rx),
-            [("/home/you".to_string(), "pro".to_string())]
-        );
+        assert_eq!(asked(&ask_rx), ["/home/you"]);
         assert!(c.waiting(), "an answer is outstanding");
-        assert!(c.candidates().is_empty(), "nothing to show yet");
-        assert_eq!(c.ghost(), "");
+        assert!(c.names().is_empty(), "nothing to show yet");
 
         answer(
             &mut c,
@@ -446,15 +408,16 @@ mod tests {
             listing(&["projects", "prototypes"]),
         );
         assert!(!c.waiting());
-        assert_eq!(c.candidates(), ["projects", "prototypes"]);
+        assert_eq!(c.names(), ["projects", "prototypes"]);
     }
 
-    /// Typing forward inside one directory must not ask again: that is what
-    /// makes a path cost about one round trip per `/` instead of one per key.
+    /// The question is the *directory*, and nothing else. Everything after the
+    /// last `/` is a query this side answers from what it already holds, which
+    /// is what makes typing inside a directory free.
     #[test]
-    fn a_cached_listing_answers_a_longer_prefix_without_asking_again() {
+    fn typing_within_one_directory_never_asks_again() {
         let (mut c, ask_rx, reply_tx) = detached();
-        c.ask("/home/you/p");
+        c.ask("/home/you/");
         answer(
             &mut c,
             &ask_rx,
@@ -462,19 +425,17 @@ mod tests {
             listing(&["projects", "prototypes", "public"]),
         );
 
-        c.ask("/home/you/pro");
-        assert!(asked(&ask_rx).is_empty(), "the answer was already in hand");
-        assert!(!c.waiting());
-        assert_eq!(c.candidates(), ["projects", "prototypes"]);
-
-        c.ask("/home/you/proj");
-        assert!(asked(&ask_rx).is_empty());
-        assert_eq!(c.candidates(), ["projects"]);
-
-        // Backspacing back inside the component is free too.
-        c.ask("/home/you/pro");
-        assert!(asked(&ask_rx).is_empty());
-        assert_eq!(c.candidates(), ["projects", "prototypes"]);
+        for typed in [
+            "/home/you/p",
+            "/home/you/pro",
+            "/home/you/xyz",
+            "/home/you/",
+        ] {
+            c.ask(typed);
+            assert!(asked(&ask_rx).is_empty(), "{typed:?} asked the host again");
+            assert!(!c.waiting());
+            assert_eq!(c.names().len(), 3, "the whole directory is still in hand");
+        }
     }
 
     /// A new directory is a new question, however much is cached about the old
@@ -486,44 +447,20 @@ mod tests {
         answer(&mut c, &ask_rx, &reply_tx, listing(&["projects"]));
 
         c.ask("/home/you/projects/s");
-        assert_eq!(
-            asked(&ask_rx),
-            [("/home/you/projects".to_string(), "s".to_string())]
-        );
+        assert_eq!(asked(&ask_rx), ["/home/you/projects"]);
         assert!(
-            c.candidates().is_empty(),
-            "the old directory's names are not this one's"
-        );
-    }
-
-    /// A truncated listing is part of an answer. Showing it is honest; nar-
-    /// rowing it is not, because what the host left out may be exactly what the
-    /// longer prefix wanted — which would show "no such directory" for one that
-    /// is there.
-    #[test]
-    fn a_truncated_listing_is_shown_but_never_narrowed() {
-        let (mut c, ask_rx, reply_tx) = detached();
-        c.ask("/big/a");
-        answer(&mut c, &ask_rx, &reply_tx, truncated(&["a1", "a2"]));
-        assert_eq!(c.candidates(), ["a1", "a2"]);
-        assert!(c.truncated(), "the row must say it is partial");
-
-        c.ask("/big/a1");
-        assert_eq!(
-            asked(&ask_rx),
-            [("/big".to_string(), "a1".to_string())],
-            "a longer prefix must be asked afresh, not filtered out of a partial answer"
+            c.names().is_empty(),
+            "the old directory's children are not this one's"
         );
     }
 
     /// The classic autocomplete bug: a slow answer landing after a fast one and
-    /// replacing the right candidates with stale ones. It gets *likelier* the
-    /// better the cache works, since a cached answer is instant.
+    /// replacing the right list with a stale one.
     #[test]
     fn a_stale_answer_never_overwrites_a_fresh_one() {
         let (mut c, ask_rx, reply_tx) = detached();
-        c.ask("/a/x");
-        c.ask("/b/x");
+        c.ask("/a/");
+        c.ask("/b/");
         let questions: Vec<Request> = {
             let mut v = Vec::new();
             while let Ok(r) = ask_rx.try_recv() {
@@ -538,63 +475,30 @@ mod tests {
             .send(Reply {
                 seq: questions[1].seq,
                 dir: "/b".into(),
-                prefix: "x".into(),
                 listing: listing(&["xbeta"]),
             })
             .expect("send");
         assert!(c.poll());
-        assert_eq!(c.candidates(), ["xbeta"]);
+        assert_eq!(c.names(), ["xbeta"]);
 
         // ...and the first arrives late. It must be kept, and not shown.
         reply_tx
             .send(Reply {
                 seq: questions[0].seq,
                 dir: "/a".into(),
-                prefix: "x".into(),
                 listing: listing(&["xalpha"]),
             })
             .expect("send");
         c.poll();
-        assert_eq!(c.candidates(), ["xbeta"], "the stale answer must not win");
+        assert_eq!(c.names(), ["xbeta"], "the stale answer must not win");
 
         // Kept, though: going back to it costs nothing.
-        c.ask("/a/x");
+        c.ask("/a/");
         assert!(
             asked(&ask_rx).is_empty(),
-            "the late answer was still worth keeping"
+            "the late answer was worth keeping"
         );
-        assert_eq!(c.candidates(), ["xalpha"]);
-    }
-
-    /// An answer to a question that has moved on can still settle the current
-    /// one, when the current one is inside the same directory.
-    #[test]
-    fn an_overtaken_answer_can_still_settle_the_question_that_overtook_it() {
-        let (mut c, ask_rx, reply_tx) = detached();
-        c.ask("/home/p");
-        c.ask("/home/pr");
-        let first = {
-            let mut v = Vec::new();
-            while let Ok(r) = ask_rx.try_recv() {
-                v.push(r);
-            }
-            v.remove(0)
-        };
-
-        reply_tx
-            .send(Reply {
-                seq: first.seq,
-                dir: "/home".into(),
-                prefix: "p".into(),
-                listing: listing(&["projects", "prototypes", "public"]),
-            })
-            .expect("send");
-        assert!(
-            c.poll(),
-            "the screen changed even though this was not the answer asked for"
-        );
-        assert_eq!(c.candidates(), ["projects", "prototypes"]);
-        assert!(!c.waiting(), "and there is nothing left to wait for");
+        assert_eq!(c.names(), ["xalpha"]);
     }
 
     /// Coalescing: everything queued behind a request is discarded in favour of
@@ -602,17 +506,16 @@ mod tests {
     #[test]
     fn only_the_newest_of_a_run_of_questions_is_served() {
         let (tx, rx) = mpsc::channel();
-        for (i, prefix) in ["p", "pr", "pro", "proj"].iter().enumerate() {
+        for (i, dir) in ["/a", "/a/b", "/a/b/c", "/a/b/c/d"].iter().enumerate() {
             tx.send(Request {
                 seq: i as u64 + 1,
-                dir: "/home".into(),
-                prefix: (*prefix).into(),
+                dir: (*dir).into(),
             })
             .expect("send");
         }
         let first = rx.recv().expect("recv");
         let served = newest(first, &rx);
-        assert_eq!(served.prefix, "proj");
+        assert_eq!(served.dir, "/a/b/c/d");
         assert_eq!(served.seq, 4);
         assert!(
             rx.try_recv().is_err(),
@@ -620,85 +523,18 @@ mod tests {
         );
     }
 
-    /// The ghost is what `→` will take, so it must never be more than is
-    /// certain.
-    #[test]
-    fn the_ghost_is_the_longest_prefix_every_candidate_shares() {
-        let (mut c, ask_rx, reply_tx) = detached();
-        c.ask("/home/pr");
-        answer(
-            &mut c,
-            &ask_rx,
-            &reply_tx,
-            listing(&["projects", "prototypes"]),
-        );
-        assert_eq!(c.ghost(), "o", "only the shared `o` is certain");
-
-        c.ask("/home/proj");
-        assert_eq!(c.ghost(), "ects/", "one candidate is certain to its end");
-    }
-
-    /// A single candidate carries a `/`, so the next component can be typed
-    /// without reaching for one — and so accepting it re-asks about the
-    /// directory it names.
-    #[test]
-    fn a_single_candidate_completes_to_a_trailing_slash() {
-        let (mut c, ask_rx, reply_tx) = detached();
-        c.ask("/home/you/");
-        answer(&mut c, &ask_rx, &reply_tx, listing(&["only"]));
-        assert_eq!(c.ghost(), "only/");
-    }
-
-    #[test]
-    fn there_is_no_ghost_when_nothing_matches_or_nothing_is_certain() {
-        let (mut c, ask_rx, reply_tx) = detached();
-        c.ask("/home/zz");
-        answer(&mut c, &ask_rx, &reply_tx, listing(&[]));
-        assert_eq!(c.ghost(), "");
-
-        // Two candidates sharing nothing beyond what is typed.
-        c.ask("/home/a");
-        answer(&mut c, &ask_rx, &reply_tx, listing(&["ab", "ac"]));
-        assert_eq!(c.ghost(), "");
-    }
-
-    /// Bytes agreeing is not characters agreeing. `é` and `ê` share their first
-    /// byte, and a completer that sliced there would hand back half a glyph —
-    /// or panic.
-    #[test]
-    fn a_shared_prefix_is_never_cut_through_a_character() {
-        assert_eq!(common_prefix(&["café".into(), "cafè".into()]), "caf");
-        assert_eq!(common_prefix(&["日本語".into(), "日本".into()]), "日本");
-        assert_eq!(common_prefix(&["日本".into(), "中国".into()]), "");
-
-        let (mut c, ask_rx, reply_tx) = detached();
-        c.ask("/home/caf");
-        answer(&mut c, &ask_rx, &reply_tx, listing(&["café", "cafè"]));
-        assert_eq!(c.ghost(), "", "nothing beyond `caf` is certain");
-    }
-
-    /// A host that answers with something other than what was asked must cost
-    /// a suggestion, not a crash. This reads a remote machine's output.
-    #[test]
-    fn a_candidate_that_does_not_start_with_what_was_typed_is_not_a_ghost() {
-        let (mut c, ask_rx, reply_tx) = detached();
-        c.ask("/home/pr");
-        answer(&mut c, &ask_rx, &reply_tx, listing(&["élan"]));
-        assert_eq!(c.ghost(), "");
-    }
-
-    /// Nothing to list, so nothing is asked: a working directory is absolute,
-    /// so there is no relative one to resolve a bare word against.
+    /// Nothing to list, so nothing is asked: a working directory is absolute, so
+    /// there is no relative one to resolve a bare word against.
     #[test]
     fn a_path_with_no_slash_asks_nothing_and_shows_nothing() {
         let (mut c, ask_rx, reply_tx) = detached();
-        c.ask("/home/p");
+        c.ask("/home/");
         answer(&mut c, &ask_rx, &reply_tx, listing(&["projects"]));
-        assert!(!c.candidates().is_empty());
+        assert!(!c.names().is_empty());
 
         c.ask("home");
         assert!(asked(&ask_rx).is_empty());
-        assert!(c.candidates().is_empty());
+        assert!(c.names().is_empty());
         assert!(!c.waiting());
     }
 
@@ -708,7 +544,7 @@ mod tests {
     fn the_cache_holds_a_bounded_number_of_directories() {
         let (mut c, _ask_rx, _reply_tx) = detached();
         for i in 0..CACHE * 2 {
-            c.remember(format!("/d{i}"), String::new(), listing(&["x"]));
+            c.remember(format!("/d{i}"), listing(&["x"]));
         }
         assert_eq!(c.cache.len(), CACHE);
         assert_eq!(
@@ -723,9 +559,83 @@ mod tests {
     #[test]
     fn remembering_a_directory_again_replaces_the_older_answer() {
         let (mut c, _ask_rx, _reply_tx) = detached();
-        c.remember("/d".into(), "a".into(), listing(&["a1"]));
-        c.remember("/d".into(), "a".into(), listing(&["a1", "a2"]));
+        c.remember("/d".into(), listing(&["a1"]));
+        c.remember("/d".into(), listing(&["a1", "a2"]));
         assert_eq!(c.cache.len(), 1);
         assert_eq!(c.cache[0].listing.names, ["a1", "a2"]);
+    }
+
+    // --- ranking -------------------------------------------------------------
+
+    /// The whole reason the host stopped filtering: a query need not be a prefix
+    /// of the name, or even contiguous within it.
+    #[test]
+    fn a_query_matches_a_subsequence_not_just_a_prefix() {
+        let mut c = holding("/src", &["nvmux-rs", "notes", "vendor"]);
+        assert_eq!(c.matches("nvmx"), ["nvmux-rs"]);
+        assert_eq!(c.matches("mux"), ["nvmux-rs"], "not anchored at the start");
+        assert_eq!(c.matches("nts"), ["notes"]);
+    }
+
+    /// The first row is what enter takes, so which one it is matters more than
+    /// anything else the scorer does.
+    #[test]
+    fn the_best_match_is_first() {
+        let mut c = holding("/d", &["a-long-name-with-src-inside", "src"]);
+        assert_eq!(
+            c.matches("src").first().map(String::as_str),
+            Some("src"),
+            "an exact name beats a scattered hit"
+        );
+
+        let mut c = holding("/d", &["prototypes", "projects"]);
+        assert_eq!(
+            c.matches("proj").first().map(String::as_str),
+            Some("projects")
+        );
+    }
+
+    /// An empty query is the whole directory, in the host's order — what a
+    /// freshly typed `/` shows.
+    #[test]
+    fn an_empty_query_is_every_child_in_the_hosts_order() {
+        let mut c = holding("/d", &["b", "a", "c"]);
+        assert_eq!(c.matches(""), ["b", "a", "c"], "not re-sorted");
+    }
+
+    /// A home directory is mostly dotted and none of it is what anyone is
+    /// looking for. The rule used to come free from the shell's globbing; it is
+    /// spelled out here because there is no glob left to carry it.
+    #[test]
+    fn dotted_directories_are_hidden_until_the_query_asks_for_one() {
+        let mut c = holding("/home", &[".config", ".local", "src", "docs"]);
+        assert_eq!(c.matches(""), ["src", "docs"], "hidden by default");
+        // `oc` is a subsequence of both `docs` and `.local`, so this is the
+        // dotted one being excluded rather than simply not matching.
+        assert_eq!(c.matches("oc"), ["docs"], "and hidden from a plain query");
+        assert_eq!(c.matches(".co"), [".config"], "a dot asks for them");
+        assert!(
+            c.matches(".").len() == 2,
+            "a bare dot shows every dotted directory: {:?}",
+            c.matches(".")
+        );
+    }
+
+    /// A list of equally good matches must not shuffle as the query grows, so
+    /// the tiebreak is the host's order rather than whatever the sort does.
+    #[test]
+    fn equal_scores_keep_the_hosts_order() {
+        let names = ["xa", "xb", "xc", "xd"];
+        let mut c = holding("/d", &names);
+        // Every candidate scores identically on a query matching only the shared
+        // first character.
+        assert_eq!(c.matches("x"), names);
+    }
+
+    /// A query nothing matches is an empty list, not every directory.
+    #[test]
+    fn a_query_that_matches_nothing_matches_nothing() {
+        let mut c = holding("/d", &["alpha", "beta"]);
+        assert!(c.matches("zzzz").is_empty());
     }
 }

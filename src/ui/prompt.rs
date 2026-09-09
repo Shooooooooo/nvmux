@@ -12,9 +12,11 @@
 //! ```text
 //!     new session name:  session 3
 //!     nvim command:      nvim --headless --listen {sock}
-//!     working directory: /home/you
+//!     working directory: /home/you/pro
 //!     └─ bold             │ └─ dim
 //!                         └─ the cursor, an inverted cell
+//!                        ▸ projects        ← the menu: reversed and bold,
+//!                          prototypes         the picker's "selected row"
 //! ```
 //!
 //! # One screen, three fields
@@ -49,26 +51,46 @@
 //! that has nowhere to go. One keypress to edit the default; typing anything
 //! else still replaces it outright.
 //!
-//! # The working directory completes as you type
+//! # The working directory has a menu
 //!
-//! The same idea a third time, and the reason `→` was worth establishing as "take
-//! what is offered": the dim text after the cursor in the directory field is as
-//! much of the path as is certain — the longest prefix every directory that could
-//! come next shares — and `→` makes it real. A single match completes to its end
-//! and gains a `/`, so the next component can be typed without reaching for one.
-//! The row below lists the alternatives when there is more than one.
+//! The third field is the one question with an answer nvmux can look up, so it
+//! does: under it hangs a dropdown of the directories the field could become,
+//! ranked fuzzily, so `nvmx` finds `nvmux-rs` and you need not know how a
+//! directory starts to reach it. `↑↓` and `Ctrl-n`/`Ctrl-p` move through it and
+//! enter takes what is highlighted, appending a `/` so the next component can be
+//! typed straight away and the menu drops a level with it.
 //!
-//! `Tab` therefore goes on meaning "next field" in every field, which is what
-//! the README's key table promises and what makes tabbing through the form
-//! survive a question that has a keyboard idiom of its own.
+//! The arrows belong to the menu in that field, and only there — `Tab` is how
+//! you leave a field, as it is in every other field. That is the whole of the
+//! collision, and it is resolved in favour of the menu because a field with a
+//! list under it is a list you expect the arrows to walk.
 //!
-//! A suggestion is offered only where `→` would actually take it: in the focused
-//! field, with something typed, and with the cursor at the end. It is never what
-//! enter submits — a ghost is an offer, and accepting one is a keystroke.
+//! # Who owns enter
 //!
-//! The listing behind it runs on a worker thread and reaches this loop through a
-//! channel; [`super::complete`] is where that lives and why. What matters here is
-//! that no keystroke ever waits for it.
+//! Enter submits the whole form, and it still does from an untouched directory
+//! field — `<prefix> c` then enter is a session in one keystroke, in the home
+//! directory, exactly as before the menu existed.
+//!
+//! The menu takes enter only while the field holds something enter could not
+//! submit: a *query*, meaning text after the last `/` that is not a directory
+//! yet. `/home/you/` is not one, so enter submits it; `/home/you/pro` is, and
+//! enter resolves it against the menu rather than starting a session somewhere
+//! that does not exist. Moving the selection takes enter too, since choosing is
+//! plainly what you are doing. `Esc` hands it back — the one place in this
+//! screen where Esc means something smaller than "leave", and the picker's
+//! filter mode sets the precedent.
+//!
+//! That is also why the default ends in `/`: it makes the opening state one
+//! enter can submit, and it makes the menu open listing the home directory's
+//! children rather than its siblings.
+//!
+//! # Nothing waits for a keystroke
+//!
+//! The listing runs on a worker thread and reaches this loop through a channel;
+//! [`super::complete`] is where that lives and why. One listing serves a whole
+//! directory — the host stopped filtering when the matching became fuzzy, since
+//! a subsequence cannot be a glob — so a path costs about one round trip per `/`
+//! and every keystroke in between is answered from memory.
 
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
@@ -112,6 +134,15 @@ const COMMAND: usize = 1;
 /// Where the working directory lives. Only [`Task::Create`] has one.
 const DIRECTORY: usize = 2;
 
+/// The tallest the dropdown gets. Enough to choose from without the form
+/// climbing to the top of the screen to make room for it.
+const MENU_ROWS: u16 = 6;
+
+/// The highlighted row's marker, and the column the rest line up in — the
+/// picker's, so the two lists read the same way.
+const MARKER: &str = "▸ ";
+const INDENT: &str = "  ";
+
 /// What enter asked for.
 #[derive(Debug, PartialEq, Eq)]
 struct Submission {
@@ -142,11 +173,6 @@ struct Field {
     /// Characters rather than bytes so arithmetic on it cannot land mid-glyph.
     cursor: usize,
     default: String,
-    /// What `→` would add to the end of `input` — the directory field's
-    /// suggestion, dim after the cursor. Derived, never typed: the prompt sets
-    /// it from [`super::complete::Completer`] after every key, so it cannot
-    /// drift out of step with what is there.
-    ghost: String,
 }
 
 impl Field {
@@ -157,7 +183,6 @@ impl Field {
             input,
             cursor,
             default,
-            ghost: String::new(),
         }
     }
 
@@ -186,9 +211,6 @@ impl Field {
         if self.adopt_default() {
             return;
         }
-        if self.adopt_ghost() {
-            return;
-        }
         self.cursor = (self.cursor + 1).min(self.len());
     }
 
@@ -198,7 +220,6 @@ impl Field {
 
     fn end(&mut self) {
         self.adopt_default();
-        self.adopt_ghost();
         self.cursor = self.len();
     }
 
@@ -213,27 +234,8 @@ impl Field {
         true
     }
 
-    /// Take the suggestion into the field. Only from the *end* of what has been
-    /// typed: with the cursor anywhere else there is a cursor to move, and the
-    /// suggestion continues text that is no longer the last thing typed.
-    ///
-    /// The same key as [`Field::adopt_default`] and the same idea — the dim text
-    /// is what `→` makes real — so one keystroke means "take what is offered"
-    /// wherever it is offered, and `Tab` goes on meaning "next field" in every
-    /// field, which is what the README's table promises.
-    fn adopt_ghost(&mut self) -> bool {
-        if self.ghost.is_empty() || self.cursor != self.len() {
-            return false;
-        }
-        self.input.push_str(&self.ghost);
-        self.ghost.clear();
-        self.cursor = self.len();
-        true
-    }
-
     /// What this field submits: the trimmed text, or the default when there is
-    /// none — which is exactly what the placeholder was showing. Never the
-    /// suggestion: a ghost is an offer, and accepting one is a keystroke.
+    /// none — which is exactly what the placeholder was showing.
     fn value(&self) -> String {
         let text = self.input.trim();
         if text.is_empty() {
@@ -256,28 +258,56 @@ fn byte_at(s: &str, chars: usize) -> usize {
 struct Prompt {
     fields: Vec<Field>,
     focus: usize,
-    hints: &'static str,
     message: Option<String>,
-    /// The row under the fields: the directories the working directory field
-    /// could still become. `None` on a prompt that has no such field — a
-    /// rename — and empty when there is nothing to say.
-    candidates: Option<Candidates>,
+    /// The dropdown under the fields. `None` on a prompt that has no directory
+    /// to complete — a rename — and otherwise always present, empty or not,
+    /// because the rows it occupies are reserved either way.
+    menu: Option<Menu>,
 }
 
-/// What the row under the fields has to say, before it is fitted to a terminal.
+/// The dropdown: the directories the working directory field could become, and
+/// which of them is under the cursor.
 ///
-/// The names are kept rather than a finished line, because how many of them fit
-/// is a question about display width, and the width is not known until the
-/// frame is drawn — see [`candidate_row`].
+/// The matches are kept rather than a finished block, because how many rows fit
+/// is a question about the terminal, and the terminal is not known until the
+/// frame is drawn.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct Candidates {
-    /// What the last component typed could still become.
-    names: Vec<String>,
-    /// The host stopped short of listing everything, so `names` is part of an
+struct Menu {
+    /// What the query could mean, best first, as the scorer ranked it.
+    matches: Vec<String>,
+    /// The highlighted row. Always in range while `matches` is non-empty.
+    selected: usize,
+    /// Whether enter acts on this menu rather than on the form.
+    ///
+    /// False on an untouched field, which is what keeps `c` followed by enter a
+    /// one-keystroke create. Typing a query or moving the selection sets it, and
+    /// typing *has* to: the field's text is a query once matching is fuzzy, so
+    /// `nvmx` is nothing enter could sensibly submit, and only the menu knows a
+    /// real directory. Esc gives enter back.
+    engaged: bool,
+    /// The host stopped short of listing the directory, so these are part of an
     /// answer rather than all of one.
     partial: bool,
-    /// Said instead of the names: so far only that nothing matched.
+    /// Said instead of the rows: waiting for an answer, or nothing matched.
     message: String,
+}
+
+impl Menu {
+    /// Wrapping, like every other list in nvmux: one key reaches the far end of
+    /// a short list rather than stopping dead at it.
+    fn move_by(&mut self, delta: isize) {
+        let len = self.matches.len();
+        if len == 0 {
+            return;
+        }
+        let len = len as isize;
+        self.selected = (((self.selected as isize + delta) % len + len) % len) as usize;
+        self.engaged = true;
+    }
+
+    fn highlighted(&self) -> Option<&str> {
+        self.matches.get(self.selected).map(String::as_str)
+    }
 }
 
 impl Prompt {
@@ -290,9 +320,8 @@ impl Prompt {
                 Field::new(labels[2].clone(), String::new(), default_directory),
             ],
             focus: NAME,
-            hints: "⏎ create   ⇥ field   → edit   esc cancel",
             message: None,
-            candidates: Some(Candidates::default()),
+            menu: Some(Menu::default()),
         }
     }
 
@@ -305,10 +334,34 @@ impl Prompt {
                 session.name.clone(),
             )],
             focus: NAME,
-            hints: "⏎ rename   esc cancel",
             message: None,
-            candidates: None,
+            menu: None,
         }
+    }
+
+    /// The bottom row. It changes with the menu, because a row reading
+    /// `⏎ create` while enter would choose a directory is worse than no row at
+    /// all — it is the only thing on screen that says which of the two enter
+    /// means right now.
+    fn hints(&self) -> &'static str {
+        if self.menu.is_none() {
+            return "⏎ rename   esc cancel";
+        }
+        if self.engaged() {
+            "⏎ choose   ↑↓ move   esc back   ⇥ field"
+        } else {
+            "⏎ create   ⇥ field   ↑↓ choose   esc cancel"
+        }
+    }
+
+    /// Is the menu what enter acts on? Only ever in the directory field, and
+    /// only once there is something in it to choose.
+    fn engaged(&self) -> bool {
+        self.focus == DIRECTORY
+            && self
+                .menu
+                .as_ref()
+                .is_some_and(|m| m.engaged && !m.matches.is_empty())
     }
 
     fn focused(&mut self) -> &mut Field {
@@ -344,13 +397,39 @@ impl Prompt {
         // A stale message must not linger over an unrelated action.
         self.message = None;
 
+        // Whether the menu is on screen with something in it. The arrows belong
+        // to it while it is, which is the one place they stop changing field —
+        // `Tab` is how you leave a field, as it is in every other field and as
+        // the README's table says.
+        let listing =
+            self.focus == DIRECTORY && self.menu.as_ref().is_some_and(|m| !m.matches.is_empty());
+
         match key {
             Key::Char(c) => {
+                // The directory field inverts the rule the other two follow. In
+                // them the default is a value being *replaced*, so typing
+                // discards it; here it is a directory being navigated *from*,
+                // and the menu below is already listing its children — so the
+                // first keystroke takes it in and the rest reads as a query
+                // inside it. Typing `pro` on an untouched field means
+                // `~/pro`, which is what the menu is showing, rather than a
+                // relative path the prompt would go on to refuse.
+                //
+                // Unless that keystroke is `/`, which is how you say "somewhere
+                // else entirely" and start an absolute path from nothing.
+                if self.focus == DIRECTORY && self.fields[DIRECTORY].input.is_empty() && c != '/' {
+                    self.fields[DIRECTORY].adopt_default();
+                }
                 self.focused().insert(c);
+                // Typing in the directory field is typing a *query*, and a query
+                // is not a path enter could submit. The menu takes enter from
+                // here until something is chosen or Esc gives it back.
+                self.engage_on_typing();
                 Step::None
             }
             Key::Backspace => {
                 self.focused().backspace();
+                self.engage_on_typing();
                 Step::None
             }
             Key::Left => {
@@ -369,22 +448,98 @@ impl Prompt {
                 self.focused().end();
                 Step::None
             }
+            Key::Down | Key::CtrlN if listing => {
+                self.menu().move_by(1);
+                Step::None
+            }
+            Key::Up | Key::CtrlP if listing => {
+                self.menu().move_by(-1);
+                Step::None
+            }
             Key::Tab | Key::Down => {
                 self.move_focus(1);
+                self.disengage();
                 Step::None
             }
             Key::BackTab | Key::Up => {
                 self.move_focus(self.fields.len() - 1);
+                self.disengage();
                 Step::None
             }
-            // From either field, so the one-keystroke create survives the
-            // second question — see the module docs.
+            // The menu owns enter only once it has been engaged with. Untouched,
+            // enter still submits the whole form from any field, so `c` then
+            // enter is still a session in one keystroke — see the module docs.
+            Key::Enter if self.engaged() => {
+                self.accept();
+                Step::None
+            }
             Key::Enter => Step::Submit(self.submission()),
+            // Hand enter back rather than cancelling, the one place Esc means
+            // something smaller than "leave". The picker's filter mode sets the
+            // same precedent; without it, engaging the menu would leave no way
+            // back to submitting except choosing something.
+            Key::Esc if self.engaged() => {
+                self.disengage();
+                Step::None
+            }
             // Not a quit here: it would tear the user out of a live session
             // they only meant to leave a prompt in.
             Key::Esc | Key::CtrlC => Step::Cancel,
             _ => Step::None,
         }
+    }
+
+    /// The menu, which every caller here has already established is there.
+    fn menu(&mut self) -> &mut Menu {
+        self.menu.as_mut().expect("a menu the caller checked for")
+    }
+
+    /// Typing hands enter to the menu exactly while the field holds something
+    /// enter could not submit.
+    ///
+    /// That is a *query* — text after the last `/` that is not yet a directory.
+    /// `/home/you/pro` is one, and enter has to resolve it or the session would
+    /// start somewhere that does not exist; `/home/you/` is not, so enter
+    /// submits it and the menu is only showing what is inside. Emptying the
+    /// field puts the default back, which ends in `/` for exactly this reason.
+    fn engage_on_typing(&mut self) {
+        if self.focus != DIRECTORY {
+            return;
+        }
+        let typed = self.fields[DIRECTORY].value();
+        let querying = crate::dirs::split(&typed).is_some_and(|(_, q)| !q.is_empty());
+        if let Some(menu) = self.menu.as_mut() {
+            menu.engaged = querying;
+        }
+    }
+
+    fn disengage(&mut self) {
+        if let Some(menu) = self.menu.as_mut() {
+            menu.engaged = false;
+        }
+    }
+
+    /// Take the highlighted directory into the field, with a trailing `/` so the
+    /// next component can be typed straight away — and so the next listing is
+    /// of the directory just chosen.
+    fn accept(&mut self) {
+        let Some(name) = self
+            .menu
+            .as_ref()
+            .and_then(Menu::highlighted)
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let field = &mut self.fields[DIRECTORY];
+        // Against the value, not the input: an untouched field is showing its
+        // default, and choosing from it means choosing inside that.
+        let current = field.value();
+        let parent = crate::dirs::split(&current).map_or(current.clone(), |(d, _)| d.to_string());
+        let parent = parent.trim_end_matches('/');
+        field.input = format!("{parent}/{name}/");
+        field.cursor = field.len();
+        self.disengage();
     }
 }
 
@@ -420,7 +575,7 @@ pub(super) fn run_on(
         Task::Create => Prompt::create(
             next_free_name(transport)?,
             default_command(transport),
-            transport.home().to_string(),
+            default_directory(transport),
         ),
         Task::Rename(session) => Prompt::rename(session),
     };
@@ -453,7 +608,7 @@ pub(super) fn run_on(
             // Nothing was typed, so nothing new is being asked. What may have
             // arrived is an answer to what was.
             if completer.as_mut().is_some_and(complete::Completer::poll) {
-                show(&mut prompt, completer.as_ref());
+                show(&mut prompt, completer.as_mut());
             }
             continue;
         };
@@ -539,129 +694,60 @@ fn refresh(prompt: &mut Prompt, completer: Option<&mut complete::Completer>) {
 /// The ghost goes on the field only while that field is where the keystrokes
 /// are going. Offering to extend a field the cursor is not in would be offering
 /// something `→` would not do.
-fn show(prompt: &mut Prompt, completer: Option<&complete::Completer>) {
+fn show(prompt: &mut Prompt, completer: Option<&mut complete::Completer>) {
     let Some(completer) = completer else {
         return;
     };
-    let field = &prompt.fields[DIRECTORY];
-    let focused = prompt.focus == DIRECTORY;
+    if prompt.menu.is_none() {
+        return;
+    }
+
     // Against the value rather than the input, matching what was asked: an
     // untouched field is showing its default, and completing it means completing
-    // that.
-    let typed = field.value();
-    // A suggestion is only ever offered where `→` would actually take it:
-    //
-    // * in the focused field, since a ghost elsewhere would be an offer the
-    //   keystrokes are not going to reach;
-    // * with something typed, because `→` on an empty field already means "take
-    //   the default", and an offer hanging off dim text nobody has touched would
-    //   be two offers on one line;
-    // * with the cursor at the end, because that is the only place
-    //   `Field::adopt_ghost` accepts one — anywhere else `→` moves the cursor,
-    //   and showing text it would not take is a lie about what the key does.
-    let offerable = focused && !field.input.is_empty() && field.cursor == field.len();
+    // inside that.
+    let typed = prompt.fields[DIRECTORY].value();
+    let query = crate::dirs::split(&typed)
+        .map_or("", |(_, q)| q)
+        .to_string();
+    let focused = prompt.focus == DIRECTORY;
 
-    prompt.fields[DIRECTORY].ghost = if offerable {
-        completer.ghost()
+    let waiting = completer.waiting();
+    let partial = completer.truncated();
+    let matches = if focused {
+        completer.matches(&query)
+    } else {
+        Vec::new()
+    };
+
+    let message = if !focused {
+        String::new()
+    } else if waiting && matches.is_empty() {
+        // Only when there is nothing to show. A cached listing answers instantly
+        // while a fresh one is still in flight, and replacing real matches with
+        // an ellipsis would be a step backwards.
+        "…".to_string()
+    } else if matches.is_empty() && !query.is_empty() {
+        // Said plainly rather than left blank: a query that matches nothing looks
+        // exactly like one still being typed, and the difference is otherwise
+        // only discovered by pressing enter.
+        format!("nothing here matches {query:?}")
     } else {
         String::new()
     };
 
-    prompt.candidates = Some(if !focused {
-        Candidates::default()
-    } else if completer.waiting() {
-        Candidates {
-            message: "…".to_string(),
-            ..Candidates::default()
-        }
-    } else {
-        alternatives(completer.candidates(), &typed, completer.truncated())
-    });
-}
-
-/// What the row under the fields should say: what else the last component could
-/// still become.
-///
-/// The names alone, not their paths — the path is on the line above, and
-/// repeating it would push the part that differs off the right of the screen.
-fn alternatives(names: &[String], typed: &str, truncated: bool) -> Candidates {
-    let matched = crate::dirs::split(typed).map(|(_, p)| p).unwrap_or("");
-
-    // Nothing matched. Said plainly rather than left blank: a path with a typo
-    // in it looks exactly like one still being typed, and the difference is
-    // otherwise only discovered by pressing enter.
-    //
-    // Only once something has been typed to not match, though — an empty
-    // directory is not a mistake, and announcing it on every fresh `/` would be
-    // noise on the commonest keystroke there is.
-    if names.is_empty() {
-        return Candidates {
-            message: if matched.is_empty() {
-                String::new()
-            } else {
-                format!("no directory here starts with {matched:?}")
-            },
-            ..Candidates::default()
-        };
+    let menu = prompt.menu.as_mut().expect("checked above");
+    // The best match, whenever the set of matches changes. Holding the index
+    // still would point it at a different directory each keystroke, which is a
+    // worse kind of stable.
+    if menu.matches != matches {
+        menu.selected = 0;
     }
-
-    Candidates {
-        names: names.to_vec(),
-        partial: truncated,
-        message: String::new(),
+    menu.matches = matches;
+    menu.partial = partial;
+    menu.message = message;
+    if menu.matches.is_empty() {
+        menu.engaged = false;
     }
-}
-
-/// Fit the row to the terminal, saying what did not fit.
-///
-/// A row cut off at the right edge reads as a complete list that happens to end
-/// there, which is the one thing it must not do: a directory with forty children
-/// would look like a directory with twelve. So names are dropped until the count
-/// of the dropped ones fits beside the rest.
-///
-/// `partial` — the host itself stopped short — is a different and weaker claim:
-/// how many more there are is not known, only that there are some.
-fn candidate_row(c: &Candidates, width: usize) -> String {
-    if !c.message.is_empty() {
-        return draw::truncate(&c.message, width);
-    }
-    // One candidate is what the ghost is already showing. Repeating it below
-    // says nothing and costs the row — unless the host stopped short, in which
-    // case the one shown is not the whole answer and the row has to say so.
-    if c.names.is_empty() || (c.names.len() < 2 && !c.partial) {
-        return String::new();
-    }
-
-    // Cumulative width of the first n names joined by two spaces, so the search
-    // below costs one pass rather than a join per candidate length.
-    let mut used = 0;
-    let widths: Vec<usize> = c
-        .names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| {
-            used += n.width() + if i == 0 { 0 } else { 2 };
-            used
-        })
-        .collect();
-
-    let tail = |shown: usize| match (c.names.len() - shown, c.partial) {
-        (0, false) => String::new(),
-        (_, true) => "  (and more)".to_string(),
-        (hidden, false) => format!("  (+{hidden} more)"),
-    };
-
-    // At most `width` names can fit in `width` columns, so this scan is bounded
-    // by the terminal rather than by the size of the directory.
-    let ceiling = widths.iter().take_while(|&&w| w <= width).count();
-    for shown in (1..=ceiling).rev() {
-        if widths[shown - 1] + tail(shown).width() <= width {
-            return format!("{}{}", c.names[..shown].join("  "), tail(shown));
-        }
-    }
-    // Not even one name and its count fit. The number alone still beats a line
-    // cut off mid-word.
-    draw::truncate(&format!("({} to choose from)", c.names.len()), width)
 }
 
 /// The name a session gets when the user just presses enter. Compared
@@ -691,6 +777,27 @@ fn next_free_name(transport: &dyn Transport) -> Result<String> {
 /// Per host, because the answer is about a machine — a path to a nightly build
 /// on one box means nothing on another, and `nvmux myhost` is a different
 /// machine's `$PATH`.
+/// The directory a session gets when the user just presses enter: the session
+/// host's home, with a trailing `/`.
+///
+/// The slash is not decoration. It is what makes the field's text mean "inside
+/// this directory" rather than "this directory, among its siblings" — so the
+/// menu opens listing the home directory's children, which is what someone
+/// tabbing into the field wants to see, and choosing one descends rather than
+/// stepping sideways. It is also what keeps enter submitting: with nothing after
+/// the slash there is no half-typed name for the menu to resolve.
+///
+/// Empty stays empty. A host that could not say where home is has no default to
+/// offer, and `/` alone would be a confident wrong answer.
+fn default_directory(transport: &dyn Transport) -> String {
+    let home = transport.home().trim_end_matches('/');
+    if home.is_empty() {
+        String::new()
+    } else {
+        format!("{home}/")
+    }
+}
+
 fn default_command(transport: &dyn Transport) -> String {
     state::remembered(transport.location())
         .unwrap_or_else(|| crate::config::get().session.command.clone())
@@ -705,7 +812,7 @@ fn draw(frame: &mut Frame, prompt: &Prompt) {
     let (body, bottom) = draw::split_hint_row(area);
 
     draw_body(frame, prompt, body);
-    draw::draw_hint_row(frame, bottom, prompt.hints, true);
+    draw::draw_hint_row(frame, bottom, prompt.hints(), true);
 }
 
 /// Centre the block as it reads the moment the prompt opens, then hold it.
@@ -721,12 +828,13 @@ fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
     }
 
     let rows = prompt.fields.len() as u16;
-    // The candidate row is reserved for the life of the prompt and left blank
-    // when there is nothing to say. A row that came and went would move the
-    // whole form up and down half a cell as you typed — which is the jitter the
-    // fixed anchor above exists to avoid, arriving by another door.
-    let height =
-        rows + u16::from(prompt.candidates.is_some()) + u16::from(prompt.message.is_some());
+    // The menu's rows are reserved for the life of the prompt and left blank
+    // when there is nothing to show. Their number is a function of the terminal
+    // and never of the match count: a block that grew and shrank as you typed
+    // would move the whole form up and down, which is the jitter the fixed
+    // anchor above exists to avoid, arriving by another door.
+    let menu_rows = menu_rows(prompt, area, rows);
+    let height = rows + menu_rows + u16::from(prompt.message.is_some());
     let opening = prompt
         .fields
         .iter()
@@ -752,38 +860,112 @@ fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
         );
     }
 
-    // Both of these are routinely wider than the fields, so they get the full
-    // width and their own centring rather than hanging off the anchor.
     let mut y = anchor.y + rows;
-    let mut row = |frame: &mut Frame, text: &str, style: Style| {
-        if y >= anchor.y + anchor.height {
-            return;
+    if let Some(menu) = prompt.menu.as_ref() {
+        // Indented to where the field values start, so the menu reads as hanging
+        // from the directory field rather than floating under the form.
+        let indent = prompt
+            .fields
+            .get(DIRECTORY)
+            .map_or(0, |f| f.label.width() as u16);
+        let block = Rect {
+            x: anchor.x.saturating_add(indent).min(area.x + area.width),
+            y,
+            width: width.saturating_sub(indent as usize) as u16,
+            height: menu_rows.min((anchor.y + anchor.height).saturating_sub(y)),
+        };
+        draw_menu(frame, menu, block);
+        y += menu_rows;
+    }
+
+    // Routinely wider than the fields, so it gets the full width and its own
+    // centring rather than hanging off the anchor.
+    if let Some(msg) = prompt.message.as_deref() {
+        if y < anchor.y + anchor.height {
+            frame.render_widget(
+                Paragraph::new(Line::from(draw::truncate(msg, area.width as usize)))
+                    .alignment(Alignment::Center),
+                Rect {
+                    y,
+                    height: 1,
+                    ..area
+                },
+            );
         }
+    }
+}
+
+/// How many rows the menu is given.
+///
+/// A function of the terminal, never of the matches — that is the whole point.
+/// One row is kept back for the message, which is what a rejected create is
+/// reported on and which must not be the thing a tall menu pushes off screen.
+fn menu_rows(prompt: &Prompt, area: Rect, fields: u16) -> u16 {
+    if prompt.menu.is_none() {
+        return 0;
+    }
+    MENU_ROWS.min(area.height.saturating_sub(fields + 1))
+}
+
+/// The dropdown, one directory per row, the highlighted one reversed.
+///
+/// `REVERSED | BOLD` is already what "the selected row in a list" means in the
+/// picker, and it is deliberately not the field cursor's plain `REVERSED` — two
+/// reversed things on one screen have to be told apart, and this is how the rest
+/// of nvmux tells them apart.
+fn draw_menu(frame: &mut Frame, menu: &Menu, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let dim = Style::default().add_modifier(Modifier::DIM);
+
+    if !menu.message.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                draw::truncate(text, area.width as usize),
-                style,
-            )))
-            .alignment(Alignment::Center),
-            Rect {
-                y,
-                height: 1,
-                ..area
-            },
+                draw::truncate(&menu.message, area.width as usize),
+                dim,
+            ))),
+            Rect { height: 1, ..area },
         );
-        y += 1;
-    };
+        return;
+    }
 
-    if let Some(candidates) = prompt.candidates.as_ref() {
-        row(
-            frame,
-            &candidate_row(candidates, area.width as usize),
-            Style::default().add_modifier(Modifier::DIM),
-        );
+    let height = area.height as usize;
+    let offset = draw::scroll_offset(menu.selected, menu.matches.len(), height);
+    let mut lines: Vec<Line> = menu
+        .matches
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(height)
+        .map(|(i, name)| {
+            let selected = i == menu.selected;
+            let style = if selected {
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                dim
+            };
+            let text = draw::truncate(
+                &format!("{}{name}", if selected { MARKER } else { INDENT }),
+                area.width as usize,
+            );
+            Line::from(Span::styled(text, style))
+        })
+        .collect();
+
+    // The host stopped short, so the last row says so rather than letting a
+    // partial list read as a complete one. It costs a match to say it, which is
+    // the right trade: a list that is quietly missing entries is worse than a
+    // list that is one shorter.
+    if menu.partial && lines.len() == height && height > 0 {
+        lines.pop();
+        lines.push(Line::from(Span::styled(
+            draw::truncate(&format!("{INDENT}(and more)"), area.width as usize),
+            dim,
+        )));
     }
-    if let Some(msg) = prompt.message.as_deref() {
-        row(frame, msg, Style::default());
-    }
+
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// One field's whole line: bold label, then either what was typed or the dim
@@ -819,13 +1001,10 @@ fn field_line(field: &Field, focused: bool, width: usize) -> Line<'static> {
         // there would be two on screen and no telling which is live.
         (true, false) => spans.push(Span::styled(draw::truncate(&field.default, room), dim)),
         (false, true) => {
-            let (before, at, after, ghost) = around_cursor(field, room);
+            let (before, at, after) = around_cursor(field, room);
             spans.push(Span::raw(before));
             spans.push(Span::styled(at, cursor));
             spans.push(Span::raw(after));
-            // The offer, in the same weight as a placeholder and for the same
-            // reason: it is not there yet, and `→` is what makes it real.
-            spans.push(Span::styled(ghost, dim));
         }
         (false, false) => spans.push(Span::raw(draw::truncate(&field.input, room))),
     }
@@ -839,28 +1018,15 @@ fn split_first(s: &str) -> Option<(String, &str)> {
 }
 
 /// The text either side of the cursor and the cell under it, windowed to `max`
-/// display columns: what was typed before it, the cell it inverts, what was
-/// typed after it, and the suggestion beyond that.
+/// display columns.
 ///
 /// The opposite choice from `draw::truncate`, and for a reason: a field has to
-/// keep the cursor visible, so when a command outgrows it the text scrolls
-/// rather than the part being edited disappearing. The cursor may sit one past
-/// the end, so the line is treated as the input plus a trailing blank — which is
-/// the cell it inverts there.
-///
-/// The suggestion is windowed **with** the input rather than after it, or a path
-/// longer than the field would scroll the typed text and leave the ghost hanging
-/// in columns it had already given away.
-fn around_cursor(field: &Field, max: usize) -> (String, String, String, String) {
-    let input: Vec<char> = field.input.chars().collect();
-    // Where the typed text stops and the offer begins. The one index that has to
-    // survive the windowing, since it is what decides which span is dim.
-    let boundary = input.len();
-    let cells: Vec<char> = input
-        .into_iter()
-        .chain(field.ghost.chars())
-        .chain([' '])
-        .collect();
+/// keep the cursor visible, so when a path outgrows it the text scrolls rather
+/// than the part being edited disappearing. The cursor may sit one past the end,
+/// so the line is treated as the input plus a trailing blank — which is the cell
+/// it inverts there.
+fn around_cursor(field: &Field, max: usize) -> (String, String, String) {
+    let cells: Vec<char> = field.input.chars().chain([' ']).collect();
     let at = field.cursor.min(cells.len() - 1);
     let width = |c: char| c.to_string().width().max(1);
 
@@ -881,19 +1047,11 @@ fn around_cursor(field: &Field, max: usize) -> (String, String, String, String) 
         end += 1;
     }
 
-    // Split whatever follows the cursor at the boundary. Clamped into
-    // `after..end` from both sides, so a cursor sitting inside the offer or past
-    // the end of everything yields an empty span rather than a reversed range.
-    let after = at + 1;
-    let plain_end = end.min(boundary).max(after);
-    let ghost_start = after.max(boundary).min(end);
-
     let text = |range: &[char]| range.iter().collect::<String>();
     (
         text(&cells[start..at]),
         text(&cells[at..at + 1]),
-        text(&cells[after..plain_end]),
-        text(&cells[ghost_start..end]),
+        text(&cells[at + 1..end]),
     )
 }
 
@@ -905,7 +1063,7 @@ mod tests {
     use ratatui::Terminal;
 
     const COMMAND_DEFAULT: &str = "nvim --headless --listen {sock}";
-    const DIRECTORY_DEFAULT: &str = "/home/you";
+    const DIRECTORY_DEFAULT: &str = "/home/you/";
 
     fn prompt() -> Prompt {
         Prompt::create(
@@ -1120,7 +1278,7 @@ mod tests {
     // --- moving between fields ---------------------------------------------
 
     #[test]
-    fn tab_and_the_arrows_move_between_the_fields_and_wrap() {
+    fn tab_moves_between_the_fields_and_wraps() {
         let mut p = prompt();
         assert_eq!(p.focus, NAME);
         p.on_key(Key::Tab);
@@ -1131,10 +1289,52 @@ mod tests {
         assert_eq!(p.focus, NAME, "three fields, so tab wraps at the last");
         p.on_key(Key::BackTab);
         assert_eq!(p.focus, DIRECTORY);
+    }
+
+    /// The arrows change field everywhere the menu is not offering anything —
+    /// which is every field but the directory one, and that one too until it has
+    /// matches to move through.
+    #[test]
+    fn the_arrows_move_between_the_fields_while_there_is_no_menu_to_move_in() {
+        let mut p = prompt();
         p.on_key(Key::Down);
-        assert_eq!(p.focus, NAME);
+        assert_eq!(p.focus, COMMAND);
+        p.on_key(Key::Down);
+        assert_eq!(p.focus, DIRECTORY);
+        p.on_key(Key::Down);
+        assert_eq!(p.focus, NAME, "an empty menu leaves the arrows alone");
         p.on_key(Key::Up);
         assert_eq!(p.focus, DIRECTORY);
+    }
+
+    /// In the directory field with something to choose from, the arrows belong
+    /// to the menu. `Tab` is how you leave a field — as it is in every other
+    /// field, and as the README's table says.
+    #[test]
+    fn the_arrows_and_ctrl_n_p_move_the_selection_and_wrap() {
+        let mut p = menuing("/home/", &["alpha", "beta", "gamma"]);
+        let at = |p: &Prompt| p.menu.as_ref().expect("a menu").selected;
+
+        for down in [Key::Down, Key::CtrlN] {
+            let mut p = menuing("/home/", &["alpha", "beta", "gamma"]);
+            p.on_key(down);
+            assert_eq!(at(&p), 1);
+            p.on_key(down);
+            assert_eq!(at(&p), 2);
+            p.on_key(down);
+            assert_eq!(at(&p), 0, "wraps at the end");
+            assert_eq!(p.focus, DIRECTORY, "and never changed field");
+        }
+
+        for up in [Key::Up, Key::CtrlP] {
+            let mut p = menuing("/home/", &["alpha", "beta", "gamma"]);
+            p.on_key(up);
+            assert_eq!(at(&p), 2, "wraps at the start");
+            assert_eq!(p.focus, DIRECTORY);
+        }
+
+        p.on_key(Key::Tab);
+        assert_eq!(p.focus, NAME, "tab is still how you leave");
     }
 
     /// A rename has one field; moving within it must be a no-op rather than an
@@ -1313,242 +1513,18 @@ mod tests {
         }
     }
 
-    fn some_candidates(names: &[&str]) -> Candidates {
-        Candidates {
-            names: names.iter().map(|n| n.to_string()).collect(),
-            partial: false,
-            message: String::new(),
-        }
-    }
-
-    /// A field with something typed in it, a suggestion attached, and the focus
-    /// on it — the state every rendering test below wants.
-    fn completing(typed: &str, ghost: &str) -> Prompt {
+    /// A prompt focused on the directory field with a menu already filled in —
+    /// the state every dropdown test below wants, without a worker to fill it.
+    fn menuing(typed: &str, matches: &[&str]) -> Prompt {
         let mut p = prompt();
         p.on_key(Key::Tab);
         p.on_key(Key::Tab);
         assert_eq!(p.focus, DIRECTORY);
         type_in(&mut p, typed);
-        p.fields[DIRECTORY].ghost = ghost.to_string();
+        let menu = p.menu.as_mut().expect("a create prompt has a menu");
+        menu.matches = matches.iter().map(|m| m.to_string()).collect();
+        menu.selected = 0;
         p
-    }
-
-    /// The suggestion recedes and the typed path does not, so it reads as an
-    /// offer rather than as text that is already there.
-    #[test]
-    fn the_completion_recedes_and_the_typed_path_does_not() {
-        let p = completing("/home/you/pro", "jects/");
-        let cells = line_cells(&p, 60, 9);
-        let text = text_of(&cells);
-        assert!(
-            text.ends_with("/home/you/projects/"),
-            "the whole line should read as the completed path: {text:?}"
-        );
-
-        // Everything the user typed is plain; everything offered is dim.
-        let dim: String = cells
-            .iter()
-            .filter(|(_, m)| m.contains(Modifier::DIM))
-            .map(|(s, _)| s.as_str())
-            .collect();
-        assert_eq!(dim, "ects/", "only the offer recedes");
-
-        // And the cursor is on the offer's first character, not on a blank past
-        // the end, so the suggestion sits in the columns it will occupy.
-        let cursor: String = cells
-            .iter()
-            .filter(|(_, m)| m.contains(Modifier::REVERSED))
-            .map(|(s, _)| s.as_str())
-            .collect();
-        assert_eq!(cursor, "j");
-    }
-
-    /// The row is reserved for the life of the prompt. A row that came and went
-    /// would move the whole form up and down as the user typed.
-    #[test]
-    fn the_candidate_row_holds_its_place_when_there_is_nothing_to_show() {
-        let quiet = prompt();
-        let mut busy = prompt();
-        busy.candidates = Some(some_candidates(&["projects", "prototypes"]));
-
-        let row_of = |p: &Prompt| {
-            cells_of(p, 60, 9)
-                .iter()
-                .position(|row| row.iter().any(|(_, m)| m.contains(Modifier::REVERSED)))
-                .expect("a cursor")
-        };
-        assert_eq!(
-            row_of(&quiet),
-            row_of(&busy),
-            "the fields must not move when candidates appear"
-        );
-
-        let lines = render(&busy, 60, 9);
-        assert!(
-            lines.iter().any(|l| l.contains("projects  prototypes")),
-            "expected the candidates below the fields, got {lines:?}"
-        );
-    }
-
-    /// What the row says in each of the states it has. The no-match line is the
-    /// one worth pinning hardest: an ordering that returned early on "fewer than
-    /// two candidates" would swallow it, and the prompt would then look exactly
-    /// the same whether a path was half-typed or wrong.
-    #[test]
-    fn the_candidate_row_says_which_of_its_states_it_is_in() {
-        let names = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
-        let row = |ns: &[&str], typed: &str, partial: bool| {
-            candidate_row(&alternatives(&names(ns), typed, partial), 80)
-        };
-
-        assert_eq!(
-            row(&["projects", "prototypes"], "/home/pro", false),
-            "projects  prototypes"
-        );
-        assert_eq!(
-            row(&["projects"], "/home/proj", false),
-            "",
-            "one candidate is what the ghost is already showing"
-        );
-        assert_eq!(
-            row(&[], "/home/zzz", false),
-            "no directory here starts with \"zzz\"",
-            "a typo must not look like a path still being typed"
-        );
-        assert_eq!(
-            row(&[], "/home/", false),
-            "",
-            "an empty directory is not a mistake to announce"
-        );
-        assert_eq!(
-            row(&["a"], "/big/a", true),
-            "a  (and more)",
-            "a lone candidate out of a partial listing is not the whole answer"
-        );
-    }
-
-    /// A row cut off at the right edge reads as a complete list that happens to
-    /// end there. A directory with forty children would then look like one with
-    /// twelve, and nothing on screen would say otherwise.
-    #[test]
-    fn a_candidate_row_too_wide_for_the_terminal_says_how_many_it_dropped() {
-        let many = Candidates {
-            names: (1..=40).map(|i| format!("deep{i}")).collect(),
-            partial: false,
-            message: String::new(),
-        };
-
-        for width in [20usize, 40, 80, 100] {
-            let row = candidate_row(&many, width);
-            assert!(
-                row.width() <= width,
-                "the row overflowed {width} columns: {row:?} ({})",
-                row.width()
-            );
-            assert!(
-                row.contains("more") || row.contains("to choose from"),
-                "a dropped name must be accounted for at {width} columns: {row:?}"
-            );
-        }
-
-        // Wide enough for all of them, so there is nothing to account for.
-        let all = candidate_row(&many, 400);
-        assert!(all.starts_with("deep1  deep2  "));
-        assert!(!all.contains("more"), "nothing was dropped: {all:?}");
-    }
-
-    /// The host stopping short is a weaker claim than a row not fitting: how
-    /// many more there are is not known, only that there are some.
-    #[test]
-    fn a_partial_listing_never_claims_a_count_it_does_not_have() {
-        let partial = Candidates {
-            names: (1..=5).map(|i| format!("d{i}")).collect(),
-            partial: true,
-            message: String::new(),
-        };
-        let row = candidate_row(&partial, 80);
-        assert_eq!(row, "d1  d2  d3  d4  d5  (and more)");
-        assert!(!row.contains('+'), "no count is known: {row:?}");
-    }
-
-    /// A terminal too narrow for even one name and its count. The number alone
-    /// still beats a line cut off mid-word.
-    #[test]
-    fn a_terminal_too_narrow_for_any_candidate_still_says_there_are_some() {
-        let many = Candidates {
-            names: (1..=40)
-                .map(|i| format!("a-long-directory-name-{i}"))
-                .collect(),
-            partial: false,
-            message: String::new(),
-        };
-        let row = candidate_row(&many, 12);
-        assert!(row.width() <= 12, "{row:?}");
-        assert!(!row.is_empty(), "silence would be the one wrong answer");
-    }
-
-    /// A rename has no directory to complete, so it has no row to reserve — and
-    /// reserving one would put a blank line under a one-field prompt.
-    #[test]
-    fn a_rename_has_no_candidate_row_at_all() {
-        assert!(renaming("notes").candidates.is_none());
-    }
-
-    /// A ghost is an offer. Enter takes what was typed, and `→` is what makes
-    /// the offer real — so a form submitted without pressing it must not smuggle
-    /// the suggestion into the session's directory.
-    #[test]
-    fn a_ghost_is_never_what_enter_submits() {
-        let mut p = completing("/home/you/pro", "jects/");
-        assert_eq!(
-            submitted(&mut p).directory,
-            Some("/home/you/pro".to_string()),
-            "only what was typed"
-        );
-    }
-
-    /// `→` and `End` take the offer, and both leave the cursor after it so the
-    /// next component can be typed straight away.
-    #[test]
-    fn right_at_the_end_of_a_path_takes_the_ghost_and_end_does_too() {
-        for key in [Key::Right, Key::End] {
-            let mut p = completing("/home/you/pro", "jects/");
-            p.on_key(key);
-            assert_eq!(p.fields[DIRECTORY].input, "/home/you/projects/");
-            assert_eq!(p.fields[DIRECTORY].cursor, p.fields[DIRECTORY].len());
-            assert!(
-                p.fields[DIRECTORY].ghost.is_empty(),
-                "the offer was taken, so it is no longer on offer"
-            );
-        }
-    }
-
-    /// Anywhere but the end, `→` still moves the cursor: the suggestion
-    /// continues text that is no longer the last thing typed, and a key that
-    /// silently did something else would be the surprise.
-    #[test]
-    fn the_right_arrow_still_moves_the_cursor_inside_a_path() {
-        let mut p = completing("/home/you/pro", "jects/");
-        p.on_key(Key::Home);
-        p.on_key(Key::Right);
-        assert_eq!(p.fields[DIRECTORY].input, "/home/you/pro", "nothing taken");
-        assert_eq!(p.fields[DIRECTORY].cursor, 1, "the cursor moved instead");
-    }
-
-    /// The offer is windowed with the input rather than after it. Otherwise a
-    /// path longer than the field scrolls the typed text and leaves the ghost
-    /// hanging in columns the field had already given away.
-    #[test]
-    fn a_completion_on_a_path_too_long_for_the_field_stays_inside_it() {
-        let p = completing("/home/you/a-very-long-directory-name-indeed/su", "bdir/");
-        for width in [24, 32, 40, 60] {
-            let cells = line_cells(&p, width, 9);
-            let shown: usize = cells.iter().map(|(s, _)| s.width().max(1)).sum();
-            assert!(
-                shown <= width as usize,
-                "the line overflowed a {width}-column terminal: {shown}"
-            );
-        }
     }
 
     /// Four roles on one line, told apart by modifier alone since nothing here
@@ -1603,21 +1579,295 @@ mod tests {
     /// Two cursors would leave no way to tell which field a keystroke reaches.
     #[test]
     fn only_the_focused_field_shows_a_cursor() {
-        for p in [prompt(), {
-            let mut p = prompt();
-            p.on_key(Key::Tab);
-            p
-        }] {
-            let reversed: usize = cells_of(&p, 60, 9)
+        for p in [
+            prompt(),
+            {
+                let mut p = prompt();
+                p.on_key(Key::Tab);
+                p
+            },
+            // With a menu on screen too: its highlight is reversed as well, and
+            // the two must still be told apart.
+            menuing("/home/", &["alpha", "beta"]),
+        ] {
+            // The field cursor is plain REVERSED; a selected row is
+            // REVERSED|BOLD. That is the distinction `field_line` documents, and
+            // it is what keeps two reversed things on one screen legible.
+            let cursors: usize = cells_of(&p, 60, 9)
                 .iter()
                 .map(|row| {
                     row.iter()
-                        .filter(|(_, m)| m.contains(Modifier::REVERSED))
+                        .filter(|(_, m)| {
+                            m.contains(Modifier::REVERSED) && !m.contains(Modifier::BOLD)
+                        })
                         .count()
                 })
                 .sum();
-            assert_eq!(reversed, 1, "exactly one cell is the cursor");
+            assert_eq!(cursors, 1, "exactly one cell is the field cursor");
         }
+    }
+
+    /// The property the reserved row existed for, at the height a dropdown
+    /// needs: the form must not climb the screen as matches come and go. A menu
+    /// sized to its contents would move it on every keystroke.
+    #[test]
+    fn the_menu_holds_its_place_however_many_matches_there_are() {
+        let row_of = |p: &Prompt| {
+            cells_of(p, 60, 14)
+                .iter()
+                .position(|row| {
+                    row.iter()
+                        .any(|(_, m)| m.contains(Modifier::REVERSED) && !m.contains(Modifier::BOLD))
+                })
+                .expect("the field cursor")
+        };
+
+        let empty = row_of(&menuing("/home/", &[]));
+        for n in [1usize, 3, 6, 40] {
+            let names: Vec<String> = (0..n).map(|i| format!("dir-{i}")).collect();
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            assert_eq!(
+                row_of(&menuing("/home/", &refs)),
+                empty,
+                "{n} matches moved the form"
+            );
+        }
+    }
+
+    /// A menu with more matches than rows keeps the selection on screen, the
+    /// same rule the picker's list follows and through the same function.
+    #[test]
+    fn a_menu_longer_than_its_rows_scrolls_to_keep_the_selection_visible() {
+        let names: Vec<String> = (0..30).map(|i| format!("dir-{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut p = menuing("/home/", &refs);
+
+        // Down past the bottom of the reserved rows.
+        for _ in 0..12 {
+            p.on_key(Key::Down);
+        }
+        let lines = render(&p, 60, 14);
+        assert!(
+            lines.iter().any(|l| l.contains("dir-12")),
+            "the selection scrolled out of view: {lines:#?}"
+        );
+
+        // And wrapping to the end brings the far end into view.
+        p.on_key(Key::Up);
+        p.on_key(Key::Up);
+        let lines = render(&p, 60, 14);
+        assert!(
+            lines.iter().any(|l| l.contains("dir-10")),
+            "expected to be looking at the selection: {lines:#?}"
+        );
+    }
+
+    /// A partial listing must not read as a complete one. It costs a row to say
+    /// so, which is the right trade: a list quietly missing entries is worse
+    /// than a list one shorter.
+    #[test]
+    fn a_partial_listing_says_so_rather_than_ending_quietly() {
+        let names: Vec<String> = (0..30).map(|i| format!("dir-{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut p = menuing("/home/", &refs);
+        p.menu.as_mut().expect("a menu").partial = true;
+
+        let lines = render(&p, 60, 14);
+        assert!(
+            lines.iter().any(|l| l.contains("(and more)")),
+            "expected the menu to admit it is partial: {lines:#?}"
+        );
+    }
+
+    /// A query matching nothing is said plainly. Left blank it looks exactly
+    /// like a path still being typed, and the difference is otherwise only
+    /// discovered by pressing enter.
+    #[test]
+    fn a_query_that_matches_nothing_says_so() {
+        let mut p = menuing("/home/zzz", &[]);
+        p.menu.as_mut().expect("a menu").message = "nothing here matches \"zzz\"".to_string();
+        let lines = render(&p, 60, 14);
+        assert!(
+            lines.iter().any(|l| l.contains("nothing here matches")),
+            "expected the menu to say so: {lines:#?}"
+        );
+    }
+
+    /// A rename has no directory to complete, so it has no menu and no rows
+    /// reserved for one — a blank block under a one-field prompt would be odd.
+    #[test]
+    fn a_rename_has_no_menu_at_all() {
+        assert!(renaming("notes").menu.is_none());
+        let lines = render(&renaming("notes"), 60, 9);
+        let filled = lines.iter().filter(|l| !l.is_empty()).count();
+        assert_eq!(filled, 2, "just the field and the hint row: {lines:#?}");
+    }
+
+    /// The directory field inverts the placeholder rule the other two follow,
+    /// because its default is a place being navigated from rather than a value
+    /// being replaced — and because the menu underneath is already listing that
+    /// place's children.
+    #[test]
+    fn typing_in_the_directory_field_continues_the_default_rather_than_replacing_it() {
+        let mut p = prompt();
+        p.on_key(Key::Tab);
+        p.on_key(Key::Tab);
+        type_in(&mut p, "pro");
+        assert_eq!(p.fields[DIRECTORY].input, format!("{DIRECTORY_DEFAULT}pro"));
+
+        // ...unless the first key is `/`, which is how you say "somewhere else
+        // entirely".
+        let mut p = prompt();
+        p.on_key(Key::Tab);
+        p.on_key(Key::Tab);
+        type_in(&mut p, "/srv/www");
+        assert_eq!(p.fields[DIRECTORY].input, "/srv/www");
+
+        // The other two fields are unchanged: there the default is a value.
+        let mut p = prompt();
+        type_in(&mut p, "notes");
+        assert_eq!(p.fields[NAME].input, "notes");
+    }
+
+    /// The pair that defines who owns enter. This half is the one-keystroke
+    /// create: an untouched field is showing its default, which is a real
+    /// directory, so enter submits the form exactly as it always did.
+    #[test]
+    fn an_untouched_field_still_lets_enter_create_the_session() {
+        let mut p = prompt();
+        p.on_key(Key::Tab);
+        p.on_key(Key::Tab);
+        assert_eq!(p.focus, DIRECTORY);
+        // Matches on screen, and still not engaged: showing is not choosing.
+        p.menu.as_mut().expect("a menu").matches = vec!["alpha".into(), "beta".into()];
+
+        assert!(!p.engaged());
+        assert!(
+            matches!(p.on_key(Key::Enter), Step::Submit(_)),
+            "an untouched field must not cost the one-keystroke create"
+        );
+    }
+
+    /// And this half is why typing has to engage: once matching is fuzzy the
+    /// field holds a *query*, and `nvmx` is not a directory enter could submit.
+    #[test]
+    fn the_menu_owns_enter_once_a_query_is_typed() {
+        let mut p = menuing("/home/nvmx", &["nvmux-rs"]);
+        assert!(p.engaged(), "typing a query hands enter to the menu");
+        assert_eq!(
+            p.on_key(Key::Enter),
+            Step::None,
+            "it chose rather than submitted"
+        );
+        assert_eq!(p.fields[DIRECTORY].input, "/home/nvmux-rs/");
+        assert!(!p.engaged(), "and gave enter back, so the next one submits");
+        assert!(matches!(p.on_key(Key::Enter), Step::Submit(_)));
+    }
+
+    /// Moving the selection engages it too, even with nothing typed.
+    #[test]
+    fn moving_the_selection_hands_enter_to_the_menu() {
+        let mut p = menuing("/home/", &["alpha", "beta"]);
+        assert!(
+            !p.engaged(),
+            "a path ending in `/` is one enter could submit"
+        );
+        p.on_key(Key::Down);
+        assert!(p.engaged());
+        assert_eq!(p.on_key(Key::Enter), Step::None);
+        assert_eq!(p.fields[DIRECTORY].input, "/home/beta/");
+    }
+
+    /// The one place Esc means something smaller than "leave". Without it,
+    /// engaging the menu would leave no way back to submitting except choosing
+    /// something.
+    #[test]
+    fn esc_gives_enter_back_to_the_form_before_it_cancels_the_prompt() {
+        let mut p = menuing("/home/", &["alpha", "beta"]);
+        p.on_key(Key::Down);
+        assert!(p.engaged());
+
+        assert_eq!(
+            p.on_key(Key::Esc),
+            Step::None,
+            "the first Esc only disengages"
+        );
+        assert!(!p.engaged());
+        assert_eq!(
+            p.fields[DIRECTORY].input, "/home/",
+            "and changed nothing else"
+        );
+
+        assert_eq!(p.on_key(Key::Esc), Step::Cancel, "the second leaves");
+    }
+
+    /// Emptying the field puts it back in the untouched state, defaults and all,
+    /// so enter goes back to submitting.
+    #[test]
+    fn backspacing_a_query_away_gives_enter_back() {
+        let mut p = menuing("/home/x", &["alpha"]);
+        assert!(p.engaged());
+        for _ in 0.."/home/x".len() {
+            p.on_key(Key::Backspace);
+        }
+        assert!(p.fields[DIRECTORY].input.is_empty());
+        assert!(!p.engaged());
+    }
+
+    /// Choosing descends: the field gains the directory and a `/`, which is both
+    /// what lets the next component be typed straight away and what makes the
+    /// next listing be of the directory just chosen.
+    #[test]
+    fn accepting_a_match_descends_into_it() {
+        let mut p = menuing("/home/you/pro", &["projects", "prototypes"]);
+        p.on_key(Key::Down);
+        p.on_key(Key::Enter);
+        assert_eq!(p.fields[DIRECTORY].input, "/home/you/prototypes/");
+        assert_eq!(
+            p.fields[DIRECTORY].cursor,
+            p.fields[DIRECTORY].len(),
+            "the cursor follows, ready for the next component"
+        );
+    }
+
+    /// Choosing from an untouched field completes inside the default it is
+    /// showing, not inside nothing.
+    #[test]
+    fn accepting_from_an_untouched_field_descends_from_its_default() {
+        let mut p = prompt();
+        p.on_key(Key::Tab);
+        p.on_key(Key::Tab);
+        p.menu.as_mut().expect("a menu").matches = vec!["src".into()];
+        p.on_key(Key::Down);
+        p.on_key(Key::Enter);
+        assert_eq!(
+            p.fields[DIRECTORY].input,
+            format!("{DIRECTORY_DEFAULT}src/"),
+            "the default is where it descended from"
+        );
+    }
+
+    /// Two reversed things on one screen have to be told apart, or the eye reads
+    /// the highlighted row as the place keystrokes are going.
+    #[test]
+    fn a_selected_row_is_not_mistaken_for_the_field_cursor() {
+        let p = menuing("/home/", &["alpha", "beta"]);
+        let rows = cells_of(&p, 60, 9);
+
+        let bold_reversed: String = rows
+            .iter()
+            .flatten()
+            .filter(|(_, m)| m.contains(Modifier::REVERSED) && m.contains(Modifier::BOLD))
+            .map(|(sym, _)| sym.as_str())
+            .collect();
+        assert!(
+            bold_reversed.contains("alpha"),
+            "the best match should be the highlighted row, got {bold_reversed:?}"
+        );
+        assert!(
+            !bold_reversed.contains("beta"),
+            "only one row is highlighted: {bold_reversed:?}"
+        );
     }
 
     #[test]
@@ -1632,12 +1882,8 @@ mod tests {
     }
 
     #[test]
-    fn the_keybindings_are_on_the_last_row_and_do_not_change() {
+    fn the_hint_row_is_on_the_last_row_and_says_what_enter_will_do() {
         let empty = render(&prompt(), 60, 9);
-        let mut p = prompt();
-        type_in(&mut p, "notes");
-        let typed = render(&p, 60, 9);
-
         assert!(
             empty[8].contains("⏎ create")
                 && empty[8].contains("⇥ field")
@@ -1645,10 +1891,23 @@ mod tests {
             "expected the hints on the last row, got {:?}",
             empty[8]
         );
+
+        let mut p = prompt();
+        type_in(&mut p, "notes");
         assert_eq!(
-            empty[8], typed[8],
-            "the hint row says the same thing either way — the placeholders \
-             carry the defaults, not the hints"
+            render(&p, 60, 9)[8],
+            empty[8],
+            "typing a name changes nothing — the placeholders carry the defaults"
+        );
+
+        // Engaged with the menu, enter no longer creates. A row saying it did
+        // would be the only thing on screen claiming otherwise.
+        let mut engaged = menuing("/home/", &["alpha", "beta"]);
+        engaged.on_key(Key::Down);
+        let row = &render(&engaged, 60, 9)[8];
+        assert!(
+            row.contains("⏎ choose") && !row.contains("⏎ create"),
+            "expected the hints to follow the menu, got {row:?}"
         );
     }
 
@@ -1708,22 +1967,25 @@ mod tests {
             Some("session 3".to_string()),
         );
 
-        // A field carrying a suggestion, and a candidate row wider than any of
-        // these terminals: both are drawn from lengths the screen never agreed
-        // to, which is exactly where an off-by-one becomes a panic.
-        let mut offering = completing("/home/you/a-very-long-directory/su", "bdir/");
-        offering.candidates = Some(some_candidates(&[
-            "subdir",
-            "subdirectory",
-            "submodule",
-            "subproject",
-            "substrate",
-        ]));
-        let mut both = completing("/home/you/a-very-long-directory/su", "bdir/");
-        both.candidates = Some(Candidates {
-            message: "no directory here starts with \"su\"".to_string(),
-            ..Candidates::default()
-        });
+        // A menu taller and wider than any of these terminals, drawn from
+        // lengths the screen never agreed to — which is exactly where an
+        // off-by-one becomes a panic.
+        let offering = menuing(
+            "/home/you/a-very-long-directory/su",
+            &[
+                "subdir",
+                "subdirectory",
+                "submodule",
+                "subproject",
+                "substrate",
+                "subsystem",
+                "subtree",
+            ],
+        );
+        let mut partial = menuing("/home/you/a-very-long-directory/su", &["subdir"]);
+        partial.menu.as_mut().expect("a menu").partial = true;
+        let mut both = menuing("/home/you/a-very-long-directory/su", &[]);
+        both.menu.as_mut().expect("a menu").message = "nothing here matches \"su\"".to_string();
         both.fail("a session named \"notes\" already exists".to_string(), None);
 
         for &(w, h) in test_support::TINY_SIZES {
@@ -1733,6 +1995,7 @@ mod tests {
                 &failed,
                 &renaming("dotfiles"),
                 &offering,
+                &partial,
                 &both,
             ] {
                 let _ = render(p, w.max(1), h.max(1));
@@ -1847,10 +2110,9 @@ mod tests {
         p.fail("nope".to_string(), Some("session 3".to_string()));
         test_support::assert_no_colour(60, 9, |f| draw(f, &p));
 
-        // The suggestion and the candidate row are the newest text on this
-        // screen, and both are drawn dim — which is a modifier, not a colour.
-        let mut offering = completing("/home/you/pro", "jects/");
-        offering.candidates = Some(some_candidates(&["projects", "prototypes"]));
+        // The menu is the newest thing on this screen, and its highlight is the
+        // strongest — reversed and bold, which are modifiers, not colours.
+        let offering = menuing("/home/you/pro", &["projects", "prototypes"]);
         test_support::assert_no_colour(60, 9, |f| draw(f, &offering));
     }
 }

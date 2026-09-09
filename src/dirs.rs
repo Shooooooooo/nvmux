@@ -44,25 +44,30 @@ pub enum DirSource {
 }
 
 impl DirSource {
-    /// The subdirectories of `dir` whose names start with `prefix`.
+    /// Every subdirectory of `dir`, dotted ones included.
     ///
-    /// `prefix` is matched by the host's shell, not here, so a directory with a
-    /// hundred thousand entries costs one small answer rather than a hundred
-    /// thousand lines. An empty prefix does not match dotfiles and a prefix of
-    /// `.` does, which is what a shell does and what someone typing a path
-    /// expects.
+    /// The whole directory rather than a filtered slice of it, because the
+    /// matching is fuzzy and lives in [`crate::ui::complete`]: a subsequence
+    /// match cannot be expressed as a shell pattern, since the first character
+    /// typed need not be the first character of the name. That is also what lets
+    /// one answer serve every keystroke inside a directory rather than only the
+    /// ones that extend the same prefix.
+    ///
+    /// Dotted names come back and are hidden further up, where a query can ask
+    /// for them. The rule is the shell's either way; only the place it is
+    /// applied has moved.
     ///
     /// A directory that is not there is an empty listing, not an error: at a
     /// prompt, half a path is the normal state of the input, and every keystroke
     /// on the way to a real directory passes through one that is not there yet.
-    pub fn children(&self, dir: &str, prefix: &str) -> Result<Listing> {
+    pub fn children(&self, dir: &str) -> Result<Listing> {
         let out = match self {
-            DirSource::Local => proc::run_local(shell::DIRS_SCRIPT, &[dir, prefix])?,
+            DirSource::Local => proc::run_local(shell::DIRS_SCRIPT, &[dir])?,
             // Unattended: nobody is watching this run, and there is no
             // terminal to answer a passphrase prompt on — see `ssh::unattended`.
             DirSource::Ssh { host, control_path } => {
                 Ssh::new(host.clone(), control_path.clone())
-                    .run_script_unattended(shell::DIRS_SCRIPT, &[dir, prefix])?
+                    .run_script_unattended(shell::DIRS_SCRIPT, &[dir])?
             }
         };
         protocol::parse_dirs(&out.stdout)
@@ -115,7 +120,7 @@ mod tests {
     /// the test that the script's contract holds as embedded rather than as it
     /// sits in the checkout.
     #[test]
-    fn the_local_source_lists_real_subdirectories() {
+    fn the_local_source_lists_every_child_including_the_dotted_ones() {
         let root =
             std::env::temp_dir().join(format!("nvmux-dirs-{}-{}", std::process::id(), line!()));
         let _ = std::fs::remove_dir_all(&root);
@@ -125,38 +130,33 @@ mod tests {
         std::fs::write(root.join("a-file"), b"not a directory").expect("write a file");
         let dir = root.to_string_lossy().into_owned();
 
-        let all = DirSource::Local.children(&dir, "").expect("list");
+        let all = DirSource::Local.children(&dir).expect("list");
         assert_eq!(
             all.names,
-            ["alpha", "beta", "beta-two"],
-            "no dotfiles, no files"
+            ["alpha", "beta", "beta-two", ".hidden"],
+            "every directory and no files; dotted ones last, and hidden further up"
         );
         assert!(!all.truncated);
-
-        let some = DirSource::Local.children(&dir, "beta").expect("list");
-        assert_eq!(
-            some.names,
-            ["beta", "beta-two"],
-            "the host does the filtering"
+        assert!(
+            !all.names.iter().any(|n| n == "." || n == ".."),
+            "`.` and `..` are never completions: {:?}",
+            all.names
         );
-
-        let dotted = DirSource::Local.children(&dir, ".").expect("list");
-        assert_eq!(dotted.names, [".hidden"], "a leading dot asks for dotfiles");
 
         // Half-typed paths are the normal state of a prompt, not an error.
         let missing = DirSource::Local
-            .children(&root.join("nope").to_string_lossy(), "")
+            .children(&root.join("nope").to_string_lossy())
             .expect("a directory that is not there is an empty answer");
         assert!(missing.names.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Names a shell would otherwise treat as patterns, or split on. Each one
+    /// Names a shell would otherwise split on or treat as a pattern. Each one
     /// is a real directory somebody could have, and each would be a different
-    /// bug: a glob metacharacter in the prefix, a space in the name.
+    /// bug in the framing between the host and here.
     #[test]
-    fn odd_directory_names_are_listed_literally() {
+    fn odd_directory_names_survive_the_listing() {
         let root =
             std::env::temp_dir().join(format!("nvmux-dirs-{}-{}", std::process::id(), line!()));
         let _ = std::fs::remove_dir_all(&root);
@@ -165,18 +165,12 @@ mod tests {
         }
         let dir = root.to_string_lossy().into_owned();
 
-        let spaced = DirSource::Local.children(&dir, "a").expect("list");
-        assert_eq!(spaced.names, ["a b"], "a name with a space is one name");
-
-        let starred = DirSource::Local.children(&dir, "c*").expect("list");
+        let all = DirSource::Local.children(&dir).expect("list");
         assert_eq!(
-            starred.names,
-            ["c*d"],
-            "a `*` in the prefix is a character, not a pattern"
+            all.names,
+            ["a b", "c*d", "c?d", "cxd"],
+            "a name with a space is one name, and a `*` is a character"
         );
-
-        let queried = DirSource::Local.children(&dir, "c?").expect("list");
-        assert_eq!(queried.names, ["c?d"], "and neither is a `?`");
 
         let _ = std::fs::remove_dir_all(&root);
     }

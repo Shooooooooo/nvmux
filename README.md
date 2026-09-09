@@ -102,38 +102,23 @@ is expanded against that machine's home directory, which is also what the field
 offers by default; nothing else is expanded, for the reasons the command section
 gives. A directory that is not there is refused before anything is started.
 
-**The path completes as you type.** The dim text after the cursor is as much of
-the path as is certain — the longest prefix every directory that could come next
-shares — and `→` takes it, the same key that takes a default. One match completes
-to its end and adds the `/`, so you can keep typing; when there is more than one,
-the row under the fields lists them. Directories starting with a dot appear once
-you type the dot, as in a shell.
+**The path completes as you type.** Under the field is a menu of the directories
+it could become, ranked fuzzily — `nvmx` finds `nvmux-rs`, so you need not know
+how a directory starts to reach it. `↑` `↓` and `Ctrl-n` `Ctrl-p` move through
+it; `Enter` takes the highlighted one and adds the `/`, so you can keep typing
+and the menu drops a level with you. Directories starting with a dot appear once
+you type a dot, as in a shell.
+
+In that field the arrows belong to the menu, so `Tab` is how you leave it — which
+is how you leave every other field too. `Enter` still submits the whole form from
+an untouched field, so `c` `Enter` is still a session in one keystroke; it goes to
+the menu only while you have typed something the form could not submit, or moved
+the selection. `Esc` hands it back, and a second `Esc` leaves the prompt.
 
 Completion never waits on your keystrokes. The listing runs beside the prompt, so
 typing is never slower than typing even when the answer is coming over ssh — and
 one listing serves a whole directory, so a path costs about one round trip per
 `/` rather than one per key.
-
-**Numbers name positions.** A session keeps the number it was created with for
-as long as you leave it where it is, so a number you have learned goes on
-meaning the same session. Moving one is the exception, and the only one: the
-sessions it travels past exchange numbers with it, which re-points `<prefix> 1`
-and its friends too. The numbers themselves do not change — the same ones stay
-in the same order down the screen — so nothing you have learned about the shape
-of the list is lost, only which session each number now names.
-
-They start at 1 and fill gaps: kill session 3 and the next one you create
-becomes 3 again. Type the digits together for a number past 9 — `12` for the
-twelfth. A single digit acts immediately unless a longer number could still be
-meant, which only happens once you have more than nine sessions.
-
-**Reordering.** `Space` picks the session under the cursor up; the movement keys
-carry it, `Enter` puts it down and `Esc` puts it back where it was. The numbers
-are hidden while a session is in flight, because they are about to change hands
-and the digit keys do nothing until it lands. Nothing is written until you press
-`Enter`, and what is written is stored with the sessions themselves — so the
-order is still there next time, and it is the same order from any machine that
-attaches to that host.
 
 ### While attached
 
