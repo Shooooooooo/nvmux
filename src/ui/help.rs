@@ -15,10 +15,10 @@
 //!
 //! `<prefix>` arrives here as `Key::Other`, because `translate` turns every
 //! control chord but `Ctrl-c`, `Ctrl-n` and `Ctrl-p` into nothing. If any key
-//! closed the help, someone who read "Ctrl-t d" and typed it would close the
-//! screen on the `Ctrl-t` and send a bare `d` into normal mode. So `t`, `d`,
-//! `c` and `Other` do nothing, and only `Esc`, `q`, `Enter`, `?` and `Ctrl-c`
-//! close it. Nothing typed on this screen is ever forwarded.
+//! closed the help, someone who read "Ctrl-Space d" and typed it would close
+//! the screen on the `Ctrl-Space` and send a bare `d` into normal mode. So `t`,
+//! `d`, `c` and `Other` do nothing, and only `Esc`, `q`, `Enter`, `?` and
+//! `Ctrl-c` close it. Nothing typed on this screen is ever forwarded.
 
 use ratatui::layout::Rect;
 use ratatui::text::Line;
@@ -78,7 +78,7 @@ fn rows(prefix: &str) -> Vec<Row> {
     rows
 }
 
-/// Named keys only. `t`, `d` and `c` — and therefore `Ctrl-t`, which arrives
+/// Named keys only. `t`, `d` and `c` — and therefore the prefix, which arrives
 /// as `Key::Other` — are deliberately not here: a chord typed while the help
 /// is open must do nothing, not close the help and forward its second key.
 ///
@@ -167,14 +167,18 @@ mod tests {
     use ratatui::style::Modifier;
     use ratatui::Terminal;
 
+    /// Wide enough that the whole table fits with slack on both sides, so the
+    /// centring is what is being measured rather than the clamp.
+    const WIDE: u16 = 70;
+
     fn render(w: u16, h: u16) -> Vec<String> {
         let rows = rows(PREFIX_LABEL);
         test_support::render(w, h, |f| draw(f, &rows))
     }
 
     /// The line a row was drawn on. Matched on the *start* of the line rather
-    /// than anywhere in it: "send a literal Ctrl-t to Neovim" contains the
-    /// text `Ctrl-t t`, so `contains` would find the picker row twice.
+    /// than anywhere in it: "send a literal Ctrl-Space to Neovim" contains the
+    /// text `Ctrl-Space t`, so `contains` would find the picker row twice.
     fn line_for<'a>(lines: &'a [String], row: &Row) -> &'a String {
         lines
             .iter()
@@ -226,7 +230,7 @@ mod tests {
                 .iter()
                 .any(|s| matches!(s, keys::Step::Act(_)));
             // Equality, not `starts_with`: `o` would otherwise match the
-            // `Ctrl-t other` row. Digits are the one range row, so they are
+            // `<prefix> other` row. Digits are the one range row, so they are
             // looked up as the range rather than as themselves.
             let listed = if b.is_ascii_digit() {
                 acts && rows.iter().any(|r| r.keys == format!("{PREFIX_LABEL} 1-n"))
@@ -280,13 +284,22 @@ mod tests {
             );
         }
         let digits = body[want.len()];
-        assert!(digits.starts_with("Ctrl-t 1-n"), "got {digits:?}");
+        assert!(
+            digits.starts_with(&format!("{PREFIX_LABEL} 1-n")),
+            "got {digits:?}"
+        );
         assert!(digits.contains("number"), "got {digits:?}");
         let literal = body[want.len() + 1];
-        assert!(literal.starts_with("Ctrl-t Ctrl-t"), "got {literal:?}");
+        assert!(
+            literal.starts_with(&format!("{PREFIX_LABEL} {PREFIX_LABEL}")),
+            "got {literal:?}"
+        );
         assert!(literal.contains("literal"), "got {literal:?}");
         let other = body[want.len() + 2];
-        assert!(other.starts_with("Ctrl-t other"), "got {other:?}");
+        assert!(
+            other.starts_with(&format!("{PREFIX_LABEL} other")),
+            "got {other:?}"
+        );
         assert!(other.contains("that key"), "got {other:?}");
     }
 
@@ -334,7 +347,7 @@ mod tests {
 
     #[test]
     fn the_whole_screen_is_a_centred_table_and_one_hint_line() {
-        let lines = render(62, 11);
+        let lines = render(WIDE, 11);
         assert_eq!(lines.len(), 11);
 
         assert_eq!(lines[10].trim(), HINTS, "hints should be on the last row");
@@ -358,7 +371,7 @@ mod tests {
             .max_by_key(|l| l.width())
             .expect("a table row");
         let left = row.len() - row.trim_start().len();
-        let right = 62 - row.width();
+        let right = WIDE as usize - row.width();
         assert!(
             left.abs_diff(right) <= 2,
             "not horizontally centred: {left} left, {right} right, row {row:?}"
@@ -370,7 +383,7 @@ mod tests {
     #[test]
     fn the_hint_row_is_dim_and_the_table_is_not() {
         let rows = rows(PREFIX_LABEL);
-        let mut terminal = Terminal::new(TestBackend::new(62, 11)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(WIDE, 11)).expect("terminal");
         terminal.draw(|f| draw(f, &rows)).expect("draw");
         let buf = terminal.backend().buffer().clone();
         let last = buf.area.height - 1;
@@ -427,6 +440,6 @@ mod tests {
     #[test]
     fn nothing_sets_a_colour() {
         let rows = rows(PREFIX_LABEL);
-        test_support::assert_no_colour(62, 11, |f| draw(f, &rows));
+        test_support::assert_no_colour(WIDE, 11, |f| draw(f, &rows));
     }
 }

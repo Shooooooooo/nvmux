@@ -345,16 +345,19 @@ mod tests {
     }
 
     /// Only Ctrl-c, Ctrl-n and Ctrl-p are keys of their own; every other
-    /// chord is nothing. The prefix is one of these (Ctrl-t by default, but
-    /// configurable), and `Ctrl-x`, `Ctrl-q`, `Ctrl-r`, `Ctrl-y` all name
+    /// chord is nothing. The prefix is one of these (Ctrl-Space by default,
+    /// but configurable), and `Ctrl-x`, `Ctrl-q`, `Ctrl-r`, `Ctrl-y` all name
     /// picker commands as bare letters.
+    ///
+    /// The space bar is in the list for the default prefix's sake: typed with
+    /// Ctrl it must not reach the filter as a space.
     #[test]
     fn other_control_chords_are_ignored_not_folded_to_letters() {
-        for c in ['t', 'x', 'q', 'r', 'y', 'g', 'a', 'd'] {
+        for c in ['t', 'x', 'q', 'r', 'y', 'g', 'a', 'd', ' '] {
             assert_eq!(
                 translate(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)),
                 Key::Other,
-                "Ctrl-{c} must not act as a plain {c}"
+                "Ctrl-{c:?} must not act as a plain {c:?}"
             );
         }
     }

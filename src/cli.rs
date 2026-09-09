@@ -19,8 +19,9 @@ use crate::transport::Location;
                   after you detach; the editor runs on the session host and all \
                   rendering happens locally.",
     after_help = "<prefix> d detaches, leaving the session running. \
-                  <prefix> ? lists the keys. The prefix is Ctrl-t by default. \
-                  :q ends the session, because the editor is the session."
+                  <prefix> ? lists the keys. The prefix is Ctrl-Space by \
+                  default. :q ends the session, because the editor is the \
+                  session."
 )]
 pub struct Cli {
     /// Host to manage sessions on; passed to ssh verbatim.
