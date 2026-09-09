@@ -47,7 +47,13 @@ pub trait Transport {
 
     /// Spawn a session running `launch`, whose `{sock}` becomes this session's
     /// socket — on this machine or on the far end, wherever the sessions live.
-    fn create_session(&self, name: &str, launch: &Launch) -> Result<Session>;
+    ///
+    /// `directory` is where it starts, absolute and on *this* host, as
+    /// [`crate::session::validate_directory`] left it. Whether it exists is the
+    /// spawn script's question and not asked here: it is the side that can
+    /// answer it without a round trip and without a gap between the answer and
+    /// the launch.
+    fn create_session(&self, name: &str, launch: &Launch, directory: &str) -> Result<Session>;
 
     /// Terminate a session, unconditionally: nvmux never asks about unsaved
     /// buffers. The ordinary way out is `:q` in the session itself, which ends
@@ -84,6 +90,15 @@ pub trait Transport {
     /// A session with no metadata — an orphan, or one killed since the listing —
     /// is skipped rather than having a record conjured for it.
     fn renumber(&self, sessions: &[Session]) -> Result<()>;
+
+    /// The home directory on the host that runs the sessions: what a new
+    /// session starts in unless the user says otherwise, and what a leading `~`
+    /// expands against.
+    ///
+    /// Empty only if the host could not say — over ssh, a `hello.sh` from a
+    /// newer nvmux than the far end has ever seen. The prompt then offers no
+    /// default rather than a wrong one.
+    fn home(&self) -> &str;
 
     /// A socket path on **this** machine that `nvim --server` can use.
     ///

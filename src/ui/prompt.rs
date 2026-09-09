@@ -10,20 +10,22 @@
 //! the labels, plain for what you type, dim for the defaults and the hint row:
 //!
 //! ```text
-//!     new session name: session 3
-//!     nvim command:     nvim --headless --listen {sock}
-//!     └─ bold            │ └─ dim
-//!                        └─ the cursor, an inverted cell
+//!     new session name:  session 3
+//!     nvim command:      nvim --headless --listen {sock}
+//!     working directory: /home/you
+//!     └─ bold             │ └─ dim
+//!                         └─ the cursor, an inverted cell
 //! ```
 //!
-//! # One screen, two fields
+//! # One screen, three fields
 //!
-//! Creating asks two questions — what the session is called, and how its Neovim
-//! is started — and asks them together rather than one after the other.
-//! Enter submits the whole form from whichever field it is pressed in, so
+//! Creating asks three questions — what the session is called, how its Neovim is
+//! started, and where it runs — and asks them together rather than one after the
+//! other. Enter submits the whole form from whichever field it is pressed in, so
 //! `<prefix> c` followed by enter still creates a session in one keystroke and
-//! the second question costs nothing to anyone who does not want it. Renaming
-//! puts up the same screen with one field, since a rename starts nothing.
+//! the second and third questions cost nothing to anyone who does not want them.
+//! Renaming puts up the same screen with one field, since a rename starts
+//! nothing.
 //!
 //! # The defaults are placeholders, not pre-filled values
 //!
@@ -85,6 +87,8 @@ pub(super) enum Task<'a> {
 const NAME: usize = 0;
 /// Where the command lives. Only [`Task::Create`] has one.
 const COMMAND: usize = 1;
+/// Where the working directory lives. Only [`Task::Create`] has one.
+const DIRECTORY: usize = 2;
 
 /// What enter asked for.
 #[derive(Debug, PartialEq, Eq)]
@@ -92,6 +96,8 @@ struct Submission {
     name: String,
     /// `None` when renaming, which starts nothing.
     command: Option<String>,
+    /// `None` when renaming, for the same reason.
+    directory: Option<String>,
 }
 
 /// What one keypress meant.
@@ -204,12 +210,13 @@ struct Prompt {
 }
 
 impl Prompt {
-    fn create(default_name: String, default_command: String) -> Self {
-        let labels = aligned(&["new session name", "nvim command"]);
+    fn create(default_name: String, default_command: String, default_directory: String) -> Self {
+        let labels = aligned(&["new session name", "nvim command", "working directory"]);
         Self {
             fields: vec![
                 Field::new(labels[0].clone(), String::new(), default_name),
                 Field::new(labels[1].clone(), String::new(), default_command),
+                Field::new(labels[2].clone(), String::new(), default_directory),
             ],
             focus: NAME,
             hints: "⏎ create   ⇥ field   → edit   esc cancel",
@@ -256,6 +263,7 @@ impl Prompt {
         Submission {
             name: self.fields[NAME].value(),
             command: self.fields.get(COMMAND).map(Field::value),
+            directory: self.fields.get(DIRECTORY).map(Field::value),
         }
     }
 
@@ -336,7 +344,11 @@ pub(super) fn run_on(
     task: Task,
 ) -> Result<Outcome> {
     let mut prompt = match task {
-        Task::Create => Prompt::create(next_free_name(transport)?, default_command(transport)),
+        Task::Create => Prompt::create(
+            next_free_name(transport)?,
+            default_command(transport),
+            transport.home().to_string(),
+        ),
         Task::Rename(session) => Prompt::rename(session),
     };
 
@@ -361,11 +373,18 @@ pub(super) fn run_on(
         let committed = match task {
             Task::Create => {
                 let line = submission.command.unwrap_or_default();
+                let typed = submission.directory.unwrap_or_default();
                 Launch::parse(&line)
                     .map_err(Into::into)
                     .and_then(|launch| {
+                        // Absolute by here, with any leading `~` already
+                        // expanded against the *session host's* home — see
+                        // `session::validate_directory`. Whether it exists is
+                        // the spawn script's question.
+                        let directory =
+                            crate::session::validate_directory(&typed, transport.home())?;
                         transport
-                            .create_session(&submission.name, &launch)
+                            .create_session(&submission.name, &launch, &directory)
                             // Only once a session has really started with it:
                             // offering back a command that never worked would
                             // make the same failure the default.
@@ -587,9 +606,14 @@ mod tests {
     use ratatui::Terminal;
 
     const COMMAND_DEFAULT: &str = "nvim --headless --listen {sock}";
+    const DIRECTORY_DEFAULT: &str = "/home/you";
 
     fn prompt() -> Prompt {
-        Prompt::create("session 3".to_string(), COMMAND_DEFAULT.to_string())
+        Prompt::create(
+            "session 3".to_string(),
+            COMMAND_DEFAULT.to_string(),
+            DIRECTORY_DEFAULT.to_string(),
+        )
     }
 
     fn renaming(name: &str) -> Prompt {
@@ -715,16 +739,17 @@ mod tests {
         );
     }
 
-    /// The zero-keystroke path `<prefix> c` used to be has to survive the
-    /// second field: enter on an untouched form means "both placeholders".
+    /// The zero-keystroke path `<prefix> c` used to be has to survive every
+    /// field added since: enter on an untouched form means "every placeholder".
     #[test]
-    fn enter_on_an_untouched_form_submits_both_defaults() {
+    fn enter_on_an_untouched_form_submits_every_default() {
         let mut p = prompt();
         assert_eq!(
             p.on_key(Key::Enter),
             Step::Submit(Submission {
                 name: "session 3".to_string(),
                 command: Some(COMMAND_DEFAULT.to_string()),
+                directory: Some(DIRECTORY_DEFAULT.to_string()),
             })
         );
     }
@@ -743,6 +768,7 @@ mod tests {
             Submission {
                 name: "notes".to_string(),
                 command: Some("nvim -u NONE --listen {sock}".to_string()),
+                directory: Some(DIRECTORY_DEFAULT.to_string()),
             }
         );
     }
@@ -801,13 +827,15 @@ mod tests {
         p.on_key(Key::Tab);
         assert_eq!(p.focus, COMMAND);
         p.on_key(Key::Tab);
-        assert_eq!(p.focus, NAME, "two fields, so tab wraps");
+        assert_eq!(p.focus, DIRECTORY);
+        p.on_key(Key::Tab);
+        assert_eq!(p.focus, NAME, "three fields, so tab wraps at the last");
         p.on_key(Key::BackTab);
-        assert_eq!(p.focus, COMMAND);
+        assert_eq!(p.focus, DIRECTORY);
         p.on_key(Key::Down);
         assert_eq!(p.focus, NAME);
         p.on_key(Key::Up);
-        assert_eq!(p.focus, COMMAND);
+        assert_eq!(p.focus, DIRECTORY);
     }
 
     /// A rename has one field; moving within it must be a no-op rather than an
@@ -951,7 +979,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("new session name: session 3")),
+                .any(|l| l.contains("new session name:  session 3")),
             "expected the placeholder back, got {lines:?}"
         );
     }
@@ -988,10 +1016,10 @@ mod tests {
     /// sets a colour.
     #[test]
     fn the_label_leads_the_cursor_marks_the_field_and_the_default_recedes() {
-        let label = "new session name: ".width();
+        let label = "new session name:  ".width();
 
         let empty = line_cells(&prompt(), 60, 9);
-        assert_eq!(text_of(&empty), "new session name: session 3");
+        assert_eq!(text_of(&empty), "new session name:  session 3");
         assert!(
             empty[..label]
                 .iter()
@@ -1011,7 +1039,7 @@ mod tests {
         let mut p = prompt();
         type_in(&mut p, "notes");
         let typed = line_cells(&p, 60, 9);
-        assert_eq!(text_of(&typed), "new session name: notes ");
+        assert_eq!(text_of(&typed), "new session name:  notes ");
         assert!(
             typed[..label]
                 .iter()
@@ -1059,7 +1087,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("nvim command:     nvim --headless --listen {sock}")),
+                .any(|l| l.contains("nvim command:      nvim --headless --listen {sock}")),
             "expected the command default under the name, got {lines:?}"
         );
     }
@@ -1094,13 +1122,16 @@ mod tests {
             Some("session 4".to_string()),
         );
         let lines = render(&p, 60, 9);
-        let field = lines
+        let first = lines
             .iter()
-            .position(|l| l.contains("new session name: notes"))
+            .position(|l| l.contains("new session name:  notes"))
             .expect("the field should still show what was typed");
+        // Counted off the last field rather than a fixed offset, so this keeps
+        // saying "below the fields" however many of them there come to be.
+        let below = first + p.fields.len();
         assert!(
-            lines[field + 2].contains("already exists"),
-            "expected the error below both fields, got {lines:?}"
+            lines[below..].iter().any(|l| l.contains("already exists")),
+            "expected the error below every field, got {lines:?}"
         );
     }
 

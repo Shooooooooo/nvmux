@@ -593,6 +593,7 @@ mod tests {
             &[
                 &dir.to_string_lossy(),
                 "aaaaaaaa",
+                "/",
                 "/bin/sh",
                 "-c",
                 STANDIN,
@@ -633,6 +634,7 @@ mod tests {
             &[
                 &dir.to_string_lossy(),
                 "aaaaaaaa",
+                "/",
                 "nvmux-no-such-editor",
                 "--listen",
                 "/tmp/x.sock",

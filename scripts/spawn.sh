@@ -1,12 +1,16 @@
 #!/bin/sh
 # Spawn a detached Neovim that survives our disconnection.
 #
-# Usage: sh spawn.sh <runtime_dir> <id> <cmd> [args...]
+# Usage: sh spawn.sh <runtime_dir> <id> <cwd> <cmd> [args...]
 #
 # The command is the caller's, one word per argument, already carrying this
 # session's socket path -- src/launch.rs is what validated and split it, and
 # nothing here re-parses it. It is run as-is: no shell, so no expansion, and no
 # string this script assembled.
+#
+# The working directory is the caller's too, and arrives already absolute:
+# src/session.rs refused a relative one and expanded any leading `~` against the
+# home directory hello.sh reported, so there is nothing here to expand either.
 #
 # Output:
 #   PID <pid>        the *validated* pid of the new nvim, or empty if we could
@@ -16,11 +20,12 @@
 #
 [ -n "${NVMUX_PRELUDE:-}" ] || . "$(dirname -- "$0")/_prelude.sh"
 
-usage='usage: spawn.sh <runtime_dir> <id> <cmd> [args...]'
+usage='usage: spawn.sh <runtime_dir> <id> <cwd> <cmd> [args...]'
 dir="${1:?$usage}"
 id="${2:?$usage}"
-: "${3:?$usage}"
-shift 2
+cwd="${3:?$usage}"
+: "${4:?$usage}"
+shift 3
 
 sock="$dir/$id.sock"
 log="$dir/$id.log"
@@ -84,6 +89,20 @@ rm -f "$sock"
 # cannot quietly fail the way a best-effort post-spawn call does, and it does
 # not build a command out of a path -- see src/shell.rs on why that matters.
 export NVMUX="$sock"
+
+# Where the session runs. Before the `command -v` below, not after: that resolves
+# a *relative* command path against the current directory, so `./nvim` would
+# otherwise be looked for in the directory nvmux happened to be started in rather
+# than the one the session is about to run in. Everything else this script names
+# -- $dir, $sock, $log -- is absolute and does not care.
+#
+# Two steps rather than one `cd`, because their failures are different questions:
+# a path that is not a directory (a typo, or a file) and one that is but cannot be
+# entered (a mode of 000, or a component we may not traverse). Both refuse rather
+# than launch somewhere else, which would be far worse than not launching: the
+# session would come up, look right, and be wrong.
+[ -d "$cwd" ] || refuse "$cwd: not a directory"
+cd -- "$cwd" || refuse "$cwd: could not enter it"
 
 # A command that is not there would otherwise be a five-second wait for a socket
 # that was never going to appear, and a timeout message blaming the session. The

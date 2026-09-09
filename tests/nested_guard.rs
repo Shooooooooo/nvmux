@@ -44,7 +44,7 @@ fn a_sessions_editor_carries_the_marker() {
     let t = scratch.transport();
 
     let session = t
-        .create_session("marked", &common::launch())
+        .create_session("marked", &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
 

@@ -80,18 +80,27 @@ reimplementing it.
 | `Esc` | clear the filter, or cancel a prompt |
 | `q` `Ctrl-c` | quit |
 
-`c` asks two things: what the session is called, and how its Neovim is started.
-`Tab` moves between the two fields and `Enter` submits both from either one, so
-`c` `Enter` still creates a session in one keystroke — with the suggested
-`session N` and the command you last used. Each field shows what `Enter` would
-take, dimmed; typing replaces it, and `→` takes it into the field to be edited
-instead, which is usually what you want for the command.
+`c` asks three things: what the session is called, how its Neovim is started, and
+where it runs. `Tab` moves between the fields and `Enter` submits the whole form
+from any one of them, so `c` `Enter` still creates a session in one keystroke —
+with the suggested `session N`, the command you last used, and your home
+directory. Each field shows what `Enter` would take, dimmed; typing replaces it,
+and `→` takes it into the field to be edited instead, which is usually what you
+want for the command.
 
 A session name is at most 64 bytes, has no leading or trailing whitespace and
 no control characters, and must not be in use — compared without regard to
 case.
 
 The command is described under [Configuration](#the-command-a-session-runs).
+
+**Where a session runs.** The third field is the directory its Neovim starts in —
+what `:pwd` reports, and what everything keyed off the working directory follows.
+It must be absolute, and it is a directory on whichever machine runs the session,
+so `nvmux myhost` completes and starts paths on *myhost*, not here. A leading `~`
+is expanded against that machine's home directory, which is also what the field
+offers by default; nothing else is expanded, for the reasons the command section
+gives. A directory that is not there is refused before anything is started.
 
 **Numbers name positions.** A session keeps the number it was created with for
 as long as you leave it where it is, so a number you have learned goes on
@@ -223,6 +232,7 @@ config file is the opposite on every count, which is why they are separate.
 Everything nvmux runs lives under `/tmp/nvmux-<uid>` (the same rule on both
 ends, so a session's files stay in one place across logouts); nvmux's own log
 is `nvmux.log` there, and each session's server output is `<id>.log` — beside
-`<id>.json`, which records the command that produced it. The verbosity comes
+`<id>.json`, which records the command that produced it and the directory it
+started in. The verbosity comes
 from `$NVMUX_LOG`, in `RUST_LOG` syntax, and defaults to warnings only.
 Keystrokes are never logged.

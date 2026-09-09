@@ -127,6 +127,17 @@ pub enum SessionError {
         reason: &'static str,
     },
 
+    /// Where a session's Neovim is started. Validated at the same boundary as a
+    /// name and a command, plus one rule of its own: it has to be absolute. A
+    /// relative path would be resolved against whatever directory the spawning
+    /// shell happened to be in, which is exactly the unpredictability asking the
+    /// question was meant to remove.
+    #[error("invalid working directory {directory:?}: {reason}")]
+    InvalidDirectory {
+        directory: String,
+        reason: &'static str,
+    },
+
     /// The socket appeared but nothing ever answered on it.
     #[error("session {name:?} did not become ready within {timeout:?}\n--- tail of {} ---\n{log_tail}", .log.display())]
     NotReady {

@@ -31,7 +31,7 @@ fn create_list_and_kill_a_session() {
     );
 
     let session = t
-        .create_session("dotfiles", &common::launch())
+        .create_session("dotfiles", &common::launch(), common::anywhere())
         .expect("create");
     assert_eq!(session.name, "dotfiles");
     assert_eq!(session.id.len(), 8, "id should be 8 base32 chars");
@@ -70,7 +70,7 @@ fn the_pid_recorded_is_the_process_serving_the_socket() {
     let scratch = Scratch::new("pid");
     let t = scratch.transport();
     let session = t
-        .create_session("pidcheck", &common::launch())
+        .create_session("pidcheck", &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
 
@@ -102,7 +102,7 @@ fn rename_edits_metadata_and_leaves_the_socket_alone() {
     let t = scratch.transport();
 
     let session = t
-        .create_session("before", &common::launch())
+        .create_session("before", &common::launch(), common::anywhere())
         .expect("create");
     let sock_before = t.local_socket_for(&session).expect("socket");
 
@@ -137,13 +137,13 @@ fn session_numbers_are_stable_and_a_freed_one_is_reused() {
     let t = scratch.transport();
 
     let first = t
-        .create_session("first", &common::launch())
+        .create_session("first", &common::launch(), common::anywhere())
         .expect("create");
     let second = t
-        .create_session("second", &common::launch())
+        .create_session("second", &common::launch(), common::anywhere())
         .expect("create");
     let third = t
-        .create_session("third", &common::launch())
+        .create_session("third", &common::launch(), common::anywhere())
         .expect("create");
     assert_eq!(
         (first.num, second.num, third.num),
@@ -168,7 +168,7 @@ fn session_numbers_are_stable_and_a_freed_one_is_reused() {
 
     // And the next create refills the hole rather than climbing to 4.
     let fourth = t
-        .create_session("fourth", &common::launch())
+        .create_session("fourth", &common::launch(), common::anywhere())
         .expect("create");
     assert_eq!(fourth.num, 2, "the freed number is handed out again");
 
@@ -188,7 +188,8 @@ fn a_reorder_is_still_there_after_a_relisting() {
     let t = scratch.transport();
 
     for name in ["first", "second", "third"] {
-        t.create_session(name, &common::launch()).expect("create");
+        t.create_session(name, &common::launch(), common::anywhere())
+            .expect("create");
     }
     let listed = t.list_sessions().expect("list");
     let names: Vec<&str> = listed.iter().map(|s| s.name.as_str()).collect();
@@ -244,7 +245,9 @@ fn a_reorder_never_writes_metadata_for_a_session_that_has_none() {
     let scratch = Scratch::new("reorder-orphan");
     let t = scratch.transport();
 
-    let session = t.create_session("only", &common::launch()).expect("create");
+    let session = t
+        .create_session("only", &common::launch(), common::anywhere())
+        .expect("create");
     let json = scratch.0.join(format!("{}.json", session.id));
     std::fs::remove_file(&json).expect("make it an orphan");
 
@@ -267,7 +270,9 @@ fn a_number_survives_the_metadata_round_trip() {
     let scratch = Scratch::new("num-roundtrip");
     let t = scratch.transport();
 
-    let session = t.create_session("only", &common::launch()).expect("create");
+    let session = t
+        .create_session("only", &common::launch(), common::anywhere())
+        .expect("create");
     let v = common::read_meta(&scratch.0.join(format!("{}.json", session.id)));
     assert_eq!(
         v.get("num").and_then(serde_json::Value::as_u64),
@@ -287,7 +292,7 @@ fn metadata_without_a_number_still_lists_and_gets_one() {
     let t = scratch.transport();
 
     let session = t
-        .create_session("legacy", &common::launch())
+        .create_session("legacy", &common::launch(), common::anywhere())
         .expect("create");
     let path = scratch.0.join(format!("{}.json", session.id));
 
@@ -312,19 +317,21 @@ fn duplicate_names_are_refused_on_create_and_rename() {
     let t = scratch.transport();
 
     let first = t
-        .create_session("taken", &common::launch())
+        .create_session("taken", &common::launch(), common::anywhere())
         .expect("create");
     assert!(
-        t.create_session("taken", &common::launch()).is_err(),
+        t.create_session("taken", &common::launch(), common::anywhere())
+            .is_err(),
         "duplicate name must be refused"
     );
     assert!(
-        t.create_session("TAKEN", &common::launch()).is_err(),
+        t.create_session("TAKEN", &common::launch(), common::anywhere())
+            .is_err(),
         "duplicate check should not be case-sensitive"
     );
 
     let second = t
-        .create_session("other", &common::launch())
+        .create_session("other", &common::launch(), common::anywhere())
         .expect("create second");
     assert!(
         t.rename_session(&second, "taken").is_err(),
@@ -344,7 +351,7 @@ fn unsaved_buffers_do_not_block_a_kill() {
     let t = scratch.transport();
 
     let session = t
-        .create_session("unsaved", &common::launch())
+        .create_session("unsaved", &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
 
@@ -368,7 +375,7 @@ fn a_dead_session_is_reaped_from_the_listing() {
     let t = scratch.transport();
 
     let session = t
-        .create_session("doomed", &common::launch())
+        .create_session("doomed", &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
     let json = sock.with_extension("json");
@@ -435,7 +442,7 @@ fn a_busy_session_is_never_reaped() {
     let t = scratch.transport();
 
     let session = t
-        .create_session("building", &common::launch())
+        .create_session("building", &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
 
@@ -468,7 +475,7 @@ fn names_with_shell_metacharacters_survive_a_round_trip() {
         "a;b|c&d",
     ] {
         let session = t
-            .create_session(name, &common::launch())
+            .create_session(name, &common::launch(), common::anywhere())
             .unwrap_or_else(|e| panic!("create {name:?}: {e}"));
         let listed = t.list_sessions().expect("list");
         let found = listed
@@ -496,7 +503,7 @@ fn a_session_busy_in_cpu_bound_lua_is_never_reaped() {
     let t = scratch.transport();
 
     let session = t
-        .create_session("compiling", &common::launch())
+        .create_session("compiling", &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
     let pid = session.pid;
@@ -540,7 +547,7 @@ fn a_timed_out_call_poisons_the_connection() {
     let scratch = Scratch::new("poison");
     let t = scratch.transport();
     let session = t
-        .create_session("poisoned", &common::launch())
+        .create_session("poisoned", &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
 
@@ -579,7 +586,7 @@ fn a_recycled_pid_neither_misfires_nor_blocks_the_kill() {
     let scratch = Scratch::new("recycled");
     let t = scratch.transport();
     let session = t
-        .create_session("stubborn", &common::launch())
+        .create_session("stubborn", &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
     let json = sock.with_extension("json");
@@ -625,7 +632,7 @@ fn killing_an_already_dead_session_cleans_up_its_files() {
     let scratch = Scratch::new("alreadydead");
     let t = scratch.transport();
     let session = t
-        .create_session("ghost", &common::launch())
+        .create_session("ghost", &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
     let json = sock.with_extension("json");
@@ -658,7 +665,7 @@ fn a_session_can_be_killed_on_a_host_with_proc_but_no_ps() {
     let scratch = Scratch::new("nops");
     let t = scratch.transport();
     let session = t
-        .create_session("noprocps", &common::launch())
+        .create_session("noprocps", &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
 
@@ -730,7 +737,7 @@ fn a_stale_pid_does_not_break_an_otherwise_normal_kill() {
     let scratch = Scratch::new("stalepid");
     let t = scratch.transport();
     let session = t
-        .create_session("staleish", &common::launch())
+        .create_session("staleish", &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
     let json = sock.with_extension("json");
@@ -760,7 +767,7 @@ fn metadata_left_by_a_self_terminating_session_is_swept_up() {
     let t = scratch.transport();
 
     let session = t
-        .create_session("selfquit", &common::launch())
+        .create_session("selfquit", &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
     let json = sock.with_extension("json");
@@ -797,7 +804,7 @@ fn a_session_at_a_hit_enter_prompt_is_listed_at_once_as_busy() {
     let scratch = Scratch::new("hitenter");
     let t = scratch.transport();
     let session = t
-        .create_session("prompted", &common::launch())
+        .create_session("prompted", &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
     let _ui = common::HitEnter::open(&sock);
@@ -826,7 +833,7 @@ fn probe_is_busy_at_a_hit_enter_prompt_and_alive_after_it() {
     let scratch = Scratch::new("hitenterprobe");
     let t = scratch.transport();
     let session = t
-        .create_session("prompted", &common::launch())
+        .create_session("prompted", &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
     let _ui = common::HitEnter::open(&sock);
@@ -856,7 +863,7 @@ fn a_fresh_attach_to_a_session_at_a_hit_enter_prompt_ends_it_and_attaches() {
     let scratch = Scratch::new("hitenterattach");
     let t = scratch.transport();
     let session = t
-        .create_session("prompted", &common::launch())
+        .create_session("prompted", &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
     let _ui = common::HitEnter::open(&sock);
@@ -900,7 +907,9 @@ fn a_chosen_command_is_what_runs_and_the_session_behaves_normally() {
     let t = scratch.transport();
 
     let launch = common::launch_with("--clean");
-    let session = t.create_session("bespoke", &launch).expect("create");
+    let session = t
+        .create_session("bespoke", &launch, common::anywhere())
+        .expect("create");
 
     let listed = t.list_sessions().expect("list");
     assert_eq!(listed.len(), 1);
@@ -945,7 +954,7 @@ fn a_command_that_names_nothing_fails_at_once_and_says_so() {
 
     let started = std::time::Instant::now();
     let err = t
-        .create_session("hopeless", &launch)
+        .create_session("hopeless", &launch, common::anywhere())
         .expect_err("nothing could have started");
     assert!(
         err.to_string().contains("nvmux-no-such-editor"),
@@ -976,7 +985,9 @@ fn a_session_whose_socket_is_not_the_last_argument_is_still_found_and_killed() {
 
     let launch = nvmux::launch::Launch::parse("nvim --headless --listen {sock} --clean")
         .expect("a valid command");
-    let session = t.create_session("trailing", &launch).expect("create");
+    let session = t
+        .create_session("trailing", &launch, common::anywhere())
+        .expect("create");
 
     let args = command_line(session.pid);
     assert!(
@@ -995,4 +1006,104 @@ fn a_session_whose_socket_is_not_the_last_argument_is_still_found_and_killed() {
         "a session nvmux cannot kill is one it has orphaned"
     );
     assert!(!sock.exists(), "kill must unlink the socket");
+}
+
+/// The whole point of asking: the editor really is started in the directory it
+/// was given, not in whatever directory nvmux happened to be run from.
+///
+/// Asked of the live Neovim rather than of `/proc`, which does not exist on
+/// macOS, and rather than of the pid's environment, which would not notice a
+/// `cd` at all.
+#[test]
+fn a_session_starts_in_the_directory_it_was_given() {
+    require_nvim!();
+    let scratch = Scratch::new("cwd");
+    let t = scratch.transport();
+
+    // A directory that is definitely not this process's, and definitely not the
+    // home directory a shell would otherwise have dropped the session into.
+    let where_ = scratch.0.join("workspace");
+    std::fs::create_dir_all(&where_).expect("make the working directory");
+    let where_ = where_.canonicalize().expect("canonicalise");
+
+    let session = t
+        .create_session("elsewhere", &common::launch(), &where_.to_string_lossy())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket");
+
+    let answer = scratch.0.join("cwd.txt");
+    let mut client = nvmux::rpc::Client::connect(&sock, Duration::from_secs(2)).expect("connect");
+    client
+        .command(&format!(
+            "call writefile([getcwd()], '{}')",
+            answer.display()
+        ))
+        .expect("ask the editor where it is");
+    drop(client);
+
+    let got = std::fs::read_to_string(&answer).expect("read the answer");
+    assert_eq!(
+        std::path::Path::new(got.trim())
+            .canonicalize()
+            .expect("canonicalise the answer"),
+        where_,
+        "the session is not where it was told to start"
+    );
+
+    t.kill_session(&session).expect("kill");
+}
+
+/// A directory that is not there is refused by the spawn script before it
+/// launches anything, so the error names the directory rather than arriving
+/// five seconds later as "the session did not become ready".
+#[test]
+fn a_directory_that_is_not_there_is_refused_before_anything_is_spawned() {
+    require_nvim!();
+    let scratch = Scratch::new("cwd-missing");
+    let t = scratch.transport();
+
+    let missing = scratch.0.join("no-such-directory");
+    let started = Instant::now();
+    let err = t
+        .create_session("hopeless", &common::launch(), &missing.to_string_lossy())
+        .expect_err("nothing could have started there");
+
+    assert!(
+        err.to_string().contains("no-such-directory")
+            && err.to_string().contains("not a directory"),
+        "the refusal must name the directory: {err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "it must not wait out the readiness timeout for a session it never started"
+    );
+    assert!(
+        t.list_sessions().expect("list").is_empty(),
+        "a refused create must leave nothing behind"
+    );
+}
+
+/// `<id>.json` records where a session was started, beside what launched it —
+/// so a listing can say, and a future nvmux has the answer without asking the
+/// editor.
+#[test]
+fn the_directory_is_recorded_in_the_session_metadata() {
+    require_nvim!();
+    let scratch = Scratch::new("cwd-meta");
+    let t = scratch.transport();
+
+    let where_ = scratch.0.join("recorded");
+    std::fs::create_dir_all(&where_).expect("make the working directory");
+
+    let session = t
+        .create_session("noted", &common::launch(), &where_.to_string_lossy())
+        .expect("create");
+    assert_eq!(session.directory, where_.to_string_lossy());
+    assert_eq!(
+        scratch.metadata(&session.id).directory,
+        where_.to_string_lossy(),
+        "what the transport returned must be what reached disk"
+    );
+
+    t.kill_session(&session).expect("kill");
 }
