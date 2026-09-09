@@ -36,6 +36,7 @@
 //! taken through it.
 
 pub mod app;
+pub mod complete;
 pub mod draw;
 pub mod help;
 pub mod prompt;
@@ -71,6 +72,17 @@ use app::{App, Key, Request};
 /// A bounded poll rather than an indefinite read, so a resize is not stuck
 /// behind an idle keyboard.
 const TICK: Duration = Duration::from_millis(250);
+
+/// The tick for a screen waiting on an answer it deliberately did not block
+/// for — the create prompt's directory completion, and nothing else so far.
+///
+/// A quarter of a second is the right wait for a resize, and far too long for a
+/// suggestion: a local listing comes back in about a millisecond, so on
+/// [`TICK`] the ghost text would appear a fifth of a second after it was ready
+/// and read as lag in the prompt rather than in the disk. Roughly one frame,
+/// and only for the few frames an answer is actually in flight — an idle prompt
+/// is back on [`TICK`] and costs nothing.
+const BUSY_TICK: Duration = Duration::from_millis(16);
 
 /// A ratatui screen that is guaranteed to be given back.
 ///
@@ -153,7 +165,13 @@ pub(crate) fn owning<T>(f: impl FnOnce(&mut ratatui::DefaultTerminal) -> Result<
 /// [`setup`] deliberately does not use this: it needs the raw chord, since
 /// [`translate`] discards every control chord but the three the picker binds.
 pub(crate) fn poll_key() -> Result<Option<Key>> {
-    if !event::poll(TICK)? {
+    poll_key_for(TICK)
+}
+
+/// The same, waiting only `tick` — for a caller with something else to check
+/// when the keyboard is idle. See [`BUSY_TICK`].
+pub(crate) fn poll_key_for(tick: Duration) -> Result<Option<Key>> {
+    if !event::poll(tick)? {
         return Ok(None);
     }
     Ok(match event::read()? {

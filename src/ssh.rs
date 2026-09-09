@@ -71,6 +71,39 @@ fn common(ctl: &Path) -> Vec<String> {
     vec!["-o".into(), format!("ControlPath={}", ctl.display())]
 }
 
+/// How long an unattended command waits to reach the host. Only a *connect*
+/// budget: a listing that is merely slow still lands, and nothing here bounds
+/// the host's own thinking time.
+const UNATTENDED_CONNECT_SECS: u64 = 5;
+
+/// Options for a command nvmux asked for rather than one the user did — so far
+/// only the create prompt's directory completion, which runs on a worker thread
+/// with nobody watching it.
+///
+/// This is where `BatchMode=yes` belongs, and it is the exact inverse of the
+/// reasoning above rather than a contradiction of it. A prompt the user can
+/// answer is right for a command they asked for; for a listing they did not ask
+/// for it is a disaster, because there is no terminal to answer it on — the
+/// screen belongs to ratatui — and the child would sit on a passphrase prompt
+/// forever, holding the worker thread with it. `ssh -O check` cannot be used to
+/// pre-empt that either: it asks the local multiplexing socket, so it answers
+/// yes for a master whose connection is wedged.
+///
+/// So: never ask, and give up on an unreachable host rather than hanging. The
+/// cost of being wrong is a suggestion the user did not get; the cost of the
+/// interactive options here would be a prompt that quietly stops completing and
+/// a thread that never ends.
+fn unattended(ctl: &Path) -> Vec<String> {
+    let mut args = common(ctl);
+    args.extend([
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        format!("ConnectTimeout={UNATTENDED_CONNECT_SECS}"),
+    ]);
+    args
+}
+
 /// Arguments for bringing up the shared master connection.
 ///
 /// `StreamLocalBindUnlink=yes` belongs **here** and nowhere else: the master
@@ -146,7 +179,17 @@ pub fn cancel_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<S
 /// `-n` must never be added: with `sh -s` it silently yields an *empty* result,
 /// because stdin comes from /dev/null and `sh` exits 0.
 pub fn exec_args(host: &str, ctl: &Path, script_args: &[&str]) -> Vec<String> {
-    let mut args = common(ctl);
+    exec_args_with(common(ctl), host, script_args)
+}
+
+/// The same command, with the options an unattended run needs — see
+/// [`unattended`]. Identical in every other respect, so what runs on the host is
+/// the same program reached the same way.
+pub fn unattended_exec_args(host: &str, ctl: &Path, script_args: &[&str]) -> Vec<String> {
+    exec_args_with(unattended(ctl), host, script_args)
+}
+
+fn exec_args_with(mut args: Vec<String>, host: &str, script_args: &[&str]) -> Vec<String> {
     let remote = format!(
         "{} nvmux {}",
         shell::login_shell_wrapper(r#"sh -s "$@""#),
@@ -326,7 +369,23 @@ impl Ssh {
 
     /// The script goes over stdin, never interpolated into the command line.
     pub fn run_script(&self, script: &str, args: &[&str]) -> Result<proc::Output, SshError> {
-        let argv = exec_args(&self.host, &self.control_path, args);
+        self.exec(exec_args(&self.host, &self.control_path, args), script)
+    }
+
+    /// The same, for a script nvmux is running on its own account: it never
+    /// prompts and it gives up on an unreachable host. See [`unattended`].
+    pub fn run_script_unattended(
+        &self,
+        script: &str,
+        args: &[&str],
+    ) -> Result<proc::Output, SshError> {
+        self.exec(
+            unattended_exec_args(&self.host, &self.control_path, args),
+            script,
+        )
+    }
+
+    fn exec(&self, argv: Vec<String>, script: &str) -> Result<proc::Output, SshError> {
         tracing::debug!(args = ?argv, "ssh exec");
         let mut cmd = Command::new("ssh");
         cmd.args(&argv);
@@ -376,6 +435,53 @@ mod tests {
 
     fn joined(args: &[String]) -> String {
         args.join(" ")
+    }
+
+    /// The one difference between a command the user asked for and a listing
+    /// nvmux asked for on its own account. Getting this backwards either way is
+    /// bad: `BatchMode` on the interactive path breaks every key that needs a
+    /// passphrase or a touch, and its absence on the completion path leaves a
+    /// worker thread sitting on a prompt no one can see, let alone answer.
+    #[test]
+    fn only_an_unattended_run_refuses_to_prompt() {
+        let interactive = exec_args("myhost", Path::new(CTL), &["/tmp/nvmux-0"]);
+        assert!(
+            !interactive.iter().any(|a| a.contains("BatchMode")),
+            "a command the user asked for must still be able to prompt: {interactive:?}"
+        );
+        assert!(!interactive.iter().any(|a| a.contains("ConnectTimeout")));
+
+        let unattended = unattended_exec_args("myhost", Path::new(CTL), &["/tmp/nvmux-0"]);
+        assert!(
+            unattended.iter().any(|a| a == "BatchMode=yes"),
+            "a listing nobody is watching must never prompt: {unattended:?}"
+        );
+        assert!(
+            unattended
+                .iter()
+                .any(|a| a == &format!("ConnectTimeout={UNATTENDED_CONNECT_SECS}")),
+            "and must give up on a host it cannot reach: {unattended:?}"
+        );
+    }
+
+    /// Otherwise the two would drift, and a completion would end up running a
+    /// different program, or reaching it a different way, from every other
+    /// script — which is exactly the sort of difference that is only ever found
+    /// in the field.
+    #[test]
+    fn the_two_option_sets_differ_in_nothing_but_the_options() {
+        let interactive = exec_args("myhost", Path::new(CTL), &["a", "b"]);
+        let unattended = unattended_exec_args("myhost", Path::new(CTL), &["a", "b"]);
+        assert_eq!(
+            interactive.last(),
+            unattended.last(),
+            "the remote command must be the same"
+        );
+        assert_eq!(
+            interactive[interactive.len() - 2],
+            unattended[unattended.len() - 2],
+            "and so must the host"
+        );
     }
 
     #[test]

@@ -48,6 +48,27 @@
 //! field take the default into it, cursor at the end, instead of moving a cursor
 //! that has nowhere to go. One keypress to edit the default; typing anything
 //! else still replaces it outright.
+//!
+//! # The working directory completes as you type
+//!
+//! The same idea a third time, and the reason `→` was worth establishing as "take
+//! what is offered": the dim text after the cursor in the directory field is as
+//! much of the path as is certain — the longest prefix every directory that could
+//! come next shares — and `→` makes it real. A single match completes to its end
+//! and gains a `/`, so the next component can be typed without reaching for one.
+//! The row below lists the alternatives when there is more than one.
+//!
+//! `Tab` therefore goes on meaning "next field" in every field, which is what
+//! the README's key table promises and what makes tabbing through the form
+//! survive a question that has a keyboard idiom of its own.
+//!
+//! A suggestion is offered only where `→` would actually take it: in the focused
+//! field, with something typed, and with the cursor at the end. It is never what
+//! enter submits — a ghost is an offer, and accepting one is a keystroke.
+//!
+//! The listing behind it runs on a worker thread and reaches this loop through a
+//! channel; [`super::complete`] is where that lives and why. What matters here is
+//! that no keystroke ever waits for it.
 
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
@@ -57,6 +78,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use super::app::Key;
+use super::complete;
 use super::draw;
 use crate::error::Result;
 use crate::launch::Launch;
@@ -120,6 +142,11 @@ struct Field {
     /// Characters rather than bytes so arithmetic on it cannot land mid-glyph.
     cursor: usize,
     default: String,
+    /// What `→` would add to the end of `input` — the directory field's
+    /// suggestion, dim after the cursor. Derived, never typed: the prompt sets
+    /// it from [`super::complete::Completer`] after every key, so it cannot
+    /// drift out of step with what is there.
+    ghost: String,
 }
 
 impl Field {
@@ -130,6 +157,7 @@ impl Field {
             input,
             cursor,
             default,
+            ghost: String::new(),
         }
     }
 
@@ -158,6 +186,9 @@ impl Field {
         if self.adopt_default() {
             return;
         }
+        if self.adopt_ghost() {
+            return;
+        }
         self.cursor = (self.cursor + 1).min(self.len());
     }
 
@@ -167,6 +198,7 @@ impl Field {
 
     fn end(&mut self) {
         self.adopt_default();
+        self.adopt_ghost();
         self.cursor = self.len();
     }
 
@@ -181,8 +213,27 @@ impl Field {
         true
     }
 
+    /// Take the suggestion into the field. Only from the *end* of what has been
+    /// typed: with the cursor anywhere else there is a cursor to move, and the
+    /// suggestion continues text that is no longer the last thing typed.
+    ///
+    /// The same key as [`Field::adopt_default`] and the same idea — the dim text
+    /// is what `→` makes real — so one keystroke means "take what is offered"
+    /// wherever it is offered, and `Tab` goes on meaning "next field" in every
+    /// field, which is what the README's table promises.
+    fn adopt_ghost(&mut self) -> bool {
+        if self.ghost.is_empty() || self.cursor != self.len() {
+            return false;
+        }
+        self.input.push_str(&self.ghost);
+        self.ghost.clear();
+        self.cursor = self.len();
+        true
+    }
+
     /// What this field submits: the trimmed text, or the default when there is
-    /// none — which is exactly what the placeholder was showing.
+    /// none — which is exactly what the placeholder was showing. Never the
+    /// suggestion: a ghost is an offer, and accepting one is a keystroke.
     fn value(&self) -> String {
         let text = self.input.trim();
         if text.is_empty() {
@@ -207,6 +258,26 @@ struct Prompt {
     focus: usize,
     hints: &'static str,
     message: Option<String>,
+    /// The row under the fields: the directories the working directory field
+    /// could still become. `None` on a prompt that has no such field — a
+    /// rename — and empty when there is nothing to say.
+    candidates: Option<Candidates>,
+}
+
+/// What the row under the fields has to say, before it is fitted to a terminal.
+///
+/// The names are kept rather than a finished line, because how many of them fit
+/// is a question about display width, and the width is not known until the
+/// frame is drawn — see [`candidate_row`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Candidates {
+    /// What the last component typed could still become.
+    names: Vec<String>,
+    /// The host stopped short of listing everything, so `names` is part of an
+    /// answer rather than all of one.
+    partial: bool,
+    /// Said instead of the names: so far only that nothing matched.
+    message: String,
 }
 
 impl Prompt {
@@ -221,6 +292,7 @@ impl Prompt {
             focus: NAME,
             hints: "⏎ create   ⇥ field   → edit   esc cancel",
             message: None,
+            candidates: Some(Candidates::default()),
         }
     }
 
@@ -235,6 +307,7 @@ impl Prompt {
             focus: NAME,
             hints: "⏎ rename   esc cancel",
             message: None,
+            candidates: None,
         }
     }
 
@@ -352,14 +425,45 @@ pub(super) fn run_on(
         Task::Rename(session) => Prompt::rename(session),
     };
 
+    // Only a create has a directory to complete, and only a create pays for the
+    // worker. Dropped with the prompt, which is what ends it — see
+    // `super::complete`.
+    let mut completer = match task {
+        Task::Create => Some(complete::Completer::new(transport.dir_source())),
+        Task::Rename(_) => None,
+    };
+    // Ask about the default before a key is pressed. The answer is then usually
+    // already in hand when the first one is, which is the difference between the
+    // field feeling instant and it paying a round trip to say its first word.
+    refresh(&mut prompt, completer.as_mut());
+
     loop {
         terminal.draw(|f| draw(f, &prompt))?;
 
-        let Some(key) = super::poll_key()? else {
+        // A shorter wait only while an answer is outstanding: an idle prompt is
+        // back on the ordinary tick and costs nothing.
+        let waiting = completer.as_ref().is_some_and(complete::Completer::waiting);
+        let tick = if waiting {
+            super::BUSY_TICK
+        } else {
+            super::TICK
+        };
+
+        let Some(key) = super::poll_key_for(tick)? else {
+            // Nothing was typed, so nothing new is being asked. What may have
+            // arrived is an answer to what was.
+            if completer.as_mut().is_some_and(complete::Completer::poll) {
+                show(&mut prompt, completer.as_ref());
+            }
             continue;
         };
 
-        let submission = match prompt.on_key(key) {
+        let step = prompt.on_key(key);
+        // After the key, not before: `→` may have taken the suggestion, which
+        // makes the input a new question.
+        refresh(&mut prompt, completer.as_mut());
+
+        let submission = match step {
             Step::None => continue,
             Step::Cancel => return Ok(Outcome::Cancelled),
             Step::Submit(submission) => submission,
@@ -409,6 +513,155 @@ pub(super) fn run_on(
             }
         }
     }
+}
+
+/// Put the directory field's current text to the completer, and show whatever
+/// it can already answer.
+///
+/// Called after every key. It does no I/O: [`complete::Completer::ask`] looks in
+/// memory and, failing that, posts a question for the worker — which is the
+/// whole reason a keystroke is never slower than a keystroke.
+///
+/// What is offered follows the *value*, not the input, so an untouched field
+/// completes inside the home directory it is showing rather than inside nothing.
+fn refresh(prompt: &mut Prompt, completer: Option<&mut complete::Completer>) {
+    let Some(completer) = completer else {
+        return;
+    };
+    let typed = prompt.fields[DIRECTORY].value();
+    completer.ask(&typed);
+    show(prompt, Some(completer));
+}
+
+/// Copy what the completer is offering onto the screen: the suggestion after
+/// the cursor, and the alternatives on the row below.
+///
+/// The ghost goes on the field only while that field is where the keystrokes
+/// are going. Offering to extend a field the cursor is not in would be offering
+/// something `→` would not do.
+fn show(prompt: &mut Prompt, completer: Option<&complete::Completer>) {
+    let Some(completer) = completer else {
+        return;
+    };
+    let field = &prompt.fields[DIRECTORY];
+    let focused = prompt.focus == DIRECTORY;
+    // Against the value rather than the input, matching what was asked: an
+    // untouched field is showing its default, and completing it means completing
+    // that.
+    let typed = field.value();
+    // A suggestion is only ever offered where `→` would actually take it:
+    //
+    // * in the focused field, since a ghost elsewhere would be an offer the
+    //   keystrokes are not going to reach;
+    // * with something typed, because `→` on an empty field already means "take
+    //   the default", and an offer hanging off dim text nobody has touched would
+    //   be two offers on one line;
+    // * with the cursor at the end, because that is the only place
+    //   `Field::adopt_ghost` accepts one — anywhere else `→` moves the cursor,
+    //   and showing text it would not take is a lie about what the key does.
+    let offerable = focused && !field.input.is_empty() && field.cursor == field.len();
+
+    prompt.fields[DIRECTORY].ghost = if offerable {
+        completer.ghost()
+    } else {
+        String::new()
+    };
+
+    prompt.candidates = Some(if !focused {
+        Candidates::default()
+    } else if completer.waiting() {
+        Candidates {
+            message: "…".to_string(),
+            ..Candidates::default()
+        }
+    } else {
+        alternatives(completer.candidates(), &typed, completer.truncated())
+    });
+}
+
+/// What the row under the fields should say: what else the last component could
+/// still become.
+///
+/// The names alone, not their paths — the path is on the line above, and
+/// repeating it would push the part that differs off the right of the screen.
+fn alternatives(names: &[String], typed: &str, truncated: bool) -> Candidates {
+    let matched = crate::dirs::split(typed).map(|(_, p)| p).unwrap_or("");
+
+    // Nothing matched. Said plainly rather than left blank: a path with a typo
+    // in it looks exactly like one still being typed, and the difference is
+    // otherwise only discovered by pressing enter.
+    //
+    // Only once something has been typed to not match, though — an empty
+    // directory is not a mistake, and announcing it on every fresh `/` would be
+    // noise on the commonest keystroke there is.
+    if names.is_empty() {
+        return Candidates {
+            message: if matched.is_empty() {
+                String::new()
+            } else {
+                format!("no directory here starts with {matched:?}")
+            },
+            ..Candidates::default()
+        };
+    }
+
+    Candidates {
+        names: names.to_vec(),
+        partial: truncated,
+        message: String::new(),
+    }
+}
+
+/// Fit the row to the terminal, saying what did not fit.
+///
+/// A row cut off at the right edge reads as a complete list that happens to end
+/// there, which is the one thing it must not do: a directory with forty children
+/// would look like a directory with twelve. So names are dropped until the count
+/// of the dropped ones fits beside the rest.
+///
+/// `partial` — the host itself stopped short — is a different and weaker claim:
+/// how many more there are is not known, only that there are some.
+fn candidate_row(c: &Candidates, width: usize) -> String {
+    if !c.message.is_empty() {
+        return draw::truncate(&c.message, width);
+    }
+    // One candidate is what the ghost is already showing. Repeating it below
+    // says nothing and costs the row — unless the host stopped short, in which
+    // case the one shown is not the whole answer and the row has to say so.
+    if c.names.is_empty() || (c.names.len() < 2 && !c.partial) {
+        return String::new();
+    }
+
+    // Cumulative width of the first n names joined by two spaces, so the search
+    // below costs one pass rather than a join per candidate length.
+    let mut used = 0;
+    let widths: Vec<usize> = c
+        .names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            used += n.width() + if i == 0 { 0 } else { 2 };
+            used
+        })
+        .collect();
+
+    let tail = |shown: usize| match (c.names.len() - shown, c.partial) {
+        (0, false) => String::new(),
+        (_, true) => "  (and more)".to_string(),
+        (hidden, false) => format!("  (+{hidden} more)"),
+    };
+
+    // At most `width` names can fit in `width` columns, so this scan is bounded
+    // by the terminal rather than by the size of the directory.
+    let ceiling = widths.iter().take_while(|&&w| w <= width).count();
+    for shown in (1..=ceiling).rev() {
+        if widths[shown - 1] + tail(shown).width() <= width {
+            return format!("{}{}", c.names[..shown].join("  "), tail(shown));
+        }
+    }
+    // Not even one name and its count fit. The number alone still beats a line
+    // cut off mid-word.
+    draw::truncate(&format!("({} to choose from)", c.names.len()), width)
 }
 
 /// The name a session gets when the user just presses enter. Compared
@@ -468,7 +721,12 @@ fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
     }
 
     let rows = prompt.fields.len() as u16;
-    let height = rows + u16::from(prompt.message.is_some());
+    // The candidate row is reserved for the life of the prompt and left blank
+    // when there is nothing to say. A row that came and went would move the
+    // whole form up and down half a cell as you typed — which is the jitter the
+    // fixed anchor above exists to avoid, arriving by another door.
+    let height =
+        rows + u16::from(prompt.candidates.is_some()) + u16::from(prompt.message.is_some());
     let opening = prompt
         .fields
         .iter()
@@ -494,20 +752,37 @@ fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
         );
     }
 
-    // Routinely wider than the fields, so it gets the full width and its own
-    // centring rather than hanging off the anchor.
-    if anchor.height > rows {
-        if let Some(msg) = prompt.message.as_deref() {
-            frame.render_widget(
-                Paragraph::new(Line::from(draw::truncate(msg, area.width as usize)))
-                    .alignment(Alignment::Center),
-                Rect {
-                    y: anchor.y + rows,
-                    height: 1,
-                    ..area
-                },
-            );
+    // Both of these are routinely wider than the fields, so they get the full
+    // width and their own centring rather than hanging off the anchor.
+    let mut y = anchor.y + rows;
+    let mut row = |frame: &mut Frame, text: &str, style: Style| {
+        if y >= anchor.y + anchor.height {
+            return;
         }
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                draw::truncate(text, area.width as usize),
+                style,
+            )))
+            .alignment(Alignment::Center),
+            Rect {
+                y,
+                height: 1,
+                ..area
+            },
+        );
+        y += 1;
+    };
+
+    if let Some(candidates) = prompt.candidates.as_ref() {
+        row(
+            frame,
+            &candidate_row(candidates, area.width as usize),
+            Style::default().add_modifier(Modifier::DIM),
+        );
+    }
+    if let Some(msg) = prompt.message.as_deref() {
+        row(frame, msg, Style::default());
     }
 }
 
@@ -544,10 +819,13 @@ fn field_line(field: &Field, focused: bool, width: usize) -> Line<'static> {
         // there would be two on screen and no telling which is live.
         (true, false) => spans.push(Span::styled(draw::truncate(&field.default, room), dim)),
         (false, true) => {
-            let (before, at, after) = around_cursor(field, room);
+            let (before, at, after, ghost) = around_cursor(field, room);
             spans.push(Span::raw(before));
             spans.push(Span::styled(at, cursor));
             spans.push(Span::raw(after));
+            // The offer, in the same weight as a placeholder and for the same
+            // reason: it is not there yet, and `→` is what makes it real.
+            spans.push(Span::styled(ghost, dim));
         }
         (false, false) => spans.push(Span::raw(draw::truncate(&field.input, room))),
     }
@@ -561,15 +839,28 @@ fn split_first(s: &str) -> Option<(String, &str)> {
 }
 
 /// The text either side of the cursor and the cell under it, windowed to `max`
-/// display columns.
+/// display columns: what was typed before it, the cell it inverts, what was
+/// typed after it, and the suggestion beyond that.
 ///
 /// The opposite choice from `draw::truncate`, and for a reason: a field has to
 /// keep the cursor visible, so when a command outgrows it the text scrolls
 /// rather than the part being edited disappearing. The cursor may sit one past
 /// the end, so the line is treated as the input plus a trailing blank — which is
 /// the cell it inverts there.
-fn around_cursor(field: &Field, max: usize) -> (String, String, String) {
-    let cells: Vec<char> = field.input.chars().chain([' ']).collect();
+///
+/// The suggestion is windowed **with** the input rather than after it, or a path
+/// longer than the field would scroll the typed text and leave the ghost hanging
+/// in columns it had already given away.
+fn around_cursor(field: &Field, max: usize) -> (String, String, String, String) {
+    let input: Vec<char> = field.input.chars().collect();
+    // Where the typed text stops and the offer begins. The one index that has to
+    // survive the windowing, since it is what decides which span is dim.
+    let boundary = input.len();
+    let cells: Vec<char> = input
+        .into_iter()
+        .chain(field.ghost.chars())
+        .chain([' '])
+        .collect();
     let at = field.cursor.min(cells.len() - 1);
     let width = |c: char| c.to_string().width().max(1);
 
@@ -590,11 +881,19 @@ fn around_cursor(field: &Field, max: usize) -> (String, String, String) {
         end += 1;
     }
 
+    // Split whatever follows the cursor at the boundary. Clamped into
+    // `after..end` from both sides, so a cursor sitting inside the offer or past
+    // the end of everything yields an empty span rather than a reversed range.
+    let after = at + 1;
+    let plain_end = end.min(boundary).max(after);
+    let ghost_start = after.max(boundary).min(end);
+
     let text = |range: &[char]| range.iter().collect::<String>();
     (
         text(&cells[start..at]),
         text(&cells[at..at + 1]),
-        text(&cells[at + 1..end]),
+        text(&cells[after..plain_end]),
+        text(&cells[ghost_start..end]),
     )
 }
 
@@ -1003,13 +1302,253 @@ mod tests {
     /// Both fields' values start in the same column, so the cursor does not
     /// jump sideways when focus moves between them.
     #[test]
-    fn the_two_fields_line_up() {
-        let mut on_command = prompt();
-        on_command.on_key(Key::Tab);
-        assert_eq!(
-            field_column(&prompt(), 60, 9),
-            field_column(&on_command, 60, 9)
+    fn the_three_fields_line_up() {
+        let base = field_column(&prompt(), 60, 9);
+        for tabs in 1..3 {
+            let mut p = prompt();
+            for _ in 0..tabs {
+                p.on_key(Key::Tab);
+            }
+            assert_eq!(field_column(&p, 60, 9), base, "field {tabs} is out of line");
+        }
+    }
+
+    fn some_candidates(names: &[&str]) -> Candidates {
+        Candidates {
+            names: names.iter().map(|n| n.to_string()).collect(),
+            partial: false,
+            message: String::new(),
+        }
+    }
+
+    /// A field with something typed in it, a suggestion attached, and the focus
+    /// on it — the state every rendering test below wants.
+    fn completing(typed: &str, ghost: &str) -> Prompt {
+        let mut p = prompt();
+        p.on_key(Key::Tab);
+        p.on_key(Key::Tab);
+        assert_eq!(p.focus, DIRECTORY);
+        type_in(&mut p, typed);
+        p.fields[DIRECTORY].ghost = ghost.to_string();
+        p
+    }
+
+    /// The suggestion recedes and the typed path does not, so it reads as an
+    /// offer rather than as text that is already there.
+    #[test]
+    fn the_completion_recedes_and_the_typed_path_does_not() {
+        let p = completing("/home/you/pro", "jects/");
+        let cells = line_cells(&p, 60, 9);
+        let text = text_of(&cells);
+        assert!(
+            text.ends_with("/home/you/projects/"),
+            "the whole line should read as the completed path: {text:?}"
         );
+
+        // Everything the user typed is plain; everything offered is dim.
+        let dim: String = cells
+            .iter()
+            .filter(|(_, m)| m.contains(Modifier::DIM))
+            .map(|(s, _)| s.as_str())
+            .collect();
+        assert_eq!(dim, "ects/", "only the offer recedes");
+
+        // And the cursor is on the offer's first character, not on a blank past
+        // the end, so the suggestion sits in the columns it will occupy.
+        let cursor: String = cells
+            .iter()
+            .filter(|(_, m)| m.contains(Modifier::REVERSED))
+            .map(|(s, _)| s.as_str())
+            .collect();
+        assert_eq!(cursor, "j");
+    }
+
+    /// The row is reserved for the life of the prompt. A row that came and went
+    /// would move the whole form up and down as the user typed.
+    #[test]
+    fn the_candidate_row_holds_its_place_when_there_is_nothing_to_show() {
+        let quiet = prompt();
+        let mut busy = prompt();
+        busy.candidates = Some(some_candidates(&["projects", "prototypes"]));
+
+        let row_of = |p: &Prompt| {
+            cells_of(p, 60, 9)
+                .iter()
+                .position(|row| row.iter().any(|(_, m)| m.contains(Modifier::REVERSED)))
+                .expect("a cursor")
+        };
+        assert_eq!(
+            row_of(&quiet),
+            row_of(&busy),
+            "the fields must not move when candidates appear"
+        );
+
+        let lines = render(&busy, 60, 9);
+        assert!(
+            lines.iter().any(|l| l.contains("projects  prototypes")),
+            "expected the candidates below the fields, got {lines:?}"
+        );
+    }
+
+    /// What the row says in each of the states it has. The no-match line is the
+    /// one worth pinning hardest: an ordering that returned early on "fewer than
+    /// two candidates" would swallow it, and the prompt would then look exactly
+    /// the same whether a path was half-typed or wrong.
+    #[test]
+    fn the_candidate_row_says_which_of_its_states_it_is_in() {
+        let names = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        let row = |ns: &[&str], typed: &str, partial: bool| {
+            candidate_row(&alternatives(&names(ns), typed, partial), 80)
+        };
+
+        assert_eq!(
+            row(&["projects", "prototypes"], "/home/pro", false),
+            "projects  prototypes"
+        );
+        assert_eq!(
+            row(&["projects"], "/home/proj", false),
+            "",
+            "one candidate is what the ghost is already showing"
+        );
+        assert_eq!(
+            row(&[], "/home/zzz", false),
+            "no directory here starts with \"zzz\"",
+            "a typo must not look like a path still being typed"
+        );
+        assert_eq!(
+            row(&[], "/home/", false),
+            "",
+            "an empty directory is not a mistake to announce"
+        );
+        assert_eq!(
+            row(&["a"], "/big/a", true),
+            "a  (and more)",
+            "a lone candidate out of a partial listing is not the whole answer"
+        );
+    }
+
+    /// A row cut off at the right edge reads as a complete list that happens to
+    /// end there. A directory with forty children would then look like one with
+    /// twelve, and nothing on screen would say otherwise.
+    #[test]
+    fn a_candidate_row_too_wide_for_the_terminal_says_how_many_it_dropped() {
+        let many = Candidates {
+            names: (1..=40).map(|i| format!("deep{i}")).collect(),
+            partial: false,
+            message: String::new(),
+        };
+
+        for width in [20usize, 40, 80, 100] {
+            let row = candidate_row(&many, width);
+            assert!(
+                row.width() <= width,
+                "the row overflowed {width} columns: {row:?} ({})",
+                row.width()
+            );
+            assert!(
+                row.contains("more") || row.contains("to choose from"),
+                "a dropped name must be accounted for at {width} columns: {row:?}"
+            );
+        }
+
+        // Wide enough for all of them, so there is nothing to account for.
+        let all = candidate_row(&many, 400);
+        assert!(all.starts_with("deep1  deep2  "));
+        assert!(!all.contains("more"), "nothing was dropped: {all:?}");
+    }
+
+    /// The host stopping short is a weaker claim than a row not fitting: how
+    /// many more there are is not known, only that there are some.
+    #[test]
+    fn a_partial_listing_never_claims_a_count_it_does_not_have() {
+        let partial = Candidates {
+            names: (1..=5).map(|i| format!("d{i}")).collect(),
+            partial: true,
+            message: String::new(),
+        };
+        let row = candidate_row(&partial, 80);
+        assert_eq!(row, "d1  d2  d3  d4  d5  (and more)");
+        assert!(!row.contains('+'), "no count is known: {row:?}");
+    }
+
+    /// A terminal too narrow for even one name and its count. The number alone
+    /// still beats a line cut off mid-word.
+    #[test]
+    fn a_terminal_too_narrow_for_any_candidate_still_says_there_are_some() {
+        let many = Candidates {
+            names: (1..=40)
+                .map(|i| format!("a-long-directory-name-{i}"))
+                .collect(),
+            partial: false,
+            message: String::new(),
+        };
+        let row = candidate_row(&many, 12);
+        assert!(row.width() <= 12, "{row:?}");
+        assert!(!row.is_empty(), "silence would be the one wrong answer");
+    }
+
+    /// A rename has no directory to complete, so it has no row to reserve — and
+    /// reserving one would put a blank line under a one-field prompt.
+    #[test]
+    fn a_rename_has_no_candidate_row_at_all() {
+        assert!(renaming("notes").candidates.is_none());
+    }
+
+    /// A ghost is an offer. Enter takes what was typed, and `→` is what makes
+    /// the offer real — so a form submitted without pressing it must not smuggle
+    /// the suggestion into the session's directory.
+    #[test]
+    fn a_ghost_is_never_what_enter_submits() {
+        let mut p = completing("/home/you/pro", "jects/");
+        assert_eq!(
+            submitted(&mut p).directory,
+            Some("/home/you/pro".to_string()),
+            "only what was typed"
+        );
+    }
+
+    /// `→` and `End` take the offer, and both leave the cursor after it so the
+    /// next component can be typed straight away.
+    #[test]
+    fn right_at_the_end_of_a_path_takes_the_ghost_and_end_does_too() {
+        for key in [Key::Right, Key::End] {
+            let mut p = completing("/home/you/pro", "jects/");
+            p.on_key(key);
+            assert_eq!(p.fields[DIRECTORY].input, "/home/you/projects/");
+            assert_eq!(p.fields[DIRECTORY].cursor, p.fields[DIRECTORY].len());
+            assert!(
+                p.fields[DIRECTORY].ghost.is_empty(),
+                "the offer was taken, so it is no longer on offer"
+            );
+        }
+    }
+
+    /// Anywhere but the end, `→` still moves the cursor: the suggestion
+    /// continues text that is no longer the last thing typed, and a key that
+    /// silently did something else would be the surprise.
+    #[test]
+    fn the_right_arrow_still_moves_the_cursor_inside_a_path() {
+        let mut p = completing("/home/you/pro", "jects/");
+        p.on_key(Key::Home);
+        p.on_key(Key::Right);
+        assert_eq!(p.fields[DIRECTORY].input, "/home/you/pro", "nothing taken");
+        assert_eq!(p.fields[DIRECTORY].cursor, 1, "the cursor moved instead");
+    }
+
+    /// The offer is windowed with the input rather than after it. Otherwise a
+    /// path longer than the field scrolls the typed text and leaves the ghost
+    /// hanging in columns the field had already given away.
+    #[test]
+    fn a_completion_on_a_path_too_long_for_the_field_stays_inside_it() {
+        let p = completing("/home/you/a-very-long-directory-name-indeed/su", "bdir/");
+        for width in [24, 32, 40, 60] {
+            let cells = line_cells(&p, width, 9);
+            let shown: usize = cells.iter().map(|(s, _)| s.width().max(1)).sum();
+            assert!(
+                shown <= width as usize,
+                "the line overflowed a {width}-column terminal: {shown}"
+            );
+        }
     }
 
     /// Four roles on one line, told apart by modifier alone since nothing here
@@ -1169,8 +1708,33 @@ mod tests {
             Some("session 3".to_string()),
         );
 
+        // A field carrying a suggestion, and a candidate row wider than any of
+        // these terminals: both are drawn from lengths the screen never agreed
+        // to, which is exactly where an off-by-one becomes a panic.
+        let mut offering = completing("/home/you/a-very-long-directory/su", "bdir/");
+        offering.candidates = Some(some_candidates(&[
+            "subdir",
+            "subdirectory",
+            "submodule",
+            "subproject",
+            "substrate",
+        ]));
+        let mut both = completing("/home/you/a-very-long-directory/su", "bdir/");
+        both.candidates = Some(Candidates {
+            message: "no directory here starts with \"su\"".to_string(),
+            ..Candidates::default()
+        });
+        both.fail("a session named \"notes\" already exists".to_string(), None);
+
         for &(w, h) in test_support::TINY_SIZES {
-            for p in [&prompt(), &typed, &failed, &renaming("dotfiles")] {
+            for p in [
+                &prompt(),
+                &typed,
+                &failed,
+                &renaming("dotfiles"),
+                &offering,
+                &both,
+            ] {
                 let _ = render(p, w.max(1), h.max(1));
             }
         }
@@ -1282,5 +1846,11 @@ mod tests {
         p.on_key(Key::End);
         p.fail("nope".to_string(), Some("session 3".to_string()));
         test_support::assert_no_colour(60, 9, |f| draw(f, &p));
+
+        // The suggestion and the candidate row are the newest text on this
+        // screen, and both are drawn dim — which is a modifier, not a colour.
+        let mut offering = completing("/home/you/pro", "jects/");
+        offering.candidates = Some(some_candidates(&["projects", "prototypes"]));
+        test_support::assert_no_colour(60, 9, |f| draw(f, &offering));
     }
 }

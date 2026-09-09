@@ -58,9 +58,11 @@ impl DirSource {
     pub fn children(&self, dir: &str, prefix: &str) -> Result<Listing> {
         let out = match self {
             DirSource::Local => proc::run_local(shell::DIRS_SCRIPT, &[dir, prefix])?,
+            // Unattended: nobody is watching this run, and there is no
+            // terminal to answer a passphrase prompt on — see `ssh::unattended`.
             DirSource::Ssh { host, control_path } => {
                 Ssh::new(host.clone(), control_path.clone())
-                    .run_script(shell::DIRS_SCRIPT, &[dir, prefix])?
+                    .run_script_unattended(shell::DIRS_SCRIPT, &[dir, prefix])?
             }
         };
         protocol::parse_dirs(&out.stdout)

@@ -102,6 +102,18 @@ is expanded against that machine's home directory, which is also what the field
 offers by default; nothing else is expanded, for the reasons the command section
 gives. A directory that is not there is refused before anything is started.
 
+**The path completes as you type.** The dim text after the cursor is as much of
+the path as is certain — the longest prefix every directory that could come next
+shares — and `→` takes it, the same key that takes a default. One match completes
+to its end and adds the `/`, so you can keep typing; when there is more than one,
+the row under the fields lists them. Directories starting with a dot appear once
+you type the dot, as in a shell.
+
+Completion never waits on your keystrokes. The listing runs beside the prompt, so
+typing is never slower than typing even when the answer is coming over ssh — and
+one listing serves a whole directory, so a path costs about one round trip per
+`/` rather than one per key.
+
 **Numbers name positions.** A session keeps the number it was created with for
 as long as you leave it where it is, so a number you have learned goes on
 meaning the same session. Moving one is the exception, and the only one: the
