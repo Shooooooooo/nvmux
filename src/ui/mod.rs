@@ -164,18 +164,28 @@ pub(crate) fn poll_key() -> Result<Option<Key>> {
 
 /// Run the picker until the user attaches or quits. `message` replaces the hint
 /// row — how a failed attach reports itself without exiting the program.
-pub fn run(transport: &dyn Transport, message: Option<String>) -> Result<Outcome> {
-    owning(|terminal| run_loop(terminal, transport, message))
+/// `focused` is the session the caller came from, if any: the cursor starts on
+/// it, so `<prefix> Space` opens the picker where the user already was.
+pub fn run(
+    transport: &dyn Transport,
+    message: Option<String>,
+    focused: Option<&str>,
+) -> Result<Outcome> {
+    owning(|terminal| run_loop(terminal, transport, message, focused))
 }
 
 fn run_loop(
     terminal: &mut ratatui::DefaultTerminal,
     transport: &dyn Transport,
     message: Option<String>,
+    focused: Option<&str>,
 ) -> Result<Outcome> {
     let mut sessions = transport.list_sessions()?;
     let mut highest = highest_num(&sessions);
     let mut app = App::new(std::mem::take(&mut sessions));
+    if let Some(id) = focused {
+        app.select_session(id);
+    }
     if let Some(msg) = message {
         app.set_message(msg);
     }

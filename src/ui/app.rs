@@ -73,6 +73,19 @@ impl App {
             .unwrap_or_else(|| self.selected.min(self.visible().len().saturating_sub(1)));
     }
 
+    /// Put the cursor on this session, if the visible list still has it.
+    ///
+    /// How the picker opens on the session the user is attached to rather than
+    /// on the first row: `<prefix> Space` leaves the client running, so coming
+    /// back to a cursor on row one throws away the one thing the picker already
+    /// knew. A session that has since gone — killed elsewhere, or the child
+    /// exited — simply leaves the cursor where it was.
+    pub fn select_session(&mut self, id: &str) {
+        if let Some(at) = self.visible().iter().position(|s| s.id == id) {
+            self.selected = at;
+        }
+    }
+
     pub fn mode(&self) -> &Mode {
         &self.mode
     }
@@ -882,5 +895,48 @@ mod tests {
         assert!(a.message().is_some());
         a.on_key(Key::Char('j'));
         assert!(a.message().is_none(), "a stale message must not linger");
+    }
+
+    /// Coming back from a session, the cursor is on the session that was
+    /// attached — not on the first row.
+    #[test]
+    fn the_cursor_starts_on_the_session_it_is_told_to_focus() {
+        let mut a = app(&["one", "two", "three"]);
+        a.select_session("id000002");
+        assert_eq!(a.selected_index(), 2);
+        assert_eq!(a.selected_session().map(|s| s.name.as_str()), Some("three"));
+    }
+
+    /// A session that ended while it was attached, or was killed from
+    /// elsewhere, is not in the listing the picker just read.
+    #[test]
+    fn focusing_a_session_that_is_gone_leaves_the_cursor_alone() {
+        let mut a = app(&["one", "two"]);
+        a.on_key(Key::Char('j'));
+        a.select_session("id000009");
+        assert_eq!(a.selected_index(), 1, "an absent id must not move anything");
+
+        let mut empty = App::new(Vec::new());
+        empty.select_session("id000000");
+        assert_eq!(empty.selected_index(), 0);
+    }
+
+    /// The focused row keeps the cursor across a rename or a kill, which
+    /// re-list: `set_sessions` restores by identity, and the id it restores is
+    /// the focused one.
+    #[test]
+    fn a_focused_row_survives_a_refresh_that_reorders_the_list() {
+        let mut a = app(&["one", "two", "three"]);
+        a.select_session("id000002");
+
+        let reversed = app(&["one", "two", "three"])
+            .visible()
+            .into_iter()
+            .rev()
+            .cloned()
+            .collect();
+        a.set_sessions(reversed);
+
+        assert_eq!(a.selected_session().map(|s| s.name.as_str()), Some("three"));
     }
 }
