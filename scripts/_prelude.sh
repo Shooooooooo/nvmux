@@ -151,6 +151,59 @@ $1
   [ -n "$(serving_pid "$1")" ]
 }
 
+# The sockets under one directory that something has actually bound, read from
+# the kernel's own list of them, once.
+#
+# `serving` makes `ps` copy out every process's whole command line so that a
+# shell can pick a few paths back out -- 80ms on a thousand-process host, and it
+# grows with the host rather than with the sessions. This file is 3ms. A session
+# *is* an nvim with its socket bound, so this is the more direct question as
+# well as the cheaper one; `--listen` in a command line is evidence about it.
+#
+# Linux only, and never the last word. Where the file is absent (macOS, BSD), or
+# where the session's nvim is in a different network namespace from the shell
+# reading it, this finds nothing and `serving` answers exactly as it did before.
+NVMUX_BOUND=
+NVMUX_BOUND_TAKEN=
+
+take_bound() {
+  [ -z "$NVMUX_BOUND_TAKEN" ] || return 0
+  NVMUX_BOUND_TAKEN=1
+  [ -r /proc/net/unix ] || return 0
+  # Field 8 to the end of the line, for the reason `listen_args` reads to the
+  # end of its line: a runtime directory with a space in it is one path, not
+  # two. Restricted to the one directory so the test below stays a test on a
+  # short string however much else the host has bound.
+  #
+  # The prefix test is spelled as a negation because the POSIX scan in
+  # src/shell.rs rejects a spaced `==`, which in `test` is a bashism and in awk
+  # is not. Nothing else is meant by it.
+  NVMUX_BOUND=$(awk -v dir="$1" '
+    NF > 7 {
+      path = substr($0, index($0, $8))
+      if (index(path, dir) != 1) next
+      print path
+    }' /proc/net/unix)
+  NVMUX_BOUND="
+$NVMUX_BOUND
+"
+}
+
+# Has anything bound this socket?
+#
+# A "yes" is conclusive and costs one read of one small file for a whole
+# listing. A "no" means nothing at all -- callers must ask `serving`, which is
+# what decides whether a session is gone.
+bound() {
+  take_bound "${1%/*}/"
+  case "$NVMUX_BOUND" in
+    *"
+$1
+"*) return 0 ;;
+  esac
+  return 1
+}
+
 # Can we inspect processes at all? If not, "nothing found" proves nothing, and
 # every caller has to fail closed rather than delete or report absence.
 can_inspect() {

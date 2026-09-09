@@ -14,7 +14,7 @@
 # Two files rather than one, joined by src/shell.rs and delivered as a single
 # program: the listing a connection opens with is then produced by exactly the
 # code every later refresh runs, rather than by a copy of it. There is
-# deliberately no `finish` here — list.sh's terminator is the one that says the
+# deliberately no `finish` here -- list.sh's terminator is the one that says the
 # whole thing ran, and a second one printed halfway would say a listing had
 # completed when it had not even started.
 #

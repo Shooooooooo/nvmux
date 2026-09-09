@@ -381,6 +381,42 @@ mod tests {
         );
     }
 
+    /// The other half: a socket that is genuinely bound, with nothing in any
+    /// command line to say so. Only the kernel's list can answer for this one,
+    /// and it must — the alternative is the branch that deletes the files of a
+    /// session that is still running.
+    ///
+    /// Linux only, because `/proc/net/unix` is. Everywhere else `serving` is
+    /// asked, finds no process, and the socket reads as stale, which is what
+    /// nvmux has always done there.
+    #[test]
+    fn a_bound_socket_is_a_live_session_even_with_no_process_to_find() {
+        if !std::path::Path::new("/proc/net/unix").exists() {
+            eprintln!("skipping: this host does not keep /proc/net/unix");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("nvmux-bound-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        let sock = dir.join("aaaaaaaa.sock");
+        let _ = std::fs::remove_file(&sock);
+        // Held for the length of the test. Nothing anywhere names this path on
+        // a command line — this process's own argv is cargo's.
+        let held = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+
+        let out = run_script(LIST_SCRIPT, &[&dir.to_string_lossy()]);
+        let rows = crate::transport::protocol::parse_listing(&out.stdout).expect("a listing");
+        let survived = sock.exists();
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            rows.iter().any(|r| r.id == "aaaaaaaa" && r.pid_alive),
+            "a bound socket is a live session: {:?}",
+            out.stdout
+        );
+        assert!(survived, "and its files must not be swept");
+    }
+
     /// `scripts/spawn.sh` writes the nested-launch marker and `crate::nested`
     /// reads it. Two files, one name: renaming it on either side would stop
     /// every nested launch being caught, and nothing else would fail.
