@@ -74,6 +74,27 @@ impl DirSource {
     }
 }
 
+/// Split a typed path into the part that no longer counts and the part that does.
+///
+/// `//` means "start again from the root", so everything up to and including the
+/// last one is inert: `/home/shu//etc` is `/etc`, with `/home/shu/` left behind.
+/// It is what the prompt offers instead of making the user delete a path to get
+/// out of it, and the field draws the inert half dim so it reads as what it is.
+///
+/// **The live half is what must reach the session host.** POSIX reads `a//b` as
+/// `a/b`, so `cd /home/shu//etc` would land in `/home/shu/etc` — a real
+/// directory, the wrong one, and silently. Resolving the convention here, before
+/// anything leaves the prompt, is what makes it safe to offer.
+///
+/// The split falls *between* the two slashes, so the live half keeps a leading
+/// one and is therefore still absolute.
+pub fn anchored(input: &str) -> (&str, &str) {
+    match input.rfind("//") {
+        Some(at) => input.split_at(at + 1),
+        None => ("", input),
+    }
+}
+
 /// Split what has been typed into the directory to list and the name to match
 /// inside it.
 ///
@@ -96,6 +117,40 @@ pub fn split(input: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_double_slash_starts_again_from_the_root() {
+        // The case the prompt exists to serve: out of home, to somewhere else.
+        assert_eq!(anchored("/home/shu//etc"), ("/home/shu/", "/etc"));
+        // Everything discarded is inert, not just the home part of it.
+        assert_eq!(
+            anchored("/home/shu/projects//etc"),
+            ("/home/shu/projects/", "/etc")
+        );
+        // The last one wins, so changing your mind twice still works.
+        assert_eq!(anchored("/a//b//c"), ("/a//b/", "/c"));
+        // A bare `//` is the root itself.
+        assert_eq!(anchored("//"), ("/", "/"));
+        // Three in a row is the same answer: the split is at the last pair.
+        assert_eq!(anchored("///etc"), ("//", "/etc"));
+        // Nothing to discard, so nothing is inert and nothing draws dim.
+        assert_eq!(anchored("/home/shu/projects"), ("", "/home/shu/projects"));
+        assert_eq!(anchored("/"), ("", "/"));
+        assert_eq!(anchored(""), ("", ""));
+        // A trailing `//` is still the root, mid-typing.
+        assert_eq!(anchored("/home/shu//"), ("/home/shu/", "/"));
+    }
+
+    /// The live half keeps its leading slash, so what comes out of `anchored` is
+    /// still an absolute path — which is the one thing `validate_directory` will
+    /// not accept a substitute for.
+    #[test]
+    fn what_a_double_slash_leaves_behind_is_still_absolute() {
+        for input in ["/home/shu//etc", "//", "///x", "/a//b//c"] {
+            let (_, live) = anchored(input);
+            assert!(live.starts_with('/'), "{input:?} left {live:?}");
+        }
+    }
 
     #[test]
     fn a_path_is_split_into_the_directory_to_list_and_the_name_to_match() {

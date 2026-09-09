@@ -58,7 +58,7 @@
 //! |---|---|
 //! | `Tab` | completion, and nothing else |
 //! | `↑` `↓` `Ctrl-p` `Ctrl-n` | move between the fields — or through the menu while it is open |
-//! | `Enter` | create the session, always |
+//! | `Enter` | accept from the menu if one is open, otherwise create the session |
 //! | `Esc` | close the menu if it is open, otherwise leave |
 //!
 //! Two earlier schemes failed here, and both failed the same way: a key that did
@@ -86,13 +86,33 @@
 //! beside `projects` — must not be stepped into merely because it exists. Only
 //! having just chosen it means that.
 //!
-//! # Enter creates
+//! # Where the field starts, and how to leave
 //!
-//! From any field, with the menu open or shut, and with a suggestion highlighted
-//! or not: enter creates the session with the fields as they stand. So
-//! `<prefix> c` then enter is a session in one keystroke, in the home directory,
-//! and a half-typed query is refused by name rather than quietly becoming
-//! whichever directory happened to be under the cursor.
+//! The directory field opens *at* the home directory: the path is really there,
+//! as ordinary editable text, so `Tab` lists what is inside it before anything is
+//! typed. It is not an anchor — backspace eats it like any other text.
+//!
+//! To go somewhere else, type `//`. Everything up to and including the last one
+//! is discarded, so `/home/shu//etc` is `/etc`. Since the pre-filled path already
+//! ends in a slash, typing one as your first keystroke makes the `//` and means
+//! "from the root" — which is the whole of what the old first-keystroke special
+//! case used to arrange by hand.
+//!
+//! The discarded half draws dim, and that is the only thing dim means on this
+//! line: grey is the part that no longer decides where the session starts. An
+//! ordinary path has none of it.
+//!
+//! [`crate::dirs::anchored`] resolves the convention, and it is resolved *here*
+//! rather than left to the host for a reason worth knowing: POSIX reads `a//b` as
+//! `a/b`, so submitting the raw line would start the session one directory away
+//! from the one on screen, silently.
+//!
+//! # Enter
+//!
+//! With a menu open it takes what is highlighted, which is the reflex after
+//! choosing one; accepting closes the menu, so the second enter creates.
+//! Otherwise it creates, from any field — so `<prefix> c` then enter is still a
+//! session in one keystroke, in the home directory.
 //!
 //! # Nothing waits for a keystroke
 //!
@@ -332,7 +352,15 @@ impl Prompt {
             fields: vec![
                 Field::new(labels[0].clone(), String::new(), default_name),
                 Field::new(labels[1].clone(), String::new(), default_command),
-                Field::new(labels[2].clone(), String::new(), default_directory),
+                // Pre-filled rather than offered: home is where this field
+                // starts, so `Tab` lists what is in it before anything is typed
+                // and there is no placeholder to displace. The default is the
+                // same string, which only matters if the field is emptied.
+                Field::new(
+                    labels[2].clone(),
+                    default_directory.clone(),
+                    default_directory,
+                ),
             ],
             focus: NAME,
             message: None,
@@ -362,7 +390,7 @@ impl Prompt {
             return "⏎ rename   esc cancel";
         }
         if self.choosing() {
-            "⇥ accept   ↑↓ ^n ^p choose   esc close   ⏎ create"
+            "⇥ ⏎ accept   ↑↓ ^n ^p choose   esc close"
         } else {
             "⏎ create   ↑↓ field   ⇥ complete   esc cancel"
         }
@@ -399,7 +427,14 @@ impl Prompt {
         Submission {
             name: self.fields[NAME].value(),
             command: self.fields.get(COMMAND).map(Field::value),
-            directory: self.fields.get(DIRECTORY).map(Field::value),
+            // The half of the line that counts, never the raw text. POSIX reads
+            // `a//b` as `a/b`, so submitting `/home/shu//etc` verbatim would
+            // start the session in `/home/shu/etc` — a real directory, the wrong
+            // one, and with nothing on screen to say so.
+            directory: self
+                .fields
+                .get(DIRECTORY)
+                .map(|f| crate::dirs::anchored(&f.value()).1.to_string()),
         }
     }
 
@@ -415,18 +450,11 @@ impl Prompt {
 
         match key {
             Key::Char(c) => {
-                // The directory field inverts the rule the other two follow. In
-                // them the default is a value being *replaced*, so typing
-                // discards it; here it is a directory being navigated *from*, so
-                // the first keystroke takes it in and the rest reads as a query
-                // inside it. Typing `pro` on an untouched field means `~/pro`
-                // rather than a relative path the prompt would go on to refuse.
-                //
-                // Unless that keystroke is `/`, which is how you say "somewhere
-                // else entirely" and start an absolute path from nothing.
-                if self.focus == DIRECTORY && self.fields[DIRECTORY].input.is_empty() && c != '/' {
-                    self.fields[DIRECTORY].adopt_default();
-                }
+                // No special case for the directory field any more. Its text is
+                // really there rather than behind a placeholder, so typing just
+                // inserts — and a `/` typed at the end of the home path makes the
+                // `//` that means "from the root", which is what the special case
+                // used to arrange by hand.
                 self.focused().insert(c);
                 // An open menu narrows rather than closing: filtering it is what
                 // the query is for. `show` puts the selection back on the best
@@ -491,10 +519,20 @@ impl Prompt {
                 Step::None
             }
 
-            // Always, from any field, with the menu open or shut. It is the one
-            // thing enter means, so `c` then enter is still a session in one
-            // keystroke — and a half-typed query is refused by name rather than
-            // quietly becoming whichever suggestion happened to be highlighted.
+            // With a menu in front of you, enter takes what is highlighted — the
+            // reflex after choosing one with the movement keys. Accepting closes
+            // the menu, so the second enter creates.
+            //
+            // This does give enter two meanings. The rule the last rewrite set
+            // out to remove was one conditional on state nobody could see; this
+            // one turns on whether a menu is on the screen in front of you,
+            // which is what the movement keys already key off.
+            Key::Enter if choosing => {
+                self.accept();
+                Step::None
+            }
+            // Otherwise the one thing enter means, from any field: `c` then
+            // enter is still a session in one keystroke.
             Key::Enter => Step::Submit(self.submission()),
 
             // One thing at a time on the way out: the menu you opened, then the
@@ -572,12 +610,16 @@ impl Prompt {
             return;
         };
         let field = &mut self.fields[DIRECTORY];
-        // Against the value, not the input: an untouched field is showing its
+        // Against the value, not the input: an emptied field is showing its
         // default, and choosing from it means choosing inside that.
         let current = field.value();
-        let parent = crate::dirs::split(&current).map_or(current.clone(), |(d, _)| d.to_string());
+        // The inert half is left exactly as it is, so a line that says
+        // `/home/shu//etc` goes on saying it — the discarded prefix is still
+        // what the user typed, and still what the dim half of the line explains.
+        let (inert, live) = crate::dirs::anchored(&current);
+        let parent = crate::dirs::split(live).map_or(live, |(d, _)| d);
         let parent = parent.trim_end_matches('/');
-        field.input = format!("{parent}/{name}");
+        field.input = format!("{inert}{parent}/{name}");
         field.cursor = field.len();
 
         if let Some(menu) = self.menu.as_mut() {
@@ -729,8 +771,10 @@ fn refresh(prompt: &mut Prompt, completer: Option<&mut complete::Completer>) {
     let Some(completer) = completer else {
         return;
     };
+    // The live half, so a `//` re-points the listing at the root rather than
+    // leaving it in the directory the user has just walked away from.
     let typed = prompt.fields[DIRECTORY].value();
-    completer.ask(&typed);
+    completer.ask(crate::dirs::anchored(&typed).1);
     show(prompt, Some(completer));
 }
 
@@ -759,9 +803,8 @@ fn show(prompt: &mut Prompt, completer: Option<&mut complete::Completer>) {
     // untouched field is showing its default, and completing it means completing
     // inside that.
     let typed = prompt.fields[DIRECTORY].value();
-    let query = crate::dirs::split(&typed)
-        .map_or("", |(_, q)| q)
-        .to_string();
+    let live = crate::dirs::anchored(&typed).1;
+    let query = crate::dirs::split(live).map_or("", |(_, q)| q).to_string();
 
     let waiting = completer.waiting();
     let partial = completer.truncated();
@@ -1025,6 +1068,11 @@ fn field_line(field: &Field, focused: bool, width: usize) -> Line<'static> {
     let cursor = Style::default().add_modifier(Modifier::REVERSED);
     let dim = Style::default().add_modifier(Modifier::DIM);
 
+    // How much of the line no longer counts, in characters. Everything a `//`
+    // discarded is drawn dim, which is the whole of what dim means here — an
+    // ordinary path has none of it.
+    let inert = crate::dirs::anchored(&field.input).0.chars().count();
+
     match (field.input.is_empty(), focused) {
         // The placeholder, with the cursor on its first letter so the default
         // sits in exactly the columns a typed value will.
@@ -1038,13 +1086,24 @@ fn field_line(field: &Field, focused: bool, width: usize) -> Line<'static> {
         // Nothing typed and not where the keystrokes are going: no cursor, or
         // there would be two on screen and no telling which is live.
         (true, false) => spans.push(Span::styled(draw::truncate(&field.default, room), dim)),
-        (false, true) => {
-            let (before, at, after) = around_cursor(field, room);
-            spans.push(Span::raw(before));
-            spans.push(Span::styled(at, cursor));
-            spans.push(Span::raw(after));
+        (false, true) => spans.extend(windowed(field, room, inert)),
+        (false, false) => {
+            // Unfocused, so no cursor to keep in view: the line is simply cut to
+            // fit, but the dim half still has to read as dim.
+            let text = draw::truncate(&field.input, room);
+            let shown = text.chars().count();
+            let cut = inert.min(shown);
+            let (before, after): (String, String) = (
+                text.chars().take(cut).collect(),
+                text.chars().skip(cut).collect(),
+            );
+            if !before.is_empty() {
+                spans.push(Span::styled(before, dim));
+            }
+            if !after.is_empty() {
+                spans.push(Span::raw(after));
+            }
         }
-        (false, false) => spans.push(Span::raw(draw::truncate(&field.input, room))),
     }
 
     Line::from(spans)
@@ -1055,22 +1114,26 @@ fn split_first(s: &str) -> Option<(String, &str)> {
     Some((first.to_string(), &s[first.len_utf8()..]))
 }
 
-/// The text either side of the cursor and the cell under it, windowed to `max`
-/// display columns.
+/// The window of `input` to draw, as character indices: where it starts, the
+/// cell the cursor is on, and where it ends.
+///
+/// Bounds rather than ready-made strings, because the line carries a style
+/// boundary — the part a `//` has discarded is drawn dim — and a string cannot
+/// say where that boundary fell after the window moved.
 ///
 /// The opposite choice from `draw::truncate`, and for a reason: a field has to
 /// keep the cursor visible, so when a path outgrows it the text scrolls rather
 /// than the part being edited disappearing. The cursor may sit one past the end,
 /// so the line is treated as the input plus a trailing blank — which is the cell
 /// it inverts there.
-fn around_cursor(field: &Field, max: usize) -> (String, String, String) {
+fn around_cursor(field: &Field, max: usize) -> (usize, usize, usize) {
     let cells: Vec<char> = field.input.chars().chain([' ']).collect();
     let at = field.cursor.min(cells.len() - 1);
     let width = |c: char| c.to_string().width().max(1);
 
-    // The cursor's own cell first, and it is returned even when `max` is 0: a
-    // field squeezed to nothing by a long label still has to show where the
-    // keystrokes are going, which is why `field_line` reserves it a column.
+    // The cursor's own cell first, and it is kept even when `max` is 0: a field
+    // squeezed to nothing by a long label still has to show where the keystrokes
+    // are going, which is why `field_line` reserves it a column.
     let mut used = width(cells[at]).min(max);
     let (mut start, mut end) = (at, at + 1);
 
@@ -1085,12 +1148,46 @@ fn around_cursor(field: &Field, max: usize) -> (String, String, String) {
         end += 1;
     }
 
-    let text = |range: &[char]| range.iter().collect::<String>();
-    (
-        text(&cells[start..at]),
-        text(&cells[at..at + 1]),
-        text(&cells[at + 1..end]),
-    )
+    (start, at, end)
+}
+
+/// The windowed text, in as few spans as the styles allow.
+///
+/// Two things decide a cell's style and they are independent: whether it is the
+/// cursor, and whether it sits in the half of the line a `//` has discarded. So
+/// the cells are walked and runs sharing a style are coalesced, rather than the
+/// line being cut into a fixed set of pieces that could not express both.
+fn windowed(field: &Field, max: usize, inert: usize) -> Vec<Span<'static>> {
+    let cells: Vec<char> = field.input.chars().chain([' ']).collect();
+    let (start, at, end) = around_cursor(field, max);
+
+    // Plain REVERSED, not the picker's REVERSED|BOLD: that pairing means "the
+    // selected row", and a one-cell cursor wants the crisper form.
+    let cursor = Style::default().add_modifier(Modifier::REVERSED);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let style = |i: usize| match (i == at, i < inert) {
+        // The cursor keeps its own weight wherever it lands, dim half included:
+        // there is only one of it and it has to be findable.
+        (true, _) => cursor,
+        (false, true) => dim,
+        (false, false) => Style::default(),
+    };
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut current = style(start);
+    for (i, c) in cells.iter().enumerate().take(end).skip(start) {
+        let s = style(i);
+        if s != current && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), current));
+        }
+        current = s;
+        run.push(*c);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, current));
+    }
+    spans
 }
 
 #[cfg(test)]
@@ -1505,13 +1602,21 @@ mod tests {
         p
     }
 
-    /// The directory field, focused, with `typed` in it and no menu.
-    fn at_directory(typed: &str) -> Prompt {
+    /// The directory field, focused, holding exactly `path`, with no menu.
+    ///
+    /// The focus moves the real way, with the movement keys, because that is the
+    /// route in and a helper that reached past it could pass while the keys were
+    /// broken. The text is *set* rather than typed: the field starts pre-filled
+    /// at home now, so typing a path would append to it and make a `//` — which
+    /// is right, and is its own test, but is not what these fixtures want.
+    fn at_directory(path: &str) -> Prompt {
         let mut p = prompt();
         p.on_key(Key::Down);
         p.on_key(Key::Down);
         assert_eq!(p.focus, DIRECTORY);
-        type_in(&mut p, typed);
+        let field = &mut p.fields[DIRECTORY];
+        field.input = path.to_string();
+        field.cursor = field.len();
         p
     }
 
@@ -1671,32 +1776,6 @@ mod tests {
         assert_eq!(filled, 2, "just the field and the hint row: {lines:#?}");
     }
 
-    /// The directory field inverts the placeholder rule the other two follow,
-    /// because its default is a place being navigated from rather than a value
-    /// being replaced — and because the menu underneath is already listing that
-    /// place's children.
-    #[test]
-    fn typing_in_the_directory_field_continues_the_default_rather_than_replacing_it() {
-        let mut p = prompt();
-        p.on_key(Key::Down);
-        p.on_key(Key::Down);
-        type_in(&mut p, "pro");
-        assert_eq!(p.fields[DIRECTORY].input, format!("{DIRECTORY_DEFAULT}pro"));
-
-        // ...unless the first key is `/`, which is how you say "somewhere else
-        // entirely".
-        let mut p = prompt();
-        p.on_key(Key::Down);
-        p.on_key(Key::Down);
-        type_in(&mut p, "/srv/www");
-        assert_eq!(p.fields[DIRECTORY].input, "/srv/www");
-
-        // The other two fields are unchanged: there the default is a value.
-        let mut p = prompt();
-        type_in(&mut p, "notes");
-        assert_eq!(p.fields[NAME].input, "notes");
-    }
-
     /// The prompt opens as three plain fields. Nothing conjures a list of
     /// directories — not focusing the field, not typing in it — until it is
     /// asked for.
@@ -1824,21 +1903,53 @@ mod tests {
         }
     }
 
-    /// Enter means one thing everywhere: create. Even with the menu open and a
-    /// suggestion highlighted, it creates with the field as it stands — a
-    /// half-typed query is refused by name rather than quietly becoming
-    /// whichever directory happened to be under the cursor.
+    /// With a menu in front of you, enter takes what is highlighted — the reflex
+    /// after choosing one with the movement keys. Accepting closes the menu, so
+    /// the second enter creates.
     #[test]
-    fn enter_always_creates_even_with_the_menu_open() {
+    fn enter_accepts_from_the_menu_and_a_second_enter_creates() {
         let mut p = menuing("/home/nvmx", &["nvmux-rs"]);
-        p.on_key(Key::CtrlN);
         assert!(p.choosing());
 
-        let step = p.on_key(Key::Enter);
-        match step {
-            Step::Submit(s) => assert_eq!(s.directory, Some("/home/nvmx".to_string())),
-            other => panic!("enter must create, got {other:?}"),
+        assert_eq!(p.on_key(Key::Enter), Step::None, "the first enter accepts");
+        assert!(!p.choosing(), "and closes the menu");
+        assert_eq!(p.fields[DIRECTORY].input, "/home/nvmux-rs");
+
+        match p.on_key(Key::Enter) {
+            Step::Submit(s) => assert_eq!(s.directory, Some("/home/nvmux-rs".to_string())),
+            other => panic!("the second enter must create, got {other:?}"),
         }
+    }
+
+    /// The two accept keys are the same key as far as the field is concerned,
+    /// including the step that the next `Tab` takes.
+    #[test]
+    fn enter_and_tab_accept_the_same_way() {
+        let mut by_tab = menuing("/home/pro", &["projects"]);
+        by_tab.on_key(Key::Tab);
+        let mut by_enter = menuing("/home/pro", &["projects"]);
+        by_enter.on_key(Key::Enter);
+        assert_eq!(
+            by_tab.fields[DIRECTORY].input,
+            by_enter.fields[DIRECTORY].input
+        );
+
+        by_tab.on_key(Key::Tab);
+        by_enter.on_key(Key::Tab);
+        assert_eq!(
+            by_tab.fields[DIRECTORY].input, by_enter.fields[DIRECTORY].input,
+            "and both leave the next Tab able to step in"
+        );
+        assert_eq!(by_enter.fields[DIRECTORY].input, "/home/projects/");
+    }
+
+    /// Enter still creates from any field with no menu in front of it, which is
+    /// what keeps `c` then enter a session in one keystroke.
+    #[test]
+    fn enter_creates_when_no_menu_is_open() {
+        let mut p = at_directory("/home/you/");
+        assert!(!p.choosing());
+        assert!(matches!(p.on_key(Key::Enter), Step::Submit(_)));
     }
 
     /// One thing at a time on the way out: the menu you opened, then the prompt.
@@ -1916,10 +2027,170 @@ mod tests {
 
         let open = render(&menuing("/home/", &["alpha"]), 60, 14);
         assert!(
-            open[13].contains("⇥ accept") && open[13].contains("choose"),
+            open[13].contains("⇥ ⏎ accept") && open[13].contains("choose"),
             "expected the hints to follow the menu, got {:?}",
             open[13]
         );
+    }
+
+    /// Home is where this field starts, not something it offers. The text is
+    /// really there, so `Tab` lists what is inside it before anything is typed.
+    #[test]
+    fn the_directory_field_starts_at_home_rather_than_offering_it() {
+        let p = prompt();
+        assert_eq!(
+            p.fields[DIRECTORY].input, DIRECTORY_DEFAULT,
+            "pre-filled, not a placeholder"
+        );
+        assert_eq!(
+            p.fields[DIRECTORY].cursor,
+            p.fields[DIRECTORY].len(),
+            "with the cursor after it, ready to type"
+        );
+        // And it is ordinary editable text, not an anchor: backspace eats it.
+        let mut p = prompt();
+        p.on_key(Key::Down);
+        p.on_key(Key::Down);
+        p.on_key(Key::Backspace);
+        assert_eq!(
+            p.fields[DIRECTORY].input,
+            DIRECTORY_DEFAULT.trim_end_matches('/')
+        );
+    }
+
+    /// The keystroke that replaces the deleted special case: the pre-filled text
+    /// ends in a slash, so typing one makes the `//` that means "from the root".
+    #[test]
+    fn a_slash_at_the_end_of_the_home_path_means_the_root() {
+        let mut p = prompt();
+        p.on_key(Key::Down);
+        p.on_key(Key::Down);
+        type_in(&mut p, "/etc");
+        assert_eq!(
+            p.fields[DIRECTORY].input,
+            format!("{DIRECTORY_DEFAULT}/etc")
+        );
+
+        // And what is submitted is the half that counts, not the raw line.
+        match p.on_key(Key::Enter) {
+            Step::Submit(s) => assert_eq!(s.directory, Some("/etc".to_string())),
+            other => panic!("expected a create, got {other:?}"),
+        }
+    }
+
+    /// The one that would be silent if it were wrong. POSIX reads `a//b` as
+    /// `a/b`, so a raw `/home/you//etc` would start the session in
+    /// `/home/you/etc` — a real directory, the wrong one, with nothing on screen
+    /// to say so.
+    #[test]
+    fn what_is_submitted_is_the_path_that_counts() {
+        for (typed, expected) in [
+            ("/home/you//etc", "/etc"),
+            ("/home/you/projects//srv/www", "/srv/www"),
+            ("/home/you//", "/"),
+            ("/home/you/projects", "/home/you/projects"),
+        ] {
+            let mut p = at_directory(typed);
+            match p.on_key(Key::Enter) {
+                Step::Submit(s) => {
+                    assert_eq!(s.directory, Some(expected.to_string()), "from {typed:?}")
+                }
+                other => panic!("expected a create, got {other:?}"),
+            }
+        }
+    }
+
+    /// Accepting inside a `//` leaves the discarded prefix alone: it is still
+    /// what the user typed, and still what the dim half of the line explains.
+    #[test]
+    fn accepting_after_a_double_slash_keeps_the_discarded_prefix() {
+        let mut p = menuing("/home/you//e", &["etc"]);
+        p.on_key(Key::Tab);
+        assert_eq!(p.fields[DIRECTORY].input, "/home/you//etc");
+
+        match p.on_key(Key::Enter) {
+            Step::Submit(s) => assert_eq!(s.directory, Some("/etc".to_string())),
+            other => panic!("expected a create, got {other:?}"),
+        }
+    }
+
+    /// Grey means "no longer counts", and nothing else — so an ordinary path has
+    /// none of it, and a `//` dims everything it discarded rather than just the
+    /// home part of it.
+    #[test]
+    fn the_part_that_no_longer_counts_is_dim_and_the_rest_is_not() {
+        let dim_text = |p: &Prompt| -> String {
+            line_cells(p, 60, 14)
+                .iter()
+                .filter(|(_, m)| m.contains(Modifier::DIM))
+                .map(|(s, _)| s.as_str())
+                .collect()
+        };
+
+        // Nothing discarded, so nothing recedes.
+        assert_eq!(
+            dim_text(&at_directory("/home/you/projects")),
+            "",
+            "an ordinary path is all live text"
+        );
+
+        // The cursor sits at the end, outside the dim half, so the whole of the
+        // discarded prefix is accounted for.
+        assert_eq!(dim_text(&at_directory("/home/you//etc")), "/home/you/");
+        assert_eq!(
+            dim_text(&at_directory("/home/you/projects//etc")),
+            "/home/you/projects/",
+            "everything discarded, not just the home part"
+        );
+    }
+
+    /// The boundary is a property of the text, so it has to survive the window
+    /// the field scrolls — including the cursor landing inside the dim half.
+    #[test]
+    fn a_dim_prefix_survives_a_field_too_narrow_for_it() {
+        for width in [24u16, 30, 40, 60] {
+            let mut p = at_directory("/home/you/a-long-directory-name//etc");
+            let cells = line_cells(&p, width, 14);
+            // The label is bold and comes first; after it, every dim cell must
+            // come before every live one. The boundary is one place in the text,
+            // so it has to be one place on the screen however the window moved.
+            let after_label: Vec<_> = cells
+                .iter()
+                .skip_while(|(_, m)| m.contains(Modifier::BOLD))
+                .collect();
+            let last_dim = after_label
+                .iter()
+                .rposition(|(_, m)| m.contains(Modifier::DIM));
+            let first_live = after_label
+                .iter()
+                .position(|(_, m)| !m.contains(Modifier::DIM));
+            if let (Some(last), Some(first)) = (last_dim, first_live) {
+                assert!(
+                    last < first,
+                    "the dim half is not contiguous at {width}: {after_label:?}"
+                );
+            }
+
+            let live: String = after_label
+                .iter()
+                .filter(|(_, m)| !m.contains(Modifier::DIM))
+                .map(|(s, _)| s.as_str())
+                .collect();
+            assert!(
+                live.trim().ends_with("etc"),
+                "the live half should be on screen at {width}: {live:?}"
+            );
+
+            // With the cursor dragged back into the discarded half, it keeps its
+            // own weight and everything around it stays dim.
+            p.on_key(Key::Home);
+            let cells = line_cells(&p, width, 14);
+            let cursors = cells
+                .iter()
+                .filter(|(_, m)| m.contains(Modifier::REVERSED) && !m.contains(Modifier::BOLD))
+                .count();
+            assert_eq!(cursors, 1, "one cursor at {width} columns: {cells:?}");
+        }
     }
 
     /// Two reversed things on one screen have to be told apart, or the eye reads

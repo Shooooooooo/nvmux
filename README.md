@@ -87,7 +87,7 @@ where it runs.
 |---|---|
 | `↑` `↓` `Ctrl-n` `Ctrl-p` | move between the fields (wraps) |
 | `Tab` | complete the working directory — see below |
-| `Enter` | create the session |
+| `Enter` | accept from the completion menu, or create the session |
 | `Esc` | close the completion menu, or leave |
 
 `Enter` submits the whole form from any field, so `c` `Enter` creates a session in
@@ -104,11 +104,22 @@ The command is described under [Configuration](#the-command-a-session-runs).
 
 **Where a session runs.** The third field is the directory its Neovim starts in —
 what `:pwd` reports, and what everything keyed off the working directory follows.
-It must be absolute, and it is a directory on whichever machine runs the session,
-so `nvmux myhost` completes and starts paths on *myhost*, not here. A leading `~`
-is expanded against that machine's home directory, which is also what the field
-offers by default; nothing else is expanded, for the reasons the command section
-gives. A directory that is not there is refused before anything is started.
+It is a directory on whichever machine runs the session, so `nvmux myhost`
+completes and starts paths on *myhost*, not here. A directory that is not there is
+refused before anything is started.
+
+The field **starts at your home directory** on that machine — the path is really
+there, as ordinary text you can edit — so pressing `Tab` lists what is inside it
+straight away.
+
+**To go somewhere else, type `//`.** Everything before the last one is discarded,
+so `/home/shu//etc` means `/etc`. The pre-filled path already ends in a slash, so
+typing one as your first keystroke is all it takes. The discarded part is greyed
+out, and that is the only thing grey means here: the part of the line that no
+longer decides where the session starts.
+
+A leading `~` is expanded against the session host's home directory; nothing else
+is expanded, for the reasons the command section gives.
 
 **`Tab` completes it.** Press it in that field and a menu opens listing the
 directories it could become, ranked fuzzily — `nvmx` finds `nvmux-rs`, so you need
@@ -116,15 +127,12 @@ not know how a directory starts to reach it. Nothing else opens the menu; the
 prompt is three plain fields until you ask.
 
 While it is open the movement keys move through it instead of between the fields,
-and `Tab` takes the highlighted directory. It writes the name alone, and the *next*
-`Tab` adds the `/` and opens the level below — so `Tab`, choose, `Tab`, `Tab`,
-choose, `Tab` walks down a tree without ever typing a slash. Typing narrows the
-menu, directories starting with a dot appear once you type a dot, and `Esc` closes
-it again.
-
-`Enter` always creates, even with the menu open: it uses the field as it stands,
-so a half-typed path is refused by name rather than turning into whichever
-directory was highlighted.
+and `Tab` or `Enter` takes the highlighted directory. It writes the name alone,
+and the *next* `Tab` adds the `/` and opens the level below — so `Tab`, choose,
+`Tab`, `Tab`, choose, `Tab` walks down a tree without ever typing a slash. Typing
+narrows the menu, directories starting with a dot appear once you type a dot, and
+`Esc` closes it again. Accepting closes the menu, so a second `Enter` creates the
+session.
 
 Completion never waits on your keystrokes. The listing runs beside the prompt, so
 typing is never slower than typing even when the answer is coming over ssh — and
