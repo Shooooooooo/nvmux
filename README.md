@@ -81,12 +81,20 @@ reimplementing it.
 | `q` `Ctrl-c` | quit |
 
 `c` asks three things: what the session is called, how its Neovim is started, and
-where it runs. `Tab` moves between the fields and `Enter` submits the whole form
-from any one of them, so `c` `Enter` still creates a session in one keystroke —
-with the suggested `session N`, the command you last used, and your home
-directory. Each field shows what `Enter` would take, dimmed; typing replaces it,
-and `→` takes it into the field to be edited instead, which is usually what you
-want for the command.
+where it runs.
+
+| Key | In the create prompt |
+|---|---|
+| `↑` `↓` `Ctrl-n` `Ctrl-p` | move between the fields (wraps) |
+| `Tab` | complete the working directory — see below |
+| `Enter` | create the session |
+| `Esc` | close the completion menu, or leave |
+
+`Enter` submits the whole form from any field, so `c` `Enter` creates a session in
+one keystroke — with the suggested `session N`, the command you last used, and
+your home directory. Each field shows what `Enter` would take, dimmed; typing
+replaces it, and `→` takes it into the field to be edited instead, which is
+usually what you want for the command.
 
 A session name is at most 64 bytes, has no leading or trailing whitespace and
 no control characters, and must not be in use — compared without regard to
@@ -102,18 +110,21 @@ is expanded against that machine's home directory, which is also what the field
 offers by default; nothing else is expanded, for the reasons the command section
 gives. A directory that is not there is refused before anything is started.
 
-**The path completes as you type.** Under the field is a menu of the directories
-it could become, ranked fuzzily — `nvmx` finds `nvmux-rs`, so you need not know
-how a directory starts to reach it. `↑` `↓` and `Ctrl-n` `Ctrl-p` move through
-it; `Enter` takes the highlighted one and adds the `/`, so you can keep typing
-and the menu drops a level with you. Directories starting with a dot appear once
-you type a dot, as in a shell.
+**`Tab` completes it.** Press it in that field and a menu opens listing the
+directories it could become, ranked fuzzily — `nvmx` finds `nvmux-rs`, so you need
+not know how a directory starts to reach it. Nothing else opens the menu; the
+prompt is three plain fields until you ask.
 
-In that field the arrows belong to the menu, so `Tab` is how you leave it — which
-is how you leave every other field too. `Enter` still submits the whole form from
-an untouched field, so `c` `Enter` is still a session in one keystroke; it goes to
-the menu only while you have typed something the form could not submit, or moved
-the selection. `Esc` hands it back, and a second `Esc` leaves the prompt.
+While it is open the movement keys move through it instead of between the fields,
+and `Tab` takes the highlighted directory. It writes the name alone, and the *next*
+`Tab` adds the `/` and opens the level below — so `Tab`, choose, `Tab`, `Tab`,
+choose, `Tab` walks down a tree without ever typing a slash. Typing narrows the
+menu, directories starting with a dot appear once you type a dot, and `Esc` closes
+it again.
+
+`Enter` always creates, even with the menu open: it uses the field as it stands,
+so a half-typed path is refused by name rather than turning into whichever
+directory was highlighted.
 
 Completion never waits on your keystrokes. The listing runs beside the prompt, so
 typing is never slower than typing even when the answer is coming over ssh — and
