@@ -14,11 +14,25 @@ use std::time::{Duration, Instant};
 
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
+use nvmux::launch::Launch;
 use nvmux::rpc::Client;
 use nvmux::session::Session;
 use nvmux::transport::local::LocalTransport;
 use nvmux::transport::Transport;
 use portable_pty::{CommandBuilder, PtySize};
+
+/// What a session is launched with unless the test is about the command
+/// itself: the built-in default, which is what nvmux ran before the command
+/// could be chosen at all.
+pub fn launch() -> Launch {
+    Launch::parse(nvmux::launch::DEFAULT).expect("the built-in default must parse")
+}
+
+/// A launch command with extra arguments spliced in, for the tests that check
+/// the chosen command really is what runs.
+pub fn launch_with(args: &str) -> Launch {
+    Launch::parse(&format!("nvim {args} --headless --listen {{sock}}")).expect("a valid command")
+}
 
 /// Whether `$NVMUX_TEST_REQUIRE` names this requirement.
 pub fn required(what: &str) -> bool {
@@ -82,6 +96,14 @@ impl Scratch {
     pub fn transport(&self) -> LocalTransport {
         LocalTransport::with_dir(self.0.clone()).expect("build transport")
     }
+
+    /// A session's `<id>.json` as it was written, for the tests that care what
+    /// reached disk rather than what the transport returned.
+    pub fn metadata(&self, id: &str) -> Session {
+        let path = self.0.join(format!("{id}.json"));
+        let bytes = std::fs::read(&path).expect("read the session metadata");
+        Session::from_json(&bytes, &path).expect("parse the session metadata")
+    }
 }
 
 impl Drop for Scratch {
@@ -112,6 +134,19 @@ impl Drop for Scratch {
         }
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// A running process's command line, the way the session-host scripts read one.
+/// Empty when it cannot be found, which the caller's assertion then reports.
+pub fn command_line(pid: u32) -> String {
+    if let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+        return String::from_utf8_lossy(&raw).replace('\0', " ");
+    }
+    std::process::Command::new("ps")
+        .args(["-ww", "-o", "args=", "-p", &pid.to_string()])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default()
 }
 
 /// Names every test session distinctly, so a failed run cannot poison the next.

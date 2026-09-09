@@ -14,6 +14,7 @@ use std::sync::Mutex;
 
 use crate::error::{NvimError, NvmuxError, Result, SessionError, SshError};
 use crate::ids;
+use crate::launch::Launch;
 use crate::nvim;
 use crate::paths;
 use crate::session::{Liveness, Session};
@@ -245,7 +246,7 @@ impl Transport for SshTransport {
         Ok(finish_listing(sessions))
     }
 
-    fn create_session(&self, name: &str) -> Result<Session> {
+    fn create_session(&self, name: &str, launch: &Launch) -> Result<Session> {
         // The listing doubles as the source of the new session's number; see the
         // local transport.
         let (id, num) = plan_create(&self.list_sessions()?, name)?;
@@ -254,8 +255,14 @@ impl Transport for SshTransport {
         let remote_sock = self.remote_sock(&id)?;
         self.local_sock(&id)?;
 
-        tracing::info!(host = %self.host(), %id, name, "spawning remote session");
-        let out = self.run_script(shell::SPAWN_SCRIPT, &[&self.remote_dir, &id])?;
+        // The *remote* socket: the command runs over there. Every word travels
+        // as its own argument, quoted by `ssh::exec_args` for both shell layers.
+        let argv = launch.argv_for(&remote_sock.to_string_lossy());
+        let mut args: Vec<&str> = vec![&self.remote_dir, &id];
+        args.extend(argv.iter().map(String::as_str));
+
+        tracing::info!(host = %self.host(), %id, name, command = launch.line(), "spawning remote session");
+        let out = self.run_script(shell::SPAWN_SCRIPT, &args)?;
         let spawned = protocol::parse_spawn(&out.stdout)?;
 
         // Both ways out of a half-created session: terminate the remote nvim
@@ -293,7 +300,8 @@ impl Transport for SshTransport {
             ));
         }
 
-        let mut session = Session::new(id.clone(), name.to_string(), spawned.pid.unwrap_or(0), num);
+        let mut session = Session::new(id.clone(), name.to_string(), spawned.pid.unwrap_or(0), num)
+            .launched_with(launch.line());
         let json = session.to_json()?;
         let out = self.run_script(shell::WRITE_META_SCRIPT, &[&self.remote_dir, &id, &json])?;
         protocol::require_terminator(&out.stdout, "metadata write")?;

@@ -39,10 +39,14 @@ use crate::error::ConfigError;
 
 /// The whole configuration. Each field is a table of its own, so the file reads
 /// as `[keys]`-style sections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+///
+/// Not `Copy`: `[session] command` owns a `String`. Nothing reads it by value —
+/// [`get`] hands out a `&'static Settings` — so this costs nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub keys: KeySettings,
+    pub session: SessionSettings,
 }
 
 /// The prefix key and how long a half-typed sequence waits (see [`crate::keys`]).
@@ -59,6 +63,16 @@ pub struct KeySettings {
     pub timeout_ms: u64,
 }
 
+/// What a new session launches, when the user has not said otherwise in the
+/// prompt and nothing has been remembered from a previous one.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionSettings {
+    /// The command line, with `{sock}` standing in for the session's socket.
+    /// Parsed by [`crate::launch::Launch`], which is also what rejects a bad one.
+    pub command: String,
+}
+
 // These are the built-in behaviour. `#[serde(default)]` on the containers means
 // an absent file, an empty file and an omitted field all land here, so this is
 // the one place a default is written down.
@@ -71,6 +85,16 @@ impl Default for KeySettings {
             // loaded, so it has to exist on its own.
             prefix: crate::keys::PREFIX,
             timeout_ms: 500,
+        }
+    }
+}
+
+impl Default for SessionSettings {
+    fn default() -> Self {
+        Self {
+            // Not a literal, for the same reason as the prefix above: the
+            // prompt shows this before any config has necessarily been read.
+            command: crate::launch::DEFAULT.to_string(),
         }
     }
 }
@@ -103,6 +127,17 @@ impl Settings {
             // Beyond `c_int` this would wrap negative and `poll` would block
             // forever; well before that it is a prefix that never resolves.
             return Err(format!("keys.timeout_ms must be at most {MAX_TIMEOUT_MS}"));
+        }
+        // Refused at startup rather than at the prompt: a command that can never
+        // spawn a session is a broken config, and the file is where it is fixed.
+        //
+        // The reason alone, not the whole error: every one of them is phrased as
+        // a predicate, so it reads as one sentence about the key — the same
+        // shape the timeout's messages above have.
+        if let Err(crate::error::SessionError::InvalidCommand { reason, .. }) =
+            crate::launch::Launch::parse(&self.session.command)
+        {
+            return Err(format!("session.command {reason}"));
         }
         Ok(())
     }
@@ -217,6 +252,7 @@ pub fn with_prefix(prefix: u8) -> Settings {
             prefix,
             ..KeySettings::default()
         },
+        ..Settings::default()
     }
 }
 
@@ -226,6 +262,7 @@ pub fn with_prefix(prefix: u8) -> Settings {
 /// commented values are the current defaults, so the template stays accurate.
 fn render_default_config(prefix: u8) -> String {
     let k = KeySettings::default();
+    let s = SessionSettings::default();
     format!(
         "# nvmux configuration — created on first run.\n\
          #\n\
@@ -234,9 +271,14 @@ fn render_default_config(prefix: u8) -> String {
          \n\
          [keys]\n\
          prefix     = {prefix:?}\n\
-         # timeout_ms = {timeout}\n",
+         # timeout_ms = {timeout}\n\
+         \n\
+         [session]\n\
+         # {{sock}} becomes the session's socket; it is what nvmux finds it by.\n\
+         # command = {command:?}\n",
         prefix = crate::keys::prefix_label(prefix),
         timeout = k.timeout_ms,
+        command = s.command,
     )
 }
 
@@ -323,9 +365,26 @@ mod tests {
         let doc = "\
             [keys]\n\
             prefix = \"Ctrl-Space\"\n\
-            timeout_ms = 500\n";
+            timeout_ms = 500\n\
+            [session]\n\
+            command = \"nvim --headless --listen {sock}\"\n";
         let s: Settings = toml::from_str(doc).expect("valid");
         assert_eq!(s, Settings::default());
+    }
+
+    /// The one default that lives elsewhere, like the prefix: the prompt shows
+    /// it before a config has necessarily been read.
+    #[test]
+    fn the_default_command_is_the_one_the_launcher_uses() {
+        assert_eq!(SessionSettings::default().command, crate::launch::DEFAULT);
+    }
+
+    #[test]
+    fn a_partial_document_keeps_the_other_tables_defaults() {
+        let s: Settings = toml::from_str("[session]\ncommand = \"nvim -u NONE --listen {sock}\"\n")
+            .expect("valid");
+        assert_eq!(s.session.command, "nvim -u NONE --listen {sock}");
+        assert_eq!(s.keys, KeySettings::default());
     }
 
     #[test]
@@ -350,6 +409,7 @@ mod tests {
             ("an unknown top-level table", "[colours]\nx = 1\n"),
             ("an unknown keys key", "[keys]\nprefx = \"C-a\"\n"),
             ("an unparseable prefix", "[keys]\nprefix = \"nope\"\n"),
+            ("an unknown session key", "[session]\ncmd = \"nvim\"\n"),
         ] {
             assert!(
                 toml::from_str::<Settings>(doc).is_err(),
@@ -382,6 +442,28 @@ mod tests {
         }
     }
 
+    /// A command that could never spawn a session is a broken config, not a
+    /// surprise at the prompt — and the message has to name the key it is in.
+    #[test]
+    fn an_unusable_command_is_rejected_with_its_key_named() {
+        for doc in [
+            "[session]\ncommand = \"nvim --headless\"\n",
+            "[session]\ncommand = \"\"\n",
+            "[session]\ncommand = \"nvim --listen '{sock}\"\n",
+        ] {
+            let err = parse(Path::new("test.toml"), doc).expect_err(doc);
+            match err {
+                ConfigError::Invalid { message, .. } => {
+                    assert!(
+                        message.contains("session.command"),
+                        "{doc:?} -> {message:?}"
+                    )
+                }
+                other => panic!("{doc:?}: expected Invalid, got {other:?}"),
+            }
+        }
+    }
+
     // --- first-run template (pure) -----------------------------------------
 
     #[test]
@@ -403,8 +485,12 @@ mod tests {
             rendered.contains("\nprefix     = \"Ctrl-a\"\n"),
             "the chosen prefix is the one active setting: {rendered:?}"
         );
-        // The timeout is documentation, not an active setting.
+        // The timeout and the command are documentation, not active settings.
         assert!(rendered.contains("# timeout_ms = 500"));
+        assert!(
+            rendered.contains("# command = \"nvim --headless --listen {sock}\""),
+            "the template must document the command: {rendered:?}"
+        );
     }
 
     // --- path resolution (pure) --------------------------------------------

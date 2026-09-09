@@ -43,7 +43,9 @@ fn a_sessions_editor_carries_the_marker() {
     let scratch = Scratch::new("marker");
     let t = scratch.transport();
 
-    let session = t.create_session("marked").expect("create");
+    let session = t
+        .create_session("marked", &common::launch())
+        .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
 
     let mut client = nvmux::rpc::Client::connect(&sock, Duration::from_secs(2)).expect("connect");

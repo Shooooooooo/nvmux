@@ -15,7 +15,7 @@ mod common;
 use std::os::unix::fs::DirBuilderExt;
 use std::time::{Duration, Instant};
 
-use common::Scratch;
+use common::{command_line, Scratch};
 use nvmux::session::Liveness;
 use nvmux::transport::Transport;
 
@@ -30,7 +30,9 @@ fn create_list_and_kill_a_session() {
         "should start empty"
     );
 
-    let session = t.create_session("dotfiles").expect("create");
+    let session = t
+        .create_session("dotfiles", &common::launch())
+        .expect("create");
     assert_eq!(session.name, "dotfiles");
     assert_eq!(session.id.len(), 8, "id should be 8 base32 chars");
     assert!(session.pid > 1, "spawn must report a validated pid");
@@ -67,7 +69,9 @@ fn the_pid_recorded_is_the_process_serving_the_socket() {
     require_nvim!();
     let scratch = Scratch::new("pid");
     let t = scratch.transport();
-    let session = t.create_session("pidcheck").expect("create");
+    let session = t
+        .create_session("pidcheck", &common::launch())
+        .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
 
     // Require that the pid nvmux would signal is the one actually holding this
@@ -97,7 +101,9 @@ fn rename_edits_metadata_and_leaves_the_socket_alone() {
     let scratch = Scratch::new("rename");
     let t = scratch.transport();
 
-    let session = t.create_session("before").expect("create");
+    let session = t
+        .create_session("before", &common::launch())
+        .expect("create");
     let sock_before = t.local_socket_for(&session).expect("socket");
 
     t.rename_session(&session, "after").expect("rename");
@@ -130,9 +136,15 @@ fn session_numbers_are_stable_and_a_freed_one_is_reused() {
     let scratch = Scratch::new("numbers");
     let t = scratch.transport();
 
-    let first = t.create_session("first").expect("create");
-    let second = t.create_session("second").expect("create");
-    let third = t.create_session("third").expect("create");
+    let first = t
+        .create_session("first", &common::launch())
+        .expect("create");
+    let second = t
+        .create_session("second", &common::launch())
+        .expect("create");
+    let third = t
+        .create_session("third", &common::launch())
+        .expect("create");
     assert_eq!(
         (first.num, second.num, third.num),
         (1, 2, 3),
@@ -155,7 +167,9 @@ fn session_numbers_are_stable_and_a_freed_one_is_reused() {
     );
 
     // And the next create refills the hole rather than climbing to 4.
-    let fourth = t.create_session("fourth").expect("create");
+    let fourth = t
+        .create_session("fourth", &common::launch())
+        .expect("create");
     assert_eq!(fourth.num, 2, "the freed number is handed out again");
 
     let listed = t.list_sessions().expect("list");
@@ -171,7 +185,7 @@ fn a_number_survives_the_metadata_round_trip() {
     let scratch = Scratch::new("num-roundtrip");
     let t = scratch.transport();
 
-    let session = t.create_session("only").expect("create");
+    let session = t.create_session("only", &common::launch()).expect("create");
     let v = common::read_meta(&scratch.0.join(format!("{}.json", session.id)));
     assert_eq!(
         v.get("num").and_then(serde_json::Value::as_u64),
@@ -190,7 +204,9 @@ fn metadata_without_a_number_still_lists_and_gets_one() {
     let scratch = Scratch::new("num-legacy");
     let t = scratch.transport();
 
-    let session = t.create_session("legacy").expect("create");
+    let session = t
+        .create_session("legacy", &common::launch())
+        .expect("create");
     let path = scratch.0.join(format!("{}.json", session.id));
 
     // Rewrite it the way an older nvmux would have.
@@ -213,17 +229,21 @@ fn duplicate_names_are_refused_on_create_and_rename() {
     let scratch = Scratch::new("dupes");
     let t = scratch.transport();
 
-    let first = t.create_session("taken").expect("create");
+    let first = t
+        .create_session("taken", &common::launch())
+        .expect("create");
     assert!(
-        t.create_session("taken").is_err(),
+        t.create_session("taken", &common::launch()).is_err(),
         "duplicate name must be refused"
     );
     assert!(
-        t.create_session("TAKEN").is_err(),
+        t.create_session("TAKEN", &common::launch()).is_err(),
         "duplicate check should not be case-sensitive"
     );
 
-    let second = t.create_session("other").expect("create second");
+    let second = t
+        .create_session("other", &common::launch())
+        .expect("create second");
     assert!(
         t.rename_session(&second, "taken").is_err(),
         "renaming onto an existing name must be refused"
@@ -241,7 +261,9 @@ fn unsaved_buffers_do_not_block_a_kill() {
     let scratch = Scratch::new("unsaved");
     let t = scratch.transport();
 
-    let session = t.create_session("unsaved").expect("create");
+    let session = t
+        .create_session("unsaved", &common::launch())
+        .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
 
     let mut client = nvmux::rpc::Client::connect(&sock, Duration::from_secs(2)).expect("connect");
@@ -263,7 +285,9 @@ fn a_dead_session_is_reaped_from_the_listing() {
     let scratch = Scratch::new("reap");
     let t = scratch.transport();
 
-    let session = t.create_session("doomed").expect("create");
+    let session = t
+        .create_session("doomed", &common::launch())
+        .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
     let json = sock.with_extension("json");
 
@@ -328,7 +352,9 @@ fn a_busy_session_is_never_reaped() {
     let scratch = Scratch::new("busy");
     let t = scratch.transport();
 
-    let session = t.create_session("building").expect("create");
+    let session = t
+        .create_session("building", &common::launch())
+        .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
 
     // Block the editor's main loop the way `:!make` would. `system()` does not
@@ -360,7 +386,7 @@ fn names_with_shell_metacharacters_survive_a_round_trip() {
         "a;b|c&d",
     ] {
         let session = t
-            .create_session(name)
+            .create_session(name, &common::launch())
             .unwrap_or_else(|e| panic!("create {name:?}: {e}"));
         let listed = t.list_sessions().expect("list");
         let found = listed
@@ -387,7 +413,9 @@ fn a_session_busy_in_cpu_bound_lua_is_never_reaped() {
     let scratch = Scratch::new("cpubusy");
     let t = scratch.transport();
 
-    let session = t.create_session("compiling").expect("create");
+    let session = t
+        .create_session("compiling", &common::launch())
+        .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
     let pid = session.pid;
 
@@ -429,7 +457,9 @@ fn a_timed_out_call_poisons_the_connection() {
     require_nvim!();
     let scratch = Scratch::new("poison");
     let t = scratch.transport();
-    let session = t.create_session("poisoned").expect("create");
+    let session = t
+        .create_session("poisoned", &common::launch())
+        .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
 
     // Block the editor, then make a call that cannot possibly be answered.
@@ -466,7 +496,9 @@ fn a_recycled_pid_neither_misfires_nor_blocks_the_kill() {
     require_nvim!();
     let scratch = Scratch::new("recycled");
     let t = scratch.transport();
-    let session = t.create_session("stubborn").expect("create");
+    let session = t
+        .create_session("stubborn", &common::launch())
+        .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
     let json = sock.with_extension("json");
 
@@ -510,7 +542,9 @@ fn killing_an_already_dead_session_cleans_up_its_files() {
     require_nvim!();
     let scratch = Scratch::new("alreadydead");
     let t = scratch.transport();
-    let session = t.create_session("ghost").expect("create");
+    let session = t
+        .create_session("ghost", &common::launch())
+        .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
     let json = sock.with_extension("json");
 
@@ -541,7 +575,9 @@ fn a_session_can_be_killed_on_a_host_with_proc_but_no_ps() {
     }
     let scratch = Scratch::new("nops");
     let t = scratch.transport();
-    let session = t.create_session("noprocps").expect("create");
+    let session = t
+        .create_session("noprocps", &common::launch())
+        .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
 
     // A PATH with everything the script needs except `ps`.
@@ -611,7 +647,9 @@ fn a_stale_pid_does_not_break_an_otherwise_normal_kill() {
     require_nvim!();
     let scratch = Scratch::new("stalepid");
     let t = scratch.transport();
-    let session = t.create_session("staleish").expect("create");
+    let session = t
+        .create_session("staleish", &common::launch())
+        .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
     let json = sock.with_extension("json");
 
@@ -639,7 +677,9 @@ fn metadata_left_by_a_self_terminating_session_is_swept_up() {
     let scratch = Scratch::new("sweep");
     let t = scratch.transport();
 
-    let session = t.create_session("selfquit").expect("create");
+    let session = t
+        .create_session("selfquit", &common::launch())
+        .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
     let json = sock.with_extension("json");
     let log = sock.with_extension("log");
@@ -674,7 +714,9 @@ fn a_session_at_a_hit_enter_prompt_is_listed_at_once_as_busy() {
     require_nvim!();
     let scratch = Scratch::new("hitenter");
     let t = scratch.transport();
-    let session = t.create_session("prompted").expect("create");
+    let session = t
+        .create_session("prompted", &common::launch())
+        .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
     let _ui = common::HitEnter::open(&sock);
 
@@ -701,7 +743,9 @@ fn probe_is_busy_at_a_hit_enter_prompt_and_alive_after_it() {
     require_nvim!();
     let scratch = Scratch::new("hitenterprobe");
     let t = scratch.transport();
-    let session = t.create_session("prompted").expect("create");
+    let session = t
+        .create_session("prompted", &common::launch())
+        .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
     let _ui = common::HitEnter::open(&sock);
 
@@ -729,7 +773,9 @@ fn a_fresh_attach_to_a_session_at_a_hit_enter_prompt_ends_it_and_attaches() {
     require_nvim!();
     let scratch = Scratch::new("hitenterattach");
     let t = scratch.transport();
-    let session = t.create_session("prompted").expect("create");
+    let session = t
+        .create_session("prompted", &common::launch())
+        .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
     let _ui = common::HitEnter::open(&sock);
 
@@ -760,4 +806,111 @@ fn a_fresh_attach_to_a_session_at_a_hit_enter_prompt_ends_it_and_attaches() {
 
     // Retires the new client; the helper's goes with `_ui`.
     attachment.terminate();
+}
+
+/// The whole point of asking how nvim is launched: the command chosen is the
+/// command that runs, and the session it starts is an ordinary session —
+/// listed, reachable, and killable by the same socket-matching as any other.
+#[test]
+fn a_chosen_command_is_what_runs_and_the_session_behaves_normally() {
+    require_nvim!();
+    let scratch = Scratch::new("chosen-command");
+    let t = scratch.transport();
+
+    let launch = common::launch_with("--clean");
+    let session = t.create_session("bespoke", &launch).expect("create");
+
+    let listed = t.list_sessions().expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].state.liveness,
+        Liveness::Alive,
+        "a session started with a chosen command is a session like any other"
+    );
+
+    // The argument is in the running process, so it really was passed through
+    // rather than dropped somewhere between the prompt and the spawn.
+    let args = command_line(session.pid);
+    assert!(
+        args.contains("--clean"),
+        "the chosen argument never reached nvim: {args:?}"
+    );
+    assert!(
+        args.contains("--headless"),
+        "nor did the rest of the line: {args:?}"
+    );
+
+    // And it is recorded, so a session's metadata says what produced it.
+    let stored = scratch.metadata(&session.id);
+    assert_eq!(stored.command, launch.line());
+
+    // Killing still finds it: it is found by its socket, and the socket is
+    // where the command said to put it.
+    t.kill_session(&session).expect("kill");
+    assert!(t.list_sessions().expect("list").is_empty());
+}
+
+/// A command that names nothing must fail fast and say what was wrong, rather
+/// than spending the readiness budget and blaming the session for not starting.
+#[test]
+fn a_command_that_names_nothing_fails_at_once_and_says_so() {
+    require_nvim!();
+    let scratch = Scratch::new("no-such-command");
+    let t = scratch.transport();
+
+    let launch = nvmux::launch::Launch::parse("nvmux-no-such-editor --listen {sock}")
+        .expect("a well-formed command naming a program that is not there");
+
+    let started = std::time::Instant::now();
+    let err = t
+        .create_session("hopeless", &launch)
+        .expect_err("nothing could have started");
+    assert!(
+        err.to_string().contains("nvmux-no-such-editor"),
+        "the error must name the command: {err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "it must not wait out the five-second readiness budget first"
+    );
+    assert!(
+        t.list_sessions().expect("list").is_empty(),
+        "a failed create must leave nothing behind"
+    );
+}
+
+/// The sharp edge of letting the whole line be edited: `--listen <sock>` need
+/// not come last, and a session with arguments after it must still be found.
+///
+/// The scripts' fast path reads a `--listen` argument to the end of the line, so
+/// this is exactly the shape it cannot match. Listing and killing both have to
+/// fall through to asking the process table for the socket instead — which is
+/// the difference between a session nvmux can manage and one it has orphaned.
+#[test]
+fn a_session_whose_socket_is_not_the_last_argument_is_still_found_and_killed() {
+    require_nvim!();
+    let scratch = Scratch::new("socket-not-last");
+    let t = scratch.transport();
+
+    let launch = nvmux::launch::Launch::parse("nvim --headless --listen {sock} --clean")
+        .expect("a valid command");
+    let session = t.create_session("trailing", &launch).expect("create");
+
+    let args = command_line(session.pid);
+    assert!(
+        args.trim_end().ends_with("--clean"),
+        "the fixture must put something after the socket: {args:?}"
+    );
+
+    let listed = t.list_sessions().expect("list");
+    assert_eq!(listed.len(), 1, "the session must still be listed");
+    assert_eq!(listed[0].state.liveness, Liveness::Alive);
+
+    let sock = t.local_socket_for(&session).expect("socket path");
+    t.kill_session(&session).expect("kill");
+    assert!(
+        t.list_sessions().expect("list").is_empty(),
+        "a session nvmux cannot kill is one it has orphaned"
+    );
+    assert!(!sock.exists(), "kill must unlink the socket");
 }

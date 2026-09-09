@@ -88,7 +88,7 @@ fn a_session_created_over_ssh_is_reachable_through_the_forward() {
     let name = unique("reach");
     let _guard = Cleanup::of([&name]);
 
-    let session = t.create_session(&name).expect("create");
+    let session = t.create_session(&name, &common::launch()).expect("create");
     assert!(
         session.pid > 1,
         "spawn should report a validated remote pid"
@@ -125,7 +125,7 @@ fn a_remote_session_outlives_the_transport_that_made_it() {
 
     let id = {
         let t = SshTransport::new(host()).expect("connect");
-        let s = t.create_session(&name).expect("create");
+        let s = t.create_session(&name, &common::launch()).expect("create");
         s.id
     }; // transport dropped, ssh commands finished
 
@@ -147,7 +147,7 @@ fn a_forward_can_be_torn_down_and_rebuilt() {
     let name = unique("reforward");
     let _guard = Cleanup::of([&name]);
 
-    let session = t.create_session(&name).expect("create");
+    let session = t.create_session(&name, &common::launch()).expect("create");
     let first = t.local_socket_for(&session).expect("forward");
     assert!(first.exists());
 
@@ -172,7 +172,7 @@ fn renaming_a_remote_session_moves_no_socket() {
     let name = unique("rename");
     let _guard = Cleanup::of([name.clone(), format!("{name}-after")]);
 
-    let session = t.create_session(&name).expect("create");
+    let session = t.create_session(&name, &common::launch()).expect("create");
     let before = t.local_socket_for(&session).expect("forward");
 
     let after_name = format!("{name}-after");
@@ -196,7 +196,7 @@ fn killing_a_remote_session_removes_it_and_its_forward() {
     // session would otherwise outlive the run on the remote host.
     let _guard = Cleanup::of([&name]);
 
-    let session = t.create_session(&name).expect("create");
+    let session = t.create_session(&name, &common::launch()).expect("create");
     let sock = t.local_socket_for(&session).expect("forward");
     assert!(sock.exists());
 
@@ -224,7 +224,7 @@ fn remote_names_with_shell_metacharacters_survive() {
     let name = format!("{} $(id) 'q' \"d\"", unique("quote"));
     let _guard = Cleanup::of([unique("quote")]);
 
-    let session = t.create_session(&name).expect("create");
+    let session = t.create_session(&name, &common::launch()).expect("create");
     let found = common::find_by_id(&t, &session.id).expect("listed");
     assert_eq!(
         found.name, name,
@@ -258,7 +258,7 @@ fn a_listing_keeps_live_forwards_and_removes_orphaned_ones() {
     let name = unique("sweep");
     let _guard = Cleanup::of([&name]);
 
-    let session = t.create_session(&name).expect("create");
+    let session = t.create_session(&name, &common::launch()).expect("create");
     let live = t.local_socket_for(&session).expect("forward");
     assert!(live.exists());
 
@@ -277,4 +277,58 @@ fn a_listing_keeps_live_forwards_and_removes_orphaned_ones() {
     let mut client =
         nvmux::rpc::Client::connect(&live, nvmux::rpc::PROBE_TIMEOUT).expect("still connectable");
     client.api_info().expect("still usable after a listing");
+}
+
+/// The chosen command runs on the host that owns the session, not on this one,
+/// and every word of it survives ssh's argument join and the remote login
+/// shell's second parse.
+#[test]
+fn a_chosen_command_runs_on_the_remote_host_with_its_arguments_intact() {
+    require_ssh!();
+    let t = SshTransport::new(host()).expect("connect");
+    let name = unique("remote-command");
+    let _guard = Cleanup::of([&name]);
+
+    let launch = common::launch_with("--clean");
+    let session = t.create_session(&name, &launch).expect("create");
+
+    // Asked of the remote host, since that is where the process is.
+    let remote = std::process::Command::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            &host(),
+            "ps",
+            "-ww",
+            "-o",
+            "args=",
+            "-p",
+        ])
+        .arg(session.pid.to_string())
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    assert!(
+        remote.contains("--clean"),
+        "the chosen argument never reached the remote nvim: {remote:?}"
+    );
+
+    // Reachable through the forward like any other session, and recorded.
+    let sock = t.local_socket_for(&session).expect("forward");
+    let mut client =
+        nvmux::rpc::Client::connect(&sock, nvmux::rpc::PROBE_TIMEOUT).expect("connect via forward");
+    client.api_info().expect("api_info through the forward");
+
+    let listed = t.list_sessions().expect("list");
+    let stored = listed
+        .iter()
+        .find(|s| s.id == session.id)
+        .expect("the session should be listed");
+    assert_eq!(
+        stored.command,
+        launch.line(),
+        "the remote metadata must record what launched it"
+    );
+
+    t.kill_session(&session).expect("kill");
 }

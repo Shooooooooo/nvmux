@@ -126,7 +126,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         key: b'c',
         action: Action::Create,
-        help: "name a new session and attach to it",
+        help: "start a new session and attach to it",
     },
     Binding {
         key: b'?',

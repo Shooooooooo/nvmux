@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::error::{Result, SessionError};
+use crate::launch::Launch;
 use crate::rpc;
 use crate::session::Session;
 
@@ -44,7 +45,9 @@ pub trait Transport {
     /// not one per session — see [`crate::shell::LIST_SCRIPT`].
     fn list_sessions(&self) -> Result<Vec<Session>>;
 
-    fn create_session(&self, name: &str) -> Result<Session>;
+    /// Spawn a session running `launch`, whose `{sock}` becomes this session's
+    /// socket — on this machine or on the far end, wherever the sessions live.
+    fn create_session(&self, name: &str, launch: &Launch) -> Result<Session>;
 
     /// Terminate a session, unconditionally: nvmux never asks about unsaved
     /// buffers. The ordinary way out is `:q` in the session itself, which ends

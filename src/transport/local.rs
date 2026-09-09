@@ -4,6 +4,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use crate::error::{NvmuxError, Result, SessionError};
+use crate::launch::Launch;
 use crate::paths::{self, SessionPaths};
 use crate::proc;
 use crate::rpc;
@@ -142,14 +143,21 @@ impl Transport for LocalTransport {
         Ok(finish_listing(alive))
     }
 
-    fn create_session(&self, name: &str) -> Result<Session> {
+    fn create_session(&self, name: &str, launch: &Launch) -> Result<Session> {
         // The listing is also what the new session's number is allocated
         // from, so numbering costs no extra work here.
         let (id, num) = plan_create(&self.list_sessions()?, name)?;
         let paths = self.paths(&id)?;
 
-        tracing::info!(%id, name, "spawning session");
-        let out = proc::run_local(shell::SPAWN_SCRIPT, &[&self.dir_arg, &id])?;
+        // The socket is substituted here rather than in the script: this side
+        // already computed the path, and `SessionPaths::new` has bounded its
+        // length, which the script has no way to do.
+        let argv = launch.argv_for(&paths.sock.to_string_lossy());
+        let mut args: Vec<&str> = vec![&self.dir_arg, &id];
+        args.extend(argv.iter().map(String::as_str));
+
+        tracing::info!(%id, name, command = launch.line(), "spawning session");
+        let out = proc::run_local(shell::SPAWN_SCRIPT, &args)?;
         let spawned = protocol::parse_spawn(&out.stdout)?;
 
         if !spawned.socket_appeared || !wait_until_reachable(&paths.sock, REACHABLE_TIMEOUT) {
@@ -177,7 +185,8 @@ impl Transport for LocalTransport {
             .into());
         }
 
-        let mut session = Session::new(id, name.to_string(), spawned.pid.unwrap_or(0), num);
+        let mut session = Session::new(id, name.to_string(), spawned.pid.unwrap_or(0), num)
+            .launched_with(launch.line());
         session.write_atomic(&paths.json)?;
         // The caller attaches to this without re-listing, so give it the same
         // resolved number a listing would have.

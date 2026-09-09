@@ -71,7 +71,7 @@ reimplementing it.
 | `g` `G` `Home` `End` | first / last |
 | `1`, `2`, … `12` | attach to the session with that number |
 | `Enter` | attach (or end a number early) |
-| `c` | name a new session, then attach |
+| `c` | set up a new session, then attach |
 | `r` | rename the selected session |
 | `x` | kill |
 | `/` | filter |
@@ -79,9 +79,18 @@ reimplementing it.
 | `Esc` | clear the filter, or cancel a prompt |
 | `q` `Ctrl-c` | quit |
 
+`c` asks two things: what the session is called, and how its Neovim is started.
+`Tab` moves between the two fields and `Enter` submits both from either one, so
+`c` `Enter` still creates a session in one keystroke — with the suggested
+`session N` and the command you last used. Each field shows what `Enter` would
+take, dimmed; typing replaces it, and `→` takes it into the field to be edited
+instead, which is usually what you want for the command.
+
 A session name is at most 64 bytes, has no leading or trailing whitespace and
 no control characters, and must not be in use — compared without regard to
-case. Pressing `Enter` on an empty name prompt takes the suggested `session N`.
+case.
+
+The command is described under [Configuration](#the-command-a-session-runs).
 
 **Numbers are for life.** A session keeps the number it was created with, so a
 number you have learned goes on meaning the same session. They start at 1 and
@@ -99,7 +108,7 @@ once you have more than nine sessions.
 | `<prefix>` `d` | detach — leaves the session running, exits nvmux |
 | `<prefix>` `t` | back to the picker, session still attached |
 | `<prefix>` `1`, `2`, … `12` | switch straight to that session |
-| `<prefix>` `c` | name a new session and attach to it — `Esc` goes back |
+| `<prefix>` `c` | set up a new session and attach to it — `Esc` goes back |
 | `<prefix>` `?` | show these keys — `Esc` goes back |
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
 
@@ -154,12 +163,51 @@ Every value below is its default:
 [keys]
 prefix     = "Ctrl-Space"   # Ctrl-Space, or a Ctrl-<letter> chord
 timeout_ms = 500            # how long a lone prefix or half-typed number waits
+
+[session]
+command = "nvim --headless --listen {sock}"   # what a new session starts
 ```
+
+### The command a session runs
+
+`session.command` is the whole command line, and it is what the create prompt
+offers the first time. `{sock}` is required and stands for the session's socket:
+it is what `nvim` binds and what every later listing and kill finds the session
+by, so a line without it is refused rather than quietly repaired.
+
+The line is split into words the way a shell splits them — `'…'`, `"…"` and `\`
+all work, so a path with a space in it stays one word — but **nothing is
+expanded**. There is no shell in the path to do it, which is also what keeps a
+command safe to send over ssh. So no globs, no `$VAR`, no `~`, and no leading
+`VAR=value`; write `env NAME=value nvim …` and spell the home directory out.
+
+```toml
+[session]
+command = "nvim --clean --headless --listen {sock}"
+# command = "/opt/nvim-nightly/bin/nvim --headless --listen {sock}"
+# command = "env NVIM_APPNAME=work nvim --headless --listen {sock}"
+```
+
+Neovim's version is checked as `nvim` on your `$PATH`, which is not necessarily
+the binary a custom command runs. A command that names nothing is reported as
+soon as the session is created, not after a timeout.
+
+### What nvmux remembers
+
+Change the command at the prompt and the next new session on that host offers it
+back. That is kept in `$NVMUX_STATE` if set, else `$XDG_STATE_HOME/nvmux/state.toml`,
+else `~/.local/state/nvmux/state.toml` — per host, since a path to a nightly
+build on one machine means nothing on another.
+
+The file is a convenience and nothing more: nvmux writes it, deleting it only
+loses the suggestion, and a broken one is ignored rather than reported. The
+config file is the opposite on every count, which is why they are separate.
 
 ## Logs
 
 Everything nvmux runs lives under `/tmp/nvmux-<uid>` (the same rule on both
 ends, so a session's files stay in one place across logouts); nvmux's own log
-is `nvmux.log` there, and each session's server output is `<id>.log`. The
-verbosity comes from `$NVMUX_LOG`, in `RUST_LOG` syntax, and defaults to
-warnings only. Keystrokes are never logged.
+is `nvmux.log` there, and each session's server output is `<id>.log` — beside
+`<id>.json`, which records the command that produced it. The verbosity comes
+from `$NVMUX_LOG`, in `RUST_LOG` syntax, and defaults to warnings only.
+Keystrokes are never logged.

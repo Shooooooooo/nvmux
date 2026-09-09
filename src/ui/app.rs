@@ -363,6 +363,13 @@ pub enum Key {
     Backspace,
     Up,
     Down,
+    /// Only the prompt binds these four: they move within and between its
+    /// fields. The picker's handlers ignore them, as they do any other key
+    /// they do not name.
+    Left,
+    Right,
+    Tab,
+    BackTab,
     Home,
     End,
     CtrlC,

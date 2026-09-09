@@ -66,9 +66,16 @@ pub struct Session {
     /// `transport::finish_listing` resolves that into `state.num`.
     #[serde(default)]
     pub num: u32,
+    /// The command line this session's Neovim was launched with, as
+    /// [`crate::launch`] validated it and with `{sock}` still in it. A record,
+    /// not an instruction: nothing re-runs it, and the picker does not show it.
+    /// Its `<id>.log` says what the editor printed and this says what produced
+    /// it. Empty for metadata written before the field existed, and for orphans.
+    #[serde(default)]
+    pub command: String,
 
     /// Probe results. Never serialised: the on-disk shape stays exactly the
-    /// five keys above.
+    /// six keys above.
     #[serde(skip)]
     pub state: SessionState,
 }
@@ -81,8 +88,16 @@ impl Session {
             created: now_secs(),
             pid,
             num,
+            command: String::new(),
             state: SessionState::default(),
         }
+    }
+
+    /// Record what launched it. Separate from `new` because an orphan and a
+    /// session reconstructed from a listing have no command to record.
+    pub fn launched_with(mut self, command: &str) -> Self {
+        self.command = command.to_string();
+        self
     }
 
     /// Parse `<id>.json` contents.
@@ -157,7 +172,7 @@ pub fn validate_name(name: &str) -> Result<(), SessionError> {
 /// A character that a session listing cannot show honestly: a control
 /// character, or one of the zero-width and bidirectional-formatting characters
 /// that change how the *surrounding* text reads without occupying a cell.
-fn is_unrenderable(c: char) -> bool {
+pub(crate) fn is_unrenderable(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
@@ -180,14 +195,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn json_has_exactly_the_five_documented_keys() {
-        let s = Session::new("abcdefgh".into(), "dotfiles".into(), 4242, 3);
+    fn json_has_exactly_the_six_documented_keys() {
+        let s = Session::new("abcdefgh".into(), "dotfiles".into(), 4242, 3)
+            .launched_with(crate::launch::DEFAULT);
         let v: serde_json::Value =
             serde_json::from_str(&s.to_json().expect("serialise")).expect("json");
         let obj = v.as_object().expect("object");
         let mut keys: Vec<_> = obj.keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["created", "id", "name", "num", "pid"]);
+        assert_eq!(keys, ["command", "created", "id", "name", "num", "pid"]);
+        assert_eq!(v["command"], crate::launch::DEFAULT);
     }
 
     /// The resolved number is display state, and a rename over ssh writes an
@@ -216,7 +233,8 @@ mod tests {
 
     #[test]
     fn round_trips_through_json() {
-        let s = Session::new("abcdefgh".into(), "api server".into(), 99, 7);
+        let s = Session::new("abcdefgh".into(), "api server".into(), 99, 7)
+            .launched_with("nvim --clean --headless --listen {sock}");
         let json = s.to_json().expect("serialise");
         let back = Session::from_json(json.as_bytes(), Path::new("x.json")).expect("parse");
         assert_eq!(back.id, s.id);
@@ -224,6 +242,7 @@ mod tests {
         assert_eq!(back.created, s.created);
         assert_eq!(back.pid, s.pid);
         assert_eq!(back.num, s.num);
+        assert_eq!(back.command, s.command);
         // A freshly parsed session has been probed by nobody.
         assert_eq!(back.state, SessionState::default());
     }
@@ -237,6 +256,8 @@ mod tests {
         assert_eq!(s.pid, 1234);
         // Written before numbering existed: unnumbered, not a parse failure.
         assert_eq!(s.num, 0);
+        // Likewise for metadata written before the command was recorded.
+        assert_eq!(s.command, "");
     }
 
     #[test]
