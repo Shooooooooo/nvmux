@@ -20,6 +20,25 @@
 //! * a deferred call timing out means [`Liveness::Busy`] — the user is running
 //!   a build — and must never be treated as death, or nvmux would reap live
 //!   sessions out from under anyone who typed `:!make`.
+//!
+//! # Fast calls, and a session waiting at a prompt
+//!
+//! Neovim runs a handful of API functions straight from the socket read
+//! callback (`FUNC_API_FAST`: `nvim_get_api_info`, `nvim_get_mode`,
+//! `nvim_input`) and queues every other one for its main loop. An editor
+//! parked at a hit-enter prompt (`Press ENTER or type command to continue`)
+//! waits for that key with the queue switched off, so a deferred call — any of
+//! `nvim_list_bufs`, `nvim_list_uis`, `nvim_command`, `nvim_eval` — gets no
+//! answer at all until the prompt ends, however long the budget. Measured
+//! against 0.12.5: `nvim_get_mode` answers in 0.1 ms with `blocking = true`,
+//! `nvim_list_bufs` never answers. With `'cmdheight'` at 0, which AstroNvim
+//! sets, every one-line error opens that prompt; with the default 1, any
+//! message that scrolls does. So [`probe`] asks the mode before it asks
+//! anything deferred, and the attach and resume paths in [`crate::pty`] end
+//! the prompt with the one key it consumes, `<CR>`, before they wait on the
+//! editor. `nvim_get_mode` is only immediate while the editor is blocked or
+//! idle: during `:!cmd` and CPU-bound Lua it is queued like everything else,
+//! which is why every call here still carries a budget.
 
 use std::io::{BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -283,10 +302,79 @@ impl<S: Read + Write> Client<S> {
         Ok(v.as_array().map(|a| a.len()).unwrap_or(0))
     }
 
-    /// `nvim_command`. Used for `qa!` and for injecting the `:Detach` alias.
+    /// `nvim_command`. Used for `qa!`, for injecting the `:Detach` alias, and
+    /// for `:mode`, the one command that clears the grid and repaints it.
     pub fn command(&mut self, cmd: &str) -> Result<(), RpcError> {
         self.call("nvim_command", vec![Value::String(cmd.into())])?;
         Ok(())
+    }
+
+    /// `nvim_get_mode` — a *fast* call, answered even while the editor is
+    /// blocked at a prompt, which is exactly when it is worth asking. See the
+    /// module docs.
+    pub fn get_mode(&mut self) -> Result<Mode, RpcError> {
+        let v = self.call("nvim_get_mode", vec![])?;
+        let map = v
+            .as_map()
+            .ok_or_else(|| RpcError::Protocol("get_mode was not a map".into()))?;
+        let field = |name: &str| {
+            map.iter()
+                .find(|(k, _)| k.as_str() == Some(name))
+                .map(|(_, v)| v)
+        };
+        let mode = field("mode")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::Protocol("get_mode had no mode".into()))?
+            .to_string();
+        // Absent means not blocking: the key has been there since 0.2, but a
+        // missing flag must read as "go ahead", never as "blocked".
+        let blocking = field("blocking").and_then(Value::as_bool).unwrap_or(false);
+        Ok(Mode { mode, blocking })
+    }
+
+    /// `nvim_input` — a *fast* call: the keys land in the editor's input
+    /// buffer at once, prompt or no prompt. nvmux itself only ever sends a
+    /// lone `<CR>` to a hit-enter prompt this way (see [`Mode::at_hit_enter`]);
+    /// the integration tests type more.
+    pub fn input(&mut self, keys: &str) -> Result<(), RpcError> {
+        // The reply is how many bytes were queued, which says nothing useful.
+        self.call("nvim_input", vec![Value::String(keys.into())])?;
+        Ok(())
+    }
+}
+
+/// What `nvim_get_mode` reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mode {
+    /// As `mode(1)` spells it: `n`, `i`, `c`, `r` for the hit-enter prompt,
+    /// `rm` for the more-prompt, `r?` for a `:confirm` question, and so on.
+    pub mode: String,
+    /// The editor is waiting for a key with its event queue switched off, so
+    /// no deferred call is served until that key arrives: a hit-enter or
+    /// more-prompt, or the second key of a multi-key command (`g`, `d`, `"`).
+    /// Not a `:confirm` question, on 0.12 at least — measured, it reports
+    /// `r?` with this false and answers deferred calls as usual.
+    pub blocking: bool,
+}
+
+impl Mode {
+    /// The hit-enter prompt, and only that: mode `r` while blocking.
+    ///
+    /// The distinction matters because this is the one prompt nvmux is willing
+    /// to end on the user's behalf. `wait_return()` consumes `<CR>` outright
+    /// (most other keys it pushes back to run as a Normal-mode command), and
+    /// what it was showing has been painted over by the time nvmux asks. The
+    /// more-prompt (`rm`) scrolls a line on `<CR>`; a `:confirm` question
+    /// (`r?`) takes `<CR>` as its default answer, which is never nvmux's call
+    /// to make — and it is the mode string alone that keeps it out, since
+    /// `blocking` is false there. A pending multi-key command is blocking in
+    /// mode `n` or `no`, and `<CR>` would complete it.
+    ///
+    /// Advisory, not a lock: a key from another attached UI in the
+    /// microseconds after this answer ends the prompt first, and a `<CR>`
+    /// sent on the strength of it runs in whatever mode that key left.
+    pub fn at_hit_enter(&self) -> bool {
+        self.blocking && self.mode == "r"
     }
 }
 
@@ -386,12 +474,39 @@ pub fn probe(path: &Path) -> Liveness {
         }
     }
 
+    // Before anything deferred: a session waiting for a key with its event
+    // queue off — at a hit-enter prompt, most often — would hold the deferred
+    // call for the whole budget, and it is the picker that waits with it, on
+    // a cleared screen, once per such session. The mode is a fast call and
+    // says so in a millisecond. Busy, not a state of its own: like a `:!make`
+    // it is reachable and must never be reaped.
+    match client.get_mode() {
+        Ok(mode) if mode.blocking => {
+            tracing::debug!(
+                path = %path.display(),
+                mode = %mode.mode,
+                "waiting for a key; deferred calls are not served"
+            );
+            return Liveness::Busy;
+        }
+        Ok(_) => {}
+        Err(e) if e.is_definitely_dead() => return Liveness::Dead,
+        Err(e) => {
+            // Not answered even though it is fast: `:!cmd` or CPU-bound Lua.
+            tracing::debug!(path = %path.display(), error = %e, "get_mode did not answer");
+            return Liveness::Busy;
+        }
+    }
+
     match client.list_bufs() {
         Ok(_) => Liveness::Alive,
         Err(e) if e.is_definitely_dead() => Liveness::Dead,
         // Reachable but not answering: almost certainly inside a `:!make`, or
         // still sourcing a slow init.lua. Never reap this.
-        Err(_) => Liveness::Busy,
+        Err(e) => {
+            tracing::debug!(path = %path.display(), error = %e, "list_bufs did not answer");
+            Liveness::Busy
+        }
     }
 }
 
@@ -447,6 +562,127 @@ mod tests {
         assert!(at(0, 11).is_supported(), "0.11 is the documented minimum");
         assert!(at(0, 12).is_supported());
         assert!(at(1, 0).is_supported());
+    }
+
+    /// A peer that answers every request with one canned frame, and keeps
+    /// what was sent to it.
+    struct Canned {
+        reply: std::io::Cursor<Vec<u8>>,
+        sent: Vec<u8>,
+    }
+
+    impl Read for Canned {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reply.read(buf)
+        }
+    }
+
+    impl Write for Canned {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.sent.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A client whose first call is answered with `result`. The msgid is 1
+    /// because that is what a fresh client sends first.
+    fn answering(result: Value) -> Client<Canned> {
+        let frame = Value::Array(vec![
+            Value::from(RESPONSE),
+            Value::from(1u32),
+            Value::Nil,
+            result,
+        ]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &frame).expect("encode");
+        Client::new(Canned {
+            reply: std::io::Cursor::new(bytes),
+            sent: Vec::new(),
+        })
+    }
+
+    fn mode_map(mode: &str, blocking: Option<bool>) -> Value {
+        let mut pairs = vec![(Value::from("mode"), Value::from(mode))];
+        if let Some(b) = blocking {
+            pairs.push((Value::from("blocking"), Value::from(b)));
+        }
+        Value::Map(pairs)
+    }
+
+    /// The shape Neovim answers with at a hit-enter prompt — and the one
+    /// answer that took 3 s to not get before the mode was asked first.
+    #[test]
+    fn get_mode_decodes_a_hit_enter_prompt() {
+        let mut c = answering(mode_map("r", Some(true)));
+        let m = c.get_mode().expect("decode");
+        assert_eq!(
+            m,
+            Mode {
+                mode: "r".into(),
+                blocking: true
+            }
+        );
+        assert!(m.at_hit_enter());
+        let sent = rmpv::decode::read_value(&mut &c.io.get_ref().sent[..]).expect("request");
+        assert_eq!(sent[2].as_str(), Some("nvim_get_mode"));
+    }
+
+    /// A missing flag must mean "not blocking": that way round a decoding
+    /// gap costs a 3 s wait, the other way round it would end prompts.
+    #[test]
+    fn a_missing_blocking_flag_reads_as_not_blocking() {
+        let mut c = answering(mode_map("n", None));
+        let m = c.get_mode().expect("decode");
+        assert!(!m.blocking);
+        assert!(!m.at_hit_enter());
+    }
+
+    #[test]
+    fn a_non_map_mode_reply_is_a_protocol_error() {
+        let mut c = answering(Value::from(7));
+        assert!(matches!(c.get_mode(), Err(RpcError::Protocol(_))));
+    }
+
+    /// Only the hit-enter prompt may be ended by nvmux; see `Mode::at_hit_enter`.
+    #[test]
+    fn only_the_hit_enter_prompt_may_be_answered() {
+        let mode = |mode: &str, blocking| Mode {
+            mode: mode.into(),
+            blocking,
+        };
+        assert!(mode("r", true).at_hit_enter());
+        assert!(
+            !mode("r", false).at_hit_enter(),
+            "r without blocking is not a prompt"
+        );
+        assert!(
+            !mode("rm", true).at_hit_enter(),
+            "the more-prompt scrolls on <CR>"
+        );
+        assert!(
+            !mode("r?", true).at_hit_enter(),
+            "<CR> answers a :confirm question"
+        );
+        assert!(
+            !mode("r?", false).at_hit_enter(),
+            "what 0.12 actually reports for confirm(): the mode string is the guard"
+        );
+        assert!(!mode("n", false).at_hit_enter());
+        assert!(!mode("c", false).at_hit_enter());
+    }
+
+    /// The keys go out as the single `nvim_input` parameter, and the byte
+    /// count that comes back is dropped.
+    #[test]
+    fn input_sends_nvim_input_and_ignores_the_count() {
+        let mut c = answering(Value::from(4));
+        c.input("<CR>").expect("input");
+        let sent = rmpv::decode::read_value(&mut &c.io.get_ref().sent[..]).expect("request");
+        assert_eq!(sent[2].as_str(), Some("nvim_input"));
+        assert_eq!(sent[3][0].as_str(), Some("<CR>"));
     }
 
     #[test]

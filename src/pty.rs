@@ -29,7 +29,7 @@
 
 use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub use portable_pty::PtySize;
@@ -76,6 +76,10 @@ pub enum Outcome {
 pub struct Attachment {
     /// Which session this client is attached to.
     pub session_id: String,
+    /// The socket the client was attached through — locally the session's
+    /// own, over SSH the local end of the forward — so a resume can ask the
+    /// server a question without going back through the transport.
+    sock: PathBuf,
     child: Box<dyn Child + Send + Sync>,
     master: Box<dyn MasterPty>,
     writer: Box<dyn Write + Send>,
@@ -166,6 +170,27 @@ pub fn spawn(session_id: &str, sock: &Path) -> Result<Attachment> {
     // already been sprayed at the terminal.
     let mut client = rpc::Client::connect(sock, rpc::PROBE_TIMEOUT)?;
     client.api_info()?;
+    // A server at a hit-enter prompt cannot answer `list_uis`, a deferred
+    // call, until a key ends the prompt. Usually there is nobody to type one:
+    // the client that was showing the prompt is gone, and this is its
+    // replacement. So the prompt is ended here with `<CR>`, the key it
+    // consumes without running anything (see `rpc::Mode::at_hit_enter` for
+    // why only this prompt), and the count that follows is real, not guessed.
+    //
+    // A deliberate trade-off where another UI is still attached: that user's
+    // prompt ends too, and whatever it was showing — a `:!make` page, a Lua
+    // traceback — leaves their screen unread. `g<` brings the page back and
+    // `:messages` keeps the rest; the old behaviour was a 3 s failure to
+    // attach at all. Advisory, not a lock: a key from that other UI in the
+    // microseconds between the two calls ends the prompt first, and this
+    // `<CR>` then runs in whatever mode it left.
+    if client.get_mode()?.at_hit_enter() {
+        tracing::info!(
+            id = session_id,
+            "attach: ending the session's hit-enter prompt"
+        );
+        client.input("<CR>")?;
+    }
     // Not `unwrap_or(0)`: a server too busy to answer is exactly the one whose
     // UI count is unknown, and guessing zero is how the seventeenth attach
     // happens.
@@ -215,6 +240,7 @@ pub fn spawn(session_id: &str, sock: &Path) -> Result<Attachment> {
 
     Ok(Attachment {
         session_id: session_id.to_string(),
+        sock: sock.to_path_buf(),
         child,
         master: pair.master,
         writer,
@@ -251,7 +277,7 @@ pub fn relay(
     // picker has since drawn over.
     if attachment.resumed {
         discard_pending(master_fd);
-        force_repaint(attachment.master.as_ref());
+        repaint(attachment.master.as_ref(), &attachment.sock);
     }
     attachment.resumed = true;
 
@@ -615,19 +641,116 @@ fn drain_until_eof(fd: RawFd) {
     }
 }
 
-/// Make the client repaint the whole screen.
+/// Paint the screen again after one of nvmux's own screens cleared it.
 ///
-/// Nudging the size and putting it back is the reliable way to do this without
-/// an RPC round trip or a synthetic keystroke: the client redraws from the
-/// server's grid on every resize.
-fn force_repaint(master: &dyn MasterPty) {
+/// A `--remote-ui` client paints only what the server sends, so this is a
+/// request to the server, and there are two ways to make one. Over RPC,
+/// `:mode` clears the grid and redraws it in full ([`repaint_through_server`]);
+/// that is the one that works, and the only one that works on a terminal
+/// with in-band resize reports (DEC mode 2048 — kitty, ghostty, foot), where
+/// the client ignores `SIGWINCH`. Failing that, a [`nudge`] of the pty size,
+/// which needs no answer from the server and so is what a server too busy to
+/// give one gets: its resize is queued and repaints once the loop is free.
+///
+/// Whichever way, the pty is first told the terminal's current size, since
+/// the terminal may have changed shape while the picker was up and the pty is
+/// where the client learns its size from. A no-op when nothing changed, and
+/// a resize the client acts on when it did — one more repaint in that case,
+/// which is rare enough not to matter.
+fn repaint(master: &dyn MasterPty, sock: &Path) {
     let size = term::terminal_size();
+    let _ = master.resize(size);
+    if !repaint_through_server(sock) {
+        nudge(master, size);
+    }
+}
+
+/// Shrink the pty by a row and put it back, so the client asks the server for
+/// a resize, which the server answers — when its main loop is free to — with
+/// a cleared, fully redrawn grid.
+///
+/// What a server that cannot be asked over RPC gets: one busy in a `:!make`
+/// or in Lua, where the repaint then arrives with the prompt the command ends
+/// in; or one waiting for a key with its event queue off, where it repaints
+/// at the more-prompt and not otherwise (a pending operator stays blank until
+/// its next key, which completes it). A client on a terminal with in-band
+/// resize reports ignores this altogether.
+fn nudge(master: &dyn MasterPty, size: PtySize) {
     let nudged = PtySize {
         rows: size.rows.saturating_sub(1).max(1),
         ..size
     };
     let _ = master.resize(nudged);
     let _ = master.resize(size);
+}
+
+/// How long a resume waits on the server before relaying regardless.
+///
+/// `nvim_get_mode` answers within a millisecond whenever it answers at all —
+/// idle, or waiting for a key — so no answer means the loop is busy in a
+/// `:!make` or in Lua, and nothing would repaint yet whatever nvmux did. The
+/// `:mode` that follows is a deferred call whose reply can take a few hundred
+/// milliseconds under a plugin-heavy config (measured: 384 ms with AstroNvim),
+/// so this is longer than `rpc::CONNECT_TIMEOUT` and much shorter than
+/// `rpc::PROBE_TIMEOUT`.
+const RESUME_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Ask the server, over RPC, to paint the whole screen again. True if it did.
+///
+/// A server parked at a hit-enter prompt does not run its event queue, so a
+/// resize would sit there and the terminal would stay blank until a key ended
+/// the prompt — the key the user would have to press blind, and which then
+/// also runs as a command unless it is one of the few the prompt consumes. So
+/// that prompt is ended first, with the `<CR>` it consumes (a fast call,
+/// delivered at once). Any other state that is waiting for a key is left
+/// alone: `<CR>` would scroll the more-prompt or complete a pending operator.
+/// Then `:mode`, which clears the grid and redraws it — `:redraw!` does not
+/// clear, and a redraw of an unchanged grid sends the client nothing.
+///
+/// Two things `:mode` does that are accepted rather than wanted. It resets
+/// the editor's pending-message state, so a script that printed something and
+/// is waiting in `getchar()` for a key will not get the hit-enter prompt it
+/// would have had once the key arrived (the text itself was already gone from
+/// the screen). And ending the prompt discards what it showed, from every
+/// attached UI; `:messages` keeps it. The reply is waited for so the relay
+/// does not start over a repaint in flight; a reply that is late rather than
+/// missing still repaints, a moment after the nudge that stands in for it.
+fn repaint_through_server(sock: &Path) -> bool {
+    let mut client = match rpc::Client::connect(sock, RESUME_TIMEOUT) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(error = %e, "resume: could not reach the server");
+            return false;
+        }
+    };
+    let mode = match client.get_mode() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!(error = %e, "resume: the server is busy; nudge only");
+            return false;
+        }
+    };
+    if mode.blocking && !mode.at_hit_enter() {
+        tracing::debug!(
+            mode = %mode.mode,
+            "resume: the server is waiting for a key nvmux must not type; nudge only"
+        );
+        return false;
+    }
+    if mode.at_hit_enter() {
+        tracing::debug!("resume: ending the hit-enter prompt");
+        if let Err(e) = client.input("<CR>") {
+            tracing::debug!(error = %e, "resume: could not end the prompt; nudge only");
+            return false;
+        }
+    }
+    match client.command("mode") {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::debug!(error = %e, "resume: gave up waiting for the repaint; nudging");
+            false
+        }
+    }
 }
 
 #[cfg(test)]

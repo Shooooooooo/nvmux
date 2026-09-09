@@ -119,6 +119,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             let attachment = match opened {
                 Ok(a) => a,
                 Err(e) => {
+                    tracing::warn!(id = %current.id, error = %e, "attach failed");
                     message = Some(describe_attach_failure(transport.location(), &e));
                     break;
                 }
@@ -200,6 +201,12 @@ fn describe_attach_failure(location: &transport::Location, e: &nvmux::NvmuxError
             format!("that session is no longer running on {host}")
         }
         nvmux::NvmuxError::Rpc(rpc) if rpc.is_definitely_dead() => "that session is gone".into(),
+        // Reachable, and not answering: a `:!make` still running, a prompt
+        // nvmux will not answer for the user, CPU-bound Lua. The bare error
+        // ("timed out after 3s") reads as if nvmux had lost the session.
+        nvmux::NvmuxError::Rpc(nvmux::error::RpcError::Timeout(after)) => {
+            format!("that session is busy and did not answer within {after:?}")
+        }
         other => one_line(other),
     }
 }

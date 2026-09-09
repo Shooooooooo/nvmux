@@ -8,6 +8,7 @@
 
 #![allow(dead_code)]
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,7 @@ use nvmux::rpc::Client;
 use nvmux::session::Session;
 use nvmux::transport::local::LocalTransport;
 use nvmux::transport::Transport;
+use portable_pty::{CommandBuilder, PtySize};
 
 /// Whether `$NVMUX_TEST_REQUIRE` names this requirement.
 pub fn required(what: &str) -> bool {
@@ -182,4 +184,104 @@ pub fn block_editor(sock: &Path, cmd: &'static str, settle: Duration) {
         let _ = c.command(cmd);
     });
     std::thread::sleep(settle);
+}
+
+/// A real `--remote-ui` client on a throwaway pty, holding its session at a
+/// hit-enter prompt (`Press ENTER or type command to continue`) until dropped.
+///
+/// [`block_editor`] cannot produce that prompt: a headless server with no UI
+/// returns from `wait_return()` at once (`message.c`: `if (headless_mode &&
+/// !ui_active()) return;`), and `getchar()`/`input()` keep serving deferred
+/// calls while they wait. The prompt needs a UI, so this attaches one the way
+/// nvmux does, then opens the prompt with a fast `nvim_input`: a two-line
+/// message scrolls at any `'cmdheight'`, so no option has to be set for it.
+///
+/// The prompt outlives this client — it is the *server* that is waiting — so
+/// a test that wants it ended must [`press_enter`] itself.
+pub struct HitEnter {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    // Held so the pty outlives the client; dropped last.
+    _master: Box<dyn portable_pty::MasterPty>,
+}
+
+impl HitEnter {
+    pub fn open(sock: &Path) -> Self {
+        let pair = portable_pty::native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new("nvim");
+        cmd.arg("--server");
+        cmd.arg(sock);
+        cmd.arg("--remote-ui");
+        cmd.env("TERM", "xterm-256color");
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .expect("spawn remote-ui client");
+        // Or the master would never see EOF once the client exits.
+        drop(pair.slave);
+
+        // Drain what the client draws: on a full pty it blocks mid-write and
+        // stops talking to the server.
+        let mut reader = pair.master.try_clone_reader().expect("reader");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while matches!(reader.read(&mut buf), Ok(n) if n > 0) {}
+        });
+
+        let this = Self {
+            child,
+            _master: pair.master,
+        };
+
+        // The UI has to be attached before the prompt can exist. A deferred
+        // call, which is fine: nothing is blocked yet.
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                Client::connect(sock, Duration::from_secs(2))
+                    .and_then(|mut c| c.list_uis())
+                    .is_ok_and(|n| n >= 1)
+            }),
+            "the remote-ui client never attached to {}",
+            sock.display()
+        );
+
+        Client::connect(sock, Duration::from_secs(2))
+            .expect("connect")
+            .input(":echo \"a\\nb\"<CR>")
+            .expect("open the prompt");
+        assert!(
+            wait_until(Duration::from_secs(10), || at_hit_enter(sock)),
+            "the server never reached the hit-enter prompt"
+        );
+        this
+    }
+}
+
+impl Drop for HitEnter {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Whether the server behind `sock` is at a hit-enter prompt right now. A
+/// fast call, answered even then.
+pub fn at_hit_enter(sock: &Path) -> bool {
+    Client::connect(sock, Duration::from_secs(2))
+        .and_then(|mut c| c.get_mode())
+        .is_ok_and(|m| m.at_hit_enter())
+}
+
+/// End a hit-enter prompt the way a user would.
+pub fn press_enter(sock: &Path) {
+    Client::connect(sock, Duration::from_secs(2))
+        .expect("connect")
+        .input("<CR>")
+        .expect("press enter");
 }

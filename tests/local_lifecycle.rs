@@ -661,3 +661,103 @@ fn metadata_left_by_a_self_terminating_session_is_swept_up() {
     assert!(!json.exists(), "orphaned metadata was never cleaned up");
     assert!(!log.exists(), "the orphaned log was never cleaned up");
 }
+
+/// A session waiting at a hit-enter prompt cannot answer a deferred call, and
+/// the picker used to wait the whole probe budget for it — on a cleared
+/// screen, once per such session. It is listed at once now, as busy, and kept:
+/// it is reachable, so it must never be reaped.
+///
+/// AstroNvim's `cmdheight = 0` puts a session there on every one-line error;
+/// any message that scrolls does it at the default `cmdheight`.
+#[test]
+fn a_session_at_a_hit_enter_prompt_is_listed_at_once_as_busy() {
+    require_nvim!();
+    let scratch = Scratch::new("hitenter");
+    let t = scratch.transport();
+    let session = t.create_session("prompted").expect("create");
+    let sock = t.local_socket_for(&session).expect("socket");
+    let _ui = common::HitEnter::open(&sock);
+
+    let started = Instant::now();
+    let listed = t.list_sessions().expect("list");
+    let took = started.elapsed();
+
+    assert!(
+        took < Duration::from_secs(1),
+        "listing took {took:?}: the probe waited on a deferred call again"
+    );
+    let s = listed
+        .iter()
+        .find(|s| s.id == session.id)
+        .expect("a session at a prompt must still be listed");
+    assert_eq!(s.state.liveness, Liveness::Busy);
+    assert!(sock.exists(), "a session at a prompt must never be reaped");
+}
+
+/// The probe's verdict is "busy" only while the prompt lasts: once the prompt
+/// is ended, the same session is alive again. Pins both branches the probe took.
+#[test]
+fn probe_is_busy_at_a_hit_enter_prompt_and_alive_after_it() {
+    require_nvim!();
+    let scratch = Scratch::new("hitenterprobe");
+    let t = scratch.transport();
+    let session = t.create_session("prompted").expect("create");
+    let sock = t.local_socket_for(&session).expect("socket");
+    let _ui = common::HitEnter::open(&sock);
+
+    let started = Instant::now();
+    assert_eq!(nvmux::rpc::probe(&sock), Liveness::Busy);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the probe waited out a deferred call"
+    );
+
+    common::press_enter(&sock);
+    assert!(
+        common::wait_until(Duration::from_secs(5), || nvmux::rpc::probe(&sock)
+            == Liveness::Alive),
+        "the session should be alive again once the prompt is over"
+    );
+}
+
+/// A fresh attach to a session at a hit-enter prompt used to fail after the
+/// probe budget — `nvim_list_uis` is deferred, and the only client that could
+/// end the prompt was the one about to be started. It now ends the prompt
+/// itself, with the one key the prompt consumes, and attaches.
+#[test]
+fn a_fresh_attach_to_a_session_at_a_hit_enter_prompt_ends_it_and_attaches() {
+    require_nvim!();
+    let scratch = Scratch::new("hitenterattach");
+    let t = scratch.transport();
+    let session = t.create_session("prompted").expect("create");
+    let sock = t.local_socket_for(&session).expect("socket");
+    let _ui = common::HitEnter::open(&sock);
+
+    let started = Instant::now();
+    let attachment = nvmux::pty::spawn(&session.id, &sock).expect("attach");
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(2),
+        "the attach took {took:?}: it waited on the prompt"
+    );
+
+    assert!(
+        !common::at_hit_enter(&sock),
+        "the prompt should have been ended by the attach"
+    );
+    // `spawn` returns as soon as the client is forked, and the client takes a
+    // few milliseconds to attach its UI; the count is polled for, not asserted
+    // at once. Two means the helper's client and the new one, and that the
+    // deferred call answering is the proof the prompt is over.
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
+                .and_then(|mut c| c.list_uis())
+                .is_ok_and(|n| n == 2)
+        }),
+        "the new client never attached its UI"
+    );
+
+    // Retires the new client; the helper's goes with `_ui`.
+    attachment.terminate();
+}

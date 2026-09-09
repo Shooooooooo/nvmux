@@ -17,8 +17,10 @@ use crate::error::SessionError;
 pub enum Liveness {
     /// Answered a deferred RPC call. Definitely serving.
     Alive,
-    /// Reachable, but did not finish a deferred call in time. Probably running
-    /// something blocking. Never reaped.
+    /// Reachable, but not serving deferred calls right now: running something
+    /// blocking, or waiting for a key at a prompt — [`crate::rpc::probe`] asks
+    /// the mode first, and the second is settled in a millisecond rather than
+    /// a timeout. Never reaped.
     Busy,
     /// Nothing is listening. The socket file, if present, is stale.
     #[default]
