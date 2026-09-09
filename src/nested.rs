@@ -40,7 +40,7 @@ fn guard(marker: Option<&OsStr>) -> Result<()> {
     match marker {
         Some(sock) if !sock.is_empty() => bail!(
             "already inside an nvmux session ({})\n\
-             hint: `<prefix> t` opens the picker from inside a session; \
+             hint: `<prefix> Space` opens the picker from inside a session; \
              unset ${MARKER} to run nvmux anyway",
             sock.to_string_lossy()
         ),
@@ -80,7 +80,7 @@ mod tests {
         assert!(said.contains("/tmp/nvmux-1000/abcdefgh.sock"), "{msg}");
         assert!(hint.starts_with("hint: "), "{msg}");
         // Both ways on: the picker from inside, or unsetting the marker.
-        assert!(hint.contains("<prefix> t"), "{msg}");
+        assert!(hint.contains("<prefix> Space"), "{msg}");
         assert!(hint.contains("$NVMUX"), "{msg}");
     }
 

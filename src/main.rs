@@ -82,7 +82,7 @@ fn establish_settings() -> Result<config::Settings> {
 
 /// Alternate between the picker and an attached session until the user leaves.
 ///
-/// The attachment is carried across iterations, so `<prefix> t`, `<prefix> c` and
+/// The attachment is carried across iterations, so `<prefix> Space`, `<prefix> c` and
 /// `<prefix> ?` come back to the *same* client rather than starting a new one.
 fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     let mut attached: Option<pty::Attachment> = None;
@@ -92,7 +92,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
         // `<prefix> c` moves this to the session it just created.
         let (mut current, mut highest) = match ui::run(transport, message.take())? {
             ui::Outcome::Quit => {
-                // A client held across `<prefix> t` is retired explicitly; its
+                // A client held across `<prefix> Space` is retired explicitly; its
                 // `Drop` would do the same, this just says so.
                 if let Some(a) = attached.take() {
                     a.terminate();

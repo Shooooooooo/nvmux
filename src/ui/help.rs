@@ -16,9 +16,9 @@
 //! `<prefix>` arrives here as `Key::Other`, because `translate` turns every
 //! control chord but `Ctrl-c`, `Ctrl-n` and `Ctrl-p` into nothing. If any key
 //! closed the help, someone who read "Ctrl-Space d" and typed it would close
-//! the screen on the `Ctrl-Space` and send a bare `d` into normal mode. So `t`,
-//! `d`, `c` and `Other` do nothing, and only `Esc`, `q`, `Enter`, `?` and
-//! `Ctrl-c` close it. Nothing typed on this screen is ever forwarded.
+//! the screen on the `Ctrl-Space` and send a bare `d` into normal mode. So the
+//! space bar, `d`, `c` and `Other` do nothing, and only `Esc`, `q`, `Enter`,
+//! `?` and `Ctrl-c` close it. Nothing typed on this screen is ever forwarded.
 
 use ratatui::layout::Rect;
 use ratatui::text::Line;
@@ -57,7 +57,7 @@ fn rows(prefix: &str) -> Vec<Row> {
     let mut rows: Vec<Row> = keys::BINDINGS
         .iter()
         .map(|b| Row {
-            keys: format!("{prefix} {}", b.key as char),
+            keys: format!("{prefix} {}", keys::key_label(b.key)),
             what: b.help.to_string(),
         })
         .collect();
@@ -78,9 +78,10 @@ fn rows(prefix: &str) -> Vec<Row> {
     rows
 }
 
-/// Named keys only. `t`, `d` and `c` — and therefore the prefix, which arrives
-/// as `Key::Other` — are deliberately not here: a chord typed while the help
-/// is open must do nothing, not close the help and forward its second key.
+/// Named keys only. The space bar, `d` and `c` — and therefore the prefix,
+/// which arrives as `Key::Other` — are deliberately not here: a chord typed
+/// while the help is open must do nothing, not close the help and forward its
+/// second key.
 ///
 /// `q` and `Ctrl-c` close like esc rather than quitting: quitting here would
 /// tear the user out of a live session they only meant to read a key list in.
@@ -199,13 +200,13 @@ mod tests {
         }
     }
 
-    /// `<prefix>` arrives here as `Key::Other`, and its command letters as
+    /// `<prefix>` arrives here as `Key::Other`, and its command keys as
     /// themselves; if any of them closed the help, a chord typed from this
     /// screen would be half-forwarded.
     #[test]
-    fn the_prefix_and_its_command_letters_do_nothing_here() {
+    fn the_prefix_and_its_command_keys_do_nothing_here() {
         for key in [
-            Key::Char('t'),
+            Key::Char(' '),
             Key::Char('d'),
             Key::Char('c'),
             Key::Up,
@@ -236,7 +237,7 @@ mod tests {
                 acts && rows.iter().any(|r| r.keys == format!("{PREFIX_LABEL} 1-n"))
             } else {
                 rows.iter()
-                    .any(|r| r.keys == format!("{PREFIX_LABEL} {}", b as char))
+                    .any(|r| r.keys == format!("{PREFIX_LABEL} {}", keys::key_label(b)))
             };
             assert_eq!(
                 acts, listed,
@@ -274,7 +275,7 @@ mod tests {
             .collect();
         let want: Vec<String> = keys::BINDINGS
             .iter()
-            .map(|b| format!("{PREFIX_LABEL} {}", b.key as char))
+            .map(|b| format!("{PREFIX_LABEL} {}", keys::key_label(b.key)))
             .collect();
         assert_eq!(body.len(), want.len() + 3, "body rows: {body:#?}");
         for (line, key) in body.iter().zip(&want) {

@@ -101,7 +101,7 @@ pub fn reset_screen() {
 /// anything about whose screen it is.
 ///
 /// For the paths that end at another nvmux screen rather than at a shell:
-/// `<prefix> t`, `<prefix> c` and `<prefix> ?` all stop the relay mid-stream
+/// `<prefix> Space`, `<prefix> c` and `<prefix> ?` all stop the relay mid-stream
 /// and leave the client running, so nothing emits the restore sequence
 /// [`reset_screen`] relies on.
 ///
