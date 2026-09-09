@@ -109,7 +109,7 @@ const SCRIPTS: &[(&str, &str)] = &[
 mod tests {
     use super::*;
     use crate::proc::Output;
-    use std::process::Command;
+    use std::process::{Child, Command};
 
     /// Ask a real `/bin/sh` what it made of our quoting.
     ///
@@ -281,6 +281,55 @@ mod tests {
         crate::proc::run_feeding_stdin(&mut cmd, body).expect("run the script")
     }
 
+    /// What a stand-in session runs, in `sh -c <STANDIN> <name> <args...>`: the
+    /// words after it are `$0..$n` and go unread, so the process's command line
+    /// reads like a session's while the process itself does nothing. A session
+    /// is an nvim that was started `--listen`ing on its socket, and that is the
+    /// whole of what these scripts look for, so this stands in for one — and
+    /// then the tests run where there is no Neovim.
+    ///
+    /// The trailing `:` is what makes it stand in *everywhere*. A shell whose
+    /// `-c` argument is a single simple command may run it by replacing itself
+    /// with it rather than forking, and the argv the stand-in exists to carry
+    /// goes with it: `nvim --headless --listen <sock>` becomes `sleep 30`, and
+    /// every script here then truthfully reports that nothing is serving the
+    /// socket. dash does not do this and bash does — and `/bin/sh` is dash on
+    /// Debian and bash on macOS, which is exactly the split CI showed. A list
+    /// ending in a builtin cannot be exec'd away, so the shell stays, and so
+    /// does its command line.
+    const STANDIN: &str = "sleep 30; :";
+
+    /// The command line of a pid, read through the prelude's own reader, so the
+    /// question is asked the way the scripts ask it wherever this runs.
+    fn cmdline_of(pid: u32) -> String {
+        let script = concat!(include_str!("../scripts/_prelude.sh"), "cmdline \"$1\"\n");
+        crate::proc::run_local(script, &[&pid.to_string()])
+            .expect("read the command line")
+            .stdout
+    }
+
+    /// A process whose command line reads like a session serving `sock`, with
+    /// `trailing` after it.
+    ///
+    /// The argv is checked here rather than assumed. Without that, a shell that
+    /// optimised it away fails as three separate mysteries — a live session
+    /// listed dead, a session that cannot be found by its socket, a spawn that
+    /// reports the wrong pid — rather than as the one thing that went wrong.
+    fn spawn_standin(sock: &str, trailing: &[&str]) -> Child {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", STANDIN, "nvim", "--headless", "--listen", sock])
+            .args(trailing)
+            .spawn()
+            .expect("spawn a stand-in session");
+        let seen = cmdline_of(child.id());
+        if !seen.contains(&format!("--listen {sock}")) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the stand-in must carry the socket on its command line: {seen:?}");
+        }
+        child
+    }
+
     /// `HELLO_SCRIPT` is three files concatenated, and the join is only correct
     /// if the result still speaks both halves of the protocol: the greeting
     /// `parse_probe` reads, then the records `parse_listing` reads, under the
@@ -345,16 +394,7 @@ mod tests {
         for id in live {
             let sock = dir.join(format!("{id}.sock"));
             std::fs::write(&sock, "").expect("socket stand-in");
-            // `sh -c <cmd> <name> <args...>`: the arguments after the command
-            // are `$0..$n` to it and go unread, so this is a process whose
-            // command line reads like a session's and which does nothing.
-            held.push(
-                Command::new("/bin/sh")
-                    .args(["-c", "sleep 30", "nvim", "--headless", "--listen"])
-                    .arg(&sock)
-                    .spawn()
-                    .expect("spawn a stand-in session"),
-            );
+            held.push(spawn_standin(&sock.to_string_lossy(), &[]));
         }
         std::fs::write(dir.join(format!("{dead}.sock")), "").expect("socket stand-in");
 
@@ -395,23 +435,13 @@ mod tests {
         let sock = std::env::temp_dir().join(format!("nvmux-trailing-{}.sock", std::process::id()));
         let sock = sock.to_string_lossy().into_owned();
 
-        // `sh -c <cmd> <name> <args...>`: the arguments after the command are
-        // `$0..$n` to it and go unread, so this is a process whose command line
-        // reads like a session's and which does nothing.
-        let spawn = |trailing: &[&str]| {
-            Command::new("/bin/sh")
-                .args(["-c", "sleep 30", "nvim", "--headless", "--listen", &sock])
-                .args(trailing)
-                .spawn()
-                .expect("spawn a stand-in session")
-        };
         let ask = concat!(
             include_str!("../scripts/_prelude.sh"),
             "serving_pid \"$1\"\n"
         );
 
         for trailing in [&[][..], &["--clean"][..], &["--clean", "-u", "NONE"][..]] {
-            let mut held = spawn(trailing);
+            let mut held = spawn_standin(&sock, trailing);
             let found = crate::proc::run_local(ask, &[&sock]).expect("ask").stdout;
             let _ = held.kill();
             let _ = held.wait();
@@ -481,9 +511,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let sock = dir.join("aaaaaaaa.sock");
 
-        // `sh -c <cmd> <name> <args...>`: a process whose command line reads
-        // like a session's and which binds nothing, so `SOCK` times out. What
-        // is being asserted is the *pid*, which the script only reports after
+        // A stand-in session, which binds nothing, so `SOCK` times out. What is
+        // being asserted is the *pid*, which the script only reports after
         // confirming the process is the one serving this socket.
         let out = run_script(
             SPAWN_SCRIPT,
@@ -492,7 +521,7 @@ mod tests {
                 "aaaaaaaa",
                 "/bin/sh",
                 "-c",
-                "sleep 30",
+                STANDIN,
                 "nvim",
                 "--headless",
                 "--listen",
@@ -503,14 +532,9 @@ mod tests {
         let pid = spawned
             .pid
             .unwrap_or_else(|| panic!("the script must have run our command: {:?}", out.stdout));
-        // The prelude's own reader, so this asks the question the same way the
-        // scripts do wherever it runs.
-        let cmdline = concat!(include_str!("../scripts/_prelude.sh"), "cmdline \"$1\"\n");
-        let seen = crate::proc::run_local(cmdline, &[&pid.to_string()])
-            .expect("read the command line")
-            .stdout;
+        let seen = cmdline_of(pid);
         assert!(
-            seen.contains("sleep 30"),
+            seen.contains(STANDIN),
             "pid {pid} is not the command we asked for: {seen:?}"
         );
 
