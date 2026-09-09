@@ -79,7 +79,17 @@ pub const SPAWN_SCRIPT: &str = script!("../scripts/spawn.sh");
 
 pub const KILL_SCRIPT: &str = script!("../scripts/kill.sh");
 
-pub const PROBE_SCRIPT: &str = script!("../scripts/probe.sh");
+/// Opens a remote host: the probe *and* the first listing, in one round trip.
+///
+/// Two files joined rather than a third one written, so the listing a
+/// connection opens with comes from the same code every later refresh runs.
+/// `hello.sh` prints what nvmux needs to know about the host and leaves the
+/// runtime directory in `$1`, which is exactly what `list.sh` reads.
+pub const HELLO_SCRIPT: &str = concat!(
+    include_str!("../scripts/_prelude.sh"),
+    include_str!("../scripts/hello.sh"),
+    include_str!("../scripts/list.sh"),
+);
 
 /// Writes `<id>.json` on the session host. Used by the SSH transport, where
 /// Rust cannot reach the file directly.
@@ -91,13 +101,14 @@ const SCRIPTS: &[(&str, &str)] = &[
     ("list.sh", LIST_SCRIPT),
     ("spawn.sh", SPAWN_SCRIPT),
     ("kill.sh", KILL_SCRIPT),
-    ("probe.sh", PROBE_SCRIPT),
+    ("hello.sh", HELLO_SCRIPT),
     ("write_meta.sh", WRITE_META_SCRIPT),
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proc::Output;
     use std::process::Command;
 
     /// Ask a real `/bin/sh` what it made of our quoting.
@@ -261,6 +272,94 @@ mod tests {
                 "{name} is missing the prelude's helpers"
             );
         }
+    }
+
+    /// Deliver a script the way `ssh` does — on stdin, with `args` as `$1..$n`.
+    fn run_script(body: &str, args: &[&str]) -> Output {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-s").args(args);
+        crate::proc::run_feeding_stdin(&mut cmd, body).expect("run the script")
+    }
+
+    /// `HELLO_SCRIPT` is three files concatenated, and the join is only correct
+    /// if the result still speaks both halves of the protocol: the greeting
+    /// `parse_probe` reads, then the records `parse_listing` reads, under the
+    /// one terminator that says the whole thing ran.
+    ///
+    /// The obvious way to break this is a `finish` in `hello.sh`: two
+    /// terminators still parse, and the first would then claim a listing had
+    /// completed before `list.sh` had started.
+    #[test]
+    fn the_greeting_carries_a_listing_under_one_terminator() {
+        use crate::transport::protocol;
+
+        // No argument: the point of `hello.sh` is that it works out the runtime
+        // directory itself, which is what saves the extra round trip.
+        let out = run_script(HELLO_SCRIPT, &[]);
+        assert!(
+            out.stdout.matches("NVMUX_END").count() == 1,
+            "one terminator, and it is list.sh's: {:?}",
+            out.stdout
+        );
+
+        let probe = protocol::parse_probe(&out.stdout).expect("reads as a probe");
+        assert_eq!(
+            std::path::Path::new(&probe.runtime_dir),
+            crate::paths::runtime_dir(),
+            "the greeting must name the directory `paths` would"
+        );
+        protocol::parse_listing(&out.stdout).expect("reads as a listing");
+    }
+
+    /// A listing asks the process table once, not once per session, and the
+    /// answer has to stay the same. Sessions are `--listen`ing processes, so a
+    /// stand-in with the same command line is enough — and this then runs where
+    /// there is no Neovim, which is where the timing regression would land.
+    #[test]
+    fn a_listing_finds_every_live_session_and_none_of_the_dead() {
+        let dir = std::env::temp_dir().join(format!("nvmux-listing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        let live = ["aaaaaaaa", "bbbbbbbb", "cccccccc"];
+        let dead = "dddddddd";
+
+        let mut held = Vec::new();
+        for id in live {
+            let sock = dir.join(format!("{id}.sock"));
+            std::fs::write(&sock, "").expect("socket stand-in");
+            // `sh -c <cmd> <name> <args...>`: the arguments after the command
+            // are `$0..$n` to it and go unread, so this is a process whose
+            // command line reads like a session's and which does nothing.
+            held.push(
+                Command::new("/bin/sh")
+                    .args(["-c", "sleep 30", "nvim", "--headless", "--listen"])
+                    .arg(&sock)
+                    .spawn()
+                    .expect("spawn a stand-in session"),
+            );
+        }
+        std::fs::write(dir.join(format!("{dead}.sock")), "").expect("socket stand-in");
+
+        let out = run_script(LIST_SCRIPT, &[&dir.to_string_lossy()]);
+        for child in &mut held {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let rows = crate::transport::protocol::parse_listing(&out.stdout).expect("a listing");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        for id in live {
+            let row = rows.iter().find(|r| r.id == id);
+            assert!(
+                row.is_some_and(|r| r.pid_alive),
+                "{id} is being served and must be listed alive: {:?}",
+                out.stdout
+            );
+        }
+        assert!(
+            rows.iter().any(|r| r.id == dead && !r.pid_alive),
+            "{dead} is served by nothing: {:?}",
+            out.stdout
+        );
     }
 
     /// `scripts/spawn.sh` writes the nested-launch marker and `crate::nested`
