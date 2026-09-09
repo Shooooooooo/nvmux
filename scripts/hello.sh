@@ -22,11 +22,17 @@
 # rather than assuming: `ssh host nvim` finds nothing on most real setups,
 # because nvim was put on $PATH by .zprofile or .bash_profile.
 #
+# Assigned before it can be read, and never with a `:-` default. This script
+# runs inside the user's login shell, which exports whatever their profile sets
+# and whatever ssh was asked to send, so a name this script *execs* must not be
+# one the environment can supply. Namespaced for the same reason.
+NVMUX_STANDALONE=
+
 if [ -z "${NVMUX_PRELUDE:-}" ]; then
   . "$(dirname -- "$0")/_prelude.sh"
   # Run from a checkout the two files are still two files, so finish the job by
   # hand; delivered over ssh they are one stream and list.sh simply follows.
-  standalone="$(dirname -- "$0")/list.sh"
+  NVMUX_STANDALONE="$(dirname -- "$0")/list.sh"
 fi
 
 # Matches the Rust side's rule exactly; see src/paths.rs for why
@@ -40,7 +46,7 @@ else
   printf 'NVIM\n'
 fi
 
-[ -z "${standalone:-}" ] || exec sh "$standalone" "$dir"
+[ -z "$NVMUX_STANDALONE" ] || exec sh "$NVMUX_STANDALONE" "$dir"
 
 # What list.sh, appended below, reads as its runtime directory.
 set -- "$dir"

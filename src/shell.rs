@@ -311,6 +311,25 @@ mod tests {
         protocol::parse_listing(&out.stdout).expect("reads as a listing");
     }
 
+    /// The greeting runs inside the user's *login* shell, which exports
+    /// whatever their profile sets and whatever ssh was asked to send — so no
+    /// name it reads may come from the environment.
+    ///
+    /// `hello.sh` execs one of them, to hand off to `list.sh` when it is run
+    /// straight from a checkout. Read with a `:-` default it would exec an
+    /// inherited path instead, and the greeting would come back with no
+    /// terminator: `nvmux <host>` refusing to connect, blaming the probe.
+    #[test]
+    fn the_greeting_reads_nothing_from_the_environment() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-s")
+            .env("standalone", "/nonexistent-injected-path")
+            .env("NVMUX_STANDALONE", "/nonexistent-injected-path");
+        let out = crate::proc::run_feeding_stdin(&mut cmd, HELLO_SCRIPT).expect("run");
+        crate::transport::protocol::parse_probe(&out.stdout)
+            .expect("a polluted environment must not stop the greeting");
+    }
+
     /// A listing asks the process table once, not once per session, and the
     /// answer has to stay the same. Sessions are `--listen`ing processes, so a
     /// stand-in with the same command line is enough — and this then runs where

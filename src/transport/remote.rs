@@ -74,6 +74,13 @@ impl SshTransport {
 
         // One round trip for the runtime directory, the remote Neovim version
         // *and* the sessions the picker is about to draw.
+        //
+        // Which means the listing now happens before the version gate below,
+        // rather than after it: a host nvmux is about to refuse has its runtime
+        // directory swept first. Only ever of sessions that are already gone —
+        // `list.sh` removes a socket nothing serves and metadata with no socket
+        // — so the sweep is the one it would have done on the next successful
+        // run anyway.
         let out = checked_script(&ssh, shell::HELLO_SCRIPT, &[])?;
         let probe = protocol::parse_probe(&out.stdout)?;
 
