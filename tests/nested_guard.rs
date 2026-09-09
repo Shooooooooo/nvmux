@@ -75,7 +75,7 @@ fn a_nested_launch_is_refused_before_anything_else_is_looked_at() {
     );
     assert!(stderr.contains("/tmp/nvmux-0/abcdefgh.sock"), "{stderr}");
     // The two ways on: the picker from inside, or unsetting the marker.
-    assert!(stderr.contains("<prefix> t"), "{stderr}");
+    assert!(stderr.contains("<prefix> Space"), "{stderr}");
     assert!(stderr.contains("$NVMUX"), "{stderr}");
     // Neither sabotage was reached, so nothing ran ahead of the guard.
     assert!(!stderr.contains("not found on $PATH"), "{stderr}");

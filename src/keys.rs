@@ -63,7 +63,8 @@ use crate::keyseq::{self, Sequence, ESC};
 /// code do not follow from a letter — see [`prefix_label`] and [`prefix_code`].
 const CTRL_SPACE: u8 = 0x00;
 
-/// What `Ctrl-Space` is called, in a config file and on the help screen.
+/// What the space bar is called: in a config file, on the help screen, and in
+/// the README — as the prefix chord's key and as the picker command's.
 const SPACE_NAME: &str = "Space";
 
 /// `Ctrl-Space`.
@@ -76,7 +77,8 @@ pub const PREFIX_LABEL: &str = "Ctrl-Space";
 /// Something the proxy must do instead of forwarding bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// `<prefix> t` — suspend the relay and show the picker. The child stays alive.
+    /// `<prefix> Space` — suspend the relay and show the picker. The child stays
+    /// alive.
     Picker,
     /// `<prefix> d` — terminate the local UI and exit, leaving the server running.
     Detach,
@@ -103,8 +105,9 @@ pub enum Step {
 /// screen describes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Binding {
-    /// The byte typed after the prefix. Printable ASCII, so the help screen
-    /// can show it as itself.
+    /// The byte typed after the prefix. Printable ASCII; [`key_label`] spells
+    /// it for the help screen, since one of them is the space bar and would
+    /// otherwise be an empty cell.
     pub key: u8,
     pub action: Action,
     /// One line, in terms of what happens to the user.
@@ -114,7 +117,9 @@ pub struct Binding {
 /// Every command, in the order the help screen lists them.
 pub const BINDINGS: &[Binding] = &[
     Binding {
-        key: b't',
+        // The prefix chord's own key, without the Ctrl: `<prefix> Space`, the
+        // way `<prefix> <prefix>` is the prefix chord twice.
+        key: b' ',
         action: Action::Picker,
         help: "back to the picker, session still attached",
     },
@@ -187,16 +192,23 @@ pub fn parse_prefix(s: &str) -> Result<u8, String> {
     }
 }
 
+/// Spell a key the way people read it: itself for a printable character, and
+/// a name for the space bar, which would otherwise be an invisible cell on the
+/// help screen and an unreadable one in the README.
+pub fn key_label(byte: u8) -> String {
+    if byte == b' ' {
+        SPACE_NAME.to_string()
+    } else {
+        (byte as char).to_string()
+    }
+}
+
 /// Spell a prefix byte the way people read it: `0x00` -> `"Ctrl-Space"`,
 /// `0x14` -> `"Ctrl-t"`. The inverse of [`parse_prefix`], used by the runtime
 /// help screen and messages so a remapped prefix is described as the key the
 /// user actually set.
 pub fn prefix_label(byte: u8) -> String {
-    if byte == CTRL_SPACE {
-        format!("Ctrl-{SPACE_NAME}")
-    } else {
-        format!("Ctrl-{}", prefix_code(byte) as char)
-    }
+    format!("Ctrl-{}", key_label(prefix_code(byte)))
 }
 
 /// The key code a terminal reports the prefix chord under, see
@@ -477,7 +489,7 @@ impl Prefix {
                     // The digits already typed were a complete command, and
                     // this byte is simply the next key. Acting and then
                     // handling `b` afresh is what keeps `<prefix> 1 x` equivalent
-                    // to `<prefix> t x`: the command runs, the `x` reaches Neovim,
+                    // to `<prefix> Space x`: the command runs, the `x` reaches Neovim,
                     // and no stray prefix byte is injected.
                     self.state = State::Idle;
                     flush(steps, pending);
@@ -571,12 +583,12 @@ mod tests {
     fn every_binding_has_a_row_in_the_readme() {
         let readme = include_str!("../README.md");
         for b in BINDINGS {
-            let cell = format!("| `<prefix>` `{}` |", b.key as char);
+            let cell = format!("| `<prefix>` `{}` |", key_label(b.key));
             assert!(
                 readme.contains(&cell),
                 "README has no row for `<prefix> {}` — add one to \
                  the \"While attached\" table",
-                b.key as char
+                key_label(b.key)
             );
         }
     }
@@ -739,6 +751,29 @@ mod tests {
         }
     }
 
+    /// The picker key is the prefix chord's own key without the Ctrl, so both
+    /// arrive under the same key code (32) in a terminal that reports releases.
+    /// The chord's release belongs to its press and is held with it; the bare
+    /// byte that follows is the command, and neither reaches Neovim.
+    #[test]
+    fn the_prefix_then_its_bare_key_opens_the_picker() {
+        for spelling in [&[PREFIX][..], KITTY, XTERM] {
+            let mut p = Prefix::new(0);
+            assert!(p.feed(spelling).is_empty(), "{spelling:?}");
+            let steps = p.feed(b" ");
+            assert_eq!(actions(&steps), vec![Action::Picker], "{spelling:?}");
+            assert!(forwarded(&steps).is_empty(), "{spelling:?}");
+            assert!(!p.is_armed(), "{spelling:?}");
+        }
+
+        let mut p = Prefix::new(0);
+        p.feed(KITTY);
+        assert!(p.feed(b"\x1b[32;5:3u").is_empty(), "held with its press");
+        let steps = p.feed(b" ");
+        assert_eq!(actions(&steps), vec![Action::Picker]);
+        assert!(forwarded(&steps).is_empty(), "neither reaches Neovim");
+    }
+
     /// Both spellings in one read, with the command and ordinary text around
     /// them, in the right order.
     #[test]
@@ -746,7 +781,7 @@ mod tests {
         let mut p = Prefix::new(0);
         let mut input = b"before".to_vec();
         input.extend_from_slice(KITTY);
-        input.extend_from_slice(b"tmiddle");
+        input.extend_from_slice(b" middle");
         input.extend_from_slice(XTERM);
         input.extend_from_slice(b"dafter");
         let steps = p.feed(&input);
@@ -781,7 +816,7 @@ mod tests {
                 assert!(second.is_empty(), "cut at {cut}: {second:?}");
                 assert_eq!(p.wait(), Some(Wait::Command), "cut at {cut}");
 
-                let steps = p.feed(b"t");
+                let steps = p.feed(b" ");
                 assert_eq!(actions(&steps), vec![Action::Picker], "cut at {cut}");
             }
         }
@@ -968,7 +1003,7 @@ mod tests {
         assert_eq!(actions(&steps), vec![Action::Switch(1)]);
         assert!(forwarded(&steps).is_empty());
         assert_eq!(p.wait(), Some(Wait::Command));
-        assert_eq!(actions(&p.feed(b"t")), vec![Action::Picker]);
+        assert_eq!(actions(&p.feed(b" ")), vec![Action::Picker]);
     }
 
     /// The wait for the rest of a sequence is the short one, and it wins over
@@ -1103,7 +1138,7 @@ mod tests {
     #[test]
     fn a_prefix_inside_a_larger_chunk_splits_correctly() {
         let mut p = Prefix::new(0);
-        let steps = p.feed(b"before\x00tafter");
+        let steps = p.feed(b"before\x00 after");
         assert_eq!(forwarded(&steps), b"beforeafter");
         assert_eq!(actions(&steps), vec![Action::Picker]);
         // Ordering matters: the bytes before the command must be written first.
@@ -1117,7 +1152,7 @@ mod tests {
         let mut p = Prefix::new(0);
         // Literal bytes on purpose: this is what pins each letter to its
         // action, independently of what `BINDINGS` says.
-        let steps = p.feed(b"\x00t\x00d\x00c\x00?");
+        let steps = p.feed(b"\x00 \x00d\x00c\x00?");
         assert_eq!(
             actions(&steps),
             vec![Action::Picker, Action::Detach, Action::Create, Action::Help]
@@ -1247,7 +1282,7 @@ mod tests {
     fn command_keys_are_distinct_printable_and_never_the_prefix() {
         for (i, a) in BINDINGS.iter().enumerate() {
             assert!(
-                a.key.is_ascii_graphic(),
+                a.key.is_ascii() && !a.key.is_ascii_control(),
                 "byte {:#04x} cannot be shown on the help screen",
                 a.key
             );
@@ -1355,7 +1390,7 @@ mod tests {
     }
 
     /// The digits already typed were a complete command; the key after them is
-    /// simply the next key, exactly as it is after `<prefix> t`.
+    /// simply the next key, exactly as it is after `<prefix> Space`.
     #[test]
     fn a_key_after_a_number_ends_it_and_then_reaches_neovim() {
         let mut p = Prefix::new(12);
@@ -1514,7 +1549,7 @@ mod tests {
         assert!(forwarded(&armed).is_empty(), "the new prefix must be eaten");
         assert!(p.is_armed());
 
-        let steps = p.feed(b"t");
+        let steps = p.feed(b" ");
         assert_eq!(actions(&steps), vec![Action::Picker]);
 
         // The former default is no longer special.

@@ -51,7 +51,7 @@ const _: () = assert!(MAX_UIS < 16);
 /// How the relay ended. The attachment is handed back separately by [`relay`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// `<prefix> t` — show the picker. The child keeps running.
+    /// `<prefix> Space` — show the picker. The child keeps running.
     ToPicker,
     /// `<prefix> d` — detach and exit, leaving the session running.
     Detached,

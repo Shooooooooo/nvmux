@@ -106,7 +106,7 @@ once you have more than nine sessions.
 | Keys | Action |
 |---|---|
 | `<prefix>` `d` | detach — leaves the session running, exits nvmux |
-| `<prefix>` `t` | back to the picker, session still attached |
+| `<prefix>` `Space` | back to the picker, session still attached |
 | `<prefix>` `1`, `2`, … `12` | switch straight to that session |
 | `<prefix>` `c` | set up a new session and attach to it — `Esc` goes back |
 | `<prefix>` `?` | show these keys — `Esc` goes back |
@@ -127,11 +127,11 @@ the terminal sent.
 nvmux will not start inside a session. Run it in a `:terminal` there and it
 says `already inside an nvmux session` and stops — the outer proxy sees every
 `<prefix>` first, so an inner nvmux could be neither detached from nor left.
-`<prefix> t` is the way to the picker, `<prefix> c` the way to a new session.
-If you do want a second one anyway — to manage another host's sessions, say —
-`NVMUX= nvmux <host>` runs it, with the prefix belonging to the outer session
-throughout. (`$NVMUX` is the session socket, exported by the editor; it is what
-nvmux checks for.)
+`<prefix> Space` is the way to the picker, `<prefix> c` the way to a new
+session. If you do want a second one anyway — to manage another host's
+sessions, say — `NVMUX= nvmux <host>` runs it, with the prefix belonging to the
+outer session throughout. (`$NVMUX` is the session socket, exported by the
+editor; it is what nvmux checks for.)
 
 ### Leaving a session
 
