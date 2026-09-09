@@ -100,6 +100,11 @@ pub trait Transport {
     /// default rather than a wrong one.
     fn home(&self) -> &str;
 
+    /// A handle for listing directories on this session's host, owned and
+    /// `Send` so the create prompt's completion worker can hold one — see
+    /// [`crate::dirs`], which explains why it cannot simply borrow this.
+    fn dir_source(&self) -> crate::dirs::DirSource;
+
     /// A socket path on **this** machine that `nvim --server` can use.
     ///
     /// The single seam that makes remote sessions work: locally the session

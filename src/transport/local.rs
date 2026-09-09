@@ -166,6 +166,10 @@ impl Transport for LocalTransport {
         &self.home
     }
 
+    fn dir_source(&self) -> crate::dirs::DirSource {
+        crate::dirs::DirSource::Local
+    }
+
     fn create_session(&self, name: &str, launch: &Launch, directory: &str) -> Result<Session> {
         // The listing is also what the new session's number is allocated
         // from, so numbering costs no extra work here.

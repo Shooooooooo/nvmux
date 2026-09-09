@@ -208,6 +208,13 @@ impl Ssh {
         &self.host
     }
 
+    /// The `ControlPath` of this host's master connection. Handed out so that a
+    /// second, `Send` driver onto the *same* master can be built without
+    /// recomputing it — see [`crate::dirs::DirSource`].
+    pub fn control_path(&self) -> &Path {
+        &self.control_path
+    }
+
     fn run(&self, args: &[String]) -> std::io::Result<std::process::Output> {
         tracing::debug!(args = ?args, "ssh");
         Command::new("ssh")

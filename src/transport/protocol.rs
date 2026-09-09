@@ -136,6 +136,50 @@ pub fn parse_renumber(stdout: &str) -> Result<()> {
     require_terminator(stdout, "renumber")
 }
 
+/// The subdirectories of one directory, as `dirs.sh` listed them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Listing {
+    /// Their names, not their paths, in the order the host produced them —
+    /// which is `LC_ALL=C` glob order, so it is the same order on every host.
+    pub names: Vec<String>,
+    /// The host had more to say and stopped at its cap. A partial answer, which
+    /// matters to the caller: it may be shown, but it must not be filtered down
+    /// for a longer prefix, because what it is missing may be exactly what a
+    /// longer prefix wanted.
+    pub truncated: bool,
+}
+
+/// Read `dirs.sh`'s output.
+///
+/// Unrecognised lines are ignored for the reason [`parse_listing`] gives: this
+/// runs through the user's login shell, and a profile banner must not cost them
+/// their completions.
+pub fn parse_dirs(stdout: &str) -> Result<Listing> {
+    require_terminator(stdout, "directory listing")?;
+    let mut out = Listing::default();
+
+    for line in stdout.lines() {
+        let line = line.trim_end_matches('\r');
+        if line == "TRUNCATED" {
+            out.truncated = true;
+            continue;
+        }
+        // `splitn(2)` so a name containing a tab arrives whole. The script skips
+        // a name containing a newline, which is the one character that could
+        // break the framing; a tab cannot.
+        let mut fields = line.splitn(2, '\t');
+        if fields.next() != Some("D") {
+            continue;
+        }
+        match fields.next() {
+            Some(name) if !name.is_empty() => out.names.push(name.to_string()),
+            _ => tracing::debug!(line, "ignoring a nameless record from dirs.sh"),
+        }
+    }
+
+    Ok(out)
+}
+
 /// What `hello.sh` reported about a session host.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HostProbe {
@@ -538,6 +582,58 @@ mod tests {
                    NVMUX_END\n";
         let p = parse_probe(out).expect("parse");
         assert_eq!(p.runtime_dir, "/tmp/nvmux-1000");
+    }
+
+    #[test]
+    fn parses_a_directory_listing() {
+        let out = "D\talpha\nD\tbeta\nNVMUX_END\n";
+        let l = parse_dirs(out).expect("parse");
+        assert_eq!(l.names, ["alpha", "beta"]);
+        assert!(!l.truncated);
+    }
+
+    /// The cap is what keeps a huge directory from becoming a huge transfer,
+    /// and the flag is what stops the caller filtering a partial answer down
+    /// for a longer prefix — which would silently hide directories that are
+    /// there.
+    #[test]
+    fn a_truncated_directory_listing_says_so() {
+        let l = parse_dirs("D\ta\nTRUNCATED\nNVMUX_END\n").expect("parse");
+        assert_eq!(l.names, ["a"]);
+        assert!(l.truncated);
+    }
+
+    /// This runs through the user's login shell, so a profile banner or a
+    /// warning must cost them nothing. The same rule the session listing lives
+    /// by.
+    #[test]
+    fn a_directory_listing_ignores_anything_that_is_not_a_record() {
+        let out = "Welcome to example.com\n\
+                   D\tsrc\n\
+                   S\tabcdefgh\t1\t{}\n\
+                   D\n\
+                   \n\
+                   NVMUX_END\n";
+        let l = parse_dirs(out).expect("parse");
+        assert_eq!(l.names, ["src"], "only D records, and only named ones");
+    }
+
+    /// A name containing a tab arrives whole: the split is on the first one, so
+    /// everything after it is the name. `dirs.sh` skips the one character that
+    /// could break the framing, a newline, and a tab is not it.
+    #[test]
+    fn a_directory_name_containing_a_tab_survives() {
+        let l = parse_dirs("D\ta\tb\nNVMUX_END\n").expect("parse");
+        assert_eq!(l.names, ["a\tb"]);
+    }
+
+    #[test]
+    fn a_directory_listing_without_a_terminator_is_an_error() {
+        assert!(parse_dirs("D\tsrc\n").is_err(), "no terminator");
+        // An empty directory is a valid answer; an empty *output* is not, and
+        // is what `ssh -n` produces when the script never ran at all.
+        assert!(parse_dirs("NVMUX_END\n").expect("parse").names.is_empty());
+        assert!(parse_dirs("").is_err());
     }
 
     /// A host that could not say where home is — `$HOME` unset or relative, or

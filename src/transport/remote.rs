@@ -255,6 +255,16 @@ impl Transport for SshTransport {
         &self.remote_home
     }
 
+    /// Onto the master this transport already brought up, not a new connection:
+    /// the `ControlPath` is the whole handle, and `ssh` finds the live master
+    /// through it.
+    fn dir_source(&self) -> crate::dirs::DirSource {
+        crate::dirs::DirSource::Ssh {
+            host: self.ssh.host().to_string(),
+            control_path: self.ssh.control_path().to_path_buf(),
+        }
+    }
+
     fn create_session(&self, name: &str, launch: &Launch, directory: &str) -> Result<Session> {
         // The listing doubles as the source of the new session's number; see the
         // local transport.
