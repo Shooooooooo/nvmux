@@ -38,6 +38,16 @@ pub struct SshTransport {
     /// Sessions whose sockets are already forwarded, so re-attaching does not
     /// pay for a redundant round trip.
     forwarded: Mutex<HashSet<String>>,
+    /// The listing that came back with the greeting, still unparsed, waiting
+    /// for the first [`Transport::list_sessions`] to take it.
+    ///
+    /// Opening a host and drawing the picker are two questions with one answer,
+    /// and asking them separately costs a second script run over the link. The
+    /// window this is held across is the few milliseconds between
+    /// [`SshTransport::new`] returning and the picker's first listing — nvmux
+    /// creates, renames and kills nothing in between — and it is taken exactly
+    /// once, so every listing after it is fresh.
+    first_listing: Mutex<Option<String>>,
 }
 
 /// Needed by `Result::expect_err` in the SSH tests; never logged.
@@ -62,9 +72,16 @@ impl SshTransport {
         let ssh = Ssh::new(host.clone(), control_path);
         ssh.ensure_master()?;
 
-        // One round trip for both the runtime directory and the remote Neovim
-        // version.
-        let out = checked_script(&ssh, shell::PROBE_SCRIPT, &[])?;
+        // One round trip for the runtime directory, the remote Neovim version
+        // *and* the sessions the picker is about to draw.
+        //
+        // Which means the listing now happens before the version gate below,
+        // rather than after it: a host nvmux is about to refuse has its runtime
+        // directory swept first. Only ever of sessions that are already gone —
+        // `list.sh` removes a socket nothing serves and metadata with no socket
+        // — so the sweep is the one it would have done on the next successful
+        // run anyway.
+        let out = checked_script(&ssh, shell::HELLO_SCRIPT, &[])?;
         let probe = protocol::parse_probe(&out.stdout)?;
 
         if probe.nvim_banner.is_empty() {
@@ -97,6 +114,7 @@ impl SshTransport {
             local_dir,
             remote_dir: probe.runtime_dir,
             forwarded: Mutex::new(HashSet::new()),
+            first_listing: Mutex::new(Some(out.stdout)),
         })
     }
 
@@ -204,8 +222,15 @@ impl Transport for SshTransport {
     }
 
     fn list_sessions(&self) -> Result<Vec<Session>> {
-        let out = self.run_script(shell::LIST_SCRIPT, &[&self.remote_dir])?;
-        let mut sessions = protocol::rows_to_sessions(protocol::parse_listing(&out.stdout)?);
+        // The greeting already carried one, once.
+        let stdout = match self.first_listing.lock().ok().and_then(|mut f| f.take()) {
+            Some(stdout) => stdout,
+            None => {
+                self.run_script(shell::LIST_SCRIPT, &[&self.remote_dir])?
+                    .stdout
+            }
+        };
+        let mut sessions = protocol::rows_to_sessions(protocol::parse_listing(&stdout)?);
 
         // Liveness comes from the remote script, so drawing the picker needs no
         // forward per session. connect() through a forward would say nothing

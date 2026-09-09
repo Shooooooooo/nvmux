@@ -70,9 +70,138 @@ serving_pid() {
   fi
 }
 
+# Every socket a process of ours is listening on, read from the process table
+# **once** and held here framed by newlines, so that asking about one session
+# costs nothing at all.
+#
+# `serving` used to be `serving_pid` per session, and `serving_pid` reads the
+# whole process table -- so a listing read it once per session, and the picker's
+# first frame cost time proportional to sessions times processes. Measured on a
+# 1500-process box: twelve sessions took 815ms and one took 77ms. With a single
+# snapshot the same listing takes 70ms whatever the session count.
+NVMUX_LISTENING=
+NVMUX_LISTENING_TAKEN=
+
+take_listening() {
+  [ -z "$NVMUX_LISTENING_TAKEN" ] || return 0
+  NVMUX_LISTENING_TAKEN=1
+
+  # `ps` first, and `/proc` only where there is no `ps`, for the reason
+  # `serving_pid` gives. `tr` renders each `/proc` entry in the same
+  # space-joined shape `ps -o args=` produces, so one extractor reads both.
+  if command -v ps >/dev/null 2>&1; then
+    NVMUX_LISTENING=$(ps -ww -A -u "$(id -u)" -o args= 2>/dev/null | listen_args)
+  elif [ -r /proc/self/cmdline ]; then
+    NVMUX_LISTENING=$(for c in /proc/[0-9]*/cmdline; do
+      tr '\0' ' ' < "$c" 2>/dev/null
+      printf '\n'
+    done | listen_args)
+  fi
+
+  NVMUX_LISTENING="
+$NVMUX_LISTENING
+"
+}
+
+# The `--listen` argument of every command line on stdin, one per line.
+#
+# Taken to the end of the line rather than to the next space: `spawn.sh` runs
+# `nvim --headless --listen "$sock"` with the socket last, and a runtime
+# directory containing a space would otherwise be cut in half. The trailing
+# trim is for `/proc`, whose command lines end in a separator.
+#
+# The flag is spelled in two pieces so that this `awk`'s own command line --
+# which the `ps` beside it in the pipeline may well have caught -- cannot match
+# itself. That is the job the `grep -v grep` above does.
+listen_args() {
+  awk '
+    BEGIN { flag = " --lis" "ten " }
+    {
+      at = index($0, flag)
+      if (at > 0) {
+        path = substr($0, at + length(flag))
+        sub(/[ 	]*$/, "", path)
+        if (path != "") print path
+      }
+    }'
+}
+
 # Is anything serving this socket?
+#
+# A snapshot can only ever be missing an entry -- a `ps` that formatted
+# something unexpectedly, a session spawned by another nvmux a moment ago -- so
+# a miss is confirmed against the process table before it is believed. That
+# keeps the answer this returns, which is the answer `list.sh` hides sessions
+# and deletes files on, exactly the answer nvmux gave before the snapshot
+# existed; a live session, the case every listing is mostly made of, costs
+# nothing.
+#
+# Only for a socket, though. Neovim serves a session by binding one, so nothing
+# else can be a live session however the snapshot was read -- and a plain file
+# left in the runtime directory is never swept, so confirming that one would buy
+# nothing and cost a second read of the process table on every listing forever.
 serving() {
+  take_listening
+  case "$NVMUX_LISTENING" in
+    *"
+$1
+"*) return 0 ;;
+  esac
+  [ -S "$1" ] || return 1
   [ -n "$(serving_pid "$1")" ]
+}
+
+# The sockets under one directory that something has actually bound, read from
+# the kernel's own list of them, once.
+#
+# `serving` makes `ps` copy out every process's whole command line so that a
+# shell can pick a few paths back out -- 80ms on a thousand-process host, and it
+# grows with the host rather than with the sessions. This file is 3ms. A session
+# *is* an nvim with its socket bound, so this is the more direct question as
+# well as the cheaper one; `--listen` in a command line is evidence about it.
+#
+# Linux only, and never the last word. Where the file is absent (macOS, BSD), or
+# where the session's nvim is in a different network namespace from the shell
+# reading it, this finds nothing and `serving` answers exactly as it did before.
+NVMUX_BOUND=
+NVMUX_BOUND_TAKEN=
+
+take_bound() {
+  [ -z "$NVMUX_BOUND_TAKEN" ] || return 0
+  NVMUX_BOUND_TAKEN=1
+  [ -r /proc/net/unix ] || return 0
+  # Field 8 to the end of the line, for the reason `listen_args` reads to the
+  # end of its line: a runtime directory with a space in it is one path, not
+  # two. Restricted to the one directory so the test below stays a test on a
+  # short string however much else the host has bound.
+  #
+  # The prefix test is spelled as a negation because the POSIX scan in
+  # src/shell.rs rejects a spaced `==`, which in `test` is a bashism and in awk
+  # is not. Nothing else is meant by it.
+  NVMUX_BOUND=$(awk -v dir="$1" '
+    NF > 7 {
+      path = substr($0, index($0, $8))
+      if (index(path, dir) != 1) next
+      print path
+    }' /proc/net/unix)
+  NVMUX_BOUND="
+$NVMUX_BOUND
+"
+}
+
+# Has anything bound this socket?
+#
+# A "yes" is conclusive and costs one read of one small file for a whole
+# listing. A "no" means nothing at all -- callers must ask `serving`, which is
+# what decides whether a session is gone.
+bound() {
+  take_bound "${1%/*}/"
+  case "$NVMUX_BOUND" in
+    *"
+$1
+"*) return 0 ;;
+  esac
+  return 1
 }
 
 # Can we inspect processes at all? If not, "nothing found" proves nothing, and

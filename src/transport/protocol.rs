@@ -64,8 +64,9 @@ pub fn parse_listing(stdout: &str) -> Result<Vec<Listed>> {
         let mut fields = line.splitn(4, '\t');
         match fields.next() {
             Some("S") => {}
-            // The remote shell talking — a profile banner, a warning. Refusing
-            // to list sessions because of a MOTD would be maddening.
+            // The greeting `hello.sh` prints ahead of a first listing, or the
+            // remote shell talking — a profile banner, a warning. Refusing to
+            // list sessions because of a MOTD would be maddening.
             _ => {
                 tracing::debug!(line, "ignoring unrecognised line from list.sh");
                 continue;
@@ -120,7 +121,7 @@ pub fn parse_spawn(stdout: &str) -> Result<Spawned> {
     Ok(out)
 }
 
-/// What `probe.sh` reported about a session host.
+/// What `hello.sh` reported about a session host.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HostProbe {
     /// The runtime directory on the host that owns the sessions.
@@ -129,7 +130,11 @@ pub struct HostProbe {
     pub nvim_banner: String,
 }
 
-/// Parse the output of `probe.sh`.
+/// Read the greeting out of `hello.sh`'s output.
+///
+/// That output carries a listing after the two lines read here — the whole
+/// point of the script — so this ignores everything it does not recognise, and
+/// [`parse_listing`] reads the same bytes for the other half.
 pub fn parse_probe(stdout: &str) -> Result<HostProbe> {
     require_terminator(stdout, "probe")?;
     let mut out = HostProbe::default();

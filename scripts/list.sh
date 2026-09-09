@@ -45,8 +45,13 @@ if [ -d "$dir" ]; then
     # Asked by socket, not by the recorded pid: pids get reused, the socket is
     # the identity, and a busy session is still found because the process
     # exists whether or not it is answering.
+    #
+    # `bound` first because it is the cheap question and its "yes" is final;
+    # only its "no" -- which is also every host it cannot answer on -- is worth
+    # reading the process table for. What follows the `||` is therefore the
+    # whole of the old behaviour, reached whenever the new answer is not a yes.
     alive=0
-    if serving "$sock"; then
+    if bound "$sock" || serving "$sock"; then
       alive=1
     elif can_inspect && [ -S "$sock" ]; then
       # Stale: nvim unlinks its own socket on a clean exit, so one left behind
