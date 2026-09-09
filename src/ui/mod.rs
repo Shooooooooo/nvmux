@@ -273,6 +273,26 @@ fn run_loop(
                 }
             }
 
+            Request::Reorder(order) => {
+                let batch: Vec<Session> = order
+                    .into_iter()
+                    .filter_map(|(id, num)| {
+                        app.session(&id).cloned().map(|mut s| {
+                            s.num = num;
+                            s
+                        })
+                    })
+                    .collect();
+                if let Err(e) = transport.renumber(&batch) {
+                    app.set_message(one_line(&e));
+                }
+                // Whether it wrote or failed, what the numbers now are is a
+                // listing's answer and not ours. `set_sessions` restores the
+                // selection by id, so the cursor stays on the session that was
+                // just placed.
+                refresh(&mut app, &mut highest, transport)?;
+            }
+
             Request::Help => help::run_on(terminal)?,
         }
     }

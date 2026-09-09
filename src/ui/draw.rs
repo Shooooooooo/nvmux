@@ -29,6 +29,16 @@ use super::app::{App, Mode};
 const MARKER: &str = "▸ ";
 const INDENT: &str = "  ";
 
+/// The marker on the row being moved.
+///
+/// Must be exactly as wide as [`MARKER`], or every name jumps a column at the
+/// moment the eye is following one of them. `⇕` (U+21D5) rather than the more
+/// obvious `↕` (U+2195): the latter carries the Emoji property, so a terminal
+/// applying emoji presentation paints it two columns wide while `unicode-width`
+/// still reports one — the very defect that blanking the number column, rather
+/// than collapsing it, is there to avoid.
+const GRABBED: &str = "⇕ ";
+
 /// The prompt cursor.
 const CURSOR: &str = "▋";
 
@@ -47,6 +57,11 @@ const NUM_GAP: &str = "  ";
 /// keys, and the README carries the picker's own.
 const HINTS: &str = "↑↓ move  ⏎ attach  c new  r rename  x kill  / filter  q quit";
 const EMPTY: &str = "no sessions — press c to create one";
+
+/// What the hint row says while a session is in flight. Undimmed, like the
+/// filter and the kill confirm: a mode holding an unwritten edit must not look
+/// like the ambient reminder of keys.
+const REORDER_HINTS: &str = "↑↓ move  ⏎ place  esc cancel";
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -122,6 +137,17 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 
     let offset = scroll_offset(app.selected_index(), visible.len(), height as usize);
 
+    // The number column is kept but left blank while a session is being moved.
+    // Dropping it outright would narrow the centred block by `num_width` plus
+    // the gap and slide every name sideways exactly as one of them is being
+    // watched — the same thing the matching indent on unselected rows refuses.
+    // Hiding the digits is a display choice and not a correctness one: the
+    // numbers stay where they are on screen throughout a move, and it is the
+    // sessions that travel between them. They go away because the digit keys are
+    // dead in this mode, and a column of numbers changing owner under a moving
+    // row is noise.
+    let reordering = matches!(app.mode(), Mode::Reorder { .. });
+
     let rows: Vec<Line> = visible
         .iter()
         .enumerate()
@@ -129,17 +155,23 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         .take(height as usize)
         .map(|(i, session)| {
             let selected = i == app.selected_index();
-            let prefix = if selected { MARKER } else { INDENT };
+            let prefix = match (selected, reordering) {
+                (true, true) => GRABBED,
+                (true, false) => MARKER,
+                (false, _) => INDENT,
+            };
             let style = if selected {
                 Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
             } else {
                 Style::default()
             };
+            let num = if reordering {
+                String::new()
+            } else {
+                session.state.num.to_string()
+            };
             let text = truncate(
-                &format!(
-                    "{prefix}{:>num_width$}{NUM_GAP}{}",
-                    session.state.num, session.name
-                ),
+                &format!("{prefix}{num:>num_width$}{NUM_GAP}{}", session.name),
                 block.width as usize,
             );
             Line::from(Span::styled(text, style))
@@ -153,6 +185,14 @@ fn draw_bottom(frame: &mut Frame, app: &App, area: Rect) {
     let (text, dim) = match app.mode() {
         Mode::Confirm { prompt, .. } => (prompt.clone(), false),
         Mode::Filter => (format!("/{}{CURSOR}", app.filter()), false),
+        // The query comes too, when there is one. A move of one visible row can
+        // carry a session past several the filter is hiding, and that is the one
+        // moment the screen must not also stop saying a filter is applied — the
+        // reason the dim `/query` below exists at all.
+        Mode::Reorder { .. } if !app.filter().is_empty() => {
+            (format!("{REORDER_HINTS}  /{}", app.filter()), false)
+        }
+        Mode::Reorder { .. } => (REORDER_HINTS.to_string(), false),
         Mode::Normal => match app.message() {
             Some(msg) => (msg.to_string(), false),
             // A number waiting on another digit; without this the picker would
@@ -358,6 +398,93 @@ mod tests {
         );
     }
 
+    /// A session picked up for reordering, with the cursor on `row`.
+    fn reordering(names: &[&str], row: usize) -> App {
+        let mut a = app(names);
+        for _ in 0..row {
+            a.on_key(super::super::app::Key::Char('j'));
+        }
+        a.on_key(super::super::app::Key::Char(' '));
+        assert!(matches!(a.mode(), Mode::Reorder { .. }), "the grab took");
+        a
+    }
+
+    /// The numbers go away while a session is in flight, as asked: the digit
+    /// keys are dead in this mode and a column of numbers changing owner under a
+    /// moving row is noise.
+    #[test]
+    fn the_numbers_are_hidden_while_a_session_is_being_moved() {
+        let lines = render(&reordering(&["api-server", "dotfiles", "notes"], 0), 40, 6);
+        for line in lines.iter().filter(|l| l.contains("dotfiles")) {
+            assert!(
+                !line.chars().any(|c| c.is_ascii_digit()),
+                "a number survived into reorder mode: {line:?}"
+            );
+        }
+        assert!(lines.iter().any(|l| l.contains("api-server")), "{lines:#?}");
+    }
+
+    /// The column is blanked, not removed. Collapsing it would narrow the
+    /// centred block and slide every name sideways at the exact moment the eye
+    /// is following one of them.
+    #[test]
+    fn the_names_do_not_move_when_a_session_is_picked_up() {
+        let column = |a: &App| -> Vec<usize> {
+            render(a, 40, 6)
+                .iter()
+                .filter(|l| l.contains("dotfiles") || l.contains("notes"))
+                .map(|l| l[..l.find(char::is_alphabetic).expect("a name")].width())
+                .collect()
+        };
+        let before = column(&app(&["dotfiles", "notes"]));
+        let after = column(&reordering(&["dotfiles", "notes"], 0));
+        assert_eq!(before.len(), 2);
+        assert_eq!(
+            before, after,
+            "the names shifted when the row was picked up"
+        );
+    }
+
+    #[test]
+    fn the_grabbed_row_is_marked_differently_from_the_cursor() {
+        assert_eq!(
+            GRABBED.width(),
+            MARKER.width(),
+            "a marker of a different width shifts the whole name column"
+        );
+        assert_eq!(MARKER.width(), INDENT.width());
+
+        let lines = render(&reordering(&["aaa", "bbb"], 1), 40, 6);
+        let row = lines.iter().find(|l| l.contains("bbb")).expect("the row");
+        assert!(row.contains(GRABBED), "grabbed row: {row:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains(MARKER)),
+            "the plain cursor marker is still on screen: {lines:#?}"
+        );
+    }
+
+    /// One visible row of movement can carry a session past several the filter
+    /// is hiding. That is the one moment the screen must not also stop saying a
+    /// filter is applied.
+    #[test]
+    fn an_applied_filter_is_still_shown_while_reordering() {
+        let mut a = app(&["api-server", "dotfiles"]);
+        a.on_key(super::super::app::Key::Char('/'));
+        for c in "dot".chars() {
+            a.on_key(super::super::app::Key::Char(c));
+        }
+        a.on_key(super::super::app::Key::Enter); // filter applied, normal mode
+        a.on_key(super::super::app::Key::Char(' '));
+
+        let lines = render(&a, 60, 6);
+        assert!(lines[5].contains("place"), "got {:?}", lines[5]);
+        assert!(
+            lines[5].contains("/dot"),
+            "the query vanished: {:?}",
+            lines[5]
+        );
+    }
+
     #[test]
     fn the_empty_state_is_one_dimmed_line_with_hints_still_below() {
         let lines = render(&app(&[]), 60, 9);
@@ -502,6 +629,9 @@ mod tests {
         let mut a = app(&["one", "two", "three"]);
         a.on_key(super::super::app::Key::Char('j'));
         test_support::assert_no_colour(50, 8, |f| draw(f, &a));
+
+        let b = reordering(&["one", "two", "three"], 1);
+        test_support::assert_no_colour(50, 8, |f| draw(f, &b));
     }
 
     #[test]

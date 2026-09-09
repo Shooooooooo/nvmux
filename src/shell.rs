@@ -95,6 +95,12 @@ pub const HELLO_SCRIPT: &str = concat!(
 /// Rust cannot reach the file directly.
 pub const WRITE_META_SCRIPT: &str = script!("../scripts/write_meta.sh");
 
+/// Rewrites the numbers of reordered sessions, every one of them in a single
+/// run. Its own script rather than a variadic `write_meta.sh`, because that one
+/// creates a session's metadata and this one may only edit what is already
+/// there — see the comment it carries about orphans.
+pub const RENUMBER_SCRIPT: &str = script!("../scripts/renumber.sh");
+
 /// Every script, for the tests that check all of them the same way.
 #[cfg(test)]
 const SCRIPTS: &[(&str, &str)] = &[
@@ -103,6 +109,7 @@ const SCRIPTS: &[(&str, &str)] = &[
     ("kill.sh", KILL_SCRIPT),
     ("hello.sh", HELLO_SCRIPT),
     ("write_meta.sh", WRITE_META_SCRIPT),
+    ("renumber.sh", RENUMBER_SCRIPT),
 ];
 
 #[cfg(test)]
@@ -358,6 +365,73 @@ mod tests {
             "the greeting must name the directory `paths` would"
         );
         protocol::parse_listing(&out.stdout).expect("reads as a listing");
+    }
+
+    /// One run writes every pair, and it never creates a file.
+    ///
+    /// The second half is the point: an orphan is a live socket whose metadata
+    /// was never written, and the picker shows it under a name it synthesised on
+    /// the spot. Writing that here would make the placeholder real, on a session
+    /// the user reordered past rather than named. `write_meta.sh` may create;
+    /// this one may only edit, which is why it is a separate script.
+    #[test]
+    fn renumber_writes_every_pair_and_never_creates_metadata() {
+        use crate::session::Session;
+
+        let dir = std::env::temp_dir().join(format!("nvmux-renumber-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+
+        let meta = |id: &str, num: u32| {
+            let mut s = Session::new(id.to_string(), format!("name-{id}"), 0, num);
+            s.created = 100;
+            s
+        };
+        for (id, num) in [("aaaaaaaa", 1), ("bbbbbbbb", 2)] {
+            meta(id, num)
+                .write_atomic(&dir.join(format!("{id}.json")))
+                .expect("seed metadata");
+        }
+
+        // The third pair names a session with no metadata at all.
+        let swapped = [
+            meta("aaaaaaaa", 2).to_json().expect("json"),
+            meta("bbbbbbbb", 1).to_json().expect("json"),
+            meta("cccccccc", 3).to_json().expect("json"),
+        ];
+        let out = run_script(
+            RENUMBER_SCRIPT,
+            &[
+                &dir.to_string_lossy(),
+                "aaaaaaaa",
+                &swapped[0],
+                "bbbbbbbb",
+                &swapped[1],
+                "cccccccc",
+                &swapped[2],
+            ],
+        );
+        crate::transport::protocol::parse_renumber(&out.stdout).expect("the script ran");
+
+        let num_of = |id: &str| -> u32 {
+            let path = dir.join(format!("{id}.json"));
+            let bytes = std::fs::read(&path).expect("read back");
+            Session::from_json(&bytes, &path).expect("parse").num
+        };
+        assert_eq!(num_of("aaaaaaaa"), 2, "the first pair was not written");
+        assert_eq!(num_of("bbbbbbbb"), 1, "the second pair was not written");
+        assert!(
+            !dir.join("cccccccc.json").exists(),
+            "metadata was conjured for a session that had none"
+        );
+
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("tmp"))
+            .collect();
+        assert!(strays.is_empty(), "left temp files behind: {strays:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The greeting runs inside the user's *login* shell, which exports

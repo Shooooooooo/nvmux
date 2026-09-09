@@ -121,6 +121,21 @@ pub fn parse_spawn(stdout: &str) -> Result<Spawned> {
     Ok(out)
 }
 
+/// Read the outcome of `renumber.sh`.
+///
+/// Shaped like [`parse_spawn`]: the script's own `ERROR` line first, because it
+/// is more specific than "did not complete" and because without it a failed
+/// write reaches the user through `ssh::classify` as a diagnosis of the
+/// connection.
+pub fn parse_renumber(stdout: &str) -> Result<()> {
+    for line in stdout.lines() {
+        if let Some(("ERROR", reason)) = line.trim_end_matches('\r').split_once(' ') {
+            return Err(script_failed(reason.trim().to_string()));
+        }
+    }
+    require_terminator(stdout, "renumber")
+}
+
 /// What `hello.sh` reported about a session host.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HostProbe {
@@ -395,6 +410,21 @@ mod tests {
             err.to_string(),
             "runtime directory /tmp/nvmux-1000 is not owned by us"
         );
+    }
+
+    /// A metadata write that failed must reach the user as itself. Without the
+    /// `ERROR` line the script exits with nothing on stdout, and
+    /// `checked_script` hands that to `ssh::classify` — so a full disk would be
+    /// reported as a broken connection.
+    #[test]
+    fn a_failed_renumber_is_reported_in_the_scripts_own_words() {
+        parse_renumber("NVMUX_END\n").expect("a bare terminator means it ran");
+
+        let err = parse_renumber("ERROR could not replace metadata for aaaaaaaa\nNVMUX_END\n")
+            .expect_err("a refusal is not a success");
+        assert_eq!(err.to_string(), "could not replace metadata for aaaaaaaa");
+
+        parse_renumber("").expect_err("no terminator means it never ran");
     }
 
     /// The script's own reason beats "did not complete", and survives a pipe

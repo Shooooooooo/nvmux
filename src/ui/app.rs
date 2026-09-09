@@ -18,6 +18,14 @@ pub enum Mode {
         id: String,
         prompt: String,
     },
+    /// A session has been picked up and is being moved. `was` is every visible
+    /// row's `(id, state.num)` as it stood when the grab started: all `Esc`
+    /// needs to put everything back, and all `Enter` needs to tell a real move
+    /// from a grab that went nowhere.
+    Reorder {
+        id: String,
+        was: Vec<(String, u32)>,
+    },
 }
 
 /// Work the picker wants the caller to do.
@@ -32,6 +40,22 @@ pub enum Request {
     /// Ask for a new name for this session.
     RenameSession(String),
     Kill(String),
+    /// Persist this arrangement: every visible session paired with the number it
+    /// should now store.
+    ///
+    /// The whole arrangement rather than only the rows that moved. What is
+    /// persisted is [`Session::num`], and a row's stored number can already
+    /// differ from the resolved one it is showing — `finish_listing` re-derives
+    /// a number for a duplicate and for the `num == 0` of legacy metadata and
+    /// orphans. A row skipped as "unchanged" would keep a stored number that
+    /// then collides with one this batch just wrote, and the next listing would
+    /// resolve the collision the other way round: not a partly-moved list but an
+    /// arbitrary one. Sending the arrangement entire costs the same — one ssh
+    /// round trip either way — and repairs those numbers on its way past.
+    ///
+    /// Never sent empty: a grab that changed nothing returns [`Request::None`],
+    /// so picking a session up and putting it straight down costs no I/O.
+    Reorder(Vec<(String, u32)>),
     /// Show the key bindings; help happens on its own screen.
     Help,
     Quit,
@@ -149,15 +173,92 @@ impl App {
         self.session(id).map(|s| s.name.clone()).unwrap_or_default()
     }
 
-    /// Move the selection, wrapping at both ends.
-    fn move_by(&mut self, delta: isize) {
+    /// The row `delta` away from the selection, wrapping at both ends.
+    ///
+    /// Shared by the cursor and by a session being moved, so "the arrows wrap"
+    /// stays one fact about the picker rather than two implementations that
+    /// could drift apart.
+    fn wrapped(&self, delta: isize) -> usize {
         let len = self.visible().len();
         if len == 0 {
-            self.selected = 0;
-            return;
+            return 0;
         }
         let len = len as isize;
-        self.selected = (((self.selected as isize + delta) % len + len) % len) as usize;
+        (((self.selected as isize + delta) % len + len) % len) as usize
+    }
+
+    /// Move the selection, wrapping at both ends.
+    fn move_by(&mut self, delta: isize) {
+        self.selected = self.wrapped(delta);
+    }
+
+    /// Every visible row's `(id, resolved number)`, in display order.
+    fn snapshot(&self) -> Vec<(String, u32)> {
+        self.visible()
+            .iter()
+            .map(|s| (s.id.clone(), s.state.num))
+            .collect()
+    }
+
+    /// Move the grabbed row to `to`, sliding everything between it and where it
+    /// came from one place the other way.
+    ///
+    /// The numbers stay where they are on the screen; it is the sessions that
+    /// move between them. The list arrives from `finish_listing` sorted by
+    /// `state.num`, so dealing those same numbers back out down the new row
+    /// order leaves the column reading exactly as it did — which is what lets
+    /// `visible`, `scroll_offset` and the renderer stay unaware that a move
+    /// happened at all, and what keeps the numbers distinct and gap-preserving
+    /// however long the drag runs.
+    ///
+    /// One re-assignment rather than a loop of adjacent swaps: a
+    /// `while self.selected != to` around a mover that clamps by returning is an
+    /// unguarded loop, and no key can interrupt one.
+    fn shift_grabbed_to(&mut self, to: usize) {
+        let rows = self.snapshot();
+        if rows.len() < 2 {
+            return;
+        }
+        let to = to.min(rows.len() - 1);
+        let from = self.selected.min(rows.len() - 1);
+        if from == to {
+            return;
+        }
+
+        let mut ids: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
+        let moved = ids.remove(from);
+        ids.insert(to, moved);
+
+        let dealt: Vec<(String, u32)> = ids
+            .into_iter()
+            .map(str::to_string)
+            .zip(rows.iter().map(|(_, num)| *num))
+            .collect();
+        for (id, num) in dealt {
+            if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
+                s.state.num = num;
+            }
+        }
+
+        // Rows the filter is hiding keep their numbers, so the whole vector is
+        // still sorted by number once the visible ones have been dealt.
+        self.sessions.sort_by_key(|s| s.state.num);
+        self.selected = to;
+    }
+
+    /// Put the numbers back exactly as they were when the grab started, and the
+    /// cursor back on the session that was grabbed.
+    ///
+    /// By id rather than by the row it came from, so it stays right even if the
+    /// list ever moved underneath.
+    fn restore(&mut self, was: &[(String, u32)], id: &str) {
+        for (row, num) in was {
+            if let Some(s) = self.sessions.iter_mut().find(|s| &s.id == row) {
+                s.state.num = *num;
+            }
+        }
+        self.sessions.sort_by_key(|s| s.state.num);
+        self.select_session(id);
     }
 
     fn clamp_selection(&mut self) {
@@ -186,6 +287,7 @@ impl App {
             Mode::Normal => self.on_key_normal(key),
             Mode::Filter => self.on_key_filter(key),
             Mode::Confirm { .. } => self.on_key_confirm(key),
+            Mode::Reorder { .. } => self.on_key_reorder(key),
         }
     }
 
@@ -293,6 +395,15 @@ impl App {
                 }
                 Request::None
             }
+            // Guarded the way `x` is: without it, Space on an empty list would
+            // enter the mode over the "no sessions" screen with nothing to move.
+            Key::Char(' ') => {
+                if let Some(id) = self.selected_id() {
+                    let was = self.snapshot();
+                    self.mode = Mode::Reorder { id, was };
+                }
+                Request::None
+            }
             Key::Char('/') => {
                 self.mode = Mode::Filter;
                 Request::None
@@ -338,6 +449,64 @@ impl App {
                 self.filter.clear();
                 self.mode = Mode::Normal;
                 self.clamp_selection();
+                Request::None
+            }
+            Key::CtrlC => Request::Quit,
+            _ => Request::None,
+        }
+    }
+
+    /// Handle a key while a session is in flight.
+    ///
+    /// Anything not named here does nothing **and keeps the grab** — deliberately
+    /// unlike [`Mode::Confirm`], where everything but `y` dismisses. A `[y/N]` is
+    /// one question; a reorder is a multi-key edit holding an arrangement nothing
+    /// has written yet, and a stray keystroke must not silently decide whether it
+    /// is kept or thrown away. It also means `/` cannot re-filter under a grabbed
+    /// session, so the snapshot describes the same rows for the whole edit.
+    ///
+    /// Space grabs but does not also place, tempting as "the key that picked it
+    /// up puts it down" is: an autorepeat or a nervous double-tap would then read
+    /// as grab, place, grab, and with the numbers hidden the only thing saying so
+    /// is the marker on one row. `Enter` places.
+    fn on_key_reorder(&mut self, key: Key) -> Request {
+        let Mode::Reorder { id, was } = &self.mode else {
+            return Request::None;
+        };
+        let id = id.clone();
+        let was = was.clone();
+        let last = self.visible().len().saturating_sub(1);
+
+        match key {
+            Key::Char('j') | Key::Down | Key::CtrlN => {
+                self.shift_grabbed_to(self.wrapped(1));
+                Request::None
+            }
+            Key::Char('k') | Key::Up | Key::CtrlP => {
+                self.shift_grabbed_to(self.wrapped(-1));
+                Request::None
+            }
+            Key::Char('g') | Key::Home => {
+                self.shift_grabbed_to(0);
+                Request::None
+            }
+            Key::Char('G') | Key::End => {
+                self.shift_grabbed_to(last);
+                Request::None
+            }
+            Key::Enter => {
+                let now = self.snapshot();
+                self.mode = Mode::Normal;
+                if now == was {
+                    // Picked up and put straight back down, or moved and moved
+                    // back: nothing to write and nothing to re-list.
+                    return Request::None;
+                }
+                Request::Reorder(now)
+            }
+            Key::Esc => {
+                self.restore(&was, &id);
+                self.mode = Mode::Normal;
                 Request::None
             }
             Key::CtrlC => Request::Quit,
@@ -895,6 +1064,270 @@ mod tests {
         assert!(a.message().is_some());
         a.on_key(Key::Char('j'));
         assert!(a.message().is_none(), "a stale message must not linger");
+    }
+
+    // --- reordering ---------------------------------------------------------
+
+    /// The arrangement on screen: names in display order, and the numbers
+    /// beside them.
+    fn arrangement(app: &App) -> (Vec<String>, Vec<u32>) {
+        (
+            app.visible().iter().map(|s| s.name.clone()).collect(),
+            app.visible().iter().map(|s| s.state.num).collect(),
+        )
+    }
+
+    #[test]
+    fn space_picks_up_the_selected_session() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.on_key(Key::Char('j'));
+        assert_eq!(a.on_key(Key::Char(' ')), Request::None, "no I/O to request");
+        match a.mode() {
+            Mode::Reorder { id, was } => {
+                assert_eq!(id, "id000001", "the row under the cursor");
+                assert_eq!(was.len(), 2, "the whole visible list is snapshotted");
+            }
+            other => panic!("expected Reorder, got {other:?}"),
+        }
+    }
+
+    /// Without the guard, Space would enter the mode over the "no sessions"
+    /// screen, with a hint row offering to move something that is not there.
+    #[test]
+    fn space_on_an_empty_list_picks_nothing_up() {
+        let mut a = app(&[]);
+        assert_eq!(a.on_key(Key::Char(' ')), Request::None);
+        assert_eq!(*a.mode(), Mode::Normal);
+    }
+
+    /// All three families carry the grabbed row, as all three move the cursor,
+    /// and they wrap at both ends the same way.
+    #[test]
+    fn every_movement_key_carries_the_grabbed_session() {
+        for (down, up) in [
+            (Key::Char('j'), Key::Char('k')),
+            (Key::Down, Key::Up),
+            (Key::CtrlN, Key::CtrlP),
+        ] {
+            let mut a = app(&["aaa", "bbb", "ccc"]);
+            a.on_key(Key::Char(' '));
+
+            a.on_key(down);
+            assert_eq!(
+                arrangement(&a).0,
+                ["bbb", "aaa", "ccc"],
+                "{down:?} down one"
+            );
+            assert_eq!(a.selected_index(), 1, "{down:?} keeps the cursor on it");
+
+            a.on_key(down);
+            assert_eq!(arrangement(&a).0, ["bbb", "ccc", "aaa"]);
+
+            a.on_key(down);
+            assert_eq!(
+                arrangement(&a).0,
+                ["aaa", "bbb", "ccc"],
+                "{down:?} should wrap to the top"
+            );
+            assert_eq!(a.selected_index(), 0);
+
+            a.on_key(up);
+            assert_eq!(
+                arrangement(&a).0,
+                ["bbb", "ccc", "aaa"],
+                "{up:?} should wrap to the bottom"
+            );
+            assert_eq!(a.selected_index(), 2);
+        }
+    }
+
+    #[test]
+    fn g_and_shift_g_send_the_grabbed_session_to_the_ends() {
+        for (top, bottom) in [(Key::Char('g'), Key::Char('G')), (Key::Home, Key::End)] {
+            let mut a = app(&["aaa", "bbb", "ccc", "ddd"]);
+            a.on_key(Key::Char(' '));
+            a.on_key(bottom);
+            assert_eq!(arrangement(&a).0, ["bbb", "ccc", "ddd", "aaa"]);
+            assert_eq!(a.selected_index(), 3);
+            a.on_key(top);
+            assert_eq!(arrangement(&a).0, ["aaa", "bbb", "ccc", "ddd"]);
+            assert_eq!(a.selected_index(), 0);
+        }
+    }
+
+    /// The invariant the whole design rests on. A move exchanges which session
+    /// holds a number, never what the numbers are — so the column stays exactly
+    /// as it was, gaps included, and no number is invented, lost, duplicated or
+    /// zeroed however long the drag runs.
+    #[test]
+    fn the_numbers_on_screen_do_not_change_while_a_session_is_moving() {
+        // Gapped on purpose: 5 is what a listing shows after 3 and 4 were
+        // killed, and a design that renumbered densely would quietly close it.
+        let mut a = App::new(vec![
+            session("id000000", "aaa", 1),
+            session("id000001", "bbb", 2),
+            session("id000002", "ccc", 5),
+        ]);
+        a.on_key(Key::Char(' '));
+        for key in [Key::Down, Key::Down, Key::Down, Key::Up, Key::Char('G')] {
+            a.on_key(key);
+            assert_eq!(
+                arrangement(&a).1,
+                [1, 2, 5],
+                "the numbers moved when {key:?} was pressed"
+            );
+        }
+        let (names, _) = arrangement(&a);
+        assert_eq!(names, ["bbb", "ccc", "aaa"], "the sessions moved, though");
+    }
+
+    /// Every visible row, not only the ones whose number changed.
+    ///
+    /// A diff would be wrong: what is persisted is the *stored* number, and a
+    /// row can already be showing a number `finish_listing` derived for it
+    /// rather than one it stores. Skipping such a row as "unchanged" leaves it
+    /// storing a number that collides with one this batch just wrote.
+    #[test]
+    fn enter_asks_for_the_whole_arrangement_not_a_diff() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Down);
+        let request = a.on_key(Key::Enter);
+        assert_eq!(*a.mode(), Mode::Normal);
+        assert_eq!(
+            request,
+            Request::Reorder(vec![
+                ("id000001".into(), 1),
+                ("id000000".into(), 2),
+                ("id000002".into(), 3),
+            ]),
+            "ccc keeps its number and is still in the payload"
+        );
+    }
+
+    #[test]
+    fn a_grab_that_moved_nothing_asks_for_no_work() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char(' '));
+        assert_eq!(
+            a.on_key(Key::Enter),
+            Request::None,
+            "picked up and put down"
+        );
+
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Down);
+        a.on_key(Key::Up);
+        assert_eq!(
+            a.on_key(Key::Enter),
+            Request::None,
+            "moved and moved back is not a reorder"
+        );
+    }
+
+    #[test]
+    fn esc_puts_a_grabbed_session_back_where_it_came_from() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char('j')); // on "bbb"
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Down);
+        a.on_key(Key::Down);
+        assert_ne!(arrangement(&a).0, ["aaa", "bbb", "ccc"], "it did move");
+
+        assert_eq!(a.on_key(Key::Esc), Request::None, "nothing was written");
+        assert_eq!(*a.mode(), Mode::Normal);
+        assert_eq!(
+            arrangement(&a),
+            (
+                vec!["aaa".to_string(), "bbb".to_string(), "ccc".to_string()],
+                vec![1, 2, 3]
+            )
+        );
+        assert_eq!(
+            a.selected_session().expect("selected").name,
+            "bbb",
+            "the cursor comes back with it"
+        );
+    }
+
+    /// Unlike the kill confirm, where anything but `y` dismisses. A `[y/N]` is
+    /// one question; this is a multi-key edit holding an arrangement nothing has
+    /// written yet, and a stray keystroke must not decide its fate. Space is in
+    /// the list too: it grabs, it does not also place.
+    #[test]
+    fn a_stray_key_does_not_end_a_reorder() {
+        for key in [
+            Key::Char('1'),
+            Key::Char('x'),
+            Key::Char('r'),
+            Key::Char('c'),
+            Key::Char('/'),
+            Key::Char('?'),
+            Key::Char('q'),
+            Key::Char(' '),
+            Key::Tab,
+            Key::Backspace,
+            Key::Other,
+        ] {
+            let mut a = app(&["aaa", "bbb"]);
+            a.on_key(Key::Char(' '));
+            a.on_key(Key::Down);
+            let before = arrangement(&a);
+
+            assert_eq!(a.on_key(key), Request::None, "{key:?} must ask for nothing");
+            assert!(
+                matches!(a.mode(), Mode::Reorder { .. }),
+                "{key:?} dropped the session"
+            );
+            assert_eq!(arrangement(&a), before, "{key:?} disturbed the arrangement");
+        }
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_from_a_reorder() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.on_key(Key::Char(' '));
+        assert_eq!(a.on_key(Key::CtrlC), Request::Quit);
+    }
+
+    /// Moving obeys the same rule digits do — "you can press what you can see".
+    /// A row jumps over what the filter hides, and the hidden rows keep their
+    /// numbers and stay out of the payload, so nothing writes them.
+    #[test]
+    fn a_filtered_reorder_jumps_the_hidden_rows_and_leaves_their_numbers_alone() {
+        let mut a = app(&["alpha", "zzz", "gamma"]);
+        a.on_key(Key::Char('/'));
+        a.on_key(Key::Char('a'));
+        a.on_key(Key::Enter); // back to normal mode, filter still applied
+        assert_eq!(arrangement(&a).0, ["alpha", "gamma"]);
+
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Down);
+        assert_eq!(arrangement(&a).0, ["gamma", "alpha"]);
+
+        let request = a.on_key(Key::Enter);
+        assert_eq!(
+            request,
+            Request::Reorder(vec![("id000002".into(), 1), ("id000000".into(), 3)]),
+            "only the rows on screen, and zzz is not one of them"
+        );
+        assert_eq!(
+            a.session("id000001").expect("zzz").state.num,
+            2,
+            "the hidden row kept its number"
+        );
+    }
+
+    #[test]
+    fn reordering_a_list_of_one_is_harmless() {
+        let mut a = app(&["only"]);
+        a.on_key(Key::Char(' '));
+        for key in [Key::Down, Key::Up, Key::Char('g'), Key::Char('G')] {
+            assert_eq!(a.on_key(key), Request::None);
+            assert_eq!(a.selected_index(), 0);
+        }
+        assert_eq!(a.on_key(Key::Enter), Request::None, "nothing moved");
+        assert_eq!(*a.mode(), Mode::Normal);
     }
 
     /// Coming back from a session, the cursor is on the session that was

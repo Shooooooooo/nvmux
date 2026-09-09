@@ -73,6 +73,7 @@ reimplementing it.
 | `Enter` | attach (or end a number early) |
 | `c` | set up a new session, then attach |
 | `r` | rename the selected session |
+| `Space` | pick the session up; `↑↓` move it, `Enter` places it, `Esc` puts it back |
 | `x` | kill |
 | `/` | filter |
 | `?` | show the `<prefix>` keys |
@@ -92,12 +93,26 @@ case.
 
 The command is described under [Configuration](#the-command-a-session-runs).
 
-**Numbers are for life.** A session keeps the number it was created with, so a
-number you have learned goes on meaning the same session. They start at 1 and
-fill gaps: kill session 3 and the next one you create becomes 3 again. Type the
-digits together for a number past 9 — `12` for the twelfth. A single digit acts
-immediately unless a longer number could still be meant, which only happens
-once you have more than nine sessions.
+**Numbers name positions.** A session keeps the number it was created with for
+as long as you leave it where it is, so a number you have learned goes on
+meaning the same session. Moving one is the exception, and the only one: the
+sessions it travels past exchange numbers with it, which re-points `<prefix> 1`
+and its friends too. The numbers themselves do not change — the same ones stay
+in the same order down the screen — so nothing you have learned about the shape
+of the list is lost, only which session each number now names.
+
+They start at 1 and fill gaps: kill session 3 and the next one you create
+becomes 3 again. Type the digits together for a number past 9 — `12` for the
+twelfth. A single digit acts immediately unless a longer number could still be
+meant, which only happens once you have more than nine sessions.
+
+**Reordering.** `Space` picks the session under the cursor up; the movement keys
+carry it, `Enter` puts it down and `Esc` puts it back where it was. The numbers
+are hidden while a session is in flight, because they are about to change hands
+and the digit keys do nothing until it lands. Nothing is written until you press
+`Enter`, and what is written is stored with the sessions themselves — so the
+order is still there next time, and it is the same order from any machine that
+attaches to that host.
 
 ### While attached
 
