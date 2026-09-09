@@ -118,6 +118,15 @@ pub enum SessionError {
     #[error("invalid session name {name:?}: {reason}")]
     InvalidName { name: String, reason: &'static str },
 
+    /// The command a session's Neovim is launched with. Validated at the same
+    /// boundary and for the same reasons, plus one of its own: it has to carry
+    /// the socket, which is how every later listing and kill finds the session.
+    #[error("invalid command {command:?}: {reason}")]
+    InvalidCommand {
+        command: String,
+        reason: &'static str,
+    },
+
     /// The socket appeared but nothing ever answered on it.
     #[error("session {name:?} did not become ready within {timeout:?}\n--- tail of {} ---\n{log_tail}", .log.display())]
     NotReady {

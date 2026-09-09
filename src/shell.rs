@@ -381,6 +381,48 @@ mod tests {
         );
     }
 
+    /// A command may put its own arguments after the socket, now that the whole
+    /// line is the user's to write — and the snapshot `serving` reads first
+    /// cannot match that shape: `listen_args` takes the argument to the end of
+    /// the line, because a runtime directory may contain a space.
+    ///
+    /// So what has to hold is that `serving_pid`, which both the listing's
+    /// fallback and `kill.sh` fall through to, matches the socket wherever it
+    /// appears. Otherwise a live session reads as stale, its files are swept out
+    /// from under it, and nothing can ever kill it again.
+    #[test]
+    fn a_session_is_found_by_its_socket_wherever_it_sits_on_the_command_line() {
+        let sock = std::env::temp_dir().join(format!("nvmux-trailing-{}.sock", std::process::id()));
+        let sock = sock.to_string_lossy().into_owned();
+
+        // `sh -c <cmd> <name> <args...>`: the arguments after the command are
+        // `$0..$n` to it and go unread, so this is a process whose command line
+        // reads like a session's and which does nothing.
+        let spawn = |trailing: &[&str]| {
+            Command::new("/bin/sh")
+                .args(["-c", "sleep 30", "nvim", "--headless", "--listen", &sock])
+                .args(trailing)
+                .spawn()
+                .expect("spawn a stand-in session")
+        };
+        let ask = concat!(
+            include_str!("../scripts/_prelude.sh"),
+            "serving_pid \"$1\"\n"
+        );
+
+        for trailing in [&[][..], &["--clean"][..], &["--clean", "-u", "NONE"][..]] {
+            let mut held = spawn(trailing);
+            let found = crate::proc::run_local(ask, &[&sock]).expect("ask").stdout;
+            let _ = held.kill();
+            let _ = held.wait();
+            assert_eq!(
+                found.trim(),
+                held.id().to_string(),
+                "not found with {trailing:?} after the socket"
+            );
+        }
+    }
+
     /// The other half: a socket that is genuinely bound, with nothing in any
     /// command line to say so. Only the kernel's list can answer for this one,
     /// and it must — the alternative is the branch that deletes the files of a
@@ -427,6 +469,89 @@ mod tests {
             SPAWN_SCRIPT.contains(&export),
             "spawn.sh must `{export}...` for the guard to find anything"
         );
+    }
+
+    /// `spawn.sh` runs the argument list it is handed and nothing else — no
+    /// `nvim` of its own, and no string it assembled. A `sleep` whose command
+    /// line ends the way a session's does stands in for one, so this runs where
+    /// there is no Neovim.
+    #[test]
+    fn the_spawn_script_runs_the_command_it_is_given() {
+        let dir = std::env::temp_dir().join(format!("nvmux-spawn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sock = dir.join("aaaaaaaa.sock");
+
+        // `sh -c <cmd> <name> <args...>`: a process whose command line reads
+        // like a session's and which binds nothing, so `SOCK` times out. What
+        // is being asserted is the *pid*, which the script only reports after
+        // confirming the process is the one serving this socket.
+        let out = run_script(
+            SPAWN_SCRIPT,
+            &[
+                &dir.to_string_lossy(),
+                "aaaaaaaa",
+                "/bin/sh",
+                "-c",
+                "sleep 30",
+                "nvim",
+                "--headless",
+                "--listen",
+                &sock.to_string_lossy(),
+            ],
+        );
+        let spawned = crate::transport::protocol::parse_spawn(&out.stdout).expect("a spawn");
+        let pid = spawned
+            .pid
+            .unwrap_or_else(|| panic!("the script must have run our command: {:?}", out.stdout));
+        // The prelude's own reader, so this asks the question the same way the
+        // scripts do wherever it runs.
+        let cmdline = concat!(include_str!("../scripts/_prelude.sh"), "cmdline \"$1\"\n");
+        let seen = crate::proc::run_local(cmdline, &[&pid.to_string()])
+            .expect("read the command line")
+            .stdout;
+        assert!(
+            seen.contains("sleep 30"),
+            "pid {pid} is not the command we asked for: {seen:?}"
+        );
+
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(pid.to_string())
+            .status();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A command that is not there must say so at once. Waiting for a socket
+    /// that was never going to appear spends five seconds and then blames the
+    /// session for not starting.
+    #[test]
+    fn a_command_that_is_not_there_is_refused_rather_than_waited_for() {
+        let dir = std::env::temp_dir().join(format!("nvmux-spawn-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let started = std::time::Instant::now();
+        let out = run_script(
+            SPAWN_SCRIPT,
+            &[
+                &dir.to_string_lossy(),
+                "aaaaaaaa",
+                "nvmux-no-such-editor",
+                "--listen",
+                "/tmp/x.sock",
+            ],
+        );
+        let err = crate::transport::protocol::parse_spawn(&out.stdout)
+            .expect_err("a missing command is not a spawn");
+        assert!(
+            err.to_string().contains("nvmux-no-such-editor")
+                && err.to_string().contains("not found"),
+            "the refusal must name the command: {err}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "it must not wait for a socket that cannot appear"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The guard the prelude sets is what stops a prepended script sourcing it

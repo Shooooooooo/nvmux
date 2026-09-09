@@ -1,7 +1,12 @@
 #!/bin/sh
-# Spawn a detached headless Neovim that survives our disconnection.
+# Spawn a detached Neovim that survives our disconnection.
 #
-# Usage: sh spawn.sh <runtime_dir> <id>
+# Usage: sh spawn.sh <runtime_dir> <id> <cmd> [args...]
+#
+# The command is the caller's, one word per argument, already carrying this
+# session's socket path -- src/launch.rs is what validated and split it, and
+# nothing here re-parses it. It is run as-is: no shell, so no expansion, and no
+# string this script assembled.
 #
 # Output:
 #   PID <pid>        the *validated* pid of the new nvim, or empty if we could
@@ -11,8 +16,11 @@
 #
 [ -n "${NVMUX_PRELUDE:-}" ] || . "$(dirname -- "$0")/_prelude.sh"
 
-dir="${1:?usage: spawn.sh <runtime_dir> <id>}"
-id="${2:?usage: spawn.sh <runtime_dir> <id>}"
+usage='usage: spawn.sh <runtime_dir> <id> <cmd> [args...]'
+dir="${1:?$usage}"
+id="${2:?$usage}"
+: "${3:?$usage}"
+shift 2
 
 sock="$dir/$id.sock"
 log="$dir/$id.log"
@@ -77,6 +85,12 @@ rm -f "$sock"
 # not build a command out of a path -- see src/shell.rs on why that matters.
 export NVMUX="$sock"
 
+# A command that is not there would otherwise be a five-second wait for a socket
+# that was never going to appear, and a timeout message blaming the session. The
+# shell writes its own "not found" to the log, but only the caller reads that,
+# and only after giving up. `command -v` accepts a path as readily as a name.
+command -v -- "$1" >/dev/null 2>&1 || refuse "$1: not found"
+
 # Detach from the ssh session's process group, which the kernel SIGHUPs when the
 # connection closes. `setsid` is cleanest but is util-linux and does not exist
 # on macOS, so probe for it and fall back to `nohup`.
@@ -85,10 +99,10 @@ export NVMUX="$sock"
 # hygiene: `ssh host 'cmd &'` with stdout still attached hangs the ssh client
 # until its timeout. Measured at 12s versus 0.23s.
 if command -v setsid >/dev/null 2>&1; then
-  setsid nvim --headless --listen "$sock" </dev/null >>"$log" 2>&1 &
+  setsid "$@" </dev/null >>"$log" 2>&1 &
   guess=$!
 else
-  nohup nvim --headless --listen "$sock" </dev/null >>"$log" 2>&1 &
+  nohup "$@" </dev/null >>"$log" 2>&1 &
   guess=$!
   # Not a POSIX builtin, and absent in dash. `nohup` already did the work.
   disown 2>/dev/null || true

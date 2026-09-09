@@ -283,7 +283,9 @@ fn detaches_with(tag: &str, protocol: Protocol, prefix: &[u8]) {
     require_nvim!();
     let scratch = Scratch::new(tag);
     let t = scratch.transport();
-    let session = t.create_session(&common::unique(tag)).expect("create");
+    let session = t
+        .create_session(&common::unique(tag), &common::launch())
+        .expect("create");
     let sock = t.local_socket_for(&session).expect("socket path");
 
     let mut term = Terminal::spawn(&sock, &session.id, protocol);
