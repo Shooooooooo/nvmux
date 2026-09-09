@@ -59,6 +59,14 @@ pub enum Outcome {
     Quit,
 }
 
+impl Outcome {
+    /// Whether this hands the terminal straight to a client spawn, and so must
+    /// give it back cleared — see [`Screen::close_for_attach`].
+    fn attaches(&self) -> bool {
+        matches!(self, Self::Attach { .. })
+    }
+}
+
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -119,6 +127,31 @@ impl Screen {
         ratatui::try_restore()?;
         Ok(())
     }
+
+    /// Give the terminal back **cleared**, for a screen that ends by handing it
+    /// to a client spawn.
+    ///
+    /// Not `ratatui::try_restore()`: that leaves the alternate screen and stops,
+    /// which uncovers the screen this one was drawn over — the session being
+    /// switched away from — and nothing erases it until the next relay begins.
+    /// The spawn in between is three RPC round trips and a fresh `nvim` process,
+    /// so that stale frame is what the user watches for the whole switch.
+    ///
+    /// `try_restore` is exactly `disable_raw_mode` plus `\e[?1049l`, and that
+    /// escape is the first thing [`crate::term::leave_alt_screen_and_clear`]
+    /// writes — so doing the modes here and the screen there loses nothing and
+    /// puts the leave and the erase in one `write`.
+    pub(crate) fn close_for_attach(mut self) -> Result<()> {
+        self.closed = true;
+        // Modes first, for the reason ratatui gives for the same order: dropping
+        // raw mode has the wider side effects. The screen is put back either
+        // way, so a failure to restore the modes cannot also strand the user on
+        // the picker's alternate screen.
+        let modes = ratatui::crossterm::terminal::disable_raw_mode();
+        crate::term::leave_alt_screen_and_clear();
+        modes?;
+        Ok(())
+    }
 }
 
 impl Drop for Screen {
@@ -140,6 +173,27 @@ pub(crate) fn owning<T>(f: impl FnOnce(&mut ratatui::DefaultTerminal) -> Result<
     let mut screen = Screen::open()?;
     let outcome = f(screen.terminal());
     screen.close()?;
+    outcome
+}
+
+/// [`owning`], for a screen that can end by handing the terminal to a session:
+/// `attaches` names that outcome, and it alone gives the terminal back through
+/// [`Screen::close_for_attach`] rather than leaving the outgoing session's frame
+/// on display for the length of the client spawn.
+pub(crate) fn owning_for_attach<T>(
+    attaches: impl FnOnce(&T) -> bool,
+    f: impl FnOnce(&mut ratatui::DefaultTerminal) -> Result<T>,
+) -> Result<T> {
+    let mut screen = Screen::open()?;
+    let outcome = f(screen.terminal());
+    // The restore happens before the outcome propagates, as in `owning`, and an
+    // error takes the ordinary close: there is no session coming, and the shell
+    // the error is about to be printed to wants its screen back, not a cleared
+    // one.
+    match &outcome {
+        Ok(v) if attaches(v) => screen.close_for_attach()?,
+        _ => screen.close()?,
+    }
     outcome
 }
 
@@ -171,7 +225,9 @@ pub fn run(
     message: Option<String>,
     focused: Option<&str>,
 ) -> Result<Outcome> {
-    owning(|terminal| run_loop(terminal, transport, message, focused))
+    owning_for_attach(Outcome::attaches, |terminal| {
+        run_loop(terminal, transport, message, focused)
+    })
 }
 
 fn run_loop(
@@ -440,6 +496,20 @@ mod tests {
             "the only SGR reset in a frame comes after its content, which is \
              too late to undo anything inherited"
         );
+    }
+
+    /// Attaching is the outcome that gives the terminal back cleared; quitting
+    /// must not, because the shell it returns to wants its own screen rather
+    /// than a wiped one.
+    #[test]
+    fn only_attaching_hands_the_terminal_to_a_session() {
+        let session = Session::new("id000000".into(), "a".into(), 100, 1);
+        assert!(Outcome::Attach {
+            session,
+            highest: 1
+        }
+        .attaches());
+        assert!(!Outcome::Quit.attaches());
     }
 
     #[test]

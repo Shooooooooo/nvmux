@@ -162,10 +162,11 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     attached = held;
                     // A failed listing goes back to the picker like a failed
                     // attach, and for a second reason besides: this is the one
-                    // path from one relay straight into another, with no
-                    // `ui::Screen` in between to leave the alternate screen —
-                    // see the held branch of `pty::relay`. An error propagating
-                    // from here would be printed where nobody could read it.
+                    // path from one relay straight into another, so the screen
+                    // an error would land on is the cleared one the held branch
+                    // of `pty::relay` just handed over — nothing else on it, and
+                    // nothing the user could do from it. The hint row is both,
+                    // next to the row the message is about.
                     let sessions = match transport.list_sessions() {
                         Ok(sessions) => sessions,
                         Err(e) => {

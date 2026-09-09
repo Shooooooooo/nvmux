@@ -73,6 +73,14 @@ pub enum Outcome {
     Cancelled,
 }
 
+impl Outcome {
+    /// Whether the caller attaches next, and so needs the terminal given back
+    /// cleared — see [`super::Screen::close_for_attach`].
+    fn attaches(&self) -> bool {
+        matches!(self, Self::Created(_))
+    }
+}
+
 /// Which question is being asked. The two differ in how many fields there are,
 /// what they start as, and what enter finally calls.
 #[derive(Clone, Copy)]
@@ -320,8 +328,15 @@ fn aligned(labels: &[&str]) -> Vec<String> {
 
 /// Ask for a new session, owning the terminal while it does — for `<prefix> c`,
 /// which arrives from an attached session with none to borrow.
+///
+/// [`Outcome::Created`] leads straight to a client spawn, exactly as the picker's
+/// attach does, so the terminal goes back cleared on that one outcome and the
+/// session being left is not what fills the spawn. A cancelled prompt goes back
+/// to the same client, which is repainted, so it takes the ordinary close.
 pub fn run(transport: &dyn Transport) -> Result<Outcome> {
-    super::owning(|terminal| run_on(terminal, transport, Task::Create))
+    super::owning_for_attach(Outcome::attaches, |terminal| {
+        run_on(terminal, transport, Task::Create)
+    })
 }
 
 /// Ask on a terminal the caller already owns — how the picker drives this
@@ -587,6 +602,18 @@ mod tests {
     use ratatui::Terminal;
 
     const COMMAND_DEFAULT: &str = "nvim --headless --listen {sock}";
+
+    /// Only a created session is attached to next. A rename relists and a
+    /// cancel resumes the client that is still running, and both of those are
+    /// drawn over by whatever comes next — clearing for them would put a blank
+    /// screen in front of a picker that was about to paint anyway.
+    #[test]
+    fn only_a_created_session_hands_the_terminal_over() {
+        let session = Session::new("id000000".into(), "a".into(), 100, 1);
+        assert!(Outcome::Created(session).attaches());
+        assert!(!Outcome::Renamed.attaches());
+        assert!(!Outcome::Cancelled.attaches());
+    }
 
     fn prompt() -> Prompt {
         Prompt::create("session 3".to_string(), COMMAND_DEFAULT.to_string())

@@ -72,6 +72,18 @@ pub enum Outcome {
     StdinClosed,
 }
 
+impl Outcome {
+    /// Whether this leads from one relay straight into the next, with no
+    /// [`crate::ui`] screen in between to clear the outgoing frame on the way.
+    ///
+    /// Only `<prefix> <number>` does. `ToPicker`, `CreateNew` and `ShowHelp` all
+    /// open a screen, and a screen clears as it opens; the rest end the relay
+    /// for good.
+    fn leads_straight_into_another_relay(self) -> bool {
+        matches!(self, Outcome::Switch(_))
+    }
+}
+
 /// A running `--remote-ui` client, and the PTY it is talking through.
 pub struct Attachment {
     /// Which session this client is attached to.
@@ -270,6 +282,11 @@ pub fn relay(
         .ok_or_else(|| NvmuxError::Io(std::io::Error::other("pty master has no fd")))?;
 
     let winch = winch::Winch::install()?;
+    // Normally already done by whoever handed the terminal over — the picker,
+    // the prompt, or the `Switch` branch below — because a clear on this side of
+    // the client spawn is a clear too late, and the old session is what fills
+    // the wait. This is the backstop for a path that did neither, and a repeat
+    // costs one write on a screen nothing has drawn to since.
     term::leave_alt_screen_and_clear();
     let mut raw = term::RawMode::enter()?;
 
@@ -289,6 +306,14 @@ pub fn relay(
             @ (Outcome::ToPicker | Outcome::CreateNew | Outcome::ShowHelp | Outcome::Switch(_)),
         ) => {
             raw.restore();
+            // Clear here rather than leaving it to the next `relay`, which runs
+            // on the far side of the client spawn: what is on the terminal until
+            // then is the session being switched away from. Harmless when the
+            // number names nothing — the same client is resumed, and a resume
+            // forces a repaint.
+            if held.leads_straight_into_another_relay() {
+                term::leave_alt_screen_and_clear();
+            }
             Ok((held, Some(attachment)))
         }
         Ok(Outcome::ChildExited) => {
@@ -804,6 +829,29 @@ mod tests {
             assert_eq!(got, Some(want), "{action:?}");
         }
         assert!(out.is_empty(), "a command writes nothing to the child");
+    }
+
+    /// Exactly one outcome reaches the next session without a screen on the
+    /// way, and it is the one that has to clear for itself. Getting this wrong
+    /// in either direction is invisible in a test that only checks the
+    /// outcomes: too narrow leaves the old session on screen through the
+    /// spawn, too wide clears a screen that is about to draw anyway.
+    #[test]
+    fn only_a_number_switch_reaches_the_next_session_without_a_screen() {
+        assert!(Outcome::Switch(3).leads_straight_into_another_relay());
+        for other in [
+            Outcome::ToPicker,
+            Outcome::CreateNew,
+            Outcome::ShowHelp,
+            Outcome::Detached,
+            Outcome::ChildExited,
+            Outcome::StdinClosed,
+        ] {
+            assert!(
+                !other.leads_straight_into_another_relay(),
+                "{other:?} either opens a screen or ends the relay"
+            );
+        }
     }
 
     /// The peek sees a stop, leaves it in place, and sees an exit without

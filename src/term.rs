@@ -239,21 +239,36 @@ pub fn terminal_size() -> crate::pty::PtySize {
     }
 }
 
+/// What hands the terminal to a session: [`INHERITED`], then `?1049l` to leave
+/// the alternate screen, then clear + home so the session starts from a known
+/// state.
+///
+/// Every part of that order is load-bearing, and the test below pins it. An
+/// erase paints with the *current* background colour, so the attributes an
+/// outgoing client left behind have to go first; and the erase has to land on
+/// the screen the session will draw on rather than on the one being left. One
+/// string, so it is also one `write`: a terminal cannot present the moment in
+/// between, which is the outgoing session's frame.
+const HANDOVER: &[u8] = b"\x1b[?2026l\x1b[0m\x1b[?1049l\x1b[2J\x1b[H";
+
 /// Leave the alternate screen and clear, without touching the terminal modes.
 ///
-/// The picker's ratatui teardown has already dropped raw mode by the time this
-/// runs; the attach path then establishes its own. Written straight to the fd
-/// rather than through crossterm so it cannot re-enter any mode handling.
+/// **Belongs before the next client is spawned, never after.** Whatever is on
+/// the terminal stays there until this runs, and on a switch that is the session
+/// being switched away from — so with this on the far side of a spawn (three RPC
+/// round trips and a whole new `nvim` process) the old session is what the user
+/// watches for the length of the switch. The callers are therefore the picker
+/// and the prompt as they give the terminal back, `<prefix> <number>` as it
+/// leaves one relay for the next, and [`crate::pty::relay`] as the backstop for
+/// a path that did neither.
+///
+/// Written straight to stdout rather than through crossterm so it cannot
+/// re-enter any mode handling: raw mode is the caller's business, and the
+/// callers differ on whether they have dropped it yet.
 pub fn leave_alt_screen_and_clear() {
     use std::io::Write;
     let mut out = std::io::stdout();
-    // First, because the clear below erases with the *current* background
-    // colour: `<prefix> 1` goes straight from one session to another, with no
-    // screen in between to have dropped the outgoing client's attributes.
-    let _ = out.write_all(INHERITED);
-    // ?1049l leaves the alternate screen, then clear + home so the session
-    // starts from a known state.
-    let _ = out.write_all(b"\x1b[?1049l\x1b[2J\x1b[H");
+    let _ = out.write_all(HANDOVER);
     let _ = out.flush();
 }
 
@@ -281,6 +296,29 @@ mod tests {
         assert_eq!(INHERITED, b"\x1b[?2026l\x1b[0m");
         assert!(!contains(INHERITED, b"\x1b[?1049l"));
         assert!(!contains(INHERITED, b"\x1b[?25h"));
+    }
+
+    /// [`HANDOVER`] is three steps whose order is the whole of its correctness,
+    /// and nothing but this stops a later edit reshuffling them.
+    #[test]
+    fn the_handover_drops_inherited_attributes_before_it_erases() {
+        assert!(
+            HANDOVER.starts_with(INHERITED),
+            "the erase paints with the current background colour, so the \
+             outgoing client's attributes must go first"
+        );
+        let at = |needle: &[u8]| {
+            HANDOVER
+                .windows(needle.len())
+                .position(|w| w == needle)
+                .unwrap_or_else(|| panic!("HANDOVER dropped {needle:?}"))
+        };
+        assert!(
+            at(b"\x1b[?1049l") < at(b"\x1b[2J"),
+            "the erase must land on the screen the session will draw on, not \
+             on the alternate screen being left"
+        );
+        assert!(at(b"\x1b[2J") < at(b"\x1b[H"));
     }
 
     /// The distinction the module docs rest on: `cfmakeraw` already does most of
