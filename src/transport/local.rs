@@ -92,6 +92,21 @@ impl LocalTransport {
         }
     }
 
+    /// Parse `<id>.json`, or `None` when there is not one.
+    ///
+    /// A missing file is not an error here: it is how both a session reaped
+    /// since the listing and an orphan — a live socket whose metadata was never
+    /// written — present themselves, and the two callers want to say different
+    /// things about that.
+    fn read_meta(&self, json: &Path) -> Result<Option<Session>> {
+        let bytes = match std::fs::read(json) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(NvmuxError::Io(e)),
+        };
+        Ok(Some(Session::from_json(&bytes, json)?))
+    }
+
     /// Delete a dead session's files.
     fn reap(&self, paths: &SessionPaths) {
         tracing::info!(sock = %paths.sock.display(), "reaping dead session");
@@ -227,21 +242,35 @@ impl Transport for LocalTransport {
         plan_rename(&self.list_sessions()?, new_name, &s.id)?;
 
         let paths = self.paths(&s.id)?;
-
-        let bytes = std::fs::read(&paths.json).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                // The session was killed, or reaped, between the picker
-                // listing it and the rename being confirmed.
-                NvmuxError::Session(SessionError::NotFound(s.name.clone()))
-            } else {
-                NvmuxError::Io(e)
-            }
-        })?;
-        let mut session = Session::from_json(&bytes, &paths.json)?;
+        let Some(mut session) = self.read_meta(&paths.json)? else {
+            // The session was killed, or reaped, between the picker listing it
+            // and the rename being confirmed.
+            return Err(NvmuxError::Session(SessionError::NotFound(s.name.clone())));
+        };
         session.name = new_name.to_string();
         session.write_atomic(&paths.json)?;
 
         tracing::info!(id = %s.id, from = %s.name, to = new_name, "renamed");
+        Ok(())
+    }
+
+    /// Read, edit, write — rather than writing the record the picker is holding.
+    /// The file is right here, so a rename another nvmux landed between the
+    /// listing and this edit is kept rather than clobbered.
+    fn renumber(&self, sessions: &[Session]) -> Result<()> {
+        for s in sessions {
+            let paths = self.paths(&s.id)?;
+            let Some(mut on_disk) = self.read_meta(&paths.json)? else {
+                // No metadata to edit: an orphan, whose name the picker only
+                // synthesised, or a session reaped since the listing. Writing
+                // one would make a placeholder name real, and a vanished row
+                // must not abort the rest of the arrangement.
+                tracing::debug!(id = %s.id, "no metadata to renumber");
+                continue;
+            };
+            on_disk.num = s.num;
+            on_disk.write_atomic(&paths.json)?;
+        }
         Ok(())
     }
 

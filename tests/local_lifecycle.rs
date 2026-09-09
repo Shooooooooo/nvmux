@@ -16,7 +16,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::time::{Duration, Instant};
 
 use common::{command_line, Scratch};
-use nvmux::session::Liveness;
+use nvmux::session::{Liveness, Session};
 use nvmux::transport::Transport;
 
 #[test]
@@ -175,6 +175,88 @@ fn session_numbers_are_stable_and_a_freed_one_is_reused() {
     let listed = t.list_sessions().expect("list");
     let nums: Vec<u32> = listed.iter().map(|s| s.state.num).collect();
     assert_eq!(nums, vec![1, 2, 3], "the list reads in number order");
+}
+
+/// A reorder is only worth anything if it sticks. The picker arranges the
+/// numbers, `renumber` writes them, and the next listing has to read the same
+/// order back — against real sessions and real metadata, which is the part the
+/// pure tests cannot cover.
+#[test]
+fn a_reorder_is_still_there_after_a_relisting() {
+    require_nvim!();
+    let scratch = Scratch::new("reorder");
+    let t = scratch.transport();
+
+    for name in ["first", "second", "third"] {
+        t.create_session(name, &common::launch()).expect("create");
+    }
+    let listed = t.list_sessions().expect("list");
+    let names: Vec<&str> = listed.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["first", "second", "third"]);
+
+    // What the picker sends after dragging "third" to the top: every visible
+    // session, each paired with the number of the row it now sits in.
+    let numbers: Vec<u32> = listed.iter().map(|s| s.state.num).collect();
+    let arranged = ["third", "first", "second"];
+    let batch: Vec<Session> = arranged
+        .iter()
+        .zip(&numbers)
+        .map(|(name, num)| {
+            let mut s = listed
+                .iter()
+                .find(|s| s.name == *name)
+                .expect("a session by that name")
+                .clone();
+            s.num = *num;
+            s
+        })
+        .collect();
+    t.renumber(&batch).expect("renumber");
+
+    let listed = t.list_sessions().expect("list");
+    let names: Vec<&str> = listed.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, arranged, "the new order did not survive the listing");
+    assert_eq!(
+        listed.iter().map(|s| s.state.num).collect::<Vec<_>>(),
+        numbers,
+        "the numbers themselves should not have changed, only their owners"
+    );
+
+    // And it is on disk, not just in the listing this process built.
+    for s in &listed {
+        let v = common::read_meta(&scratch.0.join(format!("{}.json", s.id)));
+        assert_eq!(
+            v.get("num").and_then(serde_json::Value::as_u64),
+            Some(u64::from(s.state.num)),
+            "{} was not written: {v}",
+            s.name
+        );
+    }
+}
+
+/// A session with no metadata is skipped rather than having some conjured for
+/// it. An orphan — a live socket whose `<id>.json` was never written — is shown
+/// under a name the picker made up, and a reorder passing over one must not make
+/// that placeholder real.
+#[test]
+fn a_reorder_never_writes_metadata_for_a_session_that_has_none() {
+    require_nvim!();
+    let scratch = Scratch::new("reorder-orphan");
+    let t = scratch.transport();
+
+    let session = t.create_session("only", &common::launch()).expect("create");
+    let json = scratch.0.join(format!("{}.json", session.id));
+    std::fs::remove_file(&json).expect("make it an orphan");
+
+    let mut orphaned = session.clone();
+    orphaned.num = 7;
+    t.renumber(&[orphaned])
+        .expect("a missing file is not an error");
+
+    assert!(
+        !json.exists(),
+        "metadata was conjured for a session that had none"
+    );
 }
 
 /// The number has to survive the round trip through `<id>.json`, which is the

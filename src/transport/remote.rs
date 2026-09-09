@@ -347,6 +347,31 @@ impl Transport for SshTransport {
         Ok(())
     }
 
+    /// One round trip for the whole arrangement. Writes the records the picker
+    /// holds — see [`Transport::renumber`] for why that is complete and why the
+    /// script, not this side, is what refuses to invent metadata for an orphan.
+    fn renumber(&self, sessions: &[Session]) -> Result<()> {
+        if sessions.is_empty() {
+            return Ok(());
+        }
+        let bodies = sessions
+            .iter()
+            .map(|s| s.to_json())
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut args: Vec<&str> = Vec::with_capacity(1 + sessions.len() * 2);
+        args.push(&self.remote_dir);
+        for (s, body) in sessions.iter().zip(&bodies) {
+            args.push(&s.id);
+            args.push(body);
+        }
+
+        let out = self.run_script(shell::RENUMBER_SCRIPT, &args)?;
+        protocol::parse_renumber(&out.stdout)?;
+        tracing::info!(host = %self.host(), count = sessions.len(), "renumbered");
+        Ok(())
+    }
+
     fn local_socket_for(&self, s: &Session) -> Result<PathBuf> {
         let local = self.local_sock(&s.id)?;
         let remote = self.remote_sock(&s.id)?;

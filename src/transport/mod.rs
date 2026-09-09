@@ -59,6 +59,32 @@ pub trait Transport {
     /// is only data, so no SSH forward has to be rebuilt.
     fn rename_session(&self, s: &Session, new_name: &str) -> Result<()>;
 
+    /// Persist the order the user arranged in the picker: write each of these
+    /// records' [`Session::num`], and change nothing else.
+    ///
+    /// Whole records rather than `(id, number)` pairs, so there is one source of
+    /// truth for the number a session should store. Locally only `id` and `num`
+    /// are read — the file is right here, so it is re-read and edited, which
+    /// keeps a rename another nvmux landed in between. Over ssh the record is
+    /// written back whole, the same trade [`Transport::rename_session`] already
+    /// makes and safe for the same reason: `list.sh` ships each session's entire
+    /// `<id>.json`, so the picker's copy is complete, and `SessionState` is
+    /// `#[serde(skip)]`, so no resolved number can reach disk.
+    ///
+    /// Batched. Over ssh this is one round trip whatever the list length, where
+    /// a row dragged the length of a long list would otherwise cost one per row
+    /// it passed — see [`crate::shell`].
+    ///
+    /// Not atomic across sessions: the files are written one at a time on the
+    /// host that owns them. A failure part way is reported and the picker
+    /// re-lists straight afterwards, so what is on screen is what is on disk;
+    /// [`finish_listing`] resolves any half-written state into a valid,
+    /// duplicate-free ordering by construction.
+    ///
+    /// A session with no metadata — an orphan, or one killed since the listing —
+    /// is skipped rather than having a record conjured for it.
+    fn renumber(&self, sessions: &[Session]) -> Result<()>;
+
     /// A socket path on **this** machine that `nvim --server` can use.
     ///
     /// The single seam that makes remote sessions work: locally the session
@@ -428,5 +454,50 @@ mod tests {
         let listed = finish_listing(vec![session("aaa", 0, 1), session("bbb", 0, 2)]);
         assert_eq!(listed[0].num, 0, "still unnumbered on disk");
         assert_eq!(next_free_num(&listed), 3);
+    }
+
+    /// What a reorder writes is what the next listing reads back. Reordering is
+    /// only worth anything if this holds, and it is the round trip nothing else
+    /// covers: the picker arranges `state.num`, the transport stores those as
+    /// `num`, and `finish_listing` has to resolve them to the same order again.
+    ///
+    /// The fixture is deliberately the hard one — two sessions storing the
+    /// *same* number, which `duplicate_stored_numbers_are_broken_apart` says is
+    /// a real condition. A reorder that wrote only the rows whose displayed
+    /// number changed would leave one of these two storing a stale number that
+    /// collides with a freshly written one, and this is where that shows up.
+    #[test]
+    fn the_order_a_reorder_wrote_is_the_order_the_next_listing_reads() {
+        // As listed: "bbb" and "ccc" both claim 2, so one of them is showing a
+        // number it does not store, and "ddd" has none at all.
+        let listed = finish_listing(vec![
+            session("aaa", 1, 1),
+            session("bbb", 2, 2),
+            session("ccc", 2, 3),
+            session("ddd", 0, 4),
+        ]);
+        let shown: Vec<(String, u32)> =
+            listed.iter().map(|s| (s.id.clone(), s.state.num)).collect();
+        assert_eq!(
+            shown,
+            vec![
+                ("aaa".to_string(), 1),
+                ("bbb".to_string(), 2),
+                ("ccc".to_string(), 3),
+                ("ddd".to_string(), 4),
+            ]
+        );
+
+        // The picker sends the whole arrangement, with "aaa" dragged to the end:
+        // each row keeps the number of the position it now sits in.
+        let arranged = ["bbb", "ccc", "ddd", "aaa"];
+        let written: Vec<Session> = arranged
+            .iter()
+            .zip(shown.iter().map(|(_, n)| *n))
+            .map(|(id, num)| session(id, num, 0))
+            .collect();
+
+        let back: Vec<String> = finish_listing(written).into_iter().map(|s| s.id).collect();
+        assert_eq!(back, arranged, "the arrangement did not survive a listing");
     }
 }
