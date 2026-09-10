@@ -72,7 +72,8 @@ reimplementing it.
 | `<prefix>` `d` | detach — leaves the session running, exits nvmux |
 | `<prefix>` `Space` | back to the picker, session still attached — `Esc` goes back |
 | `<prefix>` `1`, `2`, … `12` | switch straight to that session |
-| `<prefix>` `n` / `p` | next / previous session by number — wraps at both ends |
+| `<prefix>` `n` | next session by number (wraps) |
+| `<prefix>` `p` | previous session by number (wraps) |
 | `<prefix>` `c` | set up a new session and attach to it — `Esc` goes back |
 | `<prefix>` `?` | show these keys — `Esc` goes back |
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
