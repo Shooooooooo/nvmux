@@ -102,8 +102,9 @@ pub(super) fn assert_no_colour(w: u16, h: u16, mut draw: impl FnMut(&mut Frame))
 
 /// Sizes every screen must survive: degenerate, one-row, and just big enough to
 /// tempt an off-by-one. Shared so a case added for one screen covers them all —
-/// `(10, 2)` was missing from one of the three copies this replaced.
-pub(super) const TINY_SIZES: &[(u16, u16)] =
+/// `(10, 2)` was missing from one of the three copies this replaced, and the
+/// attach notice (see [`crate::announce`]) draws on the same terminals.
+pub(crate) const TINY_SIZES: &[(u16, u16)] =
     &[(1, 1), (2, 1), (1, 2), (0, 0), (80, 1), (3, 3), (10, 2)];
 
 /// No screen draws a border: they are centred text on the terminal's own

@@ -209,6 +209,8 @@ mod tests {
             Key::Char(' '),
             Key::Char('d'),
             Key::Char('c'),
+            Key::Char('n'),
+            Key::Char('p'),
             Key::Up,
             Key::Backspace,
             Key::Other,
@@ -359,9 +361,15 @@ mod tests {
             .filter(|(_, l)| !l.is_empty())
             .map(|(i, _)| i)
             .collect();
+        // Derived rather than listed, so adding a binding does not turn a
+        // centring test into a counting one: the table is every row of
+        // `BINDINGS` plus the three fixed rules, and centring puts any odd row
+        // of slack at the bottom.
+        let rows = keys::BINDINGS.len() + 3;
+        let top = (10 - rows) / 2;
         assert_eq!(
             occupied,
-            vec![1, 2, 3, 4, 5, 6, 7],
+            (top..top + rows).collect::<Vec<_>>(),
             "table is not vertically centred: {lines:#?}"
         );
 

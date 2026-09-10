@@ -74,6 +74,13 @@ pub const PREFIX: u8 = CTRL_SPACE;
 /// in `--help`. A test ties it to [`PREFIX`].
 pub const PREFIX_LABEL: &str = "Ctrl-Space";
 
+/// Which way `<prefix> n` and `<prefix> p` step through the session list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Next,
+    Prev,
+}
+
 /// Something the proxy must do instead of forwarding bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -90,6 +97,11 @@ pub enum Action {
     /// one running. The only action with no [`BINDINGS`] row: one row cannot
     /// stand for nine keys, so digits are a rule in [`Prefix::feed`] instead.
     Switch(u32),
+    /// `<prefix> n` / `<prefix> p` — attach to the session either side of this
+    /// one in the picker's order, wrapping at both ends. One action rather than
+    /// two, so the direction stays a value all the way to the session loop
+    /// instead of being spelled out again at every hand-off.
+    Cycle(Direction),
 }
 
 /// One instruction from the machine, in order.
@@ -132,6 +144,16 @@ pub const BINDINGS: &[Binding] = &[
         key: b'c',
         action: Action::Create,
         help: "start a new session and attach to it",
+    },
+    Binding {
+        key: b'n',
+        action: Action::Cycle(Direction::Next),
+        help: "attach to the next session, wrapping",
+    },
+    Binding {
+        key: b'p',
+        action: Action::Cycle(Direction::Prev),
+        help: "attach to the previous session, wrapping",
     },
     Binding {
         key: b'?',
@@ -1152,12 +1174,50 @@ mod tests {
         let mut p = Prefix::new(0);
         // Literal bytes on purpose: this is what pins each letter to its
         // action, independently of what `BINDINGS` says.
-        let steps = p.feed(b"\x00 \x00d\x00c\x00?");
+        let steps = p.feed(b"\x00 \x00d\x00c\x00n\x00p\x00?");
         assert_eq!(
             actions(&steps),
-            vec![Action::Picker, Action::Detach, Action::Create, Action::Help]
+            vec![
+                Action::Picker,
+                Action::Detach,
+                Action::Create,
+                Action::Cycle(Direction::Next),
+                Action::Cycle(Direction::Prev),
+                Action::Help,
+            ]
         );
         assert!(forwarded(&steps).is_empty());
+    }
+
+    /// `n` and `p` are the two keys that name a *relative* target, so the
+    /// direction has to survive the machine rather than being decided later.
+    #[test]
+    fn n_and_p_step_forwards_and_backwards() {
+        for (key, want) in [(b'n', Direction::Next), (b'p', Direction::Prev)] {
+            let mut p = Prefix::new(0);
+            let steps = p.feed(&[PREFIX, key]);
+            assert_eq!(
+                actions(&steps),
+                vec![Action::Cycle(want)],
+                "{}",
+                key as char
+            );
+            assert!(
+                forwarded(&steps).is_empty(),
+                "{} must not also reach Neovim",
+                key as char
+            );
+        }
+    }
+
+    /// A doubled prefix is a literal before the table is consulted, so the two
+    /// new keys are still typable in the editor.
+    #[test]
+    fn a_literal_prefix_then_n_still_reaches_neovim() {
+        let mut p = Prefix::new(0);
+        let steps = p.feed(&[PREFIX, PREFIX, b'n']);
+        assert_eq!(forwarded(&steps), vec![PREFIX, b'n']);
+        assert!(actions(&steps).is_empty());
     }
 
     #[test]
@@ -1239,10 +1299,23 @@ mod tests {
     /// `feed` and a literal row on the help screen.
     #[test]
     fn the_table_binds_every_action_exactly_once() {
-        let all = [Action::Picker, Action::Detach, Action::Create, Action::Help];
+        let all = [
+            Action::Picker,
+            Action::Detach,
+            Action::Create,
+            Action::Cycle(Direction::Next),
+            Action::Cycle(Direction::Prev),
+            Action::Help,
+        ];
         for action in all {
             match action {
-                Action::Picker | Action::Detach | Action::Create | Action::Help => {}
+                // `Cycle` carries data and is still listed twice above: unlike a
+                // session number, each direction has one key of its own.
+                Action::Picker
+                | Action::Detach
+                | Action::Create
+                | Action::Cycle(_)
+                | Action::Help => {}
                 // Not in `all`: it carries a number, so it has no fixed key.
                 Action::Switch(_) => unreachable!("Switch is not a table action"),
             }

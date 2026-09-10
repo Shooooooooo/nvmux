@@ -257,7 +257,7 @@ fn centre_vertically(area: Rect, height: u16) -> Rect {
 /// Truncate to a display width, counting grapheme width rather than bytes or
 /// `char`s so CJK names and emoji do not overflow the block they were measured
 /// into.
-pub(super) fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.width() <= max {
         return s.to_string();
     }

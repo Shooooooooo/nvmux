@@ -152,14 +152,32 @@ one listing serves a whole directory, so a path costs about one round trip per
 | `<prefix>` `d` | detach — leaves the session running, exits nvmux |
 | `<prefix>` `Space` | back to the picker, session still attached |
 | `<prefix>` `1`, `2`, … `12` | switch straight to that session |
+| `<prefix>` `n` | next session by number — wraps at the end |
+| `<prefix>` `p` | previous session by number — wraps at the start |
 | `<prefix>` `c` | set up a new session and attach to it — `Esc` goes back |
 | `<prefix>` `?` | show these keys — `Esc` goes back |
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
 
+`<prefix> n` and `<prefix> p` walk the numbers in the order the picker lists
+them, wrapping at both ends, so you can step through every session without
+knowing a single number. One killed from somewhere else is simply skipped: you
+land on the nearest number that is still there.
+
+Landing somewhere new says so: the session's name appears in a box in the
+bottom-right corner for a moment, then goes. That happens whenever the session
+*changes* — a pick from the picker, `<prefix> 3`, `<prefix> n`, or a
+`<prefix> c` that created something — and never after `<prefix> Space` or
+`<prefix> ?`, which bring you back to the session you were already in. The box
+is nvmux's own: it is drawn straight to your terminal and taken off again by
+asking the server to repaint, so nothing is created in the editor and nothing is
+typed at it. `popup.duration_ms` in the [config](#configuration) changes how
+long it stays, and `0` turns it off.
+
 Everything else goes to Neovim untouched — including `Ctrl-c`, `Ctrl-z` and
 `Ctrl-s`, which reach the editor as ordinary keys rather than becoming signals
-for nvmux. Digits are the exception: `<prefix> 1` is a command now, so
-`<prefix> <prefix> 1` is how you send that to the editor.
+for nvmux. Digits, `n` and `p` are the exceptions: `<prefix> 1`, `<prefix> n`
+and `<prefix> p` are commands now, so `<prefix> <prefix> n` is how you send one
+of those to the editor.
 
 The prefix is recognised however your terminal spells it. Neovim asks every
 terminal for the kitty keyboard protocol (or xterm's `modifyOtherKeys`), and
@@ -210,6 +228,9 @@ timeout_ms = 500            # how long a lone prefix or half-typed number waits
 
 [session]
 command = "nvim --headless --listen {sock}"   # what a new session starts
+
+[popup]
+duration_ms = 1200          # how long the session notice stays; 0 turns it off
 ```
 
 ### The command a session runs

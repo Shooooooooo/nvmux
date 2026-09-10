@@ -4,10 +4,12 @@
 //! --remote-ui` does that, as a child on a PTY whose bytes pass through
 //! untouched. What is left is a picker ([`ui`]) and a PTY proxy ([`pty`]) that
 //! watches stdin for a `<prefix>` prefix ([`keys`]), however the terminal spells
-//! it ([`keyseq`]).
+//! it ([`keyseq`]) — plus, on a change of session, a brief notice saying which
+//! one you landed in ([`announce`]).
 //!
 //! macOS and Linux only.
 
+pub mod announce;
 pub mod cli;
 pub mod config;
 pub mod dirs;

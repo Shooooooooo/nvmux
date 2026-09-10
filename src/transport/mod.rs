@@ -284,6 +284,41 @@ pub(crate) fn next_free_num(existing: &[Session]) -> u32 {
     smallest_free(&taken)
 }
 
+/// The session `<prefix> n` / `<prefix> p` moves to from the one numbered
+/// `from`, wrapping at both ends.
+///
+/// By number rather than by position in the slice. The listing a caller hands
+/// in happens to be sorted ([`finish_listing`]), but nothing here leans on
+/// that, so the rule is the same whatever order it arrives in.
+///
+/// `from` is a pivot, not a member, and that is what makes the awkward case
+/// right without a special arm: press `n` in a session someone killed from
+/// another window and you land on the nearest number that still exists, rather
+/// than nowhere or back at the start.
+///
+/// `None` only for an empty listing. With one session it names that session,
+/// which the session loop then reuses the client for — nothing changes, and
+/// nothing is announced.
+pub fn neighbour(sessions: &[Session], from: u32, dir: crate::keys::Direction) -> Option<&Session> {
+    use crate::keys::Direction;
+    // Zero is "unnumbered", which `finish_listing` never leaves behind. Nobody
+    // can be sitting on one or have typed one, so it is not somewhere to land.
+    let numbered = || sessions.iter().filter(|s| s.state.num != 0);
+    // On the id as well as the number, so a duplicate — which only a listing
+    // built by hand can contain — still gives one deterministic answer.
+    let order = |a: &&Session, b: &&Session| (a.state.num, &a.id).cmp(&(b.state.num, &b.id));
+    match dir {
+        Direction::Next => numbered()
+            .filter(|s| s.state.num > from)
+            .min_by(order)
+            .or_else(|| numbered().min_by(order)),
+        Direction::Prev => numbered()
+            .filter(|s| s.state.num < from)
+            .max_by(order)
+            .or_else(|| numbered().max_by(order)),
+    }
+}
+
 /// The smallest positive integer not in `taken`. Linear in a list that is a
 /// handful of sessions long.
 fn smallest_free(taken: &[u32]) -> u32 {
@@ -296,6 +331,7 @@ fn smallest_free(taken: &[u32]) -> u32 {
 mod tests {
     use super::*;
     use crate::error::NvmuxError;
+    use crate::keys::Direction;
 
     #[test]
     fn a_taken_name_is_refused_case_insensitively_except_for_its_own_session() {
@@ -340,6 +376,101 @@ mod tests {
         let gapped: Vec<_> = all.into_iter().filter(|s| s.state.num != 2).collect();
         let (_, num) = plan_create(&gapped, "fresh").expect("planned");
         assert_eq!(num, 2, "the freed number is reused");
+    }
+
+    /// `<prefix> n` and `<prefix> p` must round the list and come back, or the
+    /// two keys would dead-end at either edge and the user would have to know a
+    /// number after all.
+    #[test]
+    fn stepping_wraps_at_both_ends() {
+        let all = finish_listing(vec![
+            session("aaaaaaaa", 1, 1),
+            session("bbbbbbbb", 2, 2),
+            session("cccccccc", 3, 3),
+        ]);
+        let step = |from, dir| neighbour(&all, from, dir).map(|s| s.state.num);
+
+        assert_eq!(step(1, Direction::Next), Some(2));
+        assert_eq!(step(2, Direction::Next), Some(3));
+        assert_eq!(step(3, Direction::Next), Some(1), "forwards off the end");
+        assert_eq!(step(1, Direction::Prev), Some(3), "backwards off the start");
+        assert_eq!(step(2, Direction::Prev), Some(1));
+    }
+
+    /// Numbering has gaps as soon as a session in the middle is killed, so
+    /// stepping cannot be `from + 1`: from 2 of {1, 2, 5} the next session is 5.
+    #[test]
+    fn stepping_crosses_a_gap_in_the_numbering() {
+        let all = finish_listing(vec![
+            session("aaaaaaaa", 1, 1),
+            session("bbbbbbbb", 2, 2),
+            session("cccccccc", 5, 3),
+        ]);
+        assert_eq!(
+            neighbour(&all, 2, Direction::Next).map(|s| s.state.num),
+            Some(5)
+        );
+        assert_eq!(
+            neighbour(&all, 5, Direction::Prev).map(|s| s.state.num),
+            Some(2)
+        );
+    }
+
+    /// A session killed from another window while this one was attached to it:
+    /// the number the user is on is no longer in the listing. Stepping must
+    /// still land somewhere, and the nearest number is a far better answer than
+    /// the start of the list.
+    #[test]
+    fn stepping_from_a_number_that_is_gone_lands_on_the_nearest_one_left() {
+        let all = finish_listing(vec![
+            session("aaaaaaaa", 1, 1),
+            session("bbbbbbbb", 2, 2),
+            session("dddddddd", 4, 3),
+        ]);
+        // 3 was killed underneath us.
+        assert_eq!(
+            neighbour(&all, 3, Direction::Next).map(|s| s.state.num),
+            Some(4)
+        );
+        assert_eq!(
+            neighbour(&all, 3, Direction::Prev).map(|s| s.state.num),
+            Some(2)
+        );
+        // Past either end it still wraps rather than giving up.
+        assert_eq!(
+            neighbour(&all, 9, Direction::Next).map(|s| s.state.num),
+            Some(1)
+        );
+        assert_eq!(
+            neighbour(&all, 0, Direction::Prev).map(|s| s.state.num),
+            Some(4)
+        );
+    }
+
+    /// An unnumbered session is one `finish_listing` never produces, and not
+    /// somewhere anyone could have typed their way to either.
+    #[test]
+    fn an_unnumbered_session_is_not_somewhere_to_land() {
+        let mut orphan = session("zzzzzzzz", 0, 9);
+        orphan.state.num = 0;
+        let mut one = session("aaaaaaaa", 1, 1);
+        one.state.num = 1;
+        let all = vec![one, orphan];
+        assert_eq!(
+            neighbour(&all, 1, Direction::Next).map(|s| s.id.clone()),
+            Some("aaaaaaaa".to_string())
+        );
+    }
+
+    /// One session is its own neighbour, which the session loop then reuses as
+    /// the client it already has: a no-op, not a reattach.
+    #[test]
+    fn stepping_with_one_session_stays_put_and_with_none_goes_nowhere() {
+        let one = finish_listing(vec![session("aaaaaaaa", 1, 1)]);
+        for dir in [Direction::Next, Direction::Prev] {
+            assert_eq!(neighbour(&one, 1, dir).map(|s| s.state.num), Some(1));
+            assert!(neighbour(&[], 1, dir).is_none());
+        }
     }
 
     /// `kill.sh` finds the process by its socket; a pid of 0 or 1 is never a
