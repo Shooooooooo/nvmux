@@ -17,12 +17,10 @@
 //! `nvim_ui_attach`, no `grid_line` handling and no grid diffing anywhere in
 //! this crate — `nvim --remote-ui` already is that client.
 //!
-//! The one thing that ever *joins* this direction is the attach notice, and
-//! only under `popup.style = "overlay"` (see [`crate::announce`]): a box, drawn
-//! once the child has been quiet long enough that it cannot be mid-sequence.
-//! Even then nothing is parsed — the safe moment is found with a clock, not a
-//! decoder — and the other styles have the editor draw the notice, so nothing
-//! is interleaved at all.
+//! The one thing that ever *joins* this direction is the attach notice (see
+//! [`crate::announce`]): a box, drawn once the child has been quiet long enough
+//! that it cannot be mid-sequence. Even then nothing is parsed — the safe
+//! moment is found with a clock, not a decoder.
 //!
 //! Three hazards that have no other home in the code:
 //!

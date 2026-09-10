@@ -84,9 +84,10 @@ for nvmux. Digits, `n` and `p` are the exceptions: `<prefix> 1`, `<prefix> n`
 and `<prefix> p` are commands now, so `<prefix> <prefix> n` is how you send one
 of those to the editor.
 
-Landing on a different session says so, in a box in the middle of the screen.
-`popup.duration_ms` in the [config](#configuration) changes how long it stays,
-and `0` turns it off.
+Landing on a different session says so, in a box in the middle of the screen
+for a second. The box is nvmux's own — drawn straight to your terminal and taken
+off again by asking the server to repaint — so nothing is created in the editor
+and nothing is typed at it.
 
 nvmux will not start inside a session — the outer proxy sees every `<prefix>`
 first, so an inner nvmux could be neither detached from nor left. To manage
@@ -117,7 +118,4 @@ timeout_ms = 500            # how long a lone prefix or half-typed number waits
 
 [session]
 command = "nvim --headless --listen {sock}"   # {sock} is required
-
-[popup]
-duration_ms = 1000          # how long the session notice stays; 0 turns it off
 ```
