@@ -63,40 +63,6 @@ The host string is handed to `ssh` verbatim, so a hostname, `user@host`, or any
 hardware keys, because nvmux drives your own ssh client rather than
 reimplementing it.
 
-### In the picker
-
-| Key | Action |
-|---|---|
-| `j` `k` `↓` `↑` `Ctrl-n` `Ctrl-p` | move (wraps) |
-| `g` `G` `Home` `End` | first / last |
-| `1`, `2`, … `12` | attach to the session with that number |
-| `Enter` | attach (or end a number early) |
-| `c` `r` `x` | new / rename / kill |
-| `Space` | pick the session up; `↑↓` move it, `Space` places it, `Esc` puts it back |
-| `/` | filter |
-| `?` | show the `<prefix>` keys |
-| `Esc` | clear the filter or a half-typed number, then go back to the session you came from |
-| `q` `Ctrl-c` | quit |
-
-`c` asks three things: what the session is called, how its Neovim is started, and
-where it runs. The last two arrive pre-filled and editable — the
-[command](#the-command-a-session-runs) you last used on that host, and your home
-directory there. `Enter` submits the whole form from any field, so `c` `Enter`
-creates a session in one keystroke.
-
-The directory is one on whichever machine runs the session, so `nvmux myhost`
-completes and starts paths on *myhost*, not here; one that is not there is
-refused before anything is started. `Tab` opens a fuzzily ranked completion menu
-— `nvmx` finds `nvmux-rs` — and listing runs beside the prompt, so typing is
-never slower even when the answer is coming over ssh. Typing `//` discards
-everything before it, so `/home/shu//etc` means `/etc`. A leading `~` is expanded
-against the session host's home directory; nothing else is expanded, for the
-reasons the command section gives.
-
-A session name is at most 64 bytes, has no leading or trailing whitespace and
-no control characters, and must not be in use — compared without regard to
-case.
-
 ### While attached
 
 `<prefix>` is `Ctrl-Space` unless you change it in the [config](#configuration).
@@ -159,51 +125,8 @@ prefix     = "Ctrl-Space"   # Ctrl-Space, or a Ctrl-<letter> chord
 timeout_ms = 500            # how long a lone prefix or half-typed number waits
 
 [session]
-command = "nvim --headless --listen {sock}"   # what a new session starts
+command = "nvim --headless --listen {sock}"   # {sock} is required
 
 [popup]
 duration_ms = 1000          # how long the session notice stays; 0 turns it off
 ```
-
-### The command a session runs
-
-`session.command` is the whole command line, and it is what the create prompt
-offers the first time. `{sock}` is required and stands for the session's socket:
-it is what `nvim` binds and what every later listing and kill finds the session
-by, so a line without it is refused rather than quietly repaired.
-
-The line is split into words the way a shell splits them — `'…'`, `"…"` and `\`
-all work — but **nothing is expanded**. There is no shell in the path to do it,
-which is also what keeps a command safe to send over ssh. So no globs, no
-`$VAR`, no `~`, and no leading `VAR=value`; write `env NAME=value nvim …` and
-spell the home directory out.
-
-```toml
-[session]
-command = "nvim --clean --headless --listen {sock}"
-# command = "/opt/nvim-nightly/bin/nvim --headless --listen {sock}"
-# command = "env NVIM_APPNAME=work nvim --headless --listen {sock}"
-```
-
-Neovim's version is checked as `nvim` on your `$PATH`, which is not necessarily
-the binary a custom command runs.
-
-### What nvmux remembers
-
-Change the command at the prompt and the next new session on that host offers it
-back. That is kept — per host, since a path to a nightly build on one machine
-means nothing on another — in `$NVMUX_STATE` if set, else
-`$XDG_STATE_HOME/nvmux/state.toml`, else `~/.local/state/nvmux/state.toml`.
-Deleting it only loses the suggestion, and a broken one is ignored rather than
-reported; the config file is the opposite on both counts, which is why they are
-separate.
-
-## Logs
-
-Everything nvmux runs lives under `/tmp/nvmux-<uid>` (the same rule on both
-ends, so a session's files stay in one place across logouts); nvmux's own log
-is `nvmux.log` there, and each session's server output is `<id>.log` — beside
-`<id>.json`, which records the command that produced it and the directory it
-started in. The verbosity comes
-from `$NVMUX_LOG`, in `RUST_LOG` syntax, and defaults to warnings only.
-Keystrokes are never logged.
