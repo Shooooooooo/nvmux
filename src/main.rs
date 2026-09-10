@@ -277,7 +277,7 @@ fn new_attachment(
     let sock = transport.local_socket_for(session)?;
     // Every spawn is a change of session — the loop above reuses the client
     // otherwise — so the notice is unconditional here and one-shot there.
-    let notice = announce::label(session.state.num, &session.name);
+    let notice = announce::label(&session.name);
     pty::spawn(&session.id, &sock, &notice)
 }
 

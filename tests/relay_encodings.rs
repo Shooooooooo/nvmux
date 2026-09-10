@@ -64,10 +64,10 @@ fn relay_child() {
     // These tests are about the prefix reaching the machine, not about the
     // attach notice; a box drawn over the screen would be noise in the stream
     // the parent is reading.
-    settings.popup.style = nvmux::config::PopupStyle::Off;
+    settings.popup.duration_ms = 0;
     nvmux::config::init(settings);
 
-    let attachment = nvmux::pty::spawn(&id, Path::new(&sock), "1  relay").expect("attach");
+    let attachment = nvmux::pty::spawn(&id, Path::new(&sock), "relay").expect("attach");
     let code = match nvmux::pty::relay(attachment, 0) {
         Ok((nvmux::pty::Outcome::Detached, _)) => 0,
         Ok((other, _)) => {

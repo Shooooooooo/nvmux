@@ -544,12 +544,7 @@ fn pump(
         // size is read here rather than once outside the loop, so a resize
         // between the drawing and the erasing is seen by both.
         if let Some(p) = popup.as_mut() {
-            let act = p.step(
-                Instant::now(),
-                child_spoke,
-                &attachment.sock,
-                term::terminal_size(),
-            );
+            let act = p.step(Instant::now(), child_spoke, term::terminal_size());
             match act {
                 announce::Act::Idle => {}
                 announce::Act::Paint(bytes) => {

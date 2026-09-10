@@ -7,52 +7,41 @@
 //! through without looking at them, so there is nothing to composite into and
 //! nothing to read back.
 //!
-//! Three mechanisms answer that, and the config file chooses between them (see
-//! [`crate::config::PopupStyle`]) because none of them is obviously right:
+//! So nvmux writes a box over the session's screen itself, and
+//! [`crate::pty`]'s `repaint` then puts back what it covered — the same request
+//! a resume makes, since only the server knows what was underneath. No editor
+//! state is touched: nothing is created in the session, nothing is typed at it,
+//! and a wedged editor is announced over as readily as an idle one.
 //!
-//! * **`overlay`** — nvmux writes a box over the session's screen itself, and
-//!   `pty::repaint` then puts back what it covered: the same request a resume
-//!   makes, since only the server knows what was underneath. It touches no
-//!   editor state at all, and it is the only one that still says something when
-//!   the editor is wedged. It is also the only one that writes into the
-//!   child-to-terminal direction — see the carve-out in [`crate::pty`]'s module
-//!   docs.
-//! * **`float`** — the session's own Neovim opens a floating window and closes
-//!   it on its own timer. Never torn, never covered, correct by construction —
-//!   at the cost of nvmux putting a scratch buffer and a window inside the
-//!   user's editor.
-//! * **`echo`** — one line on the message row. The least intrusive by a wide
-//!   margin, and the least like a popup.
+//! Two other shapes were built and compared before this one was kept. Neovim
+//! could open a floating window over RPC, or print a line on the message row;
+//! both are drawn by the editor, so neither can be torn or covered, and neither
+//! needs erasing. Both were dropped for the same reason: a session manager that
+//! creates windows in your editor, or writes on the row your editor talks to
+//! you on, has stopped being a proxy. What is left is the one that draws on the
+//! terminal nvmux already owns the bytes of.
 //!
 //! # The lull
 //!
-//! All three fire at the same moment: the first pass of the relay loop on which
-//! the child has been quiet for [`SETTLE`]. For `overlay` that is the *only*
-//! safe moment — `pump` never parses the child's output, so it cannot otherwise
-//! know that a write of its own would not land in the middle of one of the
-//! child's escape sequences, and a lull is the one state where it cannot. For
-//! `echo` it matters for a different reason: a message emitted before the new UI
-//! has attached is a message to nobody. For `float` it makes no difference, and
-//! one rule is better than three.
+//! The box goes up on the first pass of the relay loop on which the child has
+//! been quiet for [`SETTLE`]. That is the *only* safe moment: `pump` never
+//! parses the child's output, so it cannot otherwise know that a write of its
+//! own would not land in the middle of one of the child's escape sequences, and
+//! a lull is the one state where it cannot.
 //!
 //! If no lull arrives within [`GIVE_UP`], nothing is shown. A screen that has
 //! been busy for two solid seconds is one where a box dropped on top is as
 //! likely to be corruption as information, and the name is not worth that.
 //!
-//! Nothing here is ever worth delaying or failing an attach for. Every failure
-//! — a terminal too small for the box, an editor too busy to answer — is
-//! silence.
+//! Nothing here is ever worth delaying or failing an attach for. A terminal too
+//! small for the box, a screen that never settles: both are silence.
 
-use std::path::Path;
 use std::time::{Duration, Instant};
 
-use rmpv::Value;
 use unicode_width::UnicodeWidthStr;
 
-use crate::config::PopupStyle;
 use crate::pty::PtySize;
-use crate::rpc;
-use crate::ui::draw::{truncate, NUM_GAP};
+use crate::ui::draw::truncate;
 
 /// How long the child must have been quiet before the announcement is shown.
 ///
@@ -74,19 +63,22 @@ const PAD: usize = 1;
 const MIN_COLS: u16 = 5;
 const MIN_ROWS: u16 = 3;
 
-/// `2  dotfiles` — a picker row without its selection marker.
+/// What the box says: the session's name, and nothing else.
 ///
-/// The gap comes from the picker itself, so the list and the announcement
-/// cannot come to spell a session differently.
+/// Not the number. The number is how you *reach* a session — it is on the
+/// picker's rows and it is what `<prefix> 3` takes — but this box is answering
+/// a different question, asked after you have arrived, and a name answers it on
+/// its own. `<prefix> n` and `<prefix> p` are exactly the keys that make the
+/// number beside the answer noise: they are how you get somewhere without
+/// naming a number in the first place.
 ///
 /// Control characters are dropped. [`crate::session::validate_name`] already
 /// refuses them, but it guards the *creating* path only: `<id>.json` is a file
 /// on disk that a person can write, and this is the one place a name reaches a
 /// raw terminal — `OPOST` off, no escaping between here and the wire — where an
 /// escape sequence smuggled into a name would be executed rather than shown.
-pub fn label(num: u32, name: &str) -> String {
-    let name: String = name.chars().filter(|c| !c.is_control()).collect();
-    format!("{num}{NUM_GAP}{name}")
+pub fn label(name: &str) -> String {
+    name.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// What the relay must do about the announcement on this pass of its loop.
@@ -116,7 +108,6 @@ pub enum Act {
 #[derive(Debug)]
 pub struct Popup {
     label: String,
-    style: PopupStyle,
     duration: Duration,
     /// When the child was last seen with nothing to say, or `None` if it spoke
     /// on the last pass.
@@ -131,16 +122,20 @@ pub struct Popup {
 }
 
 impl Popup {
-    /// `None` when there is nothing to say, or the configured style says
-    /// nothing — so the relay carries no state at all for a user who turned
-    /// this off.
+    /// `None` when there is nothing to say, or `popup.duration_ms` is zero — so
+    /// the relay carries no state at all for a user who turned this off.
     pub fn arm(label: Option<String>, now: Instant) -> Option<Self> {
-        let settings = crate::config::popup();
-        let label = label.filter(|_| settings.style != PopupStyle::Off)?;
+        Self::lasting(label, crate::config::get().popup.duration_ms, now)
+    }
+
+    /// The rule on its own, so the off switch is reachable from a test without
+    /// setting the process-wide config — which is a `OnceLock`, and so would
+    /// decide it for every other test in the binary too.
+    fn lasting(label: Option<String>, duration_ms: u64, now: Instant) -> Option<Self> {
+        let label = label.filter(|_| duration_ms > 0)?;
         Some(Self {
             label,
-            style: settings.style,
-            duration: Duration::from_millis(settings.duration_ms),
+            duration: Duration::from_millis(duration_ms),
             quiet_since: Some(now),
             give_up_at: now + GIVE_UP,
             until: None,
@@ -161,11 +156,7 @@ impl Popup {
 
     /// One pass of the relay loop. `child_spoke` is whether the pty master had
     /// anything for the terminal this time round.
-    ///
-    /// `sock` is the session's socket, used only by the two editor-side styles.
-    /// They are asked exactly once, as a notification, so an editor that is busy
-    /// cannot make the relay wait — see [`crate::rpc::Client::notify`].
-    pub fn step(&mut self, now: Instant, child_spoke: bool, sock: &Path, size: PtySize) -> Act {
+    pub fn step(&mut self, now: Instant, child_spoke: bool, size: PtySize) -> Act {
         if child_spoke {
             self.quiet_since = None;
             // Whatever was on screen may have been drawn over.
@@ -190,29 +181,17 @@ impl Popup {
             };
         }
 
-        match self.style {
-            // `arm` refuses to build one of these, so this is unreachable in
-            // practice; saying `Done` rather than panicking keeps a config
-            // reloaded mid-relay from taking a session with it.
-            PopupStyle::Off => Act::Done,
-            PopupStyle::Float | PopupStyle::Echo => {
-                via_nvim(self.style, sock, &self.label, self.duration, size);
-                Act::Done
-            }
-            PopupStyle::Overlay => {
-                if self.painted {
-                    return Act::Idle;
-                }
-                let Some(bytes) = overlay_bytes(&self.label, size) else {
-                    // Too small to draw on. Saying nothing is the right answer,
-                    // and there is nothing to erase either.
-                    return Act::Done;
-                };
-                self.painted = true;
-                self.until.get_or_insert(now + self.duration);
-                Act::Paint(bytes)
-            }
+        if self.painted {
+            return Act::Idle;
         }
+        let Some(bytes) = overlay_bytes(&self.label, size) else {
+            // Too small to draw on. Saying nothing is the right answer, and
+            // there is nothing to erase either.
+            return Act::Done;
+        };
+        self.painted = true;
+        self.until.get_or_insert(now + self.duration);
+        Act::Paint(bytes)
     }
 }
 
@@ -281,103 +260,6 @@ pub fn overlay_bytes(label: &str, size: PtySize) -> Option<Vec<u8>> {
     Some(out.into_bytes())
 }
 
-/// Ask the session's Neovim to show the announcement itself.
-///
-/// Best effort, exactly like [`crate::transport::install_detach_alias`]: a
-/// session that cannot be reached simply says nothing, and the attach carries
-/// on.
-fn via_nvim(style: PopupStyle, sock: &Path, label: &str, duration: Duration, size: PtySize) {
-    let (method, params) = match style {
-        PopupStyle::Float => (
-            "nvim_exec_lua",
-            vec![
-                Value::String(FLOAT_LUA.into()),
-                // The label is an *argument*, never spliced into the source, so
-                // there is no quoting question to get wrong.
-                Value::Array(vec![
-                    Value::String(label.into()),
-                    Value::from(duration.as_millis().min(u128::from(u64::MAX)) as u64),
-                ]),
-            ],
-        ),
-        PopupStyle::Echo => (
-            "nvim_echo",
-            vec![
-                // A one-element chunk: no highlight group, so this stays as
-                // colourless as everything else nvmux puts on a screen.
-                Value::Array(vec![Value::Array(vec![Value::String(
-                    echo_label(label, size.cols).into(),
-                )])]),
-                // Not in `:messages`: an announcement is not history.
-                Value::Boolean(false),
-                Value::Map(vec![]),
-            ],
-        ),
-        PopupStyle::Overlay | PopupStyle::Off => return,
-    };
-
-    let send = || -> Result<(), crate::error::RpcError> {
-        let mut client = rpc::Client::connect(sock, rpc::CONNECT_TIMEOUT)?;
-        client.notify(method, params)
-    };
-    if let Err(e) = send() {
-        tracing::debug!(error = %e, method, "could not announce the session");
-    }
-}
-
-/// Keep an echoed name short enough that Neovim does not turn it into a
-/// hit-enter prompt.
-///
-/// A name may be 64 bytes, which is wider than a narrow terminal; a message that
-/// does not fit on the message row stops the editor dead until the user presses
-/// return, which is a great deal worse than not knowing the session's name. The
-/// margin covers the `-- INSERT --`-sized furniture the row may already carry.
-fn echo_label(label: &str, cols: u16) -> String {
-    truncate(label, usize::from(cols.saturating_sub(12)).max(1))
-}
-
-/// Opened unfocused, with `noautocmd` so nothing in the user's config sees a
-/// window come and go, and closed by a timer *inside* Neovim — so it disappears
-/// on time even if nvmux is killed first.
-///
-/// Wrapped in `pcall` throughout: a notification is not answered, so an error
-/// raised in here has nowhere to go except the user's own message row, which
-/// would make a cosmetic feature into an irritation.
-const FLOAT_LUA: &str = r#"
-local label, ms = ...
-pcall(function()
-  if vim.o.columns < 8 or vim.o.lines < 5 then return end
-  local width = math.min(vim.fn.strdisplaywidth(label) + 2, vim.o.columns - 4)
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { ' ' .. label .. ' ' })
-  local ok, win = pcall(vim.api.nvim_open_win, buf, false, {
-    relative = 'editor',
-    width = width,
-    height = 1,
-    -- The same corner the overlay uses, so switching styles compares the
-    -- mechanism and not the placement. Counted back from the far edges: three
-    -- rows for the bordered box and one for the command line, and two columns
-    -- for the border. Clamped, since a narrow editor would otherwise ask for a
-    -- negative position.
-    row = math.max(0, vim.o.lines - 4),
-    col = math.max(0, vim.o.columns - width - 2),
-    style = 'minimal',
-    border = 'rounded',
-    focusable = false,
-    noautocmd = true,
-    zindex = 300,
-  })
-  if not ok then
-    pcall(vim.api.nvim_buf_delete, buf, { force = true })
-    return
-  end
-  vim.defer_fn(function()
-    pcall(vim.api.nvim_win_close, win, true)
-    pcall(vim.api.nvim_buf_delete, buf, { force = true })
-  end, ms)
-end)
-"#;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,12 +272,6 @@ mod tests {
             pixel_width: 0,
             pixel_height: 0,
         }
-    }
-
-    /// A pty socket that is not there, so the two editor-side styles fail fast
-    /// and the state machine can be driven without a Neovim.
-    fn nowhere() -> &'static Path {
-        Path::new("/nonexistent/nvmux-test.sock")
     }
 
     /// Split what `overlay_bytes` emits into `(row, column)` placements and the
@@ -427,10 +303,14 @@ mod tests {
         placed(bytes).into_iter().map(|(_, row)| row).collect()
     }
 
+    /// The name, and only the name. The number belongs on the picker's rows and
+    /// in `<prefix> 3`, where it is how you reach a session; here it would be
+    /// beside an answer that does not need it.
     #[test]
-    fn the_label_reads_like_a_picker_row() {
-        assert_eq!(label(2, "dotfiles"), format!("2{NUM_GAP}dotfiles"));
-        assert_eq!(label(12, "api server"), format!("12{NUM_GAP}api server"));
+    fn the_label_is_the_name_and_nothing_else() {
+        assert_eq!(label("dotfiles"), "dotfiles");
+        assert_eq!(label("api server"), "api server");
+        assert_eq!(label("日本語"), "日本語");
     }
 
     /// `validate_name` guards the creating path, not `<id>.json`, which is a
@@ -439,11 +319,23 @@ mod tests {
     /// be executed rather than shown.
     #[test]
     fn a_control_character_in_a_name_cannot_reach_the_terminal() {
-        let sneaky = label(1, "ok\x1b[31mred\x07\n");
+        let sneaky = label("ok\x1b[31mred\x07\n");
         assert!(!sneaky.contains('\x1b'), "{sneaky:?}");
         assert!(!sneaky.contains('\x07'), "{sneaky:?}");
         assert!(!sneaky.contains('\n'), "{sneaky:?}");
-        assert_eq!(sneaky, format!("1{NUM_GAP}ok[31mred"));
+        assert_eq!(sneaky, "ok[31mred");
+    }
+
+    /// Zero is the off switch, and the only one — so it has to stop the popup
+    /// being built at all rather than build one that expires immediately, which
+    /// would paint and erase on the same pass and cost a repaint for nothing.
+    #[test]
+    fn a_duration_of_zero_arms_nothing() {
+        let now = Instant::now();
+        assert!(Popup::lasting(Some(label("dotfiles")), 0, now).is_none());
+        assert!(Popup::lasting(Some(label("dotfiles")), 1, now).is_some());
+        // And nothing to say is nothing to say, however long it would last.
+        assert!(Popup::lasting(None, 1200, now).is_none());
     }
 
     /// The cursor and the editor's own attributes have to come back exactly as
@@ -566,7 +458,6 @@ mod tests {
         let t0 = Instant::now();
         let mut popup = Popup {
             label: "2  dotfiles".into(),
-            style: PopupStyle::Overlay,
             duration: Duration::from_millis(1000),
             quiet_since: Some(t0),
             give_up_at: t0 + GIVE_UP,
@@ -577,43 +468,40 @@ mod tests {
 
         // Still chattering: nothing is drawn, however long it goes on.
         for ms in [10, 100, 500] {
-            let act = popup.step(t0 + Duration::from_millis(ms), true, nowhere(), big);
+            let act = popup.step(t0 + Duration::from_millis(ms), true, big);
             assert_eq!(act, Act::Idle, "drew at {ms}ms while the child was talking");
         }
         // Quiet, but not yet long enough.
         assert_eq!(
-            popup.step(t0 + Duration::from_millis(510), false, nowhere(), big),
+            popup.step(t0 + Duration::from_millis(510), false, big),
             Act::Idle
         );
         // Quiet for a whole SETTLE: now it paints, and the clock starts here.
         let painted = t0 + Duration::from_millis(600);
-        assert!(matches!(
-            popup.step(painted, false, nowhere(), big),
-            Act::Paint(_)
-        ));
+        assert!(matches!(popup.step(painted, false, big), Act::Paint(_)));
         assert_eq!(popup.until, Some(painted + Duration::from_millis(1000)));
 
         // A repaint by the editor puts the box back at the *next* lull — one
         // whole SETTLE later, not the first pass after it — without buying the
         // box any more time on screen.
         assert_eq!(
-            popup.step(painted + Duration::from_millis(10), true, nowhere(), big),
+            popup.step(painted + Duration::from_millis(10), true, big),
             Act::Idle
         );
         assert_eq!(
-            popup.step(painted + Duration::from_millis(20), false, nowhere(), big),
+            popup.step(painted + Duration::from_millis(20), false, big),
             Act::Idle,
             "one quiet pass is not a lull"
         );
         assert!(matches!(
-            popup.step(painted + Duration::from_millis(60), false, nowhere(), big),
+            popup.step(painted + Duration::from_millis(60), false, big),
             Act::Paint(_)
         ));
         assert_eq!(popup.until, Some(painted + Duration::from_millis(1000)));
 
         // And it ends on time regardless.
         assert_eq!(
-            popup.step(painted + Duration::from_millis(1001), false, nowhere(), big),
+            popup.step(painted + Duration::from_millis(1001), false, big),
             Act::Erase
         );
     }
@@ -625,7 +513,6 @@ mod tests {
         let t0 = Instant::now();
         let mut popup = Popup {
             label: "2  dotfiles".into(),
-            style: PopupStyle::Overlay,
             duration: Duration::from_millis(1000),
             quiet_since: Some(t0),
             give_up_at: t0 + GIVE_UP,
@@ -636,89 +523,12 @@ mod tests {
         let mut at = t0;
         while at + Duration::from_millis(10) < t0 + GIVE_UP {
             at += Duration::from_millis(10);
-            assert_eq!(popup.step(at, true, nowhere(), big), Act::Idle, "at {at:?}");
+            assert_eq!(popup.step(at, true, big), Act::Idle, "at {at:?}");
         }
         assert_eq!(
-            popup.step(t0 + GIVE_UP, true, nowhere(), big),
+            popup.step(t0 + GIVE_UP, true, big),
             Act::Done,
             "it must stop trying rather than draw onto a busy screen"
         );
-    }
-
-    /// The two editor-side styles are asked once and then finished: nvmux has
-    /// nothing more to draw and nothing to erase.
-    #[test]
-    fn the_editor_side_styles_ask_once_and_are_done() {
-        let t0 = Instant::now();
-        for style in [PopupStyle::Float, PopupStyle::Echo] {
-            let mut popup = Popup {
-                label: "2  dotfiles".into(),
-                style,
-                duration: Duration::from_millis(1000),
-                quiet_since: Some(t0),
-                give_up_at: t0 + GIVE_UP,
-                until: None,
-                painted: false,
-            };
-            assert_eq!(
-                popup.step(
-                    t0 + Duration::from_millis(1),
-                    false,
-                    nowhere(),
-                    size(80, 24)
-                ),
-                Act::Idle,
-                "{style:?} spoke before the lull"
-            );
-            assert_eq!(
-                popup.step(t0 + SETTLE, false, nowhere(), size(80, 24)),
-                Act::Done,
-                "{style:?} should ask the editor and finish"
-            );
-        }
-    }
-
-    /// A name may be 64 bytes; a message too wide for the row stops the editor
-    /// dead on a hit-enter prompt, which is far worse than not knowing which
-    /// session you are in.
-    #[test]
-    fn an_echoed_name_is_kept_short_enough_not_to_stop_the_editor() {
-        let long = label(1, &"x".repeat(64));
-        for cols in [20u16, 40, 80, 200] {
-            let shown = echo_label(&long, cols);
-            assert!(
-                shown.width() + 12 <= usize::from(cols).max(13),
-                "{cols} columns: {shown:?}"
-            );
-        }
-        // Even an absurdly narrow terminal gets something rather than nothing.
-        assert!(!echo_label(&long, 1).is_empty());
-    }
-
-    /// The label is an argument, never spliced into the source: that is what
-    /// removes every quoting question from a name that may contain quotes,
-    /// backslashes and brackets.
-    #[test]
-    fn the_float_lua_takes_the_label_as_an_argument() {
-        assert!(FLOAT_LUA.contains("local label, ms = ..."), "{FLOAT_LUA}");
-        assert!(!FLOAT_LUA.contains("{}"), "nothing is formatted into it");
-    }
-
-    /// Each of these is load-bearing: focus must not move, the user's autocmds
-    /// must not fire, and an error in here has nowhere to go but the user's own
-    /// message row, because a notification is never answered.
-    #[test]
-    fn the_float_never_takes_focus_and_never_raises_into_the_users_editor() {
-        for needle in [
-            "focusable = false",
-            "noautocmd = true",
-            "style = 'minimal'",
-            "zindex = 300",
-            "pcall(vim.api.nvim_open_win, buf, false,",
-            "pcall(",
-            "vim.defer_fn(",
-        ] {
-            assert!(FLOAT_LUA.contains(needle), "the float lost {needle:?}");
-        }
     }
 }

@@ -49,10 +49,8 @@ const CURSOR: &str = "▋";
 const MIN_LIST_WIDTH: u16 = 4;
 const MAX_LIST_WIDTH: u16 = 48;
 
-/// Columns between the number and the name. Not private: the attach-time
-/// announcement spells a session the same way the picker's rows do, and two
-/// copies of this would drift.
-pub(crate) const NUM_GAP: &str = "  ";
+/// Columns between the number and the name.
+const NUM_GAP: &str = "  ";
 
 /// Sixty-nine columns, and it used to be sixty exactly — the widest row that
 /// still fits a small terminal without truncation. `␣ order` is what that budget

@@ -163,12 +163,15 @@ them, wrapping at both ends, so you can step through every session without
 knowing a single number. One killed from somewhere else is simply skipped: you
 land on the nearest number that is still there.
 
-Landing somewhere new says so: the session's number and name appear for a
-moment, then go. That happens whenever the session *changes* — a pick from the
-picker, `<prefix> 3`, `<prefix> n`, or a `<prefix> c` that created something —
-and never after `<prefix> Space` or `<prefix> ?`, which bring you back to the
-session you were already in. See [the config](#how-a-change-of-session-announces-itself)
-for the three ways it can be drawn, and for turning it off.
+Landing somewhere new says so: the session's name appears in a box in the
+bottom-right corner for a moment, then goes. That happens whenever the session
+*changes* — a pick from the picker, `<prefix> 3`, `<prefix> n`, or a
+`<prefix> c` that created something — and never after `<prefix> Space` or
+`<prefix> ?`, which bring you back to the session you were already in. The box
+is nvmux's own: it is drawn straight to your terminal and taken off again by
+asking the server to repaint, so nothing is created in the editor and nothing is
+typed at it. `popup.duration_ms` in the [config](#configuration) changes how
+long it stays, and `0` turns it off.
 
 Everything else goes to Neovim untouched — including `Ctrl-c`, `Ctrl-z` and
 `Ctrl-s`, which reach the editor as ordinary keys rather than becoming signals
@@ -227,8 +230,7 @@ timeout_ms = 500            # how long a lone prefix or half-typed number waits
 command = "nvim --headless --listen {sock}"   # what a new session starts
 
 [popup]
-style       = "overlay"     # how a change of session announces itself
-duration_ms = 1200          # how long the notice stays — not used by "echo"
+duration_ms = 1200          # how long the session notice stays; 0 turns it off
 ```
 
 ### The command a session runs
@@ -254,28 +256,6 @@ command = "nvim --clean --headless --listen {sock}"
 Neovim's version is checked as `nvim` on your `$PATH`, which is not necessarily
 the binary a custom command runs. A command that names nothing is reported as
 soon as the session is created, not after a timeout.
-
-### How a change of session announces itself
-
-`popup.style` picks between three genuinely different mechanisms, or none of
-them. They differ because while a session is attached nvmux owns no cells at
-all — Neovim draws the screen and nvmux passes the bytes through:
-
-- `overlay` — nvmux draws the box itself, over whatever is on screen. Nothing in
-  the editor is touched, and it is the only one that still says something when
-  the editor is wedged. It is also the only one that writes into the stream
-  between Neovim and your terminal, so a repaint can cover it early.
-- `float` — the session's own Neovim opens a small floating window and closes it
-  on its own timer. Never torn and never covered, at the cost of nvmux putting a
-  scratch buffer and a window inside your editor.
-- `echo` — one line on the message row, with no `:messages` trace. The least
-  intrusive by far. It stays until the editor writes over it, so `duration_ms`
-  does not apply.
-- `off` — nothing.
-
-`$NVMUX_POPUP` overrides `style` for one run, so the three can be compared
-without editing this file. It is a switch rather than configuration: an
-unrecognised value is warned about and ignored, where the file would refuse it.
 
 ### What nvmux remembers
 
