@@ -255,7 +255,7 @@ const HANDOVER: &[u8] = b"\x1b[?2026l\x1b[0m\x1b[?1049l\x1b[2J\x1b[H";
 ///
 /// **Belongs before the next client is spawned, never after.** Whatever is on
 /// the terminal stays there until this runs, and on a switch that is the session
-/// being switched away from — so with this on the far side of a spawn (three RPC
+/// being switched away from — so with this on the far side of a spawn (two RPC
 /// round trips and a whole new `nvim` process) the old session is what the user
 /// watches for the length of the switch. The callers are therefore the picker
 /// and the prompt as they give the terminal back, `<prefix> <number>` as it

@@ -134,7 +134,7 @@ impl Screen {
     /// Not `ratatui::try_restore()`: that leaves the alternate screen and stops,
     /// which uncovers the screen this one was drawn over — the session being
     /// switched away from — and nothing erases it until the next relay begins.
-    /// The spawn in between is three RPC round trips and a fresh `nvim` process,
+    /// The spawn in between is two RPC round trips and a fresh `nvim` process,
     /// so that stale frame is what the user watches for the whole switch.
     ///
     /// `try_restore` is exactly `disable_raw_mode` plus `\e[?1049l`, and that
