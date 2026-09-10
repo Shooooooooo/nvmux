@@ -1,0 +1,232 @@
+//! Listing directories on the host that will run the session.
+//!
+//! The completion half of the local/remote seam. [`Transport`] answers questions
+//! about sessions; this answers the one question the create prompt asks about
+//! the host itself — what is inside this directory — and it is separate for one
+//! reason: it has to leave the transport behind.
+//!
+//! [`Transport`] is a `Box<dyn Transport>` held by the picker and is not `Send`.
+//! Completion runs on a worker thread (see [`crate::ui::complete`], which
+//! explains why), and a thread cannot borrow the picker's transport. So each
+//! transport hands out a [`DirSource`] instead: a small, owned, `Send` handle
+//! carrying just enough to ask the same host again. Locally that is nothing at
+//! all; over ssh it is the host and the `ControlPath` of the master connection
+//! the transport already brought up, so a listing is a new invocation on an
+//! existing connection rather than a new connection.
+//!
+//! # One script, both hosts
+//!
+//! Neither arm reimplements directory listing: both run `scripts/dirs.sh`, the
+//! local one through `/bin/sh` exactly as [`crate::transport::local`] runs every
+//! other script. So the dotfile rule, the sort order, the cap and the handling
+//! of odd names are one implementation and cannot drift between local and
+//! remote — which they would, silently, if the local side used `read_dir`.
+//!
+//! The measured cost of the local fork is what makes that affordable: it is a
+//! millisecond or so against `read_dir`'s tenth of one, and neither is on the
+//! keypress path at all, because a worker thread is what calls this.
+
+use std::path::PathBuf;
+
+use crate::error::Result;
+use crate::ssh::Ssh;
+use crate::transport::protocol::{self, Listing};
+use crate::{proc, shell};
+
+/// A `Send` handle that can list directories on one session host.
+///
+/// Cheap to make and cheap to hold: the ssh arm is a hostname and a path, not a
+/// connection. Cloneable so a prompt can keep one and give the worker another.
+#[derive(Debug, Clone)]
+pub enum DirSource {
+    Local,
+    Ssh { host: String, control_path: PathBuf },
+}
+
+impl DirSource {
+    /// Every subdirectory of `dir`, dotted ones included.
+    ///
+    /// The whole directory rather than a filtered slice of it, because the
+    /// matching is fuzzy and lives in [`crate::ui::complete`]: a subsequence
+    /// match cannot be expressed as a shell pattern, since the first character
+    /// typed need not be the first character of the name. That is also what lets
+    /// one answer serve every keystroke inside a directory rather than only the
+    /// ones that extend the same prefix.
+    ///
+    /// Dotted names come back and are hidden further up, where a query can ask
+    /// for them. The rule is the shell's either way; only the place it is
+    /// applied has moved.
+    ///
+    /// A directory that is not there is an empty listing, not an error: at a
+    /// prompt, half a path is the normal state of the input, and every keystroke
+    /// on the way to a real directory passes through one that is not there yet.
+    pub fn children(&self, dir: &str) -> Result<Listing> {
+        let out = match self {
+            DirSource::Local => proc::run_local(shell::DIRS_SCRIPT, &[dir])?,
+            // Unattended: nobody is watching this run, and there is no
+            // terminal to answer a passphrase prompt on — see `ssh::unattended`.
+            DirSource::Ssh { host, control_path } => {
+                Ssh::new(host.clone(), control_path.clone())
+                    .run_script_unattended(shell::DIRS_SCRIPT, &[dir])?
+            }
+        };
+        protocol::parse_dirs(&out.stdout)
+    }
+}
+
+/// Split a typed path into the part that no longer counts and the part that does.
+///
+/// `//` means "start again from the root", so everything up to and including the
+/// last one is inert: `/home/shu//etc` is `/etc`, with `/home/shu/` left behind.
+/// It is what the prompt offers instead of making the user delete a path to get
+/// out of it, and the field draws the inert half dim so it reads as what it is.
+///
+/// **The live half is what must reach the session host.** POSIX reads `a//b` as
+/// `a/b`, so `cd /home/shu//etc` would land in `/home/shu/etc` — a real
+/// directory, the wrong one, and silently. Resolving the convention here, before
+/// anything leaves the prompt, is what makes it safe to offer.
+///
+/// The split falls *between* the two slashes, so the live half keeps a leading
+/// one and is therefore still absolute.
+pub fn anchored(input: &str) -> (&str, &str) {
+    match input.rfind("//") {
+        Some(at) => input.split_at(at + 1),
+        None => ("", input),
+    }
+}
+
+/// Split what has been typed into the directory to list and the name to match
+/// inside it.
+///
+/// The split is at the last `/`, which is what makes the listing reusable: every
+/// keystroke inside one directory asks about the same directory, so the answer
+/// can be kept and filtered rather than asked for again.
+///
+/// A path with no `/` at all has no directory to list — the field's rule is that
+/// a directory is absolute, so there is no relative one to resolve against — and
+/// this returns `None` rather than inventing a root to search.
+pub fn split(input: &str) -> Option<(&str, &str)> {
+    let at = input.rfind('/')?;
+    let (dir, rest) = input.split_at(at);
+    // `/etc` splits into `/` and `etc`, not `` and `etc`: the root is a real
+    // directory and `""` is not one.
+    let dir = if dir.is_empty() { "/" } else { dir };
+    Some((dir, &rest[1..]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_double_slash_starts_again_from_the_root() {
+        // The case the prompt exists to serve: out of home, to somewhere else.
+        assert_eq!(anchored("/home/shu//etc"), ("/home/shu/", "/etc"));
+        // Everything discarded is inert, not just the home part of it.
+        assert_eq!(
+            anchored("/home/shu/projects//etc"),
+            ("/home/shu/projects/", "/etc")
+        );
+        // The last one wins, so changing your mind twice still works.
+        assert_eq!(anchored("/a//b//c"), ("/a//b/", "/c"));
+        // A bare `//` is the root itself.
+        assert_eq!(anchored("//"), ("/", "/"));
+        // Three in a row is the same answer: the split is at the last pair.
+        assert_eq!(anchored("///etc"), ("//", "/etc"));
+        // Nothing to discard, so nothing is inert and nothing draws dim.
+        assert_eq!(anchored("/home/shu/projects"), ("", "/home/shu/projects"));
+        assert_eq!(anchored("/"), ("", "/"));
+        assert_eq!(anchored(""), ("", ""));
+        // A trailing `//` is still the root, mid-typing.
+        assert_eq!(anchored("/home/shu//"), ("/home/shu/", "/"));
+    }
+
+    /// The live half keeps its leading slash, so what comes out of `anchored` is
+    /// still an absolute path — which is the one thing `validate_directory` will
+    /// not accept a substitute for.
+    #[test]
+    fn what_a_double_slash_leaves_behind_is_still_absolute() {
+        for input in ["/home/shu//etc", "//", "///x", "/a//b//c"] {
+            let (_, live) = anchored(input);
+            assert!(live.starts_with('/'), "{input:?} left {live:?}");
+        }
+    }
+
+    #[test]
+    fn a_path_is_split_into_the_directory_to_list_and_the_name_to_match() {
+        assert_eq!(split("/home/you/pro"), Some(("/home/you", "pro")));
+        assert_eq!(split("/home/you/"), Some(("/home/you", "")));
+        assert_eq!(split("/etc"), Some(("/", "etc")));
+        assert_eq!(split("/"), Some(("/", "")));
+        // Nothing to list, and nothing invented to list instead.
+        assert_eq!(split("home"), None);
+        assert_eq!(split(""), None);
+    }
+
+    /// A name with a space in it is one name. The split is on `/` alone, so
+    /// this is only worth pinning because a whitespace-splitting version would
+    /// pass every other test here.
+    #[test]
+    fn a_directory_name_with_a_space_in_it_survives_the_split() {
+        assert_eq!(split("/home/you/my pro"), Some(("/home/you", "my pro")));
+    }
+
+    /// The local arm runs the same script the remote one does, so this is also
+    /// the test that the script's contract holds as embedded rather than as it
+    /// sits in the checkout.
+    #[test]
+    fn the_local_source_lists_every_child_including_the_dotted_ones() {
+        let root =
+            std::env::temp_dir().join(format!("nvmux-dirs-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&root);
+        for name in ["alpha", "beta", "beta-two", ".hidden"] {
+            std::fs::create_dir_all(root.join(name)).expect("make a directory");
+        }
+        std::fs::write(root.join("a-file"), b"not a directory").expect("write a file");
+        let dir = root.to_string_lossy().into_owned();
+
+        let all = DirSource::Local.children(&dir).expect("list");
+        assert_eq!(
+            all.names,
+            ["alpha", "beta", "beta-two", ".hidden"],
+            "every directory and no files; dotted ones last, and hidden further up"
+        );
+        assert!(!all.truncated);
+        assert!(
+            !all.names.iter().any(|n| n == "." || n == ".."),
+            "`.` and `..` are never completions: {:?}",
+            all.names
+        );
+
+        // Half-typed paths are the normal state of a prompt, not an error.
+        let missing = DirSource::Local
+            .children(&root.join("nope").to_string_lossy())
+            .expect("a directory that is not there is an empty answer");
+        assert!(missing.names.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Names a shell would otherwise split on or treat as a pattern. Each one
+    /// is a real directory somebody could have, and each would be a different
+    /// bug in the framing between the host and here.
+    #[test]
+    fn odd_directory_names_survive_the_listing() {
+        let root =
+            std::env::temp_dir().join(format!("nvmux-dirs-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&root);
+        for name in ["a b", "c*d", "c?d", "cxd"] {
+            std::fs::create_dir_all(root.join(name)).expect("make a directory");
+        }
+        let dir = root.to_string_lossy().into_owned();
+
+        let all = DirSource::Local.children(&dir).expect("list");
+        assert_eq!(
+            all.names,
+            ["a b", "c*d", "c?d", "cxd"],
+            "a name with a space is one name, and a `*` is a character"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

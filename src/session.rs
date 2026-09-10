@@ -73,9 +73,15 @@ pub struct Session {
     /// it. Empty for metadata written before the field existed, and for orphans.
     #[serde(default)]
     pub command: String,
+    /// The directory the session's Neovim was started in, absolute and on the
+    /// host that runs it. A record in the same sense as `command`: nothing
+    /// re-enters it, and the picker does not show it. Empty for metadata written
+    /// before the field existed, and for orphans.
+    #[serde(default)]
+    pub directory: String,
 
     /// Probe results. Never serialised: the on-disk shape stays exactly the
-    /// six keys above.
+    /// seven keys above.
     #[serde(skip)]
     pub state: SessionState,
 }
@@ -89,6 +95,7 @@ impl Session {
             pid,
             num,
             command: String::new(),
+            directory: String::new(),
             state: SessionState::default(),
         }
     }
@@ -97,6 +104,12 @@ impl Session {
     /// session reconstructed from a listing have no command to record.
     pub fn launched_with(mut self, command: &str) -> Self {
         self.command = command.to_string();
+        self
+    }
+
+    /// Record where it was launched, for the same reason and on the same terms.
+    pub fn started_in(mut self, directory: &str) -> Self {
+        self.directory = directory.to_string();
         self
     }
 
@@ -169,6 +182,66 @@ pub fn validate_name(name: &str) -> Result<(), SessionError> {
     Ok(())
 }
 
+/// Validate a user-supplied working directory, and expand a leading `~`.
+///
+/// Returns the path as it should be sent to the session host: absolute, so that
+/// `scripts/spawn.sh` has nothing left to resolve and no shell is needed to
+/// resolve it. `home` is the *session host's* home directory — the local `$HOME`
+/// for a local session, and what `scripts/hello.sh` reported for a remote one.
+/// A path on one machine means nothing on another, so expanding against ours
+/// would be quietly wrong over ssh.
+///
+/// This is the one expansion nvmux performs anywhere, and it is deliberately
+/// narrow: `~` and `~/…` only, never `~user`, no globs, no `$VAR`. It is
+/// possible here for the reason [`crate::launch`] says it is not possible for a
+/// command line — nvmux *knows* this answer, so nothing has to be handed to a
+/// shell to find it out.
+pub fn validate_directory(directory: &str, home: &str) -> Result<String, SessionError> {
+    let invalid = |reason| {
+        Err(SessionError::InvalidDirectory {
+            directory: directory.to_string(),
+            reason,
+        })
+    };
+
+    let directory = directory.trim();
+    if directory.is_empty() {
+        return invalid("must not be empty");
+    }
+    // Generous: this is a path, and PATH_MAX is 4096 on Linux. The cap is here
+    // so that a pasted runaway is refused at the prompt rather than by execve.
+    if directory.len() > 4096 {
+        return invalid("must be 4096 bytes or fewer");
+    }
+    // The same rule a name and a command live by: this is drawn on the prompt
+    // and could otherwise smuggle escape sequences into the terminal.
+    if directory.chars().any(is_unrenderable) {
+        return invalid("must not contain control or invisible formatting characters");
+    }
+
+    let expanded = match directory.strip_prefix('~') {
+        // `~user` is somebody else's home directory, which only the host can
+        // resolve. Refused rather than passed through as a literal directory
+        // named `~someone`, which is what would otherwise be created-or-missing.
+        Some(rest) if !rest.is_empty() && !rest.starts_with('/') => {
+            return invalid("~user is not expanded — spell the path out")
+        }
+        Some(_) if home.is_empty() => {
+            return invalid("~ cannot be expanded: the host reported no home directory")
+        }
+        Some(rest) => format!("{}{rest}", home.trim_end_matches('/')),
+        None => directory.to_string(),
+    };
+
+    if !expanded.starts_with('/') {
+        return invalid(
+            "must be an absolute path — a relative one would be resolved against \
+             whatever directory the session host's shell happened to be in",
+        );
+    }
+    Ok(expanded)
+}
+
 /// A character that a session listing cannot show honestly: a control
 /// character, or one of the zero-width and bidirectional-formatting characters
 /// that change how the *surrounding* text reads without occupying a cell.
@@ -195,16 +268,128 @@ mod tests {
     use super::*;
 
     #[test]
-    fn json_has_exactly_the_six_documented_keys() {
+    fn json_has_exactly_the_seven_documented_keys() {
         let s = Session::new("abcdefgh".into(), "dotfiles".into(), 4242, 3)
-            .launched_with(crate::launch::DEFAULT);
+            .launched_with(crate::launch::DEFAULT)
+            .started_in("/home/you/src");
         let v: serde_json::Value =
             serde_json::from_str(&s.to_json().expect("serialise")).expect("json");
         let obj = v.as_object().expect("object");
         let mut keys: Vec<_> = obj.keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["command", "created", "id", "name", "num", "pid"]);
+        assert_eq!(
+            keys,
+            [
+                "command",
+                "created",
+                "directory",
+                "id",
+                "name",
+                "num",
+                "pid"
+            ]
+        );
         assert_eq!(v["command"], crate::launch::DEFAULT);
+        assert_eq!(v["directory"], "/home/you/src");
+    }
+
+    /// Metadata written before either field existed still loads: both are
+    /// `#[serde(default)]`, so an older session keeps working rather than
+    /// becoming an unreadable file the picker refuses to list.
+    #[test]
+    fn metadata_from_before_these_fields_existed_still_loads() {
+        let older = br#"{"id":"abcdefgh","name":"legacy","created":1,"pid":7}"#;
+        let s = Session::from_json(older, std::path::Path::new("x.json")).expect("parse");
+        assert_eq!(s.name, "legacy");
+        assert!(s.command.is_empty());
+        assert!(s.directory.is_empty());
+        assert_eq!(s.num, 0);
+    }
+
+    /// A relative directory is the one rule a directory has that a name and a
+    /// command do not, and it exists because of what would happen if it did
+    /// not: the session would start somewhere nobody chose.
+    #[test]
+    fn a_relative_working_directory_is_refused_and_says_why() {
+        let err = validate_directory("src", "/home/you").expect_err("relative");
+        assert!(
+            matches!(err, SessionError::InvalidDirectory { reason, .. } if reason.contains("absolute")),
+            "{err}"
+        );
+        assert!(validate_directory("./src", "/home/you").is_err());
+        assert!(validate_directory("", "/home/you").is_err(), "empty");
+        assert!(
+            validate_directory("   ", "/home/you").is_err(),
+            "whitespace"
+        );
+        assert!(
+            validate_directory("/home/you\u{7}", "/home/you").is_err(),
+            "a control character must be refused as it is in a name"
+        );
+        assert!(
+            validate_directory(&"/".repeat(5000), "/home/you").is_err(),
+            "overlong"
+        );
+    }
+
+    /// `~` is expanded against the *session host's* home, which over ssh is not
+    /// ours. Expanding against ours would send a path that means nothing there,
+    /// and it would look right in the prompt while doing it.
+    #[test]
+    fn a_tilde_is_expanded_against_the_hosts_home_not_ours() {
+        assert_eq!(validate_directory("~", "/home/them").unwrap(), "/home/them");
+        assert_eq!(
+            validate_directory("~/src/nvmux", "/home/them").unwrap(),
+            "/home/them/src/nvmux"
+        );
+        // A trailing slash on the host's answer must not double up.
+        assert_eq!(
+            validate_directory("~/src", "/home/them/").unwrap(),
+            "/home/them/src"
+        );
+        // An absolute path is passed through untouched, tilde or no tilde.
+        assert_eq!(
+            validate_directory("/srv/www", "/home/them").unwrap(),
+            "/srv/www"
+        );
+        // A tilde inside the path is an ordinary character, not an expansion.
+        assert_eq!(
+            validate_directory("/tmp/~x", "/home/them").unwrap(),
+            "/tmp/~x"
+        );
+        // Trimmed like every other typed value.
+        assert_eq!(
+            validate_directory("  /srv  ", "/home/them").unwrap(),
+            "/srv"
+        );
+    }
+
+    /// Only `~` and `~/…`. `~someone` is a question only the host can answer,
+    /// and passing it through would name a directory that is almost certainly
+    /// not there — reported as "not a directory", which explains nothing.
+    #[test]
+    fn a_tilde_naming_another_user_is_refused_rather_than_passed_through() {
+        let err = validate_directory("~root/src", "/home/them").expect_err("~user");
+        assert!(
+            matches!(err, SessionError::InvalidDirectory { reason, .. } if reason.contains("~user")),
+            "{err}"
+        );
+    }
+
+    /// A host that could not say where home is must not have one invented for
+    /// it. The prompt offers no default in that case, and a typed `~` is a
+    /// question nvmux cannot answer either.
+    #[test]
+    fn a_tilde_is_refused_when_the_host_reported_no_home() {
+        let err = validate_directory("~/src", "").expect_err("no home");
+        assert!(
+            matches!(err, SessionError::InvalidDirectory { reason, .. } if reason.contains("home")),
+            "{err}"
+        );
+        assert!(
+            validate_directory("/srv", "").is_ok(),
+            "an absolute path never needed the home directory"
+        );
     }
 
     /// The resolved number is display state, and a rename over ssh writes an

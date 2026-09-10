@@ -88,7 +88,9 @@ fn a_session_created_over_ssh_is_reachable_through_the_forward() {
     let name = unique("reach");
     let _guard = Cleanup::of([&name]);
 
-    let session = t.create_session(&name, &common::launch()).expect("create");
+    let session = t
+        .create_session(&name, &common::launch(), common::anywhere())
+        .expect("create");
     assert!(
         session.pid > 1,
         "spawn should report a validated remote pid"
@@ -125,7 +127,9 @@ fn a_remote_session_outlives_the_transport_that_made_it() {
 
     let id = {
         let t = SshTransport::new(host()).expect("connect");
-        let s = t.create_session(&name, &common::launch()).expect("create");
+        let s = t
+            .create_session(&name, &common::launch(), common::anywhere())
+            .expect("create");
         s.id
     }; // transport dropped, ssh commands finished
 
@@ -147,7 +151,9 @@ fn a_forward_can_be_torn_down_and_rebuilt() {
     let name = unique("reforward");
     let _guard = Cleanup::of([&name]);
 
-    let session = t.create_session(&name, &common::launch()).expect("create");
+    let session = t
+        .create_session(&name, &common::launch(), common::anywhere())
+        .expect("create");
     let first = t.local_socket_for(&session).expect("forward");
     assert!(first.exists());
 
@@ -172,7 +178,9 @@ fn renaming_a_remote_session_moves_no_socket() {
     let name = unique("rename");
     let _guard = Cleanup::of([name.clone(), format!("{name}-after")]);
 
-    let session = t.create_session(&name, &common::launch()).expect("create");
+    let session = t
+        .create_session(&name, &common::launch(), common::anywhere())
+        .expect("create");
     let before = t.local_socket_for(&session).expect("forward");
 
     let after_name = format!("{name}-after");
@@ -196,7 +204,9 @@ fn killing_a_remote_session_removes_it_and_its_forward() {
     // session would otherwise outlive the run on the remote host.
     let _guard = Cleanup::of([&name]);
 
-    let session = t.create_session(&name, &common::launch()).expect("create");
+    let session = t
+        .create_session(&name, &common::launch(), common::anywhere())
+        .expect("create");
     let sock = t.local_socket_for(&session).expect("forward");
     assert!(sock.exists());
 
@@ -224,7 +234,9 @@ fn remote_names_with_shell_metacharacters_survive() {
     let name = format!("{} $(id) 'q' \"d\"", unique("quote"));
     let _guard = Cleanup::of([unique("quote")]);
 
-    let session = t.create_session(&name, &common::launch()).expect("create");
+    let session = t
+        .create_session(&name, &common::launch(), common::anywhere())
+        .expect("create");
     let found = common::find_by_id(&t, &session.id).expect("listed");
     assert_eq!(
         found.name, name,
@@ -258,7 +270,9 @@ fn a_listing_keeps_live_forwards_and_removes_orphaned_ones() {
     let name = unique("sweep");
     let _guard = Cleanup::of([&name]);
 
-    let session = t.create_session(&name, &common::launch()).expect("create");
+    let session = t
+        .create_session(&name, &common::launch(), common::anywhere())
+        .expect("create");
     let live = t.local_socket_for(&session).expect("forward");
     assert!(live.exists());
 
@@ -290,7 +304,9 @@ fn a_chosen_command_runs_on_the_remote_host_with_its_arguments_intact() {
     let _guard = Cleanup::of([&name]);
 
     let launch = common::launch_with("--clean");
-    let session = t.create_session(&name, &launch).expect("create");
+    let session = t
+        .create_session(&name, &launch, common::anywhere())
+        .expect("create");
 
     // Asked of the remote host, since that is where the process is.
     let remote = std::process::Command::new("ssh")

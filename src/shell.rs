@@ -101,10 +101,19 @@ pub const WRITE_META_SCRIPT: &str = script!("../scripts/write_meta.sh");
 /// there — see the comment it carries about orphans.
 pub const RENUMBER_SCRIPT: &str = script!("../scripts/renumber.sh");
 
+/// Lists the subdirectories of one directory, for the create prompt's
+/// completion.
+///
+/// Batch-shaped like [`LIST_SCRIPT`] and for the same reason: one invocation
+/// answers for a whole directory, so typing a path costs about one round trip
+/// per `/` rather than one per keystroke.
+pub const DIRS_SCRIPT: &str = script!("../scripts/dirs.sh");
+
 /// Every script, for the tests that check all of them the same way.
 #[cfg(test)]
 const SCRIPTS: &[(&str, &str)] = &[
     ("list.sh", LIST_SCRIPT),
+    ("dirs.sh", DIRS_SCRIPT),
     ("spawn.sh", SPAWN_SCRIPT),
     ("kill.sh", KILL_SCRIPT),
     ("hello.sh", HELLO_SCRIPT),
@@ -593,6 +602,7 @@ mod tests {
             &[
                 &dir.to_string_lossy(),
                 "aaaaaaaa",
+                "/",
                 "/bin/sh",
                 "-c",
                 STANDIN,
@@ -633,6 +643,7 @@ mod tests {
             &[
                 &dir.to_string_lossy(),
                 "aaaaaaaa",
+                "/",
                 "nvmux-no-such-editor",
                 "--listen",
                 "/tmp/x.sock",

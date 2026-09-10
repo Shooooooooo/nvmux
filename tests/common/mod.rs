@@ -28,6 +28,16 @@ pub fn launch() -> Launch {
     Launch::parse(nvmux::launch::DEFAULT).expect("the built-in default must parse")
 }
 
+/// The working directory for a test that does not care which one it gets.
+///
+/// `/` rather than the scratch directory: it exists on both hosts a test may
+/// run against, needs no setup, and cannot be swept away by a `Scratch` drop
+/// while a session is still sitting in it. The tests that *do* care name their
+/// own directory, and say why.
+pub fn anywhere() -> &'static str {
+    "/"
+}
+
 /// A launch command with extra arguments spliced in, for the tests that check
 /// the chosen command really is what runs.
 pub fn launch_with(args: &str) -> Launch {

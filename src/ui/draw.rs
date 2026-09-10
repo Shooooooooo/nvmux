@@ -226,7 +226,7 @@ fn draw_bottom(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Keep `selected` visible within a window of `height` rows.
-fn scroll_offset(selected: usize, total: usize, height: usize) -> usize {
+pub(super) fn scroll_offset(selected: usize, total: usize, height: usize) -> usize {
     if height == 0 || total <= height {
         return 0;
     }

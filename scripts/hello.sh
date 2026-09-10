@@ -6,6 +6,7 @@
 #
 # Output:
 #   DIR  <runtime directory>
+#   HOME <the home directory of the user these sessions run as>
 #   NVIM <first line of `nvim --version`, or empty if not on PATH>
 #
 # followed by everything list.sh prints for the directory just named, that
@@ -39,6 +40,22 @@ fi
 # $XDG_RUNTIME_DIR is not consulted.
 dir="/tmp/nvmux-$(id -u)"
 printf 'DIR %s\n' "$dir"
+
+# Where a new session starts unless the user says otherwise, and what a leading
+# `~` at the prompt expands to. Asked of the host rather than assumed, because
+# `nvmux myhost` is a different machine's accounts: our own $HOME says nothing
+# about theirs.
+#
+# `$HOME` rather than a lookup in the password database: this runs inside the
+# user's login shell, so it is the same answer their own shell would give, and it
+# honours a home directory that shell chose to change. Printed empty rather than
+# guessed at if it is unset or relative -- the Rust side treats an empty answer as
+# "no default to offer", which is honest, where a guess would be a wrong path
+# offered as if nvmux knew it.
+case "${HOME:-}" in
+  /*) printf 'HOME %s\n' "$HOME" ;;
+  *) printf 'HOME\n' ;;
+esac
 
 if command -v nvim >/dev/null 2>&1; then
   printf 'NVIM %s\n' "$(nvim --version 2>/dev/null | head -1)"

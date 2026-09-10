@@ -17,6 +17,11 @@ clap = { version = "4", default-features = false, features = [
 ] }
 getrandom = "0.4"
 libc = "0.2"
+# Ranks the create prompt's directory completions. Its own two dependencies,
+# `memchr` and `unicode-segmentation`, were already in this tree, so it adds
+# exactly one crate to the build graph -- which is what made it worth taking
+# rather than hand-rolling a subsequence scorer.
+nucleo-matcher = "0.3"
 nix = { version = "0.31", default-features = false, features = [
     "fs", "process", "signal", "term", "user",
 ] }

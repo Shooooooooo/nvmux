@@ -20,6 +20,9 @@ pub struct LocalTransport {
     dir: PathBuf,
     /// `dir` as the scripts take it. Built once; every script run needs it.
     dir_arg: String,
+    /// This user's home directory, or empty if `$HOME` is unset or relative.
+    /// The local answer to the question `scripts/hello.sh` asks a remote host.
+    home: String,
 }
 
 impl LocalTransport {
@@ -36,6 +39,7 @@ impl LocalTransport {
             dir_arg: dir.to_string_lossy().into_owned(),
             location: Location::Local,
             dir,
+            home: home_dir(),
         })
     }
 
@@ -158,7 +162,15 @@ impl Transport for LocalTransport {
         Ok(finish_listing(alive))
     }
 
-    fn create_session(&self, name: &str, launch: &Launch) -> Result<Session> {
+    fn home(&self) -> &str {
+        &self.home
+    }
+
+    fn dir_source(&self) -> crate::dirs::DirSource {
+        crate::dirs::DirSource::Local
+    }
+
+    fn create_session(&self, name: &str, launch: &Launch, directory: &str) -> Result<Session> {
         // The listing is also what the new session's number is allocated
         // from, so numbering costs no extra work here.
         let (id, num) = plan_create(&self.list_sessions()?, name)?;
@@ -168,10 +180,10 @@ impl Transport for LocalTransport {
         // already computed the path, and `SessionPaths::new` has bounded its
         // length, which the script has no way to do.
         let argv = launch.argv_for(&paths.sock.to_string_lossy());
-        let mut args: Vec<&str> = vec![&self.dir_arg, &id];
+        let mut args: Vec<&str> = vec![&self.dir_arg, &id, directory];
         args.extend(argv.iter().map(String::as_str));
 
-        tracing::info!(%id, name, command = launch.line(), "spawning session");
+        tracing::info!(%id, name, command = launch.line(), directory, "spawning session");
         let out = proc::run_local(shell::SPAWN_SCRIPT, &args)?;
         let spawned = protocol::parse_spawn(&out.stdout)?;
 
@@ -201,7 +213,8 @@ impl Transport for LocalTransport {
         }
 
         let mut session = Session::new(id, name.to_string(), spawned.pid.unwrap_or(0), num)
-            .launched_with(launch.line());
+            .launched_with(launch.line())
+            .started_in(directory);
         session.write_atomic(&paths.json)?;
         // The caller attaches to this without re-listing, so give it the same
         // resolved number a listing would have.
@@ -278,5 +291,18 @@ impl Transport for LocalTransport {
         // Locally the identity function; the SSH implementation is where this
         // seam earns its keep.
         Ok(self.paths(&s.id)?.sock)
+    }
+}
+
+/// This machine's home directory, as a session host would report it.
+///
+/// `$HOME` rather than the password database, matching what `scripts/hello.sh`
+/// reads on a remote host and for the same reason: it is the answer the user's
+/// own shell would give. Anything unset or relative is no answer at all, and an
+/// empty string says so rather than standing in for one.
+fn home_dir() -> String {
+    match std::env::var_os("HOME") {
+        Some(h) if Path::new(&h).is_absolute() => h.to_string_lossy().into_owned(),
+        _ => String::new(),
     }
 }

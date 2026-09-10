@@ -36,6 +36,10 @@ pub struct SshTransport {
     local_dir: PathBuf,
     /// The runtime directory on the host that owns the nvim processes.
     remote_dir: String,
+    /// That host's home directory, from the same greeting, or empty if it could
+    /// not say. A path on this machine means nothing over there, so this is the
+    /// only home directory a remote session may be started in by default.
+    remote_home: String,
     /// Sessions whose sockets are already forwarded, so re-attaching does not
     /// pay for a redundant round trip.
     forwarded: Mutex<HashSet<String>>,
@@ -114,6 +118,7 @@ impl SshTransport {
             host_token,
             local_dir,
             remote_dir: probe.runtime_dir,
+            remote_home: probe.home,
             forwarded: Mutex::new(HashSet::new()),
             first_listing: Mutex::new(Some(out.stdout)),
         })
@@ -246,7 +251,21 @@ impl Transport for SshTransport {
         Ok(finish_listing(sessions))
     }
 
-    fn create_session(&self, name: &str, launch: &Launch) -> Result<Session> {
+    fn home(&self) -> &str {
+        &self.remote_home
+    }
+
+    /// Onto the master this transport already brought up, not a new connection:
+    /// the `ControlPath` is the whole handle, and `ssh` finds the live master
+    /// through it.
+    fn dir_source(&self) -> crate::dirs::DirSource {
+        crate::dirs::DirSource::Ssh {
+            host: self.ssh.host().to_string(),
+            control_path: self.ssh.control_path().to_path_buf(),
+        }
+    }
+
+    fn create_session(&self, name: &str, launch: &Launch, directory: &str) -> Result<Session> {
         // The listing doubles as the source of the new session's number; see the
         // local transport.
         let (id, num) = plan_create(&self.list_sessions()?, name)?;
@@ -258,10 +277,10 @@ impl Transport for SshTransport {
         // The *remote* socket: the command runs over there. Every word travels
         // as its own argument, quoted by `ssh::exec_args` for both shell layers.
         let argv = launch.argv_for(&remote_sock.to_string_lossy());
-        let mut args: Vec<&str> = vec![&self.remote_dir, &id];
+        let mut args: Vec<&str> = vec![&self.remote_dir, &id, directory];
         args.extend(argv.iter().map(String::as_str));
 
-        tracing::info!(host = %self.host(), %id, name, command = launch.line(), "spawning remote session");
+        tracing::info!(host = %self.host(), %id, name, command = launch.line(), directory, "spawning remote session");
         let out = self.run_script(shell::SPAWN_SCRIPT, &args)?;
         let spawned = protocol::parse_spawn(&out.stdout)?;
 
@@ -301,7 +320,8 @@ impl Transport for SshTransport {
         }
 
         let mut session = Session::new(id.clone(), name.to_string(), spawned.pid.unwrap_or(0), num)
-            .launched_with(launch.line());
+            .launched_with(launch.line())
+            .started_in(directory);
         let json = session.to_json()?;
         let out = self.run_script(shell::WRITE_META_SCRIPT, &[&self.remote_dir, &id, &json])?;
         protocol::require_terminator(&out.stdout, "metadata write")?;

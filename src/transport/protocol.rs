@@ -136,6 +136,50 @@ pub fn parse_renumber(stdout: &str) -> Result<()> {
     require_terminator(stdout, "renumber")
 }
 
+/// The subdirectories of one directory, as `dirs.sh` listed them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Listing {
+    /// Their names, not their paths, in the order the host produced them —
+    /// which is `LC_ALL=C` glob order, so it is the same order on every host.
+    pub names: Vec<String>,
+    /// The host had more to say and stopped at its cap. A partial answer, which
+    /// matters to the caller: it may be shown, but it must not be filtered down
+    /// for a longer prefix, because what it is missing may be exactly what a
+    /// longer prefix wanted.
+    pub truncated: bool,
+}
+
+/// Read `dirs.sh`'s output.
+///
+/// Unrecognised lines are ignored for the reason [`parse_listing`] gives: this
+/// runs through the user's login shell, and a profile banner must not cost them
+/// their completions.
+pub fn parse_dirs(stdout: &str) -> Result<Listing> {
+    require_terminator(stdout, "directory listing")?;
+    let mut out = Listing::default();
+
+    for line in stdout.lines() {
+        let line = line.trim_end_matches('\r');
+        if line == "TRUNCATED" {
+            out.truncated = true;
+            continue;
+        }
+        // `splitn(2)` so a name containing a tab arrives whole. The script skips
+        // a name containing a newline, which is the one character that could
+        // break the framing; a tab cannot.
+        let mut fields = line.splitn(2, '\t');
+        if fields.next() != Some("D") {
+            continue;
+        }
+        match fields.next() {
+            Some(name) if !name.is_empty() => out.names.push(name.to_string()),
+            _ => tracing::debug!(line, "ignoring a nameless record from dirs.sh"),
+        }
+    }
+
+    Ok(out)
+}
+
 /// What `hello.sh` reported about a session host.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HostProbe {
@@ -143,13 +187,21 @@ pub struct HostProbe {
     pub runtime_dir: String,
     /// The first line of `nvim --version`, empty if nvim is not on PATH there.
     pub nvim_banner: String,
+    /// The home directory of the user the sessions run as, empty if the host
+    /// could not say. Where a new session starts unless the user says
+    /// otherwise; never guessed at from ours, which is a different machine's.
+    pub home: String,
 }
 
 /// Read the greeting out of `hello.sh`'s output.
 ///
-/// That output carries a listing after the two lines read here — the whole
+/// That output carries a listing after the few lines read here — the whole
 /// point of the script — so this ignores everything it does not recognise, and
 /// [`parse_listing`] reads the same bytes for the other half.
+///
+/// Only the runtime directory is required. A missing `HOME` is a host that could
+/// not say, or an older `hello.sh` than this nvmux, and costs a default rather
+/// than a connection.
 pub fn parse_probe(stdout: &str) -> Result<HostProbe> {
     require_terminator(stdout, "probe")?;
     let mut out = HostProbe::default();
@@ -159,6 +211,8 @@ pub fn parse_probe(stdout: &str) -> Result<HostProbe> {
             out.runtime_dir = v.trim().to_string();
         } else if let Some(v) = line.strip_prefix("NVIM ") {
             out.nvim_banner = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("HOME ") {
+            out.home = v.trim().to_string();
         }
     }
     if out.runtime_dir.is_empty() {
@@ -505,8 +559,10 @@ mod tests {
 
     #[test]
     fn parses_a_host_probe() {
-        let p = parse_probe("DIR /tmp/nvmux-501\nNVIM NVIM v0.11.4\nNVMUX_END\n").expect("parse");
+        let p = parse_probe("DIR /tmp/nvmux-501\nHOME /home/them\nNVIM NVIM v0.11.4\nNVMUX_END\n")
+            .expect("parse");
         assert_eq!(p.runtime_dir, "/tmp/nvmux-501");
+        assert_eq!(p.home, "/home/them");
         assert_eq!(p.nvim_banner, "NVIM v0.11.4");
     }
 
@@ -526,6 +582,74 @@ mod tests {
                    NVMUX_END\n";
         let p = parse_probe(out).expect("parse");
         assert_eq!(p.runtime_dir, "/tmp/nvmux-1000");
+    }
+
+    #[test]
+    fn parses_a_directory_listing() {
+        let out = "D\talpha\nD\tbeta\nNVMUX_END\n";
+        let l = parse_dirs(out).expect("parse");
+        assert_eq!(l.names, ["alpha", "beta"]);
+        assert!(!l.truncated);
+    }
+
+    /// The cap is what keeps a huge directory from becoming a huge transfer,
+    /// and the flag is what stops the caller filtering a partial answer down
+    /// for a longer prefix — which would silently hide directories that are
+    /// there.
+    #[test]
+    fn a_truncated_directory_listing_says_so() {
+        let l = parse_dirs("D\ta\nTRUNCATED\nNVMUX_END\n").expect("parse");
+        assert_eq!(l.names, ["a"]);
+        assert!(l.truncated);
+    }
+
+    /// This runs through the user's login shell, so a profile banner or a
+    /// warning must cost them nothing. The same rule the session listing lives
+    /// by.
+    #[test]
+    fn a_directory_listing_ignores_anything_that_is_not_a_record() {
+        let out = "Welcome to example.com\n\
+                   D\tsrc\n\
+                   S\tabcdefgh\t1\t{}\n\
+                   D\n\
+                   \n\
+                   NVMUX_END\n";
+        let l = parse_dirs(out).expect("parse");
+        assert_eq!(l.names, ["src"], "only D records, and only named ones");
+    }
+
+    /// A name containing a tab arrives whole: the split is on the first one, so
+    /// everything after it is the name. `dirs.sh` skips the one character that
+    /// could break the framing, a newline, and a tab is not it.
+    #[test]
+    fn a_directory_name_containing_a_tab_survives() {
+        let l = parse_dirs("D\ta\tb\nNVMUX_END\n").expect("parse");
+        assert_eq!(l.names, ["a\tb"]);
+    }
+
+    #[test]
+    fn a_directory_listing_without_a_terminator_is_an_error() {
+        assert!(parse_dirs("D\tsrc\n").is_err(), "no terminator");
+        // An empty directory is a valid answer; an empty *output* is not, and
+        // is what `ssh -n` produces when the script never ran at all.
+        assert!(parse_dirs("NVMUX_END\n").expect("parse").names.is_empty());
+        assert!(parse_dirs("").is_err());
+    }
+
+    /// A host that could not say where home is — `$HOME` unset or relative, or
+    /// an older `hello.sh` than this nvmux — still opens. Only the runtime
+    /// directory is load-bearing; a missing home costs a default, not a
+    /// connection.
+    #[test]
+    fn a_host_that_reports_no_home_still_opens() {
+        let p =
+            parse_probe("DIR /tmp/nvmux-0\nHOME\nNVIM NVIM v0.11.4\nNVMUX_END\n").expect("parse");
+        assert_eq!(p.runtime_dir, "/tmp/nvmux-0");
+        assert!(p.home.is_empty());
+
+        // And one from before the line existed at all.
+        let p = parse_probe("DIR /tmp/nvmux-0\nNVIM NVIM v0.11.4\nNVMUX_END\n").expect("parse");
+        assert!(p.home.is_empty());
     }
 
     #[test]
