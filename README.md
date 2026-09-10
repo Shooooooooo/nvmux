@@ -73,7 +73,7 @@ reimplementing it.
 | `Enter` | attach (or end a number early) |
 | `c` | set up a new session, then attach |
 | `r` | rename the selected session |
-| `Space` | pick the session up; `↑↓` move it, `Enter` places it, `Esc` puts it back |
+| `Space` | pick the session up; `↑↓` move it, `Space` places it, `Esc` puts it back |
 | `x` | kill |
 | `/` | filter |
 | `?` | show the `<prefix>` keys |
