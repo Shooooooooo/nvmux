@@ -411,9 +411,24 @@ impl Prompt {
         }
         if self.choosing() {
             "⇥ ⏎ accept   ↑↓ choose   esc close"
-        } else {
+        } else if self.completes() {
             "⏎ create   ↑↓ field   ⇥ complete   esc cancel"
+        } else {
+            // No `⇥ complete` here: there is nothing in this field to complete,
+            // and a row promising a key that does nothing where you are standing
+            // is worse than a shorter row.
+            "⏎ create   ↑↓ field   esc cancel"
         }
+    }
+
+    /// Does `Tab` complete anything from where the cursor is?
+    ///
+    /// Only the working directory field has completions, which is why the hint
+    /// row offers `⇥ complete` only there. Asked in one place so the row cannot
+    /// come to promise a key the handler does not answer — and so a second field
+    /// gaining completions is one edit rather than two that have to agree.
+    fn completes(&self) -> bool {
+        self.menu.is_some() && self.focus == DIRECTORY
     }
 
     /// Is the menu on screen? Then it owns the movement keys, and `Tab` accepts
@@ -511,7 +526,7 @@ impl Prompt {
             // `Tab` is for completion and for nothing else — it does not move
             // between fields, and in the two fields with nothing to complete it
             // does nothing at all.
-            Key::Tab if self.menu.is_some() && self.focus == DIRECTORY => {
+            Key::Tab if self.completes() => {
                 if choosing {
                     self.accept();
                 } else {
@@ -1983,6 +1998,35 @@ mod tests {
         );
     }
 
+    /// The property, rather than the coincidence: the row advertises `⇥` in
+    /// exactly the fields where pressing it does something. Written to fail if
+    /// either half moves without the other, which is the drift the two of them
+    /// sharing one predicate exists to prevent.
+    #[test]
+    fn the_hint_row_offers_tab_only_where_tab_completes() {
+        for focus in [NAME, COMMAND, DIRECTORY] {
+            let mut p = prompt();
+            for _ in 0..focus {
+                p.on_key(Key::Down);
+            }
+            assert_eq!(p.focus, focus);
+            let advertised = p.hints().contains('⇥');
+
+            let mut pressed = prompt();
+            for _ in 0..focus {
+                pressed.on_key(Key::Down);
+            }
+            pressed.on_key(Key::Tab);
+            let did_something = pressed.choosing();
+
+            assert_eq!(
+                advertised, did_something,
+                "field {focus}: the row says {advertised} and the key does \
+                 {did_something}"
+            );
+        }
+    }
+
     /// `Tab` is for completion, and the other two fields have nothing to
     /// complete. It does not move between fields any more either.
     #[test]
@@ -2147,11 +2191,21 @@ mod tests {
     fn the_hint_row_is_on_the_last_row_and_follows_the_menu() {
         let closed = render(&prompt(), 60, 14);
         assert!(
-            closed[13].contains("⏎ create")
-                && closed[13].contains("↑↓ field")
-                && closed[13].contains("⇥ complete"),
+            closed[13].contains("⏎ create") && closed[13].contains("↑↓ field"),
             "expected the closed hints on the last row, got {:?}",
             closed[13]
+        );
+        assert!(
+            !closed[13].contains("⇥"),
+            "the name field has nothing to complete: {:?}",
+            closed[13]
+        );
+
+        let at_dir = render(&at_directory("/home/"), 60, 14);
+        assert!(
+            at_dir[13].contains("⇥ complete"),
+            "the working directory field does: {:?}",
+            at_dir[13]
         );
 
         let open = render(&menuing("/home/", &["alpha"]), 60, 14);
