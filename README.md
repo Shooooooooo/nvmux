@@ -71,77 +71,31 @@ reimplementing it.
 | `g` `G` `Home` `End` | first / last |
 | `1`, `2`, … `12` | attach to the session with that number |
 | `Enter` | attach (or end a number early) |
-| `c` | set up a new session, then attach |
-| `r` | rename the selected session |
+| `c` `r` `x` | new / rename / kill |
 | `Space` | pick the session up; `↑↓` move it, `Space` places it, `Esc` puts it back |
-| `x` | kill |
 | `/` | filter |
 | `?` | show the `<prefix>` keys |
 | `Esc` | clear the filter or a half-typed number, then go back to the session you came from |
 | `q` `Ctrl-c` | quit |
 
 `c` asks three things: what the session is called, how its Neovim is started, and
-where it runs.
+where it runs. The last two arrive pre-filled and editable — the
+[command](#the-command-a-session-runs) you last used on that host, and your home
+directory there. `Enter` submits the whole form from any field, so `c` `Enter`
+creates a session in one keystroke.
 
-| Key | In the create prompt |
-|---|---|
-| `↑` `↓` `Ctrl-n` `Ctrl-p` | move between the fields (wraps) |
-| `Tab` | complete the working directory — see below |
-| `Enter` | accept from the completion menu, or create the session |
-| `Esc` | close the completion menu, or leave |
-
-`Enter` submits the whole form from any field, so `c` `Enter` creates a session in
-one keystroke — with the suggested `session N`, the command you last used, and
-your home directory.
-
-The command and the directory are **already there** as ordinary text, ready to be
-edited: a command line is something you amend — a path to a nightly build, a
-`--clean` on the end — rather than write out. The name is the exception, shown
-dimmed as a suggestion, because `session N` is one you replace outright; typing
-over it does that, and `→` takes it into the field to be edited instead.
+The directory is one on whichever machine runs the session, so `nvmux myhost`
+completes and starts paths on *myhost*, not here; one that is not there is
+refused before anything is started. `Tab` opens a fuzzily ranked completion menu
+— `nvmx` finds `nvmux-rs` — and listing runs beside the prompt, so typing is
+never slower even when the answer is coming over ssh. Typing `//` discards
+everything before it, so `/home/shu//etc` means `/etc`. A leading `~` is expanded
+against the session host's home directory; nothing else is expanded, for the
+reasons the command section gives.
 
 A session name is at most 64 bytes, has no leading or trailing whitespace and
 no control characters, and must not be in use — compared without regard to
 case.
-
-The command is described under [Configuration](#the-command-a-session-runs).
-
-**Where a session runs.** The third field is the directory its Neovim starts in —
-what `:pwd` reports, and what everything keyed off the working directory follows.
-It is a directory on whichever machine runs the session, so `nvmux myhost`
-completes and starts paths on *myhost*, not here. A directory that is not there is
-refused before anything is started.
-
-The field **starts at your home directory** on that machine — the path is really
-there, as ordinary text you can edit — so pressing `Tab` lists what is inside it
-straight away.
-
-**To go somewhere else, type `//`.** Everything before the last one is discarded,
-so `/home/shu//etc` means `/etc`. The pre-filled path already ends in a slash, so
-typing one as your first keystroke is all it takes. The discarded part is greyed
-out, and that is the only thing grey means here: the part of the line that no
-longer decides where the session starts.
-
-A leading `~` is expanded against the session host's home directory; nothing else
-is expanded, for the reasons the command section gives.
-
-**`Tab` completes it.** Press it in that field and a menu opens listing the
-directories it could become, ranked fuzzily — `nvmx` finds `nvmux-rs`, so you need
-not know how a directory starts to reach it. Nothing else opens the menu; the
-prompt is three plain fields until you ask.
-
-While it is open the movement keys move through it instead of between the fields,
-and `Tab` or `Enter` takes the highlighted directory. It writes the name alone,
-and the *next* `Tab` adds the `/` and opens the level below — so `Tab`, choose,
-`Tab`, `Tab`, choose, `Tab` walks down a tree without ever typing a slash. Typing
-narrows the menu, directories starting with a dot appear once you type a dot, and
-`Esc` closes it again. Accepting closes the menu, so a second `Enter` creates the
-session.
-
-Completion never waits on your keystrokes. The listing runs beside the prompt, so
-typing is never slower than typing even when the answer is coming over ssh — and
-one listing serves a whole directory, so a path costs about one round trip per
-`/` rather than one per key.
 
 ### While attached
 
@@ -152,26 +106,10 @@ one listing serves a whole directory, so a path costs about one round trip per
 | `<prefix>` `d` | detach — leaves the session running, exits nvmux |
 | `<prefix>` `Space` | back to the picker, session still attached — `Esc` goes back |
 | `<prefix>` `1`, `2`, … `12` | switch straight to that session |
-| `<prefix>` `n` | next session by number — wraps at the end |
-| `<prefix>` `p` | previous session by number — wraps at the start |
+| `<prefix>` `n` / `p` | next / previous session by number — wraps at both ends |
 | `<prefix>` `c` | set up a new session and attach to it — `Esc` goes back |
 | `<prefix>` `?` | show these keys — `Esc` goes back |
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
-
-`<prefix> n` and `<prefix> p` walk the numbers in the order the picker lists
-them, wrapping at both ends, so you can step through every session without
-knowing a single number. One killed from somewhere else is simply skipped: you
-land on the nearest number that is still there.
-
-Landing somewhere new says so: the session's name appears in a box in the
-middle of the screen for a second, then goes. That happens whenever the session
-*changes* — a pick from the picker, `<prefix> 3`, `<prefix> n`, or a
-`<prefix> c` that created something — and never after `<prefix> Space` or
-`<prefix> ?`, which bring you back to the session you were already in. The box
-is nvmux's own: it is drawn straight to your terminal and taken off again by
-asking the server to repaint, so nothing is created in the editor and nothing is
-typed at it. `popup.duration_ms` in the [config](#configuration) changes how
-long it stays, and `0` turns it off.
 
 Everything else goes to Neovim untouched — including `Ctrl-c`, `Ctrl-z` and
 `Ctrl-s`, which reach the editor as ordinary keys rather than becoming signals
@@ -179,21 +117,15 @@ for nvmux. Digits, `n` and `p` are the exceptions: `<prefix> 1`, `<prefix> n`
 and `<prefix> p` are commands now, so `<prefix> <prefix> n` is how you send one
 of those to the editor.
 
-The prefix is recognised however your terminal spells it. Neovim asks every
-terminal for the kitty keyboard protocol (or xterm's `modifyOtherKeys`), and
-one that has it — Windows Terminal from 1.25, kitty, Ghostty, WezTerm, xterm —
-then sends `Ctrl-Space` as an escape sequence rather than the byte `NUL`. nvmux
-treats both as the prefix, and a literal `<prefix> <prefix>` replays whichever
-the terminal sent.
+Landing on a different session says so, in a box in the middle of the screen.
+`popup.duration_ms` in the [config](#configuration) changes how long it stays,
+and `0` turns it off.
 
-nvmux will not start inside a session. Run it in a `:terminal` there and it
-says `already inside an nvmux session` and stops — the outer proxy sees every
-`<prefix>` first, so an inner nvmux could be neither detached from nor left.
-`<prefix> Space` is the way to the picker, `<prefix> c` the way to a new
-session. If you do want a second one anyway — to manage another host's
-sessions, say — `NVMUX= nvmux <host>` runs it, with the prefix belonging to the
-outer session throughout. (`$NVMUX` is the session socket, exported by the
-editor; it is what nvmux checks for.)
+nvmux will not start inside a session — the outer proxy sees every `<prefix>`
+first, so an inner nvmux could be neither detached from nor left. To manage
+another host's sessions anyway, `NVMUX= nvmux <host>` runs it, with the prefix
+belonging to the outer session throughout. (`$NVMUX` is the session socket,
+exported by the editor; it is what nvmux checks for.)
 
 ### Leaving a session
 
@@ -241,10 +173,10 @@ it is what `nvim` binds and what every later listing and kill finds the session
 by, so a line without it is refused rather than quietly repaired.
 
 The line is split into words the way a shell splits them — `'…'`, `"…"` and `\`
-all work, so a path with a space in it stays one word — but **nothing is
-expanded**. There is no shell in the path to do it, which is also what keeps a
-command safe to send over ssh. So no globs, no `$VAR`, no `~`, and no leading
-`VAR=value`; write `env NAME=value nvim …` and spell the home directory out.
+all work — but **nothing is expanded**. There is no shell in the path to do it,
+which is also what keeps a command safe to send over ssh. So no globs, no
+`$VAR`, no `~`, and no leading `VAR=value`; write `env NAME=value nvim …` and
+spell the home directory out.
 
 ```toml
 [session]
@@ -254,19 +186,17 @@ command = "nvim --clean --headless --listen {sock}"
 ```
 
 Neovim's version is checked as `nvim` on your `$PATH`, which is not necessarily
-the binary a custom command runs. A command that names nothing is reported as
-soon as the session is created, not after a timeout.
+the binary a custom command runs.
 
 ### What nvmux remembers
 
 Change the command at the prompt and the next new session on that host offers it
-back. That is kept in `$NVMUX_STATE` if set, else `$XDG_STATE_HOME/nvmux/state.toml`,
-else `~/.local/state/nvmux/state.toml` — per host, since a path to a nightly
-build on one machine means nothing on another.
-
-The file is a convenience and nothing more: nvmux writes it, deleting it only
-loses the suggestion, and a broken one is ignored rather than reported. The
-config file is the opposite on every count, which is why they are separate.
+back. That is kept — per host, since a path to a nightly build on one machine
+means nothing on another — in `$NVMUX_STATE` if set, else
+`$XDG_STATE_HOME/nvmux/state.toml`, else `~/.local/state/nvmux/state.toml`.
+Deleting it only loses the suggestion, and a broken one is ignored rather than
+reported; the config file is the opposite on both counts, which is why they are
+separate.
 
 ## Logs
 
