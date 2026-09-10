@@ -111,9 +111,23 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 Some(a) if a.session_id == current.id => Ok(a),
                 // Retiring the old client leaves its server running: killing a
                 // --remote-ui client does not kill a --headless --listen server.
-                Some(other) => {
-                    other.terminate();
-                    new_attachment(transport, &current)
+                //
+                // Hung up first and reaped after, with the new client's spawn in
+                // between: the two have nothing to say to each other — a
+                // different session, a different server, a different pty — so
+                // serialising them would charge the user the sum of the two.
+                // Nothing reads the old pty master again either, so the dying
+                // client's own restore sequence goes nowhere near the terminal.
+                Some(mut other) => {
+                    other.hang_up();
+                    let spawned = new_attachment(transport, &current);
+                    // Explicitly, rather than by falling out of the arm: this is
+                    // the wait the hangup deferred, and leaving it to a binding's
+                    // drop would let the next edit here re-serialise it without
+                    // noticing. It has to happen on the failure path too, which
+                    // is why the spawn is held rather than returned from inside.
+                    drop(other);
+                    spawned
                 }
                 None => new_attachment(transport, &current),
             };
@@ -162,10 +176,11 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     attached = held;
                     // A failed listing goes back to the picker like a failed
                     // attach, and for a second reason besides: this is the one
-                    // path from one relay straight into another, with no
-                    // `ui::Screen` in between to leave the alternate screen —
-                    // see the held branch of `pty::relay`. An error propagating
-                    // from here would be printed where nobody could read it.
+                    // path from one relay straight into another, so the screen
+                    // an error would land on is the cleared one the held branch
+                    // of `pty::relay` just handed over — nothing else on it, and
+                    // nothing the user could do from it. The hint row is both,
+                    // next to the row the message is about.
                     let sessions = match transport.list_sessions() {
                         Ok(sessions) => sessions,
                         Err(e) => {

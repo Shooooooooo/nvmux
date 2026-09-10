@@ -72,6 +72,18 @@ pub enum Outcome {
     StdinClosed,
 }
 
+impl Outcome {
+    /// Whether this leads from one relay straight into the next, with no
+    /// [`crate::ui`] screen in between to clear the outgoing frame on the way.
+    ///
+    /// Only `<prefix> <number>` does. `ToPicker`, `CreateNew` and `ShowHelp` all
+    /// open a screen, and a screen clears as it opens; the rest end the relay
+    /// for good.
+    fn leads_straight_into_another_relay(self) -> bool {
+        matches!(self, Outcome::Switch(_))
+    }
+}
+
 /// A running `--remote-ui` client, and the PTY it is talking through.
 pub struct Attachment {
     /// Which session this client is attached to.
@@ -99,7 +111,7 @@ impl std::fmt::Debug for Attachment {
     }
 }
 
-/// How long a signalled client gets to exit before it is killed outright.
+/// How long a hung-up client gets to exit before it is killed outright.
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl Attachment {
@@ -114,24 +126,75 @@ impl Attachment {
         drop(self);
     }
 
-    /// Ask the client to exit. `portable-pty` sends SIGHUP, which is what the
-    /// client would get if the terminal itself went away.
-    fn signal(&mut self) {
-        if !self.reaped {
-            let _ = self.child.kill();
+    /// Send the client its hangup and return *without waiting for it to go*, so
+    /// the caller can get on with something — spawning the replacement — while
+    /// it dies. SIGHUP is what the client would get if the terminal itself went
+    /// away. `reap` does the waiting and `Drop` calls it, so an attachment must
+    /// still be held until the client is genuinely wanted gone.
+    ///
+    /// Through `libc` rather than `portable_pty`'s `Child::kill`, which is not a
+    /// signal but a whole teardown: it sends SIGHUP and then blocks polling for
+    /// the exit — measured at 50 ms for a client that goes quietly, 200 ms
+    /// before it gives up and escalates to SIGKILL. That is `reap`'s job, and a
+    /// hangup that blocks leaves the switch path nothing to overlap. Its poll
+    /// also *reaped* the child, which is why `reap` used to return on its first
+    /// look and why `reap`'s own escalation had never run.
+    ///
+    /// SIGCONT as well, because SIGHUP is not delivered to a *stopped* process
+    /// at all, and a client that stopped itself (see `check_child`) can be
+    /// retired before the pump's idle poll has revived it. `reap`'s `try_wait`
+    /// does not pass `WUNTRACED` either, so without this a stopped client would
+    /// read as running for the whole of `REAP_TIMEOUT`. Hung up first and
+    /// continued second, it takes the pending hangup and goes.
+    ///
+    /// Sending it twice is harmless, which is what lets `Drop` run after an
+    /// explicit `hang_up`: nothing in between waits for the child — the peek in
+    /// `check_child` passes `WNOWAIT` — so the pid is still ours and cannot have
+    /// been recycled.
+    pub fn hang_up(&mut self) {
+        if self.reaped {
+            return;
+        }
+        // Nothing to signal without one, and `reap` falls back on `wait`.
+        let Some(pid) = self.child.process_id() else {
+            return;
+        };
+        // SAFETY: a pid this process spawned and has not waited for, so it names
+        // that child or nothing.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGHUP);
+            libc::kill(pid as libc::pid_t, libc::SIGCONT);
         }
     }
 
     /// Wait for the client to be gone, escalating to SIGKILL after
     /// [`REAP_TIMEOUT`] so a client that ignores SIGHUP cannot hold nvmux —
     /// and the user's terminal — hostage.
+    ///
+    /// All of the waiting and all of the escalation is here. It used to be
+    /// shared with `portable_pty`'s `Child::kill`, which reaped the child inside
+    /// the hangup and reached SIGKILL first, so this loop returned on its first
+    /// poll and the escalation below never ran.
     fn reap(&mut self) {
         if self.reaped {
             return;
         }
         self.reaped = true;
+        // Read the client out while waiting for it, and throw it away. What it
+        // writes on the way out describes a screen that has already been cleared
+        // or restored, so none of it is wanted — but it has to be *read*, because
+        // a client parked in `write` on a master nobody drains never reaches its
+        // own signal handler. That is not hypothetical on the switch path: the
+        // picker leaves the outgoing client unread for as long as it is up, and a
+        // client that was mid-repaint when the switch was typed fills the buffer
+        // and stops there. Without this it cannot act on the hangup at all, and
+        // a healthy client ends up killed by the deadline below.
+        let master = self.master.as_raw_fd();
         let deadline = Instant::now() + REAP_TIMEOUT;
         while Instant::now() < deadline {
+            if let Some(fd) = master {
+                discard_pending(fd);
+            }
             match self.child.try_wait() {
                 Ok(None) => std::thread::sleep(Duration::from_millis(10)),
                 // Exited, or already reaped by someone else.
@@ -155,7 +218,7 @@ impl Attachment {
 /// runs, so the writer only ever goes out on a pty nobody is reading.
 impl Drop for Attachment {
     fn drop(&mut self) {
-        self.signal();
+        self.hang_up();
         self.reap();
     }
 }
@@ -165,11 +228,31 @@ impl Drop for Attachment {
 /// `sock` must already be reachable from *this* machine — locally the session
 /// socket, over SSH the local end of a forward.
 pub fn spawn(session_id: &str, sock: &Path) -> Result<Attachment> {
-    // Ping before spawning anything. Through an SSH forward the client's own
-    // failure message is empty, after ~165 bytes of escape sequences have
-    // already been sprayed at the terminal.
+    // Reach the server before spawning anything. Through an SSH forward the
+    // client's own failure message is empty, after ~165 bytes of escape
+    // sequences have already been sprayed at the terminal, so the check has to
+    // happen here, on a connection nvmux controls.
+    //
+    // The `get_mode` below *is* that check, and the only one. It is a fast call
+    // but still a full request/response round trip, so an answer proves a real
+    // Neovim is behind the socket, a forward whose remote end has gone resets
+    // instead, and a peer that is not Neovim fails on its reply shape — and
+    // `rpc` classifies all of that identically whichever method asked, which is
+    // what `describe_attach_failure` reads.
+    //
+    // An `api_info` used to run in front of it, and proved nothing more *here*:
+    // its result was discarded, nothing on this path reads a version (the gates
+    // are `nvim::check_local` and the remote `--version` banner), and the `?` on
+    // `get_mode` refuses what this path can actually meet — a forward that resets,
+    // a server that does not answer, a reply that is not Neovim-shaped. (Not
+    // *every* peer: the two reply shapes are checked separately, so something
+    // that answered one and not the other would now get further. Nothing that
+    // reaches this socket does.) It does prove
+    // more *elsewhere* — it answers during `:!cmd`, where `get_mode` is queued
+    // like any other call, which is why `rpc::probe` asks both — so this is not
+    // a claim that the two are interchangeable. What it cost was a round trip on
+    // every attach, forwarded over SSH.
     let mut client = rpc::Client::connect(sock, rpc::PROBE_TIMEOUT)?;
-    client.api_info()?;
     // A server at a hit-enter prompt cannot answer `list_uis`, a deferred
     // call, until a key ends the prompt. Usually there is nobody to type one:
     // the client that was showing the prompt is gone, and this is its
@@ -270,6 +353,11 @@ pub fn relay(
         .ok_or_else(|| NvmuxError::Io(std::io::Error::other("pty master has no fd")))?;
 
     let winch = winch::Winch::install()?;
+    // Normally already done by whoever handed the terminal over — the picker,
+    // the prompt, or the `Switch` branch below — because a clear on this side of
+    // the client spawn is a clear too late, and the old session is what fills
+    // the wait. This is the backstop for a path that did neither, and a repeat
+    // costs one write on a screen nothing has drawn to since.
     term::leave_alt_screen_and_clear();
     let mut raw = term::RawMode::enter()?;
 
@@ -289,6 +377,14 @@ pub fn relay(
             @ (Outcome::ToPicker | Outcome::CreateNew | Outcome::ShowHelp | Outcome::Switch(_)),
         ) => {
             raw.restore();
+            // Clear here rather than leaving it to the next `relay`, which runs
+            // on the far side of the client spawn: what is on the terminal until
+            // then is the session being switched away from. Harmless when the
+            // number names nothing — the same client is resumed, and a resume
+            // forces a repaint.
+            if held.leads_straight_into_another_relay() {
+                term::leave_alt_screen_and_clear();
+            }
             Ok((held, Some(attachment)))
         }
         Ok(Outcome::ChildExited) => {
@@ -304,7 +400,7 @@ pub fn relay(
             // back itself — a competing reset while it is still writing would
             // corrupt its own restore sequence. Once it is gone, a final reset
             // is harmless and covers a client that died before it got that far.
-            attachment.signal();
+            attachment.hang_up();
             drain_until_eof(master_fd);
             raw.restore();
             attachment.reap();
@@ -316,7 +412,7 @@ pub fn relay(
             // the colours back first, in case the client died mid-frame with
             // the cursor hidden or an SGR attribute set. `attachment` is
             // dropped on the way out, which retires the client.
-            attachment.signal();
+            attachment.hang_up();
             drain_until_eof(master_fd);
             raw.restore();
             attachment.reap();
@@ -755,7 +851,100 @@ fn repaint_through_server(sock: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+
     use super::*;
+
+    /// Poll until the child reaches `want`: signals are delivered
+    /// asynchronously, so the state is not visible on the first look. Returns
+    /// what it last saw, so a caller asserts on the state rather than on a
+    /// timeout — a wait that ends in the wrong state is the failure.
+    fn settle(pid: Pid, want: Peek) -> Peek {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let got = peek_child(pid);
+            if got == want || Instant::now() > deadline {
+                return got;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A stand-in client on a real pty, driven by `sh -c $script`.
+    ///
+    /// Real, because what the teardown tests are about is what a *signal* does
+    /// to a process: a fake `Child` would supply the `kill` under test and
+    /// answer for itself. `sock` is never read on these paths.
+    fn attached_to(script: &str) -> Attachment {
+        let pair = portable_pty::native_pty_system()
+            .openpty(PtySize::default())
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg(script);
+        let child = pair.slave.spawn_command(cmd).expect("spawn sh");
+        // As in `spawn`: while this process holds the slave open the master
+        // never sees EOF.
+        drop(pair.slave);
+        let writer = pair.master.take_writer().expect("writer");
+        Attachment {
+            session_id: "id000000".to_string(),
+            sock: PathBuf::from("/nvmux-test-never-read.sock"),
+            child,
+            master: pair.master,
+            writer,
+            resumed: false,
+            reaped: false,
+        }
+    }
+
+    /// Wait for a stand-in client to say it is ready, by reading the `r` its
+    /// script echoes.
+    ///
+    /// Without this a test that signals the child immediately races `sh`'s own
+    /// startup: the signal lands before the script has run, under whatever
+    /// disposition the shell was exec'd with rather than the one the script sets.
+    /// Measured — a `trap '' HUP` client signalled straight after
+    /// [`attached_to`] dies of the hangup it is supposed to ignore, and the test
+    /// then passes for the wrong reason.
+    fn wait_until_ready(a: &Attachment) {
+        assert!(
+            wait_for(a, b'r'),
+            "the stand-in client never reported ready"
+        );
+    }
+
+    /// Read the stand-in client's output until `byte` shows up, or give up.
+    ///
+    /// The only channel a shell has to report what it did, which is how a test
+    /// tells "the signal was delivered" from "the process happens to still be
+    /// in the state I expected".
+    fn wait_for(a: &Attachment, byte: u8) -> bool {
+        let fd = a.master.as_raw_fd().expect("the master has an fd");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut buf = [0u8; 256];
+        while Instant::now() < deadline {
+            let mut p = [pollfd(fd)];
+            // SAFETY: one initialised pollfd, and the fd outlives the call.
+            unsafe { libc::poll(p.as_mut_ptr(), 1, 50) };
+            if ready(&p[0]) {
+                if let Ok(n) = read_fd(fd, &mut buf) {
+                    if buf[..n].contains(&byte) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// The pid of a stand-in client. Every teardown assertion is about a pid
+    /// rather than about the `Attachment`, because the point is what is left
+    /// behind after the attachment is gone.
+    fn pid_of(a: &Attachment) -> Pid {
+        Pid::from_raw(a.child.process_id().expect("a spawned child has a pid") as i32)
+    }
 
     /// A hangup must count as "something happened", not be ignored.
     ///
@@ -806,15 +995,346 @@ mod tests {
         assert!(out.is_empty(), "a command writes nothing to the child");
     }
 
+    /// Exactly one outcome reaches the next session without a screen on the
+    /// way, and it is the one that has to clear for itself. Getting this wrong
+    /// in either direction is invisible in a test that only checks the
+    /// outcomes: too narrow leaves the old session on screen through the
+    /// spawn, too wide clears a screen that is about to draw anyway.
+    #[test]
+    fn only_a_number_switch_reaches_the_next_session_without_a_screen() {
+        assert!(Outcome::Switch(3).leads_straight_into_another_relay());
+        for other in [
+            Outcome::ToPicker,
+            Outcome::CreateNew,
+            Outcome::ShowHelp,
+            Outcome::Detached,
+            Outcome::ChildExited,
+            Outcome::StdinClosed,
+        ] {
+            assert!(
+                !other.leads_straight_into_another_relay(),
+                "{other:?} either opens a screen or ends the relay"
+            );
+        }
+    }
+
+    /// A scratch socket path, kept short: `check_sock_path` refuses anything over
+    /// `MAX_SOCK_PATH`, and macOS's temp dir is not short.
+    fn temp_sock(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("nvmux-t{}-{tag}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// A msgpack-RPC server that answers what the attach probe asks and records
+    /// the methods it was asked, so the probe's call sequence is observable
+    /// without a real Neovim — which the machines running these tests may not
+    /// have, and which would answer whatever it liked anyway.
+    ///
+    /// It answers *every* call the probe could plausibly make, `nvim_get_api_info`
+    /// included, so a regression fails on the sequence rather than on a fake that
+    /// could not keep up.
+    fn recording_server(
+        sock: &Path,
+        mode: &'static str,
+        blocking: bool,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        use rmpv::Value;
+
+        let listener = std::os::unix::net::UnixListener::bind(sock).expect("bind");
+        // Bounded rather than blocking: if the probe never connects at all — a
+        // socket path this platform refuses, say — an accept that waited forever
+        // would hang the test instead of failing it on an empty recording.
+        listener
+            .set_nonblocking(true)
+            .expect("a non-blocking listener");
+        std::thread::spawn(move || {
+            let mut asked = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() > deadline {
+                            return asked;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return asked,
+                }
+            };
+            // The accepted stream inherits O_NONBLOCK on some platforms, and the
+            // reads below are blocking ones with their own bound.
+            stream.set_nonblocking(false).expect("a blocking stream");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("a bounded read");
+            let mut reader = std::io::BufReader::new(&stream);
+            let mut out = &stream;
+            // Ends on EOF, which is `spawn` dropping the client after the last
+            // call — so joining this handle waits for the whole probe.
+            while let Ok(frame) = rmpv::decode::read_value(&mut reader) {
+                let Some(request) = frame.as_array() else {
+                    break;
+                };
+                let (Some(msgid), Some(method)) = (
+                    request.get(1).cloned(),
+                    request.get(2).and_then(Value::as_str),
+                ) else {
+                    break;
+                };
+                let result = match method {
+                    "nvim_get_api_info" => Value::Array(vec![
+                        Value::from(1u64),
+                        Value::Map(vec![(
+                            Value::String("version".into()),
+                            Value::Map(vec![
+                                (Value::String("major".into()), Value::from(0u64)),
+                                (Value::String("minor".into()), Value::from(12u64)),
+                                (Value::String("patch".into()), Value::from(0u64)),
+                            ]),
+                        )]),
+                    ]),
+                    "nvim_get_mode" => Value::Map(vec![
+                        (Value::String("mode".into()), Value::String(mode.into())),
+                        (Value::String("blocking".into()), Value::Boolean(blocking)),
+                    ]),
+                    // No UIs attached, so the `MAX_UIS` guard lets the attach by.
+                    "nvim_list_uis" => Value::Array(vec![]),
+                    // The byte count, which nvmux ignores.
+                    "nvim_input" => Value::from(4u64),
+                    _ => Value::Nil,
+                };
+                // The keys go on the record too: which prompt gets a `<CR>` is
+                // half of what this pins.
+                let keys = request
+                    .get(3)
+                    .and_then(|p| p.as_array())
+                    .and_then(|p| p.first())
+                    .and_then(Value::as_str);
+                asked.push(match keys {
+                    Some(keys) if method == "nvim_input" => format!("{method}({keys})"),
+                    _ => method.to_string(),
+                });
+                let reply = Value::Array(vec![Value::from(1u64), msgid, Value::Nil, result]);
+                if rmpv::encode::write_value(&mut out, &reply).is_err() {
+                    break;
+                }
+            }
+            asked
+        })
+    }
+
+    /// The attach probe's call sequence, which is the whole of what a change to it
+    /// can break: the mode first — a fast call, answered even at a prompt — then
+    /// a `<CR>` for the one prompt that key ends, then the deferred UI count.
+    ///
+    /// The `nvim_get_api_info` that used to lead this cost a round trip, and a
+    /// forwarded one over SSH, while proving nothing the `?` on the mode does not.
+    /// The server here would still answer it, so its absence is what is asserted.
+    #[test]
+    fn the_attach_probe_asks_the_mode_then_the_ui_count_and_nothing_else() {
+        for (tag, mode, blocking, want) in [
+            ("idle", "n", false, &["nvim_get_mode", "nvim_list_uis"][..]),
+            (
+                "hitenter",
+                "r",
+                true,
+                &["nvim_get_mode", "nvim_input(<CR>)", "nvim_list_uis"][..],
+            ),
+            // Blocking, but not the prompt a `<CR>` ends: a more-prompt, or a
+            // half-typed `g`. Typing for the user there would run something.
+            ("more", "rm", true, &["nvim_get_mode", "nvim_list_uis"][..]),
+        ] {
+            let sock = temp_sock(tag);
+            let server = recording_server(&sock, mode, blocking);
+            // The result is deliberately not asserted: `spawn` goes on to fork
+            // `nvim`, which this machine may not have, and either way the probe
+            // has already been made. Bound to `_` so an attachment, if one comes
+            // back, is retired at once.
+            let _ = spawn("probe", &sock);
+            assert_eq!(
+                server.join().expect("the server thread"),
+                want,
+                "the attach probe asked something else in mode {mode:?}"
+            );
+            let _ = std::fs::remove_file(&sock);
+        }
+    }
+
+    /// The invariant the switch path's overlap rests on, and the one that was
+    /// silently false before: the hangup signals and comes straight back.
+    ///
+    /// The client catches the hangup and reports it rather than dying of it, so
+    /// all three things are separable — that a signal was sent at all, that
+    /// nothing escalated past it, and that nothing waited for it. On the state
+    /// alone the old path looked the same, because `portable_pty`'s `Child::kill`
+    /// SIGKILLed without waiting; the elapsed bound is what fails on it, measured
+    /// at 200 ms there against two `kill` syscalls here.
+    #[test]
+    fn hanging_up_signals_the_client_without_waiting_for_it() {
+        // `read` blocks in the shell itself rather than in a child, so the
+        // process being signalled is the one that reports.
+        let mut a = attached_to("trap 'printf H' HUP; printf r; while :; do read x; done");
+        let pid = pid_of(&a);
+        // The `printf r` comes after the `trap`, so this is the point from which
+        // the hangup is genuinely caught rather than fatal.
+        wait_until_ready(&a);
+
+        let start = Instant::now();
+        a.hang_up();
+        let took = start.elapsed();
+
+        assert!(
+            wait_for(&a, b'H'),
+            "the client never reported a hangup, so none was delivered"
+        );
+        assert_eq!(
+            peek_child(pid),
+            Peek::Running,
+            "the hangup must not escalate past the signal the client caught"
+        );
+        assert!(
+            took < Duration::from_millis(100),
+            "the hangup took {took:?}; a hangup that blocks leaves the switch \
+             path nothing to overlap with the next client's spawn"
+        );
+        assert!(!a.reaped, "the hangup must leave the reaping to `reap`");
+
+        // And the reap is what gets rid of a client that will not leave. This is
+        // the only test that reaches that escalation: `portable_pty`'s own
+        // SIGKILL used to get there first, so the SIGKILL below it had never run.
+        a.reap();
+        assert_eq!(
+            settle(pid, Peek::Gone),
+            Peek::Gone,
+            "a client that stays after its hangup must still be killed by the reap"
+        );
+    }
+
+    /// A client blocked writing into a master nobody reads still takes its
+    /// hangup, because the reap reads it out while it waits for it.
+    ///
+    /// That is the state the switch path leaves behind: the picker stops reading
+    /// the outgoing client the moment it opens, so one that was mid-repaint fills
+    /// the pty buffer and stops there, in a `write` it cannot leave and with its
+    /// handler never reached. Measured: 10 ms to exit on its own with the drain,
+    /// against the full `REAP_TIMEOUT` and a SIGKILL without it.
+    #[test]
+    fn a_client_blocked_writing_still_takes_its_hangup() {
+        // Catches the hangup rather than dying of it: a default disposition is
+        // fatal whether the process is blocked or not, and would prove nothing.
+        let mut a = attached_to(
+            "trap 'exit 0' HUP; printf r; while :; do printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; done",
+        );
+        let pid = pid_of(&a);
+        wait_until_ready(&a);
+        // Long enough to fill the master's buffer and stop in `write`; a machine
+        // fast enough to still be running only makes the assertion easier.
+        std::thread::sleep(Duration::from_millis(400));
+
+        let start = Instant::now();
+        a.hang_up();
+        a.reap();
+        let took = start.elapsed();
+
+        assert_eq!(peek_child(pid), Peek::Gone);
+        assert!(
+            took < Duration::from_millis(500),
+            "the client took {took:?} — it was killed by the reap's deadline \
+             rather than read out and left to act on its hangup"
+        );
+    }
+
+    /// A client that stopped itself takes the hangup only because it is
+    /// continued as well.
+    ///
+    /// SIGHUP is not delivered to a stopped process at all, and `reap`'s
+    /// `try_wait` does not pass `WUNTRACED`, so it reads a stopped child as
+    /// still running: without the SIGCONT this sits for the whole of
+    /// `REAP_TIMEOUT` and then kills it outright. Reachable because `<prefix>`
+    /// chords are read by nvmux's own stdin loop, not by the client, so a client
+    /// that `check_child` has not revived yet can be retired on the switch.
+    #[test]
+    fn a_suspended_client_is_continued_so_the_hangup_lands() {
+        let mut a = attached_to("exec sleep 30");
+        let pid = pid_of(&a);
+        kill(pid, Signal::SIGSTOP).expect("stop");
+        assert_eq!(settle(pid, Peek::Stopped), Peek::Stopped);
+
+        a.hang_up();
+
+        // Gone, and without the reap having killed it: the pending hangup was
+        // delivered, which only happens once the process is running again.
+        assert_eq!(
+            settle(pid, Peek::Gone),
+            Peek::Gone,
+            "a stopped client stays stopped unless the hangup continues it"
+        );
+        a.reap();
+    }
+
+    /// `Drop` is the one retirement path — every `break` out of the session loop
+    /// leans on it — and it was untested. No explicit hangup, and the client is
+    /// still gone by the time the attachment is.
+    #[test]
+    fn dropping_an_attachment_hangs_it_up_and_reaps_it() {
+        let a = attached_to("exec sleep 30");
+        let pid = pid_of(&a);
+
+        let start = Instant::now();
+        drop(a);
+        let took = start.elapsed();
+
+        // Reaped, so the peek gets ECHILD, which reads as gone.
+        assert_eq!(peek_child(pid), Peek::Gone);
+        // Gone alone cannot tell "left on its hangup" from "killed by the reap's
+        // deadline two seconds later", and only the first is what `Drop` claims.
+        assert!(
+            took < Duration::from_millis(500),
+            "dropping took {took:?}, so the client was killed by the deadline \
+             rather than by the hangup"
+        );
+    }
+
+    /// The switch path's shape: hang up, do something slow, then drop. The
+    /// second hangup `Drop` sends has to be harmless — nothing in between waits
+    /// for the child, so the pid is still ours and cannot have been recycled —
+    /// and the client has to end up reaped exactly once.
+    #[test]
+    fn hanging_up_then_dropping_reaps_the_client_exactly_once() {
+        use nix::sys::wait::{waitpid, WaitPidFlag};
+
+        let mut a = attached_to("exec sleep 30");
+        let pid = pid_of(&a);
+
+        a.hang_up();
+        let start = Instant::now();
+        drop(a);
+        let took = start.elapsed();
+
+        assert_eq!(peek_child(pid), Peek::Gone);
+        assert!(
+            took < Duration::from_millis(500),
+            "dropping took {took:?}: the second hangup cost the client its life \
+             at the deadline rather than being the no-op it should be"
+        );
+        // Reaped, not merely dead: ECHILD means no zombie was left behind, which
+        // is the half of "exactly once" a peek cannot see.
+        assert_eq!(
+            waitpid(pid, Some(WaitPidFlag::WNOHANG)),
+            Err(nix::errno::Errno::ECHILD),
+            "a zombie was left behind, so the client was never waited for"
+        );
+    }
+
     /// The peek sees a stop, leaves it in place, and sees an exit without
     /// reaping it. Runs against a real child because `waitid` is what differs
     /// between platforms: nix does not bind it on macOS, so it goes through
     /// `libc`, and the flag and `si_code` handling has to hold on both.
     #[test]
     fn peek_reports_stopped_and_gone_without_consuming_either() {
-        use nix::sys::signal::{kill, Signal};
         use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-        use nix::unistd::Pid;
 
         /// Kill and reap the child however the test ends.
         struct Guard(std::process::Child);
@@ -822,19 +1342,6 @@ mod tests {
             fn drop(&mut self) {
                 let _ = self.0.kill();
                 let _ = self.0.wait();
-            }
-        }
-
-        // Poll until the child reaches `want`: signals are delivered
-        // asynchronously, so the state is not visible on the first look.
-        fn settle(pid: Pid, want: Peek) -> Peek {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                let got = peek_child(pid);
-                if got == want || Instant::now() > deadline {
-                    return got;
-                }
-                std::thread::sleep(Duration::from_millis(10));
             }
         }
 
