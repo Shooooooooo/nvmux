@@ -78,23 +78,6 @@ reimplementing it.
 | `<prefix>` `?` | show these keys — `Esc` goes back |
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
 
-Everything else goes to Neovim untouched — including `Ctrl-c`, `Ctrl-z` and
-`Ctrl-s`, which reach the editor as ordinary keys rather than becoming signals
-for nvmux. Digits, `n` and `p` are the exceptions: `<prefix> 1`, `<prefix> n`
-and `<prefix> p` are commands now, so `<prefix> <prefix> n` is how you send one
-of those to the editor.
-
-Landing on a different session says so, in a box in the middle of the screen
-for a second. The box is nvmux's own — drawn straight to your terminal and taken
-off again by asking the server to repaint — so nothing is created in the editor
-and nothing is typed at it.
-
-nvmux will not start inside a session — the outer proxy sees every `<prefix>`
-first, so an inner nvmux could be neither detached from nor left. To manage
-another host's sessions anyway, `NVMUX= nvmux <host>` runs it, with the prefix
-belonging to the outer session throughout. (`$NVMUX` is the session socket,
-exported by the editor; it is what nvmux checks for.)
-
 ### Leaving a session
 
 - **`<prefix> d` detaches.** The session keeps running with all its buffers,
