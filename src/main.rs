@@ -92,9 +92,16 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     let mut focus: Option<String> = None;
 
     loop {
-        // `<prefix> c` moves this to the session it just created.
-        let (mut current, mut highest) = match ui::run(transport, message.take(), focus.as_deref())?
-        {
+        // `<prefix> c` moves this to the session it just created. A client held
+        // across the trip is what `Esc` goes back to; without one — the first
+        // screen, a failed attach, a session that exited — there is nothing
+        // behind the picker and `Esc` says so by doing nothing.
+        let (mut current, mut highest) = match ui::run(
+            transport,
+            message.take(),
+            focus.as_deref(),
+            attached.is_some(),
+        )? {
             ui::Outcome::Quit => {
                 // A client held across `<prefix> Space` is retired explicitly; its
                 // `Drop` would do the same, this just says so.

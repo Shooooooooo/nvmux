@@ -238,13 +238,19 @@ pub(crate) fn poll_key_for(tick: Duration) -> Result<Option<Key>> {
 /// row — how a failed attach reports itself without exiting the program.
 /// `focused` is the session the caller came from, if any: the cursor starts on
 /// it, so `<prefix> Space` opens the picker where the user already was.
+///
+/// `still_attached` says that session still has a client behind it, which is
+/// what makes `Esc` a way back to it rather than a key that does nothing. It is
+/// false where the picker is all there is: the first screen of the program, and
+/// the trip back from a failed attach or a session whose child exited.
 pub fn run(
     transport: &dyn Transport,
     message: Option<String>,
     focused: Option<&str>,
+    still_attached: bool,
 ) -> Result<Outcome> {
     owning_for_attach(Outcome::attaches, |terminal| {
-        run_loop(terminal, transport, message, focused)
+        run_loop(terminal, transport, message, focused, still_attached)
     })
 }
 
@@ -253,12 +259,16 @@ fn run_loop(
     transport: &dyn Transport,
     message: Option<String>,
     focused: Option<&str>,
+    still_attached: bool,
 ) -> Result<Outcome> {
     let mut sessions = transport.list_sessions()?;
     let mut highest = highest_num(&sessions);
     let mut app = App::new(std::mem::take(&mut sessions));
     if let Some(id) = focused {
         app.select_session(id);
+        if still_attached {
+            app.set_came_from(id);
+        }
     }
     if let Some(msg) = message {
         app.set_message(msg);
