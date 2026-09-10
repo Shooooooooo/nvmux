@@ -465,10 +465,16 @@ impl App {
     /// is kept or thrown away. It also means `/` cannot re-filter under a grabbed
     /// session, so the snapshot describes the same rows for the whole edit.
     ///
-    /// Space grabs but does not also place, tempting as "the key that picked it
-    /// up puts it down" is: an autorepeat or a nervous double-tap would then read
-    /// as grab, place, grab, and with the numbers hidden the only thing saying so
-    /// is the marker on one row. `Enter` places.
+    /// Space places, the same key that picked the session up: with the numbers
+    /// hidden, the one row wearing the marker is what says an edit is open, and
+    /// the key that opened it is the one to hand. An autorepeat or a nervous
+    /// double-tap is then grab-then-place on the spot, which moves nothing and
+    /// so writes nothing — it ends back in normal mode rather than holding an
+    /// edit the screen barely shows.
+    ///
+    /// `Enter` does not place. It attaches everywhere else in the picker, and a
+    /// key that means "go" must not quietly mean "commit this arrangement" here;
+    /// like any other stray key it keeps the grab.
     fn on_key_reorder(&mut self, key: Key) -> Request {
         let Mode::Reorder { id, was } = &self.mode else {
             return Request::None;
@@ -494,7 +500,7 @@ impl App {
                 self.shift_grabbed_to(last);
                 Request::None
             }
-            Key::Enter => {
+            Key::Char(' ') => {
                 let now = self.snapshot();
                 self.mode = Mode::Normal;
                 if now == was {
@@ -1188,11 +1194,11 @@ mod tests {
     /// rather than one it stores. Skipping such a row as "unchanged" leaves it
     /// storing a number that collides with one this batch just wrote.
     #[test]
-    fn enter_asks_for_the_whole_arrangement_not_a_diff() {
+    fn placing_asks_for_the_whole_arrangement_not_a_diff() {
         let mut a = app(&["aaa", "bbb", "ccc"]);
         a.on_key(Key::Char(' '));
         a.on_key(Key::Down);
-        let request = a.on_key(Key::Enter);
+        let request = a.on_key(Key::Char(' '));
         assert_eq!(*a.mode(), Mode::Normal);
         assert_eq!(
             request,
@@ -1210,16 +1216,17 @@ mod tests {
         let mut a = app(&["aaa", "bbb", "ccc"]);
         a.on_key(Key::Char(' '));
         assert_eq!(
-            a.on_key(Key::Enter),
+            a.on_key(Key::Char(' ')),
             Request::None,
             "picked up and put down"
         );
+        assert_eq!(*a.mode(), Mode::Normal, "a double-tap leaves no edit open");
 
         a.on_key(Key::Char(' '));
         a.on_key(Key::Down);
         a.on_key(Key::Up);
         assert_eq!(
-            a.on_key(Key::Enter),
+            a.on_key(Key::Char(' ')),
             Request::None,
             "moved and moved back is not a reorder"
         );
@@ -1252,8 +1259,9 @@ mod tests {
 
     /// Unlike the kill confirm, where anything but `y` dismisses. A `[y/N]` is
     /// one question; this is a multi-key edit holding an arrangement nothing has
-    /// written yet, and a stray keystroke must not decide its fate. Space is in
-    /// the list too: it grabs, it does not also place.
+    /// written yet, and a stray keystroke must not decide its fate. `Enter` is in
+    /// the list too: Space places, and the key that attaches everywhere else does
+    /// not double as the one that commits an arrangement.
     #[test]
     fn a_stray_key_does_not_end_a_reorder() {
         for key in [
@@ -1264,7 +1272,7 @@ mod tests {
             Key::Char('/'),
             Key::Char('?'),
             Key::Char('q'),
-            Key::Char(' '),
+            Key::Enter,
             Key::Tab,
             Key::Backspace,
             Key::Other,
@@ -1305,7 +1313,7 @@ mod tests {
         a.on_key(Key::Down);
         assert_eq!(arrangement(&a).0, ["gamma", "alpha"]);
 
-        let request = a.on_key(Key::Enter);
+        let request = a.on_key(Key::Char(' '));
         assert_eq!(
             request,
             Request::Reorder(vec![("id000002".into(), 1), ("id000000".into(), 3)]),
@@ -1326,7 +1334,7 @@ mod tests {
             assert_eq!(a.on_key(key), Request::None);
             assert_eq!(a.selected_index(), 0);
         }
-        assert_eq!(a.on_key(Key::Enter), Request::None, "nothing moved");
+        assert_eq!(a.on_key(Key::Char(' ')), Request::None, "nothing moved");
         assert_eq!(*a.mode(), Mode::Normal);
     }
 

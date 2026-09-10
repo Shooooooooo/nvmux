@@ -75,7 +75,10 @@ const EMPTY: &str = "no sessions — press c to create one";
 /// What the hint row says while a session is in flight. Undimmed, like the
 /// filter and the kill confirm: a mode holding an unwritten edit must not look
 /// like the ambient reminder of keys.
-const REORDER_HINTS: &str = "↑↓ move  ⏎ place  esc cancel";
+///
+/// `␣ place` is the same glyph the normal row spends on `␣ order`, and says
+/// so: the key that picked the session up is the one that puts it down.
+const REORDER_HINTS: &str = "↑↓ move  ␣ place  esc cancel";
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
