@@ -92,9 +92,13 @@ where it runs.
 
 `Enter` submits the whole form from any field, so `c` `Enter` creates a session in
 one keystroke — with the suggested `session N`, the command you last used, and
-your home directory. Each field shows what `Enter` would take, dimmed; typing
-replaces it, and `→` takes it into the field to be edited instead, which is
-usually what you want for the command.
+your home directory.
+
+The command and the directory are **already there** as ordinary text, ready to be
+edited: a command line is something you amend — a path to a nightly build, a
+`--clean` on the end — rather than write out. The name is the exception, shown
+dimmed as a suggestion, because `session N` is one you replace outright; typing
+over it does that, and `→` takes it into the field to be edited instead.
 
 A session name is at most 64 bytes, has no leading or trailing whitespace and
 no control characters, and must not be in use — compared without regard to

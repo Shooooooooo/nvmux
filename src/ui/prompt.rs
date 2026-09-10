@@ -30,27 +30,42 @@
 //! Renaming puts up the same screen with one field, since a rename starts
 //! nothing.
 //!
-//! # The defaults are placeholders, not pre-filled values
+//! # One field offers; two start where they are
 //!
-//! Enter on an empty field creates `session 1`, `session 2`, … with whatever
-//! command was last used on this host. Each default is shown dimmed *inside* its
-//! field, so it reads as what enter will do right now and costs nothing to
-//! discard, rather than needing to be backspaced away.
+//! The command and the working directory are **there** when the prompt opens, as
+//! ordinary text with the cursor after them. Both are things you amend rather
+//! than write — a path to a nightly build, a `--clean` on the end, one directory
+//! further down — so having to take them into the field first was a keystroke
+//! spent arriving at the state you already wanted.
 //!
-//! Renaming inverts that and the same field serves both: it *starts* pre-filled,
-//! because a rename edits something that already exists. Clear it and the
-//! current name reappears as the default — which is the truth either way, since
-//! the default is always what enter would submit if you typed nothing.
+//! The session name is the exception, and stays a dimmed placeholder: `session 3`
+//! is a suggestion you replace outright, and typing over it is exactly what
+//! discarding it should cost. It is also the one field `→` and `End` still have
+//! a default to take, for the case where you want to edit the suggestion rather
+//! than replace it.
 //!
-//! Being a placeholder is also why the cursor *inverts* its first letter rather
+//! Being a placeholder is why the cursor *inverts* the name's first letter rather
 //! than taking a column in front of it: the default then occupies exactly the
 //! columns your own text will, and nothing shifts when you start typing.
 //!
-//! A command, though, is usually a small edit of the default rather than
-//! something written from scratch — and it is long. So `→` and `End` on an empty
-//! field take the default into it, cursor at the end, instead of moving a cursor
-//! that has nowhere to go. One keypress to edit the default; typing anything
-//! else still replaces it outright.
+//! Renaming inverts all of this and the same field serves it: it starts
+//! pre-filled, because a rename edits something that already exists. Clear any of
+//! them and the default reappears dimmed — which is the truth either way, since
+//! the default is always what enter would submit if the field were left empty.
+//!
+//! # Three weights, and what each one means
+//!
+//! Nothing on this screen sets a colour; every distinction is a modifier, for the
+//! reasons [`super::draw`] gives. There are three:
+//!
+//! * **dim** — text that is not deciding anything: every field's label, a
+//!   default nobody has touched, the hint row, and the half of a path a `//` has
+//!   discarded.
+//! * **plain** — what you typed and what enter will use. The labels receded so
+//!   that this, the only text at full weight, is what the eye lands on.
+//! * **reversed** — the cursor, one cell, wherever it is. Paired with bold it
+//!   means something else entirely: the selected row of the menu, which is the
+//!   picker's signal for the same idea.
 //!
 //! # One key, one job
 //!
@@ -351,7 +366,12 @@ impl Prompt {
         Self {
             fields: vec![
                 Field::new(labels[0].clone(), String::new(), default_name),
-                Field::new(labels[1].clone(), String::new(), default_command),
+                // Pre-filled like the directory below it: a command line is a
+                // thing you edit — a path to a nightly build, a `--clean` on the
+                // end — not one you write out. The name above is the exception
+                // and stays a placeholder, because `session 3` is a suggestion
+                // you replace outright rather than amend.
+                Field::new(labels[1].clone(), default_command.clone(), default_command),
                 // Pre-filled rather than offered: home is where this field
                 // starts, so `Tab` lists what is in it before anything is typed
                 // and there is no placeholder to displace. The default is the
@@ -390,7 +410,7 @@ impl Prompt {
             return "⏎ rename   esc cancel";
         }
         if self.choosing() {
-            "⇥ ⏎ accept   ↑↓ ^n ^p choose   esc close"
+            "⇥ ⏎ accept   ↑↓ choose   esc close"
         } else {
             "⏎ create   ↑↓ field   ⇥ complete   esc cancel"
         }
@@ -1058,9 +1078,13 @@ fn field_line(field: &Field, focused: bool, width: usize) -> Line<'static> {
     // would otherwise fill the line and push it off the right edge.
     let label = draw::truncate(&field.label, width.saturating_sub(1));
     let room = width.saturating_sub(label.width() + 1);
+    // Dim, not bold: a label is the least interesting thing on its line, and
+    // every one of them says the same thing on every prompt. What changes — what
+    // you typed, what enter would take — leads by being the only text at full
+    // weight.
     let mut spans = vec![Span::styled(
         label,
-        Style::default().add_modifier(Modifier::BOLD),
+        Style::default().add_modifier(Modifier::DIM),
     )];
 
     // Plain REVERSED, not the picker's REVERSED|BOLD: that pairing means "the
@@ -1350,10 +1374,10 @@ mod tests {
     /// does not cost an extra keystroke to get back.
     #[test]
     fn enter_submits_the_whole_form_from_either_field() {
-        let mut p = prompt();
+        let mut p = at_command("nvim -u NONE --listen {sock}");
+        p.on_key(Key::Up);
         type_in(&mut p, "notes");
         p.on_key(Key::Down);
-        type_in(&mut p, "nvim -u NONE --listen {sock}");
         assert_eq!(p.focus, COMMAND);
         assert_eq!(
             submitted(&mut p),
@@ -1388,10 +1412,9 @@ mod tests {
 
     #[test]
     fn a_rejected_submission_is_kept_so_it_can_be_edited() {
-        let mut p = prompt();
+        let mut p = at_command("nvim");
+        p.on_key(Key::Up);
         type_in(&mut p, "notes");
-        p.on_key(Key::Down);
-        type_in(&mut p, "nvim");
         p.fail(
             "a session named \"notes\" already exists".to_string(),
             Some("session 4".to_string()),
@@ -1427,9 +1450,14 @@ mod tests {
     fn typing_goes_to_the_focused_field_only() {
         let mut p = prompt();
         p.on_key(Key::Down);
-        type_in(&mut p, "nvim");
-        assert_eq!(p.fields[NAME].input, "");
-        assert_eq!(p.fields[COMMAND].input, "nvim");
+        assert_eq!(p.focus, COMMAND);
+        type_in(&mut p, " --clean");
+        assert_eq!(p.fields[NAME].input, "", "the name is untouched");
+        assert_eq!(
+            p.fields[COMMAND].input,
+            format!("{COMMAND_DEFAULT} --clean"),
+            "and the command took every keystroke, appended to what was there"
+        );
     }
 
     // --- editing within a field --------------------------------------------
@@ -1488,21 +1516,19 @@ mod tests {
     /// default rather than retype it. Typing anything else still replaces it.
     #[test]
     fn right_or_end_takes_the_default_into_an_empty_field() {
+        // The session name, which is the only field left with a placeholder to
+        // take: the other two start at their defaults as real text.
         for key in [Key::Right, Key::End] {
             let mut p = prompt();
-            p.on_key(Key::Down);
             p.on_key(key);
-            let field = &p.fields[COMMAND];
-            assert_eq!(field.input, COMMAND_DEFAULT, "{key:?}");
+            let field = &p.fields[NAME];
+            assert_eq!(field.input, "session 3", "{key:?}");
             assert_eq!(field.cursor, field.len(), "{key:?}: cursor at the end");
 
             // …and now it is ordinary text, editable from the end.
-            press(&mut p, &[Key::Backspace; 6]);
-            type_in(&mut p, "{sock} --clean");
-            assert_eq!(
-                p.fields[COMMAND].input,
-                "nvim --headless --listen {sock} --clean"
-            );
+            press(&mut p, &[Key::Backspace]);
+            type_in(&mut p, "9");
+            assert_eq!(p.fields[NAME].input, "session 9");
         }
     }
 
@@ -1602,6 +1628,32 @@ mod tests {
         p
     }
 
+    /// The command field, focused, holding exactly `line`.
+    ///
+    /// Set rather than typed for the reason `at_directory` gives: the field
+    /// starts pre-filled with the default now, so typing a command would append
+    /// to it rather than be it.
+    fn at_command(line: &str) -> Prompt {
+        let mut p = prompt();
+        p.on_key(Key::Down);
+        assert_eq!(p.focus, COMMAND);
+        let field = &mut p.fields[COMMAND];
+        field.input = line.to_string();
+        field.cursor = field.len();
+        p
+    }
+
+    /// The line's cells with the label's columns dropped.
+    ///
+    /// The label used to be findable by its bold, and is dim now — the same
+    /// weight the discarded half of a path is drawn in. Counting its columns is
+    /// what keeps the two apart, and a test that went on skipping bold would
+    /// quietly measure the label as if it were part of the value.
+    fn after_label(p: &Prompt, w: u16, h: u16) -> Vec<Cell> {
+        let width = p.fields[p.focus].label.width();
+        line_cells(p, w, h).into_iter().skip(width).collect()
+    }
+
     /// The directory field, focused, holding exactly `path`, with no menu.
     ///
     /// The focus moves the real way, with the movement keys, because that is the
@@ -1627,8 +1679,8 @@ mod tests {
         menu.selected = 0;
     }
 
-    /// Four roles on one line, told apart by modifier alone since nothing here
-    /// sets a colour.
+    /// Three roles on one line, told apart by modifier alone since nothing here
+    /// sets a colour — and the cursor is the only one of them at full weight.
     #[test]
     fn the_label_leads_the_cursor_marks_the_field_and_the_default_recedes() {
         let label = "new session name:  ".width();
@@ -1638,8 +1690,8 @@ mod tests {
         assert!(
             empty[..label]
                 .iter()
-                .all(|(_, m)| m.contains(Modifier::BOLD)),
-            "the label must be bold: {empty:?}"
+                .all(|(_, m)| m.contains(Modifier::DIM)),
+            "the label must recede: {empty:?}"
         );
         assert_eq!(
             empty[label].1,
@@ -1658,8 +1710,8 @@ mod tests {
         assert!(
             typed[..label]
                 .iter()
-                .all(|(_, m)| m.contains(Modifier::BOLD)),
-            "the label must stay bold once typing starts: {typed:?}"
+                .all(|(_, m)| m.contains(Modifier::DIM)),
+            "the label must stay receded once typing starts: {typed:?}"
         );
         assert!(
             typed[label..label + 5].iter().all(|(_, m)| m.is_empty()),
@@ -1671,9 +1723,86 @@ mod tests {
             "the cursor trails what was typed, over a blank"
         );
         assert!(
-            typed.iter().all(|(_, m)| !m.contains(Modifier::DIM)),
-            "nothing on a typed line is dim: {typed:?}"
+            typed[label..]
+                .iter()
+                .all(|(_, m)| !m.contains(Modifier::DIM)),
+            "past the label, nothing on a typed line is dim: {typed:?}"
         );
+    }
+
+    /// Every label on every prompt. They say the same thing on every screen and
+    /// are the least interesting text on it, so none of them is at full weight.
+    #[test]
+    fn the_labels_recede_so_the_values_lead() {
+        for focus in [NAME, COMMAND, DIRECTORY] {
+            let mut p = prompt();
+            for _ in 0..focus {
+                p.on_key(Key::Down);
+            }
+            let width = p.fields[focus].label.width();
+            let cells = line_cells(&p, 70, 14);
+            assert!(
+                cells[..width]
+                    .iter()
+                    .all(|(_, m)| m.contains(Modifier::DIM)),
+                "field {focus}'s label must recede: {:?}",
+                &cells[..width]
+            );
+        }
+
+        // The rename prompt draws through the same code and recedes with them.
+        let p = renaming("dotfiles");
+        let width = p.fields[NAME].label.width();
+        let cells = line_cells(&p, 70, 14);
+        assert!(
+            cells[..width]
+                .iter()
+                .all(|(_, m)| m.contains(Modifier::DIM)),
+            "the rename label must recede too: {:?}",
+            &cells[..width]
+        );
+    }
+
+    /// A command line is a thing you edit — a path to a nightly build, a
+    /// `--clean` on the end — so it is there to be edited rather than offered.
+    #[test]
+    fn the_command_field_starts_at_its_default_rather_than_offering_it() {
+        let p = prompt();
+        assert_eq!(p.fields[COMMAND].input, COMMAND_DEFAULT, "really there");
+        assert_eq!(
+            p.fields[COMMAND].cursor,
+            p.fields[COMMAND].len(),
+            "with the cursor after it"
+        );
+
+        // Editable from the end with no adopt step in the way.
+        let mut p = prompt();
+        p.on_key(Key::Down);
+        type_in(&mut p, " --clean");
+        assert_eq!(
+            p.fields[COMMAND].input,
+            format!("{COMMAND_DEFAULT} --clean")
+        );
+    }
+
+    /// The one field of the three that still offers rather than starts, and
+    /// deliberately: `session 3` is a suggestion you replace outright, where a
+    /// command and a directory are starting points you amend. Pinned so that if
+    /// it ever changes it changes on purpose.
+    #[test]
+    fn only_the_session_name_is_still_a_placeholder() {
+        let p = prompt();
+        assert!(
+            p.fields[NAME].input.is_empty(),
+            "the name is offered, not prefilled"
+        );
+        assert!(!p.fields[COMMAND].input.is_empty());
+        assert!(!p.fields[DIRECTORY].input.is_empty());
+
+        // And it is the only field `→` still has a default to adopt into.
+        let mut p = prompt();
+        p.on_key(Key::Right);
+        assert_eq!(p.fields[NAME].input, p.fields[NAME].default);
     }
 
     /// Two cursors would leave no way to tell which field a keystroke reaches.
@@ -2027,8 +2156,14 @@ mod tests {
 
         let open = render(&menuing("/home/", &["alpha"]), 60, 14);
         assert!(
-            open[13].contains("⇥ ⏎ accept") && open[13].contains("choose"),
+            open[13].contains("⇥ ⏎ accept") && open[13].contains("↑↓ choose"),
             "expected the hints to follow the menu, got {:?}",
+            open[13]
+        );
+        assert!(
+            !open[13].contains('^'),
+            "the arrows say it in half the width; the chords still work but do \
+             not need a place on a row that has to fit a narrow terminal: {:?}",
             open[13]
         );
     }
@@ -2119,8 +2254,10 @@ mod tests {
     /// home part of it.
     #[test]
     fn the_part_that_no_longer_counts_is_dim_and_the_rest_is_not() {
+        // Past the label, which is dim too now: what is being measured here is
+        // the part of the *path* that no longer counts.
         let dim_text = |p: &Prompt| -> String {
-            line_cells(p, 60, 14)
+            after_label(p, 60, 14)
                 .iter()
                 .filter(|(_, m)| m.contains(Modifier::DIM))
                 .map(|(s, _)| s.as_str())
@@ -2150,28 +2287,20 @@ mod tests {
     fn a_dim_prefix_survives_a_field_too_narrow_for_it() {
         for width in [24u16, 30, 40, 60] {
             let mut p = at_directory("/home/you/a-long-directory-name//etc");
-            let cells = line_cells(&p, width, 14);
-            // The label is bold and comes first; after it, every dim cell must
-            // come before every live one. The boundary is one place in the text,
-            // so it has to be one place on the screen however the window moved.
-            let after_label: Vec<_> = cells
-                .iter()
-                .skip_while(|(_, m)| m.contains(Modifier::BOLD))
-                .collect();
-            let last_dim = after_label
-                .iter()
-                .rposition(|(_, m)| m.contains(Modifier::DIM));
-            let first_live = after_label
-                .iter()
-                .position(|(_, m)| !m.contains(Modifier::DIM));
+            // Past the label: after it, every dim cell must come before every
+            // live one. The boundary is one place in the text, so it has to be
+            // one place on the screen however the window moved.
+            let value: Vec<_> = after_label(&p, width, 14);
+            let last_dim = value.iter().rposition(|(_, m)| m.contains(Modifier::DIM));
+            let first_live = value.iter().position(|(_, m)| !m.contains(Modifier::DIM));
             if let (Some(last), Some(first)) = (last_dim, first_live) {
                 assert!(
                     last < first,
-                    "the dim half is not contiguous at {width}: {after_label:?}"
+                    "the dim half is not contiguous at {width}: {value:?}"
                 );
             }
 
-            let live: String = after_label
+            let live: String = value
                 .iter()
                 .filter(|(_, m)| !m.contains(Modifier::DIM))
                 .map(|(s, _)| s.as_str())
@@ -2184,7 +2313,7 @@ mod tests {
             // With the cursor dragged back into the discarded half, it keeps its
             // own weight and everything around it stays dim.
             p.on_key(Key::Home);
-            let cells = line_cells(&p, width, 14);
+            let cells = after_label(&p, width, 14);
             let cursors = cells
                 .iter()
                 .filter(|(_, m)| m.contains(Modifier::REVERSED) && !m.contains(Modifier::BOLD))
