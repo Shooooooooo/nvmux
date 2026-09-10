@@ -113,9 +113,10 @@ pub struct PopupSettings {
 impl Default for PopupSettings {
     fn default() -> Self {
         Self {
-            // Long enough to read a name without looking for it, short enough
-            // that it is gone before the first keystroke of real work lands.
-            duration_ms: 1200,
+            // A second: long enough to catch a name out of the corner of the
+            // eye, short enough that a box in the middle of the screen is gone
+            // before it is in the way of anything.
+            duration_ms: 1000,
         }
     }
 }
@@ -405,7 +406,7 @@ mod tests {
             [session]\n\
             command = \"nvim --headless --listen {sock}\"\n\
             [popup]\n\
-            duration_ms = 1200\n";
+            duration_ms = 1000\n";
         let s: Settings = toml::from_str(doc).expect("valid");
         assert_eq!(s, Settings::default());
     }
@@ -538,7 +539,7 @@ mod tests {
             rendered.contains("# command = \"nvim --headless --listen {sock}\""),
             "the template must document the command: {rendered:?}"
         );
-        assert!(rendered.contains("# duration_ms = 1200"));
+        assert!(rendered.contains("# duration_ms = 1000"));
     }
 
     // --- path resolution (pure) --------------------------------------------
