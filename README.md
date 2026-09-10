@@ -95,19 +95,13 @@ exported by the editor; it is what nvmux checks for.)
 
 ### Leaving a session
 
-Three ways out, and they do different things.
-
 - **`<prefix> d` detaches.** The session keeps running with all its buffers,
   undo history and jumplist; reattach later, from this machine or another one.
-  Each session also gets a `:Detach` alias for `:detach`.
-- **`:q` ends the session.** The editor *is* the session, so `:q` in the last
-  window terminates the server, not just your view — as do `:qa`, `ZZ`, `ZQ`,
-  `:x`, `:wq` and `<C-w>q`. That is the ordinary way to finish and keep your
-  work: save as usual, then quit as usual. If you expected `:q` to close only
-  your local view, that is the one thing to unlearn.
-- **`x` in the picker kills, unconditionally.** It asks `kill "name"? [y/N]`
-  and then kills, without asking the session about unsaved buffers. Use `:q`
-  for the editor's own save prompts.
+- **`:q` ends the session.** The editor *is* the session, so quitting the last
+  window terminates the server, not just your view. That is the one thing to
+  unlearn.
+- **`x` in the picker kills**, without asking the session about unsaved
+  buffers. Use `:q` for the editor's own save prompts.
 
 ## Configuration
 
