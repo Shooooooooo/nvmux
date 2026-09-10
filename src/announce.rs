@@ -195,15 +195,15 @@ impl Popup {
     }
 }
 
-/// The overlay as terminal bytes: a bordered box in the bottom-right corner.
+/// The overlay as terminal bytes: a bordered box in the middle of the screen.
 ///
 /// Pure, so the geometry can be tested without a terminal. `None` when the
 /// screen cannot hold even a one-column box.
 ///
-/// The corner rather than the middle: the middle is where the text you have
-/// just switched to is. It does sit over the last three rows on the right —
-/// the statusline and the message row among them — for as long as it is up,
-/// which is what a corner costs and is why it is not up for long.
+/// The middle, where it cannot be missed. It is squarely over the text you have
+/// just switched to, which is the whole reason it is up for only a second: this
+/// is a notice to be caught out of the corner of the eye and then gone, not
+/// something to read.
 ///
 /// What the sequence has to get right, in order:
 ///
@@ -219,11 +219,10 @@ impl Popup {
 /// * an absolute `CUP` per row, and not one newline or carriage return
 ///   anywhere. `OPOST` is off in raw mode (see [`crate::term`]), so those move
 ///   the cursor rather than wrapping and are the classic way to corrupt a raw
-///   overlay. It also means the box never scrolls the screen, which in this
-///   corner is not a small thing: its last cell is the very last cell of the
-///   terminal, and the pending-wrap flag that sets is discarded by the next
-///   `CUP`, or — on the closing row — by the `DECRC` that is the last thing
-///   written. Nothing printable ever follows it.
+///   overlay. It also means a box as wide as the screen never scrolls it: the
+///   pending-wrap flag its last cell sets is discarded by the next `CUP`, or —
+///   on the closing row — by the `DECRC` that is the last thing written.
+///   Nothing printable ever follows it.
 pub fn overlay_bytes(label: &str, size: PtySize) -> Option<Vec<u8>> {
     if size.cols < MIN_COLS || size.rows < MIN_ROWS {
         return None;
@@ -239,11 +238,13 @@ pub fn overlay_bytes(label: &str, size: PtySize) -> Option<Vec<u8>> {
     let inner = text.width() + 2 * PAD;
     let width = inner + 2;
 
-    // Flush into the corner, in the terminal's own 1-based coordinates. Both
-    // subtractions are safe: the guard above puts `rows` at three or more, and
-    // `width` cannot exceed `cols` because the text was truncated to fit it.
-    let left = usize::from(size.cols) - width + 1;
-    let top = usize::from(size.rows) - 2;
+    // Centred, in the terminal's own 1-based coordinates. Both subtractions are
+    // safe: the guard above puts `rows` at three or more, and `width` cannot
+    // exceed `cols` because the text was truncated to fit it. Odd slack falls
+    // above and to the left, which is what integer division does and is not
+    // worth a correction nobody could see.
+    let left = (usize::from(size.cols) - width) / 2 + 1;
+    let top = (usize::from(size.rows) - 3) / 2 + 1;
     let pad = " ".repeat(PAD);
     let bar = "─".repeat(inner);
     let rows = [
@@ -399,14 +400,16 @@ mod tests {
             for (i, (row, col)) in placements.iter().enumerate() {
                 assert_eq!(
                     *row,
-                    usize::from(rows) - 2 + i,
-                    "the box sits in the bottom-right corner"
+                    (usize::from(rows) - 3) / 2 + 1 + i,
+                    "the box is not vertically centred"
                 );
                 assert!(*row <= usize::from(rows), "row {row} past {rows}");
-                assert_eq!(
-                    col + widths[i],
-                    usize::from(cols) + 1,
-                    "the box is flush with the right-hand edge"
+                // Centred to within the odd column integer division leaves over.
+                let before = col - 1;
+                let after = usize::from(cols) - (before + widths[i]);
+                assert!(
+                    before.abs_diff(after) <= 1,
+                    "{cols}x{rows}: {before} columns left, {after} right"
                 );
                 assert!(
                     col + widths[i] <= usize::from(cols) + 1,

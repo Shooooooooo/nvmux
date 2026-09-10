@@ -164,7 +164,7 @@ knowing a single number. One killed from somewhere else is simply skipped: you
 land on the nearest number that is still there.
 
 Landing somewhere new says so: the session's name appears in a box in the
-bottom-right corner for a moment, then goes. That happens whenever the session
+middle of the screen for a second, then goes. That happens whenever the session
 *changes* — a pick from the picker, `<prefix> 3`, `<prefix> n`, or a
 `<prefix> c` that created something — and never after `<prefix> Space` or
 `<prefix> ?`, which bring you back to the session you were already in. The box
@@ -230,7 +230,7 @@ timeout_ms = 500            # how long a lone prefix or half-typed number waits
 command = "nvim --headless --listen {sock}"   # what a new session starts
 
 [popup]
-duration_ms = 1200          # how long the session notice stays; 0 turns it off
+duration_ms = 1000          # how long the session notice stays; 0 turns it off
 ```
 
 ### The command a session runs
