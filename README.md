@@ -105,13 +105,9 @@ exported by the editor; it is what nvmux checks for.)
 
 ## Configuration
 
-nvmux needs no configuration. To move the prefix key or change how long it
-waits, it reads an optional TOML file — `$NVMUX_CONFIG` if set, else
-`$XDG_CONFIG_HOME/nvmux/config.toml`, else `~/.config/nvmux/config.toml`. Any
-omitted field keeps its default; an unknown key or a bad value is a startup
-error.
-
-Every value below is its default:
+nvmux needs no configuration. An optional TOML file — `$NVMUX_CONFIG` if set,
+else `$XDG_CONFIG_HOME/nvmux/config.toml`, else `~/.config/nvmux/config.toml` —
+overrides the defaults below; an unknown key or a bad value is a startup error.
 
 ```toml
 [keys]
