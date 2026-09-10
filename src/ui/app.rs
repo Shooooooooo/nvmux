@@ -20,8 +20,8 @@ pub enum Mode {
     },
     /// A session has been picked up and is being moved. `was` is every visible
     /// row's `(id, state.num)` as it stood when the grab started: all `Esc`
-    /// needs to put everything back, and all `Enter` needs to tell a real move
-    /// from a grab that went nowhere.
+    /// needs to put everything back, and all a placing `Space` needs to tell a
+    /// real move from a grab that went nowhere.
     Reorder {
         id: String,
         was: Vec<(String, u32)>,
@@ -72,6 +72,9 @@ pub struct App {
     /// Digits typed so far towards a session number, when more digits could
     /// still change which session is meant. See [`App::on_digit`].
     pending: Option<u32>,
+    /// The session the picker was opened from and can be dismissed back to.
+    /// See [`App::set_came_from`].
+    came_from: Option<String>,
 }
 
 impl App {
@@ -83,6 +86,7 @@ impl App {
             mode: Mode::Normal,
             message: None,
             pending: None,
+            came_from: None,
         }
     }
 
@@ -108,6 +112,18 @@ impl App {
         if let Some(at) = self.visible().iter().position(|s| s.id == id) {
             self.selected = at;
         }
+    }
+
+    /// Name the session the picker was opened from, so `Esc` can dismiss the
+    /// picker back to it.
+    ///
+    /// Only worth setting when there is still a client behind that session —
+    /// `<prefix> Space` leaves one running, a failed attach and an exited child
+    /// do not. A session that has gone from the list since is not gone back to
+    /// either: killing the session you came from leaves `Esc` with nothing to
+    /// do, which is better than dismissing the picker onto a dead client.
+    pub fn set_came_from(&mut self, id: &str) {
+        self.came_from = Some(id.to_string());
     }
 
     pub fn mode(&self) -> &Mode {
@@ -362,12 +378,25 @@ impl App {
         }
     }
 
+    /// Leave the picker for the session it was opened from.
+    ///
+    /// Nothing to go back to — opened from no session, or from one that has
+    /// since gone — is not an error and not a quit: the picker stays, because
+    /// dismissing it would leave the user looking at a terminal with nothing in
+    /// it. `q` is how you leave for good.
+    fn dismiss(&self) -> Request {
+        match &self.came_from {
+            Some(id) if self.session(id).is_some() => Request::Attach(id.clone()),
+            _ => Request::None,
+        }
+    }
+
     fn on_key_normal(&mut self, key: Key) -> Request {
         // Any key that is not a digit ends a half-typed number rather than
-        // letting it linger into an unrelated keystroke.
-        if !matches!(key, Key::Char('0'..='9')) {
-            self.pending = None;
-        }
+        // letting it linger into an unrelated keystroke. Whether there was one
+        // is what tells an `Esc` aimed at the number from one aimed at the
+        // picker.
+        let was_pending = !matches!(key, Key::Char('0'..='9')) && self.pending.take().is_some();
         match key {
             Key::Char(c @ '0'..='9') => self.on_digit(u32::from(c) - u32::from('0')),
             Key::Char('j') | Key::Down | Key::CtrlN => {
@@ -409,10 +438,20 @@ impl App {
                 Request::None
             }
             Key::Char('?') => Request::Help,
+            // One layer at a time, innermost first: a half-typed number, then
+            // a filter narrowing the list, then the picker itself. Each of the
+            // first two is something the user put there and can see, and would
+            // be thrown away unremarked by an Esc that left outright.
             Key::Esc => {
-                self.filter.clear();
-                self.clamp_selection();
-                Request::None
+                if was_pending {
+                    return Request::None;
+                }
+                if !self.filter.is_empty() {
+                    self.filter.clear();
+                    self.clamp_selection();
+                    return Request::None;
+                }
+                self.dismiss()
             }
             Key::Char('q') | Key::CtrlC => Request::Quit,
             _ => Request::None,
@@ -750,6 +789,71 @@ mod tests {
         assert_eq!(a.filter(), "o");
         a.on_key(Key::Esc);
         assert_eq!(a.filter(), "", "esc in normal mode clears the filter");
+    }
+
+    /// `<prefix> Space` leaves the client running, so the picker is a layer over
+    /// a session rather than a replacement for it, and `Esc` is the way back
+    /// down — same as everywhere else it means "never mind".
+    #[test]
+    fn esc_dismisses_the_picker_back_to_the_session_it_came_from() {
+        let mut a = app(&["one", "two", "three"]);
+        a.set_came_from("id000001");
+        a.on_key(Key::Char('G')); // the cursor need not be on it
+        assert_eq!(a.on_key(Key::Esc), Request::Attach("id000001".into()));
+    }
+
+    /// The first screen of the program is the picker, with nothing behind it.
+    /// Dismissing it would leave the user looking at an empty terminal, so `Esc`
+    /// does nothing and `q` is still the way out.
+    #[test]
+    fn esc_does_nothing_when_the_picker_was_not_opened_from_a_session() {
+        let mut a = app(&["one", "two"]);
+        assert_eq!(a.on_key(Key::Esc), Request::None);
+    }
+
+    /// Killing the session you came from takes the client with it, so there is
+    /// nothing left to go back to — and attaching to it would be attaching to
+    /// something that is gone.
+    #[test]
+    fn esc_does_not_go_back_to_a_session_that_has_since_been_killed() {
+        let mut a = app(&["one", "two"]);
+        a.set_came_from("id000000");
+        a.on_key(Key::Char('x'));
+        assert_eq!(a.on_key(Key::Char('y')), Request::Kill("id000000".into()));
+        a.set_sessions(vec![]);
+
+        assert_eq!(a.on_key(Key::Esc), Request::None);
+    }
+
+    /// Innermost first. Both of these are things the user typed and can see, and
+    /// an `Esc` that left outright would throw them away without saying so.
+    #[test]
+    fn esc_clears_what_is_half_typed_before_it_dismisses_anything() {
+        let mut a = app(&["one", "two"]);
+        a.set_came_from("id000000");
+
+        a.on_key(Key::Char('/'));
+        a.on_key(Key::Char('o'));
+        a.on_key(Key::Enter); // filter applied, back in normal mode
+        assert_eq!(a.on_key(Key::Esc), Request::None, "the filter goes first");
+        assert_eq!(a.filter(), "");
+
+        // Sessions 1 and 12 both present, so the digit is genuinely half-typed.
+        let mut a = app(&[
+            "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+            "eleven", "twelve",
+        ]);
+        a.set_came_from("id000000");
+        a.on_key(Key::Char('1'));
+        assert_eq!(a.pending(), Some(1));
+        assert_eq!(a.on_key(Key::Esc), Request::None, "the number goes first");
+        assert_eq!(a.pending(), None);
+
+        assert_eq!(
+            a.on_key(Key::Esc),
+            Request::Attach("id000000".into()),
+            "with nothing left to clear, esc dismisses the picker"
+        );
     }
 
     /// Naming a session happens on the prompt's own screen, so the picker's job

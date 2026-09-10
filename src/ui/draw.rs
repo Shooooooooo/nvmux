@@ -72,9 +72,11 @@ const NUM_GAP: &str = "  ";
 const HINTS: &str = "↑↓ move  ⏎ attach  c new  r rename  x kill  ␣ order  / filter  q quit";
 const EMPTY: &str = "no sessions — press c to create one";
 
-/// What the hint row says while a session is in flight. Undimmed, like the
-/// filter and the kill confirm: a mode holding an unwritten edit must not look
-/// like the ambient reminder of keys.
+/// What the hint row says while a session is in flight. Dim, like the hints it
+/// stands in for: it is the same kind of thing — a reminder of which keys are
+/// live — and the row that says an edit is open is the one wearing the marker,
+/// not this one. The filter and the kill confirm stay undimmed because they are
+/// something being asked or typed, which this is not.
 ///
 /// `␣ place` is the same glyph the normal row spends on `␣ order`, and says
 /// so: the key that picked the session up is the one that puts it down.
@@ -205,11 +207,11 @@ fn draw_bottom(frame: &mut Frame, app: &App, area: Rect) {
         // The query comes too, when there is one. A move of one visible row can
         // carry a session past several the filter is hiding, and that is the one
         // moment the screen must not also stop saying a filter is applied — the
-        // reason the dim `/query` below exists at all.
+        // reason the `/query` in normal mode exists at all.
         Mode::Reorder { .. } if !app.filter().is_empty() => {
-            (format!("{REORDER_HINTS}  /{}", app.filter()), false)
+            (format!("{REORDER_HINTS}  /{}", app.filter()), true)
         }
-        Mode::Reorder { .. } => (REORDER_HINTS.to_string(), false),
+        Mode::Reorder { .. } => (REORDER_HINTS.to_string(), true),
         Mode::Normal => match app.message() {
             Some(msg) => (msg.to_string(), false),
             // A number waiting on another digit; without this the picker would
@@ -426,6 +428,16 @@ mod tests {
         }
         a.on_key(super::super::app::Key::Char(' '));
         assert!(matches!(a.mode(), Mode::Reorder { .. }), "the grab took");
+        a
+    }
+
+    /// The filter prompt open with `query` typed into it.
+    fn filtering(names: &[&str], query: &str) -> App {
+        let mut a = app(names);
+        a.on_key(super::super::app::Key::Char('/'));
+        for c in query.chars() {
+            a.on_key(super::super::app::Key::Char(c));
+        }
         a
     }
 
@@ -685,6 +697,43 @@ mod tests {
 
         let b = reordering(&["one", "two", "three"], 1);
         test_support::assert_no_colour(50, 8, |f| draw(f, &b));
+    }
+
+    /// Both hint rows are hints, so both are dim. The prompts are not — the
+    /// filter and the kill confirm are being typed or asked, and would recede
+    /// into the wallpaper if they were.
+    #[test]
+    fn the_reorder_hints_are_dim_like_the_ordinary_ones() {
+        let mut with_filter = app(&["api-server", "dotfiles"]);
+        with_filter.on_key(super::super::app::Key::Char('/'));
+        with_filter.on_key(super::super::app::Key::Char('d'));
+        with_filter.on_key(super::super::app::Key::Enter);
+        with_filter.on_key(super::super::app::Key::Char(' '));
+        assert!(
+            matches!(with_filter.mode(), Mode::Reorder { .. }),
+            "the grab took"
+        );
+
+        for (what, a, want_dim) in [
+            ("plain hints", app(&["one", "two"]), true),
+            ("reorder hints", reordering(&["one", "two"], 0), true),
+            ("reorder hints with a filter", with_filter, true),
+            ("the filter prompt", filtering(&["one", "two"], "on"), false),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(60, 6)).expect("terminal");
+            terminal.draw(|f| draw(f, &a)).expect("draw");
+            let buf = terminal.backend().buffer().clone();
+            let row = buf.area.height - 1;
+            let cell = (0..buf.area.width)
+                .map(|x| &buf[(x, row)])
+                .find(|c| c.symbol().trim() != "")
+                .expect("something on the hint row");
+            assert_eq!(
+                cell.modifier.contains(Modifier::DIM),
+                want_dim,
+                "{what}: wanted dim={want_dim}"
+            );
+        }
     }
 
     #[test]

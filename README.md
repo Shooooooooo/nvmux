@@ -77,7 +77,7 @@ reimplementing it.
 | `x` | kill |
 | `/` | filter |
 | `?` | show the `<prefix>` keys |
-| `Esc` | clear the filter, or cancel a prompt |
+| `Esc` | clear the filter or a half-typed number, then go back to the session you came from |
 | `q` `Ctrl-c` | quit |
 
 `c` asks three things: what the session is called, how its Neovim is started, and
@@ -150,7 +150,7 @@ one listing serves a whole directory, so a path costs about one round trip per
 | Keys | Action |
 |---|---|
 | `<prefix>` `d` | detach — leaves the session running, exits nvmux |
-| `<prefix>` `Space` | back to the picker, session still attached |
+| `<prefix>` `Space` | back to the picker, session still attached — `Esc` goes back |
 | `<prefix>` `1`, `2`, … `12` | switch straight to that session |
 | `<prefix>` `n` | next session by number — wraps at the end |
 | `<prefix>` `p` | previous session by number — wraps at the start |
