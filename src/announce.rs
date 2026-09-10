@@ -55,6 +55,15 @@ const SETTLE: Duration = Duration::from_millis(25);
 /// How long to wait for that lull before giving up on the announcement.
 const GIVE_UP: Duration = Duration::from_secs(2);
 
+/// How long the box stays up.
+///
+/// A second: long enough to catch a name out of the corner of the eye, short
+/// enough that a box in the middle of the screen — squarely over the text you
+/// have just switched to — is gone before it is in the way of anything. Not a
+/// setting, because there is no second answer worth the config key: shorter and
+/// it is a flicker, longer and it is something you wait out on every switch.
+const DURATION: Duration = Duration::from_secs(1);
+
 /// Columns between the box's border and its text.
 const PAD: usize = 1;
 
@@ -108,7 +117,6 @@ pub enum Act {
 #[derive(Debug)]
 pub struct Popup {
     label: String,
-    duration: Duration,
     /// When the child was last seen with nothing to say, or `None` if it spoke
     /// on the last pass.
     quiet_since: Option<Instant>,
@@ -122,20 +130,14 @@ pub struct Popup {
 }
 
 impl Popup {
-    /// `None` when there is nothing to say, or `popup.duration_ms` is zero — so
-    /// the relay carries no state at all for a user who turned this off.
+    /// `None` when there is nothing to say — including a label with nothing
+    /// left in it, which is what a name of nothing but control characters comes
+    /// to once [`label`] has been through it. The relay then carries no state at
+    /// all rather than a popup that would decline to draw itself later.
     pub fn arm(label: Option<String>, now: Instant) -> Option<Self> {
-        Self::lasting(label, crate::config::get().popup.duration_ms, now)
-    }
-
-    /// The rule on its own, so the off switch is reachable from a test without
-    /// setting the process-wide config — which is a `OnceLock`, and so would
-    /// decide it for every other test in the binary too.
-    fn lasting(label: Option<String>, duration_ms: u64, now: Instant) -> Option<Self> {
-        let label = label.filter(|_| duration_ms > 0)?;
+        let label = label.filter(|l| !l.is_empty())?;
         Some(Self {
             label,
-            duration: Duration::from_millis(duration_ms),
             quiet_since: Some(now),
             give_up_at: now + GIVE_UP,
             until: None,
@@ -190,7 +192,7 @@ impl Popup {
             return Act::Done;
         };
         self.painted = true;
-        self.until.get_or_insert(now + self.duration);
+        self.until.get_or_insert(now + DURATION);
         Act::Paint(bytes)
     }
 }
@@ -327,16 +329,15 @@ mod tests {
         assert_eq!(sneaky, "ok[31mred");
     }
 
-    /// Zero is the off switch, and the only one — so it has to stop the popup
-    /// being built at all rather than build one that expires immediately, which
-    /// would paint and erase on the same pass and cost a repaint for nothing.
+    /// A name of nothing but control characters is stripped to nothing, and a
+    /// box around nothing is worse than no box. Refused at the arming rather
+    /// than at the drawing, so the relay carries no state for it either.
     #[test]
-    fn a_duration_of_zero_arms_nothing() {
+    fn a_label_with_nothing_in_it_arms_nothing() {
         let now = Instant::now();
-        assert!(Popup::lasting(Some(label("dotfiles")), 0, now).is_none());
-        assert!(Popup::lasting(Some(label("dotfiles")), 1, now).is_some());
-        // And nothing to say is nothing to say, however long it would last.
-        assert!(Popup::lasting(None, 1200, now).is_none());
+        assert!(Popup::arm(None, now).is_none());
+        assert!(Popup::arm(Some(label("\x07\x1b")), now).is_none());
+        assert!(Popup::arm(Some(label("dotfiles")), now).is_some());
     }
 
     /// The cursor and the editor's own attributes have to come back exactly as
@@ -460,8 +461,7 @@ mod tests {
     fn the_lull_clock_restarts_on_output_but_the_life_does_not() {
         let t0 = Instant::now();
         let mut popup = Popup {
-            label: "2  dotfiles".into(),
-            duration: Duration::from_millis(1000),
+            label: "dotfiles".into(),
             quiet_since: Some(t0),
             give_up_at: t0 + GIVE_UP,
             until: None,
@@ -482,7 +482,7 @@ mod tests {
         // Quiet for a whole SETTLE: now it paints, and the clock starts here.
         let painted = t0 + Duration::from_millis(600);
         assert!(matches!(popup.step(painted, false, big), Act::Paint(_)));
-        assert_eq!(popup.until, Some(painted + Duration::from_millis(1000)));
+        assert_eq!(popup.until, Some(painted + DURATION));
 
         // A repaint by the editor puts the box back at the *next* lull — one
         // whole SETTLE later, not the first pass after it — without buying the
@@ -500,11 +500,11 @@ mod tests {
             popup.step(painted + Duration::from_millis(60), false, big),
             Act::Paint(_)
         ));
-        assert_eq!(popup.until, Some(painted + Duration::from_millis(1000)));
+        assert_eq!(popup.until, Some(painted + DURATION));
 
         // And it ends on time regardless.
         assert_eq!(
-            popup.step(painted + Duration::from_millis(1001), false, big),
+            popup.step(painted + DURATION + Duration::from_millis(1), false, big),
             Act::Erase
         );
     }
@@ -515,8 +515,7 @@ mod tests {
     fn an_overlay_that_never_finds_a_lull_gives_up_rather_than_drawing_late() {
         let t0 = Instant::now();
         let mut popup = Popup {
-            label: "2  dotfiles".into(),
-            duration: Duration::from_millis(1000),
+            label: "dotfiles".into(),
             quiet_since: Some(t0),
             give_up_at: t0 + GIVE_UP,
             until: None,

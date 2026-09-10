@@ -47,7 +47,6 @@ use crate::error::ConfigError;
 pub struct Settings {
     pub keys: KeySettings,
     pub session: SessionSettings,
-    pub popup: PopupSettings,
 }
 
 /// The prefix key and how long a half-typed sequence waits (see [`crate::keys`]).
@@ -100,27 +99,6 @@ impl Default for SessionSettings {
     }
 }
 
-/// How long an attach's notice of which session it landed in stays up (see
-/// [`crate::announce`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PopupSettings {
-    /// Zero turns the notice off, and is the only thing that does — the notice
-    /// is one box drawn one way, so there is nothing else to choose between.
-    pub duration_ms: u64,
-}
-
-impl Default for PopupSettings {
-    fn default() -> Self {
-        Self {
-            // A second: long enough to catch a name out of the corner of the
-            // eye, short enough that a box in the middle of the screen is gone
-            // before it is in the way of anything.
-            duration_ms: 1000,
-        }
-    }
-}
-
 /// The prefix comes in as a human string; delegate to the one parser so the file
 /// and any other caller agree, and fold its message into serde's error (which
 /// TOML then reports with the offending span).
@@ -132,9 +110,8 @@ where
     crate::keys::parse_prefix(&s).map_err(serde::de::Error::custom)
 }
 
-/// Ceiling for `keys.timeout_ms` and `popup.duration_ms`. Generous but finite:
-/// both go into a `poll` timeout as a `c_int`, and an absurd one is a hang, not
-/// a long wait.
+/// Ceiling for `keys.timeout_ms`. Generous but finite: the value goes into a
+/// `poll` timeout as a `c_int`, and an absurd one is a hang, not a long wait.
 const MAX_TIMEOUT_MS: u64 = 60_000;
 
 impl Settings {
@@ -150,15 +127,6 @@ impl Settings {
             // Beyond `c_int` this would wrap negative and `poll` would block
             // forever; well before that it is a prefix that never resolves.
             return Err(format!("keys.timeout_ms must be at most {MAX_TIMEOUT_MS}"));
-        }
-        // No floor, unlike the timeout above: zero is how the notice is turned
-        // off, and nothing is armed at all in that case — see
-        // `announce::Popup::arm`.
-        if self.popup.duration_ms > MAX_TIMEOUT_MS {
-            // It bounds a `poll` wait, exactly as `keys.timeout_ms` does.
-            return Err(format!(
-                "popup.duration_ms must be at most {MAX_TIMEOUT_MS}"
-            ));
         }
         // Refused at startup rather than at the prompt: a command that can never
         // spawn a session is a broken config, and the file is where it is fixed.
@@ -295,7 +263,6 @@ pub fn with_prefix(prefix: u8) -> Settings {
 fn render_default_config(prefix: u8) -> String {
     let k = KeySettings::default();
     let s = SessionSettings::default();
-    let p = PopupSettings::default();
     format!(
         "# nvmux configuration — created on first run.\n\
          #\n\
@@ -308,14 +275,10 @@ fn render_default_config(prefix: u8) -> String {
          \n\
          [session]\n\
          # {{sock}} becomes the session's socket; it is what nvmux finds it by.\n\
-         # command = {command:?}\n\
-         \n\
-         [popup]\n\
-         # duration_ms = {duration}   # 0 turns the session notice off\n",
+         # command = {command:?}\n",
         prefix = crate::keys::prefix_label(prefix),
         timeout = k.timeout_ms,
         command = s.command,
-        duration = p.duration_ms,
     )
 }
 
@@ -404,9 +367,7 @@ mod tests {
             prefix = \"Ctrl-Space\"\n\
             timeout_ms = 500\n\
             [session]\n\
-            command = \"nvim --headless --listen {sock}\"\n\
-            [popup]\n\
-            duration_ms = 1000\n";
+            command = \"nvim --headless --listen {sock}\"\n";
         let s: Settings = toml::from_str(doc).expect("valid");
         assert_eq!(s, Settings::default());
     }
@@ -449,7 +410,6 @@ mod tests {
             ("an unknown keys key", "[keys]\nprefx = \"C-a\"\n"),
             ("an unparseable prefix", "[keys]\nprefix = \"nope\"\n"),
             ("an unknown session key", "[session]\ncmd = \"nvim\"\n"),
-            ("an unknown popup key", "[popup]\ndurations_ms = 900\n"),
         ] {
             assert!(
                 toml::from_str::<Settings>(doc).is_err(),
@@ -467,7 +427,6 @@ mod tests {
             ("[keys]\ntimeout_ms = 60001\n", "keys.timeout_ms"),
             // Past `c_int`: the value `poll` would have read as "block forever".
             ("[keys]\ntimeout_ms = 3000000000\n", "keys.timeout_ms"),
-            ("[popup]\nduration_ms = 60001\n", "popup.duration_ms"),
         ];
         for (doc, key) in cases {
             let err = parse(Path::new("test.toml"), doc).expect_err(doc);
@@ -478,13 +437,7 @@ mod tests {
                 other => panic!("{doc:?}: expected Invalid, got {other:?}"),
             }
         }
-        for doc in [
-            "[keys]\ntimeout_ms = 1\n",
-            "[keys]\ntimeout_ms = 60000\n",
-            // Zero is not out of range: it is how the notice is turned off.
-            "[popup]\nduration_ms = 0\n",
-            "[popup]\nduration_ms = 60000\n",
-        ] {
+        for doc in ["[keys]\ntimeout_ms = 1\n", "[keys]\ntimeout_ms = 60000\n"] {
             parse(Path::new("test.toml"), doc).expect(doc);
         }
     }
@@ -532,14 +485,12 @@ mod tests {
             rendered.contains("\nprefix     = \"Ctrl-a\"\n"),
             "the chosen prefix is the one active setting: {rendered:?}"
         );
-        // The timeout, the command and the popup are documentation, not active
-        // settings.
+        // The timeout and the command are documentation, not active settings.
         assert!(rendered.contains("# timeout_ms = 500"));
         assert!(
             rendered.contains("# command = \"nvim --headless --listen {sock}\""),
             "the template must document the command: {rendered:?}"
         );
-        assert!(rendered.contains("# duration_ms = 1000"));
     }
 
     // --- path resolution (pure) --------------------------------------------
