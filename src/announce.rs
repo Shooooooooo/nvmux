@@ -216,15 +216,15 @@ impl Popup {
     }
 }
 
-/// The overlay as terminal bytes: a bordered box across the top of the screen,
-/// centred horizontally.
+/// The overlay as terminal bytes: a bordered box in the bottom-right corner.
 ///
 /// Pure, so the geometry can be tested without a terminal. `None` when the
 /// screen cannot hold even a one-column box.
 ///
-/// The top rather than the middle: the middle is where the text you have just
-/// switched to is, and the bottom two rows are the statusline and the message
-/// row. The top is the one band a reader is least likely to be looking at.
+/// The corner rather than the middle: the middle is where the text you have
+/// just switched to is. It does sit over the last three rows on the right —
+/// the statusline and the message row among them — for as long as it is up,
+/// which is what a corner costs and is why it is not up for long.
 ///
 /// What the sequence has to get right, in order:
 ///
@@ -240,9 +240,11 @@ impl Popup {
 /// * an absolute `CUP` per row, and not one newline or carriage return
 ///   anywhere. `OPOST` is off in raw mode (see [`crate::term`]), so those move
 ///   the cursor rather than wrapping and are the classic way to corrupt a raw
-///   overlay. It also means a full-width box never scrolls the screen: the
-///   pending-wrap flag its last cell sets is discarded by the next `CUP`, and
-///   the last thing written is `DECRC`.
+///   overlay. It also means the box never scrolls the screen, which in this
+///   corner is not a small thing: its last cell is the very last cell of the
+///   terminal, and the pending-wrap flag that sets is discarded by the next
+///   `CUP`, or — on the closing row — by the `DECRC` that is the last thing
+///   written. Nothing printable ever follows it.
 pub fn overlay_bytes(label: &str, size: PtySize) -> Option<Vec<u8>> {
     if size.cols < MIN_COLS || size.rows < MIN_ROWS {
         return None;
@@ -258,7 +260,11 @@ pub fn overlay_bytes(label: &str, size: PtySize) -> Option<Vec<u8>> {
     let inner = text.width() + 2 * PAD;
     let width = inner + 2;
 
-    let left = (usize::from(size.cols) - width) / 2 + 1;
+    // Flush into the corner, in the terminal's own 1-based coordinates. Both
+    // subtractions are safe: the guard above puts `rows` at three or more, and
+    // `width` cannot exceed `cols` because the text was truncated to fit it.
+    let left = usize::from(size.cols) - width + 1;
+    let top = usize::from(size.rows) - 2;
     let pad = " ".repeat(PAD);
     let bar = "─".repeat(inner);
     let rows = [
@@ -269,7 +275,7 @@ pub fn overlay_bytes(label: &str, size: PtySize) -> Option<Vec<u8>> {
 
     let mut out = String::from("\x1b[?2026h\x1b7");
     for (i, row) in rows.iter().enumerate() {
-        out.push_str(&format!("\x1b[{};{left}H\x1b[0m{row}", i + 1));
+        out.push_str(&format!("\x1b[{};{left}H\x1b[0m{row}", top + i));
     }
     out.push_str("\x1b8\x1b[?2026l");
     Some(out.into_bytes())
@@ -348,8 +354,13 @@ pcall(function()
     relative = 'editor',
     width = width,
     height = 1,
-    row = 0,
-    col = math.floor((vim.o.columns - width) / 2),
+    -- The same corner the overlay uses, so switching styles compares the
+    -- mechanism and not the placement. Counted back from the far edges: three
+    -- rows for the bordered box and one for the command line, and two columns
+    -- for the border. Clamped, since a narrow editor would otherwise ask for a
+    -- negative position.
+    row = math.max(0, vim.o.lines - 4),
+    col = math.max(0, vim.o.columns - width - 2),
     style = 'minimal',
     border = 'rounded',
     focusable = false,
@@ -494,8 +505,17 @@ mod tests {
                 .collect();
             assert_eq!(placements.len(), 3, "one placement per row");
             for (i, (row, col)) in placements.iter().enumerate() {
-                assert_eq!(*row, i + 1, "the box sits at the top of the screen");
+                assert_eq!(
+                    *row,
+                    usize::from(rows) - 2 + i,
+                    "the box sits in the bottom-right corner"
+                );
                 assert!(*row <= usize::from(rows), "row {row} past {rows}");
+                assert_eq!(
+                    col + widths[i],
+                    usize::from(cols) + 1,
+                    "the box is flush with the right-hand edge"
+                );
                 assert!(
                     col + widths[i] <= usize::from(cols) + 1,
                     "{cols}x{rows}: a row runs off the right-hand edge"
