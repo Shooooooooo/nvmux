@@ -511,9 +511,11 @@ impl App {
     /// so writes nothing — it ends back in normal mode rather than holding an
     /// edit the screen barely shows.
     ///
-    /// `Enter` does not place. It attaches everywhere else in the picker, and a
-    /// key that means "go" must not quietly mean "commit this arrangement" here;
-    /// like any other stray key it keeps the grab.
+    /// `Enter` places too, and the hint row says so. It is the confirm key
+    /// everywhere else a mode is open, so reaching for it here is the natural
+    /// move; the earlier reading — that Enter means "attach" and so must not
+    /// commit an arrangement — cost more than the ambiguity was worth, since
+    /// nothing attaches while a session is in flight.
     fn on_key_reorder(&mut self, key: Key) -> Request {
         let Mode::Reorder { id, was } = &self.mode else {
             return Request::None;
@@ -539,7 +541,7 @@ impl App {
                 self.shift_grabbed_to(last);
                 Request::None
             }
-            Key::Char(' ') => {
+            Key::Char(' ') | Key::Enter => {
                 let now = self.snapshot();
                 self.mode = Mode::Normal;
                 if now == was {
@@ -1315,6 +1317,37 @@ mod tests {
         );
     }
 
+    /// The confirm key everywhere else a mode is open, so it confirms here too.
+    /// It cannot mean "attach" while a session is in flight — nothing attaches
+    /// from a grab — so the only reading left is the one the hint row offers.
+    #[test]
+    fn enter_places_like_space() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Down);
+        let request = a.on_key(Key::Enter);
+        assert_eq!(*a.mode(), Mode::Normal, "the grab ended");
+        assert_eq!(
+            request,
+            Request::Reorder(vec![
+                ("id000001".into(), 1),
+                ("id000000".into(), 2),
+                ("id000002".into(), 3),
+            ]),
+            "the same payload Space would have asked for"
+        );
+
+        // And the same quiet exit when the arrangement came back unchanged.
+        let mut b = app(&["aaa", "bbb"]);
+        b.on_key(Key::Char(' '));
+        assert_eq!(
+            b.on_key(Key::Enter),
+            Request::None,
+            "picked up and put down"
+        );
+        assert_eq!(*b.mode(), Mode::Normal);
+    }
+
     #[test]
     fn a_grab_that_moved_nothing_asks_for_no_work() {
         let mut a = app(&["aaa", "bbb", "ccc"]);
@@ -1363,9 +1396,8 @@ mod tests {
 
     /// Unlike the kill confirm, where anything but `y` dismisses. A `[y/N]` is
     /// one question; this is a multi-key edit holding an arrangement nothing has
-    /// written yet, and a stray keystroke must not decide its fate. `Enter` is in
-    /// the list too: Space places, and the key that attaches everywhere else does
-    /// not double as the one that commits an arrangement.
+    /// written yet, and a stray keystroke must not decide its fate. `Enter` is
+    /// not in the list: it places, alongside Space, and the hint row says so.
     #[test]
     fn a_stray_key_does_not_end_a_reorder() {
         for key in [
@@ -1376,7 +1408,6 @@ mod tests {
             Key::Char('/'),
             Key::Char('?'),
             Key::Char('q'),
-            Key::Enter,
             Key::Tab,
             Key::Backspace,
             Key::Other,

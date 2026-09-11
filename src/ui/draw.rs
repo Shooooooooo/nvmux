@@ -78,9 +78,12 @@ const EMPTY: &str = "no sessions — press c to create one";
 /// not this one. The filter and the kill confirm stay undimmed because they are
 /// something being asked or typed, which this is not.
 ///
-/// `␣ place` is the same glyph the normal row spends on `␣ order`, and says
-/// so: the key that picked the session up is the one that puts it down.
-const REORDER_HINTS: &str = "↑↓ move  ␣ place  esc cancel";
+/// `␣/⏎ place` leads with the same glyph the normal row spends on `␣ order`,
+/// and says so: the key that picked the session up is the one that puts it
+/// down. `⏎` places as well and is listed second — it is the confirm key
+/// everywhere else, so it is worth the two columns to say it does not mean
+/// "attach" here.
+const REORDER_HINTS: &str = "↑↓ move  ␣/⏎ place  esc cancel";
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
