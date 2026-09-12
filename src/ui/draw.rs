@@ -78,12 +78,14 @@ const EMPTY: &str = "no sessions — press c to create one";
 /// not this one. The filter and the kill confirm stay undimmed because they are
 /// something being asked or typed, which this is not.
 ///
-/// `␣/⏎ place` leads with the same glyph the normal row spends on `␣ order`,
-/// and says so: the key that picked the session up is the one that puts it
-/// down. `⏎` places as well and is listed second — it is the confirm key
-/// everywhere else, so it is worth the two columns to say it does not mean
-/// "attach" here.
-const REORDER_HINTS: &str = "↑↓ move  ␣/⏎ place  esc cancel";
+/// Only `⏎` is offered for placing, though Space places too and keeps doing so:
+/// the key that picked the session up still puts it down, and a user who
+/// reached for it once will reach for it again. Naming both spends columns to
+/// teach a choice nobody has to make — one row, one way to say "done", and the
+/// one to name is the key that already means confirm everywhere else a mode is
+/// open. Space stays the undocumented half of the pair, harmless to find by
+/// habit and never needed by anyone reading the row.
+const REORDER_HINTS: &str = "↑↓ move  ⏎ place  esc cancel";
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -495,6 +497,20 @@ mod tests {
         assert!(
             !lines.iter().any(|l| l.contains(MARKER)),
             "the plain cursor marker is still on screen: {lines:#?}"
+        );
+    }
+
+    /// Space places too, but the row names only `⏎`: one way to say "done" is
+    /// enough to teach, and the space bar is there for the hand that picked the
+    /// session up with it rather than for anyone reading this row.
+    #[test]
+    fn the_reorder_hints_name_enter_and_not_the_space_bar() {
+        let lines = render(&reordering(&["one", "two"], 0), 60, 6);
+        let hints = &lines[5];
+        assert!(hints.contains("⏎ place"), "got {hints:?}");
+        assert!(
+            !hints.contains('␣'),
+            "the space bar is advertised: {hints:?}"
         );
     }
 

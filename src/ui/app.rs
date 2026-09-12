@@ -504,18 +504,18 @@ impl App {
     /// is kept or thrown away. It also means `/` cannot re-filter under a grabbed
     /// session, so the snapshot describes the same rows for the whole edit.
     ///
-    /// Space places, the same key that picked the session up: with the numbers
-    /// hidden, the one row wearing the marker is what says an edit is open, and
-    /// the key that opened it is the one to hand. An autorepeat or a nervous
-    /// double-tap is then grab-then-place on the spot, which moves nothing and
-    /// so writes nothing — it ends back in normal mode rather than holding an
-    /// edit the screen barely shows.
+    /// `Enter` places, and is the only key the hint row names for it. It is the
+    /// confirm key everywhere else a mode is open, so it is the one to advertise;
+    /// the older reading — that Enter means "attach" and so must not commit an
+    /// arrangement — cost more than the ambiguity was worth, since nothing
+    /// attaches while a session is in flight.
     ///
-    /// `Enter` places too, and the hint row says so. It is the confirm key
-    /// everywhere else a mode is open, so reaching for it here is the natural
-    /// move; the earlier reading — that Enter means "attach" and so must not
-    /// commit an arrangement — cost more than the ambiguity was worth, since
-    /// nothing attaches while a session is in flight.
+    /// Space places as well, unadvertised. It is the key that picked the session
+    /// up, so a hand that found it once finds it again, and dropping the binding
+    /// to match the row would punish exactly that habit. It also makes an
+    /// autorepeat or a nervous double-tap grab-then-place on the spot, which
+    /// moves nothing and so writes nothing — it ends back in normal mode rather
+    /// than holding an edit the screen barely shows.
     fn on_key_reorder(&mut self, key: Key) -> Request {
         let Mode::Reorder { id, was } = &self.mode else {
             return Request::None;
