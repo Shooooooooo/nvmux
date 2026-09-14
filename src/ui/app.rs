@@ -163,6 +163,15 @@ impl App {
     /// The session with this id, from the list the picker is showing. What a
     /// [`Request`] carrying an id resolves against, so acting on a row costs no
     /// round trip beyond the action itself.
+    /// Every row the picker is holding, in the order it is holding them.
+    ///
+    /// For a caller that carries the listing on rather than asking for another
+    /// — see [`crate::ui::Outcome::Attach`]. `visible` is the filtered view and
+    /// answers a different question.
+    pub fn sessions(&self) -> &[Session] {
+        &self.sessions
+    }
+
     pub fn session(&self, id: &str) -> Option<&Session> {
         self.sessions.iter().find(|s| s.id == id)
     }

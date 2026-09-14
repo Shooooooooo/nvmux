@@ -96,7 +96,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
         // across the trip is what `Esc` goes back to; without one — the first
         // screen, a failed attach, a session that exited — there is nothing
         // behind the picker and `Esc` says so by doing nothing.
-        let (mut current, mut highest) = match ui::run(
+        let (mut current, mut listing) = match ui::run(
             transport,
             message.take(),
             focus.as_deref(),
@@ -110,8 +110,12 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 }
                 break;
             }
-            ui::Outcome::Attach { session, highest } => (session, highest),
+            ui::Outcome::Attach { session, sessions } => (session, sessions),
         };
+        // Derived rather than carried: one fewer thing for the picker to keep
+        // in step, and the listing it handed over is what it would be derived
+        // from anyway.
+        let mut highest = ui::highest_num(&listing);
 
         loop {
             let opened = match attached.take() {
@@ -166,8 +170,11 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     if let ui::prompt::Outcome::Created(session) = ui::prompt::run(transport)? {
                         // A new session can be numbered above anything the
                         // relay was told about, and the hint decides how long a
-                        // digit waits.
+                        // digit waits. It is also a row the listing in hand does
+                        // not have, and `<prefix> n` from here has to be able to
+                        // find its way back to it.
                         highest = highest.max(session.state.num);
+                        listing.push(session.clone());
                         current = session;
                     }
                     continue;
@@ -182,39 +189,52 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     // or a cycle with nowhere to go — puts the user straight
                     // back where they were.
                     attached = held;
-                    // Re-listed rather than reused: `n` and `p` walk what is
-                    // live now, and the digit hint has to follow the same
-                    // listing or the next number typed would resolve against a
-                    // stale one.
+                    // Resolved against the listing in hand, which is the one
+                    // thing a `<prefix>` switch used to pay for that an attach
+                    // from the picker does not: there the listing had already
+                    // happened, here it sat between the keypress and the new
+                    // session's first frame. Measured on a host whose forks are
+                    // expensive: 88-110 ms of a ~215 ms switch, and every
+                    // millisecond of it on a screen the user is watching.
                     //
-                    // A failed listing goes back to the picker like a failed
-                    // attach, and for a second reason besides: this is the one
-                    // path from one relay straight into another, so the screen
-                    // an error would land on is the cleared one the held branch
-                    // of `pty::relay` just handed over — nothing else on it, and
-                    // nothing the user could do from it. The hint row is both,
-                    // next to the row the message is about.
-                    let sessions = match transport.list_sessions() {
-                        Ok(sessions) => sessions,
-                        Err(e) => {
-                            message = Some(describe_listing_failure(&e));
-                            break;
+                    // Stale in one direction only, and the attach is what finds
+                    // out: a session that has since gone is still named here,
+                    // and the spawn's probe then fails with "that session is
+                    // gone" onto the picker's hint row — which re-lists on the
+                    // way, so the next switch is accurate. What the listing
+                    // cannot do is invent a row, which is what the miss below
+                    // is for.
+                    let mut picked = pick(&listing, target, current.state.num).cloned();
+                    if picked.is_none() {
+                        // A listing in hand cannot prove a negative: a session
+                        // created since it was taken — by another nvmux, or in
+                        // another window — is missing rather than absent. So a
+                        // miss is the one case that still pays for a listing,
+                        // and it pays it before saying no.
+                        //
+                        // A failed listing goes back to the picker like a failed
+                        // attach, and for a second reason besides: this is the
+                        // one path from one relay straight into another, so the
+                        // screen an error would land on is the cleared one the
+                        // held branch of `pty::relay` just handed over — nothing
+                        // else on it, and nothing the user could do from it. The
+                        // hint row is both, next to the row it is about.
+                        match transport.list_sessions() {
+                            Ok(fresh) => {
+                                listing = fresh;
+                                highest = ui::highest_num(&listing);
+                                picked = pick(&listing, target, current.state.num).cloned();
+                            }
+                            Err(e) => {
+                                message = Some(describe_listing_failure(&e));
+                                break;
+                            }
                         }
-                    };
-                    highest = ui::highest_num(&sessions);
-                    // Exhaustive, no `_` arm, for the reason `pty::act` is:
-                    // a new way to name a session must not be able to arrive
-                    // here and do nothing.
-                    let picked = match target {
-                        pty::Target::Number(num) => sessions.iter().find(|s| s.state.num == num),
-                        pty::Target::Step(dir) => {
-                            transport::neighbour(&sessions, current.state.num, dir)
-                        }
-                    };
+                    }
                     match picked {
                         // The loop above retires the old client and attaches the
                         // new one; an unchanged id reuses the client as it is.
-                        Some(session) => current = session.clone(),
+                        Some(session) => current = session,
                         None => tracing::debug!(?target, "nothing to switch to"),
                     }
                     continue;
@@ -275,6 +295,21 @@ fn one_line(e: &nvmux::NvmuxError) -> String {
     e.to_string().lines().collect::<Vec<_>>().join(" — ")
 }
 
+/// The session a `<prefix>` switch names, in a listing.
+///
+/// Exhaustive, no `_` arm, for the reason `pty::act` is: a new way to name a
+/// session must not be able to arrive here and do nothing.
+fn pick(
+    sessions: &[nvmux::session::Session],
+    target: pty::Target,
+    from: u32,
+) -> Option<&nvmux::session::Session> {
+    match target {
+        pty::Target::Number(num) => sessions.iter().find(|s| s.state.num == num),
+        pty::Target::Step(dir) => transport::neighbour(sessions, from, dir),
+    }
+}
+
 /// Returns the crate's own error type rather than `anyhow`, so the caller can
 /// tell a dropped connection from a dead session and say the right thing.
 fn new_attachment(
@@ -292,8 +327,57 @@ fn new_attachment(
 mod tests {
     use super::*;
     use nvmux::error::{RpcError, SessionError, SshError};
+    use nvmux::keys::Direction;
     use nvmux::NvmuxError;
     use transport::Location;
+
+    /// The listing the picker handed over is what a `<prefix>` number resolves
+    /// against, so the switch pays for no listing of its own.
+    #[test]
+    fn a_number_is_resolved_against_the_listing_in_hand() {
+        let listing = listing_of(&[(1, "id000001"), (2, "id000002"), (3, "id000003")]);
+        let picked = pick(&listing, pty::Target::Number(2), 1).expect("2 is on the list");
+        assert_eq!(picked.id, "id000002");
+    }
+
+    /// `n` and `p` walk the same listing, from the number the user is sitting on.
+    #[test]
+    fn a_step_walks_the_listing_in_hand() {
+        let listing = listing_of(&[(1, "id000001"), (2, "id000002"), (3, "id000003")]);
+        let next = pick(&listing, pty::Target::Step(Direction::Next), 2).expect("3 follows 2");
+        assert_eq!(next.id, "id000003");
+        let prev = pick(&listing, pty::Target::Step(Direction::Prev), 2).expect("1 precedes 2");
+        assert_eq!(prev.id, "id000001");
+    }
+
+    /// A number the listing does not have resolves to nothing rather than to
+    /// something else — which is what sends the switch off to re-list before it
+    /// says no, since a listing in hand cannot tell "no such session" from
+    /// "created since I was taken".
+    #[test]
+    fn a_number_the_listing_does_not_have_resolves_to_nothing() {
+        let listing = listing_of(&[(1, "id000001"), (2, "id000002")]);
+        assert!(pick(&listing, pty::Target::Number(3), 1).is_none());
+    }
+
+    /// An empty listing names nothing, by either kind of key.
+    #[test]
+    fn an_empty_listing_names_nothing() {
+        assert!(pick(&[], pty::Target::Number(1), 0).is_none());
+        assert!(pick(&[], pty::Target::Step(Direction::Next), 0).is_none());
+    }
+
+    /// A listing as the picker hands it over: resolved numbers and all.
+    fn listing_of(rows: &[(u32, &str)]) -> Vec<nvmux::session::Session> {
+        rows.iter()
+            .map(|(num, id)| {
+                let mut s =
+                    nvmux::session::Session::new((*id).into(), format!("s{num}"), 100, *num);
+                s.state.num = *num;
+                s
+            })
+            .collect()
+    }
 
     fn refused() -> NvmuxError {
         NvmuxError::Rpc(RpcError::ConnectionRefused("x.sock".into()))

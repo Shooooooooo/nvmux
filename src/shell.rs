@@ -695,6 +695,46 @@ mod tests {
         );
     }
 
+    /// Flattening metadata must match the `tr` it replaced, byte for byte,
+    /// including the shapes that made `tr` worth using: a pretty-printed file,
+    /// a tab inside a value, a CRLF line ending, no trailing newline, and a
+    /// `*` that must not be expanded against the runtime directory.
+    #[test]
+    fn flatten_matches_the_tr_it_replaced() {
+        let dir = std::env::temp_dir().join(format!("nvmux-flatten-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let cases: &[(&str, &str)] = &[
+            ("plain", "{\"a\":1}"),
+            ("pretty", "{\n  \"a\": 1\n}\n"),
+            ("tabbed", "{\"t\":\"a\tb\"}"),
+            ("crlf", "{\r\n\"a\": 1\r\n}\r\n"),
+            ("no_newline", "{\"trail\":1}"),
+            ("globby", "{\"p\":\"/x/*/y\"}"),
+            ("backslash", "{\"b\":\"a\\\\b\"}"),
+            ("empty", ""),
+            ("newlines_only", "\n\n\n"),
+            ("spaces", "{\"s\":\"  kept  \"}\n"),
+        ];
+        for (name, body) in cases {
+            let path = dir.join(format!("{name}.json"));
+            std::fs::write(&path, body).expect("write case");
+            let arg = path.to_string_lossy().into_owned();
+            let script = concat!(
+                include_str!("../scripts/_prelude.sh"),
+                r#"flatten "$1"; printf '%s' "$nvmux_flat""#,
+                "\n"
+            );
+            let flattened = run_script(script, &[&arg]);
+            let tr = run_script(r#"tr -d '\n\r\t' < "$1""#, &[&arg]);
+            assert!(flattened.ok(), "{name}: {}", flattened.stderr);
+            assert_eq!(
+                flattened.stdout, tr.stdout,
+                "{name}: flatten and tr disagree"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn scripts_are_present_and_posix_sh() {
         for &(name, body) in SCRIPTS {

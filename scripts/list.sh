@@ -38,8 +38,10 @@ if [ -d "$dir" ]; then
     # metadata and let nvmux decide.
     json=''
     if [ -f "$json_path" ]; then
-      # One line, in case someone hand-wrote pretty-printed metadata.
-      json=$(tr -d '\n\r\t' < "$json_path")
+      # One line, in case someone hand-wrote pretty-printed metadata. Through
+      # `flatten` rather than `tr`, so this costs no process per session.
+      flatten "$json_path"
+      json=$nvmux_flat
     fi
 
     # Asked by socket, not by the recorded pid: pids get reused, the socket is
