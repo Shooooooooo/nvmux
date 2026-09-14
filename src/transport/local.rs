@@ -164,13 +164,24 @@ impl Transport for LocalTransport {
     }
 
     fn list_sessions(&self) -> Result<Vec<Session>> {
+        // Split, because the two halves have different fixes: the script is
+        // a run in the shell, with a process-table read on a host without
+        // /proc/net/unix, while the probes are round trips to editors that may
+        // be busy. See the `timing:` records in `main` and `pty`.
+        let t_script = std::time::Instant::now();
         let out = self.run(shell::LIST_SCRIPT, &[&self.dir_arg])?;
+        tracing::debug!(
+            ms = t_script.elapsed().as_secs_f64() * 1000.0,
+            "timing: listing script"
+        );
         if !out.ok() {
             tracing::warn!(status = out.status, stderr = %out.stderr, "list.sh failed");
         }
         let listed = protocol::rows_to_sessions(protocol::parse_listing(&out.stdout)?);
 
         let mut alive = Vec::with_capacity(listed.len());
+        let t_probe = std::time::Instant::now();
+        let probed = listed.len();
         for mut s in listed {
             let paths = self.paths(&s.id)?;
 
@@ -192,6 +203,12 @@ impl Transport for LocalTransport {
                 }
             }
         }
+
+        tracing::debug!(
+            ms = t_probe.elapsed().as_secs_f64() * 1000.0,
+            sessions = probed,
+            "timing: listing probes"
+        );
 
         Ok(finish_listing(alive))
     }
