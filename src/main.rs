@@ -118,6 +118,11 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
         let mut highest = ui::highest_num(&listing);
 
         loop {
+            // Everything nvmux does between the keypress and a client ready to
+            // relay: retiring the old one, the probe, and the spawn. Read with
+            // the `timing: session painted` record the relay ends up emitting,
+            // which is the session's own share of the same switch.
+            let t_open = std::time::Instant::now();
             let opened = match attached.take() {
                 Some(a) if a.session_id == current.id => Ok(a),
                 // Retiring the old client leaves its server running: killing a
@@ -142,6 +147,11 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 }
                 None => new_attachment(transport, &current),
             };
+
+            tracing::debug!(
+                ms = t_open.elapsed().as_secs_f64() * 1000.0,
+                "timing: retire + probe + spawn"
+            );
 
             // A failed attach must not end the program: the user can only act
             // on it from the picker, with the reason on screen.
@@ -219,7 +229,18 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                         // held branch of `pty::relay` just handed over — nothing
                         // else on it, and nothing the user could do from it. The
                         // hint row is both, next to the row it is about.
-                        match transport.list_sessions() {
+                        //
+                        // Timed on its own because it is the one thing a
+                        // `<prefix>` switch can pay that an attach from the
+                        // picker does not: there, the listing happened before
+                        // the user pressed anything. Only a miss pays it now.
+                        let t_list = std::time::Instant::now();
+                        let listed = transport.list_sessions();
+                        tracing::debug!(
+                            ms = t_list.elapsed().as_secs_f64() * 1000.0,
+                            "timing: switch listing"
+                        );
+                        match listed {
                             Ok(fresh) => {
                                 listing = fresh;
                                 highest = ui::highest_num(&listing);
