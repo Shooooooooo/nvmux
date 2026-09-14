@@ -138,6 +138,22 @@ impl std::fmt::Debug for Attachment {
 /// How long a hung-up client gets to exit before it is killed outright.
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long the teardown paths relay a departing client's restore sequence.
+const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// A DA1 request: `ESC [ c`. What a departing client sends, and what the two
+/// drains watch for — see [`Attachment::answer_device_attributes`].
+const DA1_REQUEST: &[u8] = b"\x1b[c";
+
+/// What a terminal answers a DA1 request with, and what nvmux answers one with
+/// in a terminal's place.
+///
+/// "VT100 with an advanced video option", which every terminal emulator in
+/// existence can claim to be. The content is not what is being asked for: the
+/// client asks at shutdown only to learn that its terminal has worked through
+/// everything it sent, so the arrival is the whole of the message.
+const DA1_REPLY: &[u8] = b"\x1b[?1;2c";
+
 impl Attachment {
     /// Terminate the client, leaving the session's server running. Verified:
     /// killing a `--remote-ui` client — with SIGHUP, SIGTERM or SIGKILL — does
@@ -217,7 +233,9 @@ impl Attachment {
         let deadline = Instant::now() + REAP_TIMEOUT;
         while Instant::now() < deadline {
             if let Some(fd) = master {
-                discard_pending(fd);
+                if discard_pending(fd) {
+                    self.answer_device_attributes();
+                }
             }
             match self.child.try_wait() {
                 Ok(None) => std::thread::sleep(Duration::from_millis(10)),
@@ -232,6 +250,85 @@ impl Attachment {
             }
         }
         let _ = self.child.wait();
+    }
+
+    /// Answer the DA1 request a departing client has just sent, as its terminal
+    /// would have.
+    ///
+    /// **This is worth a full second on every switch.** Neovim's shutdown path
+    /// (`tui.c`, `tui_stop`) emits its terminal restore sequences, sends `ESC [
+    /// c`, and then *waits* for the reply — `EXIT_TIMEOUT_MS`, one second —
+    /// before it will exit, so that it knows the terminal has processed
+    /// everything it sent. A client nvmux is retiring has no terminal left to
+    /// ask: nothing relays its output once the switch is typed, and a reply
+    /// could not reach it through a stopped pump in any case. So it waits out
+    /// the whole timeout, every time. Measured at 1003 ms, and it is the same
+    /// second whether the client is asked to leave with SIGHUP or with
+    /// `:detach` — both arrive at `tui_stop`.
+    ///
+    /// nvmux answers because, for this client, nvmux *is* the terminal. It then
+    /// goes in about 4 ms.
+    ///
+    /// Only ever in reply to a request that was actually read, and never
+    /// speculatively at hangup: a reply written before the client's shutdown
+    /// installs the callback waiting for it is consumed by the startup handler
+    /// instead, and the second is paid anyway. Measured both ways — answering
+    /// on sight is reliable, answering at hangup is a race that loses about as
+    /// often as it wins.
+    ///
+    /// One `write_all`, and only ever to a client that has been hung up. A
+    /// reply that reached a live client would be harmless — Neovim's input
+    /// parser consumes a DA1 response rather than typing it, in insert mode
+    /// too, which was checked — but one delivered in *pieces* is read as keys,
+    /// and `ESC [ ? 1 ;` followed later by `2 c` leaves the editor in
+    /// operator-pending. Seven bytes in one write to a pty cannot be torn.
+    fn answer_device_attributes(&mut self) {
+        tracing::debug!("answering the departing client's DA1 request");
+        let _ = self.writer.write_all(DA1_REPLY);
+        let _ = self.writer.flush();
+    }
+
+    /// Relay whatever the client writes on its way out, then stop.
+    ///
+    /// The teardown counterpart to the drain in [`Attachment::reap`], and the
+    /// opposite policy: here the client's restore sequence *is* wanted, because
+    /// this runs on the paths that hand the terminal back to the shell.
+    ///
+    /// The DA1 request buried in that sequence still has to be answered, which
+    /// the relaying disguises: the request does reach the real terminal and the
+    /// real terminal does reply, but the pump that would carry the reply back to
+    /// the client has already stopped. Without this, `<prefix> d` costs the same
+    /// second a switch used to.
+    ///
+    /// Bounded, because a client that ignores its termination would otherwise
+    /// hold the terminal in raw mode indefinitely.
+    fn drain_until_eof(&mut self) {
+        let Some(fd) = self.master.as_raw_fd() else {
+            return;
+        };
+        let deadline = Instant::now() + DRAIN_TIMEOUT;
+        let mut buf = [0u8; 8192];
+        while Instant::now() < deadline {
+            let mut p = [pollfd(fd)];
+            let n = unsafe { libc::poll(p.as_mut_ptr(), 1, 50) };
+            if n <= 0 {
+                continue;
+            }
+            match read_fd(fd, &mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(len) => {
+                    // Read before the write, because the write borrows `self`.
+                    let asked = asks_for_device_attributes(&buf[..len]);
+                    let mut out = std::io::stdout().lock();
+                    let _ = out.write_all(&buf[..len]);
+                    let _ = out.flush();
+                    drop(out);
+                    if asked {
+                        self.answer_device_attributes();
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -429,7 +526,7 @@ pub fn relay(
         Ok(Outcome::ChildExited) => {
             // The child is gone and has emitted its own restore; relay the rest
             // of it, then hand back to the picker.
-            drain_until_eof(master_fd);
+            attachment.drain_until_eof();
             raw.restore();
             attachment.reap();
             Ok((Outcome::ChildExited, None))
@@ -440,7 +537,7 @@ pub fn relay(
             // corrupt its own restore sequence. Once it is gone, a final reset
             // is harmless and covers a client that died before it got that far.
             attachment.hang_up();
-            drain_until_eof(master_fd);
+            attachment.drain_until_eof();
             raw.restore();
             attachment.reap();
             term::reset_screen();
@@ -452,7 +549,7 @@ pub fn relay(
             // the cursor hidden or an SGR attribute set. `attachment` is
             // dropped on the way out, which retires the client.
             attachment.hang_up();
-            drain_until_eof(master_fd);
+            attachment.drain_until_eof();
             raw.restore();
             attachment.reap();
             term::reset_screen();
@@ -773,44 +870,40 @@ fn ready(p: &libc::pollfd) -> bool {
     p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
 }
 
-/// Throw away buffered child output without writing it anywhere.
-fn discard_pending(fd: RawFd) {
+/// Throw away buffered child output without writing it anywhere, reporting
+/// whether the child asked for its terminal's device attributes on the way.
+///
+/// That answer is acted on by [`Attachment::reap`] alone, which is the one
+/// caller whose client has no terminal left to ask. The resume path ignores it:
+/// a request there belongs to a client that is *staying*, and the real terminal
+/// answers that one itself as soon as the pump is running again.
+fn discard_pending(fd: RawFd) -> bool {
     let mut buf = [0u8; 8192];
+    let mut asked = false;
     loop {
         let mut p = [pollfd(fd)];
         let n = unsafe { libc::poll(p.as_mut_ptr(), 1, 0) };
         if n <= 0 || !ready(&p[0]) {
-            return;
+            return asked;
         }
         match read_fd(fd, &mut buf) {
-            Ok(len) if len > 0 => continue,
-            _ => return,
+            Ok(len) if len > 0 => {
+                asked = asked || asks_for_device_attributes(&buf[..len]);
+                continue;
+            }
+            _ => return asked,
         }
     }
 }
 
-/// Relay whatever the child writes on its way out, then stop.
+/// Whether this chunk of client output contains a DA1 request.
 ///
-/// Bounded, because a child that ignores its termination would otherwise hold
-/// the terminal in raw mode indefinitely.
-fn drain_until_eof(fd: RawFd) {
-    let deadline = std::time::Instant::now() + Duration::from_millis(500);
-    let mut buf = [0u8; 8192];
-    while std::time::Instant::now() < deadline {
-        let mut p = [pollfd(fd)];
-        let n = unsafe { libc::poll(p.as_mut_ptr(), 1, 50) };
-        if n <= 0 {
-            continue;
-        }
-        match read_fd(fd, &mut buf) {
-            Ok(0) | Err(_) => return,
-            Ok(len) => {
-                let mut out = std::io::stdout().lock();
-                let _ = out.write_all(&buf[..len]);
-                let _ = out.flush();
-            }
-        }
-    }
+/// A request split across two reads is missed, and that is survivable rather
+/// than handled: the reply is an optimisation, and missing one costs the second
+/// it used to cost every time. Neovim writes its whole shutdown sequence in one
+/// `flush_buf`, so in practice the request arrives whole.
+fn asks_for_device_attributes(chunk: &[u8]) -> bool {
+    chunk.windows(DA1_REQUEST.len()).any(|w| w == DA1_REQUEST)
 }
 
 /// Paint the screen again after one of nvmux's own screens cleared it.
@@ -1386,6 +1479,54 @@ mod tests {
             "the client took {took:?} — it was killed by the reap's deadline \
              rather than read out and left to act on its hangup"
         );
+    }
+
+    /// A client that will not leave until its terminal answers the question it
+    /// asks on the way out is answered, and leaves.
+    ///
+    /// Neovim's shape, not an invented one: `tui_stop` writes its restore
+    /// sequence, sends `ESC [ c`, and blocks for `EXIT_TIMEOUT_MS` — a whole
+    /// second — waiting for the reply that says the terminal has caught up.
+    /// The stand-in does the same thing with `dd`. Without the answer this is
+    /// the reap's deadline and a SIGKILL two seconds later; with it, the client
+    /// goes at once.
+    #[test]
+    fn a_client_waiting_on_its_terminal_is_answered_and_goes() {
+        // `stty raw` because a real client's terminal is in raw mode and the
+        // reply carries no newline: left canonical, the stand-in's read would
+        // block for a line that never comes and the test would pass for the
+        // wrong reason.
+        let mut a = attached_to(
+            r#"stty raw -echo; trap 'printf "\033[c"; dd bs=1 count=1 >/dev/null 2>&1; exit 0' HUP; printf r; while :; do sleep 0.05; done"#,
+        );
+        let pid = pid_of(&a);
+        wait_until_ready(&a);
+
+        let start = Instant::now();
+        a.hang_up();
+        a.reap();
+        let took = start.elapsed();
+
+        assert_eq!(peek_child(pid), Peek::Gone);
+        assert!(
+            took < Duration::from_millis(500),
+            "the client took {took:?} — nothing answered the device attributes \
+             request it was waiting on, so it sat there until the reap's deadline"
+        );
+    }
+
+    /// The request as Neovim spells it, and nothing else.
+    #[test]
+    fn a_device_attributes_request_is_recognised_in_a_chunk_of_output() {
+        assert!(asks_for_device_attributes(b"\x1b[c"));
+        // As it really arrives: at the tail of a restore sequence.
+        assert!(asks_for_device_attributes(
+            b"\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[c"
+        ));
+        assert!(!asks_for_device_attributes(b""));
+        assert!(!asks_for_device_attributes(b"\x1b[?1049l"));
+        // A reply is not a request; answering one with another is a loop.
+        assert!(!asks_for_device_attributes(DA1_REPLY));
     }
 
     /// A client that stopped itself takes the hangup only because it is
