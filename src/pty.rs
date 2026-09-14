@@ -231,10 +231,15 @@ impl Attachment {
         // a healthy client ends up killed by the deadline below.
         let master = self.master.as_raw_fd();
         let deadline = Instant::now() + REAP_TIMEOUT;
+        // Remembered rather than answered once: the request is seen on exactly
+        // one pass of this loop, and that pass is the likeliest moment for the
+        // client's input queue to be momentarily full.
+        let mut owed = false;
         while Instant::now() < deadline {
             if let Some(fd) = master {
-                if discard_pending(fd) {
-                    self.answer_device_attributes();
+                owed |= discard_pending(fd);
+                if owed {
+                    owed = !self.answer_device_attributes();
                 }
             }
             match self.child.try_wait() {
@@ -282,10 +287,58 @@ impl Attachment {
     /// too, which was checked — but one delivered in *pieces* is read as keys,
     /// and `ESC [ ? 1 ;` followed later by `2 c` leaves the editor in
     /// operator-pending. Seven bytes in one write to a pty cannot be torn.
-    fn answer_device_attributes(&mut self) {
+    fn answer_device_attributes(&mut self) -> bool {
+        // Asked first, and skipped rather than waited for.
+        //
+        // What this is guarding: both callers run from `Drop`, and neither may
+        // block. `reap` cannot reach its own deadline from inside a parked
+        // write, and `drain_until_eof` holds the user's terminal in raw mode
+        // while it runs — so a park in either is an nvmux that never comes back.
+        // A pty master does stop accepting bytes: measured, a sustained writer
+        // stalls indefinitely once the slave's queue fills and nothing reads it.
+        //
+        // What it is *not*: a fix for an observed hang. This reply is seven
+        // bytes, and seven bytes were never seen to block — a line discipline
+        // with no reader discards what it has no room for, so the room comes
+        // back within milliseconds whatever the client does (measured: full,
+        // then writable again 50 ms later, with the client asleep). It is the
+        // cost of the guard that justifies it — a `poll` with a zero timeout —
+        // against a wait that has no bound at all if it ever does happen.
+        //
+        // The cost of skipping is the second this saves — the client waits out
+        // `EXIT_TIMEOUT_MS` as it did before the answer existed — so this
+        // reports whether the reply went out and both callers, which are loops,
+        // carry the debt to their next pass. Retried, never waited for.
+        //
+        // And the room can be missing for a moment without the client being
+        // wedged at all: the Linux tty layer stages a write in a flip buffer and
+        // moves it on from a work queue, so a master that has just taken a burst
+        // reports no room until that queue runs, a few milliseconds later. A
+        // one-shot answer would lose that coin toss; a retried one cannot.
+        let Some(fd) = self.master.as_raw_fd() else {
+            return true;
+        };
+        if !writable(fd) {
+            tracing::debug!("the departing client's input queue is full; not answering yet");
+            return false;
+        }
         tracing::debug!("answering the departing client's DA1 request");
-        let _ = self.writer.write_all(DA1_REPLY);
-        let _ = self.writer.flush();
+        // One `write`, not `write_all`: `writable` promises room for a byte,
+        // not for seven, and the loop `write_all` would do on a short write is
+        // the same park by another name. A torn reply cannot hurt this client —
+        // it is exiting, and the worst case is the wait it would have had
+        // anyway. (Which is why no live client is ever written to here.)
+        let n = unsafe {
+            libc::write(
+                fd,
+                DA1_REPLY.as_ptr() as *const libc::c_void,
+                DA1_REPLY.len(),
+            )
+        };
+        if n != DA1_REPLY.len() as isize {
+            tracing::debug!(wrote = n, "the DA1 answer went out short");
+        }
+        true
     }
 
     /// Relay whatever the client writes on its way out, then stop.
@@ -308,6 +361,7 @@ impl Attachment {
         };
         let deadline = Instant::now() + DRAIN_TIMEOUT;
         let mut buf = [0u8; 8192];
+        let mut owed = false;
         while Instant::now() < deadline {
             let mut p = [pollfd(fd)];
             let n = unsafe { libc::poll(p.as_mut_ptr(), 1, 50) };
@@ -318,13 +372,13 @@ impl Attachment {
                 Ok(0) | Err(_) => return,
                 Ok(len) => {
                     // Read before the write, because the write borrows `self`.
-                    let asked = asks_for_device_attributes(&buf[..len]);
+                    owed |= asks_for_device_attributes(&buf[..len]);
                     let mut out = std::io::stdout().lock();
                     let _ = out.write_all(&buf[..len]);
                     let _ = out.flush();
                     drop(out);
-                    if asked {
-                        self.answer_device_attributes();
+                    if owed {
+                        owed = !self.answer_device_attributes();
                     }
                 }
             }
@@ -861,6 +915,20 @@ fn pollfd(fd: RawFd) -> libc::pollfd {
         events: libc::POLLIN,
         revents: 0,
     }
+}
+
+/// Whether a write of at least one byte would go through without blocking.
+///
+/// A zero timeout: this is a question, not a wait. The one caller has nothing
+/// it may block for — see [`Attachment::answer_device_attributes`].
+fn writable(fd: RawFd) -> bool {
+    let mut p = [libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    }];
+    let n = unsafe { libc::poll(p.as_mut_ptr(), 1, 0) };
+    n > 0 && p[0].revents & libc::POLLOUT != 0
 }
 
 /// Readable, or gone. `POLLHUP` matters as much as `POLLIN`: on Linux the
