@@ -50,11 +50,16 @@ pub enum Outcome {
     /// Attach to this session.
     Attach {
         session: Session,
-        /// The highest session number in the listing the picker was showing.
-        /// Carried out rather than re-listed because the prefix machine needs
-        /// it to know when a digit can be acted on without waiting, and over
-        /// SSH a listing is a script execution.
-        highest: u32,
+        /// The listing the picker was showing.
+        ///
+        /// Carried out rather than re-listed, for the reason the picker already
+        /// resolves its own keys against the list in hand: a listing is a script
+        /// run — ~230 ms over SSH, and 88-110 ms on a local host whose forks are
+        /// expensive — and the session loop needs the same two answers the
+        /// picker had. The highest number, so the prefix machine knows when a
+        /// digit can be acted on without waiting; and the rows themselves, so a
+        /// `<prefix>` switch can name one without going back to disk.
+        sessions: Vec<Session>,
     },
     /// The user quit.
     Quit,
@@ -289,7 +294,10 @@ fn run_loop(
                 deadline = None;
                 if let Request::Attach(id) = app.resolve_pending() {
                     if let Some(session) = app.session(&id).cloned() {
-                        return Ok(Outcome::Attach { session, highest });
+                        return Ok(Outcome::Attach {
+                            session,
+                            sessions: app.sessions().to_vec(),
+                        });
                     }
                 }
             }
@@ -318,20 +326,25 @@ fn run_loop(
 
             Request::Attach(id) => {
                 if let Some(session) = app.session(&id).cloned() {
-                    return Ok(Outcome::Attach { session, highest });
+                    return Ok(Outcome::Attach {
+                        session,
+                        sessions: app.sessions().to_vec(),
+                    });
                 }
             }
 
             Request::NewSession => {
                 match prompt::run_on(terminal, transport, prompt::Task::Create)? {
                     prompt::Outcome::Created(session) => {
-                        // The new session is the highest by construction when
-                        // it appends, but it may have refilled a gap — so take
-                        // the larger of the two rather than assuming.
-                        return Ok(Outcome::Attach {
-                            highest: highest.max(session.state.num),
-                            session,
-                        });
+                        // Appended rather than re-listed: the picker's rows are
+                        // still accurate and this is the one row they are
+                        // missing, so the caller gets a listing that includes
+                        // what it is about to attach to without another script
+                        // run. Order does not matter to either reader — one
+                        // takes a maximum, the other looks up a number.
+                        let mut sessions = app.sessions().to_vec();
+                        sessions.push(session.clone());
+                        return Ok(Outcome::Attach { session, sessions });
                     }
                     prompt::Outcome::Cancelled => {}
                     prompt::Outcome::Renamed => refresh(&mut app, &mut highest, transport)?,
@@ -533,8 +546,8 @@ mod tests {
     fn only_attaching_hands_the_terminal_to_a_session() {
         let session = Session::new("id000000".into(), "a".into(), 100, 1);
         assert!(Outcome::Attach {
-            session,
-            highest: 1
+            session: session.clone(),
+            sessions: vec![session],
         }
         .attaches());
         assert!(!Outcome::Quit.attaches());
