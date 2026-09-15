@@ -1,4 +1,10 @@
 //! Sessions on this machine. No SSH anywhere in this file.
+//!
+//! What is local about a local session: its socket is reachable as it is, its
+//! liveness can be asked over that socket rather than taken from a script's
+//! `kill -0`, and its metadata is a file right here — re-read and edited in
+//! place, so a rename another nvmux landed in between is kept. The rest is the
+//! shared bodies in [`crate::transport`].
 
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -10,11 +16,7 @@ use crate::paths::{self, SessionPaths};
 use crate::proc::{self, Shell};
 use crate::rpc;
 use crate::session::{Liveness, Session};
-use crate::shell;
-use crate::transport::{
-    finish_listing, install_detach_alias, kill_outcome, opt_pid_arg, pid_arg, plan_create,
-    plan_rename, protocol, wait_until_reachable, Location, Transport, REACHABLE_TIMEOUT,
-};
+use crate::transport::{self, plan_rename, Host, Location, Transport};
 
 pub struct LocalTransport {
     location: Location,
@@ -158,37 +160,29 @@ impl LocalTransport {
     }
 }
 
-impl Transport for LocalTransport {
+impl Host for LocalTransport {
     fn location(&self) -> &Location {
         &self.location
     }
 
-    fn list_sessions(&self) -> Result<Vec<Session>> {
-        // Split, because the two halves have different fixes: the script is
-        // a run in the shell, with a process-table read on a host without
-        // /proc/net/unix, while the probes are round trips to editors that may
-        // be busy. See the `timing:` records in `main` and `pty`.
-        let t_script = std::time::Instant::now();
-        let out = self.run(shell::LIST_SCRIPT, &[&self.dir_arg])?;
-        tracing::debug!(
-            ms = t_script.elapsed().as_secs_f64() * 1000.0,
-            "timing: listing script"
-        );
-        if !out.ok() {
-            tracing::warn!(status = out.status, stderr = %out.stderr, "list.sh failed");
-        }
-        let listed = protocol::rows_to_sessions(protocol::parse_listing(&out.stdout)?);
+    fn dir(&self) -> &str {
+        &self.dir_arg
+    }
 
-        let mut alive = Vec::with_capacity(listed.len());
+    fn run(&self, script: &str, args: &[&str]) -> Result<proc::Output> {
+        LocalTransport::run(self, script, args)
+    }
+
+    /// The script's `kill -0` result is only a hint; the socket is right here,
+    /// so it is replaced with the real answer, and a session found dead is
+    /// reaped on the spot.
+    fn settle(&self, listed: Vec<Session>) -> Result<Vec<Session>> {
         let t_probe = std::time::Instant::now();
         let probed = listed.len();
+        let mut alive = Vec::with_capacity(listed.len());
         for mut s in listed {
             let paths = self.paths(&s.id)?;
-
-            // The script's `kill -0` result is only a hint; the socket is right
-            // here, so replace it with the real answer.
             s.state.liveness = rpc::probe(&paths.sock);
-
             match s.state.liveness {
                 // Never reap a busy session: blocked in `:!make` it is
                 // reachable but cannot answer a deferred call.
@@ -203,14 +197,55 @@ impl Transport for LocalTransport {
                 }
             }
         }
-
         tracing::debug!(
             ms = t_probe.elapsed().as_secs_f64() * 1000.0,
             sessions = probed,
             "timing: listing probes"
         );
+        Ok(alive)
+    }
 
-        Ok(finish_listing(alive))
+    /// `SessionPaths::new` is what bounds the length.
+    fn host_sock(&self, id: &str) -> Result<PathBuf> {
+        Ok(self.paths(id)?.sock)
+    }
+
+    /// The identity function: the socket is already here.
+    fn reach(&self, _id: &str, host_sock: &Path) -> Result<PathBuf> {
+        Ok(host_sock.to_path_buf())
+    }
+
+    /// A socket the script could not remove would resurrect the session in
+    /// the next listing.
+    fn sweep(&self, id: &str) {
+        if let Ok(paths) = self.paths(id) {
+            if paths.sock.exists() && self.is_reapable(&paths.sock) {
+                self.reap(&paths);
+            }
+        }
+    }
+
+    fn write_meta(&self, session: &Session) -> Result<()> {
+        Ok(session.write_atomic(&self.paths(&session.id)?.json)?)
+    }
+
+    fn log_path(&self, id: &str) -> PathBuf {
+        self.dir.join(format!("{id}.log"))
+    }
+
+    /// The first thing anyone wants when a session will not start.
+    fn log_tail(&self, id: &str) -> Option<String> {
+        Some(self.log_tail(&Host::log_path(self, id)))
+    }
+}
+
+impl Transport for LocalTransport {
+    fn location(&self) -> &Location {
+        &self.location
+    }
+
+    fn list_sessions(&self) -> Result<Vec<Session>> {
+        transport::list(self)
     }
 
     fn home(&self) -> &str {
@@ -222,84 +257,11 @@ impl Transport for LocalTransport {
     }
 
     fn create_session(&self, name: &str, launch: &Launch, directory: &str) -> Result<Session> {
-        // The listing is also what the new session's number is allocated
-        // from, so numbering costs no extra work here.
-        let (id, num) = plan_create(&self.list_sessions()?, name)?;
-        let paths = self.paths(&id)?;
-
-        // The socket is substituted here rather than in the script: this side
-        // already computed the path, and `SessionPaths::new` has bounded its
-        // length, which the script has no way to do.
-        let argv = launch.argv_for(&paths.sock.to_string_lossy());
-        let mut args: Vec<&str> = vec![&self.dir_arg, &id, directory];
-        args.extend(argv.iter().map(String::as_str));
-
-        tracing::info!(%id, name, command = launch.line(), directory, "spawning session");
-        let out = self.run(shell::SPAWN_SCRIPT, &args)?;
-        let spawned = protocol::parse_spawn(&out.stdout)?;
-
-        if !spawned.socket_appeared || !wait_until_reachable(&paths.sock, REACHABLE_TIMEOUT) {
-            // Clean up rather than leave a half-created session behind — but
-            // through the kill script, which removes the files only once it
-            // has seen the process go. Unlinking the socket here on the
-            // strength of "it did not answer in time" would orphan a Neovim
-            // that was merely slow to start. An empty pid is fine: the script
-            // finds the process by its socket, the pid is only a hint.
-            let tail = self.log_tail(&paths.log);
-            let pid = opt_pid_arg(spawned.pid);
-            match self.run(shell::KILL_SCRIPT, &[&self.dir_arg, &id, &pid]) {
-                Ok(out) => match protocol::parse_kill(&out.stdout) {
-                    Ok(outcome) => tracing::debug!(%id, ?outcome, "cleaned up a failed create"),
-                    Err(e) => tracing::warn!(%id, error = %e, "cleanup after a failed create"),
-                },
-                Err(e) => tracing::warn!(%id, error = %e, "cleanup after a failed create"),
-            }
-            return Err(SessionError::NotReady {
-                name: name.to_string(),
-                timeout: REACHABLE_TIMEOUT,
-                log: paths.log.clone(),
-                log_tail: tail,
-            }
-            .into());
-        }
-
-        let mut session = Session::new(id, name.to_string(), spawned.pid.unwrap_or(0), num)
-            .launched_with(launch.line())
-            .started_in(directory);
-        session.write_atomic(&paths.json)?;
-        // The caller attaches to this without re-listing, so give it the same
-        // resolved number a listing would have.
-        session.state.num = num;
-
-        install_detach_alias(&paths.sock);
-
-        tracing::info!(id = %session.id, name, pid = session.pid, "session ready");
-        Ok(session)
+        transport::create(self, name, launch, directory)
     }
 
     fn kill_session(&self, s: &Session) -> Result<()> {
-        let paths = self.paths(&s.id)?;
-
-        // Straight to signals — SIGTERM first, inside the script, so nvim still
-        // runs VimLeavePre, writes its ShaDa file and unlinks its own socket.
-        // The recorded pid is only a starting guess: the script uses it only if
-        // it still owns this session's socket, since pids get reused.
-        let pid = pid_arg(s.pid);
-        let out = self.run(shell::KILL_SCRIPT, &[&self.dir_arg, &s.id, &pid])?;
-        if !out.ok() {
-            tracing::warn!(status = out.status, stderr = %out.stderr, "kill.sh failed");
-        }
-
-        // Files are removed only once the session is genuinely gone; see
-        // `kill_outcome`.
-        kill_outcome(protocol::parse_kill(&out.stdout)?, &s.name)?;
-        // A socket the script could not remove would resurrect the session in
-        // the next listing.
-        if paths.sock.exists() && self.is_reapable(&paths.sock) {
-            self.reap(&paths);
-        }
-        tracing::info!(id = %s.id, name = %s.name, "session killed");
-        Ok(())
+        transport::kill(self, s)
     }
 
     fn rename_session(&self, s: &Session, new_name: &str) -> Result<()> {

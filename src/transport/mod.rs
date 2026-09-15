@@ -3,6 +3,18 @@
 //! Everything above this module — the picker, the attach path — is written once
 //! against [`Transport`] and does not know whether the sessions it is listing
 //! live on this machine or on the far end of an SSH connection.
+//!
+//! Below it, most of the work is written once too. The scripts are the
+//! protocol and [`crate::proc::Shell`] runs them the same way on either host,
+//! so listing, creating and killing a session are one body each — [`list`],
+//! [`create`], [`kill`] — over a [`Host`] that supplies what differs: how the
+//! host is reached, how a session's liveness is settled, and where its
+//! metadata lives. The differences that do not fold are kept in the open, as
+//! each transport's own methods: [`Transport::local_socket_for`], which is the
+//! seam that makes a remote session attachable at all, and the metadata edits
+//! (`rename_session`, `renumber`), which the local transport does in place on
+//! files it can re-read and the remote one does by writing the picker's record
+//! back through a script.
 
 pub mod local;
 pub mod protocol;
@@ -11,10 +23,12 @@ pub mod remote;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::error::{Result, SessionError};
+use crate::error::{NvmuxError, Result, SessionError};
 use crate::launch::Launch;
+use crate::proc::Output;
 use crate::rpc;
 use crate::session::Session;
+use crate::shell;
 
 /// Where a set of sessions lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +133,204 @@ pub fn open(location: Location) -> Result<Box<dyn Transport>> {
         Location::Local => Ok(Box::new(local::LocalTransport::new()?)),
         Location::Ssh(host) => Ok(Box::new(remote::SshTransport::new(host)?)),
     }
+}
+
+// --- the bodies both transports share ---------------------------------------
+
+/// What a transport supplies to [`list`], [`create`] and [`kill`].
+///
+/// Everything here is about *where* the host is. The scripts run there, in a
+/// shell of the host's, and speak the same protocol wherever they run; what
+/// each transport knows is how a socket is spelled over there and reached from
+/// here, what a listed session's liveness is worth, and where a session's
+/// metadata is kept. The three defaults are the local answer, where a socket
+/// needs no reaching and nothing is left to clean up but a file.
+pub(crate) trait Host {
+    fn location(&self) -> &Location;
+
+    /// The runtime directory on the session host, as the scripts take it.
+    fn dir(&self) -> &str;
+
+    /// Run one of the shared scripts in the host's shell.
+    ///
+    /// A script that fails is an `Ok` with a status, which each body reads its
+    /// own way; `Err` is the shell, or the link it runs over.
+    fn run(&self, script: &str, args: &[&str]) -> Result<Output>;
+
+    /// A listing already in hand, taken once. Over ssh the greeting carries
+    /// one, so the picker's first listing costs no round trip.
+    fn take_listing(&self) -> Option<String> {
+        None
+    }
+
+    /// Settle what the listing script said about each session's liveness:
+    /// which to keep, which to drop, and what to clean up on the way.
+    fn settle(&self, listed: Vec<Session>) -> Result<Vec<Session>>;
+
+    /// The socket path as the session host sees it — what `--listen` gets —
+    /// checked against the path budget *before* anything is spawned: an
+    /// overlong path makes Neovim silently truncate and bind somewhere that
+    /// could never be reached.
+    fn host_sock(&self, id: &str) -> Result<PathBuf>;
+
+    /// Make a new session's socket reachable from this machine, and say where.
+    /// Locally that is the socket itself; over ssh, a forward onto it.
+    fn reach(&self, id: &str, host_sock: &Path) -> Result<PathBuf>;
+
+    /// Undo [`Host::reach`] for a session that is going or gone. A session
+    /// that comes back is reached again, so this is never wrong to call.
+    fn unreach(&self, _id: &str) {}
+
+    /// After the kill script has seen a session go: whatever it could not
+    /// remove itself, which would otherwise resurrect the session in the next
+    /// listing. Only the local transport has anything to do here.
+    fn sweep(&self, _id: &str) {}
+
+    /// Write a new session's metadata where the host keeps it.
+    fn write_meta(&self, session: &Session) -> Result<()>;
+
+    /// Where the session's log is, in the words of the error that names it.
+    fn log_path(&self, id: &str) -> PathBuf;
+
+    /// The last lines of that log, where it can be read from here.
+    fn log_tail(&self, _id: &str) -> Option<String> {
+        None
+    }
+}
+
+/// Every session on the host, liveness settled, numbered and sorted.
+pub(crate) fn list(h: &impl Host) -> Result<Vec<Session>> {
+    let stdout = match h.take_listing() {
+        Some(stdout) => stdout,
+        None => {
+            // Timed apart from the settling below because the two have
+            // different fixes: the script is the host's process table and a
+            // shell, while settling is round trips to editors that may be
+            // busy. See the `timing:` records in `main` and `pty`.
+            let t_script = std::time::Instant::now();
+            let out = h.run(shell::LIST_SCRIPT, &[h.dir()])?;
+            tracing::debug!(
+                ms = t_script.elapsed().as_secs_f64() * 1000.0,
+                "timing: listing script"
+            );
+            if !out.ok() {
+                tracing::warn!(status = out.status, stderr = %out.stderr, "list.sh failed");
+            }
+            out.stdout
+        }
+    };
+    let listed = protocol::rows_to_sessions(protocol::parse_listing(&stdout)?);
+    Ok(finish_listing(h.settle(listed)?))
+}
+
+/// Spawn a session and wait for it to answer; see [`Transport::create_session`].
+pub(crate) fn create(
+    h: &impl Host,
+    name: &str,
+    launch: &Launch,
+    directory: &str,
+) -> Result<Session> {
+    // The listing is also what the new session's number is allocated from, so
+    // numbering costs no extra work here.
+    let (id, num) = plan_create(&list(h)?, name)?;
+    let host_sock = h.host_sock(&id)?;
+
+    // The socket is substituted here rather than in the script: this side
+    // already computed the path and bounded its length, which the script has
+    // no way to do. Every word travels as its own argument.
+    let argv = launch.argv_for(&host_sock.to_string_lossy());
+    let mut args: Vec<&str> = vec![h.dir(), &id, directory];
+    args.extend(argv.iter().map(String::as_str));
+
+    tracing::info!(host = %h.location(), %id, name, command = launch.line(), directory, "spawning session");
+    let out = h.run(shell::SPAWN_SCRIPT, &args)?;
+    let spawned = protocol::parse_spawn(&out.stdout)?;
+
+    // Every way out of a half-created session ends it through the kill
+    // script, which removes the files only once it has seen the process go —
+    // unlinking the socket here on the strength of "it did not answer in
+    // time" would orphan a Neovim that was merely slow to start — and reports
+    // why, naming the log on the host that has it. The log is read before the
+    // kill, which removes it.
+    let not_ready = |detail: String| -> NvmuxError {
+        let log_tail = h.log_tail(&id).unwrap_or(detail);
+        discard(h, &id, spawned.pid);
+        SessionError::NotReady {
+            name: name.to_string(),
+            timeout: REACHABLE_TIMEOUT,
+            log: h.log_path(&id),
+            log_tail,
+        }
+        .into()
+    };
+
+    if !spawned.socket_appeared {
+        return Err(not_ready(out.stderr.trim().to_string()));
+    }
+
+    // Over ssh this is the forward, and proves it works before the user tries
+    // to attach; a forward that cannot be made leaves no session behind either.
+    let local = h
+        .reach(&id, &host_sock)
+        .inspect_err(|_| discard(h, &id, spawned.pid))?;
+
+    if !wait_until_reachable(&local, REACHABLE_TIMEOUT) {
+        // A forward succeeding proves nothing on its own: `ssh -O forward` to
+        // a nonexistent remote socket still exits 0 and creates a working
+        // local socket. Only an answer through it does.
+        return Err(not_ready("the session never answered".into()));
+    }
+
+    let mut session = Session::new(id, name.to_string(), spawned.pid.unwrap_or(0), num)
+        .launched_with(launch.line())
+        .started_in(directory);
+    h.write_meta(&session)?;
+    // The caller attaches to this without re-listing, so give it the same
+    // resolved number a listing would have.
+    session.state.num = num;
+
+    install_detach_alias(&local);
+
+    tracing::info!(host = %h.location(), id = %session.id, name, pid = session.pid, "session ready");
+    Ok(session)
+}
+
+/// End a session that never became one. An empty pid is fine: the script
+/// finds the process by its socket, and the pid is only a hint.
+fn discard(h: &impl Host, id: &str, pid: Option<u32>) {
+    h.unreach(id);
+    let pid = opt_pid_arg(pid);
+    match h.run(shell::KILL_SCRIPT, &[h.dir(), id, &pid]) {
+        Ok(out) => match protocol::parse_kill(&out.stdout) {
+            Ok(outcome) => tracing::debug!(%id, ?outcome, "cleaned up a failed create"),
+            Err(e) => tracing::warn!(%id, error = %e, "cleanup after a failed create"),
+        },
+        Err(e) => tracing::warn!(%id, error = %e, "cleanup after a failed create"),
+    }
+}
+
+/// Terminate a session; see [`Transport::kill_session`].
+pub(crate) fn kill(h: &impl Host, s: &Session) -> Result<()> {
+    // Straight to signals — SIGTERM first, inside the script, so nvim still
+    // runs VimLeavePre, writes its ShaDa file and unlinks its own socket. The
+    // recorded pid is only a starting guess: the script uses it only if it
+    // still owns this session's socket, since pids get reused.
+    let pid = pid_arg(s.pid);
+    let out = h.run(shell::KILL_SCRIPT, &[h.dir(), &s.id, &pid])?;
+    if !out.ok() {
+        tracing::warn!(status = out.status, stderr = %out.stderr, "kill.sh failed");
+    }
+    let outcome = protocol::parse_kill(&out.stdout)?;
+
+    // Whatever the outcome: re-attaching would reach it again anyway.
+    h.unreach(&s.id);
+
+    // Files are removed only once the session is genuinely gone; see
+    // `kill_outcome`.
+    kill_outcome(outcome, &s.name)?;
+    h.sweep(&s.id);
+    tracing::info!(host = %h.location(), id = %s.id, name = %s.name, "session killed");
+    Ok(())
 }
 
 // --- shared between the two transports -------------------------------------
