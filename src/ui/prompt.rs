@@ -90,11 +90,14 @@
 //! directory starts to reach it. Nothing else shows it — the prompt opens as
 //! three plain fields — and `Esc` puts it away again.
 //!
-//! `Tab` from inside the menu takes what is highlighted and writes it *without* a
-//! trailing slash, so the path reads exactly as it would have been typed. The
-//! next `Tab` appends the slash and opens the level below. That pairing is what
-//! makes one key enough to walk down a tree: `Tab`, choose, `Tab`, `Tab`, choose,
-//! `Tab` — and the `/` is never typed by hand.
+//! `Tab` from inside the menu steps *into* what is highlighted: the name goes
+//! into the field with a `/` after it, and the menu stays open, now listing the
+//! level below. That is what makes one key enough to walk down a tree: `Tab`,
+//! choose, `Tab`, choose, `Tab` — and the `/` is never typed by hand. `Enter`
+//! from the menu takes the name and stops there: written *without* a trailing
+//! slash, so the path reads exactly as it would have been typed, and the menu
+//! closes so that the next enter creates. A `Tab` after that steps into what
+//! was chosen, the same way.
 //!
 //! An emptied field is that pairing seen from the other end. Backspace the path
 //! to nothing and home comes back dimmed, because it is still what enter would
@@ -102,10 +105,10 @@
 //! what is inside, and the `Tab` after that opens the menu on it. So the one key
 //! the hint row offers here always acts on the text in front of you.
 //!
-//! Stepping in is remembered from the accept rather than read off the path, and
-//! deliberately: a directory whose name is also a prefix of its siblings — `pro`
-//! beside `projects` — must not be stepped into merely because it exists. Only
-//! having just chosen it means that.
+//! Stepping in after an `Enter` is remembered from the accept rather than read
+//! off the path, and deliberately: a directory whose name is also a prefix of
+//! its siblings — `pro` beside `projects` — must not be stepped into merely
+//! because it exists. Only having just chosen it means that.
 //!
 //! # Where the field starts, and how to leave
 //!
@@ -355,9 +358,10 @@ struct Menu {
     /// Whether the menu is on screen. Nothing opens it but `Tab`, so the prompt
     /// is three plain fields until asked for suggestions.
     open: bool,
-    /// The last thing `Tab` did was accept, so the next one steps *into* what it
-    /// accepted rather than reopening on the same query. Cleared by every other
-    /// key.
+    /// The last key was an `Enter` that accepted from the menu, so the next
+    /// `Tab` steps *into* what it accepted rather than reopening on the same
+    /// query. Cleared by every other key. (`Tab` from the menu steps in at
+    /// once and needs no remembering.)
     ///
     /// A flag rather than a look at the path, because a directory whose name is
     /// also a prefix of its siblings — `pro` beside `projects` — must not be
@@ -438,7 +442,7 @@ impl Prompt {
             return "⏎ rename   esc cancel";
         }
         if self.choosing() {
-            "⇥ ⏎ accept   ↑↓ choose   esc close"
+            "⇥ step in   ⏎ accept   ↑↓ choose   esc close"
         } else if self.completes() {
             "⏎ create   ↑↓ field   ⇥ complete   esc cancel"
         } else {
@@ -556,7 +560,7 @@ impl Prompt {
             // does nothing at all.
             Key::Tab if self.completes() => {
                 if choosing {
-                    self.accept();
+                    self.step_in();
                 } else if self.fields[DIRECTORY].adopt_default() {
                     // The dim path is a real answer, not decoration: an emptied
                     // field gets it back before it is offered what is inside it.
@@ -597,13 +601,19 @@ impl Prompt {
             // out to remove was one conditional on state nobody could see; this
             // one turns on whether a menu is on the screen in front of you,
             // which is what the movement keys already key off.
-            Key::Enter if choosing => {
+            Key::Enter if choosing && self.menu().highlighted().is_some() => {
                 self.accept();
                 Step::None
             }
             // Otherwise the one thing enter means, from any field: `c` then
-            // enter is still a session in one keystroke.
-            Key::Enter => Step::Submit(self.submission()),
+            // enter is still a session in one keystroke. A menu with nothing
+            // in it to take — stepped into a directory with no directories,
+            // or one still being listed — is closed on the way, rather than
+            // standing between the user and the session they asked for.
+            Key::Enter => {
+                self.close_menu();
+                Step::Submit(self.submission())
+            }
 
             // One thing at a time on the way out: the menu you opened, then the
             // prompt. The picker's filter mode sets the same precedent, and
@@ -622,10 +632,9 @@ impl Prompt {
 
     /// Open the menu on whatever the field is pointing at.
     ///
-    /// After an accept, that means *inside* the directory just chosen, so the
-    /// `/` is appended here rather than typed. This is the second half of the
-    /// pairing that lets `Tab` walk down a tree: accept writes the name, and the
-    /// next `Tab` steps into it.
+    /// After an `Enter` accept, that means *inside* the directory just chosen,
+    /// so the `/` is appended here rather than typed — the same step a `Tab`
+    /// from the menu takes at once.
     fn open_menu(&mut self) {
         let stepped = self.menu.as_ref().is_some_and(|m| m.stepped);
         if stepped {
@@ -665,19 +674,57 @@ impl Prompt {
         self.menu.as_mut().expect("a menu the caller checked for")
     }
 
-    /// Take the highlighted directory into the field, and close the menu.
+    /// Take the highlighted directory into the field, and close the menu:
+    /// what `Enter` does from the menu.
     ///
     /// The name alone, with no trailing `/`: the path then reads exactly as it
-    /// would if it had been typed, and the slash is the next `Tab`'s job — which
-    /// is what makes one key both "complete this" and "now go inside it".
+    /// would if it had been typed. Stepping in is left to the next `Tab`,
+    /// which the `stepped` flag tells to.
     fn accept(&mut self) {
+        if !self.take_highlighted() {
+            return;
+        }
+        if let Some(menu) = self.menu.as_mut() {
+            menu.open = false;
+            menu.stepped = true;
+            menu.matches.clear();
+            menu.message.clear();
+        }
+    }
+
+    /// Take the highlighted directory into the field with a `/` after it, and
+    /// keep the menu open on what is inside: what `Tab` does from the menu.
+    ///
+    /// The matches are cleared rather than kept, since they were the siblings;
+    /// the loop asks the completer for the new directory on this same
+    /// keystroke, and the menu says `…` until the answer comes — at once from
+    /// the cache for a directory seen before, a round trip otherwise.
+    fn step_in(&mut self) {
+        if !self.take_highlighted() {
+            return;
+        }
+        let field = &mut self.fields[DIRECTORY];
+        field.input.push('/');
+        field.cursor = field.len();
+        if let Some(menu) = self.menu.as_mut() {
+            menu.open = true;
+            menu.stepped = false;
+            menu.selected = 0;
+            menu.matches.clear();
+            menu.message.clear();
+        }
+    }
+
+    /// Write the highlighted directory over the half-typed name in the field.
+    /// False when there is nothing highlighted to write.
+    fn take_highlighted(&mut self) -> bool {
         let Some(name) = self
             .menu
             .as_ref()
             .and_then(Menu::highlighted)
             .map(str::to_string)
         else {
-            return;
+            return false;
         };
         let field = &mut self.fields[DIRECTORY];
         // Against the value, not the input: an emptied field is showing its
@@ -691,13 +738,7 @@ impl Prompt {
         let parent = parent.trim_end_matches('/');
         field.input = format!("{inert}{parent}/{name}");
         field.cursor = field.len();
-
-        if let Some(menu) = self.menu.as_mut() {
-            menu.open = false;
-            menu.stepped = true;
-            menu.matches.clear();
-            menu.message.clear();
-        }
+        true
     }
 }
 
@@ -1992,23 +2033,40 @@ mod tests {
         assert!(p.choosing());
     }
 
-    /// `Tab` opens the menu, and `Tab` again takes what is highlighted. One key,
-    /// one job, in sequence.
+    /// `Tab` opens the menu, and `Tab` again steps into what is highlighted:
+    /// the name with a `/` after it, and the menu still open, now on what is
+    /// inside. One key walks down the tree.
     #[test]
-    fn tab_opens_the_menu_then_accepts_from_it() {
+    fn tab_opens_the_menu_then_steps_into_what_is_highlighted() {
         let mut p = menuing("/home/pro", &["projects", "prototypes"]);
         p.on_key(Key::CtrlN);
         p.on_key(Key::Tab);
-        assert!(!p.choosing(), "accepting closes the menu");
-        assert_eq!(p.fields[DIRECTORY].input, "/home/prototypes");
+        assert!(p.choosing(), "the menu stays open, on the new directory");
+        assert_eq!(p.fields[DIRECTORY].input, "/home/prototypes/");
+        assert_eq!(
+            p.fields[DIRECTORY].cursor,
+            p.fields[DIRECTORY].len(),
+            "the cursor follows, ready for the next component"
+        );
+        let menu = p.menu.as_ref().expect("a menu");
+        assert!(
+            menu.matches.is_empty(),
+            "the siblings are not what is inside: {:?}",
+            menu.matches
+        );
+        assert!(
+            !menu.stepped,
+            "already stepped in; nothing is owed to the next Tab"
+        );
     }
 
-    /// The name alone, so the path reads exactly as it would if it had been
-    /// typed. The slash is the next `Tab`'s job.
+    /// `Enter` takes the name alone, so the path reads exactly as it would if
+    /// it had been typed, and closes the menu so the next enter creates.
     #[test]
-    fn an_accept_writes_the_name_without_a_trailing_slash() {
+    fn enter_accepts_the_name_without_a_trailing_slash_and_closes_the_menu() {
         let mut p = menuing("/home/pro", &["projects"]);
-        p.on_key(Key::Tab);
+        p.on_key(Key::Enter);
+        assert!(!p.choosing(), "accepting closes the menu");
         assert_eq!(p.fields[DIRECTORY].input, "/home/projects");
         assert_eq!(
             p.fields[DIRECTORY].cursor,
@@ -2017,12 +2075,12 @@ mod tests {
         );
     }
 
-    /// The `/` nobody types. Accepting writes the name; the next `Tab` steps
-    /// into it, so walking down a tree never leaves the keyboard's home row.
+    /// The `/` nobody types, after an `Enter`: accepting wrote the name, and
+    /// the next `Tab` steps into it rather than reoffering the siblings.
     #[test]
-    fn tab_after_an_accept_steps_into_what_it_accepted() {
+    fn tab_after_an_enter_accept_steps_into_what_it_accepted() {
         let mut p = menuing("/home/pro", &["projects"]);
-        p.on_key(Key::Tab);
+        p.on_key(Key::Enter);
         assert_eq!(p.fields[DIRECTORY].input, "/home/projects");
 
         p.on_key(Key::Tab);
@@ -2033,13 +2091,13 @@ mod tests {
         );
     }
 
-    /// Only ever for the one keystroke after an accept. A directory whose name
-    /// is also a prefix of its siblings must not be stepped into merely because
-    /// it exists — only because it was just chosen.
+    /// Only ever for the one keystroke after an `Enter` accept. A directory
+    /// whose name is also a prefix of its siblings must not be stepped into
+    /// merely because it exists — only because it was just chosen.
     #[test]
     fn anything_but_tab_after_an_accept_forgets_the_step() {
         let mut p = menuing("/home/pro", &["pro", "projects"]);
-        p.on_key(Key::Tab);
+        p.on_key(Key::Enter);
         assert_eq!(p.fields[DIRECTORY].input, "/home/pro");
 
         // A cursor move is enough to mean "I am not stepping in".
@@ -2050,6 +2108,68 @@ mod tests {
             p.fields[DIRECTORY].input, "/home/pro",
             "reopened on the query rather than stepping into `pro`"
         );
+    }
+
+    /// The whole of it, against a real directory and a real worker: `Tab`
+    /// steps in, the loop asks the completer about the new directory on that
+    /// same keystroke, and the menu shows what is inside once the answer lands.
+    #[test]
+    fn stepping_in_lists_the_directory_stepped_into() {
+        let root = std::env::temp_dir().join(format!("nvmux-stepin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for name in ["alpha/x", "alpha/y", "beta"] {
+            std::fs::create_dir_all(root.join(name)).expect("make a directory");
+        }
+        let dir = format!("{}/", root.to_string_lossy());
+
+        let mut completer = complete::Completer::new(crate::dirs::DirSource::Local);
+        let mut p = at_directory(&dir);
+        let settle = |c: &mut complete::Completer| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while c.waiting() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the listing never came"
+                );
+                c.poll();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+
+        p.on_key(Key::Tab);
+        refresh(&mut p, Some(&mut completer));
+        settle(&mut completer);
+        show(&mut p, Some(&mut completer));
+        assert_eq!(p.menu.as_ref().unwrap().matches, ["alpha", "beta"]);
+
+        p.on_key(Key::Tab);
+        assert_eq!(p.fields[DIRECTORY].input, format!("{dir}alpha/"));
+        refresh(&mut p, Some(&mut completer));
+        settle(&mut completer);
+        show(&mut p, Some(&mut completer));
+        assert!(p.choosing(), "still choosing, one level down");
+        assert_eq!(
+            p.menu.as_ref().unwrap().matches,
+            ["x", "y"],
+            "what is inside `alpha`, not its siblings"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Stepped into a directory with nothing to choose — a leaf, or one still
+    /// being listed — enter creates rather than doing nothing behind a menu
+    /// that has nothing to give it.
+    #[test]
+    fn enter_on_a_menu_with_nothing_to_choose_creates() {
+        let mut p = menuing("/home/pro", &["projects"]);
+        p.on_key(Key::Tab);
+        assert!(p.choosing() && p.menu.as_ref().unwrap().matches.is_empty());
+        match p.on_key(Key::Enter) {
+            Step::Submit(s) => assert_eq!(s.directory, Some("/home/projects/".to_string())),
+            other => panic!("expected a create, got {other:?}"),
+        }
+        assert!(!p.choosing(), "and the menu is gone");
     }
 
     /// The property, rather than the coincidence: the row advertises `⇥` in
@@ -2228,26 +2348,24 @@ mod tests {
         }
     }
 
-    /// The two accept keys are the same key as far as the field is concerned,
-    /// including the step that the next `Tab` takes.
+    /// The two keys reach the same place; `Tab` just gets there in one press.
+    /// `Enter` then `Tab` is `Tab`, as far as the field is concerned.
     #[test]
-    fn enter_and_tab_accept_the_same_way() {
+    fn tab_steps_in_at_once_where_enter_accepts_and_waits() {
         let mut by_tab = menuing("/home/pro", &["projects"]);
         by_tab.on_key(Key::Tab);
         let mut by_enter = menuing("/home/pro", &["projects"]);
         by_enter.on_key(Key::Enter);
-        assert_eq!(
-            by_tab.fields[DIRECTORY].input,
-            by_enter.fields[DIRECTORY].input
-        );
+        assert_eq!(by_tab.fields[DIRECTORY].input, "/home/projects/");
+        assert_eq!(by_enter.fields[DIRECTORY].input, "/home/projects");
+        assert!(by_tab.choosing() && !by_enter.choosing());
 
-        by_tab.on_key(Key::Tab);
         by_enter.on_key(Key::Tab);
         assert_eq!(
             by_tab.fields[DIRECTORY].input, by_enter.fields[DIRECTORY].input,
-            "and both leave the next Tab able to step in"
+            "an Enter and a Tab is a Tab"
         );
-        assert_eq!(by_enter.fields[DIRECTORY].input, "/home/projects/");
+        assert!(by_enter.choosing());
     }
 
     /// Enter still creates from any field with no menu in front of it, which is
@@ -2344,7 +2462,9 @@ mod tests {
 
         let open = render(&menuing("/home/", &["alpha"]), 60, 14);
         assert!(
-            open[13].contains("⇥ ⏎ accept") && open[13].contains("↑↓ choose"),
+            open[13].contains("⇥ step in")
+                && open[13].contains("⏎ accept")
+                && open[13].contains("↑↓ choose"),
             "expected the hints to follow the menu, got {:?}",
             open[13]
         );
@@ -2428,13 +2548,18 @@ mod tests {
     #[test]
     fn accepting_after_a_double_slash_keeps_the_discarded_prefix() {
         let mut p = menuing("/home/you//e", &["etc"]);
-        p.on_key(Key::Tab);
+        p.on_key(Key::Enter);
         assert_eq!(p.fields[DIRECTORY].input, "/home/you//etc");
 
         match p.on_key(Key::Enter) {
             Step::Submit(s) => assert_eq!(s.directory, Some("/etc".to_string())),
             other => panic!("expected a create, got {other:?}"),
         }
+
+        // Stepping in keeps it too, with the slash on the live half.
+        let mut p = menuing("/home/you//e", &["etc"]);
+        p.on_key(Key::Tab);
+        assert_eq!(p.fields[DIRECTORY].input, "/home/you//etc/");
     }
 
     /// Grey means "no longer counts", and nothing else — so an ordinary path has
