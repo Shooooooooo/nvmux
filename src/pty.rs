@@ -356,11 +356,21 @@ impl Attachment {
     /// opposite policy: here the client's restore sequence *is* wanted, because
     /// this runs on the paths that hand the terminal back to the shell.
     ///
-    /// The DA1 request buried in that sequence still has to be answered, which
-    /// the relaying disguises: the request does reach the real terminal and the
-    /// real terminal does reply, but the pump that would carry the reply back to
-    /// the client has already stopped. Without this, `<prefix> d` costs the same
-    /// second a switch used to.
+    /// The DA1 request buried in that sequence still has to be answered, and
+    /// nvmux answers it, as on a switch: the pump that would carry a terminal's
+    /// reply back to the client has already stopped. Without this, `<prefix> d`
+    /// costs the same second a switch used to.
+    ///
+    /// The request itself is the one thing taken *out* of what is relayed —
+    /// the single exception to the module's rule, and only on this path. Left
+    /// in, it reaches the real terminal, which answers it, and nobody reads
+    /// that answer: the client has gone on nvmux's reply, and nvmux is out of
+    /// raw mode and gone a few milliseconds later. The reply then lands in the
+    /// shell as typed text, `^[[?61;4;6;…c` above the next prompt — seen, on
+    /// a terminal slow enough to answer after nvmux had exited, and possible on
+    /// any. A request split across two reads is missed here as it is by
+    /// `asks_for_device_attributes`, with the same consequence as before this
+    /// existed, and for the same reason it is survivable.
     ///
     /// Bounded, because a client that ignores its termination would otherwise
     /// hold the terminal in raw mode indefinitely.
@@ -383,7 +393,7 @@ impl Attachment {
                     // Read before the write, because the write borrows `self`.
                     owed |= asks_for_device_attributes(&buf[..len]);
                     let mut out = std::io::stdout().lock();
-                    let _ = out.write_all(&buf[..len]);
+                    let _ = out.write_all(&without_device_attributes_request(&buf[..len]));
                     let _ = out.flush();
                     drop(out);
                     if owed {
@@ -1083,6 +1093,29 @@ fn discard_pending(fd: RawFd) -> bool {
 /// `flush_buf`, so in practice the request arrives whole.
 fn asks_for_device_attributes(chunk: &[u8]) -> bool {
     chunk.windows(DA1_REQUEST.len()).any(|w| w == DA1_REQUEST)
+}
+
+/// The chunk with every DA1 request taken out, and nothing else touched. See
+/// [`Attachment::drain_until_eof`] for why a request nvmux answers itself must
+/// not reach the real terminal as well.
+///
+/// Exact bytes only: `ESC [ c` is the request, and neither the reply shape
+/// (`ESC [ ? … c`) nor DA2 (`ESC [ > c`) contains it.
+fn without_device_attributes_request(chunk: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if !asks_for_device_attributes(chunk) {
+        return std::borrow::Cow::Borrowed(chunk);
+    }
+    let mut out = Vec::with_capacity(chunk.len());
+    let mut i = 0;
+    while i < chunk.len() {
+        if chunk[i..].starts_with(DA1_REQUEST) {
+            i += DA1_REQUEST.len();
+        } else {
+            out.push(chunk[i]);
+            i += 1;
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Paint the screen again after one of nvmux's own screens cleared it.
@@ -1937,5 +1970,31 @@ mod tests {
             }
         }
         assert!(act(&mut Broken, Step::Forward(b"x".to_vec())).is_err());
+    }
+
+    /// What the teardown drain relays is the client's restore sequence minus
+    /// the one question nvmux answers in the terminal's place. Everything
+    /// around it, and every sequence that merely resembles it, goes through
+    /// untouched.
+    #[test]
+    fn the_drain_takes_the_da1_request_out_and_nothing_else() {
+        let restore = b"\x1b[?1049l\x1b[?25h\x1b[c\x1b[0m";
+        assert_eq!(
+            &*without_device_attributes_request(restore),
+            b"\x1b[?1049l\x1b[?25h\x1b[0m"
+        );
+        // Twice in one chunk, back to back.
+        assert_eq!(
+            &*without_device_attributes_request(b"a\x1b[c\x1b[cb"),
+            b"ab"
+        );
+        // Not a request: a reply, DA2, and a lone CSI.
+        for left_alone in [&b"\x1b[?1;2c"[..], b"\x1b[>c", b"\x1b[", b"plain text", b""] {
+            assert_eq!(
+                &*without_device_attributes_request(left_alone),
+                left_alone,
+                "{left_alone:?} was rewritten"
+            );
+        }
     }
 }
