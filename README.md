@@ -78,6 +78,13 @@ reimplementing it.
 | `<prefix>` `?` | show these keys — `Esc` goes back |
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
 
+A session's number is its **position in the list**, recalculated every time the
+list is read. Kill session 2 of three and the old 3 becomes the new 2 — the
+column has no holes in it, so the last session is always the number of sessions
+there are. What a session keeps for life is its place in the order, not its
+number; `␣` in the picker is how you change that place, and a new session goes
+on the end.
+
 ### Leaving a session
 
 - **`<prefix> d` detaches.** The session keeps running with all its buffers,

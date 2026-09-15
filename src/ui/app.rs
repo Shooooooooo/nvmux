@@ -1282,8 +1282,9 @@ mod tests {
     /// zeroed however long the drag runs.
     #[test]
     fn the_numbers_on_screen_do_not_change_while_a_session_is_moving() {
-        // Gapped on purpose: 5 is what a listing shows after 3 and 4 were
-        // killed, and a design that renumbered densely would quietly close it.
+        // Gapped on purpose, though a listing is dense: the picker is handed
+        // whatever numbers it is handed, and a drag must deal those same ones
+        // back out rather than renumber from the row order it happens to see.
         let mut a = App::new(vec![
             session("id000000", "aaa", 1),
             session("id000001", "bbb", 2),

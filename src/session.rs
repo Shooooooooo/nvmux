@@ -32,15 +32,21 @@ pub enum Liveness {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionState {
     pub liveness: Liveness,
-    /// The number the picker shows and `<prefix> <n>` selects, resolved by
-    /// `transport::finish_listing` from the stored [`Session::num`].
+    /// The number the picker shows and `<prefix> <n>` selects: this session's
+    /// **position** in the listing, assigned by `transport::finish_listing`
+    /// after it has ordered them by the stored [`Session::num`].
     ///
-    /// Separate from the stored one on purpose. It is dense and duplicate-free
-    /// across one listing — legacy metadata and orphans have no stored number,
-    /// and two clients creating at once can store the same one — and it must
-    /// never reach disk. `SshTransport::rename_session` writes an in-memory
-    /// session straight back through `write_meta.sh`, so a derived number kept
-    /// in `Session::num` would be silently persisted by a rename.
+    /// Separate from the stored one on purpose. It is dense, starts at 1 and is
+    /// duplicate-free across one listing, whatever the stored ranks were —
+    /// legacy metadata and orphans have none at all, and two clients creating
+    /// at once can store the same one. Being a position is also what makes it
+    /// recalculate: kill the second of three and the third is second on the
+    /// next listing, with nothing written anywhere.
+    ///
+    /// It must never reach disk. `SshTransport::rename_session` writes an
+    /// in-memory session straight back through `write_meta.sh`, so a position
+    /// kept in `Session::num` would be silently persisted as a rank by a
+    /// rename.
     pub num: u32,
 }
 
@@ -60,10 +66,17 @@ pub struct Session {
     /// server's own answer once it is reachable. Liveness never rests on it:
     /// pids are reused.
     pub pid: u32,
-    /// The session's number, assigned once at creation and kept for life, so a
-    /// number a user memorised keeps naming the same session. `0` means
-    /// unnumbered: metadata written before numbering existed, and orphans.
-    /// `transport::finish_listing` resolves that into `state.num`.
+    /// The session's **rank**: what orders the listing, and nothing else. Not
+    /// what the picker shows — that is the position the rank sorts this
+    /// session into, resolved into [`SessionState::num`] by
+    /// `transport::finish_listing`, which is why killing a session above this
+    /// one changes the number it displays but not this.
+    ///
+    /// Assigned once at creation, one past the highest on the host, and
+    /// rewritten only by a reorder in the picker. Ranks are therefore *not*
+    /// dense — a kill leaves a hole in them, and nothing closes it, because a
+    /// hole in an ordering key is invisible. `0` means unranked: metadata
+    /// written before numbering existed, and orphans, both of which sort last.
     #[serde(default)]
     pub num: u32,
     /// The command line this session's Neovim was launched with, as

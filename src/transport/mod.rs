@@ -230,9 +230,11 @@ pub(crate) fn create(
     launch: &Launch,
     directory: &str,
 ) -> Result<Session> {
-    // The listing is also what the new session's number is allocated from, so
+    // The listing is also what the new session's rank is allocated from, and
+    // what its displayed number is read back out of once it exists, so
     // numbering costs no extra work here.
-    let (id, num) = plan_create(&list(h)?, name)?;
+    let existing = list(h)?;
+    let (id, rank) = plan_create(&existing, name)?;
     let host_sock = h.host_sock(&id)?;
 
     // The socket is substituted here rather than in the script: this side
@@ -281,18 +283,36 @@ pub(crate) fn create(
         return Err(not_ready("the session never answered".into()));
     }
 
-    let mut session = Session::new(id, name.to_string(), spawned.pid.unwrap_or(0), num)
+    let mut session = Session::new(id, name.to_string(), spawned.pid.unwrap_or(0), rank)
         .launched_with(launch.line())
         .started_in(directory);
     h.write_meta(&session)?;
     // The caller attaches to this without re-listing, so give it the same
-    // resolved number a listing would have.
-    session.state.num = num;
+    // resolved number a listing would have. Numbers are positions now, so that
+    // is a question only the whole list can answer: hand `finish_listing` the
+    // listing this create was planned from with the new session in it, and
+    // read back the place it takes.
+    session.state.num = numbered_in(existing, &session);
 
     install_detach_alias(&local);
 
     tracing::info!(host = %h.location(), id = %session.id, name, pid = session.pid, "session ready");
     Ok(session)
+}
+
+/// The number `session` will show once it joins `existing`: its position in
+/// the listing the two of them make.
+///
+/// Its own rank as the fallback, for the impossible case of a listing that
+/// does not contain the session just put into it — a number that is at least
+/// never zero, which is the one value [`crate::keys`] cannot dial.
+fn numbered_in(existing: Vec<Session>, session: &Session) -> u32 {
+    let mut listing = existing;
+    listing.push(session.clone());
+    finish_listing(listing)
+        .iter()
+        .find(|s| s.id == session.id)
+        .map_or(session.num, |s| s.state.num)
 }
 
 /// End a session that never became one. An empty pid is fine: the script
@@ -378,7 +398,10 @@ pub(crate) fn ensure_name_free(
 }
 
 /// Everything a create needs decided before anything is spawned: the name is
-/// legal and free, the new session has an id and a number.
+/// legal and free, the new session has an id and a rank.
+///
+/// A rank, not the number the picker will show — see [`finish_listing`] for
+/// the difference and [`create`] for where the number comes from.
 ///
 /// Pure, and shared by both transports. The listing it works from is **not**
 /// taken here: fetching one is where local and remote differ (one reaps dead
@@ -386,8 +409,7 @@ pub(crate) fn ensure_name_free(
 pub(crate) fn plan_create(existing: &[Session], name: &str) -> Result<(String, u32)> {
     crate::session::validate_name(name)?;
     ensure_name_free(existing, name, None)?;
-    let num = next_free_num(existing);
-    Ok((crate::ids::new_id()?, num))
+    Ok((crate::ids::new_id()?, next_rank(existing)))
 }
 
 /// The same checks for a rename, which allocates nothing.
@@ -447,23 +469,38 @@ pub(crate) fn install_detach_alias(sock: &Path) {
     }
 }
 
-/// Shared by both transports: resolve each session's display number, then sort
-/// by it.
+/// Shared by both transports: put the sessions in order, then number them by
+/// the position each one landed in.
 ///
-/// Ordering is by number rather than by name because the number is what the user
+/// The column is **dense and recalculated on every listing**. Kill the second
+/// of three and the third becomes the second: there is no hole to explain, the
+/// last row of a list of *n* is always *n*, and a session's number is just the
+/// count of rows above it plus one.
+///
+/// That is a trade, and this is the side of it that costs: a number is no
+/// longer a name a session keeps for life, because killing a row shifts every
+/// row below it up one. What is stable instead is the *order*, and the stored
+/// [`Session::num`] is what holds it — a **rank**, read here only to sort by
+/// and never shown. Ranks need not be dense and their gaps never reach the
+/// screen: a create takes one past the end ([`next_rank`]), a reorder writes
+/// the arrangement back ([`Transport::renumber`]), and a kill leaves the
+/// survivors' ranks exactly as they were, because nothing downstream reads a
+/// rank as a number to display.
+///
+/// Ordering is by rank rather than by name because the number is what the user
 /// reads off the screen and presses; a name sort would scramble the column and
 /// make it noise. It also stops the list reshuffling on every rename.
 ///
-/// Resolution never writes to disk. The stored number is the authority whenever
-/// it has an answer, and the gaps this fills — metadata written before numbering
-/// existed, orphans with no metadata at all, and the two-clients-created-at-once
-/// duplicate — are covered in memory. A read path that wrote would cost an SSH
-/// round trip per listing, and would persist a derived number as if it had been
+/// Resolution still never writes to disk. The three things that arrive without
+/// a usable rank — metadata written before numbering existed, orphans with no
+/// metadata at all, and the two-clients-created-at-once duplicate — are settled
+/// in memory by the sort below. A read path that wrote would cost an SSH round
+/// trip per listing, and would persist a derived number as if it had been
 /// assigned.
 pub(crate) fn finish_listing(mut sessions: Vec<Session>) -> Vec<Session> {
-    // Stored number first, so the sessions with a claim on a number get to keep
-    // it; `created` then `id` puts the unnumbered ones in a stable order rather
-    // than whatever the directory happened to yield.
+    // Rank first, so sessions with a claim on a place in the list keep it;
+    // `created` then `id` puts the rankless ones — and any pair sharing a rank
+    // — in a stable order rather than whatever the directory happened to yield.
     sessions.sort_by(|a, b| {
         let key = |s: &Session| if s.num == 0 { u32::MAX } else { s.num };
         key(a)
@@ -472,28 +509,32 @@ pub(crate) fn finish_listing(mut sessions: Vec<Session>) -> Vec<Session> {
             .then_with(|| a.id.cmp(&b.id))
     });
 
-    let mut taken: Vec<u32> = Vec::with_capacity(sessions.len());
-    for s in &mut sessions {
-        s.state.num = if s.num != 0 && !taken.contains(&s.num) {
-            s.num
-        } else {
-            smallest_free(&taken)
-        };
-        taken.push(s.state.num);
+    // Position, not rank. Every session gets a number, they start at 1, and no
+    // two can collide however broken the ranks that arrived.
+    for (i, s) in sessions.iter_mut().enumerate() {
+        s.state.num = i as u32 + 1;
     }
 
-    sessions.sort_by_key(|s| s.state.num);
     sessions
 }
 
-/// The number to give a session being created now: the smallest not already on
-/// screen, so killing 3 and creating again refills the hole rather than climbing.
+/// The rank to store for a session being created now: one past the highest
+/// rank on the host, so it sorts after everything that already exists and the
+/// new row appears at the end of the list.
 ///
-/// Resolved numbers, not stored ones — a legacy session displaying as 3 must not
-/// have 3 taken out from under it.
-pub(crate) fn next_free_num(existing: &[Session]) -> u32 {
-    let taken: Vec<u32> = existing.iter().map(|s| s.state.num).collect();
-    smallest_free(&taken)
+/// Stored ranks, not displayed numbers — those are positions now, and the
+/// number this session will show is whatever place it lands in once it joins
+/// the listing. [`create`] reads that back out of [`finish_listing`] rather
+/// than assuming it is the last one, because a session with no rank at all
+/// (legacy metadata, an orphan) sorts after every ranked one and so keeps the
+/// bottom of the list.
+pub(crate) fn next_rank(existing: &[Session]) -> u32 {
+    existing
+        .iter()
+        .map(|s| s.num)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
 }
 
 /// The session `<prefix> n` / `<prefix> p` moves to from the one numbered
@@ -531,14 +572,6 @@ pub fn neighbour(sessions: &[Session], from: u32, dir: crate::keys::Direction) -
     }
 }
 
-/// The smallest positive integer not in `taken`. Linear in a list that is a
-/// handful of sessions long.
-fn smallest_free(taken: &[u32]) -> u32 {
-    (1..)
-        .find(|n| !taken.contains(n))
-        .expect("u32 is not exhausted")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,25 +602,47 @@ mod tests {
         assert!(plan_create(&taken, "").is_err(), "an empty name is invalid");
     }
 
-    /// Killing 2 and creating again refills the hole rather than climbing.
-    ///
-    /// The listing goes through `finish_listing` first, as a real create's
-    /// does: numbering reads the *resolved* number, not the stored one.
+    /// A create takes a rank past the end, so the new row lands at the bottom
+    /// of the list rather than in the first hole — which is the whole point of
+    /// ranks being an ordering key and not the column on screen.
     #[test]
-    fn a_create_takes_the_smallest_free_number() {
+    fn a_create_takes_a_rank_past_the_end() {
         let all = finish_listing(vec![
             session("aaaaaaaa", 1, 1),
             session("bbbbbbbb", 2, 2),
             session("cccccccc", 3, 3),
         ]);
 
-        let (id, num) = plan_create(&all, "fresh").expect("planned");
-        assert_eq!(num, 4);
+        let (id, rank) = plan_create(&all, "fresh").expect("planned");
+        assert_eq!(rank, 4);
         assert!(crate::ids::is_valid_id(&id), "{id:?}");
 
-        let gapped: Vec<_> = all.into_iter().filter(|s| s.state.num != 2).collect();
-        let (_, num) = plan_create(&gapped, "fresh").expect("planned");
-        assert_eq!(num, 2, "the freed number is reused");
+        // Killing the middle session leaves a hole in the *ranks*. The next
+        // create must step over it rather than fill it, or the new session
+        // would come up between the two survivors.
+        let gapped: Vec<_> = all.into_iter().filter(|s| s.num != 2).collect();
+        let (_, rank) = plan_create(&gapped, "fresh").expect("planned");
+        assert_eq!(rank, 4, "the freed rank is not reused");
+    }
+
+    /// The number a create hands back, which the caller attaches to without
+    /// re-listing, is the place the new session takes in the list — not its
+    /// rank, and the two part company as soon as anything has been killed.
+    #[test]
+    fn a_new_session_is_numbered_by_where_it_lands() {
+        let listed = finish_listing(vec![session("aaaaaaaa", 1, 1), session("cccccccc", 3, 3)]);
+        assert_eq!(numbers(&listed), vec![1, 2], "the hole is already closed");
+
+        let (_, rank) = plan_create(&listed, "fresh").expect("planned");
+        let mut fresh = session("ffffffff", rank, 9);
+        assert_eq!(numbered_in(listed, &fresh), 3, "it shows as the third row");
+
+        // An orphan has no rank and keeps the bottom of the list, so the new
+        // session is numbered above it rather than after it.
+        let with_orphan =
+            finish_listing(vec![session("aaaaaaaa", 1, 1), session("zzzzzzzz", 0, 2)]);
+        fresh.num = next_rank(&with_orphan);
+        assert_eq!(numbered_in(with_orphan, &fresh), 2);
     }
 
     /// `<prefix> n` and `<prefix> p` must round the list and come back, or the
@@ -609,11 +664,13 @@ mod tests {
         assert_eq!(step(2, Direction::Prev), Some(1));
     }
 
-    /// Numbering has gaps as soon as a session in the middle is killed, so
-    /// stepping cannot be `from + 1`: from 2 of {1, 2, 5} the next session is 5.
+    /// A listing has no gaps to cross any more, but `neighbour` must not be the
+    /// place that assumes it: it takes whatever slice it is handed, and the
+    /// numbers in one built by hand are nobody's promise. From 2 of {1, 2, 5}
+    /// the next session is 5, not 3.
     #[test]
     fn stepping_crosses_a_gap_in_the_numbering() {
-        let all = finish_listing(vec![
+        let all = numbered(&[
             session("aaaaaaaa", 1, 1),
             session("bbbbbbbb", 2, 2),
             session("cccccccc", 5, 3),
@@ -634,7 +691,7 @@ mod tests {
     /// the start of the list.
     #[test]
     fn stepping_from_a_number_that_is_gone_lands_on_the_nearest_one_left() {
-        let all = finish_listing(vec![
+        let all = numbered(&[
             session("aaaaaaaa", 1, 1),
             session("bbbbbbbb", 2, 2),
             session("dddddddd", 4, 3),
@@ -711,11 +768,29 @@ mod tests {
         }
     }
 
-    /// `created` is what orders the unnumbered ones, so it is set explicitly.
+    /// `created` is what orders the unranked ones, so it is set explicitly.
     fn session(id: &str, num: u32, created: u64) -> Session {
         let mut s = Session::new(id.to_string(), format!("name-{id}"), 0, num);
         s.created = created;
         s
+    }
+
+    /// A listing whose displayed numbers are the stored ones, which
+    /// `finish_listing` no longer produces. For the cases that are about what
+    /// `neighbour` does with an arbitrary slice rather than about resolution.
+    fn numbered(sessions: &[Session]) -> Vec<Session> {
+        sessions
+            .iter()
+            .map(|s| {
+                let mut s = s.clone();
+                s.state.num = s.num;
+                s
+            })
+            .collect()
+    }
+
+    fn numbers(sessions: &[Session]) -> Vec<u32> {
+        sessions.iter().map(|s| s.state.num).collect()
     }
 
     fn resolved(sessions: Vec<Session>) -> Vec<(String, u32)> {
@@ -725,8 +800,10 @@ mod tests {
             .collect()
     }
 
+    /// The change this whole model exists for: the stored ranks order the list
+    /// and then stop mattering, so the column is 1, 2, 3 and not 1, 2, 5.
     #[test]
-    fn stored_numbers_are_kept_and_the_list_reads_in_number_order() {
+    fn the_column_is_dense_however_gapped_the_ranks_are() {
         let out = resolved(vec![
             session("ccc", 5, 3),
             session("aaa", 1, 1),
@@ -737,34 +814,63 @@ mod tests {
             vec![
                 ("aaa".to_string(), 1),
                 ("bbb".to_string(), 2),
-                ("ccc".to_string(), 5),
+                ("ccc".to_string(), 3),
             ],
-            "gaps are kept; the list reads in number order"
+            "ranks order the list; the numbers are positions in it"
+        );
+    }
+
+    /// Kill the second of three and the third becomes the second, with nothing
+    /// written to disk: the survivors' ranks are untouched, and only the
+    /// listing they are resolved into changed.
+    #[test]
+    fn killing_a_session_renumbers_the_ones_below_it() {
+        let all = vec![
+            session("aaa", 1, 1),
+            session("bbb", 2, 2),
+            session("ccc", 3, 3),
+        ];
+        assert_eq!(numbers(&finish_listing(all.clone())), vec![1, 2, 3]);
+
+        let survivors: Vec<Session> = all.into_iter().filter(|s| s.id != "bbb").collect();
+        let listed = finish_listing(survivors);
+        assert_eq!(
+            listed
+                .iter()
+                .map(|s| (s.id.as_str(), s.state.num))
+                .collect::<Vec<_>>(),
+            vec![("aaa", 1), ("ccc", 2)],
+            "the third session is now the second"
+        );
+        assert_eq!(
+            listed.iter().map(|s| s.num).collect::<Vec<_>>(),
+            vec![1, 3],
+            "and nothing on disk moved to make that true"
         );
     }
 
     /// Metadata written before numbering existed, and orphans, have no stored
-    /// number. They must still be reachable by keystroke.
+    /// rank. They must still be reachable by keystroke.
     #[test]
-    fn unnumbered_sessions_are_given_the_smallest_free_numbers() {
+    fn unranked_sessions_sort_last_and_are_still_numbered() {
         let out = resolved(vec![
             session("aaa", 0, 1),
             session("bbb", 2, 2),
             session("ccc", 0, 3),
         ]);
-        // "bbb" keeps the 2 it stored; the unnumbered pair take 1 and 3 around
-        // it, oldest first, and the list comes back ordered by number.
+        // "bbb" is the only one with a rank, so it heads the list; the unranked
+        // pair follow it oldest first, and all three get a number.
         assert_eq!(
             out,
             vec![
-                ("aaa".to_string(), 1),
-                ("bbb".to_string(), 2),
+                ("bbb".to_string(), 1),
+                ("aaa".to_string(), 2),
                 ("ccc".to_string(), 3),
             ]
         );
     }
 
-    /// Two clients creating at the same moment can store the same number. Both
+    /// Two clients creating at the same moment can store the same rank. Both
     /// sessions must stay pressable.
     #[test]
     fn duplicate_stored_numbers_are_broken_apart() {
@@ -775,7 +881,7 @@ mod tests {
         ]);
         let nums: Vec<u32> = out.iter().map(|(_, n)| *n).collect();
         assert_eq!(nums, vec![1, 2, 3]);
-        assert_eq!(out[0].0, "aaa", "the earliest keeps the number it claimed");
+        assert_eq!(out[0].0, "aaa", "the earliest of them leads");
     }
 
     #[test]
@@ -799,24 +905,32 @@ mod tests {
     }
 
     #[test]
-    fn the_next_free_number_starts_at_one_and_fills_gaps() {
-        assert_eq!(next_free_num(&[]), 1, "sessions are numbered from 1");
+    fn the_next_rank_starts_at_one_and_always_climbs() {
+        assert_eq!(next_rank(&[]), 1, "the first session ranks 1");
 
         let listed = finish_listing(vec![session("aaa", 1, 1), session("bbb", 2, 2)]);
-        assert_eq!(next_free_num(&listed), 3, "appends when there is no gap");
+        assert_eq!(next_rank(&listed), 3, "one past the highest");
 
-        // What killing the middle session leaves behind.
+        // What killing the middle session leaves behind: a hole in the ranks
+        // that the next create steps over rather than fills.
         let listed = finish_listing(vec![session("aaa", 1, 1), session("ccc", 3, 3)]);
-        assert_eq!(next_free_num(&listed), 2, "refills the hole");
+        assert_eq!(next_rank(&listed), 4);
     }
 
-    /// It reads the *resolved* number, or a legacy session displaying as 3 would
-    /// have 3 taken out from under it.
+    /// It reads the *stored* rank, not the number on screen — which is exactly
+    /// the pair that come apart after a kill. Ranking a new session by the
+    /// number of rows would collide with a survivor and put the two in
+    /// `created` order, which is not necessarily the end of the list.
     #[test]
-    fn the_next_free_number_respects_numbers_that_were_only_resolved() {
+    fn the_next_rank_reads_stored_ranks_and_not_the_column() {
+        let listed = finish_listing(vec![session("aaa", 1, 1), session("ccc", 9, 3)]);
+        assert_eq!(numbers(&listed), vec![1, 2], "two rows on screen");
+        assert_eq!(next_rank(&listed), 10, "but the rank clears the highest");
+
+        // Nothing has a rank at all: ranking starts over at 1.
         let listed = finish_listing(vec![session("aaa", 0, 1), session("bbb", 0, 2)]);
-        assert_eq!(listed[0].num, 0, "still unnumbered on disk");
-        assert_eq!(next_free_num(&listed), 3);
+        assert_eq!(listed[0].num, 0, "still unranked on disk");
+        assert_eq!(next_rank(&listed), 1);
     }
 
     /// What a reorder writes is what the next listing reads back. Reordering is
