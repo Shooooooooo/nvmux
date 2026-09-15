@@ -211,44 +211,25 @@ can_inspect() {
   ps -ww -o args= -p $$ >/dev/null 2>&1
 }
 
-# A tab and a carriage return, for the one place that has to remove them.
+# Read a file into $nvmux_flat as one line: its newlines removed, nothing else.
 #
-# Empty until `flatten` needs it, and never read from the environment: this file
-# runs inside the user's login shell, so a name it *uses* must be one it set.
-NVMUX_BLANKS=
-
-# Read a file into $nvmux_flat as one line, with newlines, tabs and carriage
-# returns removed.
+# `tr -d '\n' < "$file"` says this in one word, and costs a process for every
+# session in the listing. That is the whole of what a listing scales by: on a
+# host where a fork is a millisecond it is not worth the trouble, and on one
+# where a fork is fifteen it was 88-110 ms of a listing of five sessions. This
+# is the same work with no process at all.
 #
-# `tr -d '\n\r\t' < "$file"` says this in one word, and costs a process for
-# every session in the listing. That is the whole of what a listing scales by:
-# on a host where a fork is a millisecond it is not worth the trouble, and on
-# one where a fork is fifteen it was 88-110 ms of a listing of five sessions.
-# This is the same work with one fork for the whole run, and none at all for
-# the scripts that never call it.
-#
-# The splitting is how a POSIX shell deletes characters without a process:
-# field-split the line on tab and carriage return, then join the fields with
-# nothing. `set --` is safe here because a function has positional parameters of
-# its own, and the argument is saved before it is clobbered. `set -f` is not
-# optional: without it a `*` in the metadata would be expanded against the
-# runtime directory.
+# Tabs and carriage returns used to go too, and spelling them cost a `printf`
+# fork per run — the one fork the shell nvmux keeps still paid for every
+# script. Neither needs removing: the flattened file is the last field of its
+# record, so a tab inside it splits nothing (see `parse_listing`), and both
+# are whitespace to a JSON parser. A file that is only newlines flattens to
+# nothing, which is what an empty file does.
 flatten() {
-  [ -n "$NVMUX_BLANKS" ] || NVMUX_BLANKS=$(printf '\t\r')
   nvmux_flat=''
-  nvmux_path=$1
   while IFS= read -r nvmux_line || [ -n "$nvmux_line" ]; do
-    nvmux_ifs=$IFS
-    IFS=$NVMUX_BLANKS
-    set -f
-    # Deliberately unquoted: this is the split.
-    # shellcheck disable=SC2086
-    set -- $nvmux_line
-    IFS=''
-    nvmux_flat="$nvmux_flat$*"
-    set +f
-    IFS=$nvmux_ifs
-  done < "$nvmux_path"
+    nvmux_flat="$nvmux_flat$nvmux_line"
+  done < "$1"
 }
 
 # Session ids only: 8 lowercase RFC 4648 base32 characters. Nothing else in the

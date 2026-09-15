@@ -698,10 +698,11 @@ mod tests {
         );
     }
 
-    /// Flattening metadata must match the `tr` it replaced, byte for byte,
-    /// including the shapes that made `tr` worth using: a pretty-printed file,
-    /// a tab inside a value, a CRLF line ending, no trailing newline, and a
-    /// `*` that must not be expanded against the runtime directory.
+    /// Flattening metadata must match the `tr -d '\n'` it replaced, byte for
+    /// byte, including the shapes that made `tr` worth using: a pretty-printed
+    /// file, a CRLF line ending, no trailing newline, and a `*` that must not
+    /// be expanded against the runtime directory. The tabs and carriage
+    /// returns it no longer removes must still parse as the JSON they are in.
     #[test]
     fn flatten_matches_the_tr_it_replaced() {
         let dir = std::env::temp_dir().join(format!("nvmux-flatten-{}", std::process::id()));
@@ -709,7 +710,10 @@ mod tests {
         let cases: &[(&str, &str)] = &[
             ("plain", "{\"a\":1}"),
             ("pretty", "{\n  \"a\": 1\n}\n"),
-            ("tabbed", "{\"t\":\"a\tb\"}"),
+            // Tab-indented, as an editor would pretty-print it. A raw tab
+            // *inside* a string is not JSON, and is not made into some by
+            // deleting it any more.
+            ("tabbed", "{\n\t\"t\": \"a\"\n}\n"),
             ("crlf", "{\r\n\"a\": 1\r\n}\r\n"),
             ("no_newline", "{\"trail\":1}"),
             ("globby", "{\"p\":\"/x/*/y\"}"),
@@ -728,12 +732,20 @@ mod tests {
                 "\n"
             );
             let flattened = run_script(script, &[&arg]);
-            let tr = run_script(r#"tr -d '\n\r\t' < "$1""#, &[&arg]);
+            let tr = run_script(r#"tr -d '\n' < "$1""#, &[&arg]);
             assert!(flattened.ok(), "{name}: {}", flattened.stderr);
             assert_eq!(
                 flattened.stdout, tr.stdout,
                 "{name}: flatten and tr disagree"
             );
+            assert!(
+                !flattened.stdout.contains('\n'),
+                "{name}: a newline survived, which would split the record"
+            );
+            if body.trim_start().starts_with('{') {
+                serde_json::from_str::<serde_json::Value>(&flattened.stdout)
+                    .unwrap_or_else(|e| panic!("{name}: flattened JSON no longer parses: {e}"));
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
