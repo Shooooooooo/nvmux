@@ -69,6 +69,11 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct Client<S: Read + Write> {
     io: BufReader<S>,
     next_msgid: u32,
+    /// Replies that arrived while a different request was being waited for,
+    /// kept for the [`Client::wait`] that asks for them. Requests sent
+    /// back-to-back are answered in whatever order the server gets to them —
+    /// a fast call ahead of a deferred one — and a reply is never thrown away.
+    replies: Vec<(u32, Result<Value, String>)>,
     /// Once set, every call fails fast. See [`Client::poison`].
     poisoned: Option<String>,
     /// Tracked so a timeout error reports the budget that actually elapsed,
@@ -123,6 +128,7 @@ impl<S: Read + Write> Client<S> {
         Self {
             io: BufReader::new(stream),
             next_msgid: 1,
+            replies: Vec::new(),
             poisoned: None,
             read_timeout: PROBE_TIMEOUT,
         }
@@ -153,6 +159,22 @@ impl<S: Read + Write> Client<S> {
 
     /// Issue a request and wait for its response.
     pub fn call(&mut self, method: &str, params: Vec<Value>) -> Result<Value, RpcError> {
+        let pending = self.send(method, params)?;
+        self.wait(pending)
+    }
+
+    /// Issue a request without waiting for its response, which [`Client::wait`]
+    /// collects. Two requests sent this way cost one round trip between them
+    /// rather than two, which is what a probe over an SSH forward pays for.
+    ///
+    /// The server answers them in the order it gets to them, not the order
+    /// they were sent: a fast call is answered from the socket read callback,
+    /// a deferred one from the main loop — and, at a hit-enter prompt, only
+    /// once a key has ended the prompt. `wait` matches replies by msgid, so
+    /// that is fine; what it means for a caller is that a `<CR>` sent after
+    /// the mode's reply still reaches the editor before a deferred request
+    /// sent ahead of it is served.
+    pub fn send(&mut self, method: &str, params: Vec<Value>) -> Result<Pending, RpcError> {
         if let Some(why) = &self.poisoned {
             return Err(RpcError::Protocol(format!("connection poisoned: {why}")));
         }
@@ -171,14 +193,31 @@ impl<S: Read + Write> Client<S> {
 
         rmpv::encode::write_value(self.io.get_mut(), &request)
             .map_err(|e| self.poison(format!("encoding {method}: {e}")))?;
-        let budget = self.read_timeout;
         if let Err(e) = self.io.get_mut().flush() {
-            let mapped = map_io(e, budget);
+            let mapped = map_io(e, self.read_timeout);
             return Err(self.poison_if_fatal(mapped, method));
+        }
+        Ok(Pending {
+            msgid,
+            method: method.to_string(),
+        })
+    }
+
+    /// Wait for the response to a request made with [`Client::send`].
+    pub fn wait(&mut self, pending: Pending) -> Result<Value, RpcError> {
+        let Pending { msgid, method } = pending;
+        let method = method.as_str();
+        if let Some(why) = &self.poisoned {
+            return Err(RpcError::Protocol(format!("connection poisoned: {why}")));
+        }
+        // Already here, read past while waiting for something else.
+        if let Some(at) = self.replies.iter().position(|(id, _)| *id == msgid) {
+            return self.replies.remove(at).1.map_err(RpcError::Nvim);
         }
 
         // An overall deadline as well as a per-read one: a peer that keeps
         // sending frames we skip restarts the per-read budget every time.
+        let budget = self.read_timeout;
         let deadline = std::time::Instant::now() + budget;
 
         loop {
@@ -202,7 +241,8 @@ impl<S: Read + Write> Client<S> {
         }
     }
 
-    /// Sort one decoded frame into "the answer we wanted" or "ignore it".
+    /// Sort one decoded frame into "the answer we wanted", "an answer to
+    /// something else, kept" or "ignore it".
     #[allow(clippy::type_complexity)]
     fn classify(
         &mut self,
@@ -222,16 +262,21 @@ impl<S: Read + Write> Client<S> {
                 let got = arr[1]
                     .as_u64()
                     .ok_or_else(|| self.poison("response msgid was not an integer"))?;
+                let result = if arr[2].is_nil() {
+                    Ok(arr[3].clone())
+                } else {
+                    Err(describe_nvim_error(&arr[2]))
+                };
                 if got != u64::from(want) {
-                    // Not ours. Keep reading rather than answering the wrong
-                    // question.
-                    tracing::debug!(got, want, "skipping a response for another request");
+                    // Not this one's. Kept for the wait that asks for it,
+                    // rather than answering the wrong question — or, for a
+                    // msgid nobody sent, remembered harmlessly until the
+                    // connection goes.
+                    tracing::debug!(got, want, "keeping a response for another request");
+                    self.replies.push((got as u32, result));
                     return Ok(None);
                 }
-                if !arr[2].is_nil() {
-                    return Ok(Some(Err(describe_nvim_error(&arr[2]))));
-                }
-                Ok(Some(Ok(arr[3].clone())))
+                Ok(Some(result))
             }
             Some(NOTIFICATION) => Ok(None),
             Some(REQUEST) => {
@@ -299,7 +344,7 @@ impl<S: Read + Write> Client<S> {
     /// attached UI, so a small preview would shrink the grid you are editing in.
     pub fn list_uis(&mut self) -> Result<usize, RpcError> {
         let v = self.call("nvim_list_uis", vec![])?;
-        Ok(v.as_array().map(|a| a.len()).unwrap_or(0))
+        Ok(count_uis(&v))
     }
 
     /// `nvim_command`. Used for `qa!`, for injecting the `:Detach` alias, and
@@ -313,23 +358,7 @@ impl<S: Read + Write> Client<S> {
     /// blocked at a prompt, which is exactly when it is worth asking. See the
     /// module docs.
     pub fn get_mode(&mut self) -> Result<Mode, RpcError> {
-        let v = self.call("nvim_get_mode", vec![])?;
-        let map = v
-            .as_map()
-            .ok_or_else(|| RpcError::Protocol("get_mode was not a map".into()))?;
-        let field = |name: &str| {
-            map.iter()
-                .find(|(k, _)| k.as_str() == Some(name))
-                .map(|(_, v)| v)
-        };
-        let mode = field("mode")
-            .and_then(Value::as_str)
-            .ok_or_else(|| RpcError::Protocol("get_mode had no mode".into()))?
-            .to_string();
-        // Absent means not blocking: the key has been there since 0.2, but a
-        // missing flag must read as "go ahead", never as "blocked".
-        let blocking = field("blocking").and_then(Value::as_bool).unwrap_or(false);
-        Ok(Mode { mode, blocking })
+        parse_mode(&self.call("nvim_get_mode", vec![])?)
     }
 
     /// `nvim_input` — a *fast* call: the keys land in the editor's input
@@ -341,6 +370,41 @@ impl<S: Read + Write> Client<S> {
         self.call("nvim_input", vec![Value::String(keys.into())])?;
         Ok(())
     }
+}
+
+/// A request sent with [`Client::send`] and not yet waited for. Only the
+/// client that sent it can answer it.
+#[derive(Debug)]
+#[must_use = "a request that is never waited for leaves its reply in the socket"]
+pub struct Pending {
+    msgid: u32,
+    method: String,
+}
+
+/// What `nvim_get_mode` answered, decoded. Public so a caller that sent the
+/// request with [`Client::send`] can read the reply [`Client::wait`] returns.
+pub fn parse_mode(v: &Value) -> Result<Mode, RpcError> {
+    let map = v
+        .as_map()
+        .ok_or_else(|| RpcError::Protocol("get_mode was not a map".into()))?;
+    let field = |name: &str| {
+        map.iter()
+            .find(|(k, _)| k.as_str() == Some(name))
+            .map(|(_, v)| v)
+    };
+    let mode = field("mode")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::Protocol("get_mode had no mode".into()))?
+        .to_string();
+    // Absent means not blocking: the key has been there since 0.2, but a
+    // missing flag must read as "go ahead", never as "blocked".
+    let blocking = field("blocking").and_then(Value::as_bool).unwrap_or(false);
+    Ok(Mode { mode, blocking })
+}
+
+/// How many UIs `nvim_list_uis` answered with. See [`Client::list_uis`].
+pub fn count_uis(v: &Value) -> usize {
+    v.as_array().map(|a| a.len()).unwrap_or(0)
 }
 
 /// What `nvim_get_mode` reported.
@@ -590,18 +654,84 @@ mod tests {
     /// A client whose first call is answered with `result`. The msgid is 1
     /// because that is what a fresh client sends first.
     fn answering(result: Value) -> Client<Canned> {
-        let frame = Value::Array(vec![
-            Value::from(RESPONSE),
-            Value::from(1u32),
-            Value::Nil,
-            result,
-        ]);
+        answering_each(vec![(1, result)])
+    }
+
+    /// A client that finds these replies waiting, in this order, for the
+    /// requests with these msgids.
+    fn answering_each(replies: Vec<(u32, Value)>) -> Client<Canned> {
         let mut bytes = Vec::new();
-        rmpv::encode::write_value(&mut bytes, &frame).expect("encode");
+        for (msgid, result) in replies {
+            let frame = Value::Array(vec![
+                Value::from(RESPONSE),
+                Value::from(msgid),
+                Value::Nil,
+                result,
+            ]);
+            rmpv::encode::write_value(&mut bytes, &frame).expect("encode");
+        }
         Client::new(Canned {
             reply: std::io::Cursor::new(bytes),
             sent: Vec::new(),
         })
+    }
+
+    /// Two requests on the wire at once, answered the other way round — a
+    /// fast call answered ahead of the deferred one sent before it — and each
+    /// wait gets its own answer. The one read past is kept, not dropped.
+    #[test]
+    fn replies_are_matched_by_msgid_whichever_order_they_arrive() {
+        let mut c = answering_each(vec![
+            (2, mode_map("n", Some(false))),
+            (1, Value::Array(vec![Value::Nil, Value::Nil])),
+        ]);
+        let uis = c.send("nvim_list_uis", vec![]).expect("send");
+        let mode = c.send("nvim_get_mode", vec![]).expect("send");
+        assert_eq!(count_uis(&c.wait(uis).expect("uis")), 2);
+        assert_eq!(
+            parse_mode(&c.wait(mode).expect("mode"))
+                .expect("decode")
+                .mode,
+            "n"
+        );
+        assert!(c.replies.is_empty(), "nothing left unclaimed");
+    }
+
+    /// A reply kept for a later wait carries its error too.
+    #[test]
+    fn a_kept_reply_keeps_its_error() {
+        let err = Value::Array(vec![
+            Value::from(1),
+            Value::String("Key not found: pid".into()),
+        ]);
+        let mut bytes = Vec::new();
+        for frame in [
+            Value::Array(vec![
+                Value::from(RESPONSE),
+                Value::from(2u32),
+                err,
+                Value::Nil,
+            ]),
+            Value::Array(vec![
+                Value::from(RESPONSE),
+                Value::from(1u32),
+                Value::Nil,
+                Value::from(4),
+            ]),
+        ] {
+            rmpv::encode::write_value(&mut bytes, &frame).expect("encode");
+        }
+        let mut c = Client::new(Canned {
+            reply: std::io::Cursor::new(bytes),
+            sent: Vec::new(),
+        });
+        let first = c.send("nvim_input", vec![]).expect("send");
+        let second = c.send("nvim_command", vec![]).expect("send");
+        assert_eq!(c.wait(first).expect("first").as_u64(), Some(4));
+        match c.wait(second) {
+            Err(RpcError::Nvim(msg)) => assert_eq!(msg, "Key not found: pid"),
+            other => panic!("expected the kept error, got {other:?}"),
+        }
     }
 
     fn mode_map(mode: &str, blocking: Option<bool>) -> Value {

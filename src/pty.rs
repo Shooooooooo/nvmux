@@ -498,6 +498,12 @@ fn spawn_with(
 /// every attach, forwarded over SSH.
 fn probe(session_id: &str, sock: &Path) -> Result<()> {
     let mut client = rpc::Client::connect(sock, rpc::PROBE_TIMEOUT)?;
+    // Both requests go out together: one round trip for the pair rather than
+    // one each, which over a forward is a third of what the probe costs. The
+    // mode is answered first whatever the order, being a fast call, and the
+    // count follows — at once, or once the prompt below has been ended.
+    let mode = client.send("nvim_get_mode", vec![])?;
+    let uis = client.send("nvim_list_uis", vec![])?;
     // A server at a hit-enter prompt cannot answer `list_uis`, a deferred
     // call, until a key ends the prompt. Usually there is nobody to type one:
     // the client that was showing the prompt is gone, and this is its
@@ -505,7 +511,8 @@ fn probe(session_id: &str, sock: &Path) -> Result<()> {
     // prompt end and repaints, as any other UI would. So the prompt is ended
     // here with `<CR>`, the key it consumes without running anything (see
     // `rpc::Mode::at_hit_enter` for why only this prompt), and the count that
-    // follows is real, not guessed.
+    // follows is real, not guessed: the `<CR>` is a fast call, delivered
+    // ahead of the queued `list_uis` however the two were sent.
     //
     // A deliberate trade-off where another UI is still attached: that user's
     // prompt ends too, and whatever it was showing — a `:!make` page, a Lua
@@ -514,7 +521,7 @@ fn probe(session_id: &str, sock: &Path) -> Result<()> {
     // attach at all. Advisory, not a lock: a key from that other UI in the
     // microseconds between the two calls ends the prompt first, and this
     // `<CR>` then runs in whatever mode it left.
-    if client.get_mode()?.at_hit_enter() {
+    if rpc::parse_mode(&client.wait(mode)?)?.at_hit_enter() {
         tracing::info!(
             id = session_id,
             "attach: ending the session's hit-enter prompt"
@@ -530,7 +537,7 @@ fn probe(session_id: &str, sock: &Path) -> Result<()> {
     // direction of our own client. `MAX_UIS` is half of Neovim's limit, so a
     // count one too high refuses the ninth other client rather than the
     // eighth, and a count one too low still stops seven short of the abort.
-    let uis = client.list_uis()?;
+    let uis = rpc::count_uis(&client.wait(uis)?);
     if uis > MAX_UIS {
         return Err(NvmuxError::Session(
             crate::error::SessionError::TooManyUis {
@@ -1575,9 +1582,11 @@ mod tests {
             .any(|l| l.contains(&standin_mark(tag)) && !l.contains("ps -ww"))
     }
 
-    /// The attach probe's call sequence, which is the whole of what a change to it
-    /// can break: the mode first — a fast call, answered even at a prompt — then
-    /// a `<CR>` for the one prompt that key ends, then the deferred UI count.
+    /// The attach probe's call sequence on the wire, which is the whole of
+    /// what a change to it can break: the mode and the UI count sent together
+    /// — the mode a fast call, answered even at a prompt, the count deferred —
+    /// then a `<CR>` for the one prompt that key ends, sent on the mode's
+    /// answer and delivered ahead of the queued count.
     ///
     /// The `nvim_get_api_info` that used to lead this cost a round trip, and a
     /// forwarded one over SSH, while proving nothing the `?` on the mode does not.
@@ -1590,7 +1599,7 @@ mod tests {
                 "hitenter",
                 "r",
                 true,
-                &["nvim_get_mode", "nvim_input(<CR>)", "nvim_list_uis"][..],
+                &["nvim_get_mode", "nvim_list_uis", "nvim_input(<CR>)"][..],
             ),
             // Blocking, but not the prompt a `<CR>` ends: a more-prompt, or a
             // half-typed `g`. Typing for the user there would run something.
