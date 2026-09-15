@@ -1,18 +1,21 @@
 //! Sessions on another host, reached over SSH.
 //!
-//! Spawning, listing and killing are shared with the local transport — the same
-//! scripts from [`crate::shell`], the same parsing in
-//! [`crate::transport::protocol`], and the same [`crate::proc::Shell`] they run
-//! in. Only two things differ: what starts that shell — [`Ssh::start_shell`]
-//! here, `/bin/sh` there — and how a session's socket becomes reachable from
-//! this machine. The second is [`Transport::local_socket_for`], which is the
-//! seam that makes everything downstream identical in both cases.
+//! Spawning, listing and killing are the local transport's bodies, in
+//! [`crate::transport`]: the same scripts from [`crate::shell`], the same
+//! parsing in [`crate::transport::protocol`], and the same
+//! [`crate::proc::Shell`] they run in. What is remote about a remote session is
+//! what this file keeps: the shell is started by [`Ssh::start_shell`] over a
+//! master connection, a socket over there is reached from here through a
+//! forward onto that master — [`Transport::local_socket_for`], the seam that
+//! makes everything downstream identical — liveness is what the script said,
+//! since a forward answers nothing about it, and metadata is written back
+//! through a script rather than edited in place.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, TryLockError};
 
-use crate::error::{NvimError, NvmuxError, Result, SessionError, SshError};
+use crate::error::{NvimError, NvmuxError, Result, SshError};
 use crate::ids;
 use crate::launch::Launch;
 use crate::nvim;
@@ -21,10 +24,7 @@ use crate::proc::{Output, Shell};
 use crate::session::{Liveness, Session};
 use crate::shell;
 use crate::ssh::{classify, Ssh};
-use crate::transport::{
-    finish_listing, install_detach_alias, kill_outcome, opt_pid_arg, pid_arg, plan_create,
-    plan_rename, protocol, wait_until_reachable, Location, Transport, REACHABLE_TIMEOUT,
-};
+use crate::transport::{self, plan_rename, protocol, Host, Location, Transport};
 
 pub struct SshTransport {
     location: Location,
@@ -302,33 +302,85 @@ fn checked_script(
     Ok(out)
 }
 
+impl Host for SshTransport {
+    fn location(&self) -> &Location {
+        &self.location
+    }
+
+    fn dir(&self) -> &str {
+        &self.remote_dir
+    }
+
+    fn run(&self, script: &str, args: &[&str]) -> Result<Output> {
+        self.run_script(script, args)
+    }
+
+    /// The greeting already carried one, once.
+    fn take_listing(&self) -> Option<String> {
+        self.first_listing.lock().ok().and_then(|mut f| f.take())
+    }
+
+    /// Liveness comes from the remote script, so drawing the picker needs no
+    /// forward per session. connect() through a forward would say nothing
+    /// anyway: ssh accepts first and resets afterwards.
+    fn settle(&self, mut listed: Vec<Session>) -> Result<Vec<Session>> {
+        for s in &listed {
+            if s.state.liveness == Liveness::Dead {
+                tracing::debug!(id = %s.id, "remote session reported not serving");
+            }
+        }
+        listed.retain(|s| s.state.liveness != Liveness::Dead);
+        self.sweep_orphaned_forwards(&listed);
+        Ok(listed)
+    }
+
+    /// Both ends checked before spawning: the remote path against our own
+    /// budget (see `remote_sock`), and the local end of the forward it will
+    /// need against this machine's.
+    fn host_sock(&self, id: &str) -> Result<PathBuf> {
+        let remote = self.remote_sock(id)?;
+        self.local_sock(id)?;
+        Ok(remote)
+    }
+
+    fn reach(&self, id: &str, host_sock: &Path) -> Result<PathBuf> {
+        let local = self.local_sock(id)?;
+        self.ssh.forward(&local, host_sock)?;
+        self.forwarded
+            .lock()
+            .map(|mut f| f.insert(id.to_string()))
+            .ok();
+        Ok(local)
+    }
+
+    fn unreach(&self, id: &str) {
+        if let (Ok(local), Ok(remote)) = (self.local_sock(id), self.remote_sock(id)) {
+            self.ssh.cancel(&local, &remote);
+        }
+        self.forwarded.lock().map(|mut f| f.remove(id)).ok();
+    }
+
+    fn write_meta(&self, session: &Session) -> Result<()> {
+        let json = session.to_json()?;
+        let out = self.run_script(
+            shell::WRITE_META_SCRIPT,
+            &[&self.remote_dir, &session.id, &json],
+        )?;
+        protocol::require_terminator(&out.stdout, "metadata write")
+    }
+
+    fn log_path(&self, id: &str) -> PathBuf {
+        PathBuf::from(format!("{}:{}/{}.log", self.host(), self.remote_dir, id))
+    }
+}
+
 impl Transport for SshTransport {
     fn location(&self) -> &Location {
         &self.location
     }
 
     fn list_sessions(&self) -> Result<Vec<Session>> {
-        // The greeting already carried one, once.
-        let stdout = match self.first_listing.lock().ok().and_then(|mut f| f.take()) {
-            Some(stdout) => stdout,
-            None => {
-                self.run_script(shell::LIST_SCRIPT, &[&self.remote_dir])?
-                    .stdout
-            }
-        };
-        let mut sessions = protocol::rows_to_sessions(protocol::parse_listing(&stdout)?);
-
-        // Liveness comes from the remote script, so drawing the picker needs no
-        // forward per session. connect() through a forward would say nothing
-        // anyway: ssh accepts first and resets afterwards.
-        for s in &mut sessions {
-            if s.state.liveness == Liveness::Dead {
-                tracing::debug!(id = %s.id, "remote session reported not serving");
-            }
-        }
-        sessions.retain(|s| s.state.liveness != Liveness::Dead);
-        self.sweep_orphaned_forwards(&sessions);
-        Ok(finish_listing(sessions))
+        transport::list(self)
     }
 
     fn home(&self) -> &str {
@@ -346,89 +398,11 @@ impl Transport for SshTransport {
     }
 
     fn create_session(&self, name: &str, launch: &Launch, directory: &str) -> Result<Session> {
-        // The listing doubles as the source of the new session's number; see the
-        // local transport.
-        let (id, num) = plan_create(&self.list_sessions()?, name)?;
-        // Check the length before spawning, not after: an overlong path makes
-        // Neovim silently truncate and bind somewhere we could never reach.
-        let remote_sock = self.remote_sock(&id)?;
-        self.local_sock(&id)?;
-
-        // The *remote* socket: the command runs over there. Every word travels
-        // as its own argument, quoted once by the shell runner for the one
-        // `sh` that reads it.
-        let argv = launch.argv_for(&remote_sock.to_string_lossy());
-        let mut args: Vec<&str> = vec![&self.remote_dir, &id, directory];
-        args.extend(argv.iter().map(String::as_str));
-
-        tracing::info!(host = %self.host(), %id, name, command = launch.line(), directory, "spawning remote session");
-        let out = self.run_script(shell::SPAWN_SCRIPT, &args)?;
-        let spawned = protocol::parse_spawn(&out.stdout)?;
-
-        // Both ways out of a half-created session: terminate the remote nvim
-        // (the script removes its files only once it has seen the process go)
-        // and report why, naming the remote log rather than a local path.
-        let abandon = |log_tail: String| -> NvmuxError {
-            let pid = opt_pid_arg(spawned.pid);
-            let _ = self.run_script(shell::KILL_SCRIPT, &[&self.remote_dir, &id, &pid]);
-            SessionError::NotReady {
-                name: name.to_string(),
-                timeout: REACHABLE_TIMEOUT,
-                log: PathBuf::from(format!("{}:{}/{}.log", self.host(), self.remote_dir, id)),
-                log_tail,
-            }
-            .into()
-        };
-
-        if !spawned.socket_appeared {
-            return Err(abandon(out.stderr.trim().to_string()));
-        }
-
-        // Confirm through a forward, which also proves the forward works before
-        // the user tries to attach.
-        let local = self.local_sock(&id)?;
-        self.ssh.forward(&local, &remote_sock)?;
-        self.forwarded.lock().map(|mut f| f.insert(id.clone())).ok();
-
-        if !wait_until_reachable(&local, REACHABLE_TIMEOUT) {
-            // A forward succeeding proves nothing: `ssh -O forward` to a
-            // nonexistent remote socket still exits 0 and creates a working
-            // local socket.
-            self.ssh.cancel(&local, &remote_sock);
-            return Err(abandon(
-                "the session never answered through the forward".into(),
-            ));
-        }
-
-        let mut session = Session::new(id.clone(), name.to_string(), spawned.pid.unwrap_or(0), num)
-            .launched_with(launch.line())
-            .started_in(directory);
-        let json = session.to_json()?;
-        let out = self.run_script(shell::WRITE_META_SCRIPT, &[&self.remote_dir, &id, &json])?;
-        protocol::require_terminator(&out.stdout, "metadata write")?;
-        // See the local transport: the caller attaches without re-listing.
-        session.state.num = num;
-
-        install_detach_alias(&local);
-
-        tracing::info!(host = %self.host(), id = %session.id, name, "remote session ready");
-        Ok(session)
+        transport::create(self, name, launch, directory)
     }
 
     fn kill_session(&self, s: &Session) -> Result<()> {
-        let pid = pid_arg(s.pid);
-        let out = self.run_script(shell::KILL_SCRIPT, &[&self.remote_dir, &s.id, &pid])?;
-        let outcome = protocol::parse_kill(&out.stdout)?;
-
-        // Drop the forward regardless: re-attaching would rebuild it anyway.
-        if let (Ok(local), Ok(remote)) = (self.local_sock(&s.id), self.remote_sock(&s.id)) {
-            self.ssh.cancel(&local, &remote);
-        }
-        self.forwarded.lock().map(|mut f| f.remove(&s.id)).ok();
-
-        kill_outcome(outcome, &s.name)?;
-        tracing::info!(host = %self.host(), id = %s.id, "remote session killed");
-        Ok(())
+        transport::kill(self, s)
     }
 
     /// Writes the record the picker holds, with the name changed, rather than
@@ -441,9 +415,7 @@ impl Transport for SshTransport {
 
         let mut updated = s.clone();
         updated.name = new_name.to_string();
-        let json = updated.to_json()?;
-        let out = self.run_script(shell::WRITE_META_SCRIPT, &[&self.remote_dir, &s.id, &json])?;
-        protocol::require_terminator(&out.stdout, "metadata write")?;
+        self.write_meta(&updated)?;
         tracing::info!(host = %self.host(), id = %s.id, to = new_name, "renamed");
         Ok(())
     }
