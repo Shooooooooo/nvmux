@@ -81,10 +81,56 @@ extern "C" fn restore_and_reraise(sig: libc::c_int) {
 const INHERITED: &[u8] = b"\x1b[?2026l\x1b[0m";
 
 /// The screen-state reset: [`INHERITED`], plus leaving the alternate screen (a
-/// no-op when not in it) and showing the cursor. One fixed string so the signal
-/// handler can write it, and so the ordinary error paths put the screen back
-/// exactly the way a signal would.
-const RESET: &[u8] = b"\x1b[?2026l\x1b[?1049l\x1b[0m\x1b[?25h";
+/// no-op when not in it), showing the cursor, and turning mouse reporting off
+/// ([`MOUSE_OFF`]). One fixed string so the signal handler can write it, and so
+/// the ordinary error paths put the screen back exactly the way a signal would.
+///
+/// The mouse is in here because every path this ends on is a shell prompt, and
+/// a shell wants no mouse reports: the picker turns reporting on when nothing
+/// is behind it, and a client killed with nvmux never gets to turn its own off.
+const RESET: &[u8] = b"\x1b[?2026l\x1b[?1049l\x1b[0m\x1b[?25h\x1b[?1006l\x1b[?1002l";
+
+/// Mouse reporting as Neovim's own TUI turns it on: button-event tracking
+/// (`?1002`, so presses, releases and drags with a button held are reported,
+/// and plain motion is not) in the SGR encoding (`?1006`, so a click past
+/// column 223 still says where it landed).
+///
+/// The same two modes, deliberately, and not crossterm's `EnableMouseCapture`,
+/// which adds `?1000`, `?1003` and `?1015`: `?1003` reports every motion of the
+/// pointer, which the picker has no use for, and the three modes `?1000`,
+/// `?1002` and `?1003` replace one another — so a screen that set `?1003` and
+/// handed the terminal back would leave a client in a mode it never asked for.
+/// crossterm's parser reads SGR reports whichever command enabled them.
+const MOUSE_ON: &[u8] = b"\x1b[?1002h\x1b[?1006h";
+
+/// [`MOUSE_ON`] undone, in reverse order.
+const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1002l";
+
+/// Turn mouse reporting on, for a screen with nothing behind it.
+///
+/// Only that screen: one opened over a held client — `<prefix> Space`,
+/// `<prefix> c`, `<prefix> ?` — leaves the terminal's modes exactly as the
+/// client set them, because a `--remote-ui` client enables the mouse once at
+/// startup and never again (as it enters the alternate screen once, see
+/// [`enter_alt_screen_and_clear`]), and nvmux cannot know what it had on
+/// without parsing its output, which [`crate::pty`] never does. Over a client
+/// with the mouse on, reports already arrive and the screen answers them; over
+/// one with `mouse=`, the screen is keyboard-only, which is what that user
+/// asked for.
+pub fn enable_mouse() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(MOUSE_ON);
+    let _ = out.flush();
+}
+
+/// Turn mouse reporting off again, for the screen that turned it on.
+pub fn disable_mouse() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(MOUSE_OFF);
+    let _ = out.flush();
+}
 
 /// Put the screen back to a state a shell can be used in: cursor visible,
 /// colours reset, primary screen. For the paths that end at a shell prompt
@@ -340,6 +386,58 @@ mod tests {
         assert_eq!(INHERITED, b"\x1b[?2026l\x1b[0m");
         assert!(!contains(INHERITED, b"\x1b[?1049l"));
         assert!(!contains(INHERITED, b"\x1b[?25h"));
+        assert!(!contains(INHERITED, b"\x1b[?1002l"));
+    }
+
+    /// Every path `RESET` ends on is a shell prompt, and a shell wants no mouse
+    /// reports — including after a `kill` during the picker, which is why the
+    /// mouse-off has to be part of the one string the signal handler writes.
+    #[test]
+    fn the_reset_turns_mouse_reporting_off() {
+        assert!(
+            RESET.ends_with(MOUSE_OFF),
+            "RESET does not end with MOUSE_OFF"
+        );
+    }
+
+    /// The off string undoes exactly the modes the on string sets, last first.
+    #[test]
+    fn mouse_off_undoes_mouse_on_in_reverse() {
+        let modes = |s: &[u8], fin: u8| -> Vec<Vec<u8>> {
+            s.split(|&b| b == 0x1b)
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    assert_eq!(part.last(), Some(&fin), "{part:?}");
+                    part[..part.len() - 1].to_vec()
+                })
+                .collect()
+        };
+        let on = modes(MOUSE_ON, b'h');
+        let mut off = modes(MOUSE_OFF, b'l');
+        off.reverse();
+        assert_eq!(on, off);
+        assert_eq!(on, [b"[?1002".to_vec(), b"[?1006".to_vec()]);
+    }
+
+    /// A held client's modes are its own. The strings that hand a terminal to a
+    /// client, back to one, or to a screen drawn over one must not touch the
+    /// mouse: a resumed client has enabled it once and will not do so again,
+    /// and nvmux does not know whether it did.
+    #[test]
+    fn the_handover_strings_leave_mouse_reporting_alone() {
+        for (name, s) in [
+            ("INHERITED", INHERITED),
+            ("HANDOVER", HANDOVER),
+            ("RESUME", RESUME),
+        ] {
+            for mode in [&b"?1002"[..], b"?1006", b"?1000", b"?1003"] {
+                assert!(
+                    !contains(s, mode),
+                    "{name} mentions {:?}",
+                    std::str::from_utf8(mode)
+                );
+            }
+        }
     }
 
     /// [`HANDOVER`] is three steps whose order is the whole of its correctness,

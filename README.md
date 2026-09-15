@@ -78,6 +78,12 @@ reimplementing it.
 | `<prefix>` `?` | show these keys — `Esc` goes back |
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
 
+The picker takes the mouse as well: click a session to select it, click it
+again to attach, scroll to move, and drag a row to change its place in the
+order. Opened from a session with `<prefix> Space`, the picker uses the mouse
+the way that session's Neovim does — its terminal modes are left exactly as it
+set them, so `mouse=` there means a keyboard-only picker.
+
 A session's number is its **position in the list**, recalculated every time the
 list is read. Kill session 2 of three and the old 3 becomes the new 2 — the
 column has no holes in it, so the last session is always the number of sessions

@@ -720,7 +720,7 @@ fn aligned(labels: &[&str]) -> Vec<String> {
 /// session being left is not what fills the spawn. A cancelled prompt goes back
 /// to the same client, which is repainted, so it takes the ordinary close.
 pub fn run(transport: &dyn Transport) -> Result<Outcome> {
-    super::owning_for_attach(Outcome::attaches, |terminal| {
+    super::owning_for_attach(super::Behind::Client, Outcome::attaches, |terminal| {
         run_on(terminal, transport, Task::Create)
     })
 }

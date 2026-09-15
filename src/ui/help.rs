@@ -95,7 +95,7 @@ fn closes(key: Key) -> bool {
 /// Show the bindings until the user dismisses them, on its own terminal, handing
 /// the session back untouched afterwards.
 pub fn run() -> Result<()> {
-    super::owning(run_on)
+    super::owning(super::Behind::Client, run_on)
 }
 
 /// Show the bindings on a terminal the caller already owns — how the picker

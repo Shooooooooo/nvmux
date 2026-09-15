@@ -86,7 +86,7 @@ struct State {
 /// Show the screen until the user confirms or skips. Owns the terminal, like
 /// [`crate::ui::help::run`].
 pub fn run() -> Result<Outcome> {
-    super::owning(run_loop)
+    super::owning(super::Behind::Client, run_loop)
 }
 
 fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Outcome> {
