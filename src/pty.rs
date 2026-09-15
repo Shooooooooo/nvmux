@@ -416,38 +416,96 @@ impl Drop for Attachment {
 /// [`crate::announce::label`]). Not an `Option`: every spawn is a change of
 /// session, and making that unrepresentable is the point.
 pub fn spawn(session_id: &str, sock: &Path, announce: &str) -> Result<Attachment> {
-    // Reach the server before spawning anything. Through an SSH forward the
-    // client's own failure message is empty, after ~165 bytes of escape
-    // sequences have already been sprayed at the terminal, so the check has to
-    // happen here, on a connection nvmux controls.
-    //
-    // The `get_mode` below *is* that check, and the only one. It is a fast call
-    // but still a full request/response round trip, so an answer proves a real
-    // Neovim is behind the socket, a forward whose remote end has gone resets
-    // instead, and a peer that is not Neovim fails on its reply shape — and
-    // `rpc` classifies all of that identically whichever method asked, which is
-    // what `describe_attach_failure` reads.
-    //
-    // An `api_info` used to run in front of it, and proved nothing more *here*:
-    // its result was discarded, nothing on this path reads a version (the gates
-    // are `nvim::check_local` and the remote `--version` banner), and the `?` on
-    // `get_mode` refuses what this path can actually meet — a forward that resets,
-    // a server that does not answer, a reply that is not Neovim-shaped. (Not
-    // *every* peer: the two reply shapes are checked separately, so something
-    // that answered one and not the other would now get further. Nothing that
-    // reaches this socket does.) It does prove
-    // more *elsewhere* — it answers during `:!cmd`, where `get_mode` is queued
-    // like any other call, which is why `rpc::probe` asks both — so this is not
-    // a claim that the two are interchangeable. What it cost was a round trip on
-    // every attach, forwarded over SSH.
+    // `CommandBuilder::new` seeds the child's environment from ours, so `TERM`,
+    // `COLORTERM` and everything else the client negotiates with reach it
+    // without being copied by hand.
+    let mut cmd = CommandBuilder::new("nvim");
+    cmd.arg("--server");
+    cmd.arg(sock);
+    cmd.arg("--remote-ui");
+    if let Ok(cwd) = std::env::current_dir() {
+        cmd.cwd(cwd);
+    }
+    spawn_with(session_id, sock, announce, cmd)
+}
+
+/// [`spawn`] with the client command supplied, which is how the tests run it
+/// against a stand-in client where there is no `nvim`.
+///
+/// The client is started *first* and the server probed while it connects.
+/// The two have nothing to say to each other — the probe asks the server what
+/// state it is in, the client asks it for a grid — and over an SSH forward
+/// each is a run of round trips: three for the probe, two for the client
+/// before its first paint. In series they were the whole of a switch on a
+/// distant host; overlapped, a switch costs the longer of the two.
+///
+/// The probe still decides. Nothing the client prints reaches the terminal
+/// before it has passed: the client writes into its pty, and only the relay
+/// copies a pty to the terminal, which starts after this returns. A probe that
+/// fails ends the client with the attachment it was building — through the
+/// same hangup and reap as any other retirement — and its output dies with the
+/// master. That matters over a forward whose remote end has gone: the client's
+/// own failure message there is empty, after ~165 bytes of escape sequences it
+/// has already written, and none of them are seen.
+///
+/// A client that could not be started at all is reported before any probe,
+/// since the message — `nvim` is not here — is the useful one.
+fn spawn_with(
+    session_id: &str,
+    sock: &Path,
+    announce: &str,
+    cmd: CommandBuilder,
+) -> Result<Attachment> {
+    let t_spawn = std::time::Instant::now();
+    let attachment = spawn_client(session_id, sock, announce, cmd)?;
+    tracing::debug!(
+        ms = t_spawn.elapsed().as_secs_f64() * 1000.0,
+        "timing: client spawn"
+    );
+
+    // The round trips to the session — over ssh, through the forward — while
+    // the client makes its own.
     let t_probe = std::time::Instant::now();
+    if let Err(e) = probe(session_id, sock) {
+        // Explicitly, so the retirement is not left to a binding: the client
+        // must be gone, and its pty with it, before the error is shown.
+        drop(attachment);
+        return Err(e);
+    }
+    tracing::debug!(
+        ms = t_probe.elapsed().as_secs_f64() * 1000.0,
+        "timing: attach probe"
+    );
+    Ok(attachment)
+}
+
+/// Ask the server whether it can take a client, and make it ready for one.
+///
+/// The `get_mode` here is the reachability check, and the only one. It is a
+/// fast call but still a full request/response round trip, so an answer
+/// proves a real Neovim is behind the socket, a forward whose remote end has
+/// gone resets instead, and a peer that is not Neovim fails on its reply
+/// shape — and `rpc` classifies all of that identically whichever method
+/// asked, which is what the `?` relies on.
+///
+/// An `api_info` used to run in front of it, and proved nothing more *here*:
+/// its result was discarded, nothing on this path reads a version (the gates
+/// are `nvim::check_local` and the remote `--version` banner), and the `?` on
+/// `get_mode` refuses what this path can actually meet. It does prove more
+/// *elsewhere* — it answers during `:!cmd`, where `get_mode` is queued like
+/// any other call, which is why `rpc::probe` asks both — so this is not a
+/// claim that the two are interchangeable. What it cost was a round trip on
+/// every attach, forwarded over SSH.
+fn probe(session_id: &str, sock: &Path) -> Result<()> {
     let mut client = rpc::Client::connect(sock, rpc::PROBE_TIMEOUT)?;
     // A server at a hit-enter prompt cannot answer `list_uis`, a deferred
     // call, until a key ends the prompt. Usually there is nobody to type one:
     // the client that was showing the prompt is gone, and this is its
-    // replacement. So the prompt is ended here with `<CR>`, the key it
-    // consumes without running anything (see `rpc::Mode::at_hit_enter` for
-    // why only this prompt), and the count that follows is real, not guessed.
+    // replacement — which may already be attached by now, and then sees the
+    // prompt end and repaints, as any other UI would. So the prompt is ended
+    // here with `<CR>`, the key it consumes without running anything (see
+    // `rpc::Mode::at_hit_enter` for why only this prompt), and the count that
+    // follows is real, not guessed.
     //
     // A deliberate trade-off where another UI is still attached: that user's
     // prompt ends too, and whatever it was showing — a `:!make` page, a Lua
@@ -466,8 +524,14 @@ pub fn spawn(session_id: &str, sock: &Path, announce: &str) -> Result<Attachment
     // Not `unwrap_or(0)`: a server too busy to answer is exactly the one whose
     // UI count is unknown, and guessing zero is how the seventeenth attach
     // happens.
+    //
+    // `>` rather than `>=`: the client this probe runs alongside may or may
+    // not be attached yet, so the count is off by at most one, in the
+    // direction of our own client. `MAX_UIS` is half of Neovim's limit, so a
+    // count one too high refuses the ninth other client rather than the
+    // eighth, and a count one too low still stops seven short of the abort.
     let uis = client.list_uis()?;
-    if uis >= MAX_UIS {
+    if uis > MAX_UIS {
         return Err(NvmuxError::Session(
             crate::error::SessionError::TooManyUis {
                 id: session_id.to_string(),
@@ -475,16 +539,16 @@ pub fn spawn(session_id: &str, sock: &Path, announce: &str) -> Result<Attachment
             },
         ));
     }
-    drop(client);
+    Ok(())
+}
 
-    // The two records bracket the fork: the first is the round trips to the
-    // session — over ssh, through the forward — and the second adds `openpty`
-    // and the client's own exec.
-    tracing::debug!(
-        ms = t_probe.elapsed().as_secs_f64() * 1000.0,
-        "timing: attach probe"
-    );
-
+/// Open a pty and start the client on it.
+fn spawn_client(
+    session_id: &str,
+    sock: &Path,
+    announce: &str,
+    cmd: CommandBuilder,
+) -> Result<Attachment> {
     // Right *before* the child starts: `PtySize::default()` is 24x80. Note
     // `crossterm::size()` is (cols, rows) while `PtySize` is { rows, cols } —
     // passing them positionally transposes the screen.
@@ -492,17 +556,6 @@ pub fn spawn(session_id: &str, sock: &Path, announce: &str) -> Result<Attachment
     let pair: PtyPair = portable_pty::native_pty_system()
         .openpty(size)
         .map_err(|e| NvmuxError::Io(std::io::Error::other(e.to_string())))?;
-
-    // `CommandBuilder::new` seeds the child's environment from ours, so `TERM`,
-    // `COLORTERM` and everything else the client negotiates with reach it
-    // without being copied by hand.
-    let mut cmd = CommandBuilder::new("nvim");
-    cmd.arg("--server");
-    cmd.arg(sock);
-    cmd.arg("--remote-ui");
-    if let Ok(cwd) = std::env::current_dir() {
-        cmd.cwd(cwd);
-    }
 
     let child = pair
         .slave
@@ -517,11 +570,6 @@ pub fn spawn(session_id: &str, sock: &Path, announce: &str) -> Result<Attachment
         .master
         .take_writer()
         .map_err(|e| NvmuxError::Io(std::io::Error::other(e.to_string())))?;
-
-    tracing::debug!(
-        ms = t_probe.elapsed().as_secs_f64() * 1000.0,
-        "timing: probe + client spawn"
-    );
 
     Ok(Attachment {
         session_id: session_id.to_string(),
@@ -1370,6 +1418,16 @@ mod tests {
         mode: &'static str,
         blocking: bool,
     ) -> std::thread::JoinHandle<Vec<String>> {
+        recording_server_with_uis(sock, mode, blocking, 0)
+    }
+
+    /// The same, reporting `uis` attached UIs.
+    fn recording_server_with_uis(
+        sock: &Path,
+        mode: &'static str,
+        blocking: bool,
+        uis: usize,
+    ) -> std::thread::JoinHandle<Vec<String>> {
         use rmpv::Value;
 
         let listener = std::os::unix::net::UnixListener::bind(sock).expect("bind");
@@ -1430,8 +1488,7 @@ mod tests {
                         (Value::String("mode".into()), Value::String(mode.into())),
                         (Value::String("blocking".into()), Value::Boolean(blocking)),
                     ]),
-                    // No UIs attached, so the `MAX_UIS` guard lets the attach by.
-                    "nvim_list_uis" => Value::Array(vec![]),
+                    "nvim_list_uis" => Value::Array(vec![Value::Nil; uis]),
                     // The byte count, which nvmux ignores.
                     "nvim_input" => Value::from(4u64),
                     _ => Value::Nil,
@@ -1491,6 +1548,33 @@ mod tests {
         }
     }
 
+    /// A client that sits on its pty until it is hung up, in place of `nvim`,
+    /// which the machines running these tests may not have. `tag` goes on its
+    /// command line, so the process table says whether it is still there once
+    /// `spawn` has let go of it — a pid it wrote to a file would not do, since
+    /// a probe can fail before the shell has run a single line.
+    fn standin_client(tag: &str) -> CommandBuilder {
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg(format!("while :; do read x; done # {}", standin_mark(tag)));
+        cmd
+    }
+
+    fn standin_mark(tag: &str) -> String {
+        format!("nvmux-standin-{}-{tag}", std::process::id())
+    }
+
+    /// Whether a stand-in client with this tag is in the process table.
+    fn standin_running(tag: &str) -> bool {
+        let out = std::process::Command::new("ps")
+            .args(["-ww", "-eo", "args="])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|l| l.contains(&standin_mark(tag)) && !l.contains("ps -ww"))
+    }
+
     /// The attach probe's call sequence, which is the whole of what a change to it
     /// can break: the mode first — a fast call, answered even at a prompt — then
     /// a `<CR>` for the one prompt that key ends, then the deferred UI count.
@@ -1514,11 +1598,9 @@ mod tests {
         ] {
             let sock = temp_sock(tag);
             let server = recording_server(&sock, mode, blocking);
-            // The result is deliberately not asserted: `spawn` goes on to fork
-            // `nvim`, which this machine may not have, and either way the probe
-            // has already been made. Bound to `_` so an attachment, if one comes
-            // back, is retired at once.
-            let _ = spawn("probe", &sock, "1  probe");
+            // Bound to `_` so the attachment is retired at once.
+            let _ = spawn_with("probe", &sock, "1  probe", standin_client(tag))
+                .expect("a passed probe is an attachment");
             assert_eq!(
                 server.join().expect("the server thread"),
                 want,
@@ -1526,6 +1608,57 @@ mod tests {
             );
             let _ = std::fs::remove_file(&sock);
         }
+    }
+
+    /// The client is started before the probe has said yes, so a probe that
+    /// says no must take it down again: nothing left running, nothing left to
+    /// print on the terminal. Both ways a probe can say no — nothing serving
+    /// the socket, and a server with too many UIs — and the error is the
+    /// probe's, not the client's.
+    #[test]
+    fn a_failed_probe_leaves_no_client_behind() {
+        for (tag, too_many) in [("nobody", false), ("toomany", true)] {
+            let sock = temp_sock(tag);
+            let server =
+                too_many.then(|| recording_server_with_uis(&sock, "n", false, MAX_UIS + 1));
+            if !too_many {
+                // A file where the socket should be: as dead as a missing one.
+                std::fs::write(&sock, b"not a socket").expect("a file where the socket was");
+            }
+            let err = spawn_with("gone", &sock, "1  gone", standin_client(tag))
+                .expect_err("the probe must refuse");
+            match (too_many, &err) {
+                (true, NvmuxError::Session(crate::error::SessionError::TooManyUis { .. })) => {}
+                (false, NvmuxError::Rpc(_)) => {}
+                _ => panic!("{tag}: the wrong refusal: {err}"),
+            }
+            if let Some(server) = server {
+                server.join().expect("the server thread");
+            }
+            // Retired and reaped before the error came back, so it is not in
+            // the process table at all — not even as a zombie.
+            assert!(
+                !standin_running(tag),
+                "{tag}: the client is still there after a failed probe"
+            );
+            let _ = std::fs::remove_file(&sock);
+        }
+    }
+
+    /// The count the probe reads may or may not include the client started
+    /// alongside it, so the guard tolerates exactly one over.
+    #[test]
+    fn the_ui_limit_allows_for_the_client_being_counted() {
+        let sock = temp_sock("atlimit");
+        let server = recording_server_with_uis(&sock, "n", false, MAX_UIS);
+        let attached = spawn_with("limit", &sock, "1  limit", standin_client("atlimit"));
+        assert!(
+            attached.is_ok(),
+            "{MAX_UIS} UIs, one of them possibly ours, must attach"
+        );
+        drop(attached);
+        server.join().expect("the server thread");
+        let _ = std::fs::remove_file(&sock);
     }
 
     /// The invariant the switch path's overlap rests on, and the one that was
