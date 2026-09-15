@@ -120,7 +120,9 @@ pub struct Attachment {
     master: Box<dyn MasterPty>,
     writer: Box<dyn Write + Send>,
     /// True once the child has been through a full relay, so a resume knows it
-    /// must force a repaint.
+    /// must force a repaint — and that the client is one that already entered
+    /// the alternate screen and will not enter it again, so the terminal has
+    /// to be put back there before it draws.
     resumed: bool,
     /// True once the child has been waited for, so `Drop` does not do it twice.
     reaped: bool,
@@ -614,12 +616,25 @@ pub fn relay(
         .ok_or_else(|| NvmuxError::Io(std::io::Error::other("pty master has no fd")))?;
 
     let winch = winch::Winch::install()?;
-    // Normally already done by whoever handed the terminal over — the picker,
-    // the prompt, or the `Switch` branch below — because a clear on this side of
-    // the client spawn is a clear too late, and the old session is what fills
-    // the wait. This is the backstop for a path that did neither, and a repeat
-    // costs one write on a screen nothing has drawn to since.
-    term::leave_alt_screen_and_clear();
+    if attachment.resumed {
+        // The client entered the alternate screen itself on its first relay
+        // and has not been told that every screen since — the picker, the
+        // prompt, the help, the `Switch` branch below — left it. It will not
+        // enter it again: the repaint below redraws the grid wherever the
+        // terminal is. Left on the primary screen it draws there, and then
+        // on a detach its `rmcup` and nvmux's own `?1049l` have nothing to
+        // leave, and its last frame is what the shell prompt lands on.
+        term::enter_alt_screen_and_clear();
+    } else {
+        // Normally already done by whoever handed the terminal over — the
+        // picker, the prompt, or the `Switch` branch below — because a clear
+        // on this side of the client spawn is a clear too late, and the old
+        // session is what fills the wait. This is the backstop for a path
+        // that did neither, and a repeat costs one write on a screen nothing
+        // has drawn to since. The client enters the alternate screen for
+        // itself, as part of its startup.
+        term::leave_alt_screen_and_clear();
+    }
     let mut raw = term::RawMode::enter()?;
 
     // What the child buffered while blocked mid-write describes a screen the

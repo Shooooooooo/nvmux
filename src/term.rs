@@ -253,14 +253,17 @@ const HANDOVER: &[u8] = b"\x1b[?2026l\x1b[0m\x1b[?1049l\x1b[2J\x1b[H";
 
 /// Leave the alternate screen and clear, without touching the terminal modes.
 ///
-/// **Belongs before the next client is spawned, never after.** Whatever is on
-/// the terminal stays there until this runs, and on a switch that is the session
-/// being switched away from — so with this on the far side of a spawn (two RPC
-/// round trips and a whole new `nvim` process) the old session is what the user
-/// watches for the length of the switch. The callers are therefore the picker
-/// and the prompt as they give the terminal back, `<prefix> <number>` as it
-/// leaves one relay for the next, and [`crate::pty::relay`] as the backstop for
-/// a path that did neither.
+/// **For a client about to be spawned, and belongs before the spawn, never
+/// after.** Whatever is on the terminal stays there until this runs, and on a
+/// switch that is the session being switched away from — so with this on the
+/// far side of a spawn (two RPC round trips and a whole new `nvim` process) the
+/// old session is what the user watches for the length of the switch. The
+/// callers are therefore the picker and the prompt as they give the terminal
+/// back, `<prefix> <number>` as it leaves one relay for the next, and
+/// [`crate::pty::relay`] as the backstop for a path that did neither.
+///
+/// A client that is *resumed* rather than spawned needs the opposite —
+/// [`enter_alt_screen_and_clear`] — and the relay is what tells the two apart.
 ///
 /// Written straight to stdout rather than through crossterm so it cannot
 /// re-enter any mode handling: raw mode is the caller's business, and the
@@ -269,6 +272,47 @@ pub fn leave_alt_screen_and_clear() {
     use std::io::Write;
     let mut out = std::io::stdout();
     let _ = out.write_all(HANDOVER);
+    let _ = out.flush();
+}
+
+/// What hands the terminal back to a client nvmux took it from: [`INHERITED`],
+/// then `?1049h` to re-enter the alternate screen, then clear + home.
+///
+/// The same order as [`HANDOVER`], for the same reasons, with the one switch
+/// pointing the other way. `?1049h` on a terminal already in the alternate
+/// screen is a no-op on xterm and kitty (which is what the picker relies on to
+/// open over a client's frame), so the erase is explicit rather than left to
+/// the switch. No `\e[22;0;0t` beside it: the client's own `smcup` pushed the
+/// title once, its `rmcup` will pop it once, and a second push here would leave
+/// the stack one deep.
+const RESUME: &[u8] = b"\x1b[?2026l\x1b[0m\x1b[?1049h\x1b[2J\x1b[H";
+
+/// Put the terminal back in the alternate screen, cleared, for a client that
+/// is about to be resumed rather than spawned.
+///
+/// A `--remote-ui` client enters the alternate screen once, at startup, and
+/// leaves it once, at exit. Nothing nvmux can ask of the server makes it do
+/// either again: `:mode` and a resize repaint the grid wherever the terminal
+/// is. But the picker, the prompt and the help screen all end by leaving the
+/// alternate screen (see `ui::Screen`), and a switch that names the session
+/// already attached goes through [`leave_alt_screen_and_clear`] — so a client
+/// resumed after any of them has been moved to the primary screen without
+/// being told, and repaints there.
+///
+/// Nothing looks wrong until that client leaves. Its `rmcup` then has no
+/// alternate screen to leave, and neither does the `?1049l` nvmux writes on a
+/// detach, so the editor's last frame stays put and the shell prompt is printed
+/// onto it. Whether a given detach showed the bug depended on whether the user
+/// had been to the picker and back first, which is what made it intermittent.
+///
+/// A terminal with no alternate screen ignores `?1049h` as it ignored the
+/// client's; one whose `TERM` lacks `smcup` while the terminal itself has the
+/// mode is put in the alternate screen here on a client that never asked, and
+/// taken out of it by the `?1049l` every way out of nvmux ends with.
+pub fn enter_alt_screen_and_clear() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(RESUME);
     let _ = out.flush();
 }
 
@@ -319,6 +363,48 @@ mod tests {
              on the alternate screen being left"
         );
         assert!(at(b"\x1b[2J") < at(b"\x1b[H"));
+    }
+
+    /// [`RESUME`] is [`HANDOVER`] with the switch pointing the other way, and
+    /// only that: same attributes-first order, same erase-then-home, and it
+    /// must *enter* the alternate screen — a resumed client draws on whichever
+    /// screen the terminal is on, and its exit only leaves the one it entered.
+    #[test]
+    fn the_resume_re_enters_the_alternate_screen_before_it_erases() {
+        assert!(
+            RESUME.starts_with(INHERITED),
+            "the erase paints with the current background colour, so the \
+             picker's or the client's leftover attributes must go first"
+        );
+        let at = |needle: &[u8]| {
+            RESUME
+                .windows(needle.len())
+                .position(|w| w == needle)
+                .unwrap_or_else(|| panic!("RESUME dropped {needle:?}"))
+        };
+        assert!(
+            at(b"\x1b[?1049h") < at(b"\x1b[2J"),
+            "the erase must land on the alternate screen the client will draw \
+             on, not on the primary screen being left"
+        );
+        assert!(at(b"\x1b[2J") < at(b"\x1b[H"));
+        assert!(
+            !contains(RESUME, b"\x1b[?1049l"),
+            "a resume must not leave the alternate screen: the client is not \
+             going to enter it again"
+        );
+        assert!(
+            !contains(RESUME, b"\x1b[22;"),
+            "the client's own smcup pushed the title; pushing it again would \
+             leave the title stack one deep after its rmcup"
+        );
+        // And the two hand over the same amount of state, so an edit to one
+        // that forgets the other shows up here.
+        assert_eq!(
+            RESUME.len(),
+            HANDOVER.len(),
+            "RESUME and HANDOVER should differ only in the direction of the switch"
+        );
     }
 
     /// The distinction the module docs rest on: `cfmakeraw` already does most of
