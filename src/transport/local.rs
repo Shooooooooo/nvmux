@@ -2,11 +2,12 @@
 
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, TryLockError};
 
 use crate::error::{NvmuxError, Result, SessionError};
 use crate::launch::Launch;
 use crate::paths::{self, SessionPaths};
-use crate::proc;
+use crate::proc::{self, Shell};
 use crate::rpc;
 use crate::session::{Liveness, Session};
 use crate::shell;
@@ -23,6 +24,9 @@ pub struct LocalTransport {
     /// This user's home directory, or empty if `$HOME` is unset or relative.
     /// The local answer to the question `scripts/hello.sh` asks a remote host.
     home: String,
+    /// The `sh` every script runs in. Started by the first script that needs
+    /// it, so building a transport does no I/O, and replaced if it dies.
+    shell: Mutex<Option<Shell>>,
 }
 
 impl LocalTransport {
@@ -40,6 +44,36 @@ impl LocalTransport {
             location: Location::Local,
             dir,
             home: home_dir(),
+            shell: Mutex::new(None),
+        })
+    }
+
+    /// Run one of the shared scripts in this machine's shell.
+    ///
+    /// A script that fails is an `Ok` with a status, which each caller reads
+    /// its own way. `Err` is the shell itself: gone mid-run, or not startable.
+    /// A shell found dead is replaced *before* a run and never after one — a
+    /// script that was half way through must not run twice — so the caller
+    /// that hit the death sees it, and the next one gets a fresh shell.
+    fn run(&self, script: &str, args: &[&str]) -> Result<proc::Output> {
+        let mut slot = match self.shell.try_lock() {
+            Ok(slot) => slot,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            // No transport method calls another while running a script, so
+            // this is a bug being reported rather than a wait being refused.
+            Err(TryLockError::WouldBlock) => {
+                return Err(NvmuxError::Io(std::io::Error::other(
+                    "the shell is already running a script",
+                )));
+            }
+        };
+        if slot.as_mut().is_none_or(|shell| !shell.is_alive()) {
+            *slot = Some(Shell::start(&mut proc::sh_command(), "/bin/sh")?);
+        }
+        let shell = slot.as_mut().expect("just started");
+        shell.run(script, args).map_err(|died| {
+            *slot = None;
+            NvmuxError::Io(std::io::Error::other(died))
         })
     }
 
@@ -130,7 +164,7 @@ impl Transport for LocalTransport {
     }
 
     fn list_sessions(&self) -> Result<Vec<Session>> {
-        let out = proc::run_local(shell::LIST_SCRIPT, &[&self.dir_arg])?;
+        let out = self.run(shell::LIST_SCRIPT, &[&self.dir_arg])?;
         if !out.ok() {
             tracing::warn!(status = out.status, stderr = %out.stderr, "list.sh failed");
         }
@@ -184,7 +218,7 @@ impl Transport for LocalTransport {
         args.extend(argv.iter().map(String::as_str));
 
         tracing::info!(%id, name, command = launch.line(), directory, "spawning session");
-        let out = proc::run_local(shell::SPAWN_SCRIPT, &args)?;
+        let out = self.run(shell::SPAWN_SCRIPT, &args)?;
         let spawned = protocol::parse_spawn(&out.stdout)?;
 
         if !spawned.socket_appeared || !wait_until_reachable(&paths.sock, REACHABLE_TIMEOUT) {
@@ -196,7 +230,7 @@ impl Transport for LocalTransport {
             // finds the process by its socket, the pid is only a hint.
             let tail = self.log_tail(&paths.log);
             let pid = opt_pid_arg(spawned.pid);
-            match proc::run_local(shell::KILL_SCRIPT, &[&self.dir_arg, &id, &pid]) {
+            match self.run(shell::KILL_SCRIPT, &[&self.dir_arg, &id, &pid]) {
                 Ok(out) => match protocol::parse_kill(&out.stdout) {
                     Ok(outcome) => tracing::debug!(%id, ?outcome, "cleaned up a failed create"),
                     Err(e) => tracing::warn!(%id, error = %e, "cleanup after a failed create"),
@@ -234,7 +268,7 @@ impl Transport for LocalTransport {
         // The recorded pid is only a starting guess: the script uses it only if
         // it still owns this session's socket, since pids get reused.
         let pid = pid_arg(s.pid);
-        let out = proc::run_local(shell::KILL_SCRIPT, &[&self.dir_arg, &s.id, &pid])?;
+        let out = self.run(shell::KILL_SCRIPT, &[&self.dir_arg, &s.id, &pid])?;
         if !out.ok() {
             tracing::warn!(status = out.status, stderr = %out.stderr, "kill.sh failed");
         }
@@ -304,5 +338,82 @@ fn home_dir() -> String {
     match std::env::var_os("HOME") {
         Some(h) if Path::new(&h).is_absolute() => h.to_string_lossy().into_owned(),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::DirBuilderExt;
+
+    use super::*;
+
+    fn transport(tag: &str) -> (LocalTransport, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("nvmux-local-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .expect("runtime dir");
+        (
+            LocalTransport::with_dir(dir.clone()).expect("transport"),
+            dir,
+        )
+    }
+
+    fn shell_pid(t: &LocalTransport) -> u32 {
+        t.shell
+            .lock()
+            .expect("lock")
+            .as_ref()
+            .expect("a shell")
+            .pid()
+    }
+
+    /// One `sh` runs every script the transport sends — that is the whole
+    /// point — and a script that fails does not cost it. A shell that died
+    /// while idle is replaced by the next script, not reported forever.
+    #[test]
+    fn one_shell_runs_every_script_and_a_dead_one_is_replaced() {
+        let (t, dir) = transport("shell");
+        assert!(
+            t.shell.lock().expect("lock").is_none(),
+            "no I/O before the first script"
+        );
+
+        assert!(t.list_sessions().expect("list").is_empty());
+        let pid = shell_pid(&t);
+        for _ in 0..3 {
+            assert!(t.list_sessions().expect("list").is_empty());
+            assert_eq!(shell_pid(&t), pid, "a listing started a new shell");
+        }
+
+        // A script that fails: spawn.sh with a program that is not there exits
+        // on its error path, and the shell it ran in is still the shell.
+        let hopeless = Launch::parse("nvmux-no-such-editor --listen {sock}").expect("parses");
+        assert!(t.create_session("hopeless", &hopeless, "/").is_err());
+        assert_eq!(shell_pid(&t), pid, "a failed script cost the shell");
+        assert!(t.list_sessions().expect("list").is_empty());
+
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while t
+            .shell
+            .lock()
+            .expect("lock")
+            .as_mut()
+            .expect("held")
+            .is_alive()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the shell did not die"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(t.list_sessions().expect("list").is_empty());
+        assert_ne!(shell_pid(&t), pid, "the dead shell was not replaced");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

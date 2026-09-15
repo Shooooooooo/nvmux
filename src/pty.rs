@@ -909,7 +909,11 @@ fn read_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
     }
 }
 
-fn pollfd(fd: RawFd) -> libc::pollfd {
+/// A `poll` entry asking whether `fd` is readable. Shared with
+/// [`crate::proc::Shell`], which polls a child's pipes the way this module
+/// polls a pty; a negative `fd` is skipped by `poll`, which is how a pipe
+/// that has reached EOF is left out.
+pub(crate) fn pollfd(fd: RawFd) -> libc::pollfd {
     libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -934,7 +938,7 @@ fn writable(fd: RawFd) -> bool {
 /// Readable, or gone. `POLLHUP` matters as much as `POLLIN`: on Linux the
 /// master reports hangup rather than readability once the child exits, and
 /// ignoring it would leave the loop spinning against a dead pty.
-fn ready(p: &libc::pollfd) -> bool {
+pub(crate) fn ready(p: &libc::pollfd) -> bool {
     p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
 }
 

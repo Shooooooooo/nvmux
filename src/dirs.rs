@@ -9,29 +9,37 @@
 //! Completion runs on a worker thread (see [`crate::ui::complete`], which
 //! explains why), and a thread cannot borrow the picker's transport. So each
 //! transport hands out a [`DirSource`] instead: a small, owned, `Send` handle
-//! carrying just enough to ask the same host again. Locally that is nothing at
-//! all; over ssh it is the host and the `ControlPath` of the master connection
-//! the transport already brought up, so a listing is a new invocation on an
-//! existing connection rather than a new connection.
+//! carrying just enough to reach the same host again. Locally that is nothing
+//! at all; over ssh it is the host and the `ControlPath` of the master
+//! connection the transport already brought up, so the worker's shell is a new
+//! channel on an existing connection rather than a new connection.
+//!
+//! The worker turns it into a [`Lister`]: the source plus a shell of its own on
+//! the host, kept across questions. Its own, rather than the transport's,
+//! because the transport's shell is busy with what the user asked for and this
+//! one answers what nvmux asked on its own account — so over ssh it is started
+//! unattended, and can never sit on a prompt nobody can see.
 //!
 //! # One script, both hosts
 //!
-//! Neither arm reimplements directory listing: both run `scripts/dirs.sh`, the
-//! local one through `/bin/sh` exactly as [`crate::transport::local`] runs every
-//! other script. So the dotfile rule, the sort order, the cap and the handling
-//! of odd names are one implementation and cannot drift between local and
-//! remote — which they would, silently, if the local side used `read_dir`.
+//! Neither arm reimplements directory listing: both run `scripts/dirs.sh`, in
+//! the same kind of shell [`crate::transport::local`] runs every other script
+//! in. So the dotfile rule, the sort order, the cap and the handling of odd
+//! names are one implementation and cannot drift between local and remote —
+//! which they would, silently, if the local side used `read_dir`.
 //!
-//! The measured cost of the local fork is what makes that affordable: it is a
-//! millisecond or so against `read_dir`'s tenth of one, and neither is on the
-//! keypress path at all, because a worker thread is what calls this.
+//! What makes that affordable is that a listing is a run in a shell already
+//! there, not a process per question: the script itself is what a keystroke
+//! costs the host, and it is not on the keypress path at all, because a worker
+//! thread is what calls this.
 
 use std::path::PathBuf;
 
-use crate::error::Result;
+use crate::error::{NvmuxError, Result};
+use crate::proc::{self, Shell};
+use crate::shell;
 use crate::ssh::Ssh;
 use crate::transport::protocol::{self, Listing};
-use crate::{proc, shell};
 
 /// A `Send` handle that can list directories on one session host.
 ///
@@ -44,6 +52,53 @@ pub enum DirSource {
 }
 
 impl DirSource {
+    /// A shell on this host for questions nobody is watching. Over ssh that
+    /// means unattended: it never prompts, and gives up on a host it cannot
+    /// reach — see `ssh::unattended`.
+    pub fn start_shell(&self) -> Result<Shell> {
+        Ok(match self {
+            DirSource::Local => Shell::start(&mut proc::sh_command(), "/bin/sh")?,
+            DirSource::Ssh { host, control_path } => {
+                Ssh::new(host.clone(), control_path.clone()).start_unattended_shell()?
+            }
+        })
+    }
+}
+
+/// Directory listings from one host, through one shell kept across questions.
+///
+/// Owned by the completion worker, which is the only thing that asks. The
+/// shell is started by the first question, or by [`Lister::warm`] ahead of it,
+/// and replaced if it dies.
+pub struct Lister {
+    source: DirSource,
+    shell: Option<Shell>,
+}
+
+impl Lister {
+    pub fn new(source: DirSource) -> Self {
+        Self {
+            source,
+            shell: None,
+        }
+    }
+
+    /// Start the shell before there is a question for it, so what it costs to
+    /// bring up — over ssh, a login shell on the host — is paid while the user
+    /// is still typing rather than by the first keystroke that needs an answer.
+    /// A shell that will not start is not reported here; the first question
+    /// tries again and is where the failure belongs.
+    pub fn warm(&mut self) {
+        let _ = self.shell();
+    }
+
+    fn shell(&mut self) -> Result<&mut Shell> {
+        if self.shell.as_mut().is_none_or(|shell| !shell.is_alive()) {
+            self.shell = Some(self.source.start_shell()?);
+        }
+        Ok(self.shell.as_mut().expect("just started"))
+    }
+
     /// Every subdirectory of `dir`, dotted ones included.
     ///
     /// The whole directory rather than a filtered slice of it, because the
@@ -60,16 +115,19 @@ impl DirSource {
     /// A directory that is not there is an empty listing, not an error: at a
     /// prompt, half a path is the normal state of the input, and every keystroke
     /// on the way to a real directory passes through one that is not there yet.
-    pub fn children(&self, dir: &str) -> Result<Listing> {
-        let out = match self {
-            DirSource::Local => proc::run_local(shell::DIRS_SCRIPT, &[dir])?,
-            // Unattended: nobody is watching this run, and there is no
-            // terminal to answer a passphrase prompt on — see `ssh::unattended`.
-            DirSource::Ssh { host, control_path } => {
-                Ssh::new(host.clone(), control_path.clone())
-                    .run_script_unattended(shell::DIRS_SCRIPT, &[dir])?
-            }
-        };
+    pub fn children(&mut self, dir: &str) -> Result<Listing> {
+        // The status goes unread, as it always has: a directory that is not
+        // there is the script's empty answer, and anything else it could say
+        // is not worth more than the empty listing the worker shows for an
+        // error. A shell that died is dropped, and the next question replaces
+        // it.
+        let out = self
+            .shell()?
+            .run(shell::DIRS_SCRIPT, &[dir])
+            .map_err(|died| {
+                self.shell = None;
+                NvmuxError::Io(std::io::Error::other(died))
+            })?;
         protocol::parse_dirs(&out.stdout)
     }
 }
@@ -171,6 +229,10 @@ mod tests {
         assert_eq!(split("/home/you/my pro"), Some(("/home/you", "my pro")));
     }
 
+    fn local() -> Lister {
+        Lister::new(DirSource::Local)
+    }
+
     /// The local arm runs the same script the remote one does, so this is also
     /// the test that the script's contract holds as embedded rather than as it
     /// sits in the checkout.
@@ -185,7 +247,8 @@ mod tests {
         std::fs::write(root.join("a-file"), b"not a directory").expect("write a file");
         let dir = root.to_string_lossy().into_owned();
 
-        let all = DirSource::Local.children(&dir).expect("list");
+        let mut lister = local();
+        let all = lister.children(&dir).expect("list");
         assert_eq!(
             all.names,
             ["alpha", "beta", "beta-two", ".hidden"],
@@ -199,7 +262,7 @@ mod tests {
         );
 
         // Half-typed paths are the normal state of a prompt, not an error.
-        let missing = DirSource::Local
+        let missing = lister
             .children(&root.join("nope").to_string_lossy())
             .expect("a directory that is not there is an empty answer");
         assert!(missing.names.is_empty());
@@ -220,12 +283,48 @@ mod tests {
         }
         let dir = root.to_string_lossy().into_owned();
 
-        let all = DirSource::Local.children(&dir).expect("list");
+        let all = local().children(&dir).expect("list");
         assert_eq!(
             all.names,
             ["a b", "c*d", "c?d", "cxd"],
             "a name with a space is one name, and a `*` is a character"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One shell answers every question — that is the point of keeping one —
+    /// and a question after the shell has died gets a fresh one rather than an
+    /// error for the rest of the prompt's life.
+    #[test]
+    fn one_shell_serves_every_question_and_a_dead_one_is_replaced() {
+        let root =
+            std::env::temp_dir().join(format!("nvmux-dirs-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("only")).expect("make a directory");
+        let dir = root.to_string_lossy().into_owned();
+
+        let mut lister = local();
+        lister.warm();
+        let pid = lister.shell.as_ref().expect("warmed").pid();
+        for _ in 0..3 {
+            assert_eq!(lister.children(&dir).expect("list").names, ["only"]);
+            assert_eq!(lister.shell.as_ref().expect("kept").pid(), pid);
+        }
+
+        // The shell goes away while idle — an expired master, over ssh.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while lister.shell.as_mut().expect("still held").is_alive() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the shell did not die"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(lister.children(&dir).expect("list").names, ["only"]);
+        assert_ne!(lister.shell.as_ref().expect("replaced").pid(), pid);
 
         let _ = std::fs::remove_dir_all(&root);
     }

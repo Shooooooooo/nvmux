@@ -23,11 +23,19 @@ fn b32_40(bytes: &[u8; 5]) -> String {
         .collect()
 }
 
-/// A fresh random session id.
-pub fn new_id() -> Result<String> {
+/// Eight random base32 characters: forty bits nothing can guess.
+///
+/// The one source of randomness in the crate. A session id is one of these;
+/// so is the secret a [`crate::proc::Shell`] frames its output with.
+pub fn nonce() -> std::io::Result<String> {
     let mut bytes = [0u8; 5];
     getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
     Ok(b32_40(&bytes))
+}
+
+/// A fresh random session id.
+pub fn new_id() -> Result<String> {
+    Ok(nonce()?)
 }
 
 /// Reject anything that is not a well-formed session id.

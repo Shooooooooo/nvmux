@@ -7,7 +7,9 @@
 //! So no command *string* is ever built with interpolated values. Scripts are
 //! fixed text delivered on stdin, and every variable part arrives as a
 //! positional argument the remote shell never re-parses. [`quote`] covers the
-//! one place a value must be embedded in a word — the `sh -s` argument list.
+//! one place a value is embedded in shell text at all: the `set --` list that
+//! [`crate::proc::Shell`] writes ahead of each script, which one known POSIX
+//! `sh` reads once, as one literal word per value.
 
 /// Single-quote a value so a POSIX shell reads it as exactly one literal word.
 ///
@@ -52,9 +54,10 @@ where
 }
 
 /// Wrap a command so it runs under the user's **login** shell. Used by
-/// [`crate::ssh::exec_args`] for every remote script run. `$SHELL` is
-/// double-quoted so a value containing a space stays one word, and expands on
-/// the remote side because the whole string travels as ssh's command.
+/// [`crate::ssh::shell_args`] to start the shell every remote script runs in.
+/// `$SHELL` is double-quoted so a value containing a space stays one word, and
+/// expands on the remote side because the whole string travels as ssh's
+/// command.
 pub fn login_shell_wrapper(inner: &str) -> String {
     format!(r#"exec "${{SHELL:-/bin/bash}}" -l -c {}"#, quote(inner))
 }
@@ -791,24 +794,40 @@ mod tests {
         assert!(!code_only(posix).contains(" ]]"));
     }
 
+    fn syntax_check(text: &[u8]) -> std::process::Output {
+        Command::new("/bin/sh")
+            .arg("-n")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                c.stdin.take().expect("stdin").write_all(text)?;
+                c.wait_with_output()
+            })
+            .expect("run sh -n")
+    }
+
+    /// As shipped, and as framed for the shell that runs it. The framed form
+    /// matters more: a syntax error in a script fed to a fresh `sh` fails that
+    /// one run, but in the shell every script shares it is the shell that
+    /// exits — dash gives up on a parse error at the top level — and nothing
+    /// after it runs.
     #[test]
     fn scripts_pass_shell_syntax_check() {
         for &(name, body) in SCRIPTS {
-            let out = Command::new("/bin/sh")
-                .arg("-n")
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .and_then(|mut c| {
-                    use std::io::Write;
-                    c.stdin.take().expect("stdin").write_all(body.as_bytes())?;
-                    c.wait_with_output()
-                })
-                .expect("run sh -n");
+            let out = syntax_check(body.as_bytes());
             assert!(
                 out.status.success(),
                 "{name} is not valid sh: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let framed = crate::proc::frame("NVMUX_MARK_secret_1", body, &["a", "it's"]);
+            let out = syntax_check(&framed);
+            assert!(
+                out.status.success(),
+                "{name} is not valid sh once framed for the shell: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
         }

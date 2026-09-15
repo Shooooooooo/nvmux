@@ -487,6 +487,59 @@ fn names_with_shell_metacharacters_survive_a_round_trip() {
     }
 }
 
+/// Every listing after the first runs in the shell the first one started.
+/// What a fresh shell and a kept one must agree on is the whole of the
+/// listing: names, ids, numbers, liveness — and the `list.sh` sweep in between
+/// must find nothing to sweep, or the tenth answer would differ from the first.
+#[test]
+fn ten_listings_on_one_transport_agree() {
+    require_nvim!();
+    let scratch = Scratch::new("tenfold");
+    let t = scratch.transport();
+    let a = t
+        .create_session("alpha", &common::launch(), common::anywhere())
+        .expect("create alpha");
+    let b = t
+        .create_session("beta", &common::launch(), common::anywhere())
+        .expect("create beta");
+
+    // Everything the picker draws and everything a switch resolves against.
+    let rows = |sessions: &[Session]| -> Vec<(String, String, u32, u32, Liveness)> {
+        sessions
+            .iter()
+            .map(|s| {
+                (
+                    s.id.clone(),
+                    s.name.clone(),
+                    s.pid,
+                    s.state.num,
+                    s.state.liveness,
+                )
+            })
+            .collect()
+    };
+    let first = rows(&t.list_sessions().expect("list"));
+    assert_eq!(first.len(), 2);
+    for i in 1..10 {
+        let again = rows(&t.list_sessions().expect("list"));
+        assert_eq!(again, first, "listing {i} differs from the first");
+    }
+
+    // A script that fails in that shell — a spawn of a program that is not
+    // there, which exits on its error path — changes nothing for the listing
+    // after it.
+    let hopeless = nvmux::launch::Launch::parse("nvmux-no-such-editor --listen {sock}")
+        .expect("a well-formed command naming a program that is not there");
+    assert!(t
+        .create_session("hopeless", &hopeless, common::anywhere())
+        .is_err());
+    assert_eq!(rows(&t.list_sessions().expect("list")), first);
+
+    t.kill_session(&a).expect("kill alpha");
+    t.kill_session(&b).expect("kill beta");
+    assert!(t.list_sessions().expect("list").is_empty());
+}
+
 /// Regression: a session busy in CPU-bound Lua must not be reaped.
 ///
 /// The original bug ran `nvim_get_api_info` under a 250ms budget and mapped the

@@ -25,7 +25,9 @@
 //! The thread is never joined. Dropping the [`Completer`] drops the sending end,
 //! which ends the worker's loop after its current listing returns — and a
 //! wedged ssh must not hang the prompt on the way out. What is left running
-//! holds a hostname, a path and a dead channel, and exits on its own.
+//! holds a shell on the host and a dead channel; the loop ends, the shell goes
+//! with it (its stdin closes, and it gets a moment to leave before it is
+//! killed), and the thread exits on its own.
 //!
 //! # Three properties, and what each one is for
 //!
@@ -51,7 +53,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
-use crate::dirs::{self, DirSource};
+use crate::dirs::{self, DirSource, Lister};
 use crate::transport::protocol::Listing;
 
 /// How many directories to remember. A path is a handful of components and a
@@ -119,7 +121,7 @@ impl Completer {
         // Not joined, and nothing waits on it: see the module docs.
         std::thread::Builder::new()
             .name("nvmux-complete".into())
-            .spawn(move || serve(&source, &ask_rx, &reply_tx))
+            .spawn(move || serve(source, &ask_rx, &reply_tx))
             // A thread that will not start is not worth failing a prompt over.
             // The sender is dropped with the closure, `ask` finds the channel
             // closed, and the field is simply one you type into unaided.
@@ -296,10 +298,15 @@ impl Completer {
 }
 
 /// The worker: one listing at a time, always the newest question asked.
-fn serve(source: &DirSource, rx: &Receiver<Request>, tx: &Sender<Reply>) {
+fn serve(source: DirSource, rx: &Receiver<Request>, tx: &Sender<Reply>) {
+    let mut lister = Lister::new(source);
+    // Brought up now, while the user is still typing the first characters,
+    // rather than by the first question — which over ssh would otherwise pay
+    // for a login shell on the host.
+    lister.warm();
     while let Ok(first) = rx.recv() {
         let request = newest(first, rx);
-        let listing = match source.children(&request.dir) {
+        let listing = match lister.children(&request.dir) {
             Ok(listing) => listing,
             // A host that cannot answer costs completions, not a session. The
             // empty listing is also the honest answer for the commonest cause:

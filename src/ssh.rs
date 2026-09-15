@@ -165,38 +165,48 @@ pub fn cancel_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<S
     forward_op("cancel", host, ctl, local, remote)
 }
 
-/// Arguments for running a script on the remote host, through a **login** shell:
+/// Arguments for starting the host's shell — the one `sh` that
+/// [`proc::Shell`] feeds every script nvmux runs there — through a **login**
+/// shell:
 ///
 /// ```text
-/// exec "${SHELL:-/bin/bash}" -l -c 'sh -s "$@"' nvmux <args...>
+/// ssh -T <host> exec "${SHELL:-/bin/bash}" -l -c 'exec sh -s' nvmux
 /// ```
 ///
 /// A login shell because `ssh host cmd` does not read `.zprofile`, so `nvim` is
 /// off `$PATH` on most real setups. `$SHELL` expands on the *remote* side —
 /// [`shell::login_shell_wrapper`] is the one place that spells this, so the
-/// tested form and the shipped form are the same string.
+/// tested form and the shipped form are the same string. It is paid once per
+/// host: the scripts, and their arguments, travel down this shell's stdin.
 ///
-/// `-n` must never be added: with `sh -s` it silently yields an *empty* result,
-/// because stdin comes from /dev/null and `sh` exits 0.
-pub fn exec_args(host: &str, ctl: &Path, script_args: &[&str]) -> Vec<String> {
-    exec_args_with(common(ctl), host, script_args)
+/// `-T`, because that stdin is the command stream: a host with `RequestTTY
+/// force` in its config would otherwise get a pty, and a pty echoes every
+/// script back into the output. `-n` must never be added: it puts `/dev/null`
+/// on stdin, and `sh -s` then reads nothing, prints nothing and exits 0 — an
+/// *empty* result, silently, rather than an error.
+pub fn shell_args(host: &str, ctl: &Path) -> Vec<String> {
+    shell_args_with(common(ctl), host)
 }
 
-/// The same command, with the options an unattended run needs — see
+/// The same command, with the options an unattended shell needs — see
 /// [`unattended`]. Identical in every other respect, so what runs on the host is
 /// the same program reached the same way.
-pub fn unattended_exec_args(host: &str, ctl: &Path, script_args: &[&str]) -> Vec<String> {
-    exec_args_with(unattended(ctl), host, script_args)
+pub fn unattended_shell_args(host: &str, ctl: &Path) -> Vec<String> {
+    shell_args_with(unattended(ctl), host)
 }
 
-fn exec_args_with(mut args: Vec<String>, host: &str, script_args: &[&str]) -> Vec<String> {
-    let remote = format!(
-        "{} nvmux {}",
-        shell::login_shell_wrapper(r#"sh -s "$@""#),
-        shell::quote_all(script_args)
-    );
-    args.extend([host.to_string(), remote]);
+fn shell_args_with(mut args: Vec<String>, host: &str) -> Vec<String> {
+    args.push("-T".into());
+    args.extend([host.to_string(), remote_shell_command()]);
     args
+}
+
+/// What the login shell is told to run. `exec`, so the login shell is gone once
+/// `sh` is up: nothing of its own — a `.bash_logout`, say — runs when the stream
+/// closes, and nothing of it sits between ssh and the shell. `nvmux` is that
+/// login shell's `$0`, which is how it shows up in a process listing.
+fn remote_shell_command() -> String {
+    format!("{} nvmux", shell::login_shell_wrapper("exec sh -s"))
 }
 
 /// Turn an ssh failure into something a caller can act on. ssh reports almost
@@ -367,29 +377,28 @@ impl Ssh {
         let _ = std::fs::remove_file(local);
     }
 
-    /// The script goes over stdin, never interpolated into the command line.
-    pub fn run_script(&self, script: &str, args: &[&str]) -> Result<proc::Output, SshError> {
-        self.exec(exec_args(&self.host, &self.control_path, args), script)
+    /// Start this host's shell. Every script goes down its stdin from then on,
+    /// never interpolated into a command line — see [`shell_args`].
+    ///
+    /// Returns once `ssh` exists, not once the host has answered: the shell's
+    /// first run reads the handshake, so a host that turns out to be
+    /// unreachable is reported by that run, classified from ssh's stderr.
+    pub fn start_shell(&self) -> Result<proc::Shell, SshError> {
+        self.start(shell_args(&self.host, &self.control_path))
     }
 
-    /// The same, for a script nvmux is running on its own account: it never
-    /// prompts and it gives up on an unreachable host. See [`unattended`].
-    pub fn run_script_unattended(
-        &self,
-        script: &str,
-        args: &[&str],
-    ) -> Result<proc::Output, SshError> {
-        self.exec(
-            unattended_exec_args(&self.host, &self.control_path, args),
-            script,
-        )
+    /// The same, for scripts nvmux runs on its own account: this shell never
+    /// prompts and gives up on an unreachable host. See [`unattended`].
+    pub fn start_unattended_shell(&self) -> Result<proc::Shell, SshError> {
+        self.start(unattended_shell_args(&self.host, &self.control_path))
     }
 
-    fn exec(&self, argv: Vec<String>, script: &str) -> Result<proc::Output, SshError> {
-        tracing::debug!(args = ?argv, "ssh exec");
+    fn start(&self, argv: Vec<String>) -> Result<proc::Shell, SshError> {
+        tracing::debug!(args = ?argv, "ssh shell");
         let mut cmd = Command::new("ssh");
         cmd.args(&argv);
-        proc::run_feeding_stdin(&mut cmd, script).map_err(|e| spawn_error(e, &self.host))
+        proc::Shell::start(&mut cmd, format!("ssh {}", self.host))
+            .map_err(|e| spawn_error(e, &self.host))
     }
 }
 
@@ -437,24 +446,25 @@ mod tests {
         args.join(" ")
     }
 
-    /// The one difference between a command the user asked for and a listing
-    /// nvmux asked for on its own account. Getting this backwards either way is
-    /// bad: `BatchMode` on the interactive path breaks every key that needs a
-    /// passphrase or a touch, and its absence on the completion path leaves a
-    /// worker thread sitting on a prompt no one can see, let alone answer.
+    /// The one difference between the shell the user's own commands run in and
+    /// the one that answers questions nvmux asked on its own account. Getting
+    /// this backwards either way is bad: `BatchMode` on the interactive path
+    /// breaks every key that needs a passphrase or a touch, and its absence on
+    /// the completion path leaves a worker thread sitting on a prompt no one
+    /// can see, let alone answer.
     #[test]
-    fn only_an_unattended_run_refuses_to_prompt() {
-        let interactive = exec_args("myhost", Path::new(CTL), &["/tmp/nvmux-0"]);
+    fn only_an_unattended_shell_refuses_to_prompt() {
+        let interactive = shell_args("myhost", Path::new(CTL));
         assert!(
             !interactive.iter().any(|a| a.contains("BatchMode")),
-            "a command the user asked for must still be able to prompt: {interactive:?}"
+            "the shell the user's commands run in must still be able to prompt: {interactive:?}"
         );
         assert!(!interactive.iter().any(|a| a.contains("ConnectTimeout")));
 
-        let unattended = unattended_exec_args("myhost", Path::new(CTL), &["/tmp/nvmux-0"]);
+        let unattended = unattended_shell_args("myhost", Path::new(CTL));
         assert!(
             unattended.iter().any(|a| a == "BatchMode=yes"),
-            "a listing nobody is watching must never prompt: {unattended:?}"
+            "a shell nobody is watching must never prompt: {unattended:?}"
         );
         assert!(
             unattended
@@ -470,8 +480,8 @@ mod tests {
     /// in the field.
     #[test]
     fn the_two_option_sets_differ_in_nothing_but_the_options() {
-        let interactive = exec_args("myhost", Path::new(CTL), &["a", "b"]);
-        let unattended = unattended_exec_args("myhost", Path::new(CTL), &["a", "b"]);
+        let interactive = shell_args("myhost", Path::new(CTL));
+        let unattended = unattended_shell_args("myhost", Path::new(CTL));
         assert_eq!(
             interactive.last(),
             unattended.last(),
@@ -544,7 +554,7 @@ mod tests {
 
     #[test]
     fn the_remote_command_runs_through_a_login_shell() {
-        let args = exec_args("myhost", Path::new(CTL), &["/tmp/nvmux-0", "abcdefgh"]);
+        let args = shell_args("myhost", Path::new(CTL));
         let remote = args.last().expect("remote command");
         assert!(
             remote.contains("${SHELL:-/bin/bash}"),
@@ -552,9 +562,10 @@ mod tests {
         );
         assert!(remote.contains(" -l -c "), "not a login shell: {remote}");
         assert!(
-            remote.contains("sh -s"),
-            "script must arrive on stdin: {remote}"
+            remote.contains("exec sh -s"),
+            "scripts must arrive on stdin, with the login shell out of the way: {remote}"
         );
+        assert!(remote.ends_with(" nvmux"), "the login shell's $0: {remote}");
         // $SHELL must expand remotely, so it must not be single-quoted — but it
         // must be double-quoted, or a value with a space word-splits there.
         assert!(!remote.contains("'${SHELL"), "SHELL was quoted: {remote}");
@@ -564,41 +575,60 @@ mod tests {
         );
     }
 
-    /// `-n` plus `sh -s` silently yields an empty result rather than an error.
+    /// The command line carries nothing that varies per script: scripts and
+    /// their arguments go down the shell's stdin, so there is no second shell
+    /// layer for a value to be re-parsed by.
     #[test]
-    fn the_exec_form_never_passes_dash_n() {
-        let args = exec_args("myhost", Path::new(CTL), &["a"]);
+    fn the_command_line_carries_no_script_and_no_arguments() {
+        let a = shell_args("myhost", Path::new(CTL));
+        assert_eq!(a, shell_args("myhost", Path::new(CTL)));
         assert!(
-            !args.iter().any(|a| a == "-n"),
-            "-n would empty the script: {args:?}"
+            !joined(&a).contains("\"$@\""),
+            "arguments on the command line: {a:?}"
         );
     }
 
+    /// `-n` plus `sh -s` silently yields an empty result rather than an error,
+    /// and a pty would echo every script back into its own output.
+    #[test]
+    fn the_shell_is_started_without_dash_n_and_without_a_tty() {
+        let args = shell_args("myhost", Path::new(CTL));
+        assert!(
+            !args.iter().any(|a| a == "-n"),
+            "-n would empty every script: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "-T"),
+            "a forced tty would echo the scripts: {args:?}"
+        );
+        let args = unattended_shell_args("myhost", Path::new(CTL));
+        assert!(!args.iter().any(|a| a == "-n"));
+        assert!(args.iter().any(|a| a == "-T"));
+    }
+
+    /// The whole chain, locally: the command ssh would hand the remote login
+    /// shell, run by a shell here, with scripts and arguments fed to it exactly
+    /// as the transport feeds them.
     #[test]
     fn script_arguments_survive_shell_metacharacters() {
-        use std::process::Command;
-        // Emulate what the remote shell does with the command ssh hands it.
-        let args = exec_args("h", Path::new(CTL), &["my project", "it's", "$(id)"]);
+        let args = shell_args("h", Path::new(CTL));
         let remote = args.last().expect("remote").clone();
-        let out = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(remote.replace("exec ", ""))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .and_then(|mut c| {
-                use std::io::Write;
-                c.stdin
-                    .take()
-                    .expect("stdin")
-                    .write_all(br#"printf '[%s]' "$1" "$2" "$3""#)?;
-                c.wait_with_output()
-            })
-            .expect("run");
+        // What sshd does with the command: hand it to a shell. Minus the
+        // `exec`s, so the login shell and `sh` are this test's children rather
+        // than its replacements.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(remote.replace("exec ", ""));
+        let mut shell = proc::Shell::start(&mut cmd, "as sshd would").expect("start");
+        let out = shell
+            .run(
+                r#"printf '[%s]' "$1" "$2" "$3""#,
+                &["my project", "it's", "$(id)"],
+            )
+            .expect("the shell is alive");
         assert_eq!(
-            String::from_utf8_lossy(&out.stdout),
-            "[my project][it's][$(id)]",
-            "arguments were mangled or evaluated"
+            out.stdout, "[my project][it's][$(id)]",
+            "arguments were mangled or evaluated (stderr: {})",
+            out.stderr
         );
     }
 

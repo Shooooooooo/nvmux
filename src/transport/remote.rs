@@ -2,24 +2,25 @@
 //!
 //! Spawning, listing and killing are shared with the local transport — the same
 //! scripts from [`crate::shell`], the same parsing in
-//! [`crate::transport::protocol`]. Only two things differ: how a script gets
-//! run, and how a session's socket becomes reachable from this machine. The
-//! first is [`Ssh::run_script`] here against [`crate::proc::run_local`] there;
-//! the second is [`Transport::local_socket_for`], which is the seam that makes
-//! everything downstream identical in both cases.
+//! [`crate::transport::protocol`], and the same [`crate::proc::Shell`] they run
+//! in. Only two things differ: what starts that shell — [`Ssh::start_shell`]
+//! here, `/bin/sh` there — and how a session's socket becomes reachable from
+//! this machine. The second is [`Transport::local_socket_for`], which is the
+//! seam that makes everything downstream identical in both cases.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, TryLockError};
 
 use crate::error::{NvimError, NvmuxError, Result, SessionError, SshError};
 use crate::ids;
 use crate::launch::Launch;
 use crate::nvim;
 use crate::paths;
+use crate::proc::{Output, Shell};
 use crate::session::{Liveness, Session};
 use crate::shell;
-use crate::ssh::Ssh;
+use crate::ssh::{classify, Ssh};
 use crate::transport::{
     finish_listing, install_detach_alias, kill_outcome, opt_pid_arg, pid_arg, plan_create,
     plan_rename, protocol, wait_until_reachable, Location, Transport, REACHABLE_TIMEOUT,
@@ -28,6 +29,10 @@ use crate::transport::{
 pub struct SshTransport {
     location: Location,
     ssh: Ssh,
+    /// The shell on the host, over the master. Started once by [`Self::new`],
+    /// with the login shell that costs, and replaced by [`Self::run_script`]
+    /// if it dies — which it does with the master it rides on.
+    shell: Mutex<Option<Shell>>,
     /// Short, stable, filename-safe token for this host. Namespaces the local
     /// end of every forward and the ControlPath, so two hosts holding sessions
     /// with the same id cannot collide on one local path.
@@ -76,9 +81,11 @@ impl SshTransport {
 
         let ssh = Ssh::new(host.clone(), control_path);
         ssh.ensure_master()?;
+        let mut shell = ssh.start_shell()?;
 
         // One round trip for the runtime directory, the remote Neovim version
-        // *and* the sessions the picker is about to draw.
+        // *and* the sessions the picker is about to draw — the shell's first,
+        // so it also absorbs whatever the login shell prints on the way up.
         //
         // Which means the listing now happens before the version gate below,
         // rather than after it: a host nvmux is about to refuse has its runtime
@@ -86,7 +93,7 @@ impl SshTransport {
         // `list.sh` removes a socket nothing serves and metadata with no socket
         // — so the sweep is the one it would have done on the next successful
         // run anyway.
-        let out = checked_script(&ssh, shell::HELLO_SCRIPT, &[])?;
+        let out = checked_script(&host, &mut shell, shell::HELLO_SCRIPT, &[])?;
         let probe = protocol::parse_probe(&out.stdout)?;
 
         if probe.nvim_banner.is_empty() {
@@ -115,6 +122,7 @@ impl SshTransport {
         Ok(Self {
             location: Location::Ssh(host),
             ssh,
+            shell: Mutex::new(Some(shell)),
             host_token,
             local_dir,
             remote_dir: probe.runtime_dir,
@@ -188,36 +196,82 @@ impl SshTransport {
         }
     }
 
-    /// Run one of the shared scripts on the remote host.
+    /// Run one of the shared scripts on the remote host, in its shell.
     ///
     /// A dead master is reported as such rather than as a mysterious failure,
-    /// because it is the one condition the user can do something about.
-    fn run_script(&self, script: &str, args: &[&str]) -> Result<crate::proc::Output> {
-        let out = checked_script(&self.ssh, script, args).map_err(|err| {
-            if matches!(err, SshError::NoMaster(_) | SshError::MasterDied(_)) {
-                // Report it, drop the forwards we believed in, and let the
-                // caller fall back to the picker.
-                self.forwarded.lock().map(|mut f| f.clear()).ok();
+    /// because it is the one condition the user can do something about. A
+    /// shell found dead is replaced *before* a run and never after one — a
+    /// script that was half way through must not run twice — and the master
+    /// it rode on is checked first, or the replacement would die the same way.
+    fn run_script(&self, script: &str, args: &[&str]) -> Result<Output> {
+        let mut slot = match self.shell.try_lock() {
+            Ok(slot) => slot,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            // No transport method calls another while running a script, so
+            // this is a bug being reported rather than a wait being refused.
+            Err(TryLockError::WouldBlock) => {
+                return Err(NvmuxError::Io(std::io::Error::other(
+                    "the shell is already running a script",
+                )));
             }
-            err
-        })?;
-        Ok(out)
+        };
+        if slot.as_mut().is_none_or(|shell| !shell.is_alive()) {
+            *slot = None;
+            self.reconnect_if_needed()?;
+            *slot = Some(self.ssh.start_shell()?);
+        }
+        let shell = slot.as_mut().expect("just started");
+        match checked_script(self.host(), shell, script, args) {
+            Ok(out) => Ok(out),
+            Err(err) => {
+                // A shell that died is dropped now; one that merely ran a
+                // script that failed is kept.
+                if slot.as_mut().is_some_and(|shell| !shell.is_alive()) {
+                    *slot = None;
+                }
+                if matches!(err, SshError::NoMaster(_) | SshError::MasterDied(_)) {
+                    // Report it, drop the forwards we believed in, and let the
+                    // caller fall back to the picker.
+                    self.forwarded.lock().map(|mut f| f.clear()).ok();
+                }
+                Err(err.into())
+            }
+        }
+    }
+
+    /// Bring the master back if it died while nobody was using it, and forget
+    /// the forwards that died with it.
+    ///
+    /// Checking first turns "the connection died while you were in the picker"
+    /// into a sentence rather than a forwarding failure.
+    fn reconnect_if_needed(&self) -> Result<()> {
+        if !self.ssh.is_master_alive() {
+            self.forwarded.lock().map(|mut f| f.clear()).ok();
+            self.ssh.ensure_master()?;
+        }
+        Ok(())
     }
 }
 
 /// Run a script and insist it actually ran.
 ///
 /// A nonzero exit with nothing on stdout is ssh itself failing, not the script
-/// reporting something: the script would have printed its terminator. Used by
+/// reporting something: the script would have printed its terminator. A shell
+/// that died mid-run is the same failure told a different way — ssh's own exit
+/// status and last words — and is classified from them just the same. Used by
 /// `SshTransport::new` too, before there is a `self` to call the method on.
 fn checked_script(
-    ssh: &Ssh,
+    host: &str,
+    shell: &mut Shell,
     script: &str,
     args: &[&str],
-) -> std::result::Result<crate::proc::Output, SshError> {
-    let out = ssh.run_script(script, args)?;
+) -> std::result::Result<Output, SshError> {
+    let out = match shell.run(script, args) {
+        Ok(out) => out,
+        Err(died) => return Err(classify(host, died.status, &died.stderr)),
+    };
     if !out.ok() && out.stdout.trim().is_empty() {
-        return Err(crate::ssh::classify(ssh.host(), out.status, &out.stderr));
+        return Err(classify(host, out.status, &out.stderr));
     }
     Ok(out)
 }
@@ -275,7 +329,8 @@ impl Transport for SshTransport {
         self.local_sock(&id)?;
 
         // The *remote* socket: the command runs over there. Every word travels
-        // as its own argument, quoted by `ssh::exec_args` for both shell layers.
+        // as its own argument, quoted once by the shell runner for the one
+        // `sh` that reads it.
         let argv = launch.argv_for(&remote_sock.to_string_lossy());
         let mut args: Vec<&str> = vec![&self.remote_dir, &id, directory];
         args.extend(argv.iter().map(String::as_str));
@@ -405,12 +460,7 @@ impl Transport for SshTransport {
             return Ok(local);
         }
 
-        // Checking first turns "the connection died while you were in the
-        // picker" into a sentence rather than a forwarding failure.
-        if !self.ssh.is_master_alive() {
-            self.forwarded.lock().map(|mut f| f.clear()).ok();
-            self.ssh.ensure_master()?;
-        }
+        self.reconnect_if_needed()?;
 
         self.ssh.forward(&local, &remote)?;
         self.forwarded
@@ -418,5 +468,67 @@ impl Transport for SshTransport {
             .map(|mut f| f.insert(s.id.clone()))
             .ok();
         Ok(local)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proc;
+
+    /// A shell here standing in for one over there: what `checked_script` does
+    /// with a run does not depend on what started the shell.
+    fn sh() -> Shell {
+        Shell::start(&mut proc::sh_command(), "/bin/sh").expect("start /bin/sh")
+    }
+
+    /// The rule the function exists for: a script that said nothing and
+    /// failed is not a script result, it is ssh failing to run one.
+    #[test]
+    fn a_silent_failure_is_classified_rather_than_returned() {
+        let mut shell = sh();
+        match checked_script("h", &mut shell, "exit 1", &[]) {
+            Err(SshError::Failed { code, stderr }) => {
+                assert_eq!(code, 1);
+                assert_eq!(stderr, "");
+            }
+            other => panic!("expected a classified failure, got {other:?}"),
+        }
+        // The shell is fine; only the script failed.
+        let out = checked_script("h", &mut shell, "printf still", &[]).expect("runs");
+        assert_eq!(out.stdout, "still");
+    }
+
+    /// A script that reported something and then failed is a script result,
+    /// however it ended: its caller reads the stdout, as the kill path does.
+    #[test]
+    fn a_failure_with_output_is_the_scripts_to_report() {
+        let mut shell = sh();
+        let out = checked_script("h", &mut shell, "printf said; exit 1", &[]).expect("a result");
+        assert_eq!(out.stdout, "said");
+        assert_eq!(out.status, 1);
+    }
+
+    /// The shell going away mid-run reads as ssh's own exit: a signal is `-1`,
+    /// as a one-shot `Output` reported it, and the words on stderr decide.
+    #[test]
+    fn a_shell_that_dies_mid_run_is_classified_from_its_last_words() {
+        let mut shell = sh();
+        // `$$` is the shell's own pid in a subshell too.
+        match checked_script("h", &mut shell, "kill -KILL $$", &[]) {
+            Err(SshError::Failed { code, .. }) => assert_eq!(code, -1),
+            other => panic!("expected a classified death, got {other:?}"),
+        }
+        assert!(!shell.is_alive());
+
+        let mut shell = sh();
+        let err = checked_script(
+            "h",
+            &mut shell,
+            "printf 'Permission denied (publickey).\\n' >&2; kill -KILL $$",
+            &[],
+        )
+        .expect_err("died");
+        assert!(matches!(err, SshError::AuthFailed(_)), "{err:?}");
     }
 }
