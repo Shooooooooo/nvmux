@@ -119,6 +119,13 @@ pub struct Attachment {
     child: Box<dyn Child + Send + Sync>,
     master: Box<dyn MasterPty>,
     writer: Box<dyn Write + Send>,
+    /// The connection the attach probe made, kept for the questions asked of
+    /// the server later — the repaint that takes the attach notice off the
+    /// screen, and a resume's — so each of those skips the connect, which
+    /// over an SSH forward is a round trip of its own. `None` once it has
+    /// failed; the next question connects afresh and, if that works, keeps
+    /// that one instead.
+    rpc: Option<rpc::Client<std::os::unix::net::UnixStream>>,
     /// True once the child has been through a full relay, so a resume knows it
     /// must force a repaint.
     resumed: bool,
@@ -466,11 +473,16 @@ fn spawn_with(
     // The round trips to the session — over ssh, through the forward — while
     // the client makes its own.
     let t_probe = std::time::Instant::now();
-    if let Err(e) = probe(session_id, sock) {
-        // Explicitly, so the retirement is not left to a binding: the client
-        // must be gone, and its pty with it, before the error is shown.
-        drop(attachment);
-        return Err(e);
+    let mut attachment = attachment;
+    match probe(session_id, sock) {
+        Ok(client) => attachment.rpc = Some(client),
+        Err(e) => {
+            // Explicitly, so the retirement is not left to a binding: the
+            // client must be gone, and its pty with it, before the error is
+            // shown.
+            drop(attachment);
+            return Err(e);
+        }
     }
     tracing::debug!(
         ms = t_probe.elapsed().as_secs_f64() * 1000.0,
@@ -480,6 +492,7 @@ fn spawn_with(
 }
 
 /// Ask the server whether it can take a client, and make it ready for one.
+/// Returns the connection it asked over, which the attachment keeps.
 ///
 /// The `get_mode` here is the reachability check, and the only one. It is a
 /// fast call but still a full request/response round trip, so an answer
@@ -496,7 +509,7 @@ fn spawn_with(
 /// any other call, which is why `rpc::probe` asks both — so this is not a
 /// claim that the two are interchangeable. What it cost was a round trip on
 /// every attach, forwarded over SSH.
-fn probe(session_id: &str, sock: &Path) -> Result<()> {
+fn probe(session_id: &str, sock: &Path) -> Result<rpc::Client<std::os::unix::net::UnixStream>> {
     let mut client = rpc::Client::connect(sock, rpc::PROBE_TIMEOUT)?;
     // Both requests go out together: one round trip for the pair rather than
     // one each, which over a forward is a third of what the probe costs. The
@@ -546,7 +559,7 @@ fn probe(session_id: &str, sock: &Path) -> Result<()> {
             },
         ));
     }
-    Ok(())
+    Ok(client)
 }
 
 /// Open a pty and start the client on it.
@@ -585,6 +598,7 @@ fn spawn_client(
         child,
         master: pair.master,
         writer,
+        rpc: None,
         resumed: false,
         reaped: false,
     })
@@ -623,7 +637,7 @@ pub fn relay(
     // picker has since drawn over.
     if attachment.resumed {
         discard_pending(master_fd);
-        repaint(attachment.master.as_ref(), &attachment.sock, EndPrompt::Yes);
+        repaint(&mut attachment, EndPrompt::Yes);
     }
     attachment.resumed = true;
 
@@ -816,7 +830,7 @@ fn pump(
                     // reason: the cells the box covered are the server's, and
                     // only the server can say what was under them. Not the same
                     // licence, though — see [`EndPrompt`].
-                    repaint(attachment.master.as_ref(), &attachment.sock, EndPrompt::No);
+                    repaint(attachment, EndPrompt::No);
                     tracing::debug!(
                         ms = t_erase.elapsed().as_secs_f64() * 1000.0,
                         "timing: attach notice erase (:mode repaint)"
@@ -1108,11 +1122,11 @@ fn asks_for_device_attributes(chunk: &[u8]) -> bool {
 /// where the client learns its size from. A no-op when nothing changed, and
 /// a resize the client acts on when it did — one more repaint in that case,
 /// which is rare enough not to matter.
-fn repaint(master: &dyn MasterPty, sock: &Path, prompt: EndPrompt) {
+fn repaint(attachment: &mut Attachment, prompt: EndPrompt) {
     let size = term::terminal_size();
-    let _ = master.resize(size);
-    if !repaint_through_server(sock, prompt) {
-        nudge(master, size);
+    let _ = attachment.master.resize(size);
+    if !repaint_through_server(&mut attachment.rpc, &attachment.sock, prompt) {
+        nudge(attachment.master.as_ref(), size);
     }
 }
 
@@ -1185,21 +1199,69 @@ const RESUME_TIMEOUT: Duration = Duration::from_secs(1);
 /// attached UI; `:messages` keeps it. The reply is waited for so the relay
 /// does not start over a repaint in flight; a reply that is late rather than
 /// missing still repaints, a moment after the nudge that stands in for it.
-fn repaint_through_server(sock: &Path, prompt: EndPrompt) -> bool {
-    let mut client = match rpc::Client::connect(sock, RESUME_TIMEOUT) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::debug!(error = %e, "resume: could not reach the server");
-            return false;
+///
+/// Asked over the attachment's kept connection where there is one — the
+/// probe's, or a previous repaint's — which saves the connect; over a forward,
+/// a round trip. A kept connection the server has since closed fails its first
+/// call with a reset, and that is the one failure retried here, on a fresh
+/// connection: a server that has gone fails that one too, and a server that
+/// is merely busy answers neither, so a timeout is not retried.
+fn repaint_through_server(
+    kept: &mut Option<rpc::Client<std::os::unix::net::UnixStream>>,
+    sock: &Path,
+    prompt: EndPrompt,
+) -> bool {
+    let mut client = match kept.take() {
+        Some(mut c) => {
+            let _ = c.set_read_timeout(RESUME_TIMEOUT);
+            c
         }
+        None => match rpc::Client::connect(sock, RESUME_TIMEOUT) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(error = %e, "resume: could not reach the server");
+                return false;
+            }
+        },
     };
     let mode = match client.get_mode() {
         Ok(m) => m,
+        Err(crate::error::RpcError::Reset) => {
+            tracing::debug!("resume: the kept connection was closed; connecting again");
+            match rpc::Client::connect(sock, RESUME_TIMEOUT) {
+                Ok(c) => client = c,
+                Err(e) => {
+                    tracing::debug!(error = %e, "resume: could not reach the server");
+                    return false;
+                }
+            }
+            match client.get_mode() {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::debug!(error = %e, "resume: the server is busy; nudge only");
+                    return false;
+                }
+            }
+        }
         Err(e) => {
             tracing::debug!(error = %e, "resume: the server is busy; nudge only");
             return false;
         }
     };
+    // Whatever the questions below decide, the connection has answered one
+    // and is worth keeping for the next.
+    let painted = repaint_with(&mut client, mode, prompt);
+    *kept = Some(client);
+    painted
+}
+
+/// The rest of [`repaint_through_server`], once the server has said what mode
+/// it is in over a connection that works.
+fn repaint_with(
+    client: &mut rpc::Client<std::os::unix::net::UnixStream>,
+    mode: rpc::Mode,
+    prompt: EndPrompt,
+) -> bool {
     if mode.blocking && !(mode.at_hit_enter() && prompt == EndPrompt::Yes) {
         tracing::debug!(
             mode = %mode.mode,
@@ -1270,6 +1332,7 @@ mod tests {
             child,
             master: pair.master,
             writer,
+            rpc: None,
             resumed: false,
             reaped: false,
         }
@@ -1540,7 +1603,7 @@ mod tests {
         ] {
             let sock = temp_sock(tag);
             let server = recording_server(&sock, "r", true);
-            let repainted = repaint_through_server(&sock, prompt);
+            let repainted = repaint_through_server(&mut None, &sock, prompt);
             assert_eq!(
                 repainted,
                 prompt == EndPrompt::Yes,
@@ -1652,6 +1715,37 @@ mod tests {
             );
             let _ = std::fs::remove_file(&sock);
         }
+    }
+
+    /// The attach notice's repaint asks over the connection the probe made:
+    /// one connection, four questions. The server here accepts exactly one
+    /// connection, so a repaint that connected afresh would find nobody and
+    /// fall back to the nudge — which is what the `true` rules out.
+    #[test]
+    fn the_repaint_asks_over_the_probes_connection() {
+        let sock = temp_sock("kept");
+        let server = recording_server(&sock, "n", false);
+        let mut attached = spawn_with("kept", &sock, "1  kept", standin_client("kept"))
+            .expect("a passed probe is an attachment");
+        assert!(attached.rpc.is_some(), "the probe's connection is kept");
+        let sock_path = attached.sock.clone();
+        assert!(
+            repaint_through_server(&mut attached.rpc, &sock_path, EndPrompt::No),
+            "the repaint must have gone through the kept connection"
+        );
+        assert!(attached.rpc.is_some(), "and the connection is kept again");
+        drop(attached);
+        assert_eq!(
+            server.join().expect("the server thread"),
+            [
+                "nvim_get_mode",
+                "nvim_list_uis",
+                "nvim_get_mode",
+                "nvim_command"
+            ],
+            "not one connection, or not the expected questions on it"
+        );
+        let _ = std::fs::remove_file(&sock);
     }
 
     /// The count the probe reads may or may not include the client started

@@ -123,6 +123,19 @@ impl Client<UnixStream> {
     }
 }
 
+impl Client<UnixStream> {
+    /// Change the budget each reply gets, for a connection kept past the call
+    /// it was made for: a probe's three seconds are right for a probe, and a
+    /// resume wants the one second it would have asked for itself.
+    pub fn set_read_timeout(&mut self, read_timeout: Duration) -> Result<(), RpcError> {
+        let stream = self.io.get_ref();
+        stream.set_read_timeout(Some(read_timeout))?;
+        stream.set_write_timeout(Some(read_timeout))?;
+        self.read_timeout = read_timeout;
+        Ok(())
+    }
+}
+
 impl<S: Read + Write> Client<S> {
     pub fn new(stream: S) -> Self {
         Self {
