@@ -244,8 +244,34 @@ impl SshTransport {
     ///
     /// Checking first turns "the connection died while you were in the picker"
     /// into a sentence rather than a forwarding failure.
+    ///
+    /// The shell rides on the master, so a shell that is still there is a
+    /// master that is — and asking the shell is a zero-timeout poll on a pipe,
+    /// where `ssh -O check` is a fork per attach. Neither notices a master
+    /// whose connection is wedged rather than gone; that is what the master's
+    /// own `ServerAlive` options are for. Only without a shell to ask, or with
+    /// one found dead, is ssh asked — and a dead shell is dropped here, so the
+    /// next script starts a fresh one over whatever master this leaves.
     fn reconnect_if_needed(&self) -> Result<()> {
-        if !self.ssh.is_master_alive() {
+        // A slot that is locked has a script running in it, which is as alive
+        // as a shell gets.
+        let shell_alive = match self.shell.try_lock() {
+            Ok(mut slot) => match slot.as_mut().map(|shell| shell.is_alive()) {
+                Some(true) => Some(true),
+                Some(false) => {
+                    *slot = None;
+                    Some(false)
+                }
+                None => None,
+            },
+            Err(TryLockError::WouldBlock) => Some(true),
+            Err(TryLockError::Poisoned(_)) => None,
+        };
+        let master_alive = match shell_alive {
+            Some(alive) => alive,
+            None => self.ssh.is_master_alive(),
+        };
+        if !master_alive {
             self.forwarded.lock().map(|mut f| f.clear()).ok();
             self.ssh.ensure_master()?;
         }
