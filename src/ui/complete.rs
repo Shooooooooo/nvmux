@@ -610,6 +610,20 @@ mod tests {
         assert_eq!(c.matches(""), ["b", "a", "c"], "not re-sorted");
     }
 
+    /// The other half of that claim, and the one the prompt leans on: a lone
+    /// `/` is a question about the root, not a path with no directory in it. It
+    /// is what an emptied working directory field reaches the root by, so the
+    /// route is pinned here rather than left to follow from `dirs::split`.
+    #[test]
+    fn a_lone_slash_asks_about_the_root() {
+        let (mut c, ask_rx, reply_tx) = detached();
+        c.ask("/");
+        assert_eq!(asked(&ask_rx), ["/"], "the root, not nothing to list");
+
+        answer(&mut c, &ask_rx, &reply_tx, listing(&["etc", "usr", "var"]));
+        assert_eq!(c.matches(""), ["etc", "usr", "var"]);
+    }
+
     /// A home directory is mostly dotted and none of it is what anyone is
     /// looking for. The rule used to come free from the shell's globbing; it is
     /// spelled out here because there is no glob left to carry it.

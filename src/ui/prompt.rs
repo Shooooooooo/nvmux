@@ -96,6 +96,12 @@
 //! makes one key enough to walk down a tree: `Tab`, choose, `Tab`, `Tab`, choose,
 //! `Tab` — and the `/` is never typed by hand.
 //!
+//! An emptied field is that pairing seen from the other end. Backspace the path
+//! to nothing and home comes back dimmed, because it is still what enter would
+//! submit; `Tab` writes it into the field rather than reaching past it to list
+//! what is inside, and the `Tab` after that opens the menu on it. So the one key
+//! the hint row offers here always acts on the text in front of you.
+//!
 //! Stepping in is remembered from the accept rather than read off the path, and
 //! deliberately: a directory whose name is also a prefix of its siblings — `pro`
 //! beside `projects` — must not be stepped into merely because it exists. Only
@@ -105,13 +111,15 @@
 //!
 //! The directory field opens *at* the home directory: the path is really there,
 //! as ordinary editable text, so `Tab` lists what is inside it before anything is
-//! typed. It is not an anchor — backspace eats it like any other text.
+//! typed. It is not an anchor — backspace eats it like any other text, and
+//! clearing it is not a one-way door: `Tab` puts it back.
 //!
 //! To go somewhere else, type `//`. Everything up to and including the last one
 //! is discarded, so `/home/shu//etc` is `/etc`. Since the pre-filled path already
 //! ends in a slash, typing one as your first keystroke makes the `//` and means
 //! "from the root" — which is the whole of what the old first-keystroke special
-//! case used to arrange by hand.
+//! case used to arrange by hand. A field cleared to nothing has no path left to
+//! discard, so there a single `/` is already the root and lists it.
 //!
 //! The discarded half draws dim, and that is the only thing dim means on this
 //! line: grey is the part that no longer decides where the session starts. An
@@ -278,10 +286,22 @@ impl Field {
         self.cursor = self.len();
     }
 
+    /// Is the dim default sitting in this field's columns — the state `→`,
+    /// `End`, and in the working directory `Tab`, take it out of?
+    ///
+    /// `field_line` draws the placeholder on exactly this, so what those keys
+    /// act on is what you are looking at. A field with nothing to show is not in
+    /// it: a host that could not say where home is leaves the working
+    /// directory's default empty — see [`default_directory`] — and there is
+    /// nothing there to take.
+    fn showing_default(&self) -> bool {
+        self.input.is_empty() && !self.default.is_empty()
+    }
+
     /// Take the placeholder into the field so it can be edited. Only ever from
     /// an empty field: with anything typed there is a cursor to move instead.
     fn adopt_default(&mut self) -> bool {
-        if !self.input.is_empty() {
+        if !self.showing_default() {
             return false;
         }
         self.input.clone_from(&self.default);
@@ -537,6 +557,13 @@ impl Prompt {
             Key::Tab if self.completes() => {
                 if choosing {
                     self.accept();
+                } else if self.fields[DIRECTORY].adopt_default() {
+                    // The dim path is a real answer, not decoration: an emptied
+                    // field gets it back before it is offered what is inside it.
+                    // The next `Tab` opens the menu on it — the same pairing an
+                    // accept already has, write the name and then step into it,
+                    // seen from the other end.
+                    self.stayed_put();
                 } else {
                     self.open_menu();
                 }
@@ -2043,14 +2070,94 @@ mod tests {
             for _ in 0..focus {
                 pressed.on_key(Key::Down);
             }
+            let before = pressed.fields[focus].input.clone();
             pressed.on_key(Key::Tab);
-            let did_something = pressed.choosing();
+            // Opening the menu or taking the dim default in: both are `Tab`
+            // answering, and an emptied working directory gets the second.
+            let did_something = pressed.choosing() || pressed.fields[focus].input != before;
 
             assert_eq!(
                 advertised, did_something,
                 "field {focus}: the row says {advertised} and the key does \
                  {did_something}"
             );
+        }
+    }
+
+    /// The state this field could not be got out of: backspace the path away
+    /// and home comes back dimmed, and the one key the hint row offers used to
+    /// reach straight past it — listing its children under a field that still
+    /// looked empty. It takes the path first now.
+    #[test]
+    fn tab_takes_the_home_path_back_into_an_emptied_field() {
+        let mut p = prompt();
+        press(&mut p, &[Key::Down, Key::Down]);
+        assert_eq!(p.focus, DIRECTORY);
+        for _ in 0..p.fields[DIRECTORY].len() {
+            p.on_key(Key::Backspace);
+        }
+        assert!(p.fields[DIRECTORY].input.is_empty(), "cleared to nothing");
+
+        p.on_key(Key::Tab);
+        let field = &p.fields[DIRECTORY];
+        assert_eq!(field.input, DIRECTORY_DEFAULT, "the dim path, taken in");
+        assert_eq!(field.cursor, field.len(), "with the cursor after it");
+        assert!(
+            !p.choosing(),
+            "and no menu: this `Tab` was the one that filled the field"
+        );
+
+        // The next one is the ordinary `Tab`, on a path that is really there.
+        p.on_key(Key::Tab);
+        assert!(p.choosing());
+        assert_eq!(
+            p.fields[DIRECTORY].input, DIRECTORY_DEFAULT,
+            "opening the menu does not move the path it opened on"
+        );
+    }
+
+    /// A host that could not say where home is has no default to offer, so
+    /// there is nothing for `Tab` to take and it does what it always did. The
+    /// row goes on saying `⇥ complete` either way, and this is what keeps that
+    /// from being a promise the key declines.
+    #[test]
+    fn tab_still_opens_the_menu_when_there_is_no_home_to_take() {
+        let mut p = Prompt::create(
+            "session 3".to_string(),
+            COMMAND_DEFAULT.to_string(),
+            String::new(),
+        );
+        press(&mut p, &[Key::Down, Key::Down]);
+        assert_eq!(p.focus, DIRECTORY);
+        assert!(p.fields[DIRECTORY].input.is_empty());
+
+        p.on_key(Key::Tab);
+        assert!(p.choosing(), "nothing to take, so the menu opens");
+    }
+
+    /// The way out of home, now that clearing the field is a route that leads
+    /// somewhere: with nothing left to discard there is no `//` to make, so one
+    /// slash is the root itself and the listing is pointed at it.
+    #[test]
+    fn a_slash_in_an_emptied_field_is_the_root_itself() {
+        let mut p = prompt();
+        press(&mut p, &[Key::Down, Key::Down]);
+        for _ in 0..p.fields[DIRECTORY].len() {
+            p.on_key(Key::Backspace);
+        }
+        type_in(&mut p, "/");
+        assert_eq!(p.fields[DIRECTORY].input, "/");
+
+        // Nothing inert, so nothing draws dim — and what `refresh` asks about
+        // is the root rather than a directory inside home.
+        let value = p.fields[DIRECTORY].value();
+        let (inert, live) = crate::dirs::anchored(&value);
+        assert_eq!((inert, live), ("", "/"));
+        assert_eq!(crate::dirs::split(live), Some(("/", "")));
+
+        match p.on_key(Key::Enter) {
+            Step::Submit(s) => assert_eq!(s.directory, Some("/".to_string())),
+            other => panic!("expected a create, got {other:?}"),
         }
     }
 
