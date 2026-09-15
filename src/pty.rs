@@ -141,6 +141,15 @@ const REAP_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long the teardown paths relay a departing client's restore sequence.
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// How long the session must have been quiet before a switch is called painted.
+///
+/// Diagnostics only, for the `timing:` record in [`pump`]. Long enough to step
+/// over the gaps between a heavy config's redraw chunks — an AstroNvim session
+/// on a 200x50 terminal paints in bursts over about 100 ms — and short enough
+/// that the record lands while the switch it describes is still the last thing
+/// that happened.
+const PAINT_SETTLED: Duration = Duration::from_millis(150);
+
 /// A DA1 request: `ESC [ c`. What a departing client sends, and what the two
 /// drains watch for — see [`Attachment::answer_device_attributes`].
 const DA1_REQUEST: &[u8] = b"\x1b[c";
@@ -431,6 +440,7 @@ pub fn spawn(session_id: &str, sock: &Path, announce: &str) -> Result<Attachment
     // like any other call, which is why `rpc::probe` asks both — so this is not
     // a claim that the two are interchangeable. What it cost was a round trip on
     // every attach, forwarded over SSH.
+    let t_probe = std::time::Instant::now();
     let mut client = rpc::Client::connect(sock, rpc::PROBE_TIMEOUT)?;
     // A server at a hit-enter prompt cannot answer `list_uis`, a deferred
     // call, until a key ends the prompt. Usually there is nobody to type one:
@@ -467,6 +477,14 @@ pub fn spawn(session_id: &str, sock: &Path, announce: &str) -> Result<Attachment
     }
     drop(client);
 
+    // The two records bracket the fork: the first is the round trips to the
+    // session — over ssh, through the forward — and the second adds `openpty`
+    // and the client's own exec.
+    tracing::debug!(
+        ms = t_probe.elapsed().as_secs_f64() * 1000.0,
+        "timing: attach probe"
+    );
+
     // Right *before* the child starts: `PtySize::default()` is 24x80. Note
     // `crossterm::size()` is (cols, rows) while `PtySize` is { rows, cols } —
     // passing them positionally transposes the screen.
@@ -499,6 +517,11 @@ pub fn spawn(session_id: &str, sock: &Path, announce: &str) -> Result<Attachment
         .master
         .take_writer()
         .map_err(|e| NvmuxError::Io(std::io::Error::other(e.to_string())))?;
+
+    tracing::debug!(
+        ms = t_probe.elapsed().as_secs_f64() * 1000.0,
+        "timing: probe + client spawn"
+    );
 
     Ok(Attachment {
         session_id: session_id.to_string(),
@@ -630,6 +653,16 @@ fn pump(
     // running. It is set when the machine arms and cleared when it settles.
     let mut deadline: Option<Instant> = None;
     let mut buf = [0u8; 8192];
+    // Diagnostics only, and what makes a switch that felt slow attributable:
+    // everything before this is nvmux's own work and is timed where it happens,
+    // while this is the session's — its redraw, and the terminal's drawing of
+    // it. Measured from the start of the relay, which is the moment the
+    // terminal became the new session's to paint.
+    let relay_started = Instant::now();
+    let mut first_byte: Option<Duration> = None;
+    let mut painted_bytes = 0usize;
+    let mut last_byte = Instant::now();
+    let mut painted = false;
 
     loop {
         // The attach notice has a clock of its own — a lull to wait out, and a
@@ -678,8 +711,26 @@ fn pump(
                     let mut out = std::io::stdout().lock();
                     out.write_all(&buf[..len])?;
                     out.flush()?;
+                    if first_byte.is_none() {
+                        first_byte = Some(relay_started.elapsed());
+                    }
+                    painted_bytes += len;
+                    last_byte = Instant::now();
                 }
             }
+        }
+
+        // Once per relay, on the first lull after the session has said
+        // anything. After the read above, so a burst that ends on this pass is
+        // counted before the lull is measured.
+        if !painted && first_byte.is_some() && last_byte.elapsed() >= PAINT_SETTLED {
+            painted = true;
+            tracing::debug!(
+                first_byte_ms = first_byte.map(|d| d.as_secs_f64() * 1000.0),
+                painted_ms = (last_byte - relay_started).as_secs_f64() * 1000.0,
+                bytes = painted_bytes,
+                "timing: session painted"
+            );
         }
 
         if n > 0 && ready(&fds[2]) {
@@ -702,11 +753,19 @@ fn pump(
                     out.flush()?;
                 }
                 announce::Act::Erase => {
+                    // Timed because it is a second full repaint of the session,
+                    // a whole second after the switch — the one nvmux asks for
+                    // rather than the one the attach produced.
+                    let t_erase = std::time::Instant::now();
                     // The same repaint a resume asks for, and for the same
                     // reason: the cells the box covered are the server's, and
                     // only the server can say what was under them. Not the same
                     // licence, though — see [`EndPrompt`].
                     repaint(attachment.master.as_ref(), &attachment.sock, EndPrompt::No);
+                    tracing::debug!(
+                        ms = t_erase.elapsed().as_secs_f64() * 1000.0,
+                        "timing: attach notice erase (:mode repaint)"
+                    );
                     popup = None;
                 }
                 announce::Act::Done => popup = None,
@@ -909,7 +968,11 @@ fn read_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
     }
 }
 
-fn pollfd(fd: RawFd) -> libc::pollfd {
+/// A `poll` entry asking whether `fd` is readable. Shared with
+/// [`crate::proc::Shell`], which polls a child's pipes the way this module
+/// polls a pty; a negative `fd` is skipped by `poll`, which is how a pipe
+/// that has reached EOF is left out.
+pub(crate) fn pollfd(fd: RawFd) -> libc::pollfd {
     libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -934,7 +997,7 @@ fn writable(fd: RawFd) -> bool {
 /// Readable, or gone. `POLLHUP` matters as much as `POLLIN`: on Linux the
 /// master reports hangup rather than readability once the child exits, and
 /// ignoring it would leave the loop spinning against a dead pty.
-fn ready(p: &libc::pollfd) -> bool {
+pub(crate) fn ready(p: &libc::pollfd) -> bool {
     p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
 }
 
