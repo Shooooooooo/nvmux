@@ -248,14 +248,33 @@ pub(crate) fn poll_key_for(tick: Duration) -> Result<Option<Key>> {
 /// what makes `Esc` a way back to it rather than a key that does nothing. It is
 /// false where the picker is all there is: the first screen of the program, and
 /// the trip back from a failed attach or a session whose child exited.
+///
+/// `in_hand` is the listing the caller already has — the one it took out of
+/// the picker last time, plus anything it created since. With one, the picker
+/// is drawn from it *before* a fresh listing is asked for, and re-drawn once
+/// that arrives: over ssh a listing is a round trip and a script, 100-160 ms
+/// on a distant host, and `<prefix> Space` used to show a cleared screen for
+/// all of it. What the first frame can be wrong about is bounded, and in the
+/// same direction the `<prefix>` switch already accepts: a session gone since
+/// is still a row until the refresh, and one created elsewhere is missing
+/// until then. Nothing is acted on before the refresh, since it runs before
+/// the first key is read.
 pub fn run(
     transport: &dyn Transport,
     message: Option<String>,
     focused: Option<&str>,
     still_attached: bool,
+    in_hand: Option<Vec<Session>>,
 ) -> Result<Outcome> {
     owning_for_attach(Outcome::attaches, |terminal| {
-        run_loop(terminal, transport, message, focused, still_attached)
+        run_loop(
+            terminal,
+            transport,
+            message,
+            focused,
+            still_attached,
+            in_hand,
+        )
     })
 }
 
@@ -265,8 +284,15 @@ fn run_loop(
     message: Option<String>,
     focused: Option<&str>,
     still_attached: bool,
+    in_hand: Option<Vec<Session>>,
 ) -> Result<Outcome> {
-    let mut sessions = transport.list_sessions()?;
+    // Fresh, unless the caller had one: then that is drawn first and the
+    // fresh one fetched behind the first frame, below.
+    let mut stale = in_hand.is_some();
+    let mut sessions = match in_hand {
+        Some(sessions) => sessions,
+        None => transport.list_sessions()?,
+    };
     let mut highest = highest_num(&sessions);
     let mut app = App::new(std::mem::take(&mut sessions));
     if let Some(id) = focused {
@@ -286,6 +312,16 @@ fn run_loop(
 
     loop {
         terminal.draw(|f| draw::draw(f, &app))?;
+
+        // Behind the first frame, before the first key: the listing that
+        // frame was drawn from is the caller's, and this is the real one.
+        // Selection survives by id (`App::set_sessions`), so a cursor put on
+        // the session the user came from stays there.
+        if stale {
+            stale = false;
+            refresh(&mut app, &mut highest, transport)?;
+            continue;
+        }
 
         if !event::poll(TICK)? {
             // The clock lives here rather than in `App`, which stays pure —

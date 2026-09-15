@@ -90,6 +90,10 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     // The session the last trip through the picker led to, so the next one
     // opens with the cursor on it rather than on the first row.
     let mut focus: Option<String> = None;
+    // The listing that trip handed over, with anything created since, so the
+    // next picker can be drawn from it while it lists afresh. None only for
+    // the first picker, which has nothing to draw from.
+    let mut in_hand: Option<Vec<nvmux::session::Session>> = None;
 
     loop {
         // `<prefix> c` moves this to the session it just created. A client held
@@ -101,6 +105,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             message.take(),
             focus.as_deref(),
             attached.is_some(),
+            in_hand.take(),
         )? {
             ui::Outcome::Quit => {
                 // A client held across `<prefix> Space` is retired explicitly; its
@@ -267,6 +272,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
         // one of them was showing `current` — including the failures, where the
         // cursor lands on the row the message on the hint line is about.
         focus = Some(current.id.clone());
+        in_hand = Some(listing);
     }
     Ok(())
 }
