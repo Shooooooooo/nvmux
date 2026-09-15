@@ -119,19 +119,20 @@ fn rename_edits_metadata_and_leaves_the_socket_alone() {
     assert!(sock_after.exists(), "the socket must still be live");
     assert_eq!(listed[0].state.liveness, Liveness::Alive);
 
-    // The number is as much a handle as the id: a rename must not move it, or
-    // `<prefix> <n>` would start naming a different session.
+    // A rename edits the name and nothing else: neither the rank on disk nor
+    // the row it sorts into, or `<prefix> <n>` would start naming a different
+    // session every time one was renamed.
     assert_eq!(
         listed[0].num, session.num,
-        "rename must not change the number"
+        "rename must not change the rank"
     );
-    assert_eq!(listed[0].state.num, session.num);
+    assert_eq!(listed[0].state.num, session.state.num);
 }
 
-/// Numbers are assigned once and kept, and a killed session's number is handed
-/// out again so the list stays dense and single-digit for as long as possible.
+/// The column is recalculated on every listing: kill the second of three and
+/// the third becomes the second, against real metadata rather than a fixture.
 #[test]
-fn session_numbers_are_stable_and_a_freed_one_is_reused() {
+fn killing_a_session_renumbers_the_ones_below_it() {
     require_nvim!();
     let scratch = Scratch::new("numbers");
     let t = scratch.transport();
@@ -146,15 +147,15 @@ fn session_numbers_are_stable_and_a_freed_one_is_reused() {
         .create_session("third", &common::launch(), common::anywhere())
         .expect("create");
     assert_eq!(
-        (first.num, second.num, third.num),
+        (first.state.num, second.state.num, third.state.num),
         (1, 2, 3),
         "numbering starts at 1 and counts up"
     );
 
     t.kill_session(&second).expect("kill");
 
-    // The survivors keep the numbers they were given: killing 2 must not
-    // renumber 3 down to 2.
+    // The whole point: "third" moves up into the hole, and nothing had to be
+    // written to its metadata for that to happen.
     let listed = t.list_sessions().expect("list");
     let numbered: Vec<(String, u32)> = listed
         .iter()
@@ -162,19 +163,40 @@ fn session_numbers_are_stable_and_a_freed_one_is_reused() {
         .collect();
     assert_eq!(
         numbered,
-        vec![("first".to_string(), 1), ("third".to_string(), 3)],
-        "the gap is left where the killed session was"
+        vec![("first".to_string(), 1), ("third".to_string(), 2)],
+        "the session below the killed one is renumbered"
+    );
+    assert_eq!(
+        listed.iter().map(|s| s.num).collect::<Vec<_>>(),
+        vec![first.num, third.num],
+        "the ranks on disk are untouched, hole and all"
     );
 
-    // And the next create refills the hole rather than climbing to 4.
+    // A create appends rather than reusing the freed rank, so the new session
+    // comes up at the bottom of the list and nothing above it moves.
     let fourth = t
         .create_session("fourth", &common::launch(), common::anywhere())
         .expect("create");
-    assert_eq!(fourth.num, 2, "the freed number is handed out again");
+    assert_eq!(fourth.state.num, 3, "it is the third row");
+    assert!(
+        fourth.num > third.num,
+        "and ranks past everything on the host"
+    );
 
     let listed = t.list_sessions().expect("list");
-    let nums: Vec<u32> = listed.iter().map(|s| s.state.num).collect();
-    assert_eq!(nums, vec![1, 2, 3], "the list reads in number order");
+    let numbered: Vec<(String, u32)> = listed
+        .iter()
+        .map(|s| (s.name.clone(), s.state.num))
+        .collect();
+    assert_eq!(
+        numbered,
+        vec![
+            ("first".to_string(), 1),
+            ("third".to_string(), 2),
+            ("fourth".to_string(), 3),
+        ],
+        "the list is dense and in creation order"
+    );
 }
 
 /// A reorder is only worth anything if it sticks. The picker arranges the
