@@ -84,6 +84,13 @@ Opened from a session with `<prefix> Space`, the picker takes the mouse the
 same way, and puts that session's own `'mouse'` setting back when you return
 to it.
 
+`/` filters the list as you type. The match is fuzzy — `asv` finds
+`api-server` — and is tried against the session's name and the last part of its
+working directory, so `scratch` running in `~/work/billing` is found by
+`billing`. It is case-insensitive unless the query has a capital in it. The
+rows that match keep their order and their numbers; nothing is re-sorted by how
+well it matched.
+
 A session's number is its **position in the list**, recalculated every time the
 list is read. Kill session 2 of three and the old 3 becomes the new 2 — the
 column has no holes in it, so the last session is always the number of sessions
