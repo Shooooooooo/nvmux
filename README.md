@@ -1,8 +1,8 @@
 # nvmux
 
-A tmux-style session manager for Neovim. Create named Neovim sessions, attach to
-them, detach, and come back later — with the editor running on a remote host
-while every keystroke and every pixel of rendering happens on your own terminal.
+A session manager for Neovim. Create named Neovim sessions, attach to them,
+detach, and come back later — with the editor running on a remote host while
+every keystroke and every pixel of rendering happens on your own terminal.
 
 ```
                                                                        
@@ -37,10 +37,6 @@ nvmux                                    nvim --headless --listen <sock>
 |---|---|
 | Local | `nvim` >= 0.11, and `ssh` for `nvmux <host>` |
 | Remote | `nvim` >= 0.11 |
-
-0.11 is where `:detach` and `:connect` landed; it is checked at startup on both
-ends and reported plainly. `ssh` is only needed, and only checked, when a host
-is given. macOS and Linux only.
 
 ## Install
 
@@ -78,26 +74,6 @@ reimplementing it.
 | `<prefix>` `?` | show these keys — `Esc` goes back |
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
 
-The picker takes the mouse as well: point at a session to select it, click to
-attach, scroll to move, and drag a row to change its place in the order.
-Opened from a session with `<prefix> Space`, the picker takes the mouse the
-same way, and puts that session's own `'mouse'` setting back when you return
-to it.
-
-`/` filters the list as you type. The match is fuzzy — `asv` finds
-`api-server` — and is tried against the session's name and the last part of its
-working directory, so `scratch` running in `~/work/billing` is found by
-`billing`. It is case-insensitive unless the query has a capital in it. The
-rows that match keep their order and their numbers; nothing is re-sorted by how
-well it matched.
-
-A session's number is its **position in the list**, recalculated every time the
-list is read. Kill session 2 of three and the old 3 becomes the new 2 — the
-column has no holes in it, so the last session is always the number of sessions
-there are. What a session keeps for life is its place in the order, not its
-number; `␣` in the picker is how you change that place, and a new session goes
-on the end.
-
 ### Leaving a session
 
 - **`<prefix> d` detaches.** The session keeps running with all its buffers,
@@ -128,14 +104,3 @@ duration_ms = 100    # each way — a switch pays it out and then in
 session     = true   # Neovim's own screen dissolves too, in and out
 excursions  = true   # so do the <prefix> ? and <prefix> c screens
 ```
-
-The fade dissolves each screen into the terminal's own background colour and
-the next one up out of it, so a light theme dips to light and a dark one to
-dark. nvmux asks the terminal what that colour is once at startup (OSC 10, 11
-and 4); a terminal that does not answer gets the hard cuts it always had. With
-`session` on, the session's output is parsed as it passes so Neovim's screen
-can be dissolved cell by cell: out as you leave, and in as you arrive — a
-session's first paint is held back until it has settled (three quarters of a
-second at the most) and then let through as it came, so nothing Neovim
-negotiates with the terminal is changed, only that much delayed. Images drawn
-with the kitty or sixel protocols vanish on the first frame rather than fading.
