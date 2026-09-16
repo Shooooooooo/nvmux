@@ -721,7 +721,7 @@ fn aligned(labels: &[&str]) -> Vec<String> {
 /// to the same client, which is repainted, so it takes the ordinary close.
 pub fn run(transport: &dyn Transport) -> Result<Outcome> {
     // Reached from a session that has just dissolved out, so dissolve in.
-    super::owning_for_attach(Outcome::attaches, |terminal| {
+    super::owning_for_attach(Outcome::attaches, true, |terminal| {
         run_on(terminal, transport, Task::Create, crate::fade::excursions())
     })
 }

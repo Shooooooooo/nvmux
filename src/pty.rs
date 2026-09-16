@@ -46,7 +46,9 @@
 
 use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 pub use portable_pty::PtySize;
@@ -673,7 +675,7 @@ impl Drop for Attachment {
     }
 }
 
-/// Start a `--remote-ui` client for a session.
+/// Start a `--remote-ui` client for a session and wait for the probe to pass.
 ///
 /// `sock` must already be reachable from *this* machine — locally the session
 /// socket, over SSH the local end of a forward.
@@ -681,22 +683,19 @@ impl Drop for Attachment {
 /// `announce` is what the first relay says the session is (see
 /// [`crate::announce::label`]). Not an `Option`: every spawn is a change of
 /// session, and making that unrepresentable is the point.
+///
+/// The blocking form, with the probe on [`rpc::PROBE_TIMEOUT`]: what the
+/// integration tests drive, since a test wants an answer or a failure and
+/// nobody at a keyboard. The binary does not use it. There the attach is the
+/// same two halves — [`spawn_client`], then [`Probe::start`] — with the wait
+/// on a screen of its own (`ui::attaching`), which has no budget because the
+/// user is watching it and can give up whenever they choose.
 pub fn spawn(session_id: &str, sock: &Path, announce: &str) -> Result<Attachment> {
-    // `CommandBuilder::new` seeds the child's environment from ours, so `TERM`,
-    // `COLORTERM` and everything else the client negotiates with reach it
-    // without being copied by hand.
-    let mut cmd = CommandBuilder::new("nvim");
-    cmd.arg("--server");
-    cmd.arg(sock);
-    cmd.arg("--remote-ui");
-    if let Ok(cwd) = std::env::current_dir() {
-        cmd.cwd(cwd);
-    }
-    spawn_with(session_id, sock, announce, cmd)
+    spawn_with(session_id, sock, announce, client_command(sock))
 }
 
-/// [`spawn`] with the client command supplied, which is how the tests run it
-/// against a stand-in client where there is no `nvim`.
+/// Start a `--remote-ui` client for a session, and nothing else: the half of
+/// [`spawn`] that forks. The probe is the caller's, through [`Probe::start`].
 ///
 /// The client is started *first* and the server probed while it connects.
 /// The two have nothing to say to each other — the probe asks the server what
@@ -707,15 +706,40 @@ pub fn spawn(session_id: &str, sock: &Path, announce: &str) -> Result<Attachment
 ///
 /// The probe still decides. Nothing the client prints reaches the terminal
 /// before it has passed: the client writes into its pty, and only the relay
-/// copies a pty to the terminal, which starts after this returns. A probe that
-/// fails ends the client with the attachment it was building — through the
-/// same hangup and reap as any other retirement — and its output dies with the
-/// master. That matters over a forward whose remote end has gone: the client's
-/// own failure message there is empty, after ~165 bytes of escape sequences it
+/// copies a pty to the terminal, which the caller starts once the probe has
+/// said yes. A probe that fails — or a wait the user gives up on — ends the
+/// client by dropping the attachment it was building, through the same hangup
+/// and reap as any other retirement, and its output dies with the master.
+/// That matters over a forward whose remote end has gone: the client's own
+/// failure message there is empty, after ~165 bytes of escape sequences it
 /// has already written, and none of them are seen.
 ///
 /// A client that could not be started at all is reported before any probe,
 /// since the message — `nvim` is not here — is the useful one.
+pub fn spawn_client(session_id: &str, sock: &Path, announce: &str) -> Result<Attachment> {
+    spawn_client_with(session_id, sock, announce, client_command(sock))
+}
+
+/// `nvim --server <sock> --remote-ui`, in our working directory.
+fn client_command(sock: &Path) -> CommandBuilder {
+    // `CommandBuilder::new` seeds the child's environment from ours, so `TERM`,
+    // `COLORTERM` and everything else the client negotiates with reach it
+    // without being copied by hand.
+    let mut cmd = CommandBuilder::new("nvim");
+    cmd.arg("--server");
+    cmd.arg(sock);
+    cmd.arg("--remote-ui");
+    if let Ok(cwd) = std::env::current_dir() {
+        cmd.cwd(cwd);
+    }
+    cmd
+}
+
+/// [`spawn`] with the client command supplied, which is how the tests run it
+/// against a stand-in client where there is no `nvim`.
+///
+/// The same sequence `main` runs under its spinner — the client, then the
+/// probe on its own thread — waited out here, with the budget a test expects.
 fn spawn_with(
     session_id: &str,
     sock: &Path,
@@ -723,7 +747,7 @@ fn spawn_with(
     cmd: CommandBuilder,
 ) -> Result<Attachment> {
     let t_spawn = std::time::Instant::now();
-    let attachment = spawn_client(session_id, sock, announce, cmd)?;
+    let attachment = spawn_client_with(session_id, sock, announce, cmd)?;
     tracing::debug!(
         ms = t_spawn.elapsed().as_secs_f64() * 1000.0,
         "timing: client spawn"
@@ -732,7 +756,17 @@ fn spawn_with(
     // The round trips to the session — over ssh, through the forward — while
     // the client makes its own.
     let t_probe = std::time::Instant::now();
-    if let Err(e) = probe(session_id, sock) {
+    let verdict = Probe::start(session_id, sock).and_then(|mut probe| {
+        // A wait that runs out is the timeout it used to be, so the callers
+        // that read the error see the shape they always did. The probe drops
+        // at the end of this closure, which is what ends its worker.
+        probe
+            .wait(rpc::PROBE_TIMEOUT)
+            .unwrap_or(Err(NvmuxError::Rpc(crate::error::RpcError::Timeout(
+                rpc::PROBE_TIMEOUT,
+            ))))
+    });
+    if let Err(e) = verdict {
         // Explicitly, so the retirement is not left to a binding: the client
         // must be gone, and its pty with it, before the error is shown.
         drop(attachment);
@@ -743,6 +777,102 @@ fn spawn_with(
         "timing: attach probe"
     );
     Ok(attachment)
+}
+
+/// The attach probe, in flight on a thread of its own.
+///
+/// The probe is a run of blocking calls to the session, and the last of them
+/// is deferred: a session in the middle of `:!make`, or of CPU-bound Lua,
+/// answers it when it is done and not before. It used to be given three
+/// seconds and then refused. Now it is given as long as it takes, and the
+/// screen that waits on it (`ui::attaching`) is what the user gives up from —
+/// which means that screen has to keep reading keys while the probe blocks,
+/// and a blocking read cannot share a thread with a key loop.
+///
+/// So this is the second thread in the crate, and the reasons
+/// [`crate::ui::complete`] gives for the first are the reasons here: the
+/// worker reads its own socket and nothing else, so it cannot split the
+/// terminal's stream, and it owns nothing the screen needs back. What it
+/// adds is a way to be stopped. A thread parked in a blocking read cannot be
+/// told to stop, and nothing waits for it — but the socket can be shut down
+/// under it, and then the read returns at once (see [`rpc::Interrupt`]).
+/// That happens on every way out, through `Drop`, and it is not tidiness: a
+/// worker left parked behind a `:!make` would get its answer when the make
+/// ended, and if the session were then at the make's own hit-enter prompt it
+/// would type `<CR>` into a prompt somebody else was reading.
+///
+/// Told the answer through a channel rather than joined, so the screen can
+/// poll it on the same tick it draws on.
+pub struct Probe {
+    rx: mpsc::Receiver<Result<()>>,
+    interrupt: rpc::Interrupt,
+    /// `None` only once a test has taken it, to prove the worker ended.
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Probe {
+    /// Connect to the session and start asking.
+    ///
+    /// The connect happens here, on the caller's thread: a unix socket connect
+    /// either finds a listener or does not, in no time at all, so a dead
+    /// socket — nothing listening, a file where the socket was — is refused at
+    /// once rather than from a thread a moment later. Only the calls, which
+    /// are where the waiting is, go to the worker.
+    pub fn start(session_id: &str, sock: &Path) -> Result<Self> {
+        let mut client = rpc::Client::connect_with(sock, None)?;
+        let interrupt = client.interrupt()?;
+        let (tx, rx) = mpsc::channel();
+        let id = session_id.to_string();
+        let thread = std::thread::Builder::new()
+            .name("nvmux-probe".into())
+            .spawn(move || {
+                let verdict = probe_on(&mut client, &id);
+                // A receiver that has gone is a wait that was given up on,
+                // and there is nobody left to tell.
+                let _ = tx.send(verdict);
+            })?;
+        Ok(Self {
+            rx,
+            interrupt,
+            thread: Some(thread),
+        })
+    }
+
+    /// Wait up to `timeout` for the verdict. `None` is "not yet"; an answer
+    /// is given once, after which the probe is done with. A worker that died
+    /// without answering is an error, not a `None`: a screen looping on this
+    /// must never be left spinning for a verdict that is not coming.
+    pub fn wait(&mut self, timeout: Duration) -> Option<Result<()>> {
+        match self.rx.recv_timeout(timeout) {
+            Ok(verdict) => Some(verdict),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => Some(Err(NvmuxError::Io(
+                std::io::Error::other("the attach probe ended without a verdict"),
+            ))),
+        }
+    }
+
+    /// Give up on the probe as `Drop` does, but hand the worker back so a
+    /// test can prove the interrupt ended it, and not only the connection.
+    #[cfg(test)]
+    fn abandon(mut self) -> std::thread::JoinHandle<()> {
+        self.thread.take().expect("the worker is taken once")
+    }
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        // Every way out, the errors included — see the type's docs for why a
+        // worker must never be left parked. On the success path the worker
+        // has already closed its end and this shuts down a socket that is
+        // about to be dropped anyway, which is nothing. Not joined: the
+        // shutdown is what unparks the worker, and nothing here needs it gone
+        // before going on.
+        self.interrupt.fire();
+        if let Some(thread) = &self.thread {
+            tracing::debug!(finished = thread.is_finished(), "attach probe retired");
+        }
+    }
 }
 
 /// Ask the server whether it can take a client, and make it ready for one.
@@ -762,8 +892,7 @@ fn spawn_with(
 /// any other call, which is why `rpc::probe` asks both — so this is not a
 /// claim that the two are interchangeable. What it cost was a round trip on
 /// every attach, forwarded over SSH.
-fn probe(session_id: &str, sock: &Path) -> Result<()> {
-    let mut client = rpc::Client::connect(sock, rpc::PROBE_TIMEOUT)?;
+fn probe_on(client: &mut rpc::Client<UnixStream>, session_id: &str) -> Result<()> {
     // A server at a hit-enter prompt cannot answer `list_uis`, a deferred
     // call, until a key ends the prompt. Usually there is nobody to type one:
     // the client that was showing the prompt is gone, and this is its
@@ -809,7 +938,7 @@ fn probe(session_id: &str, sock: &Path) -> Result<()> {
 }
 
 /// Open a pty and start the client on it.
-fn spawn_client(
+fn spawn_client_with(
     session_id: &str,
     sock: &Path,
     announce: &str,
@@ -1964,6 +2093,26 @@ mod tests {
         uis: usize,
         mouse: (&'static str, i64),
     ) -> std::thread::JoinHandle<Vec<String>> {
+        serve_recording(sock, mode, blocking, uis, mouse, None)
+    }
+
+    /// An idle server that records `method` and then never answers it — a
+    /// session that is busy, as the attach probe sees one.
+    fn recording_server_stalling_on(
+        sock: &Path,
+        method: &'static str,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        serve_recording(sock, "n", false, 0, DEFAULT_MOUSE, Some(method))
+    }
+
+    fn serve_recording(
+        sock: &Path,
+        mode: &'static str,
+        blocking: bool,
+        uis: usize,
+        mouse: (&'static str, i64),
+        stall_on: Option<&'static str>,
+    ) -> std::thread::JoinHandle<Vec<String>> {
         use rmpv::Value;
 
         let listener = std::os::unix::net::UnixListener::bind(sock).expect("bind");
@@ -2052,6 +2201,13 @@ mod tests {
                     Some(keys) if method == "nvim_input" => format!("{method}({keys})"),
                     _ => method.to_string(),
                 });
+                if stall_on == Some(method) {
+                    // Recorded and never answered. The loop goes on reading,
+                    // so it ends on the EOF a cancelled probe's shutdown
+                    // produces — which is how joining this proves the hangup
+                    // reached the server.
+                    continue;
+                }
                 let reply = Value::Array(vec![Value::from(1u64), msgid, Value::Nil, result]);
                 if rmpv::encode::write_value(&mut out, &reply).is_err() {
                     break;
@@ -2288,6 +2444,46 @@ mod tests {
             );
             let _ = std::fs::remove_file(&sock);
         }
+    }
+
+    /// The attach probe waits on the session with no budget, so the user's
+    /// cancel is the only thing that ends a wait on a busy one — and it has
+    /// to end all of it. The worker thread must stop, or it would answer the
+    /// prompt the session shows once it is free; and the server must see the
+    /// connection go, so the `<CR>` that answer would have carried can never
+    /// be sent on it.
+    #[test]
+    fn dropping_a_probe_stops_its_worker_and_hangs_up_on_the_server() {
+        let sock = temp_sock("stall");
+        let server = recording_server_stalling_on(&sock, "nvim_list_uis");
+        let mut probe = Probe::start("stall", &sock).expect("connected");
+        assert!(
+            probe.wait(Duration::from_millis(150)).is_none(),
+            "a server that does not answer must not produce a verdict"
+        );
+
+        let started = Instant::now();
+        let worker = probe.abandon();
+        let deadline = started + Duration::from_secs(2);
+        while !worker.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            worker.is_finished(),
+            "the worker is still parked in its read after the interrupt"
+        );
+        worker.join().expect("the worker thread");
+        assert_eq!(
+            server.join().expect("the server thread"),
+            ["nvim_get_mode", "nvim_list_uis"],
+            "the server saw something other than the probe's first two calls"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the hangup took {:?} to reach the server",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_file(&sock);
     }
 
     /// The count the probe reads may or may not include the client started
