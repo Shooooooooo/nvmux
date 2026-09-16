@@ -18,9 +18,12 @@
 //!
 //! An attached session is raw Neovim that nvmux only proxies bytes for. Its
 //! cells come from the shadow grid ([`crate::shadow`]) that watched those
-//! bytes go by, and [`fade_out_session`] paints the frames from that. There is
-//! no fade *in* for a session: Neovim repaints its grid atomically, and nvmux
-//! cannot fade what it has not seen. A session cuts in and dissolves out.
+//! bytes go by, and [`fade_out_session`] and [`fade_in_session`] paint the
+//! frames from that. A fade *in* needs the finished screen before any of it
+//! is shown, so the relay holds a session's first paint back from the
+//! terminal until it has settled, dissolves the shadow in, and only then lets
+//! the bytes through (see `pty::Hold`); a resumed session dissolves in from
+//! the screen the shadow still holds, ahead of its repaint.
 //!
 //! # Colour, and what turns the effect off
 //!
@@ -244,14 +247,29 @@ where
 /// frame has every visible cell at the background colour, which is what the
 /// hand-off's erase paints next, so the seam is flat.
 pub fn fade_out_session(shadow: &mut Shadow) -> io::Result<()> {
+    run_session(shadow, Direction::Out).map(|_| ())
+}
+
+/// Dissolve an attached session's screen up out of the background, from the
+/// shadow. Says whether it did: `false` when the fade is off or the shadow
+/// cannot be trusted, so the caller knows the terminal is still blank.
+///
+/// The last frame is the shadow's screen at full colour — nvmux's rendering
+/// of it, which is close but not the client's own. What the client wrote is
+/// written after it, so its rendering is what stays.
+pub fn fade_in_session(shadow: &mut Shadow) -> io::Result<bool> {
+    run_session(shadow, Direction::In)
+}
+
+fn run_session(shadow: &mut Shadow, direction: Direction) -> io::Result<bool> {
     let Some(palette) = active() else {
-        return Ok(());
+        return Ok(false);
     };
     if !shadow.is_usable() {
-        return Ok(());
+        return Ok(false);
     }
     let mut out = io::stdout().lock();
-    let mut schedule = Schedule::start(duration(), Direction::Out, Instant::now());
+    let mut schedule = Schedule::start(duration(), direction, Instant::now());
     while let Some(t) = schedule.next(Instant::now()) {
         out.write_all(&shadow.frame(t, palette))?;
         out.flush()?;
@@ -259,7 +277,7 @@ pub fn fade_out_session(shadow: &mut Shadow) -> io::Result<()> {
             thread::sleep(FRAME);
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Write to stdout and flush, so an escape sequence lands before the next.

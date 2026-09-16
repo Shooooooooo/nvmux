@@ -153,6 +153,28 @@ impl Shadow {
         !self.broken
     }
 
+    /// Whether anything has been drawn on the screen: a glyph in any cell.
+    /// What a hold on a session's first paint waits for before a lull counts
+    /// as the paint being over — a client's startup queries come first, and a
+    /// pause after them is not a finished screen.
+    pub fn has_contents(&self) -> bool {
+        if self.broken {
+            return false;
+        }
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        (0..rows).any(|row| {
+            (0..cols).any(|col| screen.cell(row, col).is_some_and(vt100::Cell::has_contents))
+        })
+    }
+
+    /// The terminal was written to behind the shadow's back — held bytes it
+    /// had already seen, replayed — so the next frame must paint every cell
+    /// rather than trust what the last one left.
+    pub fn invalidate(&mut self) {
+        self.painted.clear();
+    }
+
     /// The bytes that paint the screen `t` of the way to `palette.bg`, as a
     /// diff against the frame before (or in full, after a [`feed`] or
     /// [`resize`]). Always at least the sync span, the cursor hide and a
@@ -547,6 +569,33 @@ mod tests {
         assert_eq!(s.size(), (MIN_SIZE, MIN_SIZE));
         s.feed(b"wrap wrap wrap wrap\r\nand scroll\r\n");
         let _ = s.frame(0.5, &palette());
+    }
+
+    /// Nothing drawn is nothing drawn, however the cells got their colours;
+    /// one glyph anywhere is enough.
+    #[test]
+    fn has_contents_means_a_glyph_somewhere() {
+        let mut s = Shadow::new(4, 8);
+        assert!(!s.has_contents());
+        s.feed(b"\x1b[44m\x1b[2J");
+        assert!(
+            !s.has_contents(),
+            "an erase with a background is not a glyph"
+        );
+        s.feed(b"\x1b[3;5H~");
+        assert!(s.has_contents());
+    }
+
+    /// A replay the terminal saw but the diff did not: the next frame paints
+    /// everything again.
+    #[test]
+    fn invalidating_makes_the_next_frame_a_full_one() {
+        let mut s = Shadow::new(2, 4);
+        s.feed(b"a");
+        let _ = s.frame(0.5, &palette());
+        assert!(wrapper_only(&s.frame(0.5, &palette())));
+        s.invalidate();
+        assert_eq!(placements(&s.frame(0.5, &palette())).len(), 2);
     }
 
     /// A parser that panics retires the shadow rather than the relay: nothing

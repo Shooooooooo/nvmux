@@ -87,9 +87,10 @@ pub struct FadeSettings {
     /// How long one direction takes; a switch pays it once on the way out and
     /// once on the way in. Must be at least 1 and at most `MAX_FADE_MS`.
     pub duration_ms: u64,
-    /// Whether the outgoing Neovim screen dissolves too, rather than only
-    /// nvmux's own screens. Costs a running parse of the session's output while
-    /// it is attached (see [`crate::shadow`]); off, a session hard-cuts out.
+    /// Whether a Neovim screen dissolves too — in, once its first paint has
+    /// settled, and out — rather than only nvmux's own screens. Costs a
+    /// running parse of the session's output while it is attached (see
+    /// [`crate::shadow`]); off, a session hard-cuts both ways.
     pub session: bool,
     /// Whether the quick `<prefix> ?` / `<prefix> c` excursions fade too. Off
     /// makes those snappier at the cost of consistency.
