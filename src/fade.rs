@@ -49,7 +49,7 @@ use ratatui::style::{Color, Modifier};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::palette::{self, Palette};
-use crate::shadow::Shadow;
+use crate::shadow::{Cursor, Shadow};
 
 /// A synchronized update: the terminal presents nothing between these, so a
 /// frame is never seen half-composited. Opening one inside another is
@@ -255,8 +255,9 @@ pub fn fade_out_session(shadow: &mut Shadow) -> io::Result<()> {
 /// cannot be trusted, so the caller knows the terminal is still blank.
 ///
 /// The last frame is the shadow's screen at full colour — nvmux's rendering
-/// of it, which is close but not the client's own. What the client wrote is
-/// written after it, so its rendering is what stays.
+/// of it, which is close but not the client's own — with the cursor back on
+/// its cell (see [`Cursor::Restored`]). What the client wrote is written
+/// after it, so its rendering is what stays.
 pub fn fade_in_session(shadow: &mut Shadow) -> io::Result<bool> {
     run_session(shadow, Direction::In)
 }
@@ -271,13 +272,25 @@ fn run_session(shadow: &mut Shadow, direction: Direction) -> io::Result<bool> {
     let mut out = io::stdout().lock();
     let mut schedule = Schedule::start(duration(), direction, Instant::now());
     while let Some(t) = schedule.next(Instant::now()) {
-        out.write_all(&shadow.frame(t, palette))?;
+        let cursor = cursor_for(direction, schedule.finished());
+        out.write_all(&shadow.frame(t, palette, cursor))?;
         out.flush()?;
         if !schedule.finished() {
             thread::sleep(FRAME);
         }
     }
     Ok(true)
+}
+
+/// Where a session frame leaves the cursor: hidden throughout, except on the
+/// last frame of a fade in, which is the one frame nothing is certain to
+/// follow. A fade out ends hidden — whatever takes the screen next shows the
+/// cursor for itself, and until then there is nothing for it to sit on.
+fn cursor_for(direction: Direction, last: bool) -> Cursor {
+    match direction {
+        Direction::In if last => Cursor::Restored,
+        Direction::In | Direction::Out => Cursor::Hidden,
+    }
 }
 
 /// Write to stdout and flush, so an escape sequence lands before the next.
@@ -382,6 +395,17 @@ mod tests {
         assert!(jumped > first + 0.4, "{first} -> {jumped}");
         assert_eq!(s.next(t0 + Duration::from_secs(10)), Some(1.0));
         assert_eq!(s.next(t0 + Duration::from_secs(20)), None);
+    }
+
+    /// Exactly one frame puts the cursor back: the last of a fade in. Every
+    /// frame of a fade out hides it, including the last — the screen it would
+    /// sit on is gone, and the next owner shows it.
+    #[test]
+    fn only_the_last_frame_of_a_fade_in_restores_the_cursor() {
+        assert_eq!(cursor_for(Direction::In, true), Cursor::Restored);
+        assert_eq!(cursor_for(Direction::In, false), Cursor::Hidden);
+        assert_eq!(cursor_for(Direction::Out, false), Cursor::Hidden);
+        assert_eq!(cursor_for(Direction::Out, true), Cursor::Hidden);
     }
 
     fn buffer() -> Buffer {

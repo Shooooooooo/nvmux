@@ -35,8 +35,23 @@
 //! What a frame must get right is the same list as the attach notice's
 //! ([`crate::announce`]): a synchronized-update span around the whole thing,
 //! an absolute cursor position for every run of cells and never a newline or
-//! carriage return (`OPOST` is off), and the cursor hidden — the next owner of
-//! the screen shows it again.
+//! carriage return (`OPOST` is off), and the cursor hidden while the cells are
+//! written, so it is not seen chasing them across the screen.
+//!
+//! # The cursor
+//!
+//! Hiding the cursor is a debt. The client's own frames pay it back — Neovim
+//! ends every flush by showing the cursor — but a fade in is nvmux's last word
+//! on the screen, and what follows it is *asked for*, not certain: a resumed
+//! client is asked to repaint through its server, and a server that is busy or
+//! waiting for a key does not answer. The cursor would then stay hidden until
+//! the editor next drew something, and an editor sitting idle draws nothing.
+//! So the last frame of a fade in puts the cursor back itself, on the cell the
+//! session's bytes left it on and shown if they left it shown
+//! ([`Cursor::Restored`]): the parser tracks both, so the shadow knows exactly
+//! what the client would have had on screen. A fade out ends with the cursor
+//! hidden, as every frame before it did; what takes the screen next — a picker,
+//! a fresh client, a fade in — shows it for itself.
 
 use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};
@@ -45,7 +60,21 @@ use crate::fade::{SYNC_BEGIN, SYNC_END};
 use crate::palette::{Palette, Rgb};
 
 const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
+const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 const RESET_SGR: &[u8] = b"\x1b[0m";
+
+/// Where a frame leaves the cursor once its cells are written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cursor {
+    /// Hidden, as it was while the cells were written. For every frame of a
+    /// fade out and all but the last of a fade in: another frame follows, or
+    /// the next owner of the screen shows the cursor for itself.
+    Hidden,
+    /// Put back where the session had it — on its cell, and shown if the
+    /// session had it shown. For the last frame of a fade in, after which
+    /// nothing else is certain to touch the screen (see the module docs).
+    Restored,
+}
 
 /// The smallest grid the parser is given, in either dimension.
 ///
@@ -177,12 +206,12 @@ impl Shadow {
 
     /// The bytes that paint the screen `t` of the way to `palette.bg`, as a
     /// diff against the frame before (or in full, after a [`feed`] or
-    /// [`resize`]). Always at least the sync span, the cursor hide and a
-    /// trailing SGR reset.
+    /// [`resize`]), leaving the cursor as `cursor` says. Always at least the
+    /// sync span, the cursor hide and a trailing SGR reset.
     ///
     /// [`feed`]: Shadow::feed
     /// [`resize`]: Shadow::resize
-    pub fn frame(&mut self, t: f32, palette: &Palette) -> Vec<u8> {
+    pub fn frame(&mut self, t: f32, palette: &Palette, cursor: Cursor) -> Vec<u8> {
         let screen = self.parser.screen();
         let (rows, cols) = if self.broken { (0, 0) } else { screen.size() };
         let total = usize::from(rows) * usize::from(cols);
@@ -227,6 +256,14 @@ impl Shadow {
             }
         }
         out.extend_from_slice(RESET_SGR);
+        // Inside the same synchronized update as the cells, so the screen and
+        // its cursor appear together. A cursor the session itself hid stays
+        // hidden: the hide at the top of the frame is then also the session's.
+        if cursor == Cursor::Restored && !self.broken && !screen.hide_cursor() {
+            let (row, col) = screen.cursor_position();
+            let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
+            out.extend_from_slice(SHOW_CURSOR);
+        }
         out.extend_from_slice(SYNC_END);
         self.painted = next;
         out
@@ -380,7 +417,7 @@ mod tests {
     fn a_frame_is_one_synchronized_update_with_no_newlines() {
         let mut s = Shadow::new(3, 8);
         s.feed(b"hello\r\nworld");
-        let f = s.frame(0.5, &palette());
+        let f = s.frame(0.5, &palette(), Cursor::Hidden);
         assert!(f.starts_with(SYNC_BEGIN));
         assert!(f[SYNC_BEGIN.len()..].starts_with(HIDE_CURSOR));
         assert!(f.ends_with(SYNC_END));
@@ -398,7 +435,7 @@ mod tests {
     fn the_first_frame_places_every_row() {
         let mut s = Shadow::new(4, 5);
         s.feed(b"x");
-        let f = s.frame(0.3, &palette());
+        let f = s.frame(0.3, &palette(), Cursor::Hidden);
         let rows: Vec<usize> = placements(&f).iter().map(|(r, _)| *r).collect();
         assert_eq!(rows, vec![1, 2, 3, 4], "{:?}", text(&f));
         assert!(placements(&f).iter().all(|(_, c)| *c == 1));
@@ -410,13 +447,13 @@ mod tests {
     fn a_foreground_is_interpolated_toward_the_background() {
         let mut s = Shadow::new(1, 4);
         s.feed(b"\x1b[31mhi");
-        let f = s.frame(0.5, &palette());
+        let f = s.frame(0.5, &palette(), Cursor::Hidden);
         assert!(
             sgrs(&f).iter().any(|sgr| sgr == "0;38;2;100;0;0"),
             "{:?}",
             sgrs(&f)
         );
-        let f = s.frame(1.0, &palette());
+        let f = s.frame(1.0, &palette(), Cursor::Hidden);
         assert!(
             sgrs(&f).iter().any(|sgr| sgr == "0;38;2;0;0;0"),
             "fully dissolved is the background: {:?}",
@@ -431,7 +468,7 @@ mod tests {
     fn a_default_background_is_left_to_the_terminal() {
         let mut s = Shadow::new(1, 6);
         s.feed(b"ab\x1b[44mcd");
-        let f = s.frame(0.5, &palette());
+        let f = s.frame(0.5, &palette(), Cursor::Hidden);
         let sgrs = sgrs(&f);
         assert!(
             sgrs.iter().any(|sgr| !sgr.contains("48;2;")),
@@ -454,13 +491,13 @@ mod tests {
     fn a_repeated_frame_paints_nothing_and_blanks_are_painted_once() {
         let mut s = Shadow::new(2, 10);
         s.feed(b"hi");
-        let first = s.frame(0.25, &palette());
+        let first = s.frame(0.25, &palette(), Cursor::Hidden);
         assert!(!wrapper_only(&first));
-        let again = s.frame(0.25, &palette());
+        let again = s.frame(0.25, &palette(), Cursor::Hidden);
         assert!(wrapper_only(&again), "{:?}", text(&again));
         // A later frame repaints the two glyphs and nothing else: one
         // placement, on the first row.
-        let later = s.frame(0.5, &palette());
+        let later = s.frame(0.5, &palette(), Cursor::Hidden);
         assert_eq!(placements(&later), vec![(1, 1)], "{:?}", text(&later));
     }
 
@@ -470,13 +507,19 @@ mod tests {
     fn output_and_resizes_make_the_next_frame_a_full_one() {
         let mut s = Shadow::new(2, 4);
         s.feed(b"a");
-        let _ = s.frame(0.5, &palette());
+        let _ = s.frame(0.5, &palette(), Cursor::Hidden);
         s.feed(b"b");
-        assert_eq!(placements(&s.frame(0.5, &palette())).len(), 2);
-        let _ = s.frame(0.5, &palette());
+        assert_eq!(
+            placements(&s.frame(0.5, &palette(), Cursor::Hidden)).len(),
+            2
+        );
+        let _ = s.frame(0.5, &palette(), Cursor::Hidden);
         s.resize(3, 4);
         assert_eq!(s.size(), (3, 4));
-        assert_eq!(placements(&s.frame(0.5, &palette())).len(), 3);
+        assert_eq!(
+            placements(&s.frame(0.5, &palette(), Cursor::Hidden)).len(),
+            3
+        );
     }
 
     /// A wide character is written once, and the cell after it is placed two
@@ -485,7 +528,7 @@ mod tests {
     fn a_wide_character_is_written_once_and_advances_two_columns() {
         let mut s = Shadow::new(1, 6);
         s.feed("日x".as_bytes());
-        let f = s.frame(0.5, &palette());
+        let f = s.frame(0.5, &palette(), Cursor::Hidden);
         let t = text(&f);
         assert_eq!(t.matches('日').count(), 1, "{t:?}");
         let on_first_row: Vec<(usize, usize)> = placements(&f)
@@ -512,7 +555,7 @@ mod tests {
     fn combining_marks_stay_with_their_base() {
         let mut s = Shadow::new(1, 4);
         s.feed("e\u{301}!".as_bytes());
-        let t = text(&s.frame(0.5, &palette()));
+        let t = text(&s.frame(0.5, &palette(), Cursor::Hidden));
         assert!(t.contains("e\u{301}!"), "{t:?}");
     }
 
@@ -523,7 +566,7 @@ mod tests {
     fn inverse_video_swaps_the_resolved_colours() {
         let mut s = Shadow::new(1, 4);
         s.feed(b"\x1b[7mx");
-        let sgrs = sgrs(&s.frame(0.5, &palette()));
+        let sgrs = sgrs(&s.frame(0.5, &palette(), Cursor::Hidden));
         // fg 200 -> 100 halfway becomes the bg; the default bg (0,0,0) is the
         // fg, and is at the background already.
         assert!(
@@ -531,7 +574,7 @@ mod tests {
                 .any(|sgr| sgr == "0;38;2;0;0;0;48;2;100;100;100"),
             "{sgrs:?}"
         );
-        assert!(!text(&s.frame(0.5, &palette())).contains(";7"));
+        assert!(!text(&s.frame(0.5, &palette(), Cursor::Hidden)).contains(";7"));
     }
 
     /// Bold and dim survive; italic and underline do not, since a fade frame
@@ -540,7 +583,7 @@ mod tests {
     fn bold_and_dim_survive_and_underline_does_not() {
         let mut s = Shadow::new(1, 8);
         s.feed(b"\x1b[1mb\x1b[0;2md\x1b[0;4mu");
-        let sgrs = sgrs(&s.frame(0.5, &palette()));
+        let sgrs = sgrs(&s.frame(0.5, &palette(), Cursor::Hidden));
         assert!(sgrs.iter().any(|sgr| sgr.starts_with("0;1;38")), "{sgrs:?}");
         assert!(sgrs.iter().any(|sgr| sgr.starts_with("0;2;38")), "{sgrs:?}");
         assert!(!sgrs.iter().any(|sgr| sgr.contains(";4;")), "{sgrs:?}");
@@ -553,7 +596,7 @@ mod tests {
         let mut s = Shadow::new(2, 6);
         s.feed(b"shell");
         s.feed(b"\x1b[?1049h\x1b[2J\x1b[Hnvim");
-        let t = text(&s.frame(0.5, &palette()));
+        let t = text(&s.frame(0.5, &palette(), Cursor::Hidden));
         assert!(t.contains("nvim"), "{t:?}");
         assert!(!t.contains("shell"), "{t:?}");
     }
@@ -568,7 +611,7 @@ mod tests {
         s.resize(0, 1);
         assert_eq!(s.size(), (MIN_SIZE, MIN_SIZE));
         s.feed(b"wrap wrap wrap wrap\r\nand scroll\r\n");
-        let _ = s.frame(0.5, &palette());
+        let _ = s.frame(0.5, &palette(), Cursor::Hidden);
     }
 
     /// Nothing drawn is nothing drawn, however the cells got their colours;
@@ -592,10 +635,101 @@ mod tests {
     fn invalidating_makes_the_next_frame_a_full_one() {
         let mut s = Shadow::new(2, 4);
         s.feed(b"a");
-        let _ = s.frame(0.5, &palette());
-        assert!(wrapper_only(&s.frame(0.5, &palette())));
+        let _ = s.frame(0.5, &palette(), Cursor::Hidden);
+        assert!(wrapper_only(&s.frame(0.5, &palette(), Cursor::Hidden)));
         s.invalidate();
-        assert_eq!(placements(&s.frame(0.5, &palette())).len(), 2);
+        assert_eq!(
+            placements(&s.frame(0.5, &palette(), Cursor::Hidden)).len(),
+            2
+        );
+    }
+
+    /// The bytes after the cells, up to the end of the sync span: the cursor
+    /// placement and show, or nothing.
+    fn cursor_tail(frame: &[u8]) -> &[u8] {
+        let body = &frame[..frame.len() - SYNC_END.len()];
+        let at = body
+            .windows(RESET_SGR.len())
+            .rposition(|w| w == RESET_SGR)
+            .expect("a trailing SGR reset");
+        &body[at + RESET_SGR.len()..]
+    }
+
+    /// The last frame of a fade in hands the screen back with the cursor on
+    /// the cell the session left it on and shown — inside the sync span, so
+    /// the screen and its cursor appear together. Every other frame leaves it
+    /// hidden, with no show anywhere in it.
+    #[test]
+    fn a_restored_cursor_is_placed_on_its_cell_and_shown() {
+        let mut s = Shadow::new(4, 8);
+        s.feed(b"\x1b[3;5Hab");
+        let hidden = s.frame(0.5, &palette(), Cursor::Hidden);
+        assert!(!contains(&hidden, SHOW_CURSOR), "{:?}", text(&hidden));
+        assert!(cursor_tail(&hidden).is_empty(), "{:?}", text(&hidden));
+
+        let restored = s.frame(0.0, &palette(), Cursor::Restored);
+        assert_eq!(
+            cursor_tail(&restored),
+            b"\x1b[3;7H\x1b[?25h",
+            "{:?}",
+            text(&restored)
+        );
+        assert!(restored.ends_with(SYNC_END));
+        assert!(
+            restored[SYNC_BEGIN.len()..].starts_with(HIDE_CURSOR),
+            "still hidden while the cells go down: {:?}",
+            text(&restored)
+        );
+    }
+
+    /// A cursor the session hid is the session's to show: a busy editor hides
+    /// it on purpose, and putting it back would second-guess that. The
+    /// restore is then nothing at all, and the frame is a hidden one.
+    #[test]
+    fn a_cursor_the_session_hid_stays_hidden() {
+        let mut s = Shadow::new(4, 8);
+        s.feed(b"\x1b[?25lx");
+        let restored = s.frame(0.0, &palette(), Cursor::Restored);
+        assert!(!contains(&restored, SHOW_CURSOR), "{:?}", text(&restored));
+        assert!(cursor_tail(&restored).is_empty(), "{:?}", text(&restored));
+        // And shown again once the session shows it.
+        s.feed(b"\x1b[?25h");
+        assert_eq!(
+            cursor_tail(&s.frame(0.0, &palette(), Cursor::Restored)),
+            b"\x1b[1;2H\x1b[?25h"
+        );
+    }
+
+    /// The attach notice saves and restores the cursor around its box (see
+    /// `announce`); the shadow follows both, so a resume after one puts the
+    /// cursor back on the editor's cell, not the box's corner.
+    #[test]
+    fn the_notices_save_and_restore_keep_the_cursor_on_the_editors_cell() {
+        let mut s = Shadow::new(6, 20);
+        s.feed(b"\x1b[2;3Hedit");
+        s.feed(
+            b"\x1b[?2026h\x1b7\x1b[4;5H\x1b[0m\xe2\x95\xad\xe2\x94\x80\xe2\x95\xae\x1b8\x1b[?2026l",
+        );
+        assert_eq!(
+            cursor_tail(&s.frame(0.0, &palette(), Cursor::Restored)),
+            b"\x1b[2;7H\x1b[?25h"
+        );
+    }
+
+    /// A retired shadow has no cursor to speak of either.
+    #[test]
+    fn a_retired_shadow_restores_no_cursor() {
+        let mut s = Shadow::new(4, 4);
+        s.feed(b"ok");
+        let hook = panic::take_hook();
+        panic::set_hook(Box::new(|_| {}));
+        s.guard(|_| panic!("a parser bug"));
+        panic::set_hook(hook);
+        assert!(wrapper_only(&s.frame(0.0, &palette(), Cursor::Restored)));
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 
     /// A parser that panics retires the shadow rather than the relay: nothing
@@ -612,7 +746,7 @@ mod tests {
         assert!(s.broken);
         assert!(!s.is_usable());
         s.feed(b"more");
-        assert!(wrapper_only(&s.frame(0.5, &palette())));
+        assert!(wrapper_only(&s.frame(0.5, &palette(), Cursor::Hidden)));
     }
 
     /// Nothing about a frame depends on the size being sane.
@@ -621,10 +755,10 @@ mod tests {
         for &(cols, rows) in crate::ui::test_support::TINY_SIZES {
             let mut s = Shadow::new(rows, cols);
             s.feed(b"\x1b[31mhello\r\nworld\x1b[0m");
-            let _ = s.frame(0.5, &palette());
-            let _ = s.frame(1.0, &palette());
+            let _ = s.frame(0.5, &palette(), Cursor::Hidden);
+            let _ = s.frame(1.0, &palette(), Cursor::Hidden);
             s.resize(rows, cols);
-            let _ = s.frame(0.5, &palette());
+            let _ = s.frame(0.5, &palette(), Cursor::Hidden);
         }
     }
 }
