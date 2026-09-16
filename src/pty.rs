@@ -448,8 +448,9 @@ impl Attachment {
     }
 
     /// Dissolve the screen the shadow holds in from the background — for a
-    /// resumed client, whose last screen the shadow still has. Says whether
-    /// it did; if not, the terminal is as the hand-off left it.
+    /// resumed client, whose last screen the shadow still has — ending with
+    /// the cursor back on the cell that screen had it on. Says whether it
+    /// did; if not, the terminal is as the hand-off left it, cursor included.
     fn dissolve_in(&mut self) -> bool {
         let Some(shadow) = self.shadow.as_mut().filter(|s| s.has_contents()) else {
             return false;
@@ -908,9 +909,19 @@ pub fn relay(
         // The size first, so the frames fit the terminal as it is now; then
         // the screen the client had dissolves in, and only then is the
         // client asked to repaint — its paint lands over the last frame.
+        //
+        // Either way the cursor is shown before the repaint is asked for,
+        // not left to it: the fade out that ended the last relay hid the
+        // cursor, and a repaint is what a server *may* do — one busy in Lua
+        // or waiting for a key does nothing until that is over, and an idle
+        // editor writes nothing on its own. A fade in puts the cursor back
+        // on the session's own cell as its last frame; without one it is
+        // shown where the erase left it, as every screen left it before
+        // there was a fade.
         attachment.resize_to(term::terminal_size());
         if !attachment.dissolve_in() {
             attachment.shadow_saw(term::RESUME);
+            term::show_cursor();
         }
         repaint(&mut attachment, Repaint::Resume);
     }

@@ -164,6 +164,25 @@ pub fn disable_mouse() {
     let _ = out.flush();
 }
 
+/// Show the cursor — `DECTCEM` on — and nothing else.
+const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
+
+/// Show the cursor, for a client about to be resumed onto a screen nothing
+/// dissolved in.
+///
+/// A fade hides the cursor and, on a fade in, puts it back on the last frame
+/// (see [`crate::shadow`]). A resume with no fade in — the fade is off, the
+/// shadow has nothing to show or cannot be trusted — inherits the hide from the
+/// fade out that ended the last relay and has nothing to undo it: the repaint
+/// asked for next is asked for, not certain. Shown here, where the erase left
+/// it, which is where every screen used to leave it before there was a fade.
+pub fn show_cursor() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(SHOW_CURSOR);
+    let _ = out.flush();
+}
+
 /// Put the screen back to a state a shell can be used in: cursor visible,
 /// colours reset, primary screen. For the paths that end at a shell prompt
 /// with a message — an attach that failed, a detach — where the last thing
@@ -417,8 +436,21 @@ mod tests {
         // would undo the hide the screen about to be drawn does for itself.
         assert_eq!(INHERITED, b"\x1b[?2026l\x1b[0m");
         assert!(!contains(INHERITED, b"\x1b[?1049l"));
-        assert!(!contains(INHERITED, b"\x1b[?25h"));
+        assert!(!contains(INHERITED, SHOW_CURSOR));
         assert!(!contains(INHERITED, b"\x1b[?1002l"));
+    }
+
+    /// The show a resume falls back on is the one every reset carries, and
+    /// says nothing else: a client is about to draw, and its screen and modes
+    /// are its own.
+    #[test]
+    fn the_cursor_show_is_the_one_the_reset_carries_and_nothing_more() {
+        assert!(contains(RESET, SHOW_CURSOR));
+        assert_eq!(SHOW_CURSOR, b"\x1b[?25h");
+        assert!(
+            !contains(HANDOVER, SHOW_CURSOR) && !contains(RESUME, SHOW_CURSOR),
+            "the hand-offs leave the cursor to whoever draws next"
+        );
     }
 
     /// Every path `RESET` ends on is a shell prompt, and a shell wants no mouse
