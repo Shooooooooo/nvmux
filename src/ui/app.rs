@@ -441,9 +441,9 @@ impl App {
     /// under it; a press on the row already selected arms its release to
     /// attach. With the pointer's row always selected that makes a single
     /// click open the session it is over — and on a terminal that reports no
-    /// motion (a held client without `'mousemoveevent'`), the same two rules
-    /// read as "click to select, click again to open", with no double-click
-    /// clock either way. A drag with the button held picks the row up — the
+    /// motion (one without any-event tracking), the same two rules read as
+    /// "click to select, click again to open", with no double-click clock
+    /// either way. A drag with the button held picks the row up — the
     /// same [`Mode::Reorder`] the space bar enters — carries it, and the
     /// release places it, with the same request `Enter` would make. The wheel
     /// moves the selection, or the row in flight, one row at a time and stops

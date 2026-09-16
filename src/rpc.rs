@@ -309,6 +309,13 @@ impl<S: Read + Write> Client<S> {
         Ok(())
     }
 
+    /// `nvim_eval` — deferred, like [`Client::command`]. The resume asks it
+    /// what the client's mouse setting is, once the server is known to be
+    /// free to answer.
+    pub fn eval(&mut self, expr: &str) -> Result<Value, RpcError> {
+        self.call("nvim_eval", vec![Value::String(expr.into())])
+    }
+
     /// `nvim_get_mode` — a *fast* call, answered even while the editor is
     /// blocked at a prompt, which is exactly when it is worth asking. See the
     /// module docs.

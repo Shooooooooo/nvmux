@@ -111,40 +111,21 @@ pub(crate) struct Screen {
     terminal: ratatui::DefaultTerminal,
     /// Set by the explicit close so `Drop` does not restore a second time.
     closed: bool,
-    /// Whether this screen turned mouse reporting on, and so must turn it off
-    /// on every way out. See [`Behind`].
-    mouse: bool,
-}
-
-/// What a screen is drawn over, which decides whose terminal modes are in
-/// force while it is up.
-///
-/// The screens set no colours so as to inherit the terminal's palette; for the
-/// same reason they inherit a held client's *modes* — the mouse, the kitty
-/// keyboard protocol, bracketed paste, focus reporting — rather than setting
-/// their own and then guessing what to put back. A `--remote-ui` client enables
-/// each of those once at startup and never again (see
-/// [`crate::term::enter_alt_screen_and_clear`] for the alternate screen, which
-/// is the same problem), and nvmux does not read the client's output to learn
-/// what it asked for. So over a client, a screen takes the mouse only if the
-/// client had it — and its highlight follows the pointer only if the client
-/// asked for motion reports, which Neovim does with `'mousemoveevent'` — and
-/// hands the modes back exactly as it found them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Behind {
-    /// A held client — `<prefix> Space`, `<prefix> c`, `<prefix> ?`. Its modes
-    /// are left as they are.
-    Client,
-    /// Nothing: the first screen of the program, or one reached after a client
-    /// exited or an attach failed. The screen turns mouse reporting on for
-    /// itself and off again as it closes, whatever it hands the terminal to —
-    /// a client spawned next enables its own.
-    Nothing,
 }
 
 impl Screen {
-    /// Take the terminal.
-    pub(crate) fn open(behind: Behind) -> Result<Self> {
+    /// Take the terminal — and the mouse.
+    ///
+    /// Every screen turns mouse reporting on for itself and off again as it
+    /// closes, whatever is behind it. Where that is a held client, the relay
+    /// puts the client's own setting back as it resumes it, having asked the
+    /// client's server what that was (see `pty::repaint`); a client spawned
+    /// next enables its own. The screens set no colours so as to inherit the
+    /// terminal's palette, but a *mode* cannot be inherited the same way — a
+    /// `--remote-ui` client enables the mouse once, at startup, and would
+    /// never re-enable a mode nvmux had turned off — which is why this is
+    /// restored by asking rather than left alone.
+    pub(crate) fn open() -> Result<Self> {
         // Stops crossterm second-guessing us; see the module docs on colour.
         ratatui::crossterm::style::force_color_output(true);
 
@@ -157,28 +138,21 @@ impl Screen {
         let mut screen = Self {
             terminal: ratatui::try_init()?,
             closed: false,
-            mouse: false,
         };
         // A second "enter alternate screen" is a no-op on xterm and kitty, and
         // ratatui's first draw only paints what differs from an empty buffer —
         // so without this the content lands in the middle of the editor's last
         // frame. From here on an error restores through `Drop`.
         screen.terminal.clear()?;
-        if behind == Behind::Nothing {
-            crate::term::enable_mouse();
-            screen.mouse = true;
-        }
+        crate::term::enable_mouse();
         Ok(screen)
     }
 
-    /// Undo [`crate::term::enable_mouse`] if this screen did it. Before the
-    /// modes and the screen switch, so nothing this writes can land after the
-    /// one-write handover the attach path relies on.
+    /// Undo [`crate::term::enable_mouse`]. Before the modes and the screen
+    /// switch, so nothing this writes can land after the one-write handover the
+    /// attach path relies on.
     fn release_mouse(&mut self) {
-        if self.mouse {
-            self.mouse = false;
-            crate::term::disable_mouse();
-        }
+        crate::term::disable_mouse();
     }
 
     pub(crate) fn terminal(&mut self) -> &mut ratatui::DefaultTerminal {
@@ -236,11 +210,8 @@ impl Drop for Screen {
 ///
 /// The restore happens before the outcome propagates: an error that leaves the
 /// terminal in raw mode with no echo is far worse than the error itself.
-pub(crate) fn owning<T>(
-    behind: Behind,
-    f: impl FnOnce(&mut ratatui::DefaultTerminal) -> Result<T>,
-) -> Result<T> {
-    let mut screen = Screen::open(behind)?;
+pub(crate) fn owning<T>(f: impl FnOnce(&mut ratatui::DefaultTerminal) -> Result<T>) -> Result<T> {
+    let mut screen = Screen::open()?;
     let outcome = f(screen.terminal());
     screen.close()?;
     outcome
@@ -251,11 +222,10 @@ pub(crate) fn owning<T>(
 /// [`Screen::close_for_attach`] rather than leaving the outgoing session's frame
 /// on display for the length of the client spawn.
 pub(crate) fn owning_for_attach<T>(
-    behind: Behind,
     attaches: impl FnOnce(&T) -> bool,
     f: impl FnOnce(&mut ratatui::DefaultTerminal) -> Result<T>,
 ) -> Result<T> {
-    let mut screen = Screen::open(behind)?;
+    let mut screen = Screen::open()?;
     let outcome = f(screen.terminal());
     // The restore happens before the outcome propagates, as in `owning`, and an
     // error takes the ordinary close: there is no session coming, and the shell
@@ -301,21 +271,14 @@ pub(crate) fn poll_key_for(tick: Duration) -> Result<Option<Key>> {
 /// `still_attached` says that session still has a client behind it, which is
 /// what makes `Esc` a way back to it rather than a key that does nothing. It is
 /// false where the picker is all there is: the first screen of the program, and
-/// the trip back from a failed attach or a session whose child exited. It is
-/// also what decides whose terminal modes the picker runs under — see
-/// [`Behind`].
+/// the trip back from a failed attach or a session whose child exited.
 pub fn run(
     transport: &dyn Transport,
     message: Option<String>,
     focused: Option<&str>,
     still_attached: bool,
 ) -> Result<Outcome> {
-    let behind = if still_attached {
-        Behind::Client
-    } else {
-        Behind::Nothing
-    };
-    owning_for_attach(behind, Outcome::attaches, |terminal| {
+    owning_for_attach(Outcome::attaches, |terminal| {
         run_loop(terminal, transport, message, focused, still_attached)
     })
 }
