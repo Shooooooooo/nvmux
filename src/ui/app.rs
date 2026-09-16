@@ -5,6 +5,11 @@
 //! makes every keybind, the filtering, and the prompt behaviour testable without
 //! a terminal, a transport, or a running Neovim.
 
+use std::cell::RefCell;
+
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
+
 use crate::session::Session;
 
 /// What the picker is currently doing.
@@ -78,6 +83,11 @@ pub struct App {
     /// What the left button last went down on, until it comes up. See
     /// [`App::on_mouse`].
     pressed: Option<Pressed>,
+    /// Scratch buffers for the filter's scorer, kept across queries: building
+    /// a `Matcher` allocates its whole matrix up front, and [`App::visible`]
+    /// is asked several times per keystroke. In a `RefCell` because scoring
+    /// takes `&mut` and `visible` is a read.
+    matcher: RefCell<Matcher>,
 }
 
 /// Where a left press landed, which decides what its release means.
@@ -91,6 +101,23 @@ enum Pressed {
     Selected,
 }
 
+/// What the filter is matched against: the name, and the last component of
+/// the working directory — the project folder, for a session whose name does
+/// not say (`scratch`, or the `session 3` the prompt suggested).
+///
+/// The last component only, never the path. Every session on a host shares
+/// most of its path with every other, and a fuzzy match over `/home/you/...`
+/// would admit the whole list for any query that could be spelled out of it.
+/// The folder is the one part that tells sessions apart, and the one part a
+/// user would think to type.
+fn haystacks(s: &Session) -> impl Iterator<Item = &str> {
+    let folder = s
+        .directory
+        .rsplit('/')
+        .find(|component| !component.is_empty());
+    std::iter::once(s.name.as_str()).chain(folder)
+}
+
 impl App {
     pub fn new(sessions: Vec<Session>) -> Self {
         Self {
@@ -102,6 +129,7 @@ impl App {
             pending: None,
             came_from: None,
             pressed: None,
+            matcher: RefCell::new(Matcher::new(Config::DEFAULT)),
         }
     }
 
@@ -164,14 +192,36 @@ impl App {
     }
 
     /// Sessions matching the current filter, in display order.
+    ///
+    /// The match is fuzzy — `asv` finds `api-server` — and is the same scorer,
+    /// with the same case and accent rules, that ranks the create prompt's
+    /// directory completions ([`super::complete`]): case-insensitive unless the
+    /// query has a capital in it, and `Pattern::parse`'s syntax throughout, so
+    /// a query of two words wants both.
+    ///
+    /// Fuzzy in what it *admits*, and nothing else. A completion menu sorts by
+    /// score because its rows are interchangeable; these are not. A row's number
+    /// is its position in the list, `<prefix> 3` and the digit keys name it by
+    /// that number, and a reorder under a filter deals the visible numbers back
+    /// out down the visible rows — all of which assume the filtered view is the
+    /// full list with rows removed. So the score is a yes or a no here, and the
+    /// order is the list's own.
     pub fn visible(&self) -> Vec<&Session> {
         if self.filter.is_empty() {
             return self.sessions.iter().collect();
         }
-        let needle = self.filter.to_lowercase();
+        let pattern = Pattern::parse(&self.filter, CaseMatching::Smart, Normalization::Smart);
+        let mut matcher = self.matcher.borrow_mut();
+        let mut buf = Vec::new();
         self.sessions
             .iter()
-            .filter(|s| s.name.to_lowercase().contains(&needle))
+            .filter(|s| {
+                haystacks(s).any(|text| {
+                    pattern
+                        .score(Utf32Str::new(text, &mut buf), &mut matcher)
+                        .is_some()
+                })
+            })
             .collect()
     }
 
@@ -948,6 +998,93 @@ mod tests {
             a.on_key(Key::Char(c));
         }
         assert_eq!(names(&a), ["API-Server"]);
+    }
+
+    /// A capital in the query asks for one in the name, as it does in the create
+    /// prompt's completion. Lower-case queries stay as forgiving as ever.
+    #[test]
+    fn a_capital_in_the_query_makes_it_case_sensitive() {
+        let a = filtering(&["API-Server", "api-client"], "API");
+        assert_eq!(names(&a), ["API-Server"]);
+        let a = filtering(&["API-Server", "api-client"], "api");
+        assert_eq!(names(&a), ["API-Server", "api-client"]);
+    }
+
+    #[test]
+    fn the_filter_is_fuzzy() {
+        let a = filtering(&["api-server", "dotfiles", "notes", "scratch"], "asv");
+        assert_eq!(names(&a), ["api-server"], "letters in order, gaps allowed");
+        let a = filtering(&["api-server", "dotfiles", "notes", "scratch"], "sva");
+        assert!(names(&a).is_empty(), "but not out of order");
+    }
+
+    /// Two words are two requirements, both of which the same row has to meet.
+    #[test]
+    fn a_query_of_two_words_wants_both() {
+        let a = filtering(&["api server", "api client", "web server"], "api ser");
+        assert_eq!(names(&a), ["api server"]);
+    }
+
+    /// The rows a fuzzy filter admits keep the list's order and their numbers;
+    /// nothing is sorted by how well it matched.
+    #[test]
+    fn a_filtered_list_keeps_its_order_rather_than_ranking_by_score() {
+        // `ts` is a far better match for "ts" than for "notes-tests-server",
+        // and comes after it in the list all the same.
+        let a = filtering(&["notes-tests-server", "ts", "api"], "ts");
+        assert_eq!(names(&a), ["notes-tests-server", "ts"]);
+        let numbers: Vec<u32> = a.visible().iter().map(|s| s.state.num).collect();
+        assert_eq!(numbers, [1, 2], "the numbers travel with the rows");
+    }
+
+    fn filtering(names: &[&str], query: &str) -> App {
+        let mut a = app(names);
+        a.on_key(Key::Char('/'));
+        for c in query.chars() {
+            a.on_key(Key::Char(c));
+        }
+        a
+    }
+
+    /// A session is where it runs as much as what it is called: `scratch` in
+    /// `~/work/billing` is found by `billing`. Only the last component takes
+    /// part, though — see `haystacks`.
+    #[test]
+    fn the_filter_also_matches_the_working_directorys_last_component() {
+        let mut a = app(&["scratch", "notes", "session 3"]);
+        let mut sessions = a.sessions().to_vec();
+        sessions[0].directory = "/home/you/work/billing".into();
+        sessions[1].directory = "/home/you/notes".into();
+        sessions[2].directory = "/home/you/work/api/".into();
+        a.set_sessions(sessions);
+
+        a.on_key(Key::Char('/'));
+        for c in "billing".chars() {
+            a.on_key(Key::Char(c));
+        }
+        assert_eq!(names(&a), ["scratch"], "found by its folder");
+
+        a.on_key(Key::Esc);
+        a.on_key(Key::Char('/'));
+        for c in "api".chars() {
+            a.on_key(Key::Char(c));
+        }
+        assert_eq!(
+            names(&a),
+            ["session 3"],
+            "a trailing slash is not a component"
+        );
+
+        a.on_key(Key::Esc);
+        a.on_key(Key::Char('/'));
+        for c in "you".chars() {
+            a.on_key(Key::Char(c));
+        }
+        assert!(
+            names(&a).is_empty(),
+            "the shared part of the path admits nothing: {:?}",
+            names(&a)
+        );
     }
 
     /// The list shrinks under the cursor as the query grows; the selection must

@@ -111,7 +111,15 @@ fn unattended(ctl: &Path) -> Vec<String> {
 /// Without it, `-O cancel` leaves the local socket file on disk and the next
 /// forward onto that path fails with rc 255 and `mux_client_forward: forwarding
 /// request failed` — which breaks detach-then-reattach. Measured both ways.
-pub fn master_args(host: &str, ctl: &Path) -> Vec<String> {
+///
+/// `connect_timeout` bounds how long the connection attempt itself may take,
+/// in seconds; `None` leaves it to the system's TCP timeout, which is what the
+/// first connection wants — the user is watching it, and can stop it. A
+/// *re*connection is different: it is one of a series, and a link that is still
+/// down drops packets rather than refusing them, so without a bound each
+/// attempt would hang for the minutes the kernel allows and the series would
+/// never get to its next try. See [`crate::reconnect`].
+pub fn master_args(host: &str, ctl: &Path, connect_timeout: Option<u64>) -> Vec<String> {
     let mut args = vec![
         "-M".into(),
         "-N".into(),
@@ -130,6 +138,9 @@ pub fn master_args(host: &str, ctl: &Path) -> Vec<String> {
         "-o".into(),
         "ServerAliveCountMax=3".into(),
     ];
+    if let Some(secs) = connect_timeout {
+        args.extend(["-o".into(), format!("ConnectTimeout={secs}")]);
+    }
     args.extend(common(ctl));
     args.push(host.to_string());
     args
@@ -223,9 +234,13 @@ pub fn classify(host: &str, code: i32, stderr: &str) -> SshError {
     if lower.contains("could not resolve hostname")
         || lower.contains("name or service not known")
         || lower.contains("no route to host")
-        || lower.contains("connection timed out")
+        // "Connection timed out" on Linux, "Operation timed out" on macOS,
+        // and "timed out during banner exchange" under `ConnectTimeout`.
+        || lower.contains("timed out")
         || lower.contains("connection refused")
         || lower.contains("network is unreachable")
+        // macOS, with the Wi-Fi off.
+        || lower.contains("host is down")
     {
         return SshError::Unreachable(host.to_string());
     }
@@ -288,6 +303,12 @@ impl Ssh {
     /// Bring up a master connection, or confirm the existing one. Reusing a live
     /// master is what makes per-session forwards cheap.
     pub fn ensure_master(&self) -> Result<(), SshError> {
+        self.ensure_master_within(None)
+    }
+
+    /// The same, with the connection attempt bounded to `connect_timeout`
+    /// seconds — see [`master_args`] for when that is wanted.
+    pub fn ensure_master_within(&self, connect_timeout: Option<u64>) -> Result<(), SshError> {
         if self.is_master_alive() {
             return Ok(());
         }
@@ -295,7 +316,11 @@ impl Ssh {
         // `-f` backgrounds ssh once authentication is done, so this blocks for
         // exactly as long as a key touch or passphrase takes.
         let out = self
-            .run(&master_args(&self.host, &self.control_path))
+            .run(&master_args(
+                &self.host,
+                &self.control_path,
+                connect_timeout,
+            ))
             .map_err(|e| spawn_error(e, &self.host))?;
         if !out.status.success() {
             return Err(classify(
@@ -496,7 +521,7 @@ mod tests {
 
     #[test]
     fn the_master_sets_stream_local_bind_unlink() {
-        let args = master_args("myhost", Path::new(CTL));
+        let args = master_args("myhost", Path::new(CTL), None);
         let s = joined(&args);
         // This one is load-bearing: without it `-O cancel` leaves the socket
         // file and the next forward fails rc 255, breaking re-attach.
@@ -508,6 +533,20 @@ mod tests {
         assert!(s.contains("ServerAliveCountMax=3"));
         assert!(s.contains(&format!("ControlPath={CTL}")));
         assert_eq!(args.last().expect("host"), "myhost");
+    }
+
+    /// The first connection waits as long as the system does; a reconnection
+    /// is bounded, and only then.
+    #[test]
+    fn a_connect_timeout_is_set_only_when_asked_for() {
+        let unbounded = joined(&master_args("myhost", Path::new(CTL), None));
+        assert!(!unbounded.contains("ConnectTimeout"), "{unbounded}");
+        let bounded = joined(&master_args("myhost", Path::new(CTL), Some(10)));
+        assert!(bounded.contains("ConnectTimeout=10"), "{bounded}");
+        assert!(
+            bounded.ends_with("myhost"),
+            "the host is still last: {bounded}"
+        );
     }
 
     /// Setting it on the forward client does nothing, because the master does
@@ -547,7 +586,7 @@ mod tests {
             "1.2.3.4",
             "h-1_2.example",
         ] {
-            assert!(master_args(host, Path::new(CTL)).contains(&host.to_string()));
+            assert!(master_args(host, Path::new(CTL), None).contains(&host.to_string()));
             assert!(check_args(host, Path::new(CTL)).contains(&host.to_string()));
         }
     }
@@ -654,6 +693,18 @@ mod tests {
             ),
             SshError::Unreachable(_)
         ));
+        // What a machine that has just woken up says, on each platform and
+        // under the bounded connect a reconnection uses.
+        for words in [
+            "ssh: connect to host h port 22: Operation timed out",
+            "ssh: connect to host h port 22: Host is down",
+            "Connection timed out during banner exchange",
+        ] {
+            assert!(
+                matches!(classify("h", 255, words), SshError::Unreachable(_)),
+                "{words}"
+            );
+        }
         assert!(matches!(
             classify(
                 "h",

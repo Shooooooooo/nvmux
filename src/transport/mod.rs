@@ -125,6 +125,34 @@ pub trait Transport {
     /// socket itself, over SSH the local end of a forward. Everything downstream
     /// is identical in both cases.
     fn local_socket_for(&self, s: &Session) -> Result<PathBuf>;
+
+    /// Bring the link to the host back if it has gone, and say whether it had.
+    ///
+    /// Asked once a client has exited on its own, which over ssh is what a
+    /// dropped connection looks like: the forward closes under the client and
+    /// it leaves, exactly as it would have if the session had been quit. The
+    /// link is what tells the two apart — a session that ended leaves the
+    /// master standing — so the answer is not a bool but three: the link was
+    /// fine ([`Reconnect::Unneeded`]) and the session is what went; it was
+    /// down and is back ([`Reconnect::Restored`]), so the same session can be
+    /// attached again; or it was down and stays down, which is the error.
+    ///
+    /// One attempt, bounded: this is the step [`crate::reconnect`] repeats, so
+    /// it must not itself wait for the system's TCP timeout. Locally there is
+    /// no link to lose, and the default says so.
+    fn reconnect(&self) -> Result<Reconnect> {
+        Ok(Reconnect::Unneeded)
+    }
+}
+
+/// What [`Transport::reconnect`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reconnect {
+    /// The link never went: whatever exited, exited for its own reasons.
+    Unneeded,
+    /// The link had gone and is back. Every forward went with it, so a
+    /// session is reached afresh — [`Transport::local_socket_for`] knows.
+    Restored,
 }
 
 /// Build the transport for a location.
