@@ -60,9 +60,9 @@ hardware keys, because nvmux drives your own ssh client rather than
 reimplementing it.
 
 Attaching waits for the session to answer, however long that takes — one in
-the middle of `:!make` answers when the make is done. After a moment a spinner
-appears in the bottom-right corner, and after a few seconds it offers `Esc`,
-which gives up and goes back to the picker.
+the middle of `:!make` answers when the make is done. If it takes more than a
+moment, the screen says which session it is waiting for, with a spinner, and
+the bottom row offers `Esc` to give up and go back to the picker.
 
 ### While attached
 

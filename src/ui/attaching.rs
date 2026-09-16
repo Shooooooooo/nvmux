@@ -5,43 +5,54 @@
 //! (see [`crate::pty::Probe`]), and the probe's last call is a deferred one: a
 //! session in the middle of `:!make` answers it when the make is done. That
 //! wait used to be three seconds and then a refusal. Now it is as long as it
-//! takes, and this screen is what makes that bearable — a spinner in the
-//! bottom-right corner, so the wait is visibly the session's and not a hang,
-//! and, once it has gone on long enough, `Esc` to give up on it.
+//! takes, and this screen is what makes that bearable — it names the session
+//! being waited for, with a spinner beside the name so the wait is visibly the
+//! session's and not a hang, and it offers `Esc` to give up on it.
 //!
-//! # Two clocks
+//! # The shape is the picker's
 //!
-//! Nothing is drawn for the first [`GRACE`]. An attach to an idle session is
-//! milliseconds locally and a few hundred over ssh, and a spinner that flashed
-//! on every one of those would be noise on the transition it is meant to
-//! explain.
+//! One centred line where the picker draws its list, and one dim hint row on
+//! the last line: [`draw::split_hint_row`] and [`draw::draw_hint_row`], the
+//! same two calls every other screen makes. The line is the picker's
+//! empty-list line by another name — a single dim sentence standing in for a
+//! list that is not there — so it is drawn the same way, through
+//! [`draw::centre_vertically`].
 //!
-//! Nothing is *read* for the first [`PATIENCE`], and this is the one that
-//! matters. Whatever the user types while an attach is in flight sits in the
-//! terminal's input queue, and every byte of it has always reached the editor
-//! once the relay began: a `:` typed straight after `Enter` on the picker
-//! opens the command line. That has to stay true, and a screen that read its
-//! keys would break it — the keys would be gone from the queue, and one of
-//! them might be the `Esc` a vim user types by reflex, which must not cancel
-//! an attach that was about to succeed. So the screen leaves the queue alone
-//! until the wait has gone on for longer than the old budget, which is the
-//! point past which no attach used to succeed at all: nothing typed by then
-//! was ever going to be delivered. From there the row says `esc cancel`, what
-//! was typed ahead is drained and dropped (an `Esc` typed before the offer
-//! existed was not an answer to it), and `Esc` or `Ctrl-c` ends the attach.
-//! Any other key is dropped too: the session is not answering, and there is
-//! nowhere to send it.
+//! # The grace period
+//!
+//! Nothing is drawn, and nothing is read, for the first [`GRACE`]. An attach
+//! to an idle session is milliseconds locally and a few hundred over ssh, and
+//! a spinner that flashed on every one of those would be noise on the very
+//! transition it exists to explain. Not *reading* matters more: whatever the
+//! user types while an attach is in flight sits in the terminal's input queue,
+//! and a fast attach hands all of it to the editor as the relay begins — a `:`
+//! typed straight after `Enter` on the picker opens the command line. A screen
+//! that polled the keyboard would take those bytes out of the queue.
+//!
+//! Once the spinner is up, that reverses: the screen is what the user is
+//! typing into. It reads keys from then on, and `Esc` or `Ctrl-c` ends the
+//! attach — the offer on the hint row is live from the moment it appears,
+//! which is the whole reason that row is unconditional. What was typed
+//! *before* the spinner appeared is drained and dropped at that moment rather
+//! than acted on: an `Esc` typed a tenth of a second after `Enter`, onto a
+//! blank screen, was not an answer to an offer nobody had seen yet. Any other
+//! key is dropped too, whenever it arrives: the session is not answering, and
+//! there is nowhere to send it.
+//!
+//! What that costs is the keys typed *during* a visible wait, which used to
+//! reach the editor and no longer do. It is the trade the offer is worth: a
+//! wait long enough to draw on is a wait long enough to want out of, and the
+//! screen the keys go to is the one on display.
 //!
 //! One consequence worth knowing: the probe used to run on a cooked terminal,
 //! where `Ctrl-c` was a signal that ended nvmux. Here it is a key — queued for
-//! the editor before [`PATIENCE`], a cancel after.
+//! the editor while the screen is blank, a cancel once the spinner is up.
 //!
 //! # No mouse
 //!
-//! The one screen that does not take the mouse, for the reason above: with
-//! reporting on, every movement of the pointer during the wait would be a
-//! report in the same queue, handed to the editor as input the moment the
-//! relay began.
+//! The one screen that does not take the mouse, and the grace period is why:
+//! with reporting on, a pointer moved during those first milliseconds would
+//! leave SGR reports in the queue the editor is about to read.
 //!
 //! # The tick
 //!
@@ -52,34 +63,31 @@
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
-use ratatui::layout::Alignment;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
-use unicode_width::UnicodeWidthStr;
 
 use super::app::Key;
 use super::draw;
 use crate::error::Result;
 use crate::pty::Probe;
 
-/// How long an attach may take before anything is shown.
+/// How long an attach may take before the screen appears — and, with it,
+/// before a single key is read. The one threshold this screen has; see the
+/// module docs for both halves of what it gates.
 const GRACE: Duration = Duration::from_millis(300);
-
-/// How long an attach may take before the user is offered a way out — and
-/// before this screen reads a single key. The old probe budget, deliberately:
-/// see the module docs.
-const PATIENCE: Duration = Duration::from_secs(3);
 
 /// One turn of the spinner, and the wait between polls.
 const FRAME: Duration = Duration::from_millis(80);
 
-/// The spinner's frames. Braille, one column each, so the row's width does
+/// The spinner's frames. Braille, one column each, so the line's width does
 /// not change as it turns.
 const GLYPHS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-/// The way out, in the grammar the hint rows use: key, then action.
+/// The way out, in the grammar the hint rows use: key, then action. Two words
+/// on the last row, like the help screen's `esc back`.
 const CANCEL: &str = "esc cancel";
 
 /// How the wait ended.
@@ -132,7 +140,7 @@ fn run_on(
         name: name.to_string(),
         elapsed: Duration::ZERO,
     };
-    // Whether the queue has been drained, which happens once, at `PATIENCE`.
+    // Whether the queue has been drained, which happens once, at `GRACE`.
     let mut listening = false;
 
     loop {
@@ -142,9 +150,9 @@ fn run_on(
         }
         state.elapsed = started.elapsed();
 
-        // Not a key before `PATIENCE` — not even a poll, which would take
-        // bytes out of the queue the editor is going to read.
-        if state.elapsed >= PATIENCE {
+        // Not a key before `GRACE` — not even a poll, which would take bytes
+        // out of the queue the editor is going to read.
+        if state.elapsed >= GRACE {
             if !listening {
                 listening = true;
                 drain()?;
@@ -160,7 +168,7 @@ fn run_on(
     }
 }
 
-/// Discard everything typed so far. Once, at `PATIENCE`.
+/// Discard whatever was typed before the offer appeared. Once, at [`GRACE`].
 fn drain() -> Result<()> {
     while event::poll(Duration::ZERO)? {
         event::read()?;
@@ -181,49 +189,48 @@ fn next_key() -> Result<Option<Key>> {
     Ok(None)
 }
 
-/// The bottom-right corner: the spinner and what it is waiting on, and after
-/// [`PATIENCE`] the way out. Nothing before [`GRACE`].
+/// The screen: the spinner and what it is waiting on where the picker draws
+/// its list, the way out on the last row. Nothing at all before [`GRACE`].
 ///
-/// Right-aligned on the last row, the one every screen keeps for its hint, and
-/// dim like a hint: it is a status, not something the user is being asked.
+/// Both rows are dim, like every hint row: a status and an offer, neither of
+/// them something the user is being asked to answer.
 fn draw(frame: &mut Frame, state: &State) {
     let area = frame.area();
     if area.height == 0 || area.width == 0 || state.elapsed < GRACE {
         return;
     }
-    let (_, bottom) = draw::split_hint_row(area);
-    let text = row(state, usize::from(bottom.width));
+    let (body, bottom) = draw::split_hint_row(area);
+    draw_status(frame, state, body);
+    draw::draw_hint_row(frame, bottom, CANCEL, true);
+}
+
+/// The status line, drawn the way the empty picker draws "no sessions": one
+/// dim sentence centred on both axes, truncated from the right rather than
+/// wrapped, so the hint row stays where it is.
+///
+/// A terminal with no room above the hint row gets no status: the way out is
+/// worth more than the name of what it gets out of.
+fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let text = draw::truncate(&status(state), usize::from(area.width));
     let para = Paragraph::new(Line::from(Span::styled(
         text,
         Style::default().add_modifier(Modifier::DIM),
     )))
-    .alignment(Alignment::Right);
-    frame.render_widget(para, bottom);
+    .alignment(Alignment::Center);
+    frame.render_widget(para, draw::centre_vertically(area, 1));
 }
 
-/// The row's text, fitted to `width` columns.
+/// The spinner and the session it is waiting for.
 ///
-/// The name is what gives way on a narrow terminal, and the words that
-/// introduce it go with it once there is no room for any of it: the glyph
-/// says a wait is on, and the hint says how to end one. Only a terminal too
-/// narrow for the hint itself cuts the hint.
-fn row(state: &State, width: usize) -> String {
+/// Fitted by the caller rather than here: the two rows truncate
+/// independently, each from the right, as every other row in this UI does.
+fn status(state: &State) -> String {
     let turn = state.elapsed.as_millis() / FRAME.as_millis();
     let glyph = GLYPHS[(turn % GLYPHS.len() as u128) as usize];
-    let tail = if state.elapsed >= PATIENCE {
-        format!("  {CANCEL}")
-    } else {
-        String::new()
-    };
-    let lead = format!("{glyph} attaching to ");
-    let room = width.saturating_sub(lead.width() + tail.width());
-    let name = draw::truncate(&state.name, room);
-    let text = if name.is_empty() {
-        format!("{glyph}{tail}")
-    } else {
-        format!("{lead}{name}{tail}")
-    };
-    draw::truncate(&text, width)
+    format!("{glyph} attaching to {}", state.name)
 }
 
 #[cfg(test)]
@@ -232,6 +239,7 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use unicode_width::UnicodeWidthStr;
 
     fn at(elapsed: Duration, name: &str) -> State {
         State {
@@ -244,8 +252,33 @@ mod tests {
         test_support::render(w, h, |f| draw(f, state))
     }
 
+    /// Which line the status lands on, given the terminal's height: the middle
+    /// of everything above the hint row. Worked out the way
+    /// `draw::centre_vertically` does, so a test says where the line *should*
+    /// be rather than agreeing with wherever it went.
+    fn status_row(h: u16) -> usize {
+        let body = h - 1;
+        usize::from((body - 1) / 2)
+    }
+
+    /// Does this line open with a spinner glyph?
+    fn spins(line: &str) -> bool {
+        line.trim_start()
+            .chars()
+            .next()
+            .is_some_and(|c| GLYPHS.contains(&c))
+    }
+
+    /// Left and right padding of a line on a `w`-column screen, for the
+    /// centring assertions. The idiom `draw` and `help` both use.
+    fn padding(line: &str, w: usize) -> (usize, usize) {
+        (line.len() - line.trim_start().len(), w - line.width())
+    }
+
     /// A fast attach — every local one, most remote ones — shows nothing at
-    /// all, so the transition it sits in is not decorated with a flash.
+    /// all, so the transition it sits in is not decorated with a flash. And
+    /// nothing is read either, which is the half this cannot see; see the
+    /// module docs.
     #[test]
     fn nothing_is_drawn_before_the_grace_period() {
         let lines = render(40, 8, &at(GRACE - Duration::from_millis(1), "dotfiles"));
@@ -253,100 +286,119 @@ mod tests {
             lines.iter().all(String::is_empty),
             "drew before GRACE: {lines:?}"
         );
+
         let lines = render(40, 8, &at(GRACE, "dotfiles"));
-        assert!(!lines[7].is_empty(), "drew nothing at GRACE: {lines:?}");
+        assert!(
+            !lines[status_row(8)].is_empty() && !lines[7].is_empty(),
+            "GRACE must bring up both rows at once: {lines:?}"
+        );
     }
 
-    /// The last row, flush against the right edge, and nothing anywhere else.
+    /// The picker's shape: the status where the list goes, centred on both
+    /// axes, and the way out alone on the last row. Nothing anywhere else —
+    /// two rows, and the screen is otherwise the terminal's own background.
     #[test]
-    fn the_spinner_sits_in_the_bottom_right_corner() {
+    fn the_status_is_centred_and_the_way_out_is_on_the_last_row() {
         let lines = render(40, 8, &at(GRACE, "dotfiles"));
-        for (i, line) in lines.iter().enumerate().take(7) {
-            assert!(line.is_empty(), "row {i} is not blank: {line:?}");
-        }
-        let last = &lines[7];
-        assert!(last.contains("attaching to dotfiles"), "{last:?}");
+        let occupied: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| !l.is_empty())
+            .map(|(i, _)| i)
+            .collect();
         assert_eq!(
-            last.width(),
-            40,
-            "the row does not reach the right edge: {last:?}"
+            occupied,
+            vec![status_row(8), 7],
+            "want the centred status row and the hint row: {lines:?}"
         );
+
+        let status = &lines[status_row(8)];
+        assert!(spins(status), "{status:?}");
+        assert!(status.contains("attaching to dotfiles"), "{status:?}");
+        let (left, right) = padding(status, 40);
         assert!(
-            GLYPHS.contains(&last.trim_start().chars().next().expect("a glyph")),
-            "the row does not start with a spinner glyph: {last:?}"
+            left.abs_diff(right) <= 2,
+            "the status is not centred: {left} left, {right} right, {status:?}"
+        );
+
+        let hint = &lines[7];
+        assert_eq!(hint.trim(), CANCEL);
+        let (left, right) = padding(hint, 40);
+        assert!(
+            left.abs_diff(right) <= 2,
+            "the hint is not centred: {left} left, {right} right, {hint:?}"
         );
     }
 
-    /// `esc cancel` appears exactly when the screen starts listening for it,
-    /// and not a frame before: an offer the screen would not honour yet is a
-    /// lie on the hint row.
+    /// The offer is live from the moment it is drawn (see the module docs), so
+    /// the row carries it on every frame the screen is up — never a hint that
+    /// has to be waited out, and never one the status line has to make room
+    /// for.
     #[test]
-    fn the_way_out_is_offered_only_after_patience() {
-        let before = render(40, 4, &at(PATIENCE - Duration::from_millis(1), "dotfiles"));
-        assert!(!before[3].contains(CANCEL), "{before:?}");
-        let after = render(40, 4, &at(PATIENCE, "dotfiles"));
-        assert!(after[3].contains(CANCEL), "{after:?}");
-        assert!(
-            after[3].ends_with(CANCEL),
-            "the hint is not last: {after:?}"
-        );
+    fn the_way_out_is_offered_for_as_long_as_the_screen_is_up() {
+        let before = render(40, 6, &at(GRACE - Duration::from_millis(1), "dotfiles"));
+        assert!(before[5].is_empty(), "offered before GRACE: {before:?}");
+
+        for elapsed in [GRACE, Duration::from_secs(1), Duration::from_secs(300)] {
+            let lines = render(40, 6, &at(elapsed, "dotfiles"));
+            assert_eq!(lines[5].trim(), CANCEL, "at {elapsed:?}: {lines:?}");
+            assert!(
+                !lines[status_row(6)].contains(CANCEL),
+                "the hint belongs to the last row alone: {lines:?}"
+            );
+        }
     }
 
     /// One glyph per frame, round and round, so the spinner visibly turns
-    /// however long the wait is.
+    /// however long the wait is — and every glyph is one column, so the line
+    /// does not jitter as it goes.
     #[test]
     fn the_spinner_turns_one_glyph_per_frame_and_wraps() {
         for k in 0..25u32 {
-            let text = row(&at(FRAME * k, "x"), 80);
+            let text = status(&at(FRAME * k, "x"));
             let want = GLYPHS[k as usize % GLYPHS.len()];
             assert!(
                 text.starts_with(want),
                 "frame {k}: want {want:?}, got {text:?}"
             );
         }
-        // And the row is the same width from one frame to the next.
         let widths: Vec<usize> = (0..GLYPHS.len() as u32)
-            .map(|k| row(&at(FRAME * k, "dotfiles"), 80).width())
+            .map(|k| status(&at(FRAME * k, "dotfiles")).width())
             .collect();
         assert!(widths.windows(2).all(|w| w[0] == w[1]), "{widths:?}");
     }
 
-    /// Once the row offers a way out, the offer has to be legible: a long
-    /// name is what gives way, then the words around it, never the hint.
+    /// Two rows, two independent truncations: a name too long for the screen
+    /// loses its tail like any other row in this UI, and takes nothing from
+    /// the row that says how to get out.
     #[test]
-    fn a_long_name_gives_way_before_the_cancel_hint() {
+    fn a_long_name_is_truncated_and_the_way_out_is_untouched() {
         let long = "a".repeat(60);
-        let lines = render(30, 3, &at(PATIENCE, &long));
-        let last = &lines[2];
-        assert!(last.ends_with(CANCEL), "{last:?}");
-        assert!(last.width() <= 30, "{last:?}");
-        assert!(last.contains("attaching to a"), "{last:?}");
+        let lines = render(30, 3, &at(GRACE, &long));
 
-        // Narrower still: the name and its introduction go, the hint stays.
-        let lines = render(16, 3, &at(PATIENCE, &long));
-        let last = &lines[2];
-        assert!(last.ends_with(CANCEL), "{last:?}");
-        assert!(!last.contains("attaching"), "{last:?}");
-        assert!(
-            GLYPHS.contains(&last.trim_start().chars().next().expect("a glyph")),
-            "{last:?}"
-        );
+        let status = &lines[status_row(3)];
+        assert!(status.width() <= 30, "{status:?}");
+        assert!(spins(status), "{status:?}");
+        assert!(status.contains("attaching to a"), "{status:?}");
+        assert_eq!(lines[2].trim(), CANCEL, "{lines:?}");
     }
 
-    /// Before the hint exists the name has the whole row less the glyph and
-    /// its introduction, and a wide name is measured in columns.
+    /// Two columns per character, so a Japanese name is fitted to what it
+    /// occupies rather than to how many characters it has.
     #[test]
     fn a_wide_name_is_fitted_by_column() {
-        let lines = render(24, 2, &at(GRACE, "日本語のセッション"));
-        let last = &lines[1];
-        assert!(last.width() <= 24, "{last:?}");
-        assert!(last.contains("attaching to 日本"), "{last:?}");
+        let lines = render(24, 4, &at(GRACE, "日本語のセッション"));
+        let status = &lines[status_row(4)];
+        assert!(status.width() <= 24, "{status:?}");
+        assert!(status.contains("attaching to 日本"), "{status:?}");
+        assert_eq!(lines[3].trim(), CANCEL, "{lines:?}");
     }
 
+    /// Down to one row, where the hint row is the only row there is.
     #[test]
     fn every_tiny_size_survives() {
         for &(w, h) in test_support::TINY_SIZES {
-            for elapsed in [Duration::ZERO, GRACE, PATIENCE] {
+            for elapsed in [Duration::ZERO, GRACE, Duration::from_secs(300)] {
                 let lines = render(w, h, &at(elapsed, "dotfiles"));
                 for line in &lines {
                     assert!(
@@ -360,36 +412,41 @@ mod tests {
 
     #[test]
     fn nothing_sets_a_colour() {
-        test_support::assert_no_colour(40, 6, |f| draw(f, &at(PATIENCE, "dotfiles")));
+        test_support::assert_no_colour(40, 6, |f| draw(f, &at(GRACE, "dotfiles")));
     }
 
     #[test]
     fn nothing_draws_a_border() {
-        test_support::assert_no_borders(&render(40, 6, &at(PATIENCE, "dotfiles")));
+        test_support::assert_no_borders(&render(40, 6, &at(GRACE, "dotfiles")));
     }
 
-    /// Dim throughout, like the hint it shares a row with on the other
-    /// screens: a status, not a message.
+    /// Dim throughout, both rows: the screen is telling the user what it is
+    /// waiting for and offering a key, and neither is something being asked
+    /// or typed — the distinction the hint row's `dim` flag carries
+    /// everywhere else.
     #[test]
-    fn the_row_is_dim() {
+    fn both_rows_are_dim() {
         let mut terminal = Terminal::new(TestBackend::new(40, 4)).expect("terminal");
         terminal
-            .draw(|f| draw(f, &at(PATIENCE, "dotfiles")))
+            .draw(|f| draw(f, &at(GRACE, "dotfiles")))
             .expect("draw");
         let buf = terminal.backend().buffer().clone();
+
         let mut seen = 0;
-        for x in 0..40 {
-            let cell = &buf[(x, 3)];
-            if cell.symbol().trim().is_empty() {
-                continue;
+        for y in [status_row(4) as u16, 3] {
+            for x in 0..40 {
+                let cell = &buf[(x, y)];
+                if cell.symbol().trim().is_empty() {
+                    continue;
+                }
+                seen += 1;
+                assert!(
+                    cell.modifier.contains(Modifier::DIM),
+                    "cell ({x},{y}) is not dim: {:?}",
+                    cell.symbol()
+                );
             }
-            seen += 1;
-            assert!(
-                cell.modifier.contains(Modifier::DIM),
-                "cell {x} on the row is not dim: {:?}",
-                cell.symbol()
-            );
         }
-        assert!(seen > 0, "the row was blank");
+        assert!(seen > 0, "both rows were blank");
     }
 }

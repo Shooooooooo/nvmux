@@ -11,9 +11,10 @@
 //!
 //! [`attaching`] is a fourth, and the odd one out: not a screen the user works
 //! on but the wait between the picker (or a `<prefix>` switch) and the session,
-//! up only while the attach probe is in flight. It keeps the vocabulary — one
-//! dim row, no borders, no colour — and is the one screen that leaves the
-//! mouse alone, for a reason given there.
+//! up only while the attach probe is in flight. It keeps the vocabulary — a
+//! centred line where the picker draws its list, one dim hint row on the last
+//! line, no borders, no colour — and is the one screen that leaves the mouse
+//! alone, for a reason given there.
 //!
 //! # There is no preview pane, and there must never be one
 //!
