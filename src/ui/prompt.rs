@@ -720,8 +720,9 @@ fn aligned(labels: &[&str]) -> Vec<String> {
 /// session being left is not what fills the spawn. A cancelled prompt goes back
 /// to the same client, which is repainted, so it takes the ordinary close.
 pub fn run(transport: &dyn Transport) -> Result<Outcome> {
+    // Reached from a session that has just dissolved out, so dissolve in.
     super::owning_for_attach(Outcome::attaches, |terminal| {
-        run_on(terminal, transport, Task::Create)
+        run_on(terminal, transport, Task::Create, crate::fade::excursions())
     })
 }
 
@@ -731,10 +732,17 @@ pub fn run(transport: &dyn Transport) -> Result<Outcome> {
 /// Not `run`: a second terminal inside the picker's would enter the alternate
 /// screen twice and leave it once. Sharing it also makes the handover
 /// invisible, since `Terminal::draw` resets the frame each pass.
+///
+/// `animate` is whether to dissolve in on the way in, and out on a cancel:
+/// true from a session, whose screen has just dissolved out and which takes
+/// over again from the background; false from the picker, whose screen is
+/// already up and simply comes back. A create dissolves out *either* way — a
+/// client spawn follows, and this is the screen that is up when it does.
 pub(super) fn run_on(
     terminal: &mut ratatui::DefaultTerminal,
     transport: &dyn Transport,
     task: Task,
+    animate: bool,
 ) -> Result<Outcome> {
     let mut prompt = match task {
         Task::Create => Prompt::create(
@@ -756,6 +764,10 @@ pub(super) fn run_on(
     // already in hand when the first one is, which is the difference between the
     // field feeling instant and it paying a round trip to say its first word.
     refresh(&mut prompt, completer.as_mut());
+
+    if animate {
+        crate::fade::fade_in(terminal, |f| draw(f, &prompt))?;
+    }
 
     loop {
         terminal.draw(|f| draw(f, &prompt))?;
@@ -785,7 +797,12 @@ pub(super) fn run_on(
 
         let submission = match step {
             Step::None => continue,
-            Step::Cancel => return Ok(Outcome::Cancelled),
+            Step::Cancel => {
+                if animate {
+                    crate::fade::fade_out(terminal, |f| draw(f, &prompt))?;
+                }
+                return Ok(Outcome::Cancelled);
+            }
             Step::Submit(submission) => submission,
         };
 
@@ -822,7 +839,15 @@ pub(super) fn run_on(
         };
 
         match committed {
-            Ok(outcome) => return Ok(outcome),
+            Ok(outcome) => {
+                // Out through the background on the way to a client spawn,
+                // whoever called; a rename only comes back to a picker that
+                // is about to redraw, so it dissolves only if it dissolved in.
+                if outcome.attaches() || animate {
+                    crate::fade::fade_out(terminal, |f| draw(f, &prompt))?;
+                }
+                return Ok(outcome);
+            }
             Err(e) => {
                 // A name that was free when the prompt opened may not be now.
                 let refreshed = match task {

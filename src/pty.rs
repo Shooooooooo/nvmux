@@ -8,19 +8,26 @@
 //! stdout <-      (untouched)        <- pty master
 //! ```
 //!
-//! **The child-to-terminal direction is never parsed, buffered by line, or
-//! rewritten.** That is the entire reason this design works: bracketed paste,
+//! **The child-to-terminal direction is never buffered by line, rewritten, or
+//! acted on.** That is the entire reason this design works: bracketed paste,
 //! the kitty keyboard protocol, truecolor, undercurl, terminal titles, OSC 52
 //! clipboard and DA1/XTGETTCAP round-trips all function because the child
-//! negotiates directly with the real terminal. Any "improvement" that inspects
-//! this direction breaks a subset of them. There is likewise no
-//! `nvim_ui_attach`, no `grid_line` handling and no grid diffing anywhere in
-//! this crate — `nvim --remote-ui` already is that client.
+//! negotiates directly with the real terminal. Any "improvement" that changes
+//! this direction on the strength of what it sees breaks a subset of them.
+//! There is likewise no `nvim_ui_attach`, no `grid_line` handling and no grid
+//! diffing anywhere in this crate — `nvim --remote-ui` already is that client.
 //!
-//! The one thing that ever *joins* this direction is the attach notice (see
+//! The one reader of this direction is the shadow grid ([`crate::shadow`]),
+//! and it reads a *copy*, handed to it after the terminal has had the bytes:
+//! it can neither delay nor alter a write, and nothing that reaches the
+//! terminal depends on what it saw. It exists so the outgoing session can be
+//! dissolved on its way out, and it is off with the fade.
+//!
+//! Two things ever *join* this direction. The attach notice (see
 //! [`crate::announce`]): a box, drawn once the child has been quiet long enough
-//! that it cannot be mid-sequence. Even then nothing is parsed — the safe
-//! moment is found with a clock, not a decoder.
+//! that it cannot be mid-sequence — the safe moment is found with a clock, not
+//! a decoder. And the fade's frames ([`crate::fade::fade_out_session`]), which
+//! are written only once the relay has stopped.
 //!
 //! Three hazards that have no other home in the code:
 //!
@@ -42,7 +49,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair};
 
 use crate::error::{NvmuxError, Result};
 use crate::keys::{Action, Prefix, Step, Wait};
-use crate::{announce, rpc, term, winch};
+use crate::{announce, fade, rpc, shadow, term, winch};
 
 /// Neovim aborts on the seventeenth attached UI rather than returning an error
 /// (`src/nvim/ui.c`: `if (ui_count == MAX_UI_COUNT) { abort(); }`), which would
@@ -126,6 +133,10 @@ pub struct Attachment {
     resumed: bool,
     /// True once the child has been waited for, so `Drop` does not do it twice.
     reaped: bool,
+    /// The session's screen as its bytes have described it, kept so the
+    /// session can be dissolved on its way out (see [`crate::shadow`]). `None`
+    /// with the fade off, and then nothing is parsed.
+    shadow: Option<shadow::Shadow>,
 }
 
 impl std::fmt::Debug for Attachment {
@@ -215,6 +226,37 @@ impl Attachment {
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGHUP);
             libc::kill(pid as libc::pid_t, libc::SIGCONT);
+        }
+    }
+
+    /// Write to the terminal, then let the shadow see what was written.
+    ///
+    /// Every byte the terminal is shown while this client has it goes through
+    /// here — the client's output, the attach notice — so the shadow's idea of
+    /// the screen is the terminal's. The write comes first and the shadow
+    /// after: nothing about the shadow may delay or change what the user sees.
+    fn write_terminal(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let mut out = std::io::stdout().lock();
+        out.write_all(bytes)?;
+        out.flush()?;
+        drop(out);
+        self.shadow_saw(bytes);
+        Ok(())
+    }
+
+    /// Let the shadow see bytes something else wrote to the terminal — the
+    /// hand-off strings [`crate::term`] writes on the client's behalf.
+    fn shadow_saw(&mut self, bytes: &[u8]) {
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.feed(bytes);
+        }
+    }
+
+    /// Tell the pty — and the shadow — the terminal's size.
+    fn resize_to(&mut self, size: PtySize) {
+        let _ = self.master.resize(size);
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.resize(size.rows, size.cols);
         }
     }
 
@@ -592,6 +634,10 @@ fn spawn_client(
         writer,
         resumed: false,
         reaped: false,
+        // Only when it will be used: a shadow costs a parse of everything the
+        // client writes.
+        shadow: (fade::enabled() && fade::session())
+            .then(|| shadow::Shadow::new(size.rows, size.cols)),
     })
 }
 
@@ -625,6 +671,7 @@ pub fn relay(
         // on a detach its `rmcup` and nvmux's own `?1049l` have nothing to
         // leave, and its last frame is what the shell prompt lands on.
         term::enter_alt_screen_and_clear();
+        attachment.shadow_saw(term::RESUME);
     } else {
         // Normally already done by whoever handed the terminal over — the
         // picker, the prompt, or the `Switch` branch below — because a clear
@@ -634,6 +681,7 @@ pub fn relay(
         // has drawn to since. The client enters the alternate screen for
         // itself, as part of its startup.
         term::leave_alt_screen_and_clear();
+        attachment.shadow_saw(term::HANDOVER);
     }
     let mut raw = term::RawMode::enter()?;
 
@@ -641,11 +689,7 @@ pub fn relay(
     // picker has since drawn over.
     if attachment.resumed {
         discard_pending(master_fd);
-        repaint(
-            attachment.master.as_ref(),
-            &attachment.sock,
-            Repaint::Resume,
-        );
+        repaint(&mut attachment, Repaint::Resume);
     }
     attachment.resumed = true;
 
@@ -666,6 +710,16 @@ pub fn relay(
             held
             @ (Outcome::ToPicker | Outcome::CreateNew | Outcome::ShowHelp | Outcome::Switch(_)),
         ) => {
+            // Dissolve the session out first: before the modes go back, so a
+            // key typed during it is not echoed, and before the hand-off
+            // below, which erases with the colour the last frame ends on. A
+            // frame that could not be written must not skip the restore, so
+            // its error is logged and dropped rather than propagated.
+            if let Some(shadow) = attachment.shadow.as_mut() {
+                if let Err(e) = fade::fade_out_session(shadow) {
+                    tracing::debug!(error = %e, "the session's fade-out did not complete");
+                }
+            }
             raw.restore();
             // Clear here rather than leaving it to the next `relay`, which runs
             // on the far side of the client spawn: what is on the terminal until
@@ -674,6 +728,7 @@ pub fn relay(
             // forces a repaint.
             if held.leads_straight_into_another_relay() {
                 term::leave_alt_screen_and_clear();
+                attachment.shadow_saw(term::HANDOVER);
             }
             Ok((held, Some(attachment)))
         }
@@ -783,11 +838,9 @@ fn pump(
                 // EOF on macOS, EIO on Linux: both mean the slave closed.
                 Ok(0) | Err(_) => return Ok(Outcome::ChildExited),
                 Ok(len) => {
-                    // Byte for byte, unparsed and unbuffered; see the module
-                    // docs.
-                    let mut out = std::io::stdout().lock();
-                    out.write_all(&buf[..len])?;
-                    out.flush()?;
+                    // Byte for byte and unbuffered; see the module docs. The
+                    // shadow, if there is one, is shown a copy afterwards.
+                    attachment.write_terminal(&buf[..len])?;
                     if first_byte.is_none() {
                         first_byte = Some(relay_started.elapsed());
                     }
@@ -814,7 +867,7 @@ fn pump(
             winch.drain();
             // Enough on its own: the kernel signals the pty's foreground group
             // and the client calls try_resize.
-            let _ = attachment.master.resize(term::terminal_size());
+            attachment.resize_to(term::terminal_size());
         }
 
         // After the frame it sits on and before any keystroke is acted on. The
@@ -824,11 +877,7 @@ fn pump(
             let act = p.step(Instant::now(), child_spoke, term::terminal_size());
             match act {
                 announce::Act::Idle => {}
-                announce::Act::Paint(bytes) => {
-                    let mut out = std::io::stdout().lock();
-                    out.write_all(&bytes)?;
-                    out.flush()?;
-                }
+                announce::Act::Paint(bytes) => attachment.write_terminal(&bytes)?,
                 announce::Act::Erase => {
                     // Timed because it is a second full repaint of the session,
                     // a whole second after the switch — the one nvmux asks for
@@ -838,11 +887,7 @@ fn pump(
                     // reason: the cells the box covered are the server's, and
                     // only the server can say what was under them. Not the same
                     // licence, though — see [`Repaint`].
-                    repaint(
-                        attachment.master.as_ref(),
-                        &attachment.sock,
-                        Repaint::Notice,
-                    );
+                    repaint(attachment, Repaint::Notice);
                     tracing::debug!(
                         ms = t_erase.elapsed().as_secs_f64() * 1000.0,
                         "timing: attach notice erase (:mode repaint)"
@@ -1040,7 +1085,9 @@ fn peek_child(pid: nix::unistd::Pid) -> Peek {
 }
 
 /// Read whatever is available. Only called after `poll` says the fd is ready.
-fn read_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
+/// Shared with [`crate::palette`], which reads the terminal's replies the same
+/// way.
+pub(crate) fn read_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
     let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
     if n < 0 {
         Err(std::io::Error::last_os_error())
@@ -1168,15 +1215,17 @@ fn without_device_attributes_request(chunk: &[u8]) -> std::borrow::Cow<'_, [u8]>
 /// tracking on until its Neovim next flips the mouse itself — and right for
 /// everything else, where the alternative is a client that no longer answers
 /// the mouse at all.
-fn repaint(master: &dyn MasterPty, sock: &Path, why: Repaint) {
+fn repaint(attachment: &mut Attachment, why: Repaint) {
     let size = term::terminal_size();
-    let _ = master.resize(size);
-    let served = repaint_through_server(sock, why);
+    attachment.resize_to(size);
+    let served = repaint_through_server(&attachment.sock, why);
     if why == Repaint::Resume {
         term::set_mouse_reporting(served.mouse.unwrap_or(term::MouseReporting::Buttons));
     }
     if !served.repainted {
-        nudge(master, size);
+        // The shrink and its undo are not shown to the shadow: what the
+        // client draws after them is for the size it was just told.
+        nudge(attachment.master.as_ref(), size);
     }
 }
 
@@ -1396,6 +1445,7 @@ mod tests {
             writer,
             resumed: false,
             reaped: false,
+            shadow: None,
         }
     }
 

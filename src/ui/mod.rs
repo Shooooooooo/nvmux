@@ -34,6 +34,10 @@
 //! drawing when the relay stopped. [`Screen::open`] therefore drops the
 //! inherited attributes first, which is the one place that can: every screen is
 //! taken through it.
+//!
+//! The fade ([`crate::fade`]) is the one thing that paints a colour on these
+//! screens, and it does so as a post-pass over a finished frame, never inside
+//! a `draw`: a screen's own drawing stays colourless, and its tests say so.
 
 pub mod app;
 pub mod complete;
@@ -303,6 +307,11 @@ fn run_loop(
         app.set_message(msg);
     }
 
+    // Dissolve the picker up out of the background before taking any input.
+    // In place of a first draw: the fade's last frame is the plain screen, so
+    // the loop's own first `draw` repaints nothing.
+    crate::fade::fade_in(terminal, |f| draw::draw(f, &app))?;
+
     // When a half-typed session number must be settled. `App` decides every
     // unambiguous digit on its own, so this is only ever set when one number is
     // a prefix of another — sessions 1 and 12 both present.
@@ -320,10 +329,7 @@ fn run_loop(
                 deadline = None;
                 if let Request::Attach(id) = app.resolve_pending() {
                     if let Some(session) = app.session(&id).cloned() {
-                        return Ok(Outcome::Attach {
-                            session,
-                            sessions: app.sessions().to_vec(),
-                        });
+                        return leave_to_session(terminal, &app, session);
                     }
                 }
             }
@@ -356,15 +362,16 @@ fn run_loop(
 
             Request::Attach(id) => {
                 if let Some(session) = app.session(&id).cloned() {
-                    return Ok(Outcome::Attach {
-                        session,
-                        sessions: app.sessions().to_vec(),
-                    });
+                    return leave_to_session(terminal, &app, session);
                 }
             }
 
             Request::NewSession => {
-                match prompt::run_on(terminal, transport, prompt::Task::Create)? {
+                // Not animated: the picker is already up, and takes over
+                // again if the prompt is cancelled. A create still dissolves
+                // the prompt out on its way to the client spawn — that is
+                // the prompt's own doing, since its screen is the one up.
+                match prompt::run_on(terminal, transport, prompt::Task::Create, false)? {
                     prompt::Outcome::Created(session) => {
                         // Appended rather than re-listed: the picker's rows are
                         // still accurate and this is the one row they are
@@ -384,7 +391,7 @@ fn run_loop(
             Request::RenameSession(id) => {
                 if let Some(session) = app.session(&id).cloned() {
                     let outcome =
-                        prompt::run_on(terminal, transport, prompt::Task::Rename(&session))?;
+                        prompt::run_on(terminal, transport, prompt::Task::Rename(&session), false)?;
                     if !matches!(outcome, prompt::Outcome::Cancelled) {
                         refresh(&mut app, &mut highest, transport)?;
                     }
@@ -420,9 +427,27 @@ fn run_loop(
                 refresh(&mut app, &mut highest, transport)?;
             }
 
-            Request::Help => help::run_on(terminal)?,
+            Request::Help => help::run_on(terminal, false)?,
         }
     }
+}
+
+/// Leave the picker for `session`: dissolve the screen out, then hand back the
+/// outcome that attaches. The picker's own two exits share this so neither
+/// can forget the fade; the prompt's `Created` exit is not one of them, since
+/// the screen up at that moment is the prompt's, and the prompt fades it.
+/// Quitting does not come through here either — the shell wants its screen
+/// back, not a dissolved one.
+fn leave_to_session(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &App,
+    session: Session,
+) -> Result<Outcome> {
+    crate::fade::fade_out(terminal, |f| draw::draw(f, app))?;
+    Ok(Outcome::Attach {
+        session,
+        sessions: app.sessions().to_vec(),
+    })
 }
 
 /// Re-list, keeping the highest number in step with what is on screen.

@@ -327,7 +327,7 @@ pub fn terminal_size() -> crate::pty::PtySize {
 /// the screen the session will draw on rather than on the one being left. One
 /// string, so it is also one `write`: a terminal cannot present the moment in
 /// between, which is the outgoing session's frame.
-const HANDOVER: &[u8] = b"\x1b[?2026l\x1b[0m\x1b[?1049l\x1b[2J\x1b[H";
+pub(crate) const HANDOVER: &[u8] = b"\x1b[?2026l\x1b[0m\x1b[?1049l\x1b[2J\x1b[H";
 
 /// Leave the alternate screen and clear, without touching the terminal modes.
 ///
@@ -363,7 +363,7 @@ pub fn leave_alt_screen_and_clear() {
 /// the switch. No `\e[22;0;0t` beside it: the client's own `smcup` pushed the
 /// title once, its `rmcup` will pop it once, and a second push here would leave
 /// the stack one deep.
-const RESUME: &[u8] = b"\x1b[?2026l\x1b[0m\x1b[?1049h\x1b[2J\x1b[H";
+pub(crate) const RESUME: &[u8] = b"\x1b[?2026l\x1b[0m\x1b[?1049h\x1b[2J\x1b[H";
 
 /// Put the terminal back in the alternate screen, cleared, for a client that
 /// is about to be resumed rather than spawned.

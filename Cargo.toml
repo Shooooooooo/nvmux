@@ -44,6 +44,11 @@ toml = { version = "1", default-features = false, features = [
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 unicode-width = "0.2.2"
+# Keeps a shadow copy of an attached session's screen, so the outgoing session
+# can be dissolved cell by cell (see `src/shadow.rs`). The bytes reaching the
+# terminal are never touched; the parser only watches them go by. It brings
+# `vte` and `arrayvec`; its other dependencies were already in the tree.
+vt100 = "0.16"
 
 [profile.release]
 lto = "thin"
