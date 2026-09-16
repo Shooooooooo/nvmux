@@ -108,6 +108,18 @@ on the end.
 - **`x` in the picker kills**, without asking the session about unsaved
   buffers. Use `:q` for the editor's own save prompts.
 
+### When the connection drops
+
+`nvmux myhost` rides one ssh connection. When that goes — the laptop slept, the
+Wi-Fi changed, a VPN renewed — the session is untouched: the editor runs over
+there and never noticed. nvmux notices within about 45 seconds (ssh's own
+keepalive), reconnects, and puts you back in the session you were in. A host
+that is not reachable yet is tried again for about a minute, with each attempt
+reported on the terminal; `Ctrl-C` during that wait quits nvmux and leaves the
+session running, for a later `nvmux myhost` to pick up. If the host stays out
+of reach, nvmux quits the same way, saying so — the session is still there,
+and the next `nvmux myhost` finds it.
+
 ## Configuration
 
 nvmux needs no configuration. An optional TOML file — `$NVMUX_CONFIG` if set,

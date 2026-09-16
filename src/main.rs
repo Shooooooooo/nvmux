@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use nvmux::cli::Cli;
-use nvmux::{announce, config, logging, nested, nvim, paths, pty, transport, ui};
+use nvmux::{announce, config, logging, nested, nvim, paths, pty, reconnect, transport, ui};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -179,7 +179,39 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 // because the user asked, on a closed stdin because there is
                 // no terminal left to ask from.
                 (pty::Outcome::Detached | pty::Outcome::StdinClosed, _) => return Ok(()),
-                (pty::Outcome::ChildExited, _) => break,
+                // Two things look like this: the session ended, and the link
+                // to its host dropped under the client. The transport can tell
+                // which — see `reconnect` — and in the second case the session
+                // is still there, so the loop goes round again onto the same
+                // `current` with no client held, which is a fresh attach.
+                //
+                // On the plain terminal, deliberately: the relay has given it
+                // back, the picker has not taken it, and a reconnection may
+                // need it — ssh asks for a passphrase there. So the progress
+                // is lines on stderr, the one thing that can be written
+                // without owning the screen.
+                (pty::Outcome::ChildExited, _) => {
+                    let host = transport.location().to_string();
+                    let verdict = reconnect::recover(
+                        transport,
+                        |retry| eprintln!("{}", describe_retry(&host, retry)),
+                        std::thread::sleep,
+                    );
+                    match verdict {
+                        reconnect::Verdict::Unneeded => break,
+                        reconnect::Verdict::Restored => continue,
+                        // Out, not back to the picker. The picker's first act
+                        // is a listing over the very link that just failed
+                        // seven times, on an unbounded connect this time, and
+                        // its failure ends nvmux with ssh's words and none of
+                        // these. Better to end here, saying what was tried and
+                        // that the session is still there to come back to.
+                        reconnect::Verdict::GaveUp(e) => {
+                            tracing::warn!(%host, error = %e, "could not reconnect");
+                            anyhow::bail!("{}", describe_reconnect_failure(&host, &e));
+                        }
+                    }
+                }
                 (pty::Outcome::CreateNew, held) => {
                     // Held rather than killed, so a cancelled prompt resumes it.
                     attached = held;
@@ -302,6 +334,43 @@ fn describe_attach_failure(location: &transport::Location, e: &nvmux::NvmuxError
         }
         other => one_line(other),
     }
+}
+
+/// One failed reconnection attempt, as a line on the terminal.
+///
+/// The first one also says what is going on and how to stop it: the client has
+/// just vanished from the screen, and a line that opens with an ssh error would
+/// read as nvmux failing rather than as nvmux recovering. Ctrl-C is worth
+/// naming because the wait is the one moment nvmux sits idle on the plain
+/// terminal — and it is safe: the session is on the far side and keeps running,
+/// which is the whole reason there is anything to reconnect to.
+fn describe_retry(host: &str, retry: &reconnect::Retry<'_>) -> String {
+    let mut lines = String::new();
+    if retry.attempt == 1 {
+        lines.push_str(&format!(
+            "nvmux: the connection to {host} dropped — reconnecting \
+             (Ctrl-C quits nvmux; the session keeps running)\n"
+        ));
+    }
+    lines.push_str(&format!(
+        "nvmux: {} — trying again in {}s ({} of {})",
+        one_line(retry.error),
+        retry.wait.as_secs(),
+        retry.attempt,
+        retry.of
+    ));
+    lines
+}
+
+/// Why the session could not be got back: nvmux's last words, so they say
+/// what was being done, what ssh said, and what is left — a session still
+/// running, and the command that finds it. The ssh errors that get this far
+/// all name the host themselves, so the first line does not.
+fn describe_reconnect_failure(host: &str, e: &nvmux::NvmuxError) -> String {
+    format!(
+        "could not reconnect: {}\nhint: the session keeps running; `nvmux {host}` will find it",
+        one_line(e)
+    )
 }
 
 /// Explain why a switch could not find out what to switch to.
@@ -450,6 +519,55 @@ mod tests {
             msg.contains("line one") && msg.contains("line two"),
             "{msg:?}"
         );
+    }
+
+    /// The first line of a reconnection is the one that explains it; the ones
+    /// after say only what happened and when the next try is.
+    #[test]
+    fn a_reconnection_is_explained_once_and_then_counted() {
+        let e = NvmuxError::Ssh(SshError::Unreachable("myhost".into()));
+        let first = describe_retry(
+            "myhost",
+            &reconnect::Retry {
+                attempt: 1,
+                of: 6,
+                error: &e,
+                wait: std::time::Duration::from_secs(1),
+            },
+        );
+        assert!(first.contains("dropped"), "{first}");
+        assert!(first.contains("Ctrl-C"), "{first}");
+        assert!(first.contains("keeps running"), "{first}");
+        assert!(first.contains("in 1s (1 of 6)"), "{first}");
+        assert_eq!(first.lines().count(), 2);
+
+        let later = describe_retry(
+            "myhost",
+            &reconnect::Retry {
+                attempt: 3,
+                of: 6,
+                error: &e,
+                wait: std::time::Duration::from_secs(4),
+            },
+        );
+        assert!(!later.contains("dropped"), "{later}");
+        assert!(later.contains("myhost is unreachable"), "{later}");
+        assert!(later.contains("in 4s (3 of 6)"), "{later}");
+        assert_eq!(later.lines().count(), 1);
+        assert!(later.starts_with("nvmux: "), "every line names its author");
+    }
+
+    /// Giving up is nvmux's last message, so it has to carry the reason, the
+    /// reassurance and the way back.
+    #[test]
+    fn giving_up_says_why_and_how_to_come_back() {
+        let e = NvmuxError::Ssh(SshError::Unreachable("myhost".into()));
+        let msg = describe_reconnect_failure("myhost", &e);
+        assert!(msg.starts_with("could not reconnect: "), "{msg}");
+        assert!(msg.contains("myhost is unreachable"), "{msg}");
+        assert!(msg.contains("keeps running"), "{msg}");
+        assert!(msg.contains("`nvmux myhost`"), "{msg}");
+        assert_eq!(msg.lines().count(), 2, "the reason, then the hint");
     }
 
     /// A listing failure reaches the picker with no other context around it, so
