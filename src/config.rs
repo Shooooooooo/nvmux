@@ -47,6 +47,7 @@ use crate::error::ConfigError;
 pub struct Settings {
     pub keys: KeySettings,
     pub session: SessionSettings,
+    pub fade: FadeSettings,
 }
 
 /// The prefix key and how long a half-typed sequence waits (see [`crate::keys`]).
@@ -71,6 +72,29 @@ pub struct SessionSettings {
     /// The command line, with `{sock}` standing in for the session's socket.
     /// Parsed by [`crate::launch::Launch`], which is also what rejects a bad one.
     pub command: String,
+}
+
+/// The fade between screens (see [`crate::fade`]): each one dissolves into the
+/// terminal's own background colour and the next dissolves up out of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FadeSettings {
+    /// Master switch. Two things force the fade off whatever this says:
+    /// `NO_COLOR`, because the effect paints explicit colours, and a terminal
+    /// that does not answer the startup colour query, because there is then
+    /// nothing to fade *to* — see [`crate::fade::enabled`].
+    pub enabled: bool,
+    /// How long one direction takes; a switch pays it once on the way out and
+    /// once on the way in. Must be at least 1 and at most `MAX_FADE_MS`.
+    pub duration_ms: u64,
+    /// Whether a Neovim screen dissolves too — in, once its first paint has
+    /// settled, and out — rather than only nvmux's own screens. Costs a
+    /// running parse of the session's output while it is attached (see
+    /// [`crate::shadow`]); off, a session hard-cuts both ways.
+    pub session: bool,
+    /// Whether the quick `<prefix> ?` / `<prefix> c` excursions fade too. Off
+    /// makes those snappier at the cost of consistency.
+    pub excursions: bool,
 }
 
 // These are the built-in behaviour. `#[serde(default)]` on the containers means
@@ -99,6 +123,20 @@ impl Default for SessionSettings {
     }
 }
 
+impl Default for FadeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // Long enough to read as a dissolve rather than a flicker, short
+            // enough that a switch — which pays it twice — still feels like
+            // one movement.
+            duration_ms: 100,
+            session: true,
+            excursions: true,
+        }
+    }
+}
+
 /// The prefix comes in as a human string; delegate to the one parser so the file
 /// and any other caller agree, and fold its message into serde's error (which
 /// TOML then reports with the offending span).
@@ -114,6 +152,10 @@ where
 /// `poll` timeout as a `c_int`, and an absurd one is a hang, not a long wait.
 const MAX_TIMEOUT_MS: u64 = 60_000;
 
+/// Ceiling for `fade.duration_ms`. Two seconds is already a fade nobody wants
+/// to sit through twice per switch; past it the value is a hang with a name.
+const MAX_FADE_MS: u64 = 2_000;
+
 impl Settings {
     /// Rules that the deserializer cannot express. Kept minimal: only values that
     /// would misbehave at runtime, not taste.
@@ -127,6 +169,15 @@ impl Settings {
             // Beyond `c_int` this would wrap negative and `poll` would block
             // forever; well before that it is a prefix that never resolves.
             return Err(format!("keys.timeout_ms must be at most {MAX_TIMEOUT_MS}"));
+        }
+        if self.fade.duration_ms == 0 {
+            // `enabled = false` is how the fade is turned off; a zero-length
+            // fade would be the same thing spelled as a schedule with no frames.
+            return Err("fade.duration_ms must be at least 1".into());
+        }
+        if self.fade.duration_ms > MAX_FADE_MS {
+            // It feeds a `sleep`, twice per switch.
+            return Err(format!("fade.duration_ms must be at most {MAX_FADE_MS}"));
         }
         // Refused at startup rather than at the prompt: a command that can never
         // spawn a session is a broken config, and the file is where it is fixed.
@@ -263,6 +314,7 @@ pub fn with_prefix(prefix: u8) -> Settings {
 fn render_default_config(prefix: u8) -> String {
     let k = KeySettings::default();
     let s = SessionSettings::default();
+    let f = FadeSettings::default();
     format!(
         "# nvmux configuration — created on first run.\n\
          #\n\
@@ -275,10 +327,21 @@ fn render_default_config(prefix: u8) -> String {
          \n\
          [session]\n\
          # {{sock}} becomes the session's socket; it is what nvmux finds it by.\n\
-         # command = {command:?}\n",
+         # command = {command:?}\n\
+         \n\
+         [fade]\n\
+         # The dissolve between screens. NO_COLOR turns it off whatever this says.\n\
+         # enabled     = {fade_enabled}\n\
+         # duration_ms = {fade_duration}\n\
+         # session     = {fade_session}\n\
+         # excursions  = {fade_excursions}\n",
         prefix = crate::keys::prefix_label(prefix),
         timeout = k.timeout_ms,
         command = s.command,
+        fade_enabled = f.enabled,
+        fade_duration = f.duration_ms,
+        fade_session = f.session,
+        fade_excursions = f.excursions,
     )
 }
 
@@ -367,9 +430,30 @@ mod tests {
             prefix = \"Ctrl-Space\"\n\
             timeout_ms = 500\n\
             [session]\n\
-            command = \"nvim --headless --listen {sock}\"\n";
+            command = \"nvim --headless --listen {sock}\"\n\
+            [fade]\n\
+            enabled = true\n\
+            duration_ms = 100\n\
+            session = true\n\
+            excursions = true\n";
         let s: Settings = toml::from_str(doc).expect("valid");
         assert_eq!(s, Settings::default());
+    }
+
+    #[test]
+    fn a_partial_fade_table_keeps_the_other_fade_defaults() {
+        let s: Settings = toml::from_str("[fade]\nduration_ms = 40\n").expect("valid");
+        assert_eq!(s.fade.duration_ms, 40);
+        assert_eq!(s.fade.enabled, FadeSettings::default().enabled);
+        assert_eq!(s.fade.session, FadeSettings::default().session);
+        assert_eq!(s.fade.excursions, FadeSettings::default().excursions);
+        assert_eq!(s.keys, KeySettings::default());
+    }
+
+    #[test]
+    fn fade_enabled_false_parses() {
+        let s: Settings = toml::from_str("[fade]\nenabled = false\n").expect("valid");
+        assert!(!s.fade.enabled);
     }
 
     /// The one default that lives elsewhere, like the prefix: the prompt shows
@@ -401,8 +485,8 @@ mod tests {
     }
 
     /// A config file is edited by hand, so a typo is likely and silence is the
-    /// wrong response — an unknown table, an unknown key in the `[keys]` table,
-    /// and an unparseable value all have to be refused rather than ignored.
+    /// wrong response — an unknown table, an unknown key in any table, and an
+    /// unparseable value all have to be refused rather than ignored.
     #[test]
     fn a_typo_is_never_silently_ignored() {
         for (what, doc) in [
@@ -410,6 +494,8 @@ mod tests {
             ("an unknown keys key", "[keys]\nprefx = \"C-a\"\n"),
             ("an unparseable prefix", "[keys]\nprefix = \"nope\"\n"),
             ("an unknown session key", "[session]\ncmd = \"nvim\"\n"),
+            ("an unknown fade key", "[fade]\nduration = 40\n"),
+            ("an unparseable fade value", "[fade]\nenabled = \"yes\"\n"),
         ] {
             assert!(
                 toml::from_str::<Settings>(doc).is_err(),
@@ -418,8 +504,9 @@ mod tests {
         }
     }
 
-    /// The timeout feeds a `poll` call, so it has a floor and a ceiling; the
-    /// extreme values that pass are also pinned so the bounds stay generous.
+    /// The timeout feeds a `poll` call and the fade's duration a `sleep`, so
+    /// each has a floor and a ceiling; the extreme values that pass are also
+    /// pinned so the bounds stay generous.
     #[test]
     fn out_of_range_values_are_rejected_with_their_key_named() {
         let cases = [
@@ -427,6 +514,8 @@ mod tests {
             ("[keys]\ntimeout_ms = 60001\n", "keys.timeout_ms"),
             // Past `c_int`: the value `poll` would have read as "block forever".
             ("[keys]\ntimeout_ms = 3000000000\n", "keys.timeout_ms"),
+            ("[fade]\nduration_ms = 0\n", "fade.duration_ms"),
+            ("[fade]\nduration_ms = 2001\n", "fade.duration_ms"),
         ];
         for (doc, key) in cases {
             let err = parse(Path::new("test.toml"), doc).expect_err(doc);
@@ -437,7 +526,12 @@ mod tests {
                 other => panic!("{doc:?}: expected Invalid, got {other:?}"),
             }
         }
-        for doc in ["[keys]\ntimeout_ms = 1\n", "[keys]\ntimeout_ms = 60000\n"] {
+        for doc in [
+            "[keys]\ntimeout_ms = 1\n",
+            "[keys]\ntimeout_ms = 60000\n",
+            "[fade]\nduration_ms = 1\n",
+            "[fade]\nduration_ms = 2000\n",
+        ] {
             parse(Path::new("test.toml"), doc).expect(doc);
         }
     }
@@ -485,12 +579,25 @@ mod tests {
             rendered.contains("\nprefix     = \"Ctrl-a\"\n"),
             "the chosen prefix is the one active setting: {rendered:?}"
         );
-        // The timeout and the command are documentation, not active settings.
+        // The timeout, the command and the fade are documentation, not active
+        // settings.
         assert!(rendered.contains("# timeout_ms = 500"));
         assert!(
             rendered.contains("# command = \"nvim --headless --listen {sock}\""),
             "the template must document the command: {rendered:?}"
         );
+        assert!(rendered.contains("\n[fade]\n"), "{rendered:?}");
+        for line in [
+            "# enabled     = true",
+            "# duration_ms = 100",
+            "# session     = true",
+            "# excursions  = true",
+        ] {
+            assert!(
+                rendered.contains(line),
+                "the template must document {line:?}: {rendered:?}"
+            );
+        }
     }
 
     // --- path resolution (pure) --------------------------------------------

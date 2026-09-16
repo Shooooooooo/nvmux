@@ -95,14 +95,19 @@ fn closes(key: Key) -> bool {
 /// Show the bindings until the user dismisses them, on its own terminal, handing
 /// the session back untouched afterwards.
 pub fn run() -> Result<()> {
-    super::owning(run_on)
+    // Reached from a session that has just dissolved out, so dissolve in.
+    super::owning(|terminal| run_on(terminal, crate::fade::excursions()))
 }
 
 /// Show the bindings on a terminal the caller already owns — how the picker
-/// answers `?`.
-pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
+/// answers `?`. `animate` is whether to dissolve in on the way in and out on
+/// the way out; from the picker the screen is already up, so it does not.
+pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> Result<()> {
     let label = keys::prefix_label(crate::config::get().keys.prefix);
     let rows = rows(&label);
+    if animate {
+        crate::fade::fade_in(terminal, |f| draw(f, &rows))?;
+    }
     loop {
         terminal.draw(|f| draw(f, &rows))?;
 
@@ -111,6 +116,11 @@ pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         };
 
         if closes(key) {
+            // Dissolve out, so the resumed session takes over from the
+            // background rather than from the key list.
+            if animate {
+                crate::fade::fade_out(terminal, |f| draw(f, &rows))?;
+            }
             return Ok(());
         }
     }

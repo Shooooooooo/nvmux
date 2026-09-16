@@ -133,4 +133,21 @@ timeout_ms = 500            # how long a lone prefix or half-typed number waits
 
 [session]
 command = "nvim --headless --listen {sock}"   # {sock} is required
+
+[fade]
+enabled     = true   # dissolve between screens; NO_COLOR forces this off
+duration_ms = 100    # each way — a switch pays it out and then in
+session     = true   # Neovim's own screen dissolves too, in and out
+excursions  = true   # so do the <prefix> ? and <prefix> c screens
 ```
+
+The fade dissolves each screen into the terminal's own background colour and
+the next one up out of it, so a light theme dips to light and a dark one to
+dark. nvmux asks the terminal what that colour is once at startup (OSC 10, 11
+and 4); a terminal that does not answer gets the hard cuts it always had. With
+`session` on, the session's output is parsed as it passes so Neovim's screen
+can be dissolved cell by cell: out as you leave, and in as you arrive — a
+session's first paint is held back until it has settled (three quarters of a
+second at the most) and then let through as it came, so nothing Neovim
+negotiates with the terminal is changed, only that much delayed. Images drawn
+with the kitty or sixel protocols vanish on the first frame rather than fading.

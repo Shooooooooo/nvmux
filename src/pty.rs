@@ -8,19 +8,31 @@
 //! stdout <-      (untouched)        <- pty master
 //! ```
 //!
-//! **The child-to-terminal direction is never parsed, buffered by line, or
-//! rewritten.** That is the entire reason this design works: bracketed paste,
-//! the kitty keyboard protocol, truecolor, undercurl, terminal titles, OSC 52
-//! clipboard and DA1/XTGETTCAP round-trips all function because the child
-//! negotiates directly with the real terminal. Any "improvement" that inspects
-//! this direction breaks a subset of them. There is likewise no
-//! `nvim_ui_attach`, no `grid_line` handling and no grid diffing anywhere in
-//! this crate — `nvim --remote-ui` already is that client.
+//! **The child-to-terminal direction is never rewritten or acted on.** That
+//! is the entire reason this design works: bracketed paste, the kitty
+//! keyboard protocol, truecolor, undercurl, terminal titles, OSC 52 clipboard
+//! and DA1/XTGETTCAP round-trips all function because the child negotiates
+//! directly with the real terminal. Any "improvement" that changes this
+//! direction on the strength of what it sees breaks a subset of them. There
+//! is likewise no `nvim_ui_attach`, no `grid_line` handling and no grid
+//! diffing anywhere in this crate — `nvim --remote-ui` already is that client.
 //!
-//! The one thing that ever *joins* this direction is the attach notice (see
+//! The one reader of this direction is the shadow grid ([`crate::shadow`]),
+//! which is shown a *copy* and can neither alter a write nor make one depend
+//! on what it saw. It exists for the fade, and is off with it. With the fade
+//! on, the direction is also *held* once per relay: a session's first paint
+//! is kept back from the terminal until it has settled, so the shadow can be
+//! dissolved in first, and is then written out exactly as it came, in one
+//! synchronized update, so the terminal ends in the state the client meant
+//! (see [`Hold`]). The queries in that paint reach the terminal that much
+//! later, and their answers reach the client that much later, which it takes
+//! as it takes any answer. A held byte is never dropped, reordered or changed.
+//!
+//! Two things ever *join* this direction. The attach notice (see
 //! [`crate::announce`]): a box, drawn once the child has been quiet long enough
-//! that it cannot be mid-sequence. Even then nothing is parsed — the safe
-//! moment is found with a clock, not a decoder.
+//! that it cannot be mid-sequence — the safe moment is found with a clock, not
+//! a decoder. And the fade's frames ([`crate::fade`]), written before the
+//! held first paint and after the relay has stopped.
 //!
 //! Three hazards that have no other home in the code:
 //!
@@ -42,7 +54,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair};
 
 use crate::error::{NvmuxError, Result};
 use crate::keys::{Action, Prefix, Step, Wait};
-use crate::{announce, rpc, term, winch};
+use crate::{announce, fade, rpc, shadow, term, winch};
 
 /// Neovim aborts on the seventeenth attached UI rather than returning an error
 /// (`src/nvim/ui.c`: `if (ui_count == MAX_UI_COUNT) { abort(); }`), which would
@@ -126,6 +138,113 @@ pub struct Attachment {
     resumed: bool,
     /// True once the child has been waited for, so `Drop` does not do it twice.
     reaped: bool,
+    /// The session's screen as its bytes have described it, kept so the
+    /// session can be dissolved in and out (see [`crate::shadow`]). `None`
+    /// with the fade off, and then nothing is parsed.
+    shadow: Option<shadow::Shadow>,
+    /// The first paint, while it is being kept back from the terminal so it
+    /// can dissolve in. `None` once released, and always without a shadow.
+    hold: Option<Hold>,
+}
+
+/// A session's first paint, held back from the terminal.
+///
+/// A fade in needs the finished screen before any of it is shown, and a
+/// client paints as it likes: startup queries, the alternate screen, then the
+/// grid in bursts. So from the start of a fresh relay the client's output is
+/// kept here — and shown to the shadow — rather than written, until the
+/// screen has been drawn on and the client has been quiet for [`HOLD_SETTLE`],
+/// the same lull the attach notice waits for and for the same reason: `pump`
+/// never parses the child's output, and a lull is the one state in which the
+/// paint cannot be mid-sequence. Failing a lull, [`HOLD_CAP`] after the first
+/// byte, so a session that never stops drawing still appears; failing both,
+/// [`HOLD_MAX`] bytes, so a hold can never be a leak.
+///
+/// The release dissolves the shadow in and then writes everything held, in
+/// the order it came and inside one synchronized update, so the terminal
+/// processes the client's paint as one frame over nvmux's last one. The
+/// client's alternate-screen entry is written *before* the frames, so they
+/// land on the screen the session will draw on rather than on the primary
+/// screen the shell comes back to (see [`Attachment::release_hold`]).
+#[derive(Debug)]
+struct Hold {
+    bytes: Vec<u8>,
+    /// When the first byte arrived, or `None` until it has.
+    first: Option<Instant>,
+    /// When the client last wrote.
+    last: Instant,
+}
+
+/// How long the client must have been quiet, with something drawn, before
+/// its first paint is called complete. See [`crate::announce`] for the
+/// reasoning behind the number, which is the same one.
+const HOLD_SETTLE: Duration = Duration::from_millis(25);
+
+/// The longest a first paint is held after its first byte. A local session
+/// settles in about 100 ms; over a distant SSH forward the grid can take a
+/// few round trips to start arriving. A session still drawing at the cap is
+/// dissolved in as far as it has got, and finishes live.
+const HOLD_CAP: Duration = Duration::from_millis(750);
+
+/// The most a hold keeps before releasing regardless. Far past any first
+/// paint — a full 200×50 grid in truecolor is a few tens of KB.
+const HOLD_MAX: usize = 1 << 20;
+
+/// The alternate-screen entry a client sends before it draws. The one
+/// sequence a hold looks for, as a fixed string like the DA1 request below.
+const ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
+
+impl Hold {
+    fn new(now: Instant) -> Self {
+        Self {
+            bytes: Vec::new(),
+            first: None,
+            last: now,
+        }
+    }
+
+    /// Keep a chunk the client wrote.
+    fn take(&mut self, chunk: &[u8], now: Instant) {
+        self.bytes.extend_from_slice(chunk);
+        self.first.get_or_insert(now);
+        self.last = now;
+    }
+
+    /// When the relay must next wake up on the hold's account, once there is
+    /// something to wait on. `drawn` is whether the shadow has a glyph yet:
+    /// until it has, a lull releases nothing, so waking for one would spin
+    /// the relay on a `poll` that returns at once until the cap.
+    fn wake_at(&self, drawn: bool) -> Option<Instant> {
+        let first = self.first?;
+        let cap = first + HOLD_CAP;
+        Some(if drawn {
+            (self.last + HOLD_SETTLE).min(cap)
+        } else {
+            cap
+        })
+    }
+
+    /// Whether the paint is over: drawn on and quiet, or held long enough, or
+    /// large enough. `drawn` is whether the shadow has a glyph anywhere yet.
+    fn due(&self, now: Instant, drawn: bool) -> bool {
+        let Some(first) = self.first else {
+            return false;
+        };
+        now >= first + HOLD_CAP
+            || self.bytes.len() >= HOLD_MAX
+            || (drawn && now >= self.last + HOLD_SETTLE)
+    }
+}
+
+/// Where the held bytes split for the release: just past the client's
+/// alternate-screen entry, or at the start if it never sent one — a client
+/// whose `TERM` has no `smcup` draws on the primary screen, and so do the
+/// frames then.
+fn split_at_alt_screen_entry(bytes: &[u8]) -> usize {
+    bytes
+        .windows(ALT_SCREEN_ENTER.len())
+        .position(|w| w == ALT_SCREEN_ENTER)
+        .map_or(0, |i| i + ALT_SCREEN_ENTER.len())
 }
 
 impl std::fmt::Debug for Attachment {
@@ -215,6 +334,140 @@ impl Attachment {
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGHUP);
             libc::kill(pid as libc::pid_t, libc::SIGCONT);
+        }
+    }
+
+    /// Write to the terminal, then let the shadow see what was written.
+    ///
+    /// Every byte the terminal is shown while this client has it goes through
+    /// here — the client's output, the attach notice — so the shadow's idea of
+    /// the screen is the terminal's. The write comes first and the shadow
+    /// after: nothing about the shadow may delay or change what the user sees.
+    fn write_terminal(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let mut out = std::io::stdout().lock();
+        out.write_all(bytes)?;
+        out.flush()?;
+        drop(out);
+        self.shadow_saw(bytes);
+        Ok(())
+    }
+
+    /// Let the shadow see bytes something else wrote to the terminal — the
+    /// hand-off strings [`crate::term`] writes on the client's behalf.
+    fn shadow_saw(&mut self, bytes: &[u8]) {
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.feed(bytes);
+        }
+    }
+
+    /// Show the terminal what the client wrote — or, while its first paint is
+    /// held, keep it and show only the shadow.
+    fn relay_output(&mut self, chunk: &[u8], now: Instant) -> std::io::Result<()> {
+        if let Some(hold) = self.hold.as_mut() {
+            hold.take(chunk, now);
+            if let Some(shadow) = self.shadow.as_mut() {
+                shadow.feed(chunk);
+            }
+            return Ok(());
+        }
+        self.write_terminal(chunk)
+    }
+
+    /// Whether the shadow has a glyph anywhere yet — what a lull needs before
+    /// it counts as the first paint being over.
+    fn drawn(&self) -> bool {
+        self.shadow
+            .as_ref()
+            .is_some_and(shadow::Shadow::has_contents)
+    }
+
+    /// Whether the held first paint is over and should be released now.
+    fn hold_is_due(&self, now: Instant) -> bool {
+        let drawn = self.drawn();
+        self.hold.as_ref().is_some_and(|hold| hold.due(now, drawn))
+    }
+
+    /// When the relay must next wake up for the held first paint, if it is
+    /// holding one.
+    fn hold_wake_at(&self) -> Option<Instant> {
+        let drawn = self.drawn();
+        self.hold.as_ref().and_then(|hold| hold.wake_at(drawn))
+    }
+
+    /// Let the held first paint through: dissolve the shadow in, when asked
+    /// to and there is something drawn to dissolve, then write everything
+    /// held exactly as it came. Harmless without a hold.
+    ///
+    /// The bytes up to the client's alternate-screen entry go first and the
+    /// frames after, so they are drawn on the screen the client is about to
+    /// draw on; the rest is written inside one synchronized update, so the
+    /// client's own clear and paint replace the last frame in one step.
+    fn release_hold(&mut self, dissolve: bool) -> std::io::Result<()> {
+        let Some(hold) = self.hold.take() else {
+            return Ok(());
+        };
+        let held_for = hold.first.map(|first| first.elapsed());
+        let bytes = hold.bytes;
+        let drawn = self.drawn();
+        let split = if dissolve && drawn {
+            split_at_alt_screen_entry(&bytes)
+        } else {
+            0
+        };
+        let mut dissolved = false;
+        if dissolve && drawn {
+            write_stdout(&bytes[..split])?;
+            if let Some(shadow) = self.shadow.as_mut() {
+                // A frame that could not be written is not a reason to keep
+                // the paint: the replay below is what the user is waiting for.
+                dissolved = match fade::fade_in_session(shadow) {
+                    Ok(faded) => faded,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "the session's fade-in did not complete");
+                        true
+                    }
+                };
+            }
+        }
+        let mut out = std::io::stdout().lock();
+        out.write_all(fade::SYNC_BEGIN)?;
+        out.write_all(&bytes[split..])?;
+        out.write_all(fade::SYNC_END)?;
+        out.flush()?;
+        drop(out);
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.invalidate();
+        }
+        tracing::debug!(
+            held_ms = held_for.map(|d| d.as_secs_f64() * 1000.0),
+            bytes = bytes.len(),
+            dissolved,
+            "timing: first paint held"
+        );
+        Ok(())
+    }
+
+    /// Dissolve the screen the shadow holds in from the background — for a
+    /// resumed client, whose last screen the shadow still has. Says whether
+    /// it did; if not, the terminal is as the hand-off left it.
+    fn dissolve_in(&mut self) -> bool {
+        let Some(shadow) = self.shadow.as_mut().filter(|s| s.has_contents()) else {
+            return false;
+        };
+        match fade::fade_in_session(shadow) {
+            Ok(faded) => faded,
+            Err(e) => {
+                tracing::debug!(error = %e, "the resumed session's fade-in did not complete");
+                true
+            }
+        }
+    }
+
+    /// Tell the pty — and the shadow — the terminal's size.
+    fn resize_to(&mut self, size: PtySize) {
+        let _ = self.master.resize(size);
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.resize(size.rows, size.cols);
         }
     }
 
@@ -592,6 +845,11 @@ fn spawn_client(
         writer,
         resumed: false,
         reaped: false,
+        // Only when it will be used: a shadow costs a parse of everything the
+        // client writes.
+        shadow: (fade::enabled() && fade::session())
+            .then(|| shadow::Shadow::new(size.rows, size.cols)),
+        hold: None,
     })
 }
 
@@ -616,6 +874,8 @@ pub fn relay(
         .ok_or_else(|| NvmuxError::Io(std::io::Error::other("pty master has no fd")))?;
 
     let winch = winch::Winch::install()?;
+    // A client that has not painted yet, whose first paint can be held.
+    let fresh = !attachment.resumed;
     if attachment.resumed {
         // The client entered the alternate screen itself on its first relay
         // and has not been told that every screen since — the picker, the
@@ -624,6 +884,9 @@ pub fn relay(
         // terminal is. Left on the primary screen it draws there, and then
         // on a detach its `rmcup` and nvmux's own `?1049l` have nothing to
         // leave, and its last frame is what the shell prompt lands on.
+        // Not shown to the shadow: the erase would take the screen the
+        // client had out of it, and that screen is what dissolves back in
+        // below, ahead of the repaint that then puts the real one back.
         term::enter_alt_screen_and_clear();
     } else {
         // Normally already done by whoever handed the terminal over — the
@@ -634,6 +897,7 @@ pub fn relay(
         // has drawn to since. The client enters the alternate screen for
         // itself, as part of its startup.
         term::leave_alt_screen_and_clear();
+        attachment.shadow_saw(term::HANDOVER);
     }
     let mut raw = term::RawMode::enter()?;
 
@@ -641,13 +905,19 @@ pub fn relay(
     // picker has since drawn over.
     if attachment.resumed {
         discard_pending(master_fd);
-        repaint(
-            attachment.master.as_ref(),
-            &attachment.sock,
-            Repaint::Resume,
-        );
+        // The size first, so the frames fit the terminal as it is now; then
+        // the screen the client had dissolves in, and only then is the
+        // client asked to repaint — its paint lands over the last frame.
+        attachment.resize_to(term::terminal_size());
+        if !attachment.dissolve_in() {
+            attachment.shadow_saw(term::RESUME);
+        }
+        repaint(&mut attachment, Repaint::Resume);
     }
     attachment.resumed = true;
+    if fresh && attachment.shadow.is_some() && fade::enabled() {
+        attachment.hold = Some(Hold::new(Instant::now()));
+    }
 
     // Taken, not copied: `<prefix> Space` and `<prefix> ?` come back to this same
     // client, and a session you never left has nothing to announce.
@@ -661,17 +931,37 @@ pub fn relay(
         popup,
     );
 
+    // Whatever ended the relay, nothing the client wrote may stay unshown: a
+    // relay cut short inside the hold — a prefix typed at once, a child that
+    // exited — lets the paint through as it is, with no fade.
+    if let Err(e) = attachment.release_hold(false) {
+        tracing::debug!(error = %e, "could not release the held first paint");
+    }
+
     match outcome {
         Ok(
             held
             @ (Outcome::ToPicker | Outcome::CreateNew | Outcome::ShowHelp | Outcome::Switch(_)),
         ) => {
+            // Dissolve the session out first: before the modes go back, so a
+            // key typed during it is not echoed, and before the hand-off
+            // below, which erases with the colour the last frame ends on. A
+            // frame that could not be written must not skip the restore, so
+            // its error is logged and dropped rather than propagated.
+            if let Some(shadow) = attachment.shadow.as_mut() {
+                if let Err(e) = fade::fade_out_session(shadow) {
+                    tracing::debug!(error = %e, "the session's fade-out did not complete");
+                }
+            }
             raw.restore();
             // Clear here rather than leaving it to the next `relay`, which runs
             // on the far side of the client spawn: what is on the terminal until
             // then is the session being switched away from. Harmless when the
             // number names nothing — the same client is resumed, and a resume
             // forces a repaint.
+            // Not shown to the shadow, for the reason the resume's erase is
+            // not: a switch that names this same session resumes it, and the
+            // screen it had is what dissolves back in.
             if held.leads_straight_into_another_relay() {
                 term::leave_alt_screen_and_clear();
             }
@@ -743,14 +1033,18 @@ fn pump(
 
     loop {
         // The attach notice has a clock of its own — a lull to wait out, and a
-        // life to end — and it is folded in here so both are honoured by the
-        // same `poll`. Absolute on both sides, for the reason above.
-        let next = match (deadline, popup.as_ref()) {
-            (Some(d), Some(p)) => Some(d.min(p.wake_at(Instant::now()))),
-            (Some(d), None) => Some(d),
-            (None, Some(p)) => Some(p.wake_at(Instant::now())),
-            (None, None) => None,
-        };
+        // life to end — and so does a held first paint; both are folded in
+        // here so all of it is honoured by the same `poll`. Absolute on every
+        // side, for the reason above.
+        let now = Instant::now();
+        let next = [
+            deadline,
+            popup.as_ref().map(|p| p.wake_at(now)),
+            attachment.hold_wake_at(),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
 
         // A stopped child produces no poll activity at all, so even an idle
         // wait is bounded; an armed prefix shortens it to its own deadline.
@@ -783,18 +1077,25 @@ fn pump(
                 // EOF on macOS, EIO on Linux: both mean the slave closed.
                 Ok(0) | Err(_) => return Ok(Outcome::ChildExited),
                 Ok(len) => {
-                    // Byte for byte, unparsed and unbuffered; see the module
-                    // docs.
-                    let mut out = std::io::stdout().lock();
-                    out.write_all(&buf[..len])?;
-                    out.flush()?;
+                    // Byte for byte, and held only while the first paint is;
+                    // see the module docs. The shadow, if there is one, is
+                    // shown a copy.
+                    let now = Instant::now();
+                    attachment.relay_output(&buf[..len], now)?;
                     if first_byte.is_none() {
                         first_byte = Some(relay_started.elapsed());
                     }
                     painted_bytes += len;
-                    last_byte = Instant::now();
+                    last_byte = now;
                 }
             }
+        }
+
+        // The held first paint, once it is over: dissolved in from the
+        // shadow, then let through. Before the notice below, which paints
+        // over the session and so must find it on screen.
+        if attachment.hold_is_due(Instant::now()) {
+            attachment.release_hold(true)?;
         }
 
         // Once per relay, on the first lull after the session has said
@@ -814,7 +1115,7 @@ fn pump(
             winch.drain();
             // Enough on its own: the kernel signals the pty's foreground group
             // and the client calls try_resize.
-            let _ = attachment.master.resize(term::terminal_size());
+            attachment.resize_to(term::terminal_size());
         }
 
         // After the frame it sits on and before any keystroke is acted on. The
@@ -824,11 +1125,7 @@ fn pump(
             let act = p.step(Instant::now(), child_spoke, term::terminal_size());
             match act {
                 announce::Act::Idle => {}
-                announce::Act::Paint(bytes) => {
-                    let mut out = std::io::stdout().lock();
-                    out.write_all(&bytes)?;
-                    out.flush()?;
-                }
+                announce::Act::Paint(bytes) => attachment.write_terminal(&bytes)?,
                 announce::Act::Erase => {
                     // Timed because it is a second full repaint of the session,
                     // a whole second after the switch — the one nvmux asks for
@@ -838,11 +1135,7 @@ fn pump(
                     // reason: the cells the box covered are the server's, and
                     // only the server can say what was under them. Not the same
                     // licence, though — see [`Repaint`].
-                    repaint(
-                        attachment.master.as_ref(),
-                        &attachment.sock,
-                        Repaint::Notice,
-                    );
+                    repaint(attachment, Repaint::Notice);
                     tracing::debug!(
                         ms = t_erase.elapsed().as_secs_f64() * 1000.0,
                         "timing: attach notice erase (:mode repaint)"
@@ -1039,8 +1332,18 @@ fn peek_child(pid: nix::unistd::Pid) -> Peek {
     }
 }
 
+/// Write to the terminal and flush, so what is written lands before the next
+/// thing does.
+fn write_stdout(bytes: &[u8]) -> std::io::Result<()> {
+    let mut out = std::io::stdout().lock();
+    out.write_all(bytes)?;
+    out.flush()
+}
+
 /// Read whatever is available. Only called after `poll` says the fd is ready.
-fn read_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
+/// Shared with [`crate::palette`], which reads the terminal's replies the same
+/// way.
+pub(crate) fn read_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
     let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
     if n < 0 {
         Err(std::io::Error::last_os_error())
@@ -1168,15 +1471,17 @@ fn without_device_attributes_request(chunk: &[u8]) -> std::borrow::Cow<'_, [u8]>
 /// tracking on until its Neovim next flips the mouse itself — and right for
 /// everything else, where the alternative is a client that no longer answers
 /// the mouse at all.
-fn repaint(master: &dyn MasterPty, sock: &Path, why: Repaint) {
+fn repaint(attachment: &mut Attachment, why: Repaint) {
     let size = term::terminal_size();
-    let _ = master.resize(size);
-    let served = repaint_through_server(sock, why);
+    attachment.resize_to(size);
+    let served = repaint_through_server(&attachment.sock, why);
     if why == Repaint::Resume {
         term::set_mouse_reporting(served.mouse.unwrap_or(term::MouseReporting::Buttons));
     }
     if !served.repainted {
-        nudge(master, size);
+        // The shrink and its undo are not shown to the shadow: what the
+        // client draws after them is for the size it was just told.
+        nudge(attachment.master.as_ref(), size);
     }
 }
 
@@ -1396,6 +1701,8 @@ mod tests {
             writer,
             resumed: false,
             reaped: false,
+            shadow: None,
+            hold: None,
         }
     }
 
@@ -1508,6 +1815,79 @@ mod tests {
     /// in either direction is invisible in a test that only checks the
     /// outcomes: too narrow leaves the old session on screen through the
     /// spawn, too wide clears a screen that is about to draw anyway.
+    /// A hold ends at the first lull after something has been drawn — not
+    /// at a lull before, which is a client between its queries and its grid.
+    #[test]
+    fn a_hold_waits_for_a_drawn_screen_and_then_a_lull() {
+        let t0 = Instant::now();
+        let mut hold = Hold::new(t0);
+        assert!(
+            !hold.due(t0 + Duration::from_secs(5), true),
+            "nothing written yet"
+        );
+        assert_eq!(hold.wake_at(true), None);
+
+        hold.take(b"\x1b[?1049h\x1b[c", t0 + Duration::from_millis(10));
+        let quiet = t0 + Duration::from_millis(10) + HOLD_SETTLE;
+        assert!(!hold.due(quiet, false), "quiet, but nothing drawn");
+        assert!(hold.due(quiet, true), "quiet and drawn");
+        assert_eq!(hold.wake_at(true), Some(quiet));
+        // Nothing drawn: the lull is not worth waking for, only the cap is —
+        // or the relay would spin on a wake-up that is already past.
+        assert_eq!(
+            hold.wake_at(false),
+            Some(t0 + Duration::from_millis(10) + HOLD_CAP)
+        );
+
+        // Every chunk restarts the lull.
+        hold.take(b"~", t0 + Duration::from_millis(30));
+        assert!(!hold.due(quiet, true));
+        assert!(hold.due(t0 + Duration::from_millis(30) + HOLD_SETTLE, true));
+    }
+
+    /// A client that never stops drawing is released at the cap, drawn or
+    /// not; one that writes an absurd amount is released by size.
+    #[test]
+    fn a_hold_is_released_at_the_cap_or_by_size() {
+        let t0 = Instant::now();
+        let mut hold = Hold::new(t0);
+        hold.take(b"x", t0);
+        for ms in (0..700).step_by(10) {
+            hold.take(b"x", t0 + Duration::from_millis(ms));
+        }
+        assert!(!hold.due(t0 + Duration::from_millis(700), false));
+        assert!(
+            hold.due(t0 + HOLD_CAP, false),
+            "the cap releases an undrawn screen too"
+        );
+        assert_eq!(
+            hold.wake_at(false),
+            Some(t0 + HOLD_CAP),
+            "undrawn, only the cap is worth waking for"
+        );
+        assert_eq!(
+            hold.wake_at(true),
+            Some(t0 + Duration::from_millis(690) + HOLD_SETTLE),
+            "drawn, the lull after the last chunk comes before the cap"
+        );
+
+        let mut big = Hold::new(t0);
+        big.take(&vec![b' '; HOLD_MAX], t0);
+        assert!(big.due(t0, false));
+    }
+
+    /// The frames go on the screen the client is about to draw on: the split
+    /// is just past its alternate-screen entry, or at the start without one.
+    #[test]
+    fn the_release_splits_just_past_the_alternate_screen_entry() {
+        let bytes = b"\x1b[?1004h\x1b[?1049h\x1b[2J~";
+        let at = split_at_alt_screen_entry(bytes);
+        assert_eq!(&bytes[..at], b"\x1b[?1004h\x1b[?1049h");
+        assert_eq!(&bytes[at..], b"\x1b[2J~");
+        assert_eq!(split_at_alt_screen_entry(b"\x1b[2J~"), 0);
+        assert_eq!(split_at_alt_screen_entry(b""), 0);
+    }
+
     #[test]
     fn only_a_switch_reaches_the_next_session_without_a_screen() {
         for target in [Target::Number(3), Target::Step(Direction::Next)] {

@@ -4,7 +4,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use nvmux::cli::Cli;
-use nvmux::{announce, config, logging, nested, nvim, paths, pty, reconnect, transport, ui};
+use nvmux::{
+    announce, config, fade, logging, nested, nvim, palette, paths, pty, reconnect, transport, ui,
+};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -49,6 +51,15 @@ fn run(cli: &Cli) -> Result<()> {
     // included. On a genuine first run at an interactive terminal this asks for a
     // prefix and records it; otherwise it loads whatever exists (or the defaults).
     config::init(establish_settings()?);
+
+    // The fade dissolves every screen into the terminal's own background, so
+    // it has to know what colour that is — and only the terminal can say. After
+    // the config, so a user who turned the fade off never pays for the question
+    // or the keystroke it can cost (see `palette::query`); before any screen
+    // that would fade; and after the first-run screen, which does not.
+    if fade::configured() {
+        palette::init(palette::query());
+    }
 
     let transport = transport::open(location.clone())?;
     session_loop(transport.as_ref())
