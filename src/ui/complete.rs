@@ -106,6 +106,11 @@ pub struct Completer {
     awaiting: bool,
     cache: Vec<Cached>,
     shown: Shown,
+    /// The session host's home, for the `~` in a typed path. Held here rather
+    /// than reached for per question because it is what [`DirSource`] is about
+    /// — the host — and because the expansion happens on this thread, before a
+    /// request is made, not in the worker.
+    home: String,
     /// Scratch buffers for the scorer, reused across queries. `Matcher` is
     /// stateful for that reason and scoring takes `&mut`, which is why ranking
     /// lives here beside the names rather than in the prompt.
@@ -114,7 +119,12 @@ pub struct Completer {
 
 impl Completer {
     /// Start completing against `source`, which the worker takes with it.
-    pub fn new(source: DirSource) -> Self {
+    ///
+    /// `home` is that same host's home directory, which is what a leading `~`
+    /// in the field means — see [`crate::session::expand_tilde`]. Empty is
+    /// allowed and means the host never said: a `~` is then left as the
+    /// literal text it is, and lists nothing.
+    pub fn new(source: DirSource, home: &str) -> Self {
         let (ask_tx, ask_rx) = mpsc::channel::<Request>();
         let (reply_tx, reply_rx) = mpsc::channel::<Reply>();
 
@@ -135,6 +145,7 @@ impl Completer {
             awaiting: false,
             cache: Vec::new(),
             shown: Shown::default(),
+            home: home.to_string(),
             matcher: Matcher::new(Config::DEFAULT),
         }
     }
@@ -148,6 +159,20 @@ impl Completer {
             self.awaiting = false;
             return;
         };
+        // The `~` is expanded here, on the directory half and after the split,
+        // which is what keeps it to the one shape that has a directory in it.
+        // A bare `~` names the home but does not yet say "inside it", and it
+        // has no `/`, so `split` has already returned above and left it alone —
+        // exactly as `/home/shu` is left alone. Typing the `/` is what asks.
+        //
+        // The expansion is the same one `enter` will apply (see
+        // `session::validate_directory`), so the menu cannot offer what
+        // creating the session would not use. A `~` that will not expand —
+        // `~user`, or a host that reported no home — stays the literal text,
+        // and the host lists nothing for it: at a prompt `~r` is `~root` half
+        // typed, not an error to report.
+        let dir = crate::session::expand_tilde(dir, &self.home).unwrap_or_else(|_| dir.to_string());
+        let dir = dir.as_str();
         // Only the directory is a question for the host. Everything after the
         // last `/` is a query, and this side answers those from what it already
         // holds — which is why typing inside a directory costs nothing at all.
@@ -354,6 +379,12 @@ mod tests {
     /// answer late, out of order, or not at all, and can see exactly which
     /// directories were asked about. No thread, no filesystem, no ssh.
     fn detached() -> (Completer, Receiver<Request>, Sender<Reply>) {
+        detached_at("/home/you")
+    }
+
+    /// The same, for a host whose home is `home` — which is what a `~` in the
+    /// field means, and the only thing the tilde tests need to vary.
+    fn detached_at(home: &str) -> (Completer, Receiver<Request>, Sender<Reply>) {
         let (ask_tx, ask_rx) = mpsc::channel();
         let (reply_tx, reply_rx) = mpsc::channel();
         let c = Completer {
@@ -363,6 +394,7 @@ mod tests {
             awaiting: false,
             cache: Vec::new(),
             shown: Shown::default(),
+            home: home.to_string(),
             matcher: Matcher::new(Config::DEFAULT),
         };
         (c, ask_rx, reply_tx)
@@ -543,6 +575,117 @@ mod tests {
         assert!(asked(&ask_rx).is_empty());
         assert!(c.names().is_empty());
         assert!(!c.waiting());
+    }
+
+    // --- the tilde -----------------------------------------------------------
+
+    /// A `~` is the *session host's* home, so what gets listed is the home the
+    /// completer was built with — never this machine's `$HOME`, which over ssh
+    /// would be a different computer's path.
+    #[test]
+    fn a_tilde_is_the_session_hosts_home_directory() {
+        let (mut c, ask_rx, reply_tx) = detached_at("/home/them");
+        c.ask("~/");
+        assert_eq!(asked(&ask_rx), ["/home/them"]);
+
+        answer(&mut c, &ask_rx, &reply_tx, listing(&["src", "docs"]));
+        assert_eq!(c.matches(""), ["src", "docs"]);
+    }
+
+    /// The expansion is of the directory half, so it survives being deep in a
+    /// path rather than only working at the front of one.
+    #[test]
+    fn a_tilde_expands_anywhere_the_directory_half_starts_with_one() {
+        let (mut c, ask_rx, _reply_tx) = detached_at("/home/them");
+        c.ask("~/src/nv");
+        assert_eq!(asked(&ask_rx), ["/home/them/src"]);
+    }
+
+    /// A trailing slash on the host's home must not become a doubled one:
+    /// `//` is the prompt's "start again from the root", so `/home/them//src`
+    /// would be read as `/src` by everything downstream.
+    #[test]
+    fn a_home_with_a_trailing_slash_does_not_make_a_double_one() {
+        let (mut c, ask_rx, _reply_tx) = detached_at("/home/them/");
+        c.ask("~/src/nv");
+        assert_eq!(asked(&ask_rx), ["/home/them/src"]);
+    }
+
+    /// The same directory by two spellings is one question. Worth pinning
+    /// because the cache is keyed on the *expanded* path: walking to `~/src`
+    /// and then typing it out in full must not cost a second round trip.
+    #[test]
+    fn a_tilde_path_and_the_spelled_out_one_share_a_listing() {
+        let (mut c, ask_rx, reply_tx) = detached_at("/home/them");
+        c.ask("~/");
+        answer(&mut c, &ask_rx, &reply_tx, listing(&["src"]));
+
+        c.ask("/home/them/s");
+        assert!(
+            asked(&ask_rx).is_empty(),
+            "the same directory was asked about twice"
+        );
+        assert_eq!(c.names(), ["src"]);
+    }
+
+    /// A bare `~` names the home but does not yet say "inside it", and it has
+    /// no `/`, so it is left alone exactly as `/home/them` is: the menu offers
+    /// what is *beside* it, and typing the `/` is what steps in. Pinned because
+    /// expanding it would make `accept` write `~/them` for a directory reached
+    /// as `/home/them`.
+    #[test]
+    fn a_bare_tilde_is_left_alone_like_any_other_directory_name() {
+        let (mut c, ask_rx, _reply_tx) = detached_at("/home/them");
+        c.ask("~");
+        assert!(asked(&ask_rx).is_empty(), "nothing to list yet");
+        assert!(!c.waiting());
+        assert!(c.names().is_empty());
+    }
+
+    /// `~user` is somebody else's home and only the host could resolve it.
+    /// `session::validate_directory` refuses it; here it is simply listed as
+    /// the literal text, which finds nothing — because at a prompt `~r` is
+    /// `~root` half typed, and a keystroke on the way somewhere must not be an
+    /// error.
+    #[test]
+    fn a_tilde_user_is_never_expanded_and_never_an_error() {
+        let (mut c, ask_rx, reply_tx) = detached_at("/home/them");
+        c.ask("~root/s");
+        assert_eq!(asked(&ask_rx), ["~root"], "the literal text, not the home");
+
+        // And the host's honest answer for it is nothing at all.
+        answer(&mut c, &ask_rx, &reply_tx, Listing::default());
+        assert!(c.matches("s").is_empty());
+    }
+
+    /// A host that never said where home is has no `~` to offer. The literal
+    /// text again, rather than a confident wrong guess at this machine's own
+    /// home — which is the whole reason the expansion takes a `home` at all.
+    #[test]
+    fn a_host_that_reported_no_home_expands_nothing() {
+        let (mut c, ask_rx, _reply_tx) = detached_at("");
+        c.ask("~/src");
+        assert_eq!(asked(&ask_rx), ["~"]);
+    }
+
+    /// The menu and enter must not mean two different directories. This is the
+    /// claim that `session::validate_directory` and the completer share one
+    /// expansion, checked against the real thing rather than restated.
+    #[test]
+    fn what_the_menu_lists_is_what_enter_would_create_in() {
+        const HOME: &str = "/home/them";
+        for (typed, inside) in [("~/", "~/"), ("~/src/nv", "~/src"), ("~/a/b/c", "~/a/b")] {
+            let (mut c, ask_rx, _reply_tx) = detached_at(HOME);
+            c.ask(typed);
+            let listed = asked(&ask_rx);
+            let created = crate::session::validate_directory(inside, HOME)
+                .expect("a directory the prompt would accept");
+            assert_eq!(
+                listed,
+                [created.trim_end_matches('/').to_string()],
+                "{typed:?} listed one directory and would create in another"
+            );
+        }
     }
 
     /// The cache is bounded, or a long session at a prompt would hold every

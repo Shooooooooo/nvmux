@@ -757,7 +757,10 @@ pub(super) fn run_on(
     // worker. Dropped with the prompt, which is what ends it — see
     // `super::complete`.
     let mut completer = match task {
-        Task::Create => Some(complete::Completer::new(transport.dir_source())),
+        Task::Create => Some(complete::Completer::new(
+            transport.dir_source(),
+            transport.home(),
+        )),
         Task::Rename(_) => None,
     };
     // Ask about the default before a key is pressed. The answer is then usually
