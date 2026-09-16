@@ -75,12 +75,15 @@ impl Outcome {
 
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 
 use crate::error::Result;
 use crate::session::Session;
 use crate::transport::Transport;
-use app::{App, Key, Request};
+use app::{App, Key, Mouse, Request};
 
 /// A bounded poll rather than an indefinite read, so a resize is not stuck
 /// behind an idle keyboard.
@@ -111,7 +114,17 @@ pub(crate) struct Screen {
 }
 
 impl Screen {
-    /// Take the terminal.
+    /// Take the terminal — and the mouse.
+    ///
+    /// Every screen turns mouse reporting on for itself and off again as it
+    /// closes, whatever is behind it. Where that is a held client, the relay
+    /// puts the client's own setting back as it resumes it, having asked the
+    /// client's server what that was (see `pty::repaint`); a client spawned
+    /// next enables its own. The screens set no colours so as to inherit the
+    /// terminal's palette, but a *mode* cannot be inherited the same way — a
+    /// `--remote-ui` client enables the mouse once, at startup, and would
+    /// never re-enable a mode nvmux had turned off — which is why this is
+    /// restored by asking rather than left alone.
     pub(crate) fn open() -> Result<Self> {
         // Stops crossterm second-guessing us; see the module docs on colour.
         ratatui::crossterm::style::force_color_output(true);
@@ -131,7 +144,15 @@ impl Screen {
         // so without this the content lands in the middle of the editor's last
         // frame. From here on an error restores through `Drop`.
         screen.terminal.clear()?;
+        crate::term::enable_mouse();
         Ok(screen)
+    }
+
+    /// Undo [`crate::term::enable_mouse`]. Before the modes and the screen
+    /// switch, so nothing this writes can land after the one-write handover the
+    /// attach path relies on.
+    fn release_mouse(&mut self) {
+        crate::term::disable_mouse();
     }
 
     pub(crate) fn terminal(&mut self) -> &mut ratatui::DefaultTerminal {
@@ -141,6 +162,7 @@ impl Screen {
     /// Give the terminal back, reporting a failure to do so.
     pub(crate) fn close(mut self) -> Result<()> {
         self.closed = true;
+        self.release_mouse();
         ratatui::try_restore()?;
         Ok(())
     }
@@ -160,6 +182,7 @@ impl Screen {
     /// puts the leave and the erase in one `write`.
     pub(crate) fn close_for_attach(mut self) -> Result<()> {
         self.closed = true;
+        self.release_mouse();
         // Modes first, for the reason ratatui gives for the same order: dropping
         // raw mode has the wider side effects. The screen is put back either
         // way, so a failure to restore the modes cannot also strand the user on
@@ -177,6 +200,7 @@ impl Drop for Screen {
             // The error path: `restore` reports a failure on stderr and goes
             // on, which is all that can be done while an error is already in
             // flight.
+            self.release_mouse();
             ratatui::restore();
         }
     }
@@ -285,7 +309,9 @@ fn run_loop(
     let mut deadline: Option<Instant> = None;
 
     loop {
-        terminal.draw(|f| draw::draw(f, &app))?;
+        // The area kept for the mouse: a click is resolved against the screen
+        // as it was last drawn, which is the one the user clicked on.
+        let area = terminal.draw(|f| draw::draw(f, &app))?.area;
 
         if !event::poll(TICK)? {
             // The clock lives here rather than in `App`, which stays pure —
@@ -303,12 +329,16 @@ fn run_loop(
             }
             continue;
         }
-        let key = match event::read()? {
-            Event::Key(k) if k.kind == KeyEventKind::Press => translate(k),
+        let request = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(translate(k)),
+            Event::Mouse(m) => {
+                match translate_mouse(m, draw::row_at(&app, area, m.column, m.row)) {
+                    Some(mouse) => app.on_mouse(mouse),
+                    None => continue,
+                }
+            }
             _ => continue,
         };
-
-        let request = app.on_key(key);
         deadline = app
             .pending()
             .is_some()
@@ -446,9 +476,78 @@ fn translate(k: KeyEvent) -> Key {
     }
 }
 
+/// Reduce a crossterm mouse event to the gestures the picker understands, with
+/// `row` the visible row under the pointer as [`draw::row_at`] resolved it.
+///
+/// Plain motion, the left button and the wheel, and nothing else: the other
+/// buttons and a horizontal wheel are nothing to the picker.
+fn translate_mouse(m: MouseEvent, row: Option<usize>) -> Option<Mouse> {
+    match m.kind {
+        MouseEventKind::Moved => Some(Mouse::Hover(row)),
+        MouseEventKind::Down(MouseButton::Left) => Some(Mouse::Press(row)),
+        MouseEventKind::Drag(MouseButton::Left) => Some(Mouse::Drag(row)),
+        MouseEventKind::Up(MouseButton::Left) => Some(Mouse::Release),
+        MouseEventKind::ScrollUp => Some(Mouse::ScrollUp),
+        MouseEventKind::ScrollDown => Some(Mouse::ScrollDown),
+        MouseEventKind::Down(_)
+        | MouseEventKind::Up(_)
+        | MouseEventKind::Drag(_)
+        | MouseEventKind::ScrollLeft
+        | MouseEventKind::ScrollRight => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Motion, the left button and the wheel reach the picker, carrying the
+    /// row the caller resolved; everything else is dropped before it can.
+    #[test]
+    fn only_motion_the_left_button_and_the_wheel_reach_the_picker() {
+        assert_eq!(
+            translate_mouse(mouse(MouseEventKind::Moved), Some(1)),
+            Some(Mouse::Hover(Some(1)))
+        );
+        assert_eq!(
+            translate_mouse(mouse(MouseEventKind::Down(MouseButton::Left)), Some(2)),
+            Some(Mouse::Press(Some(2)))
+        );
+        assert_eq!(
+            translate_mouse(mouse(MouseEventKind::Drag(MouseButton::Left)), None),
+            Some(Mouse::Drag(None))
+        );
+        assert_eq!(
+            translate_mouse(mouse(MouseEventKind::Up(MouseButton::Left)), Some(2)),
+            Some(Mouse::Release)
+        );
+        assert_eq!(
+            translate_mouse(mouse(MouseEventKind::ScrollUp), None),
+            Some(Mouse::ScrollUp)
+        );
+        assert_eq!(
+            translate_mouse(mouse(MouseEventKind::ScrollDown), None),
+            Some(Mouse::ScrollDown)
+        );
+        for kind in [
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Up(MouseButton::Right),
+            MouseEventKind::Drag(MouseButton::Middle),
+            MouseEventKind::ScrollLeft,
+            MouseEventKind::ScrollRight,
+        ] {
+            assert_eq!(translate_mouse(mouse(kind), Some(0)), None, "{kind:?}");
+        }
+    }
 
     /// The three bound chords are the only ones that survive as chords; a
     /// chord must never arrive as its bare letter (see `translate`).

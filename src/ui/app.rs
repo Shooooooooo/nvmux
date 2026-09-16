@@ -75,6 +75,20 @@ pub struct App {
     /// The session the picker was opened from and can be dismissed back to.
     /// See [`App::set_came_from`].
     came_from: Option<String>,
+    /// What the left button last went down on, until it comes up. See
+    /// [`App::on_mouse`].
+    pressed: Option<Pressed>,
+}
+
+/// Where a left press landed, which decides what its release means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pressed {
+    /// On a row that was not the selection: the press selected it, and the
+    /// release does nothing. A drag in between picks the row up.
+    Row,
+    /// On the row already selected: the release attaches, unless a drag in
+    /// between turned the gesture into a move.
+    Selected,
 }
 
 impl App {
@@ -87,6 +101,7 @@ impl App {
             message: None,
             pending: None,
             came_from: None,
+            pressed: None,
         }
     }
 
@@ -215,6 +230,20 @@ impl App {
     /// Move the selection, wrapping at both ends.
     fn move_by(&mut self, delta: isize) {
         self.selected = self.wrapped(delta);
+    }
+
+    /// The row `delta` away from the selection, stopping at both ends.
+    ///
+    /// For the wheel, which unlike the keys does not wrap: a list that jumps
+    /// from its last row to its first under a scrolling finger reads as the
+    /// list having lost its place, where a key pressed once too often reads as
+    /// the key having done what it always does.
+    fn clamped(&self, delta: isize) -> usize {
+        let len = self.visible().len();
+        if len == 0 {
+            return 0;
+        }
+        (self.selected as isize + delta).clamp(0, len as isize - 1) as usize
     }
 
     /// Every visible row's `(id, resolved number)`, in display order.
@@ -397,6 +426,149 @@ impl App {
         match &self.came_from {
             Some(id) if self.session(id).is_some() => Request::Attach(id.clone()),
             _ => Request::None,
+        }
+    }
+
+    /// Handle one mouse gesture. Returns whatever the caller now has to do.
+    ///
+    /// The rows a gesture names are indices into [`App::visible`], resolved by
+    /// the caller from where the pointer was against the screen it last drew —
+    /// so the picker knows rows, never coordinates, and stays as testable as it
+    /// is for keys.
+    ///
+    /// The highlight follows the pointer: hovering over a row selects it, so
+    /// the keyboard and the mouse share one cursor. A press selects the row
+    /// under it; a press on the row already selected arms its release to
+    /// attach. With the pointer's row always selected that makes a single
+    /// click open the session it is over — and on a terminal that reports no
+    /// motion (one without any-event tracking), the same two rules read as
+    /// "click to select, click again to open", with no double-click clock
+    /// either way. A drag with the button held picks the row up — the
+    /// same [`Mode::Reorder`] the space bar enters — carries it, and the
+    /// release places it, with the same request `Enter` would make. The wheel
+    /// moves the selection, or the row in flight, one row at a time and stops
+    /// at the ends.
+    ///
+    /// A press or a wheel step ends what a key would end: a stale message and a
+    /// half-typed number. A hover, a drag or a release ends nothing, since none
+    /// of them is something the user did on purpose *to* the picker.
+    pub fn on_mouse(&mut self, mouse: Mouse) -> Request {
+        if matches!(mouse, Mouse::Press(_) | Mouse::ScrollUp | Mouse::ScrollDown) {
+            self.message = None;
+            self.pending = None;
+        }
+        match &self.mode {
+            Mode::Normal | Mode::Filter => self.on_mouse_normal(mouse),
+            Mode::Confirm { .. } => {
+                // Only an explicit `y` kills, and a click is not one; but a
+                // click is a deliberate act, so it declines the question the
+                // way any key but `y` does. The wheel is not deliberate enough
+                // to dismiss a `[y/N]`.
+                if matches!(mouse, Mouse::Press(_)) {
+                    self.mode = Mode::Normal;
+                    self.pressed = None;
+                }
+                Request::None
+            }
+            Mode::Reorder { .. } => self.on_mouse_reorder(mouse),
+        }
+    }
+
+    fn on_mouse_normal(&mut self, mouse: Mouse) -> Request {
+        let len = self.visible().len();
+        match mouse {
+            Mouse::Press(Some(row)) if row < len => {
+                if row == self.selected {
+                    self.pressed = Some(Pressed::Selected);
+                } else {
+                    self.selected = row;
+                    self.pressed = Some(Pressed::Row);
+                }
+                Request::None
+            }
+            Mouse::Press(_) => {
+                self.pressed = None;
+                Request::None
+            }
+            Mouse::Hover(Some(row)) if row < len => {
+                self.selected = row;
+                Request::None
+            }
+            // Off the list, the cursor stays on the last row it was over.
+            Mouse::Hover(_) => Request::None,
+            // Dragged off the row it went down on: the row comes with it. Only
+            // from a press that landed on a row — a drag that started on the
+            // blank space must not pick up whatever happens to be selected.
+            Mouse::Drag(Some(row))
+                if row < len && self.pressed.is_some() && row != self.selected =>
+            {
+                if let Some(id) = self.selected_id() {
+                    let was = self.snapshot();
+                    self.mode = Mode::Reorder { id, was };
+                    self.shift_grabbed_to(row);
+                }
+                self.pressed = Some(Pressed::Row);
+                Request::None
+            }
+            Mouse::Drag(_) => Request::None,
+            Mouse::Release => {
+                let attach = self.pressed.take() == Some(Pressed::Selected);
+                if !attach {
+                    return Request::None;
+                }
+                // As `Enter` does from the filter: the query stays applied,
+                // the prompt closes.
+                self.mode = Mode::Normal;
+                self.on_selection(Request::Attach)
+            }
+            Mouse::ScrollDown => {
+                self.selected = self.clamped(1);
+                Request::None
+            }
+            Mouse::ScrollUp => {
+                self.selected = self.clamped(-1);
+                Request::None
+            }
+        }
+    }
+
+    /// The mouse over a session in flight, whether a drag or the space bar
+    /// picked it up: a press or a drag carries it to the row under the
+    /// pointer, and a release places it — "click where you want it" — with the
+    /// request `Enter` would make. The pointer merely passing over rows
+    /// carries nothing: a row in flight moves on a button, the wheel or a key.
+    fn on_mouse_reorder(&mut self, mouse: Mouse) -> Request {
+        let Mode::Reorder { was, .. } = &self.mode else {
+            return Request::None;
+        };
+        let was = was.clone();
+        let len = self.visible().len();
+        match mouse {
+            Mouse::Press(Some(row)) | Mouse::Drag(Some(row)) if row < len => {
+                if matches!(mouse, Mouse::Press(_)) {
+                    self.pressed = Some(Pressed::Row);
+                }
+                self.shift_grabbed_to(row);
+                Request::None
+            }
+            Mouse::Press(_) | Mouse::Drag(_) | Mouse::Hover(_) => Request::None,
+            Mouse::Release => {
+                self.pressed = None;
+                let now = self.snapshot();
+                self.mode = Mode::Normal;
+                if now == was {
+                    return Request::None;
+                }
+                Request::Reorder(now)
+            }
+            Mouse::ScrollDown => {
+                self.shift_grabbed_to(self.clamped(1));
+                Request::None
+            }
+            Mouse::ScrollUp => {
+                self.shift_grabbed_to(self.clamped(-1));
+                Request::None
+            }
         }
     }
 
@@ -616,6 +788,28 @@ pub enum Key {
     /// Ctrl-P — the readline-style companion to `k`/Up.
     CtrlP,
     Other,
+}
+
+/// A mouse gesture, with the visible row it landed on already resolved by the
+/// caller — see [`App::on_mouse`]. Decoupled from crossterm, as [`Key`] is, and
+/// from the screen's geometry too.
+///
+/// Only the left button and the wheel: nothing here has a use for the other
+/// buttons, and the caller drops them before they get this far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mouse {
+    /// The pointer moved with no button held, and is now over this row, or
+    /// over nothing.
+    Hover(Option<usize>),
+    /// The left button went down on this row, or on nothing.
+    Press(Option<usize>),
+    /// The pointer moved with the left button held, and is now over this row,
+    /// or over nothing.
+    Drag(Option<usize>),
+    /// The left button came up.
+    Release,
+    ScrollUp,
+    ScrollDown,
 }
 
 #[cfg(test)]
@@ -1524,5 +1718,476 @@ mod tests {
         a.set_sessions(reversed);
 
         assert_eq!(a.selected_session().map(|s| s.name.as_str()), Some("three"));
+    }
+
+    // --- the mouse ----------------------------------------------------------
+
+    /// A press and a release on the same row.
+    fn click(a: &mut App, row: usize) -> Request {
+        let down = a.on_mouse(Mouse::Press(Some(row)));
+        assert_eq!(down, Request::None, "a press alone asks for nothing");
+        a.on_mouse(Mouse::Release)
+    }
+
+    #[test]
+    fn a_click_selects_the_row_under_it() {
+        let mut a = app(&["one", "two", "three"]);
+        assert_eq!(click(&mut a, 2), Request::None);
+        assert_eq!(a.selected_index(), 2);
+        assert_eq!(*a.mode(), Mode::Normal);
+        assert_eq!(click(&mut a, 0), Request::None);
+        assert_eq!(a.selected_index(), 0);
+    }
+
+    /// Click to select, click again to open: the second click is the one that
+    /// attaches, and it is told apart from the first by where the cursor was,
+    /// not by a clock.
+    #[test]
+    fn a_click_on_the_selected_row_attaches() {
+        let mut a = app(&["one", "two", "three"]);
+        click(&mut a, 1);
+        assert_eq!(click(&mut a, 1), Request::Attach("id000001".into()));
+
+        // The cursor put there by a key counts the same as one put by a click.
+        let mut b = app(&["one", "two", "three"]);
+        b.on_key(Key::Char('j'));
+        assert_eq!(click(&mut b, 1), Request::Attach("id000001".into()));
+    }
+
+    /// The attach is decided on the release, so a press that selected a row
+    /// and a release that follows it are one click, not a click and a half.
+    #[test]
+    fn a_release_after_selecting_does_not_attach() {
+        let mut a = app(&["one", "two"]);
+        a.on_mouse(Mouse::Press(Some(1)));
+        assert_eq!(a.on_mouse(Mouse::Release), Request::None);
+        assert_eq!(a.on_mouse(Mouse::Release), Request::None, "nor a stray one");
+    }
+
+    #[test]
+    fn a_click_on_nothing_selects_nothing_and_attaches_nothing() {
+        let mut a = app(&["one", "two"]);
+        a.on_key(Key::Char('j'));
+        assert_eq!(a.on_mouse(Mouse::Press(None)), Request::None);
+        assert_eq!(a.on_mouse(Mouse::Release), Request::None);
+        assert_eq!(a.selected_index(), 1, "the cursor stayed");
+        // A row the caller should never name, but the picker guards it anyway.
+        assert_eq!(a.on_mouse(Mouse::Press(Some(7))), Request::None);
+        assert_eq!(a.on_mouse(Mouse::Release), Request::None);
+        assert_eq!(a.selected_index(), 1);
+    }
+
+    /// From the filter, a click accepts the query as `Enter` does: the list
+    /// stays narrowed and the prompt closes on the attach.
+    #[test]
+    fn a_click_attaches_from_the_filter_and_leaves_the_query_applied() {
+        let mut a = app(&["api-server", "dotfiles", "notes"]);
+        a.on_key(Key::Char('/'));
+        a.on_key(Key::Char('o'));
+        assert_eq!(names(&a), ["dotfiles", "notes"]);
+        assert_eq!(click(&mut a, 1), Request::None, "selects notes");
+        assert_eq!(*a.mode(), Mode::Filter, "a single click keeps the prompt");
+        assert_eq!(click(&mut a, 1), Request::Attach("id000002".into()));
+        assert_eq!(*a.mode(), Mode::Normal);
+        assert_eq!(a.filter(), "o");
+    }
+
+    #[test]
+    fn the_wheel_moves_the_selection_and_stops_at_the_ends() {
+        let mut a = app(&["one", "two", "three"]);
+        assert_eq!(a.on_mouse(Mouse::ScrollUp), Request::None);
+        assert_eq!(a.selected_index(), 0, "no wrap at the top");
+        a.on_mouse(Mouse::ScrollDown);
+        a.on_mouse(Mouse::ScrollDown);
+        assert_eq!(a.selected_index(), 2);
+        a.on_mouse(Mouse::ScrollDown);
+        assert_eq!(a.selected_index(), 2, "no wrap at the bottom");
+        a.on_mouse(Mouse::ScrollUp);
+        assert_eq!(a.selected_index(), 1);
+    }
+
+    #[test]
+    fn the_wheel_moves_within_the_filtered_list() {
+        let mut a = app(&["aaa", "bbb", "abc"]);
+        a.on_key(Key::Char('/'));
+        a.on_key(Key::Char('a'));
+        assert_eq!(names(&a), ["aaa", "abc"]);
+        a.on_mouse(Mouse::ScrollDown);
+        a.on_mouse(Mouse::ScrollDown);
+        assert_eq!(a.selected_session().expect("selected").name, "abc");
+        assert_eq!(
+            *a.mode(),
+            Mode::Filter,
+            "the wheel does not close the prompt"
+        );
+    }
+
+    /// What a key ends, a press or a wheel step ends too: neither should leave
+    /// a stale message over the row it just moved to, or a number waiting for
+    /// a digit the mouse will never type.
+    #[test]
+    fn a_press_or_a_wheel_step_ends_a_message_and_a_half_typed_number() {
+        let names: Vec<String> = (0..12).map(|i| format!("s{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        for gesture in [Mouse::Press(Some(0)), Mouse::Press(None), Mouse::ScrollDown] {
+            let mut a = app(&refs);
+            a.set_message("something went wrong");
+            a.on_key(Key::Char('1'));
+            assert_eq!(a.pending(), Some(1), "1 is ambiguous while 10-12 exist");
+            assert_eq!(a.on_mouse(gesture), Request::None);
+            assert_eq!(a.message(), None, "{gesture:?}");
+            assert_eq!(a.pending(), None, "{gesture:?}");
+        }
+        // A drag or a release is not something done to the picker on purpose.
+        for gesture in [
+            Mouse::Hover(Some(1)),
+            Mouse::Hover(None),
+            Mouse::Drag(Some(1)),
+            Mouse::Drag(None),
+            Mouse::Release,
+        ] {
+            let mut a = app(&refs);
+            // The key first: a keypress ends a message, and the message is
+            // what the gesture is being asked to leave alone.
+            a.on_key(Key::Char('1'));
+            a.set_message("still here");
+            a.on_mouse(gesture);
+            assert_eq!(a.message(), Some("still here"), "{gesture:?}");
+            assert_eq!(a.pending(), Some(1), "{gesture:?}");
+        }
+    }
+
+    // --- hover --------------------------------------------------------------
+
+    #[test]
+    fn hovering_over_a_row_selects_it() {
+        let mut a = app(&["one", "two", "three"]);
+        assert_eq!(a.on_mouse(Mouse::Hover(Some(2))), Request::None);
+        assert_eq!(a.selected_index(), 2);
+        assert_eq!(*a.mode(), Mode::Normal);
+        a.on_mouse(Mouse::Hover(Some(0)));
+        assert_eq!(a.selected_index(), 0);
+    }
+
+    /// The cursor stays on the last row the pointer was over — it does not
+    /// snap back, and it does not chase the pointer off the list.
+    #[test]
+    fn hovering_off_the_list_leaves_the_cursor_where_it_was() {
+        let mut a = app(&["one", "two", "three"]);
+        a.on_mouse(Mouse::Hover(Some(1)));
+        assert_eq!(a.on_mouse(Mouse::Hover(None)), Request::None);
+        assert_eq!(a.selected_index(), 1);
+        assert_eq!(
+            a.on_mouse(Mouse::Hover(Some(9))),
+            Request::None,
+            "out of range"
+        );
+        assert_eq!(a.selected_index(), 1);
+    }
+
+    /// With the highlight following the pointer, the row a click lands on is
+    /// already the selection, so one click opens it.
+    #[test]
+    fn a_single_click_on_a_hovered_row_attaches() {
+        let mut a = app(&["one", "two", "three"]);
+        a.on_mouse(Mouse::Hover(Some(2)));
+        assert_eq!(click(&mut a, 2), Request::Attach("id000002".into()));
+
+        let mut b = app(&["api-server", "dotfiles", "notes"]);
+        b.on_key(Key::Char('/'));
+        b.on_key(Key::Char('o'));
+        b.on_mouse(Mouse::Hover(Some(1)));
+        assert_eq!(click(&mut b, 1), Request::Attach("id000002".into()));
+        assert_eq!(*b.mode(), Mode::Normal);
+        assert_eq!(b.filter(), "o", "the query stays applied");
+    }
+
+    #[test]
+    fn a_drag_after_a_hover_still_picks_the_row_up() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_mouse(Mouse::Hover(Some(1)));
+        a.on_mouse(Mouse::Press(Some(1)));
+        a.on_mouse(Mouse::Drag(Some(2)));
+        assert!(matches!(a.mode(), Mode::Reorder { .. }));
+        assert_eq!(arrangement(&a).0, ["aaa", "ccc", "bbb"]);
+        assert_eq!(
+            a.on_mouse(Mouse::Release),
+            Request::Reorder(vec![
+                ("id000000".into(), 1),
+                ("id000002".into(), 2),
+                ("id000001".into(), 3),
+            ])
+        );
+    }
+
+    /// A row in flight moves on a button, the wheel or a key — not because the
+    /// pointer happened to pass over the list.
+    #[test]
+    fn hovering_does_not_carry_a_grabbed_row() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char(' '));
+        assert_eq!(a.on_mouse(Mouse::Hover(Some(2))), Request::None);
+        assert!(matches!(a.mode(), Mode::Reorder { .. }));
+        assert_eq!(arrangement(&a).0, ["aaa", "bbb", "ccc"]);
+        assert_eq!(a.selected_index(), 0);
+    }
+
+    #[test]
+    fn hovering_does_not_move_under_a_kill_confirm() {
+        let mut a = app(&["dotfiles", "notes"]);
+        a.on_key(Key::Char('x'));
+        assert_eq!(a.on_mouse(Mouse::Hover(Some(1))), Request::None);
+        assert!(matches!(a.mode(), Mode::Confirm { .. }));
+        assert_eq!(a.selected_index(), 0);
+    }
+
+    #[test]
+    fn a_drag_picks_the_row_up_and_a_release_places_it() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_mouse(Mouse::Press(Some(0)));
+        assert_eq!(*a.mode(), Mode::Normal, "a press alone grabs nothing");
+
+        assert_eq!(a.on_mouse(Mouse::Drag(Some(1))), Request::None);
+        assert!(
+            matches!(a.mode(), Mode::Reorder { .. }),
+            "the drag grabbed it"
+        );
+        assert_eq!(arrangement(&a).0, ["bbb", "aaa", "ccc"]);
+        assert_eq!(a.selected_index(), 1, "the cursor travels with it");
+
+        a.on_mouse(Mouse::Drag(Some(2)));
+        assert_eq!(arrangement(&a).0, ["bbb", "ccc", "aaa"]);
+        assert_eq!(
+            arrangement(&a).1,
+            [1, 2, 3],
+            "the numbers on screen do not change while a session is moving"
+        );
+
+        assert_eq!(
+            a.on_mouse(Mouse::Release),
+            Request::Reorder(vec![
+                ("id000001".into(), 1),
+                ("id000002".into(), 2),
+                ("id000000".into(), 3),
+            ]),
+            "the whole arrangement, as Enter would ask for it"
+        );
+        assert_eq!(*a.mode(), Mode::Normal);
+    }
+
+    /// A drag that starts on the selected row is a move, not an attach: the
+    /// release that would have opened the session places it instead.
+    #[test]
+    fn dragging_the_selected_row_moves_it_rather_than_attaching() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_mouse(Mouse::Press(Some(0))); // the selection: armed to attach
+        a.on_mouse(Mouse::Drag(Some(2)));
+        assert_eq!(
+            a.on_mouse(Mouse::Release),
+            Request::Reorder(vec![
+                ("id000001".into(), 1),
+                ("id000002".into(), 2),
+                ("id000000".into(), 3),
+            ])
+        );
+        assert_eq!(*a.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn a_drag_that_comes_back_to_where_it_started_writes_nothing() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_mouse(Mouse::Press(Some(1)));
+        a.on_mouse(Mouse::Drag(Some(2)));
+        a.on_mouse(Mouse::Drag(Some(1)));
+        assert_eq!(
+            a.on_mouse(Mouse::Release),
+            Request::None,
+            "moved and moved back"
+        );
+        assert_eq!(*a.mode(), Mode::Normal);
+        assert_eq!(arrangement(&a).0, ["aaa", "bbb", "ccc"]);
+        assert_eq!(a.selected_index(), 1);
+    }
+
+    /// Dragging within the row it went down on, or off the list altogether,
+    /// picks nothing up — the pointer wobbles.
+    #[test]
+    fn a_drag_that_leaves_no_row_grabs_nothing() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.on_mouse(Mouse::Press(Some(1)));
+        a.on_mouse(Mouse::Drag(Some(1)));
+        a.on_mouse(Mouse::Drag(None));
+        assert_eq!(*a.mode(), Mode::Normal);
+        assert_eq!(a.on_mouse(Mouse::Release), Request::None);
+
+        // And a drag that began on the blank space must not pick up whatever
+        // happened to be selected.
+        let mut b = app(&["aaa", "bbb"]);
+        b.on_mouse(Mouse::Press(None));
+        b.on_mouse(Mouse::Drag(Some(1)));
+        assert_eq!(*b.mode(), Mode::Normal);
+        assert_eq!(arrangement(&b).0, ["aaa", "bbb"]);
+    }
+
+    /// Once a row is in flight, the pointer leaving the list does not drop it:
+    /// it stays where it last was until the button comes up.
+    #[test]
+    fn a_row_in_flight_stays_put_while_the_pointer_is_off_the_list() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_mouse(Mouse::Press(Some(0)));
+        a.on_mouse(Mouse::Drag(Some(1)));
+        a.on_mouse(Mouse::Drag(None));
+        assert!(matches!(a.mode(), Mode::Reorder { .. }));
+        assert_eq!(arrangement(&a).0, ["bbb", "aaa", "ccc"]);
+        assert_eq!(
+            a.on_mouse(Mouse::Release),
+            Request::Reorder(vec![
+                ("id000001".into(), 1),
+                ("id000000".into(), 2),
+                ("id000002".into(), 3)
+            ])
+        );
+    }
+
+    /// The space bar picked it up; a click puts it down where the click is.
+    #[test]
+    fn a_keyboard_grab_can_be_dropped_with_a_click() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char(' '));
+        assert_eq!(a.on_mouse(Mouse::Press(Some(2))), Request::None);
+        assert_eq!(
+            arrangement(&a).0,
+            ["bbb", "ccc", "aaa"],
+            "carried on the press"
+        );
+        assert!(matches!(a.mode(), Mode::Reorder { .. }));
+        assert_eq!(
+            a.on_mouse(Mouse::Release),
+            Request::Reorder(vec![
+                ("id000001".into(), 1),
+                ("id000002".into(), 2),
+                ("id000000".into(), 3),
+            ])
+        );
+        assert_eq!(*a.mode(), Mode::Normal);
+    }
+
+    /// A click on the grabbed row itself, or beside the list, is a release
+    /// where it already is: picked up and put down.
+    #[test]
+    fn a_click_that_moves_a_grabbed_row_nowhere_just_places_it() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.on_key(Key::Char(' '));
+        a.on_mouse(Mouse::Press(Some(0)));
+        assert_eq!(a.on_mouse(Mouse::Release), Request::None);
+        assert_eq!(*a.mode(), Mode::Normal);
+
+        let mut b = app(&["aaa", "bbb"]);
+        b.on_key(Key::Char(' '));
+        b.on_mouse(Mouse::Press(None));
+        assert_eq!(b.on_mouse(Mouse::Release), Request::None);
+        assert_eq!(*b.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn the_wheel_carries_a_grabbed_row_and_stops_at_the_ends() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char(' '));
+        a.on_mouse(Mouse::ScrollUp);
+        assert_eq!(
+            arrangement(&a).0,
+            ["aaa", "bbb", "ccc"],
+            "no wrap at the top"
+        );
+        a.on_mouse(Mouse::ScrollDown);
+        a.on_mouse(Mouse::ScrollDown);
+        a.on_mouse(Mouse::ScrollDown);
+        assert_eq!(
+            arrangement(&a).0,
+            ["bbb", "ccc", "aaa"],
+            "no wrap at the bottom"
+        );
+        assert!(
+            matches!(a.mode(), Mode::Reorder { .. }),
+            "the wheel does not place"
+        );
+        assert_eq!(a.on_key(Key::Esc), Request::None);
+        assert_eq!(
+            arrangement(&a).0,
+            ["aaa", "bbb", "ccc"],
+            "esc still puts it back"
+        );
+    }
+
+    /// A drag can start from the filter, where the space bar cannot: the
+    /// hint row already knows how to show a reorder with a query applied.
+    #[test]
+    fn a_drag_reorders_the_filtered_rows_and_leaves_hidden_ones_alone() {
+        let mut a = app(&["alpha", "zzz", "gamma"]);
+        a.on_key(Key::Char('/'));
+        a.on_key(Key::Char('a'));
+        assert_eq!(arrangement(&a).0, ["alpha", "gamma"]);
+        a.on_mouse(Mouse::Press(Some(0)));
+        a.on_mouse(Mouse::Drag(Some(1)));
+        assert_eq!(
+            a.on_mouse(Mouse::Release),
+            Request::Reorder(vec![("id000002".into(), 1), ("id000000".into(), 3)])
+        );
+        assert_eq!(a.session("id000001").expect("zzz").state.num, 2);
+        assert_eq!(*a.mode(), Mode::Normal);
+        assert_eq!(a.filter(), "a", "the query stays applied");
+    }
+
+    /// `[y/N]` means the default is No: a click is any key but `y`, and the
+    /// wheel is not even that.
+    #[test]
+    fn a_click_declines_a_kill_confirm_and_the_wheel_leaves_it_open() {
+        let mut a = app(&["dotfiles", "notes"]);
+        a.on_key(Key::Char('x'));
+        assert_eq!(a.on_mouse(Mouse::ScrollDown), Request::None);
+        assert!(matches!(a.mode(), Mode::Confirm { .. }));
+        assert_eq!(a.selected_index(), 0, "nor does it move under the question");
+        assert_eq!(a.on_mouse(Mouse::Press(Some(1))), Request::None);
+        assert_eq!(*a.mode(), Mode::Normal, "declined");
+        assert_eq!(a.selected_index(), 0, "declined, not acted on");
+        assert_eq!(
+            a.on_mouse(Mouse::Release),
+            Request::None,
+            "and not attached"
+        );
+    }
+
+    #[test]
+    fn every_gesture_on_an_empty_list_is_harmless() {
+        let mut a = app(&[]);
+        for gesture in [
+            Mouse::Hover(Some(0)),
+            Mouse::Hover(None),
+            Mouse::Press(Some(0)),
+            Mouse::Press(None),
+            Mouse::Drag(Some(0)),
+            Mouse::Drag(None),
+            Mouse::Release,
+            Mouse::ScrollUp,
+            Mouse::ScrollDown,
+        ] {
+            assert_eq!(a.on_mouse(gesture), Request::None, "{gesture:?}");
+            assert_eq!(*a.mode(), Mode::Normal, "{gesture:?}");
+            assert_eq!(a.selected_index(), 0, "{gesture:?}");
+        }
+    }
+
+    #[test]
+    fn a_drag_on_a_list_of_one_is_harmless() {
+        let mut a = app(&["only"]);
+        a.on_mouse(Mouse::Press(Some(0)));
+        a.on_mouse(Mouse::Drag(Some(0)));
+        a.on_mouse(Mouse::Drag(None));
+        assert_eq!(*a.mode(), Mode::Normal);
+        assert_eq!(
+            a.on_mouse(Mouse::Release),
+            Request::Attach("id000000".into()),
+            "a click on the one row, which was already selected"
+        );
     }
 }

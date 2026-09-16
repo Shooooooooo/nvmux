@@ -81,10 +81,88 @@ extern "C" fn restore_and_reraise(sig: libc::c_int) {
 const INHERITED: &[u8] = b"\x1b[?2026l\x1b[0m";
 
 /// The screen-state reset: [`INHERITED`], plus leaving the alternate screen (a
-/// no-op when not in it) and showing the cursor. One fixed string so the signal
-/// handler can write it, and so the ordinary error paths put the screen back
-/// exactly the way a signal would.
-const RESET: &[u8] = b"\x1b[?2026l\x1b[?1049l\x1b[0m\x1b[?25h";
+/// no-op when not in it), showing the cursor, and turning mouse reporting off
+/// ([`MOUSE_OFF`]). One fixed string so the signal handler can write it, and so
+/// the ordinary error paths put the screen back exactly the way a signal would.
+///
+/// The mouse is in here because every path this ends on is a shell prompt, and
+/// a shell wants no mouse reports: the picker turns reporting on when nothing
+/// is behind it, and a client killed with nvmux never gets to turn its own off.
+const RESET: &[u8] = b"\x1b[?2026l\x1b[?1049l\x1b[0m\x1b[?25h\x1b[?1003l\x1b[?1006l\x1b[?1002l";
+
+/// Mouse reporting as Neovim's own TUI turns it on with `'mousemoveevent'`
+/// set: button-event tracking (`?1002`: presses, releases, and drags with a
+/// button held) in the SGR encoding (`?1006`: a click past column 223 still
+/// says where it landed), and then any-event tracking (`?1003`), which adds
+/// the plain motion the picker follows with its highlight. In that order, so
+/// a terminal without `?1003` is still left reporting clicks.
+///
+/// Fixed strings of nvmux's own rather than crossterm's `EnableMouseCapture`
+/// (which also sets `?1000` and `?1015`, redundant under the two above):
+/// [`RESET`] has to carry the undo as one string a signal handler can write,
+/// and the handover strings are pinned not to mention any of these modes.
+/// crossterm's parser reads SGR reports whichever command enabled them.
+const MOUSE_ON: &[u8] = b"\x1b[?1002h\x1b[?1006h\x1b[?1003h";
+
+/// [`MOUSE_ON`] undone, in reverse order.
+const MOUSE_OFF: &[u8] = b"\x1b[?1003l\x1b[?1006l\x1b[?1002l";
+
+/// What a resumed client's terminal mouse reporting is put back to — see
+/// [`set_mouse_reporting`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseReporting {
+    /// The client had the mouse off (`mouse=`).
+    Off,
+    /// Presses, releases and drags, in SGR: what Neovim's TUI turns on for a
+    /// non-empty `'mouse'`.
+    Buttons,
+    /// [`MouseReporting::Buttons`] plus plain motion: `'mousemoveevent'` set.
+    Motion,
+}
+
+/// [`MouseReporting::Buttons`], starting from a screen that had `?1003` on.
+/// `?1003` off *first*: on xterm, resetting any one of the tracking modes
+/// clears tracking altogether, so the two the client wants have to be set
+/// after it and not before.
+const MOUSE_BUTTONS: &[u8] = b"\x1b[?1003l\x1b[?1002h\x1b[?1006h";
+
+/// Turn mouse reporting on, for a screen of nvmux's own.
+///
+/// Every screen does, whatever is behind it, and turns it off again as it
+/// closes ([`disable_mouse`]). A held client's own setting is put back by the
+/// relay as it resumes the client, with [`set_mouse_reporting`]: a
+/// `--remote-ui` client enables the mouse once, at startup, and never again
+/// (as it enters the alternate screen once, see [`enter_alt_screen_and_clear`]),
+/// so nothing but nvmux can put the terminal back the way the client left it —
+/// and what the client had is a question for its server, which the resume
+/// already asks to repaint.
+pub fn enable_mouse() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(MOUSE_ON);
+    let _ = out.flush();
+}
+
+/// Put mouse reporting back to what a client being resumed had, after a screen
+/// that set its own. See [`crate::pty`], which asks the client's server.
+pub fn set_mouse_reporting(reporting: MouseReporting) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(match reporting {
+        MouseReporting::Off => MOUSE_OFF,
+        MouseReporting::Buttons => MOUSE_BUTTONS,
+        MouseReporting::Motion => MOUSE_ON,
+    });
+    let _ = out.flush();
+}
+
+/// Turn mouse reporting off again, for the screen that turned it on.
+pub fn disable_mouse() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(MOUSE_OFF);
+    let _ = out.flush();
+}
 
 /// Put the screen back to a state a shell can be used in: cursor visible,
 /// colours reset, primary screen. For the paths that end at a shell prompt
@@ -340,6 +418,79 @@ mod tests {
         assert_eq!(INHERITED, b"\x1b[?2026l\x1b[0m");
         assert!(!contains(INHERITED, b"\x1b[?1049l"));
         assert!(!contains(INHERITED, b"\x1b[?25h"));
+        assert!(!contains(INHERITED, b"\x1b[?1002l"));
+    }
+
+    /// Every path `RESET` ends on is a shell prompt, and a shell wants no mouse
+    /// reports — including after a `kill` during the picker, which is why the
+    /// mouse-off has to be part of the one string the signal handler writes.
+    #[test]
+    fn the_reset_turns_mouse_reporting_off() {
+        assert!(
+            RESET.ends_with(MOUSE_OFF),
+            "RESET does not end with MOUSE_OFF"
+        );
+    }
+
+    /// The off string undoes exactly the modes the on string sets, last first.
+    #[test]
+    fn mouse_off_undoes_mouse_on_in_reverse() {
+        let modes = |s: &[u8], fin: u8| -> Vec<Vec<u8>> {
+            s.split(|&b| b == 0x1b)
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    assert_eq!(part.last(), Some(&fin), "{part:?}");
+                    part[..part.len() - 1].to_vec()
+                })
+                .collect()
+        };
+        let on = modes(MOUSE_ON, b'h');
+        let mut off = modes(MOUSE_OFF, b'l');
+        off.reverse();
+        assert_eq!(on, off);
+        assert_eq!(
+            on,
+            [b"[?1002".to_vec(), b"[?1006".to_vec(), b"[?1003".to_vec()]
+        );
+    }
+
+    /// Putting a client's button tracking back after a screen had motion
+    /// tracking on: the reset must come first, or it would clear what was
+    /// just set.
+    #[test]
+    fn restoring_button_tracking_resets_motion_before_it_sets_anything() {
+        let at = |needle: &[u8]| {
+            MOUSE_BUTTONS
+                .windows(needle.len())
+                .position(|w| w == needle)
+                .unwrap_or_else(|| panic!("MOUSE_BUTTONS dropped {needle:?}"))
+        };
+        assert!(at(b"\x1b[?1003l") < at(b"\x1b[?1002h"));
+        assert!(at(b"\x1b[?1003l") < at(b"\x1b[?1006h"));
+        assert!(!contains(MOUSE_BUTTONS, b"\x1b[?1003h"));
+        assert!(!contains(MOUSE_BUTTONS, b"\x1b[?1002l"));
+        assert!(!contains(MOUSE_BUTTONS, b"\x1b[?1006l"));
+    }
+
+    /// The mouse is the screen's while a screen is up and the relay's as a
+    /// client resumes, so the strings that hand a terminal to a client, back
+    /// to one, or to a screen must not touch it: whichever of the two wrote
+    /// last would be undone.
+    #[test]
+    fn the_handover_strings_leave_mouse_reporting_alone() {
+        for (name, s) in [
+            ("INHERITED", INHERITED),
+            ("HANDOVER", HANDOVER),
+            ("RESUME", RESUME),
+        ] {
+            for mode in [&b"?1002"[..], b"?1006", b"?1000", b"?1003"] {
+                assert!(
+                    !contains(s, mode),
+                    "{name} mentions {:?}",
+                    std::str::from_utf8(mode)
+                );
+            }
+        }
     }
 
     /// [`HANDOVER`] is three steps whose order is the whole of its correctness,

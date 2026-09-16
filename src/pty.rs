@@ -641,7 +641,11 @@ pub fn relay(
     // picker has since drawn over.
     if attachment.resumed {
         discard_pending(master_fd);
-        repaint(attachment.master.as_ref(), &attachment.sock, EndPrompt::Yes);
+        repaint(
+            attachment.master.as_ref(),
+            &attachment.sock,
+            Repaint::Resume,
+        );
     }
     attachment.resumed = true;
 
@@ -833,8 +837,12 @@ fn pump(
                     // The same repaint a resume asks for, and for the same
                     // reason: the cells the box covered are the server's, and
                     // only the server can say what was under them. Not the same
-                    // licence, though — see [`EndPrompt`].
-                    repaint(attachment.master.as_ref(), &attachment.sock, EndPrompt::No);
+                    // licence, though — see [`Repaint`].
+                    repaint(
+                        attachment.master.as_ref(),
+                        &attachment.sock,
+                        Repaint::Notice,
+                    );
                     tracing::debug!(
                         ms = t_erase.elapsed().as_secs_f64() * 1000.0,
                         "timing: attach notice erase (:mode repaint)"
@@ -1149,29 +1157,89 @@ fn without_device_attributes_request(chunk: &[u8]) -> std::borrow::Cow<'_, [u8]>
 /// where the client learns its size from. A no-op when nothing changed, and
 /// a resize the client acts on when it did — one more repaint in that case,
 /// which is rare enough not to matter.
-fn repaint(master: &dyn MasterPty, sock: &Path, prompt: EndPrompt) {
+///
+/// A resume also puts the terminal's mouse reporting back to what the client
+/// had. The screen that ran in between set its own and turned it off again,
+/// and the client — which enabled the mouse once, at startup — will not do so
+/// again. What it had is its server's to say (see [`repaint_through_server`]);
+/// a server too busy to say gets Neovim's default, `mouse=nvi` without
+/// `'mousemoveevent'`, which is [`term::MouseReporting::Buttons`]. Wrong for a
+/// `mouse=` session behind a busy server, which comes back with button
+/// tracking on until its Neovim next flips the mouse itself — and right for
+/// everything else, where the alternative is a client that no longer answers
+/// the mouse at all.
+fn repaint(master: &dyn MasterPty, sock: &Path, why: Repaint) {
     let size = term::terminal_size();
     let _ = master.resize(size);
-    if !repaint_through_server(sock, prompt) {
+    let served = repaint_through_server(sock, why);
+    if why == Repaint::Resume {
+        term::set_mouse_reporting(served.mouse.unwrap_or(term::MouseReporting::Buttons));
+    }
+    if !served.repainted {
         nudge(master, size);
     }
 }
 
-/// Whether a repaint may end a hit-enter prompt to get itself served.
+/// Why the screen is being painted again, which decides what the repaint may
+/// do on the way.
 ///
-/// A resume may: the screen it is coming back to is blank, the prompt was
-/// painted over by whatever nvmux drew, and the user has no way to answer one
-/// they cannot see.
+/// A resume may end a hit-enter prompt to get itself served: the screen it is
+/// coming back to is blank, the prompt was painted over by whatever nvmux
+/// drew, and the user has no way to answer one they cannot see. It also asks
+/// what the client's mouse setting is, so the terminal can be put back to it.
 ///
-/// Taking an attach notice off the screen may not. The prompt would be one the
-/// user is looking at right now — a startup error, most likely — and a notice
-/// that says which session you are in is never worth answering somebody's
-/// editor for. A [`nudge`] stands in, and where that does not reach (a terminal
-/// with in-band resize reports) the box simply waits for the prompt to end.
+/// Taking an attach notice off the screen may do neither. The prompt would be
+/// one the user is looking at right now — a startup error, most likely — and a
+/// notice that says which session you are in is never worth answering
+/// somebody's editor for. A [`nudge`] stands in, and where that does not reach
+/// (a terminal with in-band resize reports) the box simply waits for the prompt
+/// to end. And the mouse is the client's own already: nothing ran in between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EndPrompt {
-    Yes,
-    No,
+enum Repaint {
+    Resume,
+    Notice,
+}
+
+/// What [`repaint_through_server`] got out of the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Served {
+    /// The server was asked to repaint, and did.
+    repainted: bool,
+    /// The client's mouse setting, where the server could be asked for it.
+    mouse: Option<term::MouseReporting>,
+}
+
+impl Served {
+    /// Nothing was served: the server could not be asked.
+    const NONE: Served = Served {
+        repainted: false,
+        mouse: None,
+    };
+}
+
+/// The terminal mouse reporting a client has on, from its server's answer to
+/// `[&mouse, &mousemoveevent]` — the two options Neovim's TUI enables the
+/// modes from: nothing for an empty `'mouse'`, button tracking otherwise, and
+/// motion on top of it with `'mousemoveevent'` set. `None` for an answer that
+/// is not that pair.
+///
+/// The mode the editor is in is not consulted, though Neovim does: `mouse=nvi`
+/// turns the mouse off on the command line and at a hit-enter prompt. A
+/// resume from either puts button tracking on a little early; Neovim turns it
+/// off and on again itself as the mode next changes, which is the moment it
+/// would have anyway.
+fn mouse_reporting(answer: &rmpv::Value) -> Option<term::MouseReporting> {
+    let pair = answer.as_array()?;
+    let mouse = pair.first()?.as_str()?;
+    let moves = pair.get(1)?;
+    let moves = moves.as_bool().or_else(|| moves.as_i64().map(|n| n != 0))?;
+    Some(if mouse.is_empty() {
+        term::MouseReporting::Off
+    } else if moves {
+        term::MouseReporting::Motion
+    } else {
+        term::MouseReporting::Buttons
+    })
 }
 
 /// Shrink the pty by a row and put it back, so the client asks the server for
@@ -1204,7 +1272,8 @@ fn nudge(master: &dyn MasterPty, size: PtySize) {
 /// `rpc::PROBE_TIMEOUT`.
 const RESUME_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Ask the server, over RPC, to paint the whole screen again. True if it did.
+/// Ask the server, over RPC, to paint the whole screen again — and, for a
+/// resume, what the client's mouse setting is. Says whether it repainted.
 ///
 /// A server parked at a hit-enter prompt does not run its event queue, so a
 /// resize would sit there and the terminal would stay blank until a key ended
@@ -1226,42 +1295,56 @@ const RESUME_TIMEOUT: Duration = Duration::from_secs(1);
 /// attached UI; `:messages` keeps it. The reply is waited for so the relay
 /// does not start over a repaint in flight; a reply that is late rather than
 /// missing still repaints, a moment after the nudge that stands in for it.
-fn repaint_through_server(sock: &Path, prompt: EndPrompt) -> bool {
+fn repaint_through_server(sock: &Path, why: Repaint) -> Served {
     let mut client = match rpc::Client::connect(sock, RESUME_TIMEOUT) {
         Ok(c) => c,
         Err(e) => {
             tracing::debug!(error = %e, "resume: could not reach the server");
-            return false;
+            return Served::NONE;
         }
     };
     let mode = match client.get_mode() {
         Ok(m) => m,
         Err(e) => {
             tracing::debug!(error = %e, "resume: the server is busy; nudge only");
-            return false;
+            return Served::NONE;
         }
     };
-    if mode.blocking && !(mode.at_hit_enter() && prompt == EndPrompt::Yes) {
+    if mode.blocking && !(mode.at_hit_enter() && why == Repaint::Resume) {
         tracing::debug!(
             mode = %mode.mode,
             "resume: the server is waiting for a key nvmux must not type; nudge only"
         );
-        return false;
+        return Served::NONE;
     }
     if mode.at_hit_enter() {
         tracing::debug!("resume: ending the hit-enter prompt");
         if let Err(e) = client.input("<CR>") {
             tracing::debug!(error = %e, "resume: could not end the prompt; nudge only");
-            return false;
+            return Served::NONE;
         }
     }
-    match client.command("mode") {
+    // Before the repaint, which is the call that can take a few hundred
+    // milliseconds: the answer is wanted whether or not that one comes back
+    // in time.
+    let mouse = match why {
+        Repaint::Resume => match client.eval("[&mouse, &mousemoveevent]") {
+            Ok(answer) => mouse_reporting(&answer),
+            Err(e) => {
+                tracing::debug!(error = %e, "resume: could not ask about the mouse");
+                None
+            }
+        },
+        Repaint::Notice => None,
+    };
+    let repainted = match client.command("mode") {
         Ok(()) => true,
         Err(e) => {
             tracing::debug!(error = %e, "resume: gave up waiting for the repaint; nudging");
             false
         }
-    }
+    };
+    Served { repainted, mouse }
 }
 
 #[cfg(test)]
@@ -1466,8 +1549,11 @@ mod tests {
         mode: &'static str,
         blocking: bool,
     ) -> std::thread::JoinHandle<Vec<String>> {
-        recording_server_with_uis(sock, mode, blocking, 0)
+        recording_server_with(sock, mode, blocking, 0, DEFAULT_MOUSE)
     }
+
+    /// What a server with Neovim's defaults answers `[&mouse, &mousemoveevent]`.
+    const DEFAULT_MOUSE: (&str, i64) = ("nvi", 0);
 
     /// The same, reporting `uis` attached UIs.
     fn recording_server_with_uis(
@@ -1475,6 +1561,17 @@ mod tests {
         mode: &'static str,
         blocking: bool,
         uis: usize,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        recording_server_with(sock, mode, blocking, uis, DEFAULT_MOUSE)
+    }
+
+    /// The same, with `mouse` as its `'mouse'` and `'mousemoveevent'`.
+    fn recording_server_with(
+        sock: &Path,
+        mode: &'static str,
+        blocking: bool,
+        uis: usize,
+        mouse: (&'static str, i64),
     ) -> std::thread::JoinHandle<Vec<String>> {
         use rmpv::Value;
 
@@ -1539,6 +1636,18 @@ mod tests {
                     "nvim_list_uis" => Value::Array(vec![Value::Nil; uis]),
                     // The byte count, which nvmux ignores.
                     "nvim_input" => Value::from(4u64),
+                    // Only the one expression the resume asks; anything else
+                    // is answered with nothing, as a fake should.
+                    "nvim_eval"
+                        if request
+                            .get(3)
+                            .and_then(|p| p.as_array())
+                            .and_then(|p| p.first())
+                            .and_then(Value::as_str)
+                            == Some("[&mouse, &mousemoveevent]") =>
+                    {
+                        Value::Array(vec![Value::String(mouse.0.into()), Value::from(mouse.1)])
+                    }
                     _ => Value::Nil,
                 };
                 // The keys go on the record too: which prompt gets a `<CR>` is
@@ -1571,28 +1680,125 @@ mod tests {
     /// `<CR>`, and nothing about the call sequence would look wrong.
     #[test]
     fn only_a_resume_ends_a_hit_enter_prompt_to_repaint() {
-        for (tag, prompt, want) in [
+        for (tag, why, want) in [
             (
                 "promptyes",
-                EndPrompt::Yes,
-                &["nvim_get_mode", "nvim_input(<CR>)", "nvim_command"][..],
+                Repaint::Resume,
+                &[
+                    "nvim_get_mode",
+                    "nvim_input(<CR>)",
+                    "nvim_eval",
+                    "nvim_command",
+                ][..],
             ),
-            ("promptno", EndPrompt::No, &["nvim_get_mode"][..]),
+            ("promptno", Repaint::Notice, &["nvim_get_mode"][..]),
         ] {
             let sock = temp_sock(tag);
             let server = recording_server(&sock, "r", true);
-            let repainted = repaint_through_server(&sock, prompt);
+            let served = repaint_through_server(&sock, why);
             assert_eq!(
-                repainted,
-                prompt == EndPrompt::Yes,
-                "{prompt:?} at a hit-enter prompt"
+                served.repainted,
+                why == Repaint::Resume,
+                "{why:?} at a hit-enter prompt"
             );
             assert_eq!(
                 server.join().expect("the server thread"),
                 want,
-                "{prompt:?} asked the wrong things at a hit-enter prompt"
+                "{why:?} asked the wrong things at a hit-enter prompt"
             );
             let _ = std::fs::remove_file(&sock);
+        }
+    }
+
+    /// A resume asks the server what the client's mouse setting is and reads
+    /// the answer as the modes Neovim's TUI would have enabled from it; taking
+    /// a notice off the screen does not ask, since nothing ran in between.
+    #[test]
+    fn a_resume_asks_the_server_for_the_clients_mouse_setting() {
+        use term::MouseReporting;
+        for (tag, mouse, want) in [
+            ("mouseoff", ("", 0), Some(MouseReporting::Off)),
+            ("mousenvi", ("nvi", 0), Some(MouseReporting::Buttons)),
+            ("mousemove", ("a", 1), Some(MouseReporting::Motion)),
+        ] {
+            let sock = temp_sock(tag);
+            let server = recording_server_with(&sock, "n", false, 0, mouse);
+            let served = repaint_through_server(&sock, Repaint::Resume);
+            assert_eq!(served.mouse, want, "{mouse:?}");
+            assert!(served.repainted);
+            assert_eq!(
+                server.join().expect("the server thread"),
+                ["nvim_get_mode", "nvim_eval", "nvim_command"],
+                "{mouse:?}"
+            );
+            let _ = std::fs::remove_file(&sock);
+        }
+
+        let sock = temp_sock("mousenotice");
+        let server = recording_server_with(&sock, "n", false, 0, ("", 0));
+        let served = repaint_through_server(&sock, Repaint::Notice);
+        assert_eq!(served.mouse, None, "a notice must not ask");
+        assert!(served.repainted);
+        assert_eq!(
+            server.join().expect("the server thread"),
+            ["nvim_get_mode", "nvim_command"]
+        );
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    /// A server that cannot be asked — busy, or waiting for a key — says
+    /// nothing about the mouse, and the resume falls back on the default.
+    #[test]
+    fn a_server_that_cannot_be_asked_says_nothing_about_the_mouse() {
+        let sock = temp_sock("mousebusy");
+        // Blocking on something that is not a hit-enter prompt: an operator
+        // waiting for its motion, say.
+        let server = recording_server_with(&sock, "no", true, 0, ("", 0));
+        let served = repaint_through_server(&sock, Repaint::Resume);
+        assert_eq!(served, Served::NONE);
+        assert_eq!(server.join().expect("the server thread"), ["nvim_get_mode"]);
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    /// What Neovim's TUI enables from the two options, and nothing from an
+    /// answer that is not the pair asked for.
+    #[test]
+    fn the_mouse_setting_is_read_the_way_neovims_tui_reads_it() {
+        use rmpv::Value;
+        use term::MouseReporting;
+        let pair =
+            |mouse: &str, moves: Value| Value::Array(vec![Value::String(mouse.into()), moves]);
+        assert_eq!(
+            mouse_reporting(&pair("", Value::from(0))),
+            Some(MouseReporting::Off)
+        );
+        assert_eq!(
+            mouse_reporting(&pair("", Value::from(1))),
+            Some(MouseReporting::Off),
+            "mousemoveevent means nothing with the mouse off"
+        );
+        assert_eq!(
+            mouse_reporting(&pair("nvi", Value::from(0))),
+            Some(MouseReporting::Buttons)
+        );
+        assert_eq!(
+            mouse_reporting(&pair("a", Value::from(1))),
+            Some(MouseReporting::Motion)
+        );
+        assert_eq!(
+            mouse_reporting(&pair("n", Value::Boolean(true))),
+            Some(MouseReporting::Motion),
+            "a boolean spelling of the flag reads the same"
+        );
+        for malformed in [
+            Value::Nil,
+            Value::String("nvi".into()),
+            Value::Array(vec![]),
+            Value::Array(vec![Value::String("nvi".into())]),
+            Value::Array(vec![Value::from(1), Value::from(0)]),
+            Value::Array(vec![Value::String("nvi".into()), Value::String("0".into())]),
+        ] {
+            assert_eq!(mouse_reporting(&malformed), None, "{malformed:?}");
         }
     }
 

@@ -108,6 +108,12 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 if let Some(a) = attached.take() {
                     a.terminate();
                 }
+                // The picker put its own modes back, but what that client
+                // wrote on its way out was thrown away, so whatever else it
+                // had on is still on. The same final reset the detach path
+                // ends on, for the same reason: harmless once the client is
+                // gone, and the shell wants a plain terminal.
+                nvmux::term::reset_screen();
                 break;
             }
             ui::Outcome::Attach { session, sessions } => (session, sessions),

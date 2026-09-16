@@ -144,22 +144,15 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let widest = visible.iter().map(|s| s.name.width()).max().unwrap_or(0) as u16;
-    // Right-aligned in a column as wide as the longest number, so the names stay
-    // in one column once the list runs past nine.
-    let num_width = visible
-        .iter()
-        .map(|s| s.state.num.to_string().len())
-        .max()
-        .unwrap_or(1);
-    let width = (widest + MARKER.width() as u16 + num_width as u16 + NUM_GAP.width() as u16)
-        .clamp(MIN_LIST_WIDTH, MAX_LIST_WIDTH)
-        .min(area.width);
-
-    let height = (visible.len() as u16).min(area.height);
-    let block = centre(area, width, height);
-
-    let offset = scroll_offset(app.selected_index(), visible.len(), height as usize);
+    let Some(ListLayout {
+        block,
+        offset,
+        num_width,
+    }) = list_layout(app, area)
+    else {
+        return;
+    };
+    let height = block.height;
 
     // The number column is kept but left blank while a session is being moved.
     // Dropping it outright would narrow the centred block by `num_width` plus
@@ -233,6 +226,75 @@ fn draw_bottom(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     draw_hint_row(frame, area, &text, dim);
+}
+
+/// Where the list is drawn within the body `area`, and which visible row its
+/// first line shows: the centred block, sized to its content, and the scroll
+/// offset that keeps the selection inside it. `None` when there is nothing to
+/// draw — an empty list, or no room.
+///
+/// One function for the renderer and for [`row_at`], so a click lands on the
+/// row the eye sees rather than on a second opinion about where the rows are.
+pub(super) fn list_layout(app: &App, area: Rect) -> Option<ListLayout> {
+    let visible = app.visible();
+    if area.height == 0 || visible.is_empty() {
+        return None;
+    }
+    let widest = visible.iter().map(|s| s.name.width()).max().unwrap_or(0) as u16;
+    // Right-aligned in a column as wide as the longest number, so the names stay
+    // in one column once the list runs past nine.
+    let num_width = visible
+        .iter()
+        .map(|s| s.state.num.to_string().len())
+        .max()
+        .unwrap_or(1);
+    let width = (widest + MARKER.width() as u16 + num_width as u16 + NUM_GAP.width() as u16)
+        .clamp(MIN_LIST_WIDTH, MAX_LIST_WIDTH)
+        .min(area.width);
+
+    let height = (visible.len() as u16).min(area.height);
+    let block = centre(area, width, height);
+    let offset = scroll_offset(app.selected_index(), visible.len(), height as usize);
+    Some(ListLayout {
+        block,
+        offset,
+        num_width,
+    })
+}
+
+/// See [`list_layout`].
+pub(super) struct ListLayout {
+    /// The centred block the rows are drawn in.
+    pub(super) block: Rect,
+    /// The visible row on the block's first line.
+    pub(super) offset: usize,
+    /// Columns the number column takes.
+    num_width: usize,
+}
+
+/// The visible row drawn on terminal cell (`column`, `row`), if any, with
+/// `area` the whole frame as it was last drawn.
+///
+/// A row is the full width of the terminal, not only the centred block: the
+/// picker has one column, so nothing else can be meant by a click level with a
+/// row, and a target the width of a short name is a poor one for a touchpad.
+/// The hint row and the empty space above and below the list are nothing.
+pub(super) fn row_at(app: &App, area: Rect, column: u16, row: u16) -> Option<usize> {
+    // As `draw` guards before splitting: a frame with no rows has no hint row
+    // to take off it.
+    if area.height == 0 || area.width == 0 {
+        return None;
+    }
+    let (body, _) = split_hint_row(area);
+    let ListLayout { block, offset, .. } = list_layout(app, body)?;
+    if column < area.x || column >= area.x + area.width {
+        return None;
+    }
+    if row < block.y || row >= block.y + block.height {
+        return None;
+    }
+    let index = offset + usize::from(row - block.y);
+    (index < app.visible().len()).then_some(index)
 }
 
 /// Keep `selected` visible within a window of `height` rows.
@@ -684,6 +746,101 @@ mod tests {
             name_columns.windows(2).all(|w| w[0] == w[1]),
             "names are not in one column: {lines:#?}"
         );
+    }
+
+    // --- hit-testing -------------------------------------------------------
+
+    /// The line each name was rendered on.
+    fn line_of(lines: &[String], name: &str) -> u16 {
+        lines
+            .iter()
+            .position(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("{name} not on screen: {lines:#?}")) as u16
+    }
+
+    /// A click on the line a row is drawn on names that row, whatever column it
+    /// lands in — measured against the renderer rather than against a copy of
+    /// its arithmetic.
+    #[test]
+    fn a_click_on_a_rendered_row_names_that_row() {
+        let a = app(&["api-server", "dotfiles", "notes"]);
+        let (w, h) = (40, 9);
+        let area = Rect::new(0, 0, w, h);
+        let lines = render(&a, w, h);
+        for (i, name) in ["api-server", "dotfiles", "notes"].iter().enumerate() {
+            let y = line_of(&lines, name);
+            for x in [0, w / 2, w - 1] {
+                assert_eq!(row_at(&a, area, x, y), Some(i), "({x},{y}) for {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_click_off_the_list_names_nothing() {
+        let a = app(&["one", "two"]);
+        let (w, h) = (40, 9);
+        let area = Rect::new(0, 0, w, h);
+        let lines = render(&a, w, h);
+        let first = line_of(&lines, "one");
+        let last = line_of(&lines, "two");
+        assert_eq!(row_at(&a, area, 5, first - 1), None, "the blank above");
+        assert_eq!(row_at(&a, area, 5, last + 1), None, "the blank below");
+        assert_eq!(row_at(&a, area, 5, h - 1), None, "the hint row");
+        assert_eq!(row_at(&a, area, w, first), None, "past the right edge");
+        assert_eq!(row_at(&a, area, 5, h), None, "past the bottom");
+    }
+
+    #[test]
+    fn a_click_on_the_empty_state_names_nothing() {
+        let a = app(&[]);
+        let area = Rect::new(0, 0, 40, 9);
+        for y in 0..9 {
+            assert_eq!(row_at(&a, area, 10, y), None, "row {y}");
+        }
+    }
+
+    /// With the list scrolled, the first line on screen is not row zero.
+    #[test]
+    fn a_click_on_a_scrolled_list_accounts_for_the_offset() {
+        let names: Vec<String> = (0..30).map(|i| format!("session-{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut a = app(&refs);
+        a.on_key(super::super::app::Key::Char('G'));
+        let (w, h) = (40, 10);
+        let area = Rect::new(0, 0, w, h);
+        let lines = render(&a, w, h);
+        let y = line_of(&lines, "session-29");
+        assert_eq!(row_at(&a, area, 5, y), Some(29));
+        let y = line_of(&lines, "session-21");
+        assert_eq!(row_at(&a, area, 5, y), Some(21));
+        assert_eq!(row_at(&a, area, 5, 0), Some(21), "the first line on screen");
+    }
+
+    /// A list longer than the body fills every line of it; the hint row is
+    /// still not part of the list.
+    #[test]
+    fn a_click_on_a_list_taller_than_the_screen_stops_at_the_hint_row() {
+        let names: Vec<String> = (0..30).map(|i| format!("s{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let a = app(&refs);
+        let area = Rect::new(0, 0, 20, 6);
+        assert_eq!(row_at(&a, area, 1, 0), Some(0));
+        assert_eq!(row_at(&a, area, 1, 4), Some(4));
+        assert_eq!(row_at(&a, area, 1, 5), None, "the hint row");
+    }
+
+    #[test]
+    fn hit_testing_tiny_terminals_does_not_panic() {
+        for &(w, h) in test_support::TINY_SIZES {
+            let area = Rect::new(0, 0, w, h);
+            for a in [app(&["one", "two"]), app(&[])] {
+                for y in 0..=h {
+                    for x in 0..=w {
+                        let _ = row_at(&a, area, x, y);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
