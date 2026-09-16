@@ -127,7 +127,9 @@ pub(crate) struct Screen {
 /// [`crate::term::enter_alt_screen_and_clear`] for the alternate screen, which
 /// is the same problem), and nvmux does not read the client's output to learn
 /// what it asked for. So over a client, a screen takes the mouse only if the
-/// client had it, and hands the modes back exactly as it found them.
+/// client had it — and its highlight follows the pointer only if the client
+/// asked for motion reports, which Neovim does with `'mousemoveevent'` — and
+/// hands the modes back exactly as it found them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Behind {
     /// A held client — `<prefix> Space`, `<prefix> c`, `<prefix> ?`. Its modes
@@ -514,11 +516,11 @@ fn translate(k: KeyEvent) -> Key {
 /// Reduce a crossterm mouse event to the gestures the picker understands, with
 /// `row` the visible row under the pointer as [`draw::row_at`] resolved it.
 ///
-/// The left button and the wheel, and nothing else: the other buttons, plain
-/// motion (which the modes nvmux enables never report, but a held client's
-/// might) and a horizontal wheel are nothing to the picker.
+/// Plain motion, the left button and the wheel, and nothing else: the other
+/// buttons and a horizontal wheel are nothing to the picker.
 fn translate_mouse(m: MouseEvent, row: Option<usize>) -> Option<Mouse> {
     match m.kind {
+        MouseEventKind::Moved => Some(Mouse::Hover(row)),
         MouseEventKind::Down(MouseButton::Left) => Some(Mouse::Press(row)),
         MouseEventKind::Drag(MouseButton::Left) => Some(Mouse::Drag(row)),
         MouseEventKind::Up(MouseButton::Left) => Some(Mouse::Release),
@@ -527,7 +529,6 @@ fn translate_mouse(m: MouseEvent, row: Option<usize>) -> Option<Mouse> {
         MouseEventKind::Down(_)
         | MouseEventKind::Up(_)
         | MouseEventKind::Drag(_)
-        | MouseEventKind::Moved
         | MouseEventKind::ScrollLeft
         | MouseEventKind::ScrollRight => None,
     }
@@ -546,10 +547,14 @@ mod tests {
         }
     }
 
-    /// The left button and the wheel reach the picker, carrying the row the
-    /// caller resolved; everything else is dropped before it can.
+    /// Motion, the left button and the wheel reach the picker, carrying the
+    /// row the caller resolved; everything else is dropped before it can.
     #[test]
-    fn only_the_left_button_and_the_wheel_reach_the_picker() {
+    fn only_motion_the_left_button_and_the_wheel_reach_the_picker() {
+        assert_eq!(
+            translate_mouse(mouse(MouseEventKind::Moved), Some(1)),
+            Some(Mouse::Hover(Some(1)))
+        );
         assert_eq!(
             translate_mouse(mouse(MouseEventKind::Down(MouseButton::Left)), Some(2)),
             Some(Mouse::Press(Some(2)))
@@ -574,7 +579,6 @@ mod tests {
             MouseEventKind::Down(MouseButton::Right),
             MouseEventKind::Up(MouseButton::Right),
             MouseEventKind::Drag(MouseButton::Middle),
-            MouseEventKind::Moved,
             MouseEventKind::ScrollLeft,
             MouseEventKind::ScrollRight,
         ] {

@@ -88,23 +88,24 @@ const INHERITED: &[u8] = b"\x1b[?2026l\x1b[0m";
 /// The mouse is in here because every path this ends on is a shell prompt, and
 /// a shell wants no mouse reports: the picker turns reporting on when nothing
 /// is behind it, and a client killed with nvmux never gets to turn its own off.
-const RESET: &[u8] = b"\x1b[?2026l\x1b[?1049l\x1b[0m\x1b[?25h\x1b[?1006l\x1b[?1002l";
+const RESET: &[u8] = b"\x1b[?2026l\x1b[?1049l\x1b[0m\x1b[?25h\x1b[?1003l\x1b[?1006l\x1b[?1002l";
 
-/// Mouse reporting as Neovim's own TUI turns it on: button-event tracking
-/// (`?1002`, so presses, releases and drags with a button held are reported,
-/// and plain motion is not) in the SGR encoding (`?1006`, so a click past
-/// column 223 still says where it landed).
+/// Mouse reporting as Neovim's own TUI turns it on with `'mousemoveevent'`
+/// set: button-event tracking (`?1002`: presses, releases, and drags with a
+/// button held) in the SGR encoding (`?1006`: a click past column 223 still
+/// says where it landed), and then any-event tracking (`?1003`), which adds
+/// the plain motion the picker follows with its highlight. In that order, so
+/// a terminal without `?1003` is still left reporting clicks.
 ///
-/// The same two modes, deliberately, and not crossterm's `EnableMouseCapture`,
-/// which adds `?1000`, `?1003` and `?1015`: `?1003` reports every motion of the
-/// pointer, which the picker has no use for, and the three modes `?1000`,
-/// `?1002` and `?1003` replace one another — so a screen that set `?1003` and
-/// handed the terminal back would leave a client in a mode it never asked for.
+/// Fixed strings of nvmux's own rather than crossterm's `EnableMouseCapture`
+/// (which also sets `?1000` and `?1015`, redundant under the two above):
+/// [`RESET`] has to carry the undo as one string a signal handler can write,
+/// and the handover strings are pinned not to mention any of these modes.
 /// crossterm's parser reads SGR reports whichever command enabled them.
-const MOUSE_ON: &[u8] = b"\x1b[?1002h\x1b[?1006h";
+const MOUSE_ON: &[u8] = b"\x1b[?1002h\x1b[?1006h\x1b[?1003h";
 
 /// [`MOUSE_ON`] undone, in reverse order.
-const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1002l";
+const MOUSE_OFF: &[u8] = b"\x1b[?1003l\x1b[?1006l\x1b[?1002l";
 
 /// Turn mouse reporting on, for a screen with nothing behind it.
 ///
@@ -416,7 +417,10 @@ mod tests {
         let mut off = modes(MOUSE_OFF, b'l');
         off.reverse();
         assert_eq!(on, off);
-        assert_eq!(on, [b"[?1002".to_vec(), b"[?1006".to_vec()]);
+        assert_eq!(
+            on,
+            [b"[?1002".to_vec(), b"[?1006".to_vec(), b"[?1003".to_vec()]
+        );
     }
 
     /// A held client's modes are its own. The strings that hand a terminal to a

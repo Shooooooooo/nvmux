@@ -436,17 +436,22 @@ impl App {
     /// so the picker knows rows, never coordinates, and stays as testable as it
     /// is for keys.
     ///
-    /// A press selects the row under it; a press on the row already selected
-    /// arms its release to attach, so "click to select, click again to open"
-    /// needs no double-click clock. A drag with the button held picks the row
-    /// up — the same [`Mode::Reorder`] the space bar enters — carries it, and
-    /// the release places it, with the same request `Enter` would make. The
-    /// wheel moves the selection, or the row in flight, one row at a time and
-    /// stops at the ends.
+    /// The highlight follows the pointer: hovering over a row selects it, so
+    /// the keyboard and the mouse share one cursor. A press selects the row
+    /// under it; a press on the row already selected arms its release to
+    /// attach. With the pointer's row always selected that makes a single
+    /// click open the session it is over — and on a terminal that reports no
+    /// motion (a held client without `'mousemoveevent'`), the same two rules
+    /// read as "click to select, click again to open", with no double-click
+    /// clock either way. A drag with the button held picks the row up — the
+    /// same [`Mode::Reorder`] the space bar enters — carries it, and the
+    /// release places it, with the same request `Enter` would make. The wheel
+    /// moves the selection, or the row in flight, one row at a time and stops
+    /// at the ends.
     ///
     /// A press or a wheel step ends what a key would end: a stale message and a
-    /// half-typed number. A drag or a release ends nothing, since neither is
-    /// something the user did on purpose *to* the picker.
+    /// half-typed number. A hover, a drag or a release ends nothing, since none
+    /// of them is something the user did on purpose *to* the picker.
     pub fn on_mouse(&mut self, mouse: Mouse) -> Request {
         if matches!(mouse, Mouse::Press(_) | Mouse::ScrollUp | Mouse::ScrollDown) {
             self.message = None;
@@ -485,6 +490,12 @@ impl App {
                 self.pressed = None;
                 Request::None
             }
+            Mouse::Hover(Some(row)) if row < len => {
+                self.selected = row;
+                Request::None
+            }
+            // Off the list, the cursor stays on the last row it was over.
+            Mouse::Hover(_) => Request::None,
             // Dragged off the row it went down on: the row comes with it. Only
             // from a press that landed on a row — a drag that started on the
             // blank space must not pick up whatever happens to be selected.
@@ -524,7 +535,8 @@ impl App {
     /// The mouse over a session in flight, whether a drag or the space bar
     /// picked it up: a press or a drag carries it to the row under the
     /// pointer, and a release places it — "click where you want it" — with the
-    /// request `Enter` would make.
+    /// request `Enter` would make. The pointer merely passing over rows
+    /// carries nothing: a row in flight moves on a button, the wheel or a key.
     fn on_mouse_reorder(&mut self, mouse: Mouse) -> Request {
         let Mode::Reorder { was, .. } = &self.mode else {
             return Request::None;
@@ -539,7 +551,7 @@ impl App {
                 self.shift_grabbed_to(row);
                 Request::None
             }
-            Mouse::Press(_) | Mouse::Drag(_) => Request::None,
+            Mouse::Press(_) | Mouse::Drag(_) | Mouse::Hover(_) => Request::None,
             Mouse::Release => {
                 self.pressed = None;
                 let now = self.snapshot();
@@ -786,6 +798,9 @@ pub enum Key {
 /// buttons, and the caller drops them before they get this far.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mouse {
+    /// The pointer moved with no button held, and is now over this row, or
+    /// over nothing.
+    Hover(Option<usize>),
     /// The left button went down on this row, or on nothing.
     Press(Option<usize>),
     /// The pointer moved with the left button held, and is now over this row,
@@ -1824,12 +1839,106 @@ mod tests {
             assert_eq!(a.pending(), None, "{gesture:?}");
         }
         // A drag or a release is not something done to the picker on purpose.
-        for gesture in [Mouse::Drag(Some(1)), Mouse::Drag(None), Mouse::Release] {
+        for gesture in [
+            Mouse::Hover(Some(1)),
+            Mouse::Hover(None),
+            Mouse::Drag(Some(1)),
+            Mouse::Drag(None),
+            Mouse::Release,
+        ] {
             let mut a = app(&refs);
+            // The key first: a keypress ends a message, and the message is
+            // what the gesture is being asked to leave alone.
+            a.on_key(Key::Char('1'));
             a.set_message("still here");
             a.on_mouse(gesture);
             assert_eq!(a.message(), Some("still here"), "{gesture:?}");
+            assert_eq!(a.pending(), Some(1), "{gesture:?}");
         }
+    }
+
+    // --- hover --------------------------------------------------------------
+
+    #[test]
+    fn hovering_over_a_row_selects_it() {
+        let mut a = app(&["one", "two", "three"]);
+        assert_eq!(a.on_mouse(Mouse::Hover(Some(2))), Request::None);
+        assert_eq!(a.selected_index(), 2);
+        assert_eq!(*a.mode(), Mode::Normal);
+        a.on_mouse(Mouse::Hover(Some(0)));
+        assert_eq!(a.selected_index(), 0);
+    }
+
+    /// The cursor stays on the last row the pointer was over — it does not
+    /// snap back, and it does not chase the pointer off the list.
+    #[test]
+    fn hovering_off_the_list_leaves_the_cursor_where_it_was() {
+        let mut a = app(&["one", "two", "three"]);
+        a.on_mouse(Mouse::Hover(Some(1)));
+        assert_eq!(a.on_mouse(Mouse::Hover(None)), Request::None);
+        assert_eq!(a.selected_index(), 1);
+        assert_eq!(
+            a.on_mouse(Mouse::Hover(Some(9))),
+            Request::None,
+            "out of range"
+        );
+        assert_eq!(a.selected_index(), 1);
+    }
+
+    /// With the highlight following the pointer, the row a click lands on is
+    /// already the selection, so one click opens it.
+    #[test]
+    fn a_single_click_on_a_hovered_row_attaches() {
+        let mut a = app(&["one", "two", "three"]);
+        a.on_mouse(Mouse::Hover(Some(2)));
+        assert_eq!(click(&mut a, 2), Request::Attach("id000002".into()));
+
+        let mut b = app(&["api-server", "dotfiles", "notes"]);
+        b.on_key(Key::Char('/'));
+        b.on_key(Key::Char('o'));
+        b.on_mouse(Mouse::Hover(Some(1)));
+        assert_eq!(click(&mut b, 1), Request::Attach("id000002".into()));
+        assert_eq!(*b.mode(), Mode::Normal);
+        assert_eq!(b.filter(), "o", "the query stays applied");
+    }
+
+    #[test]
+    fn a_drag_after_a_hover_still_picks_the_row_up() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_mouse(Mouse::Hover(Some(1)));
+        a.on_mouse(Mouse::Press(Some(1)));
+        a.on_mouse(Mouse::Drag(Some(2)));
+        assert!(matches!(a.mode(), Mode::Reorder { .. }));
+        assert_eq!(arrangement(&a).0, ["aaa", "ccc", "bbb"]);
+        assert_eq!(
+            a.on_mouse(Mouse::Release),
+            Request::Reorder(vec![
+                ("id000000".into(), 1),
+                ("id000002".into(), 2),
+                ("id000001".into(), 3),
+            ])
+        );
+    }
+
+    /// A row in flight moves on a button, the wheel or a key — not because the
+    /// pointer happened to pass over the list.
+    #[test]
+    fn hovering_does_not_carry_a_grabbed_row() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char(' '));
+        assert_eq!(a.on_mouse(Mouse::Hover(Some(2))), Request::None);
+        assert!(matches!(a.mode(), Mode::Reorder { .. }));
+        assert_eq!(arrangement(&a).0, ["aaa", "bbb", "ccc"]);
+        assert_eq!(a.selected_index(), 0);
+    }
+
+    #[test]
+    fn hovering_does_not_move_under_a_kill_confirm() {
+        let mut a = app(&["dotfiles", "notes"]);
+        a.on_key(Key::Char('x'));
+        assert_eq!(a.on_mouse(Mouse::Hover(Some(1))), Request::None);
+        assert!(matches!(a.mode(), Mode::Confirm { .. }));
+        assert_eq!(a.selected_index(), 0);
     }
 
     #[test]
@@ -2052,6 +2161,8 @@ mod tests {
     fn every_gesture_on_an_empty_list_is_harmless() {
         let mut a = app(&[]);
         for gesture in [
+            Mouse::Hover(Some(0)),
+            Mouse::Hover(None),
             Mouse::Press(Some(0)),
             Mouse::Press(None),
             Mouse::Drag(Some(0)),
