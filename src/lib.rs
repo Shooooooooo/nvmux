@@ -5,7 +5,8 @@
 //! untouched. What is left is a picker ([`ui`]) and a PTY proxy ([`pty`]) that
 //! watches stdin for a `<prefix>` prefix ([`keys`]), however the terminal spells
 //! it ([`keyseq`]) — plus, on a change of session, a brief notice saying which
-//! one you landed in ([`announce`]).
+//! one you landed in ([`announce`]), and a way back into the session you were
+//! in when the link to its host drops ([`reconnect`]).
 //!
 //! macOS and Linux only.
 
@@ -24,6 +25,7 @@ pub mod nvim;
 pub mod paths;
 pub mod proc;
 pub mod pty;
+pub mod reconnect;
 pub mod rpc;
 pub mod session;
 pub mod shell;

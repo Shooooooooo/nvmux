@@ -84,6 +84,13 @@ Opened from a session with `<prefix> Space`, the picker takes the mouse the
 same way, and puts that session's own `'mouse'` setting back when you return
 to it.
 
+`/` filters the list as you type. The match is fuzzy — `asv` finds
+`api-server` — and is tried against the session's name and the last part of its
+working directory, so `scratch` running in `~/work/billing` is found by
+`billing`. It is case-insensitive unless the query has a capital in it. The
+rows that match keep their order and their numbers; nothing is re-sorted by how
+well it matched.
+
 A session's number is its **position in the list**, recalculated every time the
 list is read. Kill session 2 of three and the old 3 becomes the new 2 — the
 column has no holes in it, so the last session is always the number of sessions
@@ -100,6 +107,18 @@ on the end.
   unlearn.
 - **`x` in the picker kills**, without asking the session about unsaved
   buffers. Use `:q` for the editor's own save prompts.
+
+### When the connection drops
+
+`nvmux myhost` rides one ssh connection. When that goes — the laptop slept, the
+Wi-Fi changed, a VPN renewed — the session is untouched: the editor runs over
+there and never noticed. nvmux notices within about 45 seconds (ssh's own
+keepalive), reconnects, and puts you back in the session you were in. A host
+that is not reachable yet is tried again for about a minute, with each attempt
+reported on the terminal; `Ctrl-C` during that wait quits nvmux and leaves the
+session running, for a later `nvmux myhost` to pick up. If the host stays out
+of reach, nvmux quits the same way, saying so — the session is still there,
+and the next `nvmux myhost` finds it.
 
 ## Configuration
 

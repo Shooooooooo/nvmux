@@ -24,7 +24,7 @@ use crate::proc::{Output, Shell};
 use crate::session::{Liveness, Session};
 use crate::shell;
 use crate::ssh::{classify, Ssh};
-use crate::transport::{self, plan_rename, protocol, Host, Location, Transport};
+use crate::transport::{self, plan_rename, protocol, Host, Location, Reconnect, Transport};
 
 pub struct SshTransport {
     location: Location,
@@ -217,7 +217,7 @@ impl SshTransport {
         };
         if slot.as_mut().is_none_or(|shell| !shell.is_alive()) {
             *slot = None;
-            self.reconnect_if_needed()?;
+            self.reconnect_if_needed(None)?;
             *slot = Some(self.ssh.start_shell()?);
         }
         let shell = slot.as_mut().expect("just started");
@@ -240,7 +240,8 @@ impl SshTransport {
     }
 
     /// Bring the master back if it died while nobody was using it, and forget
-    /// the forwards that died with it.
+    /// the forwards that died with it. Says which of the two it found, for
+    /// [`Transport::reconnect`]; the other callers only need it done.
     ///
     /// Checking first turns "the connection died while you were in the picker"
     /// into a sentence rather than a forwarding failure.
@@ -252,7 +253,10 @@ impl SshTransport {
     /// own `ServerAlive` options are for. Only without a shell to ask, or with
     /// one found dead, is ssh asked — and a dead shell is dropped here, so the
     /// next script starts a fresh one over whatever master this leaves.
-    fn reconnect_if_needed(&self) -> Result<()> {
+    ///
+    /// `connect_timeout` is passed through to the master, for the one caller
+    /// that is retrying — see [`crate::ssh::master_args`].
+    fn reconnect_if_needed(&self, connect_timeout: Option<u64>) -> Result<Reconnect> {
         // A slot that is locked has a script running in it, which is as alive
         // as a shell gets.
         let shell_alive = match self.shell.try_lock() {
@@ -273,9 +277,11 @@ impl SshTransport {
         };
         if !master_alive {
             self.forwarded.lock().map(|mut f| f.clear()).ok();
-            self.ssh.ensure_master()?;
+            self.ssh.ensure_master_within(connect_timeout)?;
+            tracing::info!(host = %self.host(), "reconnected");
+            return Ok(Reconnect::Restored);
         }
-        Ok(())
+        Ok(Reconnect::Unneeded)
     }
 }
 
@@ -458,7 +464,7 @@ impl Transport for SshTransport {
             return Ok(local);
         }
 
-        self.reconnect_if_needed()?;
+        self.reconnect_if_needed(None)?;
 
         self.ssh.forward(&local, &remote)?;
         self.forwarded
@@ -467,7 +473,21 @@ impl Transport for SshTransport {
             .ok();
         Ok(local)
     }
+
+    /// Bounded, because it is retried: the attempt gets
+    /// [`RECONNECT_TIMEOUT_SECS`] to reach the host, or the series never gets to
+    /// its next try. A passphrase or a key touch is not a connection attempt and
+    /// is not bounded by it — ssh asks on the terminal, as it did the first time.
+    fn reconnect(&self) -> Result<Reconnect> {
+        self.reconnect_if_needed(Some(RECONNECT_TIMEOUT_SECS))
+    }
 }
+
+/// How long one reconnection attempt may spend reaching the host. Generous for
+/// a link that is up — a handshake is well under a second — and short enough
+/// that a link which is not does not hold the series for the system's TCP
+/// timeout, which is minutes.
+const RECONNECT_TIMEOUT_SECS: u64 = 10;
 
 #[cfg(test)]
 mod tests {
