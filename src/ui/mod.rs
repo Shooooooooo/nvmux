@@ -9,6 +9,13 @@
 //! which arrives with none; `prompt::run_on` borrows the picker's — nesting the
 //! two would enter the alternate screen twice and leave it once.
 //!
+//! [`attaching`] is a fourth, and the odd one out: not a screen the user works
+//! on but the wait between the picker (or a `<prefix>` switch) and the session,
+//! up only while the attach probe is in flight. It keeps the vocabulary — a
+//! centred line where the picker draws its list, one dim hint row on the last
+//! line, no borders, no colour — and is the one screen that leaves the mouse
+//! alone, for a reason given there.
+//!
 //! # There is no preview pane, and there must never be one
 //!
 //! Neovim sizes the global grid to the per-dimension **minimum** across every
@@ -40,6 +47,7 @@
 //! a `draw`: a screen's own drawing stays colourless, and its tests say so.
 
 pub mod app;
+pub mod attaching;
 pub mod complete;
 pub mod draw;
 pub mod help;
@@ -130,6 +138,19 @@ impl Screen {
     /// never re-enable a mode nvmux had turned off — which is why this is
     /// restored by asking rather than left alone.
     pub(crate) fn open() -> Result<Self> {
+        Self::open_with(true)
+    }
+
+    /// [`Screen::open`], saying whether to take the mouse.
+    ///
+    /// Every screen the user works on does. The one that does not is
+    /// [`attaching`], which reads nothing at all for the first seconds of its
+    /// life so that keys typed ahead stay in the terminal's queue for the
+    /// client it is waiting on — and mouse reporting would fill that same
+    /// queue with motion reports, handed to the editor as input the moment
+    /// the relay began. With it off nothing is generated, and the release on
+    /// close is a harmless no-op.
+    pub(crate) fn open_with(mouse: bool) -> Result<Self> {
         // Stops crossterm second-guessing us; see the module docs on colour.
         ratatui::crossterm::style::force_color_output(true);
 
@@ -148,7 +169,9 @@ impl Screen {
         // so without this the content lands in the middle of the editor's last
         // frame. From here on an error restores through `Drop`.
         screen.terminal.clear()?;
-        crate::term::enable_mouse();
+        if mouse {
+            crate::term::enable_mouse();
+        }
         Ok(screen)
     }
 
@@ -224,12 +247,14 @@ pub(crate) fn owning<T>(f: impl FnOnce(&mut ratatui::DefaultTerminal) -> Result<
 /// [`owning`], for a screen that can end by handing the terminal to a session:
 /// `attaches` names that outcome, and it alone gives the terminal back through
 /// [`Screen::close_for_attach`] rather than leaving the outgoing session's frame
-/// on display for the length of the client spawn.
+/// on display for the length of the client spawn. `mouse` is whether the
+/// screen takes the mouse — see [`Screen::open_with`].
 pub(crate) fn owning_for_attach<T>(
     attaches: impl FnOnce(&T) -> bool,
+    mouse: bool,
     f: impl FnOnce(&mut ratatui::DefaultTerminal) -> Result<T>,
 ) -> Result<T> {
-    let mut screen = Screen::open()?;
+    let mut screen = Screen::open_with(mouse)?;
     let outcome = f(screen.terminal());
     // The restore happens before the outcome propagates, as in `owning`, and an
     // error takes the ordinary close: there is no session coming, and the shell
@@ -282,7 +307,7 @@ pub fn run(
     focused: Option<&str>,
     still_attached: bool,
 ) -> Result<Outcome> {
-    owning_for_attach(Outcome::attaches, |terminal| {
+    owning_for_attach(Outcome::attaches, true, |terminal| {
         run_loop(terminal, transport, message, focused, still_attached)
     })
 }

@@ -318,7 +318,14 @@ pub(super) fn centre(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-fn centre_vertically(area: Rect, height: u16) -> Rect {
+/// Centre a `height`-row block vertically, leaving it the full width.
+///
+/// The primitive for one line of centred text: the paragraph keeps the whole
+/// width and its own `Alignment::Center` does the rest, which is what
+/// [`centre`] cannot do — that sizes the rect to the content. Two callers, and
+/// both are a single dim line standing in for a list: the empty picker's "no
+/// sessions", and the attaching screen's spinner.
+pub(super) fn centre_vertically(area: Rect, height: u16) -> Rect {
     Rect {
         y: area.y + (area.height.saturating_sub(height)) / 2,
         height: height.min(area.height),

@@ -136,12 +136,13 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
 
         loop {
             // Everything nvmux does between the keypress and a client ready to
-            // relay: retiring the old one, the probe, and the spawn. Read with
+            // relay: retiring the old one, the probe, and the spawn — and, for
+            // a session slow to answer, the wait the user watches. Read with
             // the `timing: session painted` record the relay ends up emitting,
             // which is the session's own share of the same switch.
             let t_open = std::time::Instant::now();
             let opened = match attached.take() {
-                Some(a) if a.session_id == current.id => Ok(a),
+                Some(a) if a.session_id == current.id => Ok(Some(a)),
                 // Retiring the old client leaves its server running: killing a
                 // --remote-ui client does not kill a --headless --listen server.
                 //
@@ -173,7 +174,17 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             // A failed attach must not end the program: the user can only act
             // on it from the picker, with the reason on screen.
             let attachment = match opened {
-                Ok(a) => a,
+                Ok(Some(a)) => a,
+                // Given up on: back to the picker, with the cursor on the
+                // session that was not answering and nothing on the hint row
+                // — the user knows what they did. No client is held: after a
+                // `<prefix>` switch the old one was hung up before the spawn,
+                // so `Esc` on the picker goes nowhere, as after a failed
+                // attach.
+                Ok(None) => {
+                    tracing::info!(id = %current.id, "attach cancelled");
+                    break;
+                }
                 Err(e) => {
                     tracing::warn!(id = %current.id, error = %e, "attach failed");
                     message = Some(describe_attach_failure(transport.location(), &e));
@@ -338,8 +349,12 @@ fn describe_attach_failure(location: &transport::Location, e: &nvmux::NvmuxError
         }
         nvmux::NvmuxError::Rpc(rpc) if rpc.is_definitely_dead() => "that session is gone".into(),
         // Reachable, and not answering: a `:!make` still running, a prompt
-        // nvmux will not answer for the user, CPU-bound Lua. The bare error
-        // ("timed out after 3s") reads as if nvmux had lost the session.
+        // nvmux will not answer for the user, CPU-bound Lua. The attach probe
+        // no longer has a budget to run out of — the user waits on the
+        // attaching screen and gives up from there — so this arm is for the
+        // error type's sake, and for whatever grows a budget next. The bare
+        // error ("timed out after 3s") would read as if nvmux had lost the
+        // session.
         nvmux::NvmuxError::Rpc(nvmux::error::RpcError::Timeout(after)) => {
             format!("that session is busy and did not answer within {after:?}")
         }
@@ -417,17 +432,43 @@ fn pick(
     }
 }
 
+/// Start a client for `session` and wait, on the attaching screen, for the
+/// session to take it. `None` is the user giving up on that wait.
+///
 /// Returns the crate's own error type rather than `anyhow`, so the caller can
 /// tell a dropped connection from a dead session and say the right thing.
 fn new_attachment(
     transport: &dyn transport::Transport,
     session: &nvmux::session::Session,
-) -> nvmux::Result<pty::Attachment> {
+) -> nvmux::Result<Option<pty::Attachment>> {
     let sock = transport.local_socket_for(session)?;
     // Every spawn is a change of session — the loop above reuses the client
     // otherwise — so the notice is unconditional here and one-shot there.
     let notice = announce::label(&session.name);
-    pty::spawn(&session.id, &sock, &notice)
+    // The client first and the probe alongside it, for the overlap
+    // `pty::spawn_client` explains. A probe that cannot start, one that says
+    // no, and a wait the user gives up on all end the same way, by dropping
+    // the attachment — explicitly, so the client is gone, and its pty with
+    // it, before the picker says anything about it.
+    let attachment = pty::spawn_client(&session.id, &sock, &notice)?;
+    let probe = match pty::Probe::start(&session.id, &sock) {
+        Ok(probe) => probe,
+        Err(e) => {
+            drop(attachment);
+            return Err(e);
+        }
+    };
+    match ui::attaching::run(probe, &session.name) {
+        Ok(ui::attaching::Verdict::Ready) => Ok(Some(attachment)),
+        Ok(ui::attaching::Verdict::Cancelled) => {
+            drop(attachment);
+            Ok(None)
+        }
+        Err(e) => {
+            drop(attachment);
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]

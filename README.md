@@ -59,6 +59,11 @@ The host string is handed to `ssh` verbatim, so a hostname, `user@host`, or any
 hardware keys, because nvmux drives your own ssh client rather than
 reimplementing it.
 
+Attaching waits for the session to answer, however long that takes — one in
+the middle of `:!make` answers when the make is done. If it takes more than a
+moment, the screen says which session it is waiting for, with a spinner, and
+the bottom row offers `Esc` to give up and go back to the picker.
+
 ### While attached
 
 `<prefix>` is `Ctrl-Space` unless you change it in the [config](#configuration).

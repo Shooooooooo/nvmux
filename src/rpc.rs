@@ -62,6 +62,13 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 /// The read timeout for probes that run behind the picker. Three seconds rather
 /// than one: a deferred call blocks for the whole of any `system()` call in the
 /// user's editor, so a shorter budget marks healthy sessions dead.
+///
+/// The attach probe is the exception: it has no budget at all. There the user
+/// is watching a spinner and can give up whenever they like (see
+/// [`crate::pty::Probe`] and `ui::attaching`), and a session in the middle of
+/// a long `:!make` is one to wait for, not to refuse. This stays for the probes
+/// nobody is watching: the picker's liveness check, and the wait for a freshly
+/// created session to answer.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// A connected RPC channel, generic over the byte stream so the same code serves
@@ -72,8 +79,10 @@ pub struct Client<S: Read + Write> {
     /// Once set, every call fails fast. See [`Client::poison`].
     poisoned: Option<String>,
     /// Tracked so a timeout error reports the budget that actually elapsed,
-    /// rather than misreporting a 250ms failure as a 3s one.
-    read_timeout: Duration,
+    /// rather than misreporting a 250ms failure as a 3s one. `None` is a
+    /// connection with no budget: a call waits until it is answered, or until
+    /// the socket is shut down under it (see [`Interrupt`]).
+    read_timeout: Option<Duration>,
 }
 
 /// Needed by `Result::expect_err` in the tests; `Client` is never logged.
@@ -91,6 +100,15 @@ impl Client<UnixStream> {
     /// connect — a unix socket connect either finds a listener or does not.
     /// Passing a connect-sized value here classified live sessions as dead.
     pub fn connect(path: &Path, read_timeout: Duration) -> Result<Self, RpcError> {
+        Self::connect_with(path, Some(read_timeout))
+    }
+
+    /// [`Client::connect`], with the budget optional. `None` bounds nothing: a
+    /// call blocks until the server answers, however long that is, and the only
+    /// way to end it sooner is an [`Interrupt`] fired from another thread. For
+    /// a wait somebody is watching and can cancel, and nothing else — every
+    /// probe the picker runs on its own account keeps a budget.
+    pub fn connect_with(path: &Path, read_timeout: Option<Duration>) -> Result<Self, RpcError> {
         // std's error here is `InvalidInput` with `raw_os_error() == None` —
         // nothing a caller could match on. Check explicitly for a useful message.
         crate::paths::check_sock_path(path).map_err(|e| RpcError::Protocol(e.to_string()))?;
@@ -110,11 +128,43 @@ impl Client<UnixStream> {
             }
             _ => RpcError::Io(e),
         })?;
-        stream.set_read_timeout(Some(read_timeout))?;
-        stream.set_write_timeout(Some(read_timeout))?;
+        stream.set_read_timeout(read_timeout)?;
+        stream.set_write_timeout(read_timeout)?;
         let mut client = Self::new(stream);
         client.read_timeout = read_timeout;
         Ok(client)
+    }
+
+    /// A second handle on this connection, for ending a call in progress from
+    /// another thread. See [`Interrupt`].
+    pub fn interrupt(&self) -> std::io::Result<Interrupt> {
+        Ok(Interrupt(self.io.get_ref().try_clone()?))
+    }
+}
+
+/// A way to end a call in progress on another thread.
+///
+/// A [`Client`] with no budget ([`Client::connect_with`] given `None`) blocks
+/// in `read` until the server answers, and a thread parked in a blocking read
+/// cannot be told to stop — the reason [`crate::pty`] gives for reading the
+/// terminal from one thread and one `poll`. What *can* be done is to take the
+/// socket away from under it: `shutdown` acts on the socket itself rather than
+/// on the handle it is called through, so a shutdown here makes the read on
+/// the other thread return end-of-file at once, and the call fails as
+/// [`RpcError::Reset`]. Dropping a second handle would not do it — that only
+/// closes a file descriptor, and the socket stays open for as long as the
+/// other one is held.
+///
+/// Unconditional: the connection is unusable afterwards, which is what the
+/// holder wanted.
+pub struct Interrupt(UnixStream);
+
+impl Interrupt {
+    /// End whatever call the connection is in the middle of. Harmless when it
+    /// is in none, or already gone — an error here has nothing to tell the
+    /// caller, who is abandoning the connection either way.
+    pub fn fire(&self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Both);
     }
 }
 
@@ -124,7 +174,7 @@ impl<S: Read + Write> Client<S> {
             io: BufReader::new(stream),
             next_msgid: 1,
             poisoned: None,
-            read_timeout: PROBE_TIMEOUT,
+            read_timeout: Some(PROBE_TIMEOUT),
         }
     }
 
@@ -178,12 +228,15 @@ impl<S: Read + Write> Client<S> {
         }
 
         // An overall deadline as well as a per-read one: a peer that keeps
-        // sending frames we skip restarts the per-read budget every time.
-        let deadline = std::time::Instant::now() + budget;
+        // sending frames we skip restarts the per-read budget every time. No
+        // budget, no deadline: an unbounded call is unbounded here too.
+        let started = std::time::Instant::now();
 
         loop {
-            if std::time::Instant::now() >= deadline {
-                return Err(self.poison(format!("{method} exceeded its {budget:?} budget")));
+            if let Some(budget) = budget {
+                if started.elapsed() >= budget {
+                    return Err(self.poison(format!("{method} exceeded its {budget:?} budget")));
+                }
             }
             let decoded = rmpv::decode::read_value(&mut self.io).map_err(|e| match e {
                 rmpv::decode::Error::InvalidMarkerRead(io)
@@ -441,10 +494,14 @@ fn describe_nvim_error(v: &Value) -> String {
     v.to_string()
 }
 
-fn map_io(e: std::io::Error, timeout: Duration) -> RpcError {
+fn map_io(e: std::io::Error, timeout: Option<Duration>) -> RpcError {
     match e.kind() {
         // A read timeout surfaces as one of these two depending on platform.
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => RpcError::Timeout(timeout),
+        // Not without a budget, though — nothing sets the socket non-blocking
+        // — so the zero reported in its place is never seen.
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+            RpcError::Timeout(timeout.unwrap_or_default())
+        }
         std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof => RpcError::Reset,
         std::io::ErrorKind::BrokenPipe => RpcError::Reset,
         _ => RpcError::Io(e),
@@ -726,6 +783,43 @@ mod tests {
         let liveness = probe(&path);
         let _ = std::fs::remove_file(&path);
         assert_eq!(liveness, Liveness::Dead);
+    }
+
+    /// The attach probe has no budget, so the only thing that can end a call
+    /// the server is not answering is the interrupt — which has to unpark a
+    /// read on another thread, and promptly.
+    #[test]
+    fn an_interrupt_ends_an_unbounded_call_on_another_thread() {
+        let path =
+            std::env::temp_dir().join(format!("nvmux-interrupt-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let mut client = Client::connect_with(&path, None).expect("connect");
+        let interrupt = client.interrupt().expect("a second handle");
+        // Accepted and then ignored: a server that never answers.
+        let (server, _) = listener.accept().expect("accept");
+
+        let worker = std::thread::spawn(move || client.get_mode());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !worker.is_finished(),
+            "the call returned with no answer and no budget"
+        );
+
+        let started = std::time::Instant::now();
+        interrupt.fire();
+        let err = worker
+            .join()
+            .expect("the worker thread")
+            .expect_err("the call was cut short");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the interrupt took {:?} to unpark the read",
+            started.elapsed()
+        );
+        assert!(matches!(err, RpcError::Reset), "want Reset, got {err:?}");
+        drop(server);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
