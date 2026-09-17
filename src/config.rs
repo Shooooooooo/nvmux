@@ -93,6 +93,10 @@ pub struct FadeSettings {
     /// settled, and out — rather than only nvmux's own screens. Costs a
     /// running parse of the session's output while it is attached (see
     /// [`crate::shadow`]); off, a session hard-cuts both ways.
+    ///
+    /// That parse is also what the attach notice dissolves into, so off, the
+    /// notice's box empties the cells it covers and waits for a repaint to
+    /// fill them (see [`crate::announce`]).
     pub session: bool,
     /// Whether the quick `<prefix> ?` / `<prefix> c` excursions fade too. Off
     /// makes those snappier at the cost of consistency.

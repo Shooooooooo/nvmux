@@ -126,10 +126,10 @@ fn duration() -> Duration {
 pub struct Dissolve {
     /// One direction's length.
     pub duration: Duration,
-    /// The terminal's own foreground: a glyph fully drawn.
-    pub fg: Rgb,
-    /// The terminal's own background: a glyph fully dissolved.
-    pub bg: Rgb,
+    /// The terminal's own colours: what a glyph fully drawn is, what a glyph
+    /// fully dissolved is, and — for a caller painting the session's own cells
+    /// rather than its own text — what every indexed colour in between means.
+    pub palette: Palette,
 }
 
 impl Dissolve {
@@ -141,7 +141,7 @@ impl Dissolve {
     /// last frame of a fade in set no colour whatever, so the screen it leaves
     /// behind is byte for byte the one drawn without any fade at all.
     pub fn colour(self, t: f32) -> Option<Rgb> {
-        (t > 0.0).then(|| self.fg.lerp(self.bg, t))
+        (t > 0.0).then(|| self.palette.fg.lerp(self.palette.bg, t))
     }
 }
 
@@ -149,11 +149,9 @@ impl Dissolve {
 /// or `[fade] enabled = false`. Exactly the gate [`enabled`] reports, in the
 /// one form a caller that paints its own frames can use.
 pub fn dissolve() -> Option<Dissolve> {
-    let palette = active()?;
     Some(Dissolve {
         duration: duration(),
-        fg: palette.fg,
-        bg: palette.bg,
+        palette: *active()?,
     })
 }
 
