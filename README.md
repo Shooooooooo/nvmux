@@ -1,35 +1,33 @@
 # nvmux
 
-A session manager for Neovim. Create named Neovim sessions, attach to them,
-detach, and come back later — with the editor running on a remote host while
-every keystroke and every pixel of rendering happens on your own terminal.
+**Detachable Neovim sessions on a remote host, drawn by your own terminal.**
 
-```
-                                                                       
-                              1  api-server                            
-                            ▸ 2  dotfiles                              
-                              3  scratch                               
-                              4  notes                                 
-                                                                       
- ↑↓ move  ⏎ attach  c new  r rename  x kill  ␣ order  / filter  q quit 
-```
+[![CI](https://github.com/Shooooooooo/nvmux-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/Shooooooooo/nvmux-rs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](Cargo.toml)
 
-nvmux is a **thin multiplexer**: it does not render Neovim's UI. Neovim already
-ships a client that does, so nvmux runs it and passes the bytes through
-untouched — which is why bracketed paste, the kitty keyboard protocol,
-truecolor, OSC 52 clipboard and DA1/XTGETTCAP round-trips all just work.
+Create named Neovim sessions, attach to them, detach, and come back later —
+with the editor running on a remote host while every keystroke and every pixel
+of rendering happens on your own terminal.
 
-```
-LOCAL                                    REMOTE
-nvmux                                    nvim --headless --listen <sock>
- ├─ picker UI (ratatui)                  nvim --headless --listen <sock>
- ├─ PTY proxy (watches for <prefix>)     nvim --headless --listen <sock>
- └─ child: nvim --server … --remote-ui     (detached, survive an SSH drop)
-      │                                             ▲
-      └──── one persistent ssh master ──────────────┘
-            (ControlMaster/ControlPersist), plus one
-            `ssh -O forward` unix-socket forward per session
-```
+![Creating a session from the nvmux picker, typing in Neovim, detaching with the prefix key, then relaunching nvmux and reattaching to the same buffer, with each key shown as it is pressed.](assets/demo.gif)
+
+Make a session, type in it, detach, come back: the editor, its buffers and its
+undo history are where you left them.
+
+[Why not tmux?](#why-not-tmux) · [Requirements](#requirements) · [Install](#install) · [Use](#use) · [How it works](#how-it-works) · [Configuration](#configuration)
+
+## Why not tmux?
+
+| | tmux over ssh | nvmux |
+|---|---|---|
+| Who draws the screen | tmux re-renders the editor from its own grid | Neovim's own client draws straight to your terminal |
+| Terminal features | have to survive a trip through tmux; some need coaxing | negotiated between Neovim and your terminal directly |
+| After the link drops | the session lives, and you reconnect by hand | the session lives, and nvmux reconnects for you |
+| What it holds | any program, in panes and windows | Neovim sessions, and nothing else |
+
+That last row is the trade: nvmux is not a tmux replacement. It does one thing,
+which is why it can hand Neovim your terminal rather than an imitation of one.
 
 ## Requirements
 
@@ -38,7 +36,16 @@ nvmux                                    nvim --headless --listen <sock>
 | Local | `nvim` >= 0.11, and `ssh` for `nvmux <host>` |
 | Remote | `nvim` >= 0.11 |
 
+0.11 specifically, on both ends: that is the release where `:detach` and
+`:connect` landed.
+
 ## Install
+
+```sh
+cargo install --git https://github.com/Shooooooooo/nvmux-rs
+```
+
+Or from a checkout:
 
 ```sh
 cargo build --release
@@ -52,6 +59,18 @@ Two invocations, and no subcommands:
 ```sh
 nvmux            # sessions on this machine
 nvmux myhost     # sessions on myhost
+```
+
+Either one opens the picker:
+
+```
+                                                                       
+                              1  api-server                            
+                            ▸ 2  dotfiles                              
+                              3  scratch                               
+                              4  notes                                 
+                                                                       
+ ↑↓ move  ⏎ attach  c new  r rename  x kill  ␣ order  / filter  q quit 
 ```
 
 The host string is handed to `ssh` verbatim, so a hostname, `user@host`, or any
@@ -81,19 +100,48 @@ the bottom row offers `Esc` to give up and go back to the picker.
 
 ### Leaving a session
 
+> [!IMPORTANT]
+> **`:q` ends the session.** The editor *is* the session, so quitting the last
+> window terminates the server, not just your view. That is the one thing to
+> unlearn.
+
 - **`<prefix> d` detaches.** The session keeps running with all its buffers,
   undo history and jumplist; reattach later, from this machine or another one.
-- **`:q` ends the session.** The editor *is* the session, so quitting the last
-  window terminates the server, not just your view. That is the one thing to
-  unlearn.
 - **`x` in the picker kills**, without asking the session about unsaved
   buffers. Use `:q` for the editor's own save prompts.
+
+## How it works
+
+nvmux is a **thin multiplexer**: it does not render Neovim's UI. Neovim already
+ships a client that does, so nvmux runs it and passes the bytes through
+untouched — which is why bracketed paste, the kitty keyboard protocol,
+truecolor, OSC 52 clipboard and DA1/XTGETTCAP round-trips all just work.
+
+```
+LOCAL                                    REMOTE
+nvmux                                    nvim --headless --listen <sock>
+ ├─ picker UI (ratatui)                  nvim --headless --listen <sock>
+ ├─ PTY proxy (watches for <prefix>)     nvim --headless --listen <sock>
+ └─ child: nvim --server … --remote-ui     (detached, survive an SSH drop)
+      │                                             ▲
+      └──── one persistent ssh master ──────────────┘
+            (ControlMaster/ControlPersist), plus one
+            `ssh -O forward` unix-socket forward per session
+```
+
+When that master goes — the laptop slept, the Wi-Fi changed — the sessions on
+the far side never notice, and nvmux brings the link back on its own: six
+attempts over about a minute, then the picker with the reason and `Enter` to
+retry by hand.
 
 ## Configuration
 
 nvmux needs no configuration. An optional TOML file — `$NVMUX_CONFIG` if set,
 else `$XDG_CONFIG_HOME/nvmux/config.toml`, else `~/.config/nvmux/config.toml` —
 overrides the defaults below; an unknown key or a bad value is a startup error.
+
+<details>
+<summary>Every setting, at its default</summary>
 
 ```toml
 [keys]
@@ -109,3 +157,5 @@ duration_ms = 100    # each way — a switch pays it out, in, and for the notice
 session     = true   # Neovim's own screen dissolves too, and backs the notice
 excursions  = true   # so do the <prefix> ? and <prefix> c screens
 ```
+
+</details>
