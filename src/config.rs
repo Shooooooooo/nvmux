@@ -85,7 +85,9 @@ pub struct FadeSettings {
     /// nothing to fade *to* — see [`crate::fade::enabled`].
     pub enabled: bool,
     /// How long one direction takes; a switch pays it once on the way out and
-    /// once on the way in. Must be at least 1 and at most `MAX_FADE_MS`.
+    /// once on the way in, and twice more for the box that says where it
+    /// landed, which dissolves in and out around the second it is up (see
+    /// [`crate::announce`]). Must be at least 1 and at most `MAX_FADE_MS`.
     pub duration_ms: u64,
     /// Whether a Neovim screen dissolves too — in, once its first paint has
     /// settled, and out — rather than only nvmux's own screens. Costs a
@@ -330,7 +332,8 @@ fn render_default_config(prefix: u8) -> String {
          # command = {command:?}\n\
          \n\
          [fade]\n\
-         # The dissolve between screens. NO_COLOR turns it off whatever this says.\n\
+         # The dissolve between screens, and of the notice a switch puts up.\n\
+         # NO_COLOR turns it off whatever this says.\n\
          # enabled     = {fade_enabled}\n\
          # duration_ms = {fade_duration}\n\
          # session     = {fade_session}\n\

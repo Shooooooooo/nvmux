@@ -1259,8 +1259,10 @@ fn pump(
         }
 
         // After the frame it sits on and before any keystroke is acted on. The
-        // size is read here rather than once outside the loop, so a resize
-        // between the drawing and the erasing is seen by both.
+        // size is read here rather than once outside the loop, so every frame
+        // of the notice — it dissolves in and out, so there are many — is
+        // drawn for the screen as it is now, and a resize between the drawing
+        // and the erasing is seen by both.
         if let Some(p) = popup.as_mut() {
             let act = p.step(Instant::now(), child_spoke, term::terminal_size());
             match act {
