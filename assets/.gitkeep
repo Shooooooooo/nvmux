@@ -1,0 +1,2 @@
+Holds the README's demo recording, which is generated rather than committed
+by hand: `vhs demo.tape` writes `demo.gif` here. See demo.tape.
