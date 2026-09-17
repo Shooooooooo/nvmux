@@ -8,13 +8,30 @@
 //! move a cell toward the background it has to know what colour the cell is.
 //!
 //! So a [`Shadow`] is a terminal emulator with no terminal: the `vt100` crate's
-//! parser, fed a copy of every byte the real terminal is sent, keeping a grid
-//! of cells with their colours and attributes. **It only watches.** Nothing
-//! reaching the terminal is changed, delayed or dropped on its account; the
-//! parser sees the same bytes a moment later, and if it misreads one the only
-//! consequence is a fade frame that is slightly wrong. It costs a parse of the
-//! session's output while a session is attached, which is why `[fade]
-//! session = false` turns it off entirely rather than merely not using it.
+//! parser, fed a copy of every byte the *session* sends the real terminal,
+//! keeping a grid of cells with their colours and attributes. **It only
+//! watches.** Nothing reaching the terminal is changed, delayed or dropped on
+//! its account; the parser sees the same bytes a moment later, and if it
+//! misreads one the only consequence is a fade frame that is slightly wrong.
+//! It costs a parse of the session's output while a session is attached, which
+//! is why `[fade] session = false` turns it off entirely rather than merely
+//! not using it.
+//!
+//! The session's bytes, and not nvmux's own. What nvmux draws over a session —
+//! the attach notice, and nothing else — is deliberately withheld, because
+//! what the shadow has to remember there is precisely what is *underneath* it.
+//! The grid is the screen the client drew, which for the notice's rectangle is
+//! the only copy of it anywhere: the terminal's has been written over, and
+//! only the server could otherwise say what was there.
+//!
+//! # What a composite paints
+//!
+//! That is what [`Shadow::under`] is for. Given a rectangle nvmux has drawn on
+//! and how far through its dissolve it is, it paints the two together: the
+//! overlay's own glyphs fading out, the session's cells fading back in, each
+//! cell showing whichever of the two is the more visible. The notice then
+//! melts into the editor instead of leaving a hole for a repaint to fill —
+//! and where that repaint never lands, the screen has already been put back.
 //!
 //! # What a frame paints
 //!
@@ -58,10 +75,20 @@ use std::panic::{self, AssertUnwindSafe};
 
 use crate::fade::{SYNC_BEGIN, SYNC_END};
 use crate::palette::{Palette, Rgb};
+use unicode_width::UnicodeWidthChar;
 
 const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 const RESET_SGR: &[u8] = b"\x1b[0m";
+/// `DECSC` / `DECRC`. A single shared save slot, which is why only something
+/// written between the session's own frames may use it — see [`Shadow::under`].
+const SAVE_CURSOR: &[u8] = b"\x1b7";
+const RESTORE_CURSOR: &[u8] = b"\x1b8";
+
+/// Where a cell holding both an overlay glyph and a session cell swaps which
+/// of the two it shows. Halfway, because that is where the two are equally
+/// dissolved and the swap is the least that it can be.
+const CROSSOVER: f32 = 0.5;
 
 /// Where a frame leaves the cursor once its cells are written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +112,27 @@ pub enum Cursor {
 /// frame it paints then has a row the terminal clamps, which at that size is
 /// nothing anyone can see.
 const MIN_SIZE: u16 = 2;
+
+/// A block of text nvmux has drawn over the session's screen — the attach
+/// notice — and the rectangle of cells it covers.
+///
+/// Held here rather than in [`crate::announce`], which works the geometry out,
+/// because this is the module that composites it: only the shadow can reach
+/// the cells underneath. The dependency then runs one way, from the thing
+/// being drawn to the screen it is drawn on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Over {
+    /// The top-left cell, 0-based, in the grid's own coordinates. The notice
+    /// writes 1-based `CUP`s; the parser indexes from zero.
+    pub top: u16,
+    pub left: u16,
+    /// The width in columns — measured, so a wide glyph in the label counts
+    /// for the two cells it occupies — which every row is.
+    pub width: u16,
+    /// The rows of text. A space is a cell the overlay covers without drawing
+    /// on, which is most of the notice and is why it hides what is under it.
+    pub rows: Vec<String>,
+}
 
 /// A cell as a frame paints it: its interpolated colours and the two
 /// attributes that survive a fade. What one frame compares against the last.
@@ -198,8 +246,9 @@ impl Shadow {
     }
 
     /// The terminal was written to behind the shadow's back — held bytes it
-    /// had already seen, replayed — so the next frame must paint every cell
-    /// rather than trust what the last one left.
+    /// had already seen, replayed, or a frame of nvmux's own painted over the
+    /// screen — so the next frame must paint every cell rather than trust what
+    /// the last one left.
     pub fn invalidate(&mut self) {
         self.painted.clear();
     }
@@ -268,6 +317,117 @@ impl Shadow {
         self.painted = next;
         out
     }
+
+    /// The bytes that cross-fade `over` with the session's screen under it:
+    /// the overlay's own glyphs `t` of the way dissolved, and this shadow's
+    /// cells — what the session drew there, and what the overlay is covering —
+    /// `1 - t` of the way.
+    ///
+    /// This is what lets the attach notice dissolve into the editor rather
+    /// than into a hole. The notice's own renderer fills its box with spaces,
+    /// which erase; at `t = 0` this paints the same thing, because a cell
+    /// fully dissolved is the background. What it can do that spaces cannot is
+    /// come back: at `t = 1` the rectangle is the session's own cells at full
+    /// colour, so the box's last frame leaves the screen as it found it.
+    ///
+    /// Three things set it apart from [`Shadow::frame`], all of them because
+    /// this paints *over* a session that still owns the screen rather than
+    /// taking the screen for a fade:
+    ///
+    /// * it leaves the cursor and the editor's own attributes exactly as it
+    ///   found them — `DECSC`/`DECRC` around everything, and no cursor hide,
+    ///   which would be seen as a blink for as long as the notice is up. The
+    ///   shared save slot is safe here for the reason it is safe in
+    ///   [`crate::announce`]: nothing is written except at a lull, between the
+    ///   session's own frames;
+    /// * it keeps no diff. `frame`'s is whole-screen and keyed by length, and
+    ///   a rectangle cannot share it; every cell is painted every time, which
+    ///   costs a kilobyte or so a frame and makes this a pure function of the
+    ///   grid;
+    /// * it never writes outside the rectangle, whatever is in the way. A cell
+    ///   the notice does not cover is the session's, and a fade frame has no
+    ///   business touching it.
+    ///
+    /// Cells past the end of the grid — a terminal that grew before the shadow
+    /// was told — resolve to blanks, so a rectangle that hangs off the edge
+    /// paints spaces rather than nothing.
+    pub fn under(&self, over: &Over, palette: &Palette, t: f32) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(SYNC_BEGIN);
+        out.extend_from_slice(SAVE_CURSOR);
+        if !self.broken {
+            self.paint_under(&mut out, over, palette, t);
+        }
+        out.extend_from_slice(RESET_SGR);
+        out.extend_from_slice(RESTORE_CURSOR);
+        out.extend_from_slice(SYNC_END);
+        out
+    }
+
+    /// The cells themselves, inside the envelope [`Shadow::under`] wrote.
+    fn paint_under(&self, out: &mut Vec<u8>, over: &Over, palette: &Palette, t: f32) {
+        let screen = self.parser.screen();
+        let beneath = 1.0 - t;
+        // The overlay's glyphs while they are the more visible of the two; the
+        // session's cells once they are not.
+        let overlaid = t < CROSSOVER;
+        let ink = Painted {
+            fg: palette.fg.lerp(palette.bg, t),
+            bg: None,
+            bold: false,
+            dim: false,
+        };
+        // What the stream's SGR says, carried across rows as `frame` carries
+        // it, and where the cursor is known to be after the last cell written.
+        let mut sgr: Option<Painted> = None;
+        for (i, row) in over.rows.iter().enumerate() {
+            let Ok(line) = u16::try_from(i).map(|i| over.top + i) else {
+                break;
+            };
+            let laid = laid_out(row, over.width);
+            let mut at: Option<u16> = None;
+            let mut c = 0u16;
+            while c < over.width {
+                let col = over.left + c;
+                let glyph = laid[usize::from(c)]
+                    .as_deref()
+                    .filter(|g| overlaid && !is_blank(g));
+                let (text, painted, width) = match glyph {
+                    // The overlay's own, in the one colour the whole of it is
+                    // drawn in — the notice sets no background, so the box's
+                    // interior stays whatever the reset put back.
+                    Some(g) => (g, ink, glyph_width(g)),
+                    // The session's cell, as far as it fits. A wide character
+                    // the rectangle cuts is blanked rather than written: half
+                    // of one is a broken glyph, and the other half is outside
+                    // the rectangle and not ours to repair.
+                    None => {
+                        let cell = screen.cell(line, col);
+                        let painted = resolve(cell, palette, beneath);
+                        match cell {
+                            Some(cell) if cell.is_wide_continuation() => (" ", painted, 1),
+                            Some(cell) if cell.is_wide() && c + 2 > over.width => (" ", painted, 1),
+                            Some(cell) if cell.has_contents() => {
+                                let w = if cell.is_wide() { 2 } else { 1 };
+                                (cell.contents(), painted, w)
+                            }
+                            _ => (" ", painted, 1),
+                        }
+                    }
+                };
+                if at != Some(col) {
+                    let _ = write!(out, "\x1b[{};{}H", line + 1, col + 1);
+                }
+                if sgr != Some(painted) {
+                    write_sgr(out, painted);
+                    sgr = Some(painted);
+                }
+                out.extend_from_slice(text.as_bytes());
+                at = Some(col + width);
+                c += width;
+            }
+        }
+    }
 }
 
 /// What a cell is, `t` of the way to the background.
@@ -312,6 +472,53 @@ fn resolve(cell: Option<&vt100::Cell>, palette: &Palette, t: f32) -> Painted {
         bold: cell.bold() && !blank,
         dim: cell.dim() && !blank,
     }
+}
+
+/// Where each column of an overlay row starts: the text drawn there, or `None`
+/// for the second half of a wide character and for columns the row does not
+/// reach.
+///
+/// A row is `width` *columns*, not `width` characters, so it cannot be indexed
+/// by either the grid's coordinates or the string's. Combining marks carry no
+/// width of their own and ride along with the glyph they belong to, which is
+/// how a decomposed character in a session name survives the composite.
+fn laid_out(row: &str, width: u16) -> Vec<Option<String>> {
+    let mut out: Vec<Option<String>> = vec![None; usize::from(width)];
+    let mut start: Option<usize> = None;
+    let mut col = 0usize;
+    for ch in row.chars() {
+        let Some(w) = UnicodeWidthChar::width(ch).filter(|w| *w > 0) else {
+            if let Some(g) = start.and_then(|c| out[c].as_mut()) {
+                g.push(ch);
+            }
+            continue;
+        };
+        if col >= out.len() {
+            break;
+        }
+        out[col] = Some(ch.to_string());
+        start = Some(col);
+        col += w;
+    }
+    out
+}
+
+/// What an overlay's glyph occupies, never zero — it was laid out by width, so
+/// the only way here is a character that has one.
+fn glyph_width(glyph: &str) -> u16 {
+    glyph
+        .chars()
+        .filter_map(UnicodeWidthChar::width)
+        .find(|w| *w > 0)
+        .and_then(|w| u16::try_from(w).ok())
+        .unwrap_or(1)
+}
+
+/// Whether an overlay draws nothing here: a cell it covers without marking.
+/// The notice's padding and its box's interior, which hide the session's cells
+/// by leaving them to the dissolve rather than by drawing over them.
+fn is_blank(glyph: &str) -> bool {
+    glyph.chars().all(char::is_whitespace)
 }
 
 /// One SGR that says everything about a cell, from a reset: the reset puts
@@ -398,6 +605,236 @@ mod tests {
             .filter(|(_, fin)| *fin == 'm')
             .map(|(params, _)| params)
             .collect()
+    }
+
+    /// What a composite frame puts on the screen: one entry per glyph written,
+    /// as `((row, col), sgr, text)` in the terminal's own 1-based coordinates.
+    /// Runs share a placement, so the column is tracked as the terminal would.
+    fn painted_cells(bytes: &[u8]) -> Vec<((usize, usize), String, String)> {
+        let mut out = vec![];
+        let mut at: Option<(usize, usize)> = None;
+        let mut sgr = String::new();
+        for piece in text(bytes).split('\x1b') {
+            let Some(body) = piece.strip_prefix('[') else {
+                continue;
+            };
+            let Some(end) = body.find(|c: char| c.is_ascii_alphabetic()) else {
+                continue;
+            };
+            let fin = body[end..].chars().next().expect("a final byte");
+            match fin {
+                'H' => {
+                    let (row, col) = body[..end].split_once(';').expect("row;col");
+                    at = Some((row.parse().expect("row"), col.parse().expect("col")));
+                }
+                'm' => sgr = body[..end].to_string(),
+                _ => {}
+            }
+            for ch in body[end + fin.len_utf8()..].chars() {
+                let (row, col) = at.expect("a cell is placed before it is drawn");
+                out.push(((row, col), sgr.clone(), ch.to_string()));
+                at = Some((row, col + UnicodeWidthChar::width(ch).unwrap_or(1)));
+            }
+        }
+        out
+    }
+
+    /// A box eight columns across at the grid's row 2, column 3 — 0-based, as
+    /// `Over` counts.
+    fn over() -> Over {
+        Over {
+            top: 2,
+            left: 3,
+            width: 8,
+            rows: vec!["╭──────╮".into(), "│ hi   │".into(), "╰──────╯".into()],
+        }
+    }
+
+    /// A screen with a letter in every cell the box will cover, so anything
+    /// showing through can be told from anything that is not.
+    fn under() -> Shadow {
+        let mut shadow = Shadow::new(8, 20);
+        for row in 3..=5 {
+            shadow.feed(format!("\x1b[{row};1HABCDEFGHIJKLMNOPQRST").as_bytes());
+        }
+        shadow
+    }
+
+    /// Just the glyphs a composite wrote, in order.
+    fn glyphs(bytes: &[u8]) -> String {
+        painted_cells(bytes)
+            .into_iter()
+            .map(|(_, _, text)| text)
+            .collect()
+    }
+
+    /// The box at rest covers what it is over. The editor's glyphs are still
+    /// written — they have to be, or they could not come back a frame at a
+    /// time — but fully dissolved, which is the background colour on the
+    /// background: nothing of the text can be read through the box. This is
+    /// the frame the dissolve starts from, and it looks exactly like the
+    /// spaces the notice's own renderer fills its interior with.
+    #[test]
+    fn a_box_at_rest_hides_the_screen_it_is_over() {
+        let p = palette();
+        let box_glyphs = "╭─╮│╰╯hi";
+        let drawn = format!("0;38;2;{};{};{}", p.fg.0, p.fg.1, p.fg.2);
+        let gone = format!("0;38;2;{};{};{}", p.bg.0, p.bg.1, p.bg.2);
+        for (at, sgr, text) in painted_cells(&under().under(&over(), &p, 0.0)) {
+            if box_glyphs.contains(&text) {
+                assert_eq!(sgr, drawn, "the box was not whole at {at:?}");
+            } else {
+                assert_eq!(sgr, gone, "{text:?} showed through the box at {at:?}");
+            }
+        }
+    }
+
+    /// Fully dissolved, the rectangle is the session's own cells at full
+    /// colour: the box has not been erased, it has been replaced by what it
+    /// was covering. This is what lets the notice leave without a repaint
+    /// having to put the screen back.
+    #[test]
+    fn a_fully_dissolved_box_is_the_screen_underneath() {
+        let frame = under().under(&over(), &palette(), 1.0);
+        // Columns 3..11 of each row, 0-based: D through K.
+        assert_eq!(glyphs(&frame), "DEFGHIJKDEFGHIJKDEFGHIJK");
+        let want = format!(
+            "0;38;2;{};{};{}",
+            palette().fg.0,
+            palette().fg.1,
+            palette().fg.2
+        );
+        for (at, sgr, _) in painted_cells(&frame) {
+            assert_eq!(sgr, want, "cell {at:?} was not at full colour");
+        }
+    }
+
+    /// The crossover: a cell holding both shows the box while the box is the
+    /// more visible of the two, and the screen once it is not. Either side of
+    /// halfway, so the swap lands where the two are equally dissolved.
+    #[test]
+    fn a_cell_holding_both_swaps_at_the_crossover() {
+        let shadow = under();
+        assert!(glyphs(&shadow.under(&over(), &palette(), 0.49)).starts_with('╭'));
+        assert_eq!(
+            glyphs(&shadow.under(&over(), &palette(), 0.51)),
+            "DEFGHIJKDEFGHIJKDEFGHIJK"
+        );
+    }
+
+    /// Both layers dissolve together, so what the eye sees hand over rather
+    /// than cut: the box's glyphs move toward the background as the screen's
+    /// move away from it.
+    #[test]
+    fn the_two_layers_dissolve_in_opposite_directions() {
+        let shadow = under();
+        let ink = |t: f32| {
+            painted_cells(&shadow.under(&over(), &palette(), t))
+                .first()
+                .map(|(_, sgr, _)| sgr.clone())
+                .expect("a cell")
+        };
+        // The box, dissolving toward the background as `t` rises.
+        assert_eq!(ink(0.0), "0;38;2;200;200;200");
+        assert_eq!(ink(0.25), "0;38;2;150;150;150");
+        // Past the crossover it is the screen, rising back out of it.
+        assert_eq!(ink(0.75), "0;38;2;150;150;150");
+        assert_eq!(ink(1.0), "0;38;2;200;200;200");
+    }
+
+    /// Drawn over a session that still owns the screen, so unlike a frame it
+    /// must give the cursor and the editor's own attributes back exactly as it
+    /// found them — and never hide the cursor, which for the second the box is
+    /// up would be seen as the editor's cursor going out.
+    #[test]
+    fn the_composite_leaves_the_cursor_and_the_editors_attributes_alone() {
+        let frame = under().under(&over(), &palette(), 0.5);
+        let mut head = Vec::new();
+        head.extend_from_slice(SYNC_BEGIN);
+        head.extend_from_slice(SAVE_CURSOR);
+        let mut tail = Vec::new();
+        tail.extend_from_slice(RESET_SGR);
+        tail.extend_from_slice(RESTORE_CURSOR);
+        tail.extend_from_slice(SYNC_END);
+        assert!(frame.starts_with(&head), "{:?}", text(&frame));
+        assert!(frame.ends_with(&tail), "{:?}", text(&frame));
+        for hidden in [HIDE_CURSOR, SHOW_CURSOR] {
+            assert!(
+                !frame.windows(hidden.len()).any(|w| w == hidden),
+                "the composite touched the cursor"
+            );
+        }
+        assert!(!frame.contains(&b'\n') && !frame.contains(&b'\r'));
+    }
+
+    /// A cell the notice does not cover is the session's, and a frame of the
+    /// notice's dissolve has no business writing on it — at any `t`, and
+    /// whatever is in the way at the edges.
+    #[test]
+    fn the_composite_never_writes_outside_its_rectangle() {
+        let over = over();
+        let shadow = under();
+        for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            for (at, _, text) in painted_cells(&shadow.under(&over, &palette(), t)) {
+                let (row, col) = at;
+                assert!(
+                    (usize::from(over.top) + 1..usize::from(over.top) + 4).contains(&row),
+                    "row {row} is outside the box at t={t}"
+                );
+                let width = UnicodeWidthChar::width(text.chars().next().expect("a char"))
+                    .expect("a printable");
+                assert!(
+                    col > usize::from(over.left)
+                        && col + width <= usize::from(over.left + over.width) + 1,
+                    "column {col} ({text:?}) is outside the box at t={t}"
+                );
+            }
+        }
+    }
+
+    /// A wide character the rectangle cuts in half is blanked rather than
+    /// written: half a glyph is a broken glyph, and the other half is outside
+    /// the rectangle and not the notice's to repair. The repaint that follows
+    /// the notice is what puts it back whole.
+    #[test]
+    fn a_wide_character_cut_by_an_edge_is_blanked_rather_than_broken() {
+        let mut shadow = Shadow::new(8, 20);
+        // 日 straddles the left edge (0-based columns 2 and 3) and 本 the
+        // right (columns 10 and 11); the box covers 3..11.
+        shadow.feed("\x1b[3;3H日......本".as_bytes());
+        let frame = shadow.under(&over(), &palette(), 1.0);
+        let row: String = painted_cells(&frame)
+            .into_iter()
+            .filter(|((r, _), _, _)| *r == 3)
+            .map(|(_, _, text)| text)
+            .collect();
+        assert_eq!(row, " ...... ", "{row:?}");
+        assert!(!text(&frame).contains('日') && !text(&frame).contains('本'));
+    }
+
+    /// A terminal that grew before the shadow was told has cells the grid does
+    /// not reach. They are blanks, not a gap: the notice covered them, and
+    /// something has to be put back.
+    #[test]
+    fn a_rectangle_off_the_grid_paints_blanks() {
+        let over = Over {
+            top: 6,
+            left: 16,
+            width: 8,
+            rows: vec!["        ".into(), "        ".into(), "        ".into()],
+        };
+        let frame = under().under(&over, &palette(), 1.0);
+        assert_eq!(glyphs(&frame), " ".repeat(24));
+    }
+
+    /// A retired parser has no grid worth reading, so its composite is the
+    /// envelope and nothing else — and the caller, which checks `is_usable`
+    /// first, never asks for one.
+    #[test]
+    fn a_retired_shadow_composites_nothing() {
+        let mut shadow = under();
+        shadow.broken = true;
+        assert!(painted_cells(&shadow.under(&over(), &palette(), 1.0)).is_empty());
     }
 
     /// A frame that paints nothing at all: the wrapper, and only the wrapper.
@@ -700,11 +1137,17 @@ mod tests {
         );
     }
 
-    /// The attach notice saves and restores the cursor around its box (see
-    /// `announce`); the shadow follows both, so a resume after one puts the
-    /// cursor back on the editor's cell, not the box's corner.
+    /// `DECSC`/`DECRC` around an overlay leave the cursor where they found it,
+    /// and the parser follows both.
+    ///
+    /// The attach notice is no longer fed to the shadow — the grid has to hold
+    /// what is *under* the box, not the box (see `pty`'s
+    /// `write_over_session`) — so this is no longer about the notice. It is
+    /// about the envelope: [`Shadow::under`] writes the same pair, and
+    /// anything else drawn over a session has to, or a resume would put the
+    /// cursor back in an overlay's corner rather than on the editor's cell.
     #[test]
-    fn the_notices_save_and_restore_keep_the_cursor_on_the_editors_cell() {
+    fn a_saved_and_restored_cursor_stays_on_the_editors_cell() {
         let mut s = Shadow::new(6, 20);
         s.feed(b"\x1b[2;3Hedit");
         s.feed(

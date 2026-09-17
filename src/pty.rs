@@ -34,6 +34,12 @@
 //! a decoder. And the fade's frames ([`crate::fade`]), written before the
 //! held first paint and after the relay has stopped.
 //!
+//! Neither is ever fed back to the shadow. Both are nvmux's own picture of the
+//! screen rather than the session's bytes, and the notice's frames are
+//! composited *out of* the shadow — so showing them to it would have it
+//! holding nvmux's drawing of the editor with a box in the middle, and nothing
+//! underneath to give back (see [`Attachment::write_over_session`]).
+//!
 //! Three hazards that have no other home in the code:
 //!
 //! * **Take the writer exactly once.** `MasterPty::take_writer()` errors on a
@@ -341,16 +347,41 @@ impl Attachment {
 
     /// Write to the terminal, then let the shadow see what was written.
     ///
-    /// Every byte the terminal is shown while this client has it goes through
-    /// here — the client's output, the attach notice — so the shadow's idea of
-    /// the screen is the terminal's. The write comes first and the shadow
-    /// after: nothing about the shadow may delay or change what the user sees.
+    /// Every byte of the *session's* own screen goes through here, so what the
+    /// shadow holds is what the client drew. The write comes first and the
+    /// shadow after: nothing about the shadow may delay or change what the
+    /// user sees.
+    ///
+    /// nvmux's own notice does not come through here — see
+    /// [`Attachment::write_over_session`].
     fn write_terminal(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         let mut out = std::io::stdout().lock();
         out.write_all(bytes)?;
         out.flush()?;
         drop(out);
         self.shadow_saw(bytes);
+        Ok(())
+    }
+
+    /// Write something of nvmux's own over the session's screen: the attach
+    /// notice, and nothing else.
+    ///
+    /// The shadow must not take these for the session's. Its grid is what the
+    /// *client* drew, not what the terminal shows, and keeping it that way is
+    /// exactly what lets the notice dissolve into the screen instead of into a
+    /// hole — the cells it is covering are still there to be given back (see
+    /// [`crate::shadow::Shadow::under`]). Shown the notice, the shadow would
+    /// hold the box and have nothing underneath it to restore.
+    ///
+    /// The terminal has still been written to behind the shadow's back, so the
+    /// diff its next frame would trust no longer matches the screen and has to
+    /// go — the same reason [`Attachment::release_hold`] invalidates after
+    /// replaying what it held.
+    fn write_over_session(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        write_stdout(bytes)?;
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.invalidate();
+        }
         Ok(())
     }
 
@@ -1271,10 +1302,24 @@ fn pump(
         // drawn for the screen as it is now, and a resize between the drawing
         // and the erasing is seen by both.
         if let Some(p) = popup.as_mut() {
-            let act = p.step(Instant::now(), child_spoke, term::terminal_size());
+            // A held first paint counts as the child still talking, even
+            // though the terminal has not heard a word of it. The box must not
+            // go up over a screen the editor has not been let paint yet: there
+            // would be nothing under it to melt into, and the dissolve that
+            // ends the hold repaints every cell — it would wipe the box off a
+            // screen the popup still believes it is on. Only the lull clock
+            // restarts, as it does for any output, and the box has `GIVE_UP`
+            // against the hold's much shorter `HOLD_CAP`.
+            let busy = child_spoke || attachment.hold.is_some();
+            let act = p.step(
+                Instant::now(),
+                busy,
+                term::terminal_size(),
+                attachment.shadow.as_ref(),
+            );
             match act {
                 announce::Act::Idle => {}
-                announce::Act::Paint(bytes) => attachment.write_terminal(&bytes)?,
+                announce::Act::Paint(bytes) => attachment.write_over_session(&bytes)?,
                 announce::Act::Erase => {
                     // Timed because it is a second full repaint of the session,
                     // a whole second after the switch — the one nvmux asks for
@@ -1822,6 +1867,51 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// The notice is nvmux's own drawing, not the session's, and the shadow
+    /// must not take it for one.
+    ///
+    /// The whole cross-fade rests on this: the grid holds what the client drew
+    /// where the box is, which is the only copy of it anywhere once the
+    /// terminal has been written over. Shown the notice, the shadow would hold
+    /// the box and have nothing underneath it to give back — and
+    /// `has_contents` cannot tell nvmux's border from Neovim's text, so the
+    /// box would also answer for the client's first paint and release a hold
+    /// over a screen the client had not drawn.
+    #[test]
+    fn the_attach_notice_never_reaches_the_shadows_grid() {
+        let mut a = attached_to("exit 0");
+        let mut shadow = shadow::Shadow::new(8, 40);
+        shadow.feed(b"\x1b[4;1Hthe editor drew this");
+        a.shadow = Some(shadow);
+        assert!(a.drawn(), "the fixture put nothing on the screen");
+
+        let over = announce::overlay(
+            "dotfiles",
+            PtySize {
+                rows: 8,
+                cols: 40,
+                ..PtySize::default()
+            },
+        )
+        .expect("a box");
+        a.write_over_session(&announce::plain_bytes(&over, None))
+            .expect("write");
+
+        let colours = crate::palette::Palette {
+            fg: crate::palette::Rgb(200, 200, 200),
+            bg: crate::palette::Rgb(0, 0, 0),
+            ansi: [crate::palette::Rgb(0, 0, 0); 16],
+        };
+        let grid = a.shadow.as_mut().expect("a shadow");
+        let painted = grid.frame(0.0, &colours, shadow::Cursor::Hidden);
+        let frame = String::from_utf8_lossy(&painted).to_string();
+        assert!(
+            frame.contains("the editor drew this"),
+            "the grid lost the editor's screen: {frame:?}"
+        );
+        assert!(!frame.contains('╭'), "the grid took the box: {frame:?}");
     }
 
     /// A stand-in client on a real pty, driven by `sh -c $script`.
