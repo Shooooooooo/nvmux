@@ -177,6 +177,7 @@ class Terminal:
         self.screen = Screen()
         self.lock = threading.Lock()
         self.events = []
+        self.presses = []
         self.record = record
         self.t0 = None
         self.qbuf = b""
@@ -256,8 +257,18 @@ class Terminal:
         with self.lock:
             self.t0 = time.time()
             self.events = []
+            self.presses = []
 
-    def write(self, data, wait=0.0):
+    def write(self, data, wait=0.0, show=None):
+        """`show` is `(cap, label)` for the key strip, or None to say nothing.
+
+        Only the keys worth copying carry one -- `c`, Enter, the arrows, the
+        prefix chord. `type` never passes it, which is what keeps the literal
+        typing of a name or a sentence out of the strip.
+        """
+        if show is not None and self.t0 is not None:
+            with self.lock:
+                self.presses.append((time.time() - self.t0, show[0], show[1]))
         try:
             os.write(self.fd, data)
         except OSError:
@@ -303,7 +314,7 @@ class Terminal:
         for _ in range(limit):
             if self.is_selected(name):
                 return
-            self.write(DOWN, wait=0.55)
+            self.write(DOWN, wait=0.55, show=("\u2193", "move"))
         if not self.is_selected(name):
             self.close()
             sys.exit("the selection never reached %r:\n%s" % (name, self.text()))
@@ -355,45 +366,45 @@ def perform(env):
 
     # 1. the picker, with the sessions that already exist
     term.type("nvmux", per_char=0.09, wait=0.5)
-    term.write(ENTER, wait=0.2)
+    term.write(ENTER, wait=0.2, show=("⏎", "open the picker"))
     term.expect("attach", "the picker")
     time.sleep(1.8)
 
     # 2. make one, which is `c` and a name
-    term.write(b"c", wait=0.6)
+    term.write(b"c", wait=0.6, show=("c", "new session"))
     term.expect("new session name", "the create prompt")
     time.sleep(0.8)
     term.type(NEW_NAME, per_char=0.1, wait=0.9)
-    term.write(ENTER, wait=0.2)
+    term.write(ENTER, wait=0.2, show=("⏎", "create"))
 
     # 3. creating attaches to it
     term.expect("[No Name]", "the new session to paint")
     time.sleep(1.6)
 
-    term.write(b"i", wait=0.5)
+    term.write(b"i", wait=0.5, show=("i", "insert"))
     term.type("a session that outlives the connection", per_char=0.05, wait=0.7)
-    term.write(ESCAPE, wait=1.4)
+    term.write(ESCAPE, wait=1.4, show=("Esc", "normal"))
 
     # 4. detach: the session keeps running, nvmux exits
-    term.write(PREFIX + b"d")
+    term.write(PREFIX + b"d", show=("Ctrl-Space  d", "detach"))
     term.expect("$", "the shell prompt back")
     time.sleep(1.8)
 
     # 5. come back -- the session made a moment ago is in the list now
     term.type("nvmux", per_char=0.09, wait=0.4)
-    term.write(ENTER, wait=0.2)
+    term.write(ENTER, wait=0.2, show=("⏎", "open the picker"))
     term.expect("attach", "the picker again")
     time.sleep(1.4)
     term.select(NEW_NAME)
     time.sleep(0.7)
-    term.write(ENTER, wait=0.2)
+    term.write(ENTER, wait=0.2, show=("⏎", "attach"))
     term.expect("outlives", "the text to still be there")
     time.sleep(2.6)
 
     with term.lock:
-        events = list(term.events)
+        events, presses = list(term.events), list(term.presses)
     term.close()
-    return events
+    return events, presses
 
 
 def check_clean(events):
@@ -423,11 +434,102 @@ def check_clean(events):
         t += step
 
 
-def write_cast(events, path, tail=1.2):
+def sgr_for(attrs):
+    """The SGR that reproduces pyte's idea of the current text attributes.
+
+    Drawing the strip has to reset colour before it erases a line, so it has to
+    put back whatever was set afterwards: a program that sets an attribute at
+    the end of one write and prints at the start of the next would otherwise
+    lose it.
+    """
+    named = {"black": 30, "red": 31, "green": 32, "brown": 33, "blue": 34,
+             "magenta": 35, "cyan": 36, "white": 37}
+    codes = ["0"]
+    for flag, code in (("bold", "1"), ("italics", "3"), ("underscore", "4"),
+                       ("reverse", "7")):
+        if getattr(attrs, flag, False):
+            codes.append(code)
+    for colour, base, ground in ((attrs.fg, 30, "38"), (attrs.bg, 40, "48")):
+        if colour in (None, "default"):
+            continue
+        if colour in named:
+            codes.append(str(named[colour] - 30 + base))
+        elif len(colour) == 6:
+            try:
+                codes.append("%s;2;%d;%d;%d" % (ground, int(colour[0:2], 16),
+                                                int(colour[2:4], 16),
+                                                int(colour[4:6], 16)))
+            except ValueError:
+                pass
+    return ("\x1b[" + ";".join(codes) + "m").encode()
+
+
+def strip_bytes(screen, press, row):
+    """Paint the key strip, and leave the terminal exactly as it was found.
+
+    The cursor goes back by absolute position, taken from the replayed screen,
+    rather than through DECSC/DECRC -- there is one save slot and nvim and the
+    alternate screen both use it.
+    """
+    if press is None:
+        body = ""
+    else:
+        cap, label = press
+        body = "\x1b[7m %s \x1b[0m  \x1b[2m%s\x1b[0m" % (cap, label)
+        # Centred on the visible width, which the escapes are not part of.
+        pad = max(0, (COLS - (len(cap) + 2 + 2 + len(label))) // 2)
+        body = " " * pad + body
+    cy, cx = screen.cursor()
+    return (("\x1b[%d;1H\x1b[0m\x1b[2K" % row).encode()
+            + body.encode()
+            + ("\x1b[%d;%dH" % (cy, cx)).encode()
+            + sgr_for(screen.active.cursor.attrs))
+
+
+def with_key_strip(events, presses, hold=0.9):
+    """Draw the pressed key on rows nvmux does not know exist.
+
+    The cast declares two rows more than the pty nvmux ran on, so the strip sits
+    below everything it draws and can never cover the picker or the editor.
+
+    Re-emitted after *every* write rather than once per press: entering the
+    alternate screen clears the screen, and so does every full repaint, either
+    of which would wipe a strip drawn once and left alone.
+
+    Drawn into the stream rather than composited onto the rendered frames
+    because agg's idle-time limit compresses gaps, so a frame's time is not a
+    cast time -- every badge would drift away from the action it belongs to.
+    In the stream, agg compresses the badge and the content together.
+    """
+    row = ROWS + 2
+    screen = Screen()
+    # A change of what the strip shows, at the moment it changes.
+    changes = [(t, (cap, label)) for t, cap, label in presses]
+    for i, (t, cap, label) in enumerate(presses):
+        nxt = presses[i + 1][0] if i + 1 < len(presses) else None
+        if nxt is None or nxt > t + hold:
+            changes.append((t + hold, None))
+    changes.sort(key=lambda c: c[0])
+
+    out, ci, shown = [], 0, None
+    for t, chunk in events:
+        while ci < len(changes) and changes[ci][0] <= t:
+            shown = changes[ci][1]
+            if out:                       # before this write, at its own moment
+                out.append((changes[ci][0], strip_bytes(screen, shown, row)))
+            ci += 1
+        screen.feed(chunk)
+        out.append((t, chunk + strip_bytes(screen, shown, row)))
+    for t, press in changes[ci:]:
+        out.append((t, strip_bytes(screen, press, row)))
+    return out
+
+
+def write_cast(events, path, tail=1.2, rows=ROWS):
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     with open(path, "w") as f:
         f.write(json.dumps({
-            "version": 2, "width": COLS, "height": ROWS,
+            "version": 2, "width": COLS, "height": rows,
             "theme": THEME,
             "env": {"TERM": "xterm-256color"},
         }) + "\n")
@@ -468,12 +570,13 @@ def main():
         make_sessions(env)
 
         print("recording...")
-        events = perform(env)
+        events, presses = perform(env)
         check_clean(events)
-        print("  %d writes, %.1fs" % (len(events), events[-1][0]))
+        print("  %d writes, %d keys shown, %.1fs"
+              % (len(events), len(presses), events[-1][0]))
 
         cast = os.path.join(tmp, "demo.cast")
-        write_cast(events, cast)
+        write_cast(with_key_strip(events, presses), cast, rows=ROWS + 2)
 
         os.makedirs(os.path.dirname(OUT_GIF), exist_ok=True)
         print("rendering %s ..." % OUT_GIF)
