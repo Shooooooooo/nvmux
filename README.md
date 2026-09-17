@@ -2,7 +2,7 @@
 
 **Detachable Neovim sessions on a remote host, drawn by your own terminal.**
 
-[![CI](https://github.com/Shooooooooo/nvmux-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/Shooooooooo/nvmux-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/Shooooooooo/nvmux/actions/workflows/ci.yml/badge.svg)](https://github.com/Shooooooooo/nvmux/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](Cargo.toml)
 
@@ -10,7 +10,7 @@ Create named Neovim sessions, attach to them, detach, and come back later —
 with the editor running on a remote host while every keystroke and every pixel
 of rendering happens on your own terminal.
 
-![Creating a session from the nvmux picker, typing in Neovim, detaching with the prefix key, then relaunching nvmux and reattaching to the same buffer, with each key shown as it is pressed.](assets/demo.gif)
+![Creating a session from the nvmux picker, typing in Neovim, detaching with the prefix key, then relaunching nvmux and reattaching to the same buffer, with each key shown as it is pressed.](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/demo.gif)
 
 Make a session, type in it, detach, come back: the editor, its buffers and its
 undo history are where you left them.
@@ -41,7 +41,7 @@ which is why it can hand Neovim your terminal rather than an imitation of one.
 ## Install
 
 ```sh
-cargo install --git https://github.com/Shooooooooo/nvmux-rs
+cargo install --git https://github.com/Shooooooooo/nvmux
 ```
 
 Or from a checkout:
