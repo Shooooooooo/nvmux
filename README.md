@@ -10,9 +10,9 @@ Create named Neovim sessions, attach to them, detach, and come back later —
 with the editor running on a remote host while every keystroke and every pixel
 of rendering happens on your own terminal.
 
-![Picking a session from the nvmux picker, attaching, typing in Neovim, detaching with the prefix key, then relaunching nvmux and reattaching to the same buffer.](assets/demo.gif)
+![Creating a session from the nvmux picker, typing in Neovim, detaching with the prefix key, then relaunching nvmux and reattaching to the same buffer.](assets/demo.gif)
 
-Pick a session, type in it, detach, come back: the editor, its buffers and its
+Make a session, type in it, detach, come back: the editor, its buffers and its
 undo history are where you left them.
 
 [Why not tmux?](#why-not-tmux) · [Requirements](#requirements) · [Install](#install) · [Use](#use) · [How it works](#how-it-works) · [Configuration](#configuration)

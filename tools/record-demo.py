@@ -38,7 +38,13 @@ COLS, ROWS = 100, 28
 FPS = 20
 SOCKET = "nvmux-demo"          # a tmux server of our own, not the user's
 SESSION = "rec"
-NAMES = ["api-server", "dotfiles", "scratch", "notes"]
+# The sessions the picker already has when the recording opens, made off camera
+# so the demo starts on a populated list rather than an empty one.
+NAMES = ["api-server", "dotfiles", "notes"]
+
+# And the one made on camera, which the rest of the take then detaches from and
+# comes back to.
+NEW_NAME = "scratch"
 
 # `keys.timeout_ms` defaults to 500ms: the two halves of a prefix chord have to
 # reach nvmux inside that window, so they go in a single send-keys call.
@@ -93,6 +99,27 @@ def expect(needle, what, timeout=10):
             return
         time.sleep(0.2)
     sys.exit("timed out waiting for %s\n%s" % (what, pane()))
+
+
+def is_selected(name):
+    """Whether the picker's marked row is this session."""
+    return any("\u25b8" in line and name in line for line in pane().split("\n"))
+
+
+def select(name, limit=6):
+    """Walk down to a session and make sure that is really where we landed.
+
+    Stepping rather than jumping straight there: it shows the picker being
+    navigated, and it does not care where the selection happened to start or
+    what number the session ended up with. Checked before returning, because
+    attaching to the wrong session would still look plausible on camera.
+    """
+    for _ in range(limit):
+        if is_selected(name):
+            return
+        keys("Down", wait=0.55)
+    if not is_selected(name):
+        sys.exit("the picker's selection never reached %r:\n%s" % (name, pane()))
 
 
 def grab():
@@ -160,32 +187,39 @@ def perform():
     rec.start()
     time.sleep(1.0)
 
+    # 1. the picker, with the sessions that already exist
     literal("nvmux", per_char=0.09, wait=0.5)
     keys("Enter", wait=0.2)
     expect("attach", "the picker")
-    time.sleep(1.6)
+    time.sleep(1.8)
 
-    keys("Down", wait=0.65)
-    keys("Down", wait=1.1)                      # land on `scratch`
-
+    # 2. make one, which is `c` and a name
+    keys("c", wait=0.6)
+    expect("new session name", "the create prompt")
+    time.sleep(0.8)
+    literal(NEW_NAME, per_char=0.1, wait=0.9)
     keys("Enter", wait=0.2)
-    expect("[No Name]", "nvim to paint")
+
+    # 3. creating attaches to it
+    expect("[No Name]", "the new session to paint")
     time.sleep(1.6)
 
     keys("i", wait=0.5)
-    literal("a session that outlives the connection", per_char=0.055, wait=0.7)
+    literal("a session that outlives the connection", per_char=0.05, wait=0.7)
     keys("Escape", wait=1.4)
 
-    tmux("send-keys", "-t", SESSION, PREFIX, "d")   # detach
+    # 4. detach: the session keeps running, nvmux exits
+    tmux("send-keys", "-t", SESSION, PREFIX, "d")
     expect("$", "the shell prompt back")
     time.sleep(1.8)
 
-    literal("nvmux", per_char=0.09, wait=0.4)    # and come straight back to it
+    # 5. come back -- the session made a moment ago is in the list now
+    literal("nvmux", per_char=0.09, wait=0.4)
     keys("Enter", wait=0.2)
     expect("attach", "the picker again")
-    time.sleep(1.5)
-    keys("Down", wait=0.6)
-    keys("Down", wait=1.0)
+    time.sleep(1.4)
+    select(NEW_NAME)
+    time.sleep(0.7)
     keys("Enter", wait=0.2)
     expect("outlives", "the text to still be there")
     time.sleep(2.6)
