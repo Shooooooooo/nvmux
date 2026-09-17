@@ -105,7 +105,7 @@ command = "nvim --headless --listen {sock}"   # {sock} is required
 
 [fade]
 enabled     = true   # dissolve between screens; NO_COLOR forces this off
-duration_ms = 100    # each way — a switch pays it out and then in
+duration_ms = 100    # each way — a switch pays it out, in, and for the notice
 session     = true   # Neovim's own screen dissolves too, in and out
 excursions  = true   # so do the <prefix> ? and <prefix> c screens
 ```

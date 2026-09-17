@@ -48,7 +48,7 @@ use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::palette::{self, Palette};
+use crate::palette::{self, Palette, Rgb};
 use crate::shadow::{Cursor, Shadow};
 
 /// A synchronized update: the terminal presents nothing between these, so a
@@ -58,7 +58,11 @@ pub const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
 pub const SYNC_END: &[u8] = b"\x1b[?2026l";
 
 /// How often a frame goes out. Roughly sixty a second; more is not visible.
-const FRAME: Duration = Duration::from_millis(16);
+///
+/// Shared with [`crate::announce`], whose fade is driven a frame at a time by
+/// the relay loop rather than by a loop of its own: the same pace, from the one
+/// place it is decided.
+pub const FRAME: Duration = Duration::from_millis(16);
 
 /// Whether the config and the environment allow a fade — everything but the
 /// terminal's answer, which is what `main` decides whether to ask for on the
@@ -107,6 +111,50 @@ pub fn session() -> bool {
 /// One direction's length, from the config.
 fn duration() -> Duration {
     Duration::from_millis(crate::config::get().fade.duration_ms)
+}
+
+/// Everything a caller needs to paint its own fade frames: what to interpolate
+/// between, and how long one direction takes.
+///
+/// The drivers below sleep between frames, which the relay loop cannot do — it
+/// has a child to read and keys to pass on. So the attach notice
+/// ([`crate::announce`]) drives a [`Schedule`] from its own `poll` and is
+/// handed one of these to do it with. Plain data, copied out of the config and
+/// the palette once: a caller that read process globals mid-fade would have
+/// states no test could reach, and no palette is ever installed under test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dissolve {
+    /// One direction's length.
+    pub duration: Duration,
+    /// The terminal's own foreground: a glyph fully drawn.
+    pub fg: Rgb,
+    /// The terminal's own background: a glyph fully dissolved.
+    pub bg: Rgb,
+}
+
+impl Dissolve {
+    /// The colour a glyph is drawn in `t` of the way through a fade, or `None`
+    /// for one not being faded at all.
+    ///
+    /// Zero is "do not touch it" rather than "the foreground at no distance" —
+    /// the same rule [`apply`] keeps for a ratatui frame. It is what lets the
+    /// last frame of a fade in set no colour whatever, so the screen it leaves
+    /// behind is byte for byte the one drawn without any fade at all.
+    pub fn colour(self, t: f32) -> Option<Rgb> {
+        (t > 0.0).then(|| self.fg.lerp(self.bg, t))
+    }
+}
+
+/// What to fade with, or `None` when there is no fade — no palette, `NO_COLOR`,
+/// or `[fade] enabled = false`. Exactly the gate [`enabled`] reports, in the
+/// one form a caller that paints its own frames can use.
+pub fn dissolve() -> Option<Dissolve> {
+    let palette = active()?;
+    Some(Dissolve {
+        duration: duration(),
+        fg: palette.fg,
+        bg: palette.bg,
+    })
 }
 
 /// Which way a fade goes.
@@ -167,6 +215,23 @@ impl Schedule {
     /// anything to wait for before the next.
     pub fn finished(&self) -> bool {
         self.finished
+    }
+
+    /// Whether the fade is over by the clock, whether or not its last frame was
+    /// ever asked for.
+    ///
+    /// [`Schedule::next`] is what ends a fade being drawn frame by frame, and
+    /// it can only end one that is asked for. [`crate::announce`] cannot
+    /// promise that: its frames go out only at a lull in the session's own
+    /// output, and a session that never goes quiet would otherwise hold a fade
+    /// open for ever. So it asks the clock instead, and drains whatever is left
+    /// of the schedule when the answer is yes — which is how a fade nobody
+    /// could draw still ends on exactly its last value.
+    ///
+    /// The same reckoning as `next`'s, down to the frame it looks ahead by, so
+    /// the two can never disagree about which pass a fade ends on.
+    pub fn over(&self, now: Instant) -> bool {
+        self.finished || now.saturating_duration_since(self.started) + FRAME >= self.duration
     }
 }
 
@@ -395,6 +460,31 @@ mod tests {
         assert!(jumped > first + 0.4, "{first} -> {jumped}");
         assert_eq!(s.next(t0 + Duration::from_secs(10)), Some(1.0));
         assert_eq!(s.next(t0 + Duration::from_secs(20)), None);
+    }
+
+    /// The clock's own answer, for a caller that cannot draw every frame. It
+    /// must agree with `next` exactly — the pass on which one says the fade is
+    /// over is the pass on which the other hands out its end value — or a fade
+    /// would end a frame early or a frame late depending on who asked.
+    #[test]
+    fn a_schedule_is_over_on_the_same_frame_it_hands_out_its_last() {
+        let t0 = Instant::now();
+        let mut s = Schedule::start(Duration::from_millis(100), Direction::Out, t0);
+        let mut now = t0;
+        loop {
+            let over = s.over(now);
+            let Some(t) = s.next(now) else {
+                assert!(over, "a spent schedule is over whatever the clock says");
+                break;
+            };
+            assert_eq!(over, t == 1.0, "disagreed at {:?}", now - t0);
+            now += FRAME;
+        }
+
+        // And a schedule nobody ever read is over once its time is up.
+        let cold = Schedule::start(Duration::from_millis(100), Direction::In, t0);
+        assert!(!cold.over(t0));
+        assert!(cold.over(t0 + Duration::from_millis(100)));
     }
 
     /// Exactly one frame puts the cursor back: the last of a fade in. Every
