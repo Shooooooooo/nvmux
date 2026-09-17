@@ -194,6 +194,41 @@ pub fn reset_screen() {
     let _ = out.flush();
 }
 
+/// Home the cursor and erase the line it is on. Not part of [`RESET`], which a
+/// signal handler writes and which every nvmux screen shares: this is only for
+/// the two paths that hang up on a client and then end at a shell.
+const ERASE_LINE: &[u8] = b"\r\x1b[2K";
+
+/// Wipe the line a hung-up client printed its last words on.
+///
+/// nvmux retires a client with SIGHUP, and Neovim's shutdown runs its terminal
+/// restore *before* its signal handler prints — leaving the alternate screen
+/// first, so `Nvim: Caught deadly signal 'SIGHUP'` lands on the user's own
+/// screen rather than on the one being torn down. The detach path relays all of
+/// that on purpose (see [`crate::pty::Attachment::drain_until_eof`]): the
+/// restore sequence carries things nvmux does not send itself — the kitty
+/// keyboard pop, bracketed paste, the title — so refusing to relay it would
+/// leave the terminal worse off than the stray line does.
+///
+/// So the line goes afterwards instead, once the client is gone and [`RESET`]
+/// has left the alternate screen — which restores the cursor to where the
+/// client printed from, so that is the line this erases. Nothing of the
+/// client's output is filtered on the way through; nvmux cleans up after it in
+/// nvmux's own bytes, which is what keeps "the bytes pass through untouched"
+/// true.
+///
+/// Erasing it is safe because of where it is: the shell's cursor was at the
+/// start of an empty line when nvmux was launched, and that is the line the
+/// prompt is about to be drawn on anyway. Most prompts — zsh, starship,
+/// powerlevel10k, fish — already erase it and so already hide this; a bare
+/// `PS1='$ '` is what leaves it standing.
+pub fn erase_hung_up_clients_line() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(ERASE_LINE);
+    let _ = out.flush();
+}
+
 /// Drop the state inherited from a client cut off mid-frame, without saying
 /// anything about whose screen it is.
 ///
@@ -462,6 +497,20 @@ mod tests {
             RESET.ends_with(MOUSE_OFF),
             "RESET does not end with MOUSE_OFF"
         );
+    }
+
+    /// The erase is the hangup paths' alone. Folding it into `RESET` would put
+    /// it in the signal handler and on every error path that borrows the same
+    /// string — wiping a line of someone's scrollback on a `kill` nvmux did not
+    /// ask for, when no client had written anything there to clean up.
+    #[test]
+    fn erasing_the_hung_up_clients_line_is_not_part_of_the_shared_reset() {
+        assert_eq!(ERASE_LINE, b"\r\x1b[2K");
+        assert!(!contains(RESET, ERASE_LINE));
+        assert!(!contains(INHERITED, ERASE_LINE));
+        // Home first, so it erases the line the cursor is on wherever the
+        // client left the column, and leaves the shell a cursor at column 0.
+        assert!(ERASE_LINE.starts_with(b"\r"));
     }
 
     /// The off string undoes exactly the modes the on string sets, last first.

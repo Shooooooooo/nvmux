@@ -44,17 +44,15 @@ NAMES = ["api-server", "dotfiles", "scratch", "notes"]
 # reach nvmux inside that window, so they go in a single send-keys call.
 PREFIX = "C-Space"
 
-# A green `$`, and -- the part that matters -- an erase-line and a carriage
-# return before it.
+# A green `$`, preceded by an erase-line and a carriage return.
 #
-# nvmux detaches by sending SIGHUP to the `--remote-ui` client, and Neovim's
-# shutdown leaves the alternate screen *before* its signal handler prints, so
-# `Nvim: Caught deadly signal 'SIGHUP'` lands on the shell's own screen rather
-# than the one being torn down. Real prompts paint over it, because zsh,
-# starship, powerlevel10k and fish all erase their line before drawing; a bare
-# `PS1='$ '` is the one case bare enough to leave it standing, which is exactly
-# what `bash --norc --noprofile` would give this recording. So the prompt here
-# clears its line like a real one, and `check_clean` below holds it to that.
+# The erase is not load-bearing any more: `term::erase_hung_up_clients_line`
+# wipes the line a retired client printed its `Caught deadly signal 'SIGHUP'` on,
+# so nvmux leaves a clean screen whatever prompt follows it. It stays because
+# every prompt worth imitating does this -- zsh, starship, powerlevel10k and
+# fish all erase their line before drawing -- and `bash --norc --noprofile` with
+# a bare `PS1='$ '` is unusually bare for a recording meant to look like a
+# terminal someone uses. `check_clean` below holds the result to it either way.
 #
 # `\[ \]` marks both sequences zero-width, so bash still counts columns right.
 PROMPT = "\\[\\e[2K\\]\\[\\r\\]\\[\\e[38;5;71m\\]$\\[\\e[0m\\] "

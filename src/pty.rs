@@ -1125,6 +1125,10 @@ pub fn relay(
             raw.restore();
             attachment.reap();
             term::reset_screen();
+            // After the reset, not before: leaving the alternate screen puts the
+            // cursor back on the line the client printed its hangup message
+            // from, which is the line to erase.
+            term::erase_hung_up_clients_line();
             Ok((other, None))
         }
         Err(e) => {
@@ -1137,6 +1141,9 @@ pub fn relay(
             raw.restore();
             attachment.reap();
             term::reset_screen();
+            // The same hangup, so the same stray line — and here the error is
+            // about to be printed onto it.
+            term::erase_hung_up_clients_line();
             Err(e)
         }
     }
