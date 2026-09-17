@@ -3,30 +3,55 @@
 
     python3 tools/record-demo.py            # writes assets/demo.gif
 
-nvmux is a full-screen program that asks the terminal questions on startup
-(cursor position, device attributes), so it cannot be driven from a bare pipe
--- something has to answer. This script uses tmux as that terminal: nvmux runs
-inside a detached tmux session, `send-keys` types at it, and `capture-pane`
-screenshots the pane on a fixed tick. The frames become an asciicast, which
-`agg` renders to a GIF.
+nvmux is driven on a pty here, and every byte it writes is recorded with the
+time it was written, which becomes an asciicast for `agg` to render.
+
+Both halves of that matter, and the reason is the fade.
+
+**The pty answers.** nvmux dissolves between screens by interpolating toward
+the terminal's own background, so at startup it asks for it (OSC 10 and 11, see
+`src/palette.rs`). Nothing answers in a headless container, and an unanswered
+query is not a degraded fade but no fade at all -- `fade::enabled` is false and
+every transition is a hard cut. So this script answers the colour query itself,
+with THEME, and hands agg that same theme so the dissolve ends on exactly the
+background it renders. It answers the rest of the startup handshake too (cursor
+position, device attributes, the kitty keyboard query), without which nvmux does
+not start.
+
+**The recording is the byte stream, not screenshots.** A fade is about five
+repaints inside `duration_ms`, 100ms by default. Sampling the screen even 20
+times a second catches two of them and turns a dissolve into a step. Recording
+what nvmux actually wrote loses nothing, and agg replays it at the speed it
+happened.
+
+Driving on a pty means there is no `capture-pane` to read back, so the checks
+render the stream with pyte -- through `Screen` below, since pyte has no
+alternate screen of its own.
 
 Needs, all on PATH:
-  * tmux
   * nvim >= 0.11
   * agg          https://github.com/asciinema/agg/releases
+  * python3 -m pip install pyte
   * a release build of nvmux (cargo build --release)
 
-Everything it touches is scratch: a config under a temporary directory, a tmux
-server on its own socket, and demo sessions it creates and kills itself. Your
-own nvmux sessions and config are left alone.
+Everything it touches is scratch: a config under a temporary directory, and
+demo sessions it creates itself. Your own nvmux sessions and config are left
+alone.
 """
 
+import codecs
+import fcntl
 import json
 import os
+import pty
+import re
+import select
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import threading
 import time
 
@@ -35,9 +60,12 @@ NVMUX = os.path.join(ROOT, "target", "release", "nvmux")
 OUT_GIF = os.path.join(ROOT, "assets", "demo.gif")
 
 COLS, ROWS = 100, 28
-FPS = 20
-SOCKET = "nvmux-demo"          # a tmux server of our own, not the user's
-SESSION = "rec"
+
+# A fade is repaints about 20ms apart, so the cap has to clear 50fps or the
+# dissolve is thinned back out to the steps this script exists to avoid.
+# `check_clean` samples at the same rate, since this is what a frame can show.
+FPS_CAP = 60
+
 # The sessions the picker already has when the recording opens, made off camera
 # so the demo starts on a populated list rather than an empty one.
 NAMES = ["api-server", "dotfiles", "notes"]
@@ -46,216 +74,379 @@ NAMES = ["api-server", "dotfiles", "notes"]
 # comes back to.
 NEW_NAME = "scratch"
 
-# `keys.timeout_ms` defaults to 500ms: the two halves of a prefix chord have to
-# reach nvmux inside that window, so they go in a single send-keys call.
-PREFIX = "C-Space"
+# One theme, used twice: answered to nvmux over OSC so its fade knows what it is
+# dissolving into, and written into the asciicast header so agg renders with the
+# same colours. They have to agree, or the dissolve ends a shade off its own
+# background. agg honours the header's theme; `--theme` is not passed for that
+# reason.
+THEME = {
+    "fg": "#cdd0d4",
+    "bg": "#12131a",
+    "palette": ":".join([
+        "#21242b", "#e06c75", "#98c379", "#e5c07b",
+        "#61afef", "#c678dd", "#56b6c2", "#abb2bf",
+        "#3a3f4b", "#e88b93", "#b3d99d", "#efd8a1",
+        "#8cc6f4", "#d7a3e8", "#84ccd4", "#cdd0d4",
+    ]),
+}
 
-# A green `$`, preceded by an erase-line and a carriage return.
-#
-# The erase is not load-bearing any more: `term::erase_hung_up_clients_line`
-# wipes the line a retired client printed its `Caught deadly signal 'SIGHUP'` on,
-# so nvmux leaves a clean screen whatever prompt follows it. It stays because
-# every prompt worth imitating does this -- zsh, starship, powerlevel10k and
-# fish all erase their line before drawing -- and `bash --norc --noprofile` with
-# a bare `PS1='$ '` is unusually bare for a recording meant to look like a
-# terminal someone uses. `check_clean` below holds the result to it either way.
-#
-# `\[ \]` marks both sequences zero-width, so bash still counts columns right.
 PROMPT = "\\[\\e[2K\\]\\[\\r\\]\\[\\e[38;5;71m\\]$\\[\\e[0m\\] "
 
-
-def tmux(*args, capture=False):
-    cmd = ["tmux", "-L", SOCKET, *args]
-    if capture:
-        return subprocess.run(cmd, capture_output=True, text=True).stdout
-    subprocess.run(cmd, capture_output=True)
-
-
-def keys(*ks, wait=0.0):
-    tmux("send-keys", "-t", SESSION, *ks)
-    if wait:
-        time.sleep(wait)
+# What the keys are as bytes, now that there is no `send-keys` to name them for
+# us. Ctrl-Space is NUL, which is the whole reason it works as a prefix.
+ENTER = b"\r"
+ESCAPE = b"\x1b"
+DOWN = b"\x1b[B"
+PREFIX = b"\x00"
 
 
-def literal(text, wait=0.0, per_char=0.0):
-    if per_char:
-        for ch in text:
-            tmux("send-keys", "-t", SESSION, "-l", ch)
-            time.sleep(per_char)
-    else:
-        tmux("send-keys", "-t", SESSION, "-l", text)
-    if wait:
-        time.sleep(wait)
+def hex_to_osc(colour):
+    """`#rrggbb` as the `rgb:rrrr/gggg/bbbb` an OSC reply carries."""
+    r, g, b = (colour[1:3], colour[3:5], colour[5:7])
+    return "rgb:%s%s/%s%s/%s%s" % (r, r, g, g, b, b)
 
 
-def pane():
-    return tmux("capture-pane", "-t", SESSION, "-p", capture=True)
+class Screen:
+    """A terminal screen, only as far as the checks in here need one.
 
+    Two pyte screens with the alternate-screen sequences switching between
+    them: pyte has no `?1049` of its own, so without this the picker would go
+    on showing the editor's buffer after a detach, and every check that reads
+    the screen afterwards would be reading the wrong one.
 
-def expect(needle, what, timeout=10):
-    end = time.time() + timeout
-    while time.time() < end:
-        if needle in pane():
-            return
-        time.sleep(0.2)
-    sys.exit("timed out waiting for %s\n%s" % (what, pane()))
-
-
-def is_selected(name):
-    """Whether the picker's marked row is this session."""
-    return any("\u25b8" in line and name in line for line in pane().split("\n"))
-
-
-def select(name, limit=6):
-    """Walk down to a session and make sure that is really where we landed.
-
-    Stepping rather than jumping straight there: it shows the picker being
-    navigated, and it does not care where the selection happened to start or
-    what number the session ended up with. Checked before returning, because
-    attaching to the wrong session would still look plausible on camera.
+    `?1049` also saves the cursor on the way in and restores it on the way out,
+    and that half is not a detail here. It is what puts the cursor back on the
+    line a hung-up client printed its last words on, which is the line nvmux
+    then erases. Model the switch without the cursor and the erase lands one
+    line low, and `check_clean` reports a message that a real terminal never
+    shows.
     """
-    for _ in range(limit):
-        if is_selected(name):
-            return
-        keys("Down", wait=0.55)
-    if not is_selected(name):
-        sys.exit("the picker's selection never reached %r:\n%s" % (name, pane()))
+
+    ALT = re.compile(rb"\x1b\[\?1049([hl])")
+
+    def __init__(self, cols=COLS, rows=ROWS):
+        import pyte
+        self.primary = pyte.Screen(cols, rows)
+        self.alt = pyte.Screen(cols, rows)
+        self.streams = {
+            id(self.primary): pyte.Stream(self.primary),
+            id(self.alt): pyte.Stream(self.alt),
+        }
+        self.active = self.primary
+        self.saved = None          # one slot, as a terminal has
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    def feed(self, data):
+        pos = 0
+        for m in self.ALT.finditer(data):
+            self._feed(data[pos:m.end()])
+            if m.group(1) == b"h":
+                self.saved = (self.primary.cursor.y, self.primary.cursor.x)
+                # Entering clears, as it does on a real terminal. Without this
+                # the alternate screen still holds the last session's picture,
+                # so a check waiting for the picker matches the *previous*
+                # picker before this one has painted a cell.
+                self.alt.reset()
+                self.active = self.alt
+            else:
+                self.active = self.primary
+                if self.saved is not None:
+                    self.primary.cursor_position(self.saved[0] + 1,
+                                                 self.saved[1] + 1)
+            pos = m.end()
+        self._feed(data[pos:])
+
+    def _feed(self, chunk):
+        if chunk:
+            self.streams[id(self.active)].feed(self.decoder.decode(chunk))
+
+    def lines(self):
+        return [line.rstrip() for line in self.active.display]
+
+    def text(self):
+        return "\n".join(self.lines())
+
+    def cursor(self):
+        return self.active.cursor.y + 1, self.active.cursor.x + 1
 
 
-def grab():
-    """One screenshot, as a full-screen repaint."""
-    out = tmux("capture-pane", "-t", SESSION, "-e", "-p", capture=True)
-    lines = out.split("\n")
-    if lines and lines[-1] == "":
-        lines.pop()
-    lines = lines[:ROWS] + [""] * max(0, ROWS - len(lines))
-    return "\x1b[H\x1b[2J" + "\r\n".join(l + "\x1b[0m" for l in lines)
+class Terminal:
+    """nvmux on a pty: answers what it asks, records what it writes."""
+
+    def __init__(self, argv, env, record=False):
+        self.screen = Screen()
+        self.lock = threading.Lock()
+        self.events = []
+        self.record = record
+        self.t0 = None
+        self.qbuf = b""
+        self.closed = False
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            os.execvpe(argv[0], argv, env)
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", ROWS, COLS, 0, 0))
+        self.reader = threading.Thread(target=self._read_loop, daemon=True)
+        self.reader.start()
+
+    # --- the answering half ------------------------------------------------
+    def _replies(self, data):
+        """Reply to the startup handshake, and to the colour query the fade
+        depends on. Matched queries are cut out of the buffer so nothing is
+        answered twice; a short tail is kept so a query split across two reads
+        is still seen whole."""
+        self.qbuf += data
+        out = []
+
+        def take(pattern, answer):
+            def sub(m):
+                out.append(answer(m) if callable(answer) else answer)
+                return b""
+            self.qbuf = re.sub(pattern, sub, self.qbuf)
+
+        row, col = self.screen.cursor()
+        take(rb"\x1b\[6n", ("\x1b[%d;%dR" % (row, col)).encode())
+        take(rb"\x1b\[5n", b"\x1b[0n")
+        take(rb"\x1b\[>0?q", b"\x1bP>|answering-pty(1)\x1b\\")
+        take(rb"\x1b\[>0?c", b"\x1b[>0;279;0c")
+        take(rb"\x1b\[0?c", b"\x1b[?62;1;2;6;9;15;22;29c")
+        take(rb"\x1b\[\?u", b"\x1b[?0u")
+        take(rb"\x1bP\+q([0-9A-Fa-f;]*)\x1b\\",
+             lambda m: b"\x1bP0+r" + m.group(1) + b"\x1b\\")
+        # The colour query: without these three the fade never runs.
+        take(rb"\x1b\]10;\?(?:\x1b\\|\x07)",
+             ("\x1b]10;%s\x1b\\" % hex_to_osc(THEME["fg"])).encode())
+        take(rb"\x1b\]11;\?(?:\x1b\\|\x07)",
+             ("\x1b]11;%s\x1b\\" % hex_to_osc(THEME["bg"])).encode())
+        pal = THEME["palette"].split(":")
+        take(rb"\x1b\]4;(\d+);\?(?:\x1b\\|\x07)",
+             lambda m: ("\x1b]4;%s;%s\x1b\\"
+                        % (m.group(1).decode(),
+                           hex_to_osc(pal[int(m.group(1)) % len(pal)]))).encode())
+        self.qbuf = self.qbuf[-64:]
+        return out
+
+    def _read_loop(self):
+        while not self.closed:
+            try:
+                r, _, _ = select.select([self.fd], [], [], 0.05)
+            except (OSError, ValueError):
+                return
+            if not r:
+                continue
+            try:
+                chunk = os.read(self.fd, 65536)
+            except OSError:
+                return
+            if not chunk:
+                return
+            now = time.time()
+            with self.lock:
+                self.screen.feed(chunk)
+                if self.record and self.t0 is not None:
+                    self.events.append((now - self.t0, chunk))
+                for reply in self._replies(chunk):
+                    try:
+                        os.write(self.fd, reply)
+                    except OSError:
+                        pass
+
+    # --- driving -----------------------------------------------------------
+    def start_recording(self):
+        with self.lock:
+            self.t0 = time.time()
+            self.events = []
+
+    def write(self, data, wait=0.0):
+        try:
+            os.write(self.fd, data)
+        except OSError:
+            pass
+        if wait:
+            time.sleep(wait)
+
+    def type(self, text, per_char=0.0, wait=0.0):
+        if per_char:
+            for ch in text:
+                self.write(ch.encode())
+                time.sleep(per_char)
+        else:
+            self.write(text.encode())
+        if wait:
+            time.sleep(wait)
+
+    def text(self):
+        with self.lock:
+            return self.screen.text()
+
+    def expect(self, needle, what, timeout=15):
+        end = time.time() + timeout
+        while time.time() < end:
+            if needle in self.text():
+                return
+            time.sleep(0.1)
+        self.close()
+        sys.exit("timed out waiting for %s\n%s" % (what, self.text()))
+
+    def is_selected(self, name):
+        return any("\u25b8" in line and name in line
+                   for line in self.text().split("\n"))
+
+    def select(self, name, limit=6):
+        """Step down to a session, and make sure that is where we landed.
+
+        Stepping rather than jumping: it shows the picker being navigated, and
+        it does not care where the selection started or what number the session
+        was given. Checked before returning, because attaching to the wrong one
+        would look perfectly plausible on camera.
+        """
+        for _ in range(limit):
+            if self.is_selected(name):
+                return
+            self.write(DOWN, wait=0.55)
+        if not self.is_selected(name):
+            self.close()
+            sys.exit("the selection never reached %r:\n%s" % (name, self.text()))
+
+    def close(self):
+        self.closed = True
+        try:
+            os.kill(self.pid, 9)
+            os.waitpid(self.pid, 0)
+        except (ProcessLookupError, ChildProcessError):
+            pass
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
 
 
-class Recorder(threading.Thread):
-    """Screenshot on a tick, keeping only the frames that changed."""
-
-    def __init__(self):
-        super().__init__(daemon=True)
-        self.frames, self.stop_flag = [], False
-
-    def run(self):
-        t0, last = time.time(), None
-        while not self.stop_flag:
-            frame = grab()
-            if frame != last:
-                self.frames.append((time.time() - t0, frame))
-                last = frame
-            time.sleep(1.0 / FPS)
-
-    def stop(self):
-        self.stop_flag = True
-        self.join(timeout=2)
-
-
-def start_pane(env, command=None):
-    """A fresh tmux server, because a running one hands new sessions its own
-    environment rather than the one passed here."""
-    tmux("kill-server")
-    time.sleep(0.8)
-    argv = ["tmux", "-L", SOCKET, "new-session", "-d", "-s", SESSION,
-            "-x", str(COLS), "-y", str(ROWS)]
-    argv += [command] if command else ["bash", "--norc", "--noprofile"]
-    subprocess.run(argv, env=env, check=True)
-    time.sleep(1.5)
+def shell(env, record=False):
+    """A bash on the pty, so the recording shows `nvmux` being typed at a
+    prompt rather than starting from nowhere."""
+    term = Terminal(["bash", "--norc", "--noprofile"], env, record=record)
+    time.sleep(1.0)
+    term.type("export PS1='%s'; clear\n" % PROMPT, wait=1.2)
+    return term
 
 
 def make_sessions(env):
-    """Create the sessions the demo browses, off camera."""
-    start_pane(env, command=NVMUX)
-    expect("attach", "the picker")
+    """Create the sessions the picker already has, off camera."""
+    term = shell(env)
+    term.type("nvmux\n", wait=0.3)
+    term.expect("attach", "the picker")
     for name in NAMES:
-        keys("c", wait=1.2)
-        expect("new session name", "the create prompt")
-        literal(name, wait=0.5)
-        keys("Enter", wait=4.0)                 # creates, then attaches
-        tmux("send-keys", "-t", SESSION, PREFIX, "Space")
-        time.sleep(2.0)
-        expect("attach", "the picker after creating %s" % name)
+        term.write(b"c", wait=1.0)
+        term.expect("new session name", "the create prompt")
+        term.type(name, wait=0.5)
+        term.write(ENTER, wait=4.0)                  # creates, then attaches
+        term.write(PREFIX + b" ", wait=2.0)          # one write: the chord has
+        term.expect("attach", "the picker after %s" % name)   # 500ms to land
         print("  created %s" % name)
-    keys("q", wait=1.0)
+    term.write(b"q", wait=1.0)
+    term.close()
 
 
-def perform():
+def perform(env):
     """The recorded take."""
-    rec = Recorder()
-    rec.start()
+    term = shell(env, record=True)
+    term.start_recording()
     time.sleep(1.0)
 
     # 1. the picker, with the sessions that already exist
-    literal("nvmux", per_char=0.09, wait=0.5)
-    keys("Enter", wait=0.2)
-    expect("attach", "the picker")
+    term.type("nvmux", per_char=0.09, wait=0.5)
+    term.write(ENTER, wait=0.2)
+    term.expect("attach", "the picker")
     time.sleep(1.8)
 
     # 2. make one, which is `c` and a name
-    keys("c", wait=0.6)
-    expect("new session name", "the create prompt")
+    term.write(b"c", wait=0.6)
+    term.expect("new session name", "the create prompt")
     time.sleep(0.8)
-    literal(NEW_NAME, per_char=0.1, wait=0.9)
-    keys("Enter", wait=0.2)
+    term.type(NEW_NAME, per_char=0.1, wait=0.9)
+    term.write(ENTER, wait=0.2)
 
     # 3. creating attaches to it
-    expect("[No Name]", "the new session to paint")
+    term.expect("[No Name]", "the new session to paint")
     time.sleep(1.6)
 
-    keys("i", wait=0.5)
-    literal("a session that outlives the connection", per_char=0.05, wait=0.7)
-    keys("Escape", wait=1.4)
+    term.write(b"i", wait=0.5)
+    term.type("a session that outlives the connection", per_char=0.05, wait=0.7)
+    term.write(ESCAPE, wait=1.4)
 
     # 4. detach: the session keeps running, nvmux exits
-    tmux("send-keys", "-t", SESSION, PREFIX, "d")
-    expect("$", "the shell prompt back")
+    term.write(PREFIX + b"d")
+    term.expect("$", "the shell prompt back")
     time.sleep(1.8)
 
     # 5. come back -- the session made a moment ago is in the list now
-    literal("nvmux", per_char=0.09, wait=0.4)
-    keys("Enter", wait=0.2)
-    expect("attach", "the picker again")
+    term.type("nvmux", per_char=0.09, wait=0.4)
+    term.write(ENTER, wait=0.2)
+    term.expect("attach", "the picker again")
     time.sleep(1.4)
-    select(NEW_NAME)
+    term.select(NEW_NAME)
     time.sleep(0.7)
-    keys("Enter", wait=0.2)
-    expect("outlives", "the text to still be there")
+    term.write(ENTER, wait=0.2)
+    term.expect("outlives", "the text to still be there")
     time.sleep(2.6)
 
-    rec.stop()
-    return rec.frames
+    with term.lock:
+        events = list(term.events)
+    term.close()
+    return events
 
 
-def check_clean(frames):
-    """Refuse to ship a recording carrying the departing client's last words.
+def check_clean(events):
+    """Refuse to ship a recording showing the departing client's last words.
 
-    See PROMPT: the prompt is what covers that line, so a frame still holding it
-    means the cover failed. Checked across every frame rather than once at the
-    end, because at 20fps the message can be caught merely flashing between
-    Neovim printing it and bash redrawing over it.
+    nvmux erases that line itself (`term::erase_hung_up_clients_line`), so the
+    bytes are in the stream and the screen ends up clean. Hence replaying and
+    reading the *rendered* screen rather than searching the bytes, which would
+    find the line nvmux already wiped.
+
+    Sampled at the rate agg renders with, because that is what decides what a
+    frame can show. Checking after every write instead reports the gap between
+    the client printing the line and nvmux erasing it -- two writes about a
+    third of a millisecond apart, some fifty times shorter than one frame, and
+    a state nothing ever draws.
     """
-    stray = [round(t, 1) for t, frame in frames if "deadly signal" in frame]
-    if stray:
-        sys.exit("the departing client's signal message reached the recording "
-                 "at %ss; the prompt is meant to erase it" % stray)
+    screen = Screen()
+    step, i, t = 1.0 / FPS_CAP, 0, 0.0
+    end = events[-1][0] if events else 0.0
+    while t <= end + step:
+        while i < len(events) and events[i][0] <= t:
+            screen.feed(events[i][1])
+            i += 1
+        if "deadly signal" in screen.text():
+            sys.exit("the departing client's signal message is on screen at "
+                     "%.2fs, for a whole frame; nvmux is meant to erase it" % t)
+        t += step
 
 
-def write_cast(frames, path, tail=1.2):
+def write_cast(events, path, tail=1.2):
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     with open(path, "w") as f:
-        f.write(json.dumps({"version": 2, "width": COLS, "height": ROWS,
-                            "env": {"TERM": "xterm-256color"}}) + "\n")
-        for t, frame in frames:
-            f.write(json.dumps([round(t, 3), "o", frame]) + "\n")
-        if frames:
-            f.write(json.dumps([round(frames[-1][0] + tail, 3), "o", ""]) + "\n")
+        f.write(json.dumps({
+            "version": 2, "width": COLS, "height": ROWS,
+            "theme": THEME,
+            "env": {"TERM": "xterm-256color"},
+        }) + "\n")
+        for t, chunk in events:
+            text = decoder.decode(chunk)
+            if text:
+                f.write(json.dumps([round(t, 3), "o", text]) + "\n")
+        if events:
+            f.write(json.dumps([round(events[-1][0] + tail, 3), "o", ""]) + "\n")
 
 
 def main():
-    for tool in ("tmux", "nvim", "agg"):
+    for tool in ("nvim", "agg"):
         if not shutil.which(tool):
             sys.exit("%s is not on PATH; see the header of this script" % tool)
+    try:
+        import pyte                                   # noqa: F401
+    except ImportError:
+        sys.exit("pyte is needed for the screen checks: pip install pyte")
     if not os.path.exists(NVMUX):
         sys.exit("build nvmux first: cargo build --release")
 
@@ -268,33 +459,29 @@ def main():
     env["PATH"] = os.path.join(ROOT, "target", "release") + os.pathsep + env["PATH"]
     env["NVMUX_CONFIG"] = cfg
     env["TERM"] = "xterm-256color"
-    env["PS1"] = PROMPT
+    env["COLORTERM"] = "truecolor"
+    env.pop("NVMUX", None)
+    env.pop("NO_COLOR", None)                         # it would turn the fade off
 
     try:
         print("creating demo sessions...")
         make_sessions(env)
 
         print("recording...")
-        start_pane(env)
-        tmux("send-keys", "-t", SESSION, "-l",
-             "export PS1='%s'; clear" % PROMPT)
-        keys("Enter", wait=1.0)
-        frames = perform()
-        check_clean(frames)
+        events = perform(env)
+        check_clean(events)
+        print("  %d writes, %.1fs" % (len(events), events[-1][0]))
 
         cast = os.path.join(tmp, "demo.cast")
-        write_cast(frames, cast)
-        print("  %d frames, %.1fs" % (len(frames), frames[-1][0]))
+        write_cast(events, cast)
 
         os.makedirs(os.path.dirname(OUT_GIF), exist_ok=True)
         print("rendering %s ..." % OUT_GIF)
-        subprocess.run(["agg", "--font-size", "15", "--theme", "asciinema",
-                        "--fps-cap", str(FPS), "--idle-time-limit", "1.5",
-                        cast, OUT_GIF], check=True)
+        # No --theme: the cast header carries it.
+        subprocess.run(["agg", "--font-size", "15", "--fps-cap", str(FPS_CAP),
+                        "--idle-time-limit", "1.5", cast, OUT_GIF], check=True)
         print("wrote %s (%.0f KB)" % (OUT_GIF, os.path.getsize(OUT_GIF) / 1024))
     finally:
-        # Only this script's tmux server goes; the user's is on another socket.
-        tmux("kill-server")
         shutil.rmtree(tmp, ignore_errors=True)
         print("note: the demo's nvmux sessions are still running; "
               "remove them with `x` in the picker if you do not want them.")
