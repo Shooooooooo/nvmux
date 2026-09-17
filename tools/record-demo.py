@@ -253,40 +253,64 @@ class Terminal:
 
     # --- the answering half ------------------------------------------------
     def _replies(self, data):
-        """Reply to the startup handshake, and to the colour query the fade
-        depends on. Matched queries are cut out of the buffer so nothing is
-        answered twice; a short tail is kept so a query split across two reads
-        is still seen whole."""
+        """Answer the queries in this chunk, **in the order they were asked**.
+
+        The order is the whole thing. nvmux ends its colour query with a DSR
+        (`ESC [ 5 n`) precisely because every terminal answers it, so the reply
+        to that is its signal that the colour replies before it have all
+        arrived -- see the note in `src/palette.rs`. Answer the DSR first and
+        nvmux stops reading right there, and the OSC replies still in flight are
+        left in its input to be read as keystrokes by whatever comes next. The
+        picker takes the `/` inside `rgb:cdcd/d0d0/d4d4` as its filter key and
+        types the rest of the reply into it, which is what wiped the hint row
+        and hung this script for a whole afternoon.
+
+        So the queries are found by position and answered in that order, the way
+        a terminal would. Matched spans are cut out so nothing is answered
+        twice, and a short tail is kept so a query split across two reads is
+        still seen whole.
+        """
         self.qbuf += data
-        out = []
-
-        def take(pattern, answer):
-            def sub(m):
-                out.append(answer(m) if callable(answer) else answer)
-                return b""
-            self.qbuf = re.sub(pattern, sub, self.qbuf)
-
         row, col = self.screen.cursor()
-        take(rb"\x1b\[6n", ("\x1b[%d;%dR" % (row, col)).encode())
-        take(rb"\x1b\[5n", b"\x1b[0n")
-        take(rb"\x1b\[>0?q", b"\x1bP>|answering-pty(1)\x1b\\")
-        take(rb"\x1b\[>0?c", b"\x1b[>0;279;0c")
-        take(rb"\x1b\[0?c", b"\x1b[?62;1;2;6;9;15;22;29c")
-        take(rb"\x1b\[\?u", b"\x1b[?0u")
-        take(rb"\x1bP\+q([0-9A-Fa-f;]*)\x1b\\",
-             lambda m: b"\x1bP0+r" + m.group(1) + b"\x1b\\")
-        # The colour query: without these three the fade never runs.
-        take(rb"\x1b\]10;\?(?:\x1b\\|\x07)",
-             ("\x1b]10;%s\x1b\\" % hex_to_osc(THEME["fg"])).encode())
-        take(rb"\x1b\]11;\?(?:\x1b\\|\x07)",
-             ("\x1b]11;%s\x1b\\" % hex_to_osc(THEME["bg"])).encode())
         pal = THEME["palette"].split(":")
-        take(rb"\x1b\]4;(\d+);\?(?:\x1b\\|\x07)",
+        answers = (
+            (rb"\x1b\[6n", lambda m: ("\x1b[%d;%dR" % (row, col)).encode()),
+            (rb"\x1b\[>0?q", lambda m: b"\x1bP>|answering-pty(1)\x1b\\"),
+            (rb"\x1b\[>0?c", lambda m: b"\x1b[>0;279;0c"),
+            (rb"\x1b\[0?c", lambda m: b"\x1b[?62;1;2;6;9;15;22;29c"),
+            (rb"\x1b\[\?u", lambda m: b"\x1b[?0u"),
+            (rb"\x1bP\+q([0-9A-Fa-f;]*)\x1b\\",
+             lambda m: b"\x1bP0+r" + m.group(1) + b"\x1b\\"),
+            # The colour query. Without these the fade never runs at all.
+            (rb"\x1b\]10;\?(?:\x1b\\|\x07)",
+             lambda m: ("\x1b]10;%s\x1b\\" % hex_to_osc(THEME["fg"])).encode()),
+            (rb"\x1b\]11;\?(?:\x1b\\|\x07)",
+             lambda m: ("\x1b]11;%s\x1b\\" % hex_to_osc(THEME["bg"])).encode()),
+            (rb"\x1b\]4;(\d+);\?(?:\x1b\\|\x07)",
              lambda m: ("\x1b]4;%s;%s\x1b\\"
                         % (m.group(1).decode(),
-                           hex_to_osc(pal[int(m.group(1)) % len(pal)]))).encode())
-        self.qbuf = self.qbuf[-64:]
-        return out
+                           hex_to_osc(pal[int(m.group(1)) % len(pal)]))).encode()),
+            # Last in this list only as a tie-break; position is what orders the
+            # replies, and this one terminates the colour query.
+            (rb"\x1b\[5n", lambda m: b"\x1b[0n"),
+        )
+
+        hits = []
+        for pattern, answer in answers:
+            for m in re.finditer(pattern, self.qbuf):
+                hits.append((m.start(), m.end(), answer(m)))
+        hits.sort(key=lambda h: h[0])
+
+        kept, end = [], 0
+        for start, stop, _ in hits:
+            if start < end:          # overlapping match, already consumed
+                continue
+            kept.append(self.qbuf[end:start])
+            end = stop
+        kept.append(self.qbuf[end:])
+        self.qbuf = b"".join(kept)[-64:]
+        return [reply for start, _, reply in hits
+                if not any(s < start < e for s, e, _ in hits)]
 
     def _read_loop(self):
         while not self.closed:
@@ -303,15 +327,25 @@ class Terminal:
             if not chunk:
                 return
             now = time.time()
+            # Answer before parsing, and outside the lock. The colour query has
+            # a deadline -- QUERY_CAP in `src/palette.rs`, 1.5s -- and feeding a
+            # full-screen repaint to pyte can eat most of it, so replying second
+            # loses the race on a busy frame. nvmux then starts with no palette,
+            # which is not a rougher fade but no fade at all, and the recording
+            # comes out looking fine while showing the wrong thing.
+            #
+            # The cursor `_replies` reports is this chunk's starting one rather
+            # than where the chunk leaves it, which is the position the query was
+            # sent from, and the reader is the only thread that writes it.
+            for reply in self._replies(chunk):
+                try:
+                    os.write(self.fd, reply)
+                except OSError:
+                    pass
             with self.lock:
                 self.screen.feed(chunk)
                 if self.record and self.t0 is not None:
                     self.events.append((now - self.t0, chunk))
-                for reply in self._replies(chunk):
-                    try:
-                        os.write(self.fd, reply)
-                    except OSError:
-                        pass
 
     # --- driving -----------------------------------------------------------
     def start_recording(self):
@@ -359,6 +393,21 @@ class Terminal:
             time.sleep(0.1)
         self.close()
         sys.exit("timed out waiting for %s\n%s" % (what, self.text()))
+
+    def expect_gone(self, needle, what, timeout=15):
+        """Wait for something to leave the screen.
+
+        The counterpart to `expect`, and needed because some waits can only be
+        stated negatively. After a detach there is no new text to wait for: the
+        shell's screen comes back exactly as it was, prompt included.
+        """
+        end = time.time() + timeout
+        while time.time() < end:
+            if needle not in self.text():
+                return
+            time.sleep(0.1)
+        self.close()
+        sys.exit("timed out waiting for %s to go\n%s" % (what, self.text()))
 
     def is_selected(self, name):
         return any("\u25b8" in line and name in line
@@ -448,6 +497,12 @@ def perform(env):
 
     # 4. detach: the session keeps running, nvmux exits
     term.write(PREFIX + b"d", show=("Ctrl-Space  d", "detach"))
+    # The editor has to be gone, and waiting for the prompt does not say that:
+    # leaving the alternate screen restores the shell's screen, which already
+    # carries the `$` from before nvmux was started. That check passes the
+    # instant the alternate screen is left -- before the detach has finished --
+    # and the `nvmux` typed next then lands in the editor instead of the shell.
+    term.expect_gone("[No Name]", "the editor")
     term.expect("$", "the shell prompt back")
     time.sleep(1.8)
 
@@ -466,6 +521,33 @@ def perform(env):
         events, presses = list(term.events), list(term.presses)
     term.close()
     return events, presses
+
+
+def check_fade_ran():
+    """Refuse to ship a recording with no dissolves in it.
+
+    This is the failure the answering pty exists to prevent, and it is silent:
+    nvmux asks the terminal for its colours, gives up after QUERY_CAP, and an
+    unanswered query leaves `fade::enabled` false and every transition a hard
+    cut. The recording still comes out looking perfectly good -- it is just of
+    the wrong thing, which is how the first version of this script shipped.
+
+    nvmux says which happened, so read it rather than trust the timing.
+    """
+    log = os.path.join("/tmp/nvmux-%d" % os.getuid(), "nvmux.log")
+    try:
+        with open(log) as f:
+            lines = [l for l in f if "palette:" in l]
+    except OSError:
+        sys.exit("no nvmux log at %s; NVMUX_LOG has to be set for the fade "
+                 "check" % log)
+    if not lines:
+        sys.exit("nvmux logged no palette query; cannot tell whether the fade "
+                 "ran")
+    if not any("answered=true" in l for l in lines):
+        sys.exit("the terminal's colour query went unanswered, so nvmux ran "
+                 "with no fade and every transition in this take is a hard "
+                 "cut:\n  %s" % lines[-1].strip())
 
 
 def check_clean(events):
@@ -614,6 +696,11 @@ def main():
         sys.exit("build nvmux first: cargo build --release")
     font_dir = ensure_font()
 
+    # A stale log would let `check_fade_ran` pass on a previous run's evidence.
+    runtime = "/tmp/nvmux-%d" % os.getuid()
+    if os.path.exists(os.path.join(runtime, "nvmux.log")):
+        os.remove(os.path.join(runtime, "nvmux.log"))
+
     tmp = tempfile.mkdtemp(prefix="nvmux-demo-")
     cfg = os.path.join(tmp, "config.toml")
     with open(cfg, "w") as f:
@@ -624,6 +711,8 @@ def main():
     env["NVMUX_CONFIG"] = cfg
     env["TERM"] = "xterm-256color"
     env["COLORTERM"] = "truecolor"
+    # So `check_fade_ran` can read whether the colour query was answered.
+    env["NVMUX_LOG"] = "nvmux=debug"
     env.pop("NVMUX", None)
     env.pop("NO_COLOR", None)                         # it would turn the fade off
 
@@ -633,6 +722,7 @@ def main():
 
         print("recording...")
         events, presses = perform(env)
+        check_fade_ran()
         check_clean(events)
         print("  %d writes, %d keys shown, %.1fs"
               % (len(events), len(presses), events[-1][0]))
