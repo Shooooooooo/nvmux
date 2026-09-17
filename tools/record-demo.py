@@ -34,6 +34,10 @@ Needs, all on PATH:
   * python3 -m pip install pyte
   * a release build of nvmux (cargo build --release)
 
+The GIF is drawn in JetBrainsMono Nerd Font Mono. If it is not installed it is
+fetched once into `tools/.fonts`, which is gitignored; NVMUX_DEMO_FONT_DIR
+overrides where to look.
+
 Everything it touches is scratch: a config under a temporary directory, and
 demo sessions it creates itself. Your own nvmux sessions and config are left
 alone.
@@ -90,6 +94,21 @@ THEME = {
     ]),
 }
 
+# The font the GIF is drawn in. The `Mono` cut of the Nerd Font, not the plain
+# one: its icons are squeezed into a single cell, and a double-width glyph in a
+# character grid would push a whole row out of line.
+#
+# agg falls back through a family list silently, so a missing font does not fail
+# -- it quietly renders a different-looking GIF. `ensure_font` is what stops
+# that being discovered later.
+FONT_NAME = "JetBrainsMono Nerd Font Mono"
+FONT_FAMILY = FONT_NAME + ",JetBrains Mono,DejaVu Sans Mono"
+FONT_CACHE = os.path.join(ROOT, "tools", ".fonts")
+FONT_FILES = ["JetBrainsMonoNerdFontMono-%s.ttf" % cut
+              for cut in ("Regular", "Bold", "Italic", "BoldItalic")]
+FONT_URL = ("https://github.com/ryanoasis/nerd-fonts/releases/latest/download"
+            "/JetBrainsMono.tar.xz")
+
 PROMPT = "\\[\\e[2K\\]\\[\\r\\]\\[\\e[38;5;71m\\]$\\[\\e[0m\\] "
 
 # What the keys are as bytes, now that there is no `send-keys` to name them for
@@ -98,6 +117,48 @@ ENTER = b"\r"
 ESCAPE = b"\x1b"
 DOWN = b"\x1b[B"
 PREFIX = b"\x00"
+
+
+def font_installed():
+    """Whether fontconfig already knows the family, so nothing need be fetched."""
+    if not shutil.which("fc-list"):
+        return False
+    listed = subprocess.run(["fc-list", ":", "family"],
+                            capture_output=True, text=True).stdout
+    return FONT_NAME in listed
+
+
+def ensure_font():
+    """The directory to hand agg with `--font-dir`, or None if it is installed.
+
+    The four cuts are cached under `tools/.fonts` rather than committed: they
+    are 10MB, which is not what a repository this size should carry for a file
+    regenerated a few times a year. Set NVMUX_DEMO_FONT_DIR to point somewhere
+    else and nothing is downloaded.
+    """
+    override = os.environ.get("NVMUX_DEMO_FONT_DIR")
+    if override:
+        return override
+    if all(os.path.exists(os.path.join(FONT_CACHE, f)) for f in FONT_FILES):
+        return FONT_CACHE
+    if font_installed():
+        return None
+    if not shutil.which("curl"):
+        sys.exit("%s is not installed and curl is missing to fetch it.\n"
+                 "Install the font, or put these in %s:\n  %s\nfrom %s"
+                 % (FONT_NAME, FONT_CACHE, "\n  ".join(FONT_FILES), FONT_URL))
+
+    print("fetching %s ..." % FONT_NAME)
+    os.makedirs(FONT_CACHE, exist_ok=True)
+    tar = os.path.join(FONT_CACHE, "JetBrainsMono.tar.xz")
+    if subprocess.run(["curl", "-fsSL", "-o", tar, FONT_URL]).returncode != 0:
+        sys.exit("could not download %s; fetch it by hand into %s"
+                 % (FONT_URL, FONT_CACHE))
+    # Only the four cuts agg asks for, out of the ninety-odd in the archive.
+    subprocess.run(["tar", "-C", FONT_CACHE, "-xJf", tar] + FONT_FILES,
+                   check=True)
+    os.remove(tar)
+    return FONT_CACHE
 
 
 def hex_to_osc(colour):
@@ -551,6 +612,7 @@ def main():
         sys.exit("pyte is needed for the screen checks: pip install pyte")
     if not os.path.exists(NVMUX):
         sys.exit("build nvmux first: cargo build --release")
+    font_dir = ensure_font()
 
     tmp = tempfile.mkdtemp(prefix="nvmux-demo-")
     cfg = os.path.join(tmp, "config.toml")
@@ -581,8 +643,11 @@ def main():
         os.makedirs(os.path.dirname(OUT_GIF), exist_ok=True)
         print("rendering %s ..." % OUT_GIF)
         # No --theme: the cast header carries it.
-        subprocess.run(["agg", "--font-size", "15", "--fps-cap", str(FPS_CAP),
-                        "--idle-time-limit", "1.5", cast, OUT_GIF], check=True)
+        render = ["agg", "--font-family", FONT_FAMILY, "--font-size", "15",
+                  "--fps-cap", str(FPS_CAP), "--idle-time-limit", "1.5"]
+        if font_dir:
+            render += ["--font-dir", font_dir]
+        subprocess.run(render + [cast, OUT_GIF], check=True)
         print("wrote %s (%.0f KB)" % (OUT_GIF, os.path.getsize(OUT_GIF) / 1024))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
