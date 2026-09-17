@@ -679,11 +679,14 @@ impl Prompt {
     /// home directory's children, the same "write it, then step into it" pairing
     /// that `accept` and `adopt_default` both already have.
     ///
-    /// This is what a shell does with `~` too, and the reason it has to be
-    /// spelled out here is that a shell gets it from `~` being an expansion with
-    /// exactly one answer. nvmux expands the `~` only once there is a directory
-    /// half to expand (see [`super::complete::Completer::ask`]), so the one
-    /// shape that has no directory half is the one shape left to handle.
+    /// A shell does something else here, and deliberately not copied: `~` alone
+    /// completes *usernames* in fish, bash and zsh alike — `~root`, `~ubuntu`,
+    /// one per passwd entry. nvmux has no `~user` to offer, because
+    /// [`crate::session::expand_tilde`] refuses one: somebody else's home is a
+    /// question only the host can answer, and asking it would cost a round trip
+    /// and turn the one expansion nvmux *knows* into one it has to go and look
+    /// up. With `~user` gone, the slash is the only completion a lone `~` has
+    /// left, which is why it is the one written here.
     fn complete_bare_tilde(&mut self) -> bool {
         let field = &mut self.fields[DIRECTORY];
         // Against the value, so this is about what enter would take, not about
