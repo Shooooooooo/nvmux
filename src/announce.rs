@@ -39,11 +39,24 @@
 //! # The dissolve
 //!
 //! The box does not snap on and off. It fades, like every other transition
-//! nvmux makes ([`crate::fade`]): its border and its name rise out of the
-//! terminal's own background colour, hold, and sink back into it. What is left
-//! at the end is a blank rectangle — the interior erased the editor's cells
-//! when the box went up — and the repaint that has always followed the notice
-//! is what fills those back in.
+//! nvmux makes ([`crate::fade`]) — and it fades into the editor rather than
+//! into a hole. What it dissolves out of, and back into, is the session's own
+//! screen: [`crate::shadow`] has been keeping that all along so a session can
+//! be dissolved, and it holds the very cells the box is covering. So a frame
+//! of the dissolve paints both layers at once, each cell showing whichever of
+//! the two is the more visible — the box's border and name rising as the
+//! editor's text under them dims away, and sinking back as it returns.
+//!
+//! The rectangle is therefore never a hole for anything to fill. The repaint
+//! that has always followed the notice still runs, because the shadow carries
+//! colours and not decoration and an italic would come back plain, but it is
+//! correction now rather than restoration — and where it cannot be served at
+//! all, which is a server busy or at a prompt, or a terminal whose client
+//! ignores the resize nudge, the screen has already been put back.
+//!
+//! What pays for that is `[fade] session`: no shadow, no cells to dissolve
+//! into, and the box then does what it always did — an interior of spaces,
+//! a blank rectangle, and the repaint to fill it.
 //!
 //! The mechanism is the one difference from the rest of the fade. Every other
 //! screen dissolves inside a loop that sleeps between frames, and this one
@@ -67,6 +80,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::fade::{self, Direction, Dissolve, Schedule};
 use crate::palette::Rgb;
 use crate::pty::PtySize;
+use crate::shadow::{Over, Shadow};
 use crate::ui::draw::truncate;
 
 /// How long the child must have been quiet before the announcement is shown.
@@ -260,8 +274,16 @@ impl Popup {
     }
 
     /// One pass of the relay loop. `child_spoke` is whether the pty master had
-    /// anything for the terminal this time round.
-    pub fn step(&mut self, now: Instant, child_spoke: bool, size: PtySize) -> Act {
+    /// anything for the terminal this time round, and `under` is the session's
+    /// screen as the shadow has it — what the box is covering, and what a
+    /// dissolving frame cross-fades with.
+    pub fn step(
+        &mut self,
+        now: Instant,
+        child_spoke: bool,
+        size: PtySize,
+        under: Option<&Shadow>,
+    ) -> Act {
         if child_spoke {
             self.quiet_since = None;
             // Whatever was on screen may have been drawn over.
@@ -295,13 +317,13 @@ impl Popup {
         if self.painted {
             return Act::Idle;
         }
-        let Some(bytes) = overlay_bytes(&self.label, size, self.colour(t)) else {
+        let Some(over) = overlay(&self.label, size) else {
             // Too small to draw on. Saying nothing is the right answer, and
             // there is nothing to erase either.
             return Act::Done;
         };
         self.painted = true;
-        Act::Paint(bytes)
+        Act::Paint(self.draw(&over, under, t))
     }
 
     /// Move the box out of a phase it has outlived, whether or not a frame of
@@ -401,6 +423,29 @@ impl Popup {
         t
     }
 
+    /// This frame's bytes: cross-faded with the session's screen while the box
+    /// is dissolving, and the box on its own the rest of the time.
+    ///
+    /// The box at rest stays on the plain path deliberately. The composite
+    /// would paint the same thing at `t == 0` — every cell of the rectangle
+    /// fully dissolved, which is the background — but it would paint it in
+    /// explicit colour, and for the whole second the box is up it should be
+    /// drawn in the terminal's own foreground rather than in nvmux's reading
+    /// of it, exactly as every other nvmux screen is.
+    ///
+    /// Without a shadow there is nothing to dissolve into and the box behaves
+    /// as it did before this existed: `[fade] session = false` buys off the
+    /// parse of the session's output, and this is one of the things that
+    /// parse pays for.
+    fn draw(&self, over: &Over, under: Option<&Shadow>, t: f32) -> Vec<u8> {
+        match (under, self.dissolve) {
+            (Some(shadow), Some(d)) if t > 0.0 && shadow.is_usable() => {
+                shadow.under(over, &d.palette, t)
+            }
+            _ => plain_bytes(over, self.colour(t)),
+        }
+    }
+
     /// The colour this frame is drawn in — nothing at all without an effect,
     /// and nothing at rest.
     fn colour(&self, t: f32) -> Option<Rgb> {
@@ -421,16 +466,62 @@ fn take_frame(life: &mut Life, now: Instant) -> Option<f32> {
     Some(t)
 }
 
-/// The overlay as terminal bytes: a bordered box in the middle of the screen,
-/// drawn in `fg` — or in no colour at all, which is what the box at rest is.
-///
-/// Pure, so the geometry can be tested without a terminal. `None` when the
-/// screen cannot hold even a one-column box.
+/// Where the box goes and what it says, worked out once.
 ///
 /// The middle, where it cannot be missed. It is squarely over the text you have
 /// just switched to, which is the whole reason it is up for only a second: this
 /// is a notice to be caught out of the corner of the eye and then gone, not
 /// something to read.
+///
+/// `None` when the screen cannot hold even a one-column box. Pure, so the
+/// geometry can be tested without a terminal — and named, rather than left as
+/// locals inside the renderer, because two things draw it now: [`plain_bytes`]
+/// here, and [`Shadow::under`], which needs to know which cells of the
+/// session's screen the box is covering.
+pub fn overlay(label: &str, size: PtySize) -> Option<Over> {
+    if size.cols < MIN_COLS || size.rows < MIN_ROWS {
+        return None;
+    }
+
+    // Measured on the truncated text's own width, not on the room it was given:
+    // a wide character that did not fit leaves the text narrower than its
+    // budget, and a box sized to the budget would sit visibly loose around it.
+    let text = truncate(label, usize::from(size.cols) - 2 - 2 * PAD);
+    if text.is_empty() {
+        return None;
+    }
+    let inner = text.width() + 2 * PAD;
+    let width = inner + 2;
+
+    // Centred, in the grid's own 0-based coordinates — the renderer adds the
+    // one the terminal counts from. Both subtractions are safe: the guard above
+    // puts `rows` at three or more, and `width` cannot exceed `cols` because
+    // the text was truncated to fit it. Odd slack falls above and to the left,
+    // which is what integer division does and is not worth a correction nobody
+    // could see.
+    let left = (usize::from(size.cols) - width) / 2;
+    let top = (usize::from(size.rows) - 3) / 2;
+    let pad = " ".repeat(PAD);
+    let bar = "─".repeat(inner);
+    Some(Over {
+        top: u16::try_from(top).ok()?,
+        left: u16::try_from(left).ok()?,
+        width: u16::try_from(width).ok()?,
+        rows: vec![
+            format!("╭{bar}╮"),
+            format!("│{pad}{text}{pad}│"),
+            format!("╰{bar}╯"),
+        ],
+    })
+}
+
+/// The box on its own, drawn in `fg` — or in no colour at all, which is what
+/// the box at rest is.
+///
+/// What nvmux drew before it could dissolve, and what it still draws whenever
+/// there is no session screen to dissolve into (see [`Popup::step`]). The
+/// interior is spaces, which erase: this box hides what is under it by writing
+/// over it, and only [`Shadow::under`] can give it back.
 ///
 /// What the sequence has to get right, in order:
 ///
@@ -457,40 +548,9 @@ fn take_frame(life: &mut Life, now: Instant) -> Option<f32> {
 /// foreground is, exactly as every nvmux screen is. `Some` is a frame of a
 /// dissolve, and only the *foreground* moves — the interior is spaces, and a
 /// space is erased with the current background, which the reset has just put
-/// back to the terminal's own. That is what the glyphs are dissolving into, so
-/// leaving it alone is what makes the box disappear into the screen rather
-/// than into a rectangle of some other colour. The same division `fade::apply`
-/// makes over a ratatui buffer.
-pub fn overlay_bytes(label: &str, size: PtySize, fg: Option<Rgb>) -> Option<Vec<u8>> {
-    if size.cols < MIN_COLS || size.rows < MIN_ROWS {
-        return None;
-    }
-
-    // Measured on the truncated text's own width, not on the room it was given:
-    // a wide character that did not fit leaves the text narrower than its
-    // budget, and a box sized to the budget would sit visibly loose around it.
-    let text = truncate(label, usize::from(size.cols) - 2 - 2 * PAD);
-    if text.is_empty() {
-        return None;
-    }
-    let inner = text.width() + 2 * PAD;
-    let width = inner + 2;
-
-    // Centred, in the terminal's own 1-based coordinates. Both subtractions are
-    // safe: the guard above puts `rows` at three or more, and `width` cannot
-    // exceed `cols` because the text was truncated to fit it. Odd slack falls
-    // above and to the left, which is what integer division does and is not
-    // worth a correction nobody could see.
-    let left = (usize::from(size.cols) - width) / 2 + 1;
-    let top = (usize::from(size.rows) - 3) / 2 + 1;
-    let pad = " ".repeat(PAD);
-    let bar = "─".repeat(inner);
-    let rows = [
-        format!("╭{bar}╮"),
-        format!("│{pad}{text}{pad}│"),
-        format!("╰{bar}╯"),
-    ];
-
+/// back to the terminal's own. The same division `fade::apply` makes over a
+/// ratatui buffer.
+pub fn plain_bytes(over: &Over, fg: Option<Rgb>) -> Vec<u8> {
     // One CSI from a reset, which is the shape `shadow::write_sgr` emits for
     // the same reason: the reset is what puts the background back, so the
     // colour has to ride along with it rather than follow it.
@@ -498,12 +558,20 @@ pub fn overlay_bytes(label: &str, size: PtySize, fg: Option<Rgb>) -> Option<Vec<
         Some(Rgb(r, g, b)) => format!("\x1b[0;38;2;{r};{g};{b}m"),
         None => "\x1b[0m".to_string(),
     };
+    let left = over.left + 1;
     let mut out = String::from("\x1b[?2026h\x1b7");
-    for (i, row) in rows.iter().enumerate() {
-        out.push_str(&format!("\x1b[{};{left}H{sgr}{row}", top + i));
+    for (i, row) in over.rows.iter().enumerate() {
+        let line = usize::from(over.top) + i + 1;
+        out.push_str(&format!("\x1b[{line};{left}H{sgr}{row}"));
     }
     out.push_str("\x1b8\x1b[?2026l");
-    Some(out.into_bytes())
+    out.into_bytes()
+}
+
+/// The box for this label on this screen, drawn on its own. The two halves
+/// above, which is all most of the tests here want.
+pub fn overlay_bytes(label: &str, size: PtySize, fg: Option<Rgb>) -> Option<Vec<u8>> {
+    Some(plain_bytes(&overlay(label, size)?, fg))
 }
 
 #[cfg(test)]
@@ -530,9 +598,28 @@ mod tests {
     fn dissolve() -> Dissolve {
         Dissolve {
             duration: Duration::from_millis(100),
+            palette: palette(),
+        }
+    }
+
+    /// A terminal that said its text is light grey on black.
+    fn palette() -> crate::palette::Palette {
+        crate::palette::Palette {
             fg: Rgb(200, 200, 200),
             bg: Rgb(0, 0, 0),
+            ansi: [Rgb(0, 0, 0); 16],
         }
+    }
+
+    /// A shadow with something on it to dissolve into: every cell an `x`,
+    /// which is in none of the box's glyphs and in no session name these tests
+    /// use, so a frame shows the screen exactly when it has one in it.
+    fn screen() -> Shadow {
+        let mut shadow = Shadow::new(24, 80);
+        for row in 1..=24 {
+            shadow.feed(format!("\x1b[{row};1H{}", "x".repeat(80)).as_bytes());
+        }
+        shadow
     }
 
     /// One row of the overlay: where it was placed, the SGR it was drawn with,
@@ -585,7 +672,7 @@ mod tests {
         let mut painted = vec![];
         let mut now = from;
         for _ in 0..10_000 {
-            match popup.step(now, false, size) {
+            match popup.step(now, false, size, None) {
                 Act::Paint(_) => {
                     painted.push((now - from, popup.life.as_ref().expect("a life").t));
                 }
@@ -712,7 +799,7 @@ mod tests {
     fn a_dissolve_runs_from_no_colour_at_all_to_the_background() {
         let d = dissolve();
         assert_eq!(d.colour(0.0), None, "the box at rest picks no colour");
-        assert_eq!(d.colour(1.0), Some(d.bg));
+        assert_eq!(d.colour(1.0), Some(d.palette.bg));
         assert_eq!(d.colour(0.5), Some(Rgb(100, 100, 100)));
 
         let at_rest = overlay_bytes("2  dotfiles", big(), d.colour(0.0)).expect("drawn");
@@ -797,6 +884,122 @@ mod tests {
         }
     }
 
+    /// The box grows out of the editor's text rather than out of a hole. The
+    /// first frame of the arrival is the session's own cells — nothing has
+    /// changed on screen yet — and the box itself only appears once it is the
+    /// more visible of the two, by which point the text under it has dimmed
+    /// most of the way out.
+    #[test]
+    fn the_box_arrives_out_of_the_screen_it_is_covering() {
+        let t0 = Instant::now();
+        let screen = screen();
+        let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
+
+        let mut now = t0 + SETTLE;
+        let mut frames = vec![];
+        for _ in 0..64 {
+            if let Act::Paint(bytes) = popup.step(now, false, big(), Some(&screen)) {
+                frames.push(String::from_utf8(bytes).expect("utf-8"));
+                if held_until(&popup).is_some() {
+                    break;
+                }
+            }
+            now = popup.wake_at(now).max(now + Duration::from_millis(1));
+        }
+
+        let first = frames.first().expect("a first frame");
+        assert!(
+            first.contains('x') && !first.contains("dotfiles"),
+            "the arrival did not start from the screen: {first:?}"
+        );
+        assert!(
+            frames.iter().any(|f| f.contains("dotfiles")),
+            "the box never arrived"
+        );
+        let last = frames.last().expect("a last frame");
+        assert!(
+            last.contains("dotfiles") && !last.contains('x'),
+            "the box did not end up covering the screen: {last:?}"
+        );
+    }
+
+    /// And leaves the same way: the last frame of the departure is the
+    /// session's cells at full colour, so the screen is already back before
+    /// the repaint that follows the notice is even asked for.
+    #[test]
+    fn the_box_leaves_back_into_the_screen_it_was_covering() {
+        let t0 = Instant::now();
+        let screen = screen();
+        let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
+
+        let mut now = t0 + SETTLE;
+        let mut last = String::new();
+        for _ in 0..10_000 {
+            match popup.step(now, false, big(), Some(&screen)) {
+                Act::Paint(bytes) => last = String::from_utf8(bytes).expect("utf-8"),
+                Act::Idle => {}
+                end => {
+                    assert_eq!(end, Act::Erase);
+                    break;
+                }
+            }
+            now = popup.wake_at(now).max(now + Duration::from_millis(1));
+        }
+        assert!(
+            last.contains('x') && !last.contains("dotfiles"),
+            "the box did not dissolve back into the screen: {last:?}"
+        );
+    }
+
+    /// With no shadow there is nothing to dissolve into, and the box is the
+    /// one nvmux drew before any of this: `[fade] session = false` buys off
+    /// the parse that pays for the backdrop, and must cost nothing else.
+    #[test]
+    fn with_no_shadow_the_box_dissolves_as_it_did_before() {
+        let t0 = Instant::now();
+        let d = dissolve();
+        let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(d)).expect("armed");
+        let Act::Paint(bytes) = popup.step(t0 + SETTLE, false, big(), None) else {
+            panic!("the box did not go up");
+        };
+        let t = popup.life.as_ref().expect("a life").t;
+        let over = overlay("dotfiles", big()).expect("a box");
+        assert_eq!(bytes, plain_bytes(&over, d.colour(t)));
+    }
+
+    /// The box at rest is drawn plain even with a screen to hand. The
+    /// composite would paint the same thing — the rectangle fully dissolved is
+    /// the background — but in explicit colour, and for the whole second the
+    /// box is up it belongs in the terminal's own foreground, like every other
+    /// nvmux screen.
+    #[test]
+    fn the_box_at_rest_is_drawn_plain_even_with_a_screen_to_hand() {
+        let t0 = Instant::now();
+        let screen = screen();
+        let mut popup = Popup::armed(Some("dotfiles".into()), t0, None).expect("armed");
+        let Act::Paint(bytes) = popup.step(t0 + SETTLE, false, big(), Some(&screen)) else {
+            panic!("the box did not go up");
+        };
+        let over = overlay("dotfiles", big()).expect("a box");
+        assert_eq!(bytes, plain_bytes(&over, None));
+    }
+
+    /// The geometry the two renderers share: three rows, centred, sized to the
+    /// text's own width and never wider than the screen.
+    #[test]
+    fn the_box_is_centred_and_sized_to_its_text() {
+        let over = overlay("dotfiles", size(80, 24)).expect("a box");
+        assert_eq!(over.rows.len(), 3);
+        // "dotfiles" plus a pad each side and a border each side.
+        assert_eq!(over.width, 8 + 2 * PAD as u16 + 2);
+        assert_eq!(over.top, (24 - 3) / 2);
+        assert_eq!(over.left, (80 - over.width) / 2);
+        assert!(over
+            .rows
+            .iter()
+            .all(|r| r.width() == usize::from(over.width)));
+    }
+
     /// The lull clock restarts on every byte the child writes; the other two
     /// must not, or a session with a spinner in its statusline would hold the
     /// box on screen for ever and never reach its own deadline. The same
@@ -808,40 +1011,48 @@ mod tests {
 
         // Still chattering: nothing is drawn, however long it goes on.
         for ms in [10, 100, 500] {
-            let act = popup.step(t0 + Duration::from_millis(ms), true, big());
+            let act = popup.step(t0 + Duration::from_millis(ms), true, big(), None);
             assert_eq!(act, Act::Idle, "drew at {ms}ms while the child was talking");
         }
         // Quiet, but not yet long enough.
         assert_eq!(
-            popup.step(t0 + Duration::from_millis(510), false, big()),
+            popup.step(t0 + Duration::from_millis(510), false, big(), None),
             Act::Idle
         );
         // Quiet for a whole SETTLE: now it paints, and the clock starts here.
         let painted = t0 + Duration::from_millis(600);
-        assert!(matches!(popup.step(painted, false, big()), Act::Paint(_)));
+        assert!(matches!(
+            popup.step(painted, false, big(), None),
+            Act::Paint(_)
+        ));
         assert_eq!(held_until(&popup), Some(painted + DURATION));
 
         // A repaint by the editor puts the box back at the *next* lull — one
         // whole SETTLE later, not the first pass after it — without buying the
         // box any more time on screen.
         assert_eq!(
-            popup.step(painted + Duration::from_millis(10), true, big()),
+            popup.step(painted + Duration::from_millis(10), true, big(), None),
             Act::Idle
         );
         assert_eq!(
-            popup.step(painted + Duration::from_millis(20), false, big()),
+            popup.step(painted + Duration::from_millis(20), false, big(), None),
             Act::Idle,
             "one quiet pass is not a lull"
         );
         assert!(matches!(
-            popup.step(painted + Duration::from_millis(60), false, big()),
+            popup.step(painted + Duration::from_millis(60), false, big(), None),
             Act::Paint(_)
         ));
         assert_eq!(held_until(&popup), Some(painted + DURATION));
 
         // And it ends on time regardless.
         assert_eq!(
-            popup.step(painted + DURATION + Duration::from_millis(1), false, big()),
+            popup.step(
+                painted + DURATION + Duration::from_millis(1),
+                false,
+                big(),
+                None
+            ),
             Act::Erase
         );
     }
@@ -855,10 +1066,10 @@ mod tests {
         let mut at = t0;
         while at + Duration::from_millis(10) < t0 + GIVE_UP {
             at += Duration::from_millis(10);
-            assert_eq!(popup.step(at, true, big()), Act::Idle, "at {at:?}");
+            assert_eq!(popup.step(at, true, big(), None), Act::Idle, "at {at:?}");
         }
         assert_eq!(
-            popup.step(t0 + GIVE_UP, true, big()),
+            popup.step(t0 + GIVE_UP, true, big(), None),
             Act::Done,
             "it must stop trying rather than draw onto a busy screen"
         );
@@ -940,7 +1151,7 @@ mod tests {
         let mut now = t0;
         let mut at_rest = 0;
         for _ in 0..10_000 {
-            match popup.step(now, false, big()) {
+            match popup.step(now, false, big(), None) {
                 Act::Paint(bytes) => {
                     if bytes == unfaded {
                         at_rest += 1;
@@ -963,12 +1174,12 @@ mod tests {
         let t0 = Instant::now();
         let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
         let mut now = t0 + SETTLE;
-        assert!(matches!(popup.step(now, false, big()), Act::Paint(_)));
+        assert!(matches!(popup.step(now, false, big(), None), Act::Paint(_)));
         let first = popup.life.as_ref().expect("a life").t;
 
         // The child draws over it, then falls quiet.
         now += Duration::from_millis(10);
-        assert_eq!(popup.step(now, true, big()), Act::Idle);
+        assert_eq!(popup.step(now, true, big(), None), Act::Idle);
         assert_eq!(
             popup.life.as_ref().expect("a life").t,
             first,
@@ -978,9 +1189,9 @@ mod tests {
         // One quiet pass only starts the lull clock; the pass a whole SETTLE
         // after it is the lull.
         now += Duration::from_millis(1);
-        assert_eq!(popup.step(now, false, big()), Act::Idle);
+        assert_eq!(popup.step(now, false, big(), None), Act::Idle);
         now += SETTLE;
-        assert!(matches!(popup.step(now, false, big()), Act::Paint(_)));
+        assert!(matches!(popup.step(now, false, big(), None), Act::Paint(_)));
         let resumed = popup.life.as_ref().expect("a life").t;
         assert!(resumed < first, "{first} -> {resumed}");
         assert!(resumed > 0.0, "it jumped straight to the end");
@@ -994,14 +1205,14 @@ mod tests {
         let t0 = Instant::now();
         let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
         let mut now = t0 + SETTLE;
-        assert!(matches!(popup.step(now, false, big()), Act::Paint(_)));
+        assert!(matches!(popup.step(now, false, big(), None), Act::Paint(_)));
 
         // From here the child never stops talking, so nothing can be painted.
         let life = dissolve().duration * 2 + DURATION;
         let end = now + life + Duration::from_millis(100);
         while now < end {
             now += Duration::from_millis(10);
-            if popup.step(now, true, big()) == Act::Erase {
+            if popup.step(now, true, big(), None) == Act::Erase {
                 let lived = now - t0;
                 assert!(
                     lived.abs_diff(SETTLE + life) < Duration::from_millis(50),
@@ -1021,8 +1232,8 @@ mod tests {
         let t0 = Instant::now();
         let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
         let mut now = t0 + SETTLE;
-        assert!(matches!(popup.step(now, false, big()), Act::Paint(_)));
+        assert!(matches!(popup.step(now, false, big(), None), Act::Paint(_)));
         now += fade::FRAME;
-        assert_eq!(popup.step(now, false, size(2, 1)), Act::Done);
+        assert_eq!(popup.step(now, false, size(2, 1), None), Act::Done);
     }
 }
