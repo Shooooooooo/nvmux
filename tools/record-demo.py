@@ -44,6 +44,21 @@ NAMES = ["api-server", "dotfiles", "scratch", "notes"]
 # reach nvmux inside that window, so they go in a single send-keys call.
 PREFIX = "C-Space"
 
+# A green `$`, and -- the part that matters -- an erase-line and a carriage
+# return before it.
+#
+# nvmux detaches by sending SIGHUP to the `--remote-ui` client, and Neovim's
+# shutdown leaves the alternate screen *before* its signal handler prints, so
+# `Nvim: Caught deadly signal 'SIGHUP'` lands on the shell's own screen rather
+# than the one being torn down. Real prompts paint over it, because zsh,
+# starship, powerlevel10k and fish all erase their line before drawing; a bare
+# `PS1='$ '` is the one case bare enough to leave it standing, which is exactly
+# what `bash --norc --noprofile` would give this recording. So the prompt here
+# clears its line like a real one, and `check_clean` below holds it to that.
+#
+# `\[ \]` marks both sequences zero-width, so bash still counts columns right.
+PROMPT = "\\[\\e[2K\\]\\[\\r\\]\\[\\e[38;5;71m\\]$\\[\\e[0m\\] "
+
 
 def tmux(*args, capture=False):
     cmd = ["tmux", "-L", SOCKET, *args]
@@ -181,6 +196,20 @@ def perform():
     return rec.frames
 
 
+def check_clean(frames):
+    """Refuse to ship a recording carrying the departing client's last words.
+
+    See PROMPT: the prompt is what covers that line, so a frame still holding it
+    means the cover failed. Checked across every frame rather than once at the
+    end, because at 20fps the message can be caught merely flashing between
+    Neovim printing it and bash redrawing over it.
+    """
+    stray = [round(t, 1) for t, frame in frames if "deadly signal" in frame]
+    if stray:
+        sys.exit("the departing client's signal message reached the recording "
+                 "at %ss; the prompt is meant to erase it" % stray)
+
+
 def write_cast(frames, path, tail=1.2):
     with open(path, "w") as f:
         f.write(json.dumps({"version": 2, "width": COLS, "height": ROWS,
@@ -207,7 +236,7 @@ def main():
     env["PATH"] = os.path.join(ROOT, "target", "release") + os.pathsep + env["PATH"]
     env["NVMUX_CONFIG"] = cfg
     env["TERM"] = "xterm-256color"
-    env["PS1"] = "\\[\\e[38;5;71m\\]$\\[\\e[0m\\] "
+    env["PS1"] = PROMPT
 
     try:
         print("creating demo sessions...")
@@ -216,9 +245,10 @@ def main():
         print("recording...")
         start_pane(env)
         tmux("send-keys", "-t", SESSION, "-l",
-             "export PS1='\\[\\e[38;5;71m\\]$\\[\\e[0m\\] '; clear")
+             "export PS1='%s'; clear" % PROMPT)
         keys("Enter", wait=1.0)
         frames = perform()
+        check_clean(frames)
 
         cast = os.path.join(tmp, "demo.cast")
         write_cast(frames, cast)
