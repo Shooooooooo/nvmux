@@ -564,6 +564,8 @@ impl Prompt {
                     // accept already has, write the name and then step into it,
                     // seen from the other end.
                     self.stayed_put();
+                } else if self.complete_bare_tilde() {
+                    self.stayed_put();
                 } else {
                     self.open_menu();
                 }
@@ -665,6 +667,40 @@ impl Prompt {
         self.menu.as_mut().expect("a menu the caller checked for")
     }
 
+    /// `Tab` on a `~` alone: write the `/` that makes it a directory to look
+    /// inside. Whether it did.
+    ///
+    /// Every other path completes by being matched against its siblings — `/hom`
+    /// is ranked among everything in `/`. A lone `~` cannot be: it is not a name
+    /// in a directory, it is a whole directory named in one character, and
+    /// [`crate::dirs::split`] has no `/` in it to cut at, so the menu would open
+    /// on nothing and say so. The only completion it has is the slash, which is
+    /// therefore what `Tab` writes — and the next `Tab` opens the menu on the
+    /// home directory's children, the same "write it, then step into it" pairing
+    /// that `accept` and `adopt_default` both already have.
+    ///
+    /// A shell does something else here, and deliberately not copied: `~` alone
+    /// completes *usernames* in fish, bash and zsh alike — `~root`, `~ubuntu`,
+    /// one per passwd entry. nvmux has no `~user` to offer, because
+    /// [`crate::session::expand_tilde`] refuses one: somebody else's home is a
+    /// question only the host can answer, and asking it would cost a round trip
+    /// and turn the one expansion nvmux *knows* into one it has to go and look
+    /// up. With `~user` gone, the slash is the only completion a lone `~` has
+    /// left, which is why it is the one written here.
+    fn complete_bare_tilde(&mut self) -> bool {
+        let field = &mut self.fields[DIRECTORY];
+        // Against the value, so this is about what enter would take, not about
+        // whether the `~` is typed or still a placeholder. The default is `~/`
+        // and so already has its slash, which is why this is only ever reached
+        // by a `~` somebody typed.
+        if field.value() != "~" {
+            return false;
+        }
+        field.input = "~/".to_string();
+        field.cursor = field.len();
+        true
+    }
+
     /// Take the highlighted directory into the field, and close the menu.
     ///
     /// The name alone, with no trailing `/`: the path then reads exactly as it
@@ -748,7 +784,7 @@ pub(super) fn run_on(
         Task::Create => Prompt::create(
             next_free_name(transport)?,
             default_command(transport),
-            default_directory(transport),
+            default_directory(transport.home()),
         ),
         Task::Rename(session) => Prompt::rename(session),
     };
@@ -757,7 +793,10 @@ pub(super) fn run_on(
     // worker. Dropped with the prompt, which is what ends it — see
     // `super::complete`.
     let mut completer = match task {
-        Task::Create => Some(complete::Completer::new(transport.dir_source())),
+        Task::Create => Some(complete::Completer::new(
+            transport.dir_source(),
+            transport.home(),
+        )),
         Task::Rename(_) => None,
     };
     // Ask about the default before a key is pressed. The answer is then usually
@@ -963,14 +1002,16 @@ fn next_free_name(transport: &dyn Transport) -> Result<String> {
     Ok(next_name(&taken))
 }
 
-/// The command a session gets when the user just presses enter: what was last
-/// used on this host, else what the config says.
-///
-/// Per host, because the answer is about a machine — a path to a nightly build
-/// on one box means nothing on another, and `nvmux myhost` is a different
-/// machine's `$PATH`.
 /// The directory a session gets when the user just presses enter: the session
-/// host's home, with a trailing `/`.
+/// host's home, written `~/`.
+///
+/// The tilde rather than the path spelled out, because `~/` is what someone
+/// would have typed, and it is one short thing to read instead of a path whose
+/// length is somebody else's decision. It costs nothing to resolve:
+/// [`crate::session::expand_tilde`] turns it back into the same absolute path
+/// on the way out, against the *session host's* home — so this is the one
+/// default that is already right on a machine whose home is not the shape this
+/// one's is.
 ///
 /// The slash is not decoration. It is what makes the field's text mean "inside
 /// this directory" rather than "this directory, among its siblings" — so the
@@ -979,17 +1020,27 @@ fn next_free_name(transport: &dyn Transport) -> Result<String> {
 /// stepping sideways. It is also what keeps enter submitting: with nothing after
 /// the slash there is no half-typed name for the menu to resolve.
 ///
-/// Empty stays empty. A host that could not say where home is has no default to
-/// offer, and `/` alone would be a confident wrong answer.
-fn default_directory(transport: &dyn Transport) -> String {
-    let home = transport.home().trim_end_matches('/');
-    if home.is_empty() {
+/// Empty stays empty. A host that could not say where home is has no `~` to
+/// offer either — `expand_tilde` refuses one it cannot resolve, so `~/` would
+/// be a default that fails on enter, and `/` alone would be a confident wrong
+/// answer.
+///
+/// Takes the home rather than the transport so that this is a question about a
+/// string, which is what it is.
+fn default_directory(home: &str) -> String {
+    if home.trim_end_matches('/').is_empty() {
         String::new()
     } else {
-        format!("{home}/")
+        "~/".to_string()
     }
 }
 
+/// The command a session gets when the user just presses enter: what was last
+/// used on this host, else what the config says.
+///
+/// Per host, because the answer is about a machine — a path to a nightly build
+/// on one box means nothing on another, and `nvmux myhost` is a different
+/// machine's `$PATH`.
 fn default_command(transport: &dyn Transport) -> String {
     state::remembered(transport.location())
         .unwrap_or_else(|| crate::config::get().session.command.clone())
@@ -1304,7 +1355,7 @@ mod tests {
     use ratatui::Terminal;
 
     const COMMAND_DEFAULT: &str = "nvim --headless --listen {sock}";
-    const DIRECTORY_DEFAULT: &str = "/home/you/";
+    const DIRECTORY_DEFAULT: &str = "~/";
 
     /// Only a created session is attached to next. A rename relists and a
     /// cancel resumes the client that is still running, and both of those are
@@ -2141,6 +2192,70 @@ mod tests {
         );
     }
 
+    /// A lone `~` has no `/` for `dirs::split` to cut at, so the menu would open
+    /// on nothing. Its one completion is the slash, and `Tab` writes it — then
+    /// the next `Tab` opens the menu on what is inside, which is the same
+    /// pairing an emptied field and an accept both have.
+    #[test]
+    fn tab_on_a_bare_tilde_writes_the_slash_that_steps_into_it() {
+        let mut p = prompt();
+        press(&mut p, &[Key::Down, Key::Down]);
+        for _ in 0..p.fields[DIRECTORY].len() {
+            p.on_key(Key::Backspace);
+        }
+        type_in(&mut p, "~");
+
+        p.on_key(Key::Tab);
+        let field = &p.fields[DIRECTORY];
+        assert_eq!(field.input, "~/", "the slash, written for you");
+        assert_eq!(field.cursor, field.len(), "with the cursor after it");
+        assert!(
+            !p.choosing(),
+            "and no menu: this `Tab` was the one that wrote the slash"
+        );
+
+        p.on_key(Key::Tab);
+        assert!(p.choosing(), "the next one opens on the home directory");
+        assert_eq!(
+            p.fields[DIRECTORY].input, "~/",
+            "opening the menu does not move the path it opened on"
+        );
+    }
+
+    /// The slash is written once. A second one would make the `//` that means
+    /// "start again from the root", so a `Tab` that kept appending would walk
+    /// the field out of the home directory it had just entered.
+    #[test]
+    fn tab_never_adds_a_second_slash_to_a_tilde() {
+        let mut p = prompt();
+        press(
+            &mut p,
+            &[Key::Down, Key::Down, Key::Tab, Key::Tab, Key::Tab],
+        );
+        assert_eq!(p.fields[DIRECTORY].value(), "~/");
+        assert_eq!(
+            crate::dirs::anchored(&p.fields[DIRECTORY].value()).1,
+            "~/",
+            "still the home directory, not the root"
+        );
+    }
+
+    /// Only a `~` exactly. `~r` is `~root` half typed — a name, which the menu
+    /// handles as it handles any other, and not something to put a slash after.
+    #[test]
+    fn tab_writes_no_slash_after_a_tilde_with_anything_on_it() {
+        let mut p = prompt();
+        press(&mut p, &[Key::Down, Key::Down]);
+        for _ in 0..p.fields[DIRECTORY].len() {
+            p.on_key(Key::Backspace);
+        }
+        type_in(&mut p, "~r");
+
+        p.on_key(Key::Tab);
+        assert_eq!(p.fields[DIRECTORY].input, "~r", "left as typed");
+        assert!(p.choosing(), "the ordinary `Tab`, which opens the menu");
+    }
+
     /// A host that could not say where home is has no default to offer, so
     /// there is nothing for `Tab` to take and it does what it always did. The
     /// row goes on saying `⇥ complete` either way, and this is what keeps that
@@ -2424,6 +2539,54 @@ mod tests {
             Step::Submit(s) => assert_eq!(s.directory, Some("/etc".to_string())),
             other => panic!("expected a create, got {other:?}"),
         }
+    }
+
+    /// The default is `~/`, not the home path spelled out — one short thing to
+    /// read, and already right on a host whose home is not the shape this
+    /// machine's is.
+    #[test]
+    fn the_default_directory_is_the_tilde() {
+        assert_eq!(default_directory("/home/you"), "~/");
+        assert_eq!(
+            default_directory("/home/you/"),
+            "~/",
+            "a home already ending in a slash does not make a `//`"
+        );
+    }
+
+    /// A host that never said where home is has no `~` to offer: the expansion
+    /// would refuse it on enter, so offering it would be a default that fails.
+    #[test]
+    fn a_host_with_no_home_gets_no_default_directory() {
+        assert!(default_directory("").is_empty());
+        assert!(
+            default_directory("/").is_empty(),
+            "not a home, just the root"
+        );
+    }
+
+    /// What the shortened default is worth only holds if enter still lands in
+    /// the same place. Checked against the real expansion rather than restated,
+    /// because this is the one change a user would not see until a session had
+    /// already started somewhere else.
+    #[test]
+    fn pressing_enter_on_the_default_still_creates_in_the_home_directory() {
+        const HOME: &str = "/home/them";
+        let mut p = Prompt::create(
+            "session 3".to_string(),
+            COMMAND_DEFAULT.to_string(),
+            default_directory(HOME),
+        );
+        let Step::Submit(s) = p.on_key(Key::Enter) else {
+            panic!("expected a create");
+        };
+        let typed = s.directory.expect("a directory");
+        assert_eq!(typed, "~/", "what the untouched field submits");
+        assert_eq!(
+            crate::session::validate_directory(&typed, HOME).expect("expands"),
+            "/home/them/",
+            "the same absolute path the spelled-out default used to send"
+        );
     }
 
     /// The one that would be silent if it were wrong. POSIX reads `a//b` as

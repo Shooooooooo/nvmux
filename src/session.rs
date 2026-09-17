@@ -204,11 +204,9 @@ pub fn validate_name(name: &str) -> Result<(), SessionError> {
 /// A path on one machine means nothing on another, so expanding against ours
 /// would be quietly wrong over ssh.
 ///
-/// This is the one expansion nvmux performs anywhere, and it is deliberately
-/// narrow: `~` and `~/…` only, never `~user`, no globs, no `$VAR`. It is
-/// possible here for the reason [`crate::launch`] says it is not possible for a
-/// command line — nvmux *knows* this answer, so nothing has to be handed to a
-/// shell to find it out.
+/// The `~` is [`expand_tilde`]'s, which the create prompt's completion also
+/// calls — so what the menu lists inside `~/` and what enter finally creates
+/// cannot mean two different directories.
 pub fn validate_directory(directory: &str, home: &str) -> Result<String, SessionError> {
     let invalid = |reason| {
         Err(SessionError::InvalidDirectory {
@@ -232,18 +230,9 @@ pub fn validate_directory(directory: &str, home: &str) -> Result<String, Session
         return invalid("must not contain control or invisible formatting characters");
     }
 
-    let expanded = match directory.strip_prefix('~') {
-        // `~user` is somebody else's home directory, which only the host can
-        // resolve. Refused rather than passed through as a literal directory
-        // named `~someone`, which is what would otherwise be created-or-missing.
-        Some(rest) if !rest.is_empty() && !rest.starts_with('/') => {
-            return invalid("~user is not expanded — spell the path out")
-        }
-        Some(_) if home.is_empty() => {
-            return invalid("~ cannot be expanded: the host reported no home directory")
-        }
-        Some(rest) => format!("{}{rest}", home.trim_end_matches('/')),
-        None => directory.to_string(),
+    let expanded = match expand_tilde(directory, home) {
+        Ok(expanded) => expanded,
+        Err(reason) => return invalid(reason),
     };
 
     if !expanded.starts_with('/') {
@@ -253,6 +242,40 @@ pub fn validate_directory(directory: &str, home: &str) -> Result<String, Session
         );
     }
     Ok(expanded)
+}
+
+/// Expand a leading `~` against the session host's home directory.
+///
+/// This is the one expansion nvmux performs anywhere, and it is deliberately
+/// narrow: `~` and `~/…` only, never `~user`, no globs, no `$VAR`. It is
+/// possible here for the reason [`crate::launch`] says it is not possible for a
+/// command line — nvmux *knows* this answer, so nothing has to be handed to a
+/// shell to find it out.
+///
+/// `home` is the *session host's* home — the local `$HOME` for a local session,
+/// and what `scripts/hello.sh` reported for a remote one. A path on one machine
+/// means nothing on another, so expanding against ours would be quietly wrong
+/// over ssh.
+///
+/// The `Err` is a reason rather than a type, because its two callers want
+/// opposite things from it: [`validate_directory`] reports it and refuses, and
+/// [`crate::ui::complete`] discards it and lists the text literally — at a
+/// prompt, `~r` is not a mistake, it is `~root` half typed, and a keystroke on
+/// the way to somewhere must not turn the field red.
+pub fn expand_tilde(path: &str, home: &str) -> Result<String, &'static str> {
+    match path.strip_prefix('~') {
+        // `~user` is somebody else's home directory, which only the host can
+        // resolve. Refused rather than passed through as a literal directory
+        // named `~someone`, which is what would otherwise be created-or-missing.
+        Some(rest) if !rest.is_empty() && !rest.starts_with('/') => {
+            Err("~user is not expanded — spell the path out")
+        }
+        Some(_) if home.is_empty() => {
+            Err("~ cannot be expanded: the host reported no home directory")
+        }
+        Some(rest) => Ok(format!("{}{rest}", home.trim_end_matches('/'))),
+        None => Ok(path.to_string()),
+    }
 }
 
 /// A character that a session listing cannot show honestly: a control
