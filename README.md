@@ -23,7 +23,6 @@ undo history are where you left them.
 |---|---|---|
 | Who draws the screen | tmux re-renders the editor from its own grid | Neovim's own client draws straight to your terminal |
 | Terminal features | have to survive a trip through tmux; some need coaxing | negotiated between Neovim and your terminal directly |
-| After the link drops | the session lives, and you reconnect by hand | the session lives, and nvmux reconnects for you |
 | What it holds | any program, in panes and windows | Neovim sessions, and nothing else |
 
 That last row is the trade: nvmux is not a tmux replacement. It does one thing,
@@ -61,27 +60,10 @@ nvmux            # sessions on this machine
 nvmux myhost     # sessions on myhost
 ```
 
-Either one opens the picker:
-
-```
-                                                                       
-                              1  api-server                            
-                            ▸ 2  dotfiles                              
-                              3  scratch                               
-                              4  notes                                 
-                                                                       
- ↑↓ move  ⏎ attach  c new  r rename  x kill  ␣ order  / filter  q quit 
-```
-
 The host string is handed to `ssh` verbatim, so a hostname, `user@host`, or any
 `~/.ssh/config` alias works — including `ProxyJump`, agent forwarding and
 hardware keys, because nvmux drives your own ssh client rather than
 reimplementing it.
-
-Attaching waits for the session to answer, however long that takes — one in
-the middle of `:!make` answers when the make is done. If it takes more than a
-moment, the screen says which session it is waiting for, with a spinner, and
-the bottom row offers `Esc` to give up and go back to the picker.
 
 ### While attached
 
