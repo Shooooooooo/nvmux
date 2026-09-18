@@ -9,6 +9,13 @@
 //! being waited for, with a spinner beside the name so the wait is visibly the
 //! session's and not a hang, and it offers `Esc` to give up on it.
 //!
+//! The one wait that is *not* waited out is a session parked on a keypress,
+//! which the probe reports as [`Answer::Blocked`] rather than asking anything
+//! deferred of it. There is nothing to spin for there: the session will not
+//! move until a key reaches it, and the client this screen is holding back is
+//! how the user presses one. So that answer hands the terminal over at once —
+//! before `GRACE`, so this screen never appears for it at all.
+//!
 //! # The shape is the picker's
 //!
 //! One centred line where the picker draws its list, and one dim hint row on
@@ -35,14 +42,16 @@
 //! which is the whole reason that row is unconditional. What was typed
 //! *before* the spinner appeared is drained and dropped at that moment rather
 //! than acted on: an `Esc` typed a tenth of a second after `Enter`, onto a
-//! blank screen, was not an answer to an offer nobody had seen yet. Any other
-//! key is dropped too, whenever it arrives: the session is not answering, and
-//! there is nowhere to send it.
+//! blank screen, was not an answer to an offer nobody had seen yet.
 //!
-//! What that costs is the keys typed *during* a visible wait, which used to
-//! reach the editor and no longer do. It is the trade the offer is worth: a
-//! wait long enough to draw on is a wait long enough to want out of, and the
-//! screen the keys go to is the one on display.
+//! Any other key is sent on to the session (see [`Forward`]), which is the one
+//! thing this screen does that is not drawing or giving up. Dropping them was
+//! the obvious reading — the session is not answering, so there is nowhere to
+//! send it — and it was wrong twice over: `nvim_input` is a fast call, so a key
+//! lands whatever the editor is parked in, and the waits long enough for this
+//! screen to appear include the ones that end *only* when a key arrives. A
+//! screen that drew a spinner while swallowing the keystroke that would stop it
+//! is the shape of the bug this was written against.
 //!
 //! One consequence worth knowing: the probe used to run on a cooked terminal,
 //! where `Ctrl-c` was a signal that ended nvmux. Here it is a key — queued for
@@ -60,6 +69,8 @@
 //! wakes the loop at once, so a fast attach pays nothing for the screen, and a
 //! key is read on the way round, at most a [`FRAME`] late.
 
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
@@ -72,7 +83,8 @@ use ratatui::Frame;
 use super::app::Key;
 use super::draw;
 use crate::error::Result;
-use crate::pty::Probe;
+use crate::pty::{Answer, Probe};
+use crate::rpc;
 
 /// How long an attach may take before the screen appears — and, with it,
 /// before a single key is read. The one threshold this screen has; see the
@@ -95,6 +107,13 @@ const CANCEL: &str = "esc cancel";
 pub enum Verdict {
     /// The session will take the client: hand it the terminal.
     Ready,
+    /// The same — hand it the terminal — but the session is waiting for a key
+    /// nvmux will not press, so it will draw nothing until the user presses
+    /// one. Handing over *is* the recovery: the client's keys reach the server
+    /// on the fast path whatever it is waiting in, so the first key ends the
+    /// wait and releases the paint queued behind it. The caller says so on the
+    /// notice, since the screen itself will be blank.
+    Blocked,
     /// The user gave up on the session. The client is the caller's to retire.
     Cancelled,
 }
@@ -103,7 +122,7 @@ impl Verdict {
     /// Whether this hands the terminal to the client — see
     /// [`super::Screen::close_for_attach`].
     fn attaches(&self) -> bool {
-        matches!(self, Self::Ready)
+        matches!(self, Self::Ready | Self::Blocked)
     }
 }
 
@@ -120,13 +139,14 @@ struct State {
 ///
 /// A failed probe is the error it failed with. The terminal goes back through
 /// the ordinary close then, as on a cancel: the picker comes next and takes
-/// the screen for itself. Only [`Verdict::Ready`] gives it back cleared, for
-/// the relay. The probe is dropped on every way out, which is what ends its
-/// worker (see [`Probe`]).
-pub fn run(probe: Probe, name: &str) -> Result<Verdict> {
+/// the screen for itself. The two answers that have a client to hand —
+/// [`Verdict::Ready`] and [`Verdict::Blocked`] — give it back cleared instead,
+/// for the relay. The probe is dropped on every way out, which is what ends
+/// its worker (see [`Probe`]).
+pub fn run(probe: Probe, name: &str, sock: &Path) -> Result<Verdict> {
     // No mouse: see the module docs.
     super::owning_for_attach(Verdict::attaches, false, |terminal| {
-        run_on(terminal, probe, name)
+        run_on(terminal, probe, name, sock)
     })
 }
 
@@ -134,6 +154,7 @@ fn run_on(
     terminal: &mut ratatui::DefaultTerminal,
     mut probe: Probe,
     name: &str,
+    sock: &Path,
 ) -> Result<Verdict> {
     let started = Instant::now();
     let mut state = State {
@@ -142,11 +163,17 @@ fn run_on(
     };
     // Whether the queue has been drained, which happens once, at `GRACE`.
     let mut listening = false;
+    let mut forward = Forward::to(sock);
 
     loop {
-        if let Some(verdict) = probe.wait(FRAME) {
-            verdict?;
-            return Ok(Verdict::Ready);
+        if let Some(answer) = probe.wait(FRAME) {
+            return Ok(match answer? {
+                Answer::Ready => Verdict::Ready,
+                Answer::Blocked { mode } => {
+                    tracing::info!(mode = %mode, "attach: handing over a session waiting for a key");
+                    Verdict::Blocked
+                }
+            });
         }
         state.elapsed = started.elapsed();
 
@@ -161,10 +188,113 @@ fn run_on(
                 if matches!(key, Key::Esc | Key::CtrlC) {
                     return Ok(Verdict::Cancelled);
                 }
+                forward.send(key);
             }
         }
 
         terminal.draw(|f| draw(f, &state))?;
+    }
+}
+
+/// Where a key typed during a visible wait goes.
+///
+/// It used to go nowhere. What the module docs above call the cost of the
+/// offer — "the keys typed *during* a visible wait, which used to reach the
+/// editor and no longer do" — turned out to have a sharper edge than losing a
+/// keystroke: the waits long enough to draw on include the ones the session is
+/// in *because* it is waiting for a key, and dropping the keys there meant
+/// nvmux was eating the one thing that would end the wait it was drawing.
+///
+/// So they are sent on, over a connection of this screen's own: `nvim_input`
+/// is a fast call, answered from the socket's read callback, so a key lands
+/// whatever the editor is parked in — which is the whole reason it is worth
+/// sending. The probe's own connection cannot carry them, being parked in a
+/// blocking read on its worker thread.
+///
+/// "Whatever it is parked in" is stronger than the rest of this crate's
+/// fast-call caution, and is measured rather than assumed. During a `:!cmd`,
+/// where `nvim_get_mode` is queued like any deferred call and answers nothing
+/// at all, `nvim_input` still answers in 0.1 ms (0.12.5, `:!sleep 4`). So a
+/// send here does not stall the loop it is drawn from, in the one state where
+/// it might have been expected to — and a failure really does mean the session
+/// is unreachable, which is why one is enough to stop trying.
+///
+/// Only the keys nvmux can spell without guessing are sent (see [`notation`]).
+/// `Esc` and `Ctrl-c` never reach here: they are the offer on the hint row, and
+/// answering it is not typing.
+struct Forward<'a> {
+    sock: &'a Path,
+    /// Opened on the first key, so an attach nobody types during — which is
+    /// nearly all of them — costs no connection at all.
+    client: Option<rpc::Client<UnixStream>>,
+    /// Set once the session could not be reached or would not take a key, so
+    /// it is not dialled again on every keystroke of a long wait. Nothing is
+    /// reported: a key that did not arrive is exactly as bad as the key that
+    /// was dropped before this existed, and the wait is still the user's to
+    /// end with `Esc`.
+    gave_up: bool,
+}
+
+impl<'a> Forward<'a> {
+    fn to(sock: &'a Path) -> Self {
+        Self {
+            sock,
+            client: None,
+            gave_up: false,
+        }
+    }
+
+    fn send(&mut self, key: Key) {
+        let Some(keys) = notation(key) else {
+            return;
+        };
+        if self.gave_up {
+            return;
+        }
+        if self.client.is_none() {
+            match rpc::Client::connect(self.sock, rpc::CONNECT_TIMEOUT) {
+                Ok(client) => self.client = Some(client),
+                Err(e) => {
+                    tracing::debug!(error = %e, "attaching: no connection for the keys typed");
+                    self.gave_up = true;
+                    return;
+                }
+            }
+        }
+        let client = self.client.as_mut().expect("just connected");
+        if let Err(e) = client.input(&keys) {
+            tracing::debug!(error = %e, "attaching: the session would not take a key");
+            self.gave_up = true;
+        }
+    }
+}
+
+/// This key in Neovim's own notation, or `None` for one nvmux will not guess at.
+///
+/// Deliberately a short list. [`Key`] is lossy — everything it does not name
+/// arrives as [`Key::Other`], and a chord, a function key or an arrow cannot be
+/// recovered from that — so anything beyond these would be nvmux inventing a
+/// keystroke and typing it into somebody's editor, which is the failure the
+/// rest of this change exists to avoid. What is here is enough for the job:
+/// ending a wait takes any key at all, and these are the ones a person leans on
+/// when a screen looks stuck.
+///
+/// `<` is the one character that is not itself in this notation, being the
+/// opening of every named key; `<lt>` is how Neovim spells it.
+fn notation(key: Key) -> Option<String> {
+    match key {
+        Key::Char('<') => Some("<lt>".into()),
+        Key::Char(c) => Some(c.to_string()),
+        Key::Enter => Some("<CR>".into()),
+        Key::Backspace => Some("<BS>".into()),
+        Key::Tab => Some("<Tab>".into()),
+        Key::Up => Some("<Up>".into()),
+        Key::Down => Some("<Down>".into()),
+        Key::Left => Some("<Left>".into()),
+        Key::Right => Some("<Right>".into()),
+        Key::Home | Key::End | Key::BackTab | Key::CtrlN | Key::CtrlP | Key::Other => None,
+        // Never reached: both are the way out, taken before this is asked.
+        Key::Esc | Key::CtrlC => None,
     }
 }
 
@@ -408,6 +538,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Both answers that have a client to hand give it the terminal. A
+    /// blocked session is attached to like any other — that is the whole
+    /// recovery, since the key that ends its wait is one the user presses on
+    /// the client this hands over — and only the notice differs.
+    #[test]
+    fn a_blocked_session_is_attached_to_and_only_a_cancel_is_not() {
+        assert!(Verdict::Ready.attaches());
+        assert!(Verdict::Blocked.attaches());
+        assert!(!Verdict::Cancelled.attaches());
+    }
+
+    /// What may be typed at a session on the user's behalf, and what may not.
+    ///
+    /// The `None`s are the point. [`Key`] collapses everything it does not
+    /// name into `Key::Other`, so a chord or a function key cannot be
+    /// recovered from it, and spelling one anyway would be nvmux inventing a
+    /// keystroke for somebody's editor. `Esc` and `Ctrl-c` are the offer on
+    /// the hint row rather than text, and never reach this at all.
+    #[test]
+    fn only_the_keys_nvmux_can_spell_are_sent_on() {
+        assert_eq!(notation(Key::Char('a')).as_deref(), Some("a"));
+        assert_eq!(notation(Key::Char('日')).as_deref(), Some("日"));
+        assert_eq!(notation(Key::Enter).as_deref(), Some("<CR>"));
+        assert_eq!(notation(Key::Backspace).as_deref(), Some("<BS>"));
+        assert_eq!(notation(Key::Up).as_deref(), Some("<Up>"));
+
+        // `<` opens every named key in this notation, so it is the one
+        // character that cannot be sent as itself.
+        assert_eq!(notation(Key::Char('<')).as_deref(), Some("<lt>"));
+
+        for key in [Key::Other, Key::Esc, Key::CtrlC, Key::CtrlN, Key::CtrlP] {
+            assert_eq!(notation(key), None, "{key:?} must not be guessed at");
+        }
+    }
+
+    /// A session that cannot be reached is not dialled again on every
+    /// keystroke, and never fails the attach: the wait is still the user's to
+    /// end with `Esc`, exactly as it was when the keys went nowhere at all.
+    #[test]
+    fn a_session_that_will_not_take_a_key_is_given_up_on_once() {
+        let mut forward = Forward::to(Path::new("/nonexistent/nvmux-test.sock"));
+        for _ in 0..3 {
+            forward.send(Key::Char('x'));
+        }
+        assert!(forward.gave_up);
+        assert!(forward.client.is_none());
+    }
+
+    /// A key nvmux will not spell must not open a connection either: an
+    /// attach nobody types anything sendable during pays for nothing.
+    #[test]
+    fn an_unspellable_key_costs_no_connection() {
+        let mut forward = Forward::to(Path::new("/nonexistent/nvmux-test.sock"));
+        forward.send(Key::Other);
+        assert!(
+            !forward.gave_up,
+            "an unsendable key must not count as a failure"
+        );
+        assert!(forward.client.is_none());
     }
 
     #[test]

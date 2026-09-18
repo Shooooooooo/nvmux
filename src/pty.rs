@@ -73,6 +73,13 @@ const MAX_UIS: usize = 8;
 // user's session.
 const _: () = assert!(MAX_UIS < 16);
 
+/// What the notice adds for a session that is waiting for a key.
+///
+/// An em dash and four words, appended to the name the box already carries:
+/// the box is one line wide and up for a second, so this is the shortest thing
+/// that says both what is wrong and what to do about it.
+const WAITING: &str = " — press a key";
+
 /// How the relay ended. The attachment is handed back separately by [`relay`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -293,6 +300,33 @@ const DA1_REQUEST: &[u8] = b"\x1b[c";
 const DA1_REPLY: &[u8] = b"\x1b[?1;2c";
 
 impl Attachment {
+    /// Say on the notice that the session is waiting for a key.
+    ///
+    /// A blocked session draws nothing until one arrives, so what the user is
+    /// handed is a screen that looks broken — which is exactly how the bug
+    /// this exists for was reported. The notice is nvmux's own box, written
+    /// over the session's screen rather than by the editor, so it goes up on a
+    /// wedged session as readily as an idle one (see [`crate::announce`]) and
+    /// is the one thing that *can* be said here.
+    ///
+    /// Set between the probe and the relay, which is the only point at which
+    /// anyone knows: the label is chosen when the client is forked, a moment
+    /// before the probe has an answer. A no-op once the notice has been shown,
+    /// like everything else that reads `announce`.
+    pub fn note_waiting_for_a_key(&mut self) {
+        let Some(label) = self.announce.take() else {
+            return;
+        };
+        // Idempotent, so a caller that says it twice does not stutter. One
+        // attach only ever says it once; this is so that stays a property of
+        // the function rather than of every caller.
+        self.announce = Some(if label.ends_with(WAITING) {
+            label
+        } else {
+            format!("{label}{WAITING}")
+        });
+    }
+
     /// Terminate the client, leaving the session's server running. Verified:
     /// killing a `--remote-ui` client — with SIGHUP, SIGTERM or SIGKILL — does
     /// not kill a `--headless --listen` server; the "channel closes, Nvim
@@ -721,6 +755,12 @@ impl Drop for Attachment {
 /// same two halves — [`spawn_client`], then [`Probe::start`] — with the wait
 /// on a screen of its own (`ui::attaching`), which has no budget because the
 /// user is watching it and can give up whenever they choose.
+///
+/// A session waiting for a key is an attachment, not an error — [`Answer`] for
+/// why. It used to be one, by running the budget out, and that refusal was the
+/// bug: the way out of that state is a key pressed on the very client the
+/// refusal was throwing away. Only a session that cannot be reached, or one
+/// with too many UIs already, is still refused here.
 pub fn spawn(session_id: &str, sock: &Path, announce: &str) -> Result<Attachment> {
     spawn_with(session_id, sock, announce, client_command(sock))
 }
@@ -797,11 +837,19 @@ fn spawn_with(
                 rpc::PROBE_TIMEOUT,
             ))))
     });
-    if let Err(e) = verdict {
-        // Explicitly, so the retirement is not left to a binding: the client
-        // must be gone, and its pty with it, before the error is shown.
-        drop(attachment);
-        return Err(e);
+    match verdict {
+        // A blocked session is attached to, as the binary attaches to one:
+        // the refusal it used to get helped nobody, since the way out of that
+        // state is a key the user presses on the client this is about to hand
+        // them. Only the notice differs, and this variant draws none.
+        Ok(answer) => tracing::debug!(?answer, "attach probe answered"),
+        Err(e) => {
+            // Explicitly, so the retirement is not left to a binding: the
+            // client must be gone, and its pty with it, before the error is
+            // shown.
+            drop(attachment);
+            return Err(e);
+        }
     }
     tracing::debug!(
         ms = t_probe.elapsed().as_secs_f64() * 1000.0,
@@ -835,10 +883,31 @@ fn spawn_with(
 /// Told the answer through a channel rather than joined, so the screen can
 /// poll it on the same tick it draws on.
 pub struct Probe {
-    rx: mpsc::Receiver<Result<()>>,
+    rx: mpsc::Receiver<Result<Answer>>,
     interrupt: rpc::Interrupt,
     /// `None` only once a test has taken it, to prove the worker ended.
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// What the attach probe found, for a session it could reach at all.
+///
+/// The distinction is not how healthy the session is but whether anything
+/// deferred can be asked of it. A session waiting for a key runs its main loop
+/// with the event queue switched off, so `nvim_list_uis` — and the client's own
+/// `nvim_ui_attach` behind it — are not answered until a key arrives. The probe
+/// must therefore say so and get out of the way rather than join the queue: see
+/// [`probe_on`] for what nvmux will and will not type to end that wait itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    /// The session answered a deferred call, and has room for this client.
+    Ready,
+    /// Reachable, and waiting for a key nvmux may not press on the user's
+    /// behalf. No deferred call is served until one arrives, so the UI count
+    /// is unknown and the client's first paint is queued behind the same key.
+    Blocked {
+        /// The mode it is waiting in, as `nvim_get_mode` spells it, for the log.
+        mode: String,
+    },
 }
 
 impl Probe {
@@ -873,7 +942,7 @@ impl Probe {
     /// is given once, after which the probe is done with. A worker that died
     /// without answering is an error, not a `None`: a screen looping on this
     /// must never be left spinning for a verdict that is not coming.
-    pub fn wait(&mut self, timeout: Duration) -> Option<Result<()>> {
+    pub fn wait(&mut self, timeout: Duration) -> Option<Result<Answer>> {
         match self.rx.recv_timeout(timeout) {
             Ok(verdict) => Some(verdict),
             Err(mpsc::RecvTimeoutError::Timeout) => None,
@@ -923,39 +992,103 @@ impl Drop for Probe {
 /// any other call, which is why `rpc::probe` asks both — so this is not a
 /// claim that the two are interchangeable. What it cost was a round trip on
 /// every attach, forwarded over SSH.
-fn probe_on(client: &mut rpc::Client<UnixStream>, session_id: &str) -> Result<()> {
-    // A server at a hit-enter prompt cannot answer `list_uis`, a deferred
-    // call, until a key ends the prompt. Usually there is nobody to type one:
-    // the client that was showing the prompt is gone, and this is its
-    // replacement — which may already be attached by now, and then sees the
-    // prompt end and repaints, as any other UI would. So the prompt is ended
-    // here with `<CR>`, the key it consumes without running anything (see
-    // `rpc::Mode::at_hit_enter` for why only this prompt), and the count that
-    // follows is real, not guessed.
+fn probe_on(client: &mut rpc::Client<UnixStream>, session_id: &str) -> Result<Answer> {
+    // A server waiting for a key cannot answer `list_uis`, a deferred call,
+    // until one arrives. So the mode is read first, every time round, and
+    // nothing deferred is asked until it says the queue is running. Asking
+    // anyway is what this loop exists to stop: the connection has no budget
+    // (see [`Probe::start`]), so a deferred call to a session in that state is
+    // not a slow answer but no answer at all, and the screen waiting on it
+    // spins until the user gives up.
+    //
+    // The one wait nvmux ends itself is the hit-enter prompt, with `<CR>`, the
+    // key it consumes without running anything — see `rpc::Mode::at_hit_enter`
+    // for why only that one. Usually there is nobody else to type it: the
+    // client that was showing the prompt is gone, and this is its replacement.
+    //
+    // Re-read rather than sent and forgotten, because one `<CR>` ends one
+    // prompt and Neovim stacks them: three scheduled callbacks that each raise
+    // an error leave three, and the count is not knowable in advance. Measured
+    // against 0.12.5, the round trip is its own settle — the mode read after a
+    // `<CR>` already reflects it, so exactly three are sent for three prompts
+    // and none is wasted. Each one is justified by its own fresh reading,
+    // which is a stricter licence than the single blind `<CR>` this replaces.
     //
     // A deliberate trade-off where another UI is still attached: that user's
     // prompt ends too, and whatever it was showing — a `:!make` page, a Lua
     // traceback — leaves their screen unread. `g<` brings the page back and
-    // `:messages` keeps the rest; the old behaviour was a 3 s failure to
-    // attach at all. Advisory, not a lock: a key from that other UI in the
-    // microseconds between the two calls ends the prompt first, and this
+    // `:messages` keeps the rest. Advisory, not a lock: a key from that other
+    // UI in the microseconds between two calls ends the prompt first, and the
     // `<CR>` then runs in whatever mode it left.
-    if client.get_mode()?.at_hit_enter() {
+    for _ in 0..MAX_PROMPTS {
+        let mode = client.get_mode()?;
+        if !mode.blocking {
+            return ui_count(client, session_id);
+        }
+        if !mode.at_hit_enter() {
+            // A more-prompt, a half-typed `g`, a script parked on a key: over
+            // RPC these are one state, and nvmux cannot tell a session wedged
+            // by a crashed callback from a command the user started and left.
+            // So it says so and hands the terminal over — the client's own
+            // keys go out as `nvim_input`, a fast call, so the first thing the
+            // user presses lands, ends the wait, and releases the queued
+            // `nvim_ui_attach` behind it.
+            tracing::info!(
+                id = session_id,
+                mode = %mode.mode,
+                "attach: the session is waiting for a key nvmux must not press"
+            );
+            return Ok(Answer::Blocked { mode: mode.mode });
+        }
         tracing::info!(
             id = session_id,
             "attach: ending the session's hit-enter prompt"
         );
         client.input("<CR>")?;
     }
-    // Not `unwrap_or(0)`: a server too busy to answer is exactly the one whose
-    // UI count is unknown, and guessing zero is how the seventeenth attach
-    // happens.
-    //
-    // `>` rather than `>=`: the client this probe runs alongside may or may
-    // not be attached yet, so the count is off by at most one, in the
-    // direction of our own client. `MAX_UIS` is half of Neovim's limit, so a
-    // count one too high refuses the ninth other client rather than the
-    // eighth, and a count one too low still stops seven short of the abort.
+
+    // Still prompting after the budget: something is raising them faster than
+    // they are answered. Report it rather than park on it — the user's own
+    // keys are a better answer than an unbounded wait, and they can see what
+    // the prompts say.
+    let mode = client.get_mode()?;
+    if mode.blocking {
+        tracing::info!(
+            id = session_id,
+            mode = %mode.mode,
+            "attach: the session is still prompting after {MAX_PROMPTS} keys"
+        );
+        return Ok(Answer::Blocked { mode: mode.mode });
+    }
+    ui_count(client, session_id)
+}
+
+/// How many hit-enter prompts one attach will answer before handing the
+/// terminal over instead.
+///
+/// Three scheduled callbacks that each raise an error stack three prompts, so
+/// the budget is one more than that: enough for the case that produced it, and
+/// small enough that a session generating them faster than nvmux can answer is
+/// given back to the user rather than typed at indefinitely.
+const MAX_PROMPTS: usize = 4;
+
+/// The deferred half of the probe: whether this session has room for another
+/// client. Only ever called on a mode reading that said the queue is running.
+///
+/// The wait here is still unbounded, and deliberately: a session in the middle
+/// of a `:!make` answers when the make is done, and that is one to wait for
+/// with a spinner rather than to refuse (see `ui::attaching`). What the caller
+/// has ruled out first is the wait that would never end on its own.
+///
+/// Not `unwrap_or(0)`: a server too busy to answer is exactly the one whose UI
+/// count is unknown, and guessing zero is how the seventeenth attach happens.
+///
+/// `>` rather than `>=`: the client this probe runs alongside may or may not be
+/// attached yet, so the count is off by at most one, in the direction of our own
+/// client. `MAX_UIS` is half of Neovim's limit, so a count one too high refuses
+/// the ninth other client rather than the eighth, and a count one too low still
+/// stops seven short of the abort.
+fn ui_count(client: &mut rpc::Client<UnixStream>, session_id: &str) -> Result<Answer> {
     let uis = client.list_uis()?;
     if uis > MAX_UIS {
         return Err(NvmuxError::Session(
@@ -965,7 +1098,7 @@ fn probe_on(client: &mut rpc::Client<UnixStream>, session_id: &str) -> Result<()
             },
         ));
     }
-    Ok(())
+    Ok(Answer::Ready)
 }
 
 /// Open a pty and start the client on it.
@@ -2192,7 +2325,22 @@ mod tests {
         uis: usize,
         mouse: (&'static str, i64),
     ) -> std::thread::JoinHandle<Vec<String>> {
-        serve_recording(sock, mode, blocking, uis, mouse, None)
+        serve_recording(sock, mode, blocking, uis, mouse, None, false)
+    }
+
+    /// A server whose prompt *ends* when it is typed at: it answers `mode`
+    /// until the first `nvim_input`, and an idle `n` from then on.
+    ///
+    /// The fixed-mode servers above model a prompt that outlasts every key,
+    /// which is the state the probe must refuse to wait on. This models the
+    /// ordinary one, and is the only way to see the probe go on to the UI
+    /// count after answering a prompt — the thing that made the `<CR>` worth
+    /// sending in the first place.
+    fn recording_server_clearing_on_input(
+        sock: &Path,
+        mode: &'static str,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        serve_recording(sock, mode, true, 0, DEFAULT_MOUSE, None, true)
     }
 
     /// An idle server that records `method` and then never answers it — a
@@ -2201,7 +2349,7 @@ mod tests {
         sock: &Path,
         method: &'static str,
     ) -> std::thread::JoinHandle<Vec<String>> {
-        serve_recording(sock, "n", false, 0, DEFAULT_MOUSE, Some(method))
+        serve_recording(sock, "n", false, 0, DEFAULT_MOUSE, Some(method), false)
     }
 
     fn serve_recording(
@@ -2211,6 +2359,7 @@ mod tests {
         uis: usize,
         mouse: (&'static str, i64),
         stall_on: Option<&'static str>,
+        clears_on_input: bool,
     ) -> std::thread::JoinHandle<Vec<String>> {
         use rmpv::Value;
 
@@ -2223,6 +2372,8 @@ mod tests {
             .expect("a non-blocking listener");
         std::thread::spawn(move || {
             let mut asked = Vec::new();
+            // Set by the first `nvim_input` where the prompt is one that ends.
+            let mut typed_at = false;
             let deadline = Instant::now() + Duration::from_secs(5);
             let stream = loop {
                 match listener.accept() {
@@ -2268,6 +2419,10 @@ mod tests {
                             ]),
                         )]),
                     ]),
+                    "nvim_get_mode" if clears_on_input && typed_at => Value::Map(vec![
+                        (Value::String("mode".into()), Value::String("n".into())),
+                        (Value::String("blocking".into()), Value::Boolean(false)),
+                    ]),
                     "nvim_get_mode" => Value::Map(vec![
                         (Value::String("mode".into()), Value::String(mode.into())),
                         (Value::String("blocking".into()), Value::Boolean(blocking)),
@@ -2300,6 +2455,9 @@ mod tests {
                     Some(keys) if method == "nvim_input" => format!("{method}({keys})"),
                     _ => method.to_string(),
                 });
+                if method == "nvim_input" {
+                    typed_at = true;
+                }
                 if stall_on == Some(method) {
                     // Recorded and never answered. The loop goes on reading,
                     // so it ends on the EOF a cancelled probe's shutdown
@@ -2484,20 +2642,29 @@ mod tests {
     /// The server here would still answer it, so its absence is what is asserted.
     #[test]
     fn the_attach_probe_asks_the_mode_then_the_ui_count_and_nothing_else() {
-        for (tag, mode, blocking, want) in [
-            ("idle", "n", false, &["nvim_get_mode", "nvim_list_uis"][..]),
+        for (tag, mode, want) in [
+            ("idle", "n", &["nvim_get_mode", "nvim_list_uis"][..]),
+            // The prompt ends on the key, and the mode is read again before
+            // anything deferred is asked: the `<CR>` is not sent and forgotten,
+            // because the reading it was sent on is the only thing that says
+            // asking `list_uis` is safe.
             (
                 "hitenter",
                 "r",
-                true,
-                &["nvim_get_mode", "nvim_input(<CR>)", "nvim_list_uis"][..],
+                &[
+                    "nvim_get_mode",
+                    "nvim_input(<CR>)",
+                    "nvim_get_mode",
+                    "nvim_list_uis",
+                ][..],
             ),
-            // Blocking, but not the prompt a `<CR>` ends: a more-prompt, or a
-            // half-typed `g`. Typing for the user there would run something.
-            ("more", "rm", true, &["nvim_get_mode", "nvim_list_uis"][..]),
         ] {
             let sock = temp_sock(tag);
-            let server = recording_server(&sock, mode, blocking);
+            let server = if mode == "r" {
+                recording_server_clearing_on_input(&sock, mode)
+            } else {
+                recording_server(&sock, mode, false)
+            };
             // Bound to `_` so the attachment is retired at once.
             let _ = spawn_with("probe", &sock, "1  probe", standin_client(tag))
                 .expect("a passed probe is an attachment");
@@ -2505,6 +2672,90 @@ mod tests {
                 server.join().expect("the server thread"),
                 want,
                 "the attach probe asked something else in mode {mode:?}"
+            );
+            let _ = std::fs::remove_file(&sock);
+        }
+    }
+
+    /// The notice is the only thing a blocked session can be told with, so it
+    /// has to carry the one instruction that gets the user out: press a key.
+    ///
+    /// Amended rather than replaced, because the name is still the answer to
+    /// the question the box normally answers — which session is this — and a
+    /// blocked attach should not stop saying it. A notice already spent says
+    /// nothing new: the box is up for a second once, and there is no second
+    /// one to correct.
+    #[test]
+    fn a_blocked_session_says_so_on_its_notice_without_losing_its_name() {
+        let mut attachment = attached_to("while :; do read x; done");
+        attachment.announce = Some("dotfiles".to_string());
+        attachment.note_waiting_for_a_key();
+        let said = attachment.announce.clone().expect("a notice");
+        assert!(said.starts_with("dotfiles"), "{said:?}");
+        assert!(said.contains("press a key"), "{said:?}");
+
+        // Saying it twice says it once: no stutter on the one line the box has.
+        attachment.note_waiting_for_a_key();
+        assert_eq!(attachment.announce.as_deref(), Some(said.as_str()));
+
+        // A notice already spent stays spent: the box is up once, and there is
+        // no second one to correct.
+        attachment.announce = None;
+        attachment.note_waiting_for_a_key();
+        assert_eq!(attachment.announce, None);
+    }
+
+    /// **The regression test for the attach that never came back.** A session
+    /// waiting for a key must never be asked anything deferred.
+    ///
+    /// `nvim_list_uis` is deferred, and the probe's connection has no budget,
+    /// so asking it of a session in one of these states is not a slow answer
+    /// but no answer at all: the worker parks, `ui::attaching` spins, and the
+    /// only way out is the user giving up. Measured against 0.12.5, all three
+    /// of these did exactly that.
+    ///
+    /// So the assertion is on what is *absent*. `nvim_list_uis` must not
+    /// appear at all, and the answer must be `Blocked` — from which the attach
+    /// goes ahead anyway, because the client nvmux is about to hand over is how
+    /// the user presses the key that ends the wait.
+    #[test]
+    fn a_session_waiting_for_a_key_is_never_asked_anything_deferred() {
+        for (tag, mode, keys) in [
+            // A more-prompt. `<CR>` scrolls it a line rather than ending it.
+            ("more", "rm", 0),
+            // A half-typed `g`: `n` with `blocking` set, which is the state the
+            // reported session was found in. Indistinguishable over RPC from a
+            // command the user started, so nvmux types nothing.
+            ("pending", "n", 0),
+            // A hit-enter prompt that outlasts every key — something is raising
+            // them faster than they are answered. The budget is spent and then
+            // it is handed over, rather than typed at for ever.
+            ("stacked", "r", MAX_PROMPTS),
+        ] {
+            let sock = temp_sock(tag);
+            let server = recording_server(&sock, mode, true);
+            let mut probe = Probe::start(tag, &sock).expect("connected");
+            let answer = probe
+                .wait(Duration::from_secs(5))
+                .expect("the probe must answer rather than park")
+                .expect("a blocked session is not an error");
+            assert_eq!(
+                answer,
+                Answer::Blocked { mode: mode.into() },
+                "{tag}: the probe did not report the session as blocked"
+            );
+            drop(probe);
+
+            let asked = server.join().expect("the server thread");
+            assert!(
+                !asked.iter().any(|m| m == "nvim_list_uis"),
+                "{tag}: the probe asked a deferred call of a session \
+                 that cannot answer one: {asked:?}"
+            );
+            assert_eq!(
+                asked.iter().filter(|m| m.starts_with("nvim_input")).count(),
+                keys,
+                "{tag}: the wrong number of keys was typed at the session: {asked:?}"
             );
             let _ = std::fs::remove_file(&sock);
         }

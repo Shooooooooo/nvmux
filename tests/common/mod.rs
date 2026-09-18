@@ -323,6 +323,40 @@ pub fn at_hit_enter(sock: &Path) -> bool {
         .is_ok_and(|m| m.at_hit_enter())
 }
 
+/// The mode the server behind `sock` is in right now, or `None` if it could
+/// not be asked. A fast call, answered even while it is blocked, which is the
+/// whole reason anything asks it.
+pub fn mode(sock: &Path) -> Option<nvmux::rpc::Mode> {
+    Client::connect(sock, Duration::from_secs(2))
+        .and_then(|mut c| c.get_mode())
+        .ok()
+}
+
+/// Leave the session waiting for a key in a state nvmux must *not* answer for
+/// the user: a half-typed multi-key command, which is mode `n` with `blocking`
+/// set.
+///
+/// Unlike [`HitEnter`] this needs no UI — measured on 0.12.5, a headless server
+/// with none blocks on this exactly as one with a UI does, because it is
+/// `vgetc` waiting for the second key rather than `wait_return` waiting to be
+/// dismissed. Which is the point of the state: it is indistinguishable over RPC
+/// from a session wedged by a crashed callback, and from a command the user
+/// started and walked away from, so nvmux may not type into it.
+///
+/// Ends on any key. Nothing here presses one, which is what the tests check.
+pub fn block_on_a_key(sock: &Path) {
+    Client::connect(sock, Duration::from_secs(2))
+        .expect("connect")
+        .input("g")
+        .expect("start a multi-key command");
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            mode(sock).is_some_and(|m| m.blocking && m.mode == "n")
+        }),
+        "the server never started waiting for the second key"
+    );
+}
+
 /// End a hit-enter prompt the way a user would.
 pub fn press_enter(sock: &Path) {
     Client::connect(sock, Duration::from_secs(2))

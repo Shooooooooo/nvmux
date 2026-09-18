@@ -972,6 +972,100 @@ fn a_fresh_attach_to_a_session_at_a_hit_enter_prompt_ends_it_and_attaches() {
     attachment.terminate();
 }
 
+/// **The attach that never came back.** A session waiting for a key nvmux may
+/// not press must still be attached to — promptly, and without being typed at.
+///
+/// This is the shape of the reported bug. `nvim_list_uis` is deferred and the
+/// attach probe's connection has no budget, so a session in this state held the
+/// probe for ever: the spinner turned, nothing happened, and `Esc` was the only
+/// way out. It looked like nvmux had lost the session.
+///
+/// It is also why the fix is not a cleverer key. Mode `n` with `blocking` set
+/// is what a crashed `vim.schedule()` callback leaves behind *and* what a
+/// half-typed `g` leaves behind, and over RPC those are one state. So the probe
+/// says so and gets out of the way: the client it is holding back is how the
+/// user presses the key that ends the wait, since `nvim_input` is a fast call
+/// and lands whatever the editor is parked in.
+#[test]
+fn a_session_waiting_for_a_key_is_attached_to_without_being_typed_at() {
+    require_nvim!();
+    let scratch = Scratch::new("blockedattach");
+    let t = scratch.transport();
+    let session = t
+        .create_session("wedged", &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket");
+    common::block_on_a_key(&sock);
+
+    let started = Instant::now();
+    let attachment = nvmux::pty::spawn(&session.id, &sock, "1  wedged").expect("attach");
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(2),
+        "the attach took {took:?}: it waited on a session that cannot answer"
+    );
+
+    // The whole invariant, in one assertion: the session is *still* waiting for
+    // its second key. Nothing nvmux did completed the command the user started.
+    let after = common::mode(&sock).expect("the mode is a fast call");
+    assert!(
+        after.blocking && after.mode == "n",
+        "nvmux typed into a state it cannot identify: {after:?}"
+    );
+
+    attachment.terminate();
+}
+
+/// The other half: once a key does arrive — from the user, on the client the
+/// attach just handed them — the session serves deferred calls again and the
+/// paint queued behind the wait is released.
+///
+/// Attaching is therefore the whole recovery, not a workaround for it.
+#[test]
+fn a_key_ends_the_wait_and_releases_what_was_queued_behind_it() {
+    require_nvim!();
+    let scratch = Scratch::new("blockedkey");
+    let t = scratch.transport();
+    let session = t
+        .create_session("wedged", &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket");
+    common::block_on_a_key(&sock);
+
+    // Deferred calls are dead while it waits: this is what parked the probe.
+    assert_eq!(nvmux::rpc::probe(&sock), Liveness::Busy);
+
+    let attachment = nvmux::pty::spawn(&session.id, &sock, "1  wedged").expect("attach");
+    // The client's UI attach is deferred too, so it is queued behind the same
+    // key and the session is still blocked with it forked.
+    assert!(
+        common::mode(&sock).is_some_and(|m| m.blocking),
+        "the attach should not have ended the wait by itself"
+    );
+
+    // The user presses a key. `nvim_input` is what the client sends one with.
+    nvmux::rpc::Client::connect(&sock, Duration::from_secs(2))
+        .expect("connect")
+        .input("<Esc>")
+        .expect("press a key");
+
+    assert!(
+        common::wait_until(Duration::from_secs(10), || nvmux::rpc::probe(&sock)
+            == Liveness::Alive),
+        "the session should serve deferred calls again once a key has arrived"
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
+                .and_then(|mut c| c.list_uis())
+                .is_ok_and(|n| n == 1)
+        }),
+        "the client's queued UI attach never landed"
+    );
+
+    attachment.terminate();
+}
+
 /// The whole point of asking how nvim is launched: the command chosen is the
 /// command that runs, and the session it starts is an ordinary session —
 /// listed, reachable, and killable by the same socket-matching as any other.

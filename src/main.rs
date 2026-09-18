@@ -450,7 +450,7 @@ fn new_attachment(
     // no, and a wait the user gives up on all end the same way, by dropping
     // the attachment — explicitly, so the client is gone, and its pty with
     // it, before the picker says anything about it.
-    let attachment = pty::spawn_client(&session.id, &sock, &notice)?;
+    let mut attachment = pty::spawn_client(&session.id, &sock, &notice)?;
     let probe = match pty::Probe::start(&session.id, &sock) {
         Ok(probe) => probe,
         Err(e) => {
@@ -458,8 +458,17 @@ fn new_attachment(
             return Err(e);
         }
     };
-    match ui::attaching::run(probe, &session.name) {
+    match ui::attaching::run(probe, &session.name, &sock) {
         Ok(ui::attaching::Verdict::Ready) => Ok(Some(attachment)),
+        // Attached like any other, and the client is already on its way — but
+        // it will draw nothing until a key reaches the server, so the notice
+        // is the one thing that can say why the screen is blank. It is nvmux's
+        // own box rather than the editor's, which is what lets it go up on a
+        // session that is not drawing at all.
+        Ok(ui::attaching::Verdict::Blocked) => {
+            attachment.note_waiting_for_a_key();
+            Ok(Some(attachment))
+        }
         Ok(ui::attaching::Verdict::Cancelled) => {
             drop(attachment);
             Ok(None)
