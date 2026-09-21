@@ -115,6 +115,27 @@ impl Outcome {
     fn leads_straight_into_another_relay(self) -> bool {
         matches!(self, Outcome::Switch(_))
     }
+
+    /// The session this outcome names, for the caller that starts the next
+    /// attachment while the outgoing one dissolves (see [`relay`]). `None` for
+    /// every other way a relay can end: the three that open a screen have
+    /// nothing to start yet, and the three that end it have nowhere to go.
+    ///
+    /// Its own accessor rather than a `matches!` at the call site, so the one
+    /// rule it carries is pinned by a test — a new outcome that leads into
+    /// another relay must not be able to arrive here and silently begin
+    /// nothing, which would cost a fade's worth of overlap and no error.
+    fn switch_target(self) -> Option<Target> {
+        match self {
+            Outcome::Switch(target) => Some(target),
+            Outcome::ToPicker
+            | Outcome::Detached
+            | Outcome::CreateNew
+            | Outcome::ShowHelp
+            | Outcome::ChildExited
+            | Outcome::StdinClosed => None,
+        }
+    }
 }
 
 /// Which session a `<prefix>` switch named: one by its number, or the one next
@@ -1203,9 +1224,29 @@ fn spawn_client_with(
 /// * A thread parked in a blocking `read(0)` cannot be cancelled, so returning
 ///   to the picker would hang or swallow the first keystroke. A `poll` loop
 ///   just stops polling.
+///
+/// # Starting the next session before this one has finished leaving
+///
+/// `begin_next` is called with the target of a `<prefix>` switch, once, the
+/// moment [`pump`] returns one — before this session dissolves and before the
+/// terminal is handed back. What follows that call is the best part of a
+/// `fade.duration_ms` of nvmux drawing its own frames, and the work the next
+/// attachment opens with is a fork and a round trip that touch nothing this
+/// function is using: a client writes into its own pty and nothing reaches the
+/// terminal until a relay copies it (see [`spawn_client`]), and the probe
+/// answers on a thread of its own (see [`Probe`]). Started here, both run
+/// underneath the dissolve instead of after it.
+///
+/// So the callback must *start* things and not wait for them: it is called
+/// with the terminal still raw and the outgoing session still on it, and
+/// anything it blocks on is time the user watches a frozen screen for. It must
+/// not draw. Every other outcome calls it not at all — the picker, the prompt
+/// and the help screen have nothing to start, and the three that end the relay
+/// have nowhere to go.
 pub fn relay(
     mut attachment: Attachment,
     highest_session_num: u32,
+    begin_next: &mut dyn FnMut(Target),
 ) -> Result<(Outcome, Option<Attachment>)> {
     let master_fd = attachment
         .master
@@ -1279,6 +1320,13 @@ pub fn relay(
         highest_session_num,
         popup,
     );
+
+    // As early as there is anything to say: everything below this line is
+    // nvmux drawing, and what the caller starts here runs underneath it. See
+    // the note on `begin_next`.
+    if let Some(target) = outcome.as_ref().ok().and_then(|o| o.switch_target()) {
+        begin_next(target);
+    }
 
     // Whatever ended the relay, nothing the client wrote may stay unshown: a
     // relay cut short inside the hold — a prefix typed at once, a child that
@@ -2303,6 +2351,30 @@ mod tests {
         assert_eq!(&bytes[at..], b"\x1b[2J~");
         assert_eq!(split_at_alt_screen_entry(b"\x1b[2J~"), 0);
         assert_eq!(split_at_alt_screen_entry(b""), 0);
+    }
+
+    /// The one outcome with a session to begin before the screen goes. Every
+    /// variant is asked, so a new one has to decide rather than default to
+    /// starting nothing — the failure that would cost an overlap silently.
+    #[test]
+    fn only_a_switch_names_a_session_to_begin_early() {
+        for target in [Target::Number(3), Target::Step(Direction::Next)] {
+            assert_eq!(Outcome::Switch(target).switch_target(), Some(target));
+        }
+        for other in [
+            Outcome::ToPicker,
+            Outcome::CreateNew,
+            Outcome::ShowHelp,
+            Outcome::Detached,
+            Outcome::ChildExited,
+            Outcome::StdinClosed,
+        ] {
+            assert_eq!(
+                other.switch_target(),
+                None,
+                "{other:?} has no session to begin an attachment for"
+            );
+        }
     }
 
     #[test]

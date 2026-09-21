@@ -67,7 +67,7 @@ fn relay_child() {
     // reaching the machine, and a box drawn over the screen would be noise in
     // the stream the parent is reading.
     let attachment = nvmux::pty::spawn(&id, Path::new(&sock), "").expect("attach");
-    let code = match nvmux::pty::relay(attachment, 0) {
+    let code = match nvmux::pty::relay(attachment, 0, &mut |_| {}) {
         Ok((nvmux::pty::Outcome::Detached, _)) => 0,
         Ok((other, _)) => {
             eprintln!("relay ended with {other:?}");
