@@ -21,20 +21,32 @@
 //! you on, has stopped being a proxy. What is left is the one that draws on the
 //! terminal nvmux already owns the bytes of.
 //!
-//! # The lull
+//! # Between the session's sequences
 //!
-//! The box goes up on the first pass of the relay loop on which the child has
-//! been quiet for [`SETTLE`]. That is the *only* safe moment: `pump` never
-//! parses the child's output, so it cannot otherwise know that a write of its
-//! own would not land in the middle of one of the child's escape sequences, and
-//! a lull is the one state where it cannot.
+//! The box goes up on the first pass of the relay loop on which the terminal
+//! is between the session's escape sequences, and goes back up on every pass
+//! after one where the session wrote — which is what stops the editor's next
+//! frame taking it off the screen for good. [`crate::boundary`] is what
+//! answers that question and what makes the answer true often enough to be
+//! worth asking.
 //!
-//! If no lull arrives within [`GIVE_UP`], nothing is shown. A screen that has
-//! been busy for two solid seconds is one where a box dropped on top is as
-//! likely to be corruption as information, and the name is not worth that.
+//! It used to be a clock: 25 ms of the child saying nothing, on the reasoning
+//! that a write cannot land inside a sequence that nobody is writing. The test
+//! was sound and the question was the wrong one. A session with a window
+//! repainting at sixty frames a second never goes quiet for 25 ms — so on a
+//! busy screen the box blinked at whatever rate the lulls came, and on a
+//! genuinely busy one it never appeared at all. Reproduced, before this was
+//! changed, by running a starfield at full tilt in a `:terminal` buffer and
+//! switching into the session: the box went up and was wiped eleven times in
+//! its one second, and at sixty frames a second nvmux gave up on it entirely.
+//!
+//! If no such moment arrives within [`GIVE_UP`], nothing is shown — which now
+//! means a client that has stopped halfway through a sequence and never
+//! finished it, rather than merely a busy one.
 //!
 //! Nothing here is ever worth delaying or failing an attach for. A terminal too
-//! small for the box, a screen that never settles: both are silence.
+//! small for the box, a session that never lets go of the terminal: both are
+//! silence.
 //!
 //! # The dissolve
 //!
@@ -64,9 +76,10 @@
 //! popup holds a [`fade::Schedule`] and is asked for one frame at a time by
 //! that loop, at whatever moments the loop can spare — which is what [`Popup`]
 //! being told the time rather than reading a clock was always for. A frame is
-//! still a write to a screen nvmux does not own, so it still waits for a lull,
-//! and a chatty session simply gets fewer frames: the schedule is paced by the
-//! clock, so the fade lands on its end value on time whatever the loop managed.
+//! still a write to a screen nvmux does not own, so it still waits for a gap
+//! between the session's sequences, and a session that never leaves one gets
+//! fewer frames: the schedule is paced by the clock, so the fade lands on its
+//! end value on time whatever the loop managed.
 //!
 //! Every gate is [`fade::enabled`], and with the fade off — `NO_COLOR`, the
 //! config, or a terminal that never said what its colours are — there is no
@@ -83,16 +96,12 @@ use crate::pty::PtySize;
 use crate::shadow::{Over, Shadow};
 use crate::ui::draw::truncate;
 
-/// How long the child must have been quiet before the announcement is shown.
+/// How long to wait for a gap between the session's sequences before giving up
+/// on the announcement.
 ///
-/// Not zero, and this is the whole reason: a child whose own write blocked
-/// because the pty buffer filled leaves the master momentarily unreadable in the
-/// *middle* of a frame. That gap is microseconds; a wait this long steps over
-/// it, and is still short enough that the announcement reads as part of the
-/// attach rather than as something that happened afterwards.
-const SETTLE: Duration = Duration::from_millis(25);
-
-/// How long to wait for that lull before giving up on the announcement.
+/// A client that has not left one in two solid seconds has stopped in the
+/// middle of writing something and never finished, which is a screen where a
+/// box dropped on top is as likely to be corruption as information.
 const GIVE_UP: Duration = Duration::from_secs(2);
 
 /// How long the box stays up at full strength.
@@ -135,6 +144,24 @@ pub fn label(name: &str) -> String {
     name.chars().filter(|c| !c.is_control()).collect()
 }
 
+/// What the relay found on this pass of its loop, as far as the announcement
+/// is concerned.
+///
+/// Two questions rather than one, because they are two: whether the box may
+/// have been drawn over, and whether there is anywhere to put it back. A busy
+/// session answers yes to both on the same pass, which is exactly the case the
+/// box used to lose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pass {
+    /// The session wrote to the terminal, so whatever nvmux had on screen may
+    /// have been drawn over.
+    pub wrote: bool,
+    /// The terminal is between the session's escape sequences and none of its
+    /// own is still open, so a write of nvmux's cannot land inside one. See
+    /// [`crate::boundary`].
+    pub between: bool,
+}
+
 /// What the relay must do about the announcement on this pass of its loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Act {
@@ -160,19 +187,20 @@ enum Phase {
 }
 
 /// The box from its first paint onwards. Absent until then, which is what says
-/// the popup is still waiting for its lull.
+/// the popup has still found nowhere to put itself.
 #[derive(Debug)]
 struct Life {
     phase: Phase,
     /// How dissolved the box is: what the terminal shows, or — when the child
-    /// has drawn over it — what it will be shown again at the next lull.
+    /// has drawn over it — what it will be shown again on the next pass that
+    /// can write.
     t: f32,
     /// When the next frame of a dissolve is due. Idle while held.
     next_frame: Instant,
 }
 
 impl Life {
-    /// The box going up, at the lull that first paints it — which is where
+    /// The box going up, on the pass that first paints it — which is where
     /// every clock it lives by starts.
     ///
     /// With no effect to dissolve with there is no fade in at all: the box goes
@@ -208,25 +236,22 @@ impl Life {
 ///
 /// The deadlines are absolute [`Instant`]s for the reason written down in
 /// [`crate::pty`]: a child that keeps producing output keeps `poll` returning
-/// early, and only the *quiet* clock may restart on that. If the other two
-/// restarted with it, a session with a spinner in its statusline would hold the
-/// box on screen for ever.
+/// early, and a deadline that restarted on every wake-up would never fire. A
+/// session with a spinner in its statusline would otherwise hold the box on
+/// screen for ever.
 #[derive(Debug)]
 pub struct Popup {
     label: String,
     /// How the box dissolves, or `None` when it does not.
     dissolve: Option<Dissolve>,
-    /// When the child was last seen with nothing to say, or `None` if it spoke
-    /// on the last pass.
-    quiet_since: Option<Instant>,
-    /// When to stop waiting for a lull that is not coming.
+    /// When to stop waiting for a moment to draw in that is not coming.
     give_up_at: Instant,
     /// Set when the box is first painted: everything that happens to it after.
     life: Option<Life>,
     /// False whenever the terminal is not showing what [`Life::t`] says it is —
-    /// because the child may have drawn over the box, or because the dissolve
+    /// because the session may have drawn over the box, or because the dissolve
     /// has moved on since the last frame got through. Either way the cue is the
-    /// same: paint it again at the next lull.
+    /// same: paint it again as soon as there is a gap to paint it in.
     painted: bool,
 }
 
@@ -247,7 +272,6 @@ impl Popup {
         Some(Self {
             label,
             dissolve,
-            quiet_since: Some(now),
             give_up_at: now + GIVE_UP,
             life: None,
             painted: false,
@@ -255,67 +279,59 @@ impl Popup {
     }
 
     /// When the relay must next wake up on this popup's account.
-    pub fn wake_at(&self, now: Instant) -> Instant {
-        let settle = self.quiet_since.unwrap_or(now) + SETTLE;
+    ///
+    /// Nothing here waits for a gap in the session's output, because nothing
+    /// here can bring one about: the relay is woken by the pty the moment the
+    /// session writes, and the pass that follows that write is the pass that
+    /// paints. So a popup asks only for its own clock — the next frame of a
+    /// dissolve, the end of the hold, or the deadline for a box that has never
+    /// found anywhere to go.
+    pub fn wake_at(&self) -> Instant {
         match &self.life {
-            None => settle.min(self.give_up_at),
+            None => self.give_up_at,
             Some(life) => match &life.phase {
-                // A dissolve owes a frame on the clock — but a frame is a
-                // write, and a write waits for a lull. The later of the two,
-                // or the relay would be woken for a frame it cannot put out
-                // and would come straight back: the same spin `Hold::wake_at`
-                // steps around in [`crate::pty`]. The phase's own end needs no
-                // wake-up of its own, being never more than a frame away.
-                Phase::In(_) | Phase::Out(_) => settle.max(life.next_frame),
-                // Repaint at the next lull, but never past the end of the hold.
-                Phase::Held { until } if !self.painted => settle.min(*until),
+                // Always in the future: `frame` moves it on every pass a
+                // schedule is running, painted or not, so this cannot be a
+                // deadline already past that the relay spins on.
+                Phase::In(_) | Phase::Out(_) => life.next_frame,
                 Phase::Held { until } => *until,
             },
         }
     }
 
-    /// One pass of the relay loop. `child_spoke` is whether the pty master had
-    /// anything for the terminal this time round, and `under` is the session's
-    /// screen as the shadow has it — what the box is covering, and what a
-    /// dissolving frame cross-fades with.
-    pub fn step(
-        &mut self,
-        now: Instant,
-        child_spoke: bool,
-        size: PtySize,
-        under: Option<&Shadow>,
-    ) -> Act {
-        if child_spoke {
-            self.quiet_since = None;
+    /// One pass of the relay loop. `pass` is what the relay found — whether
+    /// the session wrote, and whether nvmux may write now — and `under` is the
+    /// session's screen as the shadow has it, which is what the box is
+    /// covering and what a dissolving frame cross-fades with.
+    pub fn step(&mut self, now: Instant, pass: Pass, size: PtySize, under: Option<&Shadow>) -> Act {
+        if pass.wrote {
             // Whatever was on screen may have been drawn over.
             self.painted = false;
-        } else {
-            self.quiet_since.get_or_insert(now);
         }
 
-        // The life runs on the clock, ahead of any lull: a dissolve whose
-        // schedule is spent moves on whether or not the screen ever caught up
-        // with it, and the box comes down on time on a session that has been
-        // talking over it throughout.
+        // The life runs on the clock, ahead of anywhere to draw: a dissolve
+        // whose schedule is spent moves on whether or not the screen ever
+        // caught up with it, and the box comes down on time on a session that
+        // has been talking over it throughout.
         if self.advance(now) {
             return Act::Erase;
         }
 
-        let settled = self
-            .quiet_since
-            .is_some_and(|quiet| now.duration_since(quiet) >= SETTLE);
-        if !settled {
-            // Nothing is on screen yet and the editor has been busy throughout:
-            // let it be.
-            return if self.life.is_none() && now >= self.give_up_at {
+        if self.life.is_none() && !pass.between {
+            // Nothing has been drawn yet and the session has not let go of the
+            // terminal since the box was armed: let it be.
+            return if now >= self.give_up_at {
                 Act::Done
             } else {
                 Act::Idle
             };
         }
 
+        // Before the gate below, not after it: the dissolve is paced by the
+        // clock, so it must move on a pass that cannot paint as surely as on
+        // one that can — and it is what keeps `wake_at` in the future.
         let t = self.frame(now);
-        if self.painted {
+        if self.painted || !pass.between {
             return Act::Idle;
         }
         let Some(over) = overlay(&self.label, size) else {
@@ -363,11 +379,11 @@ impl Popup {
     /// schedule if it is.
     ///
     /// A phase ends on the clock — [`Schedule::over`] rather than
-    /// [`Schedule::finished`] — because frames are only drawn at a lull, and a
-    /// session that talked over the whole life of the box would otherwise hold
-    /// it open for ever. The box came down on time before it dissolved at all,
-    /// and it has to still: the deadline is absolute, for the reason written
-    /// down in [`crate::pty`].
+    /// [`Schedule::finished`] — because frames are only drawn where the
+    /// session leaves a gap, and one that never left one would otherwise hold
+    /// the box open for ever. The box came down on time before it dissolved at
+    /// all, and it has to still: the deadline is absolute, for the reason
+    /// written down in [`crate::pty`].
     ///
     /// Spending the rest of the schedule rather than discarding it is what
     /// lands the box on exactly the value it was going to land on — fully
@@ -378,7 +394,7 @@ impl Popup {
     /// Which is why only one end of the life is exact on the terminal. A fade
     /// in has to be: the box then sits at that value for a whole second, and
     /// one stuck a frame short of drawn is a box drawn wrong. A fade out is
-    /// erased the moment it ends, so its last frame is whatever the last lull
+    /// erased the moment it ends, so its last frame is whatever the last gap
     /// allowed — a box already all but gone — and the pass that would have
     /// painted the rest of the way is spent on the erase instead.
     fn outlived(&mut self, now: Instant) -> bool {
@@ -406,7 +422,7 @@ impl Popup {
 
     /// How dissolved to draw the box on this pass, taking the next frame of a
     /// running schedule if one is due — and laying out the life itself, if this
-    /// is the lull that first paints it.
+    /// is the pass that first paints it.
     ///
     /// A frame that is not due, or a phase with no schedule, leaves the value
     /// where it is. That is what a repaint after the child drew over the box
@@ -531,7 +547,8 @@ pub fn overlay(label: &str, size: PtySize) -> Option<Over> {
 ///   cursor would sit in the box's corner for as long as the box is up, and the
 ///   editor's own SGR attributes would be left as whatever this drew with. It
 ///   is a single shared save slot, which is safe here only because nothing is
-///   written except at a lull, between the child's frames;
+///   written except between the child's own sequences, and never between a
+///   save of its own and the restore that takes it back ([`crate::boundary`]);
 /// * `ESC [ 0 m` on each row, because the interior is spaces and a space is
 ///   erased with *the current background* — which is whatever the editor last
 ///   set, and would otherwise bleed into the box;
@@ -664,6 +681,33 @@ mod tests {
         placed(bytes).into_iter().map(|row| row.text).collect()
     }
 
+    /// A pass on which the session said nothing and the terminal is free: an
+    /// idle editor, which is what most of these tests are about.
+    fn quiet() -> Pass {
+        Pass {
+            wrote: false,
+            between: true,
+        }
+    }
+
+    /// A pass on which the session wrote and left the terminal free again —
+    /// the ordinary busy case, and the one the box used to lose.
+    fn wrote() -> Pass {
+        Pass {
+            wrote: true,
+            between: true,
+        }
+    }
+
+    /// A pass on which the session wrote and left the terminal inside a
+    /// sequence, so nvmux may not write at all.
+    fn mid_sequence() -> Pass {
+        Pass {
+            wrote: true,
+            between: false,
+        }
+    }
+
     /// Drive a popup to the end of its life on a child that never says a word,
     /// waking exactly when `wake_at` asks to be woken.
     ///
@@ -673,7 +717,7 @@ mod tests {
         let mut painted = vec![];
         let mut now = from;
         for _ in 0..10_000 {
-            match popup.step(now, false, size, None) {
+            match popup.step(now, quiet(), size, None) {
                 Act::Paint(_) => {
                     painted.push((now - from, popup.life.as_ref().expect("a life").t));
                 }
@@ -681,7 +725,7 @@ mod tests {
                 end => return (painted, end),
             }
             // Never stand still, or a `wake_at` already in the past would spin.
-            now = popup.wake_at(now).max(now + Duration::from_millis(1));
+            now = popup.wake_at().max(now + Duration::from_millis(1));
         }
         panic!("the popup never ended");
     }
@@ -896,16 +940,16 @@ mod tests {
         let screen = screen();
         let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
 
-        let mut now = t0 + SETTLE;
+        let mut now = t0;
         let mut frames = vec![];
         for _ in 0..64 {
-            if let Act::Paint(bytes) = popup.step(now, false, big(), Some(&screen)) {
+            if let Act::Paint(bytes) = popup.step(now, quiet(), big(), Some(&screen)) {
                 frames.push(String::from_utf8(bytes).expect("utf-8"));
                 if held_until(&popup).is_some() {
                     break;
                 }
             }
-            now = popup.wake_at(now).max(now + Duration::from_millis(1));
+            now = popup.wake_at().max(now + Duration::from_millis(1));
         }
 
         let first = frames.first().expect("a first frame");
@@ -933,10 +977,10 @@ mod tests {
         let screen = screen();
         let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
 
-        let mut now = t0 + SETTLE;
+        let mut now = t0;
         let mut last = String::new();
         for _ in 0..10_000 {
-            match popup.step(now, false, big(), Some(&screen)) {
+            match popup.step(now, quiet(), big(), Some(&screen)) {
                 Act::Paint(bytes) => last = String::from_utf8(bytes).expect("utf-8"),
                 Act::Idle => {}
                 end => {
@@ -944,12 +988,48 @@ mod tests {
                     break;
                 }
             }
-            now = popup.wake_at(now).max(now + Duration::from_millis(1));
+            now = popup.wake_at().max(now + Duration::from_millis(1));
         }
         assert!(
             last.contains('x') && !last.contains("dotfiles"),
             "the box did not dissolve back into the screen: {last:?}"
         );
+    }
+
+    /// Every frame the box is ever drawn as leaves the terminal exactly where
+    /// it found it: between sequences, with no synchronized update and no
+    /// cursor save of nvmux's own still open.
+    ///
+    /// The relay writes these into the gaps in the session's own output, and
+    /// [`crate::boundary`] follows both along one parser — so a frame that
+    /// did not balance would not corrupt anything, it would quietly shut the
+    /// notice out of the terminal for the rest of its life. Both renderers
+    /// are covered: the plain box and the composite.
+    #[test]
+    fn every_frame_of_the_box_leaves_the_terminal_where_it_found_it() {
+        let t0 = Instant::now();
+        let screen = screen();
+        let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
+        let mut now = t0;
+        let mut frames = 0;
+        for _ in 0..10_000 {
+            match popup.step(now, quiet(), big(), Some(&screen)) {
+                Act::Paint(bytes) => {
+                    let mut boundary = crate::boundary::Boundary::new();
+                    boundary.saw(&bytes);
+                    assert!(
+                        boundary.between_sequences(),
+                        "frame {frames} left the terminal somewhere: {:?}",
+                        String::from_utf8_lossy(&bytes)
+                    );
+                    frames += 1;
+                }
+                Act::Idle => {}
+                _ => break,
+            }
+            now = popup.wake_at().max(now + Duration::from_millis(1));
+        }
+        assert!(frames > 8, "only {frames} frames were looked at");
     }
 
     /// With no shadow there is nothing to dissolve into, and the box is the
@@ -960,7 +1040,7 @@ mod tests {
         let t0 = Instant::now();
         let d = dissolve();
         let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(d)).expect("armed");
-        let Act::Paint(bytes) = popup.step(t0 + SETTLE, false, big(), None) else {
+        let Act::Paint(bytes) = popup.step(t0, quiet(), big(), None) else {
             panic!("the box did not go up");
         };
         let t = popup.life.as_ref().expect("a life").t;
@@ -978,7 +1058,7 @@ mod tests {
         let t0 = Instant::now();
         let screen = screen();
         let mut popup = Popup::armed(Some("dotfiles".into()), t0, None).expect("armed");
-        let Act::Paint(bytes) = popup.step(t0 + SETTLE, false, big(), Some(&screen)) else {
+        let Act::Paint(bytes) = popup.step(t0, quiet(), big(), Some(&screen)) else {
             panic!("the box did not go up");
         };
         let over = overlay("dotfiles", big()).expect("a box");
@@ -1001,56 +1081,47 @@ mod tests {
             .all(|r| r.width() == usize::from(over.width)));
     }
 
-    /// The lull clock restarts on every byte the child writes; the other two
-    /// must not, or a session with a spinner in its statusline would hold the
-    /// box on screen for ever and never reach its own deadline. The same
-    /// lesson as the absolute deadline in `crate::pty`.
+    /// **The flicker this mechanism exists for.** A window repainting at sixty
+    /// frames a second draws over the box on every frame, and the box goes
+    /// straight back up on the pass that follows — the relay writes the
+    /// session's frame and then asks the popup, and the popup has nothing left
+    /// to wait for. Without buying itself any more time on screen for the
+    /// trouble: the life is on the clock and the repaints are not part of it.
+    ///
+    /// Before this, the box waited 25 ms with the child silent, which a
+    /// session like that never gives it: measured through a real terminal, the
+    /// box went up and was wiped eleven times in its one second at ten frames
+    /// a second, and never went up at all at sixty.
     #[test]
-    fn the_lull_clock_restarts_on_output_but_the_life_does_not() {
+    fn a_box_drawn_over_is_back_up_on_the_next_pass() {
         let t0 = Instant::now();
         let mut popup = Popup::armed(Some("dotfiles".into()), t0, None).expect("armed");
+        assert!(matches!(
+            popup.step(t0, wrote(), big(), None),
+            Act::Paint(_)
+        ));
+        assert_eq!(held_until(&popup), Some(t0 + DURATION));
 
-        // Still chattering: nothing is drawn, however long it goes on.
-        for ms in [10, 100, 500] {
-            let act = popup.step(t0 + Duration::from_millis(ms), true, big(), None);
-            assert_eq!(act, Act::Idle, "drew at {ms}ms while the child was talking");
+        let mut at = t0;
+        for _ in 0..40 {
+            at += Duration::from_millis(16);
+            assert!(
+                matches!(popup.step(at, wrote(), big(), None), Act::Paint(_)),
+                "the box stayed down after the session drew over it, at {:?}",
+                at - t0
+            );
+            assert_eq!(
+                held_until(&popup),
+                Some(t0 + DURATION),
+                "a repaint bought the box more time on screen"
+            );
         }
-        // Quiet, but not yet long enough.
-        assert_eq!(
-            popup.step(t0 + Duration::from_millis(510), false, big(), None),
-            Act::Idle
-        );
-        // Quiet for a whole SETTLE: now it paints, and the clock starts here.
-        let painted = t0 + Duration::from_millis(600);
-        assert!(matches!(
-            popup.step(painted, false, big(), None),
-            Act::Paint(_)
-        ));
-        assert_eq!(held_until(&popup), Some(painted + DURATION));
 
-        // A repaint by the editor puts the box back at the *next* lull — one
-        // whole SETTLE later, not the first pass after it — without buying the
-        // box any more time on screen.
-        assert_eq!(
-            popup.step(painted + Duration::from_millis(10), true, big(), None),
-            Act::Idle
-        );
-        assert_eq!(
-            popup.step(painted + Duration::from_millis(20), false, big(), None),
-            Act::Idle,
-            "one quiet pass is not a lull"
-        );
-        assert!(matches!(
-            popup.step(painted + Duration::from_millis(60), false, big(), None),
-            Act::Paint(_)
-        ));
-        assert_eq!(held_until(&popup), Some(painted + DURATION));
-
-        // And it ends on time regardless.
+        // And it still ends on time.
         assert_eq!(
             popup.step(
-                painted + DURATION + Duration::from_millis(1),
-                false,
+                t0 + DURATION + Duration::from_millis(1),
+                wrote(),
                 big(),
                 None
             ),
@@ -1058,21 +1129,60 @@ mod tests {
         );
     }
 
-    /// A screen that has been busy for two solid seconds is one where a box
-    /// dropped on top is as likely to be corruption as information.
+    /// A session that never leaves the terminal between its own sequences —
+    /// a client stopped halfway through writing one and never finished — gets
+    /// no box, rather than one dropped inside it.
     #[test]
-    fn an_overlay_that_never_finds_a_lull_gives_up_rather_than_drawing_late() {
+    fn a_terminal_never_left_between_sequences_gets_no_box() {
         let t0 = Instant::now();
         let mut popup = Popup::armed(Some("dotfiles".into()), t0, None).expect("armed");
         let mut at = t0;
         while at + Duration::from_millis(10) < t0 + GIVE_UP {
             at += Duration::from_millis(10);
-            assert_eq!(popup.step(at, true, big(), None), Act::Idle, "at {at:?}");
+            assert_eq!(
+                popup.step(at, mid_sequence(), big(), None),
+                Act::Idle,
+                "at {at:?}"
+            );
         }
         assert_eq!(
-            popup.step(t0 + GIVE_UP, true, big(), None),
+            popup.step(t0 + GIVE_UP, mid_sequence(), big(), None),
             Act::Done,
-            "it must stop trying rather than draw onto a busy screen"
+            "it must stop trying rather than write inside a sequence"
+        );
+    }
+
+    /// A dissolve is paced by the clock whether or not a frame of it can be
+    /// put out — which is also what keeps [`Popup::wake_at`] naming a moment
+    /// that has not arrived. Were it gated on being able to paint, a box
+    /// nothing could paint would leave the relay a deadline already past and
+    /// spin it on a `poll` that returns at once: the trap `Hold::wake_at`
+    /// steps around in [`crate::pty`].
+    #[test]
+    fn a_box_that_can_never_be_painted_does_not_spin_the_relay() {
+        let t0 = Instant::now();
+        let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
+        assert!(matches!(
+            popup.step(t0, quiet(), big(), None),
+            Act::Paint(_)
+        ));
+
+        let life = dissolve().one_way * 2 + DURATION;
+        let mut now = t0;
+        let mut passes = 0;
+        while popup.step(now, mid_sequence(), big(), None) != Act::Erase {
+            passes += 1;
+            assert!(
+                passes < 200,
+                "woken {passes} times in {:?}: the relay is spinning",
+                now - t0
+            );
+            now = popup.wake_at().max(now);
+        }
+        let lived = now - t0;
+        assert!(
+            lived + Duration::from_millis(50) >= life,
+            "it came down after {lived:?}, short of {life:?}"
         );
     }
 
@@ -1087,7 +1197,11 @@ mod tests {
 
         assert_eq!(painted.len(), 1, "more than one paint: {painted:?}");
         assert_eq!(painted[0].1, 0.0, "the box went up part-drawn");
-        assert_eq!(painted[0].0, SETTLE, "it waited for something but the lull");
+        assert_eq!(
+            painted[0].0,
+            Duration::ZERO,
+            "it waited for something, with the terminal free from the start"
+        );
         assert_eq!(end, Act::Erase);
     }
 
@@ -1115,8 +1229,8 @@ mod tests {
         assert!(into.windows(2).all(|w| w[1] < w[0]), "not falling: {ts:?}");
         assert!(out_of.windows(2).all(|w| w[1] > w[0]), "not rising: {ts:?}");
         // The fade out is erased the moment it ends, so the last frame the
-        // terminal is shown is the last one a lull allowed — all but gone —
-        // and the schedule is spent to exactly the background behind it.
+        // terminal is shown is the last one there was room for — all but gone
+        // — and the schedule is spent to exactly the background behind it.
         assert!(*out_of.last().expect("a last frame") > 0.9, "{ts:?}");
         assert_eq!(popup.life.as_ref().expect("a life").t, 1.0);
 
@@ -1127,7 +1241,7 @@ mod tests {
             held.abs_diff(DURATION) < Duration::from_millis(20),
             "held for {held:?}"
         );
-        let fading_in = painted[turn].0 - SETTLE;
+        let fading_in = painted[turn].0;
         assert!(
             fading_in.abs_diff(d.one_way) < Duration::from_millis(20),
             "faded in over {fading_in:?}"
@@ -1152,7 +1266,7 @@ mod tests {
         let mut now = t0;
         let mut at_rest = 0;
         for _ in 0..10_000 {
-            match popup.step(now, false, big(), None) {
+            match popup.step(now, quiet(), big(), None) {
                 Act::Paint(bytes) => {
                     if bytes == unfaded {
                         at_rest += 1;
@@ -1162,7 +1276,7 @@ mod tests {
                 Act::Idle => {}
                 _ => break,
             }
-            now = popup.wake_at(now).max(now + Duration::from_millis(1));
+            now = popup.wake_at().max(now + Duration::from_millis(1));
         }
         assert_eq!(at_rest, 1, "the box at rest was painted {at_rest} times");
     }
@@ -1174,49 +1288,58 @@ mod tests {
     fn a_repaint_mid_dissolve_resumes_where_it_had_got_to() {
         let t0 = Instant::now();
         let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
-        let mut now = t0 + SETTLE;
-        assert!(matches!(popup.step(now, false, big(), None), Act::Paint(_)));
+        let mut now = t0;
+        assert!(matches!(
+            popup.step(now, quiet(), big(), None),
+            Act::Paint(_)
+        ));
         let first = popup.life.as_ref().expect("a life").t;
 
-        // The child draws over it, then falls quiet.
+        // The child draws over it, and leaves the terminal mid-sequence so
+        // nothing can be put back yet.
         now += Duration::from_millis(10);
-        assert_eq!(popup.step(now, true, big(), None), Act::Idle);
+        assert_eq!(popup.step(now, mid_sequence(), big(), None), Act::Idle);
         assert_eq!(
             popup.life.as_ref().expect("a life").t,
             first,
             "the dissolve moved while nothing was drawn"
         );
 
-        // One quiet pass only starts the lull clock; the pass a whole SETTLE
-        // after it is the lull.
-        now += Duration::from_millis(1);
-        assert_eq!(popup.step(now, false, big(), None), Act::Idle);
-        now += SETTLE;
-        assert!(matches!(popup.step(now, false, big(), None), Act::Paint(_)));
+        // The rest of the sequence arrives and the box goes back on, at
+        // whatever the clock says the dissolve has reached.
+        now += fade::FRAME;
+        assert!(matches!(
+            popup.step(now, wrote(), big(), None),
+            Act::Paint(_)
+        ));
         let resumed = popup.life.as_ref().expect("a life").t;
         assert!(resumed < first, "{first} -> {resumed}");
         assert!(resumed > 0.0, "it jumped straight to the end");
     }
 
-    /// A dissolve is paced by the clock, so a box the relay could never find a
-    /// lull to redraw still comes down on time rather than sitting there until
-    /// the session goes quiet.
+    /// A dissolve is paced by the clock, so a box the relay could never find
+    /// anywhere to redraw still comes down on time rather than sitting there
+    /// until the session lets go of the terminal.
     #[test]
     fn a_box_talked_over_for_its_whole_life_still_comes_down_on_time() {
         let t0 = Instant::now();
         let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
-        let mut now = t0 + SETTLE;
-        assert!(matches!(popup.step(now, false, big(), None), Act::Paint(_)));
+        let mut now = t0;
+        assert!(matches!(
+            popup.step(now, quiet(), big(), None),
+            Act::Paint(_)
+        ));
 
-        // From here the child never stops talking, so nothing can be painted.
+        // From here the child never leaves the terminal alone, so nothing can
+        // be painted.
         let life = dissolve().one_way * 2 + DURATION;
         let end = now + life + Duration::from_millis(100);
         while now < end {
             now += Duration::from_millis(10);
-            if popup.step(now, true, big(), None) == Act::Erase {
+            if popup.step(now, mid_sequence(), big(), None) == Act::Erase {
                 let lived = now - t0;
                 assert!(
-                    lived.abs_diff(SETTLE + life) < Duration::from_millis(50),
+                    lived.abs_diff(life) < Duration::from_millis(50),
                     "lived {lived:?}"
                 );
                 return;
@@ -1232,9 +1355,12 @@ mod tests {
     fn a_screen_too_small_mid_dissolve_stops_rather_than_drawing_a_fragment() {
         let t0 = Instant::now();
         let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
-        let mut now = t0 + SETTLE;
-        assert!(matches!(popup.step(now, false, big(), None), Act::Paint(_)));
+        let mut now = t0;
+        assert!(matches!(
+            popup.step(now, quiet(), big(), None),
+            Act::Paint(_)
+        ));
         now += fade::FRAME;
-        assert_eq!(popup.step(now, false, size(2, 1), None), Act::Done);
+        assert_eq!(popup.step(now, quiet(), size(2, 1), None), Act::Done);
     }
 }
