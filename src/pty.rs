@@ -1423,6 +1423,8 @@ fn pump(
     // that restarted on every wake-up would never fire while a spinner is
     // running. It is set when the machine arms and cleared when it settles.
     let mut deadline: Option<Instant> = None;
+    // The notice's repaint while it is in flight; see [`Erasing`].
+    let mut erasing: Option<Erasing> = None;
     let mut buf = [0u8; 8192];
     // Diagnostics only, and what makes a switch that felt slow attributable:
     // everything before this is nvmux's own work and is timed where it happens,
@@ -1445,6 +1447,7 @@ fn pump(
             deadline,
             popup.as_ref().map(|p| p.wake_at(now)),
             attachment.hold_wake_at(),
+            erasing.as_ref().map(|_| now + ERASE_POLL),
         ]
         .into_iter()
         .flatten()
@@ -1547,23 +1550,45 @@ fn pump(
                 announce::Act::Idle => {}
                 announce::Act::Paint(bytes) => attachment.write_over_session(&bytes)?,
                 announce::Act::Erase => {
-                    // Timed because it is a second full repaint of the session,
-                    // a whole second after the switch — the one nvmux asks for
-                    // rather than the one the attach produced.
-                    let t_erase = std::time::Instant::now();
                     // The same repaint a resume asks for, and for the same
                     // reason: the cells the box covered are the server's, and
                     // only the server can say what was under them. Not the same
-                    // licence, though — see [`Repaint`].
-                    repaint(attachment, Repaint::Notice);
-                    tracing::debug!(
-                        ms = t_erase.elapsed().as_secs_f64() * 1000.0,
-                        "timing: attach notice erase (:mode repaint)"
-                    );
+                    // licence, though — see [`Repaint`] — and not the same
+                    // wait: this one is asked from a thread, because the relay
+                    // has a session to keep running while the answer comes
+                    // (see [`Erasing`]). The size goes first, as it does for a
+                    // resume, and on this thread, where a `resize` belongs.
+                    attachment.resize_to(term::terminal_size());
+                    match Erasing::start(&attachment.sock) {
+                        Ok(started) => erasing = Some(started),
+                        // No thread to ask from: the fallback is what a server
+                        // that could not be asked would have got anyway.
+                        Err(e) => {
+                            tracing::debug!(error = %e, "no thread for the notice repaint");
+                            apply(attachment, Repaint::Notice, Served::NONE);
+                        }
+                    }
                     popup = None;
                 }
                 announce::Act::Done => popup = None,
             }
+        }
+
+        // The notice's repaint, if it has answered. Only the fallback waits on
+        // this — the repaint itself arrives as the session's own output — so a
+        // pass that finds nothing costs a `try_recv`.
+        if let Some(served) = erasing.as_ref().and_then(Erasing::answer) {
+            let asked = erasing.take().expect("it answered a moment ago").started;
+            // Timed because it is a second full repaint of the session, a
+            // whole second after the switch — the one nvmux asks for rather
+            // than the one the attach produced. What the number now measures
+            // is how long it took somewhere else, which is the point of it.
+            tracing::debug!(
+                ms = asked.elapsed().as_secs_f64() * 1000.0,
+                repainted = served.repainted,
+                "timing: attach notice erase (:mode repaint)"
+            );
+            apply(attachment, Repaint::Notice, served);
         }
 
         // Settle a pending prefix or number before reading anything new, so a
@@ -1891,19 +1916,104 @@ fn without_device_attributes_request(chunk: &[u8]) -> std::borrow::Cow<'_, [u8]>
 /// tracking on until its Neovim next flips the mouse itself — and right for
 /// everything else, where the alternative is a client that no longer answers
 /// the mouse at all.
+///
+/// The asking and the waiting are one step here, which is a resume's to be:
+/// the terminal is blank, no relay has started, and the screen coming back is
+/// the thing the user is waiting for. The other caller wants the same repaint
+/// without the wait, and takes the two apart — see [`Erasing`].
 fn repaint(attachment: &mut Attachment, why: Repaint) {
-    let size = term::terminal_size();
-    attachment.resize_to(size);
+    attachment.resize_to(term::terminal_size());
     let served = repaint_through_server(&attachment.sock, why);
+    apply(attachment, why, served);
+}
+
+/// What the relay does once a repaint has answered — or has failed to: the
+/// fallback for a server that could not be asked, and, for a resume, the mouse
+/// mode it reported.
+///
+/// Its own step because the two callers reach it from different places. A
+/// resume asks and waits, one statement above; the attach notice asks from a
+/// thread ([`Erasing`]) and gets here whenever the answer turns up. Both need
+/// the same two things done, and both can only do them here — a `resize` is
+/// the relay thread's to make.
+fn apply(attachment: &mut Attachment, why: Repaint, served: Served) {
     if why == Repaint::Resume {
         term::set_mouse_reporting(served.mouse.unwrap_or(term::MouseReporting::Buttons));
     }
     if !served.repainted {
         // The shrink and its undo are not shown to the shadow: what the
         // client draws after them is for the size it was just told.
-        nudge(attachment.master.as_ref(), size);
+        nudge(attachment.master.as_ref(), term::terminal_size());
     }
 }
+
+/// The repaint that takes the attach notice off the screen, in flight on a
+/// thread of its own.
+///
+/// The cells the box covered are the server's, and asking it for them costs
+/// two round trips — `nvim_get_mode`, and then the `:mode` that does the
+/// painting. Measured against sessions behind a delay proxy: 123 ms over a
+/// 60 ms link, 303 ms over a 150 ms one. Waited for on the relay's own thread,
+/// that is exactly how long the editor forwards no keystroke and copies no
+/// byte — a stall a whole second after the switch that put the box up, which
+/// is to say in the middle of whatever the user started typing when they
+/// arrived.
+///
+/// Nothing about the relay needs the answer, so it does not wait for one. The
+/// repaint arrives as ordinary output from the session, like every other byte
+/// the server sends; the only thing the answer decides is the fallback, and
+/// [`apply`] performs that on the relay's next pass.
+///
+/// The third thread in the crate, and the cheapest: it owns one connection,
+/// reads nothing else, and every call it makes is bounded ([`RESUME_TIMEOUT`]),
+/// so it ends on its own whether or not anyone is still listening. A relay that
+/// ends first drops the receiver, and the send fails into nothing.
+///
+/// Not the resume's repaint, which stays where it is: there the terminal is
+/// blank, the relay has not started, and the screen coming back *is* what the
+/// user is waiting for.
+struct Erasing {
+    rx: mpsc::Receiver<Served>,
+    started: Instant,
+}
+
+impl Erasing {
+    /// Ask, and come back for the answer later.
+    fn start(sock: &Path) -> std::io::Result<Self> {
+        let (tx, rx) = mpsc::channel();
+        let sock = sock.to_path_buf();
+        std::thread::Builder::new()
+            .name("nvmux-notice-repaint".into())
+            .spawn(move || {
+                // A receiver that has gone is a relay that ended first, and
+                // there is nobody left to tell.
+                let _ = tx.send(repaint_through_server(&sock, Repaint::Notice));
+            })?;
+        Ok(Self {
+            rx,
+            started: Instant::now(),
+        })
+    }
+
+    /// The verdict, if it has arrived. A worker that ended without one is
+    /// [`Served::NONE`], which is what any other failure to be answered is:
+    /// the fallback runs, exactly as it would have.
+    fn answer(&self) -> Option<Served> {
+        match self.rx.try_recv() {
+            Ok(served) => Some(served),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(Served::NONE),
+        }
+    }
+}
+
+/// How often the relay looks for [`Erasing`]'s answer while one is in flight.
+///
+/// Only the fallback waits on it, so this is not a deadline, it is a bound on
+/// how late a nudge can be: without it an idle relay would not look again for
+/// [`IDLE_POLL_MS`], and the session that needs the nudge — one too busy to
+/// answer — is exactly the one producing nothing to wake the loop.
+const ERASE_POLL: Duration = Duration::from_millis(50);
 
 /// Why the screen is being painted again, which decides what the repaint may
 /// do on the way.
@@ -2601,6 +2711,79 @@ mod tests {
             }
             asked
         })
+    }
+
+    /// The notice's repaint is asked from a thread and collected later: the
+    /// two round trips it takes happen while the relay goes on relaying.
+    ///
+    /// What the server records is the whole of what is asked — the mode, and
+    /// then the `:mode` that paints — so a change that started typing at the
+    /// session to take a box off its screen fails here.
+    #[test]
+    fn the_notice_repaint_is_asked_from_a_thread_and_answered_later() {
+        let sock = temp_sock("erasing");
+        let server = recording_server(&sock, "n", false);
+
+        let erasing = Erasing::start(&sock).expect("a thread");
+        let served = wait_for_the_answer(&erasing);
+        assert!(
+            served.repainted,
+            "the server painted; the relay must not nudge on top of it"
+        );
+
+        assert_eq!(
+            server.join().expect("the server thread"),
+            ["nvim_get_mode", "nvim_command"],
+            "the notice repaint asked for something else"
+        );
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    /// **The point of the thread.** Asking must not wait, whatever the session
+    /// is doing: a server that never answers the `:mode` used to hold the relay
+    /// for a whole [`RESUME_TIMEOUT`], with the editor forwarding no keystroke
+    /// and copying no byte for as long.
+    ///
+    /// Bounded well under that budget rather than at it, so the assertion is
+    /// about not waiting rather than about how fast a thread starts.
+    #[test]
+    fn asking_for_the_notice_repaint_does_not_wait_for_it() {
+        let sock = temp_sock("erasingstall");
+        let server = recording_server_stalling_on(&sock, "nvim_command");
+
+        let asked = Instant::now();
+        let erasing = Erasing::start(&sock).expect("a thread");
+        let took = asked.elapsed();
+        assert!(
+            took < RESUME_TIMEOUT / 4,
+            "asking took {took:?}, which is a wait, not an ask"
+        );
+        assert_eq!(
+            erasing.answer(),
+            None,
+            "an answer cannot have arrived from a server that never sent one"
+        );
+
+        // And when the budget does run out, the verdict is the fallback's:
+        // nothing was painted, so the relay nudges.
+        let served = wait_for_the_answer(&erasing);
+        assert_eq!(served, Served::NONE);
+        drop(erasing);
+        let _ = std::fs::remove_file(&sock);
+        let _ = server.join();
+    }
+
+    /// Poll for [`Erasing`]'s verdict the way the relay does, with a bound so
+    /// a worker that never answers fails the test rather than hanging it.
+    fn wait_for_the_answer(erasing: &Erasing) -> Served {
+        let deadline = Instant::now() + RESUME_TIMEOUT * 4;
+        while Instant::now() < deadline {
+            if let Some(served) = erasing.answer() {
+                return served;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the notice repaint never answered");
     }
 
     /// A resume may end a hit-enter prompt to get its screen back; taking an
