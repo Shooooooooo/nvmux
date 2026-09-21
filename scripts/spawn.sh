@@ -30,10 +30,14 @@ shift 3
 sock="$dir/$id.sock"
 log="$dir/$id.log"
 
-# Neovim creates its listen socket with 0777 & ~umask, so under a permissive
-# umask it would be world-writable. The 0700 directory is the primary control;
-# this closes the second hole.
-umask 077
+# No `umask` here, deliberately. The session's editor writes the user's files,
+# so it runs under the umask the user launched nvmux with -- locally that is
+# the mask src/proc.rs puts back on this shell, remotely the one this host
+# gives its own logins. Neovim does create its listen socket with
+# `0777 & ~umask`, which is what a mask here once guarded: what guards it now
+# is the 0700 runtime directory, checked just below before anything is
+# spawned, so a socket is unreachable for as long as it exists whatever mode
+# it is born with -- and the `chmod 600` that follows the socket's appearance.
 
 refuse() {
   printf 'ERROR %s\n' "$1"
@@ -110,6 +114,13 @@ cd -- "$cwd" || refuse "$cwd: could not enter it"
 # and only after giving up. `command -v` accepts a path as readily as a name.
 command -v -- "$1" >/dev/null 2>&1 || refuse "$1: not found"
 
+# The redirections below create the log under the caller's mask, so its mode is
+# set here rather than left to that mask. Like the socket it sits in the 0700
+# directory, which is what keeps it unreadable; this keeps it private in its own
+# right as well, and keeps the mode the same on every host.
+: >>"$log" 2>/dev/null || true
+chmod 600 "$log" 2>/dev/null || true
+
 # Detach from the ssh session's process group, which the kernel SIGHUPs when the
 # connection closes. `setsid` is cleanest but is util-linux and does not exist
 # on macOS, so probe for it and fall back to `nohup`.
@@ -133,7 +144,8 @@ sock_state=timeout
 i=0
 while [ "$i" -lt 100 ]; do
   if [ -S "$sock" ]; then
-    # Alongside the umask above: never trust the caller's mask.
+    # The socket's own control, and now the only one it has besides the
+    # directory: never trust the caller's mask.
     chmod 600 "$sock" 2>/dev/null || true
     sock_state=ok
     break

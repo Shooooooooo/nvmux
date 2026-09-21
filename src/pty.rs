@@ -803,6 +803,14 @@ fn client_command(sock: &Path) -> CommandBuilder {
     if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
     }
+    // The other half of the pair the user calls their editor, so it gets the
+    // umask nvmux was started with for the same reason the session does — see
+    // `paths::restrict_umask`. A `--remote-ui` client holds no buffers and so
+    // writes next to nothing, which is a reason for the exception to go
+    // unnoticed rather than a reason to make one.
+    if let Some(mask) = crate::paths::launch_umask() {
+        cmd.umask(Some(mask.bits()));
+    }
     cmd
 }
 

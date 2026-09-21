@@ -587,6 +587,32 @@ mod tests {
         );
     }
 
+    /// A session's editor inherits the umask of whoever launched nvmux, which
+    /// only holds while `spawn.sh` sets no mask of its own. A mask put back here
+    /// would be silent: every session would still start, and every file one
+    /// wrote would be more private than the user asked for.
+    ///
+    /// Matched on a line of its own, so the comment that explains the absence —
+    /// and says the word — does not satisfy the test that enforces it.
+    #[test]
+    fn the_spawn_script_imposes_no_umask_on_the_session() {
+        assert!(
+            !SPAWN_SCRIPT.contains("\numask "),
+            "spawn.sh must leave the caller's umask alone"
+        );
+    }
+
+    /// What replaced that mask as the socket's own control. The 0700 directory
+    /// is the other one, and `spawn.sh` refuses to spawn without it — see the
+    /// script's own checks and `paths::ensure_dir_secure`.
+    #[test]
+    fn the_spawn_script_makes_the_socket_private_itself() {
+        assert!(
+            SPAWN_SCRIPT.contains(r#"chmod 600 "$sock""#),
+            "spawn.sh must chmod the socket it waits for"
+        );
+    }
+
     /// `spawn.sh` runs the argument list it is handed and nothing else — no
     /// `nvim` of its own, and no string it assembled. A `sleep` whose command
     /// line ends the way a session's does stands in for one, so this runs where

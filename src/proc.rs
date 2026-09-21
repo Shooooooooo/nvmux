@@ -44,6 +44,7 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -107,9 +108,31 @@ pub fn run_local(script: &str, args: &[&str]) -> Result<Output> {
 
 /// `/bin/sh -s`: what a local [`Shell`] is started from, and what the one-shot
 /// form runs.
+///
+/// It runs under the umask nvmux was *started* with rather than the one nvmux
+/// clamped itself to, because this shell is what runs `scripts/spawn.sh`, and
+/// `spawn.sh` is what launches the session's editor. See
+/// [`crate::paths::restrict_umask`] for what the clamp is still for.
+///
+/// Only the local shell: a umask does not travel over ssh, so a remote session
+/// takes the remote host's own — which is what anything else launched there
+/// would get, and is not this machine's business to override.
 pub fn sh_command() -> Command {
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-s");
+    if let Some(mask) = crate::paths::launch_umask() {
+        let mask = mask.bits();
+        // Between fork and exec, so it lands on this child and on nothing else
+        // — the parent's own mask is shared with every thread and cannot be
+        // moved around a spawn. One `umask(2)` call: no allocation, no locks,
+        // which is all a pre-exec hook may do.
+        unsafe {
+            cmd.pre_exec(move || {
+                libc::umask(mask);
+                Ok(())
+            });
+        }
+    }
     cmd
 }
 

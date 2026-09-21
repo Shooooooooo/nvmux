@@ -16,6 +16,9 @@
 use std::fs::DirBuilder;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use nix::sys::stat::Mode;
 
 use crate::error::PathError;
 
@@ -121,12 +124,44 @@ pub(crate) fn ensure_dir_secure(dir: &Path) -> Result<(), PathError> {
     )))
 }
 
-/// Restrict the file mode creation mask for this process, before spawning any
-/// nvim. Neovim creates its listen socket with `0777 & ~umask`; the 0700
-/// directory is the primary control, but closing the hole at both levels costs
-/// nothing.
+/// The umask nvmux was started under, kept by [`restrict_umask`] so that what
+/// it clamps can be handed back to the editor. See [`launch_umask`].
+static LAUNCH_UMASK: OnceLock<Mode> = OnceLock::new();
+
+/// Restrict the file mode creation mask for **this process**, remembering the
+/// mask it replaced.
+///
+/// This covers the files nvmux writes itself — its config file, a local
+/// session's metadata — and stops there. The mask is deliberately *not* left
+/// on the session: a session's editor writes the user's files, and an editor
+/// that creates them more privately than the shell it was started from is an
+/// editor that behaves differently for no reason the user can see. So the
+/// recorded mask is given back to what nvmux spawns; see [`launch_umask`],
+/// `proc::sh_command` and `pty::client_command`.
+///
+/// What that leaves protecting the listen socket, which is created with
+/// `0777 & ~umask` and is what this clamp was reached for: a runtime directory
+/// that is 0700, owned by us, re-checked by [`ensure_dir_secure`] before every
+/// operation and by `scripts/spawn.sh` before every spawn — so a socket is
+/// out of reach for as long as it exists, whatever mode it is born with — and
+/// an explicit `chmod 600` on the socket once it appears. Both are controls
+/// that hold on their own; the umask never was one.
+///
+/// The first call wins, so the mask recorded is the one nvmux was started
+/// with rather than one a later call observed.
 pub fn restrict_umask() {
-    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
+    let previous = nix::sys::stat::umask(Mode::from_bits_truncate(0o077));
+    let _ = LAUNCH_UMASK.set(previous);
+}
+
+/// The umask nvmux was started with, for handing to a process that is the
+/// user's editor rather than nvmux's own bookkeeping.
+///
+/// `None` when [`restrict_umask`] has not run — only `main` calls it — in
+/// which case this process never moved the mask and there is nothing to
+/// restore: a child inherits the right one by doing nothing.
+pub fn launch_umask() -> Option<Mode> {
+    LAUNCH_UMASK.get().copied()
 }
 
 /// Validate a composed socket path against the `sun_path` budget.
@@ -213,6 +248,51 @@ pub fn client_log(dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The process umask is one value shared by every thread, so the tests that
+    /// move it take turns. Without this, one test's hostile mask is another's
+    /// launch mask, and the shells the rest of this binary starts inherit it.
+    fn umask_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// `restrict_umask` is a trade, and both halves matter: the process is
+    /// clamped, *and* the mask that clamp replaced is kept, because that is the
+    /// one a session's editor is given back.
+    ///
+    /// One test for the whole story rather than three: the recorded mask is
+    /// process-wide and written once, so a second test could only ever observe
+    /// what this one left behind.
+    #[test]
+    fn restricting_the_umask_keeps_the_mask_it_replaced() {
+        let _guard = umask_lock();
+        let original = nix::sys::stat::umask(Mode::from_bits_truncate(0o027));
+
+        restrict_umask();
+
+        // Read the mask back the only way there is — by setting it — and put
+        // the value straight back.
+        let clamped = nix::sys::stat::umask(Mode::from_bits_truncate(0o077));
+        assert_eq!(clamped.bits(), 0o077, "the process mask was not clamped");
+        assert_eq!(
+            launch_umask(),
+            Some(Mode::from_bits_truncate(0o027)),
+            "the mask the clamp replaced must survive it"
+        );
+
+        // A second call must not overwrite the launch mask with whatever the
+        // process happens to be running under by the time it lands.
+        nix::sys::stat::umask(Mode::from_bits_truncate(0o007));
+        restrict_umask();
+        assert_eq!(
+            launch_umask(),
+            Some(Mode::from_bits_truncate(0o027)),
+            "the first call must win"
+        );
+
+        nix::sys::stat::umask(original);
+    }
 
     #[test]
     fn runtime_dir_has_no_doubled_segment() {
@@ -384,6 +464,7 @@ mod tests {
         /// forced afterwards.
         #[test]
         fn survives_a_hostile_umask() {
+            let _guard = umask_lock();
             let previous = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o700));
             let d = scratch("umask");
             let result = ensure_dir_secure(&d);
