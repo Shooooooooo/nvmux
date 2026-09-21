@@ -675,6 +675,29 @@ mod tests {
         assert!(row.width() <= 62, "the row overflowed: {row:?}");
     }
 
+    /// The README's picture of the picker reproduces this row byte for byte, and
+    /// nothing else ties the two together — so without this the art quietly
+    /// describes a program that no longer exists. `keys.rs` pins its own README
+    /// table the same way.
+    ///
+    /// Whether to carry the art at all is the README's own call — it dropped it
+    /// once, for the recorded demo, which shows the picker moving and cannot go
+    /// stale — so what is pinned is the copy and not its presence. [`MARKER`] is
+    /// how the picture announces itself: it is drawn by the same screen and
+    /// appears nowhere else in the prose. Equality rather than an implication,
+    /// because either one alone is the thing this test is for: a hint row under
+    /// a selection marker nvmux no longer draws is as stale as the reverse.
+    #[test]
+    fn the_readme_shows_the_hint_row_the_picker_actually_prints() {
+        let readme = include_str!("../../README.md");
+        assert_eq!(
+            readme.contains(MARKER),
+            readme.contains(HINTS),
+            "the README's picker art is stale — it should carry this row \
+             verbatim, under a `{MARKER}` selection marker, or carry neither:\n{HINTS}"
+        );
+    }
+
     #[test]
     fn a_narrow_terminal_truncates_the_hints_rather_than_wrapping() {
         let lines = render(&app(&["one"]), 20, 5);
