@@ -7,6 +7,14 @@
 //! channel: only one that has attached a UI or registered for autocmds gets
 //! notifications, so there is nothing to demultiplex in the background.
 //!
+//! Synchronous is not the same as one call at a time. [`Client::ask`] sends a
+//! request without waiting for it, so two calls whose answers are both wanted
+//! cost one round trip rather than two — which over an SSH forward is the whole
+//! of the delay. The only frames that can arrive are replies to requests this
+//! client sent, by the paragraph above, so a reply that turns up while a
+//! different one is being waited for is kept for its own waiter rather than
+//! demultiplexed anywhere.
+//!
 //! # Reachable is not the same as ready
 //!
 //! `nvim_get_api_info` is answered off the main loop. Measured, it still replies
@@ -34,9 +42,10 @@
 //! `nvim_list_bufs` never answers. With `'cmdheight'` at 0, which AstroNvim
 //! sets, every one-line error opens that prompt; with the default 1, any
 //! message that scrolls does. So [`probe`] asks the mode before it asks
-//! anything deferred, and the attach and resume paths in [`crate::pty`] end
-//! the prompt with the one key it consumes, `<CR>`, before they wait on the
-//! editor. `nvim_get_mode` is only immediate while the editor is blocked or
+//! anything deferred, the attach probe reads the mode before it waits on
+//! anything deferred (`pty::probe_on`, which sends both at once), and the
+//! attach and resume paths in [`crate::pty`] end the prompt with the one key
+//! it consumes, `<CR>`, before they wait on the editor. `nvim_get_mode` is only immediate while the editor is blocked or
 //! idle: during `:!cmd` and CPU-bound Lua it is queued like everything else,
 //! which is why every call here still carries a budget.
 
@@ -83,6 +92,35 @@ pub struct Client<S: Read + Write> {
     /// connection with no budget: a call waits until it is answered, or until
     /// the socket is shut down under it (see [`Interrupt`]).
     read_timeout: Option<Duration>,
+    /// The msgids of requests sent and not yet read. A parking permit rather
+    /// than a ledger: its only job is to say which stray reply is worth
+    /// keeping, so an id left here by an abandoned [`Pending`] costs nothing.
+    in_flight: Vec<u32>,
+    /// Replies that arrived while a different one was being waited for, for
+    /// the waiter they belong to. Bounded by the number of requests sent and
+    /// not yet read, since nothing else is ever parked.
+    parked: Vec<(u32, Result<Value, String>)>,
+}
+
+/// A request that has been sent and whose reply has not been read.
+///
+/// Handed out by [`Client::ask`] and spent on [`Client::reply_to`], which is
+/// what makes two calls cost one round trip instead of two. Not `Clone`: two
+/// reads of one reply would take the next call's answer for the second.
+///
+/// Abandoning one is allowed and costs nothing here — the reply is dropped if
+/// it ever arrives. What it costs on the *far* side is the caller's to think
+/// about: the request has been sent, so the session will run it whenever its
+/// main loop next gets to. See `pty::probe_on`, which abandons a `nvim_list_uis`
+/// on the one path where the answer stops mattering.
+#[derive(Debug)]
+#[must_use = "a request that is sent and never read leaves its reply on the socket"]
+pub struct Pending {
+    msgid: u32,
+    /// What was asked, for the error a failed read reports. Every method name
+    /// in this crate is a literal, so this borrows rather than allocating on
+    /// a path that already costs a round trip.
+    method: &'static str,
 }
 
 /// Needed by `Result::expect_err` in the tests; `Client` is never logged.
@@ -175,6 +213,8 @@ impl<S: Read + Write> Client<S> {
             next_msgid: 1,
             poisoned: None,
             read_timeout: Some(PROBE_TIMEOUT),
+            in_flight: Vec::new(),
+            parked: Vec::new(),
         }
     }
 
@@ -202,7 +242,24 @@ impl<S: Read + Write> Client<S> {
     }
 
     /// Issue a request and wait for its response.
-    pub fn call(&mut self, method: &str, params: Vec<Value>) -> Result<Value, RpcError> {
+    pub fn call(&mut self, method: &'static str, params: Vec<Value>) -> Result<Value, RpcError> {
+        let pending = self.ask(method, params)?;
+        self.reply_to(pending)
+    }
+
+    /// Send a request without waiting for its reply.
+    ///
+    /// The half of [`Client::call`] that costs nothing to do twice. Two calls
+    /// asked in series cost two round trips, and over an SSH forward a round
+    /// trip is the whole of the delay: measured through a link with a 150 ms
+    /// round trip, `nvim_get_mode` then `nvim_list_uis` took 302 ms, and the
+    /// same pair sent before either was read took 151 ms. `pty::probe_on` is
+    /// the caller, and the only one — see it for what may and may not be asked
+    /// of a session before it has said what state it is in.
+    ///
+    /// The reply is read by [`Client::reply_to`], in any order: one that
+    /// arrives while another is being waited for is kept for its own waiter.
+    pub fn ask(&mut self, method: &'static str, params: Vec<Value>) -> Result<Pending, RpcError> {
         if let Some(why) = &self.poisoned {
             return Err(RpcError::Protocol(format!("connection poisoned: {why}")));
         }
@@ -221,15 +278,36 @@ impl<S: Read + Write> Client<S> {
 
         rmpv::encode::write_value(self.io.get_mut(), &request)
             .map_err(|e| self.poison(format!("encoding {method}: {e}")))?;
-        let budget = self.read_timeout;
         if let Err(e) = self.io.get_mut().flush() {
-            let mapped = map_io(e, budget);
+            let mapped = map_io(e, self.read_timeout);
             return Err(self.poison_if_fatal(mapped, method));
+        }
+        self.in_flight.push(msgid);
+        Ok(Pending { msgid, method })
+    }
+
+    /// Wait for the reply to a request [`Client::ask`] sent.
+    ///
+    /// The budget is this wait's, not the request's: a reply already in hand
+    /// costs nothing, and one that is still coming gets the whole of it. That
+    /// is the same bound a [`Client::call`] has, since there the two halves
+    /// are one statement apart.
+    pub fn reply_to(&mut self, pending: Pending) -> Result<Value, RpcError> {
+        let Pending { msgid, method } = pending;
+        if let Some(why) = &self.poisoned {
+            return Err(RpcError::Protocol(format!("connection poisoned: {why}")));
+        }
+        // Already read, while a different reply was being waited for.
+        if let Some(i) = self.parked.iter().position(|(id, _)| *id == msgid) {
+            let (_, result) = self.parked.remove(i);
+            self.forget(msgid);
+            return result.map_err(RpcError::Nvim);
         }
 
         // An overall deadline as well as a per-read one: a peer that keeps
         // sending frames we skip restarts the per-read budget every time. No
         // budget, no deadline: an unbounded call is unbounded here too.
+        let budget = self.read_timeout;
         let started = std::time::Instant::now();
 
         loop {
@@ -249,10 +327,19 @@ impl<S: Read + Write> Client<S> {
             };
 
             match self.classify(value, msgid)? {
-                Some(result) => return result.map_err(RpcError::Nvim),
+                Some(result) => {
+                    self.forget(msgid);
+                    return result.map_err(RpcError::Nvim);
+                }
                 None => continue,
             }
         }
+    }
+
+    /// This reply has been handed to its waiter: nothing is owed on it now,
+    /// and a late duplicate is a stray rather than something to park.
+    fn forget(&mut self, msgid: u32) {
+        self.in_flight.retain(|id| *id != msgid);
     }
 
     /// Sort one decoded frame into "the answer we wanted" or "ignore it".
@@ -275,16 +362,29 @@ impl<S: Read + Write> Client<S> {
                 let got = arr[1]
                     .as_u64()
                     .ok_or_else(|| self.poison("response msgid was not an integer"))?;
-                if got != u64::from(want) {
-                    // Not ours. Keep reading rather than answering the wrong
-                    // question.
+                let result = if arr[2].is_nil() {
+                    Ok(arr[3].clone())
+                } else {
+                    Err(describe_nvim_error(&arr[2]))
+                };
+                if got == u64::from(want) {
+                    return Ok(Some(result));
+                }
+                // Not the one being waited for. Kept if it answers something
+                // this client asked and has not read — [`Client::ask`] hands
+                // out those waiters, and dropping their replies here would
+                // lose them for good. Anything else is a stray: a duplicate,
+                // or a frame from a peer that is not answering our questions,
+                // and there is nobody to give it to.
+                let ours = u32::try_from(got).is_ok_and(|id| {
+                    self.in_flight.contains(&id) && !self.parked.iter().any(|(p, _)| *p == id)
+                });
+                if ours {
+                    self.parked.push((got as u32, result));
+                } else {
                     tracing::debug!(got, want, "skipping a response for another request");
-                    return Ok(None);
                 }
-                if !arr[2].is_nil() {
-                    return Ok(Some(Err(describe_nvim_error(&arr[2]))));
-                }
-                Ok(Some(Ok(arr[3].clone())))
+                Ok(None)
             }
             Some(NOTIFICATION) => Ok(None),
             Some(REQUEST) => {
@@ -351,7 +451,20 @@ impl<S: Read + Write> Client<S> {
     /// Neovim sizes the global grid to the per-dimension minimum across every
     /// attached UI, so a small preview would shrink the grid you are editing in.
     pub fn list_uis(&mut self) -> Result<usize, RpcError> {
-        let v = self.call("nvim_list_uis", vec![])?;
+        let pending = self.ask_uis()?;
+        self.uis_reply(pending)
+    }
+
+    /// [`Client::list_uis`], asked but not waited for. The attach probe asks
+    /// this alongside the mode and reads it only once the mode has said the
+    /// session is serving deferred calls at all — see `pty::probe_on`.
+    pub fn ask_uis(&mut self) -> Result<Pending, RpcError> {
+        self.ask("nvim_list_uis", vec![])
+    }
+
+    /// The count from an [`Client::ask_uis`] this client sent.
+    pub fn uis_reply(&mut self, pending: Pending) -> Result<usize, RpcError> {
+        let v = self.reply_to(pending)?;
         Ok(v.as_array().map(|a| a.len()).unwrap_or(0))
     }
 
@@ -373,7 +486,20 @@ impl<S: Read + Write> Client<S> {
     /// blocked at a prompt, which is exactly when it is worth asking. See the
     /// module docs.
     pub fn get_mode(&mut self) -> Result<Mode, RpcError> {
-        let v = self.call("nvim_get_mode", vec![])?;
+        let pending = self.ask_mode()?;
+        self.mode_reply(pending)
+    }
+
+    /// [`Client::get_mode`], asked but not waited for. Fast, so the reply is
+    /// on its way whatever the editor is doing — which is what lets the attach
+    /// probe send a deferred call behind it and still decide on this one.
+    pub fn ask_mode(&mut self) -> Result<Pending, RpcError> {
+        self.ask("nvim_get_mode", vec![])
+    }
+
+    /// The mode from an [`Client::ask_mode`] this client sent.
+    pub fn mode_reply(&mut self, pending: Pending) -> Result<Mode, RpcError> {
+        let v = self.reply_to(pending)?;
         let map = v
             .as_map()
             .ok_or_else(|| RpcError::Protocol("get_mode was not a map".into()))?;
@@ -662,14 +788,23 @@ mod tests {
     /// A client whose first call is answered with `result`. The msgid is 1
     /// because that is what a fresh client sends first.
     fn answering(result: Value) -> Client<Canned> {
-        let frame = Value::Array(vec![
-            Value::from(RESPONSE),
-            Value::from(1u32),
-            Value::Nil,
-            result,
-        ]);
+        answering_frames(&[(1, result)])
+    }
+
+    /// A client handed these replies, in this order, whatever it asks. The
+    /// order is the point: a peer answers a fast call before a deferred one it
+    /// was asked first, and nothing about the protocol says otherwise.
+    fn answering_frames(replies: &[(u32, Value)]) -> Client<Canned> {
         let mut bytes = Vec::new();
-        rmpv::encode::write_value(&mut bytes, &frame).expect("encode");
+        for (msgid, result) in replies {
+            let frame = Value::Array(vec![
+                Value::from(RESPONSE),
+                Value::from(*msgid),
+                Value::Nil,
+                result.clone(),
+            ]);
+            rmpv::encode::write_value(&mut bytes, &frame).expect("encode");
+        }
         Client::new(Canned {
             reply: std::io::Cursor::new(bytes),
             sent: Vec::new(),
@@ -710,6 +845,64 @@ mod tests {
         let m = c.get_mode().expect("decode");
         assert!(!m.blocking);
         assert!(!m.at_hit_enter());
+    }
+
+    /// Two questions in flight, answered in the other order: each reply
+    /// reaches the waiter it belongs to.
+    ///
+    /// This is what the attach probe does, and the order here is the one it
+    /// meets — `nvim_get_mode` is a fast call and `nvim_list_uis` waits for the
+    /// main loop, so the second question is routinely answered first. A reply
+    /// read while a different one is being waited for used to be dropped, which
+    /// would lose one of these outright.
+    #[test]
+    fn a_reply_that_arrives_out_of_order_is_kept_for_its_own_waiter() {
+        let mut c = answering_frames(&[(2, Value::from("uis")), (1, Value::from("mode"))]);
+        let mode = c.ask("nvim_get_mode", vec![]).expect("sent");
+        let uis = c.ask("nvim_list_uis", vec![]).expect("sent");
+
+        // Reading the mode takes the UI count off the socket on the way.
+        assert_eq!(c.reply_to(mode).expect("the mode").as_str(), Some("mode"));
+        assert_eq!(c.reply_to(uis).expect("the count").as_str(), Some("uis"));
+        assert!(
+            c.parked.is_empty() && c.in_flight.is_empty(),
+            "both replies were spent: {:?}, {:?}",
+            c.parked,
+            c.in_flight
+        );
+    }
+
+    /// Only a reply this client is owed is kept. Anything else — a duplicate,
+    /// a frame from a peer answering questions nobody asked — is skipped as it
+    /// always was, which is what bounds the parking to the requests in flight.
+    #[test]
+    fn a_reply_nobody_is_owed_is_skipped_rather_than_kept() {
+        let mut c = answering_frames(&[(99, Value::from("stray")), (1, Value::from("mine"))]);
+        let mine = c.ask("nvim_get_mode", vec![]).expect("sent");
+        assert_eq!(c.reply_to(mine).expect("mine").as_str(), Some("mine"));
+        assert!(c.parked.is_empty(), "kept a stray reply: {:?}", c.parked);
+    }
+
+    /// A question whose answer stopped mattering: the attach probe abandons
+    /// its UI count when the mode says the session is waiting for a key. The
+    /// reply still arrives, and the calls after it must still get their own.
+    #[test]
+    fn a_pending_nobody_reads_does_not_confuse_the_calls_after_it() {
+        let mut c = answering_frames(&[
+            (1, Value::from("mode")),
+            (2, Value::from("uis")),
+            (3, Value::from("4")),
+        ]);
+        let mode = c.ask("nvim_get_mode", vec![]).expect("sent");
+        let _abandoned = c.ask("nvim_list_uis", vec![]).expect("sent");
+        assert_eq!(c.reply_to(mode).expect("the mode").as_str(), Some("mode"));
+
+        // The abandoned reply is read past on the way to this one, and kept
+        // for a waiter that will never come back for it — which costs one
+        // entry on a connection that is about to be dropped.
+        let input = c.ask("nvim_input", vec![]).expect("sent");
+        assert_eq!(c.reply_to(input).expect("the count").as_str(), Some("4"));
+        assert_eq!(c.parked.len(), 1, "{:?}", c.parked);
     }
 
     #[test]
