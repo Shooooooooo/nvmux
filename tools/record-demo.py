@@ -30,7 +30,8 @@ alternate screen of its own.
 
 Needs, all on PATH:
   * nvim >= 0.11
-  * agg          https://github.com/asciinema/agg/releases
+  * agg >= 1.9   https://github.com/asciinema/agg/releases -- for `--renderer`,
+                 which the notice box needs; see the note where agg is run
   * python3 -m pip install pyte
   * a release build of nvmux (cargo build --release)
 
@@ -778,7 +779,20 @@ def main():
         os.makedirs(os.path.dirname(OUT_GIF), exist_ok=True)
         print("rendering %s ..." % OUT_GIF)
         # No --theme: the cast header carries it.
-        render = ["agg", "--font-family", FONT_FAMILY, "--font-size", "15",
+        #
+        # `--renderer resvg` is for the notice box, and it is not a preference.
+        # agg's default renderer, `swash`, draws the box-drawing block itself
+        # rather than from the font -- on the cell grid, a pixel thick, which is
+        # what makes a run of `─` a straight line at any size. It does not do
+        # that for the rounded corners the box is built from (`src/announce.rs`:
+        # `╭ ╮ ╰ ╯`, U+256D..U+2570), which come from the font instead and land
+        # a pixel higher and thicker than the bar they are meant to meet. The
+        # corners visibly float off the dashes at both ends of both rules.
+        # `resvg` draws every one of them from the font, where they were
+        # designed to line up, and the box closes. Nothing else in the frame
+        # moves by more than antialiasing.
+        render = ["agg", "--renderer", "resvg",
+                  "--font-family", FONT_FAMILY, "--font-size", "15",
                   "--fps-cap", str(FPS_CAP), "--idle-time-limit", "1.5"]
         if font_dir:
             render += ["--font-dir", font_dir]
