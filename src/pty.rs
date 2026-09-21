@@ -1229,13 +1229,14 @@ fn spawn_client_with(
 ///
 /// `begin_next` is called with the target of a `<prefix>` switch, once, the
 /// moment [`pump`] returns one — before this session dissolves and before the
-/// terminal is handed back. What follows that call is the best part of a
-/// `fade.duration_ms` of nvmux drawing its own frames, and the work the next
-/// attachment opens with is a fork and a round trip that touch nothing this
-/// function is using: a client writes into its own pty and nothing reaches the
-/// terminal until a relay copies it (see [`spawn_client`]), and the probe
-/// answers on a thread of its own (see [`Probe`]). Started here, both run
-/// underneath the dissolve instead of after it.
+/// terminal is handed back. What follows that call is a dissolve — half of
+/// `fade.duration_ms`, which measures both directions — of nvmux drawing its
+/// own frames off a grid it already has, and the work the next attachment
+/// opens with is a fork and a round trip that touch nothing this function is
+/// using: a client writes into its own pty and nothing reaches the terminal
+/// until a relay copies it (see [`spawn_client`]), and the probe answers on a
+/// thread of its own (see [`Probe`]). Started here, both run underneath the
+/// dissolve instead of after it.
 ///
 /// So the callback must *start* things and not wait for them: it is called
 /// with the terminal still raw and the outgoing session still on it, and

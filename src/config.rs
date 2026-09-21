@@ -159,8 +159,8 @@ impl Default for FadeSettings {
         Self {
             enabled: true,
             // Long enough to read as a dissolve rather than a flicker, short
-            // enough to be one movement: 50 ms out and 50 ms back.
-            duration_ms: 100,
+            // enough to be one movement: 100 ms out and 100 ms back.
+            duration_ms: 200,
             session: true,
             excursions: true,
         }
@@ -467,7 +467,7 @@ mod tests {
             command = \"nvim --headless --listen {sock}\"\n\
             [fade]\n\
             enabled = true\n\
-            duration_ms = 100\n\
+            duration_ms = 200\n\
             session = true\n\
             excursions = true\n";
         let s: Settings = toml::from_str(doc).expect("valid");
@@ -500,7 +500,7 @@ mod tests {
             .one_way()
         };
 
-        assert_eq!(at(100), Duration::from_millis(50), "the default");
+        assert_eq!(at(200), Duration::from_millis(100), "the default");
         assert_eq!(at(MAX_FADE_MS), Duration::from_millis(1_000), "the ceiling");
         assert_eq!(
             at(101),
@@ -650,7 +650,7 @@ mod tests {
         assert!(rendered.contains("\n[fade]\n"), "{rendered:?}");
         for line in [
             "# enabled     = true",
-            "# duration_ms = 100",
+            "# duration_ms = 200",
             "# session     = true",
             "# excursions  = true",
         ] {

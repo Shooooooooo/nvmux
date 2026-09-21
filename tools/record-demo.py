@@ -18,12 +18,11 @@ background it renders. It answers the rest of the startup handshake too (cursor
 position, device attributes, the kitty keyboard query), without which nvmux does
 not start.
 
-**The recording is the byte stream, not screenshots.** A fade is about four
-repaints inside one direction -- half of `duration_ms`, so 50ms by default.
-Sampling the screen even 20 times a second catches one of them and turns a
-dissolve into a step. Recording
-what nvmux actually wrote loses nothing, and agg replays it at the speed it
-happened.
+**The recording is the byte stream, not screenshots.** A fade is about seven
+repaints inside one direction -- half of `duration_ms`, so 100ms by default.
+Sampling the screen even 20 times a second catches two of them and turns a
+dissolve into a step. Recording what nvmux actually wrote loses nothing, and
+agg replays it at the speed it happened.
 
 Driving on a pty means there is no `capture-pane` to read back, so the checks
 render the stream with pyte -- through `Screen` below, since pyte has no
