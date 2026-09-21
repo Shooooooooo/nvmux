@@ -134,20 +134,32 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
         // in step, and the listing it handed over is what it would be derived
         // from anyway.
         let mut highest = ui::highest_num(&listing);
+        // A client begun while the last session dissolved, waiting to be
+        // waited for. Only a switch ever sets it, and a switch always comes
+        // straight back round this loop, so it never outlives the trip.
+        let mut begun: Option<Begun> = None;
 
         loop {
             // Everything nvmux does between the keypress and a client ready to
             // relay: retiring the old one, the probe, and the spawn — and, for
-            // a session slow to answer, the wait the user watches. Read with
-            // the `timing: session painted` record the relay ends up emitting,
+            // a session slow to answer, the wait the user watches. `early` is
+            // whether the fork and the probe happened under the outgoing
+            // session's dissolve, in which case what is timed here is mostly
+            // the wait for a round trip already in flight. Read with the
+            // `timing: session painted` record the relay ends up emitting,
             // which is the session's own share of the same switch.
             let t_open = std::time::Instant::now();
+            // Anything begun for a session other than the one being attached
+            // to now is a client nobody asked for: dropping it retires it.
+            let started = begun.take().filter(|b| b.session.id == current.id);
+            let early = started.is_some();
             let opened = match attached.take() {
                 Some(a) if a.session_id == current.id => Ok(Some(a)),
                 // Retiring the old client leaves its server running: killing a
                 // --remote-ui client does not kill a --headless --listen server.
                 //
-                // Hung up first and reaped after, with the new client's spawn in
+                // Hung up first and reaped after, with the new client's spawn —
+                // or, where it was begun early, the wait for its probe — in
                 // between: the two have nothing to say to each other — a
                 // different session, a different server, a different pty — so
                 // serialising them would charge the user the sum of the two.
@@ -155,7 +167,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 // client's own restore sequence goes nowhere near the terminal.
                 Some(mut other) => {
                     other.hang_up();
-                    let spawned = new_attachment(transport, &current);
+                    let spawned = attach(transport, &current, started);
                     // Explicitly, rather than by falling out of the arm: this is
                     // the wait the hangup deferred, and leaving it to a binding's
                     // drop would let the next edit here re-serialise it without
@@ -164,11 +176,12 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     drop(other);
                     spawned
                 }
-                None => new_attachment(transport, &current),
+                None => attach(transport, &current, started),
             };
 
             tracing::debug!(
                 ms = t_open.elapsed().as_secs_f64() * 1000.0,
+                early,
                 "timing: retire + probe + spawn"
             );
 
@@ -193,7 +206,45 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 }
             };
 
-            match pty::relay(attachment, highest)? {
+            // The relay, with the chance to start the next client while this
+            // session is still dissolving: `begin_next` fires on a `<prefix>`
+            // switch, before the fade, and what it leaves in `begun` is waited
+            // for at the top of this loop. Scoped, so the closure's borrows
+            // end before the match below — which assigns to the very things it
+            // reads.
+            let ended = {
+                let mut begin_next = |target: pty::Target| {
+                    // Resolved here, and not again below: the session started
+                    // for is the session switched to, or the two could differ.
+                    // A target that names nothing is left to the path below,
+                    // which can re-list for it; that is a round trip, and this
+                    // is not the place to spend one.
+                    let Some(session) = pick(&listing, target, current.state.num) else {
+                        return;
+                    };
+                    // A switch onto the session already attached reuses the
+                    // client in hand. Starting a second one for it would put a
+                    // second UI on that server — which shrinks its screen to
+                    // the smaller of the two — for a client that would then be
+                    // dropped unused.
+                    if session.id == current.id {
+                        return;
+                    }
+                    match begin_attachment(transport, session) {
+                        Ok(b) => begun = Some(b),
+                        // Not reported: the path below attempts the same
+                        // attach a moment later, where a failure has a screen
+                        // to land on and a message written for it.
+                        Err(e) => tracing::debug!(
+                            id = %session.id,
+                            error = %e,
+                            "could not start the next client early"
+                        ),
+                    }
+                };
+                pty::relay(attachment, highest, &mut begin_next)?
+            };
+            match ended {
                 (pty::Outcome::ToPicker, held) => {
                     attached = held;
                     break;
@@ -260,6 +311,13 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     // or a cycle with nowhere to go — puts the user straight
                     // back where they were.
                     attached = held;
+                    // Already resolved, and already started: the dissolve that
+                    // has just finished ran over the top of its fork and its
+                    // probe. Nothing left to look up.
+                    if let Some(b) = &begun {
+                        current = b.session.clone();
+                        continue;
+                    }
                     // Resolved against the listing in hand, which is the one
                     // thing a `<prefix>` switch used to pay for that an attach
                     // from the picker does not: there the listing had already
@@ -433,25 +491,43 @@ fn pick(
     }
 }
 
-/// Start a client for `session` and wait, on the attaching screen, for the
-/// session to take it. `None` is the user giving up on that wait.
+/// A client that has been started, and the probe in flight for it.
+///
+/// The half of an attach that does not block, kept so it can be begun at one
+/// moment and waited for at another — which is the whole point: a switch
+/// begins one before the session it is leaving dissolves (see
+/// [`pty::relay`]), so the fork and the round trip run underneath the fade
+/// rather than after it.
+///
+/// Dropping one retires the client and stops the probe, so a `Begun` that is
+/// never waited for costs nothing beyond the fork it already paid for.
+struct Begun {
+    /// What it was begun for. Carried because the caller resolves the switch
+    /// target to start it, and must not resolve it a second time and disagree.
+    session: nvmux::session::Session,
+    sock: std::path::PathBuf,
+    attachment: pty::Attachment,
+    probe: pty::Probe,
+}
+
+/// Start a client for `session` and its probe, and hand both back without
+/// waiting for either.
 ///
 /// Returns the crate's own error type rather than `anyhow`, so the caller can
 /// tell a dropped connection from a dead session and say the right thing.
-fn new_attachment(
+fn begin_attachment(
     transport: &dyn transport::Transport,
     session: &nvmux::session::Session,
-) -> nvmux::Result<Option<pty::Attachment>> {
+) -> nvmux::Result<Begun> {
     let sock = transport.local_socket_for(session)?;
     // Every spawn is a change of session — the loop above reuses the client
     // otherwise — so the notice is unconditional here and one-shot there.
     let notice = announce::label(&session.name);
     // The client first and the probe alongside it, for the overlap
-    // `pty::spawn_client` explains. A probe that cannot start, one that says
-    // no, and a wait the user gives up on all end the same way, by dropping
-    // the attachment — explicitly, so the client is gone, and its pty with
-    // it, before the picker says anything about it.
-    let mut attachment = pty::spawn_client(&session.id, &sock, &notice)?;
+    // `pty::spawn_client` explains. A probe that cannot start takes the client
+    // down with it — explicitly, so it is gone, and its pty with it, before
+    // the error goes anywhere.
+    let attachment = pty::spawn_client(&session.id, &sock, &notice)?;
     let probe = match pty::Probe::start(&session.id, &sock) {
         Ok(probe) => probe,
         Err(e) => {
@@ -459,6 +535,27 @@ fn new_attachment(
             return Err(e);
         }
     };
+    Ok(Begun {
+        session: session.clone(),
+        sock,
+        attachment,
+        probe,
+    })
+}
+
+/// Wait, on the attaching screen, for the session to take the client
+/// [`begin_attachment`] started. `None` is the user giving up on that wait.
+///
+/// A probe that says no and a wait the user gives up on end the same way, by
+/// dropping the attachment — explicitly, so the client is gone, and its pty
+/// with it, before the picker says anything about it.
+fn finish_attachment(begun: Begun) -> nvmux::Result<Option<pty::Attachment>> {
+    let Begun {
+        session,
+        sock,
+        mut attachment,
+        probe,
+    } = begun;
     match ui::attaching::run(probe, &session.name, &sock) {
         Ok(ui::attaching::Verdict::Ready) => Ok(Some(attachment)),
         // Attached like any other, and the client is already on its way — but
@@ -478,6 +575,20 @@ fn new_attachment(
             drop(attachment);
             Err(e)
         }
+    }
+}
+
+/// The attachment to relay next: one already begun, waited out, or a whole
+/// fresh one. The two halves are the same work either way; what differs is
+/// whether the fork and the probe have had a dissolve to run underneath.
+fn attach(
+    transport: &dyn transport::Transport,
+    session: &nvmux::session::Session,
+    begun: Option<Begun>,
+) -> nvmux::Result<Option<pty::Attachment>> {
+    match begun {
+        Some(begun) => finish_attachment(begun),
+        None => finish_attachment(begin_attachment(transport, session)?),
     }
 }
 

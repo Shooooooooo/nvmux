@@ -115,6 +115,27 @@ impl Outcome {
     fn leads_straight_into_another_relay(self) -> bool {
         matches!(self, Outcome::Switch(_))
     }
+
+    /// The session this outcome names, for the caller that starts the next
+    /// attachment while the outgoing one dissolves (see [`relay`]). `None` for
+    /// every other way a relay can end: the three that open a screen have
+    /// nothing to start yet, and the three that end it have nowhere to go.
+    ///
+    /// Its own accessor rather than a `matches!` at the call site, so the one
+    /// rule it carries is pinned by a test — a new outcome that leads into
+    /// another relay must not be able to arrive here and silently begin
+    /// nothing, which would cost a fade's worth of overlap and no error.
+    fn switch_target(self) -> Option<Target> {
+        match self {
+            Outcome::Switch(target) => Some(target),
+            Outcome::ToPicker
+            | Outcome::Detached
+            | Outcome::CreateNew
+            | Outcome::ShowHelp
+            | Outcome::ChildExited
+            | Outcome::StdinClosed => None,
+        }
+    }
 }
 
 /// Which session a `<prefix>` switch named: one by its number, or the one next
@@ -1001,13 +1022,28 @@ impl Drop for Probe {
 /// claim that the two are interchangeable. What it cost was a round trip on
 /// every attach, forwarded over SSH.
 fn probe_on(client: &mut rpc::Client<UnixStream>, session_id: &str) -> Result<Answer> {
-    // A server waiting for a key cannot answer `list_uis`, a deferred call,
-    // until one arrives. So the mode is read first, every time round, and
-    // nothing deferred is asked until it says the queue is running. Asking
-    // anyway is what this loop exists to stop: the connection has no budget
-    // (see [`Probe::start`]), so a deferred call to a session in that state is
-    // not a slow answer but no answer at all, and the screen waiting on it
-    // spins until the user gives up.
+    // Both questions go out before either answer is read. They are independent
+    // — what state the editor is in, and how many UIs it has — and over an SSH
+    // forward each answer is a round trip, so asking the second only once the
+    // first had come back cost two of them, on the one path the user is
+    // watching. Measured against 0.12.5 through a link with a 150 ms round
+    // trip: 302 ms in series, 151 ms asked together.
+    //
+    // A server waiting for a key cannot *answer* `list_uis`, a deferred call,
+    // until one arrives. So the mode is the reply that is read first, every
+    // time round, and nothing deferred is waited on until it says the queue is
+    // running. Waiting anyway is what this loop exists to stop: the connection
+    // has no budget (see [`Probe::start`]), so a deferred call to a session in
+    // that state is not a slow answer but no answer at all, and the screen
+    // waiting on it spins until the user gives up.
+    //
+    // Sending it early is not that hazard. `nvim_list_uis` reads a list and
+    // changes nothing, so a copy of it sitting in a blocked session's queue
+    // does nothing until the queue runs and nothing anyone can see when it
+    // does; if the probe has given up by then, the reply lands on a socket
+    // that has been shut down (see [`Probe::drop`]) and Neovim closes the
+    // channel, as it does for every client that hangs up. What must never be
+    // sent ahead of a fresh reading is a *key* — see the `<CR>` below.
     //
     // The one wait nvmux ends itself is the hit-enter prompt, with `<CR>`, the
     // key it consumes without running anything — see `rpc::Mode::at_hit_enter`
@@ -1028,10 +1064,21 @@ fn probe_on(client: &mut rpc::Client<UnixStream>, session_id: &str) -> Result<An
     // `:messages` keeps the rest. Advisory, not a lock: a key from that other
     // UI in the microseconds between two calls ends the prompt first, and the
     // `<CR>` then runs in whatever mode it left.
+    //
+    // Which is why the loop itself is not pipelined, though it is two round
+    // trips a turn. `nvim_input` and `nvim_get_mode` are both fast calls,
+    // answered from the socket's read callback, so a mode asked behind a
+    // `<CR>` would be answered before the main loop had consumed the key and
+    // would report the prompt still up — earning a second `<CR>` for one
+    // prompt, which is the bug the fresh reading exists to prevent. The pair
+    // above are safe together only because neither is a key.
+    let mut asking_mode = client.ask_mode()?;
+    let counting = client.ask_uis()?;
+
     for _ in 0..MAX_PROMPTS {
-        let mode = client.get_mode()?;
+        let mode = client.mode_reply(asking_mode)?;
         if !mode.blocking {
-            return ui_count(client, session_id);
+            return ui_count(client, session_id, counting);
         }
         if !mode.at_hit_enter() {
             // A more-prompt, a half-typed `g`, a script parked on a key: over
@@ -1053,13 +1100,14 @@ fn probe_on(client: &mut rpc::Client<UnixStream>, session_id: &str) -> Result<An
             "attach: ending the session's hit-enter prompt"
         );
         client.input("<CR>")?;
+        asking_mode = client.ask_mode()?;
     }
 
     // Still prompting after the budget: something is raising them faster than
     // they are answered. Report it rather than park on it — the user's own
     // keys are a better answer than an unbounded wait, and they can see what
     // the prompts say.
-    let mode = client.get_mode()?;
+    let mode = client.mode_reply(asking_mode)?;
     if mode.blocking {
         tracing::info!(
             id = session_id,
@@ -1068,7 +1116,7 @@ fn probe_on(client: &mut rpc::Client<UnixStream>, session_id: &str) -> Result<An
         );
         return Ok(Answer::Blocked { mode: mode.mode });
     }
-    ui_count(client, session_id)
+    ui_count(client, session_id, counting)
 }
 
 /// How many hit-enter prompts one attach will answer before handing the
@@ -1081,12 +1129,18 @@ fn probe_on(client: &mut rpc::Client<UnixStream>, session_id: &str) -> Result<An
 const MAX_PROMPTS: usize = 4;
 
 /// The deferred half of the probe: whether this session has room for another
-/// client. Only ever called on a mode reading that said the queue is running.
+/// client. The question went out with the mode; this is where its answer is
+/// waited for, and only ever on a mode reading that said the queue is running.
 ///
 /// The wait here is still unbounded, and deliberately: a session in the middle
 /// of a `:!make` answers when the make is done, and that is one to wait for
 /// with a spinner rather than to refuse (see `ui::attaching`). What the caller
 /// has ruled out first is the wait that would never end on its own.
+///
+/// One question is asked however many prompts were answered in between: the
+/// reply describes the moment the queue ran, which is after the last `<CR>`,
+/// and re-asking would buy a fresher count of a thing that is racy by one
+/// either way (see the `>` below).
 ///
 /// Not `unwrap_or(0)`: a server too busy to answer is exactly the one whose UI
 /// count is unknown, and guessing zero is how the seventeenth attach happens.
@@ -1096,8 +1150,12 @@ const MAX_PROMPTS: usize = 4;
 /// client. `MAX_UIS` is half of Neovim's limit, so a count one too high refuses
 /// the ninth other client rather than the eighth, and a count one too low still
 /// stops seven short of the abort.
-fn ui_count(client: &mut rpc::Client<UnixStream>, session_id: &str) -> Result<Answer> {
-    let uis = client.list_uis()?;
+fn ui_count(
+    client: &mut rpc::Client<UnixStream>,
+    session_id: &str,
+    counting: rpc::Pending,
+) -> Result<Answer> {
+    let uis = client.uis_reply(counting)?;
     if uis > MAX_UIS {
         return Err(NvmuxError::Session(
             crate::error::SessionError::TooManyUis {
@@ -1166,9 +1224,29 @@ fn spawn_client_with(
 /// * A thread parked in a blocking `read(0)` cannot be cancelled, so returning
 ///   to the picker would hang or swallow the first keystroke. A `poll` loop
 ///   just stops polling.
+///
+/// # Starting the next session before this one has finished leaving
+///
+/// `begin_next` is called with the target of a `<prefix>` switch, once, the
+/// moment [`pump`] returns one — before this session dissolves and before the
+/// terminal is handed back. What follows that call is the best part of a
+/// `fade.duration_ms` of nvmux drawing its own frames, and the work the next
+/// attachment opens with is a fork and a round trip that touch nothing this
+/// function is using: a client writes into its own pty and nothing reaches the
+/// terminal until a relay copies it (see [`spawn_client`]), and the probe
+/// answers on a thread of its own (see [`Probe`]). Started here, both run
+/// underneath the dissolve instead of after it.
+///
+/// So the callback must *start* things and not wait for them: it is called
+/// with the terminal still raw and the outgoing session still on it, and
+/// anything it blocks on is time the user watches a frozen screen for. It must
+/// not draw. Every other outcome calls it not at all — the picker, the prompt
+/// and the help screen have nothing to start, and the three that end the relay
+/// have nowhere to go.
 pub fn relay(
     mut attachment: Attachment,
     highest_session_num: u32,
+    begin_next: &mut dyn FnMut(Target),
 ) -> Result<(Outcome, Option<Attachment>)> {
     let master_fd = attachment
         .master
@@ -1242,6 +1320,13 @@ pub fn relay(
         highest_session_num,
         popup,
     );
+
+    // As early as there is anything to say: everything below this line is
+    // nvmux drawing, and what the caller starts here runs underneath it. See
+    // the note on `begin_next`.
+    if let Some(target) = outcome.as_ref().ok().and_then(|o| o.switch_target()) {
+        begin_next(target);
+    }
 
     // Whatever ended the relay, nothing the client wrote may stay unshown: a
     // relay cut short inside the hold — a prefix typed at once, a child that
@@ -1338,6 +1423,8 @@ fn pump(
     // that restarted on every wake-up would never fire while a spinner is
     // running. It is set when the machine arms and cleared when it settles.
     let mut deadline: Option<Instant> = None;
+    // The notice's repaint while it is in flight; see [`Erasing`].
+    let mut erasing: Option<Erasing> = None;
     let mut buf = [0u8; 8192];
     // Diagnostics only, and what makes a switch that felt slow attributable:
     // everything before this is nvmux's own work and is timed where it happens,
@@ -1360,6 +1447,7 @@ fn pump(
             deadline,
             popup.as_ref().map(|p| p.wake_at(now)),
             attachment.hold_wake_at(),
+            erasing.as_ref().map(|_| now + ERASE_POLL),
         ]
         .into_iter()
         .flatten()
@@ -1462,23 +1550,45 @@ fn pump(
                 announce::Act::Idle => {}
                 announce::Act::Paint(bytes) => attachment.write_over_session(&bytes)?,
                 announce::Act::Erase => {
-                    // Timed because it is a second full repaint of the session,
-                    // a whole second after the switch — the one nvmux asks for
-                    // rather than the one the attach produced.
-                    let t_erase = std::time::Instant::now();
                     // The same repaint a resume asks for, and for the same
                     // reason: the cells the box covered are the server's, and
                     // only the server can say what was under them. Not the same
-                    // licence, though — see [`Repaint`].
-                    repaint(attachment, Repaint::Notice);
-                    tracing::debug!(
-                        ms = t_erase.elapsed().as_secs_f64() * 1000.0,
-                        "timing: attach notice erase (:mode repaint)"
-                    );
+                    // licence, though — see [`Repaint`] — and not the same
+                    // wait: this one is asked from a thread, because the relay
+                    // has a session to keep running while the answer comes
+                    // (see [`Erasing`]). The size goes first, as it does for a
+                    // resume, and on this thread, where a `resize` belongs.
+                    attachment.resize_to(term::terminal_size());
+                    match Erasing::start(&attachment.sock) {
+                        Ok(started) => erasing = Some(started),
+                        // No thread to ask from: the fallback is what a server
+                        // that could not be asked would have got anyway.
+                        Err(e) => {
+                            tracing::debug!(error = %e, "no thread for the notice repaint");
+                            apply(attachment, Repaint::Notice, Served::NONE);
+                        }
+                    }
                     popup = None;
                 }
                 announce::Act::Done => popup = None,
             }
+        }
+
+        // The notice's repaint, if it has answered. Only the fallback waits on
+        // this — the repaint itself arrives as the session's own output — so a
+        // pass that finds nothing costs a `try_recv`.
+        if let Some(served) = erasing.as_ref().and_then(Erasing::answer) {
+            let asked = erasing.take().expect("it answered a moment ago").started;
+            // Timed because it is a second full repaint of the session, a
+            // whole second after the switch — the one nvmux asks for rather
+            // than the one the attach produced. What the number now measures
+            // is how long it took somewhere else, which is the point of it.
+            tracing::debug!(
+                ms = asked.elapsed().as_secs_f64() * 1000.0,
+                repainted = served.repainted,
+                "timing: attach notice erase (:mode repaint)"
+            );
+            apply(attachment, Repaint::Notice, served);
         }
 
         // Settle a pending prefix or number before reading anything new, so a
@@ -1806,19 +1916,104 @@ fn without_device_attributes_request(chunk: &[u8]) -> std::borrow::Cow<'_, [u8]>
 /// tracking on until its Neovim next flips the mouse itself — and right for
 /// everything else, where the alternative is a client that no longer answers
 /// the mouse at all.
+///
+/// The asking and the waiting are one step here, which is a resume's to be:
+/// the terminal is blank, no relay has started, and the screen coming back is
+/// the thing the user is waiting for. The other caller wants the same repaint
+/// without the wait, and takes the two apart — see [`Erasing`].
 fn repaint(attachment: &mut Attachment, why: Repaint) {
-    let size = term::terminal_size();
-    attachment.resize_to(size);
+    attachment.resize_to(term::terminal_size());
     let served = repaint_through_server(&attachment.sock, why);
+    apply(attachment, why, served);
+}
+
+/// What the relay does once a repaint has answered — or has failed to: the
+/// fallback for a server that could not be asked, and, for a resume, the mouse
+/// mode it reported.
+///
+/// Its own step because the two callers reach it from different places. A
+/// resume asks and waits, one statement above; the attach notice asks from a
+/// thread ([`Erasing`]) and gets here whenever the answer turns up. Both need
+/// the same two things done, and both can only do them here — a `resize` is
+/// the relay thread's to make.
+fn apply(attachment: &mut Attachment, why: Repaint, served: Served) {
     if why == Repaint::Resume {
         term::set_mouse_reporting(served.mouse.unwrap_or(term::MouseReporting::Buttons));
     }
     if !served.repainted {
         // The shrink and its undo are not shown to the shadow: what the
         // client draws after them is for the size it was just told.
-        nudge(attachment.master.as_ref(), size);
+        nudge(attachment.master.as_ref(), term::terminal_size());
     }
 }
+
+/// The repaint that takes the attach notice off the screen, in flight on a
+/// thread of its own.
+///
+/// The cells the box covered are the server's, and asking it for them costs
+/// two round trips — `nvim_get_mode`, and then the `:mode` that does the
+/// painting. Measured against sessions behind a delay proxy: 123 ms over a
+/// 60 ms link, 303 ms over a 150 ms one. Waited for on the relay's own thread,
+/// that is exactly how long the editor forwards no keystroke and copies no
+/// byte — a stall a whole second after the switch that put the box up, which
+/// is to say in the middle of whatever the user started typing when they
+/// arrived.
+///
+/// Nothing about the relay needs the answer, so it does not wait for one. The
+/// repaint arrives as ordinary output from the session, like every other byte
+/// the server sends; the only thing the answer decides is the fallback, and
+/// [`apply`] performs that on the relay's next pass.
+///
+/// The third thread in the crate, and the cheapest: it owns one connection,
+/// reads nothing else, and every call it makes is bounded ([`RESUME_TIMEOUT`]),
+/// so it ends on its own whether or not anyone is still listening. A relay that
+/// ends first drops the receiver, and the send fails into nothing.
+///
+/// Not the resume's repaint, which stays where it is: there the terminal is
+/// blank, the relay has not started, and the screen coming back *is* what the
+/// user is waiting for.
+struct Erasing {
+    rx: mpsc::Receiver<Served>,
+    started: Instant,
+}
+
+impl Erasing {
+    /// Ask, and come back for the answer later.
+    fn start(sock: &Path) -> std::io::Result<Self> {
+        let (tx, rx) = mpsc::channel();
+        let sock = sock.to_path_buf();
+        std::thread::Builder::new()
+            .name("nvmux-notice-repaint".into())
+            .spawn(move || {
+                // A receiver that has gone is a relay that ended first, and
+                // there is nobody left to tell.
+                let _ = tx.send(repaint_through_server(&sock, Repaint::Notice));
+            })?;
+        Ok(Self {
+            rx,
+            started: Instant::now(),
+        })
+    }
+
+    /// The verdict, if it has arrived. A worker that ended without one is
+    /// [`Served::NONE`], which is what any other failure to be answered is:
+    /// the fallback runs, exactly as it would have.
+    fn answer(&self) -> Option<Served> {
+        match self.rx.try_recv() {
+            Ok(served) => Some(served),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(Served::NONE),
+        }
+    }
+}
+
+/// How often the relay looks for [`Erasing`]'s answer while one is in flight.
+///
+/// Only the fallback waits on it, so this is not a deadline, it is a bound on
+/// how late a nudge can be: without it an idle relay would not look again for
+/// [`IDLE_POLL_MS`], and the session that needs the nudge — one too busy to
+/// answer — is exactly the one producing nothing to wake the loop.
+const ERASE_POLL: Duration = Duration::from_millis(50);
 
 /// Why the screen is being painted again, which decides what the repaint may
 /// do on the way.
@@ -2268,6 +2463,30 @@ mod tests {
         assert_eq!(split_at_alt_screen_entry(b""), 0);
     }
 
+    /// The one outcome with a session to begin before the screen goes. Every
+    /// variant is asked, so a new one has to decide rather than default to
+    /// starting nothing — the failure that would cost an overlap silently.
+    #[test]
+    fn only_a_switch_names_a_session_to_begin_early() {
+        for target in [Target::Number(3), Target::Step(Direction::Next)] {
+            assert_eq!(Outcome::Switch(target).switch_target(), Some(target));
+        }
+        for other in [
+            Outcome::ToPicker,
+            Outcome::CreateNew,
+            Outcome::ShowHelp,
+            Outcome::Detached,
+            Outcome::ChildExited,
+            Outcome::StdinClosed,
+        ] {
+            assert_eq!(
+                other.switch_target(),
+                None,
+                "{other:?} has no session to begin an attachment for"
+            );
+        }
+    }
+
     #[test]
     fn only_a_switch_reaches_the_next_session_without_a_screen() {
         for target in [Target::Number(3), Target::Step(Direction::Next)] {
@@ -2358,6 +2577,18 @@ mod tests {
         method: &'static str,
     ) -> std::thread::JoinHandle<Vec<String>> {
         serve_recording(sock, "n", false, 0, DEFAULT_MOUSE, Some(method), false)
+    }
+
+    /// A server waiting for a key: it reports `mode` with `blocking` set and
+    /// answers every fast call, while `method` — a deferred one — is recorded
+    /// and never answered. Which is what a session in that state does: the
+    /// event queue is off, so the call is taken and not run.
+    fn recording_server_blocked_stalling_on(
+        sock: &Path,
+        mode: &'static str,
+        method: &'static str,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        serve_recording(sock, mode, true, 0, DEFAULT_MOUSE, Some(method), false)
     }
 
     fn serve_recording(
@@ -2480,6 +2711,79 @@ mod tests {
             }
             asked
         })
+    }
+
+    /// The notice's repaint is asked from a thread and collected later: the
+    /// two round trips it takes happen while the relay goes on relaying.
+    ///
+    /// What the server records is the whole of what is asked — the mode, and
+    /// then the `:mode` that paints — so a change that started typing at the
+    /// session to take a box off its screen fails here.
+    #[test]
+    fn the_notice_repaint_is_asked_from_a_thread_and_answered_later() {
+        let sock = temp_sock("erasing");
+        let server = recording_server(&sock, "n", false);
+
+        let erasing = Erasing::start(&sock).expect("a thread");
+        let served = wait_for_the_answer(&erasing);
+        assert!(
+            served.repainted,
+            "the server painted; the relay must not nudge on top of it"
+        );
+
+        assert_eq!(
+            server.join().expect("the server thread"),
+            ["nvim_get_mode", "nvim_command"],
+            "the notice repaint asked for something else"
+        );
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    /// **The point of the thread.** Asking must not wait, whatever the session
+    /// is doing: a server that never answers the `:mode` used to hold the relay
+    /// for a whole [`RESUME_TIMEOUT`], with the editor forwarding no keystroke
+    /// and copying no byte for as long.
+    ///
+    /// Bounded well under that budget rather than at it, so the assertion is
+    /// about not waiting rather than about how fast a thread starts.
+    #[test]
+    fn asking_for_the_notice_repaint_does_not_wait_for_it() {
+        let sock = temp_sock("erasingstall");
+        let server = recording_server_stalling_on(&sock, "nvim_command");
+
+        let asked = Instant::now();
+        let erasing = Erasing::start(&sock).expect("a thread");
+        let took = asked.elapsed();
+        assert!(
+            took < RESUME_TIMEOUT / 4,
+            "asking took {took:?}, which is a wait, not an ask"
+        );
+        assert_eq!(
+            erasing.answer(),
+            None,
+            "an answer cannot have arrived from a server that never sent one"
+        );
+
+        // And when the budget does run out, the verdict is the fallback's:
+        // nothing was painted, so the relay nudges.
+        let served = wait_for_the_answer(&erasing);
+        assert_eq!(served, Served::NONE);
+        drop(erasing);
+        let _ = std::fs::remove_file(&sock);
+        let _ = server.join();
+    }
+
+    /// Poll for [`Erasing`]'s verdict the way the relay does, with a bound so
+    /// a worker that never answers fails the test rather than hanging it.
+    fn wait_for_the_answer(erasing: &Erasing) -> Served {
+        let deadline = Instant::now() + RESUME_TIMEOUT * 4;
+        while Instant::now() < deadline {
+            if let Some(served) = erasing.answer() {
+                return served;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the notice repaint never answered");
     }
 
     /// A resume may end a hit-enter prompt to get its screen back; taking an
@@ -2642,28 +2946,29 @@ mod tests {
     }
 
     /// The attach probe's call sequence, which is the whole of what a change to it
-    /// can break: the mode first — a fast call, answered even at a prompt — then
-    /// a `<CR>` for the one prompt that key ends, then the deferred UI count.
+    /// can break: the mode and the UI count together — one round trip, not two —
+    /// and then a `<CR>` for the one prompt that key ends.
     ///
     /// The `nvim_get_api_info` that used to lead this cost a round trip, and a
     /// forwarded one over SSH, while proving nothing the `?` on the mode does not.
     /// The server here would still answer it, so its absence is what is asserted.
     #[test]
-    fn the_attach_probe_asks_the_mode_then_the_ui_count_and_nothing_else() {
+    fn the_attach_probe_asks_the_mode_and_the_ui_count_together_and_nothing_else() {
         for (tag, mode, want) in [
             ("idle", "n", &["nvim_get_mode", "nvim_list_uis"][..]),
-            // The prompt ends on the key, and the mode is read again before
-            // anything deferred is asked: the `<CR>` is not sent and forgotten,
-            // because the reading it was sent on is the only thing that says
-            // asking `list_uis` is safe.
+            // The prompt ends on the key, and the mode is read again before the
+            // UI count is: the `<CR>` is not sent and forgotten, because the
+            // reading it was sent on is the only thing that says *waiting* for
+            // `list_uis` is safe. One `nvim_list_uis` however many prompts were
+            // answered — the one already in flight is what the count comes from.
             (
                 "hitenter",
                 "r",
                 &[
                     "nvim_get_mode",
+                    "nvim_list_uis",
                     "nvim_input(<CR>)",
                     "nvim_get_mode",
-                    "nvim_list_uis",
                 ][..],
             ),
         ] {
@@ -2714,20 +3019,22 @@ mod tests {
     }
 
     /// **The regression test for the attach that never came back.** A session
-    /// waiting for a key must never be asked anything deferred.
+    /// waiting for a key must never be *waited on* for a deferred answer.
     ///
     /// `nvim_list_uis` is deferred, and the probe's connection has no budget,
-    /// so asking it of a session in one of these states is not a slow answer
-    /// but no answer at all: the worker parks, `ui::attaching` spins, and the
-    /// only way out is the user giving up. Measured against 0.12.5, all three
-    /// of these did exactly that.
+    /// so an answer from a session in one of these states is not slow but
+    /// absent: a probe that waited for it would park, `ui::attaching` would
+    /// spin, and the only way out would be the user giving up. Measured
+    /// against 0.12.5, all three of these did exactly that.
     ///
-    /// So the assertion is on what is *absent*. `nvim_list_uis` must not
-    /// appear at all, and the answer must be `Blocked` — from which the attach
-    /// goes ahead anyway, because the client nvmux is about to hand over is how
-    /// the user presses the key that ends the wait.
+    /// So these servers never answer it at all, and the assertion is that the
+    /// probe says `Blocked` anyway — from which the attach goes ahead, because
+    /// the client nvmux is about to hand over is how the user presses the key
+    /// that ends the wait. Sending the question is not the hazard and is no
+    /// longer forbidden (see [`probe_on`]); waiting for it is, and a probe that
+    /// read the count before deciding would hang here rather than fail.
     #[test]
-    fn a_session_waiting_for_a_key_is_never_asked_anything_deferred() {
+    fn a_session_waiting_for_a_key_is_never_waited_on_for_a_deferred_answer() {
         for (tag, mode, keys) in [
             // A more-prompt. `<CR>` scrolls it a line rather than ending it.
             ("more", "rm", 0),
@@ -2741,7 +3048,7 @@ mod tests {
             ("stacked", "r", MAX_PROMPTS),
         ] {
             let sock = temp_sock(tag);
-            let server = recording_server(&sock, mode, true);
+            let server = recording_server_blocked_stalling_on(&sock, mode, "nvim_list_uis");
             let mut probe = Probe::start(tag, &sock).expect("connected");
             let answer = probe
                 .wait(Duration::from_secs(5))
@@ -2755,10 +3062,11 @@ mod tests {
             drop(probe);
 
             let asked = server.join().expect("the server thread");
-            assert!(
-                !asked.iter().any(|m| m == "nvim_list_uis"),
-                "{tag}: the probe asked a deferred call of a session \
-                 that cannot answer one: {asked:?}"
+            assert_eq!(
+                asked.iter().filter(|m| *m == "nvim_list_uis").count(),
+                1,
+                "{tag}: the UI count is asked once, with the mode, and not \
+                 again per prompt: {asked:?}"
             );
             assert_eq!(
                 asked.iter().filter(|m| m.starts_with("nvim_input")).count(),

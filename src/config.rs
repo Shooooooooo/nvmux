@@ -32,6 +32,7 @@ use std::ffi::OsStr;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -84,10 +85,16 @@ pub struct FadeSettings {
     /// that does not answer the startup colour query, because there is then
     /// nothing to fade *to* — see [`crate::fade::enabled`].
     pub enabled: bool,
-    /// How long one direction takes; a switch pays it once on the way out and
-    /// once on the way in, and twice more for the box that says where it
-    /// landed, which dissolves in and out around the second it is up (see
-    /// [`crate::announce`]). Must be at least 1 and at most `MAX_FADE_MS`.
+    /// How long a dissolve takes, **both directions together**: a screen going
+    /// out and the next one coming up divide this between them, half each (see
+    /// [`FadeSettings::one_way`]). So a switch pays it once for the screens,
+    /// and once more for the box that says where it landed, which dissolves in
+    /// and out around the second it is up (see [`crate::announce`]).
+    ///
+    /// Both directions rather than one because a transition is the thing
+    /// anybody watching is timing: what the number names is how long the screen
+    /// takes to change, not how long half of that takes. Must be at least 1 and
+    /// at most `MAX_FADE_MS`.
     pub duration_ms: u64,
     /// Whether a Neovim screen dissolves too — in, once its first paint has
     /// settled, and out — rather than only nvmux's own screens. Costs a
@@ -129,13 +136,30 @@ impl Default for SessionSettings {
     }
 }
 
+impl FadeSettings {
+    /// One direction of a dissolve: half of [`FadeSettings::duration_ms`],
+    /// which measures both.
+    ///
+    /// Halved here rather than at the two schedules that start a fade, so
+    /// there is one place where the config's units become the code's and
+    /// nowhere that can read the key as a single direction by mistake.
+    ///
+    /// Exact, and never zero: `Duration` divides at nanosecond resolution, so
+    /// the smallest legal setting — 1 ms — halves to 500 µs rather than to
+    /// nothing. A fade that short is one frame either way (see
+    /// [`crate::fade::Schedule::next`]), which is what any value at or under
+    /// a frame has always been.
+    pub fn one_way(&self) -> Duration {
+        Duration::from_millis(self.duration_ms) / 2
+    }
+}
+
 impl Default for FadeSettings {
     fn default() -> Self {
         Self {
             enabled: true,
             // Long enough to read as a dissolve rather than a flicker, short
-            // enough that a switch — which pays it twice — still feels like
-            // one movement.
+            // enough to be one movement: 50 ms out and 50 ms back.
             duration_ms: 100,
             session: true,
             excursions: true,
@@ -158,8 +182,9 @@ where
 /// `poll` timeout as a `c_int`, and an absurd one is a hang, not a long wait.
 const MAX_TIMEOUT_MS: u64 = 60_000;
 
-/// Ceiling for `fade.duration_ms`. Two seconds is already a fade nobody wants
-/// to sit through twice per switch; past it the value is a hang with a name.
+/// Ceiling for `fade.duration_ms`. Two seconds is already a transition nobody
+/// wants to sit through, and a switch sits through two of them — the screens
+/// and the notice; past it the value is a hang with a name.
 const MAX_FADE_MS: u64 = 2_000;
 
 impl Settings {
@@ -179,10 +204,12 @@ impl Settings {
         if self.fade.duration_ms == 0 {
             // `enabled = false` is how the fade is turned off; a zero-length
             // fade would be the same thing spelled as a schedule with no frames.
+            // One millisecond still halves to something rather than to nothing,
+            // which is what [`FadeSettings::one_way`] is careful about.
             return Err("fade.duration_ms must be at least 1".into());
         }
         if self.fade.duration_ms > MAX_FADE_MS {
-            // It feeds a `sleep`, twice per switch.
+            // It feeds a `sleep`, on every screen a switch dissolves.
             return Err(format!("fade.duration_ms must be at most {MAX_FADE_MS}"));
         }
         // Refused at startup rather than at the prompt: a command that can never
@@ -455,6 +482,33 @@ mod tests {
         assert_eq!(s.fade.session, FadeSettings::default().session);
         assert_eq!(s.fade.excursions, FadeSettings::default().excursions);
         assert_eq!(s.keys, KeySettings::default());
+    }
+
+    /// The key measures a whole dissolve, so one direction is half of it.
+    ///
+    /// The floor is the case worth pinning: `duration_ms = 1` is legal, and
+    /// halving it in whole milliseconds would be zero — a schedule with no
+    /// length, which is the very thing `validate` refuses to let the key
+    /// express.
+    #[test]
+    fn one_direction_is_half_the_configured_dissolve() {
+        let at = |ms| {
+            FadeSettings {
+                duration_ms: ms,
+                ..FadeSettings::default()
+            }
+            .one_way()
+        };
+
+        assert_eq!(at(100), Duration::from_millis(50), "the default");
+        assert_eq!(at(MAX_FADE_MS), Duration::from_millis(1_000), "the ceiling");
+        assert_eq!(
+            at(101),
+            Duration::from_micros(50_500),
+            "an odd value is not rounded away"
+        );
+        assert_eq!(at(1), Duration::from_micros(500), "the floor is not zero");
+        assert!(!at(1).is_zero(), "a legal setting must have some length");
     }
 
     #[test]

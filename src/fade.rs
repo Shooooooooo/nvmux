@@ -108,13 +108,18 @@ pub fn session() -> bool {
     crate::config::get().fade.session
 }
 
-/// One direction's length, from the config.
-fn duration() -> Duration {
-    Duration::from_millis(crate::config::get().fade.duration_ms)
+/// How long one direction takes: half of `fade.duration_ms`, which measures
+/// a dissolve both ways (see [`crate::config::FadeSettings::one_way`]).
+fn one_way() -> Duration {
+    crate::config::get().fade.one_way()
 }
 
 /// Everything a caller needs to paint its own fade frames: what to interpolate
 /// between, and how long one direction takes.
+///
+/// One direction, not the configured length of both: a caller here is driving
+/// a single [`Schedule`], and the halving happens once, on the way out of the
+/// config.
 ///
 /// The drivers below sleep between frames, which the relay loop cannot do — it
 /// has a child to read and keys to pass on. So the attach notice
@@ -124,8 +129,10 @@ fn duration() -> Duration {
 /// states no test could reach, and no palette is ever installed under test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dissolve {
-    /// One direction's length.
-    pub duration: Duration,
+    /// One direction's length — half of `fade.duration_ms`. Named for what it
+    /// is rather than for the key it comes from, since that key measures both
+    /// directions and these two numbers are no longer the same one.
+    pub one_way: Duration,
     /// The terminal's own colours: what a glyph fully drawn is, what a glyph
     /// fully dissolved is, and — for a caller painting the session's own cells
     /// rather than its own text — what every indexed colour in between means.
@@ -150,7 +157,7 @@ impl Dissolve {
 /// one form a caller that paints its own frames can use.
 pub fn dissolve() -> Option<Dissolve> {
     Some(Dissolve {
-        duration: duration(),
+        one_way: one_way(),
         palette: *active()?,
     })
 }
@@ -286,7 +293,7 @@ where
     let Some(palette) = active() else {
         return Ok(());
     };
-    let mut schedule = Schedule::start(duration(), direction, Instant::now());
+    let mut schedule = Schedule::start(one_way(), direction, Instant::now());
     while let Some(t) = schedule.next(Instant::now()) {
         write_all(SYNC_BEGIN)?;
         terminal.draw(|f| {
@@ -333,7 +340,7 @@ fn run_session(shadow: &mut Shadow, direction: Direction) -> io::Result<bool> {
         return Ok(false);
     }
     let mut out = io::stdout().lock();
-    let mut schedule = Schedule::start(duration(), direction, Instant::now());
+    let mut schedule = Schedule::start(one_way(), direction, Instant::now());
     while let Some(t) = schedule.next(Instant::now()) {
         let cursor = cursor_for(direction, schedule.finished());
         out.write_all(&shadow.frame(t, palette, cursor))?;
@@ -390,6 +397,21 @@ mod tests {
         );
         assert!(!is_configured(false, false), "the config can disable it");
         assert!(!is_configured(false, true), "off is off");
+    }
+
+    /// What the schedules are actually started with: one direction, half the
+    /// configured dissolve. The arithmetic is pinned where it happens
+    /// (`config::FadeSettings::one_way`); this pins the wiring, so a driver
+    /// that went back to reading `duration_ms` whole fails here rather than
+    /// quietly running twice as long.
+    ///
+    /// Reads the compiled default, since no test installs a config (see
+    /// [`crate::config::get`]).
+    #[test]
+    fn a_schedule_is_started_with_half_the_configured_dissolve() {
+        let configured = Duration::from_millis(crate::config::get().fade.duration_ms);
+        assert_eq!(one_way() * 2, configured);
+        assert_eq!(one_way(), Duration::from_millis(50), "the compiled default");
     }
 
     /// No palette is ever installed under test, so nothing can animate: every

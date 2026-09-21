@@ -103,9 +103,10 @@ const GIVE_UP: Duration = Duration::from_secs(2);
 /// setting, because there is no second answer worth the config key: shorter and
 /// it is a flicker, longer and it is something you wait out on every switch.
 ///
-/// The dissolves are on top of this rather than carved out of it: a fade is
-/// `fade.duration_ms` each way, and a second of the box fully drawn is the
-/// second this constant is arguing for. At the default that is 1.2s in all.
+/// The dissolves are on top of this rather than carved out of it: the box
+/// dissolves in and out for `fade.duration_ms` between them, and a second of
+/// the box fully drawn is the second this constant is arguing for. At the
+/// default that is 1.1s in all.
 const DURATION: Duration = Duration::from_secs(1);
 
 /// Columns between the box's border and its text.
@@ -188,7 +189,7 @@ impl Life {
             };
         };
         let mut life = Self {
-            phase: Phase::In(Schedule::start(d.duration, Direction::In, now)),
+            phase: Phase::In(Schedule::start(d.one_way, Direction::In, now)),
             // Fully dissolved, until the schedule's first frame says otherwise
             // — which it does before anything is drawn.
             t: 1.0,
@@ -348,7 +349,7 @@ impl Popup {
             // The second is up: start dissolving, with the first frame due at
             // once — it is what replaces the box that has been sitting there.
             (Phase::Held { .. }, Some(d)) => {
-                life.phase = Phase::Out(Schedule::start(d.duration, Direction::Out, now));
+                life.phase = Phase::Out(Schedule::start(d.one_way, Direction::Out, now));
                 life.next_frame = now;
                 false
             }
@@ -597,7 +598,7 @@ mod tests {
     /// this is the only way to reach the dissolving states.
     fn dissolve() -> Dissolve {
         Dissolve {
-            duration: Duration::from_millis(100),
+            one_way: Duration::from_millis(100),
             palette: palette(),
         }
     }
@@ -1128,12 +1129,12 @@ mod tests {
         );
         let fading_in = painted[turn].0 - SETTLE;
         assert!(
-            fading_in.abs_diff(d.duration) < Duration::from_millis(20),
+            fading_in.abs_diff(d.one_way) < Duration::from_millis(20),
             "faded in over {fading_in:?}"
         );
         let fading_out = painted.last().expect("a last frame").0 - painted[turn + 1].0;
         assert!(
-            fading_out < d.duration,
+            fading_out < d.one_way,
             "faded out over more than its length: {fading_out:?}"
         );
     }
@@ -1208,7 +1209,7 @@ mod tests {
         assert!(matches!(popup.step(now, false, big(), None), Act::Paint(_)));
 
         // From here the child never stops talking, so nothing can be painted.
-        let life = dissolve().duration * 2 + DURATION;
+        let life = dissolve().one_way * 2 + DURATION;
         let end = now + life + Duration::from_millis(100);
         while now < end {
             now += Duration::from_millis(10);
