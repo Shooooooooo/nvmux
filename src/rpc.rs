@@ -411,9 +411,17 @@ pub struct Mode {
     pub mode: String,
     /// The editor is waiting for a key with its event queue switched off, so
     /// no deferred call is served until that key arrives: a hit-enter or
-    /// more-prompt, or the second key of a multi-key command (`g`, `d`, `"`).
-    /// Not a `:confirm` question, on 0.12 at least — measured, it reports
-    /// `r?` with this false and answers deferred calls as usual.
+    /// more-prompt, or the second key of a multi-key command.
+    ///
+    /// Measured against 0.12.5, with a real UI attached, since which states
+    /// actually set this is not obvious and decides what the attach probe may
+    /// ask. A hit-enter prompt is `r` with this true; a more-prompt `rm` with
+    /// it true; a half-typed `g` is `n` with it true. But a pending *operator*
+    /// is not: `d` reports `no` with this false and answers deferred calls as
+    /// usual, and so do a `:confirm` question (`r?`) and a script parked in
+    /// `getchar()`. So this flag is narrower than "the editor is waiting for
+    /// something", and it is the reliable half — where it is set, a deferred
+    /// call will not be answered, whatever the mode string says.
     pub blocking: bool,
 }
 
