@@ -16,7 +16,8 @@ fn main() -> Result<()> {
     logging::init(&dir)?;
 
     // Before anything is spawned — and before a first-run config file is written
-    // in `run` — restrict the umask: see `paths::restrict_umask`.
+    // in `run` — clamp the umask, and record the one it replaced so that what
+    // nvmux spawns can be handed it back: see `paths::restrict_umask`.
     paths::restrict_umask();
 
     // Before any screen is drawn, so a `kill` during the picker — not only

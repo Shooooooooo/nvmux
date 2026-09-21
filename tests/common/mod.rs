@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::Signal;
+use nix::sys::stat::Mode;
 use nix::unistd::Pid;
 use nvmux::launch::Launch;
 use nvmux::rpc::Client;
@@ -157,6 +158,36 @@ pub fn command_line(pid: u32) -> String {
         .output()
         .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
         .unwrap_or_default()
+}
+
+/// The umask these suites pretend nvmux was launched with.
+///
+/// Permissive, and the shared-group setting rather than a value no login would
+/// produce, so a session that reports it can only have inherited it — nothing
+/// in nvmux would arrive at 0002 any other way.
+pub const LAUNCH_UMASK: libc::mode_t = 0o002;
+
+/// Establish [`LAUNCH_UMASK`] as this binary's launch mask, the way `main` does
+/// it: clamp the process, and record the mask that clamp replaced.
+///
+/// Once per binary, because `paths::restrict_umask` keeps the first mask it
+/// sees. The process's own mask is put straight back, so the tests running
+/// alongside are left as they were — and nothing has to hold still afterwards,
+/// since what the spawn path reads from here on is the *recorded* mask rather
+/// than the live one.
+pub fn establish_launch_umask() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let original = nix::sys::stat::umask(Mode::from_bits_truncate(LAUNCH_UMASK));
+        nvmux::paths::restrict_umask();
+        nix::sys::stat::umask(original);
+    });
+}
+
+/// [`LAUNCH_UMASK`] as `umask` prints it, which is what a shell or a session
+/// asked for its mask answers with.
+pub fn launch_umask_printed() -> String {
+    format!("{LAUNCH_UMASK:04o}")
 }
 
 /// Names every test session distinctly, so a failed run cannot poison the next.

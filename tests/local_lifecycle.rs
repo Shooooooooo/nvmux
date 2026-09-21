@@ -64,6 +64,97 @@ fn create_list_and_kill_a_session() {
     assert!(!sock.exists(), "kill must unlink the socket");
 }
 
+/// The shell nvmux runs its scripts in — and so `scripts/spawn.sh`, and so the
+/// editor `spawn.sh` launches — runs under the mask nvmux was launched with,
+/// not the 0077 nvmux clamps itself to.
+///
+/// Asked of `sh` directly, so this holds the line on machines with no nvim,
+/// where the session test below can only skip.
+#[test]
+fn the_script_shell_runs_under_the_launch_umask() {
+    common::establish_launch_umask();
+
+    let out = nvmux::proc::run_local("umask", &[]).expect("run a script");
+    assert!(out.ok(), "the script failed: {}", out.stderr);
+    assert_eq!(
+        out.stdout.trim(),
+        common::launch_umask_printed(),
+        "the script shell was handed 0077 rather than the launch mask"
+    );
+}
+
+/// A session writes the user's files, so it gets the user's umask.
+///
+/// Asked of the session rather than of the spawn: `system('umask')` runs a shell
+/// as a child of the editor, which is the inheritance a `:terminal`, a `:!make`
+/// and a language server get — and the one a user notices when a new file comes
+/// out 0600.
+///
+/// The whole production wiring is under test here: `restrict_umask` clamping the
+/// process and recording what it replaced, `proc::sh_command` handing that back
+/// to the shell, and `spawn.sh` adding no mask of its own. The modes asserted
+/// afterwards are the other half of the trade — what keeps the socket private
+/// now that the mask does not.
+#[test]
+fn a_session_runs_under_the_umask_nvmux_was_launched_with() {
+    require_nvim!();
+    common::establish_launch_umask();
+    let scratch = Scratch::new("umask");
+    let t = scratch.transport();
+
+    let session = t
+        .create_session("umask", &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket");
+
+    let reported = {
+        let mut client =
+            nvmux::rpc::Client::connect(&sock, Duration::from_secs(2)).expect("connect");
+        let value = client.eval("system('umask')").expect("ask for the umask");
+        value
+            .as_str()
+            .expect("umask prints a string")
+            .trim()
+            .to_string()
+    };
+
+    // Born 0775 under that mask, and private anyway: `spawn.sh` chmods it, and
+    // it was never anywhere but inside a 0700 directory.
+    use std::os::unix::fs::PermissionsExt;
+    let sock_mode = std::fs::metadata(&sock).expect("stat").permissions().mode() & 0o777;
+    let dir_mode = std::fs::metadata(&scratch.0)
+        .expect("stat")
+        .permissions()
+        .mode()
+        & 0o777;
+    let log_mode = std::fs::metadata(scratch.0.join(format!("{}.log", session.id)))
+        .expect("stat")
+        .permissions()
+        .mode()
+        & 0o777;
+
+    t.kill_session(&session).expect("kill");
+
+    assert_eq!(
+        reported,
+        common::launch_umask_printed(),
+        "the session was clamped rather than handed the launch mask"
+    );
+    assert_eq!(
+        sock_mode & 0o077,
+        0,
+        "socket is mode {sock_mode:04o} under a permissive umask"
+    );
+    assert_eq!(
+        dir_mode, 0o700,
+        "runtime directory is mode {dir_mode:04o} under a permissive umask"
+    );
+    assert_eq!(
+        log_mode, 0o600,
+        "log is mode {log_mode:04o} under a permissive umask"
+    );
+}
+
 #[test]
 fn the_pid_recorded_is_the_process_serving_the_socket() {
     require_nvim!();
