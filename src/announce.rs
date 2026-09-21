@@ -106,7 +106,7 @@ const GIVE_UP: Duration = Duration::from_secs(2);
 /// The dissolves are on top of this rather than carved out of it: the box
 /// dissolves in and out for `fade.duration_ms` between them, and a second of
 /// the box fully drawn is the second this constant is arguing for. At the
-/// default that is 1.1s in all.
+/// default that is 1.2s in all.
 const DURATION: Duration = Duration::from_secs(1);
 
 /// Columns between the box's border and its text.

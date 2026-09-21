@@ -411,7 +411,11 @@ mod tests {
     fn a_schedule_is_started_with_half_the_configured_dissolve() {
         let configured = Duration::from_millis(crate::config::get().fade.duration_ms);
         assert_eq!(one_way() * 2, configured);
-        assert_eq!(one_way(), Duration::from_millis(50), "the compiled default");
+        assert_eq!(
+            one_way(),
+            Duration::from_millis(100),
+            "the compiled default"
+        );
     }
 
     /// No palette is ever installed under test, so nothing can animate: every
