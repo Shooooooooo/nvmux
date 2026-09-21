@@ -18,9 +18,10 @@ background it renders. It answers the rest of the startup handshake too (cursor
 position, device attributes, the kitty keyboard query), without which nvmux does
 not start.
 
-**The recording is the byte stream, not screenshots.** A fade is about five
-repaints inside `duration_ms`, 100ms by default. Sampling the screen even 20
-times a second catches two of them and turns a dissolve into a step. Recording
+**The recording is the byte stream, not screenshots.** A fade is about four
+repaints inside one direction -- half of `duration_ms`, so 50ms by default.
+Sampling the screen even 20 times a second catches one of them and turns a
+dissolve into a step. Recording
 what nvmux actually wrote loses nothing, and agg replays it at the speed it
 happened.
 
