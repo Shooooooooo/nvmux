@@ -16,6 +16,12 @@
 //! answers the client's queries the way a terminal with the protocol under
 //! test does, waits for the client to turn the protocol on, and types.
 //! Skipped without a usable `nvim`, like the other suites.
+//!
+//! One test here is not about a spelling at all. The hint bar the prefix puts up
+//! ([`nvmux::hint`]) is written over a live editor's last row and taken off it
+//! again, and neither half can be shown to work anywhere but here: it needs a
+//! real client painting a real screen to cover, and the shadow's copy of that
+//! screen to put back.
 
 #[macro_use]
 mod common;
@@ -32,6 +38,11 @@ use portable_pty::{CommandBuilder, PtySize};
 /// The session socket and id the child attaches to.
 const CHILD_SOCK: &str = "NVMUX_TEST_RELAY_SOCK";
 const CHILD_ID: &str = "NVMUX_TEST_RELAY_ID";
+/// Set on a child that must keep a shadow of the session's screen — which is
+/// what the hint bar puts the row it covered back from. A shadow needs a palette
+/// and the fade on, and nothing here queries a real terminal, so the colours are
+/// handed to the child rather than asked for.
+const CHILD_PALETTE: &str = "NVMUX_TEST_RELAY_PALETTE";
 
 /// The client's kitty keyboard query and DA1, and the terminal's answers. The
 /// kitty reply says "supported, no flags set yet"; the DA1 reply is a
@@ -62,6 +73,19 @@ fn relay_child() {
     let mut settings = nvmux::config::with_prefix(nvmux::keys::PREFIX);
     settings.keys.timeout_ms = 10_000;
     nvmux::config::init(settings);
+
+    // Without this the fade is off — `palette::get` is `None`, so `fade::enabled`
+    // is false — and there is no shadow of the session's screen. The tests about
+    // spellings want it that way: no fade means no held first paint and no
+    // frames, so what reaches the parent is the client's own bytes and nothing
+    // else. The bar test needs the shadow, and says so.
+    if std::env::var_os(CHILD_PALETTE).is_some() {
+        nvmux::palette::init(Some(nvmux::palette::Palette {
+            fg: nvmux::palette::Rgb(200, 200, 200),
+            bg: nvmux::palette::Rgb(0, 0, 0),
+            ansi: [nvmux::palette::Rgb(0, 0, 0); 16],
+        }));
+    }
 
     // An empty notice announces nothing: these tests are about the prefix
     // reaching the machine, and a box drawn over the screen would be noise in
@@ -108,8 +132,15 @@ struct Terminal {
 }
 
 impl Terminal {
-    /// Re-run this test binary as `relay_child` on a fresh pty.
+    /// Re-run this test binary as `relay_child` on a fresh pty, with no palette
+    /// and so no fade — what every test about a spelling wants.
     fn spawn(sock: &Path, id: &str, protocol: Protocol) -> Self {
+        Self::spawn_with(sock, id, protocol, false)
+    }
+
+    /// [`Terminal::spawn`], with `shadow` asking the child for the palette that
+    /// gives it a shadow of the session's screen (see [`CHILD_PALETTE`]).
+    fn spawn_with(sock: &Path, id: &str, protocol: Protocol, shadow: bool) -> Self {
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize {
                 rows: 40,
@@ -131,6 +162,13 @@ impl Terminal {
         // that says it is an old VTE.
         cmd.env("TERM", "xterm-256color");
         cmd.env_remove("VTE_VERSION");
+        // `NO_COLOR` forces the fade off whatever the config says, and with it
+        // the shadow: removed so the child's screen does not depend on the
+        // environment whoever ran `cargo test` happened to have.
+        cmd.env_remove("NO_COLOR");
+        if shadow {
+            cmd.env(CHILD_PALETTE, "1");
+        }
         let child = pair.slave.spawn_command(cmd).expect("spawn relay child");
         // Or the master would never see EOF once the child exits.
         drop(pair.slave);
@@ -366,4 +404,135 @@ fn the_push_is_matched_by_shape() {
     // The terminal's own reply, the xterm push, and a pop are not pushes.
     assert_eq!(kitty_push_flags(b"\x1b[?0u\x1b[>4;2m\x1b[<u"), None);
     assert_eq!(kitty_push_flags(b"\x1b[>"), None);
+}
+
+/// The rows and columns of the pty every [`Terminal`] opens. Named because the
+/// hint bar's whole geometry is "the last row", and a test that asks what is on
+/// it has to agree with the child about which row that is.
+const ROWS: u16 = 40;
+const COLS: u16 = 120;
+
+/// One row of the screen the child's output describes, as a terminal would show
+/// it.
+///
+/// The byte stream cannot answer this question. nvmux's writes, the client's
+/// paints and the fade's frames all cross the same wire in whatever order the
+/// relay managed, and "the bar is gone" is a statement about cells rather than
+/// about bytes — so the test keeps a parser, as `src/shadow.rs` keeps one, and
+/// reads the row off it.
+fn row_on_screen(out: &[u8], row: u16) -> String {
+    let mut parser = vt100::Parser::new(ROWS, COLS, 0);
+    parser.process(out);
+    let screen = parser.screen();
+    (0..COLS)
+        .map(|col| match screen.cell(row, col) {
+            Some(cell) if cell.has_contents() => cell.contents(),
+            _ => " ",
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// The prefix puts the key row up over a live editor, and the next key takes it
+/// off again with the editor's own row underneath it — the two halves of the
+/// feature, neither of which is visible from a unit test.
+///
+/// `<prefix> <prefix>` is the dismissal to test on, because it is one of the
+/// three that leave the relay *running*: the picker, a detach and a switch all
+/// end it, and there the screen is dissolved or cleared on the way out and would
+/// clear the bar whether or not anything had taken it off. Here nothing else
+/// touches the row, so if the bar is still on it, it stays.
+///
+/// `shadow` picks which way the row is put back, and both have to work: from the
+/// shadow's copy of the screen, which is local and exact, or — with the fade off,
+/// and so no shadow — by blanking the row and asking the server to repaint it,
+/// the way the attach notice always leaves.
+fn the_hint_row_goes_up_and_comes_down(tag: &str, shadow: bool) {
+    require_nvim!();
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(&common::unique(tag), &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+
+    let mut term = Terminal::spawn_with(&sock, &session.id, Protocol::Kitty, shadow);
+
+    // The client is up and painting once it has turned the protocol on.
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| {
+            kitty_push_flags(out).is_some()
+        }),
+        "the client never started; got: {}",
+        term.since(0)
+    );
+    // Let the first paint land: with the fade on it is held back and dissolved
+    // in, so the screen the bar covers does not exist until that is over.
+    term.pump_until(Duration::from_secs(2), |out| {
+        !row_on_screen(out, 0).is_empty()
+    });
+    let under = row_on_screen(&term.output, ROWS - 1);
+
+    // The prefix alone. The child's `timeout_ms` is ten seconds, so the bar has
+    // as long as it needs to find a lull.
+    term.type_bytes(&[nvmux::keys::PREFIX]);
+    let mark = term.output.len();
+    assert!(
+        term.pump_until(Duration::from_secs(10), |out| {
+            row_on_screen(out, ROWS - 1).contains("space picker")
+        }),
+        "the prefix put no hint row on row {ROWS}; it says {:?}, and the child wrote: {}",
+        row_on_screen(&term.output, ROWS - 1),
+        term.since(mark)
+    );
+    assert!(
+        row_on_screen(&term.output, ROWS - 1).contains("d detach"),
+        "the row is not the key list: {:?}",
+        row_on_screen(&term.output, ROWS - 1)
+    );
+
+    // A second prefix is a literal: Neovim gets the byte and the relay carries
+    // on, so the bar has to take itself off.
+    let mark = term.output.len();
+    term.type_bytes(&[nvmux::keys::PREFIX]);
+    assert!(
+        term.pump_until(Duration::from_secs(10), |out| {
+            !row_on_screen(out, ROWS - 1).contains("picker")
+        }),
+        "the hint row is still on row {ROWS} after the prefix resolved: {:?}; the child wrote: {}",
+        row_on_screen(&term.output, ROWS - 1),
+        term.since(mark)
+    );
+    assert_eq!(
+        row_on_screen(&term.output, ROWS - 1),
+        under,
+        "the editor's own row did not come back"
+    );
+
+    // And the relay really is still running: the prefix still detaches.
+    term.type_bytes(&[nvmux::keys::PREFIX]);
+    term.pump_until(Duration::from_millis(150), |_| false);
+    term.type_bytes(b"d");
+    assert_eq!(
+        term.exit_code(Duration::from_secs(10)),
+        Some(0),
+        "the relay did not survive the bar; the child wrote: {}",
+        term.since(mark)
+    );
+}
+
+/// The ordinary path: a shadow of the session's screen, so the row goes back
+/// exactly and nothing is asked of the server.
+#[test]
+fn a_prefix_raises_the_hint_row_and_the_next_key_takes_it_off() {
+    the_hint_row_goes_up_and_comes_down("hint", true);
+}
+
+/// And with the fade off there is no shadow, so the bar blanks its row and the
+/// relay asks the server for what was under it — the one path on which taking
+/// the bar down costs a round trip, and the one a `NO_COLOR` user is on.
+#[test]
+fn the_hint_row_comes_down_through_the_server_without_a_shadow() {
+    the_hint_row_goes_up_and_comes_down("hint-no-shadow", false);
 }

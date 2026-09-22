@@ -80,6 +80,9 @@ reimplementing it.
 | `<prefix>` `?` | show these keys — `Esc` goes back |
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
 
+Pressing `<prefix>` puts a one-row reminder of these keys along the bottom of
+the screen; it goes as soon as the next key resolves it.
+
 ### Leaving a session
 
 > [!IMPORTANT]
