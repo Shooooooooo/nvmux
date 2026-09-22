@@ -40,6 +40,21 @@
 //! switching into the session: the box went up and was wiped eleven times in
 //! its one second, and at sixty frames a second nvmux gave up on it entirely.
 //!
+//! Putting it back is only half of it, and the half that is not enough on its
+//! own. A terminal parses asynchronously and presents on its own clock, so
+//! the state it puts on the glass is whatever prefix of the stream it has
+//! reached — and against a window repainting at full speed most of those fall
+//! in the middle of a repaint, with the box wiped and the rewrite not yet
+//! read. Measured on the flight above with the box merely rewritten after
+//! every frame: the whole of it stood in about one presented moment in ten,
+//! which is a box that blinks rather than one that is up.
+//!
+//! So the relay takes the choice away. It wraps each write of the session's
+//! and the frame of the notice that follows it in one synchronized update —
+//! `Attachment::write_session_frame` in [`crate::pty`] — and a terminal
+//! presents nothing inside one of those. The only states it can show are the
+//! ones nvmux ends a span on, and nvmux ends every one of them with the box.
+//!
 //! If no such moment arrives within [`GIVE_UP`], nothing is shown — which now
 //! means a client that has stopped halfway through a sequence and never
 //! finished it, rather than merely a busy one.
@@ -1016,7 +1031,7 @@ mod tests {
             match popup.step(now, quiet(), big(), Some(&screen)) {
                 Act::Paint(bytes) => {
                     let mut boundary = crate::boundary::Boundary::new();
-                    boundary.saw(&bytes);
+                    boundary.saw_own(&bytes);
                     assert!(
                         boundary.between_sequences(),
                         "frame {frames} left the terminal somewhere: {:?}",

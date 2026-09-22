@@ -37,11 +37,14 @@
 //! Two things ever *join* this direction. The attach notice (see
 //! [`crate::announce`]): a box, drawn where the child's own bytes leave the
 //! terminal between escape sequences, which [`crate::boundary`] finds with a
-//! decoder rather than with a clock. That is the second answer to the
-//! question. The first was a lull — 25 ms of the child saying nothing — and it
-//! was true but useless, because a session with a window repainting at sixty
-//! frames a second never has one, so the box blinked on a busy screen and did
-//! not appear at all on a very busy one. And the fade's frames
+//! decoder rather than with a clock, and written inside a synchronized update
+//! that also carries the session's own bytes, so that the terminal has no
+//! moment at which it could present the one without the other (see
+//! [`Attachment::write_session_frame`]). Two answers, because the first one
+//! on its own was not enough: a lull — 25 ms of the child saying nothing — is
+//! something a session with a window repainting at sixty frames a second
+//! never gives, and writing the box after every repaint instead only wins the
+//! moments the terminal happens not to present in. And the fade's frames
 //! ([`crate::fade`]), written before the held first paint and after the relay
 //! has stopped.
 //!
@@ -204,6 +207,10 @@ pub struct Attachment {
     /// twice; one not shown leaves it describing a terminal that no longer
     /// exists, and the next thing nvmux draws lands inside a sequence.
     boundary: Option<boundary::Boundary>,
+    /// A synchronized update nvmux has opened around a relayed write and
+    /// still owes the close of. Never true across two passes of the relay:
+    /// see [`Attachment::write_session_frame`].
+    span: bool,
 }
 
 /// A session's first paint, held back from the terminal.
@@ -466,7 +473,7 @@ impl Attachment {
             shadow.invalidate();
         }
         if let Some(boundary) = self.boundary.as_mut() {
-            boundary.saw(bytes);
+            boundary.saw_own(bytes);
         }
         Ok(())
     }
@@ -504,9 +511,73 @@ impl Attachment {
             if ready.is_empty() {
                 return Ok(());
             }
-            return self.write_terminal(&ready);
+            let wrap = !boundary.session_brackets_its_own_frames();
+            return self.write_session_frame(&ready, wrap);
         }
         self.write_terminal(chunk)
+    }
+
+    /// Relay a piece of the session's screen with the notice's own frame
+    /// following it inside one synchronized update.
+    ///
+    /// **This is what keeps the notice on the screen rather than merely
+    /// putting it back there.** Writing the box after the session's repaint
+    /// wins nothing on its own: a terminal parses asynchronously and presents
+    /// on its own clock, so what it puts on the glass is whatever prefix of
+    /// the stream it has reached — and most of those prefixes fall in the
+    /// middle of a repaint, with the box wiped and the rewrite not yet
+    /// arrived. Measured on a flight with a starfield in a `:terminal`
+    /// buffer: the whole box stood in 10% of them.
+    ///
+    /// A synchronized update takes the terminal's choice away. Between
+    /// `SYNC_BEGIN` and `SYNC_END` it presents nothing, so the only states it
+    /// can show are the ones nvmux ends a span on — and nvmux ends every one
+    /// of them with the notice. The span is opened here, in front of the
+    /// session's bytes, and closed by [`Attachment::close_span`] before this
+    /// pass of the relay ends, whether or not a frame of the notice went in
+    /// between.
+    ///
+    /// `wrap` is false for a client that brackets its own frames, where a
+    /// span of nvmux's would end at the client's reset rather than at its
+    /// own; see [`boundary::Boundary::session_brackets_its_own_frames`]. A
+    /// terminal that does not know `?2026` at all ignores both sequences and
+    /// gets what it got before any of this, which is the honest fallback:
+    /// there is no way to hold a frame back from a terminal that will not
+    /// hold one.
+    ///
+    /// The span's own two sequences are deliberately not shown to the
+    /// boundary — they are nvmux's rather than the session's, and the reason
+    /// is written down on [`boundary::Boundary`].
+    fn write_session_frame(&mut self, bytes: &[u8], wrap: bool) -> std::io::Result<()> {
+        if !wrap {
+            return self.write_terminal(bytes);
+        }
+        let mut out = Vec::with_capacity(fade::SYNC_BEGIN.len() + bytes.len());
+        out.extend_from_slice(fade::SYNC_BEGIN);
+        out.extend_from_slice(bytes);
+        write_stdout(&out)?;
+        self.span = true;
+        self.shadow_saw(bytes);
+        Ok(())
+    }
+
+    /// Close a synchronized update nvmux opened, if it has one open.
+    ///
+    /// Called at the end of every pass of the relay that could have opened
+    /// one, so a span never outlives the pass that began it — a terminal left
+    /// inside one shows nothing until its own timeout runs out, which is the
+    /// one way this mechanism could be worse than no mechanism.
+    ///
+    /// Unconditional rather than conditional on the notice having painted:
+    /// the notice's own frame ends in a reset of its own, which is what
+    /// actually presents the frame with the box in it, and a second reset of
+    /// a mode already reset is nothing at all. Leaning on the notice's byte
+    /// shape instead would make this correct only by coincidence.
+    fn close_span(&mut self) -> std::io::Result<()> {
+        if !std::mem::take(&mut self.span) {
+            return Ok(());
+        }
+        write_stdout(fade::SYNC_END)
     }
 
     /// Whether nvmux may write over the session right now: the terminal is
@@ -543,6 +614,7 @@ impl Attachment {
     /// still being kept on its account goes out first, or a client's frame
     /// would end a few bytes short for the rest of the relay.
     fn stop_watching_the_terminal(&mut self) -> std::io::Result<()> {
+        self.close_span()?;
         self.release_kept()?;
         self.boundary = None;
         Ok(())
@@ -618,7 +690,7 @@ impl Attachment {
         // around the replay are nvmux's own and each ends where it began, and
         // the split falls just past a whole `?1049h`.
         if let Some(boundary) = self.boundary.as_mut() {
-            boundary.saw(&bytes);
+            boundary.saw_session(&bytes);
         }
         tracing::debug!(
             held_ms = held_for.map(|d| d.as_secs_f64() * 1000.0),
@@ -1306,6 +1378,7 @@ fn spawn_client_with(
         hold: None,
         // Set by `relay`, which knows whether there is a notice to write.
         boundary: None,
+        span: false,
     })
 }
 
@@ -1700,6 +1773,17 @@ fn pump(
                 }
                 announce::Act::Done => popup = None,
             }
+            // Where the terminal stood when the notice's life ended. The one
+            // question a report of "the box never appeared" turns on, and
+            // there is no answering it from outside the process: the box is
+            // written into somebody else's byte stream and what is on the
+            // screen afterwards says nothing about why.
+            if popup.is_none() {
+                tracing::debug!(
+                    between = attachment.between_sequences(),
+                    "timing: attach notice over"
+                );
+            }
             // The notice is the only thing nvmux writes over a session, so
             // when it ends the terminal's parser stops being anybody's
             // business — and whatever was being kept back to keep a sequence
@@ -1708,6 +1792,12 @@ fn pump(
                 attachment.stop_watching_the_terminal()?;
             }
         }
+
+        // Whatever the notice did or did not do, the synchronized update the
+        // relayed write above may have opened is closed here, on the pass
+        // that opened it. A terminal left inside one shows nothing until its
+        // own timeout expires. See [`Attachment::write_session_frame`].
+        attachment.close_span()?;
 
         // The notice's repaint, if it has answered. Only the fallback waits on
         // this — the repaint itself arrives as the session's own output — so a
@@ -2417,6 +2507,46 @@ mod tests {
         );
     }
 
+    /// A relayed write is held back from the terminal's eye inside a
+    /// synchronized update, so the notice that follows it lands in the same
+    /// presented frame — and the span never outlives the pass that opened it,
+    /// because a terminal left inside one shows nothing at all until its own
+    /// timeout runs out.
+    #[test]
+    fn a_synchronized_update_never_outlives_the_pass_that_opened_it() {
+        let mut a = attached_to("exit 0");
+        a.boundary = Some(boundary::Boundary::new());
+        a.relay_output(b"\x1b[1;1Hhello", Instant::now())
+            .expect("relay");
+        assert!(a.span, "the session's repaint was not held back at all");
+
+        a.close_span().expect("close");
+        assert!(!a.span);
+        // And closing one that is already closed is nothing at all, which is
+        // what lets every way out of the relay call it without asking.
+        a.close_span().expect("close");
+        assert!(!a.span);
+    }
+
+    /// A client that brackets its own frames is left to it. Terminals hold
+    /// `?2026` as a mode rather than as a count, so a span of nvmux's around
+    /// one of the client's would end at the client's reset and present the
+    /// frame early — the tear the span exists to prevent.
+    #[test]
+    fn a_session_that_brackets_its_own_frames_is_left_to_do_it() {
+        let mut a = attached_to("exit 0");
+        a.boundary = Some(boundary::Boundary::new());
+        let now = Instant::now();
+        a.relay_output(b"\x1b[?2026h\x1b[1;1Hhello\x1b[?2026l", now)
+            .expect("relay");
+        assert!(!a.span, "nvmux opened a span inside the client's own");
+        a.relay_output(b"\x1b[2;1Hmore", now).expect("relay");
+        assert!(
+            !a.span,
+            "one frame of its own was enough; nvmux went back to wrapping"
+        );
+    }
+
     /// A held first paint has not reached the terminal, so there is nothing
     /// for a box to sit on and nothing under it to melt into — whatever the
     /// boundary makes of bytes the terminal has not been shown.
@@ -2461,6 +2591,7 @@ mod tests {
             shadow: None,
             hold: None,
             boundary: None,
+            span: false,
         }
     }
 

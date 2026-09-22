@@ -92,10 +92,20 @@ pub const KEPT_MAX: usize = 64 * 1024;
 /// of the session's output kept back so that it is never left mid-sequence.
 ///
 /// Every byte written to the terminal while one of these exists must be shown
-/// to it exactly once: by [`Boundary::relay`], which hands back what it has
-/// already taken account of, or by [`Boundary::saw`] for a write of nvmux's
-/// own. A byte shown twice moves the parser twice, and one not shown at all
-/// leaves it describing a terminal that no longer exists.
+/// to it exactly once, and said whose it is: [`Boundary::relay`] hands back
+/// the session's after taking account of them, [`Boundary::saw_session`]
+/// takes the session's that went out by another route, and
+/// [`Boundary::saw_own`] takes nvmux's. A byte shown twice moves the parser
+/// twice, one not shown at all leaves it describing a terminal that no longer
+/// exists, and one shown under the wrong name teaches it something about the
+/// session that is really about nvmux.
+///
+/// The one exception is the synchronized update nvmux opens around a relayed
+/// write (see `Attachment::write_session_frame` in [`crate::pty`]). Its two
+/// sequences are balanced across a pass of the relay and are nvmux's own, and
+/// a `sync` depth raised by them would read as *the session* holding the
+/// terminal — shutting the notice out of the very frame the span was opened
+/// to put it in.
 #[derive(Debug, Default)]
 pub struct Boundary {
     parser: Parser,
@@ -123,6 +133,25 @@ impl Boundary {
     /// Once the tail is older than [`KEPT_FOR`] or longer than [`KEPT_MAX`] it
     /// all goes out regardless, unfinished — the session's output matters more
     /// than the notice does, and this is the only way that trade is ever made.
+    ///
+    /// **The tail is dated from the first time anything was kept, not from
+    /// the last, and that is a known cost rather than a considered choice.**
+    /// On a busy session something is kept back after nearly every read, so
+    /// the clock rarely restarts and a tail goes out unfinished every
+    /// [`KEPT_FOR`]; each one leaves the parser mid-sequence for a pass, and
+    /// the notice cannot be put back into the frame that just wiped it. It
+    /// is what is left of the flicker — about one presented frame in thirty.
+    ///
+    /// Dating it from the last hand-out instead is the obvious repair, and it
+    /// was tried and backed out. Instrumented, it is plainly better — every
+    /// one of 188 relayed chunks left the terminal where nvmux could write,
+    /// against about half of them here, and the tail went out unfinished not
+    /// once. But on two runs of the same flight the notice then did not
+    /// appear *at all*, with the parser ending its life inside a CSI, and the
+    /// two observations have not been reconciled. A mechanism that measures
+    /// better and behaves worse is not understood, and shipping it would have
+    /// traded a flicker for a silence. Whatever replaces this has to explain
+    /// that first.
     pub fn relay(&mut self, chunk: &[u8], now: Instant) -> Vec<u8> {
         self.kept.extend_from_slice(chunk);
         let cut = if self.out_of_patience(now) {
@@ -140,22 +169,59 @@ impl Boundary {
         ready
     }
 
-    /// Bytes nvmux wrote over the session itself — the notice, and the first
-    /// paint let out of its hold.
+    /// Bytes of the *session's* that reached the terminal by some route other
+    /// than [`Boundary::relay`] — the first paint, let out of its hold.
     ///
-    /// Shown for the same reason the session's own are: the parser is the
-    /// *terminal's*, not the client's, and what nvmux writes moves it too.
-    /// Everything nvmux writes over a session is balanced and ends between
-    /// sequences, so in practice this leaves the parser where it found it —
-    /// which is exactly why it must be said rather than assumed.
-    pub fn saw(&mut self, bytes: &[u8]) {
+    /// Shown for the same reason the relayed ones are: the parser is the
+    /// terminal's, and these moved it. And read as the session's, which is
+    /// the difference from [`Boundary::saw_own`]: a client that brackets its
+    /// first paint is a client that brackets, and it says so here.
+    pub fn saw_session(&mut self, bytes: &[u8]) {
         self.parser.feed(bytes);
+    }
+
+    /// Bytes nvmux wrote over the session itself: the notice's own frames.
+    ///
+    /// Shown for the same reason again — the parser is the terminal's, not
+    /// the client's, and what nvmux writes moves it too. Everything nvmux
+    /// writes over a session is balanced and ends between sequences, so in
+    /// practice this leaves the parser where it found it, which is exactly
+    /// why it must be said rather than assumed.
+    ///
+    /// What it must *not* do is answer
+    /// [`Boundary::session_brackets_its_own_frames`]. Every frame of the
+    /// notice is bracketed in a synchronized update of its own, so a parser
+    /// that learned from these would conclude after the first box that the
+    /// session brackets its frames — and stand the whole mechanism down on
+    /// the strength of nvmux's own handwriting. That is not a hypothetical:
+    /// it is what this did for its first measurement, which came back at 13%
+    /// instead of 100% and was the only reason anybody looked.
+    pub fn saw_own(&mut self, bytes: &[u8]) {
+        let session_syncs = self.parser.seen_sync;
+        self.parser.feed(bytes);
+        self.parser.seen_sync = session_syncs;
     }
 
     /// Whether the terminal is between sequences, so a write of nvmux's own
     /// would land beside one of the session's rather than inside it.
     pub fn between_sequences(&self) -> bool {
         self.parser.at_rest()
+    }
+
+    /// Whether the session has ever bracketed anything in a synchronized
+    /// update of its own.
+    ///
+    /// What it decides is whether nvmux may open one *around* a relayed
+    /// write, which is how the notice is kept on the screen rather than
+    /// merely put back on it (see `Attachment::write_session_frame` in
+    /// [`crate::pty`]). Terminals hold `?2026` as a mode rather than as a
+    /// count, so a span of nvmux's around a span of the session's would end
+    /// at the session's reset and present the frame early — exactly the tear
+    /// the span was opened to prevent. One sighting is enough to stand down
+    /// for the rest of the relay: a client that brackets one frame brackets
+    /// them all, and its frames are already whole without help.
+    pub fn session_brackets_its_own_frames(&self) -> bool {
+        self.parser.seen_sync
     }
 
     /// When the kept tail goes out whether or not the rest of it has arrived,
@@ -208,6 +274,8 @@ struct Parser {
     used: usize,
     /// How deep the session is inside its own synchronized updates.
     sync: u32,
+    /// Whether the session has ever opened or closed one at all.
+    seen_sync: bool,
     /// How many `DECSC`s the session has not taken back with a `DECRC`.
     saved: u32,
 }
@@ -243,6 +311,7 @@ impl Default for Parser {
             params: [0; PARAMS],
             used: 0,
             sync: 0,
+            seen_sync: false,
             saved: 0,
         }
     }
@@ -287,6 +356,9 @@ impl Parser {
             *self = Parser {
                 sync: counters.0,
                 saved: counters.1,
+                // Not a counter and never unlearned: a session that brackets
+                // its frames once brackets them always.
+                seen_sync: self.seen_sync || scan.seen_sync,
                 ..Parser::default()
             };
         }
@@ -430,6 +502,7 @@ impl Parser {
             return;
         };
         if private.split(|b| *b == b';').any(|p| p == b"2026") {
+            self.seen_sync = true;
             self.sync = if byte == b'h' {
                 self.sync.saturating_add(1)
             } else {
@@ -464,7 +537,7 @@ mod tests {
     /// what [`Boundary::saw`] answers and what a tail given up on produces.
     fn shown(bytes: &[u8]) -> Boundary {
         let mut boundary = Boundary::new();
-        boundary.saw(bytes);
+        boundary.saw_session(bytes);
         boundary
     }
 
@@ -594,7 +667,7 @@ mod tests {
         let mut boundary = Boundary::new();
         boundary.relay(b"hello", Instant::now());
         assert!(boundary.between_sequences());
-        boundary.saw(b"\x1b[?2026h\x1b7\x1b[5;5H\x1b[0mbox\x1b8\x1b[?2026l");
+        boundary.saw_own(b"\x1b[?2026h\x1b7\x1b[5;5H\x1b[0mbox\x1b8\x1b[?2026l");
         assert!(
             boundary.between_sequences(),
             "the notice left the parser somewhere"
@@ -610,9 +683,9 @@ mod tests {
             !boundary.between_sequences(),
             "inside a synchronized update"
         );
-        boundary.saw(b"\x1b[1;1Hstill drawing");
+        boundary.saw_session(b"\x1b[1;1Hstill drawing");
         assert!(!boundary.between_sequences(), "still inside it");
-        boundary.saw(b"\x1b[?2026l");
+        boundary.saw_session(b"\x1b[?2026l");
         assert!(boundary.between_sequences(), "the span closed");
     }
 
@@ -622,7 +695,7 @@ mod tests {
     fn a_synchronized_update_is_recognised_among_other_modes() {
         let mut boundary = shown(b"\x1b[?1049;2026h");
         assert!(!boundary.between_sequences());
-        boundary.saw(b"\x1b[?2026;1049l");
+        boundary.saw_session(b"\x1b[?2026;1049l");
         assert!(boundary.between_sequences());
     }
 
@@ -636,6 +709,44 @@ mod tests {
                 "{set:?} was read as a synchronized update"
             );
         }
+    }
+
+    /// One frame of the session's own is enough to stand down for the rest of
+    /// the relay: what nvmux does with the answer is stop wrapping its own
+    /// span around a write, and a client that brackets one frame brackets
+    /// them all.
+    #[test]
+    fn a_session_that_brackets_a_frame_is_remembered_for_having_done_it() {
+        let mut boundary = Boundary::new();
+        let now = Instant::now();
+        boundary.relay(b"\x1b[1;1Hplain text", now);
+        assert!(!boundary.session_brackets_its_own_frames());
+        boundary.relay(b"\x1b[?2026h\x1b[1;1Hdrawing\x1b[?2026l", now);
+        assert!(boundary.session_brackets_its_own_frames());
+        boundary.relay(b"\x1b[2;1Hand more plain text", now);
+        assert!(
+            boundary.session_brackets_its_own_frames(),
+            "the span closing unlearned it"
+        );
+    }
+
+    /// Every frame of the notice is bracketed in a synchronized update of its
+    /// own, so a parser that learned from those would decide, on the strength
+    /// of nvmux's own handwriting, that the session brackets its frames — and
+    /// stand the whole mechanism down after the first box.
+    ///
+    /// Not hypothetical: that is what it did, and the duty cycle came back at
+    /// 13% instead of 100%, which is the only reason anybody looked.
+    #[test]
+    fn the_notices_own_brackets_are_not_the_sessions() {
+        let mut boundary = Boundary::new();
+        boundary.relay(b"\x1b[1;1Hplain", Instant::now());
+        boundary.saw_own(b"\x1b[?2026h\x1b7\x1b[5;5H\x1b[0mbox\x1b8\x1b[?2026l");
+        assert!(
+            !boundary.session_brackets_its_own_frames(),
+            "nvmux read its own span as the session's"
+        );
+        assert!(boundary.between_sequences());
     }
 
     /// A span the session has opened closes the terminal to nvmux and not to
@@ -658,9 +769,9 @@ mod tests {
     fn nothing_is_written_between_the_sessions_save_and_its_restore() {
         let mut boundary = shown(b"\x1b7");
         assert!(!boundary.between_sequences(), "the slot is the client's");
-        boundary.saw(b"\x1b[9;9Hmark");
+        boundary.saw_session(b"\x1b[9;9Hmark");
         assert!(!boundary.between_sequences());
-        boundary.saw(b"\x1b8");
+        boundary.saw_session(b"\x1b8");
         assert!(boundary.between_sequences(), "the client took it back");
     }
 
@@ -734,7 +845,7 @@ mod tests {
     fn an_escape_abandons_the_string_it_lands_in() {
         let mut boundary = shown(b"\x1b]0;a title");
         assert!(!boundary.between_sequences());
-        boundary.saw(b"\x1b[1;1H");
+        boundary.saw_session(b"\x1b[1;1H");
         assert!(
             boundary.between_sequences(),
             "the CSI inside the OSC was swallowed"
