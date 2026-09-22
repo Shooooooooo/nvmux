@@ -121,7 +121,22 @@ impl Default for KeySettings {
             // screen and by `--help`, which are printed before any config is
             // loaded, so it has to exist on its own.
             prefix: crate::keys::PREFIX,
-            timeout_ms: 500,
+            // A second, where this was half of one. What made the shorter wait
+            // right was that a lone `<prefix>` showed nothing: the screen sat
+            // unchanged, so every millisecond of the wait was a millisecond the
+            // editor looked like it had dropped a keystroke, and the sooner the
+            // byte went through as a literal the better. The hint bar
+            // ([`crate::hint`]) ended that — the wait is now on screen, saying
+            // what it is waiting for — so the number can be what it should have
+            // been all along: long enough to read the row and choose from it,
+            // rather than short enough to hide that anything was pending.
+            //
+            // It is not only the prefix's wait. The same value is how long a
+            // half-typed session number waits for another digit, in the relay
+            // and in the picker ([`crate::ui`]), and both of those show the
+            // digits so far while they wait. Every use of it is now visible,
+            // which is what makes one number right for all three.
+            timeout_ms: 1000,
         }
     }
 }
@@ -462,7 +477,7 @@ mod tests {
         let doc = "\
             [keys]\n\
             prefix = \"Ctrl-Space\"\n\
-            timeout_ms = 500\n\
+            timeout_ms = 1000\n\
             [session]\n\
             command = \"nvim --headless --listen {sock}\"\n\
             [fade]\n\
@@ -642,7 +657,7 @@ mod tests {
         );
         // The timeout, the command and the fade are documentation, not active
         // settings.
-        assert!(rendered.contains("# timeout_ms = 500"));
+        assert!(rendered.contains("# timeout_ms = 1000"));
         assert!(
             rendered.contains("# command = \"nvim --headless --listen {sock}\""),
             "the template must document the command: {rendered:?}"

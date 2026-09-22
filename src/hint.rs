@@ -50,12 +50,13 @@
 //! there, only at a lull ([`SETTLE`]). `pump` never parses the child's output,
 //! and a lull is the one state in which it cannot be mid-sequence.
 //!
-//! There is no fade. The bar has to be up the moment the prefix arms, and the
-//! window it lives in is `keys.timeout_ms` — 500 ms by default, against a
-//! dissolve that is 100 ms each way. And there is no give-up clock either: the
-//! bar's life is already bounded by the prefix, so a session too chatty to give
-//! a lull simply shows the bar late, or not at all, which is what a lull rule
-//! means. Both of those the attach notice has and needs; neither belongs here.
+//! There is no fade. The bar has to be up the moment the prefix arms — that is
+//! the whole of what it is for, and a dissolve of 100 ms each way is 100 ms of
+//! not yet saying what the next key does. And there is no give-up clock either:
+//! the bar's life is already bounded by the prefix, so a session too chatty to
+//! give a lull simply shows the bar late, or not at all, which is what a lull
+//! rule means. Both of those the attach notice has and needs; neither belongs
+//! here.
 //!
 //! # Coming down
 //!

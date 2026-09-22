@@ -131,7 +131,7 @@ overrides the defaults below; an unknown key or a bad value is a startup error.
 ```toml
 [keys]
 prefix     = "Ctrl-Space"   # Ctrl-Space, or a Ctrl-<letter> chord
-timeout_ms = 500            # how long a lone prefix or half-typed number waits
+timeout_ms = 1000           # how long a lone prefix or half-typed number waits
 
 [session]
 command = "nvim --headless --listen {sock}"   # {sock} is required
