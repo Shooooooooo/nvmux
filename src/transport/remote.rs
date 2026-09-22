@@ -202,7 +202,13 @@ impl SshTransport {
     /// because it is the one condition the user can do something about. A
     /// shell found dead is replaced *before* a run and never after one — a
     /// script that was half way through must not run twice — and the master
-    /// it rode on is checked first, or the replacement would die the same way.
+    /// it rode on is restored first, or the replacement would not ride one at
+    /// all. That last part is load-bearing and silent when it is missed: `ssh`
+    /// handed a `ControlPath` with nothing listening on it does not fail, it
+    /// opens a direct connection and says nothing. The listing then succeeds,
+    /// the picker draws, and every `-O forward` after it goes to a master
+    /// nobody brought back — which is a session that cannot be attached and a
+    /// "press enter to retry" that retries the same thing forever.
     fn run_script(&self, script: &str, args: &[&str]) -> Result<Output> {
         let mut slot = match self.shell.try_lock() {
             Ok(slot) => slot,
@@ -217,7 +223,13 @@ impl SshTransport {
         };
         if slot.as_mut().is_none_or(|shell| !shell.is_alive()) {
             *slot = None;
-            self.reconnect_if_needed(None)?;
+            // `restore_master`, and not `reconnect_if_needed`: the shell is
+            // the thing that has just gone, so it can vouch for nothing — and
+            // the lock `reconnect_if_needed` would consult is the one in this
+            // hand, which `try_lock` reports as busy, which it reads as a
+            // script hard at work over a healthy master. The question has to
+            // go to ssh.
+            self.restore_master(None)?;
             *slot = Some(self.ssh.start_shell()?);
         }
         let shell = slot.as_mut().expect("just started");
@@ -248,40 +260,67 @@ impl SshTransport {
     ///
     /// The shell rides on the master, so a shell that is still there is a
     /// master that is — and asking the shell is a zero-timeout poll on a pipe,
-    /// where `ssh -O check` is a fork per attach. Neither notices a master
-    /// whose connection is wedged rather than gone; that is what the master's
-    /// own `ServerAlive` options are for. Only without a shell to ask, or with
-    /// one found dead, is ssh asked — and a dead shell is dropped here, so the
-    /// next script starts a fresh one over whatever master this leaves.
+    /// where `ssh -O check` is a fork per attach. That shortcut is what makes
+    /// this cheap enough to ask on every attach, and it holds only because a
+    /// shell is never started except over a master that has just been seen —
+    /// by [`SshTransport::new`] for the first, by [`Self::run_script`] for
+    /// every one after it. Neither notices a master whose connection is wedged
+    /// rather
+    /// than gone; that is what the master's own `ServerAlive` options are for.
+    /// A dead shell is dropped here, so the next script starts a fresh one
+    /// over whatever master [`Self::restore_master`] leaves.
     ///
     /// `connect_timeout` is passed through to the master, for the one caller
     /// that is retrying — see [`crate::ssh::master_args`].
     fn reconnect_if_needed(&self, connect_timeout: Option<u64>) -> Result<Reconnect> {
         // A slot that is locked has a script running in it, which is as alive
-        // as a shell gets.
-        let shell_alive = match self.shell.try_lock() {
+        // as a shell gets. Never this transport's own `run_script`, which asks
+        // `restore_master` directly rather than coming back here to have its
+        // own lock answer its own question.
+        let vouched_for_by_a_shell = match self.shell.try_lock() {
             Ok(mut slot) => match slot.as_mut().map(|shell| shell.is_alive()) {
-                Some(true) => Some(true),
+                Some(true) => true,
                 Some(false) => {
                     *slot = None;
-                    Some(false)
+                    false
                 }
-                None => None,
+                None => false,
             },
-            Err(TryLockError::WouldBlock) => Some(true),
-            Err(TryLockError::Poisoned(_)) => None,
+            Err(TryLockError::WouldBlock) => true,
+            Err(TryLockError::Poisoned(_)) => false,
         };
-        let master_alive = match shell_alive {
-            Some(alive) => alive,
-            None => self.ssh.is_master_alive(),
-        };
-        if !master_alive {
-            self.forwarded.lock().map(|mut f| f.clear()).ok();
-            self.ssh.ensure_master_within(connect_timeout)?;
-            tracing::info!(host = %self.host(), "reconnected");
-            return Ok(Reconnect::Restored);
+        if vouched_for_by_a_shell {
+            return Ok(Reconnect::Unneeded);
         }
-        Ok(Reconnect::Unneeded)
+        self.restore_master(connect_timeout)
+    }
+
+    /// Ask ssh itself whether the master is there, and bring it back if it is
+    /// not — forgetting, when it has gone, the forwards that went with it.
+    ///
+    /// A fork, which is why it is the answer of last resort: a caller with a
+    /// live shell in hand has a cheaper one, and goes through
+    /// [`Self::reconnect_if_needed`] to use it.
+    ///
+    /// It asks rather than assumes, even when the shell is known to be dead. A
+    /// shell can go without its master — a remote `sh` somebody killed, a
+    /// login shell that ended itself — and treating that as a dropped link
+    /// would tear down every live forward and report a reconnection that never
+    /// happened, which sends the session loop back to a session that has in
+    /// fact ended.
+    ///
+    /// `connect_timeout` is passed through to the master, for the one caller
+    /// that is retrying — see [`crate::ssh::master_args`].
+    fn restore_master(&self, connect_timeout: Option<u64>) -> Result<Reconnect> {
+        if self.ssh.is_master_alive() {
+            return Ok(Reconnect::Unneeded);
+        }
+        // Every forward rode on the master that has gone. Believing in one now
+        // is what hands an attach a local socket nothing is listening on.
+        self.forwarded.lock().map(|mut f| f.clear()).ok();
+        self.ssh.ensure_master_within(connect_timeout)?;
+        tracing::info!(host = %self.host(), "reconnected");
+        Ok(Reconnect::Restored)
     }
 }
 
@@ -455,6 +494,18 @@ impl Transport for SshTransport {
         let local = self.local_sock(&s.id)?;
         let remote = self.remote_sock(&s.id)?;
 
+        // Before the fast path below, not after it. A forward is worth exactly
+        // what the master under it is worth, and "we forwarded this one" is
+        // precisely the belief the fast path hands back — so a master found
+        // gone has to clear it *here*, or the attach walks down a socket
+        // nothing is listening on and the picker says the connection dropped.
+        // Pressing enter then repeats the message rather than the connection,
+        // because nothing on that path ever asks about the link again.
+        //
+        // Cheap enough to pay per attach: with a shell in hand this is a
+        // zero-timeout poll on a pipe.
+        self.reconnect_if_needed(None)?;
+
         let known = self
             .forwarded
             .lock()
@@ -463,8 +514,6 @@ impl Transport for SshTransport {
         if known && local.exists() {
             return Ok(local);
         }
-
-        self.reconnect_if_needed(None)?;
 
         self.ssh.forward(&local, &remote)?;
         self.forwarded
