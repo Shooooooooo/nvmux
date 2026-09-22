@@ -236,6 +236,30 @@ pub fn key_label(byte: u8) -> String {
     }
 }
 
+/// What the space bar is drawn as on a one-line hint row: `␣` (U+2423), rather
+/// than [`SPACE_NAME`]. Such a row is uniformly lowercase — `esc`, never `Esc` —
+/// and a glyph is neither, which is the argument `src/ui/draw.rs` already makes
+/// for the picker's row, where `⏎` and `↑↓` stand for Enter and the arrows on the
+/// same grounds. One column wide, like every other cell on the row: it carries
+/// no Emoji property, so nothing paints it double.
+pub const SPACE_GLYPH: &str = "␣";
+
+/// Spell a key the way a one-line hint row does — the picker's own
+/// (`src/ui/draw.rs`), and the hint bar the prefix puts up ([`crate::hint`]).
+///
+/// [`key_label`] is the other spelling: a name, for the help screen's key column
+/// and the README's table, where there is room for a word and an invisible cell
+/// would be the worse answer. The `to_lowercase` makes the row's uniform case
+/// this function's promise rather than a property of whichever keys happen to be
+/// in [`BINDINGS`] today.
+pub fn key_glyph(byte: u8) -> String {
+    if byte == b' ' {
+        SPACE_GLYPH.to_string()
+    } else {
+        key_label(byte).to_lowercase()
+    }
+}
+
 /// Spell a prefix byte the way people read it: `0x00` -> `"Ctrl-Space"`,
 /// `0x14` -> `"Ctrl-t"`. The inverse of [`parse_prefix`], used by the runtime
 /// help screen and messages so a remapped prefix is described as the key the

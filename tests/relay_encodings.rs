@@ -480,7 +480,7 @@ fn the_hint_row_goes_up_and_comes_down(tag: &str, shadow: bool) {
     let mark = term.output.len();
     assert!(
         term.pump_until(Duration::from_secs(10), |out| {
-            row_on_screen(out, ROWS - 1).contains("space picker")
+            row_on_screen(out, ROWS - 1).contains("␣ picker")
         }),
         "the prefix put no hint row on row {ROWS}; it says {:?}, and the child wrote: {}",
         row_on_screen(&term.output, ROWS - 1),

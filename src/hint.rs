@@ -130,16 +130,15 @@ pub enum Act {
 /// Every entry the bar can offer, in the order it offers them: the commands as
 /// [`keys::BINDINGS`] lists them, then the digit rule.
 ///
-/// The key is spelled lowercase, so the space bar reads `space`. That departs
-/// from `src/ui/draw.rs`'s argument for `␣` — "this row is uniformly lowercase
-/// and a glyph is neither" — on the ground the argument itself gives: there the
-/// glyph sits among `↑↓`, `⏎` and `/` and reads as one of a vocabulary, and here
-/// it would be the only one among plain letters, on the row whose whole job is
-/// to name the key. `space` is lowercase too.
+/// Keys are spelled [`keys::key_glyph`], which is the picker's hint-row grammar
+/// and not the help screen's: lowercase throughout, and `␣` for the space bar.
+/// This is the picker's row on another screen, so it is spelled the picker's way
+/// — two rows that named the same key two ways would be the kind of drift the
+/// rest of this crate pins down with a test, and there is one below.
 fn entries() -> Vec<String> {
     keys::BINDINGS
         .iter()
-        .map(|b| format!("{} {}", keys::key_label(b.key).to_lowercase(), b.hint))
+        .map(|b| format!("{} {}", keys::key_glyph(b.key), b.hint))
         .chain(std::iter::once(DIGITS.to_string()))
         .collect()
 }
@@ -512,7 +511,7 @@ mod tests {
         let text = text(Pending::Command, 200).expect("a row");
         let mut rest = text.as_str();
         for b in keys::BINDINGS {
-            let entry = format!("{} {}", keys::key_label(b.key).to_lowercase(), b.hint);
+            let entry = format!("{} {}", keys::key_glyph(b.key), b.hint);
             let at = rest.find(&entry).unwrap_or_else(|| {
                 panic!("{entry:?} is not on the bar, or is out of order: {text:?}")
             });
@@ -539,6 +538,23 @@ mod tests {
             );
         }
         assert!(!text.contains("Ctrl"), "the bar names a chord: {text:?}");
+    }
+
+    /// The space bar is the one key on the row with no character of its own, and
+    /// the picker already settled what to draw for it. A bar that spelled it
+    /// `space` while the picker two keystrokes away spelled it `␣` would be the
+    /// same row contradicting itself.
+    #[test]
+    fn the_space_bar_is_the_glyph_the_picker_uses() {
+        let text = text(Pending::Command, 200).expect("a row");
+        assert!(
+            text.starts_with(&format!("{} picker", keys::SPACE_GLYPH)),
+            "the space bar is not the glyph: {text:?}"
+        );
+        assert!(
+            !text.contains("space") && !text.contains("Space"),
+            "the space bar is spelled out as well: {text:?}"
+        );
     }
 
     /// The help screen has rows for the machine's other two branches — a
@@ -590,18 +606,68 @@ mod tests {
     /// Below the first entry the bar says nothing at all, rather than a word and
     /// a half of one. The attach notice's answer to the same question.
     #[test]
-    fn a_screen_with_no_room_says_nothing() {
-        for &(cols, rows) in TINY_SIZES {
+    fn a_screen_too_narrow_for_one_entry_says_nothing() {
+        let first = entries().remove(0);
+        for cols in 0..first.width() {
             assert_eq!(
-                overlay(Pending::Command, size(cols, rows)),
+                text(Pending::Command, u16::try_from(cols).expect("small")),
                 None,
-                "drew a bar on {cols}x{rows}"
+                "drew part of {first:?} in {cols} columns"
             );
         }
-        // One row is never the bar's, however wide: an editor left with nothing
-        // but nvmux's hints is worse off than one with no hints.
+        assert!(text(
+            Pending::Command,
+            u16::try_from(first.width()).expect("small")
+        )
+        .is_some());
+    }
+
+    /// One row is never the bar's, however wide: an editor left with nothing but
+    /// nvmux's hints is worse off than one with no hints at all.
+    #[test]
+    fn the_bar_never_takes_a_sessions_only_row() {
         assert_eq!(overlay(Pending::Command, size(200, 1)), None);
         assert!(overlay(Pending::Command, size(200, 2)).is_some());
+    }
+
+    /// The degenerate screens, where the bar must either decline or stay inside
+    /// the grid — never write a cell the terminal would clamp somewhere else.
+    ///
+    /// Not "always nothing": `␣ picker` is eight columns, so the bar genuinely
+    /// fits some of these, and asserting silence would only pin the width of the
+    /// first entry. What must hold at every size is the rectangle.
+    #[test]
+    fn a_tiny_screen_is_either_declined_or_drawn_inside_itself() {
+        for &(cols, rows) in TINY_SIZES {
+            for pending in [Pending::Command, Pending::Number(7)] {
+                let Some(over) = overlay(pending, size(cols, rows)) else {
+                    continue;
+                };
+                assert_eq!(
+                    over.top,
+                    rows - 1,
+                    "{cols}x{rows} {pending:?}: not the last row"
+                );
+                assert_eq!(
+                    over.left, 0,
+                    "{cols}x{rows} {pending:?}: not from column one"
+                );
+                assert_eq!(
+                    over.width, cols,
+                    "{cols}x{rows} {pending:?}: not the full width"
+                );
+                assert_eq!(
+                    over.rows.len(),
+                    1,
+                    "{cols}x{rows} {pending:?}: more than one row"
+                );
+                assert_eq!(
+                    over.rows[0].width(),
+                    usize::from(cols),
+                    "{cols}x{rows} {pending:?}: the row overflows the screen"
+                );
+            }
+        }
     }
 
     /// The row is the whole of the last row: the cells beside the text are what
