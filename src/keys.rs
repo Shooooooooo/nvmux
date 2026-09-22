@@ -124,6 +124,11 @@ pub struct Binding {
     pub action: Action,
     /// One line, in terms of what happens to the user.
     pub help: &'static str,
+    /// The same thing in one lowercase word, for the hint bar the relay puts
+    /// up while the prefix is armed ([`crate::hint`]). A field rather than a
+    /// second table, so a command cannot be added without a label for the bar
+    /// — the guarantee `help` already gives the help screen.
+    pub hint: &'static str,
 }
 
 /// Every command, in the order the help screen lists them.
@@ -134,31 +139,37 @@ pub const BINDINGS: &[Binding] = &[
         key: b' ',
         action: Action::Picker,
         help: "back to the picker, session still attached",
+        hint: "picker",
     },
     Binding {
         key: b'd',
         action: Action::Detach,
         help: "detach and exit, session still running",
+        hint: "detach",
     },
     Binding {
         key: b'c',
         action: Action::Create,
         help: "start a new session and attach to it",
+        hint: "new",
     },
     Binding {
         key: b'n',
         action: Action::Cycle(Direction::Next),
         help: "attach to the next session, wrapping",
+        hint: "next",
     },
     Binding {
         key: b'p',
         action: Action::Cycle(Direction::Prev),
         help: "attach to the previous session, wrapping",
+        hint: "prev",
     },
     Binding {
         key: b'?',
         action: Action::Help,
         help: "show this help",
+        hint: "help",
     },
 ];
 
@@ -225,6 +236,30 @@ pub fn key_label(byte: u8) -> String {
     }
 }
 
+/// What the space bar is drawn as on a one-line hint row: `␣` (U+2423), rather
+/// than [`SPACE_NAME`]. Such a row is uniformly lowercase — `esc`, never `Esc` —
+/// and a glyph is neither, which is the argument `src/ui/draw.rs` already makes
+/// for the picker's row, where `⏎` and `↑↓` stand for Enter and the arrows on the
+/// same grounds. One column wide, like every other cell on the row: it carries
+/// no Emoji property, so nothing paints it double.
+pub const SPACE_GLYPH: &str = "␣";
+
+/// Spell a key the way a one-line hint row does — the picker's own
+/// (`src/ui/draw.rs`), and the hint bar the prefix puts up ([`crate::hint`]).
+///
+/// [`key_label`] is the other spelling: a name, for the help screen's key column
+/// and the README's table, where there is room for a word and an invisible cell
+/// would be the worse answer. The `to_lowercase` makes the row's uniform case
+/// this function's promise rather than a property of whichever keys happen to be
+/// in [`BINDINGS`] today.
+pub fn key_glyph(byte: u8) -> String {
+    if byte == b' ' {
+        SPACE_GLYPH.to_string()
+    } else {
+        key_label(byte).to_lowercase()
+    }
+}
+
 /// Spell a prefix byte the way people read it: `0x00` -> `"Ctrl-Space"`,
 /// `0x14` -> `"Ctrl-t"`. The inverse of [`parse_prefix`], used by the runtime
 /// help screen and messages so a remapped prefix is described as the key the
@@ -273,6 +308,27 @@ pub enum Wait {
     /// short: a bare `Esc` in a terminal that still sends one is held for
     /// exactly this long.
     Sequence,
+}
+
+/// What the machine is waiting for, for something that wants to say so on the
+/// screen — the hint bar the relay puts up while the prefix is armed (see
+/// [`crate::hint`]).
+///
+/// Not [`Wait`], which is the same question asked about clocks: that says what
+/// the caller must *time*, and an unfinished escape sequence is one of its
+/// answers because it is a timer the caller must arm. This says what the user
+/// has half-typed, which is a different set — and the set a bar can be drawn
+/// from.
+///
+/// [`State`] stays private. This is the part of it that is anybody else's
+/// business, and no more: a caller can tell a pending command from a pending
+/// number, and cannot reach in and change either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pending {
+    /// A lone `<prefix>`: the next key picks a command.
+    Command,
+    /// The digits typed so far, waiting to see whether another follows.
+    Number(u32),
 }
 
 /// The prefix state machine.
@@ -347,6 +403,22 @@ impl Prefix {
             Some(Wait::Command)
         } else {
             None
+        }
+    }
+
+    /// What the user has half-typed, if anything — for the hint bar, which says
+    /// so on the screen while the machine waits (see [`crate::hint`]).
+    ///
+    /// Read from `state` and not from [`wait`](Self::wait), which would be a
+    /// different answer: an escape sequence cut short *from idle* is the Escape
+    /// key arriving and nothing is pending, while one arriving after the prefix
+    /// is still the prefix waiting — so the bar goes up on the prefix and does
+    /// not blink off while the bytes of the next key come in.
+    pub fn pending(&self) -> Option<Pending> {
+        match self.state {
+            State::Idle => None,
+            State::Armed => Some(Pending::Command),
+            State::Number(n) => Some(Pending::Number(n)),
         }
     }
 
@@ -1378,6 +1450,103 @@ mod tests {
                 b.key as char
             );
         }
+    }
+
+    /// The hint bar is one row and reads at a glance, so a label that wrapped,
+    /// ran to two words or arrived capitalised would break the row rather than
+    /// merely look wrong — the grammar is `src/ui/draw.rs`'s, which is
+    /// uniformly lowercase and one word per key.
+    #[test]
+    fn every_binding_has_a_one_word_hint() {
+        for b in BINDINGS {
+            let hint = b.hint;
+            assert!(!hint.is_empty(), "{:?} has no hint label", b.key as char);
+            assert!(
+                !hint.contains(char::is_whitespace),
+                "{:?}'s hint {hint:?} is more than one word",
+                b.key as char
+            );
+            assert_eq!(
+                hint,
+                hint.to_lowercase(),
+                "{:?}'s hint is not lowercase",
+                b.key as char
+            );
+        }
+    }
+
+    /// Two commands labelled the same thing make the bar say one of them
+    /// twice and neither of them clearly.
+    #[test]
+    fn no_two_bindings_share_a_hint() {
+        for (i, a) in BINDINGS.iter().enumerate() {
+            for b in &BINDINGS[i + 1..] {
+                assert_ne!(a.hint, b.hint, "two commands are labelled {:?}", a.hint);
+            }
+        }
+    }
+
+    /// `pending` is what the hint bar is drawn from, so it has to follow the
+    /// machine exactly: a bar that appeared without the prefix, or stayed up
+    /// after the command ran, would be drawn over an editor that owns the row.
+    #[test]
+    fn pending_follows_the_state_machine() {
+        let mut p = Prefix::new(12);
+        assert_eq!(p.pending(), None, "nothing is pending from idle");
+
+        p.feed(&[PREFIX]);
+        assert_eq!(p.pending(), Some(Pending::Command), "a lone prefix arms");
+        p.feed(&[PREFIX]);
+        assert_eq!(p.pending(), None, "a literal prefix resolves it");
+
+        p.feed(&[PREFIX, b'1']);
+        assert_eq!(p.pending(), Some(Pending::Number(1)), "a half-typed number");
+        p.feed(b"2");
+        assert_eq!(p.pending(), None, "the twelfth session is named");
+
+        p.feed(&[PREFIX, b'd']);
+        assert_eq!(p.pending(), None, "a command resolves it");
+
+        p.feed(&[PREFIX]);
+        p.timeout();
+        assert_eq!(p.pending(), None, "so does the timeout");
+    }
+
+    /// The bar must not blink between the prefix and a next key the terminal
+    /// spells as a sequence: those bytes arrive over more than one `read` at a
+    /// human typing speed, and the prefix is still waiting throughout.
+    ///
+    /// And the other way round: a sequence cut short from *idle* is the Escape
+    /// key arriving, which is not a pending command however long the machine
+    /// holds it. That is the distinction `pending` reads `state` for rather
+    /// than `wait`, which answers `Some` to both.
+    #[test]
+    fn pending_ignores_a_half_read_sequence() {
+        let mut p = Prefix::new(0);
+        p.feed(b"\x1b[1");
+        assert_eq!(p.wait(), Some(Wait::Sequence), "mid-sequence");
+        assert_eq!(p.pending(), None, "the Escape key is not a command");
+
+        let mut p = Prefix::new(0);
+        p.feed(&[PREFIX]);
+        p.feed(b"\x1b[1");
+        assert_eq!(p.wait(), Some(Wait::Sequence), "mid-sequence");
+        assert_eq!(
+            p.pending(),
+            Some(Pending::Command),
+            "the prefix is still waiting"
+        );
+
+        // The prefix's own release report, which is held back with its press:
+        // not a key, so not the end of the wait either.
+        let mut p = Prefix::new(0);
+        p.feed(KITTY);
+        p.feed(b"\x1b[32;5:3u");
+        assert_eq!(
+            p.pending(),
+            Some(Pending::Command),
+            "a release is not a key"
+        );
     }
 
     #[test]
