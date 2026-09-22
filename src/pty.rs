@@ -208,8 +208,9 @@ pub struct Attachment {
     /// exists, and the next thing nvmux draws lands inside a sequence.
     boundary: Option<boundary::Boundary>,
     /// A synchronized update nvmux has opened around a relayed write and
-    /// still owes the close of. Never true across two passes of the relay:
-    /// see [`Attachment::write_session_frame`].
+    /// still owes the close of. Closed on the pass that opened it unless the
+    /// session's bytes ran out mid-sequence, where it is held open rather
+    /// than sawn through: see [`Attachment::close_span`].
     span: bool,
 }
 
@@ -552,32 +553,69 @@ impl Attachment {
         if !wrap {
             return self.write_terminal(bytes);
         }
-        let mut out = Vec::with_capacity(fade::SYNC_BEGIN.len() + bytes.len());
-        out.extend_from_slice(fade::SYNC_BEGIN);
-        out.extend_from_slice(bytes);
+        let out = framed(bytes, self.span);
         write_stdout(&out)?;
         self.span = true;
         self.shadow_saw(bytes);
         Ok(())
     }
 
-    /// Close a synchronized update nvmux opened, if it has one open.
+    /// Write the session's own frame close, held back so the notice could be
+    /// put in front of it.
+    ///
+    /// Called on every pass that could have held one, right after the notice
+    /// has had its chance at the screen — so the sequence is delayed by one
+    /// write of nvmux's and by nothing else, and the frame the session
+    /// presents is the frame with the box in it. See
+    /// [`boundary::Boundary::holding_the_sessions_close`].
+    fn release_the_sessions_close(&mut self) -> std::io::Result<()> {
+        let Some(boundary) = self.boundary.as_mut() else {
+            return Ok(());
+        };
+        let close = boundary.release_the_sessions_close();
+        if close.is_empty() {
+            return Ok(());
+        }
+        self.write_terminal(&close)
+    }
+
+    /// Close a synchronized update nvmux opened, if it has one open and the
+    /// terminal is in a state to be written to.
     ///
     /// Called at the end of every pass of the relay that could have opened
-    /// one, so a span never outlives the pass that began it — a terminal left
-    /// inside one shows nothing until its own timeout runs out, which is the
-    /// one way this mechanism could be worse than no mechanism.
+    /// one, so a span does not outlive the pass that began it — a terminal
+    /// left inside one shows nothing until its own timeout runs out, which is
+    /// the one way this mechanism could be worse than no mechanism.
     ///
     /// Unconditional rather than conditional on the notice having painted:
     /// the notice's own frame ends in a reset of its own, which is what
     /// actually presents the frame with the box in it, and a second reset of
     /// a mode already reset is nothing at all. Leaning on the notice's byte
     /// shape instead would make this correct only by coincidence.
+    ///
+    /// The one thing it does wait for is the session finishing what it was
+    /// saying. These two sequences are nvmux's bytes like any other, and a
+    /// tail that ran out of patience mid-character hands the relay a write
+    /// that ends between a lead byte and its continuation — where a reset
+    /// dropped in leaves the terminal a character it cannot read and the rest
+    /// of one it never asked for. Measured over eight flights before it was
+    /// noticed: up to six such characters in one, in both colour paths.
+    /// Holding the span open across the pass instead costs the terminal one
+    /// more pass of not presenting, which is the wait it was opened for.
     fn close_span(&mut self) -> std::io::Result<()> {
-        if !std::mem::take(&mut self.span) {
+        if !self.span || self.mid_sequence() {
             return Ok(());
         }
+        self.span = false;
         write_stdout(fade::SYNC_END)
+    }
+
+    /// Whether the session is half way through a character or a sequence, so
+    /// nothing of nvmux's may be written at all.
+    fn mid_sequence(&self) -> bool {
+        self.boundary
+            .as_ref()
+            .is_some_and(boundary::Boundary::mid_sequence)
     }
 
     /// Whether nvmux may write over the session right now: the terminal is
@@ -615,7 +653,16 @@ impl Attachment {
     /// would end a few bytes short for the rest of the relay.
     fn stop_watching_the_terminal(&mut self) -> std::io::Result<()> {
         self.close_span()?;
+        self.release_the_sessions_close()?;
         self.release_kept()?;
+        // And a span the session's unfinished business held open goes now
+        // whatever state that business is in: there is no next pass to close
+        // it on, and a terminal left inside one shows nothing until its own
+        // timeout runs out. At worst that is one character cut in half, once,
+        // at the end of a notice — against a picture frozen for seconds.
+        if std::mem::take(&mut self.span) {
+            write_stdout(fade::SYNC_END)?;
+        }
         self.boundary = None;
         Ok(())
     }
@@ -1793,10 +1840,13 @@ fn pump(
             }
         }
 
-        // Whatever the notice did or did not do, the synchronized update the
-        // relayed write above may have opened is closed here, on the pass
-        // that opened it. A terminal left inside one shows nothing until its
-        // own timeout expires. See [`Attachment::write_session_frame`].
+        // Whatever the notice did or did not do, whatever was held back for
+        // it goes out here, on the pass that held it: the session's own frame
+        // close if it brackets its frames, and otherwise the synchronized
+        // update nvmux opened in front of the write. A terminal left inside
+        // either shows nothing until its own timeout expires. See
+        // [`Attachment::write_session_frame`].
+        attachment.release_the_sessions_close()?;
         attachment.close_span()?;
 
         // The notice's repaint, if it has answered. Only the fallback waits on
@@ -2000,6 +2050,23 @@ fn peek_child(pid: nix::unistd::Pid) -> Peek {
         libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED => Peek::Gone,
         _ => Peek::Running,
     }
+}
+
+/// A relayed write as it goes to the terminal: the session's own bytes behind
+/// the sequence that opens a synchronized update, and behind nothing at all
+/// when `open` says one already is.
+///
+/// Terminals hold `?2026` as a mode rather than as a count, so a second open
+/// inside a span changes nothing — and a sequence that changes nothing is
+/// still a sequence, landing wherever the session's last write happened to
+/// stop. See [`Attachment::close_span`] for what stops one there.
+fn framed(bytes: &[u8], open: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(fade::SYNC_BEGIN.len() + bytes.len());
+    if !open {
+        out.extend_from_slice(fade::SYNC_BEGIN);
+    }
+    out.extend_from_slice(bytes);
+    out
 }
 
 /// Write to the terminal and flush, so what is written lands before the next
@@ -2526,6 +2593,71 @@ mod tests {
         // what lets every way out of the relay call it without asking.
         a.close_span().expect("close");
         assert!(!a.span);
+    }
+
+    /// Except that it waits for the session to finish its sentence. A tail
+    /// that ran out of patience is handed over mid-character, and the two
+    /// sequences a span is made of are nvmux's bytes like any other: dropped
+    /// between a lead byte and its continuation they leave the terminal a
+    /// character it cannot read. So the span is held open for a pass instead,
+    /// which is the very wait it exists to impose.
+    #[test]
+    fn a_span_is_not_closed_through_the_middle_of_a_character() {
+        let mut a = attached_to("exit 0");
+        a.boundary = Some(boundary::Boundary::new());
+        let t0 = Instant::now();
+        // Two thirds of `▀`, kept back for the third that has not arrived.
+        a.relay_output(b"\x1b[1;1Hab\xe2\x96", t0).expect("relay");
+        a.close_span().expect("close");
+        assert!(!a.span, "a whole write was left holding the terminal");
+
+        // The session says no more, so the two bytes go out unfinished.
+        a.relay_output(b"", t0 + boundary::KEPT_FOR).expect("relay");
+        assert!(a.span, "the unfinished tail went out unwrapped");
+        a.close_span().expect("close");
+        assert!(
+            a.span,
+            "the reset was written between a lead byte and its continuation"
+        );
+
+        // And it closes the moment the character is whole again.
+        a.relay_output(b"\x80", t0 + boundary::KEPT_FOR)
+            .expect("relay");
+        a.close_span().expect("close");
+        assert!(!a.span, "the span outlived what was holding it open");
+    }
+
+    /// And the other half of holding one open: the pass that finds it open
+    /// adds its bytes to it rather than opening a second, which would be the
+    /// same sequence dropped into the same half-finished character.
+    #[test]
+    fn a_relayed_write_opens_a_span_once_however_many_passes_it_takes() {
+        assert_eq!(
+            framed(b"\x1b[1;1Hab", false),
+            [fade::SYNC_BEGIN, b"\x1b[1;1Hab"].concat(),
+            "a write with no span open was not put inside one"
+        );
+        assert_eq!(
+            framed(b"\x80", true),
+            b"\x80",
+            "a second open was written into the character the first is holding"
+        );
+    }
+
+    /// And when the notice is over there is no next pass to close it on, so
+    /// whatever the session is half way through, the span goes. A terminal
+    /// left inside one shows nothing until its own timeout runs out.
+    #[test]
+    fn a_span_does_not_outlive_the_notice_that_opened_it() {
+        let mut a = attached_to("exit 0");
+        a.boundary = Some(boundary::Boundary::new());
+        let t0 = Instant::now();
+        a.relay_output(b"\x1b[1;1Hab\xe2\x96", t0).expect("relay");
+        a.relay_output(b"", t0 + boundary::KEPT_FOR).expect("relay");
+        assert!(a.span, "nothing to close");
+
+        a.stop_watching_the_terminal().expect("stop");
+        assert!(!a.span, "the terminal was left holding a frame for ever");
     }
 
     /// A client that brackets its own frames is left to it. Terminals hold
