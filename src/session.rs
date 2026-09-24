@@ -141,26 +141,15 @@ impl Session {
         })
     }
 
-    /// Write `<id>.json` atomically: temp file plus `rename(2)`, which within
-    /// one directory is atomic, so a concurrent listing sees the old name or the
-    /// new one and never a half-written file.
+    /// Write `<id>.json` atomically — temp file plus `rename(2)`, see
+    /// [`crate::paths::write_atomic`] — so a concurrent listing sees the old
+    /// name or the new one and never a half-written file.
     pub fn write_atomic(&self, path: &Path) -> Result<(), SessionError> {
-        use std::io::Write;
-        let json = self.to_json()?;
-        let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
-        let write = || -> std::io::Result<()> {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(json.as_bytes())?;
-            f.write_all(b"\n")?;
-            f.sync_all()?;
-            std::fs::rename(&tmp, path)
-        };
-        write().map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            SessionError::Metadata {
-                path: path.to_path_buf(),
-                source: serde_json::Error::io(e),
-            }
+        let mut json = self.to_json()?;
+        json.push('\n');
+        crate::paths::write_atomic(path, json.as_bytes()).map_err(|source| SessionError::Metadata {
+            path: path.to_path_buf(),
+            source: serde_json::Error::io(source),
         })
     }
 }
@@ -512,24 +501,18 @@ mod tests {
         assert!(validate_name("abc\u{2066}def").is_err());
     }
 
+    /// What reaches disk reads back as the session that was written; that no
+    /// temp file is left beside it is `paths::write_atomic`'s own test.
     #[test]
-    fn atomic_write_leaves_no_temp_file() {
-        let dir = std::env::temp_dir().join(format!("nvmux-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+    fn a_written_session_reads_back() {
+        let dir = crate::test_support::scratch_dir("session-atomic");
         let path = dir.join("abcdefgh.json");
         let s = Session::new("abcdefgh".into(), "x".into(), 7, 1);
         s.write_atomic(&path).expect("write");
 
         let bytes = std::fs::read(&path).expect("read back");
+        assert!(bytes.ends_with(b"\n"), "one line, newline-terminated");
         assert_eq!(Session::from_json(&bytes, &path).expect("parse").name, "x");
-
-        let strays: Vec<_> = std::fs::read_dir(&dir)
-            .expect("readdir")
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.contains("tmp"))
-            .collect();
-        assert!(strays.is_empty(), "left temp files behind: {strays:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

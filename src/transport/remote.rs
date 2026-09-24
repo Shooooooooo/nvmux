@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, TryLockError};
 
-use crate::error::{NvimError, NvmuxError, Result, SshError};
+use crate::error::{NvimError, Result, SshError};
 use crate::ids;
 use crate::launch::Launch;
 use crate::nvim;
@@ -96,6 +96,9 @@ impl SshTransport {
         let out = checked_script(&host, &mut shell, shell::HELLO_SCRIPT, &[])?;
         let probe = protocol::parse_probe(&out.stdout)?;
 
+        // An empty banner is `hello.sh`'s way of saying nvim is not on the
+        // host's PATH at all, which is a different refusal from a banner that
+        // does not parse.
         if probe.nvim_banner.is_empty() {
             return Err(NvimError::NotFound {
                 where_: host.clone(),
@@ -103,20 +106,7 @@ impl SshTransport {
             }
             .into());
         }
-        let version = nvim::parse_version(&probe.nvim_banner).ok_or_else(|| {
-            NvimError::UnparsableVersion {
-                where_: host.clone(),
-                raw: probe.nvim_banner.clone(),
-            }
-        })?;
-        if !version.is_supported() {
-            return Err(NvimError::TooOld {
-                where_: host.clone(),
-                found: version.to_string(),
-                min: nvim::MIN_VERSION,
-            }
-            .into());
-        }
+        let version = nvim::check_banner(&host, &probe.nvim_banner)?;
         tracing::info!(%host, %version, dir = %probe.runtime_dir, "remote host ready");
 
         Ok(Self {
@@ -210,17 +200,7 @@ impl SshTransport {
     /// nobody brought back — which is a session that cannot be attached and a
     /// "press enter to retry" that retries the same thing forever.
     fn run_script(&self, script: &str, args: &[&str]) -> Result<Output> {
-        let mut slot = match self.shell.try_lock() {
-            Ok(slot) => slot,
-            Err(TryLockError::Poisoned(e)) => e.into_inner(),
-            // No transport method calls another while running a script, so
-            // this is a bug being reported rather than a wait being refused.
-            Err(TryLockError::WouldBlock) => {
-                return Err(NvmuxError::Io(std::io::Error::other(
-                    "the shell is already running a script",
-                )));
-            }
-        };
+        let mut slot = transport::claim_shell(&self.shell)?;
         if slot.as_mut().is_none_or(|shell| !shell.is_alive()) {
             *slot = None;
             // `restore_master`, and not `reconnect_if_needed`: the shell is
@@ -411,7 +391,7 @@ impl Host for SshTransport {
             shell::WRITE_META_SCRIPT,
             &[&self.remote_dir, &session.id, &json],
         )?;
-        protocol::require_terminator(&out.stdout, "metadata write")
+        protocol::parse_write(&out.stdout, "metadata write")
     }
 
     fn log_path(&self, id: &str) -> PathBuf {
@@ -485,7 +465,7 @@ impl Transport for SshTransport {
         }
 
         let out = self.run_script(shell::RENUMBER_SCRIPT, &args)?;
-        protocol::parse_renumber(&out.stdout)?;
+        protocol::parse_write(&out.stdout, "renumber")?;
         tracing::info!(host = %self.host(), count = sessions.len(), "renumbered");
         Ok(())
     }
@@ -541,12 +521,11 @@ const RECONNECT_TIMEOUT_SECS: u64 = 10;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proc;
 
     /// A shell here standing in for one over there: what `checked_script` does
     /// with a run does not depend on what started the shell.
     fn sh() -> Shell {
-        Shell::start(&mut proc::sh_command(), "/bin/sh").expect("start /bin/sh")
+        Shell::local().expect("start /bin/sh")
     }
 
     /// The rule the function exists for: a script that said nothing and

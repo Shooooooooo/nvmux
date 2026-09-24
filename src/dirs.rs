@@ -36,7 +36,7 @@
 use std::path::PathBuf;
 
 use crate::error::{NvmuxError, Result};
-use crate::proc::{self, Shell};
+use crate::proc::Shell;
 use crate::shell;
 use crate::ssh::Ssh;
 use crate::transport::protocol::{self, Listing};
@@ -57,7 +57,7 @@ impl DirSource {
     /// reach — see `ssh::unattended`.
     pub fn start_shell(&self) -> Result<Shell> {
         Ok(match self {
-            DirSource::Local => Shell::start(&mut proc::sh_command(), "/bin/sh")?,
+            DirSource::Local => Shell::local()?,
             DirSource::Ssh { host, control_path } => {
                 Ssh::new(host.clone(), control_path.clone()).start_unattended_shell()?
             }

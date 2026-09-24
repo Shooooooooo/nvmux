@@ -266,8 +266,7 @@ pub enum ConfigError {
     },
 }
 
-/// The error type crossing the [`crate::transport::Transport`] boundary, plus
-/// the startup failures ([`ConfigError`]) that surface before any transport.
+/// The error type crossing the [`crate::transport::Transport`] boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum NvmuxError {
     #[error(transparent)]
@@ -281,9 +280,19 @@ pub enum NvmuxError {
     #[error(transparent)]
     Ssh(#[from] SshError),
     #[error(transparent)]
-    Config(#[from] ConfigError),
-    #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+impl NvmuxError {
+    /// Collapse the error to something that fits on one line.
+    ///
+    /// The rows it lands on — the picker's bottom row, the attaching screen's
+    /// hint row, a line on the plain terminal — are exactly one row; a
+    /// multi-line error would be truncated at the first newline and lose the
+    /// part that explains itself.
+    pub fn one_line(&self) -> String {
+        self.to_string().lines().collect::<Vec<_>>().join(" — ")
+    }
 }
 
 pub type Result<T> = std::result::Result<T, NvmuxError>;
@@ -292,5 +301,31 @@ pub type Result<T> = std::result::Result<T, NvmuxError>;
 impl From<nix::errno::Errno> for NvmuxError {
     fn from(e: nix::errno::Errno) -> Self {
         NvmuxError::Io(std::io::Error::from(e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn errors_are_flattened_to_one_line() {
+        let e = NvmuxError::Session(SessionError::NotReady {
+            name: "x".into(),
+            timeout: Duration::from_secs(1),
+            log: "x.log".into(),
+            log_tail: "line one\nline two".into(),
+        });
+        assert!(
+            e.to_string().contains('\n'),
+            "the fixture must be multi-line"
+        );
+        let flat = e.one_line();
+        assert!(!flat.contains('\n'), "{flat:?}");
+        assert!(
+            flat.contains("line one") && flat.contains("line two"),
+            "nothing is lost on the way: {flat:?}"
+        );
     }
 }

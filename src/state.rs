@@ -28,7 +28,6 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -153,33 +152,15 @@ pub fn remember(location: &Location, line: &str) {
     }
 }
 
-/// Temp file plus `rename(2)`, as everything else nvmux writes — see
-/// [`crate::config::write_default`], whose gentle `DirBuilder` this shares for
-/// the same reason.
+/// Temp file plus `rename(2)`, as everything else nvmux writes
+/// ([`crate::paths::write_atomic`]), under a parent made the gentle way the
+/// config file's is ([`crate::paths::create_private_parent`]).
 fn write_atomic(path: &Path, state: &State) -> std::io::Result<()> {
-    use std::io::Write;
-
     let body = toml::to_string(state).map_err(std::io::Error::other)?;
     let contents =
         format!("# nvmux remembers things here. Written by nvmux; safe to delete.\n\n{body}");
-
-    if let Some(parent) = path.parent() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
-    }
-
-    let tmp = path.with_extension(format!("toml.tmp{}", std::process::id()));
-    let write = || -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(contents.as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
-    };
-    write().inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    crate::paths::create_private_parent(path)?;
+    crate::paths::write_atomic(path, contents.as_bytes())
 }
 
 #[cfg(test)]

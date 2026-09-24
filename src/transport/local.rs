@@ -8,7 +8,7 @@
 
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, TryLockError};
+use std::sync::Mutex;
 
 use crate::error::{NvmuxError, Result, SessionError};
 use crate::launch::Launch;
@@ -58,19 +58,9 @@ impl LocalTransport {
     /// script that was half way through must not run twice — so the caller
     /// that hit the death sees it, and the next one gets a fresh shell.
     fn run(&self, script: &str, args: &[&str]) -> Result<proc::Output> {
-        let mut slot = match self.shell.try_lock() {
-            Ok(slot) => slot,
-            Err(TryLockError::Poisoned(e)) => e.into_inner(),
-            // No transport method calls another while running a script, so
-            // this is a bug being reported rather than a wait being refused.
-            Err(TryLockError::WouldBlock) => {
-                return Err(NvmuxError::Io(std::io::Error::other(
-                    "the shell is already running a script",
-                )));
-            }
-        };
+        let mut slot = transport::claim_shell(&self.shell)?;
         if slot.as_mut().is_none_or(|shell| !shell.is_alive()) {
-            *slot = Some(Shell::start(&mut proc::sh_command(), "/bin/sh")?);
+            *slot = Some(Shell::local()?);
         }
         let shell = slot.as_mut().expect("just started");
         shell.run(script, args).map_err(|died| {

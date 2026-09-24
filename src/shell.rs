@@ -422,7 +422,7 @@ mod tests {
                 &swapped[2],
             ],
         );
-        crate::transport::protocol::parse_renumber(&out.stdout).expect("the script ran");
+        crate::transport::protocol::parse_write(&out.stdout, "renumber").expect("the script ran");
 
         let num_of = |id: &str| -> u32 {
             let path = dir.join(format!("{id}.json"));

@@ -21,11 +21,12 @@ pub mod protocol;
 pub mod remote;
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use crate::error::{NvmuxError, Result, SessionError};
 use crate::launch::Launch;
-use crate::proc::Output;
+use crate::proc::{Output, Shell};
 use crate::rpc;
 use crate::session::Session;
 use crate::shell;
@@ -171,8 +172,11 @@ pub fn open(location: Location) -> Result<Box<dyn Transport>> {
 /// shell of the host's, and speak the same protocol wherever they run; what
 /// each transport knows is how a socket is spelled over there and reached from
 /// here, what a listed session's liveness is worth, and where a session's
-/// metadata is kept. The three defaults are the local answer, where a socket
-/// needs no reaching and nothing is left to clean up but a file.
+/// metadata is kept. Each default is the answer of the transport with nothing
+/// to do there: locally no listing is ever in hand ahead of time and a socket
+/// needs no reaching, so `take_listing` and `unreach` default to nothing; over
+/// ssh nothing is left behind to sweep and the log is on another machine, so
+/// `sweep` and `log_tail` default to nothing.
 pub(crate) trait Host {
     fn location(&self) -> &Location;
 
@@ -381,20 +385,38 @@ pub(crate) fn kill(h: &impl Host, s: &Session) -> Result<()> {
     Ok(())
 }
 
-// --- shared between the two transports -------------------------------------
+// --- behind the bodies above; plan_rename and claim_shell are also called by
+// --- the transports directly ----------------------------------------------
+
+/// Take a transport's shell slot for one script run.
+///
+/// A poisoned lock is taken anyway: every caller checks for a dead shell and
+/// replaces it before running anything, which is all a panic mid-run could
+/// have left behind. A lock that is *held* is a bug being reported rather than
+/// a wait being refused: no transport method calls another while running a
+/// script.
+pub(crate) fn claim_shell(slot: &Mutex<Option<Shell>>) -> Result<MutexGuard<'_, Option<Shell>>> {
+    match slot.try_lock() {
+        Ok(slot) => Ok(slot),
+        Err(TryLockError::Poisoned(e)) => Ok(e.into_inner()),
+        Err(TryLockError::WouldBlock) => Err(NvmuxError::Io(std::io::Error::other(
+            "the shell is already running a script",
+        ))),
+    }
+}
 
 /// How long to wait for a new session's socket to appear and accept a
 /// connection. A *reachability* budget, not a readiness one: a config that
 /// clones plugins on first run can take far longer than any timeout worth
 /// having here, and a session that is still starting is a good session.
-pub(crate) const REACHABLE_TIMEOUT: Duration = Duration::from_secs(5);
+const REACHABLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 const REACHABLE_POLL: Duration = Duration::from_millis(25);
 
 /// Wait until the socket accepts a connection and a real Neovim answers.
 /// Deliberately *not* a deferred call — see [`crate::rpc`]. Over SSH `sock` is
 /// the local end of the forward, which also proves the forward works.
-pub(crate) fn wait_until_reachable(sock: &Path, timeout: Duration) -> bool {
+fn wait_until_reachable(sock: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Ok(mut client) = rpc::Client::connect(sock, rpc::PROBE_TIMEOUT) {
@@ -411,11 +433,7 @@ pub(crate) fn wait_until_reachable(sock: &Path, timeout: Duration) -> bool {
 /// trap, so a name is refused if another session already has it — compared
 /// case-insensitively. `except` is the session being renamed, which may of
 /// course keep its own name.
-pub(crate) fn ensure_name_free(
-    existing: &[Session],
-    name: &str,
-    except: Option<&str>,
-) -> Result<()> {
+fn ensure_name_free(existing: &[Session], name: &str, except: Option<&str>) -> Result<()> {
     let taken = existing
         .iter()
         .any(|s| except != Some(s.id.as_str()) && s.name.eq_ignore_ascii_case(name));
@@ -434,10 +452,10 @@ pub(crate) fn ensure_name_free(
 /// Pure, and shared by both transports. The listing it works from is **not**
 /// taken here: fetching one is where local and remote differ (one reaps dead
 /// sessions, the other sweeps orphaned forwards), so each caller passes its own.
-pub(crate) fn plan_create(existing: &[Session], name: &str) -> Result<(String, u32)> {
+fn plan_create(existing: &[Session], name: &str) -> Result<(String, u32)> {
     crate::session::validate_name(name)?;
     ensure_name_free(existing, name, None)?;
-    Ok((crate::ids::new_id()?, next_rank(existing)))
+    Ok((crate::ids::nonce()?, next_rank(existing)))
 }
 
 /// The same checks for a rename, which allocates nothing.
@@ -451,7 +469,7 @@ pub(crate) fn plan_rename(existing: &[Session], new_name: &str, id: &str) -> Res
 /// Empty unless the recorded pid is worth signalling: 0 is "unknown" and 1 is
 /// init. The script finds the process by its socket anyway, so the pid is only
 /// ever a hint, and a wrong one must not become a signal to something else.
-pub(crate) fn pid_arg(pid: u32) -> String {
+fn pid_arg(pid: u32) -> String {
     if pid > 1 {
         pid.to_string()
     } else {
@@ -460,7 +478,7 @@ pub(crate) fn pid_arg(pid: u32) -> String {
 }
 
 /// The same argument, from what `spawn.sh` reported.
-pub(crate) fn opt_pid_arg(pid: Option<u32>) -> String {
+fn opt_pid_arg(pid: Option<u32>) -> String {
     pid.map(pid_arg).unwrap_or_default()
 }
 
@@ -468,7 +486,7 @@ pub(crate) fn opt_pid_arg(pid: Option<u32>) -> String {
 /// script only once the session is genuinely gone; claiming success on the
 /// other outcomes would drop it from the picker while its Neovim kept running,
 /// with no socket left to ever find it by.
-pub(crate) fn kill_outcome(outcome: protocol::KillOutcome, name: &str) -> Result<()> {
+fn kill_outcome(outcome: protocol::KillOutcome, name: &str) -> Result<()> {
     use protocol::KillOutcome;
     match outcome {
         KillOutcome::Killed | KillOutcome::Absent => Ok(()),
@@ -489,7 +507,7 @@ pub(crate) fn kill_outcome(outcome: protocol::KillOutcome, name: &str) -> Result
 /// Give a new session a way out that is not `:q`. `command!` requires an
 /// uppercase name (`command! q` is E183), so this cannot shadow `:q` itself.
 /// Failure is not worth failing the create over.
-pub(crate) fn install_detach_alias(sock: &Path) {
+fn install_detach_alias(sock: &Path) {
     if let Ok(mut client) = rpc::Client::connect(sock, rpc::CONNECT_TIMEOUT) {
         if let Err(e) = client.command("command! -bar Detach detach") {
             tracing::debug!(error = %e, "could not install the :Detach alias");
@@ -525,7 +543,7 @@ pub(crate) fn install_detach_alias(sock: &Path) {
 /// in memory by the sort below. A read path that wrote would cost an SSH round
 /// trip per listing, and would persist a derived number as if it had been
 /// assigned.
-pub(crate) fn finish_listing(mut sessions: Vec<Session>) -> Vec<Session> {
+fn finish_listing(mut sessions: Vec<Session>) -> Vec<Session> {
     // Rank first, so sessions with a claim on a place in the list keep it;
     // `created` then `id` puts the rankless ones — and any pair sharing a rank
     // — in a stable order rather than whatever the directory happened to yield.
@@ -556,7 +574,7 @@ pub(crate) fn finish_listing(mut sessions: Vec<Session>) -> Vec<Session> {
 /// than assuming it is the last one, because a session with no rank at all
 /// (legacy metadata, an orphan) sorts after every ranked one and so keeps the
 /// bottom of the list.
-pub(crate) fn next_rank(existing: &[Session]) -> u32 {
+fn next_rank(existing: &[Session]) -> u32 {
     existing
         .iter()
         .map(|s| s.num)

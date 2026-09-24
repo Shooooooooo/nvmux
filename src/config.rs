@@ -29,7 +29,6 @@
 //! developer's real `~/.config/nvmux/config.toml`.
 
 use std::ffi::OsStr;
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -396,38 +395,17 @@ fn render_default_config(prefix: u8) -> String {
 
 /// Write the first-run config to `path`, creating its parent directory.
 ///
-/// Atomic (temp file plus `rename` within the directory), matching
-/// [`crate::session::Session::write_atomic`]. The parent is created with a
-/// gentle `DirBuilder`, not `paths::ensure_dir_secure`: that is `/tmp`
-/// hardening that would reject a pre-existing `~/.config` at `0755` and does not
-/// create missing parents.
+/// Atomic (temp file plus `rename` within the directory, see
+/// [`crate::paths::write_atomic`]), under a parent made the gentle way rather
+/// than the `/tmp`-hardened one — see [`crate::paths::create_private_parent`]
+/// for why a pre-existing `~/.config` must not be refused.
 pub fn write_default(path: &Path, prefix: u8) -> Result<(), ConfigError> {
-    use std::io::Write;
     let err = |source| ConfigError::Write {
         path: path.to_path_buf(),
         source,
     };
-
-    if let Some(parent) = path.parent() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)
-            .map_err(err)?;
-    }
-
-    let contents = render_default_config(prefix);
-    let tmp = path.with_extension(format!("toml.tmp{}", std::process::id()));
-    let write = || -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(contents.as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
-    };
-    write().map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        err(e)
-    })
+    crate::paths::create_private_parent(path).map_err(err)?;
+    crate::paths::write_atomic(path, render_default_config(prefix).as_bytes()).map_err(err)
 }
 
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
