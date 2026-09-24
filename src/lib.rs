@@ -12,6 +12,7 @@
 //! macOS and Linux only.
 
 pub mod announce;
+pub mod boundary;
 pub mod cli;
 pub mod config;
 pub mod dirs;

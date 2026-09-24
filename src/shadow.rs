@@ -338,8 +338,9 @@ impl Shadow {
     ///   found them — `DECSC`/`DECRC` around everything, and no cursor hide,
     ///   which would be seen as a blink for as long as the notice is up. The
     ///   shared save slot is safe here for the reason it is safe in
-    ///   [`crate::announce`]: nothing is written except at a lull, between the
-    ///   session's own frames;
+    ///   [`crate::announce`]: nothing is written except between the session's
+    ///   own sequences, and never between a save of its own and the restore
+    ///   that takes it back (see [`crate::boundary`]);
     /// * it keeps no diff. `frame`'s is whole-screen and keyed by length, and
     ///   a rectangle cannot share it; every cell is painted every time, which
     ///   costs a kilobyte or so a frame and makes this a pure function of the

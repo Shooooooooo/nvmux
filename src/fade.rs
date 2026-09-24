@@ -227,11 +227,11 @@ impl Schedule {
     ///
     /// [`Schedule::next`] is what ends a fade being drawn frame by frame, and
     /// it can only end one that is asked for. [`crate::announce`] cannot
-    /// promise that: its frames go out only at a lull in the session's own
-    /// output, and a session that never goes quiet would otherwise hold a fade
-    /// open for ever. So it asks the clock instead, and drains whatever is left
-    /// of the schedule when the answer is yes — which is how a fade nobody
-    /// could draw still ends on exactly its last value.
+    /// promise that: its frames go out only where the session's own output
+    /// leaves a gap between sequences, and a session that never left one would
+    /// otherwise hold a fade open for ever. So it asks the clock instead, and
+    /// drains whatever is left of the schedule when the answer is yes — which
+    /// is how a fade nobody could draw still ends on exactly its last value.
     ///
     /// The same reckoning as `next`'s, down to the frame it looks ahead by, so
     /// the two can never disagree about which pass a fade ends on.
