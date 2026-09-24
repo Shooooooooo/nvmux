@@ -76,7 +76,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair};
 
 use crate::error::{NvmuxError, Result};
 use crate::keys::{Action, Prefix, Step, Wait};
-use crate::{announce, boundary, fade, rpc, shadow, term, winch};
+use crate::{announce, boundary, fade, hint, rpc, shadow, term, winch};
 
 /// Neovim aborts on the seventeenth attached UI rather than returning an error
 /// (`src/nvim/ui.c`: `if (ui_count == MAX_UI_COUNT) { abort(); }`), which would
@@ -1649,8 +1649,13 @@ fn pump(
     // that restarted on every wake-up would never fire while a spinner is
     // running. It is set when the machine arms and cleared when it settles.
     let mut deadline: Option<Instant> = None;
-    // The notice's repaint while it is in flight; see [`Erasing`].
+    // The notice's repaint while it is in flight; see [`Erasing`]. Shared with
+    // the hint bar, which wants the same repaint for the same reason and only
+    // when this slot is free: a `:mode` in flight repaints the whole screen and
+    // covers the bar's row on its way past.
     let mut erasing: Option<Erasing> = None;
+    // The row that says what the next key does while a `<prefix>` waits.
+    let mut bar = hint::Bar::new(Instant::now(), term::terminal_size());
     let mut buf = [0u8; 8192];
     // Diagnostics only, and what makes a switch that felt slow attributable:
     // everything before this is nvmux's own work and is timed where it happens,
@@ -1673,6 +1678,7 @@ fn pump(
         let next = [
             deadline,
             popup.as_ref().map(announce::Popup::wake_at),
+            bar.wake_at(now),
             attachment.hold_wake_at(),
             attachment.kept_due(),
             erasing.as_ref().map(|_| now + ERASE_POLL),
@@ -1796,7 +1802,18 @@ fn pump(
             );
             match act {
                 announce::Act::Idle => {}
-                announce::Act::Paint(bytes) => attachment.write_over_session(&bytes)?,
+                announce::Act::Paint(bytes) => {
+                    attachment.write_over_session(&bytes)?;
+                    // On a three-row terminal — and only there — the box's
+                    // bottom row is the bar's row, so the bar can no longer
+                    // trust that what it drew is still on the screen. Told one
+                    // way only: telling the notice that the bar is up would
+                    // freeze its dissolve for as long as a prefix is armed, on
+                    // every terminal, to settle a collision that exists on one
+                    // size. The bar's own block runs below this one, so on that
+                    // size it takes the shared row back within this pass.
+                    bar.overdrawn();
+                }
                 announce::Act::Erase => {
                     // The same repaint a resume asks for, and for the same
                     // reason: the cells the box covered are the server's, and
@@ -1831,10 +1848,10 @@ fn pump(
                     "timing: attach notice over"
                 );
             }
-            // The notice is the only thing nvmux writes over a session, so
-            // when it ends the terminal's parser stops being anybody's
-            // business — and whatever was being kept back to keep a sequence
-            // whole goes out with it.
+            // The notice is the only thing that needs the terminal's parser
+            // watched — the hint bar waits for a lull instead — so when it
+            // ends that stops being anybody's business, and whatever was being
+            // kept back to keep a sequence whole goes out with it.
             if popup.is_none() {
                 attachment.stop_watching_the_terminal()?;
             }
@@ -1908,6 +1925,56 @@ fn pump(
                                 Wait::Sequence => SEQUENCE_TIMEOUT,
                             }
                     });
+                }
+            }
+        }
+
+        // The hint bar, after the keys and not before them: the prefix that
+        // raises it arrives in the read above, and the timeout that lowers it is
+        // settled above too, so anywhere earlier in the loop the bar would be a
+        // whole wake-up late — and the only wake-up scheduled is the prefix's own
+        // deadline, so it would appear exactly as the prefix expired. After the
+        // winch, so the row is the terminal's as it is now, and after the notice,
+        // for the reason written down there.
+        //
+        // `busy` is the notice's, for the notice's reasons: a lull is the only
+        // moment nvmux can know a write of its own is not landing inside one of
+        // the child's escape sequences, and a held first paint is a screen the
+        // terminal has not been shown a word of yet.
+        //
+        // A lull is not enough while the notice is up, though: a tail that ran
+        // out of patience can leave the terminal half way through one of the
+        // session's characters on a pass the session said nothing on.
+        //
+        // A command that ends the relay has already returned from the block
+        // above and never reaches this, which is what stops `<prefix> Space`
+        // flashing a bar on its way to the picker.
+        let busy = child_spoke || attachment.hold.is_some() || attachment.mid_sequence();
+        match bar.step(
+            Instant::now(),
+            busy,
+            term::terminal_size(),
+            prefix.pending(),
+            attachment.shadow.as_ref(),
+        ) {
+            hint::Act::Idle => {}
+            hint::Act::Write(bytes) => attachment.write_over_session(&bytes)?,
+            hint::Act::Blanked(bytes) => {
+                // The bar has blanked its row because nothing here knows what
+                // was under it — no shadow, so no copy of those cells anywhere
+                // but the server. The same repaint the notice's erase asks for,
+                // asked the same way; skipped when one is already in flight,
+                // since a `:mode` repaints the whole screen and this row with it.
+                attachment.write_over_session(&bytes)?;
+                if erasing.is_none() {
+                    attachment.resize_to(term::terminal_size());
+                    match Erasing::start(&attachment.sock) {
+                        Ok(started) => erasing = Some(started),
+                        Err(e) => {
+                            tracing::debug!(error = %e, "no thread for the hint bar's repaint");
+                            apply(attachment, Repaint::Notice, Served::NONE);
+                        }
+                    }
                 }
             }
         }
@@ -2321,6 +2388,12 @@ const ERASE_POLL: Duration = Duration::from_millis(50);
 /// somebody's editor for. A [`nudge`] stands in, and where that does not reach
 /// (a terminal with in-band resize reports) the box simply waits for the prompt
 /// to end. And the mouse is the client's own already: nothing ran in between.
+///
+/// Its second caller is the hint bar ([`crate::hint`]) coming down where there
+/// is no shadow to put its row back from, and every word above applies to it
+/// unchanged — more so, if anything: the bar is asked for by a keystroke rather
+/// than once per attach, so the one thing it must never do is answer a prompt
+/// the user is in the middle of reading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Repaint {
     Resume,
@@ -2691,6 +2764,48 @@ mod tests {
         assert!(
             !a.between_sequences(),
             "the box would go up over a screen the editor has not been let paint"
+        );
+    }
+
+    /// The hint bar is nvmux's own drawing too, and the shadow must not take it
+    /// for the session's either.
+    ///
+    /// Sharper here than for the notice. The bar's *erase* is a composite out of
+    /// this grid — it is what puts the editor's last row back — so a grid that
+    /// had swallowed the bar would erase the bar with the bar, and leave it on
+    /// the screen for as long as the session did not redraw that row.
+    #[test]
+    fn the_hint_bar_never_reaches_the_shadows_grid() {
+        let size = PtySize {
+            rows: 8,
+            cols: 40,
+            ..PtySize::default()
+        };
+        let mut a = attached_to("exit 0");
+        let mut shadow = shadow::Shadow::new(size.rows, size.cols);
+        // On the bar's own row, which is the row at issue.
+        shadow.feed(b"\x1b[8;1Hthe editor drew this");
+        a.shadow = Some(shadow);
+
+        let over = hint::overlay(crate::keys::Pending::Command, size).expect("a bar");
+        a.write_over_session(&announce::placed(&over, "\x1b[0;2m"))
+            .expect("write");
+
+        let colours = crate::palette::Palette {
+            fg: crate::palette::Rgb(200, 200, 200),
+            bg: crate::palette::Rgb(0, 0, 0),
+            ansi: [crate::palette::Rgb(0, 0, 0); 16],
+        };
+        let grid = a.shadow.as_mut().expect("a shadow");
+        let painted = grid.frame(0.0, &colours, shadow::Cursor::Hidden);
+        let frame = String::from_utf8_lossy(&painted).to_string();
+        assert!(
+            frame.contains("the editor drew this"),
+            "the grid lost the editor's row: {frame:?}"
+        );
+        assert!(
+            !frame.contains("picker"),
+            "the grid took the bar: {frame:?}"
         );
     }
 

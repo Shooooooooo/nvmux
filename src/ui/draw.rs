@@ -63,10 +63,13 @@ const NUM_GAP: &str = "  ";
 /// the order to want: quitting is the one thing every user of a full-screen
 /// program tries unprompted, and `Ctrl-c` quits as well.
 ///
-/// The space bar is `␣` rather than the `Space` that [`crate::keys::key_label`]
-/// spells it everywhere else, because this row is uniformly lowercase (`esc`,
-/// never `Esc`) and a glyph is neither — the same reason `⏎` and `↑↓` stand for
-/// Enter and the arrows here and are written out in the README.
+/// The space bar is `␣` — [`crate::keys::SPACE_GLYPH`], where that decision now
+/// lives — rather than the `Space` that [`crate::keys::key_label`] spells it in
+/// the help screen's key column and the README, because this row is uniformly
+/// lowercase (`esc`, never `Esc`) and a glyph is neither. The same reason `⏎`
+/// and `↑↓` stand for Enter and the arrows here and are written out in the
+/// README — and the reason the hint bar the prefix puts up ([`crate::hint`])
+/// spells its keys the same way. A test below keeps the two rows agreeing.
 ///
 /// `?` is still not listed, for the reason above.
 const HINTS: &str = "↑↓ move  ⏎ attach  c new  r rename  x kill  ␣ order  / filter  q quit";
@@ -580,6 +583,23 @@ mod tests {
         assert!(
             !hints.contains('␣'),
             "the space bar is advertised: {hints:?}"
+        );
+    }
+
+    /// Two hint rows now name keys: this one, and the bar the prefix puts up over
+    /// an attached session ([`crate::hint`]). They are the same row on different
+    /// screens, and a user who learns `␣` on one must not meet `space` on the
+    /// other — so the glyph is [`crate::keys::SPACE_GLYPH`]'s to decide, and this
+    /// is the literal above agreeing with it.
+    #[test]
+    fn the_space_bar_is_spelled_the_way_every_hint_row_spells_it() {
+        assert!(
+            HINTS.contains(&format!("{} order", crate::keys::SPACE_GLYPH)),
+            "the picker's row has drifted from the shared glyph: {HINTS:?}"
+        );
+        assert!(
+            !HINTS.contains("space") && !HINTS.contains("Space"),
+            "the space bar is spelled out as well: {HINTS:?}"
         );
     }
 

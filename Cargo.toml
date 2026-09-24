@@ -50,6 +50,13 @@ unicode-width = "0.2.2"
 # `vte` and `arrayvec`; its other dependencies were already in the tree.
 vt100 = "0.16"
 
+[dev-dependencies]
+# The relay tests play the terminal on the far side of a pty, and one of them
+# has to ask what is *on* a row rather than what went past on the wire. Already
+# in the graph for `src/shadow.rs`, so the same artifact is reused and this adds
+# nothing to the build.
+vt100 = "0.16"
+
 [profile.release]
 lto = "thin"
 strip = true

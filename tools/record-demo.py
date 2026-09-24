@@ -30,7 +30,8 @@ alternate screen of its own.
 
 Needs, all on PATH:
   * nvim >= 0.11
-  * agg          https://github.com/asciinema/agg/releases
+  * agg >= 1.9   https://github.com/asciinema/agg/releases -- for `--renderer`,
+                 which the notice box needs; see the note where agg is run
   * python3 -m pip install pyte
   * a release build of nvmux (cargo build --release)
 
@@ -117,6 +118,9 @@ ENTER = b"\r"
 ESCAPE = b"\x1b"
 DOWN = b"\x1b[B"
 PREFIX = b"\x00"
+# Ctrl-L, which is readline's clear-screen: it reprints PS1 and echoes nothing
+# of its own. `shell` uses it to put the prompt into the recording.
+REDRAW = b"\x0c"
 
 
 def font_installed():
@@ -444,10 +448,26 @@ class Terminal:
 
 def shell(env, record=False):
     """A bash on the pty, so the recording shows `nvmux` being typed at a
-    prompt rather than starting from nowhere."""
+    prompt rather than starting from nowhere.
+
+    The prompt is set off camera and then asked for a second time, because the
+    GIF is rendered from the byte stream and the stream begins where
+    `start_recording` says it does. bash writes PS1 once, when it is ready for
+    the line after `clear`, which is before that point: the screen carried the
+    prompt the whole time while the stream did not, so the first `nvmux` was
+    drawn against a bare column 1 with no `$` in front of it.
+
+    Ctrl-L is readline redrawing -- it clears and reprints PS1, echoes nothing
+    of its own, and leaves the real screen exactly as `clear` did, so the
+    stream and the screen agree from the first frame. `check_prompt` is what
+    keeps them agreeing.
+    """
     term = Terminal(["bash", "--norc", "--noprofile"], env, record=record)
     time.sleep(1.0)
     term.type("export PS1='%s'; clear\n" % PROMPT, wait=1.2)
+    if record:
+        term.start_recording()
+        term.write(REDRAW, wait=0.5)
     return term
 
 
@@ -470,8 +490,7 @@ def make_sessions(env):
 
 def perform(env):
     """The recorded take."""
-    term = shell(env, record=True)
-    term.start_recording()
+    term = shell(env, record=True)      # recording is already running
     time.sleep(1.0)
 
     # 1. the picker, with the sessions that already exist
@@ -548,6 +567,32 @@ def check_fade_ran():
         sys.exit("the terminal's colour query went unanswered, so nvmux ran "
                  "with no fade and every transition in this take is a hard "
                  "cut:\n  %s" % lines[-1].strip())
+
+
+def check_prompt(events):
+    """Refuse to ship a recording whose first command is typed against nothing.
+
+    The pty this script drives is not what the GIF is made of: the GIF is the
+    byte stream, and the stream holds nothing written before `start_recording`.
+    bash writes PS1 once per line it reads, so the prompt the screen showed all
+    along was a write from before the recording -- and the first `nvmux` was
+    rendered at a bare column 1, with every check in here reading the pty and
+    seeing a prompt that the GIF did not have.
+
+    So this replays the stream and looks at the line the command lands on,
+    which is the only view of it that sees what the GIF will.
+    """
+    screen = Screen()
+    for t, chunk in events:
+        screen.feed(chunk)
+        for line in screen.lines():
+            if "nvmux" not in line:
+                continue
+            if not line.lstrip().startswith("$"):
+                sys.exit("the first `nvmux` of the recording is typed with no "
+                         "prompt in front of it, at %.2fs:\n  %r" % (t, line))
+            return
+    sys.exit("no `nvmux` was ever typed in the recording")
 
 
 def check_clean(events):
@@ -723,6 +768,7 @@ def main():
         print("recording...")
         events, presses = perform(env)
         check_fade_ran()
+        check_prompt(events)
         check_clean(events)
         print("  %d writes, %d keys shown, %.1fs"
               % (len(events), len(presses), events[-1][0]))
@@ -733,7 +779,20 @@ def main():
         os.makedirs(os.path.dirname(OUT_GIF), exist_ok=True)
         print("rendering %s ..." % OUT_GIF)
         # No --theme: the cast header carries it.
-        render = ["agg", "--font-family", FONT_FAMILY, "--font-size", "15",
+        #
+        # `--renderer resvg` is for the notice box, and it is not a preference.
+        # agg's default renderer, `swash`, draws the box-drawing block itself
+        # rather than from the font -- on the cell grid, a pixel thick, which is
+        # what makes a run of `─` a straight line at any size. It does not do
+        # that for the rounded corners the box is built from (`src/announce.rs`:
+        # `╭ ╮ ╰ ╯`, U+256D..U+2570), which come from the font instead and land
+        # a pixel higher and thicker than the bar they are meant to meet. The
+        # corners visibly float off the dashes at both ends of both rules.
+        # `resvg` draws every one of them from the font, where they were
+        # designed to line up, and the box closes. Nothing else in the frame
+        # moves by more than antialiasing.
+        render = ["agg", "--renderer", "resvg",
+                  "--font-family", FONT_FAMILY, "--font-size", "15",
                   "--fps-cap", str(FPS_CAP), "--idle-time-limit", "1.5"]
         if font_dir:
             render += ["--font-dir", font_dir]

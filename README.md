@@ -80,6 +80,9 @@ reimplementing it.
 | `<prefix>` `?` | show these keys — `Esc` goes back |
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
 
+Pressing `<prefix>` puts a one-row reminder of these keys along the bottom of
+the screen; it goes as soon as the next key resolves it.
+
 ### Leaving a session
 
 > [!IMPORTANT]
@@ -128,7 +131,7 @@ overrides the defaults below; an unknown key or a bad value is a startup error.
 ```toml
 [keys]
 prefix     = "Ctrl-Space"   # Ctrl-Space, or a Ctrl-<letter> chord
-timeout_ms = 500            # how long a lone prefix or half-typed number waits
+timeout_ms = 1000           # how long a lone prefix or half-typed number waits
 
 [session]
 command = "nvim --headless --listen {sock}"   # {sock} is required

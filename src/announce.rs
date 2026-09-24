@@ -547,50 +547,41 @@ pub fn overlay(label: &str, size: PtySize) -> Option<Over> {
     })
 }
 
-/// The box on its own, drawn in `fg` — or in no colour at all, which is what
-/// the box at rest is.
+/// A block of nvmux's own rows, written over a session's screen under `sgr`.
 ///
-/// What nvmux drew before it could dissolve, and what it still draws whenever
-/// there is no session screen to dissolve into (see [`Popup::step`]). The
-/// interior is spaces, which erase: this box hides what is under it by writing
-/// over it, and only [`Shadow::under`] can give it back.
+/// The one place it is done. Two things draw over a live session — the box
+/// here, and the hint bar the prefix puts up ([`crate::hint`]) — and the escape
+/// sequence they have to get right is the same one, so it is written once.
+/// `sgr` is the one thing that differs: a reset, a reset carrying a dissolve's
+/// foreground, or a reset carrying `DIM`.
+///
+/// Rows of spaces erase: a block hides what is under it by writing over it, and
+/// only [`Shadow::under`] can give it back.
 ///
 /// What the sequence has to get right, in order:
 ///
-/// * a synchronized-update span, so the box cannot be seen half-drawn;
+/// * a synchronized-update span, so the block cannot be seen half-drawn;
 /// * `DECSC`/`DECRC` (`ESC 7` / `ESC 8`) around everything — without them the
-///   cursor would sit in the box's corner for as long as the box is up, and the
-///   editor's own SGR attributes would be left as whatever this drew with. It
-///   is a single shared save slot, which is safe here only because nothing is
-///   written except between the child's own sequences, and never between a
-///   save of its own and the restore that takes it back ([`crate::boundary`]);
-/// * `ESC [ 0 m` on each row, because the interior is spaces and a space is
-///   erased with *the current background* — which is whatever the editor last
-///   set, and would otherwise bleed into the box;
+///   cursor would sit in the block's last cell for as long as the block is up,
+///   and the editor's own SGR attributes would be left as whatever this drew
+///   with. It is a single shared save slot, which is safe here only because
+///   nothing is written except between the child's own sequences, and never
+///   between a save of its own and the restore that takes it back
+///   ([`crate::boundary`]);
+/// * an SGR *reset* leading every row, because a row's spaces are erased with
+///   *the current background* — which is whatever the editor last set, and
+///   would otherwise bleed into the block. Anything `sgr` adds rides along with
+///   that reset rather than following it, the shape `shadow::write_sgr` emits
+///   for the same reason;
 /// * an absolute `CUP` per row, and not one newline or carriage return
 ///   anywhere. `OPOST` is off in raw mode (see [`crate::term`]), so those move
 ///   the cursor rather than wrapping and are the classic way to corrupt a raw
-///   overlay. It also means a box as wide as the screen never scrolls it: the
+///   overlay. It also means a block as wide as the screen never scrolls it: the
 ///   pending-wrap flag its last cell sets is discarded by the next `CUP`, or —
 ///   on the closing row — by the `DECRC` that is the last thing written.
-///   Nothing printable ever follows it.
-///
-/// `fg` is the one thing the reset does not cover. `None` is the box as it was
-/// before there was a fade and as it still is at rest, and it must stay that:
-/// the box sets no colour, so it is drawn in whatever the terminal's own
-/// foreground is, exactly as every nvmux screen is. `Some` is a frame of a
-/// dissolve, and only the *foreground* moves — the interior is spaces, and a
-/// space is erased with the current background, which the reset has just put
-/// back to the terminal's own. The same division `fade::apply` makes over a
-/// ratatui buffer.
-pub fn plain_bytes(over: &Over, fg: Option<Rgb>) -> Vec<u8> {
-    // One CSI from a reset, which is the shape `shadow::write_sgr` emits for
-    // the same reason: the reset is what puts the background back, so the
-    // colour has to ride along with it rather than follow it.
-    let sgr = match fg {
-        Some(Rgb(r, g, b)) => format!("\x1b[0;38;2;{r};{g};{b}m"),
-        None => "\x1b[0m".to_string(),
-    };
+///   Nothing printable ever follows it. That is what lets the hint bar be the
+///   full width of the *last* row, where a wrap would scroll the session.
+pub(crate) fn placed(over: &Over, sgr: &str) -> Vec<u8> {
     let left = over.left + 1;
     let mut out = String::from("\x1b[?2026h\x1b7");
     for (i, row) in over.rows.iter().enumerate() {
@@ -599,6 +590,28 @@ pub fn plain_bytes(over: &Over, fg: Option<Rgb>) -> Vec<u8> {
     }
     out.push_str("\x1b8\x1b[?2026l");
     out.into_bytes()
+}
+
+/// The box on its own, drawn in `fg` — or in no colour at all, which is what
+/// the box at rest is.
+///
+/// What nvmux drew before it could dissolve, and what it still draws whenever
+/// there is no session screen to dissolve into (see [`Popup::step`]).
+///
+/// `fg` is the one thing [`placed`]'s reset does not cover. `None` is the box
+/// as it was before there was a fade and as it still is at rest, and it must
+/// stay that: the box sets no colour, so it is drawn in whatever the terminal's
+/// own foreground is, exactly as every nvmux screen is. `Some` is a frame of a
+/// dissolve, and only the *foreground* moves — the interior is spaces, and a
+/// space is erased with the current background, which the reset has just put
+/// back to the terminal's own. The same division `fade::apply` makes over a
+/// ratatui buffer.
+pub fn plain_bytes(over: &Over, fg: Option<Rgb>) -> Vec<u8> {
+    let sgr = match fg {
+        Some(Rgb(r, g, b)) => format!("\x1b[0;38;2;{r};{g};{b}m"),
+        None => "\x1b[0m".to_string(),
+    };
+    placed(over, &sgr)
 }
 
 /// The box for this label on this screen, drawn on its own. The two halves

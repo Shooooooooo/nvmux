@@ -18,7 +18,10 @@
 #[macro_use]
 mod common;
 
+use std::path::{Path, PathBuf};
+
 use common::unique;
+use nvmux::ssh::Ssh;
 use nvmux::transport::remote::SshTransport;
 use nvmux::transport::Transport;
 
@@ -291,6 +294,129 @@ fn a_listing_keeps_live_forwards_and_removes_orphaned_ones() {
     let mut client =
         nvmux::rpc::Client::connect(&live, nvmux::rpc::PROBE_TIMEOUT).expect("still connectable");
     client.api_info().expect("still usable after a listing");
+}
+
+/// A master on a `ControlPath` of this test's own, killable without
+/// disturbing anything.
+///
+/// Every other test here reaches the host through the one master nvmux keeps
+/// in the real runtime directory, and they run in parallel: a master pulled
+/// out from under one of their live forwards would fail *them*. These two tests
+/// are about a master dying, so they bring up their own and leave that one
+/// alone.
+struct PrivateMaster {
+    ssh: Ssh,
+    dir: PathBuf,
+}
+
+impl PrivateMaster {
+    fn up(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("nvmux-cm-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        // Short, because a ControlPath is a socket path like any other.
+        let ssh = Ssh::new(host(), dir.join("cm"));
+        ssh.ensure_master().expect("bring up a master");
+        assert!(ssh.is_master_alive(), "the master did not come up");
+        Self { ssh, dir }
+    }
+
+    /// What a sleeping laptop does, near enough: the master goes and every
+    /// forward on it goes too.
+    fn kill(&self) {
+        let out = std::process::Command::new("ssh")
+            .arg("-o")
+            .arg(format!("ControlPath={}", self.ssh.control_path().display()))
+            .args(["-O", "exit", &host()])
+            .output()
+            .expect("run ssh -O exit");
+        assert!(
+            out.status.success() || !self.ssh.is_master_alive(),
+            "could not stop the master: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+impl Drop for PrivateMaster {
+    fn drop(&mut self) {
+        if self.ssh.is_master_alive() {
+            self.kill();
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The fact every reconnection decision turns on, and the one that made the
+/// bug it guards against silent: `ssh` handed a `ControlPath` with no master
+/// on it does **not** fail. It opens a connection of its own, says nothing,
+/// and works — so a shell that is alive proves the host is reachable and
+/// nothing whatever about the master that every `-O forward` needs.
+///
+/// Which is why `run_script` asks ssh itself before replacing a dead shell,
+/// rather than inferring a master from the shell it is about to start. Get
+/// that wrong and the picker lists sessions perfectly over a direct connection
+/// while no session can be attached at all — "the connection to <host> dropped
+/// — press enter to retry", repeating for as long as the user presses enter.
+#[test]
+fn a_shell_started_without_a_master_quietly_makes_its_own_connection() {
+    require_ssh!();
+    let m = PrivateMaster::up("no-master");
+    m.kill();
+    assert!(!m.ssh.is_master_alive(), "the master should be gone");
+
+    let mut shell = m.ssh.start_shell().expect("ssh runs anyway");
+    assert_eq!(
+        shell
+            .run("printf alive", &[])
+            .expect("the shell answers")
+            .stdout,
+        "alive",
+        "a shell with no master must still work — that is the whole trap"
+    );
+    assert!(
+        !m.ssh.is_master_alive(),
+        "starting a shell must not be mistaken for starting a master"
+    );
+
+    // And this is what the working shell was hiding. Nothing can be attached
+    // until something brings the master back.
+    m.ssh
+        .forward(&m.dir.join("l.sock"), Path::new("/tmp/nvmux-no-such.sock"))
+        .expect_err("there is no master to forward on");
+}
+
+/// The other half of the same coin, and the premise behind asking the shell at
+/// all: a shell that *was* started over a master dies with it. That is what
+/// lets an attach check the link with a zero-timeout poll on a pipe instead of
+/// forking `ssh -O check` every time.
+#[test]
+fn a_shell_started_over_a_master_dies_with_it() {
+    require_ssh!();
+    let m = PrivateMaster::up("with-master");
+
+    let mut shell = m.ssh.start_shell().expect("shell");
+    assert_eq!(shell.run("printf up", &[]).expect("runs").stdout, "up");
+
+    m.kill();
+
+    // The client is a separate process, so its death is not instantaneous.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while shell.is_alive() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        !shell.is_alive(),
+        "a shell over a master must not outlive it, or a live shell would \
+         vouch for a master that has gone"
+    );
+
+    // Brought back the way the transport brings it back, over a ControlPath
+    // the dead master may well have left behind.
+    m.ssh.ensure_master().expect("reconnect");
+    assert!(m.ssh.is_master_alive(), "the master did not come back");
+    let mut again = m.ssh.start_shell().expect("shell");
+    assert_eq!(again.run("printf back", &[]).expect("runs").stdout, "back");
 }
 
 /// The chosen command runs on the host that owns the session, not on this one,
