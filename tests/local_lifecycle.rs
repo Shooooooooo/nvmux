@@ -366,9 +366,15 @@ fn a_reorder_never_writes_metadata_for_a_session_that_has_none() {
 
     let mut orphaned = session.clone();
     orphaned.num = 7;
-    t.renumber(&[orphaned])
-        .expect("a missing file is not an error");
+    let renumbered = t.renumber(&[orphaned]);
 
+    // Killed here, before anything below can fail: `Scratch` finds what to
+    // kill through `<id>.json`, which this session no longer has. A signal
+    // rather than `kill_session`, which deletes `<id>.json` and so would hide
+    // one that `renumber` had wrongly written.
+    common::sigkill_and_wait(session.pid);
+
+    renumbered.expect("a missing file is not an error");
     assert!(
         !json.exists(),
         "metadata was conjured for a session that had none"
