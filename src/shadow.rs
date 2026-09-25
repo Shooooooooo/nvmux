@@ -18,8 +18,9 @@
 //! not using it.
 //!
 //! The session's bytes, and not nvmux's own. What nvmux draws over a session —
-//! the attach notice, and nothing else — is deliberately withheld, because
-//! what the shadow has to remember there is precisely what is *underneath* it.
+//! the attach notice and the hint bar ([`crate::hint`]) — is deliberately
+//! withheld, because what the shadow has to remember there is precisely what
+//! is *underneath* it.
 //! The grid is the screen the client drew, which for the notice's rectangle is
 //! the only copy of it anywhere: the terminal's has been written over, and
 //! only the server could otherwise say what was there.
@@ -114,7 +115,8 @@ pub enum Cursor {
 const MIN_SIZE: u16 = 2;
 
 /// A block of text nvmux has drawn over the session's screen — the attach
-/// notice — and the rectangle of cells it covers.
+/// notice, or the hint bar ([`crate::hint`]) — and the rectangle of cells it
+/// covers.
 ///
 /// Held here rather than in [`crate::announce`], which works the geometry out,
 /// because this is the module that composites it: only the shadow can reach
@@ -543,6 +545,7 @@ fn write_sgr(out: &mut Vec<u8>, p: Painted) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::contains;
 
     fn palette() -> Palette {
         Palette {
@@ -761,7 +764,7 @@ mod tests {
         assert!(frame.ends_with(&tail), "{:?}", text(&frame));
         for hidden in [HIDE_CURSOR, SHOW_CURSOR] {
             assert!(
-                !frame.windows(hidden.len()).any(|w| w == hidden),
+                !contains(&frame, hidden),
                 "the composite touched the cursor"
             );
         }
@@ -1170,10 +1173,6 @@ mod tests {
         s.guard(|_| panic!("a parser bug"));
         panic::set_hook(hook);
         assert!(wrapper_only(&s.frame(0.0, &palette(), Cursor::Restored)));
-    }
-
-    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-        haystack.windows(needle.len()).any(|w| w == needle)
     }
 
     /// A parser that panics retires the shadow rather than the relay: nothing

@@ -4,7 +4,7 @@
 //! listing is a millisecond; over ssh it is a round trip, measured at ~230ms
 //! even to localhost (see `scripts/list.sh`), and a prompt that spent that on
 //! every keystroke would be unusable on the connection this feature exists for.
-//! So [`Completer::ask`] is what a keystroke calls, it answers from memory or
+//! So `Completer::ask` is what a keystroke calls, it answers from memory or
 //! sends a request, and it never does any I/O at all.
 //!
 //! # The first thread in this crate, and why
@@ -22,7 +22,7 @@
 //! [`super::poll_key_for`] shortens that tick while an answer is outstanding so
 //! the wait is a frame rather than a quarter of a second.
 //!
-//! The thread is never joined. Dropping the [`Completer`] drops the sending end,
+//! The thread is never joined. Dropping the `Completer` drops the sending end,
 //! which ends the worker's loop after its current listing returns — and a
 //! wedged ssh must not hang the prompt on the way out. What is left running
 //! holds a shell on the host and a dead channel; the loop ends, the shell goes
@@ -93,7 +93,7 @@ struct Shown {
 }
 
 /// Directory completion for one prompt.
-pub struct Completer {
+pub(super) struct Completer {
     /// `None` only in tests, which drive the channels themselves. Dropping this
     /// is what ends the worker.
     tx: Option<Sender<Request>>,
@@ -124,7 +124,7 @@ impl Completer {
     /// in the field means — see [`crate::session::expand_tilde`]. Empty is
     /// allowed and means the host never said: a `~` is then left as the
     /// literal text it is, and lists nothing.
-    pub fn new(source: DirSource, home: &str) -> Self {
+    pub(super) fn new(source: DirSource, home: &str) -> Self {
         let (ask_tx, ask_rx) = mpsc::channel::<Request>();
         let (reply_tx, reply_rx) = mpsc::channel::<Reply>();
 
@@ -151,7 +151,7 @@ impl Completer {
     }
 
     /// What has been typed has changed. Never blocks, never does I/O.
-    pub fn ask(&mut self, input: &str) {
+    pub(super) fn ask(&mut self, input: &str) {
         let Some((dir, _query)) = dirs::split(input) else {
             // Nothing to list: no `/` in what has been typed, and a working
             // directory is absolute, so there is no relative one to resolve.
@@ -203,7 +203,7 @@ impl Completer {
     }
 
     /// Take whatever the worker has sent. Returns whether the screen changed.
-    pub fn poll(&mut self) -> bool {
+    pub(super) fn poll(&mut self) -> bool {
         let mut changed = false;
         loop {
             match self.rx.try_recv() {
@@ -233,13 +233,14 @@ impl Completer {
 
     /// Is an answer still outstanding? The prompt polls faster while it is, and
     /// says it is waiting rather than saying there is nothing there.
-    pub fn waiting(&self) -> bool {
+    pub(super) fn waiting(&self) -> bool {
         self.awaiting
     }
 
     /// Every child of the directory being completed, unranked and unfiltered,
     /// in the host's order. What [`Completer::matches`] scores.
-    pub fn names(&self) -> &[String] {
+    #[cfg(test)]
+    fn names(&self) -> &[String] {
         &self.shown.names
     }
 
@@ -257,7 +258,7 @@ impl Completer {
     ///
     /// Ties are broken by the host's order rather than left to the sort, so a
     /// list of equally good matches does not shuffle as the query grows.
-    pub fn matches(&mut self, query: &str) -> Vec<String> {
+    pub(super) fn matches(&mut self, query: &str) -> Vec<String> {
         let wants_dotted = query.contains('.');
         let visible = |name: &String| wants_dotted || !name.starts_with('.');
 
@@ -297,7 +298,7 @@ impl Completer {
 
     /// The host stopped short of listing everything. Shown, so a row that is
     /// missing entries does not read as one that is complete.
-    pub fn truncated(&self) -> bool {
+    pub(super) fn truncated(&self) -> bool {
         self.shown.truncated
     }
 

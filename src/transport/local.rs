@@ -2,13 +2,13 @@
 //!
 //! What is local about a local session: its socket is reachable as it is, its
 //! liveness can be asked over that socket rather than taken from a script's
-//! `kill -0`, and its metadata is a file right here — re-read and edited in
-//! place, so a rename another nvmux landed in between is kept. The rest is the
-//! shared bodies in [`crate::transport`].
+//! process-table lookup, and its metadata is a file right here — re-read and
+//! edited in place, so a rename another nvmux landed in between is kept. The
+//! rest is the shared bodies in [`crate::transport`].
 
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, TryLockError};
+use std::sync::Mutex;
 
 use crate::error::{NvmuxError, Result, SessionError};
 use crate::launch::Launch;
@@ -50,52 +50,8 @@ impl LocalTransport {
         })
     }
 
-    /// Run one of the shared scripts in this machine's shell.
-    ///
-    /// A script that fails is an `Ok` with a status, which each caller reads
-    /// its own way. `Err` is the shell itself: gone mid-run, or not startable.
-    /// A shell found dead is replaced *before* a run and never after one — a
-    /// script that was half way through must not run twice — so the caller
-    /// that hit the death sees it, and the next one gets a fresh shell.
-    fn run(&self, script: &str, args: &[&str]) -> Result<proc::Output> {
-        let mut slot = match self.shell.try_lock() {
-            Ok(slot) => slot,
-            Err(TryLockError::Poisoned(e)) => e.into_inner(),
-            // No transport method calls another while running a script, so
-            // this is a bug being reported rather than a wait being refused.
-            Err(TryLockError::WouldBlock) => {
-                return Err(NvmuxError::Io(std::io::Error::other(
-                    "the shell is already running a script",
-                )));
-            }
-        };
-        if slot.as_mut().is_none_or(|shell| !shell.is_alive()) {
-            *slot = Some(Shell::start(&mut proc::sh_command(), "/bin/sh")?);
-        }
-        let shell = slot.as_mut().expect("just started");
-        shell.run(script, args).map_err(|died| {
-            *slot = None;
-            NvmuxError::Io(std::io::Error::other(died))
-        })
-    }
-
     fn paths(&self, id: &str) -> Result<SessionPaths> {
         Ok(SessionPaths::new(&self.dir, id)?)
-    }
-
-    /// The last few lines of a session's log, included in the error because it
-    /// is the first thing anyone wants when a session will not start.
-    fn log_tail(&self, log: &Path) -> String {
-        let Ok(body) = std::fs::read_to_string(log) else {
-            return "(no log file)".to_string();
-        };
-        let lines: Vec<&str> = body.lines().collect();
-        let start = lines.len().saturating_sub(15);
-        if lines.is_empty() {
-            "(log is empty)".to_string()
-        } else {
-            lines[start..].join("\n")
-        }
     }
 
     /// Whether a socket file is safe to delete as stale: nothing listening,
@@ -169,11 +125,26 @@ impl Host for LocalTransport {
         &self.dir_arg
     }
 
+    /// Run one of the shared scripts in this machine's shell.
+    ///
+    /// A script that fails is an `Ok` with a status, which each caller reads
+    /// its own way. `Err` is the shell itself: gone mid-run, or not startable.
+    /// A shell found dead is replaced *before* a run and never after one — a
+    /// script that was half way through must not run twice — so the caller
+    /// that hit the death sees it, and the next one gets a fresh shell.
     fn run(&self, script: &str, args: &[&str]) -> Result<proc::Output> {
-        LocalTransport::run(self, script, args)
+        let mut slot = transport::claim_shell(&self.shell)?;
+        if slot.as_mut().is_none_or(|shell| !shell.is_alive()) {
+            *slot = Some(Shell::local()?);
+        }
+        let shell = slot.as_mut().expect("just started");
+        shell.run(script, args).map_err(|died| {
+            *slot = None;
+            NvmuxError::Io(std::io::Error::other(died))
+        })
     }
 
-    /// The script's `kill -0` result is only a hint; the socket is right here,
+    /// The script's liveness hint is only a hint; the socket is right here,
     /// so it is replaced with the real answer, and a session found dead is
     /// reaped on the spot.
     fn settle(&self, listed: Vec<Session>) -> Result<Vec<Session>> {
@@ -233,9 +204,19 @@ impl Host for LocalTransport {
         self.dir.join(format!("{id}.log"))
     }
 
-    /// The first thing anyone wants when a session will not start.
+    /// The last few lines of a session's log, included in the error because it
+    /// is the first thing anyone wants when a session will not start.
     fn log_tail(&self, id: &str) -> Option<String> {
-        Some(self.log_tail(&Host::log_path(self, id)))
+        let Ok(body) = std::fs::read_to_string(self.log_path(id)) else {
+            return Some("(no log file)".to_string());
+        };
+        let lines: Vec<&str> = body.lines().collect();
+        let start = lines.len().saturating_sub(15);
+        Some(if lines.is_empty() {
+            "(log is empty)".to_string()
+        } else {
+            lines[start..].join("\n")
+        })
     }
 }
 
@@ -327,8 +308,7 @@ mod tests {
     use super::*;
 
     fn transport(tag: &str) -> (LocalTransport, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("nvmux-local-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::test_support::scratch_path(&format!("local-{tag}"));
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -375,21 +355,16 @@ mod tests {
         assert!(t.list_sessions().expect("list").is_empty());
 
         unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while t
-            .shell
-            .lock()
-            .expect("lock")
-            .as_mut()
-            .expect("held")
-            .is_alive()
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the shell did not die"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        assert!(
+            crate::test_support::wait_until(std::time::Duration::from_secs(2), || !t
+                .shell
+                .lock()
+                .expect("lock")
+                .as_mut()
+                .expect("held")
+                .is_alive()),
+            "the shell did not die"
+        );
         assert!(t.list_sessions().expect("list").is_empty());
         assert_ne!(shell_pid(&t), pid, "the dead shell was not replaced");
 

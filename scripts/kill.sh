@@ -25,12 +25,6 @@ pid="${3:-}"
 
 sock="$dir/$id.sock"
 
-# Is this pid the nvim serving THIS session's socket? `grep -F` because the path
-# is data, not a pattern.
-owns_socket() {
-  cmdline "$1" | grep -q -F -- "--listen $sock"
-}
-
 # A process that has exited but not yet been reaped. Sessions are spawned
 # detached, so their parent is pid 1, and an init that does not reap promptly --
 # the norm in containers -- leaves an exited nvim as a zombie indefinitely.
@@ -64,7 +58,7 @@ wait_gone() {
 # The recorded pid is only a starting guess -- it was validated at spawn time,
 # but pids are reused -- so it is used only if it still owns this socket.
 target=''
-if [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null && ! gone "$pid" && owns_socket "$pid"; then
+if [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null && ! gone "$pid" && owns_socket "$pid" "$sock"; then
   target=$pid
 else
   target=$(serving_pid "$sock")

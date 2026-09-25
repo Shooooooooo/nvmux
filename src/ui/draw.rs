@@ -91,13 +91,27 @@ const EMPTY: &str = "no sessions — press c to create one";
 const REORDER_HINTS: &str = "↑↓ move  ⏎ place  esc cancel";
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    let (text, dim) = hint_line(app);
+    screen(frame, &text, dim, |frame, body| draw_list(frame, app, body));
+}
+
+/// Every full-screen view is the same shape: a body, then one hint row on the
+/// last line — and nothing at all on a frame with no rows, since there is no
+/// last line to take off it. One function so the zero-size guard and the split
+/// cannot be separated at a call site.
+pub(super) fn screen(
+    frame: &mut Frame,
+    hint: &str,
+    dim: bool,
+    body: impl FnOnce(&mut Frame, Rect),
+) {
     let area = frame.area();
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let (list_area, bottom) = split_hint_row(area);
-    draw_list(frame, app, list_area);
-    draw_bottom(frame, app, bottom);
+    let (top, bottom) = split_hint_row(area);
+    body(frame, top);
+    draw_hint_row(frame, bottom, hint, dim);
 }
 
 /// The layout every screen shares: the body above, one hint row on the last
@@ -119,6 +133,11 @@ pub(super) fn split_hint_row(area: Rect) -> (Rect, Rect) {
 /// than wrapped (the row owns exactly one line, and wrapping would push the
 /// body up and make the layout jump), dim when it is a hint rather than
 /// something the user is being told.
+///
+/// Two lines that are not hint rows are drawn through it as well, being the
+/// same kind of thing — one dim sentence, centred, cut to fit: the empty
+/// picker's "no sessions", and the attaching screen's status. Each stands in
+/// for a list that is not there, on the row [`centre_vertically`] picks.
 pub(super) fn draw_hint_row(frame: &mut Frame, area: Rect, text: &str, dim: bool) {
     let text = truncate(text, area.width as usize);
     let style = if dim {
@@ -137,13 +156,7 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     let visible = app.visible();
 
     if visible.is_empty() {
-        let text = truncate(EMPTY, area.width as usize);
-        let para = Paragraph::new(Line::from(Span::styled(
-            text,
-            Style::default().add_modifier(Modifier::DIM),
-        )))
-        .alignment(Alignment::Center);
-        frame.render_widget(para, centre_vertically(area, 1));
+        draw_hint_row(frame, centre_vertically(area, 1), EMPTY, true);
         return;
     }
 
@@ -201,8 +214,10 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(rows), block);
 }
 
-fn draw_bottom(frame: &mut Frame, app: &App, area: Rect) {
-    let (text, dim) = match app.mode() {
+/// What the hint row says, and whether it is dim: a hint when nothing is being
+/// asked or typed, and otherwise the thing being asked or typed, at full weight.
+fn hint_line(app: &App) -> (String, bool) {
+    match app.mode() {
         Mode::Confirm { prompt, .. } => (prompt.clone(), false),
         Mode::Filter => (format!("/{}{CURSOR}", app.filter()), false),
         // The query comes too, when there is one. A move of one visible row can
@@ -226,9 +241,7 @@ fn draw_bottom(frame: &mut Frame, app: &App, area: Rect) {
                 None => (HINTS.to_string(), true),
             },
         },
-    };
-
-    draw_hint_row(frame, area, &text, dim);
+    }
 }
 
 /// Where the list is drawn within the body `area`, and which visible row its
@@ -238,7 +251,7 @@ fn draw_bottom(frame: &mut Frame, app: &App, area: Rect) {
 ///
 /// One function for the renderer and for [`row_at`], so a click lands on the
 /// row the eye sees rather than on a second opinion about where the rows are.
-pub(super) fn list_layout(app: &App, area: Rect) -> Option<ListLayout> {
+fn list_layout(app: &App, area: Rect) -> Option<ListLayout> {
     let visible = app.visible();
     if area.height == 0 || visible.is_empty() {
         return None;
@@ -266,11 +279,11 @@ pub(super) fn list_layout(app: &App, area: Rect) -> Option<ListLayout> {
 }
 
 /// See [`list_layout`].
-pub(super) struct ListLayout {
+struct ListLayout {
     /// The centred block the rows are drawn in.
-    pub(super) block: Rect,
+    block: Rect,
     /// The visible row on the block's first line.
-    pub(super) offset: usize,
+    offset: usize,
     /// Columns the number column takes.
     num_width: usize,
 }
@@ -283,7 +296,7 @@ pub(super) struct ListLayout {
 /// row, and a target the width of a short name is a poor one for a touchpad.
 /// The hint row and the empty space above and below the list are nothing.
 pub(super) fn row_at(app: &App, area: Rect, column: u16, row: u16) -> Option<usize> {
-    // As `draw` guards before splitting: a frame with no rows has no hint row
+    // As `screen` guards before splitting: a frame with no rows has no hint row
     // to take off it.
     if area.height == 0 || area.width == 0 {
         return None;
@@ -358,32 +371,12 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support;
+    use super::super::app::Key;
+    use super::super::test_support::{self, filtering, picker as app};
     use super::*;
-    use crate::session::Session;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
 
     fn render(app: &App, w: u16, h: u16) -> Vec<String> {
         test_support::render(w, h, |f| draw(f, app))
-    }
-
-    /// Numbered the way `finish_listing` would have: these `App`s are built
-    /// directly, so nothing else would set the resolved number.
-    fn app(names: &[&str]) -> App {
-        App::new(
-            names
-                .iter()
-                .enumerate()
-                .map(|(i, n)| {
-                    let num = i as u32 + 1;
-                    let mut s =
-                        Session::new(format!("id{i:06}"), n.to_string(), 100 + i as u32, num);
-                    s.state.num = num;
-                    s
-                })
-                .collect(),
-        )
     }
 
     #[test]
@@ -446,8 +439,7 @@ mod tests {
         assert_eq!(occupied, vec![9, 10], "list is not vertically centred");
 
         let row = &lines[9];
-        let left = row.len() - row.trim_start().len();
-        let right = 60 - row.width();
+        let (left, right) = test_support::padding(row, 60);
         assert!(
             left.abs_diff(right) <= 2,
             "not horizontally centred: {left} left, {right} right, row {row:?}"
@@ -487,7 +479,7 @@ mod tests {
         let names: Vec<String> = (0..12).map(|i| format!("s{i:02}")).collect();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let mut a = app(&refs);
-        a.on_key(super::super::app::Key::Char('1'));
+        a.on_key(Key::Char('1'));
 
         let lines = render(&a, 40, 14);
         assert!(
@@ -501,20 +493,10 @@ mod tests {
     fn reordering(names: &[&str], row: usize) -> App {
         let mut a = app(names);
         for _ in 0..row {
-            a.on_key(super::super::app::Key::Char('j'));
+            a.on_key(Key::Char('j'));
         }
-        a.on_key(super::super::app::Key::Char(' '));
+        a.on_key(Key::Char(' '));
         assert!(matches!(a.mode(), Mode::Reorder { .. }), "the grab took");
-        a
-    }
-
-    /// The filter prompt open with `query` typed into it.
-    fn filtering(names: &[&str], query: &str) -> App {
-        let mut a = app(names);
-        a.on_key(super::super::app::Key::Char('/'));
-        for c in query.chars() {
-            a.on_key(super::super::app::Key::Char(c));
-        }
         a
     }
 
@@ -609,12 +591,12 @@ mod tests {
     #[test]
     fn an_applied_filter_is_still_shown_while_reordering() {
         let mut a = app(&["api-server", "dotfiles"]);
-        a.on_key(super::super::app::Key::Char('/'));
+        a.on_key(Key::Char('/'));
         for c in "dot".chars() {
-            a.on_key(super::super::app::Key::Char(c));
+            a.on_key(Key::Char(c));
         }
-        a.on_key(super::super::app::Key::Enter); // filter applied, normal mode
-        a.on_key(super::super::app::Key::Char(' '));
+        a.on_key(Key::Enter); // filter applied, normal mode
+        a.on_key(Key::Char(' '));
 
         let lines = render(&a, 60, 6);
         assert!(lines[5].contains("place"), "got {:?}", lines[5]);
@@ -644,9 +626,9 @@ mod tests {
             [('/', "dot", "/dot▋"), ('x', "", "kill \"dotfiles\"? [y/N]")]
         {
             let mut a = app(&["dotfiles"]);
-            a.on_key(super::super::app::Key::Char(open_with));
+            a.on_key(Key::Char(open_with));
             for c in typed.chars() {
-                a.on_key(super::super::app::Key::Char(c));
+                a.on_key(Key::Char(c));
             }
             // Wide enough for the whole of `HINTS`: at sixty columns `quit` no
             // longer fits either, and the assertion below would pass whether or
@@ -668,9 +650,9 @@ mod tests {
     #[test]
     fn the_filter_prompt_shows_the_query_with_a_cursor() {
         let mut a = app(&["api-server", "dotfiles"]);
-        a.on_key(super::super::app::Key::Char('/'));
+        a.on_key(Key::Char('/'));
         for c in "dot".chars() {
-            a.on_key(super::super::app::Key::Char(c));
+            a.on_key(Key::Char(c));
         }
         let lines = render(&a, 60, 6);
         assert!(lines[5].contains("/dot▋"), "got {:?}", lines[5]);
@@ -763,7 +745,7 @@ mod tests {
         let names: Vec<String> = (0..30).map(|i| format!("session-{i:02}")).collect();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let mut a = app(&refs);
-        a.on_key(super::super::app::Key::Char('G')); // last entry
+        a.on_key(Key::Char('G')); // last entry
 
         let lines = render(&a, 40, 10);
         assert!(
@@ -842,7 +824,7 @@ mod tests {
         let names: Vec<String> = (0..30).map(|i| format!("session-{i:02}")).collect();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let mut a = app(&refs);
-        a.on_key(super::super::app::Key::Char('G'));
+        a.on_key(Key::Char('G'));
         let (w, h) = (40, 10);
         let area = Rect::new(0, 0, w, h);
         let lines = render(&a, w, h);
@@ -905,7 +887,7 @@ mod tests {
     #[test]
     fn nothing_sets_a_colour() {
         let mut a = app(&["one", "two", "three"]);
-        a.on_key(super::super::app::Key::Char('j'));
+        a.on_key(Key::Char('j'));
         test_support::assert_no_colour(50, 8, |f| draw(f, &a));
 
         let b = reordering(&["one", "two", "three"], 1);
@@ -918,10 +900,10 @@ mod tests {
     #[test]
     fn the_reorder_hints_are_dim_like_the_ordinary_ones() {
         let mut with_filter = app(&["api-server", "dotfiles"]);
-        with_filter.on_key(super::super::app::Key::Char('/'));
-        with_filter.on_key(super::super::app::Key::Char('d'));
-        with_filter.on_key(super::super::app::Key::Enter);
-        with_filter.on_key(super::super::app::Key::Char(' '));
+        with_filter.on_key(Key::Char('/'));
+        with_filter.on_key(Key::Char('d'));
+        with_filter.on_key(Key::Enter);
+        with_filter.on_key(Key::Char(' '));
         assert!(
             matches!(with_filter.mode(), Mode::Reorder { .. }),
             "the grab took"
@@ -933,9 +915,7 @@ mod tests {
             ("reorder hints with a filter", with_filter, true),
             ("the filter prompt", filtering(&["one", "two"], "on"), false),
         ] {
-            let mut terminal = Terminal::new(TestBackend::new(60, 6)).expect("terminal");
-            terminal.draw(|f| draw(f, &a)).expect("draw");
-            let buf = terminal.backend().buffer().clone();
+            let buf = test_support::buffer(60, 6, |f| draw(f, &a));
             let row = buf.area.height - 1;
             let cell = (0..buf.area.width)
                 .map(|x| &buf[(x, row)])
@@ -952,9 +932,7 @@ mod tests {
     #[test]
     fn the_selected_row_is_reversed_and_bold() {
         let a = app(&["one", "two"]);
-        let mut terminal = Terminal::new(TestBackend::new(40, 6)).expect("terminal");
-        terminal.draw(|f| draw(f, &a)).expect("draw");
-        let buf = terminal.backend().buffer().clone();
+        let buf = test_support::buffer(40, 6, |f| draw(f, &a));
         let marked = (0..buf.area.height)
             .find(|y| (0..buf.area.width).any(|x| buf[(x, *y)].symbol() == "▸"))
             .expect("a marked row");

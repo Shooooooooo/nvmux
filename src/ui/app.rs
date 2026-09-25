@@ -225,9 +225,6 @@ impl App {
             .collect()
     }
 
-    /// The session with this id, from the list the picker is showing. What a
-    /// [`Request`] carrying an id resolves against, so acting on a row costs no
-    /// round trip beyond the action itself.
     /// Every row the picker is holding, in the order it is holding them.
     ///
     /// For a caller that carries the listing on rather than asking for another
@@ -237,6 +234,9 @@ impl App {
         &self.sessions
     }
 
+    /// The session with this id, from the list the picker is showing. What a
+    /// [`Request`] carrying an id resolves against, so acting on a row costs no
+    /// round trip beyond the action itself.
     pub fn session(&self, id: &str) -> Option<&Session> {
         self.sessions.iter().find(|s| s.id == id)
     }
@@ -245,7 +245,7 @@ impl App {
         self.selected
     }
 
-    pub fn selected_session(&self) -> Option<&Session> {
+    fn selected_session(&self) -> Option<&Session> {
         self.visible().get(self.selected).copied()
     }
 
@@ -823,13 +823,12 @@ pub enum Key {
     Backspace,
     Up,
     Down,
-    /// Only the prompt binds these four: they move within and between its
-    /// fields. The picker's handlers ignore them, as they do any other key
-    /// they do not name.
+    /// Only the prompt binds these three: `Left` and `Right` move within a
+    /// field, and `Tab` completes where there is something to complete. The
+    /// picker's handlers ignore them, as they do any other key they do not name.
     Left,
     Right,
     Tab,
-    BackTab,
     Home,
     End,
     CtrlC,
@@ -865,22 +864,7 @@ pub enum Mouse {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn app(names: &[&str]) -> App {
-        App::new(
-            names
-                .iter()
-                .enumerate()
-                .map(|(i, n)| {
-                    let num = i as u32 + 1;
-                    let mut s =
-                        Session::new(format!("id{i:06}"), n.to_string(), 100 + i as u32, num);
-                    s.state.num = num;
-                    s
-                })
-                .collect(),
-        )
-    }
+    use crate::ui::test_support::{filtering, picker as app};
 
     fn names(app: &App) -> Vec<String> {
         app.visible().iter().map(|s| s.name.clone()).collect()
@@ -1035,15 +1019,6 @@ mod tests {
         assert_eq!(names(&a), ["notes-tests-server", "ts"]);
         let numbers: Vec<u32> = a.visible().iter().map(|s| s.state.num).collect();
         assert_eq!(numbers, [1, 2], "the numbers travel with the rows");
-    }
-
-    fn filtering(names: &[&str], query: &str) -> App {
-        let mut a = app(names);
-        a.on_key(Key::Char('/'));
-        for c in query.chars() {
-            a.on_key(Key::Char(c));
-        }
-        a
     }
 
     /// A session is where it runs as much as what it is called: `scratch` in

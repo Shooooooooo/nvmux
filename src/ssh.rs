@@ -23,11 +23,11 @@ use crate::shell;
 /// 6.7 is where unix-domain socket forwarding (`-L <local_sock>:<remote_sock>`)
 /// was added, which is the entire remote transport. `MIN_SSH` is the same
 /// version as a tuple; a test ties the two together.
-pub const MIN_SSH_VERSION: &str = "6.7";
+const MIN_SSH_VERSION: &str = "6.7";
 const MIN_SSH: (u64, u64) = (6, 7);
 
 /// Parse the version out of `ssh -V` output, e.g. `OpenSSH_9.6p1 Ubuntu-3...`.
-pub fn parse_ssh_version(banner: &str) -> Option<(u64, u64)> {
+fn parse_ssh_version(banner: &str) -> Option<(u64, u64)> {
     let token = banner.split_whitespace().next()?;
     let rest = token.strip_prefix("OpenSSH_")?;
     let numeric: String = rest
@@ -119,7 +119,7 @@ fn unattended(ctl: &Path) -> Vec<String> {
 /// down drops packets rather than refusing them, so without a bound each
 /// attempt would hang for the minutes the kernel allows and the series would
 /// never get to its next try. See [`crate::reconnect`].
-pub fn master_args(host: &str, ctl: &Path, connect_timeout: Option<u64>) -> Vec<String> {
+fn master_args(host: &str, ctl: &Path, connect_timeout: Option<u64>) -> Vec<String> {
     let mut args = vec![
         "-M".into(),
         "-N".into(),
@@ -147,7 +147,7 @@ pub fn master_args(host: &str, ctl: &Path, connect_timeout: Option<u64>) -> Vec<
 }
 
 /// Ask whether the master is alive.
-pub fn check_args(host: &str, ctl: &Path) -> Vec<String> {
+fn check_args(host: &str, ctl: &Path) -> Vec<String> {
     let mut args = common(ctl);
     args.extend(["-O".into(), "check".into(), host.to_string()]);
     args
@@ -167,12 +167,12 @@ fn forward_op(op: &str, host: &str, ctl: &Path, local: &Path, remote: &Path) -> 
 }
 
 /// Add a unix-socket forward to the existing master, without reconnecting.
-pub fn forward_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<String> {
+fn forward_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<String> {
     forward_op("forward", host, ctl, local, remote)
 }
 
 /// Remove a forward.
-pub fn cancel_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<String> {
+fn cancel_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<String> {
     forward_op("cancel", host, ctl, local, remote)
 }
 
@@ -195,14 +195,14 @@ pub fn cancel_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<S
 /// script back into the output. `-n` must never be added: it puts `/dev/null`
 /// on stdin, and `sh -s` then reads nothing, prints nothing and exits 0 — an
 /// *empty* result, silently, rather than an error.
-pub fn shell_args(host: &str, ctl: &Path) -> Vec<String> {
+fn shell_args(host: &str, ctl: &Path) -> Vec<String> {
     shell_args_with(common(ctl), host)
 }
 
 /// The same command, with the options an unattended shell needs — see
 /// [`unattended`]. Identical in every other respect, so what runs on the host is
 /// the same program reached the same way.
-pub fn unattended_shell_args(host: &str, ctl: &Path) -> Vec<String> {
+fn unattended_shell_args(host: &str, ctl: &Path) -> Vec<String> {
     shell_args_with(unattended(ctl), host)
 }
 

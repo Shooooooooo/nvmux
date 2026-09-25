@@ -25,8 +25,9 @@
 //! on it, so a failure is retried on the schedule in [`DELAYS`]: about a minute
 //! in all, which covers a machine finding its network again and does not leave
 //! an unattended terminal spawning `ssh` for the rest of the day. After that
-//! the picker takes over, with the reason on its hint row and `Enter` as the
-//! way to try again by hand.
+//! `main` gives up and exits with the reason — not back to the picker, whose
+//! first listing would go over the same dead link (see the `GaveUp` arm in
+//! main.rs) — and the session is still there for the next `nvmux <host>`.
 //!
 //! Only an error that time can change is retried — the host not answering, or
 //! the connection to it dying on the way up. Anything else is reported at

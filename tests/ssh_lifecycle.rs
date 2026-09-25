@@ -401,12 +401,8 @@ fn a_shell_started_over_a_master_dies_with_it() {
     m.kill();
 
     // The client is a separate process, so its death is not instantaneous.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while shell.is_alive() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
     assert!(
-        !shell.is_alive(),
+        common::wait_until(std::time::Duration::from_secs(5), || !shell.is_alive()),
         "a shell over a master must not outlive it, or a live shell would \
          vouch for a master that has gone"
     );

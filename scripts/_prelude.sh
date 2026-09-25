@@ -21,6 +21,32 @@ finish() {
   printf 'NVMUX_END\n'
 }
 
+# Say why, in the script's own words, and stop. A bare exit with nothing on
+# stdout reaches the user as a diagnosis of the ssh connection instead -- and a
+# "Permission denied" from the shell on stderr reads there as an authentication
+# failure. The terminator still goes out: the script ran, and said this.
+fail() {
+  printf 'ERROR %s\n' "$1"
+  finish
+  exit 1
+}
+
+# Is pid $1 the nvim serving socket $2? `grep -F` because the path is data, not
+# a pattern.
+owns_socket() {
+  cmdline "$1" | grep -q -F -- "--listen $2"
+}
+
+# Replace $1/$2.json with $3: temp file plus rename, so a concurrent listing
+# sees the old contents or the new and never a half-written file. rename(2)
+# within one directory is atomic. Nonzero if either step failed, with the temp
+# file gone.
+write_json() {
+  nvmux_tmp="$1/$2.json.tmp$$"
+  printf '%s\n' "$3" > "$nvmux_tmp" || return 1
+  mv -f "$nvmux_tmp" "$1/$2.json" || { rm -f "$nvmux_tmp"; return 1; }
+}
+
 # The command line of a pid, or empty if we cannot find out. /proc first so this
 # works on a Linux box with no ps at all; `-ww` stops macOS truncating to
 # terminal width, which would break the match for exactly the long socket paths

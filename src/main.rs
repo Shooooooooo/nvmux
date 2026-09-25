@@ -417,7 +417,7 @@ fn describe_attach_failure(location: &transport::Location, e: &nvmux::NvmuxError
         nvmux::NvmuxError::Rpc(nvmux::error::RpcError::Timeout(after)) => {
             format!("that session is busy and did not answer within {after:?}")
         }
-        other => one_line(other),
+        other => other.one_line(),
     }
 }
 
@@ -439,7 +439,7 @@ fn describe_retry(host: &str, retry: &reconnect::Retry<'_>) -> String {
     }
     lines.push_str(&format!(
         "nvmux: {} — trying again in {}s ({} of {})",
-        one_line(retry.error),
+        retry.error.one_line(),
         retry.wait.as_secs(),
         retry.attempt,
         retry.of
@@ -454,7 +454,7 @@ fn describe_retry(host: &str, retry: &reconnect::Retry<'_>) -> String {
 fn describe_reconnect_failure(host: &str, e: &nvmux::NvmuxError) -> String {
     format!(
         "could not reconnect: {}\nhint: the session keeps running; `nvmux {host}` will find it",
-        one_line(e)
+        e.one_line()
     )
 }
 
@@ -465,15 +465,7 @@ fn describe_reconnect_failure(host: &str, e: &nvmux::NvmuxError) -> String {
 /// them says is what nvmux was attempting — a script's refusal is rendered bare,
 /// on purpose — and on the hint row there is nothing else to say it.
 fn describe_listing_failure(e: &nvmux::NvmuxError) -> String {
-    format!("could not list sessions: {}", one_line(e))
-}
-
-/// Collapse an error to something that fits on one line.
-///
-/// The hint row it lands on is exactly one row; a multi-line error would be
-/// truncated at the first newline and lose the part that explains itself.
-fn one_line(e: &nvmux::NvmuxError) -> String {
-    e.to_string().lines().collect::<Vec<_>>().join(" — ")
+    format!("could not list sessions: {}", e.one_line())
 }
 
 /// The session a `<prefix>` switch names, in a listing.
@@ -763,22 +755,5 @@ mod tests {
         let msg = describe_listing_failure(&e);
         assert!(msg.contains("could not list sessions"), "{msg}");
         assert!(msg.contains("is not owned by us"), "{msg}");
-    }
-
-    /// The hint row is one row here too.
-    #[test]
-    fn a_multi_line_listing_failure_is_flattened_to_one_line() {
-        let e = NvmuxError::Session(SessionError::NotReady {
-            name: "x".into(),
-            timeout: std::time::Duration::from_secs(1),
-            log: "x.log".into(),
-            log_tail: "line one\nline two".into(),
-        });
-        let msg = describe_listing_failure(&e);
-        assert!(!msg.contains('\n'), "{msg:?}");
-        assert!(
-            msg.contains("line one") && msg.contains("line two"),
-            "{msg:?}"
-        );
     }
 }

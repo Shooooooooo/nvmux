@@ -19,8 +19,8 @@
 //! # The shape is the picker's
 //!
 //! One centred line where the picker draws its list, and one dim hint row on
-//! the last line: [`draw::split_hint_row`] and [`draw::draw_hint_row`], the
-//! same two calls every other screen makes. The line is the picker's
+//! the last line: [`draw::screen`], the same call every other screen makes.
+//! The line is the picker's
 //! empty-list line by another name — a single dim sentence standing in for a
 //! list that is not there — so it is drawn the same way, through
 //! [`draw::centre_vertically`].
@@ -74,10 +74,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
-use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::layout::Rect;
 use ratatui::Frame;
 
 use super::app::Key;
@@ -292,7 +289,7 @@ fn notation(key: Key) -> Option<String> {
         Key::Down => Some("<Down>".into()),
         Key::Left => Some("<Left>".into()),
         Key::Right => Some("<Right>".into()),
-        Key::Home | Key::End | Key::BackTab | Key::CtrlN | Key::CtrlP | Key::Other => None,
+        Key::Home | Key::End | Key::CtrlN | Key::CtrlP | Key::Other => None,
         // Never reached: both are the way out, taken before this is asked.
         Key::Esc | Key::CtrlC => None,
     }
@@ -325,18 +322,18 @@ fn next_key() -> Result<Option<Key>> {
 /// Both rows are dim, like every hint row: a status and an offer, neither of
 /// them something the user is being asked to answer.
 fn draw(frame: &mut Frame, state: &State) {
-    let area = frame.area();
-    if area.height == 0 || area.width == 0 || state.elapsed < GRACE {
+    if state.elapsed < GRACE {
         return;
     }
-    let (body, bottom) = draw::split_hint_row(area);
-    draw_status(frame, state, body);
-    draw::draw_hint_row(frame, bottom, CANCEL, true);
+    draw::screen(frame, CANCEL, true, |frame, body| {
+        draw_status(frame, state, body)
+    });
 }
 
 /// The status line, drawn the way the empty picker draws "no sessions": one
 /// dim sentence centred on both axes, truncated from the right rather than
-/// wrapped, so the hint row stays where it is.
+/// wrapped, so the hint row stays where it is — a hint row by another name,
+/// and drawn through the same function.
 ///
 /// A terminal with no room above the hint row gets no status: the way out is
 /// worth more than the name of what it gets out of.
@@ -344,13 +341,12 @@ fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
     if area.height == 0 {
         return;
     }
-    let text = draw::truncate(&status(state), usize::from(area.width));
-    let para = Paragraph::new(Line::from(Span::styled(
-        text,
-        Style::default().add_modifier(Modifier::DIM),
-    )))
-    .alignment(Alignment::Center);
-    frame.render_widget(para, draw::centre_vertically(area, 1));
+    draw::draw_hint_row(
+        frame,
+        draw::centre_vertically(area, 1),
+        &status(state),
+        true,
+    );
 }
 
 /// The spinner and the session it is waiting for.
@@ -367,8 +363,7 @@ fn status(state: &State) -> String {
 mod tests {
     use super::super::test_support;
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
+    use ratatui::style::Modifier;
     use unicode_width::UnicodeWidthStr;
 
     fn at(elapsed: Duration, name: &str) -> State {
@@ -397,12 +392,6 @@ mod tests {
             .chars()
             .next()
             .is_some_and(|c| GLYPHS.contains(&c))
-    }
-
-    /// Left and right padding of a line on a `w`-column screen, for the
-    /// centring assertions. The idiom `draw` and `help` both use.
-    fn padding(line: &str, w: usize) -> (usize, usize) {
-        (line.len() - line.trim_start().len(), w - line.width())
     }
 
     /// A fast attach — every local one, most remote ones — shows nothing at
@@ -445,7 +434,7 @@ mod tests {
         let status = &lines[status_row(8)];
         assert!(spins(status), "{status:?}");
         assert!(status.contains("attaching to dotfiles"), "{status:?}");
-        let (left, right) = padding(status, 40);
+        let (left, right) = test_support::padding(status, 40);
         assert!(
             left.abs_diff(right) <= 2,
             "the status is not centred: {left} left, {right} right, {status:?}"
@@ -453,7 +442,7 @@ mod tests {
 
         let hint = &lines[7];
         assert_eq!(hint.trim(), CANCEL);
-        let (left, right) = padding(hint, 40);
+        let (left, right) = test_support::padding(hint, 40);
         assert!(
             left.abs_diff(right) <= 2,
             "the hint is not centred: {left} left, {right} right, {hint:?}"
@@ -617,11 +606,7 @@ mod tests {
     /// everywhere else.
     #[test]
     fn both_rows_are_dim() {
-        let mut terminal = Terminal::new(TestBackend::new(40, 4)).expect("terminal");
-        terminal
-            .draw(|f| draw(f, &at(GRACE, "dotfiles")))
-            .expect("draw");
-        let buf = terminal.backend().buffer().clone();
+        let buf = test_support::buffer(40, 4, |f| draw(f, &at(GRACE, "dotfiles")));
 
         let mut seen = 0;
         for y in [status_row(4) as u16, 3] {

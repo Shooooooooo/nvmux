@@ -1,24 +1,35 @@
 //! Shared helpers for the screen tests, which all render to a `TestBackend`
 //! and assert on the result the same way. [`emitted`] is the exception: one
 //! property of the screens is only visible in the escape stream, so it renders
-//! through the same crossterm backend the binary uses.
+//! through the same crossterm backend the binary uses. The picker builders the
+//! picker's own tests and the renderer's share live here too.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use ratatui::backend::{CrosstermBackend, TestBackend};
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthStr;
 
+use super::app::{App, Key};
+use crate::session::Session;
+
+/// Render one frame to a `w` x `h` `TestBackend` and hand back the cell
+/// buffer, for the tests that need a cell's modifier rather than its text.
+pub(super) fn buffer(w: u16, h: u16, mut draw: impl FnMut(&mut Frame)) -> Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+    terminal.draw(|f| draw(f)).expect("draw");
+    terminal.backend().buffer().clone()
+}
+
 /// Reconstruct the rendered lines, skipping the filler cell that follows a
 /// wide glyph so a CJK name is not reported as three columns per character.
 /// Trailing blanks are trimmed from every line.
-pub(super) fn render(w: u16, h: u16, mut draw: impl FnMut(&mut Frame)) -> Vec<String> {
-    let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
-    terminal.draw(|f| draw(f)).expect("draw");
-    let buf = terminal.backend().buffer().clone();
+pub(super) fn render(w: u16, h: u16, draw: impl FnMut(&mut Frame)) -> Vec<String> {
+    let buf = buffer(w, h, draw);
     (0..buf.area.height)
         .map(|y| {
             let mut line = String::new();
@@ -79,10 +90,8 @@ pub(super) fn emitted(w: u16, h: u16, mut draw: impl FnMut(&mut Frame)) -> Strin
 /// No screen may emit an SGR colour: each inherits the terminal's palette and
 /// background and is correct under `NO_COLOR` by construction rather than by
 /// remembering to check a flag at each call site (see [`super::draw`]).
-pub(super) fn assert_no_colour(w: u16, h: u16, mut draw: impl FnMut(&mut Frame)) {
-    let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
-    terminal.draw(|f| draw(f)).expect("draw");
-    let buf = terminal.backend().buffer().clone();
+pub(super) fn assert_no_colour(w: u16, h: u16, draw: impl FnMut(&mut Frame)) {
+    let buf = buffer(w, h, draw);
     for y in 0..buf.area.height {
         for x in 0..buf.area.width {
             let cell = &buf[(x, y)];
@@ -116,4 +125,39 @@ pub(super) fn assert_no_borders(lines: &[String]) {
             assert!(!line.contains(ch), "found border char {ch:?} in {line:?}");
         }
     }
+}
+
+/// Left and right padding of a rendered line on a `w`-column screen, for the
+/// horizontal-centring assertions the screens share: byte slack on the left
+/// (only spaces precede the text) and column slack on the right.
+pub(super) fn padding(line: &str, w: usize) -> (usize, usize) {
+    (line.len() - line.trim_start().len(), w - line.width())
+}
+
+/// A picker holding sessions of these names, numbered the way
+/// `transport::finish_listing` would have: these `App`s are built directly, so
+/// nothing else would set the resolved number.
+pub(super) fn picker(names: &[&str]) -> App {
+    App::new(
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let num = i as u32 + 1;
+                let mut s = Session::new(format!("id{i:06}"), n.to_string(), 100 + i as u32, num);
+                s.state.num = num;
+                s
+            })
+            .collect(),
+    )
+}
+
+/// [`picker`], with `query` typed into its filter.
+pub(super) fn filtering(names: &[&str], query: &str) -> App {
+    let mut a = picker(names);
+    a.on_key(Key::Char('/'));
+    for c in query.chars() {
+        a.on_key(Key::Char(c));
+    }
+    a
 }

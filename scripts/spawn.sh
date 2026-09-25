@@ -39,12 +39,6 @@ log="$dir/$id.log"
 # spawned, so a socket is unreachable for as long as it exists whatever mode
 # it is born with -- and the `chmod 600` that follows the socket's appearance.
 
-refuse() {
-  printf 'ERROR %s\n' "$1"
-  finish
-  exit 1
-}
-
 if [ -e "$dir" ] || [ -L "$dir" ]; then
   # An existing directory must be OURS and private. Over ssh this script is the
   # only check there is, and /tmp is world-writable, so another user could have
@@ -57,22 +51,22 @@ if [ -e "$dir" ] || [ -L "$dir" ]; then
   # check that cannot be made fails CLOSED: an empty answer is a refusal, not
   # a pass.
   info=$(ls -ldn "$dir" 2>/dev/null)
-  [ -n "$info" ] || refuse "could not inspect runtime directory $dir"
+  [ -n "$info" ] || fail "could not inspect runtime directory $dir"
   mode=$(printf '%s\n' "$info" | cut -c1-10)
   owner=$(printf '%s\n' "$info" | awk '{print $3}')
   case "$mode" in
     d*) ;;
-    *) refuse "runtime directory $dir is not a directory (or is a symlink)" ;;
+    *) fail "runtime directory $dir is not a directory (or is a symlink)" ;;
   esac
-  [ "$owner" = "$(id -u)" ] || refuse "runtime directory $dir is not owned by us"
+  [ "$owner" = "$(id -u)" ] || fail "runtime directory $dir is not owned by us"
   # Columns 5-10 are the group and other permissions; anything but dashes there
   # is a bit we would never have set.
   case "$(printf '%s\n' "$mode" | cut -c5-10)" in
     ------) ;;
-    *) refuse "runtime directory $dir is accessible to other users" ;;
+    *) fail "runtime directory $dir is accessible to other users" ;;
   esac
 else
-  mkdir -p "$dir" || exit 1
+  mkdir -p "$dir" || fail "could not create runtime directory $dir"
   # Only a directory we just created; tightening someone else's is worse than
   # refusing to use it.
   chmod 700 "$dir" 2>/dev/null || true
@@ -105,14 +99,14 @@ export NVMUX="$sock"
 # entered (a mode of 000, or a component we may not traverse). Both refuse rather
 # than launch somewhere else, which would be far worse than not launching: the
 # session would come up, look right, and be wrong.
-[ -d "$cwd" ] || refuse "$cwd: not a directory"
-cd -- "$cwd" || refuse "$cwd: could not enter it"
+[ -d "$cwd" ] || fail "$cwd: not a directory"
+cd -- "$cwd" || fail "$cwd: could not enter it"
 
 # A command that is not there would otherwise be a five-second wait for a socket
 # that was never going to appear, and a timeout message blaming the session. The
 # shell writes its own "not found" to the log, but only the caller reads that,
 # and only after giving up. `command -v` accepts a path as readily as a name.
-command -v -- "$1" >/dev/null 2>&1 || refuse "$1: not found"
+command -v -- "$1" >/dev/null 2>&1 || fail "$1: not found"
 
 # The redirections below create the log under the caller's mask, so its mode is
 # set here rather than left to that mask. Like the socket it sits in the 0700
@@ -163,7 +157,7 @@ done
 # reused, so an unvalidated one could name an unrelated process.
 pid=''
 if [ -n "$guess" ] && kill -0 "$guess" 2>/dev/null; then
-  if cmdline "$guess" | grep -q -F -- "--listen $sock"; then
+  if owns_socket "$guess" "$sock"; then
     pid=$guess
   fi
 fi

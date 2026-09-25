@@ -3,8 +3,6 @@
 //! Ids are short because socket paths are short — see [`crate::paths`] for the
 //! byte budget.
 
-use crate::error::Result;
-
 /// RFC 4648 base32, lowercased, no padding: unambiguous in a filename, safe in
 /// a shell word without quoting, and never looks like a flag.
 const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
@@ -25,17 +23,13 @@ fn b32_40(bytes: &[u8; 5]) -> String {
 
 /// Eight random base32 characters: forty bits nothing can guess.
 ///
-/// The one source of randomness in the crate. A session id is one of these;
-/// so is the secret a [`crate::proc::Shell`] frames its output with.
+/// The one source of randomness in the crate. A fresh session id is one of
+/// these, and nothing more; so is the secret a [`crate::proc::Shell`] frames
+/// its output with.
 pub fn nonce() -> std::io::Result<String> {
     let mut bytes = [0u8; 5];
     getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
     Ok(b32_40(&bytes))
-}
-
-/// A fresh random session id.
-pub fn new_id() -> Result<String> {
-    Ok(nonce()?)
 }
 
 /// Reject anything that is not a well-formed session id.
@@ -84,7 +78,7 @@ mod tests {
     #[test]
     fn ids_are_eight_chars_from_the_alphabet() {
         for _ in 0..256 {
-            let id = new_id().expect("getrandom");
+            let id = nonce().expect("getrandom");
             assert_eq!(id.len(), 8, "id {id:?} is not 8 chars");
             assert!(
                 id.bytes().all(|b| ALPHABET.contains(&b)),
@@ -95,8 +89,8 @@ mod tests {
 
     #[test]
     fn ids_do_not_obviously_collide() {
-        let ids: std::collections::HashSet<_> = (0..1000).filter_map(|_| new_id().ok()).collect();
-        assert_eq!(ids.len(), 1000, "duplicate ids from new_id()");
+        let ids: std::collections::HashSet<_> = (0..1000).filter_map(|_| nonce().ok()).collect();
+        assert_eq!(ids.len(), 1000, "duplicate ids from nonce()");
     }
 
     #[test]
@@ -110,7 +104,7 @@ mod tests {
     #[test]
     fn generated_ids_are_valid() {
         for _ in 0..256 {
-            assert!(is_valid_id(&new_id().expect("getrandom")));
+            assert!(is_valid_id(&nonce().expect("getrandom")));
         }
         assert!(is_valid_id(&host_token("myhost")));
     }

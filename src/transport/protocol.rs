@@ -44,8 +44,10 @@ pub fn require_terminator(stdout: &str, what: &str) -> Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listed {
     pub id: String,
-    /// The script's cheap `kill -0` hint. A hint only: pids are reused, and a
-    /// live pid says nothing about whether nvim is serving its socket.
+    /// The script's cheap liveness hint: something has the socket bound (per
+    /// `/proc/net/unix`), or a command line is `--listen`ing on it. A hint
+    /// only: it says a process exists, not that nvim is answering on the
+    /// socket, so local sessions are probed over RPC instead.
     pub pid_alive: bool,
     /// Raw `<id>.json` contents, or empty if the file was missing.
     pub json: String,
@@ -121,19 +123,21 @@ pub fn parse_spawn(stdout: &str) -> Result<Spawned> {
     Ok(out)
 }
 
-/// Read the outcome of `renumber.sh`.
+/// Read the outcome of `write_meta.sh` or `renumber.sh`, the two scripts that
+/// write metadata and say nothing but whether they could; `what` names the
+/// one that ran, for the error when it did not complete.
 ///
 /// Shaped like [`parse_spawn`]: the script's own `ERROR` line first, because it
 /// is more specific than "did not complete" and because without it a failed
 /// write reaches the user through `ssh::classify` as a diagnosis of the
 /// connection.
-pub fn parse_renumber(stdout: &str) -> Result<()> {
+pub fn parse_write(stdout: &str, what: &str) -> Result<()> {
     for line in stdout.lines() {
         if let Some(("ERROR", reason)) = line.trim_end_matches('\r').split_once(' ') {
             return Err(script_failed(reason.trim().to_string()));
         }
     }
-    require_terminator(stdout, "renumber")
+    require_terminator(stdout, what)
 }
 
 /// The subdirectories of one directory, as `dirs.sh` listed them.
@@ -471,14 +475,25 @@ mod tests {
     /// `checked_script` hands that to `ssh::classify` — so a full disk would be
     /// reported as a broken connection.
     #[test]
-    fn a_failed_renumber_is_reported_in_the_scripts_own_words() {
-        parse_renumber("NVMUX_END\n").expect("a bare terminator means it ran");
+    fn a_failed_write_is_reported_in_the_scripts_own_words() {
+        parse_write("NVMUX_END\n", "renumber").expect("a bare terminator means it ran");
 
-        let err = parse_renumber("ERROR could not replace metadata for aaaaaaaa\nNVMUX_END\n")
-            .expect_err("a refusal is not a success");
+        let err = parse_write(
+            "ERROR could not replace metadata for aaaaaaaa\nNVMUX_END\n",
+            "renumber",
+        )
+        .expect_err("a refusal is not a success");
         assert_eq!(err.to_string(), "could not replace metadata for aaaaaaaa");
 
-        parse_renumber("").expect_err("no terminator means it never ran");
+        let err = parse_write(
+            "ERROR could not write metadata for aaaaaaaa\nNVMUX_END\n",
+            "metadata write",
+        )
+        .expect_err("a refusal is not a success");
+        assert_eq!(err.to_string(), "could not write metadata for aaaaaaaa");
+
+        let err = parse_write("", "metadata write").expect_err("no terminator means it never ran");
+        assert!(err.to_string().contains("metadata write"), "{err}");
     }
 
     /// The script's own reason beats "did not complete", and survives a pipe

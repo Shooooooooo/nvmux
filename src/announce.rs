@@ -614,29 +614,16 @@ pub fn plain_bytes(over: &Over, fg: Option<Rgb>) -> Vec<u8> {
     placed(over, &sgr)
 }
 
-/// The box for this label on this screen, drawn on its own. The two halves
-/// above, which is all most of the tests here want.
-pub fn overlay_bytes(label: &str, size: PtySize, fg: Option<Rgb>) -> Option<Vec<u8>> {
-    Some(plain_bytes(&overlay(label, size)?, fg))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{big, palette, screen, size};
     use crate::ui::test_support::TINY_SIZES;
 
-    fn size(cols: u16, rows: u16) -> PtySize {
-        PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        }
-    }
-
-    /// A screen with room for the box, which most of these want.
-    fn big() -> PtySize {
-        size(80, 24)
+    /// The box for this label on this screen, drawn on its own: `overlay` and
+    /// `plain_bytes` composed, which is all most of the tests here want.
+    fn overlay_bytes(label: &str, size: PtySize, fg: Option<Rgb>) -> Option<Vec<u8>> {
+        Some(plain_bytes(&overlay(label, size)?, fg))
     }
 
     /// An effect to dissolve with. No palette is ever installed under test, so
@@ -646,26 +633,6 @@ mod tests {
             one_way: Duration::from_millis(100),
             palette: palette(),
         }
-    }
-
-    /// A terminal that said its text is light grey on black.
-    fn palette() -> crate::palette::Palette {
-        crate::palette::Palette {
-            fg: Rgb(200, 200, 200),
-            bg: Rgb(0, 0, 0),
-            ansi: [Rgb(0, 0, 0); 16],
-        }
-    }
-
-    /// A shadow with something on it to dissolve into: every cell an `x`,
-    /// which is in none of the box's glyphs and in no session name these tests
-    /// use, so a frame shows the screen exactly when it has one in it.
-    fn screen() -> Shadow {
-        let mut shadow = Shadow::new(24, 80);
-        for row in 1..=24 {
-            shadow.feed(format!("\x1b[{row};1H{}", "x".repeat(80)).as_bytes());
-        }
-        shadow
     }
 
     /// One row of the overlay: where it was placed, the SGR it was drawn with,
@@ -965,7 +932,7 @@ mod tests {
     #[test]
     fn the_box_arrives_out_of_the_screen_it_is_covering() {
         let t0 = Instant::now();
-        let screen = screen();
+        let screen = screen(24, 80);
         let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
 
         let mut now = t0;
@@ -1002,7 +969,7 @@ mod tests {
     #[test]
     fn the_box_leaves_back_into_the_screen_it_was_covering() {
         let t0 = Instant::now();
-        let screen = screen();
+        let screen = screen(24, 80);
         let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
 
         let mut now = t0;
@@ -1036,7 +1003,7 @@ mod tests {
     #[test]
     fn every_frame_of_the_box_leaves_the_terminal_where_it_found_it() {
         let t0 = Instant::now();
-        let screen = screen();
+        let screen = screen(24, 80);
         let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
         let mut now = t0;
         let mut frames = 0;
@@ -1084,7 +1051,7 @@ mod tests {
     #[test]
     fn the_box_at_rest_is_drawn_plain_even_with_a_screen_to_hand() {
         let t0 = Instant::now();
-        let screen = screen();
+        let screen = screen(24, 80);
         let mut popup = Popup::armed(Some("dotfiles".into()), t0, None).expect("armed");
         let Act::Paint(bytes) = popup.step(t0, quiet(), big(), Some(&screen)) else {
             panic!("the box did not go up");
