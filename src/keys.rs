@@ -1,8 +1,10 @@
 //! The `<prefix>` prefix state machine.
 //!
 //! This sits in the stdin half of the PTY proxy and is the *only* thing that
-//! inspects the byte stream on the way to Neovim; the child-to-terminal
-//! direction is never parsed at all — see [`crate::pty`].
+//! inspects the byte stream on the way to Neovim. The child-to-terminal
+//! direction is never rewritten or acted on — [`crate::pty`] states that
+//! invariant and describes the two watchers ([`crate::shadow`],
+//! [`crate::boundary`]) that read it without changing it.
 //!
 //! Deliberately pure: timing is the caller's job, via [`Prefix::timeout`], so
 //! the machine is unit-testable without a PTY, a terminal or a clock.
@@ -272,7 +274,7 @@ pub fn prefix_label(byte: u8) -> String {
 /// [`crate::keyseq`]: the letter of a `Ctrl-<letter>` control byte, its low
 /// five bits set back into ASCII, so `0x14` is `'t'`; and for `Ctrl-Space`,
 /// whose byte is `NUL`, the space bar's own code.
-pub fn prefix_code(byte: u8) -> u8 {
+fn prefix_code(byte: u8) -> u8 {
     if byte == CTRL_SPACE {
         b' '
     } else {
@@ -381,10 +383,12 @@ impl Prefix {
         }
     }
 
-    /// True if the machine is mid-sequence and a timeout must be armed —
-    /// a lone `<prefix>`, a half-typed number or an unfinished escape
-    /// sequence. [`wait`](Self::wait) says which.
-    pub fn is_armed(&self) -> bool {
+    /// The tests' shorthand for `wait().is_some()`: true while a timeout would
+    /// have to be armed — a lone `<prefix>`, a half-typed number or an
+    /// unfinished escape sequence. The relay itself calls
+    /// [`wait`](Self::wait), which says which.
+    #[cfg(test)]
+    fn is_armed(&self) -> bool {
         self.wait().is_some()
     }
 

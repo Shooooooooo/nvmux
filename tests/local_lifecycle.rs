@@ -705,8 +705,8 @@ fn a_session_busy_in_cpu_bound_lua_is_never_reaped() {
 /// rmpv consumes the stream incrementally, so abandoning a read part-way leaves
 /// the tail of that frame in the socket. Without poisoning, the next call
 /// decodes something well-formed out of it and returns it as the answer to a
-/// different question — which for `dirty_buffer_count` would mean a wrong
-/// unsaved-buffer count in a kill prompt, with no error anywhere.
+/// different question — a leftover `nvim_list_uis` reply read as the answer to
+/// `nvim_get_mode`, say, with no error anywhere.
 #[test]
 fn a_timed_out_call_poisons_the_connection() {
     require_nvim!();
@@ -942,12 +942,8 @@ fn metadata_left_by_a_self_terminating_session_is_swept_up() {
     let mut client = nvmux::rpc::Client::connect(&sock, Duration::from_secs(2)).expect("connect");
     let _ = client.command("qa!");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && sock.exists() {
-        std::thread::sleep(Duration::from_millis(20));
-    }
     assert!(
-        !sock.exists(),
+        common::wait_until(Duration::from_secs(5), || !sock.exists()),
         "precondition: a clean exit unlinks the socket"
     );
     assert!(json.exists(), "precondition: it leaves the metadata behind");

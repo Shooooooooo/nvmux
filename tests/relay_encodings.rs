@@ -44,6 +44,12 @@ const CHILD_ID: &str = "NVMUX_TEST_RELAY_ID";
 /// handed to the child rather than asked for.
 const CHILD_PALETTE: &str = "NVMUX_TEST_RELAY_PALETTE";
 
+/// The rows and columns of the pty every [`Terminal`] opens. Named because the
+/// hint bar's whole geometry is "the last row", and a test that asks what is on
+/// it has to agree with the child about which row that is.
+const ROWS: u16 = 40;
+const COLS: u16 = 120;
+
 /// The client's kitty keyboard query and DA1, and the terminal's answers. The
 /// kitty reply says "supported, no flags set yet"; the DA1 reply is a
 /// VT220's. A terminal without the kitty protocol answers only the DA1, and
@@ -143,8 +149,8 @@ impl Terminal {
     fn spawn_with(sock: &Path, id: &str, protocol: Protocol, shadow: bool) -> Self {
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize {
-                rows: 40,
-                cols: 120,
+                rows: ROWS,
+                cols: COLS,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -405,12 +411,6 @@ fn the_push_is_matched_by_shape() {
     assert_eq!(kitty_push_flags(b"\x1b[?0u\x1b[>4;2m\x1b[<u"), None);
     assert_eq!(kitty_push_flags(b"\x1b[>"), None);
 }
-
-/// The rows and columns of the pty every [`Terminal`] opens. Named because the
-/// hint bar's whole geometry is "the last row", and a test that asks what is on
-/// it has to agree with the child about which row that is.
-const ROWS: u16 = 40;
-const COLS: u16 = 120;
 
 /// One row of the screen the child's output describes, as a terminal would show
 /// it.

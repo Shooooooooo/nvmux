@@ -115,9 +115,10 @@ nvmux                                    nvim --headless --listen <sock>
 ```
 
 When that master goes — the laptop slept, the Wi-Fi changed — the sessions on
-the far side never notice, and nvmux brings the link back on its own: six
-attempts over about a minute, then the picker with the reason and `Enter` to
-retry by hand.
+the far side never notice, and nvmux brings the link back on its own: one try
+at once and then six retries over about a minute. If the host is still
+unreachable after that, nvmux exits with the reason and a reminder that the
+session is still running; `nvmux <host>` picks it up again.
 
 ## Configuration
 
