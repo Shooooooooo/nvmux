@@ -120,7 +120,9 @@ impl Drop for Scratch {
         // stray nvim processes survive the run and pile up across runs.
         //
         // Signal the recorded pids directly rather than with `pkill`: the pid
-        // in `<id>.json` was validated against its socket at spawn time.
+        // in `<id>.json` was validated against its socket at spawn time. That
+        // leaves a live session with no `<id>.json` out of reach, so a test
+        // that makes one has to kill it itself.
         if let Ok(entries) = std::fs::read_dir(&self.0) {
             for e in entries.flatten() {
                 let p = e.path();
