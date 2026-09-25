@@ -385,8 +385,8 @@ pub(crate) fn kill(h: &impl Host, s: &Session) -> Result<()> {
     Ok(())
 }
 
-// --- behind the bodies above; plan_rename and claim_shell are also called by
-// --- the transports directly ----------------------------------------------
+// --- behind list/create/kill above; the transports also call plan_rename and
+// --- claim_shell directly ---------------------------------------------------
 
 /// Take a transport's shell slot for one script run.
 ///

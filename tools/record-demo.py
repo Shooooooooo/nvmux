@@ -487,8 +487,8 @@ def make_sessions(env):
         term.expect("new session name", "the create prompt")
         term.type(name, wait=0.5)
         term.write(ENTER, wait=4.0)                  # creates, then attaches
-        term.write(PREFIX + b" ", wait=2.0)          # one write: the chord must
-        term.expect("attach", "the picker after %s" % name)   # land inside keys.timeout_ms
+        term.write(PREFIX + b" ", wait=2.0)          # one write, so the chord
+        term.expect("attach", "the picker after %s" % name)   # fits keys.timeout_ms
         print("  created %s" % name)
     term.write(b"q", wait=1.0)
     term.close()
