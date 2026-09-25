@@ -164,10 +164,13 @@ impl Screen {
             terminal: ratatui::try_init()?,
             closed: false,
         };
-        // A second "enter alternate screen" is a no-op on xterm and kitty, and
-        // ratatui's first draw only paints what differs from an empty buffer —
-        // so without this the content lands in the middle of the editor's last
-        // frame. From here on an error restores through `Drop`.
+        // ratatui's first draw only paints what differs from an empty buffer,
+        // so anything the terminal still shows — an alternate screen it did not
+        // clear on the way in — would stay wherever the screen draws nothing.
+        // Not a held client's: a relay that stops with its client held leaves
+        // the client's alternate screen before any screen opens (see
+        // `pty::relay`), because entering a second is not harmless everywhere.
+        // From here on an error restores through `Drop`.
         screen.terminal.clear()?;
         if mouse {
             crate::term::enable_mouse();

@@ -384,8 +384,15 @@ pub(crate) const HANDOVER: &[u8] = b"\x1b[?2026l\x1b[0m\x1b[?1049l\x1b[2J\x1b[H"
 /// far side of a spawn (two RPC round trips and a whole new `nvim` process) the
 /// old session is what the user watches for the length of the switch. The
 /// callers are therefore the picker and the prompt as they give the terminal
-/// back, `<prefix> <number>` as it leaves one relay for the next, and
-/// [`crate::pty::relay`] as the backstop for a path that did neither.
+/// back, [`crate::pty::relay`] as it stops with the client held, and the relay
+/// again as the backstop for a path that did neither.
+///
+/// The relay stopping with the client held writes it on the way to a screen
+/// too, not only on the way to the next relay: a screen enters the alternate
+/// screen as it opens, and must find the terminal off it. On Windows Terminal a
+/// second `?1049h` builds an alternate screen the size of the main one, and a
+/// resize made under an alternate screen leaves the main one as it was (see
+/// [`crate::pty::relay`]).
 ///
 /// A client that is *resumed* rather than spawned needs the opposite —
 /// [`enter_alt_screen_and_clear`] — and the relay is what tells the two apart.
@@ -401,10 +408,12 @@ pub fn leave_alt_screen_and_clear() {
 /// then `?1049h` to re-enter the alternate screen, then clear + home.
 ///
 /// The same order as [`HANDOVER`], for the same reasons, with the one switch
-/// pointing the other way. `?1049h` on a terminal already in the alternate
-/// screen is a no-op on xterm and kitty (which is what the picker relies on to
-/// open over a client's frame), so the erase is explicit rather than left to
-/// the switch. No `\e[22;0;0t` beside it: the client's own `smcup` pushed the
+/// pointing the other way. The erase is explicit rather than left to the
+/// switch, for a terminal whose switch does not clear. It always finds the
+/// terminal on its main screen — every screen closes by leaving the alternate
+/// one, and so does every relay that stops with its client held — so the
+/// switch is never a second `?1049h` (see [`leave_alt_screen_and_clear`]).
+/// No `\e[22;0;0t` beside it: the client's own `smcup` pushed the
 /// title once, its `rmcup` will pop it once, and a second push here would leave
 /// the stack one deep.
 pub(crate) const RESUME: &[u8] = b"\x1b[?2026l\x1b[0m\x1b[?1049h\x1b[2J\x1b[H";

@@ -17,17 +17,25 @@
 //! test does, waits for the client to turn the protocol on, and types.
 //! Skipped without a usable `nvim`, like the other suites.
 //!
-//! One test here is not about a spelling at all. The hint bar the prefix puts up
-//! ([`nvmux::hint`]) is written over a live editor's last row and taken off it
-//! again, and neither half can be shown to work anywhere but here: it needs a
+//! Two tests here are not about a spelling at all. The hint bar the prefix puts
+//! up ([`nvmux::hint`]) is written over a live editor's last row and taken off
+//! it again, and neither half can be shown to work anywhere but here: it needs a
 //! real client painting a real screen to cover, and the shadow's copy of that
 //! screen to put back.
+//!
+//! And the picker, opened by `<prefix> Space` over a session the window was
+//! resized under, has to land on a screen the size of the window. Whether it
+//! does is up to the terminal as much as to nvmux — Windows Terminal sizes a
+//! second alternate screen by its main screen, which a resize under the first
+//! leaves as it was (see [`WindowsTerminal`]) — so this is the one place it can
+//! be seen: a real client, the real relay, the real picker, and a terminal that
+//! does what that one does.
 
 #[macro_use]
 mod common;
 
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -43,6 +51,9 @@ const CHILD_ID: &str = "NVMUX_TEST_RELAY_ID";
 /// and the fade on, and nothing here queries a real terminal, so the colours are
 /// handed to the child rather than asked for.
 const CHILD_PALETTE: &str = "NVMUX_TEST_RELAY_PALETTE";
+/// Set on a child that goes on from `<prefix> Space` to the picker rather than
+/// ending there, to the runtime directory the picker lists its sessions from.
+const CHILD_PICKER: &str = "NVMUX_TEST_RELAY_PICKER";
 
 /// The rows and columns of the pty every [`Terminal`] opens. Named because the
 /// hint bar's whole geometry is "the last row", and a test that asks what is on
@@ -58,6 +69,11 @@ const KITTY_QUERY: &[u8] = b"\x1b[?u";
 const KITTY_REPLY: &[u8] = b"\x1b[?0u";
 const DA1: &[u8] = b"\x1b[c";
 const DA1_REPLY: &[u8] = b"\x1b[?62;22c";
+/// The cursor position report ratatui asks for as a screen opens, and an
+/// answer. Where the cursor is does not matter to any test here; that the
+/// question is answered does, or the screen gives up on its terminal.
+const CPR: &[u8] = b"\x1b[6n";
+const CPR_REPLY: &[u8] = b"\x1b[1;1R";
 /// What the client sends to turn `modifyOtherKeys` on.
 const XTERM_PUSH: &[u8] = b"\x1b[>4;2m";
 
@@ -93,22 +109,49 @@ fn relay_child() {
         }));
     }
 
+    let picker = std::env::var_os(CHILD_PICKER).map(PathBuf::from);
+
     // An empty notice announces nothing: these tests are about the prefix
     // reaching the machine, and a box drawn over the screen would be noise in
     // the stream the parent is reading.
     let attachment = nvmux::pty::spawn(&id, Path::new(&sock), "").expect("attach");
-    let code = match nvmux::pty::relay(attachment, 0, &mut |_| {}) {
-        Ok((nvmux::pty::Outcome::Detached, _)) => 0,
-        Ok((other, _)) => {
+    let code = match (nvmux::pty::relay(attachment, 0, &mut |_| {}), picker) {
+        (Ok((nvmux::pty::Outcome::Detached, _)), _) => 0,
+        (Ok((nvmux::pty::Outcome::ToPicker, Some(held))), Some(dir)) => {
+            open_the_picker(held, &id, dir)
+        }
+        (Ok((other, _)), _) => {
             eprintln!("relay ended with {other:?}");
             3
         }
-        Err(e) => {
+        (Err(e), _) => {
             eprintln!("relay failed: {e}");
             4
         }
     };
     std::process::exit(code);
+}
+
+/// The rest of a child told to go on to the picker: open it over the session
+/// the relay left, the way `session_loop` does, and say through the exit code
+/// how it ended. A quit is the one way out a test asks for.
+fn open_the_picker(held: nvmux::pty::Attachment, id: &str, dir: PathBuf) -> i32 {
+    let transport =
+        nvmux::transport::local::LocalTransport::with_dir(dir).expect("build transport");
+    let code = match nvmux::ui::run(&transport, None, Some(id), true) {
+        Ok(nvmux::ui::Outcome::Quit) => 0,
+        Ok(other) => {
+            eprintln!("the picker ended with {other:?}");
+            5
+        }
+        Err(e) => {
+            eprintln!("the picker failed: {e}");
+            6
+        }
+    };
+    // Retired as `session_loop` retires a held client on a quit.
+    held.terminate();
+    code
 }
 
 /// Which keyboard protocol the fake terminal admits to.
@@ -132,21 +175,33 @@ struct Terminal {
     output: Vec<u8>,
     /// How far `output` has been scanned for queries.
     answered: usize,
+    /// Every [`Terminal::resize`], as how much of `output` had arrived when it
+    /// happened and the rows and columns it left — so a replay can put each one
+    /// back at its place in the stream.
+    resizes: Vec<(usize, u16, u16)>,
     incoming: mpsc::Receiver<Vec<u8>>,
-    // Held so the pty outlives the child; dropped last.
-    _master: Box<dyn portable_pty::MasterPty>,
+    // Held so the pty outlives the child, and resized through; dropped last.
+    master: Box<dyn portable_pty::MasterPty>,
 }
 
 impl Terminal {
     /// Re-run this test binary as `relay_child` on a fresh pty, with no palette
     /// and so no fade — what every test about a spelling wants.
     fn spawn(sock: &Path, id: &str, protocol: Protocol) -> Self {
-        Self::spawn_with(sock, id, protocol, false)
+        Self::spawn_with(sock, id, protocol, false, None)
     }
 
     /// [`Terminal::spawn`], with `shadow` asking the child for the palette that
-    /// gives it a shadow of the session's screen (see [`CHILD_PALETTE`]).
-    fn spawn_with(sock: &Path, id: &str, protocol: Protocol, shadow: bool) -> Self {
+    /// gives it a shadow of the session's screen (see [`CHILD_PALETTE`]), and
+    /// `picker` the runtime directory of a child that goes on to the picker
+    /// (see [`CHILD_PICKER`]).
+    fn spawn_with(
+        sock: &Path,
+        id: &str,
+        protocol: Protocol,
+        shadow: bool,
+        picker: Option<&Path>,
+    ) -> Self {
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize {
                 rows: ROWS,
@@ -174,6 +229,9 @@ impl Terminal {
         cmd.env_remove("NO_COLOR");
         if shadow {
             cmd.env(CHILD_PALETTE, "1");
+        }
+        if let Some(dir) = picker {
+            cmd.env(CHILD_PICKER, dir);
         }
         let child = pair.slave.spawn_command(cmd).expect("spawn relay child");
         // Or the master would never see EOF once the child exits.
@@ -203,8 +261,41 @@ impl Terminal {
             writer,
             output: Vec::new(),
             answered: 0,
+            resizes: Vec::new(),
             incoming,
-            _master: pair.master,
+            master: pair.master,
+        }
+    }
+
+    /// The window changing size under the child, as a user maximising it
+    /// would: the pty is resized, and the child told so by the kernel.
+    ///
+    /// Where in the stream it happened is noted as whatever has arrived by
+    /// now, so the caller should [`Terminal::settle`] first — a byte still in
+    /// flight would otherwise be replayed as if written after it.
+    fn resize(&mut self, rows: u16, cols: u16) {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("resize the pty");
+        self.resizes.push((self.output.len(), rows, cols));
+    }
+
+    /// Relay output, answering queries, until the child has written nothing
+    /// for `quiet` — or for at most `within`, as a bound on a child that never
+    /// stops.
+    fn settle(&mut self, quiet: Duration, within: Duration) {
+        let deadline = Instant::now() + within;
+        loop {
+            let before = self.output.len();
+            self.pump_until(quiet, |_| false);
+            if self.output.len() == before || Instant::now() >= deadline {
+                return;
+            }
         }
     }
 
@@ -238,7 +329,11 @@ impl Terminal {
     fn answer(&mut self) {
         let from = self.answered.saturating_sub(8);
         let mut replies = Vec::new();
-        for (query, reply) in [(KITTY_QUERY, KITTY_REPLY), (DA1, DA1_REPLY)] {
+        for (query, reply) in [
+            (KITTY_QUERY, KITTY_REPLY),
+            (DA1, DA1_REPLY),
+            (CPR, CPR_REPLY),
+        ] {
             if query == KITTY_QUERY && self.protocol == Protocol::Xterm {
                 continue;
             }
@@ -457,7 +552,7 @@ fn the_hint_row_goes_up_and_comes_down(tag: &str, shadow: bool) {
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket path");
 
-    let mut term = Terminal::spawn_with(&sock, &session.id, Protocol::Kitty, shadow);
+    let mut term = Terminal::spawn_with(&sock, &session.id, Protocol::Kitty, shadow, None);
 
     // The client is up and painting once it has turned the protocol on.
     assert!(
@@ -535,4 +630,205 @@ fn a_prefix_raises_the_hint_row_and_the_next_key_takes_it_off() {
 #[test]
 fn the_hint_row_comes_down_through_the_server_without_a_shadow() {
     the_hint_row_goes_up_and_comes_down("hint-no-shadow", false);
+}
+
+/// The rows and columns the window grows to under the session, in the test
+/// about the picker. Wide enough that the picker's hint row, centred in it,
+/// runs one column past the edge of a screen still [`COLS`] wide — its `t` of
+/// `q quit`, which is where it broke in the photographs the report came with.
+const GROWN_ROWS: u16 = 50;
+const GROWN_COLS: u16 = 173;
+
+const ENTER_ALT: &[u8] = b"\x1b[?1049h";
+const LEAVE_ALT: &[u8] = b"\x1b[?1049l";
+
+/// The screen the child's output makes in Windows Terminal — as far as the
+/// sizes of its two screens go, which is where it parts from `vt100`.
+///
+/// Two things, both read off its source (`TerminalCore`: `UserResize`,
+/// `UseAlternateScreenBuffer`). A resize while the alternate screen is up
+/// resizes only that one, and puts the main screen's off until the main screen
+/// is shown again. And `?1049h` builds a *new* alternate screen whenever it
+/// arrives, whether or not one is already up, at the size of the main screen.
+///
+/// Between them, a terminal resized under an alternate screen and then asked
+/// for one again gets one the size the window used to be, while the window
+/// goes on showing all of itself. Everything drawn
+/// for the size the pty reports is cut down to the old one: rows past its last
+/// are drawn on its last, and a row that runs past its last column wraps —
+/// which on its last row scrolls the whole screen up a line.
+struct WindowsTerminal {
+    main: vt100::Parser,
+    alt: Option<vt100::Parser>,
+    /// The window's size: what the pty says, and what the main screen becomes
+    /// when it is next shown.
+    window: (u16, u16),
+}
+
+impl WindowsTerminal {
+    /// Everything `term` has received, replayed from the first byte, with each
+    /// of its resizes put back where it happened.
+    fn replay(term: &Terminal) -> Self {
+        let mut wt = Self {
+            main: vt100::Parser::new(ROWS, COLS, 0),
+            alt: None,
+            window: (ROWS, COLS),
+        };
+        let mut from = 0;
+        for &(at, rows, cols) in &term.resizes {
+            wt.process(&term.output[from..at]);
+            wt.resize(rows, cols);
+            from = at;
+        }
+        wt.process(&term.output[from..]);
+        wt
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        self.window = (rows, cols);
+        match &mut self.alt {
+            Some(alt) => alt.screen_mut().set_size(rows, cols),
+            None => self.main.screen_mut().set_size(rows, cols),
+        }
+    }
+
+    /// `bytes`, with the two switches taken out and done here rather than by
+    /// `vt100`, whose own alternate screen is always its main screen's size.
+    fn process(&mut self, mut bytes: &[u8]) {
+        loop {
+            let next = [ENTER_ALT, LEAVE_ALT]
+                .into_iter()
+                .filter_map(|switch| find(bytes, switch).map(|at| (at, switch)))
+                .min_by_key(|&(at, _)| at);
+            let Some((at, switch)) = next else {
+                self.shown().process(bytes);
+                return;
+            };
+            self.shown().process(&bytes[..at]);
+            if switch == ENTER_ALT {
+                let (rows, cols) = self.main.screen().size();
+                self.alt = Some(vt100::Parser::new(rows, cols, 0));
+            } else {
+                self.alt = None;
+                let (rows, cols) = self.window;
+                self.main.screen_mut().set_size(rows, cols);
+            }
+            bytes = &bytes[at + switch.len()..];
+        }
+    }
+
+    fn shown(&mut self) -> &mut vt100::Parser {
+        self.alt.as_mut().unwrap_or(&mut self.main)
+    }
+
+    /// Every row of the window as it shows: the screen that is up, and nothing
+    /// past its edges where it is smaller than the window.
+    fn rows(&self) -> Vec<String> {
+        let screen = self.alt.as_ref().unwrap_or(&self.main).screen();
+        (0..self.window.0)
+            .map(|row| {
+                (0..self.window.1)
+                    .map(|col| match screen.cell(row, col) {
+                        Some(cell) if cell.has_contents() => cell.contents(),
+                        _ => " ",
+                    })
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+}
+
+/// The report: a window resized while a session was up — maximised, in the
+/// photographs — and then `<prefix> Space`, and the picker came up in the top
+/// left of the window at the size it used to be, a copy of its hint row one
+/// line higher for every frame of its fade in, and the `t` of `q quit` wrapped
+/// onto column 0 of the line below each.
+///
+/// The picker has to fill the window it is drawn for: its hint row on the
+/// window's last row, once, and the session named once.
+#[test]
+fn the_picker_fills_a_window_resized_under_the_session_it_opens_over() {
+    require_nvim!();
+    let scratch = Scratch::new("grown");
+    let t = scratch.transport();
+    let name = common::unique("grown");
+    let session = t
+        .create_session(&name, &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+
+    // With the palette, so the fade is on: every frame of the picker's fade in
+    // is drawn in full, which is what turned one misplaced row into a smear.
+    let mut term = Terminal::spawn_with(
+        &sock,
+        &session.id,
+        Protocol::Kitty,
+        true,
+        Some(scratch.0.as_path()),
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| {
+            kitty_push_flags(out).is_some()
+        }),
+        "the client never started; got: {}",
+        term.since(0)
+    );
+    let quiet = Duration::from_millis(300);
+    term.settle(quiet, Duration::from_secs(5));
+
+    // The window grows under the session, and the client repaints to fit it.
+    term.resize(GROWN_ROWS, GROWN_COLS);
+    term.settle(quiet, Duration::from_secs(5));
+
+    let mark = term.output.len();
+    term.type_bytes(&[nvmux::keys::PREFIX]);
+    term.pump_until(Duration::from_millis(150), |_| false);
+    term.type_bytes(b" ");
+    // `quit` rather than `q quit`: the picker's hint row is drawn a word at a
+    // time, with a colour or a cursor move between each, and only its own row
+    // says `quit` — the prefix's bar says `detach`.
+    assert!(
+        term.pump_until(Duration::from_secs(10), |out| {
+            find(&out[mark..], b"quit").is_some()
+        }),
+        "no picker after <prefix> Space; the child wrote: {}",
+        term.since(mark)
+    );
+    // The rest of the fade in, which is a tenth of a second at the defaults:
+    // not a settle, since an idle picker never goes quiet — it hides the
+    // cursor again at every tick. Its first frame is already enough to be
+    // wrong in; the rest is what makes a wrong one look like the report.
+    term.pump_until(Duration::from_millis(500), |_| false);
+
+    let rows = WindowsTerminal::replay(&term).rows();
+    let screen = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| format!("{i:>3}|{row}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let hints: Vec<usize> = (0..rows.len())
+        .filter(|&i| rows[i].contains("↑↓ move"))
+        .collect();
+    assert_eq!(
+        hints,
+        [usize::from(GROWN_ROWS) - 1],
+        "the picker's hint row belongs on the window's last row, once:\n{screen}"
+    );
+    assert!(
+        rows[usize::from(GROWN_ROWS) - 1].ends_with("q quit"),
+        "the hint row lost its end:\n{screen}"
+    );
+    let named = rows.iter().filter(|row| row.contains(&name)).count();
+    assert_eq!(named, 1, "the session is listed once:\n{screen}");
+
+    term.type_bytes(b"q");
+    assert_eq!(
+        term.exit_code(Duration::from_secs(10)),
+        Some(0),
+        "the picker did not quit; the child wrote: {}",
+        term.since(mark)
+    );
 }

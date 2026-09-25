@@ -122,16 +122,6 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// Whether this leads from one relay straight into the next, with no
-    /// [`crate::ui`] screen in between to clear the outgoing frame on the way.
-    ///
-    /// Only a switch does — by number or by step. `ToPicker`, `CreateNew` and
-    /// `ShowHelp` all open a screen, and a screen clears as it opens; the rest
-    /// end the relay for good.
-    fn leads_straight_into_another_relay(self) -> bool {
-        matches!(self, Outcome::Switch(_))
-    }
-
     /// The session this outcome names, for the caller that starts the next
     /// attachment while the outgoing one dissolves (see [`relay`]). `None` for
     /// every other way a relay can end: the three that open a screen have
@@ -1590,17 +1580,36 @@ pub fn relay(
                 }
             }
             raw.restore();
-            // Clear here rather than leaving it to the next `relay`, which runs
-            // on the far side of the client spawn: what is on the terminal until
-            // then is the session being switched away from. Harmless when the
-            // number names nothing — the same client is resumed, and a resume
-            // forces a repaint.
+            // Off the client's alternate screen, and cleared, whichever way
+            // this goes on: every way on from here enters an alternate screen
+            // of its own, and the terminal has to be off one when it does.
+            //
+            // A screen — the picker, the prompt, the help — enters one as it
+            // opens, and a second `?1049h` is not harmless everywhere. Windows
+            // Terminal builds a fresh alternate screen on every one, at the
+            // size of its *main* screen, and a window resized while an
+            // alternate screen was up has had the main screen's resize put off
+            // until the main screen is shown again. So a picker opened over a
+            // session the window had been resized under came up the size the
+            // window used to be: its hint row, drawn for the real last row,
+            // landed on that screen's last row, and where it ran past that
+            // screen's right edge it wrapped — which, on the last row, scrolled
+            // the whole screen up a line for every frame of the fade in.
+            // Leaving first shows the main screen, which takes the size it was
+            // owed, and the screen's own entry is then sized from that.
+            //
+            // A switch goes on to the next relay with no screen in between, and
+            // needs the clear here rather than in the relay it leads to, which
+            // runs on the far side of the client spawn: what is on the terminal
+            // until then is the session being switched away from. Harmless
+            // when the number names nothing — the same client is resumed, and
+            // a resume forces a repaint.
+            //
             // Not shown to the shadow, for the reason the resume's erase is
-            // not: a switch that names this same session resumes it, and the
-            // screen it had is what dissolves back in.
-            if held.leads_straight_into_another_relay() {
-                term::leave_alt_screen_and_clear();
-            }
+            // not: a switch that names this same session resumes it, as does
+            // `Esc` from any of the screens, and the screen it had is what
+            // dissolves back in.
+            term::leave_alt_screen_and_clear();
             Ok((held, Some(attachment)))
         }
         Ok(Outcome::ChildExited) => {
@@ -2997,31 +3006,6 @@ mod tests {
                 other.switch_target(),
                 None,
                 "{other:?} has no session to begin an attachment for"
-            );
-        }
-    }
-
-    /// Exactly one outcome reaches the next session without a screen on the
-    /// way, and it is the one that has to clear for itself. Getting this wrong
-    /// in either direction is invisible in a test that only checks the
-    /// outcomes: too narrow leaves the old session on screen through the
-    /// spawn, too wide clears a screen that is about to draw anyway.
-    #[test]
-    fn only_a_switch_reaches_the_next_session_without_a_screen() {
-        for target in [Target::Number(3), Target::Step(Direction::Next)] {
-            assert!(Outcome::Switch(target).leads_straight_into_another_relay());
-        }
-        for other in [
-            Outcome::ToPicker,
-            Outcome::CreateNew,
-            Outcome::ShowHelp,
-            Outcome::Detached,
-            Outcome::ChildExited,
-            Outcome::StdinClosed,
-        ] {
-            assert!(
-                !other.leads_straight_into_another_relay(),
-                "{other:?} either opens a screen or ends the relay"
             );
         }
     }
