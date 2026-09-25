@@ -85,7 +85,7 @@ fn resolve_state_path(
 fn path() -> Option<PathBuf> {
     let nvmux_state = std::env::var_os("NVMUX_STATE");
     let xdg = std::env::var_os("XDG_STATE_HOME");
-    let home = std::env::var_os("HOME");
+    let home = crate::config::home();
     resolve_state_path(nvmux_state.as_deref(), xdg.as_deref(), home.as_deref())
 }
 

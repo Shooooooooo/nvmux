@@ -9,7 +9,8 @@
 //! saying which one you landed in ([`announce`]), and a way back into the
 //! session you were in when the link to its host drops ([`reconnect`]).
 //!
-//! macOS and Linux only.
+//! macOS and Linux, and Windows as a client of sessions on a remote host
+//! (see `docs/windows.md`): what differs by platform is under [`sys`].
 
 // The docs link private items on purpose — they are written for whoever reads
 // the source, and resolve under `cargo doc --document-private-items`.
@@ -45,9 +46,11 @@ pub mod shadow;
 pub mod shell;
 pub mod ssh;
 pub mod state;
+pub mod sys;
 pub mod term;
 pub mod transport;
 pub mod ui;
+#[cfg(unix)]
 pub mod winch;
 
 #[cfg(test)]

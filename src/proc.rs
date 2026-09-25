@@ -62,9 +62,9 @@ use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use crate::error::{NvmuxError, Result};
-#[cfg(unix)]
-use crate::pty::{pollfd, ready};
 use crate::shell;
+#[cfg(unix)]
+use crate::sys::unix::{pollfd, ready};
 
 /// What a script run produced.
 #[derive(Debug, Clone)]

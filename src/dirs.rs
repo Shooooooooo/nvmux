@@ -243,6 +243,7 @@ mod tests {
         assert_eq!(split("/home/you/my pro"), Some(("/home/you", "my pro")));
     }
 
+    #[cfg(unix)]
     fn local() -> Lister {
         Lister::new(DirSource::Local)
     }
@@ -250,6 +251,7 @@ mod tests {
     /// The local arm runs the same script the remote one does, so this is also
     /// the test that the script's contract holds as embedded rather than as it
     /// sits in the checkout.
+    #[cfg(unix)]
     #[test]
     fn the_local_source_lists_every_child_including_the_dotted_ones() {
         let root = crate::test_support::scratch_path("dirs-listing");
@@ -285,6 +287,7 @@ mod tests {
     /// Names a shell would otherwise split on or treat as a pattern. Each one
     /// is a real directory somebody could have, and each would be a different
     /// bug in the framing between the host and here.
+    #[cfg(unix)]
     #[test]
     fn odd_directory_names_survive_the_listing() {
         let root = crate::test_support::scratch_path("dirs-odd");
@@ -306,6 +309,7 @@ mod tests {
     /// One shell answers every question — that is the point of keeping one —
     /// and a question after the shell has died gets a fresh one rather than an
     /// error for the rest of the prompt's life.
+    #[cfg(unix)]
     #[test]
     fn one_shell_serves_every_question_and_a_dead_one_is_replaced() {
         let root = crate::test_support::scratch_path("dirs-oneshell");

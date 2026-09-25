@@ -15,7 +15,7 @@ of rendering happens on your own terminal.
 Make a session, type in it, detach, come back: the editor, its buffers and its
 undo history are where you left them.
 
-[Why not tmux?](#why-not-tmux) · [Requirements](#requirements) · [Install](#install) · [Use](#use) · [How it works](#how-it-works) · [Configuration](#configuration)
+[Why not tmux?](#why-not-tmux) · [Requirements](#requirements) · [Install](#install) · [Use](#use) · [How it works](#how-it-works) · [Configuration](#configuration) · [Windows](#windows)
 
 ## Why not tmux?
 
@@ -38,6 +38,10 @@ which is why it can hand Neovim your terminal rather than an imitation of one.
 0.11 specifically, on both ends: that is the release where `:detach` and
 `:connect` landed.
 
+Local is macOS or Linux — or, experimentally, Windows, for sessions on a host
+you reach with `ssh`: see [Windows](#windows). Remote is any host with a POSIX
+`sh`.
+
 ## Install
 
 ```sh
@@ -56,7 +60,7 @@ install -m 755 target/release/nvmux ~/.local/bin/
 Two invocations, and no subcommands:
 
 ```sh
-nvmux            # sessions on this machine
+nvmux            # sessions on this machine (macOS and Linux)
 nvmux myhost     # sessions on myhost
 ```
 
@@ -120,6 +124,14 @@ at once and then six retries over about a minute. If the host is still
 unreachable after that, nvmux exits with the reason and a reminder that the
 session is still running; `nvmux <host>` picks it up again.
 
+Where ssh cannot multiplex — the OpenSSH that ships with Windows — or a host
+refuses unix-socket forwards, `[ssh] transport = "relay"` reaches the host
+another way: one plain `ssh` connection, multiplexed by nvmux itself, with a
+small relay at the far end that runs under the host's own Neovim and needs
+nothing installed. Each session is then served locally by nvmux rather than
+forwarded by ssh; everything else is the same. See
+[docs/windows.md](docs/windows.md#one-plain-ssh-connection-with-a-relay-at-the-far-end).
+
 ### One client per session
 
 By default nvmux runs one `--remote-ui` client at a time: a switch retires it
@@ -148,8 +160,9 @@ until nvmux exits:
 ## Configuration
 
 nvmux needs no configuration. An optional TOML file — `$NVMUX_CONFIG` if set,
-else `$XDG_CONFIG_HOME/nvmux/config.toml`, else `~/.config/nvmux/config.toml` —
-overrides the defaults below; an unknown key or a bad value is a startup error.
+else `$XDG_CONFIG_HOME/nvmux/config.toml`, else `~/.config/nvmux/config.toml`
+(on Windows, `~` is `%USERPROFILE%` unless `$HOME` is set) — overrides the
+defaults below; an unknown key or a bad value is a startup error.
 
 <details>
 <summary>Every setting, at its default</summary>
@@ -170,6 +183,23 @@ enabled     = true   # dissolve between screens; NO_COLOR forces this off
 duration_ms = 200    # the whole dissolve, out and back; the notice pays it too
 session     = true   # Neovim's own screen dissolves too, and backs the notice
 excursions  = true   # so do the <prefix> ? and <prefix> c screens
+
+[ssh]
+transport = "control-master"   # or "relay"; see "How it works". Windows: "relay"
 ```
 
 </details>
+
+## Windows
+
+`nvmux <host>` builds and runs on Windows, as the local end of sessions on a
+Linux or macOS host: through the `ssh` that ships with Windows, over the relay
+transport, with each session's endpoint a named pipe and Neovim's client on a
+pseudoconsole. It is **experimental**: the transport has been tested end to
+end from a Windows build running under Wine, and the terminal side has not yet
+been run on a real Windows machine.
+Sessions on the Windows machine itself (`nvmux` with no host) are not
+supported, and the fade is off there.
+
+[docs/windows.md](docs/windows.md) has what works, how it is built, what has
+been verified, and the known limitations.

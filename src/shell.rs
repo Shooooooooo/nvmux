@@ -135,7 +135,7 @@ const RELAY_SLOT: &str = "@RELAY@\n";
 
 /// The line that ends that here-document. The relay's source must not contain
 /// it, or the rest of the source would run as shell — a test holds it to that.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 const RELAY_END: &str = "\nNVMUX_RELAY_EOF\n";
 
 /// The script that starts the relay on a host, in place of the shell it is
@@ -163,7 +163,7 @@ pub fn relay_hash() -> String {
 }
 
 /// Every script, for the tests that check all of them the same way.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 const SCRIPTS: &[(&str, &str)] = &[
     ("list.sh", LIST_SCRIPT),
     ("dirs.sh", DIRS_SCRIPT),
@@ -175,7 +175,9 @@ const SCRIPTS: &[(&str, &str)] = &[
     ("boot.sh", BOOT_TEMPLATE),
 ];
 
-#[cfg(test)]
+// The scripts run under the session host's `sh`, and these run them under this
+// machine's: Unix only, which is also the only kind of host a session is on.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::proc::Output;

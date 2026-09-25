@@ -4,6 +4,7 @@
 //! [`crate::ui::test_support`].
 
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use crate::palette::{Palette, Rgb};
@@ -41,6 +42,7 @@ pub(crate) fn scratch_sock(tag: &str) -> PathBuf {
 /// Whether there is an `nvim` on `$PATH` for a test that needs a real one. A
 /// test without one skips — unless `$NVMUX_TEST_REQUIRE` names `nvim`, as CI's
 /// does, where its absence is the bug and fails the test instead.
+#[cfg(unix)]
 pub(crate) fn have_nvim() -> bool {
     let found = std::process::Command::new("nvim")
         .arg("--version")
@@ -62,6 +64,7 @@ pub(crate) fn have_nvim() -> bool {
 
 /// Wait up to `within` for `cond` to hold, polling gently. Returns whether it
 /// did, so a caller can assert with its own message.
+#[cfg(unix)]
 pub(crate) fn wait_until(within: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {

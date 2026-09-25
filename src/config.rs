@@ -337,10 +337,20 @@ pub(crate) fn nonempty(value: Option<&OsStr>) -> Option<&OsStr> {
     value.filter(|s| !s.is_empty())
 }
 
+/// The home the default config and state paths are under: `$HOME`, and on
+/// Windows — where a shell seldom sets it — `%USERPROFILE%` in its absence,
+/// so the files are in the same place relative to it on every platform.
+pub(crate) fn home() -> Option<std::ffi::OsString> {
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
+    #[cfg(windows)]
+    let home = home.or_else(|| std::env::var_os("USERPROFILE"));
+    home
+}
+
 /// Resolve the config path from the relevant environment, purely.
 ///
 /// Precedence: `$NVMUX_CONFIG` (an exact path) > `$XDG_CONFIG_HOME/nvmux/` >
-/// `$HOME/.config/nvmux/`.
+/// `$HOME/.config/nvmux/` (see [`home`]).
 fn resolve_config_path(
     nvmux_config: Option<&OsStr>,
     xdg_config_home: Option<&OsStr>,
@@ -371,7 +381,7 @@ fn resolve_config_path(
 pub fn load() -> Result<Settings, ConfigError> {
     let nvmux_config = std::env::var_os("NVMUX_CONFIG");
     let xdg = std::env::var_os("XDG_CONFIG_HOME");
-    let home = std::env::var_os("HOME");
+    let home = home();
 
     match resolve_config_path(nvmux_config.as_deref(), xdg.as_deref(), home.as_deref()) {
         ConfigSource::None => Ok(Settings::default()),
@@ -414,7 +424,7 @@ fn parse(path: &Path, contents: &str) -> Result<Settings, ConfigError> {
 pub fn first_run_target() -> Option<PathBuf> {
     let nvmux_config = std::env::var_os("NVMUX_CONFIG");
     let xdg = std::env::var_os("XDG_CONFIG_HOME");
-    let home = std::env::var_os("HOME");
+    let home = home();
     match resolve_config_path(nvmux_config.as_deref(), xdg.as_deref(), home.as_deref()) {
         ConfigSource::Default(path) if !path.exists() => Some(path),
         _ => None,

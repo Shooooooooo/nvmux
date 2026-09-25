@@ -8,6 +8,8 @@
 //! racing and never touch the user's real `/tmp/nvmux-<uid>`. They skip, rather
 //! than fail, when there is no usable `nvim` on `$PATH` — unless
 //! `$NVMUX_TEST_REQUIRE` names `nvim`, which is how CI keeps them honest.
+// These drive a local transport, a pty or `sh` on this machine: Unix only.
+#![cfg(unix)]
 
 #[macro_use]
 mod common;

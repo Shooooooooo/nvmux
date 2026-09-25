@@ -21,7 +21,6 @@ getrandom = "0.4"
 # exactly one crate to the build graph -- which is what made it worth taking
 # rather than hand-rolling a subsequence scorer.
 nucleo-matcher = "0.3"
-portable-pty = "0.9"
 # Only the crossterm backend: the defaults also pull in every widget (the
 # calendar brings the `time` crate) and the layout macros, none of which the
 # picker uses.
@@ -63,8 +62,9 @@ nix = { version = "0.31", default-features = false, features = [
 ] }
 portable-pty = "0.9"
 
-# Already in the tree at this version, through crossterm's `mio` and `rustix`,
-# so it adds no crate: the features are the only thing new.
+# Already in Cargo.lock at this version (`errno`, `mio` and `rustix` name it
+# for their own Windows builds), so it adds no crate to the lockfile: the
+# features are the only thing new.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",

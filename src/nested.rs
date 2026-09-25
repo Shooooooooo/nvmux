@@ -87,6 +87,7 @@ mod tests {
     /// A marker nvmux cannot decode is still a marker. `std::env::var` would
     /// hand back `Err` here and the guard would fail open — which is why this
     /// reads `var_os`.
+    #[cfg(unix)]
     #[test]
     fn a_marker_that_is_not_utf8_still_refuses() {
         use std::os::unix::ffi::OsStrExt;

@@ -23,10 +23,21 @@
 //! So the saved termios also lives in a static that a signal handler can read,
 //! and the handler restores it before re-raising the signal with the default
 //! disposition — which keeps the reported exit status honest.
+//!
+//! # On Windows
+//!
+//! The same two things in a console's terms (see
+//! `sys::windows::console`): raw mode is a pair of console modes —
+//! with Ctrl-C a key rather than a signal, and every key its VT bytes — and
+//! the safety net is a console control handler, which puts the modes and the
+//! screen back when the console is closed or interrupted under nvmux.
 
+#[cfg(unix)]
 use std::os::fd::BorrowedFd;
+#[cfg(unix)]
 use std::sync::OnceLock;
 
+#[cfg(unix)]
 use nix::sys::termios::{self, SetArg, SpecialCharacterIndices, Termios};
 
 use crate::error::Result;
@@ -47,15 +58,20 @@ pub(crate) fn write_stdout(bytes: &[u8]) -> std::io::Result<()> {
 
 /// A `libc::termios` we can read from a signal handler: plain C data, and
 /// `OnceLock::get` is an atomic load plus a read of initialised memory.
+#[cfg(unix)]
 struct Saved(libc::termios);
 
 // SAFETY: `libc::termios` is a plain-data struct with no pointers or interior
 // mutability; sharing a copy across threads (and into a signal handler) is safe.
+#[cfg(unix)]
 unsafe impl Send for Saved {}
+#[cfg(unix)]
 unsafe impl Sync for Saved {}
 
+#[cfg(unix)]
 static SAVED: OnceLock<Saved> = OnceLock::new();
 
+#[cfg(unix)]
 fn stdin_fd() -> BorrowedFd<'static> {
     // SAFETY: fd 0 is valid for the lifetime of the process.
     unsafe { BorrowedFd::borrow_raw(libc::STDIN_FILENO) }
@@ -67,6 +83,7 @@ fn stdin_fd() -> BorrowedFd<'static> {
 /// Re-raising under the default disposition rather than calling `_exit` means
 /// the shell still reports "terminated" or "hangup" rather than a plain exit
 /// code that hides why the process died.
+#[cfg(unix)]
 extern "C" fn restore_and_reraise(sig: libc::c_int) {
     if let Some(saved) = SAVED.get() {
         unsafe {
@@ -150,8 +167,22 @@ const MOUSE_BUTTONS: &[u8] = b"\x1b[?1003l\x1b[?1002h\x1b[?1006h";
 /// so nothing but nvmux can put the terminal back the way the client left it —
 /// and what the client had is a question for its server, which the resume
 /// already asks to repaint.
+#[cfg(unix)]
 pub fn enable_mouse() {
     let _ = write_stdout(MOUSE_ON);
+}
+
+/// On Windows the picker hears the mouse as the console's input records,
+/// which crossterm reads — and which only carry the mouse once the console's
+/// mouse input mode is on. That is what crossterm's own command does there
+/// (it never writes the escape sequences on Windows), so it is used instead of
+/// [`MOUSE_ON`].
+#[cfg(windows)]
+pub fn enable_mouse() {
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::EnableMouseCapture
+    );
 }
 
 /// Put mouse reporting back to what a client being resumed had, after a screen
@@ -165,8 +196,18 @@ pub fn set_mouse_reporting(reporting: MouseReporting) {
 }
 
 /// Turn mouse reporting off again, for the screen that turned it on.
+#[cfg(unix)]
 pub fn disable_mouse() {
     let _ = write_stdout(MOUSE_OFF);
+}
+
+/// [`enable_mouse`] undone, the same way.
+#[cfg(windows)]
+pub fn disable_mouse() {
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::DisableMouseCapture
+    );
 }
 
 /// Show the cursor — `DECTCEM` on — and nothing else.
@@ -196,7 +237,16 @@ pub fn reset_screen() {
 /// Home the cursor and erase the line it is on. Not part of [`RESET`], which a
 /// signal handler writes and which every nvmux screen shares: this is only for
 /// the two paths that hang up on a client and then end at a shell.
+#[cfg(unix)]
 const ERASE_LINE: &[u8] = b"\r\x1b[2K";
+
+/// On Windows the whole screen, and the cursor to its top: a client there is
+/// ended outright (see `sys::windows::conpty::Pty::hang_up`) and never leaves
+/// the screen it drew, so its last frame is still up — where a Unix client's
+/// exit would have left the primary screen the handover cleared, and one line
+/// of its last words on it. Cleared whole, it leaves what a Unix detach does.
+#[cfg(windows)]
+const ERASE_LINE: &[u8] = b"\x1b[H\x1b[2J";
 
 /// Wipe the line a hung-up client printed its last words on.
 ///
@@ -257,6 +307,7 @@ pub fn reset_inherited_attributes() {
 /// is the one every later restore should return to. [`RawMode::enter`] also
 /// calls this, for callers (tests, other embedders) that never went through
 /// `main`.
+#[cfg(unix)]
 pub fn install_signal_safety_net() {
     let mut raw_saved = std::mem::MaybeUninit::<libc::termios>::uninit();
     // SAFETY: fd 0 is valid and tcgetattr fully initialises the struct on
@@ -269,13 +320,51 @@ pub fn install_signal_safety_net() {
     install_signal_handlers();
 }
 
+/// The Windows safety net: the console's modes as the shell left them, put
+/// back — with the screen reset [`RESET`] is — when the console is closed, or
+/// Ctrl-C or Ctrl-Break reach nvmux outside raw mode. It also turns on the
+/// console's escape-sequence processing, which every screen nvmux draws needs.
+#[cfg(windows)]
+pub fn install_signal_safety_net() {
+    crate::sys::windows::console::install_safety_net(RESET);
+}
+
 /// Raw mode, restored when this is dropped. Restoring twice is harmless, so the
 /// explicit [`RawMode::restore`] and the panic-path `Drop` can both run.
+#[cfg(unix)]
 pub struct RawMode {
     saved: Termios,
     restored: bool,
 }
 
+/// Raw mode, restored when this is dropped: the console modes it replaced,
+/// until they are put back.
+#[cfg(windows)]
+pub struct RawMode {
+    saved: Option<crate::sys::windows::console::Modes>,
+}
+
+#[cfg(windows)]
+impl RawMode {
+    /// Put the console into raw mode, Ctrl-C a key like any other.
+    pub fn enter() -> Result<Self> {
+        install_signal_safety_net();
+        let saved = crate::sys::windows::console::enter_raw()?;
+        Ok(Self { saved: Some(saved) })
+    }
+
+    /// Put the console back the way it was. Writes to a console are done by
+    /// the time they return, so there is nothing to drain first.
+    pub fn restore(&mut self) {
+        if let Some(saved) = self.saved.take() {
+            if let Err(e) = crate::sys::windows::console::restore(saved) {
+                tracing::error!(error = %e, "could not restore console modes");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 impl RawMode {
     /// Put the terminal into raw mode with signals disabled.
     pub fn enter() -> Result<Self> {
@@ -327,6 +416,7 @@ impl Drop for RawMode {
     }
 }
 
+#[cfg(unix)]
 fn install_signal_handlers() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -489,11 +579,15 @@ mod tests {
     /// ask for, when no client had written anything there to clean up.
     #[test]
     fn erasing_the_hung_up_clients_line_is_not_part_of_the_shared_reset() {
+        #[cfg(unix)]
         assert_eq!(ERASE_LINE, b"\r\x1b[2K");
+        #[cfg(windows)]
+        assert_eq!(ERASE_LINE, b"\x1b[H\x1b[2J");
         assert!(!contains(RESET, ERASE_LINE));
         assert!(!contains(INHERITED, ERASE_LINE));
         // Home first, so it erases the line the cursor is on wherever the
         // client left the column, and leaves the shell a cursor at column 0.
+        #[cfg(unix)]
         assert!(ERASE_LINE.starts_with(b"\r"));
     }
 
@@ -610,6 +704,7 @@ mod tests {
 
     /// The distinction the module docs rest on: `cfmakeraw` already does most of
     /// what the design calls for, and `VSUSP` is the part it does not.
+    #[cfg(unix)]
     #[test]
     fn cfmakeraw_covers_isig_and_ixon_but_not_vsusp() {
         use nix::sys::termios::{ControlFlags, InputFlags, LocalFlags, OutputFlags};
@@ -661,6 +756,7 @@ mod tests {
     /// instead of by converting. If nix ever makes the conversion sync, this
     /// test fails and the comment in `RawMode::enter` can be revisited — that
     /// is the point of asserting it rather than merely writing it down.
+    #[cfg(unix)]
     #[test]
     fn converting_a_termios_to_libc_silently_drops_field_edits() {
         let mut t: Termios = unsafe { std::mem::zeroed::<libc::termios>() }.into();

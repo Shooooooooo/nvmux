@@ -37,7 +37,6 @@
 //! are always the terminal's own or the fade does not run.
 
 use std::io::IsTerminal;
-use std::os::fd::AsRawFd;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -260,16 +259,25 @@ fn request() -> Vec<u8> {
 const QUERY_CAP: Duration = Duration::from_millis(1500);
 
 /// Ask the terminal for its colours. `None` when it cannot be asked (no
-/// terminal, a key already waiting) or did not say.
+/// terminal, a key already waiting, Windows) or did not say.
 ///
 /// Raw mode for the duration, so the replies are neither echoed nor held back
 /// for a newline; restored on the way out, whichever way that is.
+///
+/// Not asked on Windows, where the question and its answers pass through the
+/// console host, which answers some questions itself — the DSR among them —
+/// and passes others on or drops them. So the DSR's answer need not come last
+/// there, and it coming last is what says every other answer is in: one that
+/// came after the wait would be read by the picker as keys. No palette is no
+/// fade, which is all this is for.
 pub fn query() -> Option<Palette> {
+    if cfg!(windows) {
+        return None;
+    }
     let stdin = std::io::stdin();
     if !stdin.is_terminal() || !std::io::stdout().is_terminal() {
         return None;
     }
-    let fd = stdin.as_raw_fd();
     let _raw = match crate::term::RawMode::enter() {
         Ok(raw) => raw,
         Err(e) => {
@@ -281,7 +289,8 @@ pub fn query() -> Option<Palette> {
     // is sitting in the line discipline's canonical buffer, where `poll` does
     // not report it until the mode changes. Restoring the modes on the way out
     // does not flush input, so the key is still there for the picker.
-    if readable_now(fd) {
+    let mut input = crate::sys::TermInput::new();
+    if input.readable_now() {
         tracing::debug!("palette: a key is already waiting; not asking the terminal");
         return None;
     }
@@ -299,17 +308,10 @@ pub fn query() -> Option<Palette> {
         if left.is_zero() {
             break;
         }
-        let mut p = [crate::pty::pollfd(fd)];
-        let wait = left.as_millis().min(i32::MAX as u128) as libc::c_int;
-        let n = unsafe { libc::poll(p.as_mut_ptr(), 1, wait) };
-        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        if n <= 0 {
-            break;
-        }
-        match crate::pty::read_fd(fd, &mut buf) {
-            Ok(len) if len > 0 => bytes.extend_from_slice(&buf[..len]),
+        match input.read_within(left, &mut buf) {
+            Ok(Some(len)) if len > 0 => bytes.extend_from_slice(&buf[..len]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // Nothing in time, the end of the input, or an error.
             _ => break,
         }
         replies = parse_replies(&bytes);
@@ -323,13 +325,6 @@ pub fn query() -> Option<Palette> {
         "palette: asked the terminal for its colours"
     );
     palette
-}
-
-/// Whether a read on `fd` would return at once.
-fn readable_now(fd: std::os::fd::RawFd) -> bool {
-    let mut p = [crate::pty::pollfd(fd)];
-    let n = unsafe { libc::poll(p.as_mut_ptr(), 1, 0) };
-    n > 0 && crate::pty::ready(&p[0])
 }
 
 static PALETTE: OnceLock<Option<Palette>> = OnceLock::new();

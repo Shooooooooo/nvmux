@@ -28,6 +28,8 @@
 //! screen from its own copy of it and asks the server for its repaint on top —
 //! which only a real client on a real pty, and a real server made too busy to
 //! answer, can show.
+// These drive a local transport, a pty or `sh` on this machine: Unix only.
+#![cfg(unix)]
 
 #[macro_use]
 mod common;

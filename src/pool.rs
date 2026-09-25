@@ -158,7 +158,7 @@ impl Drop for Pool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::time::{Duration, Instant};
 

@@ -6,6 +6,8 @@
 //! `:terminal` opened inside the session hands to its shell — and the rest
 //! drive the real binary, since a guard that never reached `main` would still
 //! pass every unit test in `nested`.
+// These drive a local transport, a pty or `sh` on this machine: Unix only.
+#![cfg(unix)]
 
 #[macro_use]
 mod common;

@@ -13,13 +13,27 @@
 //! tokens, which expand to unpredictable lengths — see [`crate::paths`]. It is
 //! also not where a master binds: each binds a socket of its own and is linked
 //! to the `ControlPath` once it is up, so that no master can ever remove
-//! another's — see [`Ssh::ensure_master_within`].
+//! another's — see `Ssh::ensure_master_within`.
+//!
+//! The relay's one plain connection ([`relay_command`]) is here too, and is
+//! all of this that Windows uses: its ssh cannot multiplex, so the master
+//! driver ([`Ssh`]) is Unix-only. The master's arguments are still built — and
+//! their tests still run — everywhere; they are only never used on Windows.
+#![cfg_attr(windows, allow(dead_code))]
+
+#[cfg(unix)]
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
 
 use crate::error::SshError;
+#[cfg(unix)]
 use crate::paths;
+#[cfg(unix)]
 use crate::proc;
 use crate::shell;
 
@@ -31,10 +45,12 @@ use crate::shell;
 const MIN_SSH_VERSION: &str = "6.7";
 const MIN_SSH: (u64, u64) = (6, 7);
 
-/// Parse the version out of `ssh -V` output, e.g. `OpenSSH_9.6p1 Ubuntu-3...`.
+/// Parse the version out of `ssh -V` output, e.g. `OpenSSH_9.6p1 Ubuntu-3...`,
+/// or Windows' `OpenSSH_for_Windows_9.5p1, LibreSSL 3.8.2`.
 fn parse_ssh_version(banner: &str) -> Option<(u64, u64)> {
     let token = banner.split_whitespace().next()?;
     let rest = token.strip_prefix("OpenSSH_")?;
+    let rest = rest.strip_prefix("for_Windows_").unwrap_or(rest);
     let numeric: String = rest
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '.')
@@ -190,7 +206,7 @@ fn cancel_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<Strin
 }
 
 /// Arguments for starting the host's shell — the one `sh` that
-/// [`proc::Shell`] feeds every script nvmux runs there — through a **login**
+/// `proc::Shell` feeds every script nvmux runs there — through a **login**
 /// shell:
 ///
 /// ```text
@@ -325,6 +341,7 @@ fn says_no_master(stderr: &str) -> bool {
 /// What connecting to the `ControlPath` says — the question `ssh -O check`
 /// asks, without the fork, and so without an answer that has had
 /// milliseconds to go stale by the time it is read.
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Probe {
     /// Something accepted: in a directory only we can write to, a master.
@@ -336,6 +353,7 @@ enum Probe {
     Refused,
 }
 
+#[cfg(unix)]
 fn probe(path: &Path) -> Probe {
     match std::os::unix::net::UnixStream::connect(path) {
         Ok(_) => Probe::Answered,
@@ -345,6 +363,7 @@ fn probe(path: &Path) -> Probe {
 }
 
 /// What is on the `ControlPath` once anything dead there has been cleared.
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cleared {
     /// Nothing: a master can be linked there.
@@ -354,11 +373,13 @@ enum Cleared {
 }
 
 /// A driver for one host's ssh connection.
+#[cfg(unix)]
 pub struct Ssh {
     host: String,
     control_path: PathBuf,
 }
 
+#[cfg(unix)]
 impl Ssh {
     pub fn new(host: String, control_path: PathBuf) -> Self {
         Self { host, control_path }
@@ -618,6 +639,7 @@ impl Ssh {
 }
 
 /// The `ControlPath` is occupied by something no master can be linked over.
+#[cfg(unix)]
 fn in_the_way(path: &Path, why: &str) -> SshError {
     SshError::Failed {
         code: -1,
@@ -625,6 +647,7 @@ fn in_the_way(path: &Path, why: &str) -> SshError {
     }
 }
 
+#[cfg(unix)]
 fn spawn_error(e: std::io::Error, host: &str) -> SshError {
     if e.kind() == std::io::ErrorKind::NotFound {
         SshError::NotFound
@@ -660,6 +683,10 @@ mod tests {
             Some((9, 0))
         );
         assert_eq!(parse_ssh_version("OpenSSH_6.7p1"), Some((6, 7)));
+        assert_eq!(
+            parse_ssh_version("OpenSSH_for_Windows_9.5p1, LibreSSL 3.8.2"),
+            Some((9, 5))
+        );
         assert_eq!(parse_ssh_version("something else"), None);
     }
 
@@ -819,6 +846,7 @@ mod tests {
     /// has already said nothing is there, and by the time the path is looked
     /// at, another nvmux's master is. Removing it would leave that master
     /// running with no name to be reached by.
+    #[cfg(unix)]
     #[test]
     fn a_control_path_something_answers_on_is_used_rather_than_cleared() {
         let dir = crate::test_support::scratch_dir("ssh-answered");
@@ -836,6 +864,7 @@ mod tests {
 
     /// What a master leaves behind — every one now, since only its own name
     /// goes with it — is cleared, so the next can be linked in its place.
+    #[cfg(unix)]
     #[test]
     fn a_control_path_nothing_answers_on_is_cleared() {
         let dir = crate::test_support::scratch_dir("ssh-refused");
@@ -858,6 +887,7 @@ mod tests {
     /// Only a socket is ever removed: whatever else is there is reported
     /// rather than deleted, before a connection is spent on a master that
     /// could not be linked over it.
+    #[cfg(unix)]
     #[test]
     fn a_control_path_that_is_not_a_socket_is_left_alone_and_reported() {
         let dir = crate::test_support::scratch_dir("ssh-not-a-socket");
@@ -951,6 +981,7 @@ mod tests {
     /// The whole chain, locally: the command ssh would hand the remote login
     /// shell, run by a shell here, with scripts and arguments fed to it exactly
     /// as the transport feeds them.
+    #[cfg(unix)]
     #[test]
     fn script_arguments_survive_shell_metacharacters() {
         let args = shell_args("h", Path::new(CTL));

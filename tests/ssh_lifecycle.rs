@@ -14,6 +14,8 @@
 //! client, a real ControlMaster, real unix-socket forwarding and a real remote
 //! login shell — everything except latency. `$NVMUX_TEST_REQUIRE=ssh` turns
 //! the skip into a failure.
+// These drive a local transport, a pty or `sh` on this machine: Unix only.
+#![cfg(unix)]
 
 #[macro_use]
 mod common;

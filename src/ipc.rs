@@ -6,13 +6,14 @@
 //! each session's address itself, and carries whatever connects there over a
 //! channel of its own. This is that address: a unix socket, as everywhere else
 //! nvmux runs on Unix, and a named pipe on Windows (see
-//! [`crate::sys::windows::pipe`]). Neovim takes either for `--server`.
+//! `sys::windows::pipe`). Neovim takes either for `--server`.
 //!
 //! Both are private to the user by the same kind of control: a socket in a
 //! directory only its owner can enter, and a pipe whose access list names only
 //! its owner. Not a loopback TCP port, which every account on the machine can
 //! connect to — and a session is a shell as its user.
 
+#[cfg(unix)]
 use std::io;
 use std::path::{Path, PathBuf};
 

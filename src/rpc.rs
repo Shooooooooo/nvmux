@@ -50,13 +50,13 @@
 //! which is why every call here still carries a budget.
 
 use std::io::{BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
 use rmpv::Value;
 
 use crate::error::RpcError;
+use crate::ipc::Stream;
 use crate::session::Liveness;
 
 /// msgpack-rpc message kinds.
@@ -133,7 +133,11 @@ impl<S: Read + Write> std::fmt::Debug for Client<S> {
     }
 }
 
-impl Client<UnixStream> {
+/// A connection to a session's local endpoint: a unix socket, or on Windows a
+/// named pipe (see [`crate::ipc`]).
+pub type Connection = Client<Stream>;
+
+impl Client<Stream> {
     /// Connect to a session socket. `read_timeout` bounds each *reply*, not the
     /// connect — a unix socket connect either finds a listener or does not.
     /// Passing a connect-sized value here classified live sessions as dead.
@@ -151,7 +155,7 @@ impl Client<UnixStream> {
         // nothing a caller could match on. Check explicitly for a useful message.
         crate::paths::check_sock_path(path).map_err(|e| RpcError::Protocol(e.to_string()))?;
 
-        let stream = UnixStream::connect(path).map_err(|e| match e.kind() {
+        let stream = Stream::connect(path).map_err(|e| match e.kind() {
             std::io::ErrorKind::ConnectionRefused => {
                 RpcError::ConnectionRefused(path.to_path_buf())
             }
@@ -161,6 +165,7 @@ impl Client<UnixStream> {
             // way nothing can be listening on a non-socket inode, so it is as
             // dead as a missing one. Whether the file may be *deleted* is a
             // separate question the reaper answers with `lstat`.
+            #[cfg(unix)]
             _ if e.raw_os_error() == Some(libc::ENOTSOCK) => {
                 RpcError::ConnectionRefused(path.to_path_buf())
             }
@@ -195,7 +200,7 @@ impl Client<UnixStream> {
 ///
 /// Unconditional: the connection is unusable afterwards, which is what the
 /// holder wanted.
-pub struct Interrupt(UnixStream);
+pub struct Interrupt(Stream);
 
 impl Interrupt {
     /// End whatever call the connection is in the middle of. Harmless when it
@@ -957,6 +962,7 @@ mod tests {
     /// The attach probe has no budget, so the only thing that can end a call
     /// the server is not answering is the interrupt — which has to unpark a
     /// read on another thread, and promptly.
+    #[cfg(unix)]
     #[test]
     fn an_interrupt_ends_an_unbounded_call_on_another_thread() {
         let path = crate::test_support::scratch_sock("rpc-interrupt");

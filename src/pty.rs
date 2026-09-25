@@ -55,31 +55,23 @@
 //! have it holding nvmux's drawing of the editor with a box in the middle, and
 //! nothing underneath to give back (see [`Attachment::write_over_session`]).
 //!
-//! Three hazards that have no other home in the code:
-//!
-//! * **Take the writer exactly once.** `MasterPty::take_writer()` errors on a
-//!   second call.
-//! * **The child's exit code carries no information.** A server killed while
-//!   attached gives 0; terminating the child to detach gives 1; a failed attach
-//!   gives 1. Teardown is driven off the master read result instead.
-//! * `portable-pty` vendors its own `nix`, so never pass a `nix` type across
-//!   that boundary — `MasterPty::get_termios()` returns *its* `Termios`, not ours.
+//! The pty itself, and the waits on it, are the platform's: a Unix pty or a
+//! Windows pseudoconsole, `poll` or a wait on handles — see [`crate::sys`],
+//! which also keeps the hazards that come with each.
 
 use std::io::Write;
-use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-pub use portable_pty::PtySize;
-use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair};
+pub use crate::sys::PtySize;
 
 use crate::error::{NvmuxError, Result};
 use crate::keys::{Action, Prefix, Step, Wait};
 use crate::ledger::Ledger;
+use crate::sys::{ChildState, Order, Peek};
 use crate::term::write_stdout;
-use crate::{announce, boundary, fade, hint, rpc, shadow, term, winch};
+use crate::{announce, boundary, fade, hint, rpc, shadow, sys, term};
 
 /// Neovim aborts on the seventeenth attached UI rather than returning an error
 /// (`src/nvim/ui.c`: `if (ui_count == MAX_UI_COUNT) { abort(); }`), which would
@@ -184,8 +176,8 @@ pub struct Attachment {
     /// other change of session, and has it set again for that relay (see
     /// [`Attachment::announce_on_arrival`]).
     announce: Option<String>,
-    child: Box<dyn Child + Send + Sync>,
-    master: Box<dyn MasterPty>,
+    /// The client and its pty; see [`crate::sys::Pty`].
+    pty: sys::Pty,
     writer: Box<dyn Write + Send>,
     /// True once the child has been through a full relay, so a resume knows it
     /// must force a repaint — and that the client is one that already entered
@@ -490,7 +482,7 @@ impl Attachment {
     /// look and why `reap`'s own escalation had never run.
     ///
     /// SIGCONT as well, because SIGHUP is not delivered to a *stopped* process
-    /// at all, and a client that stopped itself (see `check_child`) can be
+    /// at all, and a client that stopped itself (see `sys::Pty::check`) can be
     /// retired before the pump's idle poll has revived it. `reap`'s `try_wait`
     /// does not pass `WUNTRACED` either, so without this a stopped client would
     /// read as running for the whole of `REAP_TIMEOUT`. Hung up first and
@@ -498,22 +490,17 @@ impl Attachment {
     ///
     /// Sending it twice is harmless, which is what lets `Drop` run after an
     /// explicit `hang_up`: nothing in between waits for the child — the peek in
-    /// `check_child` passes `WNOWAIT` — so the pid is still ours and cannot have
+    /// `sys::Pty::check` passes `WNOWAIT` — so the pid is still ours and cannot have
     /// been recycled.
+    ///
+    /// On Windows there is no hangup a console process would act on and still
+    /// go quickly, and the client is ended outright — which leaves its server
+    /// running just the same (see `sys::windows::conpty::Pty::hang_up`).
     pub fn hang_up(&mut self) {
         if self.reaped {
             return;
         }
-        // Nothing to signal without one, and `reap` falls back on `wait`.
-        let Some(pid) = self.child.process_id() else {
-            return;
-        };
-        // SAFETY: a pid this process spawned and has not waited for, so it names
-        // that child or nothing.
-        unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGHUP);
-            libc::kill(pid as libc::pid_t, libc::SIGCONT);
-        }
+        self.pty.hang_up();
     }
 
     /// Write to the terminal, then let the shadow see what was written.
@@ -655,7 +642,7 @@ impl Attachment {
     /// Read whatever the client has written since anything last did, and show
     /// it to the shadow and the ledger rather than to the terminal.
     ///
-    /// For a kept client being resumed, in place of [`discard_pending`]: those
+    /// For a kept client being resumed, in place of discarding it: those
     /// bytes describe the screen the client believes the terminal has — which
     /// is the one about to be painted back — and any word it said in them
     /// about the mouse or the title is one it will not say again.
@@ -672,9 +659,6 @@ impl Attachment {
     /// parked with a `:terminal` running something never runs out of things
     /// to say, and what it says after this is the relay's.
     fn drain_unrelayed(&mut self) {
-        let Some(fd) = self.master.as_raw_fd() else {
-            return;
-        };
         let mut buf = [0u8; 8192];
         let deadline = Instant::now() + FRAME_WAIT;
         let mut taken = 0usize;
@@ -689,18 +673,14 @@ impl Attachment {
             } else {
                 Duration::ZERO
             };
-            let wait_ms = wait.as_micros().div_ceil(1000) as libc::c_int;
-            let mut p = [pollfd(fd)];
-            let n = unsafe { libc::poll(p.as_mut_ptr(), 1, wait_ms) };
-            // The relay's `SIGWINCH` handler is in by now, and a resize during
-            // the wait is no reason to hand over half a frame.
-            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
+            match self.pty.wait_output(wait) {
+                Ok(true) => {}
+                // The relay's `SIGWINCH` handler is in by now, and a resize
+                // during the wait is no reason to hand over half a frame.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                _ => return,
             }
-            if n <= 0 || !ready(&p[0]) {
-                return;
-            }
-            match read_fd(fd, &mut buf) {
+            match self.pty.read_output(&mut buf) {
                 Ok(len) if len > 0 => {
                     self.saw_unrelayed(&buf[..len]);
                     taken += len;
@@ -782,20 +762,18 @@ impl Attachment {
     /// pieces *would* be read as keys, and a report that did not fit is
     /// better not sent.
     fn report_size_in_band(&mut self, size: PtySize) -> bool {
-        let Some(fd) = self.master.as_raw_fd() else {
-            return false;
-        };
-        if !writable(fd) {
-            tracing::debug!("the client's input queue is full; not reporting its size");
-            return false;
-        }
         let report = in_band_size_report(size);
-        let n = unsafe { libc::write(fd, report.as_ptr().cast(), report.len()) };
-        if n != report.len() as isize {
-            tracing::debug!(wrote = n, "the in-band size report went out short");
-            return false;
+        match self.pty.write_now(&report) {
+            None => {
+                tracing::debug!("the client's input queue is full; not reporting its size");
+                false
+            }
+            Some(n) if n != report.len() as isize => {
+                tracing::debug!(wrote = n, "the in-band size report went out short");
+                false
+            }
+            Some(_) => true,
         }
-        true
     }
 
     /// Show the terminal what the client wrote — or, while its first paint is
@@ -1080,7 +1058,7 @@ impl Attachment {
 
     /// Tell the pty — and the shadow — the terminal's size.
     fn resize_to(&mut self, size: PtySize) {
-        let _ = self.master.resize(size);
+        self.pty.resize(size);
         if let Some(shadow) = self.shadow.as_mut() {
             shadow.resize(size.rows, size.cols);
         }
@@ -1148,32 +1126,30 @@ impl Attachment {
         // client that was mid-repaint when the switch was typed fills the buffer
         // and stops there. Without this it cannot act on the hangup at all, and
         // a healthy client ends up killed by the deadline below.
-        let master = self.master.as_raw_fd();
         let deadline = Instant::now() + REAP_TIMEOUT;
         // Remembered rather than answered once: the request is seen on exactly
         // one pass of this loop, and that pass is the likeliest moment for the
         // client's input queue to be momentarily full.
         let mut owed = false;
         while Instant::now() < deadline {
-            if let Some(fd) = master {
-                owed |= discard_pending(fd);
-                if owed {
-                    owed = !self.answer_device_attributes();
-                }
+            let mut asked = false;
+            self.pty
+                .discard_pending(|chunk| asked |= asks_for_device_attributes(chunk));
+            owed |= asked;
+            if owed {
+                owed = !self.answer_device_attributes();
             }
-            match self.child.try_wait() {
-                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                // Exited, or already reaped by someone else.
-                _ => return,
+            // Exited, or already reaped by someone else.
+            if self.pty.try_wait() {
+                return;
             }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        if let Some(pid) = self.child.process_id() {
+        if let Some(pid) = self.pty.pid() {
             tracing::warn!(pid, "the remote-ui client ignored SIGHUP; killing it");
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-            }
+            self.pty.kill();
         }
-        let _ = self.child.wait();
+        self.pty.wait();
     }
 
     /// Answer the DA1 request a departing client has just sent, as its terminal
@@ -1234,26 +1210,17 @@ impl Attachment {
         // moves it on from a work queue, so a master that has just taken a burst
         // reports no room until that queue runs, a few milliseconds later. A
         // one-shot answer would lose that coin toss; a retried one cannot.
-        let Some(fd) = self.master.as_raw_fd() else {
-            return true;
-        };
-        if !writable(fd) {
-            tracing::debug!("the departing client's input queue is full; not answering yet");
-            return false;
-        }
-        tracing::debug!("answering the departing client's DA1 request");
+        //
         // One `write`, not `write_all`: `writable` promises room for a byte,
         // not for seven, and the loop `write_all` would do on a short write is
         // the same park by another name. A torn reply cannot hurt this client —
         // it is exiting, and the worst case is the wait it would have had
         // anyway. (Which is why no live client is ever written to here.)
-        let n = unsafe {
-            libc::write(
-                fd,
-                DA1_REPLY.as_ptr() as *const libc::c_void,
-                DA1_REPLY.len(),
-            )
+        let Some(n) = self.pty.write_now(DA1_REPLY) else {
+            tracing::debug!("the departing client's input queue is full; not answering yet");
+            return false;
         };
+        tracing::debug!("answered the departing client's DA1 request");
         if n != DA1_REPLY.len() as isize {
             tracing::debug!(wrote = n, "the DA1 answer went out short");
         }
@@ -1285,19 +1252,14 @@ impl Attachment {
     /// Bounded, because a client that ignores its termination would otherwise
     /// hold the terminal in raw mode indefinitely.
     fn drain_until_eof(&mut self) {
-        let Some(fd) = self.master.as_raw_fd() else {
-            return;
-        };
         let deadline = Instant::now() + DRAIN_TIMEOUT;
         let mut buf = [0u8; 8192];
         let mut owed = false;
         while Instant::now() < deadline {
-            let mut p = [pollfd(fd)];
-            let n = unsafe { libc::poll(p.as_mut_ptr(), 1, 50) };
-            if n <= 0 {
+            if !matches!(self.pty.wait_output(Duration::from_millis(50)), Ok(true)) {
                 continue;
             }
-            match read_fd(fd, &mut buf) {
+            match self.pty.read_output(&mut buf) {
                 Ok(0) | Err(_) => return,
                 Ok(len) => {
                     // Read before the write, because the write borrows `self`.
@@ -1332,7 +1294,7 @@ impl Attachment {
     pub fn park(mut self) -> Option<Parked> {
         self.exits_seen = EXITS_RELAYED.load(std::sync::atomic::Ordering::Relaxed);
         let session_id = self.session_id.clone();
-        let (stop, stopped) = match UnixStream::pair() {
+        let (stop, stopped) = match sys::stop_pair() {
             Ok(pair) => pair,
             Err(e) => {
                 tracing::warn!(error = %e, "could not park a client; retiring it");
@@ -1382,7 +1344,7 @@ impl Attachment {
 pub struct Parked {
     session_id: String,
     /// Dropped to stop the thread: the far end then reads as hung up.
-    stop: Option<UnixStream>,
+    stop: Option<sys::StopTx>,
     /// `Some` until joined. What it returns is the client, or `None` for one
     /// that left.
     thread: Option<std::thread::JoinHandle<Option<Attachment>>>,
@@ -1422,15 +1384,8 @@ impl Parked {
         // killed, its link gone — before the thread saw it go: the pty says
         // so at once, and so does its pid. Handed back, it would put a dead
         // session's last screen up only to lose it a moment later.
-        let hung_up = attachment.master.as_raw_fd().is_some_and(|fd| {
-            let mut p = [pollfd(fd)];
-            let n = unsafe { libc::poll(p.as_mut_ptr(), 1, 0) };
-            n > 0 && p[0].revents & (libc::POLLHUP | libc::POLLERR) != 0
-        });
-        let exited = attachment
-            .child
-            .process_id()
-            .is_some_and(|pid| peek_child(nix::unistd::Pid::from_raw(pid as i32)) == Peek::Gone);
+        let hung_up = attachment.pty.hung_up();
+        let exited = attachment.pty.peek() == Peek::Gone;
         if hung_up || exited {
             tracing::debug!(id = %self.session_id, "a parked client left as it was asked back");
             return None;
@@ -1444,7 +1399,7 @@ impl Parked {
     /// side by side.
     pub fn tell_to_retire(&mut self) {
         if let Some(stop) = self.stop.as_mut() {
-            let _ = stop.write_all(b"R");
+            stop.retire();
         }
     }
 
@@ -1510,28 +1465,26 @@ impl Drop for Parked {
 /// session's next visit is a fresh client. Measured on 0.11.0 and 0.12.5.
 ///
 /// A client found stopped is retired likewise, and one that has exited is
-/// let go. Only ever with [`peek_child`], which changes nothing:
-/// [`check_child`] consumes a stop, and a pid is only this thread's to wait
+/// let go. Only ever with [`sys::Pty::peek`], which changes nothing:
+/// [`sys::Pty::check`] consumes a stop, and a pid is only this thread's to wait
 /// for.
-fn keep_parked(mut attachment: Attachment, stop: UnixStream) -> Option<Attachment> {
+fn keep_parked(mut attachment: Attachment, stop: sys::StopRx) -> Option<Attachment> {
     let id = attachment.session_id.clone();
     let mut buf = [0u8; 8192];
     loop {
-        let master = attachment.master.as_raw_fd();
-        let mut fds = [pollfd(stop.as_raw_fd()), pollfd(master.unwrap_or(-1))];
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, IDLE_POLL_MS) };
-        if n < 0 {
+        let woke = match sys::park_wait(&stop, &attachment.pty, IDLE_POLL_MS) {
+            Ok(woke) => woke,
             // A `SIGWINCH` meant for the relay can land on this thread.
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                tracing::warn!(%id, "a parked client could not be watched; retiring it");
+                return None;
             }
-            tracing::warn!(%id, "a parked client could not be watched; retiring it");
-            return None;
-        }
+        };
         // The client first: whatever it has said is read before the thread
         // lets go of it, and a client that has gone is not handed back.
-        if let Some(master) = master.filter(|_| n > 0 && ready(&fds[1])) {
-            match read_fd(master, &mut buf) {
+        if woke.output {
+            match attachment.pty.read_output(&mut buf) {
                 Ok(len) if len > 0 => {
                     let chunk = &buf[..len];
                     attachment.saw_unrelayed(chunk);
@@ -1554,27 +1507,24 @@ fn keep_parked(mut attachment: Attachment, stop: UnixStream) -> Option<Attachmen
                 }
             }
         }
-        if n > 0 && ready(&fds[0]) {
+        if woke.stop {
             // A byte is an order to retire the client; the end of the stream
             // is the client wanted back.
-            let mut order = [0u8; 1];
-            return match read_fd(stop.as_raw_fd(), &mut order) {
-                Ok(1) => None,
-                _ => Some(attachment),
+            return match stop.order() {
+                Order::Retire => None,
+                Order::Back => Some(attachment),
             };
         }
-        if n == 0 {
-            if let Some(pid) = attachment.child.process_id() {
-                match peek_child(nix::unistd::Pid::from_raw(pid as i32)) {
-                    Peek::Running => {}
-                    Peek::Stopped => {
-                        tracing::debug!(%id, "a parked client stopped; retiring it");
-                        return None;
-                    }
-                    Peek::Gone => {
-                        tracing::debug!(%id, "a parked client exited");
-                        return None;
-                    }
+        if woke.idle {
+            match attachment.pty.peek() {
+                Peek::Running => {}
+                Peek::Stopped => {
+                    tracing::debug!(%id, "a parked client stopped; retiring it");
+                    return None;
+                }
+                Peek::Gone => {
+                    tracing::debug!(%id, "a parked client exited");
+                    return None;
                 }
             }
         }
@@ -1594,9 +1544,9 @@ fn leaves_alt_screen(chunk: &[u8]) -> bool {
 /// A stand-in kept client for the tests of what holds clients (see
 /// [`crate::pool`]): `sh -c script` on a real pty, as the tests here use,
 /// attached to nothing, with a ledger and no screen of its own.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn kept_standin(session_id: &str, script: &str) -> Attachment {
-    let mut cmd = CommandBuilder::new("sh");
+    let mut cmd = sys::Command::new("sh");
     cmd.arg("-c");
     cmd.arg(script);
     let mut a = spawn_client_with(
@@ -1614,11 +1564,11 @@ pub(crate) fn kept_standin(session_id: &str, script: &str) -> Attachment {
     a
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Attachment {
     /// The stand-in's pid, for a test asking what became of the process.
     pub(crate) fn pid_for_test(&self) -> i32 {
-        self.child.process_id().expect("a spawned child has a pid") as i32
+        self.pty.pid().expect("a spawned child has a pid") as i32
     }
 
     /// As if its terminal had not yet answered its opening questions.
@@ -1630,15 +1580,15 @@ impl Attachment {
     /// so that a signal sent next meets them rather than the shell's own
     /// startup disposition. Says whether it came.
     pub(crate) fn ready_for_test(&self) -> bool {
-        let Some(fd) = self.master.as_raw_fd() else {
-            return false;
-        };
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut buf = [0u8; 256];
         while Instant::now() < deadline {
-            let mut p = [pollfd(fd)];
-            unsafe { libc::poll(p.as_mut_ptr(), 1, 50) };
-            if ready(&p[0]) && read_fd(fd, &mut buf).is_ok_and(|n| buf[..n].contains(&b'r')) {
+            if matches!(self.pty.wait_output(Duration::from_millis(50)), Ok(true))
+                && self
+                    .pty
+                    .read_output(&mut buf)
+                    .is_ok_and(|n| buf[..n].contains(&b'r'))
+            {
                 return true;
             }
         }
@@ -1698,11 +1648,10 @@ pub fn spawn_client(session_id: &str, sock: &Path, announce: &str) -> Result<Att
 }
 
 /// `nvim --server <sock> --remote-ui`, in our working directory.
-fn client_command(sock: &Path) -> CommandBuilder {
-    // `CommandBuilder::new` seeds the child's environment from ours, so `TERM`,
-    // `COLORTERM` and everything else the client negotiates with reach it
-    // without being copied by hand.
-    let mut cmd = CommandBuilder::new("nvim");
+fn client_command(sock: &Path) -> sys::Command {
+    // The child's environment is ours, so `TERM`, `COLORTERM` and everything
+    // else the client negotiates with reach it without being copied by hand.
+    let mut cmd = sys::Command::new("nvim");
     cmd.arg("--server");
     cmd.arg(sock);
     cmd.arg("--remote-ui");
@@ -1714,6 +1663,7 @@ fn client_command(sock: &Path) -> CommandBuilder {
     // `paths::restrict_umask`. A `--remote-ui` client holds no buffers and so
     // writes next to nothing, which is a reason for the exception to go
     // unnoticed rather than a reason to make one.
+    #[cfg(unix)]
     if let Some(mask) = crate::paths::launch_umask() {
         cmd.umask(Some(mask.bits()));
     }
@@ -1729,7 +1679,7 @@ fn spawn_with(
     session_id: &str,
     sock: &Path,
     announce: &str,
-    cmd: CommandBuilder,
+    cmd: sys::Command,
 ) -> Result<Attachment> {
     let t_spawn = std::time::Instant::now();
     let attachment = spawn_client_with(session_id, sock, announce, cmd)?;
@@ -1868,7 +1818,7 @@ impl Probe {
 
     /// Give up on the probe as `Drop` does, but hand the worker back so a
     /// test can prove the interrupt ended it, and not only the connection.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn abandon(mut self) -> std::thread::JoinHandle<()> {
         self.thread.take().expect("the worker is taken once")
     }
@@ -1906,7 +1856,7 @@ impl Drop for Probe {
 /// any other call, which is why `rpc::probe` asks both — so this is not a
 /// claim that the two are interchangeable. What it cost was a round trip on
 /// every attach, forwarded over SSH.
-fn probe_on(client: &mut rpc::Client<UnixStream>, session_id: &str) -> Result<Answer> {
+fn probe_on(client: &mut rpc::Connection, session_id: &str) -> Result<Answer> {
     // Both questions go out before either answer is read. They are independent
     // — what state the editor is in, and how many UIs it has — and over an SSH
     // forward each answer is a round trip, so asking the second only once the
@@ -2036,7 +1986,7 @@ const MAX_PROMPTS: usize = 4;
 /// the ninth other client rather than the eighth, and a count one too low still
 /// stops seven short of the abort.
 fn ui_count(
-    client: &mut rpc::Client<UnixStream>,
+    client: &mut rpc::Connection,
     session_id: &str,
     counting: rpc::Pending,
 ) -> Result<Answer> {
@@ -2057,29 +2007,13 @@ fn spawn_client_with(
     session_id: &str,
     sock: &Path,
     announce: &str,
-    cmd: CommandBuilder,
+    cmd: sys::Command,
 ) -> Result<Attachment> {
     // Right *before* the child starts: `PtySize::default()` is 24x80. Note
     // `crossterm::size()` is (cols, rows) while `PtySize` is { rows, cols } —
     // passing them positionally transposes the screen.
     let size = term::terminal_size();
-    let pair: PtyPair = portable_pty::native_pty_system()
-        .openpty(size)
-        .map_err(|e| NvmuxError::Io(std::io::Error::other(e.to_string())))?;
-
-    let child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| NvmuxError::Io(std::io::Error::other(e.to_string())))?;
-
-    // MANDATORY: while this process holds the slave open the master never sees
-    // EOF, so the relay would hang forever after the child exits.
-    drop(pair.slave);
-
-    let writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| NvmuxError::Io(std::io::Error::other(e.to_string())))?;
+    let (pty, writer) = sys::Pty::spawn(cmd, size)?;
 
     let fades = fade::enabled() && fade::session();
     let shadow = fades.then(|| shadow::Shadow::new(size.rows, size.cols));
@@ -2089,8 +2023,7 @@ fn spawn_client_with(
         session_id: session_id.to_string(),
         sock: sock.to_path_buf(),
         announce: Some(announce.to_string()),
-        child,
-        master: pair.master,
+        pty,
         writer,
         resumed: false,
         reaped: false,
@@ -2147,12 +2080,9 @@ pub fn relay(
     highest_session_num: u32,
     begin_next: &mut dyn FnMut(Target),
 ) -> Result<(Outcome, Option<Attachment>)> {
-    let master_fd = attachment
-        .master
-        .as_raw_fd()
-        .ok_or_else(|| NvmuxError::Io(std::io::Error::other("pty master has no fd")))?;
-
-    let winch = winch::Winch::install()?;
+    // The one wait the relay makes, set up — on Unix, with its `SIGWINCH`
+    // handler in — before anything else here.
+    let mut waiter = sys::Waiter::new(&attachment.pty)?;
     // A client that has not painted yet, whose first paint can be held.
     let fresh = !attachment.resumed;
     if attachment.resumed {
@@ -2198,7 +2128,7 @@ pub fn relay(
         if attachment.is_kept() {
             attachment.drain_unrelayed();
         } else {
-            discard_pending(master_fd);
+            attachment.pty.discard_pending(|_| {});
         }
         // The size first, so the frames fit the terminal as it is now; then
         // the screen the client had dissolves in, and only then is the
@@ -2218,7 +2148,7 @@ pub fn relay(
         // either way, whatever the server is doing.
         let size = term::terminal_size();
         // Asked before the resize, because the resize is what changes it.
-        let resized = attachment.master.get_size().ok() != Some(size);
+        let resized = attachment.pty.size() != Some(size);
         attachment.resize_to(size);
         dissolved = attachment.dissolve_in();
         let on_screen = dissolved || attachment.paint_kept_screen();
@@ -2275,8 +2205,7 @@ pub fn relay(
 
     let outcome = pump(
         &mut attachment,
-        master_fd,
-        &winch,
+        &mut waiter,
         highest_session_num,
         popup,
         dissolved,
@@ -2383,14 +2312,12 @@ pub fn relay(
 
 fn pump(
     attachment: &mut Attachment,
-    master_fd: RawFd,
-    winch: &winch::Winch,
+    waiter: &mut sys::Waiter,
     highest_session_num: u32,
     mut popup: Option<announce::Popup>,
     dissolved: bool,
     mut erasing: Option<Erasing>,
 ) -> Result<Outcome> {
-    let stdin_fd = std::io::stdin().as_raw_fd();
     let keys = crate::config::get().keys;
     let mut prefix = Prefix::with_prefix(highest_session_num, keys.prefix);
     let prefix_timeout = Duration::from_millis(keys.timeout_ms);
@@ -2447,25 +2374,20 @@ fn pump(
                 // `poll` calls that return at once.
                 let left = d.saturating_duration_since(Instant::now());
                 let ms = left.as_micros().div_ceil(1000);
-                ms.min(IDLE_POLL_MS as u128) as libc::c_int
+                ms.min(u128::from(IDLE_POLL_MS)) as u64
             }
             None => IDLE_POLL_MS,
         };
 
-        let mut fds = [pollfd(stdin_fd), pollfd(master_fd), pollfd(winch.fd())];
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(NvmuxError::Io(err));
-        }
+        // A wait a signal cut short is gone round again.
+        let Some(woke) = waiter.wait(timeout_ms).map_err(NvmuxError::Io)? else {
+            continue;
+        };
 
         // Output first, so the screen is current before a keystroke is acted on.
-        let child_spoke = n > 0 && ready(&fds[1]);
+        let child_spoke = woke.child;
         if child_spoke {
-            match read_fd(master_fd, &mut buf) {
+            match waiter.read_child(&mut buf) {
                 // EOF on macOS, EIO on Linux: both mean the slave closed.
                 Ok(0) | Err(_) => return Ok(Outcome::ChildExited),
                 Ok(len) => {
@@ -2513,10 +2435,10 @@ fn pump(
             );
         }
 
-        if n > 0 && ready(&fds[2]) {
-            winch.drain();
+        if woke.resized {
             // Enough on its own: the kernel signals the pty's foreground group
-            // and the client calls try_resize.
+            // and the client calls try_resize. (A pseudoconsole tells its
+            // client the same way, as a console event.)
             attachment.resize_to(term::terminal_size());
         }
 
@@ -2650,7 +2572,7 @@ fn pump(
         // must be read first — the screen write above can outlast the short
         // wait, and settling then would break a sequence whose remainder had
         // already arrived.
-        let stdin_ready = n > 0 && ready(&fds[0]);
+        let stdin_ready = woke.stdin;
         let overdue = deadline.is_some_and(|d| Instant::now() >= d);
         if overdue && !(stdin_ready && prefix.wait() == Some(Wait::Sequence)) {
             deadline = None;
@@ -2666,7 +2588,7 @@ fn pump(
         }
 
         if stdin_ready {
-            match read_fd(stdin_fd, &mut buf) {
+            match waiter.read_stdin(&mut buf) {
                 Ok(0) => return Ok(Outcome::StdinClosed),
                 Err(e) => return Err(NvmuxError::Io(e)),
                 Ok(len) => {
@@ -2696,7 +2618,7 @@ fn pump(
         // settled above too, so anywhere earlier in the loop the bar would be a
         // whole wake-up late — and the only wake-up scheduled is the prefix's own
         // deadline, so it would appear exactly as the prefix expired. After the
-        // winch, so the row is the terminal's as it is now, and after the notice,
+        // resize, so the row is the terminal's as it is now, and after the notice,
         // for the reason written down there.
         //
         // `busy` is the bar's lull rule: the child having spoken this pass, and
@@ -2745,7 +2667,7 @@ fn pump(
         // Only on an idle tick: a child that exits is noticed through its pty
         // above, so this exists for the one that *stopped*, and a `waitid` per
         // keystroke would buy nothing.
-        if n == 0 && check_child(attachment) == ChildState::Gone {
+        if woke.idle && attachment.pty.check() == ChildState::Gone {
             return Ok(Outcome::ChildExited);
         }
     }
@@ -2788,99 +2710,7 @@ const SEQUENCE_TIMEOUT: Duration = Duration::from_millis(10);
 /// A child that has *stopped* generates no readable fd and no signal we
 /// subscribe to, so without a bounded wait the relay would sit forever against a
 /// frozen screen.
-const IDLE_POLL_MS: libc::c_int = 1000;
-
-#[derive(Debug, PartialEq, Eq)]
-enum ChildState {
-    Running,
-    Gone,
-}
-
-/// Notice a child that has exited, and revive one that has stopped.
-///
-/// # The stop case, and why it is continued rather than escalated
-///
-/// `Ctrl-z` is forwarded to Neovim as an ordinary byte — nvmux does not
-/// special-case it. If the `--remote-ui` client responds by stopping *itself*,
-/// the user is left looking at a frozen screen: nvmux still owns the terminal,
-/// so there is no shell underneath to have been returned to, and the suspended
-/// client is not a state anyone can do anything with.
-///
-/// So a stopped child is continued with `SIGCONT` rather than torn down. It
-/// cannot loop: the stop notification is consumed when read, so a client that
-/// keeps stopping itself is continued once per stop.
-///
-/// `portable_pty::Child::try_wait` cannot be used here — it does not pass
-/// `WUNTRACED`, so a stopped child reads as "still running". The peek below uses
-/// `WNOWAIT` so an *exit* status is left in place for portable-pty's own reaper.
-fn check_child(attachment: &mut Attachment) -> ChildState {
-    use nix::sys::signal::{kill, Signal};
-    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-    use nix::unistd::Pid;
-
-    let Some(raw) = attachment.child.process_id() else {
-        return ChildState::Running;
-    };
-    let pid = Pid::from_raw(raw as i32);
-
-    match peek_child(pid) {
-        Peek::Stopped => {
-            // Consume just the stop notification, which does not reap the
-            // process, then wake it up. Without consuming it, the peek would
-            // report the same stop on every poll and SIGCONT would be sent
-            // repeatedly.
-            let sig = match waitpid(pid, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED)) {
-                Ok(WaitStatus::Stopped(_, sig)) => Some(sig),
-                _ => None,
-            };
-            tracing::info!(?sig, "the remote-ui client stopped; continuing it");
-            let _ = kill(pid, Signal::SIGCONT);
-            ChildState::Running
-        }
-        Peek::Gone => ChildState::Gone,
-        Peek::Running => ChildState::Running,
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum Peek {
-    Running,
-    Stopped,
-    Gone,
-}
-
-/// Look at a child's state without changing it.
-///
-/// `waitid`, not `waitpid`. WNOWAIT is only valid for waitid(2): Linux's
-/// wait4 rejects the flag outright with EINVAL, so the waitpid spelling of
-/// this peek silently never reports anything and a stopped client would sit
-/// frozen forever. (Measured — it returned EINVAL on every poll.)
-///
-/// Called through `libc` rather than `nix`: nix binds `waitid` only on Linux
-/// and FreeBSD, but the call itself is POSIX and macOS has it too.
-fn peek_child(pid: nix::unistd::Pid) -> Peek {
-    // WNOHANG with nothing to report succeeds and leaves `si_signo` (and
-    // `si_pid`) zero, which is only distinguishable if the struct starts out
-    // zeroed.
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let flags = libc::WNOHANG | libc::WEXITED | libc::WSTOPPED | libc::WNOWAIT;
-    let rc = unsafe { libc::waitid(libc::P_PID, pid.as_raw() as libc::id_t, &mut info, flags) };
-    if rc < 0 {
-        return match nix::errno::Errno::last() {
-            // Already reaped by someone else, which also means it is gone.
-            nix::errno::Errno::ECHILD => Peek::Gone,
-            _ => Peek::Running,
-        };
-    }
-    if info.si_signo == 0 {
-        return Peek::Running;
-    }
-    match info.si_code {
-        libc::CLD_STOPPED | libc::CLD_TRAPPED => Peek::Stopped,
-        libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED => Peek::Gone,
-        _ => Peek::Running,
-    }
-}
+const IDLE_POLL_MS: u64 = 1000;
 
 /// A relayed write as it goes to the terminal: the session's own bytes behind
 /// the sequence that opens a synchronized update, and behind nothing at all
@@ -2897,77 +2727,6 @@ fn framed(bytes: &[u8], open: bool) -> Vec<u8> {
     }
     out.extend_from_slice(bytes);
     out
-}
-
-/// Read whatever is available. Only called after `poll` says the fd is ready.
-/// Shared with [`crate::palette`], which reads the terminal's replies the same
-/// way.
-pub(crate) fn read_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
-    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-    if n < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(n as usize)
-    }
-}
-
-/// A `poll` entry asking whether `fd` is readable. Shared with
-/// [`crate::proc::Shell`], which polls a child's pipes the way this module
-/// polls a pty; a negative `fd` is skipped by `poll`, which is how a pipe
-/// that has reached EOF is left out.
-pub(crate) fn pollfd(fd: RawFd) -> libc::pollfd {
-    libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    }
-}
-
-/// Whether a write of at least one byte would go through without blocking.
-///
-/// A zero timeout: this is a question, not a wait. The one caller has nothing
-/// it may block for — see [`Attachment::answer_device_attributes`].
-fn writable(fd: RawFd) -> bool {
-    let mut p = [libc::pollfd {
-        fd,
-        events: libc::POLLOUT,
-        revents: 0,
-    }];
-    let n = unsafe { libc::poll(p.as_mut_ptr(), 1, 0) };
-    n > 0 && p[0].revents & libc::POLLOUT != 0
-}
-
-/// Readable, or gone. `POLLHUP` matters as much as `POLLIN`: on Linux the
-/// master reports hangup rather than readability once the child exits, and
-/// ignoring it would leave the loop spinning against a dead pty.
-pub(crate) fn ready(p: &libc::pollfd) -> bool {
-    p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
-}
-
-/// Throw away buffered child output without writing it anywhere, reporting
-/// whether the child asked for its terminal's device attributes on the way.
-///
-/// That answer is acted on by [`Attachment::reap`] alone, which is the one
-/// caller whose client has no terminal left to ask. The resume path ignores it:
-/// a request there belongs to a client that is *staying*, and the real terminal
-/// answers that one itself as soon as the pump is running again.
-fn discard_pending(fd: RawFd) -> bool {
-    let mut buf = [0u8; 8192];
-    let mut asked = false;
-    loop {
-        let mut p = [pollfd(fd)];
-        let n = unsafe { libc::poll(p.as_mut_ptr(), 1, 0) };
-        if n <= 0 || !ready(&p[0]) {
-            return asked;
-        }
-        match read_fd(fd, &mut buf) {
-            Ok(len) if len > 0 => {
-                asked = asked || asks_for_device_attributes(&buf[..len]);
-                continue;
-            }
-            _ => return asked,
-        }
-    }
 }
 
 /// Whether this chunk of client output contains a DA1 request.
@@ -3102,7 +2861,7 @@ fn apply(attachment: &mut Attachment, why: Repaint, served: Served) {
     if !served.repainted {
         // The shrink and its undo are not shown to the shadow: what the
         // client draws after them is for the size it was just told.
-        nudge(attachment.master.as_ref(), term::terminal_size());
+        nudge(&attachment.pty, term::terminal_size());
     }
 }
 
@@ -3264,13 +3023,13 @@ fn mouse_reporting(answer: &rmpv::Value) -> Option<term::MouseReporting> {
 /// at the more-prompt and not otherwise (a pending operator stays blank until
 /// its next key, which completes it). A client on a terminal with in-band
 /// resize reports ignores this altogether.
-fn nudge(master: &dyn MasterPty, size: PtySize) {
+fn nudge(pty: &sys::Pty, size: PtySize) {
     let nudged = PtySize {
         rows: size.rows.saturating_sub(1).max(1),
         ..size
     };
-    let _ = master.resize(nudged);
-    let _ = master.resize(size);
+    pty.resize(nudged);
+    pty.resize(size);
 }
 
 /// How long a resume waits on the server before relaying regardless.
@@ -3359,10 +3118,12 @@ fn repaint_through_server(sock: &Path, why: Repaint) -> Served {
     Served { repainted, mouse }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
+
+    use crate::sys::unix::{peek_child, pollfd, read_fd, ready};
 
     use super::*;
     use crate::keys::Direction;
@@ -3589,7 +3350,7 @@ mod tests {
     /// sized from `term::terminal_size()` (or 24x80), which no caller depends
     /// on.
     fn attached_to(script: &str) -> Attachment {
-        let mut cmd = CommandBuilder::new("sh");
+        let mut cmd = sys::Command::new("sh");
         cmd.arg("-c");
         cmd.arg(script);
         let mut a = spawn_client_with(
@@ -3628,7 +3389,7 @@ mod tests {
     /// tells "the signal was delivered" from "the process happens to still be
     /// in the state I expected".
     fn wait_for(a: &Attachment, byte: u8) -> bool {
-        let fd = a.master.as_raw_fd().expect("the master has an fd");
+        let fd = a.pty.fd().expect("the master has an fd");
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut buf = [0u8; 256];
         while Instant::now() < deadline {
@@ -3650,7 +3411,7 @@ mod tests {
     /// rather than about the `Attachment`, because the point is what is left
     /// behind after the attachment is gone.
     fn pid_of(a: &Attachment) -> Pid {
-        Pid::from_raw(a.child.process_id().expect("a spawned child has a pid") as i32)
+        Pid::from_raw(a.pty.pid().expect("a spawned child has a pid") as i32)
     }
 
     /// A hangup must count as "something happened", not be ignored.
@@ -4240,8 +4001,8 @@ mod tests {
     /// command line, so the process table says whether it is still there once
     /// `spawn` has let go of it — a pid it wrote to a file would not do, since
     /// a probe can fail before the shell has run a single line.
-    fn standin_client(tag: &str) -> CommandBuilder {
-        let mut cmd = CommandBuilder::new("sh");
+    fn standin_client(tag: &str) -> sys::Command {
+        let mut cmd = sys::Command::new("sh");
         cmd.arg("-c");
         cmd.arg(format!("while :; do read x; done # {}", standin_mark(tag)));
         cmd
@@ -4769,7 +4530,7 @@ mod tests {
     /// Output up to and including `byte`, as text, or whatever came before a
     /// few seconds ran out.
     fn read_until(a: &Attachment, byte: u8) -> String {
-        let fd = a.master.as_raw_fd().expect("the master has an fd");
+        let fd = a.pty.fd().expect("the master has an fd");
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut out = Vec::new();
         let mut buf = [0u8; 256];
@@ -4787,7 +4548,7 @@ mod tests {
 
     /// [`wait_for`], for something that must not happen: a short look.
     fn wait_briefly_for(a: &Attachment, byte: u8) -> bool {
-        let fd = a.master.as_raw_fd().expect("the master has an fd");
+        let fd = a.pty.fd().expect("the master has an fd");
         let deadline = Instant::now() + Duration::from_millis(300);
         let mut buf = [0u8; 256];
         while Instant::now() < deadline {
@@ -4923,7 +4684,7 @@ mod tests {
     /// still running: without the SIGCONT this sits for the whole of
     /// `REAP_TIMEOUT` and then kills it outright. Reachable because `<prefix>`
     /// chords are read by nvmux's own stdin loop, not by the client, so a client
-    /// that `check_child` has not revived yet can be retired on the switch.
+    /// that `Pty::check` has not revived yet can be retired on the switch.
     #[test]
     fn a_suspended_client_is_continued_so_the_hangup_lands() {
         let mut a = attached_to("exec sleep 30");
@@ -5028,7 +4789,7 @@ mod tests {
         // WNOWAIT: the notification is still there for the next look.
         assert_eq!(peek_child(pid), Peek::Stopped);
 
-        // What `check_child` does with a stop: consume it, then continue.
+        // What `Pty::check` does with a stop: consume it, then continue.
         assert!(matches!(
             waitpid(pid, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED)),
             Ok(WaitStatus::Stopped(_, Signal::SIGSTOP))

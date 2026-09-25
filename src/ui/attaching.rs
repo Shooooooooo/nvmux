@@ -69,7 +69,6 @@
 //! wakes the loop at once, so a fast attach pays nothing for the screen, and a
 //! key is read on the way round, at most a [`FRAME`] late.
 
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -223,7 +222,7 @@ struct Forward<'a> {
     sock: &'a Path,
     /// Opened on the first key, so an attach nobody types during — which is
     /// nearly all of them — costs no connection at all.
-    client: Option<rpc::Client<UnixStream>>,
+    client: Option<rpc::Connection>,
     /// Set once the session could not be reached or would not take a key, so
     /// it is not dialled again on every keystroke of a long wait. Nothing is
     /// reported: a key that did not arrive is exactly as bad as the key that

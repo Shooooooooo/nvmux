@@ -17,12 +17,23 @@
 //! parent-directory creation the config and state files share
 //! ([`create_private_parent`]) live here too, with the rest of the filesystem
 //! hygiene.
+//!
+//! # On Windows
+//!
+//! There is no socket in the runtime directory — a session's local endpoint is
+//! a named pipe, private by its own access list (see [`crate::ipc`]) — so the
+//! directory only holds the client log, and it lives under `%LOCALAPPDATA%`,
+//! which the user's profile already keeps private. The socket-path checks still
+//! apply to the paths nvmux composes for the *remote* host, which is Unix.
 
 use std::fs::DirBuilder;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::OnceLock;
 
+#[cfg(unix)]
 use nix::sys::stat::Mode;
 
 use crate::error::PathError;
@@ -47,9 +58,22 @@ pub const MAX_SOCK_PATH: usize = 100;
 const WARN_SOCK_PATH: usize = 90;
 
 /// The runtime directory for this user. Does not touch the filesystem.
+#[cfg(unix)]
 pub fn runtime_dir() -> PathBuf {
     // `geteuid` rather than `getuid`: the directory we can actually own.
     PathBuf::from(format!("{}{}", RUNTIME_DIR_PREFIX, nix::unistd::geteuid()))
+}
+
+/// The runtime directory for this user: `%LOCALAPPDATA%\nvmux`, or the user's
+/// temporary directory's `nvmux` when that is not set. Both are inside the
+/// user's profile. Does not touch the filesystem.
+#[cfg(windows)]
+pub fn runtime_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("nvmux")
 }
 
 /// Resolve, create if needed, and security-check the runtime directory.
@@ -71,6 +95,7 @@ pub fn ensure_runtime_dir() -> Result<PathBuf, PathError> {
 /// A code-execution control, not a privacy nicety: `/tmp` is mode 1777, so its
 /// sticky bit stops another user *deleting* our directory but not *creating* it
 /// first, and a socket they can reach runs `nvim_command("!sh")` as us.
+#[cfg(unix)]
 pub(crate) fn ensure_dir_secure(dir: &Path) -> Result<(), PathError> {
     let io = |source| PathError::Io {
         path: dir.to_path_buf(),
@@ -131,8 +156,43 @@ pub(crate) fn ensure_dir_secure(dir: &Path) -> Result<(), PathError> {
     )))
 }
 
+/// The Windows check: a real directory, created if missing — never a link or
+/// junction to one somewhere else. What keeps it private is where it is (the
+/// user's profile, whose access list its contents inherit) rather than a mode,
+/// and nothing that reaches a session is kept in it: see the module docs.
+#[cfg(windows)]
+pub(crate) fn ensure_dir_secure(dir: &Path) -> Result<(), PathError> {
+    let io = |source| PathError::Io {
+        path: dir.to_path_buf(),
+        source,
+    };
+    for _ in 0..8 {
+        // `symlink_metadata`: a symbolic link or a junction is not followed,
+        // and reports as a link rather than as the directory it names.
+        let meta = match std::fs::symlink_metadata(dir) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match DirBuilder::new().recursive(true).create(dir) {
+                    Ok(()) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(io(e)),
+                }
+            }
+            Err(e) => return Err(io(e)),
+        };
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            return Err(PathError::NotADirectory(dir.to_path_buf()));
+        }
+        return Ok(());
+    }
+    Err(io(std::io::Error::other(
+        "runtime directory kept changing underneath us",
+    )))
+}
+
 /// The umask nvmux was started under, kept by [`restrict_umask`] so that what
 /// it clamps can be handed back to the editor. See [`launch_umask`].
+#[cfg(unix)]
 static LAUNCH_UMASK: OnceLock<Mode> = OnceLock::new();
 
 /// Restrict the file mode creation mask for **this process**, remembering the
@@ -157,6 +217,10 @@ static LAUNCH_UMASK: OnceLock<Mode> = OnceLock::new();
 ///
 /// The first call wins, so the mask recorded is the one nvmux was started
 /// with rather than one a later call observed.
+///
+/// Nothing on Windows, which has no umask: what nvmux creates there inherits
+/// its access list from the directory it is created in.
+#[cfg(unix)]
 pub fn restrict_umask() {
     let previous = nix::sys::stat::umask(Mode::from_bits_truncate(0o077));
     let _ = LAUNCH_UMASK.set(previous);
@@ -168,9 +232,13 @@ pub fn restrict_umask() {
 /// `None` when [`restrict_umask`] has not run — only `main` calls it — in
 /// which case this process never moved the mask and there is nothing to
 /// restore: a child inherits the right one by doing nothing.
+#[cfg(unix)]
 pub fn launch_umask() -> Option<Mode> {
     LAUNCH_UMASK.get().copied()
 }
+
+#[cfg(windows)]
+pub fn restrict_umask() {}
 
 /// Validate a composed socket path against the `sun_path` budget.
 ///
@@ -304,15 +372,50 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> 
 /// directories — the config and the state file.
 pub(crate) fn create_private_parent(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
+        let mut builder = DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        builder.mode(0o700);
+        builder.create(parent)?;
     }
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn the_runtime_directory_is_made_and_accepted_once_made() {
+        let dir = std::env::temp_dir().join(format!("nvmux-rt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_dir_secure(&dir).expect("made");
+        assert!(dir.is_dir());
+        ensure_dir_secure(&dir).expect("accepted as it is");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_in_the_way_is_not_a_runtime_directory() {
+        let path = std::env::temp_dir().join(format!("nvmux-rt-file-{}", std::process::id()));
+        std::fs::write(&path, b"x").expect("write");
+        let err = ensure_dir_secure(&path).expect_err("refused");
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(err, PathError::NotADirectory(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn an_atomic_write_replaces_what_was_there() {
+        let path = std::env::temp_dir().join(format!("nvmux-atomic-{}.json", std::process::id()));
+        write_atomic(&path, b"one").expect("first");
+        write_atomic(&path, b"two").expect("second, over the first");
+        let got = std::fs::read(&path).expect("read");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got, b"two");
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
