@@ -245,9 +245,10 @@ pub struct Attachment {
     /// one not kept always is, simply asks again.
     startup_answered: bool,
     /// Its in-band size reports were just turned back on (see
-    /// [`Attachment::put_back_what_it_told`]), and the terminal's answer —
-    /// a report of the size it already has — is yet to be forwarded.
-    expecting_a_size_report: bool,
+    /// [`Attachment::put_back_what_it_told`]): the size it already has, and
+    /// until when the terminal's answer — a report of that same size — is
+    /// looked for, to be kept from it (see [`Attachment::saw_input`]).
+    expecting_a_size_report: Option<(PtySize, Instant)>,
     /// How many client exits had been relayed to the terminal when this one
     /// was parked, against [`EXITS_RELAYED`] when it comes back: a difference
     /// is some other client's exit sequence having turned off modes this one
@@ -417,6 +418,12 @@ const FRAME_WAIT: Duration = Duration::from_millis(50);
 /// still writing, not one that is behind.
 const DRAIN_MAX: usize = 64 * 1024;
 
+/// How long after a resume turns a kept client's in-band size reports back
+/// on the terminal's answer is looked for (see `Attachment::saw_input`). A
+/// terminal answers as soon as it reads the mode; this only bounds how long
+/// one that does not leaves a report of the same size to be kept back.
+const SIZE_REPORT_WAIT: Duration = Duration::from_secs(1);
+
 /// The report a terminal with in-band resize reports on (DEC mode 2048)
 /// sends when its size changes: `CSI 48 ; rows ; cols ; height ; width t`,
 /// the last two in pixels, which a terminal that does not know them reports as
@@ -585,28 +592,39 @@ impl Attachment {
 
     /// Note what the user's terminal sends the client, for the two things a
     /// kept client needs to know of it: that its opening questions have been
-    /// answered (see [`Attachment::startup_answered`]), and that the size
-    /// report a resume set off has gone through. True for the second, which
-    /// wants the server's repaint asked for again: the client answers the
-    /// report by asking its server to resize, and a server in `input()` or
-    /// `getchar()` answers that with a clear and next to nothing else — which
-    /// must not be the last word, if the `:mode` asked on the resume got in
-    /// first.
-    fn saw_input(&mut self, step: &Step) -> bool {
+    /// answered (see [`Attachment::startup_answered`]), and the size report a
+    /// resume set off — which is taken out.
+    ///
+    /// A terminal answers in-band size reports being turned back on with a
+    /// report of the size it has, which is the size the client has too.
+    /// Passed on, it has the client ask its server to resize to that same
+    /// size, and a server in `input()` or `getchar()` answers that with a
+    /// clear and nothing but the prompt's row — after the `:mode` the resume
+    /// asked for, as often as not, which is then wiped. Kept from the client
+    /// it changes nothing: a size that changed while the client was parked it
+    /// has been told already (see [`Attachment::tell_its_size`]). A report of
+    /// any other size is a resize made since, and goes through.
+    fn saw_input(&mut self, step: &mut Step) {
         if self.ledger.is_none() {
-            return false;
+            return;
         }
         let Step::Forward(bytes) = step else {
-            return false;
+            return;
         };
         if !self.startup_answered && answers_device_attributes(bytes) {
             self.startup_answered = true;
         }
-        if self.expecting_a_size_report && reports_size_in_band(bytes) {
-            self.expecting_a_size_report = false;
-            return true;
+        let Some((size, until)) = self.expecting_a_size_report else {
+            return;
+        };
+        if Instant::now() > until {
+            self.expecting_a_size_report = None;
+        } else if let Some((at, rows, cols)) = find_size_report(bytes) {
+            self.expecting_a_size_report = None;
+            if (rows, cols) == (size.rows, size.cols) {
+                bytes.drain(at);
+            }
         }
-        false
     }
 
     /// Whether this client is kept one per session (`[client] per_session`):
@@ -705,22 +723,26 @@ impl Attachment {
     /// Put back what the client told the terminal and would not tell it
     /// again, before it draws on it: its mouse reporting, its title, its
     /// keyboard protocol and its cursor's shape and colour — and, if another
-    /// client's exit
-    /// has reached the terminal since this one was parked, the modes that
-    /// exit turned off (see [`crate::ledger::Ledger::put_back`]).
+    /// client's exit has reached the terminal since this one was parked, the
+    /// modes that exit turned off (see [`crate::ledger::Ledger::put_back`]).
+    /// `size` is the size the client has now, the one the terminal answers
+    /// in-band size reports turned back on with (see
+    /// [`Attachment::saw_input`]).
     ///
     /// For a kept client's return, where it is exact — the ledger holds what
     /// the client itself last wrote. A client that is not kept has its
     /// server asked about the mouse instead, and the rest left alone (see
     /// [`repaint_through_server`]).
-    fn put_back_what_it_told(&mut self) {
+    fn put_back_what_it_told(&mut self, size: PtySize) {
         let Some(ledger) = self.ledger.as_ref().filter(|l| l.is_usable()) else {
             return;
         };
         term::set_mouse_reporting(ledger.mouse());
         let after_an_exit =
             EXITS_RELAYED.load(std::sync::atomic::Ordering::Relaxed) != self.exits_seen;
-        self.expecting_a_size_report = ledger.puts_back_in_band_reports(after_an_exit);
+        self.expecting_a_size_report = ledger
+            .puts_back_in_band_reports(after_an_exit)
+            .then(|| (size, Instant::now() + SIZE_REPORT_WAIT));
         if let Err(e) = write_stdout(&ledger.put_back(after_an_exit)) {
             tracing::debug!(error = %e, "could not put the client's settings back");
         }
@@ -2084,7 +2106,7 @@ fn spawn_client_with(
         // only kind that is ever resumed from what it wrote.
         ledger: kept.then(Ledger::new),
         startup_answered: false,
-        expecting_a_size_report: false,
+        expecting_a_size_report: None,
         exits_seen: 0,
     })
 }
@@ -2222,7 +2244,7 @@ pub fn relay(
             if dissolved {
                 attachment.hand_back_the_pen();
             }
-            attachment.put_back_what_it_told();
+            attachment.put_back_what_it_told(size);
             attachment.tell_its_size(size, resized);
             erasing = match Erasing::start_for(&attachment.sock, "kept client's return") {
                 Ok(started) => Some(started),
@@ -2635,13 +2657,10 @@ fn pump(
             // `timeout` resolves a lone prefix into a literal one, but also a
             // half-typed session number into a switch — so the actions it
             // produces must be acted on, not just the bytes.
-            for step in prefix.timeout() {
-                let repaint = attachment.saw_input(&step);
+            for mut step in prefix.timeout() {
+                attachment.saw_input(&mut step);
                 if let Some(outcome) = act(&mut attachment.writer, step)? {
                     return Ok(outcome);
-                }
-                if repaint {
-                    erasing = ask_again(attachment, erasing);
                 }
             }
         }
@@ -2653,13 +2672,10 @@ fn pump(
                 Ok(len) => {
                     // Deliberately NOT logged: every keystroke the user types,
                     // into a /tmp file that outlives the session.
-                    for step in prefix.feed(&buf[..len]) {
-                        let repaint = attachment.saw_input(&step);
+                    for mut step in prefix.feed(&buf[..len]) {
+                        attachment.saw_input(&mut step);
                         if let Some(outcome) = act(&mut attachment.writer, step)? {
                             return Ok(outcome);
-                        }
-                        if repaint {
-                            erasing = ask_again(attachment, erasing);
                         }
                     }
                     // Every keystroke restarts the clock, so a number typed at
@@ -2964,29 +2980,26 @@ fn asks_for_device_attributes(chunk: &[u8]) -> bool {
     chunk.windows(DA1_REQUEST.len()).any(|w| w == DA1_REQUEST)
 }
 
-/// The kept client's return repaint, asked again once the size report a
-/// resume set off has reached the client (see [`Attachment::saw_input`]):
-/// after it, so that the server's answer to the resize it asks for is not the
-/// last word. Replaces one still in flight, whose answer no longer matters.
-fn ask_again(attachment: &mut Attachment, in_flight: Option<Erasing>) -> Option<Erasing> {
-    drop(in_flight);
-    match Erasing::start_for(
-        &attachment.sock,
-        "kept client's return, after its size report",
-    ) {
-        Ok(started) => Some(started),
-        Err(e) => {
-            tracing::debug!(error = %e, "no thread for the kept client's repaint");
-            apply(attachment, Repaint::Notice, Served::NONE);
-            None
-        }
+/// Where in these bytes, on their way from the terminal to a client, an
+/// in-band size report is — `CSI 48 ; rows ; cols ; height ; width t` — and
+/// the rows and columns it reports. The first one only, which is all a
+/// terminal answering a mode being set sends; and only whole, which is how
+/// the key parser passes on a sequence (see [`crate::keys`]).
+fn find_size_report(bytes: &[u8]) -> Option<(std::ops::Range<usize>, u16, u16)> {
+    const START: &[u8] = b"\x1b[48;";
+    let at = bytes.windows(START.len()).position(|w| w == START)?;
+    let params = &bytes[at + START.len()..];
+    let len = params
+        .iter()
+        .take_while(|b| b.is_ascii_digit() || **b == b';')
+        .count();
+    if params.get(len) != Some(&b't') {
+        return None;
     }
-}
-
-/// Whether these bytes, on their way from the terminal to a client, carry an
-/// in-band size report: `CSI 48 ; …`.
-fn reports_size_in_band(bytes: &[u8]) -> bool {
-    bytes.windows(5).any(|w| w == b"\x1b[48;")
+    let mut fields = std::str::from_utf8(&params[..len]).ok()?.split(';');
+    let rows = fields.next()?.parse().ok()?;
+    let cols = fields.next()?.parse().ok()?;
+    Some((at..at + START.len() + len + 1, rows, cols))
 }
 
 /// Whether these bytes, on their way from the terminal to a client, carry a
@@ -4791,33 +4804,81 @@ mod tests {
         false
     }
 
+    /// What the relay passes on of `bytes` from the terminal, having shown
+    /// them to [`Attachment::saw_input`].
+    fn passed_on(a: &mut Attachment, bytes: &[u8]) -> Vec<u8> {
+        let mut step = Step::Forward(bytes.to_vec());
+        a.saw_input(&mut step);
+        match step {
+            Step::Forward(bytes) => bytes,
+            Step::Act(action) => panic!("{action:?} out of forwarded bytes"),
+        }
+    }
+
+    /// The terminal's answer to in-band size reports turned back on is taken
+    /// out of what it sends the client: only that answer, only at the size
+    /// the client has, only once, and only while it is looked for.
+    #[test]
+    fn the_terminals_answer_to_a_replayed_size_mode_is_kept_from_the_client() {
+        let size = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let report: &[u8] = b"\x1b[48;24;80;480;800t";
+        let mut a = kept("exec sleep 30");
+        a.startup_answered = true;
+        assert_eq!(passed_on(&mut a, report), report, "not looked for");
+
+        a.expecting_a_size_report = Some((size, Instant::now() + SIZE_REPORT_WAIT));
+        assert_eq!(passed_on(&mut a, b"j"), b"j");
+        assert_eq!(
+            passed_on(&mut a, b"j\x1b[48;24;80;480;800tk"),
+            b"jk",
+            "the keys either side of it go through"
+        );
+        assert!(a.expecting_a_size_report.is_none());
+        assert_eq!(passed_on(&mut a, report), report, "taken out once");
+
+        a.expecting_a_size_report = Some((size, Instant::now() + SIZE_REPORT_WAIT));
+        let resized: &[u8] = b"\x1b[48;30;100;600;1000t";
+        assert_eq!(passed_on(&mut a, resized), resized, "a resize since");
+        assert!(a.expecting_a_size_report.is_none());
+
+        a.expecting_a_size_report = Some((size, Instant::now()));
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(passed_on(&mut a, report), report, "too late to be it");
+        assert!(a.expecting_a_size_report.is_none());
+    }
+
+    /// A report by its shape, wherever it falls in what the terminal sent,
+    /// and nothing short of one.
+    #[test]
+    fn a_size_report_is_found_by_its_shape() {
+        assert_eq!(
+            find_size_report(b"ab\x1b[48;24;80;0;0tcd"),
+            Some((2..17, 24, 80))
+        );
+        assert_eq!(find_size_report(b"\x1b[48;24;80;0;0"), None, "unfinished");
+        assert_eq!(find_size_report(b"\x1b[48;24t"), None, "no columns");
+        assert_eq!(find_size_report(b"\x1b[4;24;80;0;0t"), None);
+        assert_eq!(find_size_report(b"\x1b[?2048;2$y"), None);
+    }
+
     /// A kept client is parked only once the terminal has answered what it
     /// asked on the way up — the answer to its DA1, the last of its questions,
     /// forwarded to it through the relay.
     #[test]
-    fn a_size_report_after_a_replayed_mode_asks_for_the_repaint_again() {
-        let mut a = kept("exec sleep 30");
-        a.startup_answered = true;
-        assert!(!a.saw_input(&Step::Forward(b"\x1b[48;24;80;0;0t".to_vec())));
-        a.expecting_a_size_report = true;
-        assert!(!a.saw_input(&Step::Forward(b"j".to_vec())));
-        assert!(a.saw_input(&Step::Forward(b"\x1b[48;24;80;0;0t".to_vec())));
-        assert!(
-            !a.expecting_a_size_report,
-            "asked again for the same report"
-        );
-    }
-
-    #[test]
     fn a_client_is_parkable_once_its_questions_are_answered() {
         let mut a = kept("exec sleep 30");
         assert!(!a.is_parkable(), "parkable before any answer");
-        a.saw_input(&Step::Forward(b"j".to_vec()));
+        passed_on(&mut a, b"j");
         assert!(!a.is_parkable(), "a key is not an answer");
-        a.saw_input(&Step::Forward(b"\x1b[?62;22c".to_vec()));
+        passed_on(&mut a, b"\x1b[?62;22c");
         assert!(a.is_parkable());
         let mut plain = attached_to("exec sleep 30");
-        plain.saw_input(&Step::Forward(b"\x1b[?62;22c".to_vec()));
+        passed_on(&mut plain, b"\x1b[?62;22c");
         assert!(
             !plain.is_parkable(),
             "a client that is not kept is never parked"

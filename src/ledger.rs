@@ -235,8 +235,9 @@ impl Ledger {
     }
 
     /// Whether [`Ledger::put_back`] turns in-band size reports on — which a
-    /// terminal that has them answers with a report of its own, and so with a
-    /// resize the client asks its server for (see `pty::relay`).
+    /// terminal that has them answers with a report of its own, of the size
+    /// the client already has, for the relay to keep from it (see
+    /// `pty::Attachment::saw_input`).
     pub fn puts_back_in_band_reports(&self, after_an_exit: bool) -> bool {
         self.putting_back(after_an_exit).1
     }
