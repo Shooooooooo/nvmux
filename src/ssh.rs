@@ -10,11 +10,16 @@
 //! removed with `-O cancel`, tested with `-O check`.
 //!
 //! `ControlPath` is computed by nvmux rather than left to ssh's `%C`/`%h%p%r`
-//! tokens, which expand to unpredictable lengths — see [`crate::paths`].
+//! tokens, which expand to unpredictable lengths — see [`crate::paths`]. It is
+//! also not where a master binds: each binds a socket of its own and is linked
+//! to the `ControlPath` once it is up, so that no master can ever remove
+//! another's — see [`Ssh::ensure_master_within`].
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::error::SshError;
+use crate::paths;
 use crate::proc;
 use crate::shell;
 
@@ -104,7 +109,8 @@ fn unattended(ctl: &Path) -> Vec<String> {
     args
 }
 
-/// Arguments for bringing up the shared master connection.
+/// Arguments for bringing up a master connection, bound at `own`: its own
+/// socket, not the shared `ControlPath` — see [`Ssh::ensure_master_within`].
 ///
 /// `StreamLocalBindUnlink=yes` belongs **here** and nowhere else: the master
 /// performs the bind, so setting it on an `-O forward` client does nothing.
@@ -119,7 +125,7 @@ fn unattended(ctl: &Path) -> Vec<String> {
 /// down drops packets rather than refusing them, so without a bound each
 /// attempt would hang for the minutes the kernel allows and the series would
 /// never get to its next try. See [`crate::reconnect`].
-pub fn master_args(host: &str, ctl: &Path, connect_timeout: Option<u64>) -> Vec<String> {
+pub fn master_args(host: &str, own: &Path, connect_timeout: Option<u64>) -> Vec<String> {
     let mut args = vec![
         "-M".into(),
         "-N".into(),
@@ -141,8 +147,15 @@ pub fn master_args(host: &str, ctl: &Path, connect_timeout: Option<u64>) -> Vec<
     if let Some(secs) = connect_timeout {
         args.extend(["-o".into(), format!("ConnectTimeout={secs}")]);
     }
-    args.extend(common(ctl));
+    args.extend(common(own));
     args.push(host.to_string());
+    args
+}
+
+/// Ask the master answering on `own` to exit.
+fn exit_args(host: &str, own: &Path) -> Vec<String> {
+    let mut args = common(own);
+    args.extend(["-O".into(), "exit".into(), host.to_string()]);
     args
 }
 
@@ -244,9 +257,7 @@ pub fn classify(host: &str, code: i32, stderr: &str) -> SshError {
     {
         return SshError::Unreachable(host.to_string());
     }
-    if lower.contains("control socket connect")
-        || lower.contains("no such file or directory") && lower.contains("control")
-    {
+    if says_no_master(stderr) {
         return SshError::NoMaster(host.to_string());
     }
     if lower.contains("broken pipe")
@@ -259,6 +270,45 @@ pub fn classify(host: &str, code: i32, stderr: &str) -> SshError {
         code,
         stderr: stderr.trim().to_string(),
     }
+}
+
+/// Whether ssh's words say there is no master behind the `ControlPath`:
+/// nothing there to connect to, or a socket whose master has gone.
+fn says_no_master(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    lower.contains("control socket connect")
+        || lower.contains("no such file or directory") && lower.contains("control")
+}
+
+/// What connecting to the `ControlPath` says — the question `ssh -O check`
+/// asks, without the fork, and so without an answer that has had
+/// milliseconds to go stale by the time it is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    /// Something accepted: in a directory only we can write to, a master.
+    Answered,
+    /// Nothing is there.
+    Absent,
+    /// Something is there and nothing accepted: a socket whose master has
+    /// gone, or not a socket at all.
+    Refused,
+}
+
+fn probe(path: &Path) -> Probe {
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => Probe::Answered,
+        Err(e) if e.kind() == ErrorKind::NotFound => Probe::Absent,
+        Err(_) => Probe::Refused,
+    }
+}
+
+/// What is on the `ControlPath` once anything dead there has been cleared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cleared {
+    /// Nothing: a master can be linked there.
+    Empty,
+    /// A master answered, so there is one to use and nothing to start.
+    Taken,
 }
 
 /// A driver for one host's ssh connection.
@@ -308,19 +358,44 @@ impl Ssh {
 
     /// The same, with the connection attempt bounded to `connect_timeout`
     /// seconds — see [`master_args`] for when that is wanted.
+    ///
+    /// A master binds a socket of its own, [`paths::master_socket`], and is
+    /// linked to the `ControlPath` once it is up rather than bound there. The
+    /// reason is what ssh does on its way out: it removes its `ControlPath` by
+    /// name, whoever's socket the name holds by then. Every nvmux talking to
+    /// one host shares that name, and a master that has lost it — to anything
+    /// that deletes the file — keeps running for as long as it has clients,
+    /// then takes the name from under whichever master was linked there since.
+    /// That master's shell is still up, so everything that asks it says the
+    /// link is fine, and every `-O forward` fails for want of a socket.
+    /// Verified. Bound at a name of its own, a master that leaves removes only
+    /// that.
+    ///
+    /// The link is also what settles two nvmux bringing masters up at once:
+    /// the first to link wins, and the other master is told to exit. Bound at
+    /// the shared name, the second would have found it taken, which ssh
+    /// answers by switching multiplexing off and staying up regardless — an
+    /// idle connection nothing could reach, for as long as the network held.
+    ///
+    /// Which leaves every master's linked name behind when it exits: a socket
+    /// nothing listens on, cleared by `clear_control_path` before the next
+    /// master is linked there.
     pub fn ensure_master_within(&self, connect_timeout: Option<u64>) -> Result<(), SshError> {
         if self.is_master_alive() {
             return Ok(());
         }
-        self.clear_stale_control_socket();
+        if self.clear_control_path()? == Cleared::Taken {
+            return Ok(());
+        }
+        let nonce = crate::ids::nonce().map_err(|e| SshError::Failed {
+            code: -1,
+            stderr: format!("naming a master connection to {}: {e}", self.host),
+        })?;
+        let own = paths::master_socket(&self.control_path, &nonce);
         // `-f` backgrounds ssh once authentication is done, so this blocks for
         // exactly as long as a key touch or passphrase takes.
         let out = self
-            .run(&master_args(
-                &self.host,
-                &self.control_path,
-                connect_timeout,
-            ))
+            .run(&master_args(&self.host, &own, connect_timeout))
             .map_err(|e| spawn_error(e, &self.host))?;
         if !out.status.success() {
             return Err(classify(
@@ -329,36 +404,100 @@ impl Ssh {
                 &String::from_utf8_lossy(&out.stderr),
             ));
         }
-        Ok(())
+        self.publish(&own)
     }
 
-    /// Remove a ControlPath left behind by a master that died uncleanly.
+    /// Make way on the `ControlPath` for a new master — or find that one has
+    /// arrived there since `ssh -O check` looked.
     ///
-    /// A SIGKILLed master does not unlink its socket, and starting a new one
-    /// over the corpse does **not** fail: ssh prints `ControlSocket ... already
-    /// exists, disabling multiplexing` and exits **0**. Multiplexing is then
-    /// silently off and every later `-O forward` fails with no master. Verified.
-    ///
-    /// Only called once `-O check` has said nothing is listening, and only for
-    /// a socket we own.
-    fn clear_stale_control_socket(&self) {
+    /// What a dead master leaves there, cleanly or killed outright, is a
+    /// socket nothing listens on, and a name taken is a name no new master can
+    /// be linked to. So a dead one is removed: only a socket, only ours, and
+    /// only once connecting to it has been refused — never on the word of
+    /// `-O check`, whose answer is a fork old by the time it is read. Another
+    /// nvmux can link its master in that gap, and removing that master's
+    /// socket on `-O check`'s say-so is how a master came to be running with
+    /// no name to be reached by — 11 times in 260 when a second nvmux began
+    /// its restart about as long after the first as a master takes to come
+    /// up. A socket that accepts is that master, and is used rather than
+    /// joined by a second.
+    fn clear_control_path(&self) -> Result<Cleared, SshError> {
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
-        let Ok(meta) = std::fs::symlink_metadata(&self.control_path) else {
-            return;
+        match probe(&self.control_path) {
+            Probe::Answered => return Ok(Cleared::Taken),
+            Probe::Absent => return Ok(Cleared::Empty),
+            Probe::Refused => {}
+        }
+        let meta = match std::fs::symlink_metadata(&self.control_path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Cleared::Empty),
+            Err(e) => return Err(in_the_way(&self.control_path, &e.to_string())),
         };
-        if !meta.file_type().is_socket() {
-            tracing::warn!(
-                path = %self.control_path.display(),
-                "refusing to remove a stale ControlPath that is not a socket"
-            );
-            return;
+        if !meta.file_type().is_socket() || meta.uid() != nix::unistd::geteuid().as_raw() {
+            return Err(in_the_way(
+                &self.control_path,
+                "not a socket of ours, so nvmux will not remove it",
+            ));
         }
-        if meta.uid() != nix::unistd::geteuid().as_raw() {
-            tracing::warn!(path = %self.control_path.display(), "stale ControlPath is not ours");
-            return;
+        tracing::info!(path = %self.control_path.display(), "removing a dead ControlPath");
+        match std::fs::remove_file(&self.control_path) {
+            Err(e) if e.kind() != ErrorKind::NotFound => {
+                Err(in_the_way(&self.control_path, &e.to_string()))
+            }
+            _ => Ok(Cleared::Empty),
         }
-        tracing::info!(path = %self.control_path.display(), "removing a stale ControlPath");
-        let _ = std::fs::remove_file(&self.control_path);
+    }
+
+    /// Link the master answering on `own` to the `ControlPath`, where every
+    /// other ssh command finds it — unless another master got there first, in
+    /// which case that one serves and this one is told to go.
+    fn publish(&self, own: &Path) -> Result<(), SshError> {
+        // Round again only when the name is found dead, or gone, between the
+        // failed link and the look at what took it.
+        for _ in 0..3 {
+            let taken = match std::fs::hard_link(own, &self.control_path) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => self.clear_control_path(),
+                // The master went between `-f` returning and here, and took
+                // its socket with it.
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    return Err(SshError::MasterDied(self.host.clone()));
+                }
+                Err(e) => Err(in_the_way(&self.control_path, &e.to_string())),
+            };
+            match taken {
+                Ok(Cleared::Empty) => {}
+                Ok(Cleared::Taken) => {
+                    tracing::info!(host = %self.host, "another master was linked first; retiring ours");
+                    self.retire(own);
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.retire(own);
+                    return Err(e);
+                }
+            }
+        }
+        self.retire(own);
+        Err(in_the_way(
+            &self.control_path,
+            "it kept changing while a master was being linked to it",
+        ))
+    }
+
+    /// Tell the master answering on `own` to exit. Nothing was ever linked to
+    /// it, so no client can be on it: this ends the connection it holds and
+    /// nothing else. Left alone it would still go, a minute later, by
+    /// `ControlPersist`.
+    fn retire(&self, own: &Path) {
+        match self.run(&exit_args(&self.host, own)) {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => tracing::debug!(
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "could not retire a master"
+            ),
+            Err(e) => tracing::debug!(error = %e, "could not retire a master"),
+        }
     }
 
     /// Point a local socket at a remote one, idempotently.
@@ -368,6 +507,10 @@ impl Ssh {
     /// it exits 0 and does not recreate the socket file. A local socket that
     /// went missing while the forward was still registered would otherwise leave
     /// a forward that reports success and cannot be connected to.
+    ///
+    /// No master to forward on is [`SshError::NoMaster`] rather than a failed
+    /// forward, because it is the one failure a caller can do something about:
+    /// bring a master back, and ask again.
     pub fn forward(&self, local: &Path, remote: &Path) -> Result<(), SshError> {
         // Cancelling a forward that does not exist fails; that is the common
         // case, not a problem.
@@ -386,10 +529,15 @@ impl Ssh {
             .run(&forward_args(&self.host, &self.control_path, local, remote))
             .map_err(|e| spawn_error(e, &self.host))?;
         if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            if says_no_master(&stderr) {
+                tracing::debug!(host = %self.host, %stderr, "no master to forward on");
+                return Err(SshError::NoMaster(self.host.clone()));
+            }
             return Err(SshError::ForwardFailed {
                 local: local.to_path_buf(),
                 remote: remote.to_path_buf(),
-                stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                stderr,
             });
         }
         Ok(())
@@ -424,6 +572,14 @@ impl Ssh {
         cmd.args(&argv);
         proc::Shell::start(&mut cmd, format!("ssh {}", self.host))
             .map_err(|e| spawn_error(e, &self.host))
+    }
+}
+
+/// The `ControlPath` is occupied by something no master can be linked over.
+fn in_the_way(path: &Path, why: &str) -> SshError {
+    SshError::Failed {
+        code: -1,
+        stderr: format!("{}: {why}", path.display()),
     }
 }
 
@@ -566,6 +722,94 @@ mod tests {
         assert!(!s.contains("ControlMaster"));
         assert!(s.contains("-O forward"));
         assert!(s.contains("-L /tmp/l.sock:/tmp/r.sock"));
+    }
+
+    /// A master nothing was ever linked to can only be reached at the socket
+    /// it bound, so that is where it is told to go.
+    #[test]
+    fn a_master_is_retired_at_its_own_socket() {
+        let own = format!("{CTL}.abcdefgh");
+        let s = joined(&exit_args("myhost", Path::new(&own)));
+        assert_eq!(s, format!("-o ControlPath={own} -O exit myhost"));
+    }
+
+    /// Both ways ssh says there is no master behind the `ControlPath` — no
+    /// socket, and a socket nothing listens on — and not the refusal a
+    /// working master gives a forward it cannot make.
+    #[test]
+    fn a_forward_with_no_master_is_told_from_one_the_master_refused() {
+        assert!(says_no_master(
+            "Control socket connect(/tmp/nvmux-1000/cm-e2gisxlk): No such file or directory"
+        ));
+        assert!(says_no_master(
+            "Control socket connect(/tmp/nvmux-1000/cm-e2gisxlk): Connection refused"
+        ));
+        assert!(!says_no_master(
+            "mux_client_forward_request: forwarding request failed: Port forwarding failed"
+        ));
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nvmux-ssh-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        dir
+    }
+
+    /// The race this guards against, reduced to its end state: `-O check`
+    /// has already said nothing is there, and by the time the path is looked
+    /// at, another nvmux's master is. Removing it would leave that master
+    /// running with no name to be reached by.
+    #[test]
+    fn a_control_path_something_answers_on_is_used_rather_than_cleared() {
+        let dir = scratch("answered");
+        let ctl = dir.join("cm");
+        let listener = std::os::unix::net::UnixListener::bind(&ctl).expect("bind");
+        let ssh = Ssh::new("h".into(), ctl.clone());
+
+        assert_eq!(probe(&ctl), Probe::Answered);
+        assert_eq!(ssh.clear_control_path().expect("cleared"), Cleared::Taken);
+        assert!(ctl.exists(), "a live master's socket was removed");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a master leaves behind — every one now, since only its own name
+    /// goes with it — is cleared, so the next can be linked in its place.
+    #[test]
+    fn a_control_path_nothing_answers_on_is_cleared() {
+        let dir = scratch("refused");
+        let ctl = dir.join("cm");
+        drop(std::os::unix::net::UnixListener::bind(&ctl).expect("bind"));
+        let ssh = Ssh::new("h".into(), ctl.clone());
+
+        assert_eq!(probe(&ctl), Probe::Refused, "a socket nothing listens on");
+        assert_eq!(ssh.clear_control_path().expect("cleared"), Cleared::Empty);
+        assert!(!ctl.exists(), "the dead socket was left in the way");
+
+        assert_eq!(probe(&ctl), Probe::Absent);
+        assert_eq!(
+            ssh.clear_control_path().expect("nothing to clear"),
+            Cleared::Empty
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only a socket is ever removed: whatever else is there is reported
+    /// rather than deleted, before a connection is spent on a master that
+    /// could not be linked over it.
+    #[test]
+    fn a_control_path_that_is_not_a_socket_is_left_alone_and_reported() {
+        let dir = scratch("file");
+        let ctl = dir.join("cm");
+        std::fs::write(&ctl, b"not a socket").expect("write");
+        let ssh = Ssh::new("h".into(), ctl.clone());
+
+        let err = ssh.clear_control_path().expect_err("refused");
+        assert!(err.to_string().contains("not a socket"), "{err}");
+        assert_eq!(std::fs::read(&ctl).expect("still there"), b"not a socket");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

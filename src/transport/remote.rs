@@ -72,8 +72,17 @@ impl std::fmt::Debug for SshTransport {
 
 impl SshTransport {
     pub fn new(host: String) -> Result<Self> {
+        Self::with_dir(host, paths::ensure_runtime_dir()?)
+    }
+
+    /// Keep this end of the connection — the master's `ControlPath` and the
+    /// local end of every forward — in `local_dir` rather than the runtime
+    /// directory, so that a test can pull the master out from under one
+    /// transport without disturbing any other. The same security check
+    /// applies.
+    pub fn with_dir(host: String, local_dir: PathBuf) -> Result<Self> {
+        paths::ensure_dir_secure(&local_dir)?;
         let host_token = ids::host_token(&host);
-        let local_dir = paths::ensure_runtime_dir()?;
         let control_path = paths::control_path(&local_dir, &host_token)?;
 
         // Checked before connecting, so the error names the real problem.
@@ -270,6 +279,11 @@ impl SshTransport {
     /// A dead shell is dropped here, so the next script starts a fresh one
     /// over whatever master [`Self::restore_master`] leaves.
     ///
+    /// What a live shell vouches for is a master *process*. Whether that
+    /// master can still be reached at the `ControlPath` is another question,
+    /// and the forward that needs the answer is where it is asked — see
+    /// [`Self::forward`].
+    ///
     /// `connect_timeout` is passed through to the master, for the one caller
     /// that is retrying — see [`crate::ssh::master_args`].
     fn reconnect_if_needed(&self, connect_timeout: Option<u64>) -> Result<Reconnect> {
@@ -321,6 +335,47 @@ impl SshTransport {
         self.ssh.ensure_master_within(connect_timeout)?;
         tracing::info!(host = %self.host(), "reconnected");
         Ok(Reconnect::Restored)
+    }
+
+    /// Point a session's local socket at its remote one — and if ssh says
+    /// there is no master to do that over, bring one back and ask once more.
+    ///
+    /// This is where a live shell's word for the master is found to be wrong.
+    /// The shell vouches for the master process it rides on, and `-O forward`
+    /// needs that master's socket at the `ControlPath`. The two come apart when
+    /// the socket goes and the master does not: the shell stays up, nothing
+    /// that asks it hears otherwise, and every attach fails with ssh's
+    /// `Control socket connect(...): No such file or directory` — "press enter
+    /// to retry" included, since nothing on that path asked ssh again.
+    ///
+    /// So the shell is let go, since it rides a master nothing can reach and
+    /// would go on vouching for it; the forwards made through that master are
+    /// forgotten, for the same reason; the master is restored; and the forward
+    /// is asked for again. Once: a second refusal straight after a master was
+    /// brought up is not one waiting will fix.
+    fn forward(&self, local: &Path, remote: &Path) -> Result<()> {
+        match self.ssh.forward(local, remote) {
+            Err(SshError::NoMaster(_)) => {
+                tracing::info!(host = %self.host(), "no master behind the ControlPath; bringing one back");
+                self.let_go_of_shell();
+                self.forwarded.lock().map(|mut f| f.clear()).ok();
+                self.restore_master(None)?;
+                Ok(self.ssh.forward(local, remote)?)
+            }
+            forwarded => Ok(forwarded?),
+        }
+    }
+
+    /// Drop the shell, so that the next script starts one over whatever master
+    /// is on the `ControlPath` by then.
+    fn let_go_of_shell(&self) {
+        let mut slot = match self.shell.try_lock() {
+            Ok(slot) => slot,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            // Held only by `run_script`, which never calls this.
+            Err(TryLockError::WouldBlock) => return,
+        };
+        *slot = None;
     }
 }
 
@@ -390,7 +445,7 @@ impl Host for SshTransport {
 
     fn reach(&self, id: &str, host_sock: &Path) -> Result<PathBuf> {
         let local = self.local_sock(id)?;
-        self.ssh.forward(&local, host_sock)?;
+        self.forward(&local, host_sock)?;
         self.forwarded
             .lock()
             .map(|mut f| f.insert(id.to_string()))
@@ -515,7 +570,7 @@ impl Transport for SshTransport {
             return Ok(local);
         }
 
-        self.ssh.forward(&local, &remote)?;
+        self.forward(&local, &remote)?;
         self.forwarded
             .lock()
             .map(|mut f| f.insert(s.id.clone()))

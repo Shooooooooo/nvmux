@@ -296,26 +296,108 @@ fn a_listing_keeps_live_forwards_and_removes_orphaned_ones() {
     client.api_info().expect("still usable after a listing");
 }
 
-/// A master on a `ControlPath` of this test's own, killable without
-/// disturbing anything.
+/// A directory for this test's end of the connection, and every master that
+/// ever binds a socket in it retired when the test is done.
 ///
 /// Every other test here reaches the host through the one master nvmux keeps
 /// in the real runtime directory, and they run in parallel: a master pulled
-/// out from under one of their live forwards would fail *them*. These two tests
-/// are about a master dying, so they bring up their own and leave that one
-/// alone.
+/// out from under one of their live forwards would fail *them*. The tests
+/// about a master dying, or its socket going, bring up their own here and
+/// leave that one alone.
+///
+/// Under `/tmp`, as nvmux's own runtime directory is, and not `$TMPDIR`: on
+/// macOS that is long enough that a master's socket — with the seventeen
+/// bytes ssh adds to it while binding — would not fit in a socket path.
+struct PrivateDir(PathBuf);
+
+impl PrivateDir {
+    fn new(tag: &str) -> Self {
+        let dir = PathBuf::from(format!("/tmp/nvmux-t-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Self(dir)
+    }
+
+    /// The sockets masters bound here, each under a name of its own beside
+    /// the `ControlPath` they are linked to.
+    fn master_sockets(&self, control_path: &Path) -> Vec<PathBuf> {
+        let prefix = format!("{}.", control_path.file_name().unwrap().to_string_lossy());
+        let mut found: Vec<PathBuf> = std::fs::read_dir(&self.0)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+            .map(|e| e.path())
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// How many master processes are bound somewhere in here — the ones still
+    /// linked to the `ControlPath` and the ones not.
+    fn masters_running(&self) -> usize {
+        let needle = format!("ControlPath={}/", self.0.display());
+        let out = std::process::Command::new("ps")
+            .args(["-A", "-o", "command="])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.starts_with("ssh ") && l.contains(" -M ") && l.contains(&needle))
+            .count()
+    }
+}
+
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        // Telling every master in here to exit stops a test's masters
+        // outliving it by a minute of `ControlPersist`. By their names only:
+        // the local end of a forward is also a socket in here, and what
+        // answers on that is a session's Neovim.
+        for entry in std::fs::read_dir(&self.0).into_iter().flatten().flatten() {
+            if entry.file_name().to_string_lossy().starts_with("cm") {
+                exit_master_at(&entry.path());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `ssh -O exit`, through whichever of a master's names is given.
+fn exit_master_at(socket: &Path) -> std::process::Output {
+    std::process::Command::new("ssh")
+        .arg("-o")
+        .arg(format!("ControlPath={}", socket.display()))
+        .args(["-O", "exit", &host()])
+        .output()
+        .expect("run ssh -O exit")
+}
+
+/// Poll until `done`, or fail after a few seconds: a master is a separate
+/// process, and its going is not instantaneous.
+fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !done() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// A master on a `ControlPath` of this test's own, killable without
+/// disturbing anything — see [`PrivateDir`].
 struct PrivateMaster {
     ssh: Ssh,
-    dir: PathBuf,
+    dir: PrivateDir,
 }
 
 impl PrivateMaster {
     fn up(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("nvmux-cm-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch directory");
+        let dir = PrivateDir::new(tag);
+        std::fs::create_dir_all(&dir.0).expect("scratch directory");
         // Short, because a ControlPath is a socket path like any other.
-        let ssh = Ssh::new(host(), dir.join("cm"));
+        let ssh = Ssh::new(host(), dir.0.join("cm"));
         ssh.ensure_master().expect("bring up a master");
         assert!(ssh.is_master_alive(), "the master did not come up");
         Self { ssh, dir }
@@ -324,26 +406,12 @@ impl PrivateMaster {
     /// What a sleeping laptop does, near enough: the master goes and every
     /// forward on it goes too.
     fn kill(&self) {
-        let out = std::process::Command::new("ssh")
-            .arg("-o")
-            .arg(format!("ControlPath={}", self.ssh.control_path().display()))
-            .args(["-O", "exit", &host()])
-            .output()
-            .expect("run ssh -O exit");
+        let out = exit_master_at(self.ssh.control_path());
         assert!(
             out.status.success() || !self.ssh.is_master_alive(),
             "could not stop the master: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-    }
-}
-
-impl Drop for PrivateMaster {
-    fn drop(&mut self) {
-        if self.ssh.is_master_alive() {
-            self.kill();
-        }
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -382,7 +450,10 @@ fn a_shell_started_without_a_master_quietly_makes_its_own_connection() {
     // And this is what the working shell was hiding. Nothing can be attached
     // until something brings the master back.
     m.ssh
-        .forward(&m.dir.join("l.sock"), Path::new("/tmp/nvmux-no-such.sock"))
+        .forward(
+            &m.dir.0.join("l.sock"),
+            Path::new("/tmp/nvmux-no-such.sock"),
+        )
         .expect_err("there is no master to forward on");
 }
 
@@ -411,12 +482,114 @@ fn a_shell_started_over_a_master_dies_with_it() {
          vouch for a master that has gone"
     );
 
-    // Brought back the way the transport brings it back, over a ControlPath
-    // the dead master may well have left behind.
+    // Brought back the way the transport brings it back, over the name the
+    // dead master was linked to — which it leaves behind.
     m.ssh.ensure_master().expect("reconnect");
     assert!(m.ssh.is_master_alive(), "the master did not come back");
     let mut again = m.ssh.start_shell().expect("shell");
     assert_eq!(again.run("printf back", &[]).expect("runs").stdout, "back");
+}
+
+/// What left the picker unable to attach anything: a master and its shell
+/// both still running — so everything that asks the shell hears the link is
+/// fine — and no socket at the `ControlPath` for `ssh -O forward` to reach
+/// the master by. Every attach failed with `Control socket connect(...): No
+/// such file or directory`, and pressing enter asked again in the same way.
+///
+/// However the socket went, the attach has to bring a master back.
+#[test]
+fn an_attach_with_no_master_behind_the_control_path_brings_one_back() {
+    require_ssh!();
+    let name = unique("unreachable");
+    let _guard = Cleanup::of([&name]);
+    let session = SshTransport::new(host())
+        .expect("connect")
+        .create_session(&name, &common::launch(), common::anywhere())
+        .expect("create");
+
+    let dir = PrivateDir::new("gone");
+    let t = SshTransport::with_dir(host(), dir.0.clone()).expect("connect");
+    let control_path =
+        nvmux::paths::control_path(&dir.0, &nvmux::ids::host_token(&host())).expect("path");
+    std::fs::remove_file(&control_path).expect("take the master's socket away");
+
+    let sock = t
+        .local_socket_for(&session)
+        .expect("the attach should bring a master back rather than fail");
+    let mut client =
+        nvmux::rpc::Client::connect(&sock, nvmux::rpc::PROBE_TIMEOUT).expect("connect");
+    client
+        .api_info()
+        .expect("usable through the master it brought back");
+
+    // And the transport's scripts run over that master too, not the old one.
+    assert!(
+        t.list_sessions()
+            .expect("list")
+            .iter()
+            .any(|s| s.id == session.id),
+        "the session should still be listed"
+    );
+}
+
+/// ssh removes a master's `ControlPath` by name when the master exits, whoever
+/// holds that name by then. A master bound at the shared name that had lost it
+/// would, on its way out, take it from whichever master was linked there
+/// since — the master every later `-O forward` needs, with its shell still up.
+/// Bound at a name of its own, a master that leaves removes only that.
+#[test]
+fn a_master_leaving_takes_only_its_own_name_with_it() {
+    require_ssh!();
+    let m = PrivateMaster::up("leaving");
+    let first = m.dir.master_sockets(m.ssh.control_path());
+    assert_eq!(
+        first.len(),
+        1,
+        "one master, bound at a name of its own: {first:?}"
+    );
+
+    // However a master comes to lose the shared name: another nvmux clearing
+    // it, a sweep of /tmp, a stray `rm`.
+    std::fs::remove_file(m.ssh.control_path()).expect("take the name");
+    m.ssh.ensure_master().expect("a second master");
+    assert!(m.ssh.is_master_alive(), "the second master is not linked");
+
+    // The first one leaves, as it would once its last client had.
+    exit_master_at(&first[0]);
+    wait_for("the first master to exit", || !first[0].exists());
+    assert!(
+        m.ssh.is_master_alive(),
+        "the first master took the second one's ControlPath with it"
+    );
+}
+
+/// Two nvmux bringing a master up at the same moment — both of them after one
+/// dropped link, say — must end with one master and not two. Bound at the
+/// shared name, the second found it taken, and ssh answers that by switching
+/// multiplexing off and staying up anyway: an idle connection nothing could
+/// reach, for as long as the network held.
+#[test]
+fn two_masters_brought_up_at_once_leave_one_running() {
+    require_ssh!();
+    let dir = PrivateDir::new("twice");
+    std::fs::create_dir_all(&dir.0).expect("scratch directory");
+    let control_path = dir.0.join("cm");
+    let (a, b) = (
+        Ssh::new(host(), control_path.clone()),
+        Ssh::new(host(), control_path.clone()),
+    );
+
+    std::thread::scope(|s| {
+        let a = s.spawn(|| a.ensure_master());
+        let b = s.spawn(|| b.ensure_master());
+        a.join().expect("thread").expect("first master");
+        b.join().expect("thread").expect("second master");
+    });
+
+    assert!(a.is_master_alive(), "neither master is linked");
+    wait_for("the second master to be retired", || {
+        dir.masters_running() == 1
+    });
 }
 
 /// The chosen command runs on the host that owns the session, not on this one,
