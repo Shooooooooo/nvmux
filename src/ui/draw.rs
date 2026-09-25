@@ -68,7 +68,7 @@ const NUM_GAP: &str = "  ";
 /// the help screen's key column and the README, because this row is uniformly
 /// lowercase (`esc`, never `Esc`) and a glyph is neither. The same reason `⏎`
 /// and `↑↓` stand for Enter and the arrows here and are written out in the
-/// README — and the reason the hint bar the prefix puts up ([`crate::hint`])
+/// README — and the reason the key row the prefix puts up ([`crate::hint`])
 /// spells its keys the same way. A test below keeps the two rows agreeing.
 ///
 /// `?` is still not listed, for the reason above.

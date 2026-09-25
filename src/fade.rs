@@ -25,6 +25,14 @@
 //! the bytes through (see `pty::Hold`); a resumed session dissolves in from
 //! the screen the shadow still holds, ahead of its repaint.
 //!
+//! A session can also be part of the way out already. While the prefix waits,
+//! the session is veiled — half dissolved behind the rows nvmux draws over it
+//! ([`crate::hint`]) — and a command that leaves it for another screen must
+//! not bring it back to full colour only to dissolve it again. So
+//! [`fade_out_session`] carries on from wherever the veil stands, rows and
+//! all, and takes them the rest of the way into the background together
+//! ([`Glide`]).
+//!
 //! # Colour, and what turns the effect off
 //!
 //! Both ends of the interpolation have to be real colours, so the fade rests
@@ -49,7 +57,7 @@ use ratatui::style::{Color, Modifier};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::palette::{self, Palette, Rgb};
-use crate::shadow::{Cursor, Shadow};
+use crate::shadow::{Cursor, Shadow, Veil, Veiled};
 
 /// A synchronized update: the terminal presents nothing between these, so a
 /// frame is never seen half-composited. Opening one inside another is
@@ -240,6 +248,83 @@ impl Schedule {
     }
 }
 
+/// Where a veiled screen goes when the session is left for another screen:
+/// into the background, rows and all.
+pub const GONE: Veil = Veil {
+    session: 1.0,
+    rows: 1.0,
+    under: 1.0,
+};
+
+/// A veiled screen on its way from one [`Veil`] to another, paced by the
+/// clock.
+///
+/// The prefix's veil rises and lifts in the relay loop, a frame at a time as
+/// the attach notice's box does ([`crate::hint`]), and a session left from
+/// under it fades out here ([`fade_out_session`]). All three are a veil's
+/// values moving from where they stand to where they are going, and this is
+/// that, once — a [`Schedule`] run from nought to one, and every value taken
+/// that far along.
+///
+/// It takes as long as the value with the furthest to go would take in a
+/// whole dissolve, and they all arrive together: every fade nvmux draws moves
+/// at the one pace, so a veil half risen when it is let go of takes half the
+/// time to come down.
+#[derive(Debug)]
+pub struct Glide {
+    from: Veil,
+    to: Veil,
+    schedule: Schedule,
+}
+
+impl Glide {
+    /// Start from `from` for `to` now, `one_way` being how long a whole
+    /// dissolve takes.
+    pub fn start(from: Veil, to: Veil, one_way: Duration, now: Instant) -> Self {
+        let furthest = (to.session - from.session)
+            .abs()
+            .max((to.rows - from.rows).abs())
+            .max((to.under - from.under).abs())
+            .clamp(0.0, 1.0);
+        Self {
+            from,
+            to,
+            schedule: Schedule::start(one_way.mul_f32(furthest), Direction::Out, now),
+        }
+    }
+
+    /// Where the next frame should stand, or `None` once the last has been
+    /// handed out. The last is exactly `to`, however late the clock is.
+    pub fn next(&mut self, now: Instant) -> Option<Veil> {
+        let p = self.schedule.next(now)?;
+        // Exactly, rather than the arithmetic's idea of it: a row the veil has
+        // finished with is a row that is gone, and a float a hair short of one
+        // is a row that is not.
+        Some(if p >= 1.0 {
+            self.to
+        } else {
+            self.from.toward(self.to, p)
+        })
+    }
+
+    /// Whether the last frame has been handed out.
+    pub fn finished(&self) -> bool {
+        self.schedule.finished()
+    }
+
+    /// Whether the glide is over by the clock, whether or not its last frame
+    /// was ever asked for — see [`Schedule::over`], for the caller that can
+    /// only draw where the session leaves it room.
+    pub fn over(&self, now: Instant) -> bool {
+        self.schedule.over(now)
+    }
+
+    /// Where it is going.
+    pub fn to(&self) -> Veil {
+        self.to
+    }
+}
+
 /// Move every visible cell of `buf` `t` of the way to the background.
 ///
 /// A post-pass over a finished frame, so the screens themselves stay
@@ -309,15 +394,49 @@ where
 }
 
 /// Dissolve an attached session's screen out into the background, from the
-/// shadow that watched it being drawn.
+/// shadow that watched it being drawn — or, where the prefix had it veiled,
+/// from under the veil (see the module docs).
 ///
 /// Every frame is a diff against the one before (see [`Shadow::frame`]), so
 /// the whole fade costs about one full repaint plus the cells that change
 /// colour — which nvmux already emits on every resize and resume. The last
 /// frame has every visible cell at the background colour, which is what the
 /// hand-off's erase paints next, so the seam is flat.
-pub fn fade_out_session(shadow: &mut Shadow) -> io::Result<()> {
-    run_session(shadow, Direction::Out).map(|_| ())
+///
+/// From under a veil the frames are the veil's own ([`Shadow::veiled`]),
+/// carried from where it stands to [`GONE`]: the session from half gone the
+/// rest of the way, and the rows over it from wherever they were, on top to
+/// the end. Those keep no diff, and there are no more of them than a fade from
+/// full colour would take. They end in the same place — every cell the
+/// background — so the seam after them is as flat.
+pub fn fade_out_session(shadow: &mut Shadow, veiled: Option<&Veiled>) -> io::Result<()> {
+    match veiled {
+        Some(veiled) => run_veiled(shadow, veiled),
+        None => run_session(shadow, Direction::Out).map(|_| ()),
+    }
+}
+
+/// [`fade_out_session`] from under the prefix's veil.
+fn run_veiled(shadow: &Shadow, veiled: &Veiled) -> io::Result<()> {
+    let Some(palette) = active() else {
+        return Ok(());
+    };
+    if !shadow.is_usable() {
+        return Ok(());
+    }
+    // The terminal's size, not the grid's, for the reason `Shadow::veiled`
+    // takes one: nothing may be placed past the edge of the screen.
+    let size = crate::term::terminal_size();
+    let mut out = io::stdout().lock();
+    let mut glide = Glide::start(veiled.veil, GONE, one_way(), Instant::now());
+    while let Some(veil) = glide.next(Instant::now()) {
+        out.write_all(&shadow.veiled(&veiled.strips, palette, veil, (size.rows, size.cols)))?;
+        out.flush()?;
+        if !glide.finished() {
+            thread::sleep(FRAME);
+        }
+    }
+    Ok(())
 }
 
 /// Dissolve an attached session's screen up out of the background, from the
@@ -494,6 +613,88 @@ mod tests {
         let cold = Schedule::start(Duration::from_millis(100), Direction::In, t0);
         assert!(!cold.over(t0));
         assert!(cold.over(t0 + Duration::from_millis(100)));
+    }
+
+    const UP: Veil = Veil {
+        session: 0.5,
+        rows: 0.0,
+        under: 1.0,
+    };
+    const LIFTED: Veil = Veil {
+        session: 0.0,
+        rows: 1.0,
+        under: 0.0,
+    };
+
+    /// Every value a glide hands out on a well-behaved clock, and the clock
+    /// when it handed out the last.
+    fn glided(from: Veil, to: Veil) -> (Vec<Veil>, Duration) {
+        let t0 = Instant::now();
+        let mut glide = Glide::start(from, to, Duration::from_millis(100), t0);
+        let mut seen = vec![];
+        let mut now = t0;
+        while let Some(v) = glide.next(now) {
+            seen.push(v);
+            if glide.finished() {
+                break;
+            }
+            now += FRAME;
+        }
+        (seen, now - t0)
+    }
+
+    /// The one pace: a glide takes as long as its furthest value would take in
+    /// a whole dissolve. The rows going from drawn to gone is a whole one; the
+    /// session going half the way is half of one.
+    #[test]
+    fn a_glide_takes_as_long_as_its_furthest_value_needs() {
+        let t0 = Instant::now();
+        let whole = Duration::from_millis(100);
+        // The session half the way, and the rows the whole of it: the longer.
+        let back = Glide::start(LIFTED, UP, whole, t0);
+        assert!(!back.over(t0 + Duration::from_millis(80)));
+        assert!(back.over(t0 + whole));
+
+        let from_clear = Veil {
+            session: 0.0,
+            rows: 0.0,
+            under: 1.0,
+        };
+        let half = Glide::start(from_clear, UP, whole, t0);
+        assert!(!half.over(t0 + Duration::from_millis(30)));
+        assert!(
+            half.over(t0 + Duration::from_millis(40)),
+            "half the way is half the time"
+        );
+    }
+
+    /// The values move together, never back, and the last frame is exactly
+    /// where the glide was going — a row a hair short of gone is not gone.
+    #[test]
+    fn a_glide_moves_every_value_and_lands_exactly_on_its_end() {
+        for (from, to) in [(UP, GONE), (UP, LIFTED), (LIFTED, UP)] {
+            let (seen, _) = glided(from, to);
+            assert!(seen.len() >= 2, "{from:?} -> {to:?}: {seen:?}");
+            assert_eq!(*seen.last().unwrap(), to, "{from:?} -> {to:?}");
+            for pair in seen.windows(2) {
+                let toward = |a: f32, b: f32, end: f32| (end - a) * (b - a) >= 0.0;
+                assert!(
+                    toward(pair[0].session, pair[1].session, to.session)
+                        && toward(pair[0].rows, pair[1].rows, to.rows)
+                        && toward(pair[0].under, pair[1].under, to.under),
+                    "{from:?} -> {to:?} went back: {seen:?}"
+                );
+            }
+        }
+    }
+
+    /// A glide to where it already is has nothing to animate: one frame, the
+    /// end, at once.
+    #[test]
+    fn a_glide_to_where_it_stands_is_one_frame() {
+        let (seen, took) = glided(UP, UP);
+        assert_eq!(seen, vec![UP]);
+        assert_eq!(took, Duration::ZERO);
     }
 
     /// Exactly one frame puts the cursor back: the last of a fade in. Every

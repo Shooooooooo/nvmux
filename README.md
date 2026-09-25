@@ -80,8 +80,13 @@ reimplementing it.
 | `<prefix>` `?` | show these keys — `Esc` goes back |
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
 
-Pressing `<prefix>` puts a one-row reminder of these keys along the bottom of
-the screen; it goes as soon as the next key resolves it.
+Pressing `<prefix>` puts these keys along the bottom of the screen and your
+sessions along the top, each with the number that switches to it —
+`1 api  ▸2 dotfiles  3 notes`, the one you are in marked — so the number for
+`<prefix> 3` is a glance away rather than a trip to the picker. With the
+[fade](#configuration) on, the session is dimmed behind them while they are up,
+and a key that leaves it for another screen dissolves it on from there. They go
+as soon as the next key resolves the prefix.
 
 ### Leaving a session
 
@@ -168,7 +173,7 @@ per_session = false   # keep a client per session; see "One client per session"
 [fade]
 enabled     = true   # dissolve between screens; NO_COLOR forces this off
 duration_ms = 200    # the whole dissolve, out and back; the notice pays it too
-session     = true   # Neovim's own screen dissolves too, and backs the notice
+session     = true   # Neovim's own screen dissolves too, and dims behind <prefix>
 excursions  = true   # so do the <prefix> ? and <prefix> c screens
 ```
 

@@ -18,9 +18,9 @@
 //! not using it.
 //!
 //! The session's bytes, and not nvmux's own. What nvmux draws over a session —
-//! the attach notice and the hint bar ([`crate::hint`]) — is deliberately
-//! withheld, because what the shadow has to remember there is precisely what
-//! is *underneath* it.
+//! the attach notice, and the rows and the veil the prefix puts up
+//! ([`crate::hint`]) — is deliberately withheld, because what the shadow has to
+//! remember there is precisely what is *underneath* it.
 //! The grid is the screen the client drew, which for the notice's rectangle is
 //! the only copy of it anywhere: the terminal's has been written over, and
 //! only the server could otherwise say what was there.
@@ -33,6 +33,26 @@
 //! cell showing whichever of the two is the more visible. The notice then
 //! melts into the editor instead of leaving a hole for a repaint to fill —
 //! and where that repaint never lands, the screen has already been put back.
+//!
+//! # What a veil paints
+//!
+//! [`Shadow::veiled`] is the same idea over the whole screen. While the prefix
+//! waits, the session is dimmed behind the rows nvmux draws over it, so that
+//! the rows are the brightest thing on the screen: every cell of the session's
+//! `veil.session` of the way to the background, and the rows ([`Strip`]s) over
+//! it `veil.rows` of the way — separate values, because they move apart (see
+//! [`Veil`]). Under a row the session is `veil.under` of the way, and a cell
+//! holding both shows whichever is the more visible, the notice's composite's
+//! rule.
+//!
+//! A veil is painted over a session that still owns the screen, so it keeps
+//! the notice's envelope — the cursor put back where it was found, the
+//! editor's own attributes with it — but it hides the cursor, where the notice
+//! does not. A box in the middle of the screen is a thing on top of the
+//! editor; a veil is the editor put into the background, and a cursor still
+//! blinking in it would say it was not. The client's next frame shows the
+//! cursor again — Neovim ends every flush by showing it — and a veil taken
+//! down puts it back itself, through [`Shadow::paint`].
 //!
 //! # What a frame paints
 //!
@@ -94,6 +114,12 @@ use unicode_width::UnicodeWidthChar;
 const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 const RESET_SGR: &[u8] = b"\x1b[0m";
+/// A reset, then `DIM`, on the one CSI: what a dim row of nvmux's is drawn in.
+/// The reset puts the background back, which is what erases the cells beside
+/// the row's text. Here because two things draw such a row — the prefix's
+/// rows over a live screen ([`crate::hint`]) and the same rows under a veil at
+/// rest — and they must not draw it two ways.
+pub(crate) const RESET_DIM: &str = "\x1b[0;2m";
 /// `DECSC` / `DECRC`. A single shared save slot, which is why only something
 /// written between the session's own frames may use it — see [`Shadow::under`].
 const SAVE_CURSOR: &[u8] = b"\x1b7";
@@ -128,8 +154,8 @@ pub enum Cursor {
 const MIN_SIZE: u16 = 2;
 
 /// A block of text nvmux has drawn over the session's screen — the attach
-/// notice, or the hint bar ([`crate::hint`]) — and the rectangle of cells it
-/// covers.
+/// notice, or one of the prefix's rows ([`crate::hint`]) — and the rectangle of
+/// cells it covers.
 ///
 /// Held here rather than in [`crate::announce`], which works the geometry out,
 /// because this is the module that composites it: only the shadow can reach
@@ -147,6 +173,71 @@ pub struct Over {
     /// The rows of text. A space is a cell the overlay covers without drawing
     /// on, which is most of the notice and is why it hides what is under it.
     pub rows: Vec<String>,
+}
+
+/// How far a veiled screen is dissolved: the session behind nvmux's rows, the
+/// rows themselves, and the session's cells under the rows.
+///
+/// Three values, because the three do not move together. Veiled, the session is
+/// half gone, the rows not at all, and what they cover is hidden; the veil
+/// lifted, the session is back, under the rows as well, and the rows are gone;
+/// leaving for another screen, all of it goes the rest of the way into the
+/// background ([`crate::fade::fade_out_session`]). One number could say any
+/// one of those, and none of the moves between them.
+///
+/// `under` is its own value, and not worked out from the other two, for the
+/// sake of the last of those moves. Leaving, the rows go at the same time as
+/// the session does, and anything of the session's that showed through them on
+/// the way would interleave with their own glyphs — a row of the editor's text
+/// with the names of sessions threaded through it, which reads as corruption
+/// rather than as a fade. So the cells under a row stay hidden while the rows
+/// leave, and come back only when the session does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Veil {
+    /// How far the session's own cells are dissolved: 0 as the client drew
+    /// them, 1 the background.
+    pub session: f32,
+    /// How far nvmux's rows are: 0 drawn, 1 gone.
+    pub rows: f32,
+    /// How far the session's cells under the rows are dissolved: 1 while the
+    /// rows cover them, 0 once they are back.
+    pub under: f32,
+}
+
+impl Veil {
+    /// The veil `p` of the way from `self` to `to`, every value together.
+    pub fn toward(self, to: Veil, p: f32) -> Veil {
+        let mix = |a: f32, b: f32| a + (b - a) * p.clamp(0.0, 1.0);
+        Veil {
+            session: mix(self.session, to.session),
+            rows: mix(self.rows, to.rows),
+            under: mix(self.under, to.under),
+        }
+    }
+}
+
+/// One of nvmux's rows over a veiled screen: the cells it covers and the text
+/// in them, and whether the text is drawn dim.
+///
+/// Dim is the one attribute a row can have, and it is the row's own: the
+/// prefix's rows are dim over a live screen, like every nvmux hint row, and at
+/// full strength over a veil (see [`crate::hint`]). A dissolve keeps it, as
+/// [`crate::fade::apply`] keeps it on the picker's hint row — terminals dim
+/// differently, and a guess at the dimmed colour would pop on the first frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Strip {
+    pub over: Over,
+    pub dim: bool,
+}
+
+/// A veiled screen as it stands: the rows on it, and how far everything is
+/// dissolved. What a fade out that starts from under the prefix's veil carries
+/// on from, rather than from the session at full colour (see
+/// [`crate::fade::fade_out_session`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Veiled {
+    pub strips: Vec<Strip>,
+    pub veil: Veil,
 }
 
 /// A cell as a frame paints it: its interpolated colours and the two
@@ -531,6 +622,199 @@ impl Shadow {
             }
         }
     }
+
+    /// The bytes that paint the whole screen — `size`, as `(rows, cols)` —
+    /// under the prefix's veil: every cell of the session's `veil.session` of
+    /// the way to the background, and `strips` over it `veil.rows` of the way.
+    /// See the module docs.
+    ///
+    /// Painted over a session that still owns the screen, so it is wrapped the
+    /// way [`Shadow::under`] is — `DECSC`/`DECRC` around everything, putting
+    /// the cursor and the editor's own attributes back as they were found —
+    /// and safe to wrap that way for a reason of its own: it is only ever
+    /// written at a lull, when the session is not in the middle of anything.
+    /// What it adds is the hide, for the reason the module docs give.
+    ///
+    /// `size` rather than the grid's own: a composite written past the edge of
+    /// a terminal that has just shrunk would have every `CUP` beyond it clamped
+    /// onto a row of somebody's text. Cells the grid does not reach are blanks,
+    /// as they are for [`Shadow::under`].
+    ///
+    /// A row at rest — `veil.rows` at 0 — is written the way
+    /// [`crate::announce::placed`] writes one over a live screen: its own text,
+    /// spaces and all, in the terminal's own colours, which is what hides the
+    /// session's cells under it. Nothing of the row's is painted in nvmux's
+    /// reading of those colours while the row is simply up. Dissolving, a row
+    /// is a composite: its glyphs in the colour of how far they have gone, and
+    /// wherever there is no glyph, or the glyph is the less visible of the two,
+    /// the session's cell as far gone as `veil.under` says — hidden while the
+    /// rows leave with the session, and coming back as they go when the session
+    /// stays.
+    ///
+    /// No diff, for the reason [`Shadow::under`] keeps none: every cell is
+    /// painted every time, which makes this a pure function of the grid. A
+    /// frame is a full repaint's worth of bytes, a handful of times while the
+    /// veil moves and once while it stands.
+    pub fn veiled(
+        &self,
+        strips: &[Strip],
+        palette: &Palette,
+        veil: Veil,
+        size: (u16, u16),
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(SYNC_BEGIN);
+        out.extend_from_slice(SAVE_CURSOR);
+        out.extend_from_slice(HIDE_CURSOR);
+        if !self.broken {
+            self.paint_veiled(&mut out, strips, palette, veil, size);
+        }
+        out.extend_from_slice(RESET_SGR);
+        out.extend_from_slice(RESTORE_CURSOR);
+        out.extend_from_slice(SYNC_END);
+        out
+    }
+
+    /// The cells themselves, inside the envelope [`Shadow::veiled`] wrote.
+    ///
+    /// Every row is written whole, left to right from one absolute placement,
+    /// so where the cursor is never has to be asked: it is wherever the widths
+    /// written so far have taken it.
+    fn paint_veiled(
+        &self,
+        out: &mut Vec<u8>,
+        strips: &[Strip],
+        palette: &Palette,
+        veil: Veil,
+        (rows, cols): (u16, u16),
+    ) {
+        // Under a row, the session's cell is as far gone as `under` says: see
+        // `Veil` for why that is a value of its own.
+        let beneath = veil.under;
+        // A glyph of the row's shows while it is at least as visible as the
+        // session's cell under it would be — `1 - rows >= 1 - under` — which
+        // on a lift, the two moving opposite ways, is the notice's crossover
+        // at halfway, and on the way out, with nothing coming back under it,
+        // is every frame to the last.
+        let overlaid = veil.rows <= beneath;
+        let rest = veil.rows <= 0.0;
+        let ink = |dim| {
+            Ink::Painted(Painted {
+                fg: palette.fg.lerp(palette.bg, veil.rows),
+                bg: None,
+                bold: false,
+                dim,
+            })
+        };
+        let mut pen: Option<Ink> = None;
+        for line in 0..rows {
+            let strip = strips.iter().find_map(|s| {
+                let text = s
+                    .over
+                    .rows
+                    .get(usize::from(line.checked_sub(s.over.top)?))?;
+                Some((s, laid_out(text, s.over.width)))
+            });
+            let _ = write!(out, "\x1b[{};1H", line + 1);
+            let mut col = 0u16;
+            while col < cols {
+                let within = strip.as_ref().and_then(|(s, laid)| {
+                    let i = col.checked_sub(s.over.left)?;
+                    (i < s.over.width).then(|| (s, laid[usize::from(i)].as_deref()))
+                });
+                col += match within {
+                    Some((s, glyph)) => {
+                        // Nothing of the row's may reach past its own last
+                        // column, or past the screen's.
+                        let right = s.over.left.saturating_add(s.over.width).min(cols);
+                        let fits = |g: &str| col + glyph_width(g) <= right;
+                        if rest {
+                            let (text, width) = match glyph {
+                                Some(g) if fits(g) => (g, glyph_width(g)),
+                                _ => (" ", 1),
+                            };
+                            set_ink(out, &mut pen, Ink::Own { dim: s.dim });
+                            out.extend_from_slice(text.as_bytes());
+                            width
+                        } else {
+                            match glyph.filter(|g| overlaid && !is_blank(g) && fits(g)) {
+                                Some(g) => {
+                                    set_ink(out, &mut pen, ink(s.dim));
+                                    out.extend_from_slice(g.as_bytes());
+                                    glyph_width(g)
+                                }
+                                None => self.session_cell(
+                                    out,
+                                    &mut pen,
+                                    (line, col),
+                                    right,
+                                    palette,
+                                    beneath,
+                                ),
+                            }
+                        }
+                    }
+                    None => {
+                        // A wide character of the session's is not let spill
+                        // into a row that starts further along the line.
+                        let limit = match &strip {
+                            Some((s, _)) if col < s.over.left => s.over.left.min(cols),
+                            _ => cols,
+                        };
+                        self.session_cell(out, &mut pen, (line, col), limit, palette, veil.session)
+                    }
+                };
+            }
+        }
+    }
+
+    /// Write the session's cell at `(line, col)`, `t` of the way to the
+    /// background, and say how many columns it took. A wide character that
+    /// would reach `limit` is blanked rather than cut: half of one is a broken
+    /// glyph, and in the screen's last column it would wrap, and on the last
+    /// row scroll the screen. A continuation cell on its own — the second
+    /// half of a wide character something else covered — is a blank too.
+    fn session_cell(
+        &self,
+        out: &mut Vec<u8>,
+        pen: &mut Option<Ink>,
+        (line, col): (u16, u16),
+        limit: u16,
+        palette: &Palette,
+        t: f32,
+    ) -> u16 {
+        let cell = self.parser.screen().cell(line, col);
+        let (text, width) = match cell {
+            Some(c) if c.is_wide_continuation() => (" ", 1),
+            Some(c) if c.is_wide() && col + 2 > limit => (" ", 1),
+            Some(c) if c.has_contents() => (c.contents(), if c.is_wide() { 2 } else { 1 }),
+            _ => (" ", 1),
+        };
+        set_ink(out, pen, Ink::Painted(resolve(cell, palette, t)));
+        out.extend_from_slice(text.as_bytes());
+        width
+    }
+}
+
+/// What the stream's SGR says in a veiled frame: a row at rest, in the
+/// terminal's own colours, dim or not — or a cell painted in resolved ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ink {
+    Own { dim: bool },
+    Painted(Painted),
+}
+
+/// Make the stream's SGR say `want`, writing nothing if it already does.
+fn set_ink(out: &mut Vec<u8>, pen: &mut Option<Ink>, want: Ink) {
+    if *pen == Some(want) {
+        return;
+    }
+    match want {
+        Ink::Own { dim: false } => out.extend_from_slice(RESET_SGR),
+        Ink::Own { dim: true } => out.extend_from_slice(RESET_DIM.as_bytes()),
+        Ink::Painted(p) => write_sgr(out, p),
+    }
+    *pen = Some(want);
 }
 
 /// A cell's colours and attributes as the session gave them: what
@@ -1511,5 +1795,323 @@ mod tests {
             s.paint(),
             [SYNC_BEGIN, HIDE_CURSOR, RESET_SGR, SYNC_END].concat()
         );
+    }
+
+    /// A screen six rows by twenty with a row of letters on every line, so
+    /// anything of the session's showing through one of nvmux's rows can be
+    /// told from the row.
+    fn lettered() -> Shadow {
+        let mut shadow = Shadow::new(6, 20);
+        for row in 1..=6 {
+            shadow.feed(format!("\x1b[{row};1HABCDEFGHIJKLMNOPQRST").as_bytes());
+        }
+        shadow
+    }
+
+    /// The prefix's two rows on that screen, the whole width each, as it draws
+    /// them: the sessions along the top in the terminal's own weight, the keys
+    /// along the bottom dim.
+    fn strips() -> Vec<Strip> {
+        let row = |top: u16, text: &str, dim: bool| Strip {
+            over: Over {
+                top,
+                left: 0,
+                width: 20,
+                rows: vec![text.into()],
+            },
+            dim,
+        };
+        vec![
+            row(0, "   1 api  ▸2 web    ", false),
+            row(5, "  ␣ picker  d detach", true),
+        ]
+    }
+
+    /// The veil as the prefix holds it: the session half gone, the rows up.
+    const UP: Veil = Veil {
+        session: 0.5,
+        rows: 0.0,
+        under: 1.0,
+    };
+
+    /// What a veiled frame puts on one row of the screen: `(sgr, glyph)` per
+    /// cell, left to right. 1-based, as the terminal counts.
+    fn row_of(frame: &[u8], row: usize) -> Vec<(String, String)> {
+        painted_cells(frame)
+            .into_iter()
+            .filter(|((r, _), _, _)| *r == row)
+            .map(|(_, sgr, glyph)| (sgr, glyph))
+            .collect()
+    }
+
+    /// Just the glyphs of one row.
+    fn glyphs_of(frame: &[u8], row: usize) -> String {
+        row_of(frame, row).into_iter().map(|(_, g)| g).collect()
+    }
+
+    /// Every value moves together along one path, and stops at its ends.
+    #[test]
+    fn a_veil_moves_all_its_values_together() {
+        let lifted = Veil {
+            session: 0.0,
+            rows: 1.0,
+            under: 0.0,
+        };
+        assert_eq!(lifted.toward(UP, 0.0), lifted);
+        assert_eq!(lifted.toward(UP, 1.0), UP);
+        assert_eq!(
+            lifted.toward(UP, 0.5),
+            Veil {
+                session: 0.25,
+                rows: 0.5,
+                under: 0.5,
+            }
+        );
+        assert_eq!(lifted.toward(UP, 7.0), UP, "past the end is the end");
+    }
+
+    /// What the prefix is for: the session behind half gone, and nvmux's rows
+    /// in front of it drawn exactly as they are over a live screen — in the
+    /// terminal's own colours, the keys dim — hiding whatever was under them.
+    #[test]
+    fn a_veil_at_rest_dims_the_session_behind_rows_in_the_terminals_own_colours() {
+        let frame = lettered().veiled(&strips(), &palette(), UP, (6, 20));
+
+        assert_eq!(glyphs_of(&frame, 1), "   1 api  ▸2 web    ");
+        assert_eq!(glyphs_of(&frame, 6), "  ␣ picker  d detach");
+        assert!(
+            row_of(&frame, 1).iter().all(|(sgr, _)| sgr == "0"),
+            "the sessions row is not in the terminal's own colours: {:?}",
+            row_of(&frame, 1)
+        );
+        assert!(
+            row_of(&frame, 6).iter().all(|(sgr, _)| sgr == "0;2"),
+            "the key row is not dim: {:?}",
+            row_of(&frame, 6)
+        );
+        for row in 2..=5 {
+            assert_eq!(glyphs_of(&frame, row), "ABCDEFGHIJKLMNOPQRST");
+            assert!(
+                row_of(&frame, row)
+                    .iter()
+                    .all(|(sgr, _)| sgr == "0;38;2;100;100;100"),
+                "row {row} is not half dissolved: {:?}",
+                row_of(&frame, row)
+            );
+        }
+    }
+
+    /// Painted over a session that still owns the screen: the cursor and the
+    /// editor's attributes go back as they were found, and nothing moves the
+    /// cursor any way but absolutely. Unlike the notice's composite it hides
+    /// the cursor — a veil is the editor put into the background — and never
+    /// shows it again itself.
+    #[test]
+    fn a_veil_hides_the_cursor_and_gives_the_rest_back_as_it_found_it() {
+        let frame = lettered().veiled(&strips(), &palette(), UP, (6, 20));
+        let head = [SYNC_BEGIN, SAVE_CURSOR, HIDE_CURSOR].concat();
+        let tail = [RESET_SGR, RESTORE_CURSOR, SYNC_END].concat();
+        assert!(frame.starts_with(&head), "{:?}", text(&frame));
+        assert!(frame.ends_with(&tail), "{:?}", text(&frame));
+        assert!(!contains(&frame, SHOW_CURSOR), "{:?}", text(&frame));
+        assert!(!frame.contains(&b'\n') && !frame.contains(&b'\r'));
+    }
+
+    /// Every cell of the screen it is told of is painted — the rows, and the
+    /// cells a grid that has not caught up with a larger terminal does not
+    /// reach — and nothing past it, however much larger the grid is: past the
+    /// edge, the terminal would clamp every placement onto a row of text.
+    #[test]
+    fn a_veil_paints_every_cell_of_its_screen_and_none_past_it() {
+        let shadow = lettered();
+        for (rows, cols) in [(6u16, 20u16), (4, 12), (8, 30)] {
+            let frame = shadow.veiled(&[], &palette(), UP, (rows, cols));
+            let cells = painted_cells(&frame);
+            for row in 1..=usize::from(rows) {
+                assert_eq!(
+                    row_of(&frame, row).len(),
+                    usize::from(cols),
+                    "{rows}x{cols}: row {row} is not painted whole"
+                );
+            }
+            assert!(
+                cells
+                    .iter()
+                    .all(|((r, c), _, _)| *r <= usize::from(rows) && *c <= usize::from(cols)),
+                "{rows}x{cols}: painted past the screen"
+            );
+            assert_eq!(
+                placements(&frame).len(),
+                usize::from(rows),
+                "one placement a row, and the widths do the rest"
+            );
+        }
+    }
+
+    /// A row coming off a veil — the prefix resolving into a keystroke — hands
+    /// over to the session under it the way the notice's box does: its glyphs
+    /// while they are the more visible, in the colour of how far they have
+    /// gone and with the key row still dim, and the session's own cells under
+    /// the rest, coming back no faster than the row goes.
+    #[test]
+    fn a_row_dissolving_off_a_veil_hands_over_to_the_session_under_it() {
+        let shadow = lettered();
+        let early = Veil {
+            session: 0.4,
+            rows: 0.25,
+            under: 0.75,
+        };
+        let frame = shadow.veiled(&strips(), &palette(), early, (6, 20));
+        let row = "   1 api  ▸2 web    ";
+        for (i, (glyph, (sgr, drawn))) in row.chars().zip(row_of(&frame, 1)).enumerate() {
+            if glyph == ' ' {
+                // Under a blank of the row's: the session's letter, coming
+                // back as the row goes — a quarter of the way.
+                assert_eq!(sgr, "0;38;2;50;50;50", "column {i}");
+                assert_eq!(drawn, "ABCDEFGHIJKLMNOPQRST"[i..=i], "column {i}");
+            } else {
+                assert_eq!(sgr, "0;38;2;150;150;150", "column {i}");
+                assert_eq!(drawn, glyph.to_string(), "column {i}");
+            }
+        }
+        assert!(
+            row_of(&frame, 6)
+                .iter()
+                .any(|(sgr, g)| sgr == "0;2;38;2;150;150;150" && g == "p"),
+            "the key row lost its dim on the way out: {:?}",
+            row_of(&frame, 6)
+        );
+
+        // Late: the row has given way to the session under it, which is
+        // coming back, a step behind the rest of it.
+        let late = Veil {
+            session: 0.1,
+            rows: 0.8,
+            under: 0.2,
+        };
+        let frame = shadow.veiled(&strips(), &palette(), late, (6, 20));
+        for row in [1, 6] {
+            assert_eq!(glyphs_of(&frame, row), "ABCDEFGHIJKLMNOPQRST");
+            assert!(
+                row_of(&frame, row)
+                    .iter()
+                    .all(|(sgr, _)| sgr == "0;38;2;160;160;160"),
+                "row {row}: {:?}",
+                row_of(&frame, row)
+            );
+        }
+        assert!(
+            row_of(&frame, 3)
+                .iter()
+                .all(|(sgr, _)| sgr == "0;38;2;180;180;180"),
+            "{:?}",
+            row_of(&frame, 3)
+        );
+    }
+
+    /// The red channel of a painted cell's foreground, from its SGR — which is
+    /// all these tests need of a colour, their palette being greys.
+    fn red(sgr: &str) -> u8 {
+        let fields: Vec<&str> = sgr.split(';').collect();
+        let at = fields
+            .windows(2)
+            .position(|w| w == ["38", "2"])
+            .unwrap_or_else(|| panic!("no foreground in {sgr:?}"));
+        fields[at + 2].parse().expect("a channel")
+    }
+
+    /// Leaving for another screen takes the veil the rest of the way into the
+    /// background, and the rows go with it — on top the whole way, and with
+    /// nothing of the session's showing through their blanks as they go: the
+    /// editor's own row threaded through the names of sessions reads as
+    /// corruption, not as a fade.
+    #[test]
+    fn leaving_from_under_a_veil_keeps_the_rows_on_top_all_the_way_down() {
+        let shadow = lettered();
+        let gone = Veil {
+            session: 1.0,
+            rows: 1.0,
+            under: 1.0,
+        };
+        let row = "   1 api  ▸2 web    ";
+        for step in 1..=10u8 {
+            let p = f32::from(step) / 10.0;
+            let frame = shadow.veiled(&strips(), &palette(), UP.toward(gone, p), (6, 20));
+            for (i, (glyph, (sgr, drawn))) in row.chars().zip(row_of(&frame, 1)).enumerate() {
+                if glyph == ' ' {
+                    assert_eq!(
+                        red(&sgr),
+                        0,
+                        "at {p}, the session showed through column {i}: {drawn:?} in {sgr}"
+                    );
+                } else {
+                    assert_eq!(
+                        drawn,
+                        glyph.to_string(),
+                        "at {p}, column {i} gave way to what is under it"
+                    );
+                }
+            }
+        }
+        // And at the end there is nothing left but the background, which is
+        // what the hand-off's erase paints next.
+        let frame = shadow.veiled(&strips(), &palette(), gone, (6, 20));
+        for (at, sgr, _) in painted_cells(&frame) {
+            assert!(
+                sgr == "0;38;2;0;0;0" || sgr == "0;2;38;2;0;0;0",
+                "{at:?} is still visible: {sgr}"
+            );
+        }
+    }
+
+    /// A background the editor left to the terminal stays the terminal's under
+    /// a veil, and one it set is dissolved like any colour.
+    #[test]
+    fn a_veil_leaves_a_default_background_to_the_terminal() {
+        let mut shadow = Shadow::new(2, 6);
+        shadow.feed(b"ab\x1b[44mcd");
+        let sgrs = sgrs(&shadow.veiled(&[], &palette(), UP, (2, 6)));
+        assert!(
+            sgrs.iter().any(|sgr| sgr == "0;38;2;100;100;100"),
+            "{sgrs:?}"
+        );
+        assert!(
+            sgrs.iter().any(|sgr| sgr.ends_with(";48;2;0;0;100")),
+            "{sgrs:?}"
+        );
+    }
+
+    /// A wide character a narrowing left in the last column is blanked under a
+    /// veil as it is by a paint: written, it would wrap, and on the last row
+    /// scroll the screen.
+    #[test]
+    fn a_wide_character_cut_by_the_last_column_is_blanked_under_a_veil() {
+        let mut s = Shadow::new(4, 11);
+        s.feed("\x1b[1;1Hone\x1b[2;1Htwo\x1b[3;1Hthree\x1b[4;1Hlast row \u{5b57}".as_bytes());
+        s.resize(4, 10);
+        let frame = s.veiled(&[], &palette(), UP, (4, 10));
+        assert!(!text(&frame).contains('\u{5b57}'), "{:?}", text(&frame));
+        let mut again = vt100::Parser::new(4, 10, 0);
+        again.process(&frame);
+        let rows: Vec<String> = again
+            .screen()
+            .rows(0, 10)
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        assert_eq!(
+            rows,
+            ["one", "two", "three", "last row"],
+            "the screen scrolled"
+        );
+    }
+
+    /// A retired parser has nothing worth painting: the envelope, and nothing
+    /// in it.
+    #[test]
+    fn a_retired_shadow_veils_nothing() {
+        let mut shadow = lettered();
+        shadow.broken = true;
+        let frame = shadow.veiled(&strips(), &palette(), UP, (6, 20));
+        assert!(painted_cells(&frame).is_empty(), "{:?}", text(&frame));
     }
 }

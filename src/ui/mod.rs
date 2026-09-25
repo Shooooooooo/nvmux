@@ -67,10 +67,11 @@ pub enum Outcome {
         /// Carried out rather than re-listed, for the reason the picker already
         /// resolves its own keys against the list in hand: a listing is a script
         /// run — ~230 ms over SSH, and 88-110 ms on a local host whose forks are
-        /// expensive — and the session loop needs the same two answers the
-        /// picker had. The highest number, so the prefix machine knows when a
-        /// digit can be acted on without waiting; and the rows themselves, so a
-        /// `<prefix>` switch can name one without going back to disk.
+        /// expensive — and the session loop needs the same answers the picker
+        /// had. The rows themselves, so a `<prefix>` switch can name one
+        /// without going back to disk; and every number and name, which the
+        /// prefix's rows show and whose highest tells the prefix machine when
+        /// a digit can be acted on without waiting (see [`crate::hint::Listing`]).
         sessions: Vec<Session>,
     },
     /// The user quit.
@@ -484,11 +485,6 @@ fn leave_to_session(
 fn refresh(app: &mut App, transport: &dyn Transport) -> Result<()> {
     app.set_sessions(transport.list_sessions()?);
     Ok(())
-}
-
-/// The largest resolved session number in a listing, or 0 for none.
-pub fn highest_num(sessions: &[Session]) -> u32 {
-    sessions.iter().map(|s| s.state.num).max().unwrap_or(0)
 }
 
 /// Reduce a crossterm event to the keys the screens understand.

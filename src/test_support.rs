@@ -75,16 +75,16 @@ pub(crate) fn size(cols: u16, rows: u16) -> PtySize {
     }
 }
 
-/// A screen with room for a whole hint bar or attach notice, which most of
-/// the overlay tests want.
+/// A screen with room for the prefix's rows or the attach notice whole, which
+/// most of the overlay tests want.
 pub(crate) fn big() -> PtySize {
     size(80, 24)
 }
 
 /// A terminal that said its text is light grey on black. No palette is ever
 /// installed under test, so this is the only way to reach the restoring and
-/// dissolving paths — which is why `hint::Bar::with_palette` and
-/// [`crate::fade::Dissolve`] take one.
+/// dissolving paths — which is why [`crate::fade::Dissolve`] takes one, and
+/// the prefix's bar is handed a `Dissolve` in its tests.
 pub(crate) fn palette() -> Palette {
     Palette {
         fg: Rgb(200, 200, 200),

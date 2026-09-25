@@ -125,7 +125,10 @@ pub struct FadeSettings {
     ///
     /// That parse is also what the attach notice dissolves into, so off, the
     /// notice's box empties the cells it covers and waits for a repaint to
-    /// fill them (see [`crate::announce`]).
+    /// fill them (see [`crate::announce`]). And it is what a session is dimmed
+    /// with behind the rows a `<prefix>` puts up, so off, those go up over the
+    /// session at full colour, as they did before it could be dimmed (see
+    /// [`crate::hint`]).
     pub session: bool,
     /// Whether the quick `<prefix> ?` / `<prefix> c` excursions fade too. Off
     /// makes those snappier at the cost of consistency.
@@ -147,11 +150,11 @@ impl Default for KeySettings {
             // right was that a lone `<prefix>` showed nothing: the screen sat
             // unchanged, so every millisecond of the wait was a millisecond the
             // editor looked like it had dropped a keystroke, and the sooner the
-            // byte went through as a literal the better. The hint bar
+            // byte went through as a literal the better. The prefix's rows
             // ([`crate::hint`]) ended that — the wait is now on screen, saying
             // what it is waiting for — so the number can be what it should have
-            // been all along: long enough to read the row and choose from it,
-            // rather than short enough to hide that anything was pending.
+            // been all along: long enough to read the rows and choose from
+            // them, rather than short enough to hide that anything was pending.
             //
             // It is not only the prefix's wait. The same value is how long a
             // half-typed session number waits for another digit, in the relay
@@ -408,7 +411,8 @@ fn render_default_config(prefix: u8) -> String {
          # per_session = {per_session}\n\
          \n\
          [fade]\n\
-         # The dissolve between screens, and of the notice a switch puts up.\n\
+         # The dissolve between screens, of the notice a switch puts up, and of\n\
+         # a session into the background behind the rows <prefix> puts up.\n\
          # NO_COLOR turns it off whatever this says.\n\
          # enabled     = {fade_enabled}\n\
          # duration_ms = {fade_duration}\n\

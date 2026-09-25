@@ -17,11 +17,13 @@
 //! test does, waits for the client to turn the protocol on, and types.
 //! Skipped without a usable `nvim`, like the other suites.
 //!
-//! One test here is not about a spelling at all. The hint bar the prefix puts up
-//! ([`nvmux::hint`]) is written over a live editor's last row and taken off it
-//! again, and neither half can be shown to work anywhere but here: it needs a
-//! real client painting a real screen to cover, and the shadow's copy of that
-//! screen to put back.
+//! Three tests here are not about a spelling at all. The rows the prefix puts
+//! up ([`nvmux::hint`]) are written over a live editor's first and last rows
+//! and taken off them again, with the editor dimmed behind them where there is
+//! a shadow of its screen to dim — and a command that leaves the session
+//! carries its fade out on from the dimmed screen. None of that can be shown
+//! to work anywhere but here: it needs a real client painting a real screen to
+//! cover, and the shadow's copy of that screen to dim and to put back.
 //!
 //! Nor are the last two. With `[client] per_session` a client is parked while
 //! something else has the front, and when it comes back nvmux paints the
@@ -45,14 +47,17 @@ use portable_pty::{CommandBuilder, PtySize};
 const CHILD_SOCK: &str = "NVMUX_TEST_RELAY_SOCK";
 const CHILD_ID: &str = "NVMUX_TEST_RELAY_ID";
 /// Set on a child that must keep a shadow of the session's screen — which is
-/// what the hint bar puts the row it covered back from. A shadow needs a palette
-/// and the fade on, and nothing here queries a real terminal, so the colours are
-/// handed to the child rather than asked for.
+/// what the prefix veils the session with, and hands the screen back from. A
+/// shadow needs a palette and the fade on, and nothing here queries a real
+/// terminal, so the colours are handed to the child rather than asked for.
 const CHILD_PALETTE: &str = "NVMUX_TEST_RELAY_PALETTE";
 /// Set on a child that keeps its client (`[client] per_session`): where
 /// `<prefix> Space` would open the picker it parks the client instead, for
 /// [`PARKED_FOR`], and then takes it back and relays it again.
 const CHILD_KEEP: &str = "NVMUX_TEST_RELAY_KEEP";
+/// What a child's client announces itself with, where it does: the name the
+/// attach notice's box shows. Unset, it announces nothing.
+const CHILD_ANNOUNCE: &str = "NVMUX_TEST_RELAY_ANNOUNCE";
 
 /// How long a keeping child leaves its client parked: long enough for the
 /// parent to have made the server busy before the client comes back.
@@ -64,10 +69,29 @@ const PARKED_FOR: Duration = Duration::from_secs(1);
 const PARKED: &[u8] = b"\x1b]9999;parked\x07";
 
 /// The rows and columns of the pty every [`Terminal`] opens. Named because the
-/// hint bar's whole geometry is "the last row", and a test that asks what is on
-/// it has to agree with the child about which row that is.
+/// prefix's whole geometry is "the first row and the last", and a test that
+/// asks what is on them has to agree with the child about which rows those are.
 const ROWS: u16 = 40;
 const COLS: u16 = 120;
+
+/// The sessions the child's relay is told it can switch to: another one, and
+/// the one under test, second — so the prefix has a sessions row to draw.
+/// Their names are the child's to say; the relay only shows them.
+const LISTED: [(u32, &str); 2] = [(1, "api"), (2, "web")];
+
+/// What the prefix puts along the top for [`LISTED`], the session under test
+/// marked as the one in front.
+const SESSIONS_ROW: &str = "1 api  ▸2 web";
+
+/// The colours a child with a shadow is handed (see [`CHILD_PALETTE`]): light
+/// grey text on black, and black for every ANSI colour.
+fn child_palette() -> nvmux::palette::Palette {
+    nvmux::palette::Palette {
+        fg: nvmux::palette::Rgb(200, 200, 200),
+        bg: nvmux::palette::Rgb(0, 0, 0),
+        ansi: [nvmux::palette::Rgb(0, 0, 0); 16],
+    }
+}
 
 /// The client's kitty keyboard query and DA1, and the terminal's answers. The
 /// kitty reply says "supported, no flags set yet"; the DA1 reply is a
@@ -109,22 +133,20 @@ fn relay_child() {
     // is false — and there is no shadow of the session's screen. The tests about
     // spellings want it that way: no fade means no held first paint and no
     // frames, so what reaches the parent is the client's own bytes and nothing
-    // else. The bar test needs the shadow, and says so.
+    // else. The tests of the prefix's rows need the shadow, and say so.
     if std::env::var_os(CHILD_PALETTE).is_some() {
-        nvmux::palette::init(Some(nvmux::palette::Palette {
-            fg: nvmux::palette::Rgb(200, 200, 200),
-            bg: nvmux::palette::Rgb(0, 0, 0),
-            ansi: [nvmux::palette::Rgb(0, 0, 0); 16],
-        }));
+        nvmux::palette::init(Some(child_palette()));
     }
 
-    // An empty notice announces nothing: these tests are about the prefix
-    // reaching the machine, and a box drawn over the screen would be noise in
-    // the stream the parent is reading.
+    // An empty notice announces nothing: most of these tests are about the
+    // prefix reaching the machine, and a box drawn over the screen would be
+    // noise in the stream the parent is reading. The one about the box asks.
+    let announce = std::env::var(CHILD_ANNOUNCE).unwrap_or_default();
     let mut pool = nvmux::pool::Pool::configured();
-    let mut attachment = nvmux::pty::spawn(&id, Path::new(&sock), "").expect("attach");
+    let mut attachment = nvmux::pty::spawn(&id, Path::new(&sock), &announce).expect("attach");
+    let listing = nvmux::hint::Listing::new(LISTED.map(|(n, name)| (n, name.to_string())), Some(2));
     let code = loop {
-        match nvmux::pty::relay(attachment, 0, &mut |_| {}) {
+        match nvmux::pty::relay(attachment, &listing, &mut |_| {}) {
             Ok((nvmux::pty::Outcome::Detached, _)) => break 0,
             // The picker's place, in a child that keeps its client: parked for
             // as long as a picker might have been up, then taken back.
@@ -192,13 +214,19 @@ impl Terminal {
     /// [`Terminal::spawn`], with `shadow` asking the child for the palette that
     /// gives it a shadow of the session's screen (see [`CHILD_PALETTE`]).
     fn spawn_with(sock: &Path, id: &str, protocol: Protocol, shadow: bool) -> Self {
-        Self::spawn_child(sock, id, protocol, shadow, false, false)
+        Self::spawn_child(sock, id, protocol, shadow, false, false, "")
     }
 
     /// A child that keeps its client (see [`CHILD_KEEP`]), on a terminal that
     /// reports its size in band if `in_band`.
     fn spawn_keeping(sock: &Path, id: &str, in_band: bool) -> Self {
-        Self::spawn_child(sock, id, Protocol::Kitty, false, true, in_band)
+        Self::spawn_child(sock, id, Protocol::Kitty, false, true, in_band, "")
+    }
+
+    /// A child with a shadow whose client announces itself as `label` (see
+    /// [`CHILD_ANNOUNCE`]), as a client does that a switch has just started.
+    fn spawn_announcing(sock: &Path, id: &str, label: &str) -> Self {
+        Self::spawn_child(sock, id, Protocol::Kitty, true, false, false, label)
     }
 
     fn spawn_child(
@@ -208,6 +236,7 @@ impl Terminal {
         shadow: bool,
         keep: bool,
         in_band: bool,
+        announce: &str,
     ) -> Self {
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize {
@@ -239,6 +268,9 @@ impl Terminal {
         }
         if keep {
             cmd.env(CHILD_KEEP, "1");
+        }
+        if !announce.is_empty() {
+            cmd.env(CHILD_ANNOUNCE, announce);
         }
         let child = pair.slave.spawn_command(cmd).expect("spawn relay child");
         // Or the master would never see EOF once the child exits.
@@ -485,18 +517,21 @@ fn the_push_is_matched_by_shape() {
     assert_eq!(kitty_push_flags(b"\x1b[>"), None);
 }
 
-/// One row of the screen the child's output describes, as a terminal would show
-/// it.
+/// The screen the child's output describes, as a terminal would show it.
 ///
-/// The byte stream cannot answer this question. nvmux's writes, the client's
-/// paints and the fade's frames all cross the same wire in whatever order the
-/// relay managed, and "the bar is gone" is a statement about cells rather than
-/// about bytes — so the test keeps a parser, as `src/shadow.rs` keeps one, and
-/// reads the row off it.
-fn row_on_screen(out: &[u8], row: u16) -> String {
+/// The byte stream cannot answer questions about cells. nvmux's writes, the
+/// client's paints and the fade's frames all cross the same wire in whatever
+/// order the relay managed, and "the row is gone" or "the text is dimmed" is a
+/// statement about cells rather than about bytes — so the tests keep a parser,
+/// as `src/shadow.rs` keeps one, and read the screen off it.
+fn screen_of(out: &[u8]) -> vt100::Parser {
     let mut parser = vt100::Parser::new(ROWS, COLS, 0);
     parser.process(out);
-    let screen = parser.screen();
+    parser
+}
+
+/// One row of a screen, trimmed.
+fn row_of(screen: &vt100::Screen, row: u16) -> String {
     (0..COLS)
         .map(|col| match screen.cell(row, col) {
             Some(cell) if cell.has_contents() => cell.contents(),
@@ -507,56 +542,115 @@ fn row_on_screen(out: &[u8], row: u16) -> String {
         .to_string()
 }
 
-/// The prefix puts the key row up over a live editor, and the next key takes it
-/// off again with the editor's own row underneath it — the two halves of the
-/// feature, neither of which is visible from a unit test.
-///
-/// `<prefix> <prefix>` is the dismissal to test on, because it is one of the
-/// three that leave the relay *running*: the picker, a detach and a switch all
-/// end it, and there the screen is dissolved or cleared on the way out and would
-/// clear the bar whether or not anything had taken it off. Here nothing else
-/// touches the row, so if the bar is still on it, it stays.
-///
-/// `shadow` picks which way the row is put back, and both have to work: from the
-/// shadow's copy of the screen, which is local and exact, or — with the fade off,
-/// and so no shadow — by blanking the row and asking the server to repaint it,
-/// the way the attach notice always leaves.
-fn the_hint_row_goes_up_and_comes_down(tag: &str, shadow: bool) {
-    require_nvim!();
-    let scratch = Scratch::new(tag);
+/// One row of the screen the child's output describes.
+fn row_on_screen(out: &[u8], row: u16) -> String {
+    row_of(screen_of(out).screen(), row)
+}
+
+/// The colour a cell's text is drawn in, as the child's palette resolves it:
+/// what a fade starts from, and what a dimmed cell is measured against.
+fn colour_of(screen: &vt100::Screen, (row, col): (u16, u16)) -> nvmux::palette::Rgb {
+    let palette = child_palette();
+    match screen.cell(row, col).map(vt100::Cell::fgcolor) {
+        None | Some(vt100::Color::Default) => palette.fg,
+        Some(vt100::Color::Idx(n)) => palette.index(n),
+        Some(vt100::Color::Rgb(r, g, b)) => nvmux::palette::Rgb(r, g, b),
+    }
+}
+
+/// The colour of the cell at `at` on the screen the child's output describes.
+fn colour_on_screen(out: &[u8], at: (u16, u16)) -> nvmux::palette::Rgb {
+    colour_of(screen_of(out).screen(), at)
+}
+
+/// What the session under test has on its first few lines: text of the
+/// editor's own between the prefix's two rows, to watch the veil on.
+const TEXT: &str = "text the prefix veils";
+
+/// A cell of [`TEXT`]: the first letter of the third row, clear of both of the
+/// prefix's rows.
+const TEXT_AT: (u16, u16) = (2, 0);
+
+/// A session with [`TEXT`] on its first lines: the socket a client attaches to
+/// it through, and its id.
+fn session_with_text(scratch: &Scratch, tag: &str) -> (std::path::PathBuf, String) {
     let t = scratch.transport();
     let session = t
         .create_session(&common::unique(tag), &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket path");
+    let mut rpc = nvmux::rpc::Client::connect(&sock, Duration::from_secs(3)).expect("connect");
+    // No swap file: these run at once, each with an unnamed buffer, and would
+    // otherwise race for the same one.
+    rpc.command(&format!(
+        "setlocal noswapfile | call setline(1, repeat(['{TEXT}'], 5))"
+    ))
+    .expect("setline");
+    (sock, session.id)
+}
 
-    let mut term = Terminal::spawn_with(&sock, &session.id, Protocol::Kitty, shadow);
-
-    // The client is up and painting once it has turned the protocol on.
+/// A relay child attached to a session with [`TEXT`] on it, whose client has
+/// painted it. `shadow` is [`Terminal::spawn_with`]'s.
+fn attached_with_text(scratch: &Scratch, tag: &str, shadow: bool) -> Terminal {
+    let (sock, id) = session_with_text(scratch, tag);
+    let mut term = Terminal::spawn_with(&sock, &id, Protocol::Kitty, shadow);
     assert!(
         term.pump_until(Duration::from_secs(15), |out| {
-            kitty_push_flags(out).is_some()
+            row_on_screen(out, TEXT_AT.0) == TEXT
         }),
-        "the client never started; got: {}",
+        "the session never painted its text; got: {}",
         term.since(0)
     );
-    // Let the first paint land: with the fade on it is held back and dissolved
-    // in, so the screen the bar covers does not exist until that is over.
-    term.pump_until(Duration::from_secs(2), |out| {
-        !row_on_screen(out, 0).is_empty()
-    });
-    let under = row_on_screen(&term.output, ROWS - 1);
+    // With the fade on, the first paint is held back and dissolved in, and the
+    // text is in the dissolve's colours until the held paint is written after
+    // it. Let all of that be over before anything is measured.
+    term.pump_until(Duration::from_millis(500), |_| false);
+    term
+}
 
-    // The prefix alone. The child's `timeout_ms` is ten seconds, so the bar has
-    // as long as it needs to find a lull.
+/// The prefix puts its rows up over a live editor — the sessions along the
+/// first row, the keys along the last — and the next key takes them off again
+/// with the editor's own rows underneath: the two halves of the feature,
+/// neither of which is visible from a unit test.
+///
+/// `<prefix> <prefix>` is the dismissal to test on, because it is one of the
+/// three that leave the relay *running*: the picker, a detach and a switch all
+/// end it, and there the screen is dissolved or cleared on the way out and
+/// would clear the rows whether or not anything had taken them off. Here
+/// nothing else touches them, so if they are still up, they stay.
+///
+/// `shadow` picks which way the screen is put back, and both have to work.
+/// With a shadow, the session is veiled behind the rows — its text dimmed to
+/// half — and handed back painted from the shadow's copy, and the server's
+/// repaint on top of it. With the fade off, and so no shadow, nothing is dimmed
+/// and the rows are blanked, and only the server's repaint puts the rows back.
+fn the_rows_go_up_and_come_down(tag: &str, shadow: bool) {
+    require_nvim!();
+    let scratch = Scratch::new(tag);
+    let mut term = attached_with_text(&scratch, tag, shadow);
+    let top = row_on_screen(&term.output, 0);
+    let bottom = row_on_screen(&term.output, ROWS - 1);
+    let drawn = colour_on_screen(&term.output, TEXT_AT);
+    let bg = child_palette().bg;
+    // Dimmed to half with a veil, and left alone without one.
+    let behind = if shadow { drawn.lerp(bg, 0.5) } else { drawn };
+
+    // The prefix alone. The child's `timeout_ms` is ten seconds, so the rows
+    // have as long as they need to find a lull, and a veil to finish rising.
     term.type_bytes(&[nvmux::keys::PREFIX]);
     let mark = term.output.len();
     assert!(
         term.pump_until(Duration::from_secs(10), |out| {
             row_on_screen(out, ROWS - 1).contains("␣ picker")
+                && row_on_screen(out, 0) == SESSIONS_ROW
+                && colour_on_screen(out, TEXT_AT) == behind
         }),
-        "the prefix put no hint row on row {ROWS}; it says {:?}, and the child wrote: {}",
+        "the prefix did not put its rows up over the session as it should: the first row \
+         says {:?}, the last {:?}, and the text is in {:?} where {behind:?} was wanted; the \
+         child wrote: {}",
+        row_on_screen(&term.output, 0),
         row_on_screen(&term.output, ROWS - 1),
+        colour_on_screen(&term.output, TEXT_AT),
         term.since(mark)
     );
     assert!(
@@ -564,23 +658,28 @@ fn the_hint_row_goes_up_and_comes_down(tag: &str, shadow: bool) {
         "the row is not the key list: {:?}",
         row_on_screen(&term.output, ROWS - 1)
     );
+    assert_eq!(
+        row_on_screen(&term.output, TEXT_AT.0),
+        TEXT,
+        "the session's own text is not all still there behind the rows"
+    );
 
     // A second prefix is a literal: Neovim gets the byte and the relay carries
-    // on, so the bar has to take itself off.
+    // on, so the rows have to take themselves off.
     let mark = term.output.len();
     term.type_bytes(&[nvmux::keys::PREFIX]);
     assert!(
         term.pump_until(Duration::from_secs(10), |out| {
-            !row_on_screen(out, ROWS - 1).contains("picker")
+            row_on_screen(out, 0) == top
+                && row_on_screen(out, ROWS - 1) == bottom
+                && colour_on_screen(out, TEXT_AT) == drawn
         }),
-        "the hint row is still on row {ROWS} after the prefix resolved: {:?}; the child wrote: {}",
+        "the session's own screen did not come back after the prefix resolved: the first \
+         row says {:?}, the last {:?}, and the text is in {:?}; the child wrote: {}",
+        row_on_screen(&term.output, 0),
         row_on_screen(&term.output, ROWS - 1),
+        colour_on_screen(&term.output, TEXT_AT),
         term.since(mark)
-    );
-    assert_eq!(
-        row_on_screen(&term.output, ROWS - 1),
-        under,
-        "the editor's own row did not come back"
     );
 
     // And the relay really is still running: the prefix still detaches.
@@ -590,24 +689,192 @@ fn the_hint_row_goes_up_and_comes_down(tag: &str, shadow: bool) {
     assert_eq!(
         term.exit_code(Duration::from_secs(10)),
         Some(0),
-        "the relay did not survive the bar; the child wrote: {}",
+        "the relay did not survive the rows; the child wrote: {}",
         term.since(mark)
     );
 }
 
-/// The ordinary path: a shadow of the session's screen, so the row goes back
-/// exactly and nothing is asked of the server.
+/// The ordinary path: a shadow of the session's screen, so the session is
+/// veiled behind the rows and painted back from the shadow's copy.
 #[test]
-fn a_prefix_raises_the_hint_row_and_the_next_key_takes_it_off() {
-    the_hint_row_goes_up_and_comes_down("hint", true);
+fn a_prefix_veils_the_session_behind_its_rows_and_the_next_key_hands_it_back() {
+    the_rows_go_up_and_come_down("hint", true);
 }
 
-/// And with the fade off there is no shadow, so the bar blanks its row and the
-/// relay asks the server for what was under it — the one path on which taking
-/// the bar down costs a round trip, and the one a `NO_COLOR` user is on.
+/// And with the fade off there is no shadow, so nothing is veiled, the rows
+/// are blanked, and the relay asks the server for what was under them — the
+/// one path on which the screen comes back only from the server, and the one a
+/// `NO_COLOR` user is on.
 #[test]
-fn the_hint_row_comes_down_through_the_server_without_a_shadow() {
-    the_hint_row_goes_up_and_comes_down("hint-no-shadow", false);
+fn without_a_shadow_the_rows_come_down_through_the_server() {
+    the_rows_go_up_and_come_down("hint-no-shadow", false);
+}
+
+/// A command that leaves the session from under the veil carries the fade out
+/// on from the veil. Read frame by frame from the keypress: at no frame is the
+/// session's text brighter than the veil left it — the fade does not bring the
+/// session back to full colour only to dissolve it again — and the rows stay
+/// on it all the way down, which ends in the background — with nothing of the
+/// session showing through their blanks on the way: the editor's own row
+/// threaded through the names of sessions reads as corruption, not as a fade.
+#[test]
+fn leaving_from_under_the_veil_carries_the_fade_on_from_it() {
+    require_nvim!();
+    let scratch = Scratch::new("veil-leave");
+    let mut term = attached_with_text(&scratch, "veil-leave", true);
+    let bg = child_palette().bg;
+    let veiled = colour_on_screen(&term.output, TEXT_AT).lerp(bg, 0.5);
+
+    term.type_bytes(&[nvmux::keys::PREFIX]);
+    assert!(
+        term.pump_until(Duration::from_secs(10), |out| {
+            colour_on_screen(out, TEXT_AT) == veiled && row_on_screen(out, 0) == SESSIONS_ROW
+        }),
+        "the veil never rose: the text is in {:?}; the child wrote: {}",
+        colour_on_screen(&term.output, TEXT_AT),
+        term.since(0)
+    );
+    // The text's row is not the veil's last: the rest of that frame may still
+    // be on its way. Whatever arrives from here on has to be the fade out.
+    term.pump_until(Duration::from_millis(300), |_| false);
+
+    // `<prefix> Space`, the picker — which a child that does not keep its
+    // client answers by ending the relay, fade and all, and exiting with 3.
+    let mark = term.output.len();
+    term.type_bytes(b" ");
+    assert_eq!(
+        term.exit_code(Duration::from_secs(10)),
+        Some(3),
+        "the relay did not leave for the picker; the child wrote: {}",
+        term.since(mark)
+    );
+
+    // The sessions row, as the prefix centres it on the first row.
+    let left = (usize::from(COLS) - SESSIONS_ROW.chars().count()) / 2;
+    let glyph_at = |col: usize| {
+        col.checked_sub(left)
+            .and_then(|i| SESSIONS_ROW.chars().nth(i))
+            .filter(|c| *c != ' ')
+    };
+    let brighter =
+        |a: nvmux::palette::Rgb, b: nvmux::palette::Rgb| a.0 > b.0 || a.1 > b.1 || a.2 > b.2;
+
+    let mut parser = screen_of(&term.output[..mark]);
+    let mut rest = &term.output[mark..];
+    let mut frames = Vec::new();
+    while let Some(end) = find(rest, nvmux::fade::SYNC_END) {
+        let (frame, after) = rest.split_at(end + nvmux::fade::SYNC_END.len());
+        parser.process(frame);
+        rest = after;
+        let n = frames.len() + 1;
+        let screen = parser.screen();
+        let text = colour_of(screen, TEXT_AT);
+        assert!(
+            !brighter(text, veiled),
+            "frame {n} of the fade out brought the session back up to {text:?}, past the \
+             veil's {veiled:?}"
+        );
+        for col in 0..COLS {
+            let cell = screen.cell(0, col).expect("a cell");
+            match glyph_at(usize::from(col)) {
+                Some(glyph) => assert_eq!(
+                    cell.contents(),
+                    glyph.to_string(),
+                    "the sessions row left the veil before the fade did, at frame {n}"
+                ),
+                None => assert!(
+                    !cell.has_contents() || colour_of(screen, (0, col)) == bg,
+                    "frame {n}: the session shows through the sessions row at column {col}: \
+                     {:?}",
+                    cell.contents()
+                ),
+            }
+        }
+        frames.push(text);
+    }
+    assert!(
+        frames.len() >= 2,
+        "the session was not faded out, it was cut: {frames:?}; the child wrote: {}",
+        term.since(mark)
+    );
+    assert_eq!(
+        frames.last(),
+        Some(&bg),
+        "the fade out did not end in the background: {frames:?}"
+    );
+}
+
+/// The attach notice's box can be up when the prefix is pressed — a switch,
+/// and the prefix at once. The veil repaints the whole screen from the shadow,
+/// which has never held the box, so the box goes under it; the relay lets the
+/// notice go rather than have it paint itself over the veil; and the screen
+/// the veil hands back when it lifts has no box in it either — nor does
+/// anything put one back afterwards.
+#[test]
+fn a_veil_takes_the_attach_notice_with_it() {
+    require_nvim!();
+    let scratch = Scratch::new("veil-notice");
+    let (sock, id) = session_with_text(&scratch, "veil-notice");
+    let mut term = Terminal::spawn_announcing(&sock, &id, "web");
+    let boxed = |out: &[u8]| screen_of(out).screen().contents().contains('╭');
+    assert!(
+        term.pump_until(Duration::from_secs(15), boxed),
+        "the notice never went up; the child wrote: {}",
+        term.since(0)
+    );
+    // The notice goes up over a screen the client has painted, so the text is
+    // in its own colours by now.
+    let drawn = colour_on_screen(&term.output, TEXT_AT);
+    let veiled = drawn.lerp(child_palette().bg, 0.5);
+
+    term.type_bytes(&[nvmux::keys::PREFIX]);
+    let mark = term.output.len();
+    assert!(
+        term.pump_until(Duration::from_secs(10), |out| {
+            row_on_screen(out, 0) == SESSIONS_ROW
+                && colour_on_screen(out, TEXT_AT) == veiled
+                && !boxed(out)
+        }),
+        "the veil did not take the box: it is {}, the text is in {:?}; the child wrote: {}",
+        if boxed(&term.output) {
+            "still up"
+        } else {
+            "gone"
+        },
+        colour_on_screen(&term.output, TEXT_AT),
+        term.since(mark)
+    );
+
+    // A literal prefix, and the veil lifts onto a screen with no box on it.
+    let mark = term.output.len();
+    term.type_bytes(&[nvmux::keys::PREFIX]);
+    assert!(
+        term.pump_until(Duration::from_secs(10), |out| {
+            row_on_screen(out, 0) == TEXT && colour_on_screen(out, TEXT_AT) == drawn
+        }),
+        "the session did not come back: the first row says {:?}, the text is in {:?}; the \
+         child wrote: {}",
+        row_on_screen(&term.output, 0),
+        colour_on_screen(&term.output, TEXT_AT),
+        term.since(mark)
+    );
+    // Longer than the notice would have lived: nothing brings the box back.
+    term.pump_until(Duration::from_millis(1500), |_| false);
+    assert!(
+        !boxed(&term.output),
+        "the box came back after the veil lifted; the child wrote: {}",
+        term.since(mark)
+    );
+
+    term.type_bytes(&[nvmux::keys::PREFIX]);
+    term.pump_until(Duration::from_millis(150), |_| false);
+    term.type_bytes(b"d");
+    assert_eq!(
+        term.exit_code(Duration::from_secs(10)),
+        Some(0),
+        "the relay did not survive the notice and the veil; the child wrote: {}",
+        term.since(mark)
+    );
 }
 
 /// What a resumed relay writes before anything of the client's: back onto the

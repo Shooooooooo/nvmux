@@ -126,9 +126,9 @@ pub struct Binding {
     pub action: Action,
     /// One line, in terms of what happens to the user.
     pub help: &'static str,
-    /// The same thing in one lowercase word, for the hint bar the relay puts
+    /// The same thing in one lowercase word, for the key row the relay puts
     /// up while the prefix is armed ([`crate::hint`]). A field rather than a
-    /// second table, so a command cannot be added without a label for the bar
+    /// second table, so a command cannot be added without a label for the row
     /// — the guarantee `help` already gives the help screen.
     pub hint: &'static str,
 }
@@ -247,7 +247,7 @@ pub fn key_label(byte: u8) -> String {
 pub const SPACE_GLYPH: &str = "␣";
 
 /// Spell a key the way a one-line hint row does — the picker's own
-/// (`src/ui/draw.rs`), and the hint bar the prefix puts up ([`crate::hint`]).
+/// (`src/ui/draw.rs`), and the key row the prefix puts up ([`crate::hint`]).
 ///
 /// [`key_label`] is the other spelling: a name, for the help screen's key column
 /// and the README's table, where there is room for a word and an invisible cell
@@ -313,7 +313,7 @@ pub enum Wait {
 }
 
 /// What the machine is waiting for, for something that wants to say so on the
-/// screen — the hint bar the relay puts up while the prefix is armed (see
+/// screen — the rows the relay puts up while the prefix is armed (see
 /// [`crate::hint`]).
 ///
 /// Not [`Wait`], which is the same question asked about clocks: that says what
@@ -410,8 +410,8 @@ impl Prefix {
         }
     }
 
-    /// What the user has half-typed, if anything — for the hint bar, which says
-    /// so on the screen while the machine waits (see [`crate::hint`]).
+    /// What the user has half-typed, if anything — for the prefix's rows, which
+    /// say so on the screen while the machine waits (see [`crate::hint`]).
     ///
     /// Read from `state` and not from [`wait`](Self::wait), which would be a
     /// different answer: an escape sequence cut short *from idle* is the Escape
@@ -1456,7 +1456,7 @@ mod tests {
         }
     }
 
-    /// The hint bar is one row and reads at a glance, so a label that wrapped,
+    /// The key row is one row and reads at a glance, so a label that wrapped,
     /// ran to two words or arrived capitalised would break the row rather than
     /// merely look wrong — the grammar is `src/ui/draw.rs`'s, which is
     /// uniformly lowercase and one word per key.
@@ -1490,9 +1490,9 @@ mod tests {
         }
     }
 
-    /// `pending` is what the hint bar is drawn from, so it has to follow the
-    /// machine exactly: a bar that appeared without the prefix, or stayed up
-    /// after the command ran, would be drawn over an editor that owns the row.
+    /// `pending` is what the prefix's rows are drawn from, so it has to follow
+    /// the machine exactly: rows that appeared without the prefix, or stayed up
+    /// after the command ran, would be drawn over an editor that owns them.
     #[test]
     fn pending_follows_the_state_machine() {
         let mut p = Prefix::new(12);

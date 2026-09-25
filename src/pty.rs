@@ -46,14 +46,17 @@
 //! never gives, and writing the box after every repaint instead only wins the
 //! moments the terminal happens not to present in. And the fade's frames
 //! ([`crate::fade`]), written before the held first paint and after the relay
-//! has stopped. And the hint bar ([`crate::hint`]): the prefix's one-row bar,
-//! written at a lull and put back from the shadow, and never fed to it either.
+//! has stopped. And the prefix's rows ([`crate::hint`]): the sessions along
+//! the top and the keys along the bottom, over the session dimmed behind them
+//! where there is a shadow to dim it with — written at a lull, and handed back
+//! from the shadow.
 //!
 //! None of them is ever fed back to the shadow. All three are nvmux's own
 //! picture of the screen rather than the session's bytes, and the notice's
-//! frames are composited *out of* the shadow — so showing them to it would
-//! have it holding nvmux's drawing of the editor with a box in the middle, and
-//! nothing underneath to give back (see [`Attachment::write_over_session`]).
+//! frames and the prefix's veil are composited *out of* the shadow — so
+//! showing them to it would have it holding nvmux's drawing of the editor with
+//! a box in the middle, or dimmed, and nothing underneath to give back (see
+//! [`Attachment::write_over_session`]).
 //!
 //! Three hazards that have no other home in the code:
 //!
@@ -211,9 +214,9 @@ pub struct Attachment {
     /// Where the terminal's parser stands, kept only while there is a notice
     /// to write over the session (see [`crate::boundary`]). `None` the rest of
     /// the time, which is the whole of a relay after its first second and a
-    /// bit: the hint bar, the one other thing nvmux writes over a session,
-    /// waits for a lull instead and only asks the parser (`mid_sequence`)
-    /// while one happens to be there for the notice.
+    /// bit: the prefix's rows, the one other thing nvmux writes over a
+    /// session, wait for a lull instead and only ask the parser
+    /// (`mid_sequence`) while one happens to be there for the notice.
     ///
     /// While it is there, **every byte written to the terminal is shown to it
     /// exactly once, and said whose it is**: [`Attachment::relay_output`]
@@ -543,7 +546,7 @@ impl Attachment {
     }
 
     /// Write something of nvmux's own over the session's screen: the attach
-    /// notice, and the hint bar the prefix puts up ([`crate::hint`]).
+    /// notice, and the rows and the veil the prefix puts up ([`crate::hint`]).
     ///
     /// The shadow must not take these for the session's. Its grid is what the
     /// *client* drew, not what the terminal shows, and keeping it that way is
@@ -959,8 +962,8 @@ impl Attachment {
         self.write_terminal(&ready)
     }
 
-    /// The notice is over. The hint bar still writes over a session, but it
-    /// waits for a lull rather than for the parser, so the terminal's parser
+    /// The notice is over. The prefix's rows still write over a session, but
+    /// they wait for a lull rather than for the parser, so the terminal's parser
     /// need not be followed any further — but every byte still being kept on
     /// its account goes out first, or a client's frame would end a few bytes
     /// short for the rest of the relay.
@@ -2142,9 +2145,16 @@ fn spawn_client_with(
 /// not draw. Every other outcome calls it not at all — the picker, the prompt
 /// and the help screen have nothing to start, and the three that end the relay
 /// have nowhere to go.
+///
+/// # The sessions it can switch to
+///
+/// `listing` is what a `<prefix>` digit resolves against, and it is here for
+/// two readers: the prefix machine, which needs the highest number to know
+/// whether a digit could still be the start of a longer one, and the rows the
+/// prefix puts up ([`crate::hint`]), which name every session by its number.
 pub fn relay(
     mut attachment: Attachment,
-    highest_session_num: u32,
+    listing: &hint::Listing,
     begin_next: &mut dyn FnMut(Target),
 ) -> Result<(Outcome, Option<Attachment>)> {
     let master_fd = attachment
@@ -2273,14 +2283,18 @@ pub fn relay(
     // between sequences starts right.
     attachment.boundary = popup.is_some().then(boundary::Boundary::new);
 
+    // The rows a `<prefix>` puts up, and the veil under them. Here rather than
+    // in `pump`, because what is on the screen when the relay ends is what the
+    // fade out below has to carry on from.
+    let mut bar = hint::Bar::new(Instant::now(), term::terminal_size(), listing.clone());
     let outcome = pump(
         &mut attachment,
         master_fd,
         &winch,
-        highest_session_num,
         popup,
         dissolved,
         erasing,
+        &mut bar,
     );
     // From here on nothing the client writes reaches the terminal until it is
     // relayed again: what the ledger hears next is news to the terminal.
@@ -2317,8 +2331,13 @@ pub fn relay(
             // below, which erases with the colour the last frame ends on. A
             // frame that could not be written must not skip the restore, so
             // its error is logged and dropped rather than propagated.
+            //
+            // From under the veil, if the prefix had put one up: every one of
+            // these outcomes is a `<prefix>` command, and the session behind
+            // its rows is part of the way out already.
+            let veiled = bar.on_screen();
             if let Some(shadow) = attachment.shadow.as_mut() {
-                if let Err(e) = fade::fade_out_session(shadow) {
+                if let Err(e) = fade::fade_out_session(shadow, veiled.as_ref()) {
                     tracing::debug!(error = %e, "the session's fade-out did not complete");
                 }
             }
@@ -2385,14 +2404,15 @@ fn pump(
     attachment: &mut Attachment,
     master_fd: RawFd,
     winch: &winch::Winch,
-    highest_session_num: u32,
     mut popup: Option<announce::Popup>,
     dissolved: bool,
     mut erasing: Option<Erasing>,
+    bar: &mut hint::Bar,
 ) -> Result<Outcome> {
     let stdin_fd = std::io::stdin().as_raw_fd();
     let keys = crate::config::get().keys;
-    let mut prefix = Prefix::with_prefix(highest_session_num, keys.prefix);
+    // The listing the prefix's rows name is the one its digits resolve against.
+    let mut prefix = Prefix::with_prefix(bar.listing().highest(), keys.prefix);
     let prefix_timeout = Duration::from_millis(keys.timeout_ms);
     // When a pending prefix, half-typed number or cut-off escape sequence must
     // be settled. An instant rather than a per-poll timeout on purpose: a child
@@ -2400,13 +2420,11 @@ fn pump(
     // that restarted on every wake-up would never fire while a spinner is
     // running. It is set when the machine arms and cleared when it settles.
     let mut deadline: Option<Instant> = None;
-    // The notice's repaint while it is in flight; see [`Erasing`]. Shared with
-    // the hint bar, which wants the same repaint for the same reason and only
-    // when this slot is free: a `:mode` in flight repaints the whole screen and
-    // covers the bar's row on its way past. And with a kept client's return,
-    // which comes in with one already asked for.
-    // The row that says what the next key does while a `<prefix>` waits.
-    let mut bar = hint::Bar::new(Instant::now(), term::terminal_size());
+    // `erasing` is the notice's repaint while it is in flight; see [`Erasing`].
+    // Shared with the prefix's rows, which want the same repaint when they
+    // hand the screen back and only when this slot is free: a `:mode` in flight
+    // repaints the whole screen, rows and all, on its way past. And with a kept
+    // client's return, which comes in with one already asked for.
     let mut buf = [0u8; 8192];
     // Diagnostics only, and what makes a switch that felt slow attributable:
     // everything before this is nvmux's own work and is timed where it happens,
@@ -2563,14 +2581,16 @@ fn pump(
                 announce::Act::Idle => {}
                 announce::Act::Paint(bytes) => {
                     attachment.write_over_session(&bytes)?;
-                    // On a three-row terminal — and only there — the box's
-                    // bottom row is the bar's row, so the bar can no longer
-                    // trust that what it drew is still on the screen. Told one
-                    // way only: telling the notice that the bar is up would
-                    // freeze its dissolve for as long as a prefix is armed, on
-                    // every terminal, to settle a collision that exists on one
-                    // size. The bar's own block runs below this one, so on that
-                    // size it takes the shared row back within this pass.
+                    // On a terminal three or four rows tall — and only there —
+                    // the box shares a row with the prefix's, so the bar can
+                    // no longer trust that what it drew is still on the
+                    // screen. Told one way only: telling the notice that the
+                    // bar is up would freeze its dissolve for as long as a
+                    // prefix is armed, on every terminal, to settle a
+                    // collision that exists on two sizes. The bar's own block
+                    // runs below this one, so on those sizes it takes the
+                    // shared row back within this pass. (A veil ends the
+                    // notice instead; see below.)
                     bar.overdrawn();
                 }
                 announce::Act::Erase => {
@@ -2608,7 +2628,7 @@ fn pump(
                 );
             }
             // The notice is the only thing that needs the terminal's parser
-            // watched — the hint bar waits for a lull instead — so when it
+            // watched — the prefix's rows wait for a lull instead — so when it
             // ends that stops being anybody's business, and whatever was being
             // kept back to keep a sequence whole goes out with it.
             if popup.is_none() {
@@ -2691,17 +2711,18 @@ fn pump(
             }
         }
 
-        // The hint bar, after the keys and not before them: the prefix that
-        // raises it arrives in the read above, and the timeout that lowers it is
-        // settled above too, so anywhere earlier in the loop the bar would be a
-        // whole wake-up late — and the only wake-up scheduled is the prefix's own
-        // deadline, so it would appear exactly as the prefix expired. After the
-        // winch, so the row is the terminal's as it is now, and after the notice,
-        // for the reason written down there.
+        // The prefix's rows and its veil, after the keys and not before them:
+        // the prefix that raises them arrives in the read above, and the
+        // timeout that lowers them is settled above too, so anywhere earlier in
+        // the loop they would be a whole wake-up late — and the only wake-up
+        // scheduled is the prefix's own deadline, so they would appear exactly
+        // as the prefix expired. After the winch, so the rows are the
+        // terminal's as it is now, and after the notice, for the reason written
+        // down there.
         //
-        // `busy` is the bar's lull rule: the child having spoken this pass, and
-        // a held first paint — a screen the terminal has not been shown a word
-        // of yet — both mean this is no moment to write. The notice's own pass
+        // `busy` is the lull rule: the child having spoken this pass, and a
+        // held first paint — a screen the terminal has not been shown a word of
+        // yet — both mean this is no moment to write. The notice's own pass
         // above shares the first two terms but asks the boundary decoder
         // instead of waiting for a lull.
         //
@@ -2711,7 +2732,7 @@ fn pump(
         //
         // A command that ends the relay has already returned from the block
         // above and never reaches this, which is what stops `<prefix> Space`
-        // flashing a bar on its way to the picker.
+        // flashing the rows on its way to the picker.
         let busy = child_spoke || attachment.hold.is_some() || attachment.mid_sequence();
         match bar.step(
             Instant::now(),
@@ -2722,24 +2743,37 @@ fn pump(
         ) {
             hint::Act::Idle => {}
             hint::Act::Write(bytes) => attachment.write_over_session(&bytes)?,
-            hint::Act::Blanked(bytes) => {
-                // The bar has blanked its row because nothing here knows what
-                // was under it — no shadow, so no copy of those cells anywhere
-                // but the server. The same repaint the notice's erase asks for,
-                // asked the same way; skipped when one is already in flight,
-                // since a `:mode` repaints the whole screen and this row with it.
+            hint::Act::HandBack(bytes) => {
+                // The rows are down and the screen is the session's again, as
+                // far as nvmux could put it back: painted from the shadow, or
+                // blanked where there was none. Only the server has the rest —
+                // the same repaint the notice's erase asks for, asked the same
+                // way; skipped when one is already in flight, since a `:mode`
+                // repaints the whole screen and these rows with it.
                 attachment.write_over_session(&bytes)?;
                 if erasing.is_none() {
                     attachment.resize_to(term::terminal_size());
-                    match Erasing::start(&attachment.sock) {
+                    match Erasing::start_for(&attachment.sock, "prefix hand back") {
                         Ok(started) => erasing = Some(started),
                         Err(e) => {
-                            tracing::debug!(error = %e, "no thread for the hint bar's repaint");
+                            tracing::debug!(error = %e, "no thread for the prefix's repaint");
                             apply(attachment, Repaint::Notice, Served::NONE);
                         }
                     }
                 }
             }
+        }
+        // A veil repaints the whole screen from the shadow, which has never held
+        // the notice's box: the box is gone from under it. The notice is let go
+        // rather than left to paint itself over the veil, and when the veil
+        // lifts it hands back the session's own screen, which has no box in it
+        // either. Only here, once the veil is on the terminal — a notice dropped
+        // any earlier, on a prefix that resolves before a lull, would leave its
+        // box behind with nothing to take it off.
+        if bar.veiled() && popup.is_some() {
+            popup = None;
+            tracing::debug!("timing: attach notice over (under the prefix's veil)");
+            attachment.stop_watching_the_terminal()?;
         }
 
         // Only on an idle tick: a child that exits is noticed through its pty
@@ -3201,11 +3235,12 @@ const ERASE_POLL: Duration = Duration::from_millis(50);
 /// (a terminal with in-band resize reports) the box simply waits for the prompt
 /// to end. And the mouse is the client's own already: nothing ran in between.
 ///
-/// Its second caller is the hint bar ([`crate::hint`]) coming down where there
-/// is no shadow to put its row back from, and every word above applies to it
-/// unchanged — more so, if anything: the bar is asked for by a keystroke rather
-/// than once per attach, so the one thing it must never do is answer a prompt
-/// the user is in the middle of reading.
+/// Its second caller is the prefix's rows coming down ([`crate::hint`]) —
+/// blanked where there is no shadow to put the screen back from, and painted
+/// back from it, near enough, where there is — and every word above applies to
+/// it unchanged. More so, if anything: the rows are asked for by a keystroke
+/// rather than once per attach, so the one thing their repaint must never do is
+/// answer a prompt the user is in the middle of reading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Repaint {
     Resume,
@@ -3393,10 +3428,11 @@ mod tests {
     /// box would also answer for the client's first paint and release a hold
     /// over a screen the client had not drawn.
     ///
-    /// The hint bar goes through the same `write_over_session`, and for the
-    /// bar the stake is sharper: its erase is a composite out of this grid —
-    /// it is what puts the editor's last row back — so a grid that had
-    /// swallowed the bar would erase the bar with the bar.
+    /// The prefix's rows and veil go through the same `write_over_session`,
+    /// and for them the stake is sharper: the veil is painted out of this grid
+    /// and the screen handed back from it, so a grid that had swallowed a frame
+    /// of the veil would dim the session a second time on the next one, and
+    /// hand the veil back as the session's own screen.
     #[test]
     fn nothing_written_over_the_session_reaches_the_shadows_grid() {
         let mut a = attached_to("exit 0");

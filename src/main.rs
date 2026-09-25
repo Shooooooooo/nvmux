@@ -5,8 +5,8 @@ use clap::Parser;
 
 use nvmux::cli::Cli;
 use nvmux::{
-    announce, config, fade, logging, nested, nvim, palette, paths, pool, pty, reconnect, transport,
-    ui,
+    announce, config, fade, hint, logging, nested, nvim, palette, paths, pool, pty, reconnect,
+    transport, ui,
 };
 
 fn main() -> Result<()> {
@@ -147,10 +147,6 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
         };
         // A session the listing no longer has has nothing to come back to.
         pool.keep_only(&listing);
-        // Derived rather than carried: one fewer thing for the picker to keep
-        // in step, and the listing it handed over is what it would be derived
-        // from anyway.
-        let mut highest = ui::highest_num(&listing);
         // A client begun while the last session dissolved, waiting to be
         // waited for. Only a switch ever sets it, and a switch always comes
         // straight back round this loop, so it never outlives the trip.
@@ -281,7 +277,11 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                         ),
                     }
                 };
-                pty::relay(attachment, highest, &mut begin_next)?
+                // Derived on every trip rather than carried: the listing is
+                // what the digits resolve against, so what the prefix's rows
+                // name and what its machine counts up to cannot drift from it.
+                let shown = hint::Listing::of(&listing, &current.id);
+                pty::relay(attachment, &shown, &mut begin_next)?
             };
             match ended {
                 (pty::Outcome::ToPicker, held) => {
@@ -329,12 +329,11 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     // Held rather than killed, so a cancelled prompt resumes it.
                     attached = pool.set_aside(held);
                     if let ui::prompt::Outcome::Created(session) = ui::prompt::run(transport)? {
-                        // A new session can be numbered above anything the
-                        // relay was told about, and the hint decides how long a
-                        // digit waits. It is also a row the listing in hand does
-                        // not have, and `<prefix> n` from here has to be able to
-                        // find its way back to it.
-                        highest = highest.max(session.state.num);
+                        // A row the listing in hand does not have: the prefix's
+                        // rows have to name it, its number can be above any
+                        // the relay was told about — which decides how long a
+                        // digit waits — and `<prefix> n` from here has to be
+                        // able to find its way back to it.
                         listing.push(session.clone());
                         current = session;
                     }
@@ -402,7 +401,6 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                             Ok(fresh) => {
                                 listing = fresh;
                                 pool.keep_only(&listing);
-                                highest = ui::highest_num(&listing);
                                 picked = pick(&listing, target, current.state.num).cloned();
                             }
                             Err(e) => {

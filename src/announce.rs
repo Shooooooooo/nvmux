@@ -550,10 +550,13 @@ pub fn overlay(label: &str, size: PtySize) -> Option<Over> {
 /// A block of nvmux's own rows, written over a session's screen under `sgr`.
 ///
 /// The one place it is done. Two things draw over a live session — the box
-/// here, and the hint bar the prefix puts up ([`crate::hint`]) — and the escape
+/// here, and the rows the prefix puts up ([`crate::hint`]) — and the escape
 /// sequence they have to get right is the same one, so it is written once.
 /// `sgr` is the one thing that differs: a reset, a reset carrying a dissolve's
 /// foreground, or a reset carrying `DIM`.
+///
+/// [`placed_each`] is the same for several blocks at once, each under its own
+/// SGR, and inside the one update — which is what the prefix's two rows are.
 ///
 /// Rows of spaces erase: a block hides what is under it by writing over it, and
 /// only [`Shadow::under`] can give it back.
@@ -579,14 +582,24 @@ pub fn overlay(label: &str, size: PtySize) -> Option<Over> {
 ///   overlay. It also means a block as wide as the screen never scrolls it: the
 ///   pending-wrap flag its last cell sets is discarded by the next `CUP`, or —
 ///   on the closing row — by the `DECRC` that is the last thing written.
-///   Nothing printable ever follows it. That is what lets the hint bar be the
-///   full width of the *last* row, where a wrap would scroll the session.
+///   Nothing printable ever follows it. That is what lets the prefix's key row
+///   be the full width of the *last* row, where a wrap would scroll the
+///   session.
 pub(crate) fn placed(over: &Over, sgr: &str) -> Vec<u8> {
-    let left = over.left + 1;
+    placed_each(&[(over, sgr)])
+}
+
+/// [`placed`], for several blocks in one synchronized update, each under its
+/// own SGR: two rows at opposite edges of the screen that must not be seen one
+/// without the other.
+pub(crate) fn placed_each(blocks: &[(&Over, &str)]) -> Vec<u8> {
     let mut out = String::from("\x1b[?2026h\x1b7");
-    for (i, row) in over.rows.iter().enumerate() {
-        let line = usize::from(over.top) + i + 1;
-        out.push_str(&format!("\x1b[{line};{left}H{sgr}{row}"));
+    for (over, sgr) in blocks {
+        let left = over.left + 1;
+        for (i, row) in over.rows.iter().enumerate() {
+            let line = usize::from(over.top) + i + 1;
+            out.push_str(&format!("\x1b[{line};{left}H{sgr}{row}"));
+        }
     }
     out.push_str("\x1b8\x1b[?2026l");
     out.into_bytes()
