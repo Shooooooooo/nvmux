@@ -8,11 +8,14 @@ use crate::error::NvimError;
 /// The minimum Neovim nvmux supports.
 ///
 /// 0.11 specifically because that is where `:detach` and `:connect` landed,
-/// which is what makes a session survive its UI going away.
+/// which is what makes a session survive its UI going away. Spelled twice — as
+/// the errors print it and as the gate compares it — and a test keeps the two
+/// in step.
 pub const MIN_VERSION: &str = "0.11";
-pub(crate) const MIN: (u64, u64) = (0, 11);
+const MIN: (u64, u64) = (0, 11);
 
-/// A parsed `nvim --version` banner.
+/// A Neovim version: parsed from an `nvim --version` banner, or read out of
+/// `nvim_get_api_info` by [`crate::rpc::Client::api_info`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {
     pub major: u64,
@@ -97,14 +100,20 @@ pub fn check_local() -> Result<Version, NvimError> {
             where_: "local".into(),
             min: MIN_VERSION,
         })?;
-    let banner = String::from_utf8_lossy(&out.stdout);
-    let version = parse_version(&banner).ok_or_else(|| NvimError::UnparsableVersion {
-        where_: "local".into(),
+    check_banner("local", &String::from_utf8_lossy(&out.stdout))
+}
+
+/// The gate both machines go through once their `nvim --version` banner is in
+/// hand: it has to parse, and what it says has to be new enough. `where_` names
+/// the machine, for the error.
+pub fn check_banner(where_: &str, banner: &str) -> Result<Version, NvimError> {
+    let version = parse_version(banner).ok_or_else(|| NvimError::UnparsableVersion {
+        where_: where_.into(),
         raw: banner.lines().next().unwrap_or("").to_string(),
     })?;
     if !version.is_supported() {
         return Err(NvimError::TooOld {
-            where_: "local".into(),
+            where_: where_.into(),
             found: version.to_string(),
             min: MIN_VERSION,
         });
@@ -181,6 +190,37 @@ mod tests {
     fn display_round_trips() {
         assert_eq!(v(0, 11, 4, None).to_string(), "0.11.4");
         assert_eq!(v(0, 13, 0, Some("dev-1511")).to_string(), "0.13.0-dev-1511");
+    }
+
+    /// The minimum the errors print is the minimum the gate enforces.
+    #[test]
+    fn the_printed_minimum_is_the_enforced_one() {
+        assert_eq!(MIN_VERSION, format!("{}.{}", MIN.0, MIN.1));
+    }
+
+    /// Both machines' banners go through one gate, and each way it can refuse
+    /// names the machine and says what it saw.
+    #[test]
+    fn the_banner_gate_refuses_old_and_unreadable_banners_by_name() {
+        assert_eq!(
+            check_banner("myhost", "NVIM v0.11.4\nBuild type: Release").expect("new enough"),
+            v(0, 11, 4, None)
+        );
+        match check_banner("myhost", "NVIM v0.9.5") {
+            Err(NvimError::TooOld { where_, found, min }) => {
+                assert_eq!(where_, "myhost");
+                assert_eq!(found, "0.9.5");
+                assert_eq!(min, MIN_VERSION);
+            }
+            other => panic!("expected TooOld, got {other:?}"),
+        }
+        match check_banner("myhost", "garbage\nmore") {
+            Err(NvimError::UnparsableVersion { where_, raw }) => {
+                assert_eq!(where_, "myhost");
+                assert_eq!(raw, "garbage", "the first line, which is the version line");
+            }
+            other => panic!("expected UnparsableVersion, got {other:?}"),
+        }
     }
 
     /// Runs against whatever nvim is actually installed, when there is one.

@@ -19,14 +19,6 @@
 dir="${1:?usage: renumber.sh <runtime_dir> <id> <json> [<id> <json>]...}"
 shift
 
-# Say why, in the script's own words. A bare exit with nothing on stdout reaches
-# the user as a diagnosis of the ssh connection instead.
-fail() {
-  printf 'ERROR %s\n' "$1"
-  finish
-  exit 1
-}
-
 while [ "$#" -ge 2 ]; do
   id="$1"
   json="$2"
@@ -40,14 +32,7 @@ while [ "$#" -ge 2 ]; do
   # the spot -- writing that here would make the placeholder real.
   [ -f "$dir/$id.json" ] || continue
 
-  # Temp file plus rename, so a concurrent listing sees the old number or the
-  # new one and never a half-written file.
-  tmp="$dir/$id.json.tmp$$"
-  printf '%s\n' "$json" > "$tmp" || fail "could not write metadata for $id"
-  mv -f "$tmp" "$dir/$id.json" || {
-    rm -f "$tmp"
-    fail "could not replace metadata for $id"
-  }
+  write_json "$dir" "$id" "$json" || fail "could not write metadata for $id"
 done
 
 finish

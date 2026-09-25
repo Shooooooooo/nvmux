@@ -129,19 +129,14 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Outcome> {
 }
 
 fn draw(frame: &mut Frame, state: &State) {
-    let area = frame.area();
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-    let (body, bottom) = draw::split_hint_row(area);
-
-    draw_body(frame, state, body);
     let hint = if state.selected.is_some() {
         "⏎ confirm   esc skip"
     } else {
         "⏎ keep   esc skip"
     };
-    draw::draw_hint_row(frame, bottom, hint, true);
+    draw::screen(frame, hint, true, |frame, body| {
+        draw_body(frame, state, body)
+    });
 }
 
 fn draw_body(frame: &mut Frame, state: &State, area: Rect) {

@@ -31,6 +31,20 @@ use nix::sys::termios::{self, SetArg, SpecialCharacterIndices, Termios};
 
 use crate::error::Result;
 
+/// Write to stdout and flush, so an escape sequence lands before the next.
+/// One lock for both calls; the unlocked `Stdout` would take it twice.
+///
+/// Every sequence nvmux writes to the terminal on its own account — the
+/// mode strings below, the fade's frames, the relay's hand-offs — goes
+/// through here. The one exception is [`restore_and_reraise`], which is a
+/// signal handler and may only `write(2)`.
+pub(crate) fn write_stdout(bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    out.write_all(bytes)?;
+    out.flush()
+}
+
 /// A `libc::termios` we can read from a signal handler: plain C data, and
 /// `OnceLock::get` is an atomic load plus a read of initialised memory.
 struct Saved(libc::termios);
@@ -137,31 +151,22 @@ const MOUSE_BUTTONS: &[u8] = b"\x1b[?1003l\x1b[?1002h\x1b[?1006h";
 /// and what the client had is a question for its server, which the resume
 /// already asks to repaint.
 pub fn enable_mouse() {
-    use std::io::Write;
-    let mut out = std::io::stdout();
-    let _ = out.write_all(MOUSE_ON);
-    let _ = out.flush();
+    let _ = write_stdout(MOUSE_ON);
 }
 
 /// Put mouse reporting back to what a client being resumed had, after a screen
 /// that set its own. See [`crate::pty`], which asks the client's server.
 pub fn set_mouse_reporting(reporting: MouseReporting) {
-    use std::io::Write;
-    let mut out = std::io::stdout();
-    let _ = out.write_all(match reporting {
+    let _ = write_stdout(match reporting {
         MouseReporting::Off => MOUSE_OFF,
         MouseReporting::Buttons => MOUSE_BUTTONS,
         MouseReporting::Motion => MOUSE_ON,
     });
-    let _ = out.flush();
 }
 
 /// Turn mouse reporting off again, for the screen that turned it on.
 pub fn disable_mouse() {
-    use std::io::Write;
-    let mut out = std::io::stdout();
-    let _ = out.write_all(MOUSE_OFF);
-    let _ = out.flush();
+    let _ = write_stdout(MOUSE_OFF);
 }
 
 /// Show the cursor — `DECTCEM` on — and nothing else.
@@ -177,10 +182,7 @@ const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 /// asked for next is asked for, not certain. Shown here, where the erase left
 /// it, which is where every screen used to leave it before there was a fade.
 pub fn show_cursor() {
-    use std::io::Write;
-    let mut out = std::io::stdout();
-    let _ = out.write_all(SHOW_CURSOR);
-    let _ = out.flush();
+    let _ = write_stdout(SHOW_CURSOR);
 }
 
 /// Put the screen back to a state a shell can be used in: cursor visible,
@@ -188,10 +190,7 @@ pub fn show_cursor() {
 /// with a message — an attach that failed, a detach — where the last thing
 /// drawn may have been the client's, mid-frame, with the cursor hidden.
 pub fn reset_screen() {
-    use std::io::Write;
-    let mut out = std::io::stdout();
-    let _ = out.write_all(RESET);
-    let _ = out.flush();
+    let _ = write_stdout(RESET);
 }
 
 /// Home the cursor and erase the line it is on. Not part of [`RESET`], which a
@@ -223,10 +222,7 @@ const ERASE_LINE: &[u8] = b"\r\x1b[2K";
 /// powerlevel10k, fish — already erase it and so already hide this; a bare
 /// `PS1='$ '` is what leaves it standing.
 pub fn erase_hung_up_clients_line() {
-    use std::io::Write;
-    let mut out = std::io::stdout();
-    let _ = out.write_all(ERASE_LINE);
-    let _ = out.flush();
+    let _ = write_stdout(ERASE_LINE);
 }
 
 /// Drop the state inherited from a client cut off mid-frame, without saying
@@ -249,10 +245,7 @@ pub fn erase_hung_up_clients_line() {
 /// Must run before the alternate screen is entered and before the clear: both
 /// erase with the *current* background colour.
 pub fn reset_inherited_attributes() {
-    use std::io::Write;
-    let mut out = std::io::stdout();
-    let _ = out.write_all(INHERITED);
-    let _ = out.flush();
+    let _ = write_stdout(INHERITED);
 }
 
 /// Install the restore-on-signal safety net for the whole run.
@@ -401,10 +394,7 @@ pub(crate) const HANDOVER: &[u8] = b"\x1b[?2026l\x1b[0m\x1b[?1049l\x1b[2J\x1b[H"
 /// re-enter any mode handling: raw mode is the caller's business, and the
 /// callers differ on whether they have dropped it yet.
 pub fn leave_alt_screen_and_clear() {
-    use std::io::Write;
-    let mut out = std::io::stdout();
-    let _ = out.write_all(HANDOVER);
-    let _ = out.flush();
+    let _ = write_stdout(HANDOVER);
 }
 
 /// What hands the terminal back to a client nvmux took it from: [`INHERITED`],
@@ -442,19 +432,13 @@ pub(crate) const RESUME: &[u8] = b"\x1b[?2026l\x1b[0m\x1b[?1049h\x1b[2J\x1b[H";
 /// mode is put in the alternate screen here on a client that never asked, and
 /// taken out of it by the `?1049l` every way out of nvmux ends with.
 pub fn enter_alt_screen_and_clear() {
-    use std::io::Write;
-    let mut out = std::io::stdout();
-    let _ = out.write_all(RESUME);
-    let _ = out.flush();
+    let _ = write_stdout(RESUME);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-        haystack.windows(needle.len()).any(|w| w == needle)
-    }
+    use crate::test_support::{contains, position};
 
     /// The two resets must go on agreeing about what a cut-off client leaves
     /// behind. They are written out separately because the signal handler needs
@@ -540,12 +524,7 @@ mod tests {
     /// just set.
     #[test]
     fn restoring_button_tracking_resets_motion_before_it_sets_anything() {
-        let at = |needle: &[u8]| {
-            MOUSE_BUTTONS
-                .windows(needle.len())
-                .position(|w| w == needle)
-                .unwrap_or_else(|| panic!("MOUSE_BUTTONS dropped {needle:?}"))
-        };
+        let at = |needle: &[u8]| position(MOUSE_BUTTONS, needle, "MOUSE_BUTTONS");
         assert!(at(b"\x1b[?1003l") < at(b"\x1b[?1002h"));
         assert!(at(b"\x1b[?1003l") < at(b"\x1b[?1006h"));
         assert!(!contains(MOUSE_BUTTONS, b"\x1b[?1003h"));
@@ -583,12 +562,7 @@ mod tests {
             "the erase paints with the current background colour, so the \
              outgoing client's attributes must go first"
         );
-        let at = |needle: &[u8]| {
-            HANDOVER
-                .windows(needle.len())
-                .position(|w| w == needle)
-                .unwrap_or_else(|| panic!("HANDOVER dropped {needle:?}"))
-        };
+        let at = |needle: &[u8]| position(HANDOVER, needle, "HANDOVER");
         assert!(
             at(b"\x1b[?1049l") < at(b"\x1b[2J"),
             "the erase must land on the screen the session will draw on, not \
@@ -608,12 +582,7 @@ mod tests {
             "the erase paints with the current background colour, so the \
              picker's or the client's leftover attributes must go first"
         );
-        let at = |needle: &[u8]| {
-            RESUME
-                .windows(needle.len())
-                .position(|w| w == needle)
-                .unwrap_or_else(|| panic!("RESUME dropped {needle:?}"))
-        };
+        let at = |needle: &[u8]| position(RESUME, needle, "RESUME");
         assert!(
             at(b"\x1b[?1049h") < at(b"\x1b[2J"),
             "the erase must land on the alternate screen the client will draw \

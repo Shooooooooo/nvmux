@@ -127,15 +127,9 @@ pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> 
 }
 
 fn draw(frame: &mut Frame, rows: &[Row]) {
-    let area = frame.area();
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-
-    let (body, bottom) = draw::split_hint_row(area);
-
-    draw_table(frame, rows, body);
-    draw::draw_hint_row(frame, bottom, HINTS, true);
+    draw::screen(frame, HINTS, true, |frame, body| {
+        draw_table(frame, rows, body)
+    });
 }
 
 /// One left-aligned block, centred on both axes.
@@ -174,9 +168,7 @@ mod tests {
     use super::super::test_support;
     use super::*;
     use crate::keys::{Prefix, PREFIX, PREFIX_LABEL};
-    use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
-    use ratatui::Terminal;
 
     /// Wide enough that the whole table fits with slack on both sides, so the
     /// centring is what is being measured rather than the clamp.
@@ -389,8 +381,7 @@ mod tests {
             .iter()
             .max_by_key(|l| l.width())
             .expect("a table row");
-        let left = row.len() - row.trim_start().len();
-        let right = WIDE as usize - row.width();
+        let (left, right) = test_support::padding(row, WIDE as usize);
         assert!(
             left.abs_diff(right) <= 2,
             "not horizontally centred: {left} left, {right} right, row {row:?}"
@@ -402,9 +393,7 @@ mod tests {
     #[test]
     fn the_hint_row_is_dim_and_the_table_is_not() {
         let rows = rows(PREFIX_LABEL);
-        let mut terminal = Terminal::new(TestBackend::new(WIDE, 11)).expect("terminal");
-        terminal.draw(|f| draw(f, &rows)).expect("draw");
-        let buf = terminal.backend().buffer().clone();
+        let buf = test_support::buffer(WIDE, 11, |f| draw(f, &rows));
         let last = buf.area.height - 1;
         for x in 0..buf.area.width {
             let cell = &buf[(x, last)];

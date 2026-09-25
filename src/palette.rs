@@ -36,7 +36,7 @@
 //! off; the default foreground and background, which are most of any screen,
 //! are always the terminal's own or the fade does not run.
 
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::os::fd::AsRawFd;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -108,13 +108,13 @@ const XTERM_ANSI: [Rgb; 16] = [
 
 /// What the terminal answered, as far as it did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Replies {
-    pub fg: Option<Rgb>,
-    pub bg: Option<Rgb>,
-    pub ansi: [Option<Rgb>; 16],
+struct Replies {
+    fg: Option<Rgb>,
+    bg: Option<Rgb>,
+    ansi: [Option<Rgb>; 16],
     /// The DSR reply arrived: the terminal has answered everything it is
     /// going to.
-    pub dsr: bool,
+    dsr: bool,
 }
 
 impl Replies {
@@ -151,7 +151,7 @@ const DSR_REPLY: &[u8] = b"\x1b[0n";
 /// OSC reply is `ESC ] <payload> BEL` or `ESC ] <payload> ESC \`; the payload
 /// is `10;<colour>`, `11;<colour>` or `4;<n>;<colour>`. A reply cut short by
 /// the end of `bytes` is not yet a reply, and the caller comes back with more.
-pub fn parse_replies(bytes: &[u8]) -> Replies {
+fn parse_replies(bytes: &[u8]) -> Replies {
     let mut replies = Replies::default();
     let mut i = 0;
     while i < bytes.len() {
@@ -285,15 +285,8 @@ pub fn query() -> Option<Palette> {
         tracing::debug!("palette: a key is already waiting; not asking the terminal");
         return None;
     }
-    {
-        let mut out = std::io::stdout().lock();
-        if out
-            .write_all(&request())
-            .and_then(|()| out.flush())
-            .is_err()
-        {
-            return None;
-        }
+    if crate::term::write_stdout(&request()).is_err() {
+        return None;
     }
 
     let started = Instant::now();
@@ -341,8 +334,9 @@ fn readable_now(fd: std::os::fd::RawFd) -> bool {
 
 static PALETTE: OnceLock<Option<Palette>> = OnceLock::new();
 
-/// Keep the terminal's answer, once. `main` is the only caller; a second call
-/// is a bug, so it warns and keeps the first.
+/// Keep the terminal's answer, once. `main` calls this at startup, and the
+/// relay tests' child process does the same to switch the fade on; a second
+/// call in one process is a bug, so it warns and keeps the first.
 pub fn init(palette: Option<Palette>) {
     if PALETTE.set(palette).is_err() {
         tracing::warn!("palette initialised more than once; keeping the first");

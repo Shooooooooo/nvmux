@@ -399,7 +399,7 @@ impl<S: Read + Write> Client<S> {
     /// `nvim_get_api_info` — reachability and version. Answered off the main
     /// loop, so this does **not** prove the session is usable; see the module
     /// docs.
-    pub fn api_info(&mut self) -> Result<ApiInfo, RpcError> {
+    pub fn api_info(&mut self) -> Result<crate::nvim::Version, RpcError> {
         let v = self.call("nvim_get_api_info", vec![])?;
         let arr = v
             .as_array()
@@ -427,10 +427,14 @@ impl<S: Read + Write> Client<S> {
                 .and_then(|(_, v)| v.as_u64())
         };
 
-        Ok(ApiInfo {
+        Ok(crate::nvim::Version {
             major: field("major").unwrap_or(0),
             minor: field("minor").unwrap_or(0),
             patch: field("patch").unwrap_or(0),
+            // The map spells `prerelease` as a boolean and keeps the dev tag
+            // under `build`; nothing in nvmux reads either from this path, so
+            // it is left unset rather than invented.
+            prerelease: None,
         })
     }
 
@@ -468,8 +472,8 @@ impl<S: Read + Write> Client<S> {
         Ok(v.as_array().map(|a| a.len()).unwrap_or(0))
     }
 
-    /// `nvim_command`. Used for `qa!`, for injecting the `:Detach` alias, and
-    /// for `:mode`, the one command that clears the grid and repaints it.
+    /// `nvim_command`. Used for injecting the `:Detach` alias, and for
+    /// `:mode`, the one command that clears the grid and repaints it.
     pub fn command(&mut self, cmd: &str) -> Result<(), RpcError> {
         self.call("nvim_command", vec![Value::String(cmd.into())])?;
         Ok(())
@@ -572,28 +576,6 @@ impl Mode {
     }
 }
 
-/// The parts of `nvim_get_api_info`'s version map that nvmux uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ApiInfo {
-    pub major: u64,
-    pub minor: u64,
-    pub patch: u64,
-}
-
-impl ApiInfo {
-    /// The same gate [`crate::nvim::Version::is_supported`] applies to a
-    /// `--version` banner, sourced from the one constant so the two cannot drift.
-    pub fn is_supported(&self) -> bool {
-        (self.major, self.minor) >= crate::nvim::MIN
-    }
-}
-
-impl std::fmt::Display for ApiInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
-    }
-}
-
 /// Decode a Neovim handle (buffer, window, tabpage) into its integer id.
 ///
 /// Neovim encodes these as msgpack **EXT** values whose payload is itself a
@@ -608,7 +590,7 @@ impl std::fmt::Display for ApiInfo {
 /// nvmux makes no handle-based calls today, so this lives with its test as the
 /// reference for whoever adds one.
 #[cfg(test)]
-pub fn ext_to_handle(v: &Value) -> Option<i64> {
+fn ext_to_handle(v: &Value) -> Option<i64> {
     match v {
         Value::Ext(_type_code, data) => rmpv::decode::read_value(&mut &data[..])
             .ok()
@@ -746,20 +728,6 @@ mod tests {
     #[test]
     fn plain_integers_still_decode() {
         assert_eq!(ext_to_handle(&Value::from(7)), Some(7));
-    }
-
-    #[test]
-    fn version_gate_matches_the_documented_minimum() {
-        let at = |major, minor| ApiInfo {
-            major,
-            minor,
-            patch: 0,
-        };
-        assert!(!at(0, 9).is_supported());
-        assert!(!at(0, 10).is_supported());
-        assert!(at(0, 11).is_supported(), "0.11 is the documented minimum");
-        assert!(at(0, 12).is_supported());
-        assert!(at(1, 0).is_supported());
     }
 
     /// A peer that answers every request with one canned frame, and keeps
@@ -979,7 +947,7 @@ mod tests {
     /// instead would list the file as a session.
     #[test]
     fn probing_a_regular_file_is_dead_not_busy() {
-        let path = std::env::temp_dir().join(format!("nvmux-notasock-{}.sock", std::process::id()));
+        let path = crate::test_support::scratch_sock("rpc-notasock");
         std::fs::write(&path, b"not a socket").expect("write");
         let liveness = probe(&path);
         let _ = std::fs::remove_file(&path);
@@ -991,9 +959,7 @@ mod tests {
     /// read on another thread, and promptly.
     #[test]
     fn an_interrupt_ends_an_unbounded_call_on_another_thread() {
-        let path =
-            std::env::temp_dir().join(format!("nvmux-interrupt-{}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let path = crate::test_support::scratch_sock("rpc-interrupt");
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
         let mut client = Client::connect_with(&path, None).expect("connect");
         let interrupt = client.interrupt().expect("a second handle");

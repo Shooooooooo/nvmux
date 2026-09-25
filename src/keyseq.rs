@@ -67,7 +67,7 @@ pub const ESC: u8 = 0x1b;
 /// longest spelling of a chord — every optional field present — is about
 /// twenty bytes; a DA1 reply from a terminal proud of its features runs to
 /// forty.
-pub const MAX_LEN: usize = 64;
+const MAX_LEN: usize = 64;
 
 const CTRL: u32 = 4;
 const CAPS_LOCK: u32 = 64;
@@ -95,7 +95,7 @@ pub enum Sequence {
 
 /// Classify `seq`, which must start with [`ESC`], as a spelling of the `Ctrl`
 /// chord a terminal reports under the key code `code` — see
-/// [`crate::keys::prefix_code`].
+/// `keys::prefix_code`.
 ///
 /// Meant to be called again after every byte: the answer for a prefix of a
 /// sequence is [`Sequence::Partial`] until the byte that decides it arrives, and

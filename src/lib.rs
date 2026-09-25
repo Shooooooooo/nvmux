@@ -11,6 +11,10 @@
 //!
 //! macOS and Linux only.
 
+// The docs link private items on purpose — they are written for whoever reads
+// the source, and resolve under `cargo doc --document-private-items`.
+#![allow(rustdoc::private_intra_doc_links)]
+
 pub mod announce;
 pub mod boundary;
 pub mod cli;
@@ -41,5 +45,8 @@ pub mod term;
 pub mod transport;
 pub mod ui;
 pub mod winch;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use error::{NvmuxError, Result};

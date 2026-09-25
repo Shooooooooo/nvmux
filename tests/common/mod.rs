@@ -67,13 +67,10 @@ macro_rules! require {
     };
 }
 
-/// Skip rather than fail where Neovim is missing or too old.
+/// Skip rather than fail where Neovim is missing or too old: the same check
+/// `main` makes before it will run at all.
 pub fn nvim_available() -> bool {
-    match std::process::Command::new("nvim").arg("--version").output() {
-        Ok(out) => nvmux::nvim::parse_version(&String::from_utf8_lossy(&out.stdout))
-            .is_some_and(|v| v.is_supported()),
-        Err(_) => false,
-    }
+    nvmux::nvim::check_local().is_ok()
 }
 
 #[macro_export]
@@ -123,7 +120,9 @@ impl Drop for Scratch {
         // stray nvim processes survive the run and pile up across runs.
         //
         // Signal the recorded pids directly rather than with `pkill`: the pid
-        // in `<id>.json` was validated against its socket at spawn time.
+        // in `<id>.json` was validated against its socket at spawn time. That
+        // leaves a live session with no `<id>.json` out of reach, so a test
+        // that makes one has to kill it itself.
         if let Ok(entries) = std::fs::read_dir(&self.0) {
             for e in entries.flatten() {
                 let p = e.path();
@@ -197,7 +196,7 @@ pub fn unique(tag: &str) -> String {
 
 /// Wait up to `within` for `cond` to hold, polling gently. Returns whether it
 /// did, so a caller can assert with its own message.
-pub fn wait_until(within: Duration, cond: impl Fn() -> bool) -> bool {
+pub fn wait_until(within: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {
         if cond() {
@@ -349,9 +348,7 @@ impl Drop for HitEnter {
 /// Whether the server behind `sock` is at a hit-enter prompt right now. A
 /// fast call, answered even then.
 pub fn at_hit_enter(sock: &Path) -> bool {
-    Client::connect(sock, Duration::from_secs(2))
-        .and_then(|mut c| c.get_mode())
-        .is_ok_and(|m| m.at_hit_enter())
+    mode(sock).is_some_and(|m| m.at_hit_enter())
 }
 
 /// The mode the server behind `sock` is in right now, or `None` if it could

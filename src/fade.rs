@@ -295,12 +295,12 @@ where
     };
     let mut schedule = Schedule::start(one_way(), direction, Instant::now());
     while let Some(t) = schedule.next(Instant::now()) {
-        write_all(SYNC_BEGIN)?;
+        crate::term::write_stdout(SYNC_BEGIN)?;
         terminal.draw(|f| {
             draw(f);
             apply(f.buffer_mut(), palette, t);
         })?;
-        write_all(SYNC_END)?;
+        crate::term::write_stdout(SYNC_END)?;
         if !schedule.finished() {
             thread::sleep(FRAME);
         }
@@ -363,27 +363,12 @@ fn cursor_for(direction: Direction, last: bool) -> Cursor {
     }
 }
 
-/// Write to stdout and flush, so an escape sequence lands before the next.
-fn write_all(bytes: &[u8]) -> io::Result<()> {
-    let mut out = io::stdout().lock();
-    out.write_all(bytes)?;
-    out.flush()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::palette::Rgb;
+    use crate::test_support::palette;
     use ratatui::layout::Rect;
     use ratatui::style::Style;
-
-    fn palette() -> Palette {
-        Palette {
-            fg: Rgb(200, 200, 200),
-            bg: Rgb(0, 0, 0),
-            ansi: [Rgb(0, 0, 0); 16],
-        }
-    }
 
     /// The gate's precedence, without touching any global: the config can
     /// turn the effect off, and `NO_COLOR` turns it off even when the config

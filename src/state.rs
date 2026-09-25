@@ -28,11 +28,11 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::nonempty;
 use crate::transport::Location;
 
 /// The whole file. Absent tables and keys are simply nothing remembered.
@@ -57,9 +57,11 @@ fn key(location: &Location) -> String {
 /// Resolve the state path from the relevant environment, purely.
 ///
 /// Precedence mirrors [`crate::config`]: `$NVMUX_STATE` (an exact path) >
-/// `$XDG_STATE_HOME/nvmux/` > `$HOME/.local/state/nvmux/`. Unlike the config
-/// there is no explicit/default distinction, because a missing file is never an
-/// error here whichever named it.
+/// `$XDG_STATE_HOME/nvmux/` > `$HOME/.local/state/nvmux/`, and an empty
+/// variable counts as unset, by the config's own rule
+/// ([`crate::config::nonempty`]). Unlike the config there is no
+/// explicit/default distinction, because a missing file is never an error here
+/// whichever named it.
 fn resolve_state_path(
     nvmux_state: Option<&OsStr>,
     xdg_state_home: Option<&OsStr>,
@@ -78,13 +80,6 @@ fn resolve_state_path(
             .join("nvmux")
             .join("state.toml")
     })
-}
-
-/// An empty value is treated as unset, matching how a shell exports a variable
-/// that was never really set — and matching [`crate::config`], which takes the
-/// same view of the same kind of variable.
-fn nonempty(value: Option<&OsStr>) -> Option<&OsStr> {
-    value.filter(|s| !s.is_empty())
 }
 
 fn path() -> Option<PathBuf> {
@@ -153,33 +148,15 @@ pub fn remember(location: &Location, line: &str) {
     }
 }
 
-/// Temp file plus `rename(2)`, as everything else nvmux writes — see
-/// [`crate::config::write_default`], whose gentle `DirBuilder` this shares for
-/// the same reason.
+/// Temp file plus `rename(2)`, as everything else nvmux writes
+/// ([`crate::paths::write_atomic`]), under a parent made the gentle way the
+/// config file's is ([`crate::paths::create_private_parent`]).
 fn write_atomic(path: &Path, state: &State) -> std::io::Result<()> {
-    use std::io::Write;
-
     let body = toml::to_string(state).map_err(std::io::Error::other)?;
     let contents =
         format!("# nvmux remembers things here. Written by nvmux; safe to delete.\n\n{body}");
-
-    if let Some(parent) = path.parent() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
-    }
-
-    let tmp = path.with_extension(format!("toml.tmp{}", std::process::id()));
-    let write = || -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(contents.as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
-    };
-    write().inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    crate::paths::create_private_parent(path)?;
+    crate::paths::write_atomic(path, contents.as_bytes())
 }
 
 #[cfg(test)]
@@ -245,17 +222,14 @@ mod tests {
 
     impl Scratch {
         fn new(tag: &str) -> Self {
-            let saved = ["NVMUX_STATE", "XDG_STATE_HOME", "HOME"]
+            let saved = ["NVMUX_STATE"]
                 .into_iter()
                 .map(|k| (k, std::env::var_os(k)))
                 .collect::<Vec<_>>();
             for (k, _) in &saved {
                 std::env::remove_var(k);
             }
-            let dir =
-                std::env::temp_dir().join(format!("nvmux-state-{}-{tag}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let dir = crate::test_support::scratch_dir(&format!("state-{tag}"));
             std::env::set_var("NVMUX_STATE", dir.join("state.toml"));
             Self { dir, saved }
         }

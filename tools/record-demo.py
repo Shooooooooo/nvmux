@@ -39,9 +39,15 @@ The GIF is drawn in JetBrainsMono Nerd Font Mono. If it is not installed it is
 fetched once into `tools/.fonts`, which is gitignored; NVMUX_DEMO_FONT_DIR
 overrides where to look.
 
-Everything it touches is scratch: a config under a temporary directory, and
-demo sessions it creates itself. Your own nvmux sessions and config are left
-alone.
+The config is scratch: it lives under a temporary directory that is removed on
+exit, and your own config is never read. The demo sessions are not. nvmux has
+no override for its runtime directory, so they are created in your real one
+(/tmp/nvmux-<uid>) alongside any sessions you already have -- the names in
+NAMES and NEW_NAME must therefore be free -- and they are left running when the
+script ends (see the note it prints last). One file of yours is touched:
+/tmp/nvmux-<uid>/nvmux.log is removed beforehand and rewritten by the demo's
+own NVMUX_LOG=nvmux=debug run, because `check_fade_ran` reads it afterwards and
+must not pass on a previous run's evidence.
 """
 
 import codecs
@@ -481,8 +487,8 @@ def make_sessions(env):
         term.expect("new session name", "the create prompt")
         term.type(name, wait=0.5)
         term.write(ENTER, wait=4.0)                  # creates, then attaches
-        term.write(PREFIX + b" ", wait=2.0)          # one write: the chord has
-        term.expect("attach", "the picker after %s" % name)   # 500ms to land
+        term.write(PREFIX + b" ", wait=2.0)          # one write, so the chord
+        term.expect("attach", "the picker after %s" % name)   # fits keys.timeout_ms
         print("  created %s" % name)
     term.write(b"q", wait=1.0)
     term.close()

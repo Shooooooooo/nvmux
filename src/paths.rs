@@ -12,6 +12,11 @@
 //!
 //! The std error carries `raw_os_error() == None`, so there is no
 //! `ENAMETOOLONG` to detect after the fact.
+//!
+//! The one atomic file write nvmux makes ([`write_atomic`]) and the gentle
+//! parent-directory creation the config and state files share
+//! ([`create_private_parent`]) live here too, with the rest of the filesystem
+//! hygiene.
 
 use std::fs::DirBuilder;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
@@ -49,8 +54,10 @@ pub fn runtime_dir() -> PathBuf {
 
 /// Resolve, create if needed, and security-check the runtime directory.
 ///
-/// Call this before every operation that touches the directory: it is cheap, and
-/// `/tmp` reapers do delete idle directories.
+/// Run once at startup (`main`) and again when a transport is built. It is not
+/// repeated per operation: `/tmp` reapers do delete idle directories, but the
+/// only moment that matters for a socket is its creation, and
+/// `scripts/spawn.sh` repeats this same check itself before every spawn.
 pub fn ensure_runtime_dir() -> Result<PathBuf, PathError> {
     let dir = runtime_dir();
     ensure_dir_secure(&dir)?;
@@ -141,9 +148,10 @@ static LAUNCH_UMASK: OnceLock<Mode> = OnceLock::new();
 ///
 /// What that leaves protecting the listen socket, which is created with
 /// `0777 & ~umask` and is what this clamp was reached for: a runtime directory
-/// that is 0700, owned by us, re-checked by [`ensure_dir_secure`] before every
-/// operation and by `scripts/spawn.sh` before every spawn — so a socket is
-/// out of reach for as long as it exists, whatever mode it is born with — and
+/// that is 0700, owned by us, checked by [`ensure_dir_secure`] at startup and
+/// when a transport is built, and by `scripts/spawn.sh` before every spawn —
+/// the one moment a socket is created — so a socket is out of reach for as
+/// long as it exists, whatever mode it is born with — and
 /// an explicit `chmod 600` on the socket once it appears. Both are controls
 /// that hold on their own; the umask never was one.
 ///
@@ -259,6 +267,46 @@ pub fn master_socket(control_path: &Path, nonce: &str) -> PathBuf {
 /// nvmux's own log file. One per user, not per session.
 pub fn client_log(dir: &Path) -> PathBuf {
     dir.join("nvmux.log")
+}
+
+/// Write `contents` to `path` atomically: a sibling temp file, synced, then
+/// `rename(2)`, which within one directory is atomic — so a concurrent reader
+/// sees the old contents or the new and never a half-written file. The temp
+/// file is removed again if any step fails.
+///
+/// The temp name keeps the target's extension in front of `.tmp<pid>`, so a
+/// glob on the extension does not pick the temp file up as a real one.
+pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension(match path.extension() {
+        Some(ext) => format!("{}.tmp{}", ext.to_string_lossy(), std::process::id()),
+        None => format!("tmp{}", std::process::id()),
+    });
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    write().inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// Create `path`'s parent directory, private to the user, if it is missing.
+///
+/// A gentle `DirBuilder`, not [`ensure_dir_secure`]: that is `/tmp` hardening
+/// that would reject a pre-existing `~/.config` at `0755` and does not create
+/// missing parents. For the files nvmux writes under the user's own
+/// directories — the config and the state file.
+pub(crate) fn create_private_parent(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -424,16 +472,51 @@ mod tests {
         );
     }
 
+    /// The entries of a directory whose names carry `tmp`: what an atomic
+    /// write must never leave behind.
+    fn strays(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn an_atomic_write_lands_whole_and_leaves_no_temp_file() {
+        let dir = crate::test_support::scratch_dir("paths-atomic");
+        let path = dir.join("x.json");
+        write_atomic(&path, b"{\"a\":1}\n").expect("write");
+        assert_eq!(std::fs::read(&path).expect("read back"), b"{\"a\":1}\n");
+        // And again over the top, which is the rename replacing a file.
+        write_atomic(&path, b"{\"a\":2}\n").expect("rewrite");
+        assert_eq!(std::fs::read(&path).expect("read back"), b"{\"a\":2}\n");
+        assert!(strays(&dir).is_empty(), "left temp files behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rename that fails — a directory sits where the file should go — must
+    /// not leave the temp file for a listing to find.
+    #[test]
+    fn a_failed_atomic_write_cleans_up_after_itself() {
+        let dir = crate::test_support::scratch_dir("paths-atomic-fail");
+        let path = dir.join("x.json");
+        std::fs::create_dir(&path).expect("a directory in the way");
+        assert!(write_atomic(&path, b"{}").is_err());
+        assert!(strays(&dir).is_empty(), "left temp files behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The checks below are security controls, so they are tested as such:
     /// each one constructs the attack it is supposed to stop.
     mod security {
         use super::*;
 
+        /// Absent, not created: every case here makes its own thing at the
+        /// path, or wants `ensure_dir_secure` to.
         fn scratch(tag: &str) -> PathBuf {
-            let p = std::env::temp_dir().join(format!("nvmux-sec-{}-{tag}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&p);
-            let _ = std::fs::remove_file(&p);
-            p
+            crate::test_support::scratch_path(&format!("sec-{tag}"))
         }
 
         #[test]

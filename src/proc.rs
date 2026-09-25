@@ -79,9 +79,10 @@ impl From<std::process::Output> for Output {
 /// Spawn `cmd`, feed it `script` on stdin, and wait for it.
 ///
 /// The one-shot form, kept for tests. Returns `io::Result` rather than a crate
-/// error so each caller keeps its own classification — `ssh` in particular has
-/// to tell "no ssh binary" from "ssh ran and failed", which the `io::ErrorKind`
-/// is the only signal for.
+/// error for the same reason [`Shell::start`] does: a spawn that failed keeps
+/// its `io::ErrorKind`, so a test can tell "no such binary" from "ran and
+/// failed" — the signal [`crate::ssh`] classifies on, through
+/// [`Shell::start`].
 pub fn run_feeding_stdin(cmd: &mut Command, script: &str) -> std::io::Result<Output> {
     let mut child = cmd
         .stdin(Stdio::piped())
@@ -106,8 +107,8 @@ pub fn run_local(script: &str, args: &[&str]) -> Result<Output> {
     run_feeding_stdin(&mut cmd, script).map_err(NvmuxError::Io)
 }
 
-/// `/bin/sh -s`: what a local [`Shell`] is started from, and what the one-shot
-/// form runs.
+/// `/bin/sh -s`: what a local [`Shell`] is started from ([`Shell::local`]),
+/// and what the one-shot form runs.
 ///
 /// It runs under the umask nvmux was *started* with rather than the one nvmux
 /// clamped itself to, because this shell is what runs `scripts/spawn.sh`, and
@@ -117,7 +118,7 @@ pub fn run_local(script: &str, args: &[&str]) -> Result<Output> {
 /// Only the local shell: a umask does not travel over ssh, so a remote session
 /// takes the remote host's own — which is what anything else launched there
 /// would get, and is not this machine's business to override.
-pub fn sh_command() -> Command {
+fn sh_command() -> Command {
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-s");
     if let Some(mask) = crate::paths::launch_umask() {
@@ -289,6 +290,14 @@ impl Shell {
         shell.ready = Some(needle(&mark));
         tracing::debug!(name = %shell.name, pid = shell.child.id(), "shell started");
         Ok(shell)
+    }
+
+    /// This machine's `/bin/sh`, started from [`sh_command`] so it runs under
+    /// the launch umask. Every local shell is started through here: the
+    /// transport's, the directory lister's, and the ones the tests stand in
+    /// for a remote host with.
+    pub fn local() -> io::Result<Shell> {
+        Shell::start(&mut sh_command(), "/bin/sh")
     }
 
     /// Run `script` with `args` as `$1..$n`, in a subshell, and collect what it
@@ -683,16 +692,6 @@ mod tests {
         assert_eq!(out.stdout, "$(echo pwned)", "argument was re-evaluated");
     }
 
-    /// A missing binary must reach the caller as `NotFound` and not be flattened
-    /// into a generic failure: `ssh.rs` classifies on exactly this to tell "ssh
-    /// is not installed" from "ssh ran and could not connect".
-    #[test]
-    fn a_missing_binary_keeps_its_error_kind() {
-        let err = run_feeding_stdin(&mut Command::new("nvmux-no-such-binary"), "echo hi")
-            .expect_err("must fail");
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
-    }
-
     #[test]
     fn a_failing_script_reports_its_status_not_an_error() {
         let out = run_local("exit 3", &[]).expect("run");
@@ -703,7 +702,7 @@ mod tests {
     // ---- the persistent shell ------------------------------------------------
 
     fn sh() -> Shell {
-        Shell::start(&mut sh_command(), "/bin/sh").expect("start /bin/sh")
+        Shell::local().expect("start /bin/sh")
     }
 
     fn run(shell: &mut Shell, script: &str, args: &[&str]) -> Output {
@@ -712,10 +711,7 @@ mod tests {
 
     /// A scratch directory for the tests that need files on disk.
     fn scratch(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("nvmux-shell-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+        crate::test_support::scratch_dir(&format!("proc-{tag}"))
     }
 
     #[test]
@@ -938,7 +934,7 @@ mod tests {
                 r#"{"id":"cccccccc","name":"c","created":1,"pid":1,"num":2}"#,
             ],
         );
-        protocol::parse_renumber(&out.stdout).expect("renumbered");
+        protocol::parse_write(&out.stdout, "renumber").expect("renumbered");
         // A directory that is not there is an empty answer.
         let out = run(&mut shell, shell::DIRS_SCRIPT, &[&format!("{arg}/nope")]);
         assert!(protocol::parse_dirs(&out.stdout)
@@ -978,11 +974,10 @@ mod tests {
         unsafe {
             libc::kill(shell.pid() as libc::pid_t, libc::SIGKILL);
         }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while shell.is_alive() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(!shell.is_alive(), "a killed shell still reads as alive");
+        assert!(
+            crate::test_support::wait_until(Duration::from_secs(2), || !shell.is_alive()),
+            "a killed shell still reads as alive"
+        );
     }
 
     #[test]

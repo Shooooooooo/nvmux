@@ -28,11 +28,11 @@ use crate::shell;
 /// 6.7 is where unix-domain socket forwarding (`-L <local_sock>:<remote_sock>`)
 /// was added, which is the entire remote transport. `MIN_SSH` is the same
 /// version as a tuple; a test ties the two together.
-pub const MIN_SSH_VERSION: &str = "6.7";
+const MIN_SSH_VERSION: &str = "6.7";
 const MIN_SSH: (u64, u64) = (6, 7);
 
 /// Parse the version out of `ssh -V` output, e.g. `OpenSSH_9.6p1 Ubuntu-3...`.
-pub fn parse_ssh_version(banner: &str) -> Option<(u64, u64)> {
+fn parse_ssh_version(banner: &str) -> Option<(u64, u64)> {
     let token = banner.split_whitespace().next()?;
     let rest = token.strip_prefix("OpenSSH_")?;
     let numeric: String = rest
@@ -125,7 +125,7 @@ fn unattended(ctl: &Path) -> Vec<String> {
 /// down drops packets rather than refusing them, so without a bound each
 /// attempt would hang for the minutes the kernel allows and the series would
 /// never get to its next try. See [`crate::reconnect`].
-pub fn master_args(host: &str, own: &Path, connect_timeout: Option<u64>) -> Vec<String> {
+fn master_args(host: &str, own: &Path, connect_timeout: Option<u64>) -> Vec<String> {
     let mut args = vec![
         "-M".into(),
         "-N".into(),
@@ -160,7 +160,7 @@ fn exit_args(host: &str, own: &Path) -> Vec<String> {
 }
 
 /// Ask whether the master is alive.
-pub fn check_args(host: &str, ctl: &Path) -> Vec<String> {
+fn check_args(host: &str, ctl: &Path) -> Vec<String> {
     let mut args = common(ctl);
     args.extend(["-O".into(), "check".into(), host.to_string()]);
     args
@@ -180,12 +180,12 @@ fn forward_op(op: &str, host: &str, ctl: &Path, local: &Path, remote: &Path) -> 
 }
 
 /// Add a unix-socket forward to the existing master, without reconnecting.
-pub fn forward_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<String> {
+fn forward_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<String> {
     forward_op("forward", host, ctl, local, remote)
 }
 
 /// Remove a forward.
-pub fn cancel_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<String> {
+fn cancel_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<String> {
     forward_op("cancel", host, ctl, local, remote)
 }
 
@@ -208,14 +208,14 @@ pub fn cancel_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<S
 /// script back into the output. `-n` must never be added: it puts `/dev/null`
 /// on stdin, and `sh -s` then reads nothing, prints nothing and exits 0 — an
 /// *empty* result, silently, rather than an error.
-pub fn shell_args(host: &str, ctl: &Path) -> Vec<String> {
+fn shell_args(host: &str, ctl: &Path) -> Vec<String> {
     shell_args_with(common(ctl), host)
 }
 
 /// The same command, with the options an unattended shell needs — see
 /// [`unattended`]. Identical in every other respect, so what runs on the host is
 /// the same program reached the same way.
-pub fn unattended_shell_args(host: &str, ctl: &Path) -> Vec<String> {
+fn unattended_shell_args(host: &str, ctl: &Path) -> Vec<String> {
     shell_args_with(unattended(ctl), host)
 }
 
@@ -378,8 +378,8 @@ impl Ssh {
     /// idle connection nothing could reach, for as long as the network held.
     ///
     /// Which leaves every master's linked name behind when it exits: a socket
-    /// nothing listens on, cleared by `clear_control_path` before the next
-    /// master is linked there.
+    /// nothing listens on, cleared by [`Self::clear_control_path`] before the
+    /// next master is linked there.
     pub fn ensure_master_within(&self, connect_timeout: Option<u64>) -> Result<(), SshError> {
         if self.is_master_alive() {
             return Ok(());
@@ -749,20 +749,13 @@ mod tests {
         ));
     }
 
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("nvmux-ssh-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch directory");
-        dir
-    }
-
     /// The race this guards against, reduced to its end state: `-O check`
     /// has already said nothing is there, and by the time the path is looked
     /// at, another nvmux's master is. Removing it would leave that master
     /// running with no name to be reached by.
     #[test]
     fn a_control_path_something_answers_on_is_used_rather_than_cleared() {
-        let dir = scratch("answered");
+        let dir = crate::test_support::scratch_dir("ssh-answered");
         let ctl = dir.join("cm");
         let listener = std::os::unix::net::UnixListener::bind(&ctl).expect("bind");
         let ssh = Ssh::new("h".into(), ctl.clone());
@@ -779,7 +772,7 @@ mod tests {
     /// goes with it — is cleared, so the next can be linked in its place.
     #[test]
     fn a_control_path_nothing_answers_on_is_cleared() {
-        let dir = scratch("refused");
+        let dir = crate::test_support::scratch_dir("ssh-refused");
         let ctl = dir.join("cm");
         drop(std::os::unix::net::UnixListener::bind(&ctl).expect("bind"));
         let ssh = Ssh::new("h".into(), ctl.clone());
@@ -801,7 +794,7 @@ mod tests {
     /// could not be linked over it.
     #[test]
     fn a_control_path_that_is_not_a_socket_is_left_alone_and_reported() {
-        let dir = scratch("file");
+        let dir = crate::test_support::scratch_dir("ssh-not-a-socket");
         let ctl = dir.join("cm");
         std::fs::write(&ctl, b"not a socket").expect("write");
         let ssh = Ssh::new("h".into(), ctl.clone());

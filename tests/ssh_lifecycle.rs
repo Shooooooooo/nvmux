@@ -372,19 +372,6 @@ fn exit_master_at(socket: &Path) -> std::process::Output {
         .expect("run ssh -O exit")
 }
 
-/// Poll until `done`, or fail after a few seconds: a master is a separate
-/// process, and its going is not instantaneous.
-fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !done() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for {what}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-}
-
 /// A master on a `ControlPath` of this test's own, killable without
 /// disturbing anything — see [`PrivateDir`].
 struct PrivateMaster {
@@ -472,12 +459,8 @@ fn a_shell_started_over_a_master_dies_with_it() {
     m.kill();
 
     // The client is a separate process, so its death is not instantaneous.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while shell.is_alive() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
     assert!(
-        !shell.is_alive(),
+        common::wait_until(std::time::Duration::from_secs(5), || !shell.is_alive()),
         "a shell over a master must not outlive it, or a live shell would \
          vouch for a master that has gone"
     );
@@ -554,9 +537,13 @@ fn a_master_leaving_takes_only_its_own_name_with_it() {
     m.ssh.ensure_master().expect("a second master");
     assert!(m.ssh.is_master_alive(), "the second master is not linked");
 
-    // The first one leaves, as it would once its last client had.
+    // The first one leaves, as it would once its last client had — a separate
+    // process, so not instantly.
     exit_master_at(&first[0]);
-    wait_for("the first master to exit", || !first[0].exists());
+    assert!(
+        common::wait_until(std::time::Duration::from_secs(5), || !first[0].exists()),
+        "the first master did not exit"
+    );
     assert!(
         m.ssh.is_master_alive(),
         "the first master took the second one's ControlPath with it"
@@ -587,9 +574,14 @@ fn two_masters_brought_up_at_once_leave_one_running() {
     });
 
     assert!(a.is_master_alive(), "neither master is linked");
-    wait_for("the second master to be retired", || {
-        dir.masters_running() == 1
-    });
+    // The loser is told to exit, and takes a moment to.
+    assert!(
+        common::wait_until(std::time::Duration::from_secs(5), || {
+            dir.masters_running() == 1
+        }),
+        "{} masters left running for one ControlPath",
+        dir.masters_running()
+    );
 }
 
 /// The chosen command runs on the host that owns the session, not on this one,
