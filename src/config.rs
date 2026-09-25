@@ -253,8 +253,9 @@ enum ConfigSource {
 }
 
 /// An empty value is treated as unset, matching how a shell exports a variable
-/// that was never really set.
-fn nonempty(value: Option<&OsStr>) -> Option<&OsStr> {
+/// that was never really set. Shared with [`crate::state`], which takes the
+/// same view of the same kind of variable.
+pub(crate) fn nonempty(value: Option<&OsStr>) -> Option<&OsStr> {
     value.filter(|s| !s.is_empty())
 }
 
@@ -410,8 +411,9 @@ pub fn write_default(path: &Path, prefix: u8) -> Result<(), ConfigError> {
 
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
 
-/// Install the loaded settings, once, before anything reads them. `main` is the
-/// only caller; a second call is a bug, so it warns and keeps the first.
+/// Install the loaded settings, once, before anything reads them. `main` calls
+/// this at startup, and the relay tests' child process does the same; a second
+/// call in one process is a bug, so it warns and keeps the first.
 pub fn init(settings: Settings) {
     if SETTINGS.set(settings).is_err() {
         tracing::warn!("settings initialised more than once; keeping the first");
@@ -729,10 +731,7 @@ mod tests {
     }
 
     fn scratch(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("nvmux-cfg-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).expect("scratch dir");
-        p
+        crate::test_support::scratch_dir(&format!("cfg-{tag}"))
     }
 
     fn guard() -> std::sync::MutexGuard<'static, ()> {

@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::nonempty;
 use crate::transport::Location;
 
 /// The whole file. Absent tables and keys are simply nothing remembered.
@@ -56,9 +57,11 @@ fn key(location: &Location) -> String {
 /// Resolve the state path from the relevant environment, purely.
 ///
 /// Precedence mirrors [`crate::config`]: `$NVMUX_STATE` (an exact path) >
-/// `$XDG_STATE_HOME/nvmux/` > `$HOME/.local/state/nvmux/`. Unlike the config
-/// there is no explicit/default distinction, because a missing file is never an
-/// error here whichever named it.
+/// `$XDG_STATE_HOME/nvmux/` > `$HOME/.local/state/nvmux/`, and an empty
+/// variable counts as unset, by the config's own rule
+/// ([`crate::config::nonempty`]). Unlike the config there is no
+/// explicit/default distinction, because a missing file is never an error here
+/// whichever named it.
 fn resolve_state_path(
     nvmux_state: Option<&OsStr>,
     xdg_state_home: Option<&OsStr>,
@@ -77,13 +80,6 @@ fn resolve_state_path(
             .join("nvmux")
             .join("state.toml")
     })
-}
-
-/// An empty value is treated as unset, matching how a shell exports a variable
-/// that was never really set — and matching [`crate::config`], which takes the
-/// same view of the same kind of variable.
-fn nonempty(value: Option<&OsStr>) -> Option<&OsStr> {
-    value.filter(|s| !s.is_empty())
 }
 
 fn path() -> Option<PathBuf> {
@@ -226,17 +222,14 @@ mod tests {
 
     impl Scratch {
         fn new(tag: &str) -> Self {
-            let saved = ["NVMUX_STATE", "XDG_STATE_HOME", "HOME"]
+            let saved = ["NVMUX_STATE"]
                 .into_iter()
                 .map(|k| (k, std::env::var_os(k)))
                 .collect::<Vec<_>>();
             for (k, _) in &saved {
                 std::env::remove_var(k);
             }
-            let dir =
-                std::env::temp_dir().join(format!("nvmux-state-{}-{tag}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let dir = crate::test_support::scratch_dir(&format!("state-{tag}"));
             std::env::set_var("NVMUX_STATE", dir.join("state.toml"));
             Self { dir, saved }
         }
