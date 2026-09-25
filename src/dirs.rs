@@ -35,22 +35,31 @@
 //! costs the host, and it is not on the keypress path at all, because a worker
 //! thread is what calls this.
 
+#[cfg(unix)]
 use std::path::PathBuf;
 
 use crate::error::{NvmuxError, Result};
 use crate::proc::Shell;
 use crate::shell;
+#[cfg(unix)]
 use crate::ssh::Ssh;
 use crate::transport::protocol::{self, Listing};
 
 /// A `Send` handle that can list directories on one session host.
 ///
 /// Cheap to make and cheap to hold: the ssh arm is a hostname and a path, not a
-/// connection. Cloneable so a prompt can keep one and give the worker another.
+/// connection, and the relay's is a handle on the connection its transport
+/// already has. Cloneable so a prompt can keep one and give the worker another.
 #[derive(Debug, Clone)]
 pub enum DirSource {
+    #[cfg(unix)]
     Local,
+    #[cfg(unix)]
     Ssh { host: String, control_path: PathBuf },
+    /// A shell opened on the relay's one connection (see [`crate::mux`]) —
+    /// on the link as it is, never a new one, so there is nothing to prompt
+    /// for and a link that is down is simply no completion.
+    Relay(std::sync::Arc<crate::transport::relay::LinkSlot>),
 }
 
 impl DirSource {
@@ -59,10 +68,13 @@ impl DirSource {
     /// reach — see `ssh::unattended`.
     pub fn start_shell(&self) -> Result<Shell> {
         Ok(match self {
+            #[cfg(unix)]
             DirSource::Local => Shell::local()?,
+            #[cfg(unix)]
             DirSource::Ssh { host, control_path } => {
                 Ssh::new(host.clone(), control_path.clone()).start_unattended_shell()?
             }
+            DirSource::Relay(link) => link.open_shell()?,
         })
     }
 }

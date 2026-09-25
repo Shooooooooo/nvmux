@@ -225,11 +225,53 @@ fn shell_args_with(mut args: Vec<String>, host: &str) -> Vec<String> {
     args
 }
 
+/// Arguments for the one connection the relay rides on (see [`crate::mux`]):
+/// the same login shell every script runs in over a master, reached without
+/// one.
+///
+/// `ControlMaster=no` and `ControlPath=none` whatever the user's config says:
+/// a `ControlMaster auto` there would have this connection set itself up as a
+/// master nobody asked for, or join one — and on Windows, whose ssh cannot
+/// multiplex, fail outright ("getsockname failed: Not a socket"). The
+/// `ServerAlive` options are the master's, for the master's reason: a link
+/// that has gone quiet is noticed rather than hung on, and that notice is what
+/// a reconnection starts from. `connect_timeout` is too — see [`master_args`].
+///
+/// `-T`, and no `-n`, for the reasons [`shell_args`] gives: the far side's
+/// stdin is a stream of scripts and then of frames, and a pty would echo it.
+fn relay_args(host: &str, connect_timeout: Option<u64>) -> Vec<String> {
+    let mut args = vec![
+        "-T".into(),
+        "-o".into(),
+        "ControlMaster=no".into(),
+        "-o".into(),
+        "ControlPath=none".into(),
+        "-o".into(),
+        "ServerAliveInterval=15".into(),
+        "-o".into(),
+        "ServerAliveCountMax=3".into(),
+    ];
+    if let Some(secs) = connect_timeout {
+        args.extend(["-o".into(), format!("ConnectTimeout={secs}")]);
+    }
+    args.extend([host.to_string(), remote_shell_command()]);
+    args
+}
+
+/// The `ssh` that brings up the relay's connection — see [`relay_args`].
+pub(crate) fn relay_command(host: &str, connect_timeout: Option<u64>) -> Command {
+    let args = relay_args(host, connect_timeout);
+    tracing::debug!(args = ?args, "ssh relay");
+    let mut cmd = Command::new("ssh");
+    cmd.args(args);
+    cmd
+}
+
 /// What the login shell is told to run. `exec`, so the login shell is gone once
 /// `sh` is up: nothing of its own — a `.bash_logout`, say — runs when the stream
 /// closes, and nothing of it sits between ssh and the shell. `nvmux` is that
 /// login shell's `$0`, which is how it shows up in a process listing.
-fn remote_shell_command() -> String {
+pub(crate) fn remote_shell_command() -> String {
     format!("{} nvmux", shell::login_shell_wrapper("exec sh -s"))
 }
 
@@ -689,6 +731,30 @@ mod tests {
         assert!(s.contains("ServerAliveCountMax=3"));
         assert!(s.contains(&format!("ControlPath={CTL}")));
         assert_eq!(args.last().expect("host"), "myhost");
+    }
+
+    /// The relay's connection runs the same program over there as the
+    /// master's shell does, and is never itself a master, whatever the user's
+    /// config says.
+    #[test]
+    fn the_relay_connection_is_a_plain_one_to_the_same_login_shell() {
+        let args = relay_args("myhost", None);
+        let s = joined(&args);
+        assert!(s.contains("ControlMaster=no"), "{s}");
+        assert!(s.contains("ControlPath=none"), "{s}");
+        assert!(args.iter().any(|a| a == "-T"), "{s}");
+        assert!(!args.iter().any(|a| a == "-n"), "{s}");
+        assert!(s.contains("ServerAliveInterval=15") && s.contains("ServerAliveCountMax=3"));
+        assert!(
+            !s.contains("BatchMode"),
+            "the user's passphrase must still be askable"
+        );
+        assert!(!s.contains("ConnectTimeout"), "{s}");
+        assert_eq!(args.last(), shell_args("myhost", Path::new(CTL)).last());
+        assert_eq!(args[args.len() - 2], "myhost");
+
+        let bounded = joined(&relay_args("myhost", Some(10)));
+        assert!(bounded.contains("ConnectTimeout=10"), "{bounded}");
     }
 
     /// The first connection waits as long as the system does; a reconnection

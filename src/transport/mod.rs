@@ -16,8 +16,11 @@
 //! files it can re-read and the remote one does by writing the picker's record
 //! back through a script.
 
+#[cfg(unix)]
 pub mod local;
 pub mod protocol;
+pub mod relay;
+#[cfg(unix)]
 pub mod remote;
 
 use std::path::{Path, PathBuf};
@@ -157,10 +160,30 @@ pub enum Reconnect {
 }
 
 /// Build the transport for a location.
+///
+/// A host is reached the way `[ssh] transport` says — see
+/// [`crate::config::SshTransport`]. Sessions on this machine are a Unix
+/// affair for now: their scripts are POSIX `sh`, and the socket a session
+/// listens on is a unix one.
 pub fn open(location: Location) -> Result<Box<dyn Transport>> {
+    use crate::config::SshTransport;
     match location {
+        #[cfg(unix)]
         Location::Local => Ok(Box::new(local::LocalTransport::new()?)),
-        Location::Ssh(host) => Ok(Box::new(remote::SshTransport::new(host)?)),
+        #[cfg(windows)]
+        Location::Local => Err(NvmuxError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "sessions on this machine are not supported on Windows yet\n\
+             hint: `nvmux <host>` runs them on a Linux or macOS host you can ssh to",
+        ))),
+        Location::Ssh(host) => match crate::config::get().ssh.transport {
+            #[cfg(unix)]
+            SshTransport::ControlMaster => Ok(Box::new(remote::SshTransport::new(host)?)),
+            // Refused when the config was loaded; see `Settings::validate`.
+            #[cfg(windows)]
+            SshTransport::ControlMaster => Ok(Box::new(relay::RelayTransport::new(host)?)),
+            SshTransport::Relay => Ok(Box::new(relay::RelayTransport::new(host)?)),
+        },
     }
 }
 
@@ -382,6 +405,96 @@ pub(crate) fn kill(h: &impl Host, s: &Session) -> Result<()> {
     kill_outcome(outcome, &s.name)?;
     h.sweep(&s.id);
     tracing::info!(host = %h.location(), id = %s.id, name = %s.name, "session killed");
+    Ok(())
+}
+
+// --- what the two remote transports share ----------------------------------
+//
+// The ssh transport ([`remote`]) and the relay ([`relay`]) reach a host two
+// ways — a forward per session onto one ControlMaster, or a channel per
+// session inside one connection — and are the same transport in every other
+// respect: the same scripts, run in a shell over there, reading and writing
+// the same files. What follows is that respect.
+
+/// The session's socket path **on the far host**, validated against our own
+/// budget rather than ssh's: ssh checks `-L` endpoints against the *local*
+/// `sun_path` size, because it has not connected yet, so a local Linux
+/// talking to a remote macOS would accept a path that fails on the far side.
+/// The relay checks nothing at all before it connects.
+pub(crate) fn remote_sock(remote_dir: &str, id: &str) -> Result<PathBuf> {
+    if !crate::ids::is_valid_id(id) {
+        return Err(crate::error::PathError::MalformedId(id.to_string()).into());
+    }
+    let p = PathBuf::from(format!("{remote_dir}/{id}.sock"));
+    crate::paths::check_sock_path(&p)?;
+    Ok(p)
+}
+
+/// A far host's listing, settled: liveness is what the script said, since a
+/// socket over there cannot be asked from here without reaching it first —
+/// and through a forward, connecting says nothing anyway: ssh accepts first
+/// and resets afterwards.
+pub(crate) fn keep_serving(mut listed: Vec<Session>) -> Vec<Session> {
+    for s in &listed {
+        if s.state.liveness == crate::session::Liveness::Dead {
+            tracing::debug!(id = %s.id, "remote session reported not serving");
+        }
+    }
+    listed.retain(|s| s.state.liveness != crate::session::Liveness::Dead);
+    listed
+}
+
+/// Write a session's metadata where a far host keeps it, through a script:
+/// Rust cannot reach the file.
+pub(crate) fn write_meta_remotely(h: &impl Host, session: &Session) -> Result<()> {
+    let json = session.to_json()?;
+    let out = h.run(shell::WRITE_META_SCRIPT, &[h.dir(), &session.id, &json])?;
+    protocol::parse_write(&out.stdout, "metadata write")
+}
+
+/// A rename on a far host: writes the record the picker holds, with the name
+/// changed, rather than re-reading the remote file first. That would be
+/// another round trip, and the only field a rename may change is the name. A
+/// session killed between the listing and the confirm gets its metadata
+/// rewritten, which the next listing's sweep removes again, since its socket
+/// is gone.
+pub(crate) fn rename_remotely(
+    h: &impl Host,
+    listing: &[Session],
+    s: &Session,
+    new_name: &str,
+) -> Result<()> {
+    plan_rename(listing, new_name, &s.id)?;
+    let mut updated = s.clone();
+    updated.name = new_name.to_string();
+    h.write_meta(&updated)?;
+    tracing::info!(host = %h.location(), id = %s.id, to = new_name, "renamed");
+    Ok(())
+}
+
+/// A reorder on a far host, in one round trip for the whole arrangement.
+/// Writes the records the picker holds — see [`Transport::renumber`] for why
+/// that is complete and why the script, not this side, is what refuses to
+/// invent metadata for an orphan.
+pub(crate) fn renumber_remotely(h: &impl Host, sessions: &[Session]) -> Result<()> {
+    if sessions.is_empty() {
+        return Ok(());
+    }
+    let bodies = sessions
+        .iter()
+        .map(|s| s.to_json())
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut args: Vec<&str> = Vec::with_capacity(1 + sessions.len() * 2);
+    args.push(h.dir());
+    for (s, body) in sessions.iter().zip(&bodies) {
+        args.push(&s.id);
+        args.push(body);
+    }
+
+    let out = h.run(shell::RENUMBER_SCRIPT, &args)?;
+    protocol::parse_write(&out.stdout, "renumber")?;
+    tracing::info!(host = %h.location(), count = sessions.len(), "renumbered");
     Ok(())
 }
 

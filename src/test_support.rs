@@ -38,6 +38,28 @@ pub(crate) fn scratch_sock(tag: &str) -> PathBuf {
     scratch_path(&format!("{tag}.sock"))
 }
 
+/// Whether there is an `nvim` on `$PATH` for a test that needs a real one. A
+/// test without one skips — unless `$NVMUX_TEST_REQUIRE` names `nvim`, as CI's
+/// does, where its absence is the bug and fails the test instead.
+pub(crate) fn have_nvim() -> bool {
+    let found = std::process::Command::new("nvim")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok();
+    if !found {
+        let strict = std::env::var("NVMUX_TEST_REQUIRE")
+            .is_ok_and(|v| v.split(',').any(|w| w.trim() == "nvim"));
+        assert!(
+            !strict,
+            "NVMUX_TEST_REQUIRE names nvim but it is not on $PATH"
+        );
+        eprintln!("skipping: no nvim on $PATH");
+    }
+    found
+}
+
 /// Wait up to `within` for `cond` to hold, polling gently. Returns whether it
 /// did, so a caller can assert with its own message.
 pub(crate) fn wait_until(within: Duration, mut cond: impl FnMut() -> bool) -> bool {

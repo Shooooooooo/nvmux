@@ -21,10 +21,10 @@ use crate::launch::Launch;
 use crate::nvim;
 use crate::paths;
 use crate::proc::{Output, Shell};
-use crate::session::{Liveness, Session};
+use crate::session::Session;
 use crate::shell;
 use crate::ssh::{classify, Ssh};
-use crate::transport::{self, plan_rename, protocol, Host, Location, Reconnect, Transport};
+use crate::transport::{self, protocol, Host, Location, Reconnect, Transport};
 
 pub struct SshTransport {
     location: Location,
@@ -131,18 +131,10 @@ impl SshTransport {
         })
     }
 
-    /// The session's socket path **on the remote host**, validated against our
-    /// own budget rather than ssh's: ssh checks `-L` endpoints against the
-    /// *local* `sun_path` size, because it has not connected yet, so a local
-    /// Linux talking to a remote macOS would accept a path that fails on the
-    /// far side.
+    /// The session's socket path on the remote host; see
+    /// [`transport::remote_sock`].
     fn remote_sock(&self, id: &str) -> Result<PathBuf> {
-        if !ids::is_valid_id(id) {
-            return Err(crate::error::PathError::MalformedId(id.to_string()).into());
-        }
-        let p = PathBuf::from(format!("{}/{}.sock", self.remote_dir, id));
-        paths::check_sock_path(&p)?;
-        Ok(p)
+        transport::remote_sock(&self.remote_dir, id)
     }
 
     fn local_sock(&self, id: &str) -> Result<PathBuf> {
@@ -399,13 +391,8 @@ impl Host for SshTransport {
     /// Liveness comes from the remote script, so drawing the picker needs no
     /// forward per session. connect() through a forward would say nothing
     /// anyway: ssh accepts first and resets afterwards.
-    fn settle(&self, mut listed: Vec<Session>) -> Result<Vec<Session>> {
-        for s in &listed {
-            if s.state.liveness == Liveness::Dead {
-                tracing::debug!(id = %s.id, "remote session reported not serving");
-            }
-        }
-        listed.retain(|s| s.state.liveness != Liveness::Dead);
+    fn settle(&self, listed: Vec<Session>) -> Result<Vec<Session>> {
+        let listed = transport::keep_serving(listed);
         self.sweep_orphaned_forwards(&listed);
         Ok(listed)
     }
@@ -437,12 +424,7 @@ impl Host for SshTransport {
     }
 
     fn write_meta(&self, session: &Session) -> Result<()> {
-        let json = session.to_json()?;
-        let out = self.run_script(
-            shell::WRITE_META_SCRIPT,
-            &[&self.remote_dir, &session.id, &json],
-        )?;
-        protocol::parse_write(&out.stdout, "metadata write")
+        transport::write_meta_remotely(self, session)
     }
 
     fn log_path(&self, id: &str) -> PathBuf {
@@ -481,44 +463,14 @@ impl Transport for SshTransport {
         transport::kill(self, s)
     }
 
-    /// Writes the record the picker holds, with the name changed, rather than
-    /// re-reading the remote file first: that would be another round trip, and
-    /// the only field a rename may change is the name. A session killed
-    /// between the listing and the confirm gets its metadata rewritten, which
-    /// the next listing's sweep removes again, since its socket is gone.
+    /// See [`transport::rename_remotely`].
     fn rename_session(&self, s: &Session, new_name: &str) -> Result<()> {
-        plan_rename(&self.list_sessions()?, new_name, &s.id)?;
-
-        let mut updated = s.clone();
-        updated.name = new_name.to_string();
-        self.write_meta(&updated)?;
-        tracing::info!(host = %self.host(), id = %s.id, to = new_name, "renamed");
-        Ok(())
+        transport::rename_remotely(self, &self.list_sessions()?, s, new_name)
     }
 
-    /// One round trip for the whole arrangement. Writes the records the picker
-    /// holds — see [`Transport::renumber`] for why that is complete and why the
-    /// script, not this side, is what refuses to invent metadata for an orphan.
+    /// See [`transport::renumber_remotely`].
     fn renumber(&self, sessions: &[Session]) -> Result<()> {
-        if sessions.is_empty() {
-            return Ok(());
-        }
-        let bodies = sessions
-            .iter()
-            .map(|s| s.to_json())
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        let mut args: Vec<&str> = Vec::with_capacity(1 + sessions.len() * 2);
-        args.push(&self.remote_dir);
-        for (s, body) in sessions.iter().zip(&bodies) {
-            args.push(&s.id);
-            args.push(body);
-        }
-
-        let out = self.run_script(shell::RENUMBER_SCRIPT, &args)?;
-        protocol::parse_write(&out.stdout, "renumber")?;
-        tracing::info!(host = %self.host(), count = sessions.len(), "renumbered");
-        Ok(())
+        transport::renumber_remotely(self, sessions)
     }
 
     fn local_socket_for(&self, s: &Session) -> Result<PathBuf> {

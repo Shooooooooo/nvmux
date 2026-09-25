@@ -173,9 +173,12 @@ pub fn launch_umask() -> Option<Mode> {
 }
 
 /// Validate a composed socket path against the `sun_path` budget.
+///
+/// The bytes are the platform's own encoding of the path, which for a path on
+/// a Unix host — a remote session's included, whatever this machine is — is
+/// what its kernel measures.
 pub fn check_sock_path(path: &Path) -> Result<(), PathError> {
-    use std::os::unix::ffi::OsStrExt;
-    let len = path.as_os_str().as_bytes().len();
+    let len = path.as_os_str().as_encoded_bytes().len();
     if len > MAX_SOCK_PATH {
         return Err(PathError::TooLong {
             path: path.to_path_buf(),

@@ -118,6 +118,50 @@ pub const RENUMBER_SCRIPT: &str = script!("../scripts/renumber.sh");
 /// per `/` rather than one per keystroke.
 pub const DIRS_SCRIPT: &str = script!("../scripts/dirs.sh");
 
+/// The relay: what runs at the far end of the one ssh connection nvmux makes
+/// to a host it reaches without a ControlMaster (see [`crate::mux`]). Lua, run
+/// by the host's own Neovim, which every session host already has.
+pub const RELAY_LUA: &str = include_str!("../scripts/relay.lua");
+
+/// `scripts/boot.sh` as shipped, with the relay's source still to be joined on
+/// at [`RELAY_SLOT`] — see [`boot_script`]. Scanned as the other scripts are,
+/// and before the join: the Lua it carries is not shell, and trips every rule
+/// that scan has.
+const BOOT_TEMPLATE: &str = script!("../scripts/boot.sh");
+
+/// Where [`boot_script`] puts the relay's source: a line of its own, inside the
+/// here-document that writes it out.
+const RELAY_SLOT: &str = "@RELAY@\n";
+
+/// The line that ends that here-document. The relay's source must not contain
+/// it, or the rest of the source would run as shell — a test holds it to that.
+#[cfg(test)]
+const RELAY_END: &str = "\nNVMUX_RELAY_EOF\n";
+
+/// The script that starts the relay on a host, in place of the shell it is
+/// written to: the prelude, `boot.sh`, and the relay's source where the
+/// here-document wants it. Assembled once; the pieces are all fixed text.
+pub fn boot_script() -> &'static str {
+    static BOOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BOOT.get_or_init(|| BOOT_TEMPLATE.replacen(RELAY_SLOT, RELAY_LUA, 1))
+}
+
+/// What the relay's source is called on a host: a hash of it, so an nvmux that
+/// ships a different relay writes one of its own rather than running another
+/// version's, and one that ships the same relay finds it already written.
+///
+/// FNV-1a, 64 bits: a name that changes with the contents, not a defence —
+/// the file sits in a directory only its owner can write to, which `boot.sh`
+/// checks before it writes or runs anything there.
+pub fn relay_hash() -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in RELAY_LUA.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 /// Every script, for the tests that check all of them the same way.
 #[cfg(test)]
 const SCRIPTS: &[(&str, &str)] = &[
@@ -128,6 +172,7 @@ const SCRIPTS: &[(&str, &str)] = &[
     ("hello.sh", HELLO_SCRIPT),
     ("write_meta.sh", WRITE_META_SCRIPT),
     ("renumber.sh", RENUMBER_SCRIPT),
+    ("boot.sh", BOOT_TEMPLATE),
 ];
 
 #[cfg(test)]
@@ -835,5 +880,77 @@ mod tests {
                 out.stderr
             );
         }
+    }
+
+    /// The relay's source goes into `boot.sh` inside a here-document, so the
+    /// one line it may never contain is the one that ends it: everything after
+    /// that line would be run by the host's shell instead of written out.
+    #[test]
+    fn the_relay_cannot_end_the_here_document_it_travels_in() {
+        assert!(
+            !format!("\n{RELAY_LUA}").contains(RELAY_END),
+            "relay.lua contains the line that ends boot.sh's here-document"
+        );
+        assert!(
+            RELAY_LUA.ends_with('\n'),
+            "the terminator needs a line of its own"
+        );
+        assert!(
+            BOOT_TEMPLATE.contains(RELAY_SLOT),
+            "boot.sh lost its @RELAY@ line"
+        );
+        assert!(
+            BOOT_TEMPLATE.contains(&format!("{RELAY_SLOT}{}", &RELAY_END[1..])),
+            "the slot must be the whole body of the here-document"
+        );
+        let boot = boot_script();
+        assert!(!boot.contains(RELAY_SLOT), "the slot was not filled");
+        assert!(boot.contains(RELAY_LUA));
+        assert_eq!(boot.matches(RELAY_END).count(), 1);
+    }
+
+    /// Assembled, it is still one valid program — which the scan above cannot
+    /// say, since it only ever sees the template.
+    #[test]
+    fn the_assembled_boot_script_is_valid_sh() {
+        let out = syntax_check(boot_script());
+        assert!(
+            out.ok(),
+            "boot.sh is not valid sh with the relay in it: {}",
+            out.stderr
+        );
+    }
+
+    /// The name is the contents: the same source, the same name, every time.
+    #[test]
+    fn the_relay_is_named_for_its_contents() {
+        let hash = relay_hash();
+        assert_eq!(hash, relay_hash());
+        assert_eq!(hash.len(), 16);
+        assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()), "{hash}");
+    }
+
+    /// Where the directory is not ours, nothing is written and nothing runs:
+    /// the script refuses in the scripts' own words, before the marker the
+    /// other end waits for.
+    #[test]
+    fn the_boot_script_refuses_a_directory_that_is_not_private() {
+        // `/tmp/nvmux-<uid>` is the one directory boot.sh will use, so this
+        // runs the refusal on a copy that looks somewhere else instead.
+        let dir = scratch_dir("shell-boot-open");
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        let script = boot_script().replace(
+            "nvmux_dir=\"/tmp/nvmux-$(id -u)\"",
+            &format!("nvmux_dir={}", quote(&dir.to_string_lossy())),
+        );
+        let out = run_script(&script, &["secret", &relay_hash()]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            out.stdout.contains("ERROR runtime directory") && out.stdout.contains("accessible"),
+            "stdout: {:?}",
+            out.stdout
+        );
+        assert!(!out.stdout.contains("NVMUX_BOOT_"), "{:?}", out.stdout);
     }
 }

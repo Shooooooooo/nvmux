@@ -38,39 +38,7 @@ log="$dir/$id.log"
 # is the 0700 runtime directory, checked just below before anything is
 # spawned, so a socket is unreachable for as long as it exists whatever mode
 # it is born with -- and the `chmod 600` that follows the socket's appearance.
-
-if [ -e "$dir" ] || [ -L "$dir" ]; then
-  # An existing directory must be OURS and private. Over ssh this script is the
-  # only check there is, and /tmp is world-writable, so another user could have
-  # created it first.
-  #
-  # `ls -ldn` for both tests: POSIX `test` has no "-owned-by-me" operator,
-  # `stat` is spelled differently on macOS and Linux, and `find -perm /mode`
-  # (GNU) and `-perm +mode` (BSD) are not both accepted anywhere. `-n` gives
-  # the owner as a uid, so it compares with `id -u` without a name lookup. A
-  # check that cannot be made fails CLOSED: an empty answer is a refusal, not
-  # a pass.
-  info=$(ls -ldn "$dir" 2>/dev/null)
-  [ -n "$info" ] || fail "could not inspect runtime directory $dir"
-  mode=$(printf '%s\n' "$info" | cut -c1-10)
-  owner=$(printf '%s\n' "$info" | awk '{print $3}')
-  case "$mode" in
-    d*) ;;
-    *) fail "runtime directory $dir is not a directory (or is a symlink)" ;;
-  esac
-  [ "$owner" = "$(id -u)" ] || fail "runtime directory $dir is not owned by us"
-  # Columns 5-10 are the group and other permissions; anything but dashes there
-  # is a bit we would never have set.
-  case "$(printf '%s\n' "$mode" | cut -c5-10)" in
-    ------) ;;
-    *) fail "runtime directory $dir is accessible to other users" ;;
-  esac
-else
-  mkdir -p "$dir" || fail "could not create runtime directory $dir"
-  # Only a directory we just created; tightening someone else's is worse than
-  # refusing to use it.
-  chmod 700 "$dir" 2>/dev/null || true
-fi
+ensure_private_dir "$dir"
 
 # MANDATORY. `nvim --listen` refuses to start if *anything* exists at the path
 # -- live socket, stale socket or plain file -- all with the same misleading

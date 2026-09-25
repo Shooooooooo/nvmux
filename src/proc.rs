@@ -5,6 +5,13 @@
 //! failure to start it is classified, so the plumbing lives here and the error
 //! mapping stays with each caller.
 //!
+//! A shell need not be a child of this process at all. Over the relay
+//! ([`crate::mux`]) it is a `sh -s` on the far side of one ssh connection, and
+//! its three streams are a channel on that connection. So [`Shell`] holds its
+//! streams as [`Pipes`], and everything below the framing — waiting, reading,
+//! closing, reaping — is asked of them: a child's pipes, polled, where there is
+//! a child ([`ChildPipes`]); a channel's buffers where there is not.
+//!
 //! The script always travels on **stdin** and its variable parts as positional
 //! arguments — never interpolated into a command line. See [`crate::shell`].
 //!
@@ -42,13 +49,20 @@
 //! [`crate::transport::protocol`] see no difference.
 
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(unix)]
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use crate::error::{NvmuxError, Result};
+#[cfg(unix)]
 use crate::pty::{pollfd, ready};
 use crate::shell;
 
@@ -83,6 +97,7 @@ impl From<std::process::Output> for Output {
 /// its `io::ErrorKind`, so a test can tell "no such binary" from "ran and
 /// failed" — the signal [`crate::ssh`] classifies on, through
 /// [`Shell::start`].
+#[cfg(unix)]
 pub fn run_feeding_stdin(cmd: &mut Command, script: &str) -> std::io::Result<Output> {
     let mut child = cmd
         .stdin(Stdio::piped())
@@ -101,6 +116,7 @@ pub fn run_feeding_stdin(cmd: &mut Command, script: &str) -> std::io::Result<Out
 
 /// Run `script` under this machine's `/bin/sh` with `args` as `$1..$n`, in a
 /// shell of its own. The one-shot form, kept for tests.
+#[cfg(unix)]
 pub fn run_local(script: &str, args: &[&str]) -> Result<Output> {
     let mut cmd = sh_command();
     cmd.args(args);
@@ -118,6 +134,7 @@ pub fn run_local(script: &str, args: &[&str]) -> Result<Output> {
 /// Only the local shell: a umask does not travel over ssh, so a remote session
 /// takes the remote host's own — which is what anything else launched there
 /// would get, and is not this machine's business to override.
+#[cfg(unix)]
 fn sh_command() -> Command {
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-s");
@@ -158,14 +175,89 @@ const EXIT_GRACE: Duration = Duration::from_millis(200);
 /// so a failed run is worth a short wait and a successful one is not.
 const STDERR_SETTLE: Duration = Duration::from_millis(50);
 
-/// One long-lived `sh` on a session host, running every script nvmux sends it.
+/// Which of a shell's two output streams a wait is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Streams {
+    pub(crate) out: bool,
+    pub(crate) err: bool,
+}
+
+impl Streams {
+    pub(crate) const OUT: Streams = Streams {
+        out: true,
+        err: false,
+    };
+    pub(crate) const ERR: Streams = Streams {
+        out: false,
+        err: true,
+    };
+    pub(crate) const BOTH: Streams = Streams {
+        out: true,
+        err: true,
+    };
+}
+
+/// What a wait found: which streams have something to read — bytes, or their
+/// end. Nothing ready is a wait that timed out, or was interrupted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Ready {
+    pub(crate) out: bool,
+    pub(crate) err: bool,
+}
+
+/// A shell's three streams, and whatever is running it.
 ///
-/// Started from whatever command reaches the host — `/bin/sh` here, `ssh` over
-/// there — and used identically from then on. Not `Clone`, and not shared: one
-/// run at a time, on the thread that owns it.
-pub struct Shell {
-    /// For logs and for [`Died`]: `/bin/sh`, or `ssh <host>`.
-    name: String,
+/// What [`Shell`] asks of the thing on the other end of its scripts, and no
+/// more: framing, markers and the handshake are the same whatever carries them,
+/// and stay in `Shell`. Two carriers: a child process of this one
+/// ([`ChildPipes`], Unix, where its pipes can be polled), and a channel on the
+/// relay's one ssh connection ([`crate::mux`]), where the shell is a process on
+/// the far side and its streams arrive already read.
+///
+/// Every method has the meaning the pipe version gives it, so that a `Shell`
+/// cannot tell which it has: a timeout and an interrupted wait are both nothing
+/// ready, a stream's end is a read of zero, and a closed stream is never
+/// reported ready again.
+pub(crate) trait Pipes: Send {
+    /// Write all of `bytes` to the shell's stdin.
+    fn write_in(&mut self, bytes: &[u8]) -> io::Result<()>;
+
+    /// Close the shell's stdin: how it is asked to leave. Harmless twice.
+    fn close_in(&mut self);
+
+    /// Wait up to `timeout` — `None` for as long as it takes — for one of the
+    /// streams `which` names to have something to read. An `Err` is the wait
+    /// itself failing, not the shell.
+    fn wait(&mut self, which: Streams, timeout: Option<Duration>) -> io::Result<Ready>;
+
+    /// Read what stdout has; `Ok(0)` is its end.
+    fn read_out(&mut self, buf: &mut [u8]) -> io::Result<usize>;
+
+    /// Read what stderr has; `Ok(0)` is its end, after which it is closed.
+    fn read_err(&mut self, buf: &mut [u8]) -> io::Result<usize>;
+
+    /// Whether stderr is still open: not yet read to its end.
+    fn err_open(&self) -> bool;
+
+    /// The shell's exit status if it has exited, `-1` for a signal. `Ok(None)`
+    /// is still running.
+    fn try_wait(&mut self) -> io::Result<Option<i32>>;
+
+    /// End the shell now, whatever it is doing.
+    fn kill(&mut self);
+
+    /// Wait for the shell to have gone, once it has been told to: its status,
+    /// `-1` for a signal or for no status to be had.
+    fn wait_exit(&mut self) -> i32;
+
+    /// The shell's process id, for logs and tests. On the far side of the relay
+    /// it is a pid on that host.
+    fn pid(&self) -> u32;
+}
+
+/// A child process's pipes, polled the way [`crate::pty`] polls a pty.
+#[cfg(unix)]
+pub(crate) struct ChildPipes {
     child: Child,
     /// `None` once closed, on death and on drop. Closing it is how the shell is
     /// told to leave.
@@ -173,6 +265,137 @@ pub struct Shell {
     stdout: ChildStdout,
     /// `None` once it has reached EOF.
     stderr: Option<ChildStderr>,
+}
+
+#[cfg(unix)]
+impl ChildPipes {
+    /// Spawn `cmd` with all three streams piped.
+    fn spawn(cmd: &mut Command) -> io::Result<Self> {
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("child has no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("child has no stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("child has no stderr"))?;
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            stdout,
+            stderr: Some(stderr),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Pipes for ChildPipes {
+    fn write_in(&mut self, bytes: &[u8]) -> io::Result<()> {
+        match self.stdin.as_mut() {
+            Some(stdin) => stdin.write_all(bytes),
+            None => Err(io::Error::other("stdin already closed")),
+        }
+    }
+
+    fn close_in(&mut self) {
+        drop(self.stdin.take());
+    }
+
+    /// A negative fd is skipped by `poll`, which is how a stream that is not
+    /// asked about — or has reached its end — is left out.
+    fn wait(&mut self, which: Streams, timeout: Option<Duration>) -> io::Result<Ready> {
+        let out = if which.out {
+            self.stdout.as_raw_fd()
+        } else {
+            -1
+        };
+        let err = match (which.err, self.stderr.as_ref()) {
+            (true, Some(stderr)) => stderr.as_raw_fd(),
+            _ => -1,
+        };
+        let mut fds = [pollfd(out), pollfd(err)];
+        let timeout_ms = timeout.map_or(-1, |t| {
+            t.as_millis().min(libc::c_int::MAX as u128) as libc::c_int
+        });
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                return Ok(Ready::default());
+            }
+            return Err(e);
+        }
+        Ok(Ready {
+            out: n > 0 && ready(&fds[0]),
+            err: n > 0 && ready(&fds[1]),
+        })
+    }
+
+    fn read_out(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stdout.read(buf)
+    }
+
+    /// EOF closes the stream for good; it is never polled again.
+    fn read_err(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let Some(stderr) = self.stderr.as_mut() else {
+            return Ok(0);
+        };
+        match stderr.read(buf) {
+            Ok(len) if len > 0 => Ok(len),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(e),
+            other => {
+                self.stderr = None;
+                other
+            }
+        }
+    }
+
+    fn err_open(&self) -> bool {
+        self.stderr.is_some()
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<i32>> {
+        Ok(self
+            .child
+            .try_wait()?
+            .map(|status| status.code().unwrap_or(-1)))
+    }
+
+    fn kill(&mut self) {
+        let _ = self.child.kill();
+    }
+
+    fn wait_exit(&mut self) -> i32 {
+        self.child
+            .wait()
+            .map(|s| s.code().unwrap_or(-1))
+            .unwrap_or(-1)
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+/// One long-lived `sh` on a session host, running every script nvmux sends it.
+///
+/// Started from whatever reaches the host — `/bin/sh` here, `ssh` over there,
+/// or a channel on the relay — and used identically from then on. Not `Clone`,
+/// and not shared: one run at a time, on the thread that owns it.
+pub struct Shell {
+    /// For logs and for [`Died`]: `/bin/sh`, `ssh <host>`, or `relay <host>`.
+    name: String,
+    /// The shell's streams and whatever runs it; see [`Pipes`].
+    io: Box<dyn Pipes>,
     /// Bytes read from stdout that no run has claimed yet.
     out: Vec<u8>,
     /// Bytes read from stderr that no run has claimed yet.
@@ -193,7 +416,7 @@ impl fmt::Debug for Shell {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Shell")
             .field("name", &self.name)
-            .field("pid", &self.child.id())
+            .field("pid", &self.io.pid())
             .field("seq", &self.seq)
             .field("status", &self.status)
             .finish_non_exhaustive()
@@ -245,32 +468,20 @@ impl Shell {
     /// A binary that is not there is `ErrorKind::NotFound`, which is what
     /// [`crate::ssh`] classifies on; a shell that starts and dies at once is
     /// reported by the first run instead, with whatever it said on stderr.
+    #[cfg(unix)]
     pub fn start(cmd: &mut Command, name: impl Into<String>) -> io::Result<Shell> {
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("child has no stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("child has no stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| io::Error::other("child has no stderr"))?;
-        let secret = crate::ids::nonce()?;
+        let pipes = ChildPipes::spawn(cmd)?;
+        Shell::over(Box::new(pipes), name)
+    }
 
+    /// A shell on streams something else has already opened — a channel on
+    /// the relay's connection (see [`crate::mux`]). The handshake is written
+    /// here and read by the first run, exactly as for [`Shell::start`].
+    pub(crate) fn over(io: Box<dyn Pipes>, name: impl Into<String>) -> io::Result<Shell> {
+        let secret = crate::ids::nonce()?;
         let mut shell = Shell {
             name: name.into(),
-            child,
-            stdin: Some(stdin),
-            stdout,
-            stderr: Some(stderr),
+            io,
             out: Vec::new(),
             err: Vec::new(),
             secret,
@@ -283,12 +494,10 @@ impl Shell {
         // yet: the first run's write fails the same way and reports it with the
         // shell's last words attached, which is the useful form.
         let _ = shell
-            .stdin
-            .as_mut()
-            .expect("just set")
-            .write_all(format!("printf '\\n%s %s\\n' {mark} ready\n").as_bytes());
+            .io
+            .write_in(format!("printf '\\n%s %s\\n' {mark} ready\n").as_bytes());
         shell.ready = Some(needle(&mark));
-        tracing::debug!(name = %shell.name, pid = shell.child.id(), "shell started");
+        tracing::debug!(name = %shell.name, pid = shell.io.pid(), "shell started");
         Ok(shell)
     }
 
@@ -296,6 +505,7 @@ impl Shell {
     /// the launch umask. Every local shell is started through here: the
     /// transport's, the directory lister's, and the ones the tests stand in
     /// for a remote host with.
+    #[cfg(unix)]
     pub fn local() -> io::Result<Shell> {
         Shell::start(&mut sh_command(), "/bin/sh")
     }
@@ -333,11 +543,7 @@ impl Shell {
         // Written before anything is read: the shell cannot answer until it has
         // parsed the whole `( … ); printf` list, so there is nothing to read
         // yet, and a frame fits the pipe with room to spare.
-        let write = match self.stdin.as_mut() {
-            Some(stdin) => stdin.write_all(&frame),
-            None => Err(io::Error::other("stdin already closed")),
-        };
-        if let Err(e) = write {
+        if let Err(e) = self.io.write_in(&frame) {
             return Err(self.die(&format!("writing a script: {e}")));
         }
 
@@ -397,12 +603,11 @@ impl Shell {
         }
         let mut buf = [0u8; 4096];
         loop {
-            let mut fds = [pollfd(self.stdout.as_raw_fd())];
-            let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) };
-            if n <= 0 || !ready(&fds[0]) {
-                return true;
+            match self.io.wait(Streams::OUT, Some(Duration::ZERO)) {
+                Ok(ready) if ready.out => {}
+                _ => return true,
             }
-            match self.stdout.read(&mut buf) {
+            match self.io.read_out(&mut buf) {
                 // Kept rather than discarded: the handshake line arrives while
                 // the shell is idle if it was started ahead of its first run.
                 Ok(len) if len > 0 => self.out.extend_from_slice(&buf[..len]),
@@ -417,7 +622,7 @@ impl Shell {
 
     /// The shell's process id, for tests and logs.
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        self.io.pid()
     }
 
     /// Read stdout until `needle` and the rest of its line have arrived,
@@ -444,22 +649,16 @@ impl Shell {
                 Scan::NotFound => scanned = self.out.len().saturating_sub(needle.len() - 1),
             }
 
-            let stderr_fd = self.stderr.as_ref().map_or(-1, |e| e.as_raw_fd());
-            let mut fds = [pollfd(self.stdout.as_raw_fd()), pollfd(stderr_fd)];
-            let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(self.die(&format!("poll: {e}")));
-            }
+            let ready = match self.io.wait(Streams::BOTH, None) {
+                Ok(ready) => ready,
+                Err(e) => return Err(self.die(&format!("poll: {e}"))),
+            };
             // stderr first: it is the one that could fill and stall the shell.
-            if ready(&fds[1]) {
+            if ready.err {
                 self.read_stderr(&mut buf);
             }
-            if ready(&fds[0]) {
-                match self.stdout.read(&mut buf) {
+            if ready.out {
+                match self.io.read_out(&mut buf) {
                     Ok(len) if len > 0 => self.out.extend_from_slice(&buf[..len]),
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                     // EOF. The marker may have come with the last bytes, in
@@ -479,13 +678,8 @@ impl Shell {
     /// One read from stderr into the unclaimed buffer. EOF closes the stream
     /// for good; it is never polled again.
     fn read_stderr(&mut self, buf: &mut [u8]) {
-        let Some(stderr) = self.stderr.as_mut() else {
-            return;
-        };
-        match stderr.read(buf) {
-            Ok(len) if len > 0 => self.err.extend_from_slice(&buf[..len]),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            _ => self.stderr = None,
+        if let Ok(len) = self.io.read_err(buf) {
+            self.err.extend_from_slice(&buf[..len]);
         }
     }
 
@@ -495,42 +689,38 @@ impl Shell {
         let mut buf = [0u8; 4096];
         let deadline = failed.then(|| Instant::now() + STDERR_SETTLE);
         loop {
-            let Some(stderr) = self.stderr.as_ref() else {
-                return;
-            };
-            let timeout = match deadline {
-                Some(d) => d.saturating_duration_since(Instant::now()).as_millis() as libc::c_int,
-                None => 0,
-            };
-            let mut fds = [pollfd(stderr.as_raw_fd())];
-            let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, timeout) };
-            if n <= 0 || !ready(&fds[0]) {
+            if !self.io.err_open() {
                 return;
             }
-            self.read_stderr(&mut buf);
+            let timeout = match deadline {
+                Some(d) => d.saturating_duration_since(Instant::now()),
+                None => Duration::ZERO,
+            };
+            match self.io.wait(Streams::ERR, Some(timeout)) {
+                Ok(ready) if ready.err => self.read_stderr(&mut buf),
+                _ => return,
+            }
         }
     }
 
     /// The shell is gone, or about to be: close it, reap it, gather its last
     /// words, and say so.
     fn die(&mut self, why: &str) -> Died {
-        drop(self.stdin.take());
+        self.io.close_in();
         let status = self.reap();
         // What it wrote on stderr on the way out is the reason, for `ssh` —
         // bounded, because a grandchild could in theory be holding the pipe.
         let deadline = Instant::now() + EXIT_GRACE;
         let mut buf = [0u8; 4096];
-        while let Some(stderr) = self.stderr.as_ref() {
+        while self.io.err_open() {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break;
             }
-            let mut fds = [pollfd(stderr.as_raw_fd())];
-            let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, left.as_millis() as libc::c_int) };
-            if n <= 0 || !ready(&fds[0]) {
-                break;
+            match self.io.wait(Streams::ERR, Some(left)) {
+                Ok(ready) if ready.err => self.read_stderr(&mut buf),
+                _ => break,
             }
-            self.read_stderr(&mut buf);
         }
         self.status = Some(status);
         tracing::debug!(
@@ -553,18 +743,14 @@ impl Shell {
     fn reap(&mut self) -> i32 {
         let deadline = Instant::now() + EXIT_GRACE;
         loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => return status.code().unwrap_or(-1),
+            match self.io.try_wait() {
+                Ok(Some(status)) => return status,
                 Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 _ => {
-                    let _ = self.child.kill();
-                    return self
-                        .child
-                        .wait()
-                        .map(|s| s.code().unwrap_or(-1))
-                        .unwrap_or(-1);
+                    self.io.kill();
+                    return self.io.wait_exit();
                 }
             }
         }
@@ -579,7 +765,7 @@ impl Drop for Shell {
         if self.status.is_some() {
             return;
         }
-        drop(self.stdin.take());
+        self.io.close_in();
         let status = self.reap();
         tracing::debug!(name = %self.name, status, "shell stopped");
     }
@@ -671,7 +857,7 @@ fn find_marker(buf: &[u8], needle: &[u8], from: usize) -> Scan {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

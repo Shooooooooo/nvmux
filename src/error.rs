@@ -214,6 +214,12 @@ pub enum SshError {
 
     #[error("ssh {found} is too old; nvmux needs >= {min} for unix-socket forwarding")]
     TooOld { found: String, min: &'static str },
+
+    /// The connection was made and the host's shell ran, but the relay it was
+    /// asked to become never answered (see [`crate::mux`]). `why` is what the
+    /// far side said, if it said anything.
+    #[error("ssh: nvmux could not start its relay on {host}: {why}")]
+    RelayFailed { host: String, why: String },
 }
 
 /// Failures loading the user's configuration file.

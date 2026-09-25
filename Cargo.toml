@@ -16,15 +16,11 @@ clap = { version = "4", default-features = false, features = [
     "std", "help", "usage", "error-context", "suggestions", "derive",
 ] }
 getrandom = "0.4"
-libc = "0.2"
 # Ranks the create prompt's directory completions. Its own two dependencies,
 # `memchr` and `unicode-segmentation`, were already in this tree, so it adds
 # exactly one crate to the build graph -- which is what made it worth taking
 # rather than hand-rolling a subsequence scorer.
 nucleo-matcher = "0.3"
-nix = { version = "0.31", default-features = false, features = [
-    "fs", "process", "signal", "term", "user",
-] }
 portable-pty = "0.9"
 # Only the crossterm backend: the defaults also pull in every widget (the
 # calendar brings the `time` crate) and the layout macros, none of which the
@@ -55,6 +51,31 @@ vte = "0.15"
 # relay tests (tests/relay_encodings.rs) reuse it to ask what is *on* a row of
 # the far side of a pty rather than what went past on the wire.
 vt100 = "0.16"
+
+# The attach path is a pty proxy, and a pty is a Unix idea: these three are
+# how nvmux holds one open, reads it with `poll`, and signals the client on it.
+# Windows has none of that to wrap -- see `src/sys/windows/`, which holds a
+# ConPTY of its own rather than `portable-pty`'s, for the flags that one fixes.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+nix = { version = "0.31", default-features = false, features = [
+    "fs", "process", "signal", "term", "user",
+] }
+portable-pty = "0.9"
+
+# Already in the tree at this version, through crossterm's `mio` and `rustix`,
+# so it adds no crate: the features are the only thing new.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 
 [profile.release]
 lto = "thin"

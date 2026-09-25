@@ -31,6 +31,44 @@ fail() {
   exit 1
 }
 
+# Make sure $1 is a directory only we can use -- ours, private to us, and not a
+# symlink -- creating it if it is not there. Fails the script otherwise.
+#
+# An existing directory must be OURS and private. Over ssh the scripts are the
+# only check there is, and /tmp is world-writable, so another user could have
+# created it first; a socket in it is then theirs to connect to, and a file in it
+# -- the relay's source, see boot.sh -- theirs to replace before it runs.
+#
+# `ls -ldn` for both tests: POSIX `test` has no "-owned-by-me" operator, `stat`
+# is spelled differently on macOS and Linux, and `find -perm /mode` (GNU) and
+# `-perm +mode` (BSD) are not both accepted anywhere. `-n` gives the owner as a
+# uid, so it compares with `id -u` without a name lookup. A check that cannot be
+# made fails CLOSED: an empty answer is a refusal, not a pass.
+ensure_private_dir() {
+  if [ -e "$1" ] || [ -L "$1" ]; then
+    nvmux_info=$(ls -ldn "$1" 2>/dev/null)
+    [ -n "$nvmux_info" ] || fail "could not inspect runtime directory $1"
+    nvmux_mode=$(printf '%s\n' "$nvmux_info" | cut -c1-10)
+    nvmux_owner=$(printf '%s\n' "$nvmux_info" | awk '{print $3}')
+    case "$nvmux_mode" in
+      d*) ;;
+      *) fail "runtime directory $1 is not a directory (or is a symlink)" ;;
+    esac
+    [ "$nvmux_owner" = "$(id -u)" ] || fail "runtime directory $1 is not owned by us"
+    # Columns 5-10 are the group and other permissions; anything but dashes
+    # there is a bit we would never have set.
+    case "$(printf '%s\n' "$nvmux_mode" | cut -c5-10)" in
+      ------) ;;
+      *) fail "runtime directory $1 is accessible to other users" ;;
+    esac
+  else
+    mkdir -p "$1" || fail "could not create runtime directory $1"
+    # Only a directory we just created; tightening someone else's is worse than
+    # refusing to use it.
+    chmod 700 "$1" 2>/dev/null || true
+  fi
+}
+
 # Is pid $1 the nvim serving socket $2? `grep -F` because the path is data, not
 # a pattern.
 owns_socket() {

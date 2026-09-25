@@ -49,6 +49,7 @@ pub struct Settings {
     pub session: SessionSettings,
     pub client: ClientSettings,
     pub fade: FadeSettings,
+    pub ssh: SshSettings,
 }
 
 /// The prefix key and how long a half-typed sequence waits (see [`crate::keys`]).
@@ -95,6 +96,51 @@ pub struct ClientSettings {
     /// machine — shares its grid with it, at the smaller of the two sizes, and
     /// every session visited keeps an idle client process until nvmux leaves.
     pub per_session: bool,
+}
+
+/// How `nvmux <host>` reaches the host (see [`crate::transport`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SshSettings {
+    pub transport: SshTransport,
+}
+
+/// The two ways there are to reach a host over ssh. Both run the same scripts
+/// in the same kind of shell over there; they differ in how the connection is
+/// shared between the shell and every session's socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SshTransport {
+    /// One `ControlMaster` per host, and a unix-socket forward added to it per
+    /// session ([`crate::transport::remote`]). The default wherever ssh can
+    /// multiplex.
+    ControlMaster,
+    /// One plain connection with nvmux's relay at the far end, multiplexing
+    /// the shell and the sockets itself ([`crate::transport::relay`]). For an
+    /// ssh that cannot multiplex — the only one on Windows — or a host that
+    /// refuses unix-socket forwards.
+    Relay,
+}
+
+impl Default for SshTransport {
+    fn default() -> Self {
+        // OpenSSH for Windows has no ControlMaster; see `crate::mux`.
+        if cfg!(windows) {
+            Self::Relay
+        } else {
+            Self::ControlMaster
+        }
+    }
+}
+
+impl SshTransport {
+    /// As the file spells it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ControlMaster => "control-master",
+            Self::Relay => "relay",
+        }
+    }
 }
 
 /// The fade between screens (see [`crate::fade`]): each one dissolves into the
@@ -260,6 +306,15 @@ impl Settings {
         {
             return Err(format!("session.command {reason}"));
         }
+        if cfg!(windows) && self.ssh.transport == SshTransport::ControlMaster {
+            // Refused here rather than at the first `nvmux <host>`, where it
+            // would surface as ssh's own "getsockname failed".
+            return Err(
+                "ssh.transport = \"control-master\" is not available on Windows, whose ssh \
+                 cannot multiplex; \"relay\" is"
+                    .into(),
+            );
+        }
         Ok(())
     }
 }
@@ -387,6 +442,7 @@ fn render_default_config(prefix: u8) -> String {
     let s = SessionSettings::default();
     let c = ClientSettings::default();
     let f = FadeSettings::default();
+    let h = SshSettings::default();
     format!(
         "# nvmux configuration — created on first run.\n\
          #\n\
@@ -413,7 +469,14 @@ fn render_default_config(prefix: u8) -> String {
          # enabled     = {fade_enabled}\n\
          # duration_ms = {fade_duration}\n\
          # session     = {fade_session}\n\
-         # excursions  = {fade_excursions}\n",
+         # excursions  = {fade_excursions}\n\
+         \n\
+         [ssh]\n\
+         # How `nvmux <host>` reaches the host: \"control-master\" shares one ssh\n\
+         # connection through a ControlMaster; \"relay\" makes one plain connection\n\
+         # and multiplexes it itself, for an ssh that cannot (Windows) or a host\n\
+         # that refuses unix-socket forwards.\n\
+         # transport = {transport:?}\n",
         prefix = crate::keys::prefix_label(prefix),
         timeout = k.timeout_ms,
         command = s.command,
@@ -422,6 +485,7 @@ fn render_default_config(prefix: u8) -> String {
         fade_duration = f.duration_ms,
         fade_session = f.session,
         fade_excursions = f.excursions,
+        transport = h.transport.label(),
     )
 }
 
@@ -500,6 +564,44 @@ mod tests {
             excursions = true\n";
         let s: Settings = toml::from_str(doc).expect("valid");
         assert_eq!(s, Settings::default());
+        // The transport's default is the platform's, so it is spelled here as
+        // the platform would spell it.
+        let doc = format!(
+            "{doc}[ssh]\ntransport = {:?}\n",
+            SshSettings::default().transport.label()
+        );
+        let s: Settings = toml::from_str(&doc).expect("valid");
+        assert_eq!(s, Settings::default());
+    }
+
+    /// Where ssh can multiplex, a ControlMaster; where it cannot, the relay —
+    /// and the one Windows cannot use is refused by name, not left for ssh to
+    /// refuse with words about sockets.
+    #[test]
+    fn the_transport_is_the_platforms_unless_asked_for() {
+        let expected = if cfg!(windows) {
+            SshTransport::Relay
+        } else {
+            SshTransport::ControlMaster
+        };
+        assert_eq!(Settings::default().ssh.transport, expected);
+        let s: Settings = toml::from_str("[ssh]\ntransport = \"relay\"\n").expect("valid");
+        assert_eq!(s.ssh.transport, SshTransport::Relay);
+        assert!(toml::from_str::<Settings>("[ssh]\ntransport = \"mosh\"\n").is_err());
+        let master = parse(
+            Path::new("test.toml"),
+            "[ssh]\ntransport = \"control-master\"\n",
+        );
+        if cfg!(windows) {
+            match master.expect_err("refused on Windows") {
+                ConfigError::Invalid { message, .. } => {
+                    assert!(message.contains("ssh.transport"), "{message}")
+                }
+                other => panic!("expected Invalid, got {other:?}"),
+            }
+        } else {
+            master.expect("fine where ssh multiplexes");
+        }
     }
 
     #[test]
@@ -598,6 +700,7 @@ mod tests {
             ("an unknown client key", "[client]\nkeep = true\n"),
             ("an unparseable client value", "[client]\nper_session = 1\n"),
             ("an unparseable fade value", "[fade]\nenabled = \"yes\"\n"),
+            ("an unknown ssh key", "[ssh]\nmultiplex = true\n"),
         ] {
             assert!(
                 toml::from_str::<Settings>(doc).is_err(),
@@ -690,6 +793,14 @@ mod tests {
         );
         assert!(rendered.contains("\n[fade]\n"), "{rendered:?}");
         assert!(rendered.contains("\n[client]\n"), "{rendered:?}");
+        assert!(rendered.contains("\n[ssh]\n"), "{rendered:?}");
+        assert!(
+            rendered.contains(&format!(
+                "# transport = {:?}",
+                SshSettings::default().transport.label()
+            )),
+            "the template must document the transport: {rendered:?}"
+        );
         for line in [
             "# per_session = false",
             "# enabled     = true",
