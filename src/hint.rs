@@ -46,9 +46,12 @@
 //! # The lull, and the two clocks this does not have
 //!
 //! nvmux owns no cells while a session is attached, so the bar is written over
-//! the session's screen and put back — and, like everything else nvmux draws
-//! there, only at a lull ([`SETTLE`]). `pump` never parses the child's output,
-//! and a lull is the one state in which it cannot be mid-sequence.
+//! the session's screen and put back — and only at a lull ([`SETTLE`]). The
+//! bar alone waits for one. The attach notice used to wait for the same lull,
+//! and now goes up between the session's escape sequences instead, asking the
+//! decoder in [`crate::boundary`] — which is watched only for as long as the
+//! notice is up. So the bar keeps the lull: with nothing parsing the child's
+//! output, it is the one state in which the child cannot be mid-sequence.
 //!
 //! There is no fade. The bar has to be up the moment the prefix arms — that is
 //! the whole of what it is for, and a dissolve of 100 ms each way is 100 ms of
@@ -81,11 +84,12 @@ use crate::shadow::{Over, Shadow};
 
 /// How long the child must have been quiet before the bar may be written.
 ///
-/// [`crate::announce::SETTLE`]'s number, for its reason: a child whose own write
-/// blocked because the pty buffer filled leaves the master momentarily
-/// unreadable in the *middle* of a frame, and a wait this long steps over that
-/// gap. Its own constant rather than a shared one because the two are the same
-/// number by coincidence of the same hardware, not by agreement.
+/// A child whose own write blocked because the pty buffer filled leaves the
+/// master momentarily unreadable in the *middle* of a frame. That gap is
+/// microseconds, and a wait this long steps over it. `pty::HOLD_SETTLE` is the
+/// same number for the same reason, and this is its own constant rather than a
+/// shared one because the two agree by coincidence of the same hardware, not by
+/// agreement.
 ///
 /// It costs the bar nothing in practice. A human reaching for the prefix is
 /// almost always further than 25 ms from the last byte the editor wrote, so the
@@ -407,47 +411,12 @@ fn blank(over: &Over) -> Over {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{big, palette, screen, size};
     use crate::ui::test_support::TINY_SIZES;
-
-    fn size(cols: u16, rows: u16) -> PtySize {
-        PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        }
-    }
-
-    /// A screen with room for the whole row, which most of these want.
-    fn big() -> PtySize {
-        size(80, 24)
-    }
 
     /// The bar's one row of text, as it would be drawn on `size`.
     fn row(pending: Pending, size: PtySize) -> String {
         overlay(pending, size).expect("a bar").rows.remove(0)
-    }
-
-    /// A shadow with something on it to put back: every cell an `x`, which is in
-    /// none of the bar's words, so a restored row shows the screen exactly when
-    /// it has one in it.
-    fn screen(rows: u16, cols: u16) -> Shadow {
-        let mut shadow = Shadow::new(rows, cols);
-        for row in 1..=rows {
-            shadow.feed(format!("\x1b[{row};1H{}", "x".repeat(usize::from(cols))).as_bytes());
-        }
-        shadow
-    }
-
-    /// A terminal that said its text is light grey on black. No palette is ever
-    /// installed under test, so this is the only way to reach the restoring
-    /// path — which is why [`Bar::with_palette`] exists.
-    fn palette() -> Palette {
-        Palette {
-            fg: crate::palette::Rgb(200, 200, 200),
-            bg: crate::palette::Rgb(0, 0, 0),
-            ansi: [crate::palette::Rgb(0, 0, 0); 16],
-        }
     }
 
     /// A bar and the clock it is told, advanced a lull at a time.
@@ -732,9 +701,9 @@ mod tests {
         assert_eq!(tail, "\x1b[?2026l", "something follows the row: {tail:?}");
     }
 
-    /// The bar is not written while the child is talking: `pump` never parses
-    /// the child's output, so any other moment could be the middle of one of its
-    /// escape sequences.
+    /// The bar is not written while the child is talking: the relay parses the
+    /// child's output only while the attach notice is up, so for the bar any
+    /// other moment could be the middle of one of its escape sequences.
     ///
     /// And it waits out the lull rather than writing on the first quiet pass:
     /// that pass is where the lull *starts*, and a child whose own write blocked

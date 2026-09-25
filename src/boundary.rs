@@ -91,7 +91,7 @@ pub const KEPT_FOR: Duration = Duration::from_millis(16);
 /// What it bounds is the one sequence that has no length limit — an OSC 52
 /// clipboard write can be a megabyte — which must not be accumulated here
 /// while the session waits for it.
-pub const KEPT_MAX: usize = 64 * 1024;
+const KEPT_MAX: usize = 64 * 1024;
 
 /// The terminal's own parser as far as nvmux has written to it, and the tail
 /// of the session's output kept back so that it is never left mid-sequence.
@@ -218,7 +218,7 @@ impl Boundary {
     /// So the close is held back for exactly as long as it takes to write the
     /// box, and goes out immediately after. Delayed by one write and by
     /// nothing else; never dropped, reordered or changed.
-    pub fn holding_the_sessions_close(&self) -> bool {
+    fn holding_the_sessions_close(&self) -> bool {
         self.closing.is_some()
     }
 
@@ -371,7 +371,7 @@ const PARAMS: usize = 32;
 
 /// Where the terminal's parser stands.
 ///
-/// Plain data and `Copy`, which is what lets [`Parser::advance_to_last_rest`]
+/// Plain data and `Copy`, which is what lets [`Parser::scan`]
 /// run a scan ahead of itself and keep the answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Parser {
@@ -687,7 +687,7 @@ mod tests {
     }
 
     /// Where the terminal has been left, having been shown `bytes` — which is
-    /// what [`Boundary::saw`] answers and what a tail given up on produces.
+    /// what [`Boundary::saw_session`] answers and what a tail given up on produces.
     fn shown(bytes: &[u8]) -> Boundary {
         let mut boundary = Boundary::new();
         boundary.saw_session(bytes);
@@ -1100,9 +1100,10 @@ mod tests {
         );
     }
 
-    /// The invariant [`Parser::advance_to_last_rest`] throws its scan away on:
-    /// at a sequence boundary the parser is the one it started as but for its
-    /// two counters, so the scan has nothing to carry back but an index and
+    /// The invariant [`Parser::scan`] throws its scanning copy away on, and
+    /// [`Parser::take`] rebuilds a parser from: at a sequence boundary the
+    /// parser is the one it started as but for its two counters and
+    /// `seen_sync`, so the scan has nothing to carry back but an index and
     /// those.
     #[test]
     fn a_parser_between_sequences_carries_only_its_counters() {

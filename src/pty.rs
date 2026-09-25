@@ -34,7 +34,7 @@
 //! it takes as it takes any answer. **A held byte — by either of the two — is
 //! never dropped, reordered or changed.**
 //!
-//! Two things ever *join* this direction. The attach notice (see
+//! Three things ever *join* this direction. The attach notice (see
 //! [`crate::announce`]): a box, drawn where the child's own bytes leave the
 //! terminal between escape sequences, which [`crate::boundary`] finds with a
 //! decoder rather than with a clock, and written inside a synchronized update
@@ -46,13 +46,14 @@
 //! never gives, and writing the box after every repaint instead only wins the
 //! moments the terminal happens not to present in. And the fade's frames
 //! ([`crate::fade`]), written before the held first paint and after the relay
-//! has stopped.
+//! has stopped. And the hint bar ([`crate::hint`]): the prefix's one-row bar,
+//! written at a lull and put back from the shadow, and never fed to it either.
 //!
-//! Neither is ever fed back to the shadow. Both are nvmux's own picture of the
-//! screen rather than the session's bytes, and the notice's frames are
-//! composited *out of* the shadow — so showing them to it would have it
-//! holding nvmux's drawing of the editor with a box in the middle, and nothing
-//! underneath to give back (see [`Attachment::write_over_session`]).
+//! None of them is ever fed back to the shadow. All three are nvmux's own
+//! picture of the screen rather than the session's bytes, and the notice's
+//! frames are composited *out of* the shadow — so showing them to it would
+//! have it holding nvmux's drawing of the editor with a box in the middle, and
+//! nothing underneath to give back (see [`Attachment::write_over_session`]).
 //!
 //! Three hazards that have no other home in the code:
 //!
@@ -76,6 +77,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair};
 
 use crate::error::{NvmuxError, Result};
 use crate::keys::{Action, Prefix, Step, Wait};
+use crate::term::write_stdout;
 use crate::{announce, boundary, fade, hint, rpc, shadow, term, winch};
 
 /// Neovim aborts on the seventeenth attached UI rather than returning an error
@@ -190,7 +192,7 @@ pub struct Attachment {
     reaped: bool,
     /// The session's screen as its bytes have described it, kept so the
     /// session can be dissolved in and out (see [`crate::shadow`]). `None`
-    /// with the fade off, and then nothing is parsed.
+    /// with the fade off or `fade.session` false, and then nothing is parsed.
     shadow: Option<shadow::Shadow>,
     /// The first paint, while it is being kept back from the terminal so it
     /// can dissolve in. `None` once released, and always without a shadow.
@@ -198,12 +200,15 @@ pub struct Attachment {
     /// Where the terminal's parser stands, kept only while there is a notice
     /// to write over the session (see [`crate::boundary`]). `None` the rest of
     /// the time, which is the whole of a relay after its first second and a
-    /// bit: nothing else nvmux does writes over a session.
+    /// bit: the hint bar, the one other thing nvmux writes over a session,
+    /// waits for a lull instead and only asks the parser (`mid_sequence`)
+    /// while one happens to be there for the notice.
     ///
     /// While it is there, **every byte written to the terminal is shown to it
-    /// exactly once**: [`Attachment::relay_output`] hands it the session's
-    /// through `relay`, and the two writes of nvmux's own — the notice and the
-    /// released first paint — say `saw`. A byte shown twice moves the parser
+    /// exactly once, and said whose it is**: [`Attachment::relay_output`]
+    /// hands it the session's through `relay`, the notice's frames — nvmux's
+    /// own — say `saw_own`, and the released first paint, the session's by
+    /// another route, says `saw_session`. A byte shown twice moves the parser
     /// twice; one not shown leaves it describing a terminal that no longer
     /// exists, and the next thing nvmux draws lands inside a sequence.
     boundary: Option<boundary::Boundary>,
@@ -245,8 +250,10 @@ struct Hold {
 }
 
 /// How long the client must have been quiet, with something drawn, before
-/// its first paint is called complete. See [`crate::announce`] for the
-/// reasoning behind the number, which is the same one.
+/// its first paint is called complete. The same number as `hint::SETTLE`, and
+/// for the same reason given there: a pty whose buffer filled leaves the
+/// master unreadable for microseconds in the middle of a frame, and this
+/// steps over that gap.
 const HOLD_SETTLE: Duration = Duration::from_millis(25);
 
 /// The longest a first paint is held after its first byte. A local session
@@ -435,24 +442,32 @@ impl Attachment {
 
     /// Write to the terminal, then let the shadow see what was written.
     ///
-    /// Every byte of the *session's* own screen goes through here, so what the
-    /// shadow holds is what the client drew. The write comes first and the
-    /// shadow after: nothing about the shadow may delay or change what the
-    /// user sees.
+    /// The plain path for the session's bytes — a relay with no notice up and
+    /// no first paint held — and for the tails the boundary lets go of
+    /// ([`Attachment::release_the_sessions_close`],
+    /// [`Attachment::release_kept`]). The two other paths write the session's
+    /// bytes themselves and show the shadow the same bytes:
+    /// [`Attachment::write_session_frame`] wraps a relayed piece in a
+    /// synchronized update and feeds the shadow after the write (or, for a
+    /// client that brackets its own frames, comes back through here), and a
+    /// held first paint is fed to the shadow as it is held
+    /// ([`Attachment::relay_output`]) and written later by
+    /// [`Attachment::release_hold`]. Across all three the shadow sees every
+    /// byte of the session's screen exactly once — the same rule the boundary
+    /// lives by — so what it holds is what the client drew. Here the write
+    /// comes first and the shadow after: nothing about the shadow may delay or
+    /// change what the user sees.
     ///
     /// nvmux's own notice does not come through here — see
     /// [`Attachment::write_over_session`].
     fn write_terminal(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        let mut out = std::io::stdout().lock();
-        out.write_all(bytes)?;
-        out.flush()?;
-        drop(out);
+        write_stdout(bytes)?;
         self.shadow_saw(bytes);
         Ok(())
     }
 
     /// Write something of nvmux's own over the session's screen: the attach
-    /// notice, and nothing else.
+    /// notice, and the hint bar the prefix puts up ([`crate::hint`]).
     ///
     /// The shadow must not take these for the session's. Its grid is what the
     /// *client* drew, not what the terminal shows, and keeping it that way is
@@ -647,10 +662,11 @@ impl Attachment {
         self.write_terminal(&ready)
     }
 
-    /// The notice is over. Nothing else nvmux draws goes over a session, so
-    /// the terminal's parser need not be followed any further — but every byte
-    /// still being kept on its account goes out first, or a client's frame
-    /// would end a few bytes short for the rest of the relay.
+    /// The notice is over. The hint bar still writes over a session, but it
+    /// waits for a lull rather than for the parser, so the terminal's parser
+    /// need not be followed any further — but every byte still being kept on
+    /// its account goes out first, or a client's frame would end a few bytes
+    /// short for the rest of the relay.
     fn stop_watching_the_terminal(&mut self) -> std::io::Result<()> {
         self.close_span()?;
         self.release_the_sessions_close()?;
@@ -949,10 +965,7 @@ impl Attachment {
                 Ok(len) => {
                     // Read before the write, because the write borrows `self`.
                     owed |= asks_for_device_attributes(&buf[..len]);
-                    let mut out = std::io::stdout().lock();
-                    let _ = out.write_all(&without_device_attributes_request(&buf[..len]));
-                    let _ = out.flush();
-                    drop(out);
+                    let _ = write_stdout(&without_device_attributes_request(&buf[..len]));
                     if owed {
                         owed = !self.answer_device_attributes();
                     }
@@ -1522,7 +1535,7 @@ pub fn relay(
         repaint(&mut attachment, Repaint::Resume);
     }
     attachment.resumed = true;
-    if fresh && attachment.shadow.is_some() && fade::enabled() {
+    if fresh && attachment.shadow.is_some() {
         attachment.hold = Some(Hold::new(Instant::now()));
     }
 
@@ -1937,10 +1950,11 @@ fn pump(
         // winch, so the row is the terminal's as it is now, and after the notice,
         // for the reason written down there.
         //
-        // `busy` is the notice's, for the notice's reasons: a lull is the only
-        // moment nvmux can know a write of its own is not landing inside one of
-        // the child's escape sequences, and a held first paint is a screen the
-        // terminal has not been shown a word of yet.
+        // `busy` is the bar's lull rule: the child having spoken this pass, and
+        // a held first paint — a screen the terminal has not been shown a word
+        // of yet — both mean this is no moment to write. The notice's own pass
+        // above shares the first two terms but asks the boundary decoder
+        // instead of waiting for a lull.
         //
         // A lull is not enough while the notice is up, though: a tail that ran
         // out of patience can leave the terminal half way through one of the
@@ -2134,14 +2148,6 @@ fn framed(bytes: &[u8], open: bool) -> Vec<u8> {
     }
     out.extend_from_slice(bytes);
     out
-}
-
-/// Write to the terminal and flush, so what is written lands before the next
-/// thing does.
-fn write_stdout(bytes: &[u8]) -> std::io::Result<()> {
-    let mut out = std::io::stdout().lock();
-    out.write_all(bytes)?;
-    out.flush()
 }
 
 /// Read whatever is available. Only called after `poll` says the fd is ready.
@@ -2580,8 +2586,13 @@ mod tests {
     /// `has_contents` cannot tell nvmux's border from Neovim's text, so the
     /// box would also answer for the client's first paint and release a hold
     /// over a screen the client had not drawn.
+    ///
+    /// The hint bar goes through the same `write_over_session`, and for the
+    /// bar the stake is sharper: its erase is a composite out of this grid —
+    /// it is what puts the editor's last row back — so a grid that had
+    /// swallowed the bar would erase the bar with the bar.
     #[test]
-    fn the_attach_notice_never_reaches_the_shadows_grid() {
+    fn nothing_written_over_the_session_reaches_the_shadows_grid() {
         let mut a = attached_to("exit 0");
         let mut shadow = shadow::Shadow::new(8, 40);
         shadow.feed(b"\x1b[4;1Hthe editor drew this");
@@ -2600,11 +2611,7 @@ mod tests {
         a.write_over_session(&announce::plain_bytes(&over, None))
             .expect("write");
 
-        let colours = crate::palette::Palette {
-            fg: crate::palette::Rgb(200, 200, 200),
-            bg: crate::palette::Rgb(0, 0, 0),
-            ansi: [crate::palette::Rgb(0, 0, 0); 16],
-        };
+        let colours = crate::test_support::palette();
         let grid = a.shadow.as_mut().expect("a shadow");
         let painted = grid.frame(0.0, &colours, shadow::Cursor::Hidden);
         let frame = String::from_utf8_lossy(&painted).to_string();
@@ -2767,79 +2774,30 @@ mod tests {
         );
     }
 
-    /// The hint bar is nvmux's own drawing too, and the shadow must not take it
-    /// for the session's either.
-    ///
-    /// Sharper here than for the notice. The bar's *erase* is a composite out of
-    /// this grid — it is what puts the editor's last row back — so a grid that
-    /// had swallowed the bar would erase the bar with the bar, and leave it on
-    /// the screen for as long as the session did not redraw that row.
-    #[test]
-    fn the_hint_bar_never_reaches_the_shadows_grid() {
-        let size = PtySize {
-            rows: 8,
-            cols: 40,
-            ..PtySize::default()
-        };
-        let mut a = attached_to("exit 0");
-        let mut shadow = shadow::Shadow::new(size.rows, size.cols);
-        // On the bar's own row, which is the row at issue.
-        shadow.feed(b"\x1b[8;1Hthe editor drew this");
-        a.shadow = Some(shadow);
-
-        let over = hint::overlay(crate::keys::Pending::Command, size).expect("a bar");
-        a.write_over_session(&announce::placed(&over, "\x1b[0;2m"))
-            .expect("write");
-
-        let colours = crate::palette::Palette {
-            fg: crate::palette::Rgb(200, 200, 200),
-            bg: crate::palette::Rgb(0, 0, 0),
-            ansi: [crate::palette::Rgb(0, 0, 0); 16],
-        };
-        let grid = a.shadow.as_mut().expect("a shadow");
-        let painted = grid.frame(0.0, &colours, shadow::Cursor::Hidden);
-        let frame = String::from_utf8_lossy(&painted).to_string();
-        assert!(
-            frame.contains("the editor drew this"),
-            "the grid lost the editor's row: {frame:?}"
-        );
-        assert!(
-            !frame.contains("picker"),
-            "the grid took the bar: {frame:?}"
-        );
-    }
-
     /// A stand-in client on a real pty, driven by `sh -c $script`.
     ///
     /// Real, because what the teardown tests are about is what a *signal* does
     /// to a process: a fake `Child` would supply the `kill` under test and
-    /// answer for itself. `sock` is never read on these paths.
+    /// answer for itself. `sock` is never read on these paths. The pty is
+    /// opened by [`spawn_client_with`], the same path the real client takes,
+    /// sized from `term::terminal_size()` (or 24x80), which no caller depends
+    /// on.
     fn attached_to(script: &str) -> Attachment {
-        let pair = portable_pty::native_pty_system()
-            .openpty(PtySize::default())
-            .expect("openpty");
         let mut cmd = CommandBuilder::new("sh");
         cmd.arg("-c");
         cmd.arg(script);
-        let child = pair.slave.spawn_command(cmd).expect("spawn sh");
-        // As in `spawn`: while this process holds the slave open the master
-        // never sees EOF.
-        drop(pair.slave);
-        let writer = pair.master.take_writer().expect("writer");
-        Attachment {
-            session_id: "id000000".to_string(),
-            sock: PathBuf::from("/nvmux-test-never-read.sock"),
-            announce: None,
-            child,
-            master: pair.master,
-            writer,
-            resumed: false,
-            reaped: false,
-            shadow: None,
-            hold: None,
-            boundary: None,
-            span: false,
-        }
+        let mut a = spawn_client_with(
+            "id000000",
+            Path::new("/nvmux-test-never-read.sock"),
+            "",
+            cmd,
+        )
+        .expect("spawn sh");
+        // Nothing to announce and no shadow unless a test installs one: keep
+        // the fixture independent of the fade/palette process globals.
+        a.announce = None;
+        a.shadow = None;
+        a
     }
 
     /// Wait for a stand-in client to say it is ready, by reading the `r` its
@@ -2946,11 +2904,6 @@ mod tests {
         assert!(out.is_empty(), "a command writes nothing to the child");
     }
 
-    /// Exactly one outcome reaches the next session without a screen on the
-    /// way, and it is the one that has to clear for itself. Getting this wrong
-    /// in either direction is invisible in a test that only checks the
-    /// outcomes: too narrow leaves the old session on screen through the
-    /// spawn, too wide clears a screen that is about to draw anyway.
     /// A hold ends at the first lull after something has been drawn — not
     /// at a lull before, which is a client between its queries and its grid.
     #[test]
@@ -3048,6 +3001,11 @@ mod tests {
         }
     }
 
+    /// Exactly one outcome reaches the next session without a screen on the
+    /// way, and it is the one that has to clear for itself. Getting this wrong
+    /// in either direction is invisible in a test that only checks the
+    /// outcomes: too narrow leaves the old session on screen through the
+    /// spawn, too wide clears a screen that is about to draw anyway.
     #[test]
     fn only_a_switch_reaches_the_next_session_without_a_screen() {
         for target in [Target::Number(3), Target::Step(Direction::Next)] {
@@ -3066,14 +3024,6 @@ mod tests {
                 "{other:?} either opens a screen or ends the relay"
             );
         }
-    }
-
-    /// A scratch socket path, kept short: `check_sock_path` refuses anything over
-    /// `MAX_SOCK_PATH`, and macOS's temp dir is not short.
-    fn temp_sock(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("nvmux-t{}-{tag}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&p);
-        p
     }
 
     /// A msgpack-RPC server that answers what the attach probe asks and records
@@ -3282,7 +3232,7 @@ mod tests {
     /// session to take a box off its screen fails here.
     #[test]
     fn the_notice_repaint_is_asked_from_a_thread_and_answered_later() {
-        let sock = temp_sock("erasing");
+        let sock = crate::test_support::scratch_sock("pty-erasing");
         let server = recording_server(&sock, "n", false);
 
         let erasing = Erasing::start(&sock).expect("a thread");
@@ -3309,7 +3259,7 @@ mod tests {
     /// about not waiting rather than about how fast a thread starts.
     #[test]
     fn asking_for_the_notice_repaint_does_not_wait_for_it() {
-        let sock = temp_sock("erasingstall");
+        let sock = crate::test_support::scratch_sock("pty-erasingstall");
         let server = recording_server_stalling_on(&sock, "nvim_command");
 
         let asked = Instant::now();
@@ -3370,7 +3320,7 @@ mod tests {
             ),
             ("promptno", Repaint::Notice, &["nvim_get_mode"][..]),
         ] {
-            let sock = temp_sock(tag);
+            let sock = crate::test_support::scratch_sock(&format!("pty-{tag}"));
             let server = recording_server(&sock, "r", true);
             let served = repaint_through_server(&sock, why);
             assert_eq!(
@@ -3398,7 +3348,7 @@ mod tests {
             ("mousenvi", ("nvi", 0), Some(MouseReporting::Buttons)),
             ("mousemove", ("a", 1), Some(MouseReporting::Motion)),
         ] {
-            let sock = temp_sock(tag);
+            let sock = crate::test_support::scratch_sock(&format!("pty-{tag}"));
             let server = recording_server_with(&sock, "n", false, 0, mouse);
             let served = repaint_through_server(&sock, Repaint::Resume);
             assert_eq!(served.mouse, want, "{mouse:?}");
@@ -3411,7 +3361,7 @@ mod tests {
             let _ = std::fs::remove_file(&sock);
         }
 
-        let sock = temp_sock("mousenotice");
+        let sock = crate::test_support::scratch_sock("pty-mousenotice");
         let server = recording_server_with(&sock, "n", false, 0, ("", 0));
         let served = repaint_through_server(&sock, Repaint::Notice);
         assert_eq!(served.mouse, None, "a notice must not ask");
@@ -3427,7 +3377,7 @@ mod tests {
     /// nothing about the mouse, and the resume falls back on the default.
     #[test]
     fn a_server_that_cannot_be_asked_says_nothing_about_the_mouse() {
-        let sock = temp_sock("mousebusy");
+        let sock = crate::test_support::scratch_sock("pty-mousebusy");
         // Blocking on something that is not a hit-enter prompt: an operator
         // waiting for its motion, say.
         let server = recording_server_with(&sock, "no", true, 0, ("", 0));
@@ -3533,7 +3483,7 @@ mod tests {
                 ][..],
             ),
         ] {
-            let sock = temp_sock(tag);
+            let sock = crate::test_support::scratch_sock(&format!("pty-{tag}"));
             let server = if mode == "r" {
                 recording_server_clearing_on_input(&sock, mode)
             } else {
@@ -3608,7 +3558,7 @@ mod tests {
             // it is handed over, rather than typed at for ever.
             ("stacked", "r", MAX_PROMPTS),
         ] {
-            let sock = temp_sock(tag);
+            let sock = crate::test_support::scratch_sock(&format!("pty-{tag}"));
             let server = recording_server_blocked_stalling_on(&sock, mode, "nvim_list_uis");
             let mut probe = Probe::start(tag, &sock).expect("connected");
             let answer = probe
@@ -3646,7 +3596,7 @@ mod tests {
     #[test]
     fn a_failed_probe_leaves_no_client_behind() {
         for (tag, too_many) in [("nobody", false), ("toomany", true)] {
-            let sock = temp_sock(tag);
+            let sock = crate::test_support::scratch_sock(&format!("pty-{tag}"));
             let server =
                 too_many.then(|| recording_server_with_uis(&sock, "n", false, MAX_UIS + 1));
             if !too_many {
@@ -3681,7 +3631,7 @@ mod tests {
     /// be sent on it.
     #[test]
     fn dropping_a_probe_stops_its_worker_and_hangs_up_on_the_server() {
-        let sock = temp_sock("stall");
+        let sock = crate::test_support::scratch_sock("pty-stall");
         let server = recording_server_stalling_on(&sock, "nvim_list_uis");
         let mut probe = Probe::start("stall", &sock).expect("connected");
         assert!(
@@ -3691,12 +3641,8 @@ mod tests {
 
         let started = Instant::now();
         let worker = probe.abandon();
-        let deadline = started + Duration::from_secs(2);
-        while !worker.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
         assert!(
-            worker.is_finished(),
+            crate::test_support::wait_until(Duration::from_secs(2), || worker.is_finished()),
             "the worker is still parked in its read after the interrupt"
         );
         worker.join().expect("the worker thread");
@@ -3717,7 +3663,7 @@ mod tests {
     /// alongside it, so the guard tolerates exactly one over.
     #[test]
     fn the_ui_limit_allows_for_the_client_being_counted() {
-        let sock = temp_sock("atlimit");
+        let sock = crate::test_support::scratch_sock("pty-atlimit");
         let server = recording_server_with_uis(&sock, "n", false, MAX_UIS);
         let attached = spawn_with("limit", &sock, "1  limit", standin_client("atlimit"));
         assert!(
