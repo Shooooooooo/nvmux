@@ -54,7 +54,7 @@ where
 }
 
 /// Wrap a command so it runs under the user's **login** shell. Used by
-/// [`crate::ssh::shell_args`] to start the shell every remote script runs in.
+/// `ssh::shell_args` to start the shell every remote script runs in.
 /// `$SHELL` is double-quoted so a value containing a space stays one word, and
 /// expands on the remote side because the whole string travels as ssh's
 /// command.
@@ -65,9 +65,16 @@ pub fn login_shell_wrapper(inner: &str) -> String {
 /// Prepended to every script below, so what reaches the session host is one
 /// self-contained program on stdin. A script run straight from a checkout
 /// sources the same file instead — see `scripts/_prelude.sh`.
+macro_rules! with_prelude {
+    ($($tail:expr),+ $(,)?) => {
+        concat!(include_str!("../scripts/_prelude.sh"), $($tail),+)
+    };
+}
+
+/// A shipped script file with the prelude in front of it.
 macro_rules! script {
     ($file:literal) => {
-        concat!(include_str!("../scripts/_prelude.sh"), include_str!($file))
+        with_prelude!(include_str!($file))
     };
 }
 
@@ -88,10 +95,9 @@ pub const KILL_SCRIPT: &str = script!("../scripts/kill.sh");
 /// connection opens with comes from the same code every later refresh runs.
 /// `hello.sh` prints what nvmux needs to know about the host and leaves the
 /// runtime directory in `$1`, which is exactly what `list.sh` reads.
-pub const HELLO_SCRIPT: &str = concat!(
-    include_str!("../scripts/_prelude.sh"),
+pub const HELLO_SCRIPT: &str = with_prelude!(
     include_str!("../scripts/hello.sh"),
-    include_str!("../scripts/list.sh"),
+    include_str!("../scripts/list.sh")
 );
 
 /// Writes `<id>.json` on the session host. Used by the SSH transport, where
@@ -128,6 +134,7 @@ const SCRIPTS: &[(&str, &str)] = &[
 mod tests {
     use super::*;
     use crate::proc::Output;
+    use crate::test_support::{scratch_dir, scratch_path, scratch_sock};
     use std::process::{Child, Command};
 
     /// Ask a real `/bin/sh` what it made of our quoting.
@@ -321,7 +328,7 @@ mod tests {
     /// The command line of a pid, read through the prelude's own reader, so the
     /// question is asked the way the scripts ask it wherever this runs.
     fn cmdline_of(pid: u32) -> String {
-        let script = concat!(include_str!("../scripts/_prelude.sh"), "cmdline \"$1\"\n");
+        let script = with_prelude!("cmdline \"$1\"\n");
         crate::proc::run_local(script, &[&pid.to_string()])
             .expect("read the command line")
             .stdout
@@ -390,8 +397,7 @@ mod tests {
     fn renumber_writes_every_pair_and_never_creates_metadata() {
         use crate::session::Session;
 
-        let dir = std::env::temp_dir().join(format!("nvmux-renumber-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch directory");
+        let dir = scratch_dir("shell-renumber");
 
         let meta = |id: &str, num: u32| {
             let mut s = Session::new(id.to_string(), format!("name-{id}"), 0, num);
@@ -471,8 +477,7 @@ mod tests {
     /// there is no Neovim, which is where the timing regression would land.
     #[test]
     fn a_listing_finds_every_live_session_and_none_of_the_dead() {
-        let dir = std::env::temp_dir().join(format!("nvmux-listing-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch directory");
+        let dir = scratch_dir("shell-listing");
         let live = ["aaaaaaaa", "bbbbbbbb", "cccccccc"];
         let dead = "dddddddd";
 
@@ -518,13 +523,10 @@ mod tests {
     /// from under it, and nothing can ever kill it again.
     #[test]
     fn a_session_is_found_by_its_socket_wherever_it_sits_on_the_command_line() {
-        let sock = std::env::temp_dir().join(format!("nvmux-trailing-{}.sock", std::process::id()));
+        let sock = scratch_sock("shell-trailing");
         let sock = sock.to_string_lossy().into_owned();
 
-        let ask = concat!(
-            include_str!("../scripts/_prelude.sh"),
-            "serving_pid \"$1\"\n"
-        );
+        let ask = with_prelude!("serving_pid \"$1\"\n");
 
         for trailing in [&[][..], &["--clean"][..], &["--clean", "-u", "NONE"][..]] {
             let mut held = spawn_standin(&sock, trailing);
@@ -553,10 +555,8 @@ mod tests {
             eprintln!("skipping: this host does not keep /proc/net/unix");
             return;
         }
-        let dir = std::env::temp_dir().join(format!("nvmux-bound-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch directory");
+        let dir = scratch_dir("shell-bound");
         let sock = dir.join("aaaaaaaa.sock");
-        let _ = std::fs::remove_file(&sock);
         // Held for the length of the test. Nothing anywhere names this path on
         // a command line — this process's own argv is cargo's.
         let held = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
@@ -619,8 +619,7 @@ mod tests {
     /// there is no Neovim.
     #[test]
     fn the_spawn_script_runs_the_command_it_is_given() {
-        let dir = std::env::temp_dir().join(format!("nvmux-spawn-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch_path("shell-spawn");
         let sock = dir.join("aaaaaaaa.sock");
 
         // A stand-in session, which binds nothing, so `SOCK` times out. What is
@@ -663,8 +662,7 @@ mod tests {
     /// session for not starting.
     #[test]
     fn a_command_that_is_not_there_is_refused_rather_than_waited_for() {
-        let dir = std::env::temp_dir().join(format!("nvmux-spawn-missing-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch_path("shell-spawn-missing");
 
         let started = std::time::Instant::now();
         let out = run_script(
@@ -696,31 +694,17 @@ mod tests {
     /// a second time — and what lets the same file still run from a checkout.
     #[test]
     fn a_prepended_script_does_not_source_the_prelude_again() {
-        let out = Command::new("/bin/sh")
-            .arg("-s")
-            .arg("/nonexistent-runtime-dir")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut c| {
-                use std::io::Write;
-                c.stdin
-                    .take()
-                    .expect("stdin")
-                    .write_all(LIST_SCRIPT.as_bytes())?;
-                c.wait_with_output()
-            })
-            .expect("run list.sh");
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let out = run_script(LIST_SCRIPT, &["/nonexistent-runtime-dir"]);
         assert!(
-            !stderr.contains("_prelude.sh"),
-            "a prepended script tried to source the prelude: {stderr}"
+            !out.stderr.contains("_prelude.sh"),
+            "a prepended script tried to source the prelude: {}",
+            out.stderr
         );
         assert!(
-            String::from_utf8_lossy(&out.stdout).contains("NVMUX_END"),
-            "stdout: {:?} stderr: {stderr}",
-            String::from_utf8_lossy(&out.stdout)
+            out.stdout.contains("NVMUX_END"),
+            "stdout: {:?} stderr: {}",
+            out.stdout,
+            out.stderr
         );
     }
 
@@ -731,8 +715,7 @@ mod tests {
     /// returns it no longer removes must still parse as the JSON they are in.
     #[test]
     fn flatten_matches_the_tr_it_replaced() {
-        let dir = std::env::temp_dir().join(format!("nvmux-flatten-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("shell-flatten");
         let cases: &[(&str, &str)] = &[
             ("plain", "{\"a\":1}"),
             ("pretty", "{\n  \"a\": 1\n}\n"),
@@ -752,11 +735,7 @@ mod tests {
             let path = dir.join(format!("{name}.json"));
             std::fs::write(&path, body).expect("write case");
             let arg = path.to_string_lossy().into_owned();
-            let script = concat!(
-                include_str!("../scripts/_prelude.sh"),
-                r#"flatten "$1"; printf '%s' "$nvmux_flat""#,
-                "\n"
-            );
+            let script = with_prelude!(r#"flatten "$1"; printf '%s' "$nvmux_flat""#, "\n");
             let flattened = run_script(script, &[&arg]);
             let tr = run_script(r#"tr -d '\n' < "$1""#, &[&arg]);
             assert!(flattened.ok(), "{name}: {}", flattened.stderr);
@@ -832,19 +811,8 @@ mod tests {
         assert!(!code_only(posix).contains(" ]]"));
     }
 
-    fn syntax_check(text: &[u8]) -> std::process::Output {
-        Command::new("/bin/sh")
-            .arg("-n")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut c| {
-                use std::io::Write;
-                c.stdin.take().expect("stdin").write_all(text)?;
-                c.wait_with_output()
-            })
-            .expect("run sh -n")
+    fn syntax_check(text: &str) -> Output {
+        crate::proc::run_feeding_stdin(Command::new("/bin/sh").arg("-n"), text).expect("run sh -n")
     }
 
     /// As shipped, and as framed for the shell that runs it. The framed form
@@ -855,18 +823,16 @@ mod tests {
     #[test]
     fn scripts_pass_shell_syntax_check() {
         for &(name, body) in SCRIPTS {
-            let out = syntax_check(body.as_bytes());
-            assert!(
-                out.status.success(),
-                "{name} is not valid sh: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+            let out = syntax_check(body);
+            assert!(out.ok(), "{name} is not valid sh: {}", out.stderr);
             let framed = crate::proc::frame("NVMUX_MARK_secret_1", body, &["a", "it's"]);
-            let out = syntax_check(&framed);
+            let out = syntax_check(
+                std::str::from_utf8(&framed).expect("frame() builds UTF-8 from &str inputs"),
+            );
             assert!(
-                out.status.success(),
+                out.ok(),
                 "{name} is not valid sh once framed for the shell: {}",
-                String::from_utf8_lossy(&out.stderr)
+                out.stderr
             );
         }
     }

@@ -251,7 +251,7 @@ impl SshTransport {
     /// over whatever master [`Self::restore_master`] leaves.
     ///
     /// `connect_timeout` is passed through to the master, for the one caller
-    /// that is retrying — see [`crate::ssh::master_args`].
+    /// that is retrying — see `ssh::master_args`.
     fn reconnect_if_needed(&self, connect_timeout: Option<u64>) -> Result<Reconnect> {
         // A slot that is locked has a script running in it, which is as alive
         // as a shell gets. Never this transport's own `run_script`, which asks
@@ -290,7 +290,7 @@ impl SshTransport {
     /// fact ended.
     ///
     /// `connect_timeout` is passed through to the master, for the one caller
-    /// that is retrying — see [`crate::ssh::master_args`].
+    /// that is retrying — see `ssh::master_args`.
     fn restore_master(&self, connect_timeout: Option<u64>) -> Result<Reconnect> {
         if self.ssh.is_master_alive() {
             return Ok(Reconnect::Unneeded);
@@ -495,12 +495,7 @@ impl Transport for SshTransport {
             return Ok(local);
         }
 
-        self.ssh.forward(&local, &remote)?;
-        self.forwarded
-            .lock()
-            .map(|mut f| f.insert(s.id.clone()))
-            .ok();
-        Ok(local)
+        self.reach(&s.id, &remote)
     }
 
     /// Bounded, because it is retried: the attempt gets

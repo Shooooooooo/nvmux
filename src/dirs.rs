@@ -1,18 +1,20 @@
 //! Listing directories on the host that will run the session.
 //!
-//! The completion half of the local/remote seam. [`Transport`] answers questions
-//! about sessions; this answers the one question the create prompt asks about
-//! the host itself — what is inside this directory — and it is separate for one
-//! reason: it has to leave the transport behind.
+//! The completion half of the local/remote seam.
+//! [`crate::transport::Transport`] answers questions about sessions; this
+//! answers the one question the create prompt asks about the host itself —
+//! what is inside this directory — and it is separate for one reason: it has
+//! to leave the transport behind.
 //!
-//! [`Transport`] is a `Box<dyn Transport>` held by the picker and is not `Send`.
-//! Completion runs on a worker thread (see [`crate::ui::complete`], which
-//! explains why), and a thread cannot borrow the picker's transport. So each
-//! transport hands out a [`DirSource`] instead: a small, owned, `Send` handle
-//! carrying just enough to reach the same host again. Locally that is nothing
-//! at all; over ssh it is the host and the `ControlPath` of the master
-//! connection the transport already brought up, so the worker's shell is a new
-//! channel on an existing connection rather than a new connection.
+//! [`crate::transport::Transport`] is a `Box<dyn Transport>` held by the picker
+//! and is not `Send`. Completion runs on a worker thread (see
+//! [`crate::ui::complete`], which explains why), and a thread cannot borrow the
+//! picker's transport. So each transport hands out a [`DirSource`] instead: a
+//! small, owned, `Send` handle carrying just enough to reach the same host
+//! again. Locally that is nothing at all; over ssh it is the host and the
+//! `ControlPath` of the master connection the transport already brought up, so
+//! the worker's shell is a new channel on an existing connection rather than a
+//! new connection.
 //!
 //! The worker turns it into a [`Lister`]: the source plus a shell of its own on
 //! the host, kept across questions. Its own, rather than the transport's,
@@ -238,9 +240,7 @@ mod tests {
     /// sits in the checkout.
     #[test]
     fn the_local_source_lists_every_child_including_the_dotted_ones() {
-        let root =
-            std::env::temp_dir().join(format!("nvmux-dirs-{}-{}", std::process::id(), line!()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_support::scratch_path("dirs-listing");
         for name in ["alpha", "beta", "beta-two", ".hidden"] {
             std::fs::create_dir_all(root.join(name)).expect("make a directory");
         }
@@ -275,9 +275,7 @@ mod tests {
     /// bug in the framing between the host and here.
     #[test]
     fn odd_directory_names_survive_the_listing() {
-        let root =
-            std::env::temp_dir().join(format!("nvmux-dirs-{}-{}", std::process::id(), line!()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_support::scratch_path("dirs-odd");
         for name in ["a b", "c*d", "c?d", "cxd"] {
             std::fs::create_dir_all(root.join(name)).expect("make a directory");
         }
@@ -298,9 +296,7 @@ mod tests {
     /// error for the rest of the prompt's life.
     #[test]
     fn one_shell_serves_every_question_and_a_dead_one_is_replaced() {
-        let root =
-            std::env::temp_dir().join(format!("nvmux-dirs-{}-{}", std::process::id(), line!()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_support::scratch_path("dirs-oneshell");
         std::fs::create_dir_all(root.join("only")).expect("make a directory");
         let dir = root.to_string_lossy().into_owned();
 
@@ -314,14 +310,14 @@ mod tests {
 
         // The shell goes away while idle — an expired master, over ssh.
         unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while lister.shell.as_mut().expect("still held").is_alive() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the shell did not die"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        assert!(
+            crate::test_support::wait_until(std::time::Duration::from_secs(2), || !lister
+                .shell
+                .as_mut()
+                .expect("still held")
+                .is_alive()),
+            "the shell did not die"
+        );
 
         assert_eq!(lister.children(&dir).expect("list").names, ["only"]);
         assert_ne!(lister.shell.as_ref().expect("replaced").pid(), pid);
