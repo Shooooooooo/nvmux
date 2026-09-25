@@ -44,6 +44,10 @@ toml = { version = "1", default-features = false, features = [
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 unicode-width = "0.2.2"
+# The decoder `src/ledger.rs` reads a kept client's output with, for the few
+# terminal settings it would not send again. Already in the tree as `vt100`'s
+# own parser, at the same version, so it adds no crate to the build graph.
+vte = "0.15"
 # Keeps a shadow copy of an attached session's screen, so the outgoing session
 # can be dissolved cell by cell (see `src/shadow.rs`). The bytes reaching the
 # terminal are never touched; the parser only watches them go by. It brings

@@ -56,6 +56,19 @@
 //! carriage return (`OPOST` is off), and the cursor hidden while the cells are
 //! written, so it is not seen chasing them across the screen.
 //!
+//! # What a paint paints
+//!
+//! [`Shadow::paint`] is the one painter that is not a fade: the grid as the
+//! session drew it, every cell in the colours and attributes it was given —
+//! indexed colours as indices, the default as the default — with no palette
+//! and nothing interpolated. It is for a kept client coming back to the front
+//! with no fade to bring it (see `pty::Attachment::paint_kept_screen`): the
+//! screen is on the glass at once, and the server's own repaint — asked for
+//! with `:mode`, a few round trips away, or later if the server is busy —
+//! lands on top. The same rules as a frame: one synchronized
+//! update, an absolute placement per row and never a newline, the cursor put
+//! back where the session had it.
+//!
 //! # The cursor
 //!
 //! Hiding the cursor is a debt. The client's own frames pay it back — Neovim
@@ -320,6 +333,93 @@ impl Shadow {
         out
     }
 
+    /// The bytes that paint the whole screen back as the session drew it: see
+    /// the module docs. Every cell, with no diff and no palette. A retired
+    /// shadow paints no cells.
+    ///
+    /// It ends where the session's own last write did, which is where the
+    /// client believes the terminal to be: the cursor on the session's cell —
+    /// shown if it was, and placed there even if not — and the session's own
+    /// pen as the current one, rather than a reset. Neovim writes its next
+    /// change on that belief, with no placement and no colour of its own when
+    /// it thinks neither has moved, so a paint that left either anywhere else
+    /// would have that change land in the wrong place or the wrong colour.
+    ///
+    /// Short of the client's own rendering in whatever the parser does not
+    /// hold: of the attributes, it keeps bold or dim (one or the other),
+    /// italic, underline, inverse and the colours, and loses undercurl and the
+    /// other underline styles, underline colour, strikethrough, blink,
+    /// conceal and overline — which the server's repaint that follows puts
+    /// right.
+    pub fn paint(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(SYNC_BEGIN);
+        out.extend_from_slice(HIDE_CURSOR);
+        if !self.broken {
+            let screen = self.parser.screen();
+            let (rows, cols) = screen.size();
+            let mut pen: Option<Pen> = None;
+            for row in 0..rows {
+                let _ = write!(out, "\x1b[{};1H", row + 1);
+                let mut col = 0;
+                while col < cols {
+                    let cell = screen.cell(row, col);
+                    // The second half of a wide character is written by its
+                    // first; one on its own has nothing to write.
+                    if cell.is_some_and(vt100::Cell::is_wide_continuation) {
+                        col += 1;
+                        continue;
+                    }
+                    let this = Pen::of(cell);
+                    if pen != Some(this) {
+                        this.write(&mut out);
+                        pen = Some(this);
+                    }
+                    match cell {
+                        // A wide character the grid's last column cuts — one
+                        // a narrowing left behind — is blanked: written, it
+                        // would wrap, and on the last row scroll the screen.
+                        Some(c) if c.has_contents() && !(c.is_wide() && col + 2 > cols) => {
+                            out.extend_from_slice(c.contents().as_bytes());
+                            col += if c.is_wide() { 2 } else { 1 };
+                        }
+                        _ => {
+                            out.push(b' ');
+                            col += 1;
+                        }
+                    }
+                }
+            }
+        }
+        out.extend_from_slice(&self.hand_back());
+        if !self.broken && !self.parser.screen().hide_cursor() {
+            out.extend_from_slice(SHOW_CURSOR);
+        }
+        out.extend_from_slice(SYNC_END);
+        out
+    }
+
+    /// The bytes that leave the terminal where the session's own last write
+    /// left it, whatever nvmux has written since: the session's pen as the
+    /// current one, and the cursor on the session's cell — placed there even
+    /// if hidden, and neither shown nor hidden here. The tail of
+    /// [`Shadow::paint`], and what follows a fade in for a client that will
+    /// write again before its server repaints it (see `pty::relay`): Neovim
+    /// writes a change with no placement and no colour of its own when it
+    /// believes neither has moved. A retired shadow hands back a reset.
+    pub fn hand_back(&self) -> Vec<u8> {
+        let mut out = RESET_SGR.to_vec();
+        if self.broken {
+            return out;
+        }
+        let screen = self.parser.screen();
+        // A reset, and then the session's pen from there.
+        out.extend_from_slice(&screen.attributes_formatted());
+        let (row, col) = screen.cursor_position();
+        let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
+        out
+    }
+
     /// The bytes that cross-fade `over` with the session's screen under it:
     /// the overlay's own glyphs `t` of the way dissolved, and this shadow's
     /// cells — what the session drew there, and what the overlay is covering —
@@ -429,6 +529,87 @@ impl Shadow {
                 at = Some(col + width);
                 c += width;
             }
+        }
+    }
+}
+
+/// A cell's colours and attributes as the session gave them: what
+/// [`Shadow::paint`] writes, and compares to know when to write it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pen {
+    fg: vt100::Color,
+    bg: vt100::Color,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    inverse: bool,
+}
+
+impl Pen {
+    /// The cell's own, or the terminal's defaults for a cell past the grid.
+    fn of(cell: Option<&vt100::Cell>) -> Self {
+        match cell {
+            Some(c) => Pen {
+                fg: c.fgcolor(),
+                bg: c.bgcolor(),
+                bold: c.bold(),
+                dim: c.dim(),
+                italic: c.italic(),
+                underline: c.underline(),
+                inverse: c.inverse(),
+            },
+            None => Pen {
+                fg: vt100::Color::Default,
+                bg: vt100::Color::Default,
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                inverse: false,
+            },
+        }
+    }
+
+    /// One SGR that says all of it, from a reset — so a default colour is
+    /// whatever is not mentioned, and an indexed one is written as the index
+    /// it was, for the terminal's own palette to resolve.
+    fn write(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(b"\x1b[0");
+        for (on, code) in [
+            (self.bold, 1),
+            (self.dim, 2),
+            (self.italic, 3),
+            (self.underline, 4),
+            (self.inverse, 7),
+        ] {
+            if on {
+                let _ = write!(out, ";{code}");
+            }
+        }
+        write_colour(out, self.fg, 30, 90, 38);
+        write_colour(out, self.bg, 40, 100, 48);
+        out.push(b'm');
+    }
+}
+
+/// A colour as SGR parameters: the eight as `base + n`, the bright eight as
+/// `bright + n`, the rest of the 256 as `extended;5;n`, and a true colour as
+/// `extended;2;r;g;b`. Nothing for the default.
+fn write_colour(out: &mut Vec<u8>, colour: vt100::Color, base: u8, bright: u8, extended: u8) {
+    match colour {
+        vt100::Color::Default => {}
+        vt100::Color::Idx(n) if n < 8 => {
+            let _ = write!(out, ";{}", base + n);
+        }
+        vt100::Color::Idx(n) if n < 16 => {
+            let _ = write!(out, ";{}", bright + n - 8);
+        }
+        vt100::Color::Idx(n) => {
+            let _ = write!(out, ";{extended};5;{n}");
+        }
+        vt100::Color::Rgb(r, g, b) => {
+            let _ = write!(out, ";{extended};2;{r};{g};{b}");
         }
     }
 }
@@ -1203,5 +1384,132 @@ mod tests {
             s.resize(rows, cols);
             let _ = s.frame(0.5, &palette(), Cursor::Hidden);
         }
+    }
+
+    /// A paint is the screen back as it was drawn: fed to a terminal of the
+    /// same size, it leaves every cell as the session left it — glyph,
+    /// colours as given, and every attribute the parser holds — and the cursor
+    /// on the session's cell.
+    #[test]
+    fn a_paint_puts_every_cell_back_as_it_was_drawn() {
+        let mut s = Shadow::new(6, 30);
+        s.feed(
+            b"\x1b[1;1H\x1b[1;31mred bold\x1b[0m \x1b[3;4;38;5;208mitalic under\x1b[0m\
+              \x1b[2;3H\x1b[7;48;2;10;20;30mreversed\x1b[0m \x1b[92;104mbright\x1b[0m\
+              \x1b[4;1H\x1b[2mdim\x1b[0m \xe5\xad\x97\xe5\xad\x97 e\xcc\x81\
+              \x1b[5;7H",
+        );
+        let painted = s.paint();
+
+        let mut again = vt100::Parser::new(6, 30, 0);
+        again.process(&painted);
+        let (was, now) = (s.parser.screen(), again.screen());
+        // A cell never written and one written with a space look the same,
+        // and a paint writes every cell.
+        let seen = |c: &vt100::Cell| {
+            let glyph = if c.has_contents() { c.contents() } else { " " };
+            (glyph.to_string(), Pen::of(Some(c)), c.is_wide())
+        };
+        for row in 0..6 {
+            for col in 0..30 {
+                assert_eq!(
+                    was.cell(row, col).map(seen),
+                    now.cell(row, col).map(seen),
+                    "cell ({row}, {col}) came back different"
+                );
+            }
+        }
+        assert_eq!(
+            now.cursor_position(),
+            (4, 6),
+            "the cursor is not on its cell"
+        );
+        assert!(!now.hide_cursor(), "the cursor was left hidden");
+    }
+
+    /// And it leaves the terminal where the session's last write left it: the
+    /// session's pen current, and the cursor on its cell even when hidden —
+    /// the two things the client's next write takes for granted.
+    #[test]
+    fn a_paint_ends_with_the_sessions_pen_and_cursor() {
+        let mut s = Shadow::new(4, 20);
+        s.feed(b"\x1b[2;3Hsome text\x1b[?25l\x1b[3;7H\x1b[1;33;44m");
+        let mut again = vt100::Parser::new(4, 20, 0);
+        again.process(&s.paint());
+        let now = again.screen();
+        assert_eq!(
+            now.cursor_position(),
+            (2, 6),
+            "a hidden cursor is still placed"
+        );
+        assert!(now.hide_cursor(), "and still hidden");
+        assert!(now.bold(), "the session's pen was not handed back");
+        assert_eq!(now.fgcolor(), vt100::Color::Idx(3));
+        assert_eq!(now.bgcolor(), vt100::Color::Idx(4));
+    }
+
+    /// Colours go back as the session wrote them — an index as an index — so
+    /// the terminal's own palette resolves them, as it did the first time.
+    #[test]
+    fn a_paint_leaves_indexed_colours_to_the_terminal() {
+        let mut s = Shadow::new(2, 10);
+        s.feed(b"\x1b[33ma\x1b[93mb\x1b[38;5;200mc\x1b[44md");
+        let sgrs = sgrs(&s.paint());
+        assert!(sgrs.contains(&"0;33".to_string()), "{sgrs:?}");
+        assert!(sgrs.contains(&"0;93".to_string()), "{sgrs:?}");
+        assert!(sgrs.contains(&"0;38;5;200".to_string()), "{sgrs:?}");
+        assert!(sgrs.contains(&"0;38;5;200;44".to_string()), "{sgrs:?}");
+    }
+
+    /// The same rules a frame keeps: one synchronized update, a placement for
+    /// every row and never a newline or a carriage return (`OPOST` is off,
+    /// and a line feed on the last row would scroll the screen).
+    #[test]
+    fn a_paint_is_one_synchronized_update_with_no_newlines() {
+        let mut s = Shadow::new(4, 8);
+        s.feed(b"one\r\ntwo\r\nthree");
+        let painted = s.paint();
+        assert!(painted.starts_with(SYNC_BEGIN));
+        assert!(painted.ends_with(SYNC_END));
+        assert!(!painted.contains(&b'\n') && !painted.contains(&b'\r'));
+        let rows: Vec<usize> = placements(&painted).iter().map(|&(r, _)| r).collect();
+        assert_eq!(&rows[..4], &[1, 2, 3, 4], "every row is placed");
+    }
+
+    /// A wide character a narrowing left in the last column is blanked, not
+    /// written: it would wrap, and on the last row scroll the whole screen.
+    #[test]
+    fn a_wide_character_cut_by_the_last_column_is_blanked() {
+        let mut s = Shadow::new(4, 11);
+        s.feed("\x1b[1;1Hone\x1b[2;1Htwo\x1b[3;1Hthree\x1b[4;1Hlast row \u{5b57}".as_bytes());
+        s.resize(4, 10);
+        let mut again = vt100::Parser::new(4, 10, 0);
+        again.process(&s.paint());
+        let rows: Vec<String> = again
+            .screen()
+            .rows(0, 10)
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        assert_eq!(
+            rows,
+            ["one", "two", "three", "last row"],
+            "the screen scrolled"
+        );
+    }
+
+    /// A cursor the session hid stays hidden, and a retired shadow paints
+    /// nothing but the envelope.
+    #[test]
+    fn a_paint_keeps_a_hidden_cursor_hidden_and_a_retired_shadow_paints_nothing() {
+        let mut s = Shadow::new(4, 8);
+        s.feed(b"text\x1b[?25l");
+        let painted = s.paint();
+        assert!(!contains(&painted, SHOW_CURSOR), "{:?}", text(&painted));
+
+        s.broken = true;
+        assert_eq!(
+            s.paint(),
+            [SYNC_BEGIN, HIDE_CURSOR, RESET_SGR, SYNC_END].concat()
+        );
     }
 }

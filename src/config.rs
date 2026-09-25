@@ -47,6 +47,7 @@ use crate::error::ConfigError;
 pub struct Settings {
     pub keys: KeySettings,
     pub session: SessionSettings,
+    pub client: ClientSettings,
     pub fade: FadeSettings,
 }
 
@@ -72,6 +73,28 @@ pub struct SessionSettings {
     /// The command line, with `{sock}` standing in for the session's socket.
     /// Parsed by [`crate::launch::Launch`], which is also what rejects a bad one.
     pub command: String,
+}
+
+/// The local `nvim --remote-ui` client that draws a session (see [`crate::pty`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClientSettings {
+    /// Keep one client per session rather than one in all.
+    ///
+    /// Off, the client in front is the only one there is: a switch retires it
+    /// and starts another for the session switched to — a fork, a probe, and
+    /// a first paint the new client waits for its server to send. On, a client
+    /// that leaves the front is parked instead — read on a thread of its own,
+    /// still attached to its server — and a switch back to its session puts
+    /// the screen it last had straight back on the terminal and asks the
+    /// server for its own on top: no fork, no probe, and nothing to wait for
+    /// (see [`crate::pty::Parked`]).
+    ///
+    /// Off by default, because a parked client is still a UI of its session's
+    /// server: another UI on the same session — another nvmux, another
+    /// machine — shares its grid with it, at the smaller of the two sizes, and
+    /// every session visited keeps an idle client process until nvmux leaves.
+    pub per_session: bool,
 }
 
 /// The fade between screens (see [`crate::fade`]): each one dissolves into the
@@ -362,6 +385,7 @@ pub fn with_prefix(prefix: u8) -> Settings {
 fn render_default_config(prefix: u8) -> String {
     let k = KeySettings::default();
     let s = SessionSettings::default();
+    let c = ClientSettings::default();
     let f = FadeSettings::default();
     format!(
         "# nvmux configuration — created on first run.\n\
@@ -377,6 +401,12 @@ fn render_default_config(prefix: u8) -> String {
          # {{sock}} becomes the session's socket; it is what nvmux finds it by.\n\
          # command = {command:?}\n\
          \n\
+         [client]\n\
+         # One Neovim client per session, parked while another is in front, so a\n\
+         # switch back puts the screen back at once. Each is one more UI on its\n\
+         # session.\n\
+         # per_session = {per_session}\n\
+         \n\
          [fade]\n\
          # The dissolve between screens, and of the notice a switch puts up.\n\
          # NO_COLOR turns it off whatever this says.\n\
@@ -387,6 +417,7 @@ fn render_default_config(prefix: u8) -> String {
         prefix = crate::keys::prefix_label(prefix),
         timeout = k.timeout_ms,
         command = s.command,
+        per_session = c.per_session,
         fade_enabled = f.enabled,
         fade_duration = f.duration_ms,
         fade_session = f.session,
@@ -460,6 +491,8 @@ mod tests {
             timeout_ms = 1000\n\
             [session]\n\
             command = \"nvim --headless --listen {sock}\"\n\
+            [client]\n\
+            per_session = false\n\
             [fade]\n\
             enabled = true\n\
             duration_ms = 200\n\
@@ -512,6 +545,17 @@ mod tests {
         assert!(!s.fade.enabled);
     }
 
+    /// Off unless asked for: a parked client is a UI its session's other users
+    /// share a grid with, which nobody should get without having chosen it.
+    #[test]
+    fn one_client_per_session_is_off_unless_asked_for() {
+        assert!(!Settings::default().client.per_session);
+        let s: Settings = toml::from_str("[client]\nper_session = true\n").expect("valid");
+        assert!(s.client.per_session);
+        assert_eq!(s.fade, FadeSettings::default());
+        assert_eq!(s.session, SessionSettings::default());
+    }
+
     /// The one default that lives elsewhere, like the prefix: the prompt shows
     /// it before a config has necessarily been read.
     #[test]
@@ -551,6 +595,8 @@ mod tests {
             ("an unparseable prefix", "[keys]\nprefix = \"nope\"\n"),
             ("an unknown session key", "[session]\ncmd = \"nvim\"\n"),
             ("an unknown fade key", "[fade]\nduration = 40\n"),
+            ("an unknown client key", "[client]\nkeep = true\n"),
+            ("an unparseable client value", "[client]\nper_session = 1\n"),
             ("an unparseable fade value", "[fade]\nenabled = \"yes\"\n"),
         ] {
             assert!(
@@ -643,7 +689,9 @@ mod tests {
             "the template must document the command: {rendered:?}"
         );
         assert!(rendered.contains("\n[fade]\n"), "{rendered:?}");
+        assert!(rendered.contains("\n[client]\n"), "{rendered:?}");
         for line in [
+            "# per_session = false",
             "# enabled     = true",
             "# duration_ms = 200",
             "# session     = true",

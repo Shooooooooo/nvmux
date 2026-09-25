@@ -22,6 +22,12 @@
 //! again, and neither half can be shown to work anywhere but here: it needs a
 //! real client painting a real screen to cover, and the shadow's copy of that
 //! screen to put back.
+//!
+//! Nor are the last two. With `[client] per_session` a client is parked while
+//! something else has the front, and when it comes back nvmux paints the
+//! screen from its own copy of it and asks the server for its repaint on top —
+//! which only a real client on a real pty, and a real server made too busy to
+//! answer, can show.
 
 #[macro_use]
 mod common;
@@ -43,6 +49,19 @@ const CHILD_ID: &str = "NVMUX_TEST_RELAY_ID";
 /// and the fade on, and nothing here queries a real terminal, so the colours are
 /// handed to the child rather than asked for.
 const CHILD_PALETTE: &str = "NVMUX_TEST_RELAY_PALETTE";
+/// Set on a child that keeps its client (`[client] per_session`): where
+/// `<prefix> Space` would open the picker it parks the client instead, for
+/// [`PARKED_FOR`], and then takes it back and relays it again.
+const CHILD_KEEP: &str = "NVMUX_TEST_RELAY_KEEP";
+
+/// How long a keeping child leaves its client parked: long enough for the
+/// parent to have made the server busy before the client comes back.
+const PARKED_FOR: Duration = Duration::from_secs(1);
+
+/// What a keeping child writes once its client is parked, so the parent knows
+/// the relay has let go of the terminal: an OSC no terminal acts on, which
+/// the screen the tests read is none the worse for.
+const PARKED: &[u8] = b"\x1b]9999;parked\x07";
 
 /// The rows and columns of the pty every [`Terminal`] opens. Named because the
 /// hint bar's whole geometry is "the last row", and a test that asks what is on
@@ -60,6 +79,10 @@ const DA1: &[u8] = b"\x1b[c";
 const DA1_REPLY: &[u8] = b"\x1b[?62;22c";
 /// What the client sends to turn `modifyOtherKeys` on.
 const XTERM_PUSH: &[u8] = b"\x1b[>4;2m";
+/// The client asking whether the terminal reports its size in band (DEC mode
+/// 2048), and a terminal that does saying so — supported, and not yet set.
+const IN_BAND_QUERY: &[u8] = b"\x1b[?2048$p";
+const IN_BAND_REPLY: &[u8] = b"\x1b[?2048;2$y";
 
 /// The child half: attach to the session named in the environment and relay
 /// until the prefix machine ends it, then say how through the exit code.
@@ -78,6 +101,8 @@ fn relay_child() {
     // to clear the sequence wait, not to race this one.
     let mut settings = nvmux::config::with_prefix(nvmux::keys::PREFIX);
     settings.keys.timeout_ms = 10_000;
+    let keep = std::env::var_os(CHILD_KEEP).is_some();
+    settings.client.per_session = keep;
     nvmux::config::init(settings);
 
     // Without this the fade is off — `palette::get` is `None`, so `fade::enabled`
@@ -96,16 +121,32 @@ fn relay_child() {
     // An empty notice announces nothing: these tests are about the prefix
     // reaching the machine, and a box drawn over the screen would be noise in
     // the stream the parent is reading.
-    let attachment = nvmux::pty::spawn(&id, Path::new(&sock), "").expect("attach");
-    let code = match nvmux::pty::relay(attachment, 0, &mut |_| {}) {
-        Ok((nvmux::pty::Outcome::Detached, _)) => 0,
-        Ok((other, _)) => {
-            eprintln!("relay ended with {other:?}");
-            3
-        }
-        Err(e) => {
-            eprintln!("relay failed: {e}");
-            4
+    let mut pool = nvmux::pool::Pool::configured();
+    let mut attachment = nvmux::pty::spawn(&id, Path::new(&sock), "").expect("attach");
+    let code = loop {
+        match nvmux::pty::relay(attachment, 0, &mut |_| {}) {
+            Ok((nvmux::pty::Outcome::Detached, _)) => break 0,
+            // The picker's place, in a child that keeps its client: parked for
+            // as long as a picker might have been up, then taken back.
+            Ok((nvmux::pty::Outcome::ToPicker, held)) if keep => {
+                assert!(pool.set_aside(held).is_none(), "the client was not parked");
+                let mut out = std::io::stdout();
+                let _ = out.write_all(PARKED);
+                let _ = out.flush();
+                std::thread::sleep(PARKED_FOR);
+                attachment = match pool.take(&id) {
+                    nvmux::pool::Taken::Kept(back) => *back,
+                    other => panic!("the parked client did not come back: {other:?}"),
+                };
+            }
+            Ok((other, _)) => {
+                eprintln!("relay ended with {other:?}");
+                break 3;
+            }
+            Err(e) => {
+                eprintln!("relay failed: {e}");
+                break 4;
+            }
         }
     };
     std::process::exit(code);
@@ -123,6 +164,10 @@ enum Protocol {
 /// The terminal side of a relay running in a child process.
 struct Terminal {
     protocol: Protocol,
+    /// Whether this terminal claims in-band size reports (DEC mode 2048),
+    /// which a client then turns on and takes its size from instead of from
+    /// `SIGWINCH`.
+    in_band: bool,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     /// The exit code, once the child has been seen to exit; it must not be
     /// signalled or waited for again after that.
@@ -147,6 +192,23 @@ impl Terminal {
     /// [`Terminal::spawn`], with `shadow` asking the child for the palette that
     /// gives it a shadow of the session's screen (see [`CHILD_PALETTE`]).
     fn spawn_with(sock: &Path, id: &str, protocol: Protocol, shadow: bool) -> Self {
+        Self::spawn_child(sock, id, protocol, shadow, false, false)
+    }
+
+    /// A child that keeps its client (see [`CHILD_KEEP`]), on a terminal that
+    /// reports its size in band if `in_band`.
+    fn spawn_keeping(sock: &Path, id: &str, in_band: bool) -> Self {
+        Self::spawn_child(sock, id, Protocol::Kitty, false, true, in_band)
+    }
+
+    fn spawn_child(
+        sock: &Path,
+        id: &str,
+        protocol: Protocol,
+        shadow: bool,
+        keep: bool,
+        in_band: bool,
+    ) -> Self {
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize {
                 rows: ROWS,
@@ -175,6 +237,9 @@ impl Terminal {
         if shadow {
             cmd.env(CHILD_PALETTE, "1");
         }
+        if keep {
+            cmd.env(CHILD_KEEP, "1");
+        }
         let child = pair.slave.spawn_command(cmd).expect("spawn relay child");
         // Or the master would never see EOF once the child exits.
         drop(pair.slave);
@@ -198,6 +263,7 @@ impl Terminal {
 
         Self {
             protocol,
+            in_band,
             child,
             exited: None,
             writer,
@@ -238,8 +304,15 @@ impl Terminal {
     fn answer(&mut self) {
         let from = self.answered.saturating_sub(8);
         let mut replies = Vec::new();
-        for (query, reply) in [(KITTY_QUERY, KITTY_REPLY), (DA1, DA1_REPLY)] {
+        for (query, reply) in [
+            (KITTY_QUERY, KITTY_REPLY),
+            (DA1, DA1_REPLY),
+            (IN_BAND_QUERY, IN_BAND_REPLY),
+        ] {
             if query == KITTY_QUERY && self.protocol == Protocol::Xterm {
+                continue;
+            }
+            if query == IN_BAND_QUERY && !self.in_band {
                 continue;
             }
             let mut at = from;
@@ -535,4 +608,195 @@ fn a_prefix_raises_the_hint_row_and_the_next_key_takes_it_off() {
 #[test]
 fn the_hint_row_comes_down_through_the_server_without_a_shadow() {
     the_hint_row_goes_up_and_comes_down("hint-no-shadow", false);
+}
+
+/// What a resumed relay writes before anything of the client's: back onto the
+/// alternate screen, and cleared. After it, whatever is on the screen is what
+/// the client has drawn since.
+const RESUMED: &[u8] = b"\x1b[?1049h\x1b[2J";
+
+/// With `[client] per_session`, a client that comes back to the front has
+/// its screen put straight back from the copy kept while it was parked, the
+/// server's own repaint asked for on top of it, and — if the terminal changed
+/// size meanwhile — the new size told to it: by the pty, or by an in-band
+/// report for a client on a terminal that sends those (`in_band`: DEC mode
+/// 2048, which such a client takes its size from instead of from `SIGWINCH`,
+/// and which the reports sent while it was parked never reached).
+///
+/// Three returns. At the same size, where nothing but the server's repaint
+/// clears the screen — so the one that comes was asked for. After the
+/// terminal was made narrower, where the server has to end up at the new
+/// size. And with the server spinning in Lua for the whole of the wait,
+/// unable to answer a repaint or anything else, where the screen has to come
+/// back all the same: from the kept copy, which is what the user looks at
+/// until the server is free.
+fn a_kept_clients_screen_comes_back(tag: &str, in_band: bool) {
+    require_nvim!();
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(&common::unique(tag), &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    let marker = "kept, and painted straight back";
+    let mut rpc = nvmux::rpc::Client::connect(&sock, Duration::from_secs(3)).expect("connect");
+    // No swap file: two of these run at once, each with an unnamed buffer,
+    // and would otherwise race for the same one.
+    rpc.command(&format!(
+        "setlocal noswapfile | call setline(1, '{marker}')"
+    ))
+    .expect("setline");
+
+    let mut term = Terminal::spawn_keeping(&sock, &session.id, in_band);
+    // Painted, and — on a terminal that offers them — taking its size in
+    // band, which the client turns on once the terminal's answers are in.
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| {
+            row_on_screen(out, 0).contains(marker)
+                && (!in_band || find(out, b"\x1b[?2048h").is_some())
+        }),
+        "the session never painted; got: {}",
+        term.since(0)
+    );
+    assert_eq!(
+        find(&term.output, b"\x1b[?2048h").is_some(),
+        in_band,
+        "the client did not take up in-band size reports as the terminal offered them"
+    );
+
+    // Away to the picker's place — parked, in the child — and back, at the
+    // same size, until the output after the resume has cleared the screen.
+    let after = away_and_back(&mut term, |_| {});
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| {
+            find(&out[after.min(out.len())..], b"\x1b[2J").is_some()
+        }),
+        "no repaint came after the client came back; the child wrote: {}",
+        term.since(after)
+    );
+    assert!(
+        row_on_screen(&term.output, 0).contains(marker),
+        "the repainted screen is not the session's: {:?}",
+        row_on_screen(&term.output, 0)
+    );
+    // Its mouse reporting was put back from what it told the terminal —
+    // Neovim's default `'mouse'` turns on button tracking — after the resume
+    // took the screen.
+    assert!(
+        find(&term.output[after..], b"\x1b[?1002h").is_some(),
+        "the client's mouse reporting was not put back; the child wrote: {}",
+        term.since(after)
+    );
+
+    // Away again, the terminal made narrower while the client is parked, and
+    // back: the server has to be told the new size — through the pty for a
+    // client that listens to it, and, for one that takes its size in band and
+    // ignores the pty, only by the report nvmux writes it.
+    term.pump_until(Duration::from_millis(300), |_| false);
+    let narrower = COLS - 20;
+    away_and_back(&mut term, |term| {
+        term._master
+            .resize(PtySize {
+                rows: ROWS,
+                cols: narrower,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("resize the terminal");
+    });
+    let width = || {
+        nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
+            .and_then(|mut c| c.call("nvim_list_uis", vec![]))
+            .ok()
+            .and_then(|uis| {
+                let ui = uis.as_array()?.first()?.as_map()?.clone();
+                ui.iter()
+                    .find(|(k, _)| k.as_str() == Some("width"))
+                    .and_then(|(_, v)| v.as_u64())
+            })
+    };
+    assert!(
+        common::wait_until(Duration::from_secs(5), || width()
+            == Some(u64::from(narrower))),
+        "the server never took the new size: it is {:?} columns wide, not {narrower}",
+        width()
+    );
+
+    // Away again, and this time the server made too busy to answer anything
+    // for longer than the rest of this waits.
+    term.pump_until(Duration::from_millis(300), |_| false);
+    let mark = term.output.len();
+    term.type_bytes(&[nvmux::keys::PREFIX, b' ']);
+    // Written `4 > …` rather than `… < 4`: the input is key notation, where
+    // a `<` would start a key name and take the `<CR>` with it.
+    rpc.input(":lua local t = os.clock() while 4 > os.clock() - t do end<CR>")
+        .expect("make the server busy");
+    let came_back = term.pump_until(Duration::from_secs(3), |out| {
+        let since = &out[mark.min(out.len())..];
+        find(since, RESUMED).is_some() && row_on_screen(out, 0).contains(marker)
+    });
+    // Asked after the screen came back, so it says the server was busy then.
+    let busy = nvmux::rpc::Client::connect(&sock, Duration::from_millis(300))
+        .and_then(|mut c| c.get_mode())
+        .is_err();
+    assert!(
+        came_back,
+        "the kept client's screen did not come back; row 1 says {:?}, and the child wrote: {}",
+        row_on_screen(&term.output, 0),
+        term.since(mark)
+    );
+    assert!(
+        busy,
+        "the server answered while the screen came back, so this shows nothing about where \
+         it came from"
+    );
+
+    // And it is a live relay again: the prefix still detaches.
+    term.type_bytes(&[nvmux::keys::PREFIX]);
+    term.pump_until(Duration::from_millis(150), |_| false);
+    term.type_bytes(b"d");
+    assert_eq!(
+        term.exit_code(Duration::from_secs(10)),
+        Some(0),
+        "the resumed relay did not detach; the child wrote: {}",
+        term.since(mark)
+    );
+}
+
+/// `<prefix> Space` to a keeping child, `meanwhile` done once the child has
+/// parked its client, and the child's resume waited for. Returns where in the
+/// output the resumed relay's own bytes begin.
+fn away_and_back(term: &mut Terminal, meanwhile: impl FnOnce(&mut Terminal)) -> usize {
+    let mark = term.output.len();
+    term.type_bytes(&[nvmux::keys::PREFIX, b' ']);
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| {
+            find(&out[mark.min(out.len())..], PARKED).is_some()
+        }),
+        "the child never parked its client; it wrote: {}",
+        term.since(mark)
+    );
+    meanwhile(term);
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| {
+            find(&out[mark.min(out.len())..], RESUMED).is_some()
+        }),
+        "the parked client never came back; the child wrote: {}",
+        term.since(mark)
+    );
+    mark + find(&term.output[mark..], RESUMED).expect("resumed") + RESUMED.len()
+}
+
+/// A client that takes its size from the pty, and so is told a new one by
+/// the resize alone.
+#[test]
+fn a_kept_clients_screen_comes_back_through_the_pty() {
+    a_kept_clients_screen_comes_back("kept-pty", false);
+}
+
+/// A client that takes its size in band, and ignores the signal (kitty,
+/// ghostty, foot): told the new one with a report instead.
+#[test]
+fn a_kept_clients_screen_comes_back_on_an_in_band_terminal() {
+    a_kept_clients_screen_comes_back("kept-in-band", true);
 }

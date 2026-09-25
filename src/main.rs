@@ -5,7 +5,8 @@ use clap::Parser;
 
 use nvmux::cli::Cli;
 use nvmux::{
-    announce, config, fade, logging, nested, nvim, palette, paths, pty, reconnect, transport, ui,
+    announce, config, fade, logging, nested, nvim, palette, paths, pool, pty, reconnect, transport,
+    ui,
 };
 
 fn main() -> Result<()> {
@@ -96,23 +97,37 @@ fn establish_settings() -> Result<config::Settings> {
 ///
 /// The attachment is carried across iterations, so `<prefix> Space`, `<prefix> c` and
 /// `<prefix> ?` come back to the *same* client rather than starting a new one.
+///
+/// With `[client] per_session` every client that leaves the front is carried
+/// across in the [`pool::Pool`] instead — the one those three come back to, and
+/// the one of every other session visited — so a switch back to a session
+/// resumes its client rather than starting another.
 fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     let mut attached: Option<pty::Attachment> = None;
+    // Empty, and handing every client straight back, unless clients are kept
+    // one per session. Dropped on every way out of here, which retires what it
+    // holds.
+    let mut pool = pool::Pool::configured();
     let mut message: Option<String> = None;
     // The session the last trip through the picker led to, so the next one
     // opens with the cursor on it rather than on the first row.
     let mut focus: Option<String> = None;
+    // The session the last relay showed, so that a kept client coming back in
+    // place of another session's says where the user has landed, as a fresh
+    // client does.
+    let mut shown: Option<String> = None;
 
     loop {
         // `<prefix> c` moves this to the session it just created. A client held
-        // across the trip is what `Esc` goes back to; without one — the first
-        // screen, a failed attach, a session that exited — there is nothing
-        // behind the picker and `Esc` says so by doing nothing.
+        // across the trip — or parked, if clients are kept — is what `Esc` goes
+        // back to; without one — the first screen, a failed attach, a session
+        // that exited — there is nothing behind the picker and `Esc` says so by
+        // doing nothing.
         let (mut current, mut listing) = match ui::run(
             transport,
             message.take(),
             focus.as_deref(),
-            attached.is_some(),
+            attached.is_some() || focus.as_deref().is_some_and(|id| pool.holds(id)),
         )? {
             ui::Outcome::Quit => {
                 // A client held across `<prefix> Space` is retired explicitly; its
@@ -130,6 +145,8 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             }
             ui::Outcome::Attach { session, sessions } => (session, sessions),
         };
+        // A session the listing no longer has has nothing to come back to.
+        pool.keep_only(&listing);
         // Derived rather than carried: one fewer thing for the picker to keep
         // in step, and the listing it handed over is what it would be derived
         // from anyway.
@@ -153,6 +170,9 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             // to now is a client nobody asked for: dropping it retires it.
             let started = begun.take().filter(|b| b.session.id == current.id);
             let early = started.is_some();
+            // Whether the client is one kept for this session, resumed rather
+            // than started.
+            let mut warm = false;
             let opened = match attached.take() {
                 Some(a) if a.session_id == current.id => Ok(Some(a)),
                 // Retiring the old client leaves its server running: killing a
@@ -167,7 +187,8 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 // client's own restore sequence goes nowhere near the terminal.
                 Some(mut other) => {
                     other.hang_up();
-                    let spawned = attach(transport, &current, started);
+                    let spawned =
+                        resume_or_attach(transport, &mut pool, &current, started, &mut warm)?;
                     // Explicitly, rather than by falling out of the arm: this is
                     // the wait the hangup deferred, and leaving it to a binding's
                     // drop would let the next edit here re-serialise it without
@@ -176,25 +197,27 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     drop(other);
                     spawned
                 }
-                None => attach(transport, &current, started),
+                None => resume_or_attach(transport, &mut pool, &current, started, &mut warm)?,
             };
 
             tracing::debug!(
                 ms = t_open.elapsed().as_secs_f64() * 1000.0,
                 early,
+                warm,
                 "timing: retire + probe + spawn"
             );
 
             // A failed attach must not end the program: the user can only act
             // on it from the picker, with the reason on screen.
-            let attachment = match opened {
+            let mut attachment = match opened {
                 Ok(Some(a)) => a,
                 // Given up on: back to the picker, with the cursor on the
                 // session that was not answering and nothing on the hint row
                 // — the user knows what they did. No client is held: after a
-                // `<prefix>` switch the old one was hung up before the spawn,
-                // so `Esc` on the picker goes nowhere, as after a failed
-                // attach.
+                // `<prefix>` switch the old one was hung up before the spawn —
+                // or, kept one per session, parked, where Enter on its row
+                // resumes it — so `Esc` on the picker goes nowhere, as after
+                // a failed attach.
                 Ok(None) => {
                     tracing::info!(id = %current.id, "attach cancelled");
                     break;
@@ -205,6 +228,14 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     break;
                 }
             };
+            // A fresh client announces itself from the moment it is spawned. A
+            // kept one has only to say so when it is not the session the user
+            // was just looking at — back from the picker, or from `<prefix> c`
+            // cancelled, it is.
+            if warm && shown.as_deref() != Some(current.id.as_str()) {
+                attachment.announce_on_arrival(announce::label(&current.name));
+            }
+            shown = Some(current.id.clone());
 
             // The relay, with the chance to start the next client while this
             // session is still dissolving: `begin_next` fires on a `<prefix>`
@@ -230,6 +261,14 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     if session.id == current.id {
                         return;
                     }
+                    // Nor for one with a client kept for it, which has nothing
+                    // to start: the switch resumes that one. Nor for one whose
+                    // kept client has left, which may have left with the link:
+                    // the switch recovers that first, and a start here would
+                    // go over it before then (see `resume_or_attach`).
+                    if pool.has(&session.id) {
+                        return;
+                    }
                     match begin_attachment(transport, session) {
                         Ok(b) => begun = Some(b),
                         // Not reported: the path below attempts the same
@@ -246,7 +285,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             };
             match ended {
                 (pty::Outcome::ToPicker, held) => {
-                    attached = held;
+                    attached = pool.set_aside(held);
                     break;
                 }
                 // The session keeps running either way: on `<prefix> d`
@@ -288,7 +327,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 }
                 (pty::Outcome::CreateNew, held) => {
                     // Held rather than killed, so a cancelled prompt resumes it.
-                    attached = held;
+                    attached = pool.set_aside(held);
                     if let ui::prompt::Outcome::Created(session) = ui::prompt::run(transport)? {
                         // A new session can be numbered above anything the
                         // relay was told about, and the hint decides how long a
@@ -302,7 +341,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     continue;
                 }
                 (pty::Outcome::ShowHelp, held) => {
-                    attached = held;
+                    attached = pool.set_aside(held);
                     ui::help::run()?;
                     continue;
                 }
@@ -310,7 +349,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     // Held rather than killed, so a number that names nothing —
                     // or a cycle with nowhere to go — puts the user straight
                     // back where they were.
-                    attached = held;
+                    attached = pool.set_aside(held);
                     // Already resolved, and already started: the dissolve that
                     // has just finished ran over the top of its fork and its
                     // probe. Nothing left to look up.
@@ -362,6 +401,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                         match listed {
                             Ok(fresh) => {
                                 listing = fresh;
+                                pool.keep_only(&listing);
                                 highest = ui::highest_num(&listing);
                                 picked = pick(&listing, target, current.state.num).cloned();
                             }
@@ -372,8 +412,9 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                         }
                     }
                     match picked {
-                        // The loop above retires the old client and attaches the
-                        // new one; an unchanged id reuses the client as it is.
+                        // The loop above retires — or parks — the old client and
+                        // attaches the new one; an unchanged id reuses the
+                        // client as it is.
                         Some(session) => current = session,
                         None => tracing::debug!(?target, "nothing to switch to"),
                     }
@@ -388,6 +429,78 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
         focus = Some(current.id.clone());
     }
     Ok(())
+}
+
+/// The attachment to relay next, from the pool if it has one for the session
+/// — kept with `[client] per_session`, and resumed: no fork, no probe, since
+/// it is still attached to its server, and no first paint to wait for, since
+/// its last screen goes straight back on — and otherwise a fresh one (see
+/// [`attach`]). With clients not kept the pool is empty, and this is `attach`.
+///
+/// The outer `Result` is nvmux giving up on the link altogether; the inner one
+/// is an attach that failed, for the picker to say so. `warm` is set when the
+/// client is a kept one.
+fn resume_or_attach(
+    transport: &dyn transport::Transport,
+    pool: &mut pool::Pool,
+    session: &nvmux::session::Session,
+    begun: Option<Begun>,
+    warm: &mut bool,
+) -> Result<nvmux::Result<Option<pty::Attachment>>> {
+    Ok(match pool.take(&session.id) {
+        pool::Taken::Kept(kept) => {
+            *warm = true;
+            Ok(Some(*kept))
+        }
+        // One that left while parked may have left because the link it came
+        // over went — with every other parked client, while the user was in
+        // the picker. That is the front client's `ChildExited` found late,
+        // and it gets the same bounded recovery before the fresh attach goes
+        // over the link, whose own connect has no bound. (The early start a
+        // switch makes under its fade is skipped for such a session, for the
+        // same reason.)
+        pool::Taken::Left => {
+            recover_the_link(transport)?;
+            attach(transport, session, begun)
+        }
+        pool::Taken::Absent => attach(transport, session, begun),
+    })
+}
+
+/// Bring the link back, if it went, before a fresh attach replaces a parked
+/// client that left — the recovery a front client's exit gets, found late (see
+/// `session_loop`). Locally, and wherever the link is fine, this is nothing.
+///
+/// Gives up the way that one does, with nvmux's last words: the fresh
+/// attach's connect has no bound, and a link that failed seven times in a row
+/// is not one to wait on without saying so.
+///
+/// Unlike a front client's exit, nothing has undone the keyboard mode the last
+/// client left the terminal in, so it is undone here, before the first line
+/// that names Ctrl-C: with xterm's `modifyOtherKeys` still on, Ctrl-C reaches
+/// the tty as an escape sequence rather than as the byte that interrupts. A
+/// kept client coming back sets its own again (see `nvmux::ledger`).
+fn recover_the_link(transport: &dyn transport::Transport) -> Result<()> {
+    use std::io::Write;
+    let host = transport.location().to_string();
+    match reconnect::recover(
+        transport,
+        |retry| {
+            if retry.attempt == 1 {
+                let mut out = std::io::stdout();
+                let _ = out.write_all(b"\x1b[>4;0m");
+                let _ = out.flush();
+            }
+            eprintln!("{}", describe_retry(&host, retry));
+        },
+        std::thread::sleep,
+    ) {
+        reconnect::Verdict::Unneeded | reconnect::Verdict::Restored => Ok(()),
+        reconnect::Verdict::GaveUp(e) => {
+            tracing::warn!(%host, error = %e, "could not reconnect");
+            anyhow::bail!("{}", describe_reconnect_failure(&host, &e));
+        }
+    }
 }
 
 /// Explain why an attach failed, in terms of what actually went wrong.

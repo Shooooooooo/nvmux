@@ -572,6 +572,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width",
  "vt100",
+ "vte",
 ]
 
 [[package]]
