@@ -236,16 +236,32 @@ pub fn forwarded_sock(dir: &Path, host_token: &str, id: &str) -> Result<PathBuf,
     Ok(p)
 }
 
-/// The SSH `ControlPath` for a host.
+/// The SSH `ControlPath` for a host: the name every ssh command nvmux runs
+/// there finds the host's master connection by.
 ///
 /// Computed by us rather than left to ssh's `%C`/`%h%p%r` tokens, which expand
 /// to unpredictable lengths. ssh enforces its own limit and at least fails
 /// loudly (`ControlPath too long ('...' >= 108 bytes)`), but a path we choose is
 /// a path we can keep inside the budget.
+///
+/// A master binds a longer name than this one — [`master_socket`] — so that
+/// is the one checked.
 pub fn control_path(dir: &Path, host_token: &str) -> Result<PathBuf, PathError> {
     let p = dir.join(format!("cm-{host_token}"));
-    check_sock_path(&p)?;
+    check_sock_path(&master_socket(&p, &"x".repeat(crate::ids::ID_LEN)))?;
     Ok(p)
+}
+
+/// The socket one master connection binds, named for that master alone and
+/// then linked to the `ControlPath` — see `Ssh::ensure_master_within` for why
+/// a master must never bind the shared name itself.
+///
+/// `nonce` is what makes it that master's: a fresh one per master started.
+pub fn master_socket(control_path: &Path, nonce: &str) -> PathBuf {
+    let mut name = control_path.as_os_str().to_owned();
+    name.push(".");
+    name.push(nonce);
+    PathBuf::from(name)
 }
 
 /// nvmux's own log file. One per user, not per session.
@@ -373,12 +389,43 @@ mod tests {
             // The worst uid a 32-bit uid_t can produce.
             PathBuf::from("/tmp/nvmux-4294967295/6iger7ax-abcdefgh.sock"),
             PathBuf::from("/tmp/nvmux-4294967295/cm-6iger7ax"),
+            // A master's own socket, and the name ssh binds it under before
+            // linking it into place: `.` and sixteen random characters more.
+            master_socket(Path::new("/tmp/nvmux-4294967295/cm-6iger7ax"), "abcdefgh"),
+            PathBuf::from("/tmp/nvmux-4294967295/cm-6iger7ax.abcdefgh.0123456789abcdef"),
         ];
         for c in cases {
             let len = c.as_os_str().as_bytes().len();
             assert!(len <= MAX_SOCK_PATH, "{} is {len} bytes", c.display());
             check_sock_path(&c).expect("should be within budget");
         }
+    }
+
+    /// Every master for a host binds a name of its own, beside the
+    /// `ControlPath` it is then linked to.
+    #[test]
+    fn every_master_binds_a_name_of_its_own() {
+        let ctl = Path::new("/tmp/nvmux-501/cm-abcdefgh");
+        let a = master_socket(ctl, "aaaaaaaa");
+        assert_eq!(a, Path::new("/tmp/nvmux-501/cm-abcdefgh.aaaaaaaa"));
+        assert_ne!(a, master_socket(ctl, "bbbbbbbb"));
+        assert_eq!(a.parent(), ctl.parent());
+    }
+
+    /// The name a master binds is the longer of the two, so it is the one the
+    /// budget is held to: a `ControlPath` that would fit on its own is refused
+    /// when its masters' sockets would not.
+    #[test]
+    fn a_control_path_is_refused_when_its_masters_sockets_would_not_fit() {
+        let dir = PathBuf::from(format!("/tmp/{}", "a".repeat(80)));
+        assert!(
+            check_sock_path(&dir.join("cm-abcdefgh")).is_ok(),
+            "precondition: the ControlPath alone is within budget"
+        );
+        assert!(matches!(
+            control_path(&dir, "abcdefgh"),
+            Err(PathError::TooLong { .. })
+        ));
     }
 
     #[test]
