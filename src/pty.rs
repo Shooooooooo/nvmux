@@ -77,6 +77,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair};
 
 use crate::error::{NvmuxError, Result};
 use crate::keys::{Action, Prefix, Step, Wait};
+use crate::ledger::Ledger;
 use crate::term::write_stdout;
 use crate::{announce, boundary, fade, hint, rpc, shadow, term, winch};
 
@@ -179,6 +180,9 @@ pub struct Attachment {
     /// once it has. `spawn` runs exactly when the attached session changed —
     /// `session_loop` reuses the client otherwise — so this being `Some` *is*
     /// the "the session changed" test, with no flag threaded through anything.
+    /// A kept client coming back in place of another session's is the one
+    /// other change of session, and has it set again for that relay (see
+    /// [`Attachment::announce_on_arrival`]).
     announce: Option<String>,
     child: Box<dyn Child + Send + Sync>,
     master: Box<dyn MasterPty>,
@@ -194,6 +198,13 @@ pub struct Attachment {
     /// session can be dissolved in and out (see [`crate::shadow`]). `None`
     /// with the fade off or `fade.session` false, and then nothing is parsed.
     shadow: Option<shadow::Shadow>,
+    /// A kept client's copy of its screen, where there is no shadow to be one:
+    /// fed exactly as the shadow is, by [`Attachment::shadow_saw`], and used
+    /// for one thing only — to put the screen back the moment the client
+    /// returns to the front (see [`Attachment::paint_kept_screen`]), where
+    /// the shadow would have dissolved it in. `None` whenever there is a
+    /// shadow, or the client is not kept.
+    screen: Option<shadow::Shadow>,
     /// The first paint, while it is being kept back from the terminal so it
     /// can dissolve in. `None` once released, and always without a shadow.
     hold: Option<Hold>,
@@ -217,7 +228,38 @@ pub struct Attachment {
     /// session's bytes ran out mid-sequence, where it is held open rather
     /// than sawn through: see [`Attachment::close_span`].
     span: bool,
+    /// What the client has told its terminal that it would not tell it again
+    /// (see [`crate::ledger`]). `Some` exactly when clients are kept one per
+    /// session (`[client] per_session`), which makes it this client's mark of
+    /// being one: a kept client is parked rather than left unread, and comes
+    /// back to the front with what it told the terminal put back — see
+    /// [`Parked`] and [`Attachment::put_back_what_it_told`].
+    ledger: Option<Ledger>,
+    /// The terminal has answered this client's attributes request — the last
+    /// of the questions a client opens with, which a terminal answers in the
+    /// order they were asked. Until it has, the client is never parked (see
+    /// [`Attachment::is_parkable`]): cut off before its answers came, which a
+    /// switch typed within its first paint does, it would go without them —
+    /// no keyboard protocol, no synchronized updates, no in-band sizes — for
+    /// as long as it was kept, where a client replaced on the next switch, as
+    /// one not kept always is, simply asks again.
+    startup_answered: bool,
+    /// Its in-band size reports were just turned back on (see
+    /// [`Attachment::put_back_what_it_told`]), and the terminal's answer —
+    /// a report of the size it already has — is yet to be forwarded.
+    expecting_a_size_report: bool,
+    /// How many client exits had been relayed to the terminal when this one
+    /// was parked, against [`EXITS_RELAYED`] when it comes back: a difference
+    /// is some other client's exit sequence having turned off modes this one
+    /// set once and relies on (see [`crate::ledger::Ledger::put_back`]).
+    exits_seen: u64,
 }
+
+/// How many clients have had their exit sequences relayed to the terminal:
+/// the ones whose sessions ended while in front. Such a sequence turns off,
+/// for the whole terminal, modes every Neovim client sets once and relies on,
+/// which a kept client coming back afterwards must have put back.
+static EXITS_RELAYED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A session's first paint, held back from the terminal.
 ///
@@ -269,6 +311,9 @@ const HOLD_MAX: usize = 1 << 20;
 /// The alternate-screen entry a client sends before it draws. The one
 /// sequence a hold looks for, as a fixed string like the DA1 request below.
 const ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
+
+/// And its exit, which a parked client sends only on its way out.
+const ALT_SCREEN_LEAVE: &[u8] = b"\x1b[?1049l";
 
 impl Hold {
     fn new(now: Instant) -> Self {
@@ -359,6 +404,30 @@ const DA1_REQUEST: &[u8] = b"\x1b[c";
 /// client asks at shutdown only to learn that its terminal has worked through
 /// everything it sent, so the arrival is the whole of the message.
 const DA1_REPLY: &[u8] = b"\x1b[?1;2c";
+
+/// The longest a kept client being resumed is given to finish a frame it
+/// was caught in the middle of (see `Attachment::drain_unrelayed`). A frame
+/// is written in one go, so the rest is microseconds behind; this is only the
+/// bound on a client that stopped half way through one for some other reason.
+const FRAME_WAIT: Duration = Duration::from_millis(50);
+
+/// The most a resume reads of a kept client's backlog before handing the rest
+/// to the relay, once it has a whole frame: a parked client is read all the
+/// while it is parked, so anything more than a few frames is a client that is
+/// still writing, not one that is behind.
+const DRAIN_MAX: usize = 64 * 1024;
+
+/// The report a terminal with in-band resize reports on (DEC mode 2048)
+/// sends when its size changes: `CSI 48 ; rows ; cols ; height ; width t`,
+/// the last two in pixels, which a terminal that does not know them reports as
+/// zero — as `PtySize` does.
+fn in_band_size_report(size: PtySize) -> Vec<u8> {
+    format!(
+        "\x1b[48;{};{};{};{}t",
+        size.rows, size.cols, size.pixel_height, size.pixel_width
+    )
+    .into_bytes()
+}
 
 impl Attachment {
     /// Say on the notice that the session is waiting for a key.
@@ -500,6 +569,211 @@ impl Attachment {
         if let Some(shadow) = self.shadow.as_mut() {
             shadow.feed(bytes);
         }
+        if let Some(screen) = self.screen.as_mut() {
+            screen.feed(bytes);
+        }
+    }
+
+    /// Let the ledger see what the client wrote — every byte of it, once,
+    /// whichever way it went: relayed, held as a first paint, or read while
+    /// parked.
+    fn ledger_saw(&mut self, bytes: &[u8]) {
+        if let Some(ledger) = self.ledger.as_mut() {
+            ledger.saw(bytes);
+        }
+    }
+
+    /// Note what the user's terminal sends the client, for the two things a
+    /// kept client needs to know of it: that its opening questions have been
+    /// answered (see [`Attachment::startup_answered`]), and that the size
+    /// report a resume set off has gone through. True for the second, which
+    /// wants the server's repaint asked for again: the client answers the
+    /// report by asking its server to resize, and a server in `input()` or
+    /// `getchar()` answers that with a clear and next to nothing else — which
+    /// must not be the last word, if the `:mode` asked on the resume got in
+    /// first.
+    fn saw_input(&mut self, step: &Step) -> bool {
+        if self.ledger.is_none() {
+            return false;
+        }
+        let Step::Forward(bytes) = step else {
+            return false;
+        };
+        if !self.startup_answered && answers_device_attributes(bytes) {
+            self.startup_answered = true;
+        }
+        if self.expecting_a_size_report && reports_size_in_band(bytes) {
+            self.expecting_a_size_report = false;
+            return true;
+        }
+        false
+    }
+
+    /// Whether this client is kept one per session (`[client] per_session`):
+    /// parked rather than left unread, and resumed with its screen painted
+    /// straight back.
+    pub fn is_kept(&self) -> bool {
+        self.ledger.is_some()
+    }
+
+    /// Whether this client may be parked: kept, and past the handshake a
+    /// client opens with (see [`Attachment::startup_answered`]).
+    pub fn is_parkable(&self) -> bool {
+        self.is_kept() && self.startup_answered
+    }
+
+    /// Say on the next relay which session this is, as a fresh client does:
+    /// `label` is what [`announce::label`] made of the session's name, the one
+    /// place a name is made safe to reach a raw terminal.
+    ///
+    /// For a kept client coming back to the front in place of another
+    /// session's: that is as much a change of session as a spawn, and the
+    /// label is the session's name as it is now, which a rename since the
+    /// client started may have changed.
+    pub fn announce_on_arrival(&mut self, label: String) {
+        self.announce = Some(label);
+    }
+
+    /// Read whatever the client has written since anything last did, and show
+    /// it to the shadow and the ledger rather than to the terminal.
+    ///
+    /// For a kept client being resumed, in place of [`discard_pending`]: those
+    /// bytes describe the screen the client believes the terminal has — which
+    /// is the one about to be painted back — and any word it said in them
+    /// about the mouse or the title is one it will not say again.
+    ///
+    /// And a client caught half way through a frame is let finish it here,
+    /// for up to [`FRAME_WAIT`]: the half already read went to the shadow,
+    /// not the terminal, so relaying the other half would hand the terminal
+    /// the tail of a sequence whose head it never saw — printed as text until
+    /// the repaint clears it. Only a client that was busy while parked — a
+    /// `:terminal` running something — is ever caught like that, and Neovim
+    /// writes a frame in one go, so the rest is already on its way.
+    ///
+    /// Bounded either way, by [`FRAME_WAIT`] and [`DRAIN_MAX`]: a client
+    /// parked with a `:terminal` running something never runs out of things
+    /// to say, and what it says after this is the relay's.
+    fn drain_unrelayed(&mut self) {
+        let Some(fd) = self.master.as_raw_fd() else {
+            return;
+        };
+        let mut buf = [0u8; 8192];
+        let deadline = Instant::now() + FRAME_WAIT;
+        let mut taken = 0usize;
+        loop {
+            let mid_frame = self.ledger.as_ref().is_some_and(|l| !l.between_frames());
+            let now = Instant::now();
+            if now >= deadline || (!mid_frame && taken >= DRAIN_MAX) {
+                return;
+            }
+            let wait = if mid_frame {
+                deadline - now
+            } else {
+                Duration::ZERO
+            };
+            let wait_ms = wait.as_micros().div_ceil(1000) as libc::c_int;
+            let mut p = [pollfd(fd)];
+            let n = unsafe { libc::poll(p.as_mut_ptr(), 1, wait_ms) };
+            // The relay's `SIGWINCH` handler is in by now, and a resize during
+            // the wait is no reason to hand over half a frame.
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if n <= 0 || !ready(&p[0]) {
+                return;
+            }
+            match read_fd(fd, &mut buf) {
+                Ok(len) if len > 0 => {
+                    self.saw_unrelayed(&buf[..len]);
+                    taken += len;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                _ => return,
+            }
+        }
+    }
+
+    /// What a client wrote that did not reach the terminal, and never will:
+    /// the shadow and the ledger keep up with it all the same, so the one
+    /// knows the screen the client will repaint and the other what it told
+    /// the terminal on the way.
+    fn saw_unrelayed(&mut self, bytes: &[u8]) {
+        self.shadow_saw(bytes);
+        self.ledger_saw(bytes);
+    }
+
+    /// Put back what the client told the terminal and would not tell it
+    /// again, before it draws on it: its mouse reporting, its title, its
+    /// keyboard protocol and its cursor's shape and colour — and, if another
+    /// client's exit
+    /// has reached the terminal since this one was parked, the modes that
+    /// exit turned off (see [`crate::ledger::Ledger::put_back`]).
+    ///
+    /// For a kept client's return, where it is exact — the ledger holds what
+    /// the client itself last wrote. A client that is not kept has its
+    /// server asked about the mouse instead, and the rest left alone (see
+    /// [`repaint_through_server`]).
+    fn put_back_what_it_told(&mut self) {
+        let Some(ledger) = self.ledger.as_ref().filter(|l| l.is_usable()) else {
+            return;
+        };
+        term::set_mouse_reporting(ledger.mouse());
+        let after_an_exit =
+            EXITS_RELAYED.load(std::sync::atomic::Ordering::Relaxed) != self.exits_seen;
+        self.expecting_a_size_report = ledger.puts_back_in_band_reports(after_an_exit);
+        if let Err(e) = write_stdout(&ledger.put_back(after_an_exit)) {
+            tracing::debug!(error = %e, "could not put the client's settings back");
+        }
+    }
+
+    /// Tell a kept client coming back to the front the size the terminal
+    /// has now, if it changed while the client was parked.
+    ///
+    /// Usually the pty is enough: `resize_to` gives it the new size and the
+    /// kernel signals the client. Not for a client that has turned in-band
+    /// resize reports on (DEC mode 2048: kitty, ghostty, foot) — it takes its
+    /// size from those and ignores `SIGWINCH` altogether, and the reports the
+    /// terminal sent while it was parked went to whatever was in front. So it
+    /// is sent the report the terminal would have sent, written to its input
+    /// in one write. Measured on 0.11.0 and 0.12.5: taken as a size, never as
+    /// keys, by a client that turned the mode on — the ledger says which kind
+    /// of client this is, from its own output.
+    ///
+    /// Only for a size that changed. The repaint is asked of the server with
+    /// `:mode` all the same (see [`relay`]): a client told its size asks its
+    /// server to resize, and a server answers a resize to the size it already
+    /// has with a clear and — in `input()` or `getchar()` — nothing but the
+    /// prompt's row, where `:mode` draws every row.
+    fn tell_its_size(&mut self, size: PtySize, resized: bool) {
+        if resized && self.ledger.as_ref().is_some_and(Ledger::reads_size_in_band) {
+            self.report_size_in_band(size);
+        }
+    }
+
+    /// Write an in-band size report into the client's input — `CSI 48 ; rows
+    /// ; cols ; height px ; width px t`, what a terminal with DEC mode 2048
+    /// sends on a resize — and say whether it went out whole.
+    ///
+    /// Only to a client that turned the mode on, which is one that reads this
+    /// as a report and not as keys. One `write` and never a `write_all`, for
+    /// the reason [`Attachment::answer_device_attributes`] gives: a report in
+    /// pieces *would* be read as keys, and a report that did not fit is
+    /// better not sent.
+    fn report_size_in_band(&mut self, size: PtySize) -> bool {
+        let Some(fd) = self.master.as_raw_fd() else {
+            return false;
+        };
+        if !writable(fd) {
+            tracing::debug!("the client's input queue is full; not reporting its size");
+            return false;
+        }
+        let report = in_band_size_report(size);
+        let n = unsafe { libc::write(fd, report.as_ptr().cast(), report.len()) };
+        if n != report.len() as isize {
+            tracing::debug!(wrote = n, "the in-band size report went out short");
+            return false;
+        }
+        true
     }
 
     /// Show the terminal what the client wrote — or, while its first paint is
@@ -512,6 +786,7 @@ impl Attachment {
     /// what lets the notice go back up after *every* write rather than after
     /// the one read in six that happens to end where a sequence does.
     fn relay_output(&mut self, chunk: &[u8], now: Instant) -> std::io::Result<()> {
+        self.ledger_saw(chunk);
         if let Some(hold) = self.hold.as_mut() {
             hold.take(chunk, now);
             if let Some(shadow) = self.shadow.as_mut() {
@@ -787,6 +1062,46 @@ impl Attachment {
         if let Some(shadow) = self.shadow.as_mut() {
             shadow.resize(size.rows, size.cols);
         }
+        if let Some(screen) = self.screen.as_mut() {
+            screen.resize(size.rows, size.cols);
+        }
+    }
+
+    /// Leave the terminal's pen and cursor where the client's own last write
+    /// left them, after a fade in that did not: see
+    /// [`shadow::Shadow::hand_back`].
+    fn hand_back_the_pen(&self) {
+        let Some(shadow) = self.shadow.as_ref().filter(|s| s.is_usable()) else {
+            return;
+        };
+        if let Err(e) = write_stdout(&shadow.hand_back()) {
+            tracing::debug!(error = %e, "could not hand the client's pen back");
+        }
+    }
+
+    /// Put a kept client's screen back on the terminal at once, from its copy
+    /// of it, where there is no fade to dissolve it in. Says whether it did;
+    /// if not, the terminal is as the hand-off left it.
+    ///
+    /// What comes back is the screen as the client last drew it — kept
+    /// current while it was parked — in the colours and attributes it drew it
+    /// in (see [`shadow::Shadow::paint`]). The server's own repaint, asked for
+    /// next, lands on top of it a few round trips later; until then, and for
+    /// as long as a busy server or a prompt waiting for a key holds that
+    /// repaint up, the user is looking at the session rather than at a blank
+    /// screen.
+    fn paint_kept_screen(&mut self) -> bool {
+        let Some(screen) = self
+            .screen
+            .as_ref()
+            .filter(|s| s.is_usable() && s.has_contents())
+        else {
+            return false;
+        };
+        if let Err(e) = write_stdout(&screen.paint()) {
+            tracing::debug!(error = %e, "could not paint the kept screen back");
+        }
+        true
     }
 
     /// Wait for the client to be gone, escalating to SIGKILL after
@@ -984,6 +1299,328 @@ impl Drop for Attachment {
     fn drop(&mut self) {
         self.hang_up();
         self.reap();
+    }
+}
+
+impl Attachment {
+    /// Put a kept client aside while something else has the front: see
+    /// [`Parked`]. `None` if it could not be parked — no stop channel or no
+    /// thread to be had for it — in which case it has been retired and the
+    /// next attach to its session is a fresh one.
+    pub fn park(mut self) -> Option<Parked> {
+        self.exits_seen = EXITS_RELAYED.load(std::sync::atomic::Ordering::Relaxed);
+        let session_id = self.session_id.clone();
+        let (stop, stopped) = match UnixStream::pair() {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not park a client; retiring it");
+                return None;
+            }
+        };
+        let thread = std::thread::Builder::new()
+            .name("nvmux-parked".into())
+            .spawn(move || keep_parked(self, stopped));
+        match thread {
+            Ok(thread) => Some(Parked {
+                session_id,
+                stop: Some(stop),
+                thread: Some(thread),
+            }),
+            // The closure, and the client in it, went with the failed spawn:
+            // dropped, so hung up and reaped.
+            Err(e) => {
+                tracing::warn!(error = %e, "could not park a client; retired it");
+                None
+            }
+        }
+    }
+}
+
+/// A kept client that is not in front, on a thread of its own until it is
+/// wanted back.
+///
+/// With `[client] per_session` a client that leaves the front — for the
+/// picker, the prompt, the help, or another session — is not retired and not
+/// left unread. It stays attached to its server, which goes on sending it the
+/// session's screen; and something has to read what it writes meanwhile, or
+/// it stops at the pty's buffer while its server keeps every frame for it in
+/// memory, to be played back, stale, when it is next read.
+///
+/// That something is a thread that owns the whole [`Attachment`]. Owns, and
+/// not borrows, because ownership is what makes it true that one reader, and
+/// only one, is on a pty at any time — the rule [`relay`] is built on: the
+/// relay cannot have the master back until the thread has handed it over,
+/// which it does by ending. What it reads goes to the shadow (or the kept
+/// screen) and the ledger, never to the terminal — so that, wanted back, the
+/// screen it last had can go straight onto the terminal.
+///
+/// A client that leaves while parked — its session killed from the picker,
+/// quit from another UI, its ssh link gone — is retired on the thread and
+/// not handed back. Nothing else would notice: no transport call reports it.
+pub struct Parked {
+    session_id: String,
+    /// Dropped to stop the thread: the far end then reads as hung up.
+    stop: Option<UnixStream>,
+    /// `Some` until joined. What it returns is the client, or `None` for one
+    /// that left.
+    thread: Option<std::thread::JoinHandle<Option<Attachment>>>,
+}
+
+impl std::fmt::Debug for Parked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Parked")
+            .field("session_id", &self.session_id)
+            .field("alive", &self.is_alive())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Parked {
+    /// Which session this client is attached to.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Whether the client is still there to be had back. The thread ends only
+    /// when told to or when the client has left, and only one of those can
+    /// have happened to a `Parked` nobody has taken back yet.
+    pub fn is_alive(&self) -> bool {
+        self.thread.as_ref().is_some_and(|t| !t.is_finished())
+    }
+
+    /// Have the client back, ready to be resumed — or `None` if it left while
+    /// parked. The thread notices at once — it is in a `poll` on the other end
+    /// of `stop` — unless it is already retiring a client that was leaving,
+    /// which is its business and not worth waiting on: past [`UNPARK_WAIT`]
+    /// this gives up on it, and the thread finishes the retirement on its own.
+    pub fn unpark(mut self) -> Option<Attachment> {
+        drop(self.stop.take());
+        let attachment = self.join_within(UNPARK_WAIT)?;
+        // One that left in the moment before it was asked back — its session
+        // killed, its link gone — before the thread saw it go: the pty says
+        // so at once, and so does its pid. Handed back, it would put a dead
+        // session's last screen up only to lose it a moment later.
+        let hung_up = attachment.master.as_raw_fd().is_some_and(|fd| {
+            let mut p = [pollfd(fd)];
+            let n = unsafe { libc::poll(p.as_mut_ptr(), 1, 0) };
+            n > 0 && p[0].revents & (libc::POLLHUP | libc::POLLERR) != 0
+        });
+        let exited = attachment
+            .child
+            .process_id()
+            .is_some_and(|pid| peek_child(nix::unistd::Pid::from_raw(pid as i32)) == Peek::Gone);
+        if hung_up || exited {
+            tracing::debug!(id = %self.session_id, "a parked client left as it was asked back");
+            return None;
+        }
+        Some(attachment)
+    }
+
+    /// Tell the thread to retire its client — hang it up and reap it, on the
+    /// thread — and do not wait for it. Dropping the `Parked` then waits a
+    /// little (see its `Drop`); telling several first is what lets them go
+    /// side by side.
+    pub fn tell_to_retire(&mut self) {
+        if let Some(stop) = self.stop.as_mut() {
+            let _ = stop.write_all(b"R");
+        }
+    }
+
+    /// The thread's answer, if it gives one within `wait`. A thread that does
+    /// not is left to finish by itself: what it holds is its own to drop.
+    fn join_within(&mut self, wait: Duration) -> Option<Attachment> {
+        let thread = self.thread.take()?;
+        let deadline = Instant::now() + wait;
+        while !thread.is_finished() {
+            if Instant::now() >= deadline {
+                tracing::debug!(id = %self.session_id, "a parked client's thread is still busy");
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // A panic on the thread dropped the client on its way out, and a
+        // dropped client is a retired one.
+        thread.join().ok().flatten()
+    }
+}
+
+/// How long a switch waits for a parked client's thread to hand it back.
+/// Instant for a thread in its `poll`; this bounds only one caught retiring a
+/// client that was on its way out, which the switch then treats as gone.
+const UNPARK_WAIT: Duration = Duration::from_millis(50);
+
+/// How long letting go of a parked client waits for its thread to have
+/// retired it. A client that goes quietly takes about 10 ms.
+const RETIRE_WAIT: Duration = Duration::from_millis(100);
+
+/// Dropping one retires the client — hung up and reaped on its own thread, as
+/// any `Attachment` is on its way out — and waits [`RETIRE_WAIT`] at most for
+/// that. Told first, then waited for, so that a pool letting go of several
+/// can tell them all before waiting on any (see [`crate::pool::Pool`]).
+impl Drop for Parked {
+    fn drop(&mut self) {
+        self.tell_to_retire();
+        drop(self.stop.take());
+        drop(self.join_within(RETIRE_WAIT));
+    }
+}
+
+/// The parked client's thread: read what the client writes until told to
+/// stop, and hand the client back — or retire it, if told to or if it is
+/// leaving anyway.
+///
+/// What it reads goes to the shadow and the ledger (see
+/// [`Attachment::saw_unrelayed`]). Never a byte to stdout, which belongs to
+/// whatever is in front, and never a write to the client — with one
+/// exception, on its way out.
+///
+/// **A parked client that asks for its terminal's attributes, or leaves the
+/// alternate screen, is finishing.** Healthy, it does neither: they are the
+/// ends of Neovim's exit sequence — and of its `suspend`, which any other UI
+/// on the session can set off with `Ctrl-Z` and which reaches every client
+/// attached. Unanswered, such a client waits for a reply forever and never
+/// repaints again; answered and left running, it starts over against a
+/// terminal that answers nothing else, and comes back without its keyboard
+/// protocol, its synchronized updates or its in-band sizes for the rest of
+/// its life. So it is retired instead: hung up first — so that a client that
+/// was suspending finds its hangup already waiting — then answered, which is
+/// what lets it go in milliseconds rather than a second, and reaped. The
+/// session's next visit is a fresh client. Measured on 0.11.0 and 0.12.5.
+///
+/// A client found stopped is retired likewise, and one that has exited is
+/// let go. Only ever with [`peek_child`], which changes nothing:
+/// [`check_child`] consumes a stop, and a pid is only this thread's to wait
+/// for.
+fn keep_parked(mut attachment: Attachment, stop: UnixStream) -> Option<Attachment> {
+    let id = attachment.session_id.clone();
+    let mut buf = [0u8; 8192];
+    loop {
+        let master = attachment.master.as_raw_fd();
+        let mut fds = [pollfd(stop.as_raw_fd()), pollfd(master.unwrap_or(-1))];
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, IDLE_POLL_MS) };
+        if n < 0 {
+            // A `SIGWINCH` meant for the relay can land on this thread.
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            tracing::warn!(%id, "a parked client could not be watched; retiring it");
+            return None;
+        }
+        // The client first: whatever it has said is read before the thread
+        // lets go of it, and a client that has gone is not handed back.
+        if let Some(master) = master.filter(|_| n > 0 && ready(&fds[1])) {
+            match read_fd(master, &mut buf) {
+                Ok(len) if len > 0 => {
+                    let chunk = &buf[..len];
+                    attachment.saw_unrelayed(chunk);
+                    if asks_for_device_attributes(chunk) || leaves_alt_screen(chunk) {
+                        tracing::debug!(%id, "a parked client is finishing; retiring it");
+                        attachment.hang_up();
+                        attachment.answer_device_attributes();
+                        return None;
+                    }
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                // EOF on macOS, EIO on Linux: the client has gone.
+                _ => {
+                    tracing::debug!(%id, "a parked client left");
+                    return None;
+                }
+            }
+        }
+        if n > 0 && ready(&fds[0]) {
+            // A byte is an order to retire the client; the end of the stream
+            // is the client wanted back.
+            let mut order = [0u8; 1];
+            return match read_fd(stop.as_raw_fd(), &mut order) {
+                Ok(1) => None,
+                _ => Some(attachment),
+            };
+        }
+        if n == 0 {
+            if let Some(pid) = attachment.child.process_id() {
+                match peek_child(nix::unistd::Pid::from_raw(pid as i32)) {
+                    Peek::Running => {}
+                    Peek::Stopped => {
+                        tracing::debug!(%id, "a parked client stopped; retiring it");
+                        return None;
+                    }
+                    Peek::Gone => {
+                        tracing::debug!(%id, "a parked client exited");
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Whether this chunk of a client's output leaves the alternate screen: the
+/// other half, with a DA1 request, of what a finishing client writes (see
+/// [`keep_parked`]). Written in one flush with the rest of the exit sequence,
+/// so, like the DA1 request, it arrives whole.
+fn leaves_alt_screen(chunk: &[u8]) -> bool {
+    chunk
+        .windows(ALT_SCREEN_LEAVE.len())
+        .any(|w| w == ALT_SCREEN_LEAVE)
+}
+
+/// A stand-in kept client for the tests of what holds clients (see
+/// [`crate::pool`]): `sh -c script` on a real pty, as the tests here use,
+/// attached to nothing, with a ledger and no screen of its own.
+#[cfg(test)]
+pub(crate) fn kept_standin(session_id: &str, script: &str) -> Attachment {
+    let mut cmd = CommandBuilder::new("sh");
+    cmd.arg("-c");
+    cmd.arg(script);
+    let mut a = spawn_client_with(
+        session_id,
+        Path::new("/nvmux-test-never-read.sock"),
+        "",
+        cmd,
+    )
+    .expect("spawn sh");
+    a.announce = None;
+    a.shadow = None;
+    a.screen = None;
+    a.ledger = Some(Ledger::new());
+    a.startup_answered = true;
+    a
+}
+
+#[cfg(test)]
+impl Attachment {
+    /// The stand-in's pid, for a test asking what became of the process.
+    pub(crate) fn pid_for_test(&self) -> i32 {
+        self.child.process_id().expect("a spawned child has a pid") as i32
+    }
+
+    /// As if its terminal had not yet answered its opening questions.
+    pub(crate) fn cut_short_for_test(&mut self) {
+        self.startup_answered = false;
+    }
+
+    /// Wait for a stand-in whose script prints `r` once its traps are set,
+    /// so that a signal sent next meets them rather than the shell's own
+    /// startup disposition. Says whether it came.
+    pub(crate) fn ready_for_test(&self) -> bool {
+        let Some(fd) = self.master.as_raw_fd() else {
+            return false;
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut buf = [0u8; 256];
+        while Instant::now() < deadline {
+            let mut p = [pollfd(fd)];
+            unsafe { libc::poll(p.as_mut_ptr(), 1, 50) };
+            if ready(&p[0]) && read_fd(fd, &mut buf).is_ok_and(|n| buf[..n].contains(&b'r')) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -1422,6 +2059,10 @@ fn spawn_client_with(
         .take_writer()
         .map_err(|e| NvmuxError::Io(std::io::Error::other(e.to_string())))?;
 
+    let fades = fade::enabled() && fade::session();
+    let shadow = fades.then(|| shadow::Shadow::new(size.rows, size.cols));
+    let kept = crate::config::get().client.per_session;
+
     Ok(Attachment {
         session_id: session_id.to_string(),
         sock: sock.to_path_buf(),
@@ -1433,12 +2074,18 @@ fn spawn_client_with(
         reaped: false,
         // Only when it will be used: a shadow costs a parse of everything the
         // client writes.
-        shadow: (fade::enabled() && fade::session())
-            .then(|| shadow::Shadow::new(size.rows, size.cols)),
+        shadow,
+        screen: (kept && !fades).then(|| shadow::Shadow::new(size.rows, size.cols)),
         hold: None,
         // Set by `relay`, which knows whether there is a notice to write.
         boundary: None,
         span: false,
+        // Like the shadow, only when it will be used: a kept client is the
+        // only kind that is ever resumed from what it wrote.
+        ledger: kept.then(Ledger::new),
+        startup_answered: false,
+        expecting_a_size_report: false,
+        exits_seen: 0,
     })
 }
 
@@ -1511,10 +2158,26 @@ pub fn relay(
     }
     let mut raw = term::RawMode::enter()?;
 
+    // Whether the session's screen was dissolved in from the shadow on a
+    // resume, before the client has written a byte of this relay: what lets
+    // the notice go up over a kept session that has nothing to say (see
+    // `pump`).
+    let mut dissolved = false;
+    // A kept client's repaint, asked on its return and answered while the
+    // relay runs.
+    let mut erasing: Option<Erasing> = None;
     // What the child buffered while blocked mid-write describes a screen the
     // picker has since drawn over.
     if attachment.resumed {
-        discard_pending(master_fd);
+        let t_resume = Instant::now();
+        // A kept client's is read rather than thrown away: it was parked,
+        // not blocked, and what it wrote is the screen about to be painted
+        // back — see [`Attachment::drain_unrelayed`].
+        if attachment.is_kept() {
+            attachment.drain_unrelayed();
+        } else {
+            discard_pending(master_fd);
+        }
         // The size first, so the frames fit the terminal as it is now; then
         // the screen the client had dissolves in, and only then is the
         // client asked to repaint — its paint lands over the last frame.
@@ -1527,12 +2190,53 @@ pub fn relay(
         // on the session's own cell as its last frame; without one it is
         // shown where the erase left it, as every screen left it before
         // there was a fade.
-        attachment.resize_to(term::terminal_size());
-        if !attachment.dissolve_in() {
+        //
+        // A kept client with no fade to dissolve it in has its screen painted
+        // straight back instead, from its copy: it is on the glass at once
+        // either way, whatever the server is doing.
+        let size = term::terminal_size();
+        // Asked before the resize, because the resize is what changes it.
+        let resized = attachment.master.get_size().ok() != Some(size);
+        attachment.resize_to(size);
+        dissolved = attachment.dissolve_in();
+        let on_screen = dissolved || attachment.paint_kept_screen();
+        if !on_screen {
             attachment.shadow_saw(term::RESUME);
             term::show_cursor();
         }
-        repaint(&mut attachment, Repaint::Resume);
+        tracing::debug!(
+            ms = t_resume.elapsed().as_secs_f64() * 1000.0,
+            on_screen,
+            kept = attachment.is_kept(),
+            "timing: resumed screen"
+        );
+        if attachment.is_kept() {
+            // What the client told the terminal comes back from the ledger,
+            // and the exact screen from its server — asked from a thread, as
+            // the notice's repaint is, since the screen is back already and
+            // the relay has a session to run meanwhile. With nothing typed
+            // into a prompt: the prompt is on the screen, for the user.
+            // The fade's last frame leaves a reset pen and a hidden cursor
+            // wherever it was; a kept client may write before the repaint
+            // lands, and writes on the belief that neither has moved.
+            if dissolved {
+                attachment.hand_back_the_pen();
+            }
+            attachment.put_back_what_it_told();
+            attachment.tell_its_size(size, resized);
+            erasing = match Erasing::start_for(&attachment.sock, "kept client's return") {
+                Ok(started) => Some(started),
+                // No thread to ask from: the fallback a server that could not
+                // be asked would have got, as the notice's repaint has.
+                Err(e) => {
+                    tracing::debug!(error = %e, "no thread for the kept client's repaint");
+                    apply(&mut attachment, Repaint::Notice, Served::NONE);
+                    None
+                }
+            };
+        } else {
+            repaint(&mut attachment, Repaint::Resume);
+        }
     }
     attachment.resumed = true;
     if fresh && attachment.shadow.is_some() {
@@ -1553,7 +2257,14 @@ pub fn relay(
         &winch,
         highest_session_num,
         popup,
+        dissolved,
+        erasing,
     );
+    // From here on nothing the client writes reaches the terminal until it is
+    // relayed again: what the ledger hears next is news to the terminal.
+    if let Some(ledger) = attachment.ledger.as_mut() {
+        ledger.left_the_terminal();
+    }
 
     // As early as there is anything to say: everything below this line is
     // nvmux drawing, and what the caller starts here runs underneath it. See
@@ -1605,7 +2316,10 @@ pub fn relay(
         }
         Ok(Outcome::ChildExited) => {
             // The child is gone and has emitted its own restore; relay the rest
-            // of it, then hand back to the picker.
+            // of it, then hand back to the picker. A kept client parked
+            // meanwhile relies on modes that restore has just turned off, and
+            // is told so when it comes back (see [`EXITS_RELAYED`]).
+            EXITS_RELAYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             attachment.drain_until_eof();
             raw.restore();
             attachment.reap();
@@ -1651,6 +2365,8 @@ fn pump(
     winch: &winch::Winch,
     highest_session_num: u32,
     mut popup: Option<announce::Popup>,
+    dissolved: bool,
+    mut erasing: Option<Erasing>,
 ) -> Result<Outcome> {
     let stdin_fd = std::io::stdin().as_raw_fd();
     let keys = crate::config::get().keys;
@@ -1665,8 +2381,8 @@ fn pump(
     // The notice's repaint while it is in flight; see [`Erasing`]. Shared with
     // the hint bar, which wants the same repaint for the same reason and only
     // when this slot is free: a `:mode` in flight repaints the whole screen and
-    // covers the bar's row on its way past.
-    let mut erasing: Option<Erasing> = None;
+    // covers the bar's row on its way past. And with a kept client's return,
+    // which comes in with one already asked for.
     // The row that says what the next key does while a `<prefix>` waits.
     let mut bar = hint::Bar::new(Instant::now(), term::terminal_size());
     let mut buf = [0u8; 8192];
@@ -1805,7 +2521,15 @@ fn pump(
                 // the way in — which is the screen the user's shell comes back
                 // to, and no place to leave three rows of border. The hold
                 // says the same thing the other way round when there is one.
-                between: first_byte.is_some() && attachment.between_sequences(),
+                //
+                // Unless the session's screen was dissolved in from the
+                // shadow, which a kept client's return does: there the box has
+                // a screen to sit on before the client says anything — a
+                // session that is idle, or busy, may say nothing for a while
+                // yet — and the shadow to take it off again whatever the
+                // server does. A screen painted straight back has no shadow
+                // behind it, and waits for the client like any other.
+                between: (first_byte.is_some() || dissolved) && attachment.between_sequences(),
             };
             let act = p.step(
                 Instant::now(),
@@ -1883,15 +2607,16 @@ fn pump(
         // this — the repaint itself arrives as the session's own output — so a
         // pass that finds nothing costs a `try_recv`.
         if let Some(served) = erasing.as_ref().and_then(Erasing::answer) {
-            let asked = erasing.take().expect("it answered a moment ago").started;
+            let asked = erasing.take().expect("it answered a moment ago");
             // Timed because it is a second full repaint of the session, a
             // whole second after the switch — the one nvmux asks for rather
             // than the one the attach produced. What the number now measures
             // is how long it took somewhere else, which is the point of it.
             tracing::debug!(
-                ms = asked.elapsed().as_secs_f64() * 1000.0,
+                ms = asked.started.elapsed().as_secs_f64() * 1000.0,
                 repainted = served.repainted,
-                "timing: attach notice erase (:mode repaint)"
+                "timing: {} (:mode repaint)",
+                asked.what
             );
             apply(attachment, Repaint::Notice, served);
         }
@@ -1911,8 +2636,12 @@ fn pump(
             // half-typed session number into a switch — so the actions it
             // produces must be acted on, not just the bytes.
             for step in prefix.timeout() {
+                let repaint = attachment.saw_input(&step);
                 if let Some(outcome) = act(&mut attachment.writer, step)? {
                     return Ok(outcome);
+                }
+                if repaint {
+                    erasing = ask_again(attachment, erasing);
                 }
             }
         }
@@ -1925,8 +2654,12 @@ fn pump(
                     // Deliberately NOT logged: every keystroke the user types,
                     // into a /tmp file that outlives the session.
                     for step in prefix.feed(&buf[..len]) {
+                        let repaint = attachment.saw_input(&step);
                         if let Some(outcome) = act(&mut attachment.writer, step)? {
                             return Ok(outcome);
+                        }
+                        if repaint {
+                            erasing = ask_again(attachment, erasing);
                         }
                     }
                     // Every keystroke restarts the clock, so a number typed at
@@ -2231,6 +2964,54 @@ fn asks_for_device_attributes(chunk: &[u8]) -> bool {
     chunk.windows(DA1_REQUEST.len()).any(|w| w == DA1_REQUEST)
 }
 
+/// The kept client's return repaint, asked again once the size report a
+/// resume set off has reached the client (see [`Attachment::saw_input`]):
+/// after it, so that the server's answer to the resize it asks for is not the
+/// last word. Replaces one still in flight, whose answer no longer matters.
+fn ask_again(attachment: &mut Attachment, in_flight: Option<Erasing>) -> Option<Erasing> {
+    drop(in_flight);
+    match Erasing::start_for(
+        &attachment.sock,
+        "kept client's return, after its size report",
+    ) {
+        Ok(started) => Some(started),
+        Err(e) => {
+            tracing::debug!(error = %e, "no thread for the kept client's repaint");
+            apply(attachment, Repaint::Notice, Served::NONE);
+            None
+        }
+    }
+}
+
+/// Whether these bytes, on their way from the terminal to a client, carry an
+/// in-band size report: `CSI 48 ; …`.
+fn reports_size_in_band(bytes: &[u8]) -> bool {
+    bytes.windows(5).any(|w| w == b"\x1b[48;")
+}
+
+/// Whether these bytes, on their way from the terminal to a client, carry a
+/// terminal's answer to DA1: `CSI ? Ps ; … c`. What says a client's opening
+/// questions have all been answered (see `Attachment::startup_answered`).
+fn answers_device_attributes(bytes: &[u8]) -> bool {
+    let mut from = 0;
+    while let Some(at) = bytes[from..]
+        .windows(3)
+        .position(|w| w == b"\x1b[?")
+        .map(|i| from + i + 3)
+    {
+        let rest = &bytes[at..];
+        let params = rest
+            .iter()
+            .take_while(|b| b.is_ascii_digit() || **b == b';')
+            .count();
+        if params > 0 && rest.get(params) == Some(&b'c') {
+            return true;
+        }
+        from = at;
+    }
+    false
+}
+
 /// The chunk with every DA1 request taken out, and nothing else touched. See
 /// [`Attachment::drain_until_eof`] for why a request nvmux answers itself must
 /// not reach the real terminal as well.
@@ -2329,22 +3110,33 @@ fn apply(attachment: &mut Attachment, why: Repaint, served: Served) {
 /// the server sends; the only thing the answer decides is the fallback, and
 /// [`apply`] performs that on the relay's next pass.
 ///
-/// The third thread in the crate, and the cheapest: it owns one connection,
-/// reads nothing else, and every call it makes is bounded ([`RESUME_TIMEOUT`]),
-/// so it ends on its own whether or not anyone is still listening. A relay that
-/// ends first drops the receiver, and the send fails into nothing.
+/// The cheapest of the crate's threads: it owns one connection, reads nothing
+/// else, and every call it makes is bounded ([`RESUME_TIMEOUT`]), so it ends on
+/// its own whether or not anyone is still listening. A relay that ends first
+/// drops the receiver, and the send fails into nothing.
 ///
-/// Not the resume's repaint, which stays where it is: there the terminal is
+/// Not a resume's repaint, which stays where it is: there the terminal is
 /// blank, the relay has not started, and the screen coming back *is* what the
-/// user is waiting for.
+/// user is waiting for. Except a kept client's (`[client] per_session`), whose
+/// screen is already painted back from its copy by then: its repaint is asked
+/// here too, with the relay running (see [`relay`]).
 struct Erasing {
     rx: mpsc::Receiver<Served>,
     started: Instant,
+    /// What the repaint is for, for the timing record.
+    what: &'static str,
 }
 
 impl Erasing {
     /// Ask, and come back for the answer later.
     fn start(sock: &Path) -> std::io::Result<Self> {
+        Self::start_for(sock, "attach notice erase")
+    }
+
+    /// [`Erasing::start`], for something other than the notice: a kept
+    /// client coming back to the front, whose screen is already painted back
+    /// and wants the server's exact one on top (see [`relay`]).
+    fn start_for(sock: &Path, what: &'static str) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::channel();
         let sock = sock.to_path_buf();
         std::thread::Builder::new()
@@ -2357,6 +3149,7 @@ impl Erasing {
         Ok(Self {
             rx,
             started: Instant::now(),
+            what,
         })
     }
 
@@ -3790,6 +4583,260 @@ mod tests {
             took < Duration::from_millis(500),
             "the client took {took:?} — nothing answered the device attributes \
              request it was waiting on, so it sat there until the reap's deadline"
+        );
+    }
+
+    /// A stand-in client that is kept: it has a ledger, which is what makes
+    /// an attachment one to park.
+    fn kept(script: &str) -> Attachment {
+        let mut a = attached_to(script);
+        a.ledger = Some(Ledger::new());
+        a
+    }
+
+    /// Wait for a parked client's thread to finish, or give up.
+    fn settle_parked(parked: &Parked) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while parked.is_alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        !parked.is_alive()
+    }
+
+    /// Parked is not left unread: a client with far more to say than a pty
+    /// holds says all of it while parked, and what it said last — a title,
+    /// after two hundred kilobytes that would have stopped it cold — is in
+    /// the ledger when it is taken back.
+    #[test]
+    fn a_parked_client_is_read_while_it_waits() {
+        let a = kept(
+            r#"head -c 200000 /dev/zero | tr '\0' x; printf '\033]0;said it all\007'; exec sleep 30"#,
+        );
+        let pid = pid_of(&a);
+        let parked = a.park().expect("parked");
+        // Two hundred kilobytes read in pieces take a few milliseconds; a
+        // client nobody reads would still be stuck a second later.
+        std::thread::sleep(Duration::from_secs(1));
+        let a = parked.unpark().expect("handed back");
+        assert_eq!(pid_of(&a), pid, "not the same client");
+        assert_eq!(
+            a.ledger.as_ref().and_then(Ledger::title),
+            Some(&b"\x1b]0;said it all\x07"[..]),
+            "the client was not read to the end of what it said while parked"
+        );
+    }
+
+    /// Taking a parked client back hands over the very client — alive, and
+    /// its thread gone.
+    #[test]
+    fn unparking_hands_back_the_same_client() {
+        let a = kept("printf r; exec sleep 30");
+        wait_until_ready(&a);
+        let pid = pid_of(&a);
+        let parked = a.park().expect("parked");
+        assert!(parked.is_alive());
+        let back = parked.unpark().expect("handed back");
+        assert_eq!(pid_of(&back), pid);
+        assert_eq!(
+            peek_child(pid),
+            Peek::Running,
+            "the client did not survive parking"
+        );
+    }
+
+    /// A client that leaves while parked — its session killed, its link gone
+    /// — is not handed back, and is not left behind either.
+    #[test]
+    fn a_client_that_leaves_while_parked_is_not_handed_back() {
+        let a = kept("sleep 0.2; exit 0");
+        let pid = pid_of(&a);
+        let parked = a.park().expect("parked");
+        assert!(
+            settle_parked(&parked),
+            "the thread never noticed its client go"
+        );
+        assert!(
+            parked.unpark().is_none(),
+            "a client that left was handed back"
+        );
+        assert!(reaped(pid), "and it was not reaped");
+    }
+
+    /// A parked client that asks its terminal for its attributes is on its
+    /// way out — or suspending, which from here is no better — and is retired,
+    /// quickly, rather than answered and kept.
+    #[test]
+    fn a_parked_client_on_its_way_out_is_retired() {
+        let a = kept(
+            r#"stty raw -echo; trap 'exit 0' HUP; printf r; sleep 0.2; printf '\033[?1049l\033[c'; while :; do sleep 0.05; done"#,
+        );
+        wait_until_ready(&a);
+        let pid = pid_of(&a);
+        let parked = a.park().expect("parked");
+        let start = Instant::now();
+        assert!(settle_parked(&parked), "the finishing client was kept");
+        assert!(
+            parked.unpark().is_none(),
+            "the finishing client was handed back"
+        );
+        assert!(reaped(pid), "the finishing client was not reaped");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "retiring it took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Letting go of a parked client retires it, on its thread.
+    #[test]
+    fn dropping_a_parked_client_retires_it() {
+        let a = kept("printf r; exec sleep 30");
+        wait_until_ready(&a);
+        let pid = pid_of(&a);
+        drop(a.park().expect("parked"));
+        assert!(reaped(pid), "the client outlived its parking");
+    }
+
+    /// Whether the process is gone and waited for — not merely exited, which
+    /// a zombie nobody reaped is too — within a few seconds.
+    fn reaped(pid: Pid) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if kill(pid, None) == Err(nix::errno::Errno::ESRCH) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// A client that takes its size in band ignores the signal, so a new size
+    /// is sent to it as the report a terminal would send, whole, as its input
+    /// — and only a new size: the repaint is asked of the server regardless.
+    #[test]
+    fn a_client_that_reads_its_size_in_band_is_sent_a_new_one() {
+        let mut a = kept(
+            r#"stty raw -echo; printf r; head -c 15 | od -An -c | tr -d ' \n'; printf '|'; exec sleep 30"#,
+        );
+        wait_until_ready(&a);
+        a.ledger_saw(b"\x1b[?2048h");
+        let size = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        a.tell_its_size(size, false);
+        assert!(
+            !wait_briefly_for(&a, b'|'),
+            "an unchanged size was reported"
+        );
+        a.tell_its_size(size, true);
+        let heard = read_until(&a, b'|');
+        assert!(
+            heard.contains("033[48;24;80;0;0t|"),
+            "the client read something else: {heard:?}"
+        );
+    }
+
+    /// And a client that takes its size from the pty is told nothing: the
+    /// resize is enough, and a report would reach it as keys.
+    #[test]
+    fn a_client_that_reads_its_size_from_the_pty_is_sent_no_report() {
+        let mut a =
+            kept(r#"stty raw -echo; printf r; head -c 1 >/dev/null; printf '|'; exec sleep 30"#);
+        wait_until_ready(&a);
+        a.tell_its_size(PtySize::default(), true);
+        assert!(
+            !wait_briefly_for(&a, b'|'),
+            "a report reached a client that asked for none"
+        );
+    }
+
+    /// Output up to and including `byte`, as text, or whatever came before a
+    /// few seconds ran out.
+    fn read_until(a: &Attachment, byte: u8) -> String {
+        let fd = a.master.as_raw_fd().expect("the master has an fd");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut out = Vec::new();
+        let mut buf = [0u8; 256];
+        while Instant::now() < deadline && !out.contains(&byte) {
+            let mut p = [pollfd(fd)];
+            unsafe { libc::poll(p.as_mut_ptr(), 1, 50) };
+            if ready(&p[0]) {
+                if let Ok(n) = read_fd(fd, &mut buf) {
+                    out.extend_from_slice(&buf[..n]);
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).to_string()
+    }
+
+    /// [`wait_for`], for something that must not happen: a short look.
+    fn wait_briefly_for(a: &Attachment, byte: u8) -> bool {
+        let fd = a.master.as_raw_fd().expect("the master has an fd");
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let mut buf = [0u8; 256];
+        while Instant::now() < deadline {
+            let mut p = [pollfd(fd)];
+            unsafe { libc::poll(p.as_mut_ptr(), 1, 50) };
+            if ready(&p[0]) {
+                if let Ok(n) = read_fd(fd, &mut buf) {
+                    if buf[..n].contains(&byte) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// A kept client is parked only once the terminal has answered what it
+    /// asked on the way up — the answer to its DA1, the last of its questions,
+    /// forwarded to it through the relay.
+    #[test]
+    fn a_size_report_after_a_replayed_mode_asks_for_the_repaint_again() {
+        let mut a = kept("exec sleep 30");
+        a.startup_answered = true;
+        assert!(!a.saw_input(&Step::Forward(b"\x1b[48;24;80;0;0t".to_vec())));
+        a.expecting_a_size_report = true;
+        assert!(!a.saw_input(&Step::Forward(b"j".to_vec())));
+        assert!(a.saw_input(&Step::Forward(b"\x1b[48;24;80;0;0t".to_vec())));
+        assert!(
+            !a.expecting_a_size_report,
+            "asked again for the same report"
+        );
+    }
+
+    #[test]
+    fn a_client_is_parkable_once_its_questions_are_answered() {
+        let mut a = kept("exec sleep 30");
+        assert!(!a.is_parkable(), "parkable before any answer");
+        a.saw_input(&Step::Forward(b"j".to_vec()));
+        assert!(!a.is_parkable(), "a key is not an answer");
+        a.saw_input(&Step::Forward(b"\x1b[?62;22c".to_vec()));
+        assert!(a.is_parkable());
+        let mut plain = attached_to("exec sleep 30");
+        plain.saw_input(&Step::Forward(b"\x1b[?62;22c".to_vec()));
+        assert!(
+            !plain.is_parkable(),
+            "a client that is not kept is never parked"
+        );
+    }
+
+    /// The answer by its shape, wherever it falls in what the terminal sent,
+    /// and nothing that merely looks like it.
+    #[test]
+    fn a_device_attributes_answer_is_recognised_by_its_shape() {
+        assert!(answers_device_attributes(b"\x1b[?62;22c"));
+        assert!(answers_device_attributes(b"x\x1b[?1;2c\x1b[?0u"));
+        assert!(answers_device_attributes(b"\x1b[?0u\x1b[?64;1;9c"));
+        assert!(!answers_device_attributes(b"\x1b[?0u"), "the kitty answer");
+        assert!(!answers_device_attributes(b"\x1b[c"), "the request");
+        assert!(!answers_device_attributes(b"\x1b[?c"), "no attributes");
+        assert!(
+            !answers_device_attributes(b"\x1b[?2048;2$y"),
+            "a mode report"
         );
     }
 
