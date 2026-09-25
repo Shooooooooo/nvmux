@@ -6,14 +6,15 @@
 //! others; a `Task` says whether a session is being invented or renamed.
 //!
 //! It owns the whole screen rather than replacing a hint line, per the contract
-//! in the parent module. Three weights carry the three kinds of text — bold for
-//! the labels, plain for what you type, dim for the defaults and the hint row:
+//! in the parent module. Three weights carry the three kinds of text — dim for
+//! the labels, the defaults and the hint row, plain for what you type, reversed
+//! for the cursor:
 //!
 //! ```text
 //!     new session name:  session 3
 //!     nvim command:      nvim --headless --listen {sock}
 //!     working directory: /home/you/pro
-//!     └─ bold             │ └─ dim
+//!     └─ dim              │ └─ dim
 //!                         └─ the cursor, an inverted cell
 //!                        ▸ projects        ← the menu, once `Tab` asks for it:
 //!                          prototypes         reversed and bold, the picker's
@@ -186,7 +187,11 @@ impl Outcome {
 /// what they start as, and what enter finally calls.
 #[derive(Clone, Copy)]
 pub(super) enum Task<'a> {
-    Create,
+    Create {
+        /// The listing the caller already has — the picker's rows — so the
+        /// default name costs no second script run. `None` re-lists.
+        listed: Option<&'a [Session]>,
+    },
     Rename(&'a Session),
 }
 
@@ -205,6 +210,13 @@ const MENU_ROWS: u16 = 6;
 /// picker's, so the two lists read the same way.
 const MARKER: &str = "▸ ";
 const INDENT: &str = "  ";
+
+/// The cursor: plain REVERSED, not the picker's REVERSED|BOLD — that pairing
+/// means "the selected row", and a one-cell cursor wants the crisper form.
+const CURSOR: Style = Style::new().add_modifier(Modifier::REVERSED);
+
+/// Text that is not deciding anything — see the module docs on weights.
+const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 
 /// What enter asked for.
 #[derive(Debug, PartialEq, Eq)]
@@ -469,8 +481,9 @@ impl Prompt {
         &mut self.fields[self.focus]
     }
 
-    /// Wrapping, like the picker's list: with two fields, one key reaches the
-    /// other whichever one is focused.
+    /// Wrapping, like the picker's list: the create prompt has three fields, so
+    /// a key pressed once too often comes back round to the top rather than
+    /// stopping dead. (A rename has one field, where this is a no-op.)
     fn move_focus(&mut self, delta: usize) {
         let n = self.fields.len();
         self.focus = (self.focus + delta) % n;
@@ -612,7 +625,7 @@ impl Prompt {
             // without it a menu opened by accident could only be dismissed by
             // choosing something out of it.
             Key::Esc if choosing => {
-                self.close_menu();
+                self.close_menu(false);
                 Step::None
             }
             // Not a quit here: it would tear the user out of a live session
@@ -645,10 +658,13 @@ impl Prompt {
         }
     }
 
-    fn close_menu(&mut self) {
+    /// Take the menu off the screen. `stepped` is whether this close is an
+    /// accept, so the next `Tab` steps into what was chosen rather than
+    /// reopening on it; an `Esc` passes false.
+    fn close_menu(&mut self, stepped: bool) {
         if let Some(menu) = self.menu.as_mut() {
             menu.open = false;
-            menu.stepped = false;
+            menu.stepped = stepped;
             menu.matches.clear();
             menu.message.clear();
         }
@@ -728,12 +744,7 @@ impl Prompt {
         field.input = format!("{inert}{parent}/{name}");
         field.cursor = field.len();
 
-        if let Some(menu) = self.menu.as_mut() {
-            menu.open = false;
-            menu.stepped = true;
-            menu.matches.clear();
-            menu.message.clear();
-        }
+        self.close_menu(true);
     }
 }
 
@@ -758,7 +769,12 @@ fn aligned(labels: &[&str]) -> Vec<String> {
 pub fn run(transport: &dyn Transport) -> Result<Outcome> {
     // Reached from a session that has just dissolved out, so dissolve in.
     super::owning_for_attach(Outcome::attaches, true, |terminal| {
-        run_on(terminal, transport, Task::Create, crate::fade::excursions())
+        run_on(
+            terminal,
+            transport,
+            Task::Create { listed: None },
+            crate::fade::excursions(),
+        )
     })
 }
 
@@ -774,6 +790,10 @@ pub fn run(transport: &dyn Transport) -> Result<Outcome> {
 /// over again from the background; false from the picker, whose screen is
 /// already up and simply comes back. A create dissolves out *either* way — a
 /// client spawn follows, and this is the screen that is up when it does.
+///
+/// A create takes the caller's listing, when it has one, for its default name
+/// — see [`Task::Create`] — so the picker's `c` costs no script run on the way
+/// in.
 pub(super) fn run_on(
     terminal: &mut ratatui::DefaultTerminal,
     transport: &dyn Transport,
@@ -781,8 +801,8 @@ pub(super) fn run_on(
     animate: bool,
 ) -> Result<Outcome> {
     let mut prompt = match task {
-        Task::Create => Prompt::create(
-            next_free_name(transport)?,
+        Task::Create { listed } => Prompt::create(
+            next_free_name(transport, listed)?,
             default_command(transport),
             default_directory(transport.home()),
         ),
@@ -793,7 +813,7 @@ pub(super) fn run_on(
     // worker. Dropped with the prompt, which is what ends it — see
     // `super::complete`.
     let mut completer = match task {
-        Task::Create => Some(complete::Completer::new(
+        Task::Create { .. } => Some(complete::Completer::new(
             transport.dir_source(),
             transport.home(),
         )),
@@ -851,7 +871,7 @@ pub(super) fn run_on(
         // takes a `Launch` and cannot be handed a line that is not one; the
         // rules still live in `launch`.
         let committed = match task {
-            Task::Create => {
+            Task::Create { .. } => {
                 let line = submission.command.unwrap_or_default();
                 let typed = submission.directory.unwrap_or_default();
                 Launch::parse(&line)
@@ -889,11 +909,14 @@ pub(super) fn run_on(
             }
             Err(e) => {
                 // A name that was free when the prompt opened may not be now.
+                // The picker's listing is trusted on the way in, never on a
+                // retry: what was just refused is the one thing it cannot
+                // know about.
                 let refreshed = match task {
-                    Task::Create => Some(next_free_name(transport)?),
+                    Task::Create { .. } => Some(next_free_name(transport, None)?),
                     Task::Rename(_) => None,
                 };
-                prompt.fail(super::one_line(&e), refreshed);
+                prompt.fail(e.one_line(), refreshed);
             }
         }
     }
@@ -945,11 +968,11 @@ fn show(prompt: &mut Prompt, completer: Option<&mut complete::Completer>) {
     // inside that.
     let typed = prompt.fields[DIRECTORY].value();
     let live = crate::dirs::anchored(&typed).1;
-    let query = crate::dirs::split(live).map_or("", |(_, q)| q).to_string();
+    let query = crate::dirs::split(live).map_or("", |(_, q)| q);
 
     let waiting = completer.waiting();
     let partial = completer.truncated();
-    let matches = completer.matches(&query);
+    let matches = completer.matches(query);
 
     let message = if waiting && matches.is_empty() {
         // Only when there is nothing to show. A cached listing answers instantly
@@ -993,12 +1016,17 @@ fn next_name(taken: &[String]) -> String {
     "session".to_string()
 }
 
-fn next_free_name(transport: &dyn Transport) -> Result<String> {
-    let taken: Vec<String> = transport
-        .list_sessions()?
-        .into_iter()
-        .map(|s| s.name)
-        .collect();
+/// The first free default name, against `listed` when the caller has a listing
+/// in hand and against a fresh one otherwise.
+fn next_free_name(transport: &dyn Transport, listed: Option<&[Session]>) -> Result<String> {
+    let taken: Vec<String> = match listed {
+        Some(sessions) => sessions.iter().map(|s| s.name.clone()).collect(),
+        None => transport
+            .list_sessions()?
+            .into_iter()
+            .map(|s| s.name)
+            .collect(),
+    };
     Ok(next_name(&taken))
 }
 
@@ -1047,15 +1075,9 @@ fn default_command(transport: &dyn Transport) -> String {
 }
 
 fn draw(frame: &mut Frame, prompt: &Prompt) {
-    let area = frame.area();
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-
-    let (body, bottom) = draw::split_hint_row(area);
-
-    draw_body(frame, prompt, body);
-    draw::draw_hint_row(frame, bottom, prompt.hints(), true);
+    draw::screen(frame, prompt.hints(), true, |frame, body| {
+        draw_body(frame, prompt, body)
+    });
 }
 
 /// Centre the block as it reads the moment the prompt opens, then hold it.
@@ -1151,13 +1173,12 @@ fn draw_menu(frame: &mut Frame, menu: &Menu, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let dim = Style::default().add_modifier(Modifier::DIM);
 
     if !menu.message.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 draw::truncate(&menu.message, area.width as usize),
-                dim,
+                DIM,
             ))),
             Rect { height: 1, ..area },
         );
@@ -1177,7 +1198,7 @@ fn draw_menu(frame: &mut Frame, menu: &Menu, area: Rect) {
             let style = if selected {
                 Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
             } else {
-                dim
+                DIM
             };
             let text = draw::truncate(
                 &format!("{}{name}", if selected { MARKER } else { INDENT }),
@@ -1195,14 +1216,14 @@ fn draw_menu(frame: &mut Frame, menu: &Menu, area: Rect) {
         lines.pop();
         lines.push(Line::from(Span::styled(
             draw::truncate(&format!("{INDENT}(and more)"), area.width as usize),
-            dim,
+            DIM,
         )));
     }
 
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// One field's whole line: bold label, then either what was typed or the dim
+/// One field's whole line: dim label, then either what was typed or the dim
 /// default. Derived from state rather than tracked, so backspacing to nothing
 /// brings the placeholder back with nothing to keep in sync.
 fn field_line(field: &Field, focused: bool, width: usize) -> Line<'static> {
@@ -1215,15 +1236,7 @@ fn field_line(field: &Field, focused: bool, width: usize) -> Line<'static> {
     // every one of them says the same thing on every prompt. What changes — what
     // you typed, what enter would take — leads by being the only text at full
     // weight.
-    let mut spans = vec![Span::styled(
-        label,
-        Style::default().add_modifier(Modifier::DIM),
-    )];
-
-    // Plain REVERSED, not the picker's REVERSED|BOLD: that pairing means "the
-    // selected row", and a one-cell cursor wants the crisper form.
-    let cursor = Style::default().add_modifier(Modifier::REVERSED);
-    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut spans = vec![Span::styled(label, DIM)];
 
     // How much of the line no longer counts, in characters. Everything a `//`
     // discarded is drawn dim, which is the whole of what dim means here — an
@@ -1235,14 +1248,14 @@ fn field_line(field: &Field, focused: bool, width: usize) -> Line<'static> {
         // sits in exactly the columns a typed value will.
         (true, true) => match split_first(&field.default) {
             Some((first, rest)) => {
-                spans.push(Span::styled(first, cursor));
-                spans.push(Span::styled(draw::truncate(rest, room), dim));
+                spans.push(Span::styled(first, CURSOR));
+                spans.push(Span::styled(draw::truncate(rest, room), DIM));
             }
-            None => spans.push(Span::styled(" ", cursor)),
+            None => spans.push(Span::styled(" ", CURSOR)),
         },
         // Nothing typed and not where the keystrokes are going: no cursor, or
         // there would be two on screen and no telling which is live.
-        (true, false) => spans.push(Span::styled(draw::truncate(&field.default, room), dim)),
+        (true, false) => spans.push(Span::styled(draw::truncate(&field.default, room), DIM)),
         (false, true) => spans.extend(windowed(field, room, inert)),
         (false, false) => {
             // Unfocused, so no cursor to keep in view: the line is simply cut to
@@ -1255,7 +1268,7 @@ fn field_line(field: &Field, focused: bool, width: usize) -> Line<'static> {
                 text.chars().skip(cut).collect(),
             );
             if !before.is_empty() {
-                spans.push(Span::styled(before, dim));
+                spans.push(Span::styled(before, DIM));
             }
             if !after.is_empty() {
                 spans.push(Span::raw(after));
@@ -1318,15 +1331,11 @@ fn windowed(field: &Field, max: usize, inert: usize) -> Vec<Span<'static>> {
     let cells: Vec<char> = field.input.chars().chain([' ']).collect();
     let (start, at, end) = around_cursor(field, max);
 
-    // Plain REVERSED, not the picker's REVERSED|BOLD: that pairing means "the
-    // selected row", and a one-cell cursor wants the crisper form.
-    let cursor = Style::default().add_modifier(Modifier::REVERSED);
-    let dim = Style::default().add_modifier(Modifier::DIM);
     let style = |i: usize| match (i == at, i < inert) {
         // The cursor keeps its own weight wherever it lands, dim half included:
         // there is only one of it and it has to be findable.
-        (true, _) => cursor,
-        (false, true) => dim,
+        (true, _) => CURSOR,
+        (false, true) => DIM,
         (false, false) => Style::default(),
     };
 
@@ -1351,8 +1360,6 @@ fn windowed(field: &Field, max: usize, inert: usize) -> Vec<Span<'static>> {
 mod tests {
     use super::super::test_support;
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
 
     const COMMAND_DEFAULT: &str = "nvim --headless --listen {sock}";
     const DIRECTORY_DEFAULT: &str = "~/";
@@ -1414,9 +1421,7 @@ mod tests {
     type Cell = (String, Modifier);
 
     fn cells_of(p: &Prompt, w: u16, h: u16) -> Vec<Vec<Cell>> {
-        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
-        terminal.draw(|f| draw(f, p)).expect("draw");
-        let buf = terminal.backend().buffer().clone();
+        let buf = test_support::buffer(w, h, |f| draw(f, p));
         (0..buf.area.height)
             .map(|y| {
                 (0..buf.area.width)
@@ -1910,6 +1915,8 @@ mod tests {
 
     /// A command line is a thing you edit — a path to a nightly build, a
     /// `--clean` on the end — so it is there to be edited rather than offered.
+    /// That it then takes keystrokes appended to the default, with no adopt
+    /// step in the way, is pinned by `typing_goes_to_the_focused_field_only`.
     #[test]
     fn the_command_field_starts_at_its_default_rather_than_offering_it() {
         let p = prompt();
@@ -1918,15 +1925,6 @@ mod tests {
             p.fields[COMMAND].cursor,
             p.fields[COMMAND].len(),
             "with the cursor after it"
-        );
-
-        // Editable from the end with no adopt step in the way.
-        let mut p = prompt();
-        p.on_key(Key::Down);
-        type_in(&mut p, " --clean");
-        assert_eq!(
-            p.fields[COMMAND].input,
-            format!("{COMMAND_DEFAULT} --clean")
         );
     }
 
@@ -2160,12 +2158,9 @@ mod tests {
         }
     }
 
-    /// The state this field could not be got out of: backspace the path away
-    /// and home comes back dimmed, and the one key the hint row offers used to
-    /// reach straight past it — listing its children under a field that still
-    /// looked empty. It takes the path first now.
-    #[test]
-    fn tab_takes_the_home_path_back_into_an_emptied_field() {
+    /// The directory field, focused the real way and backspaced down to
+    /// nothing, so that only the dim home path is left showing under it.
+    fn emptied_directory() -> Prompt {
         let mut p = prompt();
         press(&mut p, &[Key::Down, Key::Down]);
         assert_eq!(p.focus, DIRECTORY);
@@ -2173,6 +2168,16 @@ mod tests {
             p.on_key(Key::Backspace);
         }
         assert!(p.fields[DIRECTORY].input.is_empty(), "cleared to nothing");
+        p
+    }
+
+    /// The state this field could not be got out of: backspace the path away
+    /// and home comes back dimmed, and the one key the hint row offers used to
+    /// reach straight past it — listing its children under a field that still
+    /// looked empty. It takes the path first now.
+    #[test]
+    fn tab_takes_the_home_path_back_into_an_emptied_field() {
+        let mut p = emptied_directory();
 
         p.on_key(Key::Tab);
         let field = &p.fields[DIRECTORY];
@@ -2198,11 +2203,7 @@ mod tests {
     /// pairing an emptied field and an accept both have.
     #[test]
     fn tab_on_a_bare_tilde_writes_the_slash_that_steps_into_it() {
-        let mut p = prompt();
-        press(&mut p, &[Key::Down, Key::Down]);
-        for _ in 0..p.fields[DIRECTORY].len() {
-            p.on_key(Key::Backspace);
-        }
+        let mut p = emptied_directory();
         type_in(&mut p, "~");
 
         p.on_key(Key::Tab);
@@ -2244,11 +2245,7 @@ mod tests {
     /// handles as it handles any other, and not something to put a slash after.
     #[test]
     fn tab_writes_no_slash_after_a_tilde_with_anything_on_it() {
-        let mut p = prompt();
-        press(&mut p, &[Key::Down, Key::Down]);
-        for _ in 0..p.fields[DIRECTORY].len() {
-            p.on_key(Key::Backspace);
-        }
+        let mut p = emptied_directory();
         type_in(&mut p, "~r");
 
         p.on_key(Key::Tab);
@@ -2280,11 +2277,7 @@ mod tests {
     /// slash is the root itself and the listing is pointed at it.
     #[test]
     fn a_slash_in_an_emptied_field_is_the_root_itself() {
-        let mut p = prompt();
-        press(&mut p, &[Key::Down, Key::Down]);
-        for _ in 0..p.fields[DIRECTORY].len() {
-            p.on_key(Key::Backspace);
-        }
+        let mut p = emptied_directory();
         type_in(&mut p, "/");
         assert_eq!(p.fields[DIRECTORY].input, "/");
 

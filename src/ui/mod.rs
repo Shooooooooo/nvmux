@@ -319,9 +319,7 @@ fn run_loop(
     focused: Option<&str>,
     still_attached: bool,
 ) -> Result<Outcome> {
-    let mut sessions = transport.list_sessions()?;
-    let mut highest = highest_num(&sessions);
-    let mut app = App::new(std::mem::take(&mut sessions));
+    let mut app = App::new(transport.list_sessions()?);
     if let Some(id) = focused {
         app.select_session(id);
         if still_attached {
@@ -396,7 +394,14 @@ fn run_loop(
                 // again if the prompt is cancelled. A create still dissolves
                 // the prompt out on its way to the client spawn — that is
                 // the prompt's own doing, since its screen is the one up.
-                match prompt::run_on(terminal, transport, prompt::Task::Create, false)? {
+                match prompt::run_on(
+                    terminal,
+                    transport,
+                    prompt::Task::Create {
+                        listed: Some(app.sessions()),
+                    },
+                    false,
+                )? {
                     prompt::Outcome::Created(session) => {
                         // Appended rather than re-listed: the picker's rows are
                         // still accurate and this is the one row they are
@@ -409,7 +414,7 @@ fn run_loop(
                         return Ok(Outcome::Attach { session, sessions });
                     }
                     prompt::Outcome::Cancelled => {}
-                    prompt::Outcome::Renamed => refresh(&mut app, &mut highest, transport)?,
+                    prompt::Outcome::Renamed => refresh(&mut app, transport)?,
                 }
             }
 
@@ -418,7 +423,7 @@ fn run_loop(
                     let outcome =
                         prompt::run_on(terminal, transport, prompt::Task::Rename(&session), false)?;
                     if !matches!(outcome, prompt::Outcome::Cancelled) {
-                        refresh(&mut app, &mut highest, transport)?;
+                        refresh(&mut app, transport)?;
                     }
                 }
             }
@@ -426,9 +431,9 @@ fn run_loop(
             Request::Kill(id) => {
                 if let Some(session) = app.session(&id).cloned() {
                     if let Err(e) = transport.kill_session(&session) {
-                        app.set_message(one_line(&e));
+                        app.set_message(e.one_line());
                     }
-                    refresh(&mut app, &mut highest, transport)?;
+                    refresh(&mut app, transport)?;
                 }
             }
 
@@ -443,13 +448,13 @@ fn run_loop(
                     })
                     .collect();
                 if let Err(e) = transport.renumber(&batch) {
-                    app.set_message(one_line(&e));
+                    app.set_message(e.one_line());
                 }
                 // Whether it wrote or failed, what the numbers now are is a
                 // listing's answer and not ours. `set_sessions` restores the
                 // selection by id, so the cursor stays on the session that was
                 // just placed.
-                refresh(&mut app, &mut highest, transport)?;
+                refresh(&mut app, transport)?;
             }
 
             Request::Help => help::run_on(terminal, false)?,
@@ -475,25 +480,15 @@ fn leave_to_session(
     })
 }
 
-/// Re-list, keeping the highest number in step with what is on screen.
-fn refresh(app: &mut App, highest: &mut u32, transport: &dyn Transport) -> Result<()> {
-    let sessions = transport.list_sessions()?;
-    *highest = highest_num(&sessions);
-    app.set_sessions(sessions);
+/// Re-list, restoring the selection by id (`set_sessions` does that).
+fn refresh(app: &mut App, transport: &dyn Transport) -> Result<()> {
+    app.set_sessions(transport.list_sessions()?);
     Ok(())
 }
 
 /// The largest resolved session number in a listing, or 0 for none.
 pub fn highest_num(sessions: &[Session]) -> u32 {
     sessions.iter().map(|s| s.state.num).max().unwrap_or(0)
-}
-
-/// Collapse an error to something that fits on one line.
-///
-/// The bottom row is exactly one row; a multi-line error would be truncated at
-/// the first newline and lose the part that explains itself.
-fn one_line(e: &crate::error::NvmuxError) -> String {
-    e.to_string().lines().collect::<Vec<_>>().join(" — ")
 }
 
 /// Reduce a crossterm event to the keys the screens understand.
@@ -519,7 +514,6 @@ fn translate(k: KeyEvent) -> Key {
         KeyCode::Left => Key::Left,
         KeyCode::Right => Key::Right,
         KeyCode::Tab => Key::Tab,
-        KeyCode::BackTab => Key::BackTab,
         KeyCode::Home => Key::Home,
         KeyCode::End => Key::End,
         _ => Key::Other,
@@ -700,20 +694,5 @@ mod tests {
         }
         .attaches());
         assert!(!Outcome::Quit.attaches());
-    }
-
-    #[test]
-    fn errors_are_flattened_to_one_line() {
-        let e = crate::error::NvmuxError::Session(crate::error::SessionError::NotReady {
-            name: "x".into(),
-            timeout: Duration::from_secs(1),
-            log: "x.log".into(),
-            log_tail: "a\nmultiline\nthing".into(),
-        });
-        assert!(
-            e.to_string().contains('\n'),
-            "the fixture must be multi-line"
-        );
-        assert!(!one_line(&e).contains('\n'));
     }
 }
