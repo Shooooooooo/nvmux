@@ -90,11 +90,25 @@ pub struct ClientSettings {
     /// server for its own on top: no fork, no probe, and nothing to wait for
     /// (see [`crate::pty::Parked`]).
     ///
-    /// On by default. The cost, and the reason to turn it off, is that a
-    /// parked client is still a UI of its session's server: another UI on
-    /// the same session — another nvmux, another machine — shares its grid
-    /// with it, at the smaller of the two sizes, and every session visited
-    /// keeps an idle client process until nvmux leaves.
+    /// On by default. What it costs, each for as long as nvmux runs, and so
+    /// the reasons to turn it off:
+    ///
+    /// - A parked client is still a UI of its session's server. Another UI on
+    ///   the same session — another nvmux, another machine — shares its grid
+    ///   with it, at the smaller of the two sizes; a second nvmux of your own
+    ///   holds each session at the size its terminal had when it last left.
+    /// - A switch no longer fires `UILeave` in the session it leaves, nor
+    ///   `UIEnter` in the one it comes back to.
+    /// - Every session visited keeps an idle `nvim` client (about 1.5 MB of
+    ///   its own), a thread and a copy of its screen in nvmux, and its ssh
+    ///   forward. A session that keeps redrawing — a `:terminal` running
+    ///   something — keeps sending that client frames, over the link for a
+    ///   remote one.
+    /// - Nothing limits how many are kept: one per session visited.
+    /// - The screen a switch back puts up is nvmux's copy, which has no
+    ///   undercurl, underline colour, strikethrough, blink, conceal or
+    ///   overline (see [`crate::shadow`]) until the server's own repaint
+    ///   lands, a round trip or two later.
     pub per_session: bool,
 }
 
@@ -410,8 +424,13 @@ fn render_default_config(prefix: u8) -> String {
          \n\
          [client]\n\
          # Keep each session's Neovim client while another is in front, so a\n\
-         # switch back puts its screen back at once. Each one kept is one more UI\n\
-         # on its session; false starts a new client on every switch.\n\
+         # switch back puts its screen back at once. Until nvmux exits, it costs:\n\
+         #  - a kept client is still a UI of its session, so another UI on it,\n\
+         #    a second nvmux included, is held to the smaller of the two sizes;\n\
+         #  - a switch no longer fires UILeave or UIEnter;\n\
+         #  - every session visited keeps an idle client (about 1.5 MB), its ssh\n\
+         #    forward, and the redraws its server still sends it.\n\
+         # false starts a new client on every switch instead.\n\
          # per_session = {per_session}\n\
          \n\
          [fade]\n\
