@@ -15,7 +15,7 @@ of rendering happens on your own terminal.
 Make a session, type in it, detach, come back: the editor, its buffers and its
 undo history are where you left them.
 
-[Why not tmux?](#why-not-tmux) · [Requirements](#requirements) · [Install](#install) · [Use](#use) · [How it works](#how-it-works) · [Configuration](#configuration) · [Windows](#windows)
+[Why not tmux?](#why-not-tmux) · [Requirements](#requirements) · [Install](#install) · [Use](#use) · [How it works](#how-it-works) · [Configuration](#configuration)
 
 ## Why not tmux?
 
@@ -39,8 +39,8 @@ which is why it can hand Neovim your terminal rather than an imitation of one.
 `:connect` landed.
 
 Local is macOS or Linux — or, experimentally, Windows, for sessions on a host
-you reach with `ssh`: see [Windows](#windows). Remote is any host with a POSIX
-`sh`.
+you reach with `ssh`: see [docs/windows.md](docs/windows.md). Remote is any
+host with a POSIX `sh`.
 
 ## Install
 
@@ -189,17 +189,3 @@ transport = "control-master"   # or "relay"; see "How it works". Windows: "relay
 ```
 
 </details>
-
-## Windows
-
-`nvmux <host>` builds and runs on Windows, as the local end of sessions on a
-Linux or macOS host: through the `ssh` that ships with Windows, over the relay
-transport, with each session's endpoint a named pipe and Neovim's client on a
-pseudoconsole. It is **experimental**: the transport has been tested end to
-end from a Windows build running under Wine, and the terminal side has not yet
-been run on a real Windows machine.
-Sessions on the Windows machine itself (`nvmux` with no host) are not
-supported, and the fade is off there.
-
-[docs/windows.md](docs/windows.md) has what works, how it is built, what has
-been verified, and the known limitations.
