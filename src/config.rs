@@ -76,7 +76,7 @@ pub struct SessionSettings {
 }
 
 /// The local `nvim --remote-ui` client that draws a session (see [`crate::pty`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClientSettings {
     /// Keep one client per session rather than one in all.
@@ -90,11 +90,32 @@ pub struct ClientSettings {
     /// server for its own on top: no fork, no probe, and nothing to wait for
     /// (see [`crate::pty::Parked`]).
     ///
-    /// Off by default, because a parked client is still a UI of its session's
-    /// server: another UI on the same session — another nvmux, another
-    /// machine — shares its grid with it, at the smaller of the two sizes, and
-    /// every session visited keeps an idle client process until nvmux leaves.
+    /// On by default. What it costs, each for as long as nvmux runs, and so
+    /// the reasons to turn it off:
+    ///
+    /// - A parked client is still a UI of its session's server. Another UI on
+    ///   the same session — another nvmux, another machine — shares its grid
+    ///   with it, at the smaller of the two sizes; a second nvmux of your own
+    ///   holds each session at the size its terminal had when it last left.
+    /// - A switch no longer fires `UILeave` in the session it leaves, nor
+    ///   `UIEnter` in the one it comes back to.
+    /// - Every session visited keeps an idle `nvim` client (about 1.5 MB of
+    ///   its own), a thread and a copy of its screen in nvmux, and its ssh
+    ///   forward. A session that keeps redrawing — a `:terminal` running
+    ///   something — keeps sending that client frames, over the link for a
+    ///   remote one.
+    /// - Nothing limits how many are kept: one per session visited.
+    /// - The screen a switch back puts up is nvmux's copy, which has no
+    ///   undercurl, underline colour, strikethrough, blink, conceal or
+    ///   overline (see [`crate::shadow`]) until the server's own repaint
+    ///   lands, a round trip or two later.
     pub per_session: bool,
+}
+
+impl Default for ClientSettings {
+    fn default() -> Self {
+        Self { per_session: true }
+    }
 }
 
 /// The fade between screens (see [`crate::fade`]): each one dissolves into the
@@ -121,7 +142,10 @@ pub struct FadeSettings {
     /// Whether a Neovim screen dissolves too — in, once its first paint has
     /// settled, and out — rather than only nvmux's own screens. Costs a
     /// running parse of the session's output while it is attached (see
-    /// [`crate::shadow`]); off, a session hard-cuts both ways.
+    /// [`crate::shadow`]); off, a session hard-cuts both ways. A kept client
+    /// (`[client] per_session`, the default) parses the same output into its
+    /// own copy of its screen either way, so off saves the parse only with
+    /// `per_session = false` too.
     ///
     /// That parse is also what the attach notice dissolves into, so off, the
     /// notice's box empties the cells it covers and waits for a repaint to
@@ -402,9 +426,14 @@ fn render_default_config(prefix: u8) -> String {
          # command = {command:?}\n\
          \n\
          [client]\n\
-         # One Neovim client per session, parked while another is in front, so a\n\
-         # switch back puts the screen back at once. Each is one more UI on its\n\
-         # session.\n\
+         # Keep each session's Neovim client while another is in front, so a\n\
+         # switch back puts its screen back at once. Until nvmux exits, it costs:\n\
+         #  - a kept client is still a UI of its session, so another UI on it,\n\
+         #    a second nvmux included, is held to the smaller of the two sizes;\n\
+         #  - a switch no longer fires UILeave or UIEnter;\n\
+         #  - every session visited keeps an idle client (about 1.5 MB), its ssh\n\
+         #    forward, and the redraws its server still sends it.\n\
+         # false starts a new client on every switch instead.\n\
          # per_session = {per_session}\n\
          \n\
          [fade]\n\
@@ -492,7 +521,7 @@ mod tests {
             [session]\n\
             command = \"nvim --headless --listen {sock}\"\n\
             [client]\n\
-            per_session = false\n\
+            per_session = true\n\
             [fade]\n\
             enabled = true\n\
             duration_ms = 200\n\
@@ -545,13 +574,14 @@ mod tests {
         assert!(!s.fade.enabled);
     }
 
-    /// Off unless asked for: a parked client is a UI its session's other users
-    /// share a grid with, which nobody should get without having chosen it.
+    /// On unless turned off, and `false` turns it off: a parked client is a
+    /// UI its session's other users share a grid with, and `false` is how
+    /// whoever runs this nvmux spares them that.
     #[test]
-    fn one_client_per_session_is_off_unless_asked_for() {
-        assert!(!Settings::default().client.per_session);
-        let s: Settings = toml::from_str("[client]\nper_session = true\n").expect("valid");
-        assert!(s.client.per_session);
+    fn one_client_per_session_is_on_unless_turned_off() {
+        assert!(Settings::default().client.per_session);
+        let s: Settings = toml::from_str("[client]\nper_session = false\n").expect("valid");
+        assert!(!s.client.per_session);
         assert_eq!(s.fade, FadeSettings::default());
         assert_eq!(s.session, SessionSettings::default());
     }
@@ -691,7 +721,7 @@ mod tests {
         assert!(rendered.contains("\n[fade]\n"), "{rendered:?}");
         assert!(rendered.contains("\n[client]\n"), "{rendered:?}");
         for line in [
-            "# per_session = false",
+            "# per_session = true",
             "# enabled     = true",
             "# duration_ms = 200",
             "# session     = true",

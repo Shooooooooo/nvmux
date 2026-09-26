@@ -96,9 +96,11 @@ fn relay_child() {
     let (Ok(sock), Ok(id)) = (std::env::var(CHILD_SOCK), std::env::var(CHILD_ID)) else {
         return;
     };
-    // The defaults, but with a command wait no scheduler hiccup can beat:
+    // The defaults, but with a command wait no scheduler hiccup can beat —
     // the gap the parent leaves between the prefix and its command is meant
-    // to clear the sequence wait, not to race this one.
+    // to clear the sequence wait, not to race this one — and the client kept
+    // only in a child that asks for it (CHILD_KEEP): the tests about spellings
+    // and the hint row are about a relay that never parks.
     let mut settings = nvmux::config::with_prefix(nvmux::keys::PREFIX);
     settings.keys.timeout_ms = 10_000;
     let keep = std::env::var_os(CHILD_KEEP).is_some();
@@ -123,6 +125,11 @@ fn relay_child() {
     // the stream the parent is reading.
     let mut pool = nvmux::pool::Pool::configured();
     let mut attachment = nvmux::pty::spawn(&id, Path::new(&sock), "").expect("attach");
+    assert_eq!(
+        attachment.is_kept(),
+        keep,
+        "[client] per_session = {keep} was not honoured"
+    );
     let code = loop {
         match nvmux::pty::relay(attachment, 0, &mut |_| {}) {
             Ok((nvmux::pty::Outcome::Detached, _)) => break 0,
@@ -184,7 +191,8 @@ struct Terminal {
 
 impl Terminal {
     /// Re-run this test binary as `relay_child` on a fresh pty, with no palette
-    /// and so no fade — what every test about a spelling wants.
+    /// and so no fade, and a client that is not kept — what every test about a
+    /// spelling wants.
     fn spawn(sock: &Path, id: &str, protocol: Protocol) -> Self {
         Self::spawn_with(sock, id, protocol, false)
     }
@@ -196,9 +204,9 @@ impl Terminal {
     }
 
     /// A child that keeps its client (see [`CHILD_KEEP`]), on a terminal that
-    /// reports its size in band if `in_band`.
-    fn spawn_keeping(sock: &Path, id: &str, in_band: bool) -> Self {
-        Self::spawn_child(sock, id, Protocol::Kitty, false, true, in_band)
+    /// reports its size in band if `in_band`, and with the fade on if `fade`.
+    fn spawn_keeping(sock: &Path, id: &str, in_band: bool, fade: bool) -> Self {
+        Self::spawn_child(sock, id, Protocol::Kitty, fade, true, in_band)
     }
 
     fn spawn_child(
@@ -630,7 +638,10 @@ const RESUMED: &[u8] = b"\x1b[?1049h\x1b[2J";
 /// unable to answer a repaint or anything else, where the screen has to come
 /// back all the same: from the kept copy, which is what the user looks at
 /// until the server is free.
-fn a_kept_clients_screen_comes_back(tag: &str, in_band: bool) {
+///
+/// With the fade on (`fade`), the copy is the fade's shadow and the screen is
+/// dissolved back in from it rather than painted straight back.
+fn a_kept_clients_screen_comes_back(tag: &str, in_band: bool, fade: bool) {
     require_nvim!();
     let scratch = Scratch::new(tag);
     let t = scratch.transport();
@@ -647,7 +658,7 @@ fn a_kept_clients_screen_comes_back(tag: &str, in_band: bool) {
     ))
     .expect("setline");
 
-    let mut term = Terminal::spawn_keeping(&sock, &session.id, in_band);
+    let mut term = Terminal::spawn_keeping(&sock, &session.id, in_band, fade);
     // Painted, and — on a terminal that offers them — taking its size in
     // band, which the client turns on once the terminal's answers are in.
     assert!(
@@ -663,6 +674,16 @@ fn a_kept_clients_screen_comes_back(tag: &str, in_band: bool) {
         in_band,
         "the client did not take up in-band size reports as the terminal offered them"
     );
+    // A client is parked only once the terminal has answered its DA1. With
+    // the fade, the marker is on the screen in the fade's frames before the
+    // client's first paint, the DA1 in it, is let through: so until the DA1
+    // has gone by, and a moment for the answer to reach the client.
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| find(out, DA1).is_some()),
+        "the client never asked its DA1; got: {}",
+        term.since(0)
+    );
+    term.pump_until(Duration::from_millis(300), |_| false);
 
     // Away to the picker's place — parked, in the child — and back, at the
     // same size, until the output after the resume has cleared the screen.
@@ -791,12 +812,20 @@ fn away_and_back(term: &mut Terminal, meanwhile: impl FnOnce(&mut Terminal)) -> 
 /// the resize alone.
 #[test]
 fn a_kept_clients_screen_comes_back_through_the_pty() {
-    a_kept_clients_screen_comes_back("kept-pty", false);
+    a_kept_clients_screen_comes_back("kept-pty", false, false);
 }
 
 /// A client that takes its size in band, and ignores the signal (kitty,
 /// ghostty, foot): told the new one with a report instead.
 #[test]
 fn a_kept_clients_screen_comes_back_on_an_in_band_terminal() {
-    a_kept_clients_screen_comes_back("kept-in-band", true);
+    a_kept_clients_screen_comes_back("kept-in-band", true, false);
+}
+
+/// With the fade on, as it is wherever the terminal answers the colour
+/// query: dissolved back in from the shadow, the pen and cursor then handed
+/// back to the client.
+#[test]
+fn a_kept_clients_screen_dissolves_back_in() {
+    a_kept_clients_screen_comes_back("kept-fade", false, true);
 }

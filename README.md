@@ -107,7 +107,7 @@ LOCAL                                    REMOTE
 nvmux                                    nvim --headless --listen <sock>
  ├─ picker UI (ratatui)                  nvim --headless --listen <sock>
  ├─ PTY proxy (watches for <prefix>)     nvim --headless --listen <sock>
- └─ child: nvim --server … --remote-ui     (detached, survive an SSH drop)
+ └─ clients: nvim --server … --remote-ui   (detached, survive an SSH drop)
       │                                             ▲
       └──── one persistent ssh master ──────────────┘
             (ControlMaster/ControlPersist), plus one
@@ -119,31 +119,6 @@ the far side never notice, and nvmux brings the link back on its own: one try
 at once and then six retries over about a minute. If the host is still
 unreachable after that, nvmux exits with the reason and a reminder that the
 session is still running; `nvmux <host>` picks it up again.
-
-### One client per session
-
-By default nvmux runs one `--remote-ui` client at a time: a switch retires it
-and starts a new one for the next session, which has to connect and wait for
-its server to send a whole screen — several round trips over ssh. With
-`[client] per_session = true`, every session you visit keeps its client, parked
-while another is in front and kept up to date. Switching back puts that
-session's screen straight back on the terminal and asks its server for its own
-on top: no new process and nothing to wait for, even while the editor is busy
-or waiting on a prompt, which the screen then shows.
-
-It is off by default because a parked client is still a UI of its session,
-until nvmux exits:
-
-- another UI on the same session shares its screen with it, at the smaller of
-  the two sizes — including a second nvmux of your own, whose parked clients
-  keep the size its terminal had when it last left each session;
-- switching away no longer fires `UILeave` in the session, nor switching back
-  `UIEnter`;
-- every session visited keeps an idle `nvim` client (about 1.5 MB of its own,
-  and a copy of its screen in nvmux) and its ssh forward, and a session that
-  keeps redrawing — a `:terminal` running something — keeps sending it frames,
-  over the link for a remote one;
-- there is no limit on how many are kept: one per session visited.
 
 ## Configuration
 
@@ -163,7 +138,7 @@ timeout_ms = 1000           # how long a lone prefix or half-typed number waits
 command = "nvim --headless --listen {sock}"   # {sock} is required
 
 [client]
-per_session = false   # keep a client per session; see "One client per session"
+per_session = true   # keep each session's client; a switch back reuses it
 
 [fade]
 enabled     = true   # dissolve between screens; NO_COLOR forces this off

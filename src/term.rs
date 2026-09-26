@@ -143,19 +143,21 @@ const MOUSE_BUTTONS: &[u8] = b"\x1b[?1003l\x1b[?1002h\x1b[?1006h";
 /// Turn mouse reporting on, for a screen of nvmux's own.
 ///
 /// Every screen does, whatever is behind it, and turns it off again as it
-/// closes ([`disable_mouse`]). A held client's own setting is put back by the
-/// relay as it resumes the client, with [`set_mouse_reporting`]: a
+/// closes ([`disable_mouse`]). A resumed client's own setting is put back by
+/// the relay as it resumes the client, with [`set_mouse_reporting`]: a
 /// `--remote-ui` client enables the mouse once, at startup, and never again
 /// (as it enters the alternate screen once, see [`enter_alt_screen_and_clear`]),
-/// so nothing but nvmux can put the terminal back the way the client left it —
-/// and what the client had is a question for its server, which the resume
-/// already asks to repaint.
+/// so nothing but nvmux can put the terminal back the way the client left it.
+/// What the client had comes from its ledger for a kept client
+/// (`[client] per_session`, the default), and for a held one is a question
+/// for its server, which that resume already asks to repaint.
 pub fn enable_mouse() {
     let _ = write_stdout(MOUSE_ON);
 }
 
 /// Put mouse reporting back to what a client being resumed had, after a screen
-/// that set its own. See [`crate::pty`], which asks the client's server.
+/// that set its own. See [`crate::pty`], which takes it from a kept client's
+/// ledger or asks a held client's server.
 pub fn set_mouse_reporting(reporting: MouseReporting) {
     let _ = write_stdout(match reporting {
         MouseReporting::Off => MOUSE_OFF,
