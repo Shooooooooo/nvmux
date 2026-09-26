@@ -25,6 +25,13 @@
 //! sequence — a delay of microseconds, until the client writes the rest of
 //! them, and only while there is a notice on screen to protect.
 //!
+//! A kept client (`[client] per_session`, the default) is watched by two more,
+//! each shown a copy as the shadow is. Its ledger ([`crate::ledger`]) notes
+//! what the client told the terminal, so that it can be told again — the
+//! client's own sequences, replayed, never rewritten — when the client comes
+//! back to the front (see [`Attachment::put_back_what_it_told`]). And, with
+//! the fade off, a copy of its screen stands in for the shadow.
+//!
 //! The direction is also *held* once per relay: with the fade on, a session's
 //! first paint is kept back from the terminal until it has settled, so the
 //! shadow can be dissolved in first, and is then written out exactly as it
@@ -34,7 +41,7 @@
 //! it takes as it takes any answer. **A held byte — by either of the two — is
 //! never dropped, reordered or changed.**
 //!
-//! Three things ever *join* this direction. The attach notice (see
+//! Four things ever *join* this direction. The attach notice (see
 //! [`crate::announce`]): a box, drawn where the child's own bytes leave the
 //! terminal between escape sequences, which [`crate::boundary`] finds with a
 //! decoder rather than with a clock, and written inside a synchronized update
@@ -48,8 +55,11 @@
 //! ([`crate::fade`]), written before the held first paint and after the relay
 //! has stopped. And the hint bar ([`crate::hint`]): the prefix's one-row bar,
 //! written at a lull and put back from the shadow, and never fed to it either.
+//! And a kept client's screen, painted back from its copy as the client
+//! returns to the front with no fade to dissolve it in (see
+//! [`Attachment::paint_kept_screen`]).
 //!
-//! None of them is ever fed back to the shadow. All three are nvmux's own
+//! None of them is ever fed back to the shadow. All four are nvmux's own
 //! picture of the screen rather than the session's bytes, and the notice's
 //! frames are composited *out of* the shadow — so showing them to it would
 //! have it holding nvmux's drawing of the editor with a box in the middle, and
@@ -196,7 +206,8 @@ pub struct Attachment {
     reaped: bool,
     /// The session's screen as its bytes have described it, kept so the
     /// session can be dissolved in and out (see [`crate::shadow`]). `None`
-    /// with the fade off or `fade.session` false, and then nothing is parsed.
+    /// with the fade off or `fade.session` false, and then nothing is parsed
+    /// unless the client is kept, which parses into `screen` instead.
     shadow: Option<shadow::Shadow>,
     /// A kept client's copy of its screen, where there is no shadow to be one:
     /// fed exactly as the shadow is, by [`Attachment::shadow_saw`], and used
@@ -1143,10 +1154,10 @@ impl Attachment {
         // writes on the way out describes a screen that has already been cleared
         // or restored, so none of it is wanted — but it has to be *read*, because
         // a client parked in `write` on a master nobody drains never reaches its
-        // own signal handler. That is not hypothetical on the switch path: the
-        // picker leaves the outgoing client unread for as long as it is up, and a
-        // client that was mid-repaint when the switch was typed fills the buffer
-        // and stops there. Without this it cannot act on the hangup at all, and
+        // own signal handler. That is not hypothetical on the switch path with
+        // clients not kept: the picker leaves the outgoing client unread for as
+        // long as it is up, and a client that was mid-repaint when the switch was
+        // typed fills the buffer and stops there. Without this it cannot act on the hangup at all, and
         // a healthy client ends up killed by the deadline below.
         let master = self.master.as_raw_fd();
         let deadline = Instant::now() + REAP_TIMEOUT;
@@ -1179,16 +1190,18 @@ impl Attachment {
     /// Answer the DA1 request a departing client has just sent, as its terminal
     /// would have.
     ///
-    /// **This is worth a full second on every switch.** Neovim's shutdown path
-    /// (`tui.c`, `tui_stop`) emits its terminal restore sequences, sends `ESC [
-    /// c`, and then *waits* for the reply — `EXIT_TIMEOUT_MS`, one second —
-    /// before it will exit, so that it knows the terminal has processed
-    /// everything it sent. A client nvmux is retiring has no terminal left to
-    /// ask: nothing relays its output once the switch is typed, and a reply
-    /// could not reach it through a stopped pump in any case. So it waits out
-    /// the whole timeout, every time. Measured at 1003 ms, and it is the same
-    /// second whether the client is asked to leave with SIGHUP or with
-    /// `:detach` — both arrive at `tui_stop`.
+    /// **This is worth a full second on every client retired**: at every
+    /// switch with `[client] per_session = false`, at a detach, and for every
+    /// kept client let go. Neovim's shutdown path (`tui.c`, `tui_stop`) emits
+    /// its terminal restore sequences, sends `ESC [ c`, and then *waits* for
+    /// the reply — `EXIT_TIMEOUT_MS`, one second — before it will exit, so
+    /// that it knows the terminal has processed everything it sent. A client
+    /// nvmux is retiring has no terminal left to ask: nothing relays its
+    /// output once it is let go, and a reply could not reach it through a
+    /// stopped pump in any case. So it waits out the whole timeout, every
+    /// time. Measured at 1003 ms, and it is the same second whether the
+    /// client is asked to leave with SIGHUP or with `:detach` — both arrive at
+    /// `tui_stop`.
     ///
     /// nvmux answers because, for this client, nvmux *is* the terminal. It then
     /// goes in about 4 ms.

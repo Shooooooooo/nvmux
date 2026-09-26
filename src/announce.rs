@@ -466,9 +466,10 @@ impl Popup {
     /// of it, exactly as every other nvmux screen is.
     ///
     /// Without a shadow there is nothing to dissolve into and the box behaves
-    /// as it did before this existed: `[fade] session = false` buys off the
-    /// parse of the session's output, and this is one of the things that
-    /// parse pays for.
+    /// as it did before this existed: `[fade] session = false` does without
+    /// the shadow — and without its parse, unless the client is kept
+    /// (`[client] per_session`, the default) and parses for its own copy of
+    /// the screen — and this is one of the things the shadow pays for.
     fn draw(&self, over: &Over, under: Option<&Shadow>, t: f32) -> Vec<u8> {
         match (under, self.dissolve) {
             (Some(shadow), Some(d)) if t > 0.0 && shadow.is_usable() => {
@@ -1028,8 +1029,8 @@ mod tests {
     }
 
     /// With no shadow there is nothing to dissolve into, and the box is the
-    /// one nvmux drew before any of this: `[fade] session = false` buys off
-    /// the parse that pays for the backdrop, and must cost nothing else.
+    /// one nvmux drew before any of this: `[fade] session = false` does
+    /// without the shadow that backs the box, and must cost nothing else.
     #[test]
     fn with_no_shadow_the_box_dissolves_as_it_did_before() {
         let t0 = Instant::now();

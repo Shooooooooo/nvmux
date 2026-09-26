@@ -12,10 +12,13 @@
 //! keeping a grid of cells with their colours and attributes. **It only
 //! watches.** Nothing reaching the terminal is changed, delayed or dropped on
 //! its account; the parser sees the same bytes a moment later, and if it
-//! misreads one the only consequence is a fade frame that is slightly wrong.
-//! It costs a parse of the session's output while a session is attached, which
-//! is why `[fade] session = false` turns it off entirely rather than merely
-//! not using it.
+//! misreads one the only consequence is a frame that is slightly wrong: a
+//! fade's, or, for a kept client, the screen put back on its return, until the
+//! server's own repaint lands. It costs a parse of the session's output while
+//! a session is attached, which is why `[fade] session = false` turns it off
+//! entirely rather than merely not using it. A kept client
+//! (`[client] per_session`, the default) pays that parse anyway, for its own
+//! copy of its screen (see `pty::Attachment::paint_kept_screen`).
 //!
 //! The session's bytes, and not nvmux's own. What nvmux draws over a session —
 //! the attach notice and the hint bar ([`crate::hint`]) — is deliberately

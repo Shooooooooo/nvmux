@@ -107,7 +107,7 @@ LOCAL                                    REMOTE
 nvmux                                    nvim --headless --listen <sock>
  ├─ picker UI (ratatui)                  nvim --headless --listen <sock>
  ├─ PTY proxy (watches for <prefix>)     nvim --headless --listen <sock>
- └─ child: nvim --server … --remote-ui     (detached, survive an SSH drop)
+ └─ clients: nvim --server … --remote-ui   (detached, survive an SSH drop)
       │                                             ▲
       └──── one persistent ssh master ──────────────┘
             (ControlMaster/ControlPersist), plus one
@@ -138,7 +138,7 @@ timeout_ms = 1000           # how long a lone prefix or half-typed number waits
 command = "nvim --headless --listen {sock}"   # {sock} is required
 
 [client]
-per_session = true    # keep each session's client; a switch back reuses it
+per_session = true   # keep each session's client; a switch back reuses it
 
 [fade]
 enabled     = true   # dissolve between screens; NO_COLOR forces this off

@@ -142,7 +142,10 @@ pub struct FadeSettings {
     /// Whether a Neovim screen dissolves too — in, once its first paint has
     /// settled, and out — rather than only nvmux's own screens. Costs a
     /// running parse of the session's output while it is attached (see
-    /// [`crate::shadow`]); off, a session hard-cuts both ways.
+    /// [`crate::shadow`]); off, a session hard-cuts both ways. A kept client
+    /// (`[client] per_session`, the default) parses the same output into its
+    /// own copy of its screen either way, so off saves the parse only with
+    /// `per_session = false` too.
     ///
     /// That parse is also what the attach notice dissolves into, so off, the
     /// notice's box empties the cells it covers and waits for a repaint to
@@ -572,8 +575,8 @@ mod tests {
     }
 
     /// On unless turned off, and `false` turns it off: a parked client is a
-    /// UI its session's other users share a grid with, which is theirs to
-    /// decline.
+    /// UI its session's other users share a grid with, and `false` is how
+    /// whoever runs this nvmux spares them that.
     #[test]
     fn one_client_per_session_is_on_unless_turned_off() {
         assert!(Settings::default().client.per_session);

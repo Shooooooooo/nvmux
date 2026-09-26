@@ -129,14 +129,15 @@ impl Screen {
     /// Take the terminal — and the mouse.
     ///
     /// Every screen turns mouse reporting on for itself and off again as it
-    /// closes, whatever is behind it. Where that is a held client, the relay
-    /// puts the client's own setting back as it resumes it, having asked the
-    /// client's server what that was (see `pty::repaint`); a client spawned
-    /// next enables its own. The screens set no colours so as to inherit the
-    /// terminal's palette, but a *mode* cannot be inherited the same way — a
-    /// `--remote-ui` client enables the mouse once, at startup, and would
-    /// never re-enable a mode nvmux had turned off — which is why this is
-    /// restored by asking rather than left alone.
+    /// closes, whatever is behind it. The relay puts a resumed client's own
+    /// setting back: a kept client's (`[client] per_session`, the default)
+    /// from its ledger, as the client last wrote it (see [`crate::ledger`]),
+    /// and a held one's by asking the client's server (see `pty::repaint`); a
+    /// client spawned next enables its own. The screens set no colours so as
+    /// to inherit the terminal's palette, but a *mode* cannot be inherited the
+    /// same way — a `--remote-ui` client enables the mouse once, at startup,
+    /// and would never re-enable a mode nvmux had turned off — which is why
+    /// this is restored rather than left alone.
     pub(crate) fn open() -> Result<Self> {
         Self::open_with(true)
     }
