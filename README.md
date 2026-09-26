@@ -122,28 +122,20 @@ session is still running; `nvmux <host>` picks it up again.
 
 ### One client per session
 
-By default nvmux runs one `--remote-ui` client at a time: a switch retires it
-and starts a new one for the next session, which has to connect and wait for
-its server to send a whole screen — several round trips over ssh. With
-`[client] per_session = true`, every session you visit keeps its client, parked
-while another is in front and kept up to date. Switching back puts that
-session's screen straight back on the terminal and asks its server for its own
-on top: no new process and nothing to wait for, even while the editor is busy
-or waiting on a prompt, which the screen then shows.
+A switch normally starts a new client, which then waits for its server to send
+a whole screen: several round trips over ssh. With
+`[client] per_session = true`, each session you visit keeps its client, parked
+while another is in front, and switching back puts its screen back at once.
 
-It is off by default because a parked client is still a UI of its session,
-until nvmux exits:
+It is off by default because a parked client is still a UI of its session until
+nvmux exits:
 
-- another UI on the same session shares its screen with it, at the smaller of
-  the two sizes — including a second nvmux of your own, whose parked clients
-  keep the size its terminal had when it last left each session;
-- switching away no longer fires `UILeave` in the session, nor switching back
-  `UIEnter`;
-- every session visited keeps an idle `nvim` client (about 1.5 MB of its own,
-  and a copy of its screen in nvmux) and its ssh forward, and a session that
-  keeps redrawing — a `:terminal` running something — keeps sending it frames,
-  over the link for a remote one;
-- there is no limit on how many are kept: one per session visited.
+- another UI on the session, a second nvmux included, is held to the smaller of
+  the two sizes;
+- `UILeave` and `UIEnter` no longer fire on a switch;
+- every session visited keeps an idle client (about 1.5 MB), a copy of its
+  screen and its ssh forward, and keeps receiving its redraws, with no limit on
+  how many.
 
 ## Configuration
 
