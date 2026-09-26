@@ -120,23 +120,6 @@ at once and then six retries over about a minute. If the host is still
 unreachable after that, nvmux exits with the reason and a reminder that the
 session is still running; `nvmux <host>` picks it up again.
 
-### One client per session
-
-A switch normally starts a new client, which then waits for its server to send
-a whole screen: several round trips over ssh. With
-`[client] per_session = true`, each session you visit keeps its client, parked
-while another is in front, and switching back puts its screen back at once.
-
-It is off by default because a parked client is still a UI of its session until
-nvmux exits:
-
-- another UI on the session, a second nvmux included, is held to the smaller of
-  the two sizes;
-- `UILeave` and `UIEnter` no longer fire on a switch;
-- every session visited keeps an idle client (about 1.5 MB), a copy of its
-  screen and its ssh forward, and keeps receiving its redraws, with no limit on
-  how many.
-
 ## Configuration
 
 nvmux needs no configuration. An optional TOML file — `$NVMUX_CONFIG` if set,
@@ -155,7 +138,7 @@ timeout_ms = 1000           # how long a lone prefix or half-typed number waits
 command = "nvim --headless --listen {sock}"   # {sock} is required
 
 [client]
-per_session = false   # keep a client per session; see "One client per session"
+per_session = true    # keep each session's client; a switch back reuses it
 
 [fade]
 enabled     = true   # dissolve between screens; NO_COLOR forces this off

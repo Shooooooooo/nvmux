@@ -1,20 +1,20 @@
 //! The clients kept for the sessions that are not in front.
 //!
-//! With `[client] per_session` off — the default — nvmux has one client at a
-//! time. A switch retires it and starts another, and the client that
-//! `<prefix> Space`, `<prefix> c` and `<prefix> ?` come back to is simply held,
-//! unread, until they do. That path does not come through here at all:
-//! [`Pool::set_aside`] hands the client straight back, and a `Pool` that has
-//! never been given one has nothing to take.
+//! On — `[client] per_session`, the default — every client that leaves the
+//! front is parked (see [`crate::pty::Parked`]), one per session, and a
+//! return to that session — from the picker, the prompt, the help, or a
+//! switch — takes it back out: a resume, not a spawn. The screen the client
+//! last had goes straight back on the terminal, with what it told the
+//! terminal, and its server's own is asked for on top (see `pty::relay`). The
+//! cost is that each one stays a UI of its session's server until nvmux
+//! leaves, which is why it can be turned off.
 //!
-//! On, every client that leaves the front is parked instead (see
-//! [`crate::pty::Parked`]), one per session, and a return to that session —
-//! from the picker, the prompt, the help, or a switch — takes it back out: a
-//! resume, not a spawn. The screen the client last had goes straight back on
-//! the terminal, with what it told the terminal, and its server's own is
-//! asked for on top (see `pty::relay`). The cost is that each one
-//! stays a UI of its session's server until nvmux leaves, which is why it is
-//! off unless asked for.
+//! Off, nvmux has one client at a time. A switch retires it and starts
+//! another, and the client that `<prefix> Space`, `<prefix> c` and
+//! `<prefix> ?` come back to is simply held, unread, until they do. That path
+//! does not come through here at all: [`Pool::set_aside`] hands the client
+//! straight back, and a `Pool` that has never been given one has nothing to
+//! take.
 
 use crate::pty::{Attachment, Parked};
 use crate::session::Session;

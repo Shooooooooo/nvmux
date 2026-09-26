@@ -3599,10 +3599,13 @@ mod tests {
             cmd,
         )
         .expect("spawn sh");
-        // Nothing to announce and no shadow unless a test installs one: keep
-        // the fixture independent of the fade/palette process globals.
+        // Nothing to announce, no shadow and not kept unless a test installs
+        // them: keep the fixture independent of the fade/palette process
+        // globals and of `[client] per_session`.
         a.announce = None;
         a.shadow = None;
+        a.screen = None;
+        a.ledger = None;
         a
     }
 

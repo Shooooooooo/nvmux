@@ -76,7 +76,7 @@ pub struct SessionSettings {
 }
 
 /// The local `nvim --remote-ui` client that draws a session (see [`crate::pty`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClientSettings {
     /// Keep one client per session rather than one in all.
@@ -90,11 +90,18 @@ pub struct ClientSettings {
     /// server for its own on top: no fork, no probe, and nothing to wait for
     /// (see [`crate::pty::Parked`]).
     ///
-    /// Off by default, because a parked client is still a UI of its session's
-    /// server: another UI on the same session — another nvmux, another
-    /// machine — shares its grid with it, at the smaller of the two sizes, and
-    /// every session visited keeps an idle client process until nvmux leaves.
+    /// On by default. The cost, and the reason to turn it off, is that a
+    /// parked client is still a UI of its session's server: another UI on
+    /// the same session — another nvmux, another machine — shares its grid
+    /// with it, at the smaller of the two sizes, and every session visited
+    /// keeps an idle client process until nvmux leaves.
     pub per_session: bool,
+}
+
+impl Default for ClientSettings {
+    fn default() -> Self {
+        Self { per_session: true }
+    }
 }
 
 /// The fade between screens (see [`crate::fade`]): each one dissolves into the
@@ -402,9 +409,9 @@ fn render_default_config(prefix: u8) -> String {
          # command = {command:?}\n\
          \n\
          [client]\n\
-         # One Neovim client per session, parked while another is in front, so a\n\
-         # switch back puts the screen back at once. Each is one more UI on its\n\
-         # session.\n\
+         # Keep each session's Neovim client while another is in front, so a\n\
+         # switch back puts its screen back at once. Each one kept is one more UI\n\
+         # on its session; false starts a new client on every switch.\n\
          # per_session = {per_session}\n\
          \n\
          [fade]\n\
@@ -492,7 +499,7 @@ mod tests {
             [session]\n\
             command = \"nvim --headless --listen {sock}\"\n\
             [client]\n\
-            per_session = false\n\
+            per_session = true\n\
             [fade]\n\
             enabled = true\n\
             duration_ms = 200\n\
@@ -545,13 +552,14 @@ mod tests {
         assert!(!s.fade.enabled);
     }
 
-    /// Off unless asked for: a parked client is a UI its session's other users
-    /// share a grid with, which nobody should get without having chosen it.
+    /// On unless turned off, and `false` turns it off: a parked client is a
+    /// UI its session's other users share a grid with, which is theirs to
+    /// decline.
     #[test]
-    fn one_client_per_session_is_off_unless_asked_for() {
-        assert!(!Settings::default().client.per_session);
-        let s: Settings = toml::from_str("[client]\nper_session = true\n").expect("valid");
-        assert!(s.client.per_session);
+    fn one_client_per_session_is_on_unless_turned_off() {
+        assert!(Settings::default().client.per_session);
+        let s: Settings = toml::from_str("[client]\nper_session = false\n").expect("valid");
+        assert!(!s.client.per_session);
         assert_eq!(s.fade, FadeSettings::default());
         assert_eq!(s.session, SessionSettings::default());
     }
@@ -691,7 +699,7 @@ mod tests {
         assert!(rendered.contains("\n[fade]\n"), "{rendered:?}");
         assert!(rendered.contains("\n[client]\n"), "{rendered:?}");
         for line in [
-            "# per_session = false",
+            "# per_session = true",
             "# enabled     = true",
             "# duration_ms = 200",
             "# session     = true",
