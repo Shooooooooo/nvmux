@@ -65,6 +65,15 @@ The host string is handed to `ssh` verbatim, so a hostname, `user@host`, or any
 hardware keys, because nvmux drives your own ssh client rather than
 reimplementing it.
 
+### Making a session
+
+`c` in the picker, or `<prefix> c` from a session, first asks where the new
+session goes: a `⇕` row appears just below the cursor, with stars running
+through the space a name would take. Move it with `↑`/`↓` or the mouse, press
+`⏎` to place it, then name it. The sessions below it move down a number. `Esc`
+goes back a step — from the name to the placing, and from the placing to where
+you started.
+
 ### While attached
 
 `<prefix>` is `Ctrl-Space` unless you change it in the [config](#configuration).

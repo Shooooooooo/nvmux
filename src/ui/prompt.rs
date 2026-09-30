@@ -1,9 +1,10 @@
 //! The naming prompt — the only place a session is named, and the only place
 //! one is created.
 //!
-//! Three ways in: `<prefix> c` from an attached session, and `c` or `r` from the
-//! picker. [`run`] owns a terminal for the first, `run_on` borrows one for the
-//! others; a `Task` says whether a session is being invented or renamed.
+//! Two ways in, both through the picker: `c`, once the new session's place in
+//! the list has been chosen — `<prefix> c` opens the picker for exactly that —
+//! and `r`. `run_on` borrows the picker's terminal for both; a `Task` says
+//! whether a session is being invented or renamed.
 //!
 //! It owns the whole screen rather than replacing a hint line, per the contract
 //! in the parent module. Three weights carry the three kinds of text — dim for
@@ -26,8 +27,8 @@
 //! Creating asks three questions — what the session is called, how its Neovim is
 //! started, and where it runs — and asks them together rather than one after the
 //! other. Enter submits the whole form from whichever field it is pressed in, so
-//! `<prefix> c` followed by enter still creates a session in one keystroke and
-//! the second and third questions cost nothing to anyone who does not want them.
+//! the enter after placing the session creates it with nothing typed, and the
+//! second and third questions cost nothing to anyone who does not want them.
 //! Renaming puts up the same screen with one field, since a rename starts
 //! nothing.
 //!
@@ -135,8 +136,8 @@
 //!
 //! With a menu open it takes what is highlighted, which is the reflex after
 //! choosing one; accepting closes the menu, so the second enter creates.
-//! Otherwise it creates, from any field — so `<prefix> c` then enter is still a
-//! session in one keystroke, in the home directory.
+//! Otherwise it creates, from any field — so `<prefix> c`, enter to place it and
+//! enter again is a session with nothing typed, in the home directory.
 //!
 //! # Nothing waits for a keystroke
 //!
@@ -759,37 +760,20 @@ fn aligned(labels: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// Ask for a new session, owning the terminal while it does — for `<prefix> c`,
-/// which arrives from an attached session with none to borrow.
-///
-/// [`Outcome::Created`] leads straight to a client spawn, exactly as the picker's
-/// attach does, so the terminal goes back cleared on that one outcome and the
-/// session being left is not what fills the spawn. A cancelled prompt goes back
-/// to the same client, which is repainted, so it takes the ordinary close.
-pub fn run(transport: &dyn Transport) -> Result<Outcome> {
-    // Reached from a session that has just dissolved out, so dissolve in.
-    super::owning_for_attach(Outcome::attaches, true, |terminal| {
-        run_on(
-            terminal,
-            transport,
-            Task::Create { listed: None },
-            crate::fade::excursions(),
-        )
-    })
-}
-
 /// Ask on a terminal the caller already owns — how the picker drives this
 /// screen for `c` and `r`.
 ///
-/// Not `run`: a second terminal inside the picker's would enter the alternate
-/// screen twice and leave it once. Sharing it also makes the handover
-/// invisible, since `Terminal::draw` resets the frame each pass.
+/// Borrowed rather than taken: a second terminal inside the picker's would
+/// enter the alternate screen twice and leave it once. Sharing it also makes
+/// the handover invisible, since `Terminal::draw` resets the frame each pass.
 ///
-/// `animate` is whether to dissolve in on the way in, and out on a cancel:
-/// true from a session, whose screen has just dissolved out and which takes
-/// over again from the background; false from the picker, whose screen is
-/// already up and simply comes back. A create dissolves out *either* way — a
-/// client spawn follows, and this is the screen that is up when it does.
+/// Not dissolved in, nor out on a cancel or a rename: the picker's screen is
+/// already up, and simply comes back. A create does dissolve out — a client
+/// spawn follows, and this is the screen that is up when it does.
+///
+/// [`Outcome::Created`] leads straight to that spawn, exactly as the picker's
+/// attach does, which is why [`Outcome::attaches`] names it: the picker gives
+/// the terminal back cleared on that one outcome.
 ///
 /// A create takes the caller's listing, when it has one, for its default name
 /// — see [`Task::Create`] — so the picker's `c` costs no script run on the way
@@ -798,7 +782,6 @@ pub(super) fn run_on(
     terminal: &mut ratatui::DefaultTerminal,
     transport: &dyn Transport,
     task: Task,
-    animate: bool,
 ) -> Result<Outcome> {
     let mut prompt = match task {
         Task::Create { listed } => Prompt::create(
@@ -823,10 +806,6 @@ pub(super) fn run_on(
     // already in hand when the first one is, which is the difference between the
     // field feeling instant and it paying a round trip to say its first word.
     refresh(&mut prompt, completer.as_mut());
-
-    if animate {
-        crate::fade::fade_in(terminal, |f| draw(f, &prompt))?;
-    }
 
     loop {
         terminal.draw(|f| draw(f, &prompt))?;
@@ -856,12 +835,7 @@ pub(super) fn run_on(
 
         let submission = match step {
             Step::None => continue,
-            Step::Cancel => {
-                if animate {
-                    crate::fade::fade_out(terminal, |f| draw(f, &prompt))?;
-                }
-                return Ok(Outcome::Cancelled);
-            }
+            Step::Cancel => return Ok(Outcome::Cancelled),
             Step::Submit(submission) => submission,
         };
 
@@ -899,10 +873,9 @@ pub(super) fn run_on(
 
         match committed {
             Ok(outcome) => {
-                // Out through the background on the way to a client spawn,
-                // whoever called; a rename only comes back to a picker that
-                // is about to redraw, so it dissolves only if it dissolved in.
-                if outcome.attaches() || animate {
+                // Out through the background on the way to a client spawn; a
+                // rename only comes back to a picker that is about to redraw.
+                if outcome.attaches() {
                     crate::fade::fade_out(terminal, |f| draw(f, &prompt))?;
                 }
                 return Ok(outcome);
@@ -1505,8 +1478,8 @@ mod tests {
         );
     }
 
-    /// The zero-keystroke path `<prefix> c` used to be has to survive every
-    /// field added since: enter on an untouched form means "every placeholder".
+    /// The nothing-typed path through `<prefix> c` has to survive every field
+    /// added since: enter on an untouched form means "every placeholder".
     #[test]
     fn enter_on_an_untouched_form_submits_every_default() {
         let mut p = prompt();

@@ -116,18 +116,22 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     // place of another session's says where the user has landed, as a fresh
     // client does.
     let mut shown: Option<String> = None;
+    // What the next trip through the picker opens to: the list, or — after
+    // `<prefix> c` — choosing where the new session goes, below `focus`.
+    let mut start = ui::Start::Browse;
 
     loop {
-        // `<prefix> c` moves this to the session it just created. A client held
-        // across the trip — or parked, if clients are kept — is what `Esc` goes
-        // back to; without one — the first screen, a failed attach, a session
-        // that exited — there is nothing behind the picker and `Esc` says so by
+        // A client held across the trip — or parked, if clients are kept — is
+        // what `Esc` goes back to, from the list or from placing a new session;
+        // without one — the first screen, a failed attach, a session that
+        // exited — there is nothing behind the picker and `Esc` says so by
         // doing nothing.
         let (mut current, mut listing) = match ui::run(
             transport,
             message.take(),
             focus.as_deref(),
             attached.is_some() || focus.as_deref().is_some_and(|id| pool.holds(id)),
+            std::mem::replace(&mut start, ui::Start::Browse),
         )? {
             ui::Outcome::Quit => {
                 // A client held across `<prefix> Space` is retired explicitly; its
@@ -326,19 +330,14 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     }
                 }
                 (pty::Outcome::CreateNew, held) => {
-                    // Held rather than killed, so a cancelled prompt resumes it.
+                    // Held rather than killed, so backing out resumes it. To
+                    // the picker, which asks where the new session goes before
+                    // it asks what to call it: what comes back is an attach,
+                    // to the new session with the listing it now belongs to,
+                    // or to this one if the user backed out.
                     attached = pool.set_aside(held);
-                    if let ui::prompt::Outcome::Created(session) = ui::prompt::run(transport)? {
-                        // A new session can be numbered above anything the
-                        // relay was told about, and the hint decides how long a
-                        // digit waits. It is also a row the listing in hand does
-                        // not have, and `<prefix> n` from here has to be able to
-                        // find its way back to it.
-                        highest = highest.max(session.state.num);
-                        listing.push(session.clone());
-                        current = session;
-                    }
-                    continue;
+                    start = ui::Start::Create;
+                    break;
                 }
                 (pty::Outcome::ShowHelp, held) => {
                     attached = pool.set_aside(held);

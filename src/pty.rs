@@ -114,8 +114,8 @@ pub enum Outcome {
     ToPicker,
     /// `<prefix> d` — detach and exit, leaving the session running.
     Detached,
-    /// `<prefix> c` — prompt for a name and create a new session. The child keeps
-    /// running, so a cancelled prompt puts the user straight back.
+    /// `<prefix> c` — choose where a new session goes, then name and create it.
+    /// The child keeps running, so backing out puts the user straight back.
     CreateNew,
     /// `<prefix> ?` — show the key bindings. The child keeps running.
     ShowHelp,

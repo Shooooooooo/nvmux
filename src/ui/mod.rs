@@ -5,9 +5,11 @@
 //! [`prompt`] and [`help`] are the other two screens. Both take the whole
 //! terminal rather than drawing over anything, share the same vocabulary
 //! (centred content, one dim hint row, no borders, no colour), and hand the
-//! same client back afterwards. `prompt::run` owns a terminal for `<prefix> c`,
-//! which arrives with none; `prompt::run_on` borrows the picker's — nesting the
-//! two would enter the alternate screen twice and leave it once.
+//! same client back afterwards. The prompt is only ever reached through the
+//! picker — `<prefix> c` opens the picker to choose the new session's place
+//! first — so `prompt::run_on` borrows the picker's terminal rather than taking
+//! one: nesting the two would enter the alternate screen twice and leave it
+//! once.
 //!
 //! [`attaching`] is a fourth, and the odd one out: not a screen the user works
 //! on but the wait between the picker (or a `<prefix>` switch) and the session,
@@ -53,8 +55,20 @@ pub mod draw;
 pub mod help;
 pub mod prompt;
 pub mod setup;
+pub mod starfield;
 #[cfg(test)]
 pub(crate) mod test_support;
+
+/// What the picker opens to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Start {
+    /// The list, as it always has.
+    Browse,
+    /// Choosing a new session's place, with the placeholder just below the
+    /// session the picker was opened from: `<prefix> c`. Backing out goes back
+    /// to that session (see [`app::Mode::Place`]).
+    Create,
+}
 
 /// What the picker returned.
 #[derive(Debug, Clone)]
@@ -62,7 +76,9 @@ pub enum Outcome {
     /// Attach to this session.
     Attach {
         session: Session,
-        /// The listing the picker was showing.
+        /// The listing the picker was showing — or, after a new session was
+        /// placed among its rows, the one listed once its place was stored
+        /// (see `settle`).
         ///
         /// Carried out rather than re-listed, for the reason the picker already
         /// resolves its own keys against the list in hand: a listing is a script
@@ -302,14 +318,18 @@ pub(crate) fn poll_key_for(tick: Duration) -> Result<Option<Key>> {
 /// what makes `Esc` a way back to it rather than a key that does nothing. It is
 /// false where the picker is all there is: the first screen of the program, and
 /// the trip back from a failed attach or a session whose child exited.
+///
+/// `start` is what it opens to: the list, or — for `<prefix> c` — choosing
+/// where a new session goes, below `focused`.
 pub fn run(
     transport: &dyn Transport,
     message: Option<String>,
     focused: Option<&str>,
     still_attached: bool,
+    start: Start,
 ) -> Result<Outcome> {
     owning_for_attach(Outcome::attaches, true, |terminal| {
-        run_loop(terminal, transport, message, focused, still_attached)
+        run_loop(terminal, transport, message, focused, still_attached, start)
     })
 }
 
@@ -319,6 +339,7 @@ fn run_loop(
     message: Option<String>,
     focused: Option<&str>,
     still_attached: bool,
+    start: Start,
 ) -> Result<Outcome> {
     let mut app = App::new(transport.list_sessions()?);
     if let Some(id) = focused {
@@ -330,44 +351,75 @@ fn run_loop(
     if let Some(msg) = message {
         app.set_message(msg);
     }
+    // What `<prefix> c` asks for, carried out before the first key as though
+    // `c` had been pressed on the session's own row: the placeholder below it,
+    // or, with no rows to place among, the name at once.
+    let mut queued = match start {
+        Start::Browse => None,
+        Start::Create => Some(app.begin_placing(true)),
+    };
 
     // Dissolve the picker up out of the background before taking any input.
     // In place of a first draw: the fade's last frame is the plain screen, so
-    // the loop's own first `draw` repaints nothing.
-    crate::fade::fade_in(terminal, |f| draw::draw(f, &app))?;
+    // the loop's own first `draw` repaints nothing. `<prefix> c` is one of the
+    // quick excursions `[fade] excursions` governs, as it was when it opened
+    // the prompt directly.
+    if start == Start::Browse || crate::fade::excursions() {
+        crate::fade::fade_in(terminal, |f| draw::draw(f, &app))?;
+    }
 
     // When a half-typed session number must be settled. `App` decides every
     // unambiguous digit on its own, so this is only ever set when one number is
     // a prefix of another — sessions 1 and 12 both present.
     let mut deadline: Option<Instant> = None;
+    // When the placeholder's stars were last moved on. The clock lives here
+    // for the same reason the digit deadline does.
+    let mut ticked = Instant::now();
 
     loop {
+        let now = Instant::now();
+        app.tick(now - ticked);
+        ticked = now;
+
         // The area kept for the mouse: a click is resolved against the screen
         // as it was last drawn, which is the one the user clicked on.
         let area = terminal.draw(|f| draw::draw(f, &app))?.area;
 
-        if !event::poll(TICK)? {
-            // The clock lives here rather than in `App`, which stays pure —
-            // the same split `pty::pump` uses for `keys::Prefix`.
-            if deadline.is_some_and(|d| Instant::now() >= d) {
-                deadline = None;
-                if let Request::Attach(id) = app.resolve_pending() {
-                    if let Some(session) = app.session(&id).cloned() {
-                        return leave_to_session(terminal, &app, session);
+        let request = match queued.take() {
+            Some(request) => request,
+            None => {
+                // A frame's wait while the placeholder's stars are moving, and
+                // only then: the rest of the time the picker changes on a key
+                // and nothing else, and waits the ordinary tick.
+                let tick = if app.placing() {
+                    crate::fade::FRAME
+                } else {
+                    TICK
+                };
+                if !event::poll(tick)? {
+                    // The clock lives here rather than in `App`, which stays
+                    // pure — the same split `pty::pump` uses for `keys::Prefix`.
+                    if deadline.is_some_and(|d| Instant::now() >= d) {
+                        deadline = None;
+                        if let Request::Attach(id) = app.resolve_pending() {
+                            if let Some(session) = app.session(&id).cloned() {
+                                return leave_to_session(terminal, &app, session);
+                            }
+                        }
                     }
+                    continue;
+                }
+                match event::read()? {
+                    Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(translate(k)),
+                    Event::Mouse(m) => {
+                        match translate_mouse(m, draw::row_at(&app, area, m.column, m.row)) {
+                            Some(mouse) => app.on_mouse(mouse),
+                            None => continue,
+                        }
+                    }
+                    _ => continue,
                 }
             }
-            continue;
-        }
-        let request = match event::read()? {
-            Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(translate(k)),
-            Event::Mouse(m) => {
-                match translate_mouse(m, draw::row_at(&app, area, m.column, m.row)) {
-                    Some(mouse) => app.on_mouse(mouse),
-                    None => continue,
-                }
-            }
-            _ => continue,
         };
         deadline = app
             .pending()
@@ -401,19 +453,14 @@ fn run_loop(
                     prompt::Task::Create {
                         listed: Some(app.sessions()),
                     },
-                    false,
                 )? {
                     prompt::Outcome::Created(session) => {
-                        // Appended rather than re-listed: the picker's rows are
-                        // still accurate and this is the one row they are
-                        // missing, so the caller gets a listing that includes
-                        // what it is about to attach to without another script
-                        // run. Order does not matter to either reader — one
-                        // takes a maximum, the other looks up a number.
-                        let mut sessions = app.sessions().to_vec();
-                        sessions.push(session.clone());
+                        let (session, sessions) = settle(&app, transport, session);
                         return Ok(Outcome::Attach { session, sessions });
                     }
+                    // Back to the placeholder, where it was left: the mode is
+                    // still standing. Or, where there was nothing to place
+                    // among, back to the list.
                     prompt::Outcome::Cancelled => {}
                     prompt::Outcome::Renamed => refresh(&mut app, transport)?,
                 }
@@ -422,7 +469,7 @@ fn run_loop(
             Request::RenameSession(id) => {
                 if let Some(session) = app.session(&id).cloned() {
                     let outcome =
-                        prompt::run_on(terminal, transport, prompt::Task::Rename(&session), false)?;
+                        prompt::run_on(terminal, transport, prompt::Task::Rename(&session))?;
                     if !matches!(outcome, prompt::Outcome::Cancelled) {
                         refresh(&mut app, transport)?;
                     }
@@ -479,6 +526,61 @@ fn leave_to_session(
         session,
         sessions: app.sessions().to_vec(),
     })
+}
+
+/// Put a session just created where its placeholder was, and hand back the
+/// session and the listing the caller attaches with.
+///
+/// Created last, a session is numbered last. Placing it anywhere else is a
+/// renumber — the batch a reorder writes, from [`App::placement_of`] — and then
+/// a listing, since what the numbers now are is a listing's answer and not
+/// ours (the reorder above says why). That is two round trips over ssh, paid
+/// only for a place other than the end.
+///
+/// Placed last, nothing is written and nothing listed: the picker's rows plus
+/// the new one are the listing, as they always were — the rows are still
+/// accurate and this is the one they are missing. Order does not matter to
+/// either reader of it — one takes a maximum, the other looks up a number.
+///
+/// Neither step may lose the session, which exists by now. A renumber that
+/// fails leaves it attached where it was created, last; a listing that fails
+/// falls back to the rows in hand. Both are logged, since there is no screen
+/// left to say so on — the next thing on it is the session.
+fn settle(app: &App, transport: &dyn Transport, session: Session) -> (Session, Vec<Session>) {
+    let mut appended = app.sessions().to_vec();
+    appended.push(session.clone());
+
+    let order = app.placement_of(&session.id);
+    if order.is_empty() {
+        return (session, appended);
+    }
+    let batch: Vec<Session> = order
+        .into_iter()
+        .filter_map(|(id, num)| {
+            appended.iter().find(|s| s.id == id).cloned().map(|mut s| {
+                s.num = num;
+                s
+            })
+        })
+        .collect();
+    if let Err(e) = transport.renumber(&batch) {
+        tracing::warn!(id = %session.id, error = %e, "could not place the new session");
+        return (session, appended);
+    }
+    match transport.list_sessions() {
+        Ok(listing) => {
+            let placed = listing
+                .iter()
+                .find(|s| s.id == session.id)
+                .cloned()
+                .unwrap_or(session);
+            (placed, listing)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not list the sessions after placing one");
+            (session, appended)
+        }
+    }
 }
 
 /// Re-list, restoring the selection by id (`set_sessions` does that).

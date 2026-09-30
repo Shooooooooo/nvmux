@@ -23,6 +23,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use super::app::{App, Mode};
+use crate::session::Session;
 
 /// The marker on the selected row. Unselected rows are indented to match, so
 /// names stay in one column and nothing shifts as the selection moves.
@@ -90,6 +91,43 @@ const EMPTY: &str = "no sessions — press c to create one";
 /// habit and never needed by anyone reading the row.
 const REORDER_HINTS: &str = "↑↓ move  ⏎ place  esc cancel";
 
+/// What the hint row says while a new session's place is being chosen: the
+/// reorder row, which it is in every key, led by what the row being moved is.
+/// The placeholder carries no label of its own — its stars fill the column a
+/// name would — so this is where the screen says a new session is coming.
+const PLACE_HINTS: &str = "new session  ↑↓ move  ⏎ place  esc cancel";
+
+/// One row of the list as drawn: a session, or the placeholder a new session
+/// is being placed with.
+#[derive(Clone, Copy)]
+enum Row<'a> {
+    Session(&'a Session),
+    Placeholder,
+}
+
+/// The rows the list draws, in order: the visible sessions, with the
+/// placeholder in among them while a place is being chosen.
+///
+/// Everything that measures, scrolls or hit-tests the list goes through this,
+/// so the placeholder is one more row to all of them and a click lands on the
+/// row the eye sees.
+fn rows(app: &App) -> Vec<Row<'_>> {
+    let mut rows: Vec<Row> = app.visible().into_iter().map(Row::Session).collect();
+    if let Mode::Place { at, .. } = app.mode() {
+        rows.insert((*at).min(rows.len()), Row::Placeholder);
+    }
+    rows
+}
+
+/// The row the list keeps in view, and the one drawn as the cursor: the
+/// placeholder while there is one, the selection otherwise.
+fn cursor(app: &App) -> usize {
+    match app.mode() {
+        Mode::Place { at, .. } => *at,
+        _ => app.selected_index(),
+    }
+}
+
 pub fn draw(frame: &mut Frame, app: &App) {
     let (text, dim) = hint_line(app);
     screen(frame, &text, dim, |frame, body| draw_list(frame, app, body));
@@ -153,9 +191,9 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
     }
-    let visible = app.visible();
+    let rows = rows(app);
 
-    if visible.is_empty() {
+    if rows.is_empty() {
         draw_hint_row(frame, centre_vertically(area, 1), EMPTY, true);
         return;
     }
@@ -178,40 +216,73 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     // numbers stay where they are on screen throughout a move, and it is the
     // sessions that travel between them. They go away because the digit keys are
     // dead in this mode, and a column of numbers changing owner under a moving
-    // row is noise.
+    // row is noise. A placeholder moving through the list is the same picture,
+    // and hides them for the same reasons.
     let reordering = matches!(app.mode(), Mode::Reorder { .. });
+    let hiding_numbers = reordering || app.placing();
+    let cursor = cursor(app);
 
-    let rows: Vec<Line> = visible
+    let lines: Vec<Line> = rows
         .iter()
         .enumerate()
         .skip(offset)
         .take(height as usize)
-        .map(|(i, session)| {
-            let selected = i == app.selected_index();
-            let prefix = match (selected, reordering) {
-                (true, true) => GRABBED,
-                (true, false) => MARKER,
-                (false, _) => INDENT,
-            };
-            let style = if selected {
-                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            let num = if reordering {
-                String::new()
-            } else {
-                session.state.num.to_string()
-            };
-            let text = truncate(
-                &format!("{prefix}{num:>num_width$}{NUM_GAP}{}", session.name),
-                block.width as usize,
-            );
-            Line::from(Span::styled(text, style))
+        .map(|(i, row)| match row {
+            Row::Placeholder => placeholder_line(app, num_width, block.width as usize),
+            Row::Session(session) => {
+                let selected = i == cursor;
+                let prefix = match (selected, reordering) {
+                    (true, true) => GRABBED,
+                    (true, false) => MARKER,
+                    (false, _) => INDENT,
+                };
+                let style = if selected {
+                    Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let num = if hiding_numbers {
+                    String::new()
+                } else {
+                    session.state.num.to_string()
+                };
+                let text = truncate(
+                    &format!("{prefix}{num:>num_width$}{NUM_GAP}{}", session.name),
+                    block.width as usize,
+                );
+                Line::from(Span::styled(text, style))
+            }
         })
         .collect();
 
-    frame.render_widget(Paragraph::new(rows), block);
+    frame.render_widget(Paragraph::new(lines), block);
+}
+
+/// The placeholder: the moving-row marker, the blank number column, and the
+/// stars where the name would be.
+///
+/// Not reversed, unlike a session in flight. A reversed bar is a row with
+/// something in it, and this one has nothing yet; plain, the stars read as
+/// passing through an empty slot, and the marker — bold, and the only thing on
+/// the row at full weight — says it is the one that moves. It is the one row
+/// on these screens that changes with nothing pressed, which is why it keeps to
+/// the weights everything else uses rather than adding one.
+///
+/// The field is drawn as wide as [`App::field_width`] and no wider than the
+/// block leaves room for, which is narrower only on a terminal too small for
+/// the list.
+fn placeholder_line(app: &App, num_width: usize, width: usize) -> Line<'static> {
+    let lead = MARKER.width() + num_width + NUM_GAP.width();
+    let cells = app.field_width().min(width.saturating_sub(lead));
+    let marker = truncate(GRABBED.trim_end(), width);
+    let rest = truncate(
+        &format!(" {:num_width$}{NUM_GAP}{}", "", app.stars().render(cells)),
+        width.saturating_sub(marker.width()),
+    );
+    Line::from(vec![
+        Span::styled(marker, Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(rest),
+    ])
 }
 
 /// What the hint row says, and whether it is dim: a hint when nothing is being
@@ -228,6 +299,12 @@ fn hint_line(app: &App) -> (String, bool) {
             (format!("{REORDER_HINTS}  /{}", app.filter()), true)
         }
         Mode::Reorder { .. } => (REORDER_HINTS.to_string(), true),
+        // With the query when there is one, for the reason a reorder shows it:
+        // the placeholder moves among the rows the filter left.
+        Mode::Place { .. } if !app.filter().is_empty() => {
+            (format!("{PLACE_HINTS}  /{}", app.filter()), true)
+        }
+        Mode::Place { .. } => (PLACE_HINTS.to_string(), true),
         Mode::Normal => match app.message() {
             Some(msg) => (msg.to_string(), false),
             // A number waiting on another digit; without this the picker would
@@ -253,10 +330,17 @@ fn hint_line(app: &App) -> (String, bool) {
 /// row the eye sees rather than on a second opinion about where the rows are.
 fn list_layout(app: &App, area: Rect) -> Option<ListLayout> {
     let visible = app.visible();
-    if area.height == 0 || visible.is_empty() {
+    let total = rows(app).len();
+    if area.height == 0 || total == 0 {
         return None;
     }
-    let widest = visible.iter().map(|s| s.name.width()).max().unwrap_or(0) as u16;
+    let mut widest = visible.iter().map(|s| s.name.width()).max().unwrap_or(0);
+    if app.placing() {
+        // The placeholder's field is the widest name, so this changes nothing
+        // unless every name is shorter than the field's minimum.
+        widest = widest.max(app.field_width());
+    }
+    let widest = widest as u16;
     // Right-aligned in a column as wide as the longest number, so the names stay
     // in one column once the list runs past nine.
     let num_width = visible
@@ -268,9 +352,9 @@ fn list_layout(app: &App, area: Rect) -> Option<ListLayout> {
         .clamp(MIN_LIST_WIDTH, MAX_LIST_WIDTH)
         .min(area.width);
 
-    let height = (visible.len() as u16).min(area.height);
+    let height = (total as u16).min(area.height);
     let block = centre(area, width, height);
-    let offset = scroll_offset(app.selected_index(), visible.len(), height as usize);
+    let offset = scroll_offset(cursor(app), total, height as usize);
     Some(ListLayout {
         block,
         offset,
@@ -291,6 +375,10 @@ struct ListLayout {
 /// The visible row drawn on terminal cell (`column`, `row`), if any, with
 /// `area` the whole frame as it was last drawn.
 ///
+/// While a place is being chosen the placeholder is one of the rows counted,
+/// which is what [`App::on_mouse`] expects then: the row clicked is where it
+/// goes.
+///
 /// A row is the full width of the terminal, not only the centred block: the
 /// picker has one column, so nothing else can be meant by a click level with a
 /// row, and a target the width of a short name is a poor one for a touchpad.
@@ -310,7 +398,7 @@ pub(super) fn row_at(app: &App, area: Rect, column: u16, row: u16) -> Option<usi
         return None;
     }
     let index = offset + usize::from(row - block.y);
-    (index < app.visible().len()).then_some(index)
+    (index < rows(app).len()).then_some(index)
 }
 
 /// Keep `selected` visible within a window of `height` rows.
@@ -878,6 +966,7 @@ mod tests {
         for &(w, h) in test_support::TINY_SIZES {
             let _ = render(&app(&["one", "two"]), w.max(1), h.max(1));
             let _ = render(&app(&[]), w.max(1), h.max(1));
+            let _ = render(&placing(&["one", "two"], 1), w.max(1), h.max(1));
         }
     }
 
@@ -892,6 +981,9 @@ mod tests {
 
         let b = reordering(&["one", "two", "three"], 1);
         test_support::assert_no_colour(50, 8, |f| draw(f, &b));
+
+        let c = placing(&["one", "two", "three"], 1);
+        test_support::assert_no_colour(50, 8, |f| draw(f, &c));
     }
 
     /// Both hint rows are hints, so both are dim. The prompts are not — the
@@ -913,6 +1005,7 @@ mod tests {
             ("plain hints", app(&["one", "two"]), true),
             ("reorder hints", reordering(&["one", "two"], 0), true),
             ("reorder hints with a filter", with_filter, true),
+            ("place hints", placing(&["one", "two"], 0), true),
             ("the filter prompt", filtering(&["one", "two"], "on"), false),
         ] {
             let buf = test_support::buffer(60, 6, |f| draw(f, &a));
@@ -951,5 +1044,154 @@ mod tests {
         assert_eq!(truncate("日本語", 4), "日本", "two columns per character");
         assert_eq!(truncate("日本語", 3), "日", "must not split a wide char");
         assert_eq!(truncate("", 0), "");
+    }
+
+    // --- choosing a new session's place -----------------------------------
+
+    /// A picker choosing a place for a new session, with the cursor on `row`
+    /// when `c` was pressed — so the placeholder sits just below it.
+    fn placing(names: &[&str], row: usize) -> App {
+        let mut a = app(names);
+        for _ in 0..row {
+            a.on_key(Key::Char('j'));
+        }
+        a.on_key(Key::Char('c'));
+        assert!(a.placing(), "the placeholder went in");
+        a
+    }
+
+    /// The line the placeholder is drawn on: the one wearing the marker.
+    fn placeholder_of(lines: &[String]) -> usize {
+        lines
+            .iter()
+            .position(|l| l.contains(GRABBED.trim_end()))
+            .unwrap_or_else(|| panic!("no placeholder on screen: {lines:#?}"))
+    }
+
+    /// Just below the cursor, with no label on the row: the hint row is what
+    /// says a new session is coming.
+    #[test]
+    fn the_placeholder_goes_in_below_the_cursor_and_carries_no_label() {
+        let lines = render(&placing(&["api-server", "docs", "scratch"], 1), 44, 9);
+        let at = placeholder_of(&lines);
+        assert_eq!(at, line_of(&lines, "docs") as usize + 1, "{lines:#?}");
+        assert_eq!(at + 1, line_of(&lines, "scratch") as usize, "{lines:#?}");
+        assert!(
+            !lines[at].contains("new"),
+            "the row carries no label: {:?}",
+            lines[at]
+        );
+        let hint = &lines[lines.len() - 1];
+        assert!(
+            hint.contains("new session") && hint.contains("⏎ place"),
+            "{hint:?}"
+        );
+    }
+
+    /// As while a session is in flight, and for the same reasons.
+    #[test]
+    fn the_numbers_are_hidden_while_a_place_is_chosen() {
+        let lines = render(&placing(&["api-server", "docs", "scratch"], 0), 44, 9);
+        for line in &lines[..lines.len() - 1] {
+            assert!(
+                !line.chars().any(|c| c.is_ascii_digit()),
+                "a number survived: {line:?}"
+            );
+        }
+    }
+
+    /// The field is as wide as the longest name, so nothing slides sideways
+    /// when the placeholder appears.
+    #[test]
+    fn the_names_do_not_move_when_the_placeholder_appears() {
+        let column = |a: &App| -> Vec<usize> {
+            render(a, 44, 9)
+                .iter()
+                .filter(|l| l.contains("api-server") || l.contains("docs"))
+                .map(|l| l[..l.find(char::is_alphabetic).expect("a name")].width())
+                .collect()
+        };
+        let names = ["api-server", "docs"];
+        let before = column(&app(&names));
+        assert_eq!(before.len(), 2);
+        assert_eq!(before, column(&placing(&names, 0)));
+    }
+
+    /// Stars and blanks, and no wider than the names: the field is the name
+    /// column, not the row.
+    #[test]
+    fn the_stars_stay_in_the_name_column() {
+        let lines = render(&placing(&["api-server", "docs"], 0), 44, 8);
+        let row = &lines[placeholder_of(&lines)];
+        let names = lines[line_of(&lines, "api-server") as usize].width();
+        assert!(row.width() <= names, "{row:?} runs past the names");
+        for c in row.chars() {
+            assert!(
+                c == ' ' || c == '⇕' || (0x2800..=0x28ff).contains(&(c as u32)),
+                "{c:?} is not a star, a blank or the marker"
+            );
+        }
+    }
+
+    /// Not a reversed bar — the placeholder has nothing in it yet — and no row
+    /// is the cursor but it. Only the marker is bold.
+    #[test]
+    fn the_placeholder_is_plain_and_only_its_marker_is_bold() {
+        let a = placing(&["api-server", "docs"], 0);
+        let buf = test_support::buffer(44, 8, |f| draw(f, &a));
+        for y in 0..buf.area.height - 1 {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                assert!(
+                    !cell.modifier.contains(Modifier::REVERSED),
+                    "({x},{y}) {:?} is reversed",
+                    cell.symbol()
+                );
+                assert_eq!(
+                    cell.modifier.contains(Modifier::BOLD),
+                    cell.symbol() == "⇕",
+                    "({x},{y}) {:?}",
+                    cell.symbol()
+                );
+            }
+        }
+    }
+
+    /// The placeholder is a row to the hit test as it is to the eye, so the
+    /// row clicked is the place chosen.
+    #[test]
+    fn a_click_while_placing_counts_the_placeholder_as_a_row() {
+        let a = placing(&["aaa", "bbb", "ccc"], 0);
+        let (w, h) = (40, 9);
+        let area = Rect::new(0, 0, w, h);
+        let lines = render(&a, w, h);
+        assert_eq!(row_at(&a, area, 5, line_of(&lines, "aaa")), Some(0));
+        assert_eq!(row_at(&a, area, 5, placeholder_of(&lines) as u16), Some(1));
+        assert_eq!(row_at(&a, area, 5, line_of(&lines, "ccc")), Some(3));
+    }
+
+    #[test]
+    fn a_long_list_scrolls_to_keep_the_placeholder_in_view() {
+        let names: Vec<String> = (0..30).map(|i| format!("session-{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let lines = render(&placing(&refs, 29), 40, 10);
+        let at = placeholder_of(&lines);
+        assert_eq!(at, line_of(&lines, "session-29") as usize + 1, "{lines:#?}");
+    }
+
+    /// The query stays on the hint row, for the reason it does while a session
+    /// is in flight: the placeholder moves among the rows the filter left.
+    #[test]
+    fn an_applied_filter_is_still_shown_while_placing() {
+        let mut a = filtering(&["api-server", "dotfiles"], "d");
+        a.on_key(Key::Enter);
+        a.on_key(Key::Char('c'));
+        assert!(a.placing());
+        let lines = render(&a, 60, 6);
+        let hint = &lines[lines.len() - 1];
+        assert!(
+            hint.contains("new session") && hint.contains("/d"),
+            "{hint:?}"
+        );
     }
 }

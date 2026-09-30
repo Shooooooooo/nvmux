@@ -6,10 +6,13 @@
 //! a terminal, a transport, or a running Neovim.
 
 use std::cell::RefCell;
+use std::time::Duration;
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
+use unicode_width::UnicodeWidthStr;
 
+use super::starfield::{self, Starfield};
 use crate::session::Session;
 
 /// What the picker is currently doing.
@@ -31,6 +34,21 @@ pub enum Mode {
         id: String,
         was: Vec<(String, u32)>,
     },
+    /// A new session's place in the list is being chosen, before it is named.
+    ///
+    /// A placeholder row stands in for it in front of the visible row `at`, or
+    /// after the last when `at` is the row count, and moves the way a session in
+    /// flight does. Nothing is written while it moves: the session does not
+    /// exist yet, and its place is stored once it does (see
+    /// [`App::placement_of`]).
+    ///
+    /// `from_session` is whether `<prefix> c` opened the picker for this. Backing
+    /// out then goes back to that session, as backing out of `<prefix> c` always
+    /// has, rather than leaving the picker up.
+    Place {
+        at: usize,
+        from_session: bool,
+    },
 }
 
 /// Work the picker wants the caller to do.
@@ -41,6 +59,10 @@ pub enum Request {
     None,
     Attach(String),
     /// Ask for a name for a new session; naming happens on its own screen.
+    ///
+    /// Sent once its place is chosen, with [`Mode::Place`] left standing so a
+    /// cancelled prompt comes back to the placeholder where it was — or at once,
+    /// from the normal mode, when there are no rows to place it among.
     NewSession,
     /// Ask for a new name for this session.
     RenameSession(String),
@@ -88,6 +110,9 @@ pub struct App {
     /// is asked several times per keystroke. In a `RefCell` because scoring
     /// takes `&mut` and `visible` is a read.
     matcher: RefCell<Matcher>,
+    /// The placeholder row's spinner. Kept whatever the mode, so each placement
+    /// carries on the same generator rather than drawing the same stars.
+    stars: Starfield,
 }
 
 /// Where a left press landed, which decides what its release means.
@@ -130,6 +155,7 @@ impl App {
             came_from: None,
             pressed: None,
             matcher: RefCell::new(Matcher::new(Config::DEFAULT)),
+            stars: Starfield::seeded(),
         }
     }
 
@@ -142,6 +168,97 @@ impl App {
         self.selected = previously
             .and_then(|id| self.visible().iter().position(|s| s.id == id))
             .unwrap_or_else(|| self.selected.min(self.visible().len().saturating_sub(1)));
+        let len = self.visible().len();
+        if let Mode::Place { at, .. } = &mut self.mode {
+            *at = (*at).min(len);
+        }
+    }
+
+    /// Start choosing a new session's place, with the placeholder just below
+    /// the cursor — the row the user was looking at, which from `<prefix> c` is
+    /// the session they came from. See [`Mode::Place`] for `from_session`.
+    ///
+    /// With no rows to place it among there is nothing to choose, and the name
+    /// is asked for at once.
+    pub fn begin_placing(&mut self, from_session: bool) -> Request {
+        let len = self.visible().len();
+        if len == 0 {
+            return Request::NewSession;
+        }
+        self.pressed = None;
+        self.mode = Mode::Place {
+            at: (self.selected + 1).min(len),
+            from_session,
+        };
+        let width = self.field_width();
+        self.stars.scatter(width);
+        Request::None
+    }
+
+    /// Whether a new session's place is being chosen — what the caller keeps a
+    /// faster clock running for, so the placeholder's stars move.
+    pub fn placing(&self) -> bool {
+        matches!(self.mode, Mode::Place { .. })
+    }
+
+    /// Move the placeholder's stars on by `elapsed`. Nothing happens unless a
+    /// place is being chosen.
+    ///
+    /// The clock is the caller's, as it is for a half-typed number: `App`
+    /// stays free of it, and a test can step it by exactly the time it wants.
+    pub fn tick(&mut self, elapsed: Duration) {
+        if self.placing() {
+            let width = self.field_width();
+            self.stars.advance(elapsed, width);
+        }
+    }
+
+    /// The placeholder's spinner, for the renderer.
+    pub fn stars(&self) -> &Starfield {
+        &self.stars
+    }
+
+    /// How many cells wide the placeholder's field is: as wide as the longest
+    /// visible name, so the list keeps its width when the row appears, and no
+    /// narrower than [`starfield::MIN_WIDTH`], so a list of short names still
+    /// leaves the stars room to be seen moving.
+    pub fn field_width(&self) -> usize {
+        self.visible()
+            .iter()
+            .map(|s| s.name.width())
+            .max()
+            .unwrap_or(0)
+            .max(starfield::MIN_WIDTH)
+    }
+
+    /// Where the session `new_id` — just created — belongs, as the arrangement
+    /// to store: every visible row and the new session, in their new order,
+    /// each paired with the number it should now hold.
+    ///
+    /// The new session is treated as though it had been appended and then moved
+    /// to the placeholder's row, which is exactly what storing it this way
+    /// does: it was created last, and this moves it. So its number is the one
+    /// past every row's, and the visible numbers plus that one are dealt back
+    /// out down the new order — the same deal a reorder makes (see
+    /// [`App::shift_grabbed_to`]), with the same result under a filter: the
+    /// hidden rows keep their numbers and stay out of the payload.
+    ///
+    /// Empty when there is nothing to write: no place was chosen, or the one
+    /// chosen is after the last visible row, which is where a new session goes
+    /// anyway.
+    pub fn placement_of(&self, new_id: &str) -> Vec<(String, u32)> {
+        let Mode::Place { at, .. } = &self.mode else {
+            return Vec::new();
+        };
+        let rows = self.snapshot();
+        if *at >= rows.len() {
+            return Vec::new();
+        }
+        let appended = self.sessions.iter().map(|s| s.state.num).max().unwrap_or(0) + 1;
+        let numbers = rows.iter().map(|(_, num)| *num).chain([appended]);
+        let mut ids: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
+        ids.insert(*at, new_id.to_string());
+        ids.into_iter().zip(numbers).collect()
     }
 
     /// Put the cursor on this session, if the visible list still has it.
@@ -392,6 +509,7 @@ impl App {
             Mode::Filter => self.on_key_filter(key),
             Mode::Confirm { .. } => self.on_key_confirm(key),
             Mode::Reorder { .. } => self.on_key_reorder(key),
+            Mode::Place { .. } => self.on_key_place(key),
         }
     }
 
@@ -521,6 +639,7 @@ impl App {
                 Request::None
             }
             Mode::Reorder { .. } => self.on_mouse_reorder(mouse),
+            Mode::Place { .. } => self.on_mouse_place(mouse),
         }
     }
 
@@ -647,7 +766,7 @@ impl App {
                 Request::None
             }
             Key::Enter => self.on_selection(Request::Attach),
-            Key::Char('c') => Request::NewSession,
+            Key::Char('c') => self.begin_placing(false),
             Key::Char('r') => self.on_selection(Request::RenameSession),
             Key::Char('x') => {
                 if let Some(id) = self.selected_id() {
@@ -789,6 +908,95 @@ impl App {
             }
             Key::CtrlC => Request::Quit,
             _ => Request::None,
+        }
+    }
+
+    /// Handle a key while a new session's place is being chosen.
+    ///
+    /// The keys a session in flight answers to, for the same reasons (see
+    /// [`App::on_key_reorder`]): the arrows, `j`/`k` and the readline chords
+    /// move and wrap, `g` and `G` go to the ends, and anything not named keeps
+    /// the placeholder where it is. `Enter` places it, which asks for the name;
+    /// the mode stays, so a cancelled prompt comes back to it. `Esc` backs out.
+    fn on_key_place(&mut self, key: Key) -> Request {
+        let Mode::Place { at, from_session } = &self.mode else {
+            return Request::None;
+        };
+        let (at, from_session) = (*at, *from_session);
+        let slots = self.visible().len() + 1;
+
+        let to = match key {
+            Key::Char('j') | Key::Down | Key::CtrlN => (at + 1) % slots,
+            Key::Char('k') | Key::Up | Key::CtrlP => (at + slots - 1) % slots,
+            Key::Char('g') | Key::Home => 0,
+            Key::Char('G') | Key::End => slots - 1,
+            Key::Enter => return Request::NewSession,
+            Key::Esc => {
+                self.mode = Mode::Normal;
+                // Back where `c` was pressed: the picker, or, from `<prefix> c`,
+                // the session — unless it has gone, when the picker is where
+                // there is left to be.
+                return if from_session {
+                    self.dismiss()
+                } else {
+                    Request::None
+                };
+            }
+            Key::CtrlC => return Request::Quit,
+            _ => return Request::None,
+        };
+        self.place_at(to);
+        Request::None
+    }
+
+    /// The mouse while a place is being chosen, as over a session in flight
+    /// ([`App::on_mouse_reorder`]): a press or a drag carries the placeholder to
+    /// the row under the pointer, the wheel moves it a row and stops at the
+    /// ends, and the release places it — "click where you want it". The rows a
+    /// gesture names here count the placeholder's own, so the row clicked is
+    /// the row it goes to.
+    ///
+    /// Only a release that follows a press made here places: the pointer
+    /// merely passing over rows carries nothing.
+    fn on_mouse_place(&mut self, mouse: Mouse) -> Request {
+        let Mode::Place { at, .. } = &self.mode else {
+            return Request::None;
+        };
+        let at = *at;
+        let slots = self.visible().len() + 1;
+        match mouse {
+            Mouse::Press(Some(row)) if row < slots => {
+                self.pressed = Some(Pressed::Row);
+                self.place_at(row);
+                Request::None
+            }
+            Mouse::Drag(Some(row)) if row < slots && self.pressed.is_some() => {
+                self.place_at(row);
+                Request::None
+            }
+            Mouse::Press(_) => {
+                self.pressed = None;
+                Request::None
+            }
+            Mouse::Drag(_) | Mouse::Hover(_) => Request::None,
+            Mouse::Release => match self.pressed.take() {
+                Some(_) => Request::NewSession,
+                None => Request::None,
+            },
+            Mouse::ScrollDown => {
+                self.place_at((at + 1).min(slots - 1));
+                Request::None
+            }
+            Mouse::ScrollUp => {
+                self.place_at(at.saturating_sub(1));
+                Request::None
+            }
+        }
+    }
+
+    fn place_at(&mut self, to: usize) {
+        if let Mode::Place { at, .. } = &mut self.mode {
+            *at = to;
         }
     }
 
@@ -1173,13 +1381,15 @@ mod tests {
         );
     }
 
-    /// Naming a session happens on the prompt's own screen, so the picker's job
-    /// is only to say it was asked for — no mode, no buffer, no name.
+    /// Naming a session happens on the prompt's own screen. With no rows there
+    /// is no place to choose either, so the picker's job is only to say a name
+    /// was asked for — no mode, no buffer, no name.
     #[test]
-    fn c_asks_for_a_new_session() {
+    fn c_on_an_empty_list_asks_for_a_name_at_once() {
         let mut a = app(&[]);
         assert_eq!(a.on_key(Key::Char('c')), Request::NewSession);
         assert_eq!(*a.mode(), Mode::Normal, "the picker stays where it is");
+        assert!(a.placement_of("new").is_empty(), "and nothing to store");
     }
 
     #[test]
@@ -2301,5 +2511,304 @@ mod tests {
             Request::Attach("id000000".into()),
             "a click on the one row, which was already selected"
         );
+    }
+
+    // ---- choosing a new session's place ---------------------------------
+
+    /// Where the placeholder is, or `None` when no place is being chosen.
+    fn place(app: &App) -> Option<usize> {
+        match app.mode() {
+            Mode::Place { at, .. } => Some(*at),
+            _ => None,
+        }
+    }
+
+    /// `c` puts the placeholder in front of the row after the cursor: just
+    /// below what the user was looking at.
+    #[test]
+    fn c_puts_the_placeholder_just_below_the_cursor() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char('j'));
+        assert_eq!(a.on_key(Key::Char('c')), Request::None, "nothing to do yet");
+        assert_eq!(
+            *a.mode(),
+            Mode::Place {
+                at: 2,
+                from_session: false
+            }
+        );
+        assert!(a.placing());
+
+        let mut a = app(&["aaa", "bbb"]);
+        a.on_key(Key::Char('G'));
+        a.on_key(Key::Char('c'));
+        assert_eq!(place(&a), Some(2), "below the last row is after it");
+    }
+
+    /// The placeholder moves the way a session in flight does, over one more
+    /// row than there are sessions: in front of each, and after the last.
+    #[test]
+    fn the_placeholder_moves_and_wraps() {
+        for (down, up) in [
+            (Key::Char('j'), Key::Char('k')),
+            (Key::Down, Key::Up),
+            (Key::CtrlN, Key::CtrlP),
+        ] {
+            let mut a = app(&["aaa", "bbb", "ccc"]);
+            a.on_key(Key::Char('j'));
+            a.on_key(Key::Char('c'));
+            a.on_key(down);
+            assert_eq!(place(&a), Some(3), "{down:?}");
+            a.on_key(down);
+            assert_eq!(place(&a), Some(0), "{down:?} should wrap forwards");
+            a.on_key(up);
+            assert_eq!(place(&a), Some(3), "{up:?} should wrap backwards");
+        }
+
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char('c'));
+        a.on_key(Key::Char('G'));
+        assert_eq!(place(&a), Some(3));
+        a.on_key(Key::Char('g'));
+        assert_eq!(place(&a), Some(0));
+        a.on_key(Key::End);
+        assert_eq!(place(&a), Some(3));
+        a.on_key(Key::Home);
+        assert_eq!(place(&a), Some(0));
+    }
+
+    /// Enter asks for the name and leaves the place standing, so a prompt
+    /// backed out of comes back to the placeholder where it was left.
+    #[test]
+    fn enter_asks_for_a_name_and_keeps_the_place() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.on_key(Key::Char('c'));
+        a.on_key(Key::Char('k'));
+        assert_eq!(a.on_key(Key::Enter), Request::NewSession);
+        assert_eq!(place(&a), Some(0));
+    }
+
+    #[test]
+    fn esc_from_the_picker_goes_back_to_the_picker() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.set_came_from("id000000");
+        a.on_key(Key::Char('j'));
+        a.on_key(Key::Char('c'));
+        a.on_key(Key::Char('g'));
+        assert_eq!(a.on_key(Key::Esc), Request::None, "not to the session");
+        assert_eq!(*a.mode(), Mode::Normal);
+        assert_eq!(a.selected_index(), 1, "the cursor is where it was");
+    }
+
+    /// From `<prefix> c` there was no picker to go back to: backing out goes
+    /// back to the session, as it always has.
+    #[test]
+    fn esc_from_a_session_goes_back_to_it() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.select_session("id000001");
+        a.set_came_from("id000001");
+        assert_eq!(a.begin_placing(true), Request::None);
+        assert_eq!(place(&a), Some(2), "below the session it came from");
+        assert_eq!(a.on_key(Key::Esc), Request::Attach("id000001".into()));
+    }
+
+    /// ...unless that session has gone, when the picker is what is left.
+    #[test]
+    fn esc_with_no_session_to_go_back_to_leaves_the_picker_up() {
+        let mut a = app(&["aaa"]);
+        a.begin_placing(true);
+        assert_eq!(a.on_key(Key::Esc), Request::None);
+        assert_eq!(*a.mode(), Mode::Normal);
+    }
+
+    /// As with a reorder: a stray key neither places the session nor drops it.
+    #[test]
+    fn a_stray_key_does_not_end_placing() {
+        for key in [
+            Key::Char('1'),
+            Key::Char('x'),
+            Key::Char('r'),
+            Key::Char('c'),
+            Key::Char(' '),
+            Key::Char('/'),
+            Key::Char('?'),
+            Key::Char('q'),
+            Key::Tab,
+            Key::Backspace,
+            Key::Left,
+            Key::Right,
+            Key::Other,
+        ] {
+            let mut a = app(&["aaa", "bbb"]);
+            a.on_key(Key::Char('c'));
+            assert_eq!(a.on_key(key), Request::None, "{key:?} must ask for nothing");
+            assert_eq!(
+                place(&a),
+                Some(1),
+                "{key:?} moved or dropped the placeholder"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_while_placing() {
+        let mut a = app(&["aaa"]);
+        a.on_key(Key::Char('c'));
+        assert_eq!(a.on_key(Key::CtrlC), Request::Quit);
+    }
+
+    /// Choosing a place writes nothing: the session does not exist yet.
+    #[test]
+    fn placing_leaves_every_number_alone() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        let before = arrangement(&a);
+        a.on_key(Key::Char('c'));
+        a.on_key(Key::Char('j'));
+        a.on_key(Key::Char('g'));
+        assert_eq!(arrangement(&a), before);
+    }
+
+    /// The new session is dealt in where the placeholder was, and everything
+    /// after it moves down one.
+    #[test]
+    fn the_new_session_is_numbered_where_it_was_placed() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char('c'));
+        a.on_key(Key::Char('g'));
+        assert_eq!(
+            a.placement_of("new"),
+            [
+                ("new".to_string(), 1),
+                ("id000000".to_string(), 2),
+                ("id000001".to_string(), 3),
+                ("id000002".to_string(), 4),
+            ]
+        );
+
+        a.on_key(Key::Char('j'));
+        a.on_key(Key::Char('j'));
+        assert_eq!(
+            a.placement_of("new"),
+            [
+                ("id000000".to_string(), 1),
+                ("id000001".to_string(), 2),
+                ("new".to_string(), 3),
+                ("id000002".to_string(), 4),
+            ]
+        );
+    }
+
+    /// After the last row is where a new session goes anyway, so there is
+    /// nothing to write — and no round trip to pay for it.
+    #[test]
+    fn placing_it_last_stores_nothing() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.on_key(Key::Char('c'));
+        a.on_key(Key::Char('G'));
+        assert!(a.placement_of("new").is_empty());
+    }
+
+    /// Under a filter the placeholder moves among the rows on screen, and the
+    /// rows the filter hides keep their numbers and stay out of the payload —
+    /// the rule a reorder follows.
+    #[test]
+    fn a_filtered_placement_leaves_the_hidden_rows_alone() {
+        let mut a = app(&["alpha", "zzz", "gamma"]);
+        a.on_key(Key::Char('/'));
+        a.on_key(Key::Char('a'));
+        a.on_key(Key::Enter); // back to normal mode, filter still applied
+        a.on_key(Key::Char('c'));
+        assert_eq!(names(&a), ["alpha", "gamma"]);
+        assert_eq!(place(&a), Some(1), "between the two rows on screen");
+        assert_eq!(
+            a.placement_of("new"),
+            [
+                ("id000000".to_string(), 1),
+                ("new".to_string(), 3),
+                ("id000002".to_string(), 4),
+            ]
+        );
+    }
+
+    /// "Click where you want it": the row a press lands on is where the
+    /// placeholder goes, and the release places it there.
+    #[test]
+    fn a_click_places_the_new_session_where_it_lands() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char('c'));
+        assert_eq!(a.on_mouse(Mouse::Press(Some(0))), Request::None);
+        assert_eq!(place(&a), Some(0));
+        assert_eq!(a.on_mouse(Mouse::Drag(Some(3))), Request::None);
+        assert_eq!(place(&a), Some(3), "a drag carries it");
+        assert_eq!(a.on_mouse(Mouse::Release), Request::NewSession);
+        assert_eq!(place(&a), Some(3), "and the place stands for the prompt");
+    }
+
+    #[test]
+    fn the_pointer_passing_over_rows_moves_nothing_while_placing() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char('c'));
+        for gesture in [
+            Mouse::Hover(Some(0)),
+            Mouse::Drag(Some(3)),
+            Mouse::Press(None),
+            Mouse::Release,
+        ] {
+            assert_eq!(a.on_mouse(gesture), Request::None, "{gesture:?}");
+            assert_eq!(place(&a), Some(1), "{gesture:?}");
+        }
+    }
+
+    #[test]
+    fn the_wheel_moves_the_placeholder_and_stops_at_the_ends() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.on_key(Key::Char('c'));
+        a.on_mouse(Mouse::ScrollDown);
+        a.on_mouse(Mouse::ScrollDown);
+        assert_eq!(place(&a), Some(2));
+        for _ in 0..4 {
+            a.on_mouse(Mouse::ScrollUp);
+        }
+        assert_eq!(place(&a), Some(0));
+    }
+
+    /// The field is as wide as the longest name on screen, and never narrower
+    /// than the starfield's own minimum.
+    #[test]
+    fn the_placeholder_is_as_wide_as_the_longest_name() {
+        assert_eq!(app(&["api-server", "docs"]).field_width(), 10);
+        assert_eq!(
+            app(&["a", "bb"]).field_width(),
+            starfield::MIN_WIDTH,
+            "short names still leave the stars room"
+        );
+    }
+
+    /// The stars only move while a place is being chosen; the rest of the
+    /// time the clock is not asked to run for them.
+    #[test]
+    fn the_stars_are_laid_out_when_a_place_is_chosen() {
+        let mut a = app(&["api-server"]);
+        a.tick(Duration::from_millis(100));
+        let width = a.field_width();
+        assert!(
+            a.stars().render(width).trim().is_empty(),
+            "no field before one is asked for"
+        );
+        a.on_key(Key::Char('c'));
+        a.tick(Duration::from_millis(16));
+        assert_eq!(a.stars().render(width).chars().count(), width);
+    }
+
+    /// A listing that shrinks under the placeholder cannot leave it pointing
+    /// past the end.
+    #[test]
+    fn a_shorter_listing_pulls_the_placeholder_back_into_range() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char('c'));
+        a.on_key(Key::Char('G'));
+        let one = app(&["aaa"]).sessions().to_vec();
+        a.set_sessions(one);
+        assert_eq!(place(&a), Some(1));
     }
 }
