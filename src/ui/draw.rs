@@ -23,6 +23,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use super::app::{App, Mode};
+use super::starfield;
 
 /// The marker on the selected row. Unselected rows are indented to match, so
 /// names stay in one column and nothing shifts as the selection moves.
@@ -212,6 +213,84 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     frame.render_widget(Paragraph::new(rows), block);
+
+    if app.trailing() {
+        draw_trails(frame, app, block, offset, num_width);
+    }
+}
+
+/// The trails behind a session in flight: stars flying off both ends of its
+/// row — rightwards off the last character of its name, and leftwards off the
+/// marker — at full weight where they leave it and dim where they trail away.
+///
+/// Drawn after the list and outside its block. The block is sized to the names
+/// and centred on them, so making room for the trails inside it would widen it
+/// and slide every name sideways the moment one was picked up — the very thing
+/// the blank number column is kept to prevent. Past either end of a row there
+/// is only the terminal's own background, so a trail can simply be laid over
+/// it; on a terminal too narrow for all of one, it stops at the edge, keeping
+/// the cells nearest the row.
+///
+/// Two weights, because these screens have two below bold: plain for the half
+/// nearest the row, so the stars read as coming off it, and dim for the far
+/// half. Modifiers, like everything else here, and never the grabbed row's own
+/// reversed bar: that marks the session, and the trails are only behind it.
+fn draw_trails(frame: &mut Frame, app: &App, block: Rect, offset: usize, num_width: usize) {
+    let selected = app.selected_index();
+    let Some(line) = selected
+        .checked_sub(offset)
+        .filter(|line| *line < block.height as usize)
+    else {
+        return;
+    };
+    let Some(session) = app.visible().get(selected).copied() else {
+        return;
+    };
+    let y = block.y + line as u16;
+    let area = frame.area();
+    let near = starfield::TRAIL / 2;
+    let dim = Style::default().add_modifier(Modifier::DIM);
+
+    // Off the end of the name. What the row above drew for it, measured the
+    // same way: the trail starts in the column after its last character,
+    // truncation included.
+    let drawn = format!("{GRABBED}{:>num_width$}{NUM_GAP}{}", "", session.name)
+        .width()
+        .min(block.width as usize) as u16;
+    let x = block.x + drawn;
+    let cells = starfield::TRAIL.min(usize::from((area.x + area.width).saturating_sub(x)));
+    if cells > 0 {
+        let stars: Vec<char> = app.trail_after().render(cells).chars().collect();
+        let (bright, faint) = stars.split_at(near.min(cells));
+        draw_trail(
+            frame,
+            Rect::new(x, y, cells as u16, 1),
+            vec![
+                Span::raw(bright.iter().collect::<String>()),
+                Span::styled(faint.iter().collect::<String>(), dim),
+            ],
+        );
+    }
+
+    // Off the other end: the marker is the row's first column, so this trail
+    // ends in the column before it, and runs the other way.
+    let cells = starfield::TRAIL.min(usize::from(block.x.saturating_sub(area.x)));
+    if cells > 0 {
+        let stars: Vec<char> = app.trail_before().render_mirrored(cells).chars().collect();
+        let (faint, bright) = stars.split_at(cells - near.min(cells));
+        draw_trail(
+            frame,
+            Rect::new(block.x - cells as u16, y, cells as u16, 1),
+            vec![
+                Span::styled(faint.iter().collect::<String>(), dim),
+                Span::raw(bright.iter().collect::<String>()),
+            ],
+        );
+    }
+}
+
+fn draw_trail(frame: &mut Frame, area: Rect, spans: Vec<Span<'static>>) {
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// What the hint row says, and whether it is dim: a hint when nothing is being
@@ -878,6 +957,7 @@ mod tests {
         for &(w, h) in test_support::TINY_SIZES {
             let _ = render(&app(&["one", "two"]), w.max(1), h.max(1));
             let _ = render(&app(&[]), w.max(1), h.max(1));
+            let _ = render(&reordering(&["one", "two"], 1), w.max(1), h.max(1));
         }
     }
 
@@ -951,5 +1031,154 @@ mod tests {
         assert_eq!(truncate("日本語", 4), "日本", "two columns per character");
         assert_eq!(truncate("日本語", 3), "日", "must not split a wide char");
         assert_eq!(truncate("", 0), "");
+    }
+
+    // --- the trail behind a session in flight --------------------------------
+
+    fn is_braille(symbol: &str) -> bool {
+        symbol
+            .chars()
+            .any(|c| (0x2801..=0x28ff).contains(&(c as u32)))
+    }
+
+    /// [`reordering`] with the trails on whatever the config says.
+    fn trailing(names: &[&str], row: usize) -> App {
+        let mut a = reordering(names, row);
+        a.set_trail(true);
+        a
+    }
+
+    /// The trail starts in the column after the grabbed name's last
+    /// character, runs `TRAIL` cells, plain for the near half and dim for the
+    /// far half, and is not part of the reversed bar.
+    #[test]
+    fn the_grabbed_row_trails_stars_off_the_end_of_its_name() {
+        let a = trailing(&["api-server", "docs"], 1);
+        let buf = test_support::buffer(44, 8, |f| draw(f, &a));
+        let row =
+            |y: u16| -> String { (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect() };
+        let y = (0..buf.area.height)
+            .find(|y| row(*y).contains("docs"))
+            .expect("the grabbed row");
+        let line = row(y);
+        let end = (line[..line.find("docs").expect("the name") + "docs".len()].width()) as u16;
+
+        assert!(
+            buf[(end - 1, y)].modifier.contains(Modifier::REVERSED),
+            "the name's last character is in the bar"
+        );
+        for i in 0..starfield::TRAIL as u16 {
+            let cell = &buf[(end + i, y)];
+            assert!(
+                cell.symbol() == " " || is_braille(cell.symbol()),
+                "{:?} at {i} is not a star or a blank",
+                cell.symbol()
+            );
+            assert!(
+                !cell.modifier.contains(Modifier::REVERSED),
+                "the trail is not part of the bar"
+            );
+            assert_eq!(
+                cell.modifier.contains(Modifier::DIM),
+                usize::from(i) >= starfield::TRAIL / 2,
+                "cell {i} of the trail has the wrong weight"
+            );
+        }
+        let past = &buf[(end + starfield::TRAIL as u16, y)];
+        assert_eq!(past.symbol(), " ", "the trail ran past its length");
+        assert!(past.modifier.is_empty());
+    }
+
+    /// Stars only ever appear behind the session in flight: not on its
+    /// neighbours, and not at all when nothing is picked up.
+    #[test]
+    fn only_a_session_in_flight_leaves_a_trail() {
+        let buf = test_support::buffer(44, 8, |f| draw(f, &app(&["api-server", "docs"])));
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                assert!(!is_braille(buf[(x, y)].symbol()), "a star at ({x},{y})");
+            }
+        }
+
+        let a = trailing(&["api-server", "docs"], 1);
+        let lines = render(&a, 44, 8);
+        for line in lines.iter().filter(|l| !l.contains("docs")) {
+            assert!(
+                !line.chars().any(|c| is_braille(&c.to_string())),
+                "{line:?}"
+            );
+        }
+    }
+
+    /// On a terminal that ends before the trail does, it is cut off at the
+    /// edge rather than drawn past it.
+    #[test]
+    fn the_trail_stops_at_the_edge_of_the_terminal() {
+        let a = trailing(&["api-server"], 0);
+        let narrow = render(&a, 40, 6);
+        let row = narrow
+            .iter()
+            .find(|l| l.contains("api-server"))
+            .expect("the row");
+        let end = row[..row.find("api-server").expect("the name") + "api-server".len()].width();
+        let w = (end + 2) as u16;
+        for line in render(&a, w, 6) {
+            assert!(line.width() <= usize::from(w), "{line:?} is wider than {w}");
+        }
+    }
+
+    /// The other trail mirrors the first: it ends in the column before the
+    /// marker, runs `TRAIL` cells leftwards, plain for the half nearest the
+    /// row and dim for the far half.
+    #[test]
+    fn the_grabbed_row_trails_stars_off_its_other_end_too() {
+        let a = trailing(&["api-server", "docs"], 1);
+        let buf = test_support::buffer(44, 8, |f| draw(f, &a));
+        let (x0, y) = (0..buf.area.height)
+            .find_map(|y| {
+                (0..buf.area.width)
+                    .find(|x| buf[(*x, y)].symbol() == GRABBED.trim_end())
+                    .map(|x| (x, y))
+            })
+            .expect("the grabbed row's marker");
+        let trail = starfield::TRAIL as u16;
+        assert!(x0 >= trail, "no room for the trail in this test's layout");
+        for i in 1..=trail {
+            let cell = &buf[(x0 - i, y)];
+            assert!(
+                cell.symbol() == " " || is_braille(cell.symbol()),
+                "{:?} at {i} before the marker is not a star or a blank",
+                cell.symbol()
+            );
+            assert!(!cell.modifier.contains(Modifier::REVERSED));
+            assert_eq!(
+                cell.modifier.contains(Modifier::DIM),
+                usize::from(i) > starfield::TRAIL / 2,
+                "cell {i} before the marker has the wrong weight"
+            );
+        }
+        let past = &buf[(x0 - trail - 1, y)];
+        assert_eq!(past.symbol(), " ", "the trail ran past its length");
+        assert!(past.modifier.is_empty());
+    }
+
+    /// `[effects.session_name] enabled = false`: the session is still picked up, marked and
+    /// moved, with nothing streaming off either end of it.
+    #[test]
+    fn with_the_trail_off_a_session_in_flight_leaves_none() {
+        let mut a = reordering(&["api-server", "docs"], 1);
+        a.set_trail(false);
+        let buf = test_support::buffer(44, 8, |f| draw(f, &a));
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                assert!(!is_braille(buf[(x, y)].symbol()), "a star at ({x},{y})");
+            }
+        }
+        assert!(
+            render(&a, 44, 8)
+                .iter()
+                .any(|l| l.contains(GRABBED.trim_end())),
+            "the session is still marked as moving"
+        );
     }
 }

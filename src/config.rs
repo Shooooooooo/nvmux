@@ -39,7 +39,7 @@ use crate::error::ConfigError;
 
 /// The whole configuration. Each field is a table of its own, so the file reads
 /// as `[keys]`-style sections — `[effects]` with a table inside it for each
-/// effect, so far `[effects.fade]`.
+/// effect, `[effects.fade]` and `[effects.session_name]`.
 ///
 /// Not `Copy`: `[session] command` owns a `String`. Nothing reads it by value —
 /// [`get`] hands out a `&'static Settings` — so this costs nothing.
@@ -120,16 +120,18 @@ impl Default for ClientSettings {
 }
 
 /// The animated effects: a master switch over them all, and a table of its own
-/// for each — so far `[effects.fade]` — with its own `enabled`. An effect runs
-/// only when both are on, which is what [`EffectsSettings::fade_enabled`]
-/// answers, so nothing reads one switch without the other.
+/// for each — `[effects.fade]` and `[effects.session_name]` — with its own
+/// `enabled`. An effect runs only when both are on, which is what
+/// [`EffectsSettings::fade_enabled`] and [`EffectsSettings::session_name_enabled`]
+/// answer, so nothing reads one switch without the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EffectsSettings {
-    /// Master switch. Off, nothing moves that does not have to, whatever each
-    /// effect's own switch says.
+    /// Master switch. Off, nothing moves that does not have to — no fade and no
+    /// trail — whatever their own switches say.
     pub enabled: bool,
     pub fade: FadeSettings,
+    pub session_name: SessionNameSettings,
 }
 
 impl EffectsSettings {
@@ -138,6 +140,12 @@ impl EffectsSettings {
     /// [`crate::fade::enabled`]).
     pub fn fade_enabled(&self) -> bool {
         self.enabled && self.fade.enabled
+    }
+
+    /// Whether a session being moved streams stars off its name: its own
+    /// switch and the master one.
+    pub fn session_name_enabled(&self) -> bool {
+        self.enabled && self.session_name.enabled
     }
 }
 
@@ -180,12 +188,33 @@ pub struct FadeSettings {
     pub excursions: bool,
 }
 
+/// The stars a session's name streams while it is picked up to be moved, off
+/// both ends of its row (see [`crate::ui::starfield`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionNameSettings {
+    /// This effect's own switch, under `[effects] enabled`. Off, a session in
+    /// flight is drawn still, and the picker redraws on a key and nothing
+    /// else, as it does the rest of the time.
+    ///
+    /// Unlike the fade, `NO_COLOR` leaves this alone: the trail is braille and
+    /// the dim modifier, and sets no colour to begin with.
+    pub enabled: bool,
+}
+
 impl Default for EffectsSettings {
     fn default() -> Self {
         Self {
             enabled: true,
             fade: FadeSettings::default(),
+            session_name: SessionNameSettings::default(),
         }
+    }
+}
+
+impl Default for SessionNameSettings {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -483,7 +512,11 @@ fn render_default_config(prefix: u8) -> String {
          # enabled     = {fade_enabled}\n\
          # duration_ms = {fade_duration}\n\
          # session     = {fade_session}\n\
-         # excursions  = {fade_excursions}\n",
+         # excursions  = {fade_excursions}\n\
+         \n\
+         [effects.session_name]\n\
+         # Stars streaming off both ends of a session picked up to be moved.\n\
+         # enabled = {session_name_enabled}\n",
         prefix = crate::keys::prefix_label(prefix),
         timeout = k.timeout_ms,
         command = s.command,
@@ -493,6 +526,7 @@ fn render_default_config(prefix: u8) -> String {
         fade_session = f.session,
         fade_excursions = f.excursions,
         effects_enabled = e.enabled,
+        session_name_enabled = e.session_name.enabled,
     )
 }
 
@@ -570,7 +604,9 @@ mod tests {
             enabled = true\n\
             duration_ms = 200\n\
             session = true\n\
-            excursions = true\n";
+            excursions = true\n\
+            [effects.session_name]\n\
+            enabled = true\n";
         let s: Settings = toml::from_str(doc).expect("valid");
         assert_eq!(s, Settings::default());
     }
@@ -586,6 +622,7 @@ mod tests {
             FadeSettings::default().excursions
         );
         assert!(s.effects.enabled, "the master switch keeps its default");
+        assert_eq!(s.effects.session_name, SessionNameSettings::default());
         assert_eq!(s.keys, KeySettings::default());
     }
 
@@ -621,7 +658,10 @@ mod tests {
         let s: Settings = toml::from_str("[effects.fade]\nenabled = false\n").expect("valid");
         assert!(!s.effects.fade.enabled);
         assert!(!s.effects.fade_enabled());
-        assert!(s.effects.enabled, "the master switch is untouched");
+        assert!(
+            s.effects.session_name_enabled(),
+            "the other effect is untouched"
+        );
     }
 
     /// One switch over all of them: off, no effect runs, and each one's own
@@ -630,8 +670,21 @@ mod tests {
     fn the_master_switch_turns_every_effect_off() {
         let s: Settings = toml::from_str("[effects]\nenabled = false\n").expect("valid");
         assert!(!s.effects.fade_enabled());
-        assert!(s.effects.fade.enabled);
+        assert!(!s.effects.session_name_enabled());
+        assert!(s.effects.fade.enabled && s.effects.session_name.enabled);
         assert!(Settings::default().effects.fade_enabled());
+        assert!(Settings::default().effects.session_name_enabled());
+    }
+
+    /// Each effect has a switch of its own, and turning one off leaves the
+    /// others running.
+    #[test]
+    fn the_session_name_effect_is_on_unless_turned_off() {
+        assert!(Settings::default().effects.session_name.enabled);
+        let s: Settings =
+            toml::from_str("[effects.session_name]\nenabled = false\n").expect("valid");
+        assert!(!s.effects.session_name_enabled());
+        assert!(s.effects.fade_enabled(), "and the fade is untouched");
     }
 
     /// On unless turned off, and `false` turns it off: a parked client is a
@@ -688,6 +741,14 @@ mod tests {
             ("an unknown client key", "[client]\nkeep = true\n"),
             ("an unknown effect", "[effects.sparkles]\nenabled = true\n"),
             ("an unknown effects key", "[effects]\nenable = false\n"),
+            (
+                "an unknown session_name key",
+                "[effects.session_name]\nenable = false\n",
+            ),
+            (
+                "an unparseable session_name value",
+                "[effects.session_name]\nenabled = \"no\"\n",
+            ),
             ("an unparseable client value", "[client]\nper_session = 1\n"),
             (
                 "an unparseable fade value",
@@ -794,15 +855,16 @@ mod tests {
             "the template must document the command: {rendered:?}"
         );
         assert!(rendered.contains("\n[client]\n"), "{rendered:?}");
-        for table in ["[effects]", "[effects.fade]"] {
+        for table in ["[effects]", "[effects.fade]", "[effects.session_name]"] {
             assert!(
                 rendered.contains(&format!("\n{table}\n")),
                 "the template must have {table}: {rendered:?}"
             );
         }
-        assert!(
-            rendered.contains("\n# enabled = true\n"),
-            "the template must document the master switch: {rendered:?}"
+        assert_eq!(
+            rendered.matches("\n# enabled = true\n").count(),
+            2,
+            "the master switch and the session name's: {rendered:?}"
         );
         for line in [
             "# per_session = true",

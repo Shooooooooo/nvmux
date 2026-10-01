@@ -6,10 +6,12 @@
 //! a terminal, a transport, or a running Neovim.
 
 use std::cell::RefCell;
+use std::time::Duration;
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
+use super::starfield::{self, Starfield};
 use crate::session::Session;
 
 /// What the picker is currently doing.
@@ -88,6 +90,17 @@ pub struct App {
     /// is asked several times per keystroke. In a `RefCell` because scoring
     /// takes `&mut` and `visible` is a read.
     matcher: RefCell<Matcher>,
+    /// Whether a session in flight leaves a trail at all: `[effects.session_name]
+    /// enabled`, under `[effects] enabled`, read once when the picker opens, as
+    /// the rest of the config is.
+    trail: bool,
+    /// The trails a session in flight leaves (see [`starfield`]): off the end
+    /// of its name, flying right, and off the other end of its row, flying
+    /// left. Two fields rather than one drawn twice, so the two ends are not
+    /// mirror images of each other. Kept between grabs, so each one carries on
+    /// the same generators rather than drawing the same stars.
+    after: Starfield,
+    before: Starfield,
 }
 
 /// Where a left press landed, which decides what its release means.
@@ -130,6 +143,9 @@ impl App {
             came_from: None,
             pressed: None,
             matcher: RefCell::new(Matcher::new(Config::DEFAULT)),
+            trail: crate::config::get().effects.session_name_enabled(),
+            after: Starfield::seeded(),
+            before: Starfield::seeded(),
         }
     }
 
@@ -189,6 +205,43 @@ impl App {
 
     pub fn set_message(&mut self, msg: impl Into<String>) {
         self.message = Some(msg.into());
+    }
+
+    /// Whether a session in flight is trailing stars: one is, and the trails
+    /// are on. What the renderer draws them for, and what the caller keeps a
+    /// faster clock running for, so they move — with the trails off, a move
+    /// is drawn still and the clock never speeds up.
+    pub fn trailing(&self) -> bool {
+        self.trail && matches!(self.mode, Mode::Reorder { .. })
+    }
+
+    /// Move the trails behind a session in flight on by `elapsed`. Nothing
+    /// happens while none is trailing.
+    ///
+    /// The clock is the caller's, as it is for a half-typed number: `App`
+    /// stays free of it, and a test can step it by exactly the time it wants.
+    pub fn tick(&mut self, elapsed: Duration) {
+        if self.trailing() {
+            self.after.advance(elapsed, starfield::TRAIL);
+            self.before.advance(elapsed, starfield::TRAIL);
+        }
+    }
+
+    /// The trail off the end of the name, for the renderer.
+    pub fn trail_after(&self) -> &Starfield {
+        &self.after
+    }
+
+    /// The trail off the other end of the row, for the renderer.
+    pub fn trail_before(&self) -> &Starfield {
+        &self.before
+    }
+
+    /// Turn the trails on or off whatever the config says, for a test that
+    /// needs one or the other.
+    #[cfg(test)]
+    pub(super) fn set_trail(&mut self, on: bool) {
+        self.trail = on;
     }
 
     /// Sessions matching the current filter, in display order.
@@ -294,6 +347,18 @@ impl App {
             return 0;
         }
         (self.selected as isize + delta).clamp(0, len as isize - 1) as usize
+    }
+
+    /// Pick the session `id` up — the space bar and a drag both come here — with
+    /// the arrangement as it stands, for `Esc` to put back, and fresh trails
+    /// off both ends of it.
+    fn pick_up(&mut self, id: String) {
+        let was = self.snapshot();
+        self.mode = Mode::Reorder { id, was };
+        if self.trail {
+            self.after.scatter(starfield::TRAIL);
+            self.before.scatter(starfield::TRAIL);
+        }
     }
 
     /// Every visible row's `(id, resolved number)`, in display order.
@@ -553,8 +618,7 @@ impl App {
                 if row < len && self.pressed.is_some() && row != self.selected =>
             {
                 if let Some(id) = self.selected_id() {
-                    let was = self.snapshot();
-                    self.mode = Mode::Reorder { id, was };
+                    self.pick_up(id);
                     self.shift_grabbed_to(row);
                 }
                 self.pressed = Some(Pressed::Row);
@@ -659,8 +723,7 @@ impl App {
             // enter the mode over the "no sessions" screen with nothing to move.
             Key::Char(' ') => {
                 if let Some(id) = self.selected_id() {
-                    let was = self.snapshot();
-                    self.mode = Mode::Reorder { id, was };
+                    self.pick_up(id);
                 }
                 Request::None
             }
@@ -2301,5 +2364,77 @@ mod tests {
             Request::Attach("id000000".into()),
             "a click on the one row, which was already selected"
         );
+    }
+
+    // ---- the trail behind a session in flight ------------------------------
+
+    /// The trails run while a session is in flight, however it was picked up,
+    /// and stop with the move — placed or put back.
+    #[test]
+    fn a_session_in_flight_keeps_the_clock_running() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.set_trail(true);
+        assert!(!a.trailing());
+        a.on_key(Key::Char(' '));
+        assert!(a.trailing(), "picked up with the space bar");
+        a.on_key(Key::Down);
+        a.on_key(Key::Enter);
+        assert!(!a.trailing(), "placed");
+
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Esc);
+        assert!(!a.trailing(), "put back");
+
+        let mut a = app(&["aaa", "bbb"]);
+        a.set_trail(true);
+        a.on_mouse(Mouse::Press(Some(0)));
+        a.on_mouse(Mouse::Drag(Some(1)));
+        assert!(a.trailing(), "picked up with a drag");
+        a.on_mouse(Mouse::Release);
+        assert!(!a.trailing());
+    }
+
+    /// The trails are laid out when a session is picked up, and only then: the
+    /// rest of the time nothing moves them, and nothing draws them.
+    #[test]
+    fn the_trails_are_laid_out_when_a_session_is_picked_up() {
+        let mut a = app(&["aaa"]);
+        a.set_trail(true);
+        a.tick(Duration::from_millis(100));
+        for trail in [a.trail_after(), a.trail_before()] {
+            assert!(
+                trail.render(starfield::TRAIL).trim().is_empty(),
+                "a trail before anything was picked up"
+            );
+        }
+        a.on_key(Key::Char(' '));
+        a.tick(Duration::from_millis(16));
+        for trail in [a.trail_after(), a.trail_before()] {
+            assert_eq!(
+                trail.render(starfield::TRAIL).chars().count(),
+                starfield::TRAIL
+            );
+        }
+    }
+
+    /// `[effects.session_name] enabled = false`: a move is still a move, but nothing trails
+    /// it and nothing asks for the faster clock.
+    #[test]
+    fn with_the_trail_off_a_move_is_drawn_still() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.set_trail(false);
+        a.on_key(Key::Char(' '));
+        assert!(matches!(a.mode(), Mode::Reorder { .. }), "still a move");
+        assert!(!a.trailing());
+        a.tick(Duration::from_millis(100));
+        assert!(a.trail_after().render(starfield::TRAIL).trim().is_empty());
+    }
+
+    /// On unless the config says otherwise — what an `App` built in a test, with
+    /// no config loaded, reads.
+    #[test]
+    fn the_trail_follows_the_config() {
+        assert!(crate::config::get().effects.session_name_enabled());
+        assert!(app(&["aaa"]).trail);
     }
 }

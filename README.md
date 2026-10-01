@@ -148,6 +148,9 @@ enabled     = true   # dissolve between screens; NO_COLOR forces this off
 duration_ms = 200    # the whole dissolve, out and back; the notice pays it too
 session     = true   # Neovim's own screen dissolves too, and backs the notice
 excursions  = true   # so do the <prefix> ? and <prefix> c screens
+
+[effects.session_name]
+enabled = true   # stars streaming off both ends of a session being moved
 ```
 
 </details>

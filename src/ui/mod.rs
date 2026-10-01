@@ -53,6 +53,7 @@ pub mod draw;
 pub mod help;
 pub mod prompt;
 pub mod setup;
+pub mod starfield;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -340,13 +341,29 @@ fn run_loop(
     // unambiguous digit on its own, so this is only ever set when one number is
     // a prefix of another — sessions 1 and 12 both present.
     let mut deadline: Option<Instant> = None;
+    // When the trail behind a session in flight was last moved on. The clock
+    // lives here for the same reason the digit deadline does.
+    let mut ticked = Instant::now();
 
     loop {
+        let now = Instant::now();
+        app.tick(now - ticked);
+        ticked = now;
+
         // The area kept for the mouse: a click is resolved against the screen
         // as it was last drawn, which is the one the user clicked on.
         let area = terminal.draw(|f| draw::draw(f, &app))?.area;
 
-        if !event::poll(TICK)? {
+        // A frame's wait while a session in flight is trailing stars, so they
+        // move; the rest of the time — and all the time, with the effect
+        // switched off in `[effects]` — the picker changes on a key and nothing
+        // else, and waits the ordinary tick.
+        let tick = if app.trailing() {
+            crate::fade::FRAME
+        } else {
+            TICK
+        };
+        if !event::poll(tick)? {
             // The clock lives here rather than in `App`, which stays pure —
             // the same split `pty::pump` uses for `keys::Prefix`.
             if deadline.is_some_and(|d| Instant::now() >= d) {
