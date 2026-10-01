@@ -216,16 +216,17 @@ fn dots(cells: usize) -> f32 {
     (cells * 2) as f32
 }
 
-/// xorshift64*: small, fast, and plenty for where some dots go.
-struct Rng(u64);
+/// xorshift64*: small, fast, and plenty for where some dots go. Shared with
+/// [`super::dust`], which needs no more of its randomness than this does.
+pub(super) struct Rng(u64);
 
 impl Rng {
-    fn new(seed: u64) -> Self {
+    pub(super) fn new(seed: u64) -> Self {
         // Zero is the one state xorshift never leaves.
         Self(seed | 1)
     }
 
-    fn next(&mut self) -> u64 {
+    pub(super) fn next(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -235,7 +236,7 @@ impl Rng {
     }
 
     /// Uniform in `[0, 1)`.
-    fn unit(&mut self) -> f32 {
+    pub(super) fn unit(&mut self) -> f32 {
         (self.next() >> 40) as f32 / (1u64 << 24) as f32
     }
 

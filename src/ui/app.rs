@@ -11,6 +11,8 @@ use std::time::Duration;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
+use super::dust::Dust;
+use super::effects;
 use super::starfield::{self, Starfield};
 use crate::session::Session;
 
@@ -104,6 +106,47 @@ pub struct App {
     /// the same generators rather than drawing the same stars.
     after: Starfield,
     before: Starfield,
+    /// How long the row the cursor leaves glows for, or `None` with
+    /// `[effects.afterglow]` off. Read once when the picker opens, like `trail`.
+    afterglow: Option<Duration>,
+    /// The rows the cursor has just left and is still glowing on, by session
+    /// id, oldest first. See [`App::glows`].
+    glows: Vec<Glow>,
+    /// Whether a filter keystroke's dropped rows fade out (`[effects.filter]
+    /// enabled`), and whether matched letters are underlined (`underline`).
+    sift: bool,
+    underline: bool,
+    /// The rows the last filter keystroke dropped, while they fade. See
+    /// [`App::rows`].
+    leaving: Option<Leaving>,
+    /// Whether a confirmed kill crumbles its row first (`[effects.kill]
+    /// enabled`).
+    crumble: bool,
+    /// The row a kill is crumbling, by session id, until a fresh listing
+    /// replaces it. See [`App::start_dust`].
+    dust: Option<(String, Dust)>,
+}
+
+/// A row the cursor has left, and how long ago.
+#[derive(Debug, Clone)]
+struct Glow {
+    id: String,
+    age: Duration,
+}
+
+/// What one filter keystroke dropped, and how long ago.
+#[derive(Debug, Clone)]
+struct Leaving {
+    ids: Vec<String>,
+    age: Duration,
+}
+
+/// One row of the list as it is drawn: a session, and whether it is one the
+/// filter has just dropped and is only on screen while it fades.
+#[derive(Debug, Clone, Copy)]
+pub struct Row<'a> {
+    pub session: &'a Session,
+    pub leaving: bool,
 }
 
 /// Where a left press landed, which decides what its release means.
@@ -149,14 +192,27 @@ impl App {
             trail: crate::config::get().effects.session_name_enabled(),
             after: Starfield::seeded(),
             before: Starfield::seeded(),
+            afterglow: crate::config::get().effects.afterglow(),
+            glows: Vec::new(),
+            sift: crate::config::get().effects.filter_enabled(),
+            underline: crate::config::get().effects.filter_underline(),
+            leaving: None,
+            crumble: crate::config::get().effects.kill_enabled(),
+            dust: None,
         }
     }
 
     /// Replace the session list, keeping the selection on the same session where
     /// possible — by identity, not position, so a rename that re-sorts the list
     /// does not move the highlight to an unrelated row.
+    ///
+    /// A fresh listing is the truth about the rows, so whatever was passing
+    /// over the old ones — dust, a glow, a fade — ends with it.
     pub fn set_sessions(&mut self, sessions: Vec<Session>) {
         let previously = self.selected_id();
+        self.dust = None;
+        self.glows.clear();
+        self.leaving = None;
         self.sessions = sessions;
         self.selected = previously
             .and_then(|id| self.visible().iter().position(|s| s.id == id))
@@ -228,6 +284,72 @@ impl App {
             self.after.advance(elapsed, starfield::TRAIL);
             self.before.advance(elapsed, starfield::TRAIL);
         }
+        if let Some(length) = self.afterglow {
+            for glow in &mut self.glows {
+                glow.age += elapsed;
+            }
+            self.glows.retain(|g| g.age < length);
+        }
+        if let Some(leaving) = &mut self.leaving {
+            leaving.age += elapsed;
+            if leaving.age >= effects::SIFT {
+                self.leaving = None;
+            }
+        }
+        if let Some((_, dust)) = &mut self.dust {
+            dust.advance(elapsed);
+        }
+    }
+
+    /// Whether anything on screen is moving, and so whether the caller should
+    /// draw at a frame's pace rather than wait on the keyboard: a trail, a
+    /// glow, a fading row or dust. With every effect off this is only ever
+    /// false, and the picker changes on a key and nothing else.
+    pub fn animating(&self) -> bool {
+        self.trailing() || !self.glows.is_empty() || self.leaving.is_some() || self.dusting()
+    }
+
+    /// The rows still glowing after the cursor left them, by session id, each
+    /// with how far through its glow it is, `0..1`.
+    pub fn glows(&self) -> impl Iterator<Item = (&str, f32)> {
+        let length = self.afterglow.unwrap_or(Duration::MAX).as_secs_f32();
+        self.glows
+            .iter()
+            .map(move |g| (g.id.as_str(), g.age.as_secs_f32() / length))
+    }
+
+    /// How far through their fade the rows the last filter keystroke dropped
+    /// are, `0..1`, or `None` when none are on screen.
+    pub fn leaving(&self) -> Option<f32> {
+        self.leaving
+            .as_ref()
+            .map(|l| l.age.as_secs_f32() / effects::SIFT.as_secs_f32())
+    }
+
+    /// Start the row `id` crumbling, for a kill just confirmed. Says whether
+    /// there is anything to watch: the effect is on, and the row is on screen.
+    pub fn start_dust(&mut self, id: &str) -> bool {
+        if !self.crumble || !self.visible().iter().any(|s| s.id == id) {
+            return false;
+        }
+        self.dust = Some((id.to_string(), Dust::seeded()));
+        true
+    }
+
+    /// The row crumbling and its dust, for the renderer. Still here once the
+    /// dust is done — the row stays empty until a listing replaces it.
+    pub fn dust(&self) -> Option<(&str, &Dust)> {
+        self.dust.as_ref().map(|(id, d)| (id.as_str(), d))
+    }
+
+    /// Whether a row is still crumbling.
+    pub fn dusting(&self) -> bool {
+        self.dust.as_ref().is_some_and(|(_, d)| !d.done())
+    }
+
+    /// Whether the letters a filter matched are underlined.
+    pub fn underlines(&self) -> bool {
+        self.underline
     }
 
     /// The trail off the end of the name, for the renderer.
@@ -245,6 +367,24 @@ impl App {
     #[cfg(test)]
     pub(super) fn set_trail(&mut self, on: bool) {
         self.trail = on;
+    }
+
+    /// Turn the picker's own effects — the afterglow, the filter's fade and
+    /// underline, the kill's dust — on or off whatever the config says, for a
+    /// test that needs one or the other.
+    #[cfg(test)]
+    pub(super) fn set_effects(&mut self, on: bool) {
+        self.afterglow = on
+            .then(|| crate::config::get().effects.afterglow.duration_ms)
+            .map(Duration::from_millis);
+        self.sift = on;
+        self.underline = on;
+        self.crumble = on;
+        if !on {
+            self.glows.clear();
+            self.leaving = None;
+            self.dust = None;
+        }
     }
 
     /// Sessions matching the current filter, in display order.
@@ -279,6 +419,85 @@ impl App {
                 })
             })
             .collect()
+    }
+
+    /// The rows the list draws: the visible ones and, for a moment after a
+    /// filter keystroke narrowed the list, the ones it dropped, where they
+    /// stood. In the list's own order.
+    ///
+    /// Only the drawing sees the dropped rows. Keys, numbers and the mouse go
+    /// on resolving against [`App::visible`], so a row on its way out can be
+    /// seen and not touched.
+    pub fn rows(&self) -> Vec<Row<'_>> {
+        let visible = self.visible();
+        let Some(leaving) = &self.leaving else {
+            return visible
+                .into_iter()
+                .map(|session| Row {
+                    session,
+                    leaving: false,
+                })
+                .collect();
+        };
+        self.sessions
+            .iter()
+            .filter_map(|session| {
+                if visible.iter().any(|v| v.id == session.id) {
+                    Some(Row {
+                        session,
+                        leaving: false,
+                    })
+                } else {
+                    leaving.ids.contains(&session.id).then_some(Row {
+                        session,
+                        leaving: true,
+                    })
+                }
+            })
+            .collect()
+    }
+
+    /// The selection's index into [`App::rows`]. The same as
+    /// [`App::selected_index`] whenever no row is leaving.
+    pub fn selected_row(&self) -> usize {
+        let Some(id) = self.selected_id() else {
+            return 0;
+        };
+        self.rows()
+            .iter()
+            .position(|r| !r.leaving && r.session.id == id)
+            .unwrap_or(0)
+    }
+
+    /// The selected session's id, if anything is selected.
+    pub fn selected_row_id(&self) -> Option<&str> {
+        self.selected_session().map(|s| s.id.as_str())
+    }
+
+    /// Which characters of `name` the filter matched, as `char` indices in
+    /// order — what the renderer underlines. Empty with no filter, or when the
+    /// session matched on its folder rather than its name.
+    ///
+    /// The matcher counts grapheme clusters, which are `char`s for every name
+    /// without combining marks; one with them can have its underline land a
+    /// letter off, which is the price of not taking a dependency for it.
+    pub fn matched(&self, name: &str) -> Vec<usize> {
+        if self.filter.is_empty() {
+            return Vec::new();
+        }
+        let pattern = Pattern::parse(&self.filter, CaseMatching::Smart, Normalization::Smart);
+        let mut matcher = self.matcher.borrow_mut();
+        let mut buf = Vec::new();
+        let mut indices = Vec::new();
+        if pattern
+            .indices(Utf32Str::new(name, &mut buf), &mut matcher, &mut indices)
+            .is_none()
+        {
+            return Vec::new();
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        indices.into_iter().map(|i| i as usize).collect()
     }
 
     /// Every row the picker is holding, in the order it is holding them.
@@ -388,6 +607,9 @@ impl App {
     /// off both ends of it.
     fn pick_up(&mut self, id: String) {
         let was = self.snapshot();
+        // A grab holds an arrangement of the visible rows; nothing else may be
+        // on screen while it does.
+        self.leaving = None;
         self.mode = Mode::Reorder { id, was };
         if self.trail {
             self.after.scatter(starfield::TRAIL);
@@ -485,12 +707,69 @@ impl App {
     pub fn on_key(&mut self, key: Key) -> Request {
         // A stale message must not linger over an unrelated action.
         self.message = None;
+        // Nor the rows the last keystroke dropped: the list is the query's
+        // again, so a fast typist never waits on rows ruled out a letter ago.
+        self.leaving = None;
+        let was = self.cursor();
+        let visible = self.visible_ids();
 
-        match &self.mode {
+        let request = match &self.mode {
             Mode::Normal => self.on_key_normal(key),
             Mode::Filter => self.on_key_filter(key),
             Mode::Confirm { .. } => self.on_key_confirm(key),
             Mode::Reorder { .. } => self.on_key_reorder(key),
+        };
+        self.glow_from(was);
+        self.note_dropped(visible);
+        request
+    }
+
+    /// The session under the cursor, where the cursor is one that glows when
+    /// it leaves a row: in the list as it is browsed or filtered, not on a
+    /// session in flight or under a `[y/N]`.
+    fn cursor(&self) -> Option<String> {
+        matches!(self.mode, Mode::Normal | Mode::Filter)
+            .then(|| self.selected_id())
+            .flatten()
+    }
+
+    /// If the cursor has moved off the session `was`, start that row glowing.
+    /// The row it moved onto stops glowing, if it was: it is the selection now.
+    fn glow_from(&mut self, was: Option<String>) {
+        if self.afterglow.is_none() {
+            return;
+        }
+        let (Some(was), Some(now)) = (was, self.cursor()) else {
+            return;
+        };
+        // A row the filter just took is leaving, not glowing.
+        if was == now || !self.visible().iter().any(|s| s.id == was) {
+            return;
+        }
+        self.glows.retain(|g| g.id != was && g.id != now);
+        self.glows.push(Glow {
+            id: was,
+            age: Duration::ZERO,
+        });
+    }
+
+    fn visible_ids(&self) -> Vec<String> {
+        self.visible().iter().map(|s| s.id.clone()).collect()
+    }
+
+    /// Keep the rows that were visible and are not now on screen a moment
+    /// longer, fading, so the eye sees which ones a filter keystroke took.
+    fn note_dropped(&mut self, before: Vec<String>) {
+        if !self.sift || !matches!(self.mode, Mode::Filter | Mode::Normal) {
+            return;
+        }
+        let now = self.visible_ids();
+        let ids: Vec<String> = before.into_iter().filter(|id| !now.contains(id)).collect();
+        if !ids.is_empty() {
+            self.leaving = Some(Leaving {
+                ids,
+                age: Duration::ZERO,
+            });
         }
     }
 
@@ -606,6 +885,13 @@ impl App {
             self.message = None;
             self.pending = None;
         }
+        let was = self.cursor();
+        let request = self.on_mouse_mode(mouse);
+        self.glow_from(was);
+        request
+    }
+
+    fn on_mouse_mode(&mut self, mouse: Mouse) -> Request {
         match &self.mode {
             Mode::Normal | Mode::Filter => self.on_mouse_normal(mouse),
             Mode::Confirm { .. } => {

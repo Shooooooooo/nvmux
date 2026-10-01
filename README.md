@@ -151,6 +151,17 @@ excursions  = true   # so do the <prefix> ? and <prefix> c screens
 
 [effects.session_name]
 enabled = true   # stars streaming off both ends of a session being moved
+
+[effects.afterglow]
+enabled     = true   # the row the cursor leaves fades back from the selection
+duration_ms = 180    # how long it takes; without colours it is held, then let go
+
+[effects.kill]
+enabled = true   # a killed session's name crumbles into dust before it goes
+
+[effects.filter]
+enabled   = true   # rows a filter keystroke drops fade out before the list closes
+underline = true   # underline the letters the filter matched
 ```
 
 </details>

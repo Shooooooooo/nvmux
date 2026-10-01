@@ -23,6 +23,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use super::app::{App, Mode};
+use super::dust::Dust;
 use super::starfield;
 
 /// The marker on the selected row. Unselected rows are indented to match, so
@@ -154,9 +155,12 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
     }
-    let visible = app.visible();
+    // The rows a filter keystroke just dropped are drawn too, where they stood,
+    // for as long as they fade (see `effects`). Drawn plain: the fade is the
+    // post-pass's, so this function still sets no colour.
+    let rows = app.rows();
 
-    if visible.is_empty() {
+    if rows.is_empty() {
         draw_hint_row(frame, centre_vertically(area, 1), EMPTY, true);
         return;
     }
@@ -181,41 +185,151 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     // dead in this mode, and a column of numbers changing owner under a moving
     // row is noise.
     let reordering = matches!(app.mode(), Mode::Reorder { .. });
+    let selected_row = app.selected_row();
+    let dust = app.dust();
 
-    let rows: Vec<Line> = visible
+    let lines: Vec<Line> = rows
         .iter()
         .enumerate()
         .skip(offset)
         .take(height as usize)
-        .map(|(i, session)| {
-            let selected = i == app.selected_index();
-            let prefix = match (selected, reordering) {
-                (true, true) => GRABBED,
-                (true, false) => MARKER,
-                (false, _) => INDENT,
-            };
+        .map(|(i, row)| {
+            // A row crumbling is drawn by its dust alone, below.
+            if dust.is_some_and(|(id, _)| id == row.session.id) {
+                return Line::default();
+            }
+            let selected = i == selected_row && !row.leaving;
             let style = if selected {
                 Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
             } else {
                 Style::default()
             };
-            let num = if reordering {
-                String::new()
+            let marked = if app.underlines() {
+                app.matched(&row.session.name)
             } else {
-                session.state.num.to_string()
+                Vec::new()
             };
-            let text = truncate(
-                &format!("{prefix}{num:>num_width$}{NUM_GAP}{}", session.name),
+            row_line(
+                &head(row.session, selected, reordering, num_width),
+                &row.session.name,
+                &marked,
                 block.width as usize,
-            );
-            Line::from(Span::styled(text, style))
+                style,
+            )
         })
         .collect();
 
-    frame.render_widget(Paragraph::new(rows), block);
+    frame.render_widget(Paragraph::new(lines), block);
 
+    if let Some((id, dust)) = dust {
+        draw_dust(frame, app, block, offset, num_width, id, dust);
+    }
     if app.trailing() {
         draw_trails(frame, app, block, offset, num_width);
+    }
+}
+
+/// What comes before a row's name: its marker, its number right-aligned in the
+/// number column, and the gap.
+fn head(
+    session: &crate::session::Session,
+    selected: bool,
+    reordering: bool,
+    num_width: usize,
+) -> String {
+    let prefix = match (selected, reordering) {
+        (true, true) => GRABBED,
+        (true, false) => MARKER,
+        (false, _) => INDENT,
+    };
+    let num = if reordering {
+        String::new()
+    } else {
+        session.state.num.to_string()
+    };
+    format!("{prefix}{num:>num_width$}{NUM_GAP}")
+}
+
+/// One row, cut to `width`, with the letters of the name at the `char` indices
+/// in `marked` underlined — the letters the filter matched (see
+/// [`App::matched`]). Underline is a modifier, so this still sets no colour,
+/// and it sits on top of the row's own style, the selection's bar included.
+fn row_line(head: &str, name: &str, marked: &[usize], width: usize, style: Style) -> Line<'static> {
+    let text = truncate(&format!("{head}{name}"), width);
+    if marked.is_empty() {
+        return Line::from(Span::styled(text, style));
+    }
+    let skip = head.chars().count();
+    let underlined = style.add_modifier(Modifier::UNDERLINED);
+    let mut spans = Vec::new();
+    let mut run = String::new();
+    let mut in_match = false;
+    for (i, c) in text.chars().enumerate() {
+        let matched = i >= skip && marked.binary_search(&(i - skip)).is_ok();
+        if matched != in_match && !run.is_empty() {
+            let style = if in_match { underlined } else { style };
+            spans.push(Span::styled(std::mem::take(&mut run), style));
+        }
+        in_match = matched;
+        run.push(c);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, if in_match { underlined } else { style }));
+    }
+    Line::from(spans)
+}
+
+/// The row a kill is crumbling: its characters where they still stand, its
+/// grains where they have drifted, and nothing once they are gone (see
+/// [`super::dust`]). The row is drawn as it was the moment it was confirmed,
+/// marker and number included, but not reversed — the bar is what breaks up
+/// first, so the dust reads as the row and not as the selection.
+///
+/// Like the trails, the grains drift past the end of the block onto the
+/// terminal's own background, and stop at the edge of the screen.
+fn draw_dust(
+    frame: &mut Frame,
+    app: &App,
+    block: Rect,
+    offset: usize,
+    num_width: usize,
+    id: &str,
+    dust: &Dust,
+) {
+    let rows = app.rows();
+    let Some(index) = rows.iter().position(|r| r.session.id == id) else {
+        return;
+    };
+    let Some(line) = index
+        .checked_sub(offset)
+        .filter(|line| *line < block.height as usize)
+    else {
+        return;
+    };
+    let session = rows[index].session;
+    let selected = index == app.selected_row();
+    let text = truncate(
+        &format!(
+            "{}{}",
+            head(session, selected, false, num_width),
+            session.name
+        ),
+        block.width as usize,
+    );
+    let area = frame.area();
+    let y = block.y + line as u16;
+    let buf = frame.buffer_mut();
+    for speck in dust.render(&text) {
+        let x = block.x + speck.column;
+        if x >= area.x + area.width {
+            continue;
+        }
+        let style = if speck.dim {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
+            Style::default()
+        };
+        buf.set_string(x, y, speck.glyph.to_string(), style);
     }
 }
 
@@ -236,14 +350,14 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 /// half. Modifiers, like everything else here, and never the grabbed row's own
 /// reversed bar: that marks the session, and the trails are only behind it.
 fn draw_trails(frame: &mut Frame, app: &App, block: Rect, offset: usize, num_width: usize) {
-    let selected = app.selected_index();
+    let selected = app.selected_row();
     let Some(line) = selected
         .checked_sub(offset)
         .filter(|line| *line < block.height as usize)
     else {
         return;
     };
-    let Some(session) = app.visible().get(selected).copied() else {
+    let Some(session) = app.rows().get(selected).map(|r| r.session) else {
         return;
     };
     let y = block.y + line as u16;
@@ -331,25 +445,31 @@ fn hint_line(app: &App) -> (String, bool) {
 /// One function for the renderer and for [`row_at`], so a click lands on the
 /// row the eye sees rather than on a second opinion about where the rows are.
 fn list_layout(app: &App, area: Rect) -> Option<ListLayout> {
-    let visible = app.visible();
-    if area.height == 0 || visible.is_empty() {
+    // Every row drawn, the ones fading out of a filter included: the block is
+    // sized to what is on screen, and settles once they have gone.
+    let rows = app.rows();
+    if area.height == 0 || rows.is_empty() {
         return None;
     }
-    let widest = visible.iter().map(|s| s.name.width()).max().unwrap_or(0) as u16;
+    let widest = rows
+        .iter()
+        .map(|r| r.session.name.width())
+        .max()
+        .unwrap_or(0) as u16;
     // Right-aligned in a column as wide as the longest number, so the names stay
     // in one column once the list runs past nine.
-    let num_width = visible
+    let num_width = rows
         .iter()
-        .map(|s| s.state.num.to_string().len())
+        .map(|r| r.session.state.num.to_string().len())
         .max()
         .unwrap_or(1);
     let width = (widest + MARKER.width() as u16 + num_width as u16 + NUM_GAP.width() as u16)
         .clamp(MIN_LIST_WIDTH, MAX_LIST_WIDTH)
         .min(area.width);
 
-    let height = (visible.len() as u16).min(area.height);
+    let height = (rows.len() as u16).min(area.height);
     let block = centre(area, width, height);
-    let offset = scroll_offset(app.selected_index(), visible.len(), height as usize);
+    let offset = scroll_offset(app.selected_row(), rows.len(), height as usize);
     Some(ListLayout {
         block,
         offset,
@@ -388,8 +508,38 @@ pub(super) fn row_at(app: &App, area: Rect, column: u16, row: u16) -> Option<usi
     if row < block.y || row >= block.y + block.height {
         return None;
     }
+    // An index into the rows drawn, which a row fading out of a filter is one
+    // of; the answer is an index into the visible ones, which it is not.
     let index = offset + usize::from(row - block.y);
-    (index < app.visible().len()).then_some(index)
+    let rows = app.rows();
+    if rows.get(index)?.leaving {
+        return None;
+    }
+    Some(rows[..index].iter().filter(|r| !r.leaving).count())
+}
+
+/// Where the row of session `id` is drawn, as wide as what is written on it,
+/// with `area` the whole frame — or `None` when it is not on screen. What the
+/// effects' post-pass paints over (see [`super::effects`]), measured by the
+/// same layout the rows were drawn with.
+pub(super) fn row_rect(app: &App, area: Rect, id: &str) -> Option<Rect> {
+    if area.height == 0 || area.width == 0 {
+        return None;
+    }
+    let (body, _) = split_hint_row(area);
+    let ListLayout {
+        block,
+        offset,
+        num_width,
+    } = list_layout(app, body)?;
+    let rows = app.rows();
+    let index = rows.iter().position(|r| r.session.id == id)?;
+    let line = index
+        .checked_sub(offset)
+        .filter(|line| *line < block.height as usize)?;
+    let width = (MARKER.width() + num_width + NUM_GAP.width() + rows[index].session.name.width())
+        .min(block.width as usize);
+    Some(Rect::new(block.x, block.y + line as u16, width as u16, 1))
 }
 
 /// Keep `selected` visible within a window of `height` rows.
@@ -1180,5 +1330,143 @@ mod tests {
                 .any(|l| l.contains(GRABBED.trim_end())),
             "the session is still marked as moving"
         );
+    }
+
+    // --- the filter's underline -------------------------------------------
+
+    /// The cells of row `y` whose symbol is in `name`'s place, left to right.
+    fn name_cells<'a>(
+        buf: &'a ratatui::buffer::Buffer,
+        y: u16,
+        name: &str,
+    ) -> Vec<&'a ratatui::buffer::Cell> {
+        let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+        let at = row.find(name).expect("the name is on the row");
+        let x0 = row[..at].chars().count() as u16;
+        (x0..x0 + name.chars().count() as u16)
+            .map(|x| &buf[(x, y)])
+            .collect()
+    }
+
+    /// The letters the query matched are underlined and the rest are not —
+    /// fuzzily, so `asv` marks three letters of `api-server` spread apart.
+    #[test]
+    fn the_letters_a_filter_matched_are_underlined() {
+        let a = filtering(&["api-server", "dotfiles"], "asv");
+        let buf = test_support::buffer(40, 6, |f| draw(f, &a));
+        let lines = render(&a, 40, 6);
+        let y = line_of(&lines, "api-server");
+        let marks: String = name_cells(&buf, y, "api-server")
+            .iter()
+            .map(|c| {
+                if c.modifier.contains(Modifier::UNDERLINED) {
+                    '^'
+                } else {
+                    ' '
+                }
+            })
+            .collect();
+        // a-p-i---s-e-r-v-e-r
+        assert_eq!(marks, "^   ^  ^  ");
+        test_support::assert_no_colour(40, 6, |f| draw(f, &a));
+    }
+
+    /// With `[effects.filter]` off nothing is underlined.
+    #[test]
+    fn with_the_filter_effect_off_nothing_is_underlined() {
+        let mut a = filtering(&["api-server", "dotfiles"], "asv");
+        a.set_effects(false);
+        let buf = test_support::buffer(40, 6, |f| draw(f, &a));
+        assert!(buf
+            .content
+            .iter()
+            .all(|c| !c.modifier.contains(Modifier::UNDERLINED)));
+    }
+
+    // --- rows fading out of a filter ----------------------------------------
+
+    /// A row a filter keystroke just dropped is drawn where it stood, but it is
+    /// not there to click: a click on it names nothing, and a click below it
+    /// names the visible row it is drawn over.
+    #[test]
+    fn a_row_fading_out_of_a_filter_cannot_be_clicked() {
+        let a = filtering(&["api-server", "dotfiles", "notes"], "n");
+        assert!(a.leaving().is_some(), "the keystroke dropped rows");
+        let area = Rect::new(0, 0, 40, 8);
+        let lines = render(&a, 40, 8);
+        assert!(lines.iter().any(|l| l.contains("dotfiles")), "{lines:#?}");
+
+        let dotfiles = line_of(&lines, "dotfiles");
+        let notes = line_of(&lines, "notes");
+        assert_eq!(row_at(&a, area, 20, dotfiles), None);
+        assert_eq!(row_at(&a, area, 20, notes), Some(0), "the only visible row");
+    }
+
+    // --- the dust a kill leaves -----------------------------------------------
+
+    /// [`picker`] with the second row selected and its kill confirmed, the
+    /// dust `ms` milliseconds along.
+    fn crumbling(ms: u64) -> App {
+        let mut a = app(&["api-server", "dotfiles", "notes"]);
+        a.on_key(Key::Char('j'));
+        a.on_key(Key::Char('x'));
+        assert!(matches!(
+            a.on_key(Key::Char('y')),
+            super::super::app::Request::Kill(_)
+        ));
+        assert!(a.start_dust("id000001"));
+        a.tick(std::time::Duration::from_millis(ms));
+        a
+    }
+
+    /// At first the row is all there, though no longer the reversed bar;
+    /// midway it is braille drifting right; at the end there is nothing left
+    /// of it, and the rows around it have not moved.
+    #[test]
+    fn a_killed_row_crumbles_into_dust_and_leaves_its_place_empty() {
+        let start = crumbling(0);
+        let buf = test_support::buffer(44, 8, |f| draw(f, &start));
+        let lines = render(&start, 44, 8);
+        let y = line_of(&lines, "dotfiles");
+        assert!(
+            (0..buf.area.width).all(|x| !buf[(x, y)].modifier.contains(Modifier::REVERSED)),
+            "the bar breaks up first"
+        );
+
+        let mid = crumbling(200);
+        let buf = test_support::buffer(44, 8, |f| draw(f, &mid));
+        assert!(
+            (0..buf.area.width).any(|x| is_braille(buf[(x, y)].symbol())),
+            "dust midway: {:?}",
+            render(&mid, 44, 8)
+        );
+
+        let end = crumbling(1_000);
+        assert!(!end.dusting());
+        let after = render(&end, 44, 8);
+        assert_eq!(after[y as usize], "", "the row is empty: {after:#?}");
+        assert_eq!(line_of(&after, "api-server"), y - 1, "the rows stay put");
+        assert_eq!(line_of(&after, "notes"), y + 1);
+        test_support::assert_no_colour(44, 8, |f| draw(f, &mid));
+    }
+
+    /// A listing after the kill is the truth: the dust is gone with it, and a
+    /// row whose kill failed comes back whole.
+    #[test]
+    fn a_fresh_listing_ends_the_dust() {
+        let mut a = crumbling(1_000);
+        let same = a.sessions().to_vec();
+        a.set_sessions(same);
+        assert!(a.dust().is_none());
+        assert!(render(&a, 44, 8).iter().any(|l| l.contains("dotfiles")));
+    }
+
+    /// `[effects.kill] enabled = false`: a confirmed kill starts no dust.
+    #[test]
+    fn with_the_kill_effect_off_there_is_no_dust() {
+        let mut a = app(&["api-server", "dotfiles"]);
+        a.set_effects(false);
+        assert!(!a.start_dust("id000001"));
+        assert!(!a.animating());
     }
 }
