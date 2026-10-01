@@ -43,6 +43,9 @@ pub enum Request {
     None,
     Attach(String),
     /// Ask for a name for a new session; naming happens on its own screen.
+    ///
+    /// The session goes in just after the row highlighted when this was asked,
+    /// which nothing moves while the prompt is up — see [`App::placement_of`].
     NewSession,
     /// Ask for a new name for this session.
     RenameSession(String),
@@ -347,6 +350,37 @@ impl App {
             return 0;
         }
         (self.selected as isize + delta).clamp(0, len as isize - 1) as usize
+    }
+
+    /// Where the session `new_id` — just created from this picker — belongs, as
+    /// the arrangement to store: every visible row and the new session, in
+    /// their new order, each paired with the number it should now hold.
+    ///
+    /// Just after the highlighted row, so a session lands next to the one the
+    /// user was looking at when they made it rather than at the bottom of the
+    /// list, and everything after it moves down one.
+    ///
+    /// The new session is treated as though it had been appended and then moved
+    /// up to that row, which is exactly what storing it this way does: it was
+    /// created last, and this moves it. So its number is the one past every
+    /// row's, and the visible numbers plus that one are dealt back out down the
+    /// new order — the same deal a reorder makes (see
+    /// [`App::shift_grabbed_to`]), with the same result under a filter: the
+    /// hidden rows keep their numbers and stay out of the payload.
+    ///
+    /// Empty when there is nothing to write: no row was highlighted, or the
+    /// last one was, and after it is where a new session goes anyway.
+    pub fn placement_of(&self, new_id: &str) -> Vec<(String, u32)> {
+        let rows = self.snapshot();
+        let at = self.selected + 1;
+        if at >= rows.len() {
+            return Vec::new();
+        }
+        let appended = self.sessions.iter().map(|s| s.state.num).max().unwrap_or(0) + 1;
+        let numbers = rows.iter().map(|(_, num)| *num).chain([appended]);
+        let mut ids: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
+        ids.insert(at, new_id.to_string());
+        ids.into_iter().zip(numbers).collect()
     }
 
     /// Pick the session `id` up — the space bar and a drag both come here — with
@@ -2436,5 +2470,77 @@ mod tests {
     fn the_trail_follows_the_config() {
         assert!(crate::config::get().effects.session_name_enabled());
         assert!(app(&["aaa"]).trail);
+    }
+
+    // ---- where a new session goes ------------------------------------------
+
+    /// Straight after the highlighted row, with everything after it moving
+    /// down one.
+    #[test]
+    fn a_new_session_goes_in_after_the_highlighted_row() {
+        let a = app(&["aaa", "bbb", "ccc"]);
+        assert_eq!(
+            a.placement_of("new"),
+            [
+                ("id000000".to_string(), 1),
+                ("new".to_string(), 2),
+                ("id000001".to_string(), 3),
+                ("id000002".to_string(), 4),
+            ]
+        );
+
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char('j'));
+        assert_eq!(
+            a.placement_of("new"),
+            [
+                ("id000000".to_string(), 1),
+                ("id000001".to_string(), 2),
+                ("new".to_string(), 3),
+                ("id000002".to_string(), 4),
+            ]
+        );
+    }
+
+    /// After the last row is where a new session goes anyway, so there is
+    /// nothing to write — and no round trip to pay for it. Nor is there with
+    /// no rows at all.
+    #[test]
+    fn a_new_session_after_the_last_row_stores_nothing() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.on_key(Key::Char('G'));
+        assert!(a.placement_of("new").is_empty());
+        assert!(app(&[]).placement_of("new").is_empty());
+    }
+
+    /// Under a filter the highlight is on a row the filter left, and the rows
+    /// it hides keep their numbers and stay out of the payload — the rule a
+    /// reorder follows.
+    #[test]
+    fn a_filtered_placement_leaves_the_hidden_rows_alone() {
+        let mut a = app(&["alpha", "zzz", "gamma"]);
+        a.on_key(Key::Char('/'));
+        a.on_key(Key::Char('a'));
+        a.on_key(Key::Enter); // back to normal mode, filter still applied
+        assert_eq!(names(&a), ["alpha", "gamma"]);
+        assert_eq!(
+            a.placement_of("new"),
+            [
+                ("id000000".to_string(), 1),
+                ("new".to_string(), 3),
+                ("id000002".to_string(), 4),
+            ]
+        );
+    }
+
+    /// Asking for a name moves nothing: the highlight the session will go
+    /// after is still where it was when the prompt comes back.
+    #[test]
+    fn asking_for_a_name_leaves_the_highlight_where_it_is() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char('j'));
+        assert_eq!(a.on_key(Key::Char('c')), Request::NewSession);
+        assert_eq!(a.selected_index(), 1);
+        assert_eq!(*a.mode(), Mode::Normal);
     }
 }
