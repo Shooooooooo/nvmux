@@ -385,7 +385,7 @@ impl Bar {
 /// that Neovim keeps mostly blank that is the right trade against asking the
 /// server on every mistyped chord.
 ///
-/// Failing a shadow — the fade off, `[fade] session = false`, a terminal that
+/// Failing a shadow — the fade off, `[effects.fade] session = false`, a terminal that
 /// never said what its colours are — or a shadow whose parser has been retired,
 /// there is nothing here that knows what was underneath. The row is blanked, and
 /// the relay is told to ask the server for the rest.

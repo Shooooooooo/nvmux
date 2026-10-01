@@ -30,8 +30,9 @@
 //! Both ends of the interpolation have to be real colours, so the fade rests
 //! on the terminal's answer to [`crate::palette::query`]: no answer, no fade,
 //! and the transitions are exactly what they were before. `NO_COLOR` turns it
-//! off too — the effect paints explicit colours — and so does `[fade]
-//! enabled = false`. [`enabled`] is the one gate every entry point checks.
+//! off too — the effect paints explicit colours — and so does switching it off
+//! in the config, as `[effects.fade] enabled` or with every other effect under
+//! `[effects] enabled`. [`enabled`] is the one gate every entry point checks.
 //!
 //! # Time
 //!
@@ -69,7 +70,7 @@ pub const FRAME: Duration = Duration::from_millis(16);
 /// strength of this.
 pub fn configured() -> bool {
     is_configured(
-        crate::config::get().fade.enabled,
+        crate::config::get().effects.fade_enabled(),
         std::env::var_os("NO_COLOR").is_some(),
     )
 }
@@ -100,18 +101,18 @@ fn active() -> Option<&'static Palette> {
 /// Whether the quick excursions — the help and the create prompt, entered
 /// from a session — fade too.
 pub fn excursions() -> bool {
-    crate::config::get().fade.excursions
+    crate::config::get().effects.fade.excursions
 }
 
 /// Whether an attached session is watched so it can dissolve out.
 pub fn session() -> bool {
-    crate::config::get().fade.session
+    crate::config::get().effects.fade.session
 }
 
-/// How long one direction takes: half of `fade.duration_ms`, which measures
+/// How long one direction takes: half of `effects.fade.duration_ms`, which measures
 /// a dissolve both ways (see [`crate::config::FadeSettings::one_way`]).
 fn one_way() -> Duration {
-    crate::config::get().fade.one_way()
+    crate::config::get().effects.fade.one_way()
 }
 
 /// Everything a caller needs to paint its own fade frames: what to interpolate
@@ -153,7 +154,7 @@ impl Dissolve {
 }
 
 /// What to fade with, or `None` when there is no fade — no palette, `NO_COLOR`,
-/// or `[fade] enabled = false`. Exactly the gate [`enabled`] reports, in the
+/// or the fade switched off in `[effects]`. Exactly the gate [`enabled`] reports, in the
 /// one form a caller that paints its own frames can use.
 pub fn dissolve() -> Option<Dissolve> {
     Some(Dissolve {
@@ -394,7 +395,7 @@ mod tests {
     /// [`crate::config::get`]).
     #[test]
     fn a_schedule_is_started_with_half_the_configured_dissolve() {
-        let configured = Duration::from_millis(crate::config::get().fade.duration_ms);
+        let configured = Duration::from_millis(crate::config::get().effects.fade.duration_ms);
         assert_eq!(one_way() * 2, configured);
         assert_eq!(
             one_way(),

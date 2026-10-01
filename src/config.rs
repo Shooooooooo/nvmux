@@ -38,7 +38,8 @@ use serde::Deserialize;
 use crate::error::ConfigError;
 
 /// The whole configuration. Each field is a table of its own, so the file reads
-/// as `[keys]`-style sections.
+/// as `[keys]`-style sections — `[effects]` with a table inside it for each
+/// effect, so far `[effects.fade]`.
 ///
 /// Not `Copy`: `[session] command` owns a `String`. Nothing reads it by value —
 /// [`get`] hands out a `&'static Settings` — so this costs nothing.
@@ -48,7 +49,7 @@ pub struct Settings {
     pub keys: KeySettings,
     pub session: SessionSettings,
     pub client: ClientSettings,
-    pub fade: FadeSettings,
+    pub effects: EffectsSettings,
 }
 
 /// The prefix key and how long a half-typed sequence waits (see [`crate::keys`]).
@@ -118,15 +119,38 @@ impl Default for ClientSettings {
     }
 }
 
+/// The animated effects: a master switch over them all, and a table of its own
+/// for each — so far `[effects.fade]` — with its own `enabled`. An effect runs
+/// only when both are on, which is what [`EffectsSettings::fade_enabled`]
+/// answers, so nothing reads one switch without the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EffectsSettings {
+    /// Master switch. Off, nothing moves that does not have to, whatever each
+    /// effect's own switch says.
+    pub enabled: bool,
+    pub fade: FadeSettings,
+}
+
+impl EffectsSettings {
+    /// Whether the fade is switched on: its own switch and the master one.
+    /// `NO_COLOR` and the terminal have their say after this (see
+    /// [`crate::fade::enabled`]).
+    pub fn fade_enabled(&self) -> bool {
+        self.enabled && self.fade.enabled
+    }
+}
+
 /// The fade between screens (see [`crate::fade`]): each one dissolves into the
 /// terminal's own background colour and the next dissolves up out of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FadeSettings {
-    /// Master switch. Two things force the fade off whatever this says:
-    /// `NO_COLOR`, because the effect paints explicit colours, and a terminal
-    /// that does not answer the startup colour query, because there is then
-    /// nothing to fade *to* — see [`crate::fade::enabled`].
+    /// This effect's own switch, under `[effects] enabled`. Two things force
+    /// the fade off whatever either says: `NO_COLOR`, because the effect paints
+    /// explicit colours, and a terminal that does not answer the startup colour
+    /// query, because there is then nothing to fade *to* — see
+    /// [`crate::fade::enabled`].
     pub enabled: bool,
     /// How long a dissolve takes, **both directions together**: a screen going
     /// out and the next one coming up divide this between them, half each (see
@@ -154,6 +178,15 @@ pub struct FadeSettings {
     /// Whether the quick `<prefix> ?` / `<prefix> c` excursions fade too. Off
     /// makes those snappier at the cost of consistency.
     pub excursions: bool,
+}
+
+impl Default for EffectsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            fade: FadeSettings::default(),
+        }
+    }
 }
 
 // These are the built-in behaviour. `#[serde(default)]` on the containers means
@@ -243,7 +276,7 @@ where
 /// `poll` timeout as a `c_int`, and an absurd one is a hang, not a long wait.
 const MAX_TIMEOUT_MS: u64 = 60_000;
 
-/// Ceiling for `fade.duration_ms`. Two seconds is already a transition nobody
+/// Ceiling for `effects.fade.duration_ms`. Two seconds is already a transition nobody
 /// wants to sit through, and a switch sits through two of them — the screens
 /// and the notice; past it the value is a hang with a name.
 const MAX_FADE_MS: u64 = 2_000;
@@ -262,16 +295,18 @@ impl Settings {
             // forever; well before that it is a prefix that never resolves.
             return Err(format!("keys.timeout_ms must be at most {MAX_TIMEOUT_MS}"));
         }
-        if self.fade.duration_ms == 0 {
+        if self.effects.fade.duration_ms == 0 {
             // `enabled = false` is how the fade is turned off; a zero-length
             // fade would be the same thing spelled as a schedule with no frames.
             // One millisecond still halves to something rather than to nothing,
             // which is what [`FadeSettings::one_way`] is careful about.
-            return Err("fade.duration_ms must be at least 1".into());
+            return Err("effects.fade.duration_ms must be at least 1".into());
         }
-        if self.fade.duration_ms > MAX_FADE_MS {
+        if self.effects.fade.duration_ms > MAX_FADE_MS {
             // It feeds a `sleep`, on every screen a switch dissolves.
-            return Err(format!("fade.duration_ms must be at most {MAX_FADE_MS}"));
+            return Err(format!(
+                "effects.fade.duration_ms must be at most {MAX_FADE_MS}"
+            ));
         }
         // Refused at startup rather than at the prompt: a command that can never
         // spawn a session is a broken config, and the file is where it is fixed.
@@ -410,7 +445,8 @@ fn render_default_config(prefix: u8) -> String {
     let k = KeySettings::default();
     let s = SessionSettings::default();
     let c = ClientSettings::default();
-    let f = FadeSettings::default();
+    let e = EffectsSettings::default();
+    let f = e.fade;
     format!(
         "# nvmux configuration — created on first run.\n\
          #\n\
@@ -436,7 +472,12 @@ fn render_default_config(prefix: u8) -> String {
          # false starts a new client on every switch instead.\n\
          # per_session = {per_session}\n\
          \n\
-         [fade]\n\
+         [effects]\n\
+         # The master switch: false turns every effect below off, whatever its\n\
+         # own enabled says.\n\
+         # enabled = {effects_enabled}\n\
+         \n\
+         [effects.fade]\n\
          # The dissolve between screens, and of the notice a switch puts up.\n\
          # NO_COLOR turns it off whatever this says.\n\
          # enabled     = {fade_enabled}\n\
@@ -451,6 +492,7 @@ fn render_default_config(prefix: u8) -> String {
         fade_duration = f.duration_ms,
         fade_session = f.session,
         fade_excursions = f.excursions,
+        effects_enabled = e.enabled,
     )
 }
 
@@ -522,7 +564,9 @@ mod tests {
             command = \"nvim --headless --listen {sock}\"\n\
             [client]\n\
             per_session = true\n\
-            [fade]\n\
+            [effects]\n\
+            enabled = true\n\
+            [effects.fade]\n\
             enabled = true\n\
             duration_ms = 200\n\
             session = true\n\
@@ -533,11 +577,15 @@ mod tests {
 
     #[test]
     fn a_partial_fade_table_keeps_the_other_fade_defaults() {
-        let s: Settings = toml::from_str("[fade]\nduration_ms = 40\n").expect("valid");
-        assert_eq!(s.fade.duration_ms, 40);
-        assert_eq!(s.fade.enabled, FadeSettings::default().enabled);
-        assert_eq!(s.fade.session, FadeSettings::default().session);
-        assert_eq!(s.fade.excursions, FadeSettings::default().excursions);
+        let s: Settings = toml::from_str("[effects.fade]\nduration_ms = 40\n").expect("valid");
+        assert_eq!(s.effects.fade.duration_ms, 40);
+        assert_eq!(s.effects.fade.enabled, FadeSettings::default().enabled);
+        assert_eq!(s.effects.fade.session, FadeSettings::default().session);
+        assert_eq!(
+            s.effects.fade.excursions,
+            FadeSettings::default().excursions
+        );
+        assert!(s.effects.enabled, "the master switch keeps its default");
         assert_eq!(s.keys, KeySettings::default());
     }
 
@@ -570,8 +618,20 @@ mod tests {
 
     #[test]
     fn fade_enabled_false_parses() {
-        let s: Settings = toml::from_str("[fade]\nenabled = false\n").expect("valid");
-        assert!(!s.fade.enabled);
+        let s: Settings = toml::from_str("[effects.fade]\nenabled = false\n").expect("valid");
+        assert!(!s.effects.fade.enabled);
+        assert!(!s.effects.fade_enabled());
+        assert!(s.effects.enabled, "the master switch is untouched");
+    }
+
+    /// One switch over all of them: off, no effect runs, and each one's own
+    /// switch is left as it was for when the master is turned back on.
+    #[test]
+    fn the_master_switch_turns_every_effect_off() {
+        let s: Settings = toml::from_str("[effects]\nenabled = false\n").expect("valid");
+        assert!(!s.effects.fade_enabled());
+        assert!(s.effects.fade.enabled);
+        assert!(Settings::default().effects.fade_enabled());
     }
 
     /// On unless turned off, and `false` turns it off: a parked client is a
@@ -582,7 +642,7 @@ mod tests {
         assert!(Settings::default().client.per_session);
         let s: Settings = toml::from_str("[client]\nper_session = false\n").expect("valid");
         assert!(!s.client.per_session);
-        assert_eq!(s.fade, FadeSettings::default());
+        assert_eq!(s.effects, EffectsSettings::default());
         assert_eq!(s.session, SessionSettings::default());
     }
 
@@ -624,10 +684,19 @@ mod tests {
             ("an unknown keys key", "[keys]\nprefx = \"C-a\"\n"),
             ("an unparseable prefix", "[keys]\nprefix = \"nope\"\n"),
             ("an unknown session key", "[session]\ncmd = \"nvim\"\n"),
-            ("an unknown fade key", "[fade]\nduration = 40\n"),
+            ("an unknown fade key", "[effects.fade]\nduration = 40\n"),
             ("an unknown client key", "[client]\nkeep = true\n"),
+            ("an unknown effect", "[effects.sparkles]\nenabled = true\n"),
+            ("an unknown effects key", "[effects]\nenable = false\n"),
             ("an unparseable client value", "[client]\nper_session = 1\n"),
-            ("an unparseable fade value", "[fade]\nenabled = \"yes\"\n"),
+            (
+                "an unparseable fade value",
+                "[effects.fade]\nenabled = \"yes\"\n",
+            ),
+            (
+                "the fade table where it used to be",
+                "[fade]\nenabled = false\n",
+            ),
         ] {
             assert!(
                 toml::from_str::<Settings>(doc).is_err(),
@@ -646,8 +715,14 @@ mod tests {
             ("[keys]\ntimeout_ms = 60001\n", "keys.timeout_ms"),
             // Past `c_int`: the value `poll` would have read as "block forever".
             ("[keys]\ntimeout_ms = 3000000000\n", "keys.timeout_ms"),
-            ("[fade]\nduration_ms = 0\n", "fade.duration_ms"),
-            ("[fade]\nduration_ms = 2001\n", "fade.duration_ms"),
+            (
+                "[effects.fade]\nduration_ms = 0\n",
+                "effects.fade.duration_ms",
+            ),
+            (
+                "[effects.fade]\nduration_ms = 2001\n",
+                "effects.fade.duration_ms",
+            ),
         ];
         for (doc, key) in cases {
             let err = parse(Path::new("test.toml"), doc).expect_err(doc);
@@ -661,8 +736,8 @@ mod tests {
         for doc in [
             "[keys]\ntimeout_ms = 1\n",
             "[keys]\ntimeout_ms = 60000\n",
-            "[fade]\nduration_ms = 1\n",
-            "[fade]\nduration_ms = 2000\n",
+            "[effects.fade]\nduration_ms = 1\n",
+            "[effects.fade]\nduration_ms = 2000\n",
         ] {
             parse(Path::new("test.toml"), doc).expect(doc);
         }
@@ -718,8 +793,17 @@ mod tests {
             rendered.contains("# command = \"nvim --headless --listen {sock}\""),
             "the template must document the command: {rendered:?}"
         );
-        assert!(rendered.contains("\n[fade]\n"), "{rendered:?}");
         assert!(rendered.contains("\n[client]\n"), "{rendered:?}");
+        for table in ["[effects]", "[effects.fade]"] {
+            assert!(
+                rendered.contains(&format!("\n{table}\n")),
+                "the template must have {table}: {rendered:?}"
+            );
+        }
+        assert!(
+            rendered.contains("\n# enabled = true\n"),
+            "the template must document the master switch: {rendered:?}"
+        );
         for line in [
             "# per_session = true",
             "# enabled     = true",

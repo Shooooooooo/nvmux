@@ -140,7 +140,10 @@ command = "nvim --headless --listen {sock}"   # {sock} is required
 [client]
 per_session = true   # keep each session's client; a switch back reuses it
 
-[fade]
+[effects]
+enabled = true   # master switch: false turns every effect below off
+
+[effects.fade]
 enabled     = true   # dissolve between screens; NO_COLOR forces this off
 duration_ms = 200    # the whole dissolve, out and back; the notice pays it too
 session     = true   # Neovim's own screen dissolves too, and backs the notice
