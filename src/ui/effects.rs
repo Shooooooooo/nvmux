@@ -23,8 +23,9 @@
 //! and then lets it go; a dropped row is dim until it goes. Coarser, and
 //! correct under `NO_COLOR` by construction, as everything else here is.
 //!
-//! The underline on a filter's matched letters is not here: it is still, a
-//! modifier, and part of how a row is drawn, so [`super::draw`] draws it.
+//! The underline on a filter's matched letters is not here, and is not an
+//! effect: it is still, a modifier, and says why a row is still on screen, so
+//! [`super::draw`] draws it whatever `[effects]` says.
 
 use std::time::Duration;
 
@@ -42,6 +43,12 @@ use crate::palette::{Palette, Rgb};
 /// millisecond of this is a millisecond the list is longer than the query
 /// says. Long enough to see which rows went, which is all it is for.
 pub const SIFT: Duration = Duration::from_millis(120);
+
+/// How long the row the cursor leaves glows. Long enough that a quick `j j j`
+/// leaves a visible tail, short enough that one key's glow is gone before the
+/// next is pressed at an ordinary pace. Not a setting: unlike the fade's, this
+/// length holds nothing up, so there is nothing to tune it for but taste.
+pub const AFTERGLOW: Duration = Duration::from_millis(180);
 
 /// The part of the afterglow the modifier fallback holds the bar for.
 const FALLBACK_HOLD: f32 = 1.0 / 3.0;
@@ -65,7 +72,7 @@ pub fn palette() -> Option<&'static Palette> {
 /// `NO_COLOR` answers no for all of them, as it does for the fade.
 pub fn want_palette() -> bool {
     let effects = &crate::config::get().effects;
-    let wanted = effects.afterglow().is_some() || effects.filter_enabled();
+    let wanted = effects.afterglow_enabled() || effects.filter_enabled();
     wanted && std::env::var_os("NO_COLOR").is_none()
 }
 

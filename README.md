@@ -150,19 +150,16 @@ session     = true   # Neovim's own screen dissolves too, and backs the notice
 excursions  = true   # so do the <prefix> ? and <prefix> c screens
 
 [effects.session_name]
-enabled = true   # stars streaming off both ends of a session being moved
-landing = true   # and an impact, with a spray of dust, when it is put down
+enabled = true   # stars off both ends of a session being moved, and its landing
 
 [effects.afterglow]
-enabled     = true   # the row the cursor leaves fades back from the selection
-duration_ms = 180    # how long it takes; without colours it is held, then let go
+enabled = true   # the row the cursor leaves fades back from the selection
 
 [effects.kill]
 enabled = true   # a killed session's name crumbles into dust before it goes
 
 [effects.filter]
-enabled   = true   # rows a filter keystroke drops fade out before the list closes
-underline = true   # underline the letters the filter matched
+enabled = true   # rows a filter keystroke drops fade out before the list closes
 ```
 
 </details>

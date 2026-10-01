@@ -152,19 +152,11 @@ impl EffectsSettings {
         self.enabled && self.session_name.enabled
     }
 
-    /// Whether a session put down lands with an impact: the trail's switches
-    /// and its own key.
-    pub fn landing_enabled(&self) -> bool {
-        self.session_name_enabled() && self.session_name.landing
-    }
-
-    /// How long the row the cursor leaves takes to fade back, or `None` when
-    /// it does not: its own switch and the master one. Whether it fades in
-    /// colour or steps through a modifier is the terminal's say after this
-    /// (see [`crate::ui::effects`]).
-    pub fn afterglow(&self) -> Option<Duration> {
-        (self.enabled && self.afterglow.enabled)
-            .then(|| Duration::from_millis(self.afterglow.duration_ms))
+    /// Whether the row the cursor leaves glows: its own switch and the master
+    /// one. Whether it fades in colour or steps through a modifier is the
+    /// terminal's say after this (see [`crate::ui::effects`]).
+    pub fn afterglow_enabled(&self) -> bool {
+        self.enabled && self.afterglow.enabled
     }
 
     /// Whether a killed session's name crumbles into dust before it goes: its
@@ -177,12 +169,6 @@ impl EffectsSettings {
     /// filter's own switch and the master one.
     pub fn filter_enabled(&self) -> bool {
         self.enabled && self.filter.enabled
-    }
-
-    /// Whether the letters a filter matched are underlined: its own key, under
-    /// the filter's switch and the master one.
-    pub fn filter_underline(&self) -> bool {
-        self.filter_enabled() && self.filter.underline
     }
 }
 
@@ -226,22 +212,22 @@ pub struct FadeSettings {
 }
 
 /// The stars a session's name streams while it is picked up to be moved, off
-/// both ends of its row (see [`crate::ui::starfield`]).
+/// both ends of its row (see [`crate::ui::starfield`]), and the impact when it
+/// is put down (see [`crate::ui::landing`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionNameSettings {
     /// This effect's own switch, under `[effects] enabled`. Off, a session in
-    /// flight is drawn still, and the picker redraws on a key and nothing
-    /// else, as it does the rest of the time.
+    /// flight is drawn still and put down without a landing, and the picker
+    /// redraws on a key and nothing else, as it does the rest of the time.
     ///
-    /// Unlike the fade, `NO_COLOR` leaves this alone: the trail is braille and
-    /// the dim modifier, and sets no colour to begin with.
+    /// One switch for the flight and the landing, not one each: the landing is
+    /// how the trail ends, and a trail that stopped dead would be the subtle
+    /// ending the landing replaced.
+    ///
+    /// Unlike the fade, `NO_COLOR` leaves this alone: the trail and the landing
+    /// are braille and modifiers, and set no colour to begin with.
     pub enabled: bool,
-    /// Whether putting the session down lands it (see [`crate::ui::landing`]):
-    /// the trail snaps into the row, the bar widens for a frame, the rows
-    /// beside it flinch and dust shoots out of both ends. Off, the trail just
-    /// stops. Under `enabled`, and as free of colour as the trail.
-    pub landing: bool,
 }
 
 /// The row the cursor leaves, fading from the selection's reversed bar back to
@@ -255,10 +241,12 @@ pub struct AfterglowSettings {
     /// terminal's answer to the colour query, and no `NO_COLOR`. Without them
     /// it falls back to the bar standing a moment longer, reversed and dim,
     /// before it goes — modifiers, like the rest of the picker.
+    ///
+    /// No length to set, unlike the fade: the fade's is how long every switch
+    /// takes, where this one is a trace behind a key that has already done its
+    /// work, and its length is a matter of look (see
+    /// [`crate::ui::effects::AFTERGLOW`]).
     pub enabled: bool,
-    /// How long the bar takes to fade. Must be at least 1 and at most
-    /// `MAX_AFTERGLOW_MS`.
-    pub duration_ms: u64,
 }
 
 /// A killed session's name crumbling into braille dust before the kill runs
@@ -273,7 +261,7 @@ pub struct KillSettings {
     pub enabled: bool,
 }
 
-/// What a filter keystroke shows besides the narrower list (see
+/// The rows a filter keystroke drops, fading out where they stood (see
 /// [`crate::ui::effects`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -281,12 +269,11 @@ pub struct FilterSettings {
     /// This effect's own switch, under `[effects] enabled`. On, the rows a
     /// keystroke drops fade out where they stand before the list closes up —
     /// in colour where the terminal said what its colours are, dim where it
-    /// did not. Off, they vanish on the keystroke, and nothing is underlined
-    /// whatever `underline` says.
+    /// did not. Off, they vanish on the keystroke.
+    ///
+    /// The underline on the letters a query matched is not part of this, and
+    /// has no switch: it does not move, and it says why a row is still there.
     pub enabled: bool,
-    /// Underline the letters of each name the query matched. A modifier, so
-    /// `NO_COLOR` leaves it alone; and still, so it costs no redraws.
-    pub underline: bool,
 }
 
 impl Default for EffectsSettings {
@@ -304,22 +291,13 @@ impl Default for EffectsSettings {
 
 impl Default for SessionNameSettings {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            landing: true,
-        }
+        Self { enabled: true }
     }
 }
 
 impl Default for AfterglowSettings {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            // Long enough that a quick `j j j` leaves a visible tail, short
-            // enough that one key's glow is gone before the next is pressed
-            // at an ordinary pace.
-            duration_ms: 180,
-        }
+        Self { enabled: true }
     }
 }
 
@@ -331,10 +309,7 @@ impl Default for KillSettings {
 
 impl Default for FilterSettings {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            underline: true,
-        }
+        Self { enabled: true }
     }
 }
 
@@ -430,11 +405,6 @@ const MAX_TIMEOUT_MS: u64 = 60_000;
 /// and the notice; past it the value is a hang with a name.
 const MAX_FADE_MS: u64 = 2_000;
 
-/// Ceiling for `effects.afterglow.duration_ms`. A glow is redrawn every frame
-/// for as long as it lasts, after every move; past a second it is no longer a
-/// trace of the last move but a smear over the next several.
-const MAX_AFTERGLOW_MS: u64 = 1_000;
-
 impl Settings {
     /// Rules that the deserializer cannot express. Kept minimal: only values that
     /// would misbehave at runtime, not taste.
@@ -460,15 +430,6 @@ impl Settings {
             // It feeds a `sleep`, on every screen a switch dissolves.
             return Err(format!(
                 "effects.fade.duration_ms must be at most {MAX_FADE_MS}"
-            ));
-        }
-        if self.effects.afterglow.duration_ms == 0 {
-            // As for the fade: `enabled = false` is how it is turned off.
-            return Err("effects.afterglow.duration_ms must be at least 1".into());
-        }
-        if self.effects.afterglow.duration_ms > MAX_AFTERGLOW_MS {
-            return Err(format!(
-                "effects.afterglow.duration_ms must be at most {MAX_AFTERGLOW_MS}"
             ));
         }
         // Refused at startup rather than at the prompt: a command that can never
@@ -652,22 +613,18 @@ fn render_default_config(prefix: u8) -> String {
          # Stars streaming off both ends of a session picked up to be moved,\n\
          # and the impact when it is put down.\n\
          # enabled = {session_name_enabled}\n\
-         # landing = {session_name_landing}\n\
          \n\
          [effects.afterglow]\n\
          # The row the cursor leaves fades back from the selection's bar.\n\
-         # enabled     = {afterglow_enabled}\n\
-         # duration_ms = {afterglow_duration}\n\
+         # enabled = {afterglow_enabled}\n\
          \n\
          [effects.kill]\n\
          # A killed session's name crumbles into dust before it goes.\n\
          # enabled = {kill_enabled}\n\
          \n\
          [effects.filter]\n\
-         # Rows a filter keystroke drops fade out before the list closes up;\n\
-         # underline marks the letters the query matched.\n\
-         # enabled   = {filter_enabled}\n\
-         # underline = {filter_underline}\n",
+         # Rows a filter keystroke drops fade out before the list closes up.\n\
+         # enabled = {filter_enabled}\n",
         prefix = crate::keys::prefix_label(prefix),
         timeout = k.timeout_ms,
         command = s.command,
@@ -678,12 +635,9 @@ fn render_default_config(prefix: u8) -> String {
         fade_excursions = f.excursions,
         effects_enabled = e.enabled,
         session_name_enabled = e.session_name.enabled,
-        session_name_landing = e.session_name.landing,
         afterglow_enabled = e.afterglow.enabled,
-        afterglow_duration = e.afterglow.duration_ms,
         kill_enabled = e.kill.enabled,
         filter_enabled = e.filter.enabled,
-        filter_underline = e.filter.underline,
     )
 }
 
@@ -764,15 +718,12 @@ mod tests {
             excursions = true\n\
             [effects.session_name]\n\
             enabled = true\n\
-            landing = true\n\
             [effects.afterglow]\n\
             enabled = true\n\
-            duration_ms = 180\n\
             [effects.kill]\n\
             enabled = true\n\
             [effects.filter]\n\
-            enabled = true\n\
-            underline = true\n";
+            enabled = true\n";
         let s: Settings = toml::from_str(doc).expect("valid");
         assert_eq!(s, Settings::default());
     }
@@ -837,44 +788,31 @@ mod tests {
         let s: Settings = toml::from_str("[effects]\nenabled = false\n").expect("valid");
         assert!(!s.effects.fade_enabled());
         assert!(!s.effects.session_name_enabled());
-        assert_eq!(s.effects.afterglow(), None);
+        assert!(!s.effects.afterglow_enabled());
         assert!(!s.effects.kill_enabled());
         assert!(!s.effects.filter_enabled());
-        assert!(!s.effects.filter_underline());
         assert!(s.effects.fade.enabled && s.effects.session_name.enabled);
         assert!(s.effects.afterglow.enabled && s.effects.kill.enabled);
-        assert!(s.effects.filter.enabled && s.effects.filter.underline);
+        assert!(s.effects.filter.enabled);
         let on = Settings::default().effects;
         assert!(on.fade_enabled() && on.session_name_enabled());
-        assert_eq!(on.afterglow(), Some(Duration::from_millis(180)));
-        assert!(on.kill_enabled() && on.filter_enabled() && on.filter_underline());
+        assert!(on.afterglow_enabled() && on.kill_enabled() && on.filter_enabled());
     }
 
-    /// The three picker effects each turn off on their own, and the filter's
-    /// underline goes with its table's switch.
+    /// The three picker effects each turn off on their own.
     #[test]
     fn each_picker_effect_turns_off_on_its_own() {
         let s: Settings = toml::from_str("[effects.afterglow]\nenabled = false\n").expect("valid");
-        assert_eq!(s.effects.afterglow(), None);
+        assert!(!s.effects.afterglow_enabled());
         assert!(s.effects.kill_enabled() && s.effects.filter_enabled());
 
         let s: Settings = toml::from_str("[effects.kill]\nenabled = false\n").expect("valid");
         assert!(!s.effects.kill_enabled());
-        assert!(s.effects.afterglow().is_some() && s.effects.filter_enabled());
-
-        let s: Settings = toml::from_str("[effects.filter]\nunderline = false\n").expect("valid");
-        assert!(s.effects.filter_enabled() && !s.effects.filter_underline());
+        assert!(s.effects.afterglow_enabled() && s.effects.filter_enabled());
 
         let s: Settings = toml::from_str("[effects.filter]\nenabled = false\n").expect("valid");
         assert!(!s.effects.filter_enabled());
-        assert!(
-            !s.effects.filter_underline(),
-            "the underline goes with the table's switch"
-        );
-
-        let s: Settings =
-            toml::from_str("[effects.afterglow]\nduration_ms = 400\n").expect("valid");
-        assert_eq!(s.effects.afterglow(), Some(Duration::from_millis(400)));
+        assert!(s.effects.afterglow_enabled() && s.effects.kill_enabled());
     }
 
     /// Each effect has a switch of its own, and turning one off leaves the
@@ -885,24 +823,7 @@ mod tests {
         let s: Settings =
             toml::from_str("[effects.session_name]\nenabled = false\n").expect("valid");
         assert!(!s.effects.session_name_enabled());
-        assert!(
-            !s.effects.landing_enabled(),
-            "the landing goes with the trail"
-        );
         assert!(s.effects.fade_enabled(), "and the fade is untouched");
-    }
-
-    /// The landing has its own key under the trail's table: off, the trail
-    /// still runs and only the impact goes.
-    #[test]
-    fn the_landing_turns_off_on_its_own() {
-        assert!(Settings::default().effects.landing_enabled());
-        let s: Settings =
-            toml::from_str("[effects.session_name]\nlanding = false\n").expect("valid");
-        assert!(!s.effects.landing_enabled());
-        assert!(s.effects.session_name_enabled());
-        let s: Settings = toml::from_str("[effects]\nenabled = false\n").expect("valid");
-        assert!(!s.effects.landing_enabled());
     }
 
     /// On unless turned off, and `false` turns it off: a parked client is a
@@ -959,13 +880,21 @@ mod tests {
             ("an unknown client key", "[client]\nkeep = true\n"),
             ("an unknown effect", "[effects.sparkles]\nenabled = true\n"),
             (
-                "an unknown afterglow key",
-                "[effects.afterglow]\nduration = 180\n",
+                "the afterglow's length, which is not a setting",
+                "[effects.afterglow]\nduration_ms = 180\n",
+            ),
+            (
+                "a landing switch apart from the trail's",
+                "[effects.session_name]\nlanding = false\n",
             ),
             ("an unknown kill key", "[effects.kill]\ndust = true\n"),
             (
+                "an underline switch, which there is not",
+                "[effects.filter]\nunderline = false\n",
+            ),
+            (
                 "an unparseable filter value",
-                "[effects.filter]\nunderline = 1\n",
+                "[effects.filter]\nenabled = 1\n",
             ),
             ("an unknown effects key", "[effects]\nenable = false\n"),
             (
@@ -1011,14 +940,6 @@ mod tests {
                 "[effects.fade]\nduration_ms = 2001\n",
                 "effects.fade.duration_ms",
             ),
-            (
-                "[effects.afterglow]\nduration_ms = 0\n",
-                "effects.afterglow.duration_ms",
-            ),
-            (
-                "[effects.afterglow]\nduration_ms = 1001\n",
-                "effects.afterglow.duration_ms",
-            ),
         ];
         for (doc, key) in cases {
             let err = parse(Path::new("test.toml"), doc).expect_err(doc);
@@ -1034,8 +955,6 @@ mod tests {
             "[keys]\ntimeout_ms = 60000\n",
             "[effects.fade]\nduration_ms = 1\n",
             "[effects.fade]\nduration_ms = 2000\n",
-            "[effects.afterglow]\nduration_ms = 1\n",
-            "[effects.afterglow]\nduration_ms = 1000\n",
         ] {
             parse(Path::new("test.toml"), doc).expect(doc);
         }
@@ -1107,8 +1026,8 @@ mod tests {
         }
         assert_eq!(
             rendered.matches("\n# enabled = true\n").count(),
-            3,
-            "the master switch, the session name's and the kill's: {rendered:?}"
+            5,
+            "the master switch and each effect's but the fade's: {rendered:?}"
         );
         for line in [
             "# per_session = true",
@@ -1116,10 +1035,6 @@ mod tests {
             "# duration_ms = 200",
             "# session     = true",
             "# excursions  = true",
-            "# duration_ms = 180",
-            "# enabled   = true",
-            "# underline = true",
-            "# landing = true",
         ] {
             assert!(
                 rendered.contains(line),

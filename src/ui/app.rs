@@ -107,22 +107,18 @@ pub struct App {
     /// the same generators rather than drawing the same stars.
     after: Starfield,
     before: Starfield,
-    /// Whether a session put down lands with an impact: `[effects.session_name]
-    /// landing`, under the trail's own switches.
-    land: bool,
     /// The landing under way, from the key that put a session down until its
     /// dust settles. See [`super::landing`].
     landing: Option<Landing>,
-    /// How long the row the cursor leaves glows for, or `None` with
-    /// `[effects.afterglow]` off. Read once when the picker opens, like `trail`.
-    afterglow: Option<Duration>,
+    /// Whether the row the cursor leaves glows: `[effects.afterglow] enabled`,
+    /// under `[effects] enabled`. Read once when the picker opens, like `trail`.
+    afterglow: bool,
     /// The rows the cursor has just left and is still glowing on, by session
     /// id, oldest first. See [`App::glows`].
     glows: Vec<Glow>,
     /// Whether a filter keystroke's dropped rows fade out (`[effects.filter]
-    /// enabled`), and whether matched letters are underlined (`underline`).
+    /// enabled`).
     sift: bool,
-    underline: bool,
     /// The rows the last filter keystroke dropped, while they fade. See
     /// [`App::rows`].
     leaving: Option<Leaving>,
@@ -199,12 +195,10 @@ impl App {
             trail: crate::config::get().effects.session_name_enabled(),
             after: Starfield::seeded(),
             before: Starfield::seeded(),
-            land: crate::config::get().effects.landing_enabled(),
             landing: None,
-            afterglow: crate::config::get().effects.afterglow(),
+            afterglow: crate::config::get().effects.afterglow_enabled(),
             glows: Vec::new(),
             sift: crate::config::get().effects.filter_enabled(),
-            underline: crate::config::get().effects.filter_underline(),
             leaving: None,
             crumble: crate::config::get().effects.kill_enabled(),
             dust: None,
@@ -294,12 +288,10 @@ impl App {
             self.after.advance(elapsed, starfield::TRAIL);
             self.before.advance(elapsed, starfield::TRAIL);
         }
-        if let Some(length) = self.afterglow {
-            for glow in &mut self.glows {
-                glow.age += elapsed;
-            }
-            self.glows.retain(|g| g.age < length);
+        for glow in &mut self.glows {
+            glow.age += elapsed;
         }
+        self.glows.retain(|g| g.age < effects::AFTERGLOW);
         if let Some(leaving) = &mut self.leaving {
             leaving.age += elapsed;
             if leaving.age >= effects::SIFT {
@@ -335,12 +327,12 @@ impl App {
     }
 
     /// Put the session in flight down: back to the ordinary list, landing it
-    /// first if that is on. Every way of placing one comes through here —
+    /// first if the trail is on — the landing is how a trail ends. Every way of placing one comes through here —
     /// the keys and the mouse's release — so none of them can forget the
     /// landing. `Esc` does not: a cancelled move did not land anywhere.
     fn put_down(&mut self) {
         self.mode = Mode::Normal;
-        if self.trail && self.land {
+        if self.trail {
             self.landing = Some(Landing::seeded());
         }
     }
@@ -348,7 +340,7 @@ impl App {
     /// The rows still glowing after the cursor left them, by session id, each
     /// with how far through its glow it is, `0..1`.
     pub fn glows(&self) -> impl Iterator<Item = (&str, f32)> {
-        let length = self.afterglow.unwrap_or(Duration::MAX).as_secs_f32();
+        let length = effects::AFTERGLOW.as_secs_f32();
         self.glows
             .iter()
             .map(move |g| (g.id.as_str(), g.age.as_secs_f32() / length))
@@ -383,11 +375,6 @@ impl App {
         self.dust.as_ref().is_some_and(|(_, d)| !d.done())
     }
 
-    /// Whether the letters a filter matched are underlined.
-    pub fn underlines(&self) -> bool {
-        self.underline
-    }
-
     /// The trail off the end of the name, for the renderer.
     pub fn trail_after(&self) -> &Starfield {
         &self.after
@@ -405,22 +392,13 @@ impl App {
         self.trail = on;
     }
 
-    /// Turn the landing on or off whatever the config says.
-    #[cfg(test)]
-    pub(super) fn set_landing(&mut self, on: bool) {
-        self.land = on;
-    }
-
-    /// Turn the picker's own effects — the afterglow, the filter's fade and
-    /// underline, the kill's dust — on or off whatever the config says, for a
-    /// test that needs one or the other.
+    /// Turn the picker's own effects — the afterglow, the filter's fade, the
+    /// kill's dust — on or off whatever the config says, for a test that needs
+    /// one or the other.
     #[cfg(test)]
     pub(super) fn set_effects(&mut self, on: bool) {
-        self.afterglow = on
-            .then(|| crate::config::get().effects.afterglow.duration_ms)
-            .map(Duration::from_millis);
+        self.afterglow = on;
         self.sift = on;
-        self.underline = on;
         self.crumble = on;
         if !on {
             self.glows.clear();
@@ -778,7 +756,7 @@ impl App {
     /// If the cursor has moved off the session `was`, start that row glowing.
     /// The row it moved onto stops glowing, if it was: it is the selection now.
     fn glow_from(&mut self, was: Option<String>) {
-        if self.afterglow.is_none() {
+        if !self.afterglow {
             return;
         }
         let (Some(was), Some(now)) = (was, self.cursor()) else {

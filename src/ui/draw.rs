@@ -213,11 +213,7 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::default()
             };
-            let marked = if app.underlines() {
-                app.matched(&row.session.name)
-            } else {
-                Vec::new()
-            };
+            let marked = app.matched(&row.session.name);
             row_line(
                 &head(row.session, selected, reordering, num_width),
                 &row.session.name,
@@ -1464,12 +1460,20 @@ mod tests {
         test_support::assert_no_colour(40, 6, |f| draw(f, &a));
     }
 
-    /// With `[effects.filter]` off nothing is underlined.
+    /// The underline is not an effect: with the picker's effects off it is
+    /// still there, and with no query there is nothing to underline.
     #[test]
-    fn with_the_filter_effect_off_nothing_is_underlined() {
+    fn the_underline_stays_with_the_effects_off() {
         let mut a = filtering(&["api-server", "dotfiles"], "asv");
         a.set_effects(false);
         let buf = test_support::buffer(40, 6, |f| draw(f, &a));
+        assert!(buf
+            .content
+            .iter()
+            .any(|c| c.modifier.contains(Modifier::UNDERLINED)));
+
+        let plain = app(&["api-server", "dotfiles"]);
+        let buf = test_support::buffer(40, 6, |f| draw(f, &plain));
         assert!(buf
             .content
             .iter()
@@ -1570,7 +1574,6 @@ mod tests {
     /// with a row on either side of it.
     fn landed(ms: u64) -> App {
         let mut a = trailing(&["api-server", "docs", "notes", "nvmux"], 2);
-        a.set_landing(true);
         a.tick(std::time::Duration::from_millis(200));
         a.on_key(Key::Char('k'));
         a.on_key(Key::Enter);
@@ -1702,17 +1705,16 @@ mod tests {
         a
     }
 
-    /// A cancelled move lands nowhere, and with `landing = false` putting a
-    /// session down just stops the trail.
+    /// A cancelled move lands nowhere, and with the trail off there is no
+    /// landing either: it is how the trail ends.
     #[test]
     fn only_a_session_put_down_lands_and_only_when_on() {
         let mut cancelled = trailing(&["api-server", "docs"], 1);
-        cancelled.set_landing(true);
         cancelled.on_key(Key::Esc);
         assert!(cancelled.landing().is_none());
 
         let mut off = trailing(&["api-server", "docs"], 1);
-        off.set_landing(false);
+        off.set_trail(false);
         off.on_key(Key::Enter);
         assert!(off.landing().is_none());
     }
