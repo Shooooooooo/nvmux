@@ -170,7 +170,7 @@ impl Starfield {
     /// width the stars were laid out for when the terminal is; the cells kept
     /// are the ones nearest where the stars leave.
     pub fn render(&self, cells: usize) -> String {
-        self.draw(cells, |dot| dot)
+        self.draw(cells, 0.0, |dot| dot)
     }
 
     /// The same field run the other way: leaving from the right-hand end and
@@ -181,18 +181,30 @@ impl Starfield {
     /// way round: a star would step left from cell to cell and right within
     /// each one.
     pub fn render_mirrored(&self, cells: usize) -> String {
-        self.draw(cells, |dot| cells * 2 - 1 - dot)
+        self.draw(cells, 0.0, |dot| cells * 2 - 1 - dot)
     }
 
-    /// Light each star's dot, at the column `place` puts it in, and spell the
-    /// cells out.
-    fn draw(&self, cells: usize, place: impl Fn(usize) -> usize) -> String {
+    /// The field `pull` of the way drawn back into the row it left, `0..1`:
+    /// every star that far nearer its start. How a trail ends when the session
+    /// it follows lands (see [`super::landing`]). `mirrored` as for
+    /// [`Starfield::render_mirrored`].
+    pub fn render_pulled(&self, cells: usize, pull: f32, mirrored: bool) -> String {
+        if mirrored {
+            self.draw(cells, pull, |dot| cells * 2 - 1 - dot)
+        } else {
+            self.draw(cells, pull, |dot| dot)
+        }
+    }
+
+    /// Light each star's dot, `pull` of the way back towards the row and at
+    /// the column `place` puts it in, and spell the cells out.
+    fn draw(&self, cells: usize, pull: f32, place: impl Fn(usize) -> usize) -> String {
         let mut bits = vec![0u32; cells];
         for star in &self.stars {
             if star.x < 0.0 {
                 continue;
             }
-            let dot = star.x as usize;
+            let dot = (star.x * (1.0 - pull.clamp(0.0, 1.0))) as usize;
             if dot >= cells * 2 {
                 continue;
             }

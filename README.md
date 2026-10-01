@@ -151,6 +151,7 @@ excursions  = true   # so do the <prefix> ? and <prefix> c screens
 
 [effects.session_name]
 enabled = true   # stars streaming off both ends of a session being moved
+landing = true   # and an impact, with a spray of dust, when it is put down
 
 [effects.afterglow]
 enabled     = true   # the row the cursor leaves fades back from the selection

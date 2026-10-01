@@ -13,6 +13,7 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use super::dust::Dust;
 use super::effects;
+use super::landing::Landing;
 use super::starfield::{self, Starfield};
 use crate::session::Session;
 
@@ -106,6 +107,12 @@ pub struct App {
     /// the same generators rather than drawing the same stars.
     after: Starfield,
     before: Starfield,
+    /// Whether a session put down lands with an impact: `[effects.session_name]
+    /// landing`, under the trail's own switches.
+    land: bool,
+    /// The landing under way, from the key that put a session down until its
+    /// dust settles. See [`super::landing`].
+    landing: Option<Landing>,
     /// How long the row the cursor leaves glows for, or `None` with
     /// `[effects.afterglow]` off. Read once when the picker opens, like `trail`.
     afterglow: Option<Duration>,
@@ -192,6 +199,8 @@ impl App {
             trail: crate::config::get().effects.session_name_enabled(),
             after: Starfield::seeded(),
             before: Starfield::seeded(),
+            land: crate::config::get().effects.landing_enabled(),
+            landing: None,
             afterglow: crate::config::get().effects.afterglow(),
             glows: Vec::new(),
             sift: crate::config::get().effects.filter_enabled(),
@@ -213,6 +222,7 @@ impl App {
         self.dust = None;
         self.glows.clear();
         self.leaving = None;
+        self.landing = None;
         self.sessions = sessions;
         self.selected = previously
             .and_then(|id| self.visible().iter().position(|s| s.id == id))
@@ -299,6 +309,12 @@ impl App {
         if let Some((_, dust)) = &mut self.dust {
             dust.advance(elapsed);
         }
+        if let Some(landing) = &mut self.landing {
+            landing.advance(elapsed);
+            if landing.done() {
+                self.landing = None;
+            }
+        }
     }
 
     /// Whether anything on screen is moving, and so whether the caller should
@@ -306,7 +322,27 @@ impl App {
     /// glow, a fading row or dust. With every effect off this is only ever
     /// false, and the picker changes on a key and nothing else.
     pub fn animating(&self) -> bool {
-        self.trailing() || !self.glows.is_empty() || self.leaving.is_some() || self.dusting()
+        self.trailing()
+            || !self.glows.is_empty()
+            || self.leaving.is_some()
+            || self.dusting()
+            || self.landing.is_some()
+    }
+
+    /// The landing under way, if a session has just been put down.
+    pub fn landing(&self) -> Option<&Landing> {
+        self.landing.as_ref()
+    }
+
+    /// Put the session in flight down: back to the ordinary list, landing it
+    /// first if that is on. Every way of placing one comes through here —
+    /// the keys and the mouse's release — so none of them can forget the
+    /// landing. `Esc` does not: a cancelled move did not land anywhere.
+    fn put_down(&mut self) {
+        self.mode = Mode::Normal;
+        if self.trail && self.land {
+            self.landing = Some(Landing::seeded());
+        }
     }
 
     /// The rows still glowing after the cursor left them, by session id, each
@@ -367,6 +403,12 @@ impl App {
     #[cfg(test)]
     pub(super) fn set_trail(&mut self, on: bool) {
         self.trail = on;
+    }
+
+    /// Turn the landing on or off whatever the config says.
+    #[cfg(test)]
+    pub(super) fn set_landing(&mut self, on: bool) {
+        self.land = on;
     }
 
     /// Turn the picker's own effects — the afterglow, the filter's fade and
@@ -989,7 +1031,7 @@ impl App {
             Mouse::Release => {
                 self.pressed = None;
                 let now = self.snapshot();
-                self.mode = Mode::Normal;
+                self.put_down();
                 if now == was {
                     return Request::None;
                 }
@@ -1157,7 +1199,7 @@ impl App {
             }
             Key::Char(' ') | Key::Enter => {
                 let now = self.snapshot();
-                self.mode = Mode::Normal;
+                self.put_down();
                 if now == was {
                     // Picked up and put straight back down, or moved and moved
                     // back: nothing to write and nothing to re-list.

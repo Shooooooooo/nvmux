@@ -152,6 +152,12 @@ impl EffectsSettings {
         self.enabled && self.session_name.enabled
     }
 
+    /// Whether a session put down lands with an impact: the trail's switches
+    /// and its own key.
+    pub fn landing_enabled(&self) -> bool {
+        self.session_name_enabled() && self.session_name.landing
+    }
+
     /// How long the row the cursor leaves takes to fade back, or `None` when
     /// it does not: its own switch and the master one. Whether it fades in
     /// colour or steps through a modifier is the terminal's say after this
@@ -231,6 +237,11 @@ pub struct SessionNameSettings {
     /// Unlike the fade, `NO_COLOR` leaves this alone: the trail is braille and
     /// the dim modifier, and sets no colour to begin with.
     pub enabled: bool,
+    /// Whether putting the session down lands it (see [`crate::ui::landing`]):
+    /// the trail snaps into the row, the bar widens for a frame, the rows
+    /// beside it flinch and dust shoots out of both ends. Off, the trail just
+    /// stops. Under `enabled`, and as free of colour as the trail.
+    pub landing: bool,
 }
 
 /// The row the cursor leaves, fading from the selection's reversed bar back to
@@ -293,7 +304,10 @@ impl Default for EffectsSettings {
 
 impl Default for SessionNameSettings {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            landing: true,
+        }
     }
 }
 
@@ -635,8 +649,10 @@ fn render_default_config(prefix: u8) -> String {
          # excursions  = {fade_excursions}\n\
          \n\
          [effects.session_name]\n\
-         # Stars streaming off both ends of a session picked up to be moved.\n\
+         # Stars streaming off both ends of a session picked up to be moved,\n\
+         # and the impact when it is put down.\n\
          # enabled = {session_name_enabled}\n\
+         # landing = {session_name_landing}\n\
          \n\
          [effects.afterglow]\n\
          # The row the cursor leaves fades back from the selection's bar.\n\
@@ -662,6 +678,7 @@ fn render_default_config(prefix: u8) -> String {
         fade_excursions = f.excursions,
         effects_enabled = e.enabled,
         session_name_enabled = e.session_name.enabled,
+        session_name_landing = e.session_name.landing,
         afterglow_enabled = e.afterglow.enabled,
         afterglow_duration = e.afterglow.duration_ms,
         kill_enabled = e.kill.enabled,
@@ -747,6 +764,7 @@ mod tests {
             excursions = true\n\
             [effects.session_name]\n\
             enabled = true\n\
+            landing = true\n\
             [effects.afterglow]\n\
             enabled = true\n\
             duration_ms = 180\n\
@@ -867,7 +885,24 @@ mod tests {
         let s: Settings =
             toml::from_str("[effects.session_name]\nenabled = false\n").expect("valid");
         assert!(!s.effects.session_name_enabled());
+        assert!(
+            !s.effects.landing_enabled(),
+            "the landing goes with the trail"
+        );
         assert!(s.effects.fade_enabled(), "and the fade is untouched");
+    }
+
+    /// The landing has its own key under the trail's table: off, the trail
+    /// still runs and only the impact goes.
+    #[test]
+    fn the_landing_turns_off_on_its_own() {
+        assert!(Settings::default().effects.landing_enabled());
+        let s: Settings =
+            toml::from_str("[effects.session_name]\nlanding = false\n").expect("valid");
+        assert!(!s.effects.landing_enabled());
+        assert!(s.effects.session_name_enabled());
+        let s: Settings = toml::from_str("[effects]\nenabled = false\n").expect("valid");
+        assert!(!s.effects.landing_enabled());
     }
 
     /// On unless turned off, and `false` turns it off: a parked client is a
@@ -1084,6 +1119,7 @@ mod tests {
             "# duration_ms = 180",
             "# enabled   = true",
             "# underline = true",
+            "# landing = true",
         ] {
             assert!(
                 rendered.contains(line),

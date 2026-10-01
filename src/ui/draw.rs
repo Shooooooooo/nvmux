@@ -24,6 +24,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::app::{App, Mode};
 use super::dust::Dust;
+use super::landing::{self, Landing, Side};
 use super::starfield;
 
 /// The marker on the selected row. Unselected rows are indented to match, so
@@ -184,7 +185,13 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     // sessions that travel between them. They go away because the digit keys are
     // dead in this mode, and a column of numbers changing owner under a moving
     // row is noise.
-    let reordering = matches!(app.mode(), Mode::Reorder { .. });
+    //
+    // A session being put down still looks in flight while its trail is pulled
+    // in: the numbers come back on the frame it lands (see `landing`).
+    let landing = app.landing();
+    let pull = landing.and_then(Landing::pulling);
+    let reordering = matches!(app.mode(), Mode::Reorder { .. }) || pull.is_some();
+    let flinch = landing.is_some_and(Landing::flinch);
     let selected_row = app.selected_row();
     let dust = app.dust();
 
@@ -201,6 +208,8 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
             let selected = i == selected_row && !row.leaving;
             let style = if selected {
                 Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else if flinch && i.abs_diff(selected_row) == 1 {
+                Style::default().add_modifier(Modifier::DIM)
             } else {
                 Style::default()
             };
@@ -225,7 +234,73 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         draw_dust(frame, app, block, offset, num_width, id, dust);
     }
     if app.trailing() {
-        draw_trails(frame, app, block, offset, num_width);
+        draw_trails(frame, app, block, offset, num_width, 0.0);
+    } else if let Some(pull) = pull {
+        draw_trails(frame, app, block, offset, num_width, pull);
+    }
+    if let Some(landing) = landing {
+        draw_landing(frame, app, block, offset, num_width, landing);
+    }
+}
+
+/// The landing's impact and its spray, on the row just put down (see
+/// [`super::landing`]): for a moment the reversed bar runs [`landing::WIDEN`]
+/// cells further at each end, and dust flies out of both ends, level with the
+/// text. Like the trails, both go over the terminal's own background beyond
+/// the block, never over the row, and stop at the edge of the screen. The
+/// spray only lands on blank cells.
+fn draw_landing(
+    frame: &mut Frame,
+    app: &App,
+    block: Rect,
+    offset: usize,
+    num_width: usize,
+    landing: &Landing,
+) {
+    let selected = app.selected_row();
+    let Some(line) = selected
+        .checked_sub(offset)
+        .filter(|line| *line < block.height as usize)
+    else {
+        return;
+    };
+    let Some(session) = app.rows().get(selected).map(|r| r.session) else {
+        return;
+    };
+    let y = block.y + line as u16;
+    let left = block.x;
+    let drawn = format!("{}{}", head(session, true, false, num_width), session.name);
+    let right = block.x + drawn.width().min(block.width as usize) as u16;
+    let area = frame.area();
+    let on_screen = |x: u16| x >= area.x && x < area.x + area.width;
+    let buf = frame.buffer_mut();
+
+    for grain in landing.spray() {
+        let x = match grain.side {
+            Side::After => right.checked_add(grain.offset),
+            Side::Before => left.checked_sub(grain.offset + 1),
+        };
+        let Some(x) = x.filter(|x| on_screen(*x)) else {
+            continue;
+        };
+        if buf[(x, y)].symbol() != " " {
+            continue;
+        }
+        let style = if grain.dim {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
+            Style::default()
+        };
+        buf.set_string(x, y, grain.glyph.to_string(), style);
+    }
+
+    if landing.impact() {
+        let bar = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
+        let before = (1..=landing::WIDEN).filter_map(|d| left.checked_sub(d));
+        let after = (0..landing::WIDEN).map(|d| right + d);
+        for x in before.chain(after).filter(|x| on_screen(*x)) {
+            buf.set_string(x, y, " ", bar);
+        }
     }
 }
 
@@ -349,7 +424,17 @@ fn draw_dust(
 /// nearest the row, so the stars read as coming off it, and dim for the far
 /// half. Modifiers, like everything else here, and never the grabbed row's own
 /// reversed bar: that marks the session, and the trails are only behind it.
-fn draw_trails(frame: &mut Frame, app: &App, block: Rect, offset: usize, num_width: usize) {
+///
+/// `pull` is how far both trails have been drawn back into the row, for a
+/// session landing: 0 for a session still in flight.
+fn draw_trails(
+    frame: &mut Frame,
+    app: &App,
+    block: Rect,
+    offset: usize,
+    num_width: usize,
+    pull: f32,
+) {
     let selected = app.selected_row();
     let Some(line) = selected
         .checked_sub(offset)
@@ -374,7 +459,11 @@ fn draw_trails(frame: &mut Frame, app: &App, block: Rect, offset: usize, num_wid
     let x = block.x + drawn;
     let cells = starfield::TRAIL.min(usize::from((area.x + area.width).saturating_sub(x)));
     if cells > 0 {
-        let stars: Vec<char> = app.trail_after().render(cells).chars().collect();
+        let stars: Vec<char> = app
+            .trail_after()
+            .render_pulled(cells, pull, false)
+            .chars()
+            .collect();
         let (bright, faint) = stars.split_at(near.min(cells));
         draw_trail(
             frame,
@@ -390,7 +479,11 @@ fn draw_trails(frame: &mut Frame, app: &App, block: Rect, offset: usize, num_wid
     // ends in the column before it, and runs the other way.
     let cells = starfield::TRAIL.min(usize::from(block.x.saturating_sub(area.x)));
     if cells > 0 {
-        let stars: Vec<char> = app.trail_before().render_mirrored(cells).chars().collect();
+        let stars: Vec<char> = app
+            .trail_before()
+            .render_pulled(cells, pull, true)
+            .chars()
+            .collect();
         let (faint, bright) = stars.split_at(cells - near.min(cells));
         draw_trail(
             frame,
@@ -1468,5 +1561,159 @@ mod tests {
         a.set_effects(false);
         assert!(!a.start_dust("id000001"));
         assert!(!a.animating());
+    }
+
+    // --- the landing --------------------------------------------------------
+
+    /// The third session of four picked up, carried up a row and put down,
+    /// `ms` milliseconds ago, with the trail and its landing on — so it lands
+    /// with a row on either side of it.
+    fn landed(ms: u64) -> App {
+        let mut a = trailing(&["api-server", "docs", "notes", "nvmux"], 2);
+        a.set_landing(true);
+        a.tick(std::time::Duration::from_millis(200));
+        a.on_key(Key::Char('k'));
+        a.on_key(Key::Enter);
+        assert!(a.landing().is_some(), "putting it down lands it");
+        a.tick(std::time::Duration::from_millis(ms));
+        a
+    }
+
+    fn line(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    /// While the trail is pulled in the row still looks in flight; on impact
+    /// the numbers come back, the bar is wider at both ends and the rows
+    /// beside it flinch.
+    #[test]
+    fn a_session_put_down_looks_in_flight_until_it_lands() {
+        let pulling = landed(30);
+        let lines = render(&pulling, 50, 8);
+        let y = line_of(&lines, "notes");
+        assert!(lines[y as usize].contains(GRABBED.trim_end()), "{lines:#?}");
+        assert!(!lines.iter().any(|l| l.contains("1  ")), "numbers hidden");
+
+        let impact = landed(landing::PULL.as_millis() as u64 + 10);
+        let buf = test_support::buffer(50, 8, |f| draw(f, &impact));
+        let lines = render(&impact, 50, 8);
+        assert_eq!(line_of(&lines, "notes"), y, "it lands where it was put");
+        assert!(lines[y as usize].contains("▸ 2  notes"), "{lines:#?}");
+        assert!(lines.iter().any(|l| l.contains("3  docs")));
+
+        let text = line(&buf, y);
+        let first = text
+            .find('▸')
+            .map(|b| text[..b].chars().count() as u16)
+            .unwrap();
+        let end = first + "▸ 2  notes".chars().count() as u16;
+        for x in (first - landing::WIDEN..first).chain(end..end + landing::WIDEN) {
+            let cell = &buf[(x, y)];
+            assert_eq!(cell.symbol(), " ", "the bar widens with blanks at {x}");
+            assert!(cell.modifier.contains(Modifier::REVERSED), "at {x}");
+        }
+        let past = &buf[(end + landing::WIDEN, y)];
+        assert!(
+            !past.modifier.contains(Modifier::REVERSED),
+            "and no further"
+        );
+
+        for neighbour in [y - 1, y + 1] {
+            let cell = (0..buf.area.width)
+                .map(|x| &buf[(x, neighbour)])
+                .find(|c| c.symbol().trim() != "")
+                .expect("a neighbour");
+            assert!(
+                cell.modifier.contains(Modifier::DIM),
+                "row {neighbour} flinches"
+            );
+        }
+    }
+
+    /// After the impact, dust flies out of both ends on the row's own line,
+    /// in braille lit only in the middle rows of dots — and none of it sets a
+    /// colour.
+    #[test]
+    fn a_landed_session_throws_dust_level_with_its_name() {
+        const MIDDLE: u32 = 0x02 | 0x04 | 0x10 | 0x20;
+        let a = landed(landing::PULL.as_millis() as u64 + 80);
+        let buf = test_support::buffer(50, 8, |f| draw(f, &a));
+        let y = line_of(&render(&a, 50, 8), "notes");
+        let text = line(&buf, y);
+        let first = text
+            .find('▸')
+            .map(|b| text[..b].chars().count() as u16)
+            .unwrap();
+        let end = first + "▸ 2  notes".chars().count() as u16;
+
+        let mut before = 0;
+        let mut after = 0;
+        for x in 0..buf.area.width {
+            let symbol = buf[(x, y)].symbol();
+            if !is_braille(symbol) {
+                continue;
+            }
+            let bits = symbol.chars().next().unwrap() as u32 - 0x2800;
+            assert_eq!(
+                bits & !MIDDLE,
+                0,
+                "{symbol:?} at {x} is off the middle rows"
+            );
+            if x < first {
+                before += 1;
+            } else if x >= end {
+                after += 1;
+            } else {
+                panic!("dust on the row itself at {x}");
+            }
+        }
+        assert!(before > 0 && after > 0, "both ends: {text:?}");
+        for other in (0..buf.area.height).filter(|r| *r != y) {
+            assert!(!line(&buf, other)
+                .chars()
+                .any(|c| is_braille(&c.to_string())));
+        }
+        test_support::assert_no_colour(50, 8, |f| draw(f, &a));
+    }
+
+    /// Once it has settled there is nothing left of it, and the picker stops
+    /// asking for frames.
+    #[test]
+    fn a_landing_settles_to_the_plain_list() {
+        let a = landed(1_000);
+        assert!(a.landing().is_none());
+        assert!(!a.animating());
+        let buf = test_support::buffer(50, 8, |f| draw(f, &a));
+        assert!(!buf.content.iter().any(|c| is_braille(c.symbol())));
+        assert_eq!(
+            render(&a, 50, 8),
+            render(&placed(&["api-server", "notes", "docs", "nvmux"], 1), 50, 8),
+            "exactly the list as drawn without any of this"
+        );
+    }
+
+    /// A picker holding `names` with row `row` selected and nothing passing.
+    fn placed(names: &[&str], row: usize) -> App {
+        let mut a = app(names);
+        for _ in 0..row {
+            a.on_key(Key::Char('j'));
+        }
+        a.tick(std::time::Duration::from_secs(1));
+        a
+    }
+
+    /// A cancelled move lands nowhere, and with `landing = false` putting a
+    /// session down just stops the trail.
+    #[test]
+    fn only_a_session_put_down_lands_and_only_when_on() {
+        let mut cancelled = trailing(&["api-server", "docs"], 1);
+        cancelled.set_landing(true);
+        cancelled.on_key(Key::Esc);
+        assert!(cancelled.landing().is_none());
+
+        let mut off = trailing(&["api-server", "docs"], 1);
+        off.set_landing(false);
+        off.on_key(Key::Enter);
+        assert!(off.landing().is_none());
     }
 }

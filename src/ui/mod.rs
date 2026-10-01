@@ -54,6 +54,7 @@ pub mod draw;
 pub mod dust;
 pub mod effects;
 pub mod help;
+pub mod landing;
 pub mod prompt;
 pub mod setup;
 pub mod starfield;
@@ -398,6 +399,10 @@ fn run_loop(
             }
             _ => continue,
         };
+        // A session just put down lands before anything is written: the
+        // renumber that follows blocks over ssh, and the landing is the
+        // answer to the key, so it comes first.
+        play_out(terminal, &mut app, palette, |app| app.landing().is_some())?;
         deadline = app
             .pending()
             .is_some()
@@ -500,8 +505,7 @@ fn frame(f: &mut ratatui::Frame, app: &App, palette: Option<&crate::palette::Pal
 }
 
 /// Crumble the row a kill was just confirmed for, and only then let the kill
-/// run (see [`dust`] for why not during it). Keys pressed meanwhile wait in
-/// the terminal's queue, as they would behind the kill itself.
+/// run (see [`dust`] for why not during it).
 ///
 /// The row stays empty afterwards until the listing that follows the kill
 /// replaces it — or, if the kill failed, puts it back.
@@ -514,15 +518,27 @@ fn crumble(
     if !app.start_dust(id) {
         return Ok(());
     }
+    play_out(terminal, app, palette, App::dusting)
+}
+
+/// Draw frames until `playing` says the effect is over — for the two that
+/// must finish before the I/O they precede, the dust and the landing. Keys
+/// pressed meanwhile wait in the terminal's queue, as they would behind the
+/// I/O itself. Nothing playing, nothing drawn.
+fn play_out(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    palette: Option<&crate::palette::Palette>,
+    playing: impl Fn(&App) -> bool,
+) -> Result<()> {
     let mut ticked = Instant::now();
-    loop {
+    while playing(app) {
         terminal.draw(|f| frame(f, app, palette))?;
-        if !app.dusting() {
-            return Ok(());
-        }
         std::thread::sleep(crate::fade::FRAME);
         tick(app, &mut ticked);
     }
+    terminal.draw(|f| frame(f, app, palette))?;
+    Ok(())
 }
 
 /// Leave the picker for `session`: dissolve the screen out, then hand back the
