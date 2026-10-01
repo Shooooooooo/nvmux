@@ -262,11 +262,16 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 /// stars where the name would be.
 ///
 /// Not reversed, unlike a session in flight. A reversed bar is a row with
-/// something in it, and this one has nothing yet; plain, the stars read as
-/// passing through an empty slot, and the marker — bold, and the only thing on
-/// the row at full weight — says it is the one that moves. It is the one row
-/// on these screens that changes with nothing pressed, which is why it keeps to
-/// the weights everything else uses rather than adding one.
+/// something in it, and this one has nothing yet; the stars read as passing
+/// through an empty slot, and the marker — bold, and the only thing on the row
+/// at full weight — says it is the one that moves.
+///
+/// The stars are dim, the weight these screens give to text that decides
+/// nothing: they only say the slot is empty, and in the dimmest weight there is
+/// they sit behind the names around them rather than competing with them —
+/// which matters on the one row here that changes with nothing pressed. It is
+/// one of the weights everything else uses rather than a new one, and a
+/// modifier rather than a colour, for the reasons [this module](self) gives.
 ///
 /// The field is drawn as wide as [`App::field_width`] and no wider than the
 /// block leaves room for, which is narrower only on a terminal too small for
@@ -281,7 +286,7 @@ fn placeholder_line(app: &App, num_width: usize, width: usize) -> Line<'static> 
     );
     Line::from(vec![
         Span::styled(marker, Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(rest),
+        Span::styled(rest, Style::default().add_modifier(Modifier::DIM)),
     ])
 }
 
@@ -1134,27 +1139,44 @@ mod tests {
     }
 
     /// Not a reversed bar — the placeholder has nothing in it yet — and no row
-    /// is the cursor but it. Only the marker is bold.
+    /// is the cursor but it. Only the marker is bold, and the stars are dim.
     #[test]
-    fn the_placeholder_is_plain_and_only_its_marker_is_bold() {
+    fn the_placeholder_has_a_bold_marker_and_dim_stars_and_is_not_reversed() {
         let a = placing(&["api-server", "docs"], 0);
         let buf = test_support::buffer(44, 8, |f| draw(f, &a));
+        let mut stars = 0;
         for y in 0..buf.area.height - 1 {
             for x in 0..buf.area.width {
                 let cell = &buf[(x, y)];
+                let symbol = cell.symbol();
                 assert!(
                     !cell.modifier.contains(Modifier::REVERSED),
-                    "({x},{y}) {:?} is reversed",
-                    cell.symbol()
+                    "({x},{y}) {symbol:?} is reversed"
                 );
                 assert_eq!(
                     cell.modifier.contains(Modifier::BOLD),
-                    cell.symbol() == "⇕",
-                    "({x},{y}) {:?}",
-                    cell.symbol()
+                    symbol == "⇕",
+                    "({x},{y}) {symbol:?}"
                 );
+                if symbol
+                    .chars()
+                    .any(|c| (0x2801..=0x28ff).contains(&(c as u32)))
+                {
+                    stars += 1;
+                    assert!(
+                        cell.modifier.contains(Modifier::DIM),
+                        "({x},{y}) {symbol:?} is a star at full weight"
+                    );
+                }
+                if symbol == "⇕" || symbol.chars().any(char::is_alphabetic) {
+                    assert!(
+                        !cell.modifier.contains(Modifier::DIM),
+                        "({x},{y}) {symbol:?} was dimmed with the stars"
+                    );
+                }
             }
         }
+        assert!(stars > 0, "no stars on screen to check");
     }
 
     /// The placeholder is a row to the hit test as it is to the eye, so the
