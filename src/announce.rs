@@ -81,7 +81,7 @@
 //! all, which is a server busy or at a prompt, or a terminal whose client
 //! ignores the resize nudge, the screen has already been put back.
 //!
-//! What pays for that is `[fade] session`: no shadow, no cells to dissolve
+//! What pays for that is `[effects.fade] session`: no shadow, no cells to dissolve
 //! into, and the box then does what it always did — an interior of spaces,
 //! a blank rectangle, and the repaint to fill it.
 //!
@@ -466,7 +466,7 @@ impl Popup {
     /// of it, exactly as every other nvmux screen is.
     ///
     /// Without a shadow there is nothing to dissolve into and the box behaves
-    /// as it did before this existed: `[fade] session = false` does without
+    /// as it did before this existed: `[effects.fade] session = false` does without
     /// the shadow — and without its parse, unless the client is kept
     /// (`[client] per_session`, the default) and parses for its own copy of
     /// the screen — and this is one of the things the shadow pays for.
@@ -1029,7 +1029,7 @@ mod tests {
     }
 
     /// With no shadow there is nothing to dissolve into, and the box is the
-    /// one nvmux drew before any of this: `[fade] session = false` does
+    /// one nvmux drew before any of this: `[effects.fade] session = false` does
     /// without the shadow that backs the box, and must cost nothing else.
     #[test]
     fn with_no_shadow_the_box_dissolves_as_it_did_before() {
@@ -1184,7 +1184,7 @@ mod tests {
 
     /// With no effect there is no dissolve at either end: one paint, a second
     /// of it, and the erase. The behaviour nvmux had before the fade existed,
-    /// which is what `NO_COLOR` and `[fade] enabled = false` must still get.
+    /// which is what `NO_COLOR` and `[effects.fade] enabled = false` must still get.
     #[test]
     fn with_no_effect_the_box_goes_up_whole_and_comes_down_whole() {
         let t0 = Instant::now();

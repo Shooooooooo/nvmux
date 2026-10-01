@@ -6,10 +6,12 @@
 //! a terminal, a transport, or a running Neovim.
 
 use std::cell::RefCell;
+use std::time::Duration;
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
+use super::starfield::{self, Starfield};
 use crate::session::Session;
 
 /// What the picker is currently doing.
@@ -41,6 +43,9 @@ pub enum Request {
     None,
     Attach(String),
     /// Ask for a name for a new session; naming happens on its own screen.
+    ///
+    /// The session goes in just after the row highlighted when this was asked,
+    /// which nothing moves while the prompt is up — see [`App::placement_of`].
     NewSession,
     /// Ask for a new name for this session.
     RenameSession(String),
@@ -88,6 +93,17 @@ pub struct App {
     /// is asked several times per keystroke. In a `RefCell` because scoring
     /// takes `&mut` and `visible` is a read.
     matcher: RefCell<Matcher>,
+    /// Whether a session in flight leaves a trail at all: `[effects.session_name]
+    /// enabled`, under `[effects] enabled`, read once when the picker opens, as
+    /// the rest of the config is.
+    trail: bool,
+    /// The trails a session in flight leaves (see [`starfield`]): off the end
+    /// of its name, flying right, and off the other end of its row, flying
+    /// left. Two fields rather than one drawn twice, so the two ends are not
+    /// mirror images of each other. Kept between grabs, so each one carries on
+    /// the same generators rather than drawing the same stars.
+    after: Starfield,
+    before: Starfield,
 }
 
 /// Where a left press landed, which decides what its release means.
@@ -130,6 +146,9 @@ impl App {
             came_from: None,
             pressed: None,
             matcher: RefCell::new(Matcher::new(Config::DEFAULT)),
+            trail: crate::config::get().effects.session_name_enabled(),
+            after: Starfield::seeded(),
+            before: Starfield::seeded(),
         }
     }
 
@@ -189,6 +208,43 @@ impl App {
 
     pub fn set_message(&mut self, msg: impl Into<String>) {
         self.message = Some(msg.into());
+    }
+
+    /// Whether a session in flight is trailing stars: one is, and the trails
+    /// are on. What the renderer draws them for, and what the caller keeps a
+    /// faster clock running for, so they move — with the trails off, a move
+    /// is drawn still and the clock never speeds up.
+    pub fn trailing(&self) -> bool {
+        self.trail && matches!(self.mode, Mode::Reorder { .. })
+    }
+
+    /// Move the trails behind a session in flight on by `elapsed`. Nothing
+    /// happens while none is trailing.
+    ///
+    /// The clock is the caller's, as it is for a half-typed number: `App`
+    /// stays free of it, and a test can step it by exactly the time it wants.
+    pub fn tick(&mut self, elapsed: Duration) {
+        if self.trailing() {
+            self.after.advance(elapsed, starfield::TRAIL);
+            self.before.advance(elapsed, starfield::TRAIL);
+        }
+    }
+
+    /// The trail off the end of the name, for the renderer.
+    pub fn trail_after(&self) -> &Starfield {
+        &self.after
+    }
+
+    /// The trail off the other end of the row, for the renderer.
+    pub fn trail_before(&self) -> &Starfield {
+        &self.before
+    }
+
+    /// Turn the trails on or off whatever the config says, for a test that
+    /// needs one or the other.
+    #[cfg(test)]
+    pub(super) fn set_trail(&mut self, on: bool) {
+        self.trail = on;
     }
 
     /// Sessions matching the current filter, in display order.
@@ -294,6 +350,49 @@ impl App {
             return 0;
         }
         (self.selected as isize + delta).clamp(0, len as isize - 1) as usize
+    }
+
+    /// Where the session `new_id` — just created from this picker — belongs, as
+    /// the arrangement to store: every visible row and the new session, in
+    /// their new order, each paired with the number it should now hold.
+    ///
+    /// Just after the highlighted row, so a session lands next to the one the
+    /// user was looking at when they made it rather than at the bottom of the
+    /// list, and everything after it moves down one.
+    ///
+    /// The new session is treated as though it had been appended and then moved
+    /// up to that row, which is exactly what storing it this way does: it was
+    /// created last, and this moves it. So its number is the one past every
+    /// row's, and the visible numbers plus that one are dealt back out down the
+    /// new order — the same deal a reorder makes (see
+    /// [`App::shift_grabbed_to`]), with the same result under a filter: the
+    /// hidden rows keep their numbers and stay out of the payload.
+    ///
+    /// Empty when there is nothing to write: no row was highlighted, or the
+    /// last one was, and after it is where a new session goes anyway.
+    pub fn placement_of(&self, new_id: &str) -> Vec<(String, u32)> {
+        let rows = self.snapshot();
+        let at = self.selected + 1;
+        if at >= rows.len() {
+            return Vec::new();
+        }
+        let appended = self.sessions.iter().map(|s| s.state.num).max().unwrap_or(0) + 1;
+        let numbers = rows.iter().map(|(_, num)| *num).chain([appended]);
+        let mut ids: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
+        ids.insert(at, new_id.to_string());
+        ids.into_iter().zip(numbers).collect()
+    }
+
+    /// Pick the session `id` up — the space bar and a drag both come here — with
+    /// the arrangement as it stands, for `Esc` to put back, and fresh trails
+    /// off both ends of it.
+    fn pick_up(&mut self, id: String) {
+        let was = self.snapshot();
+        self.mode = Mode::Reorder { id, was };
+        if self.trail {
+            self.after.scatter(starfield::TRAIL);
+            self.before.scatter(starfield::TRAIL);
+        }
     }
 
     /// Every visible row's `(id, resolved number)`, in display order.
@@ -553,8 +652,7 @@ impl App {
                 if row < len && self.pressed.is_some() && row != self.selected =>
             {
                 if let Some(id) = self.selected_id() {
-                    let was = self.snapshot();
-                    self.mode = Mode::Reorder { id, was };
+                    self.pick_up(id);
                     self.shift_grabbed_to(row);
                 }
                 self.pressed = Some(Pressed::Row);
@@ -659,8 +757,7 @@ impl App {
             // enter the mode over the "no sessions" screen with nothing to move.
             Key::Char(' ') => {
                 if let Some(id) = self.selected_id() {
-                    let was = self.snapshot();
-                    self.mode = Mode::Reorder { id, was };
+                    self.pick_up(id);
                 }
                 Request::None
             }
@@ -2301,5 +2398,149 @@ mod tests {
             Request::Attach("id000000".into()),
             "a click on the one row, which was already selected"
         );
+    }
+
+    // ---- the trail behind a session in flight ------------------------------
+
+    /// The trails run while a session is in flight, however it was picked up,
+    /// and stop with the move — placed or put back.
+    #[test]
+    fn a_session_in_flight_keeps_the_clock_running() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.set_trail(true);
+        assert!(!a.trailing());
+        a.on_key(Key::Char(' '));
+        assert!(a.trailing(), "picked up with the space bar");
+        a.on_key(Key::Down);
+        a.on_key(Key::Enter);
+        assert!(!a.trailing(), "placed");
+
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Esc);
+        assert!(!a.trailing(), "put back");
+
+        let mut a = app(&["aaa", "bbb"]);
+        a.set_trail(true);
+        a.on_mouse(Mouse::Press(Some(0)));
+        a.on_mouse(Mouse::Drag(Some(1)));
+        assert!(a.trailing(), "picked up with a drag");
+        a.on_mouse(Mouse::Release);
+        assert!(!a.trailing());
+    }
+
+    /// The trails are laid out when a session is picked up, and only then: the
+    /// rest of the time nothing moves them, and nothing draws them.
+    #[test]
+    fn the_trails_are_laid_out_when_a_session_is_picked_up() {
+        let mut a = app(&["aaa"]);
+        a.set_trail(true);
+        a.tick(Duration::from_millis(100));
+        for trail in [a.trail_after(), a.trail_before()] {
+            assert!(
+                trail.render(starfield::TRAIL).trim().is_empty(),
+                "a trail before anything was picked up"
+            );
+        }
+        a.on_key(Key::Char(' '));
+        a.tick(Duration::from_millis(16));
+        for trail in [a.trail_after(), a.trail_before()] {
+            assert_eq!(
+                trail.render(starfield::TRAIL).chars().count(),
+                starfield::TRAIL
+            );
+        }
+    }
+
+    /// `[effects.session_name] enabled = false`: a move is still a move, but nothing trails
+    /// it and nothing asks for the faster clock.
+    #[test]
+    fn with_the_trail_off_a_move_is_drawn_still() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.set_trail(false);
+        a.on_key(Key::Char(' '));
+        assert!(matches!(a.mode(), Mode::Reorder { .. }), "still a move");
+        assert!(!a.trailing());
+        a.tick(Duration::from_millis(100));
+        assert!(a.trail_after().render(starfield::TRAIL).trim().is_empty());
+    }
+
+    /// On unless the config says otherwise — what an `App` built in a test, with
+    /// no config loaded, reads.
+    #[test]
+    fn the_trail_follows_the_config() {
+        assert!(crate::config::get().effects.session_name_enabled());
+        assert!(app(&["aaa"]).trail);
+    }
+
+    // ---- where a new session goes ------------------------------------------
+
+    /// Straight after the highlighted row, with everything after it moving
+    /// down one.
+    #[test]
+    fn a_new_session_goes_in_after_the_highlighted_row() {
+        let a = app(&["aaa", "bbb", "ccc"]);
+        assert_eq!(
+            a.placement_of("new"),
+            [
+                ("id000000".to_string(), 1),
+                ("new".to_string(), 2),
+                ("id000001".to_string(), 3),
+                ("id000002".to_string(), 4),
+            ]
+        );
+
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char('j'));
+        assert_eq!(
+            a.placement_of("new"),
+            [
+                ("id000000".to_string(), 1),
+                ("id000001".to_string(), 2),
+                ("new".to_string(), 3),
+                ("id000002".to_string(), 4),
+            ]
+        );
+    }
+
+    /// After the last row is where a new session goes anyway, so there is
+    /// nothing to write — and no round trip to pay for it. Nor is there with
+    /// no rows at all.
+    #[test]
+    fn a_new_session_after_the_last_row_stores_nothing() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.on_key(Key::Char('G'));
+        assert!(a.placement_of("new").is_empty());
+        assert!(app(&[]).placement_of("new").is_empty());
+    }
+
+    /// Under a filter the highlight is on a row the filter left, and the rows
+    /// it hides keep their numbers and stay out of the payload — the rule a
+    /// reorder follows.
+    #[test]
+    fn a_filtered_placement_leaves_the_hidden_rows_alone() {
+        let mut a = app(&["alpha", "zzz", "gamma"]);
+        a.on_key(Key::Char('/'));
+        a.on_key(Key::Char('a'));
+        a.on_key(Key::Enter); // back to normal mode, filter still applied
+        assert_eq!(names(&a), ["alpha", "gamma"]);
+        assert_eq!(
+            a.placement_of("new"),
+            [
+                ("id000000".to_string(), 1),
+                ("new".to_string(), 3),
+                ("id000002".to_string(), 4),
+            ]
+        );
+    }
+
+    /// Asking for a name moves nothing: the highlight the session will go
+    /// after is still where it was when the prompt comes back.
+    #[test]
+    fn asking_for_a_name_leaves_the_highlight_where_it_is() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char('j'));
+        assert_eq!(a.on_key(Key::Char('c')), Request::NewSession);
+        assert_eq!(a.selected_index(), 1);
+        assert_eq!(*a.mode(), Mode::Normal);
     }
 }

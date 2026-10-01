@@ -206,7 +206,7 @@ pub struct Attachment {
     reaped: bool,
     /// The session's screen as its bytes have described it, kept so the
     /// session can be dissolved in and out (see [`crate::shadow`]). `None`
-    /// with the fade off or `fade.session` false, and then nothing is parsed
+    /// with the fade off or `effects.fade.session` false, and then nothing is parsed
     /// unless the client is kept, which parses into `screen` instead.
     shadow: Option<shadow::Shadow>,
     /// A kept client's copy of its screen, where there is no shadow to be one:

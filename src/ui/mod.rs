@@ -53,6 +53,7 @@ pub mod draw;
 pub mod help;
 pub mod prompt;
 pub mod setup;
+pub mod starfield;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -62,7 +63,9 @@ pub enum Outcome {
     /// Attach to this session.
     Attach {
         session: Session,
-        /// The listing the picker was showing.
+        /// The listing the picker was showing — or, after a session created
+        /// there was moved up to the highlighted row, the one listed once its
+        /// place was stored (see `settle`).
         ///
         /// Carried out rather than re-listed, for the reason the picker already
         /// resolves its own keys against the list in hand: a listing is a script
@@ -340,13 +343,29 @@ fn run_loop(
     // unambiguous digit on its own, so this is only ever set when one number is
     // a prefix of another — sessions 1 and 12 both present.
     let mut deadline: Option<Instant> = None;
+    // When the trail behind a session in flight was last moved on. The clock
+    // lives here for the same reason the digit deadline does.
+    let mut ticked = Instant::now();
 
     loop {
+        let now = Instant::now();
+        app.tick(now - ticked);
+        ticked = now;
+
         // The area kept for the mouse: a click is resolved against the screen
         // as it was last drawn, which is the one the user clicked on.
         let area = terminal.draw(|f| draw::draw(f, &app))?.area;
 
-        if !event::poll(TICK)? {
+        // A frame's wait while a session in flight is trailing stars, so they
+        // move; the rest of the time — and all the time, with the effect
+        // switched off in `[effects]` — the picker changes on a key and nothing
+        // else, and waits the ordinary tick.
+        let tick = if app.trailing() {
+            crate::fade::FRAME
+        } else {
+            TICK
+        };
+        if !event::poll(tick)? {
             // The clock lives here rather than in `App`, which stays pure —
             // the same split `pty::pump` uses for `keys::Prefix`.
             if deadline.is_some_and(|d| Instant::now() >= d) {
@@ -404,14 +423,7 @@ fn run_loop(
                     false,
                 )? {
                     prompt::Outcome::Created(session) => {
-                        // Appended rather than re-listed: the picker's rows are
-                        // still accurate and this is the one row they are
-                        // missing, so the caller gets a listing that includes
-                        // what it is about to attach to without another script
-                        // run. Order does not matter to either reader — one
-                        // takes a maximum, the other looks up a number.
-                        let mut sessions = app.sessions().to_vec();
-                        sessions.push(session.clone());
+                        let (session, sessions) = settle(&app, transport, session);
                         return Ok(Outcome::Attach { session, sessions });
                     }
                     prompt::Outcome::Cancelled => {}
@@ -479,6 +491,62 @@ fn leave_to_session(
         session,
         sessions: app.sessions().to_vec(),
     })
+}
+
+/// Put a session just created from the picker after the row that was
+/// highlighted, and hand back the session and the listing the caller attaches
+/// with.
+///
+/// Created last, a session is numbered last. Moving it up is a renumber — the
+/// batch a reorder writes, from [`App::placement_of`] — and then a listing,
+/// since what the numbers now are is a listing's answer and not ours (the
+/// reorder above says why). That is two round trips over ssh, paid only when
+/// the highlight was not already on the last row.
+///
+/// Placed last, nothing is written and nothing listed: the picker's rows plus
+/// the new one are the listing, as they always were — the rows are still
+/// accurate and this is the one they are missing. Order does not matter to
+/// either reader of it — one takes a maximum, the other looks up a number.
+///
+/// Neither step may lose the session, which exists by now. A renumber that
+/// fails leaves it attached where it was created, last; a listing that fails
+/// falls back to the rows in hand. Both are logged, since there is no screen
+/// left to say so on — the next thing on it is the session.
+fn settle(app: &App, transport: &dyn Transport, session: Session) -> (Session, Vec<Session>) {
+    let mut appended = app.sessions().to_vec();
+    appended.push(session.clone());
+
+    let order = app.placement_of(&session.id);
+    if order.is_empty() {
+        return (session, appended);
+    }
+    let batch: Vec<Session> = order
+        .into_iter()
+        .filter_map(|(id, num)| {
+            appended.iter().find(|s| s.id == id).cloned().map(|mut s| {
+                s.num = num;
+                s
+            })
+        })
+        .collect();
+    if let Err(e) = transport.renumber(&batch) {
+        tracing::warn!(id = %session.id, error = %e, "could not place the new session");
+        return (session, appended);
+    }
+    match transport.list_sessions() {
+        Ok(listing) => {
+            let placed = listing
+                .iter()
+                .find(|s| s.id == session.id)
+                .cloned()
+                .unwrap_or(session);
+            (placed, listing)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not list the sessions after placing one");
+            (session, appended)
+        }
+    }
 }
 
 /// Re-list, restoring the selection by id (`set_sessions` does that).

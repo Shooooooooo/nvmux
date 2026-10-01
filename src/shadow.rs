@@ -15,7 +15,7 @@
 //! misreads one the only consequence is a frame that is slightly wrong: a
 //! fade's, or, for a kept client, the screen put back on its return, until the
 //! server's own repaint lands. It costs a parse of the session's output while
-//! a session is attached, which is why `[fade] session = false` turns it off
+//! a session is attached, which is why `[effects.fade] session = false` turns it off
 //! entirely rather than merely not using it. A kept client
 //! (`[client] per_session`, the default) pays that parse anyway, for its own
 //! copy of its screen (see `pty::Attachment::paint_kept_screen`).
