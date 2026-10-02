@@ -279,6 +279,29 @@ impl Shadow {
     /// [`feed`]: Shadow::feed
     /// [`resize`]: Shadow::resize
     pub fn frame(&mut self, t: f32, palette: &Palette, cursor: Cursor) -> Vec<u8> {
+        self.frame_with(|_| t, palette, cursor, None)
+    }
+
+    /// [`Shadow::frame`], with each row `dissolve(row)` of the way to
+    /// `palette.bg` rather than all of them the same — the shape an iris gives
+    /// a fade (see [`crate::fade::Iris`]) — and with an overlay `over` painted
+    /// over it `ot` of the way dissolved, inside the same synchronized update,
+    /// so the terminal never presents the screen without it. The overlay's rectangle is
+    /// painted as [`Shadow::under`] paints it: its glyphs while they are the
+    /// more visible, the session's cells after.
+    ///
+    /// Those cells are painted again on every frame whatever the diff says,
+    /// since the overlay is drawn over them on every frame; so the diff,
+    /// which records the session's cells, stays true of everything the
+    /// overlay does not cover, and of the rectangle too once the overlay has
+    /// dissolved and paints the session's own cells there.
+    pub fn frame_with(
+        &mut self,
+        dissolve: impl Fn(u16) -> f32,
+        palette: &Palette,
+        cursor: Cursor,
+        over: Option<(&Over, f32)>,
+    ) -> Vec<u8> {
         let screen = self.parser.screen();
         let (rows, cols) = if self.broken { (0, 0) } else { screen.size() };
         let total = usize::from(rows) * usize::from(cols);
@@ -293,6 +316,7 @@ impl Shadow {
         // written on the row — `None` until one is.
         let mut sgr: Option<Painted> = None;
         for row in 0..rows {
+            let t = dissolve(row);
             let mut at: Option<u16> = None;
             for col in 0..cols {
                 let cell = screen.cell(row, col);
@@ -321,6 +345,9 @@ impl Shadow {
                 out.extend_from_slice(text.as_bytes());
                 at = Some(col + width);
             }
+        }
+        if let Some((over, ot)) = over.filter(|_| !self.broken) {
+            self.paint_under(&mut out, over, palette, ot, &dissolve);
         }
         out.extend_from_slice(RESET_SGR);
         // Inside the same synchronized update as the cells, so the screen and
@@ -462,7 +489,7 @@ impl Shadow {
         out.extend_from_slice(SYNC_BEGIN);
         out.extend_from_slice(SAVE_CURSOR);
         if !self.broken {
-            self.paint_under(&mut out, over, palette, t);
+            self.paint_under(&mut out, over, palette, t, &|_| 1.0 - t);
         }
         out.extend_from_slice(RESET_SGR);
         out.extend_from_slice(RESTORE_CURSOR);
@@ -471,9 +498,19 @@ impl Shadow {
     }
 
     /// The cells themselves, inside the envelope [`Shadow::under`] wrote.
-    fn paint_under(&self, out: &mut Vec<u8>, over: &Over, palette: &Palette, t: f32) {
+    ///
+    /// `beneath` is how far the session's cells under it are dissolved, row by
+    /// row: the overlay's opposite everywhere, for the notice; the frame's own
+    /// shape, for a frame with an overlay over it.
+    fn paint_under(
+        &self,
+        out: &mut Vec<u8>,
+        over: &Over,
+        palette: &Palette,
+        t: f32,
+        beneath: &dyn Fn(u16) -> f32,
+    ) {
         let screen = self.parser.screen();
-        let beneath = 1.0 - t;
         // The overlay's glyphs while they are the more visible of the two; the
         // session's cells once they are not.
         let overlaid = t < CROSSOVER;
@@ -509,7 +546,7 @@ impl Shadow {
                     // the rectangle and not ours to repair.
                     None => {
                         let cell = screen.cell(line, col);
-                        let painted = resolve(cell, palette, beneath);
+                        let painted = resolve(cell, palette, beneath(line));
                         match cell {
                             Some(cell) if cell.is_wide_continuation() => (" ", painted, 1),
                             Some(cell) if cell.is_wide() && c + 2 > over.width => (" ", painted, 1),
@@ -928,6 +965,87 @@ mod tests {
         // Past the crossover it is the screen, rising back out of it.
         assert_eq!(ink(0.75), "0;38;2;150;150;150");
         assert_eq!(ink(1.0), "0;38;2;200;200;200");
+    }
+
+    /// The name the picker hands off rides the session's own fade-in frames:
+    /// drawn whole over the still-dissolved screen on the first, inside the
+    /// one synchronized update, so the terminal never shows the frame without
+    /// it; and replaced by the session's own cells on the last.
+    #[test]
+    fn an_overlay_rides_inside_the_sessions_own_frames() {
+        let p = palette();
+        let name = Over {
+            top: 3,
+            left: 4,
+            width: 4,
+            rows: vec!["name".into()],
+        };
+        // What each cell was last painted with, 1-based as the wire has it.
+        let last = |bytes: &[u8]| {
+            let mut cells = std::collections::BTreeMap::new();
+            for (at, sgr, glyph) in painted_cells(bytes) {
+                cells.insert(at, (sgr, glyph));
+            }
+            cells
+        };
+        let mut shadow = under();
+
+        let first = shadow.frame_with(|_| 1.0, &p, Cursor::Hidden, Some((&name, 0.0)));
+        let wire = text(&first);
+        assert_eq!(
+            wire.matches("\x1b[?2026h").count(),
+            1,
+            "one update: {wire:?}"
+        );
+        assert!(wire.ends_with("\x1b[?2026l"), "{wire:?}");
+        let cells = last(&first);
+        let drawn = format!("0;38;2;{};{};{}", p.fg.0, p.fg.1, p.fg.2);
+        let shown: String = (5..=8).map(|col| cells[&(4, col)].1.clone()).collect();
+        assert_eq!(shown, "name");
+        assert!(
+            (5..=8).all(|col| cells[&(4, col)].0 == drawn),
+            "drawn whole"
+        );
+        assert_eq!(cells[&(4, 9)].1, "I", "beside it, the session's own cell");
+
+        let end = shadow.frame_with(|_| 0.0, &p, Cursor::Hidden, Some((&name, 1.0)));
+        let cells = last(&end);
+        let back: String = (5..=8).map(|col| cells[&(4, col)].1.clone()).collect();
+        assert_eq!(back, "EFGH", "the session's cells, where the name was");
+        assert!(
+            (5..=8).all(|col| cells[&(4, col)].0 == drawn),
+            "at full colour"
+        );
+    }
+
+    /// A frame can be shaped row by row: each row as far into the background
+    /// as `dissolve` says for it, which is how an iris opens a session out of
+    /// one line.
+    #[test]
+    fn a_frame_takes_each_row_as_far_as_it_is_told() {
+        let p = palette();
+        let mut shadow = under();
+        // 0-based rows 2 and 3 are 3 and 4 on the wire.
+        let shape = |row: u16| if row == 3 { 0.0 } else { 1.0 };
+        let frame = shadow.frame_with(shape, &p, Cursor::Hidden, None);
+        let full = format!("0;38;2;{};{};{}", p.fg.0, p.fg.1, p.fg.2);
+        let gone = format!("0;38;2;{};{};{}", p.bg.0, p.bg.1, p.bg.2);
+        let cells = painted_cells(&frame);
+        let row = |r: usize| {
+            cells
+                .iter()
+                .filter(move |(at, _, glyph)| at.0 == r && glyph != " ")
+                .map(|(_, sgr, _)| sgr.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            !row(4).is_empty() && row(4).iter().all(|sgr| *sgr == full),
+            "the row it opens out of"
+        );
+        assert!(
+            !row(3).is_empty() && row(3).iter().all(|sgr| *sgr == gone),
+            "a row still waiting"
+        );
     }
 
     /// Drawn over a session that still owns the screen, so unlike a frame it

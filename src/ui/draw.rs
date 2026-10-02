@@ -23,7 +23,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use super::app::{App, Mode};
-use super::dust::Dust;
+use super::backspace::Backspace;
 use super::landing::{Landing, Side, Tier};
 use super::starfield;
 
@@ -198,7 +198,7 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     let pull = landing.and_then(Landing::pulling);
     let reordering = matches!(app.mode(), Mode::Reorder { .. }) || pull.is_some();
     let selected_row = app.selected_row();
-    let dust = app.dust();
+    let backspace = app.backspace();
 
     let lines: Vec<Line> = rows
         .iter()
@@ -206,8 +206,8 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         .skip(offset)
         .take(height as usize)
         .map(|(i, row)| {
-            // A row crumbling is drawn by its dust alone, below.
-            if dust.is_some_and(|(id, _)| id == row.session.id) {
+            // A row being erased is drawn by its backspace alone, below.
+            if backspace.is_some_and(|(id, _)| id == row.session.id) {
                 return Line::default();
             }
             let selected = i == selected_row && !row.leaving;
@@ -238,8 +238,8 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 
     frame.render_widget(Paragraph::new(lines), block);
 
-    if let Some((id, dust)) = dust {
-        draw_dust(frame, app, block, offset, num_width, id, dust);
+    if let Some((id, backspace)) = backspace {
+        draw_backspace(frame, app, block, offset, num_width, id, backspace);
     }
     if app.trailing() {
         draw_trails(frame, app, block, offset, num_width, 0.0);
@@ -401,22 +401,22 @@ fn row_line(
     Line::from(spans)
 }
 
-/// The row a kill is crumbling: its characters where they still stand, its
-/// grains where they have drifted, and nothing once they are gone (see
-/// [`super::dust`]). The row is drawn as it was the moment it was confirmed,
-/// marker and number included, but not reversed — the bar is what breaks up
-/// first, so the dust reads as the row and not as the selection.
+/// The row a kill is erasing: as much of it as is left, and the cursor after
+/// it, until both have gone (see [`super::backspace`]). The row is drawn as it
+/// was the moment the kill was confirmed, marker and number included, but not
+/// reversed: it is a row being cleared now, no longer the selection.
 ///
-/// Like the trails, the grains drift past the end of the block onto the
-/// terminal's own background, and stop at the edge of the screen.
-fn draw_dust(
+/// The cursor goes in the column after what is left, which for a row as wide
+/// as the block is past its end, on the terminal's own background — and not
+/// at all past the edge of the screen.
+fn draw_backspace(
     frame: &mut Frame,
     app: &App,
     block: Rect,
     offset: usize,
     num_width: usize,
     id: &str,
-    dust: &Dust,
+    backspace: &Backspace,
 ) {
     let rows = app.rows();
     let Some(index) = rows.iter().position(|r| r.session.id == id) else {
@@ -438,20 +438,14 @@ fn draw_dust(
         ),
         block.width as usize,
     );
+    let (kept, cursor) = backspace.render(&text);
     let area = frame.area();
     let y = block.y + line as u16;
     let buf = frame.buffer_mut();
-    for speck in dust.render(&text) {
-        let x = block.x + speck.column;
-        if x >= area.x + area.width {
-            continue;
-        }
-        let style = if speck.dim {
-            Style::default().add_modifier(Modifier::DIM)
-        } else {
-            Style::default()
-        };
-        buf.set_string(x, y, speck.glyph.to_string(), style);
+    buf.set_string(block.x, y, kept, Style::default());
+    let x = block.x + kept.width() as u16;
+    if cursor && x < area.x + area.width {
+        buf.set_string(x, y, CURSOR, Style::default());
     }
 }
 
@@ -688,6 +682,56 @@ pub(super) fn row_rect(app: &App, area: Rect, id: &str) -> Option<Rect> {
         + PAD.width())
     .min(block.width as usize);
     Some(Rect::new(block.x, block.y + line as u16, width as u16, 1))
+}
+
+/// Where the name of session `id` is drawn: its row ([`row_rect`]) after the
+/// marker, the number and the gap, and short of the [`PAD`] past it, cut where
+/// the row is cut. `None` when the row is not on screen, or so narrow that
+/// none of the name is.
+pub(super) fn name_rect(app: &App, area: Rect, id: &str) -> Option<Rect> {
+    let row = row_rect(app, area, id)?;
+    let (body, _) = split_hint_row(area);
+    let num_width = list_layout(app, body)?.num_width;
+    let head = (MARKER.width() + num_width + NUM_GAP.width()) as u16;
+    let name = app
+        .rows()
+        .iter()
+        .find(|r| r.session.id == id)?
+        .session
+        .name
+        .width() as u16;
+    let width = row.width.saturating_sub(head).min(name);
+    (width > 0).then(|| Rect::new(row.x + head, row.y, width, 1))
+}
+
+/// Whether terminal cell (`column`, `row`) is part of a row as drawn — its
+/// marker, number, gap or name, the blanks among them included — rather than
+/// the terminal's own background around the list. What lets the effects lay
+/// glyphs beside rows without one landing in the space of a name like
+/// `session 3`.
+pub(super) fn on_a_row(app: &App, area: Rect, column: u16, row: u16) -> bool {
+    if area.height == 0 || area.width == 0 {
+        return false;
+    }
+    let (body, _) = split_hint_row(area);
+    let Some(ListLayout {
+        block,
+        offset,
+        num_width,
+    }) = list_layout(app, body)
+    else {
+        return false;
+    };
+    if row < block.y || row >= block.y + block.height || column < block.x {
+        return false;
+    }
+    let rows = app.rows();
+    let Some(drawn) = rows.get(offset + usize::from(row - block.y)) else {
+        return false;
+    };
+    let width = (MARKER.width() + num_width + NUM_GAP.width() + drawn.session.name.width())
+        .min(block.width as usize);
+    usize::from(column - block.x) < width
 }
 
 /// Keep `selected` visible within a window of `height` rows.
@@ -1585,6 +1629,22 @@ mod tests {
         }
     }
 
+    /// The name's own cells stop where the name does: the bar's pad is the
+    /// row's, not the name's, so what is struck or handed off is the name.
+    #[test]
+    fn a_name_is_measured_without_the_pad() {
+        let a = app(&["api-server", "docs"]);
+        let area = Rect::new(0, 0, 40, 6);
+        let lines = render(&a, 40, 6);
+        let y = line_of(&lines, "api-server");
+        let line = &lines[y as usize];
+        let x = line[..line.find("api-server").unwrap()].width() as u16;
+        let id = a.selected_row_id().unwrap().to_string();
+        assert_eq!(name_rect(&a, area, &id), Some(Rect::new(x, y, 10, 1)));
+        let row = row_rect(&a, area, &id).unwrap();
+        assert_eq!(row.x + row.width, x + 10 + PAD.width() as u16);
+    }
+
     /// The number is dim beside its name on every row but the selected one,
     /// whose bar stays whole; the names themselves are never dimmed.
     #[test]
@@ -1627,11 +1687,11 @@ mod tests {
         assert_eq!(row_at(&a, area, 20, notes), Some(0), "the only visible row");
     }
 
-    // --- the dust a kill leaves -----------------------------------------------
+    // --- the backspace a kill erases with --------------------------------------
 
     /// [`picker`] with the second row selected and its kill confirmed, the
-    /// dust `ms` milliseconds along.
-    fn crumbling(ms: u64) -> App {
+    /// backspace `ms` milliseconds along.
+    fn erasing(ms: u64) -> App {
         let mut a = app(&["api-server", "dotfiles", "notes"]);
         a.on_key(Key::Char('j'));
         a.on_key(Key::Char('x'));
@@ -1639,35 +1699,41 @@ mod tests {
             a.on_key(Key::Char('y')),
             super::super::app::Request::Kill(_)
         ));
-        assert!(a.start_dust("id000001"));
+        assert!(a.start_backspace("id000001"));
         a.tick(std::time::Duration::from_millis(ms));
         a
     }
 
-    /// At first the row is all there, though no longer the reversed bar;
-    /// midway it is braille drifting right; at the end there is nothing left
-    /// of it, and the rows around it have not moved.
+    /// At first the row is all there with the cursor after it, though no
+    /// longer the reversed bar; midway it is the start of the row and the
+    /// cursor; at the end there is nothing left of it, and the rows around it
+    /// have not moved.
     #[test]
-    fn a_killed_row_crumbles_into_dust_and_leaves_its_place_empty() {
-        let start = crumbling(0);
-        let buf = test_support::buffer(44, 8, |f| draw(f, &start));
+    fn a_killed_row_is_erased_from_its_end_and_leaves_its_place_empty() {
+        let start = erasing(0);
         let lines = render(&start, 44, 8);
         let y = line_of(&lines, "dotfiles");
         assert!(
-            (0..buf.area.width).all(|x| !buf[(x, y)].modifier.contains(Modifier::REVERSED)),
-            "the bar breaks up first"
+            lines[y as usize].ends_with(&format!("dotfiles{CURSOR}")),
+            "{lines:#?}"
         );
-
-        let mid = crumbling(200);
-        let buf = test_support::buffer(44, 8, |f| draw(f, &mid));
+        let buf = test_support::buffer(44, 8, |f| draw(f, &start));
         assert!(
-            (0..buf.area.width).any(|x| is_braille(buf[(x, y)].symbol())),
-            "dust midway: {:?}",
-            render(&mid, 44, 8)
+            (0..buf.area.width).all(|x| !buf[(x, y)].modifier.contains(Modifier::REVERSED)),
+            "no longer the selection"
         );
 
-        let end = crumbling(1_000);
-        assert!(!end.dusting());
+        let mid = erasing(120);
+        let line = render(&mid, 44, 8)[y as usize].clone();
+        let kept = line.trim_start().trim_end_matches(CURSOR);
+        assert!(line.ends_with(CURSOR), "{line:?}");
+        assert!(
+            !kept.is_empty() && "▸ 2  dotfiles".starts_with(kept) && kept != "▸ 2  dotfiles",
+            "part of the row, from its start: {line:?}"
+        );
+
+        let end = erasing(1_000);
+        assert!(!end.erasing());
         let after = render(&end, 44, 8);
         assert_eq!(after[y as usize], "", "the row is empty: {after:#?}");
         assert_eq!(line_of(&after, "api-server"), y - 1, "the rows stay put");
@@ -1675,23 +1741,23 @@ mod tests {
         test_support::assert_no_colour(44, 8, |f| draw(f, &mid));
     }
 
-    /// A listing after the kill is the truth: the dust is gone with it, and a
-    /// row whose kill failed comes back whole.
+    /// A listing after the kill is the truth: the erased row is gone with it,
+    /// and a row whose kill failed comes back whole.
     #[test]
-    fn a_fresh_listing_ends_the_dust() {
-        let mut a = crumbling(1_000);
+    fn a_fresh_listing_ends_the_backspace() {
+        let mut a = erasing(1_000);
         let same = a.sessions().to_vec();
         a.set_sessions(same);
-        assert!(a.dust().is_none());
+        assert!(a.backspace().is_none());
         assert!(render(&a, 44, 8).iter().any(|l| l.contains("dotfiles")));
     }
 
-    /// `[effects.kill] enabled = false`: a confirmed kill starts no dust.
+    /// `[effects.kill] enabled = false`: a confirmed kill erases nothing.
     #[test]
-    fn with_the_kill_effect_off_there_is_no_dust() {
+    fn with_the_kill_effect_off_there_is_no_backspace() {
         let mut a = app(&["api-server", "dotfiles"]);
         a.set_effects(false);
-        assert!(!a.start_dust("id000001"));
+        assert!(!a.start_backspace("id000001"));
         assert!(!a.animating());
     }
 

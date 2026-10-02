@@ -11,9 +11,10 @@ use std::time::Duration;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
-use super::dust::Dust;
+use super::backspace::Backspace;
 use super::effects;
 use super::landing::Landing;
+use super::sonar::Sonar;
 use super::starfield::{self, Starfield};
 use crate::session::Session;
 
@@ -110,31 +111,57 @@ pub struct App {
     /// The landing under way, from the key that put a session down until its
     /// dust settles. See [`super::landing`].
     landing: Option<Landing>,
-    /// Whether the row the cursor leaves glows: `[effects.cursor] enabled`,
-    /// under `[effects] enabled`. Read once when the picker opens, like `trail`.
-    afterglow: bool,
+    /// Whether the cursor lights the rows it moves between — the afterglow on
+    /// the row it leaves, the glint across the one it lands on:
+    /// `[effects.cursor] enabled`, under `[effects] enabled`. Read once when
+    /// the picker opens, like `trail`.
+    lights: bool,
     /// The rows the cursor has just left and is still glowing on, by session
     /// id, oldest first. See [`App::glows`].
     glows: Vec<Glow>,
+    /// The row the cursor last landed on, while the glint crosses it. One at
+    /// a time: the next move takes it to the next row. See [`App::glint`].
+    glint: Option<Glow>,
     /// Whether a filter keystroke's dropped rows fade out (`[effects.filter]
     /// enabled`).
     sift: bool,
     /// The rows the last filter keystroke dropped, while they fade. See
     /// [`App::rows`].
     leaving: Option<Leaving>,
-    /// Whether a confirmed kill crumbles its row first (`[effects.kill]
-    /// enabled`).
-    crumble: bool,
-    /// The row a kill is crumbling, by session id, until a fresh listing
-    /// replaces it. See [`App::start_dust`].
-    dust: Option<(String, Dust)>,
+    /// Whether a kill is drawn — the name struck through while the `[y/N]`
+    /// asks, and the row erased once it is confirmed: `[effects.kill]
+    /// enabled`.
+    kill: bool,
+    /// The line through the name a `[y/N]` is asking about, while it is drawn
+    /// on and, once the answer is no, back off. See [`App::strike`].
+    strike: Option<Strike>,
+    /// The row a kill is erasing, by session id, until a fresh listing
+    /// replaces it. See [`App::start_backspace`].
+    backspace: Option<(String, Backspace)>,
+    /// Whether coming back to the picker from a session sends rings out from
+    /// it: `[effects.back] enabled`.
+    back: bool,
+    /// The session the picker was opened from, and the rings pulsing out from
+    /// it, for as long as it is listed. See [`App::set_came_from`].
+    sonar: Option<(String, Sonar)>,
 }
 
-/// A row the cursor has left, and how long ago.
+/// A row the cursor has left or landed on, and how long ago.
 #[derive(Debug, Clone)]
 struct Glow {
     id: String,
     age: Duration,
+}
+
+/// The line through a name, by session id: how much of it is drawn, `0..=1`,
+/// and whether it is going back off. Kept as an amount rather than an age so a
+/// `[y/N]` answered before the line was all the way across draws it back from
+/// where it had got to.
+#[derive(Debug, Clone)]
+struct Strike {
+    id: String,
+    drawn: f32,
+    back: bool,
 }
 
 /// What one filter keystroke dropped, and how long ago.
@@ -196,12 +223,16 @@ impl App {
             after: Starfield::seeded(),
             before: Starfield::seeded(),
             landing: None,
-            afterglow: crate::config::get().effects.cursor_enabled(),
+            lights: crate::config::get().effects.cursor_enabled(),
             glows: Vec::new(),
+            glint: None,
             sift: crate::config::get().effects.filter_enabled(),
             leaving: None,
-            crumble: crate::config::get().effects.kill_enabled(),
-            dust: None,
+            kill: crate::config::get().effects.kill_enabled(),
+            strike: None,
+            backspace: None,
+            back: crate::config::get().effects.back_enabled(),
+            sonar: None,
         }
     }
 
@@ -210,11 +241,19 @@ impl App {
     /// does not move the highlight to an unrelated row.
     ///
     /// A fresh listing is the truth about the rows, so whatever was passing
-    /// over the old ones — dust, a glow, a fade — ends with it.
+    /// over the old ones — an erased row, a glow, a fade — ends with it. Not
+    /// the rings, which mark the session `Esc` goes back to, not a moment on
+    /// the screen: they go on while that session is listed.
     pub fn set_sessions(&mut self, sessions: Vec<Session>) {
         let previously = self.selected_id();
-        self.dust = None;
+        self.backspace = None;
+        self.strike = None;
+        self.sonar = self
+            .sonar
+            .take()
+            .filter(|(id, _)| sessions.iter().any(|s| &s.id == id));
         self.glows.clear();
+        self.glint = None;
         self.leaving = None;
         self.landing = None;
         self.sessions = sessions;
@@ -244,8 +283,15 @@ impl App {
     /// do not. A session that has gone from the list since is not gone back to
     /// either: killing the session you came from leaves `Esc` with nothing to
     /// do, which is better than dismissing the picker onto a dead client.
+    ///
+    /// The picker is coming back up over that session, so this is also where
+    /// the rings that say so start (see [`super::sonar`]), if the row is there
+    /// to send them from.
     pub fn set_came_from(&mut self, id: &str) {
         self.came_from = Some(id.to_string());
+        if self.back && self.visible().iter().any(|s| s.id == id) {
+            self.sonar = Some((id.to_string(), Sonar::new()));
+        }
     }
 
     pub fn mode(&self) -> &Mode {
@@ -292,14 +338,34 @@ impl App {
             glow.age += elapsed;
         }
         self.glows.retain(|g| g.age < effects::AFTERGLOW);
+        if let Some(glint) = &mut self.glint {
+            glint.age += elapsed;
+            if glint.age >= effects::GLINT {
+                self.glint = None;
+            }
+        }
         if let Some(leaving) = &mut self.leaving {
             leaving.age += elapsed;
             if leaving.age >= effects::SIFT {
                 self.leaving = None;
             }
         }
-        if let Some((_, dust)) = &mut self.dust {
-            dust.advance(elapsed);
+        if let Some(strike) = &mut self.strike {
+            let step = elapsed.as_secs_f32() / effects::STRIKE.as_secs_f32();
+            if strike.back {
+                strike.drawn -= step;
+                if strike.drawn <= 0.0 {
+                    self.strike = None;
+                }
+            } else {
+                strike.drawn = (strike.drawn + step).min(1.0);
+            }
+        }
+        if let Some((_, backspace)) = &mut self.backspace {
+            backspace.advance(elapsed);
+        }
+        if let Some((_, sonar)) = &mut self.sonar {
+            sonar.advance(elapsed);
         }
         if let Some(landing) = &mut self.landing {
             landing.advance(elapsed);
@@ -311,14 +377,28 @@ impl App {
 
     /// Whether anything on screen is moving, and so whether the caller should
     /// draw at a frame's pace rather than wait on the keyboard: a trail, a
-    /// glow, a fading row or dust. With every effect off this is only ever
-    /// false, and the picker changes on a key and nothing else.
+    /// glow, a glint, a fading row, a line being struck or drawn back, a row
+    /// being erased, or a pulse of rings. A line all the way across is still,
+    /// and asks for nothing while the `[y/N]` waits; so are the rings between
+    /// pulses, which [`App::wake_in`] answers for instead. With every effect
+    /// off this is only ever false, and the picker changes on a key and nothing
+    /// else.
     pub fn animating(&self) -> bool {
         self.trailing()
             || !self.glows.is_empty()
+            || self.glint.is_some()
             || self.leaving.is_some()
-            || self.dusting()
+            || self.striking()
+            || self.erasing()
+            || self.sonar.as_ref().is_some_and(|(_, s)| s.pulsing())
             || self.landing.is_some()
+    }
+
+    /// How long until something starts moving that is still now — the next
+    /// pulse of rings — so the caller's wait on the keyboard can end then,
+    /// rather than up to a tick late. `None` when nothing is due.
+    pub fn wake_in(&self) -> Option<Duration> {
+        self.sonar.as_ref().map(|(_, s)| s.until_next())
     }
 
     /// The landing under way, if a session has just been put down.
@@ -346,6 +426,15 @@ impl App {
             .map(move |g| (g.id.as_str(), g.age.as_secs_f32() / length))
     }
 
+    /// The row the cursor has just landed on, by session id, with how far the
+    /// glint is across it, `0..1`, or `None` once it has crossed.
+    pub fn glint(&self) -> Option<(&str, f32)> {
+        let length = effects::GLINT.as_secs_f32();
+        self.glint
+            .as_ref()
+            .map(|g| (g.id.as_str(), g.age.as_secs_f32() / length))
+    }
+
     /// How far through their fade the rows the last filter keystroke dropped
     /// are, `0..1`, or `None` when none are on screen.
     pub fn leaving(&self) -> Option<f32> {
@@ -354,25 +443,46 @@ impl App {
             .map(|l| l.age.as_secs_f32() / effects::SIFT.as_secs_f32())
     }
 
-    /// Start the row `id` crumbling, for a kill just confirmed. Says whether
+    /// The session a `[y/N]` is asking about, by id, with how much of the line
+    /// through its name is drawn, `0..=1`: on its way across while the
+    /// question is up, on its way back once it is answered no.
+    pub fn strike(&self) -> Option<(&str, f32)> {
+        self.strike.as_ref().map(|s| (s.id.as_str(), s.drawn))
+    }
+
+    /// Whether the line through a name is on its way across or back. All the
+    /// way across, it is still.
+    fn striking(&self) -> bool {
+        self.strike
+            .as_ref()
+            .is_some_and(|s| s.back || s.drawn < 1.0)
+    }
+
+    /// Start the row `id` erasing, for a kill just confirmed. Says whether
     /// there is anything to watch: the effect is on, and the row is on screen.
-    pub fn start_dust(&mut self, id: &str) -> bool {
-        if !self.crumble || !self.visible().iter().any(|s| s.id == id) {
+    pub fn start_backspace(&mut self, id: &str) -> bool {
+        if !self.kill || !self.visible().iter().any(|s| s.id == id) {
             return false;
         }
-        self.dust = Some((id.to_string(), Dust::seeded()));
+        self.backspace = Some((id.to_string(), Backspace::new()));
         true
     }
 
-    /// The row crumbling and its dust, for the renderer. Still here once the
-    /// dust is done — the row stays empty until a listing replaces it.
-    pub fn dust(&self) -> Option<(&str, &Dust)> {
-        self.dust.as_ref().map(|(id, d)| (id.as_str(), d))
+    /// The row being erased and its backspace, for the renderer. Still here
+    /// once it is done — the row stays empty until a listing replaces it.
+    pub fn backspace(&self) -> Option<(&str, &Backspace)> {
+        self.backspace.as_ref().map(|(id, b)| (id.as_str(), b))
     }
 
-    /// Whether a row is still crumbling.
-    pub fn dusting(&self) -> bool {
-        self.dust.as_ref().is_some_and(|(_, d)| !d.done())
+    /// Whether a row is still being erased.
+    pub fn erasing(&self) -> bool {
+        self.backspace.as_ref().is_some_and(|(_, b)| !b.done())
+    }
+
+    /// The session the picker came back up over, by id, and the rings that
+    /// pulse out from it.
+    pub fn sonar(&self) -> Option<(&str, &Sonar)> {
+        self.sonar.as_ref().map(|(id, s)| (id.as_str(), s))
     }
 
     /// The trail off the end of the name, for the renderer.
@@ -392,18 +502,22 @@ impl App {
         self.trail = on;
     }
 
-    /// Turn the picker's own effects — the afterglow, the filter's fade, the
-    /// kill's dust — on or off whatever the config says, for a test that needs
-    /// one or the other.
+    /// Turn the picker's own effects — the afterglow and the glint, the
+    /// filter's fade, the kill's strike and backspace, the rings — on or off
+    /// whatever the config says, for a test that needs one or the other.
     #[cfg(test)]
     pub(super) fn set_effects(&mut self, on: bool) {
-        self.afterglow = on;
+        self.lights = on;
         self.sift = on;
-        self.crumble = on;
+        self.kill = on;
+        self.back = on;
         if !on {
             self.glows.clear();
+            self.glint = None;
             self.leaving = None;
-            self.dust = None;
+            self.strike = None;
+            self.backspace = None;
+            self.sonar = None;
         }
     }
 
@@ -722,6 +836,22 @@ impl App {
             id: id.to_string(),
             prompt: format!("kill {name:?}? [y/N]"),
         };
+        if self.kill {
+            self.strike = Some(Strike {
+                id: id.to_string(),
+                drawn: 0.0,
+                back: false,
+            });
+        }
+    }
+
+    /// The `[y/N]` answered no, by a key or a click: back to the list, and the
+    /// line through the name drawn back off from wherever it had got to.
+    fn decline(&mut self) {
+        self.mode = Mode::Normal;
+        if let Some(strike) = &mut self.strike {
+            strike.back = true;
+        }
     }
 
     /// Handle one key. Returns whatever the caller now has to do.
@@ -754,13 +884,21 @@ impl App {
             .flatten()
     }
 
-    /// If the cursor has moved off the session `was`, start that row glowing.
-    /// The row it moved onto stops glowing, if it was: it is the selection now.
+    /// If the cursor has moved off the session `was`, start that row glowing,
+    /// and a glint across the row it moved onto. That row stops glowing, if it
+    /// was: it is the selection now.
     fn glow_from(&mut self, was: Option<String>) {
-        if !self.afterglow {
+        if !self.lights {
             return;
         }
-        let (Some(was), Some(now)) = (was, self.cursor()) else {
+        let now = self.cursor();
+        // A session picked up or a `[y/N]` takes the bar over, and the glint
+        // goes with it rather than carrying on across the question, or coming
+        // back half done once it is answered.
+        if now.is_none() {
+            self.glint = None;
+        }
+        let (Some(was), Some(now)) = (was, now) else {
             return;
         };
         // A row the filter just took is leaving, not glowing.
@@ -770,6 +908,10 @@ impl App {
         self.glows.retain(|g| g.id != was && g.id != now);
         self.glows.push(Glow {
             id: was,
+            age: Duration::ZERO,
+        });
+        self.glint = Some(Glow {
+            id: now,
             age: Duration::ZERO,
         });
     }
@@ -921,7 +1063,7 @@ impl App {
                 // way any key but `y` does. The wheel is not deliberate enough
                 // to dismiss a `[y/N]`.
                 if matches!(mouse, Mouse::Press(_)) {
-                    self.mode = Mode::Normal;
+                    self.decline();
                     self.pressed = None;
                 }
                 Request::None
@@ -1204,13 +1346,15 @@ impl App {
         match key {
             // Only an explicit `y` kills. Everything else, including Enter,
             // declines — that is what `[y/N]` promises.
+            // The row is erased next, and the line goes with it.
             Key::Char('y') | Key::Char('Y') => {
                 self.mode = Mode::Normal;
+                self.strike = None;
                 Request::Kill(id)
             }
             Key::CtrlC => Request::Quit,
             _ => {
-                self.mode = Mode::Normal;
+                self.decline();
                 Request::None
             }
         }
