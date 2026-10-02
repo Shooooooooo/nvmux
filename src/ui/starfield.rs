@@ -31,6 +31,15 @@
 //! A new star starts a little before the edge rather than on it, so stars that
 //! burn out together do not come back in step.
 //!
+//! # Catching
+//!
+//! A trail does not appear whole. When a session is picked up the field is
+//! [ignited](Starfield::ignite): every star is held back at the name, to leave
+//! at some moment in the first [`IGNITE`], a few at first and more and more
+//! towards the end of it. The first sparks go out alone, the crowd by the name
+//! builds behind them, and the trail has its full shape a moment later — a
+//! fuse catching rather than a picture switched on.
+//!
 //! The stars start straight off the end of the name's reversed bar. Three ramps
 //! between the two were tried and dropped — quadrant blocks stepping down a
 //! quarter of the cell at a time, the shades `▓▒░`, and braille dots lit at a
@@ -72,6 +81,11 @@ const OVERSHOOT: f32 = 4.0;
 /// How far before the left edge a new star may start, in dots — the stagger in
 /// the module docs.
 const STAGGER: f32 = 2.0;
+
+/// How long a trail takes to catch: every star has left the name by then (see
+/// the module docs). Short, so the trail is there by the time the first key
+/// moves the session, but long enough to be seen to build.
+pub const IGNITE: Duration = Duration::from_millis(300);
 
 /// Stars to a cell of trail. Burning out early, most of them crowd its first
 /// few dots, which is the point; this many makes that crowd a thick start to
@@ -135,6 +149,28 @@ impl Starfield {
             .map(|_| {
                 let mut star = self.rng.star(dots);
                 star.x = self.rng.unit() * (star.reach + STAGGER) - STAGGER;
+                star
+            })
+            .collect();
+    }
+
+    /// Lay out a fresh field `cells` wide with every star still at the name,
+    /// each to leave it at its own moment within [`IGNITE`] — so the trail
+    /// builds up rather than appearing whole (see the module docs).
+    ///
+    /// A star leaving after `delay` is placed `delay` of its own travel behind
+    /// the edge, so it needs nothing from [`Starfield::advance`] but its speed.
+    /// The delays are picked as the square root of a uniform pick, so their
+    /// density rises steadily: sparse at first, thickest at the end.
+    pub fn ignite(&mut self, cells: usize) {
+        self.cells = cells;
+        let dots = dots(cells);
+        let build = IGNITE.as_secs_f32();
+        self.stars = (0..cells * STARS_PER_CELL)
+            .map(|_| {
+                let mut star = self.rng.star(dots);
+                let delay = self.rng.unit().sqrt() * build;
+                star.x = -star.speed * delay;
                 star
             })
             .collect();
@@ -431,6 +467,50 @@ mod tests {
         f.advance(Duration::from_millis(16), 30);
         assert!(f.stars.len() > narrow);
         assert_eq!(f.cells, 30);
+    }
+
+    /// Lit dots in the field drawn `cells` wide.
+    fn lit(f: &Starfield, cells: usize) -> u32 {
+        f.render(cells)
+            .chars()
+            .map(|c| (c as u32).saturating_sub(BRAILLE).count_ones())
+            .sum()
+    }
+
+    /// An ignited field starts dark, and every star has left the name by
+    /// the time [`IGNITE`] is up.
+    #[test]
+    fn an_ignited_field_starts_dark_and_has_caught_by_the_end() {
+        let mut f = Starfield::new(7);
+        f.ignite(TRAIL);
+        assert_eq!(lit(&f, TRAIL), 0, "{:?}", f.render(TRAIL));
+        assert_eq!(f.stars.len(), TRAIL * STARS_PER_CELL);
+        let start = f.stars.clone();
+        f.advance(IGNITE, TRAIL);
+        for (was, now) in start.iter().zip(&f.stars) {
+            assert!(
+                now.reach != was.reach || now.x >= 0.0,
+                "{was:?} was still waiting at the name: {now:?}"
+            );
+        }
+    }
+
+    /// The trail builds: averaged over many seeds, it is brighter half way
+    /// through catching than a frame in, and brighter again once caught.
+    #[test]
+    fn an_ignited_field_builds_up() {
+        let at = |ms: u64| -> u32 {
+            (0..200)
+                .map(|seed| {
+                    let mut f = Starfield::new(seed);
+                    f.ignite(TRAIL);
+                    f.advance(Duration::from_millis(ms), TRAIL);
+                    lit(&f, TRAIL)
+                })
+                .sum()
+        };
+        let (early, half, caught) = (at(16), at(150), at(400));
+        assert!(early < half && half < caught, "{early} {half} {caught}");
     }
 
     #[test]
