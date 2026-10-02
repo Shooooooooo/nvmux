@@ -41,6 +41,13 @@
 //! it takes as it takes any answer. **A held byte — by either of the two — is
 //! never dropped, reordered or changed.**
 //!
+//! And a client started ahead of its first visit (`[client] lazy = false`) is
+//! held from the moment it starts until that visit, its startup questions and
+//! all, and then relayed from its first byte, through the hold when there is
+//! one (see [`Attachment::start_ahead`]). The same rule holds, and the same
+//! reasoning: the terminal answers when it hears the questions, and the client
+//! takes the answers when they come.
+//!
 //! Four things ever *join* this direction. The attach notice (see
 //! [`crate::announce`]): a box, drawn where the child's own bytes leave the
 //! terminal between escape sequences, which [`crate::boundary`] finds with a
@@ -272,6 +279,16 @@ pub struct Attachment {
     /// is some other client's exit sequence having turned off modes this one
     /// set once and relies on (see [`crate::ledger::Ledger::put_back`]).
     exits_seen: u64,
+    /// Everything a client started ahead of its first visit has written, in
+    /// order, and nothing else has seen: not the terminal, not the shadow,
+    /// not the ledger (see [`Attachment::start_ahead`]). Relayed first when
+    /// that visit comes, as if it had just been read. `None` for every other
+    /// client, and once relayed.
+    unshown: Option<Vec<u8>>,
+    /// The attach probe of a client started ahead, until it answers (see
+    /// [`Attachment::start_ahead`]). One still out when the client is asked
+    /// for is handed over with it, to be waited for as a fresh client's is.
+    probe: Option<Probe>,
 }
 
 /// How many clients have had their exit sequences relayed to the terminal:
@@ -1403,6 +1420,66 @@ impl Attachment {
     /// next attach to its session is a fresh one.
     pub fn park(mut self) -> Option<Parked> {
         self.exits_seen = EXITS_RELAYED.load(std::sync::atomic::Ordering::Relaxed);
+        self.put_aside("nvmux-parked", keep_parked)
+    }
+
+    /// Hold a client that has never been relayed until its session is first
+    /// visited: `[client] lazy = false`, which starts one for every session as
+    /// nvmux starts. `probe` is its attach probe, if that has still to answer.
+    /// `None` if it could not be held, in which case it has been retired, as
+    /// by [`Attachment::park`].
+    ///
+    /// Held as a parked client is — in a [`Parked`], on a thread that owns it
+    /// and reads it — but kept differently, because it is read for a
+    /// different reason. A parked client has been in front: the terminal has
+    /// answered its questions, and what it writes while away is wanted only
+    /// for the screen it describes and what it tells the terminal, so the
+    /// shadow and the ledger keep up with it and the bytes go. This one has
+    /// asked the terminal questions nothing has heard yet — its keyboard
+    /// protocol, its synchronized updates, its in-band sizes, the background
+    /// — and takes their answers whenever they come: measured on 0.12.5, five
+    /// seconds late exactly as at once. So what it writes is kept whole, in
+    /// [`Attachment::unshown`], and its first relay sends all of it before
+    /// anything else it says (see [`pump`]): the terminal hears the client's
+    /// startup as the client wrote it, later, and answers it then. Nothing
+    /// else sees those bytes until then, so the shadow and the ledger are
+    /// shown each of them once, on the way out, as for any client.
+    ///
+    /// Read rather than left to fill its pty, for the reason a parked client
+    /// is: a client nobody reads stops in its write while its server keeps
+    /// every frame for it, without bound. Kept whole, the bound is nvmux's
+    /// instead — see [`keep_unshown`].
+    pub fn start_ahead(mut self, probe: Option<Probe>) -> Option<Parked> {
+        self.unshown = Some(Vec::new());
+        self.probe = probe;
+        self.put_aside("nvmux-ahead", keep_unshown)
+    }
+
+    /// Whether this client was started ahead of its session's first visit
+    /// and has not been relayed yet (see [`Attachment::start_ahead`]).
+    pub fn started_ahead(&self) -> bool {
+        self.unshown.is_some()
+    }
+
+    /// The attach probe of a client started ahead, if it had not answered by
+    /// the time the client was taken back: the caller waits it out as for a
+    /// fresh client, with the attaching screen up.
+    pub fn take_probe(&mut self) -> Option<Probe> {
+        self.probe.take()
+    }
+
+    /// The socket the client was attached through — locally the session's
+    /// own, over SSH the local end of the forward.
+    pub fn sock(&self) -> &Path {
+        &self.sock
+    }
+
+    /// Hand the client to a thread of its own, named `name`, running `keep`.
+    fn put_aside(
+        self,
+        name: &str,
+        keep: fn(Attachment, UnixStream) -> Option<Attachment>,
+    ) -> Option<Parked> {
         let session_id = self.session_id.clone();
         let (stop, stopped) = match UnixStream::pair() {
             Ok(pair) => pair,
@@ -1412,8 +1489,8 @@ impl Attachment {
             }
         };
         let thread = std::thread::Builder::new()
-            .name("nvmux-parked".into())
-            .spawn(move || keep_parked(self, stopped));
+            .name(name.into())
+            .spawn(move || keep(self, stopped));
         match thread {
             Ok(thread) => Some(Parked {
                 session_id,
@@ -1451,6 +1528,11 @@ impl Attachment {
 /// A client that leaves while parked — its session killed from the picker,
 /// quit from another UI, its ssh link gone — is retired on the thread and
 /// not handed back. Nothing else would notice: no transport call reports it.
+///
+/// A client started ahead of its session's first visit (`[client] lazy =
+/// false`) is held in one too, on a thread that keeps what it reads whole
+/// rather than reducing it to a screen: see [`Attachment::start_ahead`]. The
+/// rest — the taking back, the retiring, a client that leaves — is the same.
 pub struct Parked {
     session_id: String,
     /// Dropped to stop the thread: the far end then reads as hung up.
@@ -1482,8 +1564,8 @@ impl Parked {
         self.thread.as_ref().is_some_and(|t| !t.is_finished())
     }
 
-    /// Have the client back, ready to be resumed — or `None` if it left while
-    /// parked. The thread notices at once — it is in a `poll` on the other end
+    /// Have the client back, ready to be resumed — or, started ahead, to be
+    /// relayed for the first time — or `None` if it left while parked. The thread notices at once — it is in a `poll` on the other end
     /// of `stop` — unless it is already retiring a client that was leaving,
     /// which is its business and not worth waiting on: past [`UNPARK_WAIT`]
     /// this gives up on it, and the thread finishes the retirement on its own.
@@ -1661,6 +1743,155 @@ fn leaves_alt_screen(chunk: &[u8]) -> bool {
     chunk
         .windows(ALT_SCREEN_LEAVE.len())
         .any(|w| w == ALT_SCREEN_LEAVE)
+}
+
+/// The most a client started ahead may write before its first visit (see
+/// [`Attachment::start_ahead`]): past it, the client is retired and its
+/// session started afresh on that visit. A hold's worth, so that what is
+/// kept is let through as one first paint (see [`Hold`]) — and far past
+/// what an idle session writes, which is its startup and one screen: a few
+/// kilobytes, a few tens on a large terminal. What reaches it is a session
+/// that keeps drawing, a `:terminal` running something, whose frames are of
+/// no use to anybody by the time it is visited.
+pub const AHEAD_MAX: usize = HOLD_MAX;
+
+/// How often the thread of a client started ahead looks for its probe's
+/// answer while it has none (see [`keep_unshown`]). The answer comes over a
+/// channel, which `poll` cannot wait on. Nothing waits on the thread's
+/// noticing it — a client asked for before it has is handed back with its
+/// probe, to be waited on there — so this is only how soon a refused client
+/// is let go, and how often a busy session's thread wakes for nothing.
+const PROBE_POLL_MS: libc::c_int = 100;
+
+/// The thread of a client started ahead (see [`Attachment::start_ahead`]):
+/// keep everything it writes until it is asked for, and hand it back — or
+/// retire it, if told to, if it is leaving, if it has written more than
+/// [`AHEAD_MAX`], or if its probe says it is not to be shown after all.
+///
+/// Never a byte to stdout and never one to the shadow or the ledger: every
+/// byte goes into [`Attachment::unshown`], in the order it came, for the
+/// first relay to send on.
+///
+/// The probe, while it is out, is asked on every pass and never waited on.
+/// `Ready` is the client cleared to be shown, and the probe is let go.
+/// `Blocked` — a session waiting for a key, whose server serves the client
+/// nothing until one comes — and a refusal both retire the client: its
+/// session's first visit attaches afresh, with the attaching screen to say
+/// what is wrong, which nothing here could.
+///
+/// Leaving is told by half of what tells it on [`keep_parked`]: the client
+/// leaving the alternate screen. Not the DA1 request, which here is no sign
+/// of anything — a client's startup asks it, and asks it again once its first
+/// frame is out (measured on 0.12.5, with nothing answering either), and all
+/// of it is still to be put to the terminal. Looked for in what has been kept
+/// rather than in a single read, so one split across two reads is found. A
+/// client whose `TERM` has no alternate screen leaves without saying so, and
+/// is let go when it has exited — or retired when it is found stopped, which
+/// is where a suspend ends.
+fn keep_unshown(mut attachment: Attachment, stop: UnixStream) -> Option<Attachment> {
+    let id = attachment.session_id.clone();
+    let mut buf = [0u8; 8192];
+    loop {
+        if let Some(probe) = attachment.probe.as_mut() {
+            match probe.wait(Duration::ZERO) {
+                None => {}
+                Some(Ok(Answer::Ready)) => attachment.probe = None,
+                Some(Ok(Answer::Blocked { mode })) => {
+                    tracing::debug!(%id, %mode, "a client started ahead is waiting for a key; retiring it");
+                    return None;
+                }
+                Some(Err(e)) => {
+                    tracing::debug!(%id, error = %e, "a client started ahead was refused; retiring it");
+                    return None;
+                }
+            }
+        }
+        let wait = if attachment.probe.is_some() {
+            PROBE_POLL_MS
+        } else {
+            IDLE_POLL_MS
+        };
+        let master = attachment.master.as_raw_fd();
+        let mut fds = [pollfd(stop.as_raw_fd()), pollfd(master.unwrap_or(-1))];
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, wait) };
+        if n < 0 {
+            // A `SIGWINCH` meant for the relay can land on this thread.
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            tracing::warn!(%id, "a client started ahead could not be watched; retiring it");
+            return None;
+        }
+        // The client first, as on a parked client's thread.
+        if let Some(master) = master.filter(|_| n > 0 && ready(&fds[1])) {
+            match read_fd(master, &mut buf) {
+                Ok(len) if len > 0 => {
+                    let unshown = attachment.unshown.get_or_insert_with(Vec::new);
+                    let before = unshown.len();
+                    unshown.extend_from_slice(&buf[..len]);
+                    let leaving =
+                        leaves_alt_screen(&unshown[tail_from(before, ALT_SCREEN_LEAVE)..]);
+                    let kept = unshown.len();
+                    if leaving {
+                        tracing::debug!(%id, "a client started ahead is finishing; retiring it");
+                        attachment.hang_up();
+                        attachment.answer_device_attributes();
+                        return None;
+                    }
+                    if kept > AHEAD_MAX {
+                        tracing::debug!(
+                            %id,
+                            bytes = kept,
+                            "a client started ahead said too much before it was shown; retiring it"
+                        );
+                        return None;
+                    }
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                // EOF on macOS, EIO on Linux: the client has gone.
+                _ => {
+                    tracing::debug!(%id, "a client started ahead left");
+                    return None;
+                }
+            }
+        }
+        if n > 0 && ready(&fds[0]) {
+            // A byte is an order to retire the client; the end of the stream
+            // is the client wanted.
+            let mut order = [0u8; 1];
+            return match read_fd(stop.as_raw_fd(), &mut order) {
+                Ok(1) => None,
+                _ => Some(attachment),
+            };
+        }
+        if n == 0 {
+            if let Some(pid) = attachment.child.process_id() {
+                match peek_child(nix::unistd::Pid::from_raw(pid as i32)) {
+                    Peek::Running => {}
+                    Peek::Stopped => {
+                        tracing::debug!(%id, "a client started ahead stopped; retiring it");
+                        return None;
+                    }
+                    Peek::Gone => {
+                        tracing::debug!(%id, "a client started ahead exited");
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Where to look in a buffer just grown from `before` bytes for a `needle`
+/// the growth may have completed: far enough back for one whose head was
+/// already there, and no further — one that was whole before was looked for
+/// then.
+fn tail_from(before: usize, needle: &[u8]) -> usize {
+    before.saturating_sub(needle.len() - 1)
 }
 
 /// A stand-in kept client for the tests of what holds clients (see
@@ -2181,6 +2412,8 @@ fn spawn_client_with(
         startup_answered: false,
         expecting_a_size_report: None,
         exits_seen: 0,
+        unshown: None,
+        probe: None,
     })
 }
 
@@ -2261,6 +2494,19 @@ pub fn relay(
         // the first paint takes down (see `release_hold`).
         if attachment.hand_off.is_none() {
             term::leave_alt_screen_and_clear();
+        }
+        // A client started ahead was sized for the terminal nvmux started on,
+        // which may have changed since. Told now, before anything takes a
+        // byte of what it drew: the shadow then reads those bytes at the size
+        // the terminal has, and the client's redraw for that size follows
+        // them. It takes its size from the pty, as every client does until
+        // the terminal has said whether it reports sizes in band — which this
+        // one has yet to ask it.
+        if attachment.started_ahead() {
+            let size = term::terminal_size();
+            if attachment.master.get_size().ok() != Some(size) {
+                attachment.resize_to(size);
+            }
         }
         attachment.shadow_saw(term::HANDOVER);
     }
@@ -2512,6 +2758,19 @@ fn pump(
     let mut painted_bytes = 0usize;
     let mut last_byte = Instant::now();
     let mut painted = false;
+
+    // A client started ahead of this, its first visit, has been writing all
+    // along (see [`Attachment::start_ahead`]). What it wrote goes first, and
+    // the way everything it writes from here goes — held with the first
+    // paint, shown to the shadow and the ledger, relayed — as if it had just
+    // been read, which as far as the terminal is concerned it has.
+    if let Some(unshown) = attachment.unshown.take().filter(|b| !b.is_empty()) {
+        let now = Instant::now();
+        attachment.relay_output(&unshown, now)?;
+        first_byte = Some(relay_started.elapsed());
+        painted_bytes += unshown.len();
+        last_byte = now;
+    }
 
     loop {
         // The attach notice has a clock of its own — a life to end, and a
@@ -4821,6 +5080,152 @@ mod tests {
         let pid = pid_of(&a);
         drop(a.park().expect("parked"));
         assert!(reaped(pid), "the client outlived its parking");
+    }
+
+    /// What a client started ahead writes is kept whole, in order, and seen
+    /// by nothing until it is relayed: not by the ledger, which would
+    /// otherwise count a title the terminal has not been told yet. And its
+    /// DA1 requests — two, as a real client's startup asks with nothing
+    /// answering, the first split across two reads — are questions to keep
+    /// for the terminal, not the sign of a client leaving.
+    #[test]
+    fn a_client_started_ahead_keeps_what_it_writes_whole_and_unseen() {
+        let a = kept(
+            r#"printf '\033[?1049hhello\033['; sleep 0.1; printf 'c\033]0;a title\007\033[c'; exec sleep 30"#,
+        );
+        let pid = pid_of(&a);
+        let held = a.start_ahead(None).expect("held");
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(held.is_alive(), "its startup was taken for an exit");
+        let back = held.unpark().expect("handed back");
+        assert_eq!(pid_of(&back), pid, "not the same client");
+        assert!(back.started_ahead());
+        assert_eq!(
+            back.unshown.as_deref(),
+            Some(&b"\x1b[?1049hhello\x1b[c\x1b]0;a title\x07\x1b[c"[..]),
+            "what it wrote was not kept as it wrote it"
+        );
+        assert_eq!(
+            back.ledger.as_ref().and_then(Ledger::title),
+            None,
+            "the ledger was shown what the terminal has not been"
+        );
+    }
+
+    /// A client started ahead that leaves the alternate screen is on its way
+    /// out — its exit or its suspend — and is retired, as a parked one is,
+    /// however the reads split the sequence.
+    #[test]
+    fn a_client_started_ahead_on_its_way_out_is_retired() {
+        for (tag, finish) in [
+            ("whole", r#"printf '\033[?1049l\033[c'"#),
+            ("split", r#"printf '\033[?10'; sleep 0.1; printf '49l'"#),
+        ] {
+            let a = kept(&format!(
+                r#"stty raw -echo; trap 'exit 0' HUP; printf '\033[c'; sleep 0.2; {finish}; while :; do sleep 0.05; done"#
+            ));
+            let pid = pid_of(&a);
+            let held = a.start_ahead(None).expect("held");
+            assert!(settle_parked(&held), "{tag}: the finishing client was kept");
+            assert!(
+                held.unpark().is_none(),
+                "{tag}: the finishing client was handed back"
+            );
+            assert!(reaped(pid), "{tag}: the finishing client was not reaped");
+        }
+    }
+
+    /// One that has said more than a first paint's worth before anybody
+    /// asked for it is let go, rather than kept growing.
+    #[test]
+    fn a_client_started_ahead_that_says_too_much_is_let_go() {
+        let a = kept(&format!(
+            "head -c {} /dev/zero | tr '\\0' x; exec sleep 30",
+            AHEAD_MAX + 1
+        ));
+        let pid = pid_of(&a);
+        let held = a.start_ahead(None).expect("held");
+        assert!(settle_parked(&held), "a client past the bound was kept");
+        assert!(held.unpark().is_none());
+        assert!(reaped(pid), "and it was not reaped");
+    }
+
+    /// The probe decides whether a client started ahead is kept, as it
+    /// decides whether a fresh one is shown: a session with room keeps it,
+    /// with the probe let go; one with too many UIs, or one waiting for a key,
+    /// retires it, so that its first visit attaches afresh.
+    #[test]
+    fn a_client_started_ahead_is_kept_only_if_its_probe_says_so() {
+        for (tag, mode, blocking, uis, keeps) in [
+            ("room", "n", false, 0, true),
+            ("full", "n", false, MAX_UIS + 1, false),
+            ("blocked", "rm", true, 0, false),
+        ] {
+            let sock = crate::test_support::scratch_sock(&format!("pty-ahead-{tag}"));
+            let server = if blocking {
+                recording_server_blocked_stalling_on(&sock, mode, "nvim_list_uis")
+            } else {
+                recording_server_with_uis(&sock, mode, false, uis)
+            };
+            let probe = Probe::start(tag, &sock).expect("connected");
+            let a = kept("printf r; exec sleep 30");
+            let pid = pid_of(&a);
+            let held = a.start_ahead(Some(probe)).expect("held");
+            if keeps {
+                // One round trip on a local socket, long since answered, and
+                // a few of the thread's looks for the answer.
+                std::thread::sleep(Duration::from_millis(500));
+                let mut back = held
+                    .unpark()
+                    .unwrap_or_else(|| panic!("{tag}: not handed back"));
+                assert_eq!(pid_of(&back), pid);
+                assert!(back.take_probe().is_none(), "{tag}: the probe was kept");
+            } else {
+                assert!(settle_parked(&held), "{tag}: the client was kept");
+                assert!(held.unpark().is_none(), "{tag}: and handed back");
+                assert!(reaped(pid), "{tag}: and not reaped");
+            }
+            server.join().expect("the server thread");
+            let _ = std::fs::remove_file(&sock);
+        }
+    }
+
+    /// A client asked for before its probe has answered comes back with the
+    /// probe, for the caller to wait out as it would a fresh client's.
+    #[test]
+    fn a_probe_still_out_comes_back_with_its_client() {
+        let sock = crate::test_support::scratch_sock("pty-ahead-busy");
+        let server = recording_server_stalling_on(&sock, "nvim_list_uis");
+        let probe = Probe::start("busy", &sock).expect("connected");
+        let held = kept("printf r; exec sleep 30")
+            .start_ahead(Some(probe))
+            .expect("held");
+        std::thread::sleep(Duration::from_millis(100));
+        let mut back = held.unpark().expect("handed back");
+        assert!(
+            back.take_probe().is_some(),
+            "the probe still out was not handed back"
+        );
+        drop(back);
+        server.join().expect("the server thread");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    /// A sequence the growth of a buffer completed is in the tail looked at,
+    /// wherever the growth split it, and one wholly before it is not.
+    #[test]
+    fn the_tail_looked_at_takes_in_a_sequence_split_by_the_growth() {
+        let grown = b"xx\x1b[?1049l";
+        for before in 2..grown.len() {
+            assert!(
+                leaves_alt_screen(&grown[tail_from(before, ALT_SCREEN_LEAVE)..]),
+                "grown from {before} bytes"
+            );
+        }
+        assert!(!leaves_alt_screen(
+            &grown[tail_from(grown.len(), ALT_SCREEN_LEAVE)..]
+        ));
+        assert_eq!(tail_from(3, ALT_SCREEN_LEAVE), 0);
     }
 
     /// Whether the process is gone and waited for — not merely exited, which

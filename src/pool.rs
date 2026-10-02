@@ -15,15 +15,23 @@
 //! does not come through here at all: [`Pool::set_aside`] hands the client
 //! straight back, and a `Pool` that has never been given one has nothing to
 //! take.
+//!
+//! It also holds the clients started ahead of their session's first visit —
+//! `[client] lazy = false`, which starts one for every session as nvmux
+//! starts (see [`Pool::start_ahead`]) — whichever way `per_session` is set:
+//! taken back like a parked one, they are relayed for the first time rather
+//! than resumed (see [`crate::pty::Attachment::start_ahead`]), and leave the
+//! front afterwards as every other client does.
 
-use crate::pty::{Attachment, Parked};
+use crate::pty::{Attachment, Parked, Probe};
 use crate::session::Session;
 
 /// What [`Pool::take`] found for a session.
 #[derive(Debug)]
 pub enum Taken {
-    /// Its client, parked and alive: resume it. Boxed, being the one variant
-    /// with anything in it.
+    /// Its client, parked and alive: resume it — or, one started ahead (see
+    /// [`Attachment::started_ahead`]), relay it for the first time. Boxed,
+    /// being the one variant with anything in it.
     Kept(Box<Attachment>),
     /// A client was parked for it, and has left — its session ended, or the
     /// link it came over went. The caller cannot tell which from here, and
@@ -82,6 +90,20 @@ impl Pool {
             self.parked.push(parked);
         }
         None
+    }
+
+    /// Hold a client started ahead of its session's first visit, with its
+    /// attach probe if that has still to answer (see
+    /// [`Attachment::start_ahead`]). Whether or not clients are kept: this
+    /// one has not been in front yet, and `per_session` is about what happens
+    /// when one leaves it.
+    pub fn start_ahead(&mut self, attachment: Attachment, probe: Option<Probe>) {
+        let id = attachment.session_id.clone();
+        self.retire(&id);
+        if let Some(held) = attachment.start_ahead(probe) {
+            tracing::debug!(id = %id, held = self.parked.len() + 1, "client started ahead");
+            self.parked.push(held);
+        }
     }
 
     /// The client parked for this session, taken back to be resumed; see
@@ -212,6 +234,25 @@ mod tests {
         assert_eq!(back.pid_for_test(), pid);
         assert!(!pool.holds("s1"), "taken back, and still held");
         assert!(pool.is_empty());
+    }
+
+    /// A client started ahead is held whether or not clients are kept, and
+    /// taken back by its session as one that has never been shown.
+    #[test]
+    fn a_client_started_ahead_is_held_either_way_until_its_first_visit() {
+        for keeps in [true, false] {
+            let mut pool = Pool::new(keeps);
+            let a = kept_standin("s1", "exec sleep 30");
+            let pid = a.pid_for_test();
+            pool.start_ahead(a, None);
+            assert!(pool.holds("s1"), "keeps = {keeps}: not held");
+            let Taken::Kept(back) = pool.take("s1") else {
+                panic!("keeps = {keeps}: not taken back");
+            };
+            assert_eq!(back.pid_for_test(), pid);
+            assert!(back.started_ahead());
+            assert!(pool.is_empty());
+        }
     }
 
     /// A client that left the front before its startup was over goes back to

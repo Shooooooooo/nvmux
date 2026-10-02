@@ -28,6 +28,10 @@
 //! screen from its own copy of it and asks the server for its repaint on top —
 //! which only a real client on a real pty, and a real server made too busy to
 //! answer, can show.
+//!
+//! Nor is a client started ahead of its first visit (`[client] lazy = false`),
+//! whose startup questions reach the terminal only on that visit, and have to
+//! be answered and acted on then: which only a real client can show.
 
 #[macro_use]
 mod common;
@@ -57,6 +61,19 @@ const CHILD_KEEP: &str = "NVMUX_TEST_RELAY_KEEP";
 /// How long a keeping child leaves its client parked: long enough for the
 /// parent to have made the server busy before the client comes back.
 const PARKED_FOR: Duration = Duration::from_secs(1);
+
+/// Set on a child whose client is started ahead of its first visit
+/// (`[client] lazy = false`): begun and handed to the pool, held there out of
+/// sight for [`AHEAD_FOR`], then taken back and relayed for the first time.
+const CHILD_AHEAD: &str = "NVMUX_TEST_RELAY_AHEAD";
+
+/// How long a child starting its client ahead holds it before relaying it:
+/// long enough for the parent to see the client attached to its server with
+/// nothing yet on the terminal.
+const AHEAD_FOR: Duration = Duration::from_secs(2);
+
+/// What that child writes once its client has been started ahead.
+const AHEAD: &[u8] = b"\x1b]9999;ahead\x07";
 
 /// What a keeping child writes once its client is parked, so the parent knows
 /// the relay has let go of the terminal: an OSC no terminal acts on, which
@@ -124,7 +141,11 @@ fn relay_child() {
     // reaching the machine, and a box drawn over the screen would be noise in
     // the stream the parent is reading.
     let mut pool = nvmux::pool::Pool::configured();
-    let mut attachment = nvmux::pty::spawn(&id, Path::new(&sock), "").expect("attach");
+    let mut attachment = if std::env::var_os(CHILD_AHEAD).is_some() {
+        start_ahead(&mut pool, &id, Path::new(&sock))
+    } else {
+        nvmux::pty::spawn(&id, Path::new(&sock), "").expect("attach")
+    };
     assert_eq!(
         attachment.is_kept(),
         keep,
@@ -157,6 +178,26 @@ fn relay_child() {
         }
     };
     std::process::exit(code);
+}
+
+/// A client started as `main` starts one ahead, held by the pool for
+/// [`AHEAD_FOR`] and then taken back, never yet relayed — with its probe
+/// answered, which a local server does in well under that.
+fn start_ahead(pool: &mut nvmux::pool::Pool, id: &str, sock: &Path) -> nvmux::pty::Attachment {
+    let attachment = nvmux::pty::spawn_client(id, sock, "").expect("start");
+    let probe = nvmux::pty::Probe::start(id, sock).expect("probe");
+    pool.start_ahead(attachment, Some(probe));
+    let mut out = std::io::stdout();
+    let _ = out.write_all(AHEAD);
+    let _ = out.flush();
+    std::thread::sleep(AHEAD_FOR);
+    let mut back = match pool.take(id) {
+        nvmux::pool::Taken::Kept(back) => *back,
+        other => panic!("the client started ahead did not come back: {other:?}"),
+    };
+    assert!(back.started_ahead(), "taken back as one already shown");
+    assert!(back.take_probe().is_none(), "the probe never answered");
+    back
 }
 
 /// Which keyboard protocol the fake terminal admits to.
@@ -200,13 +241,20 @@ impl Terminal {
     /// [`Terminal::spawn`], with `shadow` asking the child for the palette that
     /// gives it a shadow of the session's screen (see [`CHILD_PALETTE`]).
     fn spawn_with(sock: &Path, id: &str, protocol: Protocol, shadow: bool) -> Self {
-        Self::spawn_child(sock, id, protocol, shadow, false, false)
+        Self::spawn_child(sock, id, protocol, shadow, false, false, false)
     }
 
     /// A child that keeps its client (see [`CHILD_KEEP`]), on a terminal that
     /// reports its size in band if `in_band`, and with the fade on if `fade`.
     fn spawn_keeping(sock: &Path, id: &str, in_band: bool, fade: bool) -> Self {
-        Self::spawn_child(sock, id, Protocol::Kitty, fade, true, in_band)
+        Self::spawn_child(sock, id, Protocol::Kitty, fade, true, in_band, false)
+    }
+
+    /// A child whose client is started ahead of its first visit (see
+    /// [`CHILD_AHEAD`]) and kept, as `[client] lazy = false` leaves it with
+    /// the defaults, with the fade on if `fade`.
+    fn spawn_ahead(sock: &Path, id: &str, fade: bool) -> Self {
+        Self::spawn_child(sock, id, Protocol::Kitty, fade, true, false, true)
     }
 
     fn spawn_child(
@@ -216,6 +264,7 @@ impl Terminal {
         shadow: bool,
         keep: bool,
         in_band: bool,
+        ahead: bool,
     ) -> Self {
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize {
@@ -247,6 +296,9 @@ impl Terminal {
         }
         if keep {
             cmd.env(CHILD_KEEP, "1");
+        }
+        if ahead {
+            cmd.env(CHILD_AHEAD, "1");
         }
         let child = pair.slave.spawn_command(cmd).expect("spawn relay child");
         // Or the master would never see EOF once the child exits.
@@ -828,4 +880,118 @@ fn a_kept_clients_screen_comes_back_on_an_in_band_terminal() {
 #[test]
 fn a_kept_clients_screen_dissolves_back_in() {
     a_kept_clients_screen_comes_back("kept-fade", false, true);
+}
+
+/// `[client] lazy = false`, end to end. A client started ahead of its first
+/// visit is a UI of its session from the start, and says nothing to the
+/// terminal until that visit; then it says everything, its startup questions
+/// first, which the terminal answers late and the client acts on as though
+/// they had come at once: it draws the session's screen and turns the kitty
+/// protocol on, leaves the front and comes back as a kept client, and a
+/// prefix spelled that way detaches.
+///
+/// With the fade on (`fade`), what it kept goes through the hold, as a fresh
+/// client's first paint does, and is dissolved in.
+fn a_client_started_ahead_negotiates_on_its_first_visit(tag: &str, fade: bool) {
+    require_nvim!();
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(&common::unique(tag), &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    let marker = "started ahead, and shown at last";
+    nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
+        .expect("connect")
+        .command(&format!(
+            "setlocal noswapfile | call setline(1, '{marker}')"
+        ))
+        .expect("setline");
+
+    let mut term = Terminal::spawn_ahead(&sock, &session.id, fade);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| find(out, AHEAD).is_some()),
+        "the child never started its client; it wrote: {}",
+        term.since(0)
+    );
+    // Attached to its server, while the child still holds it.
+    assert!(
+        common::wait_until(AHEAD_FOR / 2, || {
+            nvmux::rpc::Client::connect(&sock, Duration::from_secs(2))
+                .and_then(|mut c| c.list_uis())
+                .is_ok_and(|n| n == 1)
+        }),
+        "the client started ahead never attached to its session"
+    );
+    // And not a word of it on the terminal.
+    assert!(
+        !term.pump_until(Duration::from_millis(200), |out| {
+            find(out, KITTY_QUERY).is_some()
+        }),
+        "the client's questions reached the terminal before its first visit: {}",
+        term.since(0)
+    );
+
+    // The visit: its questions asked, answered, and acted on.
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| {
+            kitty_push_flags(out).is_some_and(|flags| flags & 1 != 0)
+        }),
+        "the client never turned the kitty protocol on; got: {}",
+        term.since(0)
+    );
+    let asked = find(&term.output, KITTY_QUERY).expect("the push follows the query");
+    assert!(
+        asked > find(&term.output, AHEAD).expect("started"),
+        "the query came before the client was started ahead"
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| {
+            row_on_screen(out, 0).contains(marker)
+        }),
+        "the session's screen never came up; got: {}",
+        term.since(asked)
+    );
+
+    // Its questions answered, it is a kept client like any other from here:
+    // parked, and painted straight back.
+    term.pump_until(Duration::from_millis(300), |_| false);
+    let after = away_and_back(&mut term, |_| {});
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| {
+            find(&out[after.min(out.len())..], b"\x1b[2J").is_some()
+        }),
+        "no repaint came after the client came back; the child wrote: {}",
+        term.since(after)
+    );
+    assert!(
+        row_on_screen(&term.output, 0).contains(marker),
+        "the repainted screen is not the session's: {:?}",
+        row_on_screen(&term.output, 0)
+    );
+
+    let flags = kitty_push_flags(&term.output).unwrap_or(0);
+    let mark = term.output.len();
+    term.type_bytes(b"\x1b[32;5u");
+    if flags & 2 != 0 {
+        term.type_bytes(b"\x1b[32;5:3u");
+    }
+    term.pump_until(Duration::from_millis(150), |_| false);
+    term.type_bytes(b"d");
+    assert_eq!(
+        term.exit_code(Duration::from_secs(10)),
+        Some(0),
+        "the client started ahead did not detach; the child wrote: {}",
+        term.since(mark)
+    );
+}
+
+#[test]
+fn a_client_started_ahead_negotiates_on_its_first_visit_through_the_pty() {
+    a_client_started_ahead_negotiates_on_its_first_visit("ahead", false);
+}
+
+#[test]
+fn a_client_started_ahead_is_dissolved_in_on_its_first_visit() {
+    a_client_started_ahead_negotiates_on_its_first_visit("ahead-fade", true);
 }
