@@ -49,14 +49,15 @@
 
 pub mod app;
 pub mod attaching;
+pub mod backspace;
 pub mod complete;
 pub mod draw;
-pub mod dust;
 pub mod effects;
 pub mod help;
 pub mod landing;
 pub mod prompt;
 pub mod setup;
+pub mod sonar;
 pub mod starfield;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -494,7 +495,7 @@ fn run_loop(
 
             Request::Kill(id) => {
                 if let Some(session) = app.session(&id).cloned() {
-                    crumble(terminal, &mut app, &id, palette)?;
+                    erase(terminal, &mut app, &id, palette)?;
                     if let Err(e) = transport.kill_session(&session) {
                         app.set_message(e.one_line());
                     }
@@ -574,29 +575,29 @@ fn frame(f: &mut ratatui::Frame, app: &App, palette: Option<&crate::palette::Pal
     effects::paint(f, app, palette);
 }
 
-/// Crumble the row a kill was just confirmed for, and only then let the kill
-/// run (see [`dust`] for why not during it).
+/// Erase the row a kill was just confirmed for, and only then let the kill
+/// run (see [`backspace`] for why not during it).
 ///
 /// The row stays empty afterwards until the listing that follows the kill
 /// replaces it — or, if the kill failed, puts it back.
-fn crumble(
+fn erase(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     id: &str,
     palette: Option<&crate::palette::Palette>,
 ) -> Result<()> {
-    if !app.start_dust(id) {
+    if !app.start_backspace(id) {
         return Ok(());
     }
-    play_out(terminal, app, palette, App::dusting)
+    play_out(terminal, app, palette, App::erasing)
 }
 
 /// Draw frames until `playing` says the effect is over — for the two that
-/// must finish before the I/O they precede, the dust and the landing — and
-/// then the screen it leaves. Keys pressed meanwhile wait in the terminal's
-/// queue, as they would behind the I/O itself. Nothing playing, that last
-/// frame is the only one: the screen as it stands, for a caller about to
-/// block.
+/// must finish before the I/O they precede, the backspace and the landing —
+/// and then the screen it leaves. Keys pressed meanwhile wait in the
+/// terminal's queue, as they would behind the I/O itself. Nothing playing,
+/// that last frame is the only one: the screen as it stands, for a caller
+/// about to block.
 fn play_out(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,

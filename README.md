@@ -154,8 +154,11 @@ enabled = true   # stars off both ends of a session being moved, and its landing
 [effects.cursor]
 enabled = true   # the row the cursor leaves fades back; a glint crosses the next
 
+[effects.back]
+enabled = true   # back from a session, rings go out from its row in the picker
+
 [effects.kill]
-enabled = true   # a killed session's name crumbles into dust before it goes
+enabled = true   # a line through the name at [y/N]; then the row is erased
 
 [effects.filter]
 enabled = true   # rows a filter keystroke drops fade out before the list closes

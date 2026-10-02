@@ -265,7 +265,7 @@ fn dots(cells: usize) -> f32 {
 }
 
 /// xorshift64*: small, fast, and plenty for where some dots go. Shared with
-/// [`super::dust`], which needs no more of its randomness than this does.
+/// [`super::landing`], which needs no more of its randomness than this does.
 pub(super) struct Rng(u64);
 
 impl Rng {
