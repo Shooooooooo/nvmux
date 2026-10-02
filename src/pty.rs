@@ -482,6 +482,24 @@ impl Attachment {
         });
     }
 
+    /// Arrive without the notice saying which session this is: for an attach
+    /// out of the picker, where the user has just chosen the session by its
+    /// name and watched that name carried into it (see [`crate::handoff`]), so
+    /// a box repeating it a moment later says nothing they do not know.
+    ///
+    /// Only the name goes. A session waiting for a key keeps its notice, which
+    /// is then the one thing that says why the screen is blank — news the
+    /// picker had no way to give (see [`Attachment::note_waiting_for_a_key`]).
+    pub fn arrive_unannounced(&mut self) {
+        if self
+            .announce
+            .as_deref()
+            .is_some_and(|label| !label.ends_with(WAITING))
+        {
+            self.announce = None;
+        }
+    }
+
     /// Terminate the client, leaving the session's server running. Verified:
     /// killing a `--remote-ui` client — with SIGHUP, SIGTERM or SIGKILL — does
     /// not kill a `--headless --listen` server; the "channel closes, Nvim
@@ -4412,6 +4430,22 @@ mod tests {
         attachment.announce = None;
         attachment.note_waiting_for_a_key();
         assert_eq!(attachment.announce, None);
+    }
+
+    /// Out of the picker, the name is not announced again — but a session
+    /// waiting for a key still says so, which nothing else on the screen can.
+    #[test]
+    fn an_attach_from_the_picker_keeps_only_a_notice_with_news_in_it() {
+        let mut attachment = attached_to("while :; do read x; done");
+        attachment.announce = Some("dotfiles".to_string());
+        attachment.arrive_unannounced();
+        assert_eq!(attachment.announce, None, "the name, already seen");
+
+        attachment.announce = Some("dotfiles".to_string());
+        attachment.note_waiting_for_a_key();
+        let said = attachment.announce.clone();
+        attachment.arrive_unannounced();
+        assert_eq!(attachment.announce, said, "the key it is waiting for");
     }
 
     /// **The regression test for the attach that never came back.** A session

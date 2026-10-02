@@ -166,6 +166,10 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
         // waited for. Only a switch ever sets it, and a switch always comes
         // straight back round this loop, so it never outlives the trip.
         let mut begun: Option<Begun> = None;
+        // Whether this pass attaches out of the picker — the first, and only
+        // the first: every later one is a `<prefix>` switch, a reconnect or a
+        // session made with `<prefix> c`.
+        let mut from_picker = true;
 
         loop {
             // Everything nvmux does between the keypress and a client ready to
@@ -270,6 +274,13 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             if warm && shown.as_deref() != Some(current.id.as_str()) {
                 attachment.announce_on_arrival(announce::label(&current.name));
             }
+            // Out of the picker the user chose the session by its name, and
+            // saw it — carried across, where the hand-off is on — so the
+            // notice has nothing to add but a key the session is waiting for.
+            if from_picker {
+                attachment.arrive_unannounced();
+            }
+            from_picker = false;
             shown = Some(current.id.clone());
 
             // The relay, with the chance to start the next client while this
