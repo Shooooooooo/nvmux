@@ -158,7 +158,7 @@ enabled = true   # the row the cursor leaves fades back; a glint crosses the nex
 enabled = true   # back from a session, rings pulse from its row in the picker
 
 [effects.attach]
-enabled = true   # the picker closes onto the name; the session opens out of it
+enabled = true   # the picker closes onto the name, n/p onto the middle; the session opens out of it
 
 [effects.kill]
 enabled = true   # a line through the name at [y/N]; then the row is erased

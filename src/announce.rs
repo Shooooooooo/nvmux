@@ -505,6 +505,23 @@ fn take_frame(life: &mut Life, now: Instant) -> Option<f32> {
     Some(t)
 }
 
+/// The box's top row on a screen `rows` high: centred, with the odd slack
+/// above.
+fn top(rows: u16) -> u16 {
+    rows.saturating_sub(3) / 2
+}
+
+/// The row the notice names a session on, 0-based: the middle of the box's
+/// three, and so the middle of the screen. A `<prefix> n` or `<prefix> p`
+/// switch closes the session it leaves onto this row and opens the next out of
+/// it (see [`crate::fade::Iris`]), so the name comes up where the eye already
+/// is.
+///
+/// On a screen too short for the box this is still a row of it — its last.
+pub fn name_row(rows: u16) -> u16 {
+    (top(rows) + 1).min(rows.saturating_sub(1))
+}
+
 /// Where the box goes and what it says, worked out once.
 ///
 /// The middle, where it cannot be missed. It is squarely over the text you have
@@ -539,11 +556,11 @@ pub fn overlay(label: &str, size: PtySize) -> Option<Over> {
     // which is what integer division does and is not worth a correction nobody
     // could see.
     let left = (usize::from(size.cols) - width) / 2;
-    let top = (usize::from(size.rows) - 3) / 2;
+    let top = top(size.rows);
     let pad = " ".repeat(PAD);
     let bar = "─".repeat(inner);
     Some(Over {
-        top: u16::try_from(top).ok()?,
+        top,
         left: u16::try_from(left).ok()?,
         width: u16::try_from(width).ok()?,
         rows: vec![
@@ -1081,6 +1098,19 @@ mod tests {
             .rows
             .iter()
             .all(|r| r.width() == usize::from(over.width)));
+    }
+
+    /// The row a stepped switch closes onto is the one the name is written on,
+    /// and on a screen too small for the box it is still on the screen.
+    #[test]
+    fn the_name_row_is_the_line_the_name_stands_on() {
+        for rows in 3..60 {
+            let over = overlay("dotfiles", size(80, rows)).expect("a box");
+            assert_eq!(name_row(rows), over.top + 1, "{rows} rows");
+        }
+        assert_eq!(name_row(2), 1);
+        assert_eq!(name_row(1), 0);
+        assert_eq!(name_row(0), 0);
     }
 
     /// **The flicker this mechanism exists for.** A window repainting at sixty

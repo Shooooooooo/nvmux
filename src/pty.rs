@@ -179,6 +179,26 @@ pub enum Target {
     Step(crate::keys::Direction),
 }
 
+impl Target {
+    /// Whether a switch to this target closes the session it leaves onto the
+    /// row the notice names the next one on, and opens the next out of it (see
+    /// [`crate::fade::Iris`]): `<prefix> n` and `<prefix> p`, which change
+    /// session without naming one, so the name the notice puts up is the
+    /// news. A number names the session itself, and dissolves evenly.
+    ///
+    /// It rides `[effects.attach]` with the picker's iris, and the session's
+    /// own fade with it.
+    pub fn closes_onto_the_notice(self) -> bool {
+        self.irises(HandOff::enabled())
+    }
+
+    /// The rule itself, with the gate handed in, so it is testable without
+    /// the palette no test installs.
+    fn irises(self, enabled: bool) -> bool {
+        enabled && matches!(self, Target::Step(_))
+    }
+}
+
 /// A running `--remote-ui` client, and the PTY it is talking through.
 pub struct Attachment {
     /// Which session this client is attached to.
@@ -201,6 +221,11 @@ pub struct Attachment {
     /// not (see [`crate::handoff`]). `None` for every attach but one from the
     /// picker, and once the relay has taken it down.
     hand_off: Option<HandOff>,
+    /// Whether this attach's fade in opens out of the row the notice names
+    /// the session on, as an iris, rather than evenly: set for a `<prefix> n`
+    /// or `<prefix> p` switch (see [`Target::closes_onto_the_notice`]), and
+    /// spent by the first fade in of the relay that follows, or by its end.
+    opens_out_of_the_notice: bool,
     child: Box<dyn Child + Send + Sync>,
     master: Box<dyn MasterPty>,
     writer: Box<dyn Write + Send>,
@@ -695,10 +720,26 @@ impl Attachment {
         self.hand_off = Some(hand_off);
     }
 
+    /// Open this attach out of the row the notice will name the session on
+    /// (see [`Target::closes_onto_the_notice`]), as the one it switched from
+    /// closed onto it.
+    pub fn open_out_of_the_notice(&mut self) {
+        self.opens_out_of_the_notice = true;
+    }
+
     /// The name the picker left, as an overlay on the shadow's screen.
     fn name_over(&self, shadow: &shadow::Shadow) -> Option<shadow::Over> {
         let (rows, cols) = shadow.size();
         self.hand_off.as_ref().and_then(|h| h.over(rows, cols))
+    }
+
+    /// The row a fade in on a screen `rows` high opens out of, if it opens as
+    /// an iris: the line a name the picker left stands on, or failing one the
+    /// line the notice is about to name the session on. Spends the latter.
+    fn iris_in(&mut self, over: Option<&shadow::Over>, rows: u16) -> Option<u16> {
+        let notice = std::mem::take(&mut self.opens_out_of_the_notice);
+        over.map(|o| o.top)
+            .or_else(|| notice.then(|| announce::name_row(rows)))
     }
 
     /// Read whatever the client has written since anything last did, and show
@@ -1086,12 +1127,13 @@ impl Attachment {
                 write_stdout(&down)?;
             }
             write_stdout(&bytes[..split])?;
+            let size = self.shadow.as_ref().map(shadow::Shadow::size);
+            let over = size.and_then(|(rows, cols)| hand_off.as_ref()?.over(rows, cols));
+            let iris = size.and_then(|(rows, _)| self.iris_in(over.as_ref(), rows));
             if let Some(shadow) = self.shadow.as_mut() {
-                let (rows, cols) = shadow.size();
-                let over = hand_off.as_ref().and_then(|h| h.over(rows, cols));
                 // A frame that could not be written is not a reason to keep
                 // the paint: the replay below is what the user is waiting for.
-                dissolved = match fade::fade_in_session(shadow, over.as_ref()) {
+                dissolved = match fade::fade_in_session(shadow, over.as_ref(), iris) {
                     Ok(faded) => faded,
                     Err(e) => {
                         tracing::debug!(error = %e, "the session's fade-in did not complete");
@@ -1136,10 +1178,12 @@ impl Attachment {
             return false;
         };
         let over = self.name_over(shadow);
+        let (rows, _) = shadow.size();
+        let iris = self.iris_in(over.as_ref(), rows);
         let Some(shadow) = self.shadow.as_mut() else {
             return false;
         };
-        match fade::fade_in_session(shadow, over.as_ref()) {
+        match fade::fade_in_session(shadow, over.as_ref(), iris) {
             Ok(faded) => faded,
             Err(e) => {
                 tracing::debug!(error = %e, "the resumed session's fade-in did not complete");
@@ -2162,6 +2206,7 @@ fn spawn_client_with(
         sock: sock.to_path_buf(),
         announce: Some(announce.to_string()),
         hand_off: None,
+        opens_out_of_the_notice: false,
         child,
         master: pair.master,
         writer,
@@ -2400,6 +2445,9 @@ pub fn relay(
     if let Err(e) = attachment.release_hold(false) {
         tracing::debug!(error = %e, "could not release the held first paint");
     }
+    // Spent whether or not a fade in came to use it: the next relay of this
+    // client is a return to it, not the switch that brought it here.
+    attachment.opens_out_of_the_notice = false;
 
     match outcome {
         Ok(
@@ -2411,8 +2459,15 @@ pub fn relay(
             // below, which erases with the colour the last frame ends on. A
             // frame that could not be written must not skip the restore, so
             // its error is logged and dropped rather than propagated.
+            //
+            // A `<prefix> n` or `<prefix> p` closes onto the row the notice
+            // is about to name the next session on, which opens out of it.
+            let onto_notice = held
+                .switch_target()
+                .is_some_and(Target::closes_onto_the_notice);
             if let Some(shadow) = attachment.shadow.as_mut() {
-                if let Err(e) = fade::fade_out_session(shadow) {
+                let iris = onto_notice.then(|| announce::name_row(shadow.size().0));
+                if let Err(e) = fade::fade_out_session(shadow, iris) {
                     tracing::debug!(error = %e, "the session's fade-out did not complete");
                 }
             }
@@ -3902,6 +3957,19 @@ mod tests {
                 "{other:?} has no session to begin an attachment for"
             );
         }
+    }
+
+    /// `<prefix> n` and `<prefix> p` close onto the notice's row; a number,
+    /// which names the session itself, dissolves evenly; and neither does
+    /// without the effect — nor, so, under test, where there is no palette.
+    #[test]
+    fn only_a_step_closes_onto_the_notice() {
+        for step in [Direction::Next, Direction::Prev] {
+            assert!(Target::Step(step).irises(true));
+            assert!(!Target::Step(step).irises(false));
+            assert!(!Target::Step(step).closes_onto_the_notice());
+        }
+        assert!(!Target::Number(3).irises(true));
     }
 
     /// Exactly one outcome reaches the next session without a screen on the

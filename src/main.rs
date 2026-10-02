@@ -170,6 +170,10 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
         // the first: every later one is a `<prefix>` switch, a reconnect or a
         // session made with `<prefix> c`.
         let mut from_picker = true;
+        // Whether the switch that ended the last relay closed onto the row
+        // the notice names a session on, so the next attach opens out of it
+        // (see `pty::Target::closes_onto_the_notice`). Spent by that attach.
+        let mut onto_notice = false;
 
         loop {
             // Everything nvmux does between the keypress and a client ready to
@@ -266,6 +270,9 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             };
             if let Some(h) = hand_off.take() {
                 attachment.carry_name(h);
+            }
+            if std::mem::take(&mut onto_notice) {
+                attachment.open_out_of_the_notice();
             }
             // A fresh client announces itself from the moment it is spawned. A
             // kept one has only to say so when it is not the session the user
@@ -396,6 +403,11 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     // or a cycle with nowhere to go — puts the user straight
                     // back where they were.
                     attached = pool.set_aside(held);
+                    // Taken here rather than from whichever session the
+                    // switch lands on: the relay just closed onto the row, so
+                    // whatever comes next — the same session, when there is
+                    // nowhere to go — opens out of it.
+                    onto_notice = target.closes_onto_the_notice();
                     // Already resolved, and already started: the dissolve that
                     // has just finished ran over the top of its fork and its
                     // probe. Nothing left to look up.

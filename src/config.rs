@@ -172,7 +172,8 @@ impl EffectsSettings {
     }
 
     /// Whether an attach from the picker hands the session's name across to
-    /// the session: its own switch and the master one. It rides the fade's
+    /// the session, and a `<prefix> n` or `<prefix> p` closes onto the
+    /// notice's row: its own switch and the master one. It rides the fade's
     /// frames, so the fade decides the rest (see [`crate::handoff`]).
     pub fn attach_enabled(&self) -> bool {
         self.enabled && self.attach.enabled
@@ -284,12 +285,14 @@ pub struct BackSettings {
 /// bottom onto the chosen row with the session's name kept on the screen,
 /// through the client's start, and the session opening out of that line as
 /// the name dissolves into it (see [`crate::handoff`] and
-/// [`crate::fade::Iris`]).
+/// [`crate::fade::Iris`]). And the same iris for `<prefix> n` and
+/// `<prefix> p`: the session being left closes onto the middle row, where the
+/// notice names the next, and the next opens out of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AttachSettings {
     /// This effect's own switch, under `[effects] enabled`. Off, the picker
-    /// dissolves whole, as it did.
+    /// and a session switched away from dissolve whole, as they did.
     ///
     /// It adds no frame of its own, only changes what the fade's frames show,
     /// so it needs the fade on and `[effects.fade] session` with it; with
@@ -690,6 +693,8 @@ fn render_default_config(prefix: u8) -> String {
          [effects.attach]\n\
          # An attach from the picker closes onto the chosen row, keeping the\n\
          # session's name on screen, and opens the session out of that line.\n\
+         # <prefix> n and <prefix> p close onto the middle row, where the\n\
+         # notice names the next session, and open it out of that line.\n\
          # Rides the fade, so it needs [effects.fade] on, with session.\n\
          # enabled = {attach_enabled}\n\
          \n\

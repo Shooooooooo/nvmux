@@ -168,9 +168,15 @@ pub enum Direction {
 }
 
 /// A fade shaped around one row: an iris, closing onto that row on the way
-/// out and opening out of it on the way in. An attach from the picker's (see
-/// [`crate::handoff`]): the picker closes onto the row of the session chosen,
-/// and the session opens out of the line its name stands on.
+/// out and opening out of it on the way in. Two changes of session have one:
+///
+/// * An attach from the picker (see [`crate::handoff`]): the picker closes
+///   onto the row of the session chosen, and the session opens out of the
+///   line its name stands on.
+/// * `<prefix> n` and `<prefix> p`: the session being left closes onto the
+///   row the notice will name the next one on, and the next opens out of it
+///   (see [`crate::announce::name_row`]), so the eye is already where the
+///   name comes up.
 ///
 /// Every row still goes the whole way, and on the same clock: an iris only
 /// says *when* in the fade each row does its part. Closing, the rows furthest
@@ -456,8 +462,11 @@ where
 /// colour — which nvmux already emits on every resize and resume. The last
 /// frame has every visible cell at the background colour, which is what the
 /// hand-off's erase paints next, so the seam is flat.
-pub fn fade_out_session(shadow: &mut Shadow) -> io::Result<()> {
-    run_session(shadow, Direction::Out, None).map(|_| ())
+///
+/// With `iris`, the screen closes as an [`Iris`] onto that row rather than
+/// evenly: the rows furthest from it first, its own last.
+pub fn fade_out_session(shadow: &mut Shadow, iris: Option<u16>) -> io::Result<()> {
+    run_session(shadow, Direction::Out, None, iris).map(|_| ())
 }
 
 /// Dissolve an attached session's screen up out of the background, from the
@@ -471,14 +480,25 @@ pub fn fade_out_session(shadow: &mut Shadow) -> io::Result<()> {
 ///
 /// `over` is drawn over every frame, dissolving out as the session dissolves
 /// in: the name the picker handed off (see [`crate::handoff`]), fully drawn on
-/// the first frame and gone on the last. With it, the session comes back as an
-/// [`Iris`] opening out of the line the name stands on: that line first, the
-/// rows furthest from it last.
-pub fn fade_in_session(shadow: &mut Shadow, over: Option<&Over>) -> io::Result<bool> {
-    run_session(shadow, Direction::In, over)
+/// the first frame and gone on the last.
+///
+/// With `iris`, the session comes back as an [`Iris`] opening out of that
+/// row — the line the name stands on, or the one the notice is about to name
+/// it on: that line first, the rows furthest from it last.
+pub fn fade_in_session(
+    shadow: &mut Shadow,
+    over: Option<&Over>,
+    iris: Option<u16>,
+) -> io::Result<bool> {
+    run_session(shadow, Direction::In, over, iris)
 }
 
-fn run_session(shadow: &mut Shadow, direction: Direction, over: Option<&Over>) -> io::Result<bool> {
+fn run_session(
+    shadow: &mut Shadow,
+    direction: Direction,
+    over: Option<&Over>,
+    iris: Option<u16>,
+) -> io::Result<bool> {
     let Some(palette) = active() else {
         return Ok(false);
     };
@@ -488,7 +508,7 @@ fn run_session(shadow: &mut Shadow, direction: Direction, over: Option<&Over>) -
     let mut out = io::stdout().lock();
     let mut schedule = Schedule::start(one_way(), direction, Instant::now());
     let (rows, _) = shadow.size();
-    let iris = over.map(|o| Iris::new(o.top, rows));
+    let iris = iris.map(|row| Iris::new(row, rows));
     while let Some(t) = schedule.next(Instant::now()) {
         let cursor = cursor_for(direction, schedule.finished());
         let dissolve = |row: u16| iris.map_or(t, |iris| iris.at(direction, t, row));
