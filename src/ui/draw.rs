@@ -5,9 +5,9 @@
 //!
 //! Nothing here sets a foreground or background colour. Every distinction is
 //! carried by a *modifier* — reversed and bold for the selection, dim for the
-//! hint line — which means the picker uses the terminal's own palette, inherits
-//! its background, and is `NO_COLOR`-correct by construction rather than by
-//! remembering to check a flag at each call site.
+//! hint line and the row numbers — which means the picker uses the terminal's
+//! own palette, inherits its background, and is `NO_COLOR`-correct by
+//! construction rather than by remembering to check a flag at each call site.
 //!
 //! This matters more than it looks. crossterm's own `NO_COLOR` handling turns
 //! `SetForegroundColor(c)` into a bare `ESC[m`, which is a *full SGR reset*: it
@@ -214,9 +214,20 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default()
             };
             let marked = app.matched(&row.session.name);
+            let head = head(row.session, selected, reordering, num_width);
+            // The number is dim beside the name it stands for, except in the
+            // selection's bar: bold and dim share one reset, and most
+            // terminals cannot show both, so dimming it there would break the
+            // bar rather than quieten the number.
+            let num = if selected {
+                0..0
+            } else {
+                MARKER.chars().count()..head.chars().count() - NUM_GAP.chars().count()
+            };
             row_line(
-                &head(row.session, selected, reordering, num_width),
+                &head,
                 &row.session.name,
+                num,
                 &marked,
                 block.width as usize,
                 style,
@@ -321,31 +332,44 @@ fn head(
     format!("{prefix}{num:>num_width$}{NUM_GAP}")
 }
 
-/// One row, cut to `width`, with the letters of the name at the `char` indices
-/// in `marked` underlined — the letters the filter matched (see
-/// [`App::matched`]). Underline is a modifier, so this still sets no colour,
-/// and it sits on top of the row's own style, the selection's bar included.
-fn row_line(head: &str, name: &str, marked: &[usize], width: usize, style: Style) -> Line<'static> {
+/// One row, cut to `width`, with the characters at the `char` indices in
+/// `dim` dimmed — the number column — and the letters of the name at the
+/// `char` indices in `marked` underlined — the letters the filter matched (see
+/// [`App::matched`]). Dim and underline are modifiers, so this still sets no
+/// colour, and both sit on top of the row's own style.
+fn row_line(
+    head: &str,
+    name: &str,
+    dim: std::ops::Range<usize>,
+    marked: &[usize],
+    width: usize,
+    style: Style,
+) -> Line<'static> {
     let text = truncate(&format!("{head}{name}"), width);
-    if marked.is_empty() {
-        return Line::from(Span::styled(text, style));
-    }
     let skip = head.chars().count();
-    let underlined = style.add_modifier(Modifier::UNDERLINED);
+    let style_at = |i: usize| {
+        let mut style = style;
+        if dim.contains(&i) {
+            style = style.add_modifier(Modifier::DIM);
+        }
+        if i >= skip && marked.binary_search(&(i - skip)).is_ok() {
+            style = style.add_modifier(Modifier::UNDERLINED);
+        }
+        style
+    };
     let mut spans = Vec::new();
     let mut run = String::new();
-    let mut in_match = false;
+    let mut run_style = style_at(0);
     for (i, c) in text.chars().enumerate() {
-        let matched = i >= skip && marked.binary_search(&(i - skip)).is_ok();
-        if matched != in_match && !run.is_empty() {
-            let style = if in_match { underlined } else { style };
-            spans.push(Span::styled(std::mem::take(&mut run), style));
+        let here = style_at(i);
+        if here != run_style && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), run_style));
         }
-        in_match = matched;
+        run_style = here;
         run.push(c);
     }
-    if !run.is_empty() {
-        spans.push(Span::styled(run, if in_match { underlined } else { style }));
+    if !run.is_empty() || spans.is_empty() {
+        spans.push(Span::styled(run, run_style));
     }
     Line::from(spans)
 }
@@ -1478,6 +1502,29 @@ mod tests {
             .content
             .iter()
             .all(|c| !c.modifier.contains(Modifier::UNDERLINED)));
+    }
+
+    /// The number is dim beside its name on every row but the selected one,
+    /// whose bar stays whole; the names themselves are never dimmed.
+    #[test]
+    fn the_numbers_are_dim_except_in_the_selection() {
+        let mut a = app(&["api-server", "dotfiles"]);
+        a.set_effects(false);
+        let buf = test_support::buffer(40, 6, |f| draw(f, &a));
+        let lines = render(&a, 40, 6);
+        for (name, num, dim) in [("api-server", "1", false), ("dotfiles", "2", true)] {
+            let y = line_of(&lines, name);
+            let line = &lines[y as usize];
+            let x = line[..line.find(name).unwrap()]
+                .rfind(num)
+                .map(|at| line[..at].chars().count() as u16)
+                .expect("the number is on the row");
+            assert_eq!(buf[(x, y)].modifier.contains(Modifier::DIM), dim, "{name}");
+            assert!(name_cells(&buf, y, name)
+                .iter()
+                .all(|c| !c.modifier.contains(Modifier::DIM)));
+        }
+        test_support::assert_no_colour(40, 6, |f| draw(f, &a));
     }
 
     // --- rows fading out of a filter ----------------------------------------
