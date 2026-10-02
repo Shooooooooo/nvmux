@@ -624,7 +624,8 @@ impl App {
 
     /// Pick the session `id` up — the space bar and a drag both come here — with
     /// the arrangement as it stands, for `Esc` to put back, and fresh trails
-    /// off both ends of it.
+    /// off both ends of it, which catch rather than appear whole (see
+    /// [`Starfield::ignite`]).
     fn pick_up(&mut self, id: String) {
         let was = self.snapshot();
         // A grab holds an arrangement of the visible rows; nothing else may be
@@ -632,8 +633,8 @@ impl App {
         self.leaving = None;
         self.mode = Mode::Reorder { id, was };
         if self.trail {
-            self.after.scatter(starfield::TRAIL);
-            self.before.scatter(starfield::TRAIL);
+            self.after.ignite(starfield::TRAIL);
+            self.before.ignite(starfield::TRAIL);
         }
     }
 
