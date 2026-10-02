@@ -354,13 +354,31 @@ fn run_loop(
     // What the effects paint with, if they paint in colour: asked once, since
     // neither the answer nor `NO_COLOR` changes for the run.
     let palette = effects::palette();
+    // When the loop last drew, and the area it drew: `None` until its first
+    // frame, which is always drawn.
+    let mut drawn: Option<Instant> = None;
+    let mut area = ratatui::layout::Rect::default();
 
     loop {
         tick(&mut app, &mut ticked);
 
-        // The area kept for the mouse: a click is resolved against the screen
-        // as it was last drawn, which is the one the user clicked on.
-        let area = terminal.draw(|f| frame(f, &app, palette))?.area;
+        // Input already waiting is taken before the screen is drawn again, so
+        // a frame answers everything that came in while the last one was going
+        // out rather than one key of it. One frame a key holds the picker to
+        // the terminal's pace, and a held key repeats faster than some
+        // terminals take a frame: the repeats queue behind the frames, and the
+        // session in flight goes on moving after the key comes up, for longer
+        // the longer it was held. Never more than a frame's time without a
+        // draw, though, so input that does not pause — the pointer sweeping
+        // the list — still sees the screen follow it.
+        let waiting = event::poll(Duration::ZERO)?;
+        if !waiting || drawn.is_none_or(|at| at.elapsed() >= crate::fade::FRAME) {
+            // The area kept for the mouse: a click is resolved against the
+            // screen as it was last drawn, which is the one the user clicked
+            // on.
+            area = terminal.draw(|f| frame(f, &app, palette))?.area;
+            drawn = Some(Instant::now());
+        }
 
         // A frame's wait while anything is moving, so it moves; the rest of the
         // time — and all the time, with the effects switched off in
@@ -371,7 +389,7 @@ fn run_loop(
         } else {
             TICK
         };
-        if !event::poll(tick_for)? {
+        if !waiting && !event::poll(tick_for)? {
             // The clock lives here rather than in `App`, which stays pure —
             // the same split `pty::pump` uses for `keys::Prefix`.
             if deadline.is_some_and(|d| Instant::now() >= d) {
@@ -401,8 +419,17 @@ fn run_loop(
         };
         // A session just put down lands before anything is written: the
         // renumber that follows blocks over ssh, and the landing is the
-        // answer to the key, so it comes first.
-        play_out(terminal, &mut app, palette, |app| app.landing().is_some())?;
+        // answer to the key, so it comes first. Any other request that blocks
+        // is drawn first too, so the screen does not sit on the key's question
+        // — a `[y/N]`, a session in flight — through the I/O.
+        //
+        // A key that asks for nothing blocks on nothing, and the loop draws
+        // next. A frame here as well would be a second for the same key —
+        // with a session in flight, every arrow — and a second chance for a
+        // held key to fall behind the screen.
+        if app.landing().is_some() || request != Request::None {
+            play_out(terminal, &mut app, palette, |app| app.landing().is_some())?;
+        }
         deadline = app
             .pending()
             .is_some()
@@ -522,9 +549,11 @@ fn crumble(
 }
 
 /// Draw frames until `playing` says the effect is over — for the two that
-/// must finish before the I/O they precede, the dust and the landing. Keys
-/// pressed meanwhile wait in the terminal's queue, as they would behind the
-/// I/O itself. Nothing playing, nothing drawn.
+/// must finish before the I/O they precede, the dust and the landing — and
+/// then the screen it leaves. Keys pressed meanwhile wait in the terminal's
+/// queue, as they would behind the I/O itself. Nothing playing, that last
+/// frame is the only one: the screen as it stands, for a caller about to
+/// block.
 fn play_out(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
