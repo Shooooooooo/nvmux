@@ -358,6 +358,10 @@ fn run_loop(
     // frame, which is always drawn.
     let mut drawn: Option<Instant> = None;
     let mut area = ratatui::layout::Rect::default();
+    // Whether a frame that moves waits for the terminal to have taken it (see
+    // `caught_up`). Given up for the rest of the run the first time the
+    // terminal does not answer.
+    let mut paced = true;
 
     loop {
         tick(&mut app, &mut ticked);
@@ -377,6 +381,11 @@ fn run_loop(
             // screen as it was last drawn, which is the one the user clicked
             // on.
             area = terminal.draw(|f| frame(f, &app, palette))?.area;
+            // While anything is moving a frame goes out every `FRAME` whether
+            // or not a key asked for one, and the terminal has to keep up.
+            if paced && app.animating() {
+                paced = caught_up();
+            }
             drawn = Some(Instant::now());
         }
 
@@ -514,6 +523,40 @@ fn run_loop(
             }
 
             Request::Help => help::run_on(terminal, false)?,
+        }
+    }
+}
+
+/// Wait for the terminal to have got through everything written to it.
+///
+/// A terminal reads what it is sent as it arrives and works through it at its
+/// own pace. While a session is in flight its trail sends a frame every
+/// [`crate::fade::FRAME`], and a terminal that takes nearly that long over each
+/// keeps up with the trail alone, but not with the extra frames a held key
+/// adds. It falls behind during the hold and, the trail still coming, barely
+/// gains on the backlog afterwards. The session goes on moving after the key
+/// comes up, and every key after it waits its turn behind frames already
+/// out of date — until `Enter` puts the session down and the frames stop.
+/// Before the hold, the same terminal was keeping up and a key was instant.
+///
+/// Asking where the cursor is says when the terminal has caught up: it
+/// answers in turn, once it has got that far through what it was sent. Waiting
+/// for the answer after each frame keeps one frame in flight, so frames go no
+/// faster than the terminal takes them and no key is ever more than a frame
+/// behind. Keys that arrive meanwhile are set aside by crossterm and handed
+/// back to the loop, which takes them all before its next frame.
+///
+/// Nothing new to ask of a terminal: [`Screen::open`] has already asked it
+/// the same thing, through ratatui's `clear`, to get the picker on screen at
+/// all. Still, false when it did not answer within crossterm's two seconds,
+/// and it is not asked again: an unanswered question would cost that wait on
+/// every frame, and an unpaced trail is only what the picker had before.
+fn caught_up() -> bool {
+    match ratatui::crossterm::cursor::position() {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "the terminal did not say where its cursor is; frames go unpaced");
+            false
         }
     }
 }
