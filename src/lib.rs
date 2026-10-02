@@ -22,6 +22,7 @@ pub mod config;
 pub mod dirs;
 pub mod error;
 pub mod fade;
+pub mod handoff;
 pub mod hint;
 pub mod ids;
 pub mod keys;

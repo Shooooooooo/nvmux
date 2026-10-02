@@ -7,6 +7,12 @@
 //! through without looking at them, so there is nothing to composite into and
 //! nothing to read back.
 //!
+//! An attach out of the picker is the one change of session that goes without
+//! it: the user has just chosen the session there by its name, so the box
+//! would only repeat it — unless the session is waiting for a key, which the
+//! box is then the one thing to say (see
+//! [`crate::pty::Attachment::arrive_unannounced`]).
+//!
 //! So nvmux writes a box over the session's screen itself, and
 //! [`crate::pty`]'s `repaint` then puts back what it covered — the same request
 //! a resume makes, since only the server knows what was underneath. No editor
