@@ -59,7 +59,9 @@ fn run(cli: &Cli) -> Result<()> {
     // the config, so a user who turned the fade off never pays for the question
     // or the keystroke it can cost (see `palette::query`); before any screen
     // that would fade; and after the first-run screen, which does not.
-    if fade::configured() {
+    // The picker's afterglow and filter fade paint in colour too, so they ask
+    // even with the fade off.
+    if fade::configured() || nvmux::ui::effects::want_palette() {
         palette::init(palette::query());
     }
 

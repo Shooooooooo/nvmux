@@ -42,15 +42,19 @@
 //! inherited attributes first, which is the one place that can: every screen is
 //! taken through it.
 //!
-//! The fade ([`crate::fade`]) is the one thing that paints a colour on these
-//! screens, and it does so as a post-pass over a finished frame, never inside
-//! a `draw`: a screen's own drawing stays colourless, and its tests say so.
+//! The fade ([`crate::fade`]) and the picker's passing effects ([`effects`])
+//! are the only things that paint a colour on these screens, and they do so as
+//! a post-pass over a finished frame, never inside a `draw`: a screen's own
+//! drawing stays colourless, and its tests say so.
 
 pub mod app;
 pub mod attaching;
 pub mod complete;
 pub mod draw;
+pub mod dust;
+pub mod effects;
 pub mod help;
+pub mod landing;
 pub mod prompt;
 pub mod setup;
 pub mod starfield;
@@ -343,29 +347,31 @@ fn run_loop(
     // unambiguous digit on its own, so this is only ever set when one number is
     // a prefix of another — sessions 1 and 12 both present.
     let mut deadline: Option<Instant> = None;
-    // When the trail behind a session in flight was last moved on. The clock
-    // lives here for the same reason the digit deadline does.
+    // When whatever is moving on the picker — a trail, a glow, a fading row —
+    // was last moved on. The clock lives here for the same reason the digit
+    // deadline does.
     let mut ticked = Instant::now();
+    // What the effects paint with, if they paint in colour: asked once, since
+    // neither the answer nor `NO_COLOR` changes for the run.
+    let palette = effects::palette();
 
     loop {
-        let now = Instant::now();
-        app.tick(now - ticked);
-        ticked = now;
+        tick(&mut app, &mut ticked);
 
         // The area kept for the mouse: a click is resolved against the screen
         // as it was last drawn, which is the one the user clicked on.
-        let area = terminal.draw(|f| draw::draw(f, &app))?.area;
+        let area = terminal.draw(|f| frame(f, &app, palette))?.area;
 
-        // A frame's wait while a session in flight is trailing stars, so they
-        // move; the rest of the time — and all the time, with the effect
-        // switched off in `[effects]` — the picker changes on a key and nothing
-        // else, and waits the ordinary tick.
-        let tick = if app.trailing() {
+        // A frame's wait while anything is moving, so it moves; the rest of the
+        // time — and all the time, with the effects switched off in
+        // `[effects]` — the picker changes on a key and nothing else, and
+        // waits the ordinary tick.
+        let tick_for = if app.animating() {
             crate::fade::FRAME
         } else {
             TICK
         };
-        if !event::poll(tick)? {
+        if !event::poll(tick_for)? {
             // The clock lives here rather than in `App`, which stays pure —
             // the same split `pty::pump` uses for `keys::Prefix`.
             if deadline.is_some_and(|d| Instant::now() >= d) {
@@ -378,7 +384,12 @@ fn run_loop(
             }
             continue;
         }
-        let request = match event::read()? {
+        let event = event::read()?;
+        // Up to the moment of the event, so what it starts — a glow, a fade —
+        // starts from nothing rather than from however long the wait for it
+        // took.
+        tick(&mut app, &mut ticked);
+        let request = match event {
             Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(translate(k)),
             Event::Mouse(m) => {
                 match translate_mouse(m, draw::row_at(&app, area, m.column, m.row)) {
@@ -388,6 +399,10 @@ fn run_loop(
             }
             _ => continue,
         };
+        // A session just put down lands before anything is written: the
+        // renumber that follows blocks over ssh, and the landing is the
+        // answer to the key, so it comes first.
+        play_out(terminal, &mut app, palette, |app| app.landing().is_some())?;
         deadline = app
             .pending()
             .is_some()
@@ -443,6 +458,7 @@ fn run_loop(
 
             Request::Kill(id) => {
                 if let Some(session) = app.session(&id).cloned() {
+                    crumble(terminal, &mut app, &id, palette)?;
                     if let Err(e) = transport.kill_session(&session) {
                         app.set_message(e.one_line());
                     }
@@ -473,6 +489,56 @@ fn run_loop(
             Request::Help => help::run_on(terminal, false)?,
         }
     }
+}
+
+/// Move whatever is passing on the picker on to now.
+fn tick(app: &mut App, ticked: &mut Instant) {
+    let now = Instant::now();
+    app.tick(now - *ticked);
+    *ticked = now;
+}
+
+/// One frame of the picker: the screen, then whatever is passing over it.
+fn frame(f: &mut ratatui::Frame, app: &App, palette: Option<&crate::palette::Palette>) {
+    draw::draw(f, app);
+    effects::paint(f, app, palette);
+}
+
+/// Crumble the row a kill was just confirmed for, and only then let the kill
+/// run (see [`dust`] for why not during it).
+///
+/// The row stays empty afterwards until the listing that follows the kill
+/// replaces it — or, if the kill failed, puts it back.
+fn crumble(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    id: &str,
+    palette: Option<&crate::palette::Palette>,
+) -> Result<()> {
+    if !app.start_dust(id) {
+        return Ok(());
+    }
+    play_out(terminal, app, palette, App::dusting)
+}
+
+/// Draw frames until `playing` says the effect is over — for the two that
+/// must finish before the I/O they precede, the dust and the landing. Keys
+/// pressed meanwhile wait in the terminal's queue, as they would behind the
+/// I/O itself. Nothing playing, nothing drawn.
+fn play_out(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    palette: Option<&crate::palette::Palette>,
+    playing: impl Fn(&App) -> bool,
+) -> Result<()> {
+    let mut ticked = Instant::now();
+    while playing(app) {
+        terminal.draw(|f| frame(f, app, palette))?;
+        std::thread::sleep(crate::fade::FRAME);
+        tick(app, &mut ticked);
+    }
+    terminal.draw(|f| frame(f, app, palette))?;
+    Ok(())
 }
 
 /// Leave the picker for `session`: dissolve the screen out, then hand back the
