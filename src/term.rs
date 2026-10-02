@@ -437,9 +437,85 @@ pub fn enter_alt_screen_and_clear() {
     let _ = write_stdout(RESUME);
 }
 
+/// Opens and closes a synchronized update; [`HANDOVER`] and [`RESUME`] both
+/// begin by closing one.
+const SPAN_BEGIN: &[u8] = b"\x1b[?2026h";
+const SPAN_END: &[u8] = b"\x1b[?2026l";
+
+/// [`leave_alt_screen_and_clear`], with `keep` drawn on the cleared screen in
+/// the same synchronized update, so the terminal never presents the clear
+/// without it. For the picker, which leaves the name of the session it is
+/// attaching to standing (see [`crate::handoff`]).
+pub fn leave_alt_screen_and_clear_keeping(keep: &[u8]) {
+    let _ = write_stdout(&leaving_keeping(keep));
+}
+
+fn leaving_keeping(keep: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HANDOVER.len() + keep.len() + 2 * SPAN_BEGIN.len());
+    out.extend_from_slice(SPAN_END);
+    out.extend_from_slice(SPAN_BEGIN);
+    out.extend_from_slice(&HANDOVER[SPAN_END.len()..]);
+    out.extend_from_slice(keep);
+    out.extend_from_slice(SPAN_END);
+    out
+}
+
+/// [`enter_alt_screen_and_clear`], with `first` written on the screen being
+/// left, and the synchronized update this opens left open: the caller's next
+/// frame — a dissolve's first, drawing again on the new screen what `first`
+/// took off the old one — is what closes it, so the terminal presents the
+/// switch and that frame as one. A caller with no such frame closes it with
+/// [`end_span`].
+pub(crate) fn enter_alt_screen_and_clear_after(first: &[u8]) {
+    let _ = write_stdout(&entering_after(first));
+}
+
+fn entering_after(first: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(RESUME.len() + first.len() + SPAN_BEGIN.len());
+    out.extend_from_slice(SPAN_BEGIN);
+    out.extend_from_slice(first);
+    out.extend_from_slice(&RESUME[SPAN_END.len()..]);
+    out
+}
+
+/// Close a synchronized update left open by
+/// [`enter_alt_screen_and_clear_after`].
+pub(crate) fn end_span() {
+    let _ = write_stdout(SPAN_END);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both switches begin by closing a span, which the variants rely on to
+    /// cut it off and open their own.
+    #[test]
+    fn the_switches_begin_by_closing_a_span() {
+        assert!(HANDOVER.starts_with(SPAN_END));
+        assert!(RESUME.starts_with(SPAN_END));
+    }
+
+    /// Leaving with a name kept: the leave, the clear and the name all inside
+    /// one span, so the clear is never presented without the name.
+    #[test]
+    fn leaving_keeps_the_name_inside_the_one_span() {
+        let out = leaving_keeping(b"NAME");
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text,
+            "\x1b[?2026l\x1b[?2026h\x1b[0m\x1b[?1049l\x1b[2J\x1b[HNAME\x1b[?2026l"
+        );
+    }
+
+    /// Entering after an erase: the erase lands before the switch, on the
+    /// screen being left, and the span is left open for the caller's frame.
+    #[test]
+    fn entering_erases_first_and_leaves_the_span_open() {
+        let text = String::from_utf8(entering_after(b"ERASE")).unwrap();
+        assert_eq!(text, "\x1b[?2026hERASE\x1b[0m\x1b[?1049h\x1b[2J\x1b[H");
+        assert!(!text.ends_with("\x1b[?2026l"));
+    }
     use crate::test_support::{contains, position};
 
     /// The two resets must go on agreeing about what a cut-off client leaves

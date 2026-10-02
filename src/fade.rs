@@ -46,11 +46,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::palette::{self, Palette, Rgb};
-use crate::shadow::{Cursor, Shadow};
+use crate::shadow::{Cursor, Over, Shadow};
 
 /// A synchronized update: the terminal presents nothing between these, so a
 /// frame is never seen half-composited. Opening one inside another is
@@ -252,13 +253,78 @@ pub fn apply(buf: &mut Buffer, palette: &Palette, t: f32) {
     if t <= 0.0 {
         return;
     }
-    let fg = palette.fg.lerp(palette.bg, t);
-    let colour = Color::Rgb(fg.0, fg.1, fg.2);
+    let colour = dissolved(palette, t);
     for cell in &mut buf.content {
-        let shows = !cell.symbol().trim().is_empty() || cell.modifier.contains(Modifier::REVERSED);
-        if shows {
-            cell.set_fg(colour);
+        sink(cell, colour);
+    }
+}
+
+/// [`apply`], except for the cells of `keep`, which are handed off rather
+/// than dissolved (see [`crate::handoff`]). A kept cell on the selection's
+/// bar comes off it as `t` goes, and on the last frame is plain text in the
+/// terminal's own colours — the very cell the screen the picker leaves behind
+/// draws it as. A kept cell that was not on a bar is left as it was drawn.
+///
+/// The bar under the text sinks into the background, and the text is
+/// whichever end of the two colours stands out from it: the background's, as
+/// on the bar, until the bar is halfway down, and the foreground's after, when
+/// its bold and underline go with it. Fading the text up while the bar fades
+/// down would be the obvious move and is the wrong one — the two cross
+/// halfway, and on that frame the name is the bar's own colour and gone. This
+/// way it never stands out from the bar by less than half.
+///
+/// The colours are set outright until the last frame: a bar is drawn
+/// reversed, and its text can only be given a colour of its own once the
+/// reverse is off. The last frame puts the terminal's own back, so a
+/// transparent background ends transparent.
+pub fn apply_keeping(buf: &mut Buffer, palette: &Palette, t: f32, keep: Rect) {
+    let colour = dissolved(palette, t);
+    let area = buf.area;
+    for (i, cell) in buf.content.iter_mut().enumerate() {
+        let i = u16::try_from(i).unwrap_or(u16::MAX);
+        let (x, y) = (area.x + i % area.width, area.y + i / area.width);
+        let kept = x >= keep.x && x < keep.right() && y >= keep.y && y < keep.bottom();
+        if !kept {
+            if t > 0.0 {
+                sink(cell, colour);
+            }
+            continue;
         }
+        if !cell.modifier.contains(Modifier::REVERSED) {
+            continue;
+        }
+        if t >= 1.0 {
+            cell.modifier
+                .remove(Modifier::REVERSED | Modifier::BOLD | Modifier::UNDERLINED);
+            cell.set_fg(Color::Reset);
+            cell.set_bg(Color::Reset);
+            continue;
+        }
+        cell.modifier.remove(Modifier::REVERSED);
+        let text = if t < 0.5 {
+            palette.bg
+        } else {
+            cell.modifier.remove(Modifier::BOLD | Modifier::UNDERLINED);
+            palette.fg
+        };
+        let bar = palette.fg.lerp(palette.bg, t);
+        cell.set_fg(Color::Rgb(text.0, text.1, text.2));
+        cell.set_bg(Color::Rgb(bar.0, bar.1, bar.2));
+    }
+}
+
+/// The foreground a cell shows `t` of the way into the background.
+fn dissolved(palette: &Palette, t: f32) -> Color {
+    let fg = palette.fg.lerp(palette.bg, t);
+    Color::Rgb(fg.0, fg.1, fg.2)
+}
+
+/// One cell of [`apply`]: its foreground set to `colour`, if it shows
+/// anything — a glyph, or a reversed blank, which shows its background.
+fn sink(cell: &mut ratatui::buffer::Cell, colour: Color) {
+    let shows = !cell.symbol().trim().is_empty() || cell.modifier.contains(Modifier::REVERSED);
+    if shows {
+        cell.set_fg(colour);
     }
 }
 
@@ -268,7 +334,7 @@ pub fn fade_in<F>(terminal: &mut DefaultTerminal, draw: F) -> io::Result<()>
 where
     F: FnMut(&mut Frame),
 {
-    run(terminal, draw, Direction::In)
+    run(terminal, draw, Direction::In, None)
 }
 
 /// Dissolve a ratatui screen out into the background. Ends fully dissolved,
@@ -278,10 +344,26 @@ pub fn fade_out<F>(terminal: &mut DefaultTerminal, draw: F) -> io::Result<()>
 where
     F: FnMut(&mut Frame),
 {
-    run(terminal, draw, Direction::Out)
+    run(terminal, draw, Direction::Out, None)
 }
 
-fn run<F>(terminal: &mut DefaultTerminal, mut draw: F, direction: Direction) -> io::Result<()>
+/// [`fade_out`], handing the cells of `keep` off rather than dissolving them
+/// (see [`apply_keeping`]): the picker's, for the name of the session it is
+/// attaching to. Ends with everything else dissolved and the name standing as
+/// plain text.
+pub fn fade_out_keeping<F>(terminal: &mut DefaultTerminal, draw: F, keep: Rect) -> io::Result<()>
+where
+    F: FnMut(&mut Frame),
+{
+    run(terminal, draw, Direction::Out, Some(keep))
+}
+
+fn run<F>(
+    terminal: &mut DefaultTerminal,
+    mut draw: F,
+    direction: Direction,
+    keep: Option<Rect>,
+) -> io::Result<()>
 where
     F: FnMut(&mut Frame),
 {
@@ -293,7 +375,10 @@ where
         crate::term::write_stdout(SYNC_BEGIN)?;
         terminal.draw(|f| {
             draw(f);
-            apply(f.buffer_mut(), palette, t);
+            match keep {
+                Some(keep) => apply_keeping(f.buffer_mut(), palette, t, keep),
+                None => apply(f.buffer_mut(), palette, t),
+            }
         })?;
         crate::term::write_stdout(SYNC_END)?;
         if !schedule.finished() {
@@ -312,7 +397,7 @@ where
 /// frame has every visible cell at the background colour, which is what the
 /// hand-off's erase paints next, so the seam is flat.
 pub fn fade_out_session(shadow: &mut Shadow) -> io::Result<()> {
-    run_session(shadow, Direction::Out).map(|_| ())
+    run_session(shadow, Direction::Out, None).map(|_| ())
 }
 
 /// Dissolve an attached session's screen up out of the background, from the
@@ -323,11 +408,15 @@ pub fn fade_out_session(shadow: &mut Shadow) -> io::Result<()> {
 /// of it, which is close but not the client's own — with the cursor back on
 /// its cell (see [`Cursor::Restored`]). What the client wrote is written
 /// after it, so its rendering is what stays.
-pub fn fade_in_session(shadow: &mut Shadow) -> io::Result<bool> {
-    run_session(shadow, Direction::In)
+///
+/// `over` is drawn over every frame, dissolving out as the session dissolves
+/// in: the name the picker handed off (see [`crate::handoff`]), fully drawn on
+/// the first frame and gone on the last.
+pub fn fade_in_session(shadow: &mut Shadow, over: Option<&Over>) -> io::Result<bool> {
+    run_session(shadow, Direction::In, over)
 }
 
-fn run_session(shadow: &mut Shadow, direction: Direction) -> io::Result<bool> {
+fn run_session(shadow: &mut Shadow, direction: Direction, over: Option<&Over>) -> io::Result<bool> {
     let Some(palette) = active() else {
         return Ok(false);
     };
@@ -338,7 +427,7 @@ fn run_session(shadow: &mut Shadow, direction: Direction) -> io::Result<bool> {
     let mut schedule = Schedule::start(one_way(), direction, Instant::now());
     while let Some(t) = schedule.next(Instant::now()) {
         let cursor = cursor_for(direction, schedule.finished());
-        out.write_all(&shadow.frame(t, palette, cursor))?;
+        out.write_all(&shadow.frame_with(t, palette, cursor, over.map(|o| (o, 1.0 - t))))?;
         out.flush()?;
         if !schedule.finished() {
             thread::sleep(FRAME);
@@ -558,5 +647,99 @@ mod tests {
         assert_eq!(buf[(1, 1)].fg, Color::Rgb(100, 100, 100));
         assert!(buf[(1, 2)].modifier.contains(Modifier::REVERSED));
         assert_eq!(buf[(1, 2)].fg, Color::Rgb(100, 100, 100));
+    }
+
+    /// A selected row, `▸ 2  dotfiles` on a reversed bold bar, with a plain
+    /// row under it; and the name's cells, to keep.
+    fn a_bar() -> (Buffer, Rect) {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 16, 2));
+        let bar = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
+        buf.set_string(0, 0, "▸ 2  dotfiles", bar);
+        buf.set_string(0, 1, "  3  notes", Style::default());
+        (buf, Rect::new(5, 0, 8, 1))
+    }
+
+    /// Everything outside the name dissolves as it always did; the name's
+    /// cells come off the bar instead, the bar under them sinking.
+    #[test]
+    fn the_kept_name_comes_off_its_bar_while_the_rest_dissolves() {
+        let (mut buf, keep) = a_bar();
+        apply_keeping(&mut buf, &palette(), 0.25, keep);
+        let marker = &buf[(0, 0)];
+        assert_eq!(marker.fg, Color::Rgb(150, 150, 150), "dissolving");
+        assert!(
+            marker.modifier.contains(Modifier::REVERSED),
+            "as `apply` leaves it"
+        );
+        let name = &buf[(5, 0)];
+        assert!(!name.modifier.contains(Modifier::REVERSED), "{name:?}");
+        assert_eq!(
+            name.bg,
+            Color::Rgb(150, 150, 150),
+            "the bar, a quarter down"
+        );
+        assert_eq!(
+            name.fg,
+            Color::Rgb(0, 0, 0),
+            "the text as it was on the bar"
+        );
+        assert!(name.modifier.contains(Modifier::BOLD), "still bold");
+        assert_eq!(
+            buf[(5, 1)].fg,
+            Color::Rgb(150, 150, 150),
+            "the row below dissolves"
+        );
+    }
+
+    /// The name never stands out from its bar by less than half: the text is
+    /// the bar's own colour on no frame, and turns to the foreground the
+    /// moment the bar is the darker of the two.
+    #[test]
+    fn the_name_stays_readable_all_the_way_off_the_bar() {
+        let p = palette();
+        for step in 0..100 {
+            let t = step as f32 / 100.0;
+            let (mut buf, keep) = a_bar();
+            apply_keeping(&mut buf, &p, t, keep);
+            let (Color::Rgb(text, ..), Color::Rgb(bar, ..)) = (buf[(5, 0)].fg, buf[(5, 0)].bg)
+            else {
+                panic!("set outright before the last frame: {:?}", buf[(5, 0)]);
+            };
+            assert!(text.abs_diff(bar) >= 100, "{text} on {bar} at {t}");
+        }
+        let (mut buf, keep) = a_bar();
+        apply_keeping(&mut buf, &p, 0.75, keep);
+        assert_eq!(buf[(5, 0)].fg, Color::Rgb(200, 200, 200), "the foreground");
+        assert!(
+            !buf[(5, 0)].modifier.contains(Modifier::BOLD),
+            "plain by now"
+        );
+    }
+
+    /// On the last frame the name is plain text in the terminal's own colours,
+    /// and everything else has gone into the background.
+    #[test]
+    fn at_the_end_the_name_is_plain_text_on_nothing() {
+        let (mut buf, keep) = a_bar();
+        apply_keeping(&mut buf, &palette(), 1.0, keep);
+        for x in keep.x..keep.right() {
+            let cell = &buf[(x, 0)];
+            assert_eq!((cell.fg, cell.bg), (Color::Reset, Color::Reset), "{cell:?}");
+            assert!(cell.modifier.is_empty(), "{cell:?}");
+        }
+        let name: String = (keep.x..keep.right())
+            .map(|x| buf[(x, 0)].symbol())
+            .collect();
+        assert_eq!(name, "dotfiles");
+        assert_eq!(buf[(0, 0)].fg, Color::Rgb(0, 0, 0), "the marker is gone");
+    }
+
+    /// A name typed by number is not on the bar: it is left exactly as drawn.
+    #[test]
+    fn a_kept_name_not_on_a_bar_is_left_as_drawn() {
+        let (mut buf, _) = a_bar();
+        let before = buf[(5, 1)].clone();
+        apply_keeping(&mut buf, &palette(), 0.6, Rect::new(5, 1, 5, 1));
+        assert_eq!(buf[(5, 1)], before);
     }
 }

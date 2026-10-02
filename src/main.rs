@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use nvmux::cli::Cli;
+use nvmux::handoff::HandOff;
 use nvmux::{
     announce, config, fade, logging, nested, nvim, palette, paths, pool, pty, reconnect, transport,
     ui,
@@ -125,7 +126,11 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
         // back to; without one — the first screen, a failed attach, a session
         // that exited — there is nothing behind the picker and `Esc` says so by
         // doing nothing.
-        let (mut current, mut listing) = match ui::run(
+        // `hand_off` is the session's name, left standing on the screen by the
+        // picker for the session to take down (see `nvmux::handoff`). Whoever
+        // ends the attach first takes it down: the relay, the attaching
+        // screen, or one of the ways out below that never reach either.
+        let (mut current, mut listing, mut hand_off) = match ui::run(
             transport,
             message.take(),
             focus.as_deref(),
@@ -145,7 +150,11 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 nvmux::term::reset_screen();
                 break;
             }
-            ui::Outcome::Attach { session, sessions } => (session, sessions),
+            ui::Outcome::Attach {
+                session,
+                sessions,
+                hand_off,
+            } => (session, sessions, hand_off),
         };
         // A session the listing no longer has has nothing to come back to.
         pool.keep_only(&listing);
@@ -189,8 +198,14 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 // client's own restore sequence goes nowhere near the terminal.
                 Some(mut other) => {
                     other.hang_up();
-                    let spawned =
-                        resume_or_attach(transport, &mut pool, &current, started, &mut warm)?;
+                    let spawned = resume_or_attach(
+                        transport,
+                        &mut pool,
+                        &current,
+                        started,
+                        &mut warm,
+                        &mut hand_off,
+                    )?;
                     // Explicitly, rather than by falling out of the arm: this is
                     // the wait the hangup deferred, and leaving it to a binding's
                     // drop would let the next edit here re-serialise it without
@@ -199,7 +214,14 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     drop(other);
                     spawned
                 }
-                None => resume_or_attach(transport, &mut pool, &current, started, &mut warm)?,
+                None => resume_or_attach(
+                    transport,
+                    &mut pool,
+                    &current,
+                    started,
+                    &mut warm,
+                    &mut hand_off,
+                )?,
             };
 
             tracing::debug!(
@@ -209,6 +231,14 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 "timing: retire + probe + spawn"
             );
 
+            // No session is coming to take the name down: off the screen it
+            // comes before the picker goes up over it, or it is what the shell
+            // finds there afterwards.
+            if !matches!(opened, Ok(Some(_))) {
+                if let Some(h) = hand_off.take() {
+                    h.take_down();
+                }
+            }
             // A failed attach must not end the program: the user can only act
             // on it from the picker, with the reason on screen.
             let mut attachment = match opened {
@@ -230,6 +260,9 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     break;
                 }
             };
+            if let Some(h) = hand_off.take() {
+                attachment.carry_name(h);
+            }
             // A fresh client announces itself from the moment it is spawned. A
             // kept one has only to say so when it is not the session the user
             // was just looking at — back from the picker, or from `<prefix> c`
@@ -442,12 +475,17 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
 /// The outer `Result` is nvmux giving up on the link altogether; the inner one
 /// is an attach that failed, for the picker to say so. `warm` is set when the
 /// client is a kept one.
+///
+/// `hand_off` is the name the picker left standing, if it did; see
+/// [`attach`]. The link's recovery prints to the screen it stands on, so it is
+/// taken down before that.
 fn resume_or_attach(
     transport: &dyn transport::Transport,
     pool: &mut pool::Pool,
     session: &nvmux::session::Session,
     begun: Option<Begun>,
     warm: &mut bool,
+    hand_off: &mut Option<HandOff>,
 ) -> Result<nvmux::Result<Option<pty::Attachment>>> {
     Ok(match pool.take(&session.id) {
         pool::Taken::Kept(kept) => {
@@ -462,10 +500,13 @@ fn resume_or_attach(
         // switch makes under its fade is skipped for such a session, for the
         // same reason.)
         pool::Taken::Left => {
+            if let Some(h) = hand_off.take() {
+                h.take_down();
+            }
             recover_the_link(transport)?;
-            attach(transport, session, begun)
+            attach(transport, session, begun, hand_off)
         }
-        pool::Taken::Absent => attach(transport, session, begun),
+        pool::Taken::Absent => attach(transport, session, begun, hand_off),
     })
 }
 
@@ -656,14 +697,20 @@ fn begin_attachment(
 /// A probe that says no and a wait the user gives up on end the same way, by
 /// dropping the attachment — explicitly, so the client is gone, and its pty
 /// with it, before the picker says anything about it.
-fn finish_attachment(begun: Begun) -> nvmux::Result<Option<pty::Attachment>> {
+///
+/// `hand_off` is the name the picker left standing: the attaching screen takes
+/// it down, and drops it, if its spinner has to go up.
+fn finish_attachment(
+    begun: Begun,
+    hand_off: &mut Option<HandOff>,
+) -> nvmux::Result<Option<pty::Attachment>> {
     let Begun {
         session,
         sock,
         mut attachment,
         probe,
     } = begun;
-    match ui::attaching::run(probe, &session.name, &sock) {
+    match ui::attaching::run(probe, &session.name, &sock, hand_off) {
         Ok(ui::attaching::Verdict::Ready) => Ok(Some(attachment)),
         // Attached like any other, and the client is already on its way — but
         // it will draw nothing until a key reaches the server, so the notice
@@ -692,10 +739,11 @@ fn attach(
     transport: &dyn transport::Transport,
     session: &nvmux::session::Session,
     begun: Option<Begun>,
+    hand_off: &mut Option<HandOff>,
 ) -> nvmux::Result<Option<pty::Attachment>> {
     match begun {
-        Some(begun) => finish_attachment(begun),
-        None => finish_attachment(begin_attachment(transport, session)?),
+        Some(begun) => finish_attachment(begun, hand_off),
+        None => finish_attachment(begin_attachment(transport, session)?, hand_off),
     }
 }
 

@@ -80,6 +80,10 @@ pub enum Outcome {
         /// digit can be acted on without waiting; and the rows themselves, so a
         /// `<prefix>` switch can name one without going back to disk.
         sessions: Vec<Session>,
+        /// The session's name, left standing on the cleared screen for the
+        /// session to take down as it dissolves in — or `None`, the screen
+        /// left empty (see [`crate::handoff`]).
+        hand_off: Option<HandOff>,
     },
     /// The user quit.
     Quit,
@@ -91,6 +95,17 @@ impl Outcome {
     fn attaches(&self) -> bool {
         matches!(self, Self::Attach { .. })
     }
+
+    /// What to leave on the screen that is given back cleared: the name being
+    /// handed off, if there is one.
+    fn leaves(&self) -> Vec<u8> {
+        match self {
+            Self::Attach {
+                hand_off: Some(h), ..
+            } => h.show(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 use std::time::{Duration, Instant};
@@ -101,6 +116,7 @@ use ratatui::crossterm::event::{
 };
 
 use crate::error::Result;
+use crate::handoff::HandOff;
 use crate::session::Session;
 use crate::transport::Transport;
 use app::{App, Key, Mouse, Request};
@@ -216,7 +232,12 @@ impl Screen {
     /// escape is the first thing [`crate::term::leave_alt_screen_and_clear`]
     /// writes — so doing the modes here and the screen there loses nothing and
     /// puts the leave and the erase in one `write`.
-    pub(crate) fn close_for_attach(mut self) -> Result<()> {
+    ///
+    /// `keep` is drawn on the cleared screen in the same synchronized update
+    /// as the clear: the name of the session being attached to, which the
+    /// picker hands across (see [`crate::handoff`]). Empty, the screen is left
+    /// empty, as it always was.
+    pub(crate) fn close_for_attach(mut self, keep: &[u8]) -> Result<()> {
         self.closed = true;
         self.release_mouse();
         // Modes first, for the reason ratatui gives for the same order: dropping
@@ -224,7 +245,11 @@ impl Screen {
         // way, so a failure to restore the modes cannot also strand the user on
         // the picker's alternate screen.
         let modes = ratatui::crossterm::terminal::disable_raw_mode();
-        crate::term::leave_alt_screen_and_clear();
+        if keep.is_empty() {
+            crate::term::leave_alt_screen_and_clear();
+        } else {
+            crate::term::leave_alt_screen_and_clear_keeping(keep);
+        }
         modes?;
         Ok(())
     }
@@ -263,6 +288,17 @@ pub(crate) fn owning_for_attach<T>(
     mouse: bool,
     f: impl FnOnce(&mut ratatui::DefaultTerminal) -> Result<T>,
 ) -> Result<T> {
+    owning_for_attach_leaving(attaches, |_| Vec::new(), mouse, f)
+}
+
+/// [`owning_for_attach`], with `leaves` saying what to leave standing on the
+/// screen it gives back cleared (see [`Screen::close_for_attach`]).
+pub(crate) fn owning_for_attach_leaving<T>(
+    attaches: impl FnOnce(&T) -> bool,
+    leaves: impl FnOnce(&T) -> Vec<u8>,
+    mouse: bool,
+    f: impl FnOnce(&mut ratatui::DefaultTerminal) -> Result<T>,
+) -> Result<T> {
     let mut screen = Screen::open_with(mouse)?;
     let outcome = f(screen.terminal());
     // The restore happens before the outcome propagates, as in `owning`, and an
@@ -270,7 +306,7 @@ pub(crate) fn owning_for_attach<T>(
     // the error is about to be printed to wants its screen back, not a cleared
     // one.
     match &outcome {
-        Ok(v) if attaches(v) => screen.close_for_attach()?,
+        Ok(v) if attaches(v) => screen.close_for_attach(&leaves(v))?,
         _ => screen.close()?,
     }
     outcome
@@ -316,7 +352,7 @@ pub fn run(
     focused: Option<&str>,
     still_attached: bool,
 ) -> Result<Outcome> {
-    owning_for_attach(Outcome::attaches, true, |terminal| {
+    owning_for_attach_leaving(Outcome::attaches, Outcome::leaves, true, |terminal| {
         run_loop(terminal, transport, message, focused, still_attached)
     })
 }
@@ -476,7 +512,11 @@ fn run_loop(
                 )? {
                     prompt::Outcome::Created(session) => {
                         let (session, sessions) = settle(&app, transport, session);
-                        return Ok(Outcome::Attach { session, sessions });
+                        return Ok(Outcome::Attach {
+                            session,
+                            sessions,
+                            hand_off: None,
+                        });
                     }
                     prompt::Outcome::Cancelled => {}
                     prompt::Outcome::Renamed => refresh(&mut app, transport)?,
@@ -620,16 +660,41 @@ fn play_out(
 /// the screen up at that moment is the prompt's, and the prompt fades it.
 /// Quitting does not come through here either — the shell wants its screen
 /// back, not a dissolved one.
+///
+/// Where the hand-off is on (see [`crate::handoff`]), the session's name is
+/// kept out of the dissolve, and comes off its bar as plain text where it
+/// stood, to be left on the cleared screen for the session to take down.
 fn leave_to_session(
     terminal: &mut ratatui::DefaultTerminal,
     app: &App,
     session: Session,
 ) -> Result<Outcome> {
-    crate::fade::fade_out(terminal, |f| draw::draw(f, app))?;
+    let size = terminal.size()?;
+    let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+    let hand_off = HandOff::enabled()
+        .then(|| hand_off_for(app, area, &session))
+        .flatten();
+    match &hand_off {
+        Some(h) => {
+            let (row, col) = h.at();
+            let keep = ratatui::layout::Rect::new(col, row, h.width(), 1);
+            crate::fade::fade_out_keeping(terminal, |f| draw::draw(f, app), keep)?;
+        }
+        None => crate::fade::fade_out(terminal, |f| draw::draw(f, app))?,
+    }
     Ok(Outcome::Attach {
         session,
         sessions: app.sessions().to_vec(),
+        hand_off,
     })
+}
+
+/// The name of `session` as the picker has it on screen, ready to be handed
+/// off: where its row draws it, cut where the row cuts it. `None` when its row
+/// is not on screen — a number typed for a session scrolled out of view.
+fn hand_off_for(app: &App, area: ratatui::layout::Rect, session: &Session) -> Option<HandOff> {
+    let name = draw::name_rect(app, area, &session.id)?;
+    HandOff::new(&session.name, name.y, name.x, name.width)
 }
 
 /// Put a session just created from the picker after the row that was
@@ -899,8 +964,45 @@ mod tests {
         assert!(Outcome::Attach {
             session: session.clone(),
             sessions: vec![session],
+            hand_off: None,
         }
         .attaches());
         assert!(!Outcome::Quit.attaches());
+    }
+
+    /// The name handed off is the one the picker drew, where it drew it: the
+    /// selected row's, after its marker, number and gap.
+    #[test]
+    fn the_name_handed_off_is_where_the_picker_drew_it() {
+        let a = test_support::picker(&["api-server", "dotfiles", "notes"]);
+        let area = ratatui::layout::Rect::new(0, 0, 40, 8);
+        let lines = test_support::render(40, 8, |f| draw::draw(f, &a));
+        let session = a.session("id000001").unwrap().clone();
+        let h = hand_off_for(&a, area, &session).expect("on screen");
+        let (row, col) = h.at();
+        assert_eq!(h.text(), "dotfiles");
+        let line = &lines[usize::from(row)];
+        let at = line.find("dotfiles").expect("drawn on that row");
+        assert_eq!(line[..at].chars().count(), usize::from(col), "{line:?}");
+    }
+
+    /// Leaving to attach leaves the name drawn on the cleared screen; quitting
+    /// leaves nothing.
+    #[test]
+    fn only_an_attach_with_a_name_leaves_one() {
+        let session = Session::new("id000000".into(), "a".into(), 100, 1);
+        let with = Outcome::Attach {
+            session: session.clone(),
+            sessions: vec![session.clone()],
+            hand_off: HandOff::new("a", 3, 4, 10),
+        };
+        assert_eq!(with.leaves(), HandOff::new("a", 3, 4, 10).unwrap().show());
+        let without = Outcome::Attach {
+            session: session.clone(),
+            sessions: vec![session],
+            hand_off: None,
+        };
+        assert!(without.leaves().is_empty());
+        assert!(Outcome::Quit.leaves().is_empty());
     }
 }

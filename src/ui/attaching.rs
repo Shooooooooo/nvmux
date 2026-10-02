@@ -80,6 +80,7 @@ use ratatui::Frame;
 use super::app::Key;
 use super::draw;
 use crate::error::Result;
+use crate::handoff::HandOff;
 use crate::pty::{Answer, Probe};
 use crate::rpc;
 
@@ -140,11 +141,57 @@ struct State {
 /// [`Verdict::Ready`] and [`Verdict::Blocked`] — give it back cleared instead,
 /// for the relay. The probe is dropped on every way out, which is what ends
 /// its worker (see [`Probe`]).
-pub fn run(probe: Probe, name: &str, sock: &Path) -> Result<Verdict> {
+///
+/// The grace is waited out on no screen of its own — nothing is drawn in it
+/// anyway — so a session that answers in time is handed a terminal nothing has
+/// touched since whoever handed it here. That is what lets a name the picker
+/// left standing (`hand_off`, see [`crate::handoff`]) stay up through the
+/// wait. Once the spinner is due, the name is taken down first, and the
+/// hand-off with it: what this screen draws is not where the name stood.
+pub fn run(
+    mut probe: Probe,
+    name: &str,
+    sock: &Path,
+    hand_off: &mut Option<HandOff>,
+) -> Result<Verdict> {
+    let started = Instant::now();
+    if let Some(verdict) = wait_out_grace(&mut probe, started)? {
+        return Ok(verdict);
+    }
+    if let Some(h) = hand_off.take() {
+        h.take_down();
+    }
     // No mouse: see the module docs.
     super::owning_for_attach(Verdict::attaches, false, |terminal| {
-        run_on(terminal, probe, name, sock)
+        run_on(terminal, probe, name, sock, started)
     })
+}
+
+/// Wait for the probe until [`GRACE`] is up, in raw mode — so a key typed
+/// meanwhile is neither echoed nor read, and stays queued for the editor — and
+/// on no screen of its own. `None` when the grace ran out first.
+fn wait_out_grace(probe: &mut Probe, started: Instant) -> Result<Option<Verdict>> {
+    let _raw = crate::term::RawMode::enter()?;
+    loop {
+        let left = GRACE.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Ok(None);
+        }
+        if let Some(answer) = probe.wait(left.min(FRAME)) {
+            return Ok(Some(verdict(answer?)));
+        }
+    }
+}
+
+/// What the probe's answer means for the wait.
+fn verdict(answer: Answer) -> Verdict {
+    match answer {
+        Answer::Ready => Verdict::Ready,
+        Answer::Blocked { mode } => {
+            tracing::info!(mode = %mode, "attach: handing over a session waiting for a key");
+            Verdict::Blocked
+        }
+    }
 }
 
 fn run_on(
@@ -152,8 +199,8 @@ fn run_on(
     mut probe: Probe,
     name: &str,
     sock: &Path,
+    started: Instant,
 ) -> Result<Verdict> {
-    let started = Instant::now();
     let mut state = State {
         name: name.to_string(),
         elapsed: Duration::ZERO,
@@ -164,13 +211,7 @@ fn run_on(
 
     loop {
         if let Some(answer) = probe.wait(FRAME) {
-            return Ok(match answer? {
-                Answer::Ready => Verdict::Ready,
-                Answer::Blocked { mode } => {
-                    tracing::info!(mode = %mode, "attach: handing over a session waiting for a key");
-                    Verdict::Blocked
-                }
-            });
+            return Ok(verdict(answer?));
         }
         state.elapsed = started.elapsed();
 

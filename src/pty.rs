@@ -86,6 +86,7 @@ pub use portable_pty::PtySize;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair};
 
 use crate::error::{NvmuxError, Result};
+use crate::handoff::HandOff;
 use crate::keys::{Action, Prefix, Step, Wait};
 use crate::ledger::Ledger;
 use crate::term::write_stdout;
@@ -194,6 +195,12 @@ pub struct Attachment {
     /// other change of session, and has it set again for that relay (see
     /// [`Attachment::announce_on_arrival`]).
     announce: Option<String>,
+    /// The name the picker left standing on the screen for this attach, to be
+    /// taken down as the session takes the terminal: dissolved out over the
+    /// session's first frames where there are frames, erased where there are
+    /// not (see [`crate::handoff`]). `None` for every attach but one from the
+    /// picker, and once the relay has taken it down.
+    hand_off: Option<HandOff>,
     child: Box<dyn Child + Send + Sync>,
     master: Box<dyn MasterPty>,
     writer: Box<dyn Write + Send>,
@@ -663,6 +670,19 @@ impl Attachment {
         self.announce = Some(label);
     }
 
+    /// The name the picker left standing for this attach (see
+    /// [`crate::handoff`]): the relay takes it down as the session takes the
+    /// terminal, and from here nothing else may draw before it does.
+    pub fn carry_name(&mut self, hand_off: HandOff) {
+        self.hand_off = Some(hand_off);
+    }
+
+    /// The name the picker left, as an overlay on the shadow's screen.
+    fn name_over(&self, shadow: &shadow::Shadow) -> Option<shadow::Over> {
+        let (rows, cols) = shadow.size();
+        self.hand_off.as_ref().and_then(|h| h.over(rows, cols))
+    }
+
     /// Read whatever the client has written since anything last did, and show
     /// it to the shadow and the ledger rather than to the terminal.
     ///
@@ -1033,12 +1053,27 @@ impl Attachment {
             0
         };
         let mut dissolved = false;
+        // The name the picker left comes down here whichever way the paint
+        // goes out, and before any of it: it is on the primary screen, which
+        // the shell comes back to.
+        let hand_off = self.hand_off.take();
         if dissolve && drawn {
+            // Inside a span the dissolve's first frame closes, so the name is
+            // taken off the primary screen and drawn again over the client's
+            // in what the terminal presents as one moment. Without a frame to
+            // close it, the replay below does.
+            if let Some(h) = &hand_off {
+                let mut down = fade::SYNC_BEGIN.to_vec();
+                down.extend_from_slice(&h.erase());
+                write_stdout(&down)?;
+            }
             write_stdout(&bytes[..split])?;
             if let Some(shadow) = self.shadow.as_mut() {
+                let (rows, cols) = shadow.size();
+                let over = hand_off.as_ref().and_then(|h| h.over(rows, cols));
                 // A frame that could not be written is not a reason to keep
                 // the paint: the replay below is what the user is waiting for.
-                dissolved = match fade::fade_in_session(shadow) {
+                dissolved = match fade::fade_in_session(shadow, over.as_ref()) {
                     Ok(faded) => faded,
                     Err(e) => {
                         tracing::debug!(error = %e, "the session's fade-in did not complete");
@@ -1046,6 +1081,8 @@ impl Attachment {
                     }
                 };
             }
+        } else if let Some(h) = &hand_off {
+            write_stdout(&h.erase())?;
         }
         let mut out = std::io::stdout().lock();
         out.write_all(fade::SYNC_BEGIN)?;
@@ -1077,10 +1114,14 @@ impl Attachment {
     /// the cursor back on the cell that screen had it on. Says whether it
     /// did; if not, the terminal is as the hand-off left it, cursor included.
     fn dissolve_in(&mut self) -> bool {
-        let Some(shadow) = self.shadow.as_mut().filter(|s| s.has_contents()) else {
+        let Some(shadow) = self.shadow.as_ref().filter(|s| s.has_contents()) else {
             return false;
         };
-        match fade::fade_in_session(shadow) {
+        let over = self.name_over(shadow);
+        let Some(shadow) = self.shadow.as_mut() else {
+            return false;
+        };
+        match fade::fade_in_session(shadow, over.as_ref()) {
             Ok(faded) => faded,
             Err(e) => {
                 tracing::debug!(error = %e, "the resumed session's fade-in did not complete");
@@ -2102,6 +2143,7 @@ fn spawn_client_with(
         session_id: session_id.to_string(),
         sock: sock.to_path_buf(),
         announce: Some(announce.to_string()),
+        hand_off: None,
         child,
         master: pair.master,
         writer,
@@ -2179,7 +2221,14 @@ pub fn relay(
         // Not shown to the shadow: the erase would take the screen the
         // client had out of it, and that screen is what dissolves back in
         // below, ahead of the repaint that then puts the real one back.
-        term::enter_alt_screen_and_clear();
+        //
+        // A name the picker left standing is on the screen being left, and
+        // comes off it in the same span as the switch — a span the dissolve's
+        // first frame closes, drawing the name again over the session.
+        match attachment.hand_off.as_ref() {
+            Some(h) => term::enter_alt_screen_and_clear_after(&h.erase()),
+            None => term::enter_alt_screen_and_clear(),
+        }
     } else {
         // Normally already done by whoever handed the terminal over — the
         // picker, the prompt, or the `Switch` branch below — because a clear
@@ -2188,7 +2237,13 @@ pub fn relay(
         // that did neither, and a repeat costs one write on a screen nothing
         // has drawn to since. The client enters the alternate screen for
         // itself, as part of its startup.
-        term::leave_alt_screen_and_clear();
+        //
+        // Not where the picker left a name standing: the picker did the
+        // handover, and the name is the one thing on the screen since, which
+        // the first paint takes down (see `release_hold`).
+        if attachment.hand_off.is_none() {
+            term::leave_alt_screen_and_clear();
+        }
         attachment.shadow_saw(term::HANDOVER);
     }
     let mut raw = term::RawMode::enter()?;
@@ -2234,8 +2289,16 @@ pub fn relay(
         let resized = attachment.master.get_size().ok() != Some(size);
         attachment.resize_to(size);
         dissolved = attachment.dissolve_in();
+        // Off the primary screen since the switch, and on the session's only
+        // as long as the dissolve drew it.
+        let carried = attachment.hand_off.take().is_some();
         let on_screen = dissolved || attachment.paint_kept_screen();
         if !on_screen {
+            // The span the switch opened for the dissolve, with no frame to
+            // close it.
+            if carried {
+                term::end_span();
+            }
             attachment.shadow_saw(term::RESUME);
             term::show_cursor();
         }

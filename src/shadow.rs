@@ -279,6 +279,27 @@ impl Shadow {
     /// [`feed`]: Shadow::feed
     /// [`resize`]: Shadow::resize
     pub fn frame(&mut self, t: f32, palette: &Palette, cursor: Cursor) -> Vec<u8> {
+        self.frame_with(t, palette, cursor, None)
+    }
+
+    /// [`Shadow::frame`], with an overlay `over` painted over it `ot` of the
+    /// way dissolved, inside the same synchronized update — so the terminal
+    /// never presents the screen without it. The overlay's rectangle is
+    /// painted as [`Shadow::under`] paints it: its glyphs while they are the
+    /// more visible, the session's cells after.
+    ///
+    /// Those cells are painted again on every frame whatever the diff says,
+    /// since the overlay is drawn over them on every frame; so the diff,
+    /// which records the session's cells, stays true of everything the
+    /// overlay does not cover, and of the rectangle too once the overlay has
+    /// dissolved and paints the session's own cells there.
+    pub fn frame_with(
+        &mut self,
+        t: f32,
+        palette: &Palette,
+        cursor: Cursor,
+        over: Option<(&Over, f32)>,
+    ) -> Vec<u8> {
         let screen = self.parser.screen();
         let (rows, cols) = if self.broken { (0, 0) } else { screen.size() };
         let total = usize::from(rows) * usize::from(cols);
@@ -321,6 +342,9 @@ impl Shadow {
                 out.extend_from_slice(text.as_bytes());
                 at = Some(col + width);
             }
+        }
+        if let Some((over, ot)) = over.filter(|_| !self.broken) {
+            self.paint_under(&mut out, over, palette, ot);
         }
         out.extend_from_slice(RESET_SGR);
         // Inside the same synchronized update as the cells, so the screen and
@@ -928,6 +952,57 @@ mod tests {
         // Past the crossover it is the screen, rising back out of it.
         assert_eq!(ink(0.75), "0;38;2;150;150;150");
         assert_eq!(ink(1.0), "0;38;2;200;200;200");
+    }
+
+    /// The name the picker hands off rides the session's own fade-in frames:
+    /// drawn whole over the still-dissolved screen on the first, inside the
+    /// one synchronized update, so the terminal never shows the frame without
+    /// it; and replaced by the session's own cells on the last.
+    #[test]
+    fn an_overlay_rides_inside_the_sessions_own_frames() {
+        let p = palette();
+        let name = Over {
+            top: 3,
+            left: 4,
+            width: 4,
+            rows: vec!["name".into()],
+        };
+        // What each cell was last painted with, 1-based as the wire has it.
+        let last = |bytes: &[u8]| {
+            let mut cells = std::collections::BTreeMap::new();
+            for (at, sgr, glyph) in painted_cells(bytes) {
+                cells.insert(at, (sgr, glyph));
+            }
+            cells
+        };
+        let mut shadow = under();
+
+        let first = shadow.frame_with(1.0, &p, Cursor::Hidden, Some((&name, 0.0)));
+        let wire = text(&first);
+        assert_eq!(
+            wire.matches("\x1b[?2026h").count(),
+            1,
+            "one update: {wire:?}"
+        );
+        assert!(wire.ends_with("\x1b[?2026l"), "{wire:?}");
+        let cells = last(&first);
+        let drawn = format!("0;38;2;{};{};{}", p.fg.0, p.fg.1, p.fg.2);
+        let shown: String = (5..=8).map(|col| cells[&(4, col)].1.clone()).collect();
+        assert_eq!(shown, "name");
+        assert!(
+            (5..=8).all(|col| cells[&(4, col)].0 == drawn),
+            "drawn whole"
+        );
+        assert_eq!(cells[&(4, 9)].1, "I", "beside it, the session's own cell");
+
+        let end = shadow.frame_with(0.0, &p, Cursor::Hidden, Some((&name, 1.0)));
+        let cells = last(&end);
+        let back: String = (5..=8).map(|col| cells[&(4, col)].1.clone()).collect();
+        assert_eq!(back, "EFGH", "the session's cells, where the name was");
+        assert!(
+            (5..=8).all(|col| cells[&(4, col)].0 == drawn),
+            "at full colour"
+        );
     }
 
     /// Drawn over a session that still owns the screen, so unlike a frame it

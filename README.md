@@ -157,6 +157,9 @@ enabled = true   # the row the cursor leaves fades back; a glint crosses the nex
 [effects.back]
 enabled = true   # back from a session, rings go out from its row in the picker
 
+[effects.attach]
+enabled = true   # the session's name stays up through an attach; needs the fade
+
 [effects.kill]
 enabled = true   # a line through the name at [y/N]; then the row is erased
 
