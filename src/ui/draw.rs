@@ -55,6 +55,12 @@ const MAX_LIST_WIDTH: u16 = 48;
 /// Columns between the number and the name.
 const NUM_GAP: &str = "  ";
 
+/// What the selection's bar runs on past the end of the name, so the name does
+/// not end flush against the bar's edge — the marker already gives it room on
+/// the left. Every row's width allows for it, so the block does not widen as
+/// the selection lands on the longest name.
+const PAD: &str = " ";
+
 /// Sixty-nine columns, and it used to be sixty exactly — the widest row that
 /// still fits a small terminal without truncation. `␣ order` is what that budget
 /// was spent on: reordering is the one picker command nobody would find unaided,
@@ -224,14 +230,12 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 MARKER.chars().count()..head.chars().count() - NUM_GAP.chars().count()
             };
-            row_line(
-                &head,
-                &row.session.name,
-                num,
-                &marked,
-                block.width as usize,
-                style,
-            )
+            let name = if selected {
+                format!("{}{PAD}", row.session.name)
+            } else {
+                row.session.name.clone()
+            };
+            row_line(&head, &name, num, &marked, block.width as usize, style)
         })
         .collect();
 
@@ -276,7 +280,11 @@ fn draw_landing(
     };
     let y = block.y + line as u16;
     let left = block.x;
-    let drawn = format!("{}{}", head(session, true, false, num_width), session.name);
+    let drawn = format!(
+        "{}{}{PAD}",
+        head(session, true, false, num_width),
+        session.name
+    );
     let right = block.x + drawn.width().min(block.width as usize) as u16;
     let area = frame.area();
     let on_screen = |x: u16| x >= area.x && x < area.x + area.width;
@@ -470,10 +478,10 @@ fn draw_trails(
     let near = starfield::TRAIL / 2;
     let dim = Style::default().add_modifier(Modifier::DIM);
 
-    // Off the end of the name. What the row above drew for it, measured the
-    // same way: the trail starts in the column after its last character,
-    // truncation included.
-    let drawn = format!("{GRABBED}{:>num_width$}{NUM_GAP}{}", "", session.name)
+    // Off the end of the bar. What the row above drew for it, measured the
+    // same way: the trail starts in the column after its last cell, the pad
+    // past the name and truncation included.
+    let drawn = format!("{GRABBED}{:>num_width$}{NUM_GAP}{}{PAD}", "", session.name)
         .width()
         .min(block.width as usize) as u16;
     let x = block.x + drawn;
@@ -576,7 +584,11 @@ fn list_layout(app: &App, area: Rect) -> Option<ListLayout> {
         .map(|r| r.session.state.num.to_string().len())
         .max()
         .unwrap_or(1);
-    let width = (widest + MARKER.width() as u16 + num_width as u16 + NUM_GAP.width() as u16)
+    let width = (widest
+        + MARKER.width() as u16
+        + num_width as u16
+        + NUM_GAP.width() as u16
+        + PAD.width() as u16)
         .clamp(MIN_LIST_WIDTH, MAX_LIST_WIDTH)
         .min(area.width);
 
@@ -631,8 +643,8 @@ pub(super) fn row_at(app: &App, area: Rect, column: u16, row: u16) -> Option<usi
     Some(rows[..index].iter().filter(|r| !r.leaving).count())
 }
 
-/// Where the row of session `id` is drawn, as wide as what is written on it,
-/// with `area` the whole frame — or `None` when it is not on screen. What the
+/// Where the row of session `id` is drawn, as wide as the selection's bar is
+/// on it — what is written on it and the [`PAD`] past the name — with `area` the whole frame — or `None` when it is not on screen. What the
 /// effects' post-pass paints over (see [`super::effects`]), measured by the
 /// same layout the rows were drawn with.
 pub(super) fn row_rect(app: &App, area: Rect, id: &str) -> Option<Rect> {
@@ -650,8 +662,12 @@ pub(super) fn row_rect(app: &App, area: Rect, id: &str) -> Option<Rect> {
     let line = index
         .checked_sub(offset)
         .filter(|line| *line < block.height as usize)?;
-    let width = (MARKER.width() + num_width + NUM_GAP.width() + rows[index].session.name.width())
-        .min(block.width as usize);
+    let width = (MARKER.width()
+        + num_width
+        + NUM_GAP.width()
+        + rows[index].session.name.width()
+        + PAD.width())
+    .min(block.width as usize);
     Some(Rect::new(block.x, block.y + line as u16, width as u16, 1))
 }
 
@@ -1324,11 +1340,16 @@ mod tests {
             .find(|y| row(*y).contains("docs"))
             .expect("the grabbed row");
         let line = row(y);
-        let end = (line[..line.find("docs").expect("the name") + "docs".len()].width()) as u16;
+        let name_end = (line[..line.find("docs").expect("the name") + "docs".len()].width()) as u16;
+        let end = name_end + PAD.width() as u16;
 
         assert!(
-            buf[(end - 1, y)].modifier.contains(Modifier::REVERSED),
+            buf[(name_end - 1, y)].modifier.contains(Modifier::REVERSED),
             "the name's last character is in the bar"
+        );
+        assert!(
+            buf[(end - 1, y)].modifier.contains(Modifier::REVERSED),
+            "and so is the pad past it"
         );
         for i in 0..starfield::TRAIL as u16 {
             let cell = &buf[(end + i, y)];
@@ -1504,6 +1525,46 @@ mod tests {
             .all(|c| !c.modifier.contains(Modifier::UNDERLINED)));
     }
 
+    /// The selection's bar runs one blank cell past the end of the name, and
+    /// no further; no other row is padded.
+    #[test]
+    fn the_selection_bar_runs_a_cell_past_the_name() {
+        let mut a = app(&["api-server", "dotfiles"]);
+        a.set_effects(false);
+        let buf = test_support::buffer(40, 6, |f| draw(f, &a));
+        let lines = render(&a, 40, 6);
+        for (name, selected) in [("api-server", true), ("dotfiles", false)] {
+            let y = line_of(&lines, name);
+            let line = &lines[y as usize];
+            let end = line[..line.find(name).unwrap() + name.len()].width() as u16;
+            let pad = &buf[(end, y)];
+            assert_eq!(pad.symbol(), " ");
+            assert_eq!(
+                pad.modifier.contains(Modifier::REVERSED),
+                selected,
+                "{name}"
+            );
+            assert!(!buf[(end + 1, y)].modifier.contains(Modifier::REVERSED));
+        }
+    }
+
+    /// The pad is allowed for in every row's width, so the block stays put
+    /// as the selection moves onto the longest name.
+    #[test]
+    fn the_pad_does_not_move_the_list() {
+        let a = app(&["api-server", "docs"]);
+        let mut b = app(&["api-server", "docs"]);
+        b.on_key(Key::Char('j'));
+        let (la, lb) = (render(&a, 40, 6), render(&b, 40, 6));
+        for name in ["api-server", "docs"] {
+            let at = |lines: &[String]| {
+                let line = &lines[line_of(lines, name) as usize];
+                line[..line.find(name).unwrap()].width()
+            };
+            assert_eq!(at(&la), at(&lb), "{name} moved");
+        }
+    }
+
     /// The number is dim beside its name on every row but the selected one,
     /// whose bar stays whole; the names themselves are never dimmed.
     #[test]
@@ -1656,7 +1717,7 @@ mod tests {
             .find('▸')
             .map(|b| text[..b].chars().count() as u16)
             .unwrap();
-        let end = first + "▸ 2  notes".chars().count() as u16;
+        let end = first + "▸ 2  notes".chars().count() as u16 + PAD.width() as u16;
         for x in (first - landing::WIDEN..first).chain(end..end + landing::WIDEN) {
             let cell = &buf[(x, y)];
             assert_eq!(cell.symbol(), " ", "the bar widens with blanks at {x}");
@@ -1694,7 +1755,7 @@ mod tests {
             .find('▸')
             .map(|b| text[..b].chars().count() as u16)
             .unwrap();
-        let end = first + "▸ 2  notes".chars().count() as u16;
+        let end = first + "▸ 2  notes".chars().count() as u16 + PAD.width() as u16;
 
         let mut before = 0;
         let mut after = 0;
