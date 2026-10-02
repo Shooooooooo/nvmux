@@ -110,12 +110,17 @@ pub struct App {
     /// The landing under way, from the key that put a session down until its
     /// dust settles. See [`super::landing`].
     landing: Option<Landing>,
-    /// Whether the row the cursor leaves glows: `[effects.cursor] enabled`,
-    /// under `[effects] enabled`. Read once when the picker opens, like `trail`.
-    afterglow: bool,
+    /// Whether the cursor lights the rows it moves between — the afterglow on
+    /// the row it leaves, the glint across the one it lands on:
+    /// `[effects.cursor] enabled`, under `[effects] enabled`. Read once when
+    /// the picker opens, like `trail`.
+    lights: bool,
     /// The rows the cursor has just left and is still glowing on, by session
     /// id, oldest first. See [`App::glows`].
     glows: Vec<Glow>,
+    /// The row the cursor last landed on, while the glint crosses it. One at
+    /// a time: the next move takes it to the next row. See [`App::glint`].
+    glint: Option<Glow>,
     /// Whether a filter keystroke's dropped rows fade out (`[effects.filter]
     /// enabled`).
     sift: bool,
@@ -130,7 +135,7 @@ pub struct App {
     dust: Option<(String, Dust)>,
 }
 
-/// A row the cursor has left, and how long ago.
+/// A row the cursor has left or landed on, and how long ago.
 #[derive(Debug, Clone)]
 struct Glow {
     id: String,
@@ -196,8 +201,9 @@ impl App {
             after: Starfield::seeded(),
             before: Starfield::seeded(),
             landing: None,
-            afterglow: crate::config::get().effects.cursor_enabled(),
+            lights: crate::config::get().effects.cursor_enabled(),
             glows: Vec::new(),
+            glint: None,
             sift: crate::config::get().effects.filter_enabled(),
             leaving: None,
             crumble: crate::config::get().effects.kill_enabled(),
@@ -215,6 +221,7 @@ impl App {
         let previously = self.selected_id();
         self.dust = None;
         self.glows.clear();
+        self.glint = None;
         self.leaving = None;
         self.landing = None;
         self.sessions = sessions;
@@ -292,6 +299,12 @@ impl App {
             glow.age += elapsed;
         }
         self.glows.retain(|g| g.age < effects::AFTERGLOW);
+        if let Some(glint) = &mut self.glint {
+            glint.age += elapsed;
+            if glint.age >= effects::GLINT {
+                self.glint = None;
+            }
+        }
         if let Some(leaving) = &mut self.leaving {
             leaving.age += elapsed;
             if leaving.age >= effects::SIFT {
@@ -311,11 +324,12 @@ impl App {
 
     /// Whether anything on screen is moving, and so whether the caller should
     /// draw at a frame's pace rather than wait on the keyboard: a trail, a
-    /// glow, a fading row or dust. With every effect off this is only ever
-    /// false, and the picker changes on a key and nothing else.
+    /// glow, a glint, a fading row or dust. With every effect off this is only
+    /// ever false, and the picker changes on a key and nothing else.
     pub fn animating(&self) -> bool {
         self.trailing()
             || !self.glows.is_empty()
+            || self.glint.is_some()
             || self.leaving.is_some()
             || self.dusting()
             || self.landing.is_some()
@@ -344,6 +358,15 @@ impl App {
         self.glows
             .iter()
             .map(move |g| (g.id.as_str(), g.age.as_secs_f32() / length))
+    }
+
+    /// The row the cursor has just landed on, by session id, with how far the
+    /// glint is across it, `0..1`, or `None` once it has crossed.
+    pub fn glint(&self) -> Option<(&str, f32)> {
+        let length = effects::GLINT.as_secs_f32();
+        self.glint
+            .as_ref()
+            .map(|g| (g.id.as_str(), g.age.as_secs_f32() / length))
     }
 
     /// How far through their fade the rows the last filter keystroke dropped
@@ -392,16 +415,17 @@ impl App {
         self.trail = on;
     }
 
-    /// Turn the picker's own effects — the afterglow, the filter's fade, the
-    /// kill's dust — on or off whatever the config says, for a test that needs
-    /// one or the other.
+    /// Turn the picker's own effects — the afterglow and the glint, the
+    /// filter's fade, the kill's dust — on or off whatever the config says,
+    /// for a test that needs one or the other.
     #[cfg(test)]
     pub(super) fn set_effects(&mut self, on: bool) {
-        self.afterglow = on;
+        self.lights = on;
         self.sift = on;
         self.crumble = on;
         if !on {
             self.glows.clear();
+            self.glint = None;
             self.leaving = None;
             self.dust = None;
         }
@@ -754,13 +778,21 @@ impl App {
             .flatten()
     }
 
-    /// If the cursor has moved off the session `was`, start that row glowing.
-    /// The row it moved onto stops glowing, if it was: it is the selection now.
+    /// If the cursor has moved off the session `was`, start that row glowing,
+    /// and a glint across the row it moved onto. That row stops glowing, if it
+    /// was: it is the selection now.
     fn glow_from(&mut self, was: Option<String>) {
-        if !self.afterglow {
+        if !self.lights {
             return;
         }
-        let (Some(was), Some(now)) = (was, self.cursor()) else {
+        let now = self.cursor();
+        // A session picked up or a `[y/N]` takes the bar over, and the glint
+        // goes with it rather than carrying on across the question, or coming
+        // back half done once it is answered.
+        if now.is_none() {
+            self.glint = None;
+        }
+        let (Some(was), Some(now)) = (was, now) else {
             return;
         };
         // A row the filter just took is leaving, not glowing.
@@ -770,6 +802,10 @@ impl App {
         self.glows.retain(|g| g.id != was && g.id != now);
         self.glows.push(Glow {
             id: was,
+            age: Duration::ZERO,
+        });
+        self.glint = Some(Glow {
+            id: now,
             age: Duration::ZERO,
         });
     }
