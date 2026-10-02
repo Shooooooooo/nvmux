@@ -39,7 +39,7 @@ use crate::error::ConfigError;
 
 /// The whole configuration. Each field is a table of its own, so the file reads
 /// as `[keys]`-style sections — `[effects]` with a table inside it for each
-/// effect: `[effects.fade]`, `[effects.session_name]`, `[effects.afterglow]`,
+/// effect: `[effects.fade]`, `[effects.move]`, `[effects.cursor]`,
 /// `[effects.kill]` and `[effects.filter]`.
 ///
 /// Not `Copy`: `[session] command` owns a `String`. Nothing reads it by value —
@@ -121,19 +121,20 @@ impl Default for ClientSettings {
 }
 
 /// The animated effects: a master switch over them all, and a table of its own
-/// for each — `[effects.fade]`, `[effects.session_name]`, `[effects.afterglow]`,
+/// for each — `[effects.fade]`, `[effects.move]`, `[effects.cursor]`,
 /// `[effects.kill]` and `[effects.filter]` — with its own `enabled`. An effect
 /// runs only when both are on, which is what the `*_enabled` methods answer, so
 /// nothing reads one switch without the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EffectsSettings {
-    /// Master switch. Off, nothing moves that does not have to — no fade and no
-    /// trail — whatever their own switches say.
+    /// Master switch. Off, nothing animates, whatever the effects' own
+    /// switches say.
     pub enabled: bool,
     pub fade: FadeSettings,
-    pub session_name: SessionNameSettings,
-    pub afterglow: AfterglowSettings,
+    #[serde(rename = "move")]
+    pub moving: MoveSettings,
+    pub cursor: CursorSettings,
     pub kill: KillSettings,
     pub filter: FilterSettings,
 }
@@ -148,15 +149,15 @@ impl EffectsSettings {
 
     /// Whether a session being moved streams stars off its name: its own
     /// switch and the master one.
-    pub fn session_name_enabled(&self) -> bool {
-        self.enabled && self.session_name.enabled
+    pub fn move_enabled(&self) -> bool {
+        self.enabled && self.moving.enabled
     }
 
     /// Whether the row the cursor leaves glows: its own switch and the master
     /// one. Whether it fades in colour or steps through a modifier is the
     /// terminal's say after this (see [`crate::ui::effects`]).
-    pub fn afterglow_enabled(&self) -> bool {
-        self.enabled && self.afterglow.enabled
+    pub fn cursor_enabled(&self) -> bool {
+        self.enabled && self.cursor.enabled
     }
 
     /// Whether a killed session's name crumbles into dust before it goes: its
@@ -206,9 +207,6 @@ pub struct FadeSettings {
     /// notice's box empties the cells it covers and waits for a repaint to
     /// fill them (see [`crate::announce`]).
     pub session: bool,
-    /// Whether the quick `<prefix> ?` / `<prefix> c` excursions fade too. Off
-    /// makes those snappier at the cost of consistency.
-    pub excursions: bool,
 }
 
 /// The stars a session's name streams while it is picked up to be moved, off
@@ -216,14 +214,13 @@ pub struct FadeSettings {
 /// is put down (see [`crate::ui::landing`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct SessionNameSettings {
+pub struct MoveSettings {
     /// This effect's own switch, under `[effects] enabled`. Off, a session in
     /// flight is drawn still and put down without a landing, and the picker
     /// redraws on a key and nothing else, as it does the rest of the time.
     ///
-    /// One switch for the flight and the landing, not one each: the landing is
-    /// how the trail ends, and a trail that stopped dead would be the subtle
-    /// ending the landing replaced.
+    /// One switch for the flight and the landing: the landing is how the
+    /// flight ends.
     ///
     /// Unlike the fade, `NO_COLOR` leaves this alone: the trail and the landing
     /// are braille and modifiers, and set no colour to begin with.
@@ -234,18 +231,14 @@ pub struct SessionNameSettings {
 /// a plain row (see [`crate::ui::effects`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct AfterglowSettings {
+pub struct CursorSettings {
     /// This effect's own switch, under `[effects] enabled`.
     ///
     /// The fade back is in colour, so it wants what the fade wants: the
     /// terminal's answer to the colour query, and no `NO_COLOR`. Without them
     /// it falls back to the bar standing a moment longer, reversed and dim,
-    /// before it goes — modifiers, like the rest of the picker.
-    ///
-    /// No length to set, unlike the fade: the fade's is how long every switch
-    /// takes, where this one is a trace behind a key that has already done its
-    /// work, and its length is a matter of look (see
-    /// [`crate::ui::effects::AFTERGLOW`]).
+    /// before it goes — modifiers, like the rest of the picker. How long it
+    /// lasts is [`crate::ui::effects::AFTERGLOW`].
     pub enabled: bool,
 }
 
@@ -270,9 +263,6 @@ pub struct FilterSettings {
     /// keystroke drops fade out where they stand before the list closes up —
     /// in colour where the terminal said what its colours are, dim where it
     /// did not. Off, they vanish on the keystroke.
-    ///
-    /// The underline on the letters a query matched is not part of this, and
-    /// has no switch: it does not move, and it says why a row is still there.
     pub enabled: bool,
 }
 
@@ -281,21 +271,21 @@ impl Default for EffectsSettings {
         Self {
             enabled: true,
             fade: FadeSettings::default(),
-            session_name: SessionNameSettings::default(),
-            afterglow: AfterglowSettings::default(),
+            moving: MoveSettings::default(),
+            cursor: CursorSettings::default(),
             kill: KillSettings::default(),
             filter: FilterSettings::default(),
         }
     }
 }
 
-impl Default for SessionNameSettings {
+impl Default for MoveSettings {
     fn default() -> Self {
         Self { enabled: true }
     }
 }
 
-impl Default for AfterglowSettings {
+impl Default for CursorSettings {
     fn default() -> Self {
         Self { enabled: true }
     }
@@ -380,7 +370,6 @@ impl Default for FadeSettings {
             // enough to be one movement: 100 ms out and 100 ms back.
             duration_ms: 200,
             session: true,
-            excursions: true,
         }
     }
 }
@@ -607,16 +596,15 @@ fn render_default_config(prefix: u8) -> String {
          # enabled     = {fade_enabled}\n\
          # duration_ms = {fade_duration}\n\
          # session     = {fade_session}\n\
-         # excursions  = {fade_excursions}\n\
          \n\
-         [effects.session_name]\n\
+         [effects.move]\n\
          # Stars streaming off both ends of a session picked up to be moved,\n\
          # and the impact when it is put down.\n\
-         # enabled = {session_name_enabled}\n\
+         # enabled = {move_enabled}\n\
          \n\
-         [effects.afterglow]\n\
+         [effects.cursor]\n\
          # The row the cursor leaves fades back from the selection's bar.\n\
-         # enabled = {afterglow_enabled}\n\
+         # enabled = {cursor_enabled}\n\
          \n\
          [effects.kill]\n\
          # A killed session's name crumbles into dust before it goes.\n\
@@ -632,10 +620,9 @@ fn render_default_config(prefix: u8) -> String {
         fade_enabled = f.enabled,
         fade_duration = f.duration_ms,
         fade_session = f.session,
-        fade_excursions = f.excursions,
         effects_enabled = e.enabled,
-        session_name_enabled = e.session_name.enabled,
-        afterglow_enabled = e.afterglow.enabled,
+        move_enabled = e.moving.enabled,
+        cursor_enabled = e.cursor.enabled,
         kill_enabled = e.kill.enabled,
         filter_enabled = e.filter.enabled,
     )
@@ -715,10 +702,9 @@ mod tests {
             enabled = true\n\
             duration_ms = 200\n\
             session = true\n\
-            excursions = true\n\
-            [effects.session_name]\n\
+            [effects.move]\n\
             enabled = true\n\
-            [effects.afterglow]\n\
+            [effects.cursor]\n\
             enabled = true\n\
             [effects.kill]\n\
             enabled = true\n\
@@ -734,12 +720,8 @@ mod tests {
         assert_eq!(s.effects.fade.duration_ms, 40);
         assert_eq!(s.effects.fade.enabled, FadeSettings::default().enabled);
         assert_eq!(s.effects.fade.session, FadeSettings::default().session);
-        assert_eq!(
-            s.effects.fade.excursions,
-            FadeSettings::default().excursions
-        );
         assert!(s.effects.enabled, "the master switch keeps its default");
-        assert_eq!(s.effects.session_name, SessionNameSettings::default());
+        assert_eq!(s.effects.moving, MoveSettings::default());
         assert_eq!(s.keys, KeySettings::default());
     }
 
@@ -775,10 +757,7 @@ mod tests {
         let s: Settings = toml::from_str("[effects.fade]\nenabled = false\n").expect("valid");
         assert!(!s.effects.fade.enabled);
         assert!(!s.effects.fade_enabled());
-        assert!(
-            s.effects.session_name_enabled(),
-            "the other effect is untouched"
-        );
+        assert!(s.effects.move_enabled(), "the other effect is untouched");
     }
 
     /// One switch over all of them: off, no effect runs, and each one's own
@@ -787,42 +766,41 @@ mod tests {
     fn the_master_switch_turns_every_effect_off() {
         let s: Settings = toml::from_str("[effects]\nenabled = false\n").expect("valid");
         assert!(!s.effects.fade_enabled());
-        assert!(!s.effects.session_name_enabled());
-        assert!(!s.effects.afterglow_enabled());
+        assert!(!s.effects.move_enabled());
+        assert!(!s.effects.cursor_enabled());
         assert!(!s.effects.kill_enabled());
         assert!(!s.effects.filter_enabled());
-        assert!(s.effects.fade.enabled && s.effects.session_name.enabled);
-        assert!(s.effects.afterglow.enabled && s.effects.kill.enabled);
+        assert!(s.effects.fade.enabled && s.effects.moving.enabled);
+        assert!(s.effects.cursor.enabled && s.effects.kill.enabled);
         assert!(s.effects.filter.enabled);
         let on = Settings::default().effects;
-        assert!(on.fade_enabled() && on.session_name_enabled());
-        assert!(on.afterglow_enabled() && on.kill_enabled() && on.filter_enabled());
+        assert!(on.fade_enabled() && on.move_enabled());
+        assert!(on.cursor_enabled() && on.kill_enabled() && on.filter_enabled());
     }
 
     /// The three picker effects each turn off on their own.
     #[test]
     fn each_picker_effect_turns_off_on_its_own() {
-        let s: Settings = toml::from_str("[effects.afterglow]\nenabled = false\n").expect("valid");
-        assert!(!s.effects.afterglow_enabled());
+        let s: Settings = toml::from_str("[effects.cursor]\nenabled = false\n").expect("valid");
+        assert!(!s.effects.cursor_enabled());
         assert!(s.effects.kill_enabled() && s.effects.filter_enabled());
 
         let s: Settings = toml::from_str("[effects.kill]\nenabled = false\n").expect("valid");
         assert!(!s.effects.kill_enabled());
-        assert!(s.effects.afterglow_enabled() && s.effects.filter_enabled());
+        assert!(s.effects.cursor_enabled() && s.effects.filter_enabled());
 
         let s: Settings = toml::from_str("[effects.filter]\nenabled = false\n").expect("valid");
         assert!(!s.effects.filter_enabled());
-        assert!(s.effects.afterglow_enabled() && s.effects.kill_enabled());
+        assert!(s.effects.cursor_enabled() && s.effects.kill_enabled());
     }
 
     /// Each effect has a switch of its own, and turning one off leaves the
     /// others running.
     #[test]
-    fn the_session_name_effect_is_on_unless_turned_off() {
-        assert!(Settings::default().effects.session_name.enabled);
-        let s: Settings =
-            toml::from_str("[effects.session_name]\nenabled = false\n").expect("valid");
-        assert!(!s.effects.session_name_enabled());
+    fn the_move_effect_is_on_unless_turned_off() {
+        assert!(Settings::default().effects.moving.enabled);
+        let s: Settings = toml::from_str("[effects.move]\nenabled = false\n").expect("valid");
+        assert!(!s.effects.move_enabled());
         assert!(s.effects.fade_enabled(), "and the fade is untouched");
     }
 
@@ -880,30 +858,23 @@ mod tests {
             ("an unknown client key", "[client]\nkeep = true\n"),
             ("an unknown effect", "[effects.sparkles]\nenabled = true\n"),
             (
-                "the afterglow's length, which is not a setting",
-                "[effects.afterglow]\nduration_ms = 180\n",
+                "an unknown cursor key",
+                "[effects.cursor]\nenable = false\n",
             ),
+            ("an unknown kill key", "[effects.kill]\nenable = false\n"),
             (
-                "a landing switch apart from the trail's",
-                "[effects.session_name]\nlanding = false\n",
-            ),
-            ("an unknown kill key", "[effects.kill]\ndust = true\n"),
-            (
-                "an underline switch, which there is not",
-                "[effects.filter]\nunderline = false\n",
+                "an unknown filter key",
+                "[effects.filter]\nenable = false\n",
             ),
             (
                 "an unparseable filter value",
                 "[effects.filter]\nenabled = 1\n",
             ),
             ("an unknown effects key", "[effects]\nenable = false\n"),
+            ("an unknown move key", "[effects.move]\nenable = false\n"),
             (
-                "an unknown session_name key",
-                "[effects.session_name]\nenable = false\n",
-            ),
-            (
-                "an unparseable session_name value",
-                "[effects.session_name]\nenabled = \"no\"\n",
+                "an unparseable move value",
+                "[effects.move]\nenabled = \"no\"\n",
             ),
             ("an unparseable client value", "[client]\nper_session = 1\n"),
             (
@@ -911,7 +882,7 @@ mod tests {
                 "[effects.fade]\nenabled = \"yes\"\n",
             ),
             (
-                "the fade table where it used to be",
+                "an effect's table outside [effects]",
                 "[fade]\nenabled = false\n",
             ),
         ] {
@@ -1014,8 +985,8 @@ mod tests {
         for table in [
             "[effects]",
             "[effects.fade]",
-            "[effects.session_name]",
-            "[effects.afterglow]",
+            "[effects.move]",
+            "[effects.cursor]",
             "[effects.kill]",
             "[effects.filter]",
         ] {
@@ -1034,7 +1005,6 @@ mod tests {
             "# enabled     = true",
             "# duration_ms = 200",
             "# session     = true",
-            "# excursions  = true",
         ] {
             assert!(
                 rendered.contains(line),

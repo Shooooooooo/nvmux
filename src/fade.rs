@@ -98,12 +98,6 @@ fn active() -> Option<&'static Palette> {
     }
 }
 
-/// Whether the quick excursions — the help and the create prompt, entered
-/// from a session — fade too.
-pub fn excursions() -> bool {
-    crate::config::get().effects.fade.excursions
-}
-
 /// Whether an attached session is watched so it can dissolve out.
 pub fn session() -> bool {
     crate::config::get().effects.fade.session

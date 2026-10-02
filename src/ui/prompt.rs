@@ -769,12 +769,7 @@ fn aligned(labels: &[&str]) -> Vec<String> {
 pub fn run(transport: &dyn Transport) -> Result<Outcome> {
     // Reached from a session that has just dissolved out, so dissolve in.
     super::owning_for_attach(Outcome::attaches, true, |terminal| {
-        run_on(
-            terminal,
-            transport,
-            Task::Create { listed: None },
-            crate::fade::excursions(),
-        )
+        run_on(terminal, transport, Task::Create { listed: None }, true)
     })
 }
 

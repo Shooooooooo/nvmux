@@ -96,7 +96,7 @@ fn closes(key: Key) -> bool {
 /// the session back untouched afterwards.
 pub fn run() -> Result<()> {
     // Reached from a session that has just dissolved out, so dissolve in.
-    super::owning(|terminal| run_on(terminal, crate::fade::excursions()))
+    super::owning(|terminal| run_on(terminal, true))
 }
 
 /// Show the bindings on a terminal the caller already owns — how the picker

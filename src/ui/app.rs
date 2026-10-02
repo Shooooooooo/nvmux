@@ -96,7 +96,7 @@ pub struct App {
     /// is asked several times per keystroke. In a `RefCell` because scoring
     /// takes `&mut` and `visible` is a read.
     matcher: RefCell<Matcher>,
-    /// Whether a session in flight leaves a trail at all: `[effects.session_name]
+    /// Whether a session in flight leaves a trail at all: `[effects.move]
     /// enabled`, under `[effects] enabled`, read once when the picker opens, as
     /// the rest of the config is.
     trail: bool,
@@ -110,7 +110,7 @@ pub struct App {
     /// The landing under way, from the key that put a session down until its
     /// dust settles. See [`super::landing`].
     landing: Option<Landing>,
-    /// Whether the row the cursor leaves glows: `[effects.afterglow] enabled`,
+    /// Whether the row the cursor leaves glows: `[effects.cursor] enabled`,
     /// under `[effects] enabled`. Read once when the picker opens, like `trail`.
     afterglow: bool,
     /// The rows the cursor has just left and is still glowing on, by session
@@ -192,11 +192,11 @@ impl App {
             came_from: None,
             pressed: None,
             matcher: RefCell::new(Matcher::new(Config::DEFAULT)),
-            trail: crate::config::get().effects.session_name_enabled(),
+            trail: crate::config::get().effects.move_enabled(),
             after: Starfield::seeded(),
             before: Starfield::seeded(),
             landing: None,
-            afterglow: crate::config::get().effects.afterglow_enabled(),
+            afterglow: crate::config::get().effects.cursor_enabled(),
             glows: Vec::new(),
             sift: crate::config::get().effects.filter_enabled(),
             leaving: None,
@@ -2757,7 +2757,7 @@ mod tests {
         }
     }
 
-    /// `[effects.session_name] enabled = false`: a move is still a move, but nothing trails
+    /// `[effects.move] enabled = false`: a move is still a move, but nothing trails
     /// it and nothing asks for the faster clock.
     #[test]
     fn with_the_trail_off_a_move_is_drawn_still() {
@@ -2774,7 +2774,7 @@ mod tests {
     /// no config loaded, reads.
     #[test]
     fn the_trail_follows_the_config() {
-        assert!(crate::config::get().effects.session_name_enabled());
+        assert!(crate::config::get().effects.move_enabled());
         assert!(app(&["aaa"]).trail);
     }
 

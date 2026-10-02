@@ -1401,7 +1401,7 @@ mod tests {
         assert!(past.modifier.is_empty());
     }
 
-    /// `[effects.session_name] enabled = false`: the session is still picked up, marked and
+    /// `[effects.move] enabled = false`: the session is still picked up, marked and
     /// moved, with nothing streaming off either end of it.
     #[test]
     fn with_the_trail_off_a_session_in_flight_leaves_none() {

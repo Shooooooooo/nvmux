@@ -46,8 +46,9 @@ pub const SIFT: Duration = Duration::from_millis(120);
 
 /// How long the row the cursor leaves glows. Long enough that a quick `j j j`
 /// leaves a visible tail, short enough that one key's glow is gone before the
-/// next is pressed at an ordinary pace. Not a setting: unlike the fade's, this
-/// length holds nothing up, so there is nothing to tune it for but taste.
+/// next is pressed at an ordinary pace. Fixed, where the fade's length is
+/// configurable: the fade is waited on at every switch, and this holds nothing
+/// up.
 pub const AFTERGLOW: Duration = Duration::from_millis(180);
 
 /// The part of the afterglow the modifier fallback holds the bar for.
@@ -72,7 +73,7 @@ pub fn palette() -> Option<&'static Palette> {
 /// `NO_COLOR` answers no for all of them, as it does for the fade.
 pub fn want_palette() -> bool {
     let effects = &crate::config::get().effects;
-    let wanted = effects.afterglow_enabled() || effects.filter_enabled();
+    let wanted = effects.cursor_enabled() || effects.filter_enabled();
     wanted && std::env::var_os("NO_COLOR").is_none()
 }
 
