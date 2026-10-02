@@ -6,16 +6,19 @@
 //! the session dissolving in — with nothing carried from one to the next. The
 //! hand-off carries the one thing all three are about: the session's name.
 //!
-//! 1. The picker's fade-out dissolves everything but the name, which comes off
-//!    the selection's bar as plain text where it stood (see
-//!    [`crate::fade::fade_out_keeping`]).
+//! 1. The picker's fade-out dissolves everything but the name, closing in from
+//!    the top and the bottom onto its row, while the name comes off the
+//!    selection's bar as plain text where it stood (see
+//!    [`crate::fade::fade_out_keeping`] and [`crate::fade::Iris`]).
 //! 2. The screen the picker leaves for the client spawn is cleared with the
 //!    name still on it, in the one synchronized write, so the clear and the
 //!    name are never presented apart (see [`crate::ui`]'s `close_for_attach`).
 //!    It stays there through the probe and the first paint being held.
-//! 3. The session's fade-in paints the name over its frames as an overlay,
-//!    dissolving out as the session dissolves in — the cross-dissolve the
-//!    attach notice uses, from [`crate::shadow::Shadow::under`].
+//! 3. The session opens back out of the line the name stands on, that line
+//!    first and the rows furthest from it last, with the name painted over its
+//!    frames as an overlay, dissolving out as the session dissolves in — the
+//!    cross-dissolve the attach notice uses, from
+//!    [`crate::shadow::Shadow::under`].
 //!
 //! No frame is added to an attach: the name rides frames that were already
 //! being drawn. So it needs the fade, and the session's own fade with it

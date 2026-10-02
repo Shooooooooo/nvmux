@@ -280,9 +280,11 @@ pub struct BackSettings {
     pub enabled: bool,
 }
 
-/// An attach from the picker: the session's name kept on the screen while
-/// everything around it dissolves, through the client's start, and dissolved
-/// into the session as the session dissolves in (see [`crate::handoff`]).
+/// An attach from the picker: the picker closing in from the top and the
+/// bottom onto the chosen row with the session's name kept on the screen,
+/// through the client's start, and the session opening out of that line as
+/// the name dissolves into it (see [`crate::handoff`] and
+/// [`crate::fade::Iris`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AttachSettings {
@@ -686,9 +688,9 @@ fn render_default_config(prefix: u8) -> String {
          # enabled = {back_enabled}\n\
          \n\
          [effects.attach]\n\
-         # An attach from the picker keeps the session's name on screen as the\n\
-         # picker dissolves, and dissolves it into the session. Rides the fade,\n\
-         # so it needs [effects.fade] on, with session.\n\
+         # An attach from the picker closes onto the chosen row, keeping the\n\
+         # session's name on screen, and opens the session out of that line.\n\
+         # Rides the fade, so it needs [effects.fade] on, with session.\n\
          # enabled = {attach_enabled}\n\
          \n\
          [effects.kill]\n\
