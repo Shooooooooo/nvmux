@@ -60,11 +60,11 @@ pub const SIFT: Duration = Duration::from_millis(120);
 /// next is pressed at an ordinary pace. Fixed, where the fade's length is
 /// configurable: the fade is waited on at every switch, and this holds nothing
 /// up.
-pub const AFTERGLOW: Duration = Duration::from_millis(180);
+pub const AFTERGLOW: Duration = Duration::from_millis(120);
 
-/// How long the glint takes to cross the row the cursor lands on. A touch
-/// longer than the afterglow, so the two read as one movement: the old row
-/// letting go while the light runs across the new one. Like the afterglow it
+/// How long the glint takes to cross the row the cursor lands on. Longer
+/// than the afterglow, so the two read as one movement: the old row letting
+/// go quickly while the light runs across the new one. Like the afterglow it
 /// holds nothing up, and the next move simply takes it to the next row.
 pub const GLINT: Duration = Duration::from_millis(260);
 
@@ -448,7 +448,7 @@ mod tests {
         assert_eq!(cell.bg, rgb(p.fg), "starts as the selection's bar");
         assert_eq!(cell.fg, rgb(p.bg));
 
-        a.tick(Duration::from_millis(90));
+        a.tick(AFTERGLOW / 2);
         let buf = frame(&a, Some(&p));
         let cell = first_glyph(&buf, row_of(&buf, "one"));
         let Color::Rgb(r, ..) = cell.bg else {
@@ -490,7 +490,7 @@ mod tests {
             paint(f, &a, None);
         });
 
-        a.tick(Duration::from_millis(100));
+        a.tick(AFTERGLOW / 2);
         let buf = frame(&a, None);
         let cell = first_glyph(&buf, row_of(&buf, "one"));
         assert!(!cell.modifier.contains(Modifier::REVERSED), "let go");
