@@ -165,8 +165,8 @@ impl EffectsSettings {
         self.enabled && self.cursor.enabled
     }
 
-    /// Whether coming back to the picker from a session sends rings out from
-    /// its row: its own switch and the master one.
+    /// Whether coming back to the picker from a session sends rings pulsing
+    /// out from its row: its own switch and the master one.
     pub fn back_enabled(&self) -> bool {
         self.enabled && self.back.enabled
     }
@@ -265,8 +265,9 @@ pub struct CursorSettings {
 }
 
 /// Coming back to the picker from a session with `<prefix> Space`: rings of
-/// braille going out from that session's row, so it is plain which one `Esc`
-/// returns to (see [`crate::ui::sonar`]).
+/// braille pulsing out from that session's row every few seconds while the
+/// picker is up, so it is plain which one `Esc` returns to (see
+/// [`crate::ui::sonar`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BackSettings {
@@ -680,7 +681,8 @@ fn render_default_config(prefix: u8) -> String {
          # enabled = {cursor_enabled}\n\
          \n\
          [effects.back]\n\
-         # Back in the picker from a session, rings go out from its row.\n\
+         # Back in the picker from a session, rings pulse from its row every\n\
+         # few seconds while the picker is up.\n\
          # enabled = {back_enabled}\n\
          \n\
          [effects.attach]\n\

@@ -141,8 +141,8 @@ pub struct App {
     /// Whether coming back to the picker from a session sends rings out from
     /// it: `[effects.back] enabled`.
     back: bool,
-    /// The session the picker was opened from, while the rings go out from
-    /// it. See [`App::set_came_from`].
+    /// The session the picker was opened from, and the rings pulsing out from
+    /// it, for as long as it is listed. See [`App::set_came_from`].
     sonar: Option<(String, Sonar)>,
 }
 
@@ -241,12 +241,17 @@ impl App {
     /// does not move the highlight to an unrelated row.
     ///
     /// A fresh listing is the truth about the rows, so whatever was passing
-    /// over the old ones — an erased row, a glow, a fade, rings — ends with it.
+    /// over the old ones — an erased row, a glow, a fade — ends with it. Not
+    /// the rings, which mark the session `Esc` goes back to, not a moment on
+    /// the screen: they go on while that session is listed.
     pub fn set_sessions(&mut self, sessions: Vec<Session>) {
         let previously = self.selected_id();
         self.backspace = None;
         self.strike = None;
-        self.sonar = None;
+        self.sonar = self
+            .sonar
+            .take()
+            .filter(|(id, _)| sessions.iter().any(|s| &s.id == id));
         self.glows.clear();
         self.glint = None;
         self.leaving = None;
@@ -361,9 +366,6 @@ impl App {
         }
         if let Some((_, sonar)) = &mut self.sonar {
             sonar.advance(elapsed);
-            if sonar.done() {
-                self.sonar = None;
-            }
         }
         if let Some(landing) = &mut self.landing {
             landing.advance(elapsed);
@@ -376,9 +378,11 @@ impl App {
     /// Whether anything on screen is moving, and so whether the caller should
     /// draw at a frame's pace rather than wait on the keyboard: a trail, a
     /// glow, a glint, a fading row, a line being struck or drawn back, a row
-    /// being erased, or rings. A line all the way across is still, and asks
-    /// for nothing while the `[y/N]` waits. With every effect off this is only
-    /// ever false, and the picker changes on a key and nothing else.
+    /// being erased, or a pulse of rings. A line all the way across is still,
+    /// and asks for nothing while the `[y/N]` waits; so are the rings between
+    /// pulses, which [`App::wake_in`] answers for instead. With every effect
+    /// off this is only ever false, and the picker changes on a key and nothing
+    /// else.
     pub fn animating(&self) -> bool {
         self.trailing()
             || !self.glows.is_empty()
@@ -386,8 +390,15 @@ impl App {
             || self.leaving.is_some()
             || self.striking()
             || self.erasing()
-            || self.sonar.is_some()
+            || self.sonar.as_ref().is_some_and(|(_, s)| s.pulsing())
             || self.landing.is_some()
+    }
+
+    /// How long until something starts moving that is still now — the next
+    /// pulse of rings — so the caller's wait on the keyboard can end then,
+    /// rather than up to a tick late. `None` when nothing is due.
+    pub fn wake_in(&self) -> Option<Duration> {
+        self.sonar.as_ref().map(|(_, s)| s.until_next())
     }
 
     /// The landing under way, if a session has just been put down.
@@ -468,8 +479,8 @@ impl App {
         self.backspace.as_ref().is_some_and(|(_, b)| !b.done())
     }
 
-    /// The session the picker came back up over, by id, and its rings, while
-    /// they are going out.
+    /// The session the picker came back up over, by id, and the rings that
+    /// pulse out from it.
     pub fn sonar(&self) -> Option<(&str, &Sonar)> {
         self.sonar.as_ref().map(|(id, s)| (id.as_str(), s))
     }
@@ -850,9 +861,6 @@ impl App {
         // Nor the rows the last keystroke dropped: the list is the query's
         // again, so a fast typist never waits on rows ruled out a letter ago.
         self.leaving = None;
-        // Nor the rings: they say where `Esc` goes back to, which by the first
-        // key has been seen or no longer matters.
-        self.sonar = None;
         let was = self.cursor();
         let visible = self.visible_ids();
 
@@ -1032,15 +1040,13 @@ impl App {
     /// moves the selection, or the row in flight, one row at a time and stops
     /// at the ends.
     ///
-    /// A press or a wheel step ends what a key would end: a stale message, a
-    /// half-typed number and the rings. A hover, a drag or a release ends
-    /// nothing, since none of them is something the user did on purpose *to*
-    /// the picker.
+    /// A press or a wheel step ends what a key would end: a stale message and a
+    /// half-typed number. A hover, a drag or a release ends nothing, since none
+    /// of them is something the user did on purpose *to* the picker.
     pub fn on_mouse(&mut self, mouse: Mouse) -> Request {
         if matches!(mouse, Mouse::Press(_) | Mouse::ScrollUp | Mouse::ScrollDown) {
             self.message = None;
             self.pending = None;
-            self.sonar = None;
         }
         let was = self.cursor();
         let request = self.on_mouse_mode(mouse);

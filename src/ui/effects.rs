@@ -870,7 +870,7 @@ mod tests {
     #[test]
     fn rings_never_land_on_a_row() {
         let names = ["session 3 is long", "x", "y"];
-        for ms in (0..sonar::LENGTH.as_millis() as u64).step_by(5) {
+        for ms in (0..sonar::PULSE.as_millis() as u64).step_by(5) {
             let a = back_over(&names, 1, ms);
             let lines = test_support::render(W, H, |f| {
                 draw::draw(f, &a);
@@ -892,7 +892,7 @@ mod tests {
     /// colour is set at any point.
     #[test]
     fn without_a_palette_rings_are_dim_braille() {
-        for ms in (0..sonar::LENGTH.as_millis() as u64).step_by(20) {
+        for ms in (0..sonar::PULSE.as_millis() as u64).step_by(20) {
             let a = back_over(&["api-server", "dotfiles", "notes"], 1, ms);
             test_support::assert_no_colour(W, H, |f| {
                 draw::draw(f, &a);
@@ -909,18 +909,34 @@ mod tests {
         );
     }
 
-    /// The rings run their course and stop asking for frames — or stop at
-    /// once on the first key, which has seen them or moved on.
+    /// The rings pulse, then rest without asking for frames — saying instead
+    /// when the next pulse is due — and pulse again. A key does not stop them:
+    /// `Esc` still goes back to that session after one.
     #[test]
-    fn rings_end_on_time_or_on_a_key() {
-        let done = back_over(&["one", "two"], 1, sonar::LENGTH.as_millis() as u64);
-        assert!(done.sonar().is_none());
-        assert!(!done.animating());
+    fn rings_pulse_on_a_period_and_go_on_through_keys() {
+        let mut a = back_over(&["one", "two"], 1, sonar::PULSE.as_millis() as u64);
+        assert!(a.sonar().is_some(), "still there between pulses");
+        assert!(!a.animating(), "nothing moving between pulses");
+        assert_eq!(a.wake_in(), Some(sonar::PERIOD - sonar::PULSE));
 
-        let mut a = back_over(&["one", "two"], 1, 50);
-        assert!(a.sonar().is_some());
         a.on_key(Key::Char('j'));
-        assert!(a.sonar().is_none(), "a key ends them");
+        a.tick(sonar::PERIOD - sonar::PULSE);
+        assert!(a.animating(), "the next pulse, on time");
+        assert!(a.sonar().is_some_and(|(_, s)| !s.rings().is_empty()));
+        assert_eq!(a.wake_in(), Some(Duration::ZERO));
+    }
+
+    /// A fresh listing keeps the rings while the session they mark is in it,
+    /// and ends them once it is not.
+    #[test]
+    fn a_fresh_listing_keeps_the_rings_while_their_session_is_listed() {
+        let mut a = back_over(&["one", "two"], 1, 50);
+        let listed = a.sessions().to_vec();
+        a.set_sessions(listed.clone());
+        assert!(a.sonar().is_some(), "still listed");
+        a.set_sessions(vec![listed[0].clone()]);
+        assert!(a.sonar().is_none(), "the session they marked has gone");
+        assert_eq!(a.wake_in(), None);
     }
 
     /// A session that has gone from the list sends out no rings: there is no

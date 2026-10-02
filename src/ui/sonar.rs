@@ -3,9 +3,16 @@
 //!
 //! `<prefix> Space` opens the picker with the cursor already on that session,
 //! but a cursor is easy to take for wherever the list happened to start. Three
-//! rings leave both ends of its row, a beat apart, and thin out as they go —
-//! all within two thirds of a second of the picker coming up, and ended early
-//! by any key, since by then the eye has either found the row or moved on.
+//! rings leave both ends of its row, a beat apart, and thin out as they go:
+//! a pulse of two thirds of a second, sent out again every [`PERIOD`] for as
+//! long as the picker is up and the session is listed.
+//!
+//! Keys do not stop it. `Esc` goes back to that session after a move, a
+//! filter or a rename just as it does on arrival, so the row is worth marking
+//! for as long as that is true — and a ring only ever lands on the terminal's
+//! own background, never on a row, so it is in nobody's way. Between pulses
+//! nothing moves, and the picker sleeps until the next is due rather than
+//! drawing frames that would all be the same (see [`Sonar::until_next`]).
 //!
 //! # Braille, in three weights
 //!
@@ -47,9 +54,14 @@ const HALF: f32 = 0.65;
 /// How far out a ring has to be before it curves over the rows beside its own.
 const ARC_FROM: u16 = 2;
 
-/// The longest the sonar runs: the last ring's start, and then its life.
-pub const LENGTH: Duration =
+/// One pulse: the last ring's start, and then its life.
+pub const PULSE: Duration =
     Duration::from_millis(((RINGS - 1) as u64) * GAP.as_millis() as u64 + LIFE.as_millis() as u64);
+
+/// From the start of one pulse to the start of the next. Long enough that the
+/// rest is most of it — a ping, not a flicker going on beside the list — and
+/// short enough that a glance at the picker meets one before long.
+pub const PERIOD: Duration = Duration::from_millis(2500);
 
 /// A ring's edge on the row's own line, left of the row and right of it.
 const EDGES: [(char, char); 3] = [('⡇', '⢸'), ('⠆', '⠰'), ('⠂', '⠐')];
@@ -97,15 +109,35 @@ impl Sonar {
         self.age += elapsed;
     }
 
-    pub fn done(&self) -> bool {
-        self.age >= LENGTH
+    /// How far into the current period it is: in a pulse while this is under
+    /// [`PULSE`], resting after.
+    fn phase(&self) -> Duration {
+        let nanos = self.age.as_nanos() % PERIOD.as_nanos();
+        Duration::from_nanos(u64::try_from(nanos).unwrap_or(0))
     }
 
-    /// The rings out now, oldest — furthest out — first.
+    /// Whether a pulse is going out now, rather than the sonar resting.
+    pub fn pulsing(&self) -> bool {
+        self.phase() < PULSE
+    }
+
+    /// How long until the next pulse starts — nothing, while one is going.
+    /// What lets the caller sleep through a rest rather than draw it.
+    pub fn until_next(&self) -> Duration {
+        let phase = self.phase();
+        if phase < PULSE {
+            Duration::ZERO
+        } else {
+            PERIOD - phase
+        }
+    }
+
+    /// The rings out now, oldest — furthest out — first. None while resting.
     pub fn rings(&self) -> Vec<Ring> {
+        let phase = self.phase();
         (0..RINGS)
             .filter_map(|i| {
-                let since = self.age.checked_sub(GAP * i)?;
+                let since = phase.checked_sub(GAP * i)?;
                 let life = since.as_secs_f32() / LIFE.as_secs_f32();
                 if life >= 1.0 {
                     return None;
@@ -180,7 +212,7 @@ mod tests {
     #[test]
     fn every_glyph_is_braille() {
         let braille = |c: char| (0x2801..=0x28ff).contains(&(c as u32));
-        for ms in (0..LENGTH.as_millis() as u64).step_by(5) {
+        for ms in (0..PULSE.as_millis() as u64).step_by(5) {
             for r in at(ms).rings() {
                 assert!(braille(r.left) && braille(r.right), "{r:?} at {ms} ms");
             }
@@ -190,13 +222,24 @@ mod tests {
         }
     }
 
-    /// It ends on time, with nothing left.
+    /// A pulse runs its course and the sonar rests — no rings, and the time
+    /// to the next one — and then the same pulse goes out again, on the
+    /// period.
     #[test]
-    fn it_ends_on_time() {
-        assert!(!at(LENGTH.as_millis() as u64 - 1).done());
-        let end = at(LENGTH.as_millis() as u64);
-        assert!(end.done());
-        assert!(end.rings().is_empty());
-        assert!(LENGTH <= Duration::from_millis(700), "{LENGTH:?}");
+    fn it_pulses_rests_and_pulses_again() {
+        let pulse = PULSE.as_millis() as u64;
+        let period = PERIOD.as_millis() as u64;
+        assert!(at(pulse - 1).pulsing());
+        let resting = at(pulse);
+        assert!(!resting.pulsing());
+        assert!(resting.rings().is_empty());
+        assert_eq!(resting.until_next(), PERIOD - PULSE);
+        assert!(at(period - 1).rings().is_empty(), "still resting");
+        assert!(at(period).pulsing(), "on the period");
+        assert_eq!(at(period + 10).rings(), at(10).rings(), "the same pulse");
+        assert_eq!(at(3 * period + 200).rings(), at(200).rings(), "and again");
+        assert_eq!(at(10).until_next(), Duration::ZERO, "mid-pulse");
+        assert!(PULSE <= Duration::from_millis(700), "{PULSE:?}");
+        assert!(PERIOD > PULSE * 2, "more rest than pulse");
     }
 }

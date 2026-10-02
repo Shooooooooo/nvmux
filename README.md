@@ -155,7 +155,7 @@ enabled = true   # stars off both ends of a session being moved, and its landing
 enabled = true   # the row the cursor leaves fades back; a glint crosses the next
 
 [effects.back]
-enabled = true   # back from a session, rings go out from its row in the picker
+enabled = true   # back from a session, rings pulse from its row in the picker
 
 [effects.attach]
 enabled = true   # the session's name stays up through an attach; needs the fade
