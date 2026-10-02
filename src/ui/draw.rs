@@ -24,7 +24,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::app::{App, Mode};
 use super::dust::Dust;
-use super::landing::{self, Landing, Side};
+use super::landing::{Landing, Side, Tier};
 use super::starfield;
 
 /// The marker on the selected row. Unselected rows are indented to match, so
@@ -197,7 +197,6 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     let landing = app.landing();
     let pull = landing.and_then(Landing::pulling);
     let reordering = matches!(app.mode(), Mode::Reorder { .. }) || pull.is_some();
-    let flinch = landing.is_some_and(Landing::flinch);
     let selected_row = app.selected_row();
     let dust = app.dust();
 
@@ -214,8 +213,6 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
             let selected = i == selected_row && !row.leaving;
             let style = if selected {
                 Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-            } else if flinch && i.abs_diff(selected_row) == 1 {
-                Style::default().add_modifier(Modifier::DIM)
             } else {
                 Style::default()
             };
@@ -250,19 +247,22 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         draw_trails(frame, app, block, offset, num_width, pull);
     }
     if let Some(landing) = landing {
-        draw_landing(frame, app, block, offset, num_width, landing);
+        draw_landing(frame, app, area, block, offset, num_width, landing);
     }
 }
 
-/// The landing's impact and its spray, on the row just put down (see
-/// [`super::landing`]): for a moment the reversed bar runs [`landing::WIDEN`]
-/// cells further at each end, and dust flies out of both ends, level with the
-/// text. Like the trails, both go over the terminal's own background beyond
-/// the block, never over the row, and stop at the edge of the screen. The
-/// spray only lands on blank cells.
+/// The landing's bounce and its spray, on the row just put down (see
+/// [`super::landing`]): the reversed bar runs further at each end and back
+/// again ([`super::landing::BOUNCE`]), and dust flies out of both ends, level with
+/// the text, with a little kicked onto the rows above and below. Like the
+/// trails, all of it goes over the terminal's own background beyond the
+/// names, never over one, and stops at the edge of the screen; the splash
+/// stops at the edge of the list's `area` too, so it never reaches the hint
+/// row. Dust only lands on blank cells.
 fn draw_landing(
     frame: &mut Frame,
     app: &App,
+    area: Rect,
     block: Rect,
     offset: usize,
     num_width: usize,
@@ -286,19 +286,39 @@ fn draw_landing(
         session.name
     );
     let right = block.x + drawn.width().min(block.width as usize) as u16;
-    let area = frame.area();
-    let on_screen = |x: u16| x >= area.x && x < area.x + area.width;
+    let screen = frame.area();
+    let on_screen = |x: u16| x >= screen.x && x < screen.x + screen.width;
+    let in_list = |y: u16| y >= area.y && y < area.y + area.height;
     let buf = frame.buffer_mut();
+    // Where a row's own text ends within the block. A row away, the splash
+    // flies from whichever ends later, the landed bar or that row's text: it
+    // lands beside the list however long the names, and never in the gap
+    // inside one.
+    let text_end = |buf: &ratatui::buffer::Buffer, y: u16| {
+        (block.x..block.x + block.width)
+            .rev()
+            .find(|x| buf[(*x, y)].symbol() != " ")
+            .map_or(block.x, |x| x + 1)
+    };
 
     for grain in landing.spray() {
+        let at = match grain.tier {
+            Tier::Above => y.checked_sub(1),
+            Tier::Level => Some(y),
+            Tier::Below => y.checked_add(1),
+        };
+        let Some(at) = at.filter(|at| in_list(*at)) else {
+            continue;
+        };
         let x = match grain.side {
-            Side::After => right.checked_add(grain.offset),
+            Side::After if at == y => right.checked_add(grain.offset),
+            Side::After => right.max(text_end(buf, at)).checked_add(grain.offset),
             Side::Before => left.checked_sub(grain.offset + 1),
         };
         let Some(x) = x.filter(|x| on_screen(*x)) else {
             continue;
         };
-        if buf[(x, y)].symbol() != " " {
+        if buf[(x, at)].symbol() != " " {
             continue;
         }
         let style = if grain.dim {
@@ -306,16 +326,15 @@ fn draw_landing(
         } else {
             Style::default()
         };
-        buf.set_string(x, y, grain.glyph.to_string(), style);
+        buf.set_string(x, at, grain.glyph.to_string(), style);
     }
 
-    if landing.impact() {
-        let bar = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
-        let before = (1..=landing::WIDEN).filter_map(|d| left.checked_sub(d));
-        let after = (0..landing::WIDEN).map(|d| right + d);
-        for x in before.chain(after).filter(|x| on_screen(*x)) {
-            buf.set_string(x, y, " ", bar);
-        }
+    let widen = landing.widen();
+    let bar = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
+    let before = (1..=widen).filter_map(|d| left.checked_sub(d));
+    let after = (0..widen).map(|d| right + d);
+    for x in before.chain(after).filter(|x| on_screen(*x)) {
+        buf.set_string(x, y, " ", bar);
     }
 }
 
@@ -730,6 +749,7 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::app::Key;
+    use super::super::landing;
     use super::super::test_support::{self, filtering, picker as app};
     use super::*;
 
@@ -1694,9 +1714,35 @@ mod tests {
         (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
     }
 
+    /// Where the landed bar starts and ends on row `y`: the marker's column,
+    /// and the column past the pad after the name.
+    fn bar_ends(buf: &ratatui::buffer::Buffer, y: u16, drawn: &str) -> (u16, u16) {
+        let text = line(buf, y);
+        let first = text
+            .find('▸')
+            .map(|b| text[..b].chars().count() as u16)
+            .unwrap();
+        (
+            first,
+            first + drawn.chars().count() as u16 + PAD.width() as u16,
+        )
+    }
+
+    /// The bar's own reach on row `y` either side of it at `ms` after the
+    /// landing: how many reversed cells it runs to before `first` and from
+    /// `end`.
+    fn reach(a: &App, y: u16) -> (u16, u16) {
+        let buf = test_support::buffer(50, 8, |f| draw(f, a));
+        let (first, end) = bar_ends(&buf, y, "▸ 2  notes");
+        let reversed = |x: u16| buf[(x, y)].modifier.contains(Modifier::REVERSED);
+        let before = (1..=first).take_while(|d| reversed(first - d)).count() as u16;
+        let after = (end..buf.area.width).take_while(|x| reversed(*x)).count() as u16;
+        (before, after)
+    }
+
     /// While the trail is pulled in the row still looks in flight; on impact
-    /// the numbers come back, the bar is wider at both ends and the rows
-    /// beside it flinch.
+    /// the numbers come back and the bar runs two cells further at both ends,
+    /// with blanks, and the rows beside it are left as they are.
     #[test]
     fn a_session_put_down_looks_in_flight_until_it_lands() {
         let pulling = landed(30);
@@ -1712,33 +1758,42 @@ mod tests {
         assert!(lines[y as usize].contains("▸ 2  notes"), "{lines:#?}");
         assert!(lines.iter().any(|l| l.contains("3  docs")));
 
-        let text = line(&buf, y);
-        let first = text
-            .find('▸')
-            .map(|b| text[..b].chars().count() as u16)
-            .unwrap();
-        let end = first + "▸ 2  notes".chars().count() as u16 + PAD.width() as u16;
-        for x in (first - landing::WIDEN..first).chain(end..end + landing::WIDEN) {
+        let (first, end) = bar_ends(&buf, y, "▸ 2  notes");
+        for x in (first - 2..first).chain(end..end + 2) {
             let cell = &buf[(x, y)];
             assert_eq!(cell.symbol(), " ", "the bar widens with blanks at {x}");
             assert!(cell.modifier.contains(Modifier::REVERSED), "at {x}");
         }
-        let past = &buf[(end + landing::WIDEN, y)];
-        assert!(
-            !past.modifier.contains(Modifier::REVERSED),
-            "and no further"
-        );
+        assert_eq!(reach(&impact, y), (2, 2), "and no further");
 
         for neighbour in [y - 1, y + 1] {
-            let cell = (0..buf.area.width)
-                .map(|x| &buf[(x, neighbour)])
-                .find(|c| c.symbol().trim() != "")
-                .expect("a neighbour");
-            assert!(
-                cell.modifier.contains(Modifier::DIM),
-                "row {neighbour} flinches"
-            );
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, neighbour)];
+                if cell.symbol().trim() == "" || is_braille(cell.symbol()) {
+                    continue;
+                }
+                let number = cell.symbol().chars().all(|c| c.is_ascii_digit());
+                assert_eq!(
+                    cell.modifier.contains(Modifier::DIM),
+                    number,
+                    "row {neighbour} at {x}: only its number is dim"
+                );
+            }
         }
+    }
+
+    /// The bar bounces: two cells out at each end, back, one out, and still.
+    #[test]
+    fn a_landed_bar_bounces_once() {
+        let pull = landing::PULL.as_millis() as u64;
+        let y = line_of(&render(&landed(pull + 10), 50, 8), "notes");
+        let mut at = 0;
+        for (lasts, cells) in landing::BOUNCE {
+            let mid = at + lasts.as_millis() as u64 / 2;
+            assert_eq!(reach(&landed(pull + mid), y), (cells, cells), "{mid} ms in");
+            at += lasts.as_millis() as u64;
+        }
+        assert_eq!(reach(&landed(pull + at + 20), y), (0, 0), "at rest");
     }
 
     /// After the impact, dust flies out of both ends on the row's own line,
@@ -1750,12 +1805,8 @@ mod tests {
         let a = landed(landing::PULL.as_millis() as u64 + 80);
         let buf = test_support::buffer(50, 8, |f| draw(f, &a));
         let y = line_of(&render(&a, 50, 8), "notes");
+        let (first, end) = bar_ends(&buf, y, "▸ 2  notes");
         let text = line(&buf, y);
-        let first = text
-            .find('▸')
-            .map(|b| text[..b].chars().count() as u16)
-            .unwrap();
-        let end = first + "▸ 2  notes".chars().count() as u16 + PAD.width() as u16;
 
         let mut before = 0;
         let mut after = 0;
@@ -1779,12 +1830,77 @@ mod tests {
             }
         }
         assert!(before > 0 && after > 0, "both ends: {text:?}");
-        for other in (0..buf.area.height).filter(|r| *r != y) {
-            assert!(!line(&buf, other)
-                .chars()
-                .any(|c| is_braille(&c.to_string())));
+        for other in (0..buf.area.height).filter(|r| r.abs_diff(y) > 1) {
+            assert!(
+                !line(&buf, other)
+                    .chars()
+                    .any(|c| is_braille(&c.to_string())),
+                "dust on row {other}, more than a row from the landing"
+            );
         }
         test_support::assert_no_colour(50, 8, |f| draw(f, &a));
+    }
+
+    /// The splash lands on the rows either side, from both ends: beside the
+    /// list, past a neighbour's name even where it runs longer than the landed
+    /// one, never on its text, and in the dots nearest the landed row.
+    #[test]
+    fn a_landed_session_splashes_the_rows_beside_it() {
+        let pull = landing::PULL.as_millis() as u64;
+        let first_frame = landed(pull);
+        let y = line_of(&render(&first_frame, 50, 8), "notes");
+        let mut seen = [[false; 2]; 2];
+        for ms in (pull..=landing::LENGTH.as_millis() as u64).step_by(5) {
+            let a = landed(ms);
+            let buf = test_support::buffer(50, 8, |f| draw(f, &a));
+            let (first, _) = bar_ends(&buf, y, "▸ 2  notes");
+            for (i, (row, name, edge)) in [
+                (y - 1, "api-server", 0x40 | 0x80),
+                (y + 1, "docs", 0x01 | 0x08),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let text = line(&buf, row);
+                let name_end = text
+                    .find(name)
+                    .map(|b| text[..b].chars().count() + name.chars().count())
+                    .unwrap() as u16;
+                for x in (0..buf.area.width).filter(|x| is_braille(buf[(*x, row)].symbol())) {
+                    assert!(
+                        x < first || x >= name_end,
+                        "on {name}'s text at {x}, {ms} ms"
+                    );
+                    let bits = buf[(x, row)].symbol().chars().next().unwrap() as u32 - 0x2800;
+                    assert_eq!(bits & !edge, 0, "{x} on row {row} is off its edge");
+                    seen[i][usize::from(x >= name_end)] = true;
+                }
+            }
+            test_support::assert_no_colour(50, 8, |f| draw(f, &a));
+        }
+        assert_eq!(seen, [[true; 2]; 2], "both ends of both rows");
+    }
+
+    /// The splash stays within the list's area: none of it reaches the hint
+    /// row, though the landed row sits right above it. A short message there
+    /// leaves the row blank enough for a grain to land on, if one could.
+    #[test]
+    fn the_splash_stays_off_the_hint_row() {
+        for ms in (0..=landing::LENGTH.as_millis() as u64).step_by(10) {
+            let mut a = trailing(&["api-server", "docs", "notes"], 1);
+            a.tick(std::time::Duration::from_millis(200));
+            a.on_key(Key::Char('j'));
+            a.on_key(Key::Enter);
+            a.set_message("ok");
+            a.tick(std::time::Duration::from_millis(ms));
+            let buf = test_support::buffer(40, 4, |f| draw(f, &a));
+            assert!(line(&buf, 2).contains("docs"), "landed right above it");
+            assert!(
+                !line(&buf, 3).chars().any(|c| is_braille(&c.to_string())),
+                "dust on the hint row at {ms} ms: {:?}",
+                line(&buf, 3)
+            );
+        }
     }
 
     /// Once it has settled there is nothing left of it, and the picker stops

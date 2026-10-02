@@ -2,28 +2,34 @@
 //!
 //! The trail ([`super::starfield`]) says a session is in the air; this says it
 //! has come down, and has to be seen to, or a move ends on the trail simply
-//! stopping. Four beats, all within half a second of the key:
+//! stopping. Three beats, all within half a second of the key:
 //!
 //! 1. **Pull** ([`PULL`]): the stars of both trails are drawn back into the
 //!    row, as if the row caught them. The row still looks in flight — the `⇕`
 //!    and the blank number column — until the end of this beat.
-//! 2. **Impact** ([`IMPACT`]): for a moment the reversed bar is two cells wider
-//!    at each end, and on that same frame the marker and the numbers come
+//! 2. **Bounce** ([`BOUNCE`]): the reversed bar runs two cells further at each
+//!    end, snaps back, runs one cell further, and rests: the row bouncing once
+//!    as it hits the floor. On its first frame the marker and the numbers come
 //!    back. It is the frame the eye reads as the landing.
-//! 3. **Flinch** ([`FLINCH`]): the rows directly above and below go dim, as if
-//!    jolted, and come back.
-//! 4. **Spray**: dust shoots straight out of both ends of the row, level with
-//!    the text, and settles.
+//! 3. **Spray**: dust shoots straight out of both ends of the row, level with
+//!    the text, and settles. A little more is kicked onto the rows above and
+//!    below, beside the list: the splash.
 //!
 //! # Level with the text
 //!
 //! The spray is braille built from the two middle rows of dots only: `⠶` at
 //! first, thinning to one row (`⠒` or `⠤`) and then to one dot. Half the
 //! grains keep to the upper middle row and half to the lower, so the spray is
-//! centred on the name rather than hanging above or below it. Braille is one
-//! column on every terminal and sets no colour, so, like the trail, this is
-//! correct under `NO_COLOR` by construction; the impact and the flinch are the
-//! reversed and dim modifiers.
+//! centred on the name rather than hanging above or below it.
+//!
+//! The splash keeps to the edge of its row nearest the one that landed: the
+//! bottom row of dots on the row above, the top row on the row below, both
+//! dots at first and then the one at its leading edge. So it reads as kicked
+//! up off the landed row rather than as dust of the rows it lands on.
+//!
+//! Braille is one column on every terminal and sets no colour, so, like the
+//! trail, this is correct under `NO_COLOR` by construction; the bounce is the
+//! reversed modifier.
 //!
 //! # Time, and the seed
 //!
@@ -38,14 +44,13 @@ use super::starfield::Rng;
 /// How long the trail takes to be pulled into the row.
 pub const PULL: Duration = Duration::from_millis(70);
 
-/// How long the bar stays widened, from the end of the pull.
-pub const IMPACT: Duration = Duration::from_millis(55);
-
-/// How long the rows beside it stay dim, from the end of the pull.
-pub const FLINCH: Duration = Duration::from_millis(90);
-
-/// How many cells the bar widens by at each end on impact.
-pub const WIDEN: u16 = 2;
+/// The bounce, from the end of the pull: how many cells further the bar runs
+/// at each end, and for how long — out, back, out by less, and then still.
+pub const BOUNCE: [(Duration, u16); 3] = [
+    (Duration::from_millis(55), 2),
+    (Duration::from_millis(30), 0),
+    (Duration::from_millis(40), 1),
+];
 
 /// Grains of dust, shared between the two ends.
 const GRAINS: usize = 14;
@@ -70,9 +75,28 @@ const FAR: f32 = 0.45;
 const UPPER: [char; 5] = ['⠶', '⠒', '⠒', '⠂', '⠐'];
 const LOWER: [char; 5] = ['⠶', '⠤', '⠤', '⠄', '⠠'];
 
-/// The longest a landing runs, from the key to the last grain settling.
+/// Grains of the splash, shared between the two ends and the rows above and
+/// below. Fewer than the spray, and they go less far and last less long: it is
+/// what the spray kicks up, not a second spray.
+const SPLASH: usize = 8;
+const SPLASH_NEAREST: f32 = 1.0;
+const SPLASH_FURTHER: f32 = 4.0;
+const SPLASH_SHORTEST: f32 = 0.15;
+const SPLASH_LONGER: f32 = 0.10;
+
+/// A splash grain's glyph through its life, flying right: both dots of the
+/// row nearest the landed row, then the one at the leading edge. The bottom
+/// dots on the row above, the top dots on the row below.
+const ABOVE: [char; 2] = ['⣀', '⢀'];
+const BELOW: [char; 2] = ['⠉', '⠈'];
+
+/// The longest a landing runs, from the key to the last grain settling. The
+/// spray's grains outlive the splash's, so it is theirs.
 pub const LENGTH: Duration =
     Duration::from_millis(70 + ((STAGGER + SHORTEST + LONGER) * 1000.0) as u64);
+
+// The splash must be over by the time the spray is, or `done` would cut it off.
+const _: () = assert!(SPLASH_SHORTEST + SPLASH_LONGER <= SHORTEST + LONGER);
 
 /// Which end of the row a grain leaves from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,12 +107,25 @@ pub enum Side {
     After,
 }
 
+/// Which row a grain is on, against the row that landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    /// The row above: the splash.
+    Above,
+    /// The landed row itself: the spray.
+    Level,
+    /// The row below: the splash.
+    Below,
+}
+
 /// One grain of the spray, for the renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Grain {
     pub side: Side,
+    pub tier: Tier,
     /// Cells out from the end of the row it left, past the cell next to it:
-    /// 1 leaves that one cell clear.
+    /// 1 leaves that one cell clear. On the landed row the spray always does;
+    /// the splash, a row away, starts right beside it.
     pub offset: u16,
     pub glyph: char,
     pub dim: bool,
@@ -129,51 +166,87 @@ impl Landing {
         (self.age < PULL).then(|| self.age.as_secs_f32() / PULL.as_secs_f32())
     }
 
-    /// Whether this is the moment of impact, when the bar is widened.
-    pub fn impact(&self) -> bool {
-        self.since_impact().is_some_and(|t| t < IMPACT)
+    /// How many cells further the bar runs at each end now: the bounce, and 0
+    /// before and after it.
+    pub fn widen(&self) -> u16 {
+        let Some(mut since) = self.since_impact() else {
+            return 0;
+        };
+        for (lasts, cells) in BOUNCE {
+            if since < lasts {
+                return cells;
+            }
+            since -= lasts;
+        }
+        0
     }
 
-    /// Whether the rows beside the landed one are flinching.
-    pub fn flinch(&self) -> bool {
-        self.since_impact().is_some_and(|t| t < FLINCH)
-    }
-
-    /// The dust in the air now.
+    /// The dust in the air now: the spray, and the splash it kicks up.
     pub fn spray(&self) -> Vec<Grain> {
         let Some(since) = self.since_impact() else {
             return Vec::new();
         };
         let since = since.as_secs_f32();
-        (0..GRAINS)
-            .filter_map(|i| {
-                let mut rng =
-                    Rng::new(self.seed ^ (i as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15));
-                let reach = NEAREST + rng.unit() * FURTHER;
-                let life = SHORTEST + rng.unit() * LONGER;
-                let delay = rng.unit() * STAGGER;
-                let k = (since - delay) / life;
-                if !(0.0..1.0).contains(&k) {
-                    return None;
-                }
-                let side = if i % 2 == 0 {
-                    Side::After
-                } else {
-                    Side::Before
-                };
-                let lane = if (i / 2) % 2 == 0 { &UPPER } else { &LOWER };
-                let glyph = lane[((k * lane.len() as f32) as usize).min(lane.len() - 1)];
-                Some(Grain {
-                    side,
-                    offset: 1 + (ease_out(k) * reach).round() as u16,
-                    glyph: match side {
-                        Side::After => glyph,
-                        Side::Before => mirror(glyph),
-                    },
-                    dim: k > FAR,
-                })
+        let level = (0..GRAINS).filter_map(|i| {
+            let mut rng = Rng::new(self.seed ^ (i as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            let reach = NEAREST + rng.unit() * FURTHER;
+            let life = SHORTEST + rng.unit() * LONGER;
+            let delay = rng.unit() * STAGGER;
+            let k = (since - delay) / life;
+            if !(0.0..1.0).contains(&k) {
+                return None;
+            }
+            let side = if i % 2 == 0 {
+                Side::After
+            } else {
+                Side::Before
+            };
+            let lane = if (i / 2) % 2 == 0 { &UPPER } else { &LOWER };
+            let glyph = lane[((k * lane.len() as f32) as usize).min(lane.len() - 1)];
+            Some(Grain {
+                side,
+                tier: Tier::Level,
+                offset: 1 + (ease_out(k) * reach).round() as u16,
+                glyph: match side {
+                    Side::After => glyph,
+                    Side::Before => mirror(glyph),
+                },
+                dim: k > FAR,
             })
-            .collect()
+        });
+        let splash = (0..SPLASH).filter_map(|i| {
+            // A stream of its own, so the splash leaves the spray as it was.
+            let mut rng = Rng::new(self.seed ^ (i as u64 + 1).wrapping_mul(0xbf58_476d_1ce4_e5b9));
+            let reach = SPLASH_NEAREST + rng.unit() * SPLASH_FURTHER;
+            let life = SPLASH_SHORTEST + rng.unit() * SPLASH_LONGER;
+            let delay = rng.unit() * STAGGER;
+            let k = (since - delay) / life;
+            if !(0.0..1.0).contains(&k) {
+                return None;
+            }
+            let side = if i % 2 == 0 {
+                Side::After
+            } else {
+                Side::Before
+            };
+            let (tier, glyphs) = if (i / 2) % 2 == 0 {
+                (Tier::Above, ABOVE)
+            } else {
+                (Tier::Below, BELOW)
+            };
+            let glyph = glyphs[usize::from(k >= 0.5)];
+            Some(Grain {
+                side,
+                tier,
+                offset: (ease_out(k) * reach).round() as u16,
+                glyph: match side {
+                    Side::After => glyph,
+                    Side::Before => mirror(glyph),
+                },
+                dim: k > FAR,
+            })
+        });
+        level.chain(splash).collect()
     }
 
     fn since_impact(&self) -> Option<Duration> {
@@ -210,34 +283,58 @@ mod tests {
         l
     }
 
-    /// The beats come in order: pulling, then the impact and the flinch
-    /// together, the flinch outlasting the impact, then only the spray.
+    /// The beats come in order: pulling, then the bounce — two cells out,
+    /// back, one out, still — with the dust flying through it and after it.
     #[test]
     fn the_beats_come_in_order() {
         let pull = at(30);
         assert!(pull.pulling().is_some_and(|p| p > 0.0 && p < 1.0));
-        assert!(!pull.impact() && !pull.flinch());
+        assert_eq!(pull.widen(), 0);
         assert!(pull.spray().is_empty(), "no dust before the impact");
 
         let impact = at(80);
         assert_eq!(impact.pulling(), None);
-        assert!(impact.impact() && impact.flinch());
-
-        let flinch = at(140);
-        assert!(!flinch.impact() && flinch.flinch());
+        assert_eq!(impact.widen(), 2, "out");
+        assert!(!impact.spray().is_empty(), "dust from the impact on");
+        assert_eq!(at(140).widen(), 0, "back");
+        assert_eq!(at(170).widen(), 1, "out again, by less");
 
         let spray = at(250);
-        assert!(!spray.impact() && !spray.flinch());
+        assert_eq!(spray.widen(), 0, "still");
         assert!(!spray.spray().is_empty(), "dust in the air");
     }
 
-    /// Every grain is braille lit only in the two middle rows of dots, so the
-    /// spray stays level with the text.
+    /// The bounce is over well before the dust is, and runs no further than
+    /// its first stretch.
+    #[test]
+    fn the_bounce_settles_inside_the_landing() {
+        let lasts: Duration = BOUNCE.iter().map(|(d, _)| *d).sum();
+        assert!(PULL + lasts < LENGTH);
+        assert_eq!(BOUNCE.iter().map(|(_, c)| *c).max(), Some(BOUNCE[0].1));
+        assert_eq!(at((PULL + lasts).as_millis() as u64).widen(), 0);
+    }
+
+    fn level(l: &Landing) -> Vec<Grain> {
+        l.spray()
+            .into_iter()
+            .filter(|g| g.tier == Tier::Level)
+            .collect()
+    }
+
+    fn splash(l: &Landing) -> Vec<Grain> {
+        l.spray()
+            .into_iter()
+            .filter(|g| g.tier != Tier::Level)
+            .collect()
+    }
+
+    /// Every grain of the spray is braille lit only in the two middle rows of
+    /// dots, so the spray stays level with the text.
     #[test]
     fn the_spray_is_level_with_the_text() {
         const MIDDLE: u32 = 0x02 | 0x04 | 0x10 | 0x20;
         for ms in (0..=LENGTH.as_millis() as u64).step_by(5) {
-            for g in at(ms).spray() {
+            for g in level(&at(ms)) {
                 let bits = g.glyph as u32 - 0x2800;
                 assert!(bits != 0 && bits & !MIDDLE == 0, "{g:?} at {ms} ms");
             }
@@ -248,16 +345,51 @@ mod tests {
     /// it dims before it goes.
     #[test]
     fn dust_flies_out_of_both_ends_and_dims() {
-        let early = at(90).spray();
+        let early = level(&at(90));
         assert!(early.iter().any(|g| g.side == Side::After));
         assert!(early.iter().any(|g| g.side == Side::Before));
         for ms in (70..=LENGTH.as_millis() as u64).step_by(5) {
-            for g in at(ms).spray() {
+            for g in level(&at(ms)) {
                 assert!(g.offset >= 1 && g.offset <= 1 + (NEAREST + FURTHER) as u16);
             }
         }
         let late = at(LENGTH.as_millis() as u64 - 15).spray();
         assert!(late.iter().all(|g| g.dim), "{late:?}");
+    }
+
+    /// The splash goes onto both neighbouring rows from both ends, keeps to
+    /// the dots nearest the landed row, stays short, and is gone before the
+    /// spray is.
+    #[test]
+    fn the_splash_is_kicked_onto_the_rows_beside() {
+        let early = splash(&at(100));
+        for (side, tier) in [
+            (Side::After, Tier::Above),
+            (Side::Before, Tier::Above),
+            (Side::After, Tier::Below),
+            (Side::Before, Tier::Below),
+        ] {
+            assert!(
+                early.iter().any(|g| g.side == side && g.tier == tier),
+                "nothing {side:?} {tier:?}: {early:?}"
+            );
+        }
+        const BOTTOM: u32 = 0x40 | 0x80;
+        const TOP: u32 = 0x01 | 0x08;
+        for ms in (0..=LENGTH.as_millis() as u64).step_by(5) {
+            for g in splash(&at(ms)) {
+                let bits = g.glyph as u32 - 0x2800;
+                let edge = if g.tier == Tier::Above { BOTTOM } else { TOP };
+                assert!(bits != 0 && bits & !edge == 0, "{g:?} at {ms} ms");
+                assert!(g.offset <= (SPLASH_NEAREST + SPLASH_FURTHER) as u16);
+            }
+        }
+        let last = (PULL.as_secs_f32() + STAGGER + SPLASH_SHORTEST + SPLASH_LONGER) * 1000.0;
+        assert!(splash(&at(last.ceil() as u64)).is_empty());
+        assert!(
+            !level(&at(last.ceil() as u64)).is_empty(),
+            "the spray outlasts it"
+        );
     }
 
     /// A grain flying left is the mirror image of one flying right.
@@ -267,6 +399,8 @@ mod tests {
         assert_eq!(mirror('⠐'), '⠂');
         assert_eq!(mirror('⠶'), '⠶');
         assert_eq!(mirror('⠄'), '⠠');
+        assert_eq!(mirror('⢀'), '⡀');
+        assert_eq!(mirror('⠈'), '⠁');
     }
 
     /// It ends on time, with nothing left in the air.
