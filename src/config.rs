@@ -113,11 +113,44 @@ pub struct ClientSettings {
     ///   overline (see [`crate::shadow`]) until the server's own repaint
     ///   lands, a round trip or two later.
     pub per_session: bool,
+    /// Start a session's client on its first visit, rather than every
+    /// session's at once as nvmux starts.
+    ///
+    /// On, the default, a session has no client until it is first attached
+    /// to — a fork, a probe, and a first paint to wait for, as on a switch to
+    /// it with `per_session` off. Off, nvmux starts one for every session
+    /// there is before the picker goes up, and holds each out of sight until
+    /// its session is first visited (see
+    /// [`crate::pty::Attachment::start_ahead`]). That visit then waits for
+    /// nothing: what the client drew meanwhile goes onto the terminal as it
+    /// was written, its questions to the terminal with it, and the terminal's
+    /// answers come back to it then. A session created after nvmux started is
+    /// started on its first visit either way.
+    ///
+    /// What off costs:
+    ///
+    /// - Every session has a client — a UI of its server, with all that
+    ///   `per_session` says that costs — from the moment nvmux starts, not
+    ///   from its first visit.
+    /// - nvmux's start pays a listing and, per session, a fork and an ssh
+    ///   forward, before the picker is drawn.
+    /// - Every session is probed as nvmux starts, which ends a hit-enter
+    ///   prompt in each, as a visit would (see `pty::probe_on`).
+    /// - A client that writes more than [`crate::pty::AHEAD_MAX`] before its
+    ///   first visit — a `:terminal` running something — is let go, and its
+    ///   session is started on its first visit after all.
+    ///
+    /// With `per_session` off as well, a client started ahead is retired when
+    /// it first leaves the front, like every other.
+    pub lazy: bool,
 }
 
 impl Default for ClientSettings {
     fn default() -> Self {
-        Self { per_session: true }
+        Self {
+            per_session: true,
+            lazy: true,
+        }
     }
 }
 
@@ -659,6 +692,10 @@ fn render_default_config(prefix: u8) -> String {
          #    forward, and the redraws its server still sends it.\n\
          # false starts a new client on every switch instead.\n\
          # per_session = {per_session}\n\
+         # Start each session's client on its first visit. false starts one for\n\
+         # every session as nvmux starts, so a first visit waits for nothing,\n\
+         # at the cost above for every session rather than every one visited.\n\
+         # lazy = {lazy}\n\
          \n\
          [effects]\n\
          # The master switch: false turns every effect below off, whatever its\n\
@@ -705,6 +742,7 @@ fn render_default_config(prefix: u8) -> String {
         timeout = k.timeout_ms,
         command = s.command,
         per_session = c.per_session,
+        lazy = c.lazy,
         fade_enabled = f.enabled,
         fade_duration = f.duration_ms,
         fade_session = f.session,
@@ -786,6 +824,7 @@ mod tests {
             command = \"nvim --headless --listen {sock}\"\n\
             [client]\n\
             per_session = true\n\
+            lazy = true\n\
             [effects]\n\
             enabled = true\n\
             [effects.fade]\n\
@@ -927,6 +966,19 @@ mod tests {
         assert_eq!(s.session, SessionSettings::default());
     }
 
+    /// Lazy unless turned off, and turning it off leaves `per_session` as it
+    /// was: the two are independent, and either can be set alone.
+    #[test]
+    fn clients_start_on_their_first_visit_unless_turned_off() {
+        assert!(Settings::default().client.lazy);
+        let s: Settings = toml::from_str("[client]\nlazy = false\n").expect("valid");
+        assert!(!s.client.lazy);
+        assert!(s.client.per_session, "and the clients are still kept");
+        let s: Settings =
+            toml::from_str("[client]\nper_session = false\nlazy = false\n").expect("valid");
+        assert!(!s.client.lazy && !s.client.per_session);
+    }
+
     /// The one default that lives elsewhere, like the prefix: the prompt shows
     /// it before a config has necessarily been read.
     #[test]
@@ -993,6 +1045,7 @@ mod tests {
                 "[effects.move]\nenabled = \"no\"\n",
             ),
             ("an unparseable client value", "[client]\nper_session = 1\n"),
+            ("an unparseable lazy value", "[client]\nlazy = \"no\"\n"),
             (
                 "an unparseable fade value",
                 "[effects.fade]\nenabled = \"yes\"\n",
@@ -1120,6 +1173,7 @@ mod tests {
         );
         for line in [
             "# per_session = true",
+            "# lazy = true",
             "# enabled     = true",
             "# duration_ms = 200",
             "# session     = true",

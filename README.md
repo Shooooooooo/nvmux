@@ -139,6 +139,7 @@ command = "nvim --headless --listen {sock}"   # {sock} is required
 
 [client]
 per_session = true   # keep each session's client; a switch back reuses it
+lazy        = true   # start a client on its first visit; false starts all at launch
 
 [effects]
 enabled = true   # master switch: false turns every effect below off

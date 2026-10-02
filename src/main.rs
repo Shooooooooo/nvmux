@@ -105,12 +105,19 @@ fn establish_settings() -> Result<config::Settings> {
 /// across in the [`pool::Pool`] instead — the one those three come back to, and
 /// the one of every other session visited — so a switch back to a session
 /// resumes its client rather than starting another.
+///
+/// With `[client] lazy = false` the pool starts out holding a client for every
+/// session, started before the picker is drawn (see [`start_every_client`]),
+/// so a first visit takes one out of it as a switch back does.
 fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     let mut attached: Option<pty::Attachment> = None;
     // Empty, and handing every client straight back, unless clients are kept
-    // one per session. Dropped on every way out of here, which retires what it
-    // holds.
+    // one per session or started ahead. Dropped on every way out of here,
+    // which retires what it holds.
     let mut pool = pool::Pool::configured();
+    if !config::get().client.lazy {
+        start_every_client(transport, &mut pool);
+    }
     let mut message: Option<String> = None;
     // The session the last trip through the picker led to, so the next one
     // opens with the cursor on it rather than on the first row.
@@ -480,12 +487,15 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
 /// The attachment to relay next, from the pool if it has one for the session
 /// — kept with `[client] per_session`, and resumed: no fork, no probe, since
 /// it is still attached to its server, and no first paint to wait for, since
-/// its last screen goes straight back on — and otherwise a fresh one (see
-/// [`attach`]). With clients not kept the pool is empty, and this is `attach`.
+/// its last screen goes straight back on; or started ahead with `[client]
+/// lazy = false`, and relayed for the first time, from its first byte — and
+/// otherwise a fresh one (see [`attach`]). With clients neither kept nor
+/// started ahead the pool is empty, and this is `attach`.
 ///
 /// The outer `Result` is nvmux giving up on the link altogether; the inner one
 /// is an attach that failed, for the picker to say so. `warm` is set when the
-/// client is a kept one.
+/// client is a kept one — not one started ahead, which is as new to the
+/// terminal as a fresh one and says which session it is as one does.
 ///
 /// `hand_off` is the name the picker left standing, if it did; see
 /// [`attach`]. The link's recovery prints to the screen it stands on, so it is
@@ -499,6 +509,26 @@ fn resume_or_attach(
     hand_off: &mut Option<HandOff>,
 ) -> Result<nvmux::Result<Option<pty::Attachment>>> {
     Ok(match pool.take(&session.id) {
+        // Its notice was written when it was started, under the name the
+        // session had then. And a probe that has still not answered is waited
+        // out as a fresh client's is, with the attaching screen up: the client
+        // is no more cleared to be shown than one forked a moment ago.
+        pool::Taken::Kept(ahead) if ahead.started_ahead() => {
+            let mut ahead = *ahead;
+            ahead.announce_on_arrival(announce::label(&session.name));
+            match ahead.take_probe() {
+                Some(probe) => finish_attachment(
+                    Begun {
+                        session: session.clone(),
+                        sock: ahead.sock().to_path_buf(),
+                        attachment: ahead,
+                        probe,
+                    },
+                    hand_off,
+                ),
+                None => Ok(Some(ahead)),
+            }
+        }
         pool::Taken::Kept(kept) => {
             *warm = true;
             Ok(Some(*kept))
@@ -700,6 +730,46 @@ fn begin_attachment(
         attachment,
         probe,
     })
+}
+
+/// Start a client for every session there is and hand each to the pool, to be
+/// held out of sight until its session is first visited: `[client] lazy =
+/// false` (see [`pty::Attachment::start_ahead`]).
+///
+/// Begun as a switch begins one under its fade (see [`begin_attachment`]), and
+/// not waited for: each probe is answered on its client's own thread, which
+/// retires a client its probe refuses. So the picker waits for the listing,
+/// and for a fork and — over SSH — a forward per session, and not for a
+/// single round trip more.
+///
+/// Nothing here is reported. A listing that fails is the picker's to report a
+/// moment later, from the same call; a client that cannot be started leaves
+/// its session to be attached on its first visit as if this had not run, where
+/// a failure has a screen to land on and a message written for it.
+fn start_every_client(transport: &dyn transport::Transport, pool: &mut pool::Pool) {
+    let t_start = std::time::Instant::now();
+    let listing = match transport.list_sessions() {
+        Ok(listing) => listing,
+        Err(e) => {
+            tracing::debug!(error = %e, "could not list the sessions to start their clients");
+            return;
+        }
+    };
+    for session in &listing {
+        match begin_attachment(transport, session) {
+            Ok(begun) => pool.start_ahead(begun.attachment, Some(begun.probe)),
+            Err(e) => tracing::debug!(
+                id = %session.id,
+                error = %e,
+                "could not start a client ahead"
+            ),
+        }
+    }
+    tracing::debug!(
+        ms = t_start.elapsed().as_secs_f64() * 1000.0,
+        sessions = listing.len(),
+        "timing: clients started ahead"
+    );
 }
 
 /// Wait, on the attaching screen, for the session to take the client
