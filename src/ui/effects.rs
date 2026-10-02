@@ -61,7 +61,7 @@ pub const SIFT: Duration = Duration::from_millis(120);
 /// pressed at an ordinary pace. Fixed, where the fade's length is
 /// configurable: the fade is waited on at every switch, and this holds nothing
 /// up.
-pub const AFTERGLOW: Duration = Duration::from_millis(120);
+pub const AFTERGLOW: Duration = Duration::from_millis(100);
 
 /// How long the glint takes to cross the row the cursor lands on. Longer
 /// than the afterglow, so the two read as one movement: the old row letting
