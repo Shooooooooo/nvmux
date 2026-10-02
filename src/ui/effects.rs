@@ -55,9 +55,10 @@ use crate::palette::{Palette, Rgb};
 /// says. Long enough to see which rows went, which is all it is for.
 pub const SIFT: Duration = Duration::from_millis(120);
 
-/// How long the row the cursor leaves glows. Long enough that a quick `j j j`
-/// leaves a visible tail, short enough that one key's glow is gone before the
-/// next is pressed at an ordinary pace. Fixed, where the fade's length is
+/// How long the row the cursor leaves glows. Only that row glows: a quick
+/// `j j j`, or a held key, moves the glow along with the cursor rather than
+/// leaving a tail. Short enough that one key's glow is gone before the next is
+/// pressed at an ordinary pace. Fixed, where the fade's length is
 /// configurable: the fade is waited on at every switch, and this holds nothing
 /// up.
 pub const AFTERGLOW: Duration = Duration::from_millis(120);
@@ -153,12 +154,11 @@ pub fn paint(frame: &mut Frame, app: &App, palette: Option<&Palette>) {
     let buf = frame.buffer_mut();
     let selected = app.selected_row_id();
 
-    for (id, progress) in app.glows() {
-        if selected == Some(id) {
-            continue;
-        }
-        if let Some(rect) = draw::row_rect(app, area, id) {
-            glow(buf, rect, palette, progress);
+    if let Some((id, progress)) = app.glow() {
+        if selected != Some(id) {
+            if let Some(rect) = draw::row_rect(app, area, id) {
+                glow(buf, rect, palette, progress);
+            }
         }
     }
 
@@ -471,9 +471,28 @@ mod tests {
         let mut a = picker(&["one", "two"]);
         a.on_key(Key::Char('j'));
         a.on_key(Key::Char('k'));
-        let ids: Vec<&str> = a.glows().map(|(id, _)| id).collect();
-        assert_eq!(ids.len(), 1, "{ids:?}");
-        assert_ne!(Some(ids[0]), a.selected_row_id());
+        let (id, _) = a.glow().expect("the row just left glows");
+        assert_ne!(Some(id), a.selected_row_id());
+    }
+
+    /// Only the row the cursor last left glows: a run of moves, as a held key
+    /// makes, carries the glow along rather than leaving a tail behind it.
+    #[test]
+    fn only_the_row_last_left_glows() {
+        let p = test_palette();
+        let mut a = picker(&["one", "two", "three", "four"]);
+        a.on_key(Key::Char('j'));
+        a.on_key(Key::Char('j'));
+        a.on_key(Key::Char('j'));
+        let (id, progress) = a.glow().expect("the row just left glows");
+        assert_eq!(Some(id), a.visible().get(2).map(|s| s.id.as_str()));
+        assert_eq!(progress, 0.0, "and from the start");
+
+        let buf = frame(&a, Some(&p));
+        for name in ["one", "two"] {
+            let cell = first_glyph(&buf, row_of(&buf, name));
+            assert_eq!(cell.bg, Color::Reset, "{name} has let go: {cell:?}");
+        }
     }
 
     /// Without a palette the glow is a modifier: reversed and dim for its first
@@ -677,7 +696,7 @@ mod tests {
         a.on_key(Key::Char(' '));
         a.on_key(Key::Char('j'));
         a.on_key(Key::Char('j'));
-        assert_eq!(a.glows().count(), 0);
+        assert!(a.glow().is_none());
         assert!(a.glint().is_none());
     }
 
@@ -688,7 +707,7 @@ mod tests {
         let mut a = picker(&["api-server", "dotfiles", "notes"]);
         a.set_effects(false);
         a.on_key(Key::Char('j'));
-        assert_eq!(a.glows().count(), 0);
+        assert!(a.glow().is_none());
         assert!(a.glint().is_none());
         a.on_key(Key::Char('/'));
         a.on_key(Key::Char('n'));

@@ -116,9 +116,11 @@ pub struct App {
     /// `[effects.cursor] enabled`, under `[effects] enabled`. Read once when
     /// the picker opens, like `trail`.
     lights: bool,
-    /// The rows the cursor has just left and is still glowing on, by session
-    /// id, oldest first. See [`App::glows`].
-    glows: Vec<Glow>,
+    /// The row the cursor has just left, while it is still glowing. One at a
+    /// time, like the glint: the next move takes the glow off it and puts it on
+    /// the row that move left, so a held key never smears a tail of rows. See
+    /// [`App::glow`].
+    glow: Option<Glow>,
     /// The row the cursor last landed on, while the glint crosses it. One at
     /// a time: the next move takes it to the next row. See [`App::glint`].
     glint: Option<Glow>,
@@ -224,7 +226,7 @@ impl App {
             before: Starfield::seeded(),
             landing: None,
             lights: crate::config::get().effects.cursor_enabled(),
-            glows: Vec::new(),
+            glow: None,
             glint: None,
             sift: crate::config::get().effects.filter_enabled(),
             leaving: None,
@@ -252,7 +254,7 @@ impl App {
             .sonar
             .take()
             .filter(|(id, _)| sessions.iter().any(|s| &s.id == id));
-        self.glows.clear();
+        self.glow = None;
         self.glint = None;
         self.leaving = None;
         self.landing = None;
@@ -334,10 +336,12 @@ impl App {
             self.after.advance(elapsed, starfield::TRAIL);
             self.before.advance(elapsed, starfield::TRAIL);
         }
-        for glow in &mut self.glows {
+        if let Some(glow) = &mut self.glow {
             glow.age += elapsed;
+            if glow.age >= effects::AFTERGLOW {
+                self.glow = None;
+            }
         }
-        self.glows.retain(|g| g.age < effects::AFTERGLOW);
         if let Some(glint) = &mut self.glint {
             glint.age += elapsed;
             if glint.age >= effects::GLINT {
@@ -385,7 +389,7 @@ impl App {
     /// else.
     pub fn animating(&self) -> bool {
         self.trailing()
-            || !self.glows.is_empty()
+            || self.glow.is_some()
             || self.glint.is_some()
             || self.leaving.is_some()
             || self.striking()
@@ -417,13 +421,13 @@ impl App {
         }
     }
 
-    /// The rows still glowing after the cursor left them, by session id, each
-    /// with how far through its glow it is, `0..1`.
-    pub fn glows(&self) -> impl Iterator<Item = (&str, f32)> {
+    /// The row the cursor last left, by session id, with how far through its
+    /// glow it is, `0..1`, or `None` once it has settled.
+    pub fn glow(&self) -> Option<(&str, f32)> {
         let length = effects::AFTERGLOW.as_secs_f32();
-        self.glows
-            .iter()
-            .map(move |g| (g.id.as_str(), g.age.as_secs_f32() / length))
+        self.glow
+            .as_ref()
+            .map(|g| (g.id.as_str(), g.age.as_secs_f32() / length))
     }
 
     /// The row the cursor has just landed on, by session id, with how far the
@@ -512,7 +516,7 @@ impl App {
         self.kill = on;
         self.back = on;
         if !on {
-            self.glows.clear();
+            self.glow = None;
             self.glint = None;
             self.leaving = None;
             self.strike = None;
@@ -885,8 +889,8 @@ impl App {
     }
 
     /// If the cursor has moved off the session `was`, start that row glowing,
-    /// and a glint across the row it moved onto. That row stops glowing, if it
-    /// was: it is the selection now.
+    /// and a glint across the row it moved onto. Whatever row was glowing
+    /// before stops: only the row just left glows.
     fn glow_from(&mut self, was: Option<String>) {
         if !self.lights {
             return;
@@ -905,8 +909,7 @@ impl App {
         if was == now || !self.visible().iter().any(|s| s.id == was) {
             return;
         }
-        self.glows.retain(|g| g.id != was && g.id != now);
-        self.glows.push(Glow {
+        self.glow = Some(Glow {
             id: was,
             age: Duration::ZERO,
         });
