@@ -61,10 +61,14 @@ const MAX_LIST_WIDTH: u16 = 48;
 /// Columns between the number and the name.
 const NUM_GAP: &str = "  ";
 
-/// What the selection's bar runs on past the end of the name, so the name does
-/// not end flush against the bar's edge — the marker already gives it room on
-/// the left. Every row's width allows for it, so the block does not widen as
-/// the selection lands on the longest name.
+/// What the list's width allows past the end of its longest name, so that name
+/// does not end flush against the edge of the selection's bar — the marker
+/// already gives it room on the left.
+///
+/// The bar itself runs the whole width of the list on every row, the pad
+/// included, rather than stopping past whichever name it is on: the same bar
+/// whatever is selected, so moving the selection moves only the bar, and its
+/// right edge does not jump in and out with the length of each name.
 const PAD: &str = " ";
 
 /// Sixty-nine columns, and it used to be sixty exactly — the widest row that
@@ -248,8 +252,11 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 MARKER.chars().count()..head.chars().count() - NUM_GAP.chars().count()
             };
+            // The bar is the width of the list, whatever the name it is on.
             let name = if selected {
-                format!("{}{PAD}", row.session.name)
+                let fill =
+                    (block.width as usize).saturating_sub(head.width() + row.session.name.width());
+                format!("{}{}", row.session.name, " ".repeat(fill))
             } else {
                 row.session.name.clone()
             };
@@ -263,12 +270,12 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         draw_backspace(frame, app, block, offset, num_width, id, backspace);
     }
     if app.trailing() {
-        draw_trails(frame, app, block, offset, num_width, 0.0);
+        draw_trails(frame, app, block, offset, 0.0);
     } else if let Some(pull) = pull {
-        draw_trails(frame, app, block, offset, num_width, pull);
+        draw_trails(frame, app, block, offset, pull);
     }
     if let Some(landing) = landing {
-        draw_landing(frame, app, area, block, offset, num_width, landing);
+        draw_landing(frame, app, area, block, offset, landing);
     }
 }
 
@@ -276,8 +283,8 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 /// [`super::landing`]): the reversed bar runs further at each end and back
 /// again ([`super::landing::BOUNCE`]), and dust flies out of both ends, level with
 /// the text, with a little kicked onto the rows above and below. Like the
-/// trails, all of it goes over the terminal's own background beyond the
-/// names, never over one, and stops at the edge of the screen; the splash
+/// trails, all of it goes over the terminal's own background either side of
+/// the list, never over a row, and stops at the edge of the screen; the splash
 /// stops at the edge of the list's `area` too, so it never reaches the hint
 /// row. Dust only lands on blank cells.
 fn draw_landing(
@@ -286,7 +293,6 @@ fn draw_landing(
     area: Rect,
     block: Rect,
     offset: usize,
-    num_width: usize,
     landing: &Landing,
 ) {
     let selected = app.selected_row();
@@ -296,31 +302,16 @@ fn draw_landing(
     else {
         return;
     };
-    let Some(row) = app.rows().get(selected).copied() else {
-        return;
-    };
     let y = block.y + line as u16;
+    // The bar's ends are the list's, so a row away the splash flies from them
+    // too: it lands beside the list however long the names, and never in the
+    // gap inside one.
     let left = block.x;
-    let drawn = format!(
-        "{}{}{PAD}",
-        head(row.num, true, false, num_width),
-        row.session.name
-    );
-    let right = block.x + drawn.width().min(block.width as usize) as u16;
+    let right = block.x + block.width;
     let screen = frame.area();
     let on_screen = |x: u16| x >= screen.x && x < screen.x + screen.width;
     let in_list = |y: u16| y >= area.y && y < area.y + area.height;
     let buf = frame.buffer_mut();
-    // Where a row's own text ends within the block. A row away, the splash
-    // flies from whichever ends later, the landed bar or that row's text: it
-    // lands beside the list however long the names, and never in the gap
-    // inside one.
-    let text_end = |buf: &ratatui::buffer::Buffer, y: u16| {
-        (block.x..block.x + block.width)
-            .rev()
-            .find(|x| buf[(*x, y)].symbol() != " ")
-            .map_or(block.x, |x| x + 1)
-    };
 
     for grain in landing.spray() {
         let at = match grain.tier {
@@ -332,8 +323,7 @@ fn draw_landing(
             continue;
         };
         let x = match grain.side {
-            Side::After if at == y => right.checked_add(grain.offset),
-            Side::After => right.max(text_end(buf, at)).checked_add(grain.offset),
+            Side::After => right.checked_add(grain.offset),
             Side::Before => left.checked_sub(grain.offset + 1),
         };
         let Some(x) = x.filter(|x| on_screen(*x)) else {
@@ -466,8 +456,8 @@ fn draw_backspace(
 }
 
 /// The trails behind a session in flight: stars flying off both ends of its
-/// row — rightwards off the last character of its name, and leftwards off the
-/// marker — at full weight where they leave it and dim where they trail away.
+/// row — rightwards off the end of its bar, and leftwards off the marker — at
+/// full weight where they leave it and dim where they trail away.
 ///
 /// Drawn after the list and outside its block. The block is sized to the names
 /// and centred on them, so making room for the trails inside it would widen it
@@ -484,14 +474,7 @@ fn draw_backspace(
 ///
 /// `pull` is how far both trails have been drawn back into the row, for a
 /// session landing: 0 for a session still in flight.
-fn draw_trails(
-    frame: &mut Frame,
-    app: &App,
-    block: Rect,
-    offset: usize,
-    num_width: usize,
-    pull: f32,
-) {
+fn draw_trails(frame: &mut Frame, app: &App, block: Rect, offset: usize, pull: f32) {
     let selected = app.selected_row();
     let Some(line) = selected
         .checked_sub(offset)
@@ -499,21 +482,17 @@ fn draw_trails(
     else {
         return;
     };
-    let Some(session) = app.rows().get(selected).map(|r| r.session) else {
+    if selected >= app.rows().len() {
         return;
-    };
+    }
     let y = block.y + line as u16;
     let area = frame.area();
     let near = starfield::TRAIL / 2;
     let dim = Style::default().add_modifier(Modifier::DIM);
 
-    // Off the end of the bar. What the row above drew for it, measured the
-    // same way: the trail starts in the column after its last cell, the pad
-    // past the name and truncation included.
-    let drawn = format!("{GRABBED}{:>num_width$}{NUM_GAP}{}{PAD}", "", session.name)
-        .width()
-        .min(block.width as usize) as u16;
-    let x = block.x + drawn;
+    // Off the end of the bar, which is the end of the list: the trail starts
+    // in the column after its last cell.
+    let x = block.x + block.width;
     let cells = starfield::TRAIL.min(usize::from((area.x + area.width).saturating_sub(x)));
     if cells > 0 {
         let stars: Vec<char> = app
@@ -697,37 +676,27 @@ pub(super) fn row_at(app: &App, area: Rect, column: u16, row: u16) -> Option<usi
 }
 
 /// Where the row of session `id` is drawn, as wide as the selection's bar is
-/// on it — what is written on it and the [`PAD`] past the name — with `area` the whole frame — or `None` when it is not on screen. What the
-/// effects' post-pass paints over (see [`super::effects`]), measured by the
-/// same layout the rows were drawn with.
+/// on it — the whole width of the list, whatever the length of the name (see
+/// [`PAD`]) — with `area` the whole frame — or `None` when it is not on
+/// screen. What the effects' post-pass paints over (see [`super::effects`]),
+/// measured by the same layout the rows were drawn with.
 pub(super) fn row_rect(app: &App, area: Rect, id: &str) -> Option<Rect> {
     if area.height == 0 || area.width == 0 {
         return None;
     }
     let (body, _) = split_hint_row(area);
-    let ListLayout {
-        block,
-        offset,
-        num_width,
-    } = list_layout(app, body)?;
-    let rows = app.rows();
-    let index = rows.iter().position(|r| r.session.id == id)?;
+    let ListLayout { block, offset, .. } = list_layout(app, body)?;
+    let index = app.rows().iter().position(|r| r.session.id == id)?;
     let line = index
         .checked_sub(offset)
         .filter(|line| *line < block.height as usize)?;
-    let width = (MARKER.width()
-        + num_width
-        + NUM_GAP.width()
-        + rows[index].session.name.width()
-        + PAD.width())
-    .min(block.width as usize);
-    Some(Rect::new(block.x, block.y + line as u16, width as u16, 1))
+    Some(Rect::new(block.x, block.y + line as u16, block.width, 1))
 }
 
 /// Where the name of session `id` is drawn: its row ([`row_rect`]) after the
-/// marker, the number and the gap, and short of the [`PAD`] past it, cut where
-/// the row is cut. `None` when the row is not on screen, or so narrow that
-/// none of the name is.
+/// marker, the number and the gap, and short of the blanks the bar runs on
+/// past it, cut where the row is cut. `None` when the row is not on screen, or
+/// so narrow that none of the name is.
 pub(super) fn name_rect(app: &App, area: Rect, id: &str) -> Option<Rect> {
     let row = row_rect(app, area, id)?;
     let (body, _) = split_hint_row(area);
@@ -1431,30 +1400,32 @@ mod tests {
         a
     }
 
-    /// The trail starts in the column after the grabbed name's last
-    /// character, runs `TRAIL` cells, plain for the near half and dim for the
-    /// far half, and is not part of the reversed bar.
+    /// The trail starts in the column after the grabbed row's bar — the
+    /// list's own edge, past the pad after its longest name, however short the
+    /// grabbed one — runs `TRAIL` cells, plain for the near half and dim for
+    /// the far half, and is not part of the reversed bar.
     #[test]
-    fn the_grabbed_row_trails_stars_off_the_end_of_its_name() {
+    fn the_grabbed_row_trails_stars_off_the_end_of_its_bar() {
         let a = trailing(&["api-server", "docs"], 1);
         let buf = test_support::buffer(44, 8, |f| draw(f, &a));
         let row =
             |y: u16| -> String { (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect() };
+        let end_of = |line: &str, name: &str| {
+            line[..line.find(name).expect("the name") + name.len()].width() as u16
+        };
         let y = (0..buf.area.height)
             .find(|y| row(*y).contains("docs"))
             .expect("the grabbed row");
-        let line = row(y);
-        let name_end = (line[..line.find("docs").expect("the name") + "docs".len()].width()) as u16;
-        let end = name_end + PAD.width() as u16;
+        let name_end = end_of(&row(y), "docs");
+        let end = end_of(&row(y - 1), "api-server") + PAD.width() as u16;
 
-        assert!(
-            buf[(name_end - 1, y)].modifier.contains(Modifier::REVERSED),
-            "the name's last character is in the bar"
-        );
-        assert!(
-            buf[(end - 1, y)].modifier.contains(Modifier::REVERSED),
-            "and so is the pad past it"
-        );
+        for x in name_end - 1..end {
+            assert!(
+                buf[(x, y)].modifier.contains(Modifier::REVERSED),
+                "the name's last character and the blanks past it to the \
+                 list's edge are in the bar, at {x}"
+            );
+        }
         for i in 0..starfield::TRAIL as u16 {
             let cell = &buf[(end + i, y)];
             assert!(
@@ -1629,26 +1600,41 @@ mod tests {
             .all(|c| !c.modifier.contains(Modifier::UNDERLINED)));
     }
 
-    /// The selection's bar runs one blank cell past the end of the name, and
-    /// no further; no other row is padded.
+    /// The selection's bar is the same on every row: from the marker to one
+    /// blank cell past the end of the longest name, however short the name it
+    /// is on, and no further. No other row is reversed anywhere.
     #[test]
-    fn the_selection_bar_runs_a_cell_past_the_name() {
-        let mut a = app(&["api-server", "dotfiles"]);
+    fn the_selection_bar_is_as_wide_as_the_list_on_every_row() {
+        let names = ["api-server", "docs", "dotfiles"];
+        let mut a = app(&names);
         a.set_effects(false);
-        let buf = test_support::buffer(40, 6, |f| draw(f, &a));
         let lines = render(&a, 40, 6);
-        for (name, selected) in [("api-server", true), ("dotfiles", false)] {
-            let y = line_of(&lines, name);
-            let line = &lines[y as usize];
-            let end = line[..line.find(name).unwrap() + name.len()].width() as u16;
-            let pad = &buf[(end, y)];
-            assert_eq!(pad.symbol(), " ");
-            assert_eq!(
-                pad.modifier.contains(Modifier::REVERSED),
-                selected,
-                "{name}"
-            );
-            assert!(!buf[(end + 1, y)].modifier.contains(Modifier::REVERSED));
+        let line = &lines[line_of(&lines, "api-server") as usize];
+        let start = line[..line.find('▸').unwrap()].width() as u16;
+        let end = (line[..line.find("api-server").unwrap() + "api-server".len()].width()
+            + PAD.width()) as u16;
+
+        for selected in names {
+            let buf = test_support::buffer(40, 6, |f| draw(f, &a));
+            for name in names {
+                let y = line_of(&lines, name);
+                let bar: Vec<u16> = (0..buf.area.width)
+                    .filter(|x| buf[(*x, y)].modifier.contains(Modifier::REVERSED))
+                    .collect();
+                if name == selected {
+                    assert_eq!(
+                        bar,
+                        (start..end).collect::<Vec<_>>(),
+                        "{name}'s bar when it is selected"
+                    );
+                } else {
+                    assert!(
+                        bar.is_empty(),
+                        "{name} reversed while {selected} is selected"
+                    );
+                }
+            }
+            a.on_key(Key::Char('j'));
         }
     }
 
@@ -1669,20 +1655,31 @@ mod tests {
         }
     }
 
-    /// The name's own cells stop where the name does: the bar's pad is the
-    /// row's, not the name's, so what is struck or handed off is the name.
+    /// The name's own cells stop where the name does: the blanks the bar
+    /// runs on past it are the row's, not the name's, so what is struck or
+    /// handed off is the name. The row runs as far as the bar does, which is
+    /// the same on every row.
     #[test]
     fn a_name_is_measured_without_the_pad() {
-        let a = app(&["api-server", "docs"]);
+        let mut a = app(&["api-server", "docs"]);
         let area = Rect::new(0, 0, 40, 6);
         let lines = render(&a, 40, 6);
-        let y = line_of(&lines, "api-server");
-        let line = &lines[y as usize];
-        let x = line[..line.find("api-server").unwrap()].width() as u16;
-        let id = a.selected_row_id().unwrap().to_string();
-        assert_eq!(name_rect(&a, area, &id), Some(Rect::new(x, y, 10, 1)));
-        let row = row_rect(&a, area, &id).unwrap();
-        assert_eq!(row.x + row.width, x + 10 + PAD.width() as u16);
+        let x = |name: &str| {
+            let line = &lines[line_of(&lines, name) as usize];
+            line[..line.find(name).unwrap()].width() as u16
+        };
+        let end = x("api-server") + 10 + PAD.width() as u16;
+        for (name, width) in [("api-server", 10), ("docs", 4)] {
+            let id = a.selected_row_id().unwrap().to_string();
+            let y = line_of(&lines, name);
+            assert_eq!(
+                name_rect(&a, area, &id),
+                Some(Rect::new(x(name), y, width, 1))
+            );
+            let row = row_rect(&a, area, &id).unwrap();
+            assert_eq!(row.x + row.width, end, "{name}'s row");
+            a.on_key(Key::Char('j'));
+        }
     }
 
     /// The number is dim beside its name on every row but the selected one,
@@ -1821,13 +1818,15 @@ mod tests {
     }
 
     /// Where the landed bar starts and ends on row `y`: the marker's column,
-    /// and the column past the pad after the name.
-    fn bar_ends(buf: &ratatui::buffer::Buffer, y: u16, drawn: &str) -> (u16, u16) {
+    /// and the column past the pad after the list's longest name,
+    /// `api-server`, not the landed `notes`.
+    fn bar_ends(buf: &ratatui::buffer::Buffer, y: u16) -> (u16, u16) {
         let text = line(buf, y);
         let first = text
             .find('▸')
             .map(|b| text[..b].chars().count() as u16)
             .unwrap();
+        let drawn = "▸ 2  api-server";
         (
             first,
             first + drawn.chars().count() as u16 + PAD.width() as u16,
@@ -1839,7 +1838,7 @@ mod tests {
     /// `end`.
     fn reach(a: &App, y: u16) -> (u16, u16) {
         let buf = test_support::buffer(50, 8, |f| draw(f, a));
-        let (first, end) = bar_ends(&buf, y, "▸ 2  notes");
+        let (first, end) = bar_ends(&buf, y);
         let reversed = |x: u16| buf[(x, y)].modifier.contains(Modifier::REVERSED);
         let before = (1..=first).take_while(|d| reversed(first - d)).count() as u16;
         let after = (end..buf.area.width).take_while(|x| reversed(*x)).count() as u16;
@@ -1864,7 +1863,7 @@ mod tests {
         assert!(lines[y as usize].contains("▸ 2  notes"), "{lines:#?}");
         assert!(lines.iter().any(|l| l.contains("3  docs")));
 
-        let (first, end) = bar_ends(&buf, y, "▸ 2  notes");
+        let (first, end) = bar_ends(&buf, y);
         for x in (first - 2..first).chain(end..end + 2) {
             let cell = &buf[(x, y)];
             assert_eq!(cell.symbol(), " ", "the bar widens with blanks at {x}");
@@ -1911,7 +1910,7 @@ mod tests {
         let a = landed(landing::PULL.as_millis() as u64 + 80);
         let buf = test_support::buffer(50, 8, |f| draw(f, &a));
         let y = line_of(&render(&a, 50, 8), "notes");
-        let (first, end) = bar_ends(&buf, y, "▸ 2  notes");
+        let (first, end) = bar_ends(&buf, y);
         let text = line(&buf, y);
 
         let mut before = 0;
@@ -1948,8 +1947,8 @@ mod tests {
     }
 
     /// The splash lands on the rows either side, from both ends: beside the
-    /// list, past a neighbour's name even where it runs longer than the landed
-    /// one, never on its text, and in the dots nearest the landed row.
+    /// list, past the end of the landed bar — which is past every name — never
+    /// on a neighbour's text, and in the dots nearest the landed row.
     #[test]
     fn a_landed_session_splashes_the_rows_beside_it() {
         let pull = landing::PULL.as_millis() as u64;
@@ -1959,7 +1958,7 @@ mod tests {
         for ms in (pull..=landing::LENGTH.as_millis() as u64).step_by(5) {
             let a = landed(ms);
             let buf = test_support::buffer(50, 8, |f| draw(f, &a));
-            let (first, _) = bar_ends(&buf, y, "▸ 2  notes");
+            let (first, end) = bar_ends(&buf, y);
             for (i, (row, name, edge)) in [
                 (y - 1, "api-server", 0x40 | 0x80),
                 (y + 1, "docs", 0x01 | 0x08),
@@ -1967,19 +1966,11 @@ mod tests {
             .into_iter()
             .enumerate()
             {
-                let text = line(&buf, row);
-                let name_end = text
-                    .find(name)
-                    .map(|b| text[..b].chars().count() + name.chars().count())
-                    .unwrap() as u16;
                 for x in (0..buf.area.width).filter(|x| is_braille(buf[(*x, row)].symbol())) {
-                    assert!(
-                        x < first || x >= name_end,
-                        "on {name}'s text at {x}, {ms} ms"
-                    );
+                    assert!(x < first || x >= end, "on {name}'s row at {x}, {ms} ms");
                     let bits = buf[(x, row)].symbol().chars().next().unwrap() as u32 - 0x2800;
                     assert_eq!(bits & !edge, 0, "{x} on row {row} is off its edge");
-                    seen[i][usize::from(x >= name_end)] = true;
+                    seen[i][usize::from(x >= end)] = true;
                 }
             }
             test_support::assert_no_colour(50, 8, |f| draw(f, &a));
