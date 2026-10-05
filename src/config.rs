@@ -40,8 +40,8 @@ use crate::error::ConfigError;
 /// The whole configuration. Each field is a table of its own, so the file reads
 /// as `[keys]`-style sections — `[effects]` with a table inside it for each
 /// effect: `[effects.fade]`, `[effects.move]`, `[effects.cursor]`,
-/// `[effects.back]`, `[effects.attach]`, `[effects.kill]` and
-/// `[effects.filter]`.
+/// `[effects.back]`, `[effects.attach]`, `[effects.kill]`,
+/// `[effects.filter]` and `[effects.create]`.
 ///
 /// Not `Copy`: `[session] command` owns a `String`. Nothing reads it by value —
 /// [`get`] hands out a `&'static Settings` — so this costs nothing.
@@ -156,8 +156,8 @@ impl Default for ClientSettings {
 
 /// The animated effects: a master switch over them all, and a table of its own
 /// for each — `[effects.fade]`, `[effects.move]`, `[effects.cursor]`,
-/// `[effects.back]`, `[effects.attach]`, `[effects.kill]` and
-/// `[effects.filter]` — with its own `enabled`. An effect
+/// `[effects.back]`, `[effects.attach]`, `[effects.kill]`,
+/// `[effects.filter]` and `[effects.create]` — with its own `enabled`. An effect
 /// runs only when both are on, which is what the `*_enabled` methods answer, so
 /// nothing reads one switch without the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -174,6 +174,7 @@ pub struct EffectsSettings {
     pub attach: AttachSettings,
     pub kill: KillSettings,
     pub filter: FilterSettings,
+    pub create: CreateSettings,
 }
 
 impl EffectsSettings {
@@ -222,6 +223,14 @@ impl EffectsSettings {
     /// filter's own switch and the master one.
     pub fn filter_enabled(&self) -> bool {
         self.enabled && self.filter.enabled
+    }
+
+    /// Whether `c` on the picker opens a gap where the new session will go
+    /// before the prompt comes up: its own switch and the master one. Whether
+    /// the picker then closes onto the gap or cuts away from it is the fade's
+    /// say (see [`crate::ui::app::App::make_room`]).
+    pub fn create_enabled(&self) -> bool {
+        self.enabled && self.create.enabled
     }
 }
 
@@ -360,6 +369,24 @@ pub struct FilterSettings {
     pub enabled: bool,
 }
 
+/// `c` on the picker: the rows under the cursor step down a line, and the
+/// session about to be made fades into the gap, dim, under the name the prompt
+/// will offer and the number it will have — then the picker closes onto that
+/// row and the prompt opens out of its name field (see
+/// [`crate::ui::app::App::make_room`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CreateSettings {
+    /// This effect's own switch, under `[effects] enabled`. Off, the prompt
+    /// replaces the picker on the next frame, as it did.
+    ///
+    /// The gap and the row in it are layout and the dim modifier, so
+    /// `NO_COLOR` leaves them alone. The row fading in, and the close and the
+    /// opening either side of the prompt, are the fade's: without it the gap
+    /// is held a moment, dim, and then the prompt cuts in.
+    pub enabled: bool,
+}
+
 impl Default for EffectsSettings {
     fn default() -> Self {
         Self {
@@ -371,6 +398,7 @@ impl Default for EffectsSettings {
             attach: AttachSettings::default(),
             kill: KillSettings::default(),
             filter: FilterSettings::default(),
+            create: CreateSettings::default(),
         }
     }
 }
@@ -406,6 +434,12 @@ impl Default for KillSettings {
 }
 
 impl Default for FilterSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl Default for CreateSettings {
     fn default() -> Self {
         Self { enabled: true }
     }
@@ -737,7 +771,12 @@ fn render_default_config(prefix: u8) -> String {
          \n\
          [effects.filter]\n\
          # Rows a filter keystroke drops fade out before the list closes up.\n\
-         # enabled = {filter_enabled}\n",
+         # enabled = {filter_enabled}\n\
+         \n\
+         [effects.create]\n\
+         # c on the picker opens a gap where the new session will go, showing\n\
+         # the name the prompt will offer, before the prompt comes up.\n\
+         # enabled = {create_enabled}\n",
         prefix = crate::keys::prefix_label(prefix),
         timeout = k.timeout_ms,
         command = s.command,
@@ -753,6 +792,7 @@ fn render_default_config(prefix: u8) -> String {
         attach_enabled = e.attach.enabled,
         kill_enabled = e.kill.enabled,
         filter_enabled = e.filter.enabled,
+        create_enabled = e.create.enabled,
     )
 }
 
@@ -842,6 +882,8 @@ mod tests {
             [effects.kill]\n\
             enabled = true\n\
             [effects.filter]\n\
+            enabled = true\n\
+            [effects.create]\n\
             enabled = true\n";
         let s: Settings = toml::from_str(doc).expect("valid");
         assert_eq!(s, Settings::default());
@@ -905,14 +947,17 @@ mod tests {
         assert!(!s.effects.attach_enabled());
         assert!(!s.effects.kill_enabled());
         assert!(!s.effects.filter_enabled());
+        assert!(!s.effects.create_enabled());
         assert!(s.effects.fade.enabled && s.effects.moving.enabled);
         assert!(s.effects.cursor.enabled && s.effects.back.enabled);
         assert!(s.effects.attach.enabled);
         assert!(s.effects.kill.enabled && s.effects.filter.enabled);
+        assert!(s.effects.create.enabled);
         let on = Settings::default().effects;
         assert!(on.fade_enabled() && on.move_enabled() && on.cursor_enabled());
         assert!(on.back_enabled() && on.attach_enabled());
         assert!(on.kill_enabled() && on.filter_enabled());
+        assert!(on.create_enabled());
     }
 
     /// The picker's effects each turn off on their own.
@@ -941,7 +986,12 @@ mod tests {
         let s: Settings = toml::from_str("[effects.filter]\nenabled = false\n").expect("valid");
         assert!(!s.effects.filter_enabled());
         assert!(s.effects.cursor_enabled() && s.effects.back_enabled());
-        assert!(s.effects.kill_enabled());
+        assert!(s.effects.kill_enabled() && s.effects.create_enabled());
+
+        let s: Settings = toml::from_str("[effects.create]\nenabled = false\n").expect("valid");
+        assert!(!s.effects.create_enabled());
+        assert!(s.effects.cursor_enabled() && s.effects.filter_enabled());
+        assert!(s.effects.fade_enabled(), "the fade itself is untouched");
     }
 
     /// Each effect has a switch of its own, and turning one off leaves the
@@ -1160,6 +1210,7 @@ mod tests {
             "[effects.attach]",
             "[effects.kill]",
             "[effects.filter]",
+            "[effects.create]",
         ] {
             assert!(
                 rendered.contains(&format!("\n{table}\n")),
@@ -1168,7 +1219,7 @@ mod tests {
         }
         assert_eq!(
             rendered.matches("\n# enabled = true\n").count(),
-            7,
+            8,
             "the master switch and each effect's but the fade's: {rendered:?}"
         );
         for line in [

@@ -499,18 +499,26 @@ fn run_loop(
             }
 
             Request::NewSession => {
-                // Not animated: the picker is already up, and takes over
-                // again if the prompt is cancelled. A create still dissolves
-                // the prompt out on its way to the client spawn — that is
-                // the prompt's own doing, since its screen is the one up.
-                match prompt::run_on(
+                // A gap opens where the session will go, and the prompt comes
+                // up out of it (see `make_room`); with that off, the prompt
+                // simply replaces the picker. A create dissolves the prompt
+                // out on its way to the client spawn either way — that is the
+                // prompt's own doing, since its screen is the one up.
+                let arrival = make_room(terminal, &mut app, palette)?;
+                let outcome = prompt::run_on(
                     terminal,
                     transport,
                     prompt::Task::Create {
                         listed: Some(app.sessions()),
+                        number: Some(app.new_number()),
                     },
-                    false,
-                )? {
+                    arrival,
+                );
+                // Whatever the prompt answered, the gap was only ever the
+                // picker's way out: a created session is in the listing that
+                // follows, and a cancelled one never was.
+                app.close_room();
+                match outcome? {
                     prompt::Outcome::Created(session) => {
                         let (session, sessions) = settle(&app, transport, session);
                         return Ok(Outcome::Attach {
@@ -519,15 +527,25 @@ fn run_loop(
                             hand_off: None,
                         });
                     }
-                    prompt::Outcome::Cancelled => {}
+                    prompt::Outcome::Cancelled => {
+                        // The prompt dissolved out if it dissolved in, and the
+                        // picker it closed onto comes back up the same way.
+                        if arrival != prompt::Arrival::Cut {
+                            crate::fade::fade_in(terminal, |f| draw::draw(f, &app))?;
+                        }
+                    }
                     prompt::Outcome::Renamed => refresh(&mut app, transport)?,
                 }
             }
 
             Request::RenameSession(id) => {
                 if let Some(session) = app.session(&id).cloned() {
-                    let outcome =
-                        prompt::run_on(terminal, transport, prompt::Task::Rename(&session), false)?;
+                    let outcome = prompt::run_on(
+                        terminal,
+                        transport,
+                        prompt::Task::Rename(&session),
+                        prompt::Arrival::Cut,
+                    )?;
                     if !matches!(outcome, prompt::Outcome::Cancelled) {
                         refresh(&mut app, transport)?;
                     }
@@ -633,8 +651,55 @@ fn erase(
     play_out(terminal, app, palette, App::erasing)
 }
 
-/// Draw frames until `playing` says the effect is over — for the two that
-/// must finish before the I/O they precede, the backspace and the landing —
+/// Make room in the list for the session `c` is about to create, and close
+/// the picker onto it: what the picker does between the key and the prompt,
+/// and how the prompt should come up after it.
+///
+/// The rows under the cursor step down a line, and in the gap the session
+/// stands as it will be listed — the number it will be given, and the name the
+/// prompt will offer, numbered after it (see [`prompt::default_name`]), dim —
+/// coming up out of the background over
+/// [`effects::ROOM`] (see [`App::make_room`]). Then the picker closes in onto
+/// that row, and the prompt opens out of its name field, where the same name
+/// is waiting: [`prompt::Arrival::FromName`].
+///
+/// The close and the opening are the fade's, so with no fade — switched off,
+/// `NO_COLOR`, or a terminal that never said what its colours are — the gap
+/// is held, dim, for [`effects::ROOM_HELD`] and the prompt cuts in. With
+/// `[effects.create]` off there is no gap, and the prompt cuts in at once, as
+/// it always did. Keys pressed meanwhile wait in the terminal's queue for the
+/// prompt, as they do behind every effect played out here.
+fn make_room(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    palette: Option<&crate::palette::Palette>,
+) -> Result<prompt::Arrival> {
+    let name = prompt::default_name(app.sessions(), Some(app.new_number()));
+    if !app.make_room(&name) {
+        return Ok(prompt::Arrival::Cut);
+    }
+    let opened = Instant::now();
+    play_out(terminal, app, palette, |app| app.room().is_some())?;
+    let size = terminal.size()?;
+    let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+    match draw::row_rect(app, area, app::GHOST_ID) {
+        Some(row) if crate::fade::enabled() => {
+            crate::fade::fade_out_onto(terminal, |f| draw::draw(f, app), row.y)?;
+            Ok(prompt::Arrival::FromName)
+        }
+        // Not on screen at all — a terminal with no room for a list — or no
+        // fade to close it with: shown for as long as it is worth reading,
+        // and then the prompt cuts in over it.
+        _ => {
+            std::thread::sleep(effects::ROOM_HELD.saturating_sub(opened.elapsed()));
+            Ok(prompt::Arrival::Cut)
+        }
+    }
+}
+
+/// Draw frames until `playing` says the effect is over — for the three that
+/// must finish before what they precede, the backspace, the landing and the
+/// gap a new session opens —
 /// and then the screen it leaves. Keys pressed meanwhile wait in the
 /// terminal's queue, as they would behind the I/O itself. Nothing playing,
 /// that last frame is the only one: the screen as it stands, for a caller

@@ -1,9 +1,10 @@
 //! The picker's passing effects: the afterglow the cursor leaves behind, the
 //! glint it lands with, the rows a filter keystroke drops fading out where
-//! they stood, the line struck through a name a `[y/N]` is asking about, and
-//! the rings that go out from the session you came back to the picker from.
+//! they stood, the line struck through a name a `[y/N]` is asking about, the
+//! rings that go out from the session you came back to the picker from, and
+//! the row `c` stands in the gap it opens, coming up out of the background.
 //!
-//! All five are a post-pass over a frame [`super::draw`] has already drawn,
+//! All six are a post-pass over a frame [`super::draw`] has already drawn,
 //! the way [`crate::fade::apply`] is, and for the same reason: the screen's own
 //! drawing stays colourless, and its tests keep saying so. What is passing —
 //! which rows, and how far through — is [`App`]'s, moved on by the caller's
@@ -13,7 +14,7 @@
 //! # Colour where the terminal said, modifiers where it did not
 //!
 //! A real fade needs real colours at both ends, so with the terminal's answer
-//! to [`crate::palette::query`] and no `NO_COLOR`, all five paint in colour:
+//! to [`crate::palette::query`] and no `NO_COLOR`, all six paint in colour:
 //!
 //! - the afterglow runs from the selection's look — the foreground as the
 //!   background, the background as the foreground — back to the plain row;
@@ -23,15 +24,18 @@
 //!   the background, so it is plainly leaving from its first frame;
 //! - the bar of a row a `[y/N]` is asking about warms towards the terminal's
 //!   own red as the line goes through its name;
-//! - each ring fades into the background as it spreads.
+//! - each ring fades into the background as it spreads;
+//! - the row in the gap comes up out of the background to the dim it is
+//!   drawn in.
 //!
 //! Without them, each falls back to a modifier, which sets no colour: the
 //! afterglow holds the bar, reversed and dim, for the first third of its time
 //! and then lets it go; the glint is an underline running under the bar where
 //! the band would be; a dropped row is dim until it goes; the struck row is the
 //! line alone, which is a modifier to begin with; a ring is dim once it is
-//! halfway out. Coarser, and correct under `NO_COLOR` by construction, as
-//! everything else here is.
+//! halfway out; the row in the gap is there, dim, from the first frame.
+//! Coarser, and correct under `NO_COLOR` by construction, as everything else
+//! here is.
 //!
 //! The underline on a filter's matched letters is not here, and is not an
 //! effect: it is still, a modifier, and says why a row is still on screen, so
@@ -44,7 +48,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::Frame;
 
-use super::app::App;
+use super::app::{App, GHOST_ID};
 use super::draw;
 use super::sonar::{self, Sonar};
 use crate::palette::{Palette, Rgb};
@@ -54,6 +58,18 @@ use crate::palette::{Palette, Rgb};
 /// millisecond of this is a millisecond the list is longer than the query
 /// says. Long enough to see which rows went, which is all it is for.
 pub const SIFT: Duration = Duration::from_millis(120);
+
+/// How long the row `c` stands in the gap it opens takes to come up out of the
+/// background (see [`App::make_room`]). Long enough to read the name and
+/// the number on it before the picker closes onto it; it is waited on before
+/// the prompt every time, so no longer than that.
+pub const ROOM: Duration = Duration::from_millis(130);
+
+/// How long the gap stays up, all told, when there is no fade to close the
+/// picker onto it: the row is there at once, dim, and this is how long it is
+/// shown before the prompt cuts in. A little longer than [`ROOM`], which the
+/// close would otherwise have followed.
+pub const ROOM_HELD: Duration = Duration::from_millis(200);
 
 /// How long the row the cursor leaves glows. Only that row glows: a quick
 /// `j j j`, or a held key, moves the glow along with the cursor rather than
@@ -144,7 +160,8 @@ pub fn want_palette() -> bool {
     let wanted = effects.cursor_enabled()
         || effects.filter_enabled()
         || effects.kill_enabled()
-        || effects.back_enabled();
+        || effects.back_enabled()
+        || effects.create_enabled();
     wanted && std::env::var_os("NO_COLOR").is_none()
 }
 
@@ -193,9 +210,18 @@ pub fn paint(frame: &mut Frame, app: &App, palette: Option<&Palette>) {
         }
     }
 
+    if let (Some(progress), Some(p)) = (app.room(), palette) {
+        if let Some(rect) = draw::row_rect(app, area, GHOST_ID) {
+            arrive(buf, rect, p, progress);
+        }
+    }
+
     // Last, so the rings find the screen as everything else left it, and only
-    // ever take what is still the terminal's own background.
-    if let Some((id, sonar)) = app.sonar() {
+    // ever take what is still the terminal's own background. Not while a gap
+    // is open for a new session: the picker is on its way to the prompt, and
+    // the gap is the one thing moving. The rings pick up again if the prompt
+    // is cancelled, since `Esc` still goes back where they say.
+    if let Some((id, sonar)) = app.sonar().filter(|_| !app.has_room()) {
         if let Some(rect) = draw::row_rect(app, area, id) {
             rings(buf, app, area, rect, sonar, palette);
         }
@@ -366,6 +392,19 @@ fn leave(buf: &mut Buffer, rect: Rect, palette: Option<&Palette>, progress: f32)
             });
         }
     }
+}
+
+/// The row in a gap made for a new session, `progress` of the way up out of
+/// the background. Only with a palette: without one the row is simply there,
+/// drawn dim, from the first frame. Once it is all the way up nothing is set,
+/// and the row is the plain dim one the renderer drew.
+fn arrive(buf: &mut Buffer, rect: Rect, palette: &Palette, progress: f32) {
+    let fg = rgb(palette.bg.lerp(palette.fg, ease_out(progress)));
+    each_cell(buf, rect, |cell| {
+        if !cell.symbol().trim().is_empty() {
+            cell.set_fg(fg);
+        }
+    });
 }
 
 /// Every cell of `rect` that is on the buffer.
@@ -965,5 +1004,75 @@ mod tests {
         let mut a = picker(&["one", "two"]);
         a.set_came_from("gone");
         assert!(a.sonar().is_none());
+    }
+
+    // --- the gap a new session opens ---------------------------------------
+
+    /// [`picker`] with a gap made after the second row, `ms` milliseconds ago.
+    fn room_after(ms: u64) -> App {
+        let mut a = picker(&["api-server", "dotfiles", "notes"]);
+        a.on_key(Key::Char('j'));
+        assert!(a.make_room("session 4"));
+        a.tick(Duration::from_millis(ms));
+        a
+    }
+
+    /// In colour, the row in the gap comes up out of the background: nearly
+    /// the background on its first frame, brighter halfway, and once it is all
+    /// the way up, the plain dim row the renderer drew, with no colour set.
+    #[test]
+    fn the_row_in_the_gap_comes_up_out_of_the_background() {
+        let p = test_palette();
+        let red = |a: &App| -> u8 {
+            let buf = frame(a, Some(&p));
+            match first_glyph(&buf, row_of(&buf, "session 4")).fg {
+                Color::Rgb(r, ..) => r,
+                other => panic!("painted in colour: {other:?}"),
+            }
+        };
+        let first = red(&room_after(0));
+        let halfway = red(&room_after(ROOM.as_millis() as u64 / 2));
+        assert_eq!(first, p.bg.0, "starts in the background");
+        assert!(halfway > first && halfway < p.fg.0, "on its way: {halfway}");
+
+        let up = room_after(ROOM.as_millis() as u64);
+        let buf = frame(&up, Some(&p));
+        let cell = first_glyph(&buf, row_of(&buf, "session 4"));
+        assert_eq!(cell.fg, Color::Reset, "all the way up: {cell:?}");
+        assert!(cell.modifier.contains(Modifier::DIM));
+        let other = first_glyph(&buf, row_of(&buf, "notes"));
+        assert_eq!(other.fg, Color::Reset, "no other row is touched");
+    }
+
+    /// The rings from the session the picker came back over hold off while
+    /// the gap is open, and pick up again once it closes.
+    #[test]
+    fn the_rings_hold_off_while_the_gap_is_open() {
+        let braille = |a: &App| {
+            frame(a, None)
+                .content
+                .iter()
+                .any(|c| is_braille(c.symbol()))
+        };
+        let mut a = back_over(&["api-server", "dotfiles", "notes"], 1, 200);
+        assert!(braille(&a), "pulsing");
+        assert!(a.make_room("session 4"));
+        assert!(!braille(&a), "held off");
+        a.close_room();
+        assert!(braille(&a), "back");
+    }
+
+    /// Without a palette, nothing is painted: the row is there, dim, from the
+    /// first frame.
+    #[test]
+    fn without_a_palette_the_row_in_the_gap_is_simply_there() {
+        let a = room_after(0);
+        let buf = frame(&a, None);
+        let cell = first_glyph(&buf, row_of(&buf, "session 4"));
+        assert!(cell.modifier.contains(Modifier::DIM), "{cell:?}");
+        test_support::assert_no_colour(W, H, |f| {
+            draw::draw(f, &a);
+            paint(f, &a, None);
+        });
     }
 }

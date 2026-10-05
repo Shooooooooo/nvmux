@@ -166,6 +166,9 @@ enabled = true   # a line through the name at [y/N]; then the row is erased
 
 [effects.filter]
 enabled = true   # rows a filter keystroke drops fade out before the list closes
+
+[effects.create]
+enabled = true   # c opens a gap where the new session goes, then the prompt
 ```
 
 </details>

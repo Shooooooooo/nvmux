@@ -191,6 +191,12 @@ pub(super) enum Task<'a> {
         /// The listing the caller already has — the picker's rows — so the
         /// default name costs no second script run. `None` re-lists.
         listed: Option<&'a [Session]>,
+        /// The number the session will be given once it is listed, which its
+        /// default name is numbered after (see [`default_name`]): the
+        /// picker's, which puts it after the highlighted row (see
+        /// [`super::app::App::new_number`]). `None` for the end of the list,
+        /// where a session made from inside another goes.
+        number: Option<u32>,
     },
     Rename(&'a Session),
 }
@@ -769,8 +775,34 @@ fn aligned(labels: &[&str]) -> Vec<String> {
 pub fn run(transport: &dyn Transport) -> Result<Outcome> {
     // Reached from a session that has just dissolved out, so dissolve in.
     super::owning_for_attach(Outcome::attaches, true, |terminal| {
-        run_on(terminal, transport, Task::Create { listed: None }, true)
+        run_on(
+            terminal,
+            transport,
+            Task::Create {
+                listed: None,
+                number: None,
+            },
+            Arrival::Dissolve,
+        )
     })
+}
+
+/// How the prompt comes up — and so whether it goes back out on a cancel, for
+/// whatever was behind it to come back up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Arrival {
+    /// Cut to, over a screen that is still up: the picker's `r`, and its `c`
+    /// with `[effects.create]` off or no fade to close the picker onto its gap
+    /// with. Cut away from on a cancel too, the picker simply coming back.
+    Cut,
+    /// Dissolved in, out of the background a session has just dissolved into:
+    /// `<prefix> c`. Dissolved out again on a cancel.
+    Dissolve,
+    /// Opened out of the name field's row, the picker having closed in onto
+    /// the gap it made for the session (see [`super::app::App::make_room`]):
+    /// the name the gap showed is the first thing back. Dissolved out on a
+    /// cancel, for the picker to come back up.
+    FromName,
 }
 
 /// Ask on a terminal the caller already owns — how the picker drives this
@@ -780,11 +812,10 @@ pub fn run(transport: &dyn Transport) -> Result<Outcome> {
 /// screen twice and leave it once. Sharing it also makes the handover
 /// invisible, since `Terminal::draw` resets the frame each pass.
 ///
-/// `animate` is whether to dissolve in on the way in, and out on a cancel:
-/// true from a session, whose screen has just dissolved out and which takes
-/// over again from the background; false from the picker, whose screen is
-/// already up and simply comes back. A create dissolves out *either* way — a
-/// client spawn follows, and this is the screen that is up when it does.
+/// `arrival` is how the prompt comes up, and whether it dissolves out on a
+/// cancel: every way but [`Arrival::Cut`] does. A create dissolves out
+/// *whichever* way it came — a client spawn follows, and this is the screen
+/// that is up when it does.
 ///
 /// A create takes the caller's listing, when it has one, for its default name
 /// — see [`Task::Create`] — so the picker's `c` costs no script run on the way
@@ -793,11 +824,12 @@ pub(super) fn run_on(
     terminal: &mut ratatui::DefaultTerminal,
     transport: &dyn Transport,
     task: Task,
-    animate: bool,
+    arrival: Arrival,
 ) -> Result<Outcome> {
+    let animate = arrival != Arrival::Cut;
     let mut prompt = match task {
-        Task::Create { listed } => Prompt::create(
-            next_free_name(transport, listed)?,
+        Task::Create { listed, number } => Prompt::create(
+            next_free_name(transport, listed, number)?,
             default_command(transport),
             default_directory(transport.home()),
         ),
@@ -819,8 +851,14 @@ pub(super) fn run_on(
     // field feeling instant and it paying a round trip to say its first word.
     refresh(&mut prompt, completer.as_mut());
 
-    if animate {
-        crate::fade::fade_in(terminal, |f| draw(f, &prompt))?;
+    match arrival {
+        Arrival::Cut => {}
+        Arrival::Dissolve => crate::fade::fade_in(terminal, |f| draw(f, &prompt))?,
+        Arrival::FromName => {
+            let size = terminal.size()?;
+            let row = name_row(&prompt, Rect::new(0, 0, size.width, size.height));
+            crate::fade::fade_in_from(terminal, |f| draw(f, &prompt), row)?;
+        }
     }
 
     loop {
@@ -908,7 +946,7 @@ pub(super) fn run_on(
                 // retry: what was just refused is the one thing it cannot
                 // know about.
                 let refreshed = match task {
-                    Task::Create { .. } => Some(next_free_name(transport, None)?),
+                    Task::Create { number, .. } => Some(next_free_name(transport, None, number)?),
                     Task::Rename(_) => None,
                 };
                 prompt.fail(e.one_line(), refreshed);
@@ -999,10 +1037,18 @@ fn show(prompt: &mut Prompt, completer: Option<&mut complete::Completer>) {
     menu.message = message;
 }
 
-/// The name a session gets when the user just presses enter. Compared
-/// case-insensitively, because that is how the transports reject duplicates.
-fn next_name(taken: &[String]) -> String {
-    for n in 1..1000 {
+/// The name a session gets when the user just presses enter: `session N`, `N`
+/// the number the session will be given, so the name says where it went in.
+/// Made between the sessions numbered 2 and 3, it is `session 3`, and the
+/// one that was 3 moves down to be 4.
+///
+/// Names are unique, so when that one is taken the next free number above it
+/// is offered instead, and failing every one of those, the first free number
+/// below it. Compared case-insensitively, because that is how the transports
+/// reject duplicates.
+fn next_name(taken: &[String], number: u32) -> String {
+    let number = number.max(1);
+    for n in (number..number.saturating_add(1000)).chain(1..number) {
         let candidate = format!("session {n}");
         if !taken.iter().any(|t| t.eq_ignore_ascii_case(&candidate)) {
             return candidate;
@@ -1011,18 +1057,31 @@ fn next_name(taken: &[String]) -> String {
     "session".to_string()
 }
 
-/// The first free default name, against `listed` when the caller has a listing
-/// in hand and against a fresh one otherwise.
-fn next_free_name(transport: &dyn Transport, listed: Option<&[Session]>) -> Result<String> {
-    let taken: Vec<String> = match listed {
-        Some(sessions) => sessions.iter().map(|s| s.name.clone()).collect(),
-        None => transport
-            .list_sessions()?
-            .into_iter()
-            .map(|s| s.name)
-            .collect(),
-    };
-    Ok(next_name(&taken))
+/// The default name, against `listed` when the caller has a listing in hand
+/// and against a fresh one otherwise. See [`default_name`].
+fn next_free_name(
+    transport: &dyn Transport,
+    listed: Option<&[Session]>,
+    number: Option<u32>,
+) -> Result<String> {
+    match listed {
+        Some(sessions) => Ok(default_name(sessions, number)),
+        None => Ok(default_name(&transport.list_sessions()?, number)),
+    }
+}
+
+/// The name a create offers against the listing `listed`, for a session that
+/// will be given `number` — or, with `None`, the number one past every row's,
+/// for a session going at the end. See [`next_name`].
+///
+/// What the prompt opens with when it is handed that listing and number, and
+/// so what the picker stands in the gap it makes before asking (see
+/// [`super::app::App::make_room`]). One function, so the row in the gap and
+/// the field it hands over to can never disagree.
+pub(super) fn default_name(listed: &[Session], number: Option<u32>) -> String {
+    let taken: Vec<String> = listed.iter().map(|s| s.name.clone()).collect();
+    let last = listed.iter().map(|s| s.state.num).max().unwrap_or(0) + 1;
+    next_name(&taken, number.unwrap_or(last))
 }
 
 /// The directory a session gets when the user just presses enter: the session
@@ -1075,33 +1134,46 @@ fn draw(frame: &mut Frame, prompt: &Prompt) {
     });
 }
 
-/// Centre the block as it reads the moment the prompt opens, then hold it.
+/// Where the form is drawn within the body `area`: centred as it reads the
+/// moment the prompt opens, then held.
 ///
 /// The anchor deliberately ignores what has been typed: sizing it to the current
 /// contents would shuffle the block half a cell on every keystroke, and
 /// anchoring on the labels alone would leave it right of centre. Measuring the
 /// *opening* lines gets both, and keeps each field's first column where its
 /// placeholder sits.
-fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-
-    let rows = prompt.fields.len() as u16;
-    // The anchor counts the fields and the message and *not* the menu, so the
-    // form sits in exactly the same place whether the menu is open or shut. A
-    // block sized to include it would jump up the screen on every `Tab`, and one
-    // that reserved its rows against that would leave a permanent blank gap
-    // under a closed menu. Neither is worth having when the menu can simply hang
-    // in the space below.
-    let height = rows + u16::from(prompt.message.is_some());
+///
+/// It counts the fields and the message and *not* the menu, so the form sits
+/// in exactly the same place whether the menu is open or shut. A block sized
+/// to include it would jump up the screen on every `Tab`, and one that
+/// reserved its rows against that would leave a permanent blank gap under a
+/// closed menu. Neither is worth having when the menu can simply hang in the
+/// space below.
+fn anchor(prompt: &Prompt, area: Rect) -> Rect {
+    let height = prompt.fields.len() as u16 + u16::from(prompt.message.is_some());
     let opening = prompt
         .fields
         .iter()
         .map(|f| f.label.width() + f.default.width())
         .max()
         .unwrap_or(0) as u16;
-    let anchor = draw::centre(area, opening, height);
+    draw::centre(area, opening, height)
+}
+
+/// The screen row the name field is drawn on, on a frame of `area`: what
+/// [`Arrival::FromName`] opens the prompt out of.
+fn name_row(prompt: &Prompt, area: Rect) -> u16 {
+    let (body, _) = draw::split_hint_row(area);
+    anchor(prompt, body).y + NAME as u16
+}
+
+fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let rows = prompt.fields.len() as u16;
+    let anchor = anchor(prompt, area);
     let width = (area.x + area.width).saturating_sub(anchor.x) as usize;
 
     for (i, field) in prompt.fields.iter().enumerate() {
@@ -1688,31 +1760,44 @@ mod tests {
 
     // --- defaults ----------------------------------------------------------
 
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// The default is numbered where the session goes, whatever the other
+    /// sessions are called.
     #[test]
-    fn the_default_is_the_first_free_slot() {
-        assert_eq!(next_name(&[]), "session 1");
-        assert_eq!(
-            next_name(&["session 1".to_string(), "session 2".to_string()]),
-            "session 3"
-        );
-        assert_eq!(
-            next_name(&["session 1".to_string(), "session 3".to_string()]),
-            "session 2",
-            "gaps are filled rather than skipped past"
-        );
+    fn the_default_is_numbered_where_the_session_goes() {
+        assert_eq!(next_name(&[], 1), "session 1");
+        let taken = names(&["api-server", "dotfiles", "notes"]);
+        assert_eq!(next_name(&taken, 3), "session 3");
+        assert_eq!(next_name(&taken, 1), "session 1");
+        assert_eq!(next_name(&taken, 4), "session 4");
+        assert_eq!(next_name(&[], 0), "session 1", "there is no session 0");
+    }
+
+    /// A name already taken is passed over for the next free number above it,
+    /// and only once there are none above, the first free one below.
+    #[test]
+    fn a_taken_default_gives_way_to_the_next_free_number_up() {
+        let taken = names(&["session 1", "session 2", "session 3"]);
+        assert_eq!(next_name(&taken, 3), "session 4");
+        assert_eq!(next_name(&taken, 2), "session 4");
+        let taken: Vec<String> = (5..1005).map(|n| format!("session {n}")).collect();
+        assert_eq!(next_name(&taken, 5), "session 1", "every one above taken");
     }
 
     /// Duplicates are rejected case-insensitively, so a default differing only
     /// in case would be offered and then refused.
     #[test]
     fn the_default_avoids_names_that_differ_only_in_case() {
-        assert_eq!(next_name(&["Session 1".to_string()]), "session 2");
+        assert_eq!(next_name(&names(&["Session 1"]), 1), "session 2");
     }
 
     #[test]
     fn the_default_gives_up_gracefully_when_every_slot_is_taken() {
-        let taken: Vec<String> = (1..1000).map(|n| format!("session {n}")).collect();
-        assert_eq!(next_name(&taken), "session");
+        let taken: Vec<String> = (1..=1000).map(|n| format!("session {n}")).collect();
+        assert_eq!(next_name(&taken, 1), "session");
     }
 
     #[test]
@@ -2923,5 +3008,57 @@ mod tests {
         // strongest — reversed and bold, which are modifiers, not colours.
         let offering = menuing("/home/you/pro", &["projects", "prototypes"]);
         test_support::assert_no_colour(60, 9, |f| draw(f, &offering));
+    }
+
+    // --- out of the gap the picker makes -------------------------------------
+
+    /// `names` as a listing, numbered from 1 as a listing resolves them.
+    fn listing(names: &[&str]) -> Vec<Session> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let num = i as u32 + 1;
+                let mut s = Session::new(format!("id{i:06}"), n.to_string(), 100, num);
+                s.state.num = num;
+                s
+            })
+            .collect()
+    }
+
+    /// The name the gap shows is the one the prompt opens with: one function
+    /// answers both, against the same listing. Given a number, it is that
+    /// one's; given none, the session goes at the end, one past every row.
+    #[test]
+    fn the_default_name_is_numbered_where_the_session_goes_in_the_listing() {
+        let listed = listing(&["api-server", "dotfiles", "notes"]);
+        assert_eq!(
+            default_name(&listed, Some(3)),
+            "session 3",
+            "between dotfiles and notes"
+        );
+        assert_eq!(default_name(&listed, None), "session 4", "at the end");
+        assert_eq!(default_name(&[], None), "session 1");
+        let listed = listing(&["session 1", "Session 2", "notes"]);
+        assert_eq!(default_name(&listed, Some(2)), "session 3", "2 is taken");
+    }
+
+    /// The row the prompt opens out of is the one its name field is drawn on,
+    /// on any screen tall enough to draw it.
+    #[test]
+    fn the_name_row_is_where_the_name_field_is_drawn() {
+        let p = Prompt::create("session 4".into(), "nvim".into(), "~/".into());
+        for (w, h) in [(72, 15), (80, 24), (40, 6), (120, 50)] {
+            let lines = super::super::test_support::render(w, h, |f| draw(f, &p));
+            let drawn = lines
+                .iter()
+                .position(|l| l.contains("new session name"))
+                .expect("the name field is drawn");
+            assert_eq!(
+                usize::from(name_row(&p, Rect::new(0, 0, w, h))),
+                drawn,
+                "{w}x{h}: {lines:#?}"
+            );
+        }
     }
 }
