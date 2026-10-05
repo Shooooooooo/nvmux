@@ -769,8 +769,31 @@ fn aligned(labels: &[&str]) -> Vec<String> {
 pub fn run(transport: &dyn Transport) -> Result<Outcome> {
     // Reached from a session that has just dissolved out, so dissolve in.
     super::owning_for_attach(Outcome::attaches, true, |terminal| {
-        run_on(terminal, transport, Task::Create { listed: None }, true)
+        run_on(
+            terminal,
+            transport,
+            Task::Create { listed: None },
+            Arrival::Dissolve,
+        )
     })
+}
+
+/// How the prompt comes up — and so whether it goes back out on a cancel, for
+/// whatever was behind it to come back up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Arrival {
+    /// Cut to, over a screen that is still up: the picker's `r`, and its `c`
+    /// with `[effects.create]` off or no fade to close the picker onto its gap
+    /// with. Cut away from on a cancel too, the picker simply coming back.
+    Cut,
+    /// Dissolved in, out of the background a session has just dissolved into:
+    /// `<prefix> c`. Dissolved out again on a cancel.
+    Dissolve,
+    /// Opened out of the name field's row, the picker having closed in onto
+    /// the gap it made for the session (see [`super::app::App::make_room`]):
+    /// the name the gap showed is the first thing back. Dissolved out on a
+    /// cancel, for the picker to come back up.
+    FromName,
 }
 
 /// Ask on a terminal the caller already owns — how the picker drives this
@@ -780,11 +803,10 @@ pub fn run(transport: &dyn Transport) -> Result<Outcome> {
 /// screen twice and leave it once. Sharing it also makes the handover
 /// invisible, since `Terminal::draw` resets the frame each pass.
 ///
-/// `animate` is whether to dissolve in on the way in, and out on a cancel:
-/// true from a session, whose screen has just dissolved out and which takes
-/// over again from the background; false from the picker, whose screen is
-/// already up and simply comes back. A create dissolves out *either* way — a
-/// client spawn follows, and this is the screen that is up when it does.
+/// `arrival` is how the prompt comes up, and whether it dissolves out on a
+/// cancel: every way but [`Arrival::Cut`] does. A create dissolves out
+/// *whichever* way it came — a client spawn follows, and this is the screen
+/// that is up when it does.
 ///
 /// A create takes the caller's listing, when it has one, for its default name
 /// — see [`Task::Create`] — so the picker's `c` costs no script run on the way
@@ -793,8 +815,9 @@ pub(super) fn run_on(
     terminal: &mut ratatui::DefaultTerminal,
     transport: &dyn Transport,
     task: Task,
-    animate: bool,
+    arrival: Arrival,
 ) -> Result<Outcome> {
+    let animate = arrival != Arrival::Cut;
     let mut prompt = match task {
         Task::Create { listed } => Prompt::create(
             next_free_name(transport, listed)?,
@@ -819,8 +842,14 @@ pub(super) fn run_on(
     // field feeling instant and it paying a round trip to say its first word.
     refresh(&mut prompt, completer.as_mut());
 
-    if animate {
-        crate::fade::fade_in(terminal, |f| draw(f, &prompt))?;
+    match arrival {
+        Arrival::Cut => {}
+        Arrival::Dissolve => crate::fade::fade_in(terminal, |f| draw(f, &prompt))?,
+        Arrival::FromName => {
+            let size = terminal.size()?;
+            let row = name_row(&prompt, Rect::new(0, 0, size.width, size.height));
+            crate::fade::fade_in_from(terminal, |f| draw(f, &prompt), row)?;
+        }
     }
 
     loop {
@@ -1014,15 +1043,27 @@ fn next_name(taken: &[String]) -> String {
 /// The first free default name, against `listed` when the caller has a listing
 /// in hand and against a fresh one otherwise.
 fn next_free_name(transport: &dyn Transport, listed: Option<&[Session]>) -> Result<String> {
-    let taken: Vec<String> = match listed {
-        Some(sessions) => sessions.iter().map(|s| s.name.clone()).collect(),
-        None => transport
-            .list_sessions()?
-            .into_iter()
-            .map(|s| s.name)
-            .collect(),
-    };
-    Ok(next_name(&taken))
+    match listed {
+        Some(sessions) => Ok(default_name(sessions)),
+        None => {
+            let taken: Vec<String> = transport
+                .list_sessions()?
+                .into_iter()
+                .map(|s| s.name)
+                .collect();
+            Ok(next_name(&taken))
+        }
+    }
+}
+
+/// The name a create offers against the listing `listed`: what the prompt
+/// opens with when it is handed that listing, and so what the picker stands
+/// in the gap it makes before asking (see [`super::app::App::make_room`]). One
+/// function, so the row in the gap and the field it hands over to can never
+/// disagree.
+pub(super) fn default_name(listed: &[Session]) -> String {
+    let taken: Vec<String> = listed.iter().map(|s| s.name.clone()).collect();
+    next_name(&taken)
 }
 
 /// The directory a session gets when the user just presses enter: the session
@@ -1075,33 +1116,46 @@ fn draw(frame: &mut Frame, prompt: &Prompt) {
     });
 }
 
-/// Centre the block as it reads the moment the prompt opens, then hold it.
+/// Where the form is drawn within the body `area`: centred as it reads the
+/// moment the prompt opens, then held.
 ///
 /// The anchor deliberately ignores what has been typed: sizing it to the current
 /// contents would shuffle the block half a cell on every keystroke, and
 /// anchoring on the labels alone would leave it right of centre. Measuring the
 /// *opening* lines gets both, and keeps each field's first column where its
 /// placeholder sits.
-fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-
-    let rows = prompt.fields.len() as u16;
-    // The anchor counts the fields and the message and *not* the menu, so the
-    // form sits in exactly the same place whether the menu is open or shut. A
-    // block sized to include it would jump up the screen on every `Tab`, and one
-    // that reserved its rows against that would leave a permanent blank gap
-    // under a closed menu. Neither is worth having when the menu can simply hang
-    // in the space below.
-    let height = rows + u16::from(prompt.message.is_some());
+///
+/// It counts the fields and the message and *not* the menu, so the form sits
+/// in exactly the same place whether the menu is open or shut. A block sized
+/// to include it would jump up the screen on every `Tab`, and one that
+/// reserved its rows against that would leave a permanent blank gap under a
+/// closed menu. Neither is worth having when the menu can simply hang in the
+/// space below.
+fn anchor(prompt: &Prompt, area: Rect) -> Rect {
+    let height = prompt.fields.len() as u16 + u16::from(prompt.message.is_some());
     let opening = prompt
         .fields
         .iter()
         .map(|f| f.label.width() + f.default.width())
         .max()
         .unwrap_or(0) as u16;
-    let anchor = draw::centre(area, opening, height);
+    draw::centre(area, opening, height)
+}
+
+/// The screen row the name field is drawn on, on a frame of `area`: what
+/// [`Arrival::FromName`] opens the prompt out of.
+fn name_row(prompt: &Prompt, area: Rect) -> u16 {
+    let (body, _) = draw::split_hint_row(area);
+    anchor(prompt, body).y + NAME as u16
+}
+
+fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let rows = prompt.fields.len() as u16;
+    let anchor = anchor(prompt, area);
     let width = (area.x + area.width).saturating_sub(anchor.x) as usize;
 
     for (i, field) in prompt.fields.iter().enumerate() {
@@ -2923,5 +2977,39 @@ mod tests {
         // strongest — reversed and bold, which are modifiers, not colours.
         let offering = menuing("/home/you/pro", &["projects", "prototypes"]);
         test_support::assert_no_colour(60, 9, |f| draw(f, &offering));
+    }
+
+    // --- out of the gap the picker makes -------------------------------------
+
+    /// The name the gap shows is the one the prompt opens with: one function
+    /// answers both, against the same listing.
+    #[test]
+    fn the_default_name_is_the_first_free_one_in_the_listing() {
+        let listed: Vec<Session> = ["session 1", "Session 2", "notes"]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| Session::new(format!("id{i:06}"), n.to_string(), 100, 1))
+            .collect();
+        assert_eq!(default_name(&listed), "session 3");
+        assert_eq!(default_name(&[]), "session 1");
+    }
+
+    /// The row the prompt opens out of is the one its name field is drawn on,
+    /// on any screen tall enough to draw it.
+    #[test]
+    fn the_name_row_is_where_the_name_field_is_drawn() {
+        let p = Prompt::create("session 4".into(), "nvim".into(), "~/".into());
+        for (w, h) in [(72, 15), (80, 24), (40, 6), (120, 50)] {
+            let lines = super::super::test_support::render(w, h, |f| draw(f, &p));
+            let drawn = lines
+                .iter()
+                .position(|l| l.contains("new session name"))
+                .expect("the name field is drawn");
+            assert_eq!(
+                usize::from(name_row(&p, Rect::new(0, 0, w, h))),
+                drawn,
+                "{w}x{h}: {lines:#?}"
+            );
+        }
     }
 }

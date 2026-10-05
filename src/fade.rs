@@ -170,7 +170,9 @@ pub enum Direction {
 /// A fade shaped around one row: an iris, closing onto that row on the way
 /// out and opening out of it on the way in. An attach from the picker's (see
 /// [`crate::handoff`]): the picker closes onto the row of the session chosen,
-/// and the session opens out of the line its name stands on.
+/// and the session opens out of the line its name stands on. And a create's
+/// (see [`crate::ui::app::App::make_room`]): the picker closes onto the row
+/// the new session will take, and the prompt opens out of its name field.
 ///
 /// Every row still goes the whole way, and on the same clock: an iris only
 /// says *when* in the fade each row does its part. Closing, the rows furthest
@@ -373,6 +375,25 @@ pub fn apply_keeping(buf: &mut Buffer, palette: &Palette, t: f32, keep: Rect) {
     }
 }
 
+/// [`apply`], shaped as an [`Iris`] on `row` of the buffer: closing onto it
+/// going [`Direction::Out`], opening out of it going [`Direction::In`]. Nothing
+/// is kept back, so both ends are exactly [`apply`]'s: every visible cell gone
+/// at the end of a fade out, the screen untouched at the end of a fade in.
+pub fn apply_iris(buf: &mut Buffer, palette: &Palette, direction: Direction, t: f32, row: u16) {
+    let area = buf.area;
+    if area.width == 0 {
+        return;
+    }
+    let iris = Iris::new(row.saturating_sub(area.y), area.height);
+    for (i, cell) in buf.content.iter_mut().enumerate() {
+        let y = u16::try_from(i / usize::from(area.width)).unwrap_or(u16::MAX);
+        let k = iris.at(direction, t, y);
+        if k > 0.0 {
+            sink(cell, dissolved(palette, k));
+        }
+    }
+}
+
 /// The foreground a cell shows `t` of the way into the background.
 fn dissolved(palette: &Palette, t: f32) -> Color {
     let fg = palette.fg.lerp(palette.bg, t);
@@ -394,7 +415,7 @@ pub fn fade_in<F>(terminal: &mut DefaultTerminal, draw: F) -> io::Result<()>
 where
     F: FnMut(&mut Frame),
 {
-    run(terminal, draw, Direction::In, None)
+    run(terminal, draw, Direction::In, Shape::Even)
 }
 
 /// Dissolve a ratatui screen out into the background. Ends fully dissolved,
@@ -404,7 +425,7 @@ pub fn fade_out<F>(terminal: &mut DefaultTerminal, draw: F) -> io::Result<()>
 where
     F: FnMut(&mut Frame),
 {
-    run(terminal, draw, Direction::Out, None)
+    run(terminal, draw, Direction::Out, Shape::Even)
 }
 
 /// [`fade_out`], handing the cells of `keep` off rather than dissolving them,
@@ -415,14 +436,44 @@ pub fn fade_out_keeping<F>(terminal: &mut DefaultTerminal, draw: F, keep: Rect) 
 where
     F: FnMut(&mut Frame),
 {
-    run(terminal, draw, Direction::Out, Some(keep))
+    run(terminal, draw, Direction::Out, Shape::Keeping(keep))
+}
+
+/// [`fade_out`], closing in onto `row` as an [`Iris`], that row last: the
+/// picker's, onto the row a session about to be created will take.
+pub fn fade_out_onto<F>(terminal: &mut DefaultTerminal, draw: F, row: u16) -> io::Result<()>
+where
+    F: FnMut(&mut Frame),
+{
+    run(terminal, draw, Direction::Out, Shape::Iris(row))
+}
+
+/// [`fade_in`], opening out of `row` as an [`Iris`], that row first: the
+/// create prompt's, out of its name field.
+pub fn fade_in_from<F>(terminal: &mut DefaultTerminal, draw: F, row: u16) -> io::Result<()>
+where
+    F: FnMut(&mut Frame),
+{
+    run(terminal, draw, Direction::In, Shape::Iris(row))
+}
+
+/// How a ratatui screen's fade is laid over it.
+#[derive(Debug, Clone, Copy)]
+enum Shape {
+    /// Every cell together ([`apply`]).
+    Even,
+    /// An iris onto the row of these cells, which are handed off rather than
+    /// dissolved ([`apply_keeping`]).
+    Keeping(Rect),
+    /// An iris on this row, nothing kept ([`apply_iris`]).
+    Iris(u16),
 }
 
 fn run<F>(
     terminal: &mut DefaultTerminal,
     mut draw: F,
     direction: Direction,
-    keep: Option<Rect>,
+    shape: Shape,
 ) -> io::Result<()>
 where
     F: FnMut(&mut Frame),
@@ -435,9 +486,10 @@ where
         crate::term::write_stdout(SYNC_BEGIN)?;
         terminal.draw(|f| {
             draw(f);
-            match keep {
-                Some(keep) => apply_keeping(f.buffer_mut(), palette, t, keep),
-                None => apply(f.buffer_mut(), palette, t),
+            match shape {
+                Shape::Even => apply(f.buffer_mut(), palette, t),
+                Shape::Keeping(keep) => apply_keeping(f.buffer_mut(), palette, t, keep),
+                Shape::Iris(row) => apply_iris(f.buffer_mut(), palette, direction, t, row),
             }
         })?;
         crate::term::write_stdout(SYNC_END)?;
@@ -859,6 +911,52 @@ mod tests {
             .collect();
         assert_eq!(name, "dotfiles");
         assert_eq!(buf[(0, 0)].fg, Color::Rgb(0, 0, 0), "the marker is gone");
+    }
+
+    /// Three plain rows, `abc` on each, for the iris without a hand-off.
+    fn three_rows() -> Buffer {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 3));
+        for y in 0..3 {
+            buf.set_string(0, y, "abc", Style::default());
+        }
+        buf
+    }
+
+    /// Closing onto a row with nothing kept: the rows away from it go first
+    /// and it goes last, and at the end every row is gone, as an even fade
+    /// leaves them.
+    #[test]
+    fn an_iris_with_nothing_kept_closes_onto_its_row() {
+        let p = palette();
+        let mut buf = three_rows();
+        apply_iris(&mut buf, &p, Direction::Out, 0.5, 2);
+        assert_eq!(buf[(0, 2)].fg, Color::Reset, "its own row, still waiting");
+        assert!(
+            matches!(buf[(0, 0)].fg, Color::Rgb(..)),
+            "the furthest, going: {:?}",
+            buf[(0, 0)]
+        );
+
+        let mut buf = three_rows();
+        apply_iris(&mut buf, &p, Direction::Out, 1.0, 2);
+        let mut even = three_rows();
+        apply(&mut even, &p, 1.0);
+        assert_eq!(buf, even, "all the way out, the same as an even fade");
+    }
+
+    /// Opening out of a row: it comes back first and the rest after, and at
+    /// the end the screen is exactly as drawn.
+    #[test]
+    fn an_iris_with_nothing_kept_opens_out_of_its_row() {
+        let p = palette();
+        let mut buf = three_rows();
+        apply_iris(&mut buf, &p, Direction::In, 0.5, 0);
+        assert_eq!(buf[(0, 0)].fg, Color::Reset, "its own row, back already");
+        assert_eq!(buf[(0, 2)].fg, Color::Rgb(0, 0, 0), "the furthest, waiting");
+
+        let mut buf = three_rows();
+        apply_iris(&mut buf, &p, Direction::In, 0.0, 0);
+        assert_eq!(buf, three_rows(), "all the way in, as drawn");
     }
 
     /// A name typed by number is not on the bar: it is left exactly as drawn.

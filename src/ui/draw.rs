@@ -42,6 +42,12 @@ const INDENT: &str = "  ";
 /// than collapsing it, is there to avoid.
 const GRABBED: &str = "⇕ ";
 
+/// The marker on the row standing in a gap made for a new session (see
+/// [`App::make_room`]): a session that is not there yet.
+///
+/// Exactly as wide as [`MARKER`], for the reason [`GRABBED`] is.
+const GHOST: &str = "+ ";
+
 /// The prompt cursor.
 const CURSOR: &str = "▋";
 
@@ -210,6 +216,21 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
             if backspace.is_some_and(|(id, _)| id == row.session.id) {
                 return Line::default();
             }
+            // A session not made yet, standing in the gap made for it: dim
+            // from end to end, as a suggestion is on the prompt it is about
+            // to be named in, and never the selection.
+            if row.ghost {
+                let head = format!("{GHOST}{:>num_width$}{NUM_GAP}", row.num);
+                let dim = Style::default().add_modifier(Modifier::DIM);
+                return row_line(
+                    &head,
+                    &row.session.name,
+                    0..0,
+                    &[],
+                    block.width as usize,
+                    dim,
+                );
+            }
             let selected = i == selected_row && !row.leaving;
             let style = if selected {
                 Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
@@ -217,7 +238,7 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default()
             };
             let marked = app.matched(&row.session.name);
-            let head = head(row.session, selected, reordering, num_width);
+            let head = head(row.num, selected, reordering, num_width);
             // The number is dim beside the name it stands for, except in the
             // selection's bar: bold and dim share one reset, and most
             // terminals cannot show both, so dimming it there would break the
@@ -275,15 +296,15 @@ fn draw_landing(
     else {
         return;
     };
-    let Some(session) = app.rows().get(selected).map(|r| r.session) else {
+    let Some(row) = app.rows().get(selected).copied() else {
         return;
     };
     let y = block.y + line as u16;
     let left = block.x;
     let drawn = format!(
         "{}{}{PAD}",
-        head(session, true, false, num_width),
-        session.name
+        head(row.num, true, false, num_width),
+        row.session.name
     );
     let right = block.x + drawn.width().min(block.width as usize) as u16;
     let screen = frame.area();
@@ -338,14 +359,9 @@ fn draw_landing(
     }
 }
 
-/// What comes before a row's name: its marker, its number right-aligned in the
-/// number column, and the gap.
-fn head(
-    session: &crate::session::Session,
-    selected: bool,
-    reordering: bool,
-    num_width: usize,
-) -> String {
+/// What comes before a row's name: its marker, its number (see
+/// [`super::app::Row::num`]) right-aligned in the number column, and the gap.
+fn head(num: u32, selected: bool, reordering: bool, num_width: usize) -> String {
     let prefix = match (selected, reordering) {
         (true, true) => GRABBED,
         (true, false) => MARKER,
@@ -354,7 +370,7 @@ fn head(
     let num = if reordering {
         String::new()
     } else {
-        session.state.num.to_string()
+        num.to_string()
     };
     format!("{prefix}{num:>num_width$}{NUM_GAP}")
 }
@@ -428,13 +444,13 @@ fn draw_backspace(
     else {
         return;
     };
-    let session = rows[index].session;
+    let row = rows[index];
     let selected = index == app.selected_row();
     let text = truncate(
         &format!(
             "{}{}",
-            head(session, selected, false, num_width),
-            session.name
+            head(row.num, selected, false, num_width),
+            row.session.name
         ),
         block.width as usize,
     );
@@ -594,7 +610,7 @@ fn list_layout(app: &App, area: Rect) -> Option<ListLayout> {
     // in one column once the list runs past nine.
     let num_width = rows
         .iter()
-        .map(|r| r.session.state.num.to_string().len())
+        .map(|r| r.num.to_string().len())
         .max()
         .unwrap_or(1);
     let width = (widest
@@ -606,8 +622,25 @@ fn list_layout(app: &App, area: Rect) -> Option<ListLayout> {
         .min(area.width);
 
     let height = (rows.len() as u16).min(area.height);
-    let block = centre(area, width, height);
-    let offset = scroll_offset(app.selected_row(), rows.len(), height as usize);
+    let mut block = centre(area, width, height);
+    let gap = rows.iter().position(|r| r.ghost);
+    // A gap pushes the rows under it down and leaves the rows over it where
+    // they stood. Centred afresh on one row more, the list would rise a line
+    // on every other terminal height instead, the highlight with it, and the
+    // gap would read as the rows above making way rather than those below.
+    // So the top stays where the list had it without the gap, while there is
+    // room under it for the extra row.
+    if gap.is_some() {
+        let before = centre(area, width, height.saturating_sub(1));
+        if before.y + height <= area.y + area.height {
+            block.y = before.y;
+        }
+    }
+    // A gap made for a new session is what the screen is about while it is
+    // open, and it is the row after the selection: kept in view, the
+    // selection above it comes with it on any list more than a row high.
+    let focus = gap.unwrap_or_else(|| app.selected_row());
+    let offset = scroll_offset(focus, rows.len(), height as usize);
     Some(ListLayout {
         block,
         offset,
@@ -646,14 +679,21 @@ pub(super) fn row_at(app: &App, area: Rect, column: u16, row: u16) -> Option<usi
     if row < block.y || row >= block.y + block.height {
         return None;
     }
-    // An index into the rows drawn, which a row fading out of a filter is one
-    // of; the answer is an index into the visible ones, which it is not.
+    // An index into the rows drawn, which a row fading out of a filter or one
+    // standing in a gap is; the answer is an index into the visible ones,
+    // which neither is.
     let index = offset + usize::from(row - block.y);
     let rows = app.rows();
-    if rows.get(index)?.leaving {
+    let drawn = rows.get(index)?;
+    if drawn.leaving || drawn.ghost {
         return None;
     }
-    Some(rows[..index].iter().filter(|r| !r.leaving).count())
+    Some(
+        rows[..index]
+            .iter()
+            .filter(|r| !r.leaving && !r.ghost)
+            .count(),
+    )
 }
 
 /// Where the row of session `id` is drawn, as wide as the selection's bar is
@@ -2007,5 +2047,166 @@ mod tests {
         off.set_trail(false);
         off.on_key(Key::Enter);
         assert!(off.landing().is_none());
+    }
+
+    // --- the gap a new session opens -----------------------------------------
+
+    /// [`picker`] with the second row selected and a gap made after it for
+    /// `session 4`.
+    fn making_room() -> App {
+        let mut a = app(&["api-server", "dotfiles", "notes"]);
+        a.on_key(Key::Char('j'));
+        assert!(a.make_room("session 4"));
+        a
+    }
+
+    /// The rows under the highlight step down a line, and the new session
+    /// stands in the gap with a `+` for its marker, the number it will have and
+    /// the name the prompt will offer — in the same columns as every other
+    /// row, and dim from end to end. The row below has taken the next number.
+    #[test]
+    fn the_new_session_stands_in_a_gap_under_the_highlight() {
+        let before = render(&app(&["api-server", "dotfiles", "notes"]), 44, 9);
+        let a = making_room();
+        let lines = render(&a, 44, 9);
+        let y = line_of(&lines, "session 4");
+        assert_eq!(line_of(&lines, "dotfiles") + 1, y, "{lines:#?}");
+        assert_eq!(line_of(&lines, "notes"), y + 1);
+        assert!(lines[y as usize].contains("+ 3  session 4"), "{lines:#?}");
+        assert!(lines[y as usize + 1].contains("  4  notes"), "{lines:#?}");
+        let column = |line: &str, name: &str| line[..line.find(name).expect("drawn")].width();
+        assert_eq!(
+            column(&lines[y as usize], "session 4"),
+            column(&lines[y as usize - 1], "dotfiles"),
+            "the names are in one column"
+        );
+        assert_eq!(
+            line_of(&lines, "api-server"),
+            line_of(&before, "api-server"),
+            "four rows centre where three did, so the rows above stay put"
+        );
+
+        let buf = test_support::buffer(44, 9, |f| draw(f, &a));
+        let row: Vec<&ratatui::buffer::Cell> = (0..buf.area.width)
+            .map(|x| &buf[(x, y)])
+            .filter(|c| c.symbol() != " ")
+            .collect();
+        assert!(
+            row.iter().all(|c| c.modifier == Modifier::DIM),
+            "dim, and nothing else: {row:?}"
+        );
+        test_support::assert_no_colour(44, 9, |f| draw(f, &a));
+    }
+
+    /// The rows above the gap stay where they stood on any terminal height,
+    /// and the rows below step down: centring four rows where three were would
+    /// otherwise lift the list a line on every other height.
+    #[test]
+    fn the_rows_above_the_gap_stay_put_on_any_height() {
+        for h in 7..=12 {
+            let before = render(&app(&["api-server", "dotfiles", "notes"]), 44, h);
+            let lines = render(&making_room(), 44, h);
+            assert_eq!(
+                line_of(&lines, "api-server"),
+                line_of(&before, "api-server"),
+                "{h} rows: {lines:#?}"
+            );
+            assert_eq!(line_of(&lines, "dotfiles"), line_of(&before, "dotfiles"));
+            assert_eq!(line_of(&lines, "notes"), line_of(&before, "notes") + 1);
+        }
+    }
+
+    /// With no row to spare under the list, the gap takes the one it needs
+    /// from above instead, rather than pushing the last row off the screen.
+    #[test]
+    fn a_gap_with_no_room_below_takes_it_from_above() {
+        // Five rows of body for a list of four with the gap: the list fills it.
+        let lines = render(
+            &{
+                let mut a = app(&["one", "two", "three", "four"]);
+                a.on_key(Key::Char('j'));
+                assert!(a.make_room("session 1"));
+                a
+            },
+            30,
+            6,
+        );
+        for name in ["one", "two", "session 1", "three", "four"] {
+            line_of(&lines, name);
+        }
+    }
+
+    /// The row in the gap is not a row anything can be done to: a click on it
+    /// names nothing, and the rows around it are still the rows they were.
+    #[test]
+    fn the_new_session_cannot_be_clicked() {
+        let a = making_room();
+        let area = Rect::new(0, 0, 44, 9);
+        let lines = render(&a, 44, 9);
+        assert_eq!(row_at(&a, area, 20, line_of(&lines, "session 4")), None);
+        assert_eq!(row_at(&a, area, 20, line_of(&lines, "dotfiles")), Some(1));
+        assert_eq!(row_at(&a, area, 20, line_of(&lines, "notes")), Some(2));
+    }
+
+    /// On a list longer than the screen, with the highlight on the last row
+    /// in view, the list scrolls so the gap is in view too.
+    #[test]
+    fn a_gap_below_the_window_is_scrolled_into_view() {
+        let names: Vec<String> = (0..30).map(|i| format!("session-{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut a = app(&refs);
+        for _ in 0..8 {
+            a.on_key(Key::Char('j'));
+        }
+        let lines = render(&a, 40, 10);
+        assert!(
+            lines[8].contains("session-08"),
+            "the highlight on the last line of the window: {lines:#?}"
+        );
+        assert!(a.make_room("session 31"));
+        let lines = render(&a, 40, 10);
+        let y = line_of(&lines, "session 31");
+        assert_eq!(line_of(&lines, "session-08") + 1, y, "{lines:#?}");
+        assert!(
+            lines[y as usize].contains("+ 10  session 31"),
+            "the number session-09 had: {lines:#?}"
+        );
+    }
+
+    /// The number column is as wide as the widest number shown, the one the
+    /// last row takes once it has moved down included.
+    #[test]
+    fn the_number_column_makes_room_for_the_last_number_too() {
+        let names: Vec<String> = (1..=9).map(|i| format!("s{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut a = app(&refs);
+        assert!(a.make_room("session 10"));
+        let lines = render(&a, 40, 14);
+        assert!(
+            lines[line_of(&lines, "s9") as usize].contains(" 10  s9"),
+            "{lines:#?}"
+        );
+        assert!(
+            lines[line_of(&lines, "s1") as usize].contains("▸  1  s1"),
+            "{lines:#?}"
+        );
+        assert!(lines[line_of(&lines, "session 10") as usize].contains("+  2  session 10"));
+    }
+
+    /// Closed, the rows are back where they were, under their own numbers.
+    #[test]
+    fn a_closed_gap_leaves_the_list_as_it_was() {
+        let plain = render(&app(&["api-server", "dotfiles", "notes"]), 44, 9);
+        let mut a = making_room();
+        a.close_room();
+        let mut back = app(&["api-server", "dotfiles", "notes"]);
+        back.on_key(Key::Char('j'));
+        back.tick(std::time::Duration::from_secs(1));
+        assert_eq!(render(&a, 44, 9), render(&back, 44, 9));
+        assert_ne!(
+            render(&a, 44, 9),
+            plain,
+            "the highlight is still on dotfiles"
+        );
     }
 }

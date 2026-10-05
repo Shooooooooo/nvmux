@@ -146,6 +146,33 @@ pub struct App {
     /// The session the picker was opened from, and the rings pulsing out from
     /// it, for as long as it is listed. See [`App::set_came_from`].
     sonar: Option<(String, Sonar)>,
+    /// Whether `c` opens a gap where the new session will go before the prompt
+    /// comes up: `[effects.create] enabled`.
+    create: bool,
+    /// That gap, from `c` until the prompt is back down. See
+    /// [`App::make_room`].
+    room: Option<Room>,
+}
+
+/// The id of the row standing in the gap [`App::make_room`] opens: no session's,
+/// since `+` is not in the alphabet an id is written in (see
+/// [`crate::ids::is_valid_id`]), so nothing that looks a row up by id can find
+/// a real session there, or find this row by a real session's id.
+pub const GHOST_ID: &str = "+";
+
+/// The gap a session about to be created will land in.
+#[derive(Debug, Clone)]
+struct Room {
+    /// The row in it: the session as it will be listed, under the name the
+    /// prompt will offer and the number it will be given.
+    ghost: Session,
+    /// Where it goes among the visible rows.
+    at: usize,
+    /// The number one past every row's, which the last row takes once
+    /// everything under the gap has moved down one.
+    last: u32,
+    /// How long the gap has been open.
+    age: Duration,
 }
 
 /// A row the cursor has left or landed on, and how long ago.
@@ -173,12 +200,32 @@ struct Leaving {
     age: Duration,
 }
 
-/// One row of the list as it is drawn: a session, and whether it is one the
-/// filter has just dropped and is only on screen while it fades.
+/// One row of the list as it is drawn: a session, whether it is one the
+/// filter has just dropped and is only on screen while it fades, whether it is
+/// the session about to be created standing in the gap made for it (see
+/// [`App::make_room`]), and the number it shows.
+///
+/// The number is the session's own except under a gap, where every row below
+/// it shows the number of the row below it: the numbers stay where they are on
+/// the screen and the rows move down past them, which is what the create is
+/// about to store (see [`App::placement_of`]).
 #[derive(Debug, Clone, Copy)]
 pub struct Row<'a> {
     pub session: &'a Session,
     pub leaving: bool,
+    pub ghost: bool,
+    pub num: u32,
+}
+
+impl<'a> Row<'a> {
+    fn of(session: &'a Session, leaving: bool) -> Self {
+        Self {
+            session,
+            leaving,
+            ghost: false,
+            num: session.state.num,
+        }
+    }
 }
 
 /// Where a left press landed, which decides what its release means.
@@ -235,6 +282,8 @@ impl App {
             backspace: None,
             back: crate::config::get().effects.back_enabled(),
             sonar: None,
+            create: crate::config::get().effects.create_enabled(),
+            room: None,
         }
     }
 
@@ -258,6 +307,7 @@ impl App {
         self.glint = None;
         self.leaving = None;
         self.landing = None;
+        self.room = None;
         self.sessions = sessions;
         self.selected = previously
             .and_then(|id| self.visible().iter().position(|s| s.id == id))
@@ -377,12 +427,16 @@ impl App {
                 self.landing = None;
             }
         }
+        if let Some(room) = &mut self.room {
+            room.age += elapsed;
+        }
     }
 
     /// Whether anything on screen is moving, and so whether the caller should
     /// draw at a frame's pace rather than wait on the keyboard: a trail, a
     /// glow, a glint, a fading row, a line being struck or drawn back, a row
-    /// being erased, or a pulse of rings. A line all the way across is still,
+    /// being erased, a pulse of rings, or a row coming up in a gap made for a
+    /// new session. A line all the way across is still,
     /// and asks for nothing while the `[y/N]` waits; so are the rings between
     /// pulses, which [`App::wake_in`] answers for instead. With every effect
     /// off this is only ever false, and the picker changes on a key and nothing
@@ -396,6 +450,7 @@ impl App {
             || self.erasing()
             || self.sonar.as_ref().is_some_and(|(_, s)| s.pulsing())
             || self.landing.is_some()
+            || self.room().is_some()
     }
 
     /// How long until something starts moving that is still now — the next
@@ -483,6 +538,71 @@ impl App {
         self.backspace.as_ref().is_some_and(|(_, b)| !b.done())
     }
 
+    /// Open a gap after the highlighted row for the session `c` is about to
+    /// create, and stand it there, named `name`: what the prompt will offer.
+    /// Says whether there is anything to watch — whether the effect is on.
+    ///
+    /// The gap goes where [`App::placement_of`] will put the session once it
+    /// exists, and the rows show the numbers it will deal out: the new row the
+    /// number of the row it pushes down, each row below it the next, and the
+    /// last row the number one past every row's. With nothing highlighted, or
+    /// the last row, the gap is at the end and only the new row's number is
+    /// new. So the screen says, before the prompt asks anything, where the
+    /// session will be and what it will be called.
+    ///
+    /// Whatever else was passing — a glow, a glint, a fading row, a line
+    /// being drawn back off a name a `[y/N]` was declined for — ends here:
+    /// the picker is on its way out, and the gap is all that should be moving.
+    /// The gap stays until [`App::close_room`] or a fresh listing, so the
+    /// picker can be drawn closing in onto it.
+    pub fn make_room(&mut self, name: &str) -> bool {
+        if !self.create {
+            return false;
+        }
+        let rows = self.snapshot();
+        let at = if rows.is_empty() {
+            0
+        } else {
+            (self.selected + 1).min(rows.len())
+        };
+        let last = self.sessions.iter().map(|s| s.state.num).max().unwrap_or(0) + 1;
+        let num = rows.get(at).map_or(last, |(_, num)| *num);
+        let mut ghost = Session::new(GHOST_ID.to_string(), name.to_string(), 0, num);
+        ghost.state.num = num;
+        self.glow = None;
+        self.glint = None;
+        self.leaving = None;
+        self.strike = None;
+        self.room = Some(Room {
+            ghost,
+            at,
+            last,
+            age: Duration::ZERO,
+        });
+        true
+    }
+
+    /// Close the gap [`App::make_room`] opened: the prompt has gone, and the
+    /// rows go back to where they were — or, for a session that was created,
+    /// to the listing that has it.
+    pub fn close_room(&mut self) {
+        self.room = None;
+    }
+
+    /// How far the row in the gap has come up out of the background, `0..1`,
+    /// while it is still coming; `None` once it is all the way up, or there is
+    /// no gap.
+    pub fn room(&self) -> Option<f32> {
+        let room = self.room.as_ref()?;
+        let progress = room.age.as_secs_f32() / effects::ROOM.as_secs_f32();
+        (progress < 1.0).then_some(progress)
+    }
+
+    /// Whether there is a gap open, coming up or all the way up.
+    pub fn has_room(&self) -> bool {
+        self.room.is_some()
+    }
+
     /// The session the picker came back up over, by id, and the rings that
     /// pulse out from it.
     pub fn sonar(&self) -> Option<(&str, &Sonar)> {
@@ -515,6 +635,7 @@ impl App {
         self.sift = on;
         self.kill = on;
         self.back = on;
+        self.create = on;
         if !on {
             self.glow = None;
             self.glint = None;
@@ -561,35 +682,52 @@ impl App {
 
     /// The rows the list draws: the visible ones and, for a moment after a
     /// filter keystroke narrowed the list, the ones it dropped, where they
-    /// stood. In the list's own order.
+    /// stood; or, while [`App::make_room`] has a gap open, the visible ones
+    /// with the session about to be created in it. In the list's own order.
     ///
-    /// Only the drawing sees the dropped rows. Keys, numbers and the mouse go
-    /// on resolving against [`App::visible`], so a row on its way out can be
-    /// seen and not touched.
+    /// Only the drawing sees the dropped rows and the new one. Keys, numbers
+    /// and the mouse go on resolving against [`App::visible`], so a row on its
+    /// way out, or not yet in, can be seen and not touched.
     pub fn rows(&self) -> Vec<Row<'_>> {
         let visible = self.visible();
+        if let Some(room) = &self.room {
+            // Nothing is leaving under a gap: making room ended that.
+            let mut rows: Vec<Row> = visible.into_iter().map(|s| Row::of(s, false)).collect();
+            let at = room.at.min(rows.len());
+            let below: Vec<u32> = rows[at..].iter().map(|r| r.num).collect();
+            for (row, num) in rows[at..]
+                .iter_mut()
+                .zip(below.into_iter().skip(1).chain([room.last]))
+            {
+                row.num = num;
+            }
+            rows.insert(
+                at,
+                Row {
+                    session: &room.ghost,
+                    leaving: false,
+                    ghost: true,
+                    num: room.ghost.state.num,
+                },
+            );
+            return rows;
+        }
         let Some(leaving) = &self.leaving else {
             return visible
                 .into_iter()
-                .map(|session| Row {
-                    session,
-                    leaving: false,
-                })
+                .map(|session| Row::of(session, false))
                 .collect();
         };
         self.sessions
             .iter()
             .filter_map(|session| {
                 if visible.iter().any(|v| v.id == session.id) {
-                    Some(Row {
-                        session,
-                        leaving: false,
-                    })
+                    Some(Row::of(session, false))
                 } else {
-                    leaving.ids.contains(&session.id).then_some(Row {
-                        session,
-                        leaving: true,
-                    })
+                    leaving
+                        .ids
+                        .contains(&session.id)
+                        .then(|| Row::of(session, true))
                 }
             })
             .collect()
@@ -2996,5 +3134,156 @@ mod tests {
         assert_eq!(a.on_key(Key::Char('c')), Request::NewSession);
         assert_eq!(a.selected_index(), 1);
         assert_eq!(*a.mode(), Mode::Normal);
+    }
+
+    // ---- the gap a new session opens ---------------------------------------
+
+    /// Every row drawn, as `(id, number shown)`.
+    fn drawn(a: &App) -> Vec<(String, u32)> {
+        a.rows()
+            .iter()
+            .map(|r| (r.session.id.clone(), r.num))
+            .collect()
+    }
+
+    /// The gap shows exactly what the create will store: the new row where
+    /// [`App::placement_of`] puts it, and every row with the number it will
+    /// be given — for every row the highlight could be on, filtered or not.
+    #[test]
+    fn the_gap_shows_the_placement_the_create_will_store() {
+        let filtered = || {
+            let mut a = app(&["alpha", "zzz", "gamma", "delta"]);
+            a.on_key(Key::Char('/'));
+            a.on_key(Key::Char('a'));
+            a.on_key(Key::Enter);
+            a
+        };
+        for build in [|| app(&["aaa", "bbb", "ccc"]), filtered] {
+            let rows = build().visible().len();
+            for at in 0..rows {
+                let mut a = build();
+                a.select_session(&a.visible()[at].id.clone());
+                let placement = a.placement_of(GHOST_ID);
+                assert!(a.make_room("session 9"));
+                if placement.is_empty() {
+                    continue;
+                }
+                assert_eq!(drawn(&a), placement, "highlight on row {at}");
+            }
+        }
+    }
+
+    /// The row in the gap is named as asked, after the highlighted row, and
+    /// the rows below it move down a place and take the next number.
+    #[test]
+    fn the_rows_under_the_highlight_move_down_for_the_new_one() {
+        let mut a = app(&["api-server", "dotfiles", "notes"]);
+        a.on_key(Key::Char('j'));
+        assert!(a.make_room("session 4"));
+        let rows = a.rows();
+        let shown: Vec<(&str, u32, bool)> = rows
+            .iter()
+            .map(|r| (r.session.name.as_str(), r.num, r.ghost))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("api-server", 1, false),
+                ("dotfiles", 2, false),
+                ("session 4", 3, true),
+                ("notes", 4, false),
+            ]
+        );
+        assert_eq!(a.selected_row(), 1, "the highlight has not moved");
+        assert_eq!(a.visible().len(), 3, "and nothing can be chosen in the gap");
+        assert_eq!(a.session("id000002").expect("notes").state.num, 3);
+    }
+
+    /// With the last row highlighted, or none at all, the gap is at the end,
+    /// and its number is the one past every row's.
+    #[test]
+    fn with_nothing_after_the_highlight_the_gap_is_at_the_end() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.on_key(Key::Char('G'));
+        assert!(a.make_room("session 3"));
+        assert_eq!(
+            drawn(&a),
+            [
+                ("id000000".to_string(), 1),
+                ("id000001".to_string(), 2),
+                (GHOST_ID.to_string(), 3),
+            ]
+        );
+
+        let mut a = app(&[]);
+        assert!(a.make_room("session 1"));
+        assert_eq!(drawn(&a), [(GHOST_ID.to_string(), 1)]);
+    }
+
+    /// The row comes up over [`effects::ROOM`], asking for frames while it
+    /// does, and then stands still in its gap until the gap is closed.
+    #[test]
+    fn the_row_in_the_gap_comes_up_and_then_stands() {
+        let mut a = app(&["aaa", "bbb"]);
+        assert!(a.room().is_none() && !a.has_room());
+        assert!(a.make_room("session 3"));
+        assert_eq!(a.room(), Some(0.0));
+        assert!(a.animating());
+        a.tick(effects::ROOM / 2);
+        let halfway = a.room().expect("still coming");
+        assert!((halfway - 0.5).abs() < 0.01, "{halfway}");
+        a.tick(effects::ROOM);
+        assert!(a.room().is_none(), "all the way up");
+        assert!(a.has_room(), "and still there");
+        assert!(!a.animating());
+        a.close_room();
+        assert!(!a.has_room());
+        assert_eq!(a.rows().len(), 2);
+    }
+
+    /// A fresh listing is the truth about the rows, and ends the gap with
+    /// everything else that was passing over them.
+    #[test]
+    fn a_fresh_listing_closes_the_gap() {
+        let mut a = app(&["aaa", "bbb"]);
+        assert!(a.make_room("session 3"));
+        let listed = a.sessions().to_vec();
+        a.set_sessions(listed);
+        assert!(!a.has_room());
+        assert!(a.rows().iter().all(|r| !r.ghost));
+    }
+
+    /// The picker is on its way out: whatever else was passing ends, so the
+    /// gap is all that moves.
+    #[test]
+    fn making_room_ends_what_else_was_passing() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char('j'));
+        assert!(a.glow().is_some() && a.glint().is_some());
+        assert!(a.make_room("session 4"));
+        assert!(a.glow().is_none() && a.glint().is_none());
+
+        let mut a = app(&["aaa", "bbb"]);
+        a.on_key(Key::Char('x'));
+        a.on_key(Key::Char('n'));
+        assert!(a.strike().is_some(), "the line on its way back off");
+        assert!(a.make_room("session 3"));
+        assert!(a.strike().is_none());
+    }
+
+    /// Off, `c` opens no gap and the rows are as they were.
+    #[test]
+    fn with_the_effect_off_no_gap_opens() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.set_effects(false);
+        assert!(!a.make_room("session 3"));
+        assert!(!a.has_room());
+        assert_eq!(a.rows().len(), 2);
+    }
+
+    /// The id the row in the gap goes by is no session's, and could never be.
+    #[test]
+    fn the_gap_row_has_an_id_no_session_can_have() {
+        assert!(!crate::ids::is_valid_id(GHOST_ID));
     }
 }
