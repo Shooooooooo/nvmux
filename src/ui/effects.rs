@@ -250,9 +250,8 @@ fn glow(buf: &mut Buffer, rect: Rect, palette: Option<&Palette>, progress: f32) 
 }
 
 /// The bar the cursor has just landed on, with the glint `progress` of the way
-/// across it. `rect` is the bar: [`draw::row_rect`] measures a row as far as
-/// the pad past its name, which is as far as the selection's reversed bar
-/// runs.
+/// across it. `rect` is the bar: [`draw::row_rect`] measures a row the whole
+/// width of the list, which is as far as the selection's reversed bar runs.
 fn glint(buf: &mut Buffer, rect: Rect, palette: Option<&Palette>, progress: f32) {
     let middle = -GLINT_LEAD + ease_in_out(progress) * (f32::from(rect.width) + 2.0 * GLINT_LEAD);
     let on_screen = rect.intersection(buf.area);
