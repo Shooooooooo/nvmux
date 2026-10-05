@@ -510,6 +510,7 @@ fn run_loop(
                     transport,
                     prompt::Task::Create {
                         listed: Some(app.sessions()),
+                        number: Some(app.new_number()),
                     },
                     arrival,
                 );
@@ -655,8 +656,9 @@ fn erase(
 /// and how the prompt should come up after it.
 ///
 /// The rows under the cursor step down a line, and in the gap the session
-/// stands as it will be listed — the name the prompt will offer, the number
-/// it will be given, dim — coming up out of the background over
+/// stands as it will be listed — the number it will be given, and the name the
+/// prompt will offer, numbered after it (see [`prompt::default_name`]), dim —
+/// coming up out of the background over
 /// [`effects::ROOM`] (see [`App::make_room`]). Then the picker closes in onto
 /// that row, and the prompt opens out of its name field, where the same name
 /// is waiting: [`prompt::Arrival::FromName`].
@@ -672,7 +674,8 @@ fn make_room(
     app: &mut App,
     palette: Option<&crate::palette::Palette>,
 ) -> Result<prompt::Arrival> {
-    if !app.make_room(&prompt::default_name(app.sessions())) {
+    let name = prompt::default_name(app.sessions(), Some(app.new_number()));
+    if !app.make_room(&name) {
         return Ok(prompt::Arrival::Cut);
     }
     let opened = Instant::now();

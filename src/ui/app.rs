@@ -559,14 +559,8 @@ impl App {
         if !self.create {
             return false;
         }
-        let rows = self.snapshot();
-        let at = if rows.is_empty() {
-            0
-        } else {
-            (self.selected + 1).min(rows.len())
-        };
-        let last = self.sessions.iter().map(|s| s.state.num).max().unwrap_or(0) + 1;
-        let num = rows.get(at).map_or(last, |(_, num)| *num);
+        let (at, num) = self.slot();
+        let last = self.last_number();
         let mut ghost = Session::new(GHOST_ID.to_string(), name.to_string(), 0, num);
         ghost.state.num = num;
         self.glow = None;
@@ -580,6 +574,37 @@ impl App {
             age: Duration::ZERO,
         });
         true
+    }
+
+    /// The number a session created now will be given, and so the one its
+    /// default name is numbered after (see [`super::prompt::default_name`]):
+    /// that of the row after the highlighted one, which it pushes down, or one
+    /// past every row's when it goes at the end. What [`App::make_room`]
+    /// shows on the row in the gap, and what [`App::placement_of`] stores.
+    pub fn new_number(&self) -> u32 {
+        self.slot().1
+    }
+
+    /// Where among the visible rows a session created now goes — after the
+    /// highlighted row, or first in an empty list — and the number it will be
+    /// given there. See [`App::new_number`].
+    fn slot(&self) -> (usize, u32) {
+        let rows = self.snapshot();
+        let at = if rows.is_empty() {
+            0
+        } else {
+            (self.selected + 1).min(rows.len())
+        };
+        let num = rows
+            .get(at)
+            .map_or_else(|| self.last_number(), |(_, num)| *num);
+        (at, num)
+    }
+
+    /// The number one past every row's: what a session appended to the list
+    /// would be given.
+    fn last_number(&self) -> u32 {
+        self.sessions.iter().map(|s| s.state.num).max().unwrap_or(0) + 1
     }
 
     /// Close the gap [`App::make_room`] opened: the prompt has gone, and the
@@ -871,8 +896,7 @@ impl App {
         if at >= rows.len() {
             return Vec::new();
         }
-        let appended = self.sessions.iter().map(|s| s.state.num).max().unwrap_or(0) + 1;
-        let numbers = rows.iter().map(|(_, num)| *num).chain([appended]);
+        let numbers = rows.iter().map(|(_, num)| *num).chain([self.last_number()]);
         let mut ids: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
         ids.insert(at, new_id.to_string());
         ids.into_iter().zip(numbers).collect()
@@ -3279,6 +3303,31 @@ mod tests {
         assert!(!a.make_room("session 3"));
         assert!(!a.has_room());
         assert_eq!(a.rows().len(), 2);
+    }
+
+    /// The number a new session will be given is the one the gap shows on
+    /// its row, and the one the create stores for it: after `dotfiles`, the
+    /// 3 that `notes` had; after the last row, one past it.
+    #[test]
+    fn the_new_number_is_the_one_the_session_will_be_given() {
+        for at in 0..3 {
+            let mut a = app(&["api-server", "dotfiles", "notes"]);
+            a.select_session(&format!("id{at:06}"));
+            let number = a.new_number();
+            assert_eq!(number, at as u32 + 2, "after row {at}");
+            let stored = a.placement_of(GHOST_ID);
+            assert!(stored.is_empty() || stored.contains(&(GHOST_ID.to_string(), number)));
+            assert!(a.make_room("x"));
+            let shown = a.rows().iter().find(|r| r.ghost).map(|r| r.num);
+            assert_eq!(shown, Some(number));
+        }
+        assert_eq!(app(&[]).new_number(), 1);
+
+        let mut a = app(&["alpha", "zzz", "gamma"]);
+        a.on_key(Key::Char('/'));
+        a.on_key(Key::Char('a'));
+        a.on_key(Key::Enter);
+        assert_eq!(a.new_number(), 3, "after alpha, the number gamma shows");
     }
 
     /// The id the row in the gap goes by is no session's, and could never be.

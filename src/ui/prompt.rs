@@ -191,6 +191,12 @@ pub(super) enum Task<'a> {
         /// The listing the caller already has — the picker's rows — so the
         /// default name costs no second script run. `None` re-lists.
         listed: Option<&'a [Session]>,
+        /// The number the session will be given once it is listed, which its
+        /// default name is numbered after (see [`default_name`]): the
+        /// picker's, which puts it after the highlighted row (see
+        /// [`super::app::App::new_number`]). `None` for the end of the list,
+        /// where a session made from inside another goes.
+        number: Option<u32>,
     },
     Rename(&'a Session),
 }
@@ -772,7 +778,10 @@ pub fn run(transport: &dyn Transport) -> Result<Outcome> {
         run_on(
             terminal,
             transport,
-            Task::Create { listed: None },
+            Task::Create {
+                listed: None,
+                number: None,
+            },
             Arrival::Dissolve,
         )
     })
@@ -819,8 +828,8 @@ pub(super) fn run_on(
 ) -> Result<Outcome> {
     let animate = arrival != Arrival::Cut;
     let mut prompt = match task {
-        Task::Create { listed } => Prompt::create(
-            next_free_name(transport, listed)?,
+        Task::Create { listed, number } => Prompt::create(
+            next_free_name(transport, listed, number)?,
             default_command(transport),
             default_directory(transport.home()),
         ),
@@ -937,7 +946,7 @@ pub(super) fn run_on(
                 // retry: what was just refused is the one thing it cannot
                 // know about.
                 let refreshed = match task {
-                    Task::Create { .. } => Some(next_free_name(transport, None)?),
+                    Task::Create { number, .. } => Some(next_free_name(transport, None, number)?),
                     Task::Rename(_) => None,
                 };
                 prompt.fail(e.one_line(), refreshed);
@@ -1028,10 +1037,18 @@ fn show(prompt: &mut Prompt, completer: Option<&mut complete::Completer>) {
     menu.message = message;
 }
 
-/// The name a session gets when the user just presses enter. Compared
-/// case-insensitively, because that is how the transports reject duplicates.
-fn next_name(taken: &[String]) -> String {
-    for n in 1..1000 {
+/// The name a session gets when the user just presses enter: `session N`, `N`
+/// the number the session will be given, so the name says where it went in.
+/// Made between the sessions numbered 2 and 3, it is `session 3`, and the
+/// one that was 3 moves down to be 4.
+///
+/// Names are unique, so when that one is taken the next free number above it
+/// is offered instead, and failing every one of those, the first free number
+/// below it. Compared case-insensitively, because that is how the transports
+/// reject duplicates.
+fn next_name(taken: &[String], number: u32) -> String {
+    let number = number.max(1);
+    for n in (number..number.saturating_add(1000)).chain(1..number) {
         let candidate = format!("session {n}");
         if !taken.iter().any(|t| t.eq_ignore_ascii_case(&candidate)) {
             return candidate;
@@ -1040,30 +1057,31 @@ fn next_name(taken: &[String]) -> String {
     "session".to_string()
 }
 
-/// The first free default name, against `listed` when the caller has a listing
-/// in hand and against a fresh one otherwise.
-fn next_free_name(transport: &dyn Transport, listed: Option<&[Session]>) -> Result<String> {
+/// The default name, against `listed` when the caller has a listing in hand
+/// and against a fresh one otherwise. See [`default_name`].
+fn next_free_name(
+    transport: &dyn Transport,
+    listed: Option<&[Session]>,
+    number: Option<u32>,
+) -> Result<String> {
     match listed {
-        Some(sessions) => Ok(default_name(sessions)),
-        None => {
-            let taken: Vec<String> = transport
-                .list_sessions()?
-                .into_iter()
-                .map(|s| s.name)
-                .collect();
-            Ok(next_name(&taken))
-        }
+        Some(sessions) => Ok(default_name(sessions, number)),
+        None => Ok(default_name(&transport.list_sessions()?, number)),
     }
 }
 
-/// The name a create offers against the listing `listed`: what the prompt
-/// opens with when it is handed that listing, and so what the picker stands
-/// in the gap it makes before asking (see [`super::app::App::make_room`]). One
-/// function, so the row in the gap and the field it hands over to can never
-/// disagree.
-pub(super) fn default_name(listed: &[Session]) -> String {
+/// The name a create offers against the listing `listed`, for a session that
+/// will be given `number` — or, with `None`, the number one past every row's,
+/// for a session going at the end. See [`next_name`].
+///
+/// What the prompt opens with when it is handed that listing and number, and
+/// so what the picker stands in the gap it makes before asking (see
+/// [`super::app::App::make_room`]). One function, so the row in the gap and
+/// the field it hands over to can never disagree.
+pub(super) fn default_name(listed: &[Session], number: Option<u32>) -> String {
     let taken: Vec<String> = listed.iter().map(|s| s.name.clone()).collect();
-    next_name(&taken)
+    let last = listed.iter().map(|s| s.state.num).max().unwrap_or(0) + 1;
+    next_name(&taken, number.unwrap_or(last))
 }
 
 /// The directory a session gets when the user just presses enter: the session
@@ -1742,31 +1760,44 @@ mod tests {
 
     // --- defaults ----------------------------------------------------------
 
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// The default is numbered where the session goes, whatever the other
+    /// sessions are called.
     #[test]
-    fn the_default_is_the_first_free_slot() {
-        assert_eq!(next_name(&[]), "session 1");
-        assert_eq!(
-            next_name(&["session 1".to_string(), "session 2".to_string()]),
-            "session 3"
-        );
-        assert_eq!(
-            next_name(&["session 1".to_string(), "session 3".to_string()]),
-            "session 2",
-            "gaps are filled rather than skipped past"
-        );
+    fn the_default_is_numbered_where_the_session_goes() {
+        assert_eq!(next_name(&[], 1), "session 1");
+        let taken = names(&["api-server", "dotfiles", "notes"]);
+        assert_eq!(next_name(&taken, 3), "session 3");
+        assert_eq!(next_name(&taken, 1), "session 1");
+        assert_eq!(next_name(&taken, 4), "session 4");
+        assert_eq!(next_name(&[], 0), "session 1", "there is no session 0");
+    }
+
+    /// A name already taken is passed over for the next free number above it,
+    /// and only once there are none above, the first free one below.
+    #[test]
+    fn a_taken_default_gives_way_to_the_next_free_number_up() {
+        let taken = names(&["session 1", "session 2", "session 3"]);
+        assert_eq!(next_name(&taken, 3), "session 4");
+        assert_eq!(next_name(&taken, 2), "session 4");
+        let taken: Vec<String> = (5..1005).map(|n| format!("session {n}")).collect();
+        assert_eq!(next_name(&taken, 5), "session 1", "every one above taken");
     }
 
     /// Duplicates are rejected case-insensitively, so a default differing only
     /// in case would be offered and then refused.
     #[test]
     fn the_default_avoids_names_that_differ_only_in_case() {
-        assert_eq!(next_name(&["Session 1".to_string()]), "session 2");
+        assert_eq!(next_name(&names(&["Session 1"]), 1), "session 2");
     }
 
     #[test]
     fn the_default_gives_up_gracefully_when_every_slot_is_taken() {
-        let taken: Vec<String> = (1..1000).map(|n| format!("session {n}")).collect();
-        assert_eq!(next_name(&taken), "session");
+        let taken: Vec<String> = (1..=1000).map(|n| format!("session {n}")).collect();
+        assert_eq!(next_name(&taken, 1), "session");
     }
 
     #[test]
@@ -2981,17 +3012,35 @@ mod tests {
 
     // --- out of the gap the picker makes -------------------------------------
 
-    /// The name the gap shows is the one the prompt opens with: one function
-    /// answers both, against the same listing.
-    #[test]
-    fn the_default_name_is_the_first_free_one_in_the_listing() {
-        let listed: Vec<Session> = ["session 1", "Session 2", "notes"]
+    /// `names` as a listing, numbered from 1 as a listing resolves them.
+    fn listing(names: &[&str]) -> Vec<Session> {
+        names
             .iter()
             .enumerate()
-            .map(|(i, n)| Session::new(format!("id{i:06}"), n.to_string(), 100, 1))
-            .collect();
-        assert_eq!(default_name(&listed), "session 3");
-        assert_eq!(default_name(&[]), "session 1");
+            .map(|(i, n)| {
+                let num = i as u32 + 1;
+                let mut s = Session::new(format!("id{i:06}"), n.to_string(), 100, num);
+                s.state.num = num;
+                s
+            })
+            .collect()
+    }
+
+    /// The name the gap shows is the one the prompt opens with: one function
+    /// answers both, against the same listing. Given a number, it is that
+    /// one's; given none, the session goes at the end, one past every row.
+    #[test]
+    fn the_default_name_is_numbered_where_the_session_goes_in_the_listing() {
+        let listed = listing(&["api-server", "dotfiles", "notes"]);
+        assert_eq!(
+            default_name(&listed, Some(3)),
+            "session 3",
+            "between dotfiles and notes"
+        );
+        assert_eq!(default_name(&listed, None), "session 4", "at the end");
+        assert_eq!(default_name(&[], None), "session 1");
+        let listed = listing(&["session 1", "Session 2", "notes"]);
+        assert_eq!(default_name(&listed, Some(2)), "session 3", "2 is taken");
     }
 
     /// The row the prompt opens out of is the one its name field is drawn on,
