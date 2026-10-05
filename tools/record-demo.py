@@ -195,6 +195,17 @@ class Screen:
 
     ALT = re.compile(rb"\x1b\[\?1049([hl])")
 
+    # The strings that never draw anything -- DCS, SOS, PM and APC. pyte has no
+    # parser for them and prints their bodies as text, which is not harmless
+    # even off screen: it moves pyte's cursor. Neovim's client sends an
+    # XTGETTCAP (`ESC P + q 4D73 ESC \`) as it attaches, pyte's cursor ended six
+    # columns right of the real one, and the key strip -- which puts the cursor
+    # back where this class says it is -- dragged the GIF's cursor off the end
+    # of the line for the rest of the take. So they are cut out before pyte
+    # sees them, and one still open at the end of a read is held for the next.
+    STRING = re.compile(rb"\x1b[P_^X].*?(?:\x1b\\|\x07)", re.S)
+    OPEN = re.compile(rb"\x1b(?:[P_^X].*)?\Z", re.S)
+
     def __init__(self, cols=COLS, rows=ROWS):
         import pyte
         self.primary = pyte.Screen(cols, rows)
@@ -205,9 +216,15 @@ class Screen:
         }
         self.active = self.primary
         self.saved = None          # one slot, as a terminal has
+        self.held = b""
         self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
     def feed(self, data):
+        data = self.STRING.sub(b"", self.held + data)
+        m = self.OPEN.search(data)
+        self.held = data[m.start():] if m else b""
+        if m:
+            data = data[:m.start()]
         pos = 0
         for m in self.ALT.finditer(data):
             self._feed(data[pos:m.end()])
@@ -680,6 +697,69 @@ def strip_bytes(screen, press, row):
             + sgr_for(screen.active.cursor.attrs))
 
 
+def unfinished(data):
+    """Where the escape sequence or UTF-8 character that `data` stops partway
+    through begins, or None if it stops between two."""
+    state, start, need = "ground", None, 0
+    for i, b in enumerate(data):
+        if state == "ground":
+            if b == 0x1b:
+                state, start = "esc", i
+            elif b >= 0xc0:
+                state, start = "utf8", i
+                need = 1 if b < 0xe0 else 2 if b < 0xf0 else 3
+        elif state == "utf8":
+            need -= 1
+            if need == 0:
+                state = "ground"
+        elif state == "esc":
+            if b == 0x5b:                                     # [
+                state = "csi"
+            elif b in b"]P_^X":                               # OSC, DCS, ...
+                state = "string"
+            elif not 0x20 <= b <= 0x2f:                       # ESC ( B waits
+                state = "ground"
+        elif state == "csi":
+            if 0x40 <= b <= 0x7e:
+                state = "ground"
+        elif state == "string":
+            if b == 0x07:
+                state = "ground"
+            elif b == 0x1b:
+                state = "string-esc"
+        elif state == "string-esc":
+            state = "ground" if b == 0x5c else "string"       # ESC \ is ST
+    return None if state == "ground" else start
+
+
+def whole_writes(events):
+    """The writes, re-cut so that none ends partway through a sequence.
+
+    A pty read stops wherever the buffer happened to, and that is sometimes in
+    the middle of an escape sequence -- `ESC` at the end of one read and
+    `[14;30H` at the start of the next. The strip goes in *between* writes, so
+    there it lands inside the sequence: the lone `ESC` swallows the strip's own,
+    and the `[14;30H` left over is printed as text over the editor. The checks
+    never see it, because they replay the stream without the strip; the GIF
+    showed a `[` stuck in Neovim's intro for several takes.
+
+    So the unfinished tail of a write is held back and sent with the next one,
+    at that one's time -- which is when a terminal could have acted on it.
+    """
+    out, carry = [], b""
+    for t, chunk in events:
+        data = carry + chunk
+        cut = unfinished(data)
+        if cut is None:
+            cut = len(data)
+        carry = data[cut:]
+        if cut:
+            out.append((t, data[:cut]))
+    if carry:
+        out.append((events[-1][0], carry))
+    return out
+
+
 def with_key_strip(events, presses, hold=0.9):
     """Draw the pressed key on rows nvmux does not know exist.
 
@@ -688,13 +768,15 @@ def with_key_strip(events, presses, hold=0.9):
 
     Re-emitted after *every* write rather than once per press: entering the
     alternate screen clears the screen, and so does every full repaint, either
-    of which would wipe a strip drawn once and left alone.
+    of which would wipe a strip drawn once and left alone. Every write here is
+    a whole one (see `whole_writes`), so none of that lands inside a sequence.
 
     Drawn into the stream rather than composited onto the rendered frames
     because agg's idle-time limit compresses gaps, so a frame's time is not a
     cast time -- every badge would drift away from the action it belongs to.
     In the stream, agg compresses the badge and the content together.
     """
+    events = whole_writes(events)
     row = ROWS + 2
     screen = Screen()
     # A change of what the strip shows, at the moment it changes.
