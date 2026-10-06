@@ -214,10 +214,10 @@ enabled = true   # c opens a gap where the new session goes, then the prompt
 
 [effects.smear]
 enabled     = true   # the cursor travels between cells rather than jumping
-duration_ms = 150    # how long a move takes to settle
+duration_ms = 100    # how long a move takes to settle
 short_ms    = 40     # a move of a cell or two along a line — typing — and no trail
-trail       = 0.8    # 0: the edges move together; 1: the leading one is there at once
-gradient    = 0.9    # how far its colour fades towards the trail's end; 0 is solid
+trail       = 0.4    # 0: the edges move together; 1: the leading one is there at once
+gradient    = 1.0    # how far its colour fades towards the trail's end; 0 is solid
 insert      = true   # travel in insert mode too
 cmdline     = true   # and to and along the command line
 

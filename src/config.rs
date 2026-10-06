@@ -630,10 +630,10 @@ impl Default for SmearSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            duration_ms: 150,
+            duration_ms: 100,
             short_ms: 40,
-            trail: 0.8,
-            gradient: 0.9,
+            trail: 0.4,
+            gradient: 1.0,
             insert: true,
             cmdline: true,
         }
@@ -1371,10 +1371,10 @@ mod tests {
             enabled = true\n\
             [effects.smear]\n\
             enabled = true\n\
-            duration_ms = 150\n\
+            duration_ms = 100\n\
             short_ms = 40\n\
-            trail = 0.8\n\
-            gradient = 0.9\n\
+            trail = 0.4\n\
+            gradient = 1.0\n\
             insert = true\n\
             cmdline = true\n\
             [effects.particles]\n\
@@ -1557,13 +1557,17 @@ mod tests {
     }
 
     /// Neovide's defaults where it has the same setting: the cursor, the
-    /// scroll and the windows on, the particles and the smooth blink off.
+    /// scroll and the windows on, the particles and the smooth blink off —
+    /// but for the cursor's travel, quicker and with a shorter trail that
+    /// fades out to nothing, so that it is felt more than seen.
     #[test]
     fn the_clients_effects_start_as_neovides() {
         let e = Settings::default().effects;
         assert!(e.smear_enabled() && e.scroll_enabled() && e.windows_enabled());
         assert!(!e.particles_enabled() && !e.blink_enabled());
-        assert_eq!(e.smear.duration_ms, 150);
+        assert_eq!(e.smear.duration_ms, 100);
+        assert_eq!(e.smear.trail, 0.4);
+        assert_eq!(e.smear.gradient, 1.0);
         assert_eq!(e.scroll.duration_ms, 300);
         assert_eq!(e.scroll.far_lines, 1);
         assert_eq!(e.windows.duration_ms, 150);
@@ -1870,8 +1874,8 @@ mod tests {
             "# enabled     = true",
             "# duration_ms = 200",
             "# session     = true",
-            "# trail       = 0.8",
-            "# gradient    = 0.9",
+            "# trail       = 0.4",
+            "# gradient    = 1.0",
             "# mode        = \"railgun\"",
             "# density     = 2.0",
             "# far_lines   = 1",
