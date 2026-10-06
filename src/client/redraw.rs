@@ -447,6 +447,10 @@ fn attrs(v: &ValueRef<'_>) -> Option<Attrs> {
             "italic" => a.italic = on,
             "strikethrough" => a.strikethrough = on,
             "altfont" => a.altfont = on,
+            "dim" => a.dim = on,
+            "blink" => a.blink = on,
+            "conceal" => a.conceal = on,
+            "overline" => a.overline = on,
             "underline" if on => a.underline = Underline::Line,
             "undercurl" if on => a.underline = Underline::Curl,
             "underdouble" if on => a.underline = Underline::Double,
@@ -742,6 +746,9 @@ mod tests {
             (Value::from("special"), Value::from(0xff0000)),
             (Value::from("blend"), Value::from(30)),
             (Value::from("nocombine"), Value::from(true)),
+            (Value::from("dim"), Value::from(true)),
+            (Value::from("overline"), Value::from(true)),
+            (Value::from("url"), Value::from("https://neovim.io")),
         ]);
         let cterm = Value::Map(vec![(Value::from("foreground"), Value::from(10))]);
         let call = arr(vec![Value::from(59), rgb, cterm, arr(vec![])]);
@@ -756,6 +763,8 @@ mod tests {
         assert!(rgb.bold && !rgb.italic);
         assert_eq!(rgb.underline, Underline::Curl);
         assert_eq!(rgb.blend, 30);
+        assert!(rgb.dim && rgb.overline && !rgb.blink && !rgb.conceal);
+        assert_eq!(rgb.url.as_deref(), Some("https://neovim.io"));
         assert_eq!(cterm.fg, Some(10));
     }
 

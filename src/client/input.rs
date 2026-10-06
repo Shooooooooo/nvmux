@@ -26,6 +26,12 @@
 //! [`Parser::waiting`] says so, until the rest comes or `'ttimeoutlen'`
 //! passes — Neovim's own TUI's rule, and the reason it has that option. A
 //! sequence cut short by the end of a read is held the same way.
+//!
+//! An answer already known to be one — an OSC or a DCS string whose first
+//! bytes no key makes ([`Parser::in_reply`]) — is no key to be let go of
+//! quickly, and is given longer: an OSC 52 paste can be hundreds of kilobytes
+//! long. One longer still than the client keeps is dropped up to its end,
+//! never typed.
 
 use std::fmt::Write as _;
 
@@ -77,6 +83,9 @@ enum Step {
     Took(usize, Option<Input>),
     /// Not enough has arrived to say.
     More,
+    /// The first `n` bytes are a reply too long to keep, and not yet ended:
+    /// they go, and so does the rest of it as it comes.
+    TooLong(usize),
 }
 
 /// The longest a sequence is let grow before it is given up on: past this it
@@ -85,12 +94,22 @@ enum Step {
 const MAX_SEQUENCE: usize = 256;
 const MAX_STRING: usize = 1 << 20;
 
+/// What may follow `ESC ]`, `ESC P` and `ESC _` in a reply, and in no Alt
+/// chord: an OSC's number, the few characters a DCS reply starts with,
+/// kitty's `G` for a graphics reply.
+const OSC_OPENS: &[u8] = b"0123456789";
+const DCS_OPENS: &[u8] = b"0123456789>|+$=";
+const APC_OPENS: &[u8] = b"G";
+
 /// The parser, and what it is holding.
 #[derive(Debug, Default)]
 pub struct Parser {
     pending: Vec<u8>,
     /// Inside a bracketed paste, and whether its first part has gone.
     paste: Option<bool>,
+    /// Inside a reply too long to keep — an OSC, a DCS or an APC, by its
+    /// introducer — whose rest is dropped up to its end.
+    skipping: Option<u8>,
 }
 
 /// The bracketed paste's markers.
@@ -109,8 +128,17 @@ impl Parser {
         !self.pending.is_empty() && self.paste.is_none()
     }
 
+    /// Whether what is held is a reply part way through — an OSC or a DCS
+    /// string already known to be no key — or the rest of one being dropped:
+    /// see the module docs.
+    pub fn in_reply(&self) -> bool {
+        self.paste.is_none() && (self.skipping.is_some() || string_opener(&self.pending).is_some())
+    }
+
     /// Nothing more came: what is held is what it is.
     pub fn timeout(&mut self, out: &mut Vec<Input>) {
+        // A reply being dropped has stalled: whatever comes next is new.
+        self.skipping = None;
         self.run(out, true);
     }
 
@@ -118,6 +146,25 @@ impl Parser {
         let mut keys = String::new();
         let mut at = 0;
         while at < self.pending.len() {
+            if let Some(kind) = self.skipping {
+                let rest = &self.pending[at..];
+                match string_end(rest, kind) {
+                    Some(end) => {
+                        self.skipping = None;
+                        at += end;
+                        continue;
+                    }
+                    None => {
+                        // All of it, but an `ESC` that may begin the `ESC \`
+                        // that ends it.
+                        let keep = usize::from(rest.last() == Some(&0x1b));
+                        flush_keys(&mut keys, out);
+                        let len = self.pending.len();
+                        self.pending.drain(..len - keep);
+                        return;
+                    }
+                }
+            }
             if self.paste.is_some() {
                 flush_keys(&mut keys, out);
                 match self.paste_part(at, out) {
@@ -139,6 +186,10 @@ impl Parser {
                 continue;
             }
             match parse(rest, final_) {
+                Step::TooLong(n) => {
+                    self.skipping = string_opener(rest);
+                    at += n;
+                }
                 Step::Took(n, input) => {
                     at += n;
                     match input {
@@ -290,10 +341,9 @@ fn escape(bytes: &[u8], final_: bool) -> Step {
             Step::More
         };
     };
-    // An OSC, a DCS or an APC reply opens with what no Alt chord does: the
-    // digits of an OSC's number, the few characters a DCS reply starts with,
-    // kitty's `G` for a graphics reply. Anything else after `ESC ]`, `ESC P`
-    // or `ESC _` is Alt and a key — and so is a lone one the wait gave up on.
+    // An OSC, a DCS or an APC reply opens with what no Alt chord does (see
+    // `OSC_OPENS`). Anything else after `ESC ]`, `ESC P` or `ESC _` is Alt and
+    // a key — and so is a lone one the wait gave up on.
     let opens = |starts: &[u8]| match bytes.get(2) {
         Some(b) => starts.contains(b),
         None => !final_,
@@ -301,9 +351,9 @@ fn escape(bytes: &[u8], final_: bool) -> Step {
     let step = match next {
         b'[' => csi(bytes, final_),
         b'O' => ss3(bytes, final_),
-        b']' if opens(b"0123456789") => string(bytes, b']', final_),
-        b'P' if opens(b"0123456789>|+$=") => string(bytes, b'P', final_),
-        b'_' if opens(b"G") => match string(bytes, next, final_) {
+        b']' if opens(OSC_OPENS) => string(bytes, b']', final_),
+        b'P' if opens(DCS_OPENS) => string(bytes, b'P', final_),
+        b'_' if opens(APC_OPENS) => match string(bytes, next, final_) {
             // Graphics replies answer nothing the server asked, and are
             // dropped.
             Step::Took(n, _) => Step::Took(n, None),
@@ -353,6 +403,7 @@ fn alt(bytes: &[u8], final_: bool) -> Step {
     match parse(&bytes[1..], final_) {
         Step::Took(n, Some(Input::Keys(k))) => Step::Took(n + 1, Some(Input::Keys(with_alt(&k)))),
         Step::Took(n, other) => Step::Took(n + 1, other),
+        Step::TooLong(n) => Step::TooLong(n + 1),
         Step::More => Step::More,
     }
 }
@@ -366,6 +417,28 @@ fn name_in_brackets(c: char) -> String {
         '|' => "Bar".into(),
         c => c.to_string(),
     }
+}
+
+/// The introducer of the reply `bytes` open — `]` for an OSC, `P` for a DCS,
+/// `_` for an APC — if they open one no key could: the test [`escape`] makes,
+/// once there is a byte after the introducer to make it on.
+fn string_opener(bytes: &[u8]) -> Option<u8> {
+    match bytes {
+        [0x1b, b']', b, ..] if OSC_OPENS.contains(b) => Some(b']'),
+        [0x1b, b'P', b, ..] if DCS_OPENS.contains(b) => Some(b'P'),
+        [0x1b, b'_', b, ..] if APC_OPENS.contains(b) => Some(b'_'),
+        _ => None,
+    }
+}
+
+/// Where a reply of this kind that `bytes` are the middle of ends: just past
+/// its terminator, BEL for an OSC or `ESC \` for any.
+fn string_end(bytes: &[u8], kind: u8) -> Option<usize> {
+    bytes.iter().enumerate().find_map(|(i, b)| match b {
+        0x07 if kind == b']' => Some(i + 1),
+        0x1b if bytes.get(i + 1) == Some(&b'\\') => Some(i + 2),
+        _ => None,
+    })
 }
 
 /// An OSC or DCS reply, up to its terminator — BEL, or `ESC \` — handed on
@@ -392,8 +465,10 @@ fn string(bytes: &[u8], kind: u8, final_: bool) -> Step {
             _ => i += 1,
         }
     }
-    if final_ || bytes.len() > MAX_STRING {
+    if final_ {
         Step::Took(bytes.len(), None)
+    } else if bytes.len() > MAX_STRING {
+        Step::TooLong(bytes.len())
     } else {
         Step::More
     }
@@ -970,6 +1045,52 @@ mod tests {
             read(b"\x1b[?2026;2$y"),
             vec![Input::Reply(Reply::Other(b"\x1b[?2026;2$y".to_vec()))]
         );
+    }
+
+    /// A reply under way is known for one as soon as its first bytes say so,
+    /// and not before: a lone `ESC ]` may be Alt and `]`.
+    #[test]
+    fn a_reply_under_way_is_known_for_one() {
+        let held = |bytes: &[u8]| {
+            let mut p = Parser::default();
+            let mut out = Vec::new();
+            p.feed(bytes, &mut out);
+            assert!(out.is_empty(), "{out:?}");
+            p.in_reply()
+        };
+        assert!(held(b"\x1b]52;c;aGVsbG8"));
+        assert!(held(b"\x1bP1+r4d73"));
+        assert!(!held(b"\x1b"));
+        assert!(!held(b"\x1b]"));
+        assert!(!held(b"\x1b[1;"));
+    }
+
+    /// A reply longer than the client keeps is dropped, all of it, up to its
+    /// end however many reads it takes — and the keys after it are keys.
+    #[test]
+    fn a_reply_too_long_to_keep_is_dropped_to_its_end() {
+        let mut p = Parser::default();
+        let mut out = Vec::new();
+        p.feed(b"\x1b]52;c;", &mut out);
+        let chunk = vec![b'A'; 64 * 1024];
+        for _ in 0..(MAX_STRING / chunk.len() + 2) {
+            p.feed(&chunk, &mut out);
+        }
+        assert!(p.in_reply());
+        p.feed(b"AAAA", &mut out);
+        p.feed(b"AA\x1b", &mut out);
+        p.feed(b"\\x", &mut out);
+        assert_eq!(out, vec![Input::Keys("x".into())]);
+        assert!(!p.in_reply());
+        // And one ended by BEL.
+        let mut p = Parser::default();
+        let mut out = Vec::new();
+        p.feed(b"\x1b]52;c;", &mut out);
+        for _ in 0..(MAX_STRING / chunk.len() + 2) {
+            p.feed(&chunk, &mut out);
+        }
+        p.feed(b"AA\x07y", &mut out);
+        assert_eq!(out, vec![Input::Keys("y".into())]);
     }
 
     /// A paste in one read, split across reads, and split in the middle of

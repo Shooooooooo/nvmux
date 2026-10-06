@@ -15,6 +15,15 @@
 //! where it can, but a frame that never relies on it cannot be caught out
 //! where it cannot.
 //!
+//! # What the cells carry
+//!
+//! Every attribute Neovim's own TUI writes — bold, dim, italic, the
+//! underlines and their colour, blink, reverse, conceal, strikethrough,
+//! altfont, overline — and a highlight's hyperlink, as an OSC 8 around its
+//! cells. A link is closed before every jump of the cursor and at the end of
+//! the frame, as that TUI closes one, so it never runs on over cells that are
+//! not its own.
+//!
 //! # Synchronized
 //!
 //! A frame goes out inside a synchronized update (`?2026`), so the terminal
@@ -48,6 +57,9 @@ pub struct Cursor {
     /// Its colour, or `None` for the terminal's own.
     pub color: Option<Rgb>,
 }
+
+/// The end of a hyperlink: OSC 8 with no target.
+const LINK_END: &[u8] = b"\x1b]8;;\x1b\\";
 
 /// What the terminal shows.
 #[derive(Debug)]
@@ -83,8 +95,15 @@ impl Screen {
     }
 
     /// The bytes that turn what the terminal shows into `frame`, with the
-    /// cursor left as `cursor` says.
-    pub fn draw(&mut self, frame: Frame, cursor: &Cursor, sync: bool) -> Vec<u8> {
+    /// cursor left as `cursor` says, and the cells of a hyperlink made one
+    /// with an OSC 8 to the target `links` gives it (see [`Style::link`]).
+    pub fn draw(
+        &mut self,
+        frame: Frame,
+        cursor: &Cursor,
+        sync: bool,
+        links: &[Box<str>],
+    ) -> Vec<u8> {
         let mut out = Vec::with_capacity(4096);
         if sync {
             out.extend_from_slice(SYNC_BEGIN);
@@ -96,6 +115,10 @@ impl Screen {
             .filter(|old| (old.width, old.height) == (frame.width, frame.height));
         let mut pen: Option<Style> = None;
         let mut at: Option<(usize, usize)> = None;
+        // The hyperlink open, if one is. Closed before every jump, as
+        // Neovim's TUI does, so that a link never runs on over cells between
+        // where it was left and where the next is drawn.
+        let mut link = 0;
         for r in 0..frame.height {
             let mut c = 0;
             while c < frame.width {
@@ -112,11 +135,34 @@ impl Screen {
                     continue;
                 }
                 if at != Some((r, c)) {
+                    if link != 0 {
+                        out.extend_from_slice(LINK_END);
+                        link = 0;
+                    }
                     let _ = write!(out, "\x1b[{};{}H", r + 1, c + 1);
                 }
-                if pen != Some(cell.style) {
-                    sgr(&mut out, &cell.style);
-                    pen = Some(cell.style);
+                // The link is no part of the pen: it is the OSC 8's below.
+                let style = Style {
+                    link: 0,
+                    ..cell.style
+                };
+                if pen != Some(style) {
+                    sgr(&mut out, &style);
+                    pen = Some(style);
+                }
+                if cell.style.link != link {
+                    let target = (cell.style.link as usize)
+                        .checked_sub(1)
+                        .and_then(|i| links.get(i));
+                    match target {
+                        // Its own id, so that a terminal hovering over one
+                        // cut by a float underlines all of it.
+                        Some(url) => {
+                            let _ = write!(out, "\x1b]8;id=nvmux-{};{url}\x1b\\", cell.style.link);
+                        }
+                        None => out.extend_from_slice(LINK_END),
+                    }
+                    link = cell.style.link;
                 }
                 cell.text.push_to(&mut out);
                 c += span;
@@ -124,7 +170,10 @@ impl Screen {
             }
         }
         // Whatever the frame left the pen as is not what a cell of nvmux's own
-        // — the hint row, the notice — should inherit.
+        // — the hint row, the notice — should inherit, and nor is a link.
+        if link != 0 {
+            out.extend_from_slice(LINK_END);
+        }
         if pen.is_some() {
             out.extend_from_slice(b"\x1b[0m");
         }
@@ -159,23 +208,21 @@ impl Screen {
 /// family, over the plain `4` already set) and its colour (`58`).
 pub fn sgr(out: &mut Vec<u8>, s: &Style) {
     out.extend_from_slice(b"\x1b[0");
-    if s.bold {
-        out.extend_from_slice(b";1");
-    }
-    if s.italic {
-        out.extend_from_slice(b";3");
-    }
-    if s.underline != Underline::None {
-        out.extend_from_slice(b";4");
-    }
-    if s.reverse {
-        out.extend_from_slice(b";7");
-    }
-    if s.strikethrough {
-        out.extend_from_slice(b";9");
-    }
-    if s.altfont {
-        out.extend_from_slice(b";11");
+    for (on, n) in [
+        (s.bold, &b";1"[..]),
+        (s.dim, b";2"),
+        (s.italic, b";3"),
+        (s.underline != Underline::None, b";4"),
+        (s.blink, b";5"),
+        (s.reverse, b";7"),
+        (s.conceal, b";8"),
+        (s.strikethrough, b";9"),
+        (s.altfont, b";11"),
+        (s.overline, b";53"),
+    ] {
+        if on {
+            out.extend_from_slice(n);
+        }
     }
     colour(out, s.fg, 30, 90, 38);
     colour(out, s.bg, 40, 100, 48);
@@ -267,9 +314,9 @@ mod tests {
     #[test]
     fn the_first_frame_draws_everything_and_the_next_only_what_changed() {
         let mut s = Screen::new();
-        let first = s.draw(frame(&["ab", "cd"]), &hidden(), true);
+        let first = s.draw(frame(&["ab", "cd"]), &hidden(), true, &[]);
         assert_eq!(shown(&first, 2, 2), "ab\ncd");
-        let second = s.draw(frame(&["ab", "cX"]), &hidden(), true);
+        let second = s.draw(frame(&["ab", "cX"]), &hidden(), true, &[]);
         let text = String::from_utf8_lossy(&second);
         assert!(text.contains("\x1b[2;2H"), "{text:?}");
         assert!(
@@ -284,9 +331,9 @@ mod tests {
     #[test]
     fn invalidating_paints_every_cell_again() {
         let mut s = Screen::new();
-        s.draw(frame(&["ab"]), &hidden(), false);
+        s.draw(frame(&["ab"]), &hidden(), false, &[]);
         s.invalidate();
-        let again = s.draw(frame(&["ab"]), &hidden(), false);
+        let again = s.draw(frame(&["ab"]), &hidden(), false, &[]);
         assert_eq!(shown(&again, 2, 1), "ab");
     }
 
@@ -302,7 +349,7 @@ mod tests {
             shape: 6,
             color: Some(Rgb(1, 2, 3)),
         };
-        let bytes = s.draw(frame(&["ab", "cd"]), &cursor, true);
+        let bytes = s.draw(frame(&["ab", "cd"]), &cursor, true, &[]);
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.starts_with("\x1b[?2026h\x1b[?25l"), "{text:?}");
         assert!(
@@ -310,7 +357,7 @@ mod tests {
             "{text:?}"
         );
         // The same shape and colour again are not set again.
-        let bytes = s.draw(frame(&["ab", "cd"]), &cursor, false);
+        let bytes = s.draw(frame(&["ab", "cd"]), &cursor, false, &[]);
         let text = String::from_utf8_lossy(&bytes);
         assert!(!text.contains(" q") && !text.contains("]12"), "{text:?}");
         assert!(!text.contains("2026"), "{text:?}");
@@ -327,7 +374,7 @@ mod tests {
         };
         f.cells[1].text = Text::Half;
         let mut s = Screen::new();
-        let bytes = s.draw(f, &hidden(), false);
+        let bytes = s.draw(f, &hidden(), false, &[]);
         assert_eq!(shown(&bytes, 3, 1), "中x");
     }
 
@@ -359,5 +406,47 @@ mod tests {
             out,
             b"\x1b[0;4;38;5;200;48;2;1;2;3m\x1b[4:3m\x1b[58:2::255:0:0m"
         );
+        out.clear();
+        sgr(
+            &mut out,
+            &Style {
+                dim: true,
+                blink: true,
+                conceal: true,
+                overline: true,
+                ..Style::default()
+            },
+        );
+        assert_eq!(out, b"\x1b[0;2;5;8;53m");
+    }
+
+    /// A hyperlink's cells are written inside an OSC 8 to its target, which
+    /// is closed before the cursor jumps and at the end of the frame — never
+    /// left open over cells that are not its own.
+    #[test]
+    fn a_hyperlink_is_opened_over_its_cells_and_closed_after() {
+        let mut f = frame(&["see here", "  and x "]);
+        for c in 4..8 {
+            f.cells[c].style.link = 1;
+        }
+        f.cells[f.width + 6].style.link = 1;
+        f.cells[f.width + 7].style.link = 1;
+        let links: Vec<Box<str>> = vec!["https://neovim.io".into()];
+        let mut s = Screen::new();
+        let bytes = s.draw(f, &hidden(), false, &links);
+        let text = String::from_utf8_lossy(&bytes);
+        let open = "\x1b]8;id=nvmux-1;https://neovim.io\x1b\\";
+        let close = "\x1b]8;;\x1b\\";
+        assert!(
+            text.contains(&format!("see {open}here{close}\x1b[2;1H")),
+            "closed before the jump to the next row: {text:?}"
+        );
+        assert!(
+            text.contains(&format!("{open}x {close}\x1b[0m")),
+            "and at the end of the frame: {text:?}"
+        );
+        assert_eq!(text.matches(open).count(), 2, "{text:?}");
+        assert_eq!(text.matches(close).count(), 2, "{text:?}");
+        assert_eq!(shown(&bytes, 8, 2), "see here\n  and x ");
     }
 }

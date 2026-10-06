@@ -185,6 +185,10 @@ pub struct Model {
     blends: Vec<u8>,
     styles_stale: bool,
     term: Palette,
+    /// Every hyperlink a highlight has named, in the order they came: link
+    /// `n` (see [`Style::link`]) is `links[n - 1]`.
+    links: Vec<Box<str>>,
+    link_numbers: HashMap<Box<str>, u32>,
 }
 
 impl Model {
@@ -215,6 +219,8 @@ impl Model {
             blends: Vec::new(),
             styles_stale: true,
             term,
+            links: Vec::new(),
+            link_numbers: HashMap::new(),
         }
     }
 
@@ -239,6 +245,26 @@ impl Model {
     /// Highlight `id` as Neovim defined it, in both its forms.
     pub fn attrs(&self, id: u32) -> Option<&(Attrs, Attrs)> {
         self.highlights.defs.get(id as usize)?.as_ref()
+    }
+
+    /// The hyperlinks the styles name, link `n` at `n - 1`.
+    pub fn links(&self) -> &[Box<str>] {
+        &self.links
+    }
+
+    /// A hyperlink's number, given it the first time it is seen. Anything in
+    /// it that is not text is left out: it is written inside an OSC 8, and a
+    /// control character there would end the sequence early and write the
+    /// rest to the screen as something else.
+    fn link_number(&mut self, url: &str) -> u32 {
+        let url: Box<str> = url.chars().filter(|c| !c.is_control()).collect();
+        if let Some(n) = self.link_numbers.get(&url) {
+            return *n;
+        }
+        self.links.push(url.clone());
+        let n = self.links.len() as u32;
+        self.link_numbers.insert(url, n);
+        n
     }
 
     /// How much highlight `id` lets through of what is under it, 0 to 100.
@@ -566,6 +592,19 @@ impl Model {
                 _ => plain,
             })
             .collect();
+        // A hyperlink comes with the GUI form only, and is one whichever form
+        // is drawn.
+        let urls: Vec<(usize, Box<str>)> = self
+            .highlights
+            .defs
+            .iter()
+            .enumerate()
+            .filter_map(|(id, def)| Some((id, def.as_ref()?.0.url.clone()?)))
+            .filter(|(id, _)| *id > 0)
+            .collect();
+        for (id, url) in urls {
+            self.styles[id].link = self.link_number(&url);
+        }
         self.blends = (0..n)
             .map(|id| match self.highlights.defs.get(id) {
                 Some(Some((g, c))) if id > 0 => {
@@ -843,6 +882,36 @@ mod tests {
         assert_eq!(m.style(3).fg, Color::Rgb(Rgb(1, 2, 3)));
         assert_eq!(m.blend(3), 30);
         assert_eq!(m.style(99), m.style(0), "an unknown id is the default");
+    }
+
+    /// A highlight's hyperlink gets a number, the same one for the same
+    /// target, whichever form of the highlight is drawn — and nothing in it
+    /// that could end the OSC 8 it is written in.
+    #[test]
+    fn hyperlinks_are_numbered_by_target() {
+        let mut m = model();
+        let link = |id: u32, url: &str| Event::HlAttr {
+            id,
+            rgb: Attrs {
+                url: Some(url.into()),
+                ..Attrs::default()
+            },
+            cterm: Attrs::default(),
+        };
+        apply(
+            &mut m,
+            vec![
+                link(2, "https://neovim.io"),
+                link(3, "https://example.com/\x1b]8;;\x07x"),
+                link(4, "https://neovim.io"),
+            ],
+        );
+        m.refresh_styles();
+        assert_eq!(m.style(2).link, 1);
+        assert_eq!(m.style(4).link, 1, "the same target, the same number");
+        assert_eq!(m.style(3).link, 2);
+        assert_eq!(m.style(1).link, 0);
+        assert_eq!(&*m.links()[1], "https://example.com/]8;;x");
     }
 
     #[test]

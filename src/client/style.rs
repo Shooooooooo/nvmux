@@ -53,10 +53,14 @@ pub struct Attrs {
     pub italic: bool,
     pub strikethrough: bool,
     pub altfont: bool,
+    pub dim: bool,
+    pub blink: bool,
+    pub conceal: bool,
+    pub overline: bool,
     pub underline: Underline,
     /// `'winblend'` / `'pumblend'`, 0 to 100.
     pub blend: u8,
-    /// A hyperlink's target. Kept, not yet drawn.
+    /// A hyperlink's target, which Neovim sends with the GUI form only.
     pub url: Option<Box<str>>,
 }
 
@@ -92,7 +96,15 @@ pub struct Style {
     pub italic: bool,
     pub strikethrough: bool,
     pub altfont: bool,
+    pub dim: bool,
+    pub blink: bool,
+    pub conceal: bool,
+    pub overline: bool,
     pub underline: Underline,
+    /// The hyperlink the cell is part of, by its number in the model's table
+    /// of them (see `super::model::Model::links`): 0 for none. A number, so
+    /// that a style stays `Copy` and is compared as cheaply as the rest.
+    pub link: u32,
 }
 
 impl Style {
@@ -167,7 +179,12 @@ impl Colors {
             italic: a.italic,
             strikethrough: a.strikethrough,
             altfont: a.altfont,
+            dim: a.dim,
+            blink: a.blink,
+            conceal: a.conceal,
+            overline: a.overline,
             underline: a.underline,
+            link: 0,
         }
     }
 

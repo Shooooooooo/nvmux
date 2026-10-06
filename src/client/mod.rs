@@ -121,6 +121,10 @@ const MIN_FRAME_GAP: Duration = Duration::from_millis(4);
 /// what there is. See the module docs.
 const HOLD_LIMIT: Duration = Duration::from_millis(500);
 
+/// How long a terminal's answer part way through is waited for, from the last
+/// of it to come, before what has come of it is dropped.
+const REPLY_WAIT: Duration = Duration::from_secs(1);
+
 /// How soon to ask who is attached again, having found a UI only passing
 /// through grid 1: another nvmux client's refresh, or one attaching again.
 const RECHECK: Duration = Duration::from_millis(30);
@@ -770,9 +774,13 @@ impl App {
     }
 
     /// When what the parser holds is to be taken as it is: `'ttimeoutlen'`
-    /// after it began to be held.
+    /// after the last of it came — or [`REPLY_WAIT`] for a terminal's answer
+    /// already part way through (see [`input`]).
     fn escape_deadline(&self) -> Option<Instant> {
         let since = self.escape_since?;
+        if self.parser.in_reply() {
+            return Some(since + REPLY_WAIT);
+        }
         let o = &self.model.options;
         let wait = if o.ttimeout { o.ttimeoutlen } else { 0 };
         Some(since + Duration::from_millis(wait.max(1)))
@@ -987,7 +995,7 @@ impl App {
         frame.mend();
         let sync = self.model.options.termsync;
         let mut out = std::mem::take(&mut self.say);
-        out.extend_from_slice(&self.screen.draw(frame, &cursor, sync));
+        out.extend_from_slice(&self.screen.draw(frame, &cursor, sync, self.model.links()));
         self.dirty = false;
         self.last_frame = Some(now);
         out
@@ -1689,5 +1697,23 @@ mod tests {
             .iter()
             .any(|(_, m, args)| m == "nvim_input" && args[0] == Value::from("<Esc>")));
         assert_eq!(a.wake_at(at), None);
+    }
+
+    /// A terminal's answer part way through is waited for longer than an
+    /// escape, from the last of it to come.
+    #[test]
+    fn a_reply_under_way_is_waited_for() {
+        let t0 = Instant::now();
+        let mut a = app(false);
+        a.keys(b"\x1b]52;c;aGVs", t0);
+        assert_eq!(a.wake_at(t0), Some(t0 + REPLY_WAIT));
+        let later = t0 + Duration::from_millis(300);
+        a.keys(b"bG8", later);
+        assert!(!a.escape_due(t0 + REPLY_WAIT));
+        a.keys(b"\x1b\\", later);
+        assert_eq!(a.wake_at(later), None, "answered");
+        let sent = calls(&mut a);
+        assert!(sent.iter().any(|(_, m, args)| m == "nvim_ui_term_event"
+            && args[1].as_slice() == Some(&b"\x1b]52;c;aGVsbG8"[..])));
     }
 }
