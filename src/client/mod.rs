@@ -21,7 +21,7 @@
 //!   going ([`anim::motion`]);
 //! - and, from animate.nvim rather than Neovide, a split window opening flies
 //!   in from its side as its text fades in, one closing flies back into its
-//!   side as it fades, one changing size moves its edges there
+//!   side as its text dims away, one changing size moves its edges there
 //!   ([`anim::layout`]), and one showing another buffer fades from one to the
 //!   other ([`anim::switch`]);
 //! - a blinking cursor fades in and out ([`anim::blink`]);

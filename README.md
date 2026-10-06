@@ -148,9 +148,9 @@ Split windows move the way
 [animate.nvim](https://github.com/Shooooooooo/animate.nvim)'s window module
 moves them instead: a new split flies in from its side — from the right or
 below with `'splitright'` or `'splitbelow'` — as its text fades in out of its
-background; a closed one flies back out into its side, fading as it goes; a
-window changing size moves its separators there; and a window that shows
-another buffer fades the old text out and the new text in.
+background; a closed one flies back out into its side, its text dimming away
+as it goes; a window changing size moves its separators there; and a window
+that shows another buffer fades the old text out and the new text in.
 
 What a terminal cannot do is not imitated: no blur, no motion of text finer
 than a cell. And the trade is the one the table at the top is about: the screen

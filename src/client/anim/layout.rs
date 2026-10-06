@@ -25,20 +25,22 @@
 //!   over `open_ms`, quick to start and slow to land;
 //! - windows fewer — `:close`, `:only`: the window before each run of closed
 //!   ones, left of it or above it, takes their place at once, and a ghost of
-//!   them, blank in their background with the separator they had along its
-//!   edge, flies off into their far side as it fades, over `close_ms`, slow to
-//!   start. Where the closed windows came first, the window after them moves
-//!   into their place instead, its text with it, and their ghost goes ahead
-//!   of it;
+//!   them — what they showed, with the separator before them along its edge —
+//!   flies off into their far side, its text dimming into its background as
+//!   it goes, over `close_ms`, slow to start. Where the closed windows came
+//!   first, the window after them moves into their place instead, its text
+//!   with it, over their ghost;
 //! - anything else — windows rearranged (`<C-w>x`, `<C-w>r`, `<C-w>H` …),
 //!   another tab page, two windows opened at once — is nothing animate.nvim
 //!   draws, and is left to Neovide's slide ([`super::motion`]).
 //!
 //! These are animate.nvim's own rules, down to which window a split took its
 //! space from and where a closed window's ghost stops, ported from its
-//! `window/fly.lua`. Its windows are real, resized frame by frame, and Neovim
-//! draws each frame; the client's are drawn by the client, from what the
-//! editor last drew. A window on its way is drawn in the frame it has this
+//! `window/fly.lua` — but for the ghost, which there is blank in the closed
+//! window's background, fading off the window that takes its place, and here
+//! shows the closed window's text dimming away. Its windows are real, resized
+//! frame by frame, and Neovim draws each frame; the client's are drawn by the
+//! client, from what the editor last drew. A window on its way is drawn in the frame it has this
 //! frame, from its top left: one no bigger than it was shows what it showed,
 //! cut down to size, and one bigger shows what Neovim drew for where it is
 //! going ([`draw_window`]). Its status line is the one Neovim drew for where
@@ -974,7 +976,10 @@ fn close(
         }
         // The line the window before the run ends with, or the run's own
         // when it comes first.
-        let closed = tree.leaves(first);
+        let closed: Vec<u64> = parent.kids[run.i..=run.j]
+            .iter()
+            .flat_map(|k| tree.leaves(*k))
+            .collect();
         let owner = holders
             .as_ref()
             .and_then(|h| h.last().copied())
@@ -983,18 +988,28 @@ fn close(
             .rows
             .get(closed.first()?)
             .map_or(0, |rows| background(rows.iter().flatten()));
-        let frame = rect(&closed, &old_fr)?;
-        let bar = (kind == Kind::Row && old.layout.ends.trailing(Kind::Col, frame.bottom))
-            .then(|| line_of(Kind::Col, owner, &old, model));
+        let region = rect(&closed, &old_fr)?;
+        // Where that line meets the status lines of windows side by side:
+        // the corner as it was drawn.
+        let corner = (kind == Kind::Row && old.layout.ends.trailing(Kind::Col, region.bottom))
+            .then(|| {
+                let col = match holders {
+                    Some(_) => region.left - 1,
+                    None => region.right - 1,
+                };
+                cell_at(&old.chrome, region.bottom - 1, col).cloned()
+            })
+            .flatten();
         ghosts.push(Ghost {
             kind,
             parent: run.parent,
             first,
             after: run.after,
             holders,
+            picture: picture(&old, &closed, region),
             bg,
             line: line_of(kind, owner, &old, model),
-            bar,
+            corner,
         });
     }
     if ghosts.is_empty() {
@@ -1021,10 +1036,7 @@ fn close(
 /// `'laststatus'` 3, the separator that takes a status line's place.
 fn line_of(kind: Kind, owner: u64, old: &Shot, model: &Model) -> Cell {
     let pane = old.layout.panes.get(&owner);
-    let drawn = |row: i64, col: i64| {
-        let (row, col) = (usize::try_from(row).ok()?, usize::try_from(col).ok()?);
-        old.chrome.cell(row, col).cloned()
-    };
+    let drawn = |row: i64, col: i64| cell_at(&old.chrome, row, col).cloned();
     let group = |name: &str| model.groups.get(name).copied();
     match kind {
         Kind::Row => pane
@@ -1051,6 +1063,42 @@ fn line_of(kind: Kind, owner: u64, old: &Shot, model: &Model) -> Cell {
                 .unwrap_or(0),
         },
     }
+}
+
+/// The cell of `grid` at `row`, `col`, if there is one there.
+fn cell_at(grid: &Grid, row: i64, col: i64) -> Option<&Cell> {
+    grid.cell(usize::try_from(row).ok()?, usize::try_from(col).ok()?)
+}
+
+/// What the windows `wins` showed of `region` as it was drawn: their text,
+/// and around it their separators and status lines.
+fn picture(old: &Shot, wins: &[u64], region: Area) -> Vec<Vec<Cell>> {
+    let grids: Vec<(Area, &Vec<Vec<Cell>>)> = wins
+        .iter()
+        .filter_map(|w| {
+            let p = old.layout.panes.get(w)?;
+            Some((p.grid(p.frame), old.rows.get(w)?))
+        })
+        .collect();
+    (region.top..region.bottom)
+        .map(|y| {
+            (region.left..region.right)
+                .map(|x| {
+                    let own = grids
+                        .iter()
+                        .find(|(g, _)| {
+                            (g.top..g.bottom).contains(&y) && (g.left..g.right).contains(&x)
+                        })
+                        .and_then(|(g, rows)| {
+                            rows.get((y - g.top) as usize)?.get((x - g.left) as usize)
+                        });
+                    own.or_else(|| cell_at(&old.chrome, y, x))
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// A window's background: the highlight most of its blank cells are in.
@@ -1158,7 +1206,7 @@ impl Transition {
         let covered = now
             .values()
             .copied()
-            .chain(ghosts.iter().map(|(_, f, _)| *f))
+            .chain(ghosts.iter().map(|(_, at)| at.f))
             .reduce(|a, b| a.union(&b));
         if let Some(area) = covered {
             let blank = Out::blank(model.style(0));
@@ -1184,8 +1232,8 @@ impl Transition {
                 fade(frame, &colors, pane.grid(now[&grid]), to, percent(e));
             }
         }
-        for (g, f, lines) in &ghosts {
-            g.paint(frame, model, &colors, *f, lines, e);
+        for (g, at) in &ghosts {
+            g.paint(frame, model, &colors, at, e);
         }
     }
 }
@@ -1392,16 +1440,31 @@ struct Ghost {
     /// The child after them, if any.
     after: Option<usize>,
     /// The windows before them still open, which hold their place: the ghost
-    /// goes up to their separator, and fades as it goes, showing them. None
-    /// where the closed windows came first.
+    /// goes up to their separator. None where the closed windows came first.
     holders: Option<Vec<u64>>,
-    /// The closed windows' background, as a highlight.
+    /// What they showed of their place, as it was drawn (see [`picture`]):
+    /// drawn in the ghost from its near edge, as a window shrinking is drawn
+    /// from its top left.
+    picture: Vec<Vec<Cell>>,
+    /// Their background, as a highlight: past the picture, the ghost is
+    /// blank in it.
     bg: u32,
     /// The line along its edge: the separator, or the status line, of the
     /// window before them, or their own.
     line: Cell,
-    /// The bottom row of a ghost of windows side by side: their status lines.
-    bar: Option<Cell>,
+    /// Where that line meets their status lines, for windows side by side.
+    corner: Option<Cell>,
+}
+
+/// Where a ghost is this frame.
+#[derive(Debug)]
+struct Spot {
+    /// Its cells.
+    f: Area,
+    /// Where along it its lines are.
+    lines: Vec<i64>,
+    /// Where its picture's top left is.
+    origin: (i64, i64),
 }
 
 impl Ghosts {
@@ -1452,9 +1515,15 @@ impl Ghosts {
         rects: &[Area],
         starts: &[i64],
         now: &BTreeMap<u64, Area>,
-    ) -> Option<(Area, Vec<i64>)> {
+    ) -> Option<Spot> {
         let kind = g.kind;
         let p = rects[g.parent];
+        // Its picture goes where the closed windows start: with the line
+        // before them, flying off; or where their row or column does.
+        let origin = match kind {
+            Kind::Row => (p.top, starts[g.first]),
+            Kind::Col => (starts[g.first], p.left),
+        };
         let mut a = starts[g.first];
         let mut b = g.after.map_or(p.hi(kind), |n| starts[n]);
         let mut lines = Vec::new();
@@ -1480,47 +1549,35 @@ impl Ghosts {
         if kind == Kind::Col && self.ends.trailing(Kind::Row, f.right) {
             f.right -= 1;
         }
-        (!f.is_empty()).then_some((f, lines))
+        (!f.is_empty()).then_some(Spot { f, lines, origin })
     }
 
-    /// Every ghost still to be seen at progress `e`, with its cells and
-    /// where along it its lines are.
-    fn frames(&self, e: f32, now: &BTreeMap<u64, Area>) -> Vec<(&Ghost, Area, Vec<i64>)> {
+    /// Every ghost still to be seen at progress `e`, and where it is.
+    fn frames(&self, e: f32, now: &BTreeMap<u64, Area>) -> Vec<(&Ghost, Spot)> {
         let (rects, starts) = self.at(e);
         self.list
             .iter()
-            .filter_map(|g| {
-                let (f, lines) = self.frame_of(g, &rects, &starts, now)?;
-                Some((g, f, lines))
-            })
+            .filter_map(|g| Some((g, self.frame_of(g, &rects, &starts, now)?)))
             .collect()
     }
 }
 
 impl Ghost {
-    /// Draw it over the cells `f`, its lines across it at `lines`, at
-    /// progress `e`: blank in its background, its lines at full strength.
-    fn paint(
-        &self,
-        frame: &mut Frame,
-        model: &Model,
-        colors: &Colors,
-        f: Area,
-        lines: &[i64],
-        e: f32,
-    ) {
-        let bg = model.style(self.bg);
-        let to = colors.visual_bg(&bg);
-        // Fading, it shows the window holding its place; with none, there is
-        // nothing under it to show.
-        let opaque = self.holders.is_none();
-        let keep = percent(e);
-        let out = |cell: &Cell| Out {
+    /// Draw it where `at` has it at progress `e`: what the closed windows
+    /// showed, its text dimmed that far into its background, and the line
+    /// along its edge at full strength.
+    fn paint(&self, frame: &mut Frame, model: &Model, colors: &Colors, at: &Spot, e: f32) {
+        let keep = percent(1.0 - e);
+        let out = |cell: &Cell, wide: bool| Out {
             text: cell.text.clone(),
             style: model.style(cell.hl),
-            wide: false,
+            wide,
         };
+        let f = at.f;
         for r in f.top..f.bottom {
+            let row = usize::try_from(r - at.origin.0)
+                .ok()
+                .and_then(|i| self.picture.get(i));
             for c in f.left..f.right {
                 let Some(o) = frame.at(r, c) else {
                     continue;
@@ -1529,11 +1586,24 @@ impl Ghost {
                     Kind::Row => c,
                     Kind::Col => r,
                 };
-                match &self.bar {
-                    Some(bar) if self.kind == Kind::Row && r == f.bottom - 1 => *o = out(bar),
-                    _ if lines.contains(&along) => *o = out(&self.line),
-                    _ if opaque => *o = Out::blank(bg),
-                    _ => fade_cell(colors, o, to, keep),
+                if at.lines.contains(&along) {
+                    *o = match &self.corner {
+                        Some(corner) if r == f.bottom - 1 => out(corner, false),
+                        _ => out(&self.line, false),
+                    };
+                    continue;
+                }
+                let i = usize::try_from(c - at.origin.1).ok();
+                match row
+                    .zip(i)
+                    .and_then(|(row, i)| Some((row.get(i)?, row.get(i + 1))))
+                {
+                    Some((cell, next)) => {
+                        *o = out(cell, next.is_some_and(|n| n.text == Text::Half));
+                        let own = colors.visual_bg(&o.style);
+                        fade_cell(colors, o, own, keep);
+                    }
+                    None => *o = Out::blank(model.style(self.bg)),
                 }
             }
         }
@@ -1807,6 +1877,15 @@ mod tests {
             self.at(ms).lines().map(String::from).collect()
         }
 
+        /// How bright the text of cell `row`, `col` is `ms` after the last
+        /// batch: the red of its colour.
+        fn red(&mut self, ms: u64, row: usize, col: usize) -> u8 {
+            self.anim.advance(self.now + Duration::from_millis(ms));
+            let f = compose::compose(&self.model, &self.anim, false, W, self.height);
+            let cell = f.get(row, col).expect("a cell");
+            self.model.colors().visual_fg(&cell.style).0
+        }
+
         fn moving(&self) -> bool {
             self.anim.transition.is_some()
         }
@@ -1877,9 +1956,9 @@ mod tests {
         events
     }
 
-    /// A closed window's ghost keeps its separator, which flies off into its
-    /// far side; the window before it holds its place from the start, and
-    /// shows through the ghost as it fades.
+    /// A closed window flies off into its far side behind the separator
+    /// before it, its text going with it and dimming into its background;
+    /// the window before it holds its place from the start.
     #[test]
     fn a_closed_window_flies_out_into_its_side() {
         let mut s = Scene::new(Options {
@@ -1891,15 +1970,20 @@ mod tests {
         s.batch(close_right());
         assert!(s.moving());
         let rows = s.rows(0);
-        assert_eq!(rows[0], "aaaaaaaaaa│          ");
-        assert_eq!(
-            rows[4], "a.txt=====           ",
-            "a blank bar over its status line"
-        );
+        assert_eq!(rows[0], "aaaaaaaaaa│bbbbbbbbbb", "as it was");
+        assert_eq!(rows[4], "a.txt===== b.txt==All", "its status line too");
+        assert_eq!(s.red(0, 0, 15), 255, "at full strength");
         let mid = s.rows(100);
-        let sep = mid[0].chars().position(|c| c == '│');
-        assert!(sep.is_some_and(|c| c > 10), "{mid:?}");
+        let sep = mid[0].chars().position(|c| c == '│').expect("a separator");
+        assert!(sep > 10, "{mid:?}");
         assert!(mid[0].starts_with("aaaaaaaaaaaa"), "{mid:?}");
+        assert!(
+            mid[0].ends_with("│bbbbbb"),
+            "its text goes with it: {mid:?}"
+        );
+        let dim = s.red(100, 0, W - 1);
+        assert!(dim > 0 && dim < 255, "dimming: {dim}");
+        assert!(s.red(150, 0, W - 1) < dim, "and dimmer still");
         let last = s.settle();
         assert!(!s.moving());
         assert_eq!(last.lines().next(), Some("aaaaaaaaaaaaaaaaaaaaa"));
@@ -1907,7 +1991,8 @@ mod tests {
     }
 
     /// The first window closed: the one after it moves into its place, its
-    /// text with it, behind the ghost's separator.
+    /// text with it, over the closed window's, which stays where it was,
+    /// dimming.
     #[test]
     fn the_window_after_a_first_one_closed_moves_into_its_place() {
         let mut s = Scene::new(Options {
@@ -1923,11 +2008,14 @@ mod tests {
         s.batch(events);
         assert!(s.moving());
         let rows = s.rows(0);
-        assert_eq!(rows[0], "          │bbbbbbbbbb");
+        assert_eq!(rows[0], "aaaaaaaaaa│bbbbbbbbbb", "as it was");
         let mid = s.rows(100);
-        let sep = mid[0].chars().position(|c| c == '│');
-        assert!(sep.is_some_and(|c| c < 10), "{mid:?}");
+        let sep = mid[0].chars().position(|c| c == '│').expect("a separator");
+        assert!(sep < 10, "{mid:?}");
+        assert!(mid[0].starts_with(&"a".repeat(sep)), "{mid:?}");
         assert!(mid[0].ends_with("bbbbbbbbbbbb"), "{mid:?}");
+        let dim = s.red(100, 0, 0);
+        assert!(dim > 0 && dim < 255, "dimming: {dim}");
         let last = s.settle();
         assert_eq!(last.lines().next(), Some("bbbbbbbbbbbbbbbbbbbbb"));
     }
