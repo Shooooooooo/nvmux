@@ -122,43 +122,14 @@ session is still running; `nvmux <host>` picks it up again.
 
 ### An animated client
 
-Neovim's own client draws each cell where it goes, at once. With
-
-```toml
-[client]
-ui = "nvmux"
-```
-
-nvmux draws the editor itself instead, with its own client in the same place
-on the same pty, and animates what [Neovide](https://neovide.dev) does as far
-as a grid of character cells allows:
-
-- the cursor travels between cells, its leading edge ahead of its trailing one,
-  so a long jump smears across the screen — drawn in block elements, at a
-  quarter of a cell or finer, and fading towards its tail (off unless turned
-  on);
-- sparks, rings or an outline off the cursor as it moves (Neovide's `railgun`,
-  `torpedo`, `pixiedust`, `sonicboom`, `ripple` and `wireframe`; off unless
-  turned on);
-- a scroll slides the text through its window a row at a time;
-- a float, the message area, or windows rearranged (`<C-w>x`, `<C-w>r`,
-  `<C-w>H` …) slide to where they move to;
-- a blinking block cursor can fade rather than flash.
-
-Split windows move the way
-[animate.nvim](https://github.com/Shooooooooo/animate.nvim)'s window module
-moves them instead: a new split flies in from its side — from the right or
-below with `'splitright'` or `'splitbelow'` — as its text fades in out of its
-background; a closed one flies back out into its side, its text dimming away
-as it goes; a window changing size moves its separators there; and a window
-that shows another buffer fades the old text out and the new text in.
-
-What a terminal cannot do is not imitated: no blur, no motion of text finer
-than a cell. And the trade is the one the table at the top is about: the screen
-is drawn from nvmux's own copy of the editor's grid, and what the terminal can
-do reaches the editor through nvmux's client rather than as Neovim negotiated
-it — which is why Neovim's own client stays the default. Each animation has a
-table of its own under `[effects]`, below.
+Set `ui = "nvmux"` under `[client]` and nvmux draws the editor with its own
+client instead of Neovim's, so that it can animate it: scrolls slide, split
+windows fly in, fly out and resize as in
+[animate.nvim](https://github.com/Shooooooooo/animate.nvim), floats glide as in
+[Neovide](https://neovide.dev), and a smeared cursor, particles and a fading
+blink can be turned on under `[effects]`. Neovim's own client stays the
+default: with it, what the terminal can do reaches the editor as Neovim
+negotiates it, not through nvmux.
 
 ## Configuration
 
