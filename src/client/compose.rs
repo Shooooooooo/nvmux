@@ -10,7 +10,10 @@
 //! Where a grid is drawn is where an animation says it is this frame
 //! ([`View::origin`]), and a window in the middle of scrolling shows the lines
 //! the scroll has reached rather than its own ([`View::scroll`]): the
-//! compositor knows that things move, and nothing of how.
+//! compositor knows that things move, and nothing of how. What an animation
+//! draws of its own over the windows — split windows between two layouts, a
+//! buffer fading into another — goes on before the floats do
+//! ([`View::over_windows`]).
 //!
 //! # Wide characters
 //!
@@ -70,7 +73,7 @@ impl Frame {
     }
 
     /// A cell at a position that may be off the screen.
-    fn at(&mut self, row: i64, col: i64) -> Option<&mut Out> {
+    pub fn at(&mut self, row: i64, col: i64) -> Option<&mut Out> {
         let row = usize::try_from(row).ok()?;
         let col = usize::try_from(col).ok()?;
         self.get_mut(row, col)
@@ -117,6 +120,11 @@ pub trait View {
 
     /// The scroll in progress on grid `grid`, if one is.
     fn scroll(&self, grid: u64) -> Option<&dyn Scrolling>;
+
+    /// Draw over the windows, once they are all drawn and before the floats
+    /// are: split windows on their way from one layout to another, a window
+    /// fading from one buffer to the next.
+    fn over_windows(&self, _frame: &mut Frame, _model: &Model) {}
 }
 
 /// A scroll part way through, as the compositor asks after it.
@@ -159,7 +167,24 @@ pub fn compose(
     draw(&mut frame, model, view, 1, (0, 0), None, false);
 
     // Windows next: they never overlap one another, so their order is
-    // nobody's business.
+    // nobody's business. Under each, grid 1 has whatever Neovim drew there
+    // before the window was — nothing meant to be seen, and what a window
+    // sliding away from its place would uncover — so it is blanked first.
+    let blank = Out::blank(model.style(0));
+    for (&grid, p) in &model.layout {
+        let (Place::Window { row, col }, Some(g), false) =
+            (&p.place, model.grids.get(&grid), p.hidden || grid == 1)
+        else {
+            continue;
+        };
+        for r in 0..g.height() {
+            for c in 0..g.width() {
+                if let Some(cell) = frame.at((row + r) as i64, (col + c) as i64) {
+                    *cell = blank.clone();
+                }
+            }
+        }
+    }
     for (&grid, p) in &model.layout {
         if p.hidden || grid == 1 {
             continue;
@@ -169,6 +194,7 @@ pub fn compose(
             draw(&mut frame, model, view, grid, at, None, false);
         }
     }
+    view.over_windows(&mut frame, model);
 
     let mut layers: Vec<_> = model
         .layout
@@ -337,11 +363,19 @@ fn shadow(frame: &mut Frame, model: &Model, grid: u64, at: (i64, i64)) {
 
 /// A style moved towards black, keeping `keep` percent of its colours.
 pub fn darken(colors: &style::Colors, s: &mut Style, keep: u8) {
-    const BLACK: Rgb = Rgb(0, 0, 0);
+    fade_to(colors, s, Rgb(0, 0, 0), keep);
+}
+
+/// A style moved towards `to`, keeping `keep` percent of its colours: at 0,
+/// text and all are `to`.
+pub fn fade_to(colors: &style::Colors, s: &mut Style, to: Rgb, keep: u8) {
     let fg = colors.visual_fg(s);
     let bg = colors.visual_bg(s);
-    s.fg = Color::Rgb(style::mix(keep, fg, BLACK));
-    s.bg = Color::Rgb(style::mix(keep, bg, BLACK));
+    if s.sp != Color::Default {
+        s.sp = Color::Rgb(style::mix(keep, colors.visual_sp(s), to));
+    }
+    s.fg = Color::Rgb(style::mix(keep, fg, to));
+    s.bg = Color::Rgb(style::mix(keep, bg, to));
     s.reverse = false;
 }
 
@@ -573,6 +607,37 @@ mod tests {
         assert!(dark(1, 1), "the row under it, a column along");
         assert!(!dark(1, 0), "but not under its first column");
         assert!(!dark(2, 2) && !dark(1, 3));
+    }
+
+    /// What grid 1 has under a window is never seen, not even when the
+    /// window is drawn somewhere else for a frame.
+    #[test]
+    fn what_grid_1_has_under_a_window_stays_hidden() {
+        struct Away;
+        impl View for Away {
+            fn origin(&self, _grid: u64, placed: (i64, i64)) -> (i64, i64) {
+                (placed.0, placed.1 + 2)
+            }
+            fn scroll(&self, _grid: u64) -> Option<&dyn Scrolling> {
+                None
+            }
+        }
+        let m = model(vec![
+            resize(1, 4, 1),
+            line(1, 0, "|old", 0),
+            resize(2, 2, 1),
+            line(2, 0, "ww", 0),
+            Event::WinPos {
+                grid: 2,
+                win: Some(1000),
+                row: 0,
+                col: 0,
+                width: 2,
+                height: 1,
+            },
+        ]);
+        assert_eq!(compose(&m, &Still, false, 4, 1).text(), "wwld");
+        assert_eq!(compose(&m, &Away, false, 4, 1).text(), "  ww");
     }
 
     /// Where an animation says a grid is this frame is where it is drawn.

@@ -140,8 +140,17 @@ as a grid of character cells allows:
   `torpedo`, `pixiedust`, `sonicboom`, `ripple` and `wireframe`; off unless
   turned on);
 - a scroll slides the text through its window a row at a time;
-- a window, a float or the message area slides to where it moves to;
+- a float, the message area, or windows rearranged (`<C-w>x`, `<C-w>r`,
+  `<C-w>H` …) slide to where they move to;
 - floats cast a shadow, and a blinking block cursor can fade rather than flash.
+
+Split windows move the way
+[animate.nvim](https://github.com/Shooooooooo/animate.nvim)'s window module
+moves them instead: a new split flies in from its side — from the right or
+below with `'splitright'` or `'splitbelow'` — as its text fades in out of its
+background; a closed one flies back out into its side, fading as it goes; a
+window changing size moves its separators there; and a window that shows
+another buffer fades the old text out and the new text in.
 
 What a terminal cannot do is not imitated: no blur, no motion of text finer
 than a cell. And the trade is the one the table at the top is about: the screen
@@ -226,8 +235,12 @@ duration_ms = 300
 far_lines   = 1      # how much of a jump further than the window is tall slides
 
 [effects.windows]
-enabled     = true   # a window, a float or the messages slide to where they move
-duration_ms = 150
+enabled     = true   # windows move rather than jump
+duration_ms = 150    # a float, the messages or windows rearranged slide there (Neovide)
+resize_ms   = 150    # a split changing size (animate.nvim, as are the rest; 0 is at once)
+open_ms     = 200    # a new split flying in from its side
+close_ms    = 180    # a closed one flying out into its side
+switch_ms   = 200    # a window that shows another buffer fading from one to the other
 
 [effects.shadow]
 enabled = true   # floats cast a shadow down and to the right

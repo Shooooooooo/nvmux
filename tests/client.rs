@@ -488,3 +488,72 @@ fn a_ui_without_windows_of_its_own_is_made_room_for() {
         term.text()
     );
 }
+
+/// A split flies in the way animate.nvim draws it: with `'splitright'` the
+/// new window starts as a sliver at the right edge, and its separator comes
+/// left frame by frame to where Neovim put it.
+#[test]
+fn a_split_flies_in_from_its_side() {
+    require_nvim!();
+    let scratch = Scratch::new("client-split");
+    let (sock, mut rpc, config) = session(&scratch, "client-split");
+    rpc.command("setlocal noswapfile | set splitright | call setline(1, 'split me')")
+        .expect("setline");
+
+    let mut term = Terminal::spawn(&sock, &config);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.starts_with("split me")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    // The agent the client leaves in the editor has answered by now.
+    term.pump_until(Duration::from_millis(300), |_| false);
+    let from = term.output.len();
+    rpc.command("vsplit").expect("vsplit");
+    let col = rpc
+        .eval("win_screenpos(winnr())[1]")
+        .expect("where the new window is")
+        .as_i64()
+        .expect("a column");
+    // The separator is the column left of the new window, 0-based.
+    let landed = (col - 2) as u16;
+    let sep_at = |screen: &vt100::Screen| {
+        (0..COLS).find(|c| {
+            screen
+                .cell(0, *c)
+                .is_some_and(|cell| cell.contents() == "│")
+        })
+    };
+    assert!(
+        term.pump(Duration::from_secs(5), |t| sep_at(t.parser.screen())
+            == Some(landed)),
+        "the separator never landed at {landed}:\n{}",
+        term.text()
+    );
+    term.pump_until(Duration::from_millis(300), |_| false);
+
+    // Every frame drawn on the way, in order: where the separator was.
+    let mut replay = vt100::Parser::new(ROWS, COLS, 0);
+    replay.process(&term.output[..from]);
+    let end = b"\x1b[?2026l";
+    let mut at = from;
+    let mut seen: Vec<u16> = Vec::new();
+    while let Some(i) = find(&term.output[at..], end) {
+        replay.process(&term.output[at..at + i + end.len()]);
+        at += i + end.len();
+        if let Some(c) = sep_at(replay.screen()) {
+            if seen.last() != Some(&c) {
+                seen.push(c);
+            }
+        }
+    }
+    assert_eq!(seen.last(), Some(&landed), "{seen:?}");
+    assert!(
+        seen.first().is_some_and(|c| *c > landed + 10),
+        "it did not start at the right edge: {seen:?}"
+    );
+    assert!(
+        seen.windows(2).all(|w| w[0] > w[1]),
+        "it did not come left frame by frame: {seen:?}"
+    );
+}

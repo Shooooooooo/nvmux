@@ -17,8 +17,13 @@
 //!   ([`anim::vfx`]);
 //! - a scroll slides the text through the window a row at a time rather than
 //!   redrawing it in place ([`anim::scroll`]);
-//! - a window or a float that moves slides to where it is going
-//!   ([`anim::motion`]);
+//! - a float, the message area or windows rearranged slide to where they are
+//!   going ([`anim::motion`]);
+//! - and, from animate.nvim rather than Neovide, a split window opening flies
+//!   in from its side as its text fades in, one closing flies back into its
+//!   side as it fades, one changing size moves its edges there
+//!   ([`anim::layout`]), and one showing another buffer fades from one to the
+//!   other ([`anim::switch`]);
 //! - a blinking cursor fades in and out ([`anim::blink`]);
 //! - and a float casts a shadow on what is under it ([`compose`]).
 //!
@@ -67,6 +72,12 @@
 //! waits for both, for up to [`HOLD_LIMIT`], so that what the terminal shows is
 //! the editor whole.
 //!
+//! Two things the windows' animations need are not in what Neovim draws for a
+//! UI at all: which buffer a window shows — a window switching buffers fades
+//! from one to the other — and the options that decide how windows are laid
+//! out. So a multigrid attach leaves an agent in the editor ([`AGENT_LUA`]),
+//! a handful of autocommands that tell this client, and it only, of both.
+//!
 //! # One thread
 //!
 //! One `poll` over the terminal, the socket, and the two signal pipes, with a
@@ -106,6 +117,21 @@ use self::redraw::Event;
 use self::screen::Screen;
 use self::wire::{Arg, Inbox, Outbox};
 use crate::palette::{Palette, Rgb};
+
+/// The options that lay windows out, as the agent gives them: `'laststatus'`,
+/// `'splitright'`, `'splitbelow'`.
+fn options(v: &[ValueRef<'_>]) -> anim::layout::Options {
+    let dflt = anim::layout::Options::default();
+    let flag = |i: usize, d: bool| match v.get(i) {
+        Some(ValueRef::Boolean(b)) => *b,
+        _ => d,
+    };
+    anim::layout::Options {
+        laststatus: v.first().and_then(redraw::int).unwrap_or(dflt.laststatus),
+        splitright: flag(1, dflt.splitright),
+        splitbelow: flag(2, dflt.splitbelow),
+    }
+}
 
 /// The environment variable a parent nvmux hands the terminal's colours down
 /// in (see [`crate::palette::Palette::to_env`]): the client is on a pty and
@@ -192,6 +218,49 @@ for i, w in ipairs({ ... }) do
 end
 return out";
 
+/// The client's agent in the editor, given the client's channel: it tells the
+/// client, in `nvmux_client` notifications, of a buffer entering a window
+/// (`buf`, window, buffer), a window made (`win`, window, buffer) or closed
+/// (`closed`, window), and the options that lay windows out changing
+/// (`options`, `'laststatus'`, `'splitright'`, `'splitbelow'`) — and answers
+/// with those options and the buffer of every window there is. It goes when
+/// this client's UI does, or the first time it finds the channel gone.
+const AGENT_LUA: &str = "local chan = ...
+local api = vim.api
+local group = api.nvim_create_augroup('nvmux_client_' .. chan, { clear = true })
+local function send(...)
+  if not pcall(vim.rpcnotify, chan, 'nvmux_client', ...) then
+    pcall(api.nvim_del_augroup_by_id, group)
+  end
+end
+local function au(event, opts, f)
+  opts.group, opts.callback = group, f
+  api.nvim_create_autocmd(event, opts)
+end
+au('BufWinEnter', {}, function(ev)
+  send('buf', api.nvim_get_current_win(), ev.buf)
+end)
+au('WinNew', {}, function()
+  local win = api.nvim_get_current_win()
+  send('win', win, api.nvim_win_get_buf(win))
+end)
+au('WinClosed', {}, function(ev)
+  send('closed', tonumber(ev.match))
+end)
+au('OptionSet', { pattern = { 'laststatus', 'splitright', 'splitbelow' } }, function()
+  send('options', vim.o.laststatus, vim.o.splitright, vim.o.splitbelow)
+end)
+au('UILeave', {}, function()
+  if vim.v.event.chan == chan then
+    pcall(api.nvim_del_augroup_by_id, group)
+  end
+end)
+local wins = {}
+for _, w in ipairs(api.nvim_list_wins()) do
+  wins[#wins + 1] = { w, api.nvim_win_get_buf(w) }
+end
+return { vim.o.laststatus, vim.o.splitright, vim.o.splitbelow, wins }";
+
 /// What the client has asked and not been answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ask {
@@ -202,6 +271,8 @@ enum Ask {
     Layout(Vec<(u64, i64)>),
     /// The detach of attaching again the other way.
     Detach,
+    /// [`AGENT_LUA`].
+    Agent,
 }
 
 /// How the client is attached: see the module docs.
@@ -274,6 +345,12 @@ pub struct App {
     refreshed: HashMap<u64, Refreshed>,
     /// A refresh is to be started: see [`App::take_refresh`].
     refresh: bool,
+    /// The agent has been asked for, this attach.
+    agent: bool,
+    /// The buffer each window shows, by window, as the agent says.
+    bufs: HashMap<i64, i64>,
+    /// Windows that took another buffer since the last flush.
+    switched: Vec<i64>,
     /// Since when drawing has waited for what a multigrid attach lacks.
     hold_since: Option<Instant>,
     /// Since when the parser has held an escape, or a sequence cut short.
@@ -320,6 +397,9 @@ impl App {
             lacking: Vec::new(),
             refreshed: HashMap::new(),
             refresh: false,
+            agent: false,
+            bufs: HashMap::new(),
+            switched: Vec::new(),
             hold_since: None,
             escape_since: None,
             pressed: None,
@@ -398,6 +478,49 @@ impl App {
             "nvim_ui_attach",
             &[Arg::Int(w as i64), Arg::Int(h as i64), Arg::Map(opts)],
         );
+        self.agent = false;
+        self.leave_agent();
+    }
+
+    /// Leave the agent in the editor, once an attach that animates windows
+    /// has the channel to give it. See [`AGENT_LUA`].
+    fn leave_agent(&mut self) {
+        let Some(chan) = self.chan else { return };
+        if self.agent || !self.multigrid() || !self.anim.wants_agent() {
+            return;
+        }
+        self.agent = true;
+        let id = self.outbox.request(
+            "nvim_exec_lua",
+            &[Arg::str(AGENT_LUA), Arg::Array(vec![Arg::Int(chan as i64)])],
+        );
+        self.asked.insert(id, Ask::Agent);
+    }
+
+    /// What the agent says: see [`AGENT_LUA`].
+    fn agent_said(&mut self, params: &[ValueRef<'_>]) {
+        let int = |i: usize| params.get(i).and_then(redraw::int);
+        match params.first().and_then(redraw::as_str) {
+            Some("buf") => {
+                if let (Some(win), Some(buf)) = (int(1), int(2)) {
+                    if self.bufs.insert(win, buf).is_some_and(|was| was != buf) {
+                        self.switched.push(win);
+                    }
+                }
+            }
+            Some("win") => {
+                if let (Some(win), Some(buf)) = (int(1), int(2)) {
+                    self.bufs.insert(win, buf);
+                }
+            }
+            Some("closed") => {
+                if let Some(win) = int(1) {
+                    self.bufs.remove(&win);
+                }
+            }
+            Some("options") => self.anim.set_options(options(&params[1..])),
+            _ => {}
+        }
     }
 
     /// Detach, to attach again as `multigrid` says once Neovim has done it.
@@ -457,6 +580,11 @@ impl App {
                     (Some("nvim_error_event"), Some(params)) => {
                         tracing::warn!(error = %params.to_owned(), "client: the server reported an error");
                     }
+                    (Some("nvmux_client"), Some(params)) => {
+                        if let Some(params) = params.as_array() {
+                            self.agent_said(params);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -473,6 +601,21 @@ impl App {
                             .and_then(ValueRef::as_array)
                             .and_then(|a| a.first())
                             .and_then(ValueRef::as_u64);
+                        self.leave_agent();
+                    }
+                    Some(Ask::Agent) => {
+                        let answer = result.and_then(ValueRef::as_array);
+                        let answer = answer.map_or(&[][..], Vec::as_slice);
+                        self.anim.set_options(options(answer));
+                        let wins = answer.get(3).and_then(ValueRef::as_array);
+                        self.bufs = wins
+                            .map_or(&[][..], Vec::as_slice)
+                            .iter()
+                            .filter_map(|pair| {
+                                let pair = pair.as_array()?;
+                                Some((redraw::int(pair.first()?)?, redraw::int(pair.get(1)?)?))
+                            })
+                            .collect();
                     }
                     Some(Ask::Uis) => {
                         self.checking = false;
@@ -620,7 +763,7 @@ impl App {
             }
         }
         if !events.is_empty() {
-            self.apply(events, false, now);
+            self.apply(events, false, &[], now);
         }
     }
 
@@ -662,7 +805,16 @@ impl App {
             self.uis_changed(now);
         }
         let animate = self.flushed && !self.holding(now);
-        self.apply(batch, animate, now);
+        // The windows that took another buffer since the last flush, by grid:
+        // this batch is the one that draws them.
+        let switched: Vec<u64> = std::mem::take(&mut self.switched)
+            .into_iter()
+            .filter_map(|win| {
+                let (grid, _) = self.model.wins.iter().find(|(_, w)| **w == win)?;
+                Some(*grid)
+            })
+            .collect();
+        self.apply(batch, animate, &switched, now);
         self.flushed = true;
         if self.multigrid() {
             self.inspect(now);
@@ -671,10 +823,11 @@ impl App {
     }
 
     /// Take a batch into the model, and set off what it starts — if
-    /// `animate`, or simply put everything where it now is.
-    fn apply(&mut self, batch: Vec<Event>, animate: bool, now: Instant) {
+    /// `animate`, or simply put everything where it now is. `switched` are
+    /// the window grids the batch draws another buffer in.
+    fn apply(&mut self, batch: Vec<Event>, animate: bool, switched: &[u64], now: Instant) {
         let multigrid = self.multigrid();
-        let before = self.anim.before(&self.model, &batch, multigrid);
+        let before = self.anim.before(&self.model, &batch, multigrid, switched);
         let mut changes = Changes::default();
         for event in batch {
             self.model.apply(event, &mut changes);
@@ -1298,7 +1451,13 @@ mod tests {
     /// A client with an effect that wants windows of their own, or none.
     fn app(multigrid: bool) -> App {
         let effects = Effects {
-            windows: multigrid.then_some(0.15),
+            windows: multigrid.then_some(anim::Windows {
+                slide: 0.15,
+                resize: 0.15,
+                open: 0.2,
+                close: 0.18,
+                switch: 0.2,
+            }),
             ..Effects::none()
         };
         App::new(palette(), effects, (20, 6))
@@ -1440,6 +1599,70 @@ mod tests {
         redraw(&mut a, vec![resize(1, 20, 6)], t0);
         calls(&mut a);
         a
+    }
+
+    /// A multigrid attach leaves the agent in the editor, given the client's
+    /// channel. A window it says took a buffer other than the one it showed
+    /// is marked for the next flush, which draws it; a window it has not
+    /// told of is a new one, not a switch.
+    #[test]
+    fn the_agent_says_which_window_took_another_buffer() {
+        let t0 = Instant::now();
+        let mut a = app(true);
+        a.start();
+        let sent = calls(&mut a);
+        answer(
+            &mut a,
+            request(&sent, "nvim_get_api_info", ""),
+            Value::Array(vec![7.into()]),
+            t0,
+        );
+        answer(&mut a, asks_uis(&sent), uis(false, false), t0);
+        let sent = calls(&mut a);
+        let agent = request(&sent, "nvim_exec_lua", "local chan");
+        let (_, _, args) = sent
+            .iter()
+            .find(|(id, ..)| *id == Some(agent))
+            .expect("the agent");
+        assert_eq!(args[1], Value::Array(vec![7.into()]), "given the channel");
+        let wins = Value::Array(vec![Value::Array(vec![1000.into(), 1.into()])]);
+        let said = vec![3.into(), true.into(), false.into(), wins];
+        answer(&mut a, agent, Value::Array(said), t0);
+        assert_eq!(a.bufs.get(&1000), Some(&1));
+        let notify = |a: &mut App, params: Vec<Value>| {
+            let v = Value::Array(vec![2.into(), "nvmux_client".into(), Value::Array(params)]);
+            a.message(&encoded(v), t0);
+        };
+        notify(&mut a, vec!["buf".into(), 1000.into(), 1.into()]);
+        assert!(a.switched.is_empty(), "the buffer it showed");
+        notify(&mut a, vec!["buf".into(), 1000.into(), 2.into()]);
+        notify(&mut a, vec!["buf".into(), 1001.into(), 3.into()]);
+        assert_eq!(a.switched, vec![1000]);
+        redraw(&mut a, vec![resize(1, 20, 6)], t0);
+        assert!(a.switched.is_empty(), "taken by the flush");
+        notify(&mut a, vec!["closed".into(), 1001.into()]);
+        assert!(!a.bufs.contains_key(&1001));
+        // Without the effect, no agent.
+        let mut a = app(false);
+        a.start();
+        let sent = calls(&mut a);
+        answer(
+            &mut a,
+            request(&sent, "nvim_get_api_info", ""),
+            Value::Array(vec![7.into()]),
+            t0,
+        );
+        assert!(!calls(&mut a).iter().any(|(_, m, _)| m == "nvim_exec_lua"));
+    }
+
+    /// The agent's options, and Neovim's defaults for what it leaves out.
+    #[test]
+    fn the_agents_options_are_read() {
+        let said = [Value::from(3), Value::from(true), Value::from(false)];
+        let refs: Vec<ValueRef<'_>> = said.iter().map(Value::as_ref).collect();
+        let o = options(&refs);
+        assert_eq!((o.laststatus, o.splitright, o.splitbelow), (3, true, false));
+        assert_eq!(options(&[]), anim::layout::Options::default());
     }
 
     /// Who else is attached is asked before attaching, and decides how.

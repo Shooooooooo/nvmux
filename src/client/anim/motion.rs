@@ -1,13 +1,14 @@
 //! A window moving: Neovide's `position_animation_length`.
 //!
-//! When the editor puts a window, a float or the message area somewhere new —
-//! a split opening beside it, `<C-w>L`, a float following the cursor, messages
-//! pushing up — the grid slides there rather than appearing. Each grid that
-//! moves gets a spring per axis for how far it still is from where the editor
-//! put it, drawn at the nearest whole cell — the nearest rather than the one
-//! towards the target, as a scroll's is (see [`super::scroll`]), so that a
-//! window moved and then moved back part way carries on from exactly where
-//! it is drawn.
+//! When the editor puts a float or the message area somewhere new — a float
+//! following the cursor, messages pushing up — or rearranges split windows —
+//! `<C-w>x`, `<C-w>L` — the grid slides there rather than appearing. (A split
+//! window opening, closing or changing size moves the way animate.nvim moves
+//! it instead: see [`super::layout`].) Each grid that moves gets a spring per
+//! axis for how far it still is from where the editor put it, drawn at the
+//! nearest whole cell — the nearest rather than the one towards the target,
+//! as a scroll's is (see [`super::scroll`]), so that a window moved and then
+//! moved back part way carries on from exactly where it is drawn.
 //!
 //! A grid that is new, or shown again after being hidden — the window of
 //! another tab page — is simply put where it goes: there is nowhere it is

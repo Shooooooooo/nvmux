@@ -288,8 +288,8 @@ impl EffectsSettings {
         self.enabled && self.scroll.enabled
     }
 
-    /// Whether a window or a float that moves slides to its new place: its
-    /// own switch and the master one.
+    /// Whether windows and floats move rather than jump: its own switch and
+    /// the master one.
     pub fn windows_enabled(&self) -> bool {
         self.enabled && self.windows.enabled
     }
@@ -412,16 +412,30 @@ pub struct ScrollSettings {
     pub far_lines: u64,
 }
 
-/// nvmux's own client: a window, a float or the message area that the editor
-/// moves sliding to its new place — Neovide's `position_animation_length`
-/// (see [`crate::client::anim::motion`]).
+/// nvmux's own client: windows moving rather than jumping. A split window
+/// opening, closing or changing size moves the way animate.nvim's window
+/// module moves it, and one showing another buffer fades from one to the
+/// other (see [`crate::client::anim::layout`] and
+/// [`crate::client::anim::switch`]); a float, the message area or windows
+/// rearranged slide to their new place as Neovide's do — its
+/// `position_animation_length` (see [`crate::client::anim::motion`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WindowsSettings {
     /// This effect's own switch, under `[effects] enabled`.
     pub enabled: bool,
-    /// How long a move takes to settle.
+    /// How long Neovide's slide takes to settle.
     pub duration_ms: u64,
+    /// How long a split window takes to change size: animate.nvim's
+    /// `resize.duration`. 0 changes it at once.
+    pub resize_ms: u64,
+    /// How long a new split takes to fly in: its `open.duration`.
+    pub open_ms: u64,
+    /// How long a closed one takes to fly out: its `close.duration`.
+    pub close_ms: u64,
+    /// How long a window showing another buffer takes to fade from one to
+    /// the other: its `fade.duration`.
+    pub switch_ms: u64,
 }
 
 /// nvmux's own client: floats casting a shadow on what is under them, down
@@ -672,6 +686,10 @@ impl Default for WindowsSettings {
         Self {
             enabled: true,
             duration_ms: 150,
+            resize_ms: 150,
+            open_ms: 200,
+            close_ms: 180,
+            switch_ms: 200,
         }
     }
 }
@@ -892,11 +910,18 @@ impl Settings {
                 return Err(format!("{key} must be at most {MAX_FADE_MS}"));
             }
         }
-        // Nought is allowed here: a cell along a line taken at once.
-        if e.smear.short_ms > MAX_FADE_MS {
-            return Err(format!(
-                "effects.smear.short_ms must be at most {MAX_FADE_MS}"
-            ));
+        // Nought is allowed for these: a cell along a line taken at once, and
+        // a window that changes at once.
+        for (key, ms) in [
+            ("effects.smear.short_ms", e.smear.short_ms),
+            ("effects.windows.resize_ms", e.windows.resize_ms),
+            ("effects.windows.open_ms", e.windows.open_ms),
+            ("effects.windows.close_ms", e.windows.close_ms),
+            ("effects.windows.switch_ms", e.windows.switch_ms),
+        ] {
+            if ms > MAX_FADE_MS {
+                return Err(format!("{key} must be at most {MAX_FADE_MS}"));
+            }
         }
         for (key, value) in [
             ("effects.smear.trail", e.smear.trail),
@@ -1183,9 +1208,17 @@ fn render_default_config(prefix: u8) -> String {
          # far_lines   = {scroll_far}\n\
          \n\
          [effects.windows]\n\
-         # nvmux's own client: a window or a float that moves slides there.\n\
+         # nvmux's own client: a split window opening, closing or changing size\n\
+         # moves there, and one showing another buffer fades from one to the\n\
+         # other, the way animate.nvim draws them; 0 ms draws one at once. A\n\
+         # float, the message area or windows rearranged slide there, as in\n\
+         # Neovide, settling over duration_ms.\n\
          # enabled     = {windows_enabled}\n\
          # duration_ms = {windows_duration}\n\
+         # resize_ms   = {windows_resize}\n\
+         # open_ms     = {windows_open}\n\
+         # close_ms    = {windows_close}\n\
+         # switch_ms   = {windows_switch}\n\
          \n\
          [effects.shadow]\n\
          # nvmux's own client: floats cast a shadow down and to the right.\n\
@@ -1232,6 +1265,10 @@ fn render_default_config(prefix: u8) -> String {
         scroll_far = e.scroll.far_lines,
         windows_enabled = e.windows.enabled,
         windows_duration = e.windows.duration_ms,
+        windows_resize = e.windows.resize_ms,
+        windows_open = e.windows.open_ms,
+        windows_close = e.windows.close_ms,
+        windows_switch = e.windows.switch_ms,
         shadow_enabled = e.shadow.enabled,
         blink_enabled = e.blink.enabled,
     )
@@ -1384,6 +1421,10 @@ mod tests {
             [effects.windows]\n\
             enabled = true\n\
             duration_ms = 150\n\
+            resize_ms = 150\n\
+            open_ms = 200\n\
+            close_ms = 180\n\
+            switch_ms = 200\n\
             [effects.shadow]\n\
             enabled = true\n\
             [effects.blink]\n\
@@ -1561,6 +1602,11 @@ mod tests {
         assert_eq!(e.scroll.duration_ms, 300);
         assert_eq!(e.scroll.far_lines, 1);
         assert_eq!(e.windows.duration_ms, 150);
+        // And animate.nvim's, where it has the same setting.
+        assert_eq!(e.windows.resize_ms, 150);
+        assert_eq!(e.windows.open_ms, 200);
+        assert_eq!(e.windows.close_ms, 180);
+        assert_eq!(e.windows.switch_ms, 200);
     }
 
     /// A fraction may be written whole, and a mode as Neovide spells it.
@@ -1705,6 +1751,14 @@ mod tests {
             (
                 "[effects.windows]\nduration_ms = 0\n",
                 "effects.windows.duration_ms",
+            ),
+            (
+                "[effects.windows]\nopen_ms = 2001\n",
+                "effects.windows.open_ms",
+            ),
+            (
+                "[effects.windows]\nswitch_ms = 2001\n",
+                "effects.windows.switch_ms",
             ),
             (
                 "[effects.smear]\nshort_ms = 2001\n",

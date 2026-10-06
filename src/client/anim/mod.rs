@@ -2,37 +2,43 @@
 //!
 //! The model ([`super::model`]) is the editor as Neovim last finished drawing
 //! it; nothing here changes it. What an animation keeps is the difference
-//! between that and what is on the screen this frame — how far a window still
+//! between that and what is on the screen this frame — how far a float still
 //! has to slide, how many rows behind a scroll still is, where the cursor's
-//! corners have got to — and every frame is the model drawn through those
-//! differences ([`super::compose::View`]), with the cursor and anything flying off it
+//! corners have got to, where split windows are between two layouts — and
+//! every frame is the model drawn through those differences
+//! ([`super::compose::View`]), with the cursor and anything flying off it
 //! painted over the top ([`Animator::paint`]).
 //!
 //! Each batch from Neovim is looked at twice: before it is applied, for what
-//! is about to be lost — where the windows were, the lines a scroll is about
-//! to take away ([`Animator::before`]) — and after, for what to start
-//! ([`Animator::after`]). Nothing animates on the first batch: the editor's
-//! first frame is where everything starts, not something to arrive at.
+//! is about to be lost — where the windows were and what they showed, the
+//! lines a scroll is about to take away ([`Animator::before`]) — and after,
+//! for what to start ([`Animator::after`]). Nothing animates on the first
+//! batch: the editor's first frame is where everything starts, not something
+//! to arrive at.
 
 pub mod blink;
+pub mod layout;
 pub mod motion;
 pub mod raster;
 pub mod scroll;
 pub mod smear;
 pub mod spring;
+pub mod switch;
 pub mod vfx;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use self::blink::Blink;
+use self::layout::{Change, Transition};
 use self::motion::Motion;
 use self::scroll::Scroll;
 use self::smear::{Rect, Smear};
+use self::switch::Switch;
 use self::vfx::Vfx;
 use super::compose::{Frame, Scrolling, View};
 use super::grid::{Cell, Grid};
-use super::model::{Changes, Margins, Model};
+use super::model::{Changes, Margins, Model, Place};
 use super::redraw::{Event, Shape};
 use super::screen::Cursor;
 use super::style::{self, Color};
@@ -50,10 +56,23 @@ pub struct Effects {
     pub vfx: Option<vfx::Settings>,
     /// Seconds to settle, and the rows of a long jump animated.
     pub scroll: Option<(f32, usize)>,
-    /// Seconds to settle.
-    pub windows: Option<f32>,
+    pub windows: Option<Windows>,
     pub shadow: bool,
     pub blink: bool,
+}
+
+/// `[effects.windows]`, in seconds; nought for one turned off.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Windows {
+    /// How long Neovide's slide takes to settle: a float, the message area,
+    /// windows rearranged ([`motion`]).
+    pub slide: f32,
+    /// animate.nvim's: a split window changing size, opening and closing
+    /// ([`layout`]), and one showing another buffer fading ([`switch`]).
+    pub resize: f32,
+    pub open: f32,
+    pub close: f32,
+    pub switch: f32,
 }
 
 impl Effects {
@@ -72,7 +91,7 @@ impl Effects {
     }
 
     /// Whether any of them needs windows on grids of their own: a window
-    /// sliding, a float's shadow, a scroll told apart by window.
+    /// moving, a float's shadow, a scroll told apart by window.
     pub fn want_multigrid(&self) -> bool {
         self.windows.is_some() || self.shadow || self.scroll.is_some()
     }
@@ -99,7 +118,13 @@ impl Effects {
             scroll: e
                 .scroll_enabled()
                 .then(|| (secs(e.scroll.duration_ms), e.scroll.far_lines as usize)),
-            windows: e.windows_enabled().then(|| secs(e.windows.duration_ms)),
+            windows: e.windows_enabled().then(|| Windows {
+                slide: secs(e.windows.duration_ms),
+                resize: secs(e.windows.resize_ms),
+                open: secs(e.windows.open_ms),
+                close: secs(e.windows.close_ms),
+                switch: secs(e.windows.switch_ms),
+            }),
             shadow: e.shadow_enabled(),
             blink: e.blink_enabled(),
         }
@@ -113,6 +138,11 @@ pub struct Before {
     origins: HashMap<u64, (i64, i64)>,
     /// The lines of each rectangle about to scroll, with how far.
     scrolls: Vec<Snap>,
+    /// The split windows and what they showed, where the batch may move
+    /// them.
+    layout: Option<layout::Shot>,
+    /// Windows about to show another buffer, as they were.
+    switched: Vec<switch::Was>,
 }
 
 #[derive(Debug)]
@@ -131,6 +161,12 @@ pub struct Animator {
     vfx: Vfx,
     scrolls: HashMap<u64, Scroll>,
     motions: HashMap<u64, Motion>,
+    /// Split windows on their way from one layout to another.
+    transition: Option<Transition>,
+    /// Windows fading from one buffer to another, by grid.
+    switches: HashMap<u64, Switch>,
+    /// Neovim's options that lay the windows out.
+    options: layout::Options,
     blink: Blink,
     /// When the animations were last moved on.
     last: Option<Instant>,
@@ -149,6 +185,9 @@ impl Animator {
             vfx: Vfx::default(),
             scrolls: HashMap::new(),
             motions: HashMap::new(),
+            transition: None,
+            switches: HashMap::new(),
+            options: layout::Options::default(),
             blink: Blink::new(Instant::now()),
             last: None,
             cell: None,
@@ -163,6 +202,8 @@ impl Animator {
         self.vfx.clear();
         self.scrolls.clear();
         self.motions.clear();
+        self.transition = None;
+        self.switches.clear();
         self.cell = None;
     }
 
@@ -170,13 +211,32 @@ impl Animator {
         self.effects.shadow
     }
 
+    /// Whether the windows' animations want to know what the client's agent
+    /// in the editor says: which buffer a window shows, and the options that
+    /// lay windows out.
+    pub fn wants_agent(&self) -> bool {
+        self.effects.windows.is_some()
+    }
+
+    /// Neovim's options that lay the windows out, as the agent says them.
+    pub fn set_options(&mut self, options: layout::Options) {
+        self.options = options;
+    }
+
     /// A key was typed: the cursor is not left faded out under it.
     pub fn typed(&mut self, now: Instant) {
         self.blink.reset(now);
     }
 
-    /// Look at a batch before it is applied: see the module docs.
-    pub fn before(&self, model: &Model, batch: &[Event], multigrid: bool) -> Before {
+    /// Look at a batch before it is applied: see the module docs. `switched`
+    /// are the window grids about to show another buffer.
+    pub fn before(
+        &self,
+        model: &Model,
+        batch: &[Event],
+        multigrid: bool,
+        switched: &[u64],
+    ) -> Before {
         let origins = model
             .layout
             .iter()
@@ -216,7 +276,30 @@ impl Animator {
                 scrolls.push(snap);
             }
         }
-        Before { origins, scrolls }
+        let windows = self.effects.windows.filter(|_| multigrid);
+        let layout = windows
+            .filter(|_| layout::moves_windows(model, batch))
+            .and_then(|_| {
+                layout::Shot::take(model, self.options.laststatus, self.transition.as_ref())
+            });
+        // Only split windows fade, and only a few at once: `:windo bnext`
+        // fades none.
+        let mut switched: Vec<switch::Was> = match windows {
+            Some(w) if w.switch > 0.0 => switched
+                .iter()
+                .filter_map(|grid| switch::Was::take(model, *grid))
+                .collect(),
+            _ => Vec::new(),
+        };
+        if switched.len() > switch::MAX_BURST {
+            switched.clear();
+        }
+        Before {
+            origins,
+            scrolls,
+            layout,
+            switched,
+        }
     }
 
     /// Start whatever the batch just applied set off: see the module docs.
@@ -238,11 +321,59 @@ impl Animator {
             self.motions.remove(grid);
         }
 
-        // Windows that moved slide; one hidden or gone stops sliding.
+        // Split windows opening, closing or changing size move the way
+        // animate.nvim moves them; rearranged, they slide as Neovide's do.
+        let live = drawn && multigrid;
+        let mut slide_splits = true;
+        let mut started = false;
+        if let (Some(w), Some(shot), true) = (self.effects.windows, before.layout, live) {
+            let change = match layout::Layout::of(model, self.options.laststatus) {
+                Some(new) => layout::change(shot, &new, model, &w, self.options),
+                None => Change::Slide,
+            };
+            match change {
+                Change::Same => {}
+                Change::Animate(t) => {
+                    self.transition = Some(*t);
+                    slide_splits = false;
+                    started = true;
+                }
+                Change::Snap => {
+                    self.transition = None;
+                    slide_splits = false;
+                }
+                Change::Slide => self.transition = None,
+            }
+        }
+        if !live || self.effects.windows.is_none() {
+            self.transition = None;
+            self.switches.clear();
+        }
+
+        // A window that shows another buffer fades from one to the other —
+        // unless the windows are on their way somewhere.
+        if let (Some(w), true, false) = (self.effects.windows, live, started) {
+            for was in before.switched {
+                if let Some(s) = Switch::start(was, model, w.switch) {
+                    self.switches.insert(s.grid(), s);
+                }
+            }
+        }
+        if started {
+            self.switches.clear();
+        }
+        self.switches.retain(|_, s| s.still(model));
+
+        // Floats, the message area and windows rearranged that moved slide;
+        // one hidden or gone stops sliding.
         match self.effects.windows {
-            Some(_) if drawn && multigrid => {
+            Some(_) if live => {
                 for (grid, p) in &model.layout {
                     if p.hidden {
+                        continue;
+                    }
+                    if !slide_splits && matches!(p.place, Place::Window { .. }) {
+                        self.motions.remove(grid);
                         continue;
                     }
                     let Some(&was) = before.origins.get(grid) else {
@@ -319,7 +450,10 @@ impl Animator {
         };
         let (row, col) = model.cursor_on_screen();
         let insert = matches!(model.mode_name.as_str(), "insert" | "replace");
+        // Windows setting off somewhere take the cursor with them: it is in
+        // its cell when they land, and does not travel there.
         let allowed = drawn
+            && !started
             && !(insert && !self.effects.smear_in_insert)
             && !(model.cursor_in_messages() && !self.effects.smear_in_cmdline);
         if self.smear.target() != Some(target) {
@@ -348,6 +482,8 @@ impl Animator {
             || self.vfx.moving()
             || !self.scrolls.is_empty()
             || !self.motions.is_empty()
+            || self.transition.is_some()
+            || !self.switches.is_empty()
             || self.blink_due(model, now).is_some()
     }
 
@@ -368,7 +504,9 @@ impl Animator {
         let moving = self.smear.moving()
             || self.vfx.moving()
             || !self.scrolls.is_empty()
-            || !self.motions.is_empty();
+            || !self.motions.is_empty()
+            || self.transition.is_some()
+            || !self.switches.is_empty();
         let frame = moving.then(|| self.last.map_or(now, |last| last + FRAME));
         [frame, self.blink_due(model, now)]
             .into_iter()
@@ -387,9 +525,13 @@ impl Animator {
         if let Some((duration, _)) = self.effects.scroll {
             self.scrolls.retain(|_, s| s.step(dt, duration));
         }
-        if let Some(duration) = self.effects.windows {
-            self.motions.retain(|_, m| m.step(dt, duration));
+        if let Some(w) = self.effects.windows {
+            self.motions.retain(|_, m| m.step(dt, w.slide));
         }
+        if self.transition.as_mut().is_some_and(|t| !t.step(dt)) {
+            self.transition = None;
+        }
+        self.switches.retain(|_, s| s.step(dt));
     }
 
     /// Paint the cursor and what flies off it over a composed frame, and say
@@ -402,6 +544,15 @@ impl Animator {
         }
         let mut cursor = hardware_cursor(model, frame);
         if !cursor.visible {
+            return cursor;
+        }
+        // Its window is on its way: the cursor shows again where it lands.
+        if self
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.involves(model.cursor.grid))
+        {
+            cursor.visible = false;
             return cursor;
         }
         if let (true, Some(s)) = (self.smear.moving(), self.effects.smear) {
@@ -439,6 +590,15 @@ impl View for Animator {
 
     fn scroll(&self, grid: u64) -> Option<&dyn Scrolling> {
         self.scrolls.get(&grid).map(|s| s as &dyn Scrolling)
+    }
+
+    fn over_windows(&self, frame: &mut Frame, model: &Model) {
+        if let Some(t) = &self.transition {
+            t.paint(frame, model);
+        }
+        for s in self.switches.values() {
+            s.paint(frame, model);
+        }
     }
 }
 
@@ -602,7 +762,13 @@ mod tests {
             smear_in_cmdline: true,
             vfx: None,
             scroll: Some((0.3, 1)),
-            windows: Some(0.15),
+            windows: Some(Windows {
+                slide: 0.15,
+                resize: 0.15,
+                open: 0.2,
+                close: 0.18,
+                switch: 0.2,
+            }),
             shadow: true,
             blink: false,
         }
@@ -619,7 +785,7 @@ mod tests {
     /// Apply a batch the way the client does: looked at before, applied, and
     /// looked at after.
     fn batch(a: &mut Animator, m: &mut Model, events: Vec<Event>, drawn: bool, now: Instant) {
-        let before = a.before(m, &events, true);
+        let before = a.before(m, &events, true, &[]);
         let mut changes = Changes::default();
         for e in events {
             m.apply(e, &mut changes);
@@ -693,16 +859,33 @@ mod tests {
         assert!(a.next_frame(&m, t0).is_none());
     }
 
-    /// A window the editor moves slides there; the cursor's jump travels.
+    /// A float the editor moves slides there, as Neovide's do; the cursor's
+    /// jump travels.
     #[test]
-    fn a_moved_window_slides_and_a_jumped_cursor_travels() {
+    fn a_moved_float_slides_and_a_jumped_cursor_travels() {
         let (mut a, mut m, t0) = (Animator::new(effects()), model(), Instant::now());
         setup(&mut a, &mut m, t0);
+        let float = |col| Event::WinFloatPos {
+            grid: 5,
+            win: Some(1005),
+            mouse: true,
+            zindex: 50,
+            compindex: 1,
+            row: 0,
+            col,
+        };
+        let size = Event::GridResize {
+            grid: 5,
+            width: 4,
+            height: 2,
+        };
+        batch(&mut a, &mut m, vec![size, float(0)], true, t0);
+        assert!(a.motions.is_empty(), "a float new is simply there");
         batch(
             &mut a,
             &mut m,
             vec![
-                window(2, 0, 15),
+                float(15),
                 Event::GridCursor {
                     grid: 2,
                     row: 5,
@@ -712,11 +895,11 @@ mod tests {
             true,
             t0,
         );
-        assert_eq!(a.origin(2, (0, 15)), (0, 0), "drawn where it was");
+        assert_eq!(a.origin(5, (0, 15)), (0, 0), "drawn where it was");
         assert!(a.smear.moving());
         assert_eq!(a.next_frame(&m, t0), Some(t0 + FRAME));
         a.advance(t0 + Duration::from_secs(1));
-        assert_eq!(a.origin(2, (0, 15)), (0, 15), "and arrived");
+        assert_eq!(a.origin(5, (0, 15)), (0, 15), "and arrived");
         assert!(!a.smear.moving());
     }
 
