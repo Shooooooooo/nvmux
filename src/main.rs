@@ -54,18 +54,26 @@ fn run(cli: &Cli) -> Result<()> {
     nested::check()?;
 
     let location = cli.location();
+    let remote = matches!(location, transport::Location::Ssh(_));
 
-    // Checked up front rather than surfacing later as an unexplained connection
-    // failure. This is the nvim used as the --remote-ui client; the remote one
-    // is checked by the SSH transport when it connects.
-    let local_nvim = nvim::check_local()?;
-    tracing::debug!(version = %local_nvim, "local nvim");
+    // The local nvim, checked up front rather than surfacing later as an
+    // unexplained connection failure. It runs every local session, and draws
+    // any session when Neovim's own client does — so the one run that does
+    // without it is `nvmux <host>` drawn by nvmux's own client, which only the
+    // config can tell, below. The remote nvim is checked by the SSH transport
+    // when it connects.
+    if !remote {
+        check_local_nvim()?;
+    }
 
     // Config is a local concern — the prefix machine and the picker both run
     // here — so it is established before any transport, `nvmux <host>`
     // included. On a genuine first run at an interactive terminal this asks for a
     // prefix and records it; otherwise it loads whatever exists (or the defaults).
     config::init(establish_settings()?);
+    if remote && config::get().client.ui == config::Ui::Nvim {
+        check_local_nvim()?;
+    }
 
     // The fade dissolves every screen into the terminal's own background, so
     // it has to know what colour that is — and only the terminal can say. After
@@ -86,6 +94,13 @@ fn run(cli: &Cli) -> Result<()> {
 
     let transport = transport::open(location.clone())?;
     session_loop(transport.as_ref())
+}
+
+/// The local `nvim`: on `$PATH`, and new enough.
+fn check_local_nvim() -> Result<()> {
+    let version = nvim::check_local()?;
+    tracing::debug!(%version, "local nvim");
+    Ok(())
 }
 
 /// Decide this run's settings, prompting once on a true first run.

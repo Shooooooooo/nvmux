@@ -91,7 +91,8 @@ pub fn parse_version(banner: &str) -> Option<Version> {
     })
 }
 
-/// Check the local `nvim`, the one used as the `--remote-ui` client.
+/// Check the local `nvim`: the one local sessions run, and Neovim's own
+/// client (`--remote-ui`).
 pub fn check_local() -> Result<Version, NvimError> {
     let out = Command::new("nvim")
         .arg("--version")
