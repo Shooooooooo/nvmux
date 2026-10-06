@@ -1864,7 +1864,7 @@ mod tests {
         /// The screen `ms` after the last batch.
         fn at(&mut self, ms: u64) -> String {
             self.anim.advance(self.now + Duration::from_millis(ms));
-            compose::compose(&self.model, &self.anim, false, W, self.height).text()
+            compose::compose(&self.model, &self.anim, W, self.height).text()
         }
 
         /// Everything moving landed, a while on.
@@ -1881,7 +1881,7 @@ mod tests {
         /// batch: the red of its colour.
         fn red(&mut self, ms: u64, row: usize, col: usize) -> u8 {
             self.anim.advance(self.now + Duration::from_millis(ms));
-            let f = compose::compose(&self.model, &self.anim, false, W, self.height);
+            let f = compose::compose(&self.model, &self.anim, W, self.height);
             let cell = f.get(row, col).expect("a cell");
             self.model.colors().visual_fg(&cell.style).0
         }
@@ -2129,10 +2129,10 @@ mod tests {
             ..Options::default()
         });
         s.batch(vsplit_right());
-        let mut frame = compose::compose(&s.model, &s.anim, false, W, H);
+        let mut frame = compose::compose(&s.model, &s.anim, W, H);
         assert!(!s.anim.paint(&mut frame, &s.model, s.now).visible);
         s.settle();
-        let mut frame = compose::compose(&s.model, &s.anim, false, W, H);
+        let mut frame = compose::compose(&s.model, &s.anim, W, H);
         let cursor = s.anim.paint(&mut frame, &s.model, s.now);
         assert!(cursor.visible);
         assert_eq!((cursor.row, cursor.col), (0, 11));
@@ -2164,7 +2164,7 @@ mod tests {
         assert_eq!(s.anim.switches.len(), 1);
         let fg = |s: &mut Scene, ms: u64| {
             s.anim.advance(s.now + Duration::from_millis(ms));
-            let f = compose::compose(&s.model, &s.anim, false, W, H);
+            let f = compose::compose(&s.model, &s.anim, W, H);
             let cell = f.get(0, 0).expect("a cell").clone();
             (cell.text, s.model.colors().visual_fg(&cell.style))
         };

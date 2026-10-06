@@ -4,8 +4,7 @@
 //! `ext_multigrid` off everything else too — then each window in the layout at
 //! its place, then the floats and the message area over them in the order
 //! Neovim composes them (`zindex`, then `compindex`), mixed with what is under
-//! them where their highlight blends. A float casts a shadow onto what is under
-//! it before it is drawn, where `[effects.shadow]` says so.
+//! them where their highlight blends.
 //!
 //! Where a grid is drawn is where an animation says it is this frame
 //! ([`View::origin`]), and a window in the middle of scrolling shows the lines
@@ -151,18 +150,8 @@ impl View for Still {
     }
 }
 
-/// How much of a cell's colour a float's shadow keeps: it falls a little
-/// under half way to black.
-const SHADOW_KEEP: u8 = 55;
-
 /// Put the frame together. See the module docs.
-pub fn compose(
-    model: &Model,
-    view: &dyn View,
-    shadows: bool,
-    width: usize,
-    height: usize,
-) -> Frame {
+pub fn compose(model: &Model, view: &dyn View, width: usize, height: usize) -> Frame {
     let mut frame = Frame::new(width, height, model.style(0));
     draw(&mut frame, model, view, 1, (0, 0), None, false);
 
@@ -206,12 +195,7 @@ pub fn compose(
     for (_, grid, p) in layers {
         let at = view.origin(grid, p.origin());
         match &p.place {
-            Place::Float { .. } => {
-                if shadows {
-                    shadow(&mut frame, model, grid, at);
-                }
-                draw(&mut frame, model, view, grid, at, None, true);
-            }
+            Place::Float { .. } => draw(&mut frame, model, view, grid, at, None, true),
             Place::Message { scrolled, sep, .. } => {
                 // The message area covers the screen from its row down, and
                 // no further whatever its grid's height.
@@ -331,41 +315,6 @@ fn separator(frame: &mut Frame, model: &Model, row: i64, sep: &str) {
     }
 }
 
-/// A float's shadow: the column to its right and the row under it, one cell
-/// down and along, darkened — less so for a float that lets what is under it
-/// through.
-fn shadow(frame: &mut Frame, model: &Model, grid: u64, at: (i64, i64)) {
-    let Some(g) = model.grids.get(&grid) else {
-        return;
-    };
-    let (h, w) = (g.height() as i64, g.width() as i64);
-    if h == 0 || w == 0 {
-        return;
-    }
-    let blend = g.cell(0, 0).map_or(0, |c| model.blend(c.hl));
-    if blend >= 100 {
-        return;
-    }
-    // The float's own see-through-ness thins its shadow: a float at blend 50
-    // casts half of one.
-    let darkening = u32::from(100 - SHADOW_KEEP) * u32::from(100 - blend) / 100;
-    let keep = 100 - darkening as u8;
-    let colors = model.colors();
-    let cells = (1..=h)
-        .map(|r| (at.0 + r, at.1 + w))
-        .chain((1..w).map(|c| (at.0 + h, at.1 + c)));
-    for (y, x) in cells {
-        if let Some(cell) = frame.at(y, x) {
-            darken(&colors, &mut cell.style, keep);
-        }
-    }
-}
-
-/// A style moved towards black, keeping `keep` percent of its colours.
-pub fn darken(colors: &style::Colors, s: &mut Style, keep: u8) {
-    fade_to(colors, s, Rgb(0, 0, 0), keep);
-}
-
 /// A style moved towards `to`, keeping `keep` percent of its colours: at 0,
 /// text and all are `to`.
 pub fn fade_to(colors: &style::Colors, s: &mut Style, to: Rgb, keep: u8) {
@@ -465,7 +414,7 @@ mod tests {
             line(4, 0, "FF", 0),
             float(4, 1, 2, 50),
         ]);
-        let f = compose(&m, &Still, false, 6, 3);
+        let f = compose(&m, &Still, 6, 3);
         assert_eq!(f.text(), "aaaaaa\nbbFFbb\nstatus");
     }
 
@@ -481,7 +430,7 @@ mod tests {
             line(5, 0, "lowe", 0),
             float(5, 0, 0, 50),
         ]);
-        assert_eq!(compose(&m, &Still, false, 4, 1).text(), "hiwe");
+        assert_eq!(compose(&m, &Still, 4, 1).text(), "hiwe");
     }
 
     /// A hidden window is not drawn; a message area that scrolled up draws
@@ -514,10 +463,7 @@ mod tests {
                 compindex: 1,
             },
         ]);
-        assert_eq!(
-            compose(&m, &Still, false, 3, 4).text(),
-            "   \n---\nm1 \nm2 "
-        );
+        assert_eq!(compose(&m, &Still, 3, 4).text(), "   \n---\nm1 \nm2 ");
     }
 
     /// A blank cell of a blended float lets the text under it show; a
@@ -540,7 +486,7 @@ mod tests {
             line(4, 0, " X ", 1),
             float(4, 0, 0, 50),
         ]);
-        let f = compose(&m, &Still, false, 3, 1);
+        let f = compose(&m, &Still, 3, 1);
         assert_eq!(f.text(), "aXc");
         // Half way between the terminal's black and the float's blue.
         assert_eq!(f.cells[0].style.bg, Color::Rgb(Rgb(0, 0, 127)));
@@ -578,35 +524,9 @@ mod tests {
             line(4, 0, "F", 0),
             float(4, 0, 1, 50),
         ]);
-        let f = compose(&m, &Still, false, 4, 1);
+        let f = compose(&m, &Still, 4, 1);
         assert_eq!(f.text(), " Fxx");
         assert!(!f.cells[0].wide);
-    }
-
-    /// The shadow falls to the right of a float and under it, offset by a
-    /// cell, and only there.
-    #[test]
-    fn a_float_casts_its_shadow_down_and_to_the_right() {
-        let m = model(vec![
-            Event::DefaultColors(crate::client::style::DefaultColors {
-                rgb_fg: Some(0xffffff),
-                rgb_bg: Some(0x646464),
-                ..Default::default()
-            }),
-            resize(1, 4, 3),
-            resize(4, 2, 1),
-            line(4, 0, "ab", 0),
-            float(4, 0, 0, 50),
-        ]);
-        let f = compose(&m, &Still, true, 4, 3);
-        let dark =
-            |r: usize, c: usize| f.get(r, c).unwrap().style.bg != Color::Rgb(Rgb(100, 100, 100));
-        assert!(!dark(0, 0) && !dark(0, 1), "the float itself");
-        assert!(!dark(0, 2), "the float's own row");
-        assert!(dark(1, 2), "the column to its right, a row down");
-        assert!(dark(1, 1), "the row under it, a column along");
-        assert!(!dark(1, 0), "but not under its first column");
-        assert!(!dark(2, 2) && !dark(1, 3));
     }
 
     /// What grid 1 has under a window is never seen, not even when the
@@ -636,8 +556,8 @@ mod tests {
                 height: 1,
             },
         ]);
-        assert_eq!(compose(&m, &Still, false, 4, 1).text(), "wwld");
-        assert_eq!(compose(&m, &Away, false, 4, 1).text(), "  ww");
+        assert_eq!(compose(&m, &Still, 4, 1).text(), "wwld");
+        assert_eq!(compose(&m, &Away, 4, 1).text(), "  ww");
     }
 
     /// Where an animation says a grid is this frame is where it is drawn.
@@ -662,6 +582,6 @@ mod tests {
             line(4, 0, "F", 0),
             float(4, 0, 0, 50),
         ]);
-        assert_eq!(compose(&m, &Shifted, false, 3, 1).text(), " F ");
+        assert_eq!(compose(&m, &Shifted, 3, 1).text(), " F ");
     }
 }

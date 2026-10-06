@@ -43,8 +43,8 @@ use crate::error::ConfigError;
 /// `[effects.back]`, `[effects.attach]`, `[effects.kill]`,
 /// `[effects.filter]` and `[effects.create]` for nvmux's own screens, and
 /// `[effects.smear]`, `[effects.particles]`, `[effects.scroll]`,
-/// `[effects.windows]`, `[effects.shadow]` and `[effects.blink]` for nvmux's
-/// own client (`[client] ui = "nvmux"`, see [`crate::client`]).
+/// `[effects.windows]` and `[effects.blink]` for nvmux's own client
+/// (`[client] ui = "nvmux"`, see [`crate::client`]).
 ///
 /// Not `Copy`: `[session] command` owns a `String`. Nothing reads it by value —
 /// [`get`] hands out a `&'static Settings` — so this costs nothing. Not `Eq`
@@ -96,7 +96,7 @@ pub struct ClientSettings {
     /// ([`crate::client`]), which draws the editor itself and so can animate
     /// it as Neovide does — the cursor travelling, the scroll, windows moving
     /// — under `[effects.smear]`, `[effects.particles]`, `[effects.scroll]`,
-    /// `[effects.windows]`, `[effects.shadow]` and `[effects.blink]`.
+    /// `[effects.windows]` and `[effects.blink]`.
     pub ui: Ui,
     /// Keep one client per session rather than one in all.
     ///
@@ -187,8 +187,7 @@ pub enum Ui {
 /// `[effects.back]`, `[effects.attach]`, `[effects.kill]`,
 /// `[effects.filter]` and `[effects.create]`, and for nvmux's own client
 /// `[effects.smear]`, `[effects.particles]`, `[effects.scroll]`,
-/// `[effects.windows]`, `[effects.shadow]` and `[effects.blink]` — with its own
-/// `enabled`. An effect runs only when both are on, which is what the
+/// `[effects.windows]` and `[effects.blink]` — with its own `enabled`. An effect runs only when both are on, which is what the
 /// `*_enabled` methods answer, so nothing reads one switch without the other.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -209,7 +208,6 @@ pub struct EffectsSettings {
     pub particles: ParticleSettings,
     pub scroll: ScrollSettings,
     pub windows: WindowsSettings,
-    pub shadow: ShadowSettings,
     pub blink: BlinkSettings,
 }
 
@@ -292,11 +290,6 @@ impl EffectsSettings {
     /// the master one.
     pub fn windows_enabled(&self) -> bool {
         self.enabled && self.windows.enabled
-    }
-
-    /// Whether floats cast a shadow: its own switch and the master one.
-    pub fn shadow_enabled(&self) -> bool {
-        self.enabled && self.shadow.enabled
     }
 
     /// Whether a blinking cursor fades in and out: its own switch and the
@@ -436,16 +429,6 @@ pub struct WindowsSettings {
     /// How long a window showing another buffer takes to fade from one to
     /// the other: its `fade.duration`.
     pub switch_ms: u64,
-}
-
-/// nvmux's own client: floats casting a shadow on what is under them, down
-/// and to the right — Neovide's `floating_shadow` (see
-/// [`crate::client::compose`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ShadowSettings {
-    /// This effect's own switch, under `[effects] enabled`.
-    pub enabled: bool,
 }
 
 /// nvmux's own client: a blinking cursor fading out and back in rather than
@@ -636,7 +619,6 @@ impl Default for EffectsSettings {
             particles: ParticleSettings::default(),
             scroll: ScrollSettings::default(),
             windows: WindowsSettings::default(),
-            shadow: ShadowSettings::default(),
             blink: BlinkSettings::default(),
         }
     }
@@ -691,12 +673,6 @@ impl Default for WindowsSettings {
             close_ms: 180,
             switch_ms: 200,
         }
-    }
-}
-
-impl Default for ShadowSettings {
-    fn default() -> Self {
-        Self { enabled: true }
     }
 }
 
@@ -1220,10 +1196,6 @@ fn render_default_config(prefix: u8) -> String {
          # close_ms    = {windows_close}\n\
          # switch_ms   = {windows_switch}\n\
          \n\
-         [effects.shadow]\n\
-         # nvmux's own client: floats cast a shadow down and to the right.\n\
-         # enabled = {shadow_enabled}\n\
-         \n\
          [effects.blink]\n\
          # nvmux's own client: a blinking block cursor fades out and back in.\n\
          # enabled = {blink_enabled}\n",
@@ -1269,7 +1241,6 @@ fn render_default_config(prefix: u8) -> String {
         windows_open = e.windows.open_ms,
         windows_close = e.windows.close_ms,
         windows_switch = e.windows.switch_ms,
-        shadow_enabled = e.shadow.enabled,
         blink_enabled = e.blink.enabled,
     )
 }
@@ -1360,7 +1331,6 @@ mod tests {
             "[effects.particles]",
             "[effects.scroll]",
             "[effects.windows]",
-            "[effects.shadow]",
             "[effects.blink]",
         ] {
             assert!(doc.contains(table), "the README has no {table}");
@@ -1425,8 +1395,6 @@ mod tests {
             open_ms = 200\n\
             close_ms = 180\n\
             switch_ms = 200\n\
-            [effects.shadow]\n\
-            enabled = true\n\
             [effects.blink]\n\
             enabled = false\n";
         let s: Settings = toml::from_str(doc).expect("valid");
@@ -1495,7 +1463,6 @@ mod tests {
         assert!(!s.effects.smear_enabled());
         assert!(!s.effects.scroll_enabled());
         assert!(!s.effects.windows_enabled());
-        assert!(!s.effects.shadow_enabled());
         assert!(!s.effects.particles_enabled() && !s.effects.blink_enabled());
         assert!(s.effects.smear.enabled && s.effects.scroll.enabled);
         assert!(s.effects.fade.enabled && s.effects.moving.enabled);
@@ -1590,13 +1557,11 @@ mod tests {
     }
 
     /// Neovide's defaults where it has the same setting: the cursor, the
-    /// scroll, the windows and the shadow on, the particles and the smooth
-    /// blink off.
+    /// scroll and the windows on, the particles and the smooth blink off.
     #[test]
     fn the_clients_effects_start_as_neovides() {
         let e = Settings::default().effects;
         assert!(e.smear_enabled() && e.scroll_enabled() && e.windows_enabled());
-        assert!(e.shadow_enabled());
         assert!(!e.particles_enabled() && !e.blink_enabled());
         assert_eq!(e.smear.duration_ms, 150);
         assert_eq!(e.scroll.duration_ms, 300);
@@ -1712,7 +1677,6 @@ mod tests {
                 "an unknown windows key",
                 "[effects.windows]\nenable = true\n",
             ),
-            ("an unknown shadow key", "[effects.shadow]\nblur = true\n"),
             ("an unknown blink key", "[effects.blink]\nsmooth = true\n"),
         ] {
             assert!(
@@ -1882,7 +1846,6 @@ mod tests {
             "[effects.particles]",
             "[effects.scroll]",
             "[effects.windows]",
-            "[effects.shadow]",
             "[effects.blink]",
         ] {
             assert!(
@@ -1892,7 +1855,7 @@ mod tests {
         }
         assert_eq!(
             rendered.matches("\n# enabled = true\n").count(),
-            9,
+            8,
             "the master switch and each one-line effect's on by default: {rendered:?}"
         );
         assert_eq!(

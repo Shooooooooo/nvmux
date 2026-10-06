@@ -142,7 +142,7 @@ as a grid of character cells allows:
 - a scroll slides the text through its window a row at a time;
 - a float, the message area, or windows rearranged (`<C-w>x`, `<C-w>r`,
   `<C-w>H` …) slide to where they move to;
-- floats cast a shadow, and a blinking block cursor can fade rather than flash.
+- a blinking block cursor can fade rather than flash.
 
 Split windows move the way
 [animate.nvim](https://github.com/Shooooooooo/animate.nvim)'s window module
@@ -241,9 +241,6 @@ resize_ms   = 150    # a split changing size (animate.nvim, as are the rest; 0 i
 open_ms     = 200    # a new split flying in from its side
 close_ms    = 180    # a closed one flying out into its side
 switch_ms   = 200    # a window that shows another buffer fading from one to the other
-
-[effects.shadow]
-enabled = true   # floats cast a shadow down and to the right
 
 [effects.blink]
 enabled = false   # a blinking block cursor fades out and back in

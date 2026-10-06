@@ -19,13 +19,12 @@
 //!   redrawing it in place ([`anim::scroll`]);
 //! - a float, the message area or windows rearranged slide to where they are
 //!   going ([`anim::motion`]);
+//! - a blinking cursor fades in and out ([`anim::blink`]);
 //! - and, from animate.nvim rather than Neovide, a split window opening flies
 //!   in from its side as its text fades in, one closing flies back into its
 //!   side as its text dims away, one changing size moves its edges there
 //!   ([`anim::layout`]), and one showing another buffer fades from one to the
-//!   other ([`anim::switch`]);
-//! - a blinking cursor fades in and out ([`anim::blink`]);
-//! - and a float casts a shadow on what is under it ([`compose`]).
+//!   other ([`anim::switch`]).
 //!
 //! What a terminal cannot do is not imitated: no blur behind floats, no
 //! movement finer than a cell for text, no fonts, no transparency of its own.
@@ -55,8 +54,8 @@
 //! attached before it attaches, and again whenever that changes (Neovim says
 //! each of the editor-wide `ext_*` options again when it does), and while such
 //! a UI is there it is attached without `ext_multigrid`: everything is on grid
-//! 1, and what is lost is what needs windows of their own — their moving, and
-//! the shadows. An nvmux client says in its client info that it wants
+//! 1, and what is lost is what needs windows of their own: their moving. An
+//! nvmux client says in its client info that it wants
 //! `ext_multigrid`, so that one only passing through grid 1 does not send the
 //! rest there with it.
 //!
@@ -1143,8 +1142,7 @@ impl App {
     pub fn frame(&mut self, now: Instant) -> Vec<u8> {
         self.anim.advance(now);
         let (w, h) = self.size;
-        let shadows = self.multigrid() && self.anim.shadows();
-        let mut frame = compose::compose(&self.model, &self.anim, shadows, w, h);
+        let mut frame = compose::compose(&self.model, &self.anim, w, h);
         let cursor = self.anim.paint(&mut frame, &self.model, now);
         frame.mend();
         let sync = self.model.options.termsync;
@@ -1741,7 +1739,7 @@ mod tests {
         );
         assert!(a.due(t0));
         assert!(!a.take_refresh(), "nothing lacking now");
-        let f = compose::compose(&a.model, &a.anim, false, 20, 6);
+        let f = compose::compose(&a.model, &a.anim, 20, 6);
         let text = f.text();
         let rows: Vec<&str> = text.lines().take(2).collect();
         assert_eq!(rows, ["bar        right    ", "left                "]);

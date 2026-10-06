@@ -57,7 +57,6 @@ pub struct Effects {
     /// Seconds to settle, and the rows of a long jump animated.
     pub scroll: Option<(f32, usize)>,
     pub windows: Option<Windows>,
-    pub shadow: bool,
     pub blink: bool,
 }
 
@@ -85,15 +84,14 @@ impl Effects {
             vfx: None,
             scroll: None,
             windows: None,
-            shadow: false,
             blink: false,
         }
     }
 
     /// Whether any of them needs windows on grids of their own: a window
-    /// moving, a float's shadow, a scroll told apart by window.
+    /// moving, a scroll told apart by window.
     pub fn want_multigrid(&self) -> bool {
-        self.windows.is_some() || self.shadow || self.scroll.is_some()
+        self.windows.is_some() || self.scroll.is_some()
     }
 
     pub fn from_settings(s: &crate::config::Settings) -> Self {
@@ -125,7 +123,6 @@ impl Effects {
                 close: secs(e.windows.close_ms),
                 switch: secs(e.windows.switch_ms),
             }),
-            shadow: e.shadow_enabled(),
             blink: e.blink_enabled(),
         }
     }
@@ -205,10 +202,6 @@ impl Animator {
         self.transition = None;
         self.switches.clear();
         self.cell = None;
-    }
-
-    pub fn shadows(&self) -> bool {
-        self.effects.shadow
     }
 
     /// Whether the windows' animations want to know what the client's agent
@@ -769,7 +762,6 @@ mod tests {
                 close: 0.18,
                 switch: 0.2,
             }),
-            shadow: true,
             blink: false,
         }
     }
@@ -929,13 +921,13 @@ mod tests {
             scroll_delta: 3,
         });
         batch(&mut a, &mut m, events, true, t0);
-        let frame = compose::compose(&m, &a, false, 30, 12);
+        let frame = compose::compose(&m, &a, 30, 12);
         assert_eq!(
             frame.get(0, 0).map(|c| c.text.clone()),
             Some(Text::Char('0'))
         );
         a.advance(t0 + Duration::from_secs(1));
-        let frame = compose::compose(&m, &a, false, 30, 12);
+        let frame = compose::compose(&m, &a, 30, 12);
         assert_eq!(
             frame.get(0, 0).map(|c| c.text.clone()),
             Some(Text::Char('3'))
@@ -959,12 +951,12 @@ mod tests {
             true,
             t0,
         );
-        let mut frame = compose::compose(&m, &a, false, 30, 12);
+        let mut frame = compose::compose(&m, &a, 30, 12);
         a.advance(t0 + Duration::from_millis(30));
         let cursor = a.paint(&mut frame, &m, t0);
         assert!(!cursor.visible);
         a.advance(t0 + Duration::from_secs(1));
-        let mut frame = compose::compose(&m, &a, false, 30, 12);
+        let mut frame = compose::compose(&m, &a, 30, 12);
         let cursor = a.paint(&mut frame, &m, t0);
         assert!(cursor.visible);
         assert_eq!((cursor.row, cursor.col, cursor.shape), (5, 5, 2));
