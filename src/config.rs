@@ -629,7 +629,7 @@ impl Default for EffectsSettings {
 impl Default for SmearSettings {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             duration_ms: 100,
             short_ms: 40,
             trail: 0.4,
@@ -1370,7 +1370,7 @@ mod tests {
             [effects.create]\n\
             enabled = true\n\
             [effects.smear]\n\
-            enabled = true\n\
+            enabled = false\n\
             duration_ms = 100\n\
             short_ms = 40\n\
             trail = 0.4\n\
@@ -1464,7 +1464,7 @@ mod tests {
         assert!(!s.effects.scroll_enabled());
         assert!(!s.effects.windows_enabled());
         assert!(!s.effects.particles_enabled() && !s.effects.blink_enabled());
-        assert!(s.effects.smear.enabled && s.effects.scroll.enabled);
+        assert!(s.effects.scroll.enabled && s.effects.windows.enabled);
         assert!(s.effects.fade.enabled && s.effects.moving.enabled);
         assert!(s.effects.cursor.enabled && s.effects.back.enabled);
         assert!(s.effects.attach.enabled);
@@ -1556,15 +1556,15 @@ mod tests {
         assert!(s.client.per_session && s.client.lazy, "the rest as it was");
     }
 
-    /// Neovide's defaults where it has the same setting: the cursor, the
-    /// scroll and the windows on, the particles and the smooth blink off —
-    /// but for the cursor's travel, quicker and with a shorter trail that
-    /// fades out to nothing, so that it is felt more than seen.
+    /// Neovide's defaults where it has the same setting: the scroll and the
+    /// windows on, the particles and the smooth blink off — but for the
+    /// cursor's travel, off unless turned on, and then quicker than
+    /// Neovide's, with a shorter trail that fades out to nothing.
     #[test]
     fn the_clients_effects_start_as_neovides() {
         let e = Settings::default().effects;
-        assert!(e.smear_enabled() && e.scroll_enabled() && e.windows_enabled());
-        assert!(!e.particles_enabled() && !e.blink_enabled());
+        assert!(e.scroll_enabled() && e.windows_enabled());
+        assert!(!e.smear_enabled() && !e.particles_enabled() && !e.blink_enabled());
         assert_eq!(e.smear.duration_ms, 100);
         assert_eq!(e.smear.trail, 0.4);
         assert_eq!(e.smear.gradient, 1.0);

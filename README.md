@@ -135,7 +135,8 @@ as a grid of character cells allows:
 
 - the cursor travels between cells, its leading edge ahead of its trailing one,
   so a long jump smears across the screen — drawn in block elements, at a
-  quarter of a cell or finer, and fading towards its tail;
+  quarter of a cell or finer, and fading towards its tail (off unless turned
+  on);
 - sparks, rings or an outline off the cursor as it moves (Neovide's `railgun`,
   `torpedo`, `pixiedust`, `sonicboom`, `ripple` and `wireframe`; off unless
   turned on);
@@ -213,7 +214,7 @@ enabled = true   # c opens a gap where the new session goes, then the prompt
 # The rest are for the animated client, [client] ui = "nvmux".
 
 [effects.smear]
-enabled     = true   # the cursor travels between cells rather than jumping
+enabled     = false  # the cursor travels between cells rather than jumping
 duration_ms = 100    # how long a move takes to settle
 short_ms    = 40     # a move of a cell or two along a line — typing — and no trail
 trail       = 0.4    # 0: the edges move together; 1: the leading one is there at once
