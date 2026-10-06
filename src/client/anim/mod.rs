@@ -85,6 +85,7 @@ impl Effects {
                 duration: secs(e.smear.duration_ms),
                 short: secs(e.smear.short_ms),
                 trail: e.smear.trail as f32,
+                gradient: e.smear.gradient as f32,
             }),
             smear_in_insert: e.smear.insert,
             smear_in_cmdline: e.smear.cmdline,
@@ -403,8 +404,8 @@ impl Animator {
         if !cursor.visible {
             return cursor;
         }
-        if self.smear.moving() {
-            self.smear.paint(frame, &colors, color, text);
+        if let (true, Some(s)) = (self.smear.moving(), self.effects.smear) {
+            self.smear.paint(frame, &colors, color, text, &s);
             cursor.visible = false;
         } else if let Some(mode) = model
             .mode_info()
@@ -595,6 +596,7 @@ mod tests {
                 duration: 0.15,
                 short: 0.04,
                 trail: 0.8,
+                gradient: 0.9,
             }),
             smear_in_insert: true,
             smear_in_cmdline: true,

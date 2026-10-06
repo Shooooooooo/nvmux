@@ -10,7 +10,8 @@
 //!
 //! - the cursor travels between cells instead of jumping, its leading edge
 //!   ahead of its trailing one, so a long jump leaves a smear behind it, drawn
-//!   in block elements at a quarter of a cell or finer ([`anim::smear`]);
+//!   in block elements at a quarter of a cell or finer and fading towards its
+//!   tail ([`anim::smear`]);
 //! - sparks, rings and outlines off the cursor as it moves — Neovide's
 //!   `railgun`, `torpedo`, `pixiedust`, `sonicboom`, `ripple` and `wireframe`
 //!   ([`anim::vfx`]);

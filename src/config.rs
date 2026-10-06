@@ -326,6 +326,12 @@ pub struct SmearSettings {
     /// `cursor_trail_size`.
     #[serde(deserialize_with = "de_number")]
     pub trail: f64,
+    /// How much the cursor's colour fades along the trail towards its end,
+    /// into the colours of what it passes over: 0 not at all, the one colour
+    /// all along as Neovide draws it, and 1 to nothing of the cursor's at the
+    /// trail's very end.
+    #[serde(deserialize_with = "de_number")]
+    pub gradient: f64,
     /// Whether it travels in insert mode too: Neovide's
     /// `cursor_animate_in_insert_mode`.
     pub insert: bool,
@@ -631,6 +637,7 @@ impl Default for SmearSettings {
             duration_ms: 150,
             short_ms: 40,
             trail: 0.8,
+            gradient: 0.9,
             insert: true,
             cmdline: true,
         }
@@ -893,6 +900,7 @@ impl Settings {
         }
         for (key, value) in [
             ("effects.smear.trail", e.smear.trail),
+            ("effects.smear.gradient", e.smear.gradient),
             ("effects.particles.opacity", e.particles.opacity),
         ] {
             if !(0.0..=1.0).contains(&value) {
@@ -1152,6 +1160,9 @@ fn render_default_config(prefix: u8) -> String {
          # duration_ms = {smear_duration}\n\
          # short_ms    = {smear_short}\n\
          # trail       = {smear_trail:?}\n\
+         # The cursor's colour fades along the trail towards its end: 0 not\n\
+         # at all, 1 to nothing at the very end.\n\
+         # gradient    = {smear_gradient:?}\n\
          # insert      = {smear_insert}\n\
          # cmdline     = {smear_cmdline}\n\
          \n\
@@ -1207,6 +1218,7 @@ fn render_default_config(prefix: u8) -> String {
         smear_duration = e.smear.duration_ms,
         smear_short = e.smear.short_ms,
         smear_trail = e.smear.trail,
+        smear_gradient = e.smear.gradient,
         smear_insert = e.smear.insert,
         smear_cmdline = e.smear.cmdline,
         particles_enabled = e.particles.enabled,
@@ -1355,6 +1367,7 @@ mod tests {
             duration_ms = 150\n\
             short_ms = 40\n\
             trail = 0.8\n\
+            gradient = 0.9\n\
             insert = true\n\
             cmdline = true\n\
             [effects.particles]\n\
@@ -1699,6 +1712,11 @@ mod tests {
             ),
             ("[effects.smear]\ntrail = 1.5\n", "effects.smear.trail"),
             ("[effects.smear]\ntrail = nan\n", "effects.smear.trail"),
+            ("[effects.smear]\ngradient = 2\n", "effects.smear.gradient"),
+            (
+                "[effects.smear]\ngradient = -0.5\n",
+                "effects.smear.gradient",
+            ),
             (
                 "[effects.particles]\nopacity = -0.1\n",
                 "effects.particles.opacity",
@@ -1736,6 +1754,8 @@ mod tests {
             "[effects.fade]\nduration_ms = 2000\n",
             "[effects.smear]\nshort_ms = 0\ntrail = 0\n",
             "[effects.smear]\ntrail = 1\n",
+            "[effects.smear]\ngradient = 0\n",
+            "[effects.smear]\ngradient = 1\n",
             "[effects.particles]\nopacity = 1\ndensity = 0\nspeed = 200\n",
             "[effects.scroll]\nfar_lines = 0\n",
         ] {
@@ -1834,6 +1854,7 @@ mod tests {
             "# duration_ms = 200",
             "# session     = true",
             "# trail       = 0.8",
+            "# gradient    = 0.9",
             "# mode        = \"railgun\"",
             "# density     = 2.0",
             "# far_lines   = 1",

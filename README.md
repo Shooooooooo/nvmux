@@ -135,7 +135,7 @@ as a grid of character cells allows:
 
 - the cursor travels between cells, its leading edge ahead of its trailing one,
   so a long jump smears across the screen — drawn in block elements, at a
-  quarter of a cell or finer;
+  quarter of a cell or finer, and fading towards its tail;
 - sparks, rings or an outline off the cursor as it moves (Neovide's `railgun`,
   `torpedo`, `pixiedust`, `sonicboom`, `ripple` and `wireframe`; off unless
   turned on);
@@ -208,6 +208,7 @@ enabled     = true   # the cursor travels between cells rather than jumping
 duration_ms = 150    # how long a move takes to settle
 short_ms    = 40     # a move of a cell or two along a line — typing — and no trail
 trail       = 0.8    # 0: the edges move together; 1: the leading one is there at once
+gradient    = 0.9    # how far its colour fades towards the trail's end; 0 is solid
 insert      = true   # travel in insert mode too
 cmdline     = true   # and to and along the command line
 
