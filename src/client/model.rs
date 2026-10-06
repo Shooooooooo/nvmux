@@ -277,26 +277,12 @@ impl Model {
         self.modes.get(self.mode)
     }
 
-    /// The message area's grid, if there is one.
-    pub fn message_grid(&self) -> Option<u64> {
-        self.layout
-            .iter()
-            .find(|(_, p)| matches!(p.place, Place::Message { .. }))
-            .map(|(g, _)| *g)
-    }
-
     /// Where the cursor is on the screen, as the editor has laid it out — no
     /// animation of a window's moving counted.
     pub fn cursor_on_screen(&self) -> (i64, i64) {
         let c = self.cursor;
         let (r, k) = self.layout.get(&c.grid).map_or((0, 0), Placement::origin);
         (r + c.row as i64, k + c.col as i64)
-    }
-
-    /// Whether the cursor is in the command line or the message area rather
-    /// than in a window.
-    pub fn cursor_in_messages(&self) -> bool {
-        self.mode_name.starts_with("cmdline") || self.message_grid() == Some(self.cursor.grid)
     }
 
     /// Take one event into the picture, noting in `changes` what an animation

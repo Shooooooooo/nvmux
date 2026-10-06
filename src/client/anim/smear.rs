@@ -3,7 +3,7 @@
 //! The cursor is a quadrilateral, its four corners each sprung towards the
 //! corner of the cell — or the bar, or the underline — it is going to. They
 //! do not move together. The two corners leading the way are quick and the
-//! two behind are slow (`[effects.smear] trail`), so the quadrilateral
+//! two behind are slow ([`Settings::trail`]), so the quadrilateral
 //! stretches out along the way it is going and catches itself up at the end:
 //! a short hop is a nudge, a long jump a smear across the screen. A move of a
 //! cell or two along a line — typing — takes the short time instead, and no
@@ -15,7 +15,7 @@
 //! the block element nearest the part. The terminal's own cursor is hidden for
 //! as long as that lasts, and put back in the cell the moment it is over.
 //!
-//! The colour fades along the way it is going (`[effects.smear] gradient`):
+//! The colour fades along the way it is going ([`Settings::gradient`]):
 //! the cursor's own at the head, and less of it the further back a cell is
 //! towards the end of the trail, mixed with the cell's own colours — so the
 //! smear thins into what it is passing over rather than ending in a hard

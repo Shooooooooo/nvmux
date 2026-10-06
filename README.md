@@ -214,34 +214,17 @@ enabled = true   # c opens a gap where the new session goes, then the prompt
 # The rest are for the animated client, [client] ui = "nvmux".
 
 [effects.smear]
-enabled     = false  # the cursor travels between cells rather than jumping
-duration_ms = 100    # how long a move takes to settle
-short_ms    = 40     # a move of a cell or two along a line — typing — and no trail
-trail       = 0.4    # 0: the edges move together; 1: the leading one is there at once
-gradient    = 1.0    # how far its colour fades towards the trail's end; 0 is solid
-insert      = true   # travel in insert mode too
-cmdline     = true   # and to and along the command line
+enabled = false   # the cursor travels between cells, smearing across a long jump
 
 [effects.particles]
-enabled     = false       # what flies off the cursor as it moves
-mode        = "railgun"   # railgun, torpedo, pixiedust, sonicboom, ripple, wireframe
-opacity     = 0.8         # how strongly a particle shows at its brightest
-lifetime_ms = 500
-density     = 2.0         # particles to a cell of the cursor's travel
-speed       = 6.0         # cells a second
+enabled = false       # what flies off the cursor as it moves
+mode    = "railgun"   # railgun, torpedo, pixiedust, sonicboom, ripple, wireframe
 
 [effects.scroll]
-enabled     = true   # a scroll slides the text through its window
-duration_ms = 300
-far_lines   = 1      # how much of a jump further than the window is tall slides
+enabled = true   # a scroll slides the text through its window
 
 [effects.windows]
-enabled     = true   # windows move rather than jump
-duration_ms = 150    # a float, the messages or windows rearranged slide there (Neovide)
-resize_ms   = 150    # a split changing size (animate.nvim, as are the rest; 0 is at once)
-open_ms     = 200    # a new split flying in from its side
-close_ms    = 180    # a closed one flying out into its side
-switch_ms   = 200    # a window that shows another buffer fading from one to the other
+enabled = true   # windows and floats move rather than jump
 
 [effects.blink]
 enabled = false   # a blinking block cursor fades out and back in

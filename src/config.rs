@@ -47,9 +47,8 @@ use crate::error::ConfigError;
 /// (`[client] ui = "nvmux"`, see [`crate::client`]).
 ///
 /// Not `Copy`: `[session] command` owns a `String`. Nothing reads it by value —
-/// [`get`] hands out a `&'static Settings` — so this costs nothing. Not `Eq`
-/// either: the client's effects take fractions, as Neovide's do.
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+/// [`get`] hands out a `&'static Settings` — so this costs nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub keys: KeySettings,
@@ -189,7 +188,7 @@ pub enum Ui {
 /// `[effects.smear]`, `[effects.particles]`, `[effects.scroll]`,
 /// `[effects.windows]` and `[effects.blink]` — with its own `enabled`. An effect runs only when both are on, which is what the
 /// `*_enabled` methods answer, so nothing reads one switch without the other.
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EffectsSettings {
     /// Master switch. Off, nothing animates, whatever the effects' own
@@ -299,60 +298,31 @@ impl EffectsSettings {
     }
 }
 
+// The client's effects are switches, and the particles' one choice of what
+// they are: how each looks and how long it takes is the client's own (see
+// `crate::client::anim`).
+
 /// nvmux's own client: the cursor travelling between cells rather than
 /// jumping, its leading edge ahead and its trailing edge behind, so that a
 /// long move smears across the screen — Neovide's animated cursor (see
 /// [`crate::client::anim::smear`]).
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SmearSettings {
-    /// This effect's own switch, under `[effects] enabled`. Off, the cursor
-    /// jumps, as the terminal's does.
+    /// This effect's own switch, under `[effects] enabled`. Off unless turned
+    /// on; off, the cursor jumps, as the terminal's does.
     pub enabled: bool,
-    /// How long a move takes to settle: Neovide's `cursor_animation_length`.
-    pub duration_ms: u64,
-    /// How long a move of a cell or two along a line takes — typing — with no
-    /// trail: Neovide's `cursor_short_animation_length`.
-    pub short_ms: u64,
-    /// How far behind the leading edge the trailing one is, from 0 — they
-    /// move together — to 1, the leading edge there at once: Neovide's
-    /// `cursor_trail_size`.
-    #[serde(deserialize_with = "de_number")]
-    pub trail: f64,
-    /// How much the cursor's colour fades along the trail towards its end,
-    /// into the colours of what it passes over: 0 not at all, the one colour
-    /// all along as Neovide draws it, and 1 to nothing of the cursor's at the
-    /// trail's very end.
-    #[serde(deserialize_with = "de_number")]
-    pub gradient: f64,
-    /// Whether it travels in insert mode too: Neovide's
-    /// `cursor_animate_in_insert_mode`.
-    pub insert: bool,
-    /// Whether it travels to and along the command line: Neovide's
-    /// `cursor_animate_command_line`.
-    pub cmdline: bool,
 }
 
 /// nvmux's own client: what flies off the cursor as it moves — Neovide's
 /// `cursor_vfx_mode` (see [`crate::client::anim::vfx`]).
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ParticleSettings {
     /// This effect's own switch, under `[effects] enabled`. Off by default,
     /// as Neovide's is.
     pub enabled: bool,
     pub mode: ParticleMode,
-    /// How strongly a particle shows at its brightest, 0 to 1.
-    #[serde(deserialize_with = "de_number")]
-    pub opacity: f64,
-    /// How long a particle lives.
-    pub lifetime_ms: u64,
-    /// How many particles a cell of the cursor's travel leaves.
-    #[serde(deserialize_with = "de_number")]
-    pub density: f64,
-    /// How fast a particle flies, in cells a second.
-    #[serde(deserialize_with = "de_number")]
-    pub speed: f64,
 }
 
 /// `[effects.particles] mode`, spelt as Neovide spells `cursor_vfx_mode`.
@@ -397,12 +367,6 @@ pub struct ScrollSettings {
     /// This effect's own switch, under `[effects] enabled`. Off, the text
     /// jumps to where it scrolled to.
     pub enabled: bool,
-    /// How long a scroll takes to settle: Neovide's
-    /// `scroll_animation_length`.
-    pub duration_ms: u64,
-    /// How many rows of a scroll further than the window is tall are
-    /// animated: Neovide's `scroll_animation_far_lines`.
-    pub far_lines: u64,
 }
 
 /// nvmux's own client: windows moving rather than jumping. A split window
@@ -417,18 +381,6 @@ pub struct ScrollSettings {
 pub struct WindowsSettings {
     /// This effect's own switch, under `[effects] enabled`.
     pub enabled: bool,
-    /// How long Neovide's slide takes to settle.
-    pub duration_ms: u64,
-    /// How long a split window takes to change size: animate.nvim's
-    /// `resize.duration`. 0 changes it at once.
-    pub resize_ms: u64,
-    /// How long a new split takes to fly in: its `open.duration`.
-    pub open_ms: u64,
-    /// How long a closed one takes to fly out: its `close.duration`.
-    pub close_ms: u64,
-    /// How long a window showing another buffer takes to fade from one to
-    /// the other: its `fade.duration`.
-    pub switch_ms: u64,
 }
 
 /// nvmux's own client: a blinking cursor fading out and back in rather than
@@ -624,55 +576,27 @@ impl Default for EffectsSettings {
     }
 }
 
-// Neovide's own defaults, where it has the same setting.
-
-impl Default for SmearSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            duration_ms: 100,
-            short_ms: 40,
-            trail: 0.4,
-            gradient: 1.0,
-            insert: true,
-            cmdline: true,
-        }
-    }
-}
+// On or off as Neovide has them, where it has the same effect — but for the
+// cursor's travel, off unless turned on (`SmearSettings` derives its off).
 
 impl Default for ParticleSettings {
     fn default() -> Self {
         Self {
             enabled: false,
             mode: ParticleMode::Railgun,
-            opacity: 0.8,
-            lifetime_ms: 500,
-            density: 2.0,
-            speed: 6.0,
         }
     }
 }
 
 impl Default for ScrollSettings {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            duration_ms: 300,
-            far_lines: 1,
-        }
+        Self { enabled: true }
     }
 }
 
 impl Default for WindowsSettings {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            duration_ms: 150,
-            resize_ms: 150,
-            open_ms: 200,
-            close_ms: 180,
-            switch_ms: 200,
-        }
+        Self { enabled: true }
     }
 }
 
@@ -789,24 +713,6 @@ impl Default for FadeSettings {
     }
 }
 
-/// A number that may be written whole: `speed = 6` as readily as `6.0`, since
-/// TOML tells the two apart and a person writing one does not.
-fn de_number<'de, D>(deserializer: D) -> Result<f64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Number {
-        Float(f64),
-        Int(i64),
-    }
-    Ok(match Number::deserialize(deserializer)? {
-        Number::Float(f) => f,
-        Number::Int(n) => n as f64,
-    })
-}
-
 /// The prefix comes in as a human string; delegate to the one parser so the file
 /// and any other caller agree, and fold its message into serde's error (which
 /// TOML then reports with the offending span).
@@ -824,24 +730,8 @@ const MAX_TIMEOUT_MS: u64 = 60_000;
 
 /// Ceiling for `effects.fade.duration_ms`. Two seconds is already a transition nobody
 /// wants to sit through, and a switch sits through two of them — the screens
-/// and the notice; past it the value is a hang with a name. The same ceiling
-/// holds the client's animations: a cursor still arriving two seconds after
-/// the key that moved it has stopped being a cursor.
+/// and the notice; past it the value is a hang with a name.
 const MAX_FADE_MS: u64 = 2_000;
-
-/// Ceiling for `effects.particles.lifetime_ms`: a particle that outlives a few
-/// seconds is no longer anything to do with the move that made it.
-const MAX_LIFETIME_MS: u64 = 5_000;
-
-/// Ceiling for `effects.particles.density`, particles to a cell of travel;
-/// the client draws no more than a few hundred at once whatever this says.
-const MAX_DENSITY: f64 = 50.0;
-
-/// Ceiling for `effects.particles.speed`, in cells a second.
-const MAX_SPEED: f64 = 200.0;
-
-/// Ceiling for `effects.scroll.far_lines`: no window is taller.
-const MAX_FAR_LINES: u64 = 1_000;
 
 impl Settings {
     /// Rules that the deserializer cannot express. Kept minimal: only values that
@@ -868,69 +758,6 @@ impl Settings {
             // It feeds a `sleep`, on every screen a switch dissolves.
             return Err(format!(
                 "effects.fade.duration_ms must be at most {MAX_FADE_MS}"
-            ));
-        }
-        let e = &self.effects;
-        // Each feeds a spring's settling time, on every frame of nvmux's own
-        // client: no length is `enabled = false` spelt as a number, and past
-        // the fade's ceiling an animation is a wait.
-        for (key, ms) in [
-            ("effects.smear.duration_ms", e.smear.duration_ms),
-            ("effects.scroll.duration_ms", e.scroll.duration_ms),
-            ("effects.windows.duration_ms", e.windows.duration_ms),
-        ] {
-            if ms == 0 {
-                return Err(format!("{key} must be at least 1"));
-            }
-            if ms > MAX_FADE_MS {
-                return Err(format!("{key} must be at most {MAX_FADE_MS}"));
-            }
-        }
-        // Nought is allowed for these: a cell along a line taken at once, and
-        // a window that changes at once.
-        for (key, ms) in [
-            ("effects.smear.short_ms", e.smear.short_ms),
-            ("effects.windows.resize_ms", e.windows.resize_ms),
-            ("effects.windows.open_ms", e.windows.open_ms),
-            ("effects.windows.close_ms", e.windows.close_ms),
-            ("effects.windows.switch_ms", e.windows.switch_ms),
-        ] {
-            if ms > MAX_FADE_MS {
-                return Err(format!("{key} must be at most {MAX_FADE_MS}"));
-            }
-        }
-        for (key, value) in [
-            ("effects.smear.trail", e.smear.trail),
-            ("effects.smear.gradient", e.smear.gradient),
-            ("effects.particles.opacity", e.particles.opacity),
-        ] {
-            if !(0.0..=1.0).contains(&value) {
-                return Err(format!("{key} must be between 0 and 1"));
-            }
-        }
-        if e.particles.lifetime_ms == 0 || e.particles.lifetime_ms > MAX_LIFETIME_MS {
-            return Err(format!(
-                "effects.particles.lifetime_ms must be from 1 to {MAX_LIFETIME_MS}"
-            ));
-        }
-        // How many particles a cell of travel leaves, and how fast they go:
-        // both feed arithmetic every frame, so neither may be a NaN or an
-        // infinity smuggled in as a float.
-        for (key, value, max) in [
-            (
-                "effects.particles.density",
-                e.particles.density,
-                MAX_DENSITY,
-            ),
-            ("effects.particles.speed", e.particles.speed, MAX_SPEED),
-        ] {
-            if !(0.0..=max).contains(&value) {
-                return Err(format!("{key} must be from 0 to {max}"));
-            }
-        }
-        if e.scroll.far_lines > MAX_FAR_LINES {
-            return Err(format!(
-                "effects.scroll.far_lines must be at most {MAX_FAR_LINES}"
             ));
         }
         // Refused at startup rather than at the prompt: a command that can never
@@ -1156,45 +983,25 @@ fn render_default_config(prefix: u8) -> String {
          \n\
          [effects.smear]\n\
          # nvmux's own client ([client] ui = \"nvmux\"): the cursor travels\n\
-         # between cells, its trailing edge behind it, rather than jumping.\n\
-         # enabled     = {smear_enabled}\n\
-         # duration_ms = {smear_duration}\n\
-         # short_ms    = {smear_short}\n\
-         # trail       = {smear_trail:?}\n\
-         # The cursor's colour fades along the trail towards its end: 0 not\n\
-         # at all, 1 to nothing at the very end.\n\
-         # gradient    = {smear_gradient:?}\n\
-         # insert      = {smear_insert}\n\
-         # cmdline     = {smear_cmdline}\n\
+         # between cells rather than jumping, a long move smearing behind it.\n\
+         # enabled = {smear_enabled}\n\
          \n\
          [effects.particles]\n\
          # nvmux's own client: particles fly off the cursor as it moves. mode is\n\
          # railgun, torpedo, pixiedust, sonicboom, ripple or wireframe.\n\
-         # enabled     = {particles_enabled}\n\
-         # mode        = {particles_mode:?}\n\
-         # opacity     = {particles_opacity:?}\n\
-         # lifetime_ms = {particles_lifetime}\n\
-         # density     = {particles_density:?}\n\
-         # speed       = {particles_speed:?}\n\
+         # enabled = {particles_enabled}\n\
+         # mode    = {particles_mode:?}\n\
          \n\
          [effects.scroll]\n\
          # nvmux's own client: a scroll slides the text through the window.\n\
-         # enabled     = {scroll_enabled}\n\
-         # duration_ms = {scroll_duration}\n\
-         # far_lines   = {scroll_far}\n\
+         # enabled = {scroll_enabled}\n\
          \n\
          [effects.windows]\n\
          # nvmux's own client: a split window opening, closing or changing size\n\
          # moves there, and one showing another buffer fades from one to the\n\
-         # other, the way animate.nvim draws them; 0 ms draws one at once. A\n\
-         # float, the message area or windows rearranged slide there, as in\n\
-         # Neovide, settling over duration_ms.\n\
-         # enabled     = {windows_enabled}\n\
-         # duration_ms = {windows_duration}\n\
-         # resize_ms   = {windows_resize}\n\
-         # open_ms     = {windows_open}\n\
-         # close_ms    = {windows_close}\n\
-         # switch_ms   = {windows_switch}\n\
+         # other, the way animate.nvim draws them; a float, the message area or\n\
+         # windows rearranged slide there, as in Neovide.\n\
+         # enabled = {windows_enabled}\n\
          \n\
          [effects.blink]\n\
          # nvmux's own client: a blinking block cursor fades out and back in.\n\
@@ -1220,27 +1027,10 @@ fn render_default_config(prefix: u8) -> String {
             Ui::Nvmux => "nvmux",
         },
         smear_enabled = e.smear.enabled,
-        smear_duration = e.smear.duration_ms,
-        smear_short = e.smear.short_ms,
-        smear_trail = e.smear.trail,
-        smear_gradient = e.smear.gradient,
-        smear_insert = e.smear.insert,
-        smear_cmdline = e.smear.cmdline,
         particles_enabled = e.particles.enabled,
         particles_mode = e.particles.mode.name(),
-        particles_opacity = e.particles.opacity,
-        particles_lifetime = e.particles.lifetime_ms,
-        particles_density = e.particles.density,
-        particles_speed = e.particles.speed,
         scroll_enabled = e.scroll.enabled,
-        scroll_duration = e.scroll.duration_ms,
-        scroll_far = e.scroll.far_lines,
         windows_enabled = e.windows.enabled,
-        windows_duration = e.windows.duration_ms,
-        windows_resize = e.windows.resize_ms,
-        windows_open = e.windows.open_ms,
-        windows_close = e.windows.close_ms,
-        windows_switch = e.windows.switch_ms,
         blink_enabled = e.blink.enabled,
     )
 }
@@ -1371,30 +1161,13 @@ mod tests {
             enabled = true\n\
             [effects.smear]\n\
             enabled = false\n\
-            duration_ms = 100\n\
-            short_ms = 40\n\
-            trail = 0.4\n\
-            gradient = 1.0\n\
-            insert = true\n\
-            cmdline = true\n\
             [effects.particles]\n\
             enabled = false\n\
             mode = \"railgun\"\n\
-            opacity = 0.8\n\
-            lifetime_ms = 500\n\
-            density = 2.0\n\
-            speed = 6.0\n\
             [effects.scroll]\n\
             enabled = true\n\
-            duration_ms = 300\n\
-            far_lines = 1\n\
             [effects.windows]\n\
             enabled = true\n\
-            duration_ms = 150\n\
-            resize_ms = 150\n\
-            open_ms = 200\n\
-            close_ms = 180\n\
-            switch_ms = 200\n\
             [effects.blink]\n\
             enabled = false\n";
         let s: Settings = toml::from_str(doc).expect("valid");
@@ -1556,34 +1329,22 @@ mod tests {
         assert!(s.client.per_session && s.client.lazy, "the rest as it was");
     }
 
-    /// Neovide's defaults where it has the same setting: the scroll and the
-    /// windows on, the particles and the smooth blink off — but for the
-    /// cursor's travel, off unless turned on, and then quicker than
-    /// Neovide's, with a shorter trail that fades out to nothing.
+    /// On and off as Neovide's are: the scroll and the windows on, the
+    /// particles and the smooth blink off — but for the cursor's travel, off
+    /// unless turned on.
     #[test]
     fn the_clients_effects_start_as_neovides() {
         let e = Settings::default().effects;
         assert!(e.scroll_enabled() && e.windows_enabled());
         assert!(!e.smear_enabled() && !e.particles_enabled() && !e.blink_enabled());
-        assert_eq!(e.smear.duration_ms, 100);
-        assert_eq!(e.smear.trail, 0.4);
-        assert_eq!(e.smear.gradient, 1.0);
-        assert_eq!(e.scroll.duration_ms, 300);
-        assert_eq!(e.scroll.far_lines, 1);
-        assert_eq!(e.windows.duration_ms, 150);
-        // And animate.nvim's, where it has the same setting.
-        assert_eq!(e.windows.resize_ms, 150);
-        assert_eq!(e.windows.open_ms, 200);
-        assert_eq!(e.windows.close_ms, 180);
-        assert_eq!(e.windows.switch_ms, 200);
+        assert_eq!(e.particles.mode, ParticleMode::Railgun);
     }
 
-    /// A fraction may be written whole, and a mode as Neovide spells it.
+    /// A particle mode is spelt as Neovide spells it.
     #[test]
-    fn numbers_may_be_written_whole() {
-        let s: Settings = toml::from_str("[effects.particles]\nspeed = 6\nmode = \"pixiedust\"\n")
-            .expect("valid");
-        assert_eq!(s.effects.particles.speed, 6.0);
+    fn a_particle_mode_is_spelt_as_neovides() {
+        let s: Settings =
+            toml::from_str("[effects.particles]\nmode = \"pixiedust\"\n").expect("valid");
         assert_eq!(s.effects.particles.mode, ParticleMode::Pixiedust);
         assert_eq!(ParticleMode::Pixiedust.name(), "pixiedust");
     }
@@ -1674,8 +1435,12 @@ mod tests {
             ),
             (
                 "an unparseable particle value",
-                "[effects.particles]\nspeed = \"fast\"\n",
+                "[effects.particles]\nenabled = \"yes\"\n",
             ),
+            // How the client's effects look is not the file's to say.
+            ("a smear's look", "[effects.smear]\ntrail = 0.4\n"),
+            ("a window's timing", "[effects.windows]\nopen_ms = 200\n"),
+            ("a particle's look", "[effects.particles]\nspeed = 6.0\n"),
             ("an unknown scroll key", "[effects.scroll]\nlength = 1\n"),
             (
                 "an unknown windows key",
@@ -1708,57 +1473,6 @@ mod tests {
                 "[effects.fade]\nduration_ms = 2001\n",
                 "effects.fade.duration_ms",
             ),
-            (
-                "[effects.smear]\nduration_ms = 0\n",
-                "effects.smear.duration_ms",
-            ),
-            (
-                "[effects.scroll]\nduration_ms = 2001\n",
-                "effects.scroll.duration_ms",
-            ),
-            (
-                "[effects.windows]\nduration_ms = 0\n",
-                "effects.windows.duration_ms",
-            ),
-            (
-                "[effects.windows]\nopen_ms = 2001\n",
-                "effects.windows.open_ms",
-            ),
-            (
-                "[effects.windows]\nswitch_ms = 2001\n",
-                "effects.windows.switch_ms",
-            ),
-            (
-                "[effects.smear]\nshort_ms = 2001\n",
-                "effects.smear.short_ms",
-            ),
-            ("[effects.smear]\ntrail = 1.5\n", "effects.smear.trail"),
-            ("[effects.smear]\ntrail = nan\n", "effects.smear.trail"),
-            ("[effects.smear]\ngradient = 2\n", "effects.smear.gradient"),
-            (
-                "[effects.smear]\ngradient = -0.5\n",
-                "effects.smear.gradient",
-            ),
-            (
-                "[effects.particles]\nopacity = -0.1\n",
-                "effects.particles.opacity",
-            ),
-            (
-                "[effects.particles]\nlifetime_ms = 0\n",
-                "effects.particles.lifetime_ms",
-            ),
-            (
-                "[effects.particles]\ndensity = inf\n",
-                "effects.particles.density",
-            ),
-            (
-                "[effects.particles]\nspeed = -1\n",
-                "effects.particles.speed",
-            ),
-            (
-                "[effects.scroll]\nfar_lines = 1001\n",
-                "effects.scroll.far_lines",
-            ),
         ];
         for (doc, key) in cases {
             let err = parse(Path::new("test.toml"), doc).expect_err(doc);
@@ -1774,12 +1488,6 @@ mod tests {
             "[keys]\ntimeout_ms = 60000\n",
             "[effects.fade]\nduration_ms = 1\n",
             "[effects.fade]\nduration_ms = 2000\n",
-            "[effects.smear]\nshort_ms = 0\ntrail = 0\n",
-            "[effects.smear]\ntrail = 1\n",
-            "[effects.smear]\ngradient = 0\n",
-            "[effects.smear]\ngradient = 1\n",
-            "[effects.particles]\nopacity = 1\ndensity = 0\nspeed = 200\n",
-            "[effects.scroll]\nfar_lines = 0\n",
         ] {
             parse(Path::new("test.toml"), doc).expect(doc);
         }
@@ -1859,13 +1567,13 @@ mod tests {
         }
         assert_eq!(
             rendered.matches("\n# enabled = true\n").count(),
-            8,
-            "the master switch and each one-line effect's on by default: {rendered:?}"
+            10,
+            "the master switch and each switch-only effect on by default: {rendered:?}"
         );
         assert_eq!(
             rendered.matches("\n# enabled = false\n").count(),
-            1,
-            "the smooth blink, off as Neovide's is: {rendered:?}"
+            3,
+            "the cursor's travel, the particles and the smooth blink: {rendered:?}"
         );
         for line in [
             "# per_session = true",
@@ -1874,11 +1582,7 @@ mod tests {
             "# enabled     = true",
             "# duration_ms = 200",
             "# session     = true",
-            "# trail       = 0.4",
-            "# gradient    = 1.0",
-            "# mode        = \"railgun\"",
-            "# density     = 2.0",
-            "# far_lines   = 1",
+            "# mode    = \"railgun\"",
         ] {
             assert!(
                 rendered.contains(line),

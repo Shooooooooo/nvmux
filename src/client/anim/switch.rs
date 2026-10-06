@@ -6,8 +6,8 @@
 //! that showed another one is a switch — `:bnext`, `:edit`, `<C-^>`, a picker
 //! opening a file — and the first batch after it is the one that draws it.
 //! What the window showed is kept from just before that batch; then, over
-//! `switch_ms`, eased in and out, the old text dims into the window's
-//! background, and the new text comes up out of it.
+//! 200 ms, eased in and out, the old text dims into the window's background,
+//! and the new text comes up out of it.
 //!
 //! Only a window still where it was, the same size, fades, and only when a
 //! few switch at once: `:windo bnext`, or a session loading, switches every

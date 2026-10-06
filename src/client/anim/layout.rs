@@ -15,19 +15,19 @@
 //!
 //! - the same windows, still placed as they were relative to one another, in
 //!   new sizes — `<C-w>>`, `:resize`, `<C-w>=`: every edge moves from where it
-//!   was to where it goes, eased in and out, over `resize_ms`, or a frame a
-//!   cell for a move of a few cells, and at once for a single cell;
+//!   was to where it goes, eased in and out, over 150 ms, or a frame a cell
+//!   for a move of a few cells, and at once for a single cell;
 //! - one window more, split off another — `:split`, `:vsplit`, `:new`, a
 //!   plugin's sidebar: it starts as a sliver one cell of text deep on its own
 //!   side of the space it took (right or below with `'splitright'` and
 //!   `'splitbelow'`, left or above without), and grows to its place as every
 //!   other window moves to its own, its text fading in out of its background,
-//!   over `open_ms`, quick to start and slow to land;
+//!   over 200 ms, quick to start and slow to land;
 //! - windows fewer — `:close`, `:only`: the window before each run of closed
 //!   ones, left of it or above it, takes their place at once, and a ghost of
 //!   them — what they showed, with the separator before them along its edge —
 //!   flies off into their far side, its text dimming into its background as
-//!   it goes, over `close_ms`, slow to start. Where the closed windows came
+//!   it goes, over 180 ms, slow to start. Where the closed windows came
 //!   first, the window after them moves into their place instead, its text
 //!   with it, over their ghost;
 //! - anything else — windows rearranged (`<C-w>x`, `<C-w>r`, `<C-w>H` …),

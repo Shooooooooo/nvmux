@@ -47,12 +47,10 @@ use crate::palette::Rgb;
 /// How often a frame goes out while something moves: the fade's pace.
 pub const FRAME: Duration = crate::fade::FRAME;
 
-/// The effects as the config sets them, in the units the animations use.
+/// The effects the config turns on, each as the animations take it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Effects {
     pub smear: Option<smear::Settings>,
-    pub smear_in_insert: bool,
-    pub smear_in_cmdline: bool,
     pub vfx: Option<vfx::Settings>,
     /// Seconds to settle, and the rows of a long jump animated.
     pub scroll: Option<(f32, usize)>,
@@ -60,7 +58,43 @@ pub struct Effects {
     pub blink: bool,
 }
 
-/// `[effects.windows]`, in seconds; nought for one turned off.
+/// How each of the effects looks: the config only turns them on and off, and
+/// picks the particles' mode.
+///
+/// The cursor travels quicker than Neovide's, its trailing edge not far
+/// behind, its colour fading out to nothing along the trail.
+const SMEAR: smear::Settings = smear::Settings {
+    duration: 0.1,
+    short: 0.04,
+    trail: 0.4,
+    gradient: 1.0,
+};
+
+/// Particles as Neovide draws them, in the mode the config picks.
+const PARTICLES: vfx::Settings = vfx::Settings {
+    mode: vfx::Mode::Railgun,
+    opacity: 0.8,
+    lifetime: 0.5,
+    density: 2.0,
+    speed: 6.0,
+};
+
+/// A scroll settles in Neovide's 300 ms, and of a jump further than the
+/// window is tall, one row slides.
+const SCROLL: (f32, usize) = (0.3, 1);
+
+/// Neovide's slide settles in 150 ms; animate.nvim's resize takes its 150, a
+/// split flying in 200, one flying out 180 and a buffer switch's fade 200.
+const WINDOWS: Windows = Windows {
+    slide: 0.15,
+    resize: 0.15,
+    open: 0.2,
+    close: 0.18,
+    switch: 0.2,
+};
+
+/// How long each of the windows' animations takes, in seconds; nought for
+/// one at once.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Windows {
     /// How long Neovide's slide takes to settle: a float, the message area,
@@ -79,8 +113,6 @@ impl Effects {
     pub fn none() -> Self {
         Self {
             smear: None,
-            smear_in_insert: true,
-            smear_in_cmdline: true,
             vfx: None,
             scroll: None,
             windows: None,
@@ -96,33 +128,14 @@ impl Effects {
 
     pub fn from_settings(s: &crate::config::Settings) -> Self {
         let e = &s.effects;
-        let secs = |ms: u64| ms as f32 / 1000.0;
         Self {
-            smear: e.smear_enabled().then(|| smear::Settings {
-                duration: secs(e.smear.duration_ms),
-                short: secs(e.smear.short_ms),
-                trail: e.smear.trail as f32,
-                gradient: e.smear.gradient as f32,
-            }),
-            smear_in_insert: e.smear.insert,
-            smear_in_cmdline: e.smear.cmdline,
+            smear: e.smear_enabled().then_some(SMEAR),
             vfx: e.particles_enabled().then(|| vfx::Settings {
                 mode: vfx::Mode::named(e.particles.mode.name()).unwrap_or(vfx::Mode::Railgun),
-                opacity: e.particles.opacity as f32,
-                lifetime: secs(e.particles.lifetime_ms),
-                density: e.particles.density as f32,
-                speed: e.particles.speed as f32,
+                ..PARTICLES
             }),
-            scroll: e
-                .scroll_enabled()
-                .then(|| (secs(e.scroll.duration_ms), e.scroll.far_lines as usize)),
-            windows: e.windows_enabled().then(|| Windows {
-                slide: secs(e.windows.duration_ms),
-                resize: secs(e.windows.resize_ms),
-                open: secs(e.windows.open_ms),
-                close: secs(e.windows.close_ms),
-                switch: secs(e.windows.switch_ms),
-            }),
+            scroll: e.scroll_enabled().then_some(SCROLL),
+            windows: e.windows_enabled().then_some(WINDOWS),
             blink: e.blink_enabled(),
         }
     }
@@ -442,13 +455,9 @@ impl Animator {
             return;
         };
         let (row, col) = model.cursor_on_screen();
-        let insert = matches!(model.mode_name.as_str(), "insert" | "replace");
         // Windows setting off somewhere take the cursor with them: it is in
         // its cell when they land, and does not travel there.
-        let allowed = drawn
-            && !started
-            && !(insert && !self.effects.smear_in_insert)
-            && !(model.cursor_in_messages() && !self.effects.smear_in_cmdline);
+        let allowed = drawn && !started;
         if self.smear.target() != Some(target) {
             match self.effects.smear {
                 Some(s) if allowed => self.smear.go(target, &s),
@@ -751,8 +760,6 @@ mod tests {
                 trail: 0.8,
                 gradient: 0.9,
             }),
-            smear_in_insert: true,
-            smear_in_cmdline: true,
             vfx: None,
             scroll: Some((0.3, 1)),
             windows: Some(Windows {
@@ -960,33 +967,6 @@ mod tests {
         let cursor = a.paint(&mut frame, &m, t0);
         assert!(cursor.visible);
         assert_eq!((cursor.row, cursor.col, cursor.shape), (5, 5, 2));
-    }
-
-    /// In insert mode with `insert = false` the cursor jumps.
-    #[test]
-    fn insert_mode_can_be_left_alone() {
-        let mut e = effects();
-        e.smear_in_insert = false;
-        let (mut a, mut m, t0) = (Animator::new(e), model(), Instant::now());
-        setup(&mut a, &mut m, t0);
-        batch(
-            &mut a,
-            &mut m,
-            vec![
-                Event::ModeChange {
-                    name: "insert".into(),
-                    index: 0,
-                },
-                Event::GridCursor {
-                    grid: 2,
-                    row: 3,
-                    col: 3,
-                },
-            ],
-            true,
-            t0,
-        );
-        assert!(!a.smear.moving());
     }
 
     /// Without `ext_multigrid`, a `grid_scroll` is the current window's when

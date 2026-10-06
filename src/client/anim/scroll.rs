@@ -15,9 +15,9 @@
 //! animate in one step, and a delay would be all there was to see.
 //!
 //! A jump further than the window is tall leaves a gap between the view that
-//! was and the one that is, which nothing is known about. As Neovide's
-//! `scroll_animation_far_lines` does, only that many rows of such a jump are
-//! animated (`[effects.scroll] far_lines`), and they are drawn blank.
+//! was and the one that is, which nothing is known about. Only a row of such
+//! a jump is animated, as Neovide's `scroll_animation_far_lines` has it by
+//! default, and it is drawn blank.
 //!
 //! Without `ext_multigrid` there are no windows to speak of, only grid 1 —
 //! but `grid_scroll` there names the window's rectangle, and the scroll is
