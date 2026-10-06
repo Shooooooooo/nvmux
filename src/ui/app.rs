@@ -16,6 +16,7 @@ use super::effects;
 use super::landing::Landing;
 use super::sonar::Sonar;
 use super::starfield::{self, Starfield};
+use super::swap::Swap;
 use crate::session::Session;
 
 /// What the picker is currently doing.
@@ -97,9 +98,9 @@ pub struct App {
     /// is asked several times per keystroke. In a `RefCell` because scoring
     /// takes `&mut` and `visible` is a read.
     matcher: RefCell<Matcher>,
-    /// Whether a session in flight leaves a trail at all: `[effects.move]
-    /// enabled`, under `[effects] enabled`, read once when the picker opens, as
-    /// the rest of the config is.
+    /// Whether a session in flight leaves a trail at all, and so trades places
+    /// visibly and lands: `[effects.move] enabled`, under `[effects] enabled`,
+    /// read once when the picker opens, as the rest of the config is.
     trail: bool,
     /// The trails a session in flight leaves (see [`starfield`]): off the end
     /// of its name, flying right, and off the other end of its row, flying
@@ -111,6 +112,10 @@ pub struct App {
     /// The landing under way, from the key that put a session down until its
     /// dust settles. See [`super::landing`].
     landing: Option<Landing>,
+    /// What the last moves of a session in flight are still doing to the rows
+    /// it traded places with: stepping aside, letting its bar go, sparks off
+    /// the seam. See [`super::swap`].
+    swap: Swap,
     /// Whether the cursor lights the rows it moves between — the afterglow on
     /// the row it leaves, the glint across the one it lands on:
     /// `[effects.cursor] enabled`, under `[effects] enabled`. Read once when
@@ -272,6 +277,7 @@ impl App {
             after: Starfield::seeded(),
             before: Starfield::seeded(),
             landing: None,
+            swap: Swap::seeded(),
             lights: crate::config::get().effects.cursor_enabled(),
             glow: None,
             glint: None,
@@ -307,6 +313,7 @@ impl App {
         self.glint = None;
         self.leaving = None;
         self.landing = None;
+        self.swap.clear();
         self.room = None;
         self.sessions = sessions;
         self.selected = previously
@@ -427,16 +434,17 @@ impl App {
                 self.landing = None;
             }
         }
+        self.swap.advance(elapsed);
         if let Some(room) = &mut self.room {
             room.age += elapsed;
         }
     }
 
     /// Whether anything on screen is moving, and so whether the caller should
-    /// draw at a frame's pace rather than wait on the keyboard: a trail, a
-    /// glow, a glint, a fading row, a line being struck or drawn back, a row
-    /// being erased, a pulse of rings, or a row coming up in a gap made for a
-    /// new session. A line all the way across is still,
+    /// draw at a frame's pace rather than wait on the keyboard: a trail, rows
+    /// trading places, a glow, a glint, a fading row, a line being struck or
+    /// drawn back, a row being erased, a pulse of rings, or a row coming up in
+    /// a gap made for a new session. A line all the way across is still,
     /// and asks for nothing while the `[y/N]` waits; so are the rings between
     /// pulses, which [`App::wake_in`] answers for instead. With every effect
     /// off this is only ever false, and the picker changes on a key and nothing
@@ -450,6 +458,7 @@ impl App {
             || self.erasing()
             || self.sonar.as_ref().is_some_and(|(_, s)| s.pulsing())
             || self.landing.is_some()
+            || self.swap.moving()
             || self.room().is_some()
     }
 
@@ -463,6 +472,12 @@ impl App {
     /// The landing under way, if a session has just been put down.
     pub fn landing(&self) -> Option<&Landing> {
         self.landing.as_ref()
+    }
+
+    /// What the last moves of a session in flight are still doing to the rows
+    /// it traded places with, for the renderer and the effects' post-pass.
+    pub fn swap(&self) -> &Swap {
+        &self.swap
     }
 
     /// Put the session in flight down: back to the ordinary list, landing it
@@ -567,6 +582,7 @@ impl App {
         self.glint = None;
         self.leaving = None;
         self.strike = None;
+        self.swap.clear();
         self.room = Some(Room {
             ghost,
             at,
@@ -909,8 +925,9 @@ impl App {
     fn pick_up(&mut self, id: String) {
         let was = self.snapshot();
         // A grab holds an arrangement of the visible rows; nothing else may be
-        // on screen while it does.
+        // on screen while it does, the last grab's swap included.
         self.leaving = None;
+        self.swap.clear();
         self.mode = Mode::Reorder { id, was };
         if self.trail {
             self.after.ignite(starfield::TRAIL);
@@ -927,7 +944,8 @@ impl App {
     }
 
     /// Move the grabbed row to `to`, sliding everything between it and where it
-    /// came from one place the other way.
+    /// came from one place the other way — and, with the trail on, start the
+    /// rows that traded places stepping aside (see [`super::swap`]).
     ///
     /// The numbers stay where they are on the screen; it is the sessions that
     /// move between them. The list arrives from `finish_listing` sorted by
@@ -955,6 +973,23 @@ impl App {
         let moved = ids.remove(from);
         ids.insert(to, moved);
 
+        if self.trail {
+            // The rows passed, nearest the session's new row first, and the
+            // seam it last crossed: its top edge going down, its bottom edge
+            // going up.
+            let passed: Vec<String> = if to > from {
+                rows[from + 1..=to]
+                    .iter()
+                    .rev()
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            } else {
+                rows[to..from].iter().map(|(id, _)| id.clone()).collect()
+            };
+            let seam = if to > from { to } else { to + 1 };
+            self.swap.start(moved.to_string(), passed, seam);
+        }
+
         let dealt: Vec<(String, u32)> = ids
             .into_iter()
             .map(str::to_string)
@@ -977,7 +1012,11 @@ impl App {
     ///
     /// By id rather than by the row it came from, so it stays right even if the
     /// list ever moved underneath.
+    ///
+    /// What the moves were still drawing goes too: the rows it was drawn over
+    /// are back where they were, and a cancelled move did not happen.
     fn restore(&mut self, was: &[(String, u32)], id: &str) {
+        self.swap.clear();
         for (row, num) in was {
             if let Some(s) = self.sessions.iter_mut().find(|s| &s.id == row) {
                 s.state.num = *num;
@@ -1577,6 +1616,7 @@ pub enum Mouse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::swap;
     use crate::ui::test_support::{filtering, picker as app};
 
     fn names(app: &App) -> Vec<String> {
@@ -3086,6 +3126,102 @@ mod tests {
     fn the_trail_follows_the_config() {
         assert!(crate::config::get().effects.move_enabled());
         assert!(app(&["aaa"]).trail);
+    }
+
+    // --- the swap -----------------------------------------------------------
+
+    /// A move starts the rows that traded places stepping aside, the carried
+    /// session one way and the one it passed the other, and the picker draws at
+    /// a frame's pace until the swap is over — however the move was made.
+    #[test]
+    fn a_move_starts_a_swap_by_key_or_by_mouse() {
+        for by_mouse in [false, true] {
+            let mut a = app(&["aaa", "bbb", "ccc"]);
+            a.set_trail(true);
+            a.on_key(Key::Char(' '));
+            if by_mouse {
+                a.on_mouse(Mouse::Drag(Some(1)));
+            } else {
+                a.on_key(Key::Char('j'));
+            }
+            let swap = a.swap();
+            assert_eq!(swap.aside("id000000"), swap::ASIDE as i16, "carried");
+            assert_eq!(swap.aside("id000001"), -(swap::ASIDE as i16), "passed");
+            assert_eq!(swap.aside("id000002"), 0, "not passed");
+            let echoes: Vec<&str> = swap.echoes().map(|(id, _)| id).collect();
+            assert_eq!(echoes, ["id000001"], "the row it left lets its bar go");
+            assert!(a.animating());
+        }
+    }
+
+    /// A jump passes every row between, and the row next to where the session
+    /// lands is the nearest: last to let its bar go.
+    #[test]
+    fn a_jump_passes_every_row_between_nearest_first() {
+        let mut a = app(&["aaa", "bbb", "ccc", "ddd"]);
+        a.set_trail(true);
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Char('G'));
+        let echoes: Vec<&str> = a.swap().echoes().map(|(id, _)| id).collect();
+        assert_eq!(echoes, ["id000003", "id000002", "id000001"]);
+
+        let mut a = app(&["aaa", "bbb", "ccc", "ddd"]);
+        a.set_trail(true);
+        a.on_key(Key::Char('G'));
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Char('g'));
+        let echoes: Vec<&str> = a.swap().echoes().map(|(id, _)| id).collect();
+        assert_eq!(echoes, ["id000000", "id000001", "id000002"], "and going up");
+    }
+
+    /// Putting the session down leaves the swap to finish under the landing;
+    /// cancelling the move takes it off at once, since the rows it was drawn
+    /// over are back where they were.
+    #[test]
+    fn placing_lets_the_swap_finish_and_cancelling_ends_it() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.set_trail(true);
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Char('j'));
+        a.on_key(Key::Enter);
+        assert!(a.landing().is_some());
+        assert!(a.swap().moving(), "the swap goes on under the landing");
+        a.tick(swap::SPARKING.max(swap::SIDESTEP).max(swap::ECHO));
+        assert!(!a.swap().moving());
+
+        let mut a = app(&["aaa", "bbb"]);
+        a.set_trail(true);
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Char('j'));
+        a.on_key(Key::Esc);
+        assert!(!a.swap().moving(), "a cancelled move leaves nothing behind");
+    }
+
+    /// With the trail off, a move starts no swap and never asks for the faster
+    /// clock.
+    #[test]
+    fn with_the_trail_off_a_move_starts_no_swap() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.set_trail(false);
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Char('j'));
+        assert!(!a.swap().moving());
+        assert_eq!(a.swap().aside("id000001"), 0);
+        assert!(!a.animating());
+    }
+
+    /// A fresh listing is the truth about the rows, and the swap goes with the
+    /// rows it was drawn over.
+    #[test]
+    fn a_fresh_listing_ends_the_swap() {
+        let mut a = app(&["aaa", "bbb"]);
+        a.set_trail(true);
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Char('j'));
+        a.on_key(Key::Enter);
+        let sessions = a.sessions().to_vec();
+        a.set_sessions(sessions);
+        assert!(!a.swap().moving());
     }
 
     // ---- where a new session goes ------------------------------------------

@@ -95,10 +95,10 @@ const STARS_PER_CELL: usize = 2;
 /// The dot each row of a braille cell's 2x4 grid lights, left column then
 /// right. Braille numbers its dots down the left column and then the right,
 /// with the bottom pair added last, which is why the bits are not in order.
-const DOTS: [[u32; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
+pub(super) const DOTS: [[u32; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
 
 /// The first braille pattern, which has no dots.
-const BRAILLE: u32 = 0x2800;
+pub(super) const BRAILLE: u32 = 0x2800;
 
 /// One star: where it is, which row of dots it is on, how fast it is going, and
 /// how far it gets.

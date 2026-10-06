@@ -150,7 +150,7 @@ duration_ms = 200    # the whole dissolve, out and back; the notice pays it too
 session     = true   # Neovim's own screen dissolves too, and backs the notice
 
 [effects.move]
-enabled = true   # stars off both ends of a session being moved, and its landing
+enabled = true   # stars off a session being moved, rows stepping aside, its landing
 
 [effects.cursor]
 enabled = true   # the row the cursor leaves fades back; a glint crosses the next

@@ -15,6 +15,7 @@
 //! relies on that flag renders incorrectly for exactly the users who asked for
 //! no colour.
 
+use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -26,6 +27,7 @@ use super::app::{App, Mode};
 use super::backspace::Backspace;
 use super::landing::{Landing, Side, Tier};
 use super::starfield;
+use super::swap::Dot;
 
 /// The marker on the selected row. Unselected rows are indented to match, so
 /// names stay in one column and nothing shifts as the selection moves.
@@ -266,6 +268,17 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 
     frame.render_widget(Paragraph::new(lines), block);
 
+    // Rows trading places step aside, whole cells at a time (see `swap`):
+    // moved once drawn, so a row goes as it was drawn, bar and all, and before
+    // the trails, which leave from wherever the bar now ends.
+    for (line, row) in rows.iter().skip(offset).take(height as usize).enumerate() {
+        let aside = app.swap().aside(&row.session.id);
+        if aside != 0 {
+            let at = Rect::new(block.x, block.y + line as u16, block.width, 1);
+            step_aside(frame.buffer_mut(), at, aside);
+        }
+    }
+
     if let Some((id, backspace)) = backspace {
         draw_backspace(frame, app, block, offset, num_width, id, backspace);
     }
@@ -274,6 +287,7 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     } else if let Some(pull) = pull {
         draw_trails(frame, app, block, offset, pull);
     }
+    draw_sparks(frame, app, area, block, offset);
     if let Some(landing) = landing {
         draw_landing(frame, app, area, block, offset, landing);
     }
@@ -347,6 +361,94 @@ fn draw_landing(
     for x in before.chain(after).filter(|x| on_screen(*x)) {
         buf.set_string(x, y, " ", bar);
     }
+}
+
+/// Draw `row` `aside` columns to the right of where it was drawn, or to the
+/// left for a negative `aside`, leaving blank the cells it moves off: a row
+/// stepping aside (see [`super::swap`]). Whatever would go past the edge of the
+/// screen is dropped.
+fn step_aside(buf: &mut Buffer, row: Rect, aside: i16) {
+    let row = row.intersection(buf.area);
+    let cells: Vec<Cell> = (row.x..row.x + row.width)
+        .map(|x| std::mem::take(&mut buf[(x, row.y)]))
+        .collect();
+    let screen = buf.area;
+    for (x, cell) in (row.x..).zip(cells) {
+        let Some(to) = x
+            .checked_add_signed(aside)
+            .filter(|to| *to >= screen.x && *to < screen.x + screen.width)
+        else {
+            continue;
+        };
+        buf[(to, row.y)] = cell;
+    }
+}
+
+/// The sparks off the seams the rows of a session in flight slid past each
+/// other on (see [`super::swap`]): braille, out of both ends of the list, along
+/// the rows of dots either side of a seam. Like the trails they go over the
+/// terminal's own background, never over a row, and stop at the edge of the
+/// screen and of the list's `area`, so never on the hint row. A spark that
+/// lands on a cell of the trail shares it, its dot added to the stars'; on
+/// anything else, the bar of a session stepped aside included, it is not drawn.
+fn draw_sparks(frame: &mut Frame, app: &App, area: Rect, block: Rect, offset: usize) {
+    let dots = app.swap().sparks();
+    if dots.is_empty() {
+        return;
+    }
+    let screen = frame.area();
+    let buf = frame.buffer_mut();
+    for dot in dots {
+        let Some((x, y, bit)) = spark_cell(&dot, block, offset) else {
+            continue;
+        };
+        if x < screen.x || x >= screen.x + screen.width || y < area.y || y >= area.y + area.height {
+            continue;
+        }
+        let cell = &mut buf[(x, y)];
+        if cell.modifier.contains(Modifier::REVERSED) {
+            continue;
+        }
+        let mut symbol = cell.symbol().chars();
+        let lit = match (symbol.next(), symbol.next()) {
+            (Some(' '), None) => 0,
+            (Some(c), None)
+                if (starfield::BRAILLE..=starfield::BRAILLE + 0xff).contains(&(c as u32)) =>
+            {
+                c as u32 - starfield::BRAILLE
+            }
+            _ => continue,
+        };
+        // A new cell is as bright as its spark; one already lit keeps its own
+        // weight unless the spark is the brighter.
+        if lit == 0 && dot.dim {
+            cell.modifier.insert(Modifier::DIM);
+        } else if !dot.dim {
+            cell.modifier.remove(Modifier::DIM);
+        }
+        let glyph =
+            char::from_u32(starfield::BRAILLE + (lit | bit)).expect("braille patterns are chars");
+        cell.set_char(glyph);
+    }
+}
+
+/// The cell a spark's dot is in, on the screen of a list drawn in `block`
+/// scrolled to `offset`, and the bit that lights it there: `None` when it is
+/// off the top or the left of the screen.
+fn spark_cell(dot: &Dot, block: Rect, offset: usize) -> Option<(u16, u16, u32)> {
+    // In dots: the seam is the top edge of its row, and the list's ends are
+    // the column of dots either side of it.
+    let seam = (i64::from(block.y) + dot.seam as i64 - offset as i64) * 4;
+    let y = seam + i64::from(dot.level);
+    let x = match dot.side {
+        Side::After => i64::from(block.x + block.width) * 2 + i64::from(dot.out),
+        Side::Before => i64::from(block.x) * 2 - 1 - i64::from(dot.out),
+    };
+    if x < 0 || y < 0 {
+        return None;
+    }
+    let bit = starfield::DOTS[(y % 4) as usize][(x % 2) as usize];
+    Some((u16::try_from(x / 2).ok()?, u16::try_from(y / 4).ok()?, bit))
 }
 
 /// What comes before a row's name: its marker, its number (see
@@ -474,6 +576,9 @@ fn draw_backspace(
 ///
 /// `pull` is how far both trails have been drawn back into the row, for a
 /// session landing: 0 for a session still in flight.
+///
+/// A session stepped aside (see [`super::swap`]) takes its trails with it:
+/// they leave from the ends of the bar where it is drawn, not of the list.
 fn draw_trails(frame: &mut Frame, app: &App, block: Rect, offset: usize, pull: f32) {
     let selected = app.selected_row();
     let Some(line) = selected
@@ -489,10 +594,12 @@ fn draw_trails(frame: &mut Frame, app: &App, block: Rect, offset: usize, pull: f
     let area = frame.area();
     let near = starfield::TRAIL / 2;
     let dim = Style::default().add_modifier(Modifier::DIM);
+    let aside = app.selected_row_id().map_or(0, |id| app.swap().aside(id));
+    let left = block.x.saturating_add_signed(aside);
 
     // Off the end of the bar, which is the end of the list: the trail starts
     // in the column after its last cell.
-    let x = block.x + block.width;
+    let x = (block.x + block.width).saturating_add_signed(aside);
     let cells = starfield::TRAIL.min(usize::from((area.x + area.width).saturating_sub(x)));
     if cells > 0 {
         let stars: Vec<char> = app
@@ -513,7 +620,7 @@ fn draw_trails(frame: &mut Frame, app: &App, block: Rect, offset: usize, pull: f
 
     // Off the other end: the marker is the row's first column, so this trail
     // ends in the column before it, and runs the other way.
-    let cells = starfield::TRAIL.min(usize::from(block.x.saturating_sub(area.x)));
+    let cells = starfield::TRAIL.min(usize::from(left.saturating_sub(area.x)));
     if cells > 0 {
         let stars: Vec<char> = app
             .trail_before()
@@ -523,7 +630,7 @@ fn draw_trails(frame: &mut Frame, app: &App, block: Rect, offset: usize, pull: f
         let (faint, bright) = stars.split_at(cells - near.min(cells));
         draw_trail(
             frame,
-            Rect::new(block.x - cells as u16, y, cells as u16, 1),
+            Rect::new(left - cells as u16, y, cells as u16, 1),
             vec![
                 Span::styled(faint.iter().collect::<String>(), dim),
                 Span::raw(bright.iter().collect::<String>()),
@@ -803,8 +910,10 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::super::app::Key;
     use super::super::landing;
+    use super::super::swap;
     use super::super::test_support::{self, filtering, picker as app};
     use super::*;
+    use std::time::Duration;
 
     fn render(app: &App, w: u16, h: u16) -> Vec<String> {
         test_support::render(w, h, |f| draw(f, app))
@@ -1798,6 +1907,187 @@ mod tests {
         assert!(!a.animating());
     }
 
+    // --- the swap -----------------------------------------------------------
+
+    /// The column `name` starts at on its row, in cells.
+    fn column_of(lines: &[String], name: &str) -> usize {
+        let line = &lines[usize::from(line_of(lines, name))];
+        line[..line.find(name).expect("drawn")].width()
+    }
+
+    /// The columns of row `y` in the reversed bar.
+    fn bar(buf: &Buffer, y: u16) -> Vec<u16> {
+        (0..buf.area.width)
+            .filter(|x| buf[(*x, y)].modifier.contains(Modifier::REVERSED))
+            .collect()
+    }
+
+    /// On the key, the session carried is drawn [`swap::ASIDE`] cells right
+    /// of the column and the one it passed as far left; a row the move did not
+    /// pass stays put; once the sidestep is over, every name is back in the
+    /// column. None of it sets a colour.
+    #[test]
+    fn a_move_steps_both_rows_aside_and_back() {
+        let names = ["api-server", "docs", "notes"];
+        let column = column_of(&render(&trailing(&names, 0), 40, 6), "notes");
+        let aside = usize::from(swap::ASIDE);
+
+        let mut a = trailing(&names, 0);
+        a.on_key(Key::Char('j'));
+        let lines = render(&a, 40, 6);
+        assert!(
+            line_of(&lines, "docs") < line_of(&lines, "api-server"),
+            "the rows traded places: {lines:#?}"
+        );
+        assert_eq!(
+            column_of(&lines, "api-server"),
+            column + aside,
+            "{lines:#?}"
+        );
+        assert_eq!(column_of(&lines, "docs"), column - aside, "{lines:#?}");
+        assert_eq!(column_of(&lines, "notes"), column, "{lines:#?}");
+        test_support::assert_no_colour(40, 6, |f| draw(f, &a));
+
+        a.tick(swap::SIDESTEP);
+        let lines = render(&a, 40, 6);
+        for name in names {
+            assert_eq!(column_of(&lines, name), column, "{name}: {lines:#?}");
+        }
+    }
+
+    /// The bar steps aside whole, still the width of the list, and its trails
+    /// go with it: they leave from where the bar now ends, plain and then dim,
+    /// rather than from the list's edge.
+    #[test]
+    fn the_bar_steps_aside_with_its_trails() {
+        let names = ["api-server", "docs", "notes"];
+        let still = trailing(&names, 0);
+        let buf = test_support::buffer(44, 8, |f| draw(f, &still));
+        let y = line_of(&render(&still, 44, 8), "api-server");
+        let was = bar(&buf, y);
+
+        let mut a = trailing(&names, 0);
+        a.on_key(Key::Char('j'));
+        let buf = test_support::buffer(44, 8, |f| draw(f, &a));
+        let y = line_of(&render(&a, 44, 8), "api-server");
+        let now = bar(&buf, y);
+        let shifted: Vec<u16> = was.iter().map(|x| x + swap::ASIDE).collect();
+        assert_eq!(now, shifted, "the bar, whole, ASIDE cells right");
+
+        let (first, end) = (now[0], now[now.len() - 1] + 1);
+        let near = starfield::TRAIL as u16 / 2;
+        for i in 0..starfield::TRAIL as u16 {
+            for (x, far) in [(end + i, i >= near), (first - 1 - i, i >= near)] {
+                let cell = &buf[(x, y)];
+                assert!(
+                    cell.symbol() == " " || is_braille(cell.symbol()),
+                    "{:?} at {x} is not a star or a blank",
+                    cell.symbol()
+                );
+                assert_eq!(
+                    cell.modifier.contains(Modifier::DIM),
+                    far,
+                    "trail weight at {x}"
+                );
+            }
+        }
+    }
+
+    /// With the trail off, a move is drawn as it always was: both rows jump,
+    /// and nothing steps aside or sparks.
+    #[test]
+    fn with_the_trail_off_a_move_steps_nothing_aside() {
+        let names = ["api-server", "docs", "notes"];
+        let column = column_of(&render(&trailing(&names, 0), 40, 6), "notes");
+        let mut a = trailing(&names, 0);
+        a.set_trail(false);
+        a.on_key(Key::Char('j'));
+        let lines = render(&a, 40, 6);
+        for name in names {
+            assert_eq!(column_of(&lines, name), column, "{name}: {lines:#?}");
+        }
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.chars().any(|c| is_braille(&c.to_string()))),
+            "{lines:#?}"
+        );
+    }
+
+    /// A move's sparks fly off the seam the two rows slid past each other on.
+    /// The row over the seam has no trail of its own, so every dot there is a
+    /// spark: beside the list at both ends, never on the row's text, gone once
+    /// the sparks are. The rows further off get none.
+    #[test]
+    fn a_move_throws_sparks_off_the_seam() {
+        let names = ["api-server", "docs", "notes", "web"];
+        let still = trailing(&names, 1);
+        let buf = test_support::buffer(50, 10, |f| draw(f, &still));
+        let was = bar(&buf, line_of(&render(&still, 50, 10), "docs"));
+        let (first, end) = (was[0], was[was.len() - 1] + 1);
+
+        // Down a row: the seam is the top edge of the row it lands on, under
+        // the row of the session it passed.
+        let mut a = trailing(&names, 1);
+        a.on_key(Key::Char('j'));
+        let lines = render(&a, 50, 10);
+        let y = line_of(&lines, "docs");
+        assert_eq!(line_of(&lines, "notes"), y - 1);
+
+        let mut seen = [false; 2];
+        let mut t = Duration::ZERO;
+        while t < swap::SPARKING {
+            let buf = test_support::buffer(50, 10, |f| draw(f, &a));
+            for x in (0..buf.area.width).filter(|x| is_braille(buf[(*x, y - 1)].symbol())) {
+                assert!(x < first || x >= end, "a spark on the row at {x}, {t:?} in");
+                seen[usize::from(x >= end)] = true;
+            }
+            for other in (0..buf.area.height).filter(|r| *r + 1 < y || *r > y) {
+                assert!(
+                    !(0..buf.area.width).any(|x| is_braille(buf[(x, other)].symbol())),
+                    "a spark on row {other}, {t:?} in"
+                );
+            }
+            test_support::assert_no_colour(50, 10, |f| draw(f, &a));
+            a.tick(Duration::from_millis(10));
+            t += Duration::from_millis(10);
+        }
+        assert_eq!(seen, [true; 2], "sparks off both ends");
+        let buf = test_support::buffer(50, 10, |f| draw(f, &a));
+        assert!(
+            !(0..buf.area.width).any(|x| is_braille(buf[(x, y - 1)].symbol())),
+            "the sparks are out"
+        );
+    }
+
+    /// Sparks stay within the list's area, whatever the list's scroll and
+    /// wherever the seam: none reaches the hint row, and a seam scrolled off
+    /// the screen draws nothing rather than panicking.
+    #[test]
+    fn the_sparks_stay_off_the_hint_row() {
+        let names: Vec<String> = (0..12).map(|i| format!("session-{i}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        for key in [
+            Key::Char('j'),
+            Key::Char('k'),
+            Key::Char('G'),
+            Key::Char('g'),
+        ] {
+            let mut a = trailing(&names, 0);
+            a.on_key(Key::Char('G'));
+            a.on_key(key);
+            for _ in 0..(swap::SPARKING.as_millis() / 10) {
+                let buf = test_support::buffer(40, 6, |f| draw(f, &a));
+                let hint = buf.area.height - 1;
+                assert!(
+                    !(0..buf.area.width).any(|x| is_braille(buf[(x, hint)].symbol())),
+                    "a spark on the hint row after {key:?}"
+                );
+                a.tick(Duration::from_millis(10));
+            }
+        }
+    }
+
     // --- the landing --------------------------------------------------------
 
     /// The third session of four picked up, carried up a row and put down,
@@ -1807,6 +2097,10 @@ mod tests {
         let mut a = trailing(&["api-server", "docs", "notes", "nvmux"], 2);
         a.tick(std::time::Duration::from_millis(200));
         a.on_key(Key::Char('k'));
+        // The move's own sparks and sidestep over first, so every dot here is
+        // the landing's.
+        a.tick(swap::SPARKING);
+        assert!(!a.swap().moving());
         a.on_key(Key::Enter);
         assert!(a.landing().is_some(), "putting it down lands it");
         a.tick(std::time::Duration::from_millis(ms));

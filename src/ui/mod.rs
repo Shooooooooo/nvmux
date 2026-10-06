@@ -59,6 +59,7 @@ pub mod prompt;
 pub mod setup;
 pub mod sonar;
 pub mod starfield;
+pub mod swap;
 #[cfg(test)]
 pub(crate) mod test_support;
 

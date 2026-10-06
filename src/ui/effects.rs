@@ -1,4 +1,5 @@
-//! The picker's passing effects: the afterglow the cursor leaves behind, the
+//! The picker's passing effects: the afterglow the cursor leaves behind (and a
+//! session in flight leaves on the rows it crosses, see [`super::swap`]), the
 //! glint it lands with, the rows a filter keystroke drops fading out where
 //! they stood, the line struck through a name a `[y/N]` is asking about, the
 //! rings that go out from the session you came back to the picker from, and
@@ -158,6 +159,7 @@ pub fn palette() -> Option<&'static Palette> {
 pub fn want_palette() -> bool {
     let effects = &crate::config::get().effects;
     let wanted = effects.cursor_enabled()
+        || effects.move_enabled()
         || effects.filter_enabled()
         || effects.kill_enabled()
         || effects.back_enabled()
@@ -172,6 +174,16 @@ pub fn paint(frame: &mut Frame, app: &App, palette: Option<&Palette>) {
     let selected = app.selected_row_id();
 
     if let Some((id, progress)) = app.glow() {
+        if selected != Some(id) {
+            if let Some(rect) = draw::row_rect(app, area, id) {
+                glow(buf, rect, palette, progress);
+            }
+        }
+    }
+
+    // The rows a session in flight crossed, letting its bar go: the same glow,
+    // left by a move rather than by the cursor.
+    for (id, progress) in app.swap().echoes() {
         if selected != Some(id) {
             if let Some(rect) = draw::row_rect(app, area, id) {
                 glow(buf, rect, palette, progress);
@@ -441,6 +453,7 @@ fn ease_in_out(t: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::super::app::Key;
+    use super::super::swap;
     use super::super::test_support::{self, picker};
     use super::*;
     use crate::test_support::palette as test_palette;
@@ -724,6 +737,65 @@ mod tests {
             .map(|r| r.session.name.as_str())
             .collect();
         assert_eq!(leaving, ["notes"], "only what this key dropped");
+    }
+
+    /// The first cell of `name` where it is drawn: not the row's first glyph,
+    /// which can be a spark beside the list.
+    fn name_cell<'a>(buf: &'a Buffer, name: &str) -> &'a ratatui::buffer::Cell {
+        let y = row_of(buf, name);
+        &buf[(column_of(buf, y, name), y)]
+    }
+
+    /// The row a session in flight leaves keeps its bar for a moment, under the
+    /// session that moved into it, and lets it go: the cursor's afterglow, left
+    /// by the move. In colour, it runs from the bar back to plain.
+    #[test]
+    fn the_row_a_session_in_flight_left_lets_its_bar_go() {
+        let p = test_palette();
+        let mut a = picker(&["one", "two", "three"]);
+        a.set_trail(true);
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Char('j'));
+
+        let buf = frame(&a, Some(&p));
+        let cell = name_cell(&buf, "two");
+        assert_eq!(cell.bg, rgb(p.fg), "starts as the bar: {cell:?}");
+        assert_eq!(cell.fg, rgb(p.bg));
+
+        a.tick(swap::ECHO / 2);
+        let buf = frame(&a, Some(&p));
+        let cell = name_cell(&buf, "two");
+        let Color::Rgb(r, ..) = cell.bg else {
+            panic!("halfway, the bar is still painted: {cell:?}")
+        };
+        assert!(r > p.bg.0 && r < p.fg.0, "halfway between: {r}");
+
+        a.tick(swap::ECHO);
+        let buf = frame(&a, Some(&p));
+        let cell = name_cell(&buf, "two");
+        assert_eq!(cell.bg, Color::Reset, "let go: {cell:?}");
+    }
+
+    /// Without a palette the row holds the bar, reversed and dim, for the first
+    /// third, as the afterglow does, and sets no colour.
+    #[test]
+    fn without_a_palette_the_row_left_holds_the_bar() {
+        let mut a = picker(&["one", "two", "three"]);
+        a.set_trail(true);
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Char('j'));
+        let buf = frame(&a, None);
+        let cell = name_cell(&buf, "two");
+        assert!(cell.modifier.contains(Modifier::REVERSED | Modifier::DIM));
+        test_support::assert_no_colour(W, H, |f| {
+            draw::draw(f, &a);
+            paint(f, &a, None);
+        });
+
+        a.tick(swap::ECHO / 2);
+        let buf = frame(&a, None);
+        let cell = name_cell(&buf, "two");
+        assert!(!cell.modifier.contains(Modifier::REVERSED), "let go");
     }
 
     /// A session in flight carries the cursor with it, and that is the trail's
