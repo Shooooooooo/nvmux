@@ -246,6 +246,8 @@ pub struct App {
     /// Whether to attach with `ext_multigrid` where that can be had: an
     /// effect that needs windows of their own is on.
     multigrid_wanted: bool,
+    /// Whether the client is on a terminal, as it tells Neovim.
+    tty: term::Tty,
     keyboard: Keyboard,
     /// This client's channel, from `nvim_get_api_info`: how it tells itself
     /// apart among the UIs attached.
@@ -295,6 +297,7 @@ impl App {
             model: Model::new(term),
             screen: Screen::new(),
             multigrid_wanted: effects.want_multigrid(),
+            tty: term::Tty::detect(),
             anim: Animator::new(effects),
             parser: Parser::default(),
             outbox: Outbox::default(),
@@ -379,6 +382,9 @@ impl App {
             ("ext_termcolors", Arg::Bool(true)),
             ("term_name", Arg::str(&term)),
             ("term_colors", Arg::Int(256)),
+            // On a tty, as Neovim's own TUI says it is: see `term::Tty`.
+            ("stdin_tty", Arg::Bool(self.tty.stdin)),
+            ("stdout_tty", Arg::Bool(self.tty.stdout)),
         ];
         if multigrid {
             opts.push(("ext_multigrid", Arg::Bool(true)));

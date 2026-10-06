@@ -36,6 +36,9 @@ const COLS: u16 = 80;
 /// answer; the kitty keyboard query, and "supported, no flags set".
 const DA1: &[u8] = b"\x1b[c";
 const DA1_REPLY: &[u8] = b"\x1b[?62;22c";
+/// The answer of a terminal that takes OSC 52, which says so with a 52 among
+/// its attributes, as kitty and others do.
+const DA1_REPLY_OSC52: &[u8] = b"\x1b[?62;22;52c";
 const KITTY_QUERY: &[u8] = b"\x1b[?u";
 const KITTY_REPLY: &[u8] = b"\x1b[?0u";
 
@@ -51,6 +54,8 @@ struct Terminal {
     parser: vt100::Parser,
     /// How far `output` has been scanned for queries.
     answered: usize,
+    /// What this terminal answers a DA1 with.
+    da1: &'static [u8],
     incoming: mpsc::Receiver<Vec<u8>>,
     // Held so the pty outlives the child; dropped last.
     _master: Box<dyn portable_pty::MasterPty>,
@@ -59,6 +64,11 @@ struct Terminal {
 impl Terminal {
     /// `nvmux --client <sock>` on a fresh pty, with the config at `config`.
     fn spawn(sock: &Path, config: &Path) -> Self {
+        Self::spawn_answering(sock, config, DA1_REPLY)
+    }
+
+    /// [`Terminal::spawn`], on a terminal that answers DA1 with `da1`.
+    fn spawn_answering(sock: &Path, config: &Path, da1: &'static [u8]) -> Self {
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize {
                 rows: ROWS,
@@ -102,6 +112,7 @@ impl Terminal {
             output: Vec::new(),
             parser: vt100::Parser::new(ROWS, COLS, 0),
             answered: 0,
+            da1,
             incoming,
             _master: pair.master,
         }
@@ -111,9 +122,18 @@ impl Terminal {
     /// as a terminal would, until `done` holds of the screen. Says whether it
     /// did.
     fn pump_until(&mut self, within: Duration, done: impl Fn(&str) -> bool) -> bool {
+        self.pump(within, |t| done(&t.text()))
+    }
+
+    /// [`Terminal::pump_until`], until the client has written `needle`.
+    fn pump_until_written(&mut self, within: Duration, needle: &[u8]) -> bool {
+        self.pump(within, |t| find(&t.output, needle).is_some())
+    }
+
+    fn pump(&mut self, within: Duration, done: impl Fn(&Self) -> bool) -> bool {
         let deadline = Instant::now() + within;
         loop {
-            if done(&self.text()) {
+            if done(self) {
                 return true;
             }
             let left = deadline.saturating_duration_since(Instant::now());
@@ -127,7 +147,7 @@ impl Terminal {
                     self.answer();
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => return done(&self.text()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return done(self),
             }
         }
     }
@@ -138,7 +158,7 @@ impl Terminal {
     fn answer(&mut self) {
         let from = self.answered.saturating_sub(8);
         let mut replies = Vec::new();
-        for (query, reply) in [(KITTY_QUERY, KITTY_REPLY), (DA1, DA1_REPLY)] {
+        for (query, reply) in [(KITTY_QUERY, KITTY_REPLY), (DA1, self.da1)] {
             let mut at = from;
             while let Some(i) = find(&self.output[at..], query).map(|i| at + i) {
                 if i + query.len() > self.answered {
@@ -347,6 +367,54 @@ fn a_client_after_another_is_shown_every_window() {
         second.pump_until(Duration::from_secs(10), whole),
         "the first tab page did not come back whole:\n{}",
         second.text()
+    );
+}
+
+/// A yank to `+` reaches the terminal's clipboard as OSC 52. Neovim turns its
+/// OSC 52 clipboard on only for a terminal it has asked whether it takes it,
+/// and asks only through a UI that says it is on a tty, as the client does;
+/// what it then writes to the terminal reaches it the same way.
+#[test]
+fn a_yank_reaches_the_terminals_clipboard() {
+    require_nvim!();
+    let scratch = Scratch::new("client-osc52");
+    let (sock, mut rpc, config) = session(&scratch, "client-osc52");
+    rpc.command("setlocal noswapfile | call setline(1, 'to the clipboard')")
+        .expect("setline");
+
+    let mut term = Terminal::spawn_answering(&sock, &config, DA1_REPLY_OSC52);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s
+            .starts_with("to the clipboard")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    // Asked through the client, and answered through it.
+    let detected = |rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>| {
+        rpc.eval("get(get(g:, 'termfeatures', {}), 'osc52', v:false)")
+            .ok()
+            .and_then(|v| v.as_bool())
+            == Some(true)
+    };
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            term.pump_until(Duration::from_millis(20), |_| false);
+            detected(&mut rpc)
+        }),
+        "Neovim never found the terminal takes OSC 52"
+    );
+
+    // The provider asked for by name: one a machine has installed — pbcopy,
+    // xclip — comes first otherwise, and this is about the terminal's.
+    rpc.command("let g:clipboard = 'osc52' | normal! \"+yy")
+        .expect("yank to +");
+    // "to the clipboard\n", in base64.
+    assert!(
+        term.pump_until_written(
+            Duration::from_secs(5),
+            b"\x1b]52;c;dG8gdGhlIGNsaXBib2FyZAo="
+        ),
+        "the yank never reached the terminal"
     );
 }
 

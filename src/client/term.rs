@@ -114,6 +114,29 @@ pub fn size() -> (usize, usize) {
     }
 }
 
+/// Whether the client's input and output are a terminal, which it tells
+/// Neovim as it attaches (`stdin_tty`, `stdout_tty`) the way Neovim's own TUI
+/// does. Under nvmux both are the pty the relay reads, and Neovim keys what it
+/// writes to a terminal on the second: `nvim_ui_send` reaches only a UI that
+/// says it has one, and the OSC 52 clipboard is turned on only for a terminal
+/// asked through such a UI (`plugin/osc52.lua`): without it, a yank to `+`
+/// finds no clipboard to go to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tty {
+    pub stdin: bool,
+    pub stdout: bool,
+}
+
+impl Tty {
+    pub fn detect() -> Self {
+        use std::io::IsTerminal;
+        Self {
+            stdin: std::io::stdin().is_terminal(),
+            stdout: std::io::stdout().is_terminal(),
+        }
+    }
+}
+
 /// The write end of the hangup pipe, for the handler.
 static HANGUP_FD: AtomicI32 = AtomicI32::new(-1);
 
