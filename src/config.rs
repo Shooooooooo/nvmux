@@ -185,8 +185,9 @@ impl EffectsSettings {
         self.enabled && self.fade.enabled
     }
 
-    /// Whether a session being moved streams stars off its name: its own
-    /// switch and the master one.
+    /// Whether a session being moved streams stars off its name, the rows it
+    /// trades places with step aside, and it lands: its own switch and the
+    /// master one.
     pub fn move_enabled(&self) -> bool {
         self.enabled && self.moving.enabled
     }
@@ -271,20 +272,26 @@ pub struct FadeSettings {
 }
 
 /// The stars a session's name streams while it is picked up to be moved, off
-/// both ends of its row (see [`crate::ui::starfield`]), and the impact when it
-/// is put down (see [`crate::ui::landing`]).
+/// both ends of its row (see [`crate::ui::starfield`]); the rows it trades
+/// places with on each move stepping aside, letting its bar go and throwing
+/// sparks (see [`crate::ui::swap`]); and the impact when it is put down (see
+/// [`crate::ui::landing`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MoveSettings {
     /// This effect's own switch, under `[effects] enabled`. Off, a session in
-    /// flight is drawn still and put down without a landing, and the picker
-    /// redraws on a key and nothing else, as it does the rest of the time.
+    /// flight is drawn still, trades places with no more than a jump, and is
+    /// put down without a landing, and the picker redraws on a key and nothing
+    /// else, as it does the rest of the time.
     ///
-    /// One switch for the flight and the landing: the landing is how the
-    /// flight ends.
+    /// One switch for the flight, its moves and the landing: they are the one
+    /// carry, from picking the session up to putting it down.
     ///
-    /// Unlike the fade, `NO_COLOR` leaves this alone: the trail and the landing
-    /// are braille and modifiers, and set no colour to begin with.
+    /// Unlike the fade, `NO_COLOR` leaves this alone. The trail, the sparks and
+    /// the landing are braille and modifiers, and the sidestep moves whole
+    /// cells; the one part in colour is a row letting the bar go, which
+    /// without colour holds it as a modifier instead, as the cursor's
+    /// afterglow does.
     pub enabled: bool,
 }
 
@@ -745,7 +752,8 @@ fn render_default_config(prefix: u8) -> String {
          \n\
          [effects.move]\n\
          # Stars streaming off both ends of a session picked up to be moved,\n\
-         # and the impact when it is put down.\n\
+         # the rows it passes stepping aside, and the impact when it is put\n\
+         # down.\n\
          # enabled = {move_enabled}\n\
          \n\
          [effects.cursor]\n\
