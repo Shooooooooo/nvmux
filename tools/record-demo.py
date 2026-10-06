@@ -43,8 +43,9 @@ The config is scratch: it lives under a temporary directory that is removed on
 exit, and your own config is never read. The demo sessions are not. nvmux has
 no override for its runtime directory, so they are created in your real one
 (/tmp/nvmux-<uid>) alongside any sessions you already have -- the names in
-NAMES and NEW_NAME must therefore be free -- and they are left running when the
-script ends (see the note it prints last). One file of yours is touched:
+SESSIONS must therefore be free -- and they are left running when the script
+ends (see the note it prints last), holding the files they opened, which are
+scratch like the config. One file of yours is touched:
 /tmp/nvmux-<uid>/nvmux.log is removed beforehand and rewritten by the demo's
 own NVMUX_LOG=nvmux=debug run, because `check_fade_ran` reads it afterwards and
 must not pass on a previous run's evidence.
@@ -77,13 +78,223 @@ COLS, ROWS = 100, 28
 # `check_clean` samples at the same rate, since this is what a frame can show.
 FPS_CAP = 60
 
-# The sessions the picker already has when the recording opens, made off camera
-# so the demo starts on a populated list rather than an empty one.
-NAMES = ["api-server", "dotfiles", "notes"]
+# The sessions the picker has when the recording opens, made off camera so the
+# demo starts on a populated list rather than an empty one -- each in a small
+# project of its own, with its files open, so what the take attaches to looks
+# like work rather than Neovim's intro screen. `:cd` first, so the statusline
+# names the file relative to the project and not under a temporary directory.
+#
+# The last file a session lists is the one on screen; the one before it is the
+# window's alternate buffer, which is what Ctrl-^ goes back to on camera.
+SESSIONS = [
+    ("api-server", ["src/main.rs"]),
+    ("dotfiles", ["zsh/.zshrc", "nvim/init.lua"]),
+    ("notes", ["todo.md"]),
+]
 
-# And the one made on camera, which the rest of the take then detaches from and
-# comes back to.
-NEW_NAME = "scratch"
+# The files those sessions open. Written under the run's temporary directory,
+# so nothing of them outlives the script but the buffers the sessions hold.
+PROJECTS = {
+    "api-server/src/main.rs": """\
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use axum::routing::get;
+use axum::Router;
+use tokio::net::TcpListener;
+use tracing::info;
+
+mod config;
+mod db;
+mod routes;
+
+/// What every handler can reach.
+#[derive(Clone)]
+pub struct AppState {
+    pub db: db::Pool,
+    pub config: Arc<config::Config>,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter("api_server=debug,tower_http=info")
+        .init();
+
+    let config = config::Config::from_env()?;
+    let db = db::connect(&config.database_url).await?;
+    db::migrate(&db).await?;
+
+    let state = AppState {
+        db,
+        config: Arc::new(config),
+    };
+
+    let app = Router::new()
+        .route("/health", get(routes::health))
+        .route("/users", get(routes::list_users))
+        .route("/users/:id", get(routes::get_user))
+        .route("/sessions", get(routes::list_sessions))
+        .with_state(state.clone());
+
+    let port = state.config.port;
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = TcpListener::bind(addr).await?;
+    info!(%addr, "listening");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
+}
+
+/// Ctrl-C or SIGTERM, whichever comes first, so a deploy
+/// drains the requests in flight instead of dropping them.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install the Ctrl-C handler");
+    };
+
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        signal(SignalKind::terminate())
+            .expect("install the SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    info!("shutting down");
+}
+""",
+    "api-server/src/routes.rs": """\
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::Json;
+
+use crate::db::{Session, User};
+use crate::AppState;
+
+pub async fn health() -> &'static str {
+    "ok"
+}
+
+pub async fn list_users(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<User>>, StatusCode> {
+    let users = state
+        .db
+        .users()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(users))
+}
+
+pub async fn get_user(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<User>, StatusCode> {
+    match state.db.user(id).await {
+        Ok(Some(user)) => Ok(Json(user)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+pub async fn list_sessions(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<Session>>, StatusCode> {
+    let sessions = state
+        .db
+        .sessions()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(sessions))
+}
+""",
+    "dotfiles/nvim/init.lua": """\
+-- Options
+vim.g.mapleader = " "
+vim.opt.number = true
+vim.opt.relativenumber = true
+vim.opt.splitright = true
+vim.opt.splitbelow = true
+vim.opt.scrolloff = 8
+vim.opt.ignorecase = true
+vim.opt.smartcase = true
+vim.opt.undofile = true
+
+-- Keys
+local map = vim.keymap.set
+map("n", "<leader>w", "<cmd>write<cr>", { desc = "Write" })
+map("n", "<leader>q", "<cmd>quit<cr>", { desc = "Quit" })
+map("n", "<C-h>", "<C-w>h", { desc = "Window left" })
+map("n", "<C-l>", "<C-w>l", { desc = "Window right" })
+map("n", "<Esc>", "<cmd>nohlsearch<cr>")
+
+-- Flash what was yanked
+vim.api.nvim_create_autocmd("TextYankPost", {
+  callback = function()
+    vim.hl.on_yank({ timeout = 150 })
+  end,
+})
+
+-- Back to where the cursor was when a file was last closed
+vim.api.nvim_create_autocmd("BufReadPost", {
+  callback = function(args)
+    local mark = vim.api.nvim_buf_get_mark(args.buf, '"')
+    local lines = vim.api.nvim_buf_line_count(args.buf)
+    if mark[1] > 0 and mark[1] <= lines then
+      pcall(vim.api.nvim_win_set_cursor, 0, mark)
+    end
+  end,
+})
+""",
+    "dotfiles/zsh/.zshrc": """\
+# History
+HISTFILE=~/.zsh_history
+HISTSIZE=50000
+SAVEHIST=50000
+setopt share_history hist_ignore_dups hist_ignore_space
+
+# Completion
+autoload -Uz compinit && compinit
+zstyle ':completion:*' matcher-list 'm:{a-z}={A-Z}'
+zstyle ':completion:*' menu select
+
+# Editor
+export EDITOR=nvim
+export VISUAL=nvim
+alias v=nvim
+alias dev='nvmux devbox'
+
+# Prompt
+autoload -Uz vcs_info
+precmd() { vcs_info }
+zstyle ':vcs_info:git:*' formats ' %b'
+setopt prompt_subst
+PROMPT='%F{blue}%~%f%F{green}${vcs_info_msg_0_}%f %# '
+""",
+    "notes/todo.md": """\
+# This week
+
+- [x] Move the API to the new database
+- [x] Drain requests on shutdown
+- [ ] Rotate the deploy keys
+- [ ] Write up Tuesday's outage
+- [ ] Review the session cleanup PR
+
+## Ideas
+
+- Cache the user lookups for a minute
+- Rate limit `/sessions` per token
+""",
+}
 
 # One theme, used twice: answered to nvmux over OSC so its fade knows what it is
 # dissolving into, and written into the asciicast header so agg renders with the
@@ -123,10 +334,15 @@ PROMPT = "\\[\\e[2K\\]\\[\\r\\]\\[\\e[38;5;71m\\]$\\[\\e[0m\\] "
 ENTER = b"\r"
 ESCAPE = b"\x1b"
 DOWN = b"\x1b[B"
+UP = b"\x1b[A"
 PREFIX = b"\x00"
 # Ctrl-L, which is readline's clear-screen: it reprints PS1 and echoes nothing
 # of its own. `shell` uses it to put the prompt into the recording.
 REDRAW = b"\x0c"
+# Neovim's half-page scrolls, and its alternate buffer.
+CTRL_D = b"\x04"
+CTRL_U = b"\x15"
+CTRL_CARET = b"\x1e"
 
 
 def font_installed():
@@ -197,12 +413,13 @@ class Screen:
 
     # The strings that never draw anything -- DCS, SOS, PM and APC. pyte has no
     # parser for them and prints their bodies as text, which is not harmless
-    # even off screen: it moves pyte's cursor. Neovim's client sends an
-    # XTGETTCAP (`ESC P + q 4D73 ESC \`) as it attaches, pyte's cursor ended six
-    # columns right of the real one, and the key strip -- which puts the cursor
-    # back where this class says it is -- dragged the GIF's cursor off the end
-    # of the line for the rest of the take. So they are cut out before pyte
-    # sees them, and one still open at the end of a read is held for the next.
+    # even off screen: it moves pyte's cursor. Neovim sends an XTGETTCAP (`ESC P
+    # + q 4D73 ESC \`) through its client as it attaches, pyte's cursor ended
+    # six columns right of the real one, and the key strip -- which puts the
+    # cursor back where this class says it is -- dragged the GIF's cursor off
+    # the end of the line for the rest of the take. So they are cut out before
+    # pyte sees them, and one still open at the end of a read is held for the
+    # next.
     STRING = re.compile(rb"\x1b[P_^X].*?(?:\x1b\\|\x07)", re.S)
     OPEN = re.compile(rb"\x1b(?:[P_^X].*)?\Z", re.S)
 
@@ -440,18 +657,21 @@ class Terminal:
         return any("\u25b8" in line and name in line
                    for line in self.text().split("\n"))
 
-    def select(self, name, limit=6):
-        """Step down to a session, and make sure that is where we landed.
+    def select(self, name, key=None, limit=6):
+        """Step to a session, and make sure that is where we landed.
 
         Stepping rather than jumping: it shows the picker being navigated, and
         it does not care where the selection started or what number the session
-        was given. Checked before returning, because attaching to the wrong one
+        was given -- the list wraps, so either way gets there. Down unless `key`
+        says up. Checked before returning, because attaching to the wrong one
         would look perfectly plausible on camera.
         """
+        key = key or DOWN
+        cap = "\u2191" if key == UP else "\u2193"
         for _ in range(limit):
             if self.is_selected(name):
                 return
-            self.write(DOWN, wait=0.55, show=("\u2193", "move"))
+            self.write(key, wait=0.55, show=(cap, "move"))
         if not self.is_selected(name):
             self.close()
             sys.exit("the selection never reached %r:\n%s" % (name, self.text()))
@@ -494,16 +714,33 @@ def shell(env, record=False):
     return term
 
 
-def make_sessions(env):
-    """Create the sessions the picker already has, off camera."""
+def write_projects(root):
+    """The files the demo sessions open, under `root`."""
+    for path, text in PROJECTS.items():
+        full = os.path.join(root, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as f:
+            f.write(text)
+
+
+def make_sessions(env, projects):
+    """Create the sessions the picker already has, off camera, each with its
+    project's files open."""
     term = shell(env)
     term.type("nvmux\n", wait=0.3)
     term.expect("attach", "the picker")
-    for name in NAMES:
+    for name, files in SESSIONS:
         term.write(b"c", wait=1.0)
         term.expect("new session name", "the create prompt")
         term.type(name, wait=0.5)
         term.write(ENTER, wait=4.0)                  # creates, then attaches
+        term.expect("NVIM v", "%s to paint" % name)
+        # `nowrap`, so a split is a narrower view of the same lines rather
+        # than the same lines folded in half.
+        opens = " | ".join("edit %s" % f for f in files)
+        term.type(":cd %s | %s | set nowrap\r"
+                  % (os.path.join(projects, name), opens), wait=1.0)
+        term.expect(files[-1], "%s to open %s" % (name, files[-1]))
         term.write(PREFIX + b" ", wait=2.0)          # one write, so the chord
         term.expect("attach", "the picker after %s" % name)   # fits keys.timeout_ms
         print("  created %s" % name)
@@ -518,45 +755,54 @@ def perform(env):
 
     # 1. the picker, with the sessions that already exist
     term.type("nvmux", per_char=0.09, wait=0.5)
-    term.write(ENTER, wait=0.2, show=("⏎", "open the picker"))
+    term.write(ENTER, wait=0.2, show=("\u23ce", "open the picker"))
     term.expect("attach", "the picker")
-    time.sleep(1.8)
-
-    # 2. make one, which is `c` and a name
-    term.write(b"c", wait=0.6, show=("c", "new session"))
-    term.expect("new session name", "the create prompt")
-    time.sleep(0.8)
-    term.type(NEW_NAME, per_char=0.1, wait=0.9)
-    term.write(ENTER, wait=0.2, show=("⏎", "create"))
-
-    # 3. creating attaches to it
-    term.expect("[No Name]", "the new session to paint")
     time.sleep(1.6)
 
-    term.write(b"i", wait=0.5, show=("i", "insert"))
-    term.type("a session that outlives the connection", per_char=0.05, wait=0.7)
-    term.write(ESCAPE, wait=1.4, show=("Esc", "normal"))
+    # 2. into one: the editor as it was left, drawn by nvmux's own client
+    term.select("api-server")
+    time.sleep(0.4)
+    term.write(ENTER, wait=0.2, show=("\u23ce", "attach"))
+    term.expect("AppState", "api-server to paint")
+    time.sleep(1.4)
 
-    # 4. detach: the session keeps running, nvmux exits
+    # 3. the client animates: a scroll slides, a split flies in from its side
+    term.write(CTRL_D, wait=1.1, show=("Ctrl-d", "scroll"))
+    term.write(CTRL_D, wait=1.1, show=("Ctrl-d", "scroll"))
+    term.write(CTRL_U, wait=1.2, show=("Ctrl-u", "scroll"))
+    term.type(":vsplit src/routes.rs", per_char=0.06, wait=0.4)
+    term.write(ENTER, wait=0.2, show=("\u23ce", "split"))
+    term.expect("list_users(", "the split to open")
+    time.sleep(1.8)
+
+    # 4. the next session, without the picker; a buffer switch fades over
+    term.write(PREFIX + b"n", show=("Ctrl-Space  n", "next session"))
+    term.expect("init.lua", "dotfiles to paint")
+    time.sleep(1.8)
+    term.write(CTRL_CARET, wait=0.2, show=("Ctrl-^", "other buffer"))
+    term.expect("HISTFILE", "the other buffer")
+    time.sleep(1.6)
+
+    # 5. detach: the sessions keep running, nvmux exits
     term.write(PREFIX + b"d", show=("Ctrl-Space  d", "detach"))
     # The editor has to be gone, and waiting for the prompt does not say that:
     # leaving the alternate screen restores the shell's screen, which already
     # carries the `$` from before nvmux was started. That check passes the
     # instant the alternate screen is left -- before the detach has finished --
     # and the `nvmux` typed next then lands in the editor instead of the shell.
-    term.expect_gone("[No Name]", "the editor")
+    term.expect_gone("HISTFILE", "the editor")
     term.expect("$", "the shell prompt back")
-    time.sleep(1.8)
+    time.sleep(1.6)
 
-    # 5. come back -- the session made a moment ago is in the list now
+    # 6. come back: the split is where it was left
     term.type("nvmux", per_char=0.09, wait=0.4)
-    term.write(ENTER, wait=0.2, show=("⏎", "open the picker"))
+    term.write(ENTER, wait=0.2, show=("\u23ce", "open the picker"))
     term.expect("attach", "the picker again")
-    time.sleep(1.4)
-    term.select(NEW_NAME)
-    time.sleep(0.7)
-    term.write(ENTER, wait=0.2, show=("⏎", "attach"))
-    term.expect("outlives", "the text to still be there")
+    time.sleep(1.2)
+    term.select("api-server", key=UP)
+    time.sleep(0.5)
+    term.write(ENTER, wait=0.2, show=("\u23ce", "attach"))
+    term.expect("list_users(", "the split to still be there")
     time.sleep(2.6)
 
     with term.lock:
@@ -760,6 +1006,43 @@ def whole_writes(events):
     return out
 
 
+SYNC_BEGIN = b"\x1b[?2026h"
+SYNC_END = b"\x1b[?2026l"
+
+
+def synchronized(events, cap=0.15):
+    """The writes, re-cut so that a synchronized update is one write.
+
+    nvmux's own client draws every frame between `?2026h` and `?2026l`, and a
+    terminal that knows the mode shows none of a frame until all of it has
+    come. agg does not know it: it draws whatever has arrived at the moment it
+    samples, and a frame that took two pty reads -- a whole window's worth of
+    text, say, as a split flies in -- is sampled half drawn, with the rows
+    below the cut still showing the frame before. So what follows a `?2026h`
+    is held back until its `?2026l`, and goes out at that one's time, as a
+    terminal would show it. An update left open longer than `cap` goes out
+    anyway, as terminals let one time out.
+    """
+    out, carry, since = [], b"", None
+    for t, chunk in events:
+        data = carry + chunk
+        begin = data.rfind(SYNC_BEGIN)
+        held = begin != -1 and data.find(SYNC_END, begin) == -1
+        if held and since is not None and t - since > cap:
+            held = False
+        if held:
+            if data[:begin]:
+                out.append((t, data[:begin]))
+            carry = data[begin:]
+            since = t if since is None else since
+        else:
+            out.append((t, data))
+            carry, since = b"", None
+    if carry:
+        out.append((events[-1][0], carry))
+    return out
+
+
 def with_key_strip(events, presses, hold=0.9):
     """Draw the pressed key on rows nvmux does not know exist.
 
@@ -776,7 +1059,7 @@ def with_key_strip(events, presses, hold=0.9):
     cast time -- every badge would drift away from the action it belongs to.
     In the stream, agg compresses the badge and the content together.
     """
-    events = whole_writes(events)
+    events = whole_writes(synchronized(events))
     row = ROWS + 2
     screen = Screen()
     # A change of what the strip shows, at the moment it changes.
@@ -851,7 +1134,9 @@ def main():
 
     try:
         print("creating demo sessions...")
-        make_sessions(env)
+        projects = os.path.join(tmp, "projects")
+        write_projects(projects)
+        make_sessions(env, projects)
 
         print("recording...")
         events, presses = perform(env)

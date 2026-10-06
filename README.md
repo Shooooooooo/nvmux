@@ -10,10 +10,11 @@ Create named Neovim sessions, attach to them, detach, and come back later —
 with the editor running on a remote host while every keystroke and every pixel
 of rendering happens on your own terminal.
 
-![Creating a session from the nvmux picker, typing in Neovim, detaching with the prefix key, then relaunching nvmux and reattaching to the same buffer, with each key shown as it is pressed.](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/demo.gif)
+![Opening the nvmux picker on three sessions and attaching to one; scrolling, the text sliding, and opening a split that flies in from the side; switching to the next session with the prefix key, and to another buffer as it fades over; detaching, then relaunching nvmux and reattaching to find the split where it was. Each key is shown as it is pressed.](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/demo.gif)
 
-Make a session, type in it, detach, come back: the editor, its buffers and its
-undo history are where you left them.
+Attach, work, hop to another session, detach, come back: the editor, its
+windows and its buffers are where you left them — and nvmux's own client
+animates the scrolls, splits and switches on the way.
 
 [Why not tmux?](#why-not-tmux) · [Requirements](#requirements) · [Install](#install) · [Use](#use) · [How it works](#how-it-works) · [Configuration](#configuration)
 
