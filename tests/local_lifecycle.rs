@@ -19,6 +19,25 @@ use common::{command_line, Scratch};
 use nvmux::session::{Liveness, Session};
 use nvmux::transport::Transport;
 
+/// Have [`nvmux::pty::spawn`] start Neovim's own client, `nvim --remote-ui`.
+/// The default is nvmux's own, which `spawn` starts as the running executable
+/// with `--client` — and running here, that is this test binary, not nvmux.
+/// The attaches here are about how the relay reaches a session that cannot
+/// answer, whichever client it starts; `tests/client.rs` has nvmux's own.
+fn neovims_client() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut settings = nvmux::config::Settings::default();
+        settings.client.ui = nvmux::config::Ui::Nvim;
+        nvmux::config::init(settings);
+    });
+    assert_eq!(
+        nvmux::config::get().client.ui,
+        nvmux::config::Ui::Nvim,
+        "the settings were read before they were set"
+    );
+}
+
 #[test]
 fn create_list_and_kill_a_session() {
     require_nvim!();
@@ -1028,6 +1047,7 @@ fn probe_is_busy_at_a_hit_enter_prompt_and_alive_after_it() {
 #[test]
 fn a_fresh_attach_to_a_session_at_a_hit_enter_prompt_ends_it_and_attaches() {
     require_nvim!();
+    neovims_client();
     let scratch = Scratch::new("hitenterattach");
     let t = scratch.transport();
     let session = t
@@ -1082,6 +1102,7 @@ fn a_fresh_attach_to_a_session_at_a_hit_enter_prompt_ends_it_and_attaches() {
 #[test]
 fn a_session_waiting_for_a_key_is_attached_to_without_being_typed_at() {
     require_nvim!();
+    neovims_client();
     let scratch = Scratch::new("blockedattach");
     let t = scratch.transport();
     let session = t
@@ -1117,6 +1138,7 @@ fn a_session_waiting_for_a_key_is_attached_to_without_being_typed_at() {
 #[test]
 fn a_key_ends_the_wait_and_releases_what_was_queued_behind_it() {
     require_nvim!();
+    neovims_client();
     let scratch = Scratch::new("blockedkey");
     let t = scratch.transport();
     let session = t

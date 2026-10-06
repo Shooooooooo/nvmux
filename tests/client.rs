@@ -303,6 +303,41 @@ fn the_client_draws_a_session_and_types_into_it() {
     );
 }
 
+/// A session waiting for a key nvmux may not press for the user — a
+/// half-typed `g`, which over RPC is also what a crashed callback leaves — is
+/// drawn once the user presses one. Neovim holds the client's attach behind
+/// the key; the client sends keys from the start all the same, and types
+/// nothing of its own. The relay's half is in `tests/local_lifecycle.rs`.
+#[test]
+fn a_session_waiting_for_a_key_is_drawn_once_one_is_pressed() {
+    require_nvim!();
+    let scratch = Scratch::new("client-blocked");
+    let (sock, mut rpc, config) = session(&scratch, "client-blocked");
+    let marker = "waiting for a key";
+    rpc.command(&format!(
+        "setlocal noswapfile | call setline(1, \"{marker}\")"
+    ))
+    .expect("setline");
+    common::block_on_a_key(&sock);
+
+    let mut term = Terminal::spawn(&sock, &config);
+    // Time enough to attach, were the session answering.
+    term.pump_until(Duration::from_secs(1), |_| false);
+    let mode = common::mode(&sock).expect("the mode is a fast call");
+    assert!(
+        mode.blocking && mode.mode == "n",
+        "the client typed into a state it cannot identify: {mode:?}"
+    );
+
+    term.type_bytes(b"\x1b");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.starts_with(marker)),
+        "the session was never drawn:\n{}",
+        term.text()
+    );
+    assert_eq!(multigrid_uis(&mut rpc), vec![true], "windows of their own");
+}
+
 /// A second client is shown everything the first was — the windows, a float
 /// with its border, and a tab page it has never seen when it is first shown —
 /// though Neovim sends a UI attaching after another none of them.

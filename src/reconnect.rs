@@ -2,7 +2,7 @@
 //!
 //! A session over ssh is reached through one master connection, and when that
 //! goes — the laptop slept, the Wi-Fi changed, a VPN renewed — the forward
-//! closes under the `--remote-ui` client and the client leaves, exactly as it
+//! closes under the client on the pty and the client leaves, exactly as it
 //! would have if the session had been quit. The session itself is untouched:
 //! the editor runs on the far side and never noticed. So the client's exit is
 //! not the end of anything, and this module is what turns it back into the

@@ -17,10 +17,10 @@ fn main() -> Result<()> {
     let dir = paths::ensure_runtime_dir().context("preparing the nvmux runtime directory")?;
     logging::init(&dir)?;
 
-    // nvmux's own client, which an nvmux started on a pty in place of `nvim
-    // --remote-ui` (see `nvmux::client`). Nothing below is its business: it
-    // has a session to draw and a relay to draw it for. Its failures are
-    // logged rather than printed, since what it prints is drawn.
+    // nvmux's own client, which an nvmux started on a pty to draw a session
+    // (see `nvmux::client`). Nothing below is its business: it has a session to
+    // draw and a relay to draw it for. Its failures are logged rather than
+    // printed, since what it prints is drawn.
     if let Some(sock) = &cli.client {
         if let Err(e) = nvmux::client::run(sock) {
             tracing::warn!(error = %format!("{e:#}"), "client: ended on an error");
@@ -231,7 +231,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             let opened = match attached.take() {
                 Some(a) if a.session_id == current.id => Ok(Some(a)),
                 // Retiring the old client leaves its server running: killing a
-                // --remote-ui client does not kill a --headless --listen server.
+                // client does not kill a --headless --listen server.
                 //
                 // Hung up first and reaped after, with the new client's spawn —
                 // or, where it was begun early, the wait for its probe — in

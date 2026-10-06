@@ -1,12 +1,13 @@
-//! nvmux's own Neovim client: `[client] ui = "nvmux"`.
+//! nvmux's own Neovim client: what draws a session unless `[client] ui =
+//! "nvim"` asks for Neovim's.
 //!
-//! nvmux draws a session with `nvim --remote-ui` unless told otherwise, and
-//! says why in [`crate::pty`]: that client is Neovim's own, it negotiates with
-//! the terminal itself, and everything the terminal can do reaches the editor
-//! untouched. This is the other choice, for the one thing that client will not
-//! do — move. Neovide animates the cursor, the scroll and the windows of a
-//! Neovim it draws in a window of its own; this client draws in the terminal,
-//! and animates as much of the same as a grid of character cells allows:
+//! Neovim's own client, `nvim --remote-ui`, negotiates with the terminal
+//! itself, and everything the terminal can do reaches the editor as Neovim
+//! negotiated it (see [`crate::pty`]). What that client will not do is move.
+//! Neovide animates the cursor, the scroll and the windows of a Neovim it
+//! draws in a window of its own; this client draws in the terminal, as that
+//! one does, and animates as much of the same as a grid of character cells
+//! allows:
 //!
 //! - the cursor travels between cells instead of jumping, its leading edge
 //!   ahead of its trailing one, so a long jump leaves a smear behind it, drawn

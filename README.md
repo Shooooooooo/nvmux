@@ -21,25 +21,25 @@ undo history are where you left them.
 
 | | tmux over ssh | nvmux |
 |---|---|---|
-| Who draws the screen | tmux re-renders the editor from its own grid | Neovim's own client draws straight to your terminal |
-| Terminal features | have to survive a trip through tmux; some need coaxing | negotiated between Neovim and your terminal directly |
+| Who draws the screen | tmux re-renders the editor from its own grid | a Neovim client: nvmux's own, animated, or Neovim's, straight to your terminal |
+| Terminal features | have to survive a trip through tmux; some need coaxing | negotiated by that client with your terminal, through a relay that never rewrites them |
 | What it holds | any program, in panes and windows | Neovim sessions, and nothing else |
 
 That last row is the trade: nvmux is not a tmux replacement. It does one thing,
-which is why it can hand Neovim your terminal rather than an imitation of one.
+which is why it can draw Neovim from Neovim's own account of its screen — or
+hand Neovim your terminal outright — rather than an imitation of one.
 
 ## Requirements
 
 | Where | Needs |
 |---|---|
-| Local | `nvim` >= 0.11, and `ssh` for `nvmux <host>` |
+| Local | `nvim` >= 0.11 for local sessions, and `ssh` for `nvmux <host>` |
 | Remote | `nvim` >= 0.11 |
 
 0.11 specifically, on both ends: that is the release where `:detach` and
-`:connect` landed. The local `nvim` runs local sessions and Neovim's own
-client, the default; with nvmux's own client (`[client] ui = "nvmux"`, see
-[An animated client](#an-animated-client)), `nvmux <host>` needs only `ssh`
-locally.
+`:connect` landed. `nvmux <host>` needs no local `nvim` — unless sessions are
+drawn by Neovim's own client (`[client] ui = "nvim"`), which is `nvim
+--remote-ui`.
 
 ## Install
 
@@ -100,17 +100,19 @@ the screen; it goes as soon as the next key resolves it.
 
 ## How it works
 
-nvmux is a **thin multiplexer**: it does not render Neovim's UI. Neovim already
-ships a client that does, so nvmux runs it and passes the bytes through
-untouched — which is why bracketed paste, the kitty keyboard protocol,
-truecolor, OSC 52 clipboard and DA1/XTGETTCAP round-trips all just work.
+nvmux is a **thin multiplexer**: each session is drawn by a client of its own,
+on a pty whose bytes nvmux passes through untouched — which is why bracketed
+paste, the kitty keyboard protocol, truecolor, OSC 52 clipboard and
+DA1/XTGETTCAP round-trips all just work. That client is nvmux's own, unless
+`[client] ui = "nvim"` makes it Neovim's (see
+[An animated client](#an-animated-client)).
 
 ```
 LOCAL                                    REMOTE
 nvmux                                    nvim --headless --listen <sock>
  ├─ picker UI (ratatui)                  nvim --headless --listen <sock>
  ├─ PTY proxy (watches for <prefix>)     nvim --headless --listen <sock>
- └─ clients: nvim --server … --remote-ui   (detached, survive an SSH drop)
+ └─ clients: nvmux --client …              (detached, survive an SSH drop)
       │                                             ▲
       └──── one persistent ssh master ──────────────┘
             (ControlMaster/ControlPersist), plus one
@@ -125,14 +127,14 @@ session is still running; `nvmux <host>` picks it up again.
 
 ### An animated client
 
-Set `ui = "nvmux"` under `[client]` and nvmux draws the editor with its own
-client instead of Neovim's, so that it can animate it: scrolls slide, split
-windows fly in, fly out and resize as in
-[animate.nvim](https://github.com/Shooooooooo/animate.nvim), floats glide as in
-[Neovide](https://neovide.dev), and a smeared cursor, particles and a fading
-blink can be turned on under `[effects]`. Neovim's own client stays the
-default: with it, what the terminal can do reaches the editor as Neovim
-negotiates it, not through nvmux.
+By default nvmux draws the editor with its own client rather than Neovim's,
+so that it can animate it: scrolls slide, split windows fly in, fly out and
+resize as in [animate.nvim](https://github.com/Shooooooooo/animate.nvim),
+floats glide as in [Neovide](https://neovide.dev), and a smeared cursor,
+particles and a fading blink can be turned on under `[effects]`. Set
+`ui = "nvim"` under `[client]` for Neovim's own client instead: with it, what
+the terminal can do reaches the editor as Neovim negotiates it, not through
+nvmux.
 
 ## Configuration
 
@@ -152,9 +154,9 @@ timeout_ms = 1000           # how long a lone prefix or half-typed number waits
 command = "nvim --headless --listen {sock}"   # {sock} is required
 
 [client]
-ui          = "nvim" # who draws a session: Neovim's own client, or "nvmux"'s, animated
-per_session = true   # keep each session's client; a switch back reuses it
-lazy        = true   # start a client on its first visit; false starts all at launch
+ui          = "nvmux" # who draws a session: nvmux's own client, animated; or "nvim"
+per_session = true    # keep each session's client; a switch back reuses it
+lazy        = true    # start a client on its first visit; false starts all at launch
 
 [effects]
 enabled = true   # master switch: false turns every effect below off
@@ -185,7 +187,7 @@ enabled = true   # rows a filter keystroke drops fade out before the list closes
 [effects.create]
 enabled = true   # c opens a gap where the new session goes, then the prompt
 
-# The rest are for the animated client, [client] ui = "nvmux".
+# The rest are for nvmux's own client, the default ui.
 
 [effects.smear]
 enabled = false   # the cursor travels between cells, smearing across a long jump

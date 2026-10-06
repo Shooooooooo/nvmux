@@ -71,7 +71,8 @@
 //! in ordinary use answers. A reproduction that does not is measuring a
 //! different program: on one that left the query unanswered the client sent
 //! not one span, nor a single `ESC 7`, and every measurement taken there was
-//! of the branch almost nobody runs.
+//! of the branch almost nobody runs. nvmux's own client does not ask: it
+//! brackets every frame from the first, unless `'termsync'` is off.
 
 use std::time::{Duration, Instant};
 

@@ -82,20 +82,21 @@ pub struct SessionSettings {
 }
 
 /// The client that draws a session, on the pty nvmux relays (see
-/// [`crate::pty`]): Neovim's own, `nvim --remote-ui`, unless `ui` says
-/// nvmux's.
+/// [`crate::pty`]): nvmux's own, `nvmux --client`, unless `ui` says
+/// Neovim's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClientSettings {
     /// Which client draws a session.
     ///
-    /// `"nvim"`, the default, is Neovim's own TUI: everything the terminal
-    /// can do reaches the editor exactly as Neovim negotiated it, because
-    /// Neovim did the negotiating. `"nvmux"` is nvmux's own client
-    /// ([`crate::client`]), which draws the editor itself and so can animate
-    /// it as Neovide does — the cursor travelling, the scroll, windows moving
-    /// — under `[effects.smear]`, `[effects.particles]`, `[effects.scroll]`,
-    /// `[effects.windows]` and `[effects.blink]`.
+    /// `"nvmux"`, the default, is nvmux's own client ([`crate::client`]),
+    /// which draws the editor itself and so can animate it — the scroll,
+    /// windows moving, and if they are turned on the cursor travelling, its
+    /// particles and its blink — under `[effects.smear]`,
+    /// `[effects.particles]`, `[effects.scroll]`, `[effects.windows]` and
+    /// `[effects.blink]`. `"nvim"` is Neovim's own TUI: everything the
+    /// terminal can do reaches the editor exactly as Neovim negotiated it,
+    /// because Neovim did the negotiating.
     pub ui: Ui,
     /// Keep one client per session rather than one in all.
     ///
@@ -163,7 +164,7 @@ pub struct ClientSettings {
 impl Default for ClientSettings {
     fn default() -> Self {
         Self {
-            ui: Ui::Nvim,
+            ui: Ui::Nvmux,
             per_session: true,
             lazy: true,
         }
@@ -175,9 +176,9 @@ impl Default for ClientSettings {
 #[serde(rename_all = "lowercase")]
 pub enum Ui {
     /// `nvim --remote-ui`: Neovim's own TUI.
-    #[default]
     Nvim,
     /// `nvmux --client`: nvmux's own, animated (see [`crate::client`]).
+    #[default]
     Nvmux,
 }
 
@@ -927,10 +928,10 @@ fn render_default_config(prefix: u8) -> String {
          # every session as nvmux starts, so a first visit waits for nothing,\n\
          # at the cost above for every session rather than every one visited.\n\
          # lazy = {lazy}\n\
-         # Which client draws a session: \"nvim\" is Neovim's own, and everything\n\
-         # the terminal can do reaches the editor as Neovim negotiated it;\n\
-         # \"nvmux\" is nvmux's own, which animates the editor as Neovide does —\n\
-         # the [effects.smear] tables and those after it below.\n\
+         # Which client draws a session: \"nvmux\" is nvmux's own, which animates\n\
+         # the editor — the [effects.smear] tables and those after it below;\n\
+         # \"nvim\" is Neovim's own, and everything the terminal can do reaches\n\
+         # the editor as Neovim negotiated it.\n\
          # ui = {ui:?}\n\
          \n\
          [effects]\n\
@@ -1136,7 +1137,7 @@ mod tests {
             [session]\n\
             command = \"nvim --headless --listen {sock}\"\n\
             [client]\n\
-            ui = \"nvim\"\n\
+            ui = \"nvmux\"\n\
             per_session = true\n\
             lazy = true\n\
             [effects]\n\
@@ -1319,13 +1320,12 @@ mod tests {
         assert!(!s.client.lazy && !s.client.per_session);
     }
 
-    /// Neovim's own client unless told otherwise: nvmux's is the choice to
-    /// make, not the one made for you.
+    /// nvmux's own client unless told otherwise; Neovim's is a line away.
     #[test]
-    fn a_session_is_drawn_by_neovims_client_unless_told() {
-        assert_eq!(Settings::default().client.ui, Ui::Nvim);
-        let s: Settings = toml::from_str("[client]\nui = \"nvmux\"\n").expect("valid");
-        assert_eq!(s.client.ui, Ui::Nvmux);
+    fn a_session_is_drawn_by_nvmuxs_client_unless_told() {
+        assert_eq!(Settings::default().client.ui, Ui::Nvmux);
+        let s: Settings = toml::from_str("[client]\nui = \"nvim\"\n").expect("valid");
+        assert_eq!(s.client.ui, Ui::Nvim);
         assert!(s.client.per_session && s.client.lazy, "the rest as it was");
     }
 
@@ -1578,7 +1578,7 @@ mod tests {
         for line in [
             "# per_session = true",
             "# lazy = true",
-            "# ui = \"nvim\"",
+            "# ui = \"nvmux\"",
             "# enabled     = true",
             "# duration_ms = 200",
             "# session     = true",

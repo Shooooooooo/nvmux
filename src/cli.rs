@@ -31,9 +31,9 @@ pub struct Cli {
     #[arg(value_name = "HOST")]
     pub host: Option<String>,
 
-    /// Run as nvmux's own Neovim client for the session at this socket, on
-    /// the pty nvmux relays — what nvmux starts in place of `nvim
-    /// --remote-ui` with `[client] ui = "nvmux"` (see [`crate::client`]).
+    /// Run as nvmux's own Neovim client for the session at this socket, on the
+    /// pty nvmux relays — what nvmux starts to draw a session unless `[client]
+    /// ui = "nvim"` asks for `nvim --remote-ui` (see [`crate::client`]).
     /// Hidden: a flag for nvmux to give itself, not a way to run it.
     #[arg(long, value_name = "SOCK", hide = true, conflicts_with = "host")]
     pub client: Option<std::path::PathBuf>,
