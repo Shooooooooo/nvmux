@@ -120,6 +120,36 @@ at once and then six retries over about a minute. If the host is still
 unreachable after that, nvmux exits with the reason and a reminder that the
 session is still running; `nvmux <host>` picks it up again.
 
+### An animated client
+
+Neovim's own client draws each cell where it goes, at once. With
+
+```toml
+[client]
+ui = "nvmux"
+```
+
+nvmux draws the editor itself instead, with its own client in the same place
+on the same pty, and animates what [Neovide](https://neovide.dev) does as far
+as a grid of character cells allows:
+
+- the cursor travels between cells, its leading edge ahead of its trailing one,
+  so a long jump smears across the screen — drawn in block elements, at a
+  quarter of a cell or finer;
+- sparks, rings or an outline off the cursor as it moves (Neovide's `railgun`,
+  `torpedo`, `pixiedust`, `sonicboom`, `ripple` and `wireframe`; off unless
+  turned on);
+- a scroll slides the text through its window a row at a time;
+- a window, a float or the message area slides to where it moves to;
+- floats cast a shadow, and a blinking block cursor can fade rather than flash.
+
+What a terminal cannot do is not imitated: no blur, no motion of text finer
+than a cell. And the trade is the one the table at the top is about: the screen
+is drawn from nvmux's own copy of the editor's grid, and what the terminal can
+do reaches the editor through nvmux's client rather than as Neovim negotiated
+it — which is why Neovim's own client stays the default. Each animation has a
+table of its own under `[effects]`, below.
+
 ## Configuration
 
 nvmux needs no configuration. An optional TOML file — `$NVMUX_CONFIG` if set,
@@ -138,6 +168,7 @@ timeout_ms = 1000           # how long a lone prefix or half-typed number waits
 command = "nvim --headless --listen {sock}"   # {sock} is required
 
 [client]
+ui          = "nvim" # who draws a session: Neovim's own client, or "nvmux"'s, animated
 per_session = true   # keep each session's client; a switch back reuses it
 lazy        = true   # start a client on its first visit; false starts all at launch
 
@@ -169,6 +200,39 @@ enabled = true   # rows a filter keystroke drops fade out before the list closes
 
 [effects.create]
 enabled = true   # c opens a gap where the new session goes, then the prompt
+
+# The rest are for the animated client, [client] ui = "nvmux".
+
+[effects.smear]
+enabled     = true   # the cursor travels between cells rather than jumping
+duration_ms = 150    # how long a move takes to settle
+short_ms    = 40     # a move of a cell or two along a line — typing — and no trail
+trail       = 0.8    # 0: the edges move together; 1: the leading one is there at once
+insert      = true   # travel in insert mode too
+cmdline     = true   # and to and along the command line
+
+[effects.particles]
+enabled     = false       # what flies off the cursor as it moves
+mode        = "railgun"   # railgun, torpedo, pixiedust, sonicboom, ripple, wireframe
+opacity     = 0.8         # how strongly a particle shows at its brightest
+lifetime_ms = 500
+density     = 2.0         # particles to a cell of the cursor's travel
+speed       = 6.0         # cells a second
+
+[effects.scroll]
+enabled     = true   # a scroll slides the text through its window
+duration_ms = 300
+far_lines   = 1      # how much of a jump further than the window is tall slides
+
+[effects.windows]
+enabled     = true   # a window, a float or the messages slide to where they move
+duration_ms = 150
+
+[effects.shadow]
+enabled = true   # floats cast a shadow down and to the right
+
+[effects.blink]
+enabled = false   # a blinking block cursor fades out and back in
 ```
 
 </details>

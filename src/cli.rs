@@ -30,6 +30,13 @@ pub struct Cli {
     /// your `~/.ssh/config`.
     #[arg(value_name = "HOST")]
     pub host: Option<String>,
+
+    /// Run as nvmux's own Neovim client for the session at this socket, on
+    /// the pty nvmux relays — what nvmux starts in place of `nvim
+    /// --remote-ui` with `[client] ui = "nvmux"` (see [`crate::client`]).
+    /// Hidden: a flag for nvmux to give itself, not a way to run it.
+    #[arg(long, value_name = "SOCK", hide = true, conflicts_with = "host")]
+    pub client: Option<std::path::PathBuf>,
 }
 
 impl Cli {
@@ -76,6 +83,20 @@ mod tests {
             Cli::command().get_subcommands().next().is_none(),
             "v0.1 has no subcommands"
         );
+    }
+
+    /// nvmux's own client is the same binary with a flag nobody else is
+    /// told about: hidden from `--help`, and no host with it.
+    #[test]
+    fn the_client_flag_is_hidden_and_takes_a_socket() {
+        let cli = Cli::try_parse_from(["nvmux", "--client", "/tmp/x.sock"]).expect("parse");
+        assert_eq!(
+            cli.client.as_deref(),
+            Some(std::path::Path::new("/tmp/x.sock"))
+        );
+        assert!(Cli::try_parse_from(["nvmux", "host", "--client", "/tmp/x.sock"]).is_err());
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("--client"), "{help}");
     }
 
     #[test]

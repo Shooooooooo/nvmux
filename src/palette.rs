@@ -67,6 +67,41 @@ pub struct Palette {
 }
 
 impl Palette {
+    /// The palette as one line of text, for handing to a child process in its
+    /// environment: nvmux's own client asks nothing of the terminal itself
+    /// (see [`crate::client::PALETTE_ENV`]). The default foreground, the
+    /// default background and the sixteen, each `rrggbb`, colon-separated.
+    pub fn to_env(&self) -> String {
+        std::iter::once(&self.fg)
+            .chain(std::iter::once(&self.bg))
+            .chain(self.ansi.iter())
+            .map(|Rgb(r, g, b)| format!("{r:02x}{g:02x}{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    }
+
+    /// [`Palette::to_env`] read back; `None` for anything else.
+    pub fn from_env(text: &str) -> Option<Palette> {
+        let colours: Vec<Rgb> = text
+            .split(':')
+            .map(|hex| {
+                if hex.len() != 6 {
+                    return None;
+                }
+                let n = u32::from_str_radix(hex, 16).ok()?;
+                Some(Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8))
+            })
+            .collect::<Option<_>>()?;
+        let [fg, bg, ansi @ ..] = colours.as_slice() else {
+            return None;
+        };
+        Some(Palette {
+            fg: *fg,
+            bg: *bg,
+            ansi: ansi.try_into().ok()?,
+        })
+    }
+
     /// The colour behind an indexed SGR (`38;5;n` / `48;5;n`): the terminal's
     /// own for the first sixteen, and xterm's fixed 6×6×6 cube and grey ramp
     /// for the rest, which every terminal shares.
@@ -87,7 +122,7 @@ impl Palette {
 }
 
 /// xterm's default sixteen, for a terminal that does not answer OSC 4.
-const XTERM_ANSI: [Rgb; 16] = [
+pub(crate) const XTERM_ANSI: [Rgb; 16] = [
     Rgb(0x00, 0x00, 0x00),
     Rgb(0xcd, 0x00, 0x00),
     Rgb(0x00, 0xcd, 0x00),
@@ -372,6 +407,21 @@ mod tests {
             bg: Rgb(0x10, 0x10, 0x10),
             ansi: XTERM_ANSI,
         }
+    }
+
+    /// What a parent hands its client down is what the client reads back,
+    /// and nothing else reads as a palette.
+    #[test]
+    fn a_palette_survives_the_environment() {
+        let mut p = palette();
+        p.ansi[3] = Rgb(1, 2, 3);
+        let text = p.to_env();
+        assert_eq!(text.split(':').count(), 18);
+        assert_eq!(Palette::from_env(&text), Some(p));
+        assert_eq!(Palette::from_env(""), None);
+        assert_eq!(Palette::from_env("eeeeee:101010"), None, "no sixteen");
+        assert_eq!(Palette::from_env(&text.replace('e', "x")), None);
+        assert_eq!(Palette::from_env(&format!("{text}:000000")), None);
     }
 
     /// The corners of the 256-colour table, as xterm defines them.

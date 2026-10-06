@@ -1,7 +1,10 @@
 //! The PTY proxy.
 //!
 //! nvmux runs `nvim --server <local_sock> --remote-ui` as a child on a PTY and
-//! sits in the byte stream between the user's terminal and that child:
+//! sits in the byte stream between the user's terminal and that child — or,
+//! with `[client] ui = "nvmux"`, nvmux's own client (`nvmux --client
+//! <local_sock>`, see [`crate::client`]), which the relay treats the same way
+//! in every respect below:
 //!
 //! ```text
 //! stdin  -> [ prefix state machine ] -> pty master
@@ -13,9 +16,12 @@
 //! keyboard protocol, truecolor, undercurl, terminal titles, OSC 52 clipboard
 //! and DA1/XTGETTCAP round-trips all function because the child negotiates
 //! directly with the real terminal. Any "improvement" that changes this
-//! direction on the strength of what it sees breaks a subset of them. There
-//! is likewise no `nvim_ui_attach`, no `grid_line` handling and no grid
-//! diffing anywhere in this crate — `nvim --remote-ui` already is that client.
+//! direction on the strength of what it sees breaks a subset of them. The
+//! relay likewise attaches no UI and reads no grid: the client on the pty is
+//! the UI. Where that is nvmux's own client, the grid handling is that
+//! client's, in a process of its own, and it negotiates with the terminal as
+//! Neovim's would — its bytes pass through here exactly as `nvim
+//! --remote-ui`'s do.
 //!
 //! Two readers of this direction. The shadow grid ([`crate::shadow`]) is
 //! shown a *copy* and can neither alter a write nor make one depend on what it
@@ -2000,15 +2006,34 @@ pub fn spawn_client(session_id: &str, sock: &Path, announce: &str) -> Result<Att
     spawn_client_with(session_id, sock, announce, client_command(sock))
 }
 
-/// `nvim --server <sock> --remote-ui`, in our working directory.
+/// The client that draws a session, in our working directory: `nvim --server
+/// <sock> --remote-ui`, or with `[client] ui = "nvmux"` nvmux's own —
+/// this same binary, `--client <sock>` (see [`crate::client`]).
 fn client_command(sock: &Path) -> CommandBuilder {
     // `CommandBuilder::new` seeds the child's environment from ours, so `TERM`,
     // `COLORTERM` and everything else the client negotiates with reach it
     // without being copied by hand.
-    let mut cmd = CommandBuilder::new("nvim");
-    cmd.arg("--server");
-    cmd.arg(sock);
-    cmd.arg("--remote-ui");
+    let mut cmd = match crate::config::get().client.ui {
+        crate::config::Ui::Nvim => {
+            let mut cmd = CommandBuilder::new("nvim");
+            cmd.arg("--server");
+            cmd.arg(sock);
+            cmd.arg("--remote-ui");
+            cmd
+        }
+        crate::config::Ui::Nvmux => {
+            // The binary running now, wherever it was started from — not a
+            // `nvmux` looked up on `$PATH`, which may be another version.
+            let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nvmux"));
+            let mut cmd = CommandBuilder::new(exe);
+            cmd.arg("--client");
+            cmd.arg(sock);
+            if let Some(palette) = crate::palette::get() {
+                cmd.env(crate::client::PALETTE_ENV, palette.to_env());
+            }
+            cmd
+        }
+    };
     if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
     }

@@ -17,6 +17,18 @@ fn main() -> Result<()> {
     let dir = paths::ensure_runtime_dir().context("preparing the nvmux runtime directory")?;
     logging::init(&dir)?;
 
+    // nvmux's own client, which an nvmux started on a pty in place of `nvim
+    // --remote-ui` (see `nvmux::client`). Nothing below is its business: it
+    // has a session to draw and a relay to draw it for. Its failures are
+    // logged rather than printed, since what it prints is drawn.
+    if let Some(sock) = &cli.client {
+        if let Err(e) = nvmux::client::run(sock) {
+            tracing::warn!(error = %format!("{e:#}"), "client: ended on an error");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     // Before anything is spawned — and before a first-run config file is written
     // in `run` — clamp the umask, and record the one it replaced so that what
     // nvmux spawns can be handed it back: see `paths::restrict_umask`.
@@ -62,7 +74,13 @@ fn run(cli: &Cli) -> Result<()> {
     // that would fade; and after the first-run screen, which does not.
     // The picker's afterglow and filter fade paint in colour too, so they ask
     // even with the fade off.
-    if fade::configured() || nvmux::ui::effects::want_palette() {
+    // And nvmux's own client mixes colours for every animation it draws, so
+    // it asks too — on the client's behalf, since a client on a pty cannot
+    // ask without the answers racing the keys (see `nvmux::client`).
+    if fade::configured()
+        || nvmux::ui::effects::want_palette()
+        || config::get().client.ui == config::Ui::Nvmux
+    {
         palette::init(palette::query());
     }
 
