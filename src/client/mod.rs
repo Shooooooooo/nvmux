@@ -233,12 +233,17 @@ return out";
 /// For a client that predicts, it also sends what the predictions are drawn
 /// from (see [`predict`]): for each window of the tab page, as its view
 /// moves, the lines either side of the view — as many windows as its fifth
-/// argument says the client may scroll ahead, two at first and the rest a
-/// moment later — and the view's own (`lines`, window, buffer,
-/// `b:changedtick`, first line, lines, whether they replace what the client
-/// has, the most bytes of a line sent), only those the client does not have,
-/// by the same rule as [`predict`] keeps them by, and each no longer than the
-/// window could show; as its buffer changes, each edit, once typing pauses
+/// argument says the client may scroll ahead, or a `User` autocommand
+/// `nvmux_client_reach_<chan>` says since, with the number as its data; two
+/// at first, the rest a moment later, no more than a few hundred lines at a
+/// time — and the view's own (`lines`, window, buffer, `b:changedtick`,
+/// first line, lines, whether they replace what the client has, the most
+/// bytes of a line sent), only those the client does not have, by the same
+/// rule as [`predict`] keeps them by, and each no longer than the window
+/// could show; of those the client has, no more than a few thousand, the
+/// end away from the lines being sent let go (`keep`, window, buffer,
+/// `b:changedtick`, the first line kept, the line after the last); as its
+/// buffer changes, each edit, once typing pauses
 /// (`splice`, window, buffer, the `b:changedtick` the client's lines are at
 /// and the one they are brought to, first line, the line after the last it
 /// replaced, how many lines replace them, and those lines where they touch
@@ -629,9 +634,11 @@ if predict then
     local n = api.nvim_buf_line_count(buf)
     local cap = 4 * (vim.fn.winsaveview().leftcol + info.width) + 64
     local tick = api.nvim_buf_get_changedtick(buf)
-    -- As many windows either side as the client may scroll ahead; only two
-    -- when they are sent afresh, the rest a moment later, so that a buffer
-    -- coming into a window holds up Neovim's own redraw no more than that.
+    -- As many windows either side as the client may scroll ahead over the
+    -- link as it is now; only two when they are sent afresh, the rest a
+    -- moment later and a few hundred lines a push, so that neither a buffer
+    -- coming into a window nor a reach grown holds up Neovim's own redraw,
+    -- or the keys typed meanwhile, for long.
     local function around(k)
       local m = math.min(k * info.height + 10, 1000)
       return math.max(0, info.topline - 1 - m), math.min(n, info.botline + m)
@@ -639,7 +646,7 @@ if predict then
     local lo, hi = around(reach)
     local h = have[win]
     local joins = h and h.buf == buf and h.tick == tick and h.cap >= cap
-      and lo <= h.hi and hi >= h.lo and math.max(hi, h.hi) - math.min(lo, h.lo) <= 4000
+      and lo <= h.hi and hi >= h.lo
     if not joins then
       lo, hi = around(2)
     end
@@ -664,21 +671,41 @@ if predict then
       send('shape', win, s)
     end
     if joins then
+      -- No more than 300 lines a push, shared between the two sides where
+      -- both want them, the rest 20 ms later; and no more than 4000 kept,
+      -- those furthest from the lines sent let go, so that a long run of
+      -- pages never has the client start again from two windows.
+      local want_lo, want_hi = math.max(h.lo - lo, 0), math.max(hi - h.hi, 0)
+      local give_lo = math.min(want_lo, math.max(150, 300 - want_hi))
+      local give_hi = math.min(want_hi, 300 - give_lo)
+      local klo, khi = h.lo - give_lo, h.hi + give_hi
+      if khi - klo > 4000 and give_hi > 0 then
+        klo = khi - 4000
+      elseif khi - klo > 4000 then
+        khi = klo + 4000
+      end
+      if klo > h.lo or khi < h.hi then
+        h.lo, h.hi = math.max(klo, h.lo), math.min(khi, h.hi)
+        send('keep', win, buf, tick, h.lo, h.hi)
+      end
       for _, r in ipairs(spoilt[buf] or {}) do
         local a, b = math.max(r[1], h.lo), math.min(r[2], h.hi)
         if a < b then
           send('spans', win, buf, tick, a, colours(buf, a, b))
         end
       end
-      if lo < h.lo then
-        send('lines', win, buf, tick, lo, get(buf, lo, h.lo, cap), false, cap,
-          colours(buf, lo, h.lo))
-        h.lo = lo
+      if klo < h.lo then
+        send('lines', win, buf, tick, klo, get(buf, klo, h.lo, cap), false, cap,
+          colours(buf, klo, h.lo))
+        h.lo = klo
       end
-      if hi > h.hi then
-        send('lines', win, buf, tick, h.hi, get(buf, h.hi, hi, cap), false, cap,
-          colours(buf, h.hi, hi))
-        h.hi = hi
+      if khi > h.hi then
+        send('lines', win, buf, tick, h.hi, get(buf, h.hi, khi, cap), false, cap,
+          colours(buf, h.hi, khi))
+        h.hi = khi
+      end
+      if give_lo < want_lo or give_hi < want_hi then
+        vim.defer_fn(soon, 20)
       end
     else
       send('lines', win, buf, tick, lo, get(buf, lo, hi, cap), true, cap, colours(buf, lo, hi))
@@ -757,6 +784,11 @@ if predict then
   au('WinClosed', {}, function(ev)
     local win = tonumber(ev.match)
     have[win], shapes[win] = nil, nil
+  end)
+  -- How far the client may scroll ahead, again, as the round trip moves.
+  au('User', { pattern = 'nvmux_client_reach_' .. chan }, function(ev)
+    reach = tonumber(ev.data) or reach
+    soon()
   end)
   au('UILeave', {}, function()
     if vim.v.event.chan == chan then
@@ -902,6 +934,9 @@ pub struct App {
     refresh: bool,
     /// The agent has been asked for, this attach.
     agent: bool,
+    /// How far either side of a view the agent was last told to keep lines:
+    /// see [`Predictor::reach`].
+    reach: i64,
     /// The buffer each window shows, by window, as the agent says.
     bufs: HashMap<i64, i64>,
     /// Windows that took another buffer since the last flush.
@@ -967,6 +1002,7 @@ impl App {
             refreshed: HashMap::new(),
             refresh: false,
             agent: false,
+            reach: 0,
             bufs: HashMap::new(),
             switched: Vec::new(),
             hold_since: None,
@@ -1069,6 +1105,7 @@ impl App {
             return;
         }
         self.agent = true;
+        self.reach = self.predict.as_ref().map_or(2, Predictor::reach);
         let (keys, ikeys) = (predict::keys(), predict::insert_keys());
         fn list(keys: &[String]) -> Arg<'_> {
             Arg::Array(keys.iter().map(|k| Arg::str(k)).collect())
@@ -1082,11 +1119,36 @@ impl App {
                     Arg::Bool(predict),
                     list(&keys),
                     list(&ikeys),
-                    Arg::Int(anim::scroll::REACH),
+                    Arg::Int(self.reach),
                 ]),
             ],
         );
         self.asked.insert(id, Ask::Agent);
+    }
+
+    /// Tell the agent how far either side of a view to keep lines, should
+    /// the round trip have moved it: see [`Predictor::reach`].
+    fn tell_reach(&mut self) {
+        let (Some(chan), Some(p)) = (self.chan, self.predict.as_ref()) else {
+            return;
+        };
+        let reach = p.reach();
+        if !self.agent || reach == self.reach {
+            return;
+        }
+        self.reach = reach;
+        let pattern = format!("nvmux_client_reach_{chan}");
+        self.outbox.notify(
+            "nvim_exec_autocmds",
+            &[
+                Arg::str("User"),
+                Arg::Map(vec![
+                    ("pattern", Arg::str(&pattern)),
+                    ("data", Arg::Int(reach)),
+                    ("modeline", Arg::Bool(false)),
+                ]),
+            ],
+        );
     }
 
     /// What the agent says: see [`AGENT_LUA`].
@@ -1226,6 +1288,7 @@ impl App {
                 }
                 if let (Some(at), Some(p)) = (self.asked_at.remove(&id), self.predict.as_mut()) {
                     p.sample(now.saturating_duration_since(at));
+                    self.tell_reach();
                 }
                 match self.asked.remove(&id) {
                     Some(Ask::ApiInfo) => {
@@ -3303,6 +3366,71 @@ mod tests {
         }
         let p = a.predict.as_ref().expect("predicting");
         assert!(!p.active(), "a fast link now");
+    }
+
+    /// The agent keeps lines as far either side of a view as a key held down
+    /// pages in a round trip: it is told how far when it is left, and again
+    /// each time the round trip moves that, and only then.
+    #[test]
+    fn the_agent_is_told_how_far_a_round_trip_pages() {
+        let t0 = Instant::now();
+        let mut a = App::new(palette(), Effects::none(), true, (20, 6));
+        a.start();
+        let sent = calls(&mut a);
+        let rtt = Duration::from_millis(200);
+        answer(
+            &mut a,
+            request(&sent, "nvim_get_api_info", ""),
+            Value::Array(vec![7.into()]),
+            t0 + rtt,
+        );
+        answer(&mut a, asks_uis(&sent), uis(false, false), t0 + rtt);
+        let sent = calls(&mut a);
+        let agent = request(&sent, "nvim_exec_lua", "local chan");
+        let (_, _, args) = sent
+            .iter()
+            .find(|(id, ..)| *id == Some(agent))
+            .expect("agent");
+        let args = args[1].as_array().expect("its arguments");
+        assert_eq!(args[4], 12.into(), "ten pages a round trip, and two");
+
+        // Each round trip measured, what the agent is told.
+        let mut t = t0 + Duration::from_secs(1);
+        let mut measure = |a: &mut App, rtt: Duration| {
+            t += PING_EVERY;
+            a.keys(b"j", t);
+            a.tick(t);
+            let ping = request(&calls(a), "nvim_get_mode", "");
+            answer(a, ping, Value::Nil, t + rtt);
+            calls(a)
+                .into_iter()
+                .filter(|(_, m, _)| m == "nvim_exec_autocmds")
+                .map(|(_, _, args)| {
+                    assert_eq!(args[0], "User".into());
+                    let opts = args[1].as_map().expect("its options");
+                    let get = |k: &str| {
+                        opts.iter()
+                            .find(|(key, _)| key.as_str() == Some(k))
+                            .map(|(_, v)| v.clone())
+                    };
+                    assert_eq!(get("pattern"), Some("nvmux_client_reach_7".into()));
+                    get("data").and_then(|v| v.as_i64()).expect("how far")
+                })
+                .collect::<Vec<i64>>()
+        };
+        assert!(measure(&mut a, rtt).is_empty(), "the same round trip");
+        // A second, smoothed to 300 ms: fifteen pages.
+        assert_eq!(measure(&mut a, Duration::from_secs(1)), [17]);
+        // Faster again, down to a link no page outruns: one, and two over.
+        let mut told = Vec::new();
+        for _ in 0..60 {
+            told.extend(measure(&mut a, Duration::ZERO));
+        }
+        assert_eq!(told.last(), Some(&3));
+        assert!(
+            told.windows(2).all(|w| w[0] > w[1]),
+            "only as it moved: {told:?}"
+        );
     }
 
     /// The device attributes that close the kitty question are the client's
