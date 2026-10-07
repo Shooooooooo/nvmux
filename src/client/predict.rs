@@ -249,13 +249,11 @@ fn spans(v: Option<&ValueRef<'_>>) -> Vec<Span> {
     let Some(a) = v.and_then(ValueRef::as_array) else {
         return Vec::new();
     };
-    a.chunks_exact(3)
-        .filter_map(|c| {
-            let (start, end, group) = (
-                redraw::int(&c[0])?,
-                redraw::int(&c[1])?,
-                redraw::int(&c[2])?,
-            );
+    a.as_chunks::<3>()
+        .0
+        .iter()
+        .filter_map(|[start, end, group]| {
+            let (start, end, group) = (redraw::int(start)?, redraw::int(end)?, redraw::int(group)?);
             Some(Span {
                 start: usize::try_from(start).ok()?,
                 end: usize::try_from(end).unwrap_or(usize::MAX),
