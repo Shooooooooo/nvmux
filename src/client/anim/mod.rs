@@ -17,6 +17,7 @@
 //! to arrive at.
 
 pub mod blink;
+pub mod glide;
 pub mod layout;
 pub mod motion;
 pub mod raster;
@@ -82,10 +83,10 @@ const PARTICLES: vfx::Settings = vfx::Settings {
     speed: 6.0,
 };
 
-/// A scroll settles in 150 ms, half Neovide's 300: a page's last row lands
-/// about 110 ms after the key, quick enough that pages typed one after
-/// another do not trail behind. Of a jump further than the window is tall,
-/// one row slides.
+/// A scroll slides for 150 ms, half Neovide's 300, and one made while another
+/// is still sliding takes what that one had left with it: however many pages
+/// are typed, the last lands 150 ms after its key at most (see [`glide`]).
+/// Of a jump further than the window is tall, one row slides.
 const SCROLL: (f32, usize) = (0.15, 1);
 
 /// Neovide's slide settles in 150 ms; animate.nvim's resize takes its 150, a

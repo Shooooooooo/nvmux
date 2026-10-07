@@ -5,9 +5,11 @@
 //! the view moved (`scroll_delta`). By then the lines the view left are gone
 //! from the grid. So the client keeps, for each window scrolling, the lines
 //! either side of what it shows — the view as it was, slid by the delta — and
-//! draws the window from those and its own, offset by a spring that starts at
-//! the delta and settles at nought. What the eye sees is the text sliding
-//! through the window until it is where Neovim put it.
+//! draws the window from those and its own, offset by a glide that starts at
+//! the delta and ends at nought (see [`super::glide`]). What the eye sees is
+//! the text sliding through the window until it is where Neovim put it. A
+//! scroll made while one is still sliding takes what that one had left with
+//! it: they end together, as long after the last as one alone would.
 //!
 //! The offset is whole rows — a terminal cannot draw text between them — and
 //! it rounds towards where it is going, so the first row of a scroll moves at
@@ -27,7 +29,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use super::spring::Spring;
+use super::glide::Glide;
 use crate::client::compose::Scrolling;
 use crate::client::grid::Cell;
 
@@ -100,7 +102,7 @@ pub struct Scroll {
     /// How many rows the view is behind: above nought it shows lines above
     /// the rectangle's top — it has scrolled down the buffer and is catching
     /// up — below nought lines below its bottom.
-    spring: Spring,
+    glide: Glide,
     shown: i64,
     /// Whether it slides: off, a scroll is only ever ahead of Neovim, and
     /// jumps to wherever it is.
@@ -143,7 +145,7 @@ impl Scroll {
             above: VecDeque::new(),
             current,
             below: VecDeque::new(),
-            spring: Spring::default(),
+            glide: Glide::default(),
             shown: 0,
             animate,
             ahead: VecDeque::new(),
@@ -257,8 +259,8 @@ impl Scroll {
             } else {
                 0.0
             };
-            self.spring = Spring::at(if delta > 0 { rows } else { -rows });
-            self.shown = self.spring.cells();
+            self.glide = Glide::at(if delta > 0 { rows } else { -rows });
+            self.shown = self.glide.cells();
             return;
         }
         // Every line known, in order — those above from the furthest, the
@@ -298,11 +300,11 @@ impl Scroll {
         // drawn ahead, which it no longer is — a scroll the client made but
         // had yet to draw slides as one it did not make.
         let slide = delta - (shown - self.shown_ahead());
-        if self.animate {
-            self.spring.position =
-                (self.spring.position + slide as f32).clamp(-(h as f32), h as f32);
+        if self.animate && slide != 0 {
+            let to = self.glide.position() + slide as f32;
+            self.glide.set(to.clamp(-(h as f32), h as f32));
         }
-        self.shown = self.spring.cells();
+        self.shown = self.glide.cells();
         // Neovim's own lines may be the ones a scroll ahead was waiting for.
         self.advance(&mut |_, _| None);
     }
@@ -402,10 +404,10 @@ impl Scroll {
             at += a.rows;
             self.drawn += 1;
             if self.animate {
-                self.spring.position += a.rows as f32;
+                self.glide.add(a.rows as f32);
             }
         }
-        self.shown = self.spring.cells();
+        self.shown = self.glide.cells();
     }
 
     /// Stop being ahead of Neovim: the view goes back to Neovim's, sliding
@@ -415,8 +417,8 @@ impl Scroll {
         self.ahead.clear();
         self.drawn = 0;
         if self.animate {
-            self.spring.position -= shown as f32;
-            self.shown = self.spring.cells();
+            self.glide.add(-shown as f32);
+            self.shown = self.glide.cells();
         }
     }
 
@@ -430,17 +432,17 @@ impl Scroll {
     /// Move on `dt` seconds of a scroll that settles in `duration`. Says
     /// whether it is still wanted: going, or ahead of Neovim.
     ///
-    /// A slide is over once the offset is under a row: a spring that does
+    /// A slide is over once the offset is under a row: a glide that does
     /// not overshoot has nothing left to show after that.
     pub fn step(&mut self, dt: f32, duration: f32) -> bool {
-        self.spring.step(dt, duration);
-        self.shown = self.spring.cells();
+        self.glide.step(dt, duration);
+        self.shown = self.glide.cells();
         self.shown != 0 || !self.ahead.is_empty()
     }
 
     /// Whether a frame is wanted for it: the view is sliding.
     pub fn moving(&self) -> bool {
-        self.spring.moving()
+        self.glide.moving()
     }
 
     /// The whole rows the view is behind this frame.
@@ -753,6 +755,29 @@ mod tests {
             [10, 11, 12, 13, 14].map(Some),
             "back over what it passed"
         );
+    }
+
+    /// Scrolls made one after another while the view still slides from the
+    /// ones before land together the slide's duration after the last, and
+    /// no later, however many there were.
+    #[test]
+    fn scrolls_on_a_slide_land_a_duration_after_the_last() {
+        let mut s = Scroll::still((0, 5, 0, 1), lines(0..5), true);
+        let ms = |s: &mut Scroll, n: usize| {
+            for _ in 0..n {
+                s.step(0.001, 0.15);
+            }
+        };
+        for _ in 0..8 {
+            assert!(s.predict(go(5), &mut fill(0, 999), &mut |_, _| None));
+            ms(&mut s, 50);
+            assert!(s.moving(), "still sliding when the next comes");
+        }
+        ms(&mut s, 99);
+        assert!(s.moving());
+        ms(&mut s, 2);
+        assert!(!s.moving(), "150 ms after the last");
+        assert_eq!(shows(&s), [40, 41, 42, 43, 44].map(Some));
     }
 
     /// Past the whole view, only `far` rows are animated, and drawn blank.
