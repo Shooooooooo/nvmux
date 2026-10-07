@@ -986,3 +986,77 @@ fn every_scroll_sideways_predicted_is_the_one_neovim_makes() {
     }
     typed(&mut term, b"\x1b");
 }
+
+/// Pages typed faster than a slow link answers: each is on the screen before
+/// Neovim could have heard of it — those typed before the lines they show
+/// have come as soon as they come, and every one after at once — and the
+/// view never goes back, and ends where Neovim's does.
+#[test]
+fn pages_typed_faster_than_the_link_answers_keep_up() {
+    require_nvim!();
+    let scratch = Scratch::new("client-burst");
+    let (mut rpc, mut term) = drawn_slowly(
+        &scratch,
+        "client-burst",
+        "call setline(1, map(range(1, 2000), '\"line \" . v:val'))",
+    );
+    // A page is the window less two lines: 20.
+    let page = |k: usize| 1 + 20 * k as u32;
+    let gap = Duration::from_millis(100);
+    let presses = 10;
+    let t0 = Instant::now();
+    let mut typed = Vec::new();
+    let mut drawn: Vec<Option<Instant>> = vec![None; presses];
+    let mut tops = Vec::new();
+    let mut watch = |term: &mut Terminal, until: Instant, drawn: &mut Vec<Option<Instant>>| loop {
+        let now = Instant::now();
+        if let Some(top) = top_line(&term.text()) {
+            if tops.last() != Some(&top) {
+                tops.push(top);
+            }
+            for (k, at) in drawn.iter_mut().enumerate() {
+                if at.is_none() && top >= page(k + 1) {
+                    *at = Some(now);
+                }
+            }
+        }
+        if now >= until {
+            return tops.clone();
+        }
+        let last = tops.last().copied();
+        term.pump(until - now, |t| top_line(&t.text()) != last);
+    };
+    for k in 0..presses {
+        typed.push(Instant::now());
+        term.type_bytes(b"\x06");
+        watch(&mut term, t0 + gap * (k as u32 + 1), &mut drawn);
+    }
+    let tops = watch(&mut term, Instant::now() + 4 * SLOW, &mut drawn);
+
+    for (k, (typed, drawn)) in typed.iter().zip(&drawn).enumerate() {
+        let late = drawn.map(|d| d - *typed);
+        assert!(
+            late.is_some_and(|l| l < 2 * SLOW),
+            "page {} waited for Neovim: {late:?}",
+            k + 1
+        );
+        // Neovim has had a page to send lines from by then.
+        if *typed > t0 + 3 * SLOW {
+            assert!(
+                late.is_some_and(|l| l < SLOW),
+                "page {} was held: {late:?}",
+                k + 1
+            );
+        }
+    }
+    assert!(
+        tops.windows(2).all(|w| w[0] < w[1]),
+        "it went back: {tops:?}"
+    );
+    assert_eq!(tops.last(), Some(&page(presses)), "{tops:?}");
+    assert_eq!(
+        rpc.eval("line('w0')").ok().and_then(|v| v.as_u64()),
+        Some(u64::from(page(presses))),
+        "Neovim went elsewhere"
+    );
+}

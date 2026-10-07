@@ -33,8 +33,8 @@ use std::time::{Duration, Instant};
 use self::blink::Blink;
 use self::layout::{Change, Transition};
 use self::motion::Motion;
-pub use self::scroll::Ahead;
 use self::scroll::Scroll;
+pub use self::scroll::{Ahead, Fill, Land, Lander};
 use self::side::Side;
 use self::smear::{Rect, Smear};
 use self::switch::Switch;
@@ -545,7 +545,7 @@ impl Animator {
         model: &Model,
         grid: u64,
         go: Ahead,
-        fill: &mut dyn FnMut(i64) -> Option<Vec<Cell>>,
+        (fill, land): (&mut Fill, &mut Lander),
         now: Instant,
     ) -> bool {
         let (Some(g), Some(rect)) = (model.grids.get(&grid), text_rect(model, grid)) else {
@@ -564,11 +564,51 @@ impl Animator {
                 self.scrolls.get_mut(&grid).expect("just put there")
             }
         };
-        let went = s.predict(go, fill);
-        if went {
+        let drawn = s.shown_ahead();
+        let went = s.predict(go, fill, land);
+        if went && s.shown_ahead() != drawn {
             self.cursor_moved(model, true, now);
         }
         went
+    }
+
+    /// The window grids scrolled ahead of Neovim further than they show: see
+    /// [`Scroll::fill_in`].
+    pub fn held(&self) -> Vec<u64> {
+        self.scrolls
+            .iter()
+            .filter(|(_, s)| s.held())
+            .map(|(g, _)| *g)
+            .collect()
+    }
+
+    /// Draw what window grid `grid` was scrolled ahead to and could not
+    /// show before, as far as `fill` and `land` can now: see
+    /// [`Scroll::fill_in`].
+    pub fn fill_in(
+        &mut self,
+        model: &Model,
+        grid: u64,
+        (fill, land): (&mut Fill, &mut Lander),
+        now: Instant,
+    ) {
+        let Some(s) = self.scrolls.get_mut(&grid) else {
+            return;
+        };
+        if s.fill_in(fill, land) {
+            if !self.animating(model, now) {
+                self.last = Some(now);
+            }
+            self.cursor_moved(model, true, now);
+        }
+    }
+
+    /// Stop scrolling window grid `grid` ahead of Neovim: it shows Neovim's
+    /// view again.
+    pub fn give_up(&mut self, grid: u64) {
+        if let Some(s) = self.scrolls.get_mut(&grid) {
+            s.give_up();
+        }
     }
 
     /// How many rows window grid `grid` is ahead of Neovim, and how many
@@ -653,7 +693,7 @@ impl Animator {
         if let Some((r, k)) = self.sides.get(&c.grid).and_then(Side::cursor) {
             return (row - c.row as i64 + r as i64, col - c.col as i64 + k as i64);
         }
-        let Some(s) = self.scrolls.get(&c.grid).filter(|s| s.ahead() != 0) else {
+        let Some(s) = self.scrolls.get(&c.grid).filter(|s| s.shown_ahead() != 0) else {
             return (row, col);
         };
         let (top, bot, _, _) = s.rect();
@@ -661,10 +701,10 @@ impl Animator {
             return (row, col);
         }
         let h = (bot - top) as i64;
-        let ahead = s.ahead();
+        let ahead = s.shown_ahead();
         // In the rows of the view as predicted: where the cursor's line is,
         // and where the buffer's first and last lines are.
-        let at = c.row as i64 - top as i64 - ahead + s.cursor();
+        let at = c.row as i64 - top as i64 - ahead + s.shown_cursor();
         let so = (s.scrolloff() as i64).min((h - 1) / 2);
         let (first, last) = model
             .viewports
@@ -679,7 +719,7 @@ impl Animator {
         let hi = if last >= h { h - 1 - so } else { h - 1 };
         let at = at.max(lo).min(hi).min(last).max(first.max(0));
         let col = s
-            .col()
+            .shown_col()
             .map_or(col, |(to, _)| col - c.col as i64 + to as i64);
         (row + at - (c.row as i64 - top as i64), col)
     }
@@ -1209,10 +1249,11 @@ mod tests {
             rows,
             cursor: 0,
             col: None,
+            land: None,
             until,
             scrolloff: 2,
         };
-        assert!(a.predict(&m, 2, go(3, until), &mut fill, t0));
+        assert!(a.predict(&m, 2, go(3, until), (&mut fill, &mut |_, _| None), t0));
         assert_eq!(top(&a, &m), Some(Text::Char('3')));
         assert_eq!(a.cursor_at(&m), (2, 0), "'scrolloff' rows from the top");
         assert_eq!(
@@ -1243,7 +1284,7 @@ mod tests {
         assert_eq!(a.cursor_at(&m), (2, 0));
 
         let until = t1 + Duration::from_secs(1);
-        assert!(a.predict(&m, 2, go(-3, until), &mut fill, t1));
+        assert!(a.predict(&m, 2, go(-3, until), (&mut fill, &mut |_, _| None), t1));
         assert_eq!(top(&a, &m), Some(Text::Char('0')));
         a.advance(until);
         assert_eq!(a.ahead(2), (0, 0), "never confirmed");

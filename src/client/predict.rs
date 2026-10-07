@@ -28,18 +28,26 @@
 //!   cursor's line sending it to the longest line in view;
 //!
 //! — with `'scrolloff'` keeping the cursor in from the edges, and a count
-//! where Neovim takes one, as far as two windows each way.
+//! where Neovim takes one; one after another, as fast as they are typed, as
+//! far as eight windows ahead of Neovim (see `super::anim::scroll::REACH`).
 //!
 //! Most of the rows a scroll shows are rows the window already shows, moved.
 //! What the client does not have is the lines it uncovers. So the agent the
 //! client leaves in the editor (see `super::AGENT_LUA`) sends it the text of
 //! the lines around each window's view — two windows' worth each way, and as
-//! the view moves, only the lines it has not sent; of a long line, no more
-//! than the window could show ([`known`]) — with what it takes to draw them
-//! as the window would ([`Shape`]). A row drawn from that is the line's text and
-//! its number, in the colours the window's own rows are drawn in, and nothing
-//! more: no syntax colours, no signs, no virtual text. It is on the screen for
-//! the round trip it takes Neovim's own row to arrive.
+//! far as the client may scroll ahead the way the view last moved; as the
+//! view moves, only the lines it has not sent; of a long line, no more than
+//! the window could show ([`known`]) — with what it takes to draw them as the
+//! window would ([`Shape`]). A row drawn from that is the line's text and its
+//! number, in the colours the window's own rows are drawn in, and nothing
+//! more: no syntax colours, no signs, no virtual text. It is on the screen
+//! for the round trip it takes Neovim's own row to arrive.
+//!
+//! Pages typed faster than that can outrun the lines: until Neovim's view
+//! has moved, the agent has sent only two windows ahead of it. A scroll that
+//! uncovers a line yet to come is made all the same, and the next from where
+//! it goes, but it is drawn only once the line has come — about a round trip
+//! after the first page of the run, and every page after that at once.
 //!
 //! # Only where it can be right
 //!
