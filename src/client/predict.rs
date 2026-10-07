@@ -34,20 +34,21 @@
 //! Most of the rows a scroll shows are rows the window already shows, moved.
 //! What the client does not have is the lines it uncovers. So the agent the
 //! client leaves in the editor (see `super::AGENT_LUA`) sends it the text of
-//! the lines around each window's view — two windows' worth each way, and as
-//! far as the client may scroll ahead the way the view last moved; as the
-//! view moves, only the lines it has not sent; of a long line, no more than
-//! the window could show ([`known`]) — with what it takes to draw them as the
-//! window would ([`Shape`]). A row drawn from that is the line's text and its
-//! number, in the colours the window's own rows are drawn in, and nothing
-//! more: no syntax colours, no signs, no virtual text. It is on the screen
-//! for the round trip it takes Neovim's own row to arrive.
+//! the lines around each window's view — as far each way as the client may
+//! scroll ahead; as the view moves, only the lines it has not sent, and as
+//! the buffer changes, only the lines that did, which the client splices
+//! into what it has; of a long line, no more than the window could show
+//! ([`known`]) — with what it takes to draw them as the window would
+//! ([`Shape`]). A row drawn from that is the line's text and its number, in
+//! the colours the window's own rows are drawn in, and nothing more: no
+//! syntax colours, no signs, no virtual text. It is on the screen for the
+//! round trip it takes Neovim's own row to arrive.
 //!
-//! Pages typed faster than that can outrun the lines: until Neovim's view
-//! has moved, the agent has sent only two windows ahead of it. A scroll that
-//! uncovers a line yet to come is made all the same, and the next from where
-//! it goes, but it is drawn only once the line has come — about a round trip
-//! after the first page of the run, and every page after that at once.
+//! A buffer that comes into a window is sent two windows each way at first,
+//! the rest a moment later, and pages typed in that moment can outrun the
+//! lines. A scroll that uncovers a line yet to come is made all the same,
+//! and the next from where it goes, but it is drawn only once the line has
+//! come.
 //!
 //! # Only where it can be right
 //!
@@ -93,9 +94,10 @@ const GRACE: Duration = Duration::from_millis(250);
 /// How often the round trip is measured again while the user is at work.
 pub const PING_EVERY: Duration = Duration::from_secs(2);
 
-/// The most lines kept for a window. The agent sends far fewer; this is what
-/// keeps a client from growing should it ever not.
-const MAX_LINES: usize = 4096;
+/// The most lines kept for a window. The agent sends fewer — no run of more
+/// than 4000, and no splice of more than 2000 — and this is what keeps a
+/// client from growing should it ever not.
+const MAX_LINES: usize = 8192;
 
 /// What it takes to draw a window's lines as the window would, as the agent
 /// last said it.
@@ -263,6 +265,39 @@ impl Lines {
         self.text = all;
     }
 
+    /// Take an edit the agent says the buffer has had since it sent the
+    /// lines: by the same rule the agent keeps its account by, so that the
+    /// two agree on what the client has. One made to lines the client does
+    /// not have as they were leaves it none to trust.
+    fn splice(&mut self, s: Splice) {
+        let delta = s.count - (s.last - s.first);
+        let touches = s.first <= self.end() && s.last >= self.first;
+        if s.buf != self.buf || s.base != self.tick || (touches && s.text.len() as i64 != s.count) {
+            *self = Lines::default();
+            return;
+        }
+        if touches {
+            let keep = |n: i64| n.clamp(0, self.text.len() as i64) as usize;
+            let before = keep(s.first - self.first);
+            let after = keep(s.last - self.first);
+            let mut text = std::mem::take(&mut self.text);
+            let tail = text.split_off(after);
+            text.truncate(before);
+            text.extend(s.text);
+            text.extend(tail);
+            if text.len() > MAX_LINES {
+                *self = Lines::default();
+                return;
+            }
+            self.first = self.first.min(s.first);
+            self.text = text;
+        } else if s.last < self.first {
+            self.first += delta;
+        }
+        self.tick = s.tick;
+        self.cap = self.cap.min(s.cap);
+    }
+
     fn get(&self, buf: i64, lnum: i64) -> Option<&str> {
         if buf != self.buf || lnum < self.first {
             return None;
@@ -277,6 +312,21 @@ impl Lines {
     fn cut(&self, buf: i64, lnum: i64) -> bool {
         self.get(buf, lnum).is_some_and(|t| t.len() + 3 >= self.cap)
     }
+}
+
+/// An edit to a buffer, as the agent says it: lines `first..last` of the
+/// buffer as it was at `base` are `count` lines at `tick` — `text`, where
+/// that touches the lines the client has — each no longer than `cap` bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Splice {
+    buf: i64,
+    base: i64,
+    tick: i64,
+    first: i64,
+    last: i64,
+    count: i64,
+    text: Vec<String>,
+    cap: usize,
 }
 
 /// The colours a window's rows are drawn in, read off the rows it shows.
@@ -1387,6 +1437,34 @@ impl Predictor {
                     .take(buf, tick, first, text, cap, fresh);
                 true
             }
+            "splice" => {
+                let Some([win, buf, base, tick, first, last, count]) = (0..7)
+                    .map(int)
+                    .collect::<Option<Vec<i64>>>()
+                    .and_then(|v| <[i64; 7]>::try_from(v).ok())
+                else {
+                    return true;
+                };
+                let text = v
+                    .get(7)
+                    .and_then(ValueRef::as_array)
+                    .map(|a| a.iter().map(lossy).collect())
+                    .unwrap_or_default();
+                let cap = int(8).map_or(usize::MAX, |c| c.max(0) as usize);
+                if let Some(lines) = self.lines.get_mut(&win) {
+                    lines.splice(Splice {
+                        buf,
+                        base,
+                        tick,
+                        first,
+                        last,
+                        count,
+                        text,
+                        cap,
+                    });
+                }
+                true
+            }
             "shape" => {
                 let shape = v
                     .get(1)
@@ -2242,6 +2320,66 @@ mod tests {
             "".into(),
         ];
         vec![1000.into(), Value::Array(v)]
+    }
+
+    /// An edit the agent says the buffer has had is made to the lines kept:
+    /// within them, its text in their place; before them, they move; after
+    /// them, nothing — and one made to lines as they were at another change
+    /// leaves none.
+    #[test]
+    fn edits_are_made_to_the_lines_kept() {
+        let mut p = Predictor::default();
+        said(&mut p, "shape", shape_args(100));
+        said(
+            &mut p,
+            "lines",
+            lines(1000, 5, 10, &["a", "b", "c", "d"], true),
+        );
+        let splice = |base: i64, tick: i64, first: i64, last: i64, count: i64, text: &[&str]| {
+            vec![
+                Value::from(1000),
+                1.into(),
+                base.into(),
+                tick.into(),
+                first.into(),
+                last.into(),
+                count.into(),
+                Value::Array(text.iter().map(|t| Value::from(*t)).collect()),
+                99.into(),
+            ]
+        };
+        let kept = |p: &Predictor| -> Vec<(i64, String)> {
+            (0..30)
+                .filter_map(|l| p.text(1000, l).map(|t| (l, t.to_string())))
+                .collect()
+        };
+        let at = |first: i64, text: &[&str]| -> Vec<(i64, String)> {
+            text.iter()
+                .enumerate()
+                .map(|(i, t)| (first + i as i64, t.to_string()))
+                .collect()
+        };
+        // "b" and "c" become three lines.
+        said(&mut p, "splice", splice(5, 6, 11, 13, 3, &["x", "y", "z"]));
+        assert_eq!(kept(&p), at(10, &["a", "x", "y", "z", "d"]));
+        // Two lines deleted above: everything moves up.
+        said(&mut p, "splice", splice(6, 7, 2, 4, 0, &[]));
+        assert_eq!(kept(&p), at(8, &["a", "x", "y", "z", "d"]));
+        // After them: nothing to do but the change.
+        said(&mut p, "splice", splice(7, 8, 40, 41, 1, &[]));
+        assert_eq!(kept(&p), at(8, &["a", "x", "y", "z", "d"]));
+        // Straddling the first: what it brings joins what is kept.
+        said(&mut p, "splice", splice(8, 9, 6, 9, 2, &["p", "q"]));
+        assert_eq!(kept(&p), at(6, &["p", "q", "x", "y", "z", "d"]));
+        // Right after the last: joins too.
+        said(&mut p, "splice", splice(9, 10, 12, 12, 1, &["e"]));
+        assert_eq!(kept(&p), at(6, &["p", "q", "x", "y", "z", "d", "e"]));
+        // A tick that changed nothing.
+        said(&mut p, "splice", splice(10, 11, 0, 0, 0, &[]));
+        assert_eq!(kept(&p).len(), 7);
+        // Made to another change than the one kept: nothing to trust.
+        said(&mut p, "splice", splice(3, 12, 6, 7, 1, &["r"]));
+        assert_eq!(kept(&p), []);
     }
 
     /// Runs of lines join what is kept where they touch it, at the same

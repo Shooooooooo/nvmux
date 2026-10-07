@@ -231,14 +231,20 @@ return out";
 /// the first time it finds the channel gone.
 ///
 /// For a client that predicts, it also sends what the predictions are drawn
-/// from (see [`predict`]): for each window of the tab page, as its view moves
-/// or its buffer changes, the lines two windows either side of the view —
-/// as many as its fifth argument says the client may scroll ahead, the way
-/// the view last moved — and the view's own (`lines`, window, buffer,
+/// from (see [`predict`]): for each window of the tab page, as its view
+/// moves, the lines either side of the view — as many windows as its fifth
+/// argument says the client may scroll ahead, two at first and the rest a
+/// moment later — and the view's own (`lines`, window, buffer,
 /// `b:changedtick`, first line, lines, whether they replace what the client
 /// has, the most bytes of a line sent), only those the client does not have,
 /// by the same rule as [`predict`] keeps them by, and each no longer than the
-/// window could show; and what to draw them with and how far its
+/// window could show; as its buffer changes, each edit, once typing pauses
+/// (`splice`, window, buffer, the `b:changedtick` the client's lines are at
+/// and the one they are brought to, first line, the line after the last it
+/// replaced, how many lines replace them, and those lines where they touch
+/// what the client has, the most bytes of a line sent), or the lines afresh
+/// where the edits are more than is worth sending that way; and what to draw
+/// them with and how far its
 /// scrolls go, when that changes (`shape`, window, see [`predict::Shape`]) —
 /// among it, which of the keys the client follows, given it as the agent's
 /// third argument and those in insert mode as its fourth, something maps in
@@ -247,8 +253,11 @@ return out";
 const AGENT_LUA: &str = "local chan, predict, keys, ikeys, reach = ...
 local api = vim.api
 local group = api.nvim_create_augroup('nvmux_client_' .. chan, { clear = true })
+-- Whether this client has gone: what is left of the agent stops.
+local gone = false
 local function send(...)
   if not pcall(vim.rpcnotify, chan, 'nvmux_client', ...) then
+    gone = true
     pcall(api.nvim_del_augroup_by_id, group)
   end
 end
@@ -271,12 +280,13 @@ au('OptionSet', { pattern = { 'laststatus', 'splitright', 'splitbelow' } }, func
 end)
 au('UILeave', {}, function()
   if vim.v.event.chan == chan then
+    gone = true
     pcall(api.nvim_del_augroup_by_id, group)
   end
 end)
 if predict then
-  -- Which way each window's view last moved: 1 down the buffer, -1 up.
-  local have, shapes, maps, ways = {}, {}, {}, {}
+  local have, shapes, maps = {}, {}, {}
+  local soon
   -- The keys something maps, or starts a mapping with, in the window's
   -- buffer: looked up again a second after they last were.
   local function mapped(buf)
@@ -324,6 +334,125 @@ if predict then
       vim.o.startofline, nmaps, imaps, siso, vim.o.sidescroll,
       tonumber(vim.o.mousescroll:match('hor:(%d+)')) or 6 }
   end
+  -- No more of a line than could be shown, and a cell over for the client
+  -- to see it would not fit: a minified file is a line a megabyte long.
+  local function get(buf, from, to, cap)
+    local lines = api.nvim_buf_get_lines(buf, from, to, false)
+    for i, l in ipairs(lines) do
+      if #l > cap then
+        lines[i] = l:sub(1, cap)
+      end
+    end
+    return lines
+  end
+  -- Edits to a buffer since the client was sent its lines, in order: each
+  -- left lines a to b of the buffer as it was before it as lines a to c,
+  -- whose text it keeps. One next to the last is taken into it. Sent as
+  -- splices when the windows are next pushed, so that an edit costs the
+  -- lines it changed, not every line the client keeps; past 2000 lines of
+  -- it, the client is sent its lines afresh instead.
+  local edits, ticks, attached = {}, {}, {}
+  local function edited(buf, tick, first, last, new)
+    local shown = false
+    for _, h in pairs(have) do
+      shown = shown or h.buf == buf
+    end
+    if gone or not shown then
+      attached[buf], edits[buf] = nil, nil
+      return true
+    end
+    local e = edits[buf] or { base = ticks[buf], list = {}, size = 0 }
+    edits[buf], e.tick = e, tick
+    if not first or e.over then
+      return
+    end
+    if new - first > 2000 then
+      e.over = true
+      return
+    end
+    local text = api.nvim_buf_get_lines(buf, first, new, false)
+    local p = e.list[#e.list]
+    if p and first <= p.c and last >= p.a then
+      local t = {}
+      for i = 1, first - p.a do
+        t[#t + 1] = p.text[i]
+      end
+      for _, l in ipairs(text) do
+        t[#t + 1] = l
+      end
+      for i = last - p.a + 1, #p.text do
+        t[#t + 1] = p.text[i]
+      end
+      e.size = e.size - #p.text + #t
+      p.a, p.b, p.c = math.min(p.a, first), last > p.c and p.b + last - p.c or p.b,
+        math.max(p.c, last) + new - last
+      p.text, p.tick = t, tick
+    else
+      e.list[#e.list + 1] = { a = first, b = last, c = new, text = text, tick = tick }
+      e.size = e.size + #text
+    end
+    e.over = e.size > 2000 or #e.list > 100
+  end
+  local function attach(buf)
+    if attached[buf] then
+      return
+    end
+    attached[buf] = api.nvim_buf_attach(buf, false, {
+      on_lines = function(_, b, tick, first, last, new)
+        return edited(b, tick, first, last, new)
+      end,
+      on_changedtick = function(_, b, tick)
+        return edited(b, tick)
+      end,
+      on_reload = function(_, b)
+        edits[b] = nil
+        for win, h in pairs(have) do
+          if h.buf == b then
+            have[win] = nil
+          end
+        end
+        soon()
+      end,
+      on_detach = function(_, b)
+        attached[b], edits[b] = nil, nil
+      end,
+    })
+  end
+  -- Each window's lines brought up to date with the edits, one splice an
+  -- edit, as the client keeps them: with the edit's text where it touches
+  -- what the client has, the lines after it moved where it does not.
+  local function flush()
+    for buf, e in pairs(edits) do
+      edits[buf], ticks[buf] = nil, e.tick
+      for win, h in pairs(have) do
+        if h.buf == buf and (h.tick ~= e.base or e.over) then
+          have[win] = nil
+        elseif h.buf == buf then
+          local base, n = e.base, #e.list
+          for i = 1, math.max(n, 1) do
+            local p = e.list[i] or { a = 0, b = 0, c = 0, text = {} }
+            local tick = i >= n and e.tick or p.tick
+            local delta = (p.c - p.a) - (p.b - p.a)
+            local lines = {}
+            if p.a <= h.hi and p.b >= h.lo then
+              for j, l in ipairs(p.text) do
+                lines[j] = #l > h.cap and l:sub(1, h.cap) or l
+              end
+              h.lo, h.hi = math.min(h.lo, p.a), math.max(h.hi + delta, p.c)
+            elseif p.b < h.lo then
+              h.lo, h.hi = h.lo + delta, h.hi + delta
+            end
+            send('splice', win, buf, base, tick, p.a, p.b, p.c - p.a, lines, h.cap)
+            base = tick
+          end
+          h.tick = e.tick
+          if h.hi - h.lo > 4000 then
+            have[win] = nil
+          end
+        end
+      end
+    end
+  end
   local function push(win)
     if api.nvim_win_get_config(win).relative ~= '' then
       return
@@ -331,13 +460,22 @@ if predict then
     local buf = api.nvim_win_get_buf(win)
     local info = vim.fn.getwininfo(win)[1]
     local n = api.nvim_buf_line_count(buf)
-    -- Two windows either side, and as far as the client may scroll ahead
-    -- the way the view is moving: a page typed before Neovim has drawn the
-    -- one before.
-    local page = math.min(2 * info.height + 10, 300)
-    local far = math.min(reach * info.height + 10, 1000)
-    local lo = math.max(0, info.topline - 1 - (ways[win] == -1 and far or page))
-    local hi = math.min(n, info.botline + (ways[win] == 1 and far or page))
+    local cap = 4 * (vim.fn.winsaveview().leftcol + info.width) + 64
+    local tick = api.nvim_buf_get_changedtick(buf)
+    -- As many windows either side as the client may scroll ahead; only two
+    -- when they are sent afresh, the rest a moment later, so that a buffer
+    -- coming into a window holds up Neovim's own redraw no more than that.
+    local function around(k)
+      local m = math.min(k * info.height + 10, 1000)
+      return math.max(0, info.topline - 1 - m), math.min(n, info.botline + m)
+    end
+    local lo, hi = around(reach)
+    local h = have[win]
+    local joins = h and h.buf == buf and h.tick == tick and h.cap >= cap
+      and lo <= h.hi and hi >= h.lo and math.max(hi, h.hi) - math.min(lo, h.lo) <= 4000
+    if not joins then
+      lo, hi = around(2)
+    end
     local s = shape(buf, info)
     if s[10] and vim.wo.foldenable then
       for l = lo + 1, hi do
@@ -358,33 +496,21 @@ if predict then
       shapes[win] = key
       send('shape', win, s)
     end
-    -- No more of a line than could be shown, and a cell over for the client
-    -- to see it would not fit: a minified file is a line a megabyte long.
-    local cap = 4 * (s[9] + info.width) + 64
-    local function get(from, to)
-      local lines = api.nvim_buf_get_lines(buf, from, to, false)
-      for i, l in ipairs(lines) do
-        if #l > cap then
-          lines[i] = l:sub(1, cap)
-        end
-      end
-      return lines
-    end
-    local tick = api.nvim_buf_get_changedtick(buf)
-    local h = have[win]
-    if h and h.buf == buf and h.tick == tick and h.cap >= cap and lo <= h.hi and hi >= h.lo
-        and math.max(hi, h.hi) - math.min(lo, h.lo) <= 2000 then
+    if joins then
       if lo < h.lo then
-        send('lines', win, buf, tick, lo, get(lo, h.lo), false, cap)
+        send('lines', win, buf, tick, lo, get(buf, lo, h.lo, cap), false, cap)
         h.lo = lo
       end
       if hi > h.hi then
-        send('lines', win, buf, tick, h.hi, get(h.hi, hi), false, cap)
+        send('lines', win, buf, tick, h.hi, get(buf, h.hi, hi, cap), false, cap)
         h.hi = hi
       end
     else
-      send('lines', win, buf, tick, lo, get(lo, hi), true, cap)
+      send('lines', win, buf, tick, lo, get(buf, lo, hi, cap), true, cap)
       have[win] = { buf = buf, tick = tick, lo = lo, hi = hi, cap = cap }
+      ticks[buf] = tick
+      attach(buf)
+      vim.defer_fn(soon, 100)
     end
   end
   local queued = false
@@ -393,6 +519,7 @@ if predict then
     if not pcall(api.nvim_get_autocmds, { group = group }) then
       return
     end
+    flush()
     for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
       if api.nvim_win_is_valid(win) then
         pcall(api.nvim_win_call, win, function()
@@ -401,7 +528,7 @@ if predict then
       end
     end
   end
-  local function soon()
+  soon = function()
     if not queued then
       queued = true
       vim.schedule(push_all)
@@ -417,17 +544,13 @@ if predict then
   au('WinScrolled', {}, function()
     for id, d in pairs(vim.v.event) do
       local win = tonumber(id)
-      if win and d.topline ~= 0 then
-        ways[win] = d.topline > 0 and 1 or -1
-      end
       if win and d.leftcol ~= 0 and api.nvim_win_is_valid(win) then
         send('leftcol', win, vim.fn.getwininfo(win)[1].leftcol)
       end
     end
   end)
-  -- An edit sends every line again: as few as will do.
+  -- An edit is sent once typing pauses: see flush.
   au({ 'TextChanged', 'TextChangedI', 'TextChangedP' }, {}, function()
-    ways = {}
     timer:stop()
     timer:start(150, 0, vim.schedule_wrap(soon))
   end)
@@ -439,7 +562,7 @@ if predict then
   end)
   au('WinClosed', {}, function(ev)
     local win = tonumber(ev.match)
-    have[win], shapes[win], ways[win] = nil, nil, nil
+    have[win], shapes[win] = nil, nil
   end)
   au('UILeave', {}, function()
     if vim.v.event.chan == chan then
@@ -808,7 +931,7 @@ impl App {
                     p.said(what, &params[1..]);
                 }
                 // What a scroll ahead was waiting for, perhaps.
-                if what == "lines" && self.flushed {
+                if matches!(what, "lines" | "splice") && self.flushed {
                     self.fill_in(now);
                 }
             }
