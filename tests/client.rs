@@ -19,7 +19,8 @@ mod common;
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use common::Scratch;
@@ -597,13 +598,19 @@ fn a_split_flies_in_from_its_side() {
 /// a slow link to draw a session over. Every connection made to it gets one
 /// of its own to `to`, as an ssh forward would.
 fn slow_link(dir: &Path, to: &Path, delay: Duration) -> PathBuf {
+    counted_link(dir, to, delay).0
+}
+
+/// [`slow_link`], and a count of the bytes it has carried back from `to`.
+fn counted_link(dir: &Path, to: &Path, delay: Duration) -> (PathBuf, Arc<AtomicUsize>) {
     use std::os::unix::net::{UnixListener, UnixStream};
     /// One direction: read as it comes, written `delay` after.
-    fn carry(mut from: UnixStream, mut to: UnixStream, delay: Duration) {
+    fn carry(mut from: UnixStream, mut to: UnixStream, delay: Duration, count: Arc<AtomicUsize>) {
         let (tx, rx) = mpsc::channel::<(Instant, Vec<u8>)>();
         std::thread::spawn(move || {
             let mut buf = vec![0u8; 64 * 1024];
             while let Ok(n @ 1..) = from.read(&mut buf) {
+                count.fetch_add(n, Ordering::Relaxed);
                 if tx
                     .send((Instant::now() + delay, buf[..n].to_vec()))
                     .is_err()
@@ -626,6 +633,8 @@ fn slow_link(dir: &Path, to: &Path, delay: Duration) -> PathBuf {
     let path = dir.join("slow.sock");
     let listener = UnixListener::bind(&path).expect("bind the slow link");
     let to = to.to_path_buf();
+    let back = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&back);
     std::thread::spawn(move || {
         for near in listener.incoming() {
             let (Ok(near), Ok(far)) = (near, UnixStream::connect(&to)) else {
@@ -634,11 +643,11 @@ fn slow_link(dir: &Path, to: &Path, delay: Duration) -> PathBuf {
             let (Ok(near2), Ok(far2)) = (near.try_clone(), far.try_clone()) else {
                 return;
             };
-            carry(near, far, delay);
-            carry(far2, near2, delay);
+            carry(near, far, delay, Arc::new(AtomicUsize::new(0)));
+            carry(far2, near2, delay, Arc::clone(&count));
         }
     });
-    path
+    (path, back)
 }
 
 /// The number of the line at the top of a screen of `line N`s.
@@ -760,16 +769,22 @@ const SLOW: Duration = Duration::from_millis(250);
 /// A session whose one window shows the text `setline` puts there, drawn by
 /// a client over a slow link, scrolls jumping rather than sliding so that
 /// what a prediction shows can be read off the screen at once.
+///
+/// With it, how many bytes have come back over the link from Neovim.
 fn drawn_slowly(
     scratch: &Scratch,
     tag: &str,
     setline: &str,
-) -> (nvmux::rpc::Client<std::os::unix::net::UnixStream>, Terminal) {
+) -> (
+    nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    Terminal,
+    Arc<AtomicUsize>,
+) {
     let (sock, mut rpc, config) = session(scratch, tag);
     rpc.command(&format!("setlocal noswapfile | {setline}"))
         .expect("setline");
     std::fs::write(&config, "[effects.scroll]\nenabled = false\n").expect("config");
-    let slow = slow_link(&scratch.0.join("link"), &sock, SLOW);
+    let (slow, back) = counted_link(&scratch.0.join("link"), &sock, SLOW);
 
     let mut term = Terminal::spawn(&slow, &config);
     assert!(
@@ -779,7 +794,7 @@ fn drawn_slowly(
     );
     // The agent's lines, and the answer to the attach's fence.
     term.pump_until(Duration::from_secs(3), |_| false);
-    (rpc, term)
+    (rpc, term, back)
 }
 
 /// Type `keys`, a scroll the client predicts: it is on the screen before
@@ -821,7 +836,7 @@ fn every_scroll_predicted_is_the_one_neovim_makes() {
     let scratch = Scratch::new("client-scrolls");
     // Indented by none to three blanks, so that a cursor sent to its line's
     // first non-blank has somewhere to go.
-    let (mut rpc, mut term) = drawn_slowly(
+    let (mut rpc, mut term, _) = drawn_slowly(
         &scratch,
         "client-scrolls",
         "call setline(1, map(range(1, 200), 'repeat(\" \", v:val % 4) . \"line \" . v:val'))",
@@ -921,7 +936,7 @@ fn every_scroll_sideways_predicted_is_the_one_neovim_makes() {
     let scratch = Scratch::new("client-sideways");
     // Lines of every length, from shorter than the window to twice as wide,
     // their columns told apart by the digits in them.
-    let (mut rpc, mut term) = drawn_slowly(
+    let (mut rpc, mut term, _) = drawn_slowly(
         &scratch,
         "client-sideways",
         "setlocal nowrap | call setline(1, map(range(1, 200), \
@@ -988,14 +1003,13 @@ fn every_scroll_sideways_predicted_is_the_one_neovim_makes() {
 }
 
 /// Pages typed faster than a slow link answers: each is on the screen before
-/// Neovim could have heard of it — those typed before the lines they show
-/// have come as soon as they come, and every one after at once — and the
-/// view never goes back, and ends where Neovim's does.
+/// Neovim could have heard of it, the lines it shows sent before it was
+/// typed, and the view never goes back, and ends where Neovim's does.
 #[test]
 fn pages_typed_faster_than_the_link_answers_keep_up() {
     require_nvim!();
     let scratch = Scratch::new("client-burst");
-    let (mut rpc, mut term) = drawn_slowly(
+    let (mut rpc, mut term, _) = drawn_slowly(
         &scratch,
         "client-burst",
         "call setline(1, map(range(1, 2000), '\"line \" . v:val'))",
@@ -1036,18 +1050,10 @@ fn pages_typed_faster_than_the_link_answers_keep_up() {
     for (k, (typed, drawn)) in typed.iter().zip(&drawn).enumerate() {
         let late = drawn.map(|d| d - *typed);
         assert!(
-            late.is_some_and(|l| l < 2 * SLOW),
-            "page {} waited for Neovim: {late:?}",
+            late.is_some_and(|l| l < SLOW),
+            "page {} waited: {late:?}",
             k + 1
         );
-        // Neovim has had a page to send lines from by then.
-        if *typed > t0 + 3 * SLOW {
-            assert!(
-                late.is_some_and(|l| l < SLOW),
-                "page {} was held: {late:?}",
-                k + 1
-            );
-        }
     }
     assert!(
         tops.windows(2).all(|w| w[0] < w[1]),
@@ -1059,4 +1065,57 @@ fn pages_typed_faster_than_the_link_answers_keep_up() {
         Some(u64::from(page(presses))),
         "Neovim went elsewhere"
     );
+}
+
+/// An edit reaches the client as the lines it changed, not as every line the
+/// client keeps; and pages scrolled over lines edited, by keys or otherwise,
+/// above the view, in it and below it, are drawn as Neovim draws them.
+#[test]
+fn edits_reach_the_client_as_what_they_changed() {
+    require_nvim!();
+    let scratch = Scratch::new("client-edits");
+    // Long enough lines that sending them all again shows.
+    let (mut rpc, mut term, back) = drawn_slowly(
+        &scratch,
+        "client-edits",
+        "call setline(1, map(range(1, 600), \
+         '\"line \" . v:val . \" \" . repeat(\"abcdefghij\", 6)'))",
+    );
+    let before = back.load(Ordering::Relaxed);
+    typed(&mut term, b"x");
+    let cost = back.load(Ordering::Relaxed) - before;
+    assert!(cost < 2000, "an edit of a character cost {cost} bytes");
+
+    // Below the view, as a formatter or a language server would: the
+    // cursor stays where it is.
+    rpc.command(
+        "call setline(30, 'edited 30') | call nvim_buf_set_lines(0, 39, 40, v:true, []) | \
+         call append(50, ['new a', 'new b']) | call setline(25, 'edited 25')",
+    )
+    .expect("edit below");
+    term.pump_until(4 * SLOW, |_| false);
+    predicted(&mut term, "<C-f> over lines edited", b"\x06");
+    predicted(&mut term, "<C-f> again", b"\x06");
+    // In the view, by keys: a line deleted, one put back below, a new one.
+    typed(&mut term, b"ddjpoopened");
+    typed(&mut term, b"\x1b");
+    predicted(&mut term, "<C-b> over lines typed", b"\x02");
+    predicted(&mut term, "<C-f> back", b"\x06");
+    // Above the view: every line after moves.
+    rpc.command(
+        "call nvim_buf_set_lines(0, 0, 3, v:true, ['top a', 'top b', 'top c', 'top d', 'top e'])",
+    )
+    .expect("edit above");
+    term.pump_until(4 * SLOW, |_| false);
+    predicted(&mut term, "<C-b> after lines above changed", b"\x02");
+    predicted(&mut term, "<C-b> to the top", b"\x02");
+    // A substitute over a run of lines in view and out of it.
+    typed(&mut term, b":%s/line 4/LINE 4/\r");
+    for (name, keys) in [
+        ("<C-f> after :s", &b"\x06"[..]),
+        ("<C-f> again after :s", b"\x06"),
+        ("<C-f> past them", b"\x06"),
+    ] {
+        predicted(&mut term, name, keys);
+    }
 }

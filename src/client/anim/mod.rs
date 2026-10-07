@@ -82,9 +82,11 @@ const PARTICLES: vfx::Settings = vfx::Settings {
     speed: 6.0,
 };
 
-/// A scroll settles in Neovide's 300 ms, and of a jump further than the
-/// window is tall, one row slides.
-const SCROLL: (f32, usize) = (0.3, 1);
+/// A scroll settles in 150 ms, half Neovide's 300: a page's last row lands
+/// about 110 ms after the key, quick enough that pages typed one after
+/// another do not trail behind. Of a jump further than the window is tall,
+/// one row slides.
+const SCROLL: (f32, usize) = (0.15, 1);
 
 /// Neovide's slide settles in 150 ms; animate.nvim's resize takes its 150, a
 /// split flying in 200, one flying out 180 and a buffer switch's fade 200.
