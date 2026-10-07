@@ -55,11 +55,35 @@ where
 
 /// Wrap a command so it runs under the user's **login** shell. Used by
 /// `ssh::shell_args` to start the shell every remote script runs in.
-/// `$SHELL` is double-quoted so a value containing a space stays one word, and
-/// expands on the remote side because the whole string travels as ssh's
-/// command.
+///
+/// sshd runs a command as `<login shell> -c <command>`, so the outermost layer
+/// is parsed by whatever the user's login shell is, and that need not be POSIX:
+/// fish refuses `${`, csh and tcsh refuse the `:-` modifier. So the login shell
+/// is given nothing but `exec sh -c` and one single-quoted word with no `\`,
+/// `'` or `!` in it, which sh, bash, zsh, ksh, fish, csh and tcsh all read as
+/// the same literal. Everything else happens in that `sh`:
+///
+/// ```text
+/// exec sh -c 'case $SHELL in *csh) exec "$SHELL" -c "<inner>";; *) exec "${SHELL:-/bin/bash}" -l -c "<inner>";; esac'
+/// ```
+///
+/// `$SHELL` is double-quoted so a value containing a space stays one word. The
+/// csh family is the one exception to `-l`: tcsh refuses `-l` beside any other
+/// flag, and csh accepts it but still skips `.login`. Both read `.cshrc` under
+/// `-c`, which is where their users set `path`.
+///
+/// `inner` lands inside double quotes inside that single-quoted word, so it
+/// must be plain words that no shell would read twice; anything else panics,
+/// because it is a bug at the call site rather than a runtime condition.
+/// Values never travel this way anyway: they go down the shell's stdin.
 pub fn login_shell_wrapper(inner: &str) -> String {
-    format!(r#"exec "${{SHELL:-/bin/bash}}" -l -c {}"#, quote(inner))
+    assert!(
+        inner.split(' ').all(|w| quote(w) == w),
+        "{inner:?} is parsed by two different shells and must need no quoting"
+    );
+    format!(
+        r#"exec sh -c 'case $SHELL in *csh) exec "$SHELL" -c "{inner}";; *) exec "${{SHELL:-/bin/bash}}" -l -c "{inner}";; esac'"#
+    )
 }
 
 /// Prepended to every script below, so what reaches the session host is one
@@ -226,42 +250,44 @@ mod tests {
         );
     }
 
-    /// The two-layer case: quoted once for `ssh`'s argv join, then parsed again
-    /// by the remote shell. This is the failure the module docs describe.
+    /// The outermost layer is parsed by the user's login shell, which may be
+    /// fish or tcsh. What it sees must mean the same thing to all of them:
+    /// plain words and one single-quoted word, with none of the characters
+    /// that fish (`\`) or csh (`!`) still act on inside single quotes. Every
+    /// `$` — and so every `${` — is inside that word, for `sh` alone. The
+    /// shells themselves are run on this in `ssh`'s tests.
     #[test]
-    fn survives_two_layers_of_shell() {
-        for original in ["my project", r#"a "quoted" name"#, "it's", "$(id)"] {
-            let inner = format!("printf %s {}", quote(original));
-            let outer = login_shell_wrapper(&inner);
-            // `ssh host <args>` joins with spaces; emulate that faithfully.
-            let out = Command::new("/bin/sh")
-                .arg("-c")
-                .arg(&outer)
-                .output()
-                .expect("run sh");
-            assert!(
-                out.status.success(),
-                "outer layer failed for {original:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            assert_eq!(
-                String::from_utf8_lossy(&out.stdout),
-                original,
-                "two-layer round trip failed for {original:?}\nouter: {outer}"
-            );
-        }
+    fn the_login_shell_sees_plain_words_and_one_literal() {
+        let w = login_shell_wrapper("exec sh -s");
+        let parts: Vec<&str> = w.split('\'').collect();
+        assert_eq!(parts.len(), 3, "exactly one single-quoted word: {w}");
+        let (outside, literal) = (format!("{} {}", parts[0], parts[2]), parts[1]);
+        assert!(!outside.contains("${"), "the login shell sees ${{: {w}");
+        assert!(
+            outside.split_whitespace().all(|word| quote(word) == word),
+            "the login shell sees more than plain words: {outside:?}"
+        );
+        assert!(
+            !literal.contains(['\\', '!', '\n']),
+            "not a literal to fish and csh: {literal:?}"
+        );
     }
 
     #[test]
     fn login_wrapper_uses_the_users_shell_with_bash_fallback() {
         let w = login_shell_wrapper("true");
-        assert!(w.contains("${SHELL:-/bin/bash}"), "no fallback in {w}");
-        assert!(w.contains(" -l -c "), "not a login shell in {w}");
-        // $SHELL must be expanded remotely, so it must NOT be single-quoted.
+        assert!(w.contains(r#""${SHELL:-/bin/bash}""#), "no fallback in {w}");
+        assert!(w.contains(r#" -l -c "true""#), "not a login shell in {w}");
         assert!(
-            !w.contains(r"'${SHELL"),
-            "SHELL was quoted and will not expand: {w}"
+            w.starts_with("exec sh -c '"),
+            "the sh layer is missing: {w}"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "must need no quoting")]
+    fn an_inner_command_that_needs_quoting_is_refused() {
+        login_shell_wrapper(r#"printf %s "$HOME""#);
     }
 
     /// Strip comments and POSIX character classes so the bashism scan below

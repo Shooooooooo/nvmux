@@ -36,6 +36,13 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install neovim
       - run: nvim --version | head -1
+      # The remote command is parsed by the user's login shell first, and the
+      # test that runs it under each shell skips any it cannot find. fish and
+      # tcsh are the ones that do not speak POSIX sh, and zsh is macOS's
+      # default; macOS ships the last two, a Linux runner none of them.
+      - name: Install login shells (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y fish tcsh zsh
       # rustfmt's output does not vary by platform; clippy's findings do
       # (see the cfg-divergent waitid in src/pty.rs), so that stays on both.
       - run: cargo fmt --check
