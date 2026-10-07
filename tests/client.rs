@@ -592,3 +592,156 @@ fn a_split_flies_in_from_its_side() {
         "it did not come left frame by frame: {seen:?}"
     );
 }
+
+/// A socket that passes everything to `to` and back, `delay` late each way:
+/// a slow link to draw a session over. Every connection made to it gets one
+/// of its own to `to`, as an ssh forward would.
+fn slow_link(dir: &Path, to: &Path, delay: Duration) -> PathBuf {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    /// One direction: read as it comes, written `delay` after.
+    fn carry(mut from: UnixStream, mut to: UnixStream, delay: Duration) {
+        let (tx, rx) = mpsc::channel::<(Instant, Vec<u8>)>();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 64 * 1024];
+            while let Ok(n @ 1..) = from.read(&mut buf) {
+                if tx
+                    .send((Instant::now() + delay, buf[..n].to_vec()))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        std::thread::spawn(move || {
+            for (at, bytes) in rx {
+                std::thread::sleep(at.saturating_duration_since(Instant::now()));
+                if to.write_all(&bytes).is_err() {
+                    return;
+                }
+            }
+            let _ = to.shutdown(std::net::Shutdown::Write);
+        });
+    }
+    std::fs::create_dir_all(dir).expect("the link's directory");
+    let path = dir.join("slow.sock");
+    let listener = UnixListener::bind(&path).expect("bind the slow link");
+    let to = to.to_path_buf();
+    std::thread::spawn(move || {
+        for near in listener.incoming() {
+            let (Ok(near), Ok(far)) = (near, UnixStream::connect(&to)) else {
+                return;
+            };
+            let (Ok(near2), Ok(far2)) = (near.try_clone(), far.try_clone()) else {
+                return;
+            };
+            carry(near, far, delay);
+            carry(far2, near2, delay);
+        }
+    });
+    path
+}
+
+/// The number of the line at the top of a screen of `line N`s.
+fn top_line(screen: &str) -> Option<u32> {
+    screen
+        .lines()
+        .next()?
+        .strip_prefix("line ")?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Over a slow link, a turn of the wheel scrolls the window before Neovim
+/// could have heard of it; Neovim scrolls the same way, and when its own
+/// scroll lands, nothing on the screen moves back.
+#[test]
+fn a_turn_of_the_wheel_over_a_slow_link_scrolls_before_neovim_answers() {
+    require_nvim!();
+    let scratch = Scratch::new("client-predict");
+    let (sock, mut rpc, config) = session(&scratch, "client-predict");
+    rpc.command("setlocal noswapfile | call setline(1, map(range(1, 200), '\"line \" . v:val'))")
+        .expect("setline");
+    // A second each way and back: Neovim's answer to the wheel cannot be on
+    // the screen sooner than that.
+    let delay = Duration::from_millis(500);
+    let slow = slow_link(&scratch.0.join("link"), &sock, delay);
+
+    let mut term = Terminal::spawn(&slow, &config);
+    assert!(
+        term.pump_until(Duration::from_secs(20), |s| top_line(s) == Some(1)),
+        "never drawn:\n{}",
+        term.text()
+    );
+    // The agent's lines take a round trip or two after the first paint.
+    term.pump_until(Duration::from_secs(4), |_| false);
+
+    let from = term.output.len();
+    let turned = Instant::now();
+    term.type_bytes(b"\x1b[<65;10;5M");
+    // Three lines down: the bottom row is one the window never showed, which
+    // only the agent's lines can draw.
+    assert!(
+        term.pump_until(Duration::from_millis(800), |s| {
+            top_line(s) == Some(4) && s.lines().nth(21) == Some("line 25")
+        }),
+        "the wheel waited for Neovim:\n{}",
+        term.text()
+    );
+    assert!(turned.elapsed() < 2 * delay, "drawn too late to tell");
+
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            rpc.eval("line('w0')").ok().and_then(|v| v.as_i64()) == Some(4)
+        }),
+        "Neovim scrolled elsewhere"
+    );
+    // Its scroll, on its way back over the link.
+    term.pump_until(Duration::from_secs(2), |_| false);
+    assert_eq!(top_line(&term.text()), Some(4), "{}", term.text());
+
+    // An edit above the view: the agent sends the lines again, as they are
+    // now, and the next turn of the wheel is drawn from those.
+    rpc.command("call append(0, 'line 0')").expect("append");
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| top_line(s) == Some(3)),
+        "the edit was never drawn:\n{}",
+        term.text()
+    );
+    term.pump_until(Duration::from_secs(2), |_| false);
+    term.type_bytes(b"\x1b[<65;10;5M");
+    assert!(
+        term.pump_until(Duration::from_millis(800), |s| {
+            top_line(s) == Some(6) && s.lines().nth(21) == Some("line 27")
+        }),
+        "the wheel waited for Neovim after an edit:\n{}",
+        term.text()
+    );
+    term.pump_until(Duration::from_secs(2), |_| false);
+    assert_eq!(top_line(&term.text()), Some(6), "{}", term.text());
+
+    // Every frame drawn since the first turn, in order: down, and never back
+    // but for the edit.
+    let mut replay = vt100::Parser::new(ROWS, COLS, 0);
+    replay.process(&term.output[..from]);
+    let end = b"\x1b[?2026l";
+    let mut at = from;
+    let mut seen: Vec<u32> = Vec::new();
+    while let Some(i) = find(&term.output[at..], end) {
+        replay.process(&term.output[at..at + i + end.len()]);
+        at += i + end.len();
+        let text = replay.screen().contents();
+        if let Some(n) = top_line(&text) {
+            if seen.last() != Some(&n) {
+                seen.push(n);
+            }
+        }
+    }
+    assert_eq!(seen.last(), Some(&6), "{seen:?}");
+    let back: Vec<&[u32]> = seen.windows(2).filter(|w| w[0] > w[1]).collect();
+    assert_eq!(
+        back,
+        [&[4, 3][..]],
+        "it moved back but for the edit: {seen:?}"
+    );
+}

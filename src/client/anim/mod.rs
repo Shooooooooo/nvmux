@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 use self::blink::Blink;
 use self::layout::{Change, Transition};
 use self::motion::Motion;
+pub use self::scroll::Ahead;
 use self::scroll::Scroll;
 use self::smear::{Rect, Smear};
 use self::switch::Switch;
@@ -153,6 +154,11 @@ pub struct Before {
     layout: Option<layout::Shot>,
     /// Windows about to show another buffer, as they were.
     switched: Vec<switch::Was>,
+    /// The windows scrolled ahead of Neovim, with how many lines their
+    /// buffers had: an edit, or another buffer, ends a prediction.
+    predicted: Vec<(u64, i64)>,
+    /// Windows about to show another buffer, by grid.
+    switching: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -250,7 +256,9 @@ impl Animator {
             .map(|(g, p)| (*g, p.origin()))
             .collect();
         let mut scrolls = Vec::new();
-        if self.effects.scroll.is_some() {
+        // A window scrolled ahead of Neovim is followed whether or not
+        // scrolls slide: Neovim's scroll is what confirms it.
+        if self.effects.scroll.is_some() || !self.scrolls.is_empty() {
             if multigrid {
                 let mut deltas: HashMap<u64, i64> = HashMap::new();
                 for e in batch {
@@ -269,6 +277,9 @@ impl Animator {
                     if delta == 0 || p.hidden {
                         continue;
                     }
+                    if self.effects.scroll.is_none() && !self.scrolls.contains_key(&grid) {
+                        continue;
+                    }
                     if let Some(rect) = inner(g, model.margins(grid)) {
                         scrolls.push(Snap {
                             grid,
@@ -278,16 +289,25 @@ impl Animator {
                         });
                     }
                 }
-            } else if let Some(snap) = linegrid_scroll(model, batch) {
+            } else if let Some(snap) =
+                linegrid_scroll(model, batch).filter(|_| self.effects.scroll.is_some())
+            {
                 scrolls.push(snap);
             }
         }
+        let predicted = self
+            .scrolls
+            .iter()
+            .filter(|(_, s)| s.ahead() != 0)
+            .map(|(g, _)| (*g, model.viewports.get(g).map_or(-1, |v| v.line_count)))
+            .collect();
         let windows = self.effects.windows.filter(|_| multigrid);
         let layout = windows
             .filter(|_| layout::moves_windows(model, batch))
             .and_then(|_| {
                 layout::Shot::take(model, self.options.laststatus, self.transition.as_ref())
             });
+        let switched_grids = switched;
         // Only split windows fade, and only a few at once: `:windo bnext`
         // fades none.
         let mut switched: Vec<switch::Was> = match windows {
@@ -305,6 +325,8 @@ impl Animator {
             scrolls,
             layout,
             switched,
+            predicted,
+            switching: switched_grids.to_vec(),
         }
     }
 
@@ -399,8 +421,20 @@ impl Animator {
             _ => self.motions.clear(),
         }
 
+        // Predictions a batch has made wrong: the window shows another
+        // buffer, or its buffer has another length.
+        for (grid, lines) in &before.predicted {
+            let now_lines = model.viewports.get(grid).map_or(-1, |v| v.line_count);
+            if now_lines != *lines || before.switching.contains(grid) {
+                if let Some(s) = self.scrolls.get_mut(grid) {
+                    s.give_up();
+                }
+            }
+        }
+
         // Scrolls.
-        if let Some((_, far)) = self.effects.scroll {
+        if self.effects.scroll.is_some() || !self.scrolls.is_empty() {
+            let far = self.effects.scroll.map_or(0, |(_, far)| far);
             let mut started = Vec::new();
             for snap in before.scrolls {
                 let Some(g) = model.grids.get(&snap.grid) else {
@@ -425,11 +459,14 @@ impl Animator {
                 let lines = g.lines(top, bot, left, right);
                 match self.scrolls.get_mut(&snap.grid) {
                     Some(s) if s.rect() == snap.rect => s.scrolled(lines, snap.delta, far),
-                    _ => {
+                    _ if self.effects.scroll.is_some() => {
                         self.scrolls.insert(
                             snap.grid,
                             Scroll::new(snap.rect, snap.lines, lines, snap.delta, far),
                         );
+                    }
+                    _ => {
+                        self.scrolls.remove(&snap.grid);
                     }
                 }
                 started.push(snap.grid);
@@ -450,14 +487,18 @@ impl Animator {
             }
         }
 
-        // The cursor.
-        let Some(target) = cursor_rect(model) else {
+        // The cursor. Windows setting off somewhere take it with them: it is
+        // in its cell when they land, and does not travel there.
+        self.cursor_moved(model, drawn && !started, now);
+    }
+
+    /// Set the cursor going to where it now is, if `allowed` to travel, or
+    /// put it there.
+    fn cursor_moved(&mut self, model: &Model, allowed: bool, now: Instant) {
+        let (row, col) = self.cursor_at(model);
+        let Some(target) = cursor_rect(model, (row, col)) else {
             return;
         };
-        let (row, col) = model.cursor_on_screen();
-        // Windows setting off somewhere take the cursor with them: it is in
-        // its cell when they land, and does not travel there.
-        let allowed = drawn && !started;
         if self.smear.target() != Some(target) {
             match self.effects.smear {
                 Some(s) if allowed => self.smear.go(target, &s),
@@ -478,11 +519,86 @@ impl Animator {
         }
     }
 
+    /// Scroll window grid `grid` ahead of Neovim as `go` says, as a turn of
+    /// the wheel Neovim has yet to hear of will: see
+    /// [`crate::client::predict`]. `fill` draws the lines it uncovers (see
+    /// [`Scroll::predict`]). Says how far it went.
+    pub fn predict(
+        &mut self,
+        model: &Model,
+        grid: u64,
+        go: Ahead,
+        fill: &mut dyn FnMut(i64) -> Option<Vec<Cell>>,
+        now: Instant,
+    ) -> i64 {
+        let (Some(g), Some(rect)) = (model.grids.get(&grid), text_rect(model, grid)) else {
+            return 0;
+        };
+        if !self.animating(model, now) {
+            self.last = Some(now);
+        }
+        let animate = self.effects.scroll.is_some();
+        let s = match self.scrolls.get_mut(&grid) {
+            Some(s) if s.rect() == rect => s,
+            _ => {
+                let (top, bot, left, right) = rect;
+                let s = Scroll::still(rect, g.lines(top, bot, left, right), animate);
+                self.scrolls.insert(grid, s);
+                self.scrolls.get_mut(&grid).expect("just put there")
+            }
+        };
+        let went = s.predict(go, fill);
+        if went != 0 {
+            self.cursor_moved(model, true, now);
+        }
+        went
+    }
+
+    /// How many rows window grid `grid` is ahead of Neovim.
+    pub fn ahead(&self, grid: u64) -> i64 {
+        self.scrolls.get(&grid).map_or(0, Scroll::ahead)
+    }
+
+    /// Where the cursor is on the screen: where Neovim put it, or — in a
+    /// window scrolled ahead of Neovim — on the same line of the buffer,
+    /// moved as far as Neovim's `'scrolloff'` will move it to keep it in
+    /// view.
+    pub fn cursor_at(&self, model: &Model) -> (i64, i64) {
+        let (row, col) = model.cursor_on_screen();
+        let c = model.cursor;
+        let Some(s) = self.scrolls.get(&c.grid).filter(|s| s.ahead() != 0) else {
+            return (row, col);
+        };
+        let (top, bot, _, _) = s.rect();
+        if !(top..bot).contains(&c.row) {
+            return (row, col);
+        }
+        let h = (bot - top) as i64;
+        let ahead = s.ahead();
+        // In the rows of the view as predicted: where the cursor's line is,
+        // and where the buffer's first and last lines are.
+        let at = c.row as i64 - top as i64 - ahead;
+        let so = (s.scrolloff() as i64).min((h - 1) / 2);
+        let (first, last) = model
+            .viewports
+            .get(&c.grid)
+            .map_or((i64::MIN, i64::MAX), |v| {
+                let topline = v.topline + ahead;
+                (-topline, v.line_count - 1 - topline)
+            });
+        // Kept `so` rows from either edge, but for the buffer's own ends,
+        // which the cursor may sit on; and on a line of the buffer.
+        let lo = if first < 0 { so } else { 0 };
+        let hi = if last >= h { h - 1 - so } else { h - 1 };
+        let at = at.max(lo).min(hi).min(last).max(first.max(0));
+        (row + at - (c.row as i64 - top as i64), col)
+    }
+
     /// Whether anything is moving: a frame is wanted.
     fn animating(&self, model: &Model, now: Instant) -> bool {
         self.smear.moving()
             || self.vfx.moving()
-            || !self.scrolls.is_empty()
+            || self.scrolls.values().any(Scroll::moving)
             || !self.motions.is_empty()
             || self.transition.is_some()
             || !self.switches.is_empty()
@@ -505,12 +621,14 @@ impl Animator {
     pub fn next_frame(&self, model: &Model, now: Instant) -> Option<Instant> {
         let moving = self.smear.moving()
             || self.vfx.moving()
-            || !self.scrolls.is_empty()
+            || self.scrolls.values().any(Scroll::moving)
             || !self.motions.is_empty()
             || self.transition.is_some()
             || !self.switches.is_empty();
         let frame = moving.then(|| self.last.map_or(now, |last| last + FRAME));
-        [frame, self.blink_due(model, now)]
+        // A prediction Neovim has not confirmed is given up on in a frame.
+        let expiry = self.scrolls.values().filter_map(Scroll::until).min();
+        [frame, self.blink_due(model, now), expiry]
             .into_iter()
             .flatten()
             .min()
@@ -524,9 +642,11 @@ impl Animator {
         self.last = Some(now);
         self.smear.step(dt);
         self.vfx.step(dt);
-        if let Some((duration, _)) = self.effects.scroll {
-            self.scrolls.retain(|_, s| s.step(dt, duration));
-        }
+        let duration = self.effects.scroll.map_or(0.0, |(duration, _)| duration);
+        self.scrolls.retain(|_, s| {
+            s.expire(now);
+            s.step(dt, duration)
+        });
         if let Some(w) = self.effects.windows {
             self.motions.retain(|_, m| m.step(dt, w.slide));
         }
@@ -544,7 +664,7 @@ impl Animator {
         if let (Some(s), true) = (self.effects.vfx, self.vfx.moving()) {
             self.vfx.paint(frame, &colors, color, &s);
         }
-        let mut cursor = hardware_cursor(model, frame);
+        let mut cursor = hardware_cursor(model, frame, self.cursor_at(model));
         if !cursor.visible {
             return cursor;
         }
@@ -604,6 +724,11 @@ impl View for Animator {
     }
 }
 
+/// The rows and columns of window grid `grid` that scroll, as it is now.
+pub fn text_rect(model: &Model, grid: u64) -> Option<(usize, usize, usize, usize)> {
+    inner(model.grids.get(&grid)?, model.margins(grid))
+}
+
 /// The rows and columns of a window's grid that scroll: all of it but its
 /// margins — a winbar, a float's border.
 fn inner(g: &Grid, m: Margins) -> Option<(usize, usize, usize, usize)> {
@@ -659,9 +784,9 @@ fn linegrid_scroll(model: &Model, batch: &[Event]) -> Option<Snap> {
     })
 }
 
-/// The cursor's rectangle on the screen, in its mode's shape.
-fn cursor_rect(model: &Model) -> Option<Rect> {
-    let (row, col) = model.cursor_on_screen();
+/// The cursor's rectangle on the screen at `(row, col)`, in its mode's
+/// shape.
+fn cursor_rect(model: &Model, (row, col): (i64, i64)) -> Option<Rect> {
     let mode = model.mode_info();
     let shape = mode.and_then(|m| m.shape).unwrap_or(Shape::Block);
     let percent = mode.map_or(100, |m| m.percentage);
@@ -703,11 +828,11 @@ fn cursor_colors(model: &Model) -> (Rgb, Option<Rgb>) {
     (back.unwrap_or(plain), front)
 }
 
-/// How the terminal's own cursor is to be left: where Neovim put it, in its
-/// mode's shape and colour — or hidden, while Neovim is busy, for a mode whose
-/// highlight blends it away, or with nowhere on the screen to be.
-fn hardware_cursor(model: &Model, frame: &Frame) -> Cursor {
-    let (row, col) = model.cursor_on_screen();
+/// How the terminal's own cursor is to be left: at `(row, col)`, where Neovim
+/// put it or a prediction moves it, in its mode's shape and colour — or
+/// hidden, while Neovim is busy, for a mode whose highlight blends it away,
+/// or with nowhere on the screen to be.
+fn hardware_cursor(model: &Model, frame: &Frame, (row, col): (i64, i64)) -> Cursor {
     let on_screen =
         row >= 0 && col >= 0 && (row as usize) < frame.height && (col as usize) < frame.width;
     let mode = model.mode_info();
@@ -941,6 +1066,89 @@ mod tests {
         );
     }
 
+    fn viewport(topline: i64, curline: i64, scroll_delta: i64) -> Event {
+        Event::WinViewport {
+            grid: 2,
+            win: Some(1002),
+            topline,
+            botline: topline + 11,
+            curline,
+            curcol: 0,
+            line_count: 100,
+            scroll_delta,
+        }
+    }
+
+    /// A window scrolled ahead of Neovim — scrolls not sliding — shows its
+    /// new lines at once, the cursor on its line or as near it as
+    /// `'scrolloff'` lets it be; Neovim's own scroll lands on it, and one
+    /// Neovim never makes is given up on in time.
+    #[test]
+    fn a_window_scrolled_ahead_of_neovim_shows_at_once() {
+        let fx = Effects {
+            scroll: None,
+            smear: None,
+            ..effects()
+        };
+        let (mut a, mut m, t0) = (Animator::new(fx), model(), Instant::now());
+        setup(&mut a, &mut m, t0);
+        batch(&mut a, &mut m, vec![viewport(0, 0, 0)], true, t0);
+        let top = |a: &Animator, m: &Model| {
+            compose::compose(m, a, 30, 12)
+                .get(0, 0)
+                .map(|c| c.text.clone())
+        };
+        let mut fill = |i: i64| {
+            let digit = char::from_digit((i % 10) as u32, 10)?;
+            let mut row = vec![Cell::default(); 10];
+            row[0].text = Text::Char(digit);
+            Some(row)
+        };
+        let until = t0 + Duration::from_secs(1);
+        let go = |rows, until| Ahead {
+            rows,
+            until,
+            scrolloff: 2,
+        };
+        assert_eq!(a.predict(&m, 2, go(3, until), &mut fill, t0), 3);
+        assert_eq!(top(&a, &m), Some(Text::Char('3')));
+        assert_eq!(a.cursor_at(&m), (2, 0), "'scrolloff' rows from the top");
+        assert_eq!(
+            a.next_frame(&m, t0),
+            Some(until),
+            "nothing to draw till then"
+        );
+
+        let mut events = vec![Event::GridScroll {
+            grid: 2,
+            top: 0,
+            bot: 10,
+            left: 0,
+            right: 10,
+            rows: 3,
+        }];
+        events.extend(lines(2, 3, 10));
+        events.push(viewport(3, 5, 3));
+        events.push(Event::GridCursor {
+            grid: 2,
+            row: 2,
+            col: 0,
+        });
+        let t1 = t0 + Duration::from_millis(300);
+        batch(&mut a, &mut m, events, true, t1);
+        assert_eq!(a.ahead(2), 0);
+        assert_eq!(top(&a, &m), Some(Text::Char('3')), "landed where it was");
+        assert_eq!(a.cursor_at(&m), (2, 0));
+
+        let until = t1 + Duration::from_secs(1);
+        assert_eq!(a.predict(&m, 2, go(-3, until), &mut fill, t1), -3);
+        assert_eq!(top(&a, &m), Some(Text::Char('0')));
+        a.advance(until);
+        assert_eq!(a.ahead(2), 0, "never confirmed");
+        assert_eq!(top(&a, &m), Some(Text::Char('3')), "Neovim's view again");
+        assert_eq!(a.next_frame(&m, until), None);
+    }
+
     /// The terminal's cursor is hidden while the drawn one travels, and is
     /// back in its cell, in its shape, when it arrives.
     #[test]
@@ -1045,7 +1253,10 @@ mod tests {
         m.refresh_styles();
         assert_eq!(cursor_colors(&m), (Rgb(0, 255, 0), Some(Rgb(0, 0, 0x11))));
         let frame = Frame::new(4, 4, Default::default());
-        assert_eq!(hardware_cursor(&m, &frame).color, Some(Rgb(0, 255, 0)));
+        assert_eq!(
+            hardware_cursor(&m, &frame, m.cursor_on_screen()).color,
+            Some(Rgb(0, 255, 0))
+        );
         m.apply(
             Event::ModeInfoSet {
                 enabled: true,
@@ -1057,6 +1268,9 @@ mod tests {
             &mut changes,
         );
         assert_eq!(cursor_colors(&m), (Rgb(255, 255, 255), None));
-        assert_eq!(hardware_cursor(&m, &frame).color, None);
+        assert_eq!(
+            hardware_cursor(&m, &frame, m.cursor_on_screen()).color,
+            None
+        );
     }
 }

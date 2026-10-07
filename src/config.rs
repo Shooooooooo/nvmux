@@ -159,6 +159,18 @@ pub struct ClientSettings {
     /// With `per_session` off as well, a client started ahead is retired when
     /// it first leaves the front, like every other.
     pub lazy: bool,
+    /// Scroll ahead of a slow link: a turn of the mouse wheel over a window
+    /// scrolls it at once, before Neovim has heard of it, once the round trip
+    /// to the session is long enough to be worth it — about 30 ms, which a
+    /// session on this machine never is. nvmux's own client only (see
+    /// [`crate::client::predict`]).
+    ///
+    /// What it costs: the rows a scroll uncovers are drawn without their
+    /// syntax colours, signs or virtual text until Neovim's own arrive, a
+    /// round trip later; and the agent the client leaves in the editor sends
+    /// the text of the lines around each window's view over the link, as the
+    /// view moves. Off, every scroll waits for Neovim.
+    pub predict: bool,
 }
 
 impl Default for ClientSettings {
@@ -167,6 +179,7 @@ impl Default for ClientSettings {
             ui: Ui::Nvmux,
             per_session: true,
             lazy: true,
+            predict: true,
         }
     }
 }
@@ -933,6 +946,10 @@ fn render_default_config(prefix: u8) -> String {
          # \"nvim\" is Neovim's own, and everything the terminal can do reaches\n\
          # the editor as Neovim negotiated it.\n\
          # ui = {ui:?}\n\
+         # nvmux's own client, over a slow link: a turn of the mouse wheel\n\
+         # scrolls at once, the lines it uncovers in plain text until Neovim's\n\
+         # own arrive. false waits for Neovim.\n\
+         # predict = {predict}\n\
          \n\
          [effects]\n\
          # The master switch: false turns every effect below off, whatever its\n\
@@ -1012,6 +1029,7 @@ fn render_default_config(prefix: u8) -> String {
         command = s.command,
         per_session = c.per_session,
         lazy = c.lazy,
+        predict = c.predict,
         fade_enabled = f.enabled,
         fade_duration = f.duration_ms,
         fade_session = f.session,
@@ -1140,6 +1158,7 @@ mod tests {
             ui = \"nvmux\"\n\
             per_session = true\n\
             lazy = true\n\
+            predict = true\n\
             [effects]\n\
             enabled = true\n\
             [effects.fade]\n\
@@ -1320,6 +1339,15 @@ mod tests {
         assert!(!s.client.lazy && !s.client.per_session);
     }
 
+    /// Scrolls are predicted over a slow link unless turned off.
+    #[test]
+    fn scrolls_are_predicted_unless_turned_off() {
+        assert!(Settings::default().client.predict);
+        let s: Settings = toml::from_str("[client]\npredict = false\n").expect("valid");
+        assert!(!s.client.predict);
+        assert!(s.client.per_session && s.client.lazy, "the rest as it was");
+    }
+
     /// nvmux's own client unless told otherwise; Neovim's is a line away.
     #[test]
     fn a_session_is_drawn_by_nvmuxs_client_unless_told() {
@@ -1416,6 +1444,10 @@ mod tests {
             ),
             ("an unparseable client value", "[client]\nper_session = 1\n"),
             ("an unparseable lazy value", "[client]\nlazy = \"no\"\n"),
+            (
+                "an unparseable predict value",
+                "[client]\npredict = \"yes\"\n",
+            ),
             (
                 "an unparseable fade value",
                 "[effects.fade]\nenabled = \"yes\"\n",
@@ -1579,6 +1611,7 @@ mod tests {
             "# per_session = true",
             "# lazy = true",
             "# ui = \"nvmux\"",
+            "# predict = true",
             "# enabled     = true",
             "# duration_ms = 200",
             "# session     = true",
