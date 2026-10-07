@@ -31,8 +31,9 @@ alternate screen of its own.
 Needs, all on PATH:
   * nvim >= 0.11
   * agg >= 1.9   https://github.com/asciinema/agg/releases -- for `--renderer`,
-                 which the notice box needs; see the note where agg is run
-  * python3 -m pip install pyte
+                 which the notice box needs, and `--select`; see `render_gif`
+  * gifski       cargo install gifski -- which encodes the GIF; see `render_gif`
+  * python3 -m pip install pyte pillow
   * a release build of nvmux (cargo build --release)
 
 The GIF is drawn in JetBrainsMono Nerd Font Mono. If it is not installed it is
@@ -43,9 +44,9 @@ The config is scratch: it lives under a temporary directory that is removed on
 exit, and your own config is never read. The demo sessions are not. nvmux has
 no override for its runtime directory, so they are created in your real one
 (/tmp/nvmux-<uid>) alongside any sessions you already have -- the names in
-SESSIONS must therefore be free -- and they are left running when the script
-ends (see the note it prints last), holding the files they opened, which are
-scratch like the config. One file of yours is touched:
+SESSIONS and NEW_NAME must therefore be free -- and they are left running when
+the script ends (see the note it prints last), holding the files they opened,
+which are scratch like the config. One file of yours is touched:
 /tmp/nvmux-<uid>/nvmux.log is removed beforehand and rewritten by the demo's
 own NVMUX_LOG=nvmux=debug run, because `check_fade_ran` reads it afterwards and
 must not pass on a previous run's evidence.
@@ -91,6 +92,9 @@ SESSIONS = [
     ("dotfiles", ["zsh/.zshrc", "nvim/init.lua"]),
     ("notes", ["todo.md"]),
 ]
+
+# And the one made on camera, which the take then moves to the end of the list.
+NEW_NAME = "blog"
 
 # The files those sessions open. Written under the run's temporary directory,
 # so nothing of them outlives the script but the buffers the sessions hold.
@@ -653,6 +657,17 @@ class Terminal:
         self.close()
         sys.exit("timed out waiting for %s to go\n%s" % (what, self.text()))
 
+    def listed(self):
+        """The demo's sessions, in the order the picker lists them."""
+        names = [n for n, _ in SESSIONS] + [NEW_NAME]
+        order = []
+        for line in self.text().split("\n"):
+            words = line.split()
+            for name in names:
+                if name in words and name not in order:
+                    order.append(name)
+        return order
+
     def is_selected(self, name):
         return any("\u25b8" in line and name in line
                    for line in self.text().split("\n"))
@@ -757,33 +772,65 @@ def perform(env):
     term.type("nvmux", per_char=0.09, wait=0.5)
     term.write(ENTER, wait=0.2, show=("\u23ce", "open the picker"))
     term.expect("attach", "the picker")
-    time.sleep(1.6)
+    time.sleep(1.4)
 
-    # 2. into one: the editor as it was left, drawn by nvmux's own client
+    # 2. make one, which is `c` and a name; creating attaches to it
+    term.write(b"c", wait=0.6, show=("c", "new session"))
+    term.expect("new session name", "the create prompt")
+    time.sleep(0.6)
+    term.type(NEW_NAME, per_char=0.1, wait=0.6)
+    term.write(ENTER, wait=0.2, show=("\u23ce", "create"))
+    term.expect("NVIM v", "the new session to paint")
+    time.sleep(1.2)
+
+    # 3. back to the picker, still attached, and the new one down to the end.
+    # A session is made just below the one selected -- the gap `c` opens is
+    # where it goes -- so it starts second, and the moves are counted from
+    # wherever it is: the list wraps, and a move too many would take it round.
+    term.write(PREFIX + b" ", show=("Ctrl-Space  Space", "picker"))
+    term.expect("attach", "the picker over the session")
+    time.sleep(1.0)
+    if not term.is_selected(NEW_NAME):
+        term.close()
+        sys.exit("the picker did not open on %r:\n%s" % (NEW_NAME, term.text()))
+    want = [n for n, _ in SESSIONS] + [NEW_NAME]
+    moves = len(want) - 1 - term.listed().index(NEW_NAME)
+    term.write(b" ", wait=0.6, show=("Space", "pick up"))
+    for _ in range(moves):
+        term.write(DOWN, wait=0.45, show=("\u2193", "move"))
+    term.write(b" ", wait=0.2, show=("Space", "put down"))
+    end = time.time() + 5
+    while term.listed() != want and time.time() < end:
+        time.sleep(0.1)
+    if term.listed() != want:
+        term.close()
+        sys.exit("the reorder did not land: %r\n%s" % (term.listed(), term.text()))
+    time.sleep(1.2)
+
+    # 4. into another: the editor as it was left, drawn by nvmux's own client
     term.select("api-server")
     time.sleep(0.4)
     term.write(ENTER, wait=0.2, show=("\u23ce", "attach"))
     term.expect("AppState", "api-server to paint")
-    time.sleep(1.4)
+    time.sleep(1.2)
 
-    # 3. the client animates: a scroll slides, a split flies in from its side
+    # 5. the client animates: a scroll slides, a split flies in from its side
     term.write(CTRL_D, wait=1.1, show=("Ctrl-d", "scroll"))
-    term.write(CTRL_D, wait=1.1, show=("Ctrl-d", "scroll"))
-    term.write(CTRL_U, wait=1.2, show=("Ctrl-u", "scroll"))
-    term.type(":vsplit src/routes.rs", per_char=0.06, wait=0.4)
+    term.write(CTRL_U, wait=1.1, show=("Ctrl-u", "scroll"))
+    term.type(":vsplit src/routes.rs", per_char=0.05, wait=0.4)
     term.write(ENTER, wait=0.2, show=("\u23ce", "split"))
     term.expect("list_users(", "the split to open")
-    time.sleep(1.8)
-
-    # 4. the next session, without the picker; a buffer switch fades over
-    term.write(PREFIX + b"n", show=("Ctrl-Space  n", "next session"))
-    term.expect("init.lua", "dotfiles to paint")
-    time.sleep(1.8)
-    term.write(CTRL_CARET, wait=0.2, show=("Ctrl-^", "other buffer"))
-    term.expect("HISTFILE", "the other buffer")
     time.sleep(1.6)
 
-    # 5. detach: the sessions keep running, nvmux exits
+    # 6. the next session, without the picker; a buffer switch fades over
+    term.write(PREFIX + b"n", show=("Ctrl-Space  n", "next session"))
+    term.expect("init.lua", "dotfiles to paint")
+    time.sleep(1.6)
+    term.write(CTRL_CARET, wait=0.2, show=("Ctrl-^", "other buffer"))
+    term.expect("HISTFILE", "the other buffer")
+    time.sleep(1.4)
+
+    # 7. detach: the sessions keep running, nvmux exits
     term.write(PREFIX + b"d", show=("Ctrl-Space  d", "detach"))
     # The editor has to be gone, and waiting for the prompt does not say that:
     # leaving the alternate screen restores the shell's screen, which already
@@ -792,13 +839,16 @@ def perform(env):
     # and the `nvmux` typed next then lands in the editor instead of the shell.
     term.expect_gone("HISTFILE", "the editor")
     term.expect("$", "the shell prompt back")
-    time.sleep(1.6)
+    time.sleep(1.4)
 
-    # 6. come back: the split is where it was left
+    # 8. come back: the order is kept, and the split is where it was left
     term.type("nvmux", per_char=0.09, wait=0.4)
     term.write(ENTER, wait=0.2, show=("\u23ce", "open the picker"))
     term.expect("attach", "the picker again")
     time.sleep(1.2)
+    if term.listed() != want:
+        term.close()
+        sys.exit("the order did not survive: %r" % term.listed())
     term.select("api-server", key=UP)
     time.sleep(0.5)
     term.write(ENTER, wait=0.2, show=("\u23ce", "attach"))
@@ -1100,14 +1150,97 @@ def write_cast(events, path, tail=1.2, rows=ROWS):
             f.write(json.dumps([round(events[-1][0] + tail, 3), "o", ""]) + "\n")
 
 
+def render_gif(cast, out, font_dir, work):
+    """Draw the cast as a GIF: every frame on its own with agg, then all of
+    them encoded together with gifski.
+
+    Not agg on the whole cast, which is one command and was how this was done.
+    agg hands its frames to gifski at gifski's default quality, and at that
+    quality gifski smooths motion: a pixel that changes too little from one
+    frame to the next is left as it was. Most of this take is dissolves, and a
+    dissolve is nothing but small changes, so each one lagged behind the screen
+    and settled short of where it was going -- the create prompt and the
+    picker's numbers stayed on, faint, over the editor seconds after both had
+    gone. Rendered one at a time, a frame has no frame before it to be held to;
+    gifski at full quality then keeps every frame as drawn.
+
+    agg's own render of the whole cast is kept for one thing: when its frames
+    are. Each is drawn again at its start, a few milliseconds in -- the GIF
+    keeps time in hundredths, so that lands on the frame and short of the next.
+    gifski takes frames at a steady rate, so each is handed over once a
+    hundredth for as long as it lasts, and it puts the repeats back together.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from PIL import Image
+
+    # No --theme: the cast header carries it.
+    #
+    # `--renderer resvg` is for the notice box, and it is not a preference.
+    # agg's default renderer, `swash`, draws the box-drawing block itself
+    # rather than from the font -- on the cell grid, a pixel thick, which is
+    # what makes a run of `─` a straight line at any size. It does not do
+    # that for the rounded corners the box is built from (`src/announce.rs`:
+    # `╭ ╮ ╰ ╯`, U+256D..U+2570), which come from the font instead and land
+    # a pixel higher and thicker than the bar they are meant to meet. The
+    # corners visibly float off the dashes at both ends of both rules.
+    # `resvg` draws every one of them from the font, where they were
+    # designed to line up, and the box closes. Nothing else in the frame
+    # moves by more than antialiasing.
+    agg = ["agg", "-q", "--renderer", "resvg",
+           "--font-family", FONT_FAMILY, "--font-size", "15",
+           "--fps-cap", str(FPS_CAP), "--idle-time-limit", "1.5"]
+    if font_dir:
+        agg += ["--font-dir", font_dir]
+    os.makedirs(work)
+
+    timing = os.path.join(work, "timing.gif")
+    subprocess.run(agg + [cast, timing], check=True)
+    frames, at = [], 0
+    with Image.open(timing) as im:
+        for i in range(im.n_frames):
+            im.seek(i)
+            frames.append((at, im.info["duration"]))
+            at += im.info["duration"]
+
+    def draw(i):
+        start, _ = frames[i]
+        one = os.path.join(work, "%05d.gif" % i)
+        subprocess.run(agg + ["--select", "%.3f" % (start / 1000 + 0.006),
+                              cast, one], check=True)
+        with Image.open(one) as im:
+            im.convert("RGB").save(os.path.join(work, "%05d.png" % i))
+        os.remove(one)
+
+    print("  drawing %d frames, %.1fs" % (len(frames), at / 1000))
+    with ThreadPoolExecutor(os.cpu_count() or 4) as pool:
+        list(pool.map(draw, range(len(frames))))
+
+    # Named relative to `work`, and run there: a take this long is three
+    # thousand of them, and full paths would be most of macOS's ARG_MAX.
+    ticks = []
+    for i, (_, duration) in enumerate(frames):
+        for _ in range(max(1, round(duration / 10))):
+            tick = "t%06d.png" % len(ticks)
+            os.link(os.path.join(work, "%05d.png" % i), os.path.join(work, tick))
+            ticks.append(tick)
+    subprocess.run(["gifski", "--quiet", "--fps", "100", "--quality", "100",
+                    "--motion-quality", "100", "--lossy-quality", "100",
+                    "--output", os.path.abspath(out)] + ticks,
+                   cwd=work, check=True)
+
+
 def main():
-    for tool in ("nvim", "agg"):
+    for tool in ("nvim", "agg", "gifski"):
         if not shutil.which(tool):
             sys.exit("%s is not on PATH; see the header of this script" % tool)
     try:
         import pyte                                   # noqa: F401
     except ImportError:
         sys.exit("pyte is needed for the screen checks: pip install pyte")
+    try:
+        import PIL                                    # noqa: F401
+    except ImportError:
+        sys.exit("pillow is needed to render the GIF: pip install pillow")
     if not os.path.exists(NVMUX):
         sys.exit("build nvmux first: cargo build --release")
     font_dir = ensure_font()
@@ -1151,25 +1284,7 @@ def main():
 
         os.makedirs(os.path.dirname(OUT_GIF), exist_ok=True)
         print("rendering %s ..." % OUT_GIF)
-        # No --theme: the cast header carries it.
-        #
-        # `--renderer resvg` is for the notice box, and it is not a preference.
-        # agg's default renderer, `swash`, draws the box-drawing block itself
-        # rather than from the font -- on the cell grid, a pixel thick, which is
-        # what makes a run of `─` a straight line at any size. It does not do
-        # that for the rounded corners the box is built from (`src/announce.rs`:
-        # `╭ ╮ ╰ ╯`, U+256D..U+2570), which come from the font instead and land
-        # a pixel higher and thicker than the bar they are meant to meet. The
-        # corners visibly float off the dashes at both ends of both rules.
-        # `resvg` draws every one of them from the font, where they were
-        # designed to line up, and the box closes. Nothing else in the frame
-        # moves by more than antialiasing.
-        render = ["agg", "--renderer", "resvg",
-                  "--font-family", FONT_FAMILY, "--font-size", "15",
-                  "--fps-cap", str(FPS_CAP), "--idle-time-limit", "1.5"]
-        if font_dir:
-            render += ["--font-dir", font_dir]
-        subprocess.run(render + [cast, OUT_GIF], check=True)
+        render_gif(cast, OUT_GIF, font_dir, os.path.join(tmp, "frames"))
         print("wrote %s (%.0f KB)" % (OUT_GIF, os.path.getsize(OUT_GIF) / 1024))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
