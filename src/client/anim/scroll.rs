@@ -36,11 +36,21 @@ use crate::client::grid::Cell;
 /// A line of a scroll's rectangle, or `None` for one nothing is known of.
 type Line = Option<Vec<Cell>>;
 
-/// How many times as far as it is tall a view may be scrolled ahead of
-/// Neovim: as many pages as are typed in a round trip of a slow link, a key
-/// held down and repeating among them. The agent sends lines as far ahead
-/// of a view that moves (see `super::super::AGENT_LUA`).
+/// How many times as far as it is tall a view is drawn ahead of Neovim from
+/// lines the client has before it needs them: the agent sends lines that
+/// far either side of a view (see `super::super::AGENT_LUA`). Pages typed in
+/// a round trip of a slow link, a key held down and repeating among them,
+/// are as many.
 pub const REACH: i64 = 8;
+
+/// How many times as far as it is tall a view may be scrolled ahead of
+/// Neovim at all. Past [`REACH`], a scroll is made but held — the next made
+/// from where it goes, Neovim's view moving on meanwhile, and the agent's
+/// lines with it — and drawn once its lines have come, rather than refused,
+/// which would leave every scroll after it waiting a round trip for Neovim
+/// until the keys stopped. This only keeps a client that somehow outran
+/// Neovim for good from growing without end.
+pub const HOLD: i64 = 4 * REACH;
 
 /// What draws a line a view scrolled ahead uncovers, counted from the top
 /// of the rectangle as Neovim has it: `h` is the first line below it, `-1`
@@ -249,13 +259,14 @@ impl Scroll {
         let old = std::mem::replace(&mut self.current, after);
         if delta.abs() > h && left == delta {
             // Past the whole view, and not foreseen: nothing is known between
-            // the two, and only `far` rows of it are animated.
+            // the two, and only `far` rows of it are animated — from a row
+            // further, the first of which a glide shows gone at once.
             self.above.clear();
             self.below.clear();
             self.ahead.clear();
             self.drawn = 0;
-            let rows = if self.animate {
-                far.min(h as usize) as f32
+            let rows = if self.animate && far > 0 {
+                far.min(h as usize) as f32 + 1.0
             } else {
                 0.0
             };
@@ -316,7 +327,7 @@ impl Scroll {
         }
     }
 
-    /// Scroll ahead of Neovim as `go` says, no further than [`REACH`] times
+    /// Scroll ahead of Neovim as `go` says, no further than [`HOLD`] times
     /// the rectangle is tall. `fill` draws the lines it uncovers, and `land`
     /// works out where it leaves the cursor; where either cannot yet, it is
     /// made but not drawn till [`Scroll::fill_in`] can. Says whether it was
@@ -324,7 +335,7 @@ impl Scroll {
     pub fn predict(&mut self, go: Ahead, fill: &mut Fill, land: &mut Lander) -> bool {
         let h = self.current.len() as i64;
         let target = self.ahead() + go.rows;
-        if go.rows == 0 || target.abs() > REACH * h {
+        if go.rows == 0 || target.abs() > HOLD * h {
             return false;
         }
         self.ahead.push_back(go);
@@ -492,12 +503,13 @@ mod tests {
             .collect()
     }
 
-    /// Scrolled down three: at first the view is the old one, and it slides
-    /// up a row at a time until it is the new one.
+    /// Scrolled down three: at once the first row has gone — no frame shows
+    /// the view as it was — and it slides up a row at a time until it is the
+    /// new one.
     #[test]
-    fn the_view_starts_where_it_was_and_slides_to_where_it_is() {
+    fn the_view_starts_a_row_on_and_slides_to_where_it_is() {
         let mut s = Scroll::new((0, 5, 0, 1), lines(10..15), lines(13..18), 3, 1);
-        assert_eq!(shows(&s), [10, 11, 12, 13, 14].map(Some));
+        assert_eq!(shows(&s), [11, 12, 13, 14, 15].map(Some));
         let mut seen = vec![shows(&s)];
         while s.step(0.004, 0.3) {
             if seen.last() != Some(&shows(&s)) {
@@ -510,7 +522,6 @@ mod tests {
         assert_eq!(
             seen,
             vec![
-                [10, 11, 12, 13, 14].map(Some).to_vec(),
                 [11, 12, 13, 14, 15].map(Some).to_vec(),
                 [12, 13, 14, 15, 16].map(Some).to_vec(),
                 [13, 14, 15, 16, 17].map(Some).to_vec(),
@@ -518,11 +529,11 @@ mod tests {
         );
     }
 
-    /// Up as well as down.
+    /// Up as well as down, the first row at once.
     #[test]
     fn scrolling_up_slides_the_other_way() {
         let s = Scroll::new((0, 4, 0, 1), lines(10..14), lines(8..12), -2, 1);
-        assert_eq!(shows(&s), [10, 11, 12, 13].map(Some));
+        assert_eq!(shows(&s), [9, 10, 11, 12].map(Some));
     }
 
     /// A row's scroll is no slower than none: it is shown at once.
@@ -534,12 +545,13 @@ mod tests {
     }
 
     /// A second scroll before the first has settled carries on from where
-    /// the view had got to.
+    /// the view had got to: a row on, the first having gone at once.
     #[test]
     fn a_scroll_on_top_of_a_scroll_carries_on() {
         let mut s = Scroll::new((0, 4, 0, 1), lines(0..4), lines(2..6), 2, 1);
+        assert_eq!(shows(&s), [1, 2, 3, 4].map(Some));
         s.scrolled(lines(4..8), 2, 1);
-        assert_eq!(shows(&s), [0, 1, 2, 3].map(Some));
+        assert_eq!(shows(&s), [1, 2, 3, 4].map(Some));
         // And back again: what the first scroll put above is found below.
         let mut s = Scroll::new((0, 4, 0, 1), lines(0..4), lines(2..6), 2, 1);
         s.scrolled(lines(0..4), -2, 1);
@@ -639,8 +651,8 @@ mod tests {
         s.predict(go, &mut fill(10, 99), &mut |_, _| None);
         assert_eq!(
             shows(&s),
-            [10, 11, 12, 13, 14].map(Some),
-            "from where it was"
+            [11, 12, 13, 14, 15].map(Some),
+            "a row on from where it was"
         );
         while s.step(0.01, 0.3) && s.moving() {}
         assert_eq!(
@@ -652,21 +664,47 @@ mod tests {
         assert_eq!(s.ahead(), 2, "not yet");
         s.expire(until);
         assert_eq!(s.ahead(), 0);
-        assert_eq!(shows(&s), [12, 13, 14, 15, 16].map(Some), "back from there");
+        assert_eq!(
+            shows(&s),
+            [11, 12, 13, 14, 15].map(Some),
+            "back from there, a row at once"
+        );
         while s.step(0.01, 0.3) {}
         assert_eq!(shows(&s), [10, 11, 12, 13, 14].map(Some));
     }
 
-    /// No further than [`REACH`] times the window is tall; and a scroll
+    /// No further than [`HOLD`] times the window is tall; and a scroll
     /// whose lines are yet to come is made but drawn only once they have,
     /// those after it with it.
     #[test]
     fn a_prediction_waits_for_its_lines() {
         let mut s = Scroll::still((0, 5, 0, 1), lines(10..15), false);
-        let far = 5 * REACH;
-        assert!(!s.predict(go(far + 1), &mut fill(10, 99), &mut |_, _| None));
-        assert!(s.predict(go(far), &mut fill(10, 99), &mut |_, _| None));
+        let far = 5 * HOLD;
+        assert!(!s.predict(go(far + 1), &mut fill(10, 999), &mut |_, _| None));
+        assert!(s.predict(go(far), &mut fill(10, 999), &mut |_, _| None));
         assert_eq!(shows(&s)[0], Some(10 + far as u32));
+
+        // Further than lines have come: held, not refused, the scrolls after
+        // it made from where it goes; drawn as the lines come.
+        let mut s = Scroll::still((0, 5, 0, 1), lines(10..15), false);
+        let reach = 5 * REACH;
+        assert!(
+            s.predict(go(reach), &mut fill(10, 14 + reach as u32), &mut |_, _| {
+                None
+            })
+        );
+        assert!(s.predict(go(5), &mut fill(10, 14 + reach as u32), &mut |_, _| None));
+        assert!(s.predict(go(5), &mut fill(10, 14 + reach as u32), &mut |_, _| None));
+        assert_eq!(s.ahead(), reach + 10);
+        assert_eq!(shows(&s)[0], Some(10 + reach as u32), "as far as its lines");
+        assert!(s.fill_in(&mut fill(10, 19 + reach as u32), &mut |_, _| None));
+        assert_eq!(
+            shows(&s)[0],
+            Some(15 + reach as u32),
+            "one more, as they come"
+        );
+        assert!(s.fill_in(&mut fill(10, 999), &mut |_, _| None));
+        assert_eq!(shows(&s)[0], Some(20 + reach as u32));
 
         let mut s = Scroll::still((0, 5, 0, 1), lines(10..15), false);
         assert!(s.predict(go(2), &mut fill(10, 18), &mut |_, _| None));

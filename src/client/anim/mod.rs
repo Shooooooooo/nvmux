@@ -1170,8 +1170,9 @@ mod tests {
         assert!(!a.smear.moving());
     }
 
-    /// A window that scrolls shows the lines it showed, then slides to its
-    /// new ones; a change of margins with it is a layout change, not a scroll.
+    /// A window that scrolls shows the lines it showed, a row on at once,
+    /// then slides to its new ones; a change of margins with it is a layout
+    /// change, not a scroll.
     #[test]
     fn a_window_that_scrolls_slides_its_lines() {
         let (mut a, mut m, t0) = (Animator::new(effects()), model(), Instant::now());
@@ -1199,7 +1200,7 @@ mod tests {
         let frame = compose::compose(&m, &a, 30, 12);
         assert_eq!(
             frame.get(0, 0).map(|c| c.text.clone()),
-            Some(Text::Char('0'))
+            Some(Text::Char('1'))
         );
         a.advance(t0 + Duration::from_secs(1));
         let frame = compose::compose(&m, &a, 30, 12);

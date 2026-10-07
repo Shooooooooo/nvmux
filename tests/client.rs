@@ -1002,22 +1002,18 @@ fn every_scroll_sideways_predicted_is_the_one_neovim_makes() {
     typed(&mut term, b"\x1b");
 }
 
-/// Pages typed faster than a slow link answers: each is on the screen before
-/// Neovim could have heard of it, the lines it shows sent before it was
-/// typed, and the view never goes back, and ends where Neovim's does.
-#[test]
-fn pages_typed_faster_than_the_link_answers_keep_up() {
-    require_nvim!();
-    let scratch = Scratch::new("client-burst");
-    let (mut rpc, mut term, _) = drawn_slowly(
-        &scratch,
-        "client-burst",
-        "call setline(1, map(range(1, 2000), '\"line \" . v:val'))",
-    );
+/// Type `presses` pages, `gap` apart, into a window of `line N`s drawn over
+/// a slow link: say how long after its key each page was first on the
+/// screen, after making sure the view never went back and ended where
+/// Neovim's did.
+fn pages(
+    rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    term: &mut Terminal,
+    gap: Duration,
+    presses: usize,
+) -> Vec<Option<Duration>> {
     // A page is the window less two lines: 20.
     let page = |k: usize| 1 + 20 * k as u32;
-    let gap = Duration::from_millis(100);
-    let presses = 10;
     let t0 = Instant::now();
     let mut typed = Vec::new();
     let mut drawn: Vec<Option<Instant>> = vec![None; presses];
@@ -1043,18 +1039,9 @@ fn pages_typed_faster_than_the_link_answers_keep_up() {
     for k in 0..presses {
         typed.push(Instant::now());
         term.type_bytes(b"\x06");
-        watch(&mut term, t0 + gap * (k as u32 + 1), &mut drawn);
+        watch(term, t0 + gap * (k as u32 + 1), &mut drawn);
     }
-    let tops = watch(&mut term, Instant::now() + 4 * SLOW, &mut drawn);
-
-    for (k, (typed, drawn)) in typed.iter().zip(&drawn).enumerate() {
-        let late = drawn.map(|d| d - *typed);
-        assert!(
-            late.is_some_and(|l| l < SLOW),
-            "page {} waited: {late:?}",
-            k + 1
-        );
-    }
+    let tops = watch(term, Instant::now() + 4 * SLOW, &mut drawn);
     assert!(
         tops.windows(2).all(|w| w[0] < w[1]),
         "it went back: {tops:?}"
@@ -1065,6 +1052,56 @@ fn pages_typed_faster_than_the_link_answers_keep_up() {
         Some(u64::from(page(presses))),
         "Neovim went elsewhere"
     );
+    typed
+        .iter()
+        .zip(&drawn)
+        .map(|(typed, drawn)| drawn.map(|d| d - *typed))
+        .collect()
+}
+
+/// Pages typed faster than a slow link answers: each is on the screen before
+/// Neovim could have heard of it, the lines it shows sent before it was
+/// typed.
+#[test]
+fn pages_typed_faster_than_the_link_answers_keep_up() {
+    require_nvim!();
+    let scratch = Scratch::new("client-burst");
+    let (mut rpc, mut term, _) = drawn_slowly(
+        &scratch,
+        "client-burst",
+        "call setline(1, map(range(1, 2000), '\"line \" . v:val'))",
+    );
+    let late = pages(&mut rpc, &mut term, Duration::from_millis(100), 10);
+    for (k, late) in late.iter().enumerate() {
+        assert!(
+            late.is_some_and(|l| l < SLOW),
+            "page {} waited: {late:?}",
+            k + 1
+        );
+    }
+}
+
+/// Pages typed faster still, further ahead of Neovim than the lines it sends
+/// reach: those past them wait for their lines, which come as Neovim's view
+/// moves on, and not for Neovim — none as long as its own frame would take.
+#[test]
+fn pages_typed_further_ahead_than_lines_go_wait_only_for_them() {
+    require_nvim!();
+    let scratch = Scratch::new("client-run");
+    let (mut rpc, mut term, _) = drawn_slowly(
+        &scratch,
+        "client-run",
+        "call setline(1, map(range(1, 2000), '\"line \" . v:val'))",
+    );
+    // A round trip types ten pages, more than the eight windows of lines.
+    let late = pages(&mut rpc, &mut term, Duration::from_millis(50), 16);
+    for (k, late) in late.iter().enumerate() {
+        assert!(
+            late.is_some_and(|l| l < 2 * SLOW),
+            "page {} waited for Neovim: {late:?}",
+            k + 1
+        );
+    }
 }
 
 /// An edit reaches the client as the lines it changed, not as every line the

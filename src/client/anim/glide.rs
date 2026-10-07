@@ -80,11 +80,19 @@ impl Glide {
         self.position != 0.0
     }
 
-    /// The whole cells still to go, rounded towards the target: a scroll
-    /// shows its first row as soon as it has moved at all, and a scroll of
-    /// one row is no slower than none. See [`super::scroll`].
+    /// The whole cells still to go, rounded towards the target — and a whole
+    /// distance counted a cell less, as though the glide had moved a hair:
+    /// a scroll shows its first row the moment it sets off, not a frame
+    /// later, and a scroll of one row is no slower than none. See
+    /// [`super::scroll`].
     pub fn cells(&self) -> i64 {
-        self.position.trunc() as i64
+        let whole = self.position.trunc();
+        let cells = if whole == self.position && whole != 0.0 {
+            whole - self.position.signum()
+        } else {
+            whole
+        };
+        cells as i64
     }
 }
 
@@ -161,15 +169,20 @@ mod tests {
         assert!((a.position() - b.position()).abs() < 1e-4);
     }
 
-    /// Whole cells round towards the target: a row's glide shows its row
-    /// gone at once.
+    /// Whole cells round towards the target, and a whole distance counts a
+    /// cell less: a glide shows its first row gone the moment it sets off,
+    /// and a row's glide shows nothing to go at all.
     #[test]
     fn whole_cells_round_towards_the_target() {
-        let mut g = Glide::at(1.0);
-        assert_eq!(g.cells(), 1);
-        g.step(0.001, 0.15);
-        assert_eq!(g.cells(), 0);
+        assert_eq!(Glide::at(20.0).cells(), 19);
+        assert_eq!(Glide::at(-20.0).cells(), -19);
+        assert_eq!(Glide::at(1.0).cells(), 0);
         assert_eq!(Glide::at(-2.5).cells(), -2);
+        assert_eq!(Glide::at(0.4).cells(), 0);
+        assert_eq!(Glide::default().cells(), 0);
+        let mut g = Glide::at(20.0);
+        g.step(0.001, 0.15);
+        assert_eq!(g.cells(), 19, "a hair in, as it showed");
         let mut g = Glide::at(5.0);
         g.set(5.0);
         assert_eq!(g, Glide::at(5.0), "the same distance is no new start");

@@ -28,8 +28,9 @@
 //!   cursor's line sending it to the longest line in view;
 //!
 //! — with `'scrolloff'` keeping the cursor in from the edges, and a count
-//! where Neovim takes one; one after another, as fast as they are typed, as
-//! far as eight windows ahead of Neovim (see `super::anim::scroll::REACH`).
+//! where Neovim takes one; one after another, as fast as they are typed —
+//! further than eight windows ahead of Neovim, as soon as the lines they
+//! show have come (see `super::anim::scroll::HOLD`).
 //!
 //! Most of the rows a scroll shows are rows the window already shows, moved.
 //! What the client does not have is the lines it uncovers. So the agent the
