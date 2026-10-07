@@ -8,9 +8,10 @@
 //! `CSI ? u` query (`CSI > 1 u`; `CSI > 3 u` from Neovim 0.12, which asks for
 //! key-repeat and key-release reports too), and xterm's `modifyOtherKeys`
 //! (`CSI > 4 ; 2 m`) otherwise. A terminal that grants either one then spells
-//! the same chord as an escape sequence — and since the `--remote-ui` client
-//! runs that TUI, and nvmux relays its negotiation untouched (see
-//! [`crate::pty`]), the terminal's spelling is what arrives on nvmux's stdin:
+//! the same chord as an escape sequence — and since the client on the pty is
+//! that TUI or nvmux's own, which asks the same (see [`crate::client`]), and
+//! nvmux relays its negotiation untouched (see [`crate::pty`]), the
+//! terminal's spelling is what arrives on nvmux's stdin:
 //!
 //! ```text
 //! Ctrl-Space, legacy:          0x00

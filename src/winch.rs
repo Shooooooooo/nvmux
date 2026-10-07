@@ -3,7 +3,7 @@
 //! # Why nvmux only has to notice
 //!
 //! Resizing the PTY master is sufficient end to end: the kernel then delivers
-//! `SIGWINCH` to the pty's foreground process group, the `--remote-ui` client
+//! `SIGWINCH` to the pty's foreground process group, the client on the pty
 //! calls `try_resize`, and the server follows. nvmux never forwards the signal
 //! to the child itself.
 //!

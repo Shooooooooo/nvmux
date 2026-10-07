@@ -3,9 +3,9 @@
 //! Cycling with `<prefix> n` and `<prefix> p` means changing session without
 //! naming one, so an attach has to say where it landed. That is easy in the
 //! picker and awkward here: while a session is attached, nvmux owns no cells at
-//! all. `nvim --remote-ui` draws the screen and [`crate::pty`] copies its bytes
-//! through without looking at them, so there is nothing to composite into and
-//! nothing to read back.
+//! all. The client on the pty draws the screen and [`crate::pty`] copies its
+//! bytes through without looking at them, so there is nothing to composite into
+//! and nothing to read back.
 //!
 //! An attach out of the picker is the one change of session that goes without
 //! it: the user has just chosen the session there by its name, so the box

@@ -1,7 +1,10 @@
 //! A minimal synchronous msgpack-RPC client for Neovim.
 //!
-//! There is **no `nvim_ui_attach` anywhere in this crate**, and there must never
-//! be one — see [`Client::list_uis`].
+//! There is **no `nvim_ui_attach` through this client**, and there must never be
+//! one — see [`Client::list_uis`]. The UI nvmux is itself, [`crate::client`],
+//! is the client on the pty, in a process of its own and on a channel of its
+//! own: one UI, as `nvim --remote-ui` is where `[client] ui = "nvim"` puts
+//! that on the pty instead.
 //!
 //! Synchronous because Neovim never pushes unsolicited traffic on a bare RPC
 //! channel: only one that has attached a UI or registered for autocmds gets

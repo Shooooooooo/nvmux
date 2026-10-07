@@ -41,7 +41,10 @@ use crate::error::ConfigError;
 /// as `[keys]`-style sections — `[effects]` with a table inside it for each
 /// effect: `[effects.fade]`, `[effects.move]`, `[effects.cursor]`,
 /// `[effects.back]`, `[effects.attach]`, `[effects.kill]`,
-/// `[effects.filter]` and `[effects.create]`.
+/// `[effects.filter]` and `[effects.create]` for nvmux's own screens, and
+/// `[effects.smear]`, `[effects.particles]`, `[effects.scroll]`,
+/// `[effects.windows]` and `[effects.blink]` for nvmux's own client
+/// (`[client] ui = "nvmux"`, see [`crate::client`]).
 ///
 /// Not `Copy`: `[session] command` owns a `String`. Nothing reads it by value —
 /// [`get`] hands out a `&'static Settings` — so this costs nothing.
@@ -78,10 +81,23 @@ pub struct SessionSettings {
     pub command: String,
 }
 
-/// The local `nvim --remote-ui` client that draws a session (see [`crate::pty`]).
+/// The client that draws a session, on the pty nvmux relays (see
+/// [`crate::pty`]): nvmux's own, `nvmux --client`, unless `ui` says
+/// Neovim's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClientSettings {
+    /// Which client draws a session.
+    ///
+    /// `"nvmux"`, the default, is nvmux's own client ([`crate::client`]),
+    /// which draws the editor itself and so can animate it — the scroll,
+    /// windows moving, and if they are turned on the cursor travelling, its
+    /// particles and its blink — under `[effects.smear]`,
+    /// `[effects.particles]`, `[effects.scroll]`, `[effects.windows]` and
+    /// `[effects.blink]`. `"nvim"` is Neovim's own TUI: everything the
+    /// terminal can do reaches the editor exactly as Neovim negotiated it,
+    /// because Neovim did the negotiating.
+    pub ui: Ui,
     /// Keep one client per session rather than one in all.
     ///
     /// Off, the client in front is the only one there is: a switch retires it
@@ -148,18 +164,31 @@ pub struct ClientSettings {
 impl Default for ClientSettings {
     fn default() -> Self {
         Self {
+            ui: Ui::Nvmux,
             per_session: true,
             lazy: true,
         }
     }
 }
 
+/// `[client] ui`: whose client draws a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Ui {
+    /// `nvim --remote-ui`: Neovim's own TUI.
+    Nvim,
+    /// `nvmux --client`: nvmux's own, animated (see [`crate::client`]).
+    #[default]
+    Nvmux,
+}
+
 /// The animated effects: a master switch over them all, and a table of its own
 /// for each — `[effects.fade]`, `[effects.move]`, `[effects.cursor]`,
 /// `[effects.back]`, `[effects.attach]`, `[effects.kill]`,
-/// `[effects.filter]` and `[effects.create]` — with its own `enabled`. An effect
-/// runs only when both are on, which is what the `*_enabled` methods answer, so
-/// nothing reads one switch without the other.
+/// `[effects.filter]` and `[effects.create]`, and for nvmux's own client
+/// `[effects.smear]`, `[effects.particles]`, `[effects.scroll]`,
+/// `[effects.windows]` and `[effects.blink]` — with its own `enabled`. An effect runs only when both are on, which is what the
+/// `*_enabled` methods answer, so nothing reads one switch without the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EffectsSettings {
@@ -175,6 +204,11 @@ pub struct EffectsSettings {
     pub kill: KillSettings,
     pub filter: FilterSettings,
     pub create: CreateSettings,
+    pub smear: SmearSettings,
+    pub particles: ParticleSettings,
+    pub scroll: ScrollSettings,
+    pub windows: WindowsSettings,
+    pub blink: BlinkSettings,
 }
 
 impl EffectsSettings {
@@ -233,6 +267,134 @@ impl EffectsSettings {
     pub fn create_enabled(&self) -> bool {
         self.enabled && self.create.enabled
     }
+
+    /// Whether nvmux's own client animates its cursor between cells: its own
+    /// switch and the master one.
+    pub fn smear_enabled(&self) -> bool {
+        self.enabled && self.smear.enabled
+    }
+
+    /// Whether particles fly off the cursor as it moves: its own switch and
+    /// the master one.
+    pub fn particles_enabled(&self) -> bool {
+        self.enabled && self.particles.enabled
+    }
+
+    /// Whether a scroll slides the text through the window: its own switch
+    /// and the master one.
+    pub fn scroll_enabled(&self) -> bool {
+        self.enabled && self.scroll.enabled
+    }
+
+    /// Whether windows and floats move rather than jump: its own switch and
+    /// the master one.
+    pub fn windows_enabled(&self) -> bool {
+        self.enabled && self.windows.enabled
+    }
+
+    /// Whether a blinking cursor fades in and out: its own switch and the
+    /// master one.
+    pub fn blink_enabled(&self) -> bool {
+        self.enabled && self.blink.enabled
+    }
+}
+
+// The client's effects are switches, and the particles' one choice of what
+// they are: how each looks and how long it takes is the client's own (see
+// `crate::client::anim`).
+
+/// nvmux's own client: the cursor travelling between cells rather than
+/// jumping, its leading edge ahead and its trailing edge behind, so that a
+/// long move smears across the screen — Neovide's animated cursor (see
+/// [`crate::client::anim::smear`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SmearSettings {
+    /// This effect's own switch, under `[effects] enabled`. Off unless turned
+    /// on; off, the cursor jumps, as the terminal's does.
+    pub enabled: bool,
+}
+
+/// nvmux's own client: what flies off the cursor as it moves — Neovide's
+/// `cursor_vfx_mode` (see [`crate::client::anim::vfx`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ParticleSettings {
+    /// This effect's own switch, under `[effects] enabled`. Off by default,
+    /// as Neovide's is.
+    pub enabled: bool,
+    pub mode: ParticleMode,
+}
+
+/// `[effects.particles] mode`, spelt as Neovide spells `cursor_vfx_mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ParticleMode {
+    /// Particles coil off the cursor's path in a spiral.
+    #[default]
+    Railgun,
+    /// Particles spray out behind the cursor.
+    Torpedo,
+    /// Particles drift down from the cursor's path.
+    Pixiedust,
+    /// A disc grows round where the cursor lands and fades.
+    Sonicboom,
+    /// A ring grows round where the cursor lands.
+    Ripple,
+    /// A square outline grows round where the cursor lands.
+    Wireframe,
+}
+
+impl ParticleMode {
+    /// The mode as the file spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            ParticleMode::Railgun => "railgun",
+            ParticleMode::Torpedo => "torpedo",
+            ParticleMode::Pixiedust => "pixiedust",
+            ParticleMode::Sonicboom => "sonicboom",
+            ParticleMode::Ripple => "ripple",
+            ParticleMode::Wireframe => "wireframe",
+        }
+    }
+}
+
+/// nvmux's own client: a scroll sliding the text through the window a row at
+/// a time — Neovide's smooth scrolling (see
+/// [`crate::client::anim::scroll`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScrollSettings {
+    /// This effect's own switch, under `[effects] enabled`. Off, the text
+    /// jumps to where it scrolled to.
+    pub enabled: bool,
+}
+
+/// nvmux's own client: windows moving rather than jumping. A split window
+/// opening, closing or changing size moves the way animate.nvim's window
+/// module moves it, and one showing another buffer fades from one to the
+/// other (see [`crate::client::anim::layout`] and
+/// [`crate::client::anim::switch`]); a float, the message area or windows
+/// rearranged slide to their new place as Neovide's do — its
+/// `position_animation_length` (see [`crate::client::anim::motion`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WindowsSettings {
+    /// This effect's own switch, under `[effects] enabled`.
+    pub enabled: bool,
+}
+
+/// nvmux's own client: a blinking cursor fading out and back in rather than
+/// flashing — Neovide's `cursor_smooth_blink` (see
+/// [`crate::client::anim::blink`]). Only a block cursor fades; a bar or an
+/// underline keeps the terminal's own blink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BlinkSettings {
+    /// This effect's own switch, under `[effects] enabled`. Off by default,
+    /// as Neovide's is; and it does nothing for a cursor `'guicursor'` does
+    /// not make blink.
+    pub enabled: bool,
 }
 
 /// The fade between screens (see [`crate::fade`]): each one dissolves into the
@@ -406,7 +568,36 @@ impl Default for EffectsSettings {
             kill: KillSettings::default(),
             filter: FilterSettings::default(),
             create: CreateSettings::default(),
+            smear: SmearSettings::default(),
+            particles: ParticleSettings::default(),
+            scroll: ScrollSettings::default(),
+            windows: WindowsSettings::default(),
+            blink: BlinkSettings::default(),
         }
+    }
+}
+
+// On or off as Neovide has them, where it has the same effect — but for the
+// cursor's travel, off unless turned on (`SmearSettings` derives its off).
+
+impl Default for ParticleSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: ParticleMode::Railgun,
+        }
+    }
+}
+
+impl Default for ScrollSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl Default for WindowsSettings {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -737,6 +928,11 @@ fn render_default_config(prefix: u8) -> String {
          # every session as nvmux starts, so a first visit waits for nothing,\n\
          # at the cost above for every session rather than every one visited.\n\
          # lazy = {lazy}\n\
+         # Which client draws a session: \"nvmux\" is nvmux's own, which animates\n\
+         # the editor — the [effects.smear] tables and those after it below;\n\
+         # \"nvim\" is Neovim's own, and everything the terminal can do reaches\n\
+         # the editor as Neovim negotiated it.\n\
+         # ui = {ui:?}\n\
          \n\
          [effects]\n\
          # The master switch: false turns every effect below off, whatever its\n\
@@ -784,7 +980,33 @@ fn render_default_config(prefix: u8) -> String {
          [effects.create]\n\
          # c on the picker opens a gap where the new session will go, showing\n\
          # the name the prompt will offer, before the prompt comes up.\n\
-         # enabled = {create_enabled}\n",
+         # enabled = {create_enabled}\n\
+         \n\
+         [effects.smear]\n\
+         # nvmux's own client ([client] ui = \"nvmux\"): the cursor travels\n\
+         # between cells rather than jumping, a long move smearing behind it.\n\
+         # enabled = {smear_enabled}\n\
+         \n\
+         [effects.particles]\n\
+         # nvmux's own client: particles fly off the cursor as it moves. mode is\n\
+         # railgun, torpedo, pixiedust, sonicboom, ripple or wireframe.\n\
+         # enabled = {particles_enabled}\n\
+         # mode    = {particles_mode:?}\n\
+         \n\
+         [effects.scroll]\n\
+         # nvmux's own client: a scroll slides the text through the window.\n\
+         # enabled = {scroll_enabled}\n\
+         \n\
+         [effects.windows]\n\
+         # nvmux's own client: a split window opening, closing or changing size\n\
+         # moves there, and one showing another buffer fades from one to the\n\
+         # other, the way animate.nvim draws them; a float, the message area or\n\
+         # windows rearranged slide there, as in Neovide.\n\
+         # enabled = {windows_enabled}\n\
+         \n\
+         [effects.blink]\n\
+         # nvmux's own client: a blinking block cursor fades out and back in.\n\
+         # enabled = {blink_enabled}\n",
         prefix = crate::keys::prefix_label(prefix),
         timeout = k.timeout_ms,
         command = s.command,
@@ -801,6 +1023,16 @@ fn render_default_config(prefix: u8) -> String {
         kill_enabled = e.kill.enabled,
         filter_enabled = e.filter.enabled,
         create_enabled = e.create.enabled,
+        ui = match c.ui {
+            Ui::Nvim => "nvim",
+            Ui::Nvmux => "nvmux",
+        },
+        smear_enabled = e.smear.enabled,
+        particles_enabled = e.particles.enabled,
+        particles_mode = e.particles.mode.name(),
+        scroll_enabled = e.scroll.enabled,
+        windows_enabled = e.windows.enabled,
+        blink_enabled = e.blink.enabled,
     )
 }
 
@@ -862,6 +1094,40 @@ mod tests {
         assert_eq!(s, Settings::default());
     }
 
+    /// The README's "Every setting, at its default" is a copy of these
+    /// defaults that nothing else keeps in step: it must parse, and to them,
+    /// with every table in it that the code has.
+    #[test]
+    fn the_readmes_settings_are_the_defaults() {
+        let readme = include_str!("../README.md");
+        let start = readme
+            .find("<summary>Every setting, at its default</summary>")
+            .expect("the README's settings block");
+        let block = &readme[start..];
+        let open = block.find("```toml\n").expect("its TOML") + "```toml\n".len();
+        let close = open + block[open..].find("```").expect("its end");
+        let doc = &block[open..close];
+        let s: Settings = toml::from_str(doc).expect("the README's settings parse");
+        assert_eq!(
+            s,
+            Settings::default(),
+            "the README's settings are not the defaults"
+        );
+        for table in [
+            "[keys]",
+            "[session]",
+            "[client]",
+            "[effects]",
+            "[effects.smear]",
+            "[effects.particles]",
+            "[effects.scroll]",
+            "[effects.windows]",
+            "[effects.blink]",
+        ] {
+            assert!(doc.contains(table), "the README has no {table}");
+        }
+    }
+
     #[test]
     fn a_full_document_at_the_defaults_round_trips() {
         let doc = "\
@@ -871,6 +1137,7 @@ mod tests {
             [session]\n\
             command = \"nvim --headless --listen {sock}\"\n\
             [client]\n\
+            ui = \"nvmux\"\n\
             per_session = true\n\
             lazy = true\n\
             [effects]\n\
@@ -892,7 +1159,18 @@ mod tests {
             [effects.filter]\n\
             enabled = true\n\
             [effects.create]\n\
-            enabled = true\n";
+            enabled = true\n\
+            [effects.smear]\n\
+            enabled = false\n\
+            [effects.particles]\n\
+            enabled = false\n\
+            mode = \"railgun\"\n\
+            [effects.scroll]\n\
+            enabled = true\n\
+            [effects.windows]\n\
+            enabled = true\n\
+            [effects.blink]\n\
+            enabled = false\n";
         let s: Settings = toml::from_str(doc).expect("valid");
         assert_eq!(s, Settings::default());
     }
@@ -956,6 +1234,11 @@ mod tests {
         assert!(!s.effects.kill_enabled());
         assert!(!s.effects.filter_enabled());
         assert!(!s.effects.create_enabled());
+        assert!(!s.effects.smear_enabled());
+        assert!(!s.effects.scroll_enabled());
+        assert!(!s.effects.windows_enabled());
+        assert!(!s.effects.particles_enabled() && !s.effects.blink_enabled());
+        assert!(s.effects.scroll.enabled && s.effects.windows.enabled);
         assert!(s.effects.fade.enabled && s.effects.moving.enabled);
         assert!(s.effects.cursor.enabled && s.effects.back.enabled);
         assert!(s.effects.attach.enabled);
@@ -1037,6 +1320,35 @@ mod tests {
         assert!(!s.client.lazy && !s.client.per_session);
     }
 
+    /// nvmux's own client unless told otherwise; Neovim's is a line away.
+    #[test]
+    fn a_session_is_drawn_by_nvmuxs_client_unless_told() {
+        assert_eq!(Settings::default().client.ui, Ui::Nvmux);
+        let s: Settings = toml::from_str("[client]\nui = \"nvim\"\n").expect("valid");
+        assert_eq!(s.client.ui, Ui::Nvim);
+        assert!(s.client.per_session && s.client.lazy, "the rest as it was");
+    }
+
+    /// On and off as Neovide's are: the scroll and the windows on, the
+    /// particles and the smooth blink off — but for the cursor's travel, off
+    /// unless turned on.
+    #[test]
+    fn the_clients_effects_start_as_neovides() {
+        let e = Settings::default().effects;
+        assert!(e.scroll_enabled() && e.windows_enabled());
+        assert!(!e.smear_enabled() && !e.particles_enabled() && !e.blink_enabled());
+        assert_eq!(e.particles.mode, ParticleMode::Railgun);
+    }
+
+    /// A particle mode is spelt as Neovide spells it.
+    #[test]
+    fn a_particle_mode_is_spelt_as_neovides() {
+        let s: Settings =
+            toml::from_str("[effects.particles]\nmode = \"pixiedust\"\n").expect("valid");
+        assert_eq!(s.effects.particles.mode, ParticleMode::Pixiedust);
+        assert_eq!(ParticleMode::Pixiedust.name(), "pixiedust");
+    }
+
     /// The one default that lives elsewhere, like the prefix: the prompt shows
     /// it before a config has necessarily been read.
     #[test]
@@ -1112,6 +1424,29 @@ mod tests {
                 "an effect's table outside [effects]",
                 "[fade]\nenabled = false\n",
             ),
+            ("a client nobody makes", "[client]\nui = \"vim\"\n"),
+            (
+                "an unknown smear key",
+                "[effects.smear]\ntrail_size = 1.0\n",
+            ),
+            (
+                "a particle mode Neovide does not have",
+                "[effects.particles]\nmode = \"sparkles\"\n",
+            ),
+            (
+                "an unparseable particle value",
+                "[effects.particles]\nenabled = \"yes\"\n",
+            ),
+            // How the client's effects look is not the file's to say.
+            ("a smear's look", "[effects.smear]\ntrail = 0.4\n"),
+            ("a window's timing", "[effects.windows]\nopen_ms = 200\n"),
+            ("a particle's look", "[effects.particles]\nspeed = 6.0\n"),
+            ("an unknown scroll key", "[effects.scroll]\nlength = 1\n"),
+            (
+                "an unknown windows key",
+                "[effects.windows]\nenable = true\n",
+            ),
+            ("an unknown blink key", "[effects.blink]\nsmooth = true\n"),
         ] {
             assert!(
                 toml::from_str::<Settings>(doc).is_err(),
@@ -1219,6 +1554,11 @@ mod tests {
             "[effects.kill]",
             "[effects.filter]",
             "[effects.create]",
+            "[effects.smear]",
+            "[effects.particles]",
+            "[effects.scroll]",
+            "[effects.windows]",
+            "[effects.blink]",
         ] {
             assert!(
                 rendered.contains(&format!("\n{table}\n")),
@@ -1227,15 +1567,22 @@ mod tests {
         }
         assert_eq!(
             rendered.matches("\n# enabled = true\n").count(),
-            8,
-            "the master switch and each effect's but the fade's: {rendered:?}"
+            10,
+            "the master switch and each switch-only effect on by default: {rendered:?}"
+        );
+        assert_eq!(
+            rendered.matches("\n# enabled = false\n").count(),
+            3,
+            "the cursor's travel, the particles and the smooth blink: {rendered:?}"
         );
         for line in [
             "# per_session = true",
             "# lazy = true",
+            "# ui = \"nvmux\"",
             "# enabled     = true",
             "# duration_ms = 200",
             "# session     = true",
+            "# mode    = \"railgun\"",
         ] {
             assert!(
                 rendered.contains(line),

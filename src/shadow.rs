@@ -1,11 +1,11 @@
 //! A shadow of an attached session's screen, kept so the session can be
 //! dissolved on its way out.
 //!
-//! nvmux never renders Neovim. The `--remote-ui` client draws, and
+//! The relay never renders Neovim. The client on the pty draws, and
 //! [`crate::pty`] copies its bytes to the terminal without looking at them —
-//! which is why every terminal feature the editor negotiates keeps working,
-//! and why nvmux has no idea what is on the screen. A fade needs to know: to
-//! move a cell toward the background it has to know what colour the cell is.
+//! which is why every terminal feature the editor negotiates keeps working, and
+//! why nvmux has no idea what is on the screen. A fade needs to know: to move a
+//! cell toward the background it has to know what colour the cell is.
 //!
 //! So a [`Shadow`] is a terminal emulator with no terminal: the `vt100` crate's
 //! parser, fed a copy of every byte the *session* sends the real terminal,

@@ -1,7 +1,10 @@
 //! The PTY proxy.
 //!
-//! nvmux runs `nvim --server <local_sock> --remote-ui` as a child on a PTY and
-//! sits in the byte stream between the user's terminal and that child:
+//! nvmux runs a Neovim client as a child on a PTY and sits in the byte stream
+//! between the user's terminal and that child. The client is nvmux's own,
+//! `nvmux --client <local_sock>` (see [`crate::client`]), unless `[client] ui
+//! = "nvim"` makes it Neovim's, `nvim --server <local_sock> --remote-ui`; the
+//! relay treats the two the same way in every respect below:
 //!
 //! ```text
 //! stdin  -> [ prefix state machine ] -> pty master
@@ -13,9 +16,12 @@
 //! keyboard protocol, truecolor, undercurl, terminal titles, OSC 52 clipboard
 //! and DA1/XTGETTCAP round-trips all function because the child negotiates
 //! directly with the real terminal. Any "improvement" that changes this
-//! direction on the strength of what it sees breaks a subset of them. There
-//! is likewise no `nvim_ui_attach`, no `grid_line` handling and no grid
-//! diffing anywhere in this crate — `nvim --remote-ui` already is that client.
+//! direction on the strength of what it sees breaks a subset of them. The
+//! relay likewise attaches no UI and reads no grid: the client on the pty is
+//! the UI. Where that is nvmux's own client, the grid handling is that
+//! client's, in a process of its own, and it negotiates with the terminal as
+//! Neovim's would — its bytes pass through here exactly as `nvim
+//! --remote-ui`'s do.
 //!
 //! Two readers of this direction. The shadow grid ([`crate::shadow`]) is
 //! shown a *copy* and can neither alter a write nor make one depend on what it
@@ -186,7 +192,7 @@ pub enum Target {
     Step(crate::keys::Direction),
 }
 
-/// A running `--remote-ui` client, and the PTY it is talking through.
+/// A running client, and the PTY it is talking through.
 pub struct Attachment {
     /// Which session this client is attached to.
     pub session_id: String,
@@ -1255,7 +1261,7 @@ impl Attachment {
             }
         }
         if let Some(pid) = self.child.process_id() {
-            tracing::warn!(pid, "the remote-ui client ignored SIGHUP; killing it");
+            tracing::warn!(pid, "the client ignored SIGHUP; killing it");
             unsafe {
                 libc::kill(pid as libc::pid_t, libc::SIGKILL);
             }
@@ -1949,7 +1955,7 @@ impl Attachment {
     }
 }
 
-/// Start a `--remote-ui` client for a session and wait for the probe to pass.
+/// Start a client for a session and wait for the probe to pass.
 ///
 /// `sock` must already be reachable from *this* machine — locally the session
 /// socket, over SSH the local end of a forward.
@@ -1974,8 +1980,8 @@ pub fn spawn(session_id: &str, sock: &Path, announce: &str) -> Result<Attachment
     spawn_with(session_id, sock, announce, client_command(sock))
 }
 
-/// Start a `--remote-ui` client for a session, and nothing else: the half of
-/// [`spawn`] that forks. The probe is the caller's, through [`Probe::start`].
+/// Start a client for a session, and nothing else: the half of [`spawn`] that
+/// forks. The probe is the caller's, through [`Probe::start`].
 ///
 /// The client is started *first* and the server probed while it connects.
 /// The two have nothing to say to each other — the probe asks the server what
@@ -2000,23 +2006,42 @@ pub fn spawn_client(session_id: &str, sock: &Path, announce: &str) -> Result<Att
     spawn_client_with(session_id, sock, announce, client_command(sock))
 }
 
-/// `nvim --server <sock> --remote-ui`, in our working directory.
+/// The client that draws a session, in our working directory: nvmux's own —
+/// this same binary, `--client <sock>` (see [`crate::client`]) — or with
+/// `[client] ui = "nvim"` Neovim's, `nvim --server <sock> --remote-ui`.
 fn client_command(sock: &Path) -> CommandBuilder {
     // `CommandBuilder::new` seeds the child's environment from ours, so `TERM`,
     // `COLORTERM` and everything else the client negotiates with reach it
     // without being copied by hand.
-    let mut cmd = CommandBuilder::new("nvim");
-    cmd.arg("--server");
-    cmd.arg(sock);
-    cmd.arg("--remote-ui");
+    let mut cmd = match crate::config::get().client.ui {
+        crate::config::Ui::Nvim => {
+            let mut cmd = CommandBuilder::new("nvim");
+            cmd.arg("--server");
+            cmd.arg(sock);
+            cmd.arg("--remote-ui");
+            cmd
+        }
+        crate::config::Ui::Nvmux => {
+            // The binary running now, wherever it was started from — not a
+            // `nvmux` looked up on `$PATH`, which may be another version.
+            let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nvmux"));
+            let mut cmd = CommandBuilder::new(exe);
+            cmd.arg("--client");
+            cmd.arg(sock);
+            if let Some(palette) = crate::palette::get() {
+                cmd.env(crate::client::PALETTE_ENV, palette.to_env());
+            }
+            cmd
+        }
+    };
     if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
     }
     // The other half of the pair the user calls their editor, so it gets the
     // umask nvmux was started with for the same reason the session does — see
-    // `paths::restrict_umask`. A `--remote-ui` client holds no buffers and so
-    // writes next to nothing, which is a reason for the exception to go
-    // unnoticed rather than a reason to make one.
+    // `paths::restrict_umask`. A client holds no buffers and so writes next to
+    // nothing, which is a reason for the exception to go unnoticed rather than
+    // a reason to make one.
     if let Some(mask) = crate::paths::launch_umask() {
         cmd.umask(Some(mask.bits()));
     }
@@ -3154,10 +3179,10 @@ enum ChildState {
 /// # The stop case, and why it is continued rather than escalated
 ///
 /// `Ctrl-z` is forwarded to Neovim as an ordinary byte — nvmux does not
-/// special-case it. If the `--remote-ui` client responds by stopping *itself*,
-/// the user is left looking at a frozen screen: nvmux still owns the terminal,
-/// so there is no shell underneath to have been returned to, and the suspended
-/// client is not a state anyone can do anything with.
+/// special-case it. If the client responds by stopping *itself*, the user is
+/// left looking at a frozen screen: nvmux still owns the terminal, so there is
+/// no shell underneath to have been returned to, and the suspended client is
+/// not a state anyone can do anything with.
 ///
 /// So a stopped child is continued with `SIGCONT` rather than torn down. It
 /// cannot loop: the stop notification is consumed when read, so a client that
@@ -3186,7 +3211,7 @@ fn check_child(attachment: &mut Attachment) -> ChildState {
                 Ok(WaitStatus::Stopped(_, sig)) => Some(sig),
                 _ => None,
             };
-            tracing::info!(?sig, "the remote-ui client stopped; continuing it");
+            tracing::info!(?sig, "the client stopped; continuing it");
             let _ = kill(pid, Signal::SIGCONT);
             ChildState::Running
         }
@@ -3403,14 +3428,14 @@ fn without_device_attributes_request(chunk: &[u8]) -> std::borrow::Cow<'_, [u8]>
 
 /// Paint the screen again after one of nvmux's own screens cleared it.
 ///
-/// A `--remote-ui` client paints only what the server sends, so this is a
-/// request to the server, and there are two ways to make one. Over RPC,
-/// `:mode` clears the grid and redraws it in full ([`repaint_through_server`]);
-/// that is the one that works, and the only one that works on a terminal
-/// with in-band resize reports (DEC mode 2048 — kitty, ghostty, foot), where
-/// the client ignores `SIGWINCH`. Failing that, a [`nudge`] of the pty size,
-/// which needs no answer from the server and so is what a server too busy to
-/// give one gets: its resize is queued and repaints once the loop is free.
+/// A client paints only what the server sends, so this is a request to the
+/// server, and there are two ways to make one. Over RPC, `:mode` clears the
+/// grid and redraws it in full ([`repaint_through_server`]); that is the one
+/// that works, and the only one that works on a terminal with in-band resize
+/// reports (DEC mode 2048 — kitty, ghostty, foot), where the client ignores
+/// `SIGWINCH`. Failing that, a [`nudge`] of the pty size, which needs no answer
+/// from the server and so is what a server too busy to give one gets: its
+/// resize is queued and repaints once the loop is free.
 ///
 /// Whichever way, the pty is first told the terminal's current size, since
 /// the terminal may have changed shape while the picker was up and the pty is

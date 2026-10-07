@@ -1,13 +1,15 @@
 //! nvmux — a tmux-style session manager for Neovim.
 //!
-//! A thin multiplexer: it does not render Neovim's UI. `nvim --server <addr>
-//! --remote-ui` does that, as a child on a PTY whose bytes pass through
-//! untouched. What is left is a picker ([`ui`]) and a PTY proxy ([`pty`]) that
-//! watches stdin for a `<prefix>` prefix ([`keys`]), however the terminal spells
-//! it ([`keyseq`]) — plus a row along the bottom naming what the next key does
-//! while that prefix waits ([`hint`]), on a change of session a brief notice
-//! saying which one you landed in ([`announce`]), and a way back into the
-//! session you were in when the link to its host drops ([`reconnect`]).
+//! A thin multiplexer: the multiplexer does not render Neovim's UI. A client
+//! does, as a child on a PTY whose bytes pass through untouched — nvmux's own,
+//! `nvmux --client`, which animates the editor ([`client`]), or with `[client]
+//! ui = "nvim"` Neovim's, `nvim --server <addr> --remote-ui`. What is left is a
+//! picker ([`ui`]) and a PTY proxy ([`pty`]) that watches stdin for a
+//! `<prefix>` prefix ([`keys`]), however the terminal spells it ([`keyseq`]) —
+//! plus a row along the bottom naming what the next key does while that prefix
+//! waits ([`hint`]), on a change of session a brief notice saying which one you
+//! landed in ([`announce`]), and a way back into the session you were in when
+//! the link to its host drops ([`reconnect`]).
 //!
 //! macOS and Linux only.
 
@@ -18,6 +20,7 @@
 pub mod announce;
 pub mod boundary;
 pub mod cli;
+pub mod client;
 pub mod config;
 pub mod dirs;
 pub mod error;

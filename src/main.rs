@@ -17,6 +17,18 @@ fn main() -> Result<()> {
     let dir = paths::ensure_runtime_dir().context("preparing the nvmux runtime directory")?;
     logging::init(&dir)?;
 
+    // nvmux's own client, which an nvmux started on a pty to draw a session
+    // (see `nvmux::client`). Nothing below is its business: it has a session to
+    // draw and a relay to draw it for. Its failures are logged rather than
+    // printed, since what it prints is drawn.
+    if let Some(sock) = &cli.client {
+        if let Err(e) = nvmux::client::run(sock) {
+            tracing::warn!(error = %format!("{e:#}"), "client: ended on an error");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     // Before anything is spawned — and before a first-run config file is written
     // in `run` — clamp the umask, and record the one it replaced so that what
     // nvmux spawns can be handed it back: see `paths::restrict_umask`.
@@ -42,18 +54,26 @@ fn run(cli: &Cli) -> Result<()> {
     nested::check()?;
 
     let location = cli.location();
+    let remote = matches!(location, transport::Location::Ssh(_));
 
-    // Checked up front rather than surfacing later as an unexplained connection
-    // failure. This is the nvim used as the --remote-ui client; the remote one
-    // is checked by the SSH transport when it connects.
-    let local_nvim = nvim::check_local()?;
-    tracing::debug!(version = %local_nvim, "local nvim");
+    // The local nvim, checked up front rather than surfacing later as an
+    // unexplained connection failure. It runs every local session, and draws
+    // any session when Neovim's own client does — so the one run that does
+    // without it is `nvmux <host>` drawn by nvmux's own client, which only the
+    // config can tell, below. The remote nvim is checked by the SSH transport
+    // when it connects.
+    if !remote {
+        check_local_nvim()?;
+    }
 
     // Config is a local concern — the prefix machine and the picker both run
     // here — so it is established before any transport, `nvmux <host>`
     // included. On a genuine first run at an interactive terminal this asks for a
     // prefix and records it; otherwise it loads whatever exists (or the defaults).
     config::init(establish_settings()?);
+    if remote && config::get().client.ui == config::Ui::Nvim {
+        check_local_nvim()?;
+    }
 
     // The fade dissolves every screen into the terminal's own background, so
     // it has to know what colour that is — and only the terminal can say. After
@@ -62,12 +82,25 @@ fn run(cli: &Cli) -> Result<()> {
     // that would fade; and after the first-run screen, which does not.
     // The picker's afterglow and filter fade paint in colour too, so they ask
     // even with the fade off.
-    if fade::configured() || nvmux::ui::effects::want_palette() {
+    // And nvmux's own client mixes colours for every animation it draws, so
+    // it asks too — on the client's behalf, since a client on a pty cannot
+    // ask without the answers racing the keys (see `nvmux::client`).
+    if fade::configured()
+        || nvmux::ui::effects::want_palette()
+        || config::get().client.ui == config::Ui::Nvmux
+    {
         palette::init(palette::query());
     }
 
     let transport = transport::open(location.clone())?;
     session_loop(transport.as_ref())
+}
+
+/// The local `nvim`: on `$PATH`, and new enough.
+fn check_local_nvim() -> Result<()> {
+    let version = nvim::check_local()?;
+    tracing::debug!(%version, "local nvim");
+    Ok(())
 }
 
 /// Decide this run's settings, prompting once on a true first run.
@@ -198,7 +231,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             let opened = match attached.take() {
                 Some(a) if a.session_id == current.id => Ok(Some(a)),
                 // Retiring the old client leaves its server running: killing a
-                // --remote-ui client does not kill a --headless --listen server.
+                // client does not kill a --headless --listen server.
                 //
                 // Hung up first and reaped after, with the new client's spawn —
                 // or, where it was begun early, the wait for its probe — in

@@ -120,6 +120,10 @@ fn relay_child() {
     // and the hint row are about a relay that never parks.
     let mut settings = nvmux::config::with_prefix(nvmux::keys::PREFIX);
     settings.keys.timeout_ms = 10_000;
+    // Neovim's own client, which these tests are about: it is the one that
+    // negotiates the keyboard with the terminal through the relay, and the
+    // default's own client is `nvmux --client`, which this binary is not.
+    settings.client.ui = nvmux::config::Ui::Nvim;
     let keep = std::env::var_os(CHILD_KEEP).is_some();
     settings.client.per_session = keep;
     nvmux::config::init(settings);

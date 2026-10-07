@@ -144,13 +144,13 @@ const MOUSE_BUTTONS: &[u8] = b"\x1b[?1003l\x1b[?1002h\x1b[?1006h";
 ///
 /// Every screen does, whatever is behind it, and turns it off again as it
 /// closes ([`disable_mouse`]). A resumed client's own setting is put back by
-/// the relay as it resumes the client, with [`set_mouse_reporting`]: a
-/// `--remote-ui` client enables the mouse once, at startup, and never again
-/// (as it enters the alternate screen once, see [`enter_alt_screen_and_clear`]),
-/// so nothing but nvmux can put the terminal back the way the client left it.
-/// What the client had comes from its ledger for a kept client
-/// (`[client] per_session`, the default), and for a held one is a question
-/// for its server, which that resume already asks to repaint.
+/// the relay as it resumes the client, with [`set_mouse_reporting`]: a client
+/// enables the mouse once, at startup, and never again (as it enters the
+/// alternate screen once, see [`enter_alt_screen_and_clear`]), so nothing but
+/// nvmux can put the terminal back the way the client left it. What the client
+/// had comes from its ledger for a kept client (`[client] per_session`, the
+/// default), and for a held one is a question for its server, which that resume
+/// already asks to repaint.
 pub fn enable_mouse() {
     let _ = write_stdout(MOUSE_ON);
 }
@@ -414,14 +414,14 @@ pub(crate) const RESUME: &[u8] = b"\x1b[?2026l\x1b[0m\x1b[?1049h\x1b[2J\x1b[H";
 /// Put the terminal back in the alternate screen, cleared, for a client that
 /// is about to be resumed rather than spawned.
 ///
-/// A `--remote-ui` client enters the alternate screen once, at startup, and
-/// leaves it once, at exit. Nothing nvmux can ask of the server makes it do
-/// either again: `:mode` and a resize repaint the grid wherever the terminal
-/// is. But the picker, the prompt and the help screen all end by leaving the
-/// alternate screen (see `ui::Screen`), and a switch that names the session
-/// already attached goes through [`leave_alt_screen_and_clear`] — so a client
-/// resumed after any of them has been moved to the primary screen without
-/// being told, and repaints there.
+/// A client enters the alternate screen once, at startup, and leaves it once,
+/// at exit. Nothing nvmux can ask of the server makes it do either again:
+/// `:mode` and a resize repaint the grid wherever the terminal is. But the
+/// picker, the prompt and the help screen all end by leaving the alternate
+/// screen (see `ui::Screen`), and a switch that names the session already
+/// attached goes through [`leave_alt_screen_and_clear`] — so a client resumed
+/// after any of them has been moved to the primary screen without being told,
+/// and repaints there.
 ///
 /// Nothing looks wrong until that client leaves. Its `rmcup` then has no
 /// alternate screen to leave, and neither does the `?1049l` nvmux writes on a
