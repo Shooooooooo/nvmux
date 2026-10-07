@@ -160,8 +160,9 @@ pub struct ClientSettings {
     /// it first leaves the front, like every other.
     pub lazy: bool,
     /// Scroll ahead of a slow link: a key that scrolls — `<C-e>`, `<C-d>`,
-    /// `<C-f>`, `zz` and their kind — or a turn of the mouse wheel scrolls the
-    /// window at once, before Neovim has heard of it, once the round trip to
+    /// `<C-f>`, `zz`, `zl` and their kind, in Normal mode or Insert — or a
+    /// turn of the mouse wheel, either way, scrolls the window at once,
+    /// before Neovim has heard of it, once the round trip to
     /// the session is long enough to be worth it — about 30 ms, which a
     /// session on this machine never is. nvmux's own client only (see
     /// [`crate::client::predict`]).

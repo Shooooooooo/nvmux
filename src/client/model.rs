@@ -102,6 +102,8 @@ pub struct Viewport {
     pub topline: i64,
     pub botline: i64,
     pub curline: i64,
+    /// The cursor's column, in bytes.
+    pub curcol: i64,
     pub line_count: i64,
 }
 
@@ -464,6 +466,7 @@ impl Model {
                 topline,
                 botline,
                 curline,
+                curcol,
                 line_count,
                 scroll_delta,
                 ..
@@ -477,6 +480,7 @@ impl Model {
                         topline,
                         botline,
                         curline,
+                        curcol,
                         line_count,
                     },
                 );
@@ -690,6 +694,7 @@ mod tests {
             topline,
             botline,
             curline: 0,
+            curcol: 0,
             line_count: 30,
         };
         assert!(v(0, 23).one_to_one(22));

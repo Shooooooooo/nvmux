@@ -17,18 +17,26 @@
 //! - `<C-f>`, `<C-b>`, `<PageDown>`, `<PageUp>`, `<S-Down>`, `<S-Up>` and the
 //!   wheel with Shift or Ctrl by pages, two lines kept, the cursor to the top
 //!   of the new view or the bottom;
-//! - and `zt`, `zz`, `zb`, `z<CR>`, `z.` and `z-`, the cursor's line to the
-//!   top, the middle or the bottom;
+//! - `zt`, `zz`, `zb`, `z<CR>`, `z.` and `z-`, the cursor's line — or with
+//!   a count, that line — to the top, the middle or the bottom;
+//! - in Insert mode, `<PageDown>`, `<PageUp>`, `<S-Down>`, `<S-Up>`,
+//!   `<C-x><C-e>`, `<C-x><C-y>` and the wheel, the cursor free to sit past
+//!   the end of its line;
+//! - and in a window that does not wrap, sideways: `zl`, `zh`, `zL`, `zH`,
+//!   `zs`, `ze` and the wheel left and right ([`across`]), the cursor kept
+//!   `'sidescrolloff'` from the edges, and the wheel past the end of the
+//!   cursor's line sending it to the longest line in view;
 //!
 //! — with `'scrolloff'` keeping the cursor in from the edges, and a count
-//! where Neovim takes one.
+//! where Neovim takes one, as far as two windows each way.
 //!
 //! Most of the rows a scroll shows are rows the window already shows, moved.
 //! What the client does not have is the lines it uncovers. So the agent the
 //! client leaves in the editor (see `super::AGENT_LUA`) sends it the text of
-//! the lines around each window's view — a page each way, and as the view
-//! moves, only the lines it has not sent — with what it takes to draw them as
-//! the window would ([`Shape`]). A row drawn from that is the line's text and
+//! the lines around each window's view — two windows' worth each way, and as
+//! the view moves, only the lines it has not sent; of a long line, no more
+//! than the window could show ([`known`]) — with what it takes to draw them
+//! as the window would ([`Shape`]). A row drawn from that is the line's text and
 //! its number, in the colours the window's own rows are drawn in, and nothing
 //! more: no syntax colours, no signs, no virtual text. It is on the screen for
 //! the round trip it takes Neovim's own row to arrive.
@@ -44,10 +52,11 @@
 //! without their colours for as long as the link takes, which on a fast one
 //! is a flicker, and nothing gained.
 //!
-//! A key is a scroll only in normal or visual mode with nothing pending, and
-//! the client cannot see Neovim's pending state, only its own keys: so it
-//! follows them ([`Typed`]), and predicts nothing from where it loses track,
-//! nor while a key before has yet to be drawn.
+//! A key is a scroll only in the mode it scrolls in with nothing pending —
+//! Normal or Visual, or Insert for its own — and the client cannot see
+//! Neovim's pending state, only its own keys: so it follows them ([`Typed`]),
+//! and predicts nothing from where it loses track, nor while a key before
+//! has yet to be drawn.
 //!
 //! Neovim always has the last word. What it scrolls is taken off what the
 //! client is ahead by; a prediction it has not confirmed in two round trips
@@ -117,16 +126,25 @@ pub struct Shape {
     /// `'startofline'`: a page or half of one takes the cursor to its line's
     /// first non-blank.
     pub startofline: bool,
-    /// Which of the keys the client follows ([`KEYS`]) something maps, in
-    /// the window's buffer or everywhere — or starts a mapping with: Neovim
-    /// does with them what the mapping says.
+    /// Which of the keys the client follows ([`keys`]) something maps in
+    /// normal or visual mode, in the window's buffer or everywhere — or
+    /// starts a mapping with: Neovim does with them what the mapping says.
     pub mapped: Vec<String>,
+    /// The same of the keys it follows in insert mode ([`insert_keys`]).
+    pub imapped: Vec<String>,
+    /// `'sidescrolloff'`, `'sidescroll'`, and `'mousescroll'`'s `hor`: how
+    /// near the sides Neovim lets the cursor be, how far the view moves to
+    /// keep it, and how many columns a turn of the wheel sideways scrolls.
+    pub sidescrolloff: usize,
+    pub sidescroll: usize,
+    pub hor: i64,
 }
 
 impl Shape {
     /// As the agent sends it: `[buf, line_count, textoff, tabstop, number,
     /// relativenumber, plain_gutter, wrap, leftcol, predictable, scrolloff,
-    /// step, eob, list, tab, scroll, page, startofline, mapped]`.
+    /// step, eob, list, tab, scroll, page, startofline, mapped, imapped,
+    /// sidescrolloff, sidescroll, hor]`.
     fn read(v: &[ValueRef<'_>]) -> Option<Self> {
         let int = |i: usize| v.get(i).and_then(redraw::int);
         let size = |i: usize| int(i).and_then(|n| usize::try_from(n).ok());
@@ -154,28 +172,39 @@ impl Shape {
             scroll: int(15).unwrap_or(0),
             page: int(16).unwrap_or(0),
             startofline: flag(17),
-            mapped: v
-                .get(18)
-                .and_then(ValueRef::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(redraw::as_str)
-                        .map(String::from)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            mapped: strings(v.get(18)),
+            imapped: strings(v.get(19)),
+            sidescrolloff: size(20).unwrap_or(0),
+            sidescroll: size(21).unwrap_or(1),
+            hor: int(22).unwrap_or(6),
         })
     }
 }
 
+/// An array of strings, as the agent sends one: none for anything else.
+fn strings(v: Option<&ValueRef<'_>>) -> Vec<String> {
+    v.and_then(ValueRef::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(redraw::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The lines the agent has sent of a window's buffer: a run of them from
-/// `first`, as they were at `tick`.
+/// `first`, as they were at `tick`, none longer than `cap` bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Lines {
     buf: i64,
     tick: i64,
     first: i64,
     text: Vec<String>,
+    /// The agent sends no more of a line than the window could show, and a
+    /// little over; a line this long, give or take a character cut in two,
+    /// may be longer in the buffer.
+    cap: usize,
 }
 
 impl Lines {
@@ -187,7 +216,15 @@ impl Lines {
     /// of what the client has and follows the same rule: a run of the same
     /// buffer as it was at the same change, touching what is here, joins it;
     /// anything else — or a run it says is to start afresh — replaces it.
-    fn take(&mut self, buf: i64, tick: i64, first: i64, text: Vec<String>, fresh: bool) {
+    fn take(
+        &mut self,
+        buf: i64,
+        tick: i64,
+        first: i64,
+        text: Vec<String>,
+        cap: usize,
+        fresh: bool,
+    ) {
         let end = first + text.len() as i64;
         let joins = !fresh
             && buf == self.buf
@@ -201,9 +238,11 @@ impl Lines {
                 tick,
                 first,
                 text,
+                cap,
             };
             return;
         }
+        self.cap = self.cap.min(cap);
         let start = self.first.min(first);
         let mut all = vec![String::new(); joined];
         for (i, line) in std::mem::take(&mut self.text).into_iter().enumerate() {
@@ -223,6 +262,12 @@ impl Lines {
         self.text
             .get((lnum - self.first) as usize)
             .map(String::as_str)
+    }
+
+    /// Whether line `lnum` may have been cut short. A character cut in two
+    /// comes as one replacement character, of three bytes.
+    fn cut(&self, buf: i64, lnum: i64) -> bool {
+        self.get(buf, lnum).is_some_and(|t| t.len() + 3 >= self.cap)
     }
 }
 
@@ -439,6 +484,9 @@ pub enum Command {
     /// `<C-e>`, `<C-y>`, a turn of the wheel: lines, down the buffer above
     /// nought. The cursor stays on its line, if `'scrolloff'` lets it.
     Lines(i64),
+    /// The wheel with Shift or Ctrl in insert mode: as many lines as the
+    /// window shows, down the buffer for 1 and up it for -1.
+    Screen(i64),
     /// `<C-d>`, `<C-u>`: `'scroll'` lines, or as many as a count says, which
     /// is `'scroll'` from then on. The cursor goes as far.
     Half { down: bool, count: Option<i64> },
@@ -447,9 +495,34 @@ pub enum Command {
     /// view, or the bottom.
     Page { down: bool, count: i64 },
     /// `zt`, `zz`, `zb`: the cursor's line to the top of the view, the
-    /// middle, the bottom; `first` — `z<CR>`, `z.`, `z-` — takes the cursor to
-    /// the line's first non-blank as well.
-    Line { to: Edge, first: bool },
+    /// middle, the bottom — or, with a count, that line's, the cursor taken
+    /// there first; `first` — `z<CR>`, `z.`, `z-` — takes the cursor to the
+    /// line's first non-blank as well.
+    Line {
+        to: Edge,
+        first: bool,
+        line: Option<i64>,
+    },
+    /// A scroll sideways, in a window that does not wrap: see [`across`].
+    Side(Side),
+}
+
+/// A scroll sideways, as Neovim makes it in a window that does not wrap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    /// `zl`, `zh`: columns, the view moving right over the text above
+    /// nought.
+    Cols(i64),
+    /// `zL`, `zH`: half the window's width, as many times as counted.
+    Halves(i64),
+    /// `zs`, `ze`: the cursor's character at the left of the view, or the
+    /// right, `'sidescrolloff'` from it.
+    Start,
+    End,
+    /// The wheel sideways: `'mousescroll'`'s `hor` columns, or with Shift or
+    /// Ctrl the window's width; one that leaves the cursor's line out of
+    /// sight takes the cursor to the longest line in view.
+    Wheel(i64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -488,7 +561,12 @@ pub fn outcome(command: Command, at: At, rows: i64, line_count: i64, shape: &Sha
         c.clamp(0, last)
     };
     let to = match command {
-        Command::Lines(n) => {
+        Command::Lines(_) | Command::Screen(_) => {
+            let n = match command {
+                Command::Screen(dir) => dir * h.min(line_count - at.top),
+                Command::Lines(n) => n,
+                _ => 0,
+            };
             let top = (at.top + n).clamp(0, last);
             At {
                 top,
@@ -542,13 +620,14 @@ pub fn outcome(command: Command, at: At, rows: i64, line_count: i64, shape: &Sha
                 },
             }
         }
-        Command::Line { to, .. } => {
+        Command::Side(_) => return None,
+        Command::Line { to, line, .. } => {
             // A 'scrolloff' as tall as half the window keeps the cursor in
             // the middle by rules of its own.
             if shape.scrolloff as i64 > (h - 1) / 2 {
                 return None;
             }
-            let c = at.cursor;
+            let c = line.map_or(at.cursor, |l| (l - 1).clamp(0, last));
             let top = match to {
                 Edge::Top => c - so,
                 Edge::Middle => c - (h - 1) / 2,
@@ -588,9 +667,9 @@ fn columns(text: &str, shape: &Shape) -> Vec<(usize, usize, char)> {
 
 /// Where in a line, in display columns, the cursor sits on a character: a
 /// tab's last column, which is where Neovim shows it in normal mode, or the
-/// character's first.
-fn sits(start: usize, width: usize, c: char, shape: &Shape) -> usize {
-    if c == '\t' && !shape.list {
+/// character's first — and always its first in insert mode.
+fn sits(start: usize, width: usize, c: char, shape: &Shape, insert: bool) -> usize {
+    if c == '\t' && !shape.list && !insert {
         start + width - 1
     } else {
         start
@@ -598,14 +677,33 @@ fn sits(start: usize, width: usize, c: char, shape: &Shape) -> usize {
 }
 
 /// Where on a line the cursor lands, in display columns, wanting to be at
-/// `want`: on the character there, or on the last of a line too short.
-pub fn landing(text: &str, shape: &Shape, want: usize) -> usize {
+/// `want`: on the character there, or on the last of a line too short — or,
+/// in insert mode, just past it.
+pub fn landing(text: &str, shape: &Shape, want: usize, insert: bool) -> usize {
     let cols = columns(text, shape);
+    let end = cols.last().map_or(0, |(start, w, _)| start + w);
+    if insert && want >= end {
+        return end;
+    }
     let at = cols
         .iter()
         .find(|(start, w, _)| want < start + w)
         .or(cols.last());
-    at.map_or(0, |&(start, w, c)| sits(start, w, c, shape))
+    at.map_or(0, |&(start, w, c)| sits(start, w, c, shape, insert))
+}
+
+/// The display column of the character at byte `byte` of a line — Neovim's
+/// `curcol` — or of its last, for a byte past its end.
+pub fn vcol_at(text: &str, shape: &Shape, byte: i64) -> usize {
+    let n = text
+        .char_indices()
+        .take_while(|(i, _)| (*i as i64) < byte)
+        .filter(|(_, c)| c.width() != Some(0))
+        .count();
+    let cols = columns(text, shape);
+    cols.get(n)
+        .or(cols.last())
+        .map_or(0, |&(start, _, _)| start)
 }
 
 /// Where a line's first non-blank character is, in display columns — or
@@ -616,7 +714,192 @@ pub fn first_nonblank(text: &str, shape: &Shape) -> usize {
         .iter()
         .find(|(_, _, c)| !matches!(c, ' ' | '\t'))
         .or(cols.last());
-    at.map_or(0, |&(start, w, c)| sits(start, w, c, shape))
+    at.map_or(0, |&(start, w, c)| sits(start, w, c, shape, false))
+}
+
+/// Where a view is sideways, as far as a prediction is concerned: its first
+/// display column, and the cursor's line and display column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Across {
+    pub left: usize,
+    pub line: i64,
+    pub vcol: usize,
+}
+
+/// The span, in display columns, of the character at display column `vcol`
+/// of a line, or of its last if the line is shorter; `(0, 0)` for an empty
+/// one.
+fn span(cols: &[(usize, usize, char)], vcol: usize) -> (usize, usize) {
+    cols.iter()
+        .find(|(start, w, _)| vcol < start + w)
+        .or(cols.last())
+        .map_or((0, 0), |&(start, w, _)| (start, start + w - 1))
+}
+
+/// Where `side` takes a view at `at` in a window `width` columns wide —
+/// its gutter and all — and of `shape`, as Neovim's `set_leftcol`, `zs`, `ze`
+/// and `do_mousescroll_horiz` take it, and as Neovim 0.12 was found to:
+/// `text` is the text of a line, and `shown` the lines in view, for the
+/// wheel to find the longest of. `None` where the client cannot say.
+pub fn across<'a>(
+    side: Side,
+    at: Across,
+    width: usize,
+    shape: &Shape,
+    text: impl Fn(i64) -> Option<&'a str>,
+    shown: std::ops::Range<i64>,
+) -> Option<Across> {
+    let tw = width.saturating_sub(shape.textoff);
+    if shape.wrap || tw == 0 {
+        return Some(at);
+    }
+    let siso = shape.sidescrolloff;
+    if 2 * siso + 1 > tw {
+        return None;
+    }
+    let cols = columns(text(at.line)?, shape);
+    let shift = |n: i64| (at.left as i64 + n).max(0) as usize;
+    let left = match side {
+        // These set the column outright, and nothing more.
+        Side::Start => {
+            let (s, _) = span(&cols, at.vcol);
+            return Some(Across {
+                left: s.saturating_sub(siso),
+                ..at
+            });
+        }
+        Side::End => {
+            let (_, e) = span(&cols, at.vcol);
+            let left = if e + siso < tw { 0 } else { e + siso - tw + 1 };
+            return Some(Across { left, ..at });
+        }
+        Side::Cols(n) | Side::Wheel(n) => shift(n),
+        Side::Halves(n) => shift(n * (width / 2) as i64),
+    };
+    if left == at.left {
+        return Some(at);
+    }
+    let mut to = Across { left, ..at };
+    let mut cols = cols;
+    // The wheel, past the end of the cursor's line: the cursor goes to the
+    // longest line in view, the nearest of those as long, and its start.
+    if matches!(side, Side::Wheel(_)) && left > end(&cols) {
+        let mut best: Option<(usize, i64)> = None;
+        for l in shown {
+            let n = end(&columns(text(l)?, shape));
+            let nearer = |b: i64| (l - at.line).abs() < (b - at.line).abs();
+            if best.is_none_or(|(m, b)| n > m || (n == m && nearer(b))) {
+                best = Some((n, l));
+            }
+        }
+        to.line = best?.1;
+        to.vcol = 0;
+        cols = columns(text(to.line)?, shape);
+    }
+    // `set_leftcol`: the cursor kept in view, `'sidescrolloff'` from its
+    // edges, on a character wholly in view where there is one.
+    let last = left + tw - 1;
+    let land = |vcol: usize| span(&cols, vcol).0;
+    let mut v = span(&cols, to.vcol).0;
+    if v > last - siso {
+        v = land(last - siso);
+    } else if v < left + siso {
+        v = land(left + siso);
+    }
+    let (s, e) = span(&cols, v);
+    if e > last {
+        v = land(s.saturating_sub(1));
+    } else if s < left {
+        match cols.iter().find(|(start, ..)| *start > e) {
+            Some(&(next, ..)) => v = next,
+            None => to.left = s,
+        }
+    }
+    // And then as the cursor is drawn: a view the cursor is too near the
+    // edge of moves `'sidescroll'` columns at least — or, with that nought,
+    // or that far, centres it, which is not predicted.
+    if v < to.left + siso {
+        let diff = to.left + siso - v;
+        if shape.sidescroll == 0 || diff >= tw / 2 {
+            return None;
+        }
+        to.left = to.left.saturating_sub(diff.max(shape.sidescroll));
+    }
+    let sits = cols
+        .iter()
+        .find(|(start, ..)| *start == v)
+        .map_or(v, |&(start, w, c)| sits(start, w, c, shape, false));
+    to.vcol = sits;
+    Some(to)
+}
+
+/// The display column a line's text ends at.
+fn end(cols: &[(usize, usize, char)]) -> usize {
+    cols.last().map_or(0, |(s, w, _)| s + w)
+}
+
+/// Whether the client knows enough of the lines to scroll a view sideways
+/// from `at` to `to` (see [`across`]), where some were sent cut short
+/// (`cut`): each of those, in view or the cursor's, must reach past the new
+/// view's right edge — so that it draws, and nothing turns on where it
+/// ends — and the wheel must not have sent the cursor to the longest line.
+pub fn known<'a>(
+    at: Across,
+    to: Across,
+    width: usize,
+    shape: &Shape,
+    text: impl Fn(i64) -> Option<&'a str>,
+    cut: impl Fn(i64) -> bool,
+    shown: std::ops::Range<i64>,
+) -> bool {
+    if to.line != at.line && shown.clone().any(&cut) {
+        return false;
+    }
+    let right = to.left + width.saturating_sub(shape.textoff);
+    shown
+        .chain([at.line, to.line])
+        .filter(|&l| cut(l))
+        .all(|l| text(l).is_some_and(|t| end(&columns(t, shape)) > right))
+}
+
+/// The rows of a window's text, `rows` as Neovim drew them from display
+/// column `from`, moved to show the text from column `to`: what was in view
+/// and still is keeps its colours, and what comes into view is drawn from
+/// `text` — the row's line, `None` past the buffer's end — in the window's
+/// own colours. `None` where a line was not sent.
+pub fn shifted<'a>(
+    rows: &[Vec<Cell>],
+    from: usize,
+    to: usize,
+    shape: &Shape,
+    look: &Look,
+    text: impl Fn(usize) -> Option<Option<&'a str>>,
+) -> Option<Vec<Vec<Cell>>> {
+    let moved = Shape {
+        leftcol: to,
+        ..shape.clone()
+    };
+    rows.iter()
+        .enumerate()
+        .map(|(r, row)| {
+            let Some(line) = text(r)? else {
+                return Some(row.clone());
+            };
+            let width = row.len();
+            let tw = width.saturating_sub(shape.textoff);
+            let fresh = render(Some(line), &moved, 0, width, look, 0)?;
+            let mut out = row.clone();
+            for c in shape.textoff..width {
+                let v = to + (c - shape.textoff);
+                out[c] = if (from..from + tw).contains(&v) {
+                    row[shape.textoff + v - from].clone()
+                } else {
+                    fresh[c].clone()
+                };
+            }
+            Some(out)
+        })
+        .collect()
 }
 
 /// Keys that, typed in normal or visual mode with nothing pending, do all
@@ -644,8 +927,28 @@ const SCROLLS: &[&str] = &[
     "<S-Up>",
 ];
 
-/// The `z` commands that scroll, after their `z`.
+/// The `z` commands that scroll, after their `z`; and those that scroll
+/// sideways.
 const Z: &[&str] = &["t", "<CR>", "z", ".", "b", "-"];
+const Z_SIDE: &[&str] = &["l", "h", "L", "H", "s", "e", "<Right>", "<Left>"];
+
+/// The keys that scroll in insert mode: by themselves, and after `<C-x>`.
+const INSERT_SCROLLS: &[&str] = &["<PageDown>", "<PageUp>", "<S-Down>", "<S-Up>"];
+const CTRL_X: &[&str] = &["<C-e>", "<C-y>"];
+
+/// Keys that, in insert mode, wait for another, or leave it for a command:
+/// the client cannot follow them.
+const INSERT_WAITS: &[&str] = &[
+    "<C-r>",
+    "<C-v>",
+    "<C-q>",
+    "<C-k>",
+    "<C-o>",
+    "<C-x>",
+    "<C-\\>",
+    "<C-Bslash>",
+    "<C-g>",
+];
 
 /// The wheel, as a mapping names it.
 const WHEEL: &[&str] = &[
@@ -655,13 +958,19 @@ const WHEEL: &[&str] = &[
     "<S-ScrollWheelUp>",
     "<C-ScrollWheelDown>",
     "<C-ScrollWheelUp>",
+    "<ScrollWheelRight>",
+    "<ScrollWheelLeft>",
+    "<S-ScrollWheelRight>",
+    "<S-ScrollWheelLeft>",
+    "<C-ScrollWheelRight>",
+    "<C-ScrollWheelLeft>",
 ];
 
 /// Every key, and `z` command, a mapping of which changes what the client
 /// makes of it: what the agent is asked to look up (see [`Shape::mapped`]).
 pub fn keys() -> Vec<String> {
     let digits = (0..10).map(|d| d.to_string());
-    let z = Z.iter().map(|k| format!("z{k}"));
+    let z = Z.iter().chain(Z_SIDE).map(|k| format!("z{k}"));
     WHOLE
         .iter()
         .chain(SCROLLS)
@@ -672,10 +981,20 @@ pub fn keys() -> Vec<String> {
         .collect()
 }
 
-/// The name a mapping of the wheel turned `dir` (1 down, -1 up) with
-/// modifiers `mods` has, as in [`WHEEL`].
-pub fn wheel(dir: i64, mods: &str) -> String {
-    let way = if dir > 0 { "Down" } else { "Up" };
+/// The keys the client follows in insert mode, a mapping of which changes
+/// what it makes of them (see [`Shape::imapped`]).
+pub fn insert_keys() -> Vec<String> {
+    INSERT_SCROLLS
+        .iter()
+        .chain(CTRL_X)
+        .chain(&["<C-x>", "<Esc>", "<C-c>"])
+        .map(|k| k.to_string())
+        .collect()
+}
+
+/// The name a mapping of the wheel turned `way` — `Down`, `Up`, `Right`,
+/// `Left` — with modifiers `mods` has, as in [`WHEEL`].
+pub fn wheel(way: &str, mods: &str) -> String {
     match mods {
         "" => format!("<ScrollWheel{way}>"),
         m => format!("<{m}-ScrollWheel{way}>"),
@@ -696,6 +1015,27 @@ pub fn tokens(keys: &str) -> impl Iterator<Item = &str> {
         rest = tail;
         Some(key)
     })
+}
+
+/// The mode Neovim says it is in, as far as the predictions care.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Normal or visual mode.
+    Normal,
+    /// Insert or replace mode.
+    Insert,
+    Other,
+}
+
+impl Mode {
+    /// A mode by the name `mode_change` gives it.
+    pub fn of(name: &str) -> Self {
+        match name {
+            "normal" | "visual" => Mode::Normal,
+            "insert" | "replace" => Mode::Insert,
+            _ => Mode::Other,
+        }
+    }
 }
 
 /// The longest count kept: past it, a count is as good as endless.
@@ -729,8 +1069,10 @@ pub struct Typed {
     /// The fence asked after and not yet answered: the inputs counted when
     /// it was asked.
     fence: Option<u64>,
-    /// The last of them leaves nothing pending.
+    /// The last of them leaves nothing pending in normal mode; and it is one
+    /// that, in insert mode, waits for another.
     whole: bool,
+    waits: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -739,15 +1081,21 @@ enum State {
     Ready(Option<i64>),
     /// A `z`, and the count before it.
     Z(Option<i64>),
+    /// Insert or replace mode, after a `<C-x>` if `x`.
+    Insert { x: bool },
     #[default]
     Lost,
 }
 
 impl Typed {
-    /// A key typed — `mapped` says whether something maps it — as Neovim
-    /// in normal or visual mode will take it: the scroll it makes, if it
+    /// A key typed — `mapped` says whether something maps it, in insert mode
+    /// if asked about it — as Neovim will take it: the scroll it makes, if it
     /// makes one the client can follow.
-    pub fn key(&mut self, key: &str, mapped: impl Fn(&str) -> bool) -> Option<Command> {
+    pub fn key(&mut self, key: &str, mapped: impl Fn(bool, &str) -> bool) -> Option<Command> {
+        if let State::Insert { x } = self.state {
+            return self.insert_key(key, x, |k| mapped(true, k));
+        }
+        let mapped = |k: &str| mapped(false, k);
         match self.state {
             State::Ready(count) => {
                 let d = key
@@ -776,28 +1124,37 @@ impl Typed {
                 }
             }
             State::Z(count) => {
+                let n = count.unwrap_or(1);
+                let side = match key {
+                    "l" | "<Right>" => Some(Side::Cols(n)),
+                    "h" | "<Left>" => Some(Side::Cols(-n)),
+                    "L" => Some(Side::Halves(n)),
+                    "H" => Some(Side::Halves(-n)),
+                    "s" => Some(Side::Start),
+                    "e" => Some(Side::End),
+                    _ => None,
+                };
+                if let Some(side) = side.filter(|_| !mapped(&format!("z{key}"))) {
+                    self.state = State::Ready(None);
+                    self.whole = true;
+                    return Some(Command::Side(side));
+                }
                 let command = Z
                     .iter()
                     .position(|z| *z == key)
                     .filter(|_| !mapped(&format!("z{key}")));
-                match (command, count) {
-                    (Some(i), None) => {
+                match command {
+                    Some(i) => {
                         self.state = State::Ready(None);
                         self.whole = true;
                         let to = [Edge::Top, Edge::Middle, Edge::Bottom][i / 2];
                         Some(Command::Line {
                             to,
                             first: i % 2 == 1,
+                            line: count,
                         })
                     }
-                    // With a count, the cursor goes to that line first.
-                    (Some(_), Some(_)) => {
-                        self.sent += 1;
-                        self.whole = true;
-                        self.state = State::Ready(None);
-                        None
-                    }
-                    (None, _) => {
+                    None => {
                         self.sent += 1;
                         self.whole = false;
                         self.state = State::Lost;
@@ -805,16 +1162,61 @@ impl Typed {
                     }
                 }
             }
-            State::Lost => {
+            State::Lost | State::Insert { .. } => {
                 self.moved(key, &mapped);
                 None
             }
         }
     }
 
+    /// A key typed in insert mode, after a `<C-x>` if `x`.
+    fn insert_key(&mut self, key: &str, x: bool, mapped: impl Fn(&str) -> bool) -> Option<Command> {
+        let plain = !mapped(key);
+        if x && plain {
+            match key {
+                "<C-e>" => return Some(Command::Lines(1)),
+                "<C-y>" => return Some(Command::Lines(-1)),
+                _ => {}
+            }
+        }
+        if plain {
+            if let Some(command) = INSERT_SCROLLS
+                .contains(&key)
+                .then(|| scroll(key, None))
+                .flatten()
+            {
+                self.state = State::Insert { x: false };
+                self.whole = true;
+                return Some(command);
+            }
+            if key == "<C-x>" {
+                self.state = State::Insert { x: true };
+                return None;
+            }
+        }
+        // Text, or a key that moves the cursor, which the client does not
+        // predict; or one that waits for another, which it cannot follow.
+        self.sent += 1;
+        self.waits = !plain || INSERT_WAITS.contains(&key);
+        self.whole = !self.waits;
+        self.state = match key {
+            "<Esc>" | "<C-c>" if plain => State::Ready(None),
+            _ if self.whole => State::Insert { x: false },
+            _ => State::Lost,
+        };
+        None
+    }
+
+    /// Whether the keys are being typed in insert mode, as far as the client
+    /// can tell.
+    pub fn inserting(&self) -> bool {
+        matches!(self.state, State::Insert { .. })
+    }
+
     /// A key that moves things the client does not predict.
     fn moved(&mut self, key: &str, mapped: &impl Fn(&str) -> bool) {
         self.sent += 1;
+        self.waits = INSERT_WAITS.contains(&key);
         self.whole = (WHOLE.contains(&key) || SCROLLS.contains(&key)) && !mapped(key);
         self.state = match self.state {
             _ if self.whole && matches!(key, "<Esc>" | "<C-c>") => State::Ready(None),
@@ -833,6 +1235,7 @@ impl Typed {
     pub fn other(&mut self) {
         self.sent += 1;
         self.whole = true;
+        self.waits = false;
         self.state = State::Lost;
     }
 
@@ -840,6 +1243,7 @@ impl Typed {
     pub fn attached(&mut self) {
         self.sent += 1;
         self.whole = true;
+        self.waits = false;
         self.state = State::Lost;
     }
 
@@ -862,22 +1266,25 @@ impl Typed {
         self.sent
     }
 
-    /// The fence for the inputs counted `at` is answered, Neovim in normal or
-    /// visual mode if `normal`.
-    pub fn answered(&mut self, at: u64, normal: bool) {
+    /// The fence for the inputs counted `at` is answered, Neovim in `mode`.
+    pub fn answered(&mut self, at: u64, mode: Mode) {
         self.fence = None;
         self.drawn = self.drawn.max(at);
-        self.settle(normal);
+        self.settle(mode);
     }
 
-    /// Neovim has drawn, and is in normal or visual mode if `normal`: with
-    /// every input drawn and the last leaving nothing pending, it is waiting
-    /// for a fresh command. A fence can be answered before the frame that
-    /// says which mode Neovim is in, which is why this is asked again at
-    /// every frame.
-    pub fn settle(&mut self, normal: bool) {
-        if self.drawn == self.sent && self.state == State::Lost && self.whole && normal {
-            self.state = State::Ready(None);
+    /// Neovim has drawn, and is in `mode`: with every input drawn and the
+    /// last leaving nothing pending, it is waiting for a fresh command, or
+    /// for what is typed in insert mode. A fence can be answered before the
+    /// frame that says which mode Neovim is in, which is why this is asked
+    /// again at every frame.
+    pub fn settle(&mut self, mode: Mode) {
+        if self.drawn == self.sent && self.state == State::Lost {
+            self.state = match mode {
+                Mode::Normal if self.whole => State::Ready(None),
+                Mode::Insert if !self.waits => State::Insert { x: false },
+                _ => State::Lost,
+            };
         }
     }
 }
@@ -965,10 +1372,11 @@ impl Predictor {
                     .map(|a| a.iter().map(lossy).collect())
                     .unwrap_or_default();
                 let fresh = matches!(v.get(5), Some(ValueRef::Boolean(true)));
+                let cap = int(6).map_or(usize::MAX, |c| c.max(0) as usize);
                 self.lines
                     .entry(win)
                     .or_default()
-                    .take(buf, tick, first, text, fresh);
+                    .take(buf, tick, first, text, cap, fresh);
                 true
             }
             "shape" => {
@@ -1005,7 +1413,12 @@ impl Predictor {
     /// takes it, with that window's mappings.
     pub fn key(&mut self, win: Option<i64>, key: &str) -> Option<Command> {
         let shape = win.and_then(|w| self.shapes.get(&w));
-        let mapped = |k: &str| shape.is_some_and(|s| s.mapped.iter().any(|m| m == k));
+        let mapped = |insert: bool, k: &str| {
+            shape.is_some_and(|s| {
+                let list = if insert { &s.imapped } else { &s.mapped };
+                list.iter().any(|m| m == k)
+            })
+        };
         self.typed.key(key, mapped)
     }
 
@@ -1017,11 +1430,27 @@ impl Predictor {
         }
     }
 
+    /// Neovim's view of window `win` now starts at display column `left`.
+    pub fn set_leftcol(&mut self, win: i64, left: usize) {
+        if let Some(s) = self.shapes.get_mut(&win) {
+            s.leftcol = left;
+        }
+    }
+
     /// The text of buffer line `lnum` of window `win`, if the agent has sent
     /// it.
     pub fn text(&self, win: i64, lnum: i64) -> Option<&str> {
         let shape = self.shapes.get(&win)?;
         self.lines.get(&win)?.get(shape.buf, lnum)
+    }
+
+    /// Whether the agent may have sent buffer line `lnum` of window `win`
+    /// cut short: see [`known`].
+    pub fn cut(&self, win: i64, lnum: i64) -> bool {
+        self.shapes
+            .get(&win)
+            .zip(self.lines.get(&win))
+            .is_some_and(|(shape, lines)| lines.cut(shape.buf, lnum))
     }
 
     /// Buffer line `lnum` of window `win` as a row of it would draw it — see
@@ -1084,6 +1513,10 @@ mod tests {
             page: 0,
             startofline: false,
             mapped: Vec::new(),
+            imapped: Vec::new(),
+            sidescrolloff: 0,
+            sidescroll: 1,
+            hor: 6,
         }
     }
 
@@ -1227,7 +1660,16 @@ mod tests {
         use Edge::*;
         let half = |down| Half { down, count: None };
         let page = |down, count| Page { down, count };
-        let line = |to| Line { to, first: false };
+        let line = |to| Line {
+            to,
+            first: false,
+            line: None,
+        };
+        let at = |to, first, n| Line {
+            to,
+            first,
+            line: Some(n),
+        };
         // 'scrolloff', rows, what is typed, from (top, cursor), to the same.
         type Case = (usize, i64, Command, (i64, i64), (i64, i64));
         #[rustfmt::skip]
@@ -1328,6 +1770,19 @@ mod tests {
             (0, 3, page(true, 1), (49, 50), (52, 52)),
             (0, 3, page(false, 1), (49, 50), (46, 48)),
             (1, 3, line(Bottom), (49, 50), (49, 50)),
+            // With a count: that line, the cursor taken there.
+            (0, 22, at(Top, false, 45), (40, 50), (45, 45)),
+            (0, 22, at(Top, true, 45), (40, 50), (45, 45)),
+            (0, 22, at(Middle, true, 45), (40, 50), (35, 45)),
+            (0, 22, at(Bottom, true, 45), (40, 50), (24, 45)),
+            (0, 22, at(Bottom, false, 45), (40, 50), (24, 45)),
+            (5, 22, at(Bottom, false, 55), (40, 50), (39, 55)),
+            (0, 22, at(Top, false, 53), (40, 50), (53, 53)),
+            (0, 22, at(Top, false, 500), (40, 50), (100, 100)),
+            // The wheel with Shift or Ctrl in insert mode: what the window shows.
+            (0, 22, Screen(1), (40, 50), (62, 62)),
+            (0, 22, Screen(-1), (40, 50), (18, 39)),
+            (0, 22, Screen(1), (90, 95), (100, 100)),
         ];
         for &(so, h, command, (top, cursor), want) in cases {
             let s = Shape {
@@ -1353,14 +1808,306 @@ mod tests {
     #[test]
     fn the_cursor_lands_where_neovim_puts_it() {
         let s = shape();
-        assert_eq!(landing("abcdef", &s, 3), 3);
-        assert_eq!(landing("ab", &s, 3), 1);
-        assert_eq!(landing("", &s, 3), 0);
-        assert_eq!(landing("\tx", &s, 3), 7, "on a tab, at its end");
-        assert_eq!(landing("日本", &s, 3), 2, "on the second, wide");
+        assert_eq!(landing("abcdef", &s, 3, false), 3);
+        assert_eq!(landing("ab", &s, 3, false), 1);
+        assert_eq!(landing("", &s, 3, false), 0);
+        assert_eq!(landing("\tx", &s, 3, false), 7, "on a tab, at its end");
+        assert_eq!(landing("日本", &s, 3, false), 2, "on the second, wide");
+        assert_eq!(
+            landing("ab", &s, 30, true),
+            2,
+            "in insert mode, past the end"
+        );
+        assert_eq!(landing("\tx", &s, 3, true), 0, "and at a tab's start");
         assert_eq!(first_nonblank("    x", &s), 4);
         assert_eq!(first_nonblank("\t x", &s), 9);
         assert_eq!(first_nonblank("   ", &s), 2, "all blank: the last");
+    }
+
+    /// In insert mode, the keys that scroll there — the pages, and
+    /// `<C-e>` and `<C-y>` after `<C-x>`, for as long as they follow it — and
+    /// no others; insert mode found once Neovim has caught up, and left by an
+    /// escape.
+    #[test]
+    fn insert_mode_scrolls_are_told_apart() {
+        let mut t = Typed::default();
+        typed(&mut t, "i");
+        let at = t.fenced();
+        t.answered(at, Mode::Insert);
+        assert!(t.inserting() && t.sure());
+        assert_eq!(
+            typed(&mut t, "<PageDown><C-x><C-e><C-e><C-y><S-Up>"),
+            [
+                Command::Page {
+                    down: true,
+                    count: 1
+                },
+                Command::Lines(1),
+                Command::Lines(1),
+                Command::Lines(-1),
+                Command::Page {
+                    down: false,
+                    count: 1
+                },
+            ]
+        );
+        assert!(t.sure(), "scrolls, all of them");
+        // <C-e> without <C-x> is the character below; text is unpredicted.
+        assert!(typed(&mut t, "<C-x>a<C-e>").is_empty());
+        assert!(!t.sure() && t.inserting());
+        let at = t.fenced();
+        t.answered(at, Mode::Insert);
+        assert!(t.sure());
+        // A key that waits for another: lost.
+        assert!(typed(&mut t, "<C-r><PageDown>").is_empty());
+        assert!(!t.inserting());
+        // An escape: normal mode, as far as the client can tell.
+        typed(&mut t, "<Esc>");
+        let at = t.fenced();
+        t.answered(at, Mode::Normal);
+        assert_eq!(typed(&mut t, "<C-e>"), [Command::Lines(1)]);
+        // Mapped in insert mode: not followed.
+        typed(&mut t, "a");
+        let at = t.fenced();
+        t.answered(at, Mode::Insert);
+        let mapped: Vec<Command> = tokens("<PageDown>")
+            .filter_map(|k| t.key(k, |insert, k| insert && k == "<PageDown>"))
+            .collect();
+        assert!(mapped.is_empty());
+    }
+
+    /// What Neovim 0.12 did sideways in a window 80 columns wide that does
+    /// not wrap, over lines `n` as long as the n-th of 10, 40, 100, 160, 5,
+    /// 0 and 70 — line 52 is 160 long, 53 5 and 54 empty — from the cursor's
+    /// line, its column and the view's first column, to the cursor's column
+    /// and the view's first.
+    #[test]
+    fn sideways_scrolls_go_where_neovim_takes_them() {
+        use Side::*;
+        let text: Vec<String> = (0..200)
+            .map(|i: usize| {
+                let n = i + 1;
+                let len = [10, 40, 100, 160, 5, 0, 70][n % 7];
+                let s = format!("{}line {n}{}", " ".repeat(n % 4), "x".repeat(200));
+                s[..len.min(s.len())].to_string()
+            })
+            .collect();
+        // 'sidescrolloff', the gutter, what is typed or turned, from (line,
+        // col, left), to (col, left).
+        type Case = (usize, usize, Side, (i64, usize, usize), (usize, usize));
+        #[rustfmt::skip]
+        let cases: &[Case] = &[
+            (0, 0, Cols(1), (52, 0, 0), (1, 1)),
+            (0, 0, Cols(1), (52, 10, 0), (10, 1)),
+            (0, 0, Cols(5), (52, 10, 0), (10, 5)),
+            (0, 0, Cols(-1), (52, 10, 10), (10, 9)),
+            (0, 0, Cols(-30), (52, 10, 10), (10, 0)),
+            (0, 0, Halves(1), (52, 10, 0), (40, 40)),
+            (0, 0, Halves(2), (52, 10, 0), (80, 80)),
+            (0, 0, Halves(-1), (52, 100, 60), (99, 20)),
+            (0, 0, Start, (52, 100, 21), (100, 100)),
+            (0, 0, End, (52, 100, 21), (100, 21)),
+            (0, 0, End, (52, 30, 0), (30, 0)),
+            (0, 0, Start, (52, 130, 100), (130, 130)),
+            (0, 0, Wheel(-6), (52, 10, 0), (10, 0)),
+            (0, 0, Wheel(6), (52, 10, 10), (16, 16)),
+            (0, 0, Wheel(80), (52, 10, 0), (80, 80)),
+            (0, 0, Wheel(-6), (53, 2, 0), (2, 0)),
+            (0, 0, Cols(20), (53, 2, 0), (4, 4)),
+            (0, 0, Cols(1), (54, 0, 0), (0, 0)),
+            (0, 0, Cols(1), (53, 2, 2), (3, 3)),
+            (3, 0, Cols(1), (52, 0, 0), (4, 1)),
+            (3, 0, Cols(1), (52, 10, 0), (10, 1)),
+            (3, 0, Cols(-1), (52, 10, 7), (10, 6)),
+            (3, 0, Halves(1), (52, 10, 0), (43, 40)),
+            (3, 0, Halves(-1), (52, 100, 60), (96, 20)),
+            (3, 0, Start, (52, 100, 24), (100, 97)),
+            (3, 0, End, (52, 100, 24), (100, 24)),
+            (3, 0, Start, (52, 130, 100), (130, 127)),
+            (3, 0, Wheel(6), (52, 10, 7), (16, 13)),
+            (3, 0, Wheel(80), (52, 10, 0), (83, 80)),
+            (3, 0, Cols(20), (53, 2, 0), (4, 1)),
+            (3, 0, Cols(1), (53, 2, 0), (4, 1)),
+            (0, 4, Halves(-1), (52, 100, 60), (95, 20)),
+            (0, 4, Halves(1), (52, 10, 0), (40, 40)),
+            (0, 4, Start, (52, 100, 25), (100, 100)),
+            (0, 4, End, (52, 100, 25), (100, 25)),
+            (0, 4, Wheel(80), (52, 10, 0), (80, 80)),
+        ];
+        for &(siso, textoff, side, (line, vcol, left), want) in cases {
+            let s = Shape {
+                textoff,
+                wrap: false,
+                sidescrolloff: siso,
+                ..shape()
+            };
+            let at = Across {
+                left,
+                line: line - 1,
+                vcol,
+            };
+            let got = across(
+                side,
+                at,
+                80,
+                &s,
+                |l| text.get(l as usize).map(String::as_str),
+                39..61,
+            )
+            .map(|a| (a.vcol, a.left));
+            assert_eq!(
+                got,
+                Some(want),
+                "{side:?} from {line}, {vcol}, {left}; siso={siso}, gutter {textoff}"
+            );
+        }
+        // Wrapping, nothing moves.
+        let s = Shape {
+            wrap: true,
+            ..shape()
+        };
+        let at = Across {
+            left: 0,
+            line: 51,
+            vcol: 10,
+        };
+        assert_eq!(
+            across(
+                Cols(5),
+                at,
+                80,
+                &s,
+                |l| text.get(l as usize).map(String::as_str),
+                39..61
+            ),
+            Some(at)
+        );
+    }
+
+    /// The wheel past the end of the cursor's line takes the cursor to the
+    /// longest line in view, the nearest of those as long.
+    #[test]
+    fn the_wheel_sideways_finds_the_longest_line() {
+        let text = ["short", "a longer line", "x", "a longer line", "y"];
+        let s = Shape {
+            textoff: 0,
+            wrap: false,
+            ..shape()
+        };
+        let at = Across {
+            left: 0,
+            line: 4,
+            vcol: 0,
+        };
+        let to = across(
+            Side::Wheel(6),
+            at,
+            10,
+            &s,
+            |l| text.get(l as usize).copied(),
+            0..5,
+        );
+        assert_eq!(to.map(|a| (a.line, a.left)), Some((3, 6)));
+        assert_eq!(to.map(|a| a.vcol), Some(6), "kept in view");
+    }
+
+    /// A line sent cut short does for a scroll sideways only while it reaches
+    /// past the new view; and where the wheel looks for the longest line,
+    /// no line cut short does at all.
+    #[test]
+    fn lines_cut_short_do_only_as_far_as_they_go() {
+        let text = ["a".repeat(30), "b".repeat(12), "c".repeat(3)];
+        let s = Shape {
+            textoff: 0,
+            wrap: false,
+            ..shape()
+        };
+        let line = |l: i64| text.get(l as usize).map(String::as_str);
+        let at = Across {
+            left: 0,
+            line: 0,
+            vcol: 0,
+        };
+        let cut_first = |l: i64| l == 0;
+        let to = |left| Across {
+            left,
+            line: 0,
+            vcol: left,
+        };
+        assert!(
+            known(at, to(19), 10, &s, line, cut_first, 0..3),
+            "to 29 of 30"
+        );
+        assert!(
+            !known(at, to(20), 10, &s, line, cut_first, 0..3),
+            "to its very end"
+        );
+        assert!(known(at, to(25), 10, &s, line, |_| false, 0..3), "none cut");
+        let jumped = Across {
+            left: 6,
+            line: 1,
+            vcol: 6,
+        };
+        let at = Across { line: 2, ..at };
+        assert!(known(at, jumped, 10, &s, line, |_| false, 0..3));
+        assert!(
+            !known(at, jumped, 10, &s, line, cut_first, 0..3),
+            "the longest of lines not all known"
+        );
+
+        // The agent says how much of a line it sends; runs joined keep the
+        // least of what they were sent with.
+        let mut p = Predictor::default();
+        said(&mut p, "shape", shape_args(9));
+        let mut run = lines(1000, 5, 0, &["0123456789", "01234"], true);
+        run.push(10.into());
+        said(&mut p, "lines", run);
+        assert!(p.cut(1000, 0));
+        assert!(!p.cut(1000, 1));
+        let mut run = lines(1000, 5, 2, &["0123456"], false);
+        run.push(9.into());
+        said(&mut p, "lines", run);
+        assert!(p.cut(1000, 2), "within a character of the cap");
+        assert!(!p.cut(1000, 1));
+        said(&mut p, "lines", lines(1000, 5, 0, &["0123456789"], true));
+        assert!(!p.cut(1000, 0), "no cap said: none cut");
+    }
+
+    /// Moved sideways, what was in view keeps its colours; what comes into
+    /// view is the line's text in the window's own; the gutter stays put.
+    #[test]
+    fn rows_moved_sideways_keep_their_colours() {
+        let s = Shape {
+            textoff: 2,
+            wrap: false,
+            ..shape()
+        };
+        let row: Vec<Cell> = "12abcd"
+            .chars()
+            .enumerate()
+            .map(|(i, c)| Cell {
+                text: Text::Char(c),
+                hl: i as u32 + 10,
+            })
+            .collect();
+        let rows = vec![row.clone(), row];
+        let l = Look {
+            gutter: vec![18, 18],
+            ..look()
+        };
+        let moved = shifted(&rows, 0, 2, &s, &l, |r| {
+            Some((r == 0).then_some("abcdefgh"))
+        })
+        .unwrap();
+        let text_of = |row: &[Cell]| text(row);
+        assert_eq!(text_of(&moved[0]), "12cdef");
+        let hls: Vec<u32> = moved[0].iter().map(|c| c.hl).collect();
+        assert_eq!(
+            hls,
+            [10, 11, 14, 15, 0, 0],
+            "the gutter and what stayed in view, then plain"
+        );
+        assert_eq!(moved[1], rows[1], "past the end: as it was");
     }
 
     #[test]
@@ -1370,7 +2117,9 @@ mod tests {
     }
 
     fn typed(t: &mut Typed, keys: &str) -> Vec<Command> {
-        tokens(keys).filter_map(|k| t.key(k, |_| false)).collect()
+        tokens(keys)
+            .filter_map(|k| t.key(k, |_, _| false))
+            .collect()
     }
 
     /// Scrolls are known by their keys, with their counts and their `z`s;
@@ -1381,7 +2130,7 @@ mod tests {
         let mut t = Typed::default();
         assert!(typed(&mut t, "<C-e>").is_empty(), "lost to begin with");
         let at = t.fenced();
-        t.answered(at, true);
+        t.answered(at, Mode::Normal);
         assert!(t.sure());
         assert_eq!(
             typed(&mut t, "3<C-e><C-y>10<C-d>zz z.<C-b>"),
@@ -1394,11 +2143,13 @@ mod tests {
                 },
                 Command::Line {
                     to: Edge::Middle,
-                    first: false
+                    first: false,
+                    line: None
                 },
                 Command::Line {
                     to: Edge::Middle,
-                    first: true
+                    first: true,
+                    line: None
                 },
                 Command::Page {
                     down: false,
@@ -1410,41 +2161,41 @@ mod tests {
         assert!(t.wants_fence());
         let at = t.fenced();
         assert!(!t.wants_fence(), "one at a time");
-        t.answered(at, true);
+        t.answered(at, Mode::Normal);
         assert!(t.sure());
         // A key that waits for another: the scroll after it is not one.
         assert!(typed(&mut t, "f<C-e>").is_empty());
         assert!(!t.sure());
         let at = t.fenced();
-        t.answered(at, true);
+        t.answered(at, Mode::Normal);
         assert!(t.sure(), "and once Neovim has caught up, nothing pending");
         // One whose next key the client cannot place.
         assert!(typed(&mut t, "ma").is_empty());
         let at = t.fenced();
-        t.answered(at, true);
+        t.answered(at, Mode::Normal);
         assert!(!t.sure(), "'a' may yet be waiting for something");
         assert!(typed(&mut t, "<Esc>").is_empty());
         let at = t.fenced();
-        t.answered(at, true);
+        t.answered(at, Mode::Normal);
         assert!(t.sure(), "an escape leaves nothing pending");
         // Insert mode, as far as the client can tell, until it is left.
         assert!(typed(&mut t, "i<C-e>").is_empty());
         let at = t.fenced();
-        t.answered(at, false);
+        t.answered(at, Mode::Other);
         assert!(!t.sure());
         // A mapped key is one the client cannot follow.
         assert!(typed(&mut t, "<Esc>").is_empty());
         let at = t.fenced();
-        t.answered(at, true);
+        t.answered(at, Mode::Normal);
         let mapped: Vec<Command> = tokens("<C-d>j<C-e>")
-            .filter_map(|k| t.key(k, |k| k == "<C-d>"))
+            .filter_map(|k| t.key(k, |_, k| k == "<C-d>"))
             .collect();
         assert!(mapped.is_empty());
         // A fence answered before the last keys were drawn says nothing of
         // them.
         let at = t.fenced();
         typed(&mut t, "j");
-        t.answered(at, true);
+        t.answered(at, Mode::Normal);
         assert!(!t.sure());
     }
 

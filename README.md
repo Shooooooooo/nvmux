@@ -146,8 +146,11 @@ client can work out for itself, so once the round trip passes about 30 ms it
 scrolls the window at once and lets Neovim catch up — for `<C-e>`, `<C-y>`,
 `<C-d>`, `<C-u>`, `<C-f>`, `<C-b>`, `<PageDown>`, `<PageUp>`, `zt`, `zz`, `zb`
 and the rest of the `z` scrolls, with their counts, and the mouse wheel, with
-Shift or Ctrl a page. The rows a scroll uncovers come in plain text, from
-lines the client keeps a page either side of each view, and take on their
+Shift or Ctrl a page; in Insert mode for `<PageDown>`, `<PageUp>`,
+`<S-Down>`, `<S-Up>`, `<C-x><C-e>`, `<C-x><C-y>` and the wheel; and sideways,
+in a window that does not wrap, for `zl`, `zh`, `zL`, `zH`, `zs`, `ze` and the
+wheel left and right. The rows a scroll uncovers come in plain text, from
+lines the client keeps two windows either side of each view, and take on their
 colours, signs and virtual text when Neovim's own rows arrive. It does this
 only where it can be right — no folds, wrapped lines or virtual lines in the
 way, nothing mapped to the key, no key before it still on its way — and

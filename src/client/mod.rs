@@ -112,9 +112,10 @@ use anyhow::Context;
 use rmpv::ValueRef;
 
 use self::anim::{Animator, Effects};
+use self::grid::Cell;
 use self::input::{Input, Mouse, Parser, Reply};
 use self::model::{Changes, Model, Place, Placement};
-use self::predict::{Command, Predictor};
+use self::predict::{Command, Mode, Predictor, Side};
 use self::redraw::Event;
 use self::screen::Screen;
 use self::wire::{Arg, Inbox, Outbox};
@@ -231,15 +232,16 @@ return out";
 ///
 /// For a client that predicts, it also sends what the predictions are drawn
 /// from (see [`predict`]): for each window of the tab page, as its view moves
-/// or its buffer changes, the lines a page either side of the view and the
+/// or its buffer changes, the lines two pages either side of the view and the
 /// view's own (`lines`, window, buffer, `b:changedtick`, first line, lines,
 /// whether they replace what the client has), only those the client does not
 /// have, by the same rule as [`predict`] keeps them by, and each no longer
 /// than the window could show; and what to draw them with and how far its
 /// scrolls go, when that changes (`shape`, window, see [`predict::Shape`]) —
 /// among it, which of the keys the client follows, given it as the agent's
-/// third argument, something maps in the window's buffer.
-const AGENT_LUA: &str = "local chan, predict, keys = ...
+/// third argument and those in insert mode as its fourth, something maps in
+/// the window's buffer.
+const AGENT_LUA: &str = "local chan, predict, keys, ikeys = ...
 local api = vim.api
 local group = api.nvim_create_augroup('nvmux_client_' .. chan, { clear = true })
 local function send(...)
@@ -276,20 +278,23 @@ if predict then
   local function mapped(buf)
     local m = maps[buf]
     if m and vim.uv.now() - m.at < 1000 then
-      return m.keys
+      return m.keys, m.ikeys
     end
-    local out = {}
-    for _, key in ipairs(keys) do
-      local modes = key:find('ScrollWheel') and { 'n', 'x', 'i' } or { 'n', 'x' }
-      for _, mode in ipairs(modes) do
-        if vim.fn.mapcheck(key, mode) ~= '' then
-          out[#out + 1] = key
-          break
+    local function look(list, modes)
+      local out = {}
+      for _, key in ipairs(list) do
+        local ms = key:find('ScrollWheel') and { 'n', 'x', 'i' } or modes
+        for _, mode in ipairs(ms) do
+          if vim.fn.mapcheck(key, mode) ~= '' then
+            out[#out + 1] = key
+            break
+          end
         end
       end
+      return out
     end
-    maps[buf] = { at = vim.uv.now(), keys = out }
-    return out
+    maps[buf] = { at = vim.uv.now(), keys = look(keys, { 'n', 'x' }), ikeys = look(ikeys, { 'i' }) }
+    return maps[buf].keys, maps[buf].ikeys
   end
   local function shape(buf, info)
     local ok = not vim.wo.diff and vim.bo[buf].buftype ~= 'terminal'
@@ -298,17 +303,22 @@ if predict then
         and vim.o.window < vim.o.lines - 1 then
       page = math.max(1, vim.o.window - 2)
     end
-    local so = vim.wo.scrolloff
+    local so, siso = vim.wo.scrolloff, vim.wo.sidescrolloff
     if so < 0 then
       so = vim.go.scrolloff
     end
+    if siso < 0 then
+      siso = vim.go.sidescrolloff
+    end
+    local nmaps, imaps = mapped(buf)
     return { buf, api.nvim_buf_line_count(buf), info.textoff, vim.bo[buf].tabstop,
       vim.wo.number, vim.wo.relativenumber, vim.wo.statuscolumn == '', vim.wo.wrap,
       vim.fn.winsaveview().leftcol, ok, so,
       tonumber(vim.o.mousescroll:match('ver:(%d+)')) or 3,
       vim.opt.fillchars:get().eob or '~', vim.wo.list,
       vim.wo.list and vim.opt.listchars:get().tab or '', vim.wo.scroll, page,
-      vim.o.startofline, mapped(buf) }
+      vim.o.startofline, nmaps, imaps, siso, vim.o.sidescroll,
+      tonumber(vim.o.mousescroll:match('hor:(%d+)')) or 6 }
   end
   local function push(win)
     if api.nvim_win_get_config(win).relative ~= '' then
@@ -317,7 +327,7 @@ if predict then
     local buf = api.nvim_win_get_buf(win)
     local info = vim.fn.getwininfo(win)[1]
     local n = api.nvim_buf_line_count(buf)
-    local page = math.min(info.height + 10, 200)
+    local page = math.min(2 * info.height + 10, 300)
     local lo = math.max(0, info.topline - 1 - page)
     local hi = math.min(n, info.botline + page)
     local s = shape(buf, info)
@@ -334,7 +344,8 @@ if predict then
       s[10] = false
     end
     local key = table.concat(vim.tbl_map(tostring, { unpack(s, 1, 18) }), '\\0')
-      .. '\\0' .. table.concat(s[19], ' ')
+      .. '\\0' .. table.concat(s[19], ' ') .. '\\0' .. table.concat(s[20], ' ')
+      .. '\\0' .. table.concat({ s[21], s[22], s[23] }, ',')
     if shapes[win] ~= key then
       shapes[win] = key
       send('shape', win, s)
@@ -356,15 +367,15 @@ if predict then
     if h and h.buf == buf and h.tick == tick and h.cap >= cap and lo <= h.hi and hi >= h.lo
         and math.max(hi, h.hi) - math.min(lo, h.lo) <= 2000 then
       if lo < h.lo then
-        send('lines', win, buf, tick, lo, get(lo, h.lo), false)
+        send('lines', win, buf, tick, lo, get(lo, h.lo), false, cap)
         h.lo = lo
       end
       if hi > h.hi then
-        send('lines', win, buf, tick, h.hi, get(h.hi, hi), false)
+        send('lines', win, buf, tick, h.hi, get(h.hi, hi), false, cap)
         h.hi = hi
       end
     else
-      send('lines', win, buf, tick, lo, get(lo, hi), true)
+      send('lines', win, buf, tick, lo, get(lo, hi), true, cap)
       have[win] = { buf = buf, tick = tick, lo = lo, hi = hi, cap = cap }
     end
   end
@@ -393,6 +404,16 @@ if predict then
     'CursorHold', 'CursorHoldI' }, {}, function()
     soon()
   end)
+  -- A view moved sideways, said at once: Neovim draws it next, and nothing
+  -- else it sends says so.
+  au('WinScrolled', {}, function()
+    for id, d in pairs(vim.v.event) do
+      local win = tonumber(id)
+      if win and d.leftcol ~= 0 and api.nvim_win_is_valid(win) then
+        send('leftcol', win, vim.fn.getwininfo(win)[1].leftcol)
+      end
+    end
+  end)
   au({ 'TextChanged', 'TextChangedI', 'TextChangedP' }, {}, function()
     timer:stop()
     timer:start(150, 0, vim.schedule_wrap(soon))
@@ -400,7 +421,7 @@ if predict then
   au('OptionSet', { pattern = { 'number', 'relativenumber', 'statuscolumn', 'wrap',
     'tabstop', 'list', 'listchars', 'fillchars', 'scrolloff', 'mousescroll', 'foldenable',
     'foldcolumn', 'signcolumn', 'numberwidth', 'diff', 'buftype', 'scroll', 'window',
-    'startofline' } }, function()
+    'startofline', 'sidescrolloff', 'sidescroll' } }, function()
     soon()
   end)
   au('WinClosed', {}, function(ev)
@@ -440,12 +461,14 @@ enum Ask {
 }
 
 /// What a scroll the client predicts was made by: keys, which are predicted
-/// in normal and visual mode once Neovim has caught up with every key before
-/// them; a turn of the wheel by a page, in normal and visual mode; or by
-/// lines, in insert mode as well.
+/// in normal and visual mode — or in insert mode, those that scroll there —
+/// once Neovim has caught up with every key before them; a turn of the wheel
+/// by a page, in normal and visual mode; or by lines, in insert mode as
+/// well.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum By {
     Keys,
+    InsertKeys,
     PageWheel,
     Wheel,
 }
@@ -554,6 +577,9 @@ pub struct App {
     /// When the user last typed, turned the wheel or pasted: the round trip
     /// is measured while they are at work.
     typed: Option<Instant>,
+    /// The first columns windows' views have moved to, as the agent says,
+    /// for the next frame: see [`anim::side`].
+    lefts: Vec<(i64, usize)>,
 }
 
 impl App {
@@ -598,6 +624,7 @@ impl App {
             predict: predict.then(Predictor::default),
             asked_at: HashMap::new(),
             typed: None,
+            lefts: Vec::new(),
         }
     }
 
@@ -685,7 +712,10 @@ impl App {
             return;
         }
         self.agent = true;
-        let keys = predict::keys();
+        let (keys, ikeys) = (predict::keys(), predict::insert_keys());
+        fn list(keys: &[String]) -> Arg<'_> {
+            Arg::Array(keys.iter().map(|k| Arg::str(k)).collect())
+        }
         let id = self.outbox.request(
             "nvim_exec_lua",
             &[
@@ -693,7 +723,8 @@ impl App {
                 Arg::Array(vec![
                     Arg::Int(chan as i64),
                     Arg::Bool(predict),
-                    Arg::Array(keys.iter().map(|k| Arg::str(k)).collect()),
+                    list(&keys),
+                    list(&ikeys),
                 ]),
             ],
         );
@@ -725,6 +756,12 @@ impl App {
                 }
             }
             Some("options") => self.anim.set_options(options(&params[1..])),
+            // Said just before Neovim draws it: taken with that frame.
+            Some("leftcol") => {
+                if let (Some(win), Some(left)) = (int(1), int(2)) {
+                    self.lefts.push((win, usize::try_from(left).unwrap_or(0)));
+                }
+            }
             Some(what) => {
                 if let Some(p) = self.predict.as_mut() {
                     p.said(what, &params[1..]);
@@ -857,9 +894,9 @@ impl App {
                         }
                     }
                     Some(Ask::Fence(at)) => {
-                        let normal = matches!(self.model.mode_name.as_str(), "normal" | "visual");
+                        let mode = Mode::of(&self.model.mode_name);
                         if let Some(p) = self.predict.as_mut() {
-                            p.typed.answered(at, normal);
+                            p.typed.answered(at, mode);
                         }
                     }
                     Some(Ask::Ping) | None => {}
@@ -1040,9 +1077,9 @@ impl App {
             .collect();
         self.apply(batch, animate, &switched, now);
         self.flushed = true;
+        self.landed_sideways();
         if let Some(p) = self.predict.as_mut() {
-            let normal = matches!(self.model.mode_name.as_str(), "normal" | "visual");
-            p.typed.settle(normal);
+            p.typed.settle(Mode::of(&self.model.mode_name));
         }
         if self.multigrid() {
             self.inspect(now);
@@ -1221,7 +1258,12 @@ impl App {
                 return;
             };
             if let Some(command) = p.key(win, key) {
-                self.predict_command(grid, command, By::Keys, now);
+                let by = if p.typed.inserting() {
+                    By::InsertKeys
+                } else {
+                    By::Keys
+                };
+                self.predict_command(grid, command, by, now);
             }
         }
     }
@@ -1281,16 +1323,17 @@ impl App {
             "release" => self.pressed = None,
             _ => {}
         }
-        let dir = match (m.button, m.action) {
-            ("wheel", "down") => 1,
-            ("wheel", "up") => -1,
-            _ => 0,
-        };
-        if dir != 0 {
-            self.predict_wheel(grid, dir, &m.mods, now);
-        } else if let Some(p) = self.predict.as_mut() {
-            // A click or a drag: the cursor goes somewhere, a mode may start.
-            p.typed.other();
+        match (m.button, m.action) {
+            ("wheel", way @ ("down" | "up" | "right" | "left")) => {
+                self.predict_wheel(grid, way, &m.mods, now);
+            }
+            _ => {
+                // A click or a drag: the cursor goes somewhere, a mode may
+                // start.
+                if let Some(p) = self.predict.as_mut() {
+                    p.typed.other();
+                }
+            }
         }
         self.outbox.notify(
             "nvim_input_mouse",
@@ -1305,18 +1348,37 @@ impl App {
         );
     }
 
-    /// A turn of the wheel over grid `grid`, down the buffer for `dir` 1 and
-    /// up it for -1, with modifiers `mods`: plain, `'mousescroll'` lines;
-    /// with Shift or Ctrl, a page — or whatever something mapping it says,
-    /// which is not predicted.
-    fn predict_wheel(&mut self, grid: u64, dir: i64, mods: &str, now: Instant) {
+    /// A turn of the wheel over grid `grid`, `way` — `down`, `up`, `right` or
+    /// `left` — with modifiers `mods`: plain, `'mousescroll'` lines or
+    /// columns; with Shift or Ctrl, a page, or the window's width — or
+    /// whatever something mapping it says, which is not predicted.
+    fn predict_wheel(&mut self, grid: u64, way: &str, mods: &str, now: Instant) {
         let Some(p) = self.predict.as_mut() else {
             return;
         };
         let shape = self.model.wins.get(&grid).and_then(|w| p.shape(*w));
+        let insert = Mode::of(&self.model.mode_name) == Mode::Insert;
+        let (dir, sideways) = match way {
+            "down" => (1, false),
+            "up" => (-1, false),
+            "right" => (1, true),
+            _ => (-1, true),
+        };
+        let name = {
+            let mut w = way.to_string();
+            w[..1].make_ascii_uppercase();
+            predict::wheel(&w, mods)
+        };
+        let width = self.model.grids.get(&grid).map_or(0, |g| g.width() as i64);
         let command = match (shape, mods) {
-            (Some(s), _) if s.mapped.contains(&predict::wheel(dir, mods)) => None,
+            (Some(s), _) if s.mapped.contains(&name) => None,
+            (Some(s), "") if sideways => Some((Command::Side(Side::Wheel(dir * s.hor)), By::Wheel)),
+            (Some(_), "S" | "C") if sideways => {
+                Some((Command::Side(Side::Wheel(dir * width)), By::Wheel))
+            }
             (Some(s), "") => Some((Command::Lines(dir * s.step), By::Wheel)),
+            // In insert mode as many lines as the window shows, not a page.
+            (Some(_), "S" | "C") if insert => Some((Command::Screen(dir), By::Wheel)),
             (Some(_), "S" | "C") => Some((
                 Command::Page {
                     down: dir > 0,
@@ -1340,7 +1402,10 @@ impl App {
     /// nothing to make; one that is not is one the predictions after it wait
     /// for Neovim to have drawn. See [`predict`].
     fn predict_command(&mut self, grid: u64, command: Command, by: By, now: Instant) -> bool {
-        let made = self.predict_scroll(grid, command, by, now);
+        let made = match command {
+            Command::Side(side) => self.predict_side(grid, side, by, now),
+            _ => self.predict_scroll(grid, command, by, now),
+        };
         if let (false, Some(p)) = (made, self.predict.as_mut()) {
             p.typed.missed();
         }
@@ -1371,8 +1436,10 @@ impl App {
         // well.
         let mode = self.model.mode_name.as_str();
         let normal = matches!(mode, "normal" | "visual");
+        let insert = matches!(mode, "insert" | "replace");
         let ok = match by {
             By::Keys => normal && p.typed.sure(),
+            By::InsertKeys => insert && p.typed.sure(),
             By::PageWheel => normal && self.model.mouse,
             By::Wheel => {
                 self.model.mouse
@@ -1402,7 +1469,7 @@ impl App {
         else {
             return false;
         };
-        if !view.one_to_one(h as usize) {
+        if !view.one_to_one(h as usize) || self.anim.side_left(grid).is_some() {
             return false;
         }
         // From where the view and the cursor are, the scrolls ahead taken.
@@ -1422,8 +1489,9 @@ impl App {
         if to.top == at.top {
             return false;
         }
-        // Further than a window is a jump Neovim draws afresh.
-        if (to.top - at.top).abs() > h {
+        // Further than two windows is a jump Neovim draws afresh, from
+        // lines the client was never sent.
+        if (to.top - at.top).abs() > 2 * h {
             return false;
         }
         let width = right - left;
@@ -1432,9 +1500,11 @@ impl App {
         let first = match command {
             Command::Line { first, .. } => first,
             Command::Half { .. } | Command::Page { .. } => shape.startofline,
-            Command::Lines(_) => false,
+            Command::Lines(_) | Command::Screen(_) | Command::Side(_) => false,
         };
-        let col = (self.model.cursor.grid == grid && normal && (first || to.cursor != at.cursor))
+        let col = (self.model.cursor.grid == grid
+            && (normal || insert)
+            && (first || to.cursor != at.cursor))
             .then(|| {
                 let text = p.text(win, to.cursor)?;
                 let (_, want) = self.anim.col(grid).unwrap_or_else(|| {
@@ -1445,7 +1515,7 @@ impl App {
                     let v = predict::first_nonblank(text, shape);
                     (v, v)
                 } else {
-                    (predict::landing(text, shape, want), want)
+                    (predict::landing(text, shape, want, insert), want)
                 };
                 let col = (vcol + shape.textoff).checked_sub(shape.leftcol)?;
                 (col < width).then_some((col, want))
@@ -1479,6 +1549,151 @@ impl App {
             self.dirty = true;
         }
         made
+    }
+
+    /// A scroll sideways Neovim will make of window grid `grid`, typed or
+    /// turned `by`: made at once, where the client can say what Neovim will
+    /// make of it. See [`predict_command`](Self::predict_command).
+    fn predict_side(&mut self, grid: u64, side: Side, by: By, now: Instant) -> bool {
+        let Some(p) = self.predict.as_ref().filter(|p| p.active()) else {
+            return false;
+        };
+        if !self.multigrid() || !self.flushed || self.holding(now) {
+            return false;
+        }
+        let mode = Mode::of(&self.model.mode_name);
+        let ok = match by {
+            By::Keys => mode == Mode::Normal && p.typed.sure(),
+            By::Wheel => self.model.mouse && mode != Mode::Other,
+            By::InsertKeys | By::PageWheel => false,
+        };
+        if !ok
+            || !matches!(
+                self.model.layout.get(&grid),
+                Some(Placement {
+                    place: Place::Window { .. },
+                    hidden: false
+                })
+            )
+        {
+            return false;
+        }
+        let (Some(&win), Some(&view), Some(rect)) = (
+            self.model.wins.get(&grid),
+            self.model.viewports.get(&grid),
+            anim::text_rect(&self.model, grid),
+        ) else {
+            return false;
+        };
+        let (top, bot, left, right) = rect;
+        let h = bot - top;
+        let Some(shape) = p
+            .shape(win)
+            .filter(|s| s.predictable && s.line_count == view.line_count)
+        else {
+            return false;
+        };
+        if !view.one_to_one(h) || self.anim.ahead(grid) != (0, 0) {
+            return false;
+        }
+        // From where the view and the cursor are, a scroll sideways ahead
+        // taken: the cursor where it is drawn, in its window; elsewhere, its
+        // window's own, from the column Neovim gives it in bytes.
+        let from = self.anim.side_left(grid).unwrap_or(shape.leftcol);
+        let here = self.model.cursor.grid == grid;
+        let at = if here {
+            let (row, col) = self.anim.cursor_at(&self.model);
+            let (r0, c0) = self.origin_of(grid);
+            let row = (row - r0) as usize;
+            let col = (col - c0) as usize;
+            predict::Across {
+                left: from,
+                line: view.topline + row.saturating_sub(top) as i64,
+                vcol: (col + from).saturating_sub(shape.textoff),
+            }
+        } else {
+            let vcol = p
+                .text(win, view.curline)
+                .map_or(0, |t| predict::vcol_at(t, shape, view.curcol));
+            predict::Across {
+                left: from,
+                line: view.curline,
+                vcol,
+            }
+        };
+        let shown = view.topline..view.topline + view.lines_shown(h) as i64;
+        let Some(to) = predict::across(
+            side,
+            at,
+            right - left,
+            shape,
+            |l| p.text(win, l),
+            shown.clone(),
+        ) else {
+            return false;
+        };
+        if to == at {
+            return true;
+        }
+        let text = |l| p.text(win, l);
+        if !predict::known(at, to, right - left, shape, text, |l| p.cut(win, l), shown) {
+            return false;
+        }
+        let Some(rows) = self.side_rows(grid, to.left) else {
+            return false;
+        };
+        let row = to.line - view.topline;
+        let cursor = (here && (0..h as i64).contains(&row) && to.vcol >= to.left)
+            .then(|| (top + row as usize, shape.textoff + to.vcol - to.left));
+        let until = p.deadline(now);
+        self.anim
+            .side(&self.model, grid, rows, (to.left, until), cursor, now);
+        self.dirty = true;
+        true
+    }
+
+    /// The rows of window grid `grid` as Neovim drew them, moved to show its
+    /// text from display column `to`. See [`predict::shifted`].
+    fn side_rows(&self, grid: u64, to: usize) -> Option<Vec<Vec<Cell>>> {
+        let p = self.predict.as_ref()?;
+        let win = *self.model.wins.get(&grid)?;
+        let view = self.model.viewports.get(&grid)?;
+        let shape = p.shape(win)?;
+        let (top, bot, left, right) = anim::text_rect(&self.model, grid)?;
+        let rows = self.model.grids.get(&grid)?.lines(top, bot, left, right);
+        let lines = view.lines_shown(bot - top);
+        let cursor = (self.model.cursor.grid == grid)
+            .then(|| self.model.cursor.row.checked_sub(top))
+            .flatten();
+        let eob = self.model.groups.get("EndOfBuffer").copied().unwrap_or(0);
+        let look = predict::Look::of(&rows, lines, shape.textoff, cursor, eob);
+        predict::shifted(&rows, shape.leftcol, to, shape, &look, |r| {
+            if r < lines {
+                Some(Some(p.text(win, view.topline + r as i64)?))
+            } else {
+                Some(None)
+            }
+        })
+    }
+
+    /// Neovim has drawn: a window it moved sideways lands the scrolls ahead
+    /// up to it, and one still ahead is drawn again from Neovim's rows.
+    fn landed_sideways(&mut self) {
+        for (win, left) in std::mem::take(&mut self.lefts) {
+            if let Some(p) = self.predict.as_mut() {
+                p.set_leftcol(win, left);
+            }
+            if let Some((&grid, _)) = self.model.wins.iter().find(|(_, w)| **w == win) {
+                self.anim.landed(grid, left);
+            }
+        }
+        for grid in self.anim.sided() {
+            let rows = self
+                .anim
+                .side_left(grid)
+                .and_then(|to| self.side_rows(grid, to));
+            self.anim.refresh_side(grid, rows);
+        }
     }
 
     /// Where a grid is, as the editor laid it out.

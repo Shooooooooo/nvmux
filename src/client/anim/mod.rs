@@ -21,6 +21,7 @@ pub mod layout;
 pub mod motion;
 pub mod raster;
 pub mod scroll;
+pub mod side;
 pub mod smear;
 pub mod spring;
 pub mod switch;
@@ -34,6 +35,7 @@ use self::layout::{Change, Transition};
 use self::motion::Motion;
 pub use self::scroll::Ahead;
 use self::scroll::Scroll;
+use self::side::Side;
 use self::smear::{Rect, Smear};
 use self::switch::Switch;
 use self::vfx::Vfx;
@@ -176,6 +178,8 @@ pub struct Animator {
     smear: Smear,
     vfx: Vfx,
     scrolls: HashMap<u64, Scroll>,
+    /// Windows scrolled sideways ahead of Neovim, by grid.
+    sides: HashMap<u64, Side>,
     motions: HashMap<u64, Motion>,
     /// Split windows on their way from one layout to another.
     transition: Option<Transition>,
@@ -200,6 +204,7 @@ impl Animator {
             smear: Smear::default(),
             vfx: Vfx::default(),
             scrolls: HashMap::new(),
+            sides: HashMap::new(),
             motions: HashMap::new(),
             transition: None,
             switches: HashMap::new(),
@@ -217,6 +222,7 @@ impl Animator {
         self.smear = Smear::default();
         self.vfx.clear();
         self.scrolls.clear();
+        self.sides.clear();
         self.motions.clear();
         self.transition = None;
         self.switches.clear();
@@ -346,7 +352,18 @@ impl Animator {
         }
         for grid in &changes.reshaped {
             self.scrolls.remove(grid);
+            self.sides.remove(grid);
             self.motions.remove(grid);
+        }
+        // A window scrolled sideways ahead that scrolls up or down, or shows
+        // another buffer, is Neovim's to draw.
+        for grid in before
+            .scrolls
+            .iter()
+            .map(|s| &s.grid)
+            .chain(&before.switching)
+        {
+            self.sides.remove(grid);
         }
 
         // Split windows opening, closing or changing size move the way
@@ -568,6 +585,64 @@ impl Animator {
         self.scrolls.get(&grid).and_then(Scroll::col)
     }
 
+    /// Scroll window grid `grid` sideways ahead of Neovim, to first column
+    /// `left`, given up on `until` then: its text rectangle shows `rows`,
+    /// and the cursor is at `cursor` in its grid if it has it. See [`side`].
+    pub fn side(
+        &mut self,
+        model: &Model,
+        grid: u64,
+        rows: Vec<Vec<Cell>>,
+        (left, until): (usize, Instant),
+        cursor: Option<(usize, usize)>,
+        now: Instant,
+    ) {
+        let Some(rect) = text_rect(model, grid) else {
+            return;
+        };
+        let side = self.sides.entry(grid).or_insert_with(|| Side::new(rect));
+        side.push(rows, left, until, cursor);
+        self.cursor_moved(model, false, now);
+    }
+
+    /// The first column window grid `grid`'s view is going to ahead of
+    /// Neovim, if it is.
+    pub fn side_left(&self, grid: u64) -> Option<usize> {
+        self.sides.get(&grid).and_then(Side::left)
+    }
+
+    /// The windows scrolled sideways ahead of Neovim, by grid.
+    pub fn sided(&self) -> Vec<u64> {
+        self.sides.keys().copied().collect()
+    }
+
+    /// Neovim's view of window grid `grid` now starts at column `left`: see
+    /// [`Side::landed`].
+    pub fn landed(&mut self, grid: u64, left: usize) {
+        if let Some(side) = self.sides.get_mut(&grid) {
+            if !side.landed(left) {
+                self.sides.remove(&grid);
+            }
+        }
+    }
+
+    /// What window grid `grid`, scrolled sideways ahead, shows now that
+    /// Neovim has drawn it again — or nothing, for a window it cannot be
+    /// drawn for.
+    pub fn refresh_side(&mut self, grid: u64, rows: Option<Vec<Vec<Cell>>>) {
+        match rows {
+            Some(rows) => {
+                if let Some(side) = self.sides.get_mut(&grid) {
+                    let cursor = side.cursor();
+                    side.refresh(rows, cursor);
+                }
+            }
+            None => {
+                self.sides.remove(&grid);
+            }
+        }
+    }
+
     /// Where the cursor is on the screen: where Neovim put it, or — in a
     /// window scrolled ahead of Neovim — on the line and in the column the
     /// scrolls ahead take it to, moved as far as Neovim's `'scrolloff'` will
@@ -575,6 +650,9 @@ impl Animator {
     pub fn cursor_at(&self, model: &Model) -> (i64, i64) {
         let (row, col) = model.cursor_on_screen();
         let c = model.cursor;
+        if let Some((r, k)) = self.sides.get(&c.grid).and_then(Side::cursor) {
+            return (row - c.row as i64 + r as i64, col - c.col as i64 + k as i64);
+        }
         let Some(s) = self.scrolls.get(&c.grid).filter(|s| s.ahead() != 0) else {
             return (row, col);
         };
@@ -639,7 +717,12 @@ impl Animator {
             || !self.switches.is_empty();
         let frame = moving.then(|| self.last.map_or(now, |last| last + FRAME));
         // A prediction Neovim has not confirmed is given up on in a frame.
-        let expiry = self.scrolls.values().filter_map(Scroll::until).min();
+        let expiry = self
+            .scrolls
+            .values()
+            .filter_map(Scroll::until)
+            .chain(self.sides.values().filter_map(Side::until))
+            .min();
         [frame, self.blink_due(model, now), expiry]
             .into_iter()
             .flatten()
@@ -659,6 +742,8 @@ impl Animator {
             s.expire(now);
             s.step(dt, duration)
         });
+        self.sides
+            .retain(|_, s| s.until().is_some_and(|until| until > now));
         if let Some(w) = self.effects.windows {
             self.motions.retain(|_, m| m.step(dt, w.slide));
         }
@@ -723,7 +808,10 @@ impl View for Animator {
     }
 
     fn scroll(&self, grid: u64) -> Option<&dyn Scrolling> {
-        self.scrolls.get(&grid).map(|s| s as &dyn Scrolling)
+        match self.sides.get(&grid) {
+            Some(side) => Some(side as &dyn Scrolling),
+            None => self.scrolls.get(&grid).map(|s| s as &dyn Scrolling),
+        }
     }
 
     fn over_windows(&self, frame: &mut Frame, model: &Model) {

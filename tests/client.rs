@@ -753,57 +753,79 @@ fn window(term: &Terminal) -> (Vec<String>, (u16, u16)) {
     (rows, term.parser.screen().cursor_position())
 }
 
-/// Every kind of scroll the client predicts, typed or turned over a slow
-/// link to a real Neovim: each is on the screen before Neovim could have
-/// heard of it, and when Neovim's own frame lands, every row of the window
-/// and the cursor are where the prediction had them.
-#[test]
-fn every_scroll_predicted_is_the_one_neovim_makes() {
-    require_nvim!();
-    let scratch = Scratch::new("client-scrolls");
-    let (sock, mut rpc, config) = session(&scratch, "client-scrolls");
-    // Indented by none to three blanks, so that a cursor sent to its line's
-    // first non-blank has somewhere to go.
-    rpc.command(
-        "setlocal noswapfile | \
-         call setline(1, map(range(1, 200), 'repeat(\" \", v:val % 4) . \"line \" . v:val'))",
-    )
-    .expect("setline");
-    // Scrolls jump rather than slide, so what a prediction shows can be read
-    // off the screen at once.
+/// How late the link to Neovim is each way in the tests of scrolls drawn
+/// ahead of it.
+const SLOW: Duration = Duration::from_millis(250);
+
+/// A session whose one window shows the text `setline` puts there, drawn by
+/// a client over a slow link, scrolls jumping rather than sliding so that
+/// what a prediction shows can be read off the screen at once.
+fn drawn_slowly(
+    scratch: &Scratch,
+    tag: &str,
+    setline: &str,
+) -> (nvmux::rpc::Client<std::os::unix::net::UnixStream>, Terminal) {
+    let (sock, mut rpc, config) = session(scratch, tag);
+    rpc.command(&format!("setlocal noswapfile | {setline}"))
+        .expect("setline");
     std::fs::write(&config, "[effects.scroll]\nenabled = false\n").expect("config");
-    let delay = Duration::from_millis(250);
-    let slow = slow_link(&scratch.0.join("link"), &sock, delay);
+    let slow = slow_link(&scratch.0.join("link"), &sock, SLOW);
 
     let mut term = Terminal::spawn(&slow, &config);
     assert!(
-        term.pump_until(Duration::from_secs(20), |s| s.starts_with(" line 1")),
+        term.pump_until(Duration::from_secs(20), |s| s.contains("line 1")),
         "never drawn:\n{}",
         term.text()
     );
     // The agent's lines, and the answer to the attach's fence.
     term.pump_until(Duration::from_secs(3), |_| false);
+    (rpc, term)
+}
 
-    let step = |term: &mut Terminal, name: &str, keys: &[u8]| {
-        let before = window(term);
-        term.type_bytes(keys);
-        // Within one way of the link: Neovim has not even heard of it yet.
-        assert!(
-            term.pump(delay, |t| window(t) != before),
-            "{name} waited for Neovim:\n{}",
-            term.text()
-        );
-        // The rest of the frame, should it have come in two reads.
-        term.pump_until(Duration::from_millis(30), |_| false);
-        let predicted = window(term);
-        // Neovim's own, there and back.
-        term.pump_until(4 * delay, |_| false);
-        assert_eq!(
-            predicted,
-            window(term),
-            "{name}: predicted, then drawn by Neovim"
-        );
-    };
+/// Type `keys`, a scroll the client predicts: it is on the screen before
+/// Neovim could have heard of it, and when Neovim's own frame lands, every
+/// row of the window and the cursor are where the prediction had them.
+fn predicted(term: &mut Terminal, name: &str, keys: &[u8]) {
+    let before = window(term);
+    term.type_bytes(keys);
+    // Within one way of the link: Neovim has not even heard of it yet.
+    assert!(
+        term.pump(SLOW, |t| window(t) != before),
+        "{name} waited for Neovim:\n{}",
+        term.text()
+    );
+    // The rest of the frame, should it have come in two reads.
+    term.pump_until(Duration::from_millis(30), |_| false);
+    let predicted = window(term);
+    // Neovim's own, there and back.
+    term.pump_until(4 * SLOW, |_| false);
+    assert_eq!(
+        predicted,
+        window(term),
+        "{name}: predicted, then drawn by Neovim"
+    );
+}
+
+/// Type `keys`, which the client leaves to Neovim, and wait for it to draw
+/// them.
+fn typed(term: &mut Terminal, keys: &[u8]) {
+    term.type_bytes(keys);
+    term.pump_until(4 * SLOW, |_| false);
+}
+
+/// Every kind of scroll the client predicts, typed or turned over a slow
+/// link to a real Neovim, made as Neovim makes it.
+#[test]
+fn every_scroll_predicted_is_the_one_neovim_makes() {
+    require_nvim!();
+    let scratch = Scratch::new("client-scrolls");
+    // Indented by none to three blanks, so that a cursor sent to its line's
+    // first non-blank has somewhere to go.
+    let (mut rpc, mut term) = drawn_slowly(
+        &scratch,
+        "client-scrolls",
+        "call setline(1, map(range(1, 200), 'repeat(\" \", v:val % 4) . \"line \" . v:val'))",
+    );
     for (name, keys) in [
         ("<C-e>", &b"\x05"[..]),
         ("3<C-e>", b"3\x05"),
@@ -824,28 +846,143 @@ fn every_scroll_predicted_is_the_one_neovim_makes() {
         ("10<C-d>", b"10\x04"),
         ("<C-d> by the new 'scroll'", b"\x04"),
     ] {
-        step(&mut term, name, keys);
+        predicted(&mut term, name, keys);
     }
+
+    // With a count, the line to put at the top, middle or bottom.
+    for (name, keys) in [
+        ("45zt", &b"45zt"[..]),
+        ("30zz", b"30zz"),
+        ("60zb", b"60zb"),
+        ("50z<CR>", b"50z\r"),
+        ("40z.", b"40z."),
+        ("70z-", b"70z-"),
+    ] {
+        predicted(&mut term, name, keys);
+    }
+
+    // Further than a window.
+    for (name, keys) in [
+        ("2<C-f>", &b"2\x06"[..]),
+        ("30<C-e>", b"30\x05"),
+        ("2<C-b>", b"2\x02"),
+        ("25<C-y>", b"25\x19"),
+        ("2<PageDown>", b"2\x1b[6~"),
+    ] {
+        predicted(&mut term, name, keys);
+    }
+
+    // In Insert mode, where the cursor may sit past the end of its line.
+    typed(&mut term, b"A");
+    for (name, keys) in [
+        ("<PageDown> in Insert mode", &b"\x1b[6~"[..]),
+        ("<S-Up> in Insert mode", b"\x1b[1;2A"),
+        ("<S-Down> in Insert mode", b"\x1b[1;2B"),
+        ("<PageUp> in Insert mode", b"\x1b[5~"),
+        ("<C-x><C-e>", b"\x18\x05"),
+        ("<C-x><C-y>", b"\x18\x19"),
+        ("the wheel in Insert mode", b"\x1b[<65;10;5M"),
+        ("the wheel with Shift in Insert mode", b"\x1b[<68;10;5M"),
+    ] {
+        predicted(&mut term, name, keys);
+    }
+    typed(&mut term, b"\x1b");
 
     // With 'scrolloff', and at the end of the buffer.
     rpc.command("set scrolloff=3").expect("scrolloff");
-    term.pump_until(4 * delay, |_| false);
+    term.pump_until(4 * SLOW, |_| false);
     for (name, keys) in [
         ("<C-e>, the cursor kept from the top", &b"\x05"[..]),
         ("<C-f> with 'scrolloff'", b"\x06"),
         ("<C-b> with 'scrolloff'", b"\x02"),
         ("zt with 'scrolloff'", b"zt"),
         ("zb with 'scrolloff'", b"zb"),
+        ("90zt with 'scrolloff'", b"90zt"),
     ] {
-        step(&mut term, name, keys);
+        predicted(&mut term, name, keys);
     }
-    term.type_bytes(b"G");
-    term.pump_until(4 * delay, |_| false);
+    typed(&mut term, b"G");
     for (name, keys) in [
         ("<C-e> past the end", &b"\x05"[..]),
         ("zt on the last line", b"zt"),
         ("<C-b> from the end", b"\x02"),
+        ("2<C-f> to the end", b"2\x06"),
     ] {
-        step(&mut term, name, keys);
+        predicted(&mut term, name, keys);
     }
+}
+
+/// A window that does not wrap, scrolled sideways over a slow link to a real
+/// Neovim: each scroll is on the screen before Neovim could have heard of
+/// it, and is the one Neovim makes.
+#[test]
+fn every_scroll_sideways_predicted_is_the_one_neovim_makes() {
+    require_nvim!();
+    let scratch = Scratch::new("client-sideways");
+    // Lines of every length, from shorter than the window to twice as wide,
+    // their columns told apart by the digits in them.
+    let (mut rpc, mut term) = drawn_slowly(
+        &scratch,
+        "client-sideways",
+        "setlocal nowrap | call setline(1, map(range(1, 200), \
+         'repeat(\" \", v:val % 4) . \"line \" . v:val . \" \" . \
+         repeat(\"0123456789\", (v:val * 7) % 17)'))",
+    );
+    for (name, keys) in [
+        ("zl", &b"zl"[..]),
+        ("5zl", b"5zl"),
+        ("zL", b"zL"),
+        ("zH", b"zH"),
+        ("zh", b"zh"),
+        ("<Right> after z", b"z\x1b[C"),
+    ] {
+        predicted(&mut term, name, keys);
+    }
+    typed(&mut term, b"40l");
+    for (name, keys) in [
+        ("zs", &b"zs"[..]),
+        ("ze", b"ze"),
+        ("the wheel right", b"\x1b[<67;10;5M"),
+        ("the wheel left", b"\x1b[<66;10;5M"),
+        ("the wheel right with Shift", b"\x1b[<71;10;5M"),
+        ("the wheel left with Shift", b"\x1b[<70;10;5M"),
+        ("the wheel right again", b"\x1b[<67;10;5M"),
+    ] {
+        predicted(&mut term, name, keys);
+    }
+
+    // Past the end of the cursor's line, which sends the cursor to the
+    // longest line in view.
+    typed(&mut term, b"0j");
+    for (name, keys) in [
+        (
+            "the wheel right, twice with Shift",
+            &b"\x1b[<71;10;5M\x1b[<71;10;5M"[..],
+        ),
+        ("the wheel left with Shift, there", b"\x1b[<70;10;5M"),
+    ] {
+        predicted(&mut term, name, keys);
+    }
+
+    // Kept columns from the edges.
+    rpc.command("set sidescrolloff=5").expect("sidescrolloff");
+    typed(&mut term, b"0");
+    typed(&mut term, b"30l");
+    for (name, keys) in [
+        ("zs with 'sidescrolloff'", &b"zs"[..]),
+        ("ze with 'sidescrolloff'", b"ze"),
+        ("zl with 'sidescrolloff'", b"10zl"),
+    ] {
+        predicted(&mut term, name, keys);
+    }
+
+    // In Insert mode.
+    typed(&mut term, b"0i");
+    for (name, keys) in [
+        ("the wheel right in Insert mode", &b"\x1b[<67;10;5M"[..]),
+        ("the wheel left in Insert mode", b"\x1b[<66;10;5M"),
+    ] {
+        predicted(&mut term, name, keys);
+    }
+    typed(&mut term, b"\x1b");
 }

@@ -177,40 +177,60 @@ impl Scroll {
                 _ => break,
             }
         }
-        let h = self.current.len();
-        let d = delta.unsigned_abs() as usize;
+        let h = self.current.len() as i64;
         let old = std::mem::replace(&mut self.current, after);
-        if d > h {
-            // Past the whole view: nothing is known between the two, and
-            // only `far` rows of it are animated.
+        if delta.abs() > h && left == delta {
+            // Past the whole view, and not foreseen: nothing is known between
+            // the two, and only `far` rows of it are animated.
             self.above.clear();
             self.below.clear();
             self.ahead.clear();
-            let rows = if self.animate { far.min(h) as f32 } else { 0.0 };
+            let rows = if self.animate {
+                far.min(h as usize) as f32
+            } else {
+                0.0
+            };
             self.spring = Spring::at(if delta > 0 { rows } else { -rows });
             self.shown = self.spring.cells();
             return;
         }
-        if delta > 0 {
-            // The text moved up: its top `d` lines are now the nearest above.
-            for line in old.into_iter().take(d) {
-                self.above.push_front(Some(line));
-            }
-            self.below.drain(..d.min(self.below.len()));
-        } else {
-            for line in old.into_iter().skip(h - d).rev() {
-                self.below.push_front(Some(line));
-            }
-            self.above.drain(..d.min(self.above.len()));
-        }
+        // Every line known, in order — those above from the furthest, the
+        // view as it was, those below — and where the view is now among
+        // them: the lines either side of it are kept either side, however
+        // far it went, a jump further than the view is tall that the client
+        // made ahead of Neovim as well.
+        let above = self.above.len() as i64;
+        let mut known: Vec<Line> = std::mem::take(&mut self.above)
+            .into_iter()
+            .rev()
+            .chain(old.into_iter().map(Some))
+            .chain(std::mem::take(&mut self.below))
+            .collect();
+        let n = known.len() as i64;
+        let at = above + delta;
+        let mut take = |i: i64| {
+            (0..n)
+                .contains(&i)
+                .then(|| known[i as usize].take())
+                .flatten()
+        };
+        // Kept as far as the view could reach, and no further: a view ahead
+        // by twice as much as it is tall, behind by as much again.
+        let keep = 4 * h + 1;
+        self.above = (1..=keep)
+            .map(|k| at - k)
+            .take_while(|i| *i >= 0)
+            .map(&mut take)
+            .collect();
+        self.below = (0..keep)
+            .map(|k| at + h + k)
+            .take_while(|i| *i < n)
+            .map(&mut take)
+            .collect();
         if self.animate {
             self.spring.position =
                 (self.spring.position + left as f32).clamp(-(h as f32), h as f32);
         }
-        // Kept as far as the view could reach, and no further: a view ahead
-        // by twice as much as it is tall, behind by as much again.
-        self.above.truncate(4 * h + 1);
-        self.below.truncate(4 * h + 1);
         self.shown = self.spring.cells();
     }
 
@@ -519,6 +539,25 @@ mod tests {
         assert!(!s.predict(go(11), &mut fill(10, 99)));
         assert!(s.predict(go(10), &mut fill(10, 99)));
         assert_eq!(shows(&s), [20, 21, 22, 23, 24].map(Some));
+    }
+
+    /// A jump further than the window is tall, made ahead of Neovim, is
+    /// landed on as any other: nothing moves when Neovim makes it, and what
+    /// the view passed is kept either side.
+    #[test]
+    fn a_jump_past_the_view_made_ahead_lands_as_well() {
+        let mut s = Scroll::still((0, 5, 0, 1), lines(10..15), false);
+        assert!(s.predict(go(8), &mut fill(10, 99)));
+        assert_eq!(shows(&s), [18, 19, 20, 21, 22].map(Some));
+        s.scrolled(lines(18..23), 8, 1);
+        assert_eq!(s.ahead(), 0);
+        assert_eq!(shows(&s), [18, 19, 20, 21, 22].map(Some));
+        assert!(s.predict(go(-8), &mut fill(18, 99)));
+        assert_eq!(
+            shows(&s),
+            [10, 11, 12, 13, 14].map(Some),
+            "back over what it passed"
+        );
     }
 
     /// Past the whole view, only `far` rows are animated, and drawn blank.
