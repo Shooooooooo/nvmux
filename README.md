@@ -138,29 +138,6 @@ particles and a fading blink can be turned on under `[effects]`. Set
 the terminal can do reaches the editor as Neovim negotiates it, not through
 nvmux.
 
-### Over a slow link
-
-Over ssh, what Neovim draws reaches you a round trip after the key that
-asked for it. A scroll is one of the few things whose outcome nvmux's own
-client can work out for itself, so once the round trip passes about 30 ms it
-scrolls the window at once and lets Neovim catch up — for `<C-e>`, `<C-y>`,
-`<C-d>`, `<C-u>`, `<C-f>`, `<C-b>`, `<PageDown>`, `<PageUp>`, `zt`, `zz`, `zb`
-and the rest of the `z` scrolls, with their counts, and the mouse wheel, with
-Shift or Ctrl a page; in Insert mode for `<PageDown>`, `<PageUp>`,
-`<S-Down>`, `<S-Up>`, `<C-x><C-e>`, `<C-x><C-y>` and the wheel; and sideways,
-in a window that does not wrap, for `zl`, `zh`, `zL`, `zH`, `zs`, `ze` and the
-wheel left and right. Pages typed faster than the link answers keep up: the
-rows a scroll uncovers come from lines the client keeps either side of each
-view — as many pages as a key held down types in a round trip, more the
-slower the link — and a page typed past them shows as soon as its lines
-arrive. They are drawn in the colours tree-sitter and highlights on the
-buffer (a language server's semantic tokens, say) give them, and take on their
-signs, virtual text and any `:syntax` colours when Neovim's own rows arrive.
-It does this only where it can be right — no folds, wrapped lines or virtual
-lines in the way, nothing mapped to the key, no key before it still on its
-way — and whatever Neovim does instead wins. `predict = false` under
-`[client]` turns it off.
-
 ## Configuration
 
 nvmux needs no configuration. An optional TOML file — `$NVMUX_CONFIG` if set,
