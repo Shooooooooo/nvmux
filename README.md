@@ -149,16 +149,17 @@ and the rest of the `z` scrolls, with their counts, and the mouse wheel, with
 Shift or Ctrl a page; in Insert mode for `<PageDown>`, `<PageUp>`,
 `<S-Down>`, `<S-Up>`, `<C-x><C-e>`, `<C-x><C-y>` and the wheel; and sideways,
 in a window that does not wrap, for `zl`, `zh`, `zL`, `zH`, `zs`, `ze` and the
-wheel left and right. Pages typed faster than the link answers keep up, and
-past eight windows ahead of Neovim each shows as soon as its lines arrive. The
+wheel left and right. Pages typed faster than the link answers keep up: the
 rows a scroll uncovers come from lines the client keeps either side of each
-view, in the colours tree-sitter and highlights on the buffer (a language
-server's semantic tokens, say) give them, and take on their signs, virtual
-text and any `:syntax` colours when Neovim's own rows arrive. It does this
-only where it can be right — no folds, wrapped lines or virtual lines in the
-way, nothing mapped to the key, no key before it still on its way — and
-whatever Neovim does instead wins. `predict = false` under `[client]` turns it
-off.
+view — as many pages as a key held down types in a round trip, more the
+slower the link — and a page typed past them shows as soon as its lines
+arrive. They are drawn in the colours tree-sitter and highlights on the
+buffer (a language server's semantic tokens, say) give them, and take on their
+signs, virtual text and any `:syntax` colours when Neovim's own rows arrive.
+It does this only where it can be right — no folds, wrapped lines or virtual
+lines in the way, nothing mapped to the key, no key before it still on its
+way — and whatever Neovim does instead wins. `predict = false` under
+`[client]` turns it off.
 
 ## Configuration
 

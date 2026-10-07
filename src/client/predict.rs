@@ -29,31 +29,38 @@
 //!
 //! — with `'scrolloff'` keeping the cursor in from the edges, and a count
 //! where Neovim takes one; one after another, as fast as they are typed —
-//! further than eight windows ahead of Neovim, as soon as the lines they
+//! as far as thirty-two windows ahead of Neovim, as soon as the lines they
 //! show have come (see `super::anim::scroll::HOLD`).
 //!
 //! Most of the rows a scroll shows are rows the window already shows, moved.
 //! What the client does not have is the lines it uncovers. So the agent the
 //! client leaves in the editor (see `super::AGENT_LUA`) sends it the text of
-//! the lines around each window's view — as far each way as the client may
-//! scroll ahead; as the view moves, only the lines it has not sent, and as
-//! the buffer changes, only the lines that did, which the client splices
-//! into what it has; of a long line, no more than the window could show
-//! ([`known`]) — with what it takes to draw them as the window would
-//! ([`Shape`]), and the colours the editor's own highlighting gives them —
-//! its tree-sitter captures, and the highlights put on the buffer, such as a
-//! language server's semantic tokens — sent again where an edit or a new
-//! parse changes them. A row drawn from that is the line's text and its
-//! number, in those colours over the window's own, and nothing more: no
+//! the lines around each window's view — as far each way as a key held
+//! down pages in a round trip, which is as far ahead of Neovim's view as the
+//! client gets before the lines around Neovim's next view come
+//! ([`Predictor::reach`]), and no more than a few thousand lines in all,
+//! those furthest behind let go; as the view moves, only the lines it has
+//! not sent, and as the buffer changes, only the lines that did, which the
+//! client splices into what it has; of a long line, no more than the window
+//! could show ([`known`]) — with what it takes to draw them as the window
+//! would ([`Shape`]), and the colours the editor's own highlighting gives
+//! them — its tree-sitter captures, and the highlights put on the buffer,
+//! such as a language server's semantic tokens — sent again where an edit or
+//! a new parse changes them. A row drawn from that is the line's text and
+//! its number, in those colours over the window's own, and nothing more: no
 //! signs, no virtual text, no `:syntax` colours, which Neovim cannot say for
 //! lines it has not drawn. It is on the screen for the round trip it takes
 //! Neovim's own row to arrive.
 //!
-//! A buffer that comes into a window is sent two windows each way at first,
-//! the rest a moment later, and pages typed in that moment can outrun the
-//! lines. A scroll that uncovers a line yet to come is made all the same,
-//! and the next from where it goes, but it is drawn only once the line has
-//! come.
+//! What a line costs is Neovim's time more than the link's: its colours,
+//! found by walking its tree-sitter captures, take some 60 µs a line, all of
+//! it holding up Neovim's own redraw and the keys typed meanwhile. So no
+//! more is sent than the round trip needs, and a buffer that comes into a
+//! window is sent two windows each way at first, the rest a moment later, a
+//! few hundred lines at a time. Pages typed in that moment can outrun the
+//! lines, as can pages typed faster than keys repeat over the slowest links.
+//! A scroll that uncovers a line yet to come is made all the same, and the
+//! next from where it goes, but it is drawn only once the line has come.
 //!
 //! # Only where it can be right
 //!
@@ -99,9 +106,20 @@ const GRACE: Duration = Duration::from_millis(250);
 /// How often the round trip is measured again while the user is at work.
 pub const PING_EVERY: Duration = Duration::from_secs(2);
 
-/// The most lines kept for a window. The agent sends fewer — no run of more
-/// than 4000, and no splice of more than 2000 — and this is what keeps a
-/// client from growing should it ever not.
+/// How many pages a second a key held down types, set to repeat as fast as
+/// people set keys to: what the agent keeps lines ahead for (see
+/// [`Predictor::reach`]).
+const PAGES_A_SECOND: u128 = 50;
+
+/// The most windows either side of a view the agent keeps lines for: a round
+/// trip of over 400 ms at [`PAGES_A_SECOND`]. Short of how far a view may be
+/// scrolled ahead at all (`super::anim::scroll::HOLD`), so that pages typed
+/// past the lines on a slower link still are, held until their lines come.
+const MOST_REACH: i64 = 24;
+
+/// The most lines kept for a window. The agent has the client keep fewer —
+/// no more than 4000, and no splice of more than 2000 past that — and this
+/// is what keeps a client from growing should it ever not.
 const MAX_LINES: usize = 8192;
 
 /// What it takes to draw a window's lines as the window would, as the agent
@@ -335,6 +353,22 @@ impl Lines {
         }
         self.tick = s.tick;
         self.cap = self.cap.min(s.cap);
+    }
+
+    /// Keep only lines `from` to `to`, the agent says, of a buffer as it was
+    /// at `tick`: as it keeps its own account. Kept as they were at another
+    /// change, or of another buffer, the lines are not the ones it means,
+    /// and none are to be trusted.
+    fn keep(&mut self, buf: i64, tick: i64, from: i64, to: i64) {
+        if buf != self.buf || tick != self.tick {
+            *self = Lines::default();
+            return;
+        }
+        let from = from.clamp(self.first, self.end());
+        let to = to.clamp(from, self.end());
+        self.text.truncate((to - self.first) as usize);
+        self.text.drain(..(from - self.first) as usize);
+        self.first = from;
     }
 
     fn line(&self, buf: i64, lnum: i64) -> Option<&Line> {
@@ -1471,6 +1505,19 @@ impl Predictor {
         self.on
     }
 
+    /// How many times as far as it is tall the agent is to keep the lines
+    /// either side of a window's view, for the round trip as it is: as many
+    /// pages as a key held down types in a round trip, which is how far the
+    /// client gets ahead of Neovim's view before the lines around Neovim's
+    /// next one come, and two over, for the page in view and the time Neovim
+    /// and the link take besides; no fewer than two, and no more than
+    /// [`MOST_REACH`].
+    pub fn reach(&self) -> i64 {
+        let rtt = self.srtt.unwrap_or_default().as_micros();
+        let pages = (rtt * PAGES_A_SECOND).div_ceil(1_000_000);
+        i64::try_from(pages).map_or(MOST_REACH, |p| (p + 2).clamp(2, MOST_REACH))
+    }
+
     /// When a prediction made `now` is given up on, unconfirmed.
     pub fn deadline(&self, now: Instant) -> Instant {
         now + self.srtt.unwrap_or_default() * 2 + GRACE
@@ -1544,6 +1591,16 @@ impl Predictor {
                         text,
                         cap,
                     });
+                }
+                true
+            }
+            "keep" => {
+                if let (Some(win), Some(buf), Some(tick), Some(from), Some(to)) =
+                    (int(0), int(1), int(2), int(3), int(4))
+                {
+                    if let Some(lines) = self.lines.get_mut(&win) {
+                        lines.keep(buf, tick, from, to);
+                    }
                 }
                 true
             }
@@ -2589,6 +2646,69 @@ mod tests {
         // Made to another change than the one kept: nothing to trust.
         said(&mut p, "splice", splice(3, 12, 6, 7, 1, &["r"]));
         assert_eq!(kept(&p), []);
+    }
+
+    /// The agent says which of the lines kept to keep, as it lets go of
+    /// those furthest from where the view is going: the rest go, and what
+    /// it sends next joins what is left. Said of the buffer at another
+    /// change than the one kept, it leaves none.
+    #[test]
+    fn only_the_lines_the_agent_keeps_are_kept() {
+        let mut p = Predictor::default();
+        said(&mut p, "shape", shape_args(100));
+        said(
+            &mut p,
+            "lines",
+            lines(1000, 5, 10, &["a", "b", "c", "d", "e"], true),
+        );
+        let keep = |tick: i64, from: i64, to: i64| -> Vec<Value> {
+            vec![1000.into(), 1.into(), tick.into(), from.into(), to.into()]
+        };
+        let kept = |p: &Predictor| -> Vec<(i64, String)> {
+            (0..30)
+                .filter_map(|l| p.text(1000, l).map(|t| (l, t.to_string())))
+                .collect()
+        };
+        let at = |first: i64, text: &[&str]| -> Vec<(i64, String)> {
+            text.iter()
+                .enumerate()
+                .map(|(i, t)| (first + i as i64, t.to_string()))
+                .collect()
+        };
+        // The first two go, and the lines after the last come.
+        said(&mut p, "keep", keep(5, 12, 15));
+        said(&mut p, "lines", lines(1000, 5, 15, &["f", "g"], false));
+        assert_eq!(kept(&p), at(12, &["c", "d", "e", "f", "g"]));
+        // The other way: the last go, and lines before the first come.
+        said(&mut p, "keep", keep(5, 12, 14));
+        said(&mut p, "lines", lines(1000, 5, 11, &["b"], false));
+        assert_eq!(kept(&p), at(11, &["b", "c", "d"]));
+        // Nothing past what is kept is kept.
+        said(&mut p, "keep", keep(5, 0, 99));
+        assert_eq!(kept(&p), at(11, &["b", "c", "d"]));
+        // Of another change: nothing to trust.
+        said(&mut p, "keep", keep(6, 11, 13));
+        assert_eq!(kept(&p), []);
+    }
+
+    /// The lines kept reach as far either side as a key held down pages in
+    /// a round trip, and two windows more; no fewer than two, nor more than
+    /// [`MOST_REACH`].
+    #[test]
+    fn lines_are_kept_as_far_as_a_round_trip_pages() {
+        let reach = |ms: u64| {
+            let mut p = Predictor::default();
+            p.sample(Duration::from_millis(ms));
+            p.reach()
+        };
+        assert_eq!(Predictor::default().reach(), 2, "not yet measured");
+        assert_eq!(reach(0), 2);
+        assert_eq!(reach(10), 3, "half a page");
+        assert_eq!(reach(100), 7);
+        assert_eq!(reach(200), 12);
+        assert_eq!(reach(300), 17);
+        assert_eq!(reach(440), MOST_REACH);
+        assert_eq!(reach(5000), MOST_REACH);
     }
 
     /// Runs of lines join what is kept where they touch it, at the same

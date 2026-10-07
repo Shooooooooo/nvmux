@@ -36,21 +36,22 @@ use crate::client::grid::Cell;
 /// A line of a scroll's rectangle, or `None` for one nothing is known of.
 type Line = Option<Vec<Cell>>;
 
-/// How many times as far as it is tall a view is drawn ahead of Neovim from
-/// lines the client has before it needs them: the agent sends lines that
-/// far either side of a view (see `super::super::AGENT_LUA`). Pages typed in
-/// a round trip of a slow link, a key held down and repeating among them,
-/// are as many.
-pub const REACH: i64 = 8;
+/// How many times as far as it is tall a view keeps the lines either side
+/// of it, once Neovim has scrolled it — those Neovim drew, and those drawn
+/// from the agent's — for a view coming back over them; and further, the
+/// lines the scrolls still ahead of Neovim's show.
+const KEEP: i64 = 8;
 
 /// How many times as far as it is tall a view may be scrolled ahead of
-/// Neovim at all. Past [`REACH`], a scroll is made but held — the next made
-/// from where it goes, Neovim's view moving on meanwhile, and the agent's
-/// lines with it — and drawn once its lines have come, rather than refused,
-/// which would leave every scroll after it waiting a round trip for Neovim
-/// until the keys stopped. This only keeps a client that somehow outran
-/// Neovim for good from growing without end.
-pub const HOLD: i64 = 4 * REACH;
+/// Neovim at all. Past the lines the client has, a scroll is made but held —
+/// the next made from where it goes, Neovim's view moving on meanwhile, and
+/// the agent's lines with it — and drawn once its lines have come, rather
+/// than refused, which would leave every scroll after it waiting a round
+/// trip for Neovim until the keys stopped. This only keeps a client that
+/// somehow outran Neovim for good from growing without end. The agent keeps
+/// lines less far either side than this (see
+/// `crate::client::predict::Predictor::reach`).
+pub const HOLD: i64 = 32;
 
 /// What draws a line a view scrolled ahead uncovers, counted from the top
 /// of the rectangle as Neovim has it: `h` is the first line below it, `-1`
@@ -280,6 +281,7 @@ impl Scroll {
         // far it went, a jump further than the view is tall that the client
         // made ahead of Neovim as well.
         let above = self.above.len() as i64;
+        let (lo, hi) = self.extent();
         let mut known: Vec<Line> = std::mem::take(&mut self.above)
             .into_iter()
             .rev()
@@ -294,15 +296,16 @@ impl Scroll {
                 .then(|| known[i as usize].take())
                 .flatten()
         };
-        // Kept as far as the view could reach, and no further: a view ahead
-        // by [`REACH`] times as much as it is tall, behind by as much again.
-        let keep = 2 * REACH * h + 1;
-        self.above = (1..=keep)
+        // Kept as far as a view is usually ahead, and behind by as much again
+        // — further, as far as the scrolls still ahead go, which may already
+        // be drawn — and no further.
+        let keep = 2 * KEEP * h + 1;
+        self.above = (1..=keep.max(-lo))
             .map(|k| at - k)
             .take_while(|i| *i >= 0)
             .map(&mut take)
             .collect();
-        self.below = (0..keep)
+        self.below = (0..keep.max(hi))
             .map(|k| at + h + k)
             .take_while(|i| *i < n)
             .map(&mut take)
@@ -368,11 +371,7 @@ impl Scroll {
     /// The lines either side as far as the scrolls ahead go, from `fill`.
     fn reach(&mut self, fill: &mut Fill) {
         let h = self.current.len() as i64;
-        let (mut lo, mut hi, mut at) = (0, 0, 0);
-        for a in &self.ahead {
-            at += a.rows;
-            (lo, hi) = (lo.min(at), hi.max(at));
-        }
+        let (lo, hi) = self.extent();
         while (self.below.len() as i64) < hi {
             let line = fill(h + self.below.len() as i64);
             self.below.push_back(line);
@@ -381,6 +380,17 @@ impl Scroll {
             let line = fill(-1 - self.above.len() as i64);
             self.above.push_back(line);
         }
+    }
+
+    /// How far above the rectangle's top the scrolls ahead go, at most —
+    /// nought or below — and how far below it, nought or above.
+    fn extent(&self) -> (i64, i64) {
+        let (mut lo, mut hi, mut at) = (0, 0, 0);
+        for a in &self.ahead {
+            at += a.rows;
+            (lo, hi) = (lo.min(at), hi.max(at));
+        }
+        (lo, hi)
     }
 
     /// Whether the lines a view ahead by `rows` shows are all known.
@@ -687,7 +697,7 @@ mod tests {
         // Further than lines have come: held, not refused, the scrolls after
         // it made from where it goes; drawn as the lines come.
         let mut s = Scroll::still((0, 5, 0, 1), lines(10..15), false);
-        let reach = 5 * REACH;
+        let reach = 5 * KEEP;
         assert!(
             s.predict(go(reach), &mut fill(10, 14 + reach as u32), &mut |_, _| {
                 None

@@ -172,8 +172,8 @@ pub struct ClientSettings {
     /// and in the colours tree-sitter and highlights on the buffer give them
     /// but not `:syntax`'s; and the agent the client leaves in the editor
     /// sends the text of the lines around each window's view over the link,
-    /// and those colours, as the view moves. Off, every scroll waits for
-    /// Neovim.
+    /// and those colours, as the view moves — more of them the slower the
+    /// link. Off, every scroll waits for Neovim.
     pub predict: bool,
 }
 

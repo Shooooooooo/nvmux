@@ -1093,8 +1093,10 @@ fn pages_typed_further_ahead_than_lines_go_wait_only_for_them() {
         "client-run",
         "call setline(1, map(range(1, 2000), '\"line \" . v:val'))",
     );
-    // A round trip types ten pages, more than the eight windows of lines.
-    let late = pages(&mut rpc, &mut term, Duration::from_millis(50), 16);
+    // A round trip of this link types fifty pages, more than the most
+    // windows of lines it keeps either way (twenty-four, some twenty-seven
+    // pages); thirty-two are as far ahead as a view may go.
+    let late = pages(&mut rpc, &mut term, Duration::from_millis(10), 32);
     for (k, late) in late.iter().enumerate() {
         assert!(
             late.is_some_and(|l| l < 2 * SLOW),
@@ -1102,6 +1104,37 @@ fn pages_typed_further_ahead_than_lines_go_wait_only_for_them() {
             k + 1
         );
     }
+}
+
+/// A run of pages longer than the lines the client keeps lets go of those
+/// furthest behind rather than start again from two windows: every page of
+/// it is on the screen before Neovim could have heard of it. And edits after
+/// it, among the lines kept, are drawn as Neovim draws them.
+#[test]
+fn a_long_run_of_pages_lets_go_of_the_lines_behind() {
+    require_nvim!();
+    let scratch = Scratch::new("client-long-run");
+    let (mut rpc, mut term, _) = drawn_slowly(
+        &scratch,
+        "client-long-run",
+        "call setline(1, map(range(1, 6000), '\"line \" . v:val'))",
+    );
+    // Past the 4000 lines the client keeps at most, before the end.
+    let late = pages(&mut rpc, &mut term, Duration::from_millis(30), 200);
+    for (k, late) in late.iter().enumerate() {
+        assert!(
+            late.is_some_and(|l| l < SLOW),
+            "page {} waited: {late:?}",
+            k + 1
+        );
+    }
+    // Above the view, among the lines kept, and in it.
+    rpc.command("call setline(3990, 'edited 3990') | call append(4005, ['new a', 'new b'])")
+        .expect("edit");
+    term.pump_until(4 * SLOW, |_| false);
+    predicted(&mut term, "<C-b> over lines edited", b"\x02");
+    predicted(&mut term, "<C-f> back", b"\x06");
+    predicted(&mut term, "<C-f> past them", b"\x06");
 }
 
 /// An edit reaches the client as the lines it changed, not as every line the
