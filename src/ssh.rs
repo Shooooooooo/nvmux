@@ -194,14 +194,16 @@ fn cancel_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<Strin
 /// shell:
 ///
 /// ```text
-/// ssh -T <host> exec "${SHELL:-/bin/bash}" -l -c 'exec sh -s' nvmux
+/// ssh -T <host> exec sh -c '... exec "${SHELL:-/bin/bash}" -l -c "exec sh -s" ...' nvmux
 /// ```
 ///
 /// A login shell because `ssh host cmd` does not read `.zprofile`, so `nvim` is
-/// off `$PATH` on most real setups. `$SHELL` expands on the *remote* side —
-/// [`shell::login_shell_wrapper`] is the one place that spells this, so the
-/// tested form and the shipped form are the same string. It is paid once per
-/// host: the scripts, and their arguments, travel down this shell's stdin.
+/// off `$PATH` on most real setups. `$SHELL` expands on the *remote* side, in a
+/// POSIX `sh` rather than in the login shell sshd hands the command to, which
+/// may be fish or tcsh — [`shell::login_shell_wrapper`] is the one place that
+/// spells this, so the tested form and the shipped form are the same string. It
+/// is paid once per host: the scripts, and their arguments, travel down this
+/// shell's stdin.
 ///
 /// `-T`, because that stdin is the command stream: a host with `RequestTTY
 /// force` in its config would otherwise get a pty, and a pty echoes every
@@ -225,10 +227,11 @@ fn shell_args_with(mut args: Vec<String>, host: &str) -> Vec<String> {
     args
 }
 
-/// What the login shell is told to run. `exec`, so the login shell is gone once
-/// `sh` is up: nothing of its own — a `.bash_logout`, say — runs when the stream
-/// closes, and nothing of it sits between ssh and the shell. `nvmux` is that
-/// login shell's `$0`, which is how it shows up in a process listing.
+/// What the login shell is told to run. `exec` at every step, so each shell is
+/// gone once the next is up: nothing of the login shell's own — a
+/// `.bash_logout`, say — runs when the stream closes, and nothing of it sits
+/// between ssh and the shell. `nvmux` is the `$0` of the `sh` that looks up
+/// `$SHELL`, which is how it shows up in a process listing.
 fn remote_shell_command() -> String {
     format!("{} nvmux", shell::login_shell_wrapper("exec sh -s"))
 }
@@ -833,18 +836,17 @@ mod tests {
         let args = shell_args("myhost", Path::new(CTL));
         let remote = args.last().expect("remote command");
         assert!(
-            remote.contains("${SHELL:-/bin/bash}"),
-            "no login shell: {remote}"
+            remote.contains(r#" -l -c "exec sh -s""#),
+            "scripts must arrive on stdin of a login shell, with that shell out of the way: {remote}"
         );
-        assert!(remote.contains(" -l -c "), "not a login shell: {remote}");
+        assert!(remote.ends_with(" nvmux"), "the sh's $0: {remote}");
+        // $SHELL must expand remotely and in sh, which is what reads it: the
+        // login shell passes the single-quoted word along untouched. And it
+        // must be double-quoted there, or a value with a space word-splits.
         assert!(
-            remote.contains("exec sh -s"),
-            "scripts must arrive on stdin, with the login shell out of the way: {remote}"
+            remote.starts_with("exec sh -c '"),
+            "the login shell would expand $SHELL itself: {remote}"
         );
-        assert!(remote.ends_with(" nvmux"), "the login shell's $0: {remote}");
-        // $SHELL must expand remotely, so it must not be single-quoted — but it
-        // must be double-quoted, or a value with a space word-splits there.
-        assert!(!remote.contains("'${SHELL"), "SHELL was quoted: {remote}");
         assert!(
             remote.contains(r#""${SHELL:-/bin/bash}""#),
             "SHELL must be double-quoted: {remote}"
@@ -882,30 +884,82 @@ mod tests {
         assert!(args.iter().any(|a| a == "-T"));
     }
 
-    /// The whole chain, locally: the command ssh would hand the remote login
-    /// shell, run by a shell here, with scripts and arguments fed to it exactly
-    /// as the transport feeds them.
+    /// The first `name` on `$PATH`.
+    fn which(name: &str) -> Option<PathBuf> {
+        std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+            .map(|d| d.join(name))
+            .find(|c| c.is_file())
+    }
+
+    /// The whole chain, locally, under every login shell this machine has: the
+    /// command ssh would hand the remote login shell, run as sshd runs it —
+    /// `<login shell> -c <command>`, with `$SHELL` naming that shell — and fed
+    /// scripts and arguments exactly as the transport feeds them.
+    ///
+    /// The login shell parses the outermost layer, and fish and tcsh reject
+    /// POSIX syntax there, so `/bin/sh` alone proves nothing. Each shell's own
+    /// login profile sets a variable the script reads back, which is what the
+    /// login shell is for: `nvim` on `$PATH`. The csh family cannot be a login
+    /// shell and run a command too, so for it that is `.cshrc`. A shell this
+    /// machine lacks is skipped.
     #[test]
-    fn script_arguments_survive_shell_metacharacters() {
-        let args = shell_args("h", Path::new(CTL));
-        let remote = args.last().expect("remote").clone();
-        // What sshd does with the command: hand it to a shell. Minus the
-        // `exec`s, so the login shell and `sh` are this test's children rather
-        // than its replacements.
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg(remote.replace("exec ", ""));
-        let mut shell = proc::Shell::start(&mut cmd, "as sshd would").expect("start");
-        let out = shell
-            .run(
-                r#"printf '[%s]' "$1" "$2" "$3""#,
-                &["my project", "it's", "$(id)"],
-            )
-            .expect("the shell is alive");
-        assert_eq!(
-            out.stdout, "[my project][it's][$(id)]",
-            "arguments were mangled or evaluated (stderr: {})",
-            out.stderr
-        );
+    fn scripts_run_under_every_login_shell() {
+        let home = crate::test_support::scratch_dir("ssh-login-shells");
+        std::fs::create_dir_all(home.join(".config/fish")).expect("fish config dir");
+        for (file, text) in [
+            (".profile", "NVMUX_PROFILE=profile; export NVMUX_PROFILE\n"),
+            (".zprofile", "export NVMUX_PROFILE=zprofile\n"),
+            (
+                ".config/fish/config.fish",
+                "status is-login; and set -gx NVMUX_PROFILE fish-login\n",
+            ),
+            (".cshrc", "setenv NVMUX_PROFILE cshrc\n"),
+        ] {
+            std::fs::write(home.join(file), text).expect("write a profile");
+        }
+        let remote = remote_shell_command();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+
+        for (name, profile) in [
+            ("sh", "profile"),
+            ("dash", "profile"),
+            ("bash", "profile"),
+            ("ksh", "profile"),
+            ("mksh", "profile"),
+            ("zsh", "zprofile"),
+            ("fish", "fish-login"),
+            ("tcsh", "cshrc"),
+            ("csh", "cshrc"),
+        ] {
+            let Some(login_shell) = which(name) else {
+                eprintln!("skipping {name}: not on $PATH");
+                continue;
+            };
+            let mut cmd = Command::new(&login_shell);
+            cmd.arg("-c")
+                .arg(&remote)
+                .env_clear()
+                .env("PATH", &path)
+                .env("HOME", &home)
+                .env("SHELL", &login_shell)
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("XDG_DATA_HOME", home.join(".local/share"));
+            let mut shell = proc::Shell::start(&mut cmd, name).expect("start");
+            let out = shell
+                .run(
+                    r#"printf '[%s]' "$NVMUX_PROFILE" "$1" "$2" "$3""#,
+                    &["my project", "it's", "$(id)"],
+                )
+                .unwrap_or_else(|died| panic!("{died}: {}\nremote: {remote}", died.stderr));
+            assert_eq!(
+                out.stdout,
+                format!("[{profile}][my project][it's][$(id)]"),
+                "under {name}: no profile, or arguments mangled (stderr: {})",
+                out.stderr
+            );
+        }
     }
 
     #[test]
