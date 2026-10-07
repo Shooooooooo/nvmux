@@ -81,9 +81,9 @@
 //! editor's text under them dims away, and sinking back as it returns.
 //!
 //! The rectangle is therefore never a hole for anything to fill. The repaint
-//! that has always followed the notice still runs, because the shadow carries
-//! colours and not decoration and an italic would come back plain, but it is
-//! correction now rather than restoration — and where it cannot be served at
+//! that has always followed the notice still runs, because the shadow holds
+//! less than the client draws — no undercurl, no strikethrough — and those
+//! would come back plain, but it is correction now rather than restoration — and where it cannot be served at
 //! all, which is a server busy or at a prompt, or a terminal whose client
 //! ignores the resize nudge, the screen has already been put back.
 //!

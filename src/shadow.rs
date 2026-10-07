@@ -152,8 +152,15 @@ pub struct Over {
     pub rows: Vec<String>,
 }
 
-/// A cell as a frame paints it: its interpolated colours and the two
-/// attributes that survive a fade. What one frame compares against the last.
+/// A cell as a frame paints it: its interpolated colours and the attributes
+/// that change how its glyph is drawn. What one frame compares against the
+/// last.
+///
+/// The attributes are every one the parser holds, inverse aside, which is
+/// resolved into the colours. A fade that dropped one would draw the screen
+/// in the wrong shape for its whole length and snap back to the right one
+/// when the client's own bytes landed — italic text dissolving in upright,
+/// say, then leaning over as the fade ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Painted {
     fg: Rgb,
@@ -161,6 +168,8 @@ struct Painted {
     bg: Option<Rgb>,
     bold: bool,
     dim: bool,
+    italic: bool,
+    underline: bool,
 }
 
 /// The session's screen, as far as its bytes have said.
@@ -519,6 +528,8 @@ impl Shadow {
             bg: None,
             bold: false,
             dim: false,
+            italic: false,
+            underline: false,
         };
         // What the stream's SGR says, carried across rows as `frame` carries
         // it, and where the cursor is known to be after the last cell written.
@@ -657,10 +668,15 @@ fn write_colour(out: &mut Vec<u8>, colour: vt100::Color, base: u8, bright: u8, e
 /// What a cell is, `t` of the way to the background.
 ///
 /// A blank cell has no foreground to speak of, so it is given the background
-/// as one: then its `Painted` does not change from frame to frame and the
-/// diff leaves it alone. Inverse video is applied here — the cell's colours
-/// swapped, a default background standing in as the terminal's background
-/// colour — so the terminal is never asked to invert an interpolated pair.
+/// as one, and no attributes: then its `Painted` does not change from frame to
+/// frame and the diff leaves it alone. Blank is a cell nothing was written to
+/// since it was erased; a space the session wrote is a glyph like any other,
+/// which is how an underline under one is kept — Neovim writes spaces for an
+/// underlined stretch, since terminals do not underline an erase.
+///
+/// Inverse video is applied here — the cell's colours swapped, a default
+/// background standing in as the terminal's background colour — so the
+/// terminal is never asked to invert an interpolated pair.
 fn resolve(cell: Option<&vt100::Cell>, palette: &Palette, t: f32) -> Painted {
     let Some(cell) = cell else {
         return Painted {
@@ -668,6 +684,8 @@ fn resolve(cell: Option<&vt100::Cell>, palette: &Palette, t: f32) -> Painted {
             bg: None,
             bold: false,
             dim: false,
+            italic: false,
+            underline: false,
         };
     };
     let fg = match cell.fgcolor() {
@@ -695,6 +713,8 @@ fn resolve(cell: Option<&vt100::Cell>, palette: &Palette, t: f32) -> Painted {
         bg: bg.map(|b| b.lerp(palette.bg, t)),
         bold: cell.bold() && !blank,
         dim: cell.dim() && !blank,
+        italic: cell.italic() && !blank,
+        underline: cell.underline() && !blank,
     }
 }
 
@@ -755,6 +775,12 @@ fn write_sgr(out: &mut Vec<u8>, p: Painted) {
     }
     if p.dim {
         out.extend_from_slice(b";2");
+    }
+    if p.italic {
+        out.extend_from_slice(b";3");
+    }
+    if p.underline {
+        out.extend_from_slice(b";4");
     }
     let _ = write!(out, ";38;2;{};{};{}", p.fg.0, p.fg.1, p.fg.2);
     if let Some(bg) = p.bg {
@@ -1320,16 +1346,51 @@ mod tests {
         assert!(!text(&s.frame(0.5, &palette(), Cursor::Hidden)).contains(";7"));
     }
 
-    /// Bold and dim survive; italic and underline do not, since a fade frame
-    /// carries colours, not decoration.
+    /// Bold, dim, italic and underline survive, on every frame of a fade: one
+    /// dropped would have the text dissolve in the wrong shape and snap to the
+    /// right one as the client's own bytes landed — italic text coming in
+    /// upright, say, and leaning over as the fade ended.
     #[test]
-    fn bold_and_dim_survive_and_underline_does_not() {
+    fn every_attribute_the_grid_holds_survives_a_fade() {
         let mut s = Shadow::new(1, 8);
-        s.feed(b"\x1b[1mb\x1b[0;2md\x1b[0;4mu");
-        let sgrs = sgrs(&s.frame(0.5, &palette(), Cursor::Hidden));
-        assert!(sgrs.iter().any(|sgr| sgr.starts_with("0;1;38")), "{sgrs:?}");
-        assert!(sgrs.iter().any(|sgr| sgr.starts_with("0;2;38")), "{sgrs:?}");
-        assert!(!sgrs.iter().any(|sgr| sgr.contains(";4;")), "{sgrs:?}");
+        s.feed(b"\x1b[1mb\x1b[0;2md\x1b[0;3mi\x1b[0;4mu\x1b[0;3;4mx");
+        for t in [1.0, 0.5, 0.0] {
+            s.invalidate();
+            let cells = painted_cells(&s.frame(t, &palette(), Cursor::Hidden));
+            let sgr = |glyph: &str| {
+                cells
+                    .iter()
+                    .find(|(_, _, text)| text == glyph)
+                    .map(|(_, sgr, _)| sgr.clone())
+                    .unwrap_or_else(|| panic!("{glyph:?} not painted at {t}: {cells:?}"))
+            };
+            assert!(sgr("b").starts_with("0;1;38;"), "bold at {t}");
+            assert!(sgr("d").starts_with("0;2;38;"), "dim at {t}");
+            assert!(sgr("i").starts_with("0;3;38;"), "italic at {t}");
+            assert!(sgr("u").starts_with("0;4;38;"), "underline at {t}");
+            assert!(sgr("x").starts_with("0;3;4;38;"), "both at {t}");
+        }
+    }
+
+    /// An underline is painted under the spaces the session wrote with it —
+    /// how Neovim underlines a stretch of blanks — and not under an erase,
+    /// which a terminal never underlines whatever the pen says. The grid
+    /// keeps the pen on an erased cell all the same, so it is the frame that
+    /// has to tell the two apart.
+    #[test]
+    fn an_underline_is_painted_under_written_spaces_and_not_under_an_erase() {
+        let mut s = Shadow::new(1, 4);
+        s.feed(b"\x1b[3;4m  \x1b[K");
+        let cells = painted_cells(&s.frame(0.5, &palette(), Cursor::Hidden));
+        let at = |col: usize| {
+            cells
+                .iter()
+                .find(|(at, _, _)| *at == (1, col))
+                .map(|(_, sgr, _)| sgr.clone())
+                .unwrap_or_else(|| panic!("column {col} not painted: {cells:?}"))
+        };
+        assert!(at(1).starts_with("0;3;4;38;"), "a written space: {}", at(1));
+        assert_eq!(at(3), "0;38;2;0;0;0", "an erased cell");
     }
 
     /// What Neovim does on the way in — the alternate screen, a clear, a

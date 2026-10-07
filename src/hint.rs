@@ -380,10 +380,11 @@ impl Bar {
 /// The shadow's copy of those cells is the only one anywhere once the terminal
 /// has been written over, and at `t = 1.0` a composite is that copy with none of
 /// the overlay left in it — an erase that is exact, local, and costs no round
-/// trip. What it cannot carry is decoration: the grid resolves colours, bold and
-/// dim, so an italic or an underline on the row comes back plain. For one row
-/// that Neovim keeps mostly blank that is the right trade against asking the
-/// server on every mistyped chord.
+/// trip. What it cannot carry is what the grid does not hold: colours, bold,
+/// dim, italic and a plain underline come back, but an undercurl or a
+/// strikethrough on the row comes back plain. For one row that Neovim keeps
+/// mostly blank that is the right trade against asking the server on every
+/// mistyped chord.
 ///
 /// Failing a shadow — the fade off, `[effects.fade] session = false`, a terminal that
 /// never said what its colours are — or a shadow whose parser has been retired,
