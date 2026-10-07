@@ -745,3 +745,107 @@ fn a_turn_of_the_wheel_over_a_slow_link_scrolls_before_neovim_answers() {
         "it moved back but for the edit: {seen:?}"
     );
 }
+
+/// The rows of the window and where the cursor is: what a prediction must
+/// get right.
+fn window(term: &Terminal) -> (Vec<String>, (u16, u16)) {
+    let rows = term.text().lines().take(22).map(String::from).collect();
+    (rows, term.parser.screen().cursor_position())
+}
+
+/// Every kind of scroll the client predicts, typed or turned over a slow
+/// link to a real Neovim: each is on the screen before Neovim could have
+/// heard of it, and when Neovim's own frame lands, every row of the window
+/// and the cursor are where the prediction had them.
+#[test]
+fn every_scroll_predicted_is_the_one_neovim_makes() {
+    require_nvim!();
+    let scratch = Scratch::new("client-scrolls");
+    let (sock, mut rpc, config) = session(&scratch, "client-scrolls");
+    // Indented by none to three blanks, so that a cursor sent to its line's
+    // first non-blank has somewhere to go.
+    rpc.command(
+        "setlocal noswapfile | \
+         call setline(1, map(range(1, 200), 'repeat(\" \", v:val % 4) . \"line \" . v:val'))",
+    )
+    .expect("setline");
+    // Scrolls jump rather than slide, so what a prediction shows can be read
+    // off the screen at once.
+    std::fs::write(&config, "[effects.scroll]\nenabled = false\n").expect("config");
+    let delay = Duration::from_millis(250);
+    let slow = slow_link(&scratch.0.join("link"), &sock, delay);
+
+    let mut term = Terminal::spawn(&slow, &config);
+    assert!(
+        term.pump_until(Duration::from_secs(20), |s| s.starts_with(" line 1")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    // The agent's lines, and the answer to the attach's fence.
+    term.pump_until(Duration::from_secs(3), |_| false);
+
+    let step = |term: &mut Terminal, name: &str, keys: &[u8]| {
+        let before = window(term);
+        term.type_bytes(keys);
+        // Within one way of the link: Neovim has not even heard of it yet.
+        assert!(
+            term.pump(delay, |t| window(t) != before),
+            "{name} waited for Neovim:\n{}",
+            term.text()
+        );
+        // The rest of the frame, should it have come in two reads.
+        term.pump_until(Duration::from_millis(30), |_| false);
+        let predicted = window(term);
+        // Neovim's own, there and back.
+        term.pump_until(4 * delay, |_| false);
+        assert_eq!(
+            predicted,
+            window(term),
+            "{name}: predicted, then drawn by Neovim"
+        );
+    };
+    for (name, keys) in [
+        ("<C-e>", &b"\x05"[..]),
+        ("3<C-e>", b"3\x05"),
+        ("<C-y>", b"\x19"),
+        ("<C-d>", b"\x04"),
+        ("<C-u>", b"\x15"),
+        ("<C-f>", b"\x06"),
+        ("<C-b>", b"\x02"),
+        ("<PageDown>", b"\x1b[6~"),
+        ("<S-Up>", b"\x1b[1;2A"),
+        ("zt", b"zt"),
+        ("zz", b"zz"),
+        ("zb", b"zb"),
+        ("z<CR>", b"z\r"),
+        ("z-", b"z-"),
+        ("the wheel with Shift", b"\x1b[<69;10;5M"),
+        ("the wheel", b"\x1b[<65;10;5M"),
+        ("10<C-d>", b"10\x04"),
+        ("<C-d> by the new 'scroll'", b"\x04"),
+    ] {
+        step(&mut term, name, keys);
+    }
+
+    // With 'scrolloff', and at the end of the buffer.
+    rpc.command("set scrolloff=3").expect("scrolloff");
+    term.pump_until(4 * delay, |_| false);
+    for (name, keys) in [
+        ("<C-e>, the cursor kept from the top", &b"\x05"[..]),
+        ("<C-f> with 'scrolloff'", b"\x06"),
+        ("<C-b> with 'scrolloff'", b"\x02"),
+        ("zt with 'scrolloff'", b"zt"),
+        ("zb with 'scrolloff'", b"zb"),
+    ] {
+        step(&mut term, name, keys);
+    }
+    term.type_bytes(b"G");
+    term.pump_until(4 * delay, |_| false);
+    for (name, keys) in [
+        ("<C-e> past the end", &b"\x05"[..]),
+        ("zt on the last line", b"zt"),
+        ("<C-b> from the end", b"\x02"),
+    ] {
+        step(&mut term, name, keys);
+    }
+}

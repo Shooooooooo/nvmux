@@ -519,10 +519,10 @@ impl Animator {
         }
     }
 
-    /// Scroll window grid `grid` ahead of Neovim as `go` says, as a turn of
-    /// the wheel Neovim has yet to hear of will: see
+    /// Scroll window grid `grid` ahead of Neovim as `go` says, as a key or a
+    /// turn of the wheel Neovim has yet to hear of will: see
     /// [`crate::client::predict`]. `fill` draws the lines it uncovers (see
-    /// [`Scroll::predict`]). Says how far it went.
+    /// [`Scroll::predict`]). Says whether it did.
     pub fn predict(
         &mut self,
         model: &Model,
@@ -530,9 +530,9 @@ impl Animator {
         go: Ahead,
         fill: &mut dyn FnMut(i64) -> Option<Vec<Cell>>,
         now: Instant,
-    ) -> i64 {
+    ) -> bool {
         let (Some(g), Some(rect)) = (model.grids.get(&grid), text_rect(model, grid)) else {
-            return 0;
+            return false;
         };
         if !self.animating(model, now) {
             self.last = Some(now);
@@ -548,21 +548,30 @@ impl Animator {
             }
         };
         let went = s.predict(go, fill);
-        if went != 0 {
+        if went {
             self.cursor_moved(model, true, now);
         }
         went
     }
 
-    /// How many rows window grid `grid` is ahead of Neovim.
-    pub fn ahead(&self, grid: u64) -> i64 {
-        self.scrolls.get(&grid).map_or(0, Scroll::ahead)
+    /// How many rows window grid `grid` is ahead of Neovim, and how many
+    /// lines its cursor is.
+    pub fn ahead(&self, grid: u64) -> (i64, i64) {
+        self.scrolls
+            .get(&grid)
+            .map_or((0, 0), |s| (s.ahead(), s.cursor()))
+    }
+
+    /// The grid column window grid `grid`'s cursor has been put in ahead of
+    /// Neovim, and the display column it wants, if a prediction says.
+    pub fn col(&self, grid: u64) -> Option<(usize, usize)> {
+        self.scrolls.get(&grid).and_then(Scroll::col)
     }
 
     /// Where the cursor is on the screen: where Neovim put it, or — in a
-    /// window scrolled ahead of Neovim — on the same line of the buffer,
-    /// moved as far as Neovim's `'scrolloff'` will move it to keep it in
-    /// view.
+    /// window scrolled ahead of Neovim — on the line and in the column the
+    /// scrolls ahead take it to, moved as far as Neovim's `'scrolloff'` will
+    /// move it to keep it in view.
     pub fn cursor_at(&self, model: &Model) -> (i64, i64) {
         let (row, col) = model.cursor_on_screen();
         let c = model.cursor;
@@ -577,7 +586,7 @@ impl Animator {
         let ahead = s.ahead();
         // In the rows of the view as predicted: where the cursor's line is,
         // and where the buffer's first and last lines are.
-        let at = c.row as i64 - top as i64 - ahead;
+        let at = c.row as i64 - top as i64 - ahead + s.cursor();
         let so = (s.scrolloff() as i64).min((h - 1) / 2);
         let (first, last) = model
             .viewports
@@ -591,6 +600,9 @@ impl Animator {
         let lo = if first < 0 { so } else { 0 };
         let hi = if last >= h { h - 1 - so } else { h - 1 };
         let at = at.max(lo).min(hi).min(last).max(first.max(0));
+        let col = s
+            .col()
+            .map_or(col, |(to, _)| col - c.col as i64 + to as i64);
         (row + at - (c.row as i64 - top as i64), col)
     }
 
@@ -1107,10 +1119,12 @@ mod tests {
         let until = t0 + Duration::from_secs(1);
         let go = |rows, until| Ahead {
             rows,
+            cursor: 0,
+            col: None,
             until,
             scrolloff: 2,
         };
-        assert_eq!(a.predict(&m, 2, go(3, until), &mut fill, t0), 3);
+        assert!(a.predict(&m, 2, go(3, until), &mut fill, t0));
         assert_eq!(top(&a, &m), Some(Text::Char('3')));
         assert_eq!(a.cursor_at(&m), (2, 0), "'scrolloff' rows from the top");
         assert_eq!(
@@ -1136,15 +1150,15 @@ mod tests {
         });
         let t1 = t0 + Duration::from_millis(300);
         batch(&mut a, &mut m, events, true, t1);
-        assert_eq!(a.ahead(2), 0);
+        assert_eq!(a.ahead(2), (0, 0));
         assert_eq!(top(&a, &m), Some(Text::Char('3')), "landed where it was");
         assert_eq!(a.cursor_at(&m), (2, 0));
 
         let until = t1 + Duration::from_secs(1);
-        assert_eq!(a.predict(&m, 2, go(-3, until), &mut fill, t1), -3);
+        assert!(a.predict(&m, 2, go(-3, until), &mut fill, t1));
         assert_eq!(top(&a, &m), Some(Text::Char('0')));
         a.advance(until);
-        assert_eq!(a.ahead(2), 0, "never confirmed");
+        assert_eq!(a.ahead(2), (0, 0), "never confirmed");
         assert_eq!(top(&a, &m), Some(Text::Char('3')), "Neovim's view again");
         assert_eq!(a.next_frame(&m, until), None);
     }

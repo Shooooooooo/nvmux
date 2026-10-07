@@ -159,9 +159,10 @@ pub struct ClientSettings {
     /// With `per_session` off as well, a client started ahead is retired when
     /// it first leaves the front, like every other.
     pub lazy: bool,
-    /// Scroll ahead of a slow link: a turn of the mouse wheel over a window
-    /// scrolls it at once, before Neovim has heard of it, once the round trip
-    /// to the session is long enough to be worth it — about 30 ms, which a
+    /// Scroll ahead of a slow link: a key that scrolls — `<C-e>`, `<C-d>`,
+    /// `<C-f>`, `zz` and their kind — or a turn of the mouse wheel scrolls the
+    /// window at once, before Neovim has heard of it, once the round trip to
+    /// the session is long enough to be worth it — about 30 ms, which a
     /// session on this machine never is. nvmux's own client only (see
     /// [`crate::client::predict`]).
     ///
@@ -946,9 +947,9 @@ fn render_default_config(prefix: u8) -> String {
          # \"nvim\" is Neovim's own, and everything the terminal can do reaches\n\
          # the editor as Neovim negotiated it.\n\
          # ui = {ui:?}\n\
-         # nvmux's own client, over a slow link: a turn of the mouse wheel\n\
-         # scrolls at once, the lines it uncovers in plain text until Neovim's\n\
-         # own arrive. false waits for Neovim.\n\
+         # nvmux's own client, over a slow link: a key that scrolls, or the\n\
+         # mouse wheel, scrolls at once, the lines it uncovers in plain text\n\
+         # until Neovim's own arrive. false waits for Neovim.\n\
          # predict = {predict}\n\
          \n\
          [effects]\n\

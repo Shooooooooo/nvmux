@@ -39,6 +39,14 @@ type Line = Option<Vec<Cell>>;
 pub struct Ahead {
     /// How far: above nought down the buffer, as `scroll_delta` counts.
     pub rows: i64,
+    /// How many lines it moves the cursor, down the buffer above nought —
+    /// before `'scrolloff'` has its say, which [`super::Animator::cursor_at`]
+    /// lets it have.
+    pub cursor: i64,
+    /// The grid column it leaves the cursor in, if not the one it was in;
+    /// and the display column the cursor wants to be in from then on, as
+    /// Neovim's `curswant` keeps it.
+    pub col: Option<(usize, usize)>,
     /// When it is given up on, if Neovim has not made it by then.
     pub until: Instant,
     /// `'scrolloff'`: how near the window's edges Neovim lets the cursor be.
@@ -66,12 +74,9 @@ pub struct Scroll {
     /// jumps to wherever it is.
     animate: bool,
     /// Scrolls the client has made ahead of Neovim and Neovim has not yet
-    /// made, oldest first, each with when it is given up on: above nought
-    /// down the buffer, as `scroll_delta` counts. What they add up to is how
-    /// far the view is ahead of Neovim's. See [`crate::client::predict`].
-    ahead: VecDeque<(i64, Instant)>,
-    /// `'scrolloff'`, as the last of them found it.
-    scrolloff: usize,
+    /// made, oldest first. What their rows add up to is how far the view is
+    /// ahead of Neovim's. See [`crate::client::predict`].
+    ahead: VecDeque<Ahead>,
 }
 
 impl Scroll {
@@ -105,7 +110,6 @@ impl Scroll {
             shown: 0,
             animate,
             ahead: VecDeque::new(),
-            scrolloff: 0,
         }
     }
 
@@ -115,16 +119,28 @@ impl Scroll {
 
     /// How many rows the view is ahead of Neovim's.
     pub fn ahead(&self) -> i64 {
-        self.ahead.iter().map(|(n, _)| n).sum()
+        self.ahead.iter().map(|a| a.rows).sum()
     }
 
+    /// How many lines the cursor is ahead of Neovim's.
+    pub fn cursor(&self) -> i64 {
+        self.ahead.iter().map(|a| a.cursor).sum()
+    }
+
+    /// The column the cursor has been put in ahead of Neovim, and the one it
+    /// wants: the last scroll's to say so.
+    pub fn col(&self) -> Option<(usize, usize)> {
+        self.ahead.iter().rev().find_map(|a| a.col)
+    }
+
+    /// `'scrolloff'`, as the last prediction found it.
     pub fn scrolloff(&self) -> usize {
-        self.scrolloff
+        self.ahead.back().map_or(0, |a| a.scrolloff)
     }
 
     /// When the oldest prediction is given up on, if there is one.
     pub fn until(&self) -> Option<Instant> {
-        self.ahead.front().map(|(_, until)| *until)
+        self.ahead.front().map(|a| a.until)
     }
 
     /// The view moved `delta` more rows, and its rectangle now holds
@@ -140,7 +156,7 @@ impl Scroll {
         if self
             .ahead
             .front()
-            .is_some_and(|(n, _)| n.signum() != delta.signum())
+            .is_some_and(|a| a.rows.signum() != delta.signum())
         {
             self.give_up();
         }
@@ -149,12 +165,12 @@ impl Scroll {
         let mut left = delta;
         while left != 0 {
             match self.ahead.front_mut() {
-                Some((n, _)) if n.signum() == left.signum() => {
-                    if n.abs() <= left.abs() {
-                        left -= *n;
+                Some(a) if a.rows.signum() == left.signum() => {
+                    if a.rows.abs() <= left.abs() {
+                        left -= a.rows;
                         self.ahead.pop_front();
                     } else {
-                        *n -= left;
+                        a.rows -= left;
                         left = 0;
                     }
                 }
@@ -192,9 +208,9 @@ impl Scroll {
                 (self.spring.position + left as f32).clamp(-(h as f32), h as f32);
         }
         // Kept as far as the view could reach, and no further: a view ahead
-        // by as much as it is tall, behind by as much again.
-        self.above.truncate(2 * h + 1);
-        self.below.truncate(2 * h + 1);
+        // by twice as much as it is tall, behind by as much again.
+        self.above.truncate(4 * h + 1);
+        self.below.truncate(4 * h + 1);
         self.shown = self.spring.cells();
     }
 
@@ -210,45 +226,40 @@ impl Scroll {
     /// is the first line below it, `-1` the first above; `None` for one it
     /// cannot.
     ///
-    /// No further than the rectangle is tall, nor than `fill` can draw. Says
-    /// how far it went.
-    pub fn predict(&mut self, go: Ahead, fill: &mut dyn FnMut(i64) -> Option<Vec<Cell>>) -> i64 {
-        let Ahead {
-            rows,
-            until,
-            scrolloff,
-        } = go;
+    /// All of it or none: not if it would put the view further ahead than
+    /// twice the rectangle is tall, nor if `fill` cannot draw what it
+    /// uncovers. Says whether it scrolled.
+    pub fn predict(&mut self, go: Ahead, fill: &mut dyn FnMut(i64) -> Option<Vec<Cell>>) -> bool {
         let h = self.current.len() as i64;
-        let ahead = self.ahead();
-        let mut target = (ahead + rows).clamp(-h, h);
-        if target > 0 {
-            while (self.below.len() as i64) < target {
-                match fill(h + self.below.len() as i64) {
-                    Some(line) => self.below.push_back(Some(line)),
-                    None => break,
-                }
-            }
-            target = target.min(self.below.iter().take_while(|l| l.is_some()).count() as i64);
-        } else if target < 0 {
-            while (self.above.len() as i64) < -target {
-                match fill(-1 - self.above.len() as i64) {
-                    Some(line) => self.above.push_back(Some(line)),
-                    None => break,
-                }
-            }
-            target = target.max(-(self.above.iter().take_while(|l| l.is_some()).count() as i64));
+        let target = self.ahead() + go.rows;
+        if go.rows == 0 || target.abs() > 2 * h {
+            return false;
         }
-        let went = target - ahead;
-        if went == 0 || went.signum() != rows.signum() {
-            return 0;
+        let (side, first) = if target > 0 {
+            (&mut self.below, h)
+        } else {
+            (&mut self.above, -1)
+        };
+        let step = target.signum();
+        while (side.len() as i64) < target.abs() {
+            match fill(first + step * side.len() as i64) {
+                Some(line) => side.push_back(Some(line)),
+                None => return false,
+            }
         }
-        self.ahead.push_back((went, until));
-        self.scrolloff = scrolloff;
+        if side
+            .iter()
+            .take(target.unsigned_abs() as usize)
+            .any(Option::is_none)
+        {
+            return false;
+        }
+        self.ahead.push_back(go);
         if self.animate {
-            self.spring.position += went as f32;
+            self.spring.position += go.rows as f32;
             self.shown = self.spring.cells();
         }
-        went
+        true
     }
 
     /// Stop being ahead of Neovim: the view goes back to Neovim's, sliding
@@ -400,6 +411,8 @@ mod tests {
     fn go(rows: i64) -> Ahead {
         Ahead {
             rows,
+            cursor: 0,
+            col: None,
             until: Instant::now() + std::time::Duration::from_secs(60),
             scrolloff: 0,
         }
@@ -410,7 +423,7 @@ mod tests {
     #[test]
     fn a_prediction_shows_at_once_and_neovim_lands_on_it() {
         let mut s = Scroll::still((0, 5, 0, 1), lines(10..15), false);
-        assert_eq!(s.predict(go(2), &mut fill(10, 99)), 2);
+        assert!(s.predict(go(2), &mut fill(10, 99)));
         assert_eq!(shows(&s), [12, 13, 14, 15, 16].map(Some));
         s.scrolled(lines(12..17), 2, 1);
         assert_eq!(s.ahead(), 0);
@@ -418,7 +431,7 @@ mod tests {
         assert!(!s.step(0.01, 0.0), "nothing left to do");
         // Up as well.
         let mut s = Scroll::still((0, 5, 0, 1), lines(10..15), false);
-        assert_eq!(s.predict(go(-3), &mut fill(10, 99)), -3);
+        assert!(s.predict(go(-3), &mut fill(10, 99)));
         assert_eq!(shows(&s), [7, 8, 9, 10, 11].map(Some));
     }
 
@@ -428,7 +441,7 @@ mod tests {
     fn neovim_confirms_the_oldest_first() {
         let mut s = Scroll::still((0, 8, 0, 1), lines(0..8), false);
         for _ in 0..3 {
-            assert_eq!(s.predict(go(2), &mut fill(0, 99)), 2);
+            assert!(s.predict(go(2), &mut fill(0, 99)));
         }
         assert_eq!(shows(&s)[0], Some(6));
         s.scrolled(lines(4..12), 4, 1);
@@ -472,11 +485,7 @@ mod tests {
         let t0 = Instant::now();
         let until = t0 + std::time::Duration::from_millis(500);
         let mut s = Scroll::still((0, 5, 0, 1), lines(10..15), true);
-        let go = Ahead {
-            rows: 2,
-            until,
-            scrolloff: 0,
-        };
+        let go = Ahead { until, ..go(2) };
         s.predict(go, &mut fill(10, 99));
         assert_eq!(
             shows(&s),
@@ -498,14 +507,18 @@ mod tests {
         assert_eq!(shows(&s), [10, 11, 12, 13, 14].map(Some));
     }
 
-    /// No further than the lines it can draw, nor than the window is tall.
+    /// All or nothing: no further than the lines it can draw, nor than twice
+    /// the window is tall.
     #[test]
-    fn a_prediction_goes_no_further_than_it_can_draw() {
+    fn a_prediction_goes_all_the_way_or_not_at_all() {
         let mut s = Scroll::still((0, 5, 0, 1), lines(10..15), false);
-        assert_eq!(s.predict(go(3), &mut fill(10, 16)), 2);
-        assert_eq!(s.predict(go(3), &mut fill(10, 16)), 0);
+        assert!(!s.predict(go(3), &mut fill(10, 16)));
+        assert_eq!(s.ahead(), 0);
+        assert!(s.predict(go(2), &mut fill(10, 16)));
         let mut s = Scroll::still((0, 5, 0, 1), lines(10..15), false);
-        assert_eq!(s.predict(go(9), &mut fill(10, 99)), 5);
+        assert!(!s.predict(go(11), &mut fill(10, 99)));
+        assert!(s.predict(go(10), &mut fill(10, 99)));
+        assert_eq!(shows(&s), [20, 21, 22, 23, 24].map(Some));
     }
 
     /// Past the whole view, only `far` rows are animated, and drawn blank.
