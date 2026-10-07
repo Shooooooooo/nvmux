@@ -131,8 +131,7 @@ session is still running; `nvmux <host>` picks it up again.
 
 By default nvmux draws the editor with its own client rather than Neovim's,
 so that it can animate it: scrolls slide, split windows fly in, fly out and
-resize as in [animate.nvim](https://github.com/Shooooooooo/animate.nvim),
-floats glide as in [Neovide](https://neovide.dev), and a smeared cursor,
+resize, floats glide as in [Neovide](https://neovide.dev), and a smeared cursor,
 particles and a fading blink can be turned on under `[effects]`. Set
 `ui = "nvim"` under `[client]` for Neovim's own client instead: with it, what
 the terminal can do reaches the editor as Neovim negotiates it, not through
