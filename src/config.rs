@@ -168,10 +168,12 @@ pub struct ClientSettings {
     /// [`crate::client::predict`]).
     ///
     /// What it costs: the rows a scroll uncovers are drawn without their
-    /// syntax colours, signs or virtual text until Neovim's own arrive, a
-    /// round trip later; and the agent the client leaves in the editor sends
-    /// the text of the lines around each window's view over the link, as the
-    /// view moves. Off, every scroll waits for Neovim.
+    /// signs or virtual text until Neovim's own arrive, a round trip later,
+    /// and in the colours tree-sitter and highlights on the buffer give them
+    /// but not `:syntax`'s; and the agent the client leaves in the editor
+    /// sends the text of the lines around each window's view over the link,
+    /// and those colours, as the view moves. Off, every scroll waits for
+    /// Neovim.
     pub predict: bool,
 }
 
@@ -949,8 +951,9 @@ fn render_default_config(prefix: u8) -> String {
          # the editor as Neovim negotiated it.\n\
          # ui = {ui:?}\n\
          # nvmux's own client, over a slow link: a key that scrolls, or the\n\
-         # mouse wheel, scrolls at once, the lines it uncovers in plain text\n\
-         # until Neovim's own arrive. false waits for Neovim.\n\
+         # mouse wheel, scrolls at once, the lines it uncovers in their syntax\n\
+         # colours, if tree-sitter gives them, until Neovim's own arrive. false\n\
+         # waits for Neovim.\n\
          # predict = {predict}\n\
          \n\
          [effects]\n\

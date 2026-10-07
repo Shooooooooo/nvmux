@@ -83,11 +83,11 @@ const PARTICLES: vfx::Settings = vfx::Settings {
     speed: 6.0,
 };
 
-/// A scroll slides for 150 ms, half Neovide's 300, and one made while another
-/// is still sliding takes what that one had left with it: however many pages
-/// are typed, the last lands 150 ms after its key at most (see [`glide`]).
-/// Of a jump further than the window is tall, one row slides.
-const SCROLL: (f32, usize) = (0.15, 1);
+/// A scroll slides for 100 ms, a third of Neovide's 300, and one made while
+/// another is still sliding takes what that one had left with it: however
+/// many pages are typed, the last lands 100 ms after its key at most (see
+/// [`glide`]). Of a jump further than the window is tall, one row slides.
+const SCROLL: (f32, usize) = (0.1, 1);
 
 /// Neovide's slide settles in 150 ms; animate.nvim's resize takes its 150, a
 /// split flying in 200, one flying out 180 and a buffer switch's fade 200.
@@ -1170,8 +1170,9 @@ mod tests {
         assert!(!a.smear.moving());
     }
 
-    /// A window that scrolls shows the lines it showed, then slides to its
-    /// new ones; a change of margins with it is a layout change, not a scroll.
+    /// A window that scrolls shows the lines it showed, a row on at once,
+    /// then slides to its new ones; a change of margins with it is a layout
+    /// change, not a scroll.
     #[test]
     fn a_window_that_scrolls_slides_its_lines() {
         let (mut a, mut m, t0) = (Animator::new(effects()), model(), Instant::now());
@@ -1199,7 +1200,7 @@ mod tests {
         let frame = compose::compose(&m, &a, 30, 12);
         assert_eq!(
             frame.get(0, 0).map(|c| c.text.clone()),
-            Some(Text::Char('0'))
+            Some(Text::Char('1'))
         );
         a.advance(t0 + Duration::from_secs(1));
         let frame = compose::compose(&m, &a, 30, 12);

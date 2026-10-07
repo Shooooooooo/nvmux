@@ -185,6 +185,51 @@ pub struct Changes {
 #[derive(Debug, Default)]
 struct Highlights {
     defs: Vec<Option<(Attrs, Attrs)>>,
+    /// The editor's highlight groups the client colours its own rows with,
+    /// by group id, as the agent sends them: see [`syntax_hl`].
+    groups: HashMap<u32, (Attrs, Attrs)>,
+}
+
+/// Set in a cell's highlight id that is not Neovim's: a highlight group of
+/// the editor's laid over one of Neovim's, as the client draws the rows it
+/// draws itself (see `super::predict`) in the colours the editor's syntax
+/// highlighting gives them.
+const SYNTAX: u32 = 1 << 31;
+
+/// The highlight id of group `group` laid over Neovim's highlight `base`, as
+/// Neovim lays a syntax group over a window's text: what the group sets, and
+/// what it does not from under it. Ids too big to fit are left as `base`.
+pub fn syntax_hl(base: u32, group: u32) -> u32 {
+    if base > 0xffff || group == 0 || group > 0x7fff {
+        return base;
+    }
+    SYNTAX | group << 16 | base
+}
+
+/// `over` laid over `under`: its colours where it has them, and every
+/// attribute either has.
+fn laid(under: &Attrs, over: &Attrs) -> Attrs {
+    Attrs {
+        fg: over.fg.or(under.fg),
+        bg: over.bg.or(under.bg),
+        sp: over.sp.or(under.sp),
+        reverse: under.reverse || over.reverse,
+        bold: under.bold || over.bold,
+        italic: under.italic || over.italic,
+        strikethrough: under.strikethrough || over.strikethrough,
+        altfont: under.altfont || over.altfont,
+        dim: under.dim || over.dim,
+        blink: under.blink || over.blink,
+        conceal: under.conceal || over.conceal,
+        overline: under.overline || over.overline,
+        underline: if over.underline == Default::default() {
+            under.underline
+        } else {
+            over.underline
+        },
+        blend: under.blend,
+        url: over.url.clone().or_else(|| under.url.clone()),
+    }
 }
 
 /// The editor, as the client knows it.
@@ -275,10 +320,33 @@ impl Model {
     /// Highlight `id` resolved for drawing; an id never defined is the
     /// default.
     pub fn style(&self, id: u32) -> Style {
+        if id & SYNTAX != 0 {
+            return self.syntax_style(id);
+        }
         self.styles
             .get(id as usize)
             .copied()
             .unwrap_or_else(|| self.styles.first().copied().unwrap_or_default())
+    }
+
+    /// A highlight group laid over one of Neovim's (see [`syntax_hl`]),
+    /// resolved for drawing: as the one under it where the group is not
+    /// known.
+    fn syntax_style(&self, id: u32) -> Style {
+        let (base, group) = (id & 0xffff, (id >> 16) & 0x7fff);
+        let Some((rgb, cterm)) = self.highlights.groups.get(&group) else {
+            return self.style(base);
+        };
+        let plain = (Attrs::default(), Attrs::default());
+        let (under_rgb, under_cterm) = self.attrs(base).unwrap_or(&plain);
+        self.colors()
+            .style(&laid(under_rgb, rgb), &laid(under_cterm, cterm))
+    }
+
+    /// The editor's highlight group `group` has these attributes, in both
+    /// forms: see [`syntax_hl`].
+    pub fn set_group(&mut self, group: u32, rgb: Attrs, cterm: Attrs) {
+        self.highlights.groups.insert(group, (rgb, cterm));
     }
 
     /// Highlight `id` as Neovim defined it, in both its forms.
@@ -908,6 +976,64 @@ mod tests {
         assert!(!changes.repaint);
         let changes = apply(&mut m, vec![Event::GridClear { grid: 1 }]);
         assert!(changes.repaint);
+    }
+
+    /// A highlight group of the editor's laid over one of Neovim's: its
+    /// colours where it has them, the one under it's where not, and every
+    /// attribute either has; in the form `'termguicolors'` says; as the one
+    /// under it while the group is not known.
+    #[test]
+    fn a_group_is_laid_over_the_text_it_colours() {
+        use crate::client::style::Color;
+        let mut m = model();
+        apply(
+            &mut m,
+            vec![Event::HlAttr {
+                id: 3,
+                rgb: Attrs {
+                    fg: Some(0x010101),
+                    bg: Some(0x020202),
+                    italic: true,
+                    ..Attrs::default()
+                },
+                cterm: Attrs {
+                    fg: Some(1),
+                    bg: Some(2),
+                    ..Attrs::default()
+                },
+            }],
+        );
+        m.refresh_styles();
+        let id = syntax_hl(3, 400);
+        assert_eq!(m.style(id), m.style(3), "an unknown group");
+        m.set_group(
+            400,
+            Attrs {
+                fg: Some(0x0a0b0c),
+                bold: true,
+                ..Attrs::default()
+            },
+            Attrs {
+                fg: Some(9),
+                ..Attrs::default()
+            },
+        );
+        assert_eq!(m.style(id).fg, Color::Index(9));
+        assert_eq!(m.style(id).bg, Color::Index(2));
+        apply(
+            &mut m,
+            vec![Event::OptionSet {
+                name: "termguicolors".into(),
+                value: OptionValue::Bool(true),
+            }],
+        );
+        m.refresh_styles();
+        let s = m.style(id);
+        assert_eq!(s.fg, Color::Rgb(Rgb(10, 11, 12)));
+        assert_eq!(s.bg, Color::Rgb(Rgb(2, 2, 2)));
+        assert!(s.bold && s.italic);
+        assert_eq!(syntax_hl(1 << 20, 400), 1 << 20, "too big to fit");
+        assert_eq!(syntax_hl(3, 0), 3, "no group");
     }
 
     /// Highlights resolve lazily, and `'termguicolors'` decides which form.

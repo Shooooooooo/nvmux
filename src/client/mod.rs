@@ -243,8 +243,15 @@ return out";
 /// and the one they are brought to, first line, the line after the last it
 /// replaced, how many lines replace them, and those lines where they touch
 /// what the client has, the most bytes of a line sent), or the lines afresh
-/// where the edits are more than is worth sending that way; and what to draw
-/// them with and how far its
+/// where the edits are more than is worth sending that way. With the lines,
+/// the colours the editor's highlighting gives them (a list a line of start
+/// byte, end byte or -1 for the line's end, and highlight group), and again
+/// where an edit or a new parse changes them (`spans`, window, buffer,
+/// `b:changedtick`, first line, the lists); before them, the attributes of
+/// each group the client has yet to be sent, in both of `hl_attr_define`'s
+/// forms, and all of them again with a new colour scheme (`colours`, a list
+/// of group, GUI attributes, cterm attributes). And what to draw them with
+/// and how far its
 /// scrolls go, when that changes (`shape`, window, see [`predict::Shape`]) —
 /// among it, which of the keys the client follows, given it as the agent's
 /// third argument and those in insert mode as its fourth, something maps in
@@ -345,6 +352,146 @@ if predict then
     end
     return lines
   end
+  -- The highlight groups the client has been sent the attributes of, true;
+  -- false for one with none, whose spans are left out.
+  local groups = {}
+  local function attrs(gid)
+    local a = api.nvim_get_hl(0, { id = gid, link = false })
+    local function flags(from, into)
+      for _, k in ipairs({ 'bold', 'italic', 'underline', 'undercurl', 'underdouble',
+          'underdotted', 'underdashed', 'strikethrough', 'reverse', 'altfont' }) do
+        if from[k] then
+          into[k] = true
+        end
+      end
+      return into
+    end
+    local rgb = flags(a, vim.empty_dict())
+    rgb.foreground, rgb.background, rgb.special = a.fg, a.bg, a.sp
+    local cterm = flags(a.cterm or {}, vim.empty_dict())
+    cterm.foreground, cterm.background = a.ctermfg, a.ctermbg
+    return next(a) ~= nil, rgb, cterm
+  end
+  -- The colours the editor's own highlighting gives lines from to to of a
+  -- buffer — its tree-sitter captures, and the highlights put on it, such
+  -- as a language server's semantic tokens — a list a line of start byte,
+  -- end byte (-1 to the line's end) and highlight group, later over earlier
+  -- as priorities have it. The groups' attributes go to the client first.
+  local function colours(buf, from, to)
+    local found, fresh = {}, {}
+    local function add(sr, sc, er, ec, gid, prio, sub)
+      if not gid or gid <= 0 or er < from or sr >= to then
+        return
+      end
+      if groups[gid] == nil then
+        local some, rgb, cterm = attrs(gid)
+        groups[gid] = some
+        if some then
+          fresh[#fresh + 1] = { gid, rgb, cterm }
+        end
+      end
+      if groups[gid] then
+        found[#found + 1] = { sr, sc, er, ec, gid, prio, sub, #found }
+      end
+    end
+    local hl = vim.treesitter.highlighter.active[buf]
+    if hl then
+      pcall(function()
+        hl.tree:parse({ from, to })
+        local sub = 0
+        hl.tree:for_each_tree(function(tstree, ltree)
+          sub = sub + 1
+          local q = hl:get_query(ltree:lang())
+          local query = q and q:query()
+          if not query then
+            return
+          end
+          for id, node, meta in query:iter_captures(tstree:root(), buf, from, to) do
+            local r = vim.treesitter.get_range(node, buf, meta and meta[id])
+            local prio = tonumber(meta.priority or (meta[id] and meta[id].priority)) or 100
+            add(r[1], r[2], r[4], r[5], q:get_hl_from_capture(id), prio, sub)
+          end
+        end)
+      end)
+    end
+    local ok, marks = pcall(api.nvim_buf_get_extmarks, buf, -1, { from, 0 }, { to - 1, -1 },
+      { details = true, type = 'highlight', overlap = true })
+    for _, m in ipairs(ok and marks or {}) do
+      local d = m[4]
+      for _, g in ipairs(type(d.hl_group) == 'table' and d.hl_group or { d.hl_group }) do
+        local gid = type(g) == 'number' and g or api.nvim_get_hl_id_by_name(g)
+        add(m[2], m[3], d.end_row or m[2], d.end_col or m[3], gid, d.priority or 4096, 0)
+      end
+    end
+    if #fresh > 0 then
+      send('colours', fresh)
+    end
+    table.sort(found, function(x, y)
+      if x[6] ~= y[6] then
+        return x[6] < y[6]
+      elseif x[7] ~= y[7] then
+        return x[7] < y[7]
+      end
+      return x[8] < y[8]
+    end)
+    local out = {}
+    for i = 1, to - from do
+      out[i] = {}
+    end
+    for _, f in ipairs(found) do
+      for r = math.max(f[1], from), math.min(f[3], to - 1) do
+        if r < f[3] or f[4] > 0 or r == f[1] then
+          local line = out[r - from + 1]
+          line[#line + 1] = r == f[1] and f[2] or 0
+          line[#line + 1] = r == f[3] and f[4] or -1
+          line[#line + 1] = f[5]
+        end
+      end
+    end
+    return out
+  end
+  -- Rows of a buffer whose colours may have changed since they were sent,
+  -- a few runs of them: its tree-sitter tree changed there, or the lines did.
+  local stale, followed = {}, {}
+  local function spoil(buf, lo, hi)
+    local runs, merged = stale[buf] or {}, { lo, hi }
+    local kept = {}
+    for _, r in ipairs(runs) do
+      if r[1] <= merged[2] and r[2] >= merged[1] then
+        merged = { math.min(r[1], merged[1]), math.max(r[2], merged[2]) }
+      else
+        kept[#kept + 1] = r
+      end
+    end
+    kept[#kept + 1] = merged
+    if #kept > 16 then
+      local all = { math.huge, -1 }
+      for _, r in ipairs(kept) do
+        all = { math.min(all[1], r[1]), math.max(all[2], r[2]) }
+      end
+      kept = { all }
+    end
+    stale[buf] = kept
+  end
+  local function follow(buf)
+    local hl = vim.treesitter.highlighter.active[buf]
+    if not hl or followed[buf] == hl.tree then
+      return
+    end
+    local tree = hl.tree
+    followed[buf] = tree
+    tree:register_cbs({
+      on_changedtree = function(ranges)
+        if gone or followed[buf] ~= tree then
+          return
+        end
+        for _, r in ipairs(ranges) do
+          spoil(buf, r[1], r[4] + 1)
+        end
+        soon()
+      end,
+    }, true)
+  end
   -- Edits to a buffer since the client was sent its lines, in order: each
   -- left lines a to b of the buffer as it was before it as lines a to c,
   -- whose text it keeps. One next to the last is taken into it. Sent as
@@ -424,6 +571,26 @@ if predict then
   local function flush()
     for buf, e in pairs(edits) do
       edits[buf], ticks[buf] = nil, e.tick
+      -- The lines an edit brings have no colours with them: theirs come
+      -- after, where the editor gives any — found where the edits after it
+      -- moved them to.
+      if vim.treesitter.highlighter.active[buf] then
+        local runs = {}
+        for _, p in ipairs(e.list) do
+          local delta = (p.c - p.a) - (p.b - p.a)
+          for _, r in ipairs(runs) do
+            if r[1] >= p.b then
+              r[1], r[2] = r[1] + delta, r[2] + delta
+            elseif r[2] > p.a then
+              r[2] = math.max(r[2] + delta, p.c)
+            end
+          end
+          runs[#runs + 1] = { p.a, p.c + 1 }
+        end
+        for _, r in ipairs(runs) do
+          spoil(buf, math.max(r[1], 0), r[2])
+        end
+      end
       for win, h in pairs(have) do
         if h.buf == buf and (h.tick ~= e.base or e.over) then
           have[win] = nil
@@ -453,7 +620,7 @@ if predict then
       end
     end
   end
-  local function push(win)
+  local function push(win, spoilt)
     if api.nvim_win_get_config(win).relative ~= '' then
       return
     end
@@ -497,21 +664,32 @@ if predict then
       send('shape', win, s)
     end
     if joins then
+      for _, r in ipairs(spoilt[buf] or {}) do
+        local a, b = math.max(r[1], h.lo), math.min(r[2], h.hi)
+        if a < b then
+          send('spans', win, buf, tick, a, colours(buf, a, b))
+        end
+      end
       if lo < h.lo then
-        send('lines', win, buf, tick, lo, get(buf, lo, h.lo, cap), false, cap)
+        send('lines', win, buf, tick, lo, get(buf, lo, h.lo, cap), false, cap,
+          colours(buf, lo, h.lo))
         h.lo = lo
       end
       if hi > h.hi then
-        send('lines', win, buf, tick, h.hi, get(buf, h.hi, hi, cap), false, cap)
+        send('lines', win, buf, tick, h.hi, get(buf, h.hi, hi, cap), false, cap,
+          colours(buf, h.hi, hi))
         h.hi = hi
       end
     else
-      send('lines', win, buf, tick, lo, get(buf, lo, hi, cap), true, cap)
+      send('lines', win, buf, tick, lo, get(buf, lo, hi, cap), true, cap, colours(buf, lo, hi))
       have[win] = { buf = buf, tick = tick, lo = lo, hi = hi, cap = cap }
       ticks[buf] = tick
       attach(buf)
       vim.defer_fn(soon, 100)
     end
+    -- Changes to the colours from here on: not the parse the lines just sent
+    -- took, which they have.
+    follow(buf)
   end
   local queued = false
   local function push_all()
@@ -520,10 +698,14 @@ if predict then
       return
     end
     flush()
+    -- What was spoilt is sent again now; what pushing spoils, as a parse of
+    -- lines not parsed before may, next time.
+    local spoilt = stale
+    stale = {}
     for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
       if api.nvim_win_is_valid(win) then
         pcall(api.nvim_win_call, win, function()
-          push(win)
+          push(win, spoilt)
         end)
       end
     end
@@ -547,6 +729,18 @@ if predict then
       if win and d.leftcol ~= 0 and api.nvim_win_is_valid(win) then
         send('leftcol', win, vim.fn.getwininfo(win)[1].leftcol)
       end
+    end
+  end)
+  -- New colours for every group the client knows.
+  au('ColorScheme', {}, function()
+    local again = {}
+    for gid in pairs(groups) do
+      local some, rgb, cterm = attrs(gid)
+      groups[gid] = some
+      again[#again + 1] = { gid, rgb, cterm }
+    end
+    if #again > 0 then
+      send('colours', again)
     end
   end)
   -- An edit is sent once typing pauses: see flush.
@@ -920,6 +1114,25 @@ impl App {
                 }
             }
             Some("options") => self.anim.set_options(options(&params[1..])),
+            // The attributes of the editor's highlight groups the colours
+            // of the lines it sends name.
+            Some("colours") => {
+                let groups = params.get(1).and_then(ValueRef::as_array);
+                for g in groups.into_iter().flatten().filter_map(ValueRef::as_array) {
+                    let (Some(id), Some(rgb), Some(cterm)) = (
+                        g.first()
+                            .and_then(redraw::int)
+                            .and_then(|n| u32::try_from(n).ok()),
+                        g.get(1),
+                        g.get(2),
+                    ) else {
+                        continue;
+                    };
+                    let attrs = |v| redraw::attrs(v).unwrap_or_default();
+                    self.model.set_group(id, attrs(rgb), attrs(cterm));
+                }
+                self.dirty = true;
+            }
             // Said just before Neovim draws it: taken with that frame.
             Some("leftcol") => {
                 if let (Some(win), Some(left)) = (int(1), int(2)) {
@@ -1900,7 +2113,7 @@ impl App {
         let look = predict::Look::of(&rows, lines, shape.textoff, cursor, eob);
         predict::shifted(&rows, shape.leftcol, to, shape, &look, |r| {
             if r < lines {
-                Some(Some(p.text(win, view.topline + r as i64)?))
+                Some(Some(p.coloured(win, view.topline + r as i64)?))
             } else {
                 Some(None)
             }

@@ -1002,22 +1002,18 @@ fn every_scroll_sideways_predicted_is_the_one_neovim_makes() {
     typed(&mut term, b"\x1b");
 }
 
-/// Pages typed faster than a slow link answers: each is on the screen before
-/// Neovim could have heard of it, the lines it shows sent before it was
-/// typed, and the view never goes back, and ends where Neovim's does.
-#[test]
-fn pages_typed_faster_than_the_link_answers_keep_up() {
-    require_nvim!();
-    let scratch = Scratch::new("client-burst");
-    let (mut rpc, mut term, _) = drawn_slowly(
-        &scratch,
-        "client-burst",
-        "call setline(1, map(range(1, 2000), '\"line \" . v:val'))",
-    );
+/// Type `presses` pages, `gap` apart, into a window of `line N`s drawn over
+/// a slow link: say how long after its key each page was first on the
+/// screen, after making sure the view never went back and ended where
+/// Neovim's did.
+fn pages(
+    rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    term: &mut Terminal,
+    gap: Duration,
+    presses: usize,
+) -> Vec<Option<Duration>> {
     // A page is the window less two lines: 20.
     let page = |k: usize| 1 + 20 * k as u32;
-    let gap = Duration::from_millis(100);
-    let presses = 10;
     let t0 = Instant::now();
     let mut typed = Vec::new();
     let mut drawn: Vec<Option<Instant>> = vec![None; presses];
@@ -1043,18 +1039,9 @@ fn pages_typed_faster_than_the_link_answers_keep_up() {
     for k in 0..presses {
         typed.push(Instant::now());
         term.type_bytes(b"\x06");
-        watch(&mut term, t0 + gap * (k as u32 + 1), &mut drawn);
+        watch(term, t0 + gap * (k as u32 + 1), &mut drawn);
     }
-    let tops = watch(&mut term, Instant::now() + 4 * SLOW, &mut drawn);
-
-    for (k, (typed, drawn)) in typed.iter().zip(&drawn).enumerate() {
-        let late = drawn.map(|d| d - *typed);
-        assert!(
-            late.is_some_and(|l| l < SLOW),
-            "page {} waited: {late:?}",
-            k + 1
-        );
-    }
+    let tops = watch(term, Instant::now() + 4 * SLOW, &mut drawn);
     assert!(
         tops.windows(2).all(|w| w[0] < w[1]),
         "it went back: {tops:?}"
@@ -1065,6 +1052,56 @@ fn pages_typed_faster_than_the_link_answers_keep_up() {
         Some(u64::from(page(presses))),
         "Neovim went elsewhere"
     );
+    typed
+        .iter()
+        .zip(&drawn)
+        .map(|(typed, drawn)| drawn.map(|d| d - *typed))
+        .collect()
+}
+
+/// Pages typed faster than a slow link answers: each is on the screen before
+/// Neovim could have heard of it, the lines it shows sent before it was
+/// typed.
+#[test]
+fn pages_typed_faster_than_the_link_answers_keep_up() {
+    require_nvim!();
+    let scratch = Scratch::new("client-burst");
+    let (mut rpc, mut term, _) = drawn_slowly(
+        &scratch,
+        "client-burst",
+        "call setline(1, map(range(1, 2000), '\"line \" . v:val'))",
+    );
+    let late = pages(&mut rpc, &mut term, Duration::from_millis(100), 10);
+    for (k, late) in late.iter().enumerate() {
+        assert!(
+            late.is_some_and(|l| l < SLOW),
+            "page {} waited: {late:?}",
+            k + 1
+        );
+    }
+}
+
+/// Pages typed faster still, further ahead of Neovim than the lines it sends
+/// reach: those past them wait for their lines, which come as Neovim's view
+/// moves on, and not for Neovim — none as long as its own frame would take.
+#[test]
+fn pages_typed_further_ahead_than_lines_go_wait_only_for_them() {
+    require_nvim!();
+    let scratch = Scratch::new("client-run");
+    let (mut rpc, mut term, _) = drawn_slowly(
+        &scratch,
+        "client-run",
+        "call setline(1, map(range(1, 2000), '\"line \" . v:val'))",
+    );
+    // A round trip types ten pages, more than the eight windows of lines.
+    let late = pages(&mut rpc, &mut term, Duration::from_millis(50), 16);
+    for (k, late) in late.iter().enumerate() {
+        assert!(
+            late.is_some_and(|l| l < 2 * SLOW),
+            "page {} waited for Neovim: {late:?}",
+            k + 1
+        );
+    }
 }
 
 /// An edit reaches the client as the lines it changed, not as every line the
@@ -1118,4 +1155,95 @@ fn edits_reach_the_client_as_what_they_changed() {
     ] {
         predicted(&mut term, name, keys);
     }
+}
+
+/// The colours of the window's rows, cell by cell: what a prediction must
+/// get right as well, now that it draws the editor's syntax colours.
+fn colours(term: &Terminal) -> Vec<Vec<(vt100::Color, vt100::Color, bool, bool)>> {
+    let screen = term.parser.screen();
+    (0..22)
+        .map(|r| {
+            (0..COLS)
+                .map(|c| {
+                    screen.cell(r, c).map_or(
+                        (vt100::Color::Default, vt100::Color::Default, false, false),
+                        |x| (x.fgcolor(), x.bgcolor(), x.bold(), x.italic()),
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Rows a scroll uncovers ahead of Neovim wear the colours the editor's
+/// syntax highlighting gives them — lines edited as well, by the API or by
+/// keys: when Neovim's own rows land, not a cell of the window changes, text
+/// or colour.
+#[test]
+fn predicted_rows_wear_the_colours_neovim_gives_them() {
+    require_nvim!();
+    let scratch = Scratch::new("client-colours");
+    let (mut rpc, mut term, _) = drawn_slowly(
+        &scratch,
+        "client-colours",
+        "call setline(1, map(range(1, 600), \
+         '\"local v\" . v:val . \" = \" . v:val . \" -- line \" . v:val')) | \
+         set termguicolors | lua vim.treesitter.start(0, 'lua')",
+    );
+    let step = |term: &mut Terminal, name: &str, keys: &[u8]| {
+        let before = window(term);
+        term.type_bytes(keys);
+        assert!(
+            term.pump(SLOW, |t| window(t) != before),
+            "{name} waited for Neovim:\n{}",
+            term.text()
+        );
+        term.pump_until(Duration::from_millis(30), |_| false);
+        let predicted = (window(term), colours(term));
+        // Coloured, not plain: a keyword, a number and a comment apart, on
+        // all but the lines edited whole into a comment or a string.
+        let coloured = predicted
+            .1
+            .iter()
+            .filter(|row| {
+                let mut kinds: Vec<_> = row
+                    .iter()
+                    .take(20)
+                    .map(|(fg, _, bold, _)| (*fg, *bold))
+                    .collect();
+                kinds.dedup();
+                kinds.len() > 1
+            })
+            .count();
+        assert!(coloured >= 19, "{name}: {coloured} rows of 22 coloured");
+        term.pump_until(4 * SLOW, |_| false);
+        let landed = (window(term), colours(term));
+        assert_eq!(predicted.0, landed.0, "{name}: the text moved");
+        for (r, (p, l)) in predicted.1.iter().zip(&landed.1).enumerate() {
+            assert_eq!(p, l, "{name}: row {r} changed colour when Neovim's landed");
+        }
+    };
+    for (name, keys) in [
+        ("<C-f>", &b"\x06"[..]),
+        ("<C-f> again", b"\x06"),
+        ("<C-b>", b"\x02"),
+        ("the wheel", b"\x1b[<65;10;5M"),
+        ("3<C-e>", b"3\x05"),
+    ] {
+        step(&mut term, name, keys);
+    }
+    // Below the view, as a formatter would: a line made a comment, one a
+    // string, the cursor where it was.
+    rpc.command(
+        "call nvim_buf_set_lines(0, 60, 62, v:true, \
+         ['-- local v61 = 61 -- line 61', 'local s = [[line 62]] -- 62'])",
+    )
+    .expect("edit below");
+    term.pump_until(4 * SLOW, |_| false);
+    step(&mut term, "<C-f> over lines edited", b"\x06");
+    // In the view, by keys: a comment opened below the cursor.
+    typed(&mut term, b"o-- typed, local v = 1");
+    typed(&mut term, b"\x1b");
+    step(&mut term, "<C-f> past a line typed", b"\x06");
+    step(&mut term, "<C-b> back over it", b"\x02");
 }

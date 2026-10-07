@@ -433,7 +433,7 @@ fn line_cells(v: &ValueRef<'_>) -> Option<Vec<LineCell>> {
 /// A highlight's attributes, from either of the two maps `hl_attr_define`
 /// carries. Keys the client has no use for — `nocombine`, and anything newer —
 /// are passed over.
-fn attrs(v: &ValueRef<'_>) -> Option<Attrs> {
+pub fn attrs(v: &ValueRef<'_>) -> Option<Attrs> {
     let mut a = Attrs::default();
     for (key, value) in v_map(v)? {
         let Some(key) = as_str(key) else { continue };
