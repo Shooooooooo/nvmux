@@ -160,6 +160,19 @@ way, nothing mapped to the key, no key before it still on its way — and
 whatever Neovim does instead wins. `predict = false` under `[client]` turns it
 off.
 
+### A terminal that falls behind
+
+A scroll that slides redraws its window sixty and more times a second, and
+not every terminal reads that fast — one on Windows, behind a console host
+and WSL, or one at the far end of an ssh. Frames it cannot keep up with would
+wait in every buffer on the way and be drawn late, each of them, the scroll
+carrying on after the key is let go. So nvmux's own client asks the terminal
+for its status after every frame and draws nothing more while the answer is
+late; when it comes, the next frame is the screen as it is by then. The
+terminal is shown the newest frame, a frame or so behind, and a slide on one
+that cannot keep up takes fewer, larger steps. `pace = false` under
+`[client]` draws every frame.
+
 ## Configuration
 
 nvmux needs no configuration. An optional TOML file — `$NVMUX_CONFIG` if set,
@@ -182,6 +195,7 @@ ui          = "nvmux" # who draws a session: nvmux's own client, animated; or "n
 per_session = true    # keep each session's client; a switch back reuses it
 lazy        = true    # start a client on its first visit; false starts all at launch
 predict     = true    # over a slow link, scrolls show before Neovim answers
+pace        = true    # no frame while the terminal is still reading the last
 
 [effects]
 enabled = true   # master switch: false turns every effect below off

@@ -84,16 +84,19 @@
 //! timeout that is the next animation frame, the `'ttimeoutlen'` an escape is
 //! held for, or the end of a wait for what a multigrid attach lacks — the
 //! shape of the relay's own loop, for the relay's reasons. Nothing animates
-//! while nothing moves: an idle client sleeps in `poll`. The one thing done
-//! off it is a refresh, which blocks on a connection of its own for as long
-//! as Neovim takes to draw for it, and has nothing to tell the loop: its work
-//! arrives on the client's own socket ([`refresh`]).
+//! while nothing moves: an idle client sleeps in `poll`. Nor is a frame drawn
+//! while a terminal slow to read has yet to read the last one: the next
+//! waits for it to, and is the screen as it is by then ([`pace`]). The one
+//! thing done off the loop is a refresh, which blocks on a connection of its
+//! own for as long as Neovim takes to draw for it, and has nothing to tell
+//! the loop: its work arrives on the client's own socket ([`refresh`]).
 
 pub mod anim;
 pub mod compose;
 pub mod grid;
 pub mod input;
 pub mod model;
+pub mod pace;
 pub mod predict;
 pub mod redraw;
 pub mod screen;
@@ -115,6 +118,7 @@ use self::anim::{Animator, Effects};
 use self::grid::Cell;
 use self::input::{Input, Mouse, Parser, Reply};
 use self::model::{Changes, Model, Place, Placement};
+use self::pace::Pacer;
 use self::predict::{Command, Mode, Predictor, Side};
 use self::redraw::Event;
 use self::screen::Screen;
@@ -154,6 +158,10 @@ const HOLD_LIMIT: Duration = Duration::from_millis(500);
 /// How long a terminal's answer part way through is waited for, from the last
 /// of it to come, before what has come of it is dropped.
 const REPLY_WAIT: Duration = Duration::from_secs(1);
+
+/// How long a client leaving waits for the answers its terminal still owes
+/// it (see [`pace`]).
+const OWED_WAIT: Duration = Duration::from_millis(500);
 
 /// How soon to ask who is attached again, having found a UI only passing
 /// through grid 1: another nvmux client's refresh, or one attaching again.
@@ -937,12 +945,22 @@ pub struct App {
     /// The first columns windows' views have moved to, as the agent says,
     /// for the next frame: see [`anim::side`].
     lefts: Vec<(i64, usize)>,
+    /// Drawing no faster than the terminal reads, if the config has it: see
+    /// [`pace`].
+    pace: Option<Pacer>,
 }
 
 impl App {
     /// A client drawing with `effects`, predicting scrolls if `predict`
-    /// (see [`predict`]), on a terminal of `size`.
-    pub fn new(term: Palette, effects: Effects, predict: bool, size: (usize, usize)) -> Self {
+    /// (see [`predict`]) and pacing its frames to the terminal if `pace`
+    /// (see [`pace`]), on a terminal of `size`.
+    pub fn new(
+        term: Palette,
+        effects: Effects,
+        predict: bool,
+        pace: bool,
+        size: (usize, usize),
+    ) -> Self {
         Self {
             model: Model::new(term),
             screen: Screen::new(),
@@ -982,6 +1000,7 @@ impl App {
             asked_at: HashMap::new(),
             typed: None,
             lefts: Vec::new(),
+            pace: pace.then(Pacer::new),
         }
     }
 
@@ -1482,6 +1501,11 @@ impl App {
         self.model.refresh_styles();
         if changes.repaint {
             self.screen.invalidate();
+            // How nvmux has a client back in front repaint: the questions it
+            // asked while away went nowhere.
+            if let Some(p) = self.pace.as_mut() {
+                p.forget(now);
+            }
         }
         for bytes in &changes.sent {
             self.say.extend_from_slice(bytes);
@@ -1624,7 +1648,7 @@ impl App {
                     );
                 }
                 Input::Focus(on) => self.outbox.notify("nvim_ui_set_focus", &[Arg::Bool(on)]),
-                Input::Reply(reply) => self.reply(reply),
+                Input::Reply(reply) => self.reply(reply, now),
             }
         }
         self.fence();
@@ -1664,8 +1688,11 @@ impl App {
     }
 
     /// An answer from the terminal: to the client's own keyboard question,
-    /// or for the server.
-    fn reply(&mut self, reply: Reply) {
+    /// or the status question after a frame, or for the server.
+    fn reply(&mut self, reply: Reply, now: Instant) {
+        if reply == Reply::Ready && self.pace.as_mut().is_some_and(|p| p.answered(now)) {
+            return;
+        }
         match (self.keyboard, reply) {
             (Keyboard::Asking, Reply::KittyFlags) => {
                 self.keyboard = Keyboard::Closing;
@@ -1679,6 +1706,12 @@ impl App {
                 self.keyboard = Keyboard::Settled;
             }
             (_, Reply::KittyFlags) => {}
+            (_, Reply::Ready) => {
+                self.outbox.notify(
+                    "nvim_ui_term_event",
+                    &[Arg::str("termresponse"), Arg::Str(input::READY)],
+                );
+            }
             (_, Reply::DeviceAttributes(seq) | Reply::Other(seq)) => {
                 self.outbox.notify(
                     "nvim_ui_term_event",
@@ -2191,6 +2224,9 @@ impl App {
             );
         }
         self.screen.invalidate();
+        if let Some(p) = self.pace.as_mut() {
+            p.forget(Instant::now());
+        }
         self.anim.reset();
         self.dirty = true;
     }
@@ -2242,6 +2278,12 @@ impl App {
         } else {
             self.anim.next_frame(&self.model, now)
         };
+        // A frame held for the terminal is drawn when its answer comes, which
+        // wakes the loop; failing that, when the question is given up on.
+        let frame = match self.pace.as_ref() {
+            Some(p) if frame.is_some() && p.holding(now) => p.until(),
+            _ => frame,
+        };
         [self.escape_deadline(), frame, self.recheck_at]
             .into_iter()
             .flatten()
@@ -2250,7 +2292,7 @@ impl App {
 
     /// Whether a frame is to be drawn now.
     pub fn due(&self, now: Instant) -> bool {
-        if !self.flushed || self.holding(now) {
+        if !self.flushed || self.holding(now) || self.paced(now) {
             return false;
         }
         if self.dirty {
@@ -2263,8 +2305,14 @@ impl App {
             .is_some_and(|at| at <= now)
     }
 
+    /// Whether the terminal is behind: a frame now would queue behind one it
+    /// has not read (see [`pace`]).
+    fn paced(&self, now: Instant) -> bool {
+        self.pace.as_ref().is_some_and(|p| p.holding(now))
+    }
+
     /// The next frame's bytes, with whatever was waiting to be said ahead of
-    /// it.
+    /// it, and the question that asks when the terminal has read them.
     pub fn frame(&mut self, now: Instant) -> Vec<u8> {
         self.anim.advance(now);
         let (w, h) = self.size;
@@ -2274,9 +2322,18 @@ impl App {
         let sync = self.model.options.termsync;
         let mut out = std::mem::take(&mut self.say);
         out.extend_from_slice(&self.screen.draw(frame, &cursor, sync, self.model.links()));
+        if let Some(probe) = self.pace.as_mut().and_then(|p| p.sent(now)) {
+            out.extend_from_slice(probe);
+        }
         self.dirty = false;
         self.last_frame = Some(now);
         out
+    }
+
+    /// Whether the terminal owes the client answers to questions it asked
+    /// (see [`pace`]).
+    pub fn owed(&self) -> bool {
+        self.pace.as_ref().is_some_and(|p| p.owed() > 0)
     }
 
     /// Bytes for the terminal that cannot wait for a frame — the keyboard
@@ -2315,11 +2372,18 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
     let winch = crate::winch::Winch::install()?;
     crate::term::write_stdout(term::OPENING)?;
 
-    let mut app = App::new(term, effects, settings.client.predict, term::size());
+    let mut app = App::new(
+        term,
+        effects,
+        settings.client.predict,
+        settings.client.pace,
+        term::size(),
+    );
     app.start();
     let mut inbox = Inbox::default();
     let stdin = std::io::stdin();
     let mut buf = vec![0u8; 64 * 1024];
+    let mut hung_up = false;
 
     let outcome = loop {
         app.tick(Instant::now());
@@ -2362,6 +2426,7 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
         }
         if n > 0 && crate::pty::ready(&fds[3]) {
             tracing::debug!("client: hung up");
+            hung_up = true;
             break Ok(());
         }
         let now = Instant::now();
@@ -2407,8 +2472,43 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
     };
     // Whatever ended it, the terminal is handed back as it was.
     let _ = app.outbox.send(&mut stream);
+    // But first the answers it owes, which arriving after would be typed at
+    // whatever reads it next. Not hung up: nvmux has stopped passing the
+    // terminal's bytes on by then, and takes them in itself.
+    if !hung_up {
+        take_owed(&mut app, &stdin, &hangup, &mut buf);
+    }
     let _ = crate::term::write_stdout(term::CLOSING);
     outcome
+}
+
+/// Read the terminal for the answers it owes the client, for up to
+/// [`OWED_WAIT`]: see [`pace`].
+fn take_owed(app: &mut App, stdin: &std::io::Stdin, hangup: &term::Hangup, buf: &mut [u8]) {
+    let until = Instant::now() + OWED_WAIT;
+    while app.owed() {
+        let now = Instant::now();
+        if now >= until {
+            tracing::debug!("client: left without every answer it was owed");
+            return;
+        }
+        let ms = (until - now).as_micros().div_ceil(1000) as libc::c_int;
+        let mut fds = [
+            crate::pty::pollfd(stdin.as_raw_fd()),
+            crate::pty::pollfd(hangup.fd()),
+        ];
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if n <= 0 || crate::pty::ready(&fds[1]) || !crate::pty::ready(&fds[0]) {
+            return;
+        }
+        match (&*stdin).read(buf) {
+            Ok(0) | Err(_) => return,
+            Ok(len) => app.keys(&buf[..len], Instant::now()),
+        }
+    }
 }
 
 /// Have Neovim draw the windows of the current tab page afresh for the UIs
@@ -2585,7 +2685,7 @@ mod tests {
             }),
             ..Effects::none()
         };
-        App::new(palette(), effects, false, (20, 6))
+        App::new(palette(), effects, false, false, (20, 6))
     }
 
     fn encoded(v: Value) -> Vec<u8> {
@@ -3022,7 +3122,7 @@ mod tests {
     /// top, the cursor on it, in normal mode with the mouse on.
     fn predicting(rtt: Duration) -> App {
         let t0 = Instant::now();
-        let mut a = App::new(palette(), Effects::none(), true, (20, 6));
+        let mut a = App::new(palette(), Effects::none(), true, false, (20, 6));
         a.start();
         let sent = calls(&mut a);
         answer(
@@ -3357,5 +3457,96 @@ mod tests {
         let sent = calls(&mut a);
         assert!(sent.iter().any(|(_, m, args)| m == "nvim_ui_term_event"
             && args[1].as_slice() == Some(&b"\x1b]52;c;aGVsbG8"[..])));
+    }
+
+    /// Started and attached without windows of its own, pacing its frames,
+    /// with grid 1 drawn.
+    fn paced(t0: Instant) -> App {
+        let mut a = App::new(palette(), Effects::none(), false, true, (20, 6));
+        a.start();
+        let sent = calls(&mut a);
+        answer(
+            &mut a,
+            request(&sent, "nvim_get_api_info", ""),
+            Value::Array(vec![7.into()]),
+            t0,
+        );
+        redraw(&mut a, vec![resize(1, 20, 6)], t0);
+        calls(&mut a);
+        a
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Every frame ends asking the terminal for its status, whose answer
+    /// says the frame has been read.
+    #[test]
+    fn a_frame_asks_when_the_terminal_has_read_it() {
+        let t0 = Instant::now();
+        let mut a = paced(t0);
+        assert!(a.due(t0));
+        assert!(a.frame(t0).ends_with(pace::PROBE));
+        // Not a word of it to the server.
+        a.keys(input::READY, t0 + Duration::from_millis(1));
+        assert_eq!(calls(&mut a), vec![]);
+    }
+
+    /// While the terminal has yet to read the last frame, the next waits;
+    /// when it has, the next is the screen as it is then.
+    #[test]
+    fn no_frame_is_drawn_while_the_terminal_is_behind() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut a = paced(t0);
+        a.frame(t0);
+        a.keys(input::READY, t0 + ms(1));
+        let t1 = t0 + ms(100);
+        redraw(&mut a, vec![line(1, 0, "one")], t1);
+        assert!(a.frame(t1).ends_with(pace::PROBE));
+        let t2 = t1 + ms(20);
+        redraw(&mut a, vec![line(1, 0, "two")], t2);
+        redraw(&mut a, vec![line(1, 0, "six")], t2);
+        assert!(!a.due(t2), "the last frame has not been read");
+        assert_eq!(a.wake_at(t2), Some(t1 + Duration::from_secs(1)));
+        let t3 = t2 + ms(30);
+        a.keys(input::READY, t3);
+        assert!(a.due(t3));
+        let frame = a.frame(t3);
+        assert!(contains(&frame, b"six") && !contains(&frame, b"two"));
+    }
+
+    /// A terminal resized, or repainted — how nvmux brings a parked client
+    /// back to the front — is not waited on for what was asked before.
+    #[test]
+    fn a_resize_lets_go_of_the_questions_out() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut a = paced(t0);
+        a.frame(t0);
+        a.keys(input::READY, t0 + ms(1));
+        let t1 = t0 + ms(100);
+        redraw(&mut a, vec![line(1, 0, "one")], t1);
+        a.frame(t1);
+        let t2 = t1 + ms(20);
+        redraw(&mut a, vec![line(1, 0, "two")], t2);
+        assert!(!a.due(t2));
+        a.resized((20, 6));
+        assert!(a.due(t2));
+    }
+
+    /// A status the client did not ask for is the server's.
+    #[test]
+    fn a_status_nobody_asked_for_goes_to_the_server() {
+        let t0 = Instant::now();
+        let mut a = paced(t0);
+        a.keys(input::READY, t0);
+        let sent = calls(&mut a);
+        assert!(
+            sent.iter().any(|(_, m, args)| m == "nvim_ui_term_event"
+                && args[1].as_slice() == Some(input::READY)),
+            "{sent:?}"
+        );
     }
 }

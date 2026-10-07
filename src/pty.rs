@@ -295,6 +295,11 @@ pub struct Attachment {
     /// [`Attachment::start_ahead`]). One still out when the client is asked
     /// for is handed over with it, to be waited for as a fresh client's is.
     probe: Option<Probe>,
+    /// The status questions the client has had relayed to the terminal this
+    /// relay, and the terminal's answers to them: what it still owes is what
+    /// [`Attachment::take_owed_answers`] takes in.
+    asked: Tally,
+    answered: Tally,
 }
 
 /// How many clients have had their exit sequences relayed to the terminal:
@@ -437,6 +442,58 @@ const PAINT_SETTLED: Duration = Duration::from_millis(150);
 /// A DA1 request: `ESC [ c`. What a departing client sends, and what the two
 /// drains watch for — see [`Attachment::answer_device_attributes`].
 const DA1_REQUEST: &[u8] = b"\x1b[c";
+
+/// The status question nvmux's own client asks after every frame, and the
+/// terminal's answer: see [`crate::client::pace`], and
+/// [`Attachment::take_owed_answers`] for nvmux's part in it.
+const STATUS_REQUEST: &[u8] = b"\x1b[5n";
+const STATUS_ANSWER: &[u8] = b"\x1b[0n";
+
+/// The longest nvmux, on its way back to the shell, waits for answers the
+/// terminal still owes a client it has hung up.
+const OWED_WAIT: Duration = Duration::from_millis(500);
+
+/// Whether the terminal has ever answered a status question: one that has
+/// not is one that does not, and is owed nothing.
+static STATUS_ANSWERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How many times `needle` has gone by in a stream read in pieces — one split
+/// across two pieces included, which the end of a piece kept for the next
+/// is for.
+#[derive(Debug, Clone)]
+struct Tally {
+    needle: &'static [u8],
+    count: u64,
+    tail: Vec<u8>,
+}
+
+impl Tally {
+    fn new(needle: &'static [u8]) -> Self {
+        Self {
+            needle,
+            count: 0,
+            tail: Vec::new(),
+        }
+    }
+
+    /// Count the needles in the next piece, and say how many there were.
+    fn feed(&mut self, bytes: &[u8]) -> u64 {
+        let n = self.needle.len();
+        let is = |w: &[u8]| w == self.needle;
+        let mut found = bytes.windows(n).filter(|w| is(w)).count();
+        // Across the seam: the tail is shorter than a needle, so any match
+        // here starts in it.
+        let mut seam = self.tail.clone();
+        seam.extend_from_slice(&bytes[..bytes.len().min(n - 1)]);
+        found += seam.windows(n).filter(|w| is(w)).count();
+        let mut tail = std::mem::take(&mut self.tail);
+        tail.extend_from_slice(bytes);
+        let keep = tail.len().min(n - 1);
+        self.tail = tail.split_off(tail.len() - keep);
+        self.count += found as u64;
+        found as u64
+    }
+}
 
 /// What a terminal answers a DA1 request with, and what nvmux answers one with
 /// in a terminal's place.
@@ -881,6 +938,7 @@ impl Attachment {
     /// the one read in six that happens to end where a sequence does.
     fn relay_output(&mut self, chunk: &[u8], now: Instant) -> std::io::Result<()> {
         self.ledger_saw(chunk);
+        self.asked.feed(chunk);
         if let Some(hold) = self.hold.as_mut() {
             hold.take(chunk, now);
             if let Some(shadow) = self.shadow.as_mut() {
@@ -1397,12 +1455,67 @@ impl Attachment {
                 Ok(len) => {
                     // Read before the write, because the write borrows `self`.
                     owed |= asks_for_device_attributes(&buf[..len]);
+                    self.asked.feed(&buf[..len]);
                     let _ = write_stdout(&without_device_attributes_request(&buf[..len]));
                     if owed {
                         owed = !self.answer_device_attributes();
                     }
                 }
             }
+        }
+    }
+
+    /// Read what the terminal still owes a client nvmux has hung up — the
+    /// answers to the status questions it asks after its frames (see
+    /// [`crate::client::pace`]) — and drop it, on the way back to the shell.
+    ///
+    /// The client has stopped hearing the terminal by now: nothing passes it
+    /// the terminal's bytes once it is hung up. An answer the terminal owed it
+    /// arrives all the same, at nvmux, which is a few milliseconds from
+    /// handing the terminal back; and what nvmux has not read by then is read
+    /// by the shell, which prints it, `^[[0n` above the next prompt. So the
+    /// answers are read here, in raw mode, as many as were owed — and with
+    /// them anything typed in the meantime, which was typed at no one.
+    ///
+    /// Bounded by [`OWED_WAIT`], for a terminal far behind; and nothing at
+    /// all for a terminal that has never answered one, which owes nothing.
+    fn take_owed_answers(&mut self) {
+        let mut owed = self.asked.count.saturating_sub(self.answered.count);
+        if owed == 0 || !STATUS_ANSWERED.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let stdin_fd = std::io::stdin().as_raw_fd();
+        let until = Instant::now() + OWED_WAIT;
+        let mut buf = [0u8; 4096];
+        while owed > 0 {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                tracing::debug!(owed, "the terminal's answers did not all come");
+                return;
+            }
+            let mut p = [pollfd(stdin_fd)];
+            let ms = left.as_micros().div_ceil(1000) as libc::c_int;
+            let n = unsafe { libc::poll(p.as_mut_ptr(), 1, ms) };
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if n <= 0 || !ready(&p[0]) {
+                return;
+            }
+            match read_fd(stdin_fd, &mut buf) {
+                Ok(len) if len > 0 => {
+                    owed = owed.saturating_sub(self.answered.feed(&buf[..len]));
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// The terminal said this, to the client: answers to its status
+    /// questions among it are counted (see [`Attachment::take_owed_answers`]).
+    fn heard(&mut self, bytes: &[u8]) {
+        if self.answered.feed(bytes) > 0 {
+            STATUS_ANSWERED.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -2439,6 +2552,8 @@ fn spawn_client_with(
         exits_seen: 0,
         unshown: None,
         probe: None,
+        asked: Tally::new(STATUS_REQUEST),
+        answered: Tally::new(STATUS_ANSWER),
     })
 }
 
@@ -2719,6 +2834,7 @@ pub fn relay(
             // is harmless and covers a client that died before it got that far.
             attachment.hang_up();
             attachment.drain_until_eof();
+            attachment.take_owed_answers();
             raw.restore();
             attachment.reap();
             term::reset_screen();
@@ -2735,6 +2851,7 @@ pub fn relay(
             // dropped on the way out, which retires the client.
             attachment.hang_up();
             attachment.drain_until_eof();
+            attachment.take_owed_answers();
             raw.restore();
             attachment.reap();
             term::reset_screen();
@@ -2779,6 +2896,10 @@ fn pump(
     // it. Measured from the start of the relay, which is the moment the
     // terminal became the new session's to paint.
     let relay_started = Instant::now();
+    // What the terminal owes the client is counted afresh: a client back in
+    // front asked nothing while it was away (see `take_owed_answers`).
+    attachment.asked = Tally::new(STATUS_REQUEST);
+    attachment.answered = Tally::new(STATUS_ANSWER);
     let mut first_byte: Option<Duration> = None;
     let mut painted_bytes = 0usize;
     let mut last_byte = Instant::now();
@@ -3048,6 +3169,7 @@ fn pump(
                 Ok(0) => return Ok(Outcome::StdinClosed),
                 Err(e) => return Err(NvmuxError::Io(e)),
                 Ok(len) => {
+                    attachment.heard(&buf[..len]);
                     // Deliberately NOT logged: every keystroke the user types,
                     // into a /tmp file that outlives the session.
                     for mut step in prefix.feed(&buf[..len]) {
@@ -5628,5 +5750,26 @@ mod tests {
                 "{left_alone:?} was rewritten"
             );
         }
+    }
+
+    /// The status questions and answers are counted however the reads cut
+    /// them: whole, several to a read, or split between two.
+    #[test]
+    fn a_tally_counts_what_a_read_cuts_in_two() {
+        let mut t = Tally::new(STATUS_ANSWER);
+        assert_eq!(t.feed(b"\x1b[0n"), 1);
+        assert_eq!(t.feed(b"x\x1b[0n\x1b[0ny"), 2);
+        assert_eq!(t.feed(b"\x1b["), 0);
+        assert_eq!(t.feed(b"0n"), 1);
+        // One byte at a time.
+        for (i, b) in STATUS_ANSWER.iter().enumerate() {
+            let last = i + 1 == STATUS_ANSWER.len();
+            assert_eq!(t.feed(&[*b]), u64::from(last));
+        }
+        assert_eq!(t.count, 5);
+        // Nothing counted twice, nor anything like it counted at all.
+        assert_eq!(t.feed(b"\x1b[3n\x1b[0m"), 0);
+        assert_eq!(t.feed(b""), 0);
+        assert_eq!(t.count, 5);
     }
 }

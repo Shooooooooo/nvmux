@@ -175,6 +175,21 @@ pub struct ClientSettings {
     /// and those colours, as the view moves. Off, every scroll waits for
     /// Neovim.
     pub predict: bool,
+    /// Draw no faster than the terminal reads: after every frame the client
+    /// asks the terminal for its status, and while an answer is late — the
+    /// frame queued behind others the terminal has yet to read — it draws
+    /// nothing more, and then the screen as it is by the time the answer
+    /// comes. A terminal slower than the client's frames — a scroll sliding
+    /// draws the whole window sixty and more times a second — is shown the
+    /// newest frame a frame or so late, rather than every frame as late as
+    /// all those buffered before it. nvmux's own client only (see
+    /// [`crate::client::pace`]).
+    ///
+    /// What it costs: four bytes after every frame and four back, and a
+    /// slide that takes fewer, larger steps on a terminal that cannot keep
+    /// up. Off, every frame is drawn, however far behind that leaves the
+    /// terminal.
+    pub pace: bool,
 }
 
 impl Default for ClientSettings {
@@ -184,6 +199,7 @@ impl Default for ClientSettings {
             per_session: true,
             lazy: true,
             predict: true,
+            pace: true,
         }
     }
 }
@@ -955,6 +971,10 @@ fn render_default_config(prefix: u8) -> String {
          # colours, if tree-sitter gives them, until Neovim's own arrive. false\n\
          # waits for Neovim.\n\
          # predict = {predict}\n\
+         # nvmux's own client: no frame is drawn while the terminal is still\n\
+         # reading the last, so a terminal slower than a sliding scroll shows\n\
+         # the newest frame rather than every frame late. false draws them all.\n\
+         # pace = {pace}\n\
          \n\
          [effects]\n\
          # The master switch: false turns every effect below off, whatever its\n\
@@ -1035,6 +1055,7 @@ fn render_default_config(prefix: u8) -> String {
         per_session = c.per_session,
         lazy = c.lazy,
         predict = c.predict,
+        pace = c.pace,
         fade_enabled = f.enabled,
         fade_duration = f.duration_ms,
         fade_session = f.session,
@@ -1164,6 +1185,7 @@ mod tests {
             per_session = true\n\
             lazy = true\n\
             predict = true\n\
+            pace = true\n\
             [effects]\n\
             enabled = true\n\
             [effects.fade]\n\
@@ -1342,6 +1364,15 @@ mod tests {
         let s: Settings =
             toml::from_str("[client]\nper_session = false\nlazy = false\n").expect("valid");
         assert!(!s.client.lazy && !s.client.per_session);
+    }
+
+    /// Frames are paced to the terminal unless turned off.
+    #[test]
+    fn frames_are_paced_unless_turned_off() {
+        assert!(Settings::default().client.pace);
+        let s: Settings = toml::from_str("[client]\npace = false\n").expect("valid");
+        assert!(!s.client.pace);
+        assert!(s.client.predict, "the rest as it was");
     }
 
     /// Scrolls are predicted over a slow link unless turned off.
@@ -1617,6 +1648,7 @@ mod tests {
             "# lazy = true",
             "# ui = \"nvmux\"",
             "# predict = true",
+            "# pace = true",
             "# enabled     = true",
             "# duration_ms = 200",
             "# session     = true",

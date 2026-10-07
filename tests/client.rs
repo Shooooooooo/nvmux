@@ -42,6 +42,10 @@ const DA1_REPLY: &[u8] = b"\x1b[?62;22c";
 const DA1_REPLY_OSC52: &[u8] = b"\x1b[?62;22;52c";
 const KITTY_QUERY: &[u8] = b"\x1b[?u";
 const KITTY_REPLY: &[u8] = b"\x1b[?0u";
+/// The status question the client asks after every frame, and "ready": a
+/// terminal answering it is a terminal the client paces its frames to.
+const STATUS_QUERY: &[u8] = b"\x1b[5n";
+const STATUS_REPLY: &[u8] = b"\x1b[0n";
 
 /// The terminal a client draws on.
 struct Terminal {
@@ -49,6 +53,9 @@ struct Terminal {
     /// The exit code, once the child has been seen to exit; it must not be
     /// signalled or waited for again after that.
     exited: Option<u32>,
+    /// Hung up as nvmux hangs a client up, after which nothing the terminal
+    /// says reaches it — its answers included, as nvmux passes nothing on.
+    hung_up: bool,
     writer: Box<dyn Write + Send>,
     /// Everything the client has written, in order, and the screen it makes.
     output: Vec<u8>,
@@ -109,6 +116,7 @@ impl Terminal {
         Self {
             child,
             exited: None,
+            hung_up: false,
             writer,
             output: Vec::new(),
             parser: vt100::Parser::new(ROWS, COLS, 0),
@@ -157,9 +165,16 @@ impl Terminal {
     /// query may straddle two reads, so the scan starts a little before where
     /// it left off and counts only matches that end past it.
     fn answer(&mut self) {
+        if self.hung_up {
+            return;
+        }
         let from = self.answered.saturating_sub(8);
         let mut replies = Vec::new();
-        for (query, reply) in [(KITTY_QUERY, KITTY_REPLY), (DA1, self.da1)] {
+        for (query, reply) in [
+            (KITTY_QUERY, KITTY_REPLY),
+            (DA1, self.da1),
+            (STATUS_QUERY, STATUS_REPLY),
+        ] {
             let mut at = from;
             while let Some(i) = find(&self.output[at..], query).map(|i| at + i) {
                 if i + query.len() > self.answered {
@@ -199,6 +214,7 @@ impl Terminal {
 
     /// Hang the client up as nvmux retires one, and say how it exited.
     fn hang_up(&mut self) -> Option<u32> {
+        self.hung_up = true;
         let pid = self.child.process_id().expect("the client's pid");
         nix::sys::signal::kill(Pid::from_raw(pid as i32), Signal::SIGHUP).expect("SIGHUP");
         let deadline = Instant::now() + Duration::from_secs(5);

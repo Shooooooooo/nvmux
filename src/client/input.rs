@@ -62,9 +62,16 @@ pub enum Reply {
     DeviceAttributes(Vec<u8>),
     /// The kitty keyboard protocol's flags: `CSI ? flags u`.
     KittyFlags,
+    /// Status: `CSI 0 n`, "ready" — the answer to the question the client
+    /// asks after a frame (see `super::pace`), and to anybody else's.
+    Ready,
     /// Anything else, as the server is to be handed it.
     Other(Vec<u8>),
 }
+
+/// A status report of "ready", as a terminal spells it and the server is
+/// handed it.
+pub const READY: &[u8] = b"\x1b[0n";
 
 /// A mouse report, in `nvim_input_mouse`'s terms, at a cell of the screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -582,6 +589,9 @@ fn csi(bytes: &[u8], final_: bool) -> Step {
         (Some(_), _) => Some(Input::Reply(Reply::Other(seq.to_vec()))),
         (None, b'I') if params.is_empty() => Some(Input::Focus(true)),
         (None, b'O') if params.is_empty() => Some(Input::Focus(false)),
+        (None, b'n') if intermediates.is_empty() && params.len() == 1 && params.get(0) == 0 => {
+            Some(Input::Reply(Reply::Ready))
+        }
         // Device status, window reports: answers, not keys.
         (None, b'n' | b't') => Some(Input::Reply(Reply::Other(seq.to_vec()))),
         // A cursor position report — unless it is F3 with a modifier, which
@@ -1037,9 +1047,10 @@ mod tests {
             read(b"\x1bP1+r5463\x1b\\"),
             vec![Input::Reply(Reply::Other(b"\x1bP1+r5463".to_vec()))]
         );
+        assert_eq!(read(b"\x1b[0n"), vec![Input::Reply(Reply::Ready)]);
         assert_eq!(
-            read(b"\x1b[0n"),
-            vec![Input::Reply(Reply::Other(b"\x1b[0n".to_vec()))]
+            read(b"\x1b[3n"),
+            vec![Input::Reply(Reply::Other(b"\x1b[3n".to_vec()))]
         );
         assert_eq!(
             read(b"\x1b[?2026;2$y"),
