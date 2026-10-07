@@ -94,6 +94,42 @@ pub struct CursorPos {
     pub col: usize,
 }
 
+/// What part of its buffer a window shows, as `win_viewport` last said: all
+/// of it zero-based, `botline` as Neovim counts it (see
+/// [`Viewport::one_to_one`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Viewport {
+    pub topline: i64,
+    pub botline: i64,
+    pub curline: i64,
+    /// The cursor's column, in bytes.
+    pub curcol: i64,
+    pub line_count: i64,
+}
+
+impl Viewport {
+    /// Whether the window's `rows` rows show its buffer's lines one to a row
+    /// — nothing folded, wrapped, or put between them — as far as its view
+    /// says. A window showing them so has its `botline` one past its last
+    /// line, or `line_count` when it ends on the buffer's last line exactly,
+    /// or one past `line_count` when there are rows past the end.
+    pub fn one_to_one(&self, rows: usize) -> bool {
+        let end = self.topline + rows as i64;
+        let expected = match end.cmp(&self.line_count) {
+            std::cmp::Ordering::Less => end + 1,
+            std::cmp::Ordering::Equal => self.line_count,
+            std::cmp::Ordering::Greater => self.line_count + 1,
+        };
+        self.topline >= 0 && self.botline == expected
+    }
+
+    /// How many of the window's `rows` rows show the buffer's lines, and not
+    /// rows past its end — of a view that is one to one.
+    pub fn lines_shown(&self, rows: usize) -> usize {
+        (self.line_count - self.topline).clamp(0, rows as i64) as usize
+    }
+}
+
 /// The options Neovim tells a UI about that change how this one draws.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
@@ -159,6 +195,8 @@ pub struct Model {
     /// The window each window's grid shows, as `win_viewport` and the
     /// placements name it.
     pub wins: BTreeMap<u64, i64>,
+    /// What each window shows of its buffer, by grid.
+    pub viewports: HashMap<u64, Viewport>,
     /// The rows and columns of a window's grid that are not its text, by
     /// grid. Their own map rather than part of a placement: Neovim sends them
     /// before it places a window, and not again when it places it anew.
@@ -198,6 +236,7 @@ impl Model {
             grids: BTreeMap::new(),
             layout: BTreeMap::new(),
             wins: BTreeMap::new(),
+            viewports: HashMap::new(),
             margins: HashMap::new(),
             cursor: CursorPos {
                 grid: 1,
@@ -312,6 +351,7 @@ impl Model {
                 self.grids.remove(&grid);
                 self.layout.remove(&grid);
                 self.wins.remove(&grid);
+                self.viewports.remove(&grid);
                 self.margins.remove(&grid);
                 changes.reshaped.push(grid);
             }
@@ -418,16 +458,32 @@ impl Model {
             Event::WinClose { grid } => {
                 self.layout.remove(&grid);
                 self.wins.remove(&grid);
+                self.viewports.remove(&grid);
             }
             Event::WinViewport {
                 grid,
                 win,
+                topline,
+                botline,
+                curline,
+                curcol,
+                line_count,
                 scroll_delta,
                 ..
             } => {
                 if let Some(win) = win {
                     self.wins.insert(grid, win);
                 }
+                self.viewports.insert(
+                    grid,
+                    Viewport {
+                        topline,
+                        botline,
+                        curline,
+                        curcol,
+                        line_count,
+                    },
+                );
                 if scroll_delta != 0 {
                     *changes.scrolled.entry(grid).or_default() += scroll_delta;
                     if let Some(win) = win {
@@ -628,6 +684,27 @@ mod tests {
             m.apply(e, &mut changes);
         }
         changes
+    }
+
+    /// What Neovim sends for a 22-row window over 30 lines, scrolled to
+    /// each kind of place, and for views that are not one line to a row.
+    #[test]
+    fn a_view_one_to_one_is_told_by_its_botline() {
+        let v = |topline, botline| Viewport {
+            topline,
+            botline,
+            curline: 0,
+            curcol: 0,
+            line_count: 30,
+        };
+        assert!(v(0, 23).one_to_one(22));
+        assert!(v(8, 30).one_to_one(22), "ending on the last line exactly");
+        assert!(v(9, 31).one_to_one(22), "a row past the end");
+        assert!(v(29, 31).one_to_one(22), "the last line at the top");
+        assert!(!v(0, 22).one_to_one(22), "a line taking two rows");
+        assert!(!v(0, 25).one_to_one(22), "lines folded away");
+        assert_eq!(v(9, 31).lines_shown(22), 21);
+        assert_eq!(v(0, 23).lines_shown(22), 22);
     }
 
     /// The cursor's place on the screen is its grid's place plus its own.

@@ -138,6 +138,26 @@ particles and a fading blink can be turned on under `[effects]`. Set
 the terminal can do reaches the editor as Neovim negotiates it, not through
 nvmux.
 
+### Over a slow link
+
+Over ssh, what Neovim draws reaches you a round trip after the key that
+asked for it. A scroll is one of the few things whose outcome nvmux's own
+client can work out for itself, so once the round trip passes about 30 ms it
+scrolls the window at once and lets Neovim catch up — for `<C-e>`, `<C-y>`,
+`<C-d>`, `<C-u>`, `<C-f>`, `<C-b>`, `<PageDown>`, `<PageUp>`, `zt`, `zz`, `zb`
+and the rest of the `z` scrolls, with their counts, and the mouse wheel, with
+Shift or Ctrl a page; in Insert mode for `<PageDown>`, `<PageUp>`,
+`<S-Down>`, `<S-Up>`, `<C-x><C-e>`, `<C-x><C-y>` and the wheel; and sideways,
+in a window that does not wrap, for `zl`, `zh`, `zL`, `zH`, `zs`, `ze` and the
+wheel left and right. Pages typed faster than the link answers keep up, up to
+eight windows ahead of Neovim. The rows a scroll uncovers come in plain text,
+from lines the client keeps either side of each view, and take on their
+colours, signs and virtual text when Neovim's own rows arrive. It does this
+only where it can be right — no folds, wrapped lines or virtual lines in the
+way, nothing mapped to the key, no key before it still on its way — and
+whatever Neovim does instead wins. `predict = false` under `[client]` turns it
+off.
+
 ## Configuration
 
 nvmux needs no configuration. An optional TOML file — `$NVMUX_CONFIG` if set,
@@ -159,6 +179,7 @@ command = "nvim --headless --listen {sock}"   # {sock} is required
 ui          = "nvmux" # who draws a session: nvmux's own client, animated; or "nvim"
 per_session = true    # keep each session's client; a switch back reuses it
 lazy        = true    # start a client on its first visit; false starts all at launch
+predict     = true    # over a slow link, scrolls show before Neovim answers
 
 [effects]
 enabled = true   # master switch: false turns every effect below off
