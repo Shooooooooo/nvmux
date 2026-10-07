@@ -151,12 +151,14 @@ Shift or Ctrl a page; in Insert mode for `<PageDown>`, `<PageUp>`,
 in a window that does not wrap, for `zl`, `zh`, `zL`, `zH`, `zs`, `ze` and the
 wheel left and right. Pages typed faster than the link answers keep up, and
 past eight windows ahead of Neovim each shows as soon as its lines arrive. The
-rows a scroll uncovers come in plain text, from lines the client keeps either
-side of each view, and take on their colours, signs and virtual text when
-Neovim's own rows arrive. It does this only where it can be right — no folds,
-wrapped lines or virtual lines in the way, nothing mapped to the key, no key
-before it still on its way — and whatever Neovim does instead wins.
-`predict = false` under `[client]` turns it off.
+rows a scroll uncovers come from lines the client keeps either side of each
+view, in the colours tree-sitter and highlights on the buffer (a language
+server's semantic tokens, say) give them, and take on their signs, virtual
+text and any `:syntax` colours when Neovim's own rows arrive. It does this
+only where it can be right — no folds, wrapped lines or virtual lines in the
+way, nothing mapped to the key, no key before it still on its way — and
+whatever Neovim does instead wins. `predict = false` under `[client]` turns it
+off.
 
 ## Configuration
 

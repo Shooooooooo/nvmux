@@ -40,10 +40,14 @@
 //! the buffer changes, only the lines that did, which the client splices
 //! into what it has; of a long line, no more than the window could show
 //! ([`known`]) — with what it takes to draw them as the window would
-//! ([`Shape`]). A row drawn from that is the line's text and its number, in
-//! the colours the window's own rows are drawn in, and nothing more: no
-//! syntax colours, no signs, no virtual text. It is on the screen for the
-//! round trip it takes Neovim's own row to arrive.
+//! ([`Shape`]), and the colours the editor's own highlighting gives them —
+//! its tree-sitter captures, and the highlights put on the buffer, such as a
+//! language server's semantic tokens — sent again where an edit or a new
+//! parse changes them. A row drawn from that is the line's text and its
+//! number, in those colours over the window's own, and nothing more: no
+//! signs, no virtual text, no `:syntax` colours, which Neovim cannot say for
+//! lines it has not drawn. It is on the screen for the round trip it takes
+//! Neovim's own row to arrive.
 //!
 //! A buffer that comes into a window is sent two windows each way at first,
 //! the rest a moment later, and pages typed in that moment can outrun the
@@ -204,6 +208,45 @@ fn strings(v: Option<&ValueRef<'_>>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// A run of bytes of a line in an editor's highlight group, the end
+/// `usize::MAX` for one that runs to the end of the line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+    pub group: u32,
+}
+
+/// A line the agent sent: its text, and the colours the editor's own
+/// highlighting gives it, later spans over earlier ones.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct Line {
+    text: String,
+    spans: Vec<Span>,
+}
+
+/// The spans of a line as the agent sends them: start, end and group, flat,
+/// an end of -1 running to the end of the line.
+fn spans(v: Option<&ValueRef<'_>>) -> Vec<Span> {
+    let Some(a) = v.and_then(ValueRef::as_array) else {
+        return Vec::new();
+    };
+    a.chunks_exact(3)
+        .filter_map(|c| {
+            let (start, end, group) = (
+                redraw::int(&c[0])?,
+                redraw::int(&c[1])?,
+                redraw::int(&c[2])?,
+            );
+            Some(Span {
+                start: usize::try_from(start).ok()?,
+                end: usize::try_from(end).unwrap_or(usize::MAX),
+                group: u32::try_from(group).ok()?,
+            })
+        })
+        .collect()
+}
+
 /// The lines the agent has sent of a window's buffer: a run of them from
 /// `first`, as they were at `tick`, none longer than `cap` bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -211,7 +254,7 @@ struct Lines {
     buf: i64,
     tick: i64,
     first: i64,
-    text: Vec<String>,
+    text: Vec<Line>,
     /// The agent sends no more of a line than the window could show, and a
     /// little over; a line this long, give or take a character cut in two,
     /// may be longer in the buffer.
@@ -227,15 +270,7 @@ impl Lines {
     /// of what the client has and follows the same rule: a run of the same
     /// buffer as it was at the same change, touching what is here, joins it;
     /// anything else — or a run it says is to start afresh — replaces it.
-    fn take(
-        &mut self,
-        buf: i64,
-        tick: i64,
-        first: i64,
-        text: Vec<String>,
-        cap: usize,
-        fresh: bool,
-    ) {
+    fn take(&mut self, buf: i64, tick: i64, first: i64, text: Vec<Line>, cap: usize, fresh: bool) {
         let end = first + text.len() as i64;
         let joins = !fresh
             && buf == self.buf
@@ -255,7 +290,7 @@ impl Lines {
         }
         self.cap = self.cap.min(cap);
         let start = self.first.min(first);
-        let mut all = vec![String::new(); joined];
+        let mut all = vec![Line::default(); joined];
         for (i, line) in std::mem::take(&mut self.text).into_iter().enumerate() {
             all[(self.first - start) as usize + i] = line;
         }
@@ -284,7 +319,10 @@ impl Lines {
             let mut text = std::mem::take(&mut self.text);
             let tail = text.split_off(after);
             text.truncate(before);
-            text.extend(s.text);
+            text.extend(s.text.into_iter().map(|text| Line {
+                text,
+                spans: Vec::new(),
+            }));
             text.extend(tail);
             if text.len() > MAX_LINES {
                 *self = Lines::default();
@@ -299,13 +337,33 @@ impl Lines {
         self.cap = self.cap.min(s.cap);
     }
 
-    fn get(&self, buf: i64, lnum: i64) -> Option<&str> {
+    fn line(&self, buf: i64, lnum: i64) -> Option<&Line> {
         if buf != self.buf || lnum < self.first {
             return None;
         }
-        self.text
-            .get((lnum - self.first) as usize)
-            .map(String::as_str)
+        self.text.get((lnum - self.first) as usize)
+    }
+
+    fn get(&self, buf: i64, lnum: i64) -> Option<&str> {
+        self.line(buf, lnum).map(|l| l.text.as_str())
+    }
+
+    /// Take the colours the agent says lines from `first` have now, the
+    /// buffer at `tick`: the editor's highlighting changed, or the lines
+    /// did. Lines not kept, or kept as they were at another change, are
+    /// passed over.
+    fn recolour(&mut self, buf: i64, tick: i64, first: i64, spans: Vec<Vec<Span>>) {
+        if buf != self.buf || tick != self.tick {
+            return;
+        }
+        for (i, spans) in spans.into_iter().enumerate() {
+            let lnum = first + i as i64;
+            if lnum >= self.first {
+                if let Some(line) = self.text.get_mut((lnum - self.first) as usize) {
+                    line.spans = spans;
+                }
+            }
+        }
     }
 
     /// Whether line `lnum` may have been cut short. A character cut in two
@@ -398,14 +456,14 @@ fn most(values: impl Iterator<Item = u32>) -> u32 {
 /// would draw it, with the cursor on line `cursor`. `None` where a window
 /// that wraps would take more than one row for it.
 pub fn render(
-    text: Option<&str>,
+    text: Option<(&str, &[Span])>,
     shape: &Shape,
     lnum: i64,
     width: usize,
     look: &Look,
     cursor: i64,
 ) -> Option<Vec<Cell>> {
-    let Some(text) = text else {
+    let Some((text, spans)) = text else {
         if let Some(row) = look.eob.as_ref().filter(|row| row.len() == width) {
             return Some(row.clone());
         }
@@ -446,7 +504,7 @@ pub fn render(
         }
     }
     let room = width - textoff;
-    let fits = line(text, shape, look.text, room, &mut row);
+    let fits = line(text, spans, shape, look.text, room, &mut row);
     if shape.wrap && !fits {
         return None;
     }
@@ -460,13 +518,21 @@ pub fn render(
     Some(row)
 }
 
-/// Append the cells of a line's text in highlight `hl`, from display column
+/// Append the cells of a line's text in highlight `base` — or where `spans`
+/// colour it, their groups laid over it — from display column
 /// `shape.leftcol`, `room` of them at most. Says whether the whole line fits
 /// in `room`.
-fn line(text: &str, shape: &Shape, hl: u32, room: usize, row: &mut Vec<Cell>) -> bool {
+fn line(
+    text: &str,
+    spans: &[Span],
+    shape: &Shape,
+    base: u32,
+    room: usize,
+    row: &mut Vec<Cell>,
+) -> bool {
     let from = shape.leftcol;
     let shown = |vcol: usize| vcol >= from && vcol - from < room;
-    let put = |row: &mut Vec<Cell>, vcol: usize, text: Text| {
+    let put = |row: &mut Vec<Cell>, vcol: usize, text: Text, hl: u32| {
         if shown(vcol) {
             row.push(Cell { text, hl });
         }
@@ -474,7 +540,13 @@ fn line(text: &str, shape: &Shape, hl: u32, room: usize, row: &mut Vec<Cell>) ->
     let mut vcol = 0usize;
     // Where the last character went, for a combining mark after it.
     let mut last: Option<usize> = None;
-    for c in text.chars() {
+    for (at, c) in text.char_indices() {
+        let hl = spans
+            .iter()
+            .rev()
+            .find(|s| s.start <= at && at < s.end)
+            .map_or(base, |s| super::model::syntax_hl(base, s.group));
+        let put = |row: &mut Vec<Cell>, vcol: usize, text: Text| put(row, vcol, text, hl);
         if c.width() != Some(0) {
             last = shown(vcol).then_some(row.len());
         }
@@ -932,7 +1004,7 @@ pub fn shifted<'a>(
     to: usize,
     shape: &Shape,
     look: &Look,
-    text: impl Fn(usize) -> Option<Option<&'a str>>,
+    text: impl Fn(usize) -> Option<Option<(&'a str, &'a [Span])>>,
 ) -> Option<Vec<Vec<Cell>>> {
     let moved = Shape {
         leftcol: to,
@@ -1425,10 +1497,19 @@ impl Predictor {
                 else {
                     return true;
                 };
+                let colours = v.get(7).and_then(ValueRef::as_array);
                 let text = v
                     .get(4)
                     .and_then(ValueRef::as_array)
-                    .map(|a| a.iter().map(lossy).collect())
+                    .map(|a| {
+                        a.iter()
+                            .enumerate()
+                            .map(|(i, t)| Line {
+                                text: lossy(t),
+                                spans: spans(colours.and_then(|c| c.get(i))),
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let fresh = matches!(v.get(5), Some(ValueRef::Boolean(true)));
                 let cap = int(6).map_or(usize::MAX, |c| c.max(0) as usize);
@@ -1463,6 +1544,22 @@ impl Predictor {
                         text,
                         cap,
                     });
+                }
+                true
+            }
+            "spans" => {
+                let (Some(win), Some(buf), Some(tick), Some(first)) =
+                    (int(0), int(1), int(2), int(3))
+                else {
+                    return true;
+                };
+                let lines = v
+                    .get(4)
+                    .and_then(ValueRef::as_array)
+                    .map(|a| a.iter().map(|l| spans(Some(l))).collect())
+                    .unwrap_or_default();
+                if let Some(kept) = self.lines.get_mut(&win) {
+                    kept.recolour(buf, tick, first, lines);
                 }
                 true
             }
@@ -1540,9 +1637,17 @@ impl Predictor {
             .is_some_and(|(shape, lines)| lines.cut(shape.buf, lnum))
     }
 
+    /// The text of buffer line `lnum` of window `win`, and the colours the
+    /// editor's highlighting gives it, as the agent sent them.
+    pub fn coloured(&self, win: i64, lnum: i64) -> Option<(&str, &[Span])> {
+        let shape = self.shapes.get(&win)?;
+        let line = self.lines.get(&win)?.line(shape.buf, lnum)?;
+        Some((line.text.as_str(), line.spans.as_slice()))
+    }
+
     /// Buffer line `lnum` of window `win` as a row of it would draw it — see
     /// [`render`] — or `None` where the client cannot say: a line the agent
-    /// has not sent.
+    /// has not sent. Its text is in the colours the agent sent with it.
     pub fn row(
         &self,
         win: i64,
@@ -1558,7 +1663,8 @@ impl Predictor {
         let text = if lnum >= shape.line_count {
             None
         } else {
-            Some(self.lines.get(&win)?.get(shape.buf, lnum)?)
+            let line = self.lines.get(&win)?.line(shape.buf, lnum)?;
+            Some((line.text.as_str(), line.spans.as_slice()))
         };
         render(text, shape, lnum, width, look, cursor)
     }
@@ -1607,6 +1713,11 @@ mod tests {
         }
     }
 
+    /// A line's text with no colours of its own.
+    fn plain(text: &str) -> Option<(&str, &[Span])> {
+        Some((text, &[]))
+    }
+
     fn look() -> Look {
         Look {
             gutter: vec![18; 4],
@@ -1624,11 +1735,42 @@ mod tests {
         String::from_utf8(b).unwrap()
     }
 
+    /// Spans colour the bytes they cover, a group laid over the window's own
+    /// colour; one later in the list over one before it; one with no end to
+    /// the end of the line — whatever the characters are as wide as.
+    #[test]
+    fn spans_colour_what_they_cover() {
+        use crate::client::model::syntax_hl;
+        let s = Shape {
+            textoff: 0,
+            number: false,
+            ..shape()
+        };
+        let span = |start, end, group| Span { start, end, group };
+        let l = Look { text: 7, ..look() };
+        // "if x\t日y": bytes 0-1 `if`, 3 `x`, 4 a tab to column 8, 5-7 `日`,
+        // 8 `y`.
+        let spans = [
+            span(0, 2, 40),
+            span(0, 9, 41),
+            span(0, 2, 42),
+            span(5, usize::MAX, 43),
+        ];
+        let row = render(Some(("if x\t日y", &spans)), &s, 0, 12, &l, 0).unwrap();
+        let hls: Vec<u32> = row.iter().map(|c| c.hl).collect();
+        let (kw, word, tail) = (syntax_hl(7, 42), syntax_hl(7, 41), syntax_hl(7, 43));
+        assert_eq!(
+            hls,
+            [kw, kw, word, word, word, word, word, word, tail, tail, tail, 7],
+            "if, a blank and x, a tab to 8, 日 twice wide and y, then the rest"
+        );
+    }
+
     /// The number right-aligned in the gutter, a blank after it, as Neovim
     /// draws `'number'`; the text in the window's own colour.
     #[test]
     fn a_row_has_its_number_and_its_text() {
-        let row = render(Some("let x = 1;"), &shape(), 22, 20, &look(), 3).unwrap();
+        let row = render(plain("let x = 1;"), &shape(), 22, 20, &look(), 3).unwrap();
         assert_eq!(text(&row), " 23 let x = 1;      ");
         assert!(row[..4].iter().all(|c| c.hl == 18));
         assert!(row[4..].iter().all(|c| c.hl == 0));
@@ -1641,14 +1783,14 @@ mod tests {
             relativenumber: true,
             ..shape()
         };
-        let row = render(Some("x"), &s, 22, 8, &look(), 30).unwrap();
+        let row = render(plain("x"), &s, 22, 8, &look(), 30).unwrap();
         assert_eq!(text(&row), "  8 x   ");
         let s = Shape {
             number: false,
             relativenumber: false,
             ..shape()
         };
-        let row = render(Some("x"), &s, 22, 8, &look(), 30).unwrap();
+        let row = render(plain("x"), &s, 22, 8, &look(), 30).unwrap();
         assert_eq!(text(&row), "    x   ");
     }
 
@@ -1661,13 +1803,13 @@ mod tests {
             tabstop: 4,
             ..shape()
         };
-        let row = render(Some("a\tb\x01c"), &s, 0, 12, &look(), 0).unwrap();
+        let row = render(plain("a\tb\x01c"), &s, 0, 12, &look(), 0).unwrap();
         assert_eq!(text(&row), "a   b^Ac    ");
-        let row = render(Some("日x"), &s, 0, 5, &look(), 0).unwrap();
+        let row = render(plain("日x"), &s, 0, 5, &look(), 0).unwrap();
         assert_eq!(row[0].text, Text::Char('日'));
         assert_eq!(row[1].text, Text::Half);
         assert_eq!(row[2].text, Text::Char('x'));
-        let row = render(Some("e\u{301}x"), &s, 0, 3, &look(), 0).unwrap();
+        let row = render(plain("e\u{301}x"), &s, 0, 3, &look(), 0).unwrap();
         assert_eq!(row[0].text, Text::Cluster("e\u{301}".into()));
         assert_eq!(row[1].text, Text::Char('x'));
         let listed = Shape {
@@ -1675,7 +1817,7 @@ mod tests {
             tab: vec!['>', '-'],
             ..s.clone()
         };
-        let row = render(Some("\tx"), &listed, 0, 6, &look(), 0).unwrap();
+        let row = render(plain("\tx"), &listed, 0, 6, &look(), 0).unwrap();
         assert_eq!(text(&row), ">---x ");
     }
 
@@ -1687,13 +1829,13 @@ mod tests {
             textoff: 0,
             ..shape()
         };
-        assert_eq!(render(Some("abcdefgh"), &s, 0, 6, &look(), 0), None);
+        assert_eq!(render(plain("abcdefgh"), &s, 0, 6, &look(), 0), None);
         let s = Shape {
             wrap: false,
             leftcol: 2,
             ..s
         };
-        let row = render(Some("abcdefgh"), &s, 0, 4, &look(), 0).unwrap();
+        let row = render(plain("abcdefgh"), &s, 0, 4, &look(), 0).unwrap();
         assert_eq!(text(&row), "cdef");
     }
 
@@ -2183,7 +2325,7 @@ mod tests {
             ..look()
         };
         let moved = shifted(&rows, 0, 2, &s, &l, |r| {
-            Some((r == 0).then_some("abcdefgh"))
+            Some((r == 0).then_some(("abcdefgh", &[][..])))
         })
         .unwrap();
         let text_of = |row: &[Cell]| text(row);
@@ -2321,6 +2463,72 @@ mod tests {
             "".into(),
         ];
         vec![1000.into(), Value::Array(v)]
+    }
+
+    /// The colours the agent sends come with the lines, go with the lines an
+    /// edit replaces until it sends theirs, and are taken anew for lines kept
+    /// as they are at the change it says.
+    #[test]
+    fn colours_come_with_the_lines_and_after_them() {
+        let mut p = Predictor::default();
+        said(&mut p, "shape", shape_args(100));
+        let flat = |v: &[i64]| Value::Array(v.iter().map(|n| Value::from(*n)).collect());
+        let mut run = lines(1000, 5, 0, &["local a", "b", "c"], true);
+        run.push(99.into());
+        run.push(Value::Array(vec![
+            flat(&[0, 5, 40, 6, -1, 41]),
+            flat(&[]),
+            flat(&[0, 1, 42]),
+        ]));
+        said(&mut p, "lines", run);
+        let colours = |p: &Predictor, l: i64| p.coloured(1000, l).map(|(_, s)| s.to_vec());
+        let span = |start, end, group| Span { start, end, group };
+        assert_eq!(
+            colours(&p, 0),
+            Some(vec![span(0, 5, 40), span(6, usize::MAX, 41)])
+        );
+        assert_eq!(colours(&p, 1), Some(vec![]));
+        assert_eq!(colours(&p, 2), Some(vec![span(0, 1, 42)]));
+        // An edit: the line it brings has no colours till they are sent.
+        said(
+            &mut p,
+            "splice",
+            vec![
+                1000.into(),
+                1.into(),
+                5.into(),
+                6.into(),
+                1.into(),
+                2.into(),
+                1.into(),
+                Value::Array(vec!["B".into()]),
+                99.into(),
+            ],
+        );
+        assert_eq!(colours(&p, 1), Some(vec![]));
+        assert_eq!(colours(&p, 2), Some(vec![span(0, 1, 42)]), "untouched");
+        let recolour = |tick: i64, first: i64, spans: Vec<Value>| {
+            vec![
+                1000.into(),
+                1.into(),
+                tick.into(),
+                first.into(),
+                Value::Array(spans),
+            ]
+        };
+        said(
+            &mut p,
+            "spans",
+            recolour(6, 1, vec![flat(&[0, 1, 43]), flat(&[0, 1, 44])]),
+        );
+        assert_eq!(colours(&p, 1), Some(vec![span(0, 1, 43)]));
+        assert_eq!(colours(&p, 2), Some(vec![span(0, 1, 44)]));
+        said(&mut p, "spans", recolour(5, 1, vec![flat(&[0, 1, 45])]));
+        assert_eq!(
+            colours(&p, 1),
+            Some(vec![span(0, 1, 43)]),
+            "another change's"
+        );
     }
 
     /// An edit the agent says the buffer has had is made to the lines kept:

@@ -1156,3 +1156,94 @@ fn edits_reach_the_client_as_what_they_changed() {
         predicted(&mut term, name, keys);
     }
 }
+
+/// The colours of the window's rows, cell by cell: what a prediction must
+/// get right as well, now that it draws the editor's syntax colours.
+fn colours(term: &Terminal) -> Vec<Vec<(vt100::Color, vt100::Color, bool, bool)>> {
+    let screen = term.parser.screen();
+    (0..22)
+        .map(|r| {
+            (0..COLS)
+                .map(|c| {
+                    screen.cell(r, c).map_or(
+                        (vt100::Color::Default, vt100::Color::Default, false, false),
+                        |x| (x.fgcolor(), x.bgcolor(), x.bold(), x.italic()),
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Rows a scroll uncovers ahead of Neovim wear the colours the editor's
+/// syntax highlighting gives them — lines edited as well, by the API or by
+/// keys: when Neovim's own rows land, not a cell of the window changes, text
+/// or colour.
+#[test]
+fn predicted_rows_wear_the_colours_neovim_gives_them() {
+    require_nvim!();
+    let scratch = Scratch::new("client-colours");
+    let (mut rpc, mut term, _) = drawn_slowly(
+        &scratch,
+        "client-colours",
+        "call setline(1, map(range(1, 600), \
+         '\"local v\" . v:val . \" = \" . v:val . \" -- line \" . v:val')) | \
+         set termguicolors | lua vim.treesitter.start(0, 'lua')",
+    );
+    let step = |term: &mut Terminal, name: &str, keys: &[u8]| {
+        let before = window(term);
+        term.type_bytes(keys);
+        assert!(
+            term.pump(SLOW, |t| window(t) != before),
+            "{name} waited for Neovim:\n{}",
+            term.text()
+        );
+        term.pump_until(Duration::from_millis(30), |_| false);
+        let predicted = (window(term), colours(term));
+        // Coloured, not plain: a keyword, a number and a comment apart, on
+        // all but the lines edited whole into a comment or a string.
+        let coloured = predicted
+            .1
+            .iter()
+            .filter(|row| {
+                let mut kinds: Vec<_> = row
+                    .iter()
+                    .take(20)
+                    .map(|(fg, _, bold, _)| (*fg, *bold))
+                    .collect();
+                kinds.dedup();
+                kinds.len() > 1
+            })
+            .count();
+        assert!(coloured >= 19, "{name}: {coloured} rows of 22 coloured");
+        term.pump_until(4 * SLOW, |_| false);
+        let landed = (window(term), colours(term));
+        assert_eq!(predicted.0, landed.0, "{name}: the text moved");
+        for (r, (p, l)) in predicted.1.iter().zip(&landed.1).enumerate() {
+            assert_eq!(p, l, "{name}: row {r} changed colour when Neovim's landed");
+        }
+    };
+    for (name, keys) in [
+        ("<C-f>", &b"\x06"[..]),
+        ("<C-f> again", b"\x06"),
+        ("<C-b>", b"\x02"),
+        ("the wheel", b"\x1b[<65;10;5M"),
+        ("3<C-e>", b"3\x05"),
+    ] {
+        step(&mut term, name, keys);
+    }
+    // Below the view, as a formatter would: a line made a comment, one a
+    // string, the cursor where it was.
+    rpc.command(
+        "call nvim_buf_set_lines(0, 60, 62, v:true, \
+         ['-- local v61 = 61 -- line 61', 'local s = [[line 62]] -- 62'])",
+    )
+    .expect("edit below");
+    term.pump_until(4 * SLOW, |_| false);
+    step(&mut term, "<C-f> over lines edited", b"\x06");
+    // In the view, by keys: a comment opened below the cursor.
+    typed(&mut term, b"o-- typed, local v = 1");
+    typed(&mut term, b"\x1b");
+    step(&mut term, "<C-f> past a line typed", b"\x06");
+    step(&mut term, "<C-b> back over it", b"\x02");
+}
