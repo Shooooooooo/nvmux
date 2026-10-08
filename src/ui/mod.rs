@@ -657,12 +657,13 @@ fn still(f: &mut ratatui::Frame, app: &App, look: &Look) {
     draw::draw(f, app);
     effects::names(f, app, look.highlight.as_ref());
     effects::particles(f, app, look.ink.as_ref(), look.highlight.as_ref());
+    effects::from_the_name(f, app, look.highlight.as_ref());
     crate::theme::paint(f.buffer_mut(), look.highlight.as_ref());
 }
 
 /// One frame of the picker: the screen, then whatever is passing over it,
 /// then the theme's highlight on what has no colour yet — the other
-/// sessions' names, the braille beside the list, and what is left of the bar
+/// sessions' names, the braille beside the list, and the bar from its name on
 /// (see [`crate::theme`]) — last, so the bar's landing and the afterglow held
 /// without a palette, drawn reversed as the bar is, take it too.
 fn frame(f: &mut ratatui::Frame, app: &App, look: &Look) {
@@ -670,6 +671,7 @@ fn frame(f: &mut ratatui::Frame, app: &App, look: &Look) {
     effects::paint(f, app, look.ink.as_ref());
     effects::names(f, app, look.highlight.as_ref());
     effects::particles(f, app, look.ink.as_ref(), look.highlight.as_ref());
+    effects::from_the_name(f, app, look.highlight.as_ref());
     crate::theme::paint(f.buffer_mut(), look.highlight.as_ref());
 }
 
@@ -1112,13 +1114,14 @@ mod tests {
         assert!(Outcome::Quit.leaves().is_empty());
     }
 
-    /// Under a `[theme] highlight` the selection's bar takes it — still
-    /// reversed, so the bar is the highlight and the text the colour the theme
-    /// chose for it — and so do the names of the other sessions, and nothing
-    /// else on the picker: not their markers or numbers, not the hint row. A
-    /// fade dissolves the same frame the loop draws.
+    /// Under a `[theme] highlight` the highlighted session's name is inverted
+    /// in it, from the name to the list's edge — still reversed, so the bar is
+    /// the highlight and the text the colour the theme chose for it — while its
+    /// marker and number stay the terminal's. The other sessions' names are
+    /// the highlight, and nothing else on the picker is: not their numbers,
+    /// not the hint row. A fade dissolves the same frame the loop draws.
     #[test]
-    fn a_highlight_colours_the_selection_and_the_other_names() {
+    fn a_highlight_inverts_the_selected_name_and_colours_the_others() {
         use crate::theme::Highlight;
         use ratatui::layout::{Position, Rect};
         use ratatui::style::{Color, Modifier};
@@ -1132,6 +1135,8 @@ mod tests {
         };
         let app = test_support::picker(&["api-server", "dotfiles", "notes"]);
         let area = Rect::new(0, 0, 40, 8);
+        let row = draw::row_rect(&app, area, "id000000").expect("on screen");
+        let selected = draw::name_rect(&app, area, "id000000").expect("on screen");
         let names: Vec<Rect> = ["id000001", "id000002"]
             .iter()
             .map(|id| draw::name_rect(&app, area, id).expect("on screen"))
@@ -1140,11 +1145,21 @@ mod tests {
         let (mut bar, mut named) = (0, 0);
         for (i, cell) in buf.content.iter().enumerate() {
             let at = Position::new(i as u16 % 40, i as u16 / 40);
-            if cell.modifier.contains(Modifier::REVERSED) {
+            if at.y == row.y && at.x >= selected.x && at.x < row.right() {
                 bar += 1;
-                assert_eq!(cell.fg, Color::Rgb(100, 0, 200), "{cell:?}");
-                assert_eq!(cell.bg, Color::Rgb(250, 250, 250), "{cell:?}");
-            } else if names.iter().any(|name| name.contains(at)) {
+                assert!(
+                    cell.modifier.contains(Modifier::REVERSED),
+                    "{at:?} {cell:?}"
+                );
+                assert_eq!(cell.fg, Color::Rgb(100, 0, 200), "{at:?} {cell:?}");
+                assert_eq!(cell.bg, Color::Rgb(250, 250, 250), "{at:?} {cell:?}");
+                continue;
+            }
+            assert!(
+                !cell.modifier.contains(Modifier::REVERSED),
+                "{at:?} {cell:?}"
+            );
+            if names.iter().any(|name| name.contains(at)) {
                 named += 1;
                 assert_eq!(cell.fg, Color::Rgb(100, 0, 200), "{at:?} {cell:?}");
                 assert_eq!(cell.bg, Color::Reset, "{at:?} {cell:?}");
@@ -1156,11 +1171,12 @@ mod tests {
                 );
             }
         }
-        assert!(
-            bar >= "▸ 1  api-server".chars().count(),
-            "the whole bar: {bar}"
-        );
+        assert_eq!(bar, row.right() - selected.x, "from the name to the edge");
         assert_eq!(named, "dotfiles".len() + "notes".len());
+        let head: String = (row.x..selected.x)
+            .map(|x| buf[(x, row.y)].symbol())
+            .collect();
+        assert_eq!(head, "▸ 1  ", "the marker and number, plain");
         assert_eq!(
             buf,
             test_support::buffer(40, 8, |f| still(f, &app, &look)),
@@ -1168,17 +1184,21 @@ mod tests {
         );
 
         // The row the cursor just left holds the bar a moment without a
-        // palette, and the bar it holds is the highlight too.
+        // palette, and the bar it holds is the highlight too, from its name.
         let mut moved = test_support::picker(&["api-server", "dotfiles", "notes"]);
         moved.on_key(Key::Char('j'));
+        let left = draw::name_rect(&moved, area, "id000000").expect("on screen");
         let buf = test_support::buffer(40, 8, |f| frame(f, &moved, &look));
-        let held = buf
-            .content
-            .iter()
-            .filter(|c| c.modifier.contains(Modifier::REVERSED | Modifier::DIM))
-            .inspect(|c| assert_eq!(c.fg, Color::Rgb(100, 0, 200), "{c:?}"))
-            .count();
-        assert!(held > 0, "the bar held on the row left");
+        let held: Vec<u16> = (0..40)
+            .filter(|x| buf[(*x, left.y)].modifier.contains(Modifier::REVERSED))
+            .inspect(|x| {
+                let cell = &buf[(*x, left.y)];
+                assert!(cell.modifier.contains(Modifier::DIM), "{cell:?}");
+                assert_eq!(cell.fg, Color::Rgb(100, 0, 200), "{cell:?}");
+            })
+            .collect();
+        assert!(!held.is_empty(), "the bar held on the row left");
+        assert!(held.iter().all(|x| *x >= left.x), "from its name: {held:?}");
 
         let plain = test_support::buffer(40, 8, |f| frame(f, &app, &Look::default()));
         let drawn = test_support::buffer(40, 8, |f| draw::draw(f, &app));

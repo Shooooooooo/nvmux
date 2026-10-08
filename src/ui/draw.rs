@@ -833,9 +833,10 @@ pub(super) fn session_names(app: &App, area: Rect) -> Vec<(String, Rect)> {
 /// drawn: after the marker, the number and the gap; shifted with a row
 /// stepping aside (see [`super::swap`]); and cut at the end of the list and
 /// at the edges of the screen. A row with none of its name on screen is left
-/// out. The one measure of a name for [`name_rect`], [`session_names`] and
-/// [`in_a_name`].
-fn drawn_names(app: &App, area: Rect) -> Vec<(usize, Rect)> {
+/// out. The one measure of a name for [`name_rect`], [`session_names`],
+/// [`in_a_name`] and the theme's bar, which starts at a name (see
+/// [`super::effects::from_the_name`]).
+pub(super) fn drawn_names(app: &App, area: Rect) -> Vec<(usize, Rect)> {
     if area.height == 0 || area.width == 0 {
         return Vec::new();
     }

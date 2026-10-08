@@ -37,7 +37,10 @@
 //! that, and a dropped row's name fades out of it. The stars, sparks and dust
 //! of a session being moved take it as well, the dim ones halfway into the
 //! background ([`particles`]). The row in a gap is no session yet, and keeps
-//! the terminal's colours. That is [`Ink`], read once a run.
+//! the terminal's colours. Under a theme the bar itself starts at the name —
+//! a row's number is never the highlight's ([`from_the_name`]) — and the
+//! afterglow and the strike paint only that part of it. That is [`Ink`], read
+//! once a run.
 //!
 //! Without them, each falls back to a modifier, which sets no colour: the
 //! afterglow holds the bar, reversed and dim, for the first third of its time
@@ -143,6 +146,9 @@ pub struct Ink {
     /// The names of the sessions not highlighted: the highlight too, under a
     /// theme (see [`names`]), or the terminal's foreground.
     name: Rgb,
+    /// Whether the bar starts at the name, as it does under a theme (see
+    /// [`from_the_name`]), rather than running the whole row.
+    from_name: bool,
 }
 
 impl Ink {
@@ -156,6 +162,23 @@ impl Ink {
             bar,
             on_bar,
             name: bar,
+            from_name: highlight.is_some(),
+        }
+    }
+
+    /// The part of a row that is its bar: the whole of `row`, or under a theme
+    /// the part of it from the start of its `name` on.
+    fn bar_of(&self, row: Rect, name: Option<Rect>) -> Rect {
+        match name {
+            Some(name) if self.from_name && name.x > row.x => {
+                let x = name.x.min(row.right());
+                Rect {
+                    x,
+                    width: row.right() - x,
+                    ..row
+                }
+            }
+            _ => row,
         }
     }
 }
@@ -272,6 +295,31 @@ pub fn names(frame: &mut Frame, app: &App, highlight: Option<&Highlight>) {
     }
 }
 
+/// Under a `[theme] highlight`, the bar starts at the name: on every row's
+/// line, whatever is reversed before its name — the marker and the number of
+/// the highlighted row, the row being moved, the bar the afterglow holds
+/// without a palette, and the near half of a landing's bounce — is put back
+/// to the terminal's own, so the number is never the highlight's and only the
+/// name, and the blanks after it to the list's edge, are inverted in it.
+/// Before [`crate::theme::Highlight::paint`], which colours what is still
+/// reversed. Without a highlight, nothing: the bar is the whole row, as it
+/// always was.
+pub fn from_the_name(frame: &mut Frame, app: &App, highlight: Option<&Highlight>) {
+    if highlight.is_none() {
+        return;
+    }
+    let area = frame.area();
+    let names = draw::drawn_names(app, area);
+    let buf = frame.buffer_mut();
+    let left = buf.area.x;
+    for (_, name) in names {
+        let head = Rect::new(left, name.y, name.x.saturating_sub(left), 1);
+        each_cell(buf, head, |cell| {
+            cell.modifier.remove(Modifier::REVERSED);
+        });
+    }
+}
+
 /// Under a `[theme] highlight`, the braille the picker scatters beside the
 /// list in the highlight: the stars off a session in flight, the sparks off
 /// the seams it slides past, the dust it lands in, and the rings, if they
@@ -338,7 +386,7 @@ fn glow(buf: &mut Buffer, rect: Rect, name: Option<Rect>, ink: Option<&Ink>, pro
             let t = ease_out(progress);
             let bg = rgb(ink.bar.lerp(p.bg, t));
             let fg = rgb(ink.on_bar.lerp(p.fg, t));
-            each_cell(buf, rect, |cell| {
+            each_cell(buf, ink.bar_of(rect, name), |cell| {
                 cell.set_bg(bg);
                 cell.set_fg(fg);
             });
@@ -375,7 +423,7 @@ fn strike(buf: &mut Buffer, bar: Rect, name: Rect, ink: Option<&Ink>, drawn: f32
     if let Some(ink) = ink {
         let warm = rgb(ink.bar.lerp(ink.palette.ansi[RED], STRIKE_WARMTH * k));
         let text = rgb(ink.on_bar);
-        each_cell(buf, bar, |cell| {
+        each_cell(buf, ink.bar_of(bar, Some(name)), |cell| {
             cell.modifier.remove(Modifier::REVERSED);
             cell.set_bg(warm);
             cell.set_fg(text);
@@ -1134,13 +1182,19 @@ mod tests {
         let mut a = picker(&["one", "two", "three"]);
         a.on_key(Key::Char('j'));
         let buf = themed(&a, Some(&p), Some(HIGHLIGHT));
-        let cell = first_glyph(&buf, row_of(&buf, "one"));
+        let cell = name_cell(&buf, "one");
         assert_eq!(cell.bg, rgb(HIGHLIGHT.bar), "starts as the bar");
         assert_eq!(cell.fg, rgb(ON_BAR), "and its text");
+        let number = first_glyph(&buf, row_of(&buf, "one"));
+        assert_eq!(
+            (number.fg, number.bg),
+            (Color::Reset, Color::Reset),
+            "the bar starts at the name: {number:?}"
+        );
 
         a.tick(AFTERGLOW / 2);
         let buf = themed(&a, Some(&p), Some(HIGHLIGHT));
-        let Rgb(r, g, b) = rgb_of(first_glyph(&buf, row_of(&buf, "one")).bg);
+        let Rgb(r, g, b) = rgb_of(name_cell(&buf, "one").bg);
         assert!(
             g == 0 && b > 0 && b < 200,
             "the highlight, going: ({r},{g},{b})"
@@ -1153,12 +1207,17 @@ mod tests {
         let p = test_palette();
         let a = asking(STRIKE.as_millis() as u64);
         let buf = themed(&a, Some(&p), Some(HIGHLIGHT));
+        let name = name_cell(&buf, "dotfiles");
+        assert_eq!(name.bg, rgb(HIGHLIGHT.bar.lerp(p.ansi[RED], STRIKE_WARMTH)));
+        assert_eq!(name.fg, rgb(ON_BAR));
+        // The bar starts at the name, and the warmth with it: the marker is
+        // left to be put back to the terminal's own.
         let marker = first_glyph(&buf, row_of(&buf, "dotfiles"));
         assert_eq!(
-            marker.bg,
-            rgb(HIGHLIGHT.bar.lerp(p.ansi[RED], STRIKE_WARMTH))
+            (marker.fg, marker.bg),
+            (Color::Reset, Color::Reset),
+            "{marker:?}"
         );
-        assert_eq!(marker.fg, rgb(ON_BAR));
     }
 
     /// The rings go out in the highlight, each as far into the terminal's
@@ -1183,6 +1242,79 @@ mod tests {
                 "{ring:?}"
             );
         }
+    }
+
+    /// The screen with the bar as the theme leaves it: started at the name,
+    /// and what is still reversed coloured.
+    fn barred(app: &App, highlight: Option<Highlight>) -> Buffer {
+        test_support::buffer(W, H, |f| {
+            draw::draw(f, app);
+            from_the_name(f, app, highlight.as_ref());
+            crate::theme::paint(f.buffer_mut(), highlight.as_ref());
+        })
+    }
+
+    /// Under a highlight the bar starts at the name: the marker and the number
+    /// in front of it are put back to the terminal's own. Without one, the bar
+    /// is the whole row, as it always was.
+    #[test]
+    fn under_a_highlight_the_bar_starts_at_the_name() {
+        let a = picker(&["api-server", "dotfiles", "notes"]);
+        let area = Rect::new(0, 0, W, H);
+        let row = draw::row_rect(&a, area, "id000001").expect("on screen");
+        let name = draw::name_rect(&a, area, "id000001").expect("on screen");
+        let mut a = a;
+        a.on_key(Key::Char('j'));
+        let buf = barred(&a, Some(HIGHLIGHT));
+        for x in row.x..row.right() {
+            let cell = &buf[(x, row.y)];
+            assert_eq!(
+                cell.modifier.contains(Modifier::REVERSED),
+                x >= name.x,
+                "{x}: {cell:?}"
+            );
+        }
+        let drawn = test_support::buffer(W, H, |f| draw::draw(f, &a));
+        assert_eq!(barred(&a, None), drawn, "no highlight, no change");
+        assert!(
+            (row.x..row.right()).all(|x| drawn[(x, row.y)].modifier.contains(Modifier::REVERSED)),
+            "the whole row without one"
+        );
+    }
+
+    /// A landing's bounce widens the bar at both ends; under a highlight the
+    /// bar starts at the name, so only its far end bounces, in the highlight.
+    #[test]
+    fn under_a_highlight_a_landing_bounces_off_the_far_end() {
+        let mut a = picker(&["api-server", "docs", "notes", "nvmux"]);
+        a.on_key(Key::Char('j'));
+        a.on_key(Key::Char('j'));
+        a.on_key(Key::Char(' '));
+        a.set_trail(true);
+        a.tick(Duration::from_millis(200));
+        a.on_key(Key::Char('k'));
+        a.tick(swap::SPARKING);
+        a.on_key(Key::Enter);
+        assert!(a.landing().is_some(), "landing");
+        let area = Rect::new(0, 0, W, H);
+        let mut past = 0;
+        for _ in 0..30 {
+            let id = a.selected_row_id().expect("a selection").to_string();
+            let row = draw::row_rect(&a, area, &id).expect("on screen");
+            let name = draw::name_rect(&a, area, &id).expect("on screen");
+            let buf = barred(&a, Some(HIGHLIGHT));
+            for x in 0..W {
+                let cell = &buf[(x, row.y)];
+                if !cell.modifier.contains(Modifier::REVERSED) {
+                    continue;
+                }
+                assert!(x >= name.x, "nothing reversed before the name: {x}");
+                assert_eq!(cell.fg, rgb(HIGHLIGHT.bar), "{x}: {cell:?}");
+                past += usize::from(x >= row.right());
+            }
+            a.tick(Duration::from_millis(16));
+        }
+        assert!(past > 0, "the bar bounced past its far end");
     }
 
     /// [`themed`], with the other sessions' names coloured as the picker
@@ -1246,8 +1378,8 @@ mod tests {
         );
         assert_eq!(
             first_glyph(&buf, row_of(&buf, "one")).fg,
-            rgb(ON_BAR.lerp(p.fg, t)),
-            "the number"
+            Color::Reset,
+            "the number, no bar's under a theme"
         );
 
         a.tick(AFTERGLOW);

@@ -576,8 +576,9 @@ pub struct CreateSettings {
 /// `[theme]`: one colour, for the session the picker has highlighted, the
 /// names of the others and the effects that come off the bar (see
 /// [`crate::theme`]). `"#rrggbb"`; unset, the default, the bar is the
-/// terminal's own colours reversed and the names its foreground, as they
-/// always were, so an absent table draws exactly what nvmux always drew.
+/// terminal's own colours reversed across the whole row and the names its
+/// foreground, as they always were, so an absent table draws exactly what
+/// nvmux always drew.
 /// `NO_COLOR` sets none of it.
 ///
 /// Nothing else takes it: the picker's background is the terminal's, and so
@@ -585,9 +586,10 @@ pub struct CreateSettings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ThemeSettings {
-    /// The background of the picker's highlighted session: its selection bar,
-    /// with the text on it whichever of the terminal's colours reads there;
-    /// and the colour of every other session's name. The effects that come
+    /// The background of the picker's highlighted session's name, inverted in
+    /// it from the name to the list's edge, with the text on it whichever of
+    /// the terminal's colours reads there; and the colour of every other
+    /// session's name. A session's number is never drawn in it. The effects that come
     /// off the bar work theirs out from it, each cell at its own brightness:
     /// the afterglow it leaves as the cursor moves on, the warmth it takes
     /// while a `[y/N]` asks, the sonar's rings, which start as it and fade
@@ -1067,11 +1069,11 @@ fn render_default_config(prefix: u8) -> String {
          # enabled = {blink_enabled}\n\
          \n\
          [theme]\n\
-         # One colour, \"#rrggbb\", for the session the picker has highlighted:\n\
-         # the background of its bar, the other sessions' names, and the\n\
-         # afterglow, strike, sonar rings, and the stars, sparks and dust of a\n\
-         # move that come off the bar. Unset, the bar is the terminal's own\n\
-         # colours reversed. NO_COLOR sets none of it.\n\
+         # One colour, \"#rrggbb\", for the session names in the picker: the\n\
+         # highlighted name inverted in it, the other names written in it, and\n\
+         # the afterglow, strike, sonar rings, and the stars, sparks and dust\n\
+         # of a move. Numbers stay the terminal's. Unset, the bar is the\n\
+         # terminal's own colours reversed. NO_COLOR sets none of it.\n\
          # highlight = \"#89b4fa\"\n",
         prefix = crate::keys::prefix_label(prefix),
         timeout = k.timeout_ms,

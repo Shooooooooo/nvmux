@@ -3,12 +3,16 @@
 //!
 //! The picker draws its selection as a reversed bar (see [`crate::ui::draw`]),
 //! which shows the terminal's own foreground as the bar and its background as
-//! the text. Under a theme the bar is still reversed — everything that knows a
-//! bar by that, from the sparks that skip it to the rings that never land on
-//! it, still does — and only its colours change: reversed, a cell's foreground
-//! is what shows as the bar, so that is set to the highlight, and its
-//! background is what shows as the text, so that is set when the text has to
-//! be something other than the terminal's background to be read on it.
+//! the text. Under a theme the bar starts at the name: the marker and the
+//! number in front of it are put back to the terminal's own (see
+//! [`crate::ui::effects::from_the_name`]), so a session's number is never the
+//! highlight's and its name, with the blanks after it to the list's edge, is
+//! inverted in it. That part is still reversed — everything that knows a bar
+//! by that, from the sparks that skip it to the rings that never land on it,
+//! still does — and only its colours change: reversed, a cell's foreground is
+//! what shows as the bar, so that is set to the highlight, and its background
+//! is what shows as the text, so that is set when the text has to be
+//! something other than the terminal's background to be read on it.
 //!
 //! Like the fade and the effects, it is a post-pass over a finished frame, so
 //! `draw` and its tests never see it. With no `[theme] highlight`, or under
@@ -58,10 +62,10 @@ impl Highlight {
     }
 
     /// Colour every reversed cell of `buf` that still has the terminal's own
-    /// colours: the selection's bar, and whatever else of the picker is
-    /// drawn as it — its landing, and the afterglow without a palette. A cell
-    /// an effect has already painted, or taken the reverse off, is left as it
-    /// is.
+    /// colours: the selection's bar from its name on, and whatever else of
+    /// the picker is drawn as it — its landing, and the afterglow without a
+    /// palette. A cell an effect has already painted, or taken the reverse
+    /// off — the marker and number before a name included — is left as it is.
     pub fn paint(&self, buf: &mut Buffer) {
         for cell in &mut buf.content {
             if !cell.modifier.contains(Modifier::REVERSED) || cell.fg != Color::Reset {

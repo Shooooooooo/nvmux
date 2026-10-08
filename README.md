@@ -227,9 +227,11 @@ enabled = false   # a blinking block cursor fades out and back in
 </details>
 
 The picker draws the session it has highlighted as a bar in your terminal's
-own colours, reversed. `[theme] highlight` gives that bar a colour of its own,
-with its text in whichever of your terminal's colours reads on it, and draws
-the other sessions' names in it too. The effects that come off the bar — the
-afterglow it leaves, the warmth it takes at `[y/N]`, the sonar's rings, and
-the stars, sparks and dust of a session being reordered — work theirs out
-from it. Nothing else changes colour, and `NO_COLOR` turns it off.
+own colours, reversed. `[theme] highlight` draws the session names in a colour
+of its own instead, and leaves their numbers alone: the highlighted name is
+inverted in it, from the name to the list's edge, with its text in whichever
+of your terminal's colours reads on it, and the other names are written in
+it. The effects that come off the bar — the afterglow it leaves, the warmth it
+takes at `[y/N]`, the sonar's rings, and the stars, sparks and dust of a
+session being reordered — work theirs out from it. Nothing else changes
+colour, and `NO_COLOR` turns it off.
