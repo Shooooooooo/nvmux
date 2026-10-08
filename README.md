@@ -31,6 +31,13 @@ That last row is the trade: nvmux is not a tmux replacement. It does one thing,
 which is why it can draw Neovim from Neovim's own account of its screen — or
 hand Neovim your terminal outright — rather than an imitation of one.
 
+It is also a very opinionated program. nvmux suits folks who already run their
+terminal programs — shells, REPLs, coding agents — in Neovim terminal buffers,
+so that a Neovim session *is* the workspace. Pair it with
+[agent.nvim](https://github.com/Shooooooooo/agent.nvim) and a coding agent
+running in one of those buffers gains access to all your Neovim buffers,
+making it more powerful than the same agent in a standalone terminal.
+
 ## Requirements
 
 | Where | Needs |
