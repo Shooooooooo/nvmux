@@ -14,6 +14,9 @@
 //! wipes bold, reverse and dim mid-line. Any design that sets colours and then
 //! relies on that flag renders incorrectly for exactly the users who asked for
 //! no colour.
+//!
+//! A `[theme] background` does not change any of this: it is laid behind the
+//! finished frame by [`crate::theme::fill`], after this module is done.
 
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Alignment, Rect};

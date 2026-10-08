@@ -48,6 +48,7 @@ pub mod shell;
 pub mod ssh;
 pub mod state;
 pub mod term;
+pub mod theme;
 pub mod transport;
 pub mod ui;
 pub mod winch;

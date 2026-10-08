@@ -29,6 +29,14 @@
 //! - the row in the gap comes up out of the background to the dim it is
 //!   drawn in.
 //!
+//! A `[theme] background` (see [`crate::theme`]) changes the colours, never
+//! what is painted. Everything goes into the theme's background rather than
+//! the terminal's, and every colour an effect works out is then taken as a
+//! brightness and painted in the theme's own colour at that brightness: a
+//! ring fading out is the theme's colour going from as bright as the text to
+//! as dark as the background, the glint a brighter shade of it crossing the
+//! bar. That is [`Ink`], read once a run.
+//!
 //! Without them, each falls back to a modifier, which sets no colour: the
 //! afterglow holds the bar, reversed and dim, for the first third of its time
 //! and then lets it go; the glint is an underline running under the bar where
@@ -143,14 +151,49 @@ const FALLBACK_HOLD: f32 = 1.0 / 3.0;
 /// read as leaving on the very frame the keystroke lands.
 const SIFT_FROM: f32 = 0.3;
 
-/// The palette the effects paint with, or `None` to fall back to modifiers:
-/// none when `NO_COLOR` is set or the terminal did not say what its colours
-/// are.
-pub fn palette() -> Option<&'static Palette> {
+/// What the effects paint with: the terminal's colours, under the theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ink {
+    /// The terminal's palette, its background the theme's when there is one:
+    /// the foreground every effect starts from, and the background every one
+    /// fades into.
+    palette: Palette,
+    /// `[theme] background`, which every colour painted is a shade of.
+    theme: Option<Rgb>,
+}
+
+impl Ink {
+    /// The terminal's palette under `theme`. Pure, so a test can reach every
+    /// colour without a terminal or a config.
+    pub fn new(terminal: Palette, theme: Option<Rgb>) -> Self {
+        Self {
+            palette: Palette {
+                bg: theme.unwrap_or(terminal.bg),
+                ..terminal
+            },
+            theme,
+        }
+    }
+
+    /// What to paint where, in the terminal's colours, an effect would paint
+    /// `colour`: that colour, or under a theme the theme's own colour as
+    /// bright as it (see [`Rgb::at_lightness`]). Each cell's own brightness,
+    /// so an effect fading in or out still does, in the theme's colour — and
+    /// the theme's background is exactly itself.
+    fn tint(&self, colour: Rgb) -> Color {
+        rgb(self
+            .theme
+            .map_or(colour, |theme| theme.at_lightness(colour.lightness())))
+    }
+}
+
+/// What the effects paint with, or `None` to fall back to modifiers: none
+/// when `NO_COLOR` is set or the terminal did not say what its colours are.
+pub fn ink() -> Option<Ink> {
     if std::env::var_os("NO_COLOR").is_some() {
         return None;
     }
-    crate::palette::get()
+    crate::palette::get().map(|p| Ink::new(*p, crate::theme::background()))
 }
 
 /// Whether the config wants an effect that paints in colour, so the terminal
@@ -168,7 +211,7 @@ pub fn want_palette() -> bool {
 }
 
 /// Paint whatever is passing over the frame `draw::draw` has just drawn.
-pub fn paint(frame: &mut Frame, app: &App, palette: Option<&Palette>) {
+pub fn paint(frame: &mut Frame, app: &App, ink: Option<&Ink>) {
     let area = frame.area();
     let buf = frame.buffer_mut();
     let selected = app.selected_row_id();
@@ -176,7 +219,7 @@ pub fn paint(frame: &mut Frame, app: &App, palette: Option<&Palette>) {
     if let Some((id, progress)) = app.glow() {
         if selected != Some(id) {
             if let Some(rect) = draw::row_rect(app, area, id) {
-                glow(buf, rect, palette, progress);
+                glow(buf, rect, ink, progress);
             }
         }
     }
@@ -186,7 +229,7 @@ pub fn paint(frame: &mut Frame, app: &App, palette: Option<&Palette>) {
     for (id, progress) in app.swap().echoes() {
         if selected != Some(id) {
             if let Some(rect) = draw::row_rect(app, area, id) {
-                glow(buf, rect, palette, progress);
+                glow(buf, rect, ink, progress);
             }
         }
     }
@@ -196,7 +239,7 @@ pub fn paint(frame: &mut Frame, app: &App, palette: Option<&Palette>) {
         // since left would be lighting a plain row.
         if selected == Some(id) {
             if let Some(rect) = draw::row_rect(app, area, id) {
-                glint(buf, rect, palette, progress);
+                glint(buf, rect, ink, progress);
             }
         }
     }
@@ -204,7 +247,7 @@ pub fn paint(frame: &mut Frame, app: &App, palette: Option<&Palette>) {
     if let Some(progress) = app.leaving() {
         for row in app.rows().iter().filter(|r| r.leaving) {
             if let Some(rect) = draw::row_rect(app, area, &row.session.id) {
-                leave(buf, rect, palette, progress);
+                leave(buf, rect, ink, progress);
             }
         }
     }
@@ -217,14 +260,14 @@ pub fn paint(frame: &mut Frame, app: &App, palette: Option<&Palette>) {
             // The warmth is the bar's, so only while the row is the selection:
             // a line still being drawn back off a row the cursor has since
             // left goes off a plain row.
-            let warm = palette.filter(|_| selected == Some(id));
+            let warm = ink.filter(|_| selected == Some(id));
             strike(buf, bar, name, warm, drawn);
         }
     }
 
-    if let (Some(progress), Some(p)) = (app.room(), palette) {
+    if let (Some(progress), Some(ink)) = (app.room(), ink) {
         if let Some(rect) = draw::row_rect(app, area, GHOST_ID) {
-            arrive(buf, rect, p, progress);
+            arrive(buf, rect, ink, progress);
         }
     }
 
@@ -235,18 +278,19 @@ pub fn paint(frame: &mut Frame, app: &App, palette: Option<&Palette>) {
     // is cancelled, since `Esc` still goes back where they say.
     if let Some((id, sonar)) = app.sonar().filter(|_| !app.has_room()) {
         if let Some(rect) = draw::row_rect(app, area, id) {
-            rings(buf, app, area, rect, sonar, palette);
+            rings(buf, app, area, rect, sonar, ink);
         }
     }
 }
 
 /// The row the cursor left, `progress` of the way back to plain.
-fn glow(buf: &mut Buffer, rect: Rect, palette: Option<&Palette>, progress: f32) {
-    match palette {
-        Some(p) => {
+fn glow(buf: &mut Buffer, rect: Rect, ink: Option<&Ink>, progress: f32) {
+    match ink {
+        Some(ink) => {
+            let p = &ink.palette;
             let t = ease_out(progress);
-            let bg = rgb(p.fg.lerp(p.bg, t));
-            let fg = rgb(p.bg.lerp(p.fg, t));
+            let bg = ink.tint(p.fg.lerp(p.bg, t));
+            let fg = ink.tint(p.bg.lerp(p.fg, t));
             each_cell(buf, rect, |cell| {
                 cell.set_bg(bg);
                 cell.set_fg(fg);
@@ -264,7 +308,7 @@ fn glow(buf: &mut Buffer, rect: Rect, palette: Option<&Palette>, progress: f32) 
 /// The bar the cursor has just landed on, with the glint `progress` of the way
 /// across it. `rect` is the bar: [`draw::row_rect`] measures a row the whole
 /// width of the list, which is as far as the selection's reversed bar runs.
-fn glint(buf: &mut Buffer, rect: Rect, palette: Option<&Palette>, progress: f32) {
+fn glint(buf: &mut Buffer, rect: Rect, ink: Option<&Ink>, progress: f32) {
     let middle = -GLINT_LEAD + ease_in_out(progress) * (f32::from(rect.width) + 2.0 * GLINT_LEAD);
     let on_screen = rect.intersection(buf.area);
     for x in on_screen.x..on_screen.x + on_screen.width {
@@ -276,14 +320,15 @@ fn glint(buf: &mut Buffer, rect: Rect, palette: Option<&Palette>, progress: f32)
             continue;
         }
         let cell = &mut buf[(x, rect.y)];
-        match palette {
+        match ink {
             // The bar is the reversed default colours. Painting it means
             // setting both ends outright, the background now the brightened
             // foreground, so the reverse comes off first.
-            Some(p) => {
+            Some(ink) => {
+                let p = &ink.palette;
                 cell.modifier.remove(Modifier::REVERSED);
-                cell.set_bg(rgb(p.fg.lerp(SHINE, GLINT_PEAK * lit)));
-                cell.set_fg(rgb(p.bg));
+                cell.set_bg(ink.tint(p.fg.lerp(SHINE, GLINT_PEAK * lit)));
+                cell.set_fg(ink.tint(p.bg));
             }
             None if lit > GLINT_UNDERLINE => {
                 cell.modifier.insert(Modifier::UNDERLINED);
@@ -297,7 +342,7 @@ fn glint(buf: &mut Buffer, rect: Rect, palette: Option<&Palette>, progress: f32)
 /// the way across, and — given a palette — its bar warmed towards the
 /// terminal's red by as much. The line is the crossed-out modifier, drawn in
 /// the text's own colour, so it is the same with a palette or without one.
-fn strike(buf: &mut Buffer, bar: Rect, name: Rect, palette: Option<&Palette>, drawn: f32) {
+fn strike(buf: &mut Buffer, bar: Rect, name: Rect, ink: Option<&Ink>, drawn: f32) {
     let k = ease_out(drawn);
     let across = ((k * f32::from(name.width)).ceil() as u16).min(name.width);
     let line = Rect {
@@ -307,9 +352,10 @@ fn strike(buf: &mut Buffer, bar: Rect, name: Rect, palette: Option<&Palette>, dr
     each_cell(buf, line, |cell| {
         cell.modifier.insert(Modifier::CROSSED_OUT)
     });
-    if let Some(p) = palette {
-        let warm = rgb(p.fg.lerp(p.ansi[RED], STRIKE_WARMTH * k));
-        let text = rgb(p.bg);
+    if let Some(ink) = ink {
+        let p = &ink.palette;
+        let warm = ink.tint(p.fg.lerp(p.ansi[RED], STRIKE_WARMTH * k));
+        let text = ink.tint(p.bg);
         each_cell(buf, bar, |cell| {
             cell.modifier.remove(Modifier::REVERSED);
             cell.set_bg(warm);
@@ -323,14 +369,7 @@ fn strike(buf: &mut Buffer, bar: Rect, name: Rect, palette: Option<&Palette>, dr
 /// of the row, its arcs on the lines above and below. Laid only on the
 /// terminal's own background — never on a row, the hint row, or a glyph
 /// something else has put there — and not past the edge of the screen.
-fn rings(
-    buf: &mut Buffer,
-    app: &App,
-    area: Rect,
-    rect: Rect,
-    sonar: &Sonar,
-    palette: Option<&Palette>,
-) {
+fn rings(buf: &mut Buffer, app: &App, area: Rect, rect: Rect, sonar: &Sonar, ink: Option<&Ink>) {
     let left = |out: u16| rect.x.checked_sub(1 + out);
     let right = |out: u16| rect.x.checked_add(rect.width + out);
     // Put `glyph` at a cell, if it is on the screen and is the terminal's own
@@ -343,13 +382,13 @@ fn rings(
         }
     };
     for ring in sonar.rings() {
-        let edge = ring_style(palette, RING_FADE * ring.life, ring.life > RING_FAR);
+        let edge = ring_style(ink, RING_FADE * ring.life, ring.life > RING_FAR);
         lay(left(ring.out), Some(rect.y), ring.left, edge);
         lay(right(ring.out), Some(rect.y), ring.right, edge);
         let Some(arc) = ring.arc() else {
             continue;
         };
-        let faint = ring_style(palette, RING_FADE * ring.life + ARC_FAINTER, true);
+        let faint = ring_style(ink, RING_FADE * ring.life + ARC_FAINTER, true);
         for (y, (l, r)) in [
             (rect.y.checked_sub(1), sonar::ABOVE),
             (rect.y.checked_add(1), sonar::BELOW),
@@ -362,9 +401,9 @@ fn rings(
 
 /// How a ring's glyph is drawn: `fade` of the way into the background with a
 /// palette, and without one, dim if `dim` says so.
-fn ring_style(palette: Option<&Palette>, fade: f32, dim: bool) -> Style {
-    match palette {
-        Some(p) => Style::default().fg(rgb(p.fg.lerp(p.bg, fade))),
+fn ring_style(ink: Option<&Ink>, fade: f32, dim: bool) -> Style {
+    match ink {
+        Some(ink) => Style::default().fg(ink.tint(ink.palette.fg.lerp(ink.palette.bg, fade))),
         None if dim => Style::default().add_modifier(Modifier::DIM),
         None => Style::default(),
     }
@@ -388,11 +427,12 @@ fn ground(buf: &Buffer, app: &App, area: Rect, x: u16, y: u16) -> bool {
 }
 
 /// A row a filter keystroke dropped, `progress` of the way to gone.
-fn leave(buf: &mut Buffer, rect: Rect, palette: Option<&Palette>, progress: f32) {
-    match palette {
-        Some(p) => {
+fn leave(buf: &mut Buffer, rect: Rect, ink: Option<&Ink>, progress: f32) {
+    match ink {
+        Some(ink) => {
+            let p = &ink.palette;
             let t = SIFT_FROM + (1.0 - SIFT_FROM) * ease_out(progress);
-            let fg = rgb(p.fg.lerp(p.bg, t));
+            let fg = ink.tint(p.fg.lerp(p.bg, t));
             each_cell(buf, rect, |cell| {
                 cell.set_fg(fg);
             });
@@ -409,8 +449,9 @@ fn leave(buf: &mut Buffer, rect: Rect, palette: Option<&Palette>, progress: f32)
 /// the background. Only with a palette: without one the row is simply there,
 /// drawn dim, from the first frame. Once it is all the way up nothing is set,
 /// and the row is the plain dim one the renderer drew.
-fn arrive(buf: &mut Buffer, rect: Rect, palette: &Palette, progress: f32) {
-    let fg = rgb(palette.bg.lerp(palette.fg, ease_out(progress)));
+fn arrive(buf: &mut Buffer, rect: Rect, ink: &Ink, progress: f32) {
+    let p = &ink.palette;
+    let fg = ink.tint(p.bg.lerp(p.fg, ease_out(progress)));
     each_cell(buf, rect, |cell| {
         if !cell.symbol().trim().is_empty() {
             cell.set_fg(fg);
@@ -461,11 +502,18 @@ mod tests {
     const W: u16 = 40;
     const H: u16 = 8;
 
-    /// Draw `app` and paint its effects, the way the picker does.
+    /// Draw `app` and paint its effects, the way the picker does, in the
+    /// terminal's colours with no theme.
     fn frame(app: &App, palette: Option<&Palette>) -> Buffer {
+        themed(app, palette, None)
+    }
+
+    /// [`frame`], under a `[theme] background`.
+    fn themed(app: &App, palette: Option<&Palette>, theme: Option<Rgb>) -> Buffer {
+        let ink = palette.map(|p| Ink::new(*p, theme));
         test_support::buffer(W, H, |f| {
             draw::draw(f, app);
-            paint(f, app, palette);
+            paint(f, app, ink.as_ref());
         })
     }
 
@@ -1145,5 +1193,133 @@ mod tests {
             draw::draw(f, &a);
             paint(f, &a, None);
         });
+    }
+
+    /// A `[theme] background`: a dark blue, so a cell in its shades is easy
+    /// to tell from one in the test palette's greys — red and green equal,
+    /// blue above them.
+    const THEME: Rgb = Rgb(0, 0, 100);
+
+    /// Whether `colour` is a shade of [`THEME`] brighter than it.
+    fn a_lighter_shade(colour: Color) -> bool {
+        matches!(colour, Color::Rgb(r, g, b) if r == g && b > r && r > 0)
+    }
+
+    /// Under a theme every colour an effect works out is the theme's own, as
+    /// bright as it would have been; the theme's background is exactly
+    /// itself; and with no theme every colour is what it always was.
+    #[test]
+    fn under_a_theme_each_colour_is_the_theme_at_its_brightness() {
+        let p = test_palette();
+        let ink = Ink::new(p, Some(THEME));
+        assert_eq!(ink.palette.bg, THEME, "everything fades into the theme");
+        assert_eq!(ink.palette.fg, p.fg, "from the terminal's text");
+        assert_eq!(ink.tint(THEME), rgb(THEME), "the background is itself");
+        for colour in [p.fg, Rgb(255, 0, 0), Rgb(90, 140, 30), SHINE] {
+            let Color::Rgb(r, g, b) = ink.tint(colour) else {
+                unreachable!()
+            };
+            let got = Rgb(r, g, b).lightness();
+            assert!(
+                (got - colour.lightness()).abs() < 0.01,
+                "{colour:?}: {got} for {}",
+                colour.lightness()
+            );
+            assert!(
+                r == g && b >= r,
+                "{colour:?} in the theme's hue: ({r},{g},{b})"
+            );
+        }
+
+        let plain = Ink::new(p, None);
+        assert_eq!(plain.palette, p);
+        for colour in [p.fg, p.bg, Rgb(255, 0, 0), SHINE] {
+            assert_eq!(plain.tint(colour), rgb(colour), "untouched");
+        }
+    }
+
+    /// The rings are the theme's colour, fading into its background.
+    #[test]
+    fn under_a_theme_the_rings_are_its_colour() {
+        let p = test_palette();
+        let a = back_over(&["api-server", "dotfiles", "notes"], 1, 200);
+        let buf = themed(&a, Some(&p), Some(THEME));
+        let rings: Vec<_> = buf
+            .content
+            .iter()
+            .filter(|c| is_braille(c.symbol()))
+            .collect();
+        assert!(!rings.is_empty(), "pulsing");
+        for ring in rings {
+            assert!(a_lighter_shade(ring.fg), "{ring:?}");
+            assert_eq!(ring.bg, Color::Reset, "the theme's fill lays the ground");
+        }
+    }
+
+    /// The glint is a brighter shade of the theme crossing the bar, whose
+    /// text is the theme's background.
+    #[test]
+    fn under_a_theme_the_glint_is_a_brighter_shade_of_it() {
+        let p = test_palette();
+        let mut a = picker(&["api-server", "dotfiles", "notes"]);
+        a.on_key(Key::Char('j'));
+        a.tick(GLINT / 2);
+        let buf = themed(&a, Some(&p), Some(THEME));
+        let y = row_of(&buf, "dotfiles");
+        let cell = &buf[(brightest(&buf, y).expect("the band is on the bar"), y)];
+        assert!(a_lighter_shade(cell.bg), "{cell:?}");
+        let Color::Rgb(r, g, b) = cell.bg else {
+            unreachable!()
+        };
+        assert!(
+            Rgb(r, g, b).lightness() > p.fg.lightness(),
+            "brighter than the bar: {cell:?}"
+        );
+        assert_eq!(cell.fg, rgb(THEME));
+    }
+
+    /// At a `[y/N]` the bar goes the way it does in the terminal's colours —
+    /// darker, as the red comes in — in the theme's.
+    #[test]
+    fn under_a_theme_the_strike_warms_the_bar_in_its_colour() {
+        let p = test_palette();
+        let ink = Ink::new(p, Some(THEME));
+        let a = asking(STRIKE.as_millis() as u64);
+        let buf = themed(&a, Some(&p), Some(THEME));
+        let marker = first_glyph(&buf, row_of(&buf, "dotfiles"));
+        assert_eq!(
+            marker.bg,
+            ink.tint(p.fg.lerp(p.ansi[RED], STRIKE_WARMTH)),
+            "{marker:?}"
+        );
+        assert!(a_lighter_shade(marker.bg), "{marker:?}");
+        assert_eq!(marker.fg, rgb(THEME));
+    }
+
+    /// The afterglow, a dropped row and the row in a gap all go into the
+    /// theme's background, and come back out of it, in its shades.
+    #[test]
+    fn under_a_theme_rows_fade_through_its_shades() {
+        let p = test_palette();
+        let ink = Ink::new(p, Some(THEME));
+
+        let mut a = picker(&["one", "two", "three"]);
+        a.on_key(Key::Char('j'));
+        let buf = themed(&a, Some(&p), Some(THEME));
+        let glow = first_glyph(&buf, row_of(&buf, "one"));
+        assert_eq!(glow.bg, ink.tint(p.fg), "the bar, in the theme's colour");
+        assert_eq!(glow.fg, rgb(THEME));
+
+        let mut a = picker(&["api-server", "dotfiles", "notes"]);
+        a.on_key(Key::Char('/'));
+        a.on_key(Key::Char('n'));
+        let buf = themed(&a, Some(&p), Some(THEME));
+        let dropped = first_glyph(&buf, row_of(&buf, "dotfiles"));
+        assert_eq!(dropped.fg, ink.tint(p.fg.lerp(THEME, SIFT_FROM)));
+        assert!(a_lighter_shade(dropped.fg), "{dropped:?}");
+
+        let buf = themed(&room_after(0), Some(&p), Some(THEME));
+        let gap = first_glyph(&buf, row_of(&buf, "session 4"));
+        assert_eq!(gap.fg, rgb(THEME), "up out of the theme's background");
     }
 }

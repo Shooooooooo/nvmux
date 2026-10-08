@@ -42,10 +42,13 @@
 //! inherited attributes first, which is the one place that can: every screen is
 //! taken through it.
 //!
-//! The fade ([`crate::fade`]) and the picker's passing effects ([`effects`])
-//! are the only things that paint a colour on these screens, and they do so as
-//! a post-pass over a finished frame, never inside a `draw`: a screen's own
-//! drawing stays colourless, and its tests say so.
+//! The fade ([`crate::fade`]), the picker's passing effects ([`effects`]) and
+//! a `[theme] background` ([`crate::theme`]) are the only things that paint a
+//! colour on these screens, and they do so as a post-pass over a finished
+//! frame, never inside a `draw`: a screen's own drawing stays colourless, and
+//! its tests say so. The theme is the one exception to "set no background",
+//! and only because the user asked for it by name; without it, or under
+//! `NO_COLOR`, there is none.
 
 pub mod app;
 pub mod attaching;
@@ -390,8 +393,9 @@ fn run_loop(
     // deadline does.
     let mut ticked = Instant::now();
     // What the effects paint with, if they paint in colour: asked once, since
-    // neither the answer nor `NO_COLOR` changes for the run.
-    let palette = effects::palette();
+    // neither the answer, the theme nor `NO_COLOR` changes for the run.
+    let ink = effects::ink();
+    let ink = ink.as_ref();
     // When the loop last drew, and the area it drew: `None` until its first
     // frame, which is always drawn.
     let mut drawn: Option<Instant> = None;
@@ -418,7 +422,7 @@ fn run_loop(
             // The area kept for the mouse: a click is resolved against the
             // screen as it was last drawn, which is the one the user clicked
             // on.
-            area = terminal.draw(|f| frame(f, &app, palette))?.area;
+            area = terminal.draw(|f| frame(f, &app, ink))?.area;
             // While anything is moving a frame goes out every `FRAME` whether
             // or not a key asked for one, and the terminal has to keep up.
             if paced && app.animating() {
@@ -476,7 +480,7 @@ fn run_loop(
         // with a session in flight, every arrow — and a second chance for a
         // held key to fall behind the screen.
         if app.landing().is_some() || request != Request::None {
-            play_out(terminal, &mut app, palette, |app| app.landing().is_some())?;
+            play_out(terminal, &mut app, ink, |app| app.landing().is_some())?;
         }
         deadline = app
             .pending()
@@ -505,7 +509,7 @@ fn run_loop(
                 // simply replaces the picker. A create dissolves the prompt
                 // out on its way to the client spawn either way — that is the
                 // prompt's own doing, since its screen is the one up.
-                let arrival = make_room(terminal, &mut app, palette)?;
+                let arrival = make_room(terminal, &mut app, ink)?;
                 let outcome = prompt::run_on(
                     terminal,
                     transport,
@@ -555,7 +559,7 @@ fn run_loop(
 
             Request::Kill(id) => {
                 if let Some(session) = app.session(&id).cloned() {
-                    erase(terminal, &mut app, &id, palette)?;
+                    erase(terminal, &mut app, &id, ink)?;
                     if let Err(e) = transport.kill_session(&session) {
                         app.set_message(e.one_line());
                     }
@@ -629,10 +633,12 @@ fn tick(app: &mut App, ticked: &mut Instant) {
     *ticked = now;
 }
 
-/// One frame of the picker: the screen, then whatever is passing over it.
-fn frame(f: &mut ratatui::Frame, app: &App, palette: Option<&crate::palette::Palette>) {
+/// One frame of the picker: the screen, then whatever is passing over it,
+/// then the theme's background behind what is left (see [`crate::theme`]).
+fn frame(f: &mut ratatui::Frame, app: &App, ink: Option<&effects::Ink>) {
     draw::draw(f, app);
-    effects::paint(f, app, palette);
+    effects::paint(f, app, ink);
+    crate::theme::paint(f);
 }
 
 /// Erase the row a kill was just confirmed for, and only then let the kill
@@ -644,12 +650,12 @@ fn erase(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     id: &str,
-    palette: Option<&crate::palette::Palette>,
+    ink: Option<&effects::Ink>,
 ) -> Result<()> {
     if !app.start_backspace(id) {
         return Ok(());
     }
-    play_out(terminal, app, palette, App::erasing)
+    play_out(terminal, app, ink, App::erasing)
 }
 
 /// Make room in the list for the session `c` is about to create, and close
@@ -673,14 +679,14 @@ fn erase(
 fn make_room(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    palette: Option<&crate::palette::Palette>,
+    ink: Option<&effects::Ink>,
 ) -> Result<prompt::Arrival> {
     let name = prompt::default_name(app.sessions(), Some(app.new_number()));
     if !app.make_room(&name) {
         return Ok(prompt::Arrival::Cut);
     }
     let opened = Instant::now();
-    play_out(terminal, app, palette, |app| app.room().is_some())?;
+    play_out(terminal, app, ink, |app| app.room().is_some())?;
     let size = terminal.size()?;
     let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
     match draw::row_rect(app, area, app::GHOST_ID) {
@@ -708,16 +714,16 @@ fn make_room(
 fn play_out(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    palette: Option<&crate::palette::Palette>,
+    ink: Option<&effects::Ink>,
     playing: impl Fn(&App) -> bool,
 ) -> Result<()> {
     let mut ticked = Instant::now();
     while playing(app) {
-        terminal.draw(|f| frame(f, app, palette))?;
+        terminal.draw(|f| frame(f, app, ink))?;
         std::thread::sleep(crate::fade::FRAME);
         tick(app, &mut ticked);
     }
-    terminal.draw(|f| frame(f, app, palette))?;
+    terminal.draw(|f| frame(f, app, ink))?;
     Ok(())
 }
 

@@ -219,6 +219,17 @@ enabled = true   # windows and floats move rather than jump
 
 [effects.blink]
 enabled = false   # a blinking block cursor fades out and back in
+
+[theme]
+# background = "#1e1e2e"   # unset: the terminal's own colours
 ```
 
 </details>
+
+nvmux's own screens set no colours unless `[theme] background` gives them one,
+so by default they are drawn in your terminal's. Given one, it is the
+background of the picker, the prompt, the help and the attaching screen, and
+every effect that paints in colour — the sonar's rings, the glint, the strike,
+the rows fading in and out — paints in its shades, each cell as bright as it
+would have been without it. The editor always keeps its own colorscheme, and
+`NO_COLOR` turns the theme off along with every effect that paints in colour.

@@ -53,6 +53,53 @@ impl Rgb {
         let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
         Rgb(mix(self.0, to.0), mix(self.1, to.1), mix(self.2, to.2))
     }
+
+    /// How bright the colour is: its HSL lightness, from 0 for black to 1 for
+    /// white — halfway between its strongest channel and its weakest.
+    pub fn lightness(self) -> f32 {
+        let max = self.0.max(self.1).max(self.2);
+        let min = self.0.min(self.1).min(self.2);
+        (f32::from(max) + f32::from(min)) / 510.0
+    }
+
+    /// This colour as bright as `brightness` (a [`Rgb::lightness`], clamped to
+    /// `0..=1`): mixed towards white to be brighter and towards black to be
+    /// darker, which moves its lightness exactly that far and keeps its hue.
+    /// At its own lightness it is itself, exactly.
+    ///
+    /// What a `[theme]` paints its effects with (see
+    /// [`crate::ui::effects::Ink`]): the theme's own colour, as bright as
+    /// whatever each cell would have been without it.
+    pub fn at_lightness(self, brightness: f32) -> Rgb {
+        let own = self.lightness();
+        let brightness = brightness.clamp(0.0, 1.0);
+        if brightness > own {
+            // `own` < 1 here, or nothing is brighter than it.
+            self.lerp(Rgb(255, 255, 255), (brightness - own) / (1.0 - own))
+        } else if brightness < own {
+            // And `own` > 0 here.
+            self.lerp(Rgb(0, 0, 0), (own - brightness) / own)
+        } else {
+            self
+        }
+    }
+
+    /// A colour as the config spells one: `#rrggbb`, in either case, and
+    /// nothing else (see [`crate::config::ThemeSettings`]). `None` for any
+    /// other spelling — the forms a terminal answers in are
+    /// [`parse_colour`]'s, and a hand-written file is held to the one form.
+    pub fn from_hex(text: &str) -> Option<Rgb> {
+        Self::from_digits(text.strip_prefix('#')?)
+    }
+
+    /// Exactly six hex digits, `rrggbb`.
+    fn from_digits(hex: &str) -> Option<Rgb> {
+        if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let n = u32::from_str_radix(hex, 16).ok()?;
+        Some(Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8))
+    }
 }
 
 /// What the terminal said its colours are.
@@ -84,13 +131,7 @@ impl Palette {
     pub fn from_env(text: &str) -> Option<Palette> {
         let colours: Vec<Rgb> = text
             .split(':')
-            .map(|hex| {
-                if hex.len() != 6 {
-                    return None;
-                }
-                let n = u32::from_str_radix(hex, 16).ok()?;
-                Some(Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8))
-            })
+            .map(Rgb::from_digits)
             .collect::<Option<_>>()?;
         let [fg, bg, ansi @ ..] = colours.as_slice() else {
             return None;
@@ -422,6 +463,64 @@ mod tests {
         assert_eq!(Palette::from_env("eeeeee:101010"), None, "no sixteen");
         assert_eq!(Palette::from_env(&text.replace('e', "x")), None);
         assert_eq!(Palette::from_env(&format!("{text}:000000")), None);
+    }
+
+    #[test]
+    fn lightness_runs_from_black_to_white() {
+        assert_eq!(Rgb(0, 0, 0).lightness(), 0.0);
+        assert_eq!(Rgb(255, 255, 255).lightness(), 1.0);
+        assert_eq!(Rgb(255, 0, 0).lightness(), 0.5, "a pure hue is halfway");
+        assert_eq!(Rgb(0x1e, 0x1e, 0x2e).lightness(), (30.0 + 46.0) / 510.0);
+    }
+
+    /// A theme colour made brighter or darker keeps its hue, lands on the
+    /// brightness asked for, and at its own is untouched.
+    #[test]
+    fn a_colour_at_a_lightness_keeps_its_hue() {
+        let theme = Rgb(0x1e, 0x1e, 0x2e);
+        assert_eq!(theme.at_lightness(theme.lightness()), theme, "itself");
+        assert_eq!(theme.at_lightness(1.0), Rgb(255, 255, 255));
+        assert_eq!(theme.at_lightness(0.0), Rgb(0, 0, 0));
+        assert_eq!(theme.at_lightness(2.0), Rgb(255, 255, 255), "clamped");
+        for brightness in [0.05, 0.3, 0.5, 0.78, 0.95] {
+            let Rgb(r, g, b) = theme.at_lightness(brightness);
+            let got = Rgb(r, g, b).lightness();
+            assert!(
+                (got - brightness).abs() < 0.01,
+                "{brightness} -> {got} ({r},{g},{b})"
+            );
+            assert!(
+                r == g && b > r,
+                "still blue-grey at {brightness}: ({r},{g},{b})"
+            );
+        }
+        // The extremes have no hue to keep, and come out grey.
+        assert_eq!(Rgb(0, 0, 0).at_lightness(0.5), Rgb(128, 128, 128));
+        assert_eq!(Rgb(255, 255, 255).at_lightness(0.5), Rgb(128, 128, 128));
+    }
+
+    /// The config's one spelling of a colour, and nothing near it.
+    #[test]
+    fn a_config_colour_is_hash_and_six_digits() {
+        assert_eq!(Rgb::from_hex("#1e1e2e"), Some(Rgb(0x1e, 0x1e, 0x2e)));
+        assert_eq!(Rgb::from_hex("#1E1e2E"), Some(Rgb(0x1e, 0x1e, 0x2e)));
+        assert_eq!(Rgb::from_hex("#000000"), Some(Rgb(0, 0, 0)));
+        assert_eq!(Rgb::from_hex("#ffffff"), Some(Rgb(255, 255, 255)));
+        for bad in [
+            "",
+            "#",
+            "1e1e2e",
+            "#fff",
+            "#1e1e2",
+            "#1e1e2e0",
+            "#gggggg",
+            "#+1e1e2",
+            " #1e1e2e",
+            "blue",
+            "rgb:1e/1e/2e",
+        ] {
+            assert_eq!(Rgb::from_hex(bad), None, "{bad:?}");
+        }
     }
 
     /// The corners of the 256-colour table, as xterm defines them.

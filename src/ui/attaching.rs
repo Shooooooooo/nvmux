@@ -230,7 +230,10 @@ fn run_on(
             }
         }
 
-        terminal.draw(|f| draw(f, &state))?;
+        terminal.draw(|f| {
+            draw(f, &state);
+            crate::theme::paint(f);
+        })?;
     }
 }
 

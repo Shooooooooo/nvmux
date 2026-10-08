@@ -36,6 +36,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::error::ConfigError;
+use crate::palette::Rgb;
 
 /// The whole configuration. Each field is a table of its own, so the file reads
 /// as `[keys]`-style sections — `[effects]` with a table inside it for each
@@ -44,7 +45,8 @@ use crate::error::ConfigError;
 /// `[effects.filter]` and `[effects.create]` for nvmux's own screens, and
 /// `[effects.smear]`, `[effects.particles]`, `[effects.scroll]`,
 /// `[effects.windows]` and `[effects.blink]` for nvmux's own client
-/// (`[client] ui = "nvmux"`, see [`crate::client`]).
+/// (`[client] ui = "nvmux"`, see [`crate::client`]) — and `[theme]`, the
+/// colour of nvmux's own screens.
 ///
 /// Not `Copy`: `[session] command` owns a `String`. Nothing reads it by value —
 /// [`get`] hands out a `&'static Settings` — so this costs nothing.
@@ -55,6 +57,7 @@ pub struct Settings {
     pub session: SessionSettings,
     pub client: ClientSettings,
     pub effects: EffectsSettings,
+    pub theme: ThemeSettings,
 }
 
 /// The prefix key and how long a half-typed sequence waits (see [`crate::keys`]).
@@ -573,6 +576,34 @@ pub struct CreateSettings {
     pub enabled: bool,
 }
 
+/// `[theme]`: one colour for nvmux's own screens — the picker, the create
+/// prompt, the help and the attaching screen — and everything the picker's
+/// effects paint (see [`crate::theme`]). `"#rrggbb"`; unset, the default,
+/// leaves every colour what it was without a theme, so an absent table draws
+/// exactly what nvmux always drew. `NO_COLOR` sets none of it.
+///
+/// Not the editor's: a session is drawn in its own colorscheme. Nor the
+/// `<prefix>` bar and the notice a switch puts up, which are drawn over a
+/// session rather than on a screen of nvmux's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThemeSettings {
+    /// Behind everything on nvmux's own screens, and the one colour the
+    /// effects paint in: the rings, the glint, the strike's warmth, the
+    /// afterglow and the rows fading in and out are each this colour at the
+    /// brightness that cell would have had without it (see
+    /// [`crate::ui::effects::Ink`]), so each fades into the background it is
+    /// drawn on. Unset, the terminal's own background, and the effects in the
+    /// terminal's colours.
+    ///
+    /// A fade still dissolves all the way into the terminal's own background,
+    /// this one with it (see [`crate::fade`]), so a screen comes up out of the
+    /// session it follows and goes down into the one it leads to without a
+    /// seam — and between two of nvmux's own screens, passes through it.
+    #[serde(deserialize_with = "de_rgb")]
+    pub background: Option<Rgb>,
+}
+
 impl Default for EffectsSettings {
     fn default() -> Self {
         Self {
@@ -740,6 +771,19 @@ where
 {
     let s = String::deserialize(deserializer)?;
     crate::keys::parse_prefix(&s).map_err(serde::de::Error::custom)
+}
+
+/// The `[theme]` colour: `"#rrggbb"` and no other spelling (see
+/// [`Rgb::from_hex`]). Present means set; an absent key never reaches here, and
+/// `#[serde(default)]` leaves it `None`.
+fn de_rgb<'de, D>(deserializer: D) -> Result<Option<Rgb>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    Rgb::from_hex(&s).map(Some).ok_or_else(|| {
+        serde::de::Error::custom(format!("{s:?} is not a colour; write \"#rrggbb\""))
+    })
 }
 
 /// Ceiling for `keys.timeout_ms`. Generous but finite: the value goes into a
@@ -1028,7 +1072,14 @@ fn render_default_config(prefix: u8) -> String {
          \n\
          [effects.blink]\n\
          # nvmux's own client: a blinking block cursor fades out and back in.\n\
-         # enabled = {blink_enabled}\n",
+         # enabled = {blink_enabled}\n\
+         \n\
+         [theme]\n\
+         # One colour, \"#rrggbb\", for nvmux's own screens: the background of the\n\
+         # picker, prompt, help and attaching screen, and every effect above that\n\
+         # paints in colour, in its shades. Unset, the terminal's own colours.\n\
+         # The editor keeps its own colorscheme, and NO_COLOR sets none of it.\n\
+         # background = \"#1e1e2e\"\n",
         prefix = crate::keys::prefix_label(prefix),
         timeout = k.timeout_ms,
         command = s.command,
@@ -1146,6 +1197,7 @@ mod tests {
             "[effects.scroll]",
             "[effects.windows]",
             "[effects.blink]",
+            "[theme]",
         ] {
             assert!(doc.contains(table), "the README has no {table}");
         }
@@ -1194,9 +1246,48 @@ mod tests {
             [effects.windows]\n\
             enabled = true\n\
             [effects.blink]\n\
-            enabled = false\n";
+            enabled = false\n\
+            [theme]\n";
         let s: Settings = toml::from_str(doc).expect("valid");
         assert_eq!(s, Settings::default());
+    }
+
+    /// The `[theme]` colour reads as `#rrggbb`, in either case, and is unset
+    /// unless given.
+    #[test]
+    fn the_theme_colour_is_read_as_rgb() {
+        let s: Settings = toml::from_str("[theme]\nbackground = \"#1E1e2e\"\n").expect("valid");
+        assert_eq!(s.theme.background, Some(Rgb(0x1e, 0x1e, 0x2e)));
+        assert_eq!(
+            ThemeSettings::default().background,
+            None,
+            "unset by default"
+        );
+    }
+
+    /// RGB only, and only the one spelling: a hand-edited colour that is not
+    /// `#rrggbb` is an error at startup naming the key, never a guess.
+    #[test]
+    fn a_theme_colour_in_any_other_form_is_refused() {
+        for value in [
+            "\"1e1e2e\"",
+            "\"#fff\"",
+            "\"#gggggg\"",
+            "\"blue\"",
+            "\"\"",
+            "[30, 30, 46]",
+            "3",
+        ] {
+            let doc = format!("[theme]\nbackground = {value}\n");
+            let err = toml::from_str::<Settings>(&doc).expect_err(&doc);
+            assert!(err.to_string().contains("background"), "{doc:?} -> {err}");
+        }
+        // One colour for everything: there is no second key to set.
+        for key in ["foreground", "sonar"] {
+            let doc = format!("[theme]\n{key} = \"#ffffff\"\n");
+            let err = toml::from_str::<Settings>(&doc).expect_err(&doc);
+            assert!(err.to_string().contains(key), "{err}");
+        }
     }
 
     #[test]
@@ -1596,6 +1687,7 @@ mod tests {
             "[effects.scroll]",
             "[effects.windows]",
             "[effects.blink]",
+            "[theme]",
         ] {
             assert!(
                 rendered.contains(&format!("\n{table}\n")),
@@ -1627,6 +1719,24 @@ mod tests {
                 "the template must document {line:?}: {rendered:?}"
             );
         }
+    }
+
+    /// The template's `[theme]` is an example, not a setting: commented out it
+    /// sets nothing, and uncommented it is a colour that reads.
+    #[test]
+    fn the_default_configs_theme_examples_parse() {
+        let rendered = render_default_config(crate::keys::PREFIX);
+        let theme = &rendered[rendered.find("\n[theme]\n").expect("a [theme] table")..];
+        let uncommented: String = theme
+            .lines()
+            .map(|line| match line.strip_prefix("# ") {
+                Some(rest) if rest.contains(" = ") => rest,
+                _ => line,
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let s: Settings = toml::from_str(&uncommented).expect("the example parses");
+        assert!(s.theme.background.is_some(), "no example background");
     }
 
     // --- path resolution (pure) --------------------------------------------
