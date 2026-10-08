@@ -316,6 +316,8 @@ mod tests {
     /// The process umask is one value shared by every thread, so the tests that
     /// move it take turns. Without this, one test's hostile mask is another's
     /// launch mask, and the shells the rest of this binary starts inherit it.
+    /// The tests here that write files take it too: under the hostile mask a
+    /// file is born with no owner bits, and reading it back fails.
     fn umask_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -485,6 +487,7 @@ mod tests {
 
     #[test]
     fn an_atomic_write_lands_whole_and_leaves_no_temp_file() {
+        let _guard = umask_lock();
         let dir = crate::test_support::scratch_dir("paths-atomic");
         let path = dir.join("x.json");
         write_atomic(&path, b"{\"a\":1}\n").expect("write");
@@ -500,6 +503,7 @@ mod tests {
     /// not leave the temp file for a listing to find.
     #[test]
     fn a_failed_atomic_write_cleans_up_after_itself() {
+        let _guard = umask_lock();
         let dir = crate::test_support::scratch_dir("paths-atomic-fail");
         let path = dir.join("x.json");
         std::fs::create_dir(&path).expect("a directory in the way");
