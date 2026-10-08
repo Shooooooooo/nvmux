@@ -185,7 +185,7 @@ session     = true   # Neovim's own screen dissolves too, and backs the notice
 enabled = true   # stars off a session being moved, rows stepping aside, its landing
 
 [effects.cursor]
-enabled = true   # the row the cursor leaves fades back; a glint crosses the next
+enabled = true   # the row the cursor leaves fades back from the bar
 
 [effects.back]
 enabled = true   # back from a session, rings pulse from its row in the picker
@@ -228,8 +228,8 @@ enabled = false   # a blinking block cursor fades out and back in
 
 The picker draws the session it has highlighted as a bar in your terminal's
 own colours, reversed. `[theme] highlight` gives that bar a colour of its own,
-with its text in whichever of your terminal's colours reads on it, and the
-effects that come off it — the afterglow it leaves, the glint that crosses it,
-the warmth it takes at `[y/N]`, the sonar's rings, and the stars, sparks and
-dust of a session being reordered — work theirs out from it. Nothing else
-changes colour, and `NO_COLOR` turns it off.
+with its text in whichever of your terminal's colours reads on it, and draws
+the other sessions' names in it too. The effects that come off the bar — the
+afterglow it leaves, the warmth it takes at `[y/N]`, the sonar's rings, and
+the stars, sparks and dust of a session being reordered — work theirs out
+from it. Nothing else changes colour, and `NO_COLOR` turns it off.

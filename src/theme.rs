@@ -1,5 +1,5 @@
 //! `[theme] highlight`: one colour for the session the picker has highlighted,
-//! and for the effects that come off its bar.
+//! the names of the others, and the effects that come off its bar.
 //!
 //! The picker draws its selection as a reversed bar (see [`crate::ui::draw`]),
 //! which shows the terminal's own foreground as the bar and its background as
@@ -13,10 +13,11 @@
 //! Like the fade and the effects, it is a post-pass over a finished frame, so
 //! `draw` and its tests never see it. With no `[theme] highlight`, or under
 //! `NO_COLOR`, nothing is set, and a frame is byte for byte what it was before
-//! there was a theme. The effects that come off the bar — the afterglow, the
-//! glint, the strike and the sonar's rings — take their colours from the same
-//! [`Highlight`] (see [`crate::ui::effects::Ink`]), and so do the stars,
-//! sparks and dust a session being moved scatters beside the list (see
+//! there was a theme. The other sessions' names are drawn in the same colour
+//! (see [`crate::ui::effects::names`]). The effects that come off the bar —
+//! the afterglow, the strike and the sonar's rings — take their colours from
+//! the same [`Highlight`] (see [`crate::ui::effects::Ink`]), and so do the
+//! stars, sparks and dust a session being moved scatters beside the list (see
 //! [`crate::ui::effects::particles`]).
 
 use ratatui::buffer::Buffer;

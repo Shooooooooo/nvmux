@@ -343,8 +343,9 @@ pub fn apply(buf: &mut Buffer, palette: &Palette, t: f32) {
 /// reversed, and its text can only be given a colour of its own once the
 /// reverse is off. A bar drawn in colours of its own — a `[theme] highlight`
 /// — sinks from them: the bar from its own, the text from its own until it
-/// turns. The last frame puts the terminal's own back, so a transparent
-/// background ends transparent.
+/// turns; and a kept name in a colour of its own off any bar comes round to
+/// the terminal's foreground. The last frame puts the terminal's own back, so
+/// a transparent background ends transparent.
 pub fn apply_keeping(buf: &mut Buffer, palette: &Palette, t: f32, keep: Rect) {
     let area = buf.area;
     let iris = Iris::new(keep.y.saturating_sub(area.y), area.height);
@@ -360,6 +361,18 @@ pub fn apply_keeping(buf: &mut Buffer, palette: &Palette, t: f32, keep: Rect) {
             continue;
         }
         if !cell.modifier.contains(Modifier::REVERSED) {
+            // Not on a bar, and drawn in a colour of its own — a name under a
+            // `[theme] highlight` — it comes round to the terminal's own on
+            // the same clock, so it ends as the plain text the hand-off
+            // leaves. In the terminal's colours already, it is left as drawn.
+            if let Some(fg) = own(cell.fg) {
+                if t >= 1.0 {
+                    cell.set_fg(Color::Reset);
+                } else {
+                    let fg = fg.lerp(palette.fg, t);
+                    cell.set_fg(Color::Rgb(fg.0, fg.1, fg.2));
+                }
+            }
             continue;
         }
         if t >= 1.0 {
@@ -1061,6 +1074,29 @@ mod tests {
         }
         for cell in &buf.content {
             assert_eq!(cell.bg, Color::Reset, "nothing left of the bar: {cell:?}");
+        }
+    }
+
+    /// A name typed by number is kept off any bar; in the highlight a theme
+    /// draws the other names in, it comes round to the terminal's foreground
+    /// and ends as plain text, the hand-off's.
+    #[test]
+    fn a_themed_name_kept_off_a_bar_comes_round_to_the_terminals() {
+        let named = || {
+            let (mut buf, _) = a_bar();
+            for x in 5..10 {
+                buf[(x, 1)].set_fg(Color::Rgb(BAR.0, BAR.1, BAR.2));
+            }
+            buf
+        };
+        let keep = Rect::new(5, 1, 5, 1);
+        let mut buf = named();
+        apply_keeping(&mut buf, &palette(), 0.5, keep);
+        assert_eq!(buf[(5, 1)].fg, Color::Rgb(150, 100, 200), "halfway round");
+        let mut buf = named();
+        apply_keeping(&mut buf, &palette(), 1.0, keep);
+        for x in 5..10 {
+            assert_eq!(buf[(x, 1)].fg, Color::Reset, "plain text at {x}");
         }
     }
 }

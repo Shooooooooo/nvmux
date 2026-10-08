@@ -804,24 +804,68 @@ pub(super) fn row_rect(app: &App, area: Rect, id: &str) -> Option<Rect> {
     Some(Rect::new(block.x, block.y + line as u16, block.width, 1))
 }
 
-/// Where the name of session `id` is drawn: its row ([`row_rect`]) after the
-/// marker, the number and the gap, and short of the blanks the bar runs on
-/// past it, cut where the row is cut. `None` when the row is not on screen, or
-/// so narrow that none of the name is.
+/// Where the name of session `id` is drawn: its row after the marker, the
+/// number and the gap, and short of the blanks the bar runs on past it, cut
+/// where the row is cut — and wherever a row stepping aside has it now. `None`
+/// when the row is not on screen, or so narrow that none of the name is.
 pub(super) fn name_rect(app: &App, area: Rect, id: &str) -> Option<Rect> {
-    let row = row_rect(app, area, id)?;
+    let rows = app.rows();
+    drawn_names(app, area)
+        .into_iter()
+        .find(|(index, _)| rows[*index].session.id == id)
+        .map(|(_, rect)| rect)
+}
+
+/// The name of every session on screen, as drawn ([`name_rect`]), by session
+/// id. A row standing in a gap for a session not made yet is no session's,
+/// and is not among them. What a `[theme] highlight` colours the names the
+/// picker has not highlighted by (see [`super::effects::names`]).
+pub(super) fn session_names(app: &App, area: Rect) -> Vec<(String, Rect)> {
+    let rows = app.rows();
+    drawn_names(app, area)
+        .into_iter()
+        .filter(|(index, _)| !rows[*index].ghost)
+        .map(|(index, rect)| (rows[index].session.id.clone(), rect))
+        .collect()
+}
+
+/// Each row on screen, as an index into [`App::rows`], and where its name is
+/// drawn: after the marker, the number and the gap; shifted with a row
+/// stepping aside (see [`super::swap`]); and cut at the end of the list and
+/// at the edges of the screen. A row with none of its name on screen is left
+/// out. The one measure of a name for [`name_rect`], [`session_names`] and
+/// [`in_a_name`].
+fn drawn_names(app: &App, area: Rect) -> Vec<(usize, Rect)> {
+    if area.height == 0 || area.width == 0 {
+        return Vec::new();
+    }
     let (body, _) = split_hint_row(area);
-    let num_width = list_layout(app, body)?.num_width;
-    let head = (MARKER.width() + num_width + NUM_GAP.width()) as u16;
-    let name = app
-        .rows()
-        .iter()
-        .find(|r| r.session.id == id)?
-        .session
-        .name
-        .width() as u16;
-    let width = row.width.saturating_sub(head).min(name);
-    (width > 0).then(|| Rect::new(row.x + head, row.y, width, 1))
+    let Some(ListLayout {
+        block,
+        offset,
+        num_width,
+    }) = list_layout(app, body)
+    else {
+        return Vec::new();
+    };
+    let head = MARKER.width() + num_width + NUM_GAP.width();
+    let rows = app.rows();
+    let screen = (i32::from(area.x), i32::from(area.x + area.width));
+    (0..block.height)
+        .filter_map(|line| {
+            let index = offset + usize::from(line);
+            let row = rows.get(index)?;
+            let end = (head + row.session.name.width()).min(block.width as usize);
+            let at = i32::from(block.x) + i32::from(app.swap().aside(&row.session.id));
+            let left = (at + head as i32).max(screen.0);
+            let right = (at + end as i32).min(screen.1);
+            (right > left).then(|| {
+                let width = u16::try_from(right - left).unwrap_or(u16::MAX);
+                let x = u16::try_from(left).unwrap_or(u16::MAX);
+                (index, Rect::new(x, block.y + line, width, 1))
+            })
+        })
+        .collect()
 }
 
 /// Whether terminal cell (`column`, `row`) is part of a row as drawn — its
@@ -862,30 +906,9 @@ pub(super) fn on_a_row(app: &App, area: Rect, column: u16, row: u16) -> bool {
 /// number and blanks, is never braille, and a dot of a spark that lands in a
 /// blank of it is a spark like any other.
 pub(super) fn in_a_name(app: &App, area: Rect, column: u16, row: u16) -> bool {
-    if area.height == 0 || area.width == 0 {
-        return false;
-    }
-    let (body, _) = split_hint_row(area);
-    let Some(ListLayout {
-        block,
-        offset,
-        num_width,
-    }) = list_layout(app, body)
-    else {
-        return false;
-    };
-    if row < block.y || row >= block.y + block.height {
-        return false;
-    }
-    let rows = app.rows();
-    let Some(drawn) = rows.get(offset + usize::from(row - block.y)) else {
-        return false;
-    };
-    let head = MARKER.width() + num_width + NUM_GAP.width();
-    let end = (head + drawn.session.name.width()).min(block.width as usize);
-    let start = i32::from(block.x) + i32::from(app.swap().aside(&drawn.session.id));
-    let column = i32::from(column);
-    column >= start + head as i32 && column < start + end as i32
+    drawn_names(app, area)
+        .iter()
+        .any(|(_, rect)| rect.contains(ratatui::layout::Position::new(column, row)))
 }
 
 /// Keep `selected` visible within a window of `height` rows.

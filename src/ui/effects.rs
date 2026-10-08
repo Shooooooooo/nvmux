@@ -1,11 +1,11 @@
 //! The picker's passing effects: the afterglow the cursor leaves behind (and a
 //! session in flight leaves on the rows it crosses, see [`super::swap`]), the
-//! glint it lands with, the rows a filter keystroke drops fading out where
-//! they stood, the line struck through a name a `[y/N]` is asking about, the
-//! rings that go out from the session you came back to the picker from, and
-//! the row `c` stands in the gap it opens, coming up out of the background.
+//! rows a filter keystroke drops fading out where they stood, the line struck
+//! through a name a `[y/N]` is asking about, the rings that go out from the
+//! session you came back to the picker from, and the row `c` stands in the
+//! gap it opens, coming up out of the background.
 //!
-//! All six are a post-pass over a frame [`super::draw`] has already drawn,
+//! All five are a post-pass over a frame [`super::draw`] has already drawn,
 //! the way [`crate::fade::apply`] is, and for the same reason: the screen's own
 //! drawing stays colourless, and its tests keep saying so. What is passing —
 //! which rows, and how far through — is [`App`]'s, moved on by the caller's
@@ -15,12 +15,10 @@
 //! # Colour where the terminal said, modifiers where it did not
 //!
 //! A real fade needs real colours at both ends, so with the terminal's answer
-//! to [`crate::palette::query`] and no `NO_COLOR`, all six paint in colour:
+//! to [`crate::palette::query`] and no `NO_COLOR`, all five paint in colour:
 //!
 //! - the afterglow runs from the selection's look — the foreground as the
 //!   background, the background as the foreground — back to the plain row;
-//! - the glint is a band a few cells wide that crosses the new selection's
-//!   bar from left to right, brightening it towards [`SHINE`] at its middle;
 //! - a dropped row's text runs from most of the way to all of the way into
 //!   the background, so it is plainly leaving from its first frame;
 //! - the bar of a row a `[y/N]` is asking about warms towards the terminal's
@@ -32,18 +30,18 @@
 //! A `[theme] highlight` (see [`crate::theme`]) changes the colours, never
 //! what is painted. Everything that comes off the selection's bar starts
 //! from the bar as the theme colours it rather than from the terminal's
-//! foreground: the afterglow lets go of the highlight and the text on it,
-//! the glint brightens the highlight, the strike warms it, and the rings go
-//! out in it, each cell as far from it as its own brightness says; and the
-//! stars, sparks and dust of a session being moved take it too, the dim ones
-//! halfway into the background ([`particles`]). The rows a filter drops and
-//! the row in a gap are no bar, and keep the terminal's colours. That is
-//! [`Ink`], read once a run.
+//! foreground: the afterglow lets go of the highlight and the text on it, the
+//! strike warms it, and the rings go out in it, each cell as far from it as
+//! its own brightness says. The names of the other sessions are the
+//! highlight too ([`names`]), so a row the afterglow lets go of comes back to
+//! that, and a dropped row's name fades out of it. The stars, sparks and dust
+//! of a session being moved take it as well, the dim ones halfway into the
+//! background ([`particles`]). The row in a gap is no session yet, and keeps
+//! the terminal's colours. That is [`Ink`], read once a run.
 //!
 //! Without them, each falls back to a modifier, which sets no colour: the
 //! afterglow holds the bar, reversed and dim, for the first third of its time
-//! and then lets it go; the glint is an underline running under the bar where
-//! the band would be; a dropped row is dim until it goes; the struck row is the
+//! and then lets it go; a dropped row is dim until it goes; the struck row is the
 //! line alone, which is a modifier to begin with; a ring is dim once it is
 //! halfway out; the row in the gap is there, dim, from the first frame.
 //! Coarser, and correct under `NO_COLOR` by construction, as everything else
@@ -91,36 +89,6 @@ pub const ROOM_HELD: Duration = Duration::from_millis(200);
 /// configurable: the fade is waited on at every switch, and this holds nothing
 /// up.
 pub const AFTERGLOW: Duration = Duration::from_millis(100);
-
-/// How long the glint takes to cross the row the cursor lands on. Longer
-/// than the afterglow, so the two read as one movement: the old row letting
-/// go quickly while the light runs across the new one. Like the afterglow it
-/// holds nothing up, and the next move simply takes it to the next row.
-pub const GLINT: Duration = Duration::from_millis(260);
-
-/// What the glint brightens the bar towards: white, the one colour these
-/// effects use that the terminal did not report. Its own bright white (ANSI
-/// 15) was the obvious alternative and is no good: terminals commonly make it
-/// the default foreground itself — the demo's theme does — and a glint towards
-/// the bar's own colour shows nothing.
-const SHINE: Rgb = Rgb(255, 255, 255);
-
-/// How much of the way to [`SHINE`] the middle of the band goes. Not all of
-/// it: the glint is a sheen over the bar, not a hole in it.
-const GLINT_PEAK: f32 = 0.9;
-
-/// Half the width of the band, in cells: how far from its middle a cell is
-/// still lit at all, the light falling off evenly to nothing there.
-const GLINT_REACH: f32 = 2.6;
-
-/// How far off each end of the bar the middle of the band starts and stops,
-/// in cells, so it is seen to come on at the left and go off at the right
-/// rather than appear and vanish at full strength.
-const GLINT_LEAD: f32 = 2.0;
-
-/// How lit a cell has to be for the modifier fallback to underline it: the
-/// band's brighter middle only, a few cells wide.
-const GLINT_UNDERLINE: f32 = 0.3;
 
 /// How long the line takes to go all the way through a name a `[y/N]` is
 /// asking about, and to come back off it when the answer is no. Quick: the
@@ -172,6 +140,9 @@ pub struct Ink {
     /// The text on the bar: the theme's choice for it, or the terminal's
     /// background, which is what a reversed bar shows.
     on_bar: Rgb,
+    /// The names of the sessions not highlighted: the highlight too, under a
+    /// theme (see [`names`]), or the terminal's foreground.
+    name: Rgb,
 }
 
 impl Ink {
@@ -184,6 +155,7 @@ impl Ink {
             palette: terminal,
             bar,
             on_bar,
+            name: bar,
         }
     }
 }
@@ -220,7 +192,7 @@ pub fn paint(frame: &mut Frame, app: &App, ink: Option<&Ink>) {
     if let Some((id, progress)) = app.glow() {
         if selected != Some(id) {
             if let Some(rect) = draw::row_rect(app, area, id) {
-                glow(buf, rect, ink, progress);
+                glow(buf, rect, draw::name_rect(app, area, id), ink, progress);
             }
         }
     }
@@ -230,25 +202,16 @@ pub fn paint(frame: &mut Frame, app: &App, ink: Option<&Ink>) {
     for (id, progress) in app.swap().echoes() {
         if selected != Some(id) {
             if let Some(rect) = draw::row_rect(app, area, id) {
-                glow(buf, rect, ink, progress);
-            }
-        }
-    }
-
-    if let Some((id, progress)) = app.glint() {
-        // The bar is the selection's: a glint left on a row the cursor has
-        // since left would be lighting a plain row.
-        if selected == Some(id) {
-            if let Some(rect) = draw::row_rect(app, area, id) {
-                glint(buf, rect, ink, progress);
+                glow(buf, rect, draw::name_rect(app, area, id), ink, progress);
             }
         }
     }
 
     if let Some(progress) = app.leaving() {
         for row in app.rows().iter().filter(|r| r.leaving) {
-            if let Some(rect) = draw::row_rect(app, area, &row.session.id) {
-                leave(buf, rect, ink, progress);
+            let id = &row.session.id;
+            if let Some(rect) = draw::row_rect(app, area, id) {
+                leave(buf, rect, draw::name_rect(app, area, id), ink, progress);
             }
         }
     }
@@ -281,6 +244,31 @@ pub fn paint(frame: &mut Frame, app: &App, ink: Option<&Ink>) {
         if let Some(rect) = draw::row_rect(app, area, id) {
             rings(buf, app, area, rect, sonar, ink);
         }
+    }
+}
+
+/// Under a `[theme] highlight`, the names of the sessions the picker has not
+/// highlighted, in it: the one colour of the theme on the text of every
+/// other row, as it is the bar of the highlighted one. Only the names — the
+/// markers and the numbers stay the terminal's — and only what nothing has
+/// coloured, so a row an effect is painting is the effect's, and the
+/// highlighted row, reversed, is the bar's (see [`crate::theme`]). Measured
+/// where a row stepping aside has its name now. Without a highlight,
+/// nothing.
+pub fn names(frame: &mut Frame, app: &App, highlight: Option<&Highlight>) {
+    let Some(highlight) = highlight else {
+        return;
+    };
+    let area = frame.area();
+    let colour = rgb(highlight.bar);
+    let names = draw::session_names(app, area);
+    let buf = frame.buffer_mut();
+    for (_, name) in names {
+        each_cell(buf, name, |cell| {
+            if cell.fg == Color::Reset && !cell.modifier.contains(Modifier::REVERSED) {
+                cell.set_fg(colour);
+            }
+        });
     }
 }
 
@@ -340,8 +328,10 @@ fn braille(symbol: &str) -> bool {
     )
 }
 
-/// The row the cursor left, `progress` of the way back to plain.
-fn glow(buf: &mut Buffer, rect: Rect, ink: Option<&Ink>, progress: f32) {
+/// The row the cursor left, `progress` of the way back to plain: its text to
+/// the terminal's foreground, and its name, at `name`, to the colour names are
+/// drawn in.
+fn glow(buf: &mut Buffer, rect: Rect, name: Option<Rect>, ink: Option<&Ink>, progress: f32) {
     match ink {
         Some(ink) => {
             let p = &ink.palette;
@@ -352,6 +342,12 @@ fn glow(buf: &mut Buffer, rect: Rect, ink: Option<&Ink>, progress: f32) {
                 cell.set_bg(bg);
                 cell.set_fg(fg);
             });
+            if let Some(name) = name {
+                let fg = rgb(ink.on_bar.lerp(ink.name, t));
+                each_cell(buf, name.intersection(rect), |cell| {
+                    cell.set_fg(fg);
+                });
+            }
         }
         None if progress < FALLBACK_HOLD => {
             each_cell(buf, rect, |cell| {
@@ -359,38 +355,6 @@ fn glow(buf: &mut Buffer, rect: Rect, ink: Option<&Ink>, progress: f32) {
             });
         }
         None => {}
-    }
-}
-
-/// The bar the cursor has just landed on, with the glint `progress` of the way
-/// across it. `rect` is the bar: [`draw::row_rect`] measures a row the whole
-/// width of the list, which is as far as the selection's reversed bar runs.
-fn glint(buf: &mut Buffer, rect: Rect, ink: Option<&Ink>, progress: f32) {
-    let middle = -GLINT_LEAD + ease_in_out(progress) * (f32::from(rect.width) + 2.0 * GLINT_LEAD);
-    let on_screen = rect.intersection(buf.area);
-    for x in on_screen.x..on_screen.x + on_screen.width {
-        // From the bar's own left edge, not the screen's, and to the middle of
-        // the cell.
-        let along = f32::from(x - rect.x) + 0.5;
-        let lit = 1.0 - (along - middle).abs() / GLINT_REACH;
-        if lit <= 0.0 {
-            continue;
-        }
-        let cell = &mut buf[(x, rect.y)];
-        match ink {
-            // The bar is the reversed default colours. Painting it means
-            // setting both ends outright, the background now the brightened
-            // foreground, so the reverse comes off first.
-            Some(ink) => {
-                cell.modifier.remove(Modifier::REVERSED);
-                cell.set_bg(rgb(ink.bar.lerp(SHINE, GLINT_PEAK * lit)));
-                cell.set_fg(rgb(ink.on_bar));
-            }
-            None if lit > GLINT_UNDERLINE => {
-                cell.modifier.insert(Modifier::UNDERLINED);
-            }
-            None => {}
-        }
     }
 }
 
@@ -481,8 +445,10 @@ fn ground(buf: &Buffer, app: &App, area: Rect, x: u16, y: u16) -> bool {
         && !draw::on_a_row(app, area, x, y)
 }
 
-/// A row a filter keystroke dropped, `progress` of the way to gone.
-fn leave(buf: &mut Buffer, rect: Rect, ink: Option<&Ink>, progress: f32) {
+/// A row a filter keystroke dropped, `progress` of the way to gone: its text
+/// from the terminal's foreground, and its name, at `name`, from the colour
+/// names are drawn in.
+fn leave(buf: &mut Buffer, rect: Rect, name: Option<Rect>, ink: Option<&Ink>, progress: f32) {
     match ink {
         Some(ink) => {
             let p = &ink.palette;
@@ -491,6 +457,12 @@ fn leave(buf: &mut Buffer, rect: Rect, ink: Option<&Ink>, progress: f32) {
             each_cell(buf, rect, |cell| {
                 cell.set_fg(fg);
             });
+            if let Some(name) = name {
+                let fg = rgb(ink.name.lerp(p.bg, t));
+                each_cell(buf, name.intersection(rect), |cell| {
+                    cell.set_fg(fg);
+                });
+            }
         }
         None => {
             each_cell(buf, rect, |cell| {
@@ -533,17 +505,6 @@ fn rgb(c: Rgb) -> Color {
 fn ease_out(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     1.0 - (1.0 - t) * (1.0 - t)
-}
-
-/// Slow off the mark, quick through the middle and slow to a stop, so the
-/// glint is seen arriving and leaving and sweeps the name in between.
-fn ease_in_out(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    if t < 0.5 {
-        2.0 * t * t
-    } else {
-        1.0 - 2.0 * (1.0 - t) * (1.0 - t)
-    }
 }
 
 #[cfg(test)]
@@ -669,125 +630,6 @@ mod tests {
         assert!(!cell.modifier.contains(Modifier::REVERSED), "let go");
     }
 
-    /// The column of the brightest painted cell on row `y`: the middle of the
-    /// glint's band, if it is on the row.
-    fn brightest(buf: &Buffer, y: u16) -> Option<u16> {
-        (0..buf.area.width)
-            .filter_map(|x| match buf[(x, y)].bg {
-                Color::Rgb(r, ..) => Some((x, r)),
-                _ => None,
-            })
-            .max_by_key(|(_, r)| *r)
-            .map(|(x, _)| x)
-    }
-
-    /// The row the cursor lands on has a band of light crossing its bar,
-    /// brighter than the bar, over the bar's own reversed look elsewhere; and
-    /// once it has crossed, the bar is plain again.
-    #[test]
-    fn the_row_the_cursor_lands_on_is_crossed_by_a_glint() {
-        let p = test_palette();
-        let mut a = picker(&["api-server", "dotfiles", "notes"]);
-        a.on_key(Key::Char('j'));
-        a.tick(GLINT / 2);
-
-        let buf = frame(&a, Some(&p));
-        let y = row_of(&buf, "dotfiles");
-        let x = brightest(&buf, y).expect("the band is on the bar");
-        let cell = &buf[(x, y)];
-        let Color::Rgb(r, ..) = cell.bg else {
-            unreachable!("found by its colour")
-        };
-        assert!(r > p.fg.0, "brighter than the bar: {cell:?}");
-        assert_eq!(cell.fg, rgb(p.bg), "the name keeps the bar's text colour");
-        assert!(!cell.modifier.contains(Modifier::REVERSED), "{cell:?}");
-        assert!(
-            (0..W).any(|x| buf[(x, y)].modifier.contains(Modifier::REVERSED)),
-            "away from the band the bar is untouched"
-        );
-
-        a.tick(GLINT);
-        let buf = frame(&a, Some(&p));
-        let y = row_of(&buf, "dotfiles");
-        assert!(
-            (0..W).all(|x| buf[(x, y)].bg == Color::Reset),
-            "crossed and gone"
-        );
-        assert!(a.glint().is_none());
-        assert!(!a.animating(), "nothing left to animate");
-    }
-
-    /// The band runs left to right.
-    #[test]
-    fn the_glint_runs_left_to_right() {
-        let p = test_palette();
-        let mut a = picker(&["api-server", "dotfiles", "notes"]);
-        a.on_key(Key::Char('j'));
-        a.tick(GLINT / 4);
-        let buf = frame(&a, Some(&p));
-        let early = brightest(&buf, row_of(&buf, "dotfiles")).expect("lit early on");
-        a.tick(GLINT / 2);
-        let buf = frame(&a, Some(&p));
-        let late = brightest(&buf, row_of(&buf, "dotfiles")).expect("lit later on");
-        assert!(late > early, "{early} and then {late}");
-    }
-
-    /// Without a palette the glint is a short underline running under the bar,
-    /// and no colour at any point.
-    #[test]
-    fn without_a_palette_the_glint_is_an_underline() {
-        let mut a = picker(&["api-server", "dotfiles", "notes"]);
-        a.on_key(Key::Char('j'));
-        a.tick(GLINT / 2);
-        let buf = frame(&a, None);
-        let y = row_of(&buf, "dotfiles");
-        let under = (0..W)
-            .filter(|x| buf[(*x, y)].modifier.contains(Modifier::UNDERLINED))
-            .count();
-        assert!(under > 0 && under < 6, "a short run: {under} cells");
-        test_support::assert_no_colour(W, H, |f| {
-            draw::draw(f, &a);
-            paint(f, &a, None);
-        });
-
-        a.tick(GLINT);
-        let buf = frame(&a, None);
-        let y = row_of(&buf, "dotfiles");
-        assert!(
-            !(0..W).any(|x| buf[(x, y)].modifier.contains(Modifier::UNDERLINED)),
-            "gone once it has crossed"
-        );
-    }
-
-    /// One glint at a time, on the selection: the next move takes it to the
-    /// next row and starts it over there.
-    #[test]
-    fn the_next_move_takes_the_glint_with_it() {
-        let mut a = picker(&["one", "two", "three"]);
-        a.on_key(Key::Char('j'));
-        a.tick(GLINT / 2);
-        a.on_key(Key::Char('j'));
-        let (id, progress) = a.glint().expect("a glint");
-        assert_eq!(Some(id), a.selected_row_id());
-        assert_eq!(progress, 0.0, "starting over on the new row");
-    }
-
-    /// A `[y/N]` or a session picked up takes the bar over, and the glint goes
-    /// with it.
-    #[test]
-    fn a_question_or_a_pick_up_ends_the_glint() {
-        let mut a = picker(&["one", "two", "three"]);
-        a.on_key(Key::Char('j'));
-        a.on_key(Key::Char('x'));
-        assert!(a.glint().is_none(), "under a [y/N]");
-        a.on_key(Key::Char('n'));
-        assert!(a.glint().is_none(), "not back once it is answered");
-        a.on_key(Key::Char('j'));
-        assert!(a.glint().is_some());
-        a.on_key(Key::Char(' '));
-        assert!(a.glint().is_none(), "in flight");
-    }
-
     /// A keystroke that drops rows leaves them on screen, fading, until their
     /// time is up; then the list closes up.
     #[test]
@@ -910,7 +752,6 @@ mod tests {
         a.on_key(Key::Char('j'));
         a.on_key(Key::Char('j'));
         assert!(a.glow().is_none());
-        assert!(a.glint().is_none());
     }
 
     /// With the picker's effects off, a move and a filter keystroke leave
@@ -921,7 +762,6 @@ mod tests {
         a.set_effects(false);
         a.on_key(Key::Char('j'));
         assert!(a.glow().is_none());
-        assert!(a.glint().is_none());
         a.on_key(Key::Char('/'));
         a.on_key(Key::Char('n'));
         assert!(a.leaving().is_none());
@@ -1307,25 +1147,6 @@ mod tests {
         );
     }
 
-    /// The glint brightens the highlight, not the terminal's foreground, and
-    /// leaves its text as the theme set it.
-    #[test]
-    fn under_a_highlight_the_glint_brightens_it() {
-        let p = test_palette();
-        let mut a = picker(&["api-server", "dotfiles", "notes"]);
-        a.on_key(Key::Char('j'));
-        a.tick(GLINT / 2);
-        let buf = themed(&a, Some(&p), Some(HIGHLIGHT));
-        let y = row_of(&buf, "dotfiles");
-        let cell = &buf[(brightest(&buf, y).expect("the band is on the bar"), y)];
-        let Rgb(r, g, b) = rgb_of(cell.bg);
-        assert!(
-            r > HIGHLIGHT.bar.0 && g > 0 && b > HIGHLIGHT.bar.2,
-            "the highlight, brighter: ({r},{g},{b})"
-        );
-        assert_eq!(cell.fg, rgb(ON_BAR));
-    }
-
     /// At a `[y/N]` the highlight warms towards the terminal's red.
     #[test]
     fn under_a_highlight_the_strike_warms_it() {
@@ -1364,17 +1185,91 @@ mod tests {
         }
     }
 
-    /// A dropped row is no bar, and fades in the terminal's colours whatever
-    /// the highlight.
+    /// [`themed`], with the other sessions' names coloured as the picker
+    /// colours them.
+    fn named(app: &App, palette: Option<&Palette>, highlight: Option<Highlight>) -> Buffer {
+        let ink = palette.map(|p| Ink::new(*p, highlight));
+        test_support::buffer(W, H, |f| {
+            draw::draw(f, app);
+            paint(f, app, ink.as_ref());
+            names(f, app, highlight.as_ref());
+        })
+    }
+
+    /// The names of the sessions not highlighted are the highlight: every
+    /// cell of them, and nothing else on their rows — not the numbers — and
+    /// not the highlighted row, which is the bar's to colour.
     #[test]
-    fn under_a_highlight_a_dropped_row_is_as_it_was() {
+    fn under_a_highlight_the_other_names_are_its_colour() {
+        let a = picker(&["api-server", "dotfiles", "notes"]);
+        let buf = named(&a, None, Some(HIGHLIGHT));
+        for name in ["dotfiles", "notes"] {
+            let y = row_of(&buf, name);
+            let x = column_of(&buf, y, name);
+            for x in x..x + name.len() as u16 {
+                assert_eq!(buf[(x, y)].fg, rgb(HIGHLIGHT.bar), "{name} at {x}");
+            }
+            assert_eq!(first_glyph(&buf, y).fg, Color::Reset, "{name}'s number");
+        }
+        let y = row_of(&buf, "api-server");
+        assert!((0..W).all(|x| buf[(x, y)].fg == Color::Reset), "the bar's");
+
+        let plain = named(&a, None, None);
+        assert_eq!(plain, frame(&a, None), "no highlight, no colour");
+    }
+
+    /// The row in a gap is no session yet: its name stays as drawn.
+    #[test]
+    fn under_a_highlight_the_row_in_a_gap_keeps_its_own() {
+        let a = room_after(ROOM.as_millis() as u64);
+        let buf = named(&a, None, Some(HIGHLIGHT));
+        let y = row_of(&buf, "session 4");
+        assert!((0..W).all(|x| buf[(x, y)].fg == Color::Reset));
+        let notes = name_cell(&buf, "notes");
+        assert_eq!(notes.fg, rgb(HIGHLIGHT.bar), "a session's name is");
+    }
+
+    /// The row the cursor left lets go of the bar into the plain row as the
+    /// theme draws it: its name to the highlight, its number to the terminal's
+    /// foreground.
+    #[test]
+    fn under_a_highlight_the_afterglow_ends_on_the_name_colour() {
+        let p = test_palette();
+        let mut a = picker(&["one", "two", "three"]);
+        a.on_key(Key::Char('j'));
+        a.tick(AFTERGLOW / 2);
+        let buf = named(&a, Some(&p), Some(HIGHLIGHT));
+        let t = ease_out(0.5);
+        assert_eq!(
+            name_cell(&buf, "one").fg,
+            rgb(ON_BAR.lerp(HIGHLIGHT.bar, t))
+        );
+        assert_eq!(
+            first_glyph(&buf, row_of(&buf, "one")).fg,
+            rgb(ON_BAR.lerp(p.fg, t)),
+            "the number"
+        );
+
+        a.tick(AFTERGLOW);
+        let buf = named(&a, Some(&p), Some(HIGHLIGHT));
+        assert_eq!(name_cell(&buf, "one").fg, rgb(HIGHLIGHT.bar), "settled");
+    }
+
+    /// A dropped row's name fades out of the highlight it was drawn in, and
+    /// the rest of the row out of the terminal's foreground.
+    #[test]
+    fn under_a_highlight_a_dropped_name_fades_out_of_it() {
         let p = test_palette();
         let mut a = picker(&["api-server", "dotfiles", "notes"]);
         a.on_key(Key::Char('/'));
         a.on_key(Key::Char('n'));
-        let buf = themed(&a, Some(&p), Some(HIGHLIGHT));
-        let dropped = first_glyph(&buf, row_of(&buf, "dotfiles"));
-        assert_eq!(dropped.fg, rgb(p.fg.lerp(p.bg, SIFT_FROM)));
+        let buf = named(&a, Some(&p), Some(HIGHLIGHT));
+        let y = row_of(&buf, "dotfiles");
+        assert_eq!(
+            name_cell(&buf, "dotfiles").fg,
+            rgb(HIGHLIGHT.bar.lerp(p.bg, SIFT_FROM))
+        );
+        assert_eq!(first_glyph(&buf, y).fg, rgb(p.fg.lerp(p.bg, SIFT_FROM)));
     }
 
     /// [`themed`], and the particles beside the list coloured as the picker

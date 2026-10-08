@@ -246,10 +246,10 @@ impl EffectsSettings {
         self.enabled && self.moving.enabled
     }
 
-    /// Whether the cursor lights the rows it moves between — the row it leaves
-    /// glows, and a glint crosses the one it lands on: its own switch and the
-    /// master one. Whether they are drawn in colour or with a modifier is the
-    /// terminal's say after this (see [`crate::ui::effects`]).
+    /// Whether the row the cursor leaves glows back from the selection's bar:
+    /// its own switch and the master one. Whether it is drawn in colour or
+    /// with a modifier is the terminal's say after this (see
+    /// [`crate::ui::effects`]).
     pub fn cursor_enabled(&self) -> bool {
         self.enabled && self.cursor.enabled
     }
@@ -477,21 +477,18 @@ pub struct MoveSettings {
     pub enabled: bool,
 }
 
-/// The rows the cursor moves between: the one it leaves fading from the
-/// selection's reversed bar back to a plain row, and the one it lands on
-/// crossed by a glint (see [`crate::ui::effects`]). One switch for both,
-/// being the two ends of the one move.
+/// The row the cursor leaves, fading from the selection's reversed bar back
+/// to a plain row (see [`crate::ui::effects`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CursorSettings {
     /// This effect's own switch, under `[effects] enabled`.
     ///
-    /// Both are in colour, so they want what the fade wants: the terminal's
-    /// answer to the colour query, and no `NO_COLOR`. Without them the fade
-    /// back falls back to the bar standing a moment longer, reversed and dim,
-    /// before it goes, and the glint to an underline running under the bar —
-    /// modifiers, like the rest of the picker. How long each lasts is
-    /// [`crate::ui::effects::AFTERGLOW`] and [`crate::ui::effects::GLINT`].
+    /// In colour, so it wants what the fade wants: the terminal's answer to
+    /// the colour query, and no `NO_COLOR`. Without them it falls back to the
+    /// bar standing a moment longer, reversed and dim, before it goes — a
+    /// modifier, like the rest of the picker. How long it lasts is
+    /// [`crate::ui::effects::AFTERGLOW`].
     pub enabled: bool,
 }
 
@@ -576,11 +573,12 @@ pub struct CreateSettings {
     pub enabled: bool,
 }
 
-/// `[theme]`: one colour, for the session the picker has highlighted and the
-/// effects that come off it (see [`crate::theme`]). `"#rrggbb"`; unset, the
-/// default, the bar is the terminal's own colours reversed, as it always was,
-/// so an absent table draws exactly what nvmux always drew. `NO_COLOR` sets
-/// none of it.
+/// `[theme]`: one colour, for the session the picker has highlighted, the
+/// names of the others and the effects that come off the bar (see
+/// [`crate::theme`]). `"#rrggbb"`; unset, the default, the bar is the
+/// terminal's own colours reversed and the names its foreground, as they
+/// always were, so an absent table draws exactly what nvmux always drew.
+/// `NO_COLOR` sets none of it.
 ///
 /// Nothing else takes it: the picker's background is the terminal's, and so
 /// is every other screen's, and a session is drawn in its own colorscheme.
@@ -588,13 +586,13 @@ pub struct CreateSettings {
 #[serde(default, deny_unknown_fields)]
 pub struct ThemeSettings {
     /// The background of the picker's highlighted session: its selection bar,
-    /// with the text on it whichever of the terminal's colours reads there.
-    /// The effects that come off the bar work theirs out from it, each cell
-    /// at its own brightness: the afterglow it leaves as the cursor moves on,
-    /// the glint that crosses it, the warmth it takes while a `[y/N]` asks,
-    /// the sonar's rings, which start as it and fade into the background, and
-    /// the stars, sparks and dust of a session being moved, the dim ones
-    /// halfway into the background.
+    /// with the text on it whichever of the terminal's colours reads there;
+    /// and the colour of every other session's name. The effects that come
+    /// off the bar work theirs out from it, each cell at its own brightness:
+    /// the afterglow it leaves as the cursor moves on, the warmth it takes
+    /// while a `[y/N]` asks, the sonar's rings, which start as it and fade
+    /// into the background, and the stars, sparks and dust of a session being
+    /// moved, the dim ones halfway into the background.
     #[serde(deserialize_with = "de_rgb")]
     pub highlight: Option<Rgb>,
 }
@@ -1014,8 +1012,7 @@ fn render_default_config(prefix: u8) -> String {
          # enabled = {move_enabled}\n\
          \n\
          [effects.cursor]\n\
-         # The row the cursor leaves fades back from the selection's bar,\n\
-         # and a glint crosses the row it lands on.\n\
+         # The row the cursor leaves fades back from the selection's bar.\n\
          # enabled = {cursor_enabled}\n\
          \n\
          [effects.back]\n\
@@ -1071,10 +1068,10 @@ fn render_default_config(prefix: u8) -> String {
          \n\
          [theme]\n\
          # One colour, \"#rrggbb\", for the session the picker has highlighted:\n\
-         # the background of its bar, and the afterglow, glint, strike, sonar\n\
-         # rings, and the stars, sparks and dust of a move that come off it.\n\
-         # Unset, the bar is the terminal's own colours reversed. NO_COLOR sets\n\
-         # none of it.\n\
+         # the background of its bar, the other sessions' names, and the\n\
+         # afterglow, strike, sonar rings, and the stars, sparks and dust of a\n\
+         # move that come off the bar. Unset, the bar is the terminal's own\n\
+         # colours reversed. NO_COLOR sets none of it.\n\
          # highlight = \"#89b4fa\"\n",
         prefix = crate::keys::prefix_label(prefix),
         timeout = k.timeout_ms,

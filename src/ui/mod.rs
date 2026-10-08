@@ -650,23 +650,25 @@ impl Look {
 }
 
 /// The picker as it stands, with nothing passing over it: the screen, with
-/// the theme's highlight on its bar and on whatever it has scattered beside
-/// the list. What every fade of the picker dissolves, so a fade in ends on
-/// exactly the frame the loop draws next.
+/// the theme's highlight on its bar, on the other sessions' names and on
+/// whatever it has scattered beside the list. What every fade of the picker
+/// dissolves, so a fade in ends on exactly the frame the loop draws next.
 fn still(f: &mut ratatui::Frame, app: &App, look: &Look) {
     draw::draw(f, app);
+    effects::names(f, app, look.highlight.as_ref());
     effects::particles(f, app, look.ink.as_ref(), look.highlight.as_ref());
     crate::theme::paint(f.buffer_mut(), look.highlight.as_ref());
 }
 
 /// One frame of the picker: the screen, then whatever is passing over it,
-/// then the theme's highlight on the braille beside the list that has no
-/// colour yet, and on what is left of the bar (see [`crate::theme`]) — last,
-/// so the bar's landing and the afterglow held without a palette, drawn
-/// reversed as the bar is, take it too.
+/// then the theme's highlight on what has no colour yet — the other
+/// sessions' names, the braille beside the list, and what is left of the bar
+/// (see [`crate::theme`]) — last, so the bar's landing and the afterglow held
+/// without a palette, drawn reversed as the bar is, take it too.
 fn frame(f: &mut ratatui::Frame, app: &App, look: &Look) {
     draw::draw(f, app);
     effects::paint(f, app, look.ink.as_ref());
+    effects::names(f, app, look.highlight.as_ref());
     effects::particles(f, app, look.ink.as_ref(), look.highlight.as_ref());
     crate::theme::paint(f.buffer_mut(), look.highlight.as_ref());
 }
@@ -1110,17 +1112,17 @@ mod tests {
         assert!(Outcome::Quit.leaves().is_empty());
     }
 
-    /// Under a `[theme] highlight` the selection's bar, and nothing else on
-    /// the picker, takes its colour — still reversed, so the bar is the
-    /// highlight and the text the colour the theme chose for it; and a fade
-    /// dissolves the same frame the loop draws.
+    /// Under a `[theme] highlight` the selection's bar takes it — still
+    /// reversed, so the bar is the highlight and the text the colour the theme
+    /// chose for it — and so do the names of the other sessions, and nothing
+    /// else on the picker: not their markers or numbers, not the hint row. A
+    /// fade dissolves the same frame the loop draws.
     #[test]
-    fn a_highlight_colours_the_selection_and_nothing_else() {
+    fn a_highlight_colours_the_selection_and_the_other_names() {
         use crate::theme::Highlight;
+        use ratatui::layout::{Position, Rect};
         use ratatui::style::{Color, Modifier};
 
-        let mut app = test_support::picker(&["api-server", "dotfiles", "notes"]);
-        app.on_key(Key::Char('j'));
         let look = Look {
             ink: None,
             highlight: Some(Highlight {
@@ -1128,33 +1130,58 @@ mod tests {
                 text: Some(crate::palette::Rgb(250, 250, 250)),
             }),
         };
+        let app = test_support::picker(&["api-server", "dotfiles", "notes"]);
+        let area = Rect::new(0, 0, 40, 8);
+        let names: Vec<Rect> = ["id000001", "id000002"]
+            .iter()
+            .map(|id| draw::name_rect(&app, area, id).expect("on screen"))
+            .collect();
         let buf = test_support::buffer(40, 8, |f| frame(f, &app, &look));
-        let mut bar = 0;
-        for cell in &buf.content {
+        let (mut bar, mut named) = (0, 0);
+        for (i, cell) in buf.content.iter().enumerate() {
+            let at = Position::new(i as u16 % 40, i as u16 / 40);
             if cell.modifier.contains(Modifier::REVERSED) {
                 bar += 1;
                 assert_eq!(cell.fg, Color::Rgb(100, 0, 200), "{cell:?}");
                 assert_eq!(cell.bg, Color::Rgb(250, 250, 250), "{cell:?}");
+            } else if names.iter().any(|name| name.contains(at)) {
+                named += 1;
+                assert_eq!(cell.fg, Color::Rgb(100, 0, 200), "{at:?} {cell:?}");
+                assert_eq!(cell.bg, Color::Reset, "{at:?} {cell:?}");
             } else {
-                assert_eq!((cell.fg, cell.bg), (Color::Reset, Color::Reset), "{cell:?}");
+                assert_eq!(
+                    (cell.fg, cell.bg),
+                    (Color::Reset, Color::Reset),
+                    "{at:?} {cell:?}"
+                );
             }
         }
-        // The bar, and the row the cursor just left holding it without a
-        // palette.
         assert!(
-            bar >= 2 * "▸ 2  dotfiles".chars().count(),
+            bar >= "▸ 1  api-server".chars().count(),
             "the whole bar: {bar}"
         );
-
-        let resting = test_support::picker(&["api-server", "dotfiles", "notes"]);
+        assert_eq!(named, "dotfiles".len() + "notes".len());
         assert_eq!(
-            test_support::buffer(40, 8, |f| frame(f, &resting, &look)),
-            test_support::buffer(40, 8, |f| still(f, &resting, &look)),
+            buf,
+            test_support::buffer(40, 8, |f| still(f, &app, &look)),
             "nothing passing, the frame is the one a fade ends on"
         );
 
-        let plain = test_support::buffer(40, 8, |f| frame(f, &resting, &Look::default()));
-        let drawn = test_support::buffer(40, 8, |f| draw::draw(f, &resting));
+        // The row the cursor just left holds the bar a moment without a
+        // palette, and the bar it holds is the highlight too.
+        let mut moved = test_support::picker(&["api-server", "dotfiles", "notes"]);
+        moved.on_key(Key::Char('j'));
+        let buf = test_support::buffer(40, 8, |f| frame(f, &moved, &look));
+        let held = buf
+            .content
+            .iter()
+            .filter(|c| c.modifier.contains(Modifier::REVERSED | Modifier::DIM))
+            .inspect(|c| assert_eq!(c.fg, Color::Rgb(100, 0, 200), "{c:?}"))
+            .count();
+        assert!(held > 0, "the bar held on the row left");
+
+        let plain = test_support::buffer(40, 8, |f| frame(f, &app, &Look::default()));
+        let drawn = test_support::buffer(40, 8, |f| draw::draw(f, &app));
         assert_eq!(plain, drawn, "no highlight, no colour");
     }
 }
