@@ -46,7 +46,7 @@ use crate::palette::Rgb;
 /// `[effects.smear]`, `[effects.particles]`, `[effects.scroll]`,
 /// `[effects.windows]` and `[effects.blink]` for nvmux's own client
 /// (`[client] ui = "nvmux"`, see [`crate::client`]) — and `[theme]`, the
-/// colour of nvmux's own screens.
+/// colour of the picker's highlighted session.
 ///
 /// Not `Copy`: `[session] command` owns a `String`. Nothing reads it by value —
 /// [`get`] hands out a `&'static Settings` — so this costs nothing.
@@ -576,32 +576,25 @@ pub struct CreateSettings {
     pub enabled: bool,
 }
 
-/// `[theme]`: one colour for nvmux's own screens — the picker, the create
-/// prompt, the help and the attaching screen — and everything the picker's
-/// effects paint (see [`crate::theme`]). `"#rrggbb"`; unset, the default,
-/// leaves every colour what it was without a theme, so an absent table draws
-/// exactly what nvmux always drew. `NO_COLOR` sets none of it.
+/// `[theme]`: one colour, for the session the picker has highlighted and the
+/// effects that come off it (see [`crate::theme`]). `"#rrggbb"`; unset, the
+/// default, the bar is the terminal's own colours reversed, as it always was,
+/// so an absent table draws exactly what nvmux always drew. `NO_COLOR` sets
+/// none of it.
 ///
-/// Not the editor's: a session is drawn in its own colorscheme. Nor the
-/// `<prefix>` bar and the notice a switch puts up, which are drawn over a
-/// session rather than on a screen of nvmux's.
+/// Nothing else takes it: the picker's background is the terminal's, and so
+/// is every other screen's, and a session is drawn in its own colorscheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ThemeSettings {
-    /// Behind everything on nvmux's own screens, and the one colour the
-    /// effects paint in: the rings, the glint, the strike's warmth, the
-    /// afterglow and the rows fading in and out are each this colour at the
-    /// brightness that cell would have had without it (see
-    /// [`crate::ui::effects::Ink`]), so each fades into the background it is
-    /// drawn on. Unset, the terminal's own background, and the effects in the
-    /// terminal's colours.
-    ///
-    /// A fade still dissolves all the way into the terminal's own background,
-    /// this one with it (see [`crate::fade`]), so a screen comes up out of the
-    /// session it follows and goes down into the one it leads to without a
-    /// seam — and between two of nvmux's own screens, passes through it.
+    /// The background of the picker's highlighted session: its selection bar,
+    /// with the text on it whichever of the terminal's colours reads there.
+    /// The effects that come off the bar work theirs out from it, each cell
+    /// at its own brightness: the afterglow it leaves as the cursor moves on,
+    /// the glint that crosses it, the warmth it takes while a `[y/N]` asks,
+    /// and the sonar's rings, which start as it and fade into the background.
     #[serde(deserialize_with = "de_rgb")]
-    pub background: Option<Rgb>,
+    pub highlight: Option<Rgb>,
 }
 
 impl Default for EffectsSettings {
@@ -1075,11 +1068,11 @@ fn render_default_config(prefix: u8) -> String {
          # enabled = {blink_enabled}\n\
          \n\
          [theme]\n\
-         # One colour, \"#rrggbb\", for nvmux's own screens: the background of the\n\
-         # picker, prompt, help and attaching screen, and every effect above that\n\
-         # paints in colour, in its shades. Unset, the terminal's own colours.\n\
-         # The editor keeps its own colorscheme, and NO_COLOR sets none of it.\n\
-         # background = \"#1e1e2e\"\n",
+         # One colour, \"#rrggbb\", for the session the picker has highlighted:\n\
+         # the background of its bar, and the afterglow, glint, strike and sonar\n\
+         # rings that come off it. Unset, the bar is the terminal's own colours\n\
+         # reversed. NO_COLOR sets none of it.\n\
+         # highlight = \"#89b4fa\"\n",
         prefix = crate::keys::prefix_label(prefix),
         timeout = k.timeout_ms,
         command = s.command,
@@ -1256,13 +1249,9 @@ mod tests {
     /// unless given.
     #[test]
     fn the_theme_colour_is_read_as_rgb() {
-        let s: Settings = toml::from_str("[theme]\nbackground = \"#1E1e2e\"\n").expect("valid");
-        assert_eq!(s.theme.background, Some(Rgb(0x1e, 0x1e, 0x2e)));
-        assert_eq!(
-            ThemeSettings::default().background,
-            None,
-            "unset by default"
-        );
+        let s: Settings = toml::from_str("[theme]\nhighlight = \"#89B4fa\"\n").expect("valid");
+        assert_eq!(s.theme.highlight, Some(Rgb(0x89, 0xb4, 0xfa)));
+        assert_eq!(ThemeSettings::default().highlight, None, "unset by default");
     }
 
     /// RGB only, and only the one spelling: a hand-edited colour that is not
@@ -1278,12 +1267,12 @@ mod tests {
             "[30, 30, 46]",
             "3",
         ] {
-            let doc = format!("[theme]\nbackground = {value}\n");
+            let doc = format!("[theme]\nhighlight = {value}\n");
             let err = toml::from_str::<Settings>(&doc).expect_err(&doc);
-            assert!(err.to_string().contains("background"), "{doc:?} -> {err}");
+            assert!(err.to_string().contains("highlight"), "{doc:?} -> {err}");
         }
         // One colour for everything: there is no second key to set.
-        for key in ["foreground", "sonar"] {
+        for key in ["background", "sonar"] {
             let doc = format!("[theme]\n{key} = \"#ffffff\"\n");
             let err = toml::from_str::<Settings>(&doc).expect_err(&doc);
             assert!(err.to_string().contains(key), "{err}");
@@ -1736,7 +1725,7 @@ mod tests {
             .map(|line| format!("{line}\n"))
             .collect();
         let s: Settings = toml::from_str(&uncommented).expect("the example parses");
-        assert!(s.theme.background.is_some(), "no example background");
+        assert!(s.theme.highlight.is_some(), "no example highlight");
     }
 
     // --- path resolution (pure) --------------------------------------------

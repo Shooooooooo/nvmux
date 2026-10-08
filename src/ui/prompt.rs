@@ -862,10 +862,7 @@ pub(super) fn run_on(
     }
 
     loop {
-        terminal.draw(|f| {
-            draw(f, &prompt);
-            crate::theme::paint(f);
-        })?;
+        terminal.draw(|f| draw(f, &prompt))?;
 
         // A shorter wait only while an answer is outstanding: an idle prompt is
         // back on the ordinary tick and costs nothing.

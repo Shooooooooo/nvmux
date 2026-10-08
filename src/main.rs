@@ -85,9 +85,12 @@ fn run(cli: &Cli) -> Result<()> {
     // And nvmux's own client mixes colours for every animation it draws, so
     // it asks too — on the client's behalf, since a client on a pty cannot
     // ask without the answers racing the keys (see `nvmux::client`).
+    // A `[theme] highlight` asks so the text on it can be whichever of the
+    // terminal's own colours reads there.
     if fade::configured()
         || nvmux::ui::effects::want_palette()
         || config::get().client.ui == config::Ui::Nvmux
+        || nvmux::theme::wanted()
     {
         palette::init(palette::query());
     }

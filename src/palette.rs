@@ -62,28 +62,6 @@ impl Rgb {
         (f32::from(max) + f32::from(min)) / 510.0
     }
 
-    /// This colour as bright as `brightness` (a [`Rgb::lightness`], clamped to
-    /// `0..=1`): mixed towards white to be brighter and towards black to be
-    /// darker, which moves its lightness exactly that far and keeps its hue.
-    /// At its own lightness it is itself, exactly.
-    ///
-    /// What a `[theme]` paints its effects with (see
-    /// [`crate::ui::effects::Ink`]): the theme's own colour, as bright as
-    /// whatever each cell would have been without it.
-    pub fn at_lightness(self, brightness: f32) -> Rgb {
-        let own = self.lightness();
-        let brightness = brightness.clamp(0.0, 1.0);
-        if brightness > own {
-            // `own` < 1 here, or nothing is brighter than it.
-            self.lerp(Rgb(255, 255, 255), (brightness - own) / (1.0 - own))
-        } else if brightness < own {
-            // And `own` > 0 here.
-            self.lerp(Rgb(0, 0, 0), (own - brightness) / own)
-        } else {
-            self
-        }
-    }
-
     /// A colour as the config spells one: `#rrggbb`, in either case, and
     /// nothing else (see [`crate::config::ThemeSettings`]). `None` for any
     /// other spelling — the forms a terminal answers in are
@@ -471,32 +449,6 @@ mod tests {
         assert_eq!(Rgb(255, 255, 255).lightness(), 1.0);
         assert_eq!(Rgb(255, 0, 0).lightness(), 0.5, "a pure hue is halfway");
         assert_eq!(Rgb(0x1e, 0x1e, 0x2e).lightness(), (30.0 + 46.0) / 510.0);
-    }
-
-    /// A theme colour made brighter or darker keeps its hue, lands on the
-    /// brightness asked for, and at its own is untouched.
-    #[test]
-    fn a_colour_at_a_lightness_keeps_its_hue() {
-        let theme = Rgb(0x1e, 0x1e, 0x2e);
-        assert_eq!(theme.at_lightness(theme.lightness()), theme, "itself");
-        assert_eq!(theme.at_lightness(1.0), Rgb(255, 255, 255));
-        assert_eq!(theme.at_lightness(0.0), Rgb(0, 0, 0));
-        assert_eq!(theme.at_lightness(2.0), Rgb(255, 255, 255), "clamped");
-        for brightness in [0.05, 0.3, 0.5, 0.78, 0.95] {
-            let Rgb(r, g, b) = theme.at_lightness(brightness);
-            let got = Rgb(r, g, b).lightness();
-            assert!(
-                (got - brightness).abs() < 0.01,
-                "{brightness} -> {got} ({r},{g},{b})"
-            );
-            assert!(
-                r == g && b > r,
-                "still blue-grey at {brightness}: ({r},{g},{b})"
-            );
-        }
-        // The extremes have no hue to keep, and come out grey.
-        assert_eq!(Rgb(0, 0, 0).at_lightness(0.5), Rgb(128, 128, 128));
-        assert_eq!(Rgb(255, 255, 255).at_lightness(0.5), Rgb(128, 128, 128));
     }
 
     /// The config's one spelling of a colour, and nothing near it.

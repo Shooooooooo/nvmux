@@ -109,10 +109,7 @@ pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> 
         crate::fade::fade_in(terminal, |f| draw(f, &rows))?;
     }
     loop {
-        terminal.draw(|f| {
-            draw(f, &rows);
-            crate::theme::paint(f);
-        })?;
+        terminal.draw(|f| draw(f, &rows))?;
 
         let Some(key) = super::poll_key()? else {
             continue;

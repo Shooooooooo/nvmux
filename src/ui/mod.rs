@@ -43,12 +43,10 @@
 //! taken through it.
 //!
 //! The fade ([`crate::fade`]), the picker's passing effects ([`effects`]) and
-//! a `[theme] background` ([`crate::theme`]) are the only things that paint a
-//! colour on these screens, and they do so as a post-pass over a finished
-//! frame, never inside a `draw`: a screen's own drawing stays colourless, and
-//! its tests say so. The theme is the one exception to "set no background",
-//! and only because the user asked for it by name; without it, or under
-//! `NO_COLOR`, there is none.
+//! a `[theme] highlight` on the picker's selection ([`crate::theme`]) are the
+//! only things that paint a colour on these screens, and they do so as a
+//! post-pass over a finished frame, never inside a `draw`: a screen's own
+//! drawing stays colourless, and its tests say so.
 
 pub mod app;
 pub mod attaching;
@@ -379,10 +377,15 @@ fn run_loop(
         app.set_message(msg);
     }
 
+    // What is laid over the screen as drawn, the effects and the theme's
+    // highlight: asked once, since neither the terminal's answer, the theme
+    // nor `NO_COLOR` changes for the run.
+    let look = Look::now();
+
     // Dissolve the picker up out of the background before taking any input.
     // In place of a first draw: the fade's last frame is the plain screen, so
     // the loop's own first `draw` repaints nothing.
-    crate::fade::fade_in(terminal, |f| draw::draw(f, &app))?;
+    crate::fade::fade_in(terminal, |f| still(f, &app, &look))?;
 
     // When a half-typed session number must be settled. `App` decides every
     // unambiguous digit on its own, so this is only ever set when one number is
@@ -392,10 +395,6 @@ fn run_loop(
     // was last moved on. The clock lives here for the same reason the digit
     // deadline does.
     let mut ticked = Instant::now();
-    // What the effects paint with, if they paint in colour: asked once, since
-    // neither the answer, the theme nor `NO_COLOR` changes for the run.
-    let ink = effects::ink();
-    let ink = ink.as_ref();
     // When the loop last drew, and the area it drew: `None` until its first
     // frame, which is always drawn.
     let mut drawn: Option<Instant> = None;
@@ -422,7 +421,7 @@ fn run_loop(
             // The area kept for the mouse: a click is resolved against the
             // screen as it was last drawn, which is the one the user clicked
             // on.
-            area = terminal.draw(|f| frame(f, &app, ink))?.area;
+            area = terminal.draw(|f| frame(f, &app, &look))?.area;
             // While anything is moving a frame goes out every `FRAME` whether
             // or not a key asked for one, and the terminal has to keep up.
             if paced && app.animating() {
@@ -448,7 +447,7 @@ fn run_loop(
                 deadline = None;
                 if let Request::Attach(id) = app.resolve_pending() {
                     if let Some(session) = app.session(&id).cloned() {
-                        return leave_to_session(terminal, &app, session);
+                        return leave_to_session(terminal, &app, &look, session);
                     }
                 }
             }
@@ -480,7 +479,7 @@ fn run_loop(
         // with a session in flight, every arrow — and a second chance for a
         // held key to fall behind the screen.
         if app.landing().is_some() || request != Request::None {
-            play_out(terminal, &mut app, ink, |app| app.landing().is_some())?;
+            play_out(terminal, &mut app, &look, |app| app.landing().is_some())?;
         }
         deadline = app
             .pending()
@@ -499,7 +498,7 @@ fn run_loop(
 
             Request::Attach(id) => {
                 if let Some(session) = app.session(&id).cloned() {
-                    return leave_to_session(terminal, &app, session);
+                    return leave_to_session(terminal, &app, &look, session);
                 }
             }
 
@@ -509,7 +508,7 @@ fn run_loop(
                 // simply replaces the picker. A create dissolves the prompt
                 // out on its way to the client spawn either way — that is the
                 // prompt's own doing, since its screen is the one up.
-                let arrival = make_room(terminal, &mut app, ink)?;
+                let arrival = make_room(terminal, &mut app, &look)?;
                 let outcome = prompt::run_on(
                     terminal,
                     transport,
@@ -536,7 +535,7 @@ fn run_loop(
                         // The prompt dissolved out if it dissolved in, and the
                         // picker it closed onto comes back up the same way.
                         if arrival != prompt::Arrival::Cut {
-                            crate::fade::fade_in(terminal, |f| draw::draw(f, &app))?;
+                            crate::fade::fade_in(terminal, |f| still(f, &app, &look))?;
                         }
                     }
                     prompt::Outcome::Renamed => refresh(&mut app, transport)?,
@@ -559,7 +558,7 @@ fn run_loop(
 
             Request::Kill(id) => {
                 if let Some(session) = app.session(&id).cloned() {
-                    erase(terminal, &mut app, &id, ink)?;
+                    erase(terminal, &mut app, &id, &look)?;
                     if let Err(e) = transport.kill_session(&session) {
                         app.set_message(e.one_line());
                     }
@@ -633,12 +632,39 @@ fn tick(app: &mut App, ticked: &mut Instant) {
     *ticked = now;
 }
 
-/// One frame of the picker: the screen, then whatever is passing over it,
-/// then the theme's background behind what is left (see [`crate::theme`]).
-fn frame(f: &mut ratatui::Frame, app: &App, ink: Option<&effects::Ink>) {
+/// What the picker lays over the screen [`draw::draw`] draws: the colours its
+/// effects paint in, and the theme's highlight on its bar.
+#[derive(Debug, Clone, Copy, Default)]
+struct Look {
+    ink: Option<effects::Ink>,
+    highlight: Option<crate::theme::Highlight>,
+}
+
+impl Look {
+    fn now() -> Self {
+        Self {
+            ink: effects::ink(),
+            highlight: crate::theme::highlight(),
+        }
+    }
+}
+
+/// The picker as it stands, with nothing passing over it: the screen, with
+/// the theme's highlight on its bar. What every fade of the picker dissolves,
+/// so a fade in ends on exactly the frame the loop draws next.
+fn still(f: &mut ratatui::Frame, app: &App, look: &Look) {
     draw::draw(f, app);
-    effects::paint(f, app, ink);
-    crate::theme::paint(f);
+    crate::theme::paint(f.buffer_mut(), look.highlight.as_ref());
+}
+
+/// One frame of the picker: the screen, then whatever is passing over it,
+/// then the theme's highlight on what is left of the bar (see
+/// [`crate::theme`]) — last, so the bar's landing and the afterglow held
+/// without a palette, drawn reversed as the bar is, take it too.
+fn frame(f: &mut ratatui::Frame, app: &App, look: &Look) {
+    draw::draw(f, app);
+    effects::paint(f, app, look.ink.as_ref());
+    crate::theme::paint(f.buffer_mut(), look.highlight.as_ref());
 }
 
 /// Erase the row a kill was just confirmed for, and only then let the kill
@@ -650,12 +676,12 @@ fn erase(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     id: &str,
-    ink: Option<&effects::Ink>,
+    look: &Look,
 ) -> Result<()> {
     if !app.start_backspace(id) {
         return Ok(());
     }
-    play_out(terminal, app, ink, App::erasing)
+    play_out(terminal, app, look, App::erasing)
 }
 
 /// Make room in the list for the session `c` is about to create, and close
@@ -679,19 +705,19 @@ fn erase(
 fn make_room(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    ink: Option<&effects::Ink>,
+    look: &Look,
 ) -> Result<prompt::Arrival> {
     let name = prompt::default_name(app.sessions(), Some(app.new_number()));
     if !app.make_room(&name) {
         return Ok(prompt::Arrival::Cut);
     }
     let opened = Instant::now();
-    play_out(terminal, app, ink, |app| app.room().is_some())?;
+    play_out(terminal, app, look, |app| app.room().is_some())?;
     let size = terminal.size()?;
     let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
     match draw::row_rect(app, area, app::GHOST_ID) {
         Some(row) if crate::fade::enabled() => {
-            crate::fade::fade_out_onto(terminal, |f| draw::draw(f, app), row.y)?;
+            crate::fade::fade_out_onto(terminal, |f| still(f, app, look), row.y)?;
             Ok(prompt::Arrival::FromName)
         }
         // Not on screen at all — a terminal with no room for a list — or no
@@ -714,16 +740,16 @@ fn make_room(
 fn play_out(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    ink: Option<&effects::Ink>,
+    look: &Look,
     playing: impl Fn(&App) -> bool,
 ) -> Result<()> {
     let mut ticked = Instant::now();
     while playing(app) {
-        terminal.draw(|f| frame(f, app, ink))?;
+        terminal.draw(|f| frame(f, app, look))?;
         std::thread::sleep(crate::fade::FRAME);
         tick(app, &mut ticked);
     }
-    terminal.draw(|f| frame(f, app, ink))?;
+    terminal.draw(|f| frame(f, app, look))?;
     Ok(())
 }
 
@@ -740,6 +766,7 @@ fn play_out(
 fn leave_to_session(
     terminal: &mut ratatui::DefaultTerminal,
     app: &App,
+    look: &Look,
     session: Session,
 ) -> Result<Outcome> {
     let size = terminal.size()?;
@@ -751,9 +778,9 @@ fn leave_to_session(
         Some(h) => {
             let (row, col) = h.at();
             let keep = ratatui::layout::Rect::new(col, row, h.width(), 1);
-            crate::fade::fade_out_keeping(terminal, |f| draw::draw(f, app), keep)?;
+            crate::fade::fade_out_keeping(terminal, |f| still(f, app, look), keep)?;
         }
-        None => crate::fade::fade_out(terminal, |f| draw::draw(f, app))?,
+        None => crate::fade::fade_out(terminal, |f| still(f, app, look))?,
     }
     Ok(Outcome::Attach {
         session,
@@ -1077,5 +1104,53 @@ mod tests {
         };
         assert!(without.leaves().is_empty());
         assert!(Outcome::Quit.leaves().is_empty());
+    }
+
+    /// Under a `[theme] highlight` the selection's bar, and nothing else on
+    /// the picker, takes its colour — still reversed, so the bar is the
+    /// highlight and the text the colour the theme chose for it; and a fade
+    /// dissolves the same frame the loop draws.
+    #[test]
+    fn a_highlight_colours_the_selection_and_nothing_else() {
+        use crate::theme::Highlight;
+        use ratatui::style::{Color, Modifier};
+
+        let mut app = test_support::picker(&["api-server", "dotfiles", "notes"]);
+        app.on_key(Key::Char('j'));
+        let look = Look {
+            ink: None,
+            highlight: Some(Highlight {
+                bar: crate::palette::Rgb(100, 0, 200),
+                text: Some(crate::palette::Rgb(250, 250, 250)),
+            }),
+        };
+        let buf = test_support::buffer(40, 8, |f| frame(f, &app, &look));
+        let mut bar = 0;
+        for cell in &buf.content {
+            if cell.modifier.contains(Modifier::REVERSED) {
+                bar += 1;
+                assert_eq!(cell.fg, Color::Rgb(100, 0, 200), "{cell:?}");
+                assert_eq!(cell.bg, Color::Rgb(250, 250, 250), "{cell:?}");
+            } else {
+                assert_eq!((cell.fg, cell.bg), (Color::Reset, Color::Reset), "{cell:?}");
+            }
+        }
+        // The bar, and the row the cursor just left holding it without a
+        // palette.
+        assert!(
+            bar >= 2 * "▸ 2  dotfiles".chars().count(),
+            "the whole bar: {bar}"
+        );
+
+        let resting = test_support::picker(&["api-server", "dotfiles", "notes"]);
+        assert_eq!(
+            test_support::buffer(40, 8, |f| frame(f, &resting, &look)),
+            test_support::buffer(40, 8, |f| still(f, &resting, &look)),
+            "nothing passing, the frame is the one a fade ends on"
+        );
+
+        let plain = test_support::buffer(40, 8, |f| frame(f, &resting, &Look::default()));
+        let drawn = test_support::buffer(40, 8, |f| draw::draw(f, &resting));
+        assert_eq!(plain, drawn, "no highlight, no colour");
     }
 }

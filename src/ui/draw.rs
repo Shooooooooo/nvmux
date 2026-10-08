@@ -15,8 +15,9 @@
 //! relies on that flag renders incorrectly for exactly the users who asked for
 //! no colour.
 //!
-//! A `[theme] background` does not change any of this: it is laid behind the
-//! finished frame by [`crate::theme::fill`], after this module is done.
+//! A `[theme] highlight` gives the selection's reversed bar a colour of its
+//! own, but not here: [`crate::theme`] lays it over the finished frame, and the
+//! bar stays reversed under it.
 
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Alignment, Rect};
