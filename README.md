@@ -17,7 +17,18 @@ detach, come back: the sessions, their windows and their buffers are where you
 left them — and nvmux's own client animates the scrolls, splits and switches
 on the way.
 
-[Why not tmux?](#why-not-tmux) · [Requirements](#requirements) · [Install](#install) · [Use](#use) · [How it works](#how-it-works) · [Configuration](#configuration)
+[Who it's for](#who-its-for) · [Why not tmux?](#why-not-tmux) · [Install](#install) · [Use](#use) · [How it works](#how-it-works) · [Configuration](#configuration)
+
+## Who it's for
+
+nvmux is a very opinionated program. It suits folks who already run their
+terminal programs — shells, REPLs, coding agents — in Neovim terminal buffers,
+so that a Neovim session *is* the workspace, and nvmux only has to keep that
+session alive and get you back into it.
+
+Pair it with [agent.nvim](https://github.com/Shooooooooo/agent.nvim) and a
+coding agent running in one of those buffers gains access to all your Neovim
+buffers, making it more powerful than the same agent in a standalone terminal.
 
 ## Why not tmux?
 
@@ -31,14 +42,9 @@ That last row is the trade: nvmux is not a tmux replacement. It does one thing,
 which is why it can draw Neovim from Neovim's own account of its screen — or
 hand Neovim your terminal outright — rather than an imitation of one.
 
-It is also a very opinionated program. nvmux suits folks who already run their
-terminal programs — shells, REPLs, coding agents — in Neovim terminal buffers,
-so that a Neovim session *is* the workspace. Pair it with
-[agent.nvim](https://github.com/Shooooooooo/agent.nvim) and a coding agent
-running in one of those buffers gains access to all your Neovim buffers,
-making it more powerful than the same agent in a standalone terminal.
+## Install
 
-## Requirements
+### Requirements
 
 | Where | Needs |
 |---|---|
@@ -50,7 +56,7 @@ making it more powerful than the same agent in a standalone terminal.
 drawn by Neovim's own client (`[client] ui = "nvim"`), which is `nvim
 --remote-ui`.
 
-## Install
+### Building
 
 ```sh
 cargo install --git https://github.com/Shooooooooo/nvmux
