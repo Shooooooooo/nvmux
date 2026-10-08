@@ -15,7 +15,9 @@
 //! `NO_COLOR`, nothing is set, and a frame is byte for byte what it was before
 //! there was a theme. The effects that come off the bar — the afterglow, the
 //! glint, the strike and the sonar's rings — take their colours from the same
-//! [`Highlight`] (see [`crate::ui::effects::Ink`]).
+//! [`Highlight`] (see [`crate::ui::effects::Ink`]), and so do the stars,
+//! sparks and dust a session being moved scatters beside the list (see
+//! [`crate::ui::effects::particles`]).
 
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};

@@ -34,9 +34,11 @@
 //! from the bar as the theme colours it rather than from the terminal's
 //! foreground: the afterglow lets go of the highlight and the text on it,
 //! the glint brightens the highlight, the strike warms it, and the rings go
-//! out in it, each cell as far from it as its own brightness says. The rows
-//! a filter drops and the row in a gap are no bar, and keep the terminal's
-//! colours. That is [`Ink`], read once a run.
+//! out in it, each cell as far from it as its own brightness says; and the
+//! stars, sparks and dust of a session being moved take it too, the dim ones
+//! halfway into the background ([`particles`]). The rows a filter drops and
+//! the row in a gap are no bar, and keep the terminal's colours. That is
+//! [`Ink`], read once a run.
 //!
 //! Without them, each falls back to a modifier, which sets no colour: the
 //! afterglow holds the bar, reversed and dim, for the first third of its time
@@ -152,6 +154,11 @@ const FALLBACK_HOLD: f32 = 1.0 / 3.0;
 /// How far into the background a dropped row starts. Not zero: the row should
 /// read as leaving on the very frame the keystroke lands.
 const SIFT_FROM: f32 = 0.3;
+
+/// How far into the background a dim particle is drawn under a highlight,
+/// where the terminal said what its colours are: about where its own dim would
+/// have put it, made exact, as everything else here is.
+const PARTICLE_DIM: f32 = 0.5;
 
 /// What the effects paint with: the terminal's colours, and the bar's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,6 +282,62 @@ pub fn paint(frame: &mut Frame, app: &App, ink: Option<&Ink>) {
             rings(buf, app, area, rect, sonar, ink);
         }
     }
+}
+
+/// Under a `[theme] highlight`, the braille the picker scatters beside the
+/// list in the highlight: the stars off a session in flight, the sparks off
+/// the seams it slides past, the dust it lands in, and the rings, if they
+/// have no colour yet. A bright one is the highlight itself, and a dim one
+/// the highlight `PARTICLE_DIM` of the way into the background — or, not
+/// knowing the background, the highlight left to the terminal to dim.
+///
+/// All of it is braille, and nothing else on the picker is but a name that
+/// happens to be, so that is how it is found: a braille cell above the hint
+/// row, in no name, that nothing has coloured — the stars beside a row that
+/// has stepped aside included, and a spark in the blank of a row's indent. [`super::draw`] draws them with modifiers alone,
+/// as it draws everything; this is their colour, the way [`paint`] is the
+/// sonar's. Without a highlight, nothing.
+pub fn particles(frame: &mut Frame, app: &App, ink: Option<&Ink>, highlight: Option<&Highlight>) {
+    let Some(highlight) = highlight else {
+        return;
+    };
+    let area = frame.area();
+    let buf = frame.buffer_mut();
+    let screen = buf.area.intersection(area);
+    let above_hint = screen.y + screen.height.saturating_sub(1);
+    let bright = rgb(highlight.bar);
+    let dim = ink.map(|ink| rgb(highlight.bar.lerp(ink.palette.bg, PARTICLE_DIM)));
+    for y in screen.y..above_hint {
+        for x in screen.x..screen.x + screen.width {
+            let cell = &mut buf[(x, y)];
+            if !braille(cell.symbol())
+                || cell.fg != Color::Reset
+                || cell.modifier.contains(Modifier::REVERSED)
+                || draw::in_a_name(app, area, x, y)
+            {
+                continue;
+            }
+            match dim {
+                Some(dim) if cell.modifier.contains(Modifier::DIM) => {
+                    cell.modifier.remove(Modifier::DIM);
+                    cell.set_fg(dim);
+                }
+                _ => {
+                    cell.set_fg(bright);
+                }
+            }
+        }
+    }
+}
+
+/// Whether `symbol` is one braille cell with a dot in it: what every particle
+/// on the picker is drawn in.
+fn braille(symbol: &str) -> bool {
+    let mut chars = symbol.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some(c), None) if ('\u{2801}'..='\u{28ff}').contains(&c)
+    )
 }
 
 /// The row the cursor left, `progress` of the way back to plain.
@@ -1312,5 +1375,175 @@ mod tests {
         let buf = themed(&a, Some(&p), Some(HIGHLIGHT));
         let dropped = first_glyph(&buf, row_of(&buf, "dotfiles"));
         assert_eq!(dropped.fg, rgb(p.fg.lerp(p.bg, SIFT_FROM)));
+    }
+
+    /// [`themed`], and the particles beside the list coloured as the picker
+    /// colours them.
+    fn scattered(app: &App, palette: Option<&Palette>, highlight: Option<Highlight>) -> Buffer {
+        let ink = palette.map(|p| Ink::new(*p, highlight));
+        test_support::buffer(W, H, |f| {
+            draw::draw(f, app);
+            paint(f, app, ink.as_ref());
+            particles(f, app, ink.as_ref(), highlight.as_ref());
+        })
+    }
+
+    /// The second of two sessions picked up, its stars well on their way
+    /// off the bar.
+    fn in_flight() -> App {
+        let mut a = picker(&["api-server", "docs"]);
+        a.on_key(Key::Char('j'));
+        a.on_key(Key::Char(' '));
+        a.set_trail(true);
+        for _ in 0..40 {
+            a.tick(Duration::from_millis(16));
+        }
+        a
+    }
+
+    fn particles_of(buf: &Buffer) -> Vec<&ratatui::buffer::Cell> {
+        buf.content.iter().filter(|c| braille(c.symbol())).collect()
+    }
+
+    /// The stars off a session in flight are the highlight: the bright half
+    /// the highlight itself, the dim half halfway into the background, set
+    /// exactly rather than left to the terminal's dim.
+    #[test]
+    fn under_a_highlight_the_stars_are_its_colour() {
+        let p = test_palette();
+        let buf = scattered(&in_flight(), Some(&p), Some(HIGHLIGHT));
+        let stars = particles_of(&buf);
+        assert!(!stars.is_empty(), "a trail");
+        let bright = rgb(HIGHLIGHT.bar);
+        let dim = rgb(HIGHLIGHT.bar.lerp(p.bg, PARTICLE_DIM));
+        for star in &stars {
+            assert!(star.fg == bright || star.fg == dim, "{star:?}");
+            assert!(!star.modifier.contains(Modifier::DIM), "{star:?}");
+        }
+        assert!(stars.iter().any(|s| s.fg == bright), "a bright half");
+        assert!(stars.iter().any(|s| s.fg == dim), "a dim half");
+    }
+
+    /// Not knowing the terminal's background, a dim star is the highlight
+    /// left dim, for the terminal to dim as it dims everything.
+    #[test]
+    fn without_a_palette_the_stars_are_the_highlight_dimmed_by_the_terminal() {
+        let buf = scattered(&in_flight(), None, Some(HIGHLIGHT));
+        let stars = particles_of(&buf);
+        assert!(!stars.is_empty(), "a trail");
+        for star in &stars {
+            assert_eq!(star.fg, rgb(HIGHLIGHT.bar), "{star:?}");
+        }
+        assert!(
+            stars.iter().any(|s| s.modifier.contains(Modifier::DIM)),
+            "the far half is still dim"
+        );
+    }
+
+    /// No highlight, no colour: the stars are the modifiers they always were.
+    #[test]
+    fn without_a_highlight_the_stars_are_as_they_were() {
+        let p = test_palette();
+        let a = in_flight();
+        assert_eq!(scattered(&a, Some(&p), None), frame(&a, Some(&p)));
+    }
+
+    /// The sparks off the seams a session slides past, and the dust it lands
+    /// in, are the highlight too, frame after frame until they settle.
+    #[test]
+    fn under_a_highlight_the_sparks_and_the_dust_are_its_colour() {
+        let p = test_palette();
+        let bright = rgb(HIGHLIGHT.bar);
+        let dim = rgb(HIGHLIGHT.bar.lerp(p.bg, PARTICLE_DIM));
+        let mut a = picker(&["api-server", "docs", "notes"]);
+        a.on_key(Key::Char('j'));
+        a.on_key(Key::Char(' '));
+        a.set_trail(true);
+        a.on_key(Key::Char('j'));
+        let mut off_the_line = 0;
+        for put_down in [false, true] {
+            if put_down {
+                a.on_key(Key::Enter);
+                assert!(a.landing().is_some(), "landing");
+            }
+            for _ in 0..30 {
+                let buf = scattered(&a, Some(&p), Some(HIGHLIGHT));
+                let y = row_of(&buf, "docs");
+                for py in 0..buf.area.height {
+                    for px in 0..buf.area.width {
+                        let cell = &buf[(px, py)];
+                        if !braille(cell.symbol()) {
+                            continue;
+                        }
+                        assert!(cell.fg == bright || cell.fg == dim, "({px},{py}) {cell:?}");
+                        off_the_line += usize::from(py != y);
+                    }
+                }
+                a.tick(Duration::from_millis(16));
+            }
+        }
+        assert!(off_the_line > 0, "sparks or splash on the rows beside");
+    }
+
+    /// A row stepping aside takes its trail with it, and the stars nearest
+    /// the bar go where the row stood a moment ago: they are still stars, and
+    /// still the highlight. Names all the one length, so the bar is the
+    /// list's whole width and the stars come right up to where it was.
+    #[test]
+    fn stars_beside_a_row_stepping_aside_are_its_colour() {
+        let p = test_palette();
+        let bright = rgb(HIGHLIGHT.bar);
+        let dim = rgb(HIGHLIGHT.bar.lerp(p.bg, PARTICLE_DIM));
+        for key in ['j', 'k'] {
+            let mut a = picker(&["session 1", "session 2", "session 3"]);
+            a.on_key(Key::Char('j'));
+            a.on_key(Key::Char(' '));
+            a.set_trail(true);
+            for _ in 0..20 {
+                a.tick(Duration::from_millis(16));
+            }
+            a.on_key(Key::Char(key));
+            let mut stepped = false;
+            for _ in 0..30 {
+                stepped |= a
+                    .selected_row_id()
+                    .is_some_and(|id| a.swap().aside(id) != 0);
+                let buf = scattered(&a, Some(&p), Some(HIGHLIGHT));
+                for (i, cell) in buf.content.iter().enumerate() {
+                    if braille(cell.symbol()) {
+                        assert!(
+                            cell.fg == bright || cell.fg == dim,
+                            "{key}: cell {i} {cell:?}"
+                        );
+                    }
+                }
+                a.tick(Duration::from_millis(16));
+            }
+            assert!(stepped, "{key}: the bar never stepped aside");
+        }
+    }
+
+    /// Braille in a name is the name's, not a particle: a row is never
+    /// coloured.
+    #[test]
+    fn braille_in_a_name_is_left_alone() {
+        let p = test_palette();
+        let a = picker(&["⠿⠿⠿", "docs"]);
+        let buf = scattered(&a, Some(&p), Some(HIGHLIGHT));
+        let y = row_of(&buf, "⠿⠿⠿");
+        for x in 0..W {
+            if braille(buf[(x, y)].symbol()) {
+                let cell = &buf[(x, y)];
+                assert!(
+                    cell.fg == Color::Reset || cell.modifier.contains(Modifier::REVERSED),
+                    "{cell:?}"
+                );
+            }
+        }
+        assert_eq!(
+            buf,
+            frame(&a, Some(&p)),
+            "nothing scattered, nothing coloured"
+        );
     }
 }

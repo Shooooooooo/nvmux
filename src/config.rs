@@ -592,7 +592,9 @@ pub struct ThemeSettings {
     /// The effects that come off the bar work theirs out from it, each cell
     /// at its own brightness: the afterglow it leaves as the cursor moves on,
     /// the glint that crosses it, the warmth it takes while a `[y/N]` asks,
-    /// and the sonar's rings, which start as it and fade into the background.
+    /// the sonar's rings, which start as it and fade into the background, and
+    /// the stars, sparks and dust of a session being moved, the dim ones
+    /// halfway into the background.
     #[serde(deserialize_with = "de_rgb")]
     pub highlight: Option<Rgb>,
 }
@@ -1069,9 +1071,10 @@ fn render_default_config(prefix: u8) -> String {
          \n\
          [theme]\n\
          # One colour, \"#rrggbb\", for the session the picker has highlighted:\n\
-         # the background of its bar, and the afterglow, glint, strike and sonar\n\
-         # rings that come off it. Unset, the bar is the terminal's own colours\n\
-         # reversed. NO_COLOR sets none of it.\n\
+         # the background of its bar, and the afterglow, glint, strike, sonar\n\
+         # rings, and the stars, sparks and dust of a move that come off it.\n\
+         # Unset, the bar is the terminal's own colours reversed. NO_COLOR sets\n\
+         # none of it.\n\
          # highlight = \"#89b4fa\"\n",
         prefix = crate::keys::prefix_label(prefix),
         timeout = k.timeout_ms,

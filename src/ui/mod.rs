@@ -650,20 +650,24 @@ impl Look {
 }
 
 /// The picker as it stands, with nothing passing over it: the screen, with
-/// the theme's highlight on its bar. What every fade of the picker dissolves,
-/// so a fade in ends on exactly the frame the loop draws next.
+/// the theme's highlight on its bar and on whatever it has scattered beside
+/// the list. What every fade of the picker dissolves, so a fade in ends on
+/// exactly the frame the loop draws next.
 fn still(f: &mut ratatui::Frame, app: &App, look: &Look) {
     draw::draw(f, app);
+    effects::particles(f, app, look.ink.as_ref(), look.highlight.as_ref());
     crate::theme::paint(f.buffer_mut(), look.highlight.as_ref());
 }
 
 /// One frame of the picker: the screen, then whatever is passing over it,
-/// then the theme's highlight on what is left of the bar (see
-/// [`crate::theme`]) — last, so the bar's landing and the afterglow held
-/// without a palette, drawn reversed as the bar is, take it too.
+/// then the theme's highlight on the braille beside the list that has no
+/// colour yet, and on what is left of the bar (see [`crate::theme`]) — last,
+/// so the bar's landing and the afterglow held without a palette, drawn
+/// reversed as the bar is, take it too.
 fn frame(f: &mut ratatui::Frame, app: &App, look: &Look) {
     draw::draw(f, app);
     effects::paint(f, app, look.ink.as_ref());
+    effects::particles(f, app, look.ink.as_ref(), look.highlight.as_ref());
     crate::theme::paint(f.buffer_mut(), look.highlight.as_ref());
 }
 

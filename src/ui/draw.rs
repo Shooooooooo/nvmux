@@ -854,6 +854,40 @@ pub(super) fn on_a_row(app: &App, area: Rect, column: u16, row: u16) -> bool {
     usize::from(column - block.x) < width
 }
 
+/// Whether terminal cell (`column`, `row`) is in the name of a row as drawn,
+/// wherever a row stepping aside (see [`super::swap`]) has it now. The one
+/// part of a row that can be braille — a session can be named anything — and
+/// so what keeps the colour the particles beside the list are given off a
+/// name (see [`super::effects::particles`]). The rest of a row, its marker,
+/// number and blanks, is never braille, and a dot of a spark that lands in a
+/// blank of it is a spark like any other.
+pub(super) fn in_a_name(app: &App, area: Rect, column: u16, row: u16) -> bool {
+    if area.height == 0 || area.width == 0 {
+        return false;
+    }
+    let (body, _) = split_hint_row(area);
+    let Some(ListLayout {
+        block,
+        offset,
+        num_width,
+    }) = list_layout(app, body)
+    else {
+        return false;
+    };
+    if row < block.y || row >= block.y + block.height {
+        return false;
+    }
+    let rows = app.rows();
+    let Some(drawn) = rows.get(offset + usize::from(row - block.y)) else {
+        return false;
+    };
+    let head = MARKER.width() + num_width + NUM_GAP.width();
+    let end = (head + drawn.session.name.width()).min(block.width as usize);
+    let start = i32::from(block.x) + i32::from(app.swap().aside(&drawn.session.id));
+    let column = i32::from(column);
+    column >= start + head as i32 && column < start + end as i32
+}
+
 /// Keep `selected` visible within a window of `height` rows.
 pub(super) fn scroll_offset(selected: usize, total: usize, height: usize) -> usize {
     if height == 0 || total <= height {

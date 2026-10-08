@@ -230,5 +230,6 @@ The picker draws the session it has highlighted as a bar in your terminal's
 own colours, reversed. `[theme] highlight` gives that bar a colour of its own,
 with its text in whichever of your terminal's colours reads on it, and the
 effects that come off it — the afterglow it leaves, the glint that crosses it,
-the warmth it takes at `[y/N]` and the sonar's rings — work theirs out from
-it. Nothing else changes colour, and `NO_COLOR` turns it off.
+the warmth it takes at `[y/N]`, the sonar's rings, and the stars, sparks and
+dust of a session being reordered — work theirs out from it. Nothing else
+changes colour, and `NO_COLOR` turns it off.
