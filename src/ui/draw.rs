@@ -50,6 +50,30 @@ const GRABBED: &str = "⇕ ";
 /// Exactly as wide as [`MARKER`], for the reason [`GRABBED`] is.
 const GHOST: &str = "+ ";
 
+/// The mark on the row of the session `Esc` goes back to — the one
+/// `<prefix> Space` came back to the picker from (see [`App::back_to`]).
+///
+/// In a gutter left of the list, one blank column out from the marker column,
+/// rather than in it: the picker opens with the cursor on that very row, so
+/// its marker column already holds [`MARKER`], and a mark there would be gone
+/// the one time it is most wanted. Out there it is in the same column on every
+/// row, the way Neovim's sign column is, and never on a row.
+///
+/// A dot rather than anything that points: beside [`MARKER`] on arrival, an
+/// arrow would read as a second cursor. The bullet operator, U+2219, rather
+/// than the bullet or the middle dot, which are of ambiguous width and drawn
+/// two columns wide by a terminal set up for East Asian text; this one is
+/// one column everywhere [`MARKER`] is.
+///
+/// Dim, like the numbers: a reminder, not a second selection. And still,
+/// drawn here rather than painted over the frame by [`super::effects`], so the
+/// fade that brings the picker up has it from the first frame.
+const BACK: &str = "∙";
+
+/// How many columns left of the list [`BACK`] goes: far enough that a blank
+/// column keeps it off the marker.
+const BACK_OUT: u16 = 2;
+
 /// The prompt cursor.
 const CURSOR: &str = "▋";
 
@@ -279,6 +303,12 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
+    // Before what passes out past the ends of the rows, so a trail or a
+    // landing's bounce runs over the mark while it is there, and leaves it
+    // where it was.
+    if let Some(id) = app.back_to() {
+        draw_back(frame, app, block, offset, id);
+    }
     if let Some((id, backspace)) = backspace {
         draw_backspace(frame, app, block, offset, num_width, id, backspace);
     }
@@ -382,6 +412,39 @@ fn step_aside(buf: &mut Buffer, row: Rect, aside: i16) {
         };
         buf[(to, row.y)] = cell;
     }
+}
+
+/// The mark on the row of session `id` ([`BACK`]): [`BACK_OUT`] columns left
+/// of the list, stepping aside with the row, and not at all where there is no
+/// room left of the list or on a row that is not on screen. None on a row
+/// being erased, which is a session on its way out rather than one to go back
+/// to.
+fn draw_back(frame: &mut Frame, app: &App, block: Rect, offset: usize, id: &str) {
+    if app.backspace().is_some_and(|(erasing, _)| erasing == id) {
+        return;
+    }
+    let Some(line) = app
+        .rows()
+        .iter()
+        .position(|r| r.session.id == id)
+        .and_then(|index| index.checked_sub(offset))
+        .filter(|line| *line < block.height as usize)
+    else {
+        return;
+    };
+    let screen = frame.area();
+    let Some(x) = block
+        .x
+        .checked_add_signed(app.swap().aside(id))
+        .and_then(|x| x.checked_sub(BACK_OUT))
+        .filter(|x| *x >= screen.x && *x < screen.x + screen.width)
+    else {
+        return;
+    };
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    frame
+        .buffer_mut()
+        .set_string(x, block.y + line as u16, BACK, dim);
 }
 
 /// The sparks off the seams the rows of a session in flight slid past each
@@ -1812,6 +1875,129 @@ mod tests {
                 .all(|c| !c.modifier.contains(Modifier::DIM)));
         }
         test_support::assert_no_colour(40, 6, |f| draw(f, &a));
+    }
+
+    // --- the mark on the session come back from ------------------------------
+
+    /// `names` in the picker, opened back over the second row the way
+    /// `<prefix> Space` opens it.
+    fn back_over(names: &[&str]) -> App {
+        let mut a = app(names);
+        a.select_session("id000001");
+        a.set_came_from("id000001");
+        a
+    }
+
+    /// Every cell the mark is in, as (column, line).
+    fn marks(buf: &Buffer) -> Vec<(u16, u16)> {
+        let area = buf.area;
+        (area.y..area.y + area.height)
+            .flat_map(|y| (area.x..area.x + area.width).map(move |x| (x, y)))
+            .filter(|(x, y)| buf[(*x, *y)].symbol() == BACK)
+            .collect()
+    }
+
+    /// Back from a session, its row is marked left of the list, one blank
+    /// column out from the cursor's marker, dim, and in no colour; no other
+    /// row is.
+    #[test]
+    fn the_session_come_back_from_is_marked_left_of_its_row() {
+        let a = back_over(&["api-server", "dotfiles", "notes"]);
+        let buf = test_support::buffer(40, 8, |f| draw(f, &a));
+        let lines = render(&a, 40, 8);
+        let y = line_of(&lines, "dotfiles");
+        let start = bar(&buf, y)[0];
+        assert_eq!(buf[(start, y)].symbol(), MARKER.trim_end());
+        let x = start - BACK_OUT;
+        assert_eq!(marks(&buf), [(x, y)], "{lines:#?}");
+        assert_eq!(buf[(x + 1, y)].symbol(), " ", "a blank between");
+        assert!(buf[(x, y)].modifier.contains(Modifier::DIM));
+        test_support::assert_no_colour(40, 8, |f| draw(f, &a));
+    }
+
+    /// The mark stays on its row when the cursor leaves it, in the same
+    /// column: the gutter left of the list, whatever the row.
+    #[test]
+    fn the_mark_stays_on_its_row_when_the_cursor_leaves() {
+        let mut a = back_over(&["api-server", "dotfiles", "notes"]);
+        let before = marks(&test_support::buffer(40, 8, |f| draw(f, &a)));
+        a.on_key(Key::Char('j'));
+        let buf = test_support::buffer(40, 8, |f| draw(f, &a));
+        assert_eq!(marks(&buf), before);
+        let y = line_of(&render(&a, 40, 8), "notes");
+        assert!(!bar(&buf, y).is_empty(), "the cursor is on notes");
+    }
+
+    /// The mark is still: it asks for no frames, and time changes nothing
+    /// about it.
+    #[test]
+    fn the_mark_is_still() {
+        let mut a = back_over(&["api-server", "dotfiles", "notes"]);
+        assert!(!a.animating());
+        let first = test_support::buffer(40, 8, |f| draw(f, &a));
+        a.tick(Duration::from_secs(10));
+        assert_eq!(test_support::buffer(40, 8, |f| draw(f, &a)), first);
+    }
+
+    /// Nothing is marked when the picker came back from no session, from one
+    /// that is not listed, or with `[effects.back]` off — and once a fresh
+    /// listing no longer has the session, its mark goes with its row.
+    #[test]
+    fn only_a_listed_session_come_back_from_is_marked() {
+        let names = ["api-server", "dotfiles", "notes"];
+        let none = |a: &App| marks(&test_support::buffer(40, 8, |f| draw(f, a))).is_empty();
+        assert!(none(&app(&names)), "not opened from a session");
+
+        let mut gone = app(&names);
+        gone.set_came_from("gone");
+        assert!(none(&gone), "not listed");
+
+        let mut off = app(&names);
+        off.set_effects(false);
+        off.set_came_from("id000001");
+        assert!(none(&off), "switched off");
+
+        let mut killed = back_over(&names);
+        assert!(!none(&killed));
+        let listed = killed.sessions().to_vec();
+        killed.set_sessions(vec![listed[0].clone(), listed[2].clone()]);
+        assert!(none(&killed), "listed no longer");
+    }
+
+    /// A row being erased is no longer one to go back to, and loses its mark
+    /// as the backspace starts.
+    #[test]
+    fn a_row_being_erased_is_not_marked() {
+        let mut a = erasing(0);
+        a.set_came_from("id000001");
+        assert!(marks(&test_support::buffer(44, 8, |f| draw(f, &a))).is_empty());
+    }
+
+    /// The session come back from, picked up, trails stars over its mark;
+    /// put down, the mark is back where it was.
+    #[test]
+    fn a_trail_runs_over_the_mark_and_leaves_it() {
+        let mut a = back_over(&["api-server", "dotfiles", "notes"]);
+        a.set_trail(true);
+        let before = marks(&test_support::buffer(40, 8, |f| draw(f, &a)));
+        a.on_key(Key::Char(' '));
+        assert!(a.trailing());
+        assert!(marks(&test_support::buffer(40, 8, |f| draw(f, &a))).is_empty());
+        a.on_key(Key::Enter);
+        a.tick(Duration::from_secs(5));
+        assert!(!a.animating());
+        assert_eq!(marks(&test_support::buffer(40, 8, |f| draw(f, &a))), before);
+    }
+
+    /// Where the list runs to the edge of the screen there is no gutter left of
+    /// it, and no mark; and no size of terminal makes the mark panic.
+    #[test]
+    fn the_mark_stops_at_the_edge_of_the_screen() {
+        let a = back_over(&["a-session-with-a-long-name", "another-long-one"]);
+        assert!(marks(&test_support::buffer(30, 6, |f| draw(f, &a))).is_empty());
+        for &(w, h) in test_support::TINY_SIZES {
+            test_support::buffer(w, h, |f| draw(f, &a));
+        }
     }
 
     // --- rows fading out of a filter ----------------------------------------

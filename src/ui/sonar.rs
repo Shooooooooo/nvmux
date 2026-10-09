@@ -1,18 +1,17 @@
-//! The sonar: rings rippling out from the session you came back to the picker
-//! from, so you can see at a glance which one `Esc` returns to.
+//! The sonar: rings rippling out from a row of the picker, a pulse at a time.
 //!
-//! `<prefix> Space` opens the picker with the cursor already on that session,
-//! but a cursor is easy to take for wherever the list happened to start. Three
-//! rings leave both ends of its row, a beat apart, and thin out as they go:
-//! a pulse of two thirds of a second, sent out again every [`PERIOD`] for as
-//! long as the picker is up and the session is listed.
+//! Nothing sends it out at the moment. It marked the session you came back to
+//! the picker from, so you could see at a glance which one `Esc` returns to,
+//! until a still mark beside that row took the job over (see
+//! [`super::draw`]). It is kept, with the renderer that draws it
+//! ([`super::effects`]), for another use.
 //!
-//! Keys do not stop it. `Esc` goes back to that session after a move, a
-//! filter or a rename just as it does on arrival, so the row is worth marking
-//! for as long as that is true — and a ring only ever lands on the terminal's
-//! own background, never on a row, so it is in nobody's way. Between pulses
-//! nothing moves, and the picker sleeps until the next is due rather than
-//! drawing frames that would all be the same (see [`Sonar::until_next`]).
+//! Three rings leave both ends of the row, a beat apart, and thin out as they
+//! go: a pulse of two thirds of a second, sent out again every [`PERIOD`] for
+//! as long as the sonar is kept. A ring only ever lands on the terminal's own
+//! background, never on a row, so it is in nobody's way. Between pulses
+//! nothing moves, and a caller can sleep until the next is due rather than
+//! draw frames that would all be the same (see [`Sonar::until_next`]).
 //!
 //! # Braille, in three weights
 //!

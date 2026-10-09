@@ -251,8 +251,8 @@ impl EffectsSettings {
         self.enabled && self.cursor.enabled
     }
 
-    /// Whether coming back to the picker from a session sends rings pulsing
-    /// out from its row: its own switch and the master one.
+    /// Whether coming back to the picker from a session marks its row: its
+    /// own switch and the master one.
     pub fn back_enabled(&self) -> bool {
         self.enabled && self.back.enabled
     }
@@ -492,19 +492,17 @@ pub struct CursorSettings {
     pub enabled: bool,
 }
 
-/// Coming back to the picker from a session with `<prefix> Space`: rings of
-/// braille pulsing out from that session's row every few seconds while the
-/// picker is up, so it is plain which one `Esc` returns to (see
-/// [`crate::ui::sonar`]).
+/// Coming back to the picker from a session with `<prefix> Space`: a dot in a
+/// gutter left of that session's row, for as long as the picker is up, so it
+/// is plain which one `Esc` returns to (see [`crate::ui::draw`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BackSettings {
     /// This effect's own switch, under `[effects] enabled`. Off, the picker
     /// comes back up with the cursor on that session and nothing else.
     ///
-    /// The rings fade in colour where the terminal said what its colours are;
-    /// otherwise, and under `NO_COLOR`, they step down to dim — braille and a
-    /// modifier, like the trail.
+    /// The mark is still, and dim — a modifier, like the numbers — so it is
+    /// the same with colour or without, and under `NO_COLOR`.
     pub enabled: bool,
 }
 
@@ -980,8 +978,8 @@ fn render_default_config(prefix: u8) -> String {
          # enabled = {cursor_enabled}\n\
          \n\
          [effects.back]\n\
-         # Back in the picker from a session, rings pulse from its row every\n\
-         # few seconds while the picker is up.\n\
+         # Back in the picker from a session, a mark beside its row says\n\
+         # it is the one Esc returns to.\n\
          # enabled = {back_enabled}\n\
          \n\
          [effects.attach]\n\

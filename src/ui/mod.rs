@@ -430,12 +430,11 @@ fn run_loop(
         // A frame's wait while anything is moving, so it moves; the rest of the
         // time — and all the time, with the effects switched off in
         // `[effects]` — the picker changes on a key and nothing else, and
-        // waits the ordinary tick, or less when a pulse of rings is due
-        // sooner than that, so it goes out on time.
+        // waits the ordinary tick.
         let tick_for = if app.animating() {
             crate::fade::FRAME
         } else {
-            app.wake_in().map_or(TICK, |next| next.min(TICK))
+            TICK
         };
         if !waiting && !event::poll(tick_for)? {
             // The clock lives here rather than in `App`, which stays pure —
