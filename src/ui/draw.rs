@@ -102,13 +102,14 @@ const NOTE_GAP: &str = "  ";
 /// they had under [`MAX_LIST_WIDTH`]; the notes are cut to what is left.
 const MAX_NOTED_WIDTH: u16 = 64;
 
-/// How many columns past the right end of the list a session's sign goes
-/// (`[picker] notes = "signs"`): one blank column out from the bar — a gutter
-/// right of the list, a sign column, in the same column on every row.
+/// How many columns left of the list a session's sign goes (`[picker] notes =
+/// "signs"`): far enough that a blank column keeps it off the marker column —
+/// a gutter left of the list, a sign column, in the same column on every row,
+/// the way Neovim's is.
 ///
 /// Dim, like the back mark and the numbers, and outside the bar, so the
 /// selection's bold never meets it: bold and dim share one reset.
-const SIGN_OUT: u16 = 1;
+const SIGN_OUT: u16 = 2;
 
 /// Sixty-nine columns, and it used to be sixty exactly — the widest row that
 /// still fits a small terminal without truncation. `␣ order` is what that budget
@@ -475,12 +476,12 @@ fn push_note(
     }
 }
 
-/// Each session's sign, in a gutter right of the list (`[picker] notes =
-/// "signs"`, see [`super::note`]): [`SIGN_OUT`] columns out from the end of
+/// Each session's sign, in a gutter left of the list (`[picker] notes =
+/// "signs"`, see [`super::note`]): [`SIGN_OUT`] columns left of the start of
 /// the bar, on the row of the session it is about, stepping aside with that
-/// row — and not drawn where the screen ends first. None on a row being
-/// erased, nor on the gap made for a new session, which has nothing to report
-/// yet.
+/// row — and not drawn where there is no room left of the list. None on a row
+/// being erased, nor on the gap made for a new session, which has nothing to
+/// report yet.
 fn draw_signs(frame: &mut Frame, app: &App, block: Rect, offset: usize) {
     let screen = frame.area();
     let dim = Style::default().add_modifier(Modifier::DIM);
@@ -501,9 +502,8 @@ fn draw_signs(frame: &mut Frame, app: &App, block: Rect, offset: usize) {
         };
         let Some(x) = block
             .x
-            .saturating_add(block.width)
-            .saturating_add(SIGN_OUT)
             .checked_add_signed(app.swap().aside(&row.session.id))
+            .and_then(|x| x.checked_sub(SIGN_OUT))
             .filter(|x| *x >= screen.x && *x < screen.x + screen.width)
         else {
             continue;
@@ -2924,11 +2924,11 @@ mod tests {
             .expect("a bar on that row")
     }
 
-    /// Signs stand in a gutter right of the list, one blank column out from
-    /// the bar, on the rows of the sessions they are about — dim, and in no
-    /// colour, like the back mark on the other side.
+    /// Signs stand in a gutter left of the list, one blank column out from
+    /// the marker column, on the rows of the sessions they are about — dim,
+    /// and in no colour, like the numbers.
     #[test]
-    fn a_sign_stands_right_of_its_row_dim() {
+    fn a_sign_stands_left_of_its_row_dim() {
         let a = three(NoteStyle::Signs);
         let (w, h) = (60, 12);
         let lines = render(&a, w, h);
@@ -2938,9 +2938,10 @@ mod tests {
             line_of(&lines, "blog"),
             line_of(&lines, "dotfiles"),
         );
-        let end = bar_end(&buf, busy);
-        let x = end + 1 + SIGN_OUT;
-        assert_eq!(buf[(end + 1, busy)].symbol(), " ", "a blank column first");
+        let start = bar(&buf, busy)[0];
+        assert_eq!(buf[(start, busy)].symbol(), MARKER.trim_end());
+        let x = start - SIGN_OUT;
+        assert_eq!(buf[(x + 1, busy)].symbol(), " ", "a blank column between");
         assert_eq!(
             buf[(x, busy)].symbol(),
             "⠋",
@@ -2966,7 +2967,7 @@ mod tests {
         let lines = render(&a, w, h);
         let buf = test_support::buffer(w, h, |f| draw(f, &a));
         let y = line_of(&lines, "api-server");
-        assert_eq!(buf[(bar_end(&buf, y) + 1 + SIGN_OUT, y)].symbol(), "⠹");
+        assert_eq!(buf[(bar(&buf, y)[0] - SIGN_OUT, y)].symbol(), "⠹");
 
         let still = noted(
             &["api-server"],

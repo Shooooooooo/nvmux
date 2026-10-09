@@ -211,7 +211,7 @@ pub struct PickerSettings {
     /// notifications the programs in its terminal buffers send, an agent
     /// asking for permission among them.
     ///
-    /// `"signs"`, the default, puts one dim sign in a column right of the
+    /// `"signs"`, the default, puts one dim sign in a column left of the
     /// list — a spinner while busy, a gauge where the progress says how far
     /// it is, `∗` for a notification, `!` for a failure — and the selected
     /// session's note in full under the list. `"column"` puts each note in
@@ -234,7 +234,7 @@ pub struct PickerSettings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Notes {
-    /// A sign right of the row, and the selected session's note under the
+    /// A sign left of the row, and the selected session's note under the
     /// list.
     #[default]
     Signs,
@@ -1011,7 +1011,7 @@ fn render_default_config(prefix: u8) -> String {
          [picker]\n\
          # What a session reports beside its name: busy, failed, or a\n\
          # notification from a program in it, such as an agent asking for\n\
-         # permission. \"signs\" puts a sign right of the row and the selected\n\
+         # permission. \"signs\" puts a sign left of the row and the selected\n\
          # session's note under the list; \"column\" puts the note in the row;\n\
          # \"off\" shows none. To know, nvmux leaves a watcher in each session,\n\
          # which stays when nvmux leaves; \"off\" takes it out again.\n\
