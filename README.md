@@ -217,7 +217,7 @@ session     = true   # Neovim's own screen dissolves too, and backs the notice
 enabled = true   # stars off a session being moved, rows stepping aside, its landing
 
 [effects.cursor]
-enabled = true   # the row the cursor leaves fades back; a glint crosses the next
+enabled = true   # the row the cursor leaves fades back from the bar
 
 [effects.back]
 enabled = true   # back from a session, a mark beside its row in the picker
