@@ -53,19 +53,26 @@ const GHOST: &str = "+ ";
 /// The mark on the row of the session `Esc` goes back to — the one
 /// `<prefix> Space` came back to the picker from (see [`App::back_to`]).
 ///
-/// Past the far end of the bar, one blank column out, rather than in the
-/// marker column: the picker opens with the cursor on that very row, so its
-/// marker column already holds [`MARKER`], and a mark there would be gone the
-/// one time it is most wanted. Out there it is in the same column on every
-/// row, whatever the length of the name, never on a row, and pointing back at
-/// the one it marks — the selection's own marker turned round, the shape a
-/// back button has, and from the same block of the same font, so one column
-/// wide everywhere [`MARKER`] is: neither emoji nor of ambiguous width.
+/// In a gutter left of the list, one blank column out from the marker column,
+/// rather than in it: the picker opens with the cursor on that very row, so
+/// its marker column already holds [`MARKER`], and a mark there would be gone
+/// the one time it is most wanted. Out there it is in the same column on every
+/// row, the way Neovim's sign column is, and never on a row.
+///
+/// A dot rather than anything that points: beside [`MARKER`] on arrival, an
+/// arrow would read as a second cursor. The bullet operator, U+2219, rather
+/// than the bullet or the middle dot, which are of ambiguous width and drawn
+/// two columns wide by a terminal set up for East Asian text; this one is
+/// one column everywhere [`MARKER`] is.
 ///
 /// Dim, like the numbers: a reminder, not a second selection. And still,
 /// drawn here rather than painted over the frame by [`super::effects`], so the
 /// fade that brings the picker up has it from the first frame.
-const BACK: &str = "◂";
+const BACK: &str = "∙";
+
+/// How many columns left of the list [`BACK`] goes: far enough that a blank
+/// column keeps it off the marker.
+const BACK_OUT: u16 = 2;
 
 /// The prompt cursor.
 const CURSOR: &str = "▋";
@@ -407,10 +414,11 @@ fn step_aside(buf: &mut Buffer, row: Rect, aside: i16) {
     }
 }
 
-/// The mark on the row of session `id` ([`BACK`]): one blank column past the
-/// end of its bar, stepping aside with it, and not at all past the edge of the
-/// screen or on a row that is not on it. None on a row being erased, which is
-/// a session on its way out rather than one to go back to.
+/// The mark on the row of session `id` ([`BACK`]): [`BACK_OUT`] columns left
+/// of the list, stepping aside with the row, and not at all where there is no
+/// room left of the list or on a row that is not on screen. None on a row
+/// being erased, which is a session on its way out rather than one to go back
+/// to.
 fn draw_back(frame: &mut Frame, app: &App, block: Rect, offset: usize, id: &str) {
     if app.backspace().is_some_and(|(erasing, _)| erasing == id) {
         return;
@@ -424,13 +432,15 @@ fn draw_back(frame: &mut Frame, app: &App, block: Rect, offset: usize, id: &str)
     else {
         return;
     };
-    let x = (block.x + block.width)
-        .saturating_add(1)
-        .saturating_add_signed(app.swap().aside(id));
     let screen = frame.area();
-    if x < screen.x || x >= screen.x + screen.width {
+    let Some(x) = block
+        .x
+        .checked_add_signed(app.swap().aside(id))
+        .and_then(|x| x.checked_sub(BACK_OUT))
+        .filter(|x| *x >= screen.x && *x < screen.x + screen.width)
+    else {
         return;
-    }
+    };
     let dim = Style::default().add_modifier(Modifier::DIM);
     frame
         .buffer_mut()
@@ -1887,25 +1897,26 @@ mod tests {
             .collect()
     }
 
-    /// Back from a session, its row is marked one blank column past the end
-    /// of its bar, dim, and in no colour; no other row is.
+    /// Back from a session, its row is marked left of the list, one blank
+    /// column out from the cursor's marker, dim, and in no colour; no other
+    /// row is.
     #[test]
-    fn the_session_come_back_from_is_marked_past_its_bar() {
+    fn the_session_come_back_from_is_marked_left_of_its_row() {
         let a = back_over(&["api-server", "dotfiles", "notes"]);
         let buf = test_support::buffer(40, 8, |f| draw(f, &a));
         let lines = render(&a, 40, 8);
         let y = line_of(&lines, "dotfiles");
-        let end = *bar(&buf, y).last().expect("the row is the selection");
-        assert_eq!(marks(&buf), [(end + 2, y)], "{lines:#?}");
-        let gap = &buf[(end + 1, y)];
-        assert_eq!(gap.symbol(), " ");
-        assert!(!gap.modifier.contains(Modifier::REVERSED), "{gap:?}");
-        assert!(buf[(end + 2, y)].modifier.contains(Modifier::DIM));
+        let start = bar(&buf, y)[0];
+        assert_eq!(buf[(start, y)].symbol(), MARKER.trim_end());
+        let x = start - BACK_OUT;
+        assert_eq!(marks(&buf), [(x, y)], "{lines:#?}");
+        assert_eq!(buf[(x + 1, y)].symbol(), " ", "a blank between");
+        assert!(buf[(x, y)].modifier.contains(Modifier::DIM));
         test_support::assert_no_colour(40, 8, |f| draw(f, &a));
     }
 
     /// The mark stays on its row when the cursor leaves it, in the same
-    /// column: past where the bar ends on every row, whatever the name.
+    /// column: the gutter left of the list, whatever the row.
     #[test]
     fn the_mark_stays_on_its_row_when_the_cursor_leaves() {
         let mut a = back_over(&["api-server", "dotfiles", "notes"]);
@@ -1978,7 +1989,7 @@ mod tests {
         assert_eq!(marks(&test_support::buffer(40, 8, |f| draw(f, &a))), before);
     }
 
-    /// Where the list runs to the edge of the screen there is no column past
+    /// Where the list runs to the edge of the screen there is no gutter left of
     /// it, and no mark; and no size of terminal makes the mark panic.
     #[test]
     fn the_mark_stops_at_the_edge_of_the_screen() {

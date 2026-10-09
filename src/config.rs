@@ -492,10 +492,9 @@ pub struct CursorSettings {
     pub enabled: bool,
 }
 
-/// Coming back to the picker from a session with `<prefix> Space`: a mark
-/// beside that session's row, past the end of its bar, for as long as the
-/// picker is up, so it is plain which one `Esc` returns to (see
-/// [`crate::ui::draw`]).
+/// Coming back to the picker from a session with `<prefix> Space`: a dot in a
+/// gutter left of that session's row, for as long as the picker is up, so it
+/// is plain which one `Esc` returns to (see [`crate::ui::draw`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BackSettings {
