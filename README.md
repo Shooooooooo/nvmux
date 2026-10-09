@@ -188,7 +188,7 @@ enabled = true   # stars off a session being moved, rows stepping aside, its lan
 enabled = true   # the row the cursor leaves fades back; a glint crosses the next
 
 [effects.back]
-enabled = true   # back from a session, rings pulse from its row in the picker
+enabled = true   # back from a session, a mark beside its row in the picker
 
 [effects.attach]
 enabled = true   # the picker closes onto the name; the session opens out of it

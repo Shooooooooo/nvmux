@@ -1,11 +1,10 @@
 //! The picker's passing effects: the afterglow the cursor leaves behind (and a
 //! session in flight leaves on the rows it crosses, see [`super::swap`]), the
 //! glint it lands with, the rows a filter keystroke drops fading out where
-//! they stood, the line struck through a name a `[y/N]` is asking about, the
-//! rings that go out from the session you came back to the picker from, and
+//! they stood, the line struck through a name a `[y/N]` is asking about, and
 //! the row `c` stands in the gap it opens, coming up out of the background.
 //!
-//! All six are a post-pass over a frame [`super::draw`] has already drawn,
+//! All five are a post-pass over a frame [`super::draw`] has already drawn,
 //! the way [`crate::fade::apply`] is, and for the same reason: the screen's own
 //! drawing stays colourless, and its tests keep saying so. What is passing —
 //! which rows, and how far through — is [`App`]'s, moved on by the caller's
@@ -15,7 +14,7 @@
 //! # Colour where the terminal said, modifiers where it did not
 //!
 //! A real fade needs real colours at both ends, so with the terminal's answer
-//! to [`crate::palette::query`] and no `NO_COLOR`, all six paint in colour:
+//! to [`crate::palette::query`] and no `NO_COLOR`, all five paint in colour:
 //!
 //! - the afterglow runs from the selection's look — the foreground as the
 //!   background, the background as the foreground — back to the plain row;
@@ -25,7 +24,6 @@
 //!   the background, so it is plainly leaving from its first frame;
 //! - the bar of a row a `[y/N]` is asking about warms towards the terminal's
 //!   own red as the line goes through its name;
-//! - each ring fades into the background as it spreads;
 //! - the row in the gap comes up out of the background to the dim it is
 //!   drawn in.
 //!
@@ -33,14 +31,23 @@
 //! afterglow holds the bar, reversed and dim, for the first third of its time
 //! and then lets it go; the glint is an underline running under the bar where
 //! the band would be; a dropped row is dim until it goes; the struck row is the
-//! line alone, which is a modifier to begin with; a ring is dim once it is
-//! halfway out; the row in the gap is there, dim, from the first frame.
+//! line alone, which is a modifier to begin with; the row in the gap is
+//! there, dim, from the first frame.
 //! Coarser, and correct under `NO_COLOR` by construction, as everything else
 //! here is.
 //!
 //! The underline on a filter's matched letters is not here, and is not an
 //! effect: it is still, a modifier, and says why a row is still on screen, so
 //! [`super::draw`] draws it whatever `[effects]` says.
+//!
+//! # The rings, kept for later
+//!
+//! [`rings`] draws a [`super::sonar`] going out from a row, and nothing calls
+//! it at the moment. It marked the session you came back to the picker from
+//! until a still mark beside that row took the job over (see
+//! [`super::draw`]), and is kept, tested, for another use. With a palette each
+//! ring fades into the background as it spreads; without one, a ring is dim
+//! once it is halfway out.
 
 use std::time::Duration;
 
@@ -162,7 +169,6 @@ pub fn want_palette() -> bool {
         || effects.move_enabled()
         || effects.filter_enabled()
         || effects.kill_enabled()
-        || effects.back_enabled()
         || effects.create_enabled();
     wanted && std::env::var_os("NO_COLOR").is_none()
 }
@@ -225,17 +231,6 @@ pub fn paint(frame: &mut Frame, app: &App, palette: Option<&Palette>) {
     if let (Some(progress), Some(p)) = (app.room(), palette) {
         if let Some(rect) = draw::row_rect(app, area, GHOST_ID) {
             arrive(buf, rect, p, progress);
-        }
-    }
-
-    // Last, so the rings find the screen as everything else left it, and only
-    // ever take what is still the terminal's own background. Not while a gap
-    // is open for a new session: the picker is on its way to the prompt, and
-    // the gap is the one thing moving. The rings pick up again if the prompt
-    // is cancelled, since `Esc` still goes back where they say.
-    if let Some((id, sonar)) = app.sonar().filter(|_| !app.has_room()) {
-        if let Some(rect) = draw::row_rect(app, area, id) {
-            rings(buf, app, area, rect, sonar, palette);
         }
     }
 }
@@ -323,6 +318,10 @@ fn strike(buf: &mut Buffer, bar: Rect, name: Rect, palette: Option<&Palette>, dr
 /// of the row, its arcs on the lines above and below. Laid only on the
 /// terminal's own background — never on a row, the hint row, or a glyph
 /// something else has put there — and not past the edge of the screen.
+///
+/// Called last by whatever calls it, so the rings find the screen as
+/// everything else left it. Nothing does at the moment: see the module docs.
+#[allow(dead_code)]
 fn rings(
     buf: &mut Buffer,
     app: &App,
@@ -828,7 +827,7 @@ mod tests {
         assert!(a.strike().is_none(), "no line through the name");
         a.on_key(Key::Char('n'));
         a.set_came_from("id000000");
-        assert!(a.sonar().is_none(), "no rings");
+        assert!(a.back_to().is_none(), "no mark beside it");
         assert!(!a.animating());
     }
 
@@ -941,7 +940,7 @@ mod tests {
         assert!(a.strike().is_none());
     }
 
-    // --- the sonar ----------------------------------------------------------
+    // --- the sonar, kept for later ------------------------------------------
 
     fn is_braille(symbol: &str) -> bool {
         symbol
@@ -950,24 +949,45 @@ mod tests {
             .is_some_and(|c| (0x2801..=0x28ff).contains(&(c as u32)))
     }
 
-    /// `names` in the picker, opened back over the session at `index` the way
-    /// `<prefix> Space` opens it, `ms` milliseconds ago.
-    fn back_over(names: &[&str], index: usize, ms: u64) -> App {
+    /// A sonar `ms` milliseconds old.
+    fn sonar_at(ms: u64) -> Sonar {
+        let mut sonar = Sonar::new();
+        sonar.advance(Duration::from_millis(ms));
+        sonar
+    }
+
+    /// Draw `app`, paint its effects, and send `sonar` out from the row of
+    /// session `id` over the lot, last, the way a caller of [`rings`] would.
+    fn ping(f: &mut Frame, app: &App, id: &str, sonar: &Sonar, palette: Option<&Palette>) {
+        draw::draw(f, app);
+        paint(f, app, palette);
+        let area = f.area();
+        if let Some(rect) = draw::row_rect(app, area, id) {
+            rings(f.buffer_mut(), app, area, rect, sonar, palette);
+        }
+    }
+
+    /// `names` in the picker with the cursor on the second row, the one the
+    /// tests below send a sonar out from.
+    fn on_second(names: &[&str]) -> App {
         let mut a = picker(names);
-        let id = format!("id{index:06}");
-        a.select_session(&id);
-        a.set_came_from(&id);
-        a.tick(Duration::from_millis(ms));
+        a.select_session("id000001");
         a
     }
 
-    /// Rings go out past both ends of the row you came back from, and once
-    /// they are clear of it, over the lines above and below as well.
+    /// [`ping`] into a buffer, with a sonar `ms` milliseconds old going out
+    /// from the second row of `names`.
+    fn pinged(names: &[&str], ms: u64, palette: Option<&Palette>) -> Buffer {
+        let a = on_second(names);
+        test_support::buffer(W, H, |f| ping(f, &a, "id000001", &sonar_at(ms), palette))
+    }
+
+    /// Rings go out past both ends of the row, and once they are clear of it,
+    /// over the lines above and below as well.
     #[test]
-    fn rings_go_out_from_the_session_came_back_from() {
+    fn rings_go_out_from_a_row() {
         let p = test_palette();
-        let a = back_over(&["api-server", "dotfiles", "notes"], 1, 200);
-        let buf = frame(&a, Some(&p));
+        let buf = pinged(&["api-server", "dotfiles", "notes"], 200, Some(&p));
         let y = row_of(&buf, "dotfiles");
         let start = column_of(&buf, y, "▸");
         let end = start + "▸ 2  dotfiles".chars().count() as u16;
@@ -998,13 +1018,10 @@ mod tests {
     /// never on the hint row.
     #[test]
     fn rings_never_land_on_a_row() {
-        let names = ["session 3 is long", "x", "y"];
+        let a = on_second(&["session 3 is long", "x", "y"]);
         for ms in (0..sonar::PULSE.as_millis() as u64).step_by(5) {
-            let a = back_over(&names, 1, ms);
-            let lines = test_support::render(W, H, |f| {
-                draw::draw(f, &a);
-                paint(f, &a, None);
-            });
+            let sonar = sonar_at(ms);
+            let lines = test_support::render(W, H, |f| ping(f, &a, "id000001", &sonar, None));
             assert!(
                 lines.iter().any(|l| l.contains("session 3 is long")),
                 "a name broken into at {ms} ms: {lines:#?}"
@@ -1021,15 +1038,12 @@ mod tests {
     /// colour is set at any point.
     #[test]
     fn without_a_palette_rings_are_dim_braille() {
+        let a = on_second(&["api-server", "dotfiles", "notes"]);
         for ms in (0..sonar::PULSE.as_millis() as u64).step_by(20) {
-            let a = back_over(&["api-server", "dotfiles", "notes"], 1, ms);
-            test_support::assert_no_colour(W, H, |f| {
-                draw::draw(f, &a);
-                paint(f, &a, None);
-            });
+            let sonar = sonar_at(ms);
+            test_support::assert_no_colour(W, H, |f| ping(f, &a, "id000001", &sonar, None));
         }
-        let late = back_over(&["api-server", "dotfiles", "notes"], 1, 280);
-        let buf = frame(&late, None);
+        let buf = pinged(&["api-server", "dotfiles", "notes"], 280, None);
         assert!(
             buf.content
                 .iter()
@@ -1038,43 +1052,32 @@ mod tests {
         );
     }
 
-    /// The rings pulse, then rest without asking for frames — saying instead
-    /// when the next pulse is due — and pulse again. A key does not stop them:
-    /// `Esc` still goes back to that session after one.
+    /// Between pulses there are no rings to draw, and the picker is left as
+    /// it was.
     #[test]
-    fn rings_pulse_on_a_period_and_go_on_through_keys() {
-        let mut a = back_over(&["one", "two"], 1, sonar::PULSE.as_millis() as u64);
-        assert!(a.sonar().is_some(), "still there between pulses");
-        assert!(!a.animating(), "nothing moving between pulses");
-        assert_eq!(a.wake_in(), Some(sonar::PERIOD - sonar::PULSE));
-
-        a.on_key(Key::Char('j'));
-        a.tick(sonar::PERIOD - sonar::PULSE);
-        assert!(a.animating(), "the next pulse, on time");
-        assert!(a.sonar().is_some_and(|(_, s)| !s.rings().is_empty()));
-        assert_eq!(a.wake_in(), Some(Duration::ZERO));
+    fn between_pulses_nothing_is_drawn() {
+        let names = ["api-server", "dotfiles", "notes"];
+        let resting = pinged(&names, sonar::PULSE.as_millis() as u64, None);
+        let a = on_second(&names);
+        let plain = test_support::buffer(W, H, |f| draw::draw(f, &a));
+        assert_eq!(resting, plain);
     }
 
-    /// A fresh listing keeps the rings while the session they mark is in it,
-    /// and ends them once it is not.
+    /// The picker sends no rings out of its own: coming back from a session
+    /// marks its row, still, and asks for no frames.
     #[test]
-    fn a_fresh_listing_keeps_the_rings_while_their_session_is_listed() {
-        let mut a = back_over(&["one", "two"], 1, 50);
-        let listed = a.sessions().to_vec();
-        a.set_sessions(listed.clone());
-        assert!(a.sonar().is_some(), "still listed");
-        a.set_sessions(vec![listed[0].clone()]);
-        assert!(a.sonar().is_none(), "the session they marked has gone");
-        assert_eq!(a.wake_in(), None);
-    }
-
-    /// A session that has gone from the list sends out no rings: there is no
-    /// row to send them from.
-    #[test]
-    fn no_rings_from_a_session_not_listed() {
-        let mut a = picker(&["one", "two"]);
-        a.set_came_from("gone");
-        assert!(a.sonar().is_none());
+    fn coming_back_sends_no_rings() {
+        let mut a = on_second(&["api-server", "dotfiles", "notes"]);
+        a.set_came_from("id000001");
+        for ms in [0, 200, 400] {
+            a.tick(Duration::from_millis(ms));
+            let buf = frame(&a, None);
+            assert!(
+                !buf.content.iter().any(|c| is_braille(c.symbol())),
+                "{ms} ms"
+            );
+            assert!(!a.animating(), "{ms} ms");
+        }
     }
 
     // --- the gap a new session opens ---------------------------------------
@@ -1113,24 +1116,6 @@ mod tests {
         assert!(cell.modifier.contains(Modifier::DIM));
         let other = first_glyph(&buf, row_of(&buf, "notes"));
         assert_eq!(other.fg, Color::Reset, "no other row is touched");
-    }
-
-    /// The rings from the session the picker came back over hold off while
-    /// the gap is open, and pick up again once it closes.
-    #[test]
-    fn the_rings_hold_off_while_the_gap_is_open() {
-        let braille = |a: &App| {
-            frame(a, None)
-                .content
-                .iter()
-                .any(|c| is_braille(c.symbol()))
-        };
-        let mut a = back_over(&["api-server", "dotfiles", "notes"], 1, 200);
-        assert!(braille(&a), "pulsing");
-        assert!(a.make_room("session 4"));
-        assert!(!braille(&a), "held off");
-        a.close_room();
-        assert!(braille(&a), "back");
     }
 
     /// Without a palette, nothing is painted: the row is there, dim, from the

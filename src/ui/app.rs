@@ -14,7 +14,6 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 use super::backspace::Backspace;
 use super::effects;
 use super::landing::Landing;
-use super::sonar::Sonar;
 use super::starfield::{self, Starfield};
 use super::swap::Swap;
 use crate::session::Session;
@@ -145,12 +144,9 @@ pub struct App {
     /// The row a kill is erasing, by session id, until a fresh listing
     /// replaces it. See [`App::start_backspace`].
     backspace: Option<(String, Backspace)>,
-    /// Whether coming back to the picker from a session sends rings out from
-    /// it: `[effects.back] enabled`.
+    /// Whether coming back to the picker from a session marks that session's
+    /// row: `[effects.back] enabled`. See [`App::back_to`].
     back: bool,
-    /// The session the picker was opened from, and the rings pulsing out from
-    /// it, for as long as it is listed. See [`App::set_came_from`].
-    sonar: Option<(String, Sonar)>,
     /// Whether `c` opens a gap where the new session will go before the prompt
     /// comes up: `[effects.create] enabled`.
     create: bool,
@@ -287,7 +283,6 @@ impl App {
             strike: None,
             backspace: None,
             back: crate::config::get().effects.back_enabled(),
-            sonar: None,
             create: crate::config::get().effects.create_enabled(),
             room: None,
         }
@@ -298,17 +293,11 @@ impl App {
     /// does not move the highlight to an unrelated row.
     ///
     /// A fresh listing is the truth about the rows, so whatever was passing
-    /// over the old ones — an erased row, a glow, a fade — ends with it. Not
-    /// the rings, which mark the session `Esc` goes back to, not a moment on
-    /// the screen: they go on while that session is listed.
+    /// over the old ones — an erased row, a glow, a fade — ends with it.
     pub fn set_sessions(&mut self, sessions: Vec<Session>) {
         let previously = self.selected_id();
         self.backspace = None;
         self.strike = None;
-        self.sonar = self
-            .sonar
-            .take()
-            .filter(|(id, _)| sessions.iter().any(|s| &s.id == id));
         self.glow = None;
         self.glint = None;
         self.leaving = None;
@@ -343,14 +332,10 @@ impl App {
     /// either: killing the session you came from leaves `Esc` with nothing to
     /// do, which is better than dismissing the picker onto a dead client.
     ///
-    /// The picker is coming back up over that session, so this is also where
-    /// the rings that say so start (see [`super::sonar`]), if the row is there
-    /// to send them from.
+    /// The picker is coming back up over that session, so this is also what
+    /// marks its row as the one `Esc` returns to (see [`App::back_to`]).
     pub fn set_came_from(&mut self, id: &str) {
         self.came_from = Some(id.to_string());
-        if self.back && self.visible().iter().any(|s| s.id == id) {
-            self.sonar = Some((id.to_string(), Sonar::new()));
-        }
     }
 
     pub fn mode(&self) -> &Mode {
@@ -425,9 +410,6 @@ impl App {
         if let Some((_, backspace)) = &mut self.backspace {
             backspace.advance(elapsed);
         }
-        if let Some((_, sonar)) = &mut self.sonar {
-            sonar.advance(elapsed);
-        }
         if let Some(landing) = &mut self.landing {
             landing.advance(elapsed);
             if landing.done() {
@@ -443,12 +425,11 @@ impl App {
     /// Whether anything on screen is moving, and so whether the caller should
     /// draw at a frame's pace rather than wait on the keyboard: a trail, rows
     /// trading places, a glow, a glint, a fading row, a line being struck or
-    /// drawn back, a row being erased, a pulse of rings, or a row coming up in
-    /// a gap made for a new session. A line all the way across is still,
-    /// and asks for nothing while the `[y/N]` waits; so are the rings between
-    /// pulses, which [`App::wake_in`] answers for instead. With every effect
-    /// off this is only ever false, and the picker changes on a key and nothing
-    /// else.
+    /// drawn back, a row being erased, or a row coming up in a gap made for a
+    /// new session. A line all the way across is still, and asks for nothing
+    /// while the `[y/N]` waits; so is the mark on the session `Esc` goes back
+    /// to, which never moves. With every effect off this is only ever false,
+    /// and the picker changes on a key and nothing else.
     pub fn animating(&self) -> bool {
         self.trailing()
             || self.glow.is_some()
@@ -456,17 +437,9 @@ impl App {
             || self.leaving.is_some()
             || self.striking()
             || self.erasing()
-            || self.sonar.as_ref().is_some_and(|(_, s)| s.pulsing())
             || self.landing.is_some()
             || self.swap.moving()
             || self.room().is_some()
-    }
-
-    /// How long until something starts moving that is still now — the next
-    /// pulse of rings — so the caller's wait on the keyboard can end then,
-    /// rather than up to a tick late. `None` when nothing is due.
-    pub fn wake_in(&self) -> Option<Duration> {
-        self.sonar.as_ref().map(|(_, s)| s.until_next())
     }
 
     /// The landing under way, if a session has just been put down.
@@ -644,10 +617,13 @@ impl App {
         self.room.is_some()
     }
 
-    /// The session the picker came back up over, by id, and the rings that
-    /// pulse out from it.
-    pub fn sonar(&self) -> Option<(&str, &Sonar)> {
-        self.sonar.as_ref().map(|(id, s)| (id.as_str(), s))
+    /// The session the picker came back up over, by id — the one `Esc` goes
+    /// back to — for the renderer to mark its row (see `draw::BACK`). `None`
+    /// when the picker was opened from no session, or with `[effects.back]`
+    /// off. A session that has gone since has no row, and so no mark: whether
+    /// it is listed is the renderer's to find, as it finds every other row.
+    pub fn back_to(&self) -> Option<&str> {
+        self.came_from.as_deref().filter(|_| self.back)
     }
 
     /// The trail off the end of the name, for the renderer.
@@ -668,8 +644,9 @@ impl App {
     }
 
     /// Turn the picker's own effects — the afterglow and the glint, the
-    /// filter's fade, the kill's strike and backspace, the rings — on or off
-    /// whatever the config says, for a test that needs one or the other.
+    /// filter's fade, the kill's strike and backspace, the mark on the session
+    /// come back from — on or off whatever the config says, for a test that
+    /// needs one or the other.
     #[cfg(test)]
     pub(super) fn set_effects(&mut self, on: bool) {
         self.lights = on;
@@ -683,7 +660,6 @@ impl App {
             self.leaving = None;
             self.strike = None;
             self.backspace = None;
-            self.sonar = None;
         }
     }
 
