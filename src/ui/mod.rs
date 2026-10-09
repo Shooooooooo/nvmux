@@ -55,6 +55,7 @@ pub mod draw;
 pub mod effects;
 pub mod help;
 pub mod landing;
+pub mod note;
 pub mod prompt;
 pub mod setup;
 pub mod sonar;
@@ -109,6 +110,7 @@ impl Outcome {
     }
 }
 
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
@@ -116,6 +118,7 @@ use ratatui::crossterm::event::{
     MouseEventKind,
 };
 
+use crate::config::Notes as NoteStyle;
 use crate::error::Result;
 use crate::handoff::HandOff;
 use crate::session::Session;
@@ -347,16 +350,28 @@ pub(crate) fn poll_key_for(tick: Duration) -> Result<Option<Key>> {
 /// what makes `Esc` a way back to it rather than a key that does nothing. It is
 /// false where the picker is all there is: the first screen of the program, and
 /// the trip back from a failed attach or a session whose child exited.
+///
+/// `seen` is the session the user was looking at until the picker came up, if
+/// any: what it was keeping to report is not news to them, and is cleared
+/// before the picker reads it (see [`crate::notes`]).
 pub fn run(
     transport: &dyn Transport,
     message: Option<String>,
     focused: Option<&str>,
     still_attached: bool,
+    seen: Option<&str>,
 ) -> Result<Outcome> {
     owning_for_attach_leaving(Outcome::attaches, Outcome::leaves, true, |terminal| {
-        run_loop(terminal, transport, message, focused, still_attached)
+        run_loop(terminal, transport, message, focused, still_attached, seen)
     })
 }
+
+/// How long, of one pass of the picker's loop, may go on handing sessions to
+/// the reader of their notes. Locally every session fits in it; over ssh a
+/// session given its first forward takes most of it — an `ssh -O forward`
+/// to the master — so they go a few at a pass, between frames, rather than
+/// all before the first.
+const HAND_OVER: Duration = Duration::from_millis(8);
 
 fn run_loop(
     terminal: &mut ratatui::DefaultTerminal,
@@ -364,8 +379,22 @@ fn run_loop(
     message: Option<String>,
     focused: Option<&str>,
     still_attached: bool,
+    seen: Option<&str>,
 ) -> Result<Outcome> {
     let mut app = App::new(transport.list_sessions()?);
+    // What each session has to report: read on a thread of its own (see
+    // `crate::notes::Poller`), each session handed to it once the loop has
+    // its socket, and what they said taken up on every pass. With `[picker]
+    // notes = "off"` the same thread takes the watcher out of them instead.
+    let poller = crate::notes::Poller::start(app.note_style(), seen.map(str::to_string));
+    let mut handed: HashSet<String> = HashSet::new();
+    let mut unread: VecDeque<Session> = VecDeque::new();
+    // Until the reader first says what the sessions have to report, the loop
+    // waits a frame rather than a tick, so the notes come up with the picker
+    // rather than a quarter of a second after it — no longer than a round of
+    // reads can take, and not at all with the notes off, when it never says.
+    let mut heard = app.note_style() == NoteStyle::Off;
+    let opened = Instant::now();
     if let Some(id) = focused {
         app.select_session(id);
         if still_attached {
@@ -404,6 +433,22 @@ fn run_loop(
     loop {
         tick(&mut app, &mut ticked);
 
+        // Every session the listing has that the reader has not been given —
+        // all of them at first, and whatever a later listing adds — handed
+        // over a few milliseconds' worth at a time; and whatever they said
+        // since the last pass, taken up before it is drawn.
+        for s in app.sessions() {
+            if handed.insert(s.id.clone()) {
+                unread.push_back(s.clone());
+            }
+        }
+        hand_over(transport, &poller, &mut unread, app.note_style());
+        if let Some(notes) = poller.take() {
+            app.set_notes(notes);
+            heard = true;
+        }
+        let awaiting = !heard && opened.elapsed() < crate::notes::POLL;
+
         // Input already waiting is taken before the screen is drawn again, so
         // a frame answers everything that came in while the last one was going
         // out rather than one key of it. One frame a key holds the picker to
@@ -427,12 +472,17 @@ fn run_loop(
             drawn = Some(Instant::now());
         }
 
-        // A frame's wait while anything is moving, so it moves; the rest of the
-        // time — and all the time, with the effects switched off in
-        // `[effects]` — the picker changes on a key and nothing else, and
-        // waits the ordinary tick.
-        let tick_for = if app.animating() {
+        // A frame's wait while anything is moving, so it moves, and while the
+        // sessions are still to be handed to the reader of their notes, or it
+        // has yet to answer, so the notes come soon; a spinner's frame while
+        // one turns beside a busy session; the rest of the time — and all the
+        // time, with the effects switched off in `[effects]` and nothing busy
+        // — the picker changes on a key and nothing else, and waits the
+        // ordinary tick.
+        let tick_for = if app.animating() || !unread.is_empty() || awaiting {
             crate::fade::FRAME
+        } else if app.spinning() {
+            note::SPIN
         } else {
             TICK
         };
@@ -626,6 +676,35 @@ fn tick(app: &mut App, ticked: &mut Instant) {
     let now = Instant::now();
     app.tick(now - *ticked);
     *ticked = now;
+}
+
+/// Give the reader of notes the sockets of the sessions in `unread`, for as
+/// long as [`HAND_OVER`] allows, and at least one: locally that is all of
+/// them, and over ssh as many as can be given a forward in the time (see
+/// [`Transport::local_socket_for`], which makes one where there is none).
+///
+/// With `[picker] notes = "off"`, only the sessions the watcher has not been
+/// taken out of this run, so a remote session is given a forward for it once,
+/// not every time the picker comes up.
+fn hand_over(
+    transport: &dyn Transport,
+    poller: &crate::notes::Poller,
+    unread: &mut VecDeque<Session>,
+    style: NoteStyle,
+) {
+    let started = Instant::now();
+    while let Some(s) = unread.pop_front() {
+        if style == NoteStyle::Off && !crate::notes::to_remove(&s.id) {
+            continue;
+        }
+        match transport.local_socket_for(&s) {
+            Ok(sock) => poller.watch(&s.id, sock),
+            Err(e) => tracing::debug!(id = %s.id, error = %e, "notes: no socket to read"),
+        }
+        if started.elapsed() >= HAND_OVER {
+            break;
+        }
+    }
 }
 
 /// One frame of the picker: the screen, then whatever is passing over it.
