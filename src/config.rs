@@ -544,9 +544,10 @@ pub struct CursorSettings {
     pub enabled: bool,
 }
 
-/// Coming back to the picker from a session with `<prefix> Space`: a dot in a
-/// gutter left of that session's row, for as long as the picker is up, so it
-/// is plain which one `Esc` returns to (see [`crate::ui::draw`]).
+/// Coming back to the picker from a session with `<prefix> Space`: a hollow
+/// `▹` in that session's row, in the column the cursor's `▸` is drawn in, for
+/// as long as the picker is up, so it is plain which one `Esc` returns to (see
+/// [`crate::ui::draw`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BackSettings {
@@ -1039,8 +1040,8 @@ fn render_default_config(prefix: u8) -> String {
          # enabled = {cursor_enabled}\n\
          \n\
          [effects.back]\n\
-         # Back in the picker from a session, a mark beside its row says\n\
-         # it is the one Esc returns to.\n\
+         # Back in the picker from a session, a hollow triangle on its row,\n\
+         # where the cursor's is drawn, says it is the one Esc returns to.\n\
          # enabled = {back_enabled}\n\
          \n\
          [effects.attach]\n\

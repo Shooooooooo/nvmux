@@ -220,7 +220,7 @@ enabled = true   # stars off a session being moved, rows stepping aside, its lan
 enabled = true   # the row the cursor leaves fades back from the bar
 
 [effects.back]
-enabled = true   # back from a session, a mark beside its row in the picker
+enabled = true   # back from a session, a hollow ▹ on its row in the picker
 
 [effects.attach]
 enabled = true   # the picker closes onto the name; the session opens out of it

@@ -41,8 +41,8 @@
 //!
 //! [`rings`] draws a [`super::sonar`] going out from a row, and nothing calls
 //! it at the moment. It marked the session you came back to the picker from
-//! until a still mark beside that row took the job over (see
-//! [`super::draw`]), and is kept, tested, for another use. With a palette each
+//! until a still mark on that row took the job over (see [`super::draw`]),
+//! and is kept, tested, for another use. With a palette each
 //! ring fades into the background as it spreads; without one, a ring is dim
 //! once it is halfway out.
 
