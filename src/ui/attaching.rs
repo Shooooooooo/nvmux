@@ -89,12 +89,13 @@ use crate::rpc;
 /// module docs for both halves of what it gates.
 const GRACE: Duration = Duration::from_millis(300);
 
-/// One turn of the spinner, and the wait between polls.
-const FRAME: Duration = Duration::from_millis(80);
+/// One turn of the spinner, and the wait between polls. The picker's spinner,
+/// beside a busy session (see [`super::note`]), turns at the same pace.
+pub(super) const FRAME: Duration = Duration::from_millis(80);
 
 /// The spinner's frames. Braille, one column each, so the line's width does
-/// not change as it turns.
-const GLYPHS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// not change as it turns. The picker's are these too.
+pub(super) const GLYPHS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// The way out, in the grammar the hint rows use: key, then action. Two words
 /// on the last row, like the help screen's `esc back`.

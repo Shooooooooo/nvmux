@@ -113,6 +113,35 @@ the screen; it goes as soon as the next key resolves it.
 - **`x` in the picker kills**, without asking the session about unsaved
   buffers. Use `:q` for the editor's own save prompts.
 
+### What a session has to say
+
+Beside each name the picker shows, dim, what that session has to report:
+
+| Sign | Means |
+|---|---|
+| `⠹` (turning) | something in it is busy: a progress message is running, which is how a plugin such as [agent.nvim](https://github.com/Shooooooooo/agent.nvim) says an agent is working |
+| `⡆` | the same, with the percentage the progress gives |
+| `∗` | a program in one of its terminal buffers asked for a desktop notification — an agent wanting your permission, say |
+| `!` | a progress message failed |
+
+The selected session's note is spelt out under the list —
+`Claude Code · Claude needs your permission · 2m` — and a notification stays
+until you next open its session. `[picker] notes = "column"` puts the notes in
+the rows instead, after the names; `"off"` shows none.
+
+To know, nvmux leaves a watcher in each session — one augroup, `nvmux_notes` —
+that records Neovim's progress messages and the notifications programs in
+terminal buffers send: OSC 777 (Ghostty's), OSC 9 (iTerm2's) and OSC 99
+(kitty's). It stays when nvmux leaves, so a session that wanted you overnight
+says so in the morning; `"off"` takes it out again.
+
+> [!NOTE]
+> A program only sends a notification to a terminal it thinks will show it.
+> Claude Code goes by `TERM_PROGRAM`, which a session on this machine inherits
+> from your terminal and a session on a remote host does not. There, or in a
+> terminal Claude Code sends nothing to — Windows Terminal, WezTerm — set its
+> Notifications setting (`/config`) to "Ghostty (OSC 777)".
+
 ## How it works
 
 nvmux is a **thin multiplexer**: each session is drawn by a client of its own,
@@ -172,6 +201,9 @@ ui          = "nvmux" # who draws a session: nvmux's own client, animated; or "n
 per_session = true    # keep each session's client; a switch back reuses it
 lazy        = true    # start a client on its first visit; false starts all at launch
 predict     = true    # over a slow link, scrolls show before Neovim answers
+
+[picker]
+notes = "signs"   # what a session reports beside its name: "signs", "column" or "off"
 
 [effects]
 enabled = true   # master switch: false turns every effect below off

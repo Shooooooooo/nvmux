@@ -38,7 +38,8 @@ use serde::Deserialize;
 use crate::error::ConfigError;
 
 /// The whole configuration. Each field is a table of its own, so the file reads
-/// as `[keys]`-style sections — `[effects]` with a table inside it for each
+/// as `[keys]`-style sections — `[picker]` for what the picker shows beside the
+/// names, and `[effects]` with a table inside it for each
 /// effect: `[effects.fade]`, `[effects.move]`, `[effects.cursor]`,
 /// `[effects.back]`, `[effects.attach]`, `[effects.kill]`,
 /// `[effects.filter]` and `[effects.create]` for nvmux's own screens, and
@@ -54,6 +55,7 @@ pub struct Settings {
     pub keys: KeySettings,
     pub session: SessionSettings,
     pub client: ClientSettings,
+    pub picker: PickerSettings,
     pub effects: EffectsSettings,
 }
 
@@ -197,6 +199,60 @@ pub enum Ui {
     /// `nvmux --client`: nvmux's own, animated (see [`crate::client`]).
     #[default]
     Nvmux,
+}
+
+/// The picker's own: what it shows beside the names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PickerSettings {
+    /// What a session has to report, beside its name (see [`crate::notes`]):
+    /// that something in it is busy — a progress message is running, the way
+    /// a plugin says an agent is working — or has failed, and the desktop
+    /// notifications the programs in its terminal buffers send, an agent
+    /// asking for permission among them.
+    ///
+    /// `"signs"`, the default, puts one dim sign in a column right of the
+    /// list — a spinner while busy, a gauge where the progress says how far
+    /// it is, `∗` for a notification, `!` for a failure — and the selected
+    /// session's note in full under the list. `"column"` puts each note in
+    /// the row itself, after the name: the list widens to fit them, so the
+    /// names move over when the first one comes. `"off"` shows none.
+    ///
+    /// What it costs, and so the reason to turn it off: to know, nvmux leaves
+    /// a watcher in each session it lists or opens — one augroup,
+    /// `nvmux_notes`, of two autocommands — and the watcher stays when nvmux
+    /// leaves, recording, so that a session that wanted you overnight says so
+    /// in the morning. Nothing else in the session changes. `"off"` takes it
+    /// out of each session the picker next lists. While the picker is up it
+    /// reads every session every two seconds, a round trip each — over the
+    /// link, for a remote one, which is given an ssh forward of its own for
+    /// it.
+    pub notes: Notes,
+}
+
+/// `[picker] notes`: how a session's note is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Notes {
+    /// A sign right of the row, and the selected session's note under the
+    /// list.
+    #[default]
+    Signs,
+    /// The note in the row, after the name.
+    Column,
+    /// None, and no watcher in any session.
+    Off,
+}
+
+impl Notes {
+    /// The value as the file spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Notes::Signs => "signs",
+            Notes::Column => "column",
+            Notes::Off => "off",
+        }
+    }
 }
 
 /// The animated effects: a master switch over them all, and a table of its own
@@ -913,6 +969,7 @@ fn render_default_config(prefix: u8) -> String {
     let k = KeySettings::default();
     let s = SessionSettings::default();
     let c = ClientSettings::default();
+    let p = PickerSettings::default();
     let e = EffectsSettings::default();
     let f = e.fade;
     format!(
@@ -953,6 +1010,15 @@ fn render_default_config(prefix: u8) -> String {
          # colours, if tree-sitter gives them, until Neovim's own arrive. false\n\
          # waits for Neovim.\n\
          # predict = {predict}\n\
+         \n\
+         [picker]\n\
+         # What a session reports beside its name: busy, failed, or a\n\
+         # notification from a program in it, such as an agent asking for\n\
+         # permission. \"signs\" puts a sign right of the row and the selected\n\
+         # session's note under the list; \"column\" puts the note in the row;\n\
+         # \"off\" shows none. To know, nvmux leaves a watcher in each session,\n\
+         # which stays when nvmux leaves; \"off\" takes it out again.\n\
+         # notes = {notes:?}\n\
          \n\
          [effects]\n\
          # The master switch: false turns every effect below off, whatever its\n\
@@ -1033,6 +1099,7 @@ fn render_default_config(prefix: u8) -> String {
         per_session = c.per_session,
         lazy = c.lazy,
         predict = c.predict,
+        notes = p.notes.name(),
         fade_enabled = f.enabled,
         fade_duration = f.duration_ms,
         fade_session = f.session,
@@ -1138,6 +1205,7 @@ mod tests {
             "[keys]",
             "[session]",
             "[client]",
+            "[picker]",
             "[effects]",
             "[effects.smear]",
             "[effects.particles]",
@@ -1162,6 +1230,8 @@ mod tests {
             per_session = true\n\
             lazy = true\n\
             predict = true\n\
+            [picker]\n\
+            notes = \"signs\"\n\
             [effects]\n\
             enabled = true\n\
             [effects.fade]\n\
@@ -1360,6 +1430,24 @@ mod tests {
         assert!(s.client.per_session && s.client.lazy, "the rest as it was");
     }
 
+    /// Signs unless told otherwise; the column and off are a line away, and
+    /// each is spelt the way the file spells it.
+    #[test]
+    fn a_sessions_note_is_a_sign_unless_told() {
+        assert_eq!(Settings::default().picker.notes, Notes::Signs);
+        for (spelt, notes) in [
+            ("signs", Notes::Signs),
+            ("column", Notes::Column),
+            ("off", Notes::Off),
+        ] {
+            let s: Settings =
+                toml::from_str(&format!("[picker]\nnotes = \"{spelt}\"\n")).expect("valid");
+            assert_eq!(s.picker.notes, notes);
+            assert_eq!(notes.name(), spelt);
+            assert_eq!(s.client, ClientSettings::default(), "the rest as it was");
+        }
+    }
+
     /// On and off as Neovide's are: the scroll and the windows on, the
     /// particles and the smooth blink off — but for the cursor's travel, off
     /// unless turned on.
@@ -1420,6 +1508,11 @@ mod tests {
             ("an unknown session key", "[session]\ncmd = \"nvim\"\n"),
             ("an unknown fade key", "[effects.fade]\nduration = 40\n"),
             ("an unknown client key", "[client]\nkeep = true\n"),
+            ("an unknown picker key", "[picker]\nnote = \"off\"\n"),
+            (
+                "an unparseable notes value",
+                "[picker]\nnotes = \"bubbles\"\n",
+            ),
             ("an unknown effect", "[effects.sparkles]\nenabled = true\n"),
             (
                 "an unknown cursor key",

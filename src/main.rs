@@ -10,6 +10,11 @@ use nvmux::{
     ui,
 };
 
+/// How long the way out of nvmux waits for the session being left to have
+/// what it reported cleared: long enough for a round trip to a session over
+/// ssh, short enough that a detach is still at once.
+const SEEN_ON_THE_WAY_OUT: std::time::Duration = std::time::Duration::from_millis(300);
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -142,6 +147,10 @@ fn establish_settings() -> Result<config::Settings> {
 /// With `[client] lazy = false` the pool starts out holding a client for every
 /// session, started before the picker is drawn (see [`start_every_client`]),
 /// so a first visit takes one out of it as a switch back does.
+///
+/// Each session put in front is given the watcher its notes come from, and
+/// what it kept is cleared, and again as it leaves: it has been looked at (see
+/// [`nvmux::notes`]).
 fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     let mut attached: Option<pty::Attachment> = None;
     // Empty, and handing every client straight back, unless clients are kept
@@ -159,6 +168,14 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     // place of another session's says where the user has landed, as a fresh
     // client does.
     let mut shown: Option<String> = None;
+    // The session the user was looking at until the picker came up over it:
+    // what it was keeping to report is no news to them, so the picker clears
+    // it before it first reads it (see `nvmux::notes`).
+    let mut looked_at: Option<String> = None;
+    // Whether the sessions are told anything about notes at all: `[picker]
+    // notes = "off"` leaves them alone, but for the picker taking the watcher
+    // out of each.
+    let noting = config::get().picker.notes != config::Notes::Off;
 
     loop {
         // `<prefix> c` moves this to the session it just created. A client held
@@ -170,11 +187,13 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
         // picker for the session to take down (see `nvmux::handoff`). Whoever
         // ends the attach first takes it down: the relay, the attaching
         // screen, or one of the ways out below that never reach either.
+        let seen = looked_at.take();
         let (mut current, mut listing, mut hand_off) = match ui::run(
             transport,
             message.take(),
             focus.as_deref(),
             attached.is_some() || focus.as_deref().is_some_and(|id| pool.holds(id)),
+            seen.as_deref(),
         )? {
             ui::Outcome::Quit => {
                 // A client held across `<prefix> Space` is retired explicitly; its
@@ -323,6 +342,15 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             from_picker = false;
             shown = Some(current.id.clone());
 
+            // The session is about to be looked at: its watcher put in if it
+            // has none yet, so it records from now on, and what it kept
+            // cleared. On a thread, so the session is in front at once (see
+            // `nvmux::notes::touch`).
+            let sock = attachment.sock().to_path_buf();
+            if noting {
+                nvmux::notes::later(sock.clone(), nvmux::notes::touch);
+            }
+
             // The relay, with the chance to start the next client while this
             // session is still dissolving: `begin_next` fires on a `<prefix>`
             // switch, before the fade, and what it leaves in `begun` is waited
@@ -369,6 +397,22 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 };
                 pty::relay(attachment, highest, &mut begin_next)?
             };
+            // Whatever the session reported while it was in front was seen: it
+            // is cleared on the way out — by the picker, if that is where the
+            // user goes, before it reads it; otherwise on a thread, or, on the
+            // way out of nvmux, waited for a moment so it gets said at all.
+            match &ended.0 {
+                pty::Outcome::ToPicker => looked_at = Some(current.id.clone()),
+                pty::Outcome::Detached | pty::Outcome::StdinClosed if noting => {
+                    nvmux::notes::seen_within(sock, SEEN_ON_THE_WAY_OUT);
+                }
+                pty::Outcome::CreateNew | pty::Outcome::ShowHelp | pty::Outcome::Switch(_)
+                    if noting =>
+                {
+                    nvmux::notes::later(sock, nvmux::notes::seen);
+                }
+                _ => {}
+            }
             match ended {
                 (pty::Outcome::ToPicker, held) => {
                     attached = pool.set_aside(held);

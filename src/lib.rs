@@ -8,8 +8,10 @@
 //! `<prefix>` prefix ([`keys`]), however the terminal spells it ([`keyseq`]) —
 //! plus a row along the bottom naming what the next key does while that prefix
 //! waits ([`hint`]), on a change of session a brief notice saying which one you
-//! landed in ([`announce`]), and a way back into the session you were in when
-//! the link to its host drops ([`reconnect`]).
+//! landed in ([`announce`]), a way back into the session you were in when the
+//! link to its host drops ([`reconnect`]), and what each session has to report
+//! beside its name in the picker — busy, failed, or a notification — from a
+//! watcher left in it ([`notes`]).
 //!
 //! macOS and Linux only.
 
@@ -34,6 +36,7 @@ pub mod launch;
 pub mod ledger;
 pub mod logging;
 pub mod nested;
+pub mod notes;
 pub mod nvim;
 pub mod palette;
 pub mod paths;

@@ -6,6 +6,7 @@
 //! a terminal, a transport, or a running Neovim.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::time::Duration;
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -14,8 +15,11 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 use super::backspace::Backspace;
 use super::effects;
 use super::landing::Landing;
+use super::note;
 use super::starfield::{self, Starfield};
 use super::swap::Swap;
+use crate::config::Notes as NoteStyle;
+use crate::notes::Note;
 use crate::session::Session;
 
 /// What the picker is currently doing.
@@ -153,6 +157,17 @@ pub struct App {
     /// That gap, from `c` until the prompt is back down. See
     /// [`App::make_room`].
     room: Option<Room>,
+    /// How a session's note is shown: `[picker] notes`, read once when the
+    /// picker opens, like the effects. See [`super::note`].
+    note_style: NoteStyle,
+    /// What each session last said it had to report, by id (see
+    /// [`crate::notes`]): replaced whole by each round of reads, which is the
+    /// truth about them all.
+    notes: HashMap<String, Note>,
+    /// How long the spinner beside a busy session has been turning, which is
+    /// all that says which of its frames is up. Moved on whether or not one is
+    /// on screen: a spinner that comes up starts wherever this has got to.
+    spin: Duration,
 }
 
 /// The id of the row standing in the gap [`App::make_room`] opens: no session's,
@@ -285,7 +300,57 @@ impl App {
             back: crate::config::get().effects.back_enabled(),
             create: crate::config::get().effects.create_enabled(),
             room: None,
+            note_style: crate::config::get().picker.notes,
+            notes: HashMap::new(),
+            spin: Duration::ZERO,
         }
+    }
+
+    /// What every session has to report, as the latest round of reads found
+    /// it (see [`crate::notes::Poller`]). A session missing from it has
+    /// nothing to say.
+    pub fn set_notes(&mut self, notes: HashMap<String, Note>) {
+        self.notes = notes;
+    }
+
+    /// How a session's note is shown: `[picker] notes`.
+    pub fn note_style(&self) -> NoteStyle {
+        self.note_style
+    }
+
+    /// For the renderer's tests, which draw each way without a config.
+    #[cfg(test)]
+    pub(super) fn set_note_style(&mut self, style: NoteStyle) {
+        self.note_style = style;
+    }
+
+    /// The note session `id` has to show, if it has one and notes are shown
+    /// at all.
+    pub fn note(&self, id: &str) -> Option<&Note> {
+        if self.note_style == NoteStyle::Off {
+            return None;
+        }
+        self.notes.get(id)
+    }
+
+    /// Which frame of the spinner is up, round and round: [`note::sign`] and
+    /// [`note::column`] take it modulo their frames.
+    pub fn spin_frame(&self) -> usize {
+        (self.spin.as_millis() / note::SPIN.as_millis()) as usize
+    }
+
+    /// Whether a spinner is on screen, beside a busy session that has not
+    /// said how far it is: the caller then draws at the spinner's pace, a
+    /// frame every [`note::SPIN`], rather than waiting on the keyboard. Not
+    /// [`App::animating`], which asks for a frame every sixtieth of a second
+    /// and for the terminal to keep up with each, for something that moves
+    /// once in five of those.
+    pub fn spinning(&self) -> bool {
+        self.rows()
+            .iter()
+            .filter(|r| !r.ghost)
+            .filter_map(|r| self.note(&r.session.id))
+            .any(note::turns)
     }
 
     /// Replace the session list, keeping the selection on the same session where
@@ -373,7 +438,10 @@ impl App {
     ///
     /// The clock is the caller's, as it is for a half-typed number: `App`
     /// stays free of it, and a test can step it by exactly the time it wants.
+    ///
+    /// The spinner beside a busy session moves on too, on screen or not.
     pub fn tick(&mut self, elapsed: Duration) {
+        self.spin = self.spin.saturating_add(elapsed);
         if self.trailing() {
             self.after.advance(elapsed, starfield::TRAIL);
             self.before.advance(elapsed, starfield::TRAIL);
