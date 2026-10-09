@@ -119,19 +119,15 @@ pub struct App {
     /// it traded places with: stepping aside, letting its bar go, sparks off
     /// the seam. See [`super::swap`].
     swap: Swap,
-    /// Whether the cursor lights the rows it moves between — the afterglow on
-    /// the row it leaves, the glint across the one it lands on:
+    /// Whether the row the cursor leaves glows as it lets the bar go:
     /// `[effects.cursor] enabled`, under `[effects] enabled`. Read once when
     /// the picker opens, like `trail`.
     lights: bool,
     /// The row the cursor has just left, while it is still glowing. One at a
-    /// time, like the glint: the next move takes the glow off it and puts it on
-    /// the row that move left, so a held key never smears a tail of rows. See
+    /// time: the next move takes the glow off it and puts it on the row that
+    /// move left, so a held key never smears a tail of rows. See
     /// [`App::glow`].
     glow: Option<Glow>,
-    /// The row the cursor last landed on, while the glint crosses it. One at
-    /// a time: the next move takes it to the next row. See [`App::glint`].
-    glint: Option<Glow>,
     /// Whether a filter keystroke's dropped rows fade out (`[effects.filter]
     /// enabled`).
     sift: bool,
@@ -191,7 +187,7 @@ struct Room {
     age: Duration,
 }
 
-/// A row the cursor has left or landed on, and how long ago.
+/// A row the cursor has left, and how long ago.
 #[derive(Debug, Clone)]
 struct Glow {
     id: String,
@@ -291,7 +287,6 @@ impl App {
             swap: Swap::seeded(),
             lights: crate::config::get().effects.cursor_enabled(),
             glow: None,
-            glint: None,
             sift: crate::config::get().effects.filter_enabled(),
             leaving: None,
             kill: crate::config::get().effects.kill_enabled(),
@@ -364,7 +359,6 @@ impl App {
         self.backspace = None;
         self.strike = None;
         self.glow = None;
-        self.glint = None;
         self.leaving = None;
         self.landing = None;
         self.swap.clear();
@@ -452,12 +446,6 @@ impl App {
                 self.glow = None;
             }
         }
-        if let Some(glint) = &mut self.glint {
-            glint.age += elapsed;
-            if glint.age >= effects::GLINT {
-                self.glint = None;
-            }
-        }
         if let Some(leaving) = &mut self.leaving {
             leaving.age += elapsed;
             if leaving.age >= effects::SIFT {
@@ -492,7 +480,7 @@ impl App {
 
     /// Whether anything on screen is moving, and so whether the caller should
     /// draw at a frame's pace rather than wait on the keyboard: a trail, rows
-    /// trading places, a glow, a glint, a fading row, a line being struck or
+    /// trading places, a glow, a fading row, a line being struck or
     /// drawn back, a row being erased, or a row coming up in a gap made for a
     /// new session. A line all the way across is still, and asks for nothing
     /// while the `[y/N]` waits; so is the mark on the session `Esc` goes back
@@ -501,7 +489,6 @@ impl App {
     pub fn animating(&self) -> bool {
         self.trailing()
             || self.glow.is_some()
-            || self.glint.is_some()
             || self.leaving.is_some()
             || self.striking()
             || self.erasing()
@@ -537,15 +524,6 @@ impl App {
     pub fn glow(&self) -> Option<(&str, f32)> {
         let length = effects::AFTERGLOW.as_secs_f32();
         self.glow
-            .as_ref()
-            .map(|g| (g.id.as_str(), g.age.as_secs_f32() / length))
-    }
-
-    /// The row the cursor has just landed on, by session id, with how far the
-    /// glint is across it, `0..1`, or `None` once it has crossed.
-    pub fn glint(&self) -> Option<(&str, f32)> {
-        let length = effects::GLINT.as_secs_f32();
-        self.glint
             .as_ref()
             .map(|g| (g.id.as_str(), g.age.as_secs_f32() / length))
     }
@@ -606,7 +584,7 @@ impl App {
     /// new. So the screen says, before the prompt asks anything, where the
     /// session will be and what it will be called.
     ///
-    /// Whatever else was passing — a glow, a glint, a fading row, a line
+    /// Whatever else was passing — a glow, a fading row, a line
     /// being drawn back off a name a `[y/N]` was declined for — ends here:
     /// the picker is on its way out, and the gap is all that should be moving.
     /// The gap stays until [`App::close_room`] or a fresh listing, so the
@@ -620,7 +598,6 @@ impl App {
         let mut ghost = Session::new(GHOST_ID.to_string(), name.to_string(), 0, num);
         ghost.state.num = num;
         self.glow = None;
-        self.glint = None;
         self.leaving = None;
         self.strike = None;
         self.swap.clear();
@@ -711,8 +688,7 @@ impl App {
         self.trail = on;
     }
 
-    /// Turn the picker's own effects — the afterglow and the glint, the
-    /// filter's fade, the kill's strike and backspace, the mark on the session
+    /// Turn the picker's own effects — the afterglow, the filter's fade, the kill's strike and backspace, the mark on the session
     /// come back from — on or off whatever the config says, for a test that
     /// needs one or the other.
     #[cfg(test)]
@@ -724,7 +700,6 @@ impl App {
         self.create = on;
         if !on {
             self.glow = None;
-            self.glint = None;
             self.leaving = None;
             self.strike = None;
             self.backspace = None;
@@ -1133,21 +1108,13 @@ impl App {
             .flatten()
     }
 
-    /// If the cursor has moved off the session `was`, start that row glowing,
-    /// and a glint across the row it moved onto. Whatever row was glowing
-    /// before stops: only the row just left glows.
+    /// If the cursor has moved off the session `was`, start that row glowing.
+    /// Whatever row was glowing before stops: only the row just left glows.
     fn glow_from(&mut self, was: Option<String>) {
         if !self.lights {
             return;
         }
-        let now = self.cursor();
-        // A session picked up or a `[y/N]` takes the bar over, and the glint
-        // goes with it rather than carrying on across the question, or coming
-        // back half done once it is answered.
-        if now.is_none() {
-            self.glint = None;
-        }
-        let (Some(was), Some(now)) = (was, now) else {
+        let (Some(was), Some(now)) = (was, self.cursor()) else {
             return;
         };
         // A row the filter just took is leaving, not glowing.
@@ -1156,10 +1123,6 @@ impl App {
         }
         self.glow = Some(Glow {
             id: was,
-            age: Duration::ZERO,
-        });
-        self.glint = Some(Glow {
-            id: now,
             age: Duration::ZERO,
         });
     }
@@ -3463,9 +3426,9 @@ mod tests {
     fn making_room_ends_what_else_was_passing() {
         let mut a = app(&["aaa", "bbb", "ccc"]);
         a.on_key(Key::Char('j'));
-        assert!(a.glow().is_some() && a.glint().is_some());
+        assert!(a.glow().is_some());
         assert!(a.make_room("session 4"));
-        assert!(a.glow().is_none() && a.glint().is_none());
+        assert!(a.glow().is_none());
 
         let mut a = app(&["aaa", "bbb"]);
         a.on_key(Key::Char('x'));

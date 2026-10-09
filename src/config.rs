@@ -299,10 +299,9 @@ impl EffectsSettings {
         self.enabled && self.moving.enabled
     }
 
-    /// Whether the cursor lights the rows it moves between — the row it leaves
-    /// glows, and a glint crosses the one it lands on: its own switch and the
-    /// master one. Whether they are drawn in colour or with a modifier is the
-    /// terminal's say after this (see [`crate::ui::effects`]).
+    /// Whether the row the cursor leaves glows as it lets the bar go: its own
+    /// switch and the master one. Whether it is drawn in colour or with a
+    /// modifier is the terminal's say after this (see [`crate::ui::effects`]).
     pub fn cursor_enabled(&self) -> bool {
         self.enabled && self.cursor.enabled
     }
@@ -530,27 +529,25 @@ pub struct MoveSettings {
     pub enabled: bool,
 }
 
-/// The rows the cursor moves between: the one it leaves fading from the
-/// selection's reversed bar back to a plain row, and the one it lands on
-/// crossed by a glint (see [`crate::ui::effects`]). One switch for both,
-/// being the two ends of the one move.
+/// The row the cursor leaves, fading from the selection's reversed bar back
+/// to a plain row (see [`crate::ui::effects`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CursorSettings {
     /// This effect's own switch, under `[effects] enabled`.
     ///
-    /// Both are in colour, so they want what the fade wants: the terminal's
-    /// answer to the colour query, and no `NO_COLOR`. Without them the fade
-    /// back falls back to the bar standing a moment longer, reversed and dim,
-    /// before it goes, and the glint to an underline running under the bar —
-    /// modifiers, like the rest of the picker. How long each lasts is
-    /// [`crate::ui::effects::AFTERGLOW`] and [`crate::ui::effects::GLINT`].
+    /// It is in colour, so it wants what the fade wants: the terminal's
+    /// answer to the colour query, and no `NO_COLOR`. Without them it falls
+    /// back to the bar standing a moment longer, reversed and dim, before it
+    /// goes — a modifier, like the rest of the picker. How long it lasts is
+    /// [`crate::ui::effects::AFTERGLOW`].
     pub enabled: bool,
 }
 
-/// Coming back to the picker from a session with `<prefix> Space`: a dot in a
-/// gutter left of that session's row, for as long as the picker is up, so it
-/// is plain which one `Esc` returns to (see [`crate::ui::draw`]).
+/// Coming back to the picker from a session with `<prefix> Space`: a hollow
+/// `▹` in that session's row, in the column the cursor's `▸` is drawn in, for
+/// as long as the picker is up, so it is plain which one `Esc` returns to (see
+/// [`crate::ui::draw`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BackSettings {
@@ -1039,13 +1036,12 @@ fn render_default_config(prefix: u8) -> String {
          # enabled = {move_enabled}\n\
          \n\
          [effects.cursor]\n\
-         # The row the cursor leaves fades back from the selection's bar,\n\
-         # and a glint crosses the row it lands on.\n\
+         # The row the cursor leaves fades back from the selection's bar.\n\
          # enabled = {cursor_enabled}\n\
          \n\
          [effects.back]\n\
-         # Back in the picker from a session, a mark beside its row says\n\
-         # it is the one Esc returns to.\n\
+         # Back in the picker from a session, a hollow triangle on its row,\n\
+         # where the cursor's is drawn, says it is the one Esc returns to.\n\
          # enabled = {back_enabled}\n\
          \n\
          [effects.attach]\n\

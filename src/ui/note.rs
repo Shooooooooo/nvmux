@@ -10,9 +10,8 @@
 //! the back mark are (see [`super::draw`]): a terminal that draws a glyph two
 //! wide where `unicode-width` says one shifts the rest of the row. The
 //! spinner and the gauge are braille, as the attaching screen's spinner and
-//! the picker's trails are. `∗` is the asterisk operator, U+2217, from the
-//! same block as the back mark's bullet operator and narrow for the same
-//! reason; `!` is plain ASCII.
+//! the picker's trails are. `∗` is the asterisk operator, U+2217, which is
+//! neither emoji nor of ambiguous width; `!` is plain ASCII.
 
 use std::time::Duration;
 
