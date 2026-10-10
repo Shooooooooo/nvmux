@@ -356,7 +356,7 @@ impl Shadow {
             }
         }
         if let Some((over, ot)) = over.filter(|_| !self.broken) {
-            self.paint_under(&mut out, over, palette, ot, &dissolve);
+            self.paint_under(&mut out, over, palette, palette.fg, ot, &dissolve);
         }
         out.extend_from_slice(RESET_SGR);
         // Inside the same synchronized update as the cells, so the screen and
@@ -494,11 +494,18 @@ impl Shadow {
     /// was told — resolve to blanks, so a rectangle that hangs off the edge
     /// paints spaces rather than nothing.
     pub fn under(&self, over: &Over, palette: &Palette, t: f32) -> Vec<u8> {
+        self.under_in(over, palette, palette.fg, t)
+    }
+
+    /// [`Shadow::under`], with the overlay's own glyphs setting out from `ink`
+    /// rather than from the terminal's text colour: the attach notice, in the
+    /// colour a `[theme]` gives the selection (see [`crate::theme`]).
+    pub fn under_in(&self, over: &Over, palette: &Palette, ink: Rgb, t: f32) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(SYNC_BEGIN);
         out.extend_from_slice(SAVE_CURSOR);
         if !self.broken {
-            self.paint_under(&mut out, over, palette, t, &|_| 1.0 - t);
+            self.paint_under(&mut out, over, palette, ink, t, &|_| 1.0 - t);
         }
         out.extend_from_slice(RESET_SGR);
         out.extend_from_slice(RESTORE_CURSOR);
@@ -508,14 +515,16 @@ impl Shadow {
 
     /// The cells themselves, inside the envelope [`Shadow::under`] wrote.
     ///
-    /// `beneath` is how far the session's cells under it are dissolved, row by
-    /// row: the overlay's opposite everywhere, for the notice; the frame's own
-    /// shape, for a frame with an overlay over it.
+    /// `ink` is the colour the overlay's glyphs set out from, `t` of the way
+    /// to the background. `beneath` is how far the session's cells under it
+    /// are dissolved, row by row: the overlay's opposite everywhere, for the
+    /// notice; the frame's own shape, for a frame with an overlay over it.
     fn paint_under(
         &self,
         out: &mut Vec<u8>,
         over: &Over,
         palette: &Palette,
+        ink: Rgb,
         t: f32,
         beneath: &dyn Fn(u16) -> f32,
     ) {
@@ -524,7 +533,7 @@ impl Shadow {
         // session's cells once they are not.
         let overlaid = t < CROSSOVER;
         let ink = Painted {
-            fg: palette.fg.lerp(palette.bg, t),
+            fg: ink.lerp(palette.bg, t),
             bg: None,
             bold: false,
             dim: false,
@@ -991,6 +1000,40 @@ mod tests {
         // Past the crossover it is the screen, rising back out of it.
         assert_eq!(ink(0.75), "0;38;2;150;150;150");
         assert_eq!(ink(1.0), "0;38;2;200;200;200");
+    }
+
+    /// The overlay can set out from an ink of its own — the notice in a
+    /// theme's selection colour — and dissolves from it to the same
+    /// background, while the screen under it is the screen's whatever the
+    /// ink. `under` is the composite inked in the terminal's own text colour.
+    #[test]
+    fn an_overlay_can_set_out_from_its_own_ink() {
+        let shadow = under();
+        let p = palette();
+        let ink = Rgb(0, 100, 200);
+        let first = |bytes: Vec<u8>| {
+            painted_cells(&bytes)
+                .first()
+                .map(|(_, sgr, _)| sgr.clone())
+                .expect("a cell")
+        };
+        assert_eq!(
+            first(shadow.under_in(&over(), &p, ink, 0.0)),
+            "0;38;2;0;100;200"
+        );
+        assert_eq!(
+            first(shadow.under_in(&over(), &p, ink, 0.25)),
+            "0;38;2;0;75;150"
+        );
+        assert_eq!(
+            shadow.under_in(&over(), &p, ink, 1.0),
+            shadow.under(&over(), &p, 1.0),
+            "fully dissolved, only the screen is left"
+        );
+        assert_eq!(
+            shadow.under(&over(), &p, 0.3),
+            shadow.under_in(&over(), &p, p.fg, 0.3)
+        );
     }
 
     /// The name the picker hands off rides the session's own fade-in frames:

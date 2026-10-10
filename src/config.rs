@@ -36,10 +36,12 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::error::ConfigError;
+use crate::theme::Theme;
 
 /// The whole configuration. Each field is a table of its own, so the file reads
 /// as `[keys]`-style sections — `[picker]` for what the picker shows beside the
-/// names, and `[effects]` with a table inside it for each
+/// names, `[theme]` for what colours nvmux's own screens are drawn in (see
+/// [`crate::theme`]), and `[effects]` with a table inside it for each
 /// effect: `[effects.fade]`, `[effects.move]`, `[effects.cursor]`,
 /// `[effects.back]`, `[effects.attach]`, `[effects.kill]`,
 /// `[effects.filter]` and `[effects.create]` for nvmux's own screens, and
@@ -56,6 +58,7 @@ pub struct Settings {
     pub session: SessionSettings,
     pub client: ClientSettings,
     pub picker: PickerSettings,
+    pub theme: Theme,
     pub effects: EffectsSettings,
 }
 
@@ -967,6 +970,7 @@ fn render_default_config(prefix: u8) -> String {
     let s = SessionSettings::default();
     let c = ClientSettings::default();
     let p = PickerSettings::default();
+    let t = Theme::default();
     let e = EffectsSettings::default();
     let f = e.fade;
     format!(
@@ -1016,6 +1020,23 @@ fn render_default_config(prefix: u8) -> String {
          # \"off\" shows none. To know, nvmux leaves a watcher in each session,\n\
          # which stays when nvmux leaves; \"off\" takes it out again.\n\
          # notes = {notes:?}\n\
+         \n\
+         [theme]\n\
+         # The colours of nvmux's own screens, a role at a time: select is the\n\
+         # selected row's bar, every cursor and the notice a switch puts up;\n\
+         # muted is the hint rows, the numbers and the prompt's labels, in place\n\
+         # of dim; match is the letters a filter matched; busy, notify and fail\n\
+         # are a session's signs, and fail is whatever went wrong as well. Each\n\
+         # is \"default\", the role as nvmux draws it with no colour; one of the\n\
+         # terminal's own — black, red, green, yellow, blue, magenta, cyan or\n\
+         # white, or \"bright-\" and one of them — in whatever shade the terminal\n\
+         # gives it; or \"#rrggbb\". NO_COLOR turns them all off.\n\
+         # select = {select:?}\n\
+         # muted  = {muted:?}\n\
+         # match  = {matched:?}\n\
+         # busy   = {busy:?}\n\
+         # notify = {notify:?}\n\
+         # fail   = {fail:?}\n\
          \n\
          [effects]\n\
          # The master switch: false turns every effect below off, whatever its\n\
@@ -1096,6 +1117,12 @@ fn render_default_config(prefix: u8) -> String {
         lazy = c.lazy,
         predict = c.predict,
         notes = p.notes.name(),
+        select = t.select.name(),
+        muted = t.muted.name(),
+        matched = t.matched.name(),
+        busy = t.busy.name(),
+        notify = t.notify.name(),
+        fail = t.fail.name(),
         fade_enabled = f.enabled,
         fade_duration = f.duration_ms,
         fade_session = f.session,
@@ -1202,6 +1229,7 @@ mod tests {
             "[session]",
             "[client]",
             "[picker]",
+            "[theme]",
             "[effects]",
             "[effects.smear]",
             "[effects.particles]",
@@ -1228,6 +1256,13 @@ mod tests {
             predict = true\n\
             [picker]\n\
             notes = \"signs\"\n\
+            [theme]\n\
+            select = \"default\"\n\
+            muted = \"default\"\n\
+            match = \"default\"\n\
+            busy = \"default\"\n\
+            notify = \"default\"\n\
+            fail = \"default\"\n\
             [effects]\n\
             enabled = true\n\
             [effects.fade]\n\
@@ -1444,6 +1479,59 @@ mod tests {
         }
     }
 
+    /// No colour unless asked for, and each role read as its own key — `match`
+    /// included, which is a keyword to the code and only a word to the file.
+    #[test]
+    fn the_screens_have_no_colour_unless_told() {
+        use crate::palette::Rgb;
+        use crate::theme::Colour;
+
+        assert_eq!(Settings::default().theme, Theme::default());
+        let s: Settings = toml::from_str(
+            "[theme]\n\
+             select = \"blue\"\n\
+             muted = \"bright-black\"\n\
+             match = \"#E0AF68\"\n\
+             busy = \"yellow\"\n\
+             notify = \"magenta\"\n\
+             fail = \"red\"\n",
+        )
+        .expect("valid");
+        assert_eq!(
+            s.theme,
+            Theme {
+                select: Colour::Ansi(4),
+                muted: Colour::Ansi(8),
+                matched: Colour::Rgb(Rgb(0xe0, 0xaf, 0x68)),
+                busy: Colour::Ansi(3),
+                notify: Colour::Ansi(5),
+                fail: Colour::Ansi(1),
+            }
+        );
+        assert_eq!(s.picker, PickerSettings::default(), "the rest as it was");
+
+        // One role alone leaves the others at no colour.
+        let s: Settings = toml::from_str("[theme]\nselect = \"blue\"\n").expect("valid");
+        assert_eq!(
+            s.theme,
+            Theme {
+                select: Colour::Ansi(4),
+                ..Theme::default()
+            }
+        );
+    }
+
+    /// A colour that does not parse is refused on the line it is on, so the
+    /// error says which role it was for.
+    #[test]
+    fn a_bad_colour_is_refused_with_its_key() {
+        let err =
+            toml::from_str::<Settings>("[theme]\nselect = \"blu\"\n").expect_err("not a colour");
+        let text = err.to_string();
+        assert!(text.contains("select"), "{text}");
+        assert!(text.contains("\"blu\""), "{text}");
+    }
+
     /// On and off as Neovide's are: the scroll and the windows on, the
     /// particles and the smooth blink off — but for the cursor's travel, off
     /// unless turned on.
@@ -1571,6 +1659,12 @@ mod tests {
                 "[effects.windows]\nenable = true\n",
             ),
             ("an unknown blink key", "[effects.blink]\nsmooth = true\n"),
+            ("an unknown theme key", "[theme]\nselected = \"blue\"\n"),
+            ("the code's name for match", "[theme]\nmatched = \"blue\"\n"),
+            ("a colour nobody names", "[theme]\nselect = \"blu\"\n"),
+            ("a short hex colour", "[theme]\nselect = \"#fff\"\n"),
+            ("a colour by number", "[theme]\nselect = 4\n"),
+            ("a theme outside [theme]", "[colors]\nselect = \"blue\"\n"),
         ] {
             assert!(
                 toml::from_str::<Settings>(doc).is_err(),
@@ -1669,6 +1763,7 @@ mod tests {
         );
         assert!(rendered.contains("\n[client]\n"), "{rendered:?}");
         for table in [
+            "[theme]",
             "[effects]",
             "[effects.fade]",
             "[effects.move]",
@@ -1708,6 +1803,12 @@ mod tests {
             "# duration_ms = 200",
             "# session     = true",
             "# mode    = \"railgun\"",
+            "# select = \"default\"",
+            "# muted  = \"default\"",
+            "# match  = \"default\"",
+            "# busy   = \"default\"",
+            "# notify = \"default\"",
+            "# fail   = \"default\"",
         ] {
             assert!(
                 rendered.contains(line),

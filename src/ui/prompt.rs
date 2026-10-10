@@ -56,8 +56,11 @@
 //!
 //! # Three weights, and what each one means
 //!
-//! Nothing on this screen sets a colour; every distinction is a modifier, for the
-//! reasons [`super::draw`] gives. There are three:
+//! Nothing on this screen sets a colour of its own; every distinction is a
+//! modifier, for the reasons [`super::draw`] gives, and a `[theme]` colours
+//! the same distinctions and no others (see [`crate::theme`]) — muted in place
+//! of dim, the cursor and the menu's selected row in the selection's colour,
+//! a name the prompt turns down in the fail colour. There are three:
 //!
 //! * **dim** — text that is not deciding anything: every field's label, a
 //!   default nobody has touched, the hint row, and the half of a path a `//` has
@@ -149,7 +152,7 @@
 //! answered from memory.
 
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
@@ -162,6 +165,7 @@ use crate::error::Result;
 use crate::launch::Launch;
 use crate::session::Session;
 use crate::state;
+use crate::theme::Theme;
 use crate::transport::Transport;
 
 /// What the prompt returned.
@@ -216,13 +220,6 @@ const MENU_ROWS: u16 = 6;
 /// picker's, so the two lists read the same way.
 const MARKER: &str = "▸ ";
 const INDENT: &str = "  ";
-
-/// The cursor: plain REVERSED, not the picker's REVERSED|BOLD — that pairing
-/// means "the selected row", and a one-cell cursor wants the crisper form.
-const CURSOR: Style = Style::new().add_modifier(Modifier::REVERSED);
-
-/// Text that is not deciding anything — see the module docs on weights.
-const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 
 /// What enter asked for.
 #[derive(Debug, PartialEq, Eq)]
@@ -356,6 +353,8 @@ struct Prompt {
     /// to complete — a rename — and otherwise always present, empty or not,
     /// because the rows it occupies are reserved either way.
     menu: Option<Menu>,
+    /// What colours the prompt is drawn in: `[theme]`, read as it opens.
+    theme: Theme,
 }
 
 /// The dropdown: the directories the working directory field could become, and
@@ -431,6 +430,7 @@ impl Prompt {
             focus: NAME,
             message: None,
             menu: Some(Menu::default()),
+            theme: crate::theme::current(),
         }
     }
 
@@ -445,6 +445,7 @@ impl Prompt {
             focus: NAME,
             message: None,
             menu: None,
+            theme: crate::theme::current(),
         }
     }
 
@@ -1129,9 +1130,8 @@ fn default_command(transport: &dyn Transport) -> String {
 }
 
 fn draw(frame: &mut Frame, prompt: &Prompt) {
-    draw::screen(frame, prompt.hints(), true, |frame, body| {
-        draw_body(frame, prompt, body)
-    });
+    let hints = Span::styled(prompt.hints(), prompt.theme.muted());
+    draw::screen(frame, hints, |frame, body| draw_body(frame, prompt, body));
 }
 
 /// Where the form is drawn within the body `area`: centred as it reads the
@@ -1182,7 +1182,7 @@ fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
             break;
         }
         frame.render_widget(
-            Paragraph::new(field_line(field, prompt.focus == i, width)),
+            Paragraph::new(field_line(field, prompt.focus == i, width, &prompt.theme)),
             Rect {
                 x: anchor.x,
                 y,
@@ -1197,11 +1197,15 @@ fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
     // Routinely wider than the fields, so it gets the full width and its own
     // centring rather than hanging off the anchor. Drawn before the menu because
     // it belongs to the form: a rejected create must not be what a tall menu
-    // pushes off the screen.
+    // pushes off the screen. It is always something turned down, so it is in
+    // the fail colour, if there is one.
     if let Some(msg) = prompt.message.as_deref() {
         frame.render_widget(
-            Paragraph::new(Line::from(draw::truncate(msg, area.width as usize)))
-                .alignment(Alignment::Center),
+            Paragraph::new(Line::from(Span::styled(
+                draw::truncate(msg, area.width as usize),
+                prompt.theme.error(),
+            )))
+            .alignment(Alignment::Center),
             Rect {
                 y,
                 height: 1,
@@ -1226,7 +1230,7 @@ fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
             width: width.saturating_sub(indent as usize) as u16,
             height: MENU_ROWS.min((area.y + area.height).saturating_sub(y)),
         };
-        draw_menu(frame, menu, block);
+        draw_menu(frame, menu, block, &prompt.theme);
     }
 }
 
@@ -1235,8 +1239,9 @@ fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
 /// `REVERSED | BOLD` is already what "the selected row in a list" means in the
 /// picker, and it is deliberately not the field cursor's plain `REVERSED` — two
 /// reversed things on one screen have to be told apart, and this is how the rest
-/// of nvmux tells them apart.
-fn draw_menu(frame: &mut Frame, menu: &Menu, area: Rect) {
+/// of nvmux tells them apart. Both are the selection's colour, in a theme: the
+/// bold is what tells them apart there too.
+fn draw_menu(frame: &mut Frame, menu: &Menu, area: Rect, theme: &Theme) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -1245,7 +1250,7 @@ fn draw_menu(frame: &mut Frame, menu: &Menu, area: Rect) {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 draw::truncate(&menu.message, area.width as usize),
-                DIM,
+                theme.muted(),
             ))),
             Rect { height: 1, ..area },
         );
@@ -1262,11 +1267,7 @@ fn draw_menu(frame: &mut Frame, menu: &Menu, area: Rect) {
         .take(height)
         .map(|(i, name)| {
             let selected = i == menu.selected;
-            let style = if selected {
-                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-            } else {
-                DIM
-            };
+            let style = if selected { theme.bar() } else { theme.muted() };
             let text = draw::truncate(
                 &format!("{}{name}", if selected { MARKER } else { INDENT }),
                 area.width as usize,
@@ -1283,7 +1284,7 @@ fn draw_menu(frame: &mut Frame, menu: &Menu, area: Rect) {
         lines.pop();
         lines.push(Line::from(Span::styled(
             draw::truncate(&format!("{INDENT}(and more)"), area.width as usize),
-            DIM,
+            theme.muted(),
         )));
     }
 
@@ -1293,7 +1294,7 @@ fn draw_menu(frame: &mut Frame, menu: &Menu, area: Rect) {
 /// One field's whole line: dim label, then either what was typed or the dim
 /// default. Derived from state rather than tracked, so backspacing to nothing
 /// brings the placeholder back with nothing to keep in sync.
-fn field_line(field: &Field, focused: bool, width: usize) -> Line<'static> {
+fn field_line(field: &Field, focused: bool, width: usize, theme: &Theme) -> Line<'static> {
     // The cursor is the only feedback that typing is doing anything, so it gets
     // a column before the label does — a long rename label on a narrow terminal
     // would otherwise fill the line and push it off the right edge.
@@ -1303,7 +1304,7 @@ fn field_line(field: &Field, focused: bool, width: usize) -> Line<'static> {
     // every one of them says the same thing on every prompt. What changes — what
     // you typed, what enter would take — leads by being the only text at full
     // weight.
-    let mut spans = vec![Span::styled(label, DIM)];
+    let mut spans = vec![Span::styled(label, theme.muted())];
 
     // How much of the line no longer counts, in characters. Everything a `//`
     // discarded is drawn dim, which is the whole of what dim means here — an
@@ -1315,15 +1316,18 @@ fn field_line(field: &Field, focused: bool, width: usize) -> Line<'static> {
         // sits in exactly the columns a typed value will.
         (true, true) => match split_first(&field.default) {
             Some((first, rest)) => {
-                spans.push(Span::styled(first, CURSOR));
-                spans.push(Span::styled(draw::truncate(rest, room), DIM));
+                spans.push(Span::styled(first, theme.reversed()));
+                spans.push(Span::styled(draw::truncate(rest, room), theme.muted()));
             }
-            None => spans.push(Span::styled(" ", CURSOR)),
+            None => spans.push(Span::styled(" ", theme.reversed())),
         },
         // Nothing typed and not where the keystrokes are going: no cursor, or
         // there would be two on screen and no telling which is live.
-        (true, false) => spans.push(Span::styled(draw::truncate(&field.default, room), DIM)),
-        (false, true) => spans.extend(windowed(field, room, inert)),
+        (true, false) => spans.push(Span::styled(
+            draw::truncate(&field.default, room),
+            theme.muted(),
+        )),
+        (false, true) => spans.extend(windowed(field, room, inert, theme)),
         (false, false) => {
             // Unfocused, so no cursor to keep in view: the line is simply cut to
             // fit, but the dim half still has to read as dim.
@@ -1335,7 +1339,7 @@ fn field_line(field: &Field, focused: bool, width: usize) -> Line<'static> {
                 text.chars().skip(cut).collect(),
             );
             if !before.is_empty() {
-                spans.push(Span::styled(before, DIM));
+                spans.push(Span::styled(before, theme.muted()));
             }
             if !after.is_empty() {
                 spans.push(Span::raw(after));
@@ -1394,15 +1398,15 @@ fn around_cursor(field: &Field, max: usize) -> (usize, usize, usize) {
 /// cursor, and whether it sits in the half of the line a `//` has discarded. So
 /// the cells are walked and runs sharing a style are coalesced, rather than the
 /// line being cut into a fixed set of pieces that could not express both.
-fn windowed(field: &Field, max: usize, inert: usize) -> Vec<Span<'static>> {
+fn windowed(field: &Field, max: usize, inert: usize, theme: &Theme) -> Vec<Span<'static>> {
     let cells: Vec<char> = field.input.chars().chain([' ']).collect();
     let (start, at, end) = around_cursor(field, max);
 
     let style = |i: usize| match (i == at, i < inert) {
         // The cursor keeps its own weight wherever it lands, dim half included:
         // there is only one of it and it has to be findable.
-        (true, _) => CURSOR,
-        (false, true) => DIM,
+        (true, _) => theme.reversed(),
+        (false, true) => theme.muted(),
         (false, false) => Style::default(),
     };
 
@@ -1427,6 +1431,7 @@ fn windowed(field: &Field, max: usize, inert: usize) -> Vec<Span<'static>> {
 mod tests {
     use super::super::test_support;
     use super::*;
+    use ratatui::style::{Color, Modifier};
 
     const COMMAND_DEFAULT: &str = "nvim --headless --listen {sock}";
     const DIRECTORY_DEFAULT: &str = "~/";
@@ -3008,6 +3013,92 @@ mod tests {
         // strongest — reversed and bold, which are modifiers, not colours.
         let offering = menuing("/home/you/pro", &["projects", "prototypes"]);
         test_support::assert_no_colour(60, 9, |f| draw(f, &offering));
+    }
+
+    /// In a theme each weight takes its role's colour: the labels and the
+    /// untouched default muted in place of dim, the cursor reversed in the
+    /// selection's colour and still not bold, the menu's highlight the
+    /// picker's bar and its other rows muted, and a create the prompt turned
+    /// down said in the fail colour. Nothing is a background, and there is
+    /// still exactly one cursor.
+    #[test]
+    fn a_theme_colours_each_weight_by_its_role() {
+        let t = crate::test_support::theme();
+        let (w, h) = (60, 9);
+        type Painted = (String, Color, Modifier);
+        let rows = |p: &Prompt| -> Vec<Vec<Painted>> {
+            let buf = test_support::buffer(w, h, |f| draw(f, p));
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| {
+                            let c = &buf[(x, y)];
+                            (c.symbol().to_string(), c.fg, c.modifier)
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        let row_with = |rows: &[Vec<Painted>], text: &str| -> Vec<Painted> {
+            rows.iter()
+                .find(|r| {
+                    r.iter()
+                        .map(|(s, ..)| s.as_str())
+                        .collect::<String>()
+                        .contains(text)
+                })
+                .unwrap_or_else(|| panic!("{text:?} is not on screen"))
+                .clone()
+        };
+
+        let mut p = prompt();
+        p.theme = t;
+        let name = row_with(&rows(&p), "new session name:");
+        let first = name.iter().position(|(s, ..)| s != " ").expect("drawn");
+        let label = "new session name:  ".width();
+        let line = &name[first..];
+        assert!(line[..label]
+            .iter()
+            .all(|(_, fg, m)| Some(*fg) == t.muted.to_color() && m.is_empty()));
+        assert_eq!(
+            (line[label].1, line[label].2),
+            (t.select.to_color().expect("set"), Modifier::REVERSED),
+            "the cursor: reversed and not bold, in the selection's colour"
+        );
+        assert!(line[label + 1.."session 3".len() + label]
+            .iter()
+            .all(|(_, fg, m)| Some(*fg) == t.muted.to_color() && m.is_empty()));
+        let cursors = rows(&p)
+            .iter()
+            .flatten()
+            .filter(|(.., m)| m.contains(Modifier::REVERSED))
+            .count();
+        assert_eq!(cursors, 1);
+        test_support::assert_no_background(w, h, |f| draw(f, &p));
+
+        let mut offering = menuing("/home/you/pro", &["projects", "prototypes"]);
+        offering.theme = t;
+        let screen = rows(&offering);
+        let highlighted = row_with(&screen, "projects");
+        assert!(highlighted
+            .iter()
+            .filter(|(.., m)| m.contains(Modifier::REVERSED))
+            .all(|(_, fg, m)| Some(*fg) == t.select.to_color() && m.contains(Modifier::BOLD)));
+        let other = row_with(&screen, "prototypes");
+        assert!(other
+            .iter()
+            .filter(|(s, ..)| s != " ")
+            .all(|(_, fg, _)| Some(*fg) == t.muted.to_color()));
+        test_support::assert_no_background(w, h, |f| draw(f, &offering));
+
+        let mut refused = prompt();
+        refused.theme = t;
+        refused.fail("nope".to_string(), Some("session 3".to_string()));
+        let said = row_with(&rows(&refused), "nope");
+        assert!(said
+            .iter()
+            .filter(|(s, ..)| s != " ")
+            .all(|(_, fg, _)| Some(*fg) == t.fail.to_color()));
     }
 
     // --- out of the gap the picker makes -------------------------------------

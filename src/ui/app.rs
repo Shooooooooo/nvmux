@@ -21,6 +21,7 @@ use super::swap::Swap;
 use crate::config::Notes as NoteStyle;
 use crate::notes::Note;
 use crate::session::Session;
+use crate::theme::Theme;
 
 /// What the picker is currently doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +157,9 @@ pub struct App {
     /// How a session's note is shown: `[picker] notes`, read once when the
     /// picker opens, like the effects. See [`super::note`].
     note_style: NoteStyle,
+    /// What colours the picker is drawn in: `[theme]`, read once when it
+    /// opens, like the notes. See [`crate::theme`].
+    theme: Theme,
     /// What each session last said it had to report, by id (see
     /// [`crate::notes`]): replaced whole by each round of reads, which is the
     /// truth about them all.
@@ -296,6 +300,7 @@ impl App {
             create: crate::config::get().effects.create_enabled(),
             room: None,
             note_style: crate::config::get().picker.notes,
+            theme: crate::theme::current(),
             notes: HashMap::new(),
             spin: Duration::ZERO,
         }
@@ -317,6 +322,17 @@ impl App {
     #[cfg(test)]
     pub(super) fn set_note_style(&mut self, style: NoteStyle) {
         self.note_style = style;
+    }
+
+    /// What colours the picker is drawn in: `[theme]`.
+    pub fn theme(&self) -> Theme {
+        self.theme
+    }
+
+    /// For the renderer's tests, which draw in a theme without a config.
+    #[cfg(test)]
+    pub(super) fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
     }
 
     /// The note session `id` has to show, if it has one and notes are shown

@@ -21,7 +21,7 @@
 //! `?` and `Ctrl-c` close it. Nothing typed on this screen is ever forwarded.
 
 use ratatui::layout::Rect;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
@@ -30,6 +30,7 @@ use super::app::Key;
 use super::draw;
 use crate::error::Result;
 use crate::keys;
+use crate::theme::Theme;
 
 /// Key then action, the picker's hint grammar. `q`, `Enter`, `?` and `Ctrl-c`
 /// also close, unadvertised.
@@ -105,11 +106,12 @@ pub fn run() -> Result<()> {
 pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> Result<()> {
     let label = keys::prefix_label(crate::config::get().keys.prefix);
     let rows = rows(&label);
+    let theme = crate::theme::current();
     if animate {
-        crate::fade::fade_in(terminal, |f| draw(f, &rows))?;
+        crate::fade::fade_in(terminal, |f| draw(f, &rows, &theme))?;
     }
     loop {
-        terminal.draw(|f| draw(f, &rows))?;
+        terminal.draw(|f| draw(f, &rows, &theme))?;
 
         let Some(key) = super::poll_key()? else {
             continue;
@@ -119,17 +121,19 @@ pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> 
             // Dissolve out, so the resumed session takes over from the
             // background rather than from the key list.
             if animate {
-                crate::fade::fade_out(terminal, |f| draw(f, &rows))?;
+                crate::fade::fade_out(terminal, |f| draw(f, &rows, &theme))?;
             }
             return Ok(());
         }
     }
 }
 
-fn draw(frame: &mut Frame, rows: &[Row]) {
-    draw::screen(frame, HINTS, true, |frame, body| {
-        draw_table(frame, rows, body)
-    });
+/// The table, and the way out under it, muted like every hint row. The
+/// table itself is plain, keys and what they do alike, in a theme or not:
+/// nothing on it is more or less than the rest.
+fn draw(frame: &mut Frame, rows: &[Row], theme: &Theme) {
+    let hints = Span::styled(HINTS, theme.muted());
+    draw::screen(frame, hints, |frame, body| draw_table(frame, rows, body));
 }
 
 /// One left-aligned block, centred on both axes.
@@ -176,7 +180,7 @@ mod tests {
 
     fn render(w: u16, h: u16) -> Vec<String> {
         let rows = rows(PREFIX_LABEL);
-        test_support::render(w, h, |f| draw(f, &rows))
+        test_support::render(w, h, |f| draw(f, &rows, &Theme::default()))
     }
 
     /// The line a row was drawn on. Matched on the *start* of the line rather
@@ -393,7 +397,7 @@ mod tests {
     #[test]
     fn the_hint_row_is_dim_and_the_table_is_not() {
         let rows = rows(PREFIX_LABEL);
-        let buf = test_support::buffer(WIDE, 11, |f| draw(f, &rows));
+        let buf = test_support::buffer(WIDE, 11, |f| draw(f, &rows, &Theme::default()));
         let last = buf.area.height - 1;
         for x in 0..buf.area.width {
             let cell = &buf[(x, last)];
@@ -448,6 +452,30 @@ mod tests {
     #[test]
     fn nothing_sets_a_colour() {
         let rows = rows(PREFIX_LABEL);
-        test_support::assert_no_colour(WIDE, 11, |f| draw(f, &rows));
+        test_support::assert_no_colour(WIDE, 11, |f| draw(f, &rows, &Theme::default()));
+    }
+
+    /// In a theme the way out is muted like every hint row, and the table
+    /// stays plain: nothing on it is more or less than the rest.
+    #[test]
+    fn a_theme_mutes_the_hint_row_and_leaves_the_table_plain() {
+        let t = crate::test_support::theme();
+        let rows = rows(PREFIX_LABEL);
+        let buf = test_support::buffer(WIDE, 11, |f| draw(f, &rows, &t));
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                if cell.symbol() == " " {
+                    continue;
+                }
+                let want = if y == buf.area.height - 1 {
+                    t.muted.to_color().expect("set")
+                } else {
+                    ratatui::style::Color::Reset
+                };
+                assert_eq!(cell.fg, want, "({x},{y})");
+            }
+        }
+        test_support::assert_no_background(WIDE, 11, |f| draw(f, &rows, &t));
     }
 }

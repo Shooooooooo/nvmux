@@ -134,9 +134,12 @@ fn draw(frame: &mut Frame, state: &State) {
     } else {
         "⏎ keep   esc skip"
     };
-    draw::screen(frame, hint, true, |frame, body| {
-        draw_body(frame, state, body)
-    });
+    // Dim, and never in a theme's muted: this is the first-run screen, so
+    // there is no `[theme]` yet, and it draws before the settings are read —
+    // asking for them here would fix them at the defaults, the prefix about to
+    // be chosen included (see `crate::theme::current`).
+    let hint = Span::styled(hint, Style::default().add_modifier(Modifier::DIM));
+    draw::screen(frame, hint, |frame, body| draw_body(frame, state, body));
 }
 
 fn draw_body(frame: &mut Frame, state: &State, area: Rect) {

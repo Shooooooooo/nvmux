@@ -75,14 +75,17 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::layout::Rect;
+use ratatui::text::Span;
 use ratatui::Frame;
 
 use super::app::Key;
 use super::draw;
 use crate::error::Result;
 use crate::handoff::HandOff;
+use crate::notes::Kind;
 use crate::pty::{Answer, Probe};
 use crate::rpc;
+use crate::theme::Theme;
 
 /// How long an attach may take before the screen appears — and, with it,
 /// before a single key is read. The one threshold this screen has; see the
@@ -132,6 +135,8 @@ impl Verdict {
 struct State {
     name: String,
     elapsed: Duration,
+    /// What colours it is drawn in: `[theme]`, read as it opens.
+    theme: Theme,
 }
 
 /// Wait for `probe` on a screen of its own, and say how it ended.
@@ -205,6 +210,7 @@ fn run_on(
     let mut state = State {
         name: name.to_string(),
         elapsed: Duration::ZERO,
+        theme: crate::theme::current(),
     };
     // Whether the queue has been drained, which happens once, at `GRACE`.
     let mut listening = false;
@@ -361,21 +367,23 @@ fn next_key() -> Result<Option<Key>> {
 /// The screen: the spinner and what it is waiting on where the picker draws
 /// its list, the way out on the last row. Nothing at all before [`GRACE`].
 ///
-/// Both rows are dim, like every hint row: a status and an offer, neither of
-/// them something the user is being asked to answer.
+/// Both rows are muted, like every hint row: a status and an offer, neither
+/// of them something the user is being asked to answer.
 fn draw(frame: &mut Frame, state: &State) {
     if state.elapsed < GRACE {
         return;
     }
-    draw::screen(frame, CANCEL, true, |frame, body| {
-        draw_status(frame, state, body)
-    });
+    let cancel = Span::styled(CANCEL, state.theme.muted());
+    draw::screen(frame, cancel, |frame, body| draw_status(frame, state, body));
 }
 
 /// The status line, drawn the way the empty picker draws "no sessions": one
-/// dim sentence centred on both axes, truncated from the right rather than
+/// muted sentence centred on both axes, truncated from the right rather than
 /// wrapped, so the hint row stays where it is — a hint row by another name,
 /// and drawn through the same function.
+///
+/// The spinner is the one a busy session has beside it in the picker (see
+/// [`super::note`]), and in a theme it is in that session's colour too.
 ///
 /// A terminal with no room above the hint row gets no status: the way out is
 /// worth more than the name of what it gets out of.
@@ -383,11 +391,15 @@ fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
     if area.height == 0 {
         return;
     }
+    let text = status(state);
+    let (spinner, rest) = text.split_at(text.chars().next().map_or(0, char::len_utf8));
     draw::draw_hint_row(
         frame,
         draw::centre_vertically(area, 1),
-        &status(state),
-        true,
+        vec![
+            Span::styled(spinner.to_string(), state.theme.note(Kind::Busy(None))),
+            Span::styled(rest.to_string(), state.theme.muted()),
+        ],
     );
 }
 
@@ -412,6 +424,7 @@ mod tests {
         State {
             name: name.into(),
             elapsed,
+            theme: Theme::default(),
         }
     }
 
@@ -666,5 +679,36 @@ mod tests {
             }
         }
         assert!(seen > 0, "both rows were blank");
+    }
+
+    /// In a theme the spinner is a busy session's colour — it is the same
+    /// spinner — and the rest of both rows muted's, in place of dim.
+    #[test]
+    fn a_theme_gives_the_spinner_the_busy_colour() {
+        let t = crate::test_support::theme();
+        let mut state = at(GRACE, "dotfiles");
+        state.theme = t;
+        let buf = test_support::buffer(40, 4, |f| draw(f, &state));
+        let y = status_row(4) as u16;
+        let shown: Vec<_> = (0..40)
+            .map(|x| &buf[(x, y)])
+            .filter(|c| c.symbol() != " ")
+            .collect();
+        let (spinner, rest) = shown.split_first().expect("a status");
+        assert!(GLYPHS.contains(&spinner.symbol().chars().next().expect("a glyph")));
+        assert_eq!(Some(spinner.fg), t.busy.to_color());
+        let hint: Vec<_> = (0..40)
+            .map(|x| &buf[(x, 3)])
+            .filter(|c| c.symbol() != " ")
+            .collect();
+        for cell in rest.iter().chain(&hint) {
+            assert_eq!(Some(cell.fg), t.muted.to_color(), "{:?}", cell.symbol());
+            assert!(
+                !cell.modifier.contains(Modifier::DIM),
+                "{:?}",
+                cell.symbol()
+            );
+        }
+        test_support::assert_no_background(40, 4, |f| draw(f, &state));
     }
 }

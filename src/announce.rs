@@ -115,6 +115,7 @@ use crate::fade::{self, Direction, Dissolve, Schedule};
 use crate::palette::Rgb;
 use crate::pty::PtySize;
 use crate::shadow::{Over, Shadow};
+use crate::theme::Theme;
 use crate::ui::draw::truncate;
 
 /// How long to wait for a gap between the session's sequences before giving up
@@ -265,6 +266,10 @@ pub struct Popup {
     label: String,
     /// How the box dissolves, or `None` when it does not.
     dissolve: Option<Dissolve>,
+    /// What colour the box is drawn in: the selection's, in a `[theme]` that
+    /// gives it one, and otherwise none at all — the terminal's own text
+    /// colour, as every nvmux screen is drawn in without a theme.
+    theme: Theme,
     /// When to stop waiting for a moment to draw in that is not coming.
     give_up_at: Instant,
     /// Set when the box is first painted: everything that happens to it after.
@@ -282,7 +287,13 @@ impl Popup {
     /// to once [`label`] has been through it. The relay then carries no state at
     /// all rather than a popup that would decline to draw itself later.
     pub fn arm(label: Option<String>, now: Instant) -> Option<Self> {
-        Self::armed(label, now, fade::dissolve())
+        Self::armed(label, now, fade::dissolve()).map(|p| p.themed(crate::theme::current()))
+    }
+
+    /// The box in `theme`'s selection colour, rather than in the terminal's
+    /// own text colour.
+    fn themed(self, theme: Theme) -> Self {
+        Self { theme, ..self }
     }
 
     /// [`Popup::arm`] with the effect handed in rather than read, which is how
@@ -293,6 +304,7 @@ impl Popup {
         Some(Self {
             label,
             dissolve,
+            theme: Theme::default(),
             give_up_at: now + GIVE_UP,
             life: None,
             painted: false,
@@ -469,7 +481,10 @@ impl Popup {
     /// fully dissolved, which is the background — but it would paint it in
     /// explicit colour, and for the whole second the box is up it should be
     /// drawn in the terminal's own foreground rather than in nvmux's reading
-    /// of it, exactly as every other nvmux screen is.
+    /// of it, exactly as every other nvmux screen is. In a theme that is the
+    /// selection's colour, by the name the file gave it: a `"blue"` box at
+    /// rest is the terminal's own blue, and only a dissolve, which needs it as
+    /// a number, reads it ([`crate::theme`]).
     ///
     /// Without a shadow there is nothing to dissolve into and the box behaves
     /// as it did before this existed: `[effects.fade] session = false` does without
@@ -479,16 +494,25 @@ impl Popup {
     fn draw(&self, over: &Over, under: Option<&Shadow>, t: f32) -> Vec<u8> {
         match (under, self.dissolve) {
             (Some(shadow), Some(d)) if t > 0.0 && shadow.is_usable() => {
-                shadow.under(over, &d.palette, t)
+                shadow.under_in(over, &d.palette, self.ink(&d), t)
             }
-            _ => plain_bytes(over, self.colour(t)),
+            _ => match self.colour(t) {
+                Some(fg) => plain_bytes(over, Some(fg)),
+                None => placed(over, &self.theme.notice_sgr()),
+            },
         }
     }
 
     /// The colour this frame is drawn in — nothing at all without an effect,
     /// and nothing at rest.
     fn colour(&self, t: f32) -> Option<Rgb> {
-        self.dissolve.and_then(|d| d.colour(t))
+        self.dissolve.and_then(|d| d.colour_from(self.ink(&d), t))
+    }
+
+    /// The colour the box dissolves from: the selection's in a theme, as the
+    /// terminal said it draws it, and otherwise the terminal's own text.
+    fn ink(&self, d: &Dissolve) -> Rgb {
+        self.theme.select.rgb(&d.palette).unwrap_or(d.palette.fg)
     }
 }
 
@@ -600,7 +624,7 @@ pub(crate) fn placed(over: &Over, sgr: &str) -> Vec<u8> {
 }
 
 /// The box on its own, drawn in `fg` — or in no colour at all, which is what
-/// the box at rest is.
+/// the box at rest is with no `[theme]`.
 ///
 /// What nvmux drew before it could dissolve, and what it still draws whenever
 /// there is no session screen to dissolve into (see [`Popup::step`]).
@@ -612,7 +636,8 @@ pub(crate) fn placed(over: &Over, sgr: &str) -> Vec<u8> {
 /// dissolve, and only the *foreground* moves — the interior is spaces, and a
 /// space is erased with the current background, which the reset has just put
 /// back to the terminal's own. The same division `fade::apply` makes over a
-/// ratatui buffer.
+/// ratatui buffer. (A theme's box at rest is [`placed`] under the theme's own
+/// SGR instead, which no other caller wants.)
 pub fn plain_bytes(over: &Over, fg: Option<Rgb>) -> Vec<u8> {
     let sgr = match fg {
         Some(Rgb(r, g, b)) => format!("\x1b[0;38;2;{r};{g};{b}m"),
@@ -802,9 +827,10 @@ mod tests {
         }
     }
 
-    /// The picker sets no colour at all so it inherits the terminal's palette;
-    /// a box painted over the editor has even less business choosing one. The
-    /// raw-byte counterpart of `test_support::assert_no_colour`.
+    /// With no `[theme]` the picker sets no colour at all so it inherits the
+    /// terminal's palette; a box painted over the editor has even less business
+    /// choosing one of its own. The raw-byte counterpart of
+    /// `test_support::assert_no_colour`.
     ///
     /// Still true of the box nvmux draws with the fade off, and of every box it
     /// draws at rest — the dissolve is the one thing that colours it, and only
@@ -1048,6 +1074,66 @@ mod tests {
         let t = popup.life.as_ref().expect("a life").t;
         let over = overlay("dotfiles", big()).expect("a box");
         assert_eq!(bytes, plain_bytes(&over, d.colour(t)));
+    }
+
+    /// In a theme the box at rest is the selection's colour by the name the
+    /// file gave it — the terminal's own blue for `"blue"` — on every row's
+    /// reset, and sets no background.
+    #[test]
+    fn a_themed_box_at_rest_is_the_selections_colour() {
+        let t0 = Instant::now();
+        let theme = Theme {
+            select: crate::theme::Colour::Ansi(4),
+            ..Theme::default()
+        };
+        let mut popup = Popup::armed(Some("dotfiles".into()), t0, None)
+            .expect("armed")
+            .themed(theme);
+        let Act::Paint(bytes) = popup.step(t0, quiet(), big(), None) else {
+            panic!("the box did not go up");
+        };
+        let rows = placed(&bytes);
+        assert_eq!(rows.len(), 3);
+        for row in &rows {
+            assert_eq!(row.sgr, "0;38;5;4", "at {:?}", row.at);
+        }
+        let text = String::from_utf8(bytes).expect("utf-8");
+        assert!(!text.contains("48;"), "the box set a background: {text:?}");
+    }
+
+    /// In a theme the box dissolves from the selection's colour, on both of
+    /// its paths: on its own, and over the session's screen.
+    #[test]
+    fn a_themed_box_dissolves_from_the_selections_colour() {
+        let t0 = Instant::now();
+        let d = dissolve();
+        let ink = Rgb(0, 100, 200);
+        let theme = Theme {
+            select: crate::theme::Colour::Rgb(ink),
+            ..Theme::default()
+        };
+        let over = overlay("dotfiles", big()).expect("a box");
+        let armed = || {
+            Popup::armed(Some("dotfiles".into()), t0, Some(d))
+                .expect("armed")
+                .themed(theme)
+        };
+
+        let mut popup = armed();
+        let Act::Paint(bytes) = popup.step(t0, quiet(), big(), None) else {
+            panic!("the box did not go up");
+        };
+        let t = popup.life.as_ref().expect("a life").t;
+        assert!(t > 0.0, "dissolving in");
+        assert_eq!(bytes, plain_bytes(&over, d.colour_from(ink, t)));
+
+        let shadow = screen(24, 80);
+        let mut popup = armed();
+        let Act::Paint(bytes) = popup.step(t0, quiet(), big(), Some(&shadow)) else {
+            panic!("the box did not go up");
+        };
+        let t = popup.life.as_ref().expect("a life").t;
+        assert_eq!(bytes, shadow.under_in(&over, &d.palette, ink, t));
     }
 
     /// The box at rest is drawn plain even with a screen to hand. The

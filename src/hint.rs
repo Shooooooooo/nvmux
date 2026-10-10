@@ -107,7 +107,9 @@ const DIGITS: &str = "1-n session";
 
 /// A reset, then `DIM`. Every nvmux hint row is dim (`draw::draw_hint_row`), and
 /// the reset is what puts the background back, so the modifier rides along on
-/// the same CSI rather than following it.
+/// the same CSI rather than following it. In a `[theme]` with a muted colour,
+/// that colour rides along instead ([`crate::theme::Theme::hint_sgr`]), as it
+/// takes the place of dim on every other hint row.
 const SGR: &str = "\x1b[0;2m";
 
 /// The shortest screen the bar will draw on. Two, so it is never a session's
@@ -252,13 +254,19 @@ pub struct Bar {
     /// read a process global mid-relay would have states no test could reach,
     /// since no palette is ever installed under test.
     palette: Option<Palette>,
+    /// What the row is written under: [`SGR`], or the theme's muted colour in
+    /// place of its dim. Copied once, like the palette.
+    sgr: String,
 }
 
 impl Bar {
     /// A bar with nothing on screen, on a child presumed quiet — which it is,
     /// at the top of a relay, until it says otherwise.
     pub fn new(now: Instant, size: PtySize) -> Self {
-        Self::with_palette(now, size, palette::get().copied())
+        Self {
+            sgr: crate::theme::current().hint_sgr(),
+            ..Self::with_palette(now, size, palette::get().copied())
+        }
     }
 
     /// [`Bar::new`] with the colours handed in rather than read, which is how
@@ -271,6 +279,17 @@ impl Bar {
             agreed: true,
             size: (size.rows, size.cols),
             palette,
+            sgr: SGR.to_string(),
+        }
+    }
+
+    /// The bar written in `theme`'s colours, for the tests, which have no
+    /// config to read a theme from.
+    #[cfg(test)]
+    fn themed(self, theme: &crate::theme::Theme) -> Self {
+        Self {
+            sgr: theme.hint_sgr(),
+            ..self
         }
     }
 
@@ -355,7 +374,7 @@ impl Bar {
         self.agreed = true;
         match self.want.clone() {
             Some(over) => {
-                let bytes = announce::placed(&over, SGR);
+                let bytes = announce::placed(&over, &self.sgr);
                 self.shown = Some(over);
                 Act::Write(bytes)
             }
@@ -700,6 +719,30 @@ mod tests {
         // is discarded by the restore rather than acted on.
         let tail = text.rsplit_once("\x1b8").expect("a restore").1;
         assert_eq!(tail, "\x1b[?2026l", "something follows the row: {tail:?}");
+    }
+
+    /// In a theme with a muted colour the bar is that colour in place of dim,
+    /// on the reset's own CSI — still one row, one CUP, one SGR — and with no
+    /// theme it is the dim bar it always was.
+    #[test]
+    fn in_a_theme_the_bar_is_muted_rather_than_dim() {
+        let size = big();
+        let mut d = Driver::new(size);
+        d.bar = d.bar.themed(&crate::test_support::theme());
+        let Act::Write(bytes) = d.quiet(Some(Pending::Command), size) else {
+            panic!("the bar did not go up");
+        };
+        let text = String::from_utf8(bytes).expect("utf-8");
+        assert!(text.contains("\x1b[0;38;5;8m"), "not muted: {text:?}");
+        assert!(!text.contains(SGR), "dim as well: {text:?}");
+        assert_eq!(text.matches("\x1b[").count(), 4, "{text:?}");
+
+        let mut d = Driver::new(size);
+        let Act::Write(bytes) = d.quiet(Some(Pending::Command), size) else {
+            panic!("the bar did not go up");
+        };
+        let text = String::from_utf8(bytes).expect("utf-8");
+        assert!(text.contains(SGR), "not drawn dim: {text:?}");
     }
 
     /// The bar is not written while the child is talking: the relay parses the

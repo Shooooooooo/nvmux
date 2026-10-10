@@ -12,9 +12,10 @@
 //! buffers it draws itself, so the fade is a post-pass over a finished frame
 //! ([`apply`]): the screen is drawn as usual, then every visible cell's
 //! foreground is moved toward the background before the frame is presented.
-//! `draw::draw` and its siblings never set a colour and keep their tests
-//! saying so; the colour is added afterwards, and at the end of a fade-in the
-//! frame is byte-identical to a plain draw.
+//! `draw::draw` and its siblings set no colour of their own — none at all
+//! with no `[theme]`, and keep their tests saying so; the fade's colour is
+//! added afterwards, from whatever colour each cell was drawn in, and at the
+//! end of a fade-in the frame is byte-identical to a plain draw.
 //!
 //! An attached session is raw Neovim that nvmux only proxies bytes for. Its
 //! cells come from the shadow grid ([`crate::shadow`]) that watched those
@@ -52,6 +53,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::palette::{self, Palette, Rgb};
 use crate::shadow::{Cursor, Over, Shadow};
+use crate::theme;
 
 /// A synchronized update: the terminal presents nothing between these, so a
 /// frame is never seen half-composited. Opening one inside another is
@@ -144,7 +146,13 @@ impl Dissolve {
     /// last frame of a fade in set no colour whatever, so the screen it leaves
     /// behind is byte for byte the one drawn without any fade at all.
     pub fn colour(self, t: f32) -> Option<Rgb> {
-        (t > 0.0).then(|| self.palette.fg.lerp(self.palette.bg, t))
+        self.colour_from(self.palette.fg, t)
+    }
+
+    /// [`Dissolve::colour`] for a glyph drawn in `ink` rather than in the
+    /// terminal's own foreground — one a theme gave a colour.
+    pub fn colour_from(self, ink: Rgb, t: f32) -> Option<Rgb> {
+        (t > 0.0).then(|| ink.lerp(self.palette.bg, t))
     }
 }
 
@@ -301,7 +309,9 @@ impl Schedule {
 /// colourless. At `t == 0` nothing is touched at all — a faded-in frame's
 /// last state is exactly a plain draw. Otherwise every cell that shows
 /// something — a glyph, or a reversed blank, which shows its background —
-/// has its foreground set to the interpolated colour. Backgrounds are left
+/// has its foreground set to the colour `t` of the way from the one it was
+/// drawn in to the background: the terminal's own foreground, unless a theme
+/// gave the cell a colour ([`theme::ink`]). Backgrounds are left
 /// alone: the terminal's own, transparent or not, is what everything is
 /// dissolving into. Modifiers are left alone too. `REVERSED` then paints the
 /// interpolated colour as the cell's background, which is what a selected
@@ -312,9 +322,8 @@ pub fn apply(buf: &mut Buffer, palette: &Palette, t: f32) {
     if t <= 0.0 {
         return;
     }
-    let colour = dissolved(palette, t);
     for cell in &mut buf.content {
-        sink(cell, colour);
+        sink(cell, palette, t);
     }
 }
 
@@ -326,7 +335,8 @@ pub fn apply(buf: &mut Buffer, palette: &Palette, t: f32) {
 /// cell the screen the picker leaves behind draws it as. A kept cell that was
 /// not on a bar is left as it was drawn.
 ///
-/// The bar under the text sinks into the background, and the text is
+/// The bar under the text sinks into the background from its own colour —
+/// the terminal's foreground, or the selection's in a theme — and the text is
 /// whichever end of the two colours stands out from it: the background's, as
 /// on the bar, until the bar is halfway down, and the foreground's after, when
 /// its bold and underline go with it. Fading the text up while the bar fades
@@ -348,7 +358,7 @@ pub fn apply_keeping(buf: &mut Buffer, palette: &Palette, t: f32, keep: Rect) {
         if !kept {
             let row = iris.at(Direction::Out, t, y - area.y);
             if row > 0.0 {
-                sink(cell, dissolved(palette, row));
+                sink(cell, palette, row);
             }
             continue;
         }
@@ -362,6 +372,7 @@ pub fn apply_keeping(buf: &mut Buffer, palette: &Palette, t: f32, keep: Rect) {
             cell.set_bg(Color::Reset);
             continue;
         }
+        let bar = theme::ink(palette, cell.fg).lerp(palette.bg, t);
         cell.modifier.remove(Modifier::REVERSED);
         let text = if t < 0.5 {
             palette.bg
@@ -369,7 +380,6 @@ pub fn apply_keeping(buf: &mut Buffer, palette: &Palette, t: f32, keep: Rect) {
             cell.modifier.remove(Modifier::BOLD | Modifier::UNDERLINED);
             palette.fg
         };
-        let bar = palette.fg.lerp(palette.bg, t);
         cell.set_fg(Color::Rgb(text.0, text.1, text.2));
         cell.set_bg(Color::Rgb(bar.0, bar.1, bar.2));
     }
@@ -389,23 +399,19 @@ pub fn apply_iris(buf: &mut Buffer, palette: &Palette, direction: Direction, t: 
         let y = u16::try_from(i / usize::from(area.width)).unwrap_or(u16::MAX);
         let k = iris.at(direction, t, y);
         if k > 0.0 {
-            sink(cell, dissolved(palette, k));
+            sink(cell, palette, k);
         }
     }
 }
 
-/// The foreground a cell shows `t` of the way into the background.
-fn dissolved(palette: &Palette, t: f32) -> Color {
-    let fg = palette.fg.lerp(palette.bg, t);
-    Color::Rgb(fg.0, fg.1, fg.2)
-}
-
-/// One cell of [`apply`]: its foreground set to `colour`, if it shows
-/// anything — a glyph, or a reversed blank, which shows its background.
-fn sink(cell: &mut ratatui::buffer::Cell, colour: Color) {
+/// One cell of [`apply`]: its foreground moved `t` of the way from the
+/// colour it was drawn in into the background, if it shows anything — a
+/// glyph, or a reversed blank, which shows its background.
+fn sink(cell: &mut ratatui::buffer::Cell, palette: &Palette, t: f32) {
     let shows = !cell.symbol().trim().is_empty() || cell.modifier.contains(Modifier::REVERSED);
     if shows {
-        cell.set_fg(colour);
+        let Rgb(r, g, b) = theme::ink(palette, cell.fg).lerp(palette.bg, t);
+        cell.set_fg(Color::Rgb(r, g, b));
     }
 }
 
@@ -911,6 +917,92 @@ mod tests {
             .collect();
         assert_eq!(name, "dotfiles");
         assert_eq!(buf[(0, 0)].fg, Color::Rgb(0, 0, 0), "the marker is gone");
+    }
+
+    /// In a theme a cell is drawn in a colour of its own, and dissolves from
+    /// that colour — one of the terminal's sixteen through what the terminal
+    /// says it is, an exact one from itself — not from the terminal's text
+    /// colour. Reversed, the colour is the bar's ground, and that sinks from
+    /// its own colour too. At zero, still nothing is touched.
+    #[test]
+    fn a_cell_drawn_in_a_colour_dissolves_from_it() {
+        let p = Palette {
+            ansi: crate::palette::XTERM_ANSI,
+            ..palette()
+        };
+        let mut buf = Buffer::empty(Rect::new(0, 0, 6, 1));
+        buf.set_string(0, 0, "ab", Style::default().fg(Color::Indexed(9)));
+        buf.set_string(2, 0, "cd", Style::default().fg(Color::Rgb(100, 200, 40)));
+        buf.set_string(
+            4,
+            0,
+            "  ",
+            Style::default()
+                .fg(Color::Rgb(0, 100, 200))
+                .add_modifier(Modifier::REVERSED),
+        );
+        let before = buf.clone();
+        apply(&mut buf, &p, 0.0);
+        assert_eq!(buf, before);
+
+        apply(&mut buf, &p, 0.5);
+        let red = crate::palette::XTERM_ANSI[9].lerp(p.bg, 0.5);
+        assert_eq!(buf[(0, 0)].fg, Color::Rgb(red.0, red.1, red.2));
+        assert_eq!(buf[(2, 0)].fg, Color::Rgb(50, 100, 20));
+        assert_eq!(buf[(4, 0)].fg, Color::Rgb(0, 50, 100));
+        assert!(buf[(4, 0)].modifier.contains(Modifier::REVERSED));
+
+        let mut buf = before.clone();
+        apply(&mut buf, &p, 1.0);
+        for x in 0..6 {
+            assert_eq!(buf[(x, 0)].fg, Color::Rgb(0, 0, 0), "{x} is gone");
+        }
+    }
+
+    /// A bar a theme gave a colour sinks from that colour as its name comes
+    /// off it, and still ends as plain text in the terminal's own colours —
+    /// the name the hand-off then writes, which knows nothing of themes.
+    #[test]
+    fn a_coloured_bar_sinks_from_its_colour_and_still_ends_plain() {
+        let (mut buf, keep) = a_bar();
+        for x in 0..16 {
+            if buf[(x, 0)].modifier.contains(Modifier::REVERSED) {
+                buf[(x, 0)].set_fg(Color::Rgb(0, 100, 200));
+            }
+        }
+        let coloured = buf.clone();
+
+        apply_keeping(&mut buf, &palette(), 0.5, keep);
+        let name = &buf[(5, 0)];
+        assert_eq!(
+            name.bg,
+            Color::Rgb(0, 50, 100),
+            "the bar, half down from its colour"
+        );
+        assert_eq!(name.fg, Color::Rgb(200, 200, 200), "the text, past halfway");
+
+        let mut buf = coloured;
+        apply_keeping(&mut buf, &palette(), 1.0, keep);
+        for x in keep.x..keep.right() {
+            let cell = &buf[(x, 0)];
+            assert_eq!((cell.fg, cell.bg), (Color::Reset, Color::Reset), "{cell:?}");
+            assert!(cell.modifier.is_empty(), "{cell:?}");
+        }
+    }
+
+    /// The notice's colour, given a colour to set out from: the same zero
+    /// rule, and the same background at the end.
+    #[test]
+    fn a_dissolve_can_set_out_from_a_colour() {
+        let d = Dissolve {
+            one_way: Duration::from_millis(100),
+            palette: palette(),
+        };
+        let ink = Rgb(0, 100, 200);
+        assert_eq!(d.colour_from(ink, 0.0), None);
+        assert_eq!(d.colour_from(ink, 0.5), Some(Rgb(0, 50, 100)));
+        assert_eq!(d.colour_from(ink, 1.0), Some(d.palette.bg));
+        assert_eq!(d.colour(0.5), d.colour_from(d.palette.fg, 0.5));
     }
 
     /// Three plain rows, `abc` on each, for the iris without a hand-off.

@@ -3,11 +3,20 @@
 //!
 //! # Colour
 //!
-//! Nothing here sets a foreground or background colour. Every distinction is
-//! carried by a *modifier* — reversed and bold for the selection, dim for the
-//! hint line and the row numbers — which means the picker uses the terminal's
-//! own palette, inherits its background, and is `NO_COLOR`-correct by
-//! construction rather than by remembering to check a flag at each call site.
+//! Nothing here sets a colour of its own. Every distinction is carried by a
+//! *modifier* — reversed and bold for the selection, dim for the hint line and
+//! the row numbers, underlined for what a filter matched — which means that
+//! with no `[theme]` the picker uses the terminal's own palette, inherits its
+//! background, and is `NO_COLOR`-correct by construction rather than by
+//! remembering to check a flag at each call site.
+//!
+//! A theme colours those same roles and nothing else. Each style here is
+//! asked of [`Theme`] by its role — the bar, muted, a match, a note — rather
+//! than written down, so with every role at its default they are exactly the
+//! modifiers above, and the tests that say nothing here sets a colour still
+//! say so. No role is ever a background. And `NO_COLOR` is still answered in
+//! one place, before any of this runs: under it [`crate::theme::current`] is
+//! no theme at all.
 //!
 //! This matters more than it looks. crossterm's own `NO_COLOR` handling turns
 //! `SetForegroundColor(c)` into a bare `ESC[m`, which is a *full SGR reset*: it
@@ -30,6 +39,7 @@ use super::note;
 use super::starfield;
 use super::swap::Dot;
 use crate::config::Notes as NoteStyle;
+use crate::theme::Theme;
 
 /// The marker on the selected row. Unselected rows are indented to match, so
 /// names stay in one column and nothing shifts as the selection moves.
@@ -150,18 +160,18 @@ const EMPTY: &str = "no sessions — press c to create one";
 const REORDER_HINTS: &str = "↑↓ move  ⏎ place  esc cancel";
 
 pub fn draw(frame: &mut Frame, app: &App) {
-    let (text, dim) = hint_line(app);
-    screen(frame, &text, dim, |frame, body| draw_list(frame, app, body));
+    screen(frame, hint_line(app), |frame, body| {
+        draw_list(frame, app, body)
+    });
 }
 
 /// Every full-screen view is the same shape: a body, then one hint row on the
 /// last line — and nothing at all on a frame with no rows, since there is no
 /// last line to take off it. One function so the zero-size guard and the split
 /// cannot be separated at a call site.
-pub(super) fn screen(
+pub(super) fn screen<'a>(
     frame: &mut Frame,
-    hint: &str,
-    dim: bool,
+    hint: impl Into<Line<'a>>,
     body: impl FnOnce(&mut Frame, Rect),
 ) {
     let area = frame.area();
@@ -170,7 +180,7 @@ pub(super) fn screen(
     }
     let (top, bottom) = split_hint_row(area);
     body(frame, top);
-    draw_hint_row(frame, bottom, hint, dim);
+    draw_hint_row(frame, bottom, hint);
 }
 
 /// The layout every screen shares: the body above, one hint row on the last
@@ -190,21 +200,18 @@ pub(super) fn split_hint_row(area: Rect) -> (Rect, Rect) {
 
 /// The one-row line at the bottom of every screen: centred, truncated rather
 /// than wrapped (the row owns exactly one line, and wrapping would push the
-/// body up and make the layout jump), dim when it is a hint rather than
-/// something the user is being told.
+/// body up and make the layout jump), muted when it is a hint rather than
+/// something the user is being told. Its spans bring their own styles —
+/// [`Theme::muted`] for a hint, and whatever else for what is not one — so
+/// the row is one function whatever is on it.
 ///
 /// Two lines that are not hint rows are drawn through it as well, being the
-/// same kind of thing — one dim sentence, centred, cut to fit: the empty
+/// same kind of thing — one muted sentence, centred, cut to fit: the empty
 /// picker's "no sessions", and the attaching screen's status. Each stands in
 /// for a list that is not there, on the row [`centre_vertically`] picks.
-pub(super) fn draw_hint_row(frame: &mut Frame, area: Rect, text: &str, dim: bool) {
-    let text = truncate(text, area.width as usize);
-    let style = if dim {
-        Style::default().add_modifier(Modifier::DIM)
-    } else {
-        Style::default()
-    };
-    let para = Paragraph::new(Line::from(Span::styled(text, style))).alignment(Alignment::Center);
+pub(super) fn draw_hint_row<'a>(frame: &mut Frame, area: Rect, hint: impl Into<Line<'a>>) {
+    let line = truncate_line(hint.into(), area.width as usize);
+    let para = Paragraph::new(line).alignment(Alignment::Center);
     frame.render_widget(para, area);
 }
 
@@ -214,11 +221,16 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     }
     // The rows a filter keystroke just dropped are drawn too, where they stood,
     // for as long as they fade (see `effects`). Drawn plain: the fade is the
-    // post-pass's, so this function still sets no colour.
+    // post-pass's, so this function still sets no colour of its own.
     let rows = app.rows();
 
+    let theme = app.theme();
     if rows.is_empty() {
-        draw_hint_row(frame, centre_vertically(area, 1), EMPTY, true);
+        draw_hint_row(
+            frame,
+            centre_vertically(area, 1),
+            Span::styled(EMPTY, theme.muted()),
+        );
         return;
     }
 
@@ -262,35 +274,35 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
             if backspace.is_some_and(|(id, _)| id == row.session.id) {
                 return Line::default();
             }
-            // A session not made yet, standing in the gap made for it: dim
+            // A session not made yet, standing in the gap made for it: muted
             // from end to end, as a suggestion is on the prompt it is about
             // to be named in, and never the selection.
             if row.ghost {
                 let head = format!("{GHOST}{:>num_width$}{NUM_GAP}", row.num);
-                let dim = Style::default().add_modifier(Modifier::DIM);
                 return row_line(
                     &head,
                     &row.session.name,
                     0..0,
                     &[],
                     block.width as usize,
-                    dim,
+                    RowLook::all(theme.muted()),
                 );
             }
             let selected = i == selected_row && !row.leaving;
-            let style = if selected {
-                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            let look = if selected {
+                RowLook::selected(&theme)
             } else {
-                Style::default()
+                RowLook::unselected(&theme)
             };
             let marked = app.matched(&row.session.name);
             let back = app.back_to() == Some(row.session.id.as_str());
             let head = head(row.num, selected, reordering, back, num_width);
-            // The number is dim beside the name it stands for, and the back
+            // The number is muted beside the name it stands for, and the back
             // mark with it, except in the selection's bar: bold and dim share
             // one reset, and most terminals cannot show both, so dimming it
-            // there would break the bar rather than quieten the number.
-            let dim = if selected {
+            // there would break the bar rather than quieten the number — and
+            // a muted colour there would be a second colour in a bar of one.
+            let quiet = if selected {
                 0..0
             } else {
                 let from = if back { 0 } else { MARKER.chars().count() };
@@ -299,7 +311,7 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
             // A note of its own in the row, in the column the notes start in.
             let noted = notes_at.and_then(|at| {
                 app.note(&row.session.id)
-                    .map(|n| (at, note::column(n, spin)))
+                    .map(|n| (at, note::column(n, spin), n.kind))
             });
             // The bar is the width of the list, whatever the name it is on.
             // With a note after the name, the note runs it on (`push_note`).
@@ -310,9 +322,21 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 row.session.name.clone()
             };
-            let mut line = row_line(&head, &name, dim, &marked, block.width as usize, style);
-            if let Some((at, text)) = noted {
-                push_note(&mut line, at, &text, block.width as usize, selected, style);
+            let mut line = row_line(&head, &name, quiet, &marked, block.width as usize, look);
+            if let Some((at, text, kind)) = noted {
+                let note = if selected {
+                    theme.reversed()
+                } else {
+                    theme.note(kind)
+                };
+                push_note(
+                    &mut line,
+                    at,
+                    &text,
+                    block.width as usize,
+                    selected.then_some(look.base),
+                    note,
+                );
             }
             line
         })
@@ -414,7 +438,7 @@ fn draw_landing(
     }
 
     let widen = landing.widen();
-    let bar = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
+    let bar = app.theme().bar();
     let before = (1..=widen).filter_map(|d| left.checked_sub(d));
     let after = (0..widen).map(|d| right + d);
     for x in before.chain(after).filter(|x| on_screen(*x)) {
@@ -445,16 +469,18 @@ fn step_aside(buf: &mut Buffer, row: Rect, aside: i16) {
 
 /// A note in its row (`[picker] notes = "column"`), in column `at` of the list
 /// — where the notes start, whatever the name — cut to what the list has room
-/// for before its pad. Dim beside the name; in the selection's bar plain on
-/// the reversed ground instead, as the number is there, since bold and dim
-/// share one reset — and the bar then runs on past it to the end of the list.
+/// for before its pad, and drawn in `look`. Muted beside the name, or in the
+/// colour of its kind; in the selection's bar — `bar`, when the row is the
+/// selection — plain on the reversed ground instead, as the number is there,
+/// since bold and dim share one reset; and the bar then runs on past it to
+/// the end of the list.
 fn push_note(
     line: &mut Line<'static>,
     at: usize,
     text: &str,
     width: usize,
-    selected: bool,
-    style: Style,
+    bar: Option<Style>,
+    look: Style,
 ) {
     let used = line.width();
     let room = width.saturating_sub(at + PAD.width());
@@ -463,16 +489,12 @@ fn push_note(
     }
     let text = truncate(text, room);
     let shown = text.width();
-    let look = if selected {
-        Style::default().add_modifier(Modifier::REVERSED)
-    } else {
-        Style::default().add_modifier(Modifier::DIM)
-    };
-    line.spans.push(Span::styled(" ".repeat(at - used), style));
+    line.spans
+        .push(Span::styled(" ".repeat(at - used), bar.unwrap_or_default()));
     line.spans.push(Span::styled(text, look));
-    if selected {
+    if let Some(bar) = bar {
         let fill = width.saturating_sub(at + shown);
-        line.spans.push(Span::styled(" ".repeat(fill), style));
+        line.spans.push(Span::styled(" ".repeat(fill), bar));
     }
 }
 
@@ -481,10 +503,10 @@ fn push_note(
 /// the bar, on the row of the session it is about, stepping aside with that
 /// row — and not drawn where there is no room left of the list. None on a row
 /// being erased, nor on the gap made for a new session, which has nothing to
-/// report yet.
+/// report yet. Muted, or in the colour of its kind ([`Theme::note`]).
 fn draw_signs(frame: &mut Frame, app: &App, block: Rect, offset: usize) {
     let screen = frame.area();
-    let dim = Style::default().add_modifier(Modifier::DIM);
+    let theme = app.theme();
     let spin = app.spin_frame();
     let erasing = app.backspace().map(|(id, _)| id);
     let rows = app.rows();
@@ -513,7 +535,7 @@ fn draw_signs(frame: &mut Frame, app: &App, block: Rect, offset: usize) {
             x,
             block.y + line as u16,
             note::sign(n, spin).encode_utf8(&mut glyph),
-            dim,
+            theme.note(n.kind),
         );
     }
 }
@@ -535,8 +557,8 @@ fn draw_caption(frame: &mut Frame, app: &App, area: Rect, block: Rect) {
         return;
     }
     let text = truncate(&note::caption(n), area.width as usize);
-    let dim = Style::default().add_modifier(Modifier::DIM);
-    let para = Paragraph::new(Line::from(Span::styled(text, dim))).alignment(Alignment::Center);
+    let muted = app.theme().muted();
+    let para = Paragraph::new(Line::from(Span::styled(text, muted))).alignment(Alignment::Center);
     frame.render_widget(
         para,
         Rect {
@@ -633,28 +655,69 @@ fn head(num: u32, selected: bool, reordering: bool, back: bool, num_width: usize
     format!("{prefix}{num:>num_width$}{NUM_GAP}")
 }
 
+/// How a row is drawn: its own style, what the characters in its quiet range
+/// — the number column — have on top of it, and what the letters a filter
+/// matched have.
+#[derive(Debug, Clone, Copy)]
+struct RowLook {
+    base: Style,
+    quiet: Style,
+    mark: Style,
+}
+
+impl RowLook {
+    /// The selection: the bar from end to end, and the matched letters only
+    /// underlined on it, so the bar stays one colour. Nothing on it is quiet.
+    fn selected(theme: &Theme) -> Self {
+        Self {
+            base: theme.bar(),
+            quiet: Style::new(),
+            mark: Style::new().add_modifier(Modifier::UNDERLINED),
+        }
+    }
+
+    /// Every other row: plain, the number muted, the matches in theirs.
+    fn unselected(theme: &Theme) -> Self {
+        Self {
+            base: Style::new(),
+            quiet: theme.muted(),
+            mark: theme.matched(),
+        }
+    }
+
+    /// A row one style from end to end.
+    fn all(style: Style) -> Self {
+        Self {
+            base: style,
+            quiet: Style::new(),
+            mark: Style::new(),
+        }
+    }
+}
+
 /// One row, cut to `width`, with the characters at the `char` indices in
-/// `dim` dimmed — the number column — and the letters of the name at the
-/// `char` indices in `marked` underlined — the letters the filter matched (see
-/// [`App::matched`]). Dim and underline are modifiers, so this still sets no
-/// colour, and both sit on top of the row's own style.
+/// `quiet` quietened — the number column — and the letters of the name at the
+/// `char` indices in `marked` marked — the letters the filter matched (see
+/// [`App::matched`]). Both sit on top of the row's own style, and how each
+/// looks is `look`'s: dim and underlined with no theme, so modifiers that set
+/// no colour.
 fn row_line(
     head: &str,
     name: &str,
-    dim: std::ops::Range<usize>,
+    quiet: std::ops::Range<usize>,
     marked: &[usize],
     width: usize,
-    style: Style,
+    look: RowLook,
 ) -> Line<'static> {
     let text = truncate(&format!("{head}{name}"), width);
     let skip = head.chars().count();
     let style_at = |i: usize| {
-        let mut style = style;
-        if dim.contains(&i) {
-            style = style.add_modifier(Modifier::DIM);
+        let mut style = look.base;
+        if quiet.contains(&i) {
+            style = style.patch(look.quiet);
         }
         if i >= skip && marked.binary_search(&(i - skip)).is_ok() {
-            style = style.add_modifier(Modifier::UNDERLINED);
+            style = style.patch(look.mark);
         }
         style
     };
@@ -678,7 +741,8 @@ fn row_line(
 /// The row a kill is erasing: as much of it as is left, and the cursor after
 /// it, until both have gone (see [`super::backspace`]). The row is drawn as it
 /// was the moment the kill was confirmed, marker and number included, but not
-/// reversed: it is a row being cleared now, no longer the selection.
+/// reversed: it is a row being cleared now, no longer the selection. The
+/// cursor is the one cursor-coloured thing on it ([`Theme::caret`]).
 ///
 /// The cursor goes in the column after what is left, which for a row as wide
 /// as the block is past its end, on the terminal's own background — and not
@@ -719,7 +783,7 @@ fn draw_backspace(
     buf.set_string(block.x, y, kept, Style::default());
     let x = block.x + kept.width() as u16;
     if cursor && x < area.x + area.width {
-        buf.set_string(x, y, CURSOR, Style::default());
+        buf.set_string(x, y, CURSOR, app.theme().caret());
     }
 }
 
@@ -809,31 +873,40 @@ fn draw_trail(frame: &mut Frame, area: Rect, spans: Vec<Span<'static>>) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// What the hint row says, and whether it is dim: a hint when nothing is being
-/// asked or typed, and otherwise the thing being asked or typed, at full weight.
-fn hint_line(app: &App) -> (String, bool) {
+/// What the hint row says, and in what: a hint, muted, when nothing is being
+/// asked or typed; otherwise the thing being asked or typed, at full weight,
+/// its cursor in the cursor's colour ([`Theme::caret`]). A message is the one
+/// thing told rather than asked, and every message the picker has is
+/// something that went wrong — a number with no session, a listing, an
+/// attach, a kill or a move that failed — so it is in the fail colour
+/// ([`Theme::error`]).
+fn hint_line(app: &App) -> Line<'static> {
+    let theme = app.theme();
+    let hint = |text: String| Line::from(Span::styled(text, theme.muted()));
+    let typed =
+        |text: String| Line::from(vec![Span::raw(text), Span::styled(CURSOR, theme.caret())]);
     match app.mode() {
-        Mode::Confirm { prompt, .. } => (prompt.clone(), false),
-        Mode::Filter => (format!("/{}{CURSOR}", app.filter()), false),
+        Mode::Confirm { prompt, .. } => Line::from(prompt.clone()),
+        Mode::Filter => typed(format!("/{}", app.filter())),
         // The query comes too, when there is one. A move of one visible row can
         // carry a session past several the filter is hiding, and that is the one
         // moment the screen must not also stop saying a filter is applied — the
         // reason the `/query` in normal mode exists at all.
         Mode::Reorder { .. } if !app.filter().is_empty() => {
-            (format!("{REORDER_HINTS}  /{}", app.filter()), true)
+            hint(format!("{REORDER_HINTS}  /{}", app.filter()))
         }
-        Mode::Reorder { .. } => (REORDER_HINTS.to_string(), true),
+        Mode::Reorder { .. } => hint(REORDER_HINTS.to_string()),
         Mode::Normal => match app.message() {
-            Some(msg) => (msg.to_string(), false),
+            Some(msg) => Line::from(Span::styled(msg.to_string(), theme.error())),
             // A number waiting on another digit; without this the picker would
             // look like it had ignored the keystroke.
             None => match app.pending() {
-                Some(n) => (format!("#{n}{CURSOR}"), false),
+                Some(n) => typed(format!("#{n}")),
                 None if !app.filter().is_empty() => {
                     // Or the list silently looks shorter than it is.
-                    (format!("/{}", app.filter()), true)
+                    hint(format!("/{}", app.filter()))
                 }
-                None => (HINTS.to_string(), true),
+                None => hint(HINTS.to_string()),
             },
         },
     }
@@ -1083,6 +1156,29 @@ pub(super) fn centre_vertically(area: Rect, height: u16) -> Rect {
         y: area.y + (area.height.saturating_sub(height)) / 2,
         height: height.min(area.height),
         ..area
+    }
+}
+
+/// [`truncate`] for a line of styled spans: cut to `max` columns, each span
+/// keeping its own style. Nothing after the span the cut falls in: a wide
+/// character that did not fit there leaves a column a narrower one from the
+/// next span would otherwise slip into, out of order.
+fn truncate_line(line: Line<'_>, max: usize) -> Line<'_> {
+    let mut room = max;
+    let mut spans = Vec::with_capacity(line.spans.len());
+    for span in line.spans {
+        let text = truncate(&span.content, room);
+        let cut = text.width() < span.content.width();
+        room -= text.width();
+        spans.push(Span::styled(text, span.style));
+        if cut {
+            break;
+        }
+    }
+    Line {
+        spans,
+        style: line.style,
+        alignment: line.alignment,
     }
 }
 
@@ -3109,5 +3205,323 @@ mod tests {
             render(&app(&["api-server", "blog", "dotfiles"]), 60, 12)
         );
         assert!(!off.spinning());
+    }
+
+    // --- in a theme -----------------------------------------------------------
+
+    use crate::test_support::theme;
+    use ratatui::buffer::Cell as BufCell;
+    use ratatui::style::Color;
+
+    /// `a`, drawn in [`theme`].
+    fn in_theme(mut a: App) -> App {
+        a.set_theme(theme());
+        a
+    }
+
+    /// The cells on row `y` that show something.
+    fn glyphs(buf: &Buffer, y: u16) -> Vec<&BufCell> {
+        (0..buf.area.width)
+            .map(|x| &buf[(x, y)])
+            .filter(|c| c.symbol() != " ")
+            .collect()
+    }
+
+    /// The bar is the selection's colour — set as its cells' foreground, which
+    /// is what a reversed cell paints its background in — and as reversed and
+    /// bold as ever; the number beside a name off the bar is muted's colour in
+    /// place of dim; the names themselves are plain; and nothing anywhere is a
+    /// background.
+    #[test]
+    fn a_theme_colours_the_bar_and_mutes_the_numbers() {
+        let t = theme();
+        let mut a = in_theme(app(&["api-server", "dotfiles"]));
+        a.set_effects(false);
+        let (w, h) = (40, 6);
+        let lines = render(&a, w, h);
+        let buf = test_support::buffer(w, h, |f| draw(f, &a));
+
+        let y = line_of(&lines, "api-server");
+        let reversed = bar(&buf, y);
+        assert!(!reversed.is_empty(), "the selection has its bar");
+        for x in reversed {
+            let cell = &buf[(x, y)];
+            assert_eq!(Some(cell.fg), t.select.to_color(), "at {x}");
+            assert!(cell.modifier.contains(Modifier::REVERSED | Modifier::BOLD));
+        }
+
+        let y = line_of(&lines, "dotfiles");
+        let line = &lines[y as usize];
+        let x = line[..line.find("dotfiles").expect("drawn")]
+            .rfind('2')
+            .map(|at| line[..at].chars().count() as u16)
+            .expect("the number is on the row");
+        assert_eq!(Some(buf[(x, y)].fg), t.muted.to_color());
+        assert!(
+            !buf[(x, y)].modifier.contains(Modifier::DIM),
+            "the colour instead of dim, not as well as it"
+        );
+        assert!(name_cells(&buf, y, "dotfiles")
+            .iter()
+            .all(|c| c.fg == Color::Reset && c.modifier.is_empty()));
+
+        test_support::assert_no_background(w, h, |f| draw(f, &a));
+    }
+
+    /// Off the bar a match is the match colour and underlined; on the bar it
+    /// is only underlined, so the bar stays one colour.
+    #[test]
+    fn a_match_is_coloured_off_the_bar_and_only_underlined_on_it() {
+        let t = theme();
+        let mut a = filtering(&["api-server", "dotfiles", "notes"], "ot");
+        a.set_effects(false);
+        a.set_theme(t);
+        let (w, h) = (40, 8);
+        let lines = render(&a, w, h);
+        let buf = test_support::buffer(w, h, |f| draw(f, &a));
+        let marked = |y: u16, name: &str| -> Vec<Color> {
+            name_cells(&buf, y, name)
+                .iter()
+                .filter(|c| c.modifier.contains(Modifier::UNDERLINED))
+                .map(|c| c.fg)
+                .collect()
+        };
+
+        let on = line_of(&lines, "dotfiles");
+        assert!(
+            !bar(&buf, on).is_empty(),
+            "the cursor is on the first match"
+        );
+        let colours = marked(on, "dotfiles");
+        assert_eq!(colours.len(), 2, "{lines:#?}");
+        assert!(colours.iter().all(|c| Some(*c) == t.select.to_color()));
+
+        let off = line_of(&lines, "notes");
+        let colours = marked(off, "notes");
+        assert_eq!(colours.len(), 2, "{lines:#?}");
+        assert!(colours.iter().all(|c| Some(*c) == t.matched.to_color()));
+        assert!(name_cells(&buf, off, "notes")
+            .iter()
+            .filter(|c| !c.modifier.contains(Modifier::UNDERLINED))
+            .all(|c| c.fg == Color::Reset));
+    }
+
+    /// Each sign is the colour of its kind, and no longer dim; with only muted
+    /// set, every sign is muted, as every sign is dim with no theme at all.
+    #[test]
+    fn a_sign_is_the_colour_of_its_kind() {
+        let t = theme();
+        let notes = || {
+            vec![
+                ("api-server", note(Kind::Busy(None), "claude", "working")),
+                ("blog", note(Kind::Notified, "Claude Code", "permission")),
+                ("dotfiles", note(Kind::Failed, "claude", "exited")),
+            ]
+        };
+        let names = ["api-server", "blog", "dotfiles"];
+        let (w, h) = (60, 12);
+
+        let mut a = noted(&names, notes(), NoteStyle::Signs);
+        a.set_theme(t);
+        let lines = render(&a, w, h);
+        let buf = test_support::buffer(w, h, |f| draw(f, &a));
+        let x = bar(&buf, line_of(&lines, "api-server"))[0] - SIGN_OUT;
+        for (name, colour) in [
+            ("api-server", t.busy),
+            ("blog", t.notify),
+            ("dotfiles", t.fail),
+        ] {
+            let sign = &buf[(x, line_of(&lines, name))];
+            assert_eq!(Some(sign.fg), colour.to_color(), "{name}");
+            assert!(!sign.modifier.contains(Modifier::DIM), "{name}");
+        }
+        test_support::assert_no_background(w, h, |f| draw(f, &a));
+
+        let muted = crate::theme::Theme {
+            muted: crate::theme::Colour::Ansi(8),
+            ..crate::theme::Theme::default()
+        };
+        let mut a = noted(&names, notes(), NoteStyle::Signs);
+        a.set_theme(muted);
+        let buf = test_support::buffer(w, h, |f| draw(f, &a));
+        for name in names {
+            assert_eq!(buf[(x, line_of(&lines, name))].fg, Color::Indexed(8));
+        }
+    }
+
+    /// The selected session's note under the list is muted, whatever its
+    /// kind: the sign beside the row already says which.
+    #[test]
+    fn the_caption_is_muted() {
+        let t = theme();
+        let mut a = three(NoteStyle::Signs);
+        a.set_theme(t);
+        let (w, h) = (60, 12);
+        let lines = render(&a, w, h);
+        let buf = test_support::buffer(w, h, |f| draw(f, &a));
+        let y = line_of(&lines, "claude: working");
+        assert!(glyphs(&buf, y)
+            .iter()
+            .all(|c| Some(c.fg) == t.muted.to_color()));
+    }
+
+    /// A note in its row is the colour of its kind beside a name, and on the
+    /// bar reversed in the selection's colour, not bold, like the number there.
+    #[test]
+    fn a_note_in_its_row_takes_its_kinds_colour_off_the_bar() {
+        let t = theme();
+        let mut a = three(NoteStyle::Column);
+        a.set_theme(t);
+        let (w, h) = (80, 10);
+        let lines = render(&a, w, h);
+        let buf = test_support::buffer(w, h, |f| draw(f, &a));
+        let col = |line: &str, s: &str| line[..line.find(s).expect("there")].width() as u16;
+
+        let y = line_of(&lines, "api-server");
+        let cell = &buf[(col(&lines[y as usize], "working"), y)];
+        assert_eq!(Some(cell.fg), t.select.to_color());
+        assert!(cell.modifier.contains(Modifier::REVERSED));
+        assert!(!cell.modifier.contains(Modifier::BOLD));
+
+        let y = line_of(&lines, "blog");
+        let cell = &buf[(col(&lines[y as usize], "Claude"), y)];
+        assert_eq!(Some(cell.fg), t.notify.to_color());
+        assert!(!cell.modifier.contains(Modifier::DIM));
+        test_support::assert_no_background(w, h, |f| draw(f, &a));
+    }
+
+    /// The hints are muted; a message is the fail colour, since every one is
+    /// something that went wrong; what is being typed is plain with its cursor
+    /// in the selection's colour; and the kill confirm is plain — a question,
+    /// not an error.
+    #[test]
+    fn the_hint_row_says_each_thing_in_its_own_colour() {
+        let t = theme();
+        let (w, h) = (70, 6);
+        let last = h - 1;
+        let row = |a: &App| {
+            let buf = test_support::buffer(w, h, |f| draw(f, a));
+            glyphs(&buf, last)
+                .into_iter()
+                .map(|c| (c.symbol().to_string(), c.fg, c.modifier))
+                .collect::<Vec<_>>()
+        };
+
+        let hints = row(&in_theme(app(&["one"])));
+        assert!(hints
+            .iter()
+            .all(|(_, fg, m)| Some(*fg) == t.muted.to_color() && m.is_empty()));
+
+        let mut a = in_theme(app(&["one"]));
+        a.set_message("no session 7");
+        assert!(row(&a)
+            .iter()
+            .all(|(_, fg, _)| Some(*fg) == t.fail.to_color()));
+
+        let mut a = filtering(&["one"], "on");
+        a.set_theme(t);
+        for (glyph, fg, _) in row(&a) {
+            let want = if glyph == CURSOR {
+                t.select.to_color()
+            } else {
+                Some(Color::Reset)
+            };
+            assert_eq!(Some(fg), want, "{glyph:?}");
+        }
+
+        let mut a = in_theme(app(&["one"]));
+        a.on_key(Key::Char('x'));
+        assert!(row(&a)
+            .iter()
+            .all(|(_, fg, m)| *fg == Color::Reset && m.is_empty()));
+    }
+
+    /// The row standing in the gap made for a new session is muted from end to
+    /// end, as it is dim with no theme.
+    #[test]
+    fn the_new_sessions_row_is_muted() {
+        let t = theme();
+        let a = in_theme(making_room());
+        let lines = render(&a, 44, 9);
+        let buf = test_support::buffer(44, 9, |f| draw(f, &a));
+        let row = glyphs(&buf, line_of(&lines, "session 4"));
+        assert!(!row.is_empty());
+        assert!(row
+            .iter()
+            .all(|c| Some(c.fg) == t.muted.to_color() && c.modifier.is_empty()));
+    }
+
+    /// A session put down bounces in the bar's own colour.
+    #[test]
+    fn a_landed_bar_bounces_in_its_colour() {
+        let t = theme();
+        let pull = landing::PULL.as_millis() as u64;
+        let (lasts, _) = landing::BOUNCE[0];
+        let a = in_theme(landed(pull + lasts.as_millis() as u64 / 2));
+        let y = line_of(&render(&a, 50, 8), "notes");
+        let buf = test_support::buffer(50, 8, |f| draw(f, &a));
+        let reversed = bar(&buf, y);
+        assert!(!reversed.is_empty());
+        assert!(reversed
+            .iter()
+            .all(|x| Some(buf[(*x, y)].fg) == t.select.to_color()));
+    }
+
+    /// A theme is colour and nothing else: the same text, in the same cells,
+    /// on every screen of the picker.
+    #[test]
+    fn a_theme_changes_no_text() {
+        let pairs: Vec<(App, App)> = vec![
+            (app(&["one", "two"]), in_theme(app(&["one", "two"]))),
+            (
+                filtering(&["one", "two"], "tw"),
+                in_theme(filtering(&["one", "two"], "tw")),
+            ),
+            (
+                reordering(&["one", "two", "three"], 1),
+                in_theme(reordering(&["one", "two", "three"], 1)),
+            ),
+            (three(NoteStyle::Signs), in_theme(three(NoteStyle::Signs))),
+            (three(NoteStyle::Column), in_theme(three(NoteStyle::Column))),
+        ];
+        for (plain, themed) in &pairs {
+            assert_eq!(render(plain, 70, 10), render(themed, 70, 10));
+        }
+    }
+
+    /// On the wire, the colours go out as crossterm writes them — `38;5;n`
+    /// for one of the terminal's own, `38;2;r;g;b` for an exact one — and no
+    /// background ever does.
+    #[test]
+    fn a_themed_picker_writes_foregrounds_only() {
+        let a = in_theme(app(&["api-server", "dotfiles"]));
+        let bytes = test_support::emitted(40, 6, |f| draw(f, &a));
+        assert!(bytes.contains("38;5;8"), "muted: {bytes:?}");
+        assert!(bytes.contains("38;2;122;162;247"), "select: {bytes:?}");
+        assert!(!bytes.contains("48;"), "a background: {bytes:?}");
+    }
+
+    /// A line cut to fit keeps each span's own style, and nothing past a span
+    /// that was cut — not even a narrower character that would fit.
+    #[test]
+    fn a_line_is_cut_with_its_styles() {
+        let dim = Style::new().add_modifier(Modifier::DIM);
+        let line = Line::from(vec![
+            Span::raw("ab"),
+            Span::styled("界c", dim),
+            Span::raw("d"),
+        ]);
+        let cut = truncate_line(line.clone(), 3);
+        assert_eq!(
+            cut.spans,
+            vec![Span::raw("ab"), Span::styled("", dim)],
+            "the wide character does not fit, and nothing after it is drawn"
+        );
+        let cut = truncate_line(line.clone(), 5);
+        assert_eq!(
+            cut.spans,
+            vec![Span::raw("ab"), Span::styled("界c", dim), Span::raw("")]
+        );
+        assert_eq!(truncate_line(line.clone(), 99).spans, line.spans);
     }
 }

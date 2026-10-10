@@ -205,6 +205,14 @@ predict     = true    # over a slow link, scrolls show before Neovim answers
 [picker]
 notes = "signs"   # what a session reports beside its name: "signs", "column" or "off"
 
+[theme]
+select = "default"   # the selected row's bar, every cursor, the notice a switch puts up
+muted  = "default"   # hint rows, numbers, labels: dim, or this colour in its place
+match  = "default"   # the letters a filter matched, underlined either way
+busy   = "default"   # a busy session's sign, and the spinner while one attaches
+notify = "default"   # the sign of a session that sent a notification
+fail   = "default"   # the sign of a session that failed, and errors
+
 [effects]
 enabled = true   # master switch: false turns every effect below off
 
@@ -254,3 +262,27 @@ enabled = false   # a blinking block cursor fades out and back in
 ```
 
 </details>
+
+### Colour
+
+Out of the box nvmux's screens set no colour: the selection is reversed, what
+is not deciding anything is dim, and all of it is drawn in your terminal's
+palette. `[theme]` colours them a role at a time — the picker, the create
+prompt, help, and the hint row and notice drawn over a session:
+
+```toml
+[theme]
+select = "blue"
+muted  = "bright-black"
+match  = "yellow"
+busy   = "yellow"
+notify = "magenta"
+fail   = "red"
+```
+
+A name — `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`,
+`white`, or `bright-` and one of them — is one of your terminal's own sixteen,
+in whatever shade it gives it; `"#rrggbb"` is that colour exactly; `"default"`
+leaves the role as it is without a theme. The selection is reversed in its
+colour, so the text on it is your terminal's background: pick one that stands
+out from it. `NO_COLOR` turns the theme off.

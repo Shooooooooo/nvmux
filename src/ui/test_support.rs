@@ -87,9 +87,11 @@ pub(super) fn emitted(w: u16, h: u16, mut draw: impl FnMut(&mut Frame)) -> Strin
     String::from_utf8(bytes).expect("the screens write UTF-8")
 }
 
-/// No screen may emit an SGR colour: each inherits the terminal's palette and
-/// background and is correct under `NO_COLOR` by construction rather than by
-/// remembering to check a flag at each call site (see [`super::draw`]).
+/// No screen may emit an SGR colour with no `[theme]`: each inherits the
+/// terminal's palette and background and is correct under `NO_COLOR` by
+/// construction rather than by remembering to check a flag at each call site
+/// (see [`super::draw`]). A screen's tests draw it with no theme unless they
+/// give it one, so this is what they all say about the default.
 pub(super) fn assert_no_colour(w: u16, h: u16, draw: impl FnMut(&mut Frame)) {
     let buf = buffer(w, h, draw);
     for y in 0..buf.area.height {
@@ -102,6 +104,22 @@ pub(super) fn assert_no_colour(w: u16, h: u16, draw: impl FnMut(&mut Frame)) {
             );
             assert_eq!(
                 cell.bg,
+                Color::Reset,
+                "cell ({x},{y}) set a background colour"
+            );
+        }
+    }
+}
+
+/// No screen sets a background, in any theme: they sit on the terminal's own,
+/// and a theme colours text — and the selection's bar, which is a reversed
+/// foreground — and nothing else (see [`crate::theme`]).
+pub(super) fn assert_no_background(w: u16, h: u16, draw: impl FnMut(&mut Frame)) {
+    let buf = buffer(w, h, draw);
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            assert_eq!(
+                buf[(x, y)].bg,
                 Color::Reset,
                 "cell ({x},{y}) set a background colour"
             );

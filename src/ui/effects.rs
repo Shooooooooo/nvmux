@@ -6,7 +6,8 @@
 //!
 //! All four are a post-pass over a frame [`super::draw`] has already drawn,
 //! the way [`crate::fade::apply`] is, and for the same reason: the screen's own
-//! drawing stays colourless, and its tests keep saying so. What is passing —
+//! drawing sets no colour of its own — none at all with no `[theme]` — and its
+//! tests keep saying so. What is passing —
 //! which rows, and how far through — is [`App`]'s, moved on by the caller's
 //! clock like the trail is; where those rows are on screen is the renderer's,
 //! asked through [`draw::row_rect`] so the pass lands on the row the eye sees.
@@ -16,20 +17,28 @@
 //! A real fade needs real colours at both ends, so with the terminal's answer
 //! to [`crate::palette::query`] and no `NO_COLOR`, all four paint in colour:
 //!
-//! - the afterglow runs from the selection's look — the foreground as the
-//!   background, the background as the foreground — back to the plain row;
+//! - the afterglow runs from the selection's look — the bar's colour as the
+//!   background, the background as the foreground — back to the row as it
+//!   was drawn;
 //! - a dropped row's text runs from most of the way to all of the way into
 //!   the background, so it is plainly leaving from its first frame;
 //! - the bar of a row a `[y/N]` is asking about warms towards the terminal's
-//!   own red as the line goes through its name;
+//!   own red — or the theme's fail colour — as the line goes through its
+//!   name;
 //! - the row in the gap comes up out of the background to the dim it is
 //!   drawn in.
 //!
-//! Without them, each falls back to a modifier, which sets no colour: the
-//! afterglow holds the bar, reversed and dim, for the first third of its time
-//! and then lets it go; a dropped row is dim until it goes; the struck row is
-//! the line alone, which is a modifier to begin with; the row in the gap is
-//! there, dim, from the first frame.
+//! Each sets out from, or arrives at, the colour a cell was drawn in
+//! ([`crate::theme::ink`]): the terminal's own foreground with no `[theme]`,
+//! and in one whatever colour the cell's role has — the bar the selection's,
+//! a number muted's — so an effect never jumps a cell to the terminal's text
+//! colour and back.
+//!
+//! Without them, each falls back to a modifier, which sets no colour of its
+//! own: the afterglow holds the bar, reversed and dim, for the first third of
+//! its time and then lets it go; a dropped row is dim until it goes; the
+//! struck row is the line alone, which is a modifier to begin with; the row in
+//! the gap is there, dim, from the first frame.
 //! Coarser, and correct under `NO_COLOR` by construction, as everything else
 //! here is.
 //!
@@ -57,6 +66,7 @@ use super::app::{App, GHOST_ID};
 use super::draw;
 use super::sonar::{self, Sonar};
 use crate::palette::{Palette, Rgb};
+use crate::theme::{ink, Theme};
 
 /// How long a row a filter keystroke dropped takes to fade before the list
 /// closes up. Short: the row has already been ruled out, and every
@@ -90,12 +100,13 @@ pub const AFTERGLOW: Duration = Duration::from_millis(100);
 /// means.
 pub const STRIKE: Duration = Duration::from_millis(180);
 
-/// How much of the way towards the terminal's red the struck row's bar goes
-/// once the line is all the way across. Most of the way to the bar's own
-/// colour is kept, so the row still reads as the selection, warned about.
+/// How much of the way towards red the struck row's bar goes once the line
+/// is all the way across. Most of the way to the bar's own colour is kept, so
+/// the row still reads as the selection, warned about.
 const STRIKE_WARMTH: f32 = 0.55;
 
-/// The terminal's own red, among the sixteen [`Palette::ansi`].
+/// The terminal's own red, among the sixteen [`Palette::ansi`]: what the
+/// struck bar warms towards when the theme has no fail colour.
 const RED: usize = 1;
 
 /// How far into the background a ring's colour has gone by the end of its
@@ -145,11 +156,12 @@ pub fn paint(frame: &mut Frame, app: &App, palette: Option<&Palette>) {
     let area = frame.area();
     let buf = frame.buffer_mut();
     let selected = app.selected_row_id();
+    let theme = app.theme();
 
     if let Some((id, progress)) = app.glow() {
         if selected != Some(id) {
             if let Some(rect) = draw::row_rect(app, area, id) {
-                glow(buf, rect, palette, progress);
+                glow(buf, rect, palette, &theme, progress);
             }
         }
     }
@@ -159,7 +171,7 @@ pub fn paint(frame: &mut Frame, app: &App, palette: Option<&Palette>) {
     for (id, progress) in app.swap().echoes() {
         if selected != Some(id) {
             if let Some(rect) = draw::row_rect(app, area, id) {
-                glow(buf, rect, palette, progress);
+                glow(buf, rect, palette, &theme, progress);
             }
         }
     }
@@ -181,7 +193,7 @@ pub fn paint(frame: &mut Frame, app: &App, palette: Option<&Palette>) {
             // a line still being drawn back off a row the cursor has since
             // left goes off a plain row.
             let warm = palette.filter(|_| selected == Some(id));
-            strike(buf, bar, name, warm, drawn);
+            strike(buf, bar, name, warm, &theme, drawn);
         }
     }
 
@@ -192,21 +204,30 @@ pub fn paint(frame: &mut Frame, app: &App, palette: Option<&Palette>) {
     }
 }
 
-/// The row the cursor left, `progress` of the way back to plain.
-fn glow(buf: &mut Buffer, rect: Rect, palette: Option<&Palette>, progress: f32) {
+/// The row the cursor left, `progress` of the way back to plain: its ground
+/// from the bar's colour to the background, and each cell's text from the
+/// background to the colour it was drawn in.
+///
+/// Without a palette, the bar held for a while instead — in the bar's colour
+/// from end to end, so a cell a theme drew in another colour, a number or a
+/// match, is not a block of that colour inside it.
+fn glow(buf: &mut Buffer, rect: Rect, palette: Option<&Palette>, theme: &Theme, progress: f32) {
     match palette {
         Some(p) => {
             let t = ease_out(progress);
-            let bg = rgb(p.fg.lerp(p.bg, t));
-            let fg = rgb(p.bg.lerp(p.fg, t));
+            let bar = theme.select.rgb(p).unwrap_or(p.fg);
+            let bg = rgb(bar.lerp(p.bg, t));
             each_cell(buf, rect, |cell| {
+                let fg = rgb(p.bg.lerp(ink(p, cell.fg), t));
                 cell.set_bg(bg);
                 cell.set_fg(fg);
             });
         }
         None if progress < FALLBACK_HOLD => {
+            let bar = theme.select.to_color().unwrap_or(Color::Reset);
             each_cell(buf, rect, |cell| {
                 cell.modifier.insert(Modifier::REVERSED | Modifier::DIM);
+                cell.set_fg(bar);
             });
         }
         None => {}
@@ -214,10 +235,18 @@ fn glow(buf: &mut Buffer, rect: Rect, palette: Option<&Palette>, progress: f32) 
 }
 
 /// The row a `[y/N]` is asking about: a line through its name, `drawn` of
-/// the way across, and — given a palette — its bar warmed towards the
-/// terminal's red by as much. The line is the crossed-out modifier, drawn in
-/// the text's own colour, so it is the same with a palette or without one.
-fn strike(buf: &mut Buffer, bar: Rect, name: Rect, palette: Option<&Palette>, drawn: f32) {
+/// the way across, and — given a palette — its bar warmed by as much from its
+/// own colour towards the theme's fail colour, or the terminal's red. The line
+/// is the crossed-out modifier, drawn in the text's own colour, so it is the
+/// same with a palette or without one.
+fn strike(
+    buf: &mut Buffer,
+    bar: Rect,
+    name: Rect,
+    palette: Option<&Palette>,
+    theme: &Theme,
+    drawn: f32,
+) {
     let k = ease_out(drawn);
     let across = ((k * f32::from(name.width)).ceil() as u16).min(name.width);
     let line = Rect {
@@ -228,7 +257,9 @@ fn strike(buf: &mut Buffer, bar: Rect, name: Rect, palette: Option<&Palette>, dr
         cell.modifier.insert(Modifier::CROSSED_OUT)
     });
     if let Some(p) = palette {
-        let warm = rgb(p.fg.lerp(p.ansi[RED], STRIKE_WARMTH * k));
+        let from = theme.select.rgb(p).unwrap_or(p.fg);
+        let to = theme.fail.rgb(p).unwrap_or(p.ansi[RED]);
+        let warm = rgb(from.lerp(to, STRIKE_WARMTH * k));
         let text = rgb(p.bg);
         each_cell(buf, bar, |cell| {
             cell.modifier.remove(Modifier::REVERSED);
@@ -316,9 +347,8 @@ fn leave(buf: &mut Buffer, rect: Rect, palette: Option<&Palette>, progress: f32)
     match palette {
         Some(p) => {
             let t = SIFT_FROM + (1.0 - SIFT_FROM) * ease_out(progress);
-            let fg = rgb(p.fg.lerp(p.bg, t));
             each_cell(buf, rect, |cell| {
-                cell.set_fg(fg);
+                cell.set_fg(rgb(ink(p, cell.fg).lerp(p.bg, t)));
             });
         }
         None => {
@@ -330,14 +360,15 @@ fn leave(buf: &mut Buffer, rect: Rect, palette: Option<&Palette>, progress: f32)
 }
 
 /// The row in a gap made for a new session, `progress` of the way up out of
-/// the background. Only with a palette: without one the row is simply there,
-/// drawn dim, from the first frame. Once it is all the way up nothing is set,
-/// and the row is the plain dim one the renderer drew.
+/// the background to the colour it was drawn in. Only with a palette: without
+/// one the row is simply there, drawn dim, from the first frame. Once it is
+/// all the way up nothing is set, and the row is the plain dim one the
+/// renderer drew.
 fn arrive(buf: &mut Buffer, rect: Rect, palette: &Palette, progress: f32) {
-    let fg = rgb(palette.bg.lerp(palette.fg, ease_out(progress)));
+    let t = ease_out(progress);
     each_cell(buf, rect, |cell| {
         if !cell.symbol().trim().is_empty() {
-            cell.set_fg(fg);
+            cell.set_fg(rgb(palette.bg.lerp(ink(palette, cell.fg), t)));
         }
     });
 }
@@ -370,6 +401,7 @@ mod tests {
     use super::super::test_support::{self, picker};
     use super::*;
     use crate::test_support::palette as test_palette;
+    use crate::test_support::theme;
 
     const W: u16 = 40;
     const H: u16 = 8;
@@ -923,5 +955,118 @@ mod tests {
             draw::draw(f, &a);
             paint(f, &a, None);
         });
+    }
+
+    // --- in a theme -----------------------------------------------------------
+
+    /// A palette whose sixteen are xterm's rather than all black, so the
+    /// theme's muted — bright black — is a colour of its own.
+    fn xterm() -> Palette {
+        Palette {
+            ansi: crate::palette::XTERM_ANSI,
+            ..test_palette()
+        }
+    }
+
+    /// In a theme the row the cursor left glows from the bar's own colour, and
+    /// each of its cells comes back to the colour it was drawn in — the
+    /// number to muted's, the name to the terminal's text — rather than all of
+    /// them to the terminal's text colour.
+    #[test]
+    fn in_a_theme_the_glow_sets_out_from_the_bars_colour() {
+        let (p, t) = (xterm(), theme());
+        let mut a = picker(&["one", "two", "three"]);
+        a.set_theme(t);
+        a.on_key(Key::Char('j'));
+
+        let buf = frame(&a, Some(&p));
+        let y = row_of(&buf, "one");
+        let number = first_glyph(&buf, y);
+        assert_eq!(number.bg, rgb(t.select.rgb(&p).expect("set")), "the bar");
+        assert_eq!(number.fg, rgb(p.bg));
+
+        a.tick(AFTERGLOW / 2);
+        let buf = frame(&a, Some(&p));
+        let k = ease_out(0.5);
+        let number = first_glyph(&buf, y);
+        let name = &buf[(column_of(&buf, y, "one"), y)];
+        assert_eq!(number.fg, rgb(p.bg.lerp(p.index(8), k)), "towards muted");
+        assert_eq!(name.fg, rgb(p.bg.lerp(p.fg, k)), "towards the text");
+        assert_eq!(number.bg, name.bg, "one ground");
+    }
+
+    /// Without a palette the held bar is the bar's colour from end to end:
+    /// the number a theme drew muted is not a grey block inside it.
+    #[test]
+    fn in_a_theme_the_held_bar_is_one_colour() {
+        let t = theme();
+        let mut a = picker(&["one", "two", "three"]);
+        a.set_theme(t);
+        a.on_key(Key::Char('j'));
+        let buf = frame(&a, None);
+        let y = row_of(&buf, "one");
+        let held: Vec<_> = (0..W)
+            .map(|x| &buf[(x, y)])
+            .filter(|c| c.modifier.contains(Modifier::REVERSED))
+            .collect();
+        assert!(!held.is_empty());
+        for cell in held {
+            assert_eq!(Some(cell.fg), t.select.to_color(), "{cell:?}");
+        }
+    }
+
+    /// In a theme the struck bar warms from the selection's colour towards
+    /// the fail colour, rather than from the terminal's text towards its red.
+    #[test]
+    fn in_a_theme_the_strike_warms_towards_fail() {
+        let (p, t) = (xterm(), theme());
+        let mut a = asking(STRIKE.as_millis() as u64);
+        a.set_theme(t);
+        let buf = frame(&a, Some(&p));
+        let y = row_of(&buf, "dotfiles");
+        let from = t.select.rgb(&p).expect("set");
+        let to = t.fail.rgb(&p).expect("set");
+        let marker = first_glyph(&buf, y);
+        assert_eq!(marker.bg, rgb(from.lerp(to, STRIKE_WARMTH)), "{marker:?}");
+    }
+
+    /// In a theme a dropped row leaves from the colours it was drawn in.
+    #[test]
+    fn in_a_theme_dropped_rows_fade_from_their_own_colours() {
+        let (p, t) = (xterm(), theme());
+        let mut a = picker(&["api-server", "dotfiles", "notes"]);
+        a.set_theme(t);
+        a.on_key(Key::Char('/'));
+        a.on_key(Key::Char('n'));
+        let buf = frame(&a, Some(&p));
+        let y = row_of(&buf, "dotfiles");
+        assert_eq!(
+            first_glyph(&buf, y).fg,
+            rgb(p.index(8).lerp(p.bg, SIFT_FROM)),
+            "the number, from muted"
+        );
+        assert_eq!(
+            buf[(column_of(&buf, y, "dotfiles"), y)].fg,
+            rgb(p.fg.lerp(p.bg, SIFT_FROM)),
+            "the name, from the text"
+        );
+    }
+
+    /// In a theme the row in the gap comes up to muted's colour, and is left
+    /// in it once it is all the way up.
+    #[test]
+    fn in_a_theme_the_row_in_the_gap_comes_up_to_muted() {
+        let (p, t) = (xterm(), theme());
+        let mut a = room_after(ROOM.as_millis() as u64 / 2);
+        a.set_theme(t);
+        let buf = frame(&a, Some(&p));
+        let cell = first_glyph(&buf, row_of(&buf, "session 4"));
+        assert_eq!(cell.fg, rgb(p.bg.lerp(p.index(8), ease_out(0.5))));
+
+        let mut up = room_after(ROOM.as_millis() as u64);
+        up.set_theme(t);
+        let buf = frame(&up, Some(&p));
+        let cell = first_glyph(&buf, row_of(&buf, "session 4"));
+        assert_eq!(Some(cell.fg), t.muted.to_color(), "as drawn: {cell:?}");
     }
 }

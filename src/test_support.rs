@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crate::palette::{Palette, Rgb};
 use crate::pty::PtySize;
 use crate::shadow::Shadow;
+use crate::theme::{Colour, Theme};
 
 /// A scratch path under the temp directory, with anything left there by an
 /// earlier run removed. Nothing is created: a test that wants the path absent
@@ -90,6 +91,20 @@ pub(crate) fn palette() -> Palette {
         fg: Rgb(200, 200, 200),
         bg: Rgb(0, 0, 0),
         ansi: [Rgb(0, 0, 0); 16],
+    }
+}
+
+/// A theme with every role given a colour, each a different one — some the
+/// terminal's own and some exact — so a test can tell each role from the
+/// others, and all of them from no colour at all.
+pub(crate) fn theme() -> Theme {
+    Theme {
+        select: Colour::Rgb(Rgb(0x7a, 0xa2, 0xf7)),
+        muted: Colour::Ansi(8),
+        matched: Colour::Ansi(3),
+        busy: Colour::Ansi(11),
+        notify: Colour::Ansi(5),
+        fail: Colour::Rgb(Rgb(0xf7, 0x76, 0x8e)),
     }
 }
 

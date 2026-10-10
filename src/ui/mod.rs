@@ -4,17 +4,18 @@
 //!
 //! [`prompt`] and [`help`] are the other two screens. Both take the whole
 //! terminal rather than drawing over anything, share the same vocabulary
-//! (centred content, one dim hint row, no borders, no colour), and hand the
-//! same client back afterwards. `prompt::run` owns a terminal for `<prefix> c`,
-//! which arrives with none; `prompt::run_on` borrows the picker's — nesting the
-//! two would enter the alternate screen twice and leave it once.
+//! (centred content, one dim hint row, no borders, no colour of their own),
+//! and hand the same client back afterwards. `prompt::run` owns a terminal for
+//! `<prefix> c`, which arrives with none; `prompt::run_on` borrows the
+//! picker's — nesting the two would enter the alternate screen twice and leave
+//! it once.
 //!
 //! [`attaching`] is a fourth, and the odd one out: not a screen the user works
 //! on but the wait between the picker (or a `<prefix>` switch) and the session,
 //! up only while the attach probe is in flight. It keeps the vocabulary — a
 //! centred line where the picker draws its list, one dim hint row on the last
-//! line, no borders, no colour — and is the one screen that leaves the mouse
-//! alone, for a reason given there.
+//! line, no borders, no colour of its own — and is the one screen that leaves
+//! the mouse alone, for a reason given there.
 //!
 //! # There is no preview pane, and there must never be one
 //!
@@ -28,11 +29,14 @@
 //!
 //! # Colour
 //!
-//! Set no background and hardcode no palette. Do **not** rely on crossterm's
-//! own `NO_COLOR` handling: it turns `SetForegroundColor(c)` into a bare
-//! `ESC[m`, a full SGR reset that wipes bold, reverse and dim mid-line. Call
+//! Set no background and hardcode no palette. With no `[theme]` the screens
+//! set no colour at all; a theme colours the roles they already have — the
+//! selection, what is muted, a match, a note, what went wrong — and never a
+//! background (see [`crate::theme`]). Do **not** rely on crossterm's own
+//! `NO_COLOR` handling: it turns `SetForegroundColor(c)` into a bare `ESC[m`,
+//! a full SGR reset that wipes bold, reverse and dim mid-line. Call
 //! `force_color_output(true)`, test the variable directly, and set no colours
-//! when it is present.
+//! when it is present — which [`crate::theme::current`] does for the theme.
 //!
 //! Inheriting the palette has a cost the screens have to pay themselves.
 //! Setting no colours means ratatui writes no SGR before its content, so a
@@ -40,12 +44,17 @@
 //! coming back from a session, that is whatever the editor happened to be
 //! drawing when the relay stopped. [`Screen::open`] therefore drops the
 //! inherited attributes first, which is the one place that can: every screen is
-//! taken through it.
+//! taken through it. A theme does not make that redundant: a cell drawn in a
+//! colour sets that colour and nothing else, and inherits the rest as a plain
+//! one does.
 //!
-//! The fade ([`crate::fade`]) and the picker's passing effects ([`effects`])
-//! are the only things that paint a colour on these screens, and they do so as
-//! a post-pass over a finished frame, never inside a `draw`: a screen's own
-//! drawing stays colourless, and its tests say so.
+//! Beyond a theme's roles, the fade ([`crate::fade`]) and the picker's passing
+//! effects ([`effects`]) are the only things that paint a colour on these
+//! screens, and they do so as a post-pass over a finished frame, never inside
+//! a `draw`: with no theme a screen's own drawing stays colourless, and its
+//! tests say so. Each sets out from the colour a cell is drawn in
+//! ([`crate::theme::ink`]), so in a theme a coloured cell fades from its own
+//! colour.
 
 pub mod app;
 pub mod attaching;
@@ -161,8 +170,8 @@ impl Screen {
     /// setting back: a kept client's (`[client] per_session`, the default) from
     /// its ledger, as the client last wrote it (see [`crate::ledger`]), and a
     /// held one's by asking the client's server (see `pty::repaint`); a client
-    /// spawned next enables its own. The screens set no colours so as to
-    /// inherit the terminal's palette, but a *mode* cannot be inherited the
+    /// spawned next enables its own. The screens set no colours of their own so
+    /// as to inherit the terminal's palette, but a *mode* cannot be inherited the
     /// same way — a client enables the mouse once, at startup, and would never
     /// re-enable a mode nvmux had turned off — which is why this is restored
     /// rather than left alone.
@@ -1066,12 +1075,13 @@ mod tests {
 
     /// Why [`Screen::open`] drops the inherited attributes before it draws.
     ///
-    /// The screens set no colours on purpose, so ratatui's crossterm backend —
-    /// which tracks fg and bg from `Color::Reset` and writes SGR only on a
-    /// difference — emits nothing that would clear an attribute until the whole
-    /// frame has been painted, and never writes a blank cell at all. Whatever
-    /// the terminal was already in is what the screen is drawn in: coming back
-    /// from a session, the editor's own colours, mid-frame.
+    /// With no theme the screens set no colours on purpose, so ratatui's
+    /// crossterm backend — which tracks fg and bg from `Color::Reset` and
+    /// writes SGR only on a difference — emits nothing that would clear an
+    /// attribute until the whole frame has been painted, and never writes a
+    /// blank cell at all. Whatever the terminal was already in is what the
+    /// screen is drawn in: coming back from a session, the editor's own
+    /// colours, mid-frame.
     ///
     /// If ratatui ever leads a frame with a reset of its own this fails and the
     /// call in `Screen::open` can be revisited — the point of asserting it
@@ -1098,6 +1108,32 @@ mod tests {
             "the only SGR reset in a frame comes after its content, which is \
              too late to undo anything inherited"
         );
+    }
+
+    /// In a theme the first thing a screen writes may be a colour — the muted
+    /// empty-list line, here — and a colour sets only itself: still nothing
+    /// before the content clears the bold, reverse or dim a session left, so
+    /// the reset `Screen::open` writes is as needed with a theme as without.
+    #[test]
+    fn a_theme_clears_nothing_inherited_either() {
+        let mut app = App::new(Vec::new());
+        app.set_theme(crate::test_support::theme());
+        let emitted = test_support::emitted(48, 6, |f| draw::draw(f, &app));
+        let content = emitted
+            .find("no sessions")
+            .expect("the empty-list line is the screen's first content");
+        assert!(
+            emitted[..content].contains("38;5;8"),
+            "the line is not in muted's colour: {emitted:?}"
+        );
+        for clear in [
+            "\x1b[0m", "\x1b[m", "\x1b[39m", "\x1b[49m", "\x1b[22m", "\x1b[27m",
+        ] {
+            assert!(
+                !emitted[..content].contains(clear),
+                "{clear:?} before the first glyph in a theme"
+            );
+        }
     }
 
     /// Attaching is the outcome that gives the terminal back cleared; quitting

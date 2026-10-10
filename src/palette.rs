@@ -1,8 +1,10 @@
 //! The terminal's own colours, asked for once at startup.
 //!
-//! nvmux's screens set no colours of their own (see [`crate::ui`]), so it does
-//! not know what its text looks like on the terminal, and it never sees the
-//! cells of an attached session at all. The fade ([`crate::fade`]) needs both
+//! nvmux's screens set no colours of their own (see [`crate::ui`]) — none at
+//! all with no `[theme]`, and a theme's are often the terminal's own sixteen,
+//! by name (see [`crate::theme`]) — so it does not know what its text looks
+//! like on the terminal, and it never sees the cells of an attached session at
+//! all. The fade ([`crate::fade`]) needs both
 //! ends of every interpolation to be real colours: what a cell is now, and the
 //! terminal background it is dissolving into. So this module asks the terminal
 //! what those are — the default foreground and background (OSC 10 and 11) and
