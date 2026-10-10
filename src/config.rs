@@ -36,10 +36,12 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::error::ConfigError;
+use crate::palette::Rgb;
 
 /// The whole configuration. Each field is a table of its own, so the file reads
 /// as `[keys]`-style sections — `[picker]` for what the picker shows beside the
-/// names, and `[effects]` with a table inside it for each
+/// names, `[theme]` for the colour nvmux's own screens are drawn in, and
+/// `[effects]` with a table inside it for each
 /// effect: `[effects.fade]`, `[effects.move]`, `[effects.cursor]`,
 /// `[effects.back]`, `[effects.attach]`, `[effects.kill]`,
 /// `[effects.filter]` and `[effects.create]` for nvmux's own screens, and
@@ -56,6 +58,7 @@ pub struct Settings {
     pub session: SessionSettings,
     pub client: ClientSettings,
     pub picker: PickerSettings,
+    pub theme: ThemeSettings,
     pub effects: EffectsSettings,
 }
 
@@ -252,6 +255,83 @@ impl Notes {
             Notes::Column => "column",
             Notes::Off => "off",
         }
+    }
+}
+
+/// The colour nvmux's own screens are drawn in (see [`crate::theme`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThemeSettings {
+    /// What nvmux draws its own screens in: the picker, the prompt, the help
+    /// and the wait for a session, and over a session the hint bar and the
+    /// notice a switch puts up.
+    ///
+    /// `"terminal"`, the default, sets no colour at all, so the screens are in
+    /// the terminal's own foreground on its own background, shaded with dim,
+    /// bold and reverse. A colour, `"#rrggbb"` or `"#rgb"`, makes them
+    /// monochrome in that one instead: text in it, dim text in it dimmed, the
+    /// selection's bar in it with the name standing out of it in the
+    /// background's colour — and every fade and effect over them fading from
+    /// it, not from the terminal's foreground. The background is left the
+    /// terminal's own either way.
+    ///
+    /// Neovim's own screen is the editor's, and is never drawn in it. Nor is
+    /// the first-run screen, which is up before there is a config to read
+    /// this from. And `NO_COLOR` keeps every screen in the terminal's own
+    /// colours, whatever this says.
+    pub color: ThemeColor,
+}
+
+/// `[theme] color`: whose colour nvmux's own screens are drawn in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeColor {
+    /// The terminal's own: no colour set, as nvmux has always drawn.
+    #[default]
+    Terminal,
+    /// Shades of this one colour.
+    Mono(Rgb),
+}
+
+impl ThemeColor {
+    /// The value as the file spells it: `terminal`, or the colour as
+    /// `#rrggbb`.
+    pub fn name(self) -> String {
+        match self {
+            ThemeColor::Terminal => "terminal".to_string(),
+            ThemeColor::Mono(Rgb(r, g, b)) => format!("#{r:02x}{g:02x}{b:02x}"),
+        }
+    }
+
+    /// Read a value as the file spells it: `terminal`, or a colour as
+    /// `#rrggbb` or `#rgb`, the digits in either case.
+    ///
+    /// Those two are the spellings of a colour a terminal can answer in that
+    /// a person also writes, so they are read by the parser that reads the
+    /// terminal's answers ([`crate::palette`]), and `#f80` means `#ff8800`
+    /// there as it does here. Its other spellings — `rgb:ff/88/00`, and
+    /// twelve digits — are a terminal's, and are refused here.
+    pub fn parse(s: &str) -> Result<ThemeColor, String> {
+        if s == "terminal" {
+            return Ok(ThemeColor::Terminal);
+        }
+        s.strip_prefix('#')
+            .filter(|digits| matches!(digits.len(), 3 | 6))
+            .and_then(|_| crate::palette::parse_colour(s))
+            .map(ThemeColor::Mono)
+            .ok_or_else(|| format!("color {s:?} must be \"terminal\" or a colour like \"#7aa2f7\""))
+    }
+}
+
+/// The colour comes in as a human string; [`ThemeColor::parse`] reads it, and
+/// its message is folded into serde's error, which TOML then reports with the
+/// offending span — the shape `de_prefix` gives the prefix.
+impl<'de> Deserialize<'de> for ThemeColor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        ThemeColor::parse(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -967,6 +1047,7 @@ fn render_default_config(prefix: u8) -> String {
     let s = SessionSettings::default();
     let c = ClientSettings::default();
     let p = PickerSettings::default();
+    let t = ThemeSettings::default();
     let e = EffectsSettings::default();
     let f = e.fade;
     format!(
@@ -1016,6 +1097,13 @@ fn render_default_config(prefix: u8) -> String {
          # \"off\" shows none. To know, nvmux leaves a watcher in each session,\n\
          # which stays when nvmux leaves; \"off\" takes it out again.\n\
          # notes = {notes:?}\n\
+         \n\
+         [theme]\n\
+         # What nvmux's own screens are drawn in: \"terminal\" is the terminal's\n\
+         # own colours; a colour, \"#rrggbb\", draws them in shades of that one.\n\
+         # Neovim's screen is never drawn in it, and NO_COLOR keeps the\n\
+         # terminal's.\n\
+         # color = {theme_color:?}\n\
          \n\
          [effects]\n\
          # The master switch: false turns every effect below off, whatever its\n\
@@ -1096,6 +1184,7 @@ fn render_default_config(prefix: u8) -> String {
         lazy = c.lazy,
         predict = c.predict,
         notes = p.notes.name(),
+        theme_color = t.color.name(),
         fade_enabled = f.enabled,
         fade_duration = f.duration_ms,
         fade_session = f.session,
@@ -1202,6 +1291,7 @@ mod tests {
             "[session]",
             "[client]",
             "[picker]",
+            "[theme]",
             "[effects]",
             "[effects.smear]",
             "[effects.particles]",
@@ -1228,6 +1318,8 @@ mod tests {
             predict = true\n\
             [picker]\n\
             notes = \"signs\"\n\
+            [theme]\n\
+            color = \"terminal\"\n\
             [effects]\n\
             enabled = true\n\
             [effects.fade]\n\
@@ -1444,6 +1536,60 @@ mod tests {
         }
     }
 
+    /// The terminal's own colours unless told otherwise; a colour is a line
+    /// away, in either of the two spellings a person writes one in, and is
+    /// spelt back the long way.
+    #[test]
+    fn the_screens_are_in_the_terminals_colours_unless_told() {
+        assert_eq!(Settings::default().theme.color, ThemeColor::Terminal);
+        assert_eq!(ThemeColor::Terminal.name(), "terminal");
+        for (spelt, rgb, name) in [
+            ("#7aa2f7", Rgb(0x7a, 0xa2, 0xf7), "#7aa2f7"),
+            ("#7AA2F7", Rgb(0x7a, 0xa2, 0xf7), "#7aa2f7"),
+            ("#f80", Rgb(0xff, 0x88, 0x00), "#ff8800"),
+            ("#000", Rgb(0, 0, 0), "#000000"),
+        ] {
+            let s: Settings =
+                toml::from_str(&format!("[theme]\ncolor = \"{spelt}\"\n")).expect(spelt);
+            assert_eq!(s.theme.color, ThemeColor::Mono(rgb), "{spelt}");
+            assert_eq!(s.theme.color.name(), name, "{spelt}");
+            assert_eq!(
+                ThemeColor::parse(&s.theme.color.name()),
+                Ok(s.theme.color),
+                "{spelt} round trips"
+            );
+            assert_eq!(s.picker, PickerSettings::default(), "the rest as it was");
+            assert_eq!(s.effects, EffectsSettings::default(), "the rest as it was");
+        }
+        let s: Settings = toml::from_str("[theme]\ncolor = \"terminal\"\n").expect("valid");
+        assert_eq!(s, Settings::default(), "the default, said out loud");
+    }
+
+    /// A colour that is not one is refused with the key it was in and the
+    /// spellings that would have done.
+    #[test]
+    fn a_colour_that_is_not_one_says_what_would_be() {
+        for bad in [
+            "",
+            "blue",
+            "Terminal",
+            "7aa2f7",
+            "#7aa2f",
+            "#7aa2f7f",
+            "#7aa2fg",
+            " #7aa2f7",
+            "#7aa2f7 ",
+            "#ffff88880000",
+            "rgb:7a/a2/f7",
+        ] {
+            let err = ThemeColor::parse(bad).expect_err(bad);
+            assert!(
+                err.starts_with("color ") && err.contains("\"#7aa2f7\""),
+                "{bad:?} -> {err:?}"
+            );
+        }
+    }
+
     /// On and off as Neovide's are: the scroll and the windows on, the
     /// particles and the smooth blink off — but for the cursor's travel, off
     /// unless turned on.
@@ -1508,6 +1654,18 @@ mod tests {
             (
                 "an unparseable notes value",
                 "[picker]\nnotes = \"bubbles\"\n",
+            ),
+            ("an unknown theme key", "[theme]\ncolour = \"#7aa2f7\"\n"),
+            ("a colour by name", "[theme]\ncolor = \"blue\"\n"),
+            ("a colour with no #", "[theme]\ncolor = \"7aa2f7\"\n"),
+            ("a colour as a number", "[theme]\ncolor = 0x7aa2f7\n"),
+            (
+                "a colour of the wrong length",
+                "[theme]\ncolor = \"#7aa2f\"\n",
+            ),
+            (
+                "a theme's table outside [theme]",
+                "[color]\ncolor = \"#7aa2f7\"\n",
             ),
             ("an unknown effect", "[effects.sparkles]\nenabled = true\n"),
             (
@@ -1669,6 +1827,7 @@ mod tests {
         );
         assert!(rendered.contains("\n[client]\n"), "{rendered:?}");
         for table in [
+            "[theme]",
             "[effects]",
             "[effects.fade]",
             "[effects.move]",
@@ -1704,6 +1863,7 @@ mod tests {
             "# lazy = true",
             "# ui = \"nvmux\"",
             "# predict = true",
+            "# color = \"terminal\"",
             "# enabled     = true",
             "# duration_ms = 200",
             "# session     = true",

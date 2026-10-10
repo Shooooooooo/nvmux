@@ -33,6 +33,14 @@
 //! Coarser, and correct under `NO_COLOR` by construction, as everything else
 //! here is.
 //!
+//! "The foreground" in all of that is the colour the screen's text is drawn
+//! in, which under a theme is its ink rather than the terminal's (see
+//! [`crate::theme`]): the effects are handed the screens' palette, so they
+//! start from the colour the eye was already seeing. A theme is one colour,
+//! and has no red in it — so themed, the struck row's bar stays the ink, and
+//! the line through the name is the whole of the warning, as it is without a
+//! palette.
+//!
 //! The underline on a filter's matched letters is not here, and is not an
 //! effect: it is still, a modifier, and says why a row is still on screen, so
 //! [`super::draw`] draws it whatever `[effects]` says.
@@ -120,11 +128,15 @@ const SIFT_FROM: f32 = 0.3;
 /// The palette the effects paint with, or `None` to fall back to modifiers:
 /// none when `NO_COLOR` is set or the terminal did not say what its colours
 /// are.
-pub fn palette() -> Option<&'static Palette> {
+///
+/// The screens' palette rather than the terminal's ([`crate::theme::palette`]),
+/// so under a theme every effect starts its text from the ink, as the screen
+/// is drawn in it — and a struck row has no red to warm towards.
+pub fn palette() -> Option<Palette> {
     if std::env::var_os("NO_COLOR").is_some() {
         return None;
     }
-    crate::palette::get()
+    crate::palette::get().map(crate::theme::palette)
 }
 
 /// Whether the config wants an effect that paints in colour, so the terminal
@@ -215,8 +227,10 @@ fn glow(buf: &mut Buffer, rect: Rect, palette: Option<&Palette>, progress: f32) 
 
 /// The row a `[y/N]` is asking about: a line through its name, `drawn` of
 /// the way across, and — given a palette — its bar warmed towards the
-/// terminal's red by as much. The line is the crossed-out modifier, drawn in
-/// the text's own colour, so it is the same with a palette or without one.
+/// palette's red by as much: the terminal's own, or under a theme the ink
+/// itself, so that themed the bar stays the colour it was. The line is the
+/// crossed-out modifier, drawn in the text's own colour, so it is the same
+/// with a palette or without one.
 fn strike(buf: &mut Buffer, bar: Rect, name: Rect, palette: Option<&Palette>, drawn: f32) {
     let k = ease_out(drawn);
     let across = ((k * f32::from(name.width)).ceil() as u16).min(name.width);
@@ -668,6 +682,21 @@ mod tests {
         assert_eq!(marker.bg, warm, "{marker:?}");
         assert_eq!(marker.fg, rgb(p.bg));
         assert!(!marker.modifier.contains(Modifier::REVERSED));
+    }
+
+    /// Under a theme the screens have one colour and no red: the line goes
+    /// through the name all the same, and the bar it is on stays the ink.
+    #[test]
+    fn a_themed_strike_keeps_its_bar_in_the_ink() {
+        let ink = Rgb(0x7a, 0xa2, 0xf7);
+        let p = crate::theme::inked(&test_palette(), Some(ink));
+        let a = asking(STRIKE.as_millis() as u64);
+        let buf = frame(&a, Some(&p));
+        let y = row_of(&buf, "dotfiles");
+        assert_eq!(crossed(&buf, y).len(), 8);
+        let marker = first_glyph(&buf, y);
+        assert_eq!(marker.bg, rgb(ink), "warmed: {marker:?}");
+        assert_eq!(marker.fg, rgb(p.bg));
     }
 
     /// The line is drawn across from the left: partway, only the start of the

@@ -37,6 +37,7 @@
 
 use unicode_width::UnicodeWidthStr;
 
+use crate::palette::Rgb;
 use crate::shadow::Over;
 
 /// The name, and where it stands: what the picker hands to the session.
@@ -49,14 +50,22 @@ pub struct HandOff {
     /// The top-left cell, 0-based, in the terminal's own grid.
     row: u16,
     col: u16,
+    /// What the name is drawn in: the theme's ink, which the picker drew it
+    /// in, or `None` for the terminal's own foreground (see [`crate::theme`]).
+    ink: Option<Rgb>,
 }
 
 impl HandOff {
-    /// The name `name` at (`row`, `col`), cut to `width` columns. `None` when
-    /// nothing of it is left to show.
+    /// The name `name` at (`row`, `col`), cut to `width` columns, in the
+    /// theme's ink if there is one. `None` when nothing of it is left to show.
     pub fn new(name: &str, row: u16, col: u16, width: u16) -> Option<Self> {
         let text = crate::ui::draw::truncate(&crate::announce::label(name), usize::from(width));
-        (!text.is_empty()).then_some(Self { text, row, col })
+        (!text.is_empty()).then(|| Self {
+            text,
+            row,
+            col,
+            ink: crate::theme::ink(),
+        })
     }
 
     /// Whether config allows the hand-off and the terminal can show it: the
@@ -95,16 +104,17 @@ impl HandOff {
         })
     }
 
-    /// The bytes that draw the name in the terminal's own colours, leaving the
-    /// cursor and the pen as they were.
+    /// The bytes that draw the name as the picker left it — in the terminal's
+    /// own colours, or in the theme's ink — leaving the cursor and the pen as
+    /// they were.
     pub fn show(&self) -> Vec<u8> {
-        self.at_name(&self.text)
+        self.at_name(&self.text, self.ink)
     }
 
     /// The bytes that take the name down again: blanks over its cells, in the
     /// terminal's own background, leaving the cursor and the pen as they were.
     pub fn erase(&self) -> Vec<u8> {
-        self.at_name(&" ".repeat(usize::from(self.width())))
+        self.at_name(&" ".repeat(usize::from(self.width())), None)
     }
 
     /// Take the name down now: [`HandOff::erase`], written. For the paths that
@@ -114,11 +124,13 @@ impl HandOff {
     }
 
     /// `text` written over the name's cells: `DECSC`, a reset so the cells
-    /// are the terminal's own colours, an absolute `CUP` — no newline, which
-    /// with `OPOST` off would move the cursor rather than wrap — and `DECRC`.
-    fn at_name(&self, text: &str) -> Vec<u8> {
+    /// are the terminal's own colours — carrying `ink` when there is one (see
+    /// [`crate::announce::pen`]) — an absolute `CUP` — no newline, which with
+    /// `OPOST` off would move the cursor rather than wrap — and `DECRC`.
+    fn at_name(&self, text: &str, ink: Option<Rgb>) -> Vec<u8> {
         format!(
-            "\x1b7\x1b[0m\x1b[{};{}H{text}\x1b8",
+            "\x1b7{}\x1b[{};{}H{text}\x1b8",
+            crate::announce::pen(false, ink),
             u32::from(self.row) + 1,
             u32::from(self.col) + 1
         )
@@ -147,6 +159,22 @@ mod tests {
     fn taking_it_down_blanks_exactly_its_cells() {
         let erased = String::from_utf8(dotfiles().erase()).unwrap();
         assert_eq!(erased, "\x1b7\x1b[0m\x1b[5;28H        \x1b8");
+    }
+
+    /// Under a theme the name is left in the ink the picker drew it in; it is
+    /// taken down the same either way, blanks showing no colour.
+    #[test]
+    fn a_themed_name_is_left_in_its_ink() {
+        let h = HandOff {
+            ink: Some(Rgb(0x7a, 0xa2, 0xf7)),
+            ..dotfiles()
+        };
+        let shown = String::from_utf8(h.show()).unwrap();
+        assert_eq!(
+            shown,
+            "\x1b7\x1b[0;38;2;122;162;247m\x1b[5;28Hdotfiles\x1b8"
+        );
+        assert_eq!(h.erase(), dotfiles().erase());
     }
 
     /// Cut where the row was cut, measured in columns.

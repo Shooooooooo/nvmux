@@ -45,7 +45,10 @@
 //! The fade ([`crate::fade`]) and the picker's passing effects ([`effects`])
 //! are the only things that paint a colour on these screens, and they do so as
 //! a post-pass over a finished frame, never inside a `draw`: a screen's own
-//! drawing stays colourless, and its tests say so.
+//! drawing stays colourless, and its tests say so. So does the theme, when
+//! `[theme] color` names one ([`crate::theme`]): it is the last pass over every
+//! frame, giving whatever the others left without a colour its ink, so every
+//! screen's `terminal.draw` ends with it — the fade's frames included.
 
 pub mod app;
 pub mod attaching;
@@ -421,6 +424,7 @@ fn run_loop(
     // What the effects paint with, if they paint in colour: asked once, since
     // neither the answer nor `NO_COLOR` changes for the run.
     let palette = effects::palette();
+    let palette = palette.as_ref();
     // When the loop last drew, and the area it drew: `None` until its first
     // frame, which is always drawn.
     let mut drawn: Option<Instant> = None;
@@ -707,10 +711,12 @@ fn hand_over(
     }
 }
 
-/// One frame of the picker: the screen, then whatever is passing over it.
+/// One frame of the picker: the screen, then whatever is passing over it, and
+/// last the theme's colour on whatever that left without one.
 fn frame(f: &mut ratatui::Frame, app: &App, palette: Option<&crate::palette::Palette>) {
     draw::draw(f, app);
     effects::paint(f, app, palette);
+    crate::theme::paint(f.buffer_mut());
 }
 
 /// Erase the row a kill was just confirmed for, and only then let the kill
@@ -1098,6 +1104,28 @@ mod tests {
             "the only SGR reset in a frame comes after its content, which is \
              too late to undo anything inherited"
         );
+    }
+
+    /// A themed picker is the plain one in one colour: every cell in the ink,
+    /// no background set anywhere, and every glyph and modifier — the dim
+    /// numbers and hints, the selection's reversed bar — exactly as drawn with
+    /// no theme, which is where its shades come from.
+    #[test]
+    fn a_themed_picker_is_the_plain_one_in_its_ink() {
+        use ratatui::style::Color;
+
+        let ink = crate::palette::Rgb(0x7a, 0xa2, 0xf7);
+        let a = test_support::picker(&["api-server", "dotfiles", "notes"]);
+        let plain = test_support::buffer(40, 8, |f| draw::draw(f, &a));
+        let themed = test_support::buffer(40, 8, |f| {
+            draw::draw(f, &a);
+            crate::theme::paint_in(f.buffer_mut(), ink);
+        });
+        for (cell, was) in themed.content.iter().zip(&plain.content) {
+            assert_eq!(cell.fg, Color::Rgb(ink.0, ink.1, ink.2), "{cell:?}");
+            assert_eq!(cell.bg, Color::Reset, "{cell:?}");
+            assert_eq!((cell.symbol(), cell.modifier), (was.symbol(), was.modifier));
+        }
     }
 
     /// Attaching is the outcome that gives the terminal back cleared; quitting

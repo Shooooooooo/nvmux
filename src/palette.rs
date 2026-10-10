@@ -246,7 +246,7 @@ fn osc_payload(bytes: &[u8]) -> Option<(&[u8], usize)> {
 /// hex digits per channel (`rgba:` with a fourth channel, ignored), or
 /// `#rgb` / `#rrggbb` / `#rrrgggbbb` / `#rrrrggggbbbb`. Anything else is not
 /// a colour.
-fn parse_colour(spec: &str) -> Option<Rgb> {
+pub(crate) fn parse_colour(spec: &str) -> Option<Rgb> {
     let spec = spec.trim();
     if let Some(hex) = spec.strip_prefix('#') {
         if hex.is_empty() || hex.len() % 3 != 0 || hex.len() > 12 {

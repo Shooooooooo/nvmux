@@ -14,7 +14,11 @@
 //! foreground is moved toward the background before the frame is presented.
 //! `draw::draw` and its siblings never set a colour and keep their tests
 //! saying so; the colour is added afterwards, and at the end of a fade-in the
-//! frame is byte-identical to a plain draw.
+//! frame is byte-identical to a plain draw. Under a theme ([`crate::theme`])
+//! the colour a cell is moved from is the theme's ink rather than the
+//! terminal's foreground, and the ink is put on after the fade, last, as it
+//! is on every frame of those screens — so a plain draw there is a themed one,
+//! and the fade ends on that.
 //!
 //! An attached session is raw Neovim that nvmux only proxies bytes for. Its
 //! cells come from the shadow grid ([`crate::shadow`]) that watched those
@@ -129,22 +133,27 @@ pub struct Dissolve {
     /// is rather than for the key it comes from, since that key measures both
     /// directions and these two numbers are no longer the same one.
     pub one_way: Duration,
-    /// The terminal's own colours: what a glyph fully drawn is, what a glyph
-    /// fully dissolved is, and — for a caller painting the session's own cells
-    /// rather than its own text — what every indexed colour in between means.
+    /// The terminal's own colours: what a glyph fully dissolved is, and — for
+    /// a caller painting the session's own cells rather than its own text —
+    /// what the default foreground and every indexed colour mean.
     pub palette: Palette,
+    /// What a glyph of nvmux's own is fully drawn in: the terminal's
+    /// foreground, or the theme's colour in its place (see [`crate::theme`]).
+    /// Kept apart from `palette.fg`, which a session's own cells still
+    /// resolve through.
+    pub ink: Rgb,
 }
 
 impl Dissolve {
-    /// The colour a glyph is drawn in `t` of the way through a fade, or `None`
-    /// for one not being faded at all.
+    /// The colour a glyph of nvmux's own is drawn in `t` of the way through a
+    /// fade, or `None` for one not being faded at all.
     ///
-    /// Zero is "do not touch it" rather than "the foreground at no distance" —
-    /// the same rule [`apply`] keeps for a ratatui frame. It is what lets the
-    /// last frame of a fade in set no colour whatever, so the screen it leaves
+    /// Zero is "do not touch it" rather than "the ink at no distance" — the
+    /// same rule [`apply`] keeps for a ratatui frame. It is what lets the last
+    /// frame of a fade in set no colour of its own, so the screen it leaves
     /// behind is byte for byte the one drawn without any fade at all.
     pub fn colour(self, t: f32) -> Option<Rgb> {
-        (t > 0.0).then(|| self.palette.fg.lerp(self.palette.bg, t))
+        (t > 0.0).then(|| self.ink.lerp(self.palette.bg, t))
     }
 }
 
@@ -152,9 +161,11 @@ impl Dissolve {
 /// or the fade switched off in `[effects]`. Exactly the gate [`enabled`] reports, in the
 /// one form a caller that paints its own frames can use.
 pub fn dissolve() -> Option<Dissolve> {
+    let palette = *active()?;
     Some(Dissolve {
         one_way: one_way(),
-        palette: *active()?,
+        palette,
+        ink: crate::theme::ink().unwrap_or(palette.fg),
     })
 }
 
@@ -308,6 +319,9 @@ impl Schedule {
 /// row dissolving should look like; `DIM` keeps the hint row starting
 /// exactly as it was drawn, since terminals dim differently and a guess at
 /// the dimmed colour would pop on the first frame.
+///
+/// `palette` is the screens' ([`crate::theme::palette`]): its foreground is
+/// what the screen's text is drawn in, the theme's ink when there is one.
 pub fn apply(buf: &mut Buffer, palette: &Palette, t: f32) {
     if t <= 0.0 {
         return;
@@ -322,9 +336,10 @@ pub fn apply(buf: &mut Buffer, palette: &Palette, t: f32) {
 /// than dissolved (see [`crate::handoff`]), and with everything else going as
 /// an [`Iris`] closing onto `keep`'s row: the rows furthest from it first, its
 /// own last. A kept cell on the selection's bar comes off it as `t` goes, and
-/// on the last frame is plain text in the terminal's own colours — the very
-/// cell the screen the picker leaves behind draws it as. A kept cell that was
-/// not on a bar is left as it was drawn.
+/// on the last frame is plain text with no colour of its own — the very cell
+/// the screen the picker leaves behind draws it as, in the terminal's
+/// foreground or, themed, the ink both are given (see [`crate::handoff`]). A
+/// kept cell that was not on a bar is left as it was drawn.
 ///
 /// The bar under the text sinks into the background, and the text is
 /// whichever end of the two colours stands out from it: the background's, as
@@ -478,7 +493,9 @@ fn run<F>(
 where
     F: FnMut(&mut Frame),
 {
-    let Some(palette) = active() else {
+    // The screens' palette, not the terminal's: under a theme a screen is
+    // drawn in its ink, and dissolves from that (see `crate::theme`).
+    let Some(palette) = active().map(crate::theme::palette) else {
         return Ok(());
     };
     let mut schedule = Schedule::start(one_way(), direction, Instant::now());
@@ -487,10 +504,13 @@ where
         terminal.draw(|f| {
             draw(f);
             match shape {
-                Shape::Even => apply(f.buffer_mut(), palette, t),
-                Shape::Keeping(keep) => apply_keeping(f.buffer_mut(), palette, t, keep),
-                Shape::Iris(row) => apply_iris(f.buffer_mut(), palette, direction, t, row),
+                Shape::Even => apply(f.buffer_mut(), &palette, t),
+                Shape::Keeping(keep) => apply_keeping(f.buffer_mut(), &palette, t, keep),
+                Shape::Iris(row) => apply_iris(f.buffer_mut(), &palette, direction, t, row),
             }
+            // Last, as on every frame of a screen: what the fade left without a
+            // colour — all of it on the frame that is the screen as drawn.
+            crate::theme::paint(f.buffer_mut());
         })?;
         crate::term::write_stdout(SYNC_END)?;
         if !schedule.finished() {
@@ -541,10 +561,14 @@ fn run_session(shadow: &mut Shadow, direction: Direction, over: Option<&Over>) -
     let mut schedule = Schedule::start(one_way(), direction, Instant::now());
     let (rows, _) = shadow.size();
     let iris = over.map(|o| Iris::new(o.top, rows));
+    // The session's cells are the editor's, resolved through the terminal's
+    // palette; the name over them is nvmux's, in nvmux's colour.
+    let ink = crate::theme::ink().unwrap_or(palette.fg);
     while let Some(t) = schedule.next(Instant::now()) {
         let cursor = cursor_for(direction, schedule.finished());
         let dissolve = |row: u16| iris.map_or(t, |iris| iris.at(direction, t, row));
-        out.write_all(&shadow.frame_with(dissolve, palette, cursor, over.map(|o| (o, 1.0 - t))))?;
+        let over = over.map(|o| (o, ink, 1.0 - t));
+        out.write_all(&shadow.frame_with(dissolve, palette, cursor, over))?;
         out.flush()?;
         if !schedule.finished() {
             thread::sleep(FRAME);

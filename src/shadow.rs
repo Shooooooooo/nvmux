@@ -294,10 +294,11 @@ impl Shadow {
     /// [`Shadow::frame`], with each row `dissolve(row)` of the way to
     /// `palette.bg` rather than all of them the same — the shape an iris gives
     /// a fade (see [`crate::fade::Iris`]) — and with an overlay `over` painted
-    /// over it `ot` of the way dissolved, inside the same synchronized update,
-    /// so the terminal never presents the screen without it. The overlay's rectangle is
-    /// painted as [`Shadow::under`] paints it: its glyphs while they are the
-    /// more visible, the session's cells after.
+    /// over it, its glyphs in `ink` and `ot` of the way dissolved, inside the
+    /// same synchronized update, so the terminal never presents the screen
+    /// without it. The overlay's rectangle is painted as [`Shadow::under`]
+    /// paints it: its glyphs while they are the more visible, the session's
+    /// cells after.
     ///
     /// Those cells are painted again on every frame whatever the diff says,
     /// since the overlay is drawn over them on every frame; so the diff,
@@ -309,7 +310,7 @@ impl Shadow {
         dissolve: impl Fn(u16) -> f32,
         palette: &Palette,
         cursor: Cursor,
-        over: Option<(&Over, f32)>,
+        over: Option<(&Over, Rgb, f32)>,
     ) -> Vec<u8> {
         let screen = self.parser.screen();
         let (rows, cols) = if self.broken { (0, 0) } else { screen.size() };
@@ -355,8 +356,8 @@ impl Shadow {
                 at = Some(col + width);
             }
         }
-        if let Some((over, ot)) = over.filter(|_| !self.broken) {
-            self.paint_under(&mut out, over, palette, ot, &dissolve);
+        if let Some((over, ink, ot)) = over.filter(|_| !self.broken) {
+            self.paint_under(&mut out, over, palette, ink, ot, &dissolve);
         }
         out.extend_from_slice(RESET_SGR);
         // Inside the same synchronized update as the cells, so the screen and
@@ -460,9 +461,11 @@ impl Shadow {
     }
 
     /// The bytes that cross-fade `over` with the session's screen under it:
-    /// the overlay's own glyphs `t` of the way dissolved, and this shadow's
-    /// cells — what the session drew there, and what the overlay is covering —
-    /// `1 - t` of the way.
+    /// the overlay's own glyphs `t` of the way dissolved from `ink` — what
+    /// nvmux draws its own text in, the terminal's foreground unless a theme
+    /// says otherwise (see [`crate::theme`]) — and this shadow's cells — what
+    /// the session drew there, and what the overlay is covering — `1 - t` of
+    /// the way.
     ///
     /// This is what lets the attach notice dissolve into the editor rather
     /// than into a hole. The notice's own renderer fills its box with spaces,
@@ -493,12 +496,12 @@ impl Shadow {
     /// Cells past the end of the grid — a terminal that grew before the shadow
     /// was told — resolve to blanks, so a rectangle that hangs off the edge
     /// paints spaces rather than nothing.
-    pub fn under(&self, over: &Over, palette: &Palette, t: f32) -> Vec<u8> {
+    pub fn under(&self, over: &Over, palette: &Palette, ink: Rgb, t: f32) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(SYNC_BEGIN);
         out.extend_from_slice(SAVE_CURSOR);
         if !self.broken {
-            self.paint_under(&mut out, over, palette, t, &|_| 1.0 - t);
+            self.paint_under(&mut out, over, palette, ink, t, &|_| 1.0 - t);
         }
         out.extend_from_slice(RESET_SGR);
         out.extend_from_slice(RESTORE_CURSOR);
@@ -516,6 +519,7 @@ impl Shadow {
         out: &mut Vec<u8>,
         over: &Over,
         palette: &Palette,
+        ink: Rgb,
         t: f32,
         beneath: &dyn Fn(u16) -> f32,
     ) {
@@ -524,7 +528,7 @@ impl Shadow {
         // session's cells once they are not.
         let overlaid = t < CROSSOVER;
         let ink = Painted {
-            fg: palette.fg.lerp(palette.bg, t),
+            fg: ink.lerp(palette.bg, t),
             bg: None,
             bold: false,
             dim: false,
@@ -931,7 +935,7 @@ mod tests {
         let box_glyphs = "╭─╮│╰╯hi";
         let drawn = format!("0;38;2;{};{};{}", p.fg.0, p.fg.1, p.fg.2);
         let gone = format!("0;38;2;{};{};{}", p.bg.0, p.bg.1, p.bg.2);
-        for (at, sgr, text) in painted_cells(&under().under(&over(), &p, 0.0)) {
+        for (at, sgr, text) in painted_cells(&under().under(&over(), &p, p.fg, 0.0)) {
             if box_glyphs.contains(&text) {
                 assert_eq!(sgr, drawn, "the box was not whole at {at:?}");
             } else {
@@ -946,7 +950,7 @@ mod tests {
     /// having to put the screen back.
     #[test]
     fn a_fully_dissolved_box_is_the_screen_underneath() {
-        let frame = under().under(&over(), &palette(), 1.0);
+        let frame = under().under(&over(), &palette(), palette().fg, 1.0);
         // Columns 3..11 of each row, 0-based: D through K.
         assert_eq!(glyphs(&frame), "DEFGHIJKDEFGHIJKDEFGHIJK");
         let want = format!(
@@ -966,9 +970,9 @@ mod tests {
     #[test]
     fn a_cell_holding_both_swaps_at_the_crossover() {
         let shadow = under();
-        assert!(glyphs(&shadow.under(&over(), &palette(), 0.49)).starts_with('╭'));
+        assert!(glyphs(&shadow.under(&over(), &palette(), palette().fg, 0.49)).starts_with('╭'));
         assert_eq!(
-            glyphs(&shadow.under(&over(), &palette(), 0.51)),
+            glyphs(&shadow.under(&over(), &palette(), palette().fg, 0.51)),
             "DEFGHIJKDEFGHIJKDEFGHIJK"
         );
     }
@@ -980,7 +984,7 @@ mod tests {
     fn the_two_layers_dissolve_in_opposite_directions() {
         let shadow = under();
         let ink = |t: f32| {
-            painted_cells(&shadow.under(&over(), &palette(), t))
+            painted_cells(&shadow.under(&over(), &palette(), palette().fg, t))
                 .first()
                 .map(|(_, sgr, _)| sgr.clone())
                 .expect("a cell")
@@ -991,6 +995,28 @@ mod tests {
         // Past the crossover it is the screen, rising back out of it.
         assert_eq!(ink(0.75), "0;38;2;150;150;150");
         assert_eq!(ink(1.0), "0;38;2;200;200;200");
+    }
+
+    /// The box is drawn in the ink it is handed — nvmux's own colour, a
+    /// theme's when there is one — and dissolves from it; the screen under it
+    /// comes back in the terminal's colours whatever the ink, since its cells
+    /// are the editor's.
+    #[test]
+    fn the_box_is_in_its_ink_and_the_screen_in_its_own_colours() {
+        let p = palette();
+        let ink = Rgb(0x7a, 0xa2, 0xf7);
+        let sgr = |c: Rgb| format!("0;38;2;{};{};{}", c.0, c.1, c.2);
+        let box_glyphs = "╭─╮│╰╯hi";
+        for t in [0.0, 0.25] {
+            for (at, got, text) in painted_cells(&under().under(&over(), &p, ink, t)) {
+                if box_glyphs.contains(&text) {
+                    assert_eq!(got, sgr(ink.lerp(p.bg, t)), "at {at:?}, t = {t}");
+                }
+            }
+        }
+        for (at, got, _) in painted_cells(&under().under(&over(), &p, ink, 1.0)) {
+            assert_eq!(got, sgr(p.fg), "the screen took the ink at {at:?}");
+        }
     }
 
     /// The name the picker hands off rides the session's own fade-in frames:
@@ -1016,7 +1042,7 @@ mod tests {
         };
         let mut shadow = under();
 
-        let first = shadow.frame_with(|_| 1.0, &p, Cursor::Hidden, Some((&name, 0.0)));
+        let first = shadow.frame_with(|_| 1.0, &p, Cursor::Hidden, Some((&name, p.fg, 0.0)));
         let wire = text(&first);
         assert_eq!(
             wire.matches("\x1b[?2026h").count(),
@@ -1034,7 +1060,7 @@ mod tests {
         );
         assert_eq!(cells[&(4, 9)].1, "I", "beside it, the session's own cell");
 
-        let end = shadow.frame_with(|_| 0.0, &p, Cursor::Hidden, Some((&name, 1.0)));
+        let end = shadow.frame_with(|_| 0.0, &p, Cursor::Hidden, Some((&name, p.fg, 1.0)));
         let cells = last(&end);
         let back: String = (5..=8).map(|col| cells[&(4, col)].1.clone()).collect();
         assert_eq!(back, "EFGH", "the session's cells, where the name was");
@@ -1080,7 +1106,7 @@ mod tests {
     /// up would be seen as the editor's cursor going out.
     #[test]
     fn the_composite_leaves_the_cursor_and_the_editors_attributes_alone() {
-        let frame = under().under(&over(), &palette(), 0.5);
+        let frame = under().under(&over(), &palette(), palette().fg, 0.5);
         let mut head = Vec::new();
         head.extend_from_slice(SYNC_BEGIN);
         head.extend_from_slice(SAVE_CURSOR);
@@ -1107,7 +1133,7 @@ mod tests {
         let over = over();
         let shadow = under();
         for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
-            for (at, _, text) in painted_cells(&shadow.under(&over, &palette(), t)) {
+            for (at, _, text) in painted_cells(&shadow.under(&over, &palette(), palette().fg, t)) {
                 let (row, col) = at;
                 assert!(
                     (usize::from(over.top) + 1..usize::from(over.top) + 4).contains(&row),
@@ -1134,7 +1160,7 @@ mod tests {
         // 日 straddles the left edge (0-based columns 2 and 3) and 本 the
         // right (columns 10 and 11); the box covers 3..11.
         shadow.feed("\x1b[3;3H日......本".as_bytes());
-        let frame = shadow.under(&over(), &palette(), 1.0);
+        let frame = shadow.under(&over(), &palette(), palette().fg, 1.0);
         let row: String = painted_cells(&frame)
             .into_iter()
             .filter(|((r, _), _, _)| *r == 3)
@@ -1155,7 +1181,7 @@ mod tests {
             width: 8,
             rows: vec!["        ".into(), "        ".into(), "        ".into()],
         };
-        let frame = under().under(&over, &palette(), 1.0);
+        let frame = under().under(&over, &palette(), palette().fg, 1.0);
         assert_eq!(glyphs(&frame), " ".repeat(24));
     }
 
@@ -1166,7 +1192,7 @@ mod tests {
     fn a_retired_shadow_composites_nothing() {
         let mut shadow = under();
         shadow.broken = true;
-        assert!(painted_cells(&shadow.under(&over(), &palette(), 1.0)).is_empty());
+        assert!(painted_cells(&shadow.under(&over(), &palette(), palette().fg, 1.0)).is_empty());
     }
 
     /// A frame that paints nothing at all: the wrapper, and only the wrapper.

@@ -95,6 +95,9 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Outcome> {
         message: None,
     };
     loop {
+        // The one screen with no theme pass (see `crate::theme`): it is up
+        // before the config is read, and reading the theme would read the
+        // config — fixing the defaults in place of the file about to be loaded.
         terminal.draw(|f| draw(f, &state))?;
 
         if !event::poll(super::TICK)? {

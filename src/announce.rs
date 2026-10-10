@@ -265,6 +265,9 @@ pub struct Popup {
     label: String,
     /// How the box dissolves, or `None` when it does not.
     dissolve: Option<Dissolve>,
+    /// What the box is drawn in at rest: the theme's ink, or `None` for the
+    /// terminal's own foreground (see [`crate::theme`]).
+    ink: Option<Rgb>,
     /// When to stop waiting for a moment to draw in that is not coming.
     give_up_at: Instant,
     /// Set when the box is first painted: everything that happens to it after.
@@ -282,17 +285,24 @@ impl Popup {
     /// to once [`label`] has been through it. The relay then carries no state at
     /// all rather than a popup that would decline to draw itself later.
     pub fn arm(label: Option<String>, now: Instant) -> Option<Self> {
-        Self::armed(label, now, fade::dissolve())
+        Self::armed(label, now, fade::dissolve(), crate::theme::ink())
     }
 
-    /// [`Popup::arm`] with the effect handed in rather than read, which is how
-    /// the tests reach the dissolving states: no palette is ever installed
-    /// under test, so [`fade::dissolve`] is always `None` there.
-    fn armed(label: Option<String>, now: Instant, dissolve: Option<Dissolve>) -> Option<Self> {
+    /// [`Popup::arm`] with the effect and the ink handed in rather than read,
+    /// which is how the tests reach the dissolving and the themed states: no
+    /// palette and no config is ever installed under test, so
+    /// [`fade::dissolve`] and [`crate::theme::ink`] are always `None` there.
+    fn armed(
+        label: Option<String>,
+        now: Instant,
+        dissolve: Option<Dissolve>,
+        ink: Option<Rgb>,
+    ) -> Option<Self> {
         let label = label.filter(|l| !l.is_empty())?;
         Some(Self {
             label,
             dissolve,
+            ink,
             give_up_at: now + GIVE_UP,
             life: None,
             painted: false,
@@ -469,7 +479,8 @@ impl Popup {
     /// fully dissolved, which is the background — but it would paint it in
     /// explicit colour, and for the whole second the box is up it should be
     /// drawn in the terminal's own foreground rather than in nvmux's reading
-    /// of it, exactly as every other nvmux screen is.
+    /// of it, exactly as every other nvmux screen is — or in the theme's ink,
+    /// as every other nvmux screen is then.
     ///
     /// Without a shadow there is nothing to dissolve into and the box behaves
     /// as it did before this existed: `[effects.fade] session = false` does without
@@ -479,16 +490,17 @@ impl Popup {
     fn draw(&self, over: &Over, under: Option<&Shadow>, t: f32) -> Vec<u8> {
         match (under, self.dissolve) {
             (Some(shadow), Some(d)) if t > 0.0 && shadow.is_usable() => {
-                shadow.under(over, &d.palette, t)
+                shadow.under(over, &d.palette, d.ink, t)
             }
             _ => plain_bytes(over, self.colour(t)),
         }
     }
 
-    /// The colour this frame is drawn in — nothing at all without an effect,
-    /// and nothing at rest.
+    /// The colour this frame is drawn in: dissolving, the ink some of the way
+    /// to the background; at rest, or with no effect, the theme's ink — and
+    /// without a theme, nothing at all.
     fn colour(&self, t: f32) -> Option<Rgb> {
-        self.dissolve.and_then(|d| d.colour(t))
+        self.dissolve.and_then(|d| d.colour(t)).or(self.ink)
     }
 }
 
@@ -560,7 +572,8 @@ pub fn overlay(label: &str, size: PtySize) -> Option<Over> {
 /// here, and the hint bar the prefix puts up ([`crate::hint`]) — and the escape
 /// sequence they have to get right is the same one, so it is written once.
 /// `sgr` is the one thing that differs: a reset, a reset carrying a dissolve's
-/// foreground, or a reset carrying `DIM`.
+/// foreground, or a reset carrying `DIM` — and under a theme, the theme's ink
+/// on any of them (see [`pen`]).
 ///
 /// Rows of spaces erase: a block hides what is under it by writing over it, and
 /// only [`Shadow::under`] can give it back.
@@ -609,16 +622,24 @@ pub(crate) fn placed(over: &Over, sgr: &str) -> Vec<u8> {
 /// as it was before there was a fade and as it still is at rest, and it must
 /// stay that: the box sets no colour, so it is drawn in whatever the terminal's
 /// own foreground is, exactly as every nvmux screen is. `Some` is a frame of a
-/// dissolve, and only the *foreground* moves — the interior is spaces, and a
-/// space is erased with the current background, which the reset has just put
-/// back to the terminal's own. The same division `fade::apply` makes over a
-/// ratatui buffer.
+/// dissolve, or the box at rest under a theme, in its ink — and either way only
+/// the *foreground* is set: the interior is spaces, and a space is erased with
+/// the current background, which the reset has just put back to the terminal's
+/// own. The same division `fade::apply` makes over a ratatui buffer.
 pub fn plain_bytes(over: &Over, fg: Option<Rgb>) -> Vec<u8> {
-    let sgr = match fg {
-        Some(Rgb(r, g, b)) => format!("\x1b[0;38;2;{r};{g};{b}m"),
-        None => "\x1b[0m".to_string(),
-    };
-    placed(over, &sgr)
+    placed(over, &pen(false, fg))
+}
+
+/// The pen nvmux's own text is written in over a screen it does not own: a
+/// reset, then `DIM` if `dim`, then `fg` as a true colour if there is one, all
+/// on the one CSI — the reset first, for the reason [`placed`] gives, and
+/// nothing after it for a later write to have to undo. The box here, the hint
+/// bar ([`crate::hint`]) and the name an attach hands across
+/// ([`crate::handoff`]) all write theirs with it.
+pub(crate) fn pen(dim: bool, fg: Option<Rgb>) -> String {
+    let dim = if dim { ";2" } else { "" };
+    let fg = fg.map_or(String::new(), |Rgb(r, g, b)| format!(";38;2;{r};{g};{b}"));
+    format!("\x1b[0{dim}{fg}m")
 }
 
 #[cfg(test)]
@@ -639,6 +660,7 @@ mod tests {
         Dissolve {
             one_way: Duration::from_millis(100),
             palette: palette(),
+            ink: palette().fg,
         }
     }
 
@@ -940,7 +962,8 @@ mod tests {
     fn the_box_arrives_out_of_the_screen_it_is_covering() {
         let t0 = Instant::now();
         let screen = screen(24, 80);
-        let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
+        let mut popup =
+            Popup::armed(Some("dotfiles".into()), t0, Some(dissolve()), None).expect("armed");
 
         let mut now = t0;
         let mut frames = vec![];
@@ -977,7 +1000,8 @@ mod tests {
     fn the_box_leaves_back_into_the_screen_it_was_covering() {
         let t0 = Instant::now();
         let screen = screen(24, 80);
-        let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
+        let mut popup =
+            Popup::armed(Some("dotfiles".into()), t0, Some(dissolve()), None).expect("armed");
 
         let mut now = t0;
         let mut last = String::new();
@@ -1011,7 +1035,8 @@ mod tests {
     fn every_frame_of_the_box_leaves_the_terminal_where_it_found_it() {
         let t0 = Instant::now();
         let screen = screen(24, 80);
-        let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
+        let mut popup =
+            Popup::armed(Some("dotfiles".into()), t0, Some(dissolve()), None).expect("armed");
         let mut now = t0;
         let mut frames = 0;
         for _ in 0..10_000 {
@@ -1041,7 +1066,7 @@ mod tests {
     fn with_no_shadow_the_box_dissolves_as_it_did_before() {
         let t0 = Instant::now();
         let d = dissolve();
-        let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(d)).expect("armed");
+        let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(d), None).expect("armed");
         let Act::Paint(bytes) = popup.step(t0, quiet(), big(), None) else {
             panic!("the box did not go up");
         };
@@ -1059,7 +1084,7 @@ mod tests {
     fn the_box_at_rest_is_drawn_plain_even_with_a_screen_to_hand() {
         let t0 = Instant::now();
         let screen = screen(24, 80);
-        let mut popup = Popup::armed(Some("dotfiles".into()), t0, None).expect("armed");
+        let mut popup = Popup::armed(Some("dotfiles".into()), t0, None, None).expect("armed");
         let Act::Paint(bytes) = popup.step(t0, quiet(), big(), Some(&screen)) else {
             panic!("the box did not go up");
         };
@@ -1097,7 +1122,7 @@ mod tests {
     #[test]
     fn a_box_drawn_over_is_back_up_on_the_next_pass() {
         let t0 = Instant::now();
-        let mut popup = Popup::armed(Some("dotfiles".into()), t0, None).expect("armed");
+        let mut popup = Popup::armed(Some("dotfiles".into()), t0, None, None).expect("armed");
         assert!(matches!(
             popup.step(t0, wrote(), big(), None),
             Act::Paint(_)
@@ -1137,7 +1162,7 @@ mod tests {
     #[test]
     fn a_terminal_never_left_between_sequences_gets_no_box() {
         let t0 = Instant::now();
-        let mut popup = Popup::armed(Some("dotfiles".into()), t0, None).expect("armed");
+        let mut popup = Popup::armed(Some("dotfiles".into()), t0, None, None).expect("armed");
         let mut at = t0;
         while at + Duration::from_millis(10) < t0 + GIVE_UP {
             at += Duration::from_millis(10);
@@ -1163,7 +1188,8 @@ mod tests {
     #[test]
     fn a_box_that_can_never_be_painted_does_not_spin_the_relay() {
         let t0 = Instant::now();
-        let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
+        let mut popup =
+            Popup::armed(Some("dotfiles".into()), t0, Some(dissolve()), None).expect("armed");
         assert!(matches!(
             popup.step(t0, quiet(), big(), None),
             Act::Paint(_)
@@ -1194,7 +1220,7 @@ mod tests {
     #[test]
     fn with_no_effect_the_box_goes_up_whole_and_comes_down_whole() {
         let t0 = Instant::now();
-        let mut popup = Popup::armed(Some("dotfiles".into()), t0, None).expect("armed");
+        let mut popup = Popup::armed(Some("dotfiles".into()), t0, None, None).expect("armed");
         let (painted, end) = drive(&mut popup, t0, big());
 
         assert_eq!(painted.len(), 1, "more than one paint: {painted:?}");
@@ -1213,7 +1239,7 @@ mod tests {
     fn the_box_dissolves_in_then_holds_then_dissolves_out() {
         let t0 = Instant::now();
         let d = dissolve();
-        let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(d)).expect("armed");
+        let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(d), None).expect("armed");
         let (painted, end) = drive(&mut popup, t0, big());
         assert_eq!(end, Act::Erase);
 
@@ -1262,7 +1288,8 @@ mod tests {
     #[test]
     fn the_box_it_holds_is_the_box_it_would_have_drawn_unfaded() {
         let t0 = Instant::now();
-        let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
+        let mut popup =
+            Popup::armed(Some("dotfiles".into()), t0, Some(dissolve()), None).expect("armed");
         let unfaded = overlay_bytes("dotfiles", big(), None).expect("drawn");
 
         let mut now = t0;
@@ -1283,13 +1310,68 @@ mod tests {
         assert_eq!(at_rest, 1, "the box at rest was painted {at_rest} times");
     }
 
+    /// Under a theme the box is in its ink: whole and at rest whether or not
+    /// there is an effect to dissolve it with, and on every frame of a dissolve
+    /// the ink on its way to the background rather than the terminal's
+    /// foreground — so the box at rest is never a jump from the frame before.
+    #[test]
+    fn a_themed_box_is_in_its_ink_and_dissolves_from_it() {
+        let ink = Rgb(0x7a, 0xa2, 0xf7);
+        let t0 = Instant::now();
+        let at_rest = overlay_bytes("dotfiles", big(), Some(ink)).expect("drawn");
+
+        let mut still = Popup::armed(Some("dotfiles".into()), t0, None, Some(ink)).expect("armed");
+        assert_eq!(
+            still.step(t0, quiet(), big(), None),
+            Act::Paint(at_rest.clone()),
+            "with no effect, the box goes up whole in its ink"
+        );
+
+        let d = Dissolve { ink, ..dissolve() };
+        let mut popup =
+            Popup::armed(Some("dotfiles".into()), t0, Some(d), Some(ink)).expect("armed");
+        let mut now = t0;
+        let mut rested = 0;
+        for _ in 0..10_000 {
+            match popup.step(now, quiet(), big(), None) {
+                Act::Paint(bytes) => {
+                    let t = popup.life.as_ref().expect("a life").t;
+                    if t == 0.0 {
+                        assert_eq!(bytes, at_rest, "at rest, not in its ink");
+                        rested += 1;
+                        continue;
+                    }
+                    let Rgb(r, g, b) = ink.lerp(d.palette.bg, t);
+                    for row in placed(&bytes) {
+                        assert_eq!(row.sgr, format!("0;38;2;{r};{g};{b}"), "t = {t}");
+                    }
+                }
+                Act::Idle => {}
+                _ => break,
+            }
+            now = popup.wake_at().max(now + Duration::from_millis(1));
+        }
+        assert_eq!(rested, 1, "the box at rest was painted {rested} times");
+    }
+
+    /// The pen every overlay writes in: one CSI from a reset, with dim and a
+    /// colour riding on it when asked for, and nothing else.
+    #[test]
+    fn the_pen_is_one_csi_from_a_reset() {
+        assert_eq!(pen(false, None), "\x1b[0m");
+        assert_eq!(pen(true, None), "\x1b[0;2m");
+        assert_eq!(pen(false, Some(Rgb(1, 2, 3))), "\x1b[0;38;2;1;2;3m");
+        assert_eq!(pen(true, Some(Rgb(1, 2, 3))), "\x1b[0;2;38;2;1;2;3m");
+    }
+
     /// The editor drawing over a dissolving box does not rewind it. `painted`
     /// only ever says the screen is behind; where the dissolve has got to is
     /// the schedule's business, and it is still the clock that decides that.
     #[test]
     fn a_repaint_mid_dissolve_resumes_where_it_had_got_to() {
         let t0 = Instant::now();
-        let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
+        let mut popup =
+            Popup::armed(Some("dotfiles".into()), t0, Some(dissolve()), None).expect("armed");
         let mut now = t0;
         assert!(matches!(
             popup.step(now, quiet(), big(), None),
@@ -1325,7 +1407,8 @@ mod tests {
     #[test]
     fn a_box_talked_over_for_its_whole_life_still_comes_down_on_time() {
         let t0 = Instant::now();
-        let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
+        let mut popup =
+            Popup::armed(Some("dotfiles".into()), t0, Some(dissolve()), None).expect("armed");
         let mut now = t0;
         assert!(matches!(
             popup.step(now, quiet(), big(), None),
@@ -1356,7 +1439,8 @@ mod tests {
     #[test]
     fn a_screen_too_small_mid_dissolve_stops_rather_than_drawing_a_fragment() {
         let t0 = Instant::now();
-        let mut popup = Popup::armed(Some("dotfiles".into()), t0, Some(dissolve())).expect("armed");
+        let mut popup =
+            Popup::armed(Some("dotfiles".into()), t0, Some(dissolve()), None).expect("armed");
         let mut now = t0;
         assert!(matches!(
             popup.step(now, quiet(), big(), None),

@@ -185,6 +185,17 @@ nvmux needs no configuration. An optional TOML file — `$NVMUX_CONFIG` if set,
 else `$XDG_CONFIG_HOME/nvmux/config.toml`, else `~/.config/nvmux/config.toml` —
 overrides the defaults below; an unknown key or a bad value is a startup error.
 
+nvmux's own screens — the picker, the prompt, the help, and the hint bar and
+notice it draws over a session — come in your terminal's own colours. Name one
+colour instead and they are drawn monochrome in it: text in the colour, dim
+text dimmed, the selection's bar filled with it. Neovim's own screen keeps the
+editor's colours, and `NO_COLOR` keeps the terminal's.
+
+```toml
+[theme]
+color = "#7aa2f7"
+```
+
 <details>
 <summary>Every setting, at its default</summary>
 
@@ -204,6 +215,9 @@ predict     = true    # over a slow link, scrolls show before Neovim answers
 
 [picker]
 notes = "signs"   # what a session reports beside its name: "signs", "column" or "off"
+
+[theme]
+color = "terminal"   # or "#rrggbb": nvmux's own screens in shades of that one colour
 
 [effects]
 enabled = true   # master switch: false turns every effect below off
