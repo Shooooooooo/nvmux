@@ -72,9 +72,9 @@ pub fn ensure_runtime_dir() -> Result<PathBuf, PathError> {
 /// sticky bit stops another user *deleting* our directory but not *creating* it
 /// first, and a socket they can reach runs `nvim_command("!sh")` as us.
 pub(crate) fn ensure_dir_secure(dir: &Path) -> Result<(), PathError> {
-    let io = |source| PathError::Io {
+    let io = |error| PathError::Io {
         path: dir.to_path_buf(),
-        source,
+        error,
     };
 
     // Bounded retry: the only way round the loop is losing a create/remove race

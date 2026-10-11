@@ -903,23 +903,23 @@ pub fn load() -> Result<Settings, ConfigError> {
         ConfigSource::Default(path) => match std::fs::read_to_string(&path) {
             Ok(contents) => parse(&path, &contents),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
-            Err(source) => Err(ConfigError::Read { path, source }),
+            Err(error) => Err(ConfigError::Read { path, error }),
         },
         ConfigSource::Explicit(path) => match std::fs::read_to_string(&path) {
             Ok(contents) => parse(&path, &contents),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err(ConfigError::ExplicitMissing(path))
             }
-            Err(source) => Err(ConfigError::Read { path, source }),
+            Err(error) => Err(ConfigError::Read { path, error }),
         },
     }
 }
 
 /// Parse and validate the file contents, tagging every error with its path.
 fn parse(path: &Path, contents: &str) -> Result<Settings, ConfigError> {
-    let settings: Settings = toml::from_str(contents).map_err(|source| ConfigError::Parse {
+    let settings: Settings = toml::from_str(contents).map_err(|error| ConfigError::Parse {
         path: path.to_path_buf(),
-        source,
+        error,
     })?;
     settings
         .validate()
@@ -1127,9 +1127,9 @@ fn render_default_config(prefix: u8) -> String {
 /// than the `/tmp`-hardened one — see [`crate::paths::create_private_parent`]
 /// for why a pre-existing `~/.config` must not be refused.
 pub fn write_default(path: &Path, prefix: u8) -> Result<(), ConfigError> {
-    let err = |source| ConfigError::Write {
+    let err = |error| ConfigError::Write {
         path: path.to_path_buf(),
-        source,
+        error,
     };
     crate::paths::create_private_parent(path).map_err(err)?;
     crate::paths::write_atomic(path, render_default_config(prefix).as_bytes()).map_err(err)
@@ -1637,6 +1637,24 @@ mod tests {
                 other => panic!("{doc:?}: expected Invalid, got {other:?}"),
             }
         }
+    }
+
+    /// `main` prints a failed load through anyhow's `{:#}`, which follows the
+    /// message with every `source()`. The TOML error is in the message, so it
+    /// must not be one of those as well, or it is printed twice.
+    #[test]
+    fn a_parse_error_is_printed_once() {
+        let doc = "[keys]\nprefx = \"C-a\"\n";
+        let err = parse(Path::new("config.toml"), doc).expect_err(doc);
+        let cause = match &err {
+            ConfigError::Parse { error, .. } => error.to_string(),
+            other => panic!("expected Parse, got {other:?}"),
+        };
+        let plain = err.to_string();
+        let printed = format!("{:#}", anyhow::Error::from(err));
+        assert_eq!(printed.matches(&cause).count(), 1, "{printed}");
+        assert_eq!(printed, format!("config.toml: {cause}"));
+        assert_eq!(printed, plain, "printed plainly, it reads the same");
     }
 
     // --- first-run template (pure) -----------------------------------------

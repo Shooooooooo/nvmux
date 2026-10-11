@@ -123,7 +123,8 @@ fn establish_settings() -> Result<config::Settings> {
             match ui::setup::run()? {
                 ui::setup::Outcome::Chosen(prefix) => {
                     if let Err(e) = config::write_default(&path, prefix) {
-                        eprintln!("nvmux: could not write {}: {e}", path.display());
+                        // The error names the path itself.
+                        eprintln!("nvmux: could not write {e}");
                     }
                     Ok(config::with_prefix(prefix))
                 }
