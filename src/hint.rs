@@ -392,7 +392,9 @@ impl Bar {
 /// the relay is told to ask the server for the rest.
 fn erase(over: &Over, under: Option<&Shadow>, palette: Option<&Palette>) -> Act {
     match (under.filter(|s| s.is_usable()), palette) {
-        (Some(shadow), Some(palette)) => Act::Write(shadow.under(over, palette, 1.0)),
+        // Fully dissolved: none of the bar is drawn, so the colour it is
+        // given to be drawn in is moot.
+        (Some(shadow), Some(palette)) => Act::Write(shadow.under(over, palette, palette.fg, 1.0)),
         _ => Act::Blanked(announce::plain_bytes(&blank(over), None)),
     }
 }
