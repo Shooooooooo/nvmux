@@ -119,7 +119,7 @@ Beside each name the picker shows, dim, what that session has to report:
 
 | Sign | Means |
 |---|---|
-| `⠹` (turning) | something in it is busy: a progress message is running, which is how a plugin such as [agent.nvim](https://github.com/Shooooooooo/agent.nvim) says an agent is working |
+| `⠹` (turning) | something in it is busy: a progress message is running, which is how a plugin such as [agent.nvim](https://github.com/Shooooooooo/agent.nvim) says an agent is working, or a language server is at work — clangd indexing, say |
 | `⡆` | the same, with the percentage the progress gives |
 | `∗` | a program in one of its terminal buffers asked for a desktop notification — an agent wanting your permission, say |
 | `!` | a progress message failed |
@@ -130,8 +130,9 @@ until you next open its session. `[picker] notes = "column"` puts the notes in
 the rows instead, after the names; `"off"` shows none.
 
 To know, nvmux leaves a watcher in each session — one augroup, `nvmux_notes` —
-that records Neovim's progress messages and the notifications programs in
-terminal buffers send: OSC 777 (Ghostty's), OSC 9 (iTerm2's) and OSC 99
+that records Neovim's progress messages, what its language servers say they
+are working on (`clangd: 42% indexing 51/120`), and the notifications programs
+in terminal buffers send: OSC 777 (Ghostty's), OSC 9 (iTerm2's) and OSC 99
 (kitty's). It stays when nvmux leaves, so a session that wanted you overnight
 says so in the morning; `"off"` takes it out again.
 

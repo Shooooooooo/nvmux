@@ -1,8 +1,9 @@
 //! The watcher a session keeps its notes in ([`nvmux::notes`]), against real
-//! `nvim --headless` sessions: what it records of progress messages and of
-//! what programs in its terminal buffers send, what a read makes of that, and
-//! that clearing it, a newer version of it and taking it out each do what they
-//! say — and the picker's reader, which does all of it on a thread.
+//! `nvim --headless` sessions: what it records of progress messages, of what
+//! language servers say they are doing and of what programs in its terminal
+//! buffers send, what a read makes of that, and that clearing it, a newer
+//! version of it and taking it out each do what they say — and the picker's
+//! reader, which does all of it on a thread.
 //!
 //! They skip, rather than fail, when there is no usable `nvim` on `$PATH` —
 //! unless `$NVMUX_TEST_REQUIRE` names `nvim`, as it does in CI.
@@ -162,6 +163,93 @@ fn a_session_says_what_runs_in_it_and_what_its_terminals_ask_for() {
     );
 }
 
+/// A language server at work is busy, by its own name, from its `begin` to
+/// its `end` — or until it goes, since one that dies mid-work never says it
+/// has finished. The server is a stand-in in the session itself, as Neovim's
+/// own tests have one, saying what clangd says while it indexes.
+#[test]
+fn a_language_server_is_busy_until_its_work_ends_or_it_goes() {
+    require_nvim!();
+    let scratch = Scratch::new("notes-lsp");
+    let (_, sock) = a_session(&scratch, "indexing");
+    assert_eq!(notes::read(&sock), Reading::Said(None));
+
+    lua(
+        &sock,
+        r#"local server = {}
+_G.server = server
+vim.lsp.start({
+  name = 'clangd',
+  cmd = function(dispatchers)
+    server.dispatchers = dispatchers
+    local closing = false
+    return {
+      request = function(method, _, callback)
+        if method == 'initialize' then
+          callback(nil, { capabilities = {} })
+        elseif method == 'shutdown' then
+          callback(nil, vim.NIL)
+        end
+        return true, 1
+      end,
+      notify = function(method)
+        if method == 'exit' then
+          dispatchers.on_exit(0, 15)
+        end
+      end,
+      is_closing = function()
+        return closing
+      end,
+      terminate = function()
+        closing = true
+      end,
+    }
+  end,
+})
+function server.progress(value)
+  server.dispatchers.notification('$/progress', { token = 'backgroundIndexProgress', value = value })
+end"#,
+    );
+    let progress = |value: &str| lua(&sock, &format!("_G.server.progress({value})"));
+
+    progress("{ kind = 'begin', title = 'indexing', percentage = 0 }");
+    let begun = read_until(&sock, |n| n.is_some()).expect("busy");
+    assert_eq!(begun.kind, Kind::Busy(None), "0% is no percentage yet");
+    assert_eq!(
+        (begun.title.as_str(), begun.text.as_str()),
+        ("clangd", "indexing")
+    );
+
+    progress("{ kind = 'report', message = '3/120', percentage = 2 }");
+    let report = read_until(&sock, |n| n.is_some_and(|n| n.kind == Kind::Busy(Some(2))))
+        .expect("the report");
+    assert_eq!(report.text, "indexing 3/120");
+
+    progress("{ kind = 'report', percentage = 50 }");
+    let halfway =
+        read_until(&sock, |n| n.is_some_and(|n| n.kind == Kind::Busy(Some(50)))).expect("halfway");
+    assert_eq!(
+        halfway.text, "indexing 3/120",
+        "what a report leaves out stands"
+    );
+
+    progress("{ kind = 'end', message = 'done' }");
+    assert_eq!(
+        read_until(&sock, |n| n.is_none()),
+        None,
+        "done when it ends"
+    );
+
+    progress("{ kind = 'begin', title = 'indexing' }");
+    read_until(&sock, |n| n.is_some()).expect("busy again");
+    lua(&sock, "vim.lsp.get_clients({ name = 'clangd' })[1]:stop()");
+    assert_eq!(
+        read_until(&sock, |n| n.is_none()),
+        None,
+        "not busy once the server has gone"
+    );
+}
+
 /// A program's own progress bar, and ConEmu's other commands under OSC 9, are
 /// not notifications.
 #[test]
@@ -202,7 +290,7 @@ fn a_watcher_is_replaced_in_place_and_taken_out_whole() {
             "return #vim.api.nvim_get_autocmds({ group = 'nvmux_notes' })"
         )
         .as_u64(),
-        Some(if has_progress(&sock) { 2 } else { 1 }),
+        Some(if has_progress(&sock) { 3 } else { 2 }),
         "the autocommands replaced, not added to"
     );
 
