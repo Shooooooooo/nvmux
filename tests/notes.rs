@@ -250,6 +250,43 @@ end"#,
     );
 }
 
+/// Neovim's own progress messages are nothing running: a write's begins and
+/// ends within `:write`, and one that fails never says it has ended, which
+/// would leave the session busy for good. What an older watcher kept of one
+/// goes on the way in.
+#[test]
+fn neovims_own_progress_messages_are_never_busy() {
+    require_nvim!();
+    let scratch = Scratch::new("notes-own");
+    let (_, sock) = a_session(&scratch, "writing");
+    assert_eq!(notes::read(&sock), Reading::Said(None));
+    if !has_progress(&sock) {
+        return;
+    }
+
+    let wrote = lua(
+        &sock,
+        r"vim.cmd('noswapfile edit /nonexistent-nvmux-dir/f.txt')
+vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'x' })
+local ok = pcall(vim.cmd.write)
+return ok",
+    );
+    assert_eq!(wrote, Value::Boolean(false), "the write failed");
+    assert_eq!(notes::read(&sock), Reading::Said(None), "and is not busy");
+
+    lua(
+        &sock,
+        r"local N = require('nvmux.notes')
+N.progress['nvim\0bufwrite'] = { title = '', text = 'f.txt', at = os.time() }
+N.version = -1",
+    );
+    assert_eq!(
+        notes::read(&sock),
+        Reading::Said(None),
+        "an older watcher's, dropped"
+    );
+}
+
 /// A program's own progress bar, and ConEmu's other commands under OSC 9, are
 /// not notifications.
 #[test]

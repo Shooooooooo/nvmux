@@ -19,7 +19,7 @@
 //!
 //! So the session keeps the record itself. nvmux leaves a watcher in it
 //! ([`WATCHER`]): one augroup, `nvmux_notes`, with a `Progress` autocommand —
-//! every progress message, whatever sends it, on 0.12 and later — an
+//! every progress message but Neovim's own, on 0.12 and later — an
 //! `LspProgress` one, for what each language server says it is working on,
 //! and a `TermRequest` one, which takes the three notifications terminals
 //! know: OSC 777 `notify` (Ghostty's, urxvt's), OSC 9 (iTerm2's) and OSC 99
@@ -70,7 +70,7 @@ use crate::rpc;
 
 /// The watcher's version. A session holding an older one is given this one,
 /// the record it kept carried over; a newer nvmux does the same to this one.
-pub const VERSION: i64 = 2;
+pub const VERSION: i64 = 3;
 
 /// How long the picker waits between reads of its sessions.
 pub const POLL: Duration = Duration::from_secs(2);
@@ -100,6 +100,12 @@ const SETTLE: Duration = Duration::from_millis(30);
 /// mid-work never says it has finished; and the last notification, or failed
 /// progress message, until [`SEEN`] clears it. Text is kept without control
 /// characters and to 200 characters.
+///
+/// Neovim's own progress messages, `source` `nvim`, are left out: a write's
+/// and a completion's scan begin and end within the command that says them,
+/// so a read never finds one running — and a write that fails never says it
+/// has ended, nor does a scan, which would leave the session busy for good.
+/// An older watcher kept them, so they go from the record on the way in.
 const WATCHER: &str = r#"local version = ...
 local api = vim.api
 local N = package.loaded['nvmux.notes']
@@ -109,6 +115,11 @@ if type(N) ~= 'table' then
 end
 N.version = version
 N.progress = type(N.progress) == 'table' and N.progress or {}
+for key in pairs(N.progress) do
+  if key:sub(1, 5) == 'nvim\0' then
+    N.progress[key] = nil
+  end
+end
 N.lsp = {}
 local group = api.nvim_create_augroup('nvmux_notes', { clear = true })
 local function clean(s)
@@ -135,7 +146,7 @@ pcall(api.nvim_create_autocmd, 'Progress', {
   group = group,
   callback = function(ev)
     local d = ev.data
-    if type(d) ~= 'table' or d.id == nil then
+    if type(d) ~= 'table' or d.id == nil or d.source == 'nvim' then
       return
     end
     local key = tostring(d.source) .. '\0' .. tostring(d.id)
