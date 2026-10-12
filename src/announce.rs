@@ -572,8 +572,7 @@ pub fn overlay(label: &str, size: PtySize) -> Option<Over> {
 /// here, and the hint bar the prefix puts up ([`crate::hint`]) — and the escape
 /// sequence they have to get right is the same one, so it is written once.
 /// `sgr` is the one thing that differs: a reset, a reset carrying a dissolve's
-/// foreground, or a reset carrying `DIM` — and under a theme, the theme's ink
-/// on any of them (see [`pen`]).
+/// foreground or a theme's ink (see [`pen`]), or a reset carrying `DIM`.
 ///
 /// Rows of spaces erase: a block hides what is under it by writing over it, and
 /// only [`Shadow::under`] can give it back.
@@ -627,19 +626,19 @@ pub(crate) fn placed(over: &Over, sgr: &str) -> Vec<u8> {
 /// the current background, which the reset has just put back to the terminal's
 /// own. The same division `fade::apply` makes over a ratatui buffer.
 pub fn plain_bytes(over: &Over, fg: Option<Rgb>) -> Vec<u8> {
-    placed(over, &pen(false, fg))
+    placed(over, &pen(fg))
 }
 
 /// The pen nvmux's own text is written in over a screen it does not own: a
-/// reset, then `DIM` if `dim`, then `fg` as a true colour if there is one, all
-/// on the one CSI — the reset first, for the reason [`placed`] gives, and
-/// nothing after it for a later write to have to undo. The box here, the hint
-/// bar ([`crate::hint`]) and the name an attach hands across
-/// ([`crate::handoff`]) all write theirs with it.
-pub(crate) fn pen(dim: bool, fg: Option<Rgb>) -> String {
-    let dim = if dim { ";2" } else { "" };
-    let fg = fg.map_or(String::new(), |Rgb(r, g, b)| format!(";38;2;{r};{g};{b}"));
-    format!("\x1b[0{dim}{fg}m")
+/// reset, and `fg` as a true colour on the same CSI if there is one — the
+/// reset first, for the reason [`placed`] gives, and nothing after it for a
+/// later write to have to undo. The box here and the name an attach hands
+/// across ([`crate::handoff`]) write theirs with it.
+pub(crate) fn pen(fg: Option<Rgb>) -> String {
+    match fg {
+        Some(Rgb(r, g, b)) => format!("\x1b[0;38;2;{r};{g};{b}m"),
+        None => "\x1b[0m".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1354,14 +1353,12 @@ mod tests {
         assert_eq!(rested, 1, "the box at rest was painted {rested} times");
     }
 
-    /// The pen every overlay writes in: one CSI from a reset, with dim and a
-    /// colour riding on it when asked for, and nothing else.
+    /// The pen the box and the hand-off write in: one CSI from a reset, with
+    /// a colour riding on it when there is one, and nothing else.
     #[test]
     fn the_pen_is_one_csi_from_a_reset() {
-        assert_eq!(pen(false, None), "\x1b[0m");
-        assert_eq!(pen(true, None), "\x1b[0;2m");
-        assert_eq!(pen(false, Some(Rgb(1, 2, 3))), "\x1b[0;38;2;1;2;3m");
-        assert_eq!(pen(true, Some(Rgb(1, 2, 3))), "\x1b[0;2;38;2;1;2;3m");
+        assert_eq!(pen(None), "\x1b[0m");
+        assert_eq!(pen(Some(Rgb(1, 2, 3))), "\x1b[0;38;2;1;2;3m");
     }
 
     /// The editor drawing over a dissolving box does not rewind it. `painted`

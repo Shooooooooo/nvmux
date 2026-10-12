@@ -263,17 +263,19 @@ impl Notes {
 #[serde(default, deny_unknown_fields)]
 pub struct ThemeSettings {
     /// What nvmux draws its own screens in: the picker, the prompt, the help
-    /// and the wait for a session, and over a session the hint bar and the
-    /// notice a switch puts up.
+    /// and the wait for a session, and over a session the notice a switch
+    /// puts up and the name an attach hands across.
     ///
     /// `"terminal"`, the default, sets no colour at all, so the screens are in
     /// the terminal's own foreground on its own background, shaded with dim,
-    /// bold and reverse. A colour, `"#rrggbb"` or `"#rgb"`, makes them
-    /// monochrome in that one instead: text in it, dim text in it dimmed, the
-    /// selection's bar in it with the name standing out of it in the
-    /// background's colour — and every fade and effect over them fading from
-    /// it, not from the terminal's foreground. The background is left the
-    /// terminal's own either way.
+    /// bold and reverse. A colour, `"#rrggbb"` or `"#rgb"`, draws what they
+    /// draw at full strength in that one instead: the names and what is
+    /// typed, and the selection's bar, with the name standing out of it in the
+    /// background's colour — every fade and effect over them taking it from
+    /// that colour. What they draw dim — the session numbers, the notes, the
+    /// key hints, the hint bar a prefix puts up — stays the terminal's own,
+    /// dimmed, as it was. The background is left the terminal's own either
+    /// way.
     ///
     /// Neovim's own screen is the editor's, and is never drawn in it. Nor is
     /// the first-run screen, which is up before there is a config to read
@@ -1100,9 +1102,10 @@ fn render_default_config(prefix: u8) -> String {
          \n\
          [theme]\n\
          # What nvmux's own screens are drawn in: \"terminal\" is the terminal's\n\
-         # own colours; a colour, \"#rrggbb\", draws them in shades of that one.\n\
-         # Neovim's screen is never drawn in it, and NO_COLOR keeps the\n\
-         # terminal's.\n\
+         # own colours; a colour, \"#rrggbb\", draws their text and the\n\
+         # selection's bar in it, leaving what is dim, such as the session\n\
+         # numbers and the key hints, in the terminal's. Neovim's screen is\n\
+         # never drawn in it, and NO_COLOR keeps the terminal's.\n\
          # color = {theme_color:?}\n\
          \n\
          [effects]\n\

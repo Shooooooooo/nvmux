@@ -130,7 +130,7 @@ impl HandOff {
     fn at_name(&self, text: &str, ink: Option<Rgb>) -> Vec<u8> {
         format!(
             "\x1b7{}\x1b[{};{}H{text}\x1b8",
-            crate::announce::pen(false, ink),
+            crate::announce::pen(ink),
             u32::from(self.row) + 1,
             u32::from(self.col) + 1
         )

@@ -46,9 +46,12 @@
 //! are the only things that paint a colour on these screens, and they do so as
 //! a post-pass over a finished frame, never inside a `draw`: a screen's own
 //! drawing stays colourless, and its tests say so. So does the theme, when
-//! `[theme] color` names one ([`crate::theme`]): it is the last pass over every
-//! frame, giving whatever the others left without a colour its ink, so every
-//! screen's `terminal.draw` ends with it — the fade's frames included.
+//! `[theme] color` names one ([`crate::theme`]): it is the first pass over
+//! every frame once the screen has drawn it, giving what is drawn at full
+//! strength its ink and leaving what is drawn dim the terminal's own, so the
+//! effects and the fade after it take each cell from the colour it is drawn
+//! in. Every screen's `terminal.draw` makes that pass — the fade's frames
+//! included.
 
 pub mod app;
 pub mod attaching;
@@ -423,8 +426,8 @@ fn run_loop(
     let mut ticked = Instant::now();
     // What the effects paint with, if they paint in colour: asked once, since
     // neither the answer nor `NO_COLOR` changes for the run.
-    let palette = effects::palette();
-    let palette = palette.as_ref();
+    let colours = effects::colours();
+    let colours = colours.as_ref();
     // When the loop last drew, and the area it drew: `None` until its first
     // frame, which is always drawn.
     let mut drawn: Option<Instant> = None;
@@ -467,7 +470,7 @@ fn run_loop(
             // The area kept for the mouse: a click is resolved against the
             // screen as it was last drawn, which is the one the user clicked
             // on.
-            area = terminal.draw(|f| frame(f, &app, palette))?.area;
+            area = terminal.draw(|f| frame(f, &app, colours))?.area;
             // While anything is moving a frame goes out every `FRAME` whether
             // or not a key asked for one, and the terminal has to keep up.
             if paced && app.animating() {
@@ -529,7 +532,7 @@ fn run_loop(
         // with a session in flight, every arrow — and a second chance for a
         // held key to fall behind the screen.
         if app.landing().is_some() || request != Request::None {
-            play_out(terminal, &mut app, palette, |app| app.landing().is_some())?;
+            play_out(terminal, &mut app, colours, |app| app.landing().is_some())?;
         }
         deadline = app
             .pending()
@@ -558,7 +561,7 @@ fn run_loop(
                 // simply replaces the picker. A create dissolves the prompt
                 // out on its way to the client spawn either way — that is the
                 // prompt's own doing, since its screen is the one up.
-                let arrival = make_room(terminal, &mut app, palette)?;
+                let arrival = make_room(terminal, &mut app, colours)?;
                 let outcome = prompt::run_on(
                     terminal,
                     transport,
@@ -608,7 +611,7 @@ fn run_loop(
 
             Request::Kill(id) => {
                 if let Some(session) = app.session(&id).cloned() {
-                    erase(terminal, &mut app, &id, palette)?;
+                    erase(terminal, &mut app, &id, colours)?;
                     if let Err(e) = transport.kill_session(&session) {
                         app.set_message(e.one_line());
                     }
@@ -711,12 +714,12 @@ fn hand_over(
     }
 }
 
-/// One frame of the picker: the screen, then whatever is passing over it, and
-/// last the theme's colour on whatever that left without one.
-fn frame(f: &mut ratatui::Frame, app: &App, palette: Option<&crate::palette::Palette>) {
+/// One frame of the picker: the screen, the theme's colour on it, and then
+/// whatever is passing over it.
+fn frame(f: &mut ratatui::Frame, app: &App, colours: Option<&effects::Colours>) {
     draw::draw(f, app);
-    effects::paint(f, app, palette);
     crate::theme::paint(f.buffer_mut());
+    effects::paint(f, app, colours);
 }
 
 /// Erase the row a kill was just confirmed for, and only then let the kill
@@ -728,12 +731,12 @@ fn erase(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     id: &str,
-    palette: Option<&crate::palette::Palette>,
+    colours: Option<&effects::Colours>,
 ) -> Result<()> {
     if !app.start_backspace(id) {
         return Ok(());
     }
-    play_out(terminal, app, palette, App::erasing)
+    play_out(terminal, app, colours, App::erasing)
 }
 
 /// Make room in the list for the session `c` is about to create, and close
@@ -757,14 +760,14 @@ fn erase(
 fn make_room(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    palette: Option<&crate::palette::Palette>,
+    colours: Option<&effects::Colours>,
 ) -> Result<prompt::Arrival> {
     let name = prompt::default_name(app.sessions(), Some(app.new_number()));
     if !app.make_room(&name) {
         return Ok(prompt::Arrival::Cut);
     }
     let opened = Instant::now();
-    play_out(terminal, app, palette, |app| app.room().is_some())?;
+    play_out(terminal, app, colours, |app| app.room().is_some())?;
     let size = terminal.size()?;
     let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
     match draw::row_rect(app, area, app::GHOST_ID) {
@@ -792,16 +795,16 @@ fn make_room(
 fn play_out(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    palette: Option<&crate::palette::Palette>,
+    colours: Option<&effects::Colours>,
     playing: impl Fn(&App) -> bool,
 ) -> Result<()> {
     let mut ticked = Instant::now();
     while playing(app) {
-        terminal.draw(|f| frame(f, app, palette))?;
+        terminal.draw(|f| frame(f, app, colours))?;
         std::thread::sleep(crate::fade::FRAME);
         tick(app, &mut ticked);
     }
-    terminal.draw(|f| frame(f, app, palette))?;
+    terminal.draw(|f| frame(f, app, colours))?;
     Ok(())
 }
 
@@ -1106,13 +1109,14 @@ mod tests {
         );
     }
 
-    /// A themed picker is the plain one in one colour: every cell in the ink,
-    /// no background set anywhere, and every glyph and modifier — the dim
-    /// numbers and hints, the selection's reversed bar — exactly as drawn with
-    /// no theme, which is where its shades come from.
+    /// A themed picker is the plain one with its full-strength text in the
+    /// ink — the names, and the selection's reversed bar — and everything it
+    /// draws dim, the numbers and the hint row among it, in the terminal's own
+    /// foreground as before. No background is set anywhere, and every glyph
+    /// and modifier is exactly as drawn with no theme.
     #[test]
-    fn a_themed_picker_is_the_plain_one_in_its_ink() {
-        use ratatui::style::Color;
+    fn a_themed_picker_is_the_plain_one_with_its_ink_where_it_is_not_dim() {
+        use ratatui::style::{Color, Modifier};
 
         let ink = crate::palette::Rgb(0x7a, 0xa2, 0xf7);
         let a = test_support::picker(&["api-server", "dotfiles", "notes"]);
@@ -1121,11 +1125,19 @@ mod tests {
             draw::draw(f, &a);
             crate::theme::paint_in(f.buffer_mut(), ink);
         });
+        let mut dim = 0;
         for (cell, was) in themed.content.iter().zip(&plain.content) {
-            assert_eq!(cell.fg, Color::Rgb(ink.0, ink.1, ink.2), "{cell:?}");
+            let want = if was.modifier.contains(Modifier::DIM) {
+                dim += 1;
+                Color::Reset
+            } else {
+                Color::Rgb(ink.0, ink.1, ink.2)
+            };
+            assert_eq!(cell.fg, want, "{cell:?}");
             assert_eq!(cell.bg, Color::Reset, "{cell:?}");
             assert_eq!((cell.symbol(), cell.modifier), (was.symbol(), was.modifier));
         }
+        assert!(dim > 0, "the fixture draws something dim");
     }
 
     /// Attaching is the outcome that gives the terminal back cleared; quitting

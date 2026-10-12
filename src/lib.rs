@@ -12,7 +12,7 @@
 //! link to its host drops ([`reconnect`]), and what each session has to report
 //! beside its name in the picker — busy, failed, or a notification — from a
 //! watcher left in it ([`notes`]). All of what nvmux draws itself is in the
-//! terminal's own colours, or in shades of one colour of the user's
+//! terminal's own colours, or with its text in one colour of the user's
 //! ([`theme`]).
 //!
 //! macOS and Linux only.

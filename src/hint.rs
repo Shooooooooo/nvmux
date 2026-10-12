@@ -78,7 +78,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::announce;
 use crate::keys::{self, Pending};
-use crate::palette::{self, Palette, Rgb};
+use crate::palette::{self, Palette};
 use crate::pty::PtySize;
 use crate::shadow::{Over, Shadow};
 
@@ -104,6 +104,11 @@ const GAP: &str = "  ";
 /// [`crate::ui::help`] already gives: `Prefix::feed` reads a number, not a
 /// digit, so `12` reaches the twelfth session.
 const DIGITS: &str = "1-n session";
+
+/// A reset, then `DIM`. Every nvmux hint row is dim (`draw::draw_hint_row`), and
+/// the reset is what puts the background back, so the modifier rides along on
+/// the same CSI rather than following it.
+const SGR: &str = "\x1b[0;2m";
 
 /// The shortest screen the bar will draw on. Two, so it is never a session's
 /// only row: an editor left with nothing but nvmux's hints is worse than a user
@@ -247,27 +252,18 @@ pub struct Bar {
     /// read a process global mid-relay would have states no test could reach,
     /// since no palette is ever installed under test.
     palette: Option<Palette>,
-    /// The theme's ink, which the bar is drawn in as the picker's hint row is,
-    /// or `None` for the terminal's own foreground (see [`crate::theme`]).
-    /// Copied once, like `palette`.
-    ink: Option<Rgb>,
 }
 
 impl Bar {
     /// A bar with nothing on screen, on a child presumed quiet — which it is,
     /// at the top of a relay, until it says otherwise.
     pub fn new(now: Instant, size: PtySize) -> Self {
-        Self::with_palette(now, size, palette::get().copied(), crate::theme::ink())
+        Self::with_palette(now, size, palette::get().copied())
     }
 
     /// [`Bar::new`] with the colours handed in rather than read, which is how
-    /// the tests reach the restoring path and the themed bar at all.
-    fn with_palette(
-        now: Instant,
-        size: PtySize,
-        palette: Option<Palette>,
-        ink: Option<Rgb>,
-    ) -> Self {
+    /// the tests reach the restoring path at all.
+    fn with_palette(now: Instant, size: PtySize, palette: Option<Palette>) -> Self {
         Self {
             quiet_since: Some(now),
             shown: None,
@@ -275,7 +271,6 @@ impl Bar {
             agreed: true,
             size: (size.rows, size.cols),
             palette,
-            ink,
         }
     }
 
@@ -360,9 +355,7 @@ impl Bar {
         self.agreed = true;
         match self.want.clone() {
             Some(over) => {
-                // Dim, as every nvmux hint row is (`draw::draw_hint_row`), and
-                // in the ink when there is one, as the picker's is then.
-                let bytes = announce::placed(&over, &announce::pen(true, self.ink));
+                let bytes = announce::placed(&over, SGR);
                 self.shown = Some(over);
                 Act::Write(bytes)
             }
@@ -399,7 +392,8 @@ impl Bar {
 /// the relay is told to ask the server for the rest.
 fn erase(over: &Over, under: Option<&Shadow>, palette: Option<&Palette>) -> Act {
     match (under.filter(|s| s.is_usable()), palette) {
-        // Fully dissolved, so none of the bar is drawn and its ink is moot.
+        // Fully dissolved: none of the bar is drawn, so the colour it is
+        // given to be drawn in is moot.
         (Some(shadow), Some(palette)) => Act::Write(shadow.under(over, palette, palette.fg, 1.0)),
         _ => Act::Blanked(announce::plain_bytes(&blank(over), None)),
     }
@@ -455,7 +449,7 @@ mod tests {
         fn restoring(size: PtySize) -> Self {
             let now = Instant::now();
             Self {
-                bar: Bar::with_palette(now, size, Some(palette()), None),
+                bar: Bar::with_palette(now, size, Some(palette())),
                 now,
                 shadow: Some(screen(size.rows, size.cols)),
             }
@@ -687,8 +681,7 @@ mod tests {
     #[test]
     fn the_bytes_are_one_synchronized_update_that_cannot_scroll() {
         let over = overlay(Pending::Command, big()).expect("a bar");
-        let dim = announce::pen(true, None);
-        let bytes = announce::placed(&over, &dim);
+        let bytes = announce::placed(&over, SGR);
         let text = String::from_utf8(bytes).expect("utf-8");
 
         assert!(text.starts_with("\x1b[?2026h\x1b7"), "{text:?}");
@@ -704,27 +697,11 @@ mod tests {
             text.contains("\x1b[24;1H"),
             "not placed absolutely: {text:?}"
         );
-        assert!(text.contains(&dim), "not drawn dim: {text:?}");
+        assert!(text.contains(SGR), "not drawn dim: {text:?}");
         // Nothing printable after the last cell: the pending-wrap flag it sets
         // is discarded by the restore rather than acted on.
         let tail = text.rsplit_once("\x1b8").expect("a restore").1;
         assert_eq!(tail, "\x1b[?2026l", "something follows the row: {tail:?}");
-    }
-
-    /// Under a theme the bar is the picker's hint row as the theme draws it:
-    /// dim, and in the ink, both on the reset's own CSI.
-    #[test]
-    fn a_themed_bar_is_dim_in_its_ink() {
-        let now = Instant::now();
-        let ink = Rgb(0x7a, 0xa2, 0xf7);
-        let mut bar = Bar::with_palette(now, big(), None, Some(ink));
-        let act = bar.step(now + SETTLE, false, big(), Some(Pending::Command), None);
-        let Act::Write(bytes) = act else {
-            panic!("the bar did not go up: {act:?}");
-        };
-        let text = String::from_utf8(bytes).expect("utf-8");
-        assert!(text.contains("\x1b[0;2;38;2;122;162;247m"), "{text:?}");
-        assert!(!text.contains("\x1b[0;2m"), "drawn plain as well: {text:?}");
     }
 
     /// The bar is not written while the child is talking: the relay parses the
