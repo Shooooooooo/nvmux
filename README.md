@@ -119,10 +119,10 @@ Beside each name the picker shows, dim, what that session has to report:
 
 | Sign | Means |
 |---|---|
-| `⠹` (turning) | something in it is busy: a progress message is running, which is how a plugin such as [agent.nvim](https://github.com/Shooooooooo/agent.nvim) says an agent is working |
+| `⠹` (turning) | something in it is busy: a progress message is running, which is how a plugin such as [agent.nvim](https://github.com/Shooooooooo/agent.nvim) says an agent is working, or a language server is at work — clangd indexing, say |
 | `⡆` | the same, with the percentage the progress gives |
 | `∗` | a program in one of its terminal buffers asked for a desktop notification — an agent wanting your permission, say |
-| `!` | a progress message failed |
+| `!` | a progress message failed, or a command in one of its terminal buffers did — a build, say |
 
 The selected session's note is spelt out under the list —
 `Claude Code · Claude needs your permission · 2m` — and a notification stays
@@ -130,10 +130,14 @@ until you next open its session. `[picker] notes = "column"` puts the notes in
 the rows instead, after the names; `"off"` shows none.
 
 To know, nvmux leaves a watcher in each session — one augroup, `nvmux_notes` —
-that records Neovim's progress messages and the notifications programs in
-terminal buffers send: OSC 777 (Ghostty's), OSC 9 (iTerm2's) and OSC 99
-(kitty's). It stays when nvmux leaves, so a session that wanted you overnight
-says so in the morning; `"off"` takes it out again.
+that records Neovim's progress messages, what its language servers say they
+are working on (`clangd: 42% indexing 51/120`), the notifications programs in
+terminal buffers send — OSC 777 (Ghostty's), OSC 9 (iTerm2's) and OSC 99
+(kitty's) — and the commands in them that fail: a program that exits with a
+code other than 0, or a command its shell says did (`cargo build: exited with
+code 101`), which fish 4 says by itself and other shells can with OSC 133. It
+stays when nvmux leaves, so a session that wanted you overnight says so in the
+morning; `"off"` takes it out again.
 
 > [!NOTE]
 > A program only sends a notification to a terminal it thinks will show it.

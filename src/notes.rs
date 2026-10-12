@@ -5,25 +5,34 @@
 //!
 //! An agent in a terminal buffer tells its terminal when it wants you — Claude
 //! Code sends `ESC ] 777 ; notify ; Claude Code ; Claude needs your
-//! permission` — and a plugin that knows it is working says so with a progress
-//! message. Neither reaches nvmux by itself. Neovim's terminal keeps what a
-//! program sends to itself: it fires `TermRequest`, and that is all. And a
-//! session started `--headless` never draws its progress messages as a
-//! terminal's progress bar (OSC 9;4), because Neovim sets that up at startup
-//! only when a terminal UI is already attached, which a server's never is.
-//! Whatever a session does send its UIs goes to the ones attached at that
-//! moment, which for a session nobody has visited since nvmux started is none.
+//! permission` — and a shell there can say how each command went: fish marks
+//! where one starts and ends, and with what exit status (OSC 133). A plugin
+//! that knows it is working says so with a progress message, and a language
+//! server with LSP's own progress: clangd's `indexing`, say. None of it
+//! reaches nvmux by itself. Neovim's terminal keeps what a program sends to
+//! itself: it fires `TermRequest`, and `TermClose`, with the exit code, when
+//! the program ends, and that is all. Its LSP client does the same with a
+//! server's progress: it fires `LspProgress`, and makes no progress message
+//! of it. And a session started `--headless` never draws its progress
+//! messages as a terminal's progress bar (OSC 9;4), because Neovim sets that
+//! up at startup only when a terminal UI is already attached, which a
+//! server's never is. Whatever a session does send its UIs goes to the ones
+//! attached at that moment, which for a session nobody has visited since
+//! nvmux started is none.
 //!
 //! So the session keeps the record itself. nvmux leaves a watcher in it
 //! ([`WATCHER`]): one augroup, `nvmux_notes`, with a `Progress` autocommand —
-//! every progress message, whatever sends it, on 0.12 and later — and a
-//! `TermRequest` one, which takes the three notifications terminals know: OSC
-//! 777 `notify` (Ghostty's, urxvt's), OSC 9 (iTerm2's) and OSC 99 (kitty's,
-//! sent in parts). The picker reads it over plain RPC ([`read`]), the way it
-//! already asks a session whether it is alive. A program's own OSC 9;4 is not
-//! read: an agent's is no guide to whether it wants you — Claude Code's stays
-//! busy through its permission prompts — and what the session's progress
-//! messages say is.
+//! every progress message but Neovim's own, on 0.12 and later — an
+//! `LspProgress` one, for what each language server says it is working on, a
+//! `TermRequest` one, which takes the three notifications terminals know —
+//! OSC 777 `notify` (Ghostty's, urxvt's), OSC 9 (iTerm2's) and OSC 99
+//! (kitty's, sent in parts) — and a shell's word that a command failed, and a
+//! `TermClose` one, for a terminal's program that exits with a code other
+//! than 0. The picker reads it over plain RPC ([`read`]), the way it already
+//! asks a session whether it is alive. A program's own OSC 9;4 is not read:
+//! an agent's is no guide to whether it wants you — Claude Code's stays busy
+//! through its permission prompts — and what the session's progress messages
+//! say is.
 //!
 //! # It stays
 //!
@@ -66,7 +75,7 @@ use crate::rpc;
 
 /// The watcher's version. A session holding an older one is given this one,
 /// the record it kept carried over; a newer nvmux does the same to this one.
-pub const VERSION: i64 = 1;
+pub const VERSION: i64 = 4;
 
 /// How long the picker waits between reads of its sessions.
 pub const POLL: Duration = Duration::from_secs(2);
@@ -81,14 +90,34 @@ const BUDGET: Duration = Duration::from_secs(1);
 const SETTLE: Duration = Duration::from_millis(30);
 
 /// The watcher, sent with `nvim_exec_lua` and its version as the argument.
-/// Installing it again replaces the autocommands and keeps the record. Its
+/// Installing it again replaces the autocommands and keeps the record, but
+/// for what the language servers were doing, which starts afresh: another
+/// version's watcher, in the meantime, may have missed the end of it. Its
 /// answer is the record, as [`READ`] gives it.
 ///
 /// What it records: each progress message running, by source and id, with its
 /// title, text, percentage — 0 is no percentage, which is what Neovim 0.12
-/// gives a message that has none — and when it started; and the last
-/// notification, or failed progress message, until [`SEEN`] clears it. Text is
-/// kept without control characters and to 200 characters.
+/// gives a message that has none — and when it started; each language
+/// server's work the same way, by client and token, its server's name for the
+/// title and what it says it is doing for the text, `indexing 3/120` — a
+/// report gives only what has changed, so what it leaves out stands — until
+/// it ends or the server goes, which a read sees to, since a server that dies
+/// mid-work never says it has finished; and the last notification or failure
+/// — a failed progress message, a terminal's program that exits with a code
+/// other than 0, or a command its shell says did — until [`SEEN`] clears it.
+/// Text is kept without control characters and to 200 characters.
+///
+/// A failed command is named by what its shell said it was, where the shell
+/// says — fish's `OSC 133 ; C` carries the command line, URL-encoded — and
+/// otherwise by the terminal's program, from its buffer name
+/// (`term://…//1234:cargo build`) and without its directory: `exited with
+/// code 101`, or `a command exited with code 101` when it is the shell's.
+///
+/// Neovim's own progress messages, `source` `nvim`, are left out: a write's
+/// and a completion's scan begin and end within the command that says them,
+/// so a read never finds one running — and a write that fails never says it
+/// has ended, nor does a scan, which would leave the session busy for good.
+/// An older watcher kept them, so they go from the record on the way in.
 const WATCHER: &str = r#"local version = ...
 local api = vim.api
 local N = package.loaded['nvmux.notes']
@@ -98,6 +127,12 @@ if type(N) ~= 'table' then
 end
 N.version = version
 N.progress = type(N.progress) == 'table' and N.progress or {}
+for key in pairs(N.progress) do
+  if key:sub(1, 5) == 'nvim\0' then
+    N.progress[key] = nil
+  end
+end
+N.lsp = {}
 local group = api.nvim_create_augroup('nvmux_notes', { clear = true })
 local function clean(s)
   if type(s) == 'table' then
@@ -123,7 +158,7 @@ pcall(api.nvim_create_autocmd, 'Progress', {
   group = group,
   callback = function(ev)
     local d = ev.data
-    if type(d) ~= 'table' or d.id == nil then
+    if type(d) ~= 'table' or d.id == nil or d.source == 'nvim' then
       return
     end
     local key = tostring(d.source) .. '\0' .. tostring(d.id)
@@ -144,7 +179,43 @@ pcall(api.nvim_create_autocmd, 'Progress', {
     end
   end,
 })
-local parts = {}
+api.nvim_create_autocmd('LspProgress', {
+  group = group,
+  callback = function(ev)
+    local d = ev.data
+    local params = type(d) == 'table' and d.params
+    local v = type(params) == 'table' and params.value
+    if type(v) ~= 'table' or d.client_id == nil or params.token == nil then
+      return
+    end
+    local key = tostring(d.client_id) .. '\0' .. tostring(params.token)
+    if v.kind == 'end' then
+      N.lsp[key] = nil
+    elseif v.kind == 'begin' or v.kind == 'report' then
+      local was = v.kind == 'report' and N.lsp[key]
+      if not was then
+        local client = vim.lsp.get_client_by_id(d.client_id)
+        was = { title = clean(client and client.name), message = '', at = os.time() }
+      end
+      local message = type(v.message) == 'string' and clean(v.message) or was.message
+      local p = tonumber(v.percentage) or was.percent
+      N.lsp[key] = {
+        client = d.client_id,
+        title = was.title,
+        text = clean((type(v.title) == 'string' and v.title or '') .. ' ' .. message),
+        message = message,
+        percent = p and p > 0 and math.min(100, math.floor(p)) or nil,
+        at = was.at,
+      }
+    end
+  end,
+})
+local function program(buf)
+  local name = api.nvim_buf_is_valid(buf) and api.nvim_buf_get_name(buf) or ''
+  local command = name:match('^term://.-//%d+:(.*)$') or name
+  return (command:gsub('^%S*/', ''))
+end
+local parts, commands = {}, {}
 api.nvim_create_autocmd('TermRequest', {
   group = group,
   callback = function(ev)
@@ -156,6 +227,24 @@ api.nvim_create_autocmd('TermRequest', {
     local title, body = osc:match('^777;notify;([^;]*);?(.*)$')
     if title then
       return note('notify', title, body)
+    end
+    local mark, args = osc:match('^133;(%a)(.*)$')
+    if mark == 'C' then
+      local url = args:match(';cmdline_url=([^;]*)')
+      commands[ev.buf] = url and vim.uri_decode(url) or nil
+      return
+    elseif mark == 'D' then
+      local status = tonumber(args:match('^;(%d+)'))
+      local command = commands[ev.buf]
+      commands[ev.buf] = nil
+      if status and status > 0 then
+        if command then
+          note('failed', command, 'exited with code ' .. status)
+        else
+          note('failed', program(ev.buf), 'a command exited with code ' .. status)
+        end
+      end
+      return
     end
     local text = osc:match('^9;(.*)$')
     if text then
@@ -190,11 +279,28 @@ api.nvim_create_autocmd('TermRequest', {
     end
   end,
 })
+api.nvim_create_autocmd('TermClose', {
+  group = group,
+  callback = function(ev)
+    commands[ev.buf] = nil
+    local status = vim.v.event.status
+    if type(status) == 'number' and status > 0 then
+      note('failed', program(ev.buf), 'exited with code ' .. status)
+    end
+  end,
+})
 function N.snapshot()
   local now = os.time()
   local busy
   for _, p in pairs(N.progress) do
     if not busy or p.at > busy.at then
+      busy = p
+    end
+  end
+  for key, p in pairs(N.lsp) do
+    if not vim.lsp.get_client_by_id(p.client) then
+      N.lsp[key] = nil
+    elseif not busy or p.at > busy.at then
       busy = p
     end
   end
@@ -213,11 +319,11 @@ end
 return N.snapshot()
 "#;
 
-/// The record, as a map: `busy` (the progress message running that started
-/// last: `title`, `text`, `percent` when it has one, and `age` in seconds) and
-/// `note` (`kind` `notify` or `failed`, `title`, `body`, `age`), each there
-/// only when the session has one. `false` where there is no watcher, or one
-/// older or newer than this nvmux's.
+/// The record, as a map: `busy` (the progress message, or language server's
+/// work, running that started last: `title`, `text`, `percent` when it has
+/// one, and `age` in seconds) and `note` (`kind` `notify` or `failed`,
+/// `title`, `body`, `age`), each there only when the session has one. `false`
+/// where there is no watcher, or one older or newer than this nvmux's.
 const READ: &str = r#"local version = ...
 local N = package.loaded['nvmux.notes']
 if type(N) ~= 'table' or N.version ~= version or type(N.snapshot) ~= 'function' then
@@ -245,10 +351,11 @@ return true
 pub enum Kind {
     /// A program in a terminal buffer asked for a desktop notification.
     Notified,
-    /// A progress message ended in failure.
+    /// A progress message ended in failure, or a command in a terminal buffer
+    /// did.
     Failed,
-    /// A progress message is running, and with a percentage where it says
-    /// how far it has got.
+    /// A progress message, or a language server's work, is running, and with
+    /// a percentage where it says how far it has got.
     Busy(Option<u8>),
 }
 
@@ -258,9 +365,13 @@ pub enum Kind {
 pub struct Note {
     pub kind: Kind,
     /// The notification's title, or the progress message's: the program or
-    /// plugin it came from, as often as not — `Claude Code`, `claude`.
+    /// plugin it came from, as often as not — `Claude Code`, `claude` — and
+    /// for a language server's work, the server's name, `clangd`; for a
+    /// command that failed, the command: `cargo build`.
     pub title: String,
-    /// The notification's body, or the progress message's text.
+    /// The notification's body, the progress message's text, what the
+    /// language server says it is doing — `indexing 3/120` — or how a command
+    /// ended: `exited with code 101`.
     pub text: String,
     /// How old it was when it was read, by the session's own clock, which a
     /// remote host's need not agree with this one's on.
@@ -366,8 +477,9 @@ pub fn seen_within(sock: PathBuf, within: Duration) {
 ///
 /// The read is asked with the mode, before either is waited for, so the two
 /// cost one round trip. Left unread when the editor is blocked: the session
-/// runs it once the key comes, which costs nothing, since a read writes
-/// nothing — and the watcher, which does, is only sent once it has answered.
+/// runs it once the key comes, which costs nothing, since all a read writes
+/// is to forget a language server that has gone, as true then as now — and
+/// the watcher, which writes the record, is only sent once it has answered.
 fn snapshot<S: Read + Write>(client: &mut rpc::Client<S>) -> Result<Option<Value>, RpcError> {
     let mode = client.ask_mode()?;
     let asked = client.ask("nvim_exec_lua", lua(READ))?;
