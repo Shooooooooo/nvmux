@@ -31,10 +31,11 @@
 //! the ink this pass gave it, or for a dim cell the terminal's foreground. So
 //! a themed screen dissolves out of the colours it is drawn in, the dim ones
 //! with the rest, rather than jumping on the first frame. What an effect draws
-//! of its own — the bar a row the cursor left lets go of — is the ink. And a
-//! theme is one colour, with no red in it: the bar a kill warms towards red
-//! while it asks `[y/N]` stays the ink, and the line through the name is the
-//! warning (see [`crate::ui::effects`]).
+//! of its own — the bar a row the cursor left lets go of — is the ink. The one
+//! colour that is not the ink is the warning: while a kill asks `[y/N]`, the
+//! selection's bar warms from the ink towards the terminal's own red, as it
+//! warms from the terminal's foreground with no theme (see
+//! [`crate::ui::effects`]).
 //!
 //! What nvmux draws over a session is bytes rather than a frame. The notice a
 //! switch puts up ([`crate::announce`]) and the name an attach hands across

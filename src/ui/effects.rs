@@ -38,9 +38,9 @@
 //! takes a cell from the colour it is drawn in ([`crate::fade::drawn_in`]): a
 //! name back to the ink, a dim number back to the terminal's own foreground.
 //! What an effect draws of its own — the bar a row lets go of, a ring — is the
-//! ink, as the selection's bar is. A theme is one colour, and has no red in
-//! it, so themed, the struck row's bar stays the ink, and the line through the
-//! name is the whole of the warning, as it is without a palette.
+//! ink, as the selection's bar is. The one colour that is not the ink is the
+//! warning: the struck row's bar warms from the ink towards the terminal's own
+//! red, as it warms from the terminal's foreground with no theme.
 //!
 //! The underline on a filter's matched letters is not here, and is not an
 //! effect: it is still, a modifier, and says why a row is still on screen, so
@@ -145,15 +145,6 @@ impl Colours {
     /// ink, or the terminal's foreground.
     fn ink(&self) -> Rgb {
         self.theme.unwrap_or(self.palette.fg)
-    }
-
-    /// What a struck row's bar warms towards: the terminal's own red — or, a
-    /// theme being one colour, the bar's own, which does not warm at all.
-    fn warning(&self) -> Rgb {
-        match self.theme {
-            Some(ink) => ink,
-            None => self.palette.ansi[RED],
-        }
     }
 }
 
@@ -261,10 +252,10 @@ fn glow(buf: &mut Buffer, rect: Rect, colours: Option<&Colours>, progress: f32) 
 
 /// The row a `[y/N]` is asking about: a line through its name, `drawn` of
 /// the way across, and — given a palette — its bar warmed towards the
-/// palette's red by as much: the terminal's own, or under a theme the ink
-/// itself, so that themed the bar stays the colour it was. The line is the
-/// crossed-out modifier, drawn in the text's own colour, so it is the same
-/// with a palette or without one.
+/// terminal's red by as much, from the colour the bar is drawn in: the
+/// terminal's foreground, or a theme's ink. The line is the crossed-out
+/// modifier, drawn in the text's own colour, so it is the same with a palette
+/// or without one.
 fn strike(buf: &mut Buffer, bar: Rect, name: Rect, colours: Option<&Colours>, drawn: f32) {
     let k = ease_out(drawn);
     let across = ((k * f32::from(name.width)).ceil() as u16).min(name.width);
@@ -276,7 +267,7 @@ fn strike(buf: &mut Buffer, bar: Rect, name: Rect, colours: Option<&Colours>, dr
         cell.modifier.insert(Modifier::CROSSED_OUT)
     });
     if let Some(c) = colours {
-        let warm = rgb(c.ink().lerp(c.warning(), STRIKE_WARMTH * k));
+        let warm = rgb(c.ink().lerp(c.palette.ansi[RED], STRIKE_WARMTH * k));
         let text = rgb(c.palette.bg);
         each_cell(buf, bar, |cell| {
             cell.modifier.remove(Modifier::REVERSED);
@@ -772,19 +763,24 @@ mod tests {
         assert!(!marker.modifier.contains(Modifier::REVERSED));
     }
 
-    /// Under a theme the screens have one colour and no red: the line goes
-    /// through the name all the same, and the bar it is on stays the ink.
+    /// Under a theme a kill is still a warning: the line goes through the name
+    /// all the same, and the bar it is on warms from the ink towards the
+    /// terminal's red, as it warms from the foreground with no theme.
     #[test]
-    fn a_themed_strike_keeps_its_bar_in_the_ink() {
+    fn a_themed_strike_warms_its_bar_from_the_ink() {
         let ink = Rgb(0x7a, 0xa2, 0xf7);
-        let p = test_palette();
+        let mut p = test_palette();
+        p.ansi[RED] = Rgb(0xcd, 0, 0);
         let a = asking(STRIKE.as_millis() as u64);
         let buf = themed(&a, &p, ink);
         let y = row_of(&buf, "dotfiles");
         assert_eq!(crossed(&buf, y).len(), 8);
         let marker = first_glyph(&buf, y);
-        assert_eq!(marker.bg, rgb(ink), "warmed: {marker:?}");
+        let warm = ink.lerp(p.ansi[RED], STRIKE_WARMTH);
+        assert_eq!(marker.bg, rgb(warm), "{marker:?}");
+        assert_ne!(warm, ink, "the bar has to have warmed to say anything");
         assert_eq!(marker.fg, rgb(p.bg));
+        assert!(!marker.modifier.contains(Modifier::REVERSED));
     }
 
     /// The line is drawn across from the left: partway, only the start of the
