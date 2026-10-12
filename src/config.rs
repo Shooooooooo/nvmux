@@ -272,7 +272,6 @@ pub struct EffectsSettings {
     #[serde(rename = "move")]
     pub moving: MoveSettings,
     pub cursor: CursorSettings,
-    pub back: BackSettings,
     pub attach: AttachSettings,
     pub kill: KillSettings,
     pub filter: FilterSettings,
@@ -538,16 +537,6 @@ pub struct CursorSettings {
     pub enabled: bool,
 }
 
-/// What was the mark on the session come back from in the picker, a hollow
-/// `▹` beside its row. The mark is gone; the table is still read, and nothing
-/// reads it, so a config file written while it was there still loads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct BackSettings {
-    /// Switched nothing since the mark went.
-    pub enabled: bool,
-}
-
 /// An attach from the picker: the picker closing in from the top and the
 /// bottom onto the chosen row with the session's name kept on the screen,
 /// through the client's start, and the session opening out of that line as
@@ -620,7 +609,6 @@ impl Default for EffectsSettings {
             fade: FadeSettings::default(),
             moving: MoveSettings::default(),
             cursor: CursorSettings::default(),
-            back: BackSettings::default(),
             attach: AttachSettings::default(),
             kill: KillSettings::default(),
             filter: FilterSettings::default(),
@@ -665,12 +653,6 @@ impl Default for MoveSettings {
 }
 
 impl Default for CursorSettings {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
-}
-
-impl Default for BackSettings {
     fn default() -> Self {
         Self { enabled: true }
     }
@@ -1221,8 +1203,6 @@ mod tests {
             enabled = true\n\
             [effects.cursor]\n\
             enabled = true\n\
-            [effects.back]\n\
-            enabled = true\n\
             [effects.attach]\n\
             enabled = true\n\
             [effects.kill]\n\
@@ -1490,7 +1470,6 @@ mod tests {
                 "an unknown cursor key",
                 "[effects.cursor]\nenable = false\n",
             ),
-            ("an unknown back key", "[effects.back]\nenable = false\n"),
             (
                 "an unknown attach key",
                 "[effects.attach]\nenable = false\n",
