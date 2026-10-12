@@ -45,6 +45,31 @@ end)"#
     );
 }
 
+/// A job in a hidden terminal buffer that runs `script` and exits, waited for
+/// until its `TermClose` has been, so that the watcher has seen it go.
+fn a_job_that_exits(sock: &Path, script: &str) {
+    lua(
+        sock,
+        &format!(
+            r#"local closed = false
+local buf = vim.api.nvim_create_buf(true, false)
+vim.api.nvim_create_autocmd('TermClose', {{
+  buffer = buf,
+  once = true,
+  callback = function()
+    closed = true
+  end,
+}})
+vim.api.nvim_buf_call(buf, function()
+  vim.fn.jobstart({{ 'sh', '-c', [=[{script}]=] }}, {{ term = true }})
+end)
+vim.wait(5000, function()
+  return closed
+end)"#
+        ),
+    );
+}
+
 /// Read until the note is what `want` says, or a few seconds have gone.
 fn read_until(sock: &Path, want: impl Fn(Option<&Note>) -> bool) -> Option<Note> {
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -287,6 +312,69 @@ N.version = -1",
     );
 }
 
+/// A command in a terminal buffer that fails is kept like a failed progress
+/// message: one its shell says has (OSC 133, the way fish says it, naming the
+/// command line as it starts), and a job that exits with a code other than 0.
+/// One that succeeds is nothing.
+#[test]
+fn a_command_that_fails_in_a_terminal_is_kept() {
+    require_nvim!();
+    let scratch = Scratch::new("notes-term");
+    let (_, sock) = a_session(&scratch, "building");
+    assert_eq!(notes::read(&sock), Reading::Said(None));
+
+    in_a_terminal(
+        &sock,
+        r"\033]133;C;cmdline_url=cargo%%20build\033\134\033]133;D;101\033\134",
+    );
+    let failed = read_until(&sock, |n| n.is_some()).expect("the failure");
+    assert_eq!(failed.kind, Kind::Failed);
+    assert_eq!(
+        (failed.title.as_str(), failed.text.as_str()),
+        ("cargo build", "exited with code 101")
+    );
+
+    // A shell that does not name the command line: the terminal's program.
+    notes::seen(&sock);
+    in_a_terminal(&sock, r"\033]133;D;2\033\134");
+    let unnamed = read_until(&sock, |n| n.is_some()).expect("the unnamed failure");
+    assert_eq!(
+        (unnamed.title.as_str(), unnamed.text.as_str()),
+        ("sh", "a command exited with code 2")
+    );
+
+    // A command that succeeds, after a notification it would otherwise
+    // have taken the place of.
+    notes::seen(&sock);
+    in_a_terminal(
+        &sock,
+        r"\033]777;notify;Build;started\007\033]133;C;cmdline_url=ls\033\134\033]133;D;0\033\134",
+    );
+    read_until(&sock, |n| n.is_some()).expect("the notification");
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        read_until(&sock, |n| n.is_some()).map(|n| n.kind),
+        Some(Kind::Notified),
+        "a command that succeeds is no failure"
+    );
+
+    notes::seen(&sock);
+    a_job_that_exits(&sock, "exit 3");
+    let exited = read_until(&sock, |n| n.is_some()).expect("the job's failure");
+    assert_eq!(exited.kind, Kind::Failed);
+    assert_eq!(
+        (exited.title.as_str(), exited.text.as_str()),
+        ("sh", "exited with code 3")
+    );
+    notes::seen(&sock);
+    a_job_that_exits(&sock, "exit 0");
+    assert_eq!(
+        notes::read(&sock),
+        Reading::Said(None),
+        "a job that exits with 0 is no failure"
+    );
+}
+
 /// A program's own progress bar, and ConEmu's other commands under OSC 9, are
 /// not notifications.
 #[test]
@@ -327,7 +415,7 @@ fn a_watcher_is_replaced_in_place_and_taken_out_whole() {
             "return #vim.api.nvim_get_autocmds({ group = 'nvmux_notes' })"
         )
         .as_u64(),
-        Some(if has_progress(&sock) { 3 } else { 2 }),
+        Some(if has_progress(&sock) { 4 } else { 3 }),
         "the autocommands replaced, not added to"
     );
 

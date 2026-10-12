@@ -5,29 +5,34 @@
 //!
 //! An agent in a terminal buffer tells its terminal when it wants you — Claude
 //! Code sends `ESC ] 777 ; notify ; Claude Code ; Claude needs your
-//! permission` — a plugin that knows it is working says so with a progress
-//! message, and a language server with LSP's own progress: clangd's
-//! `indexing`, say. None of it reaches nvmux by itself. Neovim's terminal
-//! keeps what a program sends to itself: it fires `TermRequest`, and that is
-//! all. Its LSP client does the same with a server's progress: it fires
-//! `LspProgress`, and makes no progress message of it. And a session started
-//! `--headless` never draws its progress messages as a terminal's progress
-//! bar (OSC 9;4), because Neovim sets that up at startup only when a terminal
-//! UI is already attached, which a server's never is. Whatever a session does
-//! send its UIs goes to the ones attached at that moment, which for a session
-//! nobody has visited since nvmux started is none.
+//! permission` — and a shell there can say how each command went: fish marks
+//! where one starts and ends, and with what exit status (OSC 133). A plugin
+//! that knows it is working says so with a progress message, and a language
+//! server with LSP's own progress: clangd's `indexing`, say. None of it
+//! reaches nvmux by itself. Neovim's terminal keeps what a program sends to
+//! itself: it fires `TermRequest`, and `TermClose`, with the exit code, when
+//! the program ends, and that is all. Its LSP client does the same with a
+//! server's progress: it fires `LspProgress`, and makes no progress message
+//! of it. And a session started `--headless` never draws its progress
+//! messages as a terminal's progress bar (OSC 9;4), because Neovim sets that
+//! up at startup only when a terminal UI is already attached, which a
+//! server's never is. Whatever a session does send its UIs goes to the ones
+//! attached at that moment, which for a session nobody has visited since
+//! nvmux started is none.
 //!
 //! So the session keeps the record itself. nvmux leaves a watcher in it
 //! ([`WATCHER`]): one augroup, `nvmux_notes`, with a `Progress` autocommand —
 //! every progress message but Neovim's own, on 0.12 and later — an
-//! `LspProgress` one, for what each language server says it is working on,
-//! and a `TermRequest` one, which takes the three notifications terminals
-//! know: OSC 777 `notify` (Ghostty's, urxvt's), OSC 9 (iTerm2's) and OSC 99
-//! (kitty's, sent in parts). The picker reads it over plain RPC ([`read`]),
-//! the way it already asks a session whether it is alive. A program's own
-//! OSC 9;4 is not read: an agent's is no guide to whether it wants you —
-//! Claude Code's stays busy through its permission prompts — and what the
-//! session's progress messages say is.
+//! `LspProgress` one, for what each language server says it is working on, a
+//! `TermRequest` one, which takes the three notifications terminals know —
+//! OSC 777 `notify` (Ghostty's, urxvt's), OSC 9 (iTerm2's) and OSC 99
+//! (kitty's, sent in parts) — and a shell's word that a command failed, and a
+//! `TermClose` one, for a terminal's program that exits with a code other
+//! than 0. The picker reads it over plain RPC ([`read`]), the way it already
+//! asks a session whether it is alive. A program's own OSC 9;4 is not read:
+//! an agent's is no guide to whether it wants you — Claude Code's stays busy
+//! through its permission prompts — and what the session's progress messages
+//! say is.
 //!
 //! # It stays
 //!
@@ -70,7 +75,7 @@ use crate::rpc;
 
 /// The watcher's version. A session holding an older one is given this one,
 /// the record it kept carried over; a newer nvmux does the same to this one.
-pub const VERSION: i64 = 3;
+pub const VERSION: i64 = 4;
 
 /// How long the picker waits between reads of its sessions.
 pub const POLL: Duration = Duration::from_secs(2);
@@ -97,9 +102,16 @@ const SETTLE: Duration = Duration::from_millis(30);
 /// title and what it says it is doing for the text, `indexing 3/120` — a
 /// report gives only what has changed, so what it leaves out stands — until
 /// it ends or the server goes, which a read sees to, since a server that dies
-/// mid-work never says it has finished; and the last notification, or failed
-/// progress message, until [`SEEN`] clears it. Text is kept without control
-/// characters and to 200 characters.
+/// mid-work never says it has finished; and the last notification or failure
+/// — a failed progress message, a terminal's program that exits with a code
+/// other than 0, or a command its shell says did — until [`SEEN`] clears it.
+/// Text is kept without control characters and to 200 characters.
+///
+/// A failed command is named by what its shell said it was, where the shell
+/// says — fish's `OSC 133 ; C` carries the command line, URL-encoded — and
+/// otherwise by the terminal's program, from its buffer name
+/// (`term://…//1234:cargo build`) and without its directory: `exited with
+/// code 101`, or `a command exited with code 101` when it is the shell's.
 ///
 /// Neovim's own progress messages, `source` `nvim`, are left out: a write's
 /// and a completion's scan begin and end within the command that says them,
@@ -198,7 +210,12 @@ api.nvim_create_autocmd('LspProgress', {
     end
   end,
 })
-local parts = {}
+local function program(buf)
+  local name = api.nvim_buf_is_valid(buf) and api.nvim_buf_get_name(buf) or ''
+  local command = name:match('^term://.-//%d+:(.*)$') or name
+  return (command:gsub('^%S*/', ''))
+end
+local parts, commands = {}, {}
 api.nvim_create_autocmd('TermRequest', {
   group = group,
   callback = function(ev)
@@ -210,6 +227,24 @@ api.nvim_create_autocmd('TermRequest', {
     local title, body = osc:match('^777;notify;([^;]*);?(.*)$')
     if title then
       return note('notify', title, body)
+    end
+    local mark, args = osc:match('^133;(%a)(.*)$')
+    if mark == 'C' then
+      local url = args:match(';cmdline_url=([^;]*)')
+      commands[ev.buf] = url and vim.uri_decode(url) or nil
+      return
+    elseif mark == 'D' then
+      local status = tonumber(args:match('^;(%d+)'))
+      local command = commands[ev.buf]
+      commands[ev.buf] = nil
+      if status and status > 0 then
+        if command then
+          note('failed', command, 'exited with code ' .. status)
+        else
+          note('failed', program(ev.buf), 'a command exited with code ' .. status)
+        end
+      end
+      return
     end
     local text = osc:match('^9;(.*)$')
     if text then
@@ -241,6 +276,16 @@ api.nvim_create_autocmd('TermRequest', {
         parts[id] = nil
         note('notify', p.title, p.body)
       end
+    end
+  end,
+})
+api.nvim_create_autocmd('TermClose', {
+  group = group,
+  callback = function(ev)
+    commands[ev.buf] = nil
+    local status = vim.v.event.status
+    if type(status) == 'number' and status > 0 then
+      note('failed', program(ev.buf), 'exited with code ' .. status)
     end
   end,
 })
@@ -306,7 +351,8 @@ return true
 pub enum Kind {
     /// A program in a terminal buffer asked for a desktop notification.
     Notified,
-    /// A progress message ended in failure.
+    /// A progress message ended in failure, or a command in a terminal buffer
+    /// did.
     Failed,
     /// A progress message, or a language server's work, is running, and with
     /// a percentage where it says how far it has got.
@@ -320,10 +366,12 @@ pub struct Note {
     pub kind: Kind,
     /// The notification's title, or the progress message's: the program or
     /// plugin it came from, as often as not — `Claude Code`, `claude` — and
-    /// for a language server's work, the server's name: `clangd`.
+    /// for a language server's work, the server's name, `clangd`; for a
+    /// command that failed, the command: `cargo build`.
     pub title: String,
-    /// The notification's body, the progress message's text, or what the
-    /// language server says it is doing: `indexing 3/120`.
+    /// The notification's body, the progress message's text, what the
+    /// language server says it is doing — `indexing 3/120` — or how a command
+    /// ended: `exited with code 101`.
     pub text: String,
     /// How old it was when it was read, by the session's own clock, which a
     /// remote host's need not agree with this one's on.

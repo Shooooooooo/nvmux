@@ -211,8 +211,9 @@ pub struct PickerSettings {
     /// What a session has to report, beside its name (see [`crate::notes`]):
     /// that something in it is busy — a progress message is running, the way
     /// a plugin says an agent is working, or a language server is at work —
-    /// or has failed, and the desktop notifications the programs in its
-    /// terminal buffers send, an agent asking for permission among them.
+    /// or has failed — a progress message, or a command in one of its
+    /// terminal buffers — and the desktop notifications the programs there
+    /// send, an agent asking for permission among them.
     ///
     /// `"signs"`, the default, puts one dim sign in a column left of the
     /// list — a spinner while busy, a gauge where the progress says how far
@@ -223,7 +224,7 @@ pub struct PickerSettings {
     ///
     /// What it costs, and so the reason to turn it off: to know, nvmux leaves
     /// a watcher in each session it lists or opens — one augroup,
-    /// `nvmux_notes`, of three autocommands — and the watcher stays when nvmux
+    /// `nvmux_notes`, of four autocommands — and the watcher stays when nvmux
     /// leaves, recording, so that a session that wanted you overnight says so
     /// in the morning. Nothing else in the session changes. `"off"` takes it
     /// out of each session the picker next lists. While the picker is up it
