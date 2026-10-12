@@ -128,16 +128,16 @@ impl Session {
 
     /// Parse `<id>.json` contents.
     pub fn from_json(bytes: &[u8], path: &Path) -> Result<Self, SessionError> {
-        serde_json::from_slice(bytes).map_err(|source| SessionError::Metadata {
+        serde_json::from_slice(bytes).map_err(|error| SessionError::Metadata {
             path: path.to_path_buf(),
-            source,
+            error,
         })
     }
 
     pub fn to_json(&self) -> Result<String, SessionError> {
-        serde_json::to_string(self).map_err(|source| SessionError::Metadata {
+        serde_json::to_string(self).map_err(|error| SessionError::Metadata {
             path: std::path::PathBuf::from(format!("{}.json", self.id)),
-            source,
+            error,
         })
     }
 
@@ -147,9 +147,9 @@ impl Session {
     pub fn write_atomic(&self, path: &Path) -> Result<(), SessionError> {
         let mut json = self.to_json()?;
         json.push('\n');
-        crate::paths::write_atomic(path, json.as_bytes()).map_err(|source| SessionError::Metadata {
+        crate::paths::write_atomic(path, json.as_bytes()).map_err(|error| SessionError::Metadata {
             path: path.to_path_buf(),
-            source: serde_json::Error::io(source),
+            error: serde_json::Error::io(error),
         })
     }
 }

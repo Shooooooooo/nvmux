@@ -2,6 +2,14 @@
 //! Every variant exists because some caller makes a decision on it — a stale
 //! socket gets reaped and a busy one does not, a kill that did not take effect
 //! must not delete files.
+//!
+//! A variant that wraps another error says it in its own message, and does not
+//! also hand it out as its `source()`: `main` prints through anyhow's `{:#}`,
+//! which follows a message with each of its sources, so a variant that did both
+//! said its cause twice. The message is the one that has to carry it, since
+//! [`NvmuxError::one_line`] prints the message alone. The wrapped field is
+//! called `error` because thiserror takes a field called `source` as the source
+//! whether it is marked or not.
 
 use std::path::PathBuf;
 
@@ -47,11 +55,10 @@ pub enum PathError {
     #[error("malformed session id {0:?}: expected 8 lowercase base32 characters")]
     MalformedId(String),
 
-    #[error("{}: {source}", .path.display())]
+    #[error("{}: {error}", .path.display())]
     Io {
         path: PathBuf,
-        #[source]
-        source: std::io::Error,
+        error: std::io::Error,
     },
 }
 
@@ -158,11 +165,10 @@ pub enum SessionError {
     #[error("session {id} already has {attached} attached UIs; detach one before attaching again")]
     TooManyUis { id: String, attached: usize },
 
-    #[error("session metadata at {}: {source}", .path.display())]
+    #[error("session metadata at {}: {error}", .path.display())]
     Metadata {
         path: PathBuf,
-        #[source]
-        source: serde_json::Error,
+        error: serde_json::Error,
     },
 }
 
@@ -232,20 +238,18 @@ pub enum ConfigError {
 
     /// The file exists but could not be read (permissions, a broken symlink,
     /// a directory in its place).
-    #[error("{}: {source}", .path.display())]
+    #[error("{}: {error}", .path.display())]
     Read {
         path: PathBuf,
-        #[source]
-        source: std::io::Error,
+        error: std::io::Error,
     },
 
     /// The file was read but is not valid TOML, names an unknown key, or a value
     /// (e.g. the prefix string) did not parse. A typo is loud, not silent.
-    #[error("{}: {source}", .path.display())]
+    #[error("{}: {error}", .path.display())]
     Parse {
         path: PathBuf,
-        #[source]
-        source: toml::de::Error,
+        error: toml::de::Error,
     },
 
     /// The file parsed but a value is out of range — a rule of ours, not the
@@ -258,11 +262,10 @@ pub enum ConfigError {
     /// temp file, or the rename). Non-fatal at the call site — nvmux keeps the
     /// chosen prefix in memory for the session — but typed so the message names
     /// the path.
-    #[error("{}: {source}", .path.display())]
+    #[error("{}: {error}", .path.display())]
     Write {
         path: PathBuf,
-        #[source]
-        source: std::io::Error,
+        error: std::io::Error,
     },
 }
 
@@ -327,5 +330,49 @@ mod tests {
             flat.contains("line one") && flat.contains("line two"),
             "nothing is lost on the way: {flat:?}"
         );
+    }
+
+    /// A wrapped error is said once however it is printed: plainly, as
+    /// `one_line` and the first-run write print it, and through anyhow's
+    /// `{:#}`, as `main` does, which follows the message with every source.
+    #[test]
+    fn a_wrapped_error_is_said_once() {
+        let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let cases = [
+            (
+                anyhow::Error::from(ConfigError::Read {
+                    path: "c.toml".into(),
+                    error: denied(),
+                }),
+                "c.toml: permission denied",
+            ),
+            (
+                anyhow::Error::from(ConfigError::Write {
+                    path: "c.toml".into(),
+                    error: denied(),
+                }),
+                "c.toml: permission denied",
+            ),
+            (
+                anyhow::Error::from(PathError::Io {
+                    path: "/tmp/nvmux-0".into(),
+                    error: denied(),
+                }),
+                "/tmp/nvmux-0: permission denied",
+            ),
+            // serde_json hands the I/O error out as its own source, so this
+            // one used to say it three times.
+            (
+                anyhow::Error::from(SessionError::Metadata {
+                    path: "x.json".into(),
+                    error: serde_json::Error::io(denied()),
+                }),
+                "session metadata at x.json: permission denied",
+            ),
+        ];
+        for (e, want) in cases {
+            assert_eq!(format!("{e}"), want);
+            assert_eq!(format!("{e:#}"), want, "the cause is said once");
+        }
     }
 }
