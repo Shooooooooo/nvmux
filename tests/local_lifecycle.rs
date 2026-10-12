@@ -96,8 +96,8 @@ fn the_script_shell_runs_under_the_launch_umask() {
     let out = nvmux::proc::run_local("umask", &[]).expect("run a script");
     assert!(out.ok(), "the script failed: {}", out.stderr);
     assert_eq!(
-        out.stdout.trim(),
-        common::launch_umask_printed(),
+        common::printed_umask(&out.stdout),
+        common::LAUNCH_UMASK,
         "the script shell was handed 0077 rather than the launch mask"
     );
 }
@@ -155,8 +155,8 @@ fn a_session_runs_under_the_umask_nvmux_was_launched_with() {
     t.kill_session(&session).expect("kill");
 
     assert_eq!(
-        reported,
-        common::launch_umask_printed(),
+        common::printed_umask(&reported),
+        common::LAUNCH_UMASK,
         "the session was clamped rather than handed the launch mask"
     );
     assert_eq!(

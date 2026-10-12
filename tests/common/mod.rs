@@ -183,10 +183,11 @@ pub fn establish_launch_umask() {
     });
 }
 
-/// [`LAUNCH_UMASK`] as `umask` prints it, which is what a shell or a session
-/// asked for its mask answers with.
-pub fn launch_umask_printed() -> String {
-    format!("{LAUNCH_UMASK:04o}")
+/// The mask `umask` printed, read back as a number: sh prints `0002`, but a
+/// session's `system()` runs the user's 'shell', and fish prints `002`.
+pub fn printed_umask(printed: &str) -> libc::mode_t {
+    libc::mode_t::from_str_radix(printed.trim(), 8)
+        .unwrap_or_else(|_| panic!("umask printed {printed:?}, not an octal mask"))
 }
 
 /// Names every test session distinctly, so a failed run cannot poison the next.
