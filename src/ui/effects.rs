@@ -723,8 +723,6 @@ mod tests {
         a.on_key(Key::Char('x'));
         assert!(a.strike().is_none(), "no line through the name");
         a.on_key(Key::Char('n'));
-        a.set_came_from("id000000");
-        assert!(a.back_to().is_none(), "no mark beside it");
         assert!(!a.animating());
     }
 

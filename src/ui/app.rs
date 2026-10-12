@@ -144,9 +144,6 @@ pub struct App {
     /// The row a kill is erasing, by session id, until a fresh listing
     /// replaces it. See [`App::start_backspace`].
     backspace: Option<(String, Backspace)>,
-    /// Whether coming back to the picker from a session marks that session's
-    /// row: `[effects.back] enabled`. See [`App::back_to`].
-    back: bool,
     /// Whether `c` opens a gap where the new session will go before the prompt
     /// comes up: `[effects.create] enabled`.
     create: bool,
@@ -292,7 +289,6 @@ impl App {
             kill: crate::config::get().effects.kill_enabled(),
             strike: None,
             backspace: None,
-            back: crate::config::get().effects.back_enabled(),
             create: crate::config::get().effects.create_enabled(),
             room: None,
             note_style: crate::config::get().picker.notes,
@@ -390,9 +386,6 @@ impl App {
     /// do not. A session that has gone from the list since is not gone back to
     /// either: killing the session you came from leaves `Esc` with nothing to
     /// do, which is better than dismissing the picker onto a dead client.
-    ///
-    /// The picker is coming back up over that session, so this is also what
-    /// marks its row as the one `Esc` returns to (see [`App::back_to`]).
     pub fn set_came_from(&mut self, id: &str) {
         self.came_from = Some(id.to_string());
     }
@@ -662,15 +655,6 @@ impl App {
         self.room.is_some()
     }
 
-    /// The session the picker came back up over, by id — the one `Esc` goes
-    /// back to — for the renderer to mark its row (see `draw::BACK`). `None`
-    /// when the picker was opened from no session, or with `[effects.back]`
-    /// off. A session that has gone since has no row, and so no mark: whether
-    /// it is listed is the renderer's to find, as it finds every other row.
-    pub fn back_to(&self) -> Option<&str> {
-        self.came_from.as_deref().filter(|_| self.back)
-    }
-
     /// The trail off the end of the name, for the renderer.
     pub fn trail_after(&self) -> &Starfield {
         &self.after
@@ -688,15 +672,14 @@ impl App {
         self.trail = on;
     }
 
-    /// Turn the picker's own effects — the afterglow, the filter's fade, the kill's strike and backspace, the mark on the session
-    /// come back from — on or off whatever the config says, for a test that
+    /// Turn the picker's own effects — the afterglow, the filter's fade, the kill's strike and backspace — on
+    /// or off whatever the config says, for a test that
     /// needs one or the other.
     #[cfg(test)]
     pub(super) fn set_effects(&mut self, on: bool) {
         self.lights = on;
         self.sift = on;
         self.kill = on;
-        self.back = on;
         self.create = on;
         if !on {
             self.glow = None;

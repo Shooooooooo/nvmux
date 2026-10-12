@@ -43,7 +43,7 @@ use crate::palette::Rgb;
 /// names, `[theme]` for the colour nvmux's own screens are drawn in, and
 /// `[effects]` with a table inside it for each
 /// effect: `[effects.fade]`, `[effects.move]`, `[effects.cursor]`,
-/// `[effects.back]`, `[effects.attach]`, `[effects.kill]`,
+/// `[effects.attach]`, `[effects.kill]`,
 /// `[effects.filter]` and `[effects.create]` for nvmux's own screens, and
 /// `[effects.smear]`, `[effects.particles]`, `[effects.scroll]`,
 /// `[effects.windows]` and `[effects.blink]` for nvmux's own client
@@ -339,7 +339,7 @@ impl<'de> Deserialize<'de> for ThemeColor {
 
 /// The animated effects: a master switch over them all, and a table of its own
 /// for each — `[effects.fade]`, `[effects.move]`, `[effects.cursor]`,
-/// `[effects.back]`, `[effects.attach]`, `[effects.kill]`,
+/// `[effects.attach]`, `[effects.kill]`,
 /// `[effects.filter]` and `[effects.create]`, and for nvmux's own client
 /// `[effects.smear]`, `[effects.particles]`, `[effects.scroll]`,
 /// `[effects.windows]` and `[effects.blink]` — with its own `enabled`. An effect runs only when both are on, which is what the
@@ -354,7 +354,6 @@ pub struct EffectsSettings {
     #[serde(rename = "move")]
     pub moving: MoveSettings,
     pub cursor: CursorSettings,
-    pub back: BackSettings,
     pub attach: AttachSettings,
     pub kill: KillSettings,
     pub filter: FilterSettings,
@@ -386,12 +385,6 @@ impl EffectsSettings {
     /// modifier is the terminal's say after this (see [`crate::ui::effects`]).
     pub fn cursor_enabled(&self) -> bool {
         self.enabled && self.cursor.enabled
-    }
-
-    /// Whether coming back to the picker from a session marks its row: its
-    /// own switch and the master one.
-    pub fn back_enabled(&self) -> bool {
-        self.enabled && self.back.enabled
     }
 
     /// Whether an attach from the picker hands the session's name across to
@@ -626,21 +619,6 @@ pub struct CursorSettings {
     pub enabled: bool,
 }
 
-/// Coming back to the picker from a session with `<prefix> Space`: a hollow
-/// `▹` in that session's row, in the column the cursor's `▸` is drawn in, for
-/// as long as the picker is up, so it is plain which one `Esc` returns to (see
-/// [`crate::ui::draw`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct BackSettings {
-    /// This effect's own switch, under `[effects] enabled`. Off, the picker
-    /// comes back up with the cursor on that session and nothing else.
-    ///
-    /// The mark is still, and dim — a modifier, like the numbers — so it is
-    /// the same with colour or without, and under `NO_COLOR`.
-    pub enabled: bool,
-}
-
 /// An attach from the picker: the picker closing in from the top and the
 /// bottom onto the chosen row with the session's name kept on the screen,
 /// through the client's start, and the session opening out of that line as
@@ -713,7 +691,6 @@ impl Default for EffectsSettings {
             fade: FadeSettings::default(),
             moving: MoveSettings::default(),
             cursor: CursorSettings::default(),
-            back: BackSettings::default(),
             attach: AttachSettings::default(),
             kill: KillSettings::default(),
             filter: FilterSettings::default(),
@@ -758,12 +735,6 @@ impl Default for MoveSettings {
 }
 
 impl Default for CursorSettings {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
-}
-
-impl Default for BackSettings {
     fn default() -> Self {
         Self { enabled: true }
     }
@@ -1130,11 +1101,6 @@ fn render_default_config(prefix: u8) -> String {
          # The row the cursor leaves fades back from the selection's bar.\n\
          # enabled = {cursor_enabled}\n\
          \n\
-         [effects.back]\n\
-         # Back in the picker from a session, a hollow triangle on its row,\n\
-         # where the cursor's is drawn, says it is the one Esc returns to.\n\
-         # enabled = {back_enabled}\n\
-         \n\
          [effects.attach]\n\
          # An attach from the picker closes onto the chosen row, keeping the\n\
          # session's name on screen, and opens the session out of that line.\n\
@@ -1194,7 +1160,6 @@ fn render_default_config(prefix: u8) -> String {
         effects_enabled = e.enabled,
         move_enabled = e.moving.enabled,
         cursor_enabled = e.cursor.enabled,
-        back_enabled = e.back.enabled,
         attach_enabled = e.attach.enabled,
         kill_enabled = e.kill.enabled,
         filter_enabled = e.filter.enabled,
@@ -1333,8 +1298,6 @@ mod tests {
             enabled = true\n\
             [effects.cursor]\n\
             enabled = true\n\
-            [effects.back]\n\
-            enabled = true\n\
             [effects.attach]\n\
             enabled = true\n\
             [effects.kill]\n\
@@ -1412,7 +1375,6 @@ mod tests {
         assert!(!s.effects.fade_enabled());
         assert!(!s.effects.move_enabled());
         assert!(!s.effects.cursor_enabled());
-        assert!(!s.effects.back_enabled());
         assert!(!s.effects.attach_enabled());
         assert!(!s.effects.kill_enabled());
         assert!(!s.effects.filter_enabled());
@@ -1423,13 +1385,12 @@ mod tests {
         assert!(!s.effects.particles_enabled() && !s.effects.blink_enabled());
         assert!(s.effects.scroll.enabled && s.effects.windows.enabled);
         assert!(s.effects.fade.enabled && s.effects.moving.enabled);
-        assert!(s.effects.cursor.enabled && s.effects.back.enabled);
-        assert!(s.effects.attach.enabled);
+        assert!(s.effects.cursor.enabled && s.effects.attach.enabled);
         assert!(s.effects.kill.enabled && s.effects.filter.enabled);
         assert!(s.effects.create.enabled);
         let on = Settings::default().effects;
         assert!(on.fade_enabled() && on.move_enabled() && on.cursor_enabled());
-        assert!(on.back_enabled() && on.attach_enabled());
+        assert!(on.attach_enabled());
         assert!(on.kill_enabled() && on.filter_enabled());
         assert!(on.create_enabled());
     }
@@ -1439,27 +1400,22 @@ mod tests {
     fn each_picker_effect_turns_off_on_its_own() {
         let s: Settings = toml::from_str("[effects.cursor]\nenabled = false\n").expect("valid");
         assert!(!s.effects.cursor_enabled());
-        assert!(s.effects.back_enabled() && s.effects.kill_enabled());
-        assert!(s.effects.filter_enabled());
-
-        let s: Settings = toml::from_str("[effects.back]\nenabled = false\n").expect("valid");
-        assert!(!s.effects.back_enabled());
-        assert!(s.effects.cursor_enabled() && s.effects.kill_enabled());
+        assert!(s.effects.attach_enabled() && s.effects.kill_enabled());
         assert!(s.effects.filter_enabled());
 
         let s: Settings = toml::from_str("[effects.attach]\nenabled = false\n").expect("valid");
         assert!(!s.effects.attach_enabled());
-        assert!(s.effects.back_enabled() && s.effects.kill_enabled());
+        assert!(s.effects.cursor_enabled() && s.effects.kill_enabled());
         assert!(s.effects.fade_enabled(), "the fade itself is untouched");
 
         let s: Settings = toml::from_str("[effects.kill]\nenabled = false\n").expect("valid");
         assert!(!s.effects.kill_enabled());
-        assert!(s.effects.cursor_enabled() && s.effects.back_enabled());
+        assert!(s.effects.cursor_enabled() && s.effects.attach_enabled());
         assert!(s.effects.filter_enabled());
 
         let s: Settings = toml::from_str("[effects.filter]\nenabled = false\n").expect("valid");
         assert!(!s.effects.filter_enabled());
-        assert!(s.effects.cursor_enabled() && s.effects.back_enabled());
+        assert!(s.effects.cursor_enabled() && s.effects.attach_enabled());
         assert!(s.effects.kill_enabled() && s.effects.create_enabled());
 
         let s: Settings = toml::from_str("[effects.create]\nenabled = false\n").expect("valid");
@@ -1675,7 +1631,6 @@ mod tests {
                 "an unknown cursor key",
                 "[effects.cursor]\nenable = false\n",
             ),
-            ("an unknown back key", "[effects.back]\nenable = false\n"),
             (
                 "an unknown attach key",
                 "[effects.attach]\nenable = false\n",
@@ -1853,7 +1808,6 @@ mod tests {
             "[effects.fade]",
             "[effects.move]",
             "[effects.cursor]",
-            "[effects.back]",
             "[effects.attach]",
             "[effects.kill]",
             "[effects.filter]",
@@ -1871,7 +1825,7 @@ mod tests {
         }
         assert_eq!(
             rendered.matches("\n# enabled = true\n").count(),
-            10,
+            9,
             "the master switch and each switch-only effect on by default: {rendered:?}"
         );
         assert_eq!(
