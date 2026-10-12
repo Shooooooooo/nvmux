@@ -1016,6 +1016,9 @@ pub fn with_prefix(prefix: u8) -> Settings {
 /// option but activates only `[keys] prefix`. Recording just the choice means
 /// the file does not pin the other defaults — they keep tracking the code. The
 /// commented values are the current defaults, so the template stays accurate.
+///
+/// A line each, as the README's list of every setting has them: the long
+/// account of an option, what it costs included, is on its field here.
 fn render_default_config(prefix: u8) -> String {
     let k = KeySettings::default();
     let s = SessionSettings::default();
@@ -1024,6 +1027,11 @@ fn render_default_config(prefix: u8) -> String {
     let t = ThemeSettings::default();
     let e = EffectsSettings::default();
     let f = e.fade;
+    // A string as the file spells it. Quoted here rather than with `{:?}` in
+    // the template, which would ignore the widths that line up a table's
+    // notes: each setting is padded to the widest in its table, and the
+    // prefix to the widest it can be, "Ctrl-Space".
+    let quoted = |s: &str| format!("{s:?}");
     format!(
         "# nvmux configuration — created on first run.\n\
          #\n\
@@ -1031,130 +1039,75 @@ fn render_default_config(prefix: u8) -> String {
          # to start over. See the README for what each option does.\n\
          \n\
          [keys]\n\
-         prefix     = {prefix:?}\n\
-         # timeout_ms = {timeout}\n\
+         prefix = {prefix:<12}   # Ctrl-Space, or a Ctrl-<letter> chord\n\
+         # timeout_ms = {timeout:<6}   # how long a lone prefix or half-typed number waits\n\
          \n\
          [session]\n\
-         # {{sock}} becomes the session's socket; it is what nvmux finds it by.\n\
-         # command = {command:?}\n\
+         # command = {command}   # {{sock}} is required\n\
          \n\
          [client]\n\
-         # Keep each session's Neovim client while another is in front, so a\n\
-         # switch back puts its screen back at once. Until nvmux exits, it costs:\n\
-         #  - a kept client is still a UI of its session, so another UI on it,\n\
-         #    a second nvmux included, is held to the smaller of the two sizes;\n\
-         #  - a switch no longer fires UILeave or UIEnter;\n\
-         #  - every session visited keeps an idle client (about 1.5 MB), its ssh\n\
-         #    forward, and the redraws its server still sends it.\n\
-         # false starts a new client on every switch instead.\n\
-         # per_session = {per_session}\n\
-         # Start each session's client on its first visit. false starts one for\n\
-         # every session as nvmux starts, so a first visit waits for nothing,\n\
-         # at the cost above for every session rather than every one visited.\n\
-         # lazy = {lazy}\n\
-         # Which client draws a session: \"nvmux\" is nvmux's own, which animates\n\
-         # the editor — the [effects.smear] tables and those after it below;\n\
-         # \"nvim\" is Neovim's own, and everything the terminal can do reaches\n\
-         # the editor as Neovim negotiated it.\n\
-         # ui = {ui:?}\n\
-         # nvmux's own client, over a slow link: a key that scrolls, or the\n\
-         # mouse wheel, scrolls at once, the lines it uncovers in their syntax\n\
-         # colours, if tree-sitter gives them, until Neovim's own arrive. false\n\
-         # waits for Neovim.\n\
-         # predict = {predict}\n\
+         # ui          = {ui:<7}   # nvmux's own animated client, or \"nvim\" for Neovim's\n\
+         # per_session = {per_session:<7}   # keep each session's client; a switch back reuses it\n\
+         # lazy        = {lazy:<7}   # start a client on its first visit, not at launch\n\
+         # predict     = {predict:<7}   # over a slow link, scrolls show before Neovim answers\n\
          \n\
          [picker]\n\
-         # What a session reports beside its name: busy, failed, or a\n\
-         # notification from a program in it, such as an agent asking for\n\
-         # permission. \"signs\" puts a sign left of the row and the selected\n\
-         # session's note under the list; \"column\" puts the note in the row;\n\
-         # \"off\" shows none. To know, nvmux leaves a watcher in each session,\n\
-         # which stays when nvmux leaves; \"off\" takes it out again.\n\
-         # notes = {notes:?}\n\
+         # notes = {notes}   # what a session reports: \"signs\", \"column\" or \"off\"\n\
          \n\
          [theme]\n\
-         # What nvmux's own screens are drawn in: \"terminal\" is the terminal's\n\
-         # own colours; a colour, \"#rrggbb\", draws their text and the\n\
-         # selection's bar in it, leaving what is dim, such as the session\n\
-         # numbers and the key hints, in the terminal's. Neovim's screen is\n\
-         # never drawn in it, and NO_COLOR keeps the terminal's.\n\
-         # color = {theme_color:?}\n\
+         # color = {theme_color}   # or \"#rrggbb\": nvmux's text and bars in that colour\n\
          \n\
          [effects]\n\
-         # The master switch: false turns every effect below off, whatever its\n\
-         # own enabled says.\n\
-         # enabled = {effects_enabled}\n\
+         # enabled = {effects_enabled}   # master switch: false turns every effect below off\n\
          \n\
          [effects.fade]\n\
-         # The dissolve between screens, and of the notice a switch puts up.\n\
-         # NO_COLOR turns it off whatever this says.\n\
-         # enabled     = {fade_enabled}\n\
-         # duration_ms = {fade_duration}\n\
-         # session     = {fade_session}\n\
+         # enabled     = {fade_enabled:<4}   # dissolve between screens; NO_COLOR forces this off\n\
+         # duration_ms = {fade_duration:<4}   # the whole dissolve, out and back\n\
+         # session     = {fade_session:<4}   # Neovim's own screen dissolves too\n\
          \n\
          [effects.move]\n\
-         # Stars streaming off both ends of a session picked up to be moved,\n\
-         # the rows it passes stepping aside, and the impact when it is put\n\
-         # down.\n\
-         # enabled = {move_enabled}\n\
+         # enabled = {move_enabled}   # stars off a session being moved, rows stepping aside\n\
          \n\
          [effects.cursor]\n\
-         # The row the cursor leaves fades back from the selection's bar.\n\
-         # enabled = {cursor_enabled}\n\
+         # enabled = {cursor_enabled}   # the row the cursor leaves fades back from the bar\n\
          \n\
          [effects.attach]\n\
-         # An attach from the picker closes onto the chosen row, keeping the\n\
-         # session's name on screen, and opens the session out of that line.\n\
-         # Rides the fade, so it needs [effects.fade] on, with session.\n\
-         # enabled = {attach_enabled}\n\
+         # enabled = {attach_enabled}   # the picker closes onto the name; the session opens from it\n\
          \n\
          [effects.kill]\n\
-         # A line through the name while the [y/N] asks; once it is confirmed,\n\
-         # the row is erased from its end before the kill runs.\n\
-         # enabled = {kill_enabled}\n\
+         # enabled = {kill_enabled}   # a line through the name at [y/N]; then the row is erased\n\
          \n\
          [effects.filter]\n\
-         # Rows a filter keystroke drops fade out before the list closes up.\n\
-         # enabled = {filter_enabled}\n\
+         # enabled = {filter_enabled}   # rows a filter drops fade out before the list closes up\n\
          \n\
          [effects.create]\n\
-         # c on the picker opens a gap where the new session will go, showing\n\
-         # the name the prompt will offer, before the prompt comes up.\n\
-         # enabled = {create_enabled}\n\
+         # enabled = {create_enabled}   # c opens a gap where the new session goes, then the prompt\n\
+         \n\
+         # The rest are for nvmux's own client, the default ui.\n\
          \n\
          [effects.smear]\n\
-         # nvmux's own client ([client] ui = \"nvmux\"): the cursor travels\n\
-         # between cells rather than jumping, a long move smearing behind it.\n\
-         # enabled = {smear_enabled}\n\
+         # enabled = {smear_enabled}   # the cursor travels between cells rather than jumping\n\
          \n\
          [effects.particles]\n\
-         # nvmux's own client: particles fly off the cursor as it moves. mode is\n\
-         # railgun, torpedo, pixiedust, sonicboom, ripple or wireframe.\n\
-         # enabled = {particles_enabled}\n\
-         # mode    = {particles_mode:?}\n\
+         # enabled = {particles_enabled:<9}   # what flies off the cursor as it moves\n\
+         # mode    = {particles_mode:<9}   # or torpedo, pixiedust, sonicboom, ripple, wireframe\n\
          \n\
          [effects.scroll]\n\
-         # nvmux's own client: a scroll slides the text through the window.\n\
-         # enabled = {scroll_enabled}\n\
+         # enabled = {scroll_enabled}   # a scroll slides the text through its window\n\
          \n\
          [effects.windows]\n\
-         # nvmux's own client: a split window opening, closing or changing size\n\
-         # moves there, and one showing another buffer fades from one to the\n\
-         # other, the way animate.nvim draws them; a float, the message area or\n\
-         # windows rearranged slide there, as in Neovide.\n\
-         # enabled = {windows_enabled}\n\
+         # enabled = {windows_enabled}   # windows and floats move rather than jump\n\
          \n\
          [effects.blink]\n\
-         # nvmux's own client: a blinking block cursor fades out and back in.\n\
-         # enabled = {blink_enabled}\n",
-        prefix = crate::keys::prefix_label(prefix),
+         # enabled = {blink_enabled}   # a blinking block cursor fades out and back in\n",
+        prefix = quoted(&crate::keys::prefix_label(prefix)),
         timeout = k.timeout_ms,
-        command = s.command,
+        command = quoted(&s.command),
         per_session = c.per_session,
         lazy = c.lazy,
         predict = c.predict,
-        notes = p.notes.name(),
-        theme_color = t.color.name(),
+        notes = quoted(p.notes.name()),
+        theme_color = quoted(&t.color.name()),
         fade_enabled = f.enabled,
         fade_duration = f.duration_ms,
         fade_session = f.session,
@@ -1165,13 +1118,13 @@ fn render_default_config(prefix: u8) -> String {
         kill_enabled = e.kill.enabled,
         filter_enabled = e.filter.enabled,
         create_enabled = e.create.enabled,
-        ui = match c.ui {
+        ui = quoted(match c.ui {
             Ui::Nvim => "nvim",
             Ui::Nvmux => "nvmux",
-        },
+        }),
         smear_enabled = e.smear.enabled,
         particles_enabled = e.particles.enabled,
-        particles_mode = e.particles.mode.name(),
+        particles_mode = quoted(e.particles.mode.name()),
         scroll_enabled = e.scroll.enabled,
         windows_enabled = e.windows.enabled,
         blink_enabled = e.blink.enabled,
@@ -1236,11 +1189,8 @@ mod tests {
         assert_eq!(s, Settings::default());
     }
 
-    /// The README's "Every setting, at its default" is a copy of these
-    /// defaults that nothing else keeps in step: it must parse, and to them,
-    /// with every table in it that the code has.
-    #[test]
-    fn the_readmes_settings_are_the_defaults() {
+    /// The TOML of the README's "Every setting, at its default".
+    fn readme_settings() -> &'static str {
         let readme = include_str!("../README.md");
         let start = readme
             .find("<summary>Every setting, at its default</summary>")
@@ -1248,7 +1198,15 @@ mod tests {
         let block = &readme[start..];
         let open = block.find("```toml\n").expect("its TOML") + "```toml\n".len();
         let close = open + block[open..].find("```").expect("its end");
-        let doc = &block[open..close];
+        &block[open..close]
+    }
+
+    /// The README's "Every setting, at its default" is a copy of these
+    /// defaults that nothing else keeps in step: it must parse, and to them,
+    /// with every table in it that the code has.
+    #[test]
+    fn the_readmes_settings_are_the_defaults() {
+        let doc = readme_settings();
         let s: Settings = toml::from_str(doc).expect("the README's settings parse");
         assert_eq!(
             s,
@@ -1792,7 +1750,7 @@ mod tests {
     fn the_default_config_activates_only_the_prefix() {
         let rendered = render_default_config(0x01);
         assert!(
-            rendered.contains("\nprefix     = \"Ctrl-a\"\n"),
+            rendered.contains("\nprefix = \"Ctrl-a\" "),
             "the chosen prefix is the one active setting: {rendered:?}"
         );
         // The timeout, the command and the fade are documentation, not active
@@ -1825,20 +1783,21 @@ mod tests {
             );
         }
         assert_eq!(
-            rendered.matches("\n# enabled = true\n").count(),
+            rendered.matches("\n# enabled = true ").count(),
             9,
             "the master switch and each switch-only effect on by default: {rendered:?}"
         );
         assert_eq!(
-            rendered.matches("\n# enabled = false\n").count(),
+            rendered.matches("\n# enabled = false ").count(),
             3,
             "the cursor's travel, the particles and the smooth blink: {rendered:?}"
         );
         for line in [
             "# per_session = true",
-            "# lazy = true",
-            "# ui = \"nvmux\"",
-            "# predict = true",
+            "# lazy        = true",
+            "# ui          = \"nvmux\"",
+            "# predict     = true",
+            "# notes = \"signs\"",
             "# color = \"terminal\"",
             "# enabled     = true",
             "# duration_ms = 200",
@@ -1850,6 +1809,33 @@ mod tests {
                 "the template must document {line:?}: {rendered:?}"
             );
         }
+    }
+
+    /// The file is edited by uncommenting a line, its note and all, so each
+    /// commented setting must parse once uncommented, and to its default; and
+    /// between them they must be every setting the README lists, spelt as it
+    /// spells them — which is what keeps a line from going missing.
+    #[test]
+    fn the_default_config_uncommented_is_every_setting_at_its_default() {
+        let rendered = render_default_config(crate::keys::PREFIX);
+        // A commented setting is a key — lowercase and underscores — before
+        // ` = `. The header and the prose are not.
+        let is_setting = |rest: &&str| {
+            rest.split_once(" = ").is_some_and(|(key, _)| {
+                let key = key.trim_end();
+                !key.is_empty() && key.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+            })
+        };
+        let mut uncommented = String::new();
+        for line in rendered.lines() {
+            uncommented.push_str(line.strip_prefix("# ").filter(is_setting).unwrap_or(line));
+            uncommented.push('\n');
+        }
+        let s: Settings = toml::from_str(&uncommented).expect("uncommented, it parses");
+        assert_eq!(s, Settings::default(), "{uncommented}");
+        let ours: toml::Table = toml::from_str(&uncommented).expect("valid toml");
+        let readme: toml::Table = toml::from_str(readme_settings()).expect("valid toml");
+        assert_eq!(ours, readme, "not the README's settings: {uncommented}");
     }
 
     // --- path resolution (pure) --------------------------------------------
