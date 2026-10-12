@@ -268,9 +268,9 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
             let marked = app.matched(&row.session.name);
             let head = head(row.num, selected, reordering, num_width);
             // The number is dim beside the name it stands for, except in the
-            // selection's bar: bold and dim share
-            // one reset, and most terminals cannot show both, so dimming it
-            // there would break the bar rather than quieten the number.
+            // selection's bar: bold and dim share one reset, and most
+            // terminals cannot show both, so dimming it there would break the
+            // bar rather than quieten the number.
             let dim = if selected {
                 0..0
             } else {
