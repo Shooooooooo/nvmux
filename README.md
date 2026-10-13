@@ -123,20 +123,23 @@ Beside each name the picker shows, dim, what that session has to report:
 | `⡆` | the same, with the percentage the progress gives |
 | `∗` | a program in one of its terminal buffers asked for a desktop notification — an agent wanting your permission, say |
 | `!` | a progress message failed, or a command in one of its terminal buffers did — a build, say |
+| `✓` | a program in one of its terminal buffers finished, exiting with code 0 — a test run, say |
 
 The selected session's note is spelt out under the list —
-`Claude Code · Claude needs your permission · 2m` — and a notification stays
-until you next open its session.
+`Claude Code · Claude needs your permission · 2m` — and a notification, a
+failure or a finished program stays until you next open its session. A
+session with more than one thing to say shows what wants you first: a
+notification or a failure, then a finished program, then whatever is busy.
 
 To know, nvmux leaves a watcher in each session — one augroup, `nvmux_notes` —
 that records Neovim's progress messages, what its language servers say they
 are working on (`clangd: 42% indexing 51/120`), the notifications programs in
 terminal buffers send — OSC 777 (Ghostty's), OSC 9 (iTerm2's) and OSC 99
-(kitty's) — and the commands in them that fail: a program that exits with a
-code other than 0, or a command its shell says did (`cargo build: exited with
-code 101`), which fish 4 says by itself and other shells can with OSC 133. It
-stays when nvmux leaves, so a session that wanted you overnight says so in the
-morning.
+(kitty's) — and how those programs end: one that exits with 0 has finished,
+and one that exits with any other code has failed, as has a command its shell
+says did (`cargo build: exited with code 101`), which fish 4 says by itself
+and other shells can with OSC 133. It stays when nvmux leaves, so a session
+that wanted you overnight says so in the morning.
 
 > [!NOTE]
 > A program only sends a notification to a terminal it thinks will show it.

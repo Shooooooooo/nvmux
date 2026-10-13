@@ -27,12 +27,12 @@
 //! `TermRequest` one, which takes the three notifications terminals know —
 //! OSC 777 `notify` (Ghostty's, urxvt's), OSC 9 (iTerm2's) and OSC 99
 //! (kitty's, sent in parts) — and a shell's word that a command failed, and a
-//! `TermClose` one, for a terminal's program that exits with a code other
-//! than 0. The picker reads it over plain RPC ([`read`]), the way it already
-//! asks a session whether it is alive. A program's own OSC 9;4 is not read:
-//! an agent's is no guide to whether it wants you — Claude Code's stays busy
-//! through its permission prompts — and what the session's progress messages
-//! say is.
+//! `TermClose` one, for a terminal's program that exits: with a code other
+//! than 0, it failed, and with 0, it finished. The picker reads it over plain
+//! RPC ([`read`]), the way it already asks a session whether it is alive. A
+//! program's own OSC 9;4 is not read: an agent's is no guide to whether it
+//! wants you — Claude Code's stays busy through its permission prompts — and
+//! what the session's progress messages say is.
 //!
 //! # It stays
 //!
@@ -55,9 +55,11 @@
 //! A notification is news until its session has been looked at: nvmux clears
 //! it ([`SEEN`]) when a session comes to the front ([`touch`]) and again when
 //! it leaves ([`seen`]) — in the session, so that another nvmux, on another
-//! machine, stops showing it too. A failure is kept the same way. Whether
-//! something is busy is not news but state, and is shown for as long as it
-//! lasts.
+//! machine, stops showing it too. A failure is kept the same way, and so,
+//! apart from them, is a program that has finished: news too, but asking
+//! nothing of you, so that a notification or a failure comes before it.
+//! Whether something is busy is not news but state, and is shown for as long
+//! as it lasts.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -72,7 +74,7 @@ use crate::rpc;
 
 /// The watcher's version. A session holding an older one is given this one,
 /// the record it kept carried over; a newer nvmux does the same to this one.
-pub const VERSION: i64 = 4;
+pub const VERSION: i64 = 5;
 
 /// How long the picker waits between reads of its sessions.
 pub const POLL: Duration = Duration::from_secs(2);
@@ -99,16 +101,24 @@ const SETTLE: Duration = Duration::from_millis(30);
 /// title and what it says it is doing for the text, `indexing 3/120` — a
 /// report gives only what has changed, so what it leaves out stands — until
 /// it ends or the server goes, which a read sees to, since a server that dies
-/// mid-work never says it has finished; and the last notification or failure
-/// — a failed progress message, a terminal's program that exits with a code
-/// other than 0, or a command its shell says did — until [`SEEN`] clears it.
-/// Text is kept without control characters and to 200 characters.
+/// mid-work never says it has finished; the last notification or failure — a
+/// failed progress message, a terminal's program that exits with a code other
+/// than 0, or a command its shell says did — and, apart from it, the last
+/// terminal's program to exit with 0, each until [`SEEN`] clears it. Text is
+/// kept without control characters and to 200 characters.
 ///
 /// A failed command is named by what its shell said it was, where the shell
 /// says — fish's `OSC 133 ; C` carries the command line, URL-encoded — and
 /// otherwise by the terminal's program, from its buffer name
 /// (`term://…//1234:cargo build`) and without its directory: `exited with
 /// code 101`, or `a command exited with code 101` when it is the shell's.
+///
+/// A finished program is named the same way, from its terminal's buffer name:
+/// `exited with code 0`. It has to be a job's: a terminal a plugin draws into
+/// itself (`nvim_open_term`) closes with 0 too, though nothing ran in it. A
+/// terminal whose buffer is deleted while its program runs closes with -1,
+/// which is neither a failure nor a finish, and a command its shell says
+/// succeeded is not kept at all: at a prompt, nearly every one does.
 ///
 /// Neovim's own progress messages, `source` `nvim`, are left out: a write's
 /// and a completion's scan begin and end within the command that says them,
@@ -212,6 +222,10 @@ local function program(buf)
   local command = name:match('^term://.-//%d+:(.*)$') or name
   return (command:gsub('^%S*/', ''))
 end
+local function ran(buf)
+  local chan = api.nvim_buf_is_valid(buf) and vim.bo[buf].channel or 0
+  return chan > 0 and api.nvim_get_chan_info(chan).stream == 'job'
+end
 local parts, commands = {}, {}
 api.nvim_create_autocmd('TermRequest', {
   group = group,
@@ -283,6 +297,8 @@ api.nvim_create_autocmd('TermClose', {
     local status = vim.v.event.status
     if type(status) == 'number' and status > 0 then
       note('failed', program(ev.buf), 'exited with code ' .. status)
+    elseif status == 0 and ran(ev.buf) then
+      N.finished = { title = clean(program(ev.buf)), body = 'exited with code 0', at = os.time() }
     end
   end,
 })
@@ -308,19 +324,24 @@ function N.snapshot()
   if N.note then
     out.note = { kind = N.note.kind, title = N.note.title, body = N.note.body, age = now - N.note.at }
   end
+  if N.finished then
+    out.finished = { title = N.finished.title, body = N.finished.body, age = now - N.finished.at }
+  end
   return out
 end
 function N.seen()
   N.note = nil
+  N.finished = nil
 end
 return N.snapshot()
 "#;
 
 /// The record, as a map: `busy` (the progress message, or language server's
 /// work, running that started last: `title`, `text`, `percent` when it has
-/// one, and `age` in seconds) and `note` (`kind` `notify` or `failed`,
-/// `title`, `body`, `age`), each there only when the session has one. `false`
-/// where there is no watcher, or one older or newer than this nvmux's.
+/// one, and `age` in seconds), `note` (`kind` `notify` or `failed`, `title`,
+/// `body`, `age`) and `finished` (the program that finished last: `title`,
+/// `body`, `age`), each there only when the session has one. `false` where
+/// there is no watcher, or one older or newer than this nvmux's.
 const READ: &str = r#"local version = ...
 local N = package.loaded['nvmux.notes']
 if type(N) ~= 'table' or N.version ~= version or type(N.snapshot) ~= 'function' then
@@ -329,7 +350,8 @@ end
 return N.snapshot()
 "#;
 
-/// Clear the notification, or failure, the session was keeping.
+/// Clear what the session was keeping: the notification, or failure, and the
+/// program that finished.
 const SEEN: &str = r#"local N = package.loaded['nvmux.notes']
 if type(N) == 'table' and type(N.seen) == 'function' then
   N.seen()
@@ -345,20 +367,23 @@ pub enum Kind {
     /// A progress message ended in failure, or a command in a terminal buffer
     /// did.
     Failed,
+    /// A program in a terminal buffer finished: it exited with 0.
+    Finished,
     /// A progress message, or a language server's work, is running, and with
     /// a percentage where it says how far it has got.
     Busy(Option<u8>),
 }
 
 /// The one thing a session has to say: a notification or a failure, which
-/// wait for you, before anything running.
+/// wait for you, then a program that has finished, and then anything running.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Note {
     pub kind: Kind,
     /// The notification's title, or the progress message's: the program or
     /// plugin it came from, as often as not — `Claude Code`, `claude` — and
     /// for a language server's work, the server's name, `clangd`; for a
-    /// command that failed, the command: `cargo build`.
+    /// command that failed, or a program that finished, the command:
+    /// `cargo build`.
     pub title: String,
     /// The notification's body, the progress message's text, what the
     /// language server says it is doing — `indexing 3/120` — or how a command
@@ -496,20 +521,25 @@ fn lua(code: &str) -> Vec<Value> {
 }
 
 /// The note a record comes to, if any: the notification or failure it keeps
-/// first, since those wait for you, and then whatever is running.
+/// first, since those wait for you, then the program that finished, and then
+/// whatever is running.
 fn note_of(record: &Value, read_at: Instant) -> Option<Note> {
+    let kept = |n: &Value, kind| Note {
+        kind,
+        title: text(field(n, "title")),
+        text: text(field(n, "body")),
+        age: seconds(field(n, "age")),
+        read_at,
+    };
     if let Some(n) = field(record, "note") {
         let kind = match field(n, "kind").and_then(Value::as_str) {
             Some("failed") => Kind::Failed,
             _ => Kind::Notified,
         };
-        return Some(Note {
-            kind,
-            title: text(field(n, "title")),
-            text: text(field(n, "body")),
-            age: seconds(field(n, "age")),
-            read_at,
-        });
+        return Some(kept(n, kind));
+    }
+    if let Some(n) = field(record, "finished") {
+        return Some(kept(n, Kind::Finished));
     }
     let busy = field(record, "busy")?;
     let percent = field(busy, "percent")
@@ -720,6 +750,48 @@ mod tests {
         let note = note_of(&record, Instant::now()).expect("a note");
         assert_eq!(note.kind, Kind::Failed);
         assert_eq!(note.text, "exited with code 1");
+    }
+
+    /// A program that finished is news, so it comes before what is running;
+    /// but it asks nothing of you, so a notification comes before it.
+    #[test]
+    fn a_finished_program_comes_between_a_notification_and_what_is_running() {
+        let finished = (
+            "finished",
+            map(vec![
+                ("title", Value::from("cargo test")),
+                ("body", Value::from("exited with code 0")),
+                ("age", Value::from(30)),
+            ]),
+        );
+        let busy = (
+            "busy",
+            map(vec![
+                ("title", Value::from("claude")),
+                ("age", Value::from(3)),
+            ]),
+        );
+        let note =
+            note_of(&map(vec![finished.clone(), busy.clone()]), Instant::now()).expect("a note");
+        assert_eq!(note.kind, Kind::Finished);
+        assert_eq!(
+            (note.title.as_str(), note.text.as_str()),
+            ("cargo test", "exited with code 0")
+        );
+        assert_eq!(note.age, Duration::from_secs(30));
+
+        let notified = (
+            "note",
+            map(vec![
+                ("kind", Value::from("notify")),
+                ("body", Value::from("Claude needs your permission")),
+                ("age", Value::from(5)),
+            ]),
+        );
+        assert_eq!(
+            note_of(&map(vec![finished, busy, notified]), Instant::now()).map(|n| n.kind),
+            Some(Kind::Notified)
+        );
     }
 
     /// Lua's numbers are whole or not: a percentage arrives either way, is
