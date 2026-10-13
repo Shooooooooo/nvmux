@@ -304,6 +304,103 @@ fn the_client_draws_a_session_and_types_into_it() {
     );
 }
 
+/// What nvmux tells its client to show — a card, in the client's input (see
+/// `nvmux::card`) — is drawn in the top right corner over the editor, and is
+/// typed into nothing. The editor clearing its screen and drawing it again
+/// draws the card again with it; and when its time is up the card goes, and
+/// what it covered is the editor's again.
+#[test]
+fn a_card_is_drawn_over_the_editor_and_outlives_its_repaints() {
+    require_nvim!();
+    let scratch = Scratch::new("client-card");
+    let (sock, mut rpc, config) = session(&scratch, "client-card");
+    let under = "u".repeat(usize::from(COLS) - 1);
+    rpc.command(&format!(
+        "setlocal noswapfile | call setline(1, ['first', '{under}', '{under}'])"
+    ))
+    .expect("setline");
+
+    let mut term = Terminal::spawn(&sock, &config);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.lines().nth(1)
+            == Some(under.as_str())),
+        "the session was never drawn:\n{}",
+        term.text()
+    );
+
+    let life = Duration::from_millis(2500);
+    let card = nvmux::card::Card {
+        life_ms: life.as_millis() as u64,
+        fade_ms: 0,
+        ..nvmux::card::Card::news(
+            1,
+            nvmux::card::Kind::Finished,
+            "api-server",
+            "cargo test: exited with code 0",
+            3,
+            "Ctrl-Space ⏎ go there",
+        )
+    };
+    let shown = Instant::now();
+    term.type_bytes(&nvmux::card::encode(&nvmux::card::Command::Show(card)));
+    let carded = |s: &str| {
+        let rows: Vec<&str> = s.lines().collect();
+        rows.get(1)
+            .is_some_and(|r| r.ends_with("╮") && r.contains("╭─ ✓ api-server"))
+            && rows
+                .get(2)
+                .is_some_and(|r| r.contains("│ cargo test: exited with code 0"))
+            && rows
+                .get(3)
+                .is_some_and(|r| r.contains("│ Ctrl-Space ⏎ go there"))
+    };
+    assert!(
+        term.pump_until(Duration::from_secs(5), carded),
+        "the card was never drawn:\n{}",
+        term.text()
+    );
+    let row = term
+        .text()
+        .lines()
+        .nth(1)
+        .map(str::to_string)
+        .unwrap_or_default();
+    assert!(
+        row.starts_with(&"u".repeat(usize::from(COLS) - 47)),
+        "the card is not in the top right corner: {row:?}"
+    );
+    assert_eq!(
+        rpc.eval("[getline(1, '$'), mode()]")
+            .expect("ask the editor"),
+        Value::Array(vec![
+            Value::Array(vec![
+                Value::from("first"),
+                Value::from(under.as_str()),
+                Value::from(under.as_str()),
+            ]),
+            Value::from("n"),
+        ]),
+        "the card reached the editor as keys"
+    );
+
+    // The editor clears its screen and draws it all again: the card with it.
+    rpc.command("mode").expect(":mode");
+    term.pump_until(Duration::from_millis(500), |_| false);
+    assert!(
+        carded(&term.text()),
+        "a repaint took the card off the screen:\n{}",
+        term.text()
+    );
+
+    let left = life.saturating_sub(shown.elapsed()) + Duration::from_secs(3);
+    assert!(
+        term.pump_until(left, |s| s.lines().nth(1) == Some(under.as_str())),
+        "the card never went, or did not give the editor's text back:\n{}",
+        term.text()
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
 /// A session waiting for a key nvmux may not press for the user — a
 /// half-typed `g`, which over RPC is also what a crashed callback leaves — is
 /// drawn once the user presses one. Neovim holds the client's attach behind

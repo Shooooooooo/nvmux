@@ -1,174 +1,66 @@
-//! What nvmux says in the editor in front, in the editor's own words:
-//! `vim.notify`, so that it appears wherever the user has that go — the message
-//! row, or a notification plugin's window — and is kept in `:messages`.
+//! What the other sessions report while you are in one, told as it happens: a
+//! notification a program in one of their terminal buffers asked for (`∗`), a
+//! command there that failed (`!`) or finished (`✓`) — the picker's signs,
+//! while the picker is down — as cards in the corner of the session in front
+//! (see [`crate::card`]). Of the session in front, only what a terminal of its
+//! own off the screen says: the rest it was showing.
 //!
-//! Two things are said. Which session this is, on arriving in one that was not
-//! chosen by name — a `<prefix>` switch — which nvmux used to say with a box of
-//! its own drawn over the session ([`crate::announce`], kept, and no longer
-//! armed). And, while a session is in front, what the others have to report
-//! as it happens ([`Notifier`]): a notification a program in one of their
-//! terminal buffers asked for (`∗`), a command there that failed (`!`) or
-//! finished (`✓`) — the picker's signs, told while the picker is down. The
-//! session in front is told its own only of a terminal that was not on the
-//! screen when it spoke.
-//!
-//! # In the editor
-//!
-//! [`crate::announce`] says why this was once the shape not to take: a session
-//! manager that writes on the row the editor talks to you on has stopped being
-//! a proxy. It is the shape taken now, by choice, for what that buys: the
-//! user's own notification plugin, its history and `:messages`, and nothing of
-//! nvmux's own drawn over a session it owns no cells of.
-//!
-//! What it takes to work, found against Neovim 0.11 and 0.12 with a UI
-//! attached:
-//!
-//! * **One line, in the room there is.** A message wider than `v:echospace`
-//!   brings up the hit-enter prompt — the editor stopped until a key, by a
-//!   message it did not ask for — so it is cut to fit when it is shown,
-//!   whatever will show it.
-//! * **Deferred.** A request that shows a message waits for whatever showing
-//!   it does: the one too wide for its row was not answered until its prompt
-//!   was. So the chunk ([`SAY`]) only schedules the call, and answers at once,
-//!   and nvmux's thread never waits on the showing — a plugin's window, or a
-//!   prompt the cut to fit did not foresee.
-//! * **After the UI.** A message given before a UI attaches is not on the
-//!   screen once it has, and nor is one a `:mode` repaint follows. So the chunk
-//!   waits for `UIEnter` in a session with no UI yet — a client just started —
-//!   and the relay says a kept client's arrival only once the repaint it asks
-//!   for on that client's return is done.
-//! * **Not to an editor waiting for a key.** The request would wait with it,
-//!   and say what it says once the moment had gone, so such an editor is asked
-//!   nothing ([`say`]); the news waits to be tried again.
+//! The news is read off each session's watcher ([`crate::notes`]), and its
+//! cards are posted for the relay in front ([`crate::card::board`]), which has
+//! its client draw them. Nothing is asked of the session in front to show
+//! them, so they are up as soon as the news is read, whatever the editor is
+//! doing and however far away it is; and they are nvmux's, with nothing of
+//! them left in the editor once they go.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use rmpv::Value;
-
-use crate::error::RpcError;
+use crate::card::{self, Card, Go, Post};
 use crate::notes::{self, Heard, Kind, News};
-use crate::rpc;
 use crate::ui::note;
-
-/// What one call may take, from the connect to the answer.
-const BUDGET: Duration = Duration::from_secs(1);
+use crate::{ids, keys};
 
 /// How long the notifier waits, once a session is in front, before its first
 /// round of reads: long enough for the sessions handed to it at the same
 /// moment to be read in that round.
 const SETTLE: Duration = Duration::from_millis(30);
 
-/// How much news waits for an editor that is waiting for a key; past it, the
-/// oldest goes. The picker has all of it anyway.
-const KEPT: usize = 8;
-
-/// The chunk that says a message, sent with `nvim_exec_lua` and the message
-/// and its level (`vim.log.levels`) as its arguments.
-///
-/// Scheduled rather than said, cut to `v:echospace` as it is said, and held
-/// for the first UI where there is none (see the module docs). A plugin's
-/// `vim.notify` that fails is that plugin's business: it is called through
-/// `pcall`, and the editor goes on.
-const SAY: &str = r#"local msg, level = ...
-local function say()
-  local room = vim.v.echospace
-  if room < 2 then
-    return
-  end
-  while vim.fn.strdisplaywidth(msg) > room and vim.fn.strchars(msg) > 1 do
-    msg = vim.fn.strcharpart(msg, 0, vim.fn.strchars(msg) - 2) .. '…'
-  end
-  pcall(vim.notify, msg, level, { title = 'nvmux' })
-end
-if #vim.api.nvim_list_uis() == 0 then
-  vim.api.nvim_create_autocmd('UIEnter', {
-    once = true,
-    callback = function()
-      vim.defer_fn(say, 0)
-    end,
-  })
-else
-  vim.defer_fn(say, 0)
-end
-return true
-"#;
-
-/// How much a message matters, as `vim.log.levels` has it: what a plugin
-/// colours it by, and the default `vim.notify` too.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Level {
-    Info,
-    Warn,
-    Error,
-}
-
-impl Level {
-    /// The level's number in `vim.log.levels`.
-    fn code(self) -> i64 {
-        match self {
-            Level::Info => 2,
-            Level::Warn => 3,
-            Level::Error => 4,
-        }
-    }
-}
-
-/// Say `message` in the editor on `sock`, at `level`. `Ok(false)`, with
-/// nothing asked of it, where that editor is waiting for a key.
-pub fn say(sock: &Path, message: &str, level: Level) -> Result<bool, RpcError> {
-    let mut client = rpc::Client::connect(sock, BUDGET)?;
-    if client.get_mode()?.blocking {
-        return Ok(false);
-    }
-    client.call(
-        "nvim_exec_lua",
-        vec![
-            Value::from(SAY),
-            Value::Array(vec![Value::from(message), Value::from(level.code())]),
-        ],
-    )?;
-    Ok(true)
-}
-
-/// Say which session this is, in the editor on `sock`: the attach notice, as
-/// the editor gives it. On a thread of its own, so that nothing waits for it,
-/// and best effort: an editor waiting for a key is not told, and has its own
-/// prompt on the screen to say why it is not answering.
-pub fn arrive(sock: PathBuf, name: String) {
-    let spawned = std::thread::Builder::new()
-        .name("nvmux-tell".into())
-        .spawn(move || {
-            if let Err(e) = say(&sock, &name, Level::Info) {
-                tracing::debug!(error = %e, "tell: could not say which session this is");
-            }
-        });
-    if let Err(e) = spawned {
-        tracing::debug!(error = %e, "tell: no thread to say which session this is on");
-    }
-}
-
-/// What the editor in front is told of `news`: its sign, the session it is
-/// from — `None` for the session in front itself — and what it says, as the
-/// picker's caption would put it.
-pub fn message(news: &News, from: Option<&str>) -> String {
-    let sign = note::mark(news.kind);
+/// The card that tells `news`, from the session with this id and name — or,
+/// with `None`, from the session in front itself — and where acting on it
+/// goes: that session, or the terminal it came from. `prefix` is the prefix
+/// key, which the card names. `None` for what is not news: what is busy.
+pub fn card_for(news: &News, from: Option<(&str, &str)>, prefix: u8) -> Option<(Card, Option<Go>)> {
+    let kind = match news.kind {
+        Kind::Notified => card::Kind::Notified,
+        Kind::Failed => card::Kind::Failed,
+        Kind::Finished => card::Kind::Finished,
+        Kind::Busy(_) => return None,
+    };
     let what = note::what(news.kind, &news.title, &news.text);
-    match from {
-        Some(name) => format!("{sign} {name} · {what}"),
-        None => format!("{sign} {what}"),
-    }
-}
-
-/// How much news of `kind` matters: a notification wants the user, and a
-/// failure is an error.
-fn level(kind: Kind) -> Level {
-    match kind {
-        Kind::Notified => Level::Warn,
-        Kind::Failed => Level::Error,
-        Kind::Finished | Kind::Busy(_) => Level::Info,
-    }
+    let key = format!("{} {}", keys::prefix_label(prefix), keys::ENTER_GLYPH);
+    let (title, go, does) = match from {
+        Some((id, name)) => (
+            name.to_string(),
+            ids::Id::new(id).map(Go::Session),
+            "go there",
+        ),
+        None => (
+            match news.tab {
+                Some(tab) => format!("here · tab {tab}"),
+                None => "here".to_string(),
+            },
+            news.buf.map(Go::Buffer),
+            "show it",
+        ),
+    };
+    let footer = if go.is_some() {
+        format!("{key} {does}")
+    } else {
+        String::new()
+    };
+    let card = Card::news(card::next_id(), kind, &title, &what, news.age, &footer);
+    Some((card, go))
 }
 
 /// Of what a session said, what to tell, oldest first: what it numbered past
@@ -208,8 +100,9 @@ struct Watched {
     heard: Option<u64>,
 }
 
-/// Tells the editor in front, as it happens, what the other sessions have to
-/// report — and of its own terminals, what the ones off the screen do.
+/// Posts, as it happens, cards with what the other sessions have to report —
+/// and of the session in front, what its terminals off the screen do — for
+/// the relay in front to have its client draw.
 ///
 /// It reads every session it is handed every [`notes::POLL`] while a session
 /// is in front, and none while one of nvmux's own screens is: the picker has
@@ -221,29 +114,36 @@ struct Watched {
 /// a key — this runs for as long as nvmux does, and a session may wait for its
 /// key all night.
 ///
-/// Dropping it stops the thread without waiting for it, as with
+/// With `[client] ui = "nvim"` there is no client to draw a card, and nothing
+/// is read. Dropping it stops the thread without waiting for it, as with
 /// [`notes::Poller`]: a read in flight finishes to nobody.
 pub struct Notifier {
-    commands: Sender<Command>,
+    commands: Option<Sender<Command>>,
 }
 
 impl Notifier {
     /// Start reading, with no session handed over yet and none in front.
     pub fn start() -> Self {
+        if crate::config::get().client.ui == crate::config::Ui::Nvim {
+            return Self { commands: None };
+        }
+        let prefix = crate::config::get().keys.prefix;
         let (commands, inbox) = mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("nvmux-notifier".into())
-            .spawn(move || run(&inbox));
+            .spawn(move || run(&inbox, prefix));
         if let Err(e) = spawned {
             tracing::warn!(error = %e, "tell: no thread to read the sessions on");
         }
-        Self { commands }
+        Self {
+            commands: Some(commands),
+        }
     }
 
     /// Read session `id`, called `name`, through `sock` from now on — or, if it
     /// is read already, by this name and through this socket.
     pub fn watch(&self, id: &str, name: &str, sock: PathBuf) {
-        let _ = self.commands.send(Command::Watch {
+        self.send(Command::Watch {
             id: id.to_string(),
             name: name.to_string(),
             sock,
@@ -255,15 +155,19 @@ impl Notifier {
     ///
     /// [`watch`]: Notifier::watch
     pub fn front(&self, id: Option<&str>) {
-        let _ = self.commands.send(Command::Front(id.map(str::to_string)));
+        self.send(Command::Front(id.map(str::to_string)));
+    }
+
+    fn send(&self, command: Command) {
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(command);
+        }
     }
 }
 
-fn run(inbox: &Receiver<Command>) {
+fn run(inbox: &Receiver<Command>, prefix: u8) {
     let mut watched: Vec<Watched> = Vec::new();
     let mut front: Option<String> = None;
-    // News for the session in front that it could not be told yet.
-    let mut kept: Vec<(String, Level)> = Vec::new();
     let mut due: Option<Instant> = None;
     loop {
         let next = match due {
@@ -297,12 +201,11 @@ fn run(inbox: &Receiver<Command>) {
                     }
                 }
                 front = id;
-                kept.clear();
                 due = front.is_some().then(|| Instant::now() + SETTLE);
             }
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(id) = front.as_deref() {
-                    round(&mut watched, id, &mut kept);
+                    round(&mut watched, id, prefix);
                 }
                 due = front.is_some().then(|| Instant::now() + notes::POLL);
             }
@@ -311,9 +214,9 @@ fn run(inbox: &Receiver<Command>) {
     }
 }
 
-/// Read every session, all at a time, and tell the session in front, `front`,
-/// what is news.
-fn round(watched: &mut [Watched], front: &str, kept: &mut Vec<(String, Level)>) {
+/// Read every session, all at a time, and post a card for the session in
+/// front, `front`, of what is news.
+fn round(watched: &mut [Watched], front: &str, prefix: u8) {
     let heard: Vec<(usize, Heard)> = std::thread::scope(|s| {
         let reads: Vec<_> = watched
             .iter()
@@ -331,35 +234,18 @@ fn round(watched: &mut [Watched], front: &str, kept: &mut Vec<(String, Level)>) 
         };
         let w = &mut watched[i];
         let here = w.id == front;
+        let from = (!here).then_some((w.id.as_str(), w.name.as_str()));
         for n in to_tell(w.heard, &news, here) {
-            kept.push((
-                message(n, (!here).then_some(w.name.as_str())),
-                level(n.kind),
-            ));
+            if let Some((card, go)) = card_for(n, from, prefix) {
+                card::board().post(Post {
+                    front: front.to_string(),
+                    card,
+                    go,
+                });
+            }
         }
         let top = news.iter().map(|n| n.seq).max().unwrap_or(0);
         w.heard = Some(w.heard.map_or(top, |h| h.max(top)));
-    }
-    if kept.len() > KEPT {
-        kept.drain(..kept.len() - KEPT);
-    }
-    let Some(sock) = watched.iter().find(|w| w.id == front).map(|w| &w.sock) else {
-        kept.clear();
-        return;
-    };
-    while let Some((msg, level)) = kept.first() {
-        match say(sock, msg, *level) {
-            Ok(true) => {
-                kept.remove(0);
-            }
-            // Waiting for a key: the next round tries again.
-            Ok(false) => break,
-            Err(e) => {
-                tracing::debug!(error = %e, "tell: could not tell the session in front");
-                kept.clear();
-                break;
-            }
-        }
     }
 }
 
@@ -374,50 +260,64 @@ mod tests {
             text: text.to_string(),
             seq,
             shown,
+            age: 3,
+            buf: None,
+            tab: None,
         }
     }
 
-    /// The picker's sign, the session it came from, and the picker's words
-    /// for it — without the session's name for the session in front.
+    /// A card with news from another session: its sign, its name, what
+    /// happened in the picker's words, how long ago, and the key that goes
+    /// there — which goes there.
     #[test]
-    fn a_message_is_the_sign_the_session_and_what_happened() {
+    fn a_card_from_another_session_names_it_and_goes_there() {
         let finished = news(Kind::Finished, "cargo test", "exited with code 0", 1, None);
-        assert_eq!(
-            message(&finished, Some("api-server")),
-            "✓ api-server · cargo test: exited with code 0"
-        );
-        let failed = news(Kind::Failed, "cargo build", "exited with code 101", 2, None);
-        assert_eq!(
-            message(&failed, Some("api-server")),
-            "! api-server · cargo build: exited with code 101"
-        );
+        let (card, go) = card_for(&finished, Some(("abcd2345", "api-server")), 0).expect("news");
+        assert_eq!(card.kind, card::Kind::Finished);
+        assert_eq!(card.title, "api-server");
+        assert_eq!(card.body.as_deref(), Some("cargo test: exited with code 0"));
+        assert_eq!(card.age, Some(3));
+        assert_eq!(card.footer.as_deref(), Some("Ctrl-Space ⏎ go there"));
+        assert_eq!(go, Some(Go::Session(ids::Id::new("abcd2345").expect("id"))));
+
         let notified = news(
             Kind::Notified,
             "Claude Code",
             "Claude needs your permission",
-            3,
+            2,
             None,
         );
+        let (card, _) = card_for(&notified, Some(("abcd2345", "blog")), 0).expect("news");
+        assert_eq!(card.kind, card::Kind::Notified);
         assert_eq!(
-            message(&notified, Some("blog")),
-            "∗ blog · Claude Code · Claude needs your permission"
+            card.body.as_deref(),
+            Some("Claude Code · Claude needs your permission")
         );
-        assert_eq!(
-            message(&notified, None),
-            "∗ Claude Code · Claude needs your permission"
-        );
+
+        let failed = news(Kind::Failed, "make", "exited with code 2", 3, None);
+        let (card, go) = card_for(&failed, Some(("not an id", "x")), 0).expect("news");
+        assert_eq!(card.kind, card::Kind::Failed);
+        assert_eq!((card.footer, go), (None, None), "nowhere to go, so no key");
+        assert!(card_for(&news(Kind::Busy(None), "", "", 4, None), None, 0).is_none());
     }
 
+    /// Of the session in front: `here`, and where its terminal is, and the
+    /// key that shows it — where it can be shown.
     #[test]
-    fn a_notification_is_a_warning_and_a_failure_an_error() {
-        assert_eq!(level(Kind::Notified), Level::Warn);
-        assert_eq!(level(Kind::Failed), Level::Error);
-        assert_eq!(level(Kind::Finished), Level::Info);
-        assert_eq!(
-            [Level::Info, Level::Warn, Level::Error].map(Level::code),
-            [2, 3, 4],
-            "vim.log.levels"
-        );
+    fn a_card_from_the_session_in_front_is_here() {
+        let mut own = news(Kind::Failed, "sh", "exited with code 3", 1, Some(false));
+        own.buf = Some(5);
+        own.tab = Some(2);
+        let (card, go) = card_for(&own, None, 0x14).expect("news");
+        assert_eq!(card.title, "here · tab 2");
+        assert_eq!(card.footer.as_deref(), Some("Ctrl-t ⏎ show it"));
+        assert_eq!(go, Some(Go::Buffer(5)));
+
+        own.tab = None;
+        assert_eq!(card_for(&own, None, 0).expect("news").0.title, "here");
+        own.buf = None;
+        let (card, go) = card_for(&own, None, 0).expect("news");
+        assert_eq!((card.footer, go), (None, None));
     }
 
     /// The first read only finds out how far a session has got; after it,

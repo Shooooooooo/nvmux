@@ -95,13 +95,14 @@ reimplementing it.
 | `<prefix>` `n` | next session by number (wraps) |
 | `<prefix>` `p` | previous session by number (wraps) |
 | `<prefix>` `c` | set up a new session and attach to it — `Esc` goes back |
+| `<prefix>` `Enter` | go where the card in the corner is about: its session, or a terminal of this one |
 | `<prefix>` `?` | show these keys — `Esc` goes back |
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
 
 Pressing `<prefix>` puts a one-row reminder of these keys along the bottom of
 the screen; it goes as soon as the next key resolves it. A switch by key says
-which session you have landed in, as the editor says anything: with
-`vim.notify`, on its message row or in whatever notification plugin you use.
+which session you have landed in, with a card in the top right corner that
+comes in with the session's screen and goes a moment later.
 
 ### Leaving a session
 
@@ -133,11 +134,23 @@ failure or a finished command stays until you next open its session. A
 session with more than one thing to say shows what wants you first: a
 notification or a failure, then a finished command, then whatever is busy.
 
-While you are in a session, the others' `∗`, `!` and `✓` are told to you there
-as they come, the same way — `vim.notify`, so on the message row or in your
-notification plugin, and in `:messages`: `✓ api-server · cargo test: exited
-with code 0`. Of the session you are in, you are told only what a terminal
-that is not on the screen says, without the session's name.
+While you are in a session, the others' `∗`, `!` and `✓` come up as they
+happen, as cards in that same corner, the newest on top:
+
+```
+╭─ ✓ api-server ──────────────────────── 3s ─╮
+│ cargo test: exited with code 0             │
+│ Ctrl-Space ⏎ go there                      │
+╰────────────────────────────────────────────╯
+```
+
+`<prefix> Enter` takes you to the session the newest one is about. Of the
+session you are in, you are told only what a terminal that is not on the
+screen says — as `here`, with the tab page it is in — and `<prefix> Enter`
+shows it. nvmux draws the cards itself, on this side of any link to the
+session's host, so they are up as soon as nvmux knows what to say, and leave
+nothing in your editor; with `[client] ui = "nvim"`, Neovim's own client has
+no way to draw one, and there are none.
 
 To know, nvmux leaves a watcher in each session — one augroup, `nvmux_notes` —
 that records Neovim's progress messages, what its language servers say they

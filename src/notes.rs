@@ -75,7 +75,7 @@ use crate::rpc;
 
 /// The watcher's version. A session holding an older one is given this one,
 /// the record it kept carried over; a newer nvmux does the same to this one.
-pub const VERSION: i64 = 7;
+pub const VERSION: i64 = 8;
 
 /// How long the picker waits between reads of its sessions.
 pub const POLL: Duration = Duration::from_secs(2);
@@ -114,7 +114,10 @@ const SETTLE: Duration = Duration::from_millis(30);
 /// one it has (see [`crate::tell`]); and says, where it came from a terminal
 /// buffer, whether that buffer was on the screen — in a window of the current
 /// tab page — at the time, so that the session in front need not be told what
-/// it was already showing.
+/// it was already showing. A read says which buffer that was, while it still
+/// is one, and the number of the tab page a window shows it in now, if any:
+/// what the card that tells the session in front of it says, and shows it by
+/// (see [`crate::card`]).
 ///
 /// A command that ends, failed or finished, is named by what its shell said
 /// it was, where the shell says — fish's `OSC 133 ; C` carries the command
@@ -189,6 +192,7 @@ local function note(kind, title, body, buf)
       at = os.time(),
       seq = N.seq,
       shown = shown(buf),
+      buf = buf,
     }
     if kind == 'finished' then
       N.finished = kept
@@ -339,6 +343,16 @@ api.nvim_create_autocmd('TermClose', {
     end
   end,
 })
+local function tab_of(buf)
+  for _, tab in ipairs(api.nvim_list_tabpages()) do
+    for _, win in ipairs(api.nvim_tabpage_list_wins(tab)) do
+      if api.nvim_win_get_buf(win) == buf then
+        return api.nvim_tabpage_get_number(tab)
+      end
+    end
+  end
+  return nil
+end
 function N.snapshot()
   local now = os.time()
   local busy
@@ -361,6 +375,7 @@ function N.snapshot()
   for _, slot in ipairs({ 'note', 'finished' }) do
     local n = N[slot]
     if n then
+      local buf = type(n.buf) == 'number' and api.nvim_buf_is_valid(n.buf) and n.buf or nil
       out[slot] = {
         kind = n.kind,
         title = n.title,
@@ -368,6 +383,8 @@ function N.snapshot()
         age = now - n.at,
         seq = n.seq,
         shown = n.shown,
+        buf = buf,
+        tab = buf and tab_of(buf),
       }
     end
   end
@@ -493,6 +510,13 @@ pub struct News {
     /// Whether the terminal buffer it came from was on the screen when it
     /// came, and `None` where it came from no buffer: a progress message.
     pub shown: Option<bool>,
+    /// How long ago it came, in seconds, as of the read.
+    pub age: u64,
+    /// The terminal buffer it came from, while that is still a buffer.
+    pub buf: Option<i64>,
+    /// The number of the tab page a window shows that buffer in, as of the
+    /// read: `None` where no window does.
+    pub tab: Option<u32>,
 }
 
 /// What a careful read of one session came to (see [`hear`]).
@@ -684,6 +708,11 @@ fn news_of(record: &Value) -> Vec<News> {
                 text: text(field(n, "body")),
                 seq: field(n, "seq").and_then(number).unwrap_or(0),
                 shown: field(n, "shown").and_then(Value::as_bool),
+                age: field(n, "age").and_then(number).unwrap_or(0),
+                buf: field(n, "buf").and_then(Value::as_i64),
+                tab: field(n, "tab")
+                    .and_then(number)
+                    .and_then(|t| u32::try_from(t).ok()),
             })
         })
         .collect();
@@ -902,6 +931,9 @@ mod tests {
                     ("body", Value::from("Claude needs your permission")),
                     ("seq", Value::from(3)),
                     ("shown", Value::from(false)),
+                    ("age", Value::from(12)),
+                    ("buf", Value::from(5)),
+                    ("tab", Value::from(2)),
                 ]),
             ),
             (
@@ -929,6 +961,16 @@ mod tests {
         assert_eq!(
             (news[1].title.as_str(), news[1].text.as_str()),
             ("Claude Code", "Claude needs your permission")
+        );
+        assert_eq!(
+            (news[1].age, news[1].buf, news[1].tab),
+            (12, Some(5), Some(2)),
+            "how old, and the terminal it came from and where that is"
+        );
+        assert_eq!(
+            (news[0].buf, news[0].tab),
+            (None, None),
+            "a record that says neither"
         );
 
         let older = map(vec![(

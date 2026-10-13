@@ -44,6 +44,24 @@ pub fn is_valid_id(id: &str) -> bool {
 /// The length of a session id, in characters and bytes (the alphabet is ASCII).
 pub const ID_LEN: usize = 8;
 
+/// A session id as a value that can be copied: what a switch to a session by
+/// its id carries from a key to the session loop, as a number or a step does
+/// (see `pty::Target`). Only a well-formed id is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Id([u8; ID_LEN]);
+
+impl Id {
+    pub fn new(id: &str) -> Option<Self> {
+        let bytes: [u8; ID_LEN] = id.as_bytes().try_into().ok()?;
+        is_valid_id(id).then_some(Self(bytes))
+    }
+
+    pub fn as_str(&self) -> &str {
+        // Base32's alphabet, so ASCII, which `new` saw to.
+        std::str::from_utf8(&self.0).unwrap_or_default()
+    }
+}
+
 /// A short, stable, filename-safe token for a host string, naming the local end
 /// of an SSH forward.
 ///
@@ -74,6 +92,15 @@ pub fn host_token(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_id_is_a_well_formed_one_and_reads_back() {
+        let id = Id::new("abcd2345").expect("well formed");
+        assert_eq!(id.as_str(), "abcd2345");
+        assert_eq!(Id::new("abcd234"), None, "short");
+        assert_eq!(Id::new("ABCD2345"), None, "not the alphabet");
+        assert_eq!(Id::new("../../x1"), None);
+    }
 
     #[test]
     fn ids_are_eight_chars_from_the_alphabet() {

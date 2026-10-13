@@ -53,6 +53,9 @@ pub enum Input {
     Focus(bool),
     /// An answer to a question.
     Reply(Reply),
+    /// What nvmux says to show, in the sequence only it writes here (see
+    /// [`crate::card`]): the sequence's body, between its opener and its end.
+    Card(Vec<u8>),
 }
 
 /// A terminal's answer to a question.
@@ -96,10 +99,11 @@ const MAX_STRING: usize = 1 << 20;
 
 /// What may follow `ESC ]`, `ESC P` and `ESC _` in a reply, and in no Alt
 /// chord: an OSC's number, the few characters a DCS reply starts with,
-/// kitty's `G` for a graphics reply.
-const OSC_OPENS: &[u8] = b"0123456789";
-const DCS_OPENS: &[u8] = b"0123456789>|+$=";
-const APC_OPENS: &[u8] = b"G";
+/// kitty's `G` for a graphics reply — and nvmux's own `~`, for what it tells
+/// the client to show ([`crate::card::OPENER`]).
+pub(crate) const OSC_OPENS: &[u8] = b"0123456789";
+pub(crate) const DCS_OPENS: &[u8] = b"0123456789>|+$=";
+pub(crate) const APC_OPENS: &[u8] = &[b'G', crate::card::OPENER];
 
 /// The parser, and what it is holding.
 #[derive(Debug, Default)]
@@ -113,8 +117,8 @@ pub struct Parser {
 }
 
 /// The bracketed paste's markers.
-const PASTE_START: &[u8] = b"\x1b[200~";
-const PASTE_END: &[u8] = b"\x1b[201~";
+pub(crate) const PASTE_START: &[u8] = b"\x1b[200~";
+pub(crate) const PASTE_END: &[u8] = b"\x1b[201~";
 
 impl Parser {
     /// Read `bytes`, appending what they make to `out`.
@@ -354,6 +358,13 @@ fn escape(bytes: &[u8], final_: bool) -> Step {
         b']' if opens(OSC_OPENS) => string(bytes, b']', final_),
         b'P' if opens(DCS_OPENS) => string(bytes, b'P', final_),
         b'_' if opens(APC_OPENS) => match string(bytes, next, final_) {
+            // nvmux's own, for the client and nobody else: never typed, and
+            // never handed to the server.
+            Step::Took(n, Some(Input::Reply(Reply::Other(s))))
+                if s.get(2) == Some(&crate::card::OPENER) =>
+            {
+                Step::Took(n, Some(Input::Card(s[3..].to_vec())))
+            }
             // Graphics replies answer nothing the server asked, and are
             // dropped.
             Step::Took(n, _) => Step::Took(n, None),
@@ -835,6 +846,54 @@ mod tests {
         p.feed(bytes, &mut out);
         p.timeout(&mut out);
         out
+    }
+
+    /// What nvmux tells its client to show is the client's own: kept as a
+    /// card, between whatever keys it came between, and never typed or handed
+    /// to the server — however the reads fell. A graphics reply is still
+    /// dropped, and `ESC _` and a key still Alt and the key.
+    #[test]
+    fn what_nvmux_says_to_show_is_never_typed() {
+        let card = crate::card::encode(&crate::card::Command::Clear);
+        let body = card[crate::card::OPEN.len()..card.len() - crate::card::CLOSE.len()].to_vec();
+        assert_eq!(read(&card), [Input::Card(body.clone())]);
+
+        let mut between = b"a".to_vec();
+        between.extend_from_slice(&card);
+        between.extend_from_slice(b"b");
+        assert_eq!(
+            read(&between),
+            [
+                Input::Keys("a".into()),
+                Input::Card(body.clone()),
+                Input::Keys("b".into())
+            ]
+        );
+
+        // Cut anywhere, it is held whole — as a reply, not as an escape the
+        // wait could give up on as a key.
+        for cut in 1..card.len() {
+            let mut p = Parser::default();
+            let mut out = Vec::new();
+            p.feed(&card[..cut], &mut out);
+            assert!(out.is_empty(), "cut at {cut}: {out:?}");
+            if cut >= 3 {
+                assert!(p.in_reply(), "cut at {cut}: not known to be a reply");
+            }
+            p.feed(&card[cut..], &mut out);
+            assert_eq!(out, [Input::Card(body.clone())], "cut at {cut}");
+        }
+
+        // After a lone Escape the parser was holding, it is still a card.
+        let mut escaped = b"\x1b".to_vec();
+        escaped.extend_from_slice(&card);
+        assert_eq!(
+            read(&escaped),
+            [Input::Keys("<Esc>".into()), Input::Card(body)]
+        );
+
+        assert_eq!(read(b"\x1b_Gi=1;OK\x1b\\"), []);
+        assert_eq!(keys(b"\x1b_x"), "<M-_>x");
     }
 
     fn keys(bytes: &[u8]) -> String {

@@ -1,8 +1,9 @@
 //! The brief "you are now on this session" announcement.
 //!
-//! No longer armed: the editor says it now, in its own `vim.notify` (see
-//! [`crate::tell`]), and the relay passes no popup to its loop. What is here is
-//! kept as it was, with what reads it, for the day the box is wanted back.
+//! No longer armed: a card in the corner says it now, drawn by nvmux's own
+//! client (see [`crate::card`]), and the relay passes no popup to its loop.
+//! What is here is kept as it was, with what reads it, for the day the box is
+//! wanted back.
 //!
 //! Cycling with `<prefix> n` and `<prefix> p` means changing session without
 //! naming one, so an attach has to say where it landed. That is easy in the
@@ -29,8 +30,10 @@
 //! needs erasing. Both were dropped for the same reason: a session manager that
 //! creates windows in your editor, or writes on the row your editor talks to
 //! you on, has stopped being a proxy. What is left is the one that draws on the
-//! terminal nvmux already owns the bytes of. That held until the notice moved
-//! to the second of them, by choice, for the reasons [`crate::tell`] gives.
+//! terminal nvmux already owns the bytes of. That still holds: the card that
+//! says it now is drawn by nvmux's own client, over the frame it composes from
+//! the editor's grids rather than in the editor, and none of it is the
+//! editor's (see [`crate::card`]).
 //!
 //! # Between the session's sequences
 //!

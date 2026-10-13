@@ -121,7 +121,7 @@ fn progress(title: &str, text: &str, percent: Option<u8>, otherwise: &str) -> St
 }
 
 /// How long ago, in the one unit that says it: `12s`, `3m`, `2h`, `1d`.
-fn age(d: Duration) -> String {
+pub fn age(d: Duration) -> String {
     let s = d.as_secs();
     match s {
         0..60 => format!("{s}s"),

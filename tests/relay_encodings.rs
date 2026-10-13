@@ -75,11 +75,31 @@ const AHEAD_FOR: Duration = Duration::from_secs(2);
 /// What that child writes once its client has been started ahead.
 const AHEAD: &[u8] = b"\x1b]9999;ahead\x07";
 
-/// What the child's relay announces the session as — the attach notice, which
-/// the editor gives now (see [`nvmux::tell`]) — on its first attach and, kept,
-/// on every return to the front: as a switch would. Unset, it announces
-/// nothing, which is what the tests about the prefix want.
+/// What the child's relay announces the session as — on a card nvmux's own
+/// client draws (see [`nvmux::card`]), and Neovim's draws none — on its first
+/// attach and, kept, on every return to the front: as a switch would. Unset,
+/// it announces nothing, which is what the tests about the prefix want.
 const CHILD_LABEL: &str = "NVMUX_TEST_RELAY_LABEL";
+
+/// Set on a child whose client is nvmux's own — this crate's binary, run with
+/// `--client` — rather than Neovim's: the client that draws cards (see
+/// [`nvmux::card`]).
+const CHILD_OWN: &str = "NVMUX_TEST_RELAY_OWN_CLIENT";
+
+/// Set on a child to post a card on the board, for its own session, a moment
+/// into its first relay — as the notifier does — that goes to the session
+/// with the id this names, or with `buf:<n>` to buffer `n` of its own.
+const CHILD_POST: &str = "NVMUX_TEST_RELAY_POST";
+
+/// How long into the first relay that card is posted: after the first paint.
+const POST_AFTER: Duration = Duration::from_millis(1500);
+
+/// What a posted card says, so that the parent can find it on the screen.
+const POSTED: &str = "posted for the session in front";
+
+/// The exit code of a child whose relay ended in a switch to a session by
+/// its id, which only `<prefix> Enter` on a card asks for.
+const SWITCHED_BY_CARD: i32 = 5;
 
 /// The fade a child draws, both ways, in milliseconds, where the default is
 /// not what the test wants (see [`LONG_FADE_MS`]). Only a child with a
@@ -135,6 +155,10 @@ fn relay_child() {
     // negotiates the keyboard with the terminal through the relay, and the
     // default's own client is `nvmux --client`, which this binary is not.
     settings.client.ui = nvmux::config::Ui::Nvim;
+    let own = std::env::var_os(CHILD_OWN).is_some();
+    if own {
+        settings.client.ui = nvmux::config::Ui::Nvmux;
+    }
     let keep = std::env::var_os(CHILD_KEEP).is_some();
     settings.client.per_session = keep;
     if let Some(ms) = std::env::var(CHILD_FADE_MS)
@@ -165,9 +189,36 @@ fn relay_child() {
     let mut pool = nvmux::pool::Pool::configured();
     let mut attachment = if std::env::var_os(CHILD_AHEAD).is_some() {
         start_ahead(&mut pool, &id, Path::new(&sock))
+    } else if own {
+        let exe = Path::new(env!("CARGO_BIN_EXE_nvmux"));
+        nvmux::pty::spawn_own_client(&id, Path::new(&sock), &label, exe).expect("attach")
     } else {
         nvmux::pty::spawn(&id, Path::new(&sock), &label).expect("attach")
     };
+    let post = std::env::var(CHILD_POST)
+        .ok()
+        .and_then(|to| match to.strip_prefix("buf:") {
+            Some(n) => n.parse().ok().map(nvmux::card::Go::Buffer),
+            None => nvmux::ids::Id::new(&to).map(nvmux::card::Go::Session),
+        });
+    if let Some(go) = post {
+        let front = id.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(POST_AFTER);
+            nvmux::card::board().post(nvmux::card::Post {
+                front,
+                card: nvmux::card::Card::news(
+                    nvmux::card::next_id(),
+                    nvmux::card::Kind::Finished,
+                    "elsewhere",
+                    POSTED,
+                    0,
+                    "Ctrl-Space ⏎ go there",
+                ),
+                go: Some(go),
+            });
+        });
+    }
     assert_eq!(
         attachment.is_kept(),
         keep,
@@ -193,6 +244,10 @@ fn relay_child() {
                 if !label.is_empty() {
                     attachment.announce_on_arrival(label.clone());
                 }
+            }
+            Ok((nvmux::pty::Outcome::Switch(nvmux::pty::Target::Session(to)), _)) => {
+                eprintln!("switched by a card to {}", to.as_str());
+                break SWITCHED_BY_CARD;
             }
             Ok((other, _)) => {
                 eprintln!("relay ended with {other:?}");
@@ -273,6 +328,10 @@ struct Asks {
     label: Option<&'static str>,
     /// [`CHILD_FADE_MS`].
     fade_ms: Option<u64>,
+    /// [`CHILD_OWN`].
+    own: bool,
+    /// [`CHILD_POST`]: where the posted card goes.
+    post: Option<&'static str>,
 }
 
 impl Terminal {
@@ -353,6 +412,8 @@ impl Terminal {
             ahead,
             label,
             fade_ms,
+            own,
+            post,
         } = asks;
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize {
@@ -393,6 +454,12 @@ impl Terminal {
         }
         if let Some(ms) = fade_ms {
             cmd.env(CHILD_FADE_MS, ms.to_string());
+        }
+        if own {
+            cmd.env(CHILD_OWN, "1");
+        }
+        if let Some(to) = post {
+            cmd.env(CHILD_POST, to);
         }
         let child = pair.slave.spawn_command(cmd).expect("spawn relay child");
         // Or the master would never see EOF once the child exits.
@@ -983,8 +1050,8 @@ const LONG_FADE_MS: u64 = 2_000;
 
 /// A kept client's repaint is asked as its screen starts to dissolve back in,
 /// not once it has: the server redraws underneath frames nvmux draws from its
-/// copy, so what waits for that redraw — the name the editor says (see
-/// [`nvmux::tell`]) — does not wait out the fade first.
+/// copy, so the exact screen, which the copy stands in for until it comes, is
+/// there as the fade ends rather than a whole redraw after it.
 ///
 /// Seen from the server, which counts the windows it redraws. Idle, its
 /// client parked, it redraws none; half way through the fade in, the count
@@ -1228,111 +1295,325 @@ fn messages(sock: &Path) -> String {
 /// `<prefix> d`, as the kitty protocol spells the prefix, and the child's exit
 /// waited for.
 fn detach(term: &mut Terminal) -> Option<u32> {
+    prefix_then(term, b"d")
+}
+
+/// The prefix as the kitty protocol spells it, then `key`, and the child's
+/// exit waited for.
+fn prefix_then(term: &mut Terminal, key: &[u8]) -> Option<u32> {
     let flags = kitty_push_flags(&term.output).unwrap_or(0);
     term.type_bytes(b"\x1b[32;5u");
     if flags & 2 != 0 {
         term.type_bytes(b"\x1b[32;5:3u");
     }
     term.pump_until(Duration::from_millis(150), |_| false);
-    term.type_bytes(b"d");
+    term.type_bytes(key);
     term.exit_code(Duration::from_secs(10))
 }
 
-/// The notice is the editor's now (see [`nvmux::tell`]): the session's name in
-/// its own message row once its client has attached, and in its `:messages` —
-/// and no box of nvmux's drawn over the session. And news told at the error
-/// level reaches the row too, as the editor's own errors do.
+/// A child relaying nvmux's own client, which says the session is `label`.
+fn spawn_own(sock: &Path, id: &str, label: &'static str, asks: Asks) -> Terminal {
+    Terminal::spawn_child(
+        sock,
+        id,
+        Protocol::Kitty,
+        Asks {
+            own: true,
+            label: Some(label),
+            ..asks
+        },
+    )
+}
+
+/// The rows of the screen the output makes, as text.
+fn screen_rows(out: &[u8]) -> Vec<String> {
+    (0..ROWS).map(|row| row_on_screen(out, row)).collect()
+}
+
+/// Whether a card saying `label` is in the top right corner of the screen.
+fn carded(out: &[u8], label: &str) -> bool {
+    let rows = screen_rows(out);
+    rows.iter()
+        .any(|r| r.trim_end().ends_with(&format!("│ {label} │")))
+}
+
+/// Where a switch landed is a card nvmux's own client draws, in the corner:
+/// nothing is said to the editor, which keeps nothing of it.
 #[test]
-fn a_fresh_client_is_announced_by_the_editor() {
+fn a_fresh_client_is_announced_by_a_card() {
     require_nvim!();
-    let tag = "announced";
+    let tag = "card-fresh";
     let scratch = Scratch::new(tag);
     let t = scratch.transport();
     let session = t
         .create_session(&common::unique(tag), &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket path");
-    let label = "announced by the editor";
+    let label = "announced by a card";
 
-    let mut term = Terminal::spawn_announcing(&sock, &session.id, label, false);
+    let mut term = spawn_own(&sock, &session.id, label, Asks::default());
     assert!(
-        term.pump_until(Duration::from_secs(15), |out| {
-            row_on_screen(out, ROWS - 1).contains(label)
-        }),
-        "the editor never said which session this is; the child wrote: {}",
-        term.since(0)
+        term.pump_until(Duration::from_secs(15), |out| carded(out, label)),
+        "no card said which session this is; the screen: {:#?}",
+        screen_rows(&term.output)
     );
-    assert!(messages(&sock).contains(label), "{}", messages(&sock));
     assert!(
-        find(&term.output, "╭".as_bytes()).is_none(),
-        "a box was drawn over the session: {}",
-        term.since(0)
-    );
-
-    let failed = "! api-server · cargo build: exited with code 101";
-    assert!(nvmux::tell::say(&sock, failed, nvmux::tell::Level::Error).expect("said"));
-    assert!(
-        term.pump_until(Duration::from_secs(10), |out| {
-            row_on_screen(out, ROWS - 1).contains(failed)
-        }),
-        "an error never reached the message row; it shows {:?}",
-        row_on_screen(&term.output, ROWS - 1)
+        !messages(&sock).contains(label),
+        "the editor was told: {}",
+        messages(&sock)
     );
     assert_eq!(detach(&mut term), Some(0), "the child did not detach");
 }
 
-/// A kept client coming back is announced only once the repaint its return
-/// asks the server for has been done: said before it, the `:mode` would take
-/// the message straight back off the screen.
+/// A kept client coming back has the card drawn before its screen dissolves
+/// in, and the card comes in with the screen: on it half way through the
+/// fade in, before anything the client draws after the fade has arrived.
 #[test]
-fn a_kept_clients_return_is_announced_after_its_repaint() {
+fn a_kept_clients_return_is_announced_as_its_screen_comes_back() {
     require_nvim!();
-    let tag = "announced-kept";
+    let tag = "card-kept";
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(
+            &common::unique(tag),
+            &common::launch_with("--clean"),
+            common::anywhere(),
+        )
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    let label = "back, with a card";
+
+    let mut term = spawn_own(
+        &sock,
+        &session.id,
+        label,
+        Asks {
+            shadow: true,
+            keep: true,
+            fade_ms: Some(LONG_FADE_MS),
+            ..Asks::default()
+        },
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| carded(out, label)),
+        "the first attach had no card; the screen: {:#?}",
+        screen_rows(&term.output)
+    );
+    // Parked only once the terminal has answered the client's DA1, and well
+    // after the first card has gone.
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| find(out, DA1).is_some()),
+        "the client never asked its DA1"
+    );
+    term.pump_until(
+        nvmux::card::ARRIVAL_LIFE + Duration::from_millis(LONG_FADE_MS),
+        |_| false,
+    );
+    assert!(!carded(&term.output, label), "the first card never went");
+
+    let mark = term.output.len();
+    term.type_bytes(&[nvmux::keys::PREFIX, b' ']);
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| {
+            find(&out[mark.min(out.len())..], PARKED).is_some()
+        }),
+        "the child never parked its client"
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| {
+            find(&out[mark.min(out.len())..], RESUMED).is_some()
+        }),
+        "the parked client never came back"
+    );
+    let after = mark + find(&term.output[mark..], RESUMED).expect("resumed") + RESUMED.len();
+    term.pump_until(Duration::from_millis(LONG_FADE_MS / 4), |_| false);
+    assert!(
+        find(&term.output[after..], b"\x1b[2J").is_none(),
+        "the fade in was over within half its length"
+    );
+    assert!(
+        carded(&term.output, label),
+        "half way through the fade in there is no card; the screen: {:#?}",
+        screen_rows(&term.output)
+    );
+    assert_eq!(detach(&mut term), Some(0), "the child did not detach");
+}
+
+/// A card posted for the session in front — the notifier's, here the child's
+/// own — comes up in the corner, and `<prefix> Enter` goes to the session it
+/// is about: the relay ends in a switch to it.
+#[test]
+fn a_posted_card_comes_up_and_prefix_enter_goes_there() {
+    require_nvim!();
+    let tag = "card-posted";
     let scratch = Scratch::new(tag);
     let t = scratch.transport();
     let session = t
         .create_session(&common::unique(tag), &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket path");
-    let label = "back, and announced";
+    let elsewhere = "zzzzzzzz";
 
-    let mut term = Terminal::spawn_announcing(&sock, &session.id, label, true);
+    let mut term = spawn_own(
+        &sock,
+        &session.id,
+        "",
+        Asks {
+            post: Some(elsewhere),
+            ..Asks::default()
+        },
+    );
     assert!(
         term.pump_until(Duration::from_secs(15), |out| {
-            row_on_screen(out, ROWS - 1).contains(label)
+            let rows = screen_rows(out);
+            rows.iter().any(|r| r.contains("╭─ ✓ elsewhere"))
+                && rows.iter().any(|r| r.contains(&format!("│ {POSTED}")))
         }),
-        "the first attach was never announced; the child wrote: {}",
-        term.since(0)
+        "the posted card never came up; the screen: {:#?}",
+        screen_rows(&term.output)
     );
-    // Parked only once the terminal has answered the client's DA1, as in the
-    // tests of a kept client's screen.
+    let mark = term.output.len();
+    assert_eq!(
+        prefix_then(&mut term, b"\r"),
+        Some(SWITCHED_BY_CARD as u32),
+        "<prefix> Enter did not go where the card is about; the child wrote: {}",
+        term.since(mark)
+    );
     assert!(
-        term.pump_until(Duration::from_secs(5), |out| find(out, DA1).is_some()),
-        "the client never asked its DA1; got: {}",
-        term.since(0)
+        String::from_utf8_lossy(&term.output[mark..]).contains(elsewhere),
+        "switched somewhere else: {}",
+        term.since(mark)
     );
-    term.pump_until(Duration::from_millis(300), |_| false);
-    // The row cleared, so that what is on it after the return is the return's.
-    nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
-        .expect("connect")
-        .command("echo ''")
-        .expect("echo");
+}
+
+/// A card about a terminal of the session in front: `<prefix> Enter` shows
+/// it, in the session, and the relay goes on.
+#[test]
+fn prefix_enter_on_a_card_about_a_terminal_here_shows_it() {
+    require_nvim!();
+    let tag = "card-here";
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(&common::unique(tag), &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    let mut rpc = nvmux::rpc::Client::connect(&sock, Duration::from_secs(3)).expect("connect");
+    let current = |rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>| {
+        rpc.eval("bufnr()").ok().and_then(|v| v.as_i64())
+    };
+    let shown = current(&mut rpc).expect("the current buffer");
+    // A buffer no window shows, as a terminal off the screen is.
+    let hidden = rpc
+        .eval("nvim_create_buf(v:true, v:false)")
+        .ok()
+        .and_then(|v| v.as_i64())
+        .expect("a buffer");
+    assert_ne!(hidden, shown);
+
+    let post = Box::leak(format!("buf:{hidden}").into_boxed_str());
+    let mut term = spawn_own(
+        &sock,
+        &session.id,
+        "",
+        Asks {
+            post: Some(post),
+            ..Asks::default()
+        },
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| {
+            screen_rows(out)
+                .iter()
+                .any(|r| r.contains(&format!("│ {POSTED}")))
+        }),
+        "the posted card never came up; the screen: {:#?}",
+        screen_rows(&term.output)
+    );
+    let flags = kitty_push_flags(&term.output).unwrap_or(0);
+    term.type_bytes(b"\x1b[32;5u");
+    if flags & 2 != 0 {
+        term.type_bytes(b"\x1b[32;5:3u");
+    }
+    term.pump_until(Duration::from_millis(150), |_| false);
+    term.type_bytes(b"\r");
+    assert!(
+        common::wait_until(Duration::from_secs(5), || current(&mut rpc) == Some(hidden)),
+        "the terminal was not shown: the current buffer is {:?}",
+        current(&mut rpc)
+    );
     assert!(
         term.pump_until(Duration::from_secs(5), |out| {
-            !row_on_screen(out, ROWS - 1).contains(label)
+            !screen_rows(out)
+                .iter()
+                .any(|r| r.contains(&format!("│ {POSTED}")))
         }),
-        "the message row never cleared"
+        "the card acted on stayed up"
     );
+    assert_eq!(detach(&mut term), Some(0), "the relay did not go on");
+}
 
-    let after = away_and_back(&mut term, |_| {});
+/// Neovim's own client has no way to be asked to draw a card, and is never
+/// sent one: it would pass it on to the editor, as the terminal's answer to
+/// something (`TermResponse`), for every plugin that listens for those.
+#[test]
+fn neovims_own_client_is_sent_no_card() {
+    require_nvim!();
+    let tag = "card-nvim";
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(&common::unique(tag), &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    let marker = "nothing typed here";
+    nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
+        .expect("connect")
+        .command(&format!(
+            "setlocal noswapfile | call setline(1, '{marker}')"
+        ))
+        .expect("setline");
+    nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
+        .expect("connect")
+        .command(
+            "lua _G.answers = {} vim.api.nvim_create_autocmd('TermResponse', \
+             { callback = function(ev) table.insert(_G.answers, ev.data.sequence) end })",
+        )
+        .expect("listen for the terminal's answers");
+    let label = "no card for this client";
+
+    let mut term = Terminal::spawn_announcing(&sock, &session.id, label, false);
     assert!(
-        term.pump_until(Duration::from_secs(10), |out| {
-            find(&out[after.min(out.len())..], b"\x1b[2J").is_some()
-                && row_on_screen(out, ROWS - 1).contains(label)
+        term.pump_until(Duration::from_secs(15), |out| {
+            row_on_screen(out, 0).contains(marker)
         }),
-        "not announced after the return's repaint; last row {:?}; the child wrote: {}",
-        row_on_screen(&term.output, ROWS - 1),
-        term.since(after)
+        "the session never painted; the child wrote: {}",
+        term.since(0)
+    );
+    term.pump_until(Duration::from_millis(500), |_| false);
+    assert!(
+        find(&term.output, "╭".as_bytes()).is_none() && !carded(&term.output, label),
+        "a card was drawn: {:#?}",
+        screen_rows(&term.output)
+    );
+    let line = nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
+        .and_then(|mut c| c.eval("[getline(1), mode()]"))
+        .expect("ask the editor");
+    assert_eq!(
+        line,
+        rmpv::Value::Array(vec![rmpv::Value::from(marker), rmpv::Value::from("n")]),
+        "something reached the editor as keys"
+    );
+    assert!(!messages(&sock).contains(label), "{}", messages(&sock));
+    let answers = nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
+        .and_then(|mut c| c.eval("luaeval('vim.inspect(_G.answers)')"))
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    assert!(
+        !answers.contains("\\27_~"),
+        "the editor was handed a card as the terminal's answer: {answers}"
     );
     assert_eq!(detach(&mut term), Some(0), "the child did not detach");
 }

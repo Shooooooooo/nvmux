@@ -78,6 +78,14 @@
 //! out. So a multigrid attach leaves an agent in the editor ([`AGENT_LUA`]),
 //! a handful of autocommands that tell this client, and it only, of both.
 //!
+//! # Cards
+//!
+//! What nvmux has to say while a session is in front — which session a switch
+//! landed in, what the other sessions report — it tells this client to show,
+//! in a sequence on its input no terminal sends (see [`crate::card`]); and the
+//! client draws it in the corner, over every frame it composes ([`cards`]).
+//! Nothing of it is the editor's, and nothing of it is asked of the editor.
+//!
 //! # One thread
 //!
 //! One `poll` over the terminal, the socket, and the two signal pipes, with a
@@ -90,6 +98,7 @@
 //! arrives on the client's own socket ([`refresh`]).
 
 pub mod anim;
+pub mod cards;
 pub mod compose;
 pub mod grid;
 pub mod input;
@@ -972,6 +981,9 @@ pub struct App {
     /// The first columns windows' views have moved to, as the agent says,
     /// for the next frame: see [`anim::side`].
     lefts: Vec<(i64, usize)>,
+    /// The cards nvmux has said to show, drawn over every frame: see
+    /// [`cards`].
+    cards: cards::Cards,
 }
 
 impl App {
@@ -1018,6 +1030,7 @@ impl App {
             asked_at: HashMap::new(),
             typed: None,
             lefts: Vec::new(),
+            cards: cards::Cards::default(),
         }
     }
 
@@ -1688,6 +1701,14 @@ impl App {
                 }
                 Input::Focus(on) => self.outbox.notify("nvim_ui_set_focus", &[Arg::Bool(on)]),
                 Input::Reply(reply) => self.reply(reply),
+                Input::Card(body) => match crate::card::decode(&body) {
+                    Some(cmd) => {
+                        if self.cards.apply(cmd, now) {
+                            self.dirty = true;
+                        }
+                    }
+                    None => tracing::debug!("client: a card that would not decode"),
+                },
             }
         }
         self.fence();
@@ -2303,7 +2324,13 @@ impl App {
                     .map_or(now, |last| (last + MIN_FRAME_GAP).max(now)),
             )
         } else {
-            self.anim.next_frame(&self.model, now)
+            [
+                self.anim.next_frame(&self.model, now),
+                self.cards_change(now),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
         };
         [self.escape_deadline(), frame, self.recheck_at]
             .into_iter()
@@ -2321,9 +2348,18 @@ impl App {
                 .last_frame
                 .is_none_or(|last| now >= last + MIN_FRAME_GAP);
         }
-        self.anim
-            .next_frame(&self.model, now)
-            .is_some_and(|at| at <= now)
+        [
+            self.anim.next_frame(&self.model, now),
+            self.cards_change(now),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|at| at <= now)
+    }
+
+    /// When the cards next change from how the last frame showed them.
+    fn cards_change(&self, now: Instant) -> Option<Instant> {
+        self.cards.next_frame(self.last_frame.unwrap_or(now))
     }
 
     /// The next frame's bytes, with whatever was waiting to be said ahead of
@@ -2333,6 +2369,10 @@ impl App {
         let (w, h) = self.size;
         let mut frame = compose::compose(&self.model, &self.anim, w, h);
         let cursor = self.anim.paint(&mut frame, &self.model, now);
+        // Last, over everything the editor has: see [`cards`].
+        self.cards.expire(now);
+        self.cards
+            .paint(&mut frame, self.model.style(0), &self.model.colors(), now);
         frame.mend();
         let sync = self.model.options.termsync;
         let mut out = std::mem::take(&mut self.say);
@@ -2787,6 +2827,36 @@ mod tests {
         redraw(&mut a, vec![resize(1, 20, 6)], t0);
         calls(&mut a);
         a
+    }
+
+    /// A card is a frame when it comes, and another each time it looks
+    /// different — its age ticking, its going — and none in between.
+    #[test]
+    fn a_card_is_drawn_when_it_changes_and_only_then() {
+        let t0 = Instant::now();
+        let mut a = attached(true, t0);
+        a.frame(t0);
+        assert!(!a.due(t0), "drawn");
+        let card = crate::card::Card {
+            life_ms: 2500,
+            fade_ms: 0,
+            ..crate::card::Card::news(1, crate::card::Kind::Finished, "s", "done", 3, "")
+        };
+        let came = t0 + MIN_FRAME_GAP;
+        a.keys(&crate::card::encode(&crate::card::Command::Show(card)), t0);
+        assert!(a.due(came), "a card that comes is a frame");
+        a.frame(came);
+        let tick = t0 + Duration::from_secs(1);
+        assert!(a.wake_at(came).is_some_and(|at| at <= tick));
+        assert!(!a.due(tick - Duration::from_millis(1)));
+        assert!(a.due(tick), "its age ticks");
+        a.frame(tick);
+        assert!(!a.due(tick));
+        let gone = t0 + Duration::from_millis(2500);
+        assert!(a.due(gone), "it goes");
+        a.frame(gone);
+        assert!(a.cards.is_empty());
+        assert_eq!(a.cards_change(gone), None, "nothing more to wake for");
     }
 
     /// A multigrid attach leaves the agent in the editor, given the client's

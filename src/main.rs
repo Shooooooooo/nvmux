@@ -173,8 +173,8 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     // what it was keeping to report is no news to them, so the picker clears
     // it before it first reads it (see `nvmux::notes`).
     let mut looked_at: Option<String> = None;
-    // What tells the session in front, in its own editor, what the others
-    // have to report as it happens (see `nvmux::tell`). Handed each session's
+    // What posts cards for the session in front, with what the others have
+    // to report as it happens (see `nvmux::tell`). Handed each session's
     // socket as the picker finds it, and each attached one's here.
     let notifier = nvmux::tell::Notifier::start();
 
@@ -760,6 +760,7 @@ fn pick(
     match target {
         pty::Target::Number(num) => sessions.iter().find(|s| s.state.num == num),
         pty::Target::Step(dir) => transport::neighbour(sessions, from, dir),
+        pty::Target::Session(id) => sessions.iter().find(|s| s.id == id.as_str()),
     }
 }
 

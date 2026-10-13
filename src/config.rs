@@ -502,9 +502,10 @@ pub struct FadeSettings {
     /// How long a dissolve takes, **both directions together**: a screen going
     /// out and the next one coming up divide this between them, half each (see
     /// [`FadeSettings::one_way`]). So a switch pays it once, for the screens:
-    /// where it landed the editor says now (see [`crate::tell`]), and the box
-    /// that once said it, dissolving in and out around the second it was up,
-    /// is not drawn (see [`crate::announce`]).
+    /// the card that says where it landed comes in with the session's screen
+    /// (see [`crate::card`]), and the box that once said it, dissolving in and
+    /// out around the second it was up, is not drawn (see
+    /// [`crate::announce`]).
     ///
     /// Both directions rather than one because a transition is the thing
     /// anybody watching is timing: what the number names is how long the screen
