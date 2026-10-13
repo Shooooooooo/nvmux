@@ -368,19 +368,56 @@ fn a_command_that_fails_in_a_terminal_is_kept() {
     );
 }
 
-/// A job in a terminal buffer that exits with 0 has finished, and is kept as
+/// A command in a terminal buffer that succeeds has finished, and is kept as
 /// a failure is, until it is seen — but apart from a notification or a
-/// failure, so it never takes the place of one. A terminal a plugin draws
-/// into itself closes with 0 too, with nothing run in it, and one whose
-/// buffer is deleted while its program runs closes with -1: neither has
-/// finished.
+/// failure, so it never takes the place of one: one its shell says has (OSC
+/// 133, the way fish says it), once the shell has said it started, and a job
+/// that exits with 0. A terminal a plugin draws into itself closes with 0
+/// too, with nothing run in it, and one whose buffer is deleted while its
+/// program runs closes with -1: neither has finished.
 #[test]
-fn a_program_that_finishes_in_a_terminal_is_kept() {
+fn a_command_that_finishes_in_a_terminal_is_kept() {
     require_nvim!();
     let scratch = Scratch::new("notes-finished");
     let (_, sock) = a_session(&scratch, "testing");
     assert_eq!(notes::read(&sock), Reading::Said(None));
 
+    in_a_terminal(
+        &sock,
+        r"\033]133;C;cmdline_url=cargo%%20test\033\134\033]133;D;0\033\134",
+    );
+    let named = read_until(&sock, |n| n.is_some()).expect("the finish");
+    assert_eq!(named.kind, Kind::Finished);
+    assert_eq!(
+        (named.title.as_str(), named.text.as_str()),
+        ("cargo test", "exited with code 0")
+    );
+
+    // A shell that does not name the command line: the terminal's program.
+    notes::seen(&sock);
+    in_a_terminal(&sock, r"\033]133;C\033\134\033]133;D;0\033\134");
+    let unnamed = read_until(&sock, |n| n.is_some()).expect("the unnamed finish");
+    assert_eq!(
+        (unnamed.title.as_str(), unnamed.text.as_str()),
+        ("sh", "a command exited with code 0")
+    );
+
+    // A shell's word that the last command went well, at a prompt where none
+    // started — its first, or one after an empty line — is no finish.
+    notes::seen(&sock);
+    in_a_terminal(
+        &sock,
+        r"\033]133;C;cmdline_url=ls\033\134\033]133;D;0\033\134\033]133;D;0\033\134",
+    );
+    read_until(&sock, |n| n.is_some()).expect("the command before it");
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        read_until(&sock, |n| n.is_some()).map(|n| n.title),
+        Some("ls".to_string()),
+        "a prompt where no command started"
+    );
+
+    notes::seen(&sock);
     a_job_that_exits(&sock, "exit 0");
     let finished = read_until(&sock, |n| n.is_some()).expect("the finish");
     assert_eq!(finished.kind, Kind::Finished);

@@ -30,12 +30,12 @@ const NOTIFIED: char = '∗';
 /// The sign for a failure.
 const FAILED: char = '!';
 
-/// The sign for a program that has finished.
+/// The sign for a command that has finished.
 const FINISHED: char = '✓';
 
 /// The sign beside a session's row: the spinner's `frame` while it is busy
 /// without saying how far it has got, the gauge when it says, `∗` for a
-/// notification, `!` for a failure and `✓` for a program that has finished.
+/// notification, `!` for a failure and `✓` for a command that has finished.
 pub fn sign(note: &Note, frame: usize) -> char {
     match note.kind {
         Kind::Notified => NOTIFIED,

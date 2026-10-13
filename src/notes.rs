@@ -1,5 +1,6 @@
-//! What a session has to report to the picker: that something in it is busy or
-//! has failed, and the desktop notifications the programs in it send.
+//! What a session has to report to the picker: that something in it is busy,
+//! has failed or has finished, and the desktop notifications the programs in
+//! it send.
 //!
 //! # Where it comes from
 //!
@@ -26,13 +27,13 @@
 //! `LspProgress` one, for what each language server says it is working on, a
 //! `TermRequest` one, which takes the three notifications terminals know —
 //! OSC 777 `notify` (Ghostty's, urxvt's), OSC 9 (iTerm2's) and OSC 99
-//! (kitty's, sent in parts) — and a shell's word that a command failed, and a
-//! `TermClose` one, for a terminal's program that exits: with a code other
-//! than 0, it failed, and with 0, it finished. The picker reads it over plain
-//! RPC ([`read`]), the way it already asks a session whether it is alive. A
-//! program's own OSC 9;4 is not read: an agent's is no guide to whether it
-//! wants you — Claude Code's stays busy through its permission prompts — and
-//! what the session's progress messages say is.
+//! (kitty's, sent in parts) — and a shell's word on how each of its commands
+//! ended, and a `TermClose` one, for how a terminal's own program does: with
+//! 0, it finished, and with any other code, it failed. The picker reads it
+//! over plain RPC ([`read`]), the way it already asks a session whether it is
+//! alive. A program's own OSC 9;4 is not read: an agent's is no guide to
+//! whether it wants you — Claude Code's stays busy through its permission
+//! prompts — and what the session's progress messages say is.
 //!
 //! # It stays
 //!
@@ -56,7 +57,7 @@
 //! it ([`SEEN`]) when a session comes to the front ([`touch`]) and again when
 //! it leaves ([`seen`]) — in the session, so that another nvmux, on another
 //! machine, stops showing it too. A failure is kept the same way, and so,
-//! apart from them, is a program that has finished: news too, but asking
+//! apart from them, is a command that has finished: news too, but asking
 //! nothing of you, so that a notification or a failure comes before it.
 //! Whether something is busy is not news but state, and is shown for as long
 //! as it lasts.
@@ -74,7 +75,7 @@ use crate::rpc;
 
 /// The watcher's version. A session holding an older one is given this one,
 /// the record it kept carried over; a newer nvmux does the same to this one.
-pub const VERSION: i64 = 5;
+pub const VERSION: i64 = 6;
 
 /// How long the picker waits between reads of its sessions.
 pub const POLL: Duration = Duration::from_secs(2);
@@ -104,21 +105,24 @@ const SETTLE: Duration = Duration::from_millis(30);
 /// mid-work never says it has finished; the last notification or failure — a
 /// failed progress message, a terminal's program that exits with a code other
 /// than 0, or a command its shell says did — and, apart from it, the last
-/// terminal's program to exit with 0, each until [`SEEN`] clears it. Text is
-/// kept without control characters and to 200 characters.
+/// command to finish — a terminal's program that exits with 0, or a command
+/// its shell says did — each until [`SEEN`] clears it. Text is kept without
+/// control characters and to 200 characters.
 ///
-/// A failed command is named by what its shell said it was, where the shell
-/// says — fish's `OSC 133 ; C` carries the command line, URL-encoded — and
-/// otherwise by the terminal's program, from its buffer name
-/// (`term://…//1234:cargo build`) and without its directory: `exited with
-/// code 101`, or `a command exited with code 101` when it is the shell's.
+/// A command that ends, failed or finished, is named by what its shell said
+/// it was, where the shell says — fish's `OSC 133 ; C` carries the command
+/// line, URL-encoded — and otherwise by the terminal's program, from its
+/// buffer name (`term://…//1234:cargo build`) and without its directory:
+/// `exited with code 101`, or `a command exited with code 101` when it is the
+/// shell's.
 ///
-/// A finished program is named the same way, from its terminal's buffer name:
-/// `exited with code 0`. It has to be a job's: a terminal a plugin draws into
-/// itself (`nvim_open_term`) closes with 0 too, though nothing ran in it. A
-/// terminal whose buffer is deleted while its program runs closes with -1,
-/// which is neither a failure nor a finish, and a command its shell says
-/// succeeded is not kept at all: at a prompt, nearly every one does.
+/// A terminal's program has finished only where it was a job's: a terminal a
+/// plugin draws into itself (`nvim_open_term`) closes with 0 too, though
+/// nothing ran in it. One whose buffer is deleted while its program runs
+/// closes with -1, which is neither a failure nor a finish. And a command its
+/// shell says succeeded has finished only where the shell said it started
+/// (`OSC 133 ; C`): a shell set up by hand may say how the last command went
+/// at every prompt, the first one included, and with 0 where nothing ran.
 ///
 /// Neovim's own progress messages, `source` `nvim`, are left out: a write's
 /// and a completion's scan begin and end within the command that says them,
@@ -158,7 +162,12 @@ end
 local function note(kind, title, body)
   title, body = clean(title), clean(body)
   if title ~= '' or body ~= '' then
-    N.note = { kind = kind, title = title, body = body, at = os.time() }
+    local kept = { kind = kind, title = title, body = body, at = os.time() }
+    if kind == 'finished' then
+      N.finished = kept
+    else
+      N.note = kept
+    end
   end
 end
 pcall(api.nvim_create_autocmd, 'Progress', {
@@ -242,17 +251,18 @@ api.nvim_create_autocmd('TermRequest', {
     local mark, args = osc:match('^133;(%a)(.*)$')
     if mark == 'C' then
       local url = args:match(';cmdline_url=([^;]*)')
-      commands[ev.buf] = url and vim.uri_decode(url) or nil
+      commands[ev.buf] = url and vim.uri_decode(url) or false
       return
     elseif mark == 'D' then
       local status = tonumber(args:match('^;(%d+)'))
       local command = commands[ev.buf]
       commands[ev.buf] = nil
-      if status and status > 0 then
+      if status and (status > 0 or command ~= nil) then
+        local kind = status > 0 and 'failed' or 'finished'
         if command then
-          note('failed', command, 'exited with code ' .. status)
+          note(kind, command, 'exited with code ' .. status)
         else
-          note('failed', program(ev.buf), 'a command exited with code ' .. status)
+          note(kind, program(ev.buf), 'a command exited with code ' .. status)
         end
       end
       return
@@ -298,7 +308,7 @@ api.nvim_create_autocmd('TermClose', {
     if type(status) == 'number' and status > 0 then
       note('failed', program(ev.buf), 'exited with code ' .. status)
     elseif status == 0 and ran(ev.buf) then
-      N.finished = { title = clean(program(ev.buf)), body = 'exited with code 0', at = os.time() }
+      note('finished', program(ev.buf), 'exited with code 0')
     end
   end,
 })
@@ -339,7 +349,7 @@ return N.snapshot()
 /// The record, as a map: `busy` (the progress message, or language server's
 /// work, running that started last: `title`, `text`, `percent` when it has
 /// one, and `age` in seconds), `note` (`kind` `notify` or `failed`, `title`,
-/// `body`, `age`) and `finished` (the program that finished last: `title`,
+/// `body`, `age`) and `finished` (the command that finished last: `title`,
 /// `body`, `age`), each there only when the session has one. `false` where
 /// there is no watcher, or one older or newer than this nvmux's.
 const READ: &str = r#"local version = ...
@@ -351,7 +361,7 @@ return N.snapshot()
 "#;
 
 /// Clear what the session was keeping: the notification, or failure, and the
-/// program that finished.
+/// command that finished.
 const SEEN: &str = r#"local N = package.loaded['nvmux.notes']
 if type(N) == 'table' and type(N.seen) == 'function' then
   N.seen()
@@ -367,7 +377,7 @@ pub enum Kind {
     /// A progress message ended in failure, or a command in a terminal buffer
     /// did.
     Failed,
-    /// A program in a terminal buffer finished: it exited with 0.
+    /// A command in a terminal buffer finished: it exited with 0.
     Finished,
     /// A progress message, or a language server's work, is running, and with
     /// a percentage where it says how far it has got.
@@ -375,15 +385,14 @@ pub enum Kind {
 }
 
 /// The one thing a session has to say: a notification or a failure, which
-/// wait for you, then a program that has finished, and then anything running.
+/// wait for you, then a command that has finished, and then anything running.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Note {
     pub kind: Kind,
     /// The notification's title, or the progress message's: the program or
     /// plugin it came from, as often as not — `Claude Code`, `claude` — and
     /// for a language server's work, the server's name, `clangd`; for a
-    /// command that failed, or a program that finished, the command:
-    /// `cargo build`.
+    /// command that failed or finished, the command: `cargo build`.
     pub title: String,
     /// The notification's body, the progress message's text, what the
     /// language server says it is doing — `indexing 3/120` — or how a command
@@ -521,7 +530,7 @@ fn lua(code: &str) -> Vec<Value> {
 }
 
 /// The note a record comes to, if any: the notification or failure it keeps
-/// first, since those wait for you, then the program that finished, and then
+/// first, since those wait for you, then the command that finished, and then
 /// whatever is running.
 fn note_of(record: &Value, read_at: Instant) -> Option<Note> {
     let kept = |n: &Value, kind| Note {
@@ -752,10 +761,10 @@ mod tests {
         assert_eq!(note.text, "exited with code 1");
     }
 
-    /// A program that finished is news, so it comes before what is running;
+    /// A command that finished is news, so it comes before what is running;
     /// but it asks nothing of you, so a notification comes before it.
     #[test]
-    fn a_finished_program_comes_between_a_notification_and_what_is_running() {
+    fn a_finished_command_comes_between_a_notification_and_what_is_running() {
         let finished = (
             "finished",
             map(vec![
