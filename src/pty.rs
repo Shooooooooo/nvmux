@@ -2560,17 +2560,18 @@ pub fn relay(
             discard_pending(master_fd);
         }
         // The size first, so the frames fit the terminal as it is now; then
-        // the screen the client had dissolves in, and only then is the
-        // client asked to repaint — its paint lands over the last frame.
+        // the screen the client had dissolves in, and the client's repaint
+        // lands over the last frame — asked after it, or for a kept client
+        // as it starts (below), and either way relayed after it: nothing the
+        // client writes reaches the terminal until the relay copies it.
         //
-        // Either way the cursor is shown before the repaint is asked for,
-        // not left to it: the fade out that ended the last relay hid the
-        // cursor, and a repaint is what a server *may* do — one busy in Lua
-        // or waiting for a key does nothing until that is over, and an idle
-        // editor writes nothing on its own. A fade in puts the cursor back
-        // on the session's own cell as its last frame; without one it is
-        // shown where the erase left it, as every screen left it before
-        // there was a fade.
+        // Either way the cursor is shown by nvmux, not left to the repaint:
+        // the fade out that ended the last relay hid the cursor, and a
+        // repaint is what a server *may* do — one busy in Lua or waiting for
+        // a key does nothing until that is over, and an idle editor writes
+        // nothing on its own. A fade in puts the cursor back on the session's
+        // own cell as its last frame; without one it is shown where the erase
+        // left it, as every screen left it before there was a fade.
         //
         // A kept client with no fade to dissolve it in has its screen painted
         // straight back instead, from its copy: it is on the glass at once
@@ -2579,6 +2580,22 @@ pub fn relay(
         // Asked before the resize, because the resize is what changes it.
         let resized = attachment.master.get_size().ok() != Some(size);
         attachment.resize_to(size);
+        // A kept client's repaint, asked as the fade in starts rather than
+        // once it is over: the frames are nvmux's own, drawn from the copy,
+        // and take the time they take whatever the server is doing, so the
+        // server's whole redraw — which the name waits for (see `pump`) — is
+        // done underneath them instead of after them.
+        //
+        // Not where the size changed while the client was parked. The client
+        // has its server resize first, on a signal it has yet to act on, and
+        // a repaint that got in ahead of that resize would be drawn for the
+        // old size into a terminal that has the new one. Asked after the
+        // screen is back, as before, which gives the resize a fade's head
+        // start.
+        let early = attachment.is_kept() && !resized;
+        if early {
+            erasing = kept_clients_repaint(&mut attachment);
+        }
         dissolved = attachment.dissolve_in();
         // Off the primary screen since the switch, and on the session's only
         // as long as the dissolve drew it.
@@ -2601,10 +2618,8 @@ pub fn relay(
         );
         if attachment.is_kept() {
             // What the client told the terminal comes back from the ledger,
-            // and the exact screen from its server — asked from a thread, as
-            // the notice's repaint is, since the screen is back already and
-            // the relay has a session to run meanwhile. With nothing typed
-            // into a prompt: the prompt is on the screen, for the user.
+            // and the exact screen from its server — asked above where the
+            // size held, and otherwise here.
             // The fade's last frame leaves a reset pen and a hidden cursor
             // wherever it was; a kept client may write before the repaint
             // lands, and writes on the belief that neither has moved.
@@ -2613,16 +2628,9 @@ pub fn relay(
             }
             attachment.put_back_what_it_told(size);
             attachment.tell_its_size(size, resized);
-            erasing = match Erasing::start_for(&attachment.sock, "kept client's return") {
-                Ok(started) => Some(started),
-                // No thread to ask from: the fallback a server that could not
-                // be asked would have got, as the notice's repaint has.
-                Err(e) => {
-                    tracing::debug!(error = %e, "no thread for the kept client's repaint");
-                    apply(&mut attachment, Repaint::Notice, Served::NONE);
-                    None
-                }
-            };
+            if !early {
+                erasing = kept_clients_repaint(&mut attachment);
+            }
         } else {
             repaint(&mut attachment, Repaint::Resume);
         }
@@ -3015,17 +3023,7 @@ fn pump(
         // this — the repaint itself arrives as the session's own output — so a
         // pass that finds nothing costs a `try_recv`.
         if let Some(served) = erasing.as_ref().and_then(Erasing::answer) {
-            let asked = erasing.take().expect("it answered a moment ago");
-            // Timed because it is a second full repaint of the session, a
-            // whole second after the switch — the one nvmux asks for rather
-            // than the one the attach produced. What the number now measures
-            // is how long it took somewhere else, which is the point of it.
-            tracing::debug!(
-                ms = asked.started.elapsed().as_secs_f64() * 1000.0,
-                repainted = served.repainted,
-                "timing: {} (:mode repaint)",
-                asked.what
-            );
+            erasing = None;
             apply(attachment, Repaint::Notice, served);
         }
 
@@ -3509,6 +3507,25 @@ fn apply(attachment: &mut Attachment, why: Repaint, served: Served) {
     }
 }
 
+/// Ask the server of a kept client coming back to the front for its exact
+/// screen — from a thread, as the notice's repaint is, so that nothing waits
+/// for it: the screen comes back from the copy meanwhile, and the relay has a
+/// session to run. With nothing typed into a prompt ([`Repaint::Notice`]): the
+/// prompt is on the screen, for the user.
+///
+/// `None` if there was no thread to ask from, in which case the fallback has
+/// run — what a server that could not be asked would have got.
+fn kept_clients_repaint(attachment: &mut Attachment) -> Option<Erasing> {
+    match Erasing::start_for(&attachment.sock, "kept client's return") {
+        Ok(started) => Some(started),
+        Err(e) => {
+            tracing::debug!(error = %e, "no thread for the kept client's repaint");
+            apply(attachment, Repaint::Notice, Served::NONE);
+            None
+        }
+    }
+}
+
 /// The repaint that takes the attach notice off the screen, in flight on a
 /// thread of its own.
 ///
@@ -3534,13 +3551,10 @@ fn apply(attachment: &mut Attachment, why: Repaint, served: Served) {
 /// Not a resume's repaint, which stays where it is: there the terminal is
 /// blank, the relay has not started, and the screen coming back *is* what the
 /// user is waiting for. Except a kept client's (`[client] per_session`), whose
-/// screen is already painted back from its copy by then: its repaint is asked
-/// here too, with the relay running (see [`relay`]).
+/// screen is painted back from its copy meanwhile: its repaint is asked here
+/// too, as a rule as the fade in starts (see [`relay`]).
 struct Erasing {
     rx: mpsc::Receiver<Served>,
-    started: Instant,
-    /// What the repaint is for, for the timing record.
-    what: &'static str,
 }
 
 impl Erasing {
@@ -3550,23 +3564,35 @@ impl Erasing {
     }
 
     /// [`Erasing::start`], for something other than the notice: a kept
-    /// client coming back to the front, whose screen is already painted back
-    /// and wants the server's exact one on top (see [`relay`]).
+    /// client coming back to the front, whose screen is painted back from its
+    /// copy and wants the server's exact one on top (see [`relay`]). `what`
+    /// names it in the timing record.
     fn start_for(sock: &Path, what: &'static str) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::channel();
         let sock = sock.to_path_buf();
+        let asked = Instant::now();
         std::thread::Builder::new()
             .name("nvmux-notice-repaint".into())
             .spawn(move || {
+                let served = repaint_through_server(&sock, Repaint::Notice);
+                // Timed here, as the answer comes, and not where the relay
+                // collects it: a kept client's is asked as the fade in starts,
+                // and the relay does not look until the fade is over. It is a
+                // second full repaint of the session — the one nvmux asks for
+                // rather than the one the attach produced — and what the
+                // number measures is how long that took somewhere else, which
+                // is the point of it.
+                tracing::debug!(
+                    ms = asked.elapsed().as_secs_f64() * 1000.0,
+                    repainted = served.repainted,
+                    "timing: {} (:mode repaint)",
+                    what
+                );
                 // A receiver that has gone is a relay that ended first, and
                 // there is nobody left to tell.
-                let _ = tx.send(repaint_through_server(&sock, Repaint::Notice));
+                let _ = tx.send(served);
             })?;
-        Ok(Self {
-            rx,
-            started: Instant::now(),
-            what,
-        })
+        Ok(Self { rx })
     }
 
     /// The verdict, if it has arrived. A worker that ended without one is

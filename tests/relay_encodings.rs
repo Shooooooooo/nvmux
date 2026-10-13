@@ -81,6 +81,11 @@ const AHEAD: &[u8] = b"\x1b]9999;ahead\x07";
 /// nothing, which is what the tests about the prefix want.
 const CHILD_LABEL: &str = "NVMUX_TEST_RELAY_LABEL";
 
+/// The fade a child draws, both ways, in milliseconds, where the default is
+/// not what the test wants (see [`LONG_FADE_MS`]). Only a child with a
+/// palette (see [`CHILD_PALETTE`]) has a fade to draw.
+const CHILD_FADE_MS: &str = "NVMUX_TEST_RELAY_FADE_MS";
+
 /// What a keeping child writes once its client is parked, so the parent knows
 /// the relay has let go of the terminal: an OSC no terminal acts on, which
 /// the screen the tests read is none the worse for.
@@ -132,6 +137,12 @@ fn relay_child() {
     settings.client.ui = nvmux::config::Ui::Nvim;
     let keep = std::env::var_os(CHILD_KEEP).is_some();
     settings.client.per_session = keep;
+    if let Some(ms) = std::env::var(CHILD_FADE_MS)
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+    {
+        settings.effects.fade.duration_ms = ms;
+    }
     nvmux::config::init(settings);
 
     // Without this the fade is off — `palette::get` is `None`, so `fade::enabled`
@@ -260,6 +271,8 @@ struct Asks {
     ahead: bool,
     /// [`CHILD_LABEL`].
     label: Option<&'static str>,
+    /// [`CHILD_FADE_MS`].
+    fade_ms: Option<u64>,
 }
 
 impl Terminal {
@@ -339,6 +352,7 @@ impl Terminal {
             in_band,
             ahead,
             label,
+            fade_ms,
         } = asks;
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize {
@@ -376,6 +390,9 @@ impl Terminal {
         }
         if ahead {
             cmd.env(CHILD_AHEAD, "1");
+        }
+        if let Some(ms) = fade_ms {
+            cmd.env(CHILD_FADE_MS, ms.to_string());
         }
         let child = pair.slave.spawn_command(cmd).expect("spawn relay child");
         // Or the master would never see EOF once the child exits.
@@ -957,6 +974,132 @@ fn a_kept_clients_screen_comes_back_on_an_in_band_terminal() {
 #[test]
 fn a_kept_clients_screen_dissolves_back_in() {
     a_kept_clients_screen_comes_back("kept-fade", false, true);
+}
+
+/// The fade [`a_kept_clients_repaint_is_asked_under_its_fade_in`] has its
+/// child draw, both ways: as long as a fade is allowed to be, so that "while
+/// the fade in is still being drawn" is a second wide.
+const LONG_FADE_MS: u64 = 2_000;
+
+/// A kept client's repaint is asked as its screen starts to dissolve back in,
+/// not once it has: the server redraws underneath frames nvmux draws from its
+/// copy, so what waits for that redraw — the name the editor says (see
+/// [`nvmux::tell`]) — does not wait out the fade first.
+///
+/// Seen from the server, which counts the windows it redraws. Idle, its
+/// client parked, it redraws none; half way through the fade in, the count
+/// has moved while nothing the client drew has reached the terminal yet — the
+/// repaint, which clears it, comes after the fade.
+#[test]
+fn a_kept_clients_repaint_is_asked_under_its_fade_in() {
+    require_nvim!();
+    let tag = "kept-early";
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    // Clean, so nothing of a config redraws on a timer while the client is
+    // parked and the count is meant to be still.
+    let session = t
+        .create_session(
+            &common::unique(tag),
+            &common::launch_with("--clean"),
+            common::anywhere(),
+        )
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    let marker = "kept, and repainted under the fade";
+    let mut rpc = nvmux::rpc::Client::connect(&sock, Duration::from_secs(3)).expect("connect");
+    rpc.command(&format!(
+        "setlocal noswapfile | call setline(1, '{marker}')"
+    ))
+    .expect("setline");
+    rpc.command(
+        "lua _G.redrawn = 0 \
+         vim.api.nvim_set_decoration_provider(vim.api.nvim_create_namespace('redrawn'), \
+         { on_win = function() _G.redrawn = _G.redrawn + 1 end })",
+    )
+    .expect("count the redraws");
+    let redrawn = || {
+        nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
+            .and_then(|mut c| c.eval("luaeval('_G.redrawn')"))
+            .ok()
+            .and_then(|count| count.as_u64())
+            .expect("the count of redraws")
+    };
+
+    let mut term = Terminal::spawn_child(
+        &sock,
+        &session.id,
+        Protocol::Kitty,
+        Asks {
+            shadow: true,
+            keep: true,
+            fade_ms: Some(LONG_FADE_MS),
+            ..Asks::default()
+        },
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| {
+            row_on_screen(out, 0).contains(marker)
+        }),
+        "the session never painted; got: {}",
+        term.since(0)
+    );
+    // Parked only once the terminal has answered the client's DA1.
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| find(out, DA1).is_some()),
+        "the client never asked its DA1; got: {}",
+        term.since(0)
+    );
+    term.pump_until(Duration::from_millis(300), |_| false);
+
+    let mark = term.output.len();
+    let since = |out: &[u8], what: &[u8]| find(&out[mark.min(out.len())..], what).is_some();
+    term.type_bytes(&[nvmux::keys::PREFIX, b' ']);
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| since(out, PARKED)),
+        "the child never parked its client; it wrote: {}",
+        term.since(mark)
+    );
+    let parked = redrawn();
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| since(out, RESUMED)),
+        "the parked client never came back; the child wrote: {}",
+        term.since(mark)
+    );
+    let after = mark + find(&term.output[mark..], RESUMED).expect("resumed") + RESUMED.len();
+    let repainted = |out: &[u8]| find(&out[after.min(out.len())..], b"\x1b[2J").is_some();
+
+    let fade_in = Duration::from_millis(LONG_FADE_MS / 2);
+    term.pump_until(fade_in / 2, |_| false);
+    assert!(
+        !repainted(&term.output),
+        "the fade in was over within half its length, which says nothing about when the \
+         repaint was asked; the child wrote: {}",
+        term.since(after)
+    );
+    assert!(
+        redrawn() > parked,
+        "half way through the fade in the server had redrawn nothing: the repaint waits \
+         for the fade to be over"
+    );
+
+    // And it lands once the fade is over, with the session's screen.
+    assert!(
+        term.pump_until(Duration::from_secs(5), repainted),
+        "no repaint came after the fade in; the child wrote: {}",
+        term.since(after)
+    );
+    assert!(
+        row_on_screen(&term.output, 0).contains(marker),
+        "the repainted screen is not the session's: {:?}",
+        row_on_screen(&term.output, 0)
+    );
+    assert_eq!(
+        detach(&mut term),
+        Some(0),
+        "the resumed relay did not detach; the child wrote: {}",
+        term.since(after)
+    );
 }
 
 /// `[client] lazy = false`, end to end. A client started ahead of its first
