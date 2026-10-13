@@ -1,8 +1,6 @@
-//! What a session's note looks like on the picker (see [`crate::notes`]):
-//! with `[picker] notes = "signs"`, the default, one sign beside the row and
-//! the selected session's note in full under the list; with `"column"`, a
-//! short note in the row itself, after the name. Glyphs and text only — where
-//! they go, dim, is [`super::draw`]'s.
+//! What a session's note looks like on the picker (see [`crate::notes`]): one
+//! sign beside the row, and the selected session's note in full under the
+//! list. Glyphs and text only — where they go, dim, is [`super::draw`]'s.
 //!
 //! # One column, everywhere
 //!
@@ -72,31 +70,6 @@ pub fn caption(note: &Note) -> String {
         Kind::Busy(percent) => progress(note, percent, "busy"),
     };
     format!("{what} · {}", age(note.age_now()))
-}
-
-/// A note short enough for a column in the row: the notification's body
-/// rather than who sent it, a failure's text, a percentage, and the spinner's
-/// `frame` before what is running. No age: the column is for scanning, and
-/// the caption a selection would show it has none in this mode either.
-pub fn column(note: &Note, frame: usize) -> String {
-    let or = |text: &str, otherwise: &str| {
-        if text.is_empty() {
-            otherwise.to_string()
-        } else {
-            text.to_string()
-        }
-    };
-    match note.kind {
-        Kind::Notified => or(&note.text, &note.title),
-        Kind::Failed => or(&note.text, "failed"),
-        Kind::Busy(Some(percent)) if note.text.is_empty() => format!("{percent}%"),
-        Kind::Busy(Some(percent)) => format!("{percent}% {}", note.text),
-        Kind::Busy(None) => format!(
-            "{} {}",
-            GLYPHS[frame % GLYPHS.len()],
-            or(&note.text, "busy")
-        ),
-    }
 }
 
 /// `title: 42% text`, with what is missing left out, and `otherwise` when
@@ -217,33 +190,5 @@ mod tests {
             "claude: exited with code 1 · 1d"
         );
         assert_eq!(caption(&note(Kind::Failed, "", "", 0)), "failed · 0s");
-    }
-
-    #[test]
-    fn a_column_note_is_short() {
-        assert_eq!(
-            column(
-                &note(
-                    Kind::Notified,
-                    "Claude Code",
-                    "Claude needs your permission",
-                    0
-                ),
-                0
-            ),
-            "Claude needs your permission"
-        );
-        assert_eq!(column(&note(Kind::Notified, "Build", "", 0), 0), "Build");
-        assert_eq!(
-            column(&note(Kind::Busy(None), "claude", "working", 0), 2),
-            "⠹ working"
-        );
-        assert_eq!(column(&note(Kind::Busy(None), "", "", 0), 0), "⠋ busy");
-        assert_eq!(column(&note(Kind::Busy(Some(42)), "", "", 0), 0), "42%");
-        assert_eq!(
-            column(&note(Kind::Busy(Some(42)), "lua_ls", "indexing", 0), 0),
-            "42% indexing"
-        );
-        assert_eq!(column(&note(Kind::Failed, "", "", 0), 0), "failed");
     }
 }

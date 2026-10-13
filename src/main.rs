@@ -173,10 +173,6 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     // what it was keeping to report is no news to them, so the picker clears
     // it before it first reads it (see `nvmux::notes`).
     let mut looked_at: Option<String> = None;
-    // Whether the sessions are told anything about notes at all: `[picker]
-    // notes = "off"` leaves them alone, but for the picker taking the watcher
-    // out of each.
-    let noting = config::get().picker.notes != config::Notes::Off;
 
     loop {
         // `<prefix> c` moves this to the session it just created. A client held
@@ -348,9 +344,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             // cleared. On a thread, so the session is in front at once (see
             // `nvmux::notes::touch`).
             let sock = attachment.sock().to_path_buf();
-            if noting {
-                nvmux::notes::later(sock.clone(), nvmux::notes::touch);
-            }
+            nvmux::notes::later(sock.clone(), nvmux::notes::touch);
 
             // The relay, with the chance to start the next client while this
             // session is still dissolving: `begin_next` fires on a `<prefix>`
@@ -404,12 +398,10 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             // way out of nvmux, waited for a moment so it gets said at all.
             match &ended.0 {
                 pty::Outcome::ToPicker => looked_at = Some(current.id.clone()),
-                pty::Outcome::Detached | pty::Outcome::StdinClosed if noting => {
+                pty::Outcome::Detached | pty::Outcome::StdinClosed => {
                     nvmux::notes::seen_within(sock, SEEN_ON_THE_WAY_OUT);
                 }
-                pty::Outcome::CreateNew | pty::Outcome::ShowHelp | pty::Outcome::Switch(_)
-                    if noting =>
-                {
+                pty::Outcome::CreateNew | pty::Outcome::ShowHelp | pty::Outcome::Switch(_) => {
                     nvmux::notes::later(sock, nvmux::notes::seen);
                 }
                 _ => {}

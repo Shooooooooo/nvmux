@@ -126,8 +126,7 @@ Beside each name the picker shows, dim, what that session has to report:
 
 The selected session's note is spelt out under the list —
 `Claude Code · Claude needs your permission · 2m` — and a notification stays
-until you next open its session. `[picker] notes = "column"` puts the notes in
-the rows instead, after the names; `"off"` shows none.
+until you next open its session.
 
 To know, nvmux leaves a watcher in each session — one augroup, `nvmux_notes` —
 that records Neovim's progress messages, what its language servers say they
@@ -137,7 +136,7 @@ terminal buffers send — OSC 777 (Ghostty's), OSC 9 (iTerm2's) and OSC 99
 code other than 0, or a command its shell says did (`cargo build: exited with
 code 101`), which fish 4 says by itself and other shells can with OSC 133. It
 stays when nvmux leaves, so a session that wanted you overnight says so in the
-morning; `"off"` takes it out again.
+morning.
 
 > [!NOTE]
 > A program only sends a notification to a terminal it thinks will show it.
@@ -217,9 +216,6 @@ ui          = "nvmux" # who draws a session: nvmux's own client, animated; or "n
 per_session = true    # keep each session's client; a switch back reuses it
 lazy        = true    # start a client on its first visit; false starts all at launch
 predict     = true    # over a slow link, scrolls show before Neovim answers
-
-[picker]
-notes = "signs"   # what a session reports beside its name: "signs", "column" or "off"
 
 [theme]
 color = "terminal"   # or "#rrggbb": nvmux's text and bars in that colour; dim text stays dim

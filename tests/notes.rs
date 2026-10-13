@@ -1,9 +1,9 @@
 //! The watcher a session keeps its notes in ([`nvmux::notes`]), against real
 //! `nvim --headless` sessions: what it records of progress messages, of what
 //! language servers say they are doing and of what programs in its terminal
-//! buffers send, what a read makes of that, and that clearing it, a newer
-//! version of it and taking it out each do what they say — and the picker's
-//! reader, which does all of it on a thread.
+//! buffers send, what a read makes of that, and that clearing it and a newer
+//! version of it each do what they say — and the picker's reader, which does
+//! all of it on a thread.
 //!
 //! They skip, rather than fail, when there is no usable `nvim` on `$PATH` —
 //! unless `$NVMUX_TEST_REQUIRE` names `nvim`, as it does in CI.
@@ -392,9 +392,9 @@ fn a_programs_own_progress_bar_is_not_a_note() {
 }
 
 /// A session holding another nvmux's watcher is given this one's, and keeps
-/// what it recorded; taken out, it is gone, record and all.
+/// what it recorded.
 #[test]
-fn a_watcher_is_replaced_in_place_and_taken_out_whole() {
+fn a_watcher_is_replaced_in_place() {
     require_nvim!();
     let scratch = Scratch::new("notes-version");
     let (_, sock) = a_session(&scratch, "versioned");
@@ -418,13 +418,6 @@ fn a_watcher_is_replaced_in_place_and_taken_out_whole() {
         Some(if has_progress(&sock) { 4 } else { 3 }),
         "the autocommands replaced, not added to"
     );
-
-    notes::remove(&sock);
-    assert!(!has_watcher(&sock));
-    assert_eq!(
-        lua(&sock, "return package.loaded['nvmux.notes'] == nil"),
-        Value::Boolean(true)
-    );
 }
 
 /// A session coming to the front is given the watcher if it has none, and
@@ -447,8 +440,7 @@ fn a_session_brought_to_the_front_is_watched_from_then_on() {
 }
 
 /// What the picker reads with: every session handed over is read at once,
-/// the one it was opened from cleared first — and with the notes off, the
-/// watcher is taken out instead and nothing comes back.
+/// the one it was opened from cleared first.
 #[test]
 fn the_pickers_reader_reads_each_session_and_clears_the_one_just_left() {
     require_nvim!();
@@ -464,7 +456,7 @@ fn the_pickers_reader_reads_each_session_and_clears_the_one_just_left() {
         read_until(sock, |n| n.is_some()).expect("recorded");
     }
 
-    let poller = Poller::start(nvmux::config::Notes::Signs, Some(left.id.clone()));
+    let poller = Poller::start(Some(left.id.clone()));
     poller.watch(&left.id, left_sock.clone());
     poller.watch(&other.id, other_sock.clone());
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -484,15 +476,4 @@ fn the_pickers_reader_reads_each_session_and_clears_the_one_just_left() {
         Some(Kind::Notified),
         "{notes:?}"
     );
-    drop(poller);
-
-    let off = Poller::start(nvmux::config::Notes::Off, None);
-    off.watch(&other.id, other_sock.clone());
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while has_watcher(&other_sock) {
-        assert!(Instant::now() < deadline, "the watcher was never taken out");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(off.take(), None, "nothing read with the notes off");
 }

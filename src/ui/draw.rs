@@ -29,7 +29,6 @@ use super::landing::{Landing, Side, Tier};
 use super::note;
 use super::starfield;
 use super::swap::Dot;
-use crate::config::Notes as NoteStyle;
 
 /// The marker on the selected row. Unselected rows are indented to match, so
 /// names stay in one column and nothing shifts as the selection moves.
@@ -75,19 +74,10 @@ const NUM_GAP: &str = "  ";
 /// right edge does not jump in and out with the length of each name.
 const PAD: &str = " ";
 
-/// Columns between the column the names end in and the notes in the rows
-/// (`[picker] notes = "column"`, see [`super::note`]): the notes start in one
-/// column, as the names do, however long each name is.
-const NOTE_GAP: &str = "  ";
-
-/// How wide the list may grow with notes in its rows. The names keep the room
-/// they had under [`MAX_LIST_WIDTH`]; the notes are cut to what is left.
-const MAX_NOTED_WIDTH: u16 = 64;
-
-/// How many columns left of the list a session's sign goes (`[picker] notes =
-/// "signs"`): far enough that a blank column keeps it off the marker column —
-/// a gutter left of the list, a sign column, in the same column on every row,
-/// the way Neovim's is.
+/// How many columns left of the list a session's sign goes (see
+/// [`super::note`]): far enough that a blank column keeps it off the marker
+/// column — a gutter left of the list, a sign column, in the same column on
+/// every row, the way Neovim's is.
 ///
 /// Dim, like the back mark and the numbers, and outside the bar, so the
 /// selection's bold never meets it: bold and dim share one reset.
@@ -208,13 +198,11 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         block,
         offset,
         num_width,
-        notes_at,
     }) = list_layout(app, area)
     else {
         return;
     };
     let height = block.height;
-    let spin = app.spin_frame();
 
     // The number column is kept but left blank while a session is being moved.
     // Dropping it outright would narrow the centred block by `num_width` plus
@@ -276,25 +264,15 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 MARKER.chars().count()..head.chars().count() - NUM_GAP.chars().count()
             };
-            // A note of its own in the row, in the column the notes start in.
-            let noted = notes_at.and_then(|at| {
-                app.note(&row.session.id)
-                    .map(|n| (at, note::column(n, spin)))
-            });
             // The bar is the width of the list, whatever the name it is on.
-            // With a note after the name, the note runs it on (`push_note`).
-            let name = if selected && noted.is_none() {
+            let name = if selected {
                 let fill =
                     (block.width as usize).saturating_sub(head.width() + row.session.name.width());
                 format!("{}{}", row.session.name, " ".repeat(fill))
             } else {
                 row.session.name.clone()
             };
-            let mut line = row_line(&head, &name, dim, &marked, block.width as usize, style);
-            if let Some((at, text)) = noted {
-                push_note(&mut line, at, &text, block.width as usize, selected, style);
-            }
-            line
+            row_line(&head, &name, dim, &marked, block.width as usize, style)
         })
         .collect();
 
@@ -314,10 +292,8 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     // Before what passes out past the ends of the rows, so a trail or a
     // landing's bounce runs over a sign while it is there, and leaves it
     // where it was.
-    if app.note_style() == NoteStyle::Signs {
-        draw_signs(frame, app, block, offset);
-        draw_caption(frame, app, area, block);
-    }
+    draw_signs(frame, app, block, offset);
+    draw_caption(frame, app, area, block);
     if let Some((id, backspace)) = backspace {
         draw_backspace(frame, app, block, offset, num_width, id, backspace);
     }
@@ -423,45 +399,11 @@ fn step_aside(buf: &mut Buffer, row: Rect, aside: i16) {
     }
 }
 
-/// A note in its row (`[picker] notes = "column"`), in column `at` of the list
-/// — where the notes start, whatever the name — cut to what the list has room
-/// for before its pad. Dim beside the name; in the selection's bar plain on
-/// the reversed ground instead, as the number is there, since bold and dim
-/// share one reset — and the bar then runs on past it to the end of the list.
-fn push_note(
-    line: &mut Line<'static>,
-    at: usize,
-    text: &str,
-    width: usize,
-    selected: bool,
-    style: Style,
-) {
-    let used = line.width();
-    let room = width.saturating_sub(at + PAD.width());
-    if used > at || room == 0 {
-        return;
-    }
-    let text = truncate(text, room);
-    let shown = text.width();
-    let look = if selected {
-        Style::default().add_modifier(Modifier::REVERSED)
-    } else {
-        Style::default().add_modifier(Modifier::DIM)
-    };
-    line.spans.push(Span::styled(" ".repeat(at - used), style));
-    line.spans.push(Span::styled(text, look));
-    if selected {
-        let fill = width.saturating_sub(at + shown);
-        line.spans.push(Span::styled(" ".repeat(fill), style));
-    }
-}
-
-/// Each session's sign, in a gutter left of the list (`[picker] notes =
-/// "signs"`, see [`super::note`]): [`SIGN_OUT`] columns left of the start of
-/// the bar, on the row of the session it is about, stepping aside with that
-/// row — and not drawn where there is no room left of the list. None on a row
-/// being erased, nor on the gap made for a new session, which has nothing to
-/// report yet.
+/// Each session's sign, in a gutter left of the list (see [`super::note`]):
+/// [`SIGN_OUT`] columns left of the start of the bar, on the row of the
+/// session it is about, stepping aside with that row — and not drawn where
+/// there is no room left of the list. None on a row being erased, nor on the
+/// gap made for a new session, which has nothing to report yet.
 fn draw_signs(frame: &mut Frame, app: &App, block: Rect, offset: usize) {
     let screen = frame.area();
     let dim = Style::default().add_modifier(Modifier::DIM);
@@ -499,10 +441,10 @@ fn draw_signs(frame: &mut Frame, app: &App, block: Rect, offset: usize) {
 }
 
 /// The selected session's note in full, centred under the list with a blank
-/// row between them (`[picker] notes = "signs"`): its sign says there is
-/// something, this says what. Only while the picker is browsing — not while it
-/// asks `[y/N]` or carries a session — and not at all where the list leaves no
-/// row for it: a list that fills the screen goes without.
+/// row between them: its sign says there is something, this says what. Only
+/// while the picker is browsing — not while it asks `[y/N]` or carries a
+/// session — and not at all where the list leaves no row for it: a list that
+/// fills the screen goes without.
 fn draw_caption(frame: &mut Frame, app: &App, area: Rect, block: Rect) {
     if !matches!(app.mode(), Mode::Normal | Mode::Filter) {
         return;
@@ -842,37 +784,13 @@ fn list_layout(app: &App, area: Rect) -> Option<ListLayout> {
         .map(|r| r.num.to_string().len())
         .max()
         .unwrap_or(1);
-    let names = (widest
+    let width = (widest
         + MARKER.width() as u16
         + num_width as u16
         + NUM_GAP.width() as u16
         + PAD.width() as u16)
-        .clamp(MIN_LIST_WIDTH, MAX_LIST_WIDTH);
-    // Notes in the rows (`[picker] notes = "column"`): a column of their own
-    // past the names, as wide as the widest note on screen, which the list
-    // widens for — and is centred afresh with, so the names move over when
-    // the first note comes. The names keep the room they had; the notes get
-    // what is left of `MAX_NOTED_WIDTH`. The spinner's frame does not change
-    // a note's width, so any frame measures it.
-    let noted = if app.note_style() == NoteStyle::Column {
-        rows.iter()
-            .filter(|r| !r.ghost)
-            .filter_map(|r| app.note(&r.session.id))
-            .map(|n| note::column(n, 0).width())
-            .max()
-    } else {
-        None
-    };
-    let (width, notes_at) = match noted {
-        Some(w) if w > 0 => {
-            let at = names - PAD.width() as u16 + NOTE_GAP.width() as u16;
-            let width = (at + w.min(usize::from(MAX_NOTED_WIDTH)) as u16 + PAD.width() as u16)
-                .min(MAX_NOTED_WIDTH.max(names));
-            (width, Some(usize::from(at)))
-        }
-        _ => (names, None),
-    };
-    let width = width.min(area.width);
+        .clamp(MIN_LIST_WIDTH, MAX_LIST_WIDTH)
+        .min(area.width);
 
     let height = (rows.len() as u16).min(area.height);
     let mut block = centre(area, width, height);
@@ -898,7 +816,6 @@ fn list_layout(app: &App, area: Rect) -> Option<ListLayout> {
         block,
         offset,
         num_width,
-        notes_at,
     })
 }
 
@@ -910,10 +827,6 @@ struct ListLayout {
     offset: usize,
     /// Columns the number column takes.
     num_width: usize,
-    /// The column of the block the notes in the rows start in, when they are
-    /// drawn there (`[picker] notes = "column"`) and some row on screen has
-    /// one.
-    notes_at: Option<usize>,
 }
 
 /// The visible row drawn on terminal cell (`column`, `row`), if any, with
@@ -993,10 +906,10 @@ pub(super) fn name_rect(app: &App, area: Rect, id: &str) -> Option<Rect> {
 }
 
 /// Whether terminal cell (`column`, `row`) is part of a row as drawn — its
-/// marker, number, gap or name, the blanks among them included, and its note
-/// where the notes are in the rows — rather than the terminal's own
-/// background around the list. What lets the effects lay glyphs beside rows
-/// without one landing in the space of a name like `session 3`.
+/// marker, number, gap or name, the blanks among them included — rather than
+/// the terminal's own background around the list. What lets the effects lay
+/// glyphs beside rows without one landing in the space of a name like
+/// `session 3`.
 pub(super) fn on_a_row(app: &App, area: Rect, column: u16, row: u16) -> bool {
     if area.height == 0 || area.width == 0 {
         return false;
@@ -1006,7 +919,6 @@ pub(super) fn on_a_row(app: &App, area: Rect, column: u16, row: u16) -> bool {
         block,
         offset,
         num_width,
-        notes_at,
     }) = list_layout(app, body)
     else {
         return false;
@@ -1018,12 +930,8 @@ pub(super) fn on_a_row(app: &App, area: Rect, column: u16, row: u16) -> bool {
     let Some(drawn) = rows.get(offset + usize::from(row - block.y)) else {
         return false;
     };
-    let named = MARKER.width() + num_width + NUM_GAP.width() + drawn.session.name.width();
-    let width = match notes_at.zip(app.note(&drawn.session.id)) {
-        Some((at, n)) if !drawn.ghost => at + note::column(n, 0).width(),
-        _ => named,
-    }
-    .min(block.width as usize);
+    let width = (MARKER.width() + num_width + NUM_GAP.width() + drawn.session.name.width())
+        .min(block.width as usize);
     usize::from(column - block.x) < width
 }
 
@@ -2672,7 +2580,7 @@ mod tests {
         );
     }
 
-    // --- notes (`[picker] notes`) -------------------------------------------
+    // --- notes ---------------------------------------------------------------
 
     use crate::notes::{Kind, Note};
 
@@ -2686,8 +2594,8 @@ mod tests {
         }
     }
 
-    /// A picker of `names` with these notes, by name, shown the `style` way.
-    fn noted(names: &[&str], notes: Vec<(&str, Note)>, style: NoteStyle) -> App {
+    /// A picker of `names` with these notes, by name.
+    fn noted(names: &[&str], notes: Vec<(&str, Note)>) -> App {
         let mut a = app(names);
         let by_id = notes
             .into_iter()
@@ -2697,12 +2605,11 @@ mod tests {
             })
             .collect();
         a.set_notes(by_id);
-        a.set_note_style(style);
         a
     }
 
     /// A busy session, one with a notification, and one with nothing to say.
-    fn three(style: NoteStyle) -> App {
+    fn three() -> App {
         noted(
             &["api-server", "blog", "dotfiles"],
             vec![
@@ -2716,16 +2623,7 @@ mod tests {
                     ),
                 ),
             ],
-            style,
         )
-    }
-
-    /// The column the bar on row `y` ends in.
-    fn bar_end(buf: &Buffer, y: u16) -> u16 {
-        (0..buf.area.width)
-            .rev()
-            .find(|x| buf[(*x, y)].modifier.contains(Modifier::REVERSED))
-            .expect("a bar on that row")
     }
 
     /// Signs stand in a gutter left of the list, one blank column out from
@@ -2733,7 +2631,7 @@ mod tests {
     /// and in no colour, like the numbers.
     #[test]
     fn a_sign_stands_left_of_its_row_dim() {
-        let a = three(NoteStyle::Signs);
+        let a = three();
         let (w, h) = (60, 12);
         let lines = render(&a, w, h);
         let buf = test_support::buffer(w, h, |f| draw(f, &a));
@@ -2764,7 +2662,7 @@ mod tests {
     /// asks to be drawn at that pace while it is on screen.
     #[test]
     fn the_spinner_turns_with_the_clock() {
-        let mut a = three(NoteStyle::Signs);
+        let mut a = three();
         assert!(a.spinning());
         a.tick(note::SPIN * 2);
         let (w, h) = (60, 12);
@@ -2776,7 +2674,6 @@ mod tests {
         let still = noted(
             &["api-server"],
             vec![("api-server", note(Kind::Busy(Some(42)), "lua_ls", ""))],
-            NoteStyle::Signs,
         );
         assert!(!still.spinning(), "a gauge does not turn");
         assert!(!app(&["api-server"]).spinning(), "nor does nothing");
@@ -2787,7 +2684,7 @@ mod tests {
     /// nothing to say has none.
     #[test]
     fn the_selected_sessions_note_is_spelt_out_under_the_list() {
-        let mut a = three(NoteStyle::Signs);
+        let mut a = three();
         let (w, h) = (60, 12);
         let lines = render(&a, w, h);
         let last = line_of(&lines, "dotfiles") as usize;
@@ -2814,7 +2711,7 @@ mod tests {
     /// hand, and the caption keeps out of it. The signs stay.
     #[test]
     fn the_caption_keeps_out_of_a_question() {
-        let mut a = three(NoteStyle::Signs);
+        let mut a = three();
         a.on_key(Key::Char('x'));
         let lines = render(&a, 60, 12);
         let last = line_of(&lines, "dotfiles") as usize;
@@ -2827,7 +2724,7 @@ mod tests {
     /// Neither is drawn over anything else.
     #[test]
     fn signs_and_the_caption_need_room() {
-        let a = three(NoteStyle::Signs);
+        let a = three();
         // Three rows of list, and the hint row: no row under the list.
         let lines = render(&a, 60, 4);
         assert!(!lines.iter().any(|l| l.contains("working")), "{lines:#?}");
@@ -2837,81 +2734,5 @@ mod tests {
         for (w, h) in test_support::TINY_SIZES {
             render(&a, *w, *h);
         }
-    }
-
-    /// In the rows, the notes start in one column past the longest name,
-    /// two blanks after it, dim — and in the selection's bar plain on the
-    /// reversed ground, since bold and dim share one reset, with the bar run
-    /// on past the note to the end of the list.
-    #[test]
-    fn notes_in_the_rows_start_in_one_column() {
-        let a = three(NoteStyle::Column);
-        let (w, h) = (80, 10);
-        let lines = render(&a, w, h);
-        let buf = test_support::buffer(w, h, |f| draw(f, &a));
-        let col = |line: &str, s: &str| line[..line.find(s).expect("there")].width();
-        let busy = &lines[line_of(&lines, "api-server") as usize];
-        let notified = &lines[line_of(&lines, "blog") as usize];
-        assert!(busy.contains("api-server  ⠋ working"), "{busy:?}");
-        assert_eq!(
-            col(busy, "⠋ working"),
-            col(notified, "Claude needs your permission"),
-            "one column"
-        );
-
-        let y = line_of(&lines, "api-server");
-        let x = col(busy, "working") as u16;
-        assert!(buf[(x, y)].modifier.contains(Modifier::REVERSED));
-        assert!(!buf[(x, y)].modifier.contains(Modifier::BOLD));
-        assert!(!buf[(x, y)].modifier.contains(Modifier::DIM));
-        let y = line_of(&lines, "blog");
-        let x = col(notified, "Claude") as u16;
-        assert!(buf[(x, y)].modifier.contains(Modifier::DIM));
-        // The bar is as wide as the list, past the longest note.
-        let end = bar_end(&buf, line_of(&lines, "api-server"));
-        assert!(
-            usize::from(end) + 1 >= col(notified, "Claude") + "Claude needs your permission".len(),
-            "the bar stops at {end}: {lines:#?}"
-        );
-        test_support::assert_no_colour(w, h, |f| draw(f, &a));
-    }
-
-    /// The list widens for the notes, and no further than `MAX_NOTED_WIDTH`:
-    /// a longer note is cut to the room there is.
-    #[test]
-    fn notes_in_the_rows_are_cut_to_the_room_there_is() {
-        let long = "x".repeat(200);
-        let a = noted(
-            &["api-server", "blog"],
-            vec![("blog", note(Kind::Notified, "", &long))],
-            NoteStyle::Column,
-        );
-        let (w, h) = (120, 8);
-        let lines = render(&a, w, h);
-        let row = &lines[line_of(&lines, "blog") as usize];
-        let (left, _) = test_support::padding(row, w as usize);
-        assert!(
-            row.width() - left <= usize::from(MAX_NOTED_WIDTH),
-            "{row:?} is wider than the list may be"
-        );
-        assert!(row.ends_with('x'), "{row:?}");
-        let plain = render(&app(&["api-server", "blog"]), w, h);
-        let line = &plain[line_of(&plain, "blog") as usize];
-        assert!(
-            test_support::padding(line, w as usize).0 > left,
-            "the list widened and was centred afresh"
-        );
-    }
-
-    /// With the notes off, the picker is as it was, whatever the sessions
-    /// have said.
-    #[test]
-    fn notes_off_draws_none() {
-        let off = three(NoteStyle::Off);
-        assert_eq!(
-            render(&off, 60, 12),
-            render(&app(&["api-server", "blog", "dotfiles"]), 60, 12)
-        );
-        assert!(!off.spinning());
     }
 }
