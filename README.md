@@ -99,7 +99,9 @@ reimplementing it.
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
 
 Pressing `<prefix>` puts a one-row reminder of these keys along the bottom of
-the screen; it goes as soon as the next key resolves it.
+the screen; it goes as soon as the next key resolves it. A switch by key says
+which session you have landed in, as the editor says anything: with
+`vim.notify`, on its message row or in whatever notification plugin you use.
 
 ### Leaving a session
 
@@ -130,6 +132,12 @@ The selected session's note is spelt out under the list —
 failure or a finished command stays until you next open its session. A
 session with more than one thing to say shows what wants you first: a
 notification or a failure, then a finished command, then whatever is busy.
+
+While you are in a session, the others' `∗`, `!` and `✓` are told to you there
+as they come, the same way — `vim.notify`, so on the message row or in your
+notification plugin, and in `:messages`: `✓ api-server · cargo test: exited
+with code 0`. Of the session you are in, you are told only what a terminal
+that is not on the screen says, without the session's name.
 
 To know, nvmux leaves a watcher in each session — one augroup, `nvmux_notes` —
 that records Neovim's progress messages, what its language servers say they
@@ -192,12 +200,11 @@ nvmux needs no configuration. An optional TOML file — `$NVMUX_CONFIG` if set,
 else `$XDG_CONFIG_HOME/nvmux/config.toml`, else `~/.config/nvmux/config.toml` —
 overrides the defaults below; an unknown key or a bad value is a startup error.
 
-nvmux's own screens — the picker, the prompt, the help, and the notice it
-draws over a session — come in your terminal's own colours. Name one colour
-instead and their text is drawn in it, and the selection's bar filled with it,
-while what is dim — the session numbers, the key hints — stays your terminal's
-dim. Neovim's own screen keeps the editor's colours, and `NO_COLOR` keeps the
-terminal's.
+nvmux's own screens — the picker, the prompt and the help — come in your
+terminal's own colours. Name one colour instead and their text is drawn in it,
+and the selection's bar filled with it, while what is dim — the session
+numbers, the key hints — stays your terminal's dim. Neovim's own screen keeps
+the editor's colours, and `NO_COLOR` keeps the terminal's.
 
 ```toml
 [theme]
@@ -229,8 +236,8 @@ enabled = true   # master switch: false turns every effect below off
 
 [effects.fade]
 enabled     = true   # dissolve between screens; NO_COLOR forces this off
-duration_ms = 200    # the whole dissolve, out and back; the notice pays it too
-session     = true   # Neovim's own screen dissolves too, and backs the notice
+duration_ms = 200    # the whole dissolve, out and back
+session     = true   # Neovim's own screen dissolves too
 
 [effects.move]
 enabled = true   # stars off a session being moved, rows stepping aside, its landing

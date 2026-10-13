@@ -55,7 +55,9 @@
 //! takes the answers when they come.
 //!
 //! Four things ever *join* this direction. The attach notice (see
-//! [`crate::announce`]): a box, drawn where the child's own bytes leave the
+//! [`crate::announce`]) — kept, and no longer armed, the editor saying which
+//! session this is instead (see [`crate::tell`]): a box, drawn where the
+//! child's own bytes leave the
 //! terminal between escape sequences, which [`crate::boundary`] finds with a
 //! decoder rather than with a clock, and written inside a synchronized update
 //! that also carries the session's own bytes, so that the terminal has no
@@ -2630,9 +2632,11 @@ pub fn relay(
         attachment.hold = Some(Hold::new(Instant::now()));
     }
 
-    // Taken, not copied: `<prefix> Space` and `<prefix> ?` come back to this same
-    // client, and a session you never left has nothing to announce.
-    let popup = announce::Popup::arm(attachment.announce.take(), Instant::now());
+    // Announced by the editor now, in its own `vim.notify`, from the relay's
+    // loop (see `crate::tell`), and not by the box, which is kept as it was and
+    // never armed: it used to be `announce::Popup::arm(attachment.announce.take(),
+    // Instant::now())` here.
+    let popup: Option<announce::Popup> = None;
     // Only for the notice, and only from here: everything written to the
     // terminal above is nvmux's own and complete, so a parser that starts
     // between sequences starts right.
@@ -2647,6 +2651,10 @@ pub fn relay(
         dissolved,
         erasing,
     );
+    // Taken, not kept for the next relay, whether or not it was said: `<prefix>
+    // Space` and `<prefix> ?` come back to this same client, and a session you
+    // never left has nothing to announce.
+    attachment.announce = None;
     // From here on nothing the client writes reaches the terminal until it is
     // relayed again: what the ledger hears next is news to the terminal.
     if let Some(ledger) = attachment.ledger.as_mut() {
@@ -3019,6 +3027,23 @@ fn pump(
                 asked.what
             );
             apply(attachment, Repaint::Notice, served);
+        }
+
+        // Which session this is, said by the editor (see `crate::tell`) — and
+        // only once nothing asked of it is still to repaint the screen, which
+        // would take the message off it again: a kept client's return asks for
+        // a `:mode` first. A client just started has none, and the editor holds
+        // the message for its UI to attach. What waiting for a key added to the
+        // box is left out: the editor says nothing until the key comes, and has
+        // its own prompt up meanwhile.
+        if erasing.is_none() {
+            if let Some(label) = attachment.announce.take() {
+                let name = label.strip_suffix(WAITING).unwrap_or(&label).to_string();
+                // An empty label announces nothing, as it never did on the box.
+                if !name.is_empty() {
+                    crate::tell::arrive(attachment.sock.clone(), name);
+                }
+            }
         }
 
         // Settle a pending prefix or number before reading anything new, so a

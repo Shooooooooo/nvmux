@@ -75,6 +75,12 @@ const AHEAD_FOR: Duration = Duration::from_secs(2);
 /// What that child writes once its client has been started ahead.
 const AHEAD: &[u8] = b"\x1b]9999;ahead\x07";
 
+/// What the child's relay announces the session as — the attach notice, which
+/// the editor gives now (see [`nvmux::tell`]) — on its first attach and, kept,
+/// on every return to the front: as a switch would. Unset, it announces
+/// nothing, which is what the tests about the prefix want.
+const CHILD_LABEL: &str = "NVMUX_TEST_RELAY_LABEL";
+
 /// What a keeping child writes once its client is parked, so the parent knows
 /// the relay has let go of the terminal: an OSC no terminal acts on, which
 /// the screen the tests read is none the worse for.
@@ -141,14 +147,15 @@ fn relay_child() {
         }));
     }
 
-    // An empty notice announces nothing: these tests are about the prefix
-    // reaching the machine, and a box drawn over the screen would be noise in
-    // the stream the parent is reading.
+    // An empty notice announces nothing, and is the one most of these tests
+    // want: they are about the prefix reaching the machine, and a message in
+    // the editor would be noise in the stream the parent is reading.
+    let label = std::env::var(CHILD_LABEL).unwrap_or_default();
     let mut pool = nvmux::pool::Pool::configured();
     let mut attachment = if std::env::var_os(CHILD_AHEAD).is_some() {
         start_ahead(&mut pool, &id, Path::new(&sock))
     } else {
-        nvmux::pty::spawn(&id, Path::new(&sock), "").expect("attach")
+        nvmux::pty::spawn(&id, Path::new(&sock), &label).expect("attach")
     };
     assert_eq!(
         attachment.is_kept(),
@@ -170,6 +177,11 @@ fn relay_child() {
                     nvmux::pool::Taken::Kept(back) => *back,
                     other => panic!("the parked client did not come back: {other:?}"),
                 };
+                // Back in place of another session's, as far as the notice is
+                // concerned: what `main` asks of a kept client that is.
+                if !label.is_empty() {
+                    attachment.announce_on_arrival(label.clone());
+                }
             }
             Ok((other, _)) => {
                 eprintln!("relay ended with {other:?}");
@@ -234,6 +246,22 @@ struct Terminal {
     _master: Box<dyn portable_pty::MasterPty>,
 }
 
+/// What a [`Terminal`]'s child is asked for, past the session and the
+/// protocol: each is one of the `CHILD_*` switches, and none is the default.
+#[derive(Default)]
+struct Asks {
+    /// [`CHILD_PALETTE`].
+    shadow: bool,
+    /// [`CHILD_KEEP`].
+    keep: bool,
+    /// Whether the terminal reports its size in band (DEC mode 2048).
+    in_band: bool,
+    /// [`CHILD_AHEAD`].
+    ahead: bool,
+    /// [`CHILD_LABEL`].
+    label: Option<&'static str>,
+}
+
 impl Terminal {
     /// Re-run this test binary as `relay_child` on a fresh pty, with no palette
     /// and so no fade, and a client that is not kept — what every test about a
@@ -245,31 +273,73 @@ impl Terminal {
     /// [`Terminal::spawn`], with `shadow` asking the child for the palette that
     /// gives it a shadow of the session's screen (see [`CHILD_PALETTE`]).
     fn spawn_with(sock: &Path, id: &str, protocol: Protocol, shadow: bool) -> Self {
-        Self::spawn_child(sock, id, protocol, shadow, false, false, false)
+        Self::spawn_child(
+            sock,
+            id,
+            protocol,
+            Asks {
+                shadow,
+                ..Asks::default()
+            },
+        )
     }
 
     /// A child that keeps its client (see [`CHILD_KEEP`]), on a terminal that
     /// reports its size in band if `in_band`, and with the fade on if `fade`.
     fn spawn_keeping(sock: &Path, id: &str, in_band: bool, fade: bool) -> Self {
-        Self::spawn_child(sock, id, Protocol::Kitty, fade, true, in_band, false)
+        Self::spawn_child(
+            sock,
+            id,
+            Protocol::Kitty,
+            Asks {
+                shadow: fade,
+                keep: true,
+                in_band,
+                ..Asks::default()
+            },
+        )
     }
 
     /// A child whose client is started ahead of its first visit (see
     /// [`CHILD_AHEAD`]) and kept, as `[client] lazy = false` leaves it with
     /// the defaults, with the fade on if `fade`.
     fn spawn_ahead(sock: &Path, id: &str, fade: bool) -> Self {
-        Self::spawn_child(sock, id, Protocol::Kitty, fade, true, false, true)
+        Self::spawn_child(
+            sock,
+            id,
+            Protocol::Kitty,
+            Asks {
+                shadow: fade,
+                keep: true,
+                ahead: true,
+                ..Asks::default()
+            },
+        )
     }
 
-    fn spawn_child(
-        sock: &Path,
-        id: &str,
-        protocol: Protocol,
-        shadow: bool,
-        keep: bool,
-        in_band: bool,
-        ahead: bool,
-    ) -> Self {
+    /// A child that announces the session as `label` (see [`CHILD_LABEL`]),
+    /// and keeps its client if `keep`.
+    fn spawn_announcing(sock: &Path, id: &str, label: &'static str, keep: bool) -> Self {
+        Self::spawn_child(
+            sock,
+            id,
+            Protocol::Kitty,
+            Asks {
+                keep,
+                label: Some(label),
+                ..Asks::default()
+            },
+        )
+    }
+
+    fn spawn_child(sock: &Path, id: &str, protocol: Protocol, asks: Asks) -> Self {
+        let Asks {
+            shadow,
+            keep,
+            in_band,
+            ahead,
+            label,
+        } = asks;
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize {
                 rows: ROWS,
@@ -300,6 +370,9 @@ impl Terminal {
         }
         if keep {
             cmd.env(CHILD_KEEP, "1");
+        }
+        if let Some(label) = label {
+            cmd.env(CHILD_LABEL, label);
         }
         if ahead {
             cmd.env(CHILD_AHEAD, "1");
@@ -998,4 +1071,125 @@ fn a_client_started_ahead_negotiates_on_its_first_visit_through_the_pty() {
 #[test]
 fn a_client_started_ahead_is_dissolved_in_on_its_first_visit() {
     a_client_started_ahead_negotiates_on_its_first_visit("ahead-fade", true);
+}
+
+/// The session's `:messages`.
+fn messages(sock: &Path) -> String {
+    nvmux::rpc::Client::connect(sock, Duration::from_secs(3))
+        .and_then(|mut c| c.eval("execute('messages')"))
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// `<prefix> d`, as the kitty protocol spells the prefix, and the child's exit
+/// waited for.
+fn detach(term: &mut Terminal) -> Option<u32> {
+    let flags = kitty_push_flags(&term.output).unwrap_or(0);
+    term.type_bytes(b"\x1b[32;5u");
+    if flags & 2 != 0 {
+        term.type_bytes(b"\x1b[32;5:3u");
+    }
+    term.pump_until(Duration::from_millis(150), |_| false);
+    term.type_bytes(b"d");
+    term.exit_code(Duration::from_secs(10))
+}
+
+/// The notice is the editor's now (see [`nvmux::tell`]): the session's name in
+/// its own message row once its client has attached, and in its `:messages` —
+/// and no box of nvmux's drawn over the session. And news told at the error
+/// level reaches the row too, as the editor's own errors do.
+#[test]
+fn a_fresh_client_is_announced_by_the_editor() {
+    require_nvim!();
+    let tag = "announced";
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(&common::unique(tag), &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    let label = "announced by the editor";
+
+    let mut term = Terminal::spawn_announcing(&sock, &session.id, label, false);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| {
+            row_on_screen(out, ROWS - 1).contains(label)
+        }),
+        "the editor never said which session this is; the child wrote: {}",
+        term.since(0)
+    );
+    assert!(messages(&sock).contains(label), "{}", messages(&sock));
+    assert!(
+        find(&term.output, "╭".as_bytes()).is_none(),
+        "a box was drawn over the session: {}",
+        term.since(0)
+    );
+
+    let failed = "! api-server · cargo build: exited with code 101";
+    assert!(nvmux::tell::say(&sock, failed, nvmux::tell::Level::Error).expect("said"));
+    assert!(
+        term.pump_until(Duration::from_secs(10), |out| {
+            row_on_screen(out, ROWS - 1).contains(failed)
+        }),
+        "an error never reached the message row; it shows {:?}",
+        row_on_screen(&term.output, ROWS - 1)
+    );
+    assert_eq!(detach(&mut term), Some(0), "the child did not detach");
+}
+
+/// A kept client coming back is announced only once the repaint its return
+/// asks the server for has been done: said before it, the `:mode` would take
+/// the message straight back off the screen.
+#[test]
+fn a_kept_clients_return_is_announced_after_its_repaint() {
+    require_nvim!();
+    let tag = "announced-kept";
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(&common::unique(tag), &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    let label = "back, and announced";
+
+    let mut term = Terminal::spawn_announcing(&sock, &session.id, label, true);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| {
+            row_on_screen(out, ROWS - 1).contains(label)
+        }),
+        "the first attach was never announced; the child wrote: {}",
+        term.since(0)
+    );
+    // Parked only once the terminal has answered the client's DA1, as in the
+    // tests of a kept client's screen.
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| find(out, DA1).is_some()),
+        "the client never asked its DA1; got: {}",
+        term.since(0)
+    );
+    term.pump_until(Duration::from_millis(300), |_| false);
+    // The row cleared, so that what is on it after the return is the return's.
+    nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
+        .expect("connect")
+        .command("echo ''")
+        .expect("echo");
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| {
+            !row_on_screen(out, ROWS - 1).contains(label)
+        }),
+        "the message row never cleared"
+    );
+
+    let after = away_and_back(&mut term, |_| {});
+    assert!(
+        term.pump_until(Duration::from_secs(10), |out| {
+            find(&out[after.min(out.len())..], b"\x1b[2J").is_some()
+                && row_on_screen(out, ROWS - 1).contains(label)
+        }),
+        "not announced after the return's repaint; last row {:?}; the child wrote: {}",
+        row_on_screen(&term.output, ROWS - 1),
+        term.since(after)
+    );
+    assert_eq!(detach(&mut term), Some(0), "the child did not detach");
 }

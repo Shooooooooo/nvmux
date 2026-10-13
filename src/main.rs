@@ -173,6 +173,10 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     // what it was keeping to report is no news to them, so the picker clears
     // it before it first reads it (see `nvmux::notes`).
     let mut looked_at: Option<String> = None;
+    // What tells the session in front, in its own editor, what the others
+    // have to report as it happens (see `nvmux::tell`). Handed each session's
+    // socket as the picker finds it, and each attached one's here.
+    let notifier = nvmux::tell::Notifier::start();
 
     loop {
         // `<prefix> c` moves this to the session it just created. A client held
@@ -191,6 +195,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             focus.as_deref(),
             attached.is_some() || focus.as_deref().is_some_and(|id| pool.holds(id)),
             seen.as_deref(),
+            &notifier,
         )? {
             ui::Outcome::Quit => {
                 // A client held across `<prefix> Space` is retired explicitly; its
@@ -345,6 +350,10 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             // `nvmux::notes::touch`).
             let sock = attachment.sock().to_path_buf();
             nvmux::notes::later(sock.clone(), nvmux::notes::touch);
+            // And told, from now until the relay ends, what the others have
+            // to say — by its name as it is now, a rename since included.
+            notifier.watch(&current.id, &current.name, sock.clone());
+            notifier.front(Some(&current.id));
 
             // The relay, with the chance to start the next client while this
             // session is still dissolving: `begin_next` fires on a `<prefix>`
@@ -392,6 +401,10 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 };
                 pty::relay(attachment, highest, &mut begin_next)?
             };
+            // Out of the session: whatever comes next — the picker, the help,
+            // the prompt, another session, or the shell — nobody is in front
+            // to be told until the next attach says who is.
+            notifier.front(None);
             // Whatever the session reported while it was in front was seen: it
             // is cleared on the way out — by the picker, if that is where the
             // user goes, before it reads it; otherwise on a thread, or, on the

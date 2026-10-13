@@ -207,8 +207,8 @@ pub enum Ui {
 #[serde(default, deny_unknown_fields)]
 pub struct ThemeSettings {
     /// What nvmux draws its own screens in: the picker, the prompt, the help
-    /// and the wait for a session, and over a session the notice a switch
-    /// puts up and the name an attach hands across.
+    /// and the wait for a session, and over a session the name an attach
+    /// hands across.
     ///
     /// `"terminal"`, the default, sets no colour at all, so the screens are in
     /// the terminal's own foreground on its own background, shaded with dim,
@@ -501,9 +501,10 @@ pub struct FadeSettings {
     pub enabled: bool,
     /// How long a dissolve takes, **both directions together**: a screen going
     /// out and the next one coming up divide this between them, half each (see
-    /// [`FadeSettings::one_way`]). So a switch pays it once for the screens,
-    /// and once more for the box that says where it landed, which dissolves in
-    /// and out around the second it is up (see [`crate::announce`]).
+    /// [`FadeSettings::one_way`]). So a switch pays it once, for the screens:
+    /// where it landed the editor says now (see [`crate::tell`]), and the box
+    /// that once said it, dissolving in and out around the second it was up,
+    /// is not drawn (see [`crate::announce`]).
     ///
     /// Both directions rather than one because a transition is the thing
     /// anybody watching is timing: what the number names is how long the screen
@@ -518,9 +519,9 @@ pub struct FadeSettings {
     /// own copy of its screen either way, so off saves the parse only with
     /// `per_session = false` too.
     ///
-    /// That parse is also what the attach notice dissolves into, so off, the
-    /// notice's box empties the cells it covers and waits for a repaint to
-    /// fill them (see [`crate::announce`]).
+    /// That parse is also what the hint bar puts back the row it covered from,
+    /// so off, the bar blanks the row and waits for a repaint to fill it (see
+    /// [`crate::hint`]).
     pub session: bool,
 }
 
@@ -795,8 +796,8 @@ where
 const MAX_TIMEOUT_MS: u64 = 60_000;
 
 /// Ceiling for `effects.fade.duration_ms`. Two seconds is already a transition nobody
-/// wants to sit through, and a switch sits through two of them — the screens
-/// and the notice; past it the value is a hang with a name.
+/// wants to sit through, and a switch sits through one at every change of
+/// session; past it the value is a hang with a name.
 const MAX_FADE_MS: u64 = 2_000;
 
 impl Settings {

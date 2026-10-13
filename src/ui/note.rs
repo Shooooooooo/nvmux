@@ -37,7 +37,18 @@ const FINISHED: char = '✓';
 /// without saying how far it has got, the gauge when it says, `∗` for a
 /// notification, `!` for a failure and `✓` for a command that has finished.
 pub fn sign(note: &Note, frame: usize) -> char {
-    match note.kind {
+    glyph(note.kind, frame)
+}
+
+/// The sign for a note of `kind`, as it stands still: the spinner's first
+/// frame for something busy. What the editor in front is told carries it
+/// (see [`crate::tell`]).
+pub fn mark(kind: Kind) -> char {
+    glyph(kind, 0)
+}
+
+fn glyph(kind: Kind, frame: usize) -> char {
+    match kind {
         Kind::Notified => NOTIFIED,
         Kind::Failed => FAILED,
         Kind::Finished => FINISHED,
@@ -65,38 +76,47 @@ pub fn gauge(percent: u8) -> char {
 ///
 /// Progress reads the way Neovim prints a progress message, title first.
 pub fn caption(note: &Note) -> String {
-    let what = match note.kind {
-        Kind::Notified => [note.title.as_str(), note.text.as_str()]
+    format!(
+        "{} · {}",
+        what(note.kind, &note.title, &note.text),
+        age(note.age_now())
+    )
+}
+
+/// What a note of `kind` says, without how long ago: the caption's first
+/// half, and what the editor in front is told (see [`crate::tell`]).
+pub fn what(kind: Kind, title: &str, text: &str) -> String {
+    match kind {
+        Kind::Notified => [title, text]
             .into_iter()
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join(" · "),
-        Kind::Failed => progress(note, None, "failed"),
-        Kind::Finished => progress(note, None, "finished"),
-        Kind::Busy(percent) => progress(note, percent, "busy"),
-    };
-    format!("{what} · {}", age(note.age_now()))
+        Kind::Failed => progress(title, text, None, "failed"),
+        Kind::Finished => progress(title, text, None, "finished"),
+        Kind::Busy(percent) => progress(title, text, percent, "busy"),
+    }
 }
 
 /// `title: 42% text`, with what is missing left out, and `otherwise` when
 /// there is nothing at all to say.
-fn progress(note: &Note, percent: Option<u8>, otherwise: &str) -> String {
+fn progress(title: &str, text: &str, percent: Option<u8>, otherwise: &str) -> String {
     let mut body: Vec<String> = Vec::new();
     if let Some(p) = percent {
         body.push(format!("{p}%"));
     }
-    if !note.text.is_empty() {
-        body.push(note.text.clone());
+    if !text.is_empty() {
+        body.push(text.to_string());
     }
     let body = if body.is_empty() {
         otherwise.to_string()
     } else {
         body.join(" ")
     };
-    if note.title.is_empty() {
+    if title.is_empty() {
         body
     } else {
-        format!("{}: {body}", note.title)
+        format!("{title}: {body}")
     }
 }
 
