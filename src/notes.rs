@@ -40,8 +40,7 @@
 //! does (see [`crate::client`]). The watcher stays when nvmux leaves, because
 //! recording while nobody is looking is what it is for. It sets no option,
 //! maps no key, opens no window and prints nothing, and what it runs on an
-//! event is a string match and a table write. `[picker] notes = "off"` takes
-//! it out of each session the picker lists ([`REMOVE`]).
+//! event is a string match and a table write.
 //!
 //! # Read, not waited on
 //!
@@ -60,16 +59,14 @@
 //! something is busy is not news but state, and is shown for as long as it
 //! lasts.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use rmpv::Value;
 
-use crate::config::Notes as Style;
 use crate::error::RpcError;
 use crate::rpc;
 
@@ -340,12 +337,6 @@ end
 return true
 "#;
 
-/// Take the watcher out: its autocommands, and the record.
-const REMOVE: &str = r#"pcall(vim.api.nvim_del_augroup_by_name, 'nvmux_notes')
-package.loaded['nvmux.notes'] = nil
-return true
-"#;
-
 /// What a note is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -435,13 +426,6 @@ pub fn touch(sock: &Path) {
 pub fn seen(sock: &Path) {
     if let Err(e) = unblocked(sock, SEEN) {
         tracing::debug!(error = %e, "notes: could not clear");
-    }
-}
-
-/// `[picker] notes = "off"`: the watcher taken out of the session.
-pub fn remove(sock: &Path) {
-    if let Err(e) = unblocked(sock, REMOVE) {
-        tracing::debug!(error = %e, "notes: could not take the watcher out");
     }
 }
 
@@ -574,19 +558,6 @@ fn seconds(v: Option<&Value>) -> Duration {
     Duration::from_secs(v.and_then(number).unwrap_or(0))
 }
 
-/// The sessions whose watcher this nvmux has taken out (`[picker] notes =
-/// "off"`), by id, so each costs one call a run rather than one a listing —
-/// and, remote, one ssh forward a run.
-fn removed() -> &'static Mutex<HashSet<String>> {
-    static REMOVED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    REMOVED.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-/// Whether the watcher still has to be taken out of session `id` this run.
-pub fn to_remove(id: &str) -> bool {
-    removed().lock().map(|r| !r.contains(id)).unwrap_or(true)
-}
-
 /// What the picker hands its sessions to.
 enum Command {
     /// Read this session, on this socket, from now on.
@@ -606,16 +577,14 @@ pub struct Poller {
 }
 
 impl Poller {
-    /// Start reading, the way `style` asks: with `"off"`, each session handed
-    /// over has the watcher taken out instead (once a run) and nothing comes
-    /// back. `seen` is the session the picker was opened from, which has just
-    /// been looked at: it is cleared before it is first read.
-    pub fn start(style: Style, seen: Option<String>) -> Self {
+    /// Start reading. `seen` is the session the picker was opened from, which
+    /// has just been looked at: it is cleared before it is first read.
+    pub fn start(seen: Option<String>) -> Self {
         let (commands, inbox) = mpsc::channel();
         let (outbox, updates) = mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("nvmux-notes".into())
-            .spawn(move || poll(style, seen, &inbox, &outbox));
+            .spawn(move || poll(seen, &inbox, &outbox));
         if let Err(e) = spawned {
             tracing::warn!(error = %e, "notes: no thread to read the sessions on");
         }
@@ -635,7 +604,6 @@ impl Poller {
 }
 
 fn poll(
-    style: Style,
     mut seen_first: Option<String>,
     inbox: &Receiver<Command>,
     outbox: &Sender<HashMap<String, Note>>,
@@ -650,14 +618,6 @@ fn poll(
         };
         match next {
             Ok(Command::Watch(id, sock)) => {
-                if style == Style::Off {
-                    if let Ok(mut done) = removed().lock() {
-                        if done.insert(id) {
-                            remove(&sock);
-                        }
-                    }
-                    continue;
-                }
                 if seen_first.as_deref() == Some(id.as_str()) {
                     seen(&sock);
                     seen_first = None;

@@ -39,9 +39,8 @@ use crate::error::ConfigError;
 use crate::palette::Rgb;
 
 /// The whole configuration. Each field is a table of its own, so the file reads
-/// as `[keys]`-style sections — `[picker]` for what the picker shows beside the
-/// names, `[theme]` for the colour nvmux's own screens are drawn in, and
-/// `[effects]` with a table inside it for each
+/// as `[keys]`-style sections — `[theme]` for the colour nvmux's own screens
+/// are drawn in, and `[effects]` with a table inside it for each
 /// effect: `[effects.fade]`, `[effects.move]`, `[effects.cursor]`,
 /// `[effects.attach]`, `[effects.kill]`,
 /// `[effects.filter]` and `[effects.create]` for nvmux's own screens, and
@@ -57,7 +56,6 @@ pub struct Settings {
     pub keys: KeySettings,
     pub session: SessionSettings,
     pub client: ClientSettings,
-    pub picker: PickerSettings,
     pub theme: ThemeSettings,
     pub effects: EffectsSettings,
 }
@@ -202,61 +200,6 @@ pub enum Ui {
     /// `nvmux --client`: nvmux's own, animated (see [`crate::client`]).
     #[default]
     Nvmux,
-}
-
-/// The picker's own: what it shows beside the names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PickerSettings {
-    /// What a session has to report, beside its name (see [`crate::notes`]):
-    /// that something in it is busy — a progress message is running, the way
-    /// a plugin says an agent is working, or a language server is at work —
-    /// or has failed — a progress message, or a command in one of its
-    /// terminal buffers — and the desktop notifications the programs there
-    /// send, an agent asking for permission among them.
-    ///
-    /// `"signs"`, the default, puts one dim sign in a column left of the
-    /// list — a spinner while busy, a gauge where the progress says how far
-    /// it is, `∗` for a notification, `!` for a failure — and the selected
-    /// session's note in full under the list. `"column"` puts each note in
-    /// the row itself, after the name: the list widens to fit them, so the
-    /// names move over when the first one comes. `"off"` shows none.
-    ///
-    /// What it costs, and so the reason to turn it off: to know, nvmux leaves
-    /// a watcher in each session it lists or opens — one augroup,
-    /// `nvmux_notes`, of four autocommands — and the watcher stays when nvmux
-    /// leaves, recording, so that a session that wanted you overnight says so
-    /// in the morning. Nothing else in the session changes. `"off"` takes it
-    /// out of each session the picker next lists. While the picker is up it
-    /// reads every session every two seconds, a round trip each — over the
-    /// link, for a remote one, which is given an ssh forward of its own for
-    /// it.
-    pub notes: Notes,
-}
-
-/// `[picker] notes`: how a session's note is shown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Notes {
-    /// A sign left of the row, and the selected session's note under the
-    /// list.
-    #[default]
-    Signs,
-    /// The note in the row, after the name.
-    Column,
-    /// None, and no watcher in any session.
-    Off,
-}
-
-impl Notes {
-    /// The value as the file spells it.
-    pub fn name(self) -> &'static str {
-        match self {
-            Notes::Signs => "signs",
-            Notes::Column => "column",
-            Notes::Off => "off",
-        }
-    }
 }
 
 /// The colour nvmux's own screens are drawn in (see [`crate::theme`]).
@@ -1023,7 +966,6 @@ fn render_default_config(prefix: u8) -> String {
     let k = KeySettings::default();
     let s = SessionSettings::default();
     let c = ClientSettings::default();
-    let p = PickerSettings::default();
     let t = ThemeSettings::default();
     let e = EffectsSettings::default();
     let f = e.fade;
@@ -1050,9 +992,6 @@ fn render_default_config(prefix: u8) -> String {
          # per_session = {per_session:<7}   # keep each session's client; a switch back reuses it\n\
          # lazy        = {lazy:<7}   # start a client on its first visit, not at launch\n\
          # predict     = {predict:<7}   # over a slow link, scrolls show before Neovim answers\n\
-         \n\
-         [picker]\n\
-         # notes = {notes}   # what a session reports: \"signs\", \"column\" or \"off\"\n\
          \n\
          [theme]\n\
          # color = {theme_color}   # or \"#rrggbb\": nvmux's text and bars in that colour\n\
@@ -1106,7 +1045,6 @@ fn render_default_config(prefix: u8) -> String {
         per_session = c.per_session,
         lazy = c.lazy,
         predict = c.predict,
-        notes = quoted(p.notes.name()),
         theme_color = quoted(&t.color.name()),
         fade_enabled = f.enabled,
         fade_duration = f.duration_ms,
@@ -1217,7 +1155,6 @@ mod tests {
             "[keys]",
             "[session]",
             "[client]",
-            "[picker]",
             "[theme]",
             "[effects]",
             "[effects.smear]",
@@ -1243,8 +1180,6 @@ mod tests {
             per_session = true\n\
             lazy = true\n\
             predict = true\n\
-            [picker]\n\
-            notes = \"signs\"\n\
             [theme]\n\
             color = \"terminal\"\n\
             [effects]\n\
@@ -1436,24 +1371,6 @@ mod tests {
         assert!(s.client.per_session && s.client.lazy, "the rest as it was");
     }
 
-    /// Signs unless told otherwise; the column and off are a line away, and
-    /// each is spelt the way the file spells it.
-    #[test]
-    fn a_sessions_note_is_a_sign_unless_told() {
-        assert_eq!(Settings::default().picker.notes, Notes::Signs);
-        for (spelt, notes) in [
-            ("signs", Notes::Signs),
-            ("column", Notes::Column),
-            ("off", Notes::Off),
-        ] {
-            let s: Settings =
-                toml::from_str(&format!("[picker]\nnotes = \"{spelt}\"\n")).expect("valid");
-            assert_eq!(s.picker.notes, notes);
-            assert_eq!(notes.name(), spelt);
-            assert_eq!(s.client, ClientSettings::default(), "the rest as it was");
-        }
-    }
-
     /// The terminal's own colours unless told otherwise; a colour is a line
     /// away, in either of the two spellings a person writes one in, and is
     /// spelt back the long way.
@@ -1476,7 +1393,6 @@ mod tests {
                 Ok(s.theme.color),
                 "{spelt} round trips"
             );
-            assert_eq!(s.picker, PickerSettings::default(), "the rest as it was");
             assert_eq!(s.effects, EffectsSettings::default(), "the rest as it was");
         }
         let s: Settings = toml::from_str("[theme]\ncolor = \"terminal\"\n").expect("valid");
@@ -1568,11 +1484,6 @@ mod tests {
             ("an unknown session key", "[session]\ncmd = \"nvim\"\n"),
             ("an unknown fade key", "[effects.fade]\nduration = 40\n"),
             ("an unknown client key", "[client]\nkeep = true\n"),
-            ("an unknown picker key", "[picker]\nnote = \"off\"\n"),
-            (
-                "an unparseable notes value",
-                "[picker]\nnotes = \"bubbles\"\n",
-            ),
             ("an unknown theme key", "[theme]\ncolour = \"#7aa2f7\"\n"),
             ("a colour by name", "[theme]\ncolor = \"blue\"\n"),
             ("a colour with no #", "[theme]\ncolor = \"7aa2f7\"\n"),
@@ -1797,7 +1708,6 @@ mod tests {
             "# lazy        = true",
             "# ui          = \"nvmux\"",
             "# predict     = true",
-            "# notes = \"signs\"",
             "# color = \"terminal\"",
             "# enabled     = true",
             "# duration_ms = 200",

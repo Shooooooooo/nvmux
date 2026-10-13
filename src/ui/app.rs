@@ -18,7 +18,6 @@ use super::landing::Landing;
 use super::note;
 use super::starfield::{self, Starfield};
 use super::swap::Swap;
-use crate::config::Notes as NoteStyle;
 use crate::notes::Note;
 use crate::session::Session;
 
@@ -150,9 +149,6 @@ pub struct App {
     /// That gap, from `c` until the prompt is back down. See
     /// [`App::make_room`].
     room: Option<Room>,
-    /// How a session's note is shown: `[picker] notes`, read once when the
-    /// picker opens, like the effects. See [`super::note`].
-    note_style: NoteStyle,
     /// What each session last said it had to report, by id (see
     /// [`crate::notes`]): replaced whole by each round of reads, which is the
     /// truth about them all.
@@ -291,7 +287,6 @@ impl App {
             backspace: None,
             create: crate::config::get().effects.create_enabled(),
             room: None,
-            note_style: crate::config::get().picker.notes,
             notes: HashMap::new(),
             spin: Duration::ZERO,
         }
@@ -304,28 +299,13 @@ impl App {
         self.notes = notes;
     }
 
-    /// How a session's note is shown: `[picker] notes`.
-    pub fn note_style(&self) -> NoteStyle {
-        self.note_style
-    }
-
-    /// For the renderer's tests, which draw each way without a config.
-    #[cfg(test)]
-    pub(super) fn set_note_style(&mut self, style: NoteStyle) {
-        self.note_style = style;
-    }
-
-    /// The note session `id` has to show, if it has one and notes are shown
-    /// at all.
+    /// The note session `id` has to show, if it has one.
     pub fn note(&self, id: &str) -> Option<&Note> {
-        if self.note_style == NoteStyle::Off {
-            return None;
-        }
         self.notes.get(id)
     }
 
-    /// Which frame of the spinner is up, round and round: [`note::sign`] and
-    /// [`note::column`] take it modulo their frames.
+    /// Which frame of the spinner is up, round and round: [`note::sign`]
+    /// takes it modulo its frames.
     pub fn spin_frame(&self) -> usize {
         (self.spin.as_millis() / note::SPIN.as_millis()) as usize
     }

@@ -124,7 +124,6 @@ use ratatui::crossterm::event::{
     MouseEventKind,
 };
 
-use crate::config::Notes as NoteStyle;
 use crate::error::Result;
 use crate::handoff::HandOff;
 use crate::session::Session;
@@ -390,16 +389,15 @@ fn run_loop(
     let mut app = App::new(transport.list_sessions()?);
     // What each session has to report: read on a thread of its own (see
     // `crate::notes::Poller`), each session handed to it once the loop has
-    // its socket, and what they said taken up on every pass. With `[picker]
-    // notes = "off"` the same thread takes the watcher out of them instead.
-    let poller = crate::notes::Poller::start(app.note_style(), seen.map(str::to_string));
+    // its socket, and what they said taken up on every pass.
+    let poller = crate::notes::Poller::start(seen.map(str::to_string));
     let mut handed: HashSet<String> = HashSet::new();
     let mut unread: VecDeque<Session> = VecDeque::new();
     // Until the reader first says what the sessions have to report, the loop
     // waits a frame rather than a tick, so the notes come up with the picker
     // rather than a quarter of a second after it — no longer than a round of
-    // reads can take, and not at all with the notes off, when it never says.
-    let mut heard = app.note_style() == NoteStyle::Off;
+    // reads can take.
+    let mut heard = false;
     let opened = Instant::now();
     if let Some(id) = focused {
         app.select_session(id);
@@ -449,7 +447,7 @@ fn run_loop(
                 unread.push_back(s.clone());
             }
         }
-        hand_over(transport, &poller, &mut unread, app.note_style());
+        hand_over(transport, &poller, &mut unread);
         if let Some(notes) = poller.take() {
             app.set_notes(notes);
             heard = true;
@@ -689,21 +687,13 @@ fn tick(app: &mut App, ticked: &mut Instant) {
 /// long as [`HAND_OVER`] allows, and at least one: locally that is all of
 /// them, and over ssh as many as can be given a forward in the time (see
 /// [`Transport::local_socket_for`], which makes one where there is none).
-///
-/// With `[picker] notes = "off"`, only the sessions the watcher has not been
-/// taken out of this run, so a remote session is given a forward for it once,
-/// not every time the picker comes up.
 fn hand_over(
     transport: &dyn Transport,
     poller: &crate::notes::Poller,
     unread: &mut VecDeque<Session>,
-    style: NoteStyle,
 ) {
     let started = Instant::now();
     while let Some(s) = unread.pop_front() {
-        if style == NoteStyle::Off && !crate::notes::to_remove(&s.id) {
-            continue;
-        }
         match transport.local_socket_for(&s) {
             Ok(sock) => poller.watch(&s.id, sock),
             Err(e) => tracing::debug!(id = %s.id, error = %e, "notes: no socket to read"),
