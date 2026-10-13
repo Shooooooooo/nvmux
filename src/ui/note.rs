@@ -8,8 +8,9 @@
 //! the back mark are (see [`super::draw`]): a terminal that draws a glyph two
 //! wide where `unicode-width` says one shifts the rest of the row. The
 //! spinner and the gauge are braille, as the attaching screen's spinner and
-//! the picker's trails are. `∗` is the asterisk operator, U+2217, which is
-//! neither emoji nor of ambiguous width; `!` is plain ASCII.
+//! the picker's trails are. `∗` is the asterisk operator, U+2217, and `✓` the
+//! check mark, U+2713, neither of which is emoji or of ambiguous width (the
+//! heavy check mark, U+2714, is emoji); `!` is plain ASCII.
 
 use std::time::Duration;
 
@@ -29,13 +30,17 @@ const NOTIFIED: char = '∗';
 /// The sign for a failure.
 const FAILED: char = '!';
 
+/// The sign for a command that has finished.
+const FINISHED: char = '✓';
+
 /// The sign beside a session's row: the spinner's `frame` while it is busy
 /// without saying how far it has got, the gauge when it says, `∗` for a
-/// notification and `!` for a failure.
+/// notification, `!` for a failure and `✓` for a command that has finished.
 pub fn sign(note: &Note, frame: usize) -> char {
     match note.kind {
         Kind::Notified => NOTIFIED,
         Kind::Failed => FAILED,
+        Kind::Finished => FINISHED,
         Kind::Busy(Some(percent)) => gauge(percent),
         Kind::Busy(None) => GLYPHS[frame % GLYPHS.len()],
     }
@@ -67,6 +72,7 @@ pub fn caption(note: &Note) -> String {
             .collect::<Vec<_>>()
             .join(" · "),
         Kind::Failed => progress(note, None, "failed"),
+        Kind::Finished => progress(note, None, "finished"),
         Kind::Busy(percent) => progress(note, percent, "busy"),
     };
     format!("{what} · {}", age(note.age_now()))
@@ -125,6 +131,7 @@ mod tests {
     fn each_kind_has_its_sign() {
         assert_eq!(sign(&note(Kind::Notified, "", "x", 0), 0), '∗');
         assert_eq!(sign(&note(Kind::Failed, "", "x", 0), 0), '!');
+        assert_eq!(sign(&note(Kind::Finished, "", "x", 0), 0), '✓');
         assert_eq!(sign(&note(Kind::Busy(Some(42)), "", "", 0), 0), '⡆');
         let busy = note(Kind::Busy(None), "", "", 0);
         assert_eq!(sign(&busy, 0), '⠋');
@@ -141,7 +148,7 @@ mod tests {
         let signs = GLYPHS
             .iter()
             .chain(GAUGE.iter())
-            .chain([NOTIFIED, FAILED].iter());
+            .chain([NOTIFIED, FAILED, FINISHED].iter());
         for c in signs {
             assert_eq!(c.width(), Some(1), "{c:?}");
             assert_eq!(c.width_cjk(), Some(1), "{c:?} is wide on a CJK terminal");
@@ -190,5 +197,15 @@ mod tests {
             "claude: exited with code 1 · 1d"
         );
         assert_eq!(caption(&note(Kind::Failed, "", "", 0)), "failed · 0s");
+        assert_eq!(
+            caption(&note(
+                Kind::Finished,
+                "cargo test",
+                "exited with code 0",
+                45
+            )),
+            "cargo test: exited with code 0 · 45s"
+        );
+        assert_eq!(caption(&note(Kind::Finished, "", "", 0)), "finished · 0s");
     }
 }

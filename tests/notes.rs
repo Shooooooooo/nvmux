@@ -315,7 +315,7 @@ N.version = -1",
 /// A command in a terminal buffer that fails is kept like a failed progress
 /// message: one its shell says has (OSC 133, the way fish says it, naming the
 /// command line as it starts), and a job that exits with a code other than 0.
-/// One that succeeds is nothing.
+/// One that succeeds is no failure.
 #[test]
 fn a_command_that_fails_in_a_terminal_is_kept() {
     require_nvim!();
@@ -366,12 +366,119 @@ fn a_command_that_fails_in_a_terminal_is_kept() {
         (exited.title.as_str(), exited.text.as_str()),
         ("sh", "exited with code 3")
     );
+}
+
+/// A command in a terminal buffer that succeeds has finished, and is kept as
+/// a failure is, until it is seen — but apart from a notification or a
+/// failure, so it never takes the place of one: one its shell says has (OSC
+/// 133, the way fish says it), once the shell has said it started, and a job
+/// that exits with 0. A terminal a plugin draws into itself closes with 0
+/// too, with nothing run in it, and one whose buffer is deleted while its
+/// program runs closes with -1: neither has finished.
+#[test]
+fn a_command_that_finishes_in_a_terminal_is_kept() {
+    require_nvim!();
+    let scratch = Scratch::new("notes-finished");
+    let (_, sock) = a_session(&scratch, "testing");
+    assert_eq!(notes::read(&sock), Reading::Said(None));
+
+    in_a_terminal(
+        &sock,
+        r"\033]133;C;cmdline_url=cargo%%20test\033\134\033]133;D;0\033\134",
+    );
+    let named = read_until(&sock, |n| n.is_some()).expect("the finish");
+    assert_eq!(named.kind, Kind::Finished);
+    assert_eq!(
+        (named.title.as_str(), named.text.as_str()),
+        ("cargo test", "exited with code 0")
+    );
+
+    // A shell that does not name the command line: the terminal's program.
+    notes::seen(&sock);
+    in_a_terminal(&sock, r"\033]133;C\033\134\033]133;D;0\033\134");
+    let unnamed = read_until(&sock, |n| n.is_some()).expect("the unnamed finish");
+    assert_eq!(
+        (unnamed.title.as_str(), unnamed.text.as_str()),
+        ("sh", "a command exited with code 0")
+    );
+
+    // A shell's word that the last command went well, at a prompt where none
+    // started — its first, or one after an empty line — is no finish.
+    notes::seen(&sock);
+    in_a_terminal(
+        &sock,
+        r"\033]133;C;cmdline_url=ls\033\134\033]133;D;0\033\134\033]133;D;0\033\134",
+    );
+    read_until(&sock, |n| n.is_some()).expect("the command before it");
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        read_until(&sock, |n| n.is_some()).map(|n| n.title),
+        Some("ls".to_string()),
+        "a prompt where no command started"
+    );
+
     notes::seen(&sock);
     a_job_that_exits(&sock, "exit 0");
+    let finished = read_until(&sock, |n| n.is_some()).expect("the finish");
+    assert_eq!(finished.kind, Kind::Finished);
+    assert_eq!(
+        (finished.title.as_str(), finished.text.as_str()),
+        ("sh", "exited with code 0")
+    );
+
+    // A notification comes before it, and another finish after that leaves
+    // the notification where it is.
+    in_a_terminal(
+        &sock,
+        r"\033]777;notify;Claude Code;Claude needs your permission\007",
+    );
+    read_until(&sock, |n| n.is_some_and(|n| n.kind == Kind::Notified)).expect("the notification");
+    a_job_that_exits(&sock, "exit 0");
+    assert_eq!(
+        read_until(&sock, |n| n.is_some()).map(|n| n.kind),
+        Some(Kind::Notified),
+        "a finish never takes the place of a notification"
+    );
+    notes::seen(&sock);
+    assert_eq!(notes::read(&sock), Reading::Said(None), "seen, both go");
+
+    lua(
+        &sock,
+        r"local closed = false
+local buf = vim.api.nvim_create_buf(true, false)
+vim.api.nvim_create_autocmd('TermClose', {
+  buffer = buf,
+  once = true,
+  callback = function()
+    closed = true
+  end,
+})
+local chan = vim.api.nvim_open_term(buf, {})
+vim.api.nvim_chan_send(chan, 'drawn by a plugin')
+vim.fn.chanclose(chan)
+vim.wait(5000, function()
+  return closed
+end)",
+    );
     assert_eq!(
         notes::read(&sock),
         Reading::Said(None),
-        "a job that exits with 0 is no failure"
+        "a terminal drawn into, not run in"
+    );
+
+    lua(
+        &sock,
+        r"local buf = vim.api.nvim_create_buf(true, false)
+vim.api.nvim_buf_call(buf, function()
+  vim.fn.jobstart({ 'sh', '-c', 'sleep 30' }, { term = true })
+end)
+vim.api.nvim_buf_delete(buf, { force = true })",
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        notes::read(&sock),
+        Reading::Said(None),
+        "a terminal whose buffer went while its program ran"
     );
 }
 
