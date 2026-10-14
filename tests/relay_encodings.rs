@@ -750,6 +750,15 @@ fn the_hint_row_goes_up_and_comes_down(tag: &str, shadow: bool) {
         .create_session(&common::unique(tag), &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket path");
+    // No 'showcmd': the literal prefix below reaches Neovim, which shows the
+    // key it was given there — `<20>`, for the space in Ctrl-Space — on the
+    // very row this reads, until the key is done with. Whether that frame is
+    // read before the bar is down or after is the runner's timing, not the
+    // relay's.
+    nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
+        .expect("connect")
+        .command("set noshowcmd")
+        .expect("noshowcmd");
 
     let mut term = Terminal::spawn_with(&sock, &session.id, Protocol::Kitty, shadow);
 
