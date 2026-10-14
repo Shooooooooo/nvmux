@@ -21,9 +21,11 @@
 //! ╰────────────────────────────────────────────╯
 //! ```
 //!
-//! the sign and the session in the border, in `[theme] color` or the editor's
-//! text colour, its age counting on beside them, what happened in the editor's
-//! text colour, and the key that acts on it dim. The key is on one card only:
+//! the border dim; on it, the sign and the session, in `[theme] color` or the
+//! editor's text colour, and its age counting on beside them, dim; what
+//! happened in the editor's text colour; and the key that acts on it dim. A
+//! theme colour leaves the border dim, as nvmux's own screens leave what is
+//! dim on them. The key is on one card only:
 //! the newest that goes somewhere, which is the one it acts on (see
 //! [`crate::card::Desk::go`]); those below it go without, a row shorter, and
 //! the next has it once that one is acted on. One that says where a switch
@@ -270,8 +272,13 @@ impl Pens {
             bg: back,
             ..Style::default()
         };
+        let dim = Style {
+            fg: Color::Rgb(mix(DIM, fg, bg)),
+            ..plain
+        };
         Self {
-            border: plain,
+            // Dim, as the age and the key are: the frame is not what it says.
+            border: dim,
             title: Style {
                 bold: true,
                 ..plain
@@ -280,10 +287,7 @@ impl Pens {
                 fg: Color::Rgb(fg),
                 ..plain
             },
-            dim: Style {
-                fg: Color::Rgb(mix(DIM, fg, bg)),
-                ..plain
-            },
+            dim,
             bg,
         }
     }
@@ -303,7 +307,9 @@ impl Pens {
 /// `card`'s rows, each `width` cells or narrower for an arrival, which is as
 /// wide as its name; with the key that acts on it only where `keyed`.
 fn render(card: &Card, age: Option<u64>, widest: usize, pens: &Pens, keyed: bool) -> Vec<Vec<Out>> {
-    let border = Pens::inked(pens.border, card);
+    // Under a theme colour too, as what is dim on nvmux's own screens stays
+    // dim there: the colour is the sign's and the session's.
+    let border = pens.border;
     let title = Pens::inked(pens.title, card);
     if card.kind == Kind::Arrival {
         let waiting = card.body.as_deref().map(|b| format!("  {b}"));
@@ -758,6 +764,44 @@ mod tests {
             style.fg,
             Color::Rgb(mix(50, c.term.fg, c.term.bg)),
             "half way up"
+        );
+    }
+
+    /// The border is dim, as the age and the key are, and stays dim under a
+    /// theme colour, which goes to the sign and the session on it instead.
+    #[test]
+    fn the_border_is_dim_and_the_name_on_it_is_not() {
+        let now = Instant::now();
+        let c = colors();
+        let dim = Color::Rgb(mix(DIM, c.term.fg, c.term.bg));
+        let at = |cards: &Cards, r: usize, col: usize| {
+            let mut f = frame(100, 30);
+            cards.paint(&mut f, Style::default(), &c, now);
+            let cell = f.get(r, col).expect("a cell");
+            (cell.style.fg, cell.style.bold)
+        };
+
+        let mut cards = Cards::default();
+        cards.apply(Command::Show(news(1)), now);
+        for (r, col) in [(1, 53), (1, 54), (1, 98), (2, 53), (2, 98), (4, 60)] {
+            assert_eq!(at(&cards, r, col).0, dim, "the border at {r},{col}");
+        }
+        let (fg, bold) = at(&cards, 1, 58);
+        assert!(bold && fg != dim, "the session's name is not dim: {fg:?}");
+
+        let ink = (0x7a, 0xa2, 0xf7);
+        cards.apply(
+            Command::Show(Card {
+                ink: Some(ink),
+                ..news(2)
+            }),
+            now,
+        );
+        assert_eq!(at(&cards, 1, 53).0, dim, "a theme colour leaves it dim");
+        assert_eq!(
+            at(&cards, 1, 58).0,
+            Color::Rgb(Rgb(ink.0, ink.1, ink.2)),
+            "and is the name's"
         );
     }
 
