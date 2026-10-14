@@ -460,6 +460,11 @@ hl('Special', { fg = c.cyan })
 hl('Delimiter', { fg = c.dim })
 hl('Title', { fg = c.blue, bold = true })
 hl('Todo', { fg = c.yellow, bold = true })
+-- What nvmux's notes colour their signs by: a finished command, a
+-- notification, a failure.
+hl('OkMsg', { fg = c.green })
+hl('WarningMsg', { fg = c.yellow })
+hl('ErrorMsg', { fg = c.red })
 hl('@variable', { fg = c.fg })
 """
 
