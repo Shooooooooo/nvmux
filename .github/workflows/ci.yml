@@ -14,12 +14,23 @@ env:
 
 jobs:
   test:
-    name: test (${{ matrix.os }})
+    # The newest Neovim's jobs keep their plain names, which are what branch
+    # protection knows them by.
+    name: test (${{ matrix.os }}${{ matrix.nvim != 'latest' && format(', nvim {0}', matrix.nvim) || '' }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        nvim: [latest]
+        # And the oldest Neovim nvmux supports, so that what src/nvim.rs's
+        # MIN_VERSION and the README promise is what is run: the newest patch
+        # of that release, from its tarball. On Linux only: what changes from
+        # one Neovim release to the next is what it sends a client, and that
+        # is the same on every platform.
+        include:
+          - os: ubuntu-latest
+            nvim: v0.11.7
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -27,15 +38,39 @@ jobs:
           components: rustfmt, clippy
       - name: Install Neovim (Linux)
         if: runner.os == 'Linux'
+        env:
+          NVIM: ${{ matrix.nvim }}
         run: |
+          case "$NVIM" in
+            latest) release=latest/download ;;
+            *) release="download/$NVIM" ;;
+          esac
           curl -fsSL -o nvim.tar.gz \
-            https://github.com/neovim/neovim/releases/latest/download/nvim-linux-x86_64.tar.gz
+            "https://github.com/neovim/neovim/releases/$release/nvim-linux-x86_64.tar.gz"
           sudo tar -C /opt -xzf nvim.tar.gz
           echo /opt/nvim-linux-x86_64/bin >> "$GITHUB_PATH"
       - name: Install Neovim (macOS)
         if: runner.os == 'macOS'
         run: brew install neovim
       - run: nvim --version | head -1
+      # A pinned Neovim is there to be the oldest nvmux supports. Moving the
+      # minimum in src/nvim.rs without moving this, or the other way round,
+      # fails here rather than leaving CI to test a release nobody promised.
+      - name: Check the pinned Neovim is nvmux's minimum
+        if: matrix.nvim != 'latest'
+        env:
+          NVIM: ${{ matrix.nvim }}
+        run: |
+          min=$(sed -n 's/^pub const MIN_VERSION: &str = "\(.*\)";$/\1/p' src/nvim.rs)
+          case "$NVIM" in
+            "v$min".*) ;;
+            *)
+              echo "::error::CI pins Neovim $NVIM, but src/nvim.rs says the minimum is ${min:-unreadable}"
+              exit 1
+              ;;
+          esac
+          nvim --version | head -1 | grep -qxF "NVIM $NVIM" \
+            || { echo "::error::asked for Neovim $NVIM, got $(nvim --version | head -1)"; exit 1; }
       # The remote command is parsed by the user's login shell first, and the
       # test that runs it under each shell skips any it cannot find. fish and
       # tcsh are the ones that do not speak POSIX sh, and zsh is macOS's
@@ -45,9 +80,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y fish tcsh zsh
       # rustfmt's output does not vary by platform; clippy's findings do
       # (see the cfg-divergent waitid in src/pty.rs), so that stays on both.
+      # Neither varies by Neovim, so the oldest's job leaves them out.
       - run: cargo fmt --check
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.nvim == 'latest'
       - run: cargo clippy --all-targets -- -D warnings
+        if: matrix.nvim == 'latest'
       - run: cargo test
 
   msrv:
