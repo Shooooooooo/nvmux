@@ -23,7 +23,10 @@
 //!
 //! the sign and the session in the border, in `[theme] color` or the editor's
 //! text colour, its age counting on beside them, what happened in the editor's
-//! text colour, and the key that acts on it dim. One that says where a switch
+//! text colour, and the key that acts on it dim. The key is on one card only:
+//! the newest that goes somewhere, which is the one it acts on (see
+//! [`crate::card::Desk::go`]); those below it go without, a row shorter, and
+//! the next has it once that one is acted on. One that says where a switch
 //! landed is the session's name and nothing else — and that the session is
 //! waiting for a key, where it is.
 //!
@@ -212,13 +215,19 @@ impl Cards {
         let pens = Pens::new(base, colors);
         let widest = WIDTH.min(frame.width - MARGIN - 1);
         let bottom = frame.height - BOTTOM;
+        // The one card the key is drawn on: the newest that names it and has
+        // not been acted on, which is the one it acts on.
+        let keyed = self
+            .live
+            .iter()
+            .position(|l| l.card.footer.is_some() && l.dropped_at.is_none());
         let mut top = TOP;
-        for l in &self.live {
+        for (i, l) in self.live.iter().enumerate() {
             let strength = l.strength(now);
             if strength <= 0.0 {
                 continue;
             }
-            let rows = render(&l.card, l.age(now), widest, &pens);
+            let rows = render(&l.card, l.age(now), widest, &pens, keyed == Some(i));
             if top + rows.len() > bottom {
                 break;
             }
@@ -292,8 +301,8 @@ impl Pens {
 }
 
 /// `card`'s rows, each `width` cells or narrower for an arrival, which is as
-/// wide as its name.
-fn render(card: &Card, age: Option<u64>, widest: usize, pens: &Pens) -> Vec<Vec<Out>> {
+/// wide as its name; with the key that acts on it only where `keyed`.
+fn render(card: &Card, age: Option<u64>, widest: usize, pens: &Pens, keyed: bool) -> Vec<Vec<Out>> {
     let border = Pens::inked(pens.border, card);
     let title = Pens::inked(pens.title, card);
     if card.kind == Kind::Arrival {
@@ -340,7 +349,8 @@ fn render(card: &Card, age: Option<u64>, widest: usize, pens: &Pens) -> Vec<Vec<
     top.text("─╮", border);
 
     let mut rows = vec![top.cells];
-    for (line, pen) in [(&card.body, pens.text), (&card.footer, pens.dim)] {
+    let footer = card.footer.as_ref().filter(|_| keyed);
+    for (line, pen) in [(card.body.as_ref(), pens.text), (footer, pens.dim)] {
         if let Some(line) = line {
             let mut row = Row::new(width);
             row.text("│ ", border);
@@ -582,6 +592,49 @@ mod tests {
         );
         assert_eq!(screen[10], "x".repeat(80));
         assert_eq!(screen[11], "x".repeat(80));
+    }
+
+    /// The key is on one card only: the newest that names it, past a newer
+    /// one that goes nowhere — the card `<prefix> Enter` acts on. Those below
+    /// go without it, a row shorter; and once it is acted on, it goes without
+    /// too as it fades, and the next card has the key.
+    #[test]
+    fn only_the_card_the_key_acts_on_names_it() {
+        let now = Instant::now();
+        let mut cards = Cards::default();
+        for id in 1..=3 {
+            let mut card = news(id);
+            card.title = format!("s{id}");
+            card.fade_ms = 100;
+            cards.apply(Command::Show(card), now);
+        }
+        let mut nowhere = news(4);
+        nowhere.title = "here".into();
+        nowhere.footer = None;
+        cards.apply(Command::Show(nowhere), now);
+        let keyed = |screen: &[String]| -> Vec<usize> {
+            (0..screen.len())
+                .filter(|&r| screen[r].contains("go there"))
+                .collect()
+        };
+
+        let up = now + Duration::from_millis(200);
+        let screen = painted(&cards, 100, 30, up);
+        assert!(screen[1].contains("✓ here "), "{screen:#?}");
+        assert!(screen[4].contains("✓ s3 "), "{screen:#?}");
+        assert!(screen[8].contains("✓ s2 "), "{screen:#?}");
+        assert!(screen[11].contains("✓ s1 "), "{screen:#?}");
+        assert_eq!(keyed(&screen), [6], "{screen:#?}");
+        assert_eq!(
+            screen[6],
+            format!("{}│ {:<42} │x", "x".repeat(53), "Ctrl-Space ⏎ go there")
+        );
+
+        assert!(cards.apply(Command::Drop { id: 3 }, up));
+        let screen = painted(&cards, 100, 30, up + Duration::from_millis(25));
+        assert!(screen[4].contains("✓ s3 "), "still fading: {screen:#?}");
+        assert!(screen[7].contains("✓ s2 "), "{screen:#?}");
+        assert_eq!(keyed(&screen), [9], "{screen:#?}");
     }
 
     /// Where a switch landed: the name, boxed, as wide as it is; and that the

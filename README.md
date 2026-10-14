@@ -144,7 +144,8 @@ happen, as cards in that same corner, the newest on top:
 ╰────────────────────────────────────────────╯
 ```
 
-`<prefix> Enter` takes you to the session the newest one is about. Of the
+`<prefix> Enter` takes you to the session the newest one is about, the only
+card that names the key: the ones below it go without. Of the
 session you are in, you are told only what a terminal that is not on the
 screen says — as `here`, with the tab page it is in — and `<prefix> Enter`
 shows it. nvmux draws the cards itself, on this side of any link to the

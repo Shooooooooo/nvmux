@@ -110,7 +110,9 @@ pub struct Card {
     /// What happened, for news; for an arrival, whether the session is waiting
     /// for a key, which nothing else on the screen would say.
     pub body: Option<String>,
-    /// The key that acts on the card and what it does, or nothing.
+    /// The key that acts on the card and what it does, or nothing for one that
+    /// goes nowhere. The client draws it on the newest card up that has one,
+    /// which is the one the key acts on ([`Desk::go`]), and on no other.
     pub footer: Option<String>,
     /// How old the news was when the card was sent, in seconds; the client
     /// counts on from there. `None` for an arrival.
