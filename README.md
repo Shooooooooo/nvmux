@@ -156,21 +156,17 @@ nvmux.
 
 ### What a session has to say
 
-Beside each name, the picker shows a sign for what that session has to report:
+The picker shows a sign beside each session that has something to report:
 
 | Sign | Means |
 |---|---|
-| `⠹` | busy: an agent at work, through a plugin such as [agent.nvim](https://github.com/Shooooooooo/agent.nvim), or a language server indexing; `⡆` fills up as it says how far along it is |
-| `∗` | a program in a terminal buffer sent a notification — an agent wanting your permission, say |
-| `!` | something failed: a command in a terminal buffer, or a plugin's task |
+| `⠹` | busy: a plugin or a language server is working |
+| `∗` | a program in a terminal buffer sent a notification |
+| `!` | something failed — a command in a terminal buffer, say |
 | `✓` | a command in a terminal buffer succeeded |
 
-The selected session's note is spelt out under the list. A `∗`, `!` or `✓`
-stays until you next open that session, even one from overnight with nvmux
-closed.
-
-While you are in a session, the others' news comes up as cards in the top
-right corner, the newest on top:
+While you are in a session, the others' news comes up as cards in the corner,
+and `<prefix> Enter` goes to the newest:
 
 ```
 ╭─ ✓ api-server ──────────────────────── 3s ─╮
@@ -179,16 +175,11 @@ right corner, the newest on top:
 ╰────────────────────────────────────────────╯
 ```
 
-`<prefix> Enter` goes to the session on the newest card. A terminal of your own
-session that is off the screen reports too, as `here`, and `<prefix> Enter`
-shows it. The cards are drawn by nvmux's own client, so with `ui = "nvim"` there
-are none.
+Cards need nvmux's own client; with `ui = "nvim"` there are none.
 
-> [!NOTE]
-> A command typed at a shell prompt counts only if the shell reports how it
-> went, as fish 4 does. And Claude Code sends notifications only to terminals
-> it recognises: in a session on a remote host, or under Windows Terminal or
-> WezTerm, set its Notifications setting (`/config`) to "Ghostty (OSC 777)".
+> [!TIP]
+> On a remote host, set Claude Code's Notifications setting (`/config`) to
+> "Ghostty (OSC 777)", or it sends none.
 
 ## Configuration
 
