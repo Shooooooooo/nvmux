@@ -187,17 +187,6 @@ nvmux needs no configuration. An optional TOML file — `$NVMUX_CONFIG` if set,
 else `$XDG_CONFIG_HOME/nvmux/config.toml`, else `~/.config/nvmux/config.toml` —
 overrides the defaults below; an unknown key or a bad value is a startup error.
 
-nvmux's own screens — the picker, the prompt and the help — come in your
-terminal's own colours. Name one colour instead and their text is drawn in it,
-and the selection's bar filled with it, while what is dim — the session
-numbers, the key hints — stays your terminal's dim. Neovim's own screen keeps
-the editor's colours, and `NO_COLOR` keeps the terminal's.
-
-```toml
-[theme]
-color = "#7aa2f7"
-```
-
 <details>
 <summary>Every setting, at its default</summary>
 
