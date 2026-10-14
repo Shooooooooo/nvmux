@@ -359,15 +359,28 @@ pub(crate) fn poll_key_for(tick: Duration) -> Result<Option<Key>> {
 /// `seen` is the session the user was looking at until the picker came up, if
 /// any: what it was keeping to report is not news to them, and is cleared
 /// before the picker reads it (see [`crate::notes`]).
+///
+/// `notifier` is handed every session's socket as the picker finds it, so
+/// that once a session is in front the others can be heard from (see
+/// [`crate::tell`]).
 pub fn run(
     transport: &dyn Transport,
     message: Option<String>,
     focused: Option<&str>,
     still_attached: bool,
     seen: Option<&str>,
+    notifier: &crate::tell::Notifier,
 ) -> Result<Outcome> {
     owning_for_attach_leaving(Outcome::attaches, Outcome::leaves, true, |terminal| {
-        run_loop(terminal, transport, message, focused, still_attached, seen)
+        run_loop(
+            terminal,
+            transport,
+            message,
+            focused,
+            still_attached,
+            seen,
+            notifier,
+        )
     })
 }
 
@@ -385,6 +398,7 @@ fn run_loop(
     focused: Option<&str>,
     still_attached: bool,
     seen: Option<&str>,
+    notifier: &crate::tell::Notifier,
 ) -> Result<Outcome> {
     let mut app = App::new(transport.list_sessions()?);
     // What each session has to report: read on a thread of its own (see
@@ -447,7 +461,7 @@ fn run_loop(
                 unread.push_back(s.clone());
             }
         }
-        hand_over(transport, &poller, &mut unread);
+        hand_over(transport, &poller, notifier, &mut unread);
         if let Some(notes) = poller.take() {
             app.set_notes(notes);
             heard = true;
@@ -686,16 +700,21 @@ fn tick(app: &mut App, ticked: &mut Instant) {
 /// Give the reader of notes the sockets of the sessions in `unread`, for as
 /// long as [`HAND_OVER`] allows, and at least one: locally that is all of
 /// them, and over ssh as many as can be given a forward in the time (see
-/// [`Transport::local_socket_for`], which makes one where there is none).
+/// [`Transport::local_socket_for`], which makes one where there is none). The
+/// notifier is given each one too, with the session's name as it is now.
 fn hand_over(
     transport: &dyn Transport,
     poller: &crate::notes::Poller,
+    notifier: &crate::tell::Notifier,
     unread: &mut VecDeque<Session>,
 ) {
     let started = Instant::now();
     while let Some(s) = unread.pop_front() {
         match transport.local_socket_for(&s) {
-            Ok(sock) => poller.watch(&s.id, sock),
+            Ok(sock) => {
+                notifier.watch(&s.id, &s.name, sock.clone());
+                poller.watch(&s.id, sock);
+            }
             Err(e) => tracing::debug!(id = %s.id, error = %e, "notes: no socket to read"),
         }
         if started.elapsed() >= HAND_OVER {

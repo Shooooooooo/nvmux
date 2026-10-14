@@ -173,6 +173,10 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     // what it was keeping to report is no news to them, so the picker clears
     // it before it first reads it (see `nvmux::notes`).
     let mut looked_at: Option<String> = None;
+    // What posts cards for the session in front, with what the others have
+    // to report as it happens (see `nvmux::tell`). Handed each session's
+    // socket as the picker finds it, and each attached one's here.
+    let notifier = nvmux::tell::Notifier::start();
 
     loop {
         // `<prefix> c` moves this to the session it just created. A client held
@@ -191,6 +195,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             focus.as_deref(),
             attached.is_some() || focus.as_deref().is_some_and(|id| pool.holds(id)),
             seen.as_deref(),
+            &notifier,
         )? {
             ui::Outcome::Quit => {
                 // A client held across `<prefix> Space` is retired explicitly; its
@@ -330,10 +335,11 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             if warm && shown.as_deref() != Some(current.id.as_str()) {
                 attachment.announce_on_arrival(announce::label(&current.name));
             }
-            // Out of the picker the user chose the session by its name, and
-            // saw it — carried across, where the hand-off is on — so the
-            // notice has nothing to add but a key the session is waiting for.
-            if from_picker {
+            // Out of the picker, a session other than the one the user was just
+            // in is announced as a switch by key is. Back to that one — `Esc`,
+            // or Enter on its own row — the notice has nothing to add but a key
+            // the session is waiting for.
+            if from_picker && shown.as_deref() == Some(current.id.as_str()) {
                 attachment.arrive_unannounced();
             }
             from_picker = false;
@@ -345,6 +351,10 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             // `nvmux::notes::touch`).
             let sock = attachment.sock().to_path_buf();
             nvmux::notes::later(sock.clone(), nvmux::notes::touch);
+            // And told, from now until the relay ends, what the others have
+            // to say — by its name as it is now, a rename since included.
+            notifier.watch(&current.id, &current.name, sock.clone());
+            notifier.front(Some(&current.id));
 
             // The relay, with the chance to start the next client while this
             // session is still dissolving: `begin_next` fires on a `<prefix>`
@@ -392,6 +402,10 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 };
                 pty::relay(attachment, highest, &mut begin_next)?
             };
+            // Out of the session: whatever comes next — the picker, the help,
+            // the prompt, another session, or the shell — nobody is in front
+            // to be told until the next attach says who is.
+            notifier.front(None);
             // Whatever the session reported while it was in front was seen: it
             // is cleared on the way out — by the picker, if that is where the
             // user goes, before it reads it; otherwise on a thread, or, on the
@@ -747,6 +761,7 @@ fn pick(
     match target {
         pty::Target::Number(num) => sessions.iter().find(|s| s.state.num == num),
         pty::Target::Step(dir) => transport::neighbour(sessions, from, dir),
+        pty::Target::Session(id) => sessions.iter().find(|s| s.id == id.as_str()),
     }
 }
 

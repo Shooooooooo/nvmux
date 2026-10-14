@@ -55,7 +55,10 @@
 //! takes the answers when they come.
 //!
 //! Four things ever *join* this direction. The attach notice (see
-//! [`crate::announce`]): a box, drawn where the child's own bytes leave the
+//! [`crate::announce`]) — kept, and no longer armed, a card nvmux's own client
+//! draws saying which session this is instead (see [`crate::card`]): a box,
+//! drawn where the
+//! child's own bytes leave the
 //! terminal between escape sequences, which [`crate::boundary`] finds with a
 //! decoder rather than with a clock, and written inside a synchronized update
 //! that also carries the session's own bytes, so that the terminal has no
@@ -103,7 +106,7 @@ use crate::handoff::HandOff;
 use crate::keys::{Action, Prefix, Step, Wait};
 use crate::ledger::Ledger;
 use crate::term::write_stdout;
-use crate::{announce, boundary, fade, hint, rpc, shadow, term, winch};
+use crate::{announce, boundary, card, fade, hint, rpc, shadow, term, winch};
 
 /// Neovim aborts on the seventeenth attached UI rather than returning an error
 /// (`src/nvim/ui.c`: `if (ui_count == MAX_UI_COUNT) { abort(); }`), which would
@@ -118,7 +121,9 @@ const _: () = assert!(MAX_UIS < 16);
 ///
 /// An em dash and four words, appended to the name the box already carries:
 /// the box is one line wide and up for a second, so this is the shortest thing
-/// that says both what is wrong and what to do about it.
+/// that says both what is wrong and what to do about it. The card that says it
+/// now takes it off the label again, and says it in its own way (see
+/// [`Attachment::open_desk`]).
 const WAITING: &str = " — press a key";
 
 /// How the relay ended. The attachment is handed back separately by [`relay`].
@@ -179,17 +184,20 @@ impl Outcome {
     }
 }
 
-/// Which session a `<prefix>` switch named: one by its number, or the one next
-/// to this one in the picker's order.
+/// Which session a `<prefix>` switch named: one by its number, the one next to
+/// this one in the picker's order, or — `<prefix> Enter` on a card — the one
+/// the card came from, by its id.
 ///
 /// One outcome carrying which, rather than two outcomes, so the answer stays a
 /// value from the keypress all the way to the lookup instead of being spelled
-/// out again at every hand-off. Either can name nothing — a number nobody has,
-/// an empty listing — and that is the session loop's to settle, not the relay's.
+/// out again at every hand-off. Any can name nothing — a number nobody has,
+/// an empty listing, a session gone since — and that is the session loop's to
+/// settle, not the relay's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     Number(u32),
     Step(crate::keys::Direction),
+    Session(crate::ids::Id),
 }
 
 /// A running client, and the PTY it is talking through.
@@ -295,6 +303,12 @@ pub struct Attachment {
     /// [`Attachment::start_ahead`]). One still out when the client is asked
     /// for is handed over with it, to be waited for as a fresh client's is.
     probe: Option<Probe>,
+    /// Whether the client is nvmux's own, which draws cards (see
+    /// [`crate::card`]): Neovim's would be typed what tells it to.
+    draws_cards: bool,
+    /// What this relay has told its client to show, and what waits to go in:
+    /// one a relay, and only for a client that draws cards.
+    desk: Option<card::Desk>,
 }
 
 /// How many clients have had their exit sequences relayed to the terminal:
@@ -453,6 +467,12 @@ const DA1_REPLY: &[u8] = b"\x1b[?1;2c";
 /// bound on a client that stopped half way through one for some other reason.
 const FRAME_WAIT: Duration = Duration::from_millis(50);
 
+/// The longest a kept client being resumed is given to draw the card it was
+/// just asked to, before its backlog is read (see [`relay`]): it draws from
+/// what it has, so it takes a millisecond; this is only the bound on one that
+/// is busy with something else.
+const CARD_WAIT: Duration = Duration::from_millis(30);
+
 /// The most a resume reads of a kept client's backlog before handing the rest
 /// to the relay, once it has a whole frame: a parked client is read all the
 /// while it is parked, so anything more than a few frames is a client that is
@@ -482,10 +502,11 @@ impl Attachment {
     ///
     /// A blocked session draws nothing until one arrives, so what the user is
     /// handed is a screen that looks broken — which is exactly how the bug
-    /// this exists for was reported. The notice is nvmux's own box, written
-    /// over the session's screen rather than by the editor, so it goes up on a
-    /// wedged session as readily as an idle one (see [`crate::announce`]) and
-    /// is the one thing that *can* be said here.
+    /// this exists for was reported. The notice is nvmux's own — a card its
+    /// client draws from what it has, asking the editor nothing (see
+    /// [`crate::card`]) — so it goes up on a wedged session as readily as an
+    /// idle one, and is the one thing that *can* be said here. Neovim's own
+    /// client draws no card, and with it nothing says so.
     ///
     /// Set between the probe and the relay, which is the only point at which
     /// anyone knows: the label is chosen when the client is forked, a moment
@@ -506,9 +527,9 @@ impl Attachment {
     }
 
     /// Arrive without the notice saying which session this is: for an attach
-    /// out of the picker, where the user has just chosen the session by its
-    /// name and watched that name carried into it (see [`crate::handoff`]), so
-    /// a box repeating it a moment later says nothing they do not know.
+    /// out of the picker back to the session the user was just in, which a
+    /// card naming it says nothing they do not know about. Out of the picker
+    /// to any other, the notice says it, as on a switch by key.
     ///
     /// Only the name goes. A session waiting for a key keeps its notice, which
     /// is then the one thing that says why the screen is blank — news the
@@ -868,6 +889,86 @@ impl Attachment {
             return false;
         }
         true
+    }
+
+    /// Tell the client to do `cmd`, in its input: one write, as
+    /// [`Attachment::report_size_in_band`] makes one, for the same reason —
+    /// a sequence in pieces would be read as keys. Best effort: a client whose
+    /// input queue is full is not shown the card.
+    fn tell_client(&mut self, cmd: &card::Command) {
+        let Some(fd) = self.master.as_raw_fd() else {
+            return;
+        };
+        if !writable(fd) {
+            tracing::debug!("the client's input queue is full; no card");
+            return;
+        }
+        let wire = card::encode(cmd);
+        let n = unsafe { libc::write(fd, wire.as_ptr().cast(), wire.len()) };
+        if n != wire.len() as isize {
+            tracing::debug!(wrote = n, "a card went out short");
+        }
+    }
+
+    /// Open this relay's desk, for a client that draws cards, and tell the
+    /// client what it opens with (see [`card::Desk::open`]): whether that is a
+    /// card saying where the switch landed. Nothing has been passed on to the
+    /// client yet in this relay, so the stream is between keys.
+    fn open_desk(&mut self) -> bool {
+        if !self.draws_cards {
+            return false;
+        }
+        let now = Instant::now();
+        let mut desk = card::Desk::new(&self.session_id);
+        let arrival = self.announce.take().and_then(|label| {
+            let waiting = label.ends_with(WAITING);
+            let name = label.strip_suffix(WAITING).unwrap_or(&label);
+            (waiting || !name.is_empty())
+                .then(|| card::Card::arrival(card::next_id(), name, waiting))
+        });
+        let landed = arrival.is_some();
+        let opening = desk.open(arrival, now);
+        self.desk = Some(desk);
+        for cmd in &opening {
+            self.tell_client(cmd);
+        }
+        landed
+    }
+
+    /// Put in what waits on the desk, if the stream allows it now.
+    fn send_cards(&mut self, now: Instant) {
+        let Some(desk) = self.desk.as_mut() else {
+            return;
+        };
+        for cmd in desk.ready(now) {
+            self.tell_client(&cmd);
+        }
+    }
+
+    /// `<prefix> Enter`: go where the newest card that goes somewhere is
+    /// about — a switch to the session it came from, or that session's own
+    /// terminal shown — and take the card down.
+    fn go(&mut self, now: Instant) -> Option<Outcome> {
+        let (_, go) = self.desk.as_mut()?.go(now)?;
+        self.send_cards(now);
+        match go {
+            card::Go::Session(id) => Some(Outcome::Switch(Target::Session(id))),
+            card::Go::Buffer(buf) => {
+                show_buffer(self.sock.clone(), buf);
+                None
+            }
+        }
+    }
+
+    /// Wait up to `within` for the client to write something, without reading
+    /// it.
+    fn await_output(&self, within: Duration) {
+        let Some(fd) = self.master.as_raw_fd() else {
+            return;
+        };
+        let mut p = [pollfd(fd)];
+        let ms = within.as_millis().min(i32::MAX as u128) as libc::c_int;
+        let _ = unsafe { libc::poll(p.as_mut_ptr(), 1, ms) };
     }
 
     /// Show the terminal what the client wrote — or, while its first paint is
@@ -1913,6 +2014,7 @@ pub(crate) fn kept_standin(session_id: &str, script: &str) -> Attachment {
         Path::new("/nvmux-test-never-read.sock"),
         "",
         cmd,
+        false,
     )
     .expect("spawn sh");
     a.announce = None;
@@ -1977,7 +2079,8 @@ impl Attachment {
 /// refusal was throwing away. Only a session that cannot be reached, or one
 /// with too many UIs already, is still refused here.
 pub fn spawn(session_id: &str, sock: &Path, announce: &str) -> Result<Attachment> {
-    spawn_with(session_id, sock, announce, client_command(sock))
+    let (cmd, draws_cards) = client_command(sock);
+    spawn_with(session_id, sock, announce, cmd, draws_cards)
 }
 
 /// Start a client for a session, and nothing else: the half of [`spawn`] that
@@ -2003,37 +2106,59 @@ pub fn spawn(session_id: &str, sock: &Path, announce: &str) -> Result<Attachment
 /// A client that could not be started at all is reported before any probe,
 /// since the message — `nvim` is not here — is the useful one.
 pub fn spawn_client(session_id: &str, sock: &Path, announce: &str) -> Result<Attachment> {
-    spawn_client_with(session_id, sock, announce, client_command(sock))
+    let (cmd, draws_cards) = client_command(sock);
+    spawn_client_with(session_id, sock, announce, cmd, draws_cards)
+}
+
+/// [`spawn_client`], with nvmux's own client run from `exe` — the way a test
+/// that is not that binary runs the real thing.
+pub fn spawn_own_client(
+    session_id: &str,
+    sock: &Path,
+    announce: &str,
+    exe: &Path,
+) -> Result<Attachment> {
+    spawn_client_with(session_id, sock, announce, own_client(exe, sock), true)
 }
 
 /// The client that draws a session, in our working directory: nvmux's own —
 /// this same binary, `--client <sock>` (see [`crate::client`]) — or with
-/// `[client] ui = "nvim"` Neovim's, `nvim --server <sock> --remote-ui`.
-fn client_command(sock: &Path) -> CommandBuilder {
-    // `CommandBuilder::new` seeds the child's environment from ours, so `TERM`,
-    // `COLORTERM` and everything else the client negotiates with reach it
-    // without being copied by hand.
-    let mut cmd = match crate::config::get().client.ui {
+/// `[client] ui = "nvim"` Neovim's, `nvim --server <sock> --remote-ui`. And
+/// whether it draws cards, which nvmux's own does.
+fn client_command(sock: &Path) -> (CommandBuilder, bool) {
+    match crate::config::get().client.ui {
         crate::config::Ui::Nvim => {
+            // `CommandBuilder::new` seeds the child's environment from ours,
+            // so `TERM`, `COLORTERM` and everything else the client negotiates
+            // with reach it without being copied by hand.
             let mut cmd = CommandBuilder::new("nvim");
             cmd.arg("--server");
             cmd.arg(sock);
             cmd.arg("--remote-ui");
-            cmd
+            (in_place(cmd), false)
         }
         crate::config::Ui::Nvmux => {
             // The binary running now, wherever it was started from — not a
             // `nvmux` looked up on `$PATH`, which may be another version.
             let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nvmux"));
-            let mut cmd = CommandBuilder::new(exe);
-            cmd.arg("--client");
-            cmd.arg(sock);
-            if let Some(palette) = crate::palette::get() {
-                cmd.env(crate::client::PALETTE_ENV, palette.to_env());
-            }
-            cmd
+            (own_client(&exe, sock), true)
         }
-    };
+    }
+}
+
+/// nvmux's own client, run from `exe`.
+fn own_client(exe: &Path, sock: &Path) -> CommandBuilder {
+    let mut cmd = CommandBuilder::new(exe);
+    cmd.arg("--client");
+    cmd.arg(sock);
+    if let Some(palette) = crate::palette::get() {
+        cmd.env(crate::client::PALETTE_ENV, palette.to_env());
+    }
+    in_place(cmd)
+}
+
+/// `cmd` where a client runs: in our working directory, with our umask.
+fn in_place(mut cmd: CommandBuilder) -> CommandBuilder {
     if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
     }
@@ -2058,9 +2183,10 @@ fn spawn_with(
     sock: &Path,
     announce: &str,
     cmd: CommandBuilder,
+    draws_cards: bool,
 ) -> Result<Attachment> {
     let t_spawn = std::time::Instant::now();
-    let attachment = spawn_client_with(session_id, sock, announce, cmd)?;
+    let attachment = spawn_client_with(session_id, sock, announce, cmd, draws_cards)?;
     tracing::debug!(
         ms = t_spawn.elapsed().as_secs_f64() * 1000.0,
         "timing: client spawn"
@@ -2380,12 +2506,14 @@ fn ui_count(
     Ok(Answer::Ready)
 }
 
-/// Open a pty and start the client on it.
+/// Open a pty and start the client on it — one that draws cards, if
+/// `draws_cards`.
 fn spawn_client_with(
     session_id: &str,
     sock: &Path,
     announce: &str,
     cmd: CommandBuilder,
+    draws_cards: bool,
 ) -> Result<Attachment> {
     // Right *before* the child starts: `PtySize::default()` is 24x80. Note
     // `crossterm::size()` is (cols, rows) while `PtySize` is { rows, cols } —
@@ -2439,6 +2567,8 @@ fn spawn_client_with(
         exits_seen: 0,
         unshown: None,
         probe: None,
+        draws_cards,
+        desk: None,
     })
 }
 
@@ -2545,30 +2675,42 @@ pub fn relay(
     // A kept client's repaint, asked on its return and answered while the
     // relay runs.
     let mut erasing: Option<Erasing> = None;
+    // The cards first, before the screen comes back: off with whatever the
+    // client showed when it was last in front, and on with where the switch
+    // landed. Its own client draws that at once — it asks nothing of the
+    // server — so it is on the screen the session dissolves in with.
+    let landed = attachment.open_desk();
+
     // What the child buffered while blocked mid-write describes a screen the
     // picker has since drawn over.
     if attachment.resumed {
         let t_resume = Instant::now();
         // A kept client's is read rather than thrown away: it was parked,
         // not blocked, and what it wrote is the screen about to be painted
-        // back — see [`Attachment::drain_unrelayed`].
+        // back — see [`Attachment::drain_unrelayed`]. With the frame it draws
+        // the card on among it, which comes a moment after the card was asked
+        // for: so the shadow has the card, and the fade in brings it in.
         if attachment.is_kept() {
+            if landed {
+                attachment.await_output(CARD_WAIT);
+            }
             attachment.drain_unrelayed();
         } else {
             discard_pending(master_fd);
         }
         // The size first, so the frames fit the terminal as it is now; then
-        // the screen the client had dissolves in, and only then is the
-        // client asked to repaint — its paint lands over the last frame.
+        // the screen the client had dissolves in, and the client's repaint
+        // lands over the last frame — asked after it, or for a kept client
+        // as it starts (below), and either way relayed after it: nothing the
+        // client writes reaches the terminal until the relay copies it.
         //
-        // Either way the cursor is shown before the repaint is asked for,
-        // not left to it: the fade out that ended the last relay hid the
-        // cursor, and a repaint is what a server *may* do — one busy in Lua
-        // or waiting for a key does nothing until that is over, and an idle
-        // editor writes nothing on its own. A fade in puts the cursor back
-        // on the session's own cell as its last frame; without one it is
-        // shown where the erase left it, as every screen left it before
-        // there was a fade.
+        // Either way the cursor is shown by nvmux, not left to the repaint:
+        // the fade out that ended the last relay hid the cursor, and a
+        // repaint is what a server *may* do — one busy in Lua or waiting for
+        // a key does nothing until that is over, and an idle editor writes
+        // nothing on its own. A fade in puts the cursor back on the session's
+        // own cell as its last frame; without one it is shown where the erase
+        // left it, as every screen left it before there was a fade.
         //
         // A kept client with no fade to dissolve it in has its screen painted
         // straight back instead, from its copy: it is on the glass at once
@@ -2577,6 +2719,22 @@ pub fn relay(
         // Asked before the resize, because the resize is what changes it.
         let resized = attachment.master.get_size().ok() != Some(size);
         attachment.resize_to(size);
+        // A kept client's repaint, asked as the fade in starts rather than
+        // once it is over: the frames are nvmux's own, drawn from the copy,
+        // and take the time they take whatever the server is doing, so the
+        // server's whole redraw — the exact screen, which the copy stands in
+        // for until it comes — is done underneath them instead of after them.
+        //
+        // Not where the size changed while the client was parked. The client
+        // has its server resize first, on a signal it has yet to act on, and
+        // a repaint that got in ahead of that resize would be drawn for the
+        // old size into a terminal that has the new one. Asked after the
+        // screen is back, as before, which gives the resize a fade's head
+        // start.
+        let early = attachment.is_kept() && !resized;
+        if early {
+            erasing = kept_clients_repaint(&mut attachment);
+        }
         dissolved = attachment.dissolve_in();
         // Off the primary screen since the switch, and on the session's only
         // as long as the dissolve drew it.
@@ -2599,10 +2757,8 @@ pub fn relay(
         );
         if attachment.is_kept() {
             // What the client told the terminal comes back from the ledger,
-            // and the exact screen from its server — asked from a thread, as
-            // the notice's repaint is, since the screen is back already and
-            // the relay has a session to run meanwhile. With nothing typed
-            // into a prompt: the prompt is on the screen, for the user.
+            // and the exact screen from its server — asked above where the
+            // size held, and otherwise here.
             // The fade's last frame leaves a reset pen and a hidden cursor
             // wherever it was; a kept client may write before the repaint
             // lands, and writes on the belief that neither has moved.
@@ -2611,16 +2767,9 @@ pub fn relay(
             }
             attachment.put_back_what_it_told(size);
             attachment.tell_its_size(size, resized);
-            erasing = match Erasing::start_for(&attachment.sock, "kept client's return") {
-                Ok(started) => Some(started),
-                // No thread to ask from: the fallback a server that could not
-                // be asked would have got, as the notice's repaint has.
-                Err(e) => {
-                    tracing::debug!(error = %e, "no thread for the kept client's repaint");
-                    apply(&mut attachment, Repaint::Notice, Served::NONE);
-                    None
-                }
-            };
+            if !early {
+                erasing = kept_clients_repaint(&mut attachment);
+            }
         } else {
             repaint(&mut attachment, Repaint::Resume);
         }
@@ -2630,9 +2779,11 @@ pub fn relay(
         attachment.hold = Some(Hold::new(Instant::now()));
     }
 
-    // Taken, not copied: `<prefix> Space` and `<prefix> ?` come back to this same
-    // client, and a session you never left has nothing to announce.
-    let popup = announce::Popup::arm(attachment.announce.take(), Instant::now());
+    // Announced by a card now, which the client draws (see `crate::card` and
+    // `open_desk` above), and not by the box, which is kept as it was and
+    // never armed: it used to be `announce::Popup::arm(attachment.announce.take(),
+    // Instant::now())` here.
+    let popup: Option<announce::Popup> = None;
     // Only for the notice, and only from here: everything written to the
     // terminal above is nvmux's own and complete, so a parser that starts
     // between sequences starts right.
@@ -2647,6 +2798,11 @@ pub fn relay(
         dissolved,
         erasing,
     );
+    // Taken, not kept for the next relay, whether or not it was said: `<prefix>
+    // Space` and `<prefix> ?` come back to this same client, and a session you
+    // never left has nothing to announce. The desk is this relay's alone.
+    attachment.announce = None;
+    attachment.desk = None;
     // From here on nothing the client writes reaches the terminal until it is
     // relayed again: what the ledger hears next is news to the terminal.
     if let Some(ledger) = attachment.ledger.as_mut() {
@@ -2811,6 +2967,7 @@ fn pump(
             attachment.hold_wake_at(),
             attachment.kept_due(),
             erasing.as_ref().map(|_| now + ERASE_POLL),
+            attachment.desk.as_ref().and_then(card::Desk::retry_at),
         ]
         .into_iter()
         .flatten()
@@ -2830,7 +2987,15 @@ fn pump(
             None => IDLE_POLL_MS,
         };
 
-        let mut fds = [pollfd(stdin_fd), pollfd(master_fd), pollfd(winch.fd())];
+        // The board, for the cards the notifier posts: see `crate::card`. A
+        // board without its pipe is polled as -1, which `poll` passes over.
+        let board = card::board();
+        let mut fds = [
+            pollfd(stdin_fd),
+            pollfd(master_fd),
+            pollfd(winch.fd()),
+            pollfd(board.wake_fd().unwrap_or(-1)),
+        ];
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
@@ -3007,17 +3172,7 @@ fn pump(
         // this — the repaint itself arrives as the session's own output — so a
         // pass that finds nothing costs a `try_recv`.
         if let Some(served) = erasing.as_ref().and_then(Erasing::answer) {
-            let asked = erasing.take().expect("it answered a moment ago");
-            // Timed because it is a second full repaint of the session, a
-            // whole second after the switch — the one nvmux asks for rather
-            // than the one the attach produced. What the number now measures
-            // is how long it took somewhere else, which is the point of it.
-            tracing::debug!(
-                ms = asked.started.elapsed().as_secs_f64() * 1000.0,
-                repainted = served.repainted,
-                "timing: {} (:mode repaint)",
-                asked.what
-            );
+            erasing = None;
             apply(attachment, Repaint::Notice, served);
         }
 
@@ -3035,9 +3190,8 @@ fn pump(
             // `timeout` resolves a lone prefix into a literal one, but also a
             // half-typed session number into a switch — so the actions it
             // produces must be acted on, not just the bytes.
-            for mut step in prefix.timeout() {
-                attachment.saw_input(&mut step);
-                if let Some(outcome) = act(&mut attachment.writer, step)? {
+            for step in prefix.timeout() {
+                if let Some(outcome) = take_step(attachment, step)? {
                     return Ok(outcome);
                 }
             }
@@ -3050,9 +3204,8 @@ fn pump(
                 Ok(len) => {
                     // Deliberately NOT logged: every keystroke the user types,
                     // into a /tmp file that outlives the session.
-                    for mut step in prefix.feed(&buf[..len]) {
-                        attachment.saw_input(&mut step);
-                        if let Some(outcome) = act(&mut attachment.writer, step)? {
+                    for step in prefix.feed(&buf[..len]) {
+                        if let Some(outcome) = take_step(attachment, step)? {
                             return Ok(outcome);
                         }
                     }
@@ -3120,6 +3273,17 @@ fn pump(
             }
         }
 
+        // The cards: what the notifier posted, taken — or, for a client that
+        // draws none, thrown away — and what waits put in, once the keys just
+        // passed on leave a moment for it.
+        if n > 0 && ready(&fds[3]) {
+            let posts = board.take();
+            if let Some(desk) = attachment.desk.as_mut() {
+                desk.take(posts);
+            }
+        }
+        attachment.send_cards(Instant::now());
+
         // Only on an idle tick: a child that exits is noticed through its pty
         // above, so this exists for the one that *stopped*, and a `waitid` per
         // keystroke would buy nothing.
@@ -3148,7 +3312,24 @@ fn act(writer: &mut dyn Write, step: Step) -> Result<Option<Outcome>> {
         Step::Act(Action::Help) => Some(Outcome::ShowHelp),
         Step::Act(Action::Switch(num)) => Some(Outcome::Switch(Target::Number(num))),
         Step::Act(Action::Cycle(dir)) => Some(Outcome::Switch(Target::Step(dir))),
+        // The relay's, which knows the cards up: see `take_step`.
+        Step::Act(Action::Go) => None,
     })
+}
+
+/// One instruction from the prefix machine, the cards' part of it included:
+/// what is passed on to the client is watched for the moments between keys a
+/// card can go in at, and `<prefix> Enter` goes where the newest card is
+/// about (see [`crate::card`]).
+fn take_step(attachment: &mut Attachment, mut step: Step) -> Result<Option<Outcome>> {
+    attachment.saw_input(&mut step);
+    if step == Step::Act(Action::Go) {
+        return Ok(attachment.go(Instant::now()));
+    }
+    if let (Step::Forward(bytes), Some(desk)) = (&step, attachment.desk.as_mut()) {
+        desk.forwarded.saw(bytes, Instant::now());
+    }
+    act(&mut attachment.writer, step)
 }
 
 /// How long an escape sequence cut short by the end of a read waits for the
@@ -3484,6 +3665,72 @@ fn apply(attachment: &mut Attachment, why: Repaint, served: Served) {
     }
 }
 
+/// Show terminal buffer `buf` in the session on `sock`, for `<prefix> Enter`
+/// on a card about it: the window it is in, in whichever tab page that is, or
+/// a tab page of its own where no window has it. From a thread, and best
+/// effort — the session's to do, at the speed its link allows — and never of
+/// an editor waiting for a key, which would do it once the key came.
+fn show_buffer(sock: PathBuf, buf: i64) {
+    const SHOW: &str = r#"local buf = ...
+if not vim.api.nvim_buf_is_valid(buf) then
+  return false
+end
+for _, tab in ipairs(vim.api.nvim_list_tabpages()) do
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
+    if vim.api.nvim_win_get_buf(win) == buf then
+      vim.api.nvim_set_current_tabpage(tab)
+      vim.api.nvim_set_current_win(win)
+      return true
+    end
+  end
+end
+vim.cmd('tab sbuffer ' .. buf)
+return true
+"#;
+    let spawned = std::thread::Builder::new()
+        .name("nvmux-show".into())
+        .spawn(move || {
+            let shown = rpc::Client::connect(&sock, RESUME_TIMEOUT).and_then(|mut client| {
+                if client.get_mode()?.blocking {
+                    return Ok(false);
+                }
+                client.call(
+                    "nvim_exec_lua",
+                    vec![
+                        rmpv::Value::from(SHOW),
+                        rmpv::Value::Array(vec![rmpv::Value::from(buf)]),
+                    ],
+                )?;
+                Ok(true)
+            });
+            if let Err(e) = shown {
+                tracing::debug!(error = %e, "card: could not show the terminal");
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::debug!(error = %e, "card: no thread to show the terminal on");
+    }
+}
+
+/// Ask the server of a kept client coming back to the front for its exact
+/// screen — from a thread, as the notice's repaint is, so that nothing waits
+/// for it: the screen comes back from the copy meanwhile, and the relay has a
+/// session to run. With nothing typed into a prompt ([`Repaint::Notice`]): the
+/// prompt is on the screen, for the user.
+///
+/// `None` if there was no thread to ask from, in which case the fallback has
+/// run — what a server that could not be asked would have got.
+fn kept_clients_repaint(attachment: &mut Attachment) -> Option<Erasing> {
+    match Erasing::start_for(&attachment.sock, "kept client's return") {
+        Ok(started) => Some(started),
+        Err(e) => {
+            tracing::debug!(error = %e, "no thread for the kept client's repaint");
+            apply(attachment, Repaint::Notice, Served::NONE);
+            None
+        }
+    }
+}
+
 /// The repaint that takes the attach notice off the screen, in flight on a
 /// thread of its own.
 ///
@@ -3509,13 +3756,10 @@ fn apply(attachment: &mut Attachment, why: Repaint, served: Served) {
 /// Not a resume's repaint, which stays where it is: there the terminal is
 /// blank, the relay has not started, and the screen coming back *is* what the
 /// user is waiting for. Except a kept client's (`[client] per_session`), whose
-/// screen is already painted back from its copy by then: its repaint is asked
-/// here too, with the relay running (see [`relay`]).
+/// screen is painted back from its copy meanwhile: its repaint is asked here
+/// too, as a rule as the fade in starts (see [`relay`]).
 struct Erasing {
     rx: mpsc::Receiver<Served>,
-    started: Instant,
-    /// What the repaint is for, for the timing record.
-    what: &'static str,
 }
 
 impl Erasing {
@@ -3525,23 +3769,35 @@ impl Erasing {
     }
 
     /// [`Erasing::start`], for something other than the notice: a kept
-    /// client coming back to the front, whose screen is already painted back
-    /// and wants the server's exact one on top (see [`relay`]).
+    /// client coming back to the front, whose screen is painted back from its
+    /// copy and wants the server's exact one on top (see [`relay`]). `what`
+    /// names it in the timing record.
     fn start_for(sock: &Path, what: &'static str) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::channel();
         let sock = sock.to_path_buf();
+        let asked = Instant::now();
         std::thread::Builder::new()
             .name("nvmux-notice-repaint".into())
             .spawn(move || {
+                let served = repaint_through_server(&sock, Repaint::Notice);
+                // Timed here, as the answer comes, and not where the relay
+                // collects it: a kept client's is asked as the fade in starts,
+                // and the relay does not look until the fade is over. It is a
+                // second full repaint of the session — the one nvmux asks for
+                // rather than the one the attach produced — and what the
+                // number measures is how long that took somewhere else, which
+                // is the point of it.
+                tracing::debug!(
+                    ms = asked.elapsed().as_secs_f64() * 1000.0,
+                    repainted = served.repainted,
+                    "timing: {} (:mode repaint)",
+                    what
+                );
                 // A receiver that has gone is a relay that ended first, and
                 // there is nobody left to tell.
-                let _ = tx.send(repaint_through_server(&sock, Repaint::Notice));
+                let _ = tx.send(served);
             })?;
-        Ok(Self {
-            rx,
-            started: Instant::now(),
-            what,
-        })
+        Ok(Self { rx })
     }
 
     /// The verdict, if it has arrived. A worker that ended without one is
@@ -3975,6 +4231,7 @@ mod tests {
             Path::new("/nvmux-test-never-read.sock"),
             "",
             cmd,
+            false,
         )
         .expect("spawn sh");
         // Nothing to announce, no shadow and not kept unless a test installs
@@ -4677,7 +4934,7 @@ mod tests {
                 recording_server(&sock, mode, false)
             };
             // Bound to `_` so the attachment is retired at once.
-            let _ = spawn_with("probe", &sock, "1  probe", standin_client(tag))
+            let _ = spawn_with("probe", &sock, "1  probe", standin_client(tag), false)
                 .expect("a passed probe is an attachment");
             assert_eq!(
                 server.join().expect("the server thread"),
@@ -4716,10 +4973,11 @@ mod tests {
         assert_eq!(attachment.announce, None);
     }
 
-    /// Out of the picker, the name is not announced again — but a session
-    /// waiting for a key still says so, which nothing else on the screen can.
+    /// Back from the picker to the session just left, its name is not
+    /// announced again — but a session waiting for a key still says so, which
+    /// nothing else on the screen can.
     #[test]
-    fn an_attach_from_the_picker_keeps_only_a_notice_with_news_in_it() {
+    fn going_back_to_the_session_just_left_keeps_only_a_notice_with_news_in_it() {
         let mut attachment = attached_to("while :; do read x; done");
         attachment.announce = Some("dotfiles".to_string());
         attachment.arrive_unannounced();
@@ -4806,7 +5064,7 @@ mod tests {
                 // A file where the socket should be: as dead as a missing one.
                 std::fs::write(&sock, b"not a socket").expect("a file where the socket was");
             }
-            let err = spawn_with("gone", &sock, "1  gone", standin_client(tag))
+            let err = spawn_with("gone", &sock, "1  gone", standin_client(tag), false)
                 .expect_err("the probe must refuse");
             match (too_many, &err) {
                 (true, NvmuxError::Session(crate::error::SessionError::TooManyUis { .. })) => {}
@@ -4868,7 +5126,7 @@ mod tests {
     fn the_ui_limit_allows_for_the_client_being_counted() {
         let sock = crate::test_support::scratch_sock("pty-atlimit");
         let server = recording_server_with_uis(&sock, "n", false, MAX_UIS);
-        let attached = spawn_with("limit", &sock, "1  limit", standin_client("atlimit"));
+        let attached = spawn_with("limit", &sock, "1  limit", standin_client("atlimit"), false);
         assert!(
             attached.is_ok(),
             "{MAX_UIS} UIs, one of them possibly ours, must attach"

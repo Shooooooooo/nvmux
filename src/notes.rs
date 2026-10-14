@@ -75,7 +75,7 @@ use crate::rpc;
 
 /// The watcher's version. A session holding an older one is given this one,
 /// the record it kept carried over; a newer nvmux does the same to this one.
-pub const VERSION: i64 = 6;
+pub const VERSION: i64 = 8;
 
 /// How long the picker waits between reads of its sessions.
 pub const POLL: Duration = Duration::from_secs(2);
@@ -108,6 +108,16 @@ const SETTLE: Duration = Duration::from_millis(30);
 /// command to finish — a terminal's program that exits with 0, or a command
 /// its shell says did — each until [`SEEN`] clears it. Text is kept without
 /// control characters and to 200 characters.
+///
+/// Each of those two is numbered as it comes, from one count the session
+/// keeps, so that whoever reads the record can tell one it has not seen from
+/// one it has (see [`crate::tell`]); and says, where it came from a terminal
+/// buffer, whether that buffer was on the screen — in a window of the current
+/// tab page — at the time, so that the session in front need not be told what
+/// it was already showing. A read says which buffer that was, while it still
+/// is one, and the number of the tab page a window shows it in now, if any:
+/// what the card that tells the session in front of it says, and shows it by
+/// (see [`crate::card`]).
 ///
 /// A command that ends, failed or finished, is named by what its shell said
 /// it was, where the shell says — fish's `OSC 133 ; C` carries the command
@@ -144,6 +154,7 @@ for key in pairs(N.progress) do
   end
 end
 N.lsp = {}
+N.seq = type(N.seq) == 'number' and N.seq or 0
 local group = api.nvim_create_augroup('nvmux_notes', { clear = true })
 local function clean(s)
   if type(s) == 'table' then
@@ -159,10 +170,30 @@ local function clean(s)
   s = s:gsub('[%z\1-\31\127]', ' '):gsub('\194[\128-\159]', ' ')
   return vim.fn.strcharpart(vim.trim(s), 0, 200)
 end
-local function note(kind, title, body)
+local function shown(buf)
+  if not buf or not api.nvim_buf_is_valid(buf) then
+    return nil
+  end
+  for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
+    if api.nvim_win_get_buf(win) == buf then
+      return true
+    end
+  end
+  return false
+end
+local function note(kind, title, body, buf)
   title, body = clean(title), clean(body)
   if title ~= '' or body ~= '' then
-    local kept = { kind = kind, title = title, body = body, at = os.time() }
+    N.seq = N.seq + 1
+    local kept = {
+      kind = kind,
+      title = title,
+      body = body,
+      at = os.time(),
+      seq = N.seq,
+      shown = shown(buf),
+      buf = buf,
+    }
     if kind == 'finished' then
       N.finished = kept
     else
@@ -246,7 +277,7 @@ api.nvim_create_autocmd('TermRequest', {
     local osc = seq:sub(3)
     local title, body = osc:match('^777;notify;([^;]*);?(.*)$')
     if title then
-      return note('notify', title, body)
+      return note('notify', title, body, ev.buf)
     end
     local mark, args = osc:match('^133;(%a)(.*)$')
     if mark == 'C' then
@@ -260,9 +291,9 @@ api.nvim_create_autocmd('TermRequest', {
       if status and (status > 0 or command ~= nil) then
         local kind = status > 0 and 'failed' or 'finished'
         if command then
-          note(kind, command, 'exited with code ' .. status)
+          note(kind, command, 'exited with code ' .. status, ev.buf)
         else
-          note(kind, program(ev.buf), 'a command exited with code ' .. status)
+          note(kind, program(ev.buf), 'a command exited with code ' .. status, ev.buf)
         end
       end
       return
@@ -270,7 +301,7 @@ api.nvim_create_autocmd('TermRequest', {
     local text = osc:match('^9;(.*)$')
     if text then
       if not text:match('^%d+;') and not text:match('^%d+$') then
-        note('notify', '', text)
+        note('notify', '', text, ev.buf)
       end
       return
     end
@@ -295,7 +326,7 @@ api.nvim_create_autocmd('TermRequest', {
         parts[id] = p
       else
         parts[id] = nil
-        note('notify', p.title, p.body)
+        note('notify', p.title, p.body, ev.buf)
       end
     end
   end,
@@ -306,12 +337,22 @@ api.nvim_create_autocmd('TermClose', {
     commands[ev.buf] = nil
     local status = vim.v.event.status
     if type(status) == 'number' and status > 0 then
-      note('failed', program(ev.buf), 'exited with code ' .. status)
+      note('failed', program(ev.buf), 'exited with code ' .. status, ev.buf)
     elseif status == 0 and ran(ev.buf) then
-      note('finished', program(ev.buf), 'exited with code 0')
+      note('finished', program(ev.buf), 'exited with code 0', ev.buf)
     end
   end,
 })
+local function tab_of(buf)
+  for _, tab in ipairs(api.nvim_list_tabpages()) do
+    for _, win in ipairs(api.nvim_tabpage_list_wins(tab)) do
+      if api.nvim_win_get_buf(win) == buf then
+        return api.nvim_tabpage_get_number(tab)
+      end
+    end
+  end
+  return nil
+end
 function N.snapshot()
   local now = os.time()
   local busy
@@ -331,11 +372,21 @@ function N.snapshot()
   if busy then
     out.busy = { title = busy.title, text = busy.text, percent = busy.percent, age = now - busy.at }
   end
-  if N.note then
-    out.note = { kind = N.note.kind, title = N.note.title, body = N.note.body, age = now - N.note.at }
-  end
-  if N.finished then
-    out.finished = { title = N.finished.title, body = N.finished.body, age = now - N.finished.at }
+  for _, slot in ipairs({ 'note', 'finished' }) do
+    local n = N[slot]
+    if n then
+      local buf = type(n.buf) == 'number' and api.nvim_buf_is_valid(n.buf) and n.buf or nil
+      out[slot] = {
+        kind = n.kind,
+        title = n.title,
+        body = n.body,
+        age = now - n.at,
+        seq = n.seq,
+        shown = n.shown,
+        buf = buf,
+        tab = buf and tab_of(buf),
+      }
+    end
   end
   return out
 end
@@ -349,8 +400,10 @@ return N.snapshot()
 /// The record, as a map: `busy` (the progress message, or language server's
 /// work, running that started last: `title`, `text`, `percent` when it has
 /// one, and `age` in seconds), `note` (`kind` `notify` or `failed`, `title`,
-/// `body`, `age`) and `finished` (the command that finished last: `title`,
-/// `body`, `age`), each there only when the session has one. `false` where
+/// `body`, `age`) and `finished` (the command that finished last, `kind`
+/// `finished`, and the rest the same), each there only when the session has
+/// one, and those two with their number (`seq`) and, where they came from a
+/// terminal buffer, whether it was on the screen (`shown`). `false` where
 /// there is no watcher, or one older or newer than this nvmux's.
 const READ: &str = r#"local version = ...
 local N = package.loaded['nvmux.notes']
@@ -439,6 +492,79 @@ pub fn read(sock: &Path) -> Reading {
         Err(e) if e.is_definitely_dead() => Reading::Gone,
         Err(_) => Reading::Unknown,
     }
+}
+
+/// One of the things a session keeps until it is seen — a notification, a
+/// failure, a command that finished — numbered, so that a reader can tell it
+/// from one it has already had (see [`crate::tell`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct News {
+    pub kind: Kind,
+    /// As a [`Note`]'s.
+    pub title: String,
+    /// As a [`Note`]'s.
+    pub text: String,
+    /// Its number in the session's count, which only goes up: 0 from a
+    /// watcher too old to keep one.
+    pub seq: u64,
+    /// Whether the terminal buffer it came from was on the screen when it
+    /// came, and `None` where it came from no buffer: a progress message.
+    pub shown: Option<bool>,
+    /// How long ago it came, in seconds, as of the read.
+    pub age: u64,
+    /// The terminal buffer it came from, while that is still a buffer.
+    pub buf: Option<i64>,
+    /// The number of the tab page a window shows that buffer in, as of the
+    /// read: `None` where no window does.
+    pub tab: Option<u32>,
+}
+
+/// What a careful read of one session came to (see [`hear`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Heard {
+    /// What it is keeping, oldest first: none, one or both of the two.
+    Said(Vec<News>),
+    /// It could not say just now, and nothing was left with it to run later.
+    Unknown,
+    /// Nothing is listening on its socket any more.
+    Gone,
+}
+
+/// Read the news the session on `sock` is keeping, giving it the watcher first
+/// where it has none, or another version's — and asking nothing of an editor
+/// waiting for a key.
+///
+/// [`read`] asks the mode and the record together, and leaves the record to be
+/// read when the key comes, which costs nothing for the minutes the picker is
+/// up. This is for a reader that runs for as long as nvmux does, of a session
+/// that may wait for its key all night, so the record is asked for only once
+/// the mode says the editor can answer: a round trip more, and nothing piled
+/// up in the session for the morning.
+pub fn hear(sock: &Path) -> Heard {
+    let mut client = match rpc::Client::connect(sock, BUDGET) {
+        Ok(c) => c,
+        Err(e) if e.is_definitely_dead() => return Heard::Gone,
+        Err(_) => return Heard::Unknown,
+    };
+    match carefully(&mut client) {
+        Ok(Some(v)) => Heard::Said(news_of(&v)),
+        Ok(None) => Heard::Unknown,
+        Err(e) if e.is_definitely_dead() => Heard::Gone,
+        Err(_) => Heard::Unknown,
+    }
+}
+
+/// [`snapshot`], one question at a time: `None`, and nothing asked, of an
+/// editor waiting for a key.
+fn carefully<S: Read + Write>(client: &mut rpc::Client<S>) -> Result<Option<Value>, RpcError> {
+    if client.get_mode()?.blocking {
+        return Ok(None);
+    }
+    let record = client.call("nvim_exec_lua", lua(READ))?;
+    if record == Value::Boolean(false) {
+        return client.call("nvim_exec_lua", lua(WATCHER)).map(Some);
+    }
+    Ok(Some(record))
 }
 
 /// A session coming to the front: the watcher put in where it is missing, and
@@ -562,6 +688,36 @@ fn note_of(record: &Value, read_at: Instant) -> Option<Note> {
         age: seconds(field(busy, "age")),
         read_at,
     })
+}
+
+/// The news a record holds, oldest first: the notification or failure, and
+/// the command that finished, each where there is one.
+fn news_of(record: &Value) -> Vec<News> {
+    let mut news: Vec<News> = ["note", "finished"]
+        .into_iter()
+        .filter_map(|slot| {
+            let n = field(record, slot)?;
+            let kind = match (slot, field(n, "kind").and_then(Value::as_str)) {
+                ("finished", _) => Kind::Finished,
+                (_, Some("failed")) => Kind::Failed,
+                _ => Kind::Notified,
+            };
+            Some(News {
+                kind,
+                title: text(field(n, "title")),
+                text: text(field(n, "body")),
+                seq: field(n, "seq").and_then(number).unwrap_or(0),
+                shown: field(n, "shown").and_then(Value::as_bool),
+                age: field(n, "age").and_then(number).unwrap_or(0),
+                buf: field(n, "buf").and_then(Value::as_i64),
+                tab: field(n, "tab")
+                    .and_then(number)
+                    .and_then(|t| u32::try_from(t).ok()),
+            })
+        })
+        .collect();
+    news.sort_by_key(|n| n.seq);
+    news
 }
 
 /// A key of a msgpack map.
@@ -759,6 +915,79 @@ mod tests {
         let note = note_of(&record, Instant::now()).expect("a note");
         assert_eq!(note.kind, Kind::Failed);
         assert_eq!(note.text, "exited with code 1");
+    }
+
+    /// The news is both of what a session keeps, whichever the picker would
+    /// show, oldest first, each with its number and whether its terminal was on
+    /// the screen; an older watcher's says neither.
+    #[test]
+    fn the_news_is_both_of_what_is_kept_by_number() {
+        let record = map(vec![
+            (
+                "note",
+                map(vec![
+                    ("kind", Value::from("notify")),
+                    ("title", Value::from("Claude Code")),
+                    ("body", Value::from("Claude needs your permission")),
+                    ("seq", Value::from(3)),
+                    ("shown", Value::from(false)),
+                    ("age", Value::from(12)),
+                    ("buf", Value::from(5)),
+                    ("tab", Value::from(2)),
+                ]),
+            ),
+            (
+                "finished",
+                map(vec![
+                    ("kind", Value::from("finished")),
+                    ("title", Value::from("cargo test")),
+                    ("body", Value::from("exited with code 0")),
+                    ("seq", Value::from(2)),
+                    ("shown", Value::from(true)),
+                ]),
+            ),
+            ("busy", map(vec![("title", Value::from("claude"))])),
+        ]);
+        let news = news_of(&record);
+        assert_eq!(
+            news.iter()
+                .map(|n| (n.kind, n.seq, n.shown))
+                .collect::<Vec<_>>(),
+            [
+                (Kind::Finished, 2, Some(true)),
+                (Kind::Notified, 3, Some(false))
+            ]
+        );
+        assert_eq!(
+            (news[1].title.as_str(), news[1].text.as_str()),
+            ("Claude Code", "Claude needs your permission")
+        );
+        assert_eq!(
+            (news[1].age, news[1].buf, news[1].tab),
+            (12, Some(5), Some(2)),
+            "how old, and the terminal it came from and where that is"
+        );
+        assert_eq!(
+            (news[0].buf, news[0].tab),
+            (None, None),
+            "a record that says neither"
+        );
+
+        let older = map(vec![(
+            "note",
+            map(vec![
+                ("kind", Value::from("failed")),
+                ("body", Value::from("x")),
+            ]),
+        )]);
+        assert_eq!(
+            news_of(&older)
+                .iter()
+                .map(|n| (n.kind, n.seq, n.shown))
+                .collect::<Vec<_>>(),
+            [(Kind::Failed, 0, None)]
+        );
+        assert!(news_of(&Value::Boolean(false)).is_empty());
     }
 
     /// A command that finished is news, so it comes before what is running;

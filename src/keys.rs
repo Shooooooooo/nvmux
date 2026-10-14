@@ -104,6 +104,10 @@ pub enum Action {
     /// two, so the direction stays a value all the way to the session loop
     /// instead of being spelled out again at every hand-off.
     Cycle(Direction),
+    /// `<prefix> Enter` — go where the newest card in the corner is about:
+    /// the session it came from, or the terminal of this one it came from
+    /// (see [`crate::card`]). Nothing, with no such card up.
+    Go,
 }
 
 /// One instruction from the machine, in order.
@@ -119,9 +123,9 @@ pub enum Step {
 /// screen describes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Binding {
-    /// The byte typed after the prefix. Printable ASCII; [`key_label`] spells
-    /// it for the help screen, since one of them is the space bar and would
-    /// otherwise be an empty cell.
+    /// The byte typed after the prefix. Printable ASCII, or Enter; [`key_label`]
+    /// spells it for the help screen, since one of them is the space bar and
+    /// would otherwise be an empty cell, and another is no character at all.
     pub key: u8,
     pub action: Action,
     /// One line, in terms of what happens to the user.
@@ -166,6 +170,12 @@ pub const BINDINGS: &[Binding] = &[
         action: Action::Cycle(Direction::Prev),
         help: "attach to the previous session, wrapping",
         hint: "prev",
+    },
+    Binding {
+        key: ENTER,
+        action: Action::Go,
+        help: "go where the card in the corner is about",
+        hint: "go",
     },
     Binding {
         key: b'?',
@@ -229,14 +239,22 @@ pub fn parse_prefix(s: &str) -> Result<u8, String> {
 
 /// Spell a key the way people read it: itself for a printable character, and
 /// a name for the space bar, which would otherwise be an invisible cell on the
-/// help screen and an unreadable one in the README.
+/// help screen and an unreadable one in the README — and for Enter, which is
+/// no character at all.
 pub fn key_label(byte: u8) -> String {
-    if byte == b' ' {
-        SPACE_NAME.to_string()
-    } else {
-        (byte as char).to_string()
+    match byte {
+        b' ' => SPACE_NAME.to_string(),
+        ENTER => ENTER_NAME.to_string(),
+        _ => (byte as char).to_string(),
     }
 }
+
+/// What the Enter key is called on the help screen and in the README.
+pub const ENTER_NAME: &str = "Enter";
+
+/// What it is drawn as on a one-line hint row, and on a card: `⏎`, as the
+/// picker's own row has it (see [`SPACE_GLYPH`]).
+pub const ENTER_GLYPH: &str = "⏎";
 
 /// What the space bar is drawn as on a one-line hint row: `␣` (U+2423), rather
 /// than [`SPACE_NAME`]. Such a row is uniformly lowercase — `esc`, never `Esc` —
@@ -255,10 +273,10 @@ pub const SPACE_GLYPH: &str = "␣";
 /// this function's promise rather than a property of whichever keys happen to be
 /// in [`BINDINGS`] today.
 pub fn key_glyph(byte: u8) -> String {
-    if byte == b' ' {
-        SPACE_GLYPH.to_string()
-    } else {
-        key_label(byte).to_lowercase()
+    match byte {
+        b' ' => SPACE_GLYPH.to_string(),
+        ENTER => ENTER_GLYPH.to_string(),
+        _ => key_label(byte).to_lowercase(),
     }
 }
 
@@ -1381,6 +1399,7 @@ mod tests {
             Action::Create,
             Action::Cycle(Direction::Next),
             Action::Cycle(Direction::Prev),
+            Action::Go,
             Action::Help,
         ];
         for action in all {
@@ -1391,6 +1410,7 @@ mod tests {
                 | Action::Detach
                 | Action::Create
                 | Action::Cycle(_)
+                | Action::Go
                 | Action::Help => {}
                 // Not in `all`: it carries a number, so it has no fixed key.
                 Action::Switch(_) => unreachable!("Switch is not a table action"),
@@ -1431,7 +1451,7 @@ mod tests {
     fn command_keys_are_distinct_printable_and_never_the_prefix() {
         for (i, a) in BINDINGS.iter().enumerate() {
             assert!(
-                a.key.is_ascii() && !a.key.is_ascii_control(),
+                a.key.is_ascii() && (!a.key.is_ascii_control() || a.key == ENTER),
                 "byte {:#04x} cannot be shown on the help screen",
                 a.key
             );
@@ -1616,6 +1636,19 @@ mod tests {
             forwarded(&steps).is_empty(),
             "the terminator must not reach nvim"
         );
+    }
+
+    /// `<prefix> Enter` with no number begun goes where the card in the
+    /// corner is about; begun, Enter still ends the number.
+    #[test]
+    fn enter_after_the_prefix_alone_goes_where_the_card_is_about() {
+        let mut p = Prefix::new(12);
+        let steps = p.feed(&[PREFIX, ENTER]);
+        assert_eq!(actions(&steps), vec![Action::Go]);
+        assert!(forwarded(&steps).is_empty(), "nothing reaches nvim");
+        assert!(!p.is_armed());
+        assert_eq!(key_label(ENTER), "Enter");
+        assert_eq!(key_glyph(ENTER), "⏎");
     }
 
     /// A number never starts with zero, so this is not a command at all.

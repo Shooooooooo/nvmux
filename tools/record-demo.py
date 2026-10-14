@@ -28,6 +28,16 @@ Driving on a pty means there is no `capture-pane` to read back, so the checks
 render the stream with pyte -- through `Screen` below, since pyte has no
 alternate screen of its own.
 
+**What the sessions have to say is staged.** The picker's signs and the card
+in the corner report what each session's watcher recorded (`src/notes.rs`),
+and a session made a minute ago has recorded nothing. So, off camera,
+api-server is given an agent at work -- a progress message left running, as a
+plugin driving one leaves it -- and dotfiles a run of its install script, in a
+terminal buffer no window shows, that has finished. During the take, the agent
+asks for permission the way Claude Code does: an OSC 777 notification, from
+another terminal buffer no window shows. All of it goes in through the
+session's own socket (see `rpc`), and none of it is typed at an editor.
+
 Needs, all on PATH:
   * nvim >= 0.11
   * agg >= 1.9   https://github.com/asciinema/agg/releases -- for `--renderer`,
@@ -283,6 +293,14 @@ precmd() { vcs_info }
 zstyle ':vcs_info:git:*' formats ' %b'
 setopt prompt_subst
 PROMPT='%F{blue}%~%f%F{green}${vcs_info_msg_0_}%f %# '
+""",
+    # Run off camera, in a terminal buffer no window shows, for the `✓` the
+    # picker opens on. It says what it would link and links nothing.
+    "dotfiles/install.sh": """\
+#!/bin/sh
+cd "$(dirname "$0")" || exit 1
+echo "would link ~/.zshrc -> $PWD/zsh/.zshrc"
+echo "would link ~/.config/nvim/init.lua -> $PWD/nvim/init.lua"
 """,
     "notes/todo.md": """\
 # This week
@@ -736,6 +754,8 @@ def write_projects(root):
         os.makedirs(os.path.dirname(full), exist_ok=True)
         with open(full, "w") as f:
             f.write(text)
+        if text.startswith("#!"):
+            os.chmod(full, 0o755)
 
 
 def make_sessions(env, projects):
@@ -763,16 +783,107 @@ def make_sessions(env, projects):
     term.close()
 
 
+# Run by an `nvim` that is only a client of the session (see `rpc`). The socket
+# and the code come in through the environment, so nothing is quoted twice.
+RPC = ("local ch = vim.fn.sockconnect('pipe', os.getenv('DEMO_SOCK'), { rpc = true }) "
+       "local ok, err = pcall(vim.rpcrequest, ch, 'nvim_exec_lua', os.getenv('DEMO_LUA'), {}) "
+       "vim.fn.chanclose(ch) "
+       "if not ok then io.stderr:write(tostring(err) .. '\\n') vim.cmd('cquit 1') end "
+       "vim.cmd('qall!')")
+
+# Off camera: an agent at work in api-server, reported as a plugin driving one
+# reports it -- a progress message, left running -- and the message line
+# cleared after it, so the editor does not show it once it is attached to.
+AGENT_AT_WORK = r"""
+vim.api.nvim_echo({ { 'editing src/routes.rs' } }, false,
+  { kind = 'progress', source = 'agent', title = 'claude', status = 'running' })
+vim.cmd.echo('""')
+"""
+
+# Off camera: dotfiles' install script, run to its end in a terminal buffer no
+# window shows -- and waited for until it has closed, so the watcher has seen
+# it finish.
+INSTALL = r"""
+local buf = vim.api.nvim_create_buf(true, false)
+local closed = false
+vim.api.nvim_create_autocmd('TermClose', {
+  buffer = buf,
+  once = true,
+  callback = function()
+    closed = true
+  end,
+})
+vim.api.nvim_buf_call(buf, function()
+  vim.fn.jobstart({ './install.sh' }, { term = true, cwd = vim.fn.getcwd() })
+end)
+vim.wait(5000, function()
+  return closed
+end)
+"""
+
+# In the take: the agent in api-server asks for permission, as Claude Code
+# does, from a terminal buffer no window shows -- and stays up after, as the
+# agent would, so that its ending is not news of its own.
+AGENT_ASKS = r"""
+local buf = vim.api.nvim_create_buf(true, false)
+vim.api.nvim_buf_call(buf, function()
+  vim.fn.jobstart({ 'sh', '-c',
+    [=[printf '\033]777;notify;Claude Code;Claude needs your permission\007'; exec sleep 600]=] },
+    { term = true })
+end)
+"""
+
+
+def socket_of(name):
+    """The socket of the session called `name`, from its metadata."""
+    runtime = "/tmp/nvmux-%d" % os.getuid()
+    for entry in sorted(os.listdir(runtime)):
+        if not entry.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(runtime, entry)) as f:
+                if json.load(f).get("name") == name:
+                    return os.path.join(runtime, entry[:-len(".json")] + ".sock")
+        except (OSError, ValueError):
+            pass
+    sys.exit("no session called %r in %s" % (name, runtime))
+
+
+def rpc(env, name, code):
+    """Run `code`, Lua, in the session called `name`, over its own socket."""
+    run = dict(env, DEMO_SOCK=socket_of(name), DEMO_LUA=code)
+    done = subprocess.run(["nvim", "--clean", "--headless",
+                           "-c", "lua " + RPC, "-c", "cquit 1"],
+                          env=run, capture_output=True, text=True, timeout=30)
+    if done.returncode != 0:
+        sys.exit("could not run Lua in %s: %s" % (name, done.stderr.strip()))
+
+
+def stage_news(env):
+    """What the sessions have to say when the take opens on them, off camera
+    (see the header): the agent at work in api-server, and dotfiles'
+    install, finished."""
+    rpc(env, "api-server", AGENT_AT_WORK)
+    rpc(env, "dotfiles", INSTALL)
+
+
 def perform(env):
     """The recorded take."""
     term = shell(env, record=True)      # recording is already running
     time.sleep(1.0)
 
-    # 1. the picker, with the sessions that already exist
+    # 1. the picker, with the sessions that already exist and what they have
+    # to say beside their names: the agent at work in api-server, its spinner
+    # turning and its note under the list, and dotfiles' install finished
     term.type("nvmux", per_char=0.09, wait=0.5)
     term.write(ENTER, wait=0.2, show=("\u23ce", "open the picker"))
     term.expect("attach", "the picker")
-    time.sleep(1.4)
+    term.expect("editing src/routes.rs", "the agent's note under the list")
+    if not any("dotfiles" in line and "\u2713" in line
+               for line in term.text().split("\n")):
+        term.close()
+        sys.exit("no \u2713 beside dotfiles:\n%s" % term.text())
+    time.sleep(2.4)
 
     # 2. make one, which is `c` and a name; creating attaches to it
     term.write(b"c", wait=0.6, show=("c", "new session"))
@@ -830,18 +941,27 @@ def perform(env):
     term.expect("HISTFILE", "the other buffer")
     time.sleep(1.4)
 
-    # 7. detach: the sessions keep running, nvmux exits
+    # 7. the agent left at work in api-server wants you: a card in the corner
+    # says so, and the prefix key and Enter go there
+    rpc(env, "api-server", AGENT_ASKS)
+    term.expect("Claude needs your permission", "the card in the corner")
+    time.sleep(2.2)
+    term.write(PREFIX + ENTER, show=("Ctrl-Space  ⏎", "go there"))
+    term.expect("list_users(", "api-server, its split and all")
+    time.sleep(1.6)
+
+    # 8. detach: the sessions keep running, nvmux exits
     term.write(PREFIX + b"d", show=("Ctrl-Space  d", "detach"))
     # The editor has to be gone, and waiting for the prompt does not say that:
     # leaving the alternate screen restores the shell's screen, which already
     # carries the `$` from before nvmux was started. That check passes the
     # instant the alternate screen is left -- before the detach has finished --
     # and the `nvmux` typed next then lands in the editor instead of the shell.
-    term.expect_gone("HISTFILE", "the editor")
+    term.expect_gone("list_users(", "the editor")
     term.expect("$", "the shell prompt back")
     time.sleep(1.4)
 
-    # 8. come back: the order is kept, and the split is where it was left
+    # 9. come back: the order is kept, and the split is where it was left
     term.type("nvmux", per_char=0.09, wait=0.4)
     term.write(ENTER, wait=0.2, show=("\u23ce", "open the picker"))
     term.expect("attach", "the picker again")
@@ -1270,6 +1390,7 @@ def main():
         projects = os.path.join(tmp, "projects")
         write_projects(projects)
         make_sessions(env, projects)
+        stage_news(env)
 
         print("recording...")
         events, presses = perform(env)

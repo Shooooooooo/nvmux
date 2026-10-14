@@ -10,12 +10,12 @@ Create named Neovim sessions, attach to them, detach, and come back later —
 with the editor running on a remote host while every keystroke and every pixel
 of rendering happens on your own terminal.
 
-![Opening the nvmux picker on three sessions; creating a fourth, blog, and moving it to the end of the list; attaching to api-server, scrolling as the text slides and opening a split that flies in from the side; switching to the next session with the prefix key, and to another buffer as it fades over; detaching, then relaunching nvmux to find the list in the order it was left, and reattaching to find the split where it was. Each key is shown as it is pressed.](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/demo.gif)
+![Opening the nvmux picker on three sessions, an agent's spinner turning beside api-server and a check mark beside dotfiles, whose install script finished; creating a fourth, blog, and moving it to the end of the list; attaching to api-server, scrolling as the text slides and opening a split that flies in from the side; switching to the next session with the prefix key, and to another buffer as it fades over; a card coming up in the corner as the agent in api-server asks for permission, and the prefix key and Enter going back there; detaching, then relaunching nvmux to find the list in the order it was left, and reattaching to find the split where it was. Each key is shown as it is pressed.](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/demo.gif)
 
 Make a session, put it where you want it in the list, work, hop to another,
-detach, come back: the sessions, their windows and their buffers are where you
-left them — and nvmux's own client animates the scrolls, splits and switches
-on the way.
+go back to the one that wants you, detach, come back: the sessions, their
+windows and their buffers are where you left them — and nvmux's own client
+animates the scrolls, splits and switches on the way.
 
 [Who it's for](#who-its-for) · [Why not tmux?](#why-not-tmux) · [Install](#install) · [Use](#use) · [How it works](#how-it-works) · [Configuration](#configuration)
 
@@ -95,11 +95,15 @@ reimplementing it.
 | `<prefix>` `n` | next session by number (wraps) |
 | `<prefix>` `p` | previous session by number (wraps) |
 | `<prefix>` `c` | set up a new session and attach to it — `Esc` goes back |
+| `<prefix>` `Enter` | go where the card in the corner is about: its session, or a terminal of this one |
 | `<prefix>` `?` | show these keys — `Esc` goes back |
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
 
 Pressing `<prefix>` puts a one-row reminder of these keys along the bottom of
-the screen; it goes as soon as the next key resolves it.
+the screen; it goes as soon as the next key resolves it. A switch, by key or
+out of the picker, says which session you have landed in, with a card in the
+top right corner that comes in with the session's screen and goes a moment
+later.
 
 ### Leaving a session
 
@@ -112,42 +116,6 @@ the screen; it goes as soon as the next key resolves it.
   undo history and jumplist; reattach later, from this machine or another one.
 - **`x` in the picker kills**, without asking the session about unsaved
   buffers. Use `:q` for the editor's own save prompts.
-
-### What a session has to say
-
-Beside each name the picker shows, dim, what that session has to report:
-
-| Sign | Means |
-|---|---|
-| `⠹` (turning) | something in it is busy: a progress message is running, which is how a plugin such as [agent.nvim](https://github.com/Shooooooooo/agent.nvim) says an agent is working, or a language server is at work — clangd indexing, say |
-| `⡆` | the same, with the percentage the progress gives |
-| `∗` | a program in one of its terminal buffers asked for a desktop notification — an agent wanting your permission, say |
-| `!` | a progress message failed, or a command in one of its terminal buffers did — a build, say |
-| `✓` | a command in one of its terminal buffers succeeded — a test run, say |
-
-The selected session's note is spelt out under the list —
-`Claude Code · Claude needs your permission · 2m` — and a notification, a
-failure or a finished command stays until you next open its session. A
-session with more than one thing to say shows what wants you first: a
-notification or a failure, then a finished command, then whatever is busy.
-
-To know, nvmux leaves a watcher in each session — one augroup, `nvmux_notes` —
-that records Neovim's progress messages, what its language servers say they
-are working on (`clangd: 42% indexing 51/120`), the notifications programs in
-terminal buffers send — OSC 777 (Ghostty's), OSC 9 (iTerm2's) and OSC 99
-(kitty's) — and how each command there ends, a terminal's own program or one
-run at its shell's prompt: with 0, it has finished, and with any other code,
-failed (`cargo build: exited with code 101`). A shell's commands count only
-where it says how they went, with OSC 133, which fish 4 does by itself and
-other shells can be set up to. The watcher stays when nvmux leaves, so a
-session that wanted you overnight says so in the morning.
-
-> [!NOTE]
-> A program only sends a notification to a terminal it thinks will show it.
-> Claude Code goes by `TERM_PROGRAM`, which a session on this machine inherits
-> from your terminal and a session on a remote host does not. There, or in a
-> terminal Claude Code sends nothing to — Windows Terminal, WezTerm — set its
-> Notifications setting (`/config`) to "Ghostty (OSC 777)".
 
 ## How it works
 
@@ -186,6 +154,33 @@ particles and a fading blink can be turned on under `[effects]`. Set
 the terminal can do reaches the editor as Neovim negotiates it, not through
 nvmux.
 
+### What a session has to say
+
+The picker shows a sign beside each session that has something to report:
+
+| Sign | Means |
+|---|---|
+| `⠹` | busy: a plugin or a language server is working |
+| `∗` | a program in a terminal buffer sent a notification |
+| `!` | something failed — a command in a terminal buffer, say |
+| `✓` | a command in a terminal buffer succeeded |
+
+While you are in a session, the others' news comes up as cards in the corner,
+and `<prefix> Enter` goes to the newest:
+
+```
+╭─ ✓ api-server ──────────────────────── 3s ─╮
+│ cargo test: exited with code 0             │
+│ Ctrl-Space ⏎ go there                      │
+╰────────────────────────────────────────────╯
+```
+
+Cards need nvmux's own client; with `ui = "nvim"` there are none.
+
+> [!TIP]
+> On a remote host, set Claude Code's Notifications setting (`/config`) to
+> "Ghostty (OSC 777)", or it sends none.
+
 ## Configuration
 
 nvmux needs no configuration. An optional TOML file — `$NVMUX_CONFIG` if set,
@@ -217,8 +212,8 @@ enabled = true   # master switch: false turns every effect below off
 
 [effects.fade]
 enabled     = true   # dissolve between screens; NO_COLOR forces this off
-duration_ms = 200    # the whole dissolve, out and back; the notice pays it too
-session     = true   # Neovim's own screen dissolves too, and backs the notice
+duration_ms = 200    # the whole dissolve, out and back
+session     = true   # Neovim's own screen dissolves too
 
 [effects.move]
 enabled = true   # stars off a session being moved, rows stepping aside, its landing
