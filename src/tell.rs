@@ -215,7 +215,8 @@ fn run(inbox: &Receiver<Command>, prefix: u8) {
 }
 
 /// Read every session, all at a time, and post a card for the session in
-/// front, `front`, of what is news.
+/// front, `front`, of what is news — oldest first, whichever session said it
+/// ([`oldest_first`]).
 fn round(watched: &mut [Watched], front: &str, prefix: u8) {
     let heard: Vec<(usize, Heard)> = std::thread::scope(|s| {
         let reads: Vec<_> = watched
@@ -228,6 +229,7 @@ fn round(watched: &mut [Watched], front: &str, prefix: u8) {
             .collect();
         reads.into_iter().filter_map(|r| r.join().ok()).collect()
     });
+    let mut told = Vec::new();
     for (i, heard) in heard {
         let Heard::Said(news) = heard else {
             continue;
@@ -237,16 +239,29 @@ fn round(watched: &mut [Watched], front: &str, prefix: u8) {
         let from = (!here).then_some((w.id.as_str(), w.name.as_str()));
         for n in to_tell(w.heard, &news, here) {
             if let Some((card, go)) = card_for(n, from, prefix) {
-                card::board().post(Post {
+                let post = Post {
                     front: front.to_string(),
                     card,
                     go,
-                });
+                };
+                told.push((n.age, post));
             }
         }
         let top = news.iter().map(|n| n.seq).max().unwrap_or(0);
         w.heard = Some(w.heard.map_or(top, |h| h.max(top)));
     }
+    for post in oldest_first(told) {
+        card::board().post(post);
+    }
+}
+
+/// What a round tells, `(age, post)` as the sessions were read, in the order
+/// to post it: oldest first, so that the newest card lands on top whichever
+/// session said it. What one session said, and what several said the same
+/// second, keeps the order it came in.
+fn oldest_first(mut told: Vec<(u64, Post)>) -> Vec<Post> {
+    told.sort_by_key(|&(age, _)| std::cmp::Reverse(age));
+    told.into_iter().map(|(_, post)| post).collect()
 }
 
 #[cfg(test)]
@@ -356,6 +371,49 @@ mod tests {
             to_tell(Some(0), &said, false).len(),
             3,
             "from elsewhere, all"
+        );
+    }
+
+    /// What a round tells is posted oldest first, so that the newest card is
+    /// the one on top, though another session was read before the one that
+    /// said it; and what one session said in a second keeps its order.
+    #[test]
+    fn what_a_round_tells_is_posted_oldest_first_whichever_session_said_it() {
+        let told = |name: &str, text: &str, age: u64| {
+            let said = News {
+                age,
+                ..news(Kind::Finished, text, "exited with code 0", 1, None)
+            };
+            let (card, go) = card_for(&said, Some(("abcd2345", name)), 0).expect("news");
+            let post = Post {
+                front: "front".to_string(),
+                card,
+                go,
+            };
+            (age, post)
+        };
+        let posted = oldest_first(vec![
+            told("blog", "npm run build", 1),
+            told("notes", "git push", 2),
+            told("api-server", "cargo test", 4),
+            told("api-server", "cargo clippy", 4),
+        ]);
+        assert_eq!(
+            posted
+                .iter()
+                .map(|p| (p.card.title.as_str(), p.card.age))
+                .collect::<Vec<_>>(),
+            [
+                ("api-server", Some(4)),
+                ("api-server", Some(4)),
+                ("notes", Some(2)),
+                ("blog", Some(1)),
+            ]
+        );
+        assert_eq!(
+            posted[0].card.body.as_deref(),
+            Some("cargo test: exited with code 0"),
+            "{posted:?}"
         );
     }
 }
