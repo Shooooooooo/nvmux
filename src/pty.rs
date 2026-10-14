@@ -3356,11 +3356,14 @@ fn pump(
         // above and never reaches this, which is what stops `<prefix> Space`
         // flashing a bar on its way to the picker.
         let busy = child_spoke || attachment.hold.is_some() || attachment.mid_sequence();
+        let now = Instant::now();
+        let go = attachment.desk.as_ref().is_some_and(|d| d.can_go(now));
         match bar.step(
-            Instant::now(),
+            now,
             busy,
             term::terminal_size(),
             prefix.pending(),
+            go,
             attachment.shadow.as_ref(),
         ) {
             hint::Act::Idle => {}

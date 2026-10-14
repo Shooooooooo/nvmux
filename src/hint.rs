@@ -132,17 +132,23 @@ pub enum Act {
     Blanked(Vec<u8>),
 }
 
-/// Every entry the bar can offer, in the order it offers them: the commands as
+/// Every entry the bar offers, in the order it offers them: the commands as
 /// [`keys::BINDINGS`] lists them, then the digit rule.
+///
+/// All of them but `⏎ go` when `go` is false — no card up that
+/// `<prefix> Enter` would act on (see [`crate::card::Desk::can_go`]). That one
+/// command does nothing then, and a row offering it would send the user to a
+/// key that does nothing.
 ///
 /// Keys are spelled [`keys::key_glyph`], which is the picker's hint-row grammar
 /// and not the help screen's: lowercase throughout, and `␣` for the space bar.
 /// This is the picker's row on another screen, so it is spelled the picker's way
 /// — two rows that named the same key two ways would be the kind of drift the
 /// rest of this crate pins down with a test, and there is one below.
-fn entries() -> Vec<String> {
+fn entries(go: bool) -> Vec<String> {
     keys::BINDINGS
         .iter()
+        .filter(|b| go || b.action != keys::Action::Go)
         .map(|b| format!("{} {}", keys::key_glyph(b.key), b.hint))
         .chain(std::iter::once(DIGITS.to_string()))
         .collect()
@@ -158,7 +164,7 @@ fn entries() -> Vec<String> {
 /// opinion about priority — one table, one order — so `? help` goes before
 /// `p prev`, and the two that a user pressing the prefix by accident most needs,
 /// the picker and the detach, are the two that survive longest.
-fn text(pending: Pending, cols: u16) -> Option<String> {
+fn text(pending: Pending, go: bool, cols: u16) -> Option<String> {
     let cols = usize::from(cols);
     let row = match pending {
         // A number being typed, as the picker shows one on its own hint row —
@@ -168,7 +174,7 @@ fn text(pending: Pending, cols: u16) -> Option<String> {
         Pending::Number(n) => format!("#{n}"),
         Pending::Command => {
             let mut row = String::new();
-            for entry in entries() {
+            for entry in entries(go) {
                 let gap = if row.is_empty() { 0 } else { GAP.width() };
                 if row.width() + gap + entry.width() > cols {
                     break;
@@ -198,11 +204,11 @@ fn text(pending: Pending, cols: u16) -> Option<String> {
 /// `None` when the screen has no room. Pure, so the geometry is testable without
 /// a terminal, and named, because two things need it: the paint, and the erase
 /// that has to put back exactly the cells the paint covered.
-pub fn overlay(pending: Pending, size: PtySize) -> Option<Over> {
+pub fn overlay(pending: Pending, go: bool, size: PtySize) -> Option<Over> {
     if size.rows < MIN_ROWS || size.cols == 0 {
         return None;
     }
-    let text = text(pending, size.cols)?;
+    let text = text(pending, go, size.cols)?;
     let cols = usize::from(size.cols);
     // Both subtractions are safe: `text` was measured to fit `cols`. Odd slack
     // falls to the right, which is what integer division does and is not worth a
@@ -306,13 +312,15 @@ impl Bar {
     /// round, or is having its first paint held: both mean the same two things
     /// here, that this is no moment to write and that anything already on the
     /// row may have been drawn over. `under` is the session's screen as the
-    /// shadow has it, which is what an erase puts back.
+    /// shadow has it, which is what an erase puts back. `go` is whether a card
+    /// is up for `<prefix> Enter` to act on, and so whether the bar offers it.
     pub fn step(
         &mut self,
         now: Instant,
         busy: bool,
         size: PtySize,
         pending: Option<Pending>,
+        go: bool,
         under: Option<&Shadow>,
     ) -> Act {
         // A resize is its own erase, so the bar forgets what it drew instead of
@@ -329,7 +337,7 @@ impl Bar {
         // Before the lull, not after it: the bar has to know a write is owed in
         // order to ask to be woken to make it, and the pass that reads the
         // prefix is often one the child is still talking on.
-        let want = pending.and_then(|p| overlay(p, size));
+        let want = pending.and_then(|p| overlay(p, go, size));
         if want != self.want {
             self.want = want;
             self.agreed = false;
@@ -419,7 +427,7 @@ mod tests {
 
     /// The bar's one row of text, as it would be drawn on `size`.
     fn row(pending: Pending, size: PtySize) -> String {
-        overlay(pending, size).expect("a bar").rows.remove(0)
+        overlay(pending, true, size).expect("a bar").rows.remove(0)
     }
 
     /// A bar and the clock it is told, advanced a lull at a time.
@@ -468,7 +476,7 @@ mod tests {
         fn step(&mut self, busy: bool, pending: Option<Pending>, size: PtySize) -> Act {
             self.now += SETTLE;
             self.bar
-                .step(self.now, busy, size, pending, self.shadow.as_ref())
+                .step(self.now, busy, size, pending, true, self.shadow.as_ref())
         }
 
         fn wake_at(&self) -> Option<Instant> {
@@ -481,7 +489,7 @@ mod tests {
     /// screen already gives, on the row you see before you have chosen a key.
     #[test]
     fn the_row_lists_every_binding_in_table_order() {
-        let text = text(Pending::Command, 200).expect("a row");
+        let text = text(Pending::Command, true, 200).expect("a row");
         let mut rest = text.as_str();
         for b in keys::BINDINGS {
             let entry = format!("{} {}", keys::key_glyph(b.key), b.hint);
@@ -502,7 +510,7 @@ mod tests {
     /// wrong in the one place they cannot miss.
     #[test]
     fn the_row_never_spells_the_prefix() {
-        let text = text(Pending::Command, 200).expect("a row");
+        let text = text(Pending::Command, true, 200).expect("a row");
         for prefix in [keys::PREFIX, keys::parse_prefix("C-t").expect("a chord")] {
             let label = keys::prefix_label(prefix);
             assert!(
@@ -519,7 +527,7 @@ mod tests {
     /// same row contradicting itself.
     #[test]
     fn the_space_bar_is_the_glyph_the_picker_uses() {
-        let text = text(Pending::Command, 200).expect("a row");
+        let text = text(Pending::Command, true, 200).expect("a row");
         assert!(
             text.starts_with(&format!("{} picker", keys::SPACE_GLYPH)),
             "the space bar is not the glyph: {text:?}"
@@ -536,7 +544,7 @@ mod tests {
     /// with a command half-typed.
     #[test]
     fn the_row_does_not_offer_a_repeated_prefix_or_a_replay() {
-        let text = text(Pending::Command, 200).expect("a row");
+        let text = text(Pending::Command, true, 200).expect("a row");
         assert!(
             !text.contains("literal"),
             "the bar offers the literal prefix: {text:?}"
@@ -555,9 +563,9 @@ mod tests {
     /// which is why this row does not use `draw::truncate`.
     #[test]
     fn entries_are_dropped_whole_to_fit() {
-        let all = entries();
+        let all = entries(true);
         for cols in 1..=200u16 {
-            let Some(text) = text(Pending::Command, cols) else {
+            let Some(text) = text(Pending::Command, true, cols) else {
                 continue;
             };
             assert!(
@@ -580,16 +588,17 @@ mod tests {
     /// a half of one. The attach notice's answer to the same question.
     #[test]
     fn a_screen_too_narrow_for_one_entry_says_nothing() {
-        let first = entries().remove(0);
+        let first = entries(true).remove(0);
         for cols in 0..first.width() {
             assert_eq!(
-                text(Pending::Command, u16::try_from(cols).expect("small")),
+                text(Pending::Command, true, u16::try_from(cols).expect("small")),
                 None,
                 "drew part of {first:?} in {cols} columns"
             );
         }
         assert!(text(
             Pending::Command,
+            true,
             u16::try_from(first.width()).expect("small")
         )
         .is_some());
@@ -599,8 +608,8 @@ mod tests {
     /// nvmux's hints is worse off than one with no hints at all.
     #[test]
     fn the_bar_never_takes_a_sessions_only_row() {
-        assert_eq!(overlay(Pending::Command, size(200, 1)), None);
-        assert!(overlay(Pending::Command, size(200, 2)).is_some());
+        assert_eq!(overlay(Pending::Command, true, size(200, 1)), None);
+        assert!(overlay(Pending::Command, true, size(200, 2)).is_some());
     }
 
     /// The degenerate screens, where the bar must either decline or stay inside
@@ -613,7 +622,7 @@ mod tests {
     fn a_tiny_screen_is_either_declined_or_drawn_inside_itself() {
         for &(cols, rows) in TINY_SIZES {
             for pending in [Pending::Command, Pending::Number(7)] {
-                let Some(over) = overlay(pending, size(cols, rows)) else {
+                let Some(over) = overlay(pending, true, size(cols, rows)) else {
                     continue;
                 };
                 assert_eq!(
@@ -648,7 +657,7 @@ mod tests {
     #[test]
     fn the_bar_is_the_last_row_at_full_width() {
         for (cols, rows) in [(80u16, 24u16), (13, 2), (200, 50)] {
-            let over = overlay(Pending::Command, size(cols, rows)).expect("a bar");
+            let over = overlay(Pending::Command, true, size(cols, rows)).expect("a bar");
             assert_eq!(over.top, rows - 1, "not the last row at {cols}x{rows}");
             assert_eq!(over.left, 0, "not the full width at {cols}x{rows}");
             assert_eq!(over.width, cols);
@@ -680,7 +689,7 @@ mod tests {
     /// a line rather than merely draw in the wrong place.
     #[test]
     fn the_bytes_are_one_synchronized_update_that_cannot_scroll() {
-        let over = overlay(Pending::Command, big()).expect("a bar");
+        let over = overlay(Pending::Command, true, big()).expect("a bar");
         let bytes = announce::placed(&over, SGR);
         let text = String::from_utf8(bytes).expect("utf-8");
 
@@ -877,7 +886,7 @@ mod tests {
     /// row the editor has moved on from, and call the bar erased.
     #[test]
     fn only_a_usable_shadow_with_colours_puts_the_row_back() {
-        let over = overlay(Pending::Command, big()).expect("a bar");
+        let over = overlay(Pending::Command, true, big()).expect("a bar");
         let shadow = screen(24, 80);
         assert!(shadow.is_usable(), "the fixture starts usable");
 
@@ -925,12 +934,51 @@ mod tests {
         );
     }
 
+    /// With no card up, `<prefix> Enter` does nothing, so the bar does not
+    /// offer it — and offers everything else just as it would.
+    #[test]
+    fn go_is_offered_only_with_a_card_to_go_to() {
+        let go = format!("{} go", keys::ENTER_GLYPH);
+        let with = text(Pending::Command, true, 200).expect("a row");
+        let without = text(Pending::Command, false, 200).expect("a row");
+        assert!(with.contains(&go), "{with:?}");
+        assert!(!without.contains(&go), "{without:?}");
+        assert_eq!(
+            without,
+            with.split(GAP)
+                .filter(|e| *e != go)
+                .collect::<Vec<_>>()
+                .join(GAP)
+        );
+    }
+
+    /// The card going up or coming down while the prefix waits redraws the
+    /// bar: it is a change in what the bar wants, like any other.
+    #[test]
+    fn a_card_coming_down_redraws_the_bar() {
+        let size = big();
+        let mut d = Driver::new(size);
+        assert!(matches!(
+            d.quiet(Some(Pending::Command), size),
+            Act::Write(_)
+        ));
+        d.now += SETTLE;
+        let act = d
+            .bar
+            .step(d.now, false, size, Some(Pending::Command), false, None);
+        let Act::Write(bytes) = act else {
+            panic!("the bar was not redrawn: {act:?}");
+        };
+        let painted = String::from_utf8_lossy(&bytes);
+        assert!(!painted.contains("go"), "{painted:?}");
+    }
+
     /// A half-typed number is shown, or the bar would look like it had swallowed
     /// the digit — the reason the picker shows one on its own hint row.
     #[test]
     fn a_pending_number_is_shown() {
-        assert_eq!(text(Pending::Number(1), 80).as_deref(), Some("#1"));
-        assert_eq!(text(Pending::Number(12), 80).as_deref(), Some("#12"));
+        assert_eq!(text(Pending::Number(1), true, 80).as_deref(), Some("#1"));
+        assert_eq!(text(Pending::Number(12), true, 80).as_deref(), Some("#12"));
         assert!(row(Pending::Number(7), big()).contains("#7"));
     }
 
@@ -942,7 +990,7 @@ mod tests {
     fn a_bar_with_nothing_to_draw_asks_for_no_wake_up() {
         let narrow = size(6, 24);
         assert_eq!(
-            overlay(Pending::Command, narrow),
+            overlay(Pending::Command, true, narrow),
             None,
             "the fixture is wide enough after all"
         );
