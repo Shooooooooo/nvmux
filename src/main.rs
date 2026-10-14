@@ -369,9 +369,11 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             // The relay, with the chance to start the next client while this
             // session is still dissolving: `begin_next` fires on a `<prefix>`
             // switch, before the fade, and what it leaves in `begun` is waited
-            // for at the top of this loop. Scoped, so the closure's borrows
-            // end before the match below — which assigns to the very things it
-            // reads.
+            // for at the top of this loop. What it hands back is the card the
+            // switch lands with, which stands on the screen from the key to
+            // the session it names (see `pty::relay`). Scoped, so the
+            // closure's borrows end before the match below — which assigns to
+            // the very things it reads.
             let ended = {
                 let mut begin_next = |target: pty::Target| {
                     // Resolved here, and not again below: the session started
@@ -379,36 +381,44 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     // A target that names nothing is left to the path below,
                     // which can re-list for it; that is a round trip, and this
                     // is not the place to spend one.
-                    let Some(session) = pick(&listing, target, current.state.num) else {
-                        return;
-                    };
+                    let session = pick(&listing, target, current.state.num)?;
                     // A switch onto the session already attached reuses the
                     // client in hand. Starting a second one for it would put a
                     // second UI on that server — which shrinks its screen to
                     // the smaller of the two — for a client that would then be
-                    // dropped unused.
+                    // dropped unused; and it lands nowhere new.
                     if session.id == current.id {
-                        return;
+                        return None;
                     }
+                    let step = match target {
+                        pty::Target::Step(dir) => Some((dir, &current)),
+                        pty::Target::Number(_) | pty::Target::Session(_) => None,
+                    };
+                    let landing = nvmux::card::Card::arrival(
+                        nvmux::card::next_id(),
+                        &announce::label(&session.name),
+                        false,
+                    )
+                    .in_row(row_of(&listing, session, step));
                     // Nor for one with a client kept for it, which has nothing
                     // to start: the switch resumes that one. Nor for one whose
                     // kept client has left, which may have left with the link:
                     // the switch recovers that first, and a start here would
                     // go over it before then (see `resume_or_attach`).
-                    if pool.has(&session.id) {
-                        return;
+                    if !pool.has(&session.id) {
+                        match begin_attachment(transport, session) {
+                            Ok(b) => begun = Some(b),
+                            // Not reported: the path below attempts the same
+                            // attach a moment later, where a failure has a
+                            // screen to land on and a message written for it.
+                            Err(e) => tracing::debug!(
+                                id = %session.id,
+                                error = %e,
+                                "could not start the next client early"
+                            ),
+                        }
                     }
-                    match begin_attachment(transport, session) {
-                        Ok(b) => begun = Some(b),
-                        // Not reported: the path below attempts the same
-                        // attach a moment later, where a failure has a screen
-                        // to land on and a message written for it.
-                        Err(e) => tracing::debug!(
-                            id = %session.id,
-                            error = %e,
-                            "could not start the next client early"
-                        ),
-                    }
+                    Some(landing)
                 };
                 pty::relay(attachment, highest, &mut begin_next)?
             };
@@ -492,7 +502,14 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     ui::help::run()?;
                     continue;
                 }
-                (pty::Outcome::Switch(target), held) => {
+                (pty::Outcome::Switch(target), mut held) => {
+                    // The card the switch lands with, left standing on the
+                    // screen for the next attach to take down as it draws the
+                    // card again — or, attaching nowhere, as the one it falls
+                    // back on does.
+                    if let Some(h) = held.as_mut().and_then(pty::Attachment::take_left_standing) {
+                        hand_off = Some(h);
+                    }
                     // Held rather than killed, so a number that names nothing —
                     // or a cycle with nowhere to go — puts the user straight
                     // back where they were.

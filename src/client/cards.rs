@@ -29,8 +29,11 @@
 //! Where a switch landed is a row of names: the session landed in, bold,
 //! between the one `<prefix> p` goes to and the one `<prefix> n` goes to,
 //! faint — and under it, that the session is waiting for a key, where it is.
-//! It has no fade in of its own: it is drawn before the session's screen
-//! dissolves in, and comes in with it. A switch by `<prefix> n` or
+//! It takes no part in the session's own fade: drawn before the session's
+//! screen dissolves in, it stands while the screen comes in under it (see
+//! [`arrival_footprint`]) — and on a switch by key, from the key on, the
+//! session left drawing it as it goes, and the screen handed over between the
+//! two keeping it (see [`crate::handoff`]). A switch by `<prefix> n` or
 //! `<prefix> p` then moves the row a name the way it went: the session left
 //! goes faint as the one landed in comes up, a name goes off one end and the
 //! next comes on at the other.
@@ -562,10 +565,7 @@ impl Cards {
             return;
         }
         let pens = Pens::new(base, colors, signs);
-        let at = Margin {
-            end: frame.width - MARGIN - 1,
-            widest: WIDTH.min(frame.width - MARGIN),
-        };
+        let at = Margin::of(frame.width);
         let bottom = frame.height - BOTTOM;
         let whole = self.whole();
         let mut sheet = Sheet::new(frame.width);
@@ -616,6 +616,16 @@ impl Cards {
 struct Margin {
     end: usize,
     widest: usize,
+}
+
+impl Margin {
+    /// On a screen `cols` wide.
+    fn of(cols: usize) -> Self {
+        Self {
+            end: cols - MARGIN - 1,
+            widest: WIDTH.min(cols - MARGIN),
+        }
+    }
 }
 
 /// The rows `card` takes while its words are up: the arrival's row of names
@@ -751,14 +761,20 @@ impl<'a> Name<'a> {
     }
 }
 
-/// Where a switch landed, on `row`: the row of names, moving if the switch
-/// was a step along it, and under it that the session is waiting for a key.
-fn arrival(sheet: &mut Sheet, l: &Live, p: Pieces, row: usize, at: Margin, pens: &Pens) {
-    let card = &l.card;
-    if p.whole <= 0.0 {
-        return;
-    }
-    let title = fit(&card.title, at.widest);
+/// An arrival laid out on its row: its names, each from where it lies
+/// before a step to where it lies after, and the columns it covers — its row
+/// as it lies either side of the step, the one span while it moves — and the
+/// line under it, that the session is waiting for a key, and where.
+struct Landing<'a> {
+    names: Vec<Name<'a>>,
+    covers: (usize, usize),
+    waiting: Option<(String, usize, usize)>,
+}
+
+/// `card`'s names, the one landed in cut to `title`, laid out flush right in
+/// the margin, a gap between: the one landed in alone where they are too
+/// wide for it.
+fn landing<'a>(card: &'a Card, title: &'a str, at: Margin) -> Landing<'a> {
     // Flush right, a gap between: `None` where the names are too wide.
     let lay = |names: &[&str]| -> Option<Vec<isize>> {
         let width = names.iter().map(|n| n.width()).sum::<usize>() + GAP * (names.len() - 1);
@@ -776,22 +792,22 @@ fn arrival(sheet: &mut Sheet, l: &Live, p: Pieces, row: usize, at: Margin, pens:
                 .collect(),
         )
     };
-    let side = card.row.as_deref().cloned().unwrap_or_default();
+    let side = card.row.as_deref();
+    let prev = side.and_then(|s| s.prev.as_deref());
+    let next = side.and_then(|s| s.next.as_deref());
     let mut after_names: Vec<&str> = Vec::new();
-    after_names.extend(side.prev.as_deref());
-    after_names.push(&title);
-    after_names.extend(side.next.as_deref());
-    let mut landed_at = usize::from(side.prev.is_some());
+    after_names.extend(prev);
+    after_names.push(title);
+    after_names.extend(next);
+    let mut landed_at = usize::from(prev.is_some());
     let after = match lay(&after_names) {
         Some(cols) => cols,
         None => {
-            after_names = vec![&title];
+            after_names = vec![title];
             landed_at = 0;
             vec![(at.end + 1 - title.width()) as isize]
         }
     };
-    // What it covers: its row as it lies after the step and before it, the
-    // one span as the row moves.
     let mut covers = after[0];
     let mut names: Vec<Name> = after_names
         .iter()
@@ -805,14 +821,15 @@ fn arrival(sheet: &mut Sheet, l: &Live, p: Pieces, row: usize, at: Margin, pens:
             there: (1.0, 1.0),
         })
         .collect();
-    let moving = match (&side.step, &side.prev, &side.next) {
+    let step = side.and_then(|s| s.step.as_ref());
+    let moving = match (step, prev, next) {
         (Some(step), Some(prev), Some(next)) if after_names.len() == 3 => {
             let before_names: [&str; 3] = if step.forward {
-                [&step.gone, prev, &title]
+                [&step.gone, prev, title]
             } else {
-                [&title, next, &step.gone]
+                [title, next, &step.gone]
             };
-            lay(&before_names).map(|before| (step.forward, before, prev, next, &step.gone))
+            lay(&before_names).map(|before| (step.forward, before, prev, next, step.gone.as_str()))
         }
         _ => None,
     };
@@ -829,22 +846,94 @@ fn arrival(sheet: &mut Sheet, l: &Live, p: Pieces, row: usize, at: Margin, pens:
             vec![
                 name(gone, (before[0], before[0] + shift), false, false, off),
                 name(prev, (before[1], after[0]), true, false, (1.0, 1.0)),
-                name(&title, (before[2], after[1]), false, true, (1.0, 1.0)),
+                name(title, (before[2], after[1]), false, true, (1.0, 1.0)),
                 name(next, (after[2] - shift, after[2]), false, false, on),
             ]
         } else {
             vec![
                 name(prev, (after[0] - shift, after[0]), false, false, on),
-                name(&title, (before[0], after[1]), false, true, (1.0, 1.0)),
+                name(title, (before[0], after[1]), false, true, (1.0, 1.0)),
                 name(next, (before[1], after[2]), true, false, (1.0, 1.0)),
                 name(gone, (before[2], before[2] + shift), false, false, off),
             ]
         };
     }
+    let waiting = card.body.as_ref().map(|waiting| {
+        let end = after[landed_at] as usize + after_names[landed_at].width() - 1;
+        let waiting = fit(waiting, end + 1);
+        let from = end + 1 - waiting.width();
+        (waiting, from, end)
+    });
+    Landing {
+        names,
+        covers: (covers.max(0) as usize, at.end),
+        waiting,
+    }
+}
+
+/// Where an arrival stands on a screen, as the one card up — as a relay opens
+/// with it — and as its first frame draws it, before its row moves.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Footprint {
+    /// On each of its rows, the columns it covers: its row of names as wide as
+    /// it lies either side of a step, and the line under it.
+    pub spans: Vec<(usize, usize, usize)>,
+    /// What it writes on them: each character, and the cell it starts on.
+    pub glyphs: Vec<(usize, usize, char)>,
+}
+
+/// Where `card`, an arrival, stands on a screen `cols` wide and `rows` high:
+/// what a session's dissolve leaves standing (see [`crate::shadow::Kept`]), so
+/// that it stays as it is while the screen under it comes and goes. Nothing
+/// where it would not be drawn: not an arrival, or a screen too small for it.
+pub fn arrival_footprint(card: &Card, cols: usize, rows: usize) -> Footprint {
+    if card.kind != Kind::Arrival
+        || cols < MIN_COLS
+        || rows < MIN_ROWS
+        || TOP + height(card, false) > rows - BOTTOM
+    {
+        return Footprint::default();
+    }
+    let at = Margin::of(cols);
+    let title = fit(&card.title, at.widest);
+    let landing = landing(card, &title, at);
+    let mut glyphs = Vec::new();
+    let mut write = |row: usize, col: usize, text: &str| {
+        let mut at = col;
+        for ch in text.chars() {
+            let w = ch.width().unwrap_or(0);
+            if w > 0 && ch != ' ' && at + w <= cols {
+                glyphs.push((row, at, ch));
+            }
+            at += w;
+        }
+    };
+    for n in landing.names.iter().filter(|n| n.there.0 > 0.0) {
+        if let Ok(col) = usize::try_from(n.cols.0) {
+            write(TOP, col, n.text);
+        }
+    }
+    let mut spans = vec![(TOP, landing.covers.0, landing.covers.1)];
+    if let Some((waiting, from, end)) = &landing.waiting {
+        write(TOP + 1, *from, waiting);
+        spans.push((TOP + 1, *from, *end));
+    }
+    Footprint { spans, glyphs }
+}
+
+/// Where a switch landed, on `row`: the row of names, moving if the switch
+/// was a step along it, and under it that the session is waiting for a key.
+fn arrival(sheet: &mut Sheet, l: &Live, p: Pieces, row: usize, at: Margin, pens: &Pens) {
+    let card = &l.card;
+    if p.whole <= 0.0 {
+        return;
+    }
+    let title = fit(&card.title, at.widest);
+    let landing = landing(card, &title, at);
     let s = p.slide;
     let bright = pens.name(card);
     let faint = pens.faint;
-    for n in &names {
+    for n in &landing.names {
         let there = p.whole * (n.there.0 + (n.there.1 - n.there.0) * s);
         if there <= 0.01 {
             continue;
@@ -861,13 +950,11 @@ fn arrival(sheet: &mut Sheet, l: &Live, p: Pieces, row: usize, at: Margin, pens:
         };
         sheet.text_at(row, col, n.text, pen, there);
     }
-    sheet.part(row, covers.max(0) as usize, at.end, p.mask, PEAK, REACH);
-    if let Some(waiting) = &card.body {
-        let end = after[landed_at] as usize + after_names[landed_at].width() - 1;
-        let waiting = fit(waiting, end + 1);
-        let from = end + 1 - waiting.width();
-        sheet.text(row + 1, from, &waiting, pens.soft, p.whole);
-        sheet.part(row + 1, from, end, p.mask, PEAK, REACH);
+    let (from, to) = landing.covers;
+    sheet.part(row, from, to, p.mask, PEAK, REACH);
+    if let Some((waiting, from, end)) = &landing.waiting {
+        sheet.text(row + 1, *from, waiting, pens.soft, p.whole);
+        sheet.part(row + 1, *from, *end, p.mask, PEAK, REACH);
     }
 }
 
@@ -1695,6 +1782,49 @@ mod tests {
         assert_eq!(before[1], right(100, "api-server   blog   notes"));
         let after = painted(&mut cards, 100, 30, now + ms(380));
         assert_eq!(after[1], right(100, "nvmux   api-server   blog"));
+    }
+
+    /// Where an arrival stands is where it is drawn: on its first frame, every
+    /// glyph of its footprint is on its cell, the row as it lies before a
+    /// step, the name coming on at the far end not yet among them; the span is
+    /// as wide as the row either side of the step; and the line that says the
+    /// session is waiting has its own.
+    #[test]
+    fn an_arrival_stands_where_it_is_drawn() {
+        let now = Instant::now();
+        let step = Some(Step {
+            forward: true,
+            gone: "notes".into(),
+        });
+        let mut card = landed("api-server", Some("nvmux"), Some("blog"), step);
+        card.fade_ms = 100;
+        card.body = Some(crate::card::WAITING.into());
+        let footprint = arrival_footprint(&card, 100, 30);
+        assert_eq!(footprint.spans, [(1, 72, 97), (2, 74, 90)]);
+        assert_eq!(footprint.glyphs.len(), 5 + 5 + 10 + "waitingforakey".len());
+        assert_eq!(footprint.glyphs.first(), Some(&(1, 72, 'n')));
+        assert!(footprint.glyphs.iter().all(|&(_, col, _)| col <= 97));
+        let mut cards = Cards::default();
+        cards.apply(Command::Show(card), now);
+        let f = drawn(&mut cards, 100, 30, now);
+        for &(row, col, ch) in &footprint.glyphs {
+            assert_eq!(
+                f.get(row, col).expect("a cell").text,
+                Text::Char(ch),
+                "{row},{col}"
+            );
+        }
+
+        assert_eq!(
+            arrival_footprint(&news(1), 100, 30),
+            Footprint::default(),
+            "news stands nowhere"
+        );
+        assert_eq!(
+            arrival_footprint(&landed("blog", None, None, None), 20, 30),
+            Footprint::default(),
+            "nor on a screen too small for it"
+        );
     }
 
     /// A name or a line too wide is cut to fit, with `…`, and the age is never

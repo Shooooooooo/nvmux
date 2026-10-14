@@ -313,6 +313,14 @@ pub struct Attachment {
     /// through, for the card that says where a switch landed (see
     /// [`Attachment::place_in_row`]).
     row: Option<card::Row>,
+    /// The cells that card stands on, which this relay's fade in leaves
+    /// standing: drawn by the client before the screen comes, it is on the
+    /// screen as it is from the fade's first frame (see [`shadow::Kept`]).
+    kept: shadow::Kept,
+    /// The card a switch by key lands with, left standing on the screen this
+    /// relay handed over, for the next to take down as it draws the card again
+    /// (see [`Attachment::take_left_standing`]).
+    left_standing: Option<HandOff>,
 }
 
 /// How many clients have had their exit sequences relayed to the terminal:
@@ -743,6 +751,57 @@ impl Attachment {
         self.row = Some(row);
     }
 
+    /// The card a switch by key landed with, as the relay that ended in the
+    /// switch left it standing on the screen it handed over: for the next
+    /// attach to carry, as it carries the picker's name ([`carry_name`]).
+    ///
+    /// [`carry_name`]: Attachment::carry_name
+    pub fn take_left_standing(&mut self) -> Option<HandOff> {
+        self.left_standing.take()
+    }
+
+    /// Have the client draw `card` — what the switch this relay ended in
+    /// lands with — over the screen it is about to leave: off with what else
+    /// it shows, on with the card, and what it draws for it read into the
+    /// shadow, which the fade out is drawn from, as a kept client's return is
+    /// (see [`CARD_WAIT`]). The cells the card stands on, for the fade out to
+    /// leave standing; none where there is no fade to stand it through, or no
+    /// client to draw it.
+    fn stand_landing(&mut self, card: &card::Card) -> shadow::Kept {
+        if !self.draws_cards || !fade::enabled() || !fade::session() || self.shadow.is_none() {
+            return shadow::Kept::default();
+        }
+        let size = term::terminal_size();
+        let kept = shadow::Kept::arrival(card, size.cols, size.rows);
+        if kept.is_empty() {
+            return kept;
+        }
+        self.tell_client(&card::Command::Clear);
+        self.tell_client(&card::Command::Show(card.clone()));
+        let deadline = Instant::now() + CARD_WAIT;
+        loop {
+            self.await_output(deadline.saturating_duration_since(Instant::now()));
+            self.drain_unrelayed();
+            if self.shadow.as_ref().is_some_and(|s| s.shows(&kept)) {
+                return kept;
+            }
+            if Instant::now() >= deadline {
+                tracing::debug!("the client did not draw the card a switch lands with in time");
+                return shadow::Kept::default();
+            }
+        }
+    }
+
+    /// The cells this relay's fade in leaves standing: its arrival's, where
+    /// the screen it dissolves in has the arrival on it (see
+    /// [`shadow::Shadow::shows`]), and none otherwise.
+    fn standing(&self) -> shadow::Kept {
+        match self.shadow.as_ref() {
+            Some(shadow) if shadow.shows(&self.kept) => self.kept.clone(),
+            _ => shadow::Kept::default(),
+        }
+    }
+
     /// The name the picker left standing for this attach (see
     /// [`crate::handoff`]): the relay takes it down as the session takes the
     /// terminal, and from here nothing else may draw before it does.
@@ -938,6 +997,10 @@ impl Attachment {
                 .then(|| card::Card::arrival(card::next_id(), name, waiting).in_row(row))
         });
         let landed = arrival.is_some();
+        let size = term::terminal_size();
+        self.kept = arrival.as_ref().map_or_else(shadow::Kept::default, |card| {
+            shadow::Kept::arrival(card, size.cols, size.rows)
+        });
         let opening = desk.open(arrival);
         self.desk = Some(desk);
         for cmd in &opening {
@@ -1221,12 +1284,13 @@ impl Attachment {
                 write_stdout(&down)?;
             }
             write_stdout(&bytes[..split])?;
+            let kept = self.standing();
             if let Some(shadow) = self.shadow.as_mut() {
                 let (rows, cols) = shadow.size();
                 let over = hand_off.as_ref().and_then(|h| h.over(rows, cols));
                 // A frame that could not be written is not a reason to keep
                 // the paint: the replay below is what the user is waiting for.
-                dissolved = match fade::fade_in_session(shadow, over.as_ref()) {
+                dissolved = match fade::fade_in_session(shadow, over.as_ref(), &kept) {
                     Ok(faded) => faded,
                     Err(e) => {
                         tracing::debug!(error = %e, "the session's fade-in did not complete");
@@ -1271,10 +1335,11 @@ impl Attachment {
             return false;
         };
         let over = self.name_over(shadow);
+        let kept = self.standing();
         let Some(shadow) = self.shadow.as_mut() else {
             return false;
         };
-        match fade::fade_in_session(shadow, over.as_ref()) {
+        match fade::fade_in_session(shadow, over.as_ref(), &kept) {
             Ok(faded) => faded,
             Err(e) => {
                 tracing::debug!(error = %e, "the resumed session's fade-in did not complete");
@@ -2581,6 +2646,8 @@ fn spawn_client_with(
         draws_cards,
         desk: None,
         row: None,
+        kept: shadow::Kept::default(),
+        left_standing: None,
     })
 }
 
@@ -2615,10 +2682,16 @@ fn spawn_client_with(
 /// not draw. Every other outcome calls it not at all — the picker, the prompt
 /// and the help screen have nothing to start, and the three that end the relay
 /// have nowhere to go.
+///
+/// What it hands back is the card the switch lands with, if it knows where
+/// that is: this session's client draws it as the switch begins, and its fade
+/// out leaves it standing, as does the next session's fade in — so the card is
+/// on the screen as it is from the key to the session it names, left standing
+/// on the screen handed over between the two ([`Attachment::take_left_standing`]).
 pub fn relay(
     mut attachment: Attachment,
     highest_session_num: u32,
-    begin_next: &mut dyn FnMut(Target),
+    begin_next: &mut dyn FnMut(Target) -> Option<card::Card>,
 ) -> Result<(Outcome, Option<Attachment>)> {
     let master_fd = attachment
         .master
@@ -2690,7 +2763,8 @@ pub fn relay(
     // The cards first, before the screen comes back: off with whatever the
     // client showed when it was last in front, and on with where the switch
     // landed. Its own client draws that at once — it asks nothing of the
-    // server — so it is on the screen the session dissolves in with.
+    // server — so it is on the screen the session dissolves in with, which
+    // leaves it standing as the rest comes in.
     let landed = attachment.open_desk();
 
     // What the child buffered while blocked mid-write describes a screen the
@@ -2824,9 +2898,11 @@ pub fn relay(
     // As early as there is anything to say: everything below this line is
     // nvmux drawing, and what the caller starts here runs underneath it. See
     // the note on `begin_next`.
-    if let Some(target) = outcome.as_ref().ok().and_then(|o| o.switch_target()) {
-        begin_next(target);
-    }
+    let landing = outcome
+        .as_ref()
+        .ok()
+        .and_then(|o| o.switch_target())
+        .and_then(begin_next);
 
     // Whatever ended the relay, nothing the client wrote may stay unshown —
     // which is as true of the few bytes the notice was holding a sequence
@@ -2850,11 +2926,19 @@ pub fn relay(
             // below, which erases with the colour the last frame ends on. A
             // frame that could not be written must not skip the restore, so
             // its error is logged and dropped rather than propagated.
-            if let Some(shadow) = attachment.shadow.as_mut() {
-                if let Err(e) = fade::fade_out_session(shadow) {
+            //
+            // A switch has its client draw the card it lands with first, and
+            // the dissolve leaves the card standing.
+            let kept = landing
+                .as_ref()
+                .map_or_else(shadow::Kept::default, |card| attachment.stand_landing(card));
+            let faded = match attachment.shadow.as_mut() {
+                Some(shadow) => fade::fade_out_session(shadow, &kept).unwrap_or_else(|e| {
                     tracing::debug!(error = %e, "the session's fade-out did not complete");
-                }
-            }
+                    false
+                }),
+                None => false,
+            };
             raw.restore();
             // Clear here rather than leaving it to the next `relay`, which runs
             // on the far side of the client spawn: what is on the terminal until
@@ -2864,8 +2948,24 @@ pub fn relay(
             // Not shown to the shadow, for the reason the resume's erase is
             // not: a switch that names this same session resumes it, and the
             // screen it had is what dissolves back in.
+            //
+            // A card the dissolve left standing stays on the cleared screen,
+            // in the same synchronized write, for the next relay to take down
+            // in the one it draws the card again with (see `crate::handoff`).
             if held.leads_straight_into_another_relay() {
-                term::leave_alt_screen_and_clear();
+                let standing = attachment
+                    .shadow
+                    .as_ref()
+                    .filter(|_| faded && !kept.is_empty())
+                    .map(|shadow| fade::standing(shadow, &kept))
+                    .and_then(|drawn| HandOff::card(drawn, kept.spans()));
+                match standing {
+                    Some(h) => {
+                        term::leave_alt_screen_and_clear_keeping(&h.show());
+                        attachment.left_standing = Some(h);
+                    }
+                    None => term::leave_alt_screen_and_clear(),
+                }
             }
             Ok((held, Some(attachment)))
         }
