@@ -57,11 +57,15 @@
 //! the nearer it is to one of their lines — a row counting as two columns, a
 //! cell being about twice as tall as it is wide — and under a line itself
 //! emptied: so the note reads on a busy screen, and the screen around it
-//! still reads as itself. A sign on its own takes less of it, and not as far.
-//! The status line and the command line are left as they are. What is drawn
-//! comes up out of what is under it: that fades to the background over the
-//! first half of a piece's coming, and the piece comes up out of it over the
-//! second.
+//! still reads as itself. A note takes all of that at once, for every line it
+//! has, and has it before any of its words come, as its sign does; and gives
+//! it back once they have all gone: so the words come up on a patch already
+//! quiet, rather than the quiet spreading as they come. An arrival's is as
+//! wide as its row is either side of a step, and stays still as the row
+//! moves. A sign on its own takes less of it, and not as far. The status line
+//! and the command line are left as they are. What is drawn comes up out of
+//! what is under it: that fades to the background over the first half of a
+//! piece's coming, and the piece comes up out of it over the second.
 
 use std::time::{Duration, Instant};
 
@@ -139,12 +143,17 @@ const BODY_IN: (f32, f32) = (4.3, 2.6);
 const SAID: f32 = 6.9;
 
 /// And from the end of its life: what, then who, go, and the sign goes to
-/// the edge and dims, a mark; the rows the words took are let go of at
-/// [`UNSAID`].
+/// the edge and dims, a mark.
 const BODY_OUT: (f32, f32) = (0.0, 2.2);
 const HEAD_OUT: (f32, f32) = (1.2, 2.2);
 const TO_MARK: (f32, f32) = (2.6, 3.0);
-const UNSAID: f32 = 3.4;
+
+/// What is under a note is taken back as its sign comes, before any of its
+/// words, and given back from the end of its life once they have gone — at
+/// which the rows they took are let go of, [`UNSAID`].
+const MASK_IN: (f32, f32) = (0.0, 1.6);
+const MASK_OUT: (f32, f32) = (3.4, 1.6);
+const UNSAID: f32 = MASK_OUT.0 + MASK_OUT.1;
 
 /// A card let go of fades out, all of it, over this.
 const LET_GO: f32 = 3.0;
@@ -221,6 +230,8 @@ struct Pieces {
     body: f32,
     /// How far the sign has gone to being a mark: dimmer, and at the edge.
     marked: f32,
+    /// How much of what is under all of its lines is taken back.
+    mask: f32,
     /// Whether its words still take their rows.
     words: bool,
     /// For an arrival: how far its row has moved, and how much of it there is.
@@ -236,6 +247,7 @@ impl Pieces {
         head: 1.0,
         body: 1.0,
         marked: 0.0,
+        mask: 1.0,
         words: true,
         slide: 1.0,
         whole: 1.0,
@@ -328,13 +340,15 @@ impl Live {
         let u = self.fade();
         let t = self.t(now);
         let mut p = if self.card.kind == Kind::Arrival {
+            let whole = 1.0 - ramp(t, (self.card.life_ms as f32, ARRIVAL_OUT * u));
             Pieces {
                 slide: if self.steps() {
                     ramp(t, scaled(SLIDE, u, 0.0))
                 } else {
                     1.0
                 },
-                whole: 1.0 - ramp(t, (self.card.life_ms as f32, ARRIVAL_OUT * u)),
+                whole,
+                mask: whole,
                 words: true,
                 ..Pieces::default()
             }
@@ -363,6 +377,8 @@ impl Live {
                 } else {
                     ramp(t, scaled(TO_MARK, u, leave))
                 },
+                mask: ramp(t, scaled(MASK_IN, u, 0.0))
+                    * (1.0 - ramp(t, scaled(MASK_OUT, u, leave))),
                 words: t < leave + UNSAID * u,
                 ..Pieces::default()
             }
@@ -372,6 +388,7 @@ impl Live {
             p.sign *= left;
             p.head *= left;
             p.body *= left;
+            p.mask *= left;
             p.whole *= left;
         }
         p
@@ -418,7 +435,8 @@ impl Live {
             _ if self.card.only_mark => moves.push(scaled(SIGN_IN, u, 0.0)),
             _ => {
                 moves.push((0.0, SAID * u));
-                moves.push((self.leave(), (TO_MARK.0 + TO_MARK.1) * u));
+                let going = (TO_MARK.0 + TO_MARK.1).max(UNSAID);
+                moves.push((self.leave(), going * u));
             }
         }
         // The microsecond a move starts at, or the one after.
@@ -436,7 +454,8 @@ impl Live {
             })
             .collect();
         let says_age = self.card.age.is_some()
-            && (whole || (!self.card.only_mark && t < self.leave() + UNSAID * u));
+            && (whole
+                || (!self.card.only_mark && t < self.leave() + (HEAD_OUT.0 + HEAD_OUT.1) * u));
         if says_age {
             let since = drawn.saturating_duration_since(self.shown_at);
             next.push(self.shown_at + Duration::from_secs(since.as_secs() + 1));
@@ -639,19 +658,20 @@ fn head(card: &Card, age: Option<u64>, at: Margin) -> Head {
     }
 }
 
-/// A note with news on `row`: its sign, who, its age and what.
+/// A note with news on `row`: its sign, who, its age and what — over all of
+/// what it covers taken back as one, however far its words have come.
 fn news(sheet: &mut Sheet, l: &Live, p: Pieces, row: usize, at: Margin, pens: &Pens, now: Instant) {
     let card = &l.card;
     let h = head(card, l.age(now), at);
     sign(sheet, card, p, row, h.sign, at.end, pens);
     sheet.text(row, h.title_at(), &h.title, pens.name(card), p.head);
     sheet.text(row, h.age_at(), &h.age, pens.faint, p.head);
-    sheet.part(row, h.sign + 1, at.end, p.head, PEAK, REACH);
+    sheet.part(row, h.sign, at.end, p.mask, PEAK, REACH);
     if let Some(body) = &card.body {
         let body = fit(body, at.widest);
         let from = at.end + 1 - body.width();
         sheet.text(row + 1, from, &body, pens.soft, p.body);
-        sheet.part(row + 1, from, at.end, p.body, PEAK, REACH);
+        sheet.part(row + 1, from, at.end, p.mask, PEAK, REACH);
     }
 }
 
@@ -770,6 +790,9 @@ fn arrival(sheet: &mut Sheet, l: &Live, p: Pieces, row: usize, at: Margin, pens:
             vec![(at.end + 1 - title.width()) as isize]
         }
     };
+    // What it covers: its row as it lies after the step and before it, the
+    // one span as the row moves.
+    let mut covers = after[0];
     let mut names: Vec<Name> = after_names
         .iter()
         .zip(&after)
@@ -797,6 +820,7 @@ fn arrival(sheet: &mut Sheet, l: &Live, p: Pieces, row: usize, at: Margin, pens:
         // The row moves by what the name landed in moves by.
         let landed_before = if forward { before[2] } else { before[0] };
         let shift = after[1] - landed_before;
+        covers = covers.min(before[0]);
         let name = Name::new;
         // Going off the end, coming on at the other, the one left and the one
         // landed in, and the rest: each from where it was to where it goes.
@@ -820,7 +844,6 @@ fn arrival(sheet: &mut Sheet, l: &Live, p: Pieces, row: usize, at: Margin, pens:
     let s = p.slide;
     let bright = pens.name(card);
     let faint = pens.faint;
-    let (mut from, mut to) = (isize::MAX, isize::MIN);
     for n in &names {
         let there = p.whole * (n.there.0 + (n.there.1 - n.there.0) * s);
         if there <= 0.01 {
@@ -837,28 +860,14 @@ fn arrival(sheet: &mut Sheet, l: &Live, p: Pieces, row: usize, at: Margin, pens:
             italic: false,
         };
         sheet.text_at(row, col, n.text, pen, there);
-        if there > 0.05 {
-            from = from.min(col);
-            to = to.max(col + n.text.width() as isize - 1);
-        }
     }
-    if from <= to {
-        let last = sheet.width as isize - 1;
-        sheet.part(
-            row,
-            from.clamp(0, last) as usize,
-            to.clamp(0, last) as usize,
-            p.whole,
-            PEAK,
-            REACH,
-        );
-    }
+    sheet.part(row, covers.max(0) as usize, at.end, p.mask, PEAK, REACH);
     if let Some(waiting) = &card.body {
         let end = after[landed_at] as usize + after_names[landed_at].width() - 1;
         let waiting = fit(waiting, end + 1);
         let from = end + 1 - waiting.width();
         sheet.text(row + 1, from, &waiting, pens.soft, p.whole);
-        sheet.part(row + 1, from, end, p.whole, PEAK, REACH);
+        sheet.part(row + 1, from, end, p.mask, PEAK, REACH);
     }
 }
 
@@ -1411,7 +1420,12 @@ mod tests {
         let screen = painted(&mut cards, 100, 30, now);
         assert_eq!(screen[1], "x".repeat(100), "nothing yet");
         let screen = painted(&mut cards, 100, 30, now + ms(160));
-        assert_eq!(screen[1], format!("{}✓{}", "x".repeat(82), "x".repeat(17)));
+        assert_eq!(
+            screen[1],
+            format!("{}✓{}xx", "x".repeat(82), " ".repeat(15)),
+            "the sign, on all the note will cover taken back"
+        );
+        assert_eq!(screen[2], format!("{}{}xx", "x".repeat(68), " ".repeat(30)));
         let f = drawn(&mut cards, 100, 30, now + ms(160));
         let lit = mix(LIT, OK, WHITE);
         assert_eq!(f.get(1, 82).expect("a cell").style.fg, Color::Rgb(lit));
@@ -1422,7 +1436,11 @@ mod tests {
         );
         let screen = painted(&mut cards, 100, 30, now + ms(500));
         assert_eq!(screen[1], right(100, "✓ api-server  3s"));
-        assert_eq!(screen[2], "x".repeat(100), "what happened comes last");
+        assert_eq!(
+            screen[2],
+            format!("{}{}xx", "x".repeat(68), " ".repeat(30)),
+            "what happened comes last"
+        );
         let screen = painted(&mut cards, 100, 30, now + ms(700));
         assert_eq!(screen[2], right(100, "cargo test: exited with code 0"));
         let f = drawn(&mut cards, 100, 30, now + ms(700));
@@ -1445,6 +1463,58 @@ mod tests {
         cards.expire(leave + Duration::from_secs(3600));
         assert!(!cards.is_empty(), "and it stays");
         assert_eq!(cards.next_frame(leave + ms(600)), None, "still");
+    }
+
+    /// What is under a note is taken back all at once, for every line it
+    /// has, and all of it before any of its words come: half way at half the
+    /// sign's coming, emptied by its end. And it is given back only once the
+    /// words have all gone.
+    #[test]
+    fn what_is_under_a_note_is_taken_back_before_its_words_come() {
+        let now = Instant::now();
+        let c = colors();
+        let mut cards = Cards::default();
+        let card = Card {
+            fade_ms: 100,
+            ..news(1)
+        };
+        let leave = now + ms(690 + card.life_ms);
+        cards.apply(Command::Show(card), now);
+        drawn(&mut cards, 100, 30, now);
+        let half = mix(50, c.term.fg, c.term.bg);
+        let f = drawn(&mut cards, 100, 30, now + ms(80));
+        for (row, col) in [(1, 90), (1, 96), (2, 68), (2, 90)] {
+            let cell = f.get(row, col).expect("a cell");
+            assert_eq!(
+                (&cell.text, cell.style.fg),
+                (&Text::Char('x'), Color::Rgb(half)),
+                "{row},{col}: the whole of it, half way"
+            );
+        }
+        let f = drawn(&mut cards, 100, 30, now + ms(160));
+        for (row, col) in [(1, 90), (1, 96), (2, 68), (2, 90)] {
+            assert_eq!(
+                f.get(row, col).expect("a cell").text,
+                Text::Char(' '),
+                "{row},{col}: emptied, and nothing written on it yet"
+            );
+        }
+        assert_eq!(cards.next_frame(now + ms(160)), Some(now + ms(160) + FRAME));
+
+        // Its words gone, what they were on is still taken back, and given
+        // back after.
+        let f = drawn(&mut cards, 100, 30, leave + ms(340));
+        assert_eq!(f.get(2, 68).expect("a cell").text, Text::Char(' '));
+        assert_eq!(f.get(1, 90).expect("a cell").text, Text::Char(' '));
+        let f = drawn(&mut cards, 100, 30, leave + ms(420));
+        let cell = f.get(2, 68).expect("a cell");
+        assert_eq!(
+            (&cell.text, cell.style.fg),
+            (&Text::Char('x'), Color::Rgb(half)),
+            "half given back"
+        );
+        let f = drawn(&mut cards, 100, 30, leave + ms(500));
+        assert_eq!(f.get(2, 68).expect("a cell").style, Style::default());
     }
 
     /// The marks are one to a row, under the notes, newest first.
@@ -1606,7 +1676,11 @@ mod tests {
             "the row moves once the screen is in"
         );
         let after = painted(&mut cards, 100, 30, now + ms(380));
-        assert_eq!(after[1], right(100, "nvmux   api-server   blog"));
+        assert_eq!(
+            after[1],
+            format!("{} {}xx", "x".repeat(72), "nvmux   api-server   blog"),
+            "what it covers is as wide as the row was"
+        );
 
         let mut cards = Cards::default();
         let mut card = landed(
