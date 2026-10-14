@@ -205,17 +205,17 @@ fn relay_child() {
         let front = id.clone();
         std::thread::spawn(move || {
             std::thread::sleep(POST_AFTER);
+            let card = nvmux::card::Card::news(
+                nvmux::card::next_id(),
+                nvmux::card::Kind::Finished,
+                "elsewhere",
+                POSTED,
+                0,
+                "Ctrl-Space ⏎ go there",
+            );
             nvmux::card::board().post(nvmux::card::Post {
                 front,
-                card: nvmux::card::Card::news(
-                    nvmux::card::next_id(),
-                    nvmux::card::Kind::Finished,
-                    "elsewhere",
-                    POSTED,
-                    0,
-                    "Ctrl-Space ⏎ go there",
-                ),
-                go: Some(go),
+                what: nvmux::card::Posted::Card(card, Some(go)),
             });
         });
     }
@@ -1339,14 +1339,13 @@ fn screen_rows(out: &[u8]) -> Vec<String> {
     (0..ROWS).map(|row| row_on_screen(out, row)).collect()
 }
 
-/// Whether a card saying `label` is in the top right corner of the screen.
+/// Whether a card saying `label` is in the margin, set flush right on the
+/// row under the top one.
 fn carded(out: &[u8], label: &str) -> bool {
-    let rows = screen_rows(out);
-    rows.iter()
-        .any(|r| r.trim_end().ends_with(&format!("│ {label} │")))
+    row_on_screen(out, 1).ends_with(label)
 }
 
-/// Where a switch landed is a card nvmux's own client draws, in the corner:
+/// Where a switch landed is a card nvmux's own client draws, in the margin:
 /// nothing is said to the editor, which keeps nothing of it.
 #[test]
 fn a_fresh_client_is_announced_by_a_card() {
@@ -1415,8 +1414,9 @@ fn a_kept_clients_return_is_announced_as_its_screen_comes_back() {
         term.pump_until(Duration::from_secs(5), |out| find(out, DA1).is_some()),
         "the client never asked its DA1"
     );
+    // Its life, and three of the fade's one way to go: see `client::cards`.
     term.pump_until(
-        nvmux::card::ARRIVAL_LIFE + Duration::from_millis(LONG_FADE_MS),
+        nvmux::card::ARRIVAL_LIFE + Duration::from_millis(3 * LONG_FADE_MS / 2 + 500),
         |_| false,
     );
     assert!(!carded(&term.output, label), "the first card never went");
@@ -1450,7 +1450,7 @@ fn a_kept_clients_return_is_announced_as_its_screen_comes_back() {
 }
 
 /// A card posted for the session in front — the notifier's, here the child's
-/// own — comes up in the corner, and `<prefix> Enter` goes to the session it
+/// own — comes up in the margin, and `<prefix> Enter` goes to the session it
 /// is about: the relay ends in a switch to it.
 #[test]
 fn a_posted_card_comes_up_and_prefix_enter_goes_there() {
@@ -1475,9 +1475,8 @@ fn a_posted_card_comes_up_and_prefix_enter_goes_there() {
     );
     assert!(
         term.pump_until(Duration::from_secs(15), |out| {
-            let rows = screen_rows(out);
-            rows.iter().any(|r| r.contains("╭─ ✓ elsewhere"))
-                && rows.iter().any(|r| r.contains(&format!("│ {POSTED}")))
+            row_on_screen(out, 1).ends_with("✓ elsewhere  0s")
+                && row_on_screen(out, 2).ends_with(POSTED)
         }),
         "the posted card never came up; the screen: {:#?}",
         screen_rows(&term.output)
@@ -1533,9 +1532,7 @@ fn prefix_enter_on_a_card_about_a_terminal_here_shows_it() {
     );
     assert!(
         term.pump_until(Duration::from_secs(15), |out| {
-            screen_rows(out)
-                .iter()
-                .any(|r| r.contains(&format!("│ {POSTED}")))
+            row_on_screen(out, 2).ends_with(POSTED)
         }),
         "the posted card never came up; the screen: {:#?}",
         screen_rows(&term.output)
@@ -1554,9 +1551,7 @@ fn prefix_enter_on_a_card_about_a_terminal_here_shows_it() {
     );
     assert!(
         term.pump_until(Duration::from_secs(5), |out| {
-            !screen_rows(out)
-                .iter()
-                .any(|r| r.contains(&format!("│ {POSTED}")))
+            !screen_rows(out).iter().any(|r| r.contains(POSTED))
         }),
         "the card acted on stayed up"
     );
@@ -1602,7 +1597,7 @@ fn neovims_own_client_is_sent_no_card() {
     );
     term.pump_until(Duration::from_millis(500), |_| false);
     assert!(
-        find(&term.output, "╭".as_bytes()).is_none() && !carded(&term.output, label),
+        !carded(&term.output, label),
         "a card was drawn: {:#?}",
         screen_rows(&term.output)
     );

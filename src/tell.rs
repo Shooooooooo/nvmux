@@ -1,9 +1,14 @@
 //! What the other sessions report while you are in one, told as it happens: a
 //! notification a program in one of their terminal buffers asked for (`∗`), a
 //! command there that failed (`!`) or finished (`✓`) — the picker's signs,
-//! while the picker is down — as cards in the corner of the session in front
+//! while the picker is down — as cards in the margin of the session in front
 //! (see [`crate::card`]). Of the session in front, only what a terminal of its
 //! own off the screen says: the rest it was showing.
+//!
+//! What a session keeps until it is opened stays as its mark, the sign the
+//! picker has beside it, once the card's words have gone; and a session
+//! brought to the front while another still keeps something is told that
+//! session's mark alone, the words having been said already.
 //!
 //! The news is read off each session's watcher ([`crate::notes`]), and its
 //! cards are posted for the relay in front ([`crate::card::board`]), which has
@@ -16,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use crate::card::{self, Card, Go, Post};
+use crate::card::{self, Card, Go, Post, Posted};
 use crate::notes::{self, Heard, Kind, News};
 use crate::ui::note;
 use crate::{ids, keys};
@@ -30,13 +35,11 @@ const SETTLE: Duration = Duration::from_millis(30);
 /// with `None`, from the session in front itself — and where acting on it
 /// goes: that session, or the terminal it came from. `prefix` is the prefix
 /// key, which the card names. `None` for what is not news: what is busy.
+///
+/// It is about the session, or the terminal, it came from (see
+/// [`Card::about`]), and leaves its own sign — or, going nowhere, none.
 pub fn card_for(news: &News, from: Option<(&str, &str)>, prefix: u8) -> Option<(Card, Option<Go>)> {
-    let kind = match news.kind {
-        Kind::Notified => card::Kind::Notified,
-        Kind::Failed => card::Kind::Failed,
-        Kind::Finished => card::Kind::Finished,
-        Kind::Busy(_) => return None,
-    };
+    let kind = sign(news.kind)?;
     let what = note::what(news.kind, &news.title, &news.text);
     let key = format!("{} {}", keys::prefix_label(prefix), keys::ENTER_GLYPH);
     let (title, go, does) = match from {
@@ -60,7 +63,42 @@ pub fn card_for(news: &News, from: Option<(&str, &str)>, prefix: u8) -> Option<(
         String::new()
     };
     let card = Card::news(card::next_id(), kind, &title, &what, news.age, &footer);
+    let card = match (from, news.buf) {
+        (Some((id, _)), _) => card.about(id),
+        (None, Some(buf)) => card.about(&format!("here {buf}")),
+        (None, None) => card,
+    };
+    // Nowhere to go is nothing to open, and a mark would wait for that.
+    let card = if go.is_some() {
+        card
+    } else {
+        card.leaving(None)
+    };
     Some((card, go))
+}
+
+/// The sign on a card for news of `kind`; none for what is not news.
+fn sign(kind: Kind) -> Option<card::Kind> {
+    match kind {
+        Kind::Notified => Some(card::Kind::Notified),
+        Kind::Failed => Some(card::Kind::Failed),
+        Kind::Finished => Some(card::Kind::Finished),
+        Kind::Busy(_) => None,
+    }
+}
+
+/// Of what a session keeps, what its mark says: a notification or a failure,
+/// which wait for you, over a command that has finished — the sign the picker
+/// has beside it, and the news that sign is for.
+fn marking(news: &[News]) -> Option<&News> {
+    let rank = |n: &&News| match n.kind {
+        Kind::Notified | Kind::Failed => 0,
+        Kind::Finished => 1,
+        Kind::Busy(_) => 2,
+    };
+    news.iter()
+        .filter(|n| sign(n.kind).is_some())
+        .min_by_key(rank)
 }
 
 /// Of what a session said, what to tell, oldest first: what it numbered past
@@ -98,6 +136,9 @@ struct Watched {
     /// The highest number among what it has said, by the last read; `None`
     /// until it has been read since nvmux's own screens were last up.
     heard: Option<u64>,
+    /// Whether a card about it is up in front, which leaves its mark: to be
+    /// let go of once it has nothing to say.
+    marked: bool,
 }
 
 /// Posts, as it happens, cards with what the other sessions have to report —
@@ -186,6 +227,7 @@ fn run(inbox: &Receiver<Command>, prefix: u8) {
                         name,
                         sock,
                         heard: None,
+                        marked: false,
                     }),
                 }
             }
@@ -194,11 +236,13 @@ fn run(inbox: &Receiver<Command>, prefix: u8) {
                     continue;
                 }
                 // Back from one of nvmux's own screens: what was said while it
-                // was up was on it, or is old by now.
-                if front.is_none() {
-                    for w in &mut watched {
+                // was up was on it, or is old by now. And whatever is in front
+                // now has come up with nothing on it.
+                for w in &mut watched {
+                    if front.is_none() {
                         w.heard = None;
                     }
+                    w.marked = false;
                 }
                 front = id;
                 due = front.is_some().then(|| Instant::now() + SETTLE);
@@ -216,7 +260,9 @@ fn run(inbox: &Receiver<Command>, prefix: u8) {
 
 /// Read every session, all at a time, and post a card for the session in
 /// front, `front`, of what is news — oldest first, whichever session said it
-/// ([`oldest_first`]).
+/// ([`oldest_first`]). On a first read, which says only how far a session
+/// has got, what another keeps is its mark alone; and of one that keeps
+/// nothing any more, or is gone, the mark is let go of.
 fn round(watched: &mut [Watched], front: &str, prefix: u8) {
     let heard: Vec<(usize, Heard)> = std::thread::scope(|s| {
         let reads: Vec<_> = watched
@@ -229,29 +275,59 @@ fn round(watched: &mut [Watched], front: &str, prefix: u8) {
             .collect();
         reads.into_iter().filter_map(|r| r.join().ok()).collect()
     });
+    let post = |what| Post {
+        front: front.to_string(),
+        what,
+    };
     let mut told = Vec::new();
+    let mut forgot = Vec::new();
     for (i, heard) in heard {
-        let Heard::Said(news) = heard else {
-            continue;
-        };
         let w = &mut watched[i];
+        let news = match heard {
+            Heard::Said(news) => news,
+            Heard::Gone => {
+                if std::mem::take(&mut w.marked) {
+                    forgot.push(w.id.clone());
+                }
+                continue;
+            }
+            Heard::Unknown => continue,
+        };
         let here = w.id == front;
         let from = (!here).then_some((w.id.as_str(), w.name.as_str()));
-        for n in to_tell(w.heard, &news, here) {
-            if let Some((card, go)) = card_for(n, from, prefix) {
-                let post = Post {
-                    front: front.to_string(),
-                    card,
-                    go,
-                };
-                told.push((n.age, post));
+        let marks = marking(&news);
+        let mark = marks.and_then(|n| sign(n.kind));
+        let mut cards = Vec::new();
+        if w.heard.is_none() {
+            if let Some(n) = marks.filter(|_| !here) {
+                cards.extend(card_for(n, from, prefix).map(|(c, go)| (n.age, c.as_mark(), go)));
             }
+        }
+        for n in to_tell(w.heard, &news, here) {
+            cards.extend(card_for(n, from, prefix).map(|(c, go)| (n.age, c, go)));
+        }
+        for (age, card, go) in cards {
+            // What another session keeps leaves the one sign the picker has
+            // for it, whichever news came last.
+            let card = if here || card.mark.is_none() {
+                card
+            } else {
+                w.marked = true;
+                card.leaving(mark)
+            };
+            told.push((age, post(Posted::Card(card, go))));
+        }
+        if mark.is_none() && std::mem::take(&mut w.marked) {
+            forgot.push(w.id.clone());
         }
         let top = news.iter().map(|n| n.seq).max().unwrap_or(0);
         w.heard = Some(w.heard.map_or(top, |h| h.max(top)));
     }
-    for post in oldest_first(told) {
-        card::board().post(post);
+    for id in forgot {
+        card::board().post(post(Posted::Forget(id)));
+    }
+    for p in oldest_first(told) {
+        card::board().post(p);
     }
 }
 
@@ -313,7 +389,40 @@ mod tests {
         let (card, go) = card_for(&failed, Some(("not an id", "x")), 0).expect("news");
         assert_eq!(card.kind, card::Kind::Failed);
         assert_eq!((card.footer, go), (None, None), "nowhere to go, so no key");
+        assert_eq!(card.mark, None, "and no mark to wait for it");
         assert!(card_for(&news(Kind::Busy(None), "", "", 4, None), None, 0).is_none());
+    }
+
+    /// A card is about the session it came from, which a newer one about it
+    /// replaces; of the session in front, about the terminal; and leaves its
+    /// own sign.
+    #[test]
+    fn a_card_is_about_where_it_came_from() {
+        let finished = news(Kind::Finished, "cargo test", "exited with code 0", 1, None);
+        let (card, _) = card_for(&finished, Some(("abcd2345", "api-server")), 0).expect("news");
+        assert_eq!(card.about.as_deref(), Some("abcd2345"));
+        assert_eq!(card.mark, Some(card::Kind::Finished));
+        let mut own = news(Kind::Failed, "sh", "exited with code 3", 1, Some(false));
+        own.buf = Some(5);
+        let (card, _) = card_for(&own, None, 0).expect("news");
+        assert_eq!(card.about.as_deref(), Some("here 5"));
+    }
+
+    /// What a session's mark says is what the picker's sign does: a
+    /// notification or a failure, waiting, over a command that has finished
+    /// since; and nothing, where it keeps nothing.
+    #[test]
+    fn a_mark_is_the_pickers_sign() {
+        let finished = news(Kind::Finished, "cargo test", "exited with code 0", 2, None);
+        let notified = news(Kind::Notified, "Claude Code", "waiting", 1, None);
+        let kept = [notified.clone(), finished.clone()];
+        assert_eq!(marking(&kept).map(|n| n.kind), Some(Kind::Notified));
+        assert_eq!(marking(&[finished]).map(|n| n.kind), Some(Kind::Finished));
+        assert_eq!(marking(&[]), None);
+        assert_eq!(
+            marking(&[news(Kind::Busy(Some(3)), "lua_ls", "", 1, None)]),
+            None
+        );
     }
 
     /// Of the session in front: `here`, and where its terminal is, and the
@@ -387,8 +496,7 @@ mod tests {
             let (card, go) = card_for(&said, Some(("abcd2345", name)), 0).expect("news");
             let post = Post {
                 front: "front".to_string(),
-                card,
-                go,
+                what: Posted::Card(card, go),
             };
             (age, post)
         };
@@ -398,20 +506,21 @@ mod tests {
             told("api-server", "cargo test", 4),
             told("api-server", "cargo clippy", 4),
         ]);
+        let card = |p: &Post| p.card().cloned().expect("a card");
         assert_eq!(
             posted
                 .iter()
-                .map(|p| (p.card.title.as_str(), p.card.age))
+                .map(|p| (card(p).title, card(p).age))
                 .collect::<Vec<_>>(),
             [
-                ("api-server", Some(4)),
-                ("api-server", Some(4)),
-                ("notes", Some(2)),
-                ("blog", Some(1)),
+                ("api-server".to_string(), Some(4)),
+                ("api-server".to_string(), Some(4)),
+                ("notes".to_string(), Some(2)),
+                ("blog".to_string(), Some(1)),
             ]
         );
         assert_eq!(
-            posted[0].card.body.as_deref(),
+            card(&posted[0]).body.as_deref(),
             Some("cargo test: exited with code 0"),
             "{posted:?}"
         );

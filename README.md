@@ -94,15 +94,15 @@ reimplementing it.
 | `<prefix>` `n` | next session by number (wraps) |
 | `<prefix>` `p` | previous session by number (wraps) |
 | `<prefix>` `c` | set up a new session and attach to it — `Esc` goes back |
-| `<prefix>` `Enter` | go where the card in the corner is about: its session, or a terminal of this one |
+| `<prefix>` `Enter` | go where the newest note in the margin is about: its session, or a terminal of this one |
 | `<prefix>` `?` | show these keys — `Esc` goes back |
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
 
 Pressing `<prefix>` puts a one-row reminder of these keys along the bottom of
 the screen; it goes as soon as the next key resolves it. A switch, by key or
-out of the picker, says which session you have landed in, with a card in the
-top right corner that comes in with the session's screen and goes a moment
-later.
+out of the picker, says where you have landed: in the top right margin, the
+session's name between the ones `<prefix> p` and `<prefix> n` go to, which
+moves the way you went and goes a moment later.
 
 ### Leaving a session
 
@@ -167,17 +167,16 @@ The picker shows a sign beside each session that has something to report:
 A command typed at a shell prompt counts only if the shell reports how it went,
 as fish 4 does.
 
-While you are in a session, the others' news comes up as cards in the corner,
-and `<prefix> Enter` goes to the newest:
+While you are in a session, the others' news comes up in the top right
+margin, and goes, leaving its sign there until you open that session.
+`<prefix> Enter` goes to the newest:
 
 ```
-╭─ ✓ api-server ──────────────────────── 3s ─╮
-│ cargo test: exited with code 0             │
-│ Ctrl-Space ⏎ go there                      │
-╰────────────────────────────────────────────╯
+              ✓ api-server  3s
+cargo test: exited with code 0
 ```
 
-Cards need nvmux's own client; with `ui = "nvim"` there are none.
+Notes need nvmux's own client; with `ui = "nvim"` there are none.
 
 > [!TIP]
 > If Claude Code's notifications never show, as on a remote host, set its

@@ -103,7 +103,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair};
 
 use crate::error::{NvmuxError, Result};
 use crate::handoff::HandOff;
-use crate::keys::{Action, Prefix, Step, Wait};
+use crate::keys::{Action, Pending, Prefix, Step, Wait};
 use crate::ledger::Ledger;
 use crate::term::write_stdout;
 use crate::{announce, boundary, card, fade, hint, rpc, shadow, term, winch};
@@ -309,6 +309,10 @@ pub struct Attachment {
     /// What this relay has told its client to show, and what waits to go in:
     /// one a relay, and only for a client that draws cards.
     desk: Option<card::Desk>,
+    /// Where the session is among the ones `<prefix> n` and `<prefix> p` step
+    /// through, for the card that says where a switch landed (see
+    /// [`Attachment::place_in_row`]).
+    row: Option<card::Row>,
 }
 
 /// How many clients have had their exit sequences relayed to the terminal:
@@ -732,6 +736,13 @@ impl Attachment {
         self.announce = Some(label);
     }
 
+    /// Where the session is among the ones `<prefix> n` and `<prefix> p` step
+    /// through, and for a step, which way it went: what the card that says
+    /// where a switch landed shows beside the name, if there is one to show.
+    pub fn place_in_row(&mut self, row: card::Row) {
+        self.row = Some(row);
+    }
+
     /// The name the picker left standing for this attach (see
     /// [`crate::handoff`]): the relay takes it down as the session takes the
     /// terminal, and from here nothing else may draw before it does.
@@ -918,16 +929,16 @@ impl Attachment {
         if !self.draws_cards {
             return false;
         }
-        let now = Instant::now();
         let mut desk = card::Desk::new(&self.session_id);
+        let row = self.row.take().unwrap_or_default();
         let arrival = self.announce.take().and_then(|label| {
             let waiting = label.ends_with(WAITING);
             let name = label.strip_suffix(WAITING).unwrap_or(&label);
             (waiting || !name.is_empty())
-                .then(|| card::Card::arrival(card::next_id(), name, waiting))
+                .then(|| card::Card::arrival(card::next_id(), name, waiting).in_row(row))
         });
         let landed = arrival.is_some();
-        let opening = desk.open(arrival, now);
+        let opening = desk.open(arrival);
         self.desk = Some(desk);
         for cmd in &opening {
             self.tell_client(cmd);
@@ -949,7 +960,7 @@ impl Attachment {
     /// about — a switch to the session it came from, or that session's own
     /// terminal shown — and take the card down.
     fn go(&mut self, now: Instant) -> Option<Outcome> {
-        let (_, go) = self.desk.as_mut()?.go(now)?;
+        let (_, go) = self.desk.as_mut()?.go()?;
         self.send_cards(now);
         match go {
             card::Go::Session(id) => Some(Outcome::Switch(Target::Session(id))),
@@ -2569,6 +2580,7 @@ fn spawn_client_with(
         probe: None,
         draws_cards,
         desk: None,
+        row: None,
     })
 }
 
@@ -3274,13 +3286,17 @@ fn pump(
         }
 
         // The cards: what the notifier posted, taken — or, for a client that
-        // draws none, thrown away — and what waits put in, once the keys just
-        // passed on leave a moment for it.
+        // draws none, thrown away — whether the prefix is held, which has the
+        // card the key acts on say so, and what waits put in, once the keys
+        // just passed on leave a moment for it.
         if n > 0 && ready(&fds[3]) {
             let posts = board.take();
             if let Some(desk) = attachment.desk.as_mut() {
                 desk.take(posts);
             }
+        }
+        if let Some(desk) = attachment.desk.as_mut() {
+            desk.keys(prefix.pending() == Some(Pending::Command));
         }
         attachment.send_cards(Instant::now());
 

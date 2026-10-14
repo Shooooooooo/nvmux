@@ -231,6 +231,10 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
         // the first: every later one is a `<prefix>` switch, a reconnect or a
         // session made with `<prefix> c`.
         let mut from_picker = true;
+        // A switch by `<prefix> n` or `<prefix> p`: which way, and the session
+        // it left, for the card that says where it landed to move its row the
+        // way it went. Set by the switch, and spent by the attach it leads to.
+        let mut stepped: Option<(nvmux::keys::Direction, nvmux::session::Session)> = None;
 
         loop {
             // Everything nvmux does between the keypress and a client ready to
@@ -342,6 +346,12 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             if from_picker && shown.as_deref() == Some(current.id.as_str()) {
                 attachment.arrive_unannounced();
             }
+            let step = stepped.take();
+            attachment.place_in_row(row_of(
+                &listing,
+                &current,
+                step.as_ref().map(|(dir, left)| (*dir, left)),
+            ));
             from_picker = false;
             shown = Some(current.id.clone());
 
@@ -487,6 +497,10 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                     // or a cycle with nowhere to go — puts the user straight
                     // back where they were.
                     attached = pool.set_aside(held);
+                    stepped = match target {
+                        pty::Target::Step(dir) => Some((dir, current.clone())),
+                        pty::Target::Number(_) | pty::Target::Session(_) => None,
+                    };
                     // Already resolved, and already started: the dissolve that
                     // has just finished ran over the top of its fork and its
                     // probe. Nothing left to look up.
@@ -765,6 +779,47 @@ fn pick(
     }
 }
 
+/// Where `current` is among the sessions `<prefix> n` and `<prefix> p` step
+/// through, for the card that says where a switch landed: the session each
+/// goes to from it — with two, the other is the one `n` goes to — and, for a
+/// step from `left`, which way it went and the session beyond `left`, which
+/// the row lets go of as it moves. Among three sessions or more: with fewer,
+/// a step comes back round to where it started and the row has nowhere to
+/// move.
+fn row_of(
+    listing: &[nvmux::session::Session],
+    current: &nvmux::session::Session,
+    stepped: Option<(nvmux::keys::Direction, &nvmux::session::Session)>,
+) -> nvmux::card::Row {
+    use nvmux::keys::Direction;
+    let beside = |s: &nvmux::session::Session, dir| {
+        transport::neighbour(listing, s.state.num, dir).filter(|n| n.id != current.id)
+    };
+    let next = beside(current, Direction::Next);
+    let prev = beside(current, Direction::Prev).filter(|p| Some(&p.id) != next.map(|n| &n.id));
+    let step = match (stepped, prev, next) {
+        (Some((dir, left)), Some(prev), Some(next)) => {
+            let (from, away) = match dir {
+                Direction::Next => (prev, Direction::Prev),
+                Direction::Prev => (next, Direction::Next),
+            };
+            transport::neighbour(listing, from.state.num, away)
+                .filter(|_| from.id == left.id)
+                .map(|gone| nvmux::card::Step {
+                    forward: dir == Direction::Next,
+                    gone: announce::label(&gone.name),
+                })
+        }
+        _ => None,
+    };
+    let name = |s: &nvmux::session::Session| announce::label(&s.name);
+    nvmux::card::Row {
+        prev: prev.map(name),
+        next: next.map(name),
+        step,
+    }
+}
+
 /// A client that has been started, and the probe in flight for it.
 ///
 /// The half of an attach that does not block, kept so it can be begun at one
@@ -955,6 +1010,48 @@ mod tests {
     fn an_empty_listing_names_nothing() {
         assert!(pick(&[], pty::Target::Number(1), 0).is_none());
         assert!(pick(&[], pty::Target::Step(Direction::Next), 0).is_none());
+    }
+
+    /// The card that says where a switch landed shows the session `p` goes
+    /// to and the one `n` goes to, round the ends; with two, only the other,
+    /// as the one `n` goes to; alone, neither.
+    #[test]
+    fn an_arrival_names_the_sessions_either_side() {
+        let listing = listing_of(&[(1, "id000001"), (2, "id000002"), (3, "id000003")]);
+        let row = row_of(&listing, &listing[0], None);
+        assert_eq!(
+            (row.prev.as_deref(), row.next.as_deref(), row.step),
+            (Some("s3"), Some("s2"), None)
+        );
+        let two = &listing[..2];
+        let row = row_of(two, &two[1], None);
+        assert_eq!((row.prev, row.next.as_deref()), (None, Some("s1")));
+        let row = row_of(&listing[..1], &listing[0], None);
+        assert_eq!((row.prev, row.next), (None, None));
+    }
+
+    /// A step says which way it went, and the session beyond the one it left,
+    /// which the row lets go of: forward round the end, and back.
+    #[test]
+    fn a_step_says_which_way_it_went() {
+        let listing = listing_of(&[
+            (1, "id000001"),
+            (2, "id000002"),
+            (3, "id000003"),
+            (4, "id000004"),
+        ]);
+        let gone = |row: nvmux::card::Row| row.step.map(|s| (s.forward, s.gone));
+        let forward = row_of(&listing, &listing[0], Some((Direction::Next, &listing[3])));
+        assert_eq!(gone(forward), Some((true, "s3".to_string())));
+        let back = row_of(&listing, &listing[1], Some((Direction::Prev, &listing[2])));
+        assert_eq!(gone(back), Some((false, "s4".to_string())));
+        let jumped = row_of(&listing, &listing[0], Some((Direction::Next, &listing[2])));
+        assert_eq!(gone(jumped), None, "not a step from where it says it left");
+        let two = &listing[..2];
+        assert_eq!(
+            gone(row_of(two, &two[1], Some((Direction::Next, &two[0])))),
+            None
+        );
     }
 
     /// A listing as the picker hands it over: resolved numbers and all.
