@@ -727,10 +727,12 @@ impl Desk {
         self.forwarded.retry_at()
     }
 
-    /// Whether [`Desk::go`] would find a card to act on now: what the hint bar
-    /// asks before it offers `<prefix> Enter` (see [`crate::hint`]).
-    pub fn can_go(&self, now: Instant) -> bool {
-        self.up.iter().any(|u| u.go.is_some() && u.until > now)
+    /// Whether [`Desk::go`] would find a card to act on: what the hint bar asks
+    /// before it offers `<prefix> Enter` (see [`crate::hint`]). One stays up
+    /// until it is acted on or what it is about has nothing more to say, as
+    /// news leaves its mark.
+    pub fn can_go(&self) -> bool {
+        self.up.iter().any(|u| u.go.is_some())
     }
 
     /// The newest card up that goes somewhere, taken down: what
@@ -1091,23 +1093,30 @@ mod tests {
     }
 
     /// `can_go` is `go` asked without acting: what the hint bar offers
-    /// `<prefix> Enter` on, so the two must never disagree.
+    /// `<prefix> Enter` on, so the two must never disagree — a mark included,
+    /// and none once what it is about is let go of.
     #[test]
     fn can_go_says_whether_going_would_go_anywhere() {
         let t0 = Instant::now();
         let a = crate::ids::Id::new("aaaaaaaa").expect("id");
         let mut desk = Desk::new("front");
-        desk.open(Some(Card::arrival(1, "front", false)), t0);
-        assert!(!desk.can_go(t0), "an arrival card goes nowhere");
+        desk.open(Some(Card::arrival(1, "front", false)));
+        assert!(!desk.can_go(), "an arrival card goes nowhere");
 
         desk.take(vec![post("front", 2, Some(Go::Session(a)))]);
-        assert!(!desk.can_go(t0), "a card not yet put in is not up");
+        assert!(!desk.can_go(), "a card not yet put in is not up");
         desk.ready(t0);
-        assert!(desk.can_go(t0));
-        let later = t0 + on_screen(&post("front", 2, None).card);
-        assert!(!desk.can_go(later), "its time is up");
+        assert!(desk.can_go(), "up, for as long as it leaves a mark");
+        assert!(desk.go().is_some());
+        assert!(!desk.can_go(), "the card acted on is down");
 
-        assert!(desk.go(t0).is_some());
-        assert!(!desk.can_go(t0), "the card acted on is down");
+        desk.take(vec![about("front", 3, "aaaaaaaa", Some(Go::Session(a)))]);
+        desk.ready(t0);
+        assert!(desk.can_go());
+        desk.take(vec![Post {
+            front: "front".into(),
+            what: Posted::Forget("aaaaaaaa".into()),
+        }]);
+        assert!(!desk.can_go(), "what it was about has nothing more to say");
     }
 }

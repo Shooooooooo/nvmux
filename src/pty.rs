@@ -3357,7 +3357,7 @@ fn pump(
         // flashing a bar on its way to the picker.
         let busy = child_spoke || attachment.hold.is_some() || attachment.mid_sequence();
         let now = Instant::now();
-        let go = attachment.desk.as_ref().is_some_and(|d| d.can_go(now));
+        let go = attachment.desk.as_ref().is_some_and(card::Desk::can_go);
         match bar.step(
             now,
             busy,
