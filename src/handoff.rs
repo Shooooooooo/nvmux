@@ -25,10 +25,24 @@
 //! (`[effects.fade] session`); with either off, or `NO_COLOR`, there are no
 //! frames to ride and an attach is what it was.
 //!
+//! # A switch's card
+//!
+//! A switch by key carries the card it lands with in the same way (see
+//! [`crate::card`]): the session it leaves has its own client draw the card as
+//! the switch begins, and that session's fade out leaves it standing, at its
+//! full colour; the screen it leaves for the next session's client is cleared
+//! with the card still on it, as the picker leaves its name; and the next
+//! session's client draws the card again where it stands, before its screen
+//! dissolves in, which leaves it standing too ([`crate::shadow::Kept`]). So
+//! the card is on the screen as it is from the key to the session it names,
+//! and takes no part in either fade. It is no overlay: the session it goes to
+//! draws it itself.
+//!
 //! # The screen the shell comes back to
 //!
 //! Between the picker and the session, the terminal is on its primary screen —
-//! the one the shell sees again on a detach — and the name is drawn there.
+//! the one the shell sees again on a detach — and the name is drawn there, as
+//! a switch's card is.
 //! Nothing nvmux does afterwards clears that screen on its own, so whoever
 //! takes the terminal next takes the name down first: the session's first
 //! frame, in the same synchronized write as its switch to the alternate
@@ -40,19 +54,39 @@ use unicode_width::UnicodeWidthStr;
 use crate::palette::Rgb;
 use crate::shadow::Over;
 
-/// The name, and where it stands: what the picker hands to the session.
+/// What is left standing for the session an attach goes to: the picker's
+/// name for it, or the card a switch by key lands with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandOff {
-    /// The name as it was drawn — cut where the picker's row cut it, and with
-    /// anything that is not text taken out (see [`crate::announce::label`]),
-    /// since this reaches a raw terminal.
-    text: String,
-    /// The top-left cell, 0-based, in the terminal's own grid.
-    row: u16,
-    col: u16,
-    /// What the name is drawn in: the theme's ink, which the picker drew it
-    /// in, or `None` for the terminal's own foreground (see [`crate::theme`]).
-    ink: Option<Rgb>,
+    left: Left,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Left {
+    /// The name, and where it stands: what the picker hands to the session,
+    /// which opens out of it.
+    Name {
+        /// The name as it was drawn — cut where the picker's row cut it, and
+        /// with anything that is not text taken out (see
+        /// [`crate::announce::label`]), since this reaches a raw terminal.
+        text: String,
+        /// The top-left cell, 0-based, in the terminal's own grid.
+        row: u16,
+        col: u16,
+        /// What the name is drawn in: the theme's ink, which the picker drew
+        /// it in, or `None` for the terminal's own foreground (see
+        /// [`crate::theme`]).
+        ink: Option<Rgb>,
+    },
+    /// The card a switch by key lands with, as the session it left drew it
+    /// and its fade out left it standing (see [`crate::shadow::Kept`]): the
+    /// bytes that draw it, and the cells they draw on, each span a row, its
+    /// first column and its last. The session it lands in draws the card
+    /// again where it stands, and stands it through its fade in.
+    Card {
+        drawn: Vec<u8>,
+        spans: Vec<(u16, u16, u16)>,
+    },
 }
 
 impl HandOff {
@@ -61,10 +95,24 @@ impl HandOff {
     pub fn new(name: &str, row: u16, col: u16, width: u16) -> Option<Self> {
         let text = crate::ui::draw::truncate(&crate::announce::label(name), usize::from(width));
         (!text.is_empty()).then(|| Self {
-            text,
-            row,
-            col,
-            ink: crate::theme::ink(),
+            left: Left::Name {
+                text,
+                row,
+                col,
+                ink: crate::theme::ink(),
+            },
+        })
+    }
+
+    /// The card a switch lands with, as `drawn` draws it on the cells of
+    /// `spans` (see [`crate::shadow::Shadow::kept_bytes`]). `None` when there
+    /// is nothing to draw.
+    pub fn card(drawn: Vec<u8>, spans: &[(u16, u16, u16)]) -> Option<Self> {
+        (!drawn.is_empty() && !spans.is_empty()).then(|| Self {
+            left: Left::Card {
+                drawn,
+                spans: spans.to_vec(),
+            },
         })
     }
 
@@ -76,66 +124,107 @@ impl HandOff {
             && crate::fade::session()
     }
 
+    /// The name, for the picker's; nothing for a card.
     pub fn text(&self) -> &str {
-        &self.text
+        match &self.left {
+            Left::Name { text, .. } => text,
+            Left::Card { .. } => "",
+        }
     }
 
-    /// The cell the name starts on, 0-based: row, then column.
+    /// The cell it starts on, 0-based: row, then column.
     pub fn at(&self) -> (u16, u16) {
-        (self.row, self.col)
+        match &self.left {
+            Left::Name { row, col, .. } => (*row, *col),
+            Left::Card { spans, .. } => spans.first().map_or((0, 0), |&(row, from, _)| (row, from)),
+        }
     }
 
-    /// Columns the name takes.
+    /// Columns the name takes, for the picker's; the first of a card's rows.
     pub fn width(&self) -> u16 {
-        u16::try_from(self.text.width()).unwrap_or(u16::MAX)
+        match &self.left {
+            Left::Name { text, .. } => u16::try_from(text.width()).unwrap_or(u16::MAX),
+            Left::Card { spans, .. } => spans
+                .first()
+                .map_or(0, |&(_, from, to)| to.saturating_sub(from) + 1),
+        }
     }
 
     /// The name as an overlay for the session's fade-in, or `None` when it
     /// would not fit a screen `rows` by `cols` — a terminal resized during the
     /// attach — since a name half off the edge is better not drawn at all.
+    /// None for a card, which the session's own client draws again itself.
     pub fn over(&self, rows: u16, cols: u16) -> Option<Over> {
-        let fits =
-            self.row < rows && u32::from(self.col) + u32::from(self.width()) <= u32::from(cols);
+        let Left::Name { text, row, col, .. } = &self.left else {
+            return None;
+        };
+        let width = self.width();
+        let fits = *row < rows && u32::from(*col) + u32::from(width) <= u32::from(cols);
         fits.then(|| Over {
-            top: self.row,
-            left: self.col,
-            width: self.width(),
-            rows: vec![self.text.clone()],
+            top: *row,
+            left: *col,
+            width,
+            rows: vec![text.clone()],
         })
     }
 
-    /// The bytes that draw the name as the picker left it — in the terminal's
-    /// own colours, or in the theme's ink — leaving the cursor and the pen as
-    /// they were.
+    /// The bytes that draw it as it was left — the name in the terminal's own
+    /// colours, or in the theme's ink; the card in its own — leaving the
+    /// cursor and the pen as they were.
     pub fn show(&self) -> Vec<u8> {
-        self.at_name(&self.text, self.ink)
+        match &self.left {
+            Left::Name {
+                text,
+                row,
+                col,
+                ink,
+            } => at_cell(*row, *col, text, *ink),
+            Left::Card { drawn, .. } => drawn.clone(),
+        }
     }
 
-    /// The bytes that take the name down again: blanks over its cells, in the
+    /// The bytes that take it down again: blanks over its cells, in the
     /// terminal's own background, leaving the cursor and the pen as they were.
     pub fn erase(&self) -> Vec<u8> {
-        self.at_name(&" ".repeat(usize::from(self.width())), None)
+        match &self.left {
+            Left::Name { row, col, .. } => {
+                at_cell(*row, *col, &" ".repeat(usize::from(self.width())), None)
+            }
+            Left::Card { spans, .. } => {
+                let mut out = format!("\x1b7{}", crate::announce::pen(None));
+                for &(row, from, to) in spans {
+                    out.push_str(&format!(
+                        "\x1b[{};{}H{}",
+                        u32::from(row) + 1,
+                        u32::from(from) + 1,
+                        " ".repeat(usize::from(to.saturating_sub(from)) + 1)
+                    ));
+                }
+                out.push_str("\x1b8");
+                out.into_bytes()
+            }
+        }
     }
 
-    /// Take the name down now: [`HandOff::erase`], written. For the paths that
-    /// end an attach before the session has a frame to take it down with.
+    /// Take it down now: [`HandOff::erase`], written. For the paths that end
+    /// an attach before the session has a frame to take it down with.
     pub fn take_down(&self) {
         let _ = crate::term::write_stdout(&self.erase());
     }
+}
 
-    /// `text` written over the name's cells: `DECSC`, a reset so the cells
-    /// are the terminal's own colours — carrying `ink` when there is one (see
-    /// [`crate::announce::pen`]) — an absolute `CUP` — no newline, which with
-    /// `OPOST` off would move the cursor rather than wrap — and `DECRC`.
-    fn at_name(&self, text: &str, ink: Option<Rgb>) -> Vec<u8> {
-        format!(
-            "\x1b7{}\x1b[{};{}H{text}\x1b8",
-            crate::announce::pen(ink),
-            u32::from(self.row) + 1,
-            u32::from(self.col) + 1
-        )
-        .into_bytes()
-    }
+/// `text` written at (`row`, `col`): `DECSC`, a reset so the cells are the
+/// terminal's own colours — carrying `ink` when there is one (see
+/// [`crate::announce::pen`]) — an absolute `CUP` — no newline, which with
+/// `OPOST` off would move the cursor rather than wrap — and `DECRC`.
+fn at_cell(row: u16, col: u16, text: &str, ink: Option<Rgb>) -> Vec<u8> {
+    format!(
+        "\x1b7{}\x1b[{};{}H{text}\x1b8",
+        crate::announce::pen(ink),
+        u32::from(row) + 1,
+        u32::from(col) + 1
+    )
+    .into_bytes()
 }
 
 #[cfg(test)]
@@ -166,8 +255,12 @@ mod tests {
     #[test]
     fn a_themed_name_is_left_in_its_ink() {
         let h = HandOff {
-            ink: Some(Rgb(0x7a, 0xa2, 0xf7)),
-            ..dotfiles()
+            left: Left::Name {
+                text: "dotfiles".into(),
+                row: 4,
+                col: 27,
+                ink: Some(Rgb(0x7a, 0xa2, 0xf7)),
+            },
         };
         let shown = String::from_utf8(h.show()).unwrap();
         assert_eq!(
@@ -198,6 +291,30 @@ mod tests {
             HandOff::new("\x07\x1b", 0, 0, 40).is_none(),
             "nothing left of it"
         );
+    }
+
+    /// A switch's card is drawn as the session it left drew it, and taken
+    /// down cell for cell; it is no overlay, which the session it goes to
+    /// draws again for itself.
+    #[test]
+    fn a_card_is_drawn_as_it_was_and_taken_down_cell_for_cell() {
+        let drawn = b"\x1b7\x1b[2;90H\x1b[0;1;38;2;1;2;3mblog\x1b8".to_vec();
+        let h = HandOff::card(drawn.clone(), &[(1, 85, 96), (2, 90, 96)]).expect("a card");
+        assert_eq!(h.show(), drawn);
+        assert_eq!(
+            String::from_utf8(h.erase()).unwrap(),
+            format!(
+                "\x1b7\x1b[0m\x1b[2;86H{}\x1b[3;91H{}\x1b8",
+                " ".repeat(12),
+                " ".repeat(7)
+            )
+        );
+        assert_eq!(h.over(24, 100), None);
+        assert!(
+            HandOff::card(Vec::new(), &[(1, 1, 2)]).is_none(),
+            "nothing drawn"
+        );
+        assert!(HandOff::card(drawn, &[]).is_none(), "nowhere");
     }
 
     /// As an overlay, the name is one row of exactly its width; on a screen

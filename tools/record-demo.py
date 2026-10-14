@@ -28,8 +28,8 @@ Driving on a pty means there is no `capture-pane` to read back, so the checks
 render the stream with pyte -- through `Screen` below, since pyte has no
 alternate screen of its own.
 
-**What the sessions have to say is staged.** The picker's signs and the card
-in the corner report what each session's watcher recorded (`src/notes.rs`),
+**What the sessions have to say is staged.** The picker's signs and the note
+in the margin report what each session's watcher recorded (`src/notes.rs`),
 and a session made a minute ago has recorded nothing. So, off camera,
 api-server is given an agent at work -- a progress message left running, as a
 plugin driving one leaves it -- and dotfiles a run of its install script, in a
@@ -941,12 +941,15 @@ def perform(env):
     term.expect("HISTFILE", "the other buffer")
     time.sleep(1.4)
 
-    # 7. the agent left at work in api-server wants you: a card in the corner
-    # says so, and the prefix key and Enter go there
+    # 7. the agent left at work in api-server wants you: a note in the margin
+    # says so; the prefix key held says the key under it, and Enter goes there
     rpc(env, "api-server", AGENT_ASKS)
-    term.expect("Claude needs your permission", "the card in the corner")
+    term.expect("Claude needs your permission", "the note in the margin")
     time.sleep(2.2)
-    term.write(PREFIX + ENTER, show=("Ctrl-Space  ⏎", "go there"))
+    term.write(PREFIX, show=("Ctrl-Space", "prefix"))
+    term.expect("go there", "the key under the note")
+    time.sleep(0.5)
+    term.write(ENTER, show=("⏎", "go there"))
     term.expect("list_users(", "api-server, its split and all")
     time.sleep(1.6)
 

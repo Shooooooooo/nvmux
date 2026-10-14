@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use common::{wait_until, Scratch};
-use nvmux::card::{self, Go, Post};
+use nvmux::card::{self, Card, Go, Post, Posted};
 use nvmux::notes::{self, Heard, Kind};
 use nvmux::rpc::Client;
 use nvmux::tell::Notifier;
@@ -147,6 +147,15 @@ fn the_watcher_numbers_what_it_keeps_and_knows_where_its_terminal_is() {
     assert_eq!(news[0].buf, None, "a buffer that is gone is none: {news:?}");
 }
 
+/// The card a post shows, and where acting on it goes: none for one that lets
+/// go of what is up.
+fn shown(post: &Post) -> Option<(&Card, Option<Go>)> {
+    match &post.what {
+        Posted::Card(card, go) => Some((card, *go)),
+        Posted::Forget(_) => None,
+    }
+}
+
 /// Wait up to `within` for posts on the board that `want` says are the ones,
 /// and hand back every post taken meanwhile.
 fn posts_until(within: Duration, want: impl Fn(&[Post]) -> bool) -> Vec<Post> {
@@ -164,7 +173,9 @@ fn posts_until(within: Duration, want: impl Fn(&[Post]) -> bool) -> Vec<Post> {
 /// terminals say as it happens — a command that finished, a notification —
 /// by that session's name, going there; of its own terminals, only what one
 /// off the screen says, as `here`, going to it; and nothing while nvmux's own
-/// screens are up.
+/// screens are up. A screen that comes up while another session keeps what
+/// it said is posted that session's mark alone — and told to let it go once
+/// the session keeps nothing.
 #[test]
 fn the_notifier_posts_cards_for_the_session_in_front() {
     require_nvim!();
@@ -181,22 +192,24 @@ fn the_notifier_posts_cards_for_the_session_in_front() {
     card::board().take();
 
     let within = Duration::from_secs(8);
-    let saying = |what: &'static str| {
-        move |posts: &[Post]| posts.iter().any(|p| p.card.body.as_deref() == Some(what))
-    };
+    let says =
+        |p: &Post, what: &str| shown(p).is_some_and(|(c, _)| c.body.as_deref() == Some(what));
+    let saying = |what: &'static str| move |posts: &[Post]| posts.iter().any(|p| says(p, what));
 
     a_job_that_exits(&other_sock, "exit 0", false);
     let posts = posts_until(within, saying("sh: exited with code 0"));
     let post = posts
         .iter()
-        .find(|p| p.card.body.as_deref() == Some("sh: exited with code 0"))
+        .find(|p| says(p, "sh: exited with code 0"))
         .unwrap_or_else(|| panic!("no card: {posts:?}"));
     assert_eq!(post.front, front.id, "for the session in front");
-    assert_eq!(post.card.kind, card::Kind::Finished);
-    assert_eq!(post.card.title, "other");
-    assert_eq!(post.card.footer.as_deref(), Some("Ctrl-Space ⏎ go there"));
+    let (card, go) = shown(post).expect("a card");
+    assert_eq!(card.kind, card::Kind::Finished);
+    assert_eq!(card.title, "other");
+    assert_eq!(card.about.as_deref(), Some(other.id.as_str()));
+    assert_eq!(card.footer.as_deref(), Some("Ctrl-Space ⏎ go there"));
     assert_eq!(
-        post.go,
+        go,
         Some(Go::Session(nvmux::ids::Id::new(&other.id).expect("id")))
     );
 
@@ -205,7 +218,10 @@ fn the_notifier_posts_cards_for_the_session_in_front() {
     assert!(
         posts
             .iter()
-            .any(|p| p.card.kind == card::Kind::Notified && p.card.title == "other"),
+            .filter_map(shown)
+            .any(|(c, _)| c.kind == card::Kind::Notified
+                && c.title == "other"
+                && c.mark == Some(card::Kind::Notified)),
         "{posts:?}"
     );
 
@@ -213,18 +229,17 @@ fn the_notifier_posts_cards_for_the_session_in_front() {
     let posts = posts_until(within, saying("sh: exited with code 3"));
     let post = posts
         .iter()
-        .find(|p| p.card.body.as_deref() == Some("sh: exited with code 3"))
+        .find(|p| says(p, "sh: exited with code 3"))
         .unwrap_or_else(|| panic!("a terminal of its own off the screen: {posts:?}"));
-    assert_eq!(post.card.title, "here");
-    assert_eq!(post.card.footer.as_deref(), Some("Ctrl-Space ⏎ show it"));
-    assert_eq!(post.go, Some(Go::Buffer(hidden)));
+    let (card, go) = shown(post).expect("a card");
+    assert_eq!(card.title, "here");
+    assert_eq!(card.footer.as_deref(), Some("Ctrl-Space ⏎ show it"));
+    assert_eq!(go, Some(Go::Buffer(hidden)));
 
     a_job_that_exits(&front_sock, "exit 0", true);
     let posts = posts_until(notes::POLL + Duration::from_millis(800), |_| false);
     assert!(
-        !posts
-            .iter()
-            .any(|p| p.card.body.as_deref() == Some("sh: exited with code 0")),
+        !posts.iter().any(|p| says(p, "sh: exited with code 0")),
         "posted for a terminal it was showing: {posts:?}"
     );
 
@@ -233,4 +248,34 @@ fn the_notifier_posts_cards_for_the_session_in_front() {
     a_job_that_exits(&other_sock, "exit 2", false);
     let posts = posts_until(notes::POLL + Duration::from_millis(800), |_| false);
     assert!(posts.is_empty(), "posted with nobody in front: {posts:?}");
+
+    // Back in front, the other session keeps a failure over a command that
+    // finished: its mark alone, the failure's.
+    notifier.front(Some(&front.id));
+    let posts = posts_until(within, |posts| {
+        posts.iter().filter_map(shown).any(|(c, _)| c.only_mark)
+    });
+    let (mark, go) = posts
+        .iter()
+        .filter_map(shown)
+        .find(|(c, _)| c.only_mark)
+        .unwrap_or_else(|| panic!("no mark: {posts:?}"));
+    assert_eq!(
+        (mark.title.as_str(), mark.kind, mark.mark),
+        ("other", card::Kind::Failed, Some(card::Kind::Failed))
+    );
+    assert_eq!(mark.body.as_deref(), Some("sh: exited with code 2"));
+    assert_eq!(
+        go,
+        Some(Go::Session(nvmux::ids::Id::new(&other.id).expect("id")))
+    );
+
+    // Seen: the mark is let go of.
+    notes::seen(&other_sock);
+    let forget = |p: &Post| p.what == Posted::Forget(other.id.clone());
+    let posts = posts_until(within, |posts| posts.iter().any(forget));
+    assert!(
+        posts.iter().any(forget),
+        "the mark was never let go of: {posts:?}"
+    );
 }

@@ -152,6 +152,64 @@ pub struct Over {
     pub rows: Vec<String>,
 }
 
+/// Cells of the session's screen a dissolve leaves standing: what is written
+/// on them stays at its full colour on every frame, while all else — their
+/// backgrounds among it — dissolves. For a card nvmux's own client drew on the
+/// session's screen (see [`crate::client::cards::arrival_footprint`]), which then
+/// stays as it is while the screen under it comes and goes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Kept {
+    /// On a row, the first column and the last, 0-based.
+    spans: Vec<(u16, u16, u16)>,
+    /// What the client writes on them, each character with the cell it starts
+    /// on: how the screen shows the card is there to stand (see
+    /// [`Shadow::shows`]).
+    glyphs: Vec<(u16, u16, char)>,
+}
+
+impl Kept {
+    /// The cells of `spans`, each a row, its first column and its last, with
+    /// `glyphs` written on them.
+    pub fn new(
+        spans: impl IntoIterator<Item = (usize, usize, usize)>,
+        glyphs: impl IntoIterator<Item = (usize, usize, char)>,
+    ) -> Self {
+        let cell = |n: usize| u16::try_from(n).ok();
+        Self {
+            spans: spans
+                .into_iter()
+                .filter_map(|(row, from, to)| Some((cell(row)?, cell(from)?, cell(to)?)))
+                .collect(),
+            glyphs: glyphs
+                .into_iter()
+                .filter_map(|(row, col, ch)| Some((cell(row)?, cell(col)?, ch)))
+                .collect(),
+        }
+    }
+
+    /// Where `card` stands on a screen `cols` wide and `rows` high, if it is
+    /// an arrival (see [`crate::client::cards::arrival_footprint`]).
+    pub fn arrival(card: &crate::card::Card, cols: u16, rows: u16) -> Self {
+        let f = crate::client::cards::arrival_footprint(card, usize::from(cols), usize::from(rows));
+        Self::new(f.spans, f.glyphs)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    /// The spans, each a row, its first column and its last.
+    pub fn spans(&self) -> &[(u16, u16, u16)] {
+        &self.spans
+    }
+
+    fn holds(&self, row: u16, col: u16) -> bool {
+        self.spans
+            .iter()
+            .any(|&(r, from, to)| r == row && (from..=to).contains(&col))
+    }
+}
+
 /// A cell as a frame paints it: its interpolated colours and the attributes
 /// that change how its glyph is drawn. What one frame compares against the
 /// last.
@@ -288,7 +346,7 @@ impl Shadow {
     /// [`feed`]: Shadow::feed
     /// [`resize`]: Shadow::resize
     pub fn frame(&mut self, t: f32, palette: &Palette, cursor: Cursor) -> Vec<u8> {
-        self.frame_with(|_| t, palette, cursor, None)
+        self.frame_with(|_| t, palette, cursor, None, &Kept::default())
     }
 
     /// [`Shadow::frame`], with each row `dissolve(row)` of the way to
@@ -305,12 +363,16 @@ impl Shadow {
     /// which records the session's cells, stays true of everything the
     /// overlay does not cover, and of the rectangle too once the overlay has
     /// dissolved and paints the session's own cells there.
+    ///
+    /// What is written on the `kept` cells is painted at its full colour
+    /// whatever `dissolve` says, on a background that dissolves with the rest.
     pub fn frame_with(
         &mut self,
         dissolve: impl Fn(u16) -> f32,
         palette: &Palette,
         cursor: Cursor,
         over: Option<(&Over, Rgb, f32)>,
+        kept: &Kept,
     ) -> Vec<u8> {
         let screen = self.parser.screen();
         let (rows, cols) = if self.broken { (0, 0) } else { screen.size() };
@@ -331,7 +393,11 @@ impl Shadow {
             for col in 0..cols {
                 let cell = screen.cell(row, col);
                 let index = next.len();
-                let painted = resolve(cell, palette, t);
+                let painted = if kept.holds(row, col) {
+                    standing(cell, palette, t)
+                } else {
+                    resolve(cell, palette, t)
+                };
                 next.push(painted);
                 // The second half of the wide character before it, which the
                 // first half already covered.
@@ -370,6 +436,58 @@ impl Shadow {
         }
         out.extend_from_slice(SYNC_END);
         self.painted = next;
+        out
+    }
+
+    /// Whether the screen has on it what the `kept` cells are kept for: each of
+    /// their glyphs where it goes. A dissolve leaves them standing only then —
+    /// otherwise they would stand with whatever the session has there.
+    pub fn shows(&self, kept: &Kept) -> bool {
+        if self.broken || kept.glyphs.is_empty() {
+            return false;
+        }
+        let screen = self.parser.screen();
+        kept.glyphs.iter().all(|&(row, col, ch)| {
+            screen
+                .cell(row, col)
+                .is_some_and(|c| c.contents().starts_with(ch))
+        })
+    }
+
+    /// The bytes that draw what the `kept` cells have written on them, as a
+    /// dissolve leaves it standing — at its full colour, on the terminal's own
+    /// background — and leave the cursor and the pen as they were: to draw it
+    /// again on a screen the session has gone from (see [`crate::handoff`]).
+    /// Nothing where nothing is written, or the grid cannot be trusted.
+    pub fn kept_bytes(&self, kept: &Kept, palette: &Palette) -> Vec<u8> {
+        if self.broken || kept.is_empty() {
+            return Vec::new();
+        }
+        let screen = self.parser.screen();
+        let mut out = SAVE_CURSOR.to_vec();
+        let mut drawn = false;
+        for &(row, from, to) in &kept.spans {
+            for col in from..=to {
+                let Some(cell) = screen.cell(row, col) else {
+                    continue;
+                };
+                if !cell.has_contents() || cell.is_wide_continuation() {
+                    continue;
+                }
+                let painted = Painted {
+                    bg: None,
+                    ..resolve(Some(cell), palette, 0.0)
+                };
+                let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
+                write_sgr(&mut out, painted);
+                out.extend_from_slice(cell.contents().as_bytes());
+                drawn = true;
+            }
+        }
+        if !drawn {
+            return Vec::new();
+        }
+        out.extend_from_slice(RESTORE_CURSOR);
         out
     }
 
@@ -681,6 +799,15 @@ fn write_colour(out: &mut Vec<u8>, colour: vt100::Color, base: u8, bright: u8, e
 /// Inverse video is applied here — the cell's colours swapped, a default
 /// background standing in as the terminal's background colour — so the
 /// terminal is never asked to invert an interpolated pair.
+/// A cell a dissolve leaves standing, `t` of the way: what is written on it
+/// at its full colour, on its background `t` of the way to `palette.bg`.
+fn standing(cell: Option<&vt100::Cell>, palette: &Palette, t: f32) -> Painted {
+    Painted {
+        bg: resolve(cell, palette, t).bg,
+        ..resolve(cell, palette, 0.0)
+    }
+}
+
 fn resolve(cell: Option<&vt100::Cell>, palette: &Palette, t: f32) -> Painted {
     let Some(cell) = cell else {
         return Painted {
@@ -907,6 +1034,91 @@ mod tests {
 
     /// A screen with a letter in every cell the box will cover, so anything
     /// showing through can be told from anything that is not.
+    /// A screen with a card of nvmux's on it: a dim log on the editor's
+    /// background, and on its second row the name a switch landed in, bold.
+    fn carded() -> (Shadow, Kept) {
+        let mut shadow = Shadow::new(6, 20);
+        for row in 1..=6 {
+            shadow.feed(
+                format!("\x1b[{row};1H\x1b[0;38;2;90;90;90;48;2;20;20;20mabcdefghijklmnopqrst")
+                    .as_bytes(),
+            );
+        }
+        shadow.feed(b"\x1b[2;13H\x1b[0;1;38;2;220;220;220;48;2;20;20;20m  blog\x1b[0m");
+        let glyphs = [(1, 14, 'b'), (1, 15, 'l'), (1, 16, 'o'), (1, 17, 'g')];
+        (shadow, Kept::new([(1, 12, 17)], glyphs))
+    }
+
+    /// What a card writes on the cells it stands on stays at its full colour
+    /// as the screen dissolves, on a background that goes with the rest.
+    #[test]
+    fn what_stands_keeps_its_colour_as_the_screen_dissolves() {
+        let (mut shadow, kept) = carded();
+        let frame = shadow.frame_with(|_| 0.5, &palette(), Cursor::Hidden, None, &kept);
+        let cells = painted_cells(&frame);
+        let at = |row, col| {
+            cells
+                .iter()
+                .find(|(at, _, _)| *at == (row, col))
+                .map(|(_, sgr, text)| (sgr.clone(), text.clone()))
+                .expect("painted")
+        };
+        assert_eq!(
+            at(2, 15),
+            (
+                "0;1;38;2;220;220;220;48;2;10;10;10".to_string(),
+                "b".to_string()
+            ),
+            "the card at full, its background half way"
+        );
+        assert_eq!(
+            at(1, 15),
+            ("0;38;2;45;45;45;48;2;10;10;10".to_string(), "o".to_string()),
+            "the log half way"
+        );
+        assert_eq!(at(2, 12).0, "0;38;2;45;45;45;48;2;10;10;10", "beside it");
+    }
+
+    /// A card stands only where the screen shows it: a screen without it, or
+    /// a stand with nothing it would write, stands nothing.
+    #[test]
+    fn a_card_stands_only_where_the_screen_shows_it() {
+        let (shadow, kept) = carded();
+        assert!(shadow.shows(&kept));
+        let (_, without) = carded();
+        let mut bare = Shadow::new(6, 20);
+        bare.feed(b"\x1b[2;1Habcdefghijklmnopqrst");
+        assert!(!bare.shows(&without), "not drawn yet");
+        assert!(
+            !shadow.shows(&Kept::new([(1, 12, 17)], [])),
+            "nothing to look for"
+        );
+    }
+
+    /// What stands is drawn again as it stood: at its full colour, on the
+    /// terminal's own background, between a cursor save and restore.
+    #[test]
+    fn what_stands_is_drawn_again_as_it_stood() {
+        let (shadow, kept) = carded();
+        let bytes = shadow.kept_bytes(&kept, &palette());
+        assert!(bytes.starts_with(SAVE_CURSOR) && bytes.ends_with(RESTORE_CURSOR));
+        let drawn: Vec<_> = painted_cells(&bytes)
+            .into_iter()
+            .filter(|(_, _, text)| text != " ")
+            .collect();
+        let bold = "0;1;38;2;220;220;220".to_string();
+        assert_eq!(
+            drawn,
+            [
+                ((2, 15), bold.clone(), "b".to_string()),
+                ((2, 16), bold.clone(), "l".to_string()),
+                ((2, 17), bold.clone(), "o".to_string()),
+                ((2, 18), bold, "g".to_string()),
+            ]
+        );
+        assert!(shadow.kept_bytes(&Kept::default(), &palette()).is_empty());
+    }
+
     fn under() -> Shadow {
         let mut shadow = Shadow::new(8, 20);
         for row in 3..=5 {
@@ -1042,7 +1254,13 @@ mod tests {
         };
         let mut shadow = under();
 
-        let first = shadow.frame_with(|_| 1.0, &p, Cursor::Hidden, Some((&name, p.fg, 0.0)));
+        let first = shadow.frame_with(
+            |_| 1.0,
+            &p,
+            Cursor::Hidden,
+            Some((&name, p.fg, 0.0)),
+            &Kept::default(),
+        );
         let wire = text(&first);
         assert_eq!(
             wire.matches("\x1b[?2026h").count(),
@@ -1060,7 +1278,13 @@ mod tests {
         );
         assert_eq!(cells[&(4, 9)].1, "I", "beside it, the session's own cell");
 
-        let end = shadow.frame_with(|_| 0.0, &p, Cursor::Hidden, Some((&name, p.fg, 1.0)));
+        let end = shadow.frame_with(
+            |_| 0.0,
+            &p,
+            Cursor::Hidden,
+            Some((&name, p.fg, 1.0)),
+            &Kept::default(),
+        );
         let cells = last(&end);
         let back: String = (5..=8).map(|col| cells[&(4, col)].1.clone()).collect();
         assert_eq!(back, "EFGH", "the session's cells, where the name was");
@@ -1079,7 +1303,7 @@ mod tests {
         let mut shadow = under();
         // 0-based rows 2 and 3 are 3 and 4 on the wire.
         let shape = |row: u16| if row == 3 { 0.0 } else { 1.0 };
-        let frame = shadow.frame_with(shape, &p, Cursor::Hidden, None);
+        let frame = shadow.frame_with(shape, &p, Cursor::Hidden, None, &Kept::default());
         let full = format!("0;38;2;{};{};{}", p.fg.0, p.fg.1, p.fg.2);
         let gone = format!("0;38;2;{};{};{}", p.bg.0, p.bg.1, p.bg.2);
         let cells = painted_cells(&frame);

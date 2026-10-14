@@ -10,7 +10,7 @@ Create named Neovim sessions, attach to them, detach, and come back later —
 with the editor running on a remote host while every keystroke and every pixel
 of rendering happens on your own terminal.
 
-![Opening the nvmux picker on three sessions, an agent's spinner turning beside api-server and a check mark beside dotfiles, whose install script finished; creating a fourth, blog, and moving it to the end of the list; attaching to api-server, scrolling as the text slides and opening a split that flies in from the side; switching to the next session with the prefix key, and to another buffer as it fades over; a card coming up in the corner as the agent in api-server asks for permission, and the prefix key and Enter going back there; detaching, then relaunching nvmux to find the list in the order it was left, and reattaching to find the split where it was. Each key is shown as it is pressed.](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/demo.gif)
+![Opening the nvmux picker on three sessions, an agent's spinner turning beside api-server and a check mark beside dotfiles, whose install script finished; creating a fourth, blog, and moving it to the end of the list; attaching to api-server, scrolling as the text slides and opening a split that flies in from the side; switching to the next session with the prefix key, the row of session names in the top right margin moving the way it went, and to another buffer as it fades over; a note coming up in the margin as the agent in api-server asks for permission, the prefix key held saying the key under it, and Enter going back there; detaching, then relaunching nvmux to find the list in the order it was left, and reattaching to find the split where it was. Each key is shown as it is pressed.](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/demo.gif)
 
 Make a session, put it where you want it in the list, work, hop to another,
 go back to the one that wants you, detach, come back: the sessions, their
@@ -94,15 +94,16 @@ reimplementing it.
 | `<prefix>` `n` | next session by number (wraps) |
 | `<prefix>` `p` | previous session by number (wraps) |
 | `<prefix>` `c` | set up a new session and attach to it — `Esc` goes back |
-| `<prefix>` `Enter` | go where the card in the corner is about: its session, or a terminal of this one |
+| `<prefix>` `Enter` | go where the newest note in the margin is about: its session, or a terminal of this one |
 | `<prefix>` `?` | show these keys — `Esc` goes back |
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
 
 Pressing `<prefix>` puts a one-row reminder of these keys along the bottom of
 the screen; it goes as soon as the next key resolves it. A switch, by key or
-out of the picker, says which session you have landed in, with a card in the
-top right corner that comes in with the session's screen and goes a moment
-later.
+out of the picker, says where you have landed: in the top right margin, the
+session's name between the ones `<prefix> p` and `<prefix> n` go to, which
+moves the way you went and goes a moment later. It is up from the moment you
+press the key, and stays on the screen while the sessions fade.
 
 ### Leaving a session
 
@@ -167,17 +168,16 @@ The picker shows a sign beside each session that has something to report:
 A command typed at a shell prompt counts only if the shell reports how it went,
 as fish 4 does.
 
-While you are in a session, the others' news comes up as cards in the corner,
-and `<prefix> Enter` goes to the newest:
+While you are in a session, the others' news comes up in the top right
+margin, and goes, leaving its sign there until you open that session.
+`<prefix> Enter` goes to the newest:
 
 ```
-╭─ ✓ api-server ──────────────────────── 3s ─╮
-│ cargo test: exited with code 0             │
-│ Ctrl-Space ⏎ go there                      │
-╰────────────────────────────────────────────╯
+              ✓ api-server  3s
+cargo test: exited with code 0
 ```
 
-Cards need nvmux's own client; with `ui = "nvim"` there are none.
+Notes need nvmux's own client; with `ui = "nvim"` there are none.
 
 > [!TIP]
 > If Claude Code's notifications never show, as on a remote host, set its

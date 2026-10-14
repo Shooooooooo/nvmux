@@ -305,16 +305,17 @@ fn the_client_draws_a_session_and_types_into_it() {
 }
 
 /// What nvmux tells its client to show — a card, in the client's input (see
-/// `nvmux::card`) — is drawn in the top right corner over the editor, and is
-/// typed into nothing. The editor clearing its screen and drawing it again
-/// draws the card again with it; and when its time is up the card goes, and
-/// what it covered is the editor's again.
+/// `nvmux::card`) — is drawn in the margin over the editor, and is typed into
+/// nothing. The editor clearing its screen and drawing it again draws the card
+/// again with it. When its time is up its words go, and what they covered is
+/// the editor's again; its sign stays, at the edge, until it is let go of.
 #[test]
 fn a_card_is_drawn_over_the_editor_and_outlives_its_repaints() {
     require_nvim!();
     let scratch = Scratch::new("client-card");
     let (sock, mut rpc, config) = session(&scratch, "client-card");
-    let under = "u".repeat(usize::from(COLS) - 1);
+    let cols = usize::from(COLS);
+    let under = "u".repeat(cols - 1);
     rpc.command(&format!(
         "setlocal noswapfile | call setline(1, ['first', '{under}', '{under}'])"
     ))
@@ -343,16 +344,17 @@ fn a_card_is_drawn_over_the_editor_and_outlives_its_repaints() {
     };
     let shown = Instant::now();
     term.type_bytes(&nvmux::card::encode(&nvmux::card::Command::Show(card)));
+    // Flush right, two columns in: the last of them is past the editor's
+    // text, and blank.
+    let head = "✓ api-server  3s";
+    let body = "cargo test: exited with code 0";
     let carded = |s: &str| {
         let rows: Vec<&str> = s.lines().collect();
         rows.get(1)
-            .is_some_and(|r| r.ends_with("╮") && r.contains("╭─ ✓ api-server"))
+            .is_some_and(|r| r.ends_with(&format!("{head}u")))
             && rows
                 .get(2)
-                .is_some_and(|r| r.contains("│ cargo test: exited with code 0"))
-            && rows
-                .get(3)
-                .is_some_and(|r| r.contains("│ Ctrl-Space ⏎ go there"))
+                .is_some_and(|r| r.ends_with(&format!("{body}u")))
     };
     assert!(
         term.pump_until(Duration::from_secs(5), carded),
@@ -365,9 +367,10 @@ fn a_card_is_drawn_over_the_editor_and_outlives_its_repaints() {
         .nth(1)
         .map(str::to_string)
         .unwrap_or_default();
-    assert!(
-        row.starts_with(&"u".repeat(usize::from(COLS) - 47)),
-        "the card is not in the top right corner: {row:?}"
+    assert_eq!(
+        row,
+        format!("{}{head}u", "u".repeat(cols - 2 - head.chars().count())),
+        "the card is not in the margin"
     );
     assert_eq!(
         rpc.eval("[getline(1, '$'), mode()]")
@@ -392,10 +395,21 @@ fn a_card_is_drawn_over_the_editor_and_outlives_its_repaints() {
         term.text()
     );
 
+    let marked = format!("{}✓u", "u".repeat(cols - 3));
     let left = life.saturating_sub(shown.elapsed()) + Duration::from_secs(3);
     assert!(
-        term.pump_until(left, |s| s.lines().nth(1) == Some(under.as_str())),
-        "the card never went, or did not give the editor's text back:\n{}",
+        term.pump_until(left, |s| {
+            let rows: Vec<&str> = s.lines().collect();
+            rows.get(1) == Some(&marked.as_str()) && rows.get(2) == Some(&under.as_str())
+        }),
+        "the words never went, or did not leave the sign:\n{}",
+        term.text()
+    );
+    term.type_bytes(&nvmux::card::encode(&nvmux::card::Command::Drop { id: 1 }));
+    assert!(
+        term.pump_until(Duration::from_secs(3), |s| s.lines().nth(1)
+            == Some(under.as_str())),
+        "the mark never went, or did not give the editor's text back:\n{}",
         term.text()
     );
     assert_eq!(term.hang_up(), Some(0), "the client's exit");
