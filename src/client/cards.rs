@@ -123,14 +123,14 @@ const MARKED: f32 = 0.5;
 const GAP: usize = 3;
 
 /// The dimming under the cards: how far it reaches from a line, in columns,
-/// and how far it takes what is right beside one toward the background — less,
-/// and not as far, around a sign. A row counts as [`ASPECT`] columns; and
-/// under a line, at its full strength, what was there is emptied
-/// ([`EMPTIED`]).
-const REACH: f32 = 14.0;
-const PEAK: f32 = 0.8;
+/// and how far it takes what is right beside one toward the background — a
+/// tenth of what was there left — less, and not as far, around a sign. A row
+/// counts as [`ASPECT`] columns; and under a line, at its full strength, what
+/// was there is emptied ([`EMPTIED`]).
+const REACH: f32 = 18.0;
+const PEAK: f32 = 0.9;
 const SIGN_REACH: f32 = REACH * 0.45;
-const SIGN_PEAK: f32 = 0.6;
+const SIGN_PEAK: f32 = 0.7;
 const ASPECT: f32 = 2.1;
 const EMPTIED: f32 = 0.98;
 
