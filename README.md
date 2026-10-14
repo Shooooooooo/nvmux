@@ -10,13 +10,13 @@ Create named Neovim sessions, attach to them, detach, and come back later —
 with the editor running on a remote host while every keystroke and every pixel
 of rendering happens on your own terminal.
 
-![Running nvmux devbox and opening the picker on the three sessions on that host, an agent's spinner turning beside api-server and a check mark beside dotfiles, whose install script finished; creating a fourth, blog, and moving it to the end of the list; attaching to api-server, scrolling as the text slides and opening a split that flies in from the side; switching to the next session with the prefix key, and to another buffer as it fades over; a card coming up in the corner as the agent in api-server asks for permission, and the prefix key and Enter going back there; detaching, then running nvmux devbox again to find the list in the order it was left, and reattaching to find the split where it was. Each key is shown under the window as it is pressed.](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/demo.gif)
+![Running nvmux devbox and opening the picker on the three sessions on that host, an agent's spinner turning beside api-server and a check mark beside dotfiles, whose install script finished; creating a fourth, blog, and moving it to the end of the list; attaching to api-server, scrolling as the text slides, and starting a release build in a terminal whose split flies in from the side; switching to the next session with the prefix key while it builds, and to another buffer as it fades over; a card coming up in the corner as the build finishes, and the prefix key and Enter going back to it; detaching, then running nvmux devbox again to find the list in the order it was left, and reattaching to find the build's split where it was. Each key is shown under the window as it is pressed.](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/demo.gif)
 
-Connect to a host, make a session, put it where you want it in the list, work,
-hop to another, go back to the one that wants you, detach, come back: the
-sessions, their windows and their buffers are still running on the host, where
-you left them — and nvmux's own client animates the scrolls, splits and
-switches on the way.
+Connect to a host, make a session, put it where you want it in the list, start
+a build, hop to another session while it runs, go back the moment it finishes,
+detach, come back: the sessions, their windows and their buffers are still
+running on the host, where you left them — and nvmux's own client animates the
+scrolls, splits and switches on the way.
 
 [Who it's for](#who-its-for) · [Why not tmux?](#why-not-tmux) · [Install](#install) · [Use](#use) · [How it works](#how-it-works) · [Configuration](#configuration)
 

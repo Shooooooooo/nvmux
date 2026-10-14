@@ -53,10 +53,13 @@ in the corner report what each session's watcher recorded (`src/notes.rs`),
 and a session made a minute ago has recorded nothing. So, off camera,
 api-server is given an agent at work -- a progress message left running, as a
 plugin driving one leaves it -- and dotfiles a run of its install script, in a
-terminal buffer no window shows, that has finished. During the take, the agent
-asks for permission the way Claude Code does: an OSC 777 notification, from
-another terminal buffer no window shows. All of it goes in through the
-session's own socket (see `rpc`), and none of it is typed at an editor.
+terminal buffer no window shows, that has finished. Both go in through the
+session's own socket (see `rpc`), and neither is typed at an editor. The build
+the take starts in api-server is typed on camera, but the `cargo` it runs is
+the demo's (CARGO): there is no crate there to build, and a real build would
+take as long as it liked, where the card saying it has finished is wanted at
+one moment of the take. So it says what it compiles, and finishes when the
+take says it may.
 
 **The GIF is drawn bigger than it is shown.** A README shows it about 880
 pixels wide, which on a high-density screen is 1760 device pixels: at the size
@@ -383,7 +386,14 @@ THEME = {
 # editor sits on the terminal's own, as the picker does, and a fade between
 # the two dissolves into one colour. The rest is THEME's palette put to the
 # usual uses; Rust and zsh are highlighted by Neovim's syntax files, Lua and
-# Markdown by its tree-sitter, and both end in the groups below.
+# Markdown by its tree-sitter, and both end in the groups below. `editor`
+# adds what is the run's own: the terminal colours, and the demo's cargo.
+#
+# The window in front gets the room ('winwidth'), since cargo's last line is
+# longer than half the screen is wide. A terminal has no line numbers, and
+# its width is taken again once they are gone: it is sized while the window
+# that became it still had them, and a wrapped "Finished" line is what that
+# left on screen.
 EDITOR = r"""
 local o = vim.o
 o.termguicolors = true
@@ -391,8 +401,26 @@ o.number = true
 o.cursorline = true
 o.wrap = false
 o.splitright = true
+o.winwidth = 62
 o.fillchars = 'eob: '
-o.statusline = ' %f%( %m%)%=%{&filetype}   %l:%c  '
+
+-- A file by its path from the project, a terminal by its command.
+function _G.demo_name()
+  if vim.bo.buftype == 'terminal' then
+    return vim.api.nvim_buf_get_name(0):match('//%d+:(.*)$') or 'terminal'
+  end
+  local name = vim.fn.expand('%:.')
+  return name ~= '' and name or '[No Name]'
+end
+o.statusline = " %{v:lua.demo_name()}%{&modified ? ' [+]' : ''}%=%{&filetype}   %l:%c  "
+
+vim.api.nvim_create_autocmd('TermOpen', {
+  callback = function()
+    vim.wo.number = false
+    vim.wo.cursorline = false
+    vim.cmd('vertical resize -1 | vertical resize +1')
+  end,
+})
 
 local c = {
   fg = '#cdd0d4', dim = '#7f8695', faint = '#3d4250',
@@ -1226,17 +1254,54 @@ vim.wait(5000, function()
 end)
 """
 
-# In the take: the agent in api-server asks for permission, as Claude Code
-# does, from a terminal buffer no window shows -- and stays up after, as the
-# agent would, so that its ending is not news of its own.
-AGENT_ASKS = r"""
-local buf = vim.api.nvim_create_buf(true, false)
-vim.api.nvim_buf_call(buf, function()
-  vim.fn.jobstart({ 'sh', '-c',
-    [=[printf '\033]777;notify;Claude Code;Claude needs your permission\007'; exec sleep 600]=] },
-    { term = true })
-end)
+# The `cargo` on the sessions' PATH, for the build the take starts (see the
+# header); `main` writes it out with BUILT first, the file the take makes when
+# it wants the build done. It compiles at a builder's pace and then waits, so
+# the build is still going when the take leaves it and over when it is told
+# of. What it says is said as cargo says it -- the verb bold green, right of
+# twelve columns -- and the time it gives is the time it took.
+CARGO = r"""
+import os
+import sys
+import time
+
+CRATES = [
+    ("proc-macro2", "1.0.92"), ("unicode-ident", "1.0.14"), ("libc", "0.2.169"),
+    ("cfg-if", "1.0.0"), ("pin-project-lite", "0.2.16"), ("bytes", "1.9.0"),
+    ("itoa", "1.0.14"), ("memchr", "2.7.4"), ("quote", "1.0.38"),
+    ("syn", "2.0.96"), ("serde", "1.0.217"), ("tracing-core", "0.1.33"),
+    ("mio", "1.0.3"), ("socket2", "0.5.8"), ("tokio-macros", "2.5.0"),
+    ("tokio", "1.43.0"), ("http", "1.2.0"), ("hyper", "1.5.2"),
+    ("tower", "0.5.2"), ("axum-core", "0.5.0"), ("axum", "0.8.1"),
+]
+
+
+def say(verb, what):
+    sys.stdout.write("\033[1;32m%12s\033[0m %s\n" % (verb, what))
+    sys.stdout.flush()
+
+
+start = time.time()
+for name, version in CRATES:
+    say("Compiling", "%s v%s" % (name, version))
+    time.sleep(0.1)
+while not os.path.exists(BUILT):
+    time.sleep(0.05)
+say("Compiling", "api-server v0.1.0")
+time.sleep(0.4)
+say("Finished", "`release` profile [optimized] target(s) in %.2fs"
+    % (time.time() - start))
 """
+
+
+def editor(tools):
+    """The sessions' init.lua: EDITOR, then the run's own -- THEME's colours
+    for a terminal's programs, and the directory of the demo's cargo ahead
+    of the rest of PATH."""
+    colours = "".join("vim.g.terminal_color_%d = %s\n" % (i, json.dumps(c))
+                      for i, c in enumerate(THEME["palette"].split(":")))
+    return (EDITOR.lstrip() + colours
+            + "vim.env.PATH = %s .. ':' .. vim.env.PATH\n" % json.dumps(tools))
 
 
 def socket_of(name):
@@ -1265,8 +1330,9 @@ def stage_news(env):
     rpc(env, "dotfiles", INSTALL)
 
 
-def perform(env):
-    """The recorded take."""
+def perform(env, built):
+    """The recorded take. `built` is the file that lets the demo's cargo
+    finish (see CARGO)."""
     want = [n for n, _ in SESSIONS] + [NEW_NAME]
     term = shell(env, record=True, typed="nvmux %s" % HOST)
     time.sleep(1.1)
@@ -1324,43 +1390,47 @@ def perform(env):
     term.expect("AppState", "api-server to paint")
     time.sleep(1.0)
 
-    # 5. the client animates: a scroll slides, a split flies in from its side
+    # 5. the client animates: a scroll slides
     term.write(CTRL_D, wait=0.9, show=(("Ctrl-d",), "scroll"))
     term.write(CTRL_U, wait=0.9, show=(("Ctrl-u",), "scroll"))
-    term.type(":vsplit src/routes.rs", per_char=0.045, wait=0.3)
-    term.write(ENTER, show=(("\u23ce",), "split"))
-    term.expect("list_users(", "the split to open")
-    time.sleep(1.4)
 
-    # 6. the next session, without the picker; a buffer switch fades over
+    # 6. a release build, in a terminal whose split flies in from the side
+    term.type(":vsplit | term cargo build --release", per_char=0.04, wait=0.3)
+    term.write(ENTER, show=(("\u23ce",), "build"))
+    term.expect("Compiling", "the build to start")
+    time.sleep(1.6)
+
+    # 7. the next session while it builds, without the picker; a buffer
+    # switch fades over
     term.write(PREFIX + b"n", show=(("Ctrl-Space", "n"), "next session"))
     term.expect("init.lua", "dotfiles to paint")
     time.sleep(1.3)
     term.write(CTRL_CARET, show=(("Ctrl-^",), "other buffer"))
     term.expect("HISTFILE", "the other buffer")
-    time.sleep(1.1)
+    time.sleep(0.8)
 
-    # 7. the agent left at work in api-server wants you: a card in the corner
-    # says so, and the prefix key and Enter go there
-    rpc(env, "api-server", AGENT_ASKS)
-    term.expect("Claude needs your permission", "the card in the corner")
+    # 8. the build finishes: a card in the corner says so, and the prefix key
+    # and Enter go there, to the build as it ended
+    open(built, "w").close()
+    term.expect("exited with code 0", "the card in the corner")
     time.sleep(2.0)
     term.write(PREFIX + ENTER, show=(("Ctrl-Space", "\u23ce"), "go there"))
-    term.expect("list_users(", "api-server, its split and all")
-    time.sleep(1.2)
+    term.expect("Finished", "api-server, its build done")
+    time.sleep(1.6)
 
-    # 8. detach: the sessions keep running on devbox, nvmux exits
+    # 9. detach: the sessions keep running on devbox, nvmux exits
     term.write(PREFIX + b"d", show=(("Ctrl-Space", "d"), "detach"))
     # The editor has to be gone, and waiting for the prompt does not say that:
     # leaving the alternate screen restores the shell's screen, which already
     # carries the `$` from before nvmux was started. That check passes the
     # instant the alternate screen is left -- before the detach has finished --
     # and the `nvmux` typed next then lands in the editor instead of the shell.
-    term.expect_gone("list_users(", "the editor")
+    term.expect_gone("Finished", "the editor")
     term.expect("$", "the shell prompt back")
     time.sleep(0.8)
 
-    # 9. come back: the order is kept, and the split is where it was left
+    # 10. come back: the order is kept, and the build's split is where it
+    # was left
     term.type("nvmux %s" % HOST, per_char=0.07, wait=0.3)
     term.write(ENTER, show=(("\u23ce",), "connect"))
     term.expect("attach", "the picker again")
@@ -1371,7 +1441,7 @@ def perform(env):
     term.select("api-server", key=UP)
     time.sleep(0.3)
     term.write(ENTER, show=(("\u23ce",), "attach"))
-    term.expect("list_users(", "the split to still be there")
+    term.expect("Finished", "the build's split to still be there")
     time.sleep(2.6)
 
     with term.lock:
@@ -1854,10 +1924,16 @@ def main():
     cfg = os.path.join(tmp, "config.toml")
     with open(cfg, "w") as f:
         f.write('[keys]\nprefix = "Ctrl-Space"\n')
+    tools = os.path.join(tmp, "tools")
+    built = os.path.join(tmp, "built")
+    os.makedirs(tools)
+    with open(os.path.join(tools, "cargo"), "w") as f:
+        f.write("#!/usr/bin/env python3\nBUILT = %r\n" % built + CARGO)
+    os.chmod(os.path.join(tools, "cargo"), 0o755)
     xdg = os.path.join(tmp, "xdg")
     os.makedirs(os.path.join(xdg, "config", "nvim"))
     with open(os.path.join(xdg, "config", "nvim", "init.lua"), "w") as f:
-        f.write(EDITOR.lstrip())
+        f.write(editor(tools))
     devbox = Devbox(os.path.join(tmp, "ssh"), xdg)
 
     env = os.environ.copy()
@@ -1885,7 +1961,7 @@ def main():
         stage_news(env)
 
         print("recording...")
-        events, presses = perform(env)
+        events, presses = perform(env, built)
         check_fade_ran()
         check_prompt(events)
         check_clean(events)
