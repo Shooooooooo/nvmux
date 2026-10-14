@@ -335,10 +335,11 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             if warm && shown.as_deref() != Some(current.id.as_str()) {
                 attachment.announce_on_arrival(announce::label(&current.name));
             }
-            // Out of the picker the user chose the session by its name, and
-            // saw it — carried across, where the hand-off is on — so the
-            // notice has nothing to add but a key the session is waiting for.
-            if from_picker {
+            // Out of the picker, a session other than the one the user was just
+            // in is announced as a switch by key is. Back to that one — `Esc`,
+            // or Enter on its own row — the notice has nothing to add but a key
+            // the session is waiting for.
+            if from_picker && shown.as_deref() == Some(current.id.as_str()) {
                 attachment.arrive_unannounced();
             }
             from_picker = false;

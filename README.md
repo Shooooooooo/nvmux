@@ -100,9 +100,10 @@ reimplementing it.
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
 
 Pressing `<prefix>` puts a one-row reminder of these keys along the bottom of
-the screen; it goes as soon as the next key resolves it. A switch by key says
-which session you have landed in, with a card in the top right corner that
-comes in with the session's screen and goes a moment later.
+the screen; it goes as soon as the next key resolves it. A switch, by key or
+out of the picker, says which session you have landed in, with a card in the
+top right corner that comes in with the session's screen and goes a moment
+later.
 
 ### Leaving a session
 

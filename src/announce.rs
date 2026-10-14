@@ -12,10 +12,11 @@
 //! bytes through without looking at them, so there is nothing to composite into
 //! and nothing to read back.
 //!
-//! An attach out of the picker is the one change of session that goes without
-//! it: the user has just chosen the session there by its name, so the box
-//! would only repeat it — unless the session is waiting for a key, which the
-//! box is then the one thing to say (see
+//! An attach out of the picker was the one change of session that went
+//! without it: the user had just chosen the session there by its name, so the
+//! box would only have repeated it — unless the session was waiting for a key,
+//! which the box was then the one thing to say. The card says it there too,
+//! but on a return to the session the user was just in (see
 //! [`crate::pty::Attachment::arrive_unannounced`]).
 //!
 //! So nvmux writes a box over the session's screen itself, and

@@ -527,9 +527,9 @@ impl Attachment {
     }
 
     /// Arrive without the notice saying which session this is: for an attach
-    /// out of the picker, where the user has just chosen the session by its
-    /// name and watched that name carried into it (see [`crate::handoff`]), so
-    /// a card repeating it a moment later says nothing they do not know.
+    /// out of the picker back to the session the user was just in, which a
+    /// card naming it says nothing they do not know about. Out of the picker
+    /// to any other, the notice says it, as on a switch by key.
     ///
     /// Only the name goes. A session waiting for a key keeps its notice, which
     /// is then the one thing that says why the screen is blank — news the
@@ -4973,10 +4973,11 @@ mod tests {
         assert_eq!(attachment.announce, None);
     }
 
-    /// Out of the picker, the name is not announced again — but a session
-    /// waiting for a key still says so, which nothing else on the screen can.
+    /// Back from the picker to the session just left, its name is not
+    /// announced again — but a session waiting for a key still says so, which
+    /// nothing else on the screen can.
     #[test]
-    fn an_attach_from_the_picker_keeps_only_a_notice_with_news_in_it() {
+    fn going_back_to_the_session_just_left_keeps_only_a_notice_with_news_in_it() {
         let mut attachment = attached_to("while :; do read x; done");
         attachment.announce = Some("dotfiles".to_string());
         attachment.arrive_unannounced();
