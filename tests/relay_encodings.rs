@@ -95,6 +95,11 @@ const CHILD_POST: &str = "NVMUX_TEST_RELAY_POST";
 /// a card naming this — as `main` tells it of the session it goes to.
 const CHILD_LANDS: &str = "NVMUX_TEST_RELAY_LANDS";
 
+/// Set on a child whose switch lands with a card ([`CHILD_LANDS`]) to have
+/// that card a step along its row, as `<prefix> n` makes it: from `aa` to the
+/// session it names, with twelve `b`s next and `cc` going off the far end.
+const CHILD_STEPS: &str = "NVMUX_TEST_RELAY_STEPS";
+
 /// How long into the first relay that card is posted: after the first paint.
 const POST_AFTER: Duration = Duration::from_millis(1500);
 
@@ -229,10 +234,22 @@ fn relay_child() {
         "[client] per_session = {keep} was not honoured"
     );
     let lands = std::env::var(CHILD_LANDS).ok();
+    let steps = std::env::var_os(CHILD_STEPS).is_some();
     let mut landing = |_| {
-        lands
-            .as_deref()
-            .map(|name| nvmux::card::Card::arrival(nvmux::card::next_id(), name, false))
+        lands.as_deref().map(|name| {
+            let card = nvmux::card::Card::arrival(nvmux::card::next_id(), name, false);
+            if !steps {
+                return card;
+            }
+            card.in_row(nvmux::card::Row {
+                prev: Some("aa".into()),
+                next: Some("b".repeat(12)),
+                step: Some(nvmux::card::Step {
+                    forward: true,
+                    gone: "cc".into(),
+                }),
+            })
+        })
     };
     let code = loop {
         match nvmux::pty::relay(attachment, 0, &mut landing) {
@@ -344,6 +361,8 @@ struct Asks {
     post: Option<&'static str>,
     /// [`CHILD_LANDS`]: what a switch lands with.
     lands: Option<&'static str>,
+    /// [`CHILD_STEPS`].
+    steps: bool,
 }
 
 impl Terminal {
@@ -427,6 +446,7 @@ impl Terminal {
             own,
             post,
             lands,
+            steps,
         } = asks;
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize {
@@ -476,6 +496,9 @@ impl Terminal {
         }
         if let Some(name) = lands {
             cmd.env(CHILD_LANDS, name);
+        }
+        if steps {
+            cmd.env(CHILD_STEPS, "1");
         }
         let child = pair.slave.spawn_command(cmd).expect("spawn relay child");
         // Or the master would never see EOF once the child exits.
@@ -1700,6 +1723,140 @@ fn a_switch_lands_with_its_card_standing() {
             .enumerate()
             .all(|(r, row)| r == 1 || row.is_empty() || row.starts_with("relay ended")),
         "more than the card stayed: {rows:#?}"
+    );
+}
+
+/// A switch a step along the row lands with the row on the move from the
+/// key: the session's own client goes on drawing it as it moves, and the fade
+/// out draws it as the client does, at its full colour, while the session
+/// dissolves out from under it — so the row is further along by the end of
+/// the fade than at its start, and the screen handed over has it as far
+/// along as it came.
+///
+/// Read a frame at a time once the relay has ended, not as it runs: what the
+/// test reads the screen with is slower than the fade.
+#[test]
+fn a_step_lands_with_its_row_on_the_move() {
+    require_nvim!();
+    let tag = "card-steps";
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(
+            &common::unique(tag),
+            &common::launch_with("--clean"),
+            common::anywhere(),
+        )
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
+        .expect("connect")
+        .command("setlocal noswapfile | call setline(1, ['first', 'second'])")
+        .expect("setline");
+    let lands = "where-it-lands";
+    let mut term = spawn_own(
+        &sock,
+        &session.id,
+        "",
+        Asks {
+            shadow: true,
+            fade_ms: Some(LONG_FADE_MS),
+            lands: Some(lands),
+            steps: true,
+            ..Asks::default()
+        },
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| row_on_screen(out, 1)
+            == "second"),
+        "the session never painted; the screen: {:#?}",
+        screen_rows(&term.output)
+    );
+    term.pump_until(Duration::from_millis(500), |_| false);
+    let text_was = fg_on_screen(&term.output, 1, 0);
+
+    let mark = term.output.len();
+    let flags = kitty_push_flags(&term.output).unwrap_or(0);
+    term.type_bytes(b"\x1b[32;5u");
+    if flags & 2 != 0 {
+        term.type_bytes(b"\x1b[32;5:3u");
+    }
+    term.pump_until(Duration::from_millis(150), |_| false);
+    term.type_bytes(b"3");
+    assert_eq!(
+        term.exit_code(Duration::from_secs(10)),
+        Some(3),
+        "the relay did not end in a switch"
+    );
+
+    // Each frame from the switch on with the card in it: the column the
+    // name it lands on starts at, and its colour; and whether the session's
+    // screen is still under it, and the colour of its text.
+    let mut parser = vt100::Parser::new(ROWS, COLS, 0);
+    parser.process(&term.output[..mark]);
+    let rest = &term.output[mark..];
+    let sync = b"\x1b[?2026h";
+    let mut ends: Vec<usize> = (1..rest.len())
+        .filter(|&i| rest[i..].starts_with(sync))
+        .collect();
+    ends.push(rest.len());
+    let mut frames = Vec::new();
+    let mut from = 0;
+    for to in ends {
+        parser.process(&rest[from..to]);
+        from = to;
+        let screen = parser.screen();
+        let row: String = (0..COLS)
+            .map(|col| match screen.cell(1, col) {
+                Some(cell) if cell.has_contents() => cell.contents(),
+                _ => " ",
+            })
+            .collect();
+        let fg = |col: usize| {
+            u16::try_from(col)
+                .ok()
+                .and_then(|col| screen.cell(1, col))
+                .map_or(vt100::Color::Default, vt100::Cell::fgcolor)
+        };
+        if let Some(col) = row.find(lands) {
+            frames.push((col, fg(col), row.starts_with("second"), fg(0)));
+        }
+    }
+    let light = |c: vt100::Color| match c {
+        vt100::Color::Rgb(r, g, b) => u32::from(r) + u32::from(g) + u32::from(b),
+        // The child's palette's text colour.
+        vt100::Color::Default => 600,
+        other => panic!("not a colour a frame here is drawn in: {other:?}"),
+    };
+    let fading: Vec<_> = frames.iter().filter(|f| f.2).collect();
+    let (first, last) = match (fading.first(), fading.last()) {
+        (Some(first), Some(last)) => (first, last),
+        _ => panic!("the card never stood on the session's screen: {frames:?}"),
+    };
+    assert!(
+        last.0 + 2 <= first.0,
+        "the row did not move as the session went: from column {} to {}",
+        first.0,
+        last.0
+    );
+    assert!(
+        light(last.1) >= light(first.1),
+        "the name it lands on went dim with the session: {frames:?}"
+    );
+    assert!(
+        light(last.3) < light(text_was),
+        "the session did not dissolve: {frames:?}"
+    );
+    let handed = frames
+        .iter()
+        .rev()
+        .find(|f| !f.2)
+        .expect("the card, on the screen handed over");
+    assert!(
+        handed.0 <= last.0,
+        "the screen handed over has the row back from where it came to: {} after {}",
+        handed.0,
+        last.0
     );
 }
 

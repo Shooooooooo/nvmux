@@ -161,10 +161,14 @@ pub struct Over {
 pub struct Kept {
     /// On a row, the first column and the last, 0-based.
     spans: Vec<(u16, u16, u16)>,
-    /// What the client writes on them, each character with the cell it starts
-    /// on: how the screen shows the card is there to stand (see
+    /// What the client writes on them that stays where it is, each character
+    /// with the cell it starts on; and what moves along its row as the card
+    /// does, each character on the cell it starts from, and how many columns
+    /// along it goes: how the screen shows the card is there to stand (see
     /// [`Shadow::shows`]).
     glyphs: Vec<(u16, u16, char)>,
+    moving: Vec<(u16, u16, char)>,
+    shift: i16,
 }
 
 impl Kept {
@@ -180,22 +184,45 @@ impl Kept {
                 .into_iter()
                 .filter_map(|(row, from, to)| Some((cell(row)?, cell(from)?, cell(to)?)))
                 .collect(),
-            glyphs: glyphs
-                .into_iter()
-                .filter_map(|(row, col, ch)| Some((cell(row)?, cell(col)?, ch)))
-                .collect(),
+            glyphs: glyphs.into_iter().filter_map(Self::glyph).collect(),
+            moving: Vec::new(),
+            shift: 0,
         }
+    }
+
+    /// These cells, with `moving` written on them too, anywhere from where it
+    /// starts to `shift` columns along: a row of names on the move.
+    pub fn moving(
+        self,
+        moving: impl IntoIterator<Item = (usize, usize, char)>,
+        shift: isize,
+    ) -> Self {
+        Self {
+            moving: moving.into_iter().filter_map(Self::glyph).collect(),
+            shift: i16::try_from(shift).unwrap_or(0),
+            ..self
+        }
+    }
+
+    fn glyph((row, col, ch): (usize, usize, char)) -> Option<(u16, u16, char)> {
+        Some((u16::try_from(row).ok()?, u16::try_from(col).ok()?, ch))
     }
 
     /// Where `card` stands on a screen `cols` wide and `rows` high, if it is
     /// an arrival (see [`crate::client::cards::arrival_footprint`]).
     pub fn arrival(card: &crate::card::Card, cols: u16, rows: u16) -> Self {
         let f = crate::client::cards::arrival_footprint(card, usize::from(cols), usize::from(rows));
-        Self::new(f.spans, f.glyphs)
+        Self::new(f.spans, f.glyphs).moving(f.moving, f.shift)
     }
 
     pub fn is_empty(&self) -> bool {
         self.spans.is_empty()
+    }
+
+    /// Whether what stands moves as it stands: a row of names a step moves
+    /// along, which the client goes on drawing as it moves.
+    pub fn moves(&self) -> bool {
+        !self.moving.is_empty() && self.shift != 0
     }
 
     /// The spans, each a row, its first column and its last.
@@ -440,18 +467,33 @@ impl Shadow {
     }
 
     /// Whether the screen has on it what the `kept` cells are kept for: each of
-    /// their glyphs where it goes. A dissolve leaves them standing only then —
-    /// otherwise they would stand with whatever the session has there.
+    /// their glyphs that stays where it is on its cell, and those that move
+    /// all the same way along, as far as they go or less. A dissolve leaves
+    /// them standing only then — otherwise they would stand with whatever the
+    /// session has there.
     pub fn shows(&self, kept: &Kept) -> bool {
-        if self.broken || kept.glyphs.is_empty() {
+        if self.broken || (kept.glyphs.is_empty() && kept.moving.is_empty()) {
             return false;
         }
         let screen = self.parser.screen();
-        kept.glyphs.iter().all(|&(row, col, ch)| {
+        let on = |row: u16, col: u16, ch: char| {
             screen
                 .cell(row, col)
                 .is_some_and(|c| c.contents().starts_with(ch))
-        })
+        };
+        let along = |k: i16| {
+            kept.moving.iter().all(|&(row, col, ch)| {
+                col.checked_add_signed(k)
+                    .is_some_and(|col| on(row, col, ch))
+            })
+        };
+        let (near, far) = if kept.shift < 0 {
+            (kept.shift, 0)
+        } else {
+            (0, kept.shift)
+        };
+        kept.glyphs.iter().all(|&(row, col, ch)| on(row, col, ch))
+            && (kept.moving.is_empty() || (near..=far).any(along))
     }
 
     /// The bytes that draw what the `kept` cells have written on them, as a
@@ -1092,6 +1134,36 @@ mod tests {
         assert!(
             !shadow.shows(&Kept::new([(1, 12, 17)], [])),
             "nothing to look for"
+        );
+    }
+
+    /// A card on the move stands wherever along its way the screen shows it,
+    /// all of what moves the same way along — and nowhere past its end.
+    #[test]
+    fn a_card_on_the_move_stands_anywhere_along_its_way() {
+        let blog = |col: usize| {
+            (col..col + 4)
+                .zip("blog".chars())
+                .map(|(col, ch)| (1, col, ch))
+        };
+        let kept = Kept::new([(1, 8, 17)], []).moving(blog(14), -4);
+        assert!(kept.moves());
+        let at = |cols: &[u16]| {
+            let mut shadow = Shadow::new(6, 20);
+            shadow.feed(b"\x1b[2;1Habcdefghijklmnopqrst");
+            for &col in cols {
+                shadow.feed(format!("\x1b[2;{}Hblog", col + 1).as_bytes());
+            }
+            shadow.shows(&kept)
+        };
+        assert!(at(&[14]), "where it starts");
+        assert!(at(&[12]), "on its way");
+        assert!(at(&[10]), "where it ends");
+        assert!(!at(&[9]), "not past its end");
+        assert!(!at(&[]), "not drawn");
+        assert!(
+            !Kept::new([(1, 8, 17)], blog(14)).moves(),
+            "nor what stands still"
         );
     }
 

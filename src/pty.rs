@@ -321,6 +321,16 @@ pub struct Attachment {
     /// relay handed over, for the next to take down as it draws the card again
     /// (see [`Attachment::take_left_standing`]).
     left_standing: Option<HandOff>,
+    /// What the desk opened with (see [`card::Desk::open`]), until it goes
+    /// in: at once for a client whose screen is there already, and for one
+    /// whose first paint is held, as the paint is let through. No card goes
+    /// in while it is held: a row of names on the move, drawn again a frame
+    /// at a time, would keep it from ever settling (see [`Hold`]).
+    opening: Vec<card::Command>,
+    /// When the card a switch by key lands with went up, where the switch
+    /// left it standing (see [`HandOff::up_since`]): what it goes in timed
+    /// from.
+    landed_since: Option<Instant>,
 }
 
 /// How many clients have had their exit sequences relayed to the terminal:
@@ -342,7 +352,9 @@ static EXITS_RELAYED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// question about the bytes — has nothing to say about it. Failing a lull,
 /// [`HOLD_CAP`] after the first byte, so a session that never stops drawing
 /// still appears; failing both, [`HOLD_MAX`] bytes, so a hold can never be a
-/// leak.
+/// leak. No card goes in while it is held, so that what one draws as it
+/// comes does not keep the client from going quiet (see
+/// [`Attachment::opening`]).
 ///
 /// The release dissolves the shadow in and then writes everything held, in
 /// the order it came and inside one synchronized update, so the terminal
@@ -434,6 +446,25 @@ fn split_at_alt_screen_entry(bytes: &[u8]) -> usize {
         .windows(ALT_SCREEN_ENTER.len())
         .position(|w| w == ALT_SCREEN_ENTER)
         .map_or(0, |i| i + ALT_SCREEN_ENTER.len())
+}
+
+/// `bytes` with the ends of the synchronized updates in them taken out, so
+/// that all they draw is presented as one, in the update written around them:
+/// a held first paint, which a client draws a frame at a time, each in an
+/// update of its own (see [`Attachment::release_hold`]).
+fn unsynced(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let end = fade::SYNC_END;
+    if !bytes.windows(end.len()).any(|w| w == end) {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while let Some(i) = rest.windows(end.len()).position(|w| w == end) {
+        out.extend_from_slice(&rest[..i]);
+        rest = &rest[i + end.len()..];
+    }
+    out.extend_from_slice(rest);
+    std::borrow::Cow::Owned(out)
 }
 
 impl std::fmt::Debug for Attachment {
@@ -765,16 +796,17 @@ impl Attachment {
     /// it shows, on with the card, and what it draws for it read into the
     /// shadow, which the fade out is drawn from, as a kept client's return is
     /// (see [`CARD_WAIT`]). The cells the card stands on, for the fade out to
-    /// leave standing; none where there is no fade to stand it through, or no
-    /// client to draw it.
-    fn stand_landing(&mut self, card: &card::Card) -> shadow::Kept {
+    /// leave standing, and when it went up, which is what it is timed from on
+    /// the screen it lands on too (see [`card::Card::up_ms`]); nothing where
+    /// there is no fade to stand it through, or no client to draw it.
+    fn stand_landing(&mut self, card: &card::Card) -> Option<(shadow::Kept, Instant)> {
         if !self.draws_cards || !fade::enabled() || !fade::session() || self.shadow.is_none() {
-            return shadow::Kept::default();
+            return None;
         }
         let size = term::terminal_size();
         let kept = shadow::Kept::arrival(card, size.cols, size.rows);
         if kept.is_empty() {
-            return kept;
+            return None;
         }
         self.tell_client(&card::Command::Clear);
         self.tell_client(&card::Command::Show(card.clone()));
@@ -783,13 +815,109 @@ impl Attachment {
             self.await_output(deadline.saturating_duration_since(Instant::now()));
             self.drain_unrelayed();
             if self.shadow.as_ref().is_some_and(|s| s.shows(&kept)) {
-                return kept;
+                return Some((kept, Instant::now()));
             }
             if Instant::now() >= deadline {
                 tracing::debug!("the client did not draw the card a switch lands with in time");
-                return shadow::Kept::default();
+                return None;
             }
         }
+    }
+
+    /// Dissolve the session out, from the shadow, leaving `kept` standing —
+    /// and where what stands moves, with what the client draws of it read
+    /// into the shadow between frames, so that it goes on moving as the
+    /// screen under it goes (see [`fade::Between`]). Says whether it did.
+    fn fade_out(&mut self, kept: &shadow::Kept) -> bool {
+        let Some(mut shadow) = self.shadow.take() else {
+            return false;
+        };
+        let faded = if kept.moves() {
+            fade::fade_out_session(&mut shadow, kept, &mut |shadow, until| {
+                self.read_while_fading(shadow, until, None);
+            })
+        } else {
+            fade::fade_out_session(&mut shadow, kept, &mut fade::wait)
+        };
+        self.shadow = Some(shadow);
+        faded.unwrap_or_else(|e| {
+            tracing::debug!(error = %e, "the session's fade-out did not complete");
+            false
+        })
+    }
+
+    /// Between the frames of a fade that has the shadow out to draw from
+    /// (see [`fade::Between`]): wait until `until` for what the client
+    /// writes, and read all of it into `shadow` and the ledger, as
+    /// [`Attachment::saw_unrelayed`] does — and into `held` as well, where it
+    /// is still owed to the terminal (see [`Attachment::release_hold`]).
+    fn read_while_fading(
+        &mut self,
+        shadow: &mut shadow::Shadow,
+        until: Instant,
+        mut held: Option<&mut Vec<u8>>,
+    ) {
+        let Some(fd) = self.master.as_raw_fd() else {
+            fade::wait(shadow, until);
+            return;
+        };
+        let mut buf = [0u8; 8192];
+        loop {
+            let now = Instant::now();
+            if now >= until {
+                return;
+            }
+            let wait_ms = (until - now).as_micros().div_ceil(1000) as libc::c_int;
+            let mut p = [pollfd(fd)];
+            let n = unsafe { libc::poll(p.as_mut_ptr(), 1, wait_ms) };
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if n == 0 {
+                return;
+            }
+            // A client that has gone has nothing more to draw, and the fade
+            // goes on without it.
+            if n < 0 || !ready(&p[0]) {
+                fade::wait(shadow, until);
+                return;
+            }
+            match read_fd(fd, &mut buf) {
+                Ok(len) if len > 0 => {
+                    let bytes = &buf[..len];
+                    shadow.feed(bytes);
+                    self.ledger_saw(bytes);
+                    if let Some(held) = held.as_deref_mut() {
+                        held.extend_from_slice(bytes);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                _ => {
+                    fade::wait(shadow, until);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Read what the client writes into the shadow and the ledger, and into
+    /// `held`, still owed to the terminal, until the shadow shows the card
+    /// this relay's fade in leaves standing (see [`Attachment::kept`]), or
+    /// `deadline`.
+    fn read_until_shown(&mut self, deadline: Instant, held: &mut Vec<u8>) {
+        let Some(mut shadow) = self.shadow.take() else {
+            return;
+        };
+        while !shadow.shows(&self.kept) {
+            let now = Instant::now();
+            if now >= deadline {
+                tracing::debug!("the client did not draw the card a switch landed with in time");
+                break;
+            }
+            let until = deadline.min(now + Duration::from_millis(1));
+            self.read_while_fading(&mut shadow, until, Some(&mut *held));
+        }
+        self.shadow = Some(shadow);
     }
 
     /// The cells this relay's fade in leaves standing: its arrival's, where
@@ -980,10 +1108,10 @@ impl Attachment {
         }
     }
 
-    /// Open this relay's desk, for a client that draws cards, and tell the
-    /// client what it opens with (see [`card::Desk::open`]): whether that is a
-    /// card saying where the switch landed. Nothing has been passed on to the
-    /// client yet in this relay, so the stream is between keys.
+    /// Open this relay's desk, for a client that draws cards, with what to
+    /// tell the client first (see [`card::Desk::open`] and
+    /// [`Attachment::put_in_opening`]): whether that is a card saying where
+    /// the switch landed.
     fn open_desk(&mut self) -> bool {
         if !self.draws_cards {
             return false;
@@ -1001,21 +1129,60 @@ impl Attachment {
         self.kept = arrival.as_ref().map_or_else(shadow::Kept::default, |card| {
             shadow::Kept::arrival(card, size.cols, size.rows)
         });
-        let opening = desk.open(arrival);
+        self.opening = desk.open(arrival);
+        self.landed_since = self.hand_off.as_ref().and_then(HandOff::up_since);
         self.desk = Some(desk);
-        for cmd in &opening {
-            self.tell_client(cmd);
-        }
         landed
     }
 
-    /// Put in what waits on the desk, if the stream allows it now.
+    /// Tell the client what the desk opened with, if the stream to it is
+    /// between keys — as it is before anything has been passed on in this
+    /// relay, and may not be by the time a held paint is let through: the
+    /// card the switch landed with up as long as it has been since the key,
+    /// where the switch left it standing, so that it goes on from where it had
+    /// come to (see [`card::Card::up_ms`]). Says whether it went in.
+    fn put_in_opening(&mut self, now: Instant) -> bool {
+        if self.opening.is_empty() || !self.desk.as_ref().is_some_and(|d| d.forwarded.clear(now)) {
+            return false;
+        }
+        let up = self
+            .landed_since
+            .map(|since| now.saturating_duration_since(since));
+        for cmd in std::mem::take(&mut self.opening) {
+            let cmd = match (cmd, up) {
+                (card::Command::Show(card), Some(up)) => card::Command::Show(card.up_for(up)),
+                (cmd, _) => cmd,
+            };
+            self.tell_client(&cmd);
+        }
+        true
+    }
+
+    /// Put in what waits on the desk, if the stream allows it now — what it
+    /// opened with before anything else — and nothing while the first paint
+    /// is held (see [`Attachment::opening`]).
     fn send_cards(&mut self, now: Instant) {
+        if self.hold.is_some() || (!self.opening.is_empty() && !self.put_in_opening(now)) {
+            return;
+        }
         let Some(desk) = self.desk.as_mut() else {
             return;
         };
         for cmd in desk.ready(now) {
             self.tell_client(&cmd);
+        }
+    }
+
+    /// When to look again for a moment to put in what waits for the client:
+    /// what the desk opened with, or what has come for it since. Not while
+    /// the first paint is held, which lets it all in as it lets the paint
+    /// through.
+    fn cards_due(&self) -> Option<Instant> {
+        let desk = self.desk.as_ref().filter(|_| self.hold.is_none())?;
+        if self.opening.is_empty() {
+            desk.retry_at()
+        } else {
+            desk.forwarded.retry_at()
         }
     }
 
@@ -1269,6 +1436,12 @@ impl Attachment {
             0
         };
         let mut dissolved = false;
+        // What the client writes from here as the release reads it, owed to
+        // the terminal after what was held (see below).
+        let mut later = Vec::new();
+        // In go the cards, now that nothing they draw holds the paint up: the
+        // one the switch landed with first.
+        let opened = dissolve && self.put_in_opening(Instant::now());
         // The name the picker left comes down here whichever way the paint
         // goes out, and before any of it: it is on the primary screen, which
         // the shell comes back to.
@@ -1284,13 +1457,35 @@ impl Attachment {
                 write_stdout(&down)?;
             }
             write_stdout(&bytes[..split])?;
+            // The card is drawn a moment after it goes in, and waited for, so
+            // that the screen dissolves in with it on: it stands from the
+            // first frame.
+            if opened && !self.kept.is_empty() {
+                self.read_until_shown(Instant::now() + CARD_WAIT, &mut later);
+            }
             let kept = self.standing();
-            if let Some(shadow) = self.shadow.as_mut() {
+            if let Some(mut shadow) = self.shadow.take() {
                 let (rows, cols) = shadow.size();
                 let over = hand_off.as_ref().and_then(|h| h.over(rows, cols));
+                // A card on the move goes on moving: what the client draws of
+                // it as the fade runs is read into the shadow for the frames
+                // after, and held with the rest for the replay below.
+                let faded = if kept.moves() {
+                    fade::fade_in_session(
+                        &mut shadow,
+                        over.as_ref(),
+                        &kept,
+                        &mut |shadow, until| {
+                            self.read_while_fading(shadow, until, Some(&mut later));
+                        },
+                    )
+                } else {
+                    fade::fade_in_session(&mut shadow, over.as_ref(), &kept, &mut fade::wait)
+                };
+                self.shadow = Some(shadow);
                 // A frame that could not be written is not a reason to keep
                 // the paint: the replay below is what the user is waiting for.
-                dissolved = match fade::fade_in_session(shadow, over.as_ref(), &kept) {
+                dissolved = match faded {
                     Ok(faded) => faded,
                     Err(e) => {
                         tracing::debug!(error = %e, "the session's fade-in did not complete");
@@ -1301,9 +1496,13 @@ impl Attachment {
         } else if let Some(h) = &hand_off {
             write_stdout(&h.erase())?;
         }
+        // One update, whatever the client wrote it in: a frame of its own
+        // presented on its way through would show the screen as it was a
+        // moment ago, over the dissolve's last frame, which has it as it is.
         let mut out = std::io::stdout().lock();
         out.write_all(fade::SYNC_BEGIN)?;
-        out.write_all(&bytes[split..])?;
+        out.write_all(&unsynced(&bytes[split..]))?;
+        out.write_all(&unsynced(&later))?;
         out.write_all(fade::SYNC_END)?;
         out.flush()?;
         drop(out);
@@ -1316,6 +1515,7 @@ impl Attachment {
         // the split falls just past a whole `?1049h`.
         if let Some(boundary) = self.boundary.as_mut() {
             boundary.saw_session(&bytes);
+            boundary.saw_session(&later);
         }
         tracing::debug!(
             held_ms = held_for.map(|d| d.as_secs_f64() * 1000.0),
@@ -1336,10 +1536,21 @@ impl Attachment {
         };
         let over = self.name_over(shadow);
         let kept = self.standing();
-        let Some(shadow) = self.shadow.as_mut() else {
+        let Some(mut shadow) = self.shadow.take() else {
             return false;
         };
-        match fade::fade_in_session(shadow, over.as_ref(), &kept) {
+        // A card on the move goes on moving: what the client draws of it as
+        // the fade runs is read into the shadow for the frames after — and,
+        // as for a kept client's backlog, no further (see `relay`).
+        let faded = if kept.moves() {
+            fade::fade_in_session(&mut shadow, over.as_ref(), &kept, &mut |shadow, until| {
+                self.read_while_fading(shadow, until, None);
+            })
+        } else {
+            fade::fade_in_session(&mut shadow, over.as_ref(), &kept, &mut fade::wait)
+        };
+        self.shadow = Some(shadow);
+        match faded {
             Ok(faded) => faded,
             Err(e) => {
                 tracing::debug!(error = %e, "the resumed session's fade-in did not complete");
@@ -2648,6 +2859,8 @@ fn spawn_client_with(
         row: None,
         kept: shadow::Kept::default(),
         left_standing: None,
+        opening: Vec::new(),
+        landed_since: None,
     })
 }
 
@@ -2688,6 +2901,9 @@ fn spawn_client_with(
 /// out leaves it standing, as does the next session's fade in — so the card is
 /// on the screen as it is from the key to the session it names, left standing
 /// on the screen handed over between the two ([`Attachment::take_left_standing`]).
+/// For a step, its row moves all the while: each fade draws it from what the
+/// client draws as it goes, and the next session's client takes it up as far
+/// along as it has come since the key ([`card::Card::up_ms`]).
 pub fn relay(
     mut attachment: Attachment,
     highest_session_num: u32,
@@ -2766,6 +2982,12 @@ pub fn relay(
     // server — so it is on the screen the session dissolves in with, which
     // leaves it standing as the rest comes in.
     let landed = attachment.open_desk();
+    // Told now, for a client that has drawn its screen already or will draw
+    // it with nothing held; a fresh one's first paint is held (below), and it
+    // is told as the paint is let through.
+    if attachment.resumed || attachment.shadow.is_none() {
+        attachment.put_in_opening(Instant::now());
+    }
 
     // What the child buffered while blocked mid-write describes a screen the
     // picker has since drawn over.
@@ -2817,7 +3039,13 @@ pub fn relay(
         // old size into a terminal that has the new one. Asked after the
         // screen is back, as before, which gives the resize a fade's head
         // start.
-        let early = attachment.is_kept() && !resized;
+        //
+        // Nor where a card on the move stands through the fade in. The fade
+        // reads what the client writes, to draw the card where it has moved
+        // to, and what it reads goes no further than the shadow: a repaint
+        // landing in it would never reach the terminal. Asked once the screen
+        // is back, as there.
+        let early = attachment.is_kept() && !resized && !attachment.standing().moves();
         if early {
             erasing = kept_clients_repaint(&mut attachment);
         }
@@ -2928,17 +3156,15 @@ pub fn relay(
             // its error is logged and dropped rather than propagated.
             //
             // A switch has its client draw the card it lands with first, and
-            // the dissolve leaves the card standing.
-            let kept = landing
+            // the dissolve leaves the card standing — its row moving, for a
+            // step, from the key on.
+            let stood = landing
                 .as_ref()
-                .map_or_else(shadow::Kept::default, |card| attachment.stand_landing(card));
-            let faded = match attachment.shadow.as_mut() {
-                Some(shadow) => fade::fade_out_session(shadow, &kept).unwrap_or_else(|e| {
-                    tracing::debug!(error = %e, "the session's fade-out did not complete");
-                    false
-                }),
-                None => false,
-            };
+                .and_then(|card| attachment.stand_landing(card));
+            let kept = stood
+                .as_ref()
+                .map_or_else(shadow::Kept::default, |(kept, _)| kept.clone());
+            let faded = attachment.fade_out(&kept);
             raw.restore();
             // Clear here rather than leaving it to the next `relay`, which runs
             // on the far side of the client spawn: what is on the terminal until
@@ -2953,12 +3179,10 @@ pub fn relay(
             // in the same synchronized write, for the next relay to take down
             // in the one it draws the card again with (see `crate::handoff`).
             if held.leads_straight_into_another_relay() {
-                let standing = attachment
-                    .shadow
-                    .as_ref()
-                    .filter(|_| faded && !kept.is_empty())
-                    .map(|shadow| fade::standing(shadow, &kept))
-                    .and_then(|drawn| HandOff::card(drawn, kept.spans()));
+                let standing = stood.filter(|_| faded).and_then(|(kept, since)| {
+                    let drawn = fade::standing(attachment.shadow.as_ref()?, &kept);
+                    HandOff::card(drawn, kept.spans(), since)
+                });
                 match standing {
                     Some(h) => {
                         term::leave_alt_screen_and_clear_keeping(&h.show());
@@ -3079,7 +3303,7 @@ fn pump(
             attachment.hold_wake_at(),
             attachment.kept_due(),
             erasing.as_ref().map(|_| now + ERASE_POLL),
-            attachment.desk.as_ref().and_then(card::Desk::retry_at),
+            attachment.cards_due(),
         ]
         .into_iter()
         .flatten()
@@ -4538,6 +4762,23 @@ mod tests {
         assert_eq!(&bytes[at..], b"\x1b[2J~");
         assert_eq!(split_at_alt_screen_entry(b"\x1b[2J~"), 0);
         assert_eq!(split_at_alt_screen_entry(b""), 0);
+    }
+
+    /// What is let through after a dissolve is presented as one: the ends of
+    /// the updates a client drew its frames in are taken out, and nothing
+    /// else — the update written around them ends it all at once.
+    #[test]
+    fn what_is_let_through_is_one_update() {
+        let frames = b"\x1b[?2026h\x1b[1;1Ha\x1b[?2026l\x1b[?2026h\x1b[1;1Hb\x1b[?2026l~";
+        assert_eq!(
+            &*unsynced(frames),
+            b"\x1b[?2026h\x1b[1;1Ha\x1b[?2026h\x1b[1;1Hb~"
+        );
+        assert!(
+            matches!(unsynced(b"\x1b[2J~"), std::borrow::Cow::Borrowed(_)),
+            "nothing to take out"
+        );
+        assert_eq!(&*unsynced(b""), b"");
     }
 
     /// The one outcome with a session to begin before the screen goes. Every
