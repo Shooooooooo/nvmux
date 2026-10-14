@@ -104,9 +104,9 @@ pub enum Action {
     /// two, so the direction stays a value all the way to the session loop
     /// instead of being spelled out again at every hand-off.
     Cycle(Direction),
-    /// `<prefix> Enter` — go where the newest card in the corner is about:
+    /// `<prefix> Enter` — go where the newest note in the margin is about:
     /// the session it came from, or the terminal of this one it came from
-    /// (see [`crate::card`]). Nothing, with no such card up.
+    /// (see [`crate::card`]). Nothing, with no such note up.
     Go,
 }
 
@@ -174,7 +174,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         key: ENTER,
         action: Action::Go,
-        help: "go where the card in the corner is about",
+        help: "go where the newest note in the margin is about",
         hint: "go",
     },
     Binding {
@@ -1638,8 +1638,8 @@ mod tests {
         );
     }
 
-    /// `<prefix> Enter` with no number begun goes where the card in the
-    /// corner is about; begun, Enter still ends the number.
+    /// `<prefix> Enter` with no number begun goes where the newest note is
+    /// about; begun, Enter still ends the number.
     #[test]
     fn enter_after_the_prefix_alone_goes_where_the_card_is_about() {
         let mut p = Prefix::new(12);

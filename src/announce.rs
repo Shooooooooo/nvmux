@@ -1,6 +1,6 @@
 //! The brief "you are now on this session" announcement.
 //!
-//! No longer armed: a card in the corner says it now, drawn by nvmux's own
+//! No longer armed: a note in the margin says it now, drawn by nvmux's own
 //! client (see [`crate::card`]), and the relay passes no popup to its loop.
 //! What is here is kept as it was, with what reads it, for the day the box is
 //! wanted back.

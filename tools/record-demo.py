@@ -48,8 +48,8 @@ ssh config sets XDG_CONFIG_HOME (and the data, state and cache directories)
 under the run's temporary directory, and its sshd accepts them, so nothing of
 yours is read or written by the editors either.
 
-**What the sessions have to say is staged.** The picker's signs and the card
-in the corner report what each session's watcher recorded (`src/notes.rs`),
+**What the sessions have to say is staged.** The picker's signs and the note
+in the margin report what each session's watcher recorded (`src/notes.rs`),
 and a session made a minute ago has recorded nothing. So, off camera,
 api-server is given an agent at work -- a progress message left running, as a
 plugin driving one leaves it -- and dotfiles a run of its install script, in a
@@ -57,7 +57,7 @@ terminal buffer no window shows, that has finished. Both go in through the
 session's own socket (see `rpc`), and neither is typed at an editor. The build
 the take starts in api-server is typed on camera, but the `cargo` it runs is
 the demo's (CARGO): there is no crate there to build, and a real build would
-take as long as it liked, where the card saying it has finished is wanted at
+take as long as it liked, where the note saying it has finished is wanted at
 one moment of the take. So it says what it compiles, and finishes when the
 take says it may.
 
@@ -130,7 +130,7 @@ STEP = 1.0 / FPS
 
 # A pause longer than this, with nothing written, is cut to it. The take's own
 # holds are shorter, and the screen is rarely still that long anyway -- the
-# picker's spinner turns and a card counts -- so this only catches waits
+# picker's spinner turns and a note counts -- so this only catches waits
 # nobody meant the viewer to sit through.
 IDLE_LIMIT = 2.0
 
@@ -1409,12 +1409,15 @@ def perform(env, built):
     term.expect("HISTFILE", "the other buffer")
     time.sleep(0.8)
 
-    # 8. the build finishes: a card in the corner says so, and the prefix key
-    # and Enter go there, to the build as it ended
+    # 8. the build finishes: a note in the margin says so; the prefix key held
+    # says the key under it, and Enter goes there, to the build as it ended
     open(built, "w").close()
-    term.expect("exited with code 0", "the card in the corner")
+    term.expect("exited with code 0", "the note in the margin")
     time.sleep(2.0)
-    term.write(PREFIX + ENTER, show=(("Ctrl-Space", "\u23ce"), "go there"))
+    term.write(PREFIX, show=(("Ctrl-Space",), "prefix"))
+    term.expect("go there", "the key under the note")
+    time.sleep(0.5)
+    term.write(ENTER, show=(("\u23ce",), "go there"))
     term.expect("Finished", "api-server, its build done")
     time.sleep(1.6)
 

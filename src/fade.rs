@@ -55,7 +55,7 @@ use ratatui::style::{Color, Modifier};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::palette::{self, Palette, Rgb};
-use crate::shadow::{Cursor, Over, Shadow};
+use crate::shadow::{Cursor, Kept, Over, Shadow};
 
 /// A synchronized update: the terminal presents nothing between these, so a
 /// frame is never seen half-composited. Opening one inside another is
@@ -532,9 +532,20 @@ where
 /// the whole fade costs about one full repaint plus the cells that change
 /// colour — which nvmux already emits on every resize and resume. The last
 /// frame has every visible cell at the background colour, which is what the
-/// hand-off's erase paints next, so the seam is flat.
-pub fn fade_out_session(shadow: &mut Shadow) -> io::Result<()> {
-    run_session(shadow, Direction::Out, None).map(|_| ())
+/// hand-off's erase paints next, so the seam is flat — but for what is written
+/// on the `kept` cells, which stands at its full colour throughout: a card of
+/// nvmux's own, which the switch carries on to the next session's screen.
+/// Says whether it did, as [`fade_in_session`] does.
+pub fn fade_out_session(shadow: &mut Shadow, kept: &Kept) -> io::Result<bool> {
+    run_session(shadow, Direction::Out, None, kept)
+}
+
+/// What the `kept` cells of `shadow` have written on them, drawn again at its
+/// full colour on the terminal's own background: for a switch to leave
+/// standing on the screen it hands over (see [`crate::handoff::HandOff::card`]).
+/// Nothing with the fade off, which leaves nothing standing.
+pub fn standing(shadow: &Shadow, kept: &Kept) -> Vec<u8> {
+    active().map_or_else(Vec::new, |palette| shadow.kept_bytes(kept, palette))
 }
 
 /// Dissolve an attached session's screen up out of the background, from the
@@ -550,12 +561,19 @@ pub fn fade_out_session(shadow: &mut Shadow) -> io::Result<()> {
 /// in: the name the picker handed off (see [`crate::handoff`]), fully drawn on
 /// the first frame and gone on the last. With it, the session comes back as an
 /// [`Iris`] opening out of the line the name stands on: that line first, the
-/// rows furthest from it last.
-pub fn fade_in_session(shadow: &mut Shadow, over: Option<&Over>) -> io::Result<bool> {
-    run_session(shadow, Direction::In, over)
+/// rows furthest from it last. What is written on the `kept` cells stands at
+/// its full colour from the first frame: the card that says where a switch
+/// landed, which the session's own client drew.
+pub fn fade_in_session(shadow: &mut Shadow, over: Option<&Over>, kept: &Kept) -> io::Result<bool> {
+    run_session(shadow, Direction::In, over, kept)
 }
 
-fn run_session(shadow: &mut Shadow, direction: Direction, over: Option<&Over>) -> io::Result<bool> {
+fn run_session(
+    shadow: &mut Shadow,
+    direction: Direction,
+    over: Option<&Over>,
+    kept: &Kept,
+) -> io::Result<bool> {
     let Some(palette) = active() else {
         return Ok(false);
     };
@@ -573,7 +591,7 @@ fn run_session(shadow: &mut Shadow, direction: Direction, over: Option<&Over>) -
         let cursor = cursor_for(direction, schedule.finished());
         let dissolve = |row: u16| iris.map_or(t, |iris| iris.at(direction, t, row));
         let over = over.map(|o| (o, ink, 1.0 - t));
-        out.write_all(&shadow.frame_with(dissolve, palette, cursor, over))?;
+        out.write_all(&shadow.frame_with(dissolve, palette, cursor, over, kept))?;
         out.flush()?;
         if !schedule.finished() {
             thread::sleep(FRAME);

@@ -10,7 +10,7 @@ Create named Neovim sessions, attach to them, detach, and come back later —
 with the editor running on a remote host while every keystroke and every pixel
 of rendering happens on your own terminal.
 
-![Running nvmux devbox and opening the picker on the three sessions on that host, an agent's spinner turning beside api-server and a check mark beside dotfiles, whose install script finished; creating a fourth, blog, and moving it to the end of the list; attaching to api-server, scrolling as the text slides, and starting a release build in a terminal whose split flies in from the side; switching to the next session with the prefix key while it builds, and to another buffer as it fades over; a card coming up in the corner as the build finishes, and the prefix key and Enter going back to it; detaching, then running nvmux devbox again to find the list in the order it was left, and reattaching to find the build's split where it was. Each key is shown under the window as it is pressed.](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/demo.gif)
+![Running nvmux devbox and opening the picker on the three sessions on that host, an agent's spinner turning beside api-server and a check mark beside dotfiles, whose install script finished; creating a fourth, blog, and moving it to the end of the list; attaching to api-server, scrolling as the text slides, and starting a release build in a terminal whose split flies in from the side; switching to the next session with the prefix key while it builds, the row of session names in the top right margin moving the way it went, and to another buffer as it fades over; a note coming up in the margin as the build finishes, the prefix key held saying the key under it, and Enter going back to it; detaching, then running nvmux devbox again to find the list in the order it was left, and reattaching to find the build's split where it was. Each key is shown under the window as it is pressed.](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/demo.gif)
 
 Connect to a host, make a session, put it where you want it in the list, start
 a build, hop to another session while it runs, go back the moment it finishes,
@@ -49,13 +49,12 @@ hand Neovim your terminal outright — rather than an imitation of one.
 
 | Where | Needs |
 |---|---|
-| Local | `nvim` >= 0.11 for local sessions, and `ssh` for `nvmux <host>` |
+| Local | Linux or macOS; `nvim` >= 0.11 for local sessions, and `ssh` for `nvmux <host>` |
 | Remote | `nvim` >= 0.11 |
 
-0.11 specifically, on both ends: that is the release where `:detach` and
-`:connect` landed. `nvmux <host>` needs no local `nvim` — unless sessions are
-drawn by Neovim's own client (`[client] ui = "nvim"`), which is `nvim
---remote-ui`.
+0.11 specifically, on both ends: that is the release where `:detach` landed.
+`nvmux <host>` needs no local `nvim` — unless sessions are drawn by Neovim's
+own client (`[client] ui = "nvim"`), which is `nvim --remote-ui`.
 
 ### Building
 
@@ -92,19 +91,20 @@ reimplementing it.
 |---|---|
 | `<prefix>` `d` | detach — leaves the session running, exits nvmux |
 | `<prefix>` `Space` | back to the picker, session still attached — `Esc` goes back |
-| `<prefix>` `1`, `2`, … `12` | switch straight to that session |
+| `<prefix>` `1`, `2`, … | switch straight to that session |
 | `<prefix>` `n` | next session by number (wraps) |
 | `<prefix>` `p` | previous session by number (wraps) |
 | `<prefix>` `c` | set up a new session and attach to it — `Esc` goes back |
-| `<prefix>` `Enter` | go where the card in the corner is about: its session, or a terminal of this one |
+| `<prefix>` `Enter` | go where the newest note in the margin is about: its session, or a terminal of this one |
 | `<prefix>` `?` | show these keys — `Esc` goes back |
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
 
 Pressing `<prefix>` puts a one-row reminder of these keys along the bottom of
 the screen; it goes as soon as the next key resolves it. A switch, by key or
-out of the picker, says which session you have landed in, with a card in the
-top right corner that comes in with the session's screen and goes a moment
-later.
+out of the picker, says where you have landed: in the top right margin, the
+session's name between the ones `<prefix> p` and `<prefix> n` go to, which
+moves the way you went and goes a moment later. It is up from the moment you
+press the key, and stays on the screen while the sessions fade.
 
 ### Leaving a session
 
@@ -161,32 +161,35 @@ The picker shows a sign beside each session that has something to report:
 
 | Sign | Means |
 |---|---|
-| `⠹` | busy: a plugin or a language server is working |
+| `⠹` | busy: a plugin (Neovim 0.12+) or a language server is working |
 | `∗` | a program in a terminal buffer sent a notification |
 | `!` | something failed — a command in a terminal buffer, say |
 | `✓` | a command in a terminal buffer succeeded |
 
-While you are in a session, the others' news comes up as cards in the corner,
-and `<prefix> Enter` goes to the newest:
+A command typed at a shell prompt counts only if the shell reports how it went,
+as fish 4 does.
+
+While you are in a session, the others' news comes up in the top right
+margin, and goes, leaving its sign there until you open that session.
+`<prefix> Enter` goes to the newest:
 
 ```
-╭─ ✓ api-server ──────────────────────── 3s ─╮
-│ cargo test: exited with code 0             │
-│ Ctrl-Space ⏎ go there                      │
-╰────────────────────────────────────────────╯
+              ✓ api-server  3s
+cargo test: exited with code 0
 ```
 
-Cards need nvmux's own client; with `ui = "nvim"` there are none.
+Notes need nvmux's own client; with `ui = "nvim"` there are none.
 
 > [!TIP]
-> On a remote host, set Claude Code's Notifications setting (`/config`) to
-> "Ghostty (OSC 777)", or it sends none.
+> If Claude Code's notifications never show, as on a remote host, set its
+> Notifications setting (`/config`) to "Ghostty (OSC 777)".
 
 ## Configuration
 
 nvmux needs no configuration. An optional TOML file — `$NVMUX_CONFIG` if set,
 else `$XDG_CONFIG_HOME/nvmux/config.toml`, else `~/.config/nvmux/config.toml` —
 overrides the defaults below; an unknown key or a bad value is a startup error.
+The first run asks for a prefix and writes that file; `Esc` skips.
 
 <details>
 <summary>Every setting, at its default</summary>

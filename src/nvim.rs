@@ -7,10 +7,9 @@ use crate::error::NvimError;
 
 /// The minimum Neovim nvmux supports.
 ///
-/// 0.11 specifically because that is where `:detach` and `:connect` landed,
-/// which is what makes a session survive its UI going away. Spelled twice — as
-/// the errors print it and as the gate compares it — and a test keeps the two
-/// in step.
+/// 0.11 specifically because that is where `:detach` landed, which is what
+/// makes a session survive its UI going away. Spelled twice — as the errors
+/// print it and as the gate compares it — and a test keeps the two in step.
 pub const MIN_VERSION: &str = "0.11";
 const MIN: (u64, u64) = (0, 11);
 

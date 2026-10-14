@@ -83,7 +83,7 @@
 //! What nvmux has to say while a session is in front — which session a switch
 //! landed in, what the other sessions report — it tells this client to show,
 //! in a sequence on its input no terminal sends (see [`crate::card`]); and the
-//! client draws it in the corner, over every frame it composes ([`cards`]).
+//! client draws it in the margin, over every frame it composes ([`cards`]).
 //! Nothing of it is the editor's, and nothing of it is asked of the editor.
 //!
 //! # One thread
@@ -2371,8 +2371,14 @@ impl App {
         let cursor = self.anim.paint(&mut frame, &self.model, now);
         // Last, over everything the editor has: see [`cards`].
         self.cards.expire(now);
-        self.cards
-            .paint(&mut frame, self.model.style(0), &self.model.colors(), now);
+        let signs = cards::Signs::of(&self.model);
+        self.cards.paint(
+            &mut frame,
+            self.model.style(0),
+            &self.model.colors(),
+            &signs,
+            now,
+        );
         frame.mend();
         let sync = self.model.options.termsync;
         let mut out = std::mem::take(&mut self.say);
@@ -2830,20 +2836,27 @@ mod tests {
     }
 
     /// A card is a frame when it comes, and another each time it looks
-    /// different — its age ticking, its going — and none in between.
+    /// different — its age ticking, its words going — and none in between:
+    /// none for the mark it leaves, which stays as it is.
     #[test]
     fn a_card_is_drawn_when_it_changes_and_only_then() {
         let t0 = Instant::now();
         let mut a = attached(true, t0);
         a.frame(t0);
         assert!(!a.due(t0), "drawn");
-        let card = crate::card::Card {
-            life_ms: 2500,
-            fade_ms: 0,
-            ..crate::card::Card::news(1, crate::card::Kind::Finished, "s", "done", 3, "")
+        let card = |id, mark| {
+            crate::card::Card {
+                life_ms: 2500,
+                fade_ms: 0,
+                ..crate::card::Card::news(id, crate::card::Kind::Finished, "s", "done", 3, "")
+            }
+            .leaving(mark)
         };
         let came = t0 + MIN_FRAME_GAP;
-        a.keys(&crate::card::encode(&crate::card::Command::Show(card)), t0);
+        a.keys(
+            &crate::card::encode(&crate::card::Command::Show(card(1, None))),
+            t0,
+        );
         assert!(a.due(came), "a card that comes is a frame");
         a.frame(came);
         let tick = t0 + Duration::from_secs(1);
@@ -2852,11 +2865,25 @@ mod tests {
         assert!(a.due(tick), "its age ticks");
         a.frame(tick);
         assert!(!a.due(tick));
-        let gone = t0 + Duration::from_millis(2500);
-        assert!(a.due(gone), "it goes");
+        // Timed from the frame it was first drawn on.
+        let gone = came + Duration::from_millis(2500);
+        assert!(a.due(gone), "its words go, and it with them");
         a.frame(gone);
         assert!(a.cards.is_empty());
         assert_eq!(a.cards_change(gone), None, "nothing more to wake for");
+
+        let mark = Some(crate::card::Kind::Finished);
+        a.keys(
+            &crate::card::encode(&crate::card::Command::Show(card(2, mark))),
+            gone,
+        );
+        let came = gone + MIN_FRAME_GAP;
+        a.frame(came);
+        let marked = came + Duration::from_millis(2500);
+        assert!(a.due(marked), "its words go");
+        a.frame(marked);
+        assert!(!a.cards.is_empty(), "its mark stays");
+        assert_eq!(a.cards_change(marked), None, "and is still");
     }
 
     /// A multigrid attach leaves the agent in the editor, given the client's

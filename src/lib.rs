@@ -10,10 +10,10 @@
 //! waits ([`hint`]), a way back into the session you were in when the link to
 //! its host drops ([`reconnect`]), and what each session has to report beside
 //! its name in the picker — busy, failed, finished, or a notification — from a
-//! watcher left in it ([`notes`]). Cards in the corner are the rest ([`card`]),
-//! drawn by nvmux's own client: on a change of session which one you landed
-//! in, and as it happens what the others have to report ([`tell`]) — the
-//! notice once a box of nvmux's own, which is kept ([`announce`]). All of what
+//! watcher left in it ([`notes`]). Notes in the margin are the rest
+//! ([`card`]), drawn by nvmux's own client: on a change of session which one
+//! you landed in, and as it happens what the others have to report ([`tell`])
+//! — the notice once a box of nvmux's own, which is kept ([`announce`]). All of what
 //! nvmux draws itself is in the terminal's own colours, or with its text in
 //! one colour of the user's ([`theme`]).
 //!
