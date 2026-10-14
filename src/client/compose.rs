@@ -332,7 +332,7 @@ pub fn fade_to(colors: &style::Colors, s: &mut Style, to: Rgb, keep: u8) {
 mod tests {
     use super::*;
     use crate::client::model::Changes;
-    use crate::client::redraw::{Event, LineCell};
+    use crate::client::redraw::{Event, FloatAt, LineCell};
     use crate::client::style::Attrs;
     use crate::palette::Palette;
 
@@ -388,8 +388,7 @@ mod tests {
             mouse: true,
             zindex,
             compindex: 0,
-            row,
-            col,
+            at: FloatAt::Screen { row, col },
         }
     }
 

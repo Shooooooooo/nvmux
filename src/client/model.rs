@@ -14,9 +14,14 @@
 use std::collections::{BTreeMap, HashMap};
 
 use super::grid::Grid;
-use super::redraw::{Event, ModeInfo, OptionValue};
+use super::redraw::{Anchor, Event, FloatAt, ModeInfo, OptionValue};
 use super::style::{Attrs, Colors, DefaultColors, Style};
 use crate::palette::Palette;
+
+/// The zindex of the message area, and so of the floats drawn over it
+/// (Neovim's `kZIndexMessages`): one below it is kept clear of the command
+/// line (see [`Model::place_anchored`]).
+const MESSAGES_ZINDEX: i64 = 200;
 
 /// Where a grid goes on the screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,6 +251,13 @@ pub struct Model {
     /// grid. Their own map rather than part of a placement: Neovim sends them
     /// before it places a window, and not again when it places it anew.
     pub margins: HashMap<u64, Margins>,
+    /// The floats placed by their anchoring alone since
+    /// [`Model::place_anchored`] last placed them, in the order they came.
+    anchored: Vec<(u64, Anchor)>,
+    /// The row the message area starts on while no message has pushed it up
+    /// (the last `msg_set_pos` that was not scrolled): the editor's height
+    /// less `'cmdheight'`.
+    msg_row: Option<usize>,
     pub cursor: CursorPos,
     pub modes: Vec<ModeInfo>,
     pub mode: usize,
@@ -283,6 +295,8 @@ impl Model {
             wins: BTreeMap::new(),
             viewports: HashMap::new(),
             margins: HashMap::new(),
+            anchored: Vec::new(),
+            msg_row: None,
             cursor: CursorPos {
                 grid: 1,
                 row: 0,
@@ -480,19 +494,28 @@ impl Model {
                 mouse,
                 zindex,
                 compindex,
-                row,
-                col,
-            } => self.place(
-                grid,
-                win,
-                Place::Float {
-                    row,
-                    col,
-                    zindex,
-                    compindex,
-                    mouse,
-                },
-            ),
+                at,
+            } => {
+                self.anchored.retain(|(g, _)| *g != grid);
+                let (row, col) = match at {
+                    FloatAt::Screen { row, col } => (row, col),
+                    FloatAt::Anchored(anchor) => {
+                        self.anchored.push((grid, anchor));
+                        self.resolve(grid, &anchor, zindex)
+                    }
+                };
+                self.place(
+                    grid,
+                    win,
+                    Place::Float {
+                        row,
+                        col,
+                        zindex,
+                        compindex,
+                        mouse,
+                    },
+                );
+            }
             Event::MsgSetPos {
                 grid,
                 row,
@@ -500,17 +523,22 @@ impl Model {
                 sep,
                 zindex,
                 compindex,
-            } => self.place(
-                grid,
-                None,
-                Place::Message {
-                    row,
-                    scrolled,
-                    sep,
-                    zindex,
-                    compindex,
-                },
-            ),
+            } => {
+                if !scrolled {
+                    self.msg_row = Some(row);
+                }
+                self.place(
+                    grid,
+                    None,
+                    Place::Message {
+                        row,
+                        scrolled,
+                        sep,
+                        zindex,
+                        compindex,
+                    },
+                );
+            }
             // A grid hidden before the client knew where it went — one the
             // layout was asked about, on another tab page — is placed hidden:
             // known, and not drawn until Neovim places it.
@@ -622,6 +650,75 @@ impl Model {
         if let Some(win) = win {
             self.wins.insert(grid, win);
         }
+    }
+
+    /// Place the floats placed by their anchoring alone — all Neovim 0.11
+    /// says of a float (see [`FloatAt`]) — where Neovim would have put them
+    /// itself, now that the batch that placed them is all in: Neovim sends a
+    /// float's anchoring before its new size when it resizes one, and the
+    /// size is what a corner other than its top left is measured back from.
+    /// In the order they came, which is the order Neovim placed them in: a
+    /// float anchored to another comes after it.
+    pub fn place_anchored(&mut self) {
+        for (grid, anchor) in std::mem::take(&mut self.anchored) {
+            let Some(Placement {
+                place: Place::Float { zindex, .. },
+                ..
+            }) = self.layout.get(&grid)
+            else {
+                continue;
+            };
+            let at = self.resolve(grid, &anchor, *zindex);
+            if let Some(Placement {
+                place: Place::Float { row, col, .. },
+                ..
+            }) = self.layout.get_mut(&grid)
+            {
+                (*row, *col) = at;
+            }
+        }
+    }
+
+    /// Where on the screen the float on `grid`, anchored so at `zindex`, has
+    /// its top left: worked out as Neovim's compositor works it out for a UI
+    /// that draws floats on its own grid (`ui_ext_win_position`, `window.c`),
+    /// which is what 0.12 sends a UI with `ext_multigrid` as the float's
+    /// screen position. The anchor's corner at the anchor's position on its
+    /// grid, and then the whole float on the screen, clear of the command
+    /// line unless it is drawn over messages.
+    ///
+    /// Neovim leaves a `fixed` float anchored on its left where it is, past
+    /// the right edge or not; nothing here says which floats are, and few
+    /// are, so every one is kept in.
+    fn resolve(&self, grid: u64, anchor: &Anchor, zindex: i64) -> (i64, i64) {
+        let size = |g: u64| {
+            self.grids
+                .get(&g)
+                .map_or((0, 0), |g| (g.height() as i64, g.width() as i64))
+        };
+        let (height, width) = size(grid);
+        let (rows, cols) = size(1);
+        // The editor's grid starts at the top left, and has no placement.
+        let (top, left) = match anchor.grid {
+            1 => (0, 0),
+            g => self.layout.get(&g).map_or((0, 0), Placement::origin),
+        };
+        let cmdheight = self.msg_row.map_or(1, |r| (rows - r as i64).max(0));
+        let below = if zindex < MESSAGES_ZINDEX {
+            cmdheight
+        } else {
+            0
+        };
+        // A corner at the bottom or on the right is that far down or along
+        // from the top left.
+        let up = if anchor.south { height } else { 0 };
+        let back = if anchor.east { width } else { 0 };
+        let row = top + anchor.row - up;
+        let col = left + anchor.col - back;
+        (
+            row.min(rows - height - below).max(0),
+            col.min(cols - width).max(0),
+        )
     }
 
     /// A grid's margins: none, for a grid Neovim has not said has any.
@@ -1130,8 +1227,7 @@ mod tests {
                     mouse: false,
                     zindex: 100,
                     compindex: 1,
-                    row: 2,
-                    col: 0,
+                    at: FloatAt::Screen { row: 2, col: 0 },
                 },
                 Event::GridDestroy { grid: 4 },
             ],
@@ -1139,5 +1235,180 @@ mod tests {
         assert!(!m.grids.contains_key(&4));
         assert!(!m.layout.contains_key(&4));
         assert!(changes.reshaped.contains(&4));
+    }
+
+    /// A batch as the client takes one: every event, and then the floats
+    /// placed by their anchoring alone.
+    fn apply_batch(m: &mut Model, events: Vec<Event>) {
+        apply(m, events);
+        m.place_anchored();
+    }
+
+    fn resize(grid: u64, width: usize, height: usize) -> Event {
+        Event::GridResize {
+            grid,
+            width,
+            height,
+        }
+    }
+
+    fn float(grid: u64, zindex: i64, at: FloatAt) -> Event {
+        Event::WinFloatPos {
+            grid,
+            win: Some(1000 + grid as i64),
+            mouse: true,
+            zindex,
+            compindex: 0,
+            at,
+        }
+    }
+
+    /// How Neovim 0.11 says a float is anchored, which is all it says.
+    fn anchoring(corner: &str, grid: u64, row: i64, col: i64) -> FloatAt {
+        FloatAt::Anchored(Anchor {
+            grid,
+            row,
+            col,
+            south: corner.starts_with('S'),
+            east: corner.ends_with('E'),
+        })
+    }
+
+    /// A float as Neovim 0.11 places it: by its anchoring alone.
+    fn anchored(grid: u64, corner: &str, anchor_grid: u64, row: i64, col: i64) -> Event {
+        float(grid, 50, anchoring(corner, anchor_grid, row, col))
+    }
+
+    fn origin(m: &Model, grid: u64) -> (i64, i64) {
+        m.layout.get(&grid).expect("placed").origin()
+    }
+
+    /// An 80 by 24 editor with a one-row command line, its message area
+    /// where Neovim puts it, and a window at the right of a vertical split.
+    fn editor() -> Model {
+        let mut m = model();
+        apply_batch(
+            &mut m,
+            vec![
+                resize(1, 80, 24),
+                Event::MsgSetPos {
+                    grid: 3,
+                    row: 23,
+                    scrolled: false,
+                    sep: " ".into(),
+                    zindex: 200,
+                    compindex: 0,
+                },
+                resize(2, 39, 22),
+                Event::WinPos {
+                    grid: 2,
+                    win: Some(1002),
+                    row: 0,
+                    col: 41,
+                    width: 39,
+                    height: 22,
+                },
+            ],
+        );
+        m
+    }
+
+    /// Placed by its anchoring alone, as 0.11 places it, a float ends up where
+    /// 0.12 says Neovim puts it: each case here is one 0.12.6 was asked
+    /// about, and the place is the `screen_row`, `screen_col` it sent. A float
+    /// ten by two in a border — twelve by four — anchored by its bottom right
+    /// corner; past the edges, and kept in, clear of the command line; and
+    /// relative to a window, from that window's place.
+    #[test]
+    fn a_float_by_its_anchoring_is_placed_where_neovim_puts_it() {
+        let mut m = editor();
+        apply_batch(&mut m, vec![resize(4, 12, 4), anchored(4, "SE", 1, 20, 70)]);
+        assert_eq!(origin(&m, 4), (16, 58));
+        apply_batch(&mut m, vec![anchored(4, "NW", 1, 30, 100)]);
+        assert_eq!(origin(&m, 4), (19, 68), "kept on the screen");
+        apply_batch(&mut m, vec![anchored(4, "NW", 2, 3, 4)]);
+        assert_eq!(origin(&m, 4), (3, 45), "from the window's place");
+        apply_batch(&mut m, vec![anchored(4, "NW", 1, 5, 10)]);
+        assert_eq!(origin(&m, 4), (5, 10));
+    }
+
+    /// Neovim sends a resized float's anchoring before its new size, and a
+    /// corner other than the top left is measured back by the size: the one
+    /// the batch ends with.
+    #[test]
+    fn a_float_resized_is_placed_by_its_new_size() {
+        let mut m = editor();
+        apply_batch(&mut m, vec![resize(4, 12, 4), anchored(4, "SE", 1, 20, 70)]);
+        apply_batch(&mut m, vec![anchored(4, "SE", 1, 20, 70), resize(4, 22, 6)]);
+        assert_eq!(origin(&m, 4), (14, 48));
+    }
+
+    /// The command line a float is kept clear of is as tall as `'cmdheight'`
+    /// makes it, which the message area's place says — except for a float
+    /// drawn over messages, which may cover it.
+    #[test]
+    fn a_float_is_kept_clear_of_the_command_line_below_messages() {
+        let mut m = editor();
+        let cmdheight_3 = Event::MsgSetPos {
+            grid: 3,
+            row: 21,
+            scrolled: false,
+            sep: " ".into(),
+            zindex: 200,
+            compindex: 0,
+        };
+        apply_batch(
+            &mut m,
+            vec![cmdheight_3, resize(4, 12, 4), anchored(4, "NW", 1, 30, 0)],
+        );
+        assert_eq!(origin(&m, 4), (17, 0));
+        let over_messages = float(4, 250, anchoring("NW", 1, 30, 0));
+        apply_batch(&mut m, vec![over_messages]);
+        assert_eq!(origin(&m, 4), (20, 0));
+        // Messages pushing the area up do not make the command line taller.
+        let scrolled = Event::MsgSetPos {
+            grid: 3,
+            row: 10,
+            scrolled: true,
+            sep: " ".into(),
+            zindex: 200,
+            compindex: 0,
+        };
+        apply_batch(&mut m, vec![scrolled, anchored(4, "NW", 1, 30, 0)]);
+        assert_eq!(origin(&m, 4), (17, 0));
+    }
+
+    /// A float anchored to another is placed from where that one ends up,
+    /// in the same batch: Neovim places the one anchored to first.
+    #[test]
+    fn a_float_anchored_to_a_float_follows_it() {
+        let mut m = editor();
+        apply_batch(
+            &mut m,
+            vec![
+                resize(4, 12, 4),
+                resize(5, 4, 3),
+                anchored(4, "SE", 1, 20, 70),
+                anchored(5, "NW", 4, 1, 1),
+            ],
+        );
+        assert_eq!(origin(&m, 4), (16, 58));
+        assert_eq!(origin(&m, 5), (17, 59));
+    }
+
+    /// Where Neovim says a float is, it is: no anchoring is worked out for
+    /// it, even one it had earlier in the batch.
+    #[test]
+    fn a_float_neovim_has_placed_stays_put() {
+        let mut m = editor();
+        apply_batch(
+            &mut m,
+            vec![
+                resize(4, 12, 4),
+                anchored(4, "SE", 1, 20, 70),
+                float(4, 50, FloatAt::Screen { row: 2, col: 3 }),
+            ],
+        );
+        assert_eq!(origin(&m, 4), (2, 3));
     }
 }

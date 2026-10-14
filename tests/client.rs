@@ -406,6 +406,121 @@ fn a_client_after_another_is_shown_every_window() {
     );
 }
 
+/// Where on the screen `needle` is: its row, and its column in cells.
+fn at(screen: &str, needle: &str) -> Option<(usize, usize)> {
+    screen.lines().enumerate().find_map(|(row, line)| {
+        line.find(needle)
+            .map(|byte| (row, line[..byte].chars().count()))
+    })
+}
+
+/// A float the editor moves is drawn where Neovim puts it: by a corner other
+/// than its top left, relative to a window, and past the screen's edges and
+/// kept in. Neovim 0.12 says where that is; 0.11 says only how the float is
+/// anchored, and the client works the rest out as Neovim's compositor does
+/// (see `nvmux::client::model::Model::place_anchored`) — so on 0.11 this is
+/// what tells the two apart.
+#[test]
+fn a_float_moved_is_drawn_where_neovim_puts_it() {
+    require_nvim!();
+    let scratch = Scratch::new("client-float-moved");
+    let (sock, mut rpc, config) = session(&scratch, "client-float-moved");
+    rpc.command("setlocal noswapfile | call setline(1, 'under a float') | vsplit")
+        .expect("a split");
+    let mut term = Terminal::spawn(&sock, &config);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| {
+            s.lines()
+                .next()
+                .is_some_and(|row| row.matches("under a float").count() == 2)
+        }),
+        "never drawn:\n{}",
+        term.text()
+    );
+
+    // Ten by one in a border, twelve by three in all. On an 80 by 24 screen
+    // with a one-row command line: its bottom right corner at row 20 and
+    // column 70 puts its top left at 17, 58; 3, 4 into the right-hand
+    // window, which starts at column 41, is 3, 45; and 30, 100 is kept on
+    // the screen, clear of the command line, at 20, 68.
+    rpc.command(
+        "lua local b = vim.api.nvim_create_buf(false, true) \
+         vim.api.nvim_buf_set_lines(b, 0, -1, false, { 'moved here' }) \
+         vim.g.moved = vim.api.nvim_open_win(b, false, { relative = 'editor', \
+         anchor = 'SE', row = 20, col = 70, width = 10, height = 1, border = 'single' })",
+    )
+    .expect("a float");
+    let top = "┌──────────┐";
+    let moves = [
+        ("anchored by its bottom right", None, (17, 58)),
+        (
+            "relative to the right-hand window",
+            Some(
+                "{ relative = 'win', win = vim.fn.win_getid(2), anchor = 'NW', row = 3, col = 4 }",
+            ),
+            (3, 45),
+        ),
+        (
+            "past the edges",
+            Some("{ relative = 'editor', anchor = 'NW', row = 30, col = 100 }"),
+            (20, 68),
+        ),
+    ];
+    for (what, config, want) in moves {
+        if let Some(config) = config {
+            rpc.command(&format!(
+                "lua vim.api.nvim_win_set_config(vim.g.moved, {config})"
+            ))
+            .expect("move the float");
+        }
+        assert!(
+            term.pump_until(Duration::from_secs(10), |s| {
+                at(s, top) == Some(want) && at(s, "│moved here│") == Some((want.0 + 1, want.1))
+            }),
+            "{what}: the float is at {:?}, not {want:?}:\n{}",
+            at(&term.text(), top),
+            term.text()
+        );
+    }
+}
+
+/// A float anchored by its bottom right corner that was there before the
+/// client is drawn where Neovim puts it. A UI attaching is told nothing of a
+/// float already there, and asks where it is: on 0.11, which works out where
+/// an anchored float goes only for a UI without `ext_multigrid`, that answer
+/// is where its config says, and what puts it right is Neovim placing it by
+/// its anchoring, which the client works out.
+#[test]
+fn a_float_there_before_the_client_is_drawn_where_neovim_puts_it() {
+    require_nvim!();
+    let scratch = Scratch::new("client-float-before");
+    let (sock, mut rpc, config) = session(&scratch, "client-float-before");
+    rpc.command("setlocal noswapfile | call setline(1, 'under a float')")
+        .expect("setline");
+    // Eleven by one in a border, thirteen by three in all, its bottom right
+    // corner at row 20 and column 70 of an 80 by 24 screen: its top left at
+    // 17, 57.
+    rpc.command(
+        "lua local b = vim.api.nvim_create_buf(false, true) \
+         vim.api.nvim_buf_set_lines(b, 0, -1, false, { 'there first' }) \
+         vim.api.nvim_open_win(b, false, { relative = 'editor', anchor = 'SE', \
+         row = 20, col = 70, width = 11, height = 1, border = 'single' })",
+    )
+    .expect("a float");
+    let top = "┌───────────┐";
+    let mut term = Terminal::spawn(&sock, &config);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| {
+            s.starts_with("under a float")
+                && at(s, top) == Some((17, 57))
+                && at(s, "│there first│") == Some((18, 57))
+        }),
+        "the float is at {:?}, not (17, 57):\n{}",
+        at(&term.text(), top),
+        term.text()
+    );
+}
+
 /// A yank to `+` reaches the terminal's clipboard as OSC 52. Neovim turns its
 /// OSC 52 clipboard on only for a terminal it has asked whether it takes it,
 /// and asks only through a UI that says it is on a tty, as the client does;

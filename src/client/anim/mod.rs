@@ -1017,7 +1017,7 @@ mod tests {
     use crate::client::compose;
     use crate::client::grid::Text;
     use crate::client::model::Changes;
-    use crate::client::redraw::{LineCell, ModeInfo, OptionValue};
+    use crate::client::redraw::{FloatAt, LineCell, ModeInfo, OptionValue};
     use crate::palette::Palette;
 
     fn effects() -> Effects {
@@ -1138,8 +1138,7 @@ mod tests {
             mouse: true,
             zindex: 50,
             compindex: 1,
-            row: 0,
-            col,
+            at: FloatAt::Screen { row: 0, col },
         };
         let size = Event::GridResize {
             grid: 5,

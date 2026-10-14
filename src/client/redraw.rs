@@ -5,7 +5,9 @@
 //! [`Event`]. Neovim adds parameters to events as it goes — `win_float_pos`
 //! has grown from eight to eleven — so a list longer than what is read here is
 //! read as far as it goes, and one shorter than that, or the wrong shape, is
-//! dropped on its own rather than taking its batch with it. An event this
+//! dropped on its own rather than taking its batch with it. Shorter by what an
+//! older Neovim the client attaches to never sends is another matter: read as
+//! that Neovim means it (see [`FloatAt`]). An event this
 //! module does not know is dropped the same way: the set Neovim sends is the
 //! set this client asked for (see `super::App`), and anything else
 //! is something a newer Neovim says that an older client has no use for.
@@ -70,16 +72,14 @@ pub enum Event {
         width: usize,
         height: usize,
     },
-    /// Where a float is, on the screen: Neovim works out the anchoring itself
-    /// and says where that put it (`screen_row`, `screen_col`).
+    /// Where a float is: see [`FloatAt`].
     WinFloatPos {
         grid: u64,
         win: Option<i64>,
         mouse: bool,
         zindex: i64,
         compindex: i64,
-        row: i64,
-        col: i64,
+        at: FloatAt,
     },
     WinHide {
         grid: u64,
@@ -137,6 +137,31 @@ pub enum Event {
     UiSend(Vec<u8>),
     /// The server is going, and says with what status.
     ErrorExit(i64),
+}
+
+/// Where a float goes, as `win_float_pos` says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatAt {
+    /// Its top left on the screen: Neovim has worked the anchoring out and
+    /// says where that put it (`screen_row`, `screen_col`), from 0.12 on.
+    Screen { row: i64, col: i64 },
+    /// How it is anchored, which is all 0.11 says: it leaves the rest to a UI
+    /// with `ext_multigrid`, and so to the client (see
+    /// `super::model::Model::place_anchored`).
+    Anchored(Anchor),
+}
+
+/// How a float is anchored: the corner of it its anchor names at `row`, `col`
+/// of grid `grid` — the editor's, or that of the window it is relative to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Anchor {
+    pub grid: u64,
+    pub row: i64,
+    pub col: i64,
+    /// Whether the corner is on the float's bottom edge (`SW`, `SE`), and
+    /// whether it is on its right one (`NE`, `SE`).
+    pub south: bool,
+    pub east: bool,
 }
 
 /// One run of cells in a `grid_line`: a text, the highlight it is drawn in if
@@ -314,17 +339,20 @@ fn event(name: &str, a: &[ValueRef<'_>]) -> Option<Option<Event>> {
             height: size(a.get(5)?)?,
         },
         // `[grid, win, anchor, anchor_grid, anchor_row, anchor_col,
-        // mouse_enabled, zindex, compindex, screen_row, screen_col]`: the last
-        // four came later, and the last two are the only position the client
-        // needs — the anchoring is Neovim's to resolve, and it has.
+        // mouse_enabled, zindex, compindex, screen_row, screen_col]`. The last
+        // three came in 0.12, and the last two are then the only position the
+        // client needs: the anchoring is Neovim's to resolve, and it has. 0.11
+        // sends the first eight, and only the anchoring to go by.
         "win_float_pos" => Event::WinFloatPos {
             grid: uint(a.first()?)?,
             win: a.get(1).and_then(handle),
             mouse: a.get(6).and_then(boolean).unwrap_or(true),
             zindex: a.get(7).and_then(int).unwrap_or(50),
             compindex: a.get(8).and_then(int).unwrap_or(0),
-            row: int(a.get(9)?)?,
-            col: int(a.get(10)?)?,
+            at: match (a.get(9).and_then(int), a.get(10).and_then(int)) {
+                (Some(row), Some(col)) => FloatAt::Screen { row, col },
+                _ => FloatAt::Anchored(anchor(a)?),
+            },
         },
         "win_hide" => Event::WinHide {
             grid: uint(a.first()?)?,
@@ -528,6 +556,31 @@ pub(super) fn uint(v: &ValueRef<'_>) -> Option<u64> {
     v.as_u64()
 }
 
+/// A number Neovim keeps as a `Float`, sent as a float, or by a peer that
+/// sends one as an integer.
+fn number(v: &ValueRef<'_>) -> Option<f64> {
+    match v {
+        ValueRef::F64(f) => Some(*f),
+        ValueRef::F32(f) => Some(f64::from(*f)),
+        ValueRef::Integer(n) => n.as_f64(),
+        _ => None,
+    }
+}
+
+/// How `win_float_pos` anchors its float: its third to sixth parameters.
+fn anchor(a: &[ValueRef<'_>]) -> Option<Anchor> {
+    let corner = as_str(a.get(2)?)?;
+    Some(Anchor {
+        grid: uint(a.get(3)?)?,
+        // To a cell the way Neovim's compositor takes them, `(int)row`: `as`
+        // truncates towards zero as C's cast does.
+        row: number(a.get(4)?)? as i64,
+        col: number(a.get(5)?)? as i64,
+        south: corner.starts_with('S'),
+        east: corner.ends_with('E'),
+    })
+}
+
 fn size(v: &ValueRef<'_>) -> Option<usize> {
     usize::try_from(uint(v)?).ok()
 }
@@ -670,8 +723,43 @@ mod tests {
                 mouse: true,
                 zindex: 50,
                 compindex: 2,
-                row: 3,
-                col: 10,
+                at: FloatAt::Screen { row: 3, col: 10 },
+            }]
+        );
+    }
+
+    /// Neovim 0.11 sends the first eight, which say only how the float is
+    /// anchored: read as that, for the model to resolve, and not dropped as
+    /// a call too short.
+    #[test]
+    fn a_float_from_0_11_is_read_as_its_anchoring() {
+        let call = arr(vec![
+            Value::from(4),
+            win(1001),
+            Value::from("SE"),
+            Value::from(2),
+            Value::F64(20.0),
+            Value::F64(70.9),
+            Value::from(false),
+            Value::from(50),
+        ]);
+        let (out, dropped) = events(arr(vec![batch("win_float_pos", vec![call])]));
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            out,
+            vec![Event::WinFloatPos {
+                grid: 4,
+                win: Some(1001),
+                mouse: false,
+                zindex: 50,
+                compindex: 0,
+                at: FloatAt::Anchored(Anchor {
+                    grid: 2,
+                    row: 20,
+                    col: 70,
+                    south: true,
+                    east: true,
+                }),
             }]
         );
     }

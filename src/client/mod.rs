@@ -46,7 +46,9 @@
 //! message area and every float on a grid of its own, placed by the client
 //! ([`compose`]). That is what makes a window something that can be seen to
 //! move, and a scroll something that happened to one window rather than to a
-//! rectangle of the screen.
+//! rectangle of the screen. Where a float goes Neovim says from 0.12; 0.11
+//! says only how it is anchored, and the client works out the rest as Neovim
+//! would ([`model::Model::place_anchored`]).
 //!
 //! Neovim keeps windows on grids of their own only while every UI attached
 //! asks for it, though. With one attached that does not — Neovim's own TUI in
@@ -116,7 +118,7 @@ use self::grid::Cell;
 use self::input::{Input, Mouse, Parser, Reply};
 use self::model::{Changes, Model, Place, Placement};
 use self::predict::{Command, Mode, Predictor, Side};
-use self::redraw::Event;
+use self::redraw::{Event, FloatAt};
 use self::screen::Screen;
 use self::wire::{Arg, Inbox, Outbox};
 use crate::palette::{Palette, Rgb};
@@ -1449,8 +1451,10 @@ impl App {
                         mouse: at(8) != 0,
                         zindex: at(7),
                         compindex,
-                        row: at(1),
-                        col: at(2),
+                        at: FloatAt::Screen {
+                            row: at(1),
+                            col: at(2),
+                        },
                     });
                     events.push(Event::WinViewportMargins {
                         grid,
@@ -1542,6 +1546,7 @@ impl App {
         for event in batch {
             self.model.apply(event, &mut changes);
         }
+        self.model.place_anchored();
         self.model.refresh_styles();
         if changes.repaint {
             self.screen.invalidate();
