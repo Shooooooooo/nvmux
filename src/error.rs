@@ -179,7 +179,7 @@ pub enum NvimError {
     #[error("{where_}: `nvim` not found on $PATH\nhint: nvmux needs Neovim >= {min} on {where_}")]
     NotFound { where_: String, min: &'static str },
 
-    #[error("{where_}: Neovim {found} is too old; nvmux needs >= {min}\nhint: {min} is where `:detach` and `:connect` landed, which nvmux relies on")]
+    #[error("{where_}: Neovim {found} is too old; nvmux needs >= {min}\nhint: {min} is where `:detach` landed, which nvmux relies on")]
     TooOld {
         where_: String,
         found: String,
