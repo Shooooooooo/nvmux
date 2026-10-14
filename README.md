@@ -51,10 +51,9 @@ hand Neovim your terminal outright — rather than an imitation of one.
 | Local | `nvim` >= 0.11 for local sessions, and `ssh` for `nvmux <host>` |
 | Remote | `nvim` >= 0.11 |
 
-0.11 specifically, on both ends: that is the release where `:detach` and
-`:connect` landed. `nvmux <host>` needs no local `nvim` — unless sessions are
-drawn by Neovim's own client (`[client] ui = "nvim"`), which is `nvim
---remote-ui`.
+0.11 specifically, on both ends: that is the release where `:detach` landed.
+`nvmux <host>` needs no local `nvim` — unless sessions are drawn by Neovim's
+own client (`[client] ui = "nvim"`), which is `nvim --remote-ui`.
 
 ### Building
 
