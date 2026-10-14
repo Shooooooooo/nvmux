@@ -560,6 +560,12 @@ impl Desk {
         self.forwarded.retry_at()
     }
 
+    /// Whether [`Desk::go`] would find a card to act on now: what the hint bar
+    /// asks before it offers `<prefix> Enter` (see [`crate::hint`]).
+    pub fn can_go(&self, now: Instant) -> bool {
+        self.up.iter().any(|u| u.go.is_some() && u.until > now)
+    }
+
     /// The newest card up that goes somewhere, taken down: what
     /// `<prefix> Enter` acts on.
     pub fn go(&mut self, now: Instant) -> Option<(u64, Go)> {
@@ -805,5 +811,26 @@ mod tests {
         desk.ready(t0);
         let later = t0 + on_screen(&post("front", 5, None).card);
         assert_eq!(desk.go(later), None, "its time is up");
+    }
+
+    /// `can_go` is `go` asked without acting: what the hint bar offers
+    /// `<prefix> Enter` on, so the two must never disagree.
+    #[test]
+    fn can_go_says_whether_going_would_go_anywhere() {
+        let t0 = Instant::now();
+        let a = crate::ids::Id::new("aaaaaaaa").expect("id");
+        let mut desk = Desk::new("front");
+        desk.open(Some(Card::arrival(1, "front", false)), t0);
+        assert!(!desk.can_go(t0), "an arrival card goes nowhere");
+
+        desk.take(vec![post("front", 2, Some(Go::Session(a)))]);
+        assert!(!desk.can_go(t0), "a card not yet put in is not up");
+        desk.ready(t0);
+        assert!(desk.can_go(t0));
+        let later = t0 + on_screen(&post("front", 2, None).card);
+        assert!(!desk.can_go(later), "its time is up");
+
+        assert!(desk.go(t0).is_some());
+        assert!(!desk.can_go(t0), "the card acted on is down");
     }
 }
