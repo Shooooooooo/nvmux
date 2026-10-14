@@ -536,8 +536,27 @@ where
 /// on the `kept` cells, which stands at its full colour throughout: a card of
 /// nvmux's own, which the switch carries on to the next session's screen.
 /// Says whether it did, as [`fade_in_session`] does.
-pub fn fade_out_session(shadow: &mut Shadow, kept: &Kept) -> io::Result<bool> {
-    run_session(shadow, Direction::Out, None, kept)
+///
+/// Between frames it does what `between` does (see [`Between`]).
+pub fn fade_out_session(
+    shadow: &mut Shadow,
+    kept: &Kept,
+    between: Between<'_>,
+) -> io::Result<bool> {
+    run_session(shadow, Direction::Out, None, kept, between)
+}
+
+/// What a session's fade does between its frames, given the shadow it draws
+/// them from and when the next is due: [`wait`] for it — or read what the
+/// session writes meanwhile into the shadow, so that the frames after show it:
+/// a card on the move that the `kept` cells stand for, which its client goes
+/// on drawing as the screen under it comes and goes (see [`crate::pty`]).
+pub type Between<'a> = &'a mut dyn FnMut(&mut Shadow, Instant);
+
+/// Wait for the next frame, and do nothing else: between the frames of a fade
+/// with nothing to read.
+pub fn wait(_: &mut Shadow, until: Instant) {
+    thread::sleep(until.saturating_duration_since(Instant::now()));
 }
 
 /// What the `kept` cells of `shadow` have written on them, drawn again at its
@@ -563,9 +582,15 @@ pub fn standing(shadow: &Shadow, kept: &Kept) -> Vec<u8> {
 /// [`Iris`] opening out of the line the name stands on: that line first, the
 /// rows furthest from it last. What is written on the `kept` cells stands at
 /// its full colour from the first frame: the card that says where a switch
-/// landed, which the session's own client drew.
-pub fn fade_in_session(shadow: &mut Shadow, over: Option<&Over>, kept: &Kept) -> io::Result<bool> {
-    run_session(shadow, Direction::In, over, kept)
+/// landed, which the session's own client drew. Between frames it does what
+/// `between` does (see [`Between`]).
+pub fn fade_in_session(
+    shadow: &mut Shadow,
+    over: Option<&Over>,
+    kept: &Kept,
+    between: Between<'_>,
+) -> io::Result<bool> {
+    run_session(shadow, Direction::In, over, kept, between)
 }
 
 fn run_session(
@@ -573,6 +598,7 @@ fn run_session(
     direction: Direction,
     over: Option<&Over>,
     kept: &Kept,
+    between: Between<'_>,
 ) -> io::Result<bool> {
     let Some(palette) = active() else {
         return Ok(false);
@@ -594,7 +620,7 @@ fn run_session(
         out.write_all(&shadow.frame_with(dissolve, palette, cursor, over, kept))?;
         out.flush()?;
         if !schedule.finished() {
-            thread::sleep(FRAME);
+            between(shadow, Instant::now() + FRAME);
         }
     }
     Ok(true)

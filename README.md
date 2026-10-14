@@ -103,8 +103,8 @@ Pressing `<prefix>` puts a one-row reminder of these keys along the bottom of
 the screen; it goes as soon as the next key resolves it. A switch, by key or
 out of the picker, says where you have landed: in the top right margin, the
 session's name between the ones `<prefix> p` and `<prefix> n` go to, which
-moves the way you went and goes a moment later. It is up from the moment you
-press the key, and stays on the screen while the sessions fade.
+moves the way you went and goes a moment later. It is up, and moving, from
+the moment you press the key, and stays on the screen while the sessions fade.
 
 ### Leaving a session
 

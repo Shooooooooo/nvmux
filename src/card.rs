@@ -157,6 +157,15 @@ pub struct Card {
     /// `<prefix> p` step through. Boxed, as only an arrival has one.
     #[serde(default)]
     pub row: Option<Box<Row>>,
+    /// How long it has been up already, in milliseconds, where it was up on
+    /// another screen first: the card a switch lands with, which the client
+    /// of the session it leaves draws from the key on (see
+    /// [`crate::pty::relay`]). The client of the session it lands in takes it
+    /// up from there, its row as far along as it has come, rather than from
+    /// the start. 0 for a card on its first screen, which is timed from when
+    /// it is first drawn there.
+    #[serde(default)]
+    pub up_ms: u64,
 }
 
 /// Where a switch landed among the sessions `<prefix> n` and `<prefix> p`
@@ -204,6 +213,7 @@ impl Card {
             mark: None,
             only_mark: false,
             row: None,
+            up_ms: 0,
         }
     }
 
@@ -226,6 +236,7 @@ impl Card {
             mark: Some(kind),
             only_mark: false,
             row: None,
+            up_ms: 0,
         }
     }
 
@@ -245,6 +256,14 @@ impl Card {
                 next: clean_name(row.next),
                 step,
             })),
+            ..self
+        }
+    }
+
+    /// This card, up for `up` already on another screen (see [`Card::up_ms`]).
+    pub fn up_for(self, up: Duration) -> Self {
+        Self {
+            up_ms: millis(up),
             ..self
         }
     }
@@ -586,7 +605,7 @@ impl Forwarded {
     }
 
     /// When a card may go in, if it may not go in at any time.
-    fn retry_at(&self) -> Option<Instant> {
+    pub fn retry_at(&self) -> Option<Instant> {
         let quiet = match self.inside {
             Inside::Nothing if self.tail.is_empty() => return None,
             Inside::Paste => QUIET_PASTE,

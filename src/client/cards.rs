@@ -34,9 +34,11 @@
 //! [`arrival_footprint`]) — and on a switch by key, from the key on, the
 //! session left drawing it as it goes, and the screen handed over between the
 //! two keeping it (see [`crate::handoff`]). A switch by `<prefix> n` or
-//! `<prefix> p` then moves the row a name the way it went: the session left
-//! goes faint as the one landed in comes up, a name goes off one end and the
-//! next comes on at the other.
+//! `<prefix> p` moves the row a name the way it went, from the moment it is
+//! up — the key — and on through both fades, the screen it lands on taking
+//! it up as far along as it has come ([`crate::card::Card::up_ms`]): the
+//! session left goes faint as the one landed in comes up, a name goes off one
+//! end and the next comes on at the other.
 //!
 //! # The sign first, and it stays
 //!
@@ -63,9 +65,9 @@
 //! still reads as itself. A note takes all of that at once, for every line it
 //! has, and has it before any of its words come, as its sign does; and gives
 //! it back once they have all gone: so the words come up on a patch already
-//! quiet, rather than the quiet spreading as they come. An arrival's is as
-//! wide as its row is either side of a step, and stays still as the row
-//! moves. A sign on its own takes less of it, and not as far. The status line
+//! quiet, rather than the quiet spreading as they come. An arrival's covers
+//! all the way the names on its row go on a step, and stays still as the
+//! row moves. A sign on its own takes less of it, and not as far. The status line
 //! and the command line are left as they are. What is drawn comes up out of
 //! what is under it: that fades to the background over the first half of a
 //! piece's coming, and the piece comes up out of it over the second.
@@ -161,9 +163,11 @@ const UNSAID: f32 = MASK_OUT.0 + MASK_OUT.1;
 /// A card let go of fades out, all of it, over this.
 const LET_GO: f32 = 3.0;
 
-/// An arrival's row moves the way the switch went once the screen has come in,
-/// and the arrival goes over [`ARRIVAL_OUT`] once its life is over.
-const SLIDE: (f32, f32) = (1.0, 2.8);
+/// An arrival's row moves the way the switch went from the moment it is up —
+/// for a switch by key, the key: it is up on the screen being left before
+/// that dissolves (see [`Card::up_ms`]) — and the arrival goes over
+/// [`ARRIVAL_OUT`] once its life is over.
+const SLIDE: (f32, f32) = (0.0, 2.8);
 const ARRIVAL_OUT: f32 = 3.0;
 
 /// The colours the editor has for each kind of news, which a sign is drawn
@@ -210,9 +214,9 @@ pub struct Cards {
 struct Live {
     card: Card,
     shown_at: Instant,
-    /// When it was first drawn, which is what it is timed from: a card that
-    /// came while the editor was still drawing its first screen has not been
-    /// seen yet.
+    /// When it was first drawn, which is what it is timed from (see
+    /// [`Live::origin`]): a card that came while the editor was still drawing
+    /// its first screen has not been seen yet.
     drawn_at: Option<Instant>,
     /// Let go of — acted on, or about what has nothing more to say — and
     /// fading out from then.
@@ -304,9 +308,22 @@ impl Live {
         self.card.fade_ms as f32
     }
 
+    /// What it is timed from, once it has been drawn: its first frame — or
+    /// for one that was up on another screen first, as long before it came
+    /// as it had been up there ([`Card::up_ms`]), so that it goes on as it
+    /// was going rather than starting over.
+    fn origin(&self) -> Option<Instant> {
+        let drawn = self.drawn_at?;
+        if self.card.up_ms == 0 {
+            return Some(drawn);
+        }
+        let up = Duration::from_millis(self.card.up_ms);
+        Some(self.shown_at.checked_sub(up).unwrap_or(self.shown_at))
+    }
+
     /// How long it has been up at `now`, in milliseconds.
     fn t(&self, now: Instant) -> f32 {
-        self.drawn_at
+        self.origin()
             .map_or(0.0, |at| ms(now.saturating_duration_since(at)))
     }
 
@@ -420,7 +437,7 @@ impl Live {
     /// shows the card the key acts on: a step of a piece on the move, the
     /// moment one starts to, the next tick of an age that shows.
     fn next_change(&self, drawn: Instant, whole: bool) -> Option<Instant> {
-        let origin = self.drawn_at?;
+        let origin = self.origin()?;
         let u = self.fade();
         let t = ms(drawn.saturating_duration_since(origin));
         let mut moves = Vec::new();
@@ -762,9 +779,10 @@ impl<'a> Name<'a> {
 }
 
 /// An arrival laid out on its row: its names, each from where it lies
-/// before a step to where it lies after, and the columns it covers — its row
-/// as it lies either side of the step, the one span while it moves — and the
-/// line under it, that the session is waiting for a key, and where.
+/// before a step to where it lies after, and the columns it covers — for a
+/// step, all the way its names go, the one going off and the one coming on
+/// among them, out to the edge of the screen; the one span while it moves —
+/// and the line under it, that the session is waiting for a key, and where.
 struct Landing<'a> {
     names: Vec<Name<'a>>,
     covers: (usize, usize),
@@ -808,7 +826,7 @@ fn landing<'a>(card: &'a Card, title: &'a str, at: Margin) -> Landing<'a> {
             vec![(at.end + 1 - title.width()) as isize]
         }
     };
-    let mut covers = after[0];
+    let (mut covers, mut right) = (after[0], at.end);
     let mut names: Vec<Name> = after_names
         .iter()
         .zip(&after)
@@ -837,7 +855,6 @@ fn landing<'a>(card: &'a Card, title: &'a str, at: Margin) -> Landing<'a> {
         // The row moves by what the name landed in moves by.
         let landed_before = if forward { before[2] } else { before[0] };
         let shift = after[1] - landed_before;
-        covers = covers.min(before[0]);
         let name = Name::new;
         // Going off the end, coming on at the other, the one left and the one
         // landed in, and the rest: each from where it was to where it goes.
@@ -857,6 +874,15 @@ fn landing<'a>(card: &'a Card, title: &'a str, at: Margin) -> Landing<'a> {
                 name(gone, (before[2], before[2] + shift), false, false, off),
             ]
         };
+        // All the way the names go, off one end and on at the other, and
+        // past the margin there: a name half out of the patch would be half
+        // gone with the screen, through a fade it stands in.
+        covers = names
+            .iter()
+            .map(|n| n.cols.0.min(n.cols.1))
+            .min()
+            .unwrap_or(covers);
+        right = at.end + MARGIN;
     }
     let waiting = card.body.as_ref().map(|waiting| {
         let end = after[landed_at] as usize + after_names[landed_at].width() - 1;
@@ -866,20 +892,27 @@ fn landing<'a>(card: &'a Card, title: &'a str, at: Margin) -> Landing<'a> {
     });
     Landing {
         names,
-        covers: (covers.max(0) as usize, at.end),
+        covers: (covers.max(0) as usize, right),
         waiting,
     }
 }
 
 /// Where an arrival stands on a screen, as the one card up — as a relay opens
-/// with it — and as its first frame draws it, before its row moves.
+/// with it — on any frame it is drawn on, its row still or on the move.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Footprint {
     /// On each of its rows, the columns it covers: its row of names as wide as
     /// it lies either side of a step, and the line under it.
     pub spans: Vec<(usize, usize, usize)>,
-    /// What it writes on them: each character, and the cell it starts on.
+    /// What it writes on them that stays where it is: each character, and
+    /// the cell it starts on.
     pub glyphs: Vec<(usize, usize, char)>,
+    /// And what moves with its row, for a step: the names on it all the
+    /// while, each character on the cell it starts on before the step. After
+    /// it they are `shift` columns along, and as the row moves, anywhere from
+    /// the one to the other — all of them the same way.
+    pub moving: Vec<(usize, usize, char)>,
+    pub shift: isize,
 }
 
 /// Where `card`, an arrival, stands on a screen `cols` wide and `rows` high:
@@ -897,28 +930,45 @@ pub fn arrival_footprint(card: &Card, cols: usize, rows: usize) -> Footprint {
     let at = Margin::of(cols);
     let title = fit(&card.title, at.widest);
     let landing = landing(card, &title, at);
-    let mut glyphs = Vec::new();
-    let mut write = |row: usize, col: usize, text: &str| {
+    let write = |into: &mut Vec<(usize, usize, char)>, row: usize, col: usize, text: &str| {
         let mut at = col;
         for ch in text.chars() {
             let w = ch.width().unwrap_or(0);
             if w > 0 && ch != ' ' && at + w <= cols {
-                glyphs.push((row, at, ch));
+                into.push((row, at, ch));
             }
             at += w;
         }
     };
-    for n in landing.names.iter().filter(|n| n.there.0 > 0.0) {
-        if let Ok(col) = usize::try_from(n.cols.0) {
-            write(TOP, col, n.text);
+    let (mut glyphs, mut moving, mut shift) = (Vec::new(), Vec::new(), 0);
+    for n in &landing.names {
+        // One coming on to the row or going off it is drawn on some of its
+        // frames and not on others.
+        if n.there.0 < 1.0 || n.there.1 < 1.0 {
+            continue;
+        }
+        let Ok(col) = usize::try_from(n.cols.0) else {
+            continue;
+        };
+        let moves = n.cols.1 - n.cols.0;
+        if moves == 0 {
+            write(&mut glyphs, TOP, col, n.text);
+        } else {
+            write(&mut moving, TOP, col, n.text);
+            shift = moves;
         }
     }
     let mut spans = vec![(TOP, landing.covers.0, landing.covers.1)];
     if let Some((waiting, from, end)) = &landing.waiting {
-        write(TOP + 1, *from, waiting);
+        write(&mut glyphs, TOP + 1, *from, waiting);
         spans.push((TOP + 1, *from, *end));
     }
-    Footprint { spans, glyphs }
+    Footprint {
+        spans,
+        glyphs,
+        moving,
+        shift,
+    }
 }
 
 /// Where a switch landed, on `row`: the row of names, moving if the switch
@@ -1729,9 +1779,9 @@ mod tests {
         );
     }
 
-    /// A step moves the row a name the way it went, once the screen has come
-    /// in: forward, a name off the left and the next on at the right; back,
-    /// the other way.
+    /// A step moves the row a name the way it went, from the moment it is up:
+    /// forward, a name off the left and the next on at the right; back, the
+    /// other way.
     #[test]
     fn a_step_moves_the_row_the_way_it_went() {
         let now = Instant::now();
@@ -1740,6 +1790,15 @@ mod tests {
                 forward,
                 gone: gone.into(),
             })
+        };
+        // `row` flush right, on the patch the row's names go over: from
+        // `from` out to the edge of the screen.
+        let patch = |from: usize, row: &str| {
+            format!(
+                "{}{}{row}  ",
+                "x".repeat(from),
+                " ".repeat(98 - from - row.width())
+            )
         };
         let mut cards = Cards::default();
         let mut card = landed(
@@ -1751,22 +1810,23 @@ mod tests {
         card.fade_ms = 100;
         cards.apply(Command::Show(card), now);
         let before = painted(&mut cards, 100, 30, now);
-        assert_eq!(before[1], right(100, "notes   nvmux   api-server"));
-        let f = drawn(&mut cards, 100, 30, now + ms(50));
-        assert!(
-            f.get(1, 80).expect("a cell").style.bold,
-            "the one left, still"
-        );
+        assert_eq!(before[1], patch(65, "notes   nvmux   api-server"));
         assert_eq!(
-            cards.next_frame(now + ms(50)),
-            Some(now + ms(100)),
-            "the row moves once the screen is in"
+            cards.next_frame(now),
+            Some(now + FRAME),
+            "the row moves from its first frame"
+        );
+        let moving = painted(&mut cards, 100, 30, now + ms(50));
+        assert_eq!(
+            moving[1],
+            patch(65, "notes   nvmux   api-server "),
+            "a column along by the next"
         );
         let after = painted(&mut cards, 100, 30, now + ms(380));
         assert_eq!(
             after[1],
-            format!("{} {}xx", "x".repeat(72), "nvmux   api-server   blog"),
-            "what it covers is as wide as the row was"
+            patch(65, "nvmux   api-server   blog"),
+            "what it covers is all the way the names went"
         );
 
         let mut cards = Cards::default();
@@ -1779,16 +1839,59 @@ mod tests {
         card.fade_ms = 100;
         cards.apply(Command::Show(card), now);
         let before = painted(&mut cards, 100, 30, now);
-        assert_eq!(before[1], right(100, "api-server   blog   notes"));
+        assert_eq!(before[1], patch(65, "api-server   blog   notes"));
         let after = painted(&mut cards, 100, 30, now + ms(380));
-        assert_eq!(after[1], right(100, "nvmux   api-server   blog"));
+        assert_eq!(after[1], patch(65, "nvmux   api-server   blog"));
     }
 
-    /// Where an arrival stands is where it is drawn: on its first frame, every
-    /// glyph of its footprint is on its cell, the row as it lies before a
-    /// step, the name coming on at the far end not yet among them; the span is
-    /// as wide as the row either side of the step; and the line that says the
-    /// session is waiting has its own.
+    /// A card up on another screen first goes on from where it was there: the
+    /// card a switch lands with has its row as far along as it has come since
+    /// the key, on its first frame on the screen it lands on as on every one
+    /// after — and drawn first a while after it came, further along by that
+    /// while.
+    #[test]
+    fn a_card_up_elsewhere_first_goes_on_from_there() {
+        let now = Instant::now();
+        let mut card = landed(
+            "api-server",
+            Some("nvmux"),
+            Some("blog"),
+            Some(Step {
+                forward: true,
+                gone: "notes".into(),
+            }),
+        );
+        card.fade_ms = 100;
+        let landed_at = |cards: &mut Cards, at| painted(cards, 100, 30, at)[1].find("api-server");
+
+        let mut first = Cards::default();
+        first.apply(Command::Show(card.clone()), now);
+        assert_eq!(
+            landed_at(&mut first, now),
+            Some(88),
+            "where the step starts"
+        );
+
+        let mut handed = Cards::default();
+        handed.apply(Command::Show(card.clone().up_for(ms(100))), now);
+        assert_eq!(landed_at(&mut handed, now), Some(86), "two columns along");
+
+        let mut late = Cards::default();
+        late.apply(Command::Show(card.up_for(ms(100))), now);
+        assert_eq!(
+            landed_at(&mut late, now + ms(80)),
+            Some(83),
+            "and five, drawn first 80 ms after it came"
+        );
+    }
+
+    /// Where an arrival stands is where it is drawn, on every frame: what
+    /// stays where it is on its cell, and the names on the row all the while
+    /// all the same way along, from none of its shift on its first frame to
+    /// all of it once the row has moved — the names going off and coming on
+    /// not among them. The span is all the way the row's names go, out to the
+    /// edge of the screen; and the line that says the session is waiting has
+    /// its own.
     #[test]
     fn an_arrival_stands_where_it_is_drawn() {
         let now = Instant::now();
@@ -1800,19 +1903,33 @@ mod tests {
         card.fade_ms = 100;
         card.body = Some(crate::card::WAITING.into());
         let footprint = arrival_footprint(&card, 100, 30);
-        assert_eq!(footprint.spans, [(1, 72, 97), (2, 74, 90)]);
-        assert_eq!(footprint.glyphs.len(), 5 + 5 + 10 + "waitingforakey".len());
-        assert_eq!(footprint.glyphs.first(), Some(&(1, 72, 'n')));
-        assert!(footprint.glyphs.iter().all(|&(_, col, _)| col <= 97));
+        assert_eq!(footprint.spans, [(1, 65, 99), (2, 74, 90)]);
+        assert_eq!(footprint.glyphs.len(), "waitingforakey".len());
+        assert_eq!(footprint.moving.len(), 5 + 10);
+        assert_eq!(footprint.moving.first(), Some(&(1, 80, 'n')));
+        assert_eq!(footprint.shift, -7);
         let mut cards = Cards::default();
         cards.apply(Command::Show(card), now);
-        let f = drawn(&mut cards, 100, 30, now);
-        for &(row, col, ch) in &footprint.glyphs {
-            assert_eq!(
-                f.get(row, col).expect("a cell").text,
-                Text::Char(ch),
-                "{row},{col}"
-            );
+        // How far along the moving names are on a frame, if they are all on
+        // their cells the same way along.
+        let along = |f: &Frame| {
+            (footprint.shift..=0).find(|k| {
+                footprint.moving.iter().all(|&(row, col, ch)| {
+                    let col = usize::try_from(col as isize + k).expect("a column");
+                    f.get(row, col).expect("a cell").text == Text::Char(ch)
+                })
+            })
+        };
+        for (t, was) in [(0, Some(0)), (150, Some(-4)), (380, Some(-7))] {
+            let f = drawn(&mut cards, 100, 30, now + ms(t));
+            for &(row, col, ch) in &footprint.glyphs {
+                assert_eq!(
+                    f.get(row, col).expect("a cell").text,
+                    Text::Char(ch),
+                    "{row},{col} at {t} ms"
+                );
+            }
+            assert_eq!(along(&f), was, "at {t} ms");
         }
 
         assert_eq!(

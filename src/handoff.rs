@@ -36,7 +36,9 @@
 //! dissolves in, which leaves it standing too ([`crate::shadow::Kept`]). So
 //! the card is on the screen as it is from the key to the session it names,
 //! and takes no part in either fade. It is no overlay: the session it goes to
-//! draws it itself.
+//! draws it itself — timed from when it went up on the screen the switch
+//! left, so that a row of names on the move goes on from where it had come
+//! to there ([`crate::card::Card::up_ms`]).
 //!
 //! # The screen the shell comes back to
 //!
@@ -48,6 +50,8 @@
 //! frame, in the same synchronized write as its switch to the alternate
 //! screen; the attaching screen, before its spinner; and every path that ends
 //! an attach before it begins.
+
+use std::time::Instant;
 
 use unicode_width::UnicodeWidthStr;
 
@@ -82,10 +86,13 @@ enum Left {
     /// and its fade out left it standing (see [`crate::shadow::Kept`]): the
     /// bytes that draw it, and the cells they draw on, each span a row, its
     /// first column and its last. The session it lands in draws the card
-    /// again where it stands, and stands it through its fade in.
+    /// again where it stands, and stands it through its fade in; and `since`
+    /// is when it went up, which that session times it from. Slices, not
+    /// vectors, which keeps a hand-off as small as one that carries a name.
     Card {
-        drawn: Vec<u8>,
-        spans: Vec<(u16, u16, u16)>,
+        drawn: Box<[u8]>,
+        spans: Box<[(u16, u16, u16)]>,
+        since: Instant,
     },
 }
 
@@ -104,16 +111,27 @@ impl HandOff {
         })
     }
 
-    /// The card a switch lands with, as `drawn` draws it on the cells of
-    /// `spans` (see [`crate::shadow::Shadow::kept_bytes`]). `None` when there
-    /// is nothing to draw.
-    pub fn card(drawn: Vec<u8>, spans: &[(u16, u16, u16)]) -> Option<Self> {
+    /// The card a switch lands with, up since `since`, as `drawn` draws it on
+    /// the cells of `spans` (see [`crate::shadow::Shadow::kept_bytes`]).
+    /// `None` when there is nothing to draw.
+    pub fn card(drawn: Vec<u8>, spans: &[(u16, u16, u16)], since: Instant) -> Option<Self> {
         (!drawn.is_empty() && !spans.is_empty()).then(|| Self {
             left: Left::Card {
-                drawn,
-                spans: spans.to_vec(),
+                drawn: drawn.into(),
+                spans: spans.into(),
+                since,
             },
         })
+    }
+
+    /// For a switch's card, when it went up on the screen the switch left:
+    /// what the session it lands in times it from (see
+    /// [`crate::card::Card::up_ms`]). Nothing for a name.
+    pub fn up_since(&self) -> Option<Instant> {
+        match &self.left {
+            Left::Card { since, .. } => Some(*since),
+            Left::Name { .. } => None,
+        }
     }
 
     /// Whether config allows the hand-off and the terminal can show it: the
@@ -179,7 +197,7 @@ impl HandOff {
                 col,
                 ink,
             } => at_cell(*row, *col, text, *ink),
-            Left::Card { drawn, .. } => drawn.clone(),
+            Left::Card { drawn, .. } => drawn.to_vec(),
         }
     }
 
@@ -192,7 +210,7 @@ impl HandOff {
             }
             Left::Card { spans, .. } => {
                 let mut out = format!("\x1b7{}", crate::announce::pen(None));
-                for &(row, from, to) in spans {
+                for &(row, from, to) in spans.iter() {
                     out.push_str(&format!(
                         "\x1b[{};{}H{}",
                         u32::from(row) + 1,
@@ -299,8 +317,14 @@ mod tests {
     #[test]
     fn a_card_is_drawn_as_it_was_and_taken_down_cell_for_cell() {
         let drawn = b"\x1b7\x1b[2;90H\x1b[0;1;38;2;1;2;3mblog\x1b8".to_vec();
-        let h = HandOff::card(drawn.clone(), &[(1, 85, 96), (2, 90, 96)]).expect("a card");
+        let up = Instant::now();
+        let h = HandOff::card(drawn.clone(), &[(1, 85, 96), (2, 90, 96)], up).expect("a card");
         assert_eq!(h.show(), drawn);
+        assert_eq!(
+            h.up_since(),
+            Some(up),
+            "up since it went up on the screen left"
+        );
         assert_eq!(
             String::from_utf8(h.erase()).unwrap(),
             format!(
@@ -311,10 +335,10 @@ mod tests {
         );
         assert_eq!(h.over(24, 100), None);
         assert!(
-            HandOff::card(Vec::new(), &[(1, 1, 2)]).is_none(),
+            HandOff::card(Vec::new(), &[(1, 1, 2)], up).is_none(),
             "nothing drawn"
         );
-        assert!(HandOff::card(drawn, &[]).is_none(), "nowhere");
+        assert!(HandOff::card(drawn, &[], up).is_none(), "nowhere");
     }
 
     /// As an overlay, the name is one row of exactly its width; on a screen
