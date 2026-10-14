@@ -56,6 +56,10 @@ hand Neovim your terminal outright — rather than an imitation of one.
 drawn by Neovim's own client (`[client] ui = "nvim"`), which is `nvim
 --remote-ui`.
 
+The terminal's clipboard wants 0.12 on the session's end: a yank to `+`
+reaches your terminal as OSC 52 through `nvim_ui_send`, which 0.12 brought.
+0.11 writes it to the session's own output, which is its log.
+
 ### Building
 
 ```sh

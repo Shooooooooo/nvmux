@@ -1444,7 +1444,12 @@ impl Attachment {
     /// asked the terminal questions nothing has heard yet — its keyboard
     /// protocol, its synchronized updates, its in-band sizes, the background
     /// — and takes their answers whenever they come: measured on 0.12.5, five
-    /// seconds late exactly as at once. So what it writes is kept whole, in
+    /// seconds late exactly as at once. 0.11 takes them as well, but what it
+    /// writes back for one that comes after its server has drawn — the
+    /// keyboard protocol turned on — goes out only with the next thing the
+    /// server draws (measured on 0.11.6): the user's first key, at the
+    /// latest, and until then keys come spelled the old way, which the
+    /// client and the prefix both read. So what it writes is kept whole, in
     /// [`Attachment::unshown`], and its first relay sends all of it before
     /// anything else it says (see [`pump`]): the terminal hears the client's
     /// startup as the client wrote it, later, and answers it then. Nothing

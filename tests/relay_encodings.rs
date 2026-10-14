@@ -362,6 +362,42 @@ impl Terminal {
         }
     }
 
+    /// [`Terminal::pump_until`], for what the client writes once the terminal
+    /// has answered its startup questions — its keyboard protocol turned on —
+    /// asking the server behind `sock` to redraw every so often once they are
+    /// on the terminal and `done` does not yet hold.
+    ///
+    /// Neovim 0.12's client writes what it makes of an answer when the answer
+    /// comes. 0.11's decides then too, but writes it only with its next
+    /// flush, which is the server's next redraw: measured on 0.11.6, an answer
+    /// that comes after the server has drawn gets nothing written for it at
+    /// all until the server draws again, which for a user is their first key.
+    /// The answers here come that late wherever nvmux holds the questions back
+    /// — the fade's held first paint, a client started ahead until its first
+    /// visit — and may even where it does not, on a busy machine. The redraws
+    /// stand in for the key, and cost a 0.12 client nothing.
+    fn pump_until_nudging(
+        &mut self,
+        sock: &Path,
+        within: Duration,
+        done: impl Fn(&[u8]) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if self.pump_until(left.min(Duration::from_millis(250)), &done) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            if find(&self.output, DA1).is_some() {
+                let _ = nvmux::rpc::Client::connect(sock, Duration::from_secs(1))
+                    .and_then(|mut c| c.command("redraw!"));
+            }
+        }
+    }
+
     /// Answer every query in the output not yet answered. A query may straddle
     /// two reads, so the scan restarts a little before where it left off and
     /// counts only matches that end past it.
@@ -478,10 +514,10 @@ fn detaches_with(tag: &str, protocol: Protocol, prefix: &[u8]) {
     // protocol on, and it only does that after our replies reach it —
     // through nvmux, in both directions.
     let pushed = match protocol {
-        Protocol::Kitty => term.pump_until(Duration::from_secs(15), |out| {
+        Protocol::Kitty => term.pump_until_nudging(&sock, Duration::from_secs(15), |out| {
             kitty_push_flags(out).is_some_and(|flags| flags & 1 != 0)
         }),
-        Protocol::Xterm => term.pump_until(Duration::from_secs(15), |out| {
+        Protocol::Xterm => term.pump_until_nudging(&sock, Duration::from_secs(15), |out| {
             find(out, XTERM_PUSH).is_some()
         }),
     };
@@ -598,7 +634,7 @@ fn the_hint_row_goes_up_and_comes_down(tag: &str, shadow: bool) {
 
     // The client is up and painting once it has turned the protocol on.
     assert!(
-        term.pump_until(Duration::from_secs(15), |out| {
+        term.pump_until_nudging(&sock, Duration::from_secs(15), |out| {
             kitty_push_flags(out).is_some()
         }),
         "the client never started; got: {}",
@@ -938,7 +974,7 @@ fn a_client_started_ahead_negotiates_on_its_first_visit(tag: &str, fade: bool) {
 
     // The visit: its questions asked, answered, and acted on.
     assert!(
-        term.pump_until(Duration::from_secs(15), |out| {
+        term.pump_until_nudging(&sock, Duration::from_secs(15), |out| {
             kitty_push_flags(out).is_some_and(|flags| flags & 1 != 0)
         }),
         "the client never turned the kitty protocol on; got: {}",

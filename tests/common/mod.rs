@@ -84,6 +84,30 @@ macro_rules! require_nvim {
     };
 }
 
+/// Whether the local `nvim` is usable and at least `major.minor`.
+pub fn nvim_at_least(major: u64, minor: u64) -> bool {
+    nvmux::nvim::check_local().is_ok_and(|v| (v.major, v.minor) >= (major, minor))
+}
+
+/// [`require_nvim!`], and then skip the test where the local `nvim` is older
+/// than `major.minor`, saying `why`: for a test of something only a newer
+/// Neovim does. Skipped whatever `$NVMUX_TEST_REQUIRE` says, because an older
+/// Neovim that nvmux supports not doing it is not a failure: CI runs the
+/// oldest as well as the newest, and this is how the oldest says so.
+#[macro_export]
+macro_rules! require_nvim_at_least {
+    ($major:literal, $minor:literal, $why:expr) => {
+        $crate::require_nvim!();
+        if !$crate::common::nvim_at_least($major, $minor) {
+            eprintln!(
+                "skipping: needs Neovim {}.{}, because {}",
+                $major, $minor, $why
+            );
+            return;
+        }
+    };
+}
+
 /// A scratch runtime directory, removed when the guard drops. Each test gets
 /// its own, so tests run in parallel without racing and never touch the
 /// user's real `/tmp/nvmux-<uid>`.

@@ -525,9 +525,18 @@ fn a_float_there_before_the_client_is_drawn_where_neovim_puts_it() {
 /// OSC 52 clipboard on only for a terminal it has asked whether it takes it,
 /// and asks only through a UI that says it is on a tty, as the client does;
 /// what it then writes to the terminal reaches it the same way.
+///
+/// From Neovim 0.12, which is what brought that way: `nvim_ui_send`. 0.11
+/// asks on the server's own stdout and copies to its own stderr, which for a
+/// session — a server nvmux started headless — are no terminal at all: no
+/// client attached to one sees either, this one or Neovim's own.
 #[test]
 fn a_yank_reaches_the_terminals_clipboard() {
-    require_nvim!();
+    require_nvim_at_least!(
+        0,
+        12,
+        "Neovim reaches a remote UI's terminal only from 0.12, with nvim_ui_send"
+    );
     let scratch = Scratch::new("client-osc52");
     let (sock, mut rpc, config) = session(&scratch, "client-osc52");
     rpc.command("setlocal noswapfile | call setline(1, 'to the clipboard')")
