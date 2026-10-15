@@ -72,18 +72,12 @@ impl Terminal {
 
     /// [`Terminal::spawn`], on a terminal that answers DA1 with `da1`.
     fn spawn_answering(sock: &Path, config: &Path, da1: &'static [u8]) -> Self {
-        Self::spawn_sized(sock, config, da1, (COLS, ROWS), &[])
+        Self::spawn_sized(sock, config, da1, (COLS, ROWS))
     }
 
-    /// [`Terminal::spawn_answering`], on a terminal `size` big — columns,
-    /// rows — and with `env` set for the client as well.
-    fn spawn_sized(
-        sock: &Path,
-        config: &Path,
-        da1: &'static [u8],
-        size: (u16, u16),
-        env: &[(&str, &str)],
-    ) -> Self {
+    /// [`Terminal::spawn_answering`], on a terminal `size` big: columns,
+    /// rows.
+    fn spawn_sized(sock: &Path, config: &Path, da1: &'static [u8], size: (u16, u16)) -> Self {
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize {
                 rows: size.1,
@@ -100,10 +94,6 @@ impl Terminal {
         // The colours a parent nvmux would hand down: none, so the client
         // falls back on its own, whatever the environment running the tests.
         cmd.env_remove(nvmux::client::PALETTE_ENV);
-        cmd.env_remove(nvmux::client::CENTRE_ENV);
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
         let child = pair.slave.spawn_command(cmd).expect("spawn the client");
         // Or the master would never see EOF once the child exits.
         drop(pair.slave);
@@ -1411,30 +1401,32 @@ fn predicted_rows_wear_the_colours_neovim_gives_them() {
     step(&mut term, "<C-b> back over it", b"\x02");
 }
 
-/// A config for a wide terminal: every window's text up to 60 columns, used
-/// as nvmux says to the client. A session in one window, its status line its
+/// A config for a wide terminal: every window's text up to 60 columns, and
+/// centred as `centre` says. A session in one window, its status line its
 /// own colour, and a terminal 160 columns wide.
 fn wide(
     scratch: &Scratch,
     tag: &str,
     centre: &str,
-) -> (Terminal, nvmux::rpc::Client<std::os::unix::net::UnixStream>) {
+) -> (
+    Terminal,
+    nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    PathBuf,
+) {
     let (sock, mut rpc, config) = session(scratch, tag);
-    std::fs::write(&config, "[client]\nwindow_width = 60\n").expect("write the config");
+    std::fs::write(
+        &config,
+        format!("[client]\ncentre = \"{centre}\"\nwindow_width = 60\n"),
+    )
+    .expect("write the config");
     rpc.command(
         "setlocal noswapfile | set laststatus=2 termguicolors \
          | hi StatusLine guibg=#123456 | hi StatusLineNC guibg=#123456 \
          | call setline(1, ['the left window'])",
     )
     .expect("set the session up");
-    let term = Terminal::spawn_sized(
-        &sock,
-        &config,
-        DA1_REPLY,
-        (160, 12),
-        &[(nvmux::client::CENTRE_ENV, centre)],
-    );
-    (term, rpc)
+    let term = Terminal::spawn_sized(&sock, &config, DA1_REPLY, (160, 12));
+    (term, rpc, sock)
 }
 
 /// What the editor says of itself: `'columns'`, and each window's width.
@@ -1458,7 +1450,7 @@ fn columns(n: i64, wins: &[i64]) -> Value {
 fn a_wide_terminal_has_the_editor_centred_as_wide_as_its_windows_want() {
     require_nvim!();
     let scratch = Scratch::new("client-centre");
-    let (mut term, mut rpc) = wide(&scratch, "client-centre", "editor");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-centre", "editor");
     let at = |n: usize| format!("{}the left window", " ".repeat(n));
     assert!(
         term.pump_until(Duration::from_secs(15), |s| s.starts_with(&at(50))),
@@ -1509,7 +1501,7 @@ fn a_wide_terminal_has_the_editor_centred_as_wide_as_its_windows_want() {
 fn a_wide_window_has_its_text_centred_in_it() {
     require_nvim!();
     let scratch = Scratch::new("client-centre-windows");
-    let (mut term, mut rpc) = wide(&scratch, "client-centre-windows", "windows");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-centre-windows", "windows");
     // One window, the whole terminal wide, its text in the middle.
     let alone = format!("{}the left window", " ".repeat(50));
     assert!(
@@ -1576,49 +1568,75 @@ fn a_wide_window_has_its_text_centred_in_it() {
     );
 }
 
-/// Told another way, the client goes over to it at once: the editor's width,
-/// and the windows', follow.
+/// What a client centring each window's text leaves the next to attach: the
+/// windows' grids, given their width back as it went, and holding what was
+/// drawn on them narrower unless Neovim drew them again before the client
+/// was gone. Of a grid it kept, Neovim sends the next client only the cells
+/// that differ from what it holds: none, or those of a line that wrapped
+/// narrower and what that moved. A client centring nothing draws every
+/// window whole all the same.
 #[test]
-fn the_client_is_told_another_way() {
+fn the_next_client_draws_whole_what_a_centring_one_left() {
     require_nvim!();
-    let scratch = Scratch::new("client-centre-told");
-    let (mut term, mut rpc) = wide(&scratch, "client-centre-told", "editor");
-    rpc.command("vsplit").expect("vsplit");
+    let scratch = Scratch::new("client-centre-left");
+    let (mut term, mut rpc, sock) = wide(&scratch, "client-centre-left", "windows");
+    // Split once it is drawn: split before the client attaches, the split is
+    // laid out for Neovim's own width, and the client's widens the right.
     assert!(
-        term.pump_until(Duration::from_secs(15), |s| s
-            .starts_with(&format!("{}the left window", " ".repeat(19)))),
-        "never drawn centred:\n{}",
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
         term.text()
     );
-    let tell = |term: &mut Terminal, centre| {
-        term.type_bytes(&nvmux::card::encode(&nvmux::card::Command::Centre {
-            centre,
-        }));
+    rpc.command(
+        "set filetype=rust number | syntax on \
+         | call setline(1, ['fn clean() {', \
+             '    // A thousand at a time, so a backlog never locks the table.', \
+             '    let mut deleted = 0;', '    loop {', '        deleted += 1;', \
+             '    }', '}']) \
+         | vsplit",
+    )
+    .expect("set the session up");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s
+            .matches("let mut deleted")
+            .count()
+            == 2),
+        "never drawn:\n{}",
+        term.text()
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            let w = widths(&mut rpc);
+            w.as_array()
+                .and_then(|a| a.get(1))
+                .and_then(Value::as_array)
+                .is_some_and(|ws| ws.iter().all(|w| w.as_i64().unwrap_or(0) > 60))
+        }),
+        "the windows were not given their width back: {}",
+        widths(&mut rpc)
+    );
+
+    let config = scratch.0.join("config.toml");
+    std::fs::write(&config, "[client]\ncentre = \"off\"\n").expect("write the config");
+    let mut term = Terminal::spawn_sized(&sock, &config, DA1_REPLY, (160, 12));
+    let whole = |s: &str| {
+        let lines: Vec<&str> = s.lines().collect();
+        [
+            "fn clean() {",
+            "so a backlog never locks the table.",
+            "let mut deleted = 0;",
+            "loop {",
+            "deleted += 1;",
+        ]
+        .iter()
+        .enumerate()
+        .all(|(row, text)| lines.get(row).is_some_and(|l| l.matches(text).count() == 2))
     };
-    for (centre, want) in [
-        (nvmux::config::Centre::Windows, columns(160, &[60, 60])),
-        (nvmux::config::Centre::Off, columns(160, &[80, 79])),
-        (nvmux::config::Centre::Editor, columns(121, &[60, 60])),
-    ] {
-        tell(&mut term, centre);
-        assert!(
-            common::wait_until(Duration::from_secs(5), || {
-                term.pump_until(Duration::from_millis(20), |_| false);
-                widths(&mut rpc) == want
-            }),
-            "told {centre:?}: {}\n{}",
-            widths(&mut rpc),
-            term.text()
-        );
-    }
-    assert_eq!(
-        rpc.eval("[getline(1, '$'), mode()]")
-            .expect("ask the editor"),
-        Value::Array(vec![
-            Value::Array(vec![Value::from("the left window")]),
-            Value::from("n")
-        ]),
-        "what it was told reached the editor as keys"
+    assert!(
+        term.pump_until(Duration::from_secs(15), whole),
+        "not every window drawn whole:\n{}",
+        term.text()
     );
     assert_eq!(term.hang_up(), Some(0), "the client's exit");
 }

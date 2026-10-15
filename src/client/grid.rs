@@ -127,6 +127,14 @@ impl Grid {
         self.written = true;
     }
 
+    /// Every cell blank, and nothing drawn: what Neovim sends of a grid it
+    /// kept from another UI is only the cells that changed since that UI saw
+    /// them, which is not the grid (see `super::App`).
+    pub fn forget(&mut self) {
+        self.cells.fill(Cell::default());
+        self.written = false;
+    }
+
     /// Row `r`, or nothing past the last.
     pub fn row(&self, r: usize) -> &[Cell] {
         if r >= self.height {

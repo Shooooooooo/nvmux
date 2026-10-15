@@ -3,13 +3,16 @@
 
     python3 tools/screenshot-wide.py        # writes assets/wide-*.png
 
-One session, on a terminal wider than its two windows need, shot three
-times with `<prefix> w` pressed between the shots -- the way a user goes from
-one `[client] centre` to the next: "editor", the default, then "windows",
-then "off". Each shot is drawn by agg from what nvmux had written up to that
-moment, and set in the demo's window. The README says which is which: a
-label in the picture would be too small to read at the width a page shows
-it.
+One session, on a terminal wider than its two windows need, shot once for
+each `[client] centre`: nvmux is run three times at a prompt, each with a
+config of its own, and attaches to the session each time -- "off", the
+default, then "windows", then "editor". In that order because the last is
+the one that lays the windows out again for the width it attaches at: an
+editor narrower than the terminal when it was last attached to would leave
+the other two its windows as they were. Each shot is drawn by agg from what
+nvmux had written up to that moment, and set in the demo's window. The
+README says which is which: a label in the picture would be too small to
+read at the width a page shows it.
 
 **The sizes are smaller than a monitor that wants this.** At 120 columns a
 window, the default `window_width`, two windows side by side and a margin
@@ -34,6 +37,7 @@ start beside a session that is already there, and is killed on the way out.
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -56,16 +60,16 @@ WIDTH = 50
 
 NAME = "api-server"
 
-# The shots, in the order `<prefix> w` goes through them from the default,
-# each with what the editor then says of itself (see `widths`): `'columns'`,
-# what each window's text is given, and each window's own width. Sharing the
-# whole terminal, the left window is half of it and the right one short of
-# that, for the separator between them.
+# The shots, in the order they are taken (see the header), each with what
+# the editor then says of itself (see `widths`): `'columns'`, what each
+# window's text is given, and each window's own width. Sharing the whole
+# terminal, the left window is half of it and the right one short of that,
+# for the separator between them.
 LEFT, RIGHT = COLS // 2, COLS - 1 - COLS // 2
 SHOTS = [
-    ("editor", [2 * WIDTH + 1, [WIDTH, WIDTH], [WIDTH, WIDTH]]),
-    ("windows", [COLS, [WIDTH, WIDTH], [LEFT, RIGHT]]),
     ("off", [COLS, [LEFT, RIGHT], [LEFT, RIGHT]]),
+    ("windows", [COLS, [WIDTH, WIDTH], [LEFT, RIGHT]]),
+    ("editor", [2 * WIDTH + 1, [WIDTH, WIDTH], [WIDTH, WIDTH]]),
 ]
 
 # The project's, in the demo's api-server: some code, and the page of prose
@@ -124,13 +128,17 @@ vim.api.nvim_create_autocmd('FileType', {
 
 # Off camera, in the session: the two files side by side, the code in front
 # and scrolled to `clean`, and the message line cleared of what opening them
-# said.
+# said. Made the same width from the code's window, as nvmux's client makes
+# them when it centres the editor: `wincmd =` gives the odd column to the
+# window in front, which a split leaves on the right, so the windows are laid
+# out alike whichever way is shot first.
 SETUP = r"""
 vim.cmd.cd(%s)
 vim.cmd('silent edit src/sessions.rs')
 vim.cmd('silent vsplit docs/sessions.md')
 vim.wo.cursorline = false
 vim.cmd.wincmd('h')
+vim.cmd.wincmd('=')
 vim.fn.winrestview({ topline = 8, lnum = 14, col = 8 })
 vim.cmd.echo('""')
 """
@@ -151,7 +159,9 @@ def widths(sock):
 
 def settle(term, want, sock, what, quiet=0.8, limit=10.0):
     """Wait for the editor to say `want`, and then for nvmux to have drawn
-    nothing for `quiet` seconds -- whatever moved on the way, stopped. The
+    nothing for `quiet` seconds with the session's name nowhere on the screen
+    -- whatever moved on the way stopped, and the row of names an attach
+    lands with, in the top right corner over whatever is under it, gone. The
     moment of the shot, on the recording's clock."""
     end = time.time() + limit
     while widths(sock) != want:
@@ -164,7 +174,7 @@ def settle(term, want, sock, what, quiet=0.8, limit=10.0):
         with term.lock:
             last = term.events[-1][0] if term.events else 0.0
         now = time.time() - term.t0
-        if now - last >= quiet:
+        if now - last >= quiet and NAME not in term.text():
             return now
         if time.time() > end:
             term.close()
@@ -189,39 +199,42 @@ def kill(since):
     print("note: could not kill %s; `x` in nvmux's picker will" % NAME)
 
 
-def shoot(env, project):
-    """The take: nvmux at a prompt, a session made, the shots. Returns the
-    recording and the moment of each shot."""
+def shoot(env, project, configs):
+    """The take: nvmux run at a prompt once a shot, with that shot's config
+    (see the header) -- the first making the session, the others attaching
+    to it. Returns the recording and the moment of each shot."""
     term = demo.Terminal(["bash", "--norc", "--noprofile"], env,
                          record=True, size=(COLS, ROWS))
     time.sleep(1.0)
     term.type("export PS1='$ '; clear\n", wait=1.0)
     term.start_recording()
-    term.type("nvmux\n")
-    term.expect("press c", "the picker")
-    term.write(b"c", wait=1.0)
-    term.expect("new session name", "the create prompt")
-    term.type(NAME, wait=0.3)
-    term.write(demo.ENTER)
-    term.expect("[No Name]", "the session to paint", timeout=20)
-    # The row of names the attach landed with, in the top right corner, over
-    # whatever is under it until it goes a moment later: the shots are of the
-    # editor, so they wait for it.
-    term.expect(NAME, "the row of names the attach landed with")
-    term.expect_gone(NAME, "the row of names the attach landed with")
-    demo.rpc(env, NAME, SETUP % json.dumps(project))
-    sock = demo.socket_of(NAME)
 
-    moments = []
-    for i, (centre, want) in enumerate(SHOTS):
-        if i:
-            # One write, so the chord fits keys.timeout_ms.
-            term.write(demo.PREFIX + b"w")
+    moments, sock = [], None
+    for centre, want in SHOTS:
+        term.type("NVMUX_CONFIG=%s nvmux\n" % shlex.quote(configs[centre]))
+        if sock is None:
+            term.expect("press c", "the picker")
+            term.write(b"c", wait=1.0)
+            term.expect("new session name", "the create prompt")
+            term.type(NAME, wait=0.3)
+            term.write(demo.ENTER)
+            term.expect("[No Name]", "the session to paint", timeout=20)
+            demo.rpc(env, NAME, SETUP % json.dumps(project))
+            sock = demo.socket_of(NAME)
+        else:
+            term.expect(NAME, "the picker")
+            term.write(demo.ENTER)
+            term.expect("sessions.rs", "the session to paint", timeout=20)
         moments.append(settle(term, want, sock, 'centre = "%s"' % centre))
+        # One write, so the chord fits keys.timeout_ms; and back at the
+        # prompt, the editor gone with the screen nvmux drew it on, before
+        # the next run is typed.
+        term.write(demo.PREFIX + b"d")
+        term.expect_gone("sessions.rs", "the detach")
+        time.sleep(0.5)
     with term.lock:
         term.record = False
         events = list(term.events)
-    term.write(demo.PREFIX + b"d", wait=1.0)
     term.close()
     return events, moments
 
@@ -286,27 +299,29 @@ def main():
     init = os.path.join(tmp, "init.lua")
     with open(init, "w") as f:
         f.write(demo.editor(tmp) + EDITOR)
-    cfg = os.path.join(tmp, "config.toml")
-    with open(cfg, "w") as f:
-        f.write('[keys]\nprefix = "Ctrl-Space"\n\n'
-                '[session]\ncommand = "nvim --headless -u %s -i NONE -n '
-                '--listen {sock}"\n\n'
-                '[client]\nwindow_width = %d\n' % (init, WIDTH))
+    configs = {}
+    for centre, _ in SHOTS:
+        configs[centre] = os.path.join(tmp, "%s.toml" % centre)
+        with open(configs[centre], "w") as f:
+            f.write('[keys]\nprefix = "Ctrl-Space"\n\n'
+                    '[session]\ncommand = "nvim --headless -u %s -i NONE -n '
+                    '--listen {sock}"\n\n'
+                    '[client]\ncentre = "%s"\nwindow_width = %d\n'
+                    % (init, centre, WIDTH))
 
     env = os.environ.copy()
     env["PATH"] = os.pathsep.join([os.path.dirname(demo.NVMUX), env["PATH"]])
-    env["NVMUX_CONFIG"] = cfg
     for kind in ("config", "data", "state", "cache"):
         env["XDG_%s_HOME" % kind.upper()] = os.path.join(tmp, "xdg", kind)
     env["TERM"] = "xterm-256color"
     env["COLORTERM"] = "truecolor"
-    for name in ("NVMUX", "NO_COLOR", "NVMUX_CENTRE"):
+    for name in ("NVMUX", "NO_COLOR", "NVMUX_CONFIG"):
         env.pop(name, None)
 
     since = int(time.time())
     try:
         print("shooting...")
-        events, moments = shoot(env, project)
+        events, moments = shoot(env, project, configs)
         print("rendering...")
         render(events, moments, font_dir, os.path.join(tmp, "render"))
     finally:

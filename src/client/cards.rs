@@ -525,8 +525,6 @@ impl Cards {
                 let was = std::mem::replace(&mut self.held, held);
                 was != held && self.keyed().is_some()
             }
-            // The client's, not the cards': see `super::App::inputs`.
-            Command::Centre { .. } => false,
         }
     }
 

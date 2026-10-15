@@ -1108,17 +1108,6 @@ impl Attachment {
         true
     }
 
-    /// `<prefix> w`: a wide terminal used the next way, from now on, and this
-    /// client told so — one that draws cards being nvmux's own, the one that
-    /// can be told (see [`crate::centre`]).
-    fn centre_next(&mut self) {
-        let centre = crate::centre::cycle();
-        tracing::info!(centre = centre.name(), "a wide terminal used another way");
-        if self.draws_cards {
-            self.tell_client(&card::Command::Centre { centre });
-        }
-    }
-
     /// Tell the client to do `cmd`, in its input: one write, as
     /// [`Attachment::report_size_in_band`] makes one, for the same reason —
     /// a sequence in pieces would be read as keys. Best effort: a client whose
@@ -1166,14 +1155,6 @@ impl Attachment {
             shadow::Kept::arrival(card, size.cols, size.rows)
         });
         self.opening = desk.open(arrival);
-        // First of all, how a wide terminal is used as it stands: a client
-        // kept while it changed comes back to it (see `crate::centre`).
-        self.opening.insert(
-            0,
-            card::Command::Centre {
-                centre: crate::centre::current(),
-            },
-        );
         self.landed_since = self.hand_off.as_ref().and_then(HandOff::up_since);
         self.desk = Some(desk);
         landed
@@ -2485,8 +2466,6 @@ fn own_client(exe: &Path, sock: &Path) -> CommandBuilder {
     if let Some(palette) = crate::palette::get() {
         cmd.env(crate::client::PALETTE_ENV, palette.to_env());
     }
-    // As it stands, which `<prefix> w` may have changed from the config's.
-    cmd.env(crate::client::CENTRE_ENV, crate::centre::current().name());
     in_place(cmd)
 }
 
@@ -3701,9 +3680,8 @@ fn act(writer: &mut dyn Write, step: Step) -> Result<Option<Outcome>> {
         Step::Act(Action::Help) => Some(Outcome::ShowHelp),
         Step::Act(Action::Switch(num)) => Some(Outcome::Switch(Target::Number(num))),
         Step::Act(Action::Cycle(dir)) => Some(Outcome::Switch(Target::Step(dir))),
-        // The relay's, which knows the cards up and the client: see
-        // `take_step`.
-        Step::Act(Action::Go | Action::Centre) => None,
+        // The relay's, which knows the cards up: see `take_step`.
+        Step::Act(Action::Go) => None,
     })
 }
 
@@ -3715,10 +3693,6 @@ fn take_step(attachment: &mut Attachment, mut step: Step) -> Result<Option<Outco
     attachment.saw_input(&mut step);
     if step == Step::Act(Action::Go) {
         return Ok(attachment.go(Instant::now()));
-    }
-    if step == Step::Act(Action::Centre) {
-        attachment.centre_next();
-        return Ok(None);
     }
     if let (Step::Forward(bytes), Some(desk)) = (&step, attachment.desk.as_mut()) {
         desk.forwarded.saw(bytes, Instant::now());

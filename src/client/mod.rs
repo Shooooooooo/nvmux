@@ -63,14 +63,15 @@
 //! A UI attaching with `ext_multigrid` to a session another UI has drawn is
 //! sent no window at all, besides: no placement, and nothing drawn on its
 //! grid. Neovim keeps a window's grid from one UI to the next and sends its
-//! cells only when they change, and nothing has. So the client asks where
-//! every window it is told of is ([`LAYOUT_LUA`]), and has Neovim draw the
-//! windows afresh by having it put them on grid 1 and back: a second
-//! connection attaches a UI without `ext_multigrid` for as long as Neovim
-//! takes to draw for it, and goes ([`refresh`]). The windows of a tab page
-//! the client has not seen are the same, the first time it is shown. Drawing
-//! waits for both, for up to [`HOLD_LIMIT`], so that what the terminal shows is
-//! the editor whole.
+//! cells only when they change, and nothing has — or a few have, which the
+//! client forgets: a window it is not told where to put is one it has none
+//! of until it has all of it. So the client asks where every window it is
+//! told of is ([`LAYOUT_LUA`]), and has Neovim draw the windows afresh by
+//! having it put them on grid 1 and back: a second connection attaches a UI
+//! without `ext_multigrid` for as long as Neovim takes to draw for it, and
+//! goes ([`refresh`]). The windows of a tab page the client has not seen are
+//! the same, the first time it is shown. Drawing waits for both, for up to
+//! [`HOLD_LIMIT`], so that what the terminal shows is the editor whole.
 //!
 //! Two things the windows' animations need are not in what Neovim draws for a
 //! UI at all: which buffer a window shows — a window switching buffers fades
@@ -151,11 +152,6 @@ fn options(v: &[ValueRef<'_>]) -> anim::layout::Options {
 /// in (see [`crate::palette::Palette::to_env`]): the client is on a pty and
 /// cannot ask the terminal itself without the answers racing the user's keys.
 pub const PALETTE_ENV: &str = "NVMUX_PALETTE";
-
-/// The environment variable a parent nvmux hands down what to do with a
-/// terminal wider than the windows need, as it stands — `<prefix> w` may
-/// have changed it from what the config says (see [`wide`]).
-pub const CENTRE_ENV: &str = "NVMUX_CENTRE";
 
 /// The least time between two frames drawn for Neovim's flushes: a burst of
 /// them — a `:terminal` running something — is drawn at most this often, the
@@ -995,8 +991,8 @@ pub struct App {
     /// The cards nvmux has said to show, drawn over every frame: see
     /// [`cards`].
     cards: cards::Cards,
-    /// What to do with a terminal wider than the windows need, as nvmux last
-    /// said: see [`wide`].
+    /// What to do with a terminal wider than the windows need, as
+    /// `[client] centre` says: see [`wide`].
     centre: Centre,
     /// `[client] window_width`: the most columns a window's text gets with
     /// the editor or the windows' text centred; 0 for no limit.
@@ -1195,15 +1191,14 @@ impl App {
         }
         match self.attach_after_measure.take() {
             Some(multigrid) => self.attach_as(multigrid),
-            None => self.fit(true),
+            None => self.fit(),
         }
     }
 
     /// Tell Neovim the editor's size again, where it has changed — the
-    /// windows want more or less of a centred editor, or the terminal is
-    /// used another way — and with `equalise`, have it make the windows the
-    /// same width again, as it does on a split (see [`wide`]).
-    fn fit(&mut self, equalise: bool) {
+    /// windows want more or less of a centred editor — and have it make the
+    /// windows the same width again, as it does on a split (see [`wide`]).
+    fn fit(&mut self) {
         if !matches!(self.attach, Attach::Attached { .. }) {
             return;
         }
@@ -1216,28 +1211,10 @@ impl App {
             "nvim_ui_try_resize",
             &[Arg::Int(w as i64), Arg::Int(h as i64)],
         );
-        if equalise {
-            self.outbox.notify(
-                "nvim_exec_lua",
-                &[Arg::str(wide::EQUALISE_LUA), Arg::Array(Vec::new())],
-            );
-        }
-        self.screen.invalidate();
-        self.dirty = true;
-    }
-
-    /// nvmux says to use a wide terminal another way (see [`wide`]).
-    fn set_centre(&mut self, centre: Centre) {
-        if centre == self.centre {
-            return;
-        }
-        tracing::info!(
-            centre = centre.name(),
-            "client: a wide terminal used another way"
+        self.outbox.notify(
+            "nvim_exec_lua",
+            &[Arg::str(wide::EQUALISE_LUA), Arg::Array(Vec::new())],
         );
-        self.centre = centre;
-        self.fit(true);
-        self.narrow_windows();
         self.screen.invalidate();
         self.dirty = true;
     }
@@ -1866,6 +1843,7 @@ impl App {
     /// nothing drawn on them, which a refresh is for, and windows nowhere,
     /// which a layout is asked for. See the module docs.
     fn inspect(&mut self, now: Instant) {
+        self.model.forget_kept();
         self.lacking = self.model.lacking();
         let lacking = &self.lacking;
         self.refreshed.retain(|grid, _| lacking.contains(grid));
@@ -1981,7 +1959,6 @@ impl App {
                 Input::Focus(on) => self.outbox.notify("nvim_ui_set_focus", &[Arg::Bool(on)]),
                 Input::Reply(reply) => self.reply(reply),
                 Input::Card(body) => match crate::card::decode(&body) {
-                    Some(crate::card::Command::Centre { centre }) => self.set_centre(centre),
                     Some(cmd) => {
                         if self.cards.apply(cmd, now) {
                             self.dirty = true;
@@ -2811,12 +2788,10 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
     let winch = crate::winch::Winch::install()?;
     crate::term::write_stdout(term::OPENING)?;
 
-    let centre = std::env::var(CENTRE_ENV)
-        .ok()
-        .and_then(|c| Centre::parse(&c))
-        .unwrap_or(settings.client.centre);
-    let mut app = App::new(term, effects, settings.client.predict, term::size())
-        .with_centre(centre, usize::from(settings.client.window_width));
+    let mut app = App::new(term, effects, settings.client.predict, term::size()).with_centre(
+        settings.client.centre,
+        usize::from(settings.client.window_width),
+    );
     app.start();
     let mut inbox = Inbox::default();
     let stdin = std::io::stdin();
@@ -3372,6 +3347,39 @@ mod tests {
         let mut a = app(false);
         a.start();
         assert_eq!(attached_with_multigrid(&calls(&mut a)), Some(false));
+    }
+
+    /// Attached to a session another UI drew, a window placed nowhere with a
+    /// few cells on it — those that changed since that UI saw it — is as
+    /// good as one with nothing: it is refreshed, and the screen waits for
+    /// it, with none of those cells drawn.
+    #[test]
+    fn a_few_cells_of_a_window_drawn_before_wait_for_the_rest() {
+        let t0 = Instant::now();
+        let mut a = app(true);
+        a.start();
+        let uis_id = asks_uis(&calls(&mut a));
+        answer(&mut a, uis_id, uis(false, false), t0);
+        calls(&mut a);
+        redraw(
+            &mut a,
+            vec![
+                resize(1, 20, 6),
+                resize(2, 20, 5),
+                viewport(2, 1000),
+                line(2, 3, "let mut"),
+            ],
+            t0,
+        );
+        assert!(a.take_refresh(), "refreshed, a few cells or none");
+        assert!(!a.due(t0), "waited for");
+        assert!(
+            a.model.grids[&2]
+                .row(3)
+                .iter()
+                .all(|c| c.text != grid::Text::Char('l')),
+            "what came is not drawn"
+        );
     }
 
     /// Attached to a session another UI drew, the windows come placed
@@ -4166,8 +4174,8 @@ mod tests {
     }
 
     /// With each window's text centred, a window wider than the text gets is
-    /// asked for a grid that wide and drawn in its middle — and let go of,
-    /// told the editor is used another way.
+    /// asked for a grid that wide and drawn in its middle — and let go of as
+    /// the client goes, so that another UI sees the window whole.
     #[test]
     fn a_window_wider_than_its_text_has_it_in_its_middle() {
         let t0 = Instant::now();
@@ -4204,7 +4212,7 @@ mod tests {
         assert!(narrowed(&calls(&mut a)).is_empty(), "asked once");
         assert_eq!(shown(&mut a, t0)[0], "      text", "6 in, of 20");
 
-        a.set_centre(Centre::Off);
+        a.let_windows_go();
         assert_eq!(narrowed(&calls(&mut a)), [vec![n(2), n(0), n(0)]]);
     }
 }

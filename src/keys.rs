@@ -108,10 +108,6 @@ pub enum Action {
     /// the session it came from, or the terminal of this one it came from
     /// (see [`crate::card`]). Nothing, with no such note up.
     Go,
-    /// `<prefix> w` — use a terminal wider than the windows need the next
-    /// way: the editor centred, each window's text centred in it, or neither
-    /// (see [`crate::centre`]). The session stays in front.
-    Centre,
 }
 
 /// One instruction from the machine, in order.
@@ -174,12 +170,6 @@ pub const BINDINGS: &[Binding] = &[
         action: Action::Cycle(Direction::Prev),
         help: "attach to the previous session, wrapping",
         hint: "prev",
-    },
-    Binding {
-        key: b'w',
-        action: Action::Centre,
-        help: "centre the editor, each window's text, or none",
-        hint: "wide",
     },
     Binding {
         key: ENTER,
@@ -1409,7 +1399,6 @@ mod tests {
             Action::Create,
             Action::Cycle(Direction::Next),
             Action::Cycle(Direction::Prev),
-            Action::Centre,
             Action::Go,
             Action::Help,
         ];
@@ -1421,7 +1410,6 @@ mod tests {
                 | Action::Detach
                 | Action::Create
                 | Action::Cycle(_)
-                | Action::Centre
                 | Action::Go
                 | Action::Help => {}
                 // Not in `all`: it carries a number, so it has no fixed key.

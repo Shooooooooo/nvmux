@@ -26,7 +26,6 @@
 pub mod announce;
 pub mod boundary;
 pub mod card;
-pub mod centre;
 pub mod cli;
 pub mod client;
 pub mod config;

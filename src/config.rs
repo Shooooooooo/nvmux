@@ -179,10 +179,9 @@ pub struct ClientSettings {
     /// link. Off, every scroll waits for Neovim.
     pub predict: bool,
     /// What a session does with a terminal wider than its windows need (see
-    /// [`Centre`]): the editor only as wide as its windows want and centred,
-    /// the default; each window's text centred in it; or neither.
-    /// `<prefix> w` goes from one to the next while nvmux runs. nvmux's own
-    /// client only: Neovim's draws on the whole terminal.
+    /// [`Centre`]): nothing, the default; the editor only as wide as its
+    /// windows want and centred; or each window's text centred in it.
+    /// nvmux's own client only: Neovim's draws on the whole terminal.
     pub centre: Centre,
     /// The most columns a window's text gets with `centre` on: what each
     /// window side by side wants of a centred editor, and how wide the text
@@ -198,7 +197,7 @@ impl Default for ClientSettings {
             per_session: true,
             lazy: true,
             predict: true,
-            centre: Centre::Editor,
+            centre: Centre::Off,
             window_width: 120,
         }
     }
@@ -210,6 +209,7 @@ impl Default for ClientSettings {
 #[serde(rename_all = "lowercase")]
 pub enum Centre {
     /// The editor is as wide as the terminal, as Neovim's own client has it.
+    #[default]
     Off,
     /// The editor is only as wide as its windows side by side want — each up
     /// to `window_width`, one that keeps its width (`'winfixwidth'`, as a
@@ -219,7 +219,6 @@ pub enum Centre {
     /// terminal's edges. A split or a window closed widens or narrows it once
     /// Neovim has laid the windows out, and with `'equalalways'` the windows
     /// are made the same width again, as Neovim makes them on a split.
-    #[default]
     Editor,
     /// The editor is as wide as the terminal, and a window wider than
     /// `window_width` has its text that wide, in its middle: its lines wrap
@@ -228,28 +227,12 @@ pub enum Centre {
 }
 
 impl Centre {
-    /// As the config file and the client's environment spell it.
+    /// As the config file spells it.
     pub fn name(self) -> &'static str {
         match self {
             Centre::Off => "off",
             Centre::Editor => "editor",
             Centre::Windows => "windows",
-        }
-    }
-
-    /// The inverse of [`Centre::name`].
-    pub fn parse(s: &str) -> Option<Centre> {
-        [Centre::Off, Centre::Editor, Centre::Windows]
-            .into_iter()
-            .find(|c| c.name() == s)
-    }
-
-    /// The one `<prefix> w` goes to from this one.
-    pub fn next(self) -> Centre {
-        match self {
-            Centre::Off => Centre::Editor,
-            Centre::Editor => Centre::Windows,
-            Centre::Windows => Centre::Off,
         }
     }
 }
@@ -1057,8 +1040,8 @@ fn render_default_config(prefix: u8) -> String {
          # per_session  = {per_session:<8}   # keep each session's client; a switch back reuses it\n\
          # lazy         = {lazy:<8}   # start a client on its first visit, not at launch\n\
          # predict      = {predict:<8}   # over a slow link, scrolls show before Neovim answers\n\
-         # centre       = {centre:<8}   # on a wide terminal; or \"windows\", each window's text, or \"off\"\n\
-         # window_width = {window_width:<8}   # the most columns a window's text gets; 0 for no limit\n\
+         # centre       = {centre:<8}   # \"editor\": centred on a wide terminal; \"windows\": each window's text\n\
+         # window_width = {window_width:<8}   # with centre on, the most columns a window's text gets; 0 for no limit\n\
          \n\
          [theme]\n\
          # color = {theme_color}   # or \"#rrggbb\": nvmux's text and bars in that colour\n\
@@ -1431,36 +1414,24 @@ mod tests {
         assert!(s.client.per_session && s.client.lazy, "the rest as it was");
     }
 
-    /// A wide terminal has the editor centred unless told otherwise, each
-    /// window's text up to 120 columns; the other ways are a word away, and
-    /// a way that is not one is an error.
+    /// A wide terminal is left alone unless told otherwise, and centred with
+    /// each window's text up to 120 columns when it is; each way is a word
+    /// away, spelt as the template spells it, and a way that is not one is an
+    /// error.
     #[test]
-    fn the_editor_is_centred_unless_told() {
+    fn nothing_is_centred_unless_told() {
         let c = Settings::default().client;
-        assert_eq!((c.centre, c.window_width), (Centre::Editor, 120));
+        assert_eq!((c.centre, c.window_width), (Centre::Off, 120));
         for way in [Centre::Off, Centre::Editor, Centre::Windows] {
             let s: Settings =
                 toml::from_str(&format!("[client]\ncentre = \"{}\"\n", way.name())).expect("valid");
             assert_eq!(s.client.centre, way);
-            assert_eq!(Centre::parse(way.name()), Some(way), "round trips");
             assert_eq!(s.client.window_width, 120, "the rest as it was");
         }
         let s: Settings = toml::from_str("[client]\nwindow_width = 0\n").expect("valid");
         assert_eq!(s.client.window_width, 0);
         assert!(toml::from_str::<Settings>("[client]\ncentre = \"middle\"\n").is_err());
         assert!(toml::from_str::<Settings>("[client]\nwindow_width = -1\n").is_err());
-    }
-
-    /// `<prefix> w` goes through all three, and back to where it began.
-    #[test]
-    fn the_ways_go_round() {
-        let mut way = Centre::Off;
-        let mut seen = Vec::new();
-        for _ in 0..3 {
-            way = way.next();
-            seen.push(way);
-        }
-        assert_eq!(seen, [Centre::Editor, Centre::Windows, Centre::Off]);
     }
 
     /// nvmux's own client unless told otherwise; Neovim's is a line away.
@@ -1809,7 +1780,7 @@ mod tests {
             "# lazy         = true",
             "# ui           = \"nvmux\"",
             "# predict      = true",
-            "# centre       = \"editor\"",
+            "# centre       = \"off\"",
             "# window_width = 120",
             "# color = \"terminal\"",
             "# enabled     = true",

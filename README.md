@@ -96,7 +96,6 @@ reimplementing it.
 | `<prefix>` `p` | previous session by number (wraps) |
 | `<prefix>` `c` | set up a new session and attach to it — `Esc` goes back |
 | `<prefix>` `Enter` | go where the newest note in the margin is about: its session, or a terminal of this one |
-| `<prefix>` `w` | on a wide terminal: the editor centred, each window's text centred, or neither, in turn — see [A wide terminal](#a-wide-terminal) |
 | `<prefix>` `?` | show these keys — `Esc` goes back |
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
 
@@ -158,22 +157,22 @@ nvmux.
 
 ### A wide terminal
 
-On a terminal wider than its windows need, nvmux's own client centres the
-editor, as wide as its windows side by side want — `window_width` columns
-each, 120 by default — until they fill the terminal. `<prefix> w` goes from
-one way to the next while nvmux runs:
+On a terminal wider than its windows need, nvmux's own client can centre
+the editor, or each window's text, as `[client] centre` says:
 
-`centre = "editor"`, the default:
+`centre = "off"`, the default:
 
-![Two windows side by side in the middle of a wide terminal, code on the left and a page of prose on the right, with a margin either side that their status lines run on through to the terminal's edges](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-editor.png)
+![Two windows side by side across a wide terminal, code on the left and a page of prose on the right, each at the left of its window, the prose in lines as long as its window is wide](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-off.png)
 
-`centre = "windows"`, each window's text centred in it instead:
+`centre = "editor"`: the editor as wide as its windows side by side want —
+`window_width` columns each, 120 by default — until they fill the terminal:
 
-![The same two windows sharing the whole terminal, the code and the prose each in the middle of its own window, with the words of its status line over it](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-windows.png)
+![The same two windows in the middle of the terminal, with a margin either side that their status lines run on through to the terminal's edges](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-editor.png)
 
-`centre = "off"`, neither:
+`centre = "windows"`: each window's text at most `window_width` columns
+wide, in its middle:
 
-![The same two windows sharing the whole terminal, the code and the prose at the left of each, the prose in lines as long as its window is wide](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-off.png)
+![The same two windows across the whole terminal, the code and the prose each in the middle of its own window, with the words of its status line over it](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-windows.png)
 
 ### What a session has to say
 
@@ -227,8 +226,8 @@ ui           = "nvmux"  # who draws a session: nvmux's own client, animated; or 
 per_session  = true     # keep each session's client; a switch back reuses it
 lazy         = true     # start a client on its first visit; false starts all at launch
 predict      = true     # over a slow link, scrolls show before Neovim answers
-centre       = "editor" # on a wide terminal; or "windows", each window's text, or "off"
-window_width = 120      # the most columns a window's text gets; 0 for no limit
+centre       = "off"    # "editor": centred on a wide terminal; "windows": each window's text
+window_width = 120      # with centre on, the most columns a window's text gets; 0 for no limit
 
 [theme]
 color = "terminal"   # or "#rrggbb": nvmux's text and bars in that colour; dim text stays dim

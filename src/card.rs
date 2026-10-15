@@ -336,12 +336,6 @@ pub enum Command {
     /// The prefix is held, or it is not any more: while it is, the card the
     /// key acts on says so.
     Keys { held: bool },
-    /// What to do with a terminal wider than the windows need (see
-    /// [`crate::config::Centre`]): said when `<prefix> w` changes it, and as
-    /// a client comes back to the front, which may have been parked through
-    /// a change. Nothing to do with a card, but told the same way, for the
-    /// same reasons.
-    Centre { centre: crate::config::Centre },
 }
 
 /// `cmd` as it goes into the client's input: see the module docs.
@@ -1023,7 +1017,6 @@ mod tests {
                 Command::Drop { id } => format!("drop {id}"),
                 Command::Clear => "clear".to_string(),
                 Command::Keys { held } => format!("keys {held}"),
-                Command::Centre { centre } => format!("centre {}", centre.name()),
             })
             .collect()
     }
