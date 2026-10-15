@@ -14,6 +14,15 @@
 //! window's for every UI of the session: as the client goes, it asks for each
 //! window's own width back, and waits a moment for Neovim to have done it
 //! ([`super::run`]).
+//!
+//! A client killed outright — by nvmux, still there two seconds after it was
+//! hung up, or by a crash — asks for nothing back, and Neovim keeps a grid
+//! as it was asked for until a UI asks for the window whole. So a client
+//! with windows of their own looks at each window once an attach, the first
+//! time it knows how wide both the window and its grid are, and asks for one
+//! on a grid not its width whole, unless it narrows that window itself. Two
+//! clients attached at once share the grids: the one to attach last has the
+//! windows as it wants them, and the other draws them as they are.
 
 use super::compose::Out;
 use super::grid::Text;

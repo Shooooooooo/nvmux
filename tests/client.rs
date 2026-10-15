@@ -219,9 +219,21 @@ impl Terminal {
 
     /// Hang the client up as nvmux retires one, and say how it exited.
     fn hang_up(&mut self) -> Option<u32> {
+        self.signal(Signal::SIGHUP)
+    }
+
+    /// Kill the client outright, as nvmux kills one still there two seconds
+    /// after it was hung up, or as a crash ends one: it does nothing more on
+    /// its way out. Says whether it is gone.
+    fn kill(&mut self) -> bool {
+        self.signal(Signal::SIGKILL).is_some()
+    }
+
+    /// Send the client `signal`, and say how it exited.
+    fn signal(&mut self, signal: Signal) -> Option<u32> {
         let pid = self.child.process_id().expect("the client's pid");
         self.hung_up = true;
-        nix::sys::signal::kill(Pid::from_raw(pid as i32), Signal::SIGHUP).expect("SIGHUP");
+        nix::sys::signal::kill(Pid::from_raw(pid as i32), signal).expect("signal the client");
         let deadline = Instant::now() + Duration::from_secs(5);
         while self.exited.is_none() && Instant::now() < deadline {
             if let Ok(Some(status)) = self.child.try_wait() {
@@ -1621,6 +1633,85 @@ fn the_next_client_draws_whole_what_a_centring_one_left() {
     assert!(
         term.pump_until(Duration::from_secs(15), whole),
         "not every window drawn whole:\n{}",
+        term.text()
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
+/// What a client centring each window's text leaves the next to attach when
+/// it is killed outright — by nvmux, still there two seconds after it was
+/// hung up, or by a crash — rather than let go: the windows asked to be
+/// narrower, and narrower for every UI, for Neovim keeps a grid as narrow as
+/// it was asked to be until a UI asks for it whole. The next client with
+/// windows of their own asks for every one whole that it does not narrow
+/// itself: one centring nothing, for every one.
+#[test]
+fn the_next_client_gives_back_the_width_a_killed_one_took() {
+    require_nvim!();
+    let scratch = Scratch::new("client-centre-kill");
+    let (mut term, mut rpc, sock) = wide(&scratch, "client-centre-kill");
+    // Split once it is drawn: split before the client attaches, the split is
+    // laid out for Neovim's own width, and the client's widens the right.
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    rpc.command("vsplit").expect("vsplit");
+    let narrow = columns(160, &[60, 60]);
+    assert!(
+        until_widths(&mut term, &mut rpc, &narrow),
+        "never narrowed: {}\n{}",
+        widths(&mut rpc),
+        term.text()
+    );
+    assert!(term.kill(), "the client outlived a SIGKILL");
+    assert!(
+        common::wait_until(Duration::from_secs(5), || rpc.list_uis().ok() == Some(0)),
+        "the killed client stayed attached"
+    );
+    assert_eq!(
+        widths(&mut rpc),
+        narrow,
+        "left narrow, with no UI to see it"
+    );
+
+    let config = scratch.0.join("config.toml");
+    std::fs::write(&config, "[client]\ncentre = false\n").expect("write the config");
+    let mut term = Terminal::spawn_sized(&sock, &config, DA1_REPLY, (160, 12));
+    let whole = |w: &Value| -> Option<Vec<usize>> {
+        let ws: Vec<usize> = w
+            .as_array()?
+            .get(1)?
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_u64)
+            .map(|w| w as usize)
+            .collect();
+        (ws.len() == 2 && ws.iter().all(|w| *w > 60)).then_some(ws)
+    };
+    let mut given = None;
+    assert!(
+        common::wait_until(Duration::from_secs(15), || {
+            term.pump_until(Duration::from_millis(20), |_| false);
+            given = whole(&widths(&mut rpc));
+            given.is_some()
+        }),
+        "the windows were not given their width back: {}\n{}",
+        widths(&mut rpc),
+        term.text()
+    );
+    // And drawn as wide: each window's text at its left edge, not in its
+    // middle as it is on a grid narrower than the window.
+    let w = given.unwrap_or_default();
+    let laid = |s: &str| {
+        let first: Vec<char> = s.lines().next().unwrap_or("").chars().collect();
+        let at = |n: usize| first.iter().skip(n).take(15).collect::<String>();
+        at(0) == "the left window" && at(w[0] + 1) == "the left window"
+    };
+    assert!(
+        term.pump_until(Duration::from_secs(5), laid),
+        "the windows are not drawn whole ({w:?}):\n{}",
         term.text()
     );
     assert_eq!(term.hang_up(), Some(0), "the client's exit");
