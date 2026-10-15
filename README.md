@@ -158,21 +158,13 @@ nvmux.
 ### A wide terminal
 
 On a terminal wider than its windows need, nvmux's own client can centre
-the editor, or each window's text, as `[client] centre` says:
+the editor — as wide as its windows side by side want, `window_width`
+columns each (120 by default), until they fill the terminal — or the text
+in each window, as `[client] centre` says:
 
-`centre = "off"`, the default:
-
-![Two windows side by side across a terminal as wide as an ultra-wide monitor, code on the left and a page of prose on the right, each at the left of its window, the prose in lines as long as its window is wide](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-off.png)
-
-`centre = "editor"`: the editor as wide as its windows side by side want —
-`window_width` columns each, 120 by default — until they fill the terminal:
-
-![The same two windows in the middle of the terminal, with a margin either side that their status lines run on through to the terminal's edges](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-editor.png)
-
-`centre = "windows"`: each window's text at most `window_width` columns
-wide, in its middle:
-
-![The same two windows across the whole terminal, the code and the prose each in the middle of its own window, with the words of its status line over it](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-windows.png)
+| `centre = "off"` (default) | `centre = "editor"` | `centre = "windows"` |
+| :---: | :---: | :---: |
+| <img src="https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-off.png" width="250" alt="Two windows side by side across a terminal as wide as an ultra-wide monitor, code on the left and a page of prose on the right, each at the left of its window, the prose in lines as long as its window is wide"> | <img src="https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-editor.png" width="250" alt="The same two windows in the middle of the terminal, with a margin either side that their status lines run on through to the terminal's edges"> | <img src="https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-windows.png" width="250" alt="The same two windows across the whole terminal, the code and the prose each in the middle of its own window, with the words of its status line over it"> |
 
 ### What a session has to say
 
