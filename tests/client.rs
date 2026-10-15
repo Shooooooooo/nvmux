@@ -49,6 +49,12 @@ struct Terminal {
     /// The exit code, once the child has been seen to exit; it must not be
     /// signalled or waited for again after that.
     exited: Option<u32>,
+    /// The client has been hung up, and what it asks from then on goes
+    /// unanswered: it does not wait for an answer on its way out, and one
+    /// written once it has gone fails on macOS. Neovim asks the terminal
+    /// something whenever a UI attaches, a refresh's among them, so a
+    /// question can come as the client goes.
+    hung_up: bool,
     writer: Box<dyn Write + Send>,
     /// Everything the client has written, in order, and the screen it makes.
     output: Vec<u8>,
@@ -117,6 +123,7 @@ impl Terminal {
         Self {
             child,
             exited: None,
+            hung_up: false,
             writer,
             output: Vec::new(),
             parser: vt100::Parser::new(size.1, size.0, 0),
@@ -166,6 +173,10 @@ impl Terminal {
     /// query may straddle two reads, so the scan starts a little before where
     /// it left off and counts only matches that end past it.
     fn answer(&mut self) {
+        if self.hung_up {
+            self.answered = self.output.len();
+            return;
+        }
         let from = self.answered.saturating_sub(8);
         let mut replies = Vec::new();
         for (query, reply) in [(KITTY_QUERY, KITTY_REPLY), (DA1, self.da1)] {
@@ -209,6 +220,7 @@ impl Terminal {
     /// Hang the client up as nvmux retires one, and say how it exited.
     fn hang_up(&mut self) -> Option<u32> {
         let pid = self.child.process_id().expect("the client's pid");
+        self.hung_up = true;
         nix::sys::signal::kill(Pid::from_raw(pid as i32), Signal::SIGHUP).expect("SIGHUP");
         let deadline = Instant::now() + Duration::from_secs(5);
         while self.exited.is_none() && Instant::now() < deadline {
