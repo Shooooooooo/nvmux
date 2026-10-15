@@ -11,7 +11,7 @@
 //! region scrolled — [`Model::apply`] says so in a [`Changes`], and
 //! [`super::anim`] decides what to make of it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::grid::Grid;
 use super::redraw::{Event, ModeInfo, OptionValue};
@@ -21,8 +21,17 @@ use crate::palette::Palette;
 /// Where a grid goes on the screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Place {
-    /// A window in the editor's layout, its top left at `row`, `col`.
-    Window { row: usize, col: usize },
+    /// A window in the editor's layout, its top left at `row`, `col`, and
+    /// `width` by `height` cells of the screen its own: its grid's size, but
+    /// where the client asked for a narrower grid, to centre the window's
+    /// text in it (see [`super::wide`]). Nought for a window placed before
+    /// its size was known.
+    Window {
+        row: usize,
+        col: usize,
+        width: usize,
+        height: usize,
+    },
     /// A float, over everything in the layout.
     Float {
         row: i64,
@@ -31,6 +40,9 @@ pub enum Place {
         compindex: i64,
         /// Whether the mouse can land on it.
         mouse: bool,
+        /// The grid it is anchored to, where Neovim said: one anchored to a
+        /// window goes where that window's text is drawn.
+        anchor: Option<u64>,
     },
     /// The message area: the full width, from `row` down. `scrolled` is
     /// messages having pushed it up over the windows, and then the row above
@@ -65,7 +77,7 @@ impl Placement {
     /// Where its top left is on the screen.
     pub fn origin(&self) -> (i64, i64) {
         match &self.place {
-            Place::Window { row, col } => (*row as i64, *col as i64),
+            Place::Window { row, col, .. } => (*row as i64, *col as i64),
             Place::Float { row, col, .. } => (*row, *col),
             Place::Message { row, .. } => (*row as i64, 0),
         }
@@ -240,6 +252,9 @@ pub struct Model {
     /// The window each window's grid shows, as `win_viewport` and the
     /// placements name it.
     pub wins: BTreeMap<u64, i64>,
+    /// The window grids seen named and not placed, whose cells were then
+    /// forgotten: see [`Model::forget_kept`].
+    kept: BTreeSet<u64>,
     /// What each window shows of its buffer, by grid.
     pub viewports: HashMap<u64, Viewport>,
     /// The rows and columns of a window's grid that are not its text, by
@@ -260,6 +275,10 @@ pub struct Model {
     pub defaults: DefaultColors,
     /// `hl_group_set`: the highlight ids of the groups the UI draws itself.
     pub groups: HashMap<String, u32>,
+    /// `'laststatus'`, as the editor's measure says it (see
+    /// [`super::wide::MEASURE_LUA`]): which windows have a status line of
+    /// their own. `None` until it has said.
+    pub laststatus: Option<i64>,
     highlights: Highlights,
     /// Every highlight resolved for drawing, by id, and its blend: rebuilt when
     /// a highlight, the defaults or `'termguicolors'` change (see
@@ -281,6 +300,7 @@ impl Model {
             grids: BTreeMap::new(),
             layout: BTreeMap::new(),
             wins: BTreeMap::new(),
+            kept: BTreeSet::new(),
             viewports: HashMap::new(),
             margins: HashMap::new(),
             cursor: CursorPos {
@@ -298,6 +318,7 @@ impl Model {
             title: String::new(),
             defaults: DefaultColors::default(),
             groups: HashMap::new(),
+            laststatus: None,
             highlights: Highlights::default(),
             styles: Vec::new(),
             blends: Vec::new(),
@@ -388,8 +409,61 @@ impl Model {
     /// animation of a window's moving counted.
     pub fn cursor_on_screen(&self) -> (i64, i64) {
         let c = self.cursor;
-        let (r, k) = self.layout.get(&c.grid).map_or((0, 0), Placement::origin);
+        let (r, k) = self.drawn_origin(c.grid);
         (r + c.row as i64, k + c.col as i64)
+    }
+
+    /// How far in from where the editor put it grid `grid` is drawn: a
+    /// window's grid narrower than the window in the middle of it, and a
+    /// float anchored to that window as far in as its text (see
+    /// [`super::wide`]). Nought for anything else.
+    pub fn inset(&self, grid: u64) -> usize {
+        let window = |grid: u64| match self.layout.get(&grid).map(|p| &p.place) {
+            Some(Place::Window { width, .. }) => self
+                .grids
+                .get(&grid)
+                .map_or(0, |g| super::wide::inset(*width, g.width())),
+            _ => 0,
+        };
+        match self.layout.get(&grid).map(|p| &p.place) {
+            Some(Place::Window { .. }) => window(grid),
+            Some(Place::Float {
+                anchor: Some(anchor),
+                ..
+            }) if *anchor != grid => window(*anchor),
+            _ => 0,
+        }
+    }
+
+    /// Where grid `grid`'s top left is drawn: where the editor put it, and
+    /// [`Model::inset`] in from there.
+    pub fn drawn_origin(&self, grid: u64) -> (i64, i64) {
+        let (r, c) = self.layout.get(&grid).map_or((0, 0), Placement::origin);
+        (r, c + self.inset(grid) as i64)
+    }
+
+    /// The cells window grid `grid` has of the screen — its top row, its
+    /// first column, and how many of each — as wide as Neovim made the
+    /// window, whatever its grid; `None` for a grid that is no window in the
+    /// layout.
+    pub fn window_cells(&self, grid: u64) -> Option<(usize, usize, usize, usize)> {
+        let Some(Place::Window {
+            row,
+            col,
+            width,
+            height,
+        }) = self.layout.get(&grid).map(|p| &p.place)
+        else {
+            return None;
+        };
+        let g = self.grids.get(&grid)?;
+        let pick = |own: usize, grid: usize| if own > 0 { own } else { grid };
+        Some((
+            *row,
+            *col,
+            pick(*width, g.width()),
+            pick(*height, g.height()),
+        ))
     }
 
     /// Take one event into the picture, noting in `changes` what an animation
@@ -472,8 +546,18 @@ impl Model {
                 win,
                 row,
                 col,
-                ..
-            } => self.place(grid, win, Place::Window { row, col }),
+                width,
+                height,
+            } => self.place(
+                grid,
+                win,
+                Place::Window {
+                    row,
+                    col,
+                    width,
+                    height,
+                },
+            ),
             Event::WinFloatPos {
                 grid,
                 win,
@@ -482,6 +566,7 @@ impl Model {
                 compindex,
                 row,
                 col,
+                anchor,
             } => self.place(
                 grid,
                 win,
@@ -491,6 +576,7 @@ impl Model {
                     zindex,
                     compindex,
                     mouse,
+                    anchor,
                 },
             ),
             Event::MsgSetPos {
@@ -518,7 +604,12 @@ impl Model {
                 self.layout
                     .entry(grid)
                     .or_insert(Placement {
-                        place: Place::Window { row: 0, col: 0 },
+                        place: Place::Window {
+                            row: 0,
+                            col: 0,
+                            width: 0,
+                            height: 0,
+                        },
                         hidden: true,
                     })
                     .hidden = true;
@@ -638,6 +729,22 @@ impl Model {
             .filter(|(grid, _)| !self.layout.contains_key(grid))
             .map(|(grid, win)| (*grid, *win))
             .collect()
+    }
+
+    /// Forget what Neovim has drawn on each window it names without placing,
+    /// the first time it is seen so. Such a window's grid is one Neovim kept
+    /// from another UI, and of it Neovim sends only the cells that changed
+    /// since that UI saw them: none, or a few — and a few would be taken for
+    /// all of it. Forgotten, the window is [`Model::lacking`] until a refresh
+    /// draws the whole of it; anything drawn on it after is kept.
+    pub fn forget_kept(&mut self) {
+        for (grid, _) in self.unplaced() {
+            if self.kept.insert(grid) {
+                if let Some(g) = self.grids.get_mut(&grid) {
+                    g.forget();
+                }
+            }
+        }
     }
 
     /// The window grids that are to be seen — placed and showing, or named
@@ -944,6 +1051,77 @@ mod tests {
         assert_eq!(m.lacking(), vec![4, 7]);
     }
 
+    /// A window named and not placed, with a few cells drawn on it — what
+    /// Neovim sends of a grid it kept from another UI when some changed since
+    /// — has them forgotten, and is lacking; once only, so that what is drawn
+    /// on it after, the whole of it, is kept. A window placed keeps what is
+    /// drawn on it.
+    #[test]
+    fn a_few_cells_of_a_window_never_placed_are_forgotten_once() {
+        let mut m = model();
+        let line = |grid, text: char| Event::GridLine {
+            grid,
+            row: 0,
+            col: 0,
+            cells: vec![LineCell {
+                text: Text::Char(text),
+                hl: Some(0),
+                repeat: 1,
+            }],
+        };
+        let resize = |grid| Event::GridResize {
+            grid,
+            width: 10,
+            height: 4,
+        };
+        apply(
+            &mut m,
+            vec![
+                resize(2),
+                resize(4),
+                Event::WinViewport {
+                    grid: 2,
+                    win: Some(1000),
+                    topline: 0,
+                    botline: 1,
+                    curline: 0,
+                    curcol: 0,
+                    line_count: 1,
+                    scroll_delta: 0,
+                },
+                line(2, 'a'),
+                Event::WinPos {
+                    grid: 4,
+                    win: Some(1001),
+                    row: 0,
+                    col: 11,
+                    width: 10,
+                    height: 4,
+                },
+                line(4, 'b'),
+            ],
+        );
+        assert!(m.lacking().is_empty(), "both drawn on");
+        m.forget_kept();
+        assert_eq!(m.lacking(), vec![2], "the one never placed");
+        assert_eq!(
+            m.grids[&2].cell(0, 0),
+            Some(&crate::client::grid::Cell::default())
+        );
+        assert_eq!(
+            m.grids[&4].cell(0, 0).map(|c| &c.text),
+            Some(&Text::Char('b'))
+        );
+
+        apply(&mut m, vec![line(2, 'c')]);
+        m.forget_kept();
+        assert!(m.lacking().is_empty(), "drawn again, and kept");
+        assert_eq!(
+            m.grids[&2].cell(0, 0).map(|c| &c.text),
+            Some(&Text::Char('c'))
+        );
+    }
+
     /// Scrolls are added up per window over a batch, and only grid 1 being
     /// cleared asks for every cell to be painted again.
     #[test]
@@ -1132,6 +1310,7 @@ mod tests {
                     compindex: 1,
                     row: 2,
                     col: 0,
+                    anchor: None,
                 },
                 Event::GridDestroy { grid: 4 },
             ],

@@ -93,6 +93,10 @@ enum Left {
         drawn: Box<[u8]>,
         spans: Box<[(u16, u16, u16)]>,
         since: Instant,
+        /// The column its lines end at, where the session it left laid it:
+        /// what the session it lands in lays it against too, its own editor
+        /// being where it may not be (see [`crate::card::Card::end`]).
+        end: Option<u16>,
     },
 }
 
@@ -120,8 +124,27 @@ impl HandOff {
                 drawn: drawn.into(),
                 spans: spans.into(),
                 since,
+                end: None,
             },
         })
+    }
+
+    /// This card, its lines ending at column `end` where the session it left
+    /// laid it. Nothing for a name.
+    pub fn ending_at(mut self, end: u16) -> Self {
+        if let Left::Card { end: at, .. } = &mut self.left {
+            *at = Some(end);
+        }
+        self
+    }
+
+    /// For a switch's card, the column its lines end at where the session it
+    /// left laid it, if that was said (see [`HandOff::ending_at`]).
+    pub fn card_end(&self) -> Option<u16> {
+        match &self.left {
+            Left::Card { end, .. } => *end,
+            Left::Name { .. } => None,
+        }
     }
 
     /// For a switch's card, when it went up on the screen the switch left:
@@ -351,5 +374,17 @@ mod tests {
         assert!(dotfiles().over(4, 80).is_none(), "below the last row");
         assert!(dotfiles().over(24, 34).is_none(), "off the right edge");
         assert!(dotfiles().over(24, 35).is_some(), "exactly to the edge");
+    }
+
+    /// A switch's card carries where it ended on the screen it left, for the
+    /// next session to lay it against; a name carries nothing of the kind.
+    #[test]
+    fn a_cards_end_goes_with_it() {
+        let now = Instant::now();
+        let card = HandOff::card(b"x".to_vec(), &[(1, 4, 9)], now).expect("a card");
+        assert_eq!(card.card_end(), None, "none said");
+        assert_eq!(card.ending_at(9).card_end(), Some(9));
+        let name = HandOff::new("api", 3, 4, 10).expect("a name");
+        assert_eq!(name.ending_at(9).card_end(), None);
     }
 }

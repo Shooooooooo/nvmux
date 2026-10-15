@@ -33,7 +33,7 @@ pub struct Was {
 impl Was {
     /// Split window `grid` as the model has it, if it is on show.
     pub fn take(model: &Model, grid: u64) -> Option<Was> {
-        let p = model
+        model
             .layout
             .get(&grid)
             .filter(|p| !p.hidden && matches!(p.place, Place::Window { .. }))?;
@@ -41,7 +41,7 @@ impl Was {
         Some(Was {
             grid,
             rows: g.lines(0, g.height(), 0, g.width()),
-            at: p.origin(),
+            at: model.drawn_origin(grid),
             size: (g.width(), g.height()),
         })
     }
@@ -49,7 +49,9 @@ impl Was {
     /// Whether the window is where it was, the same size, on show.
     fn still(&self, model: &Model) -> bool {
         let placed = model.layout.get(&self.grid).is_some_and(|p| {
-            !p.hidden && matches!(p.place, Place::Window { .. }) && p.origin() == self.at
+            !p.hidden
+                && matches!(p.place, Place::Window { .. })
+                && model.drawn_origin(self.grid) == self.at
         });
         let sized = model
             .grids

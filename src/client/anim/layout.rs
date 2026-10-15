@@ -288,15 +288,11 @@ impl Layout {
             .iter()
             .filter(|(grid, p)| **grid != 1 && !p.hidden)
             .filter_map(|(grid, p)| match p.place {
-                Place::Window { row, col } => {
-                    let g = model.grids.get(grid)?;
-                    Some((
-                        *grid,
-                        row as i64,
-                        col as i64,
-                        g.width() as i64,
-                        g.height() as i64,
-                    ))
+                // The window's own cells, which its grid fills unless it was
+                // asked to be narrower, to centre its text (see `wide`).
+                Place::Window { .. } => {
+                    let (row, col, w, h) = model.window_cells(*grid)?;
+                    Some((*grid, row as i64, col as i64, w as i64, h as i64))
                 }
                 _ => None,
             })
@@ -1223,7 +1219,7 @@ impl Transition {
             let at = now[grid];
             draw_window(frame, model, *grid, pane, at, self.rows.get(grid));
             if let Some(chrome) = chrome {
-                draw_lines(frame, model, chrome, pane, at);
+                draw_lines(frame, model, chrome, *grid, pane, at);
             }
         }
         if let Some((grid, bg)) = self.veil {
@@ -1259,14 +1255,27 @@ fn draw_window(
     let (height, width) = (text.height().max(0) as usize, text.width().max(0) as usize);
     let within =
         old.is_some_and(|rows| height <= rows.len() && width <= rows.first().map_or(0, Vec::len));
+    // A window whose text is drawn narrower than it, in its middle (see
+    // `crate::client::wide`), has it in the middle of its frame on the way
+    // there too: its grid, and nothing either side of it.
+    let pad = if model.inset(grid) > 0 {
+        width.saturating_sub(g.map_or(0, Grid::width)) / 2
+    } else {
+        0
+    };
     for r in 0..height {
         for c in 0..width {
-            let own = || g.and_then(|g| Some((g.cell(r, c)?, g.is_wide(r, c))));
+            let k = c.checked_sub(pad);
+            let own = || {
+                let k = k?;
+                g.and_then(|g| Some((g.cell(r, k)?, g.is_wide(r, k))))
+            };
             let was = || {
+                let k = k.filter(|_| pad == 0)?;
                 let row = old?.get(r)?;
                 Some((
-                    row.get(c)?,
-                    row.get(c + 1).is_some_and(|n| n.text == Text::Half),
+                    row.get(k)?,
+                    row.get(k + 1).is_some_and(|n| n.text == Text::Half),
                 ))
             };
             let cell = if within {
@@ -1280,6 +1289,9 @@ fn draw_window(
                     style: model.style(cell.hl),
                     wide,
                 },
+                // Either side of a centred window's text is the editor's
+                // own background, as it is once the window is there.
+                None if pad > 0 => Out::blank(model.style(0)),
                 None => Out::blank(model.style(edge(g, old, r, c))),
             };
             if let Some(o) = frame.at(text.top + r as i64, text.left + c as i64) {
@@ -1304,7 +1316,7 @@ fn edge(g: Option<&Grid>, old: Option<&Vec<Vec<Cell>>>, r: usize, c: usize) -> u
 /// A window's separator and status line in the frame `at`, as Neovim drew
 /// them where the window ends up: the separator as long as the frame is
 /// deep, and the status line as wide as it is (see [`stretch`]).
-fn draw_lines(frame: &mut Frame, model: &Model, chrome: &Grid, pane: &Pane, at: Area) {
+fn draw_lines(frame: &mut Frame, model: &Model, chrome: &Grid, grid: u64, pane: &Pane, at: Area) {
     let f = pane.frame;
     let cell = |row: i64, col: i64| {
         let (row, col) = (usize::try_from(row).ok()?, usize::try_from(col).ok()?);
@@ -1339,6 +1351,25 @@ fn draw_lines(frame: &mut Frame, model: &Model, chrome: &Grid, pane: &Pane, at: 
         for (k, c) in line.iter().enumerate() {
             let wide = line.get(k + 1).is_some_and(|n| n.text == Text::Half);
             put(at.bottom - 1, at.left + k as i64, c, wide);
+        }
+        // A window whose text is centred in it (see `crate::client::wide`)
+        // has its status line's words over its text on the way there too.
+        let text = model.grids.get(&grid).map_or(0, Grid::width);
+        let body = (at.width() - i64::from(pane.vsep)).max(0) as usize;
+        if let (true, Ok(row), Ok(left)) = (
+            model.inset(grid) > 0 && text > 0 && text < body,
+            usize::try_from(at.bottom - 1),
+            usize::try_from(at.left),
+        ) {
+            let end = (left + body).min(frame.width);
+            if row < frame.height && left < end {
+                let start = row * frame.width;
+                crate::client::wide::realign(
+                    &mut frame.cells[start + left..start + end],
+                    (body - text) / 2,
+                    text,
+                );
+            }
         }
     }
 }

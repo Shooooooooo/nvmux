@@ -57,6 +57,8 @@ struct Terminal {
     answered: usize,
     /// What this terminal answers a DA1 with.
     da1: &'static [u8],
+    /// Its size: columns, rows.
+    size: (u16, u16),
     incoming: mpsc::Receiver<Vec<u8>>,
     // Held so the pty outlives the child; dropped last.
     _master: Box<dyn portable_pty::MasterPty>,
@@ -70,10 +72,16 @@ impl Terminal {
 
     /// [`Terminal::spawn`], on a terminal that answers DA1 with `da1`.
     fn spawn_answering(sock: &Path, config: &Path, da1: &'static [u8]) -> Self {
+        Self::spawn_sized(sock, config, da1, (COLS, ROWS))
+    }
+
+    /// [`Terminal::spawn_answering`], on a terminal `size` big: columns,
+    /// rows.
+    fn spawn_sized(sock: &Path, config: &Path, da1: &'static [u8], size: (u16, u16)) -> Self {
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize {
-                rows: ROWS,
-                cols: COLS,
+                rows: size.1,
+                cols: size.0,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -111,9 +119,10 @@ impl Terminal {
             exited: None,
             writer,
             output: Vec::new(),
-            parser: vt100::Parser::new(ROWS, COLS, 0),
+            parser: vt100::Parser::new(size.1, size.0, 0),
             answered: 0,
             da1,
+            size,
             incoming,
             _master: pair.master,
         }
@@ -183,9 +192,9 @@ impl Terminal {
     /// The screen as text, a row to a line, trailing blanks trimmed.
     fn text(&self) -> String {
         let screen = self.parser.screen();
-        (0..ROWS)
+        (0..self.size.1)
             .map(|row| {
-                let line: String = (0..COLS)
+                let line: String = (0..self.size.0)
                     .map(|col| match screen.cell(row, col) {
                         Some(cell) if cell.has_contents() => cell.contents(),
                         _ => " ",
@@ -1390,4 +1399,244 @@ fn predicted_rows_wear_the_colours_neovim_gives_them() {
     typed(&mut term, b"\x1b");
     step(&mut term, "<C-f> past a line typed", b"\x06");
     step(&mut term, "<C-b> back over it", b"\x02");
+}
+
+/// A config for a wide terminal: every window's text up to 60 columns, and
+/// centred as `centre` says. A session in one window, its status line its
+/// own colour, and a terminal 160 columns wide.
+fn wide(
+    scratch: &Scratch,
+    tag: &str,
+    centre: &str,
+) -> (
+    Terminal,
+    nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    PathBuf,
+) {
+    let (sock, mut rpc, config) = session(scratch, tag);
+    std::fs::write(
+        &config,
+        format!("[client]\ncentre = \"{centre}\"\nwindow_width = 60\n"),
+    )
+    .expect("write the config");
+    rpc.command(
+        "setlocal noswapfile | set laststatus=2 termguicolors \
+         | hi StatusLine guibg=#123456 | hi StatusLineNC guibg=#123456 \
+         | call setline(1, ['the left window'])",
+    )
+    .expect("set the session up");
+    let term = Terminal::spawn_sized(&sock, &config, DA1_REPLY, (160, 12));
+    (term, rpc, sock)
+}
+
+/// What the editor says of itself: `'columns'`, and each window's width.
+fn widths(rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>) -> Value {
+    rpc.eval("[&columns, map(range(1, winnr('$')), 'winwidth(v:val)')]")
+        .expect("ask the editor")
+}
+
+fn columns(n: i64, wins: &[i64]) -> Value {
+    Value::Array(vec![
+        n.into(),
+        Value::Array(wins.iter().map(|w| Value::from(*w)).collect()),
+    ])
+}
+
+/// The editor centred: Neovim is only as wide as its windows side by side
+/// want, and in the middle of the terminal, its status line run on to both
+/// edges; a split widens it and has the windows the same width, closing it
+/// narrows it again.
+#[test]
+fn a_wide_terminal_has_the_editor_centred_as_wide_as_its_windows_want() {
+    require_nvim!();
+    let scratch = Scratch::new("client-centre");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-centre", "editor");
+    let at = |n: usize| format!("{}the left window", " ".repeat(n));
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.starts_with(&at(50))),
+        "one window is not 60 wide in the middle:\n{}",
+        term.text()
+    );
+    assert_eq!(widths(&mut rpc), columns(60, &[60]));
+    // The status line, under the window: across the terminal.
+    let status = Some(vt100::Color::Rgb(0x12, 0x34, 0x56));
+    let bg = |t: &Terminal, col: u16| t.parser.screen().cell(10, col).map(vt100::Cell::bgcolor);
+    assert_eq!(
+        (bg(&term, 0), bg(&term, 80), bg(&term, 159)),
+        (status, status, status)
+    );
+    let cell = |t: &Terminal, col: u16| t.parser.screen().cell(5, col).map(vt100::Cell::bgcolor);
+    assert_eq!(
+        cell(&term, 0),
+        cell(&term, 80),
+        "a margin is the editor's own background"
+    );
+
+    rpc.command("vsplit").expect("vsplit");
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| s.starts_with(&at(19))),
+        "a split did not widen it:\n{}",
+        term.text()
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(5), || widths(&mut rpc)
+            == columns(121, &[60, 60])),
+        "the windows are not the same width: {}",
+        widths(&mut rpc)
+    );
+
+    rpc.command("close").expect("close");
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| s.starts_with(&at(50))),
+        "closing it did not narrow it again:\n{}",
+        term.text()
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
+/// Each window's text centred: Neovim has the whole terminal, and a window
+/// wider than the text gets has it that wide in its middle, its status line's
+/// words over it; the client gives the windows their width back as it goes.
+#[test]
+fn a_wide_window_has_its_text_centred_in_it() {
+    require_nvim!();
+    let scratch = Scratch::new("client-centre-windows");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-centre-windows", "windows");
+    // One window, the whole terminal wide, its text in the middle.
+    let alone = format!("{}the left window", " ".repeat(50));
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.starts_with(&alone)),
+        "the text is not in the middle of its window:\n{}",
+        term.text()
+    );
+    // Split, two windows of about 80, each with its text 60 in its middle.
+    rpc.command("vsplit").expect("vsplit");
+    let own = |rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>| -> Vec<usize> {
+        rpc.eval("map(nvim_tabpage_list_wins(0), 'nvim_win_get_width(v:val)')")
+            .expect("ask the editor")
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_u64)
+                    .map(|w| w as usize)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert!(
+        common::wait_until(Duration::from_secs(5), || own(&mut rpc).len() == 2),
+        "no split"
+    );
+    let w = own(&mut rpc);
+    let (a, b) = ((w[0] - 60) / 2, w[0] + 1 + (w[1] - 60) / 2);
+    let laid = |s: &str| {
+        let first: Vec<char> = s.lines().next().unwrap_or("").chars().collect();
+        let at = |n: usize| first.iter().skip(n).take(15).collect::<String>();
+        at(a) == "the left window" && at(b) == "the left window"
+    };
+    assert!(
+        term.pump_until(Duration::from_secs(5), laid),
+        "the text is not in the middle of each window ({w:?}):\n{}",
+        term.text()
+    );
+    assert_eq!(
+        widths(&mut rpc),
+        columns(160, &[60, 60]),
+        "the text 60 wide"
+    );
+    let over = format!("{}[No Name]", " ".repeat(a));
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| s
+            .lines()
+            .nth(10)
+            .is_some_and(|l| l.starts_with(&over))),
+        "the status line's words are not over the text:\n{}",
+        term.text()
+    );
+
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            let w = widths(&mut rpc);
+            w.as_array()
+                .and_then(|a| a.get(1))
+                .and_then(Value::as_array)
+                .is_some_and(|ws| ws.iter().all(|w| w.as_i64().unwrap_or(0) > 60))
+        }),
+        "the windows were not given their width back: {}",
+        widths(&mut rpc)
+    );
+}
+
+/// What a client centring each window's text leaves the next to attach: the
+/// windows' grids, given their width back as it went, and holding what was
+/// drawn on them narrower unless Neovim drew them again before the client
+/// was gone. Of a grid it kept, Neovim sends the next client only the cells
+/// that differ from what it holds: none, or those of a line that wrapped
+/// narrower and what that moved. A client centring nothing draws every
+/// window whole all the same.
+#[test]
+fn the_next_client_draws_whole_what_a_centring_one_left() {
+    require_nvim!();
+    let scratch = Scratch::new("client-centre-left");
+    let (mut term, mut rpc, sock) = wide(&scratch, "client-centre-left", "windows");
+    // Split once it is drawn: split before the client attaches, the split is
+    // laid out for Neovim's own width, and the client's widens the right.
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    rpc.command(
+        "set filetype=rust number | syntax on \
+         | call setline(1, ['fn clean() {', \
+             '    // A thousand at a time, so a backlog never locks the table.', \
+             '    let mut deleted = 0;', '    loop {', '        deleted += 1;', \
+             '    }', '}']) \
+         | vsplit",
+    )
+    .expect("set the session up");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s
+            .matches("let mut deleted")
+            .count()
+            == 2),
+        "never drawn:\n{}",
+        term.text()
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            let w = widths(&mut rpc);
+            w.as_array()
+                .and_then(|a| a.get(1))
+                .and_then(Value::as_array)
+                .is_some_and(|ws| ws.iter().all(|w| w.as_i64().unwrap_or(0) > 60))
+        }),
+        "the windows were not given their width back: {}",
+        widths(&mut rpc)
+    );
+
+    let config = scratch.0.join("config.toml");
+    std::fs::write(&config, "[client]\ncentre = \"off\"\n").expect("write the config");
+    let mut term = Terminal::spawn_sized(&sock, &config, DA1_REPLY, (160, 12));
+    let whole = |s: &str| {
+        let lines: Vec<&str> = s.lines().collect();
+        [
+            "fn clean() {",
+            "so a backlog never locks the table.",
+            "let mut deleted = 0;",
+            "loop {",
+            "deleted += 1;",
+        ]
+        .iter()
+        .enumerate()
+        .all(|(row, text)| lines.get(row).is_some_and(|l| l.matches(text).count() == 2))
+    };
+    assert!(
+        term.pump_until(Duration::from_secs(15), whole),
+        "not every window drawn whole:\n{}",
+        term.text()
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
 }

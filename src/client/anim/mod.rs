@@ -1140,6 +1140,7 @@ mod tests {
             compindex: 1,
             row: 0,
             col,
+            anchor: None,
         };
         let size = Event::GridResize {
             grid: 5,

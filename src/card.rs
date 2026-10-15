@@ -166,6 +166,13 @@ pub struct Card {
     /// it is first drawn there.
     #[serde(default)]
     pub up_ms: u64,
+    /// For an arrival drawn again on the screen a switch lands on: the column
+    /// its lines end at on the screen it left, where the client there laid
+    /// it — against its own editor, which with `[client] centre` need not be
+    /// where this one's is — so that it stands where it stood through both
+    /// fades. `None` for one laid against this client's own editor.
+    #[serde(default)]
+    pub end: Option<u16>,
 }
 
 /// Where a switch landed among the sessions `<prefix> n` and `<prefix> p`
@@ -214,6 +221,7 @@ impl Card {
             only_mark: false,
             row: None,
             up_ms: 0,
+            end: None,
         }
     }
 
@@ -237,6 +245,7 @@ impl Card {
             only_mark: false,
             row: None,
             up_ms: 0,
+            end: None,
         }
     }
 
@@ -264,6 +273,15 @@ impl Card {
     pub fn up_for(self, up: Duration) -> Self {
         Self {
             up_ms: millis(up),
+            ..self
+        }
+    }
+
+    /// This arrival, its lines ending at column `end`, as it stood on the
+    /// screen it was up on first (see [`Card::end`]).
+    pub fn ending_at(self, end: u16) -> Self {
+        Self {
+            end: Some(end),
             ..self
         }
     }

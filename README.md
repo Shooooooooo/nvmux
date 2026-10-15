@@ -145,16 +145,6 @@ at once and then six retries over about a minute. If the host is still
 unreachable after that, nvmux exits with the reason and a reminder that the
 session is still running; `nvmux <host>` picks it up again.
 
-### An animated client
-
-By default nvmux draws the editor with its own client rather than Neovim's,
-so that it can animate it: scrolls slide, split windows fly in, fly out and
-resize, floats glide as in [Neovide](https://neovide.dev), and a smeared cursor,
-particles and a fading blink can be turned on under `[effects]`. Set
-`ui = "nvim"` under `[client]` for Neovim's own client instead: with it, what
-the terminal can do reaches the editor as Neovim negotiates it, not through
-nvmux.
-
 ### What a session has to say
 
 The picker shows a sign beside each session that has something to report:
@@ -184,6 +174,35 @@ Notes need nvmux's own client; with `ui = "nvim"` there are none.
 > If Claude Code's notifications never show, as on a remote host, set its
 > Notifications setting (`/config`) to "Ghostty (OSC 777)".
 
+### An animated client
+
+By default nvmux draws the editor with its own client rather than Neovim's,
+so that it can animate it: scrolls slide, split windows fly in, fly out and
+resize, floats glide as in [Neovide](https://neovide.dev), and a smeared cursor,
+particles and a fading blink can be turned on under `[effects]`. Set
+`ui = "nvim"` under `[client]` for Neovim's own client instead: with it, what
+the terminal can do reaches the editor as Neovim negotiates it, not through
+nvmux.
+
+### A wide terminal
+
+On a terminal wider than its windows need, nvmux's own client can centre
+each window's text, or the editor, as `[client] centre` says:
+
+`centre = "off"`, the default:
+
+![Two windows side by side across a terminal as wide as an ultra-wide monitor, code on the left and a page of prose on the right, each at the left of its window, the prose in lines as long as its window is wide](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-off.png)
+
+`centre = "windows"`: each window's text at most `window_width` columns
+wide, 120 by default, in its middle:
+
+![The same two windows across the whole terminal, the code and the prose each in the middle of its own window, with the words of its status line over it](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-windows.png)
+
+`centre = "editor"`: the editor as wide as its windows side by side want,
+`window_width` columns each, until they fill the terminal:
+
+![The same two windows in the middle of the terminal, with a margin either side that their status lines run on through to the terminal's edges](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-editor.png)
+
 ## Configuration
 
 nvmux needs no configuration. An optional TOML file — `$NVMUX_CONFIG` if set,
@@ -203,10 +222,12 @@ timeout_ms = 1000           # how long a lone prefix or half-typed number waits
 command = "nvim --headless --listen {sock}"   # {sock} is required
 
 [client]
-ui          = "nvmux" # who draws a session: nvmux's own client, animated; or "nvim"
-per_session = true    # keep each session's client; a switch back reuses it
-lazy        = true    # start a client on its first visit; false starts all at launch
-predict     = true    # over a slow link, scrolls show before Neovim answers
+ui           = "nvmux"  # who draws a session: nvmux's own client, animated; or "nvim"
+per_session  = true     # keep each session's client; a switch back reuses it
+lazy         = true     # start a client on its first visit; false starts all at launch
+predict      = true     # over a slow link, scrolls show before Neovim answers
+centre       = "off"    # on a wide terminal: "windows" centres each window's text, "editor" the editor
+window_width = 120      # with centre on, the most columns a window's text gets; 0 for no limit
 
 [theme]
 color = "terminal"   # or "#rrggbb": nvmux's text and bars in that colour; dim text stays dim
