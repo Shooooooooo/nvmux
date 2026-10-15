@@ -114,7 +114,7 @@ pub mod term;
 pub mod wide;
 pub mod wire;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -1039,6 +1039,9 @@ pub struct App {
     /// What each window of the tab page in front wants, by window, as the
     /// measure last said (see [`wide::MEASURE_LUA`]).
     wants: BTreeMap<i64, usize>,
+    /// The window grids this attach has looked at for a width another
+    /// client asked for, each once: see [`App::narrow_windows`].
+    looked: HashSet<u64>,
 }
 
 impl App {
@@ -1097,6 +1100,7 @@ impl App {
             columns: None,
             narrowed: HashMap::new(),
             wants: BTreeMap::new(),
+            looked: HashSet::new(),
         }
     }
 
@@ -1274,7 +1278,9 @@ impl App {
     /// it wants to have a grid as wide as that, and for the rest to have
     /// their own width again (see [`wide`]): a window on a tab page not on
     /// show keeps what it has. With the text not centred, every grid asked
-    /// to be narrower is let go of. Says whether it asked Neovim anything.
+    /// to be narrower is let go of. A window this attach finds on a grid
+    /// another client asked for, and that this one would not narrow, is
+    /// asked for whole. Says whether it asked Neovim anything.
     fn narrow_windows(&mut self) -> bool {
         let on = self.centring() == Centre::Windows && self.multigrid();
         let mut want: HashMap<u64, usize> = HashMap::new();
@@ -1309,7 +1315,33 @@ impl App {
                 .filter(|g| !want.contains_key(g) && self.model.grids.contains_key(g))
                 .map(|g| (*g, 0)),
         );
+        // A window on a grid not its own width is on one another client
+        // asked for: one attached now, the windows' grids being every UI's,
+        // or one killed before it could let go of it, whose ask Neovim keeps
+        // for every UI until one asks for the window whole — keeps as it
+        // was, too, so that a window made narrower since is on a grid wider
+        // than itself. Asked for whole unless this client narrows it itself,
+        // so that the client to attach last has the windows as it wants
+        // them. Looked at once an attach, the first time both widths are
+        // known: what another client asks for after that is left to it.
+        if self.multigrid() {
+            for (&grid, p) in &self.model.layout {
+                let Place::Window { width, .. } = p.place else {
+                    continue;
+                };
+                let Some(g) = self.model.grids.get(&grid) else {
+                    continue;
+                };
+                if grid == 1 || p.hidden || width == 0 || !self.looked.insert(grid) {
+                    continue;
+                }
+                if g.width() != width && !want.contains_key(&grid) {
+                    asks.push((grid, 0));
+                }
+            }
+        }
         asks.sort_unstable();
+        asks.dedup();
         self.narrowed = want;
         let asked = !asks.is_empty();
         for (grid, width) in asks {
@@ -1394,9 +1426,10 @@ impl App {
         let term = std::env::var("TERM").unwrap_or_default();
         let (w, h) = self.editor_size();
         self.told = Some((w, h));
-        // Asked afresh of this attach, which may not have the windows the
-        // last one had grids for.
+        // Asked and looked at afresh by this attach, which may not have the
+        // windows the last one had grids for.
         self.narrowed.clear();
+        self.looked.clear();
         // A centred editor attached at another width than the windows were
         // laid out for has them given the widths they want again, as a change
         // of width while attached does (see `fit`).
@@ -1669,6 +1702,9 @@ impl App {
                             (self.multigrid(), result.and_then(ValueRef::as_array))
                         {
                             self.placed(&wins, answer, now);
+                            // How wide the windows are is known now, where
+                            // Neovim did not say: see `narrow_windows`.
+                            self.narrow_windows();
                         }
                         self.settle(now);
                     }
@@ -4219,6 +4255,16 @@ mod tests {
             .and_then(|(_, _, a)| Some((a.first()?.as_i64()?, a.get(1)?.as_i64()?)))
     }
 
+    /// What `calls` asked of the windows' grids: each grid, and the width
+    /// and height asked for it.
+    fn grids_asked(calls: &[Call]) -> Vec<Vec<Value>> {
+        calls
+            .iter()
+            .filter(|(_, m, _)| m == "nvim_ui_try_resize_grid")
+            .map(|(_, _, args)| args.clone())
+            .collect()
+    }
+
     /// Started with a wide terminal used as `centre` says, every window's
     /// text up to 8 columns; its windows wanting `wanted`, Neovim 20 wide
     /// before it; attached, and what it sent let go of.
@@ -4582,6 +4628,84 @@ mod tests {
                     .and_then(Value::as_str)
                     .is_some_and(|lua| lua.starts_with("local most"))),
             "no measure: {sent:?}"
+        );
+    }
+
+    /// A window on a grid narrower than itself — as a client killed before
+    /// it could let go of one leaves it, for every UI — is asked for whole
+    /// by the next client to attach with windows of their own, as soon as
+    /// it knows how wide the window is: from Neovim placing it, or from the
+    /// layout asked for where Neovim does not. Once: a grid narrower after
+    /// that is one a client attached now asked for.
+    #[test]
+    fn a_window_left_narrow_is_asked_for_whole() {
+        let t0 = Instant::now();
+        let mut a = attached(false, t0);
+        let n = Value::from;
+        redraw(
+            &mut a,
+            vec![
+                resize(2, 8, 5),
+                place(2, 1000, 0, 0, 20, 5),
+                viewport(2, 1000),
+            ],
+            t0,
+        );
+        assert_eq!(grids_asked(&calls(&mut a)), [vec![n(2), n(0), n(0)]]);
+        redraw(&mut a, vec![resize(2, 20, 5)], t0);
+        redraw(&mut a, vec![resize(2, 8, 5)], t0);
+        assert!(grids_asked(&calls(&mut a)).is_empty(), "looked at once");
+
+        // Not placed, as Neovim places no window of a session another UI
+        // drew: not till the layout says how wide it is.
+        redraw(&mut a, vec![resize(3, 8, 5), viewport(3, 1001)], t0);
+        let sent = calls(&mut a);
+        assert!(grids_asked(&sent).is_empty(), "{sent:?}");
+        let laid = Value::Array(vec![n(1), n(0), n(0), n(0), n(20), n(5)]);
+        answer(
+            &mut a,
+            request(&sent, "nvim_exec_lua", "local cur"),
+            Value::Array(vec![laid]),
+            t0,
+        );
+        assert_eq!(grids_asked(&calls(&mut a)), [vec![n(3), n(0), n(0)]]);
+    }
+
+    /// A client centring each window's text has the windows it finds on
+    /// grids another client asked for as it wants them: one it narrows as
+    /// wide as it narrows windows, and one it does not whole — on a grid
+    /// narrower than the window, or wider, the window made narrower since.
+    #[test]
+    fn a_centring_client_has_the_windows_it_finds_as_it_wants_them() {
+        let t0 = Instant::now();
+        let (mut a, _) = wide_app(Centre::Windows, 8, t0);
+        let n = Value::from;
+        redraw(
+            &mut a,
+            vec![
+                resize(1, 20, 6),
+                // Wider than the 8 its text gets, on a grid of 6.
+                resize(2, 6, 2),
+                place(2, 1000, 0, 0, 13, 2),
+                viewport(2, 1000),
+                // Narrower than that, on a grid of 4.
+                resize(3, 4, 2),
+                place(3, 1001, 0, 14, 6, 2),
+                viewport(3, 1001),
+                // And on a grid of 7, wider than it.
+                resize(4, 7, 2),
+                place(4, 1002, 3, 0, 5, 2),
+                viewport(4, 1002),
+            ],
+            t0,
+        );
+        assert_eq!(
+            grids_asked(&calls(&mut a)),
+            [
+                vec![n(2), n(8), n(0)],
+                vec![n(3), n(0), n(0)],
+                vec![n(4), n(0), n(0)],
+            ]
         );
     }
 }
