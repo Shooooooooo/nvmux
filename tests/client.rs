@@ -1413,26 +1413,24 @@ fn predicted_rows_wear_the_colours_neovim_gives_them() {
     step(&mut term, "<C-b> back over it", b"\x02");
 }
 
-/// A config for a wide terminal: every window's text up to 60 columns, and
-/// centred as `centre` says. A session in one window, its status line its
-/// own colour, and a terminal 160 columns wide.
+/// A config for a wide terminal: every window's text centred, up to 60
+/// columns of it. A session in one window, its status line its own colour,
+/// and a terminal 160 columns wide.
 fn wide(
     scratch: &Scratch,
     tag: &str,
-    centre: &str,
 ) -> (
     Terminal,
     nvmux::rpc::Client<std::os::unix::net::UnixStream>,
     PathBuf,
 ) {
-    wide_with(scratch, tag, centre, "")
+    wide_with(scratch, tag, "")
 }
 
 /// [`wide`], with `more` in the config's `[client]` as well.
 fn wide_with(
     scratch: &Scratch,
     tag: &str,
-    centre: &str,
     more: &str,
 ) -> (
     Terminal,
@@ -1442,7 +1440,7 @@ fn wide_with(
     let (sock, mut rpc, config) = session(scratch, tag);
     std::fs::write(
         &config,
-        format!("[client]\ncentre = \"{centre}\"\nwindow_width = 60\n{more}"),
+        format!("[client]\ncentre = true\nwindow_width = 60\n{more}"),
     )
     .expect("write the config");
     rpc.command(
@@ -1468,74 +1466,6 @@ fn columns(n: i64, wins: &[i64]) -> Value {
     ])
 }
 
-/// The editor centred: Neovim is only as wide as its windows side by side
-/// want, and in the middle of the terminal, its status line run on to both
-/// edges; a split widens it and has the windows the same width, closing it
-/// narrows it again.
-#[test]
-fn a_wide_terminal_has_the_editor_centred_as_wide_as_its_windows_want() {
-    require_nvim!();
-    let scratch = Scratch::new("client-centre");
-    let (mut term, mut rpc, _) = wide(&scratch, "client-centre", "editor");
-    let at = |n: usize| format!("{}the left window", " ".repeat(n));
-    assert!(
-        term.pump_until(Duration::from_secs(15), |s| s.starts_with(&at(50))),
-        "one window is not 60 wide in the middle:\n{}",
-        term.text()
-    );
-    assert_eq!(widths(&mut rpc), columns(60, &[60]));
-    // The status line, under the window: across the terminal. Waited for,
-    // and said of in full where it does not come: macOS has drawn it in the
-    // editor's own background, as Linux has never been seen to.
-    let status = Some(vt100::Color::Rgb(0x12, 0x34, 0x56));
-    let bg = |t: &Terminal, col: u16| t.parser.screen().cell(10, col).map(vt100::Cell::bgcolor);
-    let across = |t: &Terminal| [0, 80, 159].iter().all(|&col| bg(t, col) == status);
-    if !term.pump(Duration::from_secs(5), across) {
-        let cells: Vec<_> = [0, 80, 159]
-            .iter()
-            .map(|&col| {
-                let c = term.parser.screen().cell(10, col);
-                c.map(|c| (c.bgcolor(), c.fgcolor(), c.inverse()))
-            })
-            .collect();
-        let editor = rpc
-            .eval("[&termguicolors, &cmdheight, execute('messages')]")
-            .expect("ask the editor");
-        panic!(
-            "the status line is not its colour across the terminal: {cells:?}; \
-             'termguicolors', 'cmdheight' and the messages: {editor}\n{}",
-            term.text()
-        );
-    }
-    let cell = |t: &Terminal, col: u16| t.parser.screen().cell(5, col).map(vt100::Cell::bgcolor);
-    assert_eq!(
-        cell(&term, 0),
-        cell(&term, 80),
-        "a margin is the editor's own background"
-    );
-
-    rpc.command("vsplit").expect("vsplit");
-    assert!(
-        term.pump_until(Duration::from_secs(5), |s| s.starts_with(&at(19))),
-        "a split did not widen it:\n{}",
-        term.text()
-    );
-    assert!(
-        common::wait_until(Duration::from_secs(5), || widths(&mut rpc)
-            == columns(121, &[60, 60])),
-        "the windows are not the same width: {}",
-        widths(&mut rpc)
-    );
-
-    rpc.command("close").expect("close");
-    assert!(
-        term.pump_until(Duration::from_secs(5), |s| s.starts_with(&at(50))),
-        "closing it did not narrow it again:\n{}",
-        term.text()
-    );
-    assert_eq!(term.hang_up(), Some(0), "the client's exit");
-}
-
 /// Each window's text centred: Neovim has the whole terminal, and a window
 /// wider than the text gets has it that wide in its middle, its status line's
 /// words over it; the client gives the windows their width back as it goes.
@@ -1543,7 +1473,7 @@ fn a_wide_terminal_has_the_editor_centred_as_wide_as_its_windows_want() {
 fn a_wide_window_has_its_text_centred_in_it() {
     require_nvim!();
     let scratch = Scratch::new("client-centre-text");
-    let (mut term, mut rpc, _) = wide(&scratch, "client-centre-text", "windows");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-centre-text");
     // One window, the whole terminal wide, its text in the middle.
     let alone = format!("{}the left window", " ".repeat(50));
     assert!(
@@ -1621,7 +1551,7 @@ fn a_wide_window_has_its_text_centred_in_it() {
 fn the_next_client_draws_whole_what_a_centring_one_left() {
     require_nvim!();
     let scratch = Scratch::new("client-centre-left");
-    let (mut term, mut rpc, sock) = wide(&scratch, "client-centre-left", "windows");
+    let (mut term, mut rpc, sock) = wide(&scratch, "client-centre-left");
     // Split once it is drawn: split before the client attaches, the split is
     // laid out for Neovim's own width, and the client's widens the right.
     assert!(
@@ -1673,7 +1603,7 @@ fn the_next_client_draws_whole_what_a_centring_one_left() {
     );
 
     let config = scratch.0.join("config.toml");
-    std::fs::write(&config, "[client]\ncentre = \"off\"\n").expect("write the config");
+    std::fs::write(&config, "[client]\ncentre = false\n").expect("write the config");
     let mut term = Terminal::spawn_sized(&sock, &config, DA1_REPLY, (160, 12));
     let whole = |s: &str| {
         let lines: Vec<&str> = s.lines().collect();
@@ -1704,7 +1634,7 @@ fn the_next_client_draws_whole_what_a_centring_one_left() {
 fn a_ui_without_windows_of_its_own_sees_them_whole() {
     require_nvim!();
     let scratch = Scratch::new("client-centre-ui");
-    let (mut term, mut rpc, sock) = wide(&scratch, "client-centre-ui", "windows");
+    let (mut term, mut rpc, sock) = wide(&scratch, "client-centre-ui");
     assert!(
         term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
         "never drawn:\n{}",
@@ -1751,7 +1681,7 @@ fn a_ui_without_windows_of_its_own_sees_them_whole() {
 fn a_window_showing_a_terminal_keeps_its_width() {
     require_nvim!();
     let scratch = Scratch::new("client-centre-term");
-    let (mut term, mut rpc, _) = wide(&scratch, "client-centre-term", "windows");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-centre-term");
     assert!(
         term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
         "never drawn:\n{}",
@@ -1766,44 +1696,6 @@ fn a_window_showing_a_terminal_keeps_its_width() {
             widths(&mut rpc) == columns(160, &[80, 60])
         }),
         "the terminal narrowed, or the text not: {}\n{}",
-        widths(&mut rpc),
-        term.text()
-    );
-    assert_eq!(term.hang_up(), Some(0), "the client's exit");
-}
-
-/// With the editor centred, a window showing a terminal has the editor take
-/// the whole terminal while it is on show — the terminal's window all of it
-/// the window beside it does not want — and centred again once it is not.
-#[test]
-fn a_terminal_on_show_has_the_editor_take_the_whole_terminal() {
-    require_nvim!();
-    let scratch = Scratch::new("client-editor-term");
-    let (mut term, mut rpc, _) = wide(&scratch, "client-editor-term", "editor");
-    assert!(
-        term.pump_until(Duration::from_secs(15), |s| s
-            .starts_with(&format!("{}the left window", " ".repeat(50)))),
-        "never drawn centred:\n{}",
-        term.text()
-    );
-    rpc.command("vsplit | terminal")
-        .expect("a terminal beside it");
-    assert!(
-        common::wait_until(Duration::from_secs(5), || {
-            term.pump_until(Duration::from_millis(20), |_| false);
-            widths(&mut rpc) == columns(160, &[99, 60])
-        }),
-        "not the whole terminal: {}\n{}",
-        widths(&mut rpc),
-        term.text()
-    );
-    rpc.command("close").expect("the terminal's window closed");
-    assert!(
-        common::wait_until(Duration::from_secs(5), || {
-            term.pump_until(Duration::from_millis(20), |_| false);
-            widths(&mut rpc) == columns(60, &[60])
-        }),
-        "not centred again: {}\n{}",
         widths(&mut rpc),
         term.text()
     );
@@ -1830,7 +1722,7 @@ fn until_widths(
 fn a_windows_text_is_as_wide_as_what_it_shows_wants() {
     require_nvim!();
     let scratch = Scratch::new("client-smart");
-    let (mut term, mut rpc, _) = wide(&scratch, "client-smart", "windows");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-smart");
     assert!(
         term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
         "never drawn:\n{}",
@@ -1866,7 +1758,7 @@ fn a_windows_text_is_as_wide_as_what_it_shows_wants() {
 fn a_markdown_window_has_room_for_its_tables() {
     require_nvim!();
     let scratch = Scratch::new("client-smart-md");
-    let (mut term, mut rpc, _) = wide(&scratch, "client-smart-md", "windows");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-smart-md");
     assert!(
         term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
         "never drawn:\n{}",
@@ -1912,12 +1804,7 @@ fn a_markdown_window_has_room_for_its_tables() {
 fn widths_judged_by_nothing_are_window_width() {
     require_nvim!();
     let scratch = Scratch::new("client-smart-off");
-    let (mut term, mut rpc, _) = wide_with(
-        &scratch,
-        "client-smart-off",
-        "windows",
-        "smart_width = false\n",
-    );
+    let (mut term, mut rpc, _) = wide_with(&scratch, "client-smart-off", "smart_width = false\n");
     assert!(
         term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
         "never drawn:\n{}",
@@ -1927,36 +1814,6 @@ fn widths_judged_by_nothing_are_window_width() {
     assert!(
         until_widths(&mut term, &mut rpc, &columns(160, &[60])),
         "{}",
-        widths(&mut rpc)
-    );
-    assert_eq!(term.hang_up(), Some(0), "the client's exit");
-}
-
-/// With the editor centred, it is as wide as its windows' texts side by side
-/// want, each judged by what it shows, and each window is given what it
-/// wants rather than all the same.
-#[test]
-fn a_centred_editor_gives_each_window_what_it_wants() {
-    require_nvim!();
-    let scratch = Scratch::new("client-smart-editor");
-    let (mut term, mut rpc, _) = wide(&scratch, "client-smart-editor", "editor");
-    assert!(
-        term.pump_until(Duration::from_secs(15), |s| s
-            .starts_with(&format!("{}the left window", " ".repeat(50)))),
-        "never drawn centred:\n{}",
-        term.text()
-    );
-    rpc.command("setlocal textwidth=40").expect("a textwidth");
-    assert!(
-        until_widths(&mut term, &mut rpc, &columns(40, &[40])),
-        "one window: {}",
-        widths(&mut rpc)
-    );
-    rpc.command("vsplit | enew | setlocal textwidth=30")
-        .expect("another window, its own buffer");
-    assert!(
-        until_widths(&mut term, &mut rpc, &columns(71, &[30, 40])),
-        "two: {}",
         widths(&mut rpc)
     );
     assert_eq!(term.hang_up(), Some(0), "the client's exit");

@@ -799,13 +799,7 @@ impl Attachment {
     /// leave standing, and when it went up, which is what it is timed from on
     /// the screen it lands on too (see [`card::Card::up_ms`]); nothing where
     /// there is no fade to stand it through, or no client to draw it.
-    ///
-    /// Where the client laid it is read off the screen, as well: against an
-    /// editor centred on the terminal it stands further in (see
-    /// [`crate::client::wide`]), as far as the client alone knows. The column
-    /// its lines end at goes with the cells, for the session it lands in to
-    /// lay it against the same.
-    fn stand_landing(&mut self, card: &card::Card) -> Option<(shadow::Kept, Instant, u16)> {
+    fn stand_landing(&mut self, card: &card::Card) -> Option<(shadow::Kept, Instant)> {
         if !self.draws_cards || !fade::enabled() || !fade::session() || self.shadow.is_none() {
             return None;
         }
@@ -817,14 +811,11 @@ impl Attachment {
         self.tell_client(&card::Command::Clear);
         self.tell_client(&card::Command::Show(card.clone()));
         let deadline = Instant::now() + CARD_WAIT;
-        let end = crate::client::cards::arrival_end(card, usize::from(size.cols));
         loop {
             self.await_output(deadline.saturating_duration_since(Instant::now()));
             self.drain_unrelayed();
-            if let Some(by) = self.shadow.as_ref().and_then(|s| s.find(&kept)) {
-                let end = u16::try_from(end.saturating_sub(usize::from(by))).unwrap_or(0);
-                let kept = kept.left_by(by).unwrap_or(kept);
-                return Some((kept, Instant::now(), end));
+            if self.shadow.as_ref().is_some_and(|s| s.shows(&kept)) {
+                return Some((kept, Instant::now()));
             }
             if Instant::now() >= deadline {
                 tracing::debug!("the client did not draw the card a switch lands with in time");
@@ -917,9 +908,7 @@ impl Attachment {
         let Some(mut shadow) = self.shadow.take() else {
             return;
         };
-        // Where the client laid it, which against an editor centred on the
-        // terminal is further in than the card says (see `stand_landing`).
-        while shadow.find(&self.kept).is_none() {
+        while !shadow.shows(&self.kept) {
             let now = Instant::now();
             if now >= deadline {
                 tracing::debug!("the client did not draw the card a switch landed with in time");
@@ -928,25 +917,17 @@ impl Attachment {
             let until = deadline.min(now + Duration::from_millis(1));
             self.read_while_fading(&mut shadow, until, Some(&mut *held));
         }
-        if let Some(kept) = shadow
-            .find(&self.kept)
-            .filter(|by| *by > 0)
-            .and_then(|by| self.kept.left_by(by))
-        {
-            self.kept = kept;
-        }
         self.shadow = Some(shadow);
     }
 
     /// The cells this relay's fade in leaves standing: its arrival's, where
-    /// the screen it dissolves in has the arrival on it — as far in as the
-    /// client laid it (see [`shadow::Shadow::find`]) — and none otherwise.
+    /// the screen it dissolves in has the arrival on it (see
+    /// [`shadow::Shadow::shows`]), and none otherwise.
     fn standing(&self) -> shadow::Kept {
-        self.shadow
-            .as_ref()
-            .and_then(|shadow| shadow.find(&self.kept))
-            .and_then(|by| self.kept.left_by(by))
-            .unwrap_or_default()
+        match self.shadow.as_ref() {
+            Some(shadow) if shadow.shows(&self.kept) => self.kept.clone(),
+            _ => shadow::Kept::default(),
+        }
     }
 
     /// The name the picker left standing for this attach (see
@@ -1143,12 +1124,6 @@ impl Attachment {
             (waiting || !name.is_empty())
                 .then(|| card::Card::arrival(card::next_id(), name, waiting).in_row(row))
         });
-        // Where the session the switch left laid it, if it stood there: laid
-        // against the same here, so it stands where it stood.
-        let arrival = match self.hand_off.as_ref().and_then(HandOff::card_end) {
-            Some(end) => arrival.map(|card| card.ending_at(end)),
-            None => arrival,
-        };
         let landed = arrival.is_some();
         let size = term::terminal_size();
         self.kept = arrival.as_ref().map_or_else(shadow::Kept::default, |card| {
@@ -3188,7 +3163,7 @@ pub fn relay(
                 .and_then(|card| attachment.stand_landing(card));
             let kept = stood
                 .as_ref()
-                .map_or_else(shadow::Kept::default, |(kept, _, _)| kept.clone());
+                .map_or_else(shadow::Kept::default, |(kept, _)| kept.clone());
             let faded = attachment.fade_out(&kept);
             raw.restore();
             // Clear here rather than leaving it to the next `relay`, which runs
@@ -3204,9 +3179,9 @@ pub fn relay(
             // in the same synchronized write, for the next relay to take down
             // in the one it draws the card again with (see `crate::handoff`).
             if held.leads_straight_into_another_relay() {
-                let standing = stood.filter(|_| faded).and_then(|(kept, since, end)| {
+                let standing = stood.filter(|_| faded).and_then(|(kept, since)| {
                     let drawn = fade::standing(attachment.shadow.as_ref()?, &kept);
-                    HandOff::card(drawn, kept.spans(), since).map(|h| h.ending_at(end))
+                    HandOff::card(drawn, kept.spans(), since)
                 });
                 match standing {
                     Some(h) => {

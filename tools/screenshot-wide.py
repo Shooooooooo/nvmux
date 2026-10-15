@@ -3,16 +3,13 @@
 
     python3 tools/screenshot-wide.py        # writes assets/wide-*.png
 
-One session, on a terminal wider than its two windows need, shot once for
-each `[client] centre`: nvmux is run three times at a prompt, each with a
-config of its own, and attaches to the session each time -- "off", the
-default, then "windows", then "editor". In that order because the last is
-the one that lays the windows out again for the width it attaches at: an
-editor narrower than the terminal when it was last attached to would leave
-the other two its windows as they were. Each shot is drawn by agg from what
-nvmux had written up to that moment, and set in the demo's window. The
-README says which is which: a label in the picture would be too small to
-read at the width a page shows it.
+One session, on a terminal wider than its two windows need, shot with
+`[client] centre` off and on: nvmux is run twice at a prompt, each time with
+a config of its own, and attaches to the session each time -- off, the
+default, then on. Each shot is drawn by agg from what nvmux had written up
+to that moment, and set in the demo's window. The README says which is
+which: a label in the picture would be too small to read at the width a
+page shows it.
 
 **The terminal is a whole ultra-wide monitor's:** 3440 by 1440 pixels, the
 commonest, filled by a terminal in the demo's font at the demo's size --
@@ -24,8 +21,8 @@ as wide, where its text is not for reading but where it stands is.
 
 **The left window is code and the right one prose,** wrapped at the window's
 width: what a wide window does to a paragraph is most of why a user would
-want its text centred instead. Each fits its window as the centred ways
-have it: a line longer than WIDTH would be cut off, and a paragraph wrapped
+want its text centred instead. Each fits its window with its text
+centred: a line longer than WIDTH would be cut off, and a paragraph wrapped
 past the last row ends in Neovim's `@@@`.
 
 It borrows from tools/record-demo.py -- the theme the pty answers with and
@@ -59,9 +56,9 @@ OUT = os.path.join(demo.ROOT, "assets", "wide-%s.png")
 # at the demo's size -- 9 pixels by 21, with half a cell more all round.
 # And `[client] window_width`, as it is by default, which the prose gets;
 # the code gets its `'textwidth'`, as Rust's is set, and the column of its
-# line numbers beside it, three digits and a space. Two windows that wide
-# side by side leave a margin either side in COLS, and half of COLS is wider
-# than either, so that each of the three ways looks unlike the others.
+# line numbers beside it, three digits and a space. Half of COLS is wider
+# than either, so that centred, each window's text stands well in from the
+# window's left edge, where it starts with centring off.
 COLS, ROWS = 376, 64
 WIDTH = 120
 TEXTWIDTH = 100
@@ -69,16 +66,15 @@ CODE_WIDTH = TEXTWIDTH + 4
 
 NAME = "api-server"
 
-# The shots, in the order they are taken (see the header), each with what
-# the editor then says of itself (see `widths`): `'columns'`, what each
-# window's text is given, and each window's own width. Sharing the whole
-# terminal, the left window is half of it and the right one short of that,
-# for the separator between them.
+# The shots, in the order they are taken (see the header): each one's name,
+# `[client] centre`, and what the editor then says of itself (see `widths`):
+# `'columns'`, what each window's text is given, and each window's own
+# width. Sharing the whole terminal, the left window is half of it and the
+# right one short of that, for the separator between them.
 LEFT, RIGHT = COLS // 2, COLS - 1 - COLS // 2
 SHOTS = [
-    ("off", [COLS, [LEFT, RIGHT], [LEFT, RIGHT]]),
-    ("windows", [COLS, [CODE_WIDTH, WIDTH], [LEFT, RIGHT]]),
-    ("editor", [CODE_WIDTH + 1 + WIDTH, [CODE_WIDTH, WIDTH], [CODE_WIDTH, WIDTH]]),
+    ("off", False, [COLS, [LEFT, RIGHT], [LEFT, RIGHT]]),
+    ("on", True, [COLS, [CODE_WIDTH, WIDTH], [LEFT, RIGHT]]),
 ]
 
 # The project's, in the demo's api-server: some code, and the page of prose
@@ -260,10 +256,9 @@ vim.api.nvim_create_autocmd('FileType', {
 
 # Off camera, in the session: the two files side by side, the code in front
 # and scrolled to its end, and the message line cleared of what opening them
-# said. Made the same width from the code's window, as nvmux's client makes
-# them when it centres the editor: `wincmd =` gives the odd column to the
-# window in front, which a split leaves on the right, so the windows are laid
-# out alike whichever way is shot first.
+# said. Made the same width from the code's window: `wincmd =` gives the odd
+# column to the window in front, which a split leaves on the right, and the
+# shots have it on the left (see LEFT).
 SETUP = r"""
 vim.cmd.cd(%s)
 vim.cmd('silent edit src/sessions.rs')
@@ -278,6 +273,11 @@ vim.cmd.echo('""')
 
 WIDTHS = ("json_encode([&columns, map(range(1, winnr('$')), 'winwidth(v:val)'),"
           " map(nvim_tabpage_list_wins(0), 'nvim_win_get_width(v:val)')])")
+
+
+def toml(on):
+    """A switch as the config file spells it."""
+    return "true" if on else "false"
 
 
 def widths(sock):
@@ -343,8 +343,8 @@ def shoot(env, project, configs):
     term.start_recording()
 
     moments, sock = [], None
-    for centre, want in SHOTS:
-        term.type("NVMUX_CONFIG=%s nvmux\n" % shlex.quote(configs[centre]))
+    for name, centre, want in SHOTS:
+        term.type("NVMUX_CONFIG=%s nvmux\n" % shlex.quote(configs[name]))
         if sock is None:
             term.expect("press c", "the picker")
             term.write(b"c", wait=1.0)
@@ -358,7 +358,7 @@ def shoot(env, project, configs):
             term.expect(NAME, "the picker")
             term.write(demo.ENTER)
             term.expect("sessions.rs", "the session to paint", timeout=20)
-        moments.append(settle(term, want, sock, 'centre = "%s"' % centre))
+        moments.append(settle(term, want, sock, "centre = %s" % toml(centre)))
         # One write, so the chord fits keys.timeout_ms; and back at the
         # prompt, the editor gone with the screen nvmux drew it on, before
         # the next run is typed.
@@ -392,15 +392,15 @@ def render(events, moments, font_dir, work):
         agg += ["--font-dir", font_dir]
     fonts = {cut: demo.font_file(font_dir, cut) for cut in ("Regular", "Bold")}
     window = None
-    for (centre, _), moment in zip(SHOTS, moments):
-        gif = os.path.join(work, "%s.gif" % centre)
+    for (name, _, _), moment in zip(SHOTS, moments):
+        gif = os.path.join(work, "%s.gif" % name)
         subprocess.run(agg + ["--select", "%.4f" % moment, cast, gif], check=True)
         with Image.open(gif) as im:
             screen = im.convert("RGB")
         if window is None:
             window = demo.Window(screen.size, fonts)
         shot = window.frame(screen, None)
-        out = OUT % centre
+        out = OUT % name
         shot.save(out, optimize=True, transparency=255)
         print("wrote %s (%.0f KB)" % (out, os.path.getsize(out) / 1024))
 
@@ -435,14 +435,14 @@ def main():
     with open(init, "w") as f:
         f.write(demo.editor(tmp) + EDITOR)
     configs = {}
-    for centre, _ in SHOTS:
-        configs[centre] = os.path.join(tmp, "%s.toml" % centre)
-        with open(configs[centre], "w") as f:
+    for name, centre, _ in SHOTS:
+        configs[name] = os.path.join(tmp, "%s.toml" % name)
+        with open(configs[name], "w") as f:
             f.write('[keys]\nprefix = "Ctrl-Space"\n\n'
                     '[session]\ncommand = "nvim --headless -u %s -i NONE -n '
                     '--listen {sock}"\n\n'
-                    '[client]\ncentre = "%s"\nwindow_width = %d\n'
-                    % (init, centre, WIDTH))
+                    '[client]\ncentre = %s\nwindow_width = %d\n'
+                    % (init, toml(centre), WIDTH))
 
     env = os.environ.copy()
     env["PATH"] = os.pathsep.join([os.path.dirname(demo.NVMUX), env["PATH"]])
