@@ -1155,10 +1155,15 @@ impl App {
     }
 
     /// What the measure says: `'laststatus'`, and what each window wants.
-    fn measured(&mut self, laststatus: Option<i64>, wants: Option<BTreeMap<i64, usize>>) {
+    fn measured(
+        &mut self,
+        laststatus: Option<i64>,
+        wants: Option<BTreeMap<i64, usize>>,
+        now: Instant,
+    ) {
         if let Some(w) = wants.filter(|w| *w != self.wants) {
             self.wants = w;
-            self.narrow_windows();
+            self.narrow_windows(now);
             self.dirty = true;
         }
         if let Some(l) = laststatus {
@@ -1175,8 +1180,10 @@ impl App {
     /// show keeps what it has. With the text not centred, every grid asked
     /// to be narrower is let go of. A window this attach finds on a grid
     /// another client asked for, and that this one would not narrow, is
-    /// asked for whole. Says whether it asked Neovim anything.
-    fn narrow_windows(&mut self) -> bool {
+    /// asked for whole. A grid asked to be narrower is cut to that width in
+    /// the client's own copy at once, as Neovim will cut its own. Says
+    /// whether it asked Neovim anything.
+    fn narrow_windows(&mut self, now: Instant) -> bool {
         let on = self.centring() && self.multigrid();
         let mut want: HashMap<u64, usize> = HashMap::new();
         if on {
@@ -1240,12 +1247,31 @@ impl App {
         self.narrowed = want;
         let asked = !asks.is_empty();
         for (grid, width) in asks {
+            // What Neovim does to its own copy of the grid once it has the
+            // ask, done to the client's at once: as wide as asked, what it
+            // shows kept from the left, as a resize keeps it. So the window's
+            // text is drawn where it goes from the next frame — a split's
+            // first, as it flies in — not a round trip later, and Neovim's
+            // grid of that width, once it comes, changes no more than where
+            // its lines wrap. A grid asked for wider has what it gains from
+            // Neovim alone.
+            if let Some(g) = self
+                .model
+                .grids
+                .get_mut(&grid)
+                .filter(|g| width > 0 && width < g.width())
+            {
+                g.resize(width, g.height());
+                self.dirty = true;
+            }
             // A height of nought asks for none: the window's own.
             self.outbox.notify(
                 "nvim_ui_try_resize_grid",
                 &[Arg::Int(grid as i64), Arg::Int(width as i64), Arg::Int(0)],
             );
         }
+        // Text that moved in or out of its window slides there.
+        self.anim.insets(&self.model, now);
         asked
     }
 
@@ -1263,9 +1289,9 @@ impl App {
     /// Let go of every grid asked to be narrower than its window, as the
     /// client goes: another UI of the session is to see the windows whole.
     /// Says whether there were any.
-    pub fn let_windows_go(&mut self) -> bool {
+    pub fn let_windows_go(&mut self, now: Instant) -> bool {
         let window_width = std::mem::take(&mut self.window_width);
-        let asked = self.narrow_windows();
+        let asked = self.narrow_windows(now);
         self.window_width = window_width;
         asked
     }
@@ -1413,7 +1439,7 @@ impl App {
                 }
             }
             Some("options") => self.anim.set_options(options(&params[1..])),
-            Some("measure") => self.measured(int(1), wants(params.get(2))),
+            Some("measure") => self.measured(int(1), wants(params.get(2)), now),
             // The attributes of the editor's highlight groups the colours
             // of the lines it sends name.
             Some("colours") => {
@@ -1454,9 +1480,9 @@ impl App {
 
     /// Detach, to attach again as `multigrid` says once Neovim has done it:
     /// the windows let go of first, while Neovim still takes it of this UI.
-    fn leave(&mut self, multigrid: bool) {
+    fn leave(&mut self, multigrid: bool, now: Instant) {
         tracing::info!(multigrid, "client: attaching again for the UIs there are");
-        self.let_windows_go();
+        self.let_windows_go(now);
         let id = self.outbox.request("nvim_ui_detach", &[]);
         self.asked.insert(id, Ask::Detach);
         self.attach = Attach::Leaving { multigrid };
@@ -1556,7 +1582,7 @@ impl App {
                     Some(Ask::Measure) => {
                         let answer = result.and_then(ValueRef::as_array);
                         let laststatus = answer.and_then(|a| a.first()).and_then(redraw::int);
-                        self.measured(laststatus, wants(answer.and_then(|a| a.get(1))));
+                        self.measured(laststatus, wants(answer.and_then(|a| a.get(1))), now);
                     }
                     Some(Ask::Uis) => {
                         self.checking = false;
@@ -1576,7 +1602,7 @@ impl App {
                             self.placed(&wins, answer, now);
                             // How wide the windows are is known now, where
                             // Neovim did not say: see `narrow_windows`.
-                            self.narrow_windows();
+                            self.narrow_windows(now);
                         }
                         self.settle(now);
                     }
@@ -1609,7 +1635,7 @@ impl App {
     fn consider(&mut self, foreign: bool, passing: bool, now: Instant) {
         match self.attach {
             Attach::Asking => self.attach_as(!foreign),
-            Attach::Attached { multigrid: true } if foreign => self.leave(false),
+            Attach::Attached { multigrid: true } if foreign => self.leave(false, now),
             Attach::Attached { multigrid: true } => {
                 if passing {
                     self.recheck_at = Some(now + RECHECK);
@@ -1622,7 +1648,7 @@ impl App {
                 }
             }
             Attach::Attached { multigrid: false } if !foreign && self.multigrid_wanted => {
-                self.leave(true);
+                self.leave(true, now);
             }
             Attach::Attached { .. } | Attach::Leaving { .. } => {}
         }
@@ -1788,7 +1814,7 @@ impl App {
         if self.multigrid() {
             self.inspect(now);
         }
-        self.narrow_windows();
+        self.narrow_windows(now);
         self.settle(now);
     }
 
@@ -2804,7 +2830,7 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
     };
     // Whatever ended it, the terminal is handed back as it was — and the
     // windows their own width, for whoever else draws them.
-    if app.let_windows_go() {
+    if app.let_windows_go(Instant::now()) {
         leave(stream, inbox, std::mem::take(&mut app.outbox));
     } else {
         let _ = app.outbox.send(&mut stream);
@@ -4104,9 +4130,40 @@ mod tests {
         assert!(narrowed(&calls(&mut a)).is_empty(), "asked once");
         assert_eq!(shown(&mut a, t0)[0], "      text", "6 in, of 20");
 
-        assert!(a.let_windows_go(), "a grid to let go of");
+        assert!(a.let_windows_go(t0), "a grid to let go of");
         assert_eq!(narrowed(&calls(&mut a)), [vec![n(2), n(0), n(0)]]);
-        assert!(!a.let_windows_go(), "none left");
+        assert!(!a.let_windows_go(t0), "none left");
+    }
+
+    /// A window's grid is cut to the width the client asks for at once, as
+    /// Neovim will cut its own: its text is in the middle of the window in
+    /// the next frame, not a round trip later, and Neovim's grid of that
+    /// width, when it comes, changes nothing of where.
+    #[test]
+    fn a_window_narrowed_is_drawn_narrowed_at_once() {
+        let t0 = Instant::now();
+        let (mut a, _) = wide_app(t0);
+        let n = Value::from;
+        redraw(
+            &mut a,
+            vec![
+                resize(1, 20, 6),
+                resize(2, 20, 5),
+                ("win_pos", vec![n(2), n(1000), n(0), n(0), n(20), n(5)]),
+                viewport(2, 1000),
+                line(2, 0, "text"),
+            ],
+            t0,
+        );
+        assert_eq!(a.model.grids[&2].width(), 8, "cut as asked");
+        assert_eq!(
+            shown(&mut a, t0)[0],
+            "      text",
+            "6 in, of 20, unanswered"
+        );
+        redraw(&mut a, vec![resize(2, 8, 5)], t0);
+        a.screen.invalidate();
+        assert_eq!(shown(&mut a, t0)[0], "      text", "answered");
     }
 
     /// Attaching again without `ext_multigrid` for a UI that keeps windows on

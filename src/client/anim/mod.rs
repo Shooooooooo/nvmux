@@ -174,6 +174,16 @@ struct Snap {
     delta: i64,
 }
 
+/// A grid as [`Animator::insets`] last saw it: where the editor put it, how
+/// wide its window is — nought for a float — and how far in from there its
+/// text is drawn (see [`Model::inset`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Inset {
+    origin: (i64, i64),
+    width: usize,
+    inset: usize,
+}
+
 /// Every animation in flight.
 #[derive(Debug)]
 pub struct Animator {
@@ -184,6 +194,12 @@ pub struct Animator {
     /// Windows scrolled sideways ahead of Neovim, by grid.
     sides: HashMap<u64, Side>,
     motions: HashMap<u64, Motion>,
+    /// Text on its way across its window to where it goes in it, by grid:
+    /// moved in or out, its grid made narrower or wider, with the window
+    /// where it was (see [`Animator::insets`]). Only the columns move.
+    shifts: HashMap<u64, Motion>,
+    /// Each grid on show as [`Animator::insets`] last saw it.
+    seen: HashMap<u64, Inset>,
     /// Split windows on their way from one layout to another.
     transition: Option<Transition>,
     /// Windows fading from one buffer to another, by grid.
@@ -209,6 +225,8 @@ impl Animator {
             scrolls: HashMap::new(),
             sides: HashMap::new(),
             motions: HashMap::new(),
+            shifts: HashMap::new(),
+            seen: HashMap::new(),
             transition: None,
             switches: HashMap::new(),
             options: layout::Options::default(),
@@ -227,6 +245,8 @@ impl Animator {
         self.scrolls.clear();
         self.sides.clear();
         self.motions.clear();
+        self.shifts.clear();
+        self.seen.clear();
         self.transition = None;
         self.switches.clear();
         self.cell = None;
@@ -693,6 +713,8 @@ impl Animator {
     pub fn cursor_at(&self, model: &Model) -> (i64, i64) {
         let (row, col) = model.cursor_on_screen();
         let c = model.cursor;
+        // With its text, should that be on its way across its window.
+        let col = col + self.shift_of(c.grid);
         if let Some((r, k)) = self.sides.get(&c.grid).and_then(Side::cursor) {
             return (row - c.row as i64 + r as i64, col - c.col as i64 + k as i64);
         }
@@ -733,6 +755,7 @@ impl Animator {
             || self.vfx.moving()
             || self.scrolls.values().any(Scroll::moving)
             || !self.motions.is_empty()
+            || !self.shifts.is_empty()
             || self.transition.is_some()
             || !self.switches.is_empty()
             || self.blink_due(model, now).is_some()
@@ -756,6 +779,7 @@ impl Animator {
             || self.vfx.moving()
             || self.scrolls.values().any(Scroll::moving)
             || !self.motions.is_empty()
+            || !self.shifts.is_empty()
             || self.transition.is_some()
             || !self.switches.is_empty();
         let frame = moving.then(|| self.last.map_or(now, |last| last + FRAME));
@@ -789,6 +813,7 @@ impl Animator {
             .retain(|_, s| s.until().is_some_and(|until| until > now));
         if let Some(w) = self.effects.windows {
             self.motions.retain(|_, m| m.step(dt, w.slide));
+            self.shifts.retain(|_, m| m.step(dt, w.slide));
         }
         if self.transition.as_mut().is_some_and(|t| !t.step(dt)) {
             self.transition = None;
@@ -837,6 +862,51 @@ impl Animator {
         }
         cursor
     }
+
+    /// Note how far in each grid on show has its text: one whose text moved
+    /// in or out of its window — its grid made narrower or wider, as the
+    /// client asks of Neovim with each window's text centred (see
+    /// `crate::client::wide`) — with the window where it was and as wide,
+    /// slides there from where it was, as a grid that moves does
+    /// ([`motion`]). A grid seen for the first time, or put somewhere else,
+    /// is simply where it goes: a window's own animation takes it there.
+    pub fn insets(&mut self, model: &Model, now: Instant) {
+        // Moved on from now, not from whenever the last animation ended.
+        if !self.animating(model, now) {
+            self.last = Some(now);
+        }
+        let mut seen = HashMap::new();
+        for (&grid, p) in &model.layout {
+            if grid == 1 || p.hidden {
+                continue;
+            }
+            let width = match p.place {
+                Place::Window { width, .. } => width,
+                _ => 0,
+            };
+            let here = Inset {
+                origin: p.origin(),
+                width,
+                inset: model.inset(grid),
+            };
+            if let (Some(was), Some(_)) = (self.seen.get(&grid), self.effects.windows) {
+                if (was.origin, was.width) == (here.origin, here.width) && was.inset != here.inset {
+                    let by = here.inset as i64 - was.inset as i64;
+                    self.shifts.entry(grid).or_default().moved((0, by));
+                }
+            }
+            seen.insert(grid, here);
+        }
+        self.seen = seen;
+        let seen = &self.seen;
+        self.shifts.retain(|grid, _| seen.contains_key(grid));
+    }
+
+    /// How far grid `grid`'s text is drawn from where it goes in its window,
+    /// in columns, on its way there (see [`Animator::insets`]).
+    fn shift_of(&self, grid: u64) -> i64 {
+        self.shifts.get(&grid).map_or(0, |m| m.offset().1)
+    }
 }
 
 impl View for Animator {
@@ -857,9 +927,13 @@ impl View for Animator {
         }
     }
 
+    fn shift(&self, grid: u64) -> i64 {
+        self.shift_of(grid)
+    }
+
     fn over_windows(&self, frame: &mut Frame, model: &Model) {
         if let Some(t) = &self.transition {
-            t.paint(frame, model);
+            t.paint(frame, model, &|grid| self.shift_of(grid));
         }
         for s in self.switches.values() {
             s.paint(frame, model);
@@ -1169,6 +1243,55 @@ mod tests {
         a.advance(t0 + Duration::from_secs(1));
         assert_eq!(a.origin(5, (0, 15)), (0, 15), "and arrived");
         assert!(!a.smear.moving());
+    }
+
+    /// Text that moves in or out of its window — its grid made narrower or
+    /// wider, the window where it was — is drawn where it was and slides to
+    /// where it goes, the cursor with it, either way; a window seen for the
+    /// first time, or resized with its grid, is simply where it goes.
+    #[test]
+    fn text_moved_across_its_window_slides_there() {
+        let (mut a, mut m, t0) = (Animator::new(effects()), model(), Instant::now());
+        setup(&mut a, &mut m, t0);
+        let grid = |width| Event::GridResize {
+            grid: 2,
+            width,
+            height: 10,
+        };
+        let secs = |s: u64| t0 + Duration::from_secs(s);
+        a.insets(&m, t0);
+        assert_eq!(a.shift_of(2), 0, "seen for the first time");
+
+        // Made narrower as the client asks for it — no batch — long after
+        // anything last moved: ten wide on a grid of six, two in.
+        m.grids.get_mut(&2).expect("window 2").resize(6, 10);
+        a.insets(&m, secs(9));
+        assert_eq!(a.shift_of(2), -2, "drawn where it was");
+        assert_eq!(a.cursor_at(&m), (0, 0), "the cursor with it");
+        assert_eq!(a.next_frame(&m, secs(9)), Some(secs(9) + FRAME));
+        a.advance(secs(9) + FRAME);
+        assert!(a.shift_of(2) < 0, "on its way from then, not from long ago");
+        a.advance(secs(10));
+        assert_eq!(a.shift_of(2), 0, "and there");
+        assert_eq!(a.cursor_at(&m), (0, 2));
+
+        batch(&mut a, &mut m, vec![grid(10)], true, secs(10));
+        a.insets(&m, secs(10));
+        assert_eq!(a.shift_of(2), 2, "back out, the other way");
+        a.advance(secs(11));
+        assert_eq!(a.shift_of(2), 0);
+
+        let wider = Event::WinPos {
+            grid: 2,
+            win: Some(1002),
+            row: 0,
+            col: 0,
+            width: 20,
+            height: 10,
+        };
+        batch(&mut a, &mut m, vec![wider, grid(12)], true, secs(11));
+        a.insets(&m, secs(11));
+        assert_eq!(a.shift_of(2), 0, "the window's own move");
     }
 
     /// A window that scrolls shows the lines it showed, a row on at once,

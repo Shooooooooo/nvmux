@@ -1717,6 +1717,67 @@ fn the_next_client_gives_back_the_width_a_killed_one_took() {
     assert_eq!(term.hang_up(), Some(0), "the client's exit");
 }
 
+/// Over a slow link, a window split off another, each window's text
+/// centred, has its text in the middle of the window from the first frame
+/// it shows in: the client cuts the grid to the width it asks for at once,
+/// rather than drawing the window's text from its edge until Neovim's
+/// narrower grid comes, a round trip later. On its way in, the new window's
+/// text only ever moves left, to where it goes — never back right, as it
+/// did when the narrower grid came.
+#[test]
+fn a_split_over_a_slow_link_is_centred_from_its_first_frame() {
+    require_nvim!();
+    let scratch = Scratch::new("client-centre-slow");
+    let (sock, mut rpc, config) = session(&scratch, "client-centre-slow");
+    std::fs::write(&config, "[client]\ncentre = true\nwindow_width = 60\n")
+        .expect("write the config");
+    rpc.command(
+        "setlocal noswapfile | set splitright \
+         | call setline(1, map(range(1, 10), '\"MARK \" . v:val'))",
+    )
+    .expect("set the session up");
+    let slow = slow_link(&scratch.0.join("link"), &sock, Duration::from_millis(80));
+    let mut term = Terminal::spawn_sized(&slow, &config, DA1_REPLY, (160, 12));
+    assert!(
+        term.pump_until(Duration::from_secs(20), |s| s
+            .starts_with(&format!("{}MARK 1", " ".repeat(50)))),
+        "never drawn centred:\n{}",
+        term.text()
+    );
+
+    rpc.command("vsplit").expect("vsplit");
+    // The column the new window's text starts at on the first row, each
+    // time it moves, as it flies in and once it has landed.
+    let right = |t: &Terminal| -> Option<usize> {
+        let text = t.text();
+        let row = text.lines().next()?;
+        let (at, _) = row.match_indices("MARK").nth(1)?;
+        Some(row[..at].chars().count())
+    };
+    let mut seen: Vec<usize> = Vec::new();
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until {
+        term.pump_until(Duration::from_millis(5), |_| false);
+        if let Some(col) = right(&term).filter(|col| seen.last() != Some(col)) {
+            seen.push(col);
+        }
+    }
+    let goes = rpc
+        .eval("[win_screenpos(2)[1] - 1, nvim_win_get_width(win_getid(2))]")
+        .expect("where the new window is");
+    let goes: Vec<i64> = goes
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default();
+    let want = usize::try_from(goes[0] + (goes[1] - 60) / 2).expect("a column");
+    assert_eq!(seen.last(), Some(&want), "landed in its middle: {seen:?}");
+    assert!(
+        seen.windows(2).all(|w| w[1] <= w[0]),
+        "moved back right on its way in: {seen:?}"
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
 /// A UI that keeps every window on grid 1 sees the windows whole: the client
 /// attaching again without `ext_multigrid` lets go of the windows it had
 /// narrowed, and once that UI has gone and the client has windows of its own

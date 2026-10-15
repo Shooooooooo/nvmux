@@ -120,6 +120,13 @@ pub trait View {
     /// The scroll in progress on grid `grid`, if one is.
     fn scroll(&self, grid: u64) -> Option<&dyn Scrolling>;
 
+    /// How far grid `grid`'s text is drawn from where it goes in its window,
+    /// in columns, on its way there: moved in or out, its grid made narrower
+    /// or wider with the window where it was (see `super::wide`).
+    fn shift(&self, _grid: u64) -> i64 {
+        0
+    }
+
     /// Draw over the windows, once they are all drawn and before the floats
     /// are: split windows on their way from one layout to another, a window
     /// fading from one buffer to the next.
@@ -153,11 +160,11 @@ impl View for Still {
 /// Put the frame together. See the module docs.
 pub fn compose(model: &Model, view: &dyn View, width: usize, height: usize) -> Frame {
     let mut frame = Frame::new(width, height, model.style(0));
-    draw(&mut frame, model, view, 1, (0, 0), None, false);
+    draw(&mut frame, model, view, 1, (0, 0), Within::default(), false);
 
     // A window's status line stands over its text, where that is drawn
     // narrower than the window (see `super::wide`).
-    status_lines_over_text(&mut frame, model);
+    status_lines_over_text(&mut frame, model, view);
 
     // Windows next: they never overlap one another, so their order is
     // nobody's business. Under each, grid 1 has whatever Neovim drew there
@@ -187,7 +194,28 @@ pub fn compose(model: &Model, view: &dyn View, width: usize, height: usize) -> F
         }
         if let Place::Window { .. } = p.place {
             let at = view.origin(grid, model.drawn_origin(grid));
-            draw(&mut frame, model, view, grid, at, None, false);
+            // Its text on its way across the window, should it be, and kept
+            // to the window as it goes.
+            let shift = view.shift(grid);
+            let within = Within {
+                cols: model
+                    .window_cells(grid)
+                    .filter(|_| shift != 0)
+                    .map(|(_, _, width, _)| {
+                        let left = at.1 - model.inset(grid) as i64;
+                        (left, left + width as i64)
+                    }),
+                ..Within::default()
+            };
+            draw(
+                &mut frame,
+                model,
+                view,
+                grid,
+                (at.0, at.1 + shift),
+                within,
+                false,
+            );
         }
     }
     view.over_windows(&mut frame, model);
@@ -202,7 +230,11 @@ pub fn compose(model: &Model, view: &dyn View, width: usize, height: usize) -> F
     for (_, grid, p) in layers {
         let at = view.origin(grid, model.drawn_origin(grid));
         match &p.place {
-            Place::Float { .. } => draw(&mut frame, model, view, grid, at, None, true),
+            // One anchored to a window goes with the window's text.
+            Place::Float { .. } => {
+                let at = (at.0, at.1 + view.shift(grid));
+                draw(&mut frame, model, view, grid, at, Within::default(), true);
+            }
             Place::Message { scrolled, sep, .. } => {
                 // The message area covers the screen from its row down, and
                 // no further whatever its grid's height.
@@ -210,7 +242,11 @@ pub fn compose(model: &Model, view: &dyn View, width: usize, height: usize) -> F
                 if *scrolled && at.0 > 0 {
                     separator(&mut frame, model, at.0 - 1, sep);
                 }
-                draw(&mut frame, model, view, grid, at, Some(rows), true);
+                let within = Within {
+                    rows: Some(rows),
+                    ..Within::default()
+                };
+                draw(&mut frame, model, view, grid, at, within, true);
             }
             Place::Window { .. } => {}
         }
@@ -223,13 +259,21 @@ pub fn compose(model: &Model, view: &dyn View, width: usize, height: usize) -> F
 /// Draw grid `grid` with its top left at `at`, its first `rows` rows if that
 /// is given, mixing it into what is under it where `blends` and its
 /// highlights say to.
+/// How much of a grid [`draw`] puts on the frame: rows from its top, and the
+/// columns of the frame it may cover — all of either where not said.
+#[derive(Debug, Clone, Copy, Default)]
+struct Within {
+    rows: Option<usize>,
+    cols: Option<(i64, i64)>,
+}
+
 fn draw(
     frame: &mut Frame,
     model: &Model,
     view: &dyn View,
     grid: u64,
     at: (i64, i64),
-    rows: Option<usize>,
+    within: Within,
     blends: bool,
 ) {
     let Some(g) = model.grids.get(&grid) else {
@@ -238,7 +282,7 @@ fn draw(
     let colors = model.colors();
     let scroll = view.scroll(grid);
     let blank = Cell::default();
-    let height = rows.map_or(g.height(), |n| n.min(g.height()));
+    let height = within.rows.map_or(g.height(), |n| n.min(g.height()));
     for r in 0..height {
         let y = at.0 + r as i64;
         if y < 0 || y >= frame.height as i64 {
@@ -255,7 +299,8 @@ fn draw(
         });
         for c in 0..g.width() {
             let x = at.1 + c as i64;
-            if x < 0 || x >= frame.width as i64 {
+            let outside = within.cols.is_some_and(|(lo, hi)| x < lo || x >= hi);
+            if x < 0 || x >= frame.width as i64 || outside {
                 continue;
             }
             let (cell, wide) = match scrolled {
@@ -304,7 +349,7 @@ fn draw(
 /// window at 2; at 1 every window where there are two or more; and at 0 the
 /// ones with another window under them. None where it is 3, one line across
 /// the whole screen, or where it is not known.
-fn status_lines_over_text(frame: &mut Frame, model: &Model) {
+fn status_lines_over_text(frame: &mut Frame, model: &Model, view: &dyn View) {
     let Some(laststatus) = model.laststatus.filter(|l| *l != 3) else {
         return;
     };
@@ -320,7 +365,8 @@ fn status_lines_over_text(frame: &mut Frame, model: &Model) {
         .max()
         .unwrap_or(0);
     for &(grid, (row, col, width, height)) in &windows {
-        let inset = model.inset(grid);
+        // Where its text is drawn, on its way there or not.
+        let inset = model.inset(grid) as i64 + view.shift(grid);
         let Some(g) = model.grids.get(&grid).filter(|_| inset > 0) else {
             continue;
         };
@@ -335,7 +381,7 @@ fn status_lines_over_text(frame: &mut Frame, model: &Model) {
         }
         let start = below * frame.width + col;
         let end = start + width.min(frame.width - col);
-        super::wide::realign(&mut frame.cells[start..end], inset, g.width());
+        super::wide::realign(&mut frame.cells[start..end], inset as usize, g.width());
     }
 }
 
@@ -607,6 +653,49 @@ mod tests {
         ]);
         assert_eq!(compose(&m, &Still, 4, 1).text(), "wwld");
         assert_eq!(compose(&m, &Away, 4, 1).text(), "  ww");
+    }
+
+    /// A window's text on its way across its window is drawn as far from
+    /// where it goes as the view says, and kept to the window: what it has
+    /// past the window's edge is not drawn over the separator beside it.
+    #[test]
+    fn text_on_its_way_across_its_window_stays_in_it() {
+        struct Across;
+        impl View for Across {
+            fn origin(&self, _grid: u64, placed: (i64, i64)) -> (i64, i64) {
+                placed
+            }
+            fn scroll(&self, _grid: u64) -> Option<&dyn Scrolling> {
+                None
+            }
+            fn shift(&self, grid: u64) -> i64 {
+                if grid == 2 {
+                    2
+                } else {
+                    0
+                }
+            }
+        }
+        let m = model(vec![
+            resize(1, 6, 1),
+            line(1, 0, "   |  ", 0),
+            resize(2, 3, 1),
+            line(2, 0, "abc", 0),
+            Event::WinPos {
+                grid: 2,
+                win: Some(1000),
+                row: 0,
+                col: 0,
+                width: 3,
+                height: 1,
+            },
+        ]);
+        assert_eq!(compose(&m, &Still, 6, 1).text(), "abc|  ");
+        assert_eq!(
+            compose(&m, &Across, 6, 1).text(),
+            "  a|  ",
+            "two columns on its way, and cut at the window's edge"
+        );
     }
 
     /// Where an animation says a grid is this frame is where it is drawn.
