@@ -1189,7 +1189,10 @@ impl Transition {
 
     /// Draw the windows as they are this frame, over where the compositor put
     /// them.
-    pub fn paint(&self, frame: &mut Frame, model: &Model) {
+    /// Draw the windows as they are this frame, each window's text `shift`
+    /// columns from where it goes in it, on its way there (see
+    /// `super::Animator::insets`).
+    pub fn paint(&self, frame: &mut Frame, model: &Model, shift: &dyn Fn(u64) -> i64) {
         let e = self.progress();
         let colors = model.colors();
         let now = self.frames_at(e);
@@ -1217,9 +1220,10 @@ impl Transition {
         let chrome = model.grids.get(&1);
         for (grid, (_, pane)) in &self.wins {
             let at = now[grid];
-            draw_window(frame, model, *grid, pane, at, self.rows.get(grid));
+            let shift = shift(*grid);
+            draw_window(frame, model, *grid, pane, at, self.rows.get(grid), shift);
             if let Some(chrome) = chrome {
-                draw_lines(frame, model, chrome, *grid, pane, at);
+                draw_lines(frame, model, chrome, *grid, pane, at, shift);
             }
         }
         if let Some((grid, bg)) = self.veil {
@@ -1249,6 +1253,7 @@ fn draw_window(
     pane: &Pane,
     at: Area,
     old: Option<&Vec<Vec<Cell>>>,
+    shift: i64,
 ) {
     let text = pane.grid(at);
     let g = model.grids.get(&grid);
@@ -1263,6 +1268,8 @@ fn draw_window(
     } else {
         0
     };
+    // And `shift` from there, on its way across the window.
+    let pad = (pad as i64 + shift).max(0) as usize;
     for r in 0..height {
         for c in 0..width {
             let k = c.checked_sub(pad);
@@ -1316,7 +1323,15 @@ fn edge(g: Option<&Grid>, old: Option<&Vec<Vec<Cell>>>, r: usize, c: usize) -> u
 /// A window's separator and status line in the frame `at`, as Neovim drew
 /// them where the window ends up: the separator as long as the frame is
 /// deep, and the status line as wide as it is (see [`stretch`]).
-fn draw_lines(frame: &mut Frame, model: &Model, chrome: &Grid, grid: u64, pane: &Pane, at: Area) {
+fn draw_lines(
+    frame: &mut Frame,
+    model: &Model,
+    chrome: &Grid,
+    grid: u64,
+    pane: &Pane,
+    at: Area,
+    shift: i64,
+) {
     let f = pane.frame;
     let cell = |row: i64, col: i64| {
         let (row, col) = (usize::try_from(row).ok()?, usize::try_from(col).ok()?);
@@ -1362,11 +1377,12 @@ fn draw_lines(frame: &mut Frame, model: &Model, chrome: &Grid, grid: u64, pane: 
             usize::try_from(at.left),
         ) {
             let end = (left + body).min(frame.width);
+            let inset = (((body - text) / 2) as i64 + shift).max(0) as usize;
             if row < frame.height && left < end {
                 let start = row * frame.width;
                 crate::client::wide::realign(
                     &mut frame.cells[start + left..start + end],
-                    (body - text) / 2,
+                    inset,
                     text,
                 );
             }

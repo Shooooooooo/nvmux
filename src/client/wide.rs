@@ -15,6 +15,16 @@
 //! window's own width back, and waits a moment for Neovim to have done it
 //! ([`super::run`]).
 //!
+//! The client cuts its own copy of a grid to the width it asks for as it
+//! asks, as Neovim cuts its own once it has the ask: a window split off
+//! another has its text in its middle from the first frame of its flying in,
+//! not a round trip later — over a slow link, once it had landed against the
+//! window's edge — and Neovim's grid of that width, when it comes, moves
+//! nothing, but for where long lines wrap. Text that moves in or out of a
+//! window that stays where it is — the window's width judged again, or the
+//! window wanting the whole terminal — slides there rather than jumping (see
+//! [`super::anim::Animator::insets`]).
+//!
 //! A client killed outright — by nvmux, still there two seconds after it was
 //! hung up, or by a crash — asks for nothing back, and Neovim keeps a grid
 //! as it was asked for until a UI asks for the window whole. So a client

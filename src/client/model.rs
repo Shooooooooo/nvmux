@@ -402,11 +402,17 @@ impl Model {
     }
 
     /// Where the cursor is on the screen, as the editor has laid it out — no
-    /// animation of a window's moving counted.
+    /// animation of a window's moving counted. No further right than its
+    /// grid: one the client has made narrower before Neovim has (see
+    /// [`super::wide`]) may have it past that until Neovim moves it.
     pub fn cursor_on_screen(&self) -> (i64, i64) {
         let c = self.cursor;
         let (r, k) = self.drawn_origin(c.grid);
-        (r + c.row as i64, k + c.col as i64)
+        let col = self
+            .grids
+            .get(&c.grid)
+            .map_or(c.col, |g| c.col.min(g.width().saturating_sub(1)));
+        (r + c.row as i64, k + col as i64)
     }
 
     /// How far in from where the editor put it grid `grid` is drawn: a
