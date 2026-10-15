@@ -219,29 +219,6 @@ impl Kept {
         self.spans.is_empty()
     }
 
-    /// These cells, `by` columns to the left: where an arrival laid against
-    /// an editor centred on a terminal wider than it stands (see
-    /// [`Shadow::find`]). `None` where that would put any of it off the
-    /// screen.
-    pub fn left_by(&self, by: u16) -> Option<Self> {
-        let back = |c: u16| c.checked_sub(by);
-        let cells = |v: &[(u16, u16, char)]| -> Option<Vec<(u16, u16, char)>> {
-            v.iter()
-                .map(|&(row, col, ch)| Some((row, back(col)?, ch)))
-                .collect()
-        };
-        Some(Self {
-            spans: self
-                .spans
-                .iter()
-                .map(|&(row, from, to)| Some((row, back(from)?, back(to)?)))
-                .collect::<Option<_>>()?,
-            glyphs: cells(&self.glyphs)?,
-            moving: cells(&self.moving)?,
-            shift: self.shift,
-        })
-    }
-
     /// Whether what stands moves as it stands: a row of names a step moves
     /// along, which the client goes on drawing as it moves.
     pub fn moves(&self) -> bool {
@@ -494,16 +471,6 @@ impl Shadow {
     /// all the same way along, as far as they go or less. A dissolve leaves
     /// them standing only then — otherwise they would stand with whatever the
     /// session has there.
-    /// How far left of where `kept` says the screen shows it, if anywhere,
-    /// the nearest first: nowhere further, most often, but an arrival laid
-    /// against an editor centred on a terminal wider than it (see
-    /// [`crate::client::wide`]) stands that much further in — which only its
-    /// client knows, and the screen says.
-    pub fn find(&self, kept: &Kept) -> Option<u16> {
-        let furthest = kept.glyphs.iter().chain(&kept.moving).map(|g| g.1).min()?;
-        (0..=furthest).find(|&by| kept.left_by(by).is_some_and(|k| self.shows(&k)))
-    }
-
     pub fn shows(&self, kept: &Kept) -> bool {
         if self.broken || (kept.glyphs.is_empty() && kept.moving.is_empty()) {
             return false;
@@ -1168,38 +1135,6 @@ mod tests {
             !shadow.shows(&Kept::new([(1, 12, 17)], [])),
             "nothing to look for"
         );
-    }
-
-    /// A card laid further in than it says — against an editor centred on a
-    /// terminal wider than it — is found where the screen shows it, the
-    /// nearest first; one drawn nowhere is found nowhere, and a stand moved
-    /// off the screen's edge is no stand.
-    #[test]
-    fn a_card_laid_further_in_is_found_where_it_stands() {
-        let name = |col: usize| {
-            (col..col + 4)
-                .zip("blog".chars())
-                .map(|(col, ch)| (1, col, ch))
-        };
-        let kept = Kept::new([(1, 14, 17)], name(14));
-        let at = |col: u16| {
-            let mut shadow = Shadow::new(6, 20);
-            shadow.feed(b"\x1b[2;1Habcdefghijklmnopqrst");
-            shadow.feed(format!("\x1b[2;{}Hblog", col + 1).as_bytes());
-            shadow
-        };
-        assert_eq!(at(14).find(&kept), Some(0), "where it says");
-        assert_eq!(at(9).find(&kept), Some(5), "five in");
-        assert_eq!(at(0).find(&kept), Some(14), "all the way");
-        let mut bare = Shadow::new(6, 20);
-        bare.feed(b"\x1b[2;1Habcdefghijklmnopqrst");
-        assert_eq!(bare.find(&kept), None, "not drawn");
-        assert_eq!(
-            kept.left_by(5),
-            Some(Kept::new([(1, 9, 12)], name(9))),
-            "its cells, five to the left"
-        );
-        assert_eq!(kept.left_by(15), None, "off the edge");
     }
 
     /// A card on the move stands wherever along its way the screen shows it,

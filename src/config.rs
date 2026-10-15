@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::error::ConfigError;
 use crate::palette::Rgb;
@@ -186,16 +186,17 @@ pub struct ClientSettings {
     /// and those colours, as the view moves — more of them the slower the
     /// link. Off, every scroll waits for Neovim.
     pub predict: bool,
-    /// What a session does with a terminal wider than its windows need (see
-    /// [`Centre`]): nothing, the default; each window's text centred in it;
-    /// or the editor only as wide as its windows want, and centred. nvmux's
-    /// own client only: Neovim's draws on the whole terminal.
-    pub centre: Centre,
-    /// How many columns a window's text gets with `centre` on: how wide the
-    /// text is that is centred in a wider window, and what each window side
-    /// by side wants of a centred editor — where `smart_width` does not judge
-    /// otherwise. 0 for no limit, which is `centre = "off"` whatever that
-    /// says.
+    /// On a terminal wider than a window's text needs, draw the text in the
+    /// middle of the window: a window wider than its text wants has it that
+    /// wide, its lines wrapping there and its status line's words standing
+    /// over it. A window showing a terminal keeps its whole width: the
+    /// program in it is told its window's width. Off, the default, every
+    /// window's text is as wide as the window, as Neovim's own client draws
+    /// it. nvmux's own client only (see `crate::client::wide`).
+    pub centre: bool,
+    /// How many columns a window's text gets with `centre` on, where
+    /// `smart_width` does not judge otherwise. 0 for no limit, which is
+    /// `centre` off whatever that says.
     pub window_width: u16,
     /// With `centre` on, judge how wide each window's text is to be by what
     /// it shows, rather than give every window `window_width`: its buffer's
@@ -213,46 +214,9 @@ impl Default for ClientSettings {
             per_session: true,
             lazy: true,
             predict: true,
-            centre: Centre::Off,
+            centre: false,
             window_width: 120,
             smart_width: true,
-        }
-    }
-}
-
-/// `[client] centre`: what a session drawn by nvmux's own client does with a
-/// terminal wider than its windows need.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Centre {
-    /// The editor is as wide as the terminal, as Neovim's own client has it.
-    #[default]
-    Off,
-    /// The editor is as wide as the terminal, and a window wider than
-    /// `window_width` has its text that wide, in its middle: its lines wrap
-    /// there, and its status line's words stand over it. But for a window
-    /// showing a terminal, which keeps its whole width: the program in it is
-    /// told its window's width.
-    Windows,
-    /// The editor is only as wide as its windows side by side want — each up
-    /// to `window_width`, one that keeps its width (`'winfixwidth'`, as a
-    /// file tree does) as wide as it keeps, one showing a terminal the whole
-    /// terminal, and a column between each two — and centred in the
-    /// terminal, so that while a terminal is on show it is not centred. Its margins are the editor's own
-    /// background, but where its status lines run on through them to the
-    /// terminal's edges. A split or a window closed widens or narrows it once
-    /// Neovim has laid the windows out, and with `'equalalways'` the windows
-    /// are made the same width again, as Neovim makes them on a split.
-    Editor,
-}
-
-impl Centre {
-    /// As the config file spells it.
-    pub fn name(self) -> &'static str {
-        match self {
-            Centre::Off => "off",
-            Centre::Windows => "windows",
-            Centre::Editor => "editor",
         }
     }
 }
@@ -1151,7 +1115,7 @@ fn render_default_config(prefix: u8) -> String {
          # per_session  = {per_session:<8}   # keep each session's client; a switch back reuses it\n\
          # lazy         = {lazy:<8}   # start a client on its first visit, not at launch\n\
          # predict      = {predict:<8}   # over a slow link, scrolls show before Neovim answers\n\
-         # centre       = {centre:<8}   # on a wide terminal: \"windows\" centres each window's text, \"editor\" the editor\n\
+         # centre       = {centre:<8}   # on a wide terminal, each window's text in the middle of the window\n\
          # window_width = {window_width:<8}   # with centre on, how many columns a window's text gets; 0 for no limit\n\
          # smart_width  = {smart_width:<8}   # or as many as what it shows wants: its 'textwidth', its long lines\n\
          \n\
@@ -1207,7 +1171,7 @@ fn render_default_config(prefix: u8) -> String {
         per_session = c.per_session,
         lazy = c.lazy,
         predict = c.predict,
-        centre = quoted(c.centre.name()),
+        centre = c.centre,
         window_width = c.window_width,
         smart_width = c.smart_width,
         theme_color = quoted(&t.color.name()),
@@ -1536,23 +1500,21 @@ mod tests {
         assert!(s.client.per_session && s.client.lazy, "the rest as it was");
     }
 
-    /// A wide terminal is left alone unless told otherwise, and centred with
-    /// each window's text up to 120 columns when it is; each way is a word
-    /// away, spelt as the template spells it, and a way that is not one is an
-    /// error.
+    /// A wide terminal is left alone unless told otherwise, and each window's
+    /// text centred up to 120 columns when it is: a switch, on or off, and
+    /// anything else an error.
     #[test]
     fn nothing_is_centred_unless_told() {
         let c = Settings::default().client;
-        assert_eq!((c.centre, c.window_width), (Centre::Off, 120));
-        for way in [Centre::Off, Centre::Windows, Centre::Editor] {
-            let s: Settings =
-                toml::from_str(&format!("[client]\ncentre = \"{}\"\n", way.name())).expect("valid");
-            assert_eq!(s.client.centre, way);
+        assert_eq!((c.centre, c.window_width), (false, 120));
+        for on in [false, true] {
+            let s: Settings = toml::from_str(&format!("[client]\ncentre = {on}\n")).expect("valid");
+            assert_eq!(s.client.centre, on);
             assert_eq!(s.client.window_width, 120, "the rest as it was");
         }
         let s: Settings = toml::from_str("[client]\nwindow_width = 0\n").expect("valid");
         assert_eq!(s.client.window_width, 0);
-        assert!(toml::from_str::<Settings>("[client]\ncentre = \"middle\"\n").is_err());
+        assert!(toml::from_str::<Settings>("[client]\ncentre = \"windows\"\n").is_err());
         assert!(toml::from_str::<Settings>("[client]\nwindow_width = -1\n").is_err());
     }
 
@@ -2007,7 +1969,7 @@ mod tests {
             "# lazy         = true",
             "# ui           = \"nvmux\"",
             "# predict      = true",
-            "# centre       = \"off\"",
+            "# centre       = false",
             "# window_width = 120",
             "# smart_width  = true",
             "# color = \"terminal\"",
