@@ -14,11 +14,12 @@ nvmux had written up to that moment, and set in the demo's window. The
 README says which is which: a label in the picture would be too small to
 read at the width a page shows it.
 
-**The sizes are smaller than a monitor that wants this.** At 120 columns a
-window, the default `window_width`, two windows side by side and a margin
-either side of them make a picture whose text is too small to read on a
-page; COLS and WIDTH below are that picture brought down to one that can
-be, the same in every way but the numbers.
+**The terminal is a whole ultra-wide monitor's:** 3440 by 1440 pixels, the
+commonest, filled by a terminal in the demo's font at the demo's size --
+COLS by ROWS below -- with each window's text as wide as `window_width` has
+it by default. It is drawn at that size, and not at the half as big again
+the demo is drawn at (see SCALE there): a page shows the picture a quarter
+as wide, where its text is not for reading but where it stands is.
 
 **The left window is code and the right one prose,** wrapped at the window's
 width: what a wide window does to a paragraph is most of why a user would
@@ -52,11 +53,14 @@ _spec.loader.exec_module(demo)
 
 OUT = os.path.join(demo.ROOT, "assets", "wide-%s.png")
 
-# The terminal, and `[client] window_width`. Two windows of WIDTH side by
-# side leave a margin either side in COLS, and half of COLS is wider than
+# The terminal: as much of an ultra-wide monitor's 3440 by 1440 pixels as
+# the window it is set in leaves, in the cells agg draws the demo's font in
+# at the demo's size -- 9 pixels by 21, with half a cell more all round.
+# And `[client] window_width`, as it is by default. Two windows of WIDTH side
+# by side leave a margin either side in COLS, and half of COLS is wider than
 # WIDTH, so that each of the three ways looks unlike the others.
-COLS, ROWS = 150, 13
-WIDTH = 50
+COLS, ROWS = 376, 64
+WIDTH = 120
 
 NAME = "api-server"
 
@@ -73,44 +77,167 @@ SHOTS = [
 ]
 
 # The project's, in the demo's api-server: some code, and the page of prose
-# about it beside it. Every line fits in WIDTH, line numbers and all, and
-# every paragraph, wrapped there, in the rows above the status line (see the
+# about it beside it, enough of each to fill a window as tall as the
+# monitor. Every line fits in WIDTH, line numbers and all, and every
+# paragraph, wrapped there, in the rows above the status line (see the
 # header).
 FILES = {
     "src/sessions.rs": """\
-use anyhow::Result;
+//! Sessions: who is signed in, and until when.
+//!
+//! A session is a row in `sessions`, found by the hash of its token. The token itself is only ever in the
+//! user's cookie, so a copy of the database is not a copy of anyone's sign-in.
 
-use crate::db::Pool;
+use std::time::Duration;
 
-/// Sessions unused this long are expired.
-const IDLE_DAYS: i64 = 30;
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use rand::RngCore;
+use sha2::{Digest, Sha256};
+use sqlx::PgPool;
+use tracing::{debug, info};
 
-/// Delete expired sessions, a thousand at a
-/// time, so that a backlog after an outage
-/// never locks the table for long.
-pub async fn clean(db: &Pool) -> Result<u64> {
+/// How long a session lasts unused.
+pub const IDLE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// How many rows the cleanup deletes in one statement, so that a backlog never holds the table for long.
+const BATCH: i64 = 1000;
+
+/// A signed-in user, as a request sees them.
+#[derive(Debug, Clone)]
+pub struct Session {
+    pub id: i64,
+    pub user_id: i64,
+    pub created: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+}
+
+/// A new session for `user_id`: its row, and the token to put in the cookie.
+pub async fn create(db: &PgPool, user_id: i64) -> Result<(Session, String)> {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let token = hex::encode(bytes);
+    let session = sqlx::query_as!(
+        Session,
+        "INSERT INTO sessions (user_id, token_hash) VALUES ($1, $2)
+         RETURNING id, user_id, created, last_seen",
+        user_id,
+        hash(&token),
+    )
+    .fetch_one(db)
+    .await
+    .context("creating a session")?;
+    info!(user_id, session = session.id, "signed in");
+    Ok((session, token))
+}
+
+/// The session `token` names, unless it has expired: seen now, so that it lasts another `IDLE`.
+pub async fn find(db: &PgPool, token: &str) -> Result<Option<Session>> {
+    sqlx::query_as!(
+        Session,
+        "UPDATE sessions SET last_seen = now()
+         WHERE token_hash = $1 AND last_seen > now() - $2::interval
+         RETURNING id, user_id, created, last_seen",
+        hash(token),
+        IDLE,
+    )
+    .fetch_optional(db)
+    .await
+    .context("finding a session")
+}
+
+/// Sign out: the session is gone, and its token with it.
+pub async fn end(db: &PgPool, id: i64) -> Result<()> {
+    sqlx::query!("DELETE FROM sessions WHERE id = $1", id).execute(db).await?;
+    info!(session = id, "signed out");
+    Ok(())
+}
+
+/// Sign `user_id` out everywhere, as a new password does.
+pub async fn end_all(db: &PgPool, user_id: i64) -> Result<u64> {
+    let n = sqlx::query!("DELETE FROM sessions WHERE user_id = $1", user_id)
+        .execute(db)
+        .await?
+        .rows_affected();
+    info!(user_id, sessions = n, "signed out everywhere");
+    Ok(n)
+}
+
+/// Delete expired sessions, `BATCH` at a time, until none are left. Run every hour.
+pub async fn clean(db: &PgPool) -> Result<u64> {
     let mut deleted = 0;
     loop {
-        let n = db.expire(IDLE_DAYS).await?;
+        let n = sqlx::query!(
+            "DELETE FROM sessions WHERE id IN (
+                 SELECT id FROM sessions WHERE last_seen < now() - $1::interval LIMIT $2
+             )",
+            IDLE,
+            BATCH,
+        )
+        .execute(db)
+        .await?
+        .rows_affected();
         if n == 0 {
+            debug!(deleted, "expired sessions deleted");
             return Ok(deleted);
         }
         deleted += n;
     }
 }
+
+/// What the table keeps of a token.
+fn hash(token: &str) -> String {
+    hex::encode(Sha256::digest(token.as_bytes()))
+}
 """,
     "docs/sessions.md": """\
 # Sessions
 
-A session starts when a user signs in, and lasts until they sign out or \
-leave it unused for thirty days. Every request carries its token in a \
-cookie.
+A session starts when a user signs in, and lasts until they sign out or leave it unused for thirty days. Every \
+request carries its token in a cookie, and the server looks the token up before it does anything else: a token it \
+cannot find is treated as signed out, not as an error, so a request with an old cookie gets the sign-in page rather \
+than a 500.
+
+Sessions live in Postgres, in the `sessions` table, one row each. Nothing about a session is kept in memory between \
+requests, so any instance of the server can answer any request, and a deploy signs nobody out.
+
+## Tokens
+
+A token is 32 random bytes, hex-encoded into the cookie. The table never holds a token, only its SHA-256: a copy of \
+the database, or a backup of it, is not a copy of anyone's sign-in. Looking a session up by its token is a lookup by \
+that hash, which is indexed, so it costs the same however many sessions there are.
+
+The cookie is `HttpOnly`, `Secure` and `SameSite=Lax`, and has no `Expires`: the server decides when a session ends, \
+not the browser, which only forgets the cookie when it is closed.
+
+## Expiry
+
+Every request a session answers moves its `last_seen` to now, in the same statement that finds it, so a session in \
+use never expires. One that has not been seen for thirty days is gone from that moment on, whether or not the \
+cleanup has deleted its row yet: `find` only matches rows seen within the last thirty days.
 
 ## Cleanup
 
-A job deletes expired sessions every hour, a thousand rows at a time.
+Expired sessions are deleted by a job that runs every hour. It deletes at most a thousand rows in one statement and \
+repeats until there are none left, so a backlog — after an outage, say, or the first run on a database that has \
+never been cleaned — drains over a few statements instead of locking the table for one long one.
+
+The job logs how many sessions it deleted at `debug`. It is safe to run twice at once: both delete the same expired \
+rows, and whichever gets there second finds fewer.
+
+## Signing out everywhere
+
+Signing out deletes the session's row, so its token stops working on the next request. To sign a user out \
+everywhere — after a password change, say — `end_all` deletes every row with their `user_id`; there is no list of \
+devices to keep in step, because each session is its own row.
 """,
 }
+
+# The code from where its last line is at the bottom of its window, the
+# cursor in `clean`, at the start of its query.
+CODE = FILES["src/sessions.rs"].splitlines()
+CURSOR = max(i for i, line in enumerate(CODE, 1) if line.lstrip().startswith("let n = "))
+TOP = max(1, len(CODE) - (ROWS - 2) + 1)
 
 # The shots' own, after the demo's editor: no room kept for the window in
 # front ('winwidth'), which would make the two unequal, and prose wrapped at
@@ -127,7 +254,7 @@ vim.api.nvim_create_autocmd('FileType', {
 """
 
 # Off camera, in the session: the two files side by side, the code in front
-# and scrolled to `clean`, and the message line cleared of what opening them
+# and scrolled to its end, and the message line cleared of what opening them
 # said. Made the same width from the code's window, as nvmux's client makes
 # them when it centres the editor: `wincmd =` gives the odd column to the
 # window in front, which a split leaves on the right, so the windows are laid
@@ -139,7 +266,7 @@ vim.cmd('silent vsplit docs/sessions.md')
 vim.wo.cursorline = false
 vim.cmd.wincmd('h')
 vim.cmd.wincmd('=')
-vim.fn.winrestview({ topline = 8, lnum = 14, col = 8 })
+vim.fn.winrestview({ topline = %d, lnum = %d, col = 8 })
 vim.cmd.echo('""')
 """
 
@@ -219,7 +346,7 @@ def shoot(env, project, configs):
             term.type(NAME, wait=0.3)
             term.write(demo.ENTER)
             term.expect("[No Name]", "the session to paint", timeout=20)
-            demo.rpc(env, NAME, SETUP % json.dumps(project))
+            demo.rpc(env, NAME, SETUP % (json.dumps(project), TOP, CURSOR))
             sock = demo.socket_of(NAME)
         else:
             term.expect(NAME, "the picker")
@@ -241,9 +368,11 @@ def shoot(env, project, configs):
 
 def render(events, moments, font_dir, work):
     """Each shot, drawn by agg at its moment and set in the demo's window --
-    with no keys under it, so with no more room under the terminal than
+    at the size the demo is shown at rather than drawn at (see the header),
+    and with no keys under it, so with no more room under the terminal than
     either side of it."""
     from PIL import Image
+    demo.SCALE = 1.0
     demo.WINDOW = dict(demo.WINDOW, foot=demo.WINDOW["pad"])
     os.makedirs(work)
     cast = os.path.join(work, "wide.cast")

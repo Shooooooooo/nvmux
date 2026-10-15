@@ -162,7 +162,7 @@ the editor, or each window's text, as `[client] centre` says:
 
 `centre = "off"`, the default:
 
-![Two windows side by side across a wide terminal, code on the left and a page of prose on the right, each at the left of its window, the prose in lines as long as its window is wide](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-off.png)
+![Two windows side by side across a terminal as wide as an ultra-wide monitor, code on the left and a page of prose on the right, each at the left of its window, the prose in lines as long as its window is wide](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-off.png)
 
 `centre = "editor"`: the editor as wide as its windows side by side want —
 `window_width` columns each, 120 by default — until they fill the terminal:
