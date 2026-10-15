@@ -16,7 +16,8 @@
 //! ([`crate::ui::help`]) renders and the hint bar ([`crate::hint`]) draws — so
 //! a command cannot be added without appearing in the help, nor moved without
 //! the help saying where to. The README's "While attached" table is a prose
-//! copy of the defaults, and it is what can go stale.
+//! copy — each command's name, its default key, and what it does — and it is
+//! what can go stale.
 //!
 //! Note what is *not* here: `Ctrl-z` (0x1a) is not special-cased. It is
 //! forwarded like any other byte and Neovim receives it as a key.
@@ -840,22 +841,23 @@ mod tests {
 
     /// The README's "While attached" table is a prose copy of [`BINDINGS`], and
     /// a reader picking the tool up has only that copy — the `<prefix> ?` screen
-    /// needs a running session. So every command must have a row there.
+    /// needs a running session. So every command must have a row there, under
+    /// the name `[keys.bind]` moves it by and on the key it has by default.
     ///
-    /// The key cell, not the description: the two word things differently on
-    /// purpose (the screen has one line, the README has a column), and pinning
-    /// the prose would only force them to drift together. What actually goes
-    /// wrong is a command added here and never written down.
+    /// Those two cells, not the description: the two word things differently
+    /// on purpose (the screen has one line, the README has a column), and
+    /// pinning the prose would only force them to drift together. What
+    /// actually goes wrong is a command added here and never written down — or
+    /// renamed, or given another key by default, with its row left behind.
     #[test]
     fn every_binding_has_a_row_in_the_readme() {
         let readme = include_str!("../README.md");
         for b in BINDINGS {
-            let cell = format!("| `<prefix>` `{}` |", key_label(b.key));
+            let cells = format!("| `{}` | `<prefix>` `{}` |", b.hint, key_label(b.key));
             assert!(
-                readme.contains(&cell),
-                "README has no row for `<prefix> {}` — add one to \
-                 the \"While attached\" table",
-                key_label(b.key)
+                readme.contains(&cells),
+                "README has no row starting {cells:?} — add one to the \
+                 \"While attached\" table"
             );
         }
     }

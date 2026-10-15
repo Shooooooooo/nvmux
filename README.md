@@ -85,28 +85,32 @@ reimplementing it.
 
 ### While attached
 
-`<prefix>` is `Ctrl-Space`, and each key after it the one below, unless you
-change them in the [config](#configuration): the prefix under `[keys]`, the
-others under `[keys.bind]`.
+`<prefix>` is `Ctrl-Space`, and a key after it runs a command. Each command
+is on the key below unless the [config](#configuration) moves it, by name,
+under `[keys.bind]` — `detach = "x"` makes it `<prefix> x` — as
+`[keys] prefix` moves the prefix.
 
-| Keys | Action |
-|---|---|
-| `<prefix>` `d` | detach — leaves the session running, exits nvmux |
-| `<prefix>` `Space` | back to the picker, session still attached — `Esc` goes back |
-| `<prefix>` `1`, `2`, … | switch straight to that session |
-| `<prefix>` `n` | next session by number (wraps) |
-| `<prefix>` `p` | previous session by number (wraps) |
-| `<prefix>` `c` | set up a new session and attach to it — `Esc` goes back |
-| `<prefix>` `Enter` | go where the newest note in the margin is about: its session, or a terminal of this one |
-| `<prefix>` `?` | show these keys — `Esc` goes back |
-| `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
+| Command | Default key | Action |
+|---|---|---|
+| `detach` | `<prefix>` `d` | leave the session running and exit nvmux |
+| `picker` | `<prefix>` `Space` | back to the picker, session still attached — `Esc` goes back |
+| `next` | `<prefix>` `n` | the next session by number (wraps) |
+| `prev` | `<prefix>` `p` | the previous session by number (wraps) |
+| `new` | `<prefix>` `c` | set up a new session and attach to it — `Esc` goes back |
+| `go` | `<prefix>` `Enter` | go where the newest note in the margin is about: its session, or a terminal of this one |
+| `help` | `<prefix>` `?` | show these keys, as you have them — `Esc` goes back |
 
-Pressing `<prefix>` puts a one-row reminder of these keys along the bottom of
-the screen; it goes as soon as the next key resolves it. A switch, by key or
-out of the picker, says where you have landed: in the top right margin, the
-session's name between the ones `<prefix> p` and `<prefix> n` go to, which
-moves the way you went and goes a moment later. It is up, and moving, from
-the moment you press the key, and stays on the screen while the sessions fade.
+Two keys after the prefix are not commands, and stay where they are: a number
+— `<prefix> 1`, `<prefix> 12` — switches straight to that session, and
+`<prefix>` again sends a literal `<prefix>` to Neovim.
+
+Pressing `<prefix>` puts a one-row reminder of the commands, on the keys you
+have them on, along the bottom of the screen; it goes as soon as the next key
+resolves it. A switch, by key or out of the picker, says where you have
+landed: in the top right margin, the session's name between the ones `prev`
+and `next` go to, which moves the way you went and goes a moment later. It is
+up, and moving, from the moment you press the key, and stays on the screen
+while the sessions fade.
 
 ### Leaving a session
 
@@ -115,8 +119,8 @@ the moment you press the key, and stays on the screen while the sessions fade.
 > window terminates the server, not just your view. That is the one thing to
 > unlearn.
 
-- **`<prefix> d` detaches.** The session keeps running with all its buffers,
-  undo history and jumplist; reattach later, from this machine or another one.
+- **`detach` (`<prefix> d`) leaves it running**, with all its buffers, undo
+  history and jumplist; reattach later, from this machine or another one.
 - **`x` in the picker kills**, without asking the session about unsaved
   buffers. Use `:q` for the editor's own save prompts.
 
@@ -173,7 +177,7 @@ as fish 4 does.
 
 While you are in a session, the others' news comes up in the top right
 margin, and goes, leaving its sign there until you open that session.
-`<prefix> Enter` goes to the newest:
+`go` (`<prefix> Enter`) goes to the newest:
 
 ```
               ✓ api-server  3s
