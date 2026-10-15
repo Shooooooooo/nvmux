@@ -114,7 +114,7 @@ pub mod term;
 pub mod wide;
 pub mod wire;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -148,6 +148,22 @@ fn options(v: &[ValueRef<'_>]) -> anim::layout::Options {
         splitright: flag(1, dflt.splitright),
         splitbelow: flag(2, dflt.splitbelow),
     }
+}
+
+/// What each window wants, as the measure says (see [`wide::MEASURE_LUA`]),
+/// or `None` where it said nothing of them.
+fn wants(v: Option<&ValueRef<'_>>) -> Option<BTreeMap<i64, usize>> {
+    let v = v?.as_array()?;
+    Some(
+        v.iter()
+            .filter_map(|pair| {
+                let pair = pair.as_array()?;
+                let win = redraw::int(pair.first()?)?;
+                let wanted = usize::try_from(redraw::int(pair.get(1)?)?).ok()?;
+                Some((win, wanted))
+            })
+            .collect(),
+    )
 }
 
 /// The environment variable a parent nvmux hands the terminal's colours down
@@ -996,9 +1012,12 @@ pub struct App {
     /// What to do with a terminal wider than the windows need, as
     /// `[client] centre` says: see [`wide`].
     centre: Centre,
-    /// `[client] window_width`: the most columns a window's text gets with
+    /// `[client] window_width`: how many columns a window's text gets with
     /// the editor or the windows' text centred; 0 for no limit.
     window_width: usize,
+    /// `[client] smart_width`: each window's width judged by what it shows,
+    /// rather than `window_width` for all of them (see [`wide::MEASURE_LUA`]).
+    smart: bool,
     /// What the editor's windows side by side want, as its measure last said
     /// (see [`wide::MEASURE_LUA`]).
     wanted: Option<usize>,
@@ -1017,6 +1036,9 @@ pub struct App {
     /// The window grids asked to be narrower than their windows, and how
     /// wide: see [`wide`].
     narrowed: HashMap<u64, usize>,
+    /// What each window of the tab page in front wants, by window, as the
+    /// measure last said (see [`wide::MEASURE_LUA`]).
+    wants: BTreeMap<i64, usize>,
 }
 
 impl App {
@@ -1066,6 +1088,7 @@ impl App {
             cards: cards::Cards::default(),
             centre: Centre::Off,
             window_width: 0,
+            smart: false,
             wanted: None,
             measured: false,
             measuring: false,
@@ -1073,15 +1096,18 @@ impl App {
             told: None,
             columns: None,
             narrowed: HashMap::new(),
+            wants: BTreeMap::new(),
         }
     }
 
     /// This client, using a terminal wider than the windows need as `centre`
-    /// says, with no window's text wider than `window_width` (see [`wide`]).
-    pub fn with_centre(self, centre: Centre, window_width: usize) -> Self {
+    /// says, each window's text `window_width` wide — or, `smart`, as wide as
+    /// what it shows wants (see [`wide`]).
+    pub fn with_centre(self, centre: Centre, window_width: usize, smart: bool) -> Self {
         Self {
             centre,
             window_width,
+            smart,
             ..self
         }
     }
@@ -1124,8 +1150,8 @@ impl App {
         self.client_info();
         // Asked before anything an attach waits for, so its answer comes
         // first: how wide a centred editor is is known by the time the
-        // client attaches.
-        if self.window_width > 0 {
+        // client attaches. Nothing is, with nothing centred.
+        if self.centring() != Centre::Off {
             self.measure(None);
         }
         if self.multigrid_wanted {
@@ -1139,7 +1165,7 @@ impl App {
     /// [`wide::MEASURE_LUA`]); given this client's channel, the measure stays
     /// and says so again whenever that changes.
     fn measure(&mut self, chan: Option<u64>) {
-        let mut args = vec![Arg::Int(self.window_width as i64)];
+        let mut args = vec![Arg::Int(self.window_width as i64), Arg::Bool(self.smart)];
         if let Some(chan) = chan {
             args.push(Arg::Int(chan as i64));
         }
@@ -1153,7 +1179,7 @@ impl App {
     /// Leave the measure in the editor for this attach, once the client knows
     /// its own channel.
     fn leave_measure(&mut self) {
-        if self.window_width == 0 || self.measuring || self.attach == Attach::Asking {
+        if self.centring() == Centre::Off || self.measuring || self.attach == Attach::Asking {
             return;
         }
         if let Some(chan) = self.chan {
@@ -1173,9 +1199,23 @@ impl App {
     }
 
     /// What the measure says: what the windows side by side want,
-    /// `'laststatus'`, and how wide the editor is as it stands.
-    fn measured(&mut self, wanted: Option<i64>, laststatus: Option<i64>, columns: Option<i64>) {
+    /// `'laststatus'`, how wide the editor is as it stands, and what each
+    /// window wants.
+    fn measured(
+        &mut self,
+        wanted: Option<i64>,
+        laststatus: Option<i64>,
+        columns: Option<i64>,
+        wants: Option<BTreeMap<i64, usize>>,
+    ) {
         self.measured = true;
+        let resize = wants.filter(|w| *w != self.wants);
+        let changed = resize.is_some();
+        if let Some(w) = resize {
+            self.wants = w;
+            self.narrow_windows();
+            self.dirty = true;
+        }
         if let Some(c) = columns.and_then(|c| usize::try_from(c).ok()) {
             self.columns = Some(c);
         }
@@ -1193,36 +1233,45 @@ impl App {
         }
         match self.attach_after_measure.take() {
             Some(multigrid) => self.attach_as(multigrid),
-            None => self.fit(),
+            // The windows wanting other widths than they did, all of them as
+            // much as before: the editor as wide, and the windows sized
+            // again all the same.
+            None if !self.fit()
+                && changed
+                && self.centring() == Centre::Editor
+                && matches!(self.attach, Attach::Attached { .. }) =>
+            {
+                self.size_windows();
+            }
+            None => {}
         }
     }
 
     /// Tell Neovim the editor's size again, where it has changed — the
-    /// windows want more or less of a centred editor — and have it make the
-    /// windows the same width again, as it does on a split (see [`wide`]).
-    fn fit(&mut self) {
+    /// windows want more or less of a centred editor — and have it give each
+    /// window the width it wants again (see [`wide::SIZE_LUA`]). Whether it
+    /// had changed.
+    fn fit(&mut self) -> bool {
         if !matches!(self.attach, Attach::Attached { .. }) {
-            return;
+            return false;
         }
         let (w, h) = self.editor_size();
         if self.told == Some((w, h)) {
-            return;
+            return false;
         }
         self.told = Some((w, h));
         self.outbox.notify(
             "nvim_ui_try_resize",
             &[Arg::Int(w as i64), Arg::Int(h as i64)],
         );
-        self.outbox.notify(
-            "nvim_exec_lua",
-            &[Arg::str(wide::EQUALISE_LUA), Arg::Array(Vec::new())],
-        );
+        self.size_windows();
         self.screen.invalidate();
         self.dirty = true;
+        true
     }
 
     /// With each window's text centred in it, ask for every window wider than
-    /// `window_width` to have a grid that wide, and for the rest to have
+    /// it wants to have a grid as wide as that, and for the rest to have
     /// their own width again (see [`wide`]): a window on a tab page not on
     /// show keeps what it has. With the text not centred, every grid asked
     /// to be narrower is let go of. Says whether it asked Neovim anything.
@@ -1241,8 +1290,11 @@ impl App {
                     if let Some(&w) = self.narrowed.get(&grid) {
                         want.insert(grid, w);
                     }
-                } else if width > self.window_width {
-                    want.insert(grid, self.window_width);
+                } else {
+                    let w = self.want_of(grid);
+                    if w < width {
+                        want.insert(grid, w);
+                    }
                 }
             }
         }
@@ -1268,6 +1320,31 @@ impl App {
             );
         }
         asked
+    }
+
+    /// What the window on `grid` wants, as the measure last said; or
+    /// `window_width`, of a window it has not said anything of yet.
+    fn want_of(&self, grid: u64) -> usize {
+        self.model
+            .wins
+            .get(&grid)
+            .and_then(|win| self.wants.get(win))
+            .copied()
+            .unwrap_or(self.window_width)
+    }
+
+    /// Have Neovim give each window the width it wants, as the measure last
+    /// said (see [`wide::SIZE_LUA`]).
+    fn size_windows(&mut self) {
+        let each = self
+            .wants
+            .iter()
+            .map(|(&win, &w)| Arg::Array(vec![Arg::Int(win), Arg::Int(w as i64)]))
+            .collect();
+        self.outbox.notify(
+            "nvim_exec_lua",
+            &[Arg::str(wide::SIZE_LUA), Arg::Array(vec![Arg::Array(each)])],
+        );
     }
 
     /// Let go of every grid asked to be narrower than its window, as the
@@ -1321,9 +1398,9 @@ impl App {
         // last one had grids for.
         self.narrowed.clear();
         // A centred editor attached at another width than the windows were
-        // laid out for has them made the same width again, as a change of
-        // width while attached does (see `fit`).
-        let equalise = self.centring() == Centre::Editor && self.columns.is_some_and(|c| c != w);
+        // laid out for has them given the widths they want again, as a change
+        // of width while attached does (see `fit`).
+        let size = self.centring() == Centre::Editor && self.columns.is_some_and(|c| c != w);
         let mut opts = vec![
             ("rgb", Arg::Bool(true)),
             ("ext_linegrid", Arg::Bool(true)),
@@ -1341,11 +1418,8 @@ impl App {
             "nvim_ui_attach",
             &[Arg::Int(w as i64), Arg::Int(h as i64), Arg::Map(opts)],
         );
-        if equalise {
-            self.outbox.notify(
-                "nvim_exec_lua",
-                &[Arg::str(wide::EQUALISE_LUA), Arg::Array(Vec::new())],
-            );
+        if size {
+            self.size_windows();
         }
         self.agent = false;
         self.leave_agent();
@@ -1433,7 +1507,7 @@ impl App {
                 }
             }
             Some("options") => self.anim.set_options(options(&params[1..])),
-            Some("measure") => self.measured(int(1), int(2), int(3)),
+            Some("measure") => self.measured(int(1), int(2), int(3), wants(params.get(4))),
             // The attributes of the editor's highlight groups the colours
             // of the lines it sends name.
             Some("colours") => {
@@ -1472,9 +1546,11 @@ impl App {
         }
     }
 
-    /// Detach, to attach again as `multigrid` says once Neovim has done it.
+    /// Detach, to attach again as `multigrid` says once Neovim has done it:
+    /// the windows let go of first, while Neovim still takes it of this UI.
     fn leave(&mut self, multigrid: bool) {
         tracing::info!(multigrid, "client: attaching again for the UIs there are");
+        self.let_windows_go();
         let id = self.outbox.request("nvim_ui_detach", &[]);
         self.asked.insert(id, Ask::Detach);
         self.attach = Attach::Leaving { multigrid };
@@ -1574,7 +1650,8 @@ impl App {
                     Some(Ask::Measure) => {
                         let answer = result.and_then(ValueRef::as_array);
                         let int = |i: usize| answer.and_then(|a| a.get(i)).and_then(redraw::int);
-                        self.measured(int(0), int(1), int(2));
+                        let each = wants(answer.and_then(|a| a.get(3)));
+                        self.measured(int(0), int(1), int(2), each);
                     }
                     Some(Ask::Uis) => {
                         self.checking = false;
@@ -2796,13 +2873,14 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
     let mut app = App::new(term, effects, settings.client.predict, term::size()).with_centre(
         settings.client.centre,
         usize::from(settings.client.window_width),
+        settings.client.smart_width,
     );
     app.start();
     let mut inbox = Inbox::default();
     let stdin = std::io::stdin();
     let mut buf = vec![0u8; 64 * 1024];
 
-    let outcome = loop {
+    let outcome = 'session: loop {
         app.tick(Instant::now());
         if app.take_refresh() {
             refresh(sock, app.size());
@@ -2812,7 +2890,9 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
         }
         let said = app.take_said();
         if !said.is_empty() {
-            crate::term::write_stdout(&said)?;
+            if let Err(e) = crate::term::write_stdout(&said) {
+                break Err(e.into());
+            }
         }
         let now = Instant::now();
         let timeout = app.wake_at(now).map_or(-1, |at| {
@@ -2861,7 +2941,9 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
                     Ok(Some(frame)) => app.message(&frame, now),
                     Ok(None) => break,
                     Err(e) => {
-                        return Err(anyhow::Error::from(e).context("reading from the session"))
+                        break 'session Err(
+                            anyhow::Error::from(e).context("reading from the session")
+                        );
                     }
                 }
             }
@@ -2880,7 +2962,9 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
         }
         if app.due(now) {
             let bytes = app.frame(now);
-            crate::term::write_stdout(&bytes)?;
+            if let Err(e) = crate::term::write_stdout(&bytes) {
+                break Err(e.into());
+            }
         }
         if app.done {
             break Ok(());
@@ -3029,11 +3113,9 @@ impl Line {
     /// what `read` makes of its result. Anything else that comes — what
     /// Neovim draws for an attached UI — is read and let go.
     fn answer<T>(&mut self, id: u32, read: impl Fn(&ValueRef<'_>) -> T) -> std::io::Result<T> {
-        let timed_out = || std::io::Error::from(std::io::ErrorKind::TimedOut);
         while !self.out.is_empty() {
-            if Instant::now() > self.deadline {
-                return Err(timed_out());
-            }
+            let left = self.left()?;
+            self.stream.set_write_timeout(Some(left))?;
             self.out.send(&mut self.stream)?;
         }
         loop {
@@ -3053,13 +3135,22 @@ impl Line {
                     return Ok(read(msg.get(3).unwrap_or(&ValueRef::Nil)));
                 }
             }
-            if Instant::now() > self.deadline {
-                return Err(timed_out());
-            }
+            let left = self.left()?;
+            self.stream.set_read_timeout(Some(left))?;
             if !self.inbox.fill(&mut self.stream)? {
                 return Err(std::io::ErrorKind::UnexpectedEof.into());
             }
         }
+    }
+
+    /// What is left of the time given, for a read or a write to wait no
+    /// longer than; none left, an error.
+    fn left(&self) -> std::io::Result<Duration> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        Ok(left)
     }
 }
 
@@ -4101,9 +4192,23 @@ mod tests {
         app.message(&encoded(v), now);
     }
 
-    fn equalised(calls: &[Call]) -> bool {
-        calls.iter().any(|(_, m, args)| {
-            m == "nvim_exec_lua" && args.first().and_then(Value::as_str) == Some(wide::EQUALISE_LUA)
+    /// The windows as Neovim was asked to size them (see [`wide::SIZE_LUA`]),
+    /// each `(window, wanted)`; `None` where it was not asked.
+    fn sized(calls: &[Call]) -> Option<Vec<(i64, i64)>> {
+        calls.iter().rev().find_map(|(_, m, args)| {
+            if m != "nvim_exec_lua" || args.first().and_then(Value::as_str) != Some(wide::SIZE_LUA)
+            {
+                return None;
+            }
+            let each = args.get(1)?.as_array()?.first()?.as_array()?;
+            Some(
+                each.iter()
+                    .filter_map(|p| {
+                        let p = p.as_array()?;
+                        Some((p.first()?.as_i64()?, p.get(1)?.as_i64()?))
+                    })
+                    .collect(),
+            )
         })
     }
 
@@ -4118,7 +4223,7 @@ mod tests {
     /// text up to 8 columns; its windows wanting `wanted`, Neovim 20 wide
     /// before it; attached, and what it sent let go of.
     fn wide_app(centre: Centre, wanted: i64, t0: Instant) -> (App, Vec<Call>) {
-        let mut a = app(true).with_centre(centre, 8);
+        let mut a = app(true).with_centre(centre, 8, false);
         a.start();
         let sent = calls(&mut a);
         let measure = request(&sent, "nvim_exec_lua", "local most");
@@ -4165,7 +4270,7 @@ mod tests {
             .find(|(_, m, _)| m == "nvim_ui_attach")
             .expect("attached");
         assert_eq!(args[..2], [Value::from(8), Value::from(6)], "{sent:?}");
-        assert!(equalised(&sent), "laid out for 20: {sent:?}");
+        assert!(sized(&sent).is_some(), "laid out for 20: {sent:?}");
         let stays = request(&sent, "nvim_exec_lua", "local most");
         let (_, _, args) = sent
             .iter()
@@ -4173,7 +4278,7 @@ mod tests {
             .expect("left");
         assert_eq!(
             args.get(1).and_then(Value::as_array).map(|a| a.len()),
-            Some(2),
+            Some(3),
             "given the client's channel, to stay: {sent:?}"
         );
 
@@ -4185,7 +4290,7 @@ mod tests {
         );
         let sent = calls(&mut a);
         assert_eq!(resized_to(&sent), Some((17, 6)), "a split: {sent:?}");
-        assert!(equalised(&sent));
+        assert!(sized(&sent).is_some());
 
         notify(
             &mut a,
@@ -4202,7 +4307,7 @@ mod tests {
         a.resized((40, 6));
         let sent = calls(&mut a);
         assert_eq!(resized_to(&sent), Some((26, 6)));
-        assert!(!equalised(&sent), "{sent:?}");
+        assert!(sized(&sent).is_none(), "{sent:?}");
     }
 
     /// The editor goes in the middle of the terminal, on blank margins; and
@@ -4321,7 +4426,162 @@ mod tests {
         assert!(narrowed(&calls(&mut a)).is_empty(), "asked once");
         assert_eq!(shown(&mut a, t0)[0], "      text", "6 in, of 20");
 
-        a.let_windows_go();
+        assert!(a.let_windows_go(), "a grid to let go of");
         assert_eq!(narrowed(&calls(&mut a)), [vec![n(2), n(0), n(0)]]);
+        assert!(!a.let_windows_go(), "none left");
+    }
+
+    /// Attaching again without `ext_multigrid` for a UI that keeps windows on
+    /// grid 1, the client lets go of the windows it narrowed before it
+    /// detaches, while Neovim still takes it of it: that UI is to see them
+    /// whole.
+    #[test]
+    fn a_ui_without_windows_of_its_own_has_them_let_go_of() {
+        let t0 = Instant::now();
+        let (mut a, _) = wide_app(Centre::Windows, 8, t0);
+        let n = Value::from;
+        redraw(
+            &mut a,
+            vec![
+                resize(1, 20, 6),
+                resize(2, 20, 5),
+                ("win_pos", vec![n(2), n(1000), n(0), n(0), n(20), n(5)]),
+                viewport(2, 1000),
+            ],
+            t0,
+        );
+        let resized = |calls: &[Call], width: i64| {
+            calls.iter().position(|(_, m, args)| {
+                m == "nvim_ui_try_resize_grid" && args[..] == [n(2), n(width), n(0)]
+            })
+        };
+        assert!(resized(&calls(&mut a), 8).is_some(), "narrowed");
+
+        redraw(&mut a, vec![ui_change()], t0);
+        let uis_id = asks_uis(&calls(&mut a));
+        answer(&mut a, uis_id, uis(true, false), t0);
+        let sent = calls(&mut a);
+        let detach = sent.iter().position(|(_, m, _)| m == "nvim_ui_detach");
+        let let_go = resized(&sent, 0);
+        assert!(
+            let_go.is_some() && detach.is_some() && let_go < detach,
+            "not let go of before the detach: {sent:?}"
+        );
+    }
+
+    /// Each window's text is as wide as the measure says the window wants:
+    /// narrower than the window, a grid that wide; as wide or wider — a
+    /// window showing a terminal wants the whole terminal — none narrower,
+    /// and one that was let go of; said nothing of, `window_width`.
+    #[test]
+    fn each_window_is_given_what_it_wants() {
+        let t0 = Instant::now();
+        let (mut a, _) = wide_app(Centre::Windows, 8, t0);
+        let n = Value::from;
+        redraw(
+            &mut a,
+            vec![
+                resize(1, 20, 6),
+                resize(2, 20, 5),
+                ("win_pos", vec![n(2), n(1000), n(0), n(0), n(20), n(5)]),
+                viewport(2, 1000),
+            ],
+            t0,
+        );
+        let narrowed = |calls: &[Call]| -> Vec<Vec<Value>> {
+            calls
+                .iter()
+                .filter(|(_, m, _)| m == "nvim_ui_try_resize_grid")
+                .map(|(_, _, args)| args.clone())
+                .collect()
+        };
+        assert_eq!(
+            narrowed(&calls(&mut a)),
+            [vec![n(2), n(8), n(0)]],
+            "said nothing of"
+        );
+
+        let measure = |wants: Vec<(i64, i64)>| {
+            let each = wants
+                .into_iter()
+                .map(|(win, w)| Value::Array(vec![n(win), n(w)]))
+                .collect();
+            vec![
+                "measure".into(),
+                8.into(),
+                2.into(),
+                20.into(),
+                Value::Array(each),
+            ]
+        };
+        notify(&mut a, "nvmux_client", measure(vec![(1000, 12)]), t0);
+        assert_eq!(
+            narrowed(&calls(&mut a)),
+            [vec![n(2), n(12), n(0)]],
+            "what it wants"
+        );
+        redraw(&mut a, vec![resize(2, 12, 5)], t0);
+        assert!(narrowed(&calls(&mut a)).is_empty(), "asked once");
+
+        notify(&mut a, "nvmux_client", measure(vec![(1000, 1 << 30)]), t0);
+        assert_eq!(
+            narrowed(&calls(&mut a)),
+            [vec![n(2), n(0), n(0)]],
+            "the whole terminal: a terminal"
+        );
+        redraw(&mut a, vec![resize(2, 20, 5)], t0);
+        assert!(narrowed(&calls(&mut a)).is_empty(), "and left be");
+    }
+
+    /// A centred editor has Neovim give each window the width the measure
+    /// says it wants, by window, once it is made wider or narrower for them.
+    #[test]
+    fn a_centred_editor_gives_each_window_what_it_wants() {
+        let t0 = Instant::now();
+        let (mut a, _) = wide_app(Centre::Editor, 8, t0);
+        let n = Value::from;
+        let each = Value::Array(vec![
+            Value::Array(vec![n(1000), n(5)]),
+            Value::Array(vec![n(1001), n(9)]),
+        ]);
+        notify(
+            &mut a,
+            "nvmux_client",
+            vec!["measure".into(), 15.into(), 2.into(), 8.into(), each],
+            t0,
+        );
+        let sent = calls(&mut a);
+        assert_eq!(resized_to(&sent), Some((15, 6)), "{sent:?}");
+        assert_eq!(sized(&sent), Some(vec![(1000, 5), (1001, 9)]));
+    }
+
+    /// With nothing centred, nothing is measured, and nothing left in the
+    /// editor to measure it.
+    #[test]
+    fn nothing_centred_measures_nothing() {
+        let t0 = Instant::now();
+        let mut a = app(true).with_centre(Centre::Off, 8, true);
+        a.start();
+        let sent = calls(&mut a);
+        answer(
+            &mut a,
+            request(&sent, "nvim_get_api_info", ""),
+            Value::Array(vec![7.into()]),
+            t0,
+        );
+        answer(&mut a, asks_uis(&sent), uis(false, false), t0);
+        let sent = [sent, calls(&mut a)].concat();
+        assert!(
+            sent.iter().any(|(_, m, _)| m == "nvim_ui_attach"),
+            "attached: {sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|(_, m, args)| m == "nvim_exec_lua"
+                && args
+                    .first()
+                    .and_then(Value::as_str)
+                    .is_some_and(|lua| lua.starts_with("local most"))),
+            "no measure: {sent:?}"
+        );
     }
 }

@@ -199,15 +199,23 @@ each window's text, or the editor, as `[client] centre` says:
 
 ![Two windows side by side across a terminal as wide as an ultra-wide monitor, code on the left and a page of prose on the right, each at the left of its window, the prose in lines as long as its window is wide](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-off.png)
 
-`centre = "windows"`: each window's text at most `window_width` columns
-wide, 120 by default, in its middle:
+`centre = "windows"`: each window's text in its middle:
 
 ![The same two windows across the whole terminal, the code and the prose each in the middle of its own window, with the words of its status line over it](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-windows.png)
 
-`centre = "editor"`: the editor as wide as its windows side by side want,
-`window_width` columns each, until they fill the terminal:
+`centre = "editor"`: the editor as wide as its windows' texts side by side,
+until they fill the terminal:
 
 ![The same two windows in the middle of the terminal, with a margin either side that their status lines run on through to the terminal's edges](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-editor.png)
+
+How wide a window's text is depends on what the window shows (`smart_width`,
+on unless turned off): its buffer's `'textwidth'` where it has one, and room
+for its long lines where they are not wrapped — all of them with `'wrap'`
+off, and with it on those of a Markdown table or code block. Otherwise it is
+`window_width`, 120 columns by default. A window showing a terminal keeps its
+whole width either way, since that is the width the program in it is told it
+has: with `"editor"`, the editor takes the whole terminal while one is on
+show.
 
 ## Configuration
 
@@ -242,7 +250,8 @@ per_session  = true     # keep each session's client; a switch back reuses it
 lazy         = true     # start a client on its first visit; false starts all at launch
 predict      = true     # over a slow link, scrolls show before Neovim answers
 centre       = "off"    # on a wide terminal: "windows" centres each window's text, "editor" the editor
-window_width = 120      # with centre on, the most columns a window's text gets; 0 for no limit
+window_width = 120      # with centre on, how many columns a window's text gets; 0 for no limit
+smart_width  = true     # or as many as what it shows wants: its 'textwidth', its long lines
 
 [theme]
 color = "terminal"   # or "#rrggbb": nvmux's text and bars in that colour; dim text stays dim
