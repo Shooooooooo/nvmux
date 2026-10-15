@@ -80,6 +80,8 @@ pub enum Event {
         compindex: i64,
         row: i64,
         col: i64,
+        /// The grid it is anchored to: where its text is drawn, it is.
+        anchor: Option<u64>,
     },
     WinHide {
         grid: u64,
@@ -316,7 +318,10 @@ fn event(name: &str, a: &[ValueRef<'_>]) -> Option<Option<Event>> {
         // `[grid, win, anchor, anchor_grid, anchor_row, anchor_col,
         // mouse_enabled, zindex, compindex, screen_row, screen_col]`: the last
         // four came later, and the last two are the only position the client
-        // needs — the anchoring is Neovim's to resolve, and it has.
+        // needs — the anchoring is Neovim's to resolve, and it has. Which grid
+        // it is anchored to is kept all the same: a window's text the client
+        // draws further in than Neovim put it takes its floats with it (see
+        // `super::wide`).
         "win_float_pos" => Event::WinFloatPos {
             grid: uint(a.first()?)?,
             win: a.get(1).and_then(handle),
@@ -325,6 +330,7 @@ fn event(name: &str, a: &[ValueRef<'_>]) -> Option<Option<Event>> {
             compindex: a.get(8).and_then(int).unwrap_or(0),
             row: int(a.get(9)?)?,
             col: int(a.get(10)?)?,
+            anchor: a.get(3).and_then(uint),
         },
         "win_hide" => Event::WinHide {
             grid: uint(a.first()?)?,
@@ -672,6 +678,7 @@ mod tests {
                 compindex: 2,
                 row: 3,
                 col: 10,
+                anchor: Some(1),
             }]
         );
     }

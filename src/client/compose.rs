@@ -155,19 +155,26 @@ pub fn compose(model: &Model, view: &dyn View, width: usize, height: usize) -> F
     let mut frame = Frame::new(width, height, model.style(0));
     draw(&mut frame, model, view, 1, (0, 0), None, false);
 
+    // A window's status line stands over its text, where that is drawn
+    // narrower than the window (see `super::wide`).
+    status_lines_over_text(&mut frame, model);
+
     // Windows next: they never overlap one another, so their order is
     // nobody's business. Under each, grid 1 has whatever Neovim drew there
     // before the window was — nothing meant to be seen, and what a window
-    // sliding away from its place would uncover — so it is blanked first.
+    // sliding away from its place would uncover — so it is blanked first:
+    // the whole of the window's place, of which a grid narrower than it
+    // fills the middle.
     let blank = Out::blank(model.style(0));
     for (&grid, p) in &model.layout {
-        let (Place::Window { row, col }, Some(g), false) =
-            (&p.place, model.grids.get(&grid), p.hidden || grid == 1)
-        else {
+        if p.hidden || grid == 1 {
+            continue;
+        }
+        let Some((row, col, width, height)) = model.window_cells(grid) else {
             continue;
         };
-        for r in 0..g.height() {
-            for c in 0..g.width() {
+        for r in 0..height {
+            for c in 0..width {
                 if let Some(cell) = frame.at((row + r) as i64, (col + c) as i64) {
                     *cell = blank.clone();
                 }
@@ -179,7 +186,7 @@ pub fn compose(model: &Model, view: &dyn View, width: usize, height: usize) -> F
             continue;
         }
         if let Place::Window { .. } = p.place {
-            let at = view.origin(grid, p.origin());
+            let at = view.origin(grid, model.drawn_origin(grid));
             draw(&mut frame, model, view, grid, at, None, false);
         }
     }
@@ -193,7 +200,7 @@ pub fn compose(model: &Model, view: &dyn View, width: usize, height: usize) -> F
         .collect();
     layers.sort_by_key(|(z, g, _)| (*z, *g));
     for (_, grid, p) in layers {
-        let at = view.origin(grid, p.origin());
+        let at = view.origin(grid, model.drawn_origin(grid));
         match &p.place {
             Place::Float { .. } => draw(&mut frame, model, view, grid, at, None, true),
             Place::Message { scrolled, sep, .. } => {
@@ -288,6 +295,47 @@ fn draw(
                 under.wide = wide;
             }
         }
+    }
+}
+
+/// Each window's status line, where its grid is drawn narrower than the
+/// window, closed up to stand over its text (see [`super::wide::realign`]):
+/// the windows that have one of their own, as `'laststatus'` says — every
+/// window at 2; at 1 every window where there are two or more; and at 0 the
+/// ones with another window under them. None where it is 3, one line across
+/// the whole screen, or where it is not known.
+fn status_lines_over_text(frame: &mut Frame, model: &Model) {
+    let Some(laststatus) = model.laststatus.filter(|l| *l != 3) else {
+        return;
+    };
+    let windows: Vec<(u64, (usize, usize, usize, usize))> = model
+        .layout
+        .iter()
+        .filter(|(g, p)| **g != 1 && !p.hidden && matches!(p.place, Place::Window { .. }))
+        .filter_map(|(g, _)| Some((*g, model.window_cells(*g)?)))
+        .collect();
+    let bottom = windows
+        .iter()
+        .map(|(_, (row, _, _, height))| row + height)
+        .max()
+        .unwrap_or(0);
+    for &(grid, (row, col, width, height)) in &windows {
+        let inset = model.inset(grid);
+        let Some(g) = model.grids.get(&grid).filter(|_| inset > 0) else {
+            continue;
+        };
+        let below = row + height;
+        let has = match laststatus {
+            2 => true,
+            1 => windows.len() > 1 || below < bottom,
+            _ => below < bottom,
+        };
+        if !has || below >= frame.height || col >= frame.width {
+            continue;
+        }
+        let start = below * frame.width + col;
+        let end = start + width.min(frame.width - col);
+        super::wide::realign(&mut frame.cells[start..end], inset, g.width());
     }
 }
 
@@ -390,6 +438,7 @@ mod tests {
             compindex: 0,
             row,
             col,
+            anchor: None,
         }
     }
 

@@ -96,6 +96,7 @@ reimplementing it.
 | `<prefix>` `p` | previous session by number (wraps) |
 | `<prefix>` `c` | set up a new session and attach to it — `Esc` goes back |
 | `<prefix>` `Enter` | go where the newest note in the margin is about: its session, or a terminal of this one |
+| `<prefix>` `w` | on a wide terminal: the editor centred, each window's text centred, or neither, in turn — see [A wide terminal](#a-wide-terminal) |
 | `<prefix>` `?` | show these keys — `Esc` goes back |
 | `<prefix>` `<prefix>` | send a literal `<prefix>` to Neovim |
 
@@ -155,6 +156,24 @@ particles and a fading blink can be turned on under `[effects]`. Set
 the terminal can do reaches the editor as Neovim negotiates it, not through
 nvmux.
 
+### A wide terminal
+
+On a terminal wider than the editor's windows need, nvmux's own client
+centres the editor. Neovim gets only as many columns as its windows side by
+side want — `window_width` each, 120 by default; a window that keeps its
+width, such as a file tree, its own; and a column between each two — and the
+rest of the terminal is margin, in the editor's background, with the status
+lines running on through it to the terminal's edges. A split widens the
+editor to make room a moment after Neovim lays it out, and closing a window
+narrows it again; enough windows side by side take the whole terminal, as
+they would without it.
+
+`centre = "windows"` leaves the editor the whole terminal and centres the
+text in each window wider than `window_width` instead: its lines wrap at that
+width, and its status line's words stand over it. `"off"` leaves both alone,
+and `<prefix> w` goes from one to the next while nvmux runs. Neovim's own
+client (`ui = "nvim"`) draws on the whole terminal whatever this says.
+
 ### What a session has to say
 
 The picker shows a sign beside each session that has something to report:
@@ -203,10 +222,12 @@ timeout_ms = 1000           # how long a lone prefix or half-typed number waits
 command = "nvim --headless --listen {sock}"   # {sock} is required
 
 [client]
-ui          = "nvmux" # who draws a session: nvmux's own client, animated; or "nvim"
-per_session = true    # keep each session's client; a switch back reuses it
-lazy        = true    # start a client on its first visit; false starts all at launch
-predict     = true    # over a slow link, scrolls show before Neovim answers
+ui           = "nvmux"  # who draws a session: nvmux's own client, animated; or "nvim"
+per_session  = true     # keep each session's client; a switch back reuses it
+lazy         = true     # start a client on its first visit; false starts all at launch
+predict      = true     # over a slow link, scrolls show before Neovim answers
+centre       = "editor" # on a wide terminal; or "windows", each window's text, or "off"
+window_width = 120      # the most columns a window's text gets; 0 for no limit
 
 [theme]
 color = "terminal"   # or "#rrggbb": nvmux's text and bars in that colour; dim text stays dim

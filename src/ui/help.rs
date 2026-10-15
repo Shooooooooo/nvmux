@@ -355,23 +355,25 @@ mod tests {
 
     #[test]
     fn the_whole_screen_is_a_centred_table_and_one_hint_line() {
-        let lines = render(WIDE, 11);
-        assert_eq!(lines.len(), 11);
+        // Derived rather than listed, so adding a binding does not turn a
+        // centring test into a counting one: the table is every row of
+        // `BINDINGS` plus the three fixed rules, on a screen with a few rows
+        // of slack and the hint row, and centring puts any odd row of slack
+        // at the bottom.
+        let rows = keys::BINDINGS.len() + 3;
+        let body = rows + 3;
+        let lines = render(WIDE, body as u16 + 1);
+        assert_eq!(lines.len(), body + 1);
 
-        assert_eq!(lines[10].trim(), HINTS, "hints should be on the last row");
+        assert_eq!(lines[body].trim(), HINTS, "hints should be on the last row");
 
-        let occupied: Vec<usize> = lines[..10]
+        let occupied: Vec<usize> = lines[..body]
             .iter()
             .enumerate()
             .filter(|(_, l)| !l.is_empty())
             .map(|(i, _)| i)
             .collect();
-        // Derived rather than listed, so adding a binding does not turn a
-        // centring test into a counting one: the table is every row of
-        // `BINDINGS` plus the three fixed rules, and centring puts any odd row
-        // of slack at the bottom.
-        let rows = keys::BINDINGS.len() + 3;
-        let top = (10 - rows) / 2;
+        let top = (body - rows) / 2;
         assert_eq!(
             occupied,
             (top..top + rows).collect::<Vec<_>>(),
@@ -380,7 +382,7 @@ mod tests {
 
         // The widest row is the one that defines the block; a shorter one has
         // slack on the right by construction.
-        let row = lines[..10]
+        let row = lines[..body]
             .iter()
             .max_by_key(|l| l.width())
             .expect("a table row");
