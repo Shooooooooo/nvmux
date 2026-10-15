@@ -11,7 +11,7 @@
 //! region scrolled — [`Model::apply`] says so in a [`Changes`], and
 //! [`super::anim`] decides what to make of it.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
 use super::grid::Grid;
 use super::redraw::{Event, ModeInfo, OptionValue};
@@ -252,9 +252,6 @@ pub struct Model {
     /// The window each window's grid shows, as `win_viewport` and the
     /// placements name it.
     pub wins: BTreeMap<u64, i64>,
-    /// The window grids seen named and not placed, whose cells were then
-    /// forgotten: see [`Model::forget_kept`].
-    kept: BTreeSet<u64>,
     /// What each window shows of its buffer, by grid.
     pub viewports: HashMap<u64, Viewport>,
     /// The rows and columns of a window's grid that are not its text, by
@@ -300,7 +297,6 @@ impl Model {
             grids: BTreeMap::new(),
             layout: BTreeMap::new(),
             wins: BTreeMap::new(),
-            kept: BTreeSet::new(),
             viewports: HashMap::new(),
             margins: HashMap::new(),
             cursor: CursorPos {
@@ -731,27 +727,13 @@ impl Model {
             .collect()
     }
 
-    /// Forget what Neovim has drawn on each window it names without placing,
-    /// the first time it is seen so. Such a window's grid is one Neovim kept
-    /// from another UI, and of it Neovim sends only the cells that changed
-    /// since that UI saw them: none, or a few — and a few would be taken for
-    /// all of it. Forgotten, the window is [`Model::lacking`] until a refresh
-    /// draws the whole of it; anything drawn on it after is kept.
-    pub fn forget_kept(&mut self) {
-        for (grid, _) in self.unplaced() {
-            if self.kept.insert(grid) {
-                if let Some(g) = self.grids.get_mut(&grid) {
-                    g.forget();
-                }
-            }
-        }
-    }
-
     /// The window grids that are to be seen — placed and showing, or named
-    /// and not yet placed — and that Neovim has never drawn anything on:
-    /// grids it thinks the client already has. See `super::App`.
+    /// and not yet placed — and that Neovim has not drawn every cell of since
+    /// the client made them: grids it kept from a UI before this one, which
+    /// it thinks the client has as that UI did, or has but for what a resize
+    /// added. See `super::App`.
     pub fn lacking(&self) -> Vec<u64> {
-        let blank = |grid: &u64| !self.grids.get(grid).is_some_and(Grid::written);
+        let undrawn = |grid: &u64| !self.grids.get(grid).is_some_and(Grid::whole);
         let shown = self.layout.iter().filter(|(grid, p)| {
             **grid != 1 && !p.hidden && !matches!(p.place, Place::Message { .. })
         });
@@ -762,7 +744,7 @@ impl Model {
         let mut out: Vec<u64> = shown
             .map(|(grid, _)| *grid)
             .chain(named.copied())
-            .filter(blank)
+            .filter(undrawn)
             .collect();
         out.sort_unstable();
         out.dedup();
@@ -956,9 +938,24 @@ mod tests {
         assert_eq!(m.margins(2).top, 1);
     }
 
+    /// A `grid_line` of `n` cells from `col`.
+    fn cells(grid: u64, row: usize, col: usize, n: usize) -> Event {
+        Event::GridLine {
+            grid,
+            row,
+            col,
+            cells: vec![LineCell {
+                text: Text::Char('x'),
+                hl: Some(0),
+                repeat: n,
+            }],
+        }
+    }
+
     /// What a UI attaching to a session another UI drew is sent: its windows'
     /// grids resized and named, but neither placed nor drawn on. Both are
-    /// noticed; drawing on a grid, or hiding it, settles the question.
+    /// noticed; drawing every cell of a grid, or hiding it, settles the
+    /// question — and a cell is not every cell.
     #[test]
     fn windows_never_placed_or_drawn_are_noticed() {
         let mut m = model();
@@ -999,16 +996,7 @@ mod tests {
         apply(
             &mut m,
             vec![
-                Event::GridLine {
-                    grid: 2,
-                    row: 0,
-                    col: 0,
-                    cells: vec![LineCell {
-                        text: Text::Char('a'),
-                        hl: Some(0),
-                        repeat: 1,
-                    }],
-                },
+                cells(2, 0, 0, 1),
                 Event::WinPos {
                     grid: 2,
                     win: Some(1000),
@@ -1021,7 +1009,9 @@ mod tests {
             ],
         );
         assert!(m.unplaced().is_empty());
-        assert!(m.lacking().is_empty(), "drawn, or hidden");
+        assert_eq!(m.lacking(), vec![2], "a cell drawn of forty");
+        apply(&mut m, (0..4).map(|r| cells(2, r, 0, 10)).collect());
+        assert!(m.lacking().is_empty(), "drawn whole, or hidden");
         // Shown again, with nothing ever drawn on it: lacking again.
         apply(
             &mut m,
@@ -1051,75 +1041,47 @@ mod tests {
         assert_eq!(m.lacking(), vec![4, 7]);
     }
 
-    /// A window named and not placed, with a few cells drawn on it — what
-    /// Neovim sends of a grid it kept from another UI when some changed since
-    /// — has them forgotten, and is lacking; once only, so that what is drawn
-    /// on it after, the whole of it, is kept. A window placed keeps what is
-    /// drawn on it.
+    /// What a UI attaching to a session another UI drew on a smaller terminal
+    /// is sent: its windows' grids resized and placed, and drawn on only where
+    /// the resize added to them — under the rows a grid kept, or to the right
+    /// of every one of them. Each is noticed until the rest of it is drawn.
     #[test]
-    fn a_few_cells_of_a_window_never_placed_are_forgotten_once() {
+    fn windows_drawn_only_where_a_resize_added_are_noticed() {
         let mut m = model();
-        let line = |grid, text: char| Event::GridLine {
+        let place = |grid, win, col, width| Event::WinPos {
             grid,
+            win: Some(win),
             row: 0,
-            col: 0,
-            cells: vec![LineCell {
-                text: Text::Char(text),
-                hl: Some(0),
-                repeat: 1,
-            }],
+            col,
+            width,
+            height: 6,
         };
-        let resize = |grid| Event::GridResize {
+        let resize = |grid, width| Event::GridResize {
             grid,
-            width: 10,
-            height: 4,
+            width,
+            height: 6,
         };
-        apply(
-            &mut m,
-            vec![
-                resize(2),
-                resize(4),
-                Event::WinViewport {
-                    grid: 2,
-                    win: Some(1000),
-                    topline: 0,
-                    botline: 1,
-                    curline: 0,
-                    curcol: 0,
-                    line_count: 1,
-                    scroll_delta: 0,
-                },
-                line(2, 'a'),
-                Event::WinPos {
-                    grid: 4,
-                    win: Some(1001),
-                    row: 0,
-                    col: 11,
-                    width: 10,
-                    height: 4,
-                },
-                line(4, 'b'),
-            ],
-        );
-        assert!(m.lacking().is_empty(), "both drawn on");
-        m.forget_kept();
-        assert_eq!(m.lacking(), vec![2], "the one never placed");
-        assert_eq!(
-            m.grids[&2].cell(0, 0),
-            Some(&crate::client::grid::Cell::default())
-        );
-        assert_eq!(
-            m.grids[&4].cell(0, 0).map(|c| &c.text),
-            Some(&Text::Char('b'))
-        );
-
-        apply(&mut m, vec![line(2, 'c')]);
-        m.forget_kept();
-        assert!(m.lacking().is_empty(), "drawn again, and kept");
-        assert_eq!(
-            m.grids[&2].cell(0, 0).map(|c| &c.text),
-            Some(&Text::Char('c'))
-        );
+        let mut events = vec![
+            Event::GridResize {
+                grid: 1,
+                width: 30,
+                height: 8,
+            },
+            resize(2, 15),
+            place(2, 1000, 0, 15),
+            cells(2, 4, 0, 15),
+            cells(2, 5, 0, 15),
+            resize(4, 14),
+            place(4, 1001, 16, 14),
+        ];
+        events.extend((0..6).map(|r| cells(4, r, 10, 4)));
+        apply(&mut m, events);
+        assert!(m.unplaced().is_empty(), "both placed");
+        assert_eq!(m.lacking(), vec![2, 4]);
+        apply(&mut m, (0..4).map(|r| cells(2, r, 0, 15)).collect());
+        assert_eq!(m.lacking(), vec![4], "the taller drawn whole");
+        apply(&mut m, (0..6).map(|r| cells(4, r, 0, 10)).collect());
+        assert!(m.lacking().is_empty(), "and the wider");
     }
 
     /// Scrolls are added up per window over a batch, and only grid 1 being

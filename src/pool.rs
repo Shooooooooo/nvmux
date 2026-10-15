@@ -326,12 +326,15 @@ mod tests {
     }
 
     /// Letting go of the pool retires every client in it, side by side: each
-    /// stand-in takes 80 ms to leave once hung up, so four of them one after
-    /// another would take over 300 ms.
+    /// stand-in takes 80 ms to leave once hung up, less than the most letting
+    /// go of one waits for it (`RETIRE_WAIT`), so eight of them one after
+    /// another would take 640 ms at the least, however slow the machine. Side
+    /// by side they take about as long as one does, which a busy runner has
+    /// made 250 ms.
     #[test]
     fn dropping_the_pool_retires_every_client_side_by_side() {
         let mut pool = Pool::new(true);
-        let pids: Vec<i32> = (0..4)
+        let pids: Vec<i32> = (0..8)
             .map(|i| {
                 let a = kept_standin(
                     &format!("s{i}"),
@@ -350,8 +353,8 @@ mod tests {
             assert!(gone(pid), "client {pid} outlived the pool");
         }
         assert!(
-            took < Duration::from_millis(250),
-            "retiring four took {took:?}: one after another, not side by side"
+            took < Duration::from_millis(500),
+            "retiring eight took {took:?}: one after another, not side by side"
         );
     }
 }
