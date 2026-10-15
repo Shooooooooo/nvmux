@@ -209,6 +209,10 @@ wide, 120 by default, in its middle:
 
 ![The same two windows in the middle of the terminal, with a margin either side that their status lines run on through to the terminal's edges](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-editor.png)
 
+Either way, a window showing a terminal keeps its whole width, which is the
+width the program in it is told it has: with `"editor"`, the editor takes the
+whole terminal while one is on show.
+
 ## Configuration
 
 nvmux needs no configuration. An optional TOML file — `$NVMUX_CONFIG` if set,

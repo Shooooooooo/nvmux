@@ -1640,3 +1640,68 @@ fn the_next_client_draws_whole_what_a_centring_one_left() {
     );
     assert_eq!(term.hang_up(), Some(0), "the client's exit");
 }
+
+/// A window showing a terminal keeps its whole width with each window's text
+/// centred: the program in it is told its window's width. The window beside
+/// it has its text centred as before.
+#[test]
+fn a_window_showing_a_terminal_keeps_its_width() {
+    require_nvim!();
+    let scratch = Scratch::new("client-centre-terminal");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-centre-terminal", "windows");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    // The new window, on the left and in front, the terminal.
+    rpc.command("vsplit | terminal")
+        .expect("a terminal beside it");
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            term.pump_until(Duration::from_millis(20), |_| false);
+            widths(&mut rpc) == columns(160, &[80, 60])
+        }),
+        "the terminal narrowed, or the text not: {}\n{}",
+        widths(&mut rpc),
+        term.text()
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
+/// With the editor centred, a window showing a terminal has the editor take
+/// the whole terminal while it is on show, and centred again once it is not.
+#[test]
+fn a_terminal_on_show_has_the_editor_take_the_whole_terminal() {
+    require_nvim!();
+    let scratch = Scratch::new("client-centre-editor-terminal");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-centre-editor-terminal", "editor");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s
+            .starts_with(&format!("{}the left window", " ".repeat(50)))),
+        "never drawn centred:\n{}",
+        term.text()
+    );
+    rpc.command("vsplit | terminal")
+        .expect("a terminal beside it");
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            term.pump_until(Duration::from_millis(20), |_| false);
+            widths(&mut rpc) == columns(160, &[80, 79])
+        }),
+        "not the whole terminal: {}\n{}",
+        widths(&mut rpc),
+        term.text()
+    );
+    rpc.command("close").expect("the terminal's window closed");
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            term.pump_until(Duration::from_millis(20), |_| false);
+            widths(&mut rpc) == columns(60, &[60])
+        }),
+        "not centred again: {}\n{}",
+        widths(&mut rpc),
+        term.text()
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}

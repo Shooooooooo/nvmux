@@ -221,12 +221,15 @@ pub enum Centre {
     Off,
     /// The editor is as wide as the terminal, and a window wider than
     /// `window_width` has its text that wide, in its middle: its lines wrap
-    /// there, and its status line's words stand over it.
+    /// there, and its status line's words stand over it. But for a window
+    /// showing a terminal, which keeps its whole width: the program in it is
+    /// told its window's width.
     Windows,
     /// The editor is only as wide as its windows side by side want — each up
     /// to `window_width`, one that keeps its width (`'winfixwidth'`, as a
-    /// file tree does) as wide as it keeps, and a column between each two —
-    /// and centred in the terminal. Its margins are the editor's own
+    /// file tree does) as wide as it keeps, one showing a terminal the whole
+    /// terminal, and a column between each two — and centred in the
+    /// terminal, so that while a terminal is on show it is not centred. Its margins are the editor's own
     /// background, but where its status lines run on through them to the
     /// terminal's edges. A split or a window closed widens or narrows it once
     /// Neovim has laid the windows out, and with `'equalalways'` the windows

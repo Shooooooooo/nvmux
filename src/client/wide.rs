@@ -23,6 +23,11 @@
 //! it make them the same width again, as `'equalalways'` makes them on a
 //! split — where that is on, as it is unless turned off.
 //!
+//! A window showing a terminal wants the whole terminal: Neovim tells the
+//! program in it its window's width, and a shell or a program drawing a
+//! screen of its own is given all of it. So with one on show the editor is
+//! the whole terminal, and centred again once there is none.
+//!
 //! # Each window's text centred
 //!
 //! Neovim keeps the whole terminal, and a window wider than `window_width` is
@@ -31,31 +36,45 @@
 //! its lines there, ends its cursor line there — and the client puts it in
 //! the middle of the window ([`inset`]), a float anchored to it with it. The
 //! status line under it is still the window's width, as Neovim draws it, and
-//! has its words moved in to stand over the text ([`realign`]).
+//! has its words moved in to stand over the text ([`realign`]). A window
+//! showing a terminal, as the measure says which are, is not asked: its grid
+//! is as wide as Neovim tells the program in it its terminal is, and that
+//! would be held to `window_width` with it.
 
 use super::compose::{Frame, Out};
 use super::grid::Text;
 use super::style::Style;
 
 /// What the windows of the tab page in front want, side by side, given the
-/// most columns a window's text gets (the first argument): a window that
-/// keeps its width wants that, any other the most, a row of them the sum
-/// with a column between each two, and a column of them the most any one of
-/// them wants. Answered as `{ wanted, 'laststatus', 'columns' }`: the last
-/// so that an attach at another width knows the windows were laid out for
-/// that one.
+/// most columns a window's text gets (the first argument): a window showing
+/// a terminal wants the whole terminal, more than any is wide — the program
+/// in it is told its window's width; a window that keeps its width wants
+/// that, any other the most; a row of them the sum with a column between
+/// each two, and a column of them the most any one of them wants. Answered
+/// as `{ wanted, 'laststatus', 'columns', terminals }`: `'columns'` so that
+/// an attach at another width knows the windows were laid out for that one,
+/// and the windows showing a terminal, so that the text of none of them is
+/// centred in it.
 ///
 /// Given the client's channel as well, it stays in the editor and says it
-/// again, as an `nvmux_client` notification (`measure`, and the same three),
-/// whenever either of the first two changes: a window made, closed or
-/// resized, a tab page entered, `'winfixwidth'` or `'laststatus'` set. It
-/// goes when this client's UI does, or the first time it finds the channel
-/// gone.
+/// again, as an `nvmux_client` notification (`measure`, and the same four),
+/// whenever what the windows want, `'laststatus'` or the windows showing a
+/// terminal change: a window made, closed or resized, a buffer shown in a
+/// window, a terminal opened, a tab page entered, `'winfixwidth'` or
+/// `'laststatus'` set. It goes when this client's UI does, or the first time
+/// it finds the channel gone.
 pub const MEASURE_LUA: &str = "local most, chan = ...
 local api = vim.api
+local whole = 1073741824
+local function terminal(win)
+  return vim.bo[api.nvim_win_get_buf(win)].buftype == 'terminal'
+end
 local function want(node)
   local kind, v = node[1], node[2]
   if kind == 'leaf' then
+    if terminal(v) then
+      return whole
+    end
     if vim.wo[v].winfixwidth then
       return api.nvim_win_get_width(v)
     end
@@ -72,8 +91,17 @@ local function want(node)
   end
   return n
 end
+local function terminals()
+  local wins = {}
+  for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
+    if terminal(win) then
+      table.insert(wins, win)
+    end
+  end
+  return wins
+end
 local function measure()
-  return { want(vim.fn.winlayout()), vim.o.laststatus, vim.o.columns }
+  return { want(vim.fn.winlayout()), vim.o.laststatus, vim.o.columns, terminals() }
 end
 local last = measure()
 if chan then
@@ -82,9 +110,9 @@ if chan then
   local function check()
     queued = false
     local now = measure()
-    if now[1] ~= last[1] or now[2] ~= last[2] then
+    if now[1] ~= last[1] or now[2] ~= last[2] or not vim.deep_equal(now[4], last[4]) then
       last = now
-      if not pcall(vim.rpcnotify, chan, 'nvmux_client', 'measure', now[1], now[2], now[3]) then
+      if not pcall(vim.rpcnotify, chan, 'nvmux_client', 'measure', now[1], now[2], now[3], now[4]) then
         pcall(api.nvim_del_augroup_by_id, group)
       end
     end
@@ -95,8 +123,9 @@ if chan then
       vim.schedule(check)
     end
   end
-  api.nvim_create_autocmd({ 'WinNew', 'WinClosed', 'WinResized', 'TabEnter', 'VimResized' },
-    { group = group, callback = soon })
+  api.nvim_create_autocmd({
+    'WinNew', 'WinClosed', 'WinResized', 'TabEnter', 'VimResized', 'BufWinEnter', 'TermOpen',
+  }, { group = group, callback = soon })
   api.nvim_create_autocmd('OptionSet',
     { group = group, pattern = { 'winfixwidth', 'laststatus' }, callback = soon })
   api.nvim_create_autocmd('UILeave', {

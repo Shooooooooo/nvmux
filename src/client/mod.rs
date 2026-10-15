@@ -112,7 +112,7 @@ pub mod term;
 pub mod wide;
 pub mod wire;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -146,6 +146,13 @@ fn options(v: &[ValueRef<'_>]) -> anim::layout::Options {
         splitright: flag(1, dflt.splitright),
         splitbelow: flag(2, dflt.splitbelow),
     }
+}
+
+/// Windows, as the measure names them (see [`wide::MEASURE_LUA`]), or
+/// `None` where it named none.
+fn wins(v: Option<&ValueRef<'_>>) -> Option<BTreeSet<i64>> {
+    let v = v?.as_array()?;
+    Some(v.iter().filter_map(redraw::int).collect())
 }
 
 /// The environment variable a parent nvmux hands the terminal's colours down
@@ -1015,6 +1022,9 @@ pub struct App {
     /// The window grids asked to be narrower than their windows, and how
     /// wide: see [`wide`].
     narrowed: HashMap<u64, usize>,
+    /// The windows of the tab page in front showing a terminal, as the
+    /// measure last said: their text is never centred in them (see [`wide`]).
+    terminals: BTreeSet<i64>,
 }
 
 impl App {
@@ -1071,6 +1081,7 @@ impl App {
             told: None,
             columns: None,
             narrowed: HashMap::new(),
+            terminals: BTreeSet::new(),
         }
     }
 
@@ -1122,8 +1133,8 @@ impl App {
         self.client_info();
         // Asked before anything an attach waits for, so its answer comes
         // first: how wide a centred editor is is known by the time the
-        // client attaches.
-        if self.window_width > 0 {
+        // client attaches. Nothing is, with nothing centred.
+        if self.centring() != Centre::Off {
             self.measure(None);
         }
         if self.multigrid_wanted {
@@ -1151,7 +1162,7 @@ impl App {
     /// Leave the measure in the editor for this attach, once the client knows
     /// its own channel.
     fn leave_measure(&mut self) {
-        if self.window_width == 0 || self.measuring || self.attach == Attach::Asking {
+        if self.centring() == Centre::Off || self.measuring || self.attach == Attach::Asking {
             return;
         }
         if let Some(chan) = self.chan {
@@ -1171,9 +1182,21 @@ impl App {
     }
 
     /// What the measure says: what the windows side by side want,
-    /// `'laststatus'`, and how wide the editor is as it stands.
-    fn measured(&mut self, wanted: Option<i64>, laststatus: Option<i64>, columns: Option<i64>) {
+    /// `'laststatus'`, how wide the editor is as it stands, and which windows
+    /// show a terminal.
+    fn measured(
+        &mut self,
+        wanted: Option<i64>,
+        laststatus: Option<i64>,
+        columns: Option<i64>,
+        terminals: Option<BTreeSet<i64>>,
+    ) {
         self.measured = true;
+        if let Some(t) = terminals.filter(|t| *t != self.terminals) {
+            self.terminals = t;
+            self.narrow_windows();
+            self.dirty = true;
+        }
         if let Some(c) = columns.and_then(|c| usize::try_from(c).ok()) {
             self.columns = Some(c);
         }
@@ -1239,7 +1262,7 @@ impl App {
                     if let Some(&w) = self.narrowed.get(&grid) {
                         want.insert(grid, w);
                     }
-                } else if width > self.window_width {
+                } else if width > self.window_width && !self.shows_terminal(grid) {
                     want.insert(grid, self.window_width);
                 }
             }
@@ -1264,6 +1287,14 @@ impl App {
                 &[Arg::Int(grid as i64), Arg::Int(width as i64), Arg::Int(0)],
             );
         }
+    }
+
+    /// Whether the window on `grid` shows a terminal, as the measure last said.
+    fn shows_terminal(&self, grid: u64) -> bool {
+        self.model
+            .wins
+            .get(&grid)
+            .is_some_and(|win| self.terminals.contains(win))
     }
 
     /// Let go of every grid asked to be narrower than its window, as the
@@ -1427,7 +1458,7 @@ impl App {
                 }
             }
             Some("options") => self.anim.set_options(options(&params[1..])),
-            Some("measure") => self.measured(int(1), int(2), int(3)),
+            Some("measure") => self.measured(int(1), int(2), int(3), wins(params.get(4))),
             // The attributes of the editor's highlight groups the colours
             // of the lines it sends name.
             Some("colours") => {
@@ -1568,7 +1599,8 @@ impl App {
                     Some(Ask::Measure) => {
                         let answer = result.and_then(ValueRef::as_array);
                         let int = |i: usize| answer.and_then(|a| a.get(i)).and_then(redraw::int);
-                        self.measured(int(0), int(1), int(2));
+                        let terminals = wins(answer.and_then(|a| a.get(3)));
+                        self.measured(int(0), int(1), int(2), terminals);
                     }
                     Some(Ask::Uis) => {
                         self.checking = false;
@@ -4214,5 +4246,88 @@ mod tests {
 
         a.let_windows_go();
         assert_eq!(narrowed(&calls(&mut a)), [vec![n(2), n(0), n(0)]]);
+    }
+
+    /// A window showing a terminal has its text centred in it by no way of
+    /// using a wide terminal: the measure saying it shows one lets its grid
+    /// go, and saying it no longer does narrows it again.
+    #[test]
+    fn a_window_showing_a_terminal_keeps_its_width() {
+        let t0 = Instant::now();
+        let (mut a, _) = wide_app(Centre::Windows, 8, t0);
+        let n = Value::from;
+        redraw(
+            &mut a,
+            vec![
+                resize(1, 20, 6),
+                resize(2, 20, 5),
+                ("win_pos", vec![n(2), n(1000), n(0), n(0), n(20), n(5)]),
+                viewport(2, 1000),
+            ],
+            t0,
+        );
+        let narrowed = |calls: &[Call]| -> Vec<Vec<Value>> {
+            calls
+                .iter()
+                .filter(|(_, m, _)| m == "nvim_ui_try_resize_grid")
+                .map(|(_, _, args)| args.clone())
+                .collect()
+        };
+        assert_eq!(narrowed(&calls(&mut a)), [vec![n(2), n(8), n(0)]]);
+
+        let measure = |terminals: Vec<Value>| {
+            vec![
+                "measure".into(),
+                8.into(),
+                2.into(),
+                20.into(),
+                Value::Array(terminals),
+            ]
+        };
+        notify(&mut a, "nvmux_client", measure(vec![n(1000)]), t0);
+        assert_eq!(
+            narrowed(&calls(&mut a)),
+            [vec![n(2), n(0), n(0)]],
+            "a terminal now"
+        );
+        redraw(&mut a, vec![resize(2, 20, 5)], t0);
+        assert!(narrowed(&calls(&mut a)).is_empty(), "and left be");
+
+        notify(&mut a, "nvmux_client", measure(Vec::new()), t0);
+        assert_eq!(
+            narrowed(&calls(&mut a)),
+            [vec![n(2), n(8), n(0)]],
+            "a terminal no longer"
+        );
+    }
+
+    /// With nothing centred, nothing is measured, and nothing left in the
+    /// editor to measure it.
+    #[test]
+    fn nothing_centred_measures_nothing() {
+        let t0 = Instant::now();
+        let mut a = app(true).with_centre(Centre::Off, 8);
+        a.start();
+        let sent = calls(&mut a);
+        answer(
+            &mut a,
+            request(&sent, "nvim_get_api_info", ""),
+            Value::Array(vec![7.into()]),
+            t0,
+        );
+        answer(&mut a, asks_uis(&sent), uis(false, false), t0);
+        let sent = [sent, calls(&mut a)].concat();
+        assert!(
+            sent.iter().any(|(_, m, _)| m == "nvim_ui_attach"),
+            "attached: {sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|(_, m, args)| m == "nvim_exec_lua"
+                && args
+                    .first()
+                    .and_then(Value::as_str)
+                    .is_some_and(|lua| lua.starts_with("local most"))),
+            "no measure: {sent:?}"
+        );
     }
 }
