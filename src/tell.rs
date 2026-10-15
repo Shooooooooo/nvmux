@@ -22,6 +22,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use crate::card::{self, Card, Go, Post, Posted};
+use crate::config::KeySettings;
 use crate::notes::{self, Heard, Kind, News};
 use crate::ui::note;
 use crate::{ids, keys};
@@ -33,15 +34,30 @@ const SETTLE: Duration = Duration::from_millis(30);
 
 /// The card that tells `news`, from the session with this id and name — or,
 /// with `None`, from the session in front itself — and where acting on it
-/// goes: that session, or the terminal it came from. `prefix` is the prefix
-/// key, which the card names. `None` for what is not news: what is busy.
+/// goes: that session, or the terminal it came from. `settings` are the keys
+/// as the user has them, of which the card names the two that go there:
+/// `<prefix> Enter` by default. `None` for what is not news: what is busy.
 ///
 /// It is about the session, or the terminal, it came from (see
 /// [`Card::about`]), and leaves its own sign — or, going nowhere, none.
-pub fn card_for(news: &News, from: Option<(&str, &str)>, prefix: u8) -> Option<(Card, Option<Go>)> {
+pub fn card_for(
+    news: &News,
+    from: Option<(&str, &str)>,
+    settings: KeySettings,
+) -> Option<(Card, Option<Go>)> {
     let kind = sign(news.kind)?;
     let what = note::what(news.kind, &news.title, &news.text);
-    let key = format!("{} {}", keys::prefix_label(prefix), keys::ENTER_GLYPH);
+    // The prefix, and the key `go` is on — which every row of the table has,
+    // so the second is never missing.
+    let key = format!(
+        "{} {}",
+        keys::prefix_label(settings.prefix),
+        settings
+            .bind
+            .key(keys::Action::Go)
+            .map(keys::key_glyph)
+            .unwrap_or_default()
+    );
     let (title, go, does) = match from {
         Some((id, name)) => (
             name.to_string(),
@@ -168,11 +184,11 @@ impl Notifier {
         if crate::config::get().client.ui == crate::config::Ui::Nvim {
             return Self { commands: None };
         }
-        let prefix = crate::config::get().keys.prefix;
+        let settings = crate::config::get().keys;
         let (commands, inbox) = mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("nvmux-notifier".into())
-            .spawn(move || run(&inbox, prefix));
+            .spawn(move || run(&inbox, settings));
         if let Err(e) = spawned {
             tracing::warn!(error = %e, "tell: no thread to read the sessions on");
         }
@@ -206,7 +222,7 @@ impl Notifier {
     }
 }
 
-fn run(inbox: &Receiver<Command>, prefix: u8) {
+fn run(inbox: &Receiver<Command>, settings: KeySettings) {
     let mut watched: Vec<Watched> = Vec::new();
     let mut front: Option<String> = None;
     let mut due: Option<Instant> = None;
@@ -249,7 +265,7 @@ fn run(inbox: &Receiver<Command>, prefix: u8) {
             }
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(id) = front.as_deref() {
-                    round(&mut watched, id, prefix);
+                    round(&mut watched, id, settings);
                 }
                 due = front.is_some().then(|| Instant::now() + notes::POLL);
             }
@@ -263,7 +279,7 @@ fn run(inbox: &Receiver<Command>, prefix: u8) {
 /// ([`oldest_first`]). On a first read, which says only how far a session
 /// has got, what another keeps is its mark alone; and of one that keeps
 /// nothing any more, or is gone, the mark is let go of.
-fn round(watched: &mut [Watched], front: &str, prefix: u8) {
+fn round(watched: &mut [Watched], front: &str, settings: KeySettings) {
     let heard: Vec<(usize, Heard)> = std::thread::scope(|s| {
         let reads: Vec<_> = watched
             .iter()
@@ -300,11 +316,11 @@ fn round(watched: &mut [Watched], front: &str, prefix: u8) {
         let mut cards = Vec::new();
         if w.heard.is_none() {
             if let Some(n) = marks.filter(|_| !here) {
-                cards.extend(card_for(n, from, prefix).map(|(c, go)| (n.age, c.as_mark(), go)));
+                cards.extend(card_for(n, from, settings).map(|(c, go)| (n.age, c.as_mark(), go)));
             }
         }
         for n in to_tell(w.heard, &news, here) {
-            cards.extend(card_for(n, from, prefix).map(|(c, go)| (n.age, c, go)));
+            cards.extend(card_for(n, from, settings).map(|(c, go)| (n.age, c, go)));
         }
         for (age, card, go) in cards {
             // What another session keeps leaves the one sign the picker has
@@ -344,6 +360,14 @@ fn oldest_first(mut told: Vec<(u64, Post)>) -> Vec<Post> {
 mod tests {
     use super::*;
 
+    /// The keys a card names, as they are by default but for the prefix.
+    fn prefixed(prefix: u8) -> KeySettings {
+        KeySettings {
+            prefix,
+            ..KeySettings::default()
+        }
+    }
+
     fn news(kind: Kind, title: &str, text: &str, seq: u64, shown: Option<bool>) -> News {
         News {
             kind,
@@ -363,7 +387,8 @@ mod tests {
     #[test]
     fn a_card_from_another_session_names_it_and_goes_there() {
         let finished = news(Kind::Finished, "cargo test", "exited with code 0", 1, None);
-        let (card, go) = card_for(&finished, Some(("abcd2345", "api-server")), 0).expect("news");
+        let (card, go) =
+            card_for(&finished, Some(("abcd2345", "api-server")), prefixed(0)).expect("news");
         assert_eq!(card.kind, card::Kind::Finished);
         assert_eq!(card.title, "api-server");
         assert_eq!(card.body.as_deref(), Some("cargo test: exited with code 0"));
@@ -378,7 +403,7 @@ mod tests {
             2,
             None,
         );
-        let (card, _) = card_for(&notified, Some(("abcd2345", "blog")), 0).expect("news");
+        let (card, _) = card_for(&notified, Some(("abcd2345", "blog")), prefixed(0)).expect("news");
         assert_eq!(card.kind, card::Kind::Notified);
         assert_eq!(
             card.body.as_deref(),
@@ -386,11 +411,11 @@ mod tests {
         );
 
         let failed = news(Kind::Failed, "make", "exited with code 2", 3, None);
-        let (card, go) = card_for(&failed, Some(("not an id", "x")), 0).expect("news");
+        let (card, go) = card_for(&failed, Some(("not an id", "x")), prefixed(0)).expect("news");
         assert_eq!(card.kind, card::Kind::Failed);
         assert_eq!((card.footer, go), (None, None), "nowhere to go, so no key");
         assert_eq!(card.mark, None, "and no mark to wait for it");
-        assert!(card_for(&news(Kind::Busy(None), "", "", 4, None), None, 0).is_none());
+        assert!(card_for(&news(Kind::Busy(None), "", "", 4, None), None, prefixed(0)).is_none());
     }
 
     /// A card is about the session it came from, which a newer one about it
@@ -399,12 +424,13 @@ mod tests {
     #[test]
     fn a_card_is_about_where_it_came_from() {
         let finished = news(Kind::Finished, "cargo test", "exited with code 0", 1, None);
-        let (card, _) = card_for(&finished, Some(("abcd2345", "api-server")), 0).expect("news");
+        let (card, _) =
+            card_for(&finished, Some(("abcd2345", "api-server")), prefixed(0)).expect("news");
         assert_eq!(card.about.as_deref(), Some("abcd2345"));
         assert_eq!(card.mark, Some(card::Kind::Finished));
         let mut own = news(Kind::Failed, "sh", "exited with code 3", 1, Some(false));
         own.buf = Some(5);
-        let (card, _) = card_for(&own, None, 0).expect("news");
+        let (card, _) = card_for(&own, None, prefixed(0)).expect("news");
         assert_eq!(card.about.as_deref(), Some("here 5"));
     }
 
@@ -432,16 +458,42 @@ mod tests {
         let mut own = news(Kind::Failed, "sh", "exited with code 3", 1, Some(false));
         own.buf = Some(5);
         own.tab = Some(2);
-        let (card, go) = card_for(&own, None, 0x14).expect("news");
+        let (card, go) = card_for(&own, None, prefixed(0x14)).expect("news");
         assert_eq!(card.title, "here · tab 2");
         assert_eq!(card.footer.as_deref(), Some("Ctrl-t ⏎ show it"));
         assert_eq!(go, Some(Go::Buffer(5)));
 
         own.tab = None;
-        assert_eq!(card_for(&own, None, 0).expect("news").0.title, "here");
+        assert_eq!(
+            card_for(&own, None, prefixed(0)).expect("news").0.title,
+            "here"
+        );
         own.buf = None;
-        let (card, go) = card_for(&own, None, 0).expect("news");
+        let (card, go) = card_for(&own, None, prefixed(0)).expect("news");
         assert_eq!((card.footer, go), (None, None));
+    }
+
+    /// A card names the key that goes there as the user has it: with `go`
+    /// moved off Enter, the key it was moved to, drawn the way the hint bar
+    /// draws it.
+    #[test]
+    fn a_card_names_the_key_go_was_moved_to() {
+        let mut settings = prefixed(0);
+        assert!(settings.bind.bind("go", b'g'));
+        let finished = news(Kind::Finished, "cargo test", "exited with code 0", 1, None);
+        let (card, _) =
+            card_for(&finished, Some(("abcd2345", "api-server")), settings).expect("news");
+        assert_eq!(card.footer.as_deref(), Some("Ctrl-Space g go there"));
+
+        let mut settings = prefixed(0);
+        assert!(settings.bind.bind("go", b' '));
+        assert!(
+            settings.bind.bind("picker", b'\r'),
+            "trading Enter for Space"
+        );
+        let (card, _) =
+            card_for(&finished, Some(("abcd2345", "api-server")), settings).expect("news");
+        assert_eq!(card.footer.as_deref(), Some("Ctrl-Space ␣ go there"));
     }
 
     /// The first read only finds out how far a session has got; after it,
@@ -493,7 +545,7 @@ mod tests {
                 age,
                 ..news(Kind::Finished, text, "exited with code 0", 1, None)
             };
-            let (card, go) = card_for(&said, Some(("abcd2345", name)), 0).expect("news");
+            let (card, go) = card_for(&said, Some(("abcd2345", name)), prefixed(0)).expect("news");
             let post = Post {
                 front: "front".to_string(),
                 what: Posted::Card(card, go),
