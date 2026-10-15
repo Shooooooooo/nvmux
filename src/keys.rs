@@ -9,10 +9,15 @@
 //! Deliberately pure: timing is the caller's job, via [`Prefix::timeout`], so
 //! the machine is unit-testable without a PTY, a terminal or a clock.
 //!
-//! [`BINDINGS`] is the one table. [`Prefix::feed`] consults it, the tests
-//! iterate it, and the help screen ([`crate::ui::help`]) renders it, so a
-//! command cannot be added without appearing in the help. The README's "While
-//! attached" table is a prose copy, and it is what can go stale.
+//! [`BINDINGS`] is the one table: every command, the key it is on by default,
+//! and its name. A config file can move a command to another key under
+//! `[keys.bind]` (see [`crate::config`]), and a [`Keymap`] is the table as
+//! moved — what [`Prefix::feed`] consults, the help screen
+//! ([`crate::ui::help`]) renders and the hint bar ([`crate::hint`]) draws — so
+//! a command cannot be added without appearing in the help, nor moved without
+//! the help saying where to. The README's "While attached" table is a prose
+//! copy — each command's name, its default key, and what it does — and it is
+//! what can go stale.
 //!
 //! Note what is *not* here: `Ctrl-z` (0x1a) is not special-cased. It is
 //! forwarded like any other byte and Neovim receives it as a key.
@@ -123,9 +128,11 @@ pub enum Step {
 /// screen describes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Binding {
-    /// The byte typed after the prefix. Printable ASCII, or Enter; [`key_label`]
-    /// spells it for the help screen, since one of them is the space bar and
-    /// would otherwise be an empty cell, and another is no character at all.
+    /// The byte typed after the prefix: in [`BINDINGS`] the one the command is
+    /// on unless `[keys.bind]` moves it, and out of [`Keymap::bindings`] the
+    /// one it is on. Printable ASCII, or Enter; [`key_label`] spells it for the
+    /// help screen, since one of them is the space bar and would otherwise be
+    /// an empty cell, and another is no character at all.
     pub key: u8,
     pub action: Action,
     /// One line, in terms of what happens to the user.
@@ -134,6 +141,11 @@ pub struct Binding {
     /// up while the prefix is armed ([`crate::hint`]). A field rather than a
     /// second table, so a command cannot be added without a label for the bar
     /// — the guarantee `help` already gives the help screen.
+    ///
+    /// It is the command's name in `[keys.bind]` as well, so the bar names the
+    /// setting that moves what it shows. Renaming one renames the other, and a
+    /// config file that used the old name stops loading — the README's, which a
+    /// test parses, first.
     pub hint: &'static str,
 }
 
@@ -180,15 +192,95 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         key: b'?',
         action: Action::Help,
-        help: "show this help",
+        help: "show these keys",
         hint: "help",
     },
 ];
 
-/// The command a second byte selects, if any. Linear over a handful of rows; a
-/// `match` would be a second copy of the table.
-pub fn command(byte: u8) -> Option<Action> {
-    BINDINGS.iter().find(|b| b.key == byte).map(|b| b.action)
+/// How many commands there are: a row of [`BINDINGS`] each.
+const COMMANDS: usize = BINDINGS.len();
+
+/// Every command's name in `[keys.bind]`, in [`BINDINGS`]' order: each row's
+/// [`hint`](Binding::hint). Spelled out for a config file that names a command
+/// there is not — this is the list the refusal offers instead.
+pub(crate) static NAMES: [&str; COMMANDS] = {
+    let mut names = [""; COMMANDS];
+    let mut i = 0;
+    while i < COMMANDS {
+        names[i] = BINDINGS[i].hint;
+        i += 1;
+    }
+    names
+};
+
+/// Which key each command is on: the table's own, or where `[keys.bind]` moved
+/// it (see [`crate::config`]).
+///
+/// A key per row of [`BINDINGS`], in its order, rather than a table of its own:
+/// what a command does, what the help says of it and what the bar calls it stay
+/// the table's, and only the key can be moved. Everything that reads the table
+/// as the user has it reads it through here — the machine ([`Prefix`]), the
+/// help screen and the hint bar — so none of them can disagree about where a
+/// command is.
+///
+/// Two commands can be put on one key here; [`clash`](Keymap::clash) finds
+/// them, and the config refuses to load them. No command can be put on a digit
+/// or on the prefix, because [`parse_key`], the one way a key comes in from a
+/// file, refuses the one and cannot spell the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Keymap([u8; COMMANDS]);
+
+/// The derive would put every command on `NUL`; the default is the table's.
+impl Default for Keymap {
+    fn default() -> Self {
+        Self(std::array::from_fn(|i| BINDINGS[i].key))
+    }
+}
+
+impl Keymap {
+    /// Every command in the table's order, each on the key it is on now: a row
+    /// of [`BINDINGS`] with its key moved, if it has been.
+    pub fn bindings(&self) -> impl Iterator<Item = Binding> {
+        BINDINGS
+            .iter()
+            .zip(self.0)
+            .map(|(b, key)| Binding { key, ..*b })
+    }
+
+    /// The command a second byte selects, if any. Linear over a handful of
+    /// rows; a `match` would be a second copy of the table.
+    pub fn command(&self, byte: u8) -> Option<Action> {
+        self.bindings().find(|b| b.key == byte).map(|b| b.action)
+    }
+
+    /// The key `action` is on: `None` only for [`Action::Switch`], which is a
+    /// rule and no row.
+    pub fn key(&self, action: Action) -> Option<u8> {
+        self.bindings().find(|b| b.action == action).map(|b| b.key)
+    }
+
+    /// Put the command called `name` — its word on the hint bar — on `key`.
+    /// False, with nothing moved, when no command is called that.
+    pub fn bind(&mut self, name: &str, key: u8) -> bool {
+        match NAMES.iter().position(|n| *n == name) {
+            Some(i) => {
+                self.0[i] = key;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The first two commands that share a key, by name and in the table's
+    /// order, and the key they share. The second of them could never be
+    /// reached, and the help and the bar would offer it all the same.
+    pub fn clash(&self) -> Option<(&'static str, &'static str, u8)> {
+        (0..COMMANDS).find_map(|i| {
+            (i + 1..COMMANDS)
+                .find(|&j| self.0[j] == self.0[i])
+                .map(|j| (NAMES[i], NAMES[j], self.0[i]))
+        })
+    }
 }
 
 /// Parse a human prefix spelling like `"C-Space"`, `"C-t"` or `"Ctrl-a"` into
@@ -237,6 +329,52 @@ pub fn parse_prefix(s: &str) -> Result<u8, String> {
     }
 }
 
+/// Parse a command's key as `[keys.bind]` spells it: one character, as itself,
+/// or the space bar or Enter by name, `Space` and `Enter` in any case — the
+/// spellings [`key_label`] prints, so the help screen's key column reads back
+/// as the keys it names.
+///
+/// Only a key that reaches [`Prefix`] as a byte of its own, in every keyboard
+/// protocol a terminal speaks to it (see [`crate::keyseq`]): a printable ASCII
+/// character, which a terminal sends as the text it types, shifted or not — the
+/// way `?` has always arrived; the space bar; and Enter, which even the kitty
+/// protocol leaves a carriage return. Not a digit, which the session-number rule
+/// has already taken; and not a chord, which arrives as an escape sequence the
+/// machine passes on rather than reads. Nor can a key be the prefix: that is a
+/// control byte, and the one control byte a key can be, Enter's, is one
+/// [`parse_prefix`] refuses.
+///
+/// Case matters for a character, as it does to the terminal: `D` is a key of
+/// its own, Shift and `d`.
+pub fn parse_key(s: &str) -> Result<u8, String> {
+    if s.eq_ignore_ascii_case(SPACE_NAME) {
+        return Ok(b' ');
+    }
+    if s.eq_ignore_ascii_case(ENTER_NAME) {
+        return Ok(ENTER);
+    }
+    let mut chars = s.chars();
+    let (Some(c), None) = (chars.next(), chars.next()) else {
+        return Err(format!(
+            "key {s:?} must be one character, \"Space\" or \"Enter\""
+        ));
+    };
+    let Some(byte) = u8::try_from(c)
+        .ok()
+        .filter(|b| *b == b' ' || b.is_ascii_graphic())
+    else {
+        return Err(format!(
+            "key {s:?} must be a printable ASCII character, \"Space\" or \"Enter\""
+        ));
+    };
+    if byte.is_ascii_digit() {
+        return Err(format!(
+            "key {s:?} is a digit, and a digit after the prefix picks a session"
+        ));
+    }
+    Ok(byte)
+}
+
 /// Spell a key the way people read it: itself for a printable character, and
 /// a name for the space bar, which would otherwise be an invisible cell on the
 /// help screen and an unreadable one in the README — and for Enter, which is
@@ -269,14 +407,16 @@ pub const SPACE_GLYPH: &str = "␣";
 ///
 /// [`key_label`] is the other spelling: a name, for the help screen's key column
 /// and the README's table, where there is room for a word and an invisible cell
-/// would be the worse answer. The `to_lowercase` makes the row's uniform case
-/// this function's promise rather than a property of whichever keys happen to be
-/// in [`BINDINGS`] today.
+/// would be the worse answer. The two keys with names are the two with glyphs;
+/// every other key is a character, drawn as itself, case and all. `D` is a key
+/// of its own, Shift and `d`, that `[keys.bind]` can put a command on, and a row
+/// that drew it `d` would send the user to the wrong key — so the row is as
+/// lowercase as the keys it names, and no more.
 pub fn key_glyph(byte: u8) -> String {
     match byte {
         b' ' => SPACE_GLYPH.to_string(),
         ENTER => ENTER_GLYPH.to_string(),
-        _ => key_label(byte).to_lowercase(),
+        _ => key_label(byte),
     }
 }
 
@@ -353,9 +493,10 @@ pub enum Pending {
 
 /// The prefix state machine.
 ///
-/// The prefix byte is state, not a global read: the machine stays pure and
-/// clock-free (see the module docs), and the configured key enters through the
-/// constructor rather than a settings lookup buried in [`feed`](Prefix::feed).
+/// The prefix byte and the keymap are state, not a global read: the machine
+/// stays pure and clock-free (see the module docs), and the configured keys
+/// enter through the constructor rather than a settings lookup buried in
+/// [`feed`](Prefix::feed).
 #[derive(Debug)]
 pub struct Prefix {
     state: State,
@@ -366,6 +507,9 @@ pub struct Prefix {
     /// The byte that arms the machine. [`PREFIX`] by default; a config file can
     /// remap it (see [`crate::config`]).
     prefix: u8,
+    /// Which key after the prefix runs which command. The table's own by
+    /// default; a config file can move them (see [`Keymap`]).
+    keymap: Keymap,
     /// The bytes that armed the machine — the control byte, or the sequence a
     /// terminal sent instead of it, and that key's release report if one has
     /// arrived since — replayed verbatim when the prefix turns out to be meant
@@ -385,17 +529,25 @@ impl Default for Prefix {
 }
 
 impl Prefix {
-    /// A machine armed by the standard [`PREFIX`] (`Ctrl-Space`).
+    /// A machine armed by the standard [`PREFIX`] (`Ctrl-Space`), with every
+    /// command on the table's own key.
     pub fn new(highest: u32) -> Self {
         Self::with_prefix(highest, PREFIX)
     }
 
     /// A machine armed by `prefix`, for a config file that remaps the key.
     pub fn with_prefix(highest: u32, prefix: u8) -> Self {
+        Self::with_keys(highest, prefix, Keymap::default())
+    }
+
+    /// A machine armed by `prefix`, with its commands on the keys `keymap`
+    /// puts them on: all that a config file can say about the keys.
+    pub fn with_keys(highest: u32, prefix: u8, keymap: Keymap) -> Self {
         Self {
             state: State::Idle,
             highest,
             prefix,
+            keymap,
             armed: Vec::new(),
             seq: Vec::new(),
         }
@@ -576,7 +728,7 @@ impl Prefix {
                     // A number never starts with 0, so `<prefix> 0` falls
                     // through to the replay branch below.
                     self.start_number(u32::from(b - b'0'), steps, pending);
-                } else if let Some(action) = command(b) {
+                } else if let Some(action) = self.keymap.command(b) {
                     flush(steps, pending);
                     steps.push(Step::Act(action));
                 } else {
@@ -689,22 +841,23 @@ mod tests {
 
     /// The README's "While attached" table is a prose copy of [`BINDINGS`], and
     /// a reader picking the tool up has only that copy — the `<prefix> ?` screen
-    /// needs a running session. So every command must have a row there.
+    /// needs a running session. So every command must have a row there, under
+    /// the name `[keys.bind]` moves it by and on the key it has by default.
     ///
-    /// The key cell, not the description: the two word things differently on
-    /// purpose (the screen has one line, the README has a column), and pinning
-    /// the prose would only force them to drift together. What actually goes
-    /// wrong is a command added here and never written down.
+    /// Those two cells, not the description: the two word things differently
+    /// on purpose (the screen has one line, the README has a column), and
+    /// pinning the prose would only force them to drift together. What
+    /// actually goes wrong is a command added here and never written down — or
+    /// renamed, or given another key by default, with its row left behind.
     #[test]
     fn every_binding_has_a_row_in_the_readme() {
         let readme = include_str!("../README.md");
         for b in BINDINGS {
-            let cell = format!("| `<prefix>` `{}` |", key_label(b.key));
+            let cells = format!("| `{}` | `<prefix>` `{}` |", b.hint, key_label(b.key));
             assert!(
-                readme.contains(&cell),
-                "README has no row for `<prefix> {}` — add one to \
-                 the \"While attached\" table",
-                key_label(b.key)
+                readme.contains(&cells),
+                "README has no row starting {cells:?} — add one to the \
+                 \"While attached\" table"
             );
         }
     }
@@ -754,7 +907,7 @@ mod tests {
     #[test]
     fn unknown_command_replays_both_bytes_in_order() {
         assert!(
-            command(b'x').is_none(),
+            Keymap::default().command(b'x').is_none(),
             "this test needs a byte that is not a command"
         );
         let mut p = Prefix::new(0);
@@ -1331,47 +1484,245 @@ mod tests {
         assert!(p.is_armed(), "an empty read must not disarm");
     }
 
-    /// Every byte that is not a command must survive a prefix unchanged.
+    /// A keymap with commands moved the ways a config file can move them: onto
+    /// a capital, onto punctuation, onto the key another command left, and off
+    /// Enter.
+    fn moved() -> Keymap {
+        let mut keymap = Keymap::default();
+        for (name, key) in [
+            ("picker", b'D'),
+            ("detach", b' '),
+            ("go", b'g'),
+            ("help", b'!'),
+        ] {
+            assert!(keymap.bind(name, key), "no command is called {name}");
+        }
+        assert_eq!(keymap.clash(), None, "the fixture puts two on one key");
+        keymap
+    }
+
+    /// Every byte that is not a command must survive a prefix unchanged — on
+    /// the table's keys, and on keys a config file has moved, where a key a
+    /// command left is as ordinary as any other.
     ///
     /// With no sessions known, every digit resolves at once, so nothing here is
     /// left mid-sequence — except `ESC`, which could be the start of another
     /// spelling of the prefix and is held until the wait passes.
     #[test]
     fn exhaustive_second_byte_table() {
-        for b in 0u8..=255 {
-            let mut p = Prefix::new(0);
-            let steps = p.feed(&[PREFIX, b]);
-            // Same order as `feed`: the literal rule, then digits, then the table.
-            if b == PREFIX {
-                assert_eq!(forwarded(&steps), vec![PREFIX]);
-            } else if b == ESC {
-                assert!(steps.is_empty(), "a bare ESC is held, not replayed yet");
-                assert_eq!(p.wait(), Some(Wait::Sequence));
-                assert_eq!(
-                    forwarded(&p.timeout()),
-                    vec![PREFIX, ESC],
-                    "the wait passing replays both, in order"
-                );
-            } else if (b'1'..=b'9').contains(&b) {
-                assert_eq!(
-                    actions(&steps),
-                    vec![Action::Switch(u32::from(b - b'0'))],
-                    "digit {:?} should select a session",
-                    b as char
-                );
-                assert!(forwarded(&steps).is_empty(), "byte {b:#04x} leaked bytes");
-            } else if let Some(action) = command(b) {
-                assert_eq!(actions(&steps), vec![action], "byte {b:#04x} should act");
-                assert!(forwarded(&steps).is_empty(), "byte {b:#04x} leaked bytes");
-            } else {
-                assert_eq!(
-                    forwarded(&steps),
-                    vec![PREFIX, b],
-                    "byte {b:#04x} must be replayed after the prefix"
-                );
+        for keymap in [Keymap::default(), moved()] {
+            for b in 0u8..=255 {
+                let mut p = Prefix::with_keys(0, PREFIX, keymap);
+                let steps = p.feed(&[PREFIX, b]);
+                // Same order as `feed`: the literal rule, then digits, then the
+                // table.
+                if b == PREFIX {
+                    assert_eq!(forwarded(&steps), vec![PREFIX]);
+                } else if b == ESC {
+                    assert!(steps.is_empty(), "a bare ESC is held, not replayed yet");
+                    assert_eq!(p.wait(), Some(Wait::Sequence));
+                    assert_eq!(
+                        forwarded(&p.timeout()),
+                        vec![PREFIX, ESC],
+                        "the wait passing replays both, in order"
+                    );
+                } else if (b'1'..=b'9').contains(&b) {
+                    assert_eq!(
+                        actions(&steps),
+                        vec![Action::Switch(u32::from(b - b'0'))],
+                        "digit {:?} should select a session",
+                        b as char
+                    );
+                    assert!(forwarded(&steps).is_empty(), "byte {b:#04x} leaked bytes");
+                } else if let Some(action) = keymap.command(b) {
+                    assert_eq!(actions(&steps), vec![action], "byte {b:#04x} should act");
+                    assert!(forwarded(&steps).is_empty(), "byte {b:#04x} leaked bytes");
+                } else {
+                    assert_eq!(
+                        forwarded(&steps),
+                        vec![PREFIX, b],
+                        "byte {b:#04x} must be replayed after the prefix"
+                    );
+                }
+                assert!(!p.is_armed(), "byte {b:#04x} left the machine armed");
             }
-            assert!(!p.is_armed(), "byte {b:#04x} left the machine armed");
         }
+    }
+
+    /// The table is the default keymap, row for row, and the names a config
+    /// file moves its rows by are their hints, in its order.
+    #[test]
+    fn the_default_keymap_is_the_table() {
+        let keymap = Keymap::default();
+        assert_eq!(keymap.bindings().collect::<Vec<_>>(), BINDINGS);
+        let hints: Vec<&str> = BINDINGS.iter().map(|b| b.hint).collect();
+        assert_eq!(NAMES.to_vec(), hints);
+        assert_eq!(keymap.clash(), None, "the table's own keys are distinct");
+    }
+
+    /// Moving a command moves that one and no other: its new key runs it, the
+    /// key it left runs nothing, and a name that is no command moves nothing.
+    #[test]
+    fn binding_a_command_by_name_moves_only_that_command() {
+        let mut keymap = Keymap::default();
+        assert!(keymap.bind("detach", b'x'));
+        assert_eq!(keymap.command(b'x'), Some(Action::Detach));
+        assert_eq!(keymap.command(b'd'), None);
+        assert_eq!(keymap.key(Action::Detach), Some(b'x'));
+        for b in BINDINGS.iter().filter(|b| b.action != Action::Detach) {
+            assert_eq!(keymap.key(b.action), Some(b.key), "{} moved too", b.hint);
+        }
+
+        let before = keymap;
+        assert!(!keymap.bind("detatch", b'y'), "no command is called that");
+        assert_eq!(keymap, before, "and nothing moved");
+        assert_eq!(keymap.key(Action::Switch(1)), None, "a rule, not a row");
+    }
+
+    /// Two commands on one key is a clash, whether both were moved there or one
+    /// was moved onto the other's own key; trading keys is not one.
+    #[test]
+    fn a_shared_key_is_a_clash_and_a_swap_is_not() {
+        let mut keymap = Keymap::default();
+        keymap.bind("detach", b'c');
+        assert_eq!(keymap.clash(), Some(("detach", "new", b'c')));
+
+        let mut keymap = Keymap::default();
+        keymap.bind("next", b'z');
+        keymap.bind("help", b'z');
+        assert_eq!(keymap.clash(), Some(("next", "help", b'z')));
+
+        let mut keymap = Keymap::default();
+        keymap.bind("detach", b'c');
+        keymap.bind("new", b'd');
+        assert_eq!(keymap.clash(), None);
+        assert_eq!(keymap.command(b'c'), Some(Action::Detach));
+        assert_eq!(keymap.command(b'd'), Some(Action::Create));
+    }
+
+    /// A moved command acts on its new key, and the key it left is an ordinary
+    /// one, replayed with the prefix — however the terminal spells the prefix.
+    #[test]
+    fn a_moved_command_acts_on_its_new_key_in_every_spelling() {
+        let mut keymap = Keymap::default();
+        keymap.bind("detach", b'x');
+        for spelling in [&[PREFIX][..], KITTY, XTERM] {
+            let mut p = Prefix::with_keys(0, PREFIX, keymap);
+            assert!(p.feed(spelling).is_empty(), "{spelling:?}");
+            let steps = p.feed(b"x");
+            assert_eq!(actions(&steps), vec![Action::Detach], "{spelling:?}");
+            assert!(forwarded(&steps).is_empty(), "{spelling:?}");
+
+            let mut p = Prefix::with_keys(0, PREFIX, keymap);
+            let mut input = spelling.to_vec();
+            input.push(b'd');
+            let steps = p.feed(&input);
+            assert_eq!(forwarded(&steps), input, "{spelling:?}");
+            assert!(actions(&steps).is_empty(), "{spelling:?}");
+            assert!(!p.is_armed(), "{spelling:?}");
+        }
+    }
+
+    /// Enter is two things: the key `go` is on by default, and the end of a
+    /// half-typed number. Moving `go` takes away only the first.
+    #[test]
+    fn enter_off_go_is_replayed_and_still_ends_a_number() {
+        let mut keymap = Keymap::default();
+        keymap.bind("go", b'g');
+
+        let mut p = Prefix::with_keys(12, PREFIX, keymap);
+        let steps = p.feed(&[PREFIX, ENTER]);
+        assert_eq!(forwarded(&steps), vec![PREFIX, ENTER]);
+        assert!(actions(&steps).is_empty());
+        assert_eq!(actions(&p.feed(&[PREFIX, b'g'])), vec![Action::Go]);
+
+        let mut p = Prefix::with_keys(12, PREFIX, keymap);
+        p.feed(&[PREFIX, b'1']);
+        let steps = p.feed(&[ENTER]);
+        assert_eq!(actions(&steps), vec![Action::Switch(1)]);
+        assert!(
+            forwarded(&steps).is_empty(),
+            "the terminator must not reach nvim"
+        );
+    }
+
+    /// A command on the prefix chord's own letter is what the space bar already
+    /// is for `Ctrl-Space`: the chord and the bare key arrive under one key
+    /// code, and the chord's release still belongs to its press.
+    #[test]
+    fn a_command_on_the_prefix_s_own_letter_is_that_command() {
+        let ctrl_a = 0x01;
+        let mut keymap = Keymap::default();
+        keymap.bind("picker", b'a');
+        for spelling in [&[ctrl_a][..], b"\x1b[97;5u", b"\x1b[27;5;97~"] {
+            let mut p = Prefix::with_keys(0, ctrl_a, keymap);
+            assert!(p.feed(spelling).is_empty(), "{spelling:?}");
+            assert!(p.feed(b"\x1b[97;5:3u").is_empty(), "held with its press");
+            let steps = p.feed(b"a");
+            assert_eq!(actions(&steps), vec![Action::Picker], "{spelling:?}");
+            assert!(forwarded(&steps).is_empty(), "{spelling:?}");
+        }
+    }
+
+    /// One character is itself, case and all; the two keys with no character
+    /// are their names, in any case.
+    #[test]
+    fn a_key_string_parses_to_its_byte() {
+        for (s, byte) in [
+            ("d", b'd'),
+            ("D", b'D'),
+            ("?", b'?'),
+            ("!", b'!'),
+            ("~", b'~'),
+            (" ", b' '),
+            ("Space", b' '),
+            ("space", b' '),
+            ("SPACE", b' '),
+            ("Enter", ENTER),
+            ("enter", ENTER),
+        ] {
+            assert_eq!(parse_key(s), Ok(byte), "{s:?}");
+        }
+    }
+
+    /// A key a terminal does not send as one byte of its own is refused, and so
+    /// is a digit, which the session numbers have already taken — saying so.
+    #[test]
+    fn what_cannot_be_a_key_is_refused() {
+        for s in [
+            "", "dd", "Ctrl-d", "C-d", "Esc", "Tab", " d", "d ", "é", "\t", "\x7f", "\r",
+        ] {
+            assert!(parse_key(s).is_err(), "{s:?} should be refused");
+        }
+        for d in '0'..='9' {
+            let err = parse_key(&d.to_string()).expect_err("a digit");
+            assert!(err.contains("session"), "{d:?}: {err}");
+        }
+    }
+
+    /// What the help screen prints in its key column reads back as the key it
+    /// names, for every key a command can be on — the table's own among them,
+    /// which is what the first-run file writes down.
+    #[test]
+    fn the_key_string_round_trips() {
+        let bindable = (b' '..=b'~').filter(|b| !b.is_ascii_digit()).chain([ENTER]);
+        for byte in bindable {
+            assert_eq!(parse_key(&key_label(byte)), Ok(byte), "{byte:#04x}");
+        }
+        for b in BINDINGS {
+            assert_eq!(parse_key(&key_label(b.key)), Ok(b.key), "{}", b.hint);
+        }
+    }
+
+    /// A capital is a key of its own, so the bar draws it as one: the glyphs
+    /// are for the two keys with no character, and every other key is itself.
+    #[test]
+    fn a_key_is_drawn_as_itself_case_and_all() {
+        assert_eq!(key_glyph(b'D'), "D");
+        assert_eq!(key_glyph(b'd'), "d");
+        assert_eq!(key_glyph(b'!'), "!");
+        assert_eq!(key_glyph(b' '), SPACE_GLYPH);
+        assert_eq!(key_glyph(ENTER), ENTER_GLYPH);
     }
 
     /// `<prefix> ?` used to be replayed to Neovim as two bytes. This is the way to
@@ -1496,6 +1847,38 @@ mod tests {
                 "{:?}'s hint is not lowercase",
                 b.key as char
             );
+        }
+    }
+
+    /// A hint is also its command's name in `[keys.bind]`, where it is written
+    /// as a bare TOML key — and the first-run file is checked by reading its
+    /// commented settings as ones named in lowercase letters and underscores.
+    /// Letters alone keep a name all three of those at once.
+    #[test]
+    fn every_hint_is_a_name_a_config_file_can_write() {
+        for name in NAMES {
+            assert!(
+                name.bytes().all(|b| b.is_ascii_lowercase()),
+                "{name:?} is not a run of lowercase letters"
+            );
+        }
+    }
+
+    /// `parse_key`'s promise that a command can never be put on the prefix:
+    /// no key it accepts is a byte `parse_prefix` does.
+    #[test]
+    fn no_key_a_command_can_be_on_is_a_prefix() {
+        let prefixes: Vec<u8> = (b'a'..=b'z')
+            .filter_map(|c| parse_prefix(&format!("C-{}", c as char)).ok())
+            .chain([CTRL_SPACE])
+            .collect();
+        for byte in 0u8..=255 {
+            if parse_key(&key_label(byte)) == Ok(byte) {
+                assert!(
+                    !prefixes.contains(&byte),
+                    "{byte:#04x} is both a key and a prefix"
+                );
+            }
         }
     }
 

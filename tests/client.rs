@@ -1470,13 +1470,29 @@ fn a_wide_terminal_has_the_editor_centred_as_wide_as_its_windows_want() {
         term.text()
     );
     assert_eq!(widths(&mut rpc), columns(60, &[60]));
-    // The status line, under the window: across the terminal.
+    // The status line, under the window: across the terminal. Waited for,
+    // and said of in full where it does not come: macOS has drawn it in the
+    // editor's own background, as Linux has never been seen to.
     let status = Some(vt100::Color::Rgb(0x12, 0x34, 0x56));
     let bg = |t: &Terminal, col: u16| t.parser.screen().cell(10, col).map(vt100::Cell::bgcolor);
-    assert_eq!(
-        (bg(&term, 0), bg(&term, 80), bg(&term, 159)),
-        (status, status, status)
-    );
+    let across = |t: &Terminal| [0, 80, 159].iter().all(|&col| bg(t, col) == status);
+    if !term.pump(Duration::from_secs(5), across) {
+        let cells: Vec<_> = [0, 80, 159]
+            .iter()
+            .map(|&col| {
+                let c = term.parser.screen().cell(10, col);
+                c.map(|c| (c.bgcolor(), c.fgcolor(), c.inverse()))
+            })
+            .collect();
+        let editor = rpc
+            .eval("[&termguicolors, &cmdheight, execute('messages')]")
+            .expect("ask the editor");
+        panic!(
+            "the status line is not its colour across the terminal: {cells:?}; \
+             'termguicolors', 'cmdheight' and the messages: {editor}\n{}",
+            term.text()
+        );
+    }
     let cell = |t: &Terminal, col: u16| t.parser.screen().cell(5, col).map(vt100::Cell::bgcolor);
     assert_eq!(
         cell(&term, 0),
@@ -1512,8 +1528,8 @@ fn a_wide_terminal_has_the_editor_centred_as_wide_as_its_windows_want() {
 #[test]
 fn a_wide_window_has_its_text_centred_in_it() {
     require_nvim!();
-    let scratch = Scratch::new("client-centre-windows");
-    let (mut term, mut rpc, _) = wide(&scratch, "client-centre-windows", "windows");
+    let scratch = Scratch::new("client-centre-text");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-centre-text", "windows");
     // One window, the whole terminal wide, its text in the middle.
     let alone = format!("{}the left window", " ".repeat(50));
     assert!(

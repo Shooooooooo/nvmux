@@ -1225,8 +1225,8 @@ impl App {
     /// `window_width` to have a grid that wide, and for the rest to have
     /// their own width again (see [`wide`]): a window on a tab page not on
     /// show keeps what it has. With the text not centred, every grid asked
-    /// to be narrower is let go of.
-    fn narrow_windows(&mut self) {
+    /// to be narrower is let go of. Says whether it asked Neovim anything.
+    fn narrow_windows(&mut self) -> bool {
         let on = self.centring() == Centre::Windows && self.multigrid();
         let mut want: HashMap<u64, usize> = HashMap::new();
         if on {
@@ -1259,6 +1259,7 @@ impl App {
         );
         asks.sort_unstable();
         self.narrowed = want;
+        let asked = !asks.is_empty();
         for (grid, width) in asks {
             // A height of nought asks for none: the window's own.
             self.outbox.notify(
@@ -1266,14 +1267,17 @@ impl App {
                 &[Arg::Int(grid as i64), Arg::Int(width as i64), Arg::Int(0)],
             );
         }
+        asked
     }
 
     /// Let go of every grid asked to be narrower than its window, as the
     /// client goes: another UI of the session is to see the windows whole.
-    pub fn let_windows_go(&mut self) {
+    /// Says whether there were any.
+    pub fn let_windows_go(&mut self) -> bool {
         let window_width = std::mem::take(&mut self.window_width);
-        self.narrow_windows();
+        let asked = self.narrow_windows();
         self.window_width = window_width;
+        asked
     }
 
     /// `nvim_set_client_info`: an nvmux UI, and whether it wants
@@ -2884,10 +2888,46 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
     };
     // Whatever ended it, the terminal is handed back as it was — and the
     // windows their own width, for whoever else draws them.
-    app.let_windows_go();
-    let _ = app.outbox.send(&mut stream);
+    if app.let_windows_go() {
+        leave(stream, inbox, std::mem::take(&mut app.outbox));
+    } else {
+        let _ = app.outbox.send(&mut stream);
+    }
     let _ = crate::term::write_stdout(term::CLOSING);
     outcome
+}
+
+/// How long a client on its way out waits for Neovim to have done what it
+/// last asked (see [`leave`]): well inside the two seconds nvmux gives a
+/// client it hangs up before killing it.
+const LEAVE_WAIT: Duration = Duration::from_millis(500);
+
+/// Send what is queued on the way out, and wait for Neovim to have done it,
+/// for up to [`LEAVE_WAIT`]. Neovim queues what a channel asks of it, and
+/// throws away what is still queued once it has read the channel's end
+/// (`request_event` in its `msgpack_rpc/channel.c`): a client that goes the
+/// moment it has asked can have its last asks dropped — under load, one time
+/// in four. So a request goes after them, queued as they are, and its answer
+/// says they are done.
+fn leave(stream: UnixStream, inbox: Inbox, mut out: Outbox) {
+    let fence = out.request("nvim_eval", &[Arg::str("0")]);
+    // Blocking last, so that it never blocks without the timeouts.
+    let blocking = stream.set_read_timeout(Some(LEAVE_WAIT)).is_ok()
+        && stream.set_write_timeout(Some(LEAVE_WAIT)).is_ok()
+        && stream.set_nonblocking(false).is_ok();
+    let mut line = Line {
+        stream,
+        inbox,
+        out,
+        deadline: Instant::now() + LEAVE_WAIT,
+    };
+    if !blocking {
+        let _ = line.out.send(&mut line.stream);
+        return;
+    }
+    if let Err(e) = line.answer(fence, |_| ()) {
+        tracing::debug!(error = %e, "client: Neovim did not answer on the way out");
+    }
 }
 
 /// Have Neovim draw the windows of the current tab page afresh for the UIs
@@ -2975,7 +3015,8 @@ fn refresh_now(sock: &Path, (w, h): (usize, usize)) -> std::io::Result<()> {
 /// see [`refresh_now`].
 const REFRESH_MAX_UIS: usize = 4;
 
-/// A refresh's own connection: blocking, and given until `deadline`.
+/// A connection used blocking, and given until `deadline`: a refresh's own,
+/// or the client's on its way out.
 struct Line {
     stream: UnixStream,
     inbox: Inbox,

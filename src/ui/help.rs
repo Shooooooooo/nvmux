@@ -5,9 +5,10 @@
 //! the child's output. So this takes the terminal the way the prompt does,
 //! draws, and hands the same client back to repaint on resume.
 //!
-//! Every command row comes from [`keys::BINDINGS`], the same table
-//! [`keys::Prefix::feed`] runs on, so this screen cannot claim something the
-//! machine does not do. The rows that are not commands — a digit selects a
+//! Every command row comes from [`keys::BINDINGS`] as the user has it — the
+//! [`Keymap`] [`keys::Prefix::feed`] runs on — so this screen cannot claim
+//! something the machine does not do, nor name a key a command was moved off.
+//! The rows that are not commands — a digit selects a
 //! session, `<prefix> <prefix>` is a literal, anything else is replayed — are the
 //! machine's other branches, spelled here and pinned to it by a test.
 //!
@@ -29,7 +30,7 @@ use unicode_width::UnicodeWidthStr;
 use super::app::Key;
 use super::draw;
 use crate::error::Result;
-use crate::keys;
+use crate::keys::{self, Keymap};
 
 /// Key then action, the picker's hint grammar. `q`, `Enter`, `?` and `Ctrl-c`
 /// also close, unadvertised.
@@ -45,17 +46,17 @@ struct Row {
     what: String,
 }
 
-/// The command rows from [`keys::BINDINGS`], then the rules that are not
-/// commands: digits select a session, a doubled prefix is a literal, and
-/// anything else is replayed.
+/// The command rows from [`keys::BINDINGS`], each on the key `keymap` puts it
+/// on, then the rules that are not commands: digits select a session, a
+/// doubled prefix is a literal, and anything else is replayed.
 ///
 /// `prefix` is the label to spell the prefix with — [`keys::PREFIX_LABEL`] by
 /// default, or whatever a remapped prefix reads as (see
 /// [`keys::prefix_label`]) — so every row, and the two descriptions that name
 /// the prefix, follow the key the user actually set.
-fn rows(prefix: &str) -> Vec<Row> {
-    let mut rows: Vec<Row> = keys::BINDINGS
-        .iter()
+fn rows(prefix: &str, keymap: &Keymap) -> Vec<Row> {
+    let mut rows: Vec<Row> = keymap
+        .bindings()
         .map(|b| Row {
             keys: format!("{prefix} {}", keys::key_label(b.key)),
             what: b.help.to_string(),
@@ -103,8 +104,8 @@ pub fn run() -> Result<()> {
 /// answers `?`. `animate` is whether to dissolve in on the way in and out on
 /// the way out; from the picker the screen is already up, so it does not.
 pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> Result<()> {
-    let label = keys::prefix_label(crate::config::get().keys.prefix);
-    let rows = rows(&label);
+    let settings = crate::config::get().keys;
+    let rows = rows(&keys::prefix_label(settings.prefix), &settings.bind);
     if animate {
         crate::fade::fade_in(terminal, |f| draw(f, &rows))?;
     }
@@ -177,6 +178,12 @@ mod tests {
     /// centring is what is being measured rather than the clamp.
     const WIDE: u16 = 70;
 
+    /// [`super::rows`] with every command on the table's own key: what the
+    /// screen is about everywhere but the one test that moves them.
+    fn rows(prefix: &str) -> Vec<Row> {
+        super::rows(prefix, &Keymap::default())
+    }
+
     fn render(w: u16, h: u16) -> Vec<String> {
         let rows = rows(PREFIX_LABEL);
         test_support::render(w, h, |f| draw(f, &rows))
@@ -225,31 +232,39 @@ mod tests {
     }
 
     /// The rendered rows are checked against what the machine actually does,
-    /// not against the table both of them read.
+    /// not against the table both of them read — on the table's own keys, and
+    /// on keys a config file has moved, where a key a command left must be
+    /// listed for nothing.
     ///
     /// `highest` is 0 so every digit resolves on the spot; what is being checked
     /// is which bytes are commands at all, not how long one waits.
     #[test]
     fn every_row_matches_what_the_prefix_machine_does() {
-        let rows = rows(PREFIX_LABEL);
-        for b in 0u8..=255 {
-            let acts = Prefix::new(0)
-                .feed(&[PREFIX, b])
-                .iter()
-                .any(|s| matches!(s, keys::Step::Act(_)));
-            // Equality, not `starts_with`: `o` would otherwise match the
-            // `<prefix> other` row. Digits are the one range row, so they are
-            // looked up as the range rather than as themselves.
-            let listed = if b.is_ascii_digit() {
-                acts && rows.iter().any(|r| r.keys == format!("{PREFIX_LABEL} 1-n"))
-            } else {
-                rows.iter()
-                    .any(|r| r.keys == format!("{PREFIX_LABEL} {}", keys::key_label(b)))
-            };
-            assert_eq!(
-                acts, listed,
-                "byte {b:#04x}: the machine acts = {acts}, the help lists it = {listed}"
-            );
+        let mut moved = Keymap::default();
+        for (name, key) in [("picker", b'D'), ("detach", b' '), ("go", b'g')] {
+            assert!(moved.bind(name, key), "no command is called {name}");
+        }
+        for keymap in [Keymap::default(), moved] {
+            let rows = super::rows(PREFIX_LABEL, &keymap);
+            for b in 0u8..=255 {
+                let acts = Prefix::with_keys(0, PREFIX, keymap)
+                    .feed(&[PREFIX, b])
+                    .iter()
+                    .any(|s| matches!(s, keys::Step::Act(_)));
+                // Equality, not `starts_with`: `o` would otherwise match the
+                // `<prefix> other` row. Digits are the one range row, so they
+                // are looked up as the range rather than as themselves.
+                let listed = if b.is_ascii_digit() {
+                    acts && rows.iter().any(|r| r.keys == format!("{PREFIX_LABEL} 1-n"))
+                } else {
+                    rows.iter()
+                        .any(|r| r.keys == format!("{PREFIX_LABEL} {}", keys::key_label(b)))
+                };
+                assert_eq!(
+                    acts, listed,
+                    "byte {b:#04x}: the machine acts = {acts}, the help lists it = {listed}"
+                );
+            }
         }
     }
 
