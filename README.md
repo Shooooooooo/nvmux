@@ -85,7 +85,9 @@ reimplementing it.
 
 ### While attached
 
-`<prefix>` is `Ctrl-Space` unless you change it in the [config](#configuration).
+`<prefix>` is `Ctrl-Space`, and each key after it the one below, unless you
+change them in the [config](#configuration): the prefix under `[keys]`, the
+others under `[keys.bind]`.
 
 | Keys | Action |
 |---|---|
@@ -198,6 +200,15 @@ The first run asks for a prefix and writes that file; `Esc` skips.
 [keys]
 prefix     = "Ctrl-Space"   # Ctrl-Space, or a Ctrl-<letter> chord
 timeout_ms = 1000           # how long a lone prefix or half-typed number waits
+
+[keys.bind]        # the key after the prefix: one character, "Space" or "Enter"
+picker = "Space"   # back to the picker, session still attached
+detach = "d"       # detach, leaving the session running
+new    = "c"       # set up a new session and attach to it
+next   = "n"       # the next session by number, wrapping
+prev   = "p"       # the previous session by number, wrapping
+go     = "Enter"   # where the newest note in the margin is about
+help   = "?"       # show these keys
 
 [session]
 command = "nvim --headless --listen {sock}"   # {sock} is required

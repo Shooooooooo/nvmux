@@ -100,6 +100,10 @@ const CHILD_LANDS: &str = "NVMUX_TEST_RELAY_LANDS";
 /// session it names, with twelve `b`s next and `cc` going off the far end.
 const CHILD_STEPS: &str = "NVMUX_TEST_RELAY_STEPS";
 
+/// Set on a child to move commands to other keys: the body of a `[keys.bind]`
+/// table, read as the config file's would be.
+const CHILD_BIND: &str = "NVMUX_TEST_RELAY_BIND";
+
 /// How long into the first relay that card is posted: after the first paint.
 const POST_AFTER: Duration = Duration::from_millis(1500);
 
@@ -170,6 +174,11 @@ fn relay_child() {
     }
     let keep = std::env::var_os(CHILD_KEEP).is_some();
     settings.client.per_session = keep;
+    if let Ok(bind) = std::env::var(CHILD_BIND) {
+        let moved: nvmux::config::Settings =
+            toml::from_str(&format!("[keys.bind]\n{bind}\n")).expect("a [keys.bind] table");
+        settings.keys.bind = moved.keys.bind;
+    }
     if let Some(ms) = std::env::var(CHILD_FADE_MS)
         .ok()
         .and_then(|ms| ms.parse().ok())
@@ -363,6 +372,8 @@ struct Asks {
     lands: Option<&'static str>,
     /// [`CHILD_STEPS`].
     steps: bool,
+    /// [`CHILD_BIND`]: the commands moved, as a `[keys.bind]` table says it.
+    bind: Option<&'static str>,
 }
 
 impl Terminal {
@@ -447,6 +458,7 @@ impl Terminal {
             post,
             lands,
             steps,
+            bind,
         } = asks;
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize {
@@ -499,6 +511,9 @@ impl Terminal {
         }
         if steps {
             cmd.env(CHILD_STEPS, "1");
+        }
+        if let Some(bind) = bind {
+            cmd.env(CHILD_BIND, bind);
         }
         let child = pair.slave.spawn_command(cmd).expect("spawn relay child");
         // Or the master would never see EOF once the child exits.
@@ -877,6 +892,63 @@ fn a_prefix_raises_the_hint_row_and_the_next_key_takes_it_off() {
 #[test]
 fn the_hint_row_comes_down_through_the_server_without_a_shadow() {
     the_hint_row_goes_up_and_comes_down("hint-no-shadow", false);
+}
+
+/// A command `[keys.bind]` moves runs on its new key through a real client, and
+/// the row the prefix puts up names that key: the machine and the bar both
+/// follow the config rather than the table's own keys.
+#[test]
+fn a_moved_command_runs_on_its_new_key_through_a_real_client() {
+    require_nvim!();
+    let tag = "bind";
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(&common::unique(tag), &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+
+    let mut term = Terminal::spawn_child(
+        &sock,
+        &session.id,
+        Protocol::Kitty,
+        Asks {
+            bind: Some("detach = \"x\""),
+            ..Asks::default()
+        },
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| {
+            kitty_push_flags(out).is_some()
+        }),
+        "the client never started; got: {}",
+        term.since(0)
+    );
+    term.pump_until(Duration::from_secs(2), |out| {
+        !row_on_screen(out, 0).is_empty()
+    });
+
+    // The prefix as the kitty protocol spells it, which is how this terminal
+    // sends it now that the client has asked.
+    let mark = term.output.len();
+    term.type_bytes(b"\x1b[32;5u");
+    assert!(
+        term.pump_until(Duration::from_secs(10), |out| {
+            row_on_screen(out, ROWS - 1).contains("x detach")
+        }),
+        "the hint row does not name the key detach was moved to: {:?}; the child wrote: {}",
+        row_on_screen(&term.output, ROWS - 1),
+        term.since(mark)
+    );
+
+    term.type_bytes(b"x");
+    let code = term.exit_code(Duration::from_secs(10));
+    assert_eq!(
+        code,
+        Some(0),
+        "expected a detach (exit 0) on the moved key; the child wrote: {}",
+        term.since(mark)
+    );
 }
 
 /// What a resumed relay writes before anything of the client's: back onto the

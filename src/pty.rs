@@ -3249,7 +3249,7 @@ fn pump(
 ) -> Result<Outcome> {
     let stdin_fd = std::io::stdin().as_raw_fd();
     let keys = crate::config::get().keys;
-    let mut prefix = Prefix::with_prefix(highest_session_num, keys.prefix);
+    let mut prefix = Prefix::with_keys(highest_session_num, keys.prefix, keys.bind);
     let prefix_timeout = Duration::from_millis(keys.timeout_ms);
     // When a pending prefix, half-typed number or cut-off escape sequence must
     // be settled. An instant rather than a per-poll timeout on purpose: a child
@@ -3263,7 +3263,7 @@ fn pump(
     // covers the bar's row on its way past. And with a kept client's return,
     // which comes in with one already asked for.
     // The row that says what the next key does while a `<prefix>` waits.
-    let mut bar = hint::Bar::new(Instant::now(), term::terminal_size());
+    let mut bar = hint::Bar::new(Instant::now(), term::terminal_size(), keys.bind);
     let mut buf = [0u8; 8192];
     // Diagnostics only, and what makes a switch that felt slow attributable:
     // everything before this is nvmux's own work and is timed where it happens,

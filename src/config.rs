@@ -39,8 +39,9 @@ use crate::error::ConfigError;
 use crate::palette::Rgb;
 
 /// The whole configuration. Each field is a table of its own, so the file reads
-/// as `[keys]`-style sections — `[theme]` for the colour nvmux's own screens
-/// are drawn in, and `[effects]` with a table inside it for each
+/// as `[keys]`-style sections — `[keys.bind]` inside `[keys]` for the key after
+/// the prefix that runs each command, `[theme]` for the colour nvmux's own
+/// screens are drawn in, and `[effects]` with a table inside it for each
 /// effect: `[effects.fade]`, `[effects.move]`, `[effects.cursor]`,
 /// `[effects.attach]`, `[effects.kill]`,
 /// `[effects.filter]` and `[effects.create]` for nvmux's own screens, and
@@ -60,7 +61,8 @@ pub struct Settings {
     pub effects: EffectsSettings,
 }
 
-/// The prefix key and how long a half-typed sequence waits (see [`crate::keys`]).
+/// The prefix key, how long a half-typed sequence waits, and which key after
+/// the prefix runs which command (see [`crate::keys`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KeySettings {
@@ -72,6 +74,12 @@ pub struct KeySettings {
     /// deciding the user meant a literal `<prefix>`, and how long a half-typed
     /// session number waits for another digit.
     pub timeout_ms: u64,
+    /// `[keys.bind]`: the key after the prefix that runs each command, by the
+    /// command's name on the hint bar — `detach = "x"`. A command left out
+    /// stays on its own key (see [`crate::keys::Keymap`]); a key is read by
+    /// [`crate::keys::parse_key`], and two commands on one key are refused at
+    /// startup.
+    pub bind: crate::keys::Keymap,
 }
 
 /// What a new session launches, when the user has not said otherwise in the
@@ -737,6 +745,9 @@ impl Default for KeySettings {
             // digits so far while they wait. Every use of it is now visible,
             // which is what makes one number right for all three.
             timeout_ms: 1000,
+            // Every command on the key `keys::BINDINGS` gives it, which is
+            // where each of those is written down, once.
+            bind: crate::keys::Keymap::default(),
         }
     }
 }
@@ -792,6 +803,66 @@ where
     crate::keys::parse_prefix(&s).map_err(serde::de::Error::custom)
 }
 
+/// `[keys.bind]` comes in as a table of command names and human key strings,
+/// and goes onto the defaults: a command it leaves out stays on its own key.
+/// Which two commands share a key is a question about the whole table, so it is
+/// [`Settings::validate`]'s.
+impl<'de> Deserialize<'de> for crate::keys::Keymap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let moved =
+            std::collections::BTreeMap::<CommandName, CommandKey>::deserialize(deserializer)?;
+        let mut keymap = crate::keys::Keymap::default();
+        for (CommandName(name), CommandKey(key)) in moved {
+            // A name the table has, or it would not have been read, so this
+            // always lands.
+            keymap.bind(&name, key);
+        }
+        Ok(keymap)
+    }
+}
+
+/// A command's name in `[keys.bind]`: one of the table's own
+/// ([`crate::keys::NAMES`]), so a command cannot be added without being one a
+/// file can move. Any other is refused in the words `deny_unknown_fields` uses
+/// for every other typo in the file, and TOML points at the name.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct CommandName(String);
+
+impl<'de> Deserialize<'de> for CommandName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let name = String::deserialize(deserializer)?;
+        if crate::keys::NAMES.contains(&name.as_str()) {
+            Ok(CommandName(name))
+        } else {
+            Err(serde::de::Error::unknown_field(&name, &crate::keys::NAMES))
+        }
+    }
+}
+
+/// The key a command is put on, read by the one parser
+/// ([`crate::keys::parse_key`]) and its message folded into serde's error,
+/// which TOML then reports with the offending span — the shape `de_prefix`
+/// gives the prefix.
+struct CommandKey(u8);
+
+impl<'de> Deserialize<'de> for CommandKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        crate::keys::parse_key(&s)
+            .map(CommandKey)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Ceiling for `keys.timeout_ms`. Generous but finite: the value goes into a
 /// `poll` timeout as a `c_int`, and an absurd one is a hang, not a long wait.
 const MAX_TIMEOUT_MS: u64 = 60_000;
@@ -814,6 +885,16 @@ impl Settings {
             // Beyond `c_int` this would wrap negative and `poll` would block
             // forever; well before that it is a prefix that never resolves.
             return Err(format!("keys.timeout_ms must be at most {MAX_TIMEOUT_MS}"));
+        }
+        if let Some((first, second, key)) = self.keys.bind.clash() {
+            // The second could never be reached, and the help and the hint bar
+            // would offer it all the same. Both are named, since moving either
+            // is the fix — and one may be a command the file never mentions,
+            // still on its own key when another was moved onto it.
+            return Err(format!(
+                "keys.bind.{first} and keys.bind.{second} are both {:?}",
+                crate::keys::key_label(key)
+            ));
         }
         if self.effects.fade.duration_ms == 0 {
             // `enabled = false` is how the fade is turned off; a zero-length
@@ -976,6 +1057,21 @@ fn render_default_config(prefix: u8) -> String {
     // notes: each setting is padded to the widest in its table, and the
     // prefix to the widest it can be, "Ctrl-Space".
     let quoted = |s: &str| format!("{s:?}");
+    // A line a command, made from the table rather than written out here, so a
+    // command cannot be added without one: its name, its key as `key_label`
+    // spells it — which `parse_key` reads back — and what the help screen says
+    // it does.
+    let bind: String = crate::keys::BINDINGS
+        .iter()
+        .map(|b| {
+            format!(
+                "# {:<6} = {:<7}   # {}\n",
+                b.hint,
+                quoted(&crate::keys::key_label(b.key)),
+                b.help
+            )
+        })
+        .collect();
     format!(
         "# nvmux configuration — created on first run.\n\
          #\n\
@@ -985,6 +1081,9 @@ fn render_default_config(prefix: u8) -> String {
          [keys]\n\
          prefix = {prefix:<12}   # Ctrl-Space, or a Ctrl-<letter> chord\n\
          # timeout_ms = {timeout:<6}   # how long a lone prefix or half-typed number waits\n\
+         \n\
+         [keys.bind]   # the key after the prefix: one character, \"Space\" or \"Enter\"\n\
+         {bind}\
          \n\
          [session]\n\
          # command = {command}   # {{sock}} is required\n\
@@ -1155,6 +1254,7 @@ mod tests {
         );
         for table in [
             "[keys]",
+            "[keys.bind]",
             "[session]",
             "[client]",
             "[theme]",
@@ -1175,6 +1275,14 @@ mod tests {
             [keys]\n\
             prefix = \"Ctrl-Space\"\n\
             timeout_ms = 1000\n\
+            [keys.bind]\n\
+            picker = \"Space\"\n\
+            detach = \"d\"\n\
+            new = \"c\"\n\
+            next = \"n\"\n\
+            prev = \"p\"\n\
+            go = \"Enter\"\n\
+            help = \"?\"\n\
             [session]\n\
             command = \"nvim --headless --listen {sock}\"\n\
             [client]\n\
@@ -1474,6 +1582,83 @@ mod tests {
         assert_eq!(s.keys.prefix, 0x01);
     }
 
+    /// `[keys.bind]` moves what it names and nothing else: every other command
+    /// stays on its own key, and the rest of `[keys]` at its default — in the
+    /// table's own form and in TOML's inline one.
+    #[test]
+    fn a_partial_bind_table_moves_only_what_it_names() {
+        let s: Settings = toml::from_str("[keys.bind]\ndetach = \"x\"\n").expect("valid");
+        let mut want = crate::keys::Keymap::default();
+        assert!(want.bind("detach", b'x'));
+        assert_eq!(s.keys.bind, want);
+        assert_eq!(s.keys.prefix, KeySettings::default().prefix);
+        assert_eq!(s.keys.timeout_ms, KeySettings::default().timeout_ms);
+
+        let inline: Settings =
+            toml::from_str("[keys]\nbind = { detach = \"x\" }\n").expect("valid");
+        assert_eq!(inline, s);
+    }
+
+    /// Two commands on one key would leave one of them unreachable, so the file
+    /// is refused, naming both — the one moved, and the one it was moved onto
+    /// that the file never mentions. Trading two keys is no clash.
+    #[test]
+    fn two_commands_on_one_key_are_refused_with_both_named() {
+        for (doc, first, second) in [
+            (
+                "[keys.bind]\ndetach = \"c\"\n",
+                "keys.bind.detach",
+                "keys.bind.new",
+            ),
+            (
+                "[keys.bind]\nnext = \"z\"\nhelp = \"z\"\n",
+                "keys.bind.next",
+                "keys.bind.help",
+            ),
+        ] {
+            match parse(Path::new("test.toml"), doc).expect_err(doc) {
+                ConfigError::Invalid { message, .. } => assert!(
+                    message.contains(first) && message.contains(second),
+                    "{doc:?} -> {message:?}"
+                ),
+                other => panic!("{doc:?}: expected Invalid, got {other:?}"),
+            }
+        }
+
+        let swapped = parse(
+            Path::new("test.toml"),
+            "[keys.bind]\ndetach = \"c\"\nnew = \"d\"\n",
+        )
+        .expect("a swap");
+        assert_eq!(
+            swapped.keys.bind.command(b'c'),
+            Some(crate::keys::Action::Detach)
+        );
+        assert_eq!(
+            swapped.keys.bind.command(b'd'),
+            Some(crate::keys::Action::Create)
+        );
+    }
+
+    /// A name that is no command is refused in the words every other unknown
+    /// key is, offering the names there are; a key that cannot be one says
+    /// what would do. Each points at its own line.
+    #[test]
+    fn a_bad_binding_says_what_would_do() {
+        let doc = "[keys.bind]\nnext = \"j\"\ndetatch = \"x\"\n";
+        let msg = toml::from_str::<Settings>(doc).expect_err(doc).to_string();
+        assert!(
+            msg.contains("unknown field `detatch`") && msg.contains("`detach`"),
+            "{msg}"
+        );
+        assert!(msg.contains("line 3"), "not at the name: {msg}");
+
+        let doc = "[keys.bind]\nnext = \"j\"\ndetach = \"dd\"\n";
+        let msg = toml::from_str::<Settings>(doc).expect_err(doc).to_string();
+        assert!(msg.contains("one character"), "{msg}");
+        assert!(msg.contains("line 3"), "not at the key: {msg}");
+    }
+
     /// A config file is edited by hand, so a typo is likely and silence is the
     /// wrong response — an unknown table, an unknown key in any table, and an
     /// unparseable value all have to be refused rather than ignored.
@@ -1483,6 +1668,13 @@ mod tests {
             ("an unknown top-level table", "[colours]\nx = 1\n"),
             ("an unknown keys key", "[keys]\nprefx = \"C-a\"\n"),
             ("an unparseable prefix", "[keys]\nprefix = \"nope\"\n"),
+            ("an unknown command", "[keys.bind]\ndetatch = \"x\"\n"),
+            ("a command outside [keys.bind]", "[keys]\ndetach = \"x\"\n"),
+            ("a key of two characters", "[keys.bind]\ndetach = \"dd\"\n"),
+            ("a digit for a key", "[keys.bind]\ndetach = \"1\"\n"),
+            ("a chord for a key", "[keys.bind]\ndetach = \"C-d\"\n"),
+            ("a key as a number", "[keys.bind]\ndetach = 1\n"),
+            ("a key where its table goes", "[keys]\nbind = \"x\"\n"),
             ("an unknown session key", "[session]\ncmd = \"nvim\"\n"),
             ("an unknown fade key", "[effects.fade]\nduration = 40\n"),
             ("an unknown client key", "[client]\nkeep = true\n"),
@@ -1669,6 +1861,17 @@ mod tests {
         // The timeout, the command and the fade are documentation, not active
         // settings.
         assert!(rendered.contains("# timeout_ms = 1000"));
+        // As is every command's key, under a table of their own: a line each,
+        // in the table's order.
+        assert!(rendered.contains("\n[keys.bind]   # "), "{rendered:?}");
+        let mut rest = rendered.as_str();
+        for b in crate::keys::BINDINGS {
+            let line = format!("\n# {:<6} = {:?}", b.hint, crate::keys::key_label(b.key));
+            let at = rest.find(&line).unwrap_or_else(|| {
+                panic!("the template must document {line:?}, in order: {rendered:?}")
+            });
+            rest = &rest[at + line.len()..];
+        }
         assert!(
             rendered.contains("# command = \"nvim --headless --listen {sock}\""),
             "the template must document the command: {rendered:?}"

@@ -20,8 +20,8 @@ use crate::transport::Location;
                   rendering happens locally.",
     after_help = "<prefix> d detaches, leaving the session running. \
                   <prefix> ? lists the keys. The prefix is Ctrl-Space by \
-                  default. :q ends the session, because the editor is the \
-                  session."
+                  default; the config file can change it, and the keys after \
+                  it. :q ends the session, because the editor is the session."
 )]
 pub struct Cli {
     /// Host to manage sessions on; passed to ssh verbatim.

@@ -9,8 +9,10 @@
 //! dropped. This is the row the picker has always had, on the one screen that
 //! did not have it.
 //!
-//! It is built from [`crate::keys::BINDINGS`], like the help screen
-//! ([`crate::ui::help`]), so a command cannot be added without appearing on it.
+//! It is built from [`crate::keys::BINDINGS`] as the user has it — the
+//! [`crate::keys::Keymap`] the prefix machine runs on — like the help screen
+//! ([`crate::ui::help`]), so a command cannot be added without appearing on
+//! it, nor moved to another key without the bar naming that key.
 //!
 //! # What is on it, and what is not
 //!
@@ -77,7 +79,7 @@ use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
 use crate::announce;
-use crate::keys::{self, Pending};
+use crate::keys::{self, Keymap, Pending};
 use crate::palette::{self, Palette};
 use crate::pty::PtySize;
 use crate::shadow::{Over, Shadow};
@@ -133,7 +135,8 @@ pub enum Act {
 }
 
 /// Every entry the bar offers, in the order it offers them: the commands as
-/// [`keys::BINDINGS`] lists them, then the digit rule.
+/// [`keys::BINDINGS`] lists them, each on the key `keymap` puts it on, then the
+/// digit rule.
 ///
 /// All of them but `⏎ go` when `go` is false — no card up that
 /// `<prefix> Enter` would act on (see [`crate::card::Desk::can_go`]). That one
@@ -141,13 +144,15 @@ pub enum Act {
 /// key that does nothing.
 ///
 /// Keys are spelled [`keys::key_glyph`], which is the picker's hint-row grammar
-/// and not the help screen's: lowercase throughout, and `␣` for the space bar.
+/// and not the help screen's: `␣` for the space bar, `⏎` for Enter, and any
+/// other key as itself — lowercase, as the picker's are, unless the user has
+/// put a command on a capital, which is a key of its own and drawn as one.
 /// This is the picker's row on another screen, so it is spelled the picker's way
 /// — two rows that named the same key two ways would be the kind of drift the
 /// rest of this crate pins down with a test, and there is one below.
-fn entries(go: bool) -> Vec<String> {
-    keys::BINDINGS
-        .iter()
+fn entries(keymap: &Keymap, go: bool) -> Vec<String> {
+    keymap
+        .bindings()
         .filter(|b| go || b.action != keys::Action::Go)
         .map(|b| format!("{} {}", keys::key_glyph(b.key), b.hint))
         .chain(std::iter::once(DIGITS.to_string()))
@@ -164,7 +169,7 @@ fn entries(go: bool) -> Vec<String> {
 /// opinion about priority — one table, one order — so `? help` goes before
 /// `p prev`, and the two that a user pressing the prefix by accident most needs,
 /// the picker and the detach, are the two that survive longest.
-fn text(pending: Pending, go: bool, cols: u16) -> Option<String> {
+fn text(pending: Pending, keymap: &Keymap, go: bool, cols: u16) -> Option<String> {
     let cols = usize::from(cols);
     let row = match pending {
         // A number being typed, as the picker shows one on its own hint row —
@@ -174,7 +179,7 @@ fn text(pending: Pending, go: bool, cols: u16) -> Option<String> {
         Pending::Number(n) => format!("#{n}"),
         Pending::Command => {
             let mut row = String::new();
-            for entry in entries(go) {
+            for entry in entries(keymap, go) {
                 let gap = if row.is_empty() { 0 } else { GAP.width() };
                 if row.width() + gap + entry.width() > cols {
                     break;
@@ -204,11 +209,11 @@ fn text(pending: Pending, go: bool, cols: u16) -> Option<String> {
 /// `None` when the screen has no room. Pure, so the geometry is testable without
 /// a terminal, and named, because two things need it: the paint, and the erase
 /// that has to put back exactly the cells the paint covered.
-pub fn overlay(pending: Pending, go: bool, size: PtySize) -> Option<Over> {
+pub fn overlay(pending: Pending, keymap: &Keymap, go: bool, size: PtySize) -> Option<Over> {
     if size.rows < MIN_ROWS || size.cols == 0 {
         return None;
     }
-    let text = text(pending, go, size.cols)?;
+    let text = text(pending, keymap, go, size.cols)?;
     let cols = usize::from(size.cols);
     // Both subtractions are safe: `text` was measured to fit `cols`. Odd slack
     // falls to the right, which is what integer division does and is not worth a
@@ -258,18 +263,23 @@ pub struct Bar {
     /// read a process global mid-relay would have states no test could reach,
     /// since no palette is ever installed under test.
     palette: Option<Palette>,
+    /// Which key each command is on, for the entries to name: handed in by
+    /// the relay, from the same settings its prefix machine was built with,
+    /// rather than read here — for the reason the palette is.
+    keymap: Keymap,
 }
 
 impl Bar {
     /// A bar with nothing on screen, on a child presumed quiet — which it is,
-    /// at the top of a relay, until it says otherwise.
-    pub fn new(now: Instant, size: PtySize) -> Self {
-        Self::with_palette(now, size, palette::get().copied())
+    /// at the top of a relay, until it says otherwise — naming each command
+    /// on the key `keymap` puts it on.
+    pub fn new(now: Instant, size: PtySize, keymap: Keymap) -> Self {
+        Self::with_palette(now, size, keymap, palette::get().copied())
     }
 
     /// [`Bar::new`] with the colours handed in rather than read, which is how
     /// the tests reach the restoring path at all.
-    fn with_palette(now: Instant, size: PtySize, palette: Option<Palette>) -> Self {
+    fn with_palette(now: Instant, size: PtySize, keymap: Keymap, palette: Option<Palette>) -> Self {
         Self {
             quiet_since: Some(now),
             shown: None,
@@ -277,6 +287,7 @@ impl Bar {
             agreed: true,
             size: (size.rows, size.cols),
             palette,
+            keymap,
         }
     }
 
@@ -337,7 +348,7 @@ impl Bar {
         // Before the lull, not after it: the bar has to know a write is owed in
         // order to ask to be woken to make it, and the pass that reads the
         // prefix is often one the child is still talking on.
-        let want = pending.and_then(|p| overlay(p, go, size));
+        let want = pending.and_then(|p| overlay(p, &self.keymap, go, size));
         if want != self.want {
             self.want = want;
             self.agreed = false;
@@ -425,6 +436,23 @@ mod tests {
     use crate::test_support::{big, palette, screen, size};
     use crate::ui::test_support::TINY_SIZES;
 
+    /// [`super::text`] with every command on the table's own key, which is
+    /// what almost every test here is about: where each command is is the
+    /// keymap's business, and the one test that moves them says so.
+    fn text(pending: Pending, go: bool, cols: u16) -> Option<String> {
+        super::text(pending, &Keymap::default(), go, cols)
+    }
+
+    /// [`super::overlay`], on the table's own keys.
+    fn overlay(pending: Pending, go: bool, size: PtySize) -> Option<Over> {
+        super::overlay(pending, &Keymap::default(), go, size)
+    }
+
+    /// [`super::entries`], on the table's own keys.
+    fn entries(go: bool) -> Vec<String> {
+        super::entries(&Keymap::default(), go)
+    }
+
     /// The bar's one row of text, as it would be drawn on `size`.
     fn row(pending: Pending, size: PtySize) -> String {
         overlay(pending, true, size).expect("a bar").rows.remove(0)
@@ -446,7 +474,7 @@ mod tests {
         fn new(size: PtySize) -> Self {
             let now = Instant::now();
             Self {
-                bar: Bar::new(now, size),
+                bar: Bar::new(now, size, Keymap::default()),
                 now,
                 shadow: None,
             }
@@ -457,7 +485,7 @@ mod tests {
         fn restoring(size: PtySize) -> Self {
             let now = Instant::now();
             Self {
-                bar: Bar::with_palette(now, size, Some(palette())),
+                bar: Bar::with_palette(now, size, Keymap::default(), Some(palette())),
                 now,
                 shadow: Some(screen(size.rows, size.cols)),
             }
@@ -502,6 +530,65 @@ mod tests {
             rest.contains(DIGITS),
             "the digit rule is not on the bar: {text:?}"
         );
+    }
+
+    /// Commands moved the ways a config file can move them: onto a capital,
+    /// a letter no command had, and off Enter. Not onto `x`, which is what the
+    /// screen under the bar is made of in these tests (see
+    /// [`crate::test_support::screen`]).
+    fn moved() -> Keymap {
+        let mut keymap = Keymap::default();
+        for (name, key) in [("picker", b'D'), ("detach", b'z'), ("go", b'g')] {
+            assert!(keymap.bind(name, key), "no command is called {name}");
+        }
+        keymap
+    }
+
+    /// The bar names each command on the key the user put it on — the keymap
+    /// the machine runs on, not the table's defaults — still in the table's
+    /// order, and with nothing offered on a key a command has left.
+    #[test]
+    fn the_row_names_the_keys_the_commands_were_moved_to() {
+        let keymap = moved();
+        let text = super::text(Pending::Command, &keymap, true, 200).expect("a row");
+        let mut rest = text.as_str();
+        for entry in ["D picker", "z detach", "c new", "g go", "? help"] {
+            let at = rest.find(entry).unwrap_or_else(|| {
+                panic!("{entry:?} is not on the bar, or is out of order: {text:?}")
+            });
+            rest = &rest[at + entry.len()..];
+        }
+        assert!(
+            !text.contains("d detach"),
+            "the old key is offered: {text:?}"
+        );
+        assert!(
+            !text.contains(keys::SPACE_GLYPH) && !text.contains(keys::ENTER_GLYPH),
+            "a key no command is on any more is offered: {text:?}"
+        );
+
+        let without = super::text(Pending::Command, &keymap, false, 200).expect("a row");
+        assert!(
+            !without.contains("g go"),
+            "go is offered with no card to go to: {without:?}"
+        );
+    }
+
+    /// What the relay builds the bar with is what it draws: the keymap handed
+    /// to [`Bar::new`] reaches the row the bar writes, rather than the table's
+    /// own keys standing in for it somewhere on the way.
+    #[test]
+    fn the_bar_draws_the_keymap_it_was_given() {
+        let size = big();
+        let now = Instant::now() + SETTLE;
+        let mut bar = Bar::new(now - SETTLE, size, moved());
+        let Act::Write(bytes) = bar.step(now, false, size, Some(Pending::Command), true, None)
+        else {
+            panic!("the bar did not go up");
+        };
+        let painted = String::from_utf8_lossy(&bytes);
+        assert!(painted.contains("z detach"), "{painted:?}");
+        assert!(!painted.contains("d detach"), "{painted:?}");
     }
 
     /// The prefix is the user's to set, so the bar must not name it: every entry
