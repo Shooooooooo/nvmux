@@ -563,11 +563,15 @@ impl Cards {
             .min()
     }
 
-    /// Draw the cards up at `now` over `frame`: on `base`, the editor's own
-    /// colours, resolved through `colors`, with the signs in `signs`.
+    /// Draw the cards up at `now` over `frame`, against the editor in its
+    /// columns `area` — the first and how many, all of the frame's but
+    /// where the editor is centred in it (see [`super::wide`]): on `base`,
+    /// the editor's own colours, resolved through `colors`, with the signs in
+    /// `signs`.
     pub fn paint(
         &mut self,
         frame: &mut Frame,
+        area: (usize, usize),
         base: Style,
         colors: &Colors,
         signs: &Signs,
@@ -578,11 +582,12 @@ impl Cards {
         for l in &mut self.live {
             l.drawn_at.get_or_insert(now);
         }
-        if self.live.is_empty() || frame.width < MIN_COLS || frame.height < MIN_ROWS {
+        let (left, width) = (area.0, area.1.min(frame.width.saturating_sub(area.0)));
+        if self.live.is_empty() || width < MIN_COLS || frame.height < MIN_ROWS {
             return;
         }
         let pens = Pens::new(base, colors, signs);
-        let at = Margin::of(frame.width);
+        let at = Margin::within(left, width);
         let bottom = frame.height - BOTTOM;
         let whole = self.whole();
         let mut sheet = Sheet::new(frame.width);
@@ -604,6 +609,11 @@ impl Cards {
                 continue;
             }
             if l.card.kind == Kind::Arrival {
+                // Where it stood on the screen a switch left, if it says.
+                let at = l
+                    .card
+                    .end
+                    .map_or(at, |end| Margin::ending(usize::from(end), frame.width));
                 arrival(&mut sheet, l, pieces, row, at, &pens);
             } else {
                 news(&mut sheet, l, pieces, row, at, &pens, now);
@@ -638,9 +648,25 @@ struct Margin {
 impl Margin {
     /// On a screen `cols` wide.
     fn of(cols: usize) -> Self {
+        Self::within(0, cols)
+    }
+
+    /// Against an editor in columns `left..left + width` of the screen, at
+    /// least [`MIN_COLS`] of them.
+    fn within(left: usize, width: usize) -> Self {
         Self {
-            end: cols - MARGIN - 1,
-            widest: WIDTH.min(cols - MARGIN),
+            end: left + width - MARGIN - 1,
+            widest: WIDTH.min(width - MARGIN),
+        }
+    }
+
+    /// Ending at column `end`, as a card that says where it stood does (see
+    /// [`Card::end`]), as far as a screen `cols` wide has room for.
+    fn ending(end: usize, cols: usize) -> Self {
+        let end = end.min(cols.saturating_sub(MARGIN + 1));
+        Self {
+            end,
+            widest: WIDTH.min(end + 1),
         }
     }
 }
@@ -915,6 +941,18 @@ pub struct Footprint {
     pub shift: isize,
 }
 
+/// The column the lines of `card`, an arrival, end at on a screen `cols`
+/// wide, as [`arrival_footprint`] lays it: where it says it stood, or two in
+/// from the screen's edge.
+pub fn arrival_end(card: &Card, cols: usize) -> usize {
+    card.end
+        .map_or_else(
+            || Margin::of(cols),
+            |end| Margin::ending(usize::from(end), cols),
+        )
+        .end
+}
+
 /// Where `card`, an arrival, stands on a screen `cols` wide and `rows` high:
 /// what a session's dissolve leaves standing (see [`crate::shadow::Kept`]), so
 /// that it stays as it is while the screen under it comes and goes. Nothing
@@ -927,7 +965,10 @@ pub fn arrival_footprint(card: &Card, cols: usize, rows: usize) -> Footprint {
     {
         return Footprint::default();
     }
-    let at = Margin::of(cols);
+    let at = card.end.map_or_else(
+        || Margin::of(cols),
+        |end| Margin::ending(usize::from(end), cols),
+    );
     let title = fit(&card.title, at.widest);
     let landing = landing(card, &title, at);
     let write = |into: &mut Vec<(usize, usize, char)>, row: usize, col: usize, text: &str| {
@@ -1394,7 +1435,7 @@ mod tests {
     fn drawn(cards: &mut Cards, w: usize, h: usize, now: Instant) -> Frame {
         let mut f = frame(w, h);
         cards.expire(now);
-        cards.paint(&mut f, Style::default(), &colors(), &signs(), now);
+        cards.paint(&mut f, (0, w), Style::default(), &colors(), &signs(), now);
         f.mend();
         f
     }

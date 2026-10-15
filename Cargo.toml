@@ -9,8 +9,8 @@ repository = "https://github.com/Shooooooooo/nvmux"
 readme = "README.md"
 keywords = ["neovim", "nvim", "session", "tmux", "ssh"]
 categories = ["command-line-utilities", "development-tools"]
-# The demo is linked from the README by absolute URL, and the recorder is
-# for re-making it: neither is needed to build nvmux.
+# The README's pictures are linked from it by absolute URL, and the tools
+# are for re-making them: neither is needed to build nvmux.
 exclude = ["assets/", "tools/", ".github/"]
 
 [dependencies]
