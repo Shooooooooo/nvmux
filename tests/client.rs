@@ -1500,8 +1500,8 @@ fn a_wide_terminal_has_the_editor_centred_as_wide_as_its_windows_want() {
 #[test]
 fn a_wide_window_has_its_text_centred_in_it() {
     require_nvim!();
-    let scratch = Scratch::new("client-centre-windows");
-    let (mut term, mut rpc, _) = wide(&scratch, "client-centre-windows", "windows");
+    let scratch = Scratch::new("client-centre-text");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-centre-text", "windows");
     // One window, the whole terminal wide, its text in the middle.
     let alone = format!("{}the left window", " ".repeat(50));
     assert!(
