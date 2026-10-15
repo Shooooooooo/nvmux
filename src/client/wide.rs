@@ -4,10 +4,11 @@
 //! # The editor centred
 //!
 //! Neovim is told the terminal is only as wide as the editor's windows side
-//! by side want — each up to `window_width`, one that keeps its width
-//! (`'winfixwidth'`, as a file tree does) as wide as it keeps, and a column
-//! between each two — which the measure left in the editor works out from
-//! its layout, and says again whenever that changes ([`MEASURE_LUA`]). The
+//! by side want — each as wide as what it shows wants, or `window_width`
+//! (see [`MEASURE_LUA`]), one that keeps its width (`'winfixwidth'`, as a
+//! file tree does) as wide as it keeps, and a column between each two —
+//! which the measure left in the editor works out from its layout, and says
+//! again whenever that changes. The
 //! frame its grids are composed into is that wide, and goes on the terminal
 //! in its middle ([`place`]): the margins either side are blank in the
 //! editor's own background, but for the rows the editor draws a bar across —
@@ -20,88 +21,160 @@
 //! the change itself: Neovim splits the window it has, at the width it has,
 //! and the editor widens to give each its share once the measure says so. And
 //! Neovim gives a wider screen to the windows on its right, so the client has
-//! it make them the same width again, as `'equalalways'` makes them on a
-//! split — where that is on, as it is unless turned off.
+//! it give each window the width it wants again ([`SIZE_LUA`]), where
+//! `'equalalways'` says it is to lay them out — as it does unless turned off.
 //!
 //! A window showing a terminal wants the whole terminal: Neovim tells the
 //! program in it its window's width, and a shell or a program drawing a
 //! screen of its own is given all of it. So with one on show the editor is
-//! the whole terminal, and centred again once there is none.
+//! the whole terminal — that window all of it the others do not want — and
+//! centred again once there is none.
 //!
 //! # Each window's text centred
 //!
-//! Neovim keeps the whole terminal, and a window wider than `window_width` is
-//! asked for a grid that wide (`nvim_ui_try_resize_grid`, which only a UI
-//! with `ext_multigrid` can ask): Neovim draws its text to that width — wraps
+//! Neovim keeps the whole terminal, and a window wider than it wants, as the
+//! measure says, is asked for a grid that wide (`nvim_ui_try_resize_grid`,
+//! which only a UI with `ext_multigrid` can ask): Neovim draws its text to that width — wraps
 //! its lines there, ends its cursor line there — and the client puts it in
 //! the middle of the window ([`inset`]), a float anchored to it with it. The
 //! status line under it is still the window's width, as Neovim draws it, and
 //! has its words moved in to stand over the text ([`realign`]). A window
-//! showing a terminal, as the measure says which are, is not asked: its grid
-//! is as wide as Neovim tells the program in it its terminal is, and that
-//! would be held to `window_width` with it.
+//! showing a terminal wants the whole terminal, so it is not asked: its grid
+//! is as wide as Neovim tells the program in it its terminal is.
 
 use super::compose::{Frame, Out};
 use super::grid::Text;
 use super::style::Style;
 
-/// What the windows of the tab page in front want, side by side, given the
-/// most columns a window's text gets (the first argument): a window showing
-/// a terminal wants the whole terminal, more than any is wide — the program
-/// in it is told its window's width; a window that keeps its width wants
-/// that, any other the most; a row of them the sum with a column between
-/// each two, and a column of them the most any one of them wants. Answered
-/// as `{ wanted, 'laststatus', 'columns', terminals }`: `'columns'` so that
-/// an attach at another width knows the windows were laid out for that one,
-/// and the windows showing a terminal, so that the text of none of them is
-/// centred in it.
+/// What each window of the tab page in front wants, and what they all want
+/// side by side, given how wide a window's text is (the first argument) and
+/// whether to judge each by what it shows (the second: see
+/// [`crate::config::ClientSettings::smart_width`]).
+///
+/// A window showing a terminal wants the whole terminal, more than any is
+/// wide — the program in it is told its window's width; a window that keeps
+/// its width wants that. Any other wants the width given — or, judged by
+/// what it shows, its buffer's `'textwidth'` where it has one, and room for
+/// its long lines where they are not wrapped: all of them with `'wrap'` off,
+/// and with it on those of a Markdown table or code block, where tree-sitter
+/// has a parser to say which those are. Enough room for nine in ten of them,
+/// the first few thousand saying as much as the rest; and the gutter as well
+/// — the line numbers, the signs and the folds. Side by side, a row of
+/// windows wants the sum with a column between each two, and a column of
+/// them the most any one of them wants.
+///
+/// Answered as `{ wanted, 'laststatus', 'columns', windows }`: `'columns'`
+/// so that an attach at another width knows the windows were laid out for
+/// that one, and `windows` each window as `{ window, wanted }`, so that the
+/// text of each can be given what it wants (see [`SIZE_LUA`]).
 ///
 /// Given the client's channel as well, it stays in the editor and says it
 /// again, as an `nvmux_client` notification (`measure`, and the same four),
-/// whenever what the windows want, `'laststatus'` or the windows showing a
-/// terminal change: a window made, closed or resized, a buffer shown in a
-/// window, a terminal opened, a tab page entered, `'winfixwidth'` or
-/// `'laststatus'` set. It goes when this client's UI does, or the first time
-/// it finds the channel gone.
-pub const MEASURE_LUA: &str = "local most, chan = ...
+/// whenever what the windows want or `'laststatus'` changes: a window made,
+/// closed or resized, a buffer shown in a window, read, written or given a
+/// filetype, a terminal opened, a tab page entered, or an option set that a
+/// window's width or what it wants turns on. Not as its text is typed,
+/// which would have it widen and narrow under the cursor. It goes when this
+/// client's UI does, or the first time it finds the channel gone.
+pub const MEASURE_LUA: &str = "local most, smart, chan = ...
 local api = vim.api
 local whole = 1073741824
+local blocks
+local seen = {}
 local function terminal(win)
   return vim.bo[api.nvim_win_get_buf(win)].buftype == 'terminal'
 end
-local function want(node)
-  local kind, v = node[1], node[2]
-  if kind == 'leaf' then
-    if terminal(v) then
-      return whole
+local function blocked(buf, n)
+  if blocks == nil then
+    local ok, q = pcall(vim.treesitter.query.parse, 'markdown',
+      '[(pipe_table) (fenced_code_block) (indented_code_block)] @block')
+    blocks = ok and q or false
+  end
+  local ok, parser = pcall(vim.treesitter.get_parser, buf, 'markdown')
+  if not blocks or not ok or not parser then
+    return nil
+  end
+  local tree = parser:parse()[1]
+  if not tree then
+    return nil
+  end
+  local rows = {}
+  for _, node in blocks:iter_captures(tree:root(), buf, 0, n) do
+    local first, _, last, col = node:range()
+    if col == 0 then
+      last = last - 1
     end
-    if vim.wo[v].winfixwidth then
-      return api.nvim_win_get_width(v)
+    for r = first, math.min(last, n - 1) do
+      rows[r + 1] = true
     end
+  end
+  return rows
+end
+local function long(win, buf)
+  local wrap = vim.wo[win].wrap
+  local key = table.concat({ vim.b[buf].changedtick, tostring(wrap), vim.bo[buf].filetype }, ':')
+  if seen[buf] and seen[buf].key == key then
+    return seen[buf].width
+  end
+  local n = math.min(api.nvim_buf_line_count(buf), 4000)
+  local rows = true
+  if wrap then
+    rows = vim.bo[buf].filetype == 'markdown' and blocked(buf, n)
+  end
+  local widths = {}
+  if rows then
+    for i, line in ipairs(api.nvim_buf_get_lines(buf, 0, n, false)) do
+      if (rows == true or rows[i]) and line ~= '' then
+        widths[#widths + 1] = vim.fn.strdisplaywidth(line)
+      end
+    end
+  end
+  table.sort(widths)
+  local width = widths[math.ceil(#widths * 0.9)] or 0
+  seen[buf] = { key = key, width = width }
+  return width
+end
+local function of(win)
+  if terminal(win) then
+    return whole
+  end
+  if vim.wo[win].winfixwidth then
+    return api.nvim_win_get_width(win)
+  end
+  if not smart then
     return most
   end
-  local n = 0
-  for i, k in ipairs(v) do
-    local w = want(k)
-    if kind == 'row' then
-      n = n + w + (i > 1 and 1 or 0)
-    else
-      n = math.max(n, w)
-    end
-  end
-  return n
-end
-local function terminals()
-  local wins = {}
-  for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
-    if terminal(win) then
-      table.insert(wins, win)
-    end
-  end
-  return wins
+  local buf = api.nvim_win_get_buf(win)
+  local gutter = vim.fn.getwininfo(win)[1].textoff
+  local tw = vim.bo[buf].textwidth
+  local w = tw > 0 and tw + gutter or most
+  return math.max(w, long(win, buf) + gutter)
 end
 local function measure()
-  return { want(vim.fn.winlayout()), vim.o.laststatus, vim.o.columns, terminals() }
+  local each, by = {}, {}
+  for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
+    if api.nvim_win_get_config(win).relative == '' then
+      by[win] = of(win)
+      each[#each + 1] = { win, by[win] }
+    end
+  end
+  local function want(node)
+    local kind, v = node[1], node[2]
+    if kind == 'leaf' then
+      return by[v] or most
+    end
+    local n = 0
+    for i, k in ipairs(v) do
+      local w = want(k)
+      if kind == 'row' then
+        n = n + w + (i > 1 and 1 or 0)
+      else
+        n = math.max(n, w)
+      end
+    end
+    return n
+  end
+  return { want(vim.fn.winlayout()), vim.o.laststatus, vim.o.columns, each }
 end
 local last = measure()
 if chan then
@@ -125,9 +198,16 @@ if chan then
   end
   api.nvim_create_autocmd({
     'WinNew', 'WinClosed', 'WinResized', 'TabEnter', 'VimResized', 'BufWinEnter', 'TermOpen',
+    'FileType', 'BufReadPost', 'BufWritePost',
   }, { group = group, callback = soon })
-  api.nvim_create_autocmd('OptionSet',
-    { group = group, pattern = { 'winfixwidth', 'laststatus' }, callback = soon })
+  api.nvim_create_autocmd('OptionSet', {
+    group = group,
+    pattern = {
+      'winfixwidth', 'laststatus', 'textwidth', 'wrap', 'number', 'relativenumber',
+      'numberwidth', 'signcolumn', 'foldcolumn', 'statuscolumn',
+    },
+    callback = soon,
+  })
   api.nvim_create_autocmd('UILeave', {
     group = group,
     callback = function()
@@ -140,9 +220,93 @@ end
 return last";
 
 /// What Neovim is asked to do once the editor has been made wider or
-/// narrower for its windows: make them the same width again, as it does on a
-/// split, where `'equalalways'` says it is to.
-pub const EQUALISE_LUA: &str = "if vim.o.equalalways then
+/// narrower for its windows, where `'equalalways'` says it is to lay them
+/// out: give each the width it wants, as the measure last said (the first
+/// argument, `{ window, wanted }` each: see [`MEASURE_LUA`]). Along a row,
+/// those that want a width are given it, and those that want the whole
+/// terminal share what is left; a column of windows is as wide as the row
+/// gives it. Where the row has less room than they want — the terminal
+/// narrower than the editor would be — they are made the same width, as
+/// Neovim makes them on a split.
+pub const SIZE_LUA: &str = "local each = ...
+if not vim.o.equalalways then
+  return
+end
+local api = vim.api
+local whole = 1073741824
+local by = {}
+for _, p in ipairs(each) do
+  by[p[1]] = p[2]
+end
+local function want(node)
+  local kind, v = node[1], node[2]
+  if kind == 'leaf' then
+    return by[v] or whole
+  end
+  local n = 0
+  for i, k in ipairs(v) do
+    local w = want(k)
+    if kind == 'row' then
+      n = n + w + (i > 1 and 1 or 0)
+    else
+      n = math.max(n, w)
+    end
+  end
+  return n
+end
+local function leaf(node)
+  while node[1] ~= 'leaf' do
+    node = node[2][1]
+  end
+  return node[2]
+end
+local function size(node, width)
+  local kind, v = node[1], node[2]
+  if kind == 'leaf' then
+    return true
+  end
+  if kind == 'col' then
+    for _, k in ipairs(v) do
+      if not size(k, width) then
+        return false
+      end
+    end
+    return true
+  end
+  local widths, fixed, open = {}, 0, {}
+  for i, k in ipairs(v) do
+    local w = want(k)
+    if w >= whole then
+      open[#open + 1] = i
+    else
+      widths[i] = w
+      fixed = fixed + w
+    end
+  end
+  local room = width - (#v - 1) - fixed
+  if room < #open then
+    return false
+  end
+  if #open > 0 then
+    for j, i in ipairs(open) do
+      widths[i] = math.floor(room / #open) + (j <= room % #open and 1 or 0)
+    end
+  else
+    widths[#v] = widths[#v] + room
+  end
+  for i, k in ipairs(v) do
+    if i < #v then
+      pcall(api.nvim_win_set_width, leaf(k), widths[i])
+    end
+  end
+  for i, k in ipairs(v) do
+    if not size(k, widths[i]) then
+      return false
+    end
+  end
+  return true
+end
+if not size(vim.fn.winlayout(), vim.o.columns) then
   vim.cmd('horizontal wincmd =')
 end";
 

@@ -16,8 +16,9 @@ read at the width a page shows it.
 
 **The terminal is a whole ultra-wide monitor's:** 3440 by 1440 pixels, the
 commonest, filled by a terminal in the demo's font at the demo's size --
-COLS by ROWS below -- with each window's text as wide as `window_width` has
-it by default. It is drawn at that size, and not at the half as big again
+COLS by ROWS below -- with each window's text as wide as what it shows
+wants, as `smart_width` has it by default: the code its `'textwidth'`, and
+the prose `window_width`. It is drawn at that size, and not at the half as big again
 the demo is drawn at (see SCALE there): a page shows the picture a quarter
 as wide, where its text is not for reading but where it stands is.
 
@@ -56,11 +57,15 @@ OUT = os.path.join(demo.ROOT, "assets", "wide-%s.png")
 # The terminal: as much of an ultra-wide monitor's 3440 by 1440 pixels as
 # the window it is set in leaves, in the cells agg draws the demo's font in
 # at the demo's size -- 9 pixels by 21, with half a cell more all round.
-# And `[client] window_width`, as it is by default. Two windows of WIDTH side
-# by side leave a margin either side in COLS, and half of COLS is wider than
-# WIDTH, so that each of the three ways looks unlike the others.
+# And `[client] window_width`, as it is by default, which the prose gets;
+# the code gets its `'textwidth'`, as Rust's is set, and the column of its
+# line numbers beside it, three digits and a space. Two windows that wide
+# side by side leave a margin either side in COLS, and half of COLS is wider
+# than either, so that each of the three ways looks unlike the others.
 COLS, ROWS = 376, 64
 WIDTH = 120
+TEXTWIDTH = 100
+CODE_WIDTH = TEXTWIDTH + 4
 
 NAME = "api-server"
 
@@ -72,8 +77,8 @@ NAME = "api-server"
 LEFT, RIGHT = COLS // 2, COLS - 1 - COLS // 2
 SHOTS = [
     ("off", [COLS, [LEFT, RIGHT], [LEFT, RIGHT]]),
-    ("windows", [COLS, [WIDTH, WIDTH], [LEFT, RIGHT]]),
-    ("editor", [2 * WIDTH + 1, [WIDTH, WIDTH], [WIDTH, WIDTH]]),
+    ("windows", [COLS, [CODE_WIDTH, WIDTH], [LEFT, RIGHT]]),
+    ("editor", [CODE_WIDTH + 1 + WIDTH, [CODE_WIDTH, WIDTH], [CODE_WIDTH, WIDTH]]),
 ]
 
 # The project's, in the demo's api-server: some code, and the page of prose
@@ -262,6 +267,7 @@ vim.api.nvim_create_autocmd('FileType', {
 SETUP = r"""
 vim.cmd.cd(%s)
 vim.cmd('silent edit src/sessions.rs')
+vim.bo.textwidth = %d
 vim.cmd('silent vsplit docs/sessions.md')
 vim.wo.cursorline = false
 vim.cmd.wincmd('h')
@@ -346,7 +352,7 @@ def shoot(env, project, configs):
             term.type(NAME, wait=0.3)
             term.write(demo.ENTER)
             term.expect("[No Name]", "the session to paint", timeout=20)
-            demo.rpc(env, NAME, SETUP % (json.dumps(project), TOP, CURSOR))
+            demo.rpc(env, NAME, SETUP % (json.dumps(project), TEXTWIDTH, TOP, CURSOR))
             sock = demo.socket_of(NAME)
         else:
             term.expect(NAME, "the picker")

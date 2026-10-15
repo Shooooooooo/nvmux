@@ -191,11 +191,19 @@ pub struct ClientSettings {
     /// or the editor only as wide as its windows want, and centred. nvmux's
     /// own client only: Neovim's draws on the whole terminal.
     pub centre: Centre,
-    /// The most columns a window's text gets with `centre` on: how wide the
+    /// How many columns a window's text gets with `centre` on: how wide the
     /// text is that is centred in a wider window, and what each window side
-    /// by side wants of a centred editor. 0 for no limit, which is
-    /// `centre = "off"` whatever that says.
+    /// by side wants of a centred editor — where `smart_width` does not judge
+    /// otherwise. 0 for no limit, which is `centre = "off"` whatever that
+    /// says.
     pub window_width: u16,
+    /// With `centre` on, judge how wide each window's text is to be by what
+    /// it shows, rather than give every window `window_width`: its buffer's
+    /// `'textwidth'` where it has one, and room for its long lines where they
+    /// are not wrapped — all of them with `'wrap'` off, and with it on those
+    /// of a Markdown table or code block. A window showing a terminal keeps
+    /// its whole width either way (see `crate::client::wide`).
+    pub smart_width: bool,
 }
 
 impl Default for ClientSettings {
@@ -207,6 +215,7 @@ impl Default for ClientSettings {
             predict: true,
             centre: Centre::Off,
             window_width: 120,
+            smart_width: true,
         }
     }
 }
@@ -1143,7 +1152,8 @@ fn render_default_config(prefix: u8) -> String {
          # lazy         = {lazy:<8}   # start a client on its first visit, not at launch\n\
          # predict      = {predict:<8}   # over a slow link, scrolls show before Neovim answers\n\
          # centre       = {centre:<8}   # on a wide terminal: \"windows\" centres each window's text, \"editor\" the editor\n\
-         # window_width = {window_width:<8}   # with centre on, the most columns a window's text gets; 0 for no limit\n\
+         # window_width = {window_width:<8}   # with centre on, how many columns a window's text gets; 0 for no limit\n\
+         # smart_width  = {smart_width:<8}   # or as many as what it shows wants: its 'textwidth', its long lines\n\
          \n\
          [theme]\n\
          # color = {theme_color}   # or \"#rrggbb\": nvmux's text and bars in that colour\n\
@@ -1199,6 +1209,7 @@ fn render_default_config(prefix: u8) -> String {
         predict = c.predict,
         centre = quoted(c.centre.name()),
         window_width = c.window_width,
+        smart_width = c.smart_width,
         theme_color = quoted(&t.color.name()),
         fade_enabled = f.enabled,
         fade_duration = f.duration_ms,
@@ -1543,6 +1554,16 @@ mod tests {
         assert_eq!(s.client.window_width, 0);
         assert!(toml::from_str::<Settings>("[client]\ncentre = \"middle\"\n").is_err());
         assert!(toml::from_str::<Settings>("[client]\nwindow_width = -1\n").is_err());
+    }
+
+    /// Each window's text as wide as what it shows wants unless told
+    /// otherwise; `window_width` for every one of them is a line away.
+    #[test]
+    fn widths_are_judged_unless_told() {
+        assert!(Settings::default().client.smart_width);
+        let s: Settings = toml::from_str("[client]\nsmart_width = false\n").expect("valid");
+        assert!(!s.client.smart_width);
+        assert_eq!(s.client.window_width, 120, "the rest as it was");
     }
 
     /// nvmux's own client unless told otherwise; Neovim's is a line away.
@@ -1988,6 +2009,7 @@ mod tests {
             "# predict      = true",
             "# centre       = \"off\"",
             "# window_width = 120",
+            "# smart_width  = true",
             "# color = \"terminal\"",
             "# enabled     = true",
             "# duration_ms = 200",
