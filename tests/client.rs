@@ -1668,6 +1668,54 @@ fn the_next_client_draws_whole_what_a_centring_one_left() {
     assert_eq!(term.hang_up(), Some(0), "the client's exit");
 }
 
+/// A UI that keeps every window on grid 1 sees the windows whole: the client
+/// attaching again without `ext_multigrid` lets go of the windows it had
+/// narrowed, and once that UI has gone and the client has windows of its own
+/// again, narrows them again.
+#[test]
+fn a_ui_without_windows_of_its_own_sees_them_whole() {
+    require_nvim!();
+    let scratch = Scratch::new("client-centre-foreign");
+    let (mut term, mut rpc, sock) = wide(&scratch, "client-centre-foreign", "windows");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    assert!(
+        until_widths(&mut term, &mut rpc, &columns(160, &[60])),
+        "never narrowed: {}",
+        widths(&mut rpc)
+    );
+
+    // A UI of no nvmux's, never read: see
+    // `a_ui_without_windows_of_its_own_is_made_room_for`.
+    let mut other = nvmux::rpc::Client::connect(&sock, Duration::from_secs(5)).expect("connect");
+    other
+        .call(
+            "nvim_ui_attach",
+            vec![
+                Value::from(160),
+                Value::from(12),
+                Value::Map(vec![(Value::from("ext_linegrid"), Value::from(true))]),
+            ],
+        )
+        .expect("attach a UI without ext_multigrid");
+    assert!(
+        until_widths(&mut term, &mut rpc, &columns(160, &[160])),
+        "the window was left narrow: {}",
+        widths(&mut rpc)
+    );
+
+    drop(other);
+    assert!(
+        until_widths(&mut term, &mut rpc, &columns(160, &[60])),
+        "not narrowed again: {}",
+        widths(&mut rpc)
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
 /// A window showing a terminal keeps its whole width with each window's text
 /// centred: the program in it is told its window's width. The window beside
 /// it has its text centred as before.

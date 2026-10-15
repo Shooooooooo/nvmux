@@ -1345,10 +1345,14 @@ impl App {
 
     /// Let go of every grid asked to be narrower than its window, as the
     /// client goes: another UI of the session is to see the windows whole.
-    pub fn let_windows_go(&mut self) {
+    /// Whether there were any, for [`run`] to wait for Neovim to have done
+    /// it.
+    pub fn let_windows_go(&mut self) -> bool {
+        let held = !self.narrowed.is_empty();
         let window_width = std::mem::take(&mut self.window_width);
         self.narrow_windows();
         self.window_width = window_width;
+        held
     }
 
     /// `nvim_set_client_info`: an nvmux UI, and whether it wants
@@ -1540,9 +1544,11 @@ impl App {
         }
     }
 
-    /// Detach, to attach again as `multigrid` says once Neovim has done it.
+    /// Detach, to attach again as `multigrid` says once Neovim has done it:
+    /// the windows let go of first, while Neovim still takes it of this UI.
     fn leave(&mut self, multigrid: bool) {
         tracing::info!(multigrid, "client: attaching again for the UIs there are");
+        self.let_windows_go();
         let id = self.outbox.request("nvim_ui_detach", &[]);
         self.asked.insert(id, Ask::Detach);
         self.attach = Attach::Leaving { multigrid };
@@ -2873,7 +2879,7 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let mut buf = vec![0u8; 64 * 1024];
 
-    let outcome = loop {
+    let outcome = 'session: loop {
         app.tick(Instant::now());
         if app.take_refresh() {
             refresh(sock, app.size());
@@ -2883,7 +2889,9 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
         }
         let said = app.take_said();
         if !said.is_empty() {
-            crate::term::write_stdout(&said)?;
+            if let Err(e) = crate::term::write_stdout(&said) {
+                break Err(e.into());
+            }
         }
         let now = Instant::now();
         let timeout = app.wake_at(now).map_or(-1, |at| {
@@ -2932,7 +2940,9 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
                     Ok(Some(frame)) => app.message(&frame, now),
                     Ok(None) => break,
                     Err(e) => {
-                        return Err(anyhow::Error::from(e).context("reading from the session"))
+                        break 'session Err(
+                            anyhow::Error::from(e).context("reading from the session")
+                        );
                     }
                 }
             }
@@ -2951,7 +2961,9 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
         }
         if app.due(now) {
             let bytes = app.frame(now);
-            crate::term::write_stdout(&bytes)?;
+            if let Err(e) = crate::term::write_stdout(&bytes) {
+                break Err(e.into());
+            }
         }
         if app.done {
             break Ok(());
@@ -2959,10 +2971,41 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
     };
     // Whatever ended it, the terminal is handed back as it was — and the
     // windows their own width, for whoever else draws them.
-    app.let_windows_go();
-    let _ = app.outbox.send(&mut stream);
+    if app.let_windows_go() {
+        let out = std::mem::take(&mut app.outbox);
+        if let Err(e) = let_go(stream, inbox, out, LETTING_GO) {
+            tracing::debug!(error = %e, "client: the windows may not have been let go of");
+        }
+    }
     let _ = crate::term::write_stdout(term::CLOSING);
     outcome
+}
+
+/// How long the way out waits for Neovim to have given the windows their
+/// width back: a round trip, to a session over ssh as well, and not so long
+/// that a detach is not still at once.
+const LETTING_GO: Duration = Duration::from_millis(300);
+
+/// Send what is queued — the windows let go of — then detach, and wait for
+/// the detach to be answered, for no longer than `wait`. The answer says the
+/// rest was done: Neovim does what a connection asks in the order it asks
+/// it, but takes the connection closing ahead of all of it, and a window let
+/// go of once the UI has gone is refused and stays narrow.
+fn let_go(
+    stream: UnixStream,
+    inbox: Inbox,
+    mut out: Outbox,
+    wait: Duration,
+) -> std::io::Result<()> {
+    let detach = out.request("nvim_ui_detach", &[]);
+    stream.set_nonblocking(false)?;
+    let mut line = Line {
+        stream,
+        inbox,
+        out,
+        deadline: Instant::now() + wait,
+    };
+    line.answer(detach, |_| ())
 }
 
 /// Have Neovim draw the windows of the current tab page afresh for the UIs
@@ -3050,7 +3093,8 @@ fn refresh_now(sock: &Path, (w, h): (usize, usize)) -> std::io::Result<()> {
 /// see [`refresh_now`].
 const REFRESH_MAX_UIS: usize = 4;
 
-/// A refresh's own connection: blocking, and given until `deadline`.
+/// A connection waited on, a refresh's own or the client's on its way out:
+/// blocking, and given until `deadline`.
 struct Line {
     stream: UnixStream,
     inbox: Inbox,
@@ -3063,11 +3107,9 @@ impl Line {
     /// what `read` makes of its result. Anything else that comes — what
     /// Neovim draws for an attached UI — is read and let go.
     fn answer<T>(&mut self, id: u32, read: impl Fn(&ValueRef<'_>) -> T) -> std::io::Result<T> {
-        let timed_out = || std::io::Error::from(std::io::ErrorKind::TimedOut);
         while !self.out.is_empty() {
-            if Instant::now() > self.deadline {
-                return Err(timed_out());
-            }
+            let left = self.left()?;
+            self.stream.set_write_timeout(Some(left))?;
             self.out.send(&mut self.stream)?;
         }
         loop {
@@ -3087,13 +3129,22 @@ impl Line {
                     return Ok(read(msg.get(3).unwrap_or(&ValueRef::Nil)));
                 }
             }
-            if Instant::now() > self.deadline {
-                return Err(timed_out());
-            }
+            let left = self.left()?;
+            self.stream.set_read_timeout(Some(left))?;
             if !self.inbox.fill(&mut self.stream)? {
                 return Err(std::io::ErrorKind::UnexpectedEof.into());
             }
         }
+    }
+
+    /// What is left of the time given, for a read or a write to wait no
+    /// longer than; none left, an error.
+    fn left(&self) -> std::io::Result<Duration> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        Ok(left)
     }
 }
 
@@ -4302,8 +4353,123 @@ mod tests {
         assert!(narrowed(&calls(&mut a)).is_empty(), "asked once");
         assert_eq!(shown(&mut a, t0)[0], "      text", "6 in, of 20");
 
-        a.let_windows_go();
+        assert!(a.let_windows_go(), "a grid to let go of");
         assert_eq!(narrowed(&calls(&mut a)), [vec![n(2), n(0), n(0)]]);
+        assert!(!a.let_windows_go(), "none left");
+    }
+
+    /// Attaching again without `ext_multigrid` for a UI that keeps windows on
+    /// grid 1, the client lets go of the windows it narrowed before it
+    /// detaches, while Neovim still takes it of it: that UI is to see them
+    /// whole.
+    #[test]
+    fn a_ui_without_windows_of_its_own_has_them_let_go_of() {
+        let t0 = Instant::now();
+        let (mut a, _) = wide_app(Centre::Windows, 8, t0);
+        let n = Value::from;
+        redraw(
+            &mut a,
+            vec![
+                resize(1, 20, 6),
+                resize(2, 20, 5),
+                ("win_pos", vec![n(2), n(1000), n(0), n(0), n(20), n(5)]),
+                viewport(2, 1000),
+            ],
+            t0,
+        );
+        let resized = |calls: &[Call], width: i64| {
+            calls.iter().position(|(_, m, args)| {
+                m == "nvim_ui_try_resize_grid" && args[..] == [n(2), n(width), n(0)]
+            })
+        };
+        assert!(resized(&calls(&mut a), 8).is_some(), "narrowed");
+
+        redraw(&mut a, vec![ui_change()], t0);
+        let uis_id = asks_uis(&calls(&mut a));
+        answer(&mut a, uis_id, uis(true, false), t0);
+        let sent = calls(&mut a);
+        let detach = sent.iter().position(|(_, m, _)| m == "nvim_ui_detach");
+        let let_go = resized(&sent, 0);
+        assert!(
+            let_go.is_some() && detach.is_some() && let_go < detach,
+            "not let go of before the detach: {sent:?}"
+        );
+    }
+
+    /// What the far end of a connection is sent, as `(id, method)` — no id
+    /// for a notification — up to a request for `last`.
+    fn read_until(theirs: &mut UnixStream, last: &str) -> Vec<(Option<u64>, String)> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut inbox = Inbox::default();
+        let mut got = Vec::new();
+        loop {
+            while let Some(frame) = inbox.take_frame().expect("whole frames") {
+                let v = rmpv::decode::read_value(&mut &frame[..]).expect("msgpack");
+                let a = v.as_array().expect("an array");
+                let (id, method) = match a[0].as_u64() {
+                    Some(0) => (a[1].as_u64(), &a[2]),
+                    _ => (None, &a[1]),
+                };
+                let method = method.as_str().unwrap_or("").to_string();
+                let done = id.is_some() && method == last;
+                got.push((id, method));
+                if done {
+                    return got;
+                }
+            }
+            assert!(Instant::now() < deadline, "no {last} in {got:?}");
+            assert!(inbox.fill(theirs).expect("read"), "closed before {last}");
+        }
+    }
+
+    /// On its way out, the client sends what it let go of, then detaches,
+    /// and goes once Neovim has answered the detach: Neovim does what a
+    /// connection asks in the order it asks it, so the answer says the rest
+    /// was done.
+    #[test]
+    fn the_way_out_waits_for_the_windows_to_be_let_go_of() {
+        let (ours, mut theirs) = UnixStream::pair().expect("a socket pair");
+        ours.set_nonblocking(true).expect("as the client has it");
+        theirs
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("a read timeout");
+        let mut out = Outbox::default();
+        out.notify(
+            "nvim_ui_try_resize_grid",
+            &[Arg::Int(2), Arg::Int(0), Arg::Int(0)],
+        );
+        let wait = Duration::from_secs(10);
+        let gone = std::thread::spawn(move || let_go(ours, Inbox::default(), out, wait));
+        let got = read_until(&mut theirs, "nvim_ui_detach");
+        let methods: Vec<&str> = got.iter().map(|(_, m)| m.as_str()).collect();
+        assert_eq!(methods, ["nvim_ui_try_resize_grid", "nvim_ui_detach"]);
+        assert!(!gone.is_finished(), "gone before the answer");
+        let id = got[1].0.expect("a request");
+        let answer = Value::Array(vec![1.into(), id.into(), Value::Nil, Value::Nil]);
+        std::io::Write::write_all(&mut theirs, &encoded(answer)).expect("answer");
+        gone.join().expect("no panic").expect("answered");
+    }
+
+    /// And goes all the same once it has waited as long as it was given, or
+    /// at once with Neovim gone.
+    #[test]
+    fn the_way_out_waits_no_longer_than_it_is_given() {
+        let (ours, mut theirs) = UnixStream::pair().expect("a socket pair");
+        theirs
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("a read timeout");
+        let wait = Duration::from_millis(50);
+        let gone =
+            std::thread::spawn(move || let_go(ours, Inbox::default(), Outbox::default(), wait));
+        read_until(&mut theirs, "nvim_ui_detach");
+        let e = gone.join().expect("no panic").expect_err("never answered");
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}");
+
+        let (ours, theirs) = UnixStream::pair().expect("a socket pair");
+        drop(theirs);
+        let wait = Duration::from_secs(10);
+        let e = let_go(ours, Inbox::default(), Outbox::default(), wait).expect_err("gone");
+        assert_ne!(e.kind(), std::io::ErrorKind::TimedOut, "waited for: {e}");
     }
 
     /// Each window's text is as wide as the measure says the window wants:

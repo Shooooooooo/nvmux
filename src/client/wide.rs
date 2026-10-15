@@ -40,7 +40,10 @@
 //! status line under it is still the window's width, as Neovim draws it, and
 //! has its words moved in to stand over the text ([`realign`]). A window
 //! showing a terminal wants the whole terminal, so it is not asked: its grid
-//! is as wide as Neovim tells the program in it its terminal is.
+//! is as wide as Neovim tells the program in it its terminal is. A grid asked
+//! for is the window's for every UI of the session: as the client goes, it
+//! asks for each window's own width back, and waits a moment for Neovim to
+//! have done it ([`super::run`]).
 
 use super::compose::{Frame, Out};
 use super::grid::Text;
