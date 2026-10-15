@@ -45,15 +45,39 @@
 //! cursor for an overlay for the same reason: the hide would itself be seen, for
 //! as long as the bar is up.
 //!
-//! # The lull, and the two clocks this does not have
+//! # Up at a lull, and kept up between the session's sequences
 //!
 //! nvmux owns no cells while a session is attached, so the bar is written over
-//! the session's screen and put back — and only at a lull ([`SETTLE`]). The
-//! bar alone waits for one. The attach notice used to wait for the same lull,
-//! and now goes up between the session's escape sequences instead, asking the
-//! decoder in [`crate::boundary`] — which is watched only for as long as the
-//! notice is up. So the bar keeps the lull: with nothing parsing the child's
-//! output, it is the one state in which the child cannot be mid-sequence.
+//! the session's screen and put back. It goes *up* at a lull ([`SETTLE`]):
+//! with nothing parsing the child's output, a lull is the one state in which
+//! the child cannot be mid-sequence.
+//!
+//! It is *kept* up another way. The session goes on drawing while the prefix
+//! waits, and the row it draws on most is very often this one: a statusline
+//! with a language server's progress in it, redrawn a few times a second, or
+//! the message row a plugin reports on. Each of those redraws used to wipe the
+//! bar, which went back up at the lull after it — so the editor's row showed
+//! through the bar on every redraw, and on an editor redrawing faster than the
+//! lull, the bar never came back at all. That is the attach notice's old
+//! trouble exactly, and the bar takes the notice's answer to it: from the write
+//! that puts it up to the one that takes it down, the relay follows the
+//! terminal's parser with [`crate::boundary`], and the bar goes back up on the
+//! very pass the session drew over it — between the session's sequences,
+//! inside the same synchronized update as what the session drew, in front of
+//! its frame close for a client that brackets its own frames. The terminal has
+//! no moment at which it could present the one without the other. Nothing
+//! after the lull the bar went up at is a clock, the erase included: it, too,
+//! goes in between the session's sequences, at once.
+//!
+//! The parser is followed for that long and no longer — the second or so a
+//! prefix waits — because following it is not free: the last few bytes of a
+//! write that ends inside a sequence are kept back until the rest of it
+//! arrives, and the writes of a client that does not bracket its own frames
+//! go to the terminal inside updates of nvmux's (see
+//! `Attachment::write_session_frame` in [`crate::pty`]). Neither is worth
+//! having for a row nobody has asked for.
+//!
+//! # The two clocks this does not have
 //!
 //! There is no fade. The bar has to be up the moment the prefix arms — that is
 //! the whole of what it is for, and a dissolve of 100 ms each way is 100 ms of
@@ -84,7 +108,9 @@ use crate::palette::{self, Palette};
 use crate::pty::PtySize;
 use crate::shadow::{Over, Shadow};
 
-/// How long the child must have been quiet before the bar may be written.
+/// How long the child must have been quiet before the bar may be written,
+/// while nothing is following the terminal's parser to say so sooner: which
+/// is how the bar goes up, though not how it is kept up (see the module docs).
 ///
 /// A child whose own write blocked because the pty buffer filled leaves the
 /// master momentarily unreadable in the *middle* of a frame. That gap is
@@ -116,6 +142,28 @@ const SGR: &str = "\x1b[0;2m";
 /// only row: an editor left with nothing but nvmux's hints is worse than a user
 /// left to find `<prefix> ?`.
 const MIN_ROWS: u16 = 2;
+
+/// What the relay found on this pass of its loop, as far as the bar is
+/// concerned.
+///
+/// The two questions [`announce::Pass`] asks, for the reason it asks them:
+/// whether the bar may have been drawn over, and whether there is anywhere to
+/// put it back. A session drawing on the bar's row answers yes to both on the
+/// same pass, which is exactly the pass the bar has to go back up on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pass {
+    /// The child had something for the terminal, or is having its first paint
+    /// held: either way whatever the bar had on the row may have been drawn
+    /// over, and a lull, if one is being waited for, starts again.
+    pub wrote: bool,
+    /// Where the terminal's parser stands, when the relay is following it
+    /// (see [`crate::boundary`]): `Some(true)` between the session's
+    /// sequences with nothing of the session's open, so the bar may be
+    /// written now, and `Some(false)` in the middle of something, so it may
+    /// not be written at all. `None` when nothing is following it, which
+    /// leaves the bar a lull to go on.
+    pub between: Option<bool>,
+}
 
 /// What the relay must do about the bar on this pass of its loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,8 +300,12 @@ pub struct Bar {
     /// The rectangle the machine's state implies, worked out on every pass.
     want: Option<Over>,
     /// Whether the terminal has been made to agree with `want`. False is a write
-    /// owed, and is exactly when [`Bar::wake_at`] asks to be woken.
+    /// owed, and is when [`Bar::wake_at`] asks to be woken — unless `watched`.
     agreed: bool,
+    /// Whether the last pass had the terminal's parser to go on rather than a
+    /// lull: then nothing the bar could wait for is a clock, and
+    /// [`Bar::wake_at`] asks for nothing.
+    watched: bool,
     /// The screen the last pass was for. Rows and columns only: a pixel-size
     /// change moves no cell.
     size: (u16, u16),
@@ -285,10 +337,18 @@ impl Bar {
             shown: None,
             want: None,
             agreed: true,
+            watched: false,
             size: (size.rows, size.cols),
             palette,
             keymap,
         }
+    }
+
+    /// Whether the bar is on the screen, or wants to be: what the relay
+    /// follows the terminal's parser for (see [`Pass::between`]). Up from the
+    /// prefix to the erase, and down again once nothing is left on the row.
+    pub fn is_up(&self) -> bool {
+        self.shown.is_some() || self.want.is_some()
     }
 
     /// When the relay must next wake up on the bar's account, or `None` when it
@@ -304,8 +364,18 @@ impl Bar {
     /// it to keep asking, the poll timeout would round to zero and the relay
     /// would spin on a write it can never make: the hazard `pty::Hold::wake_at`
     /// steps around for the held first paint.
+    ///
+    /// And a bar the relay is following the terminal for asks for nothing
+    /// either, owed a write or not, for the reason [`announce::Popup::wake_at`]
+    /// gives: what it waits for is the session leaving the terminal between
+    /// its sequences, which no clock brings about. The session's next bytes
+    /// wake the relay, and so does a tail kept back to keep a sequence whole,
+    /// and the pass that follows either is the pass that writes. Asking for
+    /// the lull instead would be asking, once it had passed, for a wake-up
+    /// already due — on every pass, for as long as the session sat in the
+    /// middle of a sequence of its own.
     pub fn wake_at(&self, now: Instant) -> Option<Instant> {
-        if self.agreed {
+        if self.agreed || self.watched {
             return None;
         }
         Some(self.quiet_since.unwrap_or(now) + SETTLE)
@@ -319,16 +389,16 @@ impl Bar {
 
     /// One pass of the relay loop.
     ///
-    /// `busy` is whether the child had anything for the terminal this time
-    /// round, or is having its first paint held: both mean the same two things
-    /// here, that this is no moment to write and that anything already on the
-    /// row may have been drawn over. `under` is the session's screen as the
-    /// shadow has it, which is what an erase puts back. `go` is whether a card
-    /// is up for `<prefix> Enter` to act on, and so whether the bar offers it.
+    /// `pass` is what the relay found: whether the row may have been drawn
+    /// over, and whether the terminal may be written to now — or, with nothing
+    /// following its parser, nothing about that at all, and then the bar waits
+    /// for a lull. `under` is the session's screen as the shadow has it, which
+    /// is what an erase puts back. `go` is whether a card is up for
+    /// `<prefix> Enter` to act on, and so whether the bar offers it.
     pub fn step(
         &mut self,
         now: Instant,
-        busy: bool,
+        pass: Pass,
         size: PtySize,
         pending: Option<Pending>,
         go: bool,
@@ -354,17 +424,24 @@ impl Bar {
             self.agreed = false;
         }
 
-        if busy {
+        if pass.wrote {
             self.quiet_since = None;
             self.may_have_been_covered();
         } else {
             self.quiet_since.get_or_insert(now);
         }
 
-        let settled = self
-            .quiet_since
-            .is_some_and(|quiet| now.duration_since(quiet) >= SETTLE);
-        if !settled || self.agreed {
+        // The parser's word, where there is one, is the whole of it: between
+        // the session's sequences the bar goes in at once — which on a pass
+        // the session drew on is inside the frame it drew, before the terminal
+        // can present that frame without the bar — and in the middle of one it
+        // does not go in at all, however long the session has been quiet.
+        self.watched = pass.between.is_some();
+        let free = pass.between.unwrap_or_else(|| {
+            self.quiet_since
+                .is_some_and(|quiet| now.duration_since(quiet) >= SETTLE)
+        });
+        if !free || self.agreed {
             return Act::Idle;
         }
 
@@ -491,20 +568,52 @@ mod tests {
             }
         }
 
-        /// One pass `SETTLE` later on a child with nothing to say.
+        /// One pass `SETTLE` later on a child with nothing to say, with nothing
+        /// following the terminal's parser.
         fn quiet(&mut self, pending: Option<Pending>, size: PtySize) -> Act {
             self.step(false, pending, size)
         }
 
-        /// One pass `SETTLE` later on a child that is talking.
+        /// One pass `SETTLE` later on a child that is talking, with nothing
+        /// following the terminal's parser.
         fn busy(&mut self, pending: Option<Pending>, size: PtySize) -> Act {
             self.step(true, pending, size)
         }
 
-        fn step(&mut self, busy: bool, pending: Option<Pending>, size: PtySize) -> Act {
+        fn step(&mut self, wrote: bool, pending: Option<Pending>, size: PtySize) -> Act {
+            self.pass(
+                Pass {
+                    wrote,
+                    between: None,
+                },
+                pending,
+                size,
+            )
+        }
+
+        /// One pass `SETTLE` later, with the terminal's parser followed and
+        /// standing where `between` says.
+        fn watched(
+            &mut self,
+            wrote: bool,
+            between: bool,
+            pending: Option<Pending>,
+            size: PtySize,
+        ) -> Act {
+            self.pass(
+                Pass {
+                    wrote,
+                    between: Some(between),
+                },
+                pending,
+                size,
+            )
+        }
+
+        fn pass(&mut self, pass: Pass, pending: Option<Pending>, size: PtySize) -> Act {
             self.now += SETTLE;
             self.bar
-                .step(self.now, busy, size, pending, true, self.shadow.as_ref())
+                .step(self.now, pass, size, pending, true, self.shadow.as_ref())
         }
 
         fn wake_at(&self) -> Option<Instant> {
@@ -582,7 +691,11 @@ mod tests {
         let size = big();
         let now = Instant::now() + SETTLE;
         let mut bar = Bar::new(now - SETTLE, size, moved());
-        let Act::Write(bytes) = bar.step(now, false, size, Some(Pending::Command), true, None)
+        let quiet = Pass {
+            wrote: false,
+            between: None,
+        };
+        let Act::Write(bytes) = bar.step(now, quiet, size, Some(Pending::Command), true, None)
         else {
             panic!("the bar did not go up");
         };
@@ -851,7 +964,10 @@ mod tests {
 
     /// The child drawing over the row is the one thing that makes a repaint due,
     /// and `overdrawn` is the same news from the attach notice. Either way the
-    /// bar goes back up at the next lull.
+    /// bar goes back up — at the next lull, with nothing following the
+    /// terminal's parser to say it may go up sooner. With the parser followed,
+    /// which the relay does for as long as the bar is up, it goes up on the
+    /// pass itself: see the next test.
     #[test]
     fn a_covered_bar_is_painted_again_at_the_next_lull() {
         for cover in ["the child", "the notice"] {
@@ -896,6 +1012,137 @@ mod tests {
         }
         d.bar.overdrawn();
         assert_eq!(d.wake_at(), None, "woken for a bar that is not up");
+    }
+
+    /// The fix for the session's own row showing through the bar: with the
+    /// terminal's parser followed, a pass the session drew on is a pass the bar
+    /// goes back up on, as long as the session has left the terminal between
+    /// its sequences — no lull, which a statusline redrawn faster than one
+    /// would never give, and no moment at which the terminal could present
+    /// the row without the bar, since the relay writes it inside the same
+    /// update as what the session drew.
+    ///
+    /// Every pass, however busy the session: one repaint for each write it
+    /// makes, and nothing on the passes it makes none.
+    #[test]
+    fn a_watched_bar_goes_back_up_on_the_pass_the_session_drew_over_it() {
+        let mut d = Driver::new(big());
+        assert!(matches!(
+            d.quiet(Some(Pending::Command), big()),
+            Act::Write(_)
+        ));
+        for _ in 0..10 {
+            let act = d.watched(true, true, Some(Pending::Command), big());
+            let Act::Write(bytes) = act else {
+                panic!("the session drew over the bar and it stayed down: {act:?}");
+            };
+            assert!(
+                String::from_utf8_lossy(&bytes).contains("picker"),
+                "what went back up is not the bar"
+            );
+            assert_eq!(
+                d.watched(false, true, Some(Pending::Command), big()),
+                Act::Idle,
+                "painted again over a row nothing had touched"
+            );
+        }
+    }
+
+    /// Except in the middle of one of the session's sequences, however long
+    /// the session has been quiet in it: the parser's word is the whole of
+    /// it, and a lull that would have let the bar in with nothing following
+    /// the parser does not here. Nor does a bar owed a write ask to be woken
+    /// for one — the session's next bytes wake the relay, and a clock already
+    /// past would have it spin until they came.
+    #[test]
+    fn a_watched_bar_is_never_written_into_a_sequence() {
+        let mut d = Driver::new(big());
+        assert!(matches!(
+            d.quiet(Some(Pending::Command), big()),
+            Act::Write(_)
+        ));
+        assert_eq!(
+            d.watched(true, false, Some(Pending::Command), big()),
+            Act::Idle,
+            "written into the middle of the session's sequence"
+        );
+        for _ in 0..10 {
+            assert_eq!(
+                d.watched(false, false, Some(Pending::Command), big()),
+                Act::Idle,
+                "a lull let the bar into the middle of a sequence"
+            );
+            assert_eq!(
+                d.wake_at(),
+                None,
+                "asked to be woken for a moment no clock brings"
+            );
+        }
+        assert!(
+            matches!(
+                d.watched(true, true, Some(Pending::Command), big()),
+                Act::Write(_)
+            ),
+            "the session finished its sequence and the bar stayed down"
+        );
+    }
+
+    /// The bar comes down the same way it is kept up: between the session's
+    /// sequences, on the pass the prefix resolves, whether or not the session
+    /// is quiet — and with the session's own row, as the shadow has it.
+    #[test]
+    fn a_watched_bar_comes_down_without_waiting_for_a_lull() {
+        let mut d = Driver::restoring(big());
+        assert!(matches!(
+            d.quiet(Some(Pending::Command), big()),
+            Act::Write(_)
+        ));
+        let act = d.watched(true, true, None, big());
+        let Act::Write(down) = act else {
+            panic!("the bar waited to come down: {act:?}");
+        };
+        let down = String::from_utf8_lossy(&down).to_string();
+        assert!(
+            down.contains(&"x".repeat(80)) && !down.contains("picker"),
+            "the session's own row did not come back: {down:?}"
+        );
+        assert_eq!(
+            d.watched(true, true, None, big()),
+            Act::Idle,
+            "erased twice"
+        );
+    }
+
+    /// What the relay follows the terminal's parser for: from the prefix,
+    /// before the bar has found its lull, to the erase — and not a pass
+    /// longer, or a chatty session would have its writes held up by a parser
+    /// nobody needs.
+    #[test]
+    fn the_bar_is_up_from_the_prefix_to_the_erase() {
+        let mut d = Driver::restoring(big());
+        assert!(!d.bar.is_up(), "up before anything was asked of it");
+        assert_eq!(d.busy(Some(Pending::Command), big()), Act::Idle);
+        assert!(d.bar.is_up(), "a bar waiting for its lull is not up");
+        // The pass that ends the burst starts the lull; the next one is past
+        // it.
+        assert_eq!(d.quiet(Some(Pending::Command), big()), Act::Idle);
+        assert!(matches!(
+            d.quiet(Some(Pending::Command), big()),
+            Act::Write(_)
+        ));
+        assert!(d.bar.is_up());
+
+        // Taken down: still up while the erase is owed and the session is in
+        // the middle of a sequence, and down once it has been written.
+        assert_eq!(d.watched(true, false, None, big()), Act::Idle);
+        assert!(d.bar.is_up(), "down with the bar still on the row");
+        assert!(matches!(d.watched(false, true, None, big()), Act::Write(_)));
+        assert!(!d.bar.is_up(), "still up once the row was put back");
+
+        // A screen too small for it is down the whole time.
+        let mut d = Driver::new(size(6, 24));
+        d.quiet(Some(Pending::Command), size(6, 24));
+        assert!(!d.bar.is_up(), "up on a screen it cannot draw on");
     }
 
     /// The prefix resolving before any lull means nothing was ever drawn, so
@@ -1050,9 +1297,13 @@ mod tests {
             Act::Write(_)
         ));
         d.now += SETTLE;
+        let quiet = Pass {
+            wrote: false,
+            between: None,
+        };
         let act = d
             .bar
-            .step(d.now, false, size, Some(Pending::Command), false, None);
+            .step(d.now, quiet, size, Some(Pending::Command), false, None);
         let Act::Write(bytes) = act else {
             panic!("the bar was not redrawn: {act:?}");
         };

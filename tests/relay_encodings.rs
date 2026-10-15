@@ -21,7 +21,10 @@
 //! ([`nvmux::hint`]) is written over a live editor's last row and taken off it
 //! again, and neither half can be shown to work anywhere but here: it needs a
 //! real client painting a real screen to cover, and the shadow's copy of that
-//! screen to put back.
+//! screen to put back. Nor is the bar staying on that row while the editor
+//! redraws it underneath — a statusline ticking over with a language server's
+//! progress — which needs the same, and every moment in between as a terminal
+//! could have shown it.
 //!
 //! Nor are the last two. With `[client] per_session` a client is parked while
 //! something else has the front, and when it comes back nvmux paints the
@@ -771,7 +774,11 @@ fn the_push_is_matched_by_shape() {
 fn row_on_screen(out: &[u8], row: u16) -> String {
     let mut parser = vt100::Parser::new(ROWS, COLS, 0);
     parser.process(out);
-    let screen = parser.screen();
+    row_of(parser.screen(), row)
+}
+
+/// One row of a parsed screen, as text, trimmed.
+fn row_of(screen: &vt100::Screen, row: u16) -> String {
     (0..COLS)
         .map(|col| match screen.cell(row, col) {
             Some(cell) if cell.has_contents() => cell.contents(),
@@ -780,6 +787,42 @@ fn row_on_screen(out: &[u8], row: u16) -> String {
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+/// What a terminal could have put on the glass of `row`, at every moment it
+/// could have put anything there: the end of each synchronized update, and
+/// every byte of what is written outside one. A run of moments that show the
+/// same thing is one, at the first of them, and each comes with how far into
+/// `out` it is.
+///
+/// [`row_on_screen`] reads the end of the stream, where a row wiped by every
+/// frame of the session's and put back after each looks exactly like one that
+/// was never touched. What the user sees is everything in between, because a
+/// terminal presents on a clock of its own: outside an update it may show any
+/// prefix of the stream, and inside one only the whole of it.
+fn presented(out: &[u8], row: u16) -> Vec<(usize, String)> {
+    let mut parser = vt100::Parser::new(ROWS, COLS, 0);
+    let mut moments: Vec<(usize, String)> = Vec::new();
+    let mut held = false;
+    for (i, byte) in out.iter().enumerate() {
+        parser.process(std::slice::from_ref(byte));
+        // Held as a mode, as terminals hold it: a second begin inside an
+        // update changes nothing, and the first end lets it all go.
+        let so_far = &out[..=i];
+        if so_far.ends_with(nvmux::fade::SYNC_BEGIN) {
+            held = true;
+        } else if so_far.ends_with(nvmux::fade::SYNC_END) {
+            held = false;
+        }
+        if held {
+            continue;
+        }
+        let shown = row_of(parser.screen(), row);
+        if moments.last().is_none_or(|(_, last)| *last != shown) {
+            moments.push((i + 1, shown));
+        }
+    }
+    moments
 }
 
 /// The prefix puts the key row up over a live editor, and the next key takes it
@@ -892,6 +935,164 @@ fn a_prefix_raises_the_hint_row_and_the_next_key_takes_it_off() {
 #[test]
 fn the_hint_row_comes_down_through_the_server_without_a_shadow() {
     the_hint_row_goes_up_and_comes_down("hint-no-shadow", false);
+}
+
+/// How often the editor redraws its last row in
+/// [`the_hint_row_stays_over_a_last_row_that_keeps_changing`]: about as often
+/// as a language server reports progress while it indexes, and far enough
+/// apart for a lull between two of them.
+const TICK_MS: u64 = 50;
+
+/// A last row the editor keeps redrawing — a statusline with a language
+/// server's progress in it — does not show through the bar while the prefix
+/// waits: at every moment the terminal could have presented, from the bar
+/// going up to the key that takes it down, the row is the bar, whole.
+///
+/// The row is a statusline with no command line under it (`cmdheight=0`),
+/// one letter the whole way across and the next letter every [`TICK_MS`], so
+/// every cell of the bar is drawn over on every tick. A letter rather than a
+/// digit, because a `%{}` that comes to nothing but digits is read as a
+/// number, and a row of them is one far too big to show. The ticks leave lulls,
+/// so a bar that waits for one goes up between them — which is how it used to
+/// be lost: wiped by the next tick, and put back at the lull after it.
+///
+/// `own` is whose client draws the session. Neovim's brackets nothing here,
+/// since this terminal never answers its `?2026` query, so the bar goes into
+/// a synchronized update nvmux opens around each of the client's writes;
+/// nvmux's own brackets every frame, and the bar goes in front of the
+/// frame's close.
+fn the_hint_row_stays_over_a_last_row_that_keeps_changing(tag: &str, own: bool) {
+    require_nvim!();
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(&common::unique(tag), &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    let mut editor = nvmux::rpc::Client::connect(&sock, Duration::from_secs(3)).expect("connect");
+    // No 'showcmd', for the reason the test above gives.
+    for cmd in [
+        "let g:n = 0",
+        "set noshowcmd laststatus=2 cmdheight=0 \
+         statusline=%{repeat(nr2char(97+g:n%26),winwidth(0))}",
+    ] {
+        editor.command(cmd).expect(cmd);
+    }
+    let mut ticks = || {
+        editor
+            .eval("g:n")
+            .ok()
+            .and_then(|n| n.as_u64())
+            .expect("the tick count")
+    };
+
+    let mut term = Terminal::spawn_child(
+        &sock,
+        &session.id,
+        Protocol::Kitty,
+        Asks {
+            shadow: true,
+            own,
+            ..Asks::default()
+        },
+    );
+    // One letter across the whole row: the statusline, as the editor has it.
+    let ticking = |row: &str| {
+        row.len() == usize::from(COLS)
+            && row
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() && row.starts_with(b as char))
+    };
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| {
+            ticking(&row_on_screen(out, ROWS - 1))
+        }),
+        "the statusline never reached the last row; it says {:?}, and the child wrote: {}",
+        row_on_screen(&term.output, ROWS - 1),
+        term.since(0)
+    );
+    nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
+        .expect("connect")
+        .command(&format!(
+            "lua vim.fn.timer_start({TICK_MS}, function() \
+             vim.g.n = vim.g.n + 1 vim.cmd.redrawstatus() end, {{ ['repeat'] = -1 }})"
+        ))
+        .expect("start the ticks");
+
+    term.type_bytes(&[nvmux::keys::PREFIX]);
+    let pressed = term.output.len();
+    assert!(
+        term.pump_until(Duration::from_secs(10), |out| {
+            row_on_screen(out, ROWS - 1).contains("␣ picker")
+        }),
+        "the prefix put no hint row over the statusline; it says {:?}, and the child wrote: {}",
+        row_on_screen(&term.output, ROWS - 1),
+        term.since(pressed)
+    );
+    let before = ticks();
+    term.pump_until(Duration::from_millis(20 * TICK_MS), |_| false);
+    let after = ticks();
+    // What the relay wrote before the key that takes the bar down: all of it
+    // was written with the bar wanted up.
+    let resolved = term.output.len();
+    assert!(
+        after >= before + 10,
+        "the statusline was not redrawn under the bar ({before} ticks, then {after}), \
+         so this shows nothing"
+    );
+
+    let moments = presented(&term.output[..resolved], ROWS - 1);
+    let up = moments
+        .iter()
+        .position(|(at, row)| *at > pressed && row.contains("␣ picker"))
+        .expect("the bar was on the screen a moment ago");
+    let bar = &moments[up].1;
+    assert!(
+        bar.contains("d detach") && bar.contains("1-n session"),
+        "the bar went up only in part: {bar:?}"
+    );
+    let through: Vec<&str> = moments[up + 1..]
+        .iter()
+        .map(|(_, row)| row.as_str())
+        .collect();
+    assert!(
+        through.is_empty(),
+        "the statusline showed through the bar {} times while the prefix waited; \
+         the bar is {bar:?}, and the row was presented as {:#?}, and so on",
+        through.len(),
+        &through[..through.len().min(3)]
+    );
+
+    // A second prefix is a literal, and takes the bar down; the editor's row,
+    // still ticking, is what is left.
+    term.type_bytes(&[nvmux::keys::PREFIX]);
+    assert!(
+        term.pump_until(Duration::from_secs(10), |out| {
+            ticking(&row_on_screen(out, ROWS - 1))
+        }),
+        "the statusline did not come back from under the bar: {:?}; the child wrote: {}",
+        row_on_screen(&term.output, ROWS - 1),
+        term.since(resolved)
+    );
+
+    assert_eq!(
+        detach(&mut term),
+        Some(0),
+        "the relay did not survive the bar; the child wrote: {}",
+        term.since(resolved)
+    );
+}
+
+/// Neovim's own client, whose writes nvmux has to hold together with the bar.
+#[test]
+fn the_hint_row_stays_over_a_last_row_that_keeps_changing_under_neovims_client() {
+    the_hint_row_stays_over_a_last_row_that_keeps_changing("hint-tick", false);
+}
+
+/// nvmux's own client, the default, which brackets its frames itself.
+#[test]
+fn the_hint_row_stays_over_a_last_row_that_keeps_changing_under_its_own_client() {
+    the_hint_row_stays_over_a_last_row_that_keeps_changing("hint-tick-own", true);
 }
 
 /// A command `[keys.bind]` moves runs on its new key through a real client, and
