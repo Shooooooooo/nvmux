@@ -158,21 +158,22 @@ nvmux.
 
 ### A wide terminal
 
-On a terminal wider than the editor's windows need, nvmux's own client
-centres the editor. Neovim gets only as many columns as its windows side by
-side want — `window_width` each, 120 by default; a window that keeps its
-width, such as a file tree, its own; and a column between each two — and the
-rest of the terminal is margin, in the editor's background, with the status
-lines running on through it to the terminal's edges. A split widens the
-editor to make room a moment after Neovim lays it out, and closing a window
-narrows it again; enough windows side by side take the whole terminal, as
-they would without it.
+On a terminal wider than its windows need, nvmux's own client centres the
+editor, as wide as its windows side by side want — `window_width` columns
+each, 120 by default — until they fill the terminal. `<prefix> w` goes from
+one way to the next while nvmux runs:
 
-`centre = "windows"` leaves the editor the whole terminal and centres the
-text in each window wider than `window_width` instead: its lines wrap at that
-width, and its status line's words stand over it. `"off"` leaves both alone,
-and `<prefix> w` goes from one to the next while nvmux runs. Neovim's own
-client (`ui = "nvim"`) draws on the whole terminal whatever this says.
+`centre = "editor"`, the default:
+
+![Two windows side by side in the middle of a wide terminal, code on the left and a page of prose on the right, with a margin either side that their status lines run on through to the terminal's edges](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-editor.png)
+
+`centre = "windows"`, each window's text centred in it instead:
+
+![The same two windows sharing the whole terminal, the code and the prose each in the middle of its own window, with the words of its status line over it](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-windows.png)
+
+`centre = "off"`, neither:
+
+![The same two windows sharing the whole terminal, the code and the prose at the left of each, the prose in lines as long as its window is wide](https://raw.githubusercontent.com/Shooooooooo/nvmux/main/assets/wide-off.png)
 
 ### What a session has to say
 

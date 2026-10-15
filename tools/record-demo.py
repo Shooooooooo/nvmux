@@ -697,8 +697,8 @@ class Screen:
 class Terminal:
     """A program on a pty: answers what it asks, records what it writes."""
 
-    def __init__(self, argv, env, record=False):
-        self.screen = Screen()
+    def __init__(self, argv, env, record=False, size=(COLS, ROWS)):
+        self.screen = Screen(*size)
         self.lock = threading.Lock()
         self.events = []
         self.presses = []
@@ -710,7 +710,7 @@ class Terminal:
         if self.pid == 0:
             os.execvpe(argv[0], argv, env)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ,
-                    struct.pack("HHHH", ROWS, COLS, 0, 0))
+                    struct.pack("HHHH", size[1], size[0], 0, 0))
         self.reader = threading.Thread(target=self._read_loop, daemon=True)
         self.reader.start()
 
@@ -1608,13 +1608,13 @@ def retime(events, presses, limit=IDLE_LIMIT):
     return out, moved
 
 
-def write_cast(events, path, end):
+def write_cast(events, path, end, size=(COLS, ROWS)):
     """The cast agg draws from, running to `end` -- agg will not draw a
     moment past its last event, so an empty one closes it there."""
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     with open(path, "w") as f:
         f.write(json.dumps({
-            "version": 2, "width": COLS, "height": ROWS,
+            "version": 2, "width": size[0], "height": size[1],
             "theme": THEME,
             "env": {"TERM": "xterm-256color"},
         }) + "\n")
