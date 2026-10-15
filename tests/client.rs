@@ -57,6 +57,8 @@ struct Terminal {
     answered: usize,
     /// What this terminal answers a DA1 with.
     da1: &'static [u8],
+    /// Its size: columns, rows.
+    size: (u16, u16),
     incoming: mpsc::Receiver<Vec<u8>>,
     // Held so the pty outlives the child; dropped last.
     _master: Box<dyn portable_pty::MasterPty>,
@@ -70,10 +72,16 @@ impl Terminal {
 
     /// [`Terminal::spawn`], on a terminal that answers DA1 with `da1`.
     fn spawn_answering(sock: &Path, config: &Path, da1: &'static [u8]) -> Self {
+        Self::spawn_sized(sock, config, da1, (COLS, ROWS))
+    }
+
+    /// [`Terminal::spawn_answering`], on a terminal `size` big: columns,
+    /// rows.
+    fn spawn_sized(sock: &Path, config: &Path, da1: &'static [u8], size: (u16, u16)) -> Self {
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize {
-                rows: ROWS,
-                cols: COLS,
+                rows: size.1,
+                cols: size.0,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -111,9 +119,10 @@ impl Terminal {
             exited: None,
             writer,
             output: Vec::new(),
-            parser: vt100::Parser::new(ROWS, COLS, 0),
+            parser: vt100::Parser::new(size.1, size.0, 0),
             answered: 0,
             da1,
+            size,
             incoming,
             _master: pair.master,
         }
@@ -183,9 +192,9 @@ impl Terminal {
     /// The screen as text, a row to a line, trailing blanks trimmed.
     fn text(&self) -> String {
         let screen = self.parser.screen();
-        (0..ROWS)
+        (0..self.size.1)
             .map(|row| {
-                let line: String = (0..COLS)
+                let line: String = (0..self.size.0)
                     .map(|col| match screen.cell(row, col) {
                         Some(cell) if cell.has_contents() => cell.contents(),
                         _ => " ",
@@ -1390,4 +1399,79 @@ fn predicted_rows_wear_the_colours_neovim_gives_them() {
     typed(&mut term, b"\x1b");
     step(&mut term, "<C-f> past a line typed", b"\x06");
     step(&mut term, "<C-b> back over it", b"\x02");
+}
+
+/// Whether each of the first `rows` rows of a screen shows `line 1` on, a
+/// line a row, in each of `windows` side by side.
+fn lines_in(screen: &str, rows: usize, windows: usize) -> bool {
+    let lines: Vec<&str> = screen.lines().collect();
+    (0..rows).all(|r| {
+        let text = format!("line {}", r + 1);
+        lines.get(r).is_some_and(|l| {
+            let shown: Vec<&str> = l.split('│').map(str::trim_end).collect();
+            shown.len() == windows && shown.iter().all(|s| *s == text)
+        })
+    })
+}
+
+/// A session of eleven lines drawn by a client `first` big — columns, rows —
+/// in `windows` side by side, and then by one `second` big: drawn whole by
+/// the second.
+fn drawn_again_at(tag: &str, windows: usize, first: (u16, u16), second: (u16, u16)) {
+    let scratch = Scratch::new(tag);
+    let (sock, mut rpc, config) = session(&scratch, tag);
+    rpc.command("setlocal noswapfile | call setline(1, map(range(1, 11), '\"line \" . v:val'))")
+        .expect("setline");
+    // Every window drawn on a screen `size` big: as many rows of text as
+    // there are lines, or all but its status line and the command line's.
+    let drawn = |size: (u16, u16), s: &str| lines_in(s, usize::from(size.1 - 2).min(11), windows);
+
+    let mut term = Terminal::spawn_sized(&sock, &config, DA1_REPLY, first);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.starts_with("line 1")),
+        "the first client never drew it:\n{}",
+        term.text()
+    );
+    // Split once it is drawn: split before the client attaches, the split is
+    // laid out for Neovim's own width, and the client's widens the right.
+    for _ in 1..windows {
+        rpc.command("vsplit").expect("vsplit");
+    }
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| drawn(first, s)),
+        "the first client never drew every window:\n{}",
+        term.text()
+    );
+    assert_eq!(term.hang_up(), Some(0), "the first client's exit");
+    assert!(
+        common::wait_until(Duration::from_secs(5), || rpc.list_uis().ok() == Some(0)),
+        "the first client stayed attached"
+    );
+
+    let mut term = Terminal::spawn_sized(&sock, &config, DA1_REPLY, second);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| drawn(second, s)),
+        "the second client never drew every window whole:\n{}",
+        term.text()
+    );
+    assert_eq!(term.hang_up(), Some(0), "the second client's exit");
+}
+
+/// A client on a terminal taller than the last one to draw the session.
+/// Neovim keeps each window's grid from one UI to the next, and a resize
+/// keeps the rows it had as they were: of a window the client is sent its
+/// new place and the rows it gained, and nothing of the rows above them,
+/// which have not changed. It draws every row of every window all the same.
+#[test]
+fn a_client_taller_than_the_last_draws_every_window_whole() {
+    require_nvim!();
+    drawn_again_at("client-taller", 2, (160, 12), (160, 20));
+}
+
+/// The same on a terminal wider than the last: of every row the client is
+/// sent only the columns the window gained, to the right of its text.
+#[test]
+fn a_client_wider_than_the_last_draws_its_window_whole() {
+    require_nvim!();
+    drawn_again_at("client-wider", 1, (160, 12), (200, 12));
 }

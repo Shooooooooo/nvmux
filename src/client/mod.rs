@@ -63,14 +63,17 @@
 //! A UI attaching with `ext_multigrid` to a session another UI has drawn is
 //! sent no window at all, besides: no placement, and nothing drawn on its
 //! grid. Neovim keeps a window's grid from one UI to the next and sends its
-//! cells only when they change, and nothing has. So the client asks where
-//! every window it is told of is ([`LAYOUT_LUA`]), and has Neovim draw the
-//! windows afresh by having it put them on grid 1 and back: a second
-//! connection attaches a UI without `ext_multigrid` for as long as Neovim
-//! takes to draw for it, and goes ([`refresh`]). The windows of a tab page
-//! the client has not seen are the same, the first time it is shown. Drawing
-//! waits for both, for up to [`HOLD_LIMIT`], so that what the terminal shows is
-//! the editor whole.
+//! cells only when they change, and nothing has. On a terminal of another
+//! size than that UI's, a window Neovim resizes is placed again, and drawn
+//! only where the resize added to it: under the rows it kept, or to the
+//! right of each of them. So the client asks where every window it is told
+//! of is ([`LAYOUT_LUA`]), and while Neovim has yet to draw every cell of one
+//! for it ([`model::Model::lacking`]), has Neovim draw the windows afresh by
+//! having it put them on grid 1 and back: a second connection attaches a UI
+//! without `ext_multigrid` for as long as Neovim takes to draw for it, and
+//! goes ([`refresh`]). The windows of a tab page the client has not seen are
+//! the same, the first time it is shown. Drawing waits for both, for up to
+//! [`HOLD_LIMIT`], so that what the terminal shows is the editor whole.
 //!
 //! Two things the windows' animations need are not in what Neovim draws for a
 //! UI at all: which buffer a window shows — a window switching buffers fades
@@ -172,8 +175,8 @@ const RECHECK: Duration = Duration::from_millis(30);
 /// long before one that came to nothing is tried again.
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How many times a window is refreshed for, at most, before it is drawn
-/// blank: Neovim does not draw for a UI attaching while it waits for Enter.
+/// How many times a window is refreshed for, at most, before it is drawn as
+/// it is: Neovim does not draw for a UI attaching while it waits for Enter.
 const REFRESH_TRIES: u8 = 2;
 
 /// Who else is attached: `{ foreign, passing }` — a UI but this one without
@@ -935,8 +938,8 @@ pub struct App {
     unsettled: bool,
     /// Layouts asked for and not answered.
     placing: usize,
-    /// The window grids to be seen with nothing on them, as of the last
-    /// flush, and the refreshes asked for them.
+    /// The window grids to be seen that Neovim has yet to draw every cell of,
+    /// as of the last flush, and the refreshes asked for them.
     lacking: Vec<u64>,
     refreshed: HashMap<u64, Refreshed>,
     /// A refresh is to be started: see [`App::take_refresh`].
@@ -1583,9 +1586,9 @@ impl App {
         self.dirty = true;
     }
 
-    /// What a multigrid attach still lacks after a flush: windows with
-    /// nothing drawn on them, which a refresh is for, and windows nowhere,
-    /// which a layout is asked for. See the module docs.
+    /// What a multigrid attach still lacks after a flush: windows not drawn
+    /// whole, which a refresh is for, and windows nowhere, which a layout is
+    /// asked for. See the module docs.
     fn inspect(&mut self, now: Instant) {
         self.lacking = self.model.lacking();
         let lacking = &self.lacking;
@@ -1598,7 +1601,7 @@ impl App {
                 Some(r) => r.tries < REFRESH_TRIES && now >= r.at + REFRESH_TIMEOUT,
             });
         if due {
-            tracing::debug!(grids = ?self.lacking, "client: windows with nothing on them; refreshing");
+            tracing::debug!(grids = ?self.lacking, "client: windows not drawn whole; refreshing");
             for grid in &self.lacking {
                 let r = self
                     .refreshed
@@ -2776,6 +2779,11 @@ mod tests {
     /// A `grid_line` of `text` from the start of a row: a cell a character,
     /// the first naming the highlight and the rest carrying it on.
     fn line(grid: u64, row: u64, text: &str) -> (&'static str, Vec<Value>) {
+        line_at(grid, row, 0, text)
+    }
+
+    /// [`line`], from column `col`.
+    fn line_at(grid: u64, row: u64, col: u64, text: &str) -> (&'static str, Vec<Value>) {
         let cells = text
             .chars()
             .enumerate()
@@ -2792,17 +2800,56 @@ mod tests {
             vec![
                 grid.into(),
                 row.into(),
-                0.into(),
+                col.into(),
                 Value::Array(cells),
                 false.into(),
             ],
         )
     }
 
+    /// What Neovim draws of a grid `width` × `height` it has just made: every
+    /// cell of it, `rows` from the top and blanks after them.
+    fn whole(
+        grid: u64,
+        width: usize,
+        height: usize,
+        rows: &[impl AsRef<str>],
+    ) -> Vec<(&'static str, Vec<Value>)> {
+        (0..height)
+            .map(|r| {
+                let text = rows.get(r).map_or("", AsRef::as_ref);
+                line(grid, r as u64, &format!("{text:width$}"))
+            })
+            .collect()
+    }
+
     fn resize(grid: u64, width: u64, height: u64) -> (&'static str, Vec<Value>) {
         (
             "grid_resize",
             vec![grid.into(), width.into(), height.into()],
+        )
+    }
+
+    /// A `win_pos`: window `win`'s grid `grid`, at `row`, `col` and `width`
+    /// by `height`.
+    fn place(
+        grid: u64,
+        win: i64,
+        row: u64,
+        col: u64,
+        width: u64,
+        height: u64,
+    ) -> (&'static str, Vec<Value>) {
+        (
+            "win_pos",
+            vec![
+                grid.into(),
+                win.into(),
+                row.into(),
+                col.into(),
+                width.into(),
+                height.into(),
+            ],
         )
     }
 
@@ -3025,7 +3072,11 @@ mod tests {
         assert!(!a.due(t0), "the windows have nothing on them yet");
         redraw(
             &mut a,
-            vec![line(2, 0, "right"), line(4, 0, "bar"), line(4, 1, "left")],
+            [
+                whole(2, 9, 5, &["right"]),
+                whole(4, 10, 5, &["bar", "left"]),
+            ]
+            .concat(),
             t0,
         );
         assert!(a.due(t0));
@@ -3036,6 +3087,45 @@ mod tests {
         assert_eq!(rows, ["bar        right    ", "left                "]);
         assert_eq!(a.model.margins(4).top, 1, "the winbar, as the layout said");
         assert_eq!(a.model.cursor_on_screen(), (1, 0));
+    }
+
+    /// Attached on a terminal taller than the last UI's, or wider, a window
+    /// Neovim kept from that UI comes resized and placed, and drawn on only
+    /// where the resize added to it: its last rows, or the last columns of
+    /// every row. The rest Neovim takes the client to have as that UI did.
+    /// It is refreshed, nothing is drawn until it is in whole, and then all
+    /// of it is.
+    #[test]
+    fn a_window_drawn_only_where_it_grew_is_waited_for() {
+        let t0 = Instant::now();
+        let taller: Vec<_> = (3..5).map(|r| line(2, r, &" ".repeat(20))).collect();
+        let wider: Vec<_> = (0..5).map(|r| line_at(2, r, 12, &" ".repeat(8))).collect();
+        for (grew, drawn) in [("taller", taller), ("wider", wider)] {
+            let mut a = app(true);
+            a.start();
+            let uis_id = asks_uis(&calls(&mut a));
+            answer(&mut a, uis_id, uis(false, false), t0);
+            calls(&mut a);
+            let mut events = vec![
+                resize(1, 20, 6),
+                resize(2, 20, 5),
+                place(2, 1000, 0, 0, 20, 5),
+            ];
+            events.extend(drawn);
+            redraw(&mut a, events, t0);
+            assert!(a.take_refresh(), "{grew}: a refresh, for what it kept");
+            assert!(!a.due(t0), "{grew}: and the frame held for it");
+            assert!(
+                calls(&mut a).iter().all(|(_, m, _)| m != "nvim_exec_lua"),
+                "{grew}: placed, so no layout asked"
+            );
+
+            // What the refresh has Neovim draw: every cell of it.
+            redraw(&mut a, whole(2, 20, 5, &["kept from before"]), t0);
+            assert!(a.due(t0), "{grew}: drawn once it is whole");
+            assert!(!a.take_refresh(), "{grew}: nothing lacking now");
+            assert_eq!(top_row(&a), "kept from before", "{grew}");
+        }
     }
 
     /// A layout that never answers keeps the screen from being drawn for a
@@ -3100,26 +3190,10 @@ mod tests {
     fn a_ui_passing_through_is_waited_out() {
         let t0 = Instant::now();
         let mut a = attached(false, t0);
-        redraw(
-            &mut a,
-            vec![
-                resize(2, 10, 5),
-                line(2, 0, "x"),
-                viewport(2, 1000),
-                (
-                    "win_pos",
-                    vec![
-                        2.into(),
-                        1000.into(),
-                        0.into(),
-                        0.into(),
-                        10.into(),
-                        5.into(),
-                    ],
-                ),
-            ],
-            t0,
-        );
+        let mut events = vec![resize(2, 10, 5)];
+        events.extend(whole(2, 10, 5, &["x"]));
+        events.extend([viewport(2, 1000), place(2, 1000, 0, 0, 10, 5)]);
+        redraw(&mut a, events, t0);
         assert!(
             a.due(t0),
             "a session drawn for this client: nothing lacking"
@@ -3172,7 +3246,9 @@ mod tests {
         );
         assert!(a.take_refresh());
         assert!(!a.due(t0));
-        redraw(&mut a, vec![resize(6, 20, 4), line(6, 0, "tab two")], t0);
+        let mut events = vec![resize(6, 20, 4)];
+        events.extend(whole(6, 20, 4, &["tab two"]));
+        redraw(&mut a, events, t0);
         assert!(a.due(t0));
     }
 
@@ -3226,7 +3302,8 @@ mod tests {
             ("grid_cursor_goto", vec![2.into(), 0.into(), 0.into()]),
             at(0, 0, 0),
         ];
-        events.extend((0..5).map(|r| line(2, r, &format!("line {r}"))));
+        let rows: Vec<String> = (0..5).map(|r| format!("line {r}")).collect();
+        events.extend(whole(2, 20, 5, &rows));
         redraw(&mut a, events, t0 + rtt);
         let notify = |a: &mut App, params: Vec<Value>| {
             let v = Value::Array(vec![2.into(), "nvmux_client".into(), Value::Array(params)]);

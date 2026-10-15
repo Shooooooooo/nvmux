@@ -75,10 +75,14 @@ pub struct Grid {
     width: usize,
     height: usize,
     cells: Vec<Cell>,
-    /// Anything has been drawn on it: a `grid_line` or a `grid_clear`. A grid
-    /// Neovim only ever resized is one it thinks the client already has —
-    /// see `super::App` on attaching to a session another UI has drawn.
-    written: bool,
+    /// Which cells Neovim has drawn since the client made the grid, a flag a
+    /// cell like `cells`, and how many it has not. Of a grid Neovim kept from
+    /// a UI before this one it sends only the cells that differ from what it
+    /// holds, which is what that UI was sent: none, the cells a resize added,
+    /// a few that changed since — see `super::App` on attaching to a session
+    /// another UI has drawn.
+    drawn: Vec<bool>,
+    undrawn: usize,
 }
 
 impl Grid {
@@ -87,13 +91,16 @@ impl Grid {
             width,
             height,
             cells: vec![Cell::default(); width * height],
-            written: false,
+            drawn: vec![false; width * height],
+            undrawn: width * height,
         }
     }
 
-    /// Whether Neovim has drawn anything on it.
-    pub fn written(&self) -> bool {
-        self.written
+    /// Whether Neovim has drawn every cell of it since the client made it.
+    /// Of a grid it makes it draws every cell in the flush that makes it, and
+    /// of one it resizes every cell the resize added.
+    pub fn whole(&self) -> bool {
+        self.undrawn == 0
     }
 
     pub fn width(&self) -> usize {
@@ -104,27 +111,34 @@ impl Grid {
         self.height
     }
 
-    /// Change size, keeping what is in the top left. Neovim redraws a grid it
-    /// resizes, so what is kept only matters for the moment before it does.
+    /// Change size, keeping what is in the top left as Neovim keeps it, and
+    /// which of it was drawn. What a resize adds is blank, and not drawn until
+    /// Neovim draws it, which it does straight after; of what the grid kept,
+    /// it sends only what has changed.
     pub fn resize(&mut self, width: usize, height: usize) {
         if (width, height) == (self.width, self.height) {
             return;
         }
         let mut cells = vec![Cell::default(); width * height];
+        let mut drawn = vec![false; width * height];
+        let n = width.min(self.width);
         for r in 0..height.min(self.height) {
-            let n = width.min(self.width);
-            cells[r * width..r * width + n]
-                .clone_from_slice(&self.cells[r * self.width..r * self.width + n]);
+            let (to, from) = (r * width, r * self.width);
+            cells[to..to + n].clone_from_slice(&self.cells[from..from + n]);
+            drawn[to..to + n].copy_from_slice(&self.drawn[from..from + n]);
         }
         self.width = width;
         self.height = height;
         self.cells = cells;
+        self.undrawn = drawn.iter().filter(|d| !**d).count();
+        self.drawn = drawn;
     }
 
     /// Every cell blank, in the default highlight.
     pub fn clear(&mut self) {
         self.cells.fill(Cell::default());
-        self.written = true;
+        self.drawn.fill(true);
+        self.undrawn = 0;
     }
 
     /// Row `r`, or nothing past the last.
@@ -149,20 +163,19 @@ impl Grid {
     /// A `grid_line`: runs of cells from `col` on, each in the highlight it
     /// names or the one before it. What would fall past the edge is dropped.
     pub fn put(&mut self, row: usize, col: usize, runs: &[LineCell]) {
-        self.written = true;
-        if row >= self.height {
+        if row >= self.height || col >= self.width {
             return;
         }
         let base = row * self.width;
         let mut c = col;
         let mut hl = 0;
-        for run in runs {
+        'runs: for run in runs {
             if let Some(h) = run.hl {
                 hl = h;
             }
             for _ in 0..run.repeat {
                 if c >= self.width {
-                    return;
+                    break 'runs;
                 }
                 let cell = &mut self.cells[base + c];
                 cell.text.clone_from(&run.text);
@@ -170,11 +183,21 @@ impl Grid {
                 c += 1;
             }
         }
+        // Nothing to mark of a grid drawn whole, which is nearly every line.
+        if self.undrawn > 0 {
+            for drawn in &mut self.drawn[base + col..base + c] {
+                if !*drawn {
+                    *drawn = true;
+                    self.undrawn -= 1;
+                }
+            }
+        }
     }
 
     /// A `grid_scroll`: the rectangle `top..bot` × `left..right` moves up by
     /// `rows`, or down by minus that. The rows it uncovers keep what they had;
-    /// Neovim fills them with `grid_line` straight after.
+    /// Neovim fills them with `grid_line` straight after. Which cells were
+    /// drawn moves with them.
     pub fn scroll(&mut self, top: usize, bot: usize, left: usize, right: usize, rows: i64) {
         let bot = bot.min(self.height);
         let right = right.min(self.width);
@@ -186,14 +209,12 @@ impl Grid {
         if n >= bot - top {
             return;
         }
+        // Of a grid drawn whole, every cell is drawn wherever it goes.
+        let marked = self.undrawn > 0;
         let mut copy_row = |to: usize, from: usize| {
-            let (to, from) = (to * w, from * w);
-            if to < from {
-                let (a, b) = self.cells.split_at_mut(from);
-                a[to + left..to + right].clone_from_slice(&b[left..right]);
-            } else {
-                let (a, b) = self.cells.split_at_mut(to);
-                b[left..right].clone_from_slice(&a[from + left..from + right]);
+            copy_cells(&mut self.cells, w, to, from, (left, right));
+            if marked {
+                copy_cells(&mut self.drawn, w, to, from, (left, right));
             }
         };
         if rows > 0 {
@@ -204,6 +225,9 @@ impl Grid {
             for r in (top + n..bot).rev() {
                 copy_row(r, r - n);
             }
+        }
+        if marked {
+            self.undrawn = self.drawn.iter().filter(|d| !**d).count();
         }
     }
 
@@ -232,6 +256,25 @@ impl Grid {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+}
+
+/// Columns `left..right` of row `from` copied over those of row `to`, in a
+/// grid's cells, or what it keeps of each, row-major and `width` wide.
+fn copy_cells<T: Clone>(
+    grid: &mut [T],
+    width: usize,
+    to: usize,
+    from: usize,
+    (left, right): (usize, usize),
+) {
+    let (to, from) = (to * width, from * width);
+    if to < from {
+        let (a, b) = grid.split_at_mut(from);
+        a[to + left..to + right].clone_from_slice(&b[left..right]);
+    } else {
+        let (a, b) = grid.split_at_mut(to);
+        b[left..right].clone_from_slice(&a[from + left..from + right]);
     }
 }
 
@@ -317,6 +360,85 @@ mod tests {
         assert_eq!(g.text(), "ab\nde\n  ");
         g.resize(4, 1);
         assert_eq!(g.text(), "ab  ");
+    }
+
+    /// A grid is whole once Neovim has drawn every cell of it, whatever the
+    /// lines it took: a line marks the cells it drew and no others, and a
+    /// clear marks them all.
+    #[test]
+    fn a_grid_is_whole_once_every_cell_is_drawn() {
+        let mut g = Grid::new(3, 2);
+        assert!(!g.whole());
+        g.put(0, 1, &[run("a", Some(1), 5)]);
+        g.put(1, 0, &[run("b", Some(1), 2)]);
+        g.put(2, 0, &[run("c", Some(1), 3)]);
+        assert!(!g.whole(), "two cells to go");
+        g.put(0, 0, &[run("d", None, 1)]);
+        assert!(!g.whole(), "one");
+        g.put(1, 2, &[run("e", None, 1)]);
+        assert!(g.whole());
+        assert_eq!(g.text(), "daa\nbbe");
+
+        let mut g = Grid::new(3, 2);
+        g.clear();
+        assert!(g.whole(), "cleared");
+        assert!(Grid::new(4, 0).whole(), "nothing to draw");
+    }
+
+    /// What a grid kept from another UI and resized is sent: the rows a
+    /// resize added, or the columns, or both; never what it kept. Until that
+    /// is drawn as well it is not whole — nor a grid drawn whole and resized,
+    /// until the cells the resize added are drawn.
+    #[test]
+    fn a_resize_keeps_which_cells_were_drawn() {
+        let mut g = Grid::new(3, 2);
+        g.resize(3, 4);
+        lines(&mut g, &["", "", "ghi", "jkl"]);
+        assert!(!g.whole(), "taller: the rows kept");
+        lines(&mut g, &["abc", "def"]);
+        assert!(g.whole());
+
+        let mut g = Grid::new(3, 2);
+        g.resize(5, 2);
+        g.put(0, 3, &[run("x", Some(1), 2)]);
+        g.put(1, 3, &[run("y", Some(1), 2)]);
+        assert!(!g.whole(), "wider: every row drawn, but only in part");
+        lines(&mut g, &["abc", "def"]);
+        assert!(g.whole());
+        assert_eq!(g.text(), "abcxx\ndefyy");
+
+        g.resize(6, 3);
+        assert!(!g.whole(), "drawn whole, and then resized");
+        g.put(0, 5, &[run("1", Some(1), 1)]);
+        g.put(1, 5, &[run("2", Some(1), 1)]);
+        g.put(2, 0, &[run("3", Some(1), 6)]);
+        assert!(g.whole());
+        g.resize(2, 2);
+        assert!(g.whole(), "smaller: nothing added");
+        assert_eq!(g.text(), "ab\nde");
+    }
+
+    /// Which cells were drawn moves with them in a scroll; the rows it
+    /// uncovers keep theirs, as they keep their cells.
+    #[test]
+    fn a_scroll_moves_which_cells_were_drawn() {
+        let mut g = Grid::new(2, 4);
+        lines(&mut g, &["aa", "bb"]);
+        g.scroll(0, 4, 0, 2, 2);
+        // What Neovim draws after it: the rows it uncovered.
+        lines(&mut g, &["", "", "cc", "dd"]);
+        assert!(!g.whole(), "the rows scrolled up were never drawn");
+        lines(&mut g, &["ee", "ff"]);
+        assert!(g.whole());
+        assert_eq!(g.text(), "ee\nff\ncc\ndd");
+
+        let mut g = Grid::new(2, 3);
+        lines(&mut g, &["aa", "", "cc"]);
+        g.scroll(0, 3, 0, 2, -1);
+        assert!(!g.whole(), "row 1 down to row 2, never drawn");
+        lines(&mut g, &["", "", "yy"]);
+        assert!(g.whole(), "and the row uncovered drawn, as it was");
+        assert_eq!(g.text(), "aa\naa\nyy");
     }
 
     #[test]
