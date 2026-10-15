@@ -91,6 +91,15 @@ pub struct Scratch(pub PathBuf);
 
 impl Scratch {
     pub fn new(tag: &str) -> Self {
+        // A session's socket is made in here, and a socket's path may be 100
+        // bytes long at most (see `nvmux::paths`). On macOS the temporary
+        // directory takes 49 of them, a process id up to five, the counter
+        // below two and the rest of the socket's path 25: a tag longer than
+        // the 19 left passes on Linux and fails there.
+        assert!(
+            tag.len() <= 19,
+            "the tag {tag:?} is too long for a socket's path on macOS"
+        );
         // A plain counter, not `ThreadId`, whose Debug form is `ThreadId(2)`.
         // Parentheses are regex metacharacters, so a directory named that way
         // cannot be matched literally by anything pattern-based later.

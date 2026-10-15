@@ -63,10 +63,12 @@
 //! A UI attaching with `ext_multigrid` to a session another UI has drawn is
 //! sent no window at all, besides: no placement, and nothing drawn on its
 //! grid. Neovim keeps a window's grid from one UI to the next and sends its
-//! cells only when they change, and nothing has — or a few have, which the
-//! client forgets: a window it is not told where to put is one it has none
-//! of until it has all of it. So the client asks where every window it is
-//! told of is ([`LAYOUT_LUA`]), and has Neovim draw the windows afresh by
+//! cells only when they change, and nothing has, or a few have. On a terminal
+//! of another size than that UI's, a window Neovim resizes is placed again,
+//! and drawn only where the resize added to it: under the rows it kept, or to
+//! the right of each of them. So the client asks where every window it is told
+//! of is ([`LAYOUT_LUA`]), and while Neovim has yet to draw every cell of one
+//! for it ([`model::Model::lacking`]), has Neovim draw the windows afresh by
 //! having it put them on grid 1 and back: a second connection attaches a UI
 //! without `ext_multigrid` for as long as Neovim takes to draw for it, and
 //! goes ([`refresh`]). The windows of a tab page the client has not seen are
@@ -175,8 +177,8 @@ const RECHECK: Duration = Duration::from_millis(30);
 /// long before one that came to nothing is tried again.
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How many times a window is refreshed for, at most, before it is drawn
-/// blank: Neovim does not draw for a UI attaching while it waits for Enter.
+/// How many times a window is refreshed for, at most, before it is drawn as
+/// it is: Neovim does not draw for a UI attaching while it waits for Enter.
 const REFRESH_TRIES: u8 = 2;
 
 /// Who else is attached: `{ foreign, passing }` — a UI but this one without
@@ -942,8 +944,8 @@ pub struct App {
     unsettled: bool,
     /// Layouts asked for and not answered.
     placing: usize,
-    /// The window grids to be seen with nothing on them, as of the last
-    /// flush, and the refreshes asked for them.
+    /// The window grids to be seen that Neovim has yet to draw every cell of,
+    /// as of the last flush, and the refreshes asked for them.
     lacking: Vec<u64>,
     refreshed: HashMap<u64, Refreshed>,
     /// A refresh is to be started: see [`App::take_refresh`].
@@ -1223,8 +1225,8 @@ impl App {
     /// `window_width` to have a grid that wide, and for the rest to have
     /// their own width again (see [`wide`]): a window on a tab page not on
     /// show keeps what it has. With the text not centred, every grid asked
-    /// to be narrower is let go of.
-    fn narrow_windows(&mut self) {
+    /// to be narrower is let go of. Says whether it asked Neovim anything.
+    fn narrow_windows(&mut self) -> bool {
         let on = self.centring() == Centre::Windows && self.multigrid();
         let mut want: HashMap<u64, usize> = HashMap::new();
         if on {
@@ -1257,6 +1259,7 @@ impl App {
         );
         asks.sort_unstable();
         self.narrowed = want;
+        let asked = !asks.is_empty();
         for (grid, width) in asks {
             // A height of nought asks for none: the window's own.
             self.outbox.notify(
@@ -1264,14 +1267,17 @@ impl App {
                 &[Arg::Int(grid as i64), Arg::Int(width as i64), Arg::Int(0)],
             );
         }
+        asked
     }
 
     /// Let go of every grid asked to be narrower than its window, as the
     /// client goes: another UI of the session is to see the windows whole.
-    pub fn let_windows_go(&mut self) {
+    /// Says whether there were any.
+    pub fn let_windows_go(&mut self) -> bool {
         let window_width = std::mem::take(&mut self.window_width);
-        self.narrow_windows();
+        let asked = self.narrow_windows();
         self.window_width = window_width;
+        asked
     }
 
     /// `nvim_set_client_info`: an nvmux UI, and whether it wants
@@ -1839,11 +1845,10 @@ impl App {
         self.dirty = true;
     }
 
-    /// What a multigrid attach still lacks after a flush: windows with
-    /// nothing drawn on them, which a refresh is for, and windows nowhere,
-    /// which a layout is asked for. See the module docs.
+    /// What a multigrid attach still lacks after a flush: windows not drawn
+    /// whole, which a refresh is for, and windows nowhere, which a layout is
+    /// asked for. See the module docs.
     fn inspect(&mut self, now: Instant) {
-        self.model.forget_kept();
         self.lacking = self.model.lacking();
         let lacking = &self.lacking;
         self.refreshed.retain(|grid, _| lacking.contains(grid));
@@ -1855,7 +1860,7 @@ impl App {
                 Some(r) => r.tries < REFRESH_TRIES && now >= r.at + REFRESH_TIMEOUT,
             });
         if due {
-            tracing::debug!(grids = ?self.lacking, "client: windows with nothing on them; refreshing");
+            tracing::debug!(grids = ?self.lacking, "client: windows not drawn whole; refreshing");
             for grid in &self.lacking {
                 let r = self
                     .refreshed
@@ -2883,10 +2888,46 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
     };
     // Whatever ended it, the terminal is handed back as it was — and the
     // windows their own width, for whoever else draws them.
-    app.let_windows_go();
-    let _ = app.outbox.send(&mut stream);
+    if app.let_windows_go() {
+        leave(stream, inbox, std::mem::take(&mut app.outbox));
+    } else {
+        let _ = app.outbox.send(&mut stream);
+    }
     let _ = crate::term::write_stdout(term::CLOSING);
     outcome
+}
+
+/// How long a client on its way out waits for Neovim to have done what it
+/// last asked (see [`leave`]): well inside the two seconds nvmux gives a
+/// client it hangs up before killing it.
+const LEAVE_WAIT: Duration = Duration::from_millis(500);
+
+/// Send what is queued on the way out, and wait for Neovim to have done it,
+/// for up to [`LEAVE_WAIT`]. Neovim queues what a channel asks of it, and
+/// throws away what is still queued once it has read the channel's end
+/// (`request_event` in its `msgpack_rpc/channel.c`): a client that goes the
+/// moment it has asked can have its last asks dropped — under load, one time
+/// in four. So a request goes after them, queued as they are, and its answer
+/// says they are done.
+fn leave(stream: UnixStream, inbox: Inbox, mut out: Outbox) {
+    let fence = out.request("nvim_eval", &[Arg::str("0")]);
+    // Blocking last, so that it never blocks without the timeouts.
+    let blocking = stream.set_read_timeout(Some(LEAVE_WAIT)).is_ok()
+        && stream.set_write_timeout(Some(LEAVE_WAIT)).is_ok()
+        && stream.set_nonblocking(false).is_ok();
+    let mut line = Line {
+        stream,
+        inbox,
+        out,
+        deadline: Instant::now() + LEAVE_WAIT,
+    };
+    if !blocking {
+        let _ = line.out.send(&mut line.stream);
+        return;
+    }
+    if let Err(e) = line.answer(fence, |_| ()) {
+        tracing::debug!(error = %e, "client: Neovim did not answer on the way out");
+    }
 }
 
 /// Have Neovim draw the windows of the current tab page afresh for the UIs
@@ -2974,7 +3015,8 @@ fn refresh_now(sock: &Path, (w, h): (usize, usize)) -> std::io::Result<()> {
 /// see [`refresh_now`].
 const REFRESH_MAX_UIS: usize = 4;
 
-/// A refresh's own connection: blocking, and given until `deadline`.
+/// A connection used blocking, and given until `deadline`: a refresh's own,
+/// or the client's on its way out.
 struct Line {
     stream: UnixStream,
     inbox: Inbox,
@@ -3145,6 +3187,11 @@ mod tests {
     /// A `grid_line` of `text` from the start of a row: a cell a character,
     /// the first naming the highlight and the rest carrying it on.
     fn line(grid: u64, row: u64, text: &str) -> (&'static str, Vec<Value>) {
+        line_at(grid, row, 0, text)
+    }
+
+    /// [`line`], from column `col`.
+    fn line_at(grid: u64, row: u64, col: u64, text: &str) -> (&'static str, Vec<Value>) {
         let cells = text
             .chars()
             .enumerate()
@@ -3161,17 +3208,56 @@ mod tests {
             vec![
                 grid.into(),
                 row.into(),
-                0.into(),
+                col.into(),
                 Value::Array(cells),
                 false.into(),
             ],
         )
     }
 
+    /// What Neovim draws of a grid `width` × `height` it has just made: every
+    /// cell of it, `rows` from the top and blanks after them.
+    fn whole(
+        grid: u64,
+        width: usize,
+        height: usize,
+        rows: &[impl AsRef<str>],
+    ) -> Vec<(&'static str, Vec<Value>)> {
+        (0..height)
+            .map(|r| {
+                let text = rows.get(r).map_or("", AsRef::as_ref);
+                line(grid, r as u64, &format!("{text:width$}"))
+            })
+            .collect()
+    }
+
     fn resize(grid: u64, width: u64, height: u64) -> (&'static str, Vec<Value>) {
         (
             "grid_resize",
             vec![grid.into(), width.into(), height.into()],
+        )
+    }
+
+    /// A `win_pos`: window `win`'s grid `grid`, at `row`, `col` and `width`
+    /// by `height`.
+    fn place(
+        grid: u64,
+        win: i64,
+        row: u64,
+        col: u64,
+        width: u64,
+        height: u64,
+    ) -> (&'static str, Vec<Value>) {
+        (
+            "win_pos",
+            vec![
+                grid.into(),
+                win.into(),
+                row.into(),
+                col.into(),
+                width.into(),
+                height.into(),
+            ],
         )
     }
 
@@ -3352,7 +3438,7 @@ mod tests {
     /// Attached to a session another UI drew, a window placed nowhere with a
     /// few cells on it — those that changed since that UI saw it — is as
     /// good as one with nothing: it is refreshed, and the screen waits for
-    /// it, with none of those cells drawn.
+    /// it, none of those cells drawn until the rest are.
     #[test]
     fn a_few_cells_of_a_window_drawn_before_wait_for_the_rest() {
         let t0 = Instant::now();
@@ -3373,13 +3459,6 @@ mod tests {
         );
         assert!(a.take_refresh(), "refreshed, a few cells or none");
         assert!(!a.due(t0), "waited for");
-        assert!(
-            a.model.grids[&2]
-                .row(3)
-                .iter()
-                .all(|c| c.text != grid::Text::Char('l')),
-            "what came is not drawn"
-        );
     }
 
     /// Attached to a session another UI drew, the windows come placed
@@ -3427,7 +3506,11 @@ mod tests {
         assert!(!a.due(t0), "the windows have nothing on them yet");
         redraw(
             &mut a,
-            vec![line(2, 0, "right"), line(4, 0, "bar"), line(4, 1, "left")],
+            [
+                whole(2, 9, 5, &["right"]),
+                whole(4, 10, 5, &["bar", "left"]),
+            ]
+            .concat(),
             t0,
         );
         assert!(a.due(t0));
@@ -3438,6 +3521,45 @@ mod tests {
         assert_eq!(rows, ["bar        right    ", "left                "]);
         assert_eq!(a.model.margins(4).top, 1, "the winbar, as the layout said");
         assert_eq!(a.model.cursor_on_screen(), (1, 0));
+    }
+
+    /// Attached on a terminal taller than the last UI's, or wider, a window
+    /// Neovim kept from that UI comes resized and placed, and drawn on only
+    /// where the resize added to it: its last rows, or the last columns of
+    /// every row. The rest Neovim takes the client to have as that UI did.
+    /// It is refreshed, nothing is drawn until it is in whole, and then all
+    /// of it is.
+    #[test]
+    fn a_window_drawn_only_where_it_grew_is_waited_for() {
+        let t0 = Instant::now();
+        let taller: Vec<_> = (3..5).map(|r| line(2, r, &" ".repeat(20))).collect();
+        let wider: Vec<_> = (0..5).map(|r| line_at(2, r, 12, &" ".repeat(8))).collect();
+        for (grew, drawn) in [("taller", taller), ("wider", wider)] {
+            let mut a = app(true);
+            a.start();
+            let uis_id = asks_uis(&calls(&mut a));
+            answer(&mut a, uis_id, uis(false, false), t0);
+            calls(&mut a);
+            let mut events = vec![
+                resize(1, 20, 6),
+                resize(2, 20, 5),
+                place(2, 1000, 0, 0, 20, 5),
+            ];
+            events.extend(drawn);
+            redraw(&mut a, events, t0);
+            assert!(a.take_refresh(), "{grew}: a refresh, for what it kept");
+            assert!(!a.due(t0), "{grew}: and the frame held for it");
+            assert!(
+                calls(&mut a).iter().all(|(_, m, _)| m != "nvim_exec_lua"),
+                "{grew}: placed, so no layout asked"
+            );
+
+            // What the refresh has Neovim draw: every cell of it.
+            redraw(&mut a, whole(2, 20, 5, &["kept from before"]), t0);
+            assert!(a.due(t0), "{grew}: drawn once it is whole");
+            assert!(!a.take_refresh(), "{grew}: nothing lacking now");
+            assert_eq!(top_row(&a), "kept from before", "{grew}");
+        }
     }
 
     /// A layout that never answers keeps the screen from being drawn for a
@@ -3502,26 +3624,10 @@ mod tests {
     fn a_ui_passing_through_is_waited_out() {
         let t0 = Instant::now();
         let mut a = attached(false, t0);
-        redraw(
-            &mut a,
-            vec![
-                resize(2, 10, 5),
-                line(2, 0, "x"),
-                viewport(2, 1000),
-                (
-                    "win_pos",
-                    vec![
-                        2.into(),
-                        1000.into(),
-                        0.into(),
-                        0.into(),
-                        10.into(),
-                        5.into(),
-                    ],
-                ),
-            ],
-            t0,
-        );
+        let mut events = vec![resize(2, 10, 5)];
+        events.extend(whole(2, 10, 5, &["x"]));
+        events.extend([viewport(2, 1000), place(2, 1000, 0, 0, 10, 5)]);
+        redraw(&mut a, events, t0);
         assert!(
             a.due(t0),
             "a session drawn for this client: nothing lacking"
@@ -3574,7 +3680,9 @@ mod tests {
         );
         assert!(a.take_refresh());
         assert!(!a.due(t0));
-        redraw(&mut a, vec![resize(6, 20, 4), line(6, 0, "tab two")], t0);
+        let mut events = vec![resize(6, 20, 4)];
+        events.extend(whole(6, 20, 4, &["tab two"]));
+        redraw(&mut a, events, t0);
         assert!(a.due(t0));
     }
 
@@ -3628,7 +3736,8 @@ mod tests {
             ("grid_cursor_goto", vec![2.into(), 0.into(), 0.into()]),
             at(0, 0, 0),
         ];
-        events.extend((0..5).map(|r| line(2, r, &format!("line {r}"))));
+        let rows: Vec<String> = (0..5).map(|r| format!("line {r}")).collect();
+        events.extend(whole(2, 20, 5, &rows));
         redraw(&mut a, events, t0 + rtt);
         let notify = |a: &mut App, params: Vec<Value>| {
             let v = Value::Array(vec![2.into(), "nvmux_client".into(), Value::Array(params)]);

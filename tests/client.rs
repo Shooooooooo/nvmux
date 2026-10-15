@@ -49,6 +49,12 @@ struct Terminal {
     /// The exit code, once the child has been seen to exit; it must not be
     /// signalled or waited for again after that.
     exited: Option<u32>,
+    /// The client has been hung up, and what it asks from then on goes
+    /// unanswered: it does not wait for an answer on its way out, and one
+    /// written once it has gone fails on macOS. Neovim asks the terminal
+    /// something whenever a UI attaches, a refresh's among them, so a
+    /// question can come as the client goes.
+    hung_up: bool,
     writer: Box<dyn Write + Send>,
     /// Everything the client has written, in order, and the screen it makes.
     output: Vec<u8>,
@@ -117,6 +123,7 @@ impl Terminal {
         Self {
             child,
             exited: None,
+            hung_up: false,
             writer,
             output: Vec::new(),
             parser: vt100::Parser::new(size.1, size.0, 0),
@@ -166,6 +173,10 @@ impl Terminal {
     /// query may straddle two reads, so the scan starts a little before where
     /// it left off and counts only matches that end past it.
     fn answer(&mut self) {
+        if self.hung_up {
+            self.answered = self.output.len();
+            return;
+        }
         let from = self.answered.saturating_sub(8);
         let mut replies = Vec::new();
         for (query, reply) in [(KITTY_QUERY, KITTY_REPLY), (DA1, self.da1)] {
@@ -209,6 +220,7 @@ impl Terminal {
     /// Hang the client up as nvmux retires one, and say how it exited.
     fn hang_up(&mut self) -> Option<u32> {
         let pid = self.child.process_id().expect("the client's pid");
+        self.hung_up = true;
         nix::sys::signal::kill(Pid::from_raw(pid as i32), Signal::SIGHUP).expect("SIGHUP");
         let deadline = Instant::now() + Duration::from_secs(5);
         while self.exited.is_none() && Instant::now() < deadline {
@@ -1458,13 +1470,29 @@ fn a_wide_terminal_has_the_editor_centred_as_wide_as_its_windows_want() {
         term.text()
     );
     assert_eq!(widths(&mut rpc), columns(60, &[60]));
-    // The status line, under the window: across the terminal.
+    // The status line, under the window: across the terminal. Waited for,
+    // and said of in full where it does not come: macOS has drawn it in the
+    // editor's own background, as Linux has never been seen to.
     let status = Some(vt100::Color::Rgb(0x12, 0x34, 0x56));
     let bg = |t: &Terminal, col: u16| t.parser.screen().cell(10, col).map(vt100::Cell::bgcolor);
-    assert_eq!(
-        (bg(&term, 0), bg(&term, 80), bg(&term, 159)),
-        (status, status, status)
-    );
+    let across = |t: &Terminal| [0, 80, 159].iter().all(|&col| bg(t, col) == status);
+    if !term.pump(Duration::from_secs(5), across) {
+        let cells: Vec<_> = [0, 80, 159]
+            .iter()
+            .map(|&col| {
+                let c = term.parser.screen().cell(10, col);
+                c.map(|c| (c.bgcolor(), c.fgcolor(), c.inverse()))
+            })
+            .collect();
+        let editor = rpc
+            .eval("[&termguicolors, &cmdheight, execute('messages')]")
+            .expect("ask the editor");
+        panic!(
+            "the status line is not its colour across the terminal: {cells:?}; \
+             'termguicolors', 'cmdheight' and the messages: {editor}\n{}",
+            term.text()
+        );
+    }
     let cell = |t: &Terminal, col: u16| t.parser.screen().cell(5, col).map(vt100::Cell::bgcolor);
     assert_eq!(
         cell(&term, 0),
@@ -1500,8 +1528,8 @@ fn a_wide_terminal_has_the_editor_centred_as_wide_as_its_windows_want() {
 #[test]
 fn a_wide_window_has_its_text_centred_in_it() {
     require_nvim!();
-    let scratch = Scratch::new("client-centre-windows");
-    let (mut term, mut rpc, _) = wide(&scratch, "client-centre-windows", "windows");
+    let scratch = Scratch::new("client-centre-text");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-centre-text", "windows");
     // One window, the whole terminal wide, its text in the middle.
     let alone = format!("{}the left window", " ".repeat(50));
     assert!(
@@ -1639,4 +1667,79 @@ fn the_next_client_draws_whole_what_a_centring_one_left() {
         term.text()
     );
     assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
+/// Whether each of the first `rows` rows of a screen shows `line 1` on, a
+/// line a row, in each of `windows` side by side.
+fn lines_in(screen: &str, rows: usize, windows: usize) -> bool {
+    let lines: Vec<&str> = screen.lines().collect();
+    (0..rows).all(|r| {
+        let text = format!("line {}", r + 1);
+        lines.get(r).is_some_and(|l| {
+            let shown: Vec<&str> = l.split('│').map(str::trim_end).collect();
+            shown.len() == windows && shown.iter().all(|s| *s == text)
+        })
+    })
+}
+
+/// A session of eleven lines drawn by a client `first` big — columns, rows —
+/// in `windows` side by side, and then by one `second` big: drawn whole by
+/// the second.
+fn drawn_again_at(tag: &str, windows: usize, first: (u16, u16), second: (u16, u16)) {
+    let scratch = Scratch::new(tag);
+    let (sock, mut rpc, config) = session(&scratch, tag);
+    rpc.command("setlocal noswapfile | call setline(1, map(range(1, 11), '\"line \" . v:val'))")
+        .expect("setline");
+    // Every window drawn on a screen `size` big: as many rows of text as
+    // there are lines, or all but its status line and the command line's.
+    let drawn = |size: (u16, u16), s: &str| lines_in(s, usize::from(size.1 - 2).min(11), windows);
+
+    let mut term = Terminal::spawn_sized(&sock, &config, DA1_REPLY, first);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.starts_with("line 1")),
+        "the first client never drew it:\n{}",
+        term.text()
+    );
+    // Split once it is drawn: split before the client attaches, the split is
+    // laid out for Neovim's own width, and the client's widens the right.
+    for _ in 1..windows {
+        rpc.command("vsplit").expect("vsplit");
+    }
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| drawn(first, s)),
+        "the first client never drew every window:\n{}",
+        term.text()
+    );
+    assert_eq!(term.hang_up(), Some(0), "the first client's exit");
+    assert!(
+        common::wait_until(Duration::from_secs(5), || rpc.list_uis().ok() == Some(0)),
+        "the first client stayed attached"
+    );
+
+    let mut term = Terminal::spawn_sized(&sock, &config, DA1_REPLY, second);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| drawn(second, s)),
+        "the second client never drew every window whole:\n{}",
+        term.text()
+    );
+    assert_eq!(term.hang_up(), Some(0), "the second client's exit");
+}
+
+/// A client on a terminal taller than the last one to draw the session.
+/// Neovim keeps each window's grid from one UI to the next, and a resize
+/// keeps the rows it had as they were: of a window the client is sent its
+/// new place and the rows it gained, and nothing of the rows above them,
+/// which have not changed. It draws every row of every window all the same.
+#[test]
+fn a_client_taller_than_the_last_draws_every_window_whole() {
+    require_nvim!();
+    drawn_again_at("client-taller", 2, (160, 12), (160, 20));
+}
+
+/// The same on a terminal wider than the last: of every row the client is
+/// sent only the columns the window gained, to the right of its text.
+#[test]
+fn a_client_wider_than_the_last_draws_its_window_whole() {
+    require_nvim!();
+    drawn_again_at("client-wider", 1, (160, 12), (200, 12));
 }
