@@ -41,7 +41,10 @@
 //!
 //! None of this is on while there is nothing to draw: `pty` keeps a
 //! `Boundary` only for the life of a notice, which is a second and a bit at
-//! the start of a relay.
+//! the start of a relay, and of the hint bar the prefix puts up
+//! ([`crate::hint`]), from the lull it goes up at to the key that takes it
+//! down — the one row of nvmux's that a session's busiest row, its
+//! statusline, is drawn under.
 //!
 //! # Two things that are not sequences and still say "not here"
 //!
@@ -247,7 +250,8 @@ impl Boundary {
         self.parser.feed(bytes);
     }
 
-    /// Bytes nvmux wrote over the session itself: the notice's own frames.
+    /// Bytes nvmux wrote over the session itself: the notice's own frames,
+    /// and the hint bar.
     ///
     /// Shown for the same reason again — the parser is the terminal's, not
     /// the client's, and what nvmux writes moves it too. Everything nvmux
@@ -257,10 +261,11 @@ impl Boundary {
     ///
     /// What it must *not* do is answer
     /// [`Boundary::session_brackets_its_own_frames`]. Every frame of the
-    /// notice is bracketed in a synchronized update of its own, so a parser
-    /// that learned from these would conclude after the first box that the
-    /// session brackets its frames — and stand the whole mechanism down on
-    /// the strength of nvmux's own handwriting. That is not a hypothetical:
+    /// notice, and every write of the bar, is bracketed in a synchronized
+    /// update of its own, so a parser that learned from these would conclude
+    /// after the first box that the session brackets its frames — and stand
+    /// the whole mechanism down on the strength of nvmux's own handwriting.
+    /// That is not a hypothetical:
     /// it is what this did for its first measurement, which came back at 13%
     /// instead of 100% and was the only reason anybody looked.
     pub fn saw_own(&mut self, bytes: &[u8]) {

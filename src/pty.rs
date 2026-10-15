@@ -29,7 +29,7 @@
 //! ([`crate::boundary`]) is shown the bytes as they go and keeps back the few
 //! at the end of a write that would leave the terminal's parser inside a
 //! sequence — a delay of microseconds, until the client writes the rest of
-//! them, and only while there is a notice on screen to protect.
+//! them, and only while there is a notice or a hint bar on screen to protect.
 //!
 //! A kept client (`[client] per_session`, the default) is watched by two more,
 //! each shown a copy as the shadow is. Its ledger ([`crate::ledger`]) notes
@@ -70,7 +70,10 @@
 //! moments the terminal happens not to present in. And the fade's frames
 //! ([`crate::fade`]), written before the held first paint and after the relay
 //! has stopped. And the hint bar ([`crate::hint`]): the prefix's one-row bar,
-//! written at a lull and put back from the shadow, and never fed to it either.
+//! put up at a lull and from then on kept up as the notice is — written where
+//! the session's bytes leave the terminal between sequences, in the update
+//! that carries them — and put back from the shadow, and never fed to it
+//! either.
 //! And a kept client's screen, painted back from its copy as the client
 //! returns to the front with no fade to dissolve it in (see
 //! [`Attachment::paint_kept_screen`]).
@@ -247,20 +250,20 @@ pub struct Attachment {
     /// The first paint, while it is being kept back from the terminal so it
     /// can dissolve in. `None` once released, and always without a shadow.
     hold: Option<Hold>,
-    /// Where the terminal's parser stands, kept only while there is a notice
-    /// to write over the session (see [`crate::boundary`]). `None` the rest of
-    /// the time, which is the whole of a relay after its first second and a
-    /// bit: the hint bar, the one other thing nvmux writes over a session,
-    /// waits for a lull instead and only asks the parser (`mid_sequence`)
-    /// while one happens to be there for the notice.
+    /// Where the terminal's parser stands, kept only while there is something
+    /// of nvmux's on the session's screen to keep there (see
+    /// [`crate::boundary`]): the notice, or the hint bar, from the lull it goes
+    /// up at to its erase (see [`Attachment::watch_the_terminal`]). `None` the
+    /// rest of the time, which is nearly all of a relay.
     ///
     /// While it is there, **every byte written to the terminal is shown to it
     /// exactly once, and said whose it is**: [`Attachment::relay_output`]
-    /// hands it the session's through `relay`, the notice's frames — nvmux's
-    /// own — say `saw_own`, and the released first paint, the session's by
-    /// another route, says `saw_session`. A byte shown twice moves the parser
-    /// twice; one not shown leaves it describing a terminal that no longer
-    /// exists, and the next thing nvmux draws lands inside a sequence.
+    /// hands it the session's through `relay`, the notice's frames and the
+    /// bar — nvmux's own — say `saw_own`, and the released first paint, the
+    /// session's by another route, says `saw_session`. A byte shown twice
+    /// moves the parser twice; one not shown leaves it describing a terminal
+    /// that no longer exists, and the next thing nvmux draws lands inside a
+    /// sequence.
     boundary: Option<boundary::Boundary>,
     /// A synchronized update nvmux has opened around a relayed write and
     /// still owes the close of. Closed on the pass that opened it unless the
@@ -1215,12 +1218,13 @@ impl Attachment {
     /// Show the terminal what the client wrote — or, while its first paint is
     /// held, keep it and show only the shadow.
     ///
-    /// While a notice is up the chunk goes through the boundary first, which
-    /// keeps back whatever would leave the terminal's parser inside a
-    /// sequence. A few bytes, for as long as it takes the client to write the
-    /// rest of them, and [`crate::boundary`] says why it is worth it: it is
-    /// what lets the notice go back up after *every* write rather than after
-    /// the one read in six that happens to end where a sequence does.
+    /// While a notice or the hint bar is up the chunk goes through the
+    /// boundary first, which keeps back whatever would leave the terminal's
+    /// parser inside a sequence. A few bytes, for as long as it takes the
+    /// client to write the rest of them, and [`crate::boundary`] says why it is
+    /// worth it: it is what lets the notice, or the bar, go back up after
+    /// *every* write rather than after the one read in six that happens to end
+    /// where a sequence does.
     fn relay_output(&mut self, chunk: &[u8], now: Instant) -> std::io::Result<()> {
         self.ledger_saw(chunk);
         if let Some(hold) = self.hold.as_mut() {
@@ -1244,24 +1248,26 @@ impl Attachment {
         self.write_terminal(chunk)
     }
 
-    /// Relay a piece of the session's screen with the notice's own frame
-    /// following it inside one synchronized update.
+    /// Relay a piece of the session's screen with the notice's own frame — or
+    /// the hint bar — following it inside one synchronized update.
     ///
     /// **This is what keeps the notice on the screen rather than merely
-    /// putting it back there.** Writing the box after the session's repaint
-    /// wins nothing on its own: a terminal parses asynchronously and presents
-    /// on its own clock, so what it puts on the glass is whatever prefix of
-    /// the stream it has reached — and most of those prefixes fall in the
-    /// middle of a repaint, with the box wiped and the rewrite not yet
+    /// putting it back there**, and the bar on its row: a statusline redrawn
+    /// under the bar would otherwise be presented over it, every time, for as
+    /// long as the bar took to go back up. Writing the box after the session's
+    /// repaint wins nothing on its own: a terminal parses asynchronously and
+    /// presents on its own clock, so what it puts on the glass is whatever
+    /// prefix of the stream it has reached — and most of those prefixes fall
+    /// in the middle of a repaint, with the box wiped and the rewrite not yet
     /// arrived. Measured on a flight with a starfield in a `:terminal`
     /// buffer: the whole box stood in 10% of them.
     ///
     /// A synchronized update takes the terminal's choice away. Between
     /// `SYNC_BEGIN` and `SYNC_END` it presents nothing, so the only states it
     /// can show are the ones nvmux ends a span on — and nvmux ends every one
-    /// of them with the notice. The span is opened here, in front of the
-    /// session's bytes, and closed by [`Attachment::close_span`] before this
-    /// pass of the relay ends, whether or not a frame of the notice went in
+    /// of them with the notice, or the bar. The span is opened here, in front
+    /// of the session's bytes, and closed by [`Attachment::close_span`] before
+    /// this pass of the relay ends, whether or not anything of nvmux's went in
     /// between.
     ///
     /// `wrap` is false for a client that brackets its own frames, where a
@@ -1286,13 +1292,13 @@ impl Attachment {
         Ok(())
     }
 
-    /// Write the session's own frame close, held back so the notice could be
-    /// put in front of it.
+    /// Write the session's own frame close, held back so the notice, or the
+    /// hint bar, could be put in front of it.
     ///
     /// Called on every pass that could have held one, right after the notice
-    /// has had its chance at the screen — so the sequence is delayed by one
-    /// write of nvmux's and by nothing else, and the frame the session
-    /// presents is the frame with the box in it. See
+    /// and the bar have had their chance at the screen — so the sequence is
+    /// delayed by a write or two of nvmux's and by nothing else, and the frame
+    /// the session presents is the frame with the box, or the bar, in it. See
     /// [`boundary::Boundary::holding_the_sessions_close`].
     fn release_the_sessions_close(&mut self) -> std::io::Result<()> {
         let Some(boundary) = self.boundary.as_mut() else {
@@ -1373,11 +1379,27 @@ impl Attachment {
         self.write_terminal(&ready)
     }
 
-    /// The notice is over. The hint bar still writes over a session, but it
-    /// waits for a lull rather than for the parser, so the terminal's parser
-    /// need not be followed any further — but every byte still being kept on
-    /// its account goes out first, or a client's frame would end a few bytes
-    /// short for the rest of the relay.
+    /// Whether the terminal's parser is being followed: while the notice is
+    /// up, or the hint bar.
+    fn watching(&self) -> bool {
+        self.boundary.is_some()
+    }
+
+    /// Start following the terminal's parser, for the hint bar: from the
+    /// write that puts it up, which it makes at a lull — the one moment
+    /// nothing parsing the session's output knows that the session cannot be
+    /// in the middle of a sequence, and so the one moment a parser that starts
+    /// between sequences starts right. Nothing at all if it is being followed
+    /// already, for the notice.
+    fn watch_the_terminal(&mut self) {
+        self.boundary.get_or_insert_with(boundary::Boundary::new);
+    }
+
+    /// Nothing nvmux draws over the session is up any more — neither the
+    /// notice nor the hint bar — so the terminal's parser need not be followed
+    /// any further: but every byte still being kept on its account goes out
+    /// first, or a client's frame would end a few bytes short for the rest of
+    /// the relay.
     fn stop_watching_the_terminal(&mut self) -> std::io::Result<()> {
         self.close_span()?;
         self.release_the_sessions_close()?;
@@ -3486,23 +3508,7 @@ fn pump(
                     "timing: attach notice over"
                 );
             }
-            // The notice is the only thing that needs the terminal's parser
-            // watched — the hint bar waits for a lull instead — so when it
-            // ends that stops being anybody's business, and whatever was being
-            // kept back to keep a sequence whole goes out with it.
-            if popup.is_none() {
-                attachment.stop_watching_the_terminal()?;
-            }
         }
-
-        // Whatever the notice did or did not do, whatever was held back for
-        // it goes out here, on the pass that held it: the session's own frame
-        // close if it brackets its frames, and otherwise the synchronized
-        // update nvmux opened in front of the write. A terminal left inside
-        // either shows nothing until its own timeout expires. See
-        // [`Attachment::write_session_frame`].
-        attachment.release_the_sessions_close()?;
-        attachment.close_span()?;
 
         // The notice's repaint, if it has answered. Only the fallback waits on
         // this — the repaint itself arrives as the session's own output — so a
@@ -3566,32 +3572,47 @@ fn pump(
         // winch, so the row is the terminal's as it is now, and after the notice,
         // for the reason written down there.
         //
-        // `busy` is the bar's lull rule: the child having spoken this pass, and
-        // a held first paint — a screen the terminal has not been shown a word
-        // of yet — both mean this is no moment to write. The notice's own pass
-        // above shares the first two terms but asks the boundary decoder
-        // instead of waiting for a lull.
-        //
-        // A lull is not enough while the notice is up, though: a tail that ran
-        // out of patience can leave the terminal half way through one of the
-        // session's characters on a pass the session said nothing on.
+        // The pass is the notice's: the child having spoken, and a held first
+        // paint — a screen the terminal has not been shown a word of yet — both
+        // mean the row may have been drawn over. Where the bar may write is the
+        // terminal's parser's to say while it is being followed, which it is
+        // from the moment the bar goes up (below) to the moment it is down: then
+        // the bar goes back up on the very pass the session drew over it, inside
+        // the frame it drew (see the closes below). Before that there is nothing
+        // to ask, and the bar waits for a lull, as it always has to go up.
         //
         // A command that ends the relay has already returned from the block
         // above and never reaches this, which is what stops `<prefix> Space`
         // flashing a bar on its way to the picker.
-        let busy = child_spoke || attachment.hold.is_some() || attachment.mid_sequence();
+        let pass = hint::Pass {
+            wrote: child_spoke || attachment.hold.is_some(),
+            between: attachment
+                .watching()
+                .then(|| attachment.between_sequences()),
+        };
         let now = Instant::now();
         let go = attachment.desk.as_ref().is_some_and(card::Desk::can_go);
         match bar.step(
             now,
-            busy,
+            pass,
             term::terminal_size(),
             prefix.pending(),
             go,
             attachment.shadow.as_ref(),
         ) {
             hint::Act::Idle => {}
-            hint::Act::Write(bytes) => attachment.write_over_session(&bytes)?,
+            hint::Act::Write(bytes) => {
+                // Going up — at a lull, unless the notice has the parser
+                // followed already — and from here on what the session writes
+                // over the row is answered on the pass it is written on,
+                // rather than at the next lull: a statusline redrawn every
+                // tenth of a second, with a language server's progress in it,
+                // never shows through. See [`Attachment::watch_the_terminal`].
+                if bar.is_up() {
+                    attachment.watch_the_terminal();
+                }
+                attachment.write_over_session(&bytes)?;
+            }
             hint::Act::Blanked(bytes) => {
                 // The bar has blanked its row because nothing here knows what
                 // was under it — no shadow, so no copy of those cells anywhere
@@ -3611,6 +3632,32 @@ fn pump(
                 }
             }
         }
+
+        // With nothing of nvmux's on the session's screen — the notice over,
+        // the bar down — what the parser was followed for is nobody's
+        // business, and whatever was being kept back to keep a sequence whole
+        // goes out with it.
+        if popup.is_none() && !bar.is_up() {
+            attachment.stop_watching_the_terminal()?;
+        }
+
+        // Whatever the notice and the bar did or did not do, whatever was held
+        // back for them goes out here, on the pass that held it: the session's
+        // own frame close if it brackets its frames, and otherwise the
+        // synchronized update nvmux opened in front of the write. A terminal
+        // left inside either shows nothing until its own timeout expires. See
+        // [`Attachment::write_session_frame`].
+        //
+        // Here, after the bar, and not straight after the notice, where they
+        // stood while the notice was the one thing written over a session: the
+        // bar is written after the keys, and a frame closed before it is a
+        // frame the terminal may present without it. Nothing between the two
+        // writes to the terminal — the keys go to the client, as does what the
+        // cards tell it — and a key that ends the relay leaves both to the
+        // relay's own way out, which lets them go before anything else is
+        // drawn.
+        attachment.release_the_sessions_close()?;
+        attachment.close_span()?;
 
         // The cards: what the notifier posted, taken — or, for a client that
         // draws none, thrown away — whether the prefix is held, which has the
@@ -4540,6 +4587,55 @@ mod tests {
             !a.span,
             "one frame of its own was enough; nvmux went back to wrapping"
         );
+    }
+
+    /// The hint bar has the terminal followed from the write that puts it up
+    /// to its erase, and what that buys is the place in the session's frame
+    /// the notice had: a statusline redrawn under the bar is a frame whose
+    /// close waits for the bar to be written in front of it.
+    ///
+    /// One parser at a time: asked again while the notice already has one
+    /// following the terminal — part way through a character, here — the bar
+    /// takes that one rather than a new one that would think the terminal
+    /// between sequences.
+    #[test]
+    fn the_bar_has_the_sessions_frames_wait_for_it_while_it_is_up() {
+        let mut a = attached_to("exit 0");
+        assert!(!a.watching(), "followed with nothing on the screen");
+        a.watch_the_terminal();
+        assert!(
+            a.between_sequences(),
+            "a fresh parser starts between sequences"
+        );
+
+        let now = Instant::now();
+        a.relay_output(b"\x1b[?2026h\x1b[40;1Hbuilding... 40%", now)
+            .expect("relay");
+        assert!(
+            !a.between_sequences(),
+            "the bar would go into the middle of the session's frame"
+        );
+        a.relay_output(b"\x1b[?2026l", now).expect("relay");
+        assert!(
+            a.between_sequences(),
+            "the frame went to the terminal without the bar in it"
+        );
+        a.release_the_sessions_close().expect("close");
+
+        // Two thirds of `▀`, kept back, and then let go unfinished.
+        a.relay_output(b"\x1b[40;1H\xe2\x96", now).expect("relay");
+        a.relay_output(b"", now + boundary::KEPT_FOR)
+            .expect("relay");
+        assert!(a.mid_sequence(), "the fixture left the character whole");
+        a.watch_the_terminal();
+        assert!(
+            a.mid_sequence(),
+            "a second watch forgot the character the first was waiting on"
+        );
+
+        a.stop_watching_the_terminal().expect("stop");
+        assert!(!a.watching(), "still followed with the bar down");
+        assert!(a.kept_due().is_none(), "bytes outlived the bar");
     }
 
     /// A held first paint has not reached the terminal, so there is nothing
