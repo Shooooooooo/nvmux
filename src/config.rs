@@ -179,13 +179,13 @@ pub struct ClientSettings {
     /// link. Off, every scroll waits for Neovim.
     pub predict: bool,
     /// What a session does with a terminal wider than its windows need (see
-    /// [`Centre`]): nothing, the default; the editor only as wide as its
-    /// windows want and centred; or each window's text centred in it.
-    /// nvmux's own client only: Neovim's draws on the whole terminal.
+    /// [`Centre`]): nothing, the default; each window's text centred in it;
+    /// or the editor only as wide as its windows want, and centred. nvmux's
+    /// own client only: Neovim's draws on the whole terminal.
     pub centre: Centre,
-    /// The most columns a window's text gets with `centre` on: what each
-    /// window side by side wants of a centred editor, and how wide the text
-    /// is that is centred in a wider window. 0 for no limit, which is
+    /// The most columns a window's text gets with `centre` on: how wide the
+    /// text is that is centred in a wider window, and what each window side
+    /// by side wants of a centred editor. 0 for no limit, which is
     /// `centre = "off"` whatever that says.
     pub window_width: u16,
 }
@@ -211,6 +211,10 @@ pub enum Centre {
     /// The editor is as wide as the terminal, as Neovim's own client has it.
     #[default]
     Off,
+    /// The editor is as wide as the terminal, and a window wider than
+    /// `window_width` has its text that wide, in its middle: its lines wrap
+    /// there, and its status line's words stand over it.
+    Windows,
     /// The editor is only as wide as its windows side by side want — each up
     /// to `window_width`, one that keeps its width (`'winfixwidth'`, as a
     /// file tree does) as wide as it keeps, and a column between each two —
@@ -220,10 +224,6 @@ pub enum Centre {
     /// Neovim has laid the windows out, and with `'equalalways'` the windows
     /// are made the same width again, as Neovim makes them on a split.
     Editor,
-    /// The editor is as wide as the terminal, and a window wider than
-    /// `window_width` has its text that wide, in its middle: its lines wrap
-    /// there, and its status line's words stand over it.
-    Windows,
 }
 
 impl Centre {
@@ -231,8 +231,8 @@ impl Centre {
     pub fn name(self) -> &'static str {
         match self {
             Centre::Off => "off",
-            Centre::Editor => "editor",
             Centre::Windows => "windows",
+            Centre::Editor => "editor",
         }
     }
 }
@@ -1040,7 +1040,7 @@ fn render_default_config(prefix: u8) -> String {
          # per_session  = {per_session:<8}   # keep each session's client; a switch back reuses it\n\
          # lazy         = {lazy:<8}   # start a client on its first visit, not at launch\n\
          # predict      = {predict:<8}   # over a slow link, scrolls show before Neovim answers\n\
-         # centre       = {centre:<8}   # \"editor\": centred on a wide terminal; \"windows\": each window's text\n\
+         # centre       = {centre:<8}   # on a wide terminal: \"windows\" centres each window's text, \"editor\" the editor\n\
          # window_width = {window_width:<8}   # with centre on, the most columns a window's text gets; 0 for no limit\n\
          \n\
          [theme]\n\
@@ -1422,7 +1422,7 @@ mod tests {
     fn nothing_is_centred_unless_told() {
         let c = Settings::default().client;
         assert_eq!((c.centre, c.window_width), (Centre::Off, 120));
-        for way in [Centre::Off, Centre::Editor, Centre::Windows] {
+        for way in [Centre::Off, Centre::Windows, Centre::Editor] {
             let s: Settings =
                 toml::from_str(&format!("[client]\ncentre = \"{}\"\n", way.name())).expect("valid");
             assert_eq!(s.client.centre, way);
