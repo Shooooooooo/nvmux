@@ -202,9 +202,11 @@ pub struct ClientSettings {
     /// middle of the window: a window wider than its text wants has it that
     /// wide, its lines wrapping there and its status line's words standing
     /// over it. A window showing a terminal keeps its whole width: the
-    /// program in it is told its window's width. Off, the default, every
-    /// window's text is as wide as the window, as Neovim's own client draws
-    /// it. nvmux's own client only (see `crate::client::wide`).
+    /// program in it is told its window's width. So does a window whose
+    /// text is in its middle already, as a start screen lays itself out.
+    /// Off, the default, every window's text is as wide as the window, as
+    /// Neovim's own client draws it. nvmux's own client only (see
+    /// `crate::client::wide`).
     pub centre: bool,
     /// How many columns a window's text gets with `centre` on, where
     /// `smart_width` does not judge otherwise. 0 for no limit, which is
@@ -214,8 +216,9 @@ pub struct ClientSettings {
     /// it shows, rather than give every window `window_width`: its buffer's
     /// `'textwidth'` where it has one, and room for its long lines where they
     /// are not wrapped — all of them with `'wrap'` off, and with it on those
-    /// of a Markdown table or code block. A window showing a terminal keeps
-    /// its whole width either way (see `crate::client::wide`).
+    /// of a Markdown table or code block. A window showing a terminal, or
+    /// whose text is in its middle already, keeps its whole width either way
+    /// (see `crate::client::wide`).
     pub smart_width: bool,
 }
 
