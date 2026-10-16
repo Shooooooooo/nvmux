@@ -38,7 +38,9 @@
 //! In nvmux's fade, the way a card comes: over the first half the session
 //! dims, and empties where the panel will be; over the second the panel
 //! comes up out of the background. Going, the other way round. With the fade
-//! off it is at once.
+//! off it is at once. While it is up, the row the bar leaves fades back from
+//! it as the picker's does (see [`crate::ui::settings`]), and frames come at
+//! the fade's pace until it has.
 //!
 //! # Where it does not float
 //!
@@ -222,8 +224,11 @@ pub(super) fn float(
         if !moving && drawn_at != coming.to {
             owed = true;
         }
-        let frame_due = (moving || owed).then(|| {
-            let gap = if moving || !session_drew {
+        // Frames at a frame's pace while anything moves: the panel coming or
+        // going, or a row on it fading back from the bar.
+        let lively = moving || panel.moving();
+        let frame_due = (lively || owed).then(|| {
+            let gap = if lively || !session_drew {
                 fade::FRAME
             } else {
                 SESSION_FRAME
@@ -342,15 +347,16 @@ pub(super) fn float(
             let settle = client.ui != was.ui || client.per_session != was.per_session;
             return Ok(settle.then_some(Outcome::Resettle));
         }
+        let lively = moving || panel.moving();
         let due = last_frame.is_none_or(|last| {
-            let gap = if moving || !session_drew {
+            let gap = if lively || !session_drew {
                 fade::FRAME
             } else {
                 SESSION_FRAME
             };
             now >= last + gap
         });
-        if (moving || owed) && due {
+        if (lively || owed) && due {
             // A frame that could not go out is tried again a frame later.
             last_frame = Some(now);
             let there = coming.at(now);

@@ -40,6 +40,14 @@
 //! does, and the wheel moves the selection a row at a time, stopping at the
 //! ends. A click on a tab opens it. A click ends an edit without keeping it, as
 //! `Esc` does, and the wheel does not. Nothing is dragged.
+//!
+//! # The bar
+//!
+//! The selected row is a bar the block's width, and the row it leaves fades
+//! back from it as the picker's does (see [`super::effects`], and
+//! `[effects.cursor]`), so the bar glides rather than jumps. Only the row just
+//! left fades: a held key moves the fade along with the bar rather than
+//! leaving a tail of them.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -56,6 +64,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::app::Key;
 use super::draw;
+use super::effects::{self, AFTERGLOW};
 use super::prompt::Field;
 use super::setup;
 use crate::config::{self, Settings, ThemeColor};
@@ -214,6 +223,15 @@ struct State {
     clash: Option<Settings>,
     /// The terminal's colours 1 to 6, for `[theme] color`.
     colours: [Rgb; 6],
+    /// The row the bar last left, fading back from it. See [`State::tick`].
+    glow: Option<Glow>,
+}
+
+/// A row the bar has left, and how long ago.
+#[derive(Debug, Clone, Copy)]
+struct Glow {
+    setting: &'static Setting,
+    age: Duration,
 }
 
 impl State {
@@ -231,6 +249,7 @@ impl State {
             armed: false,
             clash: None,
             colours,
+            glow: None,
         }
     }
 
@@ -329,6 +348,51 @@ impl State {
         self.armed = false;
     }
 
+    /// The selected setting, where the selection is a bar that leaves a glow
+    /// behind it: while browsing or finding, not while a value is changed.
+    fn cursor(&self) -> Option<&'static Setting> {
+        (self.mode == Mode::Browse)
+            .then(|| self.current())
+            .flatten()
+    }
+
+    /// If the bar has moved off `was`, start that row fading back from it, as
+    /// the picker's cursor does; whatever was fading before stops. Not for a
+    /// row that is no longer on screen — another tab's, or one a find
+    /// keystroke took — and not with `[effects.cursor]` off.
+    fn glow_from(&mut self, was: Option<&'static Setting>) {
+        if !self.live.effects.cursor_enabled() {
+            return;
+        }
+        let (Some(was), Some(now)) = (was, self.cursor()) else {
+            return;
+        };
+        if std::ptr::eq(was, now) || !self.rows().iter().any(|s| std::ptr::eq(*s, was)) {
+            return;
+        }
+        self.glow = Some(Glow {
+            setting: was,
+            age: Duration::ZERO,
+        });
+    }
+
+    /// Move the row fading back from the bar on by `elapsed`. The clock is
+    /// the caller's, as the picker's is, so the state stays pure.
+    fn tick(&mut self, elapsed: Duration) {
+        if let Some(glow) = &mut self.glow {
+            glow.age += elapsed;
+            if glow.age >= AFTERGLOW {
+                self.glow = None;
+            }
+        }
+    }
+
+    /// Whether a row is fading back from the bar, so the caller draws at a
+    /// frame's pace until it is done.
+    fn glowing(&self) -> bool {
+        self.glow.is_some()
+    }
+
     /// A change this screen made that nvmux would not run on: put back.
     fn refused(&mut self, why: String, running: Settings) {
         self.live = running;
@@ -336,6 +400,13 @@ impl State {
     }
 
     fn on_key(&mut self, press: Press) -> Step {
+        let was = self.cursor();
+        let step = self.on_key_mode(press);
+        self.glow_from(was);
+        step
+    }
+
+    fn on_key_mode(&mut self, press: Press) -> Step {
         self.message = None;
         self.error = None;
         if self.armed {
@@ -657,6 +728,13 @@ impl State {
     }
 
     fn on_mouse(&mut self, gesture: Gesture) -> Step {
+        let was = self.cursor();
+        let step = self.on_mouse_mode(gesture);
+        self.glow_from(was);
+        step
+    }
+
+    fn on_mouse_mode(&mut self, gesture: Gesture) -> Step {
         if matches!(gesture, Gesture::Press(_) | Gesture::Up | Gesture::Down) {
             self.message = None;
             self.error = None;
@@ -848,26 +926,39 @@ pub(super) fn run_on(
         crate::fade::fade_in(terminal, |f| draw(f, &state))?;
     }
     // When the prefix's wait runs out, while it is armed: the clock lives
-    // here, so the state stays pure, as `pty::pump` keeps the relay's.
+    // here, so the state stays pure, as `pty::pump` keeps the relay's. And
+    // when the row the bar left was last moved on, for the same reason.
     let mut armed_until: Option<Instant> = None;
+    let mut ticked = Instant::now();
     loop {
+        tick(&mut state, &mut ticked);
         // The area kept for the mouse: a click is resolved against the screen
         // as it was last drawn, which is the one the user clicked on.
         let area = terminal
             .draw(|f| {
-                draw(f, &state);
-                crate::theme::paint(f.buffer_mut());
+                let area = f.area();
+                paint_on(f.buffer_mut(), area, &state);
             })?
             .area;
 
-        if !event::poll(super::TICK)? {
+        // A frame's wait while a row fades back from the bar, so it fades.
+        let wait = if state.glowing() {
+            crate::fade::FRAME
+        } else {
+            super::TICK
+        };
+        if !event::poll(wait)? {
             if armed_until.is_some_and(|until| Instant::now() >= until) {
                 armed_until = None;
                 state.disarm();
             }
             continue;
         }
-        let step = match event::read()? {
+        let event = event::read()?;
+        // Up to the moment of the event, so a glow it starts starts from
+        // nothing rather than from however long the wait for it took.
+        tick(&mut state, &mut ticked);
+        let step = match event {
             Event::Key(k) if k.kind == KeyEventKind::Press => state.on_key(press(k)),
             Event::Mouse(m) => match gesture(m, hit(&state, area, m.column, m.row)) {
                 Some(g) => state.on_mouse(g),
@@ -885,6 +976,13 @@ pub(super) fn run_on(
             return Ok(());
         }
     }
+}
+
+/// Move whatever is passing on the screen on to now.
+fn tick(state: &mut State, ticked: &mut Instant) {
+    let now = Instant::now();
+    state.tick(now.saturating_duration_since(*ticked));
+    *ticked = now;
 }
 
 /// What follows every key or gesture, wherever the screen is up: the
@@ -997,6 +1095,8 @@ pub struct Panel {
     /// Where the screen's parts were last drawn, which a click is resolved
     /// against: the one the user clicked on.
     drawn: Rect,
+    /// When the row the bar left was last moved on (see [`State::tick`]).
+    ticked: Instant,
 }
 
 impl Panel {
@@ -1008,6 +1108,7 @@ impl Panel {
             remote: REMOTE.load(Ordering::Relaxed),
             armed_until: None,
             drawn: Rect::default(),
+            ticked: Instant::now(),
         }
     }
 
@@ -1016,6 +1117,8 @@ impl Panel {
         if key.kind == KeyEventKind::Release {
             return Did::Stay;
         }
+        // Up to the key, so a glow it starts starts from nothing.
+        self.move_on(now);
         let step = self.state.on_key(press(key));
         self.after(step, now)
     }
@@ -1027,8 +1130,21 @@ impl Panel {
         let Some(g) = gesture(mouse, at) else {
             return Did::Stay;
         };
+        self.move_on(now);
         let step = self.state.on_mouse(g);
         self.after(step, now)
+    }
+
+    /// Whether anything on the panel is moving — a row fading back from the
+    /// bar — so frames come at a frame's pace until it is done.
+    pub fn moving(&self) -> bool {
+        self.state.glowing()
+    }
+
+    /// The row the bar left moved on to `now`.
+    fn move_on(&mut self, now: Instant) {
+        self.state.tick(now.saturating_duration_since(self.ticked));
+        self.ticked = self.ticked.max(now);
     }
 
     fn after(&mut self, step: Step, now: Instant) -> Did {
@@ -1051,24 +1167,26 @@ impl Panel {
         self.armed_until
     }
 
-    /// The prefix's wait ran out with no key after it, if it has by `now`:
-    /// whether that changed anything.
+    /// The panel moved on to `now`: the row the bar left a little further
+    /// back from it, and the prefix's wait run out with no key after it, if
+    /// it has by then. Whether that changed anything.
     pub fn tick(&mut self, now: Instant) -> bool {
+        let glowed = self.state.glowing();
+        self.move_on(now);
         if self.armed_until.is_some_and(|until| now >= until) {
             self.armed_until = None;
             self.state.disarm();
             return true;
         }
-        false
+        glowed
     }
 
     /// The settings drawn into `area`, a buffer of that area, in the theme's
-    /// colour where it has one.
+    /// colour where it has one, and the row the bar left fading back from it.
     pub fn draw(&mut self, area: Rect) -> Buffer {
         let mut buf = Buffer::empty(area);
         self.drawn = inside(area);
-        draw_on(&mut buf, self.drawn, &self.state);
-        crate::theme::paint(&mut buf);
+        paint_on(&mut buf, self.drawn, &self.state);
         buf
     }
 
@@ -1244,9 +1362,55 @@ fn hit(state: &State, area: Rect, column: u16, row: u16) -> Option<Hit> {
     }
 }
 
+/// Where `setting`'s row is drawn on `area`, as wide as the bar is on it, or
+/// `None` when it is not on screen: what the afterglow paints over, measured
+/// by the same layout the rows are drawn with.
+fn row_rect(state: &State, area: Rect, setting: &Setting) -> Option<Rect> {
+    let l = layout(area)?;
+    let i = state
+        .rows()
+        .iter()
+        .position(|s| std::ptr::eq(*s, setting))?;
+    let lines = lines(state);
+    let height = usize::from(l.body.height);
+    let (offset, top) = placed(&lines, state.at(), height);
+    let line = lines.iter().position(|line| *line == Line::Row(i))?;
+    let n = line.checked_sub(offset).filter(|n| top + n < height)?;
+    Some(Rect::new(l.x, l.body.y + (top + n) as u16, l.width, 1))
+}
+
 fn draw(frame: &mut Frame, state: &State) {
     let area = frame.area();
     draw_on(frame.buffer_mut(), area, state);
+}
+
+/// A frame of the screen as it is up: drawn on `area`, the theme's colour on
+/// it, and the row the bar last left fading back from it over all that, as
+/// the picker's passing effects go over its frame (see [`super::effects`]).
+fn paint_on(buf: &mut Buffer, area: Rect, state: &State) {
+    draw_on(buf, area, state);
+    crate::theme::paint(buf);
+    afterglow(buf, area, state, effects::colours().as_ref());
+}
+
+/// The row the bar last left, fading back from it: in colour where the
+/// terminal said what its colours are, and otherwise held reversed and dim
+/// for a moment, as the picker's are.
+fn afterglow(buf: &mut Buffer, area: Rect, state: &State, colours: Option<&effects::Colours>) {
+    let Some(glow) = state.glow else {
+        return;
+    };
+    // Back on the bar: it glows no longer.
+    if state
+        .cursor()
+        .is_some_and(|s| std::ptr::eq(s, glow.setting))
+    {
+        return;
+    }
+    if let Some(rect) = row_rect(state, area, glow.setting) {
+        let progress = glow.age.as_secs_f32() / AFTERGLOW.as_secs_f32();
+        effects::glow(buf, rect, colours, progress);
+    }
 }
 
 /// The screen, drawn on `area` of `buf`: the whole of the terminal, or the
@@ -2310,6 +2474,134 @@ mod tests {
         assert_eq!(panel_area(screen(120, 19)), None, "too short");
     }
 
+    /// Moving the bar leaves the row it was on fading back from it, for the
+    /// picker's afterglow: only the row it last left, each from the start,
+    /// and nothing once the time is up.
+    #[test]
+    fn the_row_the_bar_leaves_fades_back_from_it() {
+        let mut s = on(Tab::Effects);
+        let first = s.current().expect("a row");
+        key(&mut s, KeyCode::Char('j'));
+        let second = s.current().expect("a row");
+        let glow = s.glow.expect("the row left glows");
+        assert!(std::ptr::eq(glow.setting, first));
+        assert_eq!(glow.age, Duration::ZERO);
+        s.tick(AFTERGLOW / 2);
+        assert!(s.glowing(), "half way");
+        key(&mut s, KeyCode::Char('j'));
+        let glow = s.glow.expect("the row just left glows");
+        assert!(std::ptr::eq(glow.setting, second), "only the last row left");
+        assert_eq!(glow.age, Duration::ZERO, "from the start");
+        s.tick(AFTERGLOW);
+        assert!(!s.glowing(), "done");
+    }
+
+    /// No row glows with `[effects.cursor]` off, or every effect; nor when
+    /// the row left is no longer on screen; nor when the bar did not move.
+    #[test]
+    fn no_row_glows_with_the_effect_off_or_the_row_gone() {
+        let mut s = on(Tab::Effects);
+        s.live.effects.cursor.enabled = false;
+        key(&mut s, KeyCode::Char('j'));
+        assert!(!s.glowing(), "[effects.cursor] off");
+        let mut s = on(Tab::Effects);
+        s.live.effects.enabled = false;
+        key(&mut s, KeyCode::Char('j'));
+        assert!(!s.glowing(), "every effect off");
+        let mut s = on(Tab::Keys);
+        key(&mut s, KeyCode::Tab);
+        assert!(!s.glowing(), "the row left is on another tab");
+        let mut s = on(Tab::Keys);
+        key(&mut s, KeyCode::Char('k'));
+        assert!(!s.glowing(), "already on the first row");
+    }
+
+    /// The row left is drawn as the bar was at first — the ink its
+    /// background, the terminal's background its text — and comes back to
+    /// the plain row as the glow runs out. Without colours it is held
+    /// reversed and dim for a moment, and then let go.
+    #[test]
+    fn the_row_left_is_painted_back_from_the_bar() {
+        use ratatui::style::Color;
+        let palette = crate::test_support::palette();
+        let colours = effects::Colours {
+            palette,
+            theme: None,
+        };
+        let area = Rect::new(0, 0, 80, 24);
+        let painted = |s: &State, colours: Option<&effects::Colours>| {
+            let mut buf = Buffer::empty(area);
+            draw_on(&mut buf, area, s);
+            afterglow(&mut buf, area, s, colours);
+            buf
+        };
+        let mut s = on(Tab::Effects);
+        key(&mut s, KeyCode::Char('j'));
+        let left = s.glow.expect("glowing").setting;
+        let rect = row_rect(&s, area, left).expect("on screen");
+
+        let buf = painted(&s, Some(&colours));
+        let (fg, bg) = (palette.fg, palette.bg);
+        for x in rect.x..rect.x + rect.width {
+            assert_eq!(buf[(x, rect.y)].bg, Color::Rgb(fg.0, fg.1, fg.2), "at {x}");
+            assert_eq!(buf[(x, rect.y)].fg, Color::Rgb(bg.0, bg.1, bg.2), "at {x}");
+        }
+        let text: String = (rect.x..rect.x + rect.width)
+            .map(|x| buf[(x, rect.y)].symbol())
+            .collect();
+        assert!(text.contains(left.name), "{text:?}");
+        s.tick(AFTERGLOW * 9 / 10);
+        let buf = painted(&s, Some(&colours));
+        let Color::Rgb(r, g, b) = buf[(rect.x, rect.y)].bg else {
+            panic!("a colour");
+        };
+        let near = |a: u8, b: u8| a.abs_diff(b) <= 8;
+        assert!(
+            near(r, bg.0) && near(g, bg.1) && near(b, bg.2),
+            "nearly plain"
+        );
+
+        let mut s = on(Tab::Effects);
+        key(&mut s, KeyCode::Char('j'));
+        let held = Modifier::REVERSED | Modifier::DIM;
+        let buf = painted(&s, None);
+        assert!(buf[(rect.x, rect.y)].modifier.contains(held), "held");
+        s.tick(AFTERGLOW / 2);
+        let buf = painted(&s, None);
+        assert!(!buf[(rect.x, rect.y)].modifier.contains(held), "let go");
+    }
+
+    /// The afterglow goes where the row is drawn, as wide as the bar is,
+    /// whether the rows fit or scroll.
+    #[test]
+    fn a_row_glows_where_it_is_drawn() {
+        for (w, h) in [(80, 24), (60, 12)] {
+            let area = Rect::new(0, 0, w, h);
+            let mut s = on(Tab::Keys);
+            s.selected = s.rows().len() - 1;
+            let lines = render(&s, w, h);
+            for setting in s.rows() {
+                let drawn = lines.iter().position(|l| {
+                    let t = l.trim_start_matches([' ', '•']).trim_start_matches(MARKER);
+                    t.split_whitespace().next() == Some(setting.name)
+                });
+                let rect = row_rect(&s, area, setting);
+                assert_eq!(
+                    rect.map(|r| usize::from(r.y)),
+                    drawn,
+                    "{} on {w}x{h}",
+                    setting.name
+                );
+            }
+            let bar = row_rect(&s, area, s.current().expect("a row")).expect("on screen");
+            let mut buf = Buffer::empty(area);
+            draw_on(&mut buf, area, &s);
+            let reversed = |x: u16| buf[(x, bar.y)].modifier.contains(Modifier::REVERSED);
+            assert!((bar.x..bar.x + bar.width).all(reversed), "the bar's width");
+            assert!(!reversed(bar.x - 1) && !reversed(bar.x + bar.width));
+        }
+    }
+
     /// The text of a buffer's rows, as the screen tests read a frame.
     fn rows_of(buf: &Buffer) -> Vec<String> {
         let area = buf.area;
@@ -2371,8 +2663,8 @@ mod tests {
     /// out on its own clock.
     #[test]
     fn the_panel_answers_the_mouse_where_it_drew_and_its_prefix_times_out() {
-        let now = Instant::now();
         let mut panel = Panel::open();
+        let now = Instant::now();
         panel.state.tab = Tab::Effects;
         panel.state.selected = 0;
         let area = Rect::new(8, 3, 64, 18);
@@ -2390,6 +2682,10 @@ mod tests {
         };
         assert_eq!(panel.on_mouse(click, now), Did::Stay);
         assert_eq!(panel.state.current().map(|s| s.name), Some("smear"));
+        // The row the click took the bar off fades back from it, and is done.
+        assert!(panel.moving());
+        assert!(panel.tick(now + AFTERGLOW), "the last of the glow");
+        assert!(!panel.moving());
         let prefix = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL);
         panel.on_key(prefix, now);
         let until = panel.wake_at().expect("armed");
