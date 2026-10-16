@@ -3369,7 +3369,7 @@ fn pump(
         let next = [
             deadline,
             popup.as_ref().map(announce::Popup::wake_at),
-            bar.wake_at(now),
+            bar.wake_at(),
             attachment.hold_wake_at(),
             attachment.kept_due(),
             erasing.as_ref().map(|_| now + ERASE_POLL),
@@ -3435,7 +3435,8 @@ fn pump(
         // The held first paint, once it is over: dissolved in from the
         // shadow, then let through. Before the notice below, which paints
         // over the session and so must find it on screen.
-        if attachment.hold_is_due(Instant::now()) {
+        let released = attachment.hold_is_due(Instant::now());
+        if released {
             attachment.release_hold(true)?;
         }
 
@@ -3629,11 +3630,18 @@ fn pump(
         // the frame it drew (see the closes below). Before that there is nothing
         // to ask, and the bar waits for a lull, as it always has to go up.
         //
+        // And one thing the notice's pass does not count: the paint let
+        // through above, on this pass. It is the client's bytes reaching the
+        // terminal, after however long a dissolve, and let through at the
+        // hold's cap they may end in the middle of a sequence — so the lull
+        // the bar goes up at is counted from here, and not from the last read
+        // before the dissolve.
+        //
         // A command that ends the relay has already returned from the block
         // above and never reaches this, which is what stops `<prefix> Space`
         // flashing a bar on its way to the picker.
         let pass = hint::Pass {
-            wrote: child_spoke || attachment.hold.is_some(),
+            wrote: child_spoke || released || attachment.hold.is_some(),
             between: attachment
                 .watching()
                 .then(|| attachment.between_sequences()),
