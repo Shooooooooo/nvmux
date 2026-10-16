@@ -1896,6 +1896,66 @@ fn a_windows_text_is_as_wide_as_what_it_shows_wants() {
     assert_eq!(term.hang_up(), Some(0), "the client's exit");
 }
 
+/// A window whose text is in its middle already, as a start screen lays
+/// itself out for its window's whole width, keeps that width — judged by
+/// what it shows or not: on a grid narrower, it would be centred twice
+/// over, and so off to the right. Lines set in from the left but not to the
+/// middle, and lines not set in at all, are narrowed as any are.
+fn a_window_centred_already_keeps_its_width(tag: &str, more: &str) {
+    let scratch = Scratch::new(tag);
+    let (mut term, mut rpc, _) = wide_with(&scratch, tag, more);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    // 40 columns of it 60 in on the 160, and a shorter line in its middle.
+    let screen = format!("{}{}", " ".repeat(60), "x".repeat(40));
+    for (command, want) in [
+        (
+            "setlocal wrap | call setline(1, \
+             [repeat(' ', 60) .. repeat('x', 40), '', repeat(' ', 70) .. repeat('y', 20)])",
+            columns(160, &[160]),
+        ),
+        (
+            "setlocal wrap | call setline(1, [repeat(' ', 10) .. repeat('x', 40)])",
+            columns(160, &[60]),
+        ),
+        (
+            "setlocal wrap | call setline(1, \
+             [repeat(' ', 60) .. repeat('x', 40), repeat('z', 10)])",
+            columns(160, &[60]),
+        ),
+    ] {
+        rpc.command(command).expect(command);
+        assert!(
+            until_widths(&mut term, &mut rpc, &want),
+            "after {command}: {} not {want}",
+            widths(&mut rpc)
+        );
+        if want == columns(160, &[160]) {
+            assert!(
+                term.pump_until(Duration::from_secs(5), |s| s.starts_with(&screen)),
+                "not in the middle of the window:\n{}",
+                term.text()
+            );
+        }
+    }
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
+#[test]
+fn a_window_centred_already_keeps_its_width_judged_by_what_it_shows() {
+    require_nvim!();
+    a_window_centred_already_keeps_its_width("client-centred", "");
+}
+
+#[test]
+fn a_window_centred_already_keeps_its_width_judged_by_nothing() {
+    require_nvim!();
+    a_window_centred_already_keeps_its_width("client-centred-off", "smart_width = false\n");
+}
+
 /// Its width judged as a window's text always is, a Markdown window's is as
 /// wide as its tables and code blocks, which wrapping would break, and no
 /// wider for its paragraphs, which it does not — where this Neovim has its
