@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use common::Scratch;
 use nvmux::transport::Transport;
-use portable_pty::{CommandBuilder, PtySize};
+use pty_process::blocking::{Command, Pty};
 
 /// The session socket and id the child attaches to.
 const CHILD_SOCK: &str = "NVMUX_TEST_RELAY_SOCK";
@@ -337,18 +337,19 @@ struct Terminal {
     /// which a client then turns on and takes its size from instead of from
     /// `SIGWINCH`.
     in_band: bool,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: std::process::Child,
     /// The exit code, once the child has been seen to exit; it must not be
     /// signalled or waited for again after that.
     exited: Option<u32>,
-    writer: Box<dyn Write + Send>,
+    /// The pty's master, which what is typed goes in through and the
+    /// terminal's size is set on. Held so the pty outlives the child, which
+    /// `Drop` reaps before the fields go.
+    pty: Pty,
     /// Everything the child has written, in order.
     output: Vec<u8>,
     /// How far `output` has been scanned for queries.
     answered: usize,
     incoming: mpsc::Receiver<Vec<u8>>,
-    // Held so the pty outlives the child; dropped last.
-    _master: Box<dyn portable_pty::MasterPty>,
 }
 
 /// What a [`Terminal`]'s child is asked for, past the session and the
@@ -463,67 +464,61 @@ impl Terminal {
             steps,
             bind,
         } = asks;
-        let pair = portable_pty::native_pty_system()
-            .openpty(PtySize {
-                rows: ROWS,
-                cols: COLS,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("openpty");
+        let (pty, pts) = pty_process::blocking::open().expect("open a pty");
+        pty.resize(pty_process::Size::new(ROWS, COLS))
+            .expect("size the pty");
 
-        let mut cmd = CommandBuilder::new(std::env::current_exe().expect("current exe"));
-        // `--nocapture`, or the child's diagnostics would sit in libtest's
-        // capture buffer when it exits, and never reach this pty.
-        cmd.args(["--ignored", "--exact", "relay_child", "--nocapture"]);
-        cmd.env(CHILD_SOCK, sock);
-        cmd.env(CHILD_ID, id);
-        // What Windows Terminal, and most others, set. Not that it matters
-        // for the kitty query, which is sent whatever the terminal claims to
-        // be; but the `modifyOtherKeys` fallback is withheld from a terminal
-        // that says it is an old VTE.
-        cmd.env("TERM", "xterm-256color");
-        cmd.env_remove("VTE_VERSION");
-        // `NO_COLOR` forces the fade off whatever the config says, and with it
-        // the shadow: removed so the child's screen does not depend on the
-        // environment whoever ran `cargo test` happened to have.
-        cmd.env_remove("NO_COLOR");
+        let mut cmd = Command::new(std::env::current_exe().expect("current exe"))
+            // `--nocapture`, or the child's diagnostics would sit in libtest's
+            // capture buffer when it exits, and never reach this pty.
+            .args(["--ignored", "--exact", "relay_child", "--nocapture"])
+            .env(CHILD_SOCK, sock)
+            .env(CHILD_ID, id)
+            // What Windows Terminal, and most others, set. Not that it matters
+            // for the kitty query, which is sent whatever the terminal claims
+            // to be; but the `modifyOtherKeys` fallback is withheld from a
+            // terminal that says it is an old VTE.
+            .env("TERM", "xterm-256color")
+            .env_remove("VTE_VERSION")
+            // `NO_COLOR` forces the fade off whatever the config says, and with
+            // it the shadow: removed so the child's screen does not depend on
+            // the environment whoever ran `cargo test` happened to have.
+            .env_remove("NO_COLOR");
         if shadow {
-            cmd.env(CHILD_PALETTE, "1");
+            cmd = cmd.env(CHILD_PALETTE, "1");
         }
         if keep {
-            cmd.env(CHILD_KEEP, "1");
+            cmd = cmd.env(CHILD_KEEP, "1");
         }
         if let Some(label) = label {
-            cmd.env(CHILD_LABEL, label);
+            cmd = cmd.env(CHILD_LABEL, label);
         }
         if ahead {
-            cmd.env(CHILD_AHEAD, "1");
+            cmd = cmd.env(CHILD_AHEAD, "1");
         }
         if let Some(ms) = fade_ms {
-            cmd.env(CHILD_FADE_MS, ms.to_string());
+            cmd = cmd.env(CHILD_FADE_MS, ms.to_string());
         }
         if own {
-            cmd.env(CHILD_OWN, "1");
+            cmd = cmd.env(CHILD_OWN, "1");
         }
         if let Some(to) = post {
-            cmd.env(CHILD_POST, to);
+            cmd = cmd.env(CHILD_POST, to);
         }
         if let Some(name) = lands {
-            cmd.env(CHILD_LANDS, name);
+            cmd = cmd.env(CHILD_LANDS, name);
         }
         if steps {
-            cmd.env(CHILD_STEPS, "1");
+            cmd = cmd.env(CHILD_STEPS, "1");
         }
         if let Some(bind) = bind {
-            cmd.env(CHILD_BIND, bind);
+            cmd = cmd.env(CHILD_BIND, bind);
         }
-        let child = pair.slave.spawn_command(cmd).expect("spawn relay child");
-        // Or the master would never see EOF once the child exits.
-        drop(pair.slave);
+        // Takes the slave, or the master would never see EOF once the child
+        // exits.
+        let child = cmd.spawn(pts).expect("spawn relay child");
 
-        let writer = pair.master.take_writer().expect("writer");
-        let mut reader = pair.master.try_clone_reader().expect("reader");
+        let mut reader = common::reader(&pty);
         let (tx, incoming) = mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
@@ -544,11 +539,10 @@ impl Terminal {
             in_band,
             child,
             exited: None,
-            writer,
+            pty,
             output: Vec::new(),
             answered: 0,
             incoming,
-            _master: pair.master,
         }
     }
 
@@ -610,8 +604,8 @@ impl Terminal {
     }
 
     fn type_bytes(&mut self, bytes: &[u8]) {
-        self.writer.write_all(bytes).expect("write to pty");
-        self.writer.flush().expect("flush pty");
+        self.pty.write_all(bytes).expect("write to pty");
+        self.pty.flush().expect("flush pty");
     }
 
     /// The child's exit code, if it exits within `within`.
@@ -619,7 +613,7 @@ impl Terminal {
         let deadline = Instant::now() + within;
         while self.exited.is_none() && Instant::now() < deadline {
             if let Ok(Some(status)) = self.child.try_wait() {
-                self.exited = Some(status.exit_code());
+                self.exited = Some(common::exit_code(status));
                 break;
             }
             // Keep answering: the client's own exit waits on a DA1 reply.
@@ -645,8 +639,7 @@ impl Drop for Terminal {
         // A child already reaped must not be signalled: its pid may be
         // someone else's by now.
         if self.exited.is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            common::hang_up_and_reap(&mut self.child);
         }
     }
 }
@@ -1256,13 +1249,8 @@ fn a_kept_clients_screen_comes_back(tag: &str, in_band: bool, fade: bool) {
     term.pump_until(Duration::from_millis(300), |_| false);
     let narrower = COLS - 20;
     away_and_back(&mut term, |term| {
-        term._master
-            .resize(PtySize {
-                rows: ROWS,
-                cols: narrower,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+        term.pty
+            .resize(pty_process::Size::new(ROWS, narrower))
             .expect("resize the terminal");
     });
     let width = || {

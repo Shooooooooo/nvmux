@@ -27,7 +27,7 @@ use common::Scratch;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 use nvmux::transport::Transport;
-use portable_pty::{CommandBuilder, PtySize};
+use pty_process::blocking::{Command, Pty};
 use rmpv::Value;
 
 const ROWS: u16 = 24;
@@ -45,7 +45,7 @@ const KITTY_REPLY: &[u8] = b"\x1b[?0u";
 
 /// The terminal a client draws on.
 struct Terminal {
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: std::process::Child,
     /// The exit code, once the child has been seen to exit; it must not be
     /// signalled or waited for again after that.
     exited: Option<u32>,
@@ -55,7 +55,9 @@ struct Terminal {
     /// something whenever a UI attaches, a refresh's among them, so a
     /// question can come as the client goes.
     hung_up: bool,
-    writer: Box<dyn Write + Send>,
+    /// The pty's master, which what is typed goes in through. Held so the pty
+    /// outlives the child, which `Drop` reaps before the fields go.
+    pty: Pty,
     /// Everything the client has written, in order, and the screen it makes.
     output: Vec<u8>,
     parser: vt100::Parser,
@@ -66,8 +68,6 @@ struct Terminal {
     /// Its size: columns, rows.
     size: (u16, u16),
     incoming: mpsc::Receiver<Vec<u8>>,
-    // Held so the pty outlives the child; dropped last.
-    _master: Box<dyn portable_pty::MasterPty>,
 }
 
 impl Terminal {
@@ -84,28 +84,24 @@ impl Terminal {
     /// [`Terminal::spawn_answering`], on a terminal `size` big: columns,
     /// rows.
     fn spawn_sized(sock: &Path, config: &Path, da1: &'static [u8], size: (u16, u16)) -> Self {
-        let pair = portable_pty::native_pty_system()
-            .openpty(PtySize {
-                rows: size.1,
-                cols: size.0,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("openpty");
-        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_nvmux"));
-        cmd.arg("--client");
-        cmd.arg(sock);
-        cmd.env("NVMUX_CONFIG", config);
-        cmd.env("TERM", "xterm-256color");
-        // The colours a parent nvmux would hand down: none, so the client
-        // falls back on its own, whatever the environment running the tests.
-        cmd.env_remove(nvmux::client::PALETTE_ENV);
-        let child = pair.slave.spawn_command(cmd).expect("spawn the client");
-        // Or the master would never see EOF once the child exits.
-        drop(pair.slave);
+        let (pty, pts) = pty_process::blocking::open().expect("open a pty");
+        pty.resize(pty_process::Size::new(size.1, size.0))
+            .expect("size the pty");
+        let child = Command::new(env!("CARGO_BIN_EXE_nvmux"))
+            .arg("--client")
+            .arg(sock)
+            .env("NVMUX_CONFIG", config)
+            .env("TERM", "xterm-256color")
+            // The colours a parent nvmux would hand down: none, so the client
+            // falls back on its own, whatever the environment running the
+            // tests.
+            .env_remove(nvmux::client::PALETTE_ENV)
+            // Takes the slave, or the master would never see EOF once the
+            // child exits.
+            .spawn(pts)
+            .expect("spawn the client");
 
-        let writer = pair.master.take_writer().expect("writer");
-        let mut reader = pair.master.try_clone_reader().expect("reader");
+        let mut reader = common::reader(&pty);
         let (tx, incoming) = mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
@@ -124,14 +120,13 @@ impl Terminal {
             child,
             exited: None,
             hung_up: false,
-            writer,
+            pty,
             output: Vec::new(),
             parser: vt100::Parser::new(size.1, size.0, 0),
             answered: 0,
             da1,
             size,
             incoming,
-            _master: pair.master,
         }
     }
 
@@ -196,8 +191,8 @@ impl Terminal {
     }
 
     fn type_bytes(&mut self, bytes: &[u8]) {
-        self.writer.write_all(bytes).expect("write to the pty");
-        self.writer.flush().expect("flush the pty");
+        self.pty.write_all(bytes).expect("write to the pty");
+        self.pty.flush().expect("flush the pty");
     }
 
     /// The screen as text, a row to a line, trailing blanks trimmed.
@@ -231,13 +226,13 @@ impl Terminal {
 
     /// Send the client `signal`, and say how it exited.
     fn signal(&mut self, signal: Signal) -> Option<u32> {
-        let pid = self.child.process_id().expect("the client's pid");
+        let pid = self.child.id();
         self.hung_up = true;
         nix::sys::signal::kill(Pid::from_raw(pid as i32), signal).expect("signal the client");
         let deadline = Instant::now() + Duration::from_secs(5);
         while self.exited.is_none() && Instant::now() < deadline {
             if let Ok(Some(status)) = self.child.try_wait() {
-                self.exited = Some(status.exit_code());
+                self.exited = Some(common::exit_code(status));
                 break;
             }
             self.pump_until(Duration::from_millis(50), |_| false);
@@ -253,8 +248,7 @@ impl Drop for Terminal {
         // A child already reaped must not be signalled: its pid may be
         // someone else's by now.
         if self.exited.is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            common::hang_up_and_reap(&mut self.child);
         }
     }
 }

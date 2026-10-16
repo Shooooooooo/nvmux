@@ -90,25 +90,20 @@
 //! have it holding nvmux's drawing of the editor with a box in the middle, and
 //! nothing underneath to give back (see [`Attachment::write_over_session`]).
 //!
-//! Three hazards that have no other home in the code:
-//!
-//! * **Take the writer exactly once.** `MasterPty::take_writer()` errors on a
-//!   second call.
-//! * **The child's exit code carries no information.** A server killed while
-//!   attached gives 0; terminating the child to detach gives 1; a failed attach
-//!   gives 1. Teardown is driven off the master read result instead.
-//! * `portable-pty` vendors its own `nix`, so never pass a `nix` type across
-//!   that boundary — `MasterPty::get_termios()` returns *its* `Termios`, not ours.
+//! One hazard that has no other home in the code: **the child's exit code
+//! carries no information.** A server killed while attached gives 0;
+//! terminating the child to detach gives 1; a failed attach gives 1. Teardown
+//! is driven off the master read result instead.
 
 use std::io::Write;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::process::Child;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-pub use portable_pty::PtySize;
-use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair};
+use pty_process::blocking::{Command, Pty};
 
 use crate::error::{NvmuxError, Result};
 use crate::handoff::HandOff;
@@ -118,6 +113,37 @@ use crate::term::write_stdout;
 use crate::{announce, boundary, card, config, fade, hint, keyseq, rpc, shadow, term, winch};
 
 mod panel;
+
+/// A terminal's size as a pty is told it: the `winsize` of `TIOCSWINSZ`.
+///
+/// Ours rather than the pty crate's `Size`, whose fields are private, because
+/// everything that lays anything out over a session reads `rows` and `cols`
+/// off it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtySize {
+    pub rows: u16,
+    pub cols: u16,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
+}
+
+impl Default for PtySize {
+    /// 24x80, what a terminal is taken to be when nothing says otherwise.
+    fn default() -> Self {
+        Self {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    }
+}
+
+impl From<PtySize> for pty_process::Size {
+    fn from(size: PtySize) -> Self {
+        Self::new_with_pixel(size.rows, size.cols, size.pixel_width, size.pixel_height)
+    }
+}
 
 /// Neovim aborts on the seventeenth attached UI rather than returning an error
 /// (`src/nvim/ui.c`: `if (ui_count == MAX_UI_COUNT) { abort(); }`), which would
@@ -247,9 +273,10 @@ pub struct Attachment {
     /// not (see [`crate::handoff`]). `None` for every attach but one from the
     /// picker, and once the relay has taken it down.
     hand_off: Option<HandOff>,
-    child: Box<dyn Child + Send + Sync>,
-    master: Box<dyn MasterPty>,
-    writer: Box<dyn Write + Send>,
+    child: Child,
+    /// The pty's master: the client's output is read from it, and what is
+    /// written into the client goes in through it.
+    master: Pty,
     /// True once the child has been through a full relay, so a resume knows it
     /// must force a repaint — and that the client is one that already entered
     /// the alternate screen and will not enter it again, so the terminal has
@@ -636,13 +663,10 @@ impl Attachment {
     /// away. `reap` does the waiting and `Drop` calls it, so an attachment must
     /// still be held until the client is genuinely wanted gone.
     ///
-    /// Through `libc` rather than `portable_pty`'s `Child::kill`, which is not a
-    /// signal but a whole teardown: it sends SIGHUP and then blocks polling for
-    /// the exit — measured at 50 ms for a client that goes quietly, 200 ms
-    /// before it gives up and escalates to SIGKILL. That is `reap`'s job, and a
-    /// hangup that blocks leaves the switch path nothing to overlap. Its poll
-    /// also *reaped* the child, which is why `reap` used to return on its first
-    /// look and why `reap`'s own escalation had never run.
+    /// Through `libc` rather than `Child::kill`, which is SIGKILL: no hangup at
+    /// all, so a client with a terminal to put back never gets to. Nor does
+    /// this wait: that is `reap`'s job, and a hangup that blocked would leave
+    /// the switch path nothing to overlap.
     ///
     /// SIGCONT as well, because SIGHUP is not delivered to a *stopped* process
     /// at all, and a client that stopped itself (see `check_child`) can be
@@ -659,15 +683,12 @@ impl Attachment {
         if self.reaped {
             return;
         }
-        // Nothing to signal without one, and `reap` falls back on `wait`.
-        let Some(pid) = self.child.process_id() else {
-            return;
-        };
+        let pid = self.child.id() as libc::pid_t;
         // SAFETY: a pid this process spawned and has not waited for, so it names
         // that child or nothing.
         unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGHUP);
-            libc::kill(pid as libc::pid_t, libc::SIGCONT);
+            libc::kill(pid, libc::SIGHUP);
+            libc::kill(pid, libc::SIGCONT);
         }
     }
 
@@ -889,10 +910,7 @@ impl Attachment {
         until: Instant,
         mut held: Option<&mut Vec<u8>>,
     ) {
-        let Some(fd) = self.master.as_raw_fd() else {
-            fade::wait(shadow, until);
-            return;
-        };
+        let fd = self.master.as_raw_fd();
         let mut buf = [0u8; 8192];
         loop {
             let now = Instant::now();
@@ -995,9 +1013,7 @@ impl Attachment {
     /// parked with a `:terminal` running something never runs out of things
     /// to say, and what it says after this is the relay's.
     fn drain_unrelayed(&mut self) {
-        let Some(fd) = self.master.as_raw_fd() else {
-            return;
-        };
+        let fd = self.master.as_raw_fd();
         let mut buf = [0u8; 8192];
         let deadline = Instant::now() + FRAME_WAIT;
         let mut taken = 0usize;
@@ -1105,9 +1121,7 @@ impl Attachment {
     /// pieces *would* be read as keys, and a report that did not fit is
     /// better not sent.
     fn report_size_in_band(&mut self, size: PtySize) -> bool {
-        let Some(fd) = self.master.as_raw_fd() else {
-            return false;
-        };
+        let fd = self.master.as_raw_fd();
         if !writable(fd) {
             tracing::debug!("the client's input queue is full; not reporting its size");
             return false;
@@ -1126,9 +1140,7 @@ impl Attachment {
     /// a sequence in pieces would be read as keys. Best effort: a client whose
     /// input queue is full is not shown the card.
     fn tell_client(&mut self, cmd: &card::Command) {
-        let Some(fd) = self.master.as_raw_fd() else {
-            return;
-        };
+        let fd = self.master.as_raw_fd();
         if !writable(fd) {
             tracing::debug!("the client's input queue is full; no card");
             return;
@@ -1245,9 +1257,7 @@ impl Attachment {
     /// Wait up to `within` for the client to write something, without reading
     /// it.
     fn await_output(&self, within: Duration) {
-        let Some(fd) = self.master.as_raw_fd() else {
-            return;
-        };
+        let fd = self.master.as_raw_fd();
         let mut p = [pollfd(fd)];
         let ms = within.as_millis().min(i32::MAX as u128) as libc::c_int;
         let _ = unsafe { libc::poll(p.as_mut_ptr(), 1, ms) };
@@ -1627,7 +1637,7 @@ impl Attachment {
 
     /// Tell the pty — and the shadow — the terminal's size.
     fn resize_to(&mut self, size: PtySize) {
-        let _ = self.master.resize(size);
+        let _ = self.master.resize(size.into());
         if let Some(shadow) = self.shadow.as_mut() {
             shadow.resize(size.rows, size.cols);
         }
@@ -1682,10 +1692,8 @@ impl Attachment {
     /// [`REAP_TIMEOUT`] so a client that ignores SIGHUP cannot hold nvmux —
     /// and the user's terminal — hostage.
     ///
-    /// All of the waiting and all of the escalation is here. It used to be
-    /// shared with `portable_pty`'s `Child::kill`, which reaped the child inside
-    /// the hangup and reached SIGKILL first, so this loop returned on its first
-    /// poll and the escalation below never ran.
+    /// All of the waiting and all of the escalation is here, and nothing else
+    /// waits for the client: [`Attachment::hang_up`] only signals it.
     fn reap(&mut self) {
         if self.reaped {
             return;
@@ -1707,11 +1715,9 @@ impl Attachment {
         // client's input queue to be momentarily full.
         let mut owed = false;
         while Instant::now() < deadline {
-            if let Some(fd) = master {
-                owed |= discard_pending(fd);
-                if owed {
-                    owed = !self.answer_device_attributes();
-                }
+            owed |= discard_pending(master);
+            if owed {
+                owed = !self.answer_device_attributes();
             }
             match self.child.try_wait() {
                 Ok(None) => std::thread::sleep(Duration::from_millis(10)),
@@ -1719,12 +1725,12 @@ impl Attachment {
                 _ => return,
             }
         }
-        if let Some(pid) = self.child.process_id() {
-            tracing::warn!(pid, "the client ignored SIGHUP; killing it");
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-            }
-        }
+        tracing::warn!(
+            pid = self.child.id(),
+            "the client ignored SIGHUP; killing it"
+        );
+        // SIGKILL, and nothing if the child has been waited for already.
+        let _ = self.child.kill();
         let _ = self.child.wait();
     }
 
@@ -1788,9 +1794,7 @@ impl Attachment {
         // moves it on from a work queue, so a master that has just taken a burst
         // reports no room until that queue runs, a few milliseconds later. A
         // one-shot answer would lose that coin toss; a retried one cannot.
-        let Some(fd) = self.master.as_raw_fd() else {
-            return true;
-        };
+        let fd = self.master.as_raw_fd();
         if !writable(fd) {
             tracing::debug!("the departing client's input queue is full; not answering yet");
             return false;
@@ -1839,9 +1843,7 @@ impl Attachment {
     /// Bounded, because a client that ignores its termination would otherwise
     /// hold the terminal in raw mode indefinitely.
     fn drain_until_eof(&mut self) {
-        let Some(fd) = self.master.as_raw_fd() else {
-            return;
-        };
+        let fd = self.master.as_raw_fd();
         let deadline = Instant::now() + DRAIN_TIMEOUT;
         let mut buf = [0u8; 8192];
         let mut owed = false;
@@ -1866,11 +1868,8 @@ impl Attachment {
     }
 }
 
-/// The client must be dead before the PTY writer is dropped: `portable-pty`'s
-/// writer writes a newline and `VEOF` to the master on drop, and a client that
-/// is still attached would deliver both to the editor as keystrokes — an Enter
-/// in insert mode is a new line in the user's buffer. Fields drop after this
-/// runs, so the writer only ever goes out on a pty nobody is reading.
+/// The client is hung up and reaped before the fields go, the master among
+/// them: `reap` reads the client out through it while it waits.
 impl Drop for Attachment {
     fn drop(&mut self) {
         self.hang_up();
@@ -2041,15 +2040,10 @@ impl Parked {
         // killed, its link gone — before the thread saw it go: the pty says
         // so at once, and so does its pid. Handed back, it would put a dead
         // session's last screen up only to lose it a moment later.
-        let hung_up = attachment.master.as_raw_fd().is_some_and(|fd| {
-            let mut p = [pollfd(fd)];
-            let n = unsafe { libc::poll(p.as_mut_ptr(), 1, 0) };
-            n > 0 && p[0].revents & (libc::POLLHUP | libc::POLLERR) != 0
-        });
-        let exited = attachment
-            .child
-            .process_id()
-            .is_some_and(|pid| peek_child(nix::unistd::Pid::from_raw(pid as i32)) == Peek::Gone);
+        let mut p = [pollfd(attachment.master.as_raw_fd())];
+        let n = unsafe { libc::poll(p.as_mut_ptr(), 1, 0) };
+        let hung_up = n > 0 && p[0].revents & (libc::POLLHUP | libc::POLLERR) != 0;
+        let exited = peek_child(child_pid(&attachment.child)) == Peek::Gone;
         if hung_up || exited {
             tracing::debug!(id = %self.session_id, "a parked client left as it was asked back");
             return None;
@@ -2137,7 +2131,7 @@ fn keep_parked(mut attachment: Attachment, stop: UnixStream) -> Option<Attachmen
     let mut buf = [0u8; 8192];
     loop {
         let master = attachment.master.as_raw_fd();
-        let mut fds = [pollfd(stop.as_raw_fd()), pollfd(master.unwrap_or(-1))];
+        let mut fds = [pollfd(stop.as_raw_fd()), pollfd(master)];
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, IDLE_POLL_MS) };
         if n < 0 {
             // A `SIGWINCH` meant for the relay can land on this thread.
@@ -2149,7 +2143,7 @@ fn keep_parked(mut attachment: Attachment, stop: UnixStream) -> Option<Attachmen
         }
         // The client first: whatever it has said is read before the thread
         // lets go of it, and a client that has gone is not handed back.
-        if let Some(master) = master.filter(|_| n > 0 && ready(&fds[1])) {
+        if n > 0 && ready(&fds[1]) {
             match read_fd(master, &mut buf) {
                 Ok(len) if len > 0 => {
                     let chunk = &buf[..len];
@@ -2183,17 +2177,15 @@ fn keep_parked(mut attachment: Attachment, stop: UnixStream) -> Option<Attachmen
             };
         }
         if n == 0 {
-            if let Some(pid) = attachment.child.process_id() {
-                match peek_child(nix::unistd::Pid::from_raw(pid as i32)) {
-                    Peek::Running => {}
-                    Peek::Stopped => {
-                        tracing::debug!(%id, "a parked client stopped; retiring it");
-                        return None;
-                    }
-                    Peek::Gone => {
-                        tracing::debug!(%id, "a parked client exited");
-                        return None;
-                    }
+            match peek_child(child_pid(&attachment.child)) {
+                Peek::Running => {}
+                Peek::Stopped => {
+                    tracing::debug!(%id, "a parked client stopped; retiring it");
+                    return None;
+                }
+                Peek::Gone => {
+                    tracing::debug!(%id, "a parked client exited");
+                    return None;
                 }
             }
         }
@@ -2277,7 +2269,7 @@ fn keep_unshown(mut attachment: Attachment, stop: UnixStream) -> Option<Attachme
             IDLE_POLL_MS
         };
         let master = attachment.master.as_raw_fd();
-        let mut fds = [pollfd(stop.as_raw_fd()), pollfd(master.unwrap_or(-1))];
+        let mut fds = [pollfd(stop.as_raw_fd()), pollfd(master)];
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, wait) };
         if n < 0 {
             // A `SIGWINCH` meant for the relay can land on this thread.
@@ -2288,7 +2280,7 @@ fn keep_unshown(mut attachment: Attachment, stop: UnixStream) -> Option<Attachme
             return None;
         }
         // The client first, as on a parked client's thread.
-        if let Some(master) = master.filter(|_| n > 0 && ready(&fds[1])) {
+        if n > 0 && ready(&fds[1]) {
             match read_fd(master, &mut buf) {
                 Ok(len) if len > 0 => {
                     let unshown = attachment.unshown.get_or_insert_with(Vec::new);
@@ -2334,17 +2326,15 @@ fn keep_unshown(mut attachment: Attachment, stop: UnixStream) -> Option<Attachme
             };
         }
         if n == 0 {
-            if let Some(pid) = attachment.child.process_id() {
-                match peek_child(nix::unistd::Pid::from_raw(pid as i32)) {
-                    Peek::Running => {}
-                    Peek::Stopped => {
-                        tracing::debug!(%id, "a client started ahead stopped; retiring it");
-                        return None;
-                    }
-                    Peek::Gone => {
-                        tracing::debug!(%id, "a client started ahead exited");
-                        return None;
-                    }
+            match peek_child(child_pid(&attachment.child)) {
+                Peek::Running => {}
+                Peek::Stopped => {
+                    tracing::debug!(%id, "a client started ahead stopped; retiring it");
+                    return None;
+                }
+                Peek::Gone => {
+                    tracing::debug!(%id, "a client started ahead exited");
+                    return None;
                 }
             }
         }
@@ -2364,9 +2354,7 @@ fn tail_from(before: usize, needle: &[u8]) -> usize {
 /// attached to nothing, with a ledger and no screen of its own.
 #[cfg(test)]
 pub(crate) fn kept_standin(session_id: &str, script: &str) -> Attachment {
-    let mut cmd = CommandBuilder::new("sh");
-    cmd.arg("-c");
-    cmd.arg(script);
+    let cmd = Command::new("sh").arg("-c").arg(script);
     let mut a = spawn_client_with(
         session_id,
         Path::new("/nvmux-test-never-read.sock"),
@@ -2387,7 +2375,7 @@ pub(crate) fn kept_standin(session_id: &str, script: &str) -> Attachment {
 impl Attachment {
     /// The stand-in's pid, for a test asking what became of the process.
     pub(crate) fn pid_for_test(&self) -> i32 {
-        self.child.process_id().expect("a spawned child has a pid") as i32
+        child_pid(&self.child).as_raw()
     }
 
     /// As if its terminal had not yet answered its opening questions.
@@ -2399,9 +2387,7 @@ impl Attachment {
     /// so that a signal sent next meets them rather than the shell's own
     /// startup disposition. Says whether it came.
     pub(crate) fn ready_for_test(&self) -> bool {
-        let Some(fd) = self.master.as_raw_fd() else {
-            return false;
-        };
+        let fd = self.master.as_raw_fd();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut buf = [0u8; 256];
         while Instant::now() < deadline {
@@ -2483,17 +2469,18 @@ pub fn spawn_own_client(
 /// this same binary, `--client <sock>` (see [`crate::client`]) — or with
 /// `[client] ui = "nvim"` Neovim's, `nvim --server <sock> --remote-ui`. And
 /// whether it draws cards, which nvmux's own does.
-fn client_command(sock: &Path) -> (CommandBuilder, bool) {
+fn client_command(sock: &Path) -> (Command, bool) {
     match crate::config::get().client.ui {
         crate::config::Ui::Nvim => {
-            // `CommandBuilder::new` seeds the child's environment from ours,
-            // so `TERM`, `COLORTERM` and everything else the client negotiates
-            // with reach it without being copied by hand.
-            let mut cmd = CommandBuilder::new("nvim");
-            cmd.arg("--server");
-            cmd.arg(sock);
-            cmd.arg("--remote-ui");
-            (in_place(cmd), false)
+            // A `Command` runs with our environment and in our working
+            // directory unless told otherwise, so `TERM`, `COLORTERM` and
+            // everything else the client negotiates with reach it without
+            // being copied by hand.
+            let cmd = Command::new("nvim")
+                .arg("--server")
+                .arg(sock)
+                .arg("--remote-ui");
+            (cmd, false)
         }
         crate::config::Ui::Nvmux => {
             // The binary running now, wherever it was started from — not a
@@ -2505,35 +2492,16 @@ fn client_command(sock: &Path) -> (CommandBuilder, bool) {
 }
 
 /// nvmux's own client, run from `exe`.
-fn own_client(exe: &Path, sock: &Path) -> CommandBuilder {
-    let mut cmd = CommandBuilder::new(exe);
-    cmd.arg("--client");
-    cmd.arg(sock);
+fn own_client(exe: &Path, sock: &Path) -> Command {
+    let mut cmd = Command::new(exe).arg("--client").arg(sock);
     if let Some(palette) = crate::palette::get() {
-        cmd.env(crate::client::PALETTE_ENV, palette.to_env());
+        cmd = cmd.env(crate::client::PALETTE_ENV, palette.to_env());
     }
     // The settings nvmux runs on, which may not be the file's.
     cmd.env(
         crate::client::SETTINGS_ENV,
         crate::config::get().drawing().to_env(),
-    );
-    in_place(cmd)
-}
-
-/// `cmd` where a client runs: in our working directory, with our umask.
-fn in_place(mut cmd: CommandBuilder) -> CommandBuilder {
-    if let Ok(cwd) = std::env::current_dir() {
-        cmd.cwd(cwd);
-    }
-    // The other half of the pair the user calls their editor, so it gets the
-    // umask nvmux was started with for the same reason the session does — see
-    // `paths::restrict_umask`. A client holds no buffers and so writes next to
-    // nothing, which is a reason for the exception to go unnoticed rather than
-    // a reason to make one.
-    if let Some(mask) = crate::paths::launch_umask() {
-        cmd.umask(Some(mask.bits()));
-    }
-    cmd
+    )
 }
 
 /// [`spawn`] with the client command supplied, which is how the tests run it
@@ -2545,7 +2513,7 @@ fn spawn_with(
     session_id: &str,
     sock: &Path,
     announce: &str,
-    cmd: CommandBuilder,
+    cmd: Command,
     draws_cards: bool,
 ) -> Result<Attachment> {
     let t_spawn = std::time::Instant::now();
@@ -2875,34 +2843,39 @@ fn spawn_client_with(
     session_id: &str,
     sock: &Path,
     announce: &str,
-    cmd: CommandBuilder,
+    cmd: Command,
     draws_cards: bool,
 ) -> Result<Attachment> {
     // Right *before* the child starts: `PtySize::default()` is 24x80. Note
     // `crossterm::size()` is (cols, rows) while `PtySize` is { rows, cols } —
     // passing them positionally transposes the screen.
     let size = term::terminal_size();
-    let pair: PtyPair = portable_pty::native_pty_system()
-        .openpty(size)
-        .map_err(|e| NvmuxError::Io(std::io::Error::other(e.to_string())))?;
+    let (master, pts) = pty_process::blocking::open()
+        .map_err(|e| pty_error("could not open a pty for the client", e))?;
+    master
+        .resize(size.into())
+        .map_err(|e| pty_error("could not size the client's pty", e))?;
 
     // Before the child starts on it, so that no moment of its life finds the
     // pty echoing what the relay writes in.
-    take_input_as_written(pair.master.as_ref());
+    take_input_as_written(&master);
 
-    let child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| NvmuxError::Io(std::io::Error::other(e.to_string())))?;
-
-    // MANDATORY: while this process holds the slave open the master never sees
-    // EOF, so the relay would hang forever after the child exits.
-    drop(pair.slave);
-
-    let writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| NvmuxError::Io(std::io::Error::other(e.to_string())))?;
+    // The other half of the pair the user calls their editor, so it gets the
+    // umask nvmux was started with for the same reason the session does — see
+    // `paths::restrict_umask`. A client holds no buffers and so writes next to
+    // nothing, which is a reason for the exception to go unnoticed rather than
+    // a reason to make one.
+    let umask = crate::paths::launch_umask().map(|mask| mask.bits());
+    // Asked here, because `sysconf` is not a call the child may make.
+    let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    // SAFETY: `before_exec` makes async-signal-safe calls only.
+    let cmd = unsafe { cmd.pre_exec(move || before_exec(umask, open_max)) };
+    // `spawn` takes the slave and closes it. It has to be closed here: while
+    // this process held it open the master would never see EOF, and the relay
+    // would hang forever after the child exits.
+    let child = cmd
+        .spawn(pts)
+        .map_err(|e| pty_error("could not start the client", e))?;
 
     let fades = fade::enabled() && fade::session();
     let shadow = fades.then(|| shadow::Shadow::new(size.rows, size.cols));
@@ -2914,8 +2887,7 @@ fn spawn_client_with(
         announce: Some(announce.to_string()),
         hand_off: None,
         child,
-        master: pair.master,
-        writer,
+        master,
         resumed: false,
         reaped: false,
         // Only when it will be used: a shadow costs a parse of everything the
@@ -2948,6 +2920,99 @@ fn spawn_client_with(
     })
 }
 
+/// What a client is given between the fork and the exec, besides the new
+/// session and the controlling terminal the pty crate makes it — what
+/// portable-pty, which started clients before it, gave them there as well:
+///
+/// - The signals a process is likeliest to have been started with ignored put
+///   back to their defaults, and none blocked. Both survive an exec — an
+///   nvmux started under `nohup` would hand every client an ignored SIGHUP —
+///   and std puts back SIGPIPE alone.
+/// - Every descriptor past stderr closed by the exec: the SIGWINCH self-pipe,
+///   and whatever whoever started nvmux let it inherit. Marked close-on-exec
+///   rather than closed, so that std's own pipe for reporting a failed exec,
+///   close-on-exec already, can still report one.
+/// - Our umask, for the reason [`spawn_client_with`] gives.
+///
+/// It runs in the child of a fork in a process with other threads, so it
+/// makes async-signal-safe calls only, and allocates nothing.
+fn before_exec(umask: Option<libc::mode_t>, open_max: libc::c_long) -> std::io::Result<()> {
+    for sig in [
+        libc::SIGCHLD,
+        libc::SIGHUP,
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGTERM,
+        libc::SIGALRM,
+    ] {
+        // SAFETY: async-signal-safe, and SIG_DFL installs nothing to run.
+        unsafe { libc::signal(sig, libc::SIG_DFL) };
+    }
+    // SAFETY: async-signal-safe, on a set of our own.
+    unsafe {
+        let mut none: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut none);
+        libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
+    }
+    close_on_exec_from(3, open_max);
+    if let Some(mask) = umask {
+        // SAFETY: async-signal-safe, and it cannot fail.
+        unsafe { libc::umask(mask) };
+    }
+    Ok(())
+}
+
+/// The most descriptors [`close_on_exec_from`] will look at one at a time: a
+/// limit can be set far past any descriptor a process holds, and each is a
+/// syscall.
+const CLOEXEC_SCAN_MAX: libc::c_long = 65_536;
+
+/// Mark every descriptor from `low` up close-on-exec, below `open_max`: the
+/// descriptor limit, asked before the fork.
+fn close_on_exec_from(low: libc::c_int, open_max: libc::c_long) {
+    // All of them in one call, where the kernel has it: Linux 5.11 and later.
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: a syscall on no memory of ours, which an older kernel refuses.
+        let marked = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                low as libc::c_uint,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        if marked == 0 {
+            return;
+        }
+    }
+    let high = if open_max > 0 {
+        open_max.min(CLOEXEC_SCAN_MAX)
+    } else {
+        CLOEXEC_SCAN_MAX
+    };
+    for fd in low..high as libc::c_int {
+        // SAFETY: async-signal-safe, and on a number that is not an open
+        // descriptor it fails and changes nothing.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+}
+
+/// A failure of the pty crate's as one of ours: an I/O error saying what was
+/// being done, of the kind the system gave.
+fn pty_error(doing: &str, e: pty_process::Error) -> NvmuxError {
+    let e = match e {
+        pty_process::Error::Io(e) => e,
+        e => std::io::Error::other(e.to_string()),
+    };
+    NvmuxError::Io(std::io::Error::new(e.kind(), format!("{doing}: {e}")))
+}
+
 /// Have the pty hand the client its input exactly as the relay writes it:
 /// nothing echoed back, nothing kept for the end of a line or edited on the
 /// way, no key made a signal and no `CR` a `NL` — the raw input a client sets
@@ -2971,16 +3036,11 @@ fn spawn_client_with(
 /// same holds once it has, for whatever is still on its way in.
 ///
 /// Through the master, which sets the slave's termios on Linux and macOS
-/// both: portable-pty hands back no descriptor for the slave. A pty that will
-/// not take it is used as it came.
-fn take_input_as_written(master: &dyn MasterPty) {
+/// both. A pty that will not take it is used as it came.
+fn take_input_as_written(master: &Pty) {
     use nix::sys::termios::{self, SetArg};
 
-    let Some(fd) = master.as_raw_fd() else {
-        return;
-    };
-    // SAFETY: the master's own descriptor, which outlives this call.
-    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    let fd = master.as_fd();
     let made = termios::tcgetattr(fd).and_then(|opened| {
         let mut raw = opened.clone();
         termios::cfmakeraw(&mut raw);
@@ -3037,10 +3097,7 @@ pub fn relay(
     highest_session_num: u32,
     begin_next: &mut dyn FnMut(Target) -> Option<card::Card>,
 ) -> Result<(Outcome, Option<Attachment>)> {
-    let master_fd = attachment
-        .master
-        .as_raw_fd()
-        .ok_or_else(|| NvmuxError::Io(std::io::Error::other("pty master has no fd")))?;
+    let master_fd = attachment.master.as_raw_fd();
 
     let winch = winch::Winch::install()?;
     // A client that has not painted yet, whose first paint can be held.
@@ -3088,7 +3145,7 @@ pub fn relay(
         // one has yet to ask it.
         if attachment.started_ahead() {
             let size = term::terminal_size();
-            if attachment.master.get_size().ok() != Some(size) {
+            if pty_size(&attachment.master) != Some(size) {
                 attachment.resize_to(size);
             }
         }
@@ -3153,7 +3210,7 @@ pub fn relay(
         // either way, whatever the server is doing.
         let size = term::terminal_size();
         // Asked before the resize, because the resize is what changes it.
-        let resized = attachment.master.get_size().ok() != Some(size);
+        let resized = pty_size(&attachment.master) != Some(size);
         attachment.resize_to(size);
         // A kept client's repaint, asked as the fade in starts rather than
         // once it is over: the frames are nvmux's own, drawn from the copy,
@@ -4046,7 +4103,7 @@ fn take_step(attachment: &mut Attachment, mut step: Step) -> Result<Option<Outco
     if let (Step::Forward(bytes), Some(desk)) = (&step, attachment.desk.as_mut()) {
         desk.forwarded.saw(bytes, Instant::now());
     }
-    act(&mut attachment.writer, step)
+    act(&mut attachment.master, step)
 }
 
 /// How long an escape sequence cut short by the end of a read waits for the
@@ -4086,18 +4143,14 @@ enum ChildState {
 /// cannot loop: the stop notification is consumed when read, so a client that
 /// keeps stopping itself is continued once per stop.
 ///
-/// `portable_pty::Child::try_wait` cannot be used here — it does not pass
-/// `WUNTRACED`, so a stopped child reads as "still running". The peek below uses
-/// `WNOWAIT` so an *exit* status is left in place for portable-pty's own reaper.
+/// `Child::try_wait` cannot be used here — it does not pass `WUNTRACED`, so a
+/// stopped child reads as "still running". The peek below uses `WNOWAIT` so an
+/// *exit* status is left in place for the `Child`'s own wait in `reap`.
 fn check_child(attachment: &mut Attachment) -> ChildState {
     use nix::sys::signal::{kill, Signal};
     use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-    use nix::unistd::Pid;
 
-    let Some(raw) = attachment.child.process_id() else {
-        return ChildState::Running;
-    };
-    let pid = Pid::from_raw(raw as i32);
+    let pid = child_pid(&attachment.child);
 
     match peek_child(pid) {
         Peek::Stopped => {
@@ -4123,6 +4176,11 @@ enum Peek {
     Running,
     Stopped,
     Gone,
+}
+
+/// The client's pid, as the waits and signals here take it.
+fn child_pid(child: &Child) -> nix::unistd::Pid {
+    nix::unistd::Pid::from_raw(child.id() as i32)
 }
 
 /// Look at a child's state without changing it.
@@ -4378,7 +4436,7 @@ fn apply(attachment: &mut Attachment, why: Repaint, served: Served) {
     if !served.repainted {
         // The shrink and its undo are not shown to the shadow: what the
         // client draws after them is for the size it was just told.
-        nudge(attachment.master.as_ref(), term::terminal_size());
+        nudge(&attachment.master, term::terminal_size());
     }
 }
 
@@ -4615,13 +4673,27 @@ fn mouse_reporting(answer: &rmpv::Value) -> Option<term::MouseReporting> {
 /// at the more-prompt and not otherwise (a pending operator stays blank until
 /// its next key, which completes it). A client on a terminal with in-band
 /// resize reports ignores this altogether.
-fn nudge(master: &dyn MasterPty, size: PtySize) {
+fn nudge(master: &Pty, size: PtySize) {
     let nudged = PtySize {
         rows: size.rows.saturating_sub(1).max(1),
         ..size
     };
-    let _ = master.resize(nudged);
-    let _ = master.resize(size);
+    let _ = master.resize(nudged.into());
+    let _ = master.resize(size.into());
+}
+
+/// The size the pty was last told, read back with `TIOCGWINSZ`; `None` for
+/// a pty that will not say.
+fn pty_size(master: &Pty) -> Option<PtySize> {
+    // SAFETY: zero is a valid `winsize`, and the kernel fills it in.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let read = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGWINSZ, &mut ws) };
+    (read == 0).then_some(PtySize {
+        rows: ws.ws_row,
+        cols: ws.ws_col,
+        pixel_width: ws.ws_xpixel,
+        pixel_height: ws.ws_ypixel,
+    })
 }
 
 /// How long a resume waits on the server before relaying regardless.
@@ -4989,9 +5061,7 @@ mod tests {
     /// sized from `term::terminal_size()` (or 24x80), which no caller depends
     /// on.
     fn attached_to(script: &str) -> Attachment {
-        let mut cmd = CommandBuilder::new("sh");
-        cmd.arg("-c");
-        cmd.arg(script);
+        let cmd = Command::new("sh").arg("-c").arg(script);
         let mut a = spawn_client_with(
             "id000000",
             Path::new("/nvmux-test-never-read.sock"),
@@ -5032,7 +5102,7 @@ mod tests {
     /// tells "the signal was delivered" from "the process happens to still be
     /// in the state I expected".
     fn wait_for(a: &Attachment, byte: u8) -> bool {
-        let fd = a.master.as_raw_fd().expect("the master has an fd");
+        let fd = a.master.as_raw_fd();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut buf = [0u8; 256];
         while Instant::now() < deadline {
@@ -5054,7 +5124,7 @@ mod tests {
     /// rather than about the `Attachment`, because the point is what is left
     /// behind after the attachment is gone.
     fn pid_of(a: &Attachment) -> Pid {
-        Pid::from_raw(a.child.process_id().expect("a spawned child has a pid") as i32)
+        child_pid(&a.child)
     }
 
     /// A hangup must count as "something happened", not be ignored.
@@ -5764,11 +5834,10 @@ mod tests {
     /// command line, so the process table says whether it is still there once
     /// `spawn` has let go of it — a pid it wrote to a file would not do, since
     /// a probe can fail before the shell has run a single line.
-    fn standin_client(tag: &str) -> CommandBuilder {
-        let mut cmd = CommandBuilder::new("sh");
-        cmd.arg("-c");
-        cmd.arg(format!("while :; do read x; done # {}", standin_mark(tag)));
-        cmd
+    fn standin_client(tag: &str) -> Command {
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("while :; do read x; done # {}", standin_mark(tag)))
     }
 
     fn standin_mark(tag: &str) -> String {
@@ -6487,8 +6556,8 @@ mod tests {
             r#"printf r; head -c 3 | od -An -c | tr -d ' \n'; printf '|'; exec sleep 30"#,
         );
         wait_until_ready(&a);
-        a.writer.write_all(b"a\r\x7f").expect("write");
-        a.writer.flush().expect("flush");
+        a.master.write_all(b"a\r\x7f").expect("write");
+        a.master.flush().expect("flush");
         let heard = read_until(&a, b'|');
         assert!(
             heard.ends_with("a\\r177|"),
@@ -6496,10 +6565,34 @@ mod tests {
         );
     }
 
+    /// A client starts with its terminal open and nothing else of ours: not a
+    /// descriptor nvmux made without close-on-exec, as it makes the SIGWINCH
+    /// self-pipe, nor one whoever started nvmux left it (see `before_exec`).
+    #[test]
+    fn a_client_inherits_no_descriptor_but_its_terminal() {
+        let (read, write) = nix::unistd::pipe().expect("a pipe without close-on-exec");
+        let a = attached_to(&format!(
+            "[ -e /dev/fd/0 ] && printf T; \
+             for fd in {} {}; do [ -e /dev/fd/$fd ] && printf L; done; \
+             printf '|'; exec sleep 30",
+            read.as_raw_fd(),
+            write.as_raw_fd(),
+        ));
+        let heard = read_until(&a, b'|');
+        assert!(
+            heard.contains('T'),
+            "the client could not see its own terminal: {heard:?}"
+        );
+        assert!(
+            !heard.contains('L'),
+            "the client inherited a descriptor of ours: {heard:?}"
+        );
+    }
+
     /// Output up to and including `byte`, as text, or whatever came before a
     /// few seconds ran out.
     fn read_until(a: &Attachment, byte: u8) -> String {
-        let fd = a.master.as_raw_fd().expect("the master has an fd");
+        let fd = a.master.as_raw_fd();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut out = Vec::new();
         let mut buf = [0u8; 256];
@@ -6517,7 +6610,7 @@ mod tests {
 
     /// [`wait_for`], for something that must not happen: a short look.
     fn wait_briefly_for(a: &Attachment, byte: u8) -> bool {
-        let fd = a.master.as_raw_fd().expect("the master has an fd");
+        let fd = a.master.as_raw_fd();
         let deadline = Instant::now() + Duration::from_millis(300);
         let mut buf = [0u8; 256];
         while Instant::now() < deadline {
