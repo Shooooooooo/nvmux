@@ -20,8 +20,9 @@ pub mod local;
 pub mod protocol;
 pub mod remote;
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::error::{NvmuxError, Result, SessionError};
@@ -51,7 +52,7 @@ impl std::fmt::Display for Location {
 
 /// Session management, independent of where the sessions run.
 ///
-/// Object-safe on purpose: the picker holds a `Box<dyn Transport>` and never
+/// Object-safe on purpose: the picker holds a `dyn Transport` and never
 /// branches on which one it has.
 pub trait Transport {
     fn location(&self) -> &Location;
@@ -156,11 +157,19 @@ pub enum Reconnect {
     Restored,
 }
 
+/// A transport that can be lent to a thread: what [`open`] builds.
+///
+/// The one thread it is lent to so far lists the sessions behind a picker
+/// that opened without waiting for the host (see [`crate::ui::Listing`]).
+/// Both transports keep their shell behind a lock, so a script asked for
+/// meanwhile waits for that listing rather than running inside it.
+pub type Shared = std::sync::Arc<dyn Transport + Send + Sync>;
+
 /// Build the transport for a location.
-pub fn open(location: Location) -> Result<Box<dyn Transport>> {
+pub fn open(location: Location) -> Result<Shared> {
     match location {
-        Location::Local => Ok(Box::new(local::LocalTransport::new()?)),
-        Location::Ssh(host) => Ok(Box::new(remote::SshTransport::new(host)?)),
+        Location::Local => Ok(std::sync::Arc::new(local::LocalTransport::new()?)),
+        Location::Ssh(host) => Ok(std::sync::Arc::new(remote::SshTransport::new(host)?)),
     }
 }
 
@@ -388,20 +397,54 @@ pub(crate) fn kill(h: &impl Host, s: &Session) -> Result<()> {
 // --- behind list/create/kill above; the transports also call plan_rename and
 // --- claim_shell directly ---------------------------------------------------
 
-/// Take a transport's shell slot for one script run.
+/// Take a transport's shell slot for one script run, once another thread's
+/// run in it is over: the listing behind a picker that opened on the rows in
+/// hand runs on a thread of its own (see [`crate::ui::Listing`]), and a kill
+/// asked for in the picker meanwhile goes after it.
 ///
 /// A poisoned lock is taken anyway: every caller checks for a dead shell and
 /// replaces it before running anything, which is all a panic mid-run could
-/// have left behind. A lock that is *held* is a bug being reported rather than
-/// a wait being refused: no transport method calls another while running a
-/// script.
-pub(crate) fn claim_shell(slot: &Mutex<Option<Shell>>) -> Result<MutexGuard<'_, Option<Shell>>> {
-    match slot.try_lock() {
-        Ok(slot) => Ok(slot),
-        Err(TryLockError::Poisoned(e)) => Ok(e.into_inner()),
-        Err(TryLockError::WouldBlock) => Err(NvmuxError::Io(std::io::Error::other(
+/// have left behind. A slot that *this* thread holds already is a bug being
+/// reported rather than a wait that would never end: no transport method
+/// calls another while running a script.
+pub(crate) fn claim_shell(slot: &Mutex<Option<Shell>>) -> Result<Claimed<'_>> {
+    if CLAIMED.with(Cell::get) {
+        return Err(NvmuxError::Io(std::io::Error::other(
             "the shell is already running a script",
-        ))),
+        )));
+    }
+    let slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    CLAIMED.with(|c| c.set(true));
+    Ok(Claimed(slot))
+}
+
+thread_local! {
+    /// Whether this thread holds a shell slot, which is what tells a claim
+    /// from inside a script run — a bug — from one made while another
+    /// thread's run is under way, which waits its turn (see [`claim_shell`]).
+    static CLAIMED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A shell slot claimed for one script run: see [`claim_shell`].
+pub(crate) struct Claimed<'a>(MutexGuard<'a, Option<Shell>>);
+
+impl Drop for Claimed<'_> {
+    fn drop(&mut self) {
+        CLAIMED.with(|c| c.set(false));
+    }
+}
+
+impl std::ops::Deref for Claimed<'_> {
+    type Target = Option<Shell>;
+
+    fn deref(&self) -> &Option<Shell> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Claimed<'_> {
+    fn deref_mut(&mut self) -> &mut Option<Shell> {
+        &mut self.0
     }
 }
 
@@ -1022,5 +1065,39 @@ mod tests {
 
         let back: Vec<String> = finish_listing(written).into_iter().map(|s| s.id).collect();
         assert_eq!(back, arranged, "the arrangement did not survive a listing");
+    }
+
+    /// A shell slot another thread holds is waited for — the listing behind
+    /// the picker's rows, with a kill asked for meanwhile — and had once that
+    /// thread lets go of it, not refused.
+    #[test]
+    fn a_claim_waits_for_another_threads_run() {
+        let slot = Mutex::new(None);
+        let held = claim_shell(&slot).expect("the first claim");
+        std::thread::scope(|s| {
+            let waiting = s.spawn(|| claim_shell(&slot).map(|_| ()));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                !waiting.is_finished(),
+                "the second thread did not wait for the first"
+            );
+            drop(held);
+            waiting
+                .join()
+                .expect("the second thread")
+                .expect("refused once the first had let go");
+        });
+    }
+
+    /// A claim on the thread that holds the slot already is refused, not
+    /// waited on — it would wait for itself — and the thread can claim again
+    /// once it has let go.
+    #[test]
+    fn a_claim_inside_a_claim_is_refused() {
+        let slot = Mutex::new(None);
+        let held = claim_shell(&slot).expect("the first claim");
+        assert!(claim_shell(&slot).is_err(), "claimed twice by one thread");
+        drop(held);
+        assert!(claim_shell(&slot).is_ok(), "not had again once let go");
     }
 }

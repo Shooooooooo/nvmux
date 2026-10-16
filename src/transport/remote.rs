@@ -54,9 +54,10 @@ pub struct SshTransport {
     /// Opening a host and drawing the picker are two questions with one answer,
     /// and asking them separately costs a second script run over the link. The
     /// window this is held across is the few milliseconds between
-    /// [`SshTransport::new`] returning and the picker's first listing — nvmux
-    /// creates, renames and kills nothing in between — and it is taken exactly
-    /// once, so every listing after it is fresh.
+    /// [`SshTransport::new`] returning and the first listing — the picker's,
+    /// or with clients started ahead the one they are started from, which the
+    /// picker then opens on — and nvmux creates, renames and kills nothing in
+    /// between. It is taken exactly once, so every listing after it is fresh.
     first_listing: Mutex<Option<String>>,
 }
 

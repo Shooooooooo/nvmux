@@ -119,7 +119,61 @@ impl Outcome {
     }
 }
 
+/// What the picker opens on: the rows its first frame draws, and whether a
+/// listing is still to come.
+///
+/// Over ssh a listing is a round trip to the host, and the first frame used
+/// to wait for one every time the picker came up — after `<prefix> Space` a
+/// third of a second and more of blank screen on a distant host, between
+/// the session dissolving out and the picker dissolving in. Coming back from
+/// a session the session loop has the rows already, as a `<prefix>` switch
+/// does (see `main`), and they are as good as a listing's but for what has
+/// changed since outside this nvmux.
+#[derive(Debug, Default)]
+pub enum Listing {
+    /// No rows in hand: the picker lists, and its first frame waits for the
+    /// answer.
+    #[default]
+    Ask,
+    /// A listing taken a moment ago, which one taken now would only repeat:
+    /// the one nvmux started its clients ahead from (see `main`).
+    Fresh(Vec<Session>),
+    /// The rows as nvmux last had them, drawn at once, and a listing under way
+    /// on a thread of its own, whose answer replaces them once it has come and
+    /// the picker is at rest (see [`take_listing`]).
+    InHand(Vec<Session>, Behind),
+}
+
+/// The answer of a listing under way behind the picker: see
+/// [`Listing::InHand`].
+pub type Behind = std::sync::mpsc::Receiver<Result<Vec<Session>>>;
+
+impl Listing {
+    /// `rows`, up at once, and a listing begun now on a thread `transport` is
+    /// lent to.
+    ///
+    /// A thread that cannot be had leaves the rows as they are: the answer
+    /// that never comes is a channel that has hung up, and the picker takes
+    /// that as no news.
+    pub fn in_hand(rows: Vec<Session>, transport: &crate::transport::Shared) -> Self {
+        let (tell, answer) = std::sync::mpsc::channel();
+        let transport = std::sync::Arc::clone(transport);
+        let spawned = std::thread::Builder::new()
+            .name("nvmux-listing".into())
+            .spawn(move || {
+                // A picker gone by now has nobody left to tell, and loses
+                // nothing: the next one lists again.
+                let _ = tell.send(transport.list_sessions());
+            });
+        if let Err(e) = spawned {
+            tracing::debug!(error = %e, "no thread to list the sessions behind the picker");
+        }
+        Self::InHand(rows, answer)
+    }
+}
+
 use std::collections::{HashSet, VecDeque};
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
@@ -131,7 +185,7 @@ use crate::error::Result;
 use crate::handoff::HandOff;
 use crate::session::Session;
 use crate::transport::Transport;
-use app::{App, Key, Mouse, Request};
+use app::{App, Key, Mode, Mouse, Request};
 
 /// A bounded poll rather than an indefinite read, so a resize is not stuck
 /// behind an idle keyboard.
@@ -349,10 +403,12 @@ pub(crate) fn poll_key_for(tick: Duration) -> Result<Option<Key>> {
     })
 }
 
-/// Run the picker until the user attaches or quits. `message` replaces the hint
-/// row — how a failed attach reports itself without exiting the program.
-/// `focused` is the session the caller came from, if any: the cursor starts on
-/// it, so `<prefix> Space` opens the picker where the user already was.
+/// Run the picker until the user attaches or quits. `listing` is what it opens
+/// on: rows in hand or a listing to wait for (see [`Listing`]). `message`
+/// replaces the hint row — how a failed attach reports itself without exiting
+/// the program. `focused` is the session the caller came from, if any: the
+/// cursor starts on it, so `<prefix> Space` opens the picker where the user
+/// already was.
 ///
 /// `still_attached` says that session still has a client behind it, which is
 /// what makes `Esc` a way back to it rather than a key that does nothing. It is
@@ -368,6 +424,7 @@ pub(crate) fn poll_key_for(tick: Duration) -> Result<Option<Key>> {
 /// [`crate::tell`]).
 pub fn run(
     transport: &dyn Transport,
+    listing: Listing,
     message: Option<String>,
     focused: Option<&str>,
     still_attached: bool,
@@ -375,16 +432,39 @@ pub fn run(
     notifier: &crate::tell::Notifier,
 ) -> Result<Outcome> {
     owning_for_attach_leaving(Outcome::attaches, Outcome::leaves, true, |terminal| {
-        run_loop(
-            terminal,
-            transport,
-            message,
-            focused,
-            still_attached,
-            seen,
-            notifier,
-        )
+        let (app, behind) = open(transport, listing, message, focused, still_attached)?;
+        run_loop(terminal, transport, app, behind, seen, notifier)
     })
+}
+
+/// The picker as it comes up: on the rows `listing` has, or a listing's, with
+/// the cursor on `focused` and `message` on the hint row — and the listing
+/// under way behind the rows, while it is, to be taken up on the first pass
+/// at rest after it answers (see [`take_listing`]) and let go of by every
+/// listing the picker takes itself (see [`refresh`]).
+fn open(
+    transport: &dyn Transport,
+    listing: Listing,
+    message: Option<String>,
+    focused: Option<&str>,
+    still_attached: bool,
+) -> Result<(App, Option<Behind>)> {
+    let (rows, behind) = match listing {
+        Listing::Ask => (transport.list_sessions()?, None),
+        Listing::Fresh(rows) => (rows, None),
+        Listing::InHand(rows, answer) => (rows, Some(answer)),
+    };
+    let mut app = App::new(rows);
+    if let Some(id) = focused {
+        app.select_session(id);
+        if still_attached {
+            app.set_came_from(id);
+        }
+    }
+    if let Some(msg) = message {
+        app.set_message(msg);
+    }
+    Ok((app, behind))
 }
 
 /// How long, of one pass of the picker's loop, may go on handing sessions to
@@ -397,13 +477,11 @@ const HAND_OVER: Duration = Duration::from_millis(8);
 fn run_loop(
     terminal: &mut ratatui::DefaultTerminal,
     transport: &dyn Transport,
-    message: Option<String>,
-    focused: Option<&str>,
-    still_attached: bool,
+    mut app: App,
+    mut behind: Option<Behind>,
     seen: Option<&str>,
     notifier: &crate::tell::Notifier,
 ) -> Result<Outcome> {
-    let mut app = App::new(transport.list_sessions()?);
     app.set_unsaved(unsaved());
     // What each session has to report: read on a thread of its own (see
     // `crate::notes::Poller`), each session handed to it once the loop has
@@ -417,15 +495,6 @@ fn run_loop(
     // reads can take.
     let mut heard = false;
     let opened = Instant::now();
-    if let Some(id) = focused {
-        app.select_session(id);
-        if still_attached {
-            app.set_came_from(id);
-        }
-    }
-    if let Some(msg) = message {
-        app.set_message(msg);
-    }
 
     // Dissolve the picker up out of the background before taking any input.
     // In place of a first draw: the fade's last frame is the plain screen, so
@@ -455,6 +524,11 @@ fn run_loop(
 
     loop {
         tick(&mut app, &mut ticked);
+
+        // The listing behind the rows in hand, if it has answered, before the
+        // sessions are handed over below: one it adds is handed over on this
+        // pass.
+        take_listing(&mut app, &mut behind);
 
         // Every session the listing has that the reader has not been given —
         // all of them at first, and whatever a later listing adds — handed
@@ -497,12 +571,13 @@ fn run_loop(
 
         // A frame's wait while anything is moving, so it moves, and while the
         // sessions are still to be handed to the reader of their notes, or it
-        // has yet to answer, so the notes come soon; a spinner's frame while
-        // one turns beside a busy session; the rest of the time — and all the
-        // time, with the effects switched off in `[effects]` and nothing busy
-        // — the picker changes on a key and nothing else, and waits the
-        // ordinary tick.
-        let tick_for = if app.animating() || !unread.is_empty() || awaiting {
+        // has yet to answer, so the notes come soon — and while a listing is
+        // under way behind the rows, so what it changes comes as soon; a
+        // spinner's frame while one turns beside a busy session; the rest of
+        // the time — and all the time, with the effects switched off in
+        // `[effects]` and nothing busy — the picker changes on a key and
+        // nothing else, and waits the ordinary tick.
+        let tick_for = if app.animating() || !unread.is_empty() || awaiting || behind.is_some() {
             crate::fade::FRAME
         } else if app.spinning() {
             note::SPIN
@@ -607,7 +682,7 @@ fn run_loop(
                             crate::fade::fade_in(terminal, |f| draw::draw(f, &app))?;
                         }
                     }
-                    prompt::Outcome::Renamed => refresh(&mut app, transport)?,
+                    prompt::Outcome::Renamed => refresh(&mut app, transport, &mut behind)?,
                 }
             }
 
@@ -620,7 +695,7 @@ fn run_loop(
                         prompt::Arrival::Cut,
                     )?;
                     if !matches!(outcome, prompt::Outcome::Cancelled) {
-                        refresh(&mut app, transport)?;
+                        refresh(&mut app, transport, &mut behind)?;
                     }
                 }
             }
@@ -631,7 +706,7 @@ fn run_loop(
                     if let Err(e) = transport.kill_session(&session) {
                         app.set_message(e.one_line());
                     }
-                    refresh(&mut app, transport)?;
+                    refresh(&mut app, transport, &mut behind)?;
                 }
             }
 
@@ -652,7 +727,7 @@ fn run_loop(
                 // listing's answer and not ours. `set_sessions` restores the
                 // selection by id, so the cursor stays on the session that was
                 // just placed.
-                refresh(&mut app, transport)?;
+                refresh(&mut app, transport, &mut behind)?;
             }
 
             Request::Help => help::run_on(terminal, false)?,
@@ -945,10 +1020,41 @@ fn settle(app: &App, transport: &dyn Transport, session: Session) -> (Session, V
     }
 }
 
-/// Re-list, restoring the selection by id (`set_sessions` does that).
-fn refresh(app: &mut App, transport: &dyn Transport) -> Result<()> {
+/// Re-list, restoring the selection by id (`set_sessions` does that) — and let
+/// go of the listing under way behind the rows in hand, if there is one. It
+/// was asked before whatever this listing follows, a kill or a rename, and
+/// taken up after it would put back what that changed.
+fn refresh(app: &mut App, transport: &dyn Transport, behind: &mut Option<Behind>) -> Result<()> {
+    *behind = None;
     app.set_sessions(transport.list_sessions()?);
     Ok(())
+}
+
+/// Take up the answer of the listing under way behind the rows in hand (see
+/// [`Listing::InHand`]), if it has come and the picker is at rest: browsing or
+/// filtering, with nothing on the move. A session picked up to be moved, a
+/// `[y/N]` about one, a row still fading — each of them about the rows as they
+/// are — keeps the answer waiting in its channel until it is over, so the rows
+/// never change under a question about one of them, nor under a frame of one.
+/// At rest, [`App::set_sessions`] has nothing to end but the rows, and keeps
+/// the cursor on its session.
+///
+/// A listing that failed leaves the rows as they are, and whatever needs the
+/// host next says so for itself.
+fn take_listing(app: &mut App, behind: &mut Option<Behind>) {
+    let Some(answer) = behind.as_ref() else {
+        return;
+    };
+    if !matches!(app.mode(), Mode::Normal | Mode::Filter) || app.animating() {
+        return;
+    }
+    match answer.try_recv() {
+        Err(TryRecvError::Empty) => return,
+        Ok(Ok(fresh)) => app.set_sessions(fresh),
+        Ok(Err(e)) => tracing::debug!(error = %e, "could not list the sessions behind the picker"),
+        Err(TryRecvError::Disconnected) => {}
+    }
+    *behind = None;
 }
 
 /// The largest resolved session number in a listing, or 0 for none.
@@ -1228,5 +1334,217 @@ mod tests {
         };
         assert!(without.leaves().is_empty());
         assert!(Outcome::Quit.leaves().is_empty());
+    }
+
+    /// A host that answers every listing with `rows`, `wait` after it is
+    /// asked, and counts the listings: all the picker's opening asks of one.
+    struct Lister {
+        location: crate::transport::Location,
+        rows: Vec<Session>,
+        wait: Duration,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Lister {
+        fn new(rows: Vec<Session>, wait: Duration) -> Self {
+            Self {
+                location: crate::transport::Location::Local,
+                rows,
+                wait,
+                asked: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn asked(&self) -> usize {
+            self.asked.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Transport for Lister {
+        fn location(&self) -> &crate::transport::Location {
+            &self.location
+        }
+        fn list_sessions(&self) -> Result<Vec<Session>> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(self.wait);
+            Ok(self.rows.clone())
+        }
+        fn create_session(&self, _: &str, _: &crate::launch::Launch, _: &str) -> Result<Session> {
+            unimplemented!()
+        }
+        fn kill_session(&self, _: &Session) -> Result<()> {
+            unimplemented!()
+        }
+        fn rename_session(&self, _: &Session, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        fn renumber(&self, _: &[Session]) -> Result<()> {
+            unimplemented!()
+        }
+        fn home(&self) -> &str {
+            unimplemented!()
+        }
+        fn dir_source(&self) -> crate::dirs::DirSource {
+            unimplemented!()
+        }
+        fn local_socket_for(&self, _: &Session) -> Result<std::path::PathBuf> {
+            unimplemented!()
+        }
+    }
+
+    /// Rows of these names, numbered as a listing numbers them: the ones
+    /// `test_support::picker` opens on, ids and all.
+    fn rows(names: &[&str]) -> Vec<Session> {
+        test_support::picker(names).sessions().to_vec()
+    }
+
+    fn names(app: &App) -> Vec<String> {
+        app.sessions().iter().map(|s| s.name.clone()).collect()
+    }
+
+    /// The id of the session the cursor is on.
+    fn cursor(app: &App) -> String {
+        app.visible()[app.selected_index()].id.clone()
+    }
+
+    /// The listing behind the rows, given until `within` to answer and be
+    /// taken up, a pass at a time as the picker's loop takes it.
+    fn take_up(app: &mut App, behind: &mut Option<Behind>, within: Duration) {
+        let deadline = Instant::now() + within;
+        while behind.is_some() && Instant::now() < deadline {
+            take_listing(app, behind);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// **What `<prefix> Space` used to wait for.** The picker opens on the rows
+    /// in hand however long the host takes to list — the cursor on the session
+    /// it came from — and what the listing behind them says replaces them on
+    /// the first pass after it answers, the cursor staying on its session.
+    #[test]
+    fn the_picker_opens_on_the_rows_in_hand_and_takes_the_listing_when_it_comes() {
+        let wait = Duration::from_millis(300);
+        let host = std::sync::Arc::new(Lister::new(rows(&["one", "two", "three"]), wait));
+        let shared: crate::transport::Shared = host.clone();
+        let started = Instant::now();
+        let (mut app, mut behind) = open(
+            host.as_ref(),
+            Listing::in_hand(rows(&["one", "two"]), &shared),
+            None,
+            Some("id000001"),
+            true,
+        )
+        .expect("open");
+        assert!(
+            started.elapsed() < wait,
+            "opened {:?} after it was asked, the host's time",
+            started.elapsed()
+        );
+        assert_eq!(names(&app), ["one", "two"]);
+        assert_eq!(cursor(&app), "id000001");
+
+        take_up(&mut app, &mut behind, Duration::from_secs(10));
+        assert!(
+            behind.is_none(),
+            "the listing behind the rows never answered"
+        );
+        assert_eq!(names(&app), ["one", "two", "three"]);
+        assert_eq!(cursor(&app), "id000001", "the cursor left its session");
+        assert_eq!(host.asked(), 1);
+    }
+
+    /// A listing taken a moment ago is opened on as it is, and the host is
+    /// asked nothing: the one nvmux started its clients ahead from. With no
+    /// rows in hand the picker lists, and opens on the answer.
+    #[test]
+    fn a_fresh_listing_is_opened_on_without_asking_the_host() {
+        let host = Lister::new(rows(&["one", "two", "three"]), Duration::ZERO);
+        let (app, behind) = open(
+            &host,
+            Listing::Fresh(rows(&["one", "two"])),
+            None,
+            None,
+            false,
+        )
+        .expect("open");
+        assert_eq!(names(&app), ["one", "two"]);
+        assert!(behind.is_none());
+        assert_eq!(host.asked(), 0, "a fresh listing was asked for again");
+
+        let (app, behind) = open(&host, Listing::Ask, None, None, false).expect("open");
+        assert_eq!(names(&app), ["one", "two", "three"]);
+        assert!(behind.is_none());
+        assert_eq!(host.asked(), 1);
+    }
+
+    /// A question about a row as it stands — a kill's `[y/N]`, a session
+    /// picked up to be moved — keeps the listing's answer waiting until it is
+    /// over and the picker is still, so the rows do not change under it; then
+    /// the answer is taken up.
+    #[test]
+    fn a_question_about_a_row_keeps_the_listing_waiting() {
+        for (what, ask, done) in [
+            ("a kill's [y/N]", Key::Char('x'), Key::Char('n')),
+            ("a session picked up", Key::Char(' '), Key::Esc),
+        ] {
+            let mut app = test_support::picker(&["one", "two"]);
+            let (tell, answer) = std::sync::mpsc::channel();
+            let mut behind = Some(answer);
+            app.on_key(ask);
+            // "one" gone, killed somewhere else.
+            tell.send(Ok(app.sessions()[1..].to_vec())).expect("send");
+            take_listing(&mut app, &mut behind);
+            assert!(behind.is_some(), "{what}: taken up under the question");
+            assert_eq!(names(&app), ["one", "two"], "{what}");
+
+            app.on_key(done);
+            app.tick(Duration::from_secs(5));
+            assert!(!app.animating(), "{what}: still moving");
+            take_listing(&mut app, &mut behind);
+            assert!(behind.is_none(), "{what}: left waiting once it was over");
+            assert_eq!(names(&app), ["two"], "{what}");
+        }
+    }
+
+    /// A listing that failed, or a thread that went without answering, leaves
+    /// the rows and the cursor as they were, and is no longer waited for.
+    #[test]
+    fn no_answer_leaves_the_rows_as_they_were() {
+        for what in ["a failed listing", "a thread that went"] {
+            let mut app = test_support::picker(&["one", "two"]);
+            app.on_key(Key::Down);
+            app.tick(Duration::from_secs(5));
+            let (tell, answer) = std::sync::mpsc::channel();
+            if what == "a failed listing" {
+                let gone = crate::error::NvmuxError::Io(std::io::Error::other("the link went"));
+                tell.send(Err(gone)).expect("send");
+            } else {
+                drop(tell);
+            }
+            let mut behind = Some(answer);
+            take_listing(&mut app, &mut behind);
+            assert!(behind.is_none(), "{what}: still waited for");
+            assert_eq!(names(&app), ["one", "two"], "{what}");
+            assert_eq!(cursor(&app), "id000001", "{what}");
+        }
+    }
+
+    /// A listing the picker takes itself, after a kill, a rename or a move,
+    /// lets go of the one behind the rows: asked before what it follows, that
+    /// one would put back what it changed — here a session just killed.
+    #[test]
+    fn a_listing_of_the_pickers_own_lets_go_of_the_one_behind() {
+        let mut app = test_support::picker(&["one", "two"]);
+        let host = Lister::new(app.sessions()[1..].to_vec(), Duration::ZERO);
+        let (tell, answer) = std::sync::mpsc::channel();
+        tell.send(Ok(app.sessions().to_vec())).expect("send");
+        let mut behind = Some(answer);
+        refresh(&mut app, &host, &mut behind).expect("refresh");
+        assert!(
+            behind.is_none(),
+            "the listing behind outlived the picker's own"
+        );
+        take_listing(&mut app, &mut behind);
+        assert_eq!(names(&app), ["two"]);
     }
 }
