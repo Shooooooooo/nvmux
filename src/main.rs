@@ -161,6 +161,11 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     if !config::get().client.lazy {
         start_every_client(transport, &mut pool);
     }
+    // The client settings the clients in hand were started under, for what
+    // the settings screen changes of them that telling cannot reach (see
+    // `settle`).
+    let mut clients = config::get().client;
+    let remote = matches!(transport.location(), transport::Location::Ssh(_));
     let mut message: Option<String> = None;
     // The session the last trip through the picker led to, so the next one
     // opens with the cursor on it rather than on the first row.
@@ -219,6 +224,8 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
         };
         // A session the listing no longer has has nothing to come back to.
         pool.keep_only(&listing);
+        // The picker may have had the settings changed.
+        settle(&mut clients, &mut attached, &mut pool);
         // Derived rather than carried: one fewer thing for the picker to keep
         // in step, and the listing it handed over is what it would be derived
         // from anyway.
@@ -507,7 +514,8 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 }
                 (pty::Outcome::ShowSettings, held) => {
                     attached = pool.set_aside(held);
-                    ui::settings::run()?;
+                    ui::settings::run(remote)?;
+                    settle(&mut clients, &mut attached, &mut pool);
                     continue;
                 }
                 (pty::Outcome::Switch(target), mut held) => {
@@ -605,6 +613,28 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
         focus = Some(current.id.clone());
     }
     Ok(())
+}
+
+/// What the settings screen changed of the clients that they cannot follow by
+/// being told (for what they can, see `pty::Attachment::open_desk`). The
+/// other kind of client, `[client] ui`, retires every one there is — the one
+/// held across the screen and those kept — for each session's next attach to
+/// start the new kind; clients no longer kept, `[client] per_session`, retire
+/// those kept, and kept ones are kept again from the next to leave the front.
+fn settle(
+    was: &mut config::ClientSettings,
+    attached: &mut Option<pty::Attachment>,
+    pool: &mut pool::Pool,
+) {
+    let now = config::get().client;
+    if now.ui != was.ui {
+        if let Some(a) = attached.take() {
+            a.terminate();
+        }
+        pool.retire_all();
+    }
+    pool.keep(now.per_session);
+    *was = now;
 }
 
 /// The attachment to relay next, from the pool if it has one for the session

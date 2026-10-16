@@ -659,7 +659,8 @@ fn run_loop(
             // What changed there runs from here: the picker's own copies of
             // its effects are read again, and the rest it reads as it goes.
             Request::Settings => {
-                settings::run_on(terminal, false)?;
+                let remote = matches!(transport.location(), crate::transport::Location::Ssh(_));
+                settings::run_on(terminal, false, remote)?;
                 app.reload_effects();
                 app.set_unsaved(unsaved());
             }

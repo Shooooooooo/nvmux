@@ -189,6 +189,11 @@ if chan then
 end
 return last";
 
+/// What takes [`MEASURE_LUA`] back out of the editor, given the client's
+/// channel: once nothing is centred, nothing is to be measured.
+pub const UNMEASURE_LUA: &str =
+    "pcall(vim.api.nvim_del_augroup_by_name, 'nvmux_centre_' .. select(1, ...))";
+
 /// How far into a window `slot` columns wide its grid `grid` columns wide is
 /// drawn: in its middle, odd slack to the right; nowhere in for a grid as
 /// wide as its window, or wider.

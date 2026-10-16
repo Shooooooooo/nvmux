@@ -237,6 +237,12 @@ impl Animator {
         }
     }
 
+    /// Animate with `effects` from here on: what is moving moves on to its
+    /// end, and nothing turned off starts again.
+    pub fn set_effects(&mut self, effects: Effects) {
+        self.effects = effects;
+    }
+
     /// Stop everything, and forget where the cursor was: the next batch
     /// places it, rather than sending it anywhere.
     pub fn reset(&mut self) {

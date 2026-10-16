@@ -312,6 +312,12 @@ pub struct Attachment {
     /// Whether the client is nvmux's own, which draws cards (see
     /// [`crate::card`]): Neovim's would be typed what tells it to.
     draws_cards: bool,
+    /// The settings generation the client last heard (see
+    /// [`crate::config::generation`]): the one it was started with, and then
+    /// the one it was last told. A relay that finds it stale tells it the
+    /// settings as they are now, before anything else (see
+    /// [`Attachment::open_desk`]).
+    heard: u64,
     /// What this relay has told its client to show, and what waits to go in:
     /// one a relay, and only for a client that draws cards.
     desk: Option<card::Desk>,
@@ -1136,6 +1142,15 @@ impl Attachment {
             shadow::Kept::arrival(card, size.cols, size.rows)
         });
         self.opening = desk.open(arrival);
+        // A client that last heard the settings before they changed — on
+        // the settings screen this relay is back from, or while it was kept —
+        // is told them as they are now, ahead of anything it is to show.
+        let generation = crate::config::generation();
+        if self.heard != generation {
+            self.heard = generation;
+            self.opening
+                .insert(0, card::Command::Settings(crate::config::get().drawing()));
+        }
         self.landed_since = self.hand_off.as_ref().and_then(HandOff::up_since);
         self.desk = Some(desk);
         landed
@@ -2466,6 +2481,11 @@ fn own_client(exe: &Path, sock: &Path) -> CommandBuilder {
     if let Some(palette) = crate::palette::get() {
         cmd.env(crate::client::PALETTE_ENV, palette.to_env());
     }
+    // The settings nvmux runs on, which may not be the file's.
+    cmd.env(
+        crate::client::SETTINGS_ENV,
+        crate::config::get().drawing().to_env(),
+    );
     in_place(cmd)
 }
 
@@ -2884,6 +2904,9 @@ fn spawn_client_with(
         unshown: None,
         probe: None,
         draws_cards,
+        // What its environment was given (see `own_client`), built on this
+        // thread a moment ago with nothing changed since.
+        heard: crate::config::generation(),
         desk: None,
         row: None,
         kept: shadow::Kept::default(),
@@ -5080,6 +5103,29 @@ mod tests {
             .not_saved(&crate::error::SaveError::Nowhere)
             .ends_with("— d detach anyway  esc stay"));
         assert!(!leave.overwrite);
+    }
+
+    /// A client that last heard the settings before they changed is told
+    /// them as they are, ahead of anything else the relay opens with; one
+    /// that heard them last is told nothing.
+    #[test]
+    fn a_relay_opens_by_telling_a_stale_client_the_settings() {
+        let mut a = attached_to("exec sleep 30");
+        a.draws_cards = true;
+        a.heard = crate::config::generation().wrapping_add(1);
+        a.open_desk();
+        assert_eq!(
+            a.opening.first(),
+            Some(&card::Command::Settings(crate::config::get().drawing()))
+        );
+        assert_eq!(a.heard, crate::config::generation());
+        a.open_desk();
+        assert!(
+            !a.opening
+                .iter()
+                .any(|c| matches!(c, card::Command::Settings(_))),
+            "told twice"
+        );
     }
 
     #[test]

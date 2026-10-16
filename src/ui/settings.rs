@@ -821,16 +821,22 @@ fn best(query: &str) -> usize {
 }
 
 /// Show the settings until the user closes them, on a terminal of its own,
-/// handing the session back afterwards.
-pub fn run() -> Result<()> {
+/// handing the session back afterwards. `remote` is whether the sessions
+/// are another machine's, where Neovim's own client takes an `nvim` on this
+/// one.
+pub fn run(remote: bool) -> Result<()> {
     // Reached from a session that has just dissolved out, so dissolve in.
-    super::owning(|terminal| run_on(terminal, true))
+    super::owning(|terminal| run_on(terminal, true, remote))
 }
 
 /// Show the settings on a terminal the caller already owns — how the picker
 /// answers `,`. `animate` is whether to dissolve in on the way in and out on
 /// the way out; from the picker the screen is already up, so it does not.
-pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> Result<()> {
+pub(super) fn run_on(
+    terminal: &mut ratatui::DefaultTerminal,
+    animate: bool,
+    remote: bool,
+) -> Result<()> {
     let mut state = State::open();
     if animate {
         crate::fade::fade_in(terminal, |f| draw(f, &state))?;
@@ -873,7 +879,9 @@ pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> 
         // already shows a new theme.
         let running = config::get();
         if state.live != *running {
-            if let Err(why) = config::apply(state.live.clone()) {
+            if let Err(why) = runnable(&state.live, &running, remote)
+                .and_then(|()| config::apply(state.live.clone()))
+            {
                 state.refused(why, (*running).clone());
             }
         }
@@ -894,6 +902,23 @@ pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> 
             return Ok(());
         }
     }
+}
+
+/// Whether nvmux can run on `live`, changed from `running`, beyond what the
+/// file's rules say: Neovim's own client, for sessions on another machine,
+/// is an `nvim` on this one, as `main` checks at the start.
+fn runnable(live: &Settings, running: &Settings, remote: bool) -> std::result::Result<(), String> {
+    let to_nvim = live.client.ui == config::Ui::Nvim && running.client.ui != config::Ui::Nvim;
+    if !(remote && to_nvim) {
+        return Ok(());
+    }
+    crate::nvim::check_local().map(|_| ()).map_err(|e| {
+        let why = e.to_string();
+        format!(
+            "client.ui = \"nvim\" needs nvim here — {}",
+            why.lines().next().unwrap_or_default()
+        )
+    })
 }
 
 /// Where the screen's parts go on `area`: one function for the drawing and
@@ -1824,6 +1849,20 @@ mod tests {
         key(&mut s, KeyCode::Down);
         key(&mut s, KeyCode::Right);
         assert!(!s.overwrite(), "not once anything has changed since");
+    }
+
+    /// Only a switch to Neovim's own client, for another machine's sessions,
+    /// has anything more to it than the file's rules: an `nvim` here.
+    #[test]
+    fn only_neovims_client_for_another_machine_needs_anything_more() {
+        let running = Settings::default();
+        let mut live = Settings::default();
+        live.client.ui = config::Ui::Nvim;
+        assert_eq!(runnable(&live, &running, false), Ok(()), "sessions here");
+        let mut other = Settings::default();
+        other.client.centre = true;
+        assert_eq!(runnable(&other, &running, true), Ok(()), "anything else");
+        assert_eq!(runnable(&live, &live, true), Ok(()), "already so");
     }
 
     // --- the mouse ----------------------------------------------------------

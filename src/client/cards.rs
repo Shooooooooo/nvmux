@@ -525,6 +525,8 @@ impl Cards {
                 let was = std::mem::replace(&mut self.held, held);
                 was != held && self.keyed().is_some()
             }
+            // The client's, not the cards': see `App::reconfigure`.
+            Command::Settings(_) => false,
         }
     }
 

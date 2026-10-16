@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{ConfigError, SaveError};
 use crate::palette::Rgb;
@@ -107,7 +107,7 @@ pub struct SessionSettings {
 /// The client that draws a session, on the pty nvmux relays (see
 /// [`crate::pty`]): nvmux's own, `nvmux --client`, unless `ui` says
 /// Neovim's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClientSettings {
     /// Which client draws a session.
@@ -233,8 +233,53 @@ impl Default for ClientSettings {
     }
 }
 
+/// What nvmux's own client draws with: `[client]` and `[effects]`, of the
+/// settings nvmux is running on.
+///
+/// Handed to a client as it starts, in its environment ([`Drawing::to_env`]),
+/// and told again whenever they change (`card::Command::Settings`), rather
+/// than read from the file by the client itself: the file does not have
+/// what the settings screen has changed and not saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Drawing {
+    pub client: ClientSettings,
+    pub effects: EffectsSettings,
+}
+
+impl Drawing {
+    /// As a client's environment carries it: JSON, on one line.
+    pub fn to_env(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// [`Drawing::to_env`] read back; `None` for anything else.
+    pub fn from_env(text: &str) -> Option<Drawing> {
+        serde_json::from_str(text).ok()
+    }
+
+    /// The settings a client runs on: these, and the defaults for what it
+    /// has no use for.
+    pub fn settings(&self) -> Settings {
+        Settings {
+            client: self.client,
+            effects: self.effects,
+            ..Settings::default()
+        }
+    }
+}
+
+impl Settings {
+    /// What nvmux's own client draws with, of these settings.
+    pub fn drawing(&self) -> Drawing {
+        Drawing {
+            client: self.client,
+            effects: self.effects,
+        }
+    }
+}
+
 /// `[client] ui`: whose client draws a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Ui {
     /// `nvim --remote-ui`: Neovim's own TUI.
@@ -343,7 +388,7 @@ impl<'de> Deserialize<'de> for ThemeColor {
 /// `[effects.smear]`, `[effects.particles]`, `[effects.scroll]`,
 /// `[effects.windows]` and `[effects.blink]` — with its own `enabled`. An effect runs only when both are on, which is what the
 /// `*_enabled` methods answer, so nothing reads one switch without the other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EffectsSettings {
     /// Master switch. Off, nothing animates, whatever the effects' own
@@ -453,7 +498,7 @@ impl EffectsSettings {
 /// jumping, its leading edge ahead and its trailing edge behind, so that a
 /// long move smears across the screen — Neovide's animated cursor (see
 /// [`crate::client::anim::smear`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SmearSettings {
     /// This effect's own switch, under `[effects] enabled`. Off unless turned
@@ -463,7 +508,7 @@ pub struct SmearSettings {
 
 /// nvmux's own client: what flies off the cursor as it moves — Neovide's
 /// `cursor_vfx_mode` (see [`crate::client::anim::vfx`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ParticleSettings {
     /// This effect's own switch, under `[effects] enabled`. Off by default,
@@ -473,7 +518,7 @@ pub struct ParticleSettings {
 }
 
 /// `[effects.particles] mode`, spelt as Neovide spells `cursor_vfx_mode`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ParticleMode {
     /// Particles coil off the cursor's path in a spiral.
@@ -518,7 +563,7 @@ impl ParticleMode {
 /// nvmux's own client: a scroll sliding the text through the window a row at
 /// a time — Neovide's smooth scrolling (see
 /// [`crate::client::anim::scroll`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ScrollSettings {
     /// This effect's own switch, under `[effects] enabled`. Off, the text
@@ -533,7 +578,7 @@ pub struct ScrollSettings {
 /// [`crate::client::anim::switch`]); a float, the message area or windows
 /// rearranged slide to their new place as Neovide's do — its
 /// `position_animation_length` (see [`crate::client::anim::motion`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WindowsSettings {
     /// This effect's own switch, under `[effects] enabled`.
@@ -544,7 +589,7 @@ pub struct WindowsSettings {
 /// flashing — Neovide's `cursor_smooth_blink` (see
 /// [`crate::client::anim::blink`]). Only a block cursor fades; a bar or an
 /// underline keeps the terminal's own blink.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BlinkSettings {
     /// This effect's own switch, under `[effects] enabled`. Off by default,
@@ -555,7 +600,7 @@ pub struct BlinkSettings {
 
 /// The fade between screens (see [`crate::fade`]): each one dissolves into the
 /// terminal's own background colour and the next dissolves up out of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FadeSettings {
     /// This effect's own switch, under `[effects] enabled`. Two things force
@@ -596,7 +641,7 @@ pub struct FadeSettings {
 /// places with on each move stepping aside, letting its bar go and throwing
 /// sparks (see [`crate::ui::swap`]); and the impact when it is put down (see
 /// [`crate::ui::landing`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MoveSettings {
     /// This effect's own switch, under `[effects] enabled`. Off, a session in
@@ -617,7 +662,7 @@ pub struct MoveSettings {
 
 /// The row the cursor leaves, fading from the selection's reversed bar back
 /// to a plain row (see [`crate::ui::effects`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CursorSettings {
     /// This effect's own switch, under `[effects] enabled`.
@@ -635,7 +680,7 @@ pub struct CursorSettings {
 /// through the client's start, and the session opening out of that line as
 /// the name dissolves into it (see [`crate::handoff`] and
 /// [`crate::fade::Iris`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AttachSettings {
     /// This effect's own switch, under `[effects] enabled`. Off, the picker
@@ -652,7 +697,7 @@ pub struct AttachSettings {
 /// the session's name ([`crate::ui::effects`]); once it is confirmed, the row
 /// erased from its end behind a cursor before the kill runs
 /// ([`crate::ui::backspace`]). One switch for both, being the one kill.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KillSettings {
     /// This effect's own switch, under `[effects] enabled`. Off, the question
@@ -667,7 +712,7 @@ pub struct KillSettings {
 
 /// The rows a filter keystroke drops, fading out where they stood (see
 /// [`crate::ui::effects`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FilterSettings {
     /// This effect's own switch, under `[effects] enabled`. On, the rows a
@@ -682,7 +727,7 @@ pub struct FilterSettings {
 /// will offer and the number it will have — then the picker closes onto that
 /// row and the prompt opens out of its name field (see
 /// [`crate::ui::app::App::make_room`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CreateSettings {
     /// This effect's own switch, under `[effects] enabled`. Off, the prompt
@@ -2683,6 +2728,28 @@ mod tests {
         let ours: toml::Table = toml::from_str(&uncommented).expect("valid toml");
         let readme: toml::Table = toml::from_str(readme_settings()).expect("valid toml");
         assert_eq!(ours, readme, "not the README's settings: {uncommented}");
+    }
+
+    /// What a client draws with goes to it in its environment and comes back
+    /// as it went, the rest of its settings the defaults.
+    #[test]
+    fn what_a_client_draws_with_survives_its_environment() {
+        let mut settings = Settings::default();
+        settings.client.ui = Ui::Nvim;
+        settings.client.window_width = 0;
+        settings.effects.enabled = false;
+        settings.effects.blink.enabled = true;
+        settings.keys.timeout_ms = 1500;
+        let drawing = settings.drawing();
+        assert_eq!(Drawing::from_env(&drawing.to_env()), Some(drawing));
+        assert_eq!(drawing.settings().client, settings.client);
+        assert_eq!(drawing.settings().effects, settings.effects);
+        assert_eq!(
+            drawing.settings().keys,
+            KeySettings::default(),
+            "not a client's"
+        );
+        assert_eq!(Drawing::from_env("{"), None);
     }
 
     // --- live settings (each test its own store) ---------------------------
