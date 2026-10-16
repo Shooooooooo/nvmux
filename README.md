@@ -216,7 +216,8 @@ for its long lines where they are not wrapped — all of them with `'wrap'`
 off, and with it on those of a Markdown table or code block. Otherwise it is
 `window_width`, 120 columns by default. A window showing a terminal keeps its
 whole width either way, since that is the width the program in it is told it
-has.
+has; so does a window whose text is in its middle already, as a start
+screen's is, since it was laid out for the whole window.
 
 ## Configuration
 

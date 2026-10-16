@@ -42,14 +42,21 @@ use super::grid::Text;
 /// it shows (the second: see [`crate::config::ClientSettings::smart_width`]).
 ///
 /// A window showing a terminal wants the whole terminal, more than any is
-/// wide — the program in it is told its window's width; a window that keeps
-/// its width wants that. Any other wants the width given — or, judged by
-/// what it shows, its buffer's `'textwidth'` where it has one, and room for
-/// its long lines where they are not wrapped: all of them with `'wrap'` off,
-/// and with it on those of a Markdown table or code block, where tree-sitter
-/// has a parser to say which those are. Enough room for nine in ten of them,
-/// the first few thousand saying as much as the rest; and the gutter as well
-/// — the line numbers, the signs and the folds.
+/// wide — the program in it is told its window's width. So does one whose
+/// text is in its middle already, as a start screen's is: every line set in
+/// from the left by about as much as the longest stops short of the
+/// window's right edge — to within a couple of columns, and the gutter,
+/// which the screen may or may not have left out. Such a screen laid itself
+/// out for the window's whole width, which `nvim_win_get_width` gives it
+/// whatever the grid; on a narrower grid it would be centred twice over,
+/// and so off to the right. A window that keeps its width wants that. Any
+/// other wants the width given — or, judged by what it shows, its buffer's
+/// `'textwidth'` where it has one, and room for its long lines where they
+/// are not wrapped: all of them with `'wrap'` off, and with it on those of a
+/// Markdown table or code block, where tree-sitter has a parser to say which
+/// those are. Enough room for nine in ten of them, the first few thousand
+/// saying as much as the rest; and the gutter as well — the line numbers,
+/// the signs and the folds.
 ///
 /// Answered as `{ 'laststatus', windows }`, `windows` each window as
 /// `{ window, wanted }`: `'laststatus'` says which windows have a status line
@@ -68,8 +75,35 @@ local api = vim.api
 local whole = 1073741824
 local blocks
 local seen = {}
+local edges = {}
 local function terminal(win)
   return vim.bo[api.nvim_win_get_buf(win)].buftype == 'terminal'
+end
+local function centred(win, buf)
+  local tick = vim.b[buf].changedtick
+  local e = edges[buf]
+  if not e or e.tick ~= tick then
+    e = { tick = tick }
+    local n = math.min(api.nvim_buf_line_count(buf), 4000)
+    for _, line in ipairs(api.nvim_buf_get_lines(buf, 0, n, false)) do
+      local ink = line:match('^.*%S')
+      if ink then
+        local lead = ink:match('^%s*')
+        if lead == '' then
+          e.left = nil
+          break
+        end
+        e.left = math.min(e.left or whole, vim.fn.strdisplaywidth(lead))
+        e.right = math.max(e.right or 0, vim.fn.strdisplaywidth(ink))
+      end
+    end
+    edges[buf] = e
+  end
+  if not e.left then
+    return false
+  end
+  local slack = api.nvim_win_get_width(win) - e.right - e.left
+  return slack >= -2 and slack <= vim.fn.getwininfo(win)[1].textoff + 2
 end
 local function blocked(buf, n)
   if blocks == nil then
@@ -128,10 +162,13 @@ local function of(win)
   if vim.wo[win].winfixwidth then
     return api.nvim_win_get_width(win)
   end
+  local buf = api.nvim_win_get_buf(win)
+  if centred(win, buf) then
+    return whole
+  end
   if not smart then
     return most
   end
-  local buf = api.nvim_win_get_buf(win)
   local gutter = vim.fn.getwininfo(win)[1].textoff
   local tw = vim.bo[buf].textwidth
   local w = tw > 0 and tw + gutter or most
