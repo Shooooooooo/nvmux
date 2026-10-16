@@ -60,7 +60,7 @@
 //! screen says how big a one it needs ([`Floating::area`]) — and for a
 //! session nvmux keeps no copy of, the screen takes the terminal as it always
 //! did ([`Outcome::ShowSettings`], [`Outcome::ShowHelp`],
-//! [`Outcome::ToPicker`]). With `[theme] float` off, none of them floats:
+//! [`Outcome::ToPicker`]). With `[style] float` off, none of them floats:
 //! each takes the terminal, wherever it could have floated.
 
 use std::os::fd::{AsRawFd, RawFd};
@@ -166,7 +166,7 @@ pub(super) enum What {
 
 impl What {
     /// What floats in place of the screen `outcome` would show full screen,
-    /// if it shows one that floats and they `float` (`[theme] float`).
+    /// if it shows one that floats and they `float` (`[style] float`).
     pub(super) fn of(outcome: Outcome, float: bool) -> Option<Self> {
         if !float {
             return None;
@@ -914,7 +914,7 @@ mod tests {
 
     /// The settings, the help and the picker float, each in place of its own
     /// screen and full screen as itself where it cannot; nothing else floats.
-    /// With `[theme] float` off, none of them does.
+    /// With `[style] float` off, none of them does.
     #[test]
     fn the_settings_the_help_and_the_picker_float_and_nothing_else() {
         for (outcome, what) in [

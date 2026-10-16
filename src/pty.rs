@@ -166,7 +166,7 @@ const WAITING: &str = " — press a key";
 /// How the relay ended. The attachment is handed back separately by [`relay`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// `<prefix> Space` with `[theme] float` off, on a terminal too small for
+    /// `<prefix> Space` with `[style] float` off, on a terminal too small for
     /// the picker to float over the session, or for a session nvmux keeps no
     /// copy of; or a rename from the picker floating: show the picker full
     /// screen. The child keeps running.
@@ -176,11 +176,11 @@ pub enum Outcome {
     /// `<prefix> c` — prompt for a name and create a new session. The child keeps
     /// running, so a cancelled prompt puts the user straight back.
     CreateNew,
-    /// `<prefix> ?` with `[theme] float` off, on a terminal too small for the
+    /// `<prefix> ?` with `[style] float` off, on a terminal too small for the
     /// help to float over the session, or a session nvmux keeps no copy of:
     /// show the key bindings full screen. The child keeps running.
     ShowHelp,
-    /// `<prefix> ,` with `[theme] float` off, on a terminal too small for the
+    /// `<prefix> ,` with `[style] float` off, on a terminal too small for the
     /// settings to float over the session, or a session nvmux keeps no copy
     /// of: show them full screen. The child keeps running.
     ShowSettings,
@@ -3764,9 +3764,9 @@ fn pump(
                             // the settings, the help or the picker, over the
                             // session, and back to it once they are taken down —
                             // unless they cannot float or are not to
-                            // (`[theme] float`), or where they lead needs the
+                            // (`[style] float`), or where they lead needs the
                             // session loop.
-                            let float = config::get().theme.float;
+                            let float = config::get().style.float;
                             let outcome = match panel::What::of(outcome, float) {
                                 Some(what) => {
                                     match panel::float(attachment, master_fd, winch, what)? {

@@ -24,7 +24,7 @@ pub enum Tab {
     Keys,
     Session,
     Client,
-    Theme,
+    Style,
     Effects,
 }
 
@@ -34,7 +34,7 @@ impl Tab {
         Tab::Keys,
         Tab::Session,
         Tab::Client,
-        Tab::Theme,
+        Tab::Style,
         Tab::Effects,
     ];
 
@@ -44,7 +44,7 @@ impl Tab {
             Tab::Keys => "keys",
             Tab::Session => "session",
             Tab::Client => "client",
-            Tab::Theme => "theme",
+            Tab::Style => "style",
             Tab::Effects => "effects",
         }
     }
@@ -98,7 +98,7 @@ pub enum Kind {
     Key(usize),
     /// `[session] command`.
     Command,
-    /// `[theme] color`.
+    /// `[style] color`.
     Colour,
 }
 
@@ -168,7 +168,7 @@ impl Setting {
                     .map_or(BINDINGS[row].key, |b| b.key),
             ),
             Kind::Command => Value::Text(settings.session.command.clone()),
-            Kind::Colour => Value::Colour(settings.theme.color),
+            Kind::Colour => Value::Colour(settings.style.color),
         }
     }
 
@@ -195,7 +195,7 @@ impl Setting {
                 settings.keys.bind.bind(BINDINGS[row].hint, *byte);
             }
             (Kind::Command, Value::Text(command)) => settings.session.command = command.clone(),
-            (Kind::Colour, Value::Colour(colour)) => settings.theme.color = *colour,
+            (Kind::Colour, Value::Colour(colour)) => settings.style.color = *colour,
             _ => debug_assert!(false, "{}: a value of another kind", self.path()),
         }
     }
@@ -384,18 +384,18 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
             ),
         )),
         row(
-            "theme",
+            "style",
             "color",
-            Tab::Theme,
+            Tab::Style,
             "nvmux's text and bars in that colour",
             Kind::Colour,
         ),
         row(
-            "theme",
+            "style",
             "float",
-            Tab::Theme,
+            Tab::Style,
             "the picker, settings and help float over the session; off, full screen",
-            switch!(theme.float),
+            switch!(style.float),
         ),
         row(
             "effects",

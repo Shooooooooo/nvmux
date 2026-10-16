@@ -52,7 +52,7 @@ use crate::palette::Rgb;
 
 /// The whole configuration. Each field is a table of its own, so the file reads
 /// as `[keys]`-style sections — `[keys.bind]` inside `[keys]` for the key after
-/// the prefix that runs each command, `[theme]` for how nvmux's own screens
+/// the prefix that runs each command, `[style]` for how nvmux's own screens
 /// look — the colour they are drawn in, and whether they float over a session
 /// — and `[effects]` with a table inside it for each
 /// effect: `[effects.fade]`, `[effects.move]`, `[effects.cursor]`,
@@ -70,7 +70,7 @@ pub struct Settings {
     pub keys: KeySettings,
     pub session: SessionSettings,
     pub client: ClientSettings,
-    pub theme: ThemeSettings,
+    pub style: StyleSettings,
     pub effects: EffectsSettings,
 }
 
@@ -311,7 +311,7 @@ impl Ui {
 /// float over it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct ThemeSettings {
+pub struct StyleSettings {
     /// What nvmux draws its own screens in: the picker, the prompt, the help
     /// and the wait for a session, and over a session the name an attach
     /// hands across.
@@ -346,7 +346,7 @@ pub struct ThemeSettings {
     pub float: bool,
 }
 
-impl Default for ThemeSettings {
+impl Default for StyleSettings {
     fn default() -> Self {
         Self {
             color: ThemeColor::Terminal,
@@ -355,7 +355,7 @@ impl Default for ThemeSettings {
     }
 }
 
-/// `[theme] color`: whose colour nvmux's own screens are drawn in.
+/// `[style] color`: whose colour nvmux's own screens are drawn in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThemeColor {
     /// The terminal's own: no colour set, as nvmux has always drawn.
@@ -1178,7 +1178,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
     let k = KeySettings::default();
     let s = SessionSettings::default();
     let c = ClientSettings::default();
-    let t = ThemeSettings::default();
+    let t = StyleSettings::default();
     let e = EffectsSettings::default();
     let f = e.fade;
     // A string as the file spells it. Quoted here rather than with `{:?}` in
@@ -1227,9 +1227,9 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          # window_width = {window_width:<8}   # with centre on, how many columns a window's text gets; 0 for no limit\n\
          # smart_width  = {smart_width:<8}   # or as many as what it shows wants: its 'textwidth', its long lines\n\
          \n\
-         [theme]\n\
-         # color = {theme_color:<10}   # or \"#rrggbb\": nvmux's text and bars in that colour\n\
-         # float = {theme_float:<10}   # the picker, settings and help over the session; false takes the screen\n\
+         [style]\n\
+         # color = {style_color:<10}   # or \"#rrggbb\": nvmux's text and bars in that colour\n\
+         # float = {style_float:<10}   # the picker, settings and help over the session; false takes the screen\n\
          \n\
          [effects]\n\
          # enabled = {effects_enabled}   # master switch: false turns every effect below off\n\
@@ -1283,8 +1283,8 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
         centre = c.centre,
         window_width = c.window_width,
         smart_width = c.smart_width,
-        theme_color = quoted(&t.color.name()),
-        theme_float = t.float,
+        style_color = quoted(&t.color.name()),
+        style_float = t.float,
         fade_enabled = f.enabled,
         fade_duration = f.duration_ms,
         fade_session = f.session,
@@ -2026,7 +2026,7 @@ mod tests {
             "[keys.bind]",
             "[session]",
             "[client]",
-            "[theme]",
+            "[style]",
             "[effects]",
             "[effects.smear]",
             "[effects.particles]",
@@ -2059,7 +2059,7 @@ mod tests {
             per_session = true\n\
             lazy = false\n\
             predict = true\n\
-            [theme]\n\
+            [style]\n\
             color = \"terminal\"\n\
             float = true\n\
             [effects]\n\
@@ -2285,7 +2285,7 @@ mod tests {
     /// spelt back the long way.
     #[test]
     fn the_screens_are_in_the_terminals_colours_unless_told() {
-        assert_eq!(Settings::default().theme.color, ThemeColor::Terminal);
+        assert_eq!(Settings::default().style.color, ThemeColor::Terminal);
         assert_eq!(ThemeColor::Terminal.name(), "terminal");
         for (spelt, rgb, name) in [
             ("#7aa2f7", Rgb(0x7a, 0xa2, 0xf7), "#7aa2f7"),
@@ -2294,17 +2294,17 @@ mod tests {
             ("#000", Rgb(0, 0, 0), "#000000"),
         ] {
             let s: Settings =
-                toml::from_str(&format!("[theme]\ncolor = \"{spelt}\"\n")).expect(spelt);
-            assert_eq!(s.theme.color, ThemeColor::Mono(rgb), "{spelt}");
-            assert_eq!(s.theme.color.name(), name, "{spelt}");
+                toml::from_str(&format!("[style]\ncolor = \"{spelt}\"\n")).expect(spelt);
+            assert_eq!(s.style.color, ThemeColor::Mono(rgb), "{spelt}");
+            assert_eq!(s.style.color.name(), name, "{spelt}");
             assert_eq!(
-                ThemeColor::parse(&s.theme.color.name()),
-                Ok(s.theme.color),
+                ThemeColor::parse(&s.style.color.name()),
+                Ok(s.style.color),
                 "{spelt} round trips"
             );
             assert_eq!(s.effects, EffectsSettings::default(), "the rest as it was");
         }
-        let s: Settings = toml::from_str("[theme]\ncolor = \"terminal\"\n").expect("valid");
+        let s: Settings = toml::from_str("[style]\ncolor = \"terminal\"\n").expect("valid");
         assert_eq!(s, Settings::default(), "the default, said out loud");
     }
 
@@ -2313,14 +2313,14 @@ mod tests {
     /// was.
     #[test]
     fn the_screens_float_over_the_session_unless_told() {
-        assert!(Settings::default().theme.float);
-        let s: Settings = toml::from_str("[theme]\nfloat = false\n").expect("valid");
-        assert!(!s.theme.float);
-        assert_eq!(s.theme.color, ThemeColor::Terminal, "the colour as it was");
-        let s: Settings = toml::from_str("[theme]\nfloat = true\n").expect("valid");
+        assert!(Settings::default().style.float);
+        let s: Settings = toml::from_str("[style]\nfloat = false\n").expect("valid");
+        assert!(!s.style.float);
+        assert_eq!(s.style.color, ThemeColor::Terminal, "the colour as it was");
+        let s: Settings = toml::from_str("[style]\nfloat = true\n").expect("valid");
         assert_eq!(s, Settings::default(), "the default, said out loud");
         assert!(
-            toml::from_str::<Settings>("[theme]\nfloat = \"yes\"\n").is_err(),
+            toml::from_str::<Settings>("[style]\nfloat = \"yes\"\n").is_err(),
             "a switch is true or false"
         );
     }
@@ -2494,17 +2494,21 @@ mod tests {
             ("an unknown session key", "[session]\ncmd = \"nvim\"\n"),
             ("an unknown fade key", "[effects.fade]\nduration = 40\n"),
             ("an unknown client key", "[client]\nkeep = true\n"),
-            ("an unknown theme key", "[theme]\ncolour = \"#7aa2f7\"\n"),
-            ("a colour by name", "[theme]\ncolor = \"blue\"\n"),
-            ("a colour with no #", "[theme]\ncolor = \"7aa2f7\"\n"),
-            ("a colour as a number", "[theme]\ncolor = 0x7aa2f7\n"),
+            ("an unknown style key", "[style]\ncolour = \"#7aa2f7\"\n"),
+            ("a colour by name", "[style]\ncolor = \"blue\"\n"),
+            ("a colour with no #", "[style]\ncolor = \"7aa2f7\"\n"),
+            ("a colour as a number", "[style]\ncolor = 0x7aa2f7\n"),
             (
                 "a colour of the wrong length",
-                "[theme]\ncolor = \"#7aa2f\"\n",
+                "[style]\ncolor = \"#7aa2f\"\n",
             ),
             (
-                "a theme's table outside [theme]",
+                "the colour outside [style]",
                 "[color]\ncolor = \"#7aa2f7\"\n",
+            ),
+            (
+                "the table [style] was called",
+                "[theme]\ncolor = \"#7aa2f7\"\n",
             ),
             ("an unknown effect", "[effects.sparkles]\nenabled = true\n"),
             (
@@ -2699,7 +2703,7 @@ mod tests {
         );
         assert!(rendered.contains("\n[client]\n"), "{rendered:?}");
         for table in [
-            "[theme]",
+            "[style]",
             "[effects]",
             "[effects.fade]",
             "[effects.move]",
@@ -2988,7 +2992,7 @@ mod tests {
     #[test]
     fn a_setting_with_no_line_is_added_to_its_table() {
         let before =
-            "[client]\nlazy = false\n# a note about the client\n\n[theme]\ncolor = \"#7aa2f7\"";
+            "[client]\nlazy = false\n# a note about the client\n\n[style]\ncolor = \"#7aa2f7\"";
         let saved: Settings = toml::from_str(before).expect("valid");
         let live = with(&saved, "client.centre", Value::Switch(true));
         let live = with(&live, "effects.blink.enabled", Value::Switch(true));
@@ -2998,7 +3002,7 @@ mod tests {
         assert_eq!(
             after,
             "[client]\nlazy = false\ncentre = true\nwindow_width = 100\n# a note about the client\n\n\
-             [theme]\ncolor = \"#7aa2f7\"\n\n[effects.blink]\nenabled = true\n"
+             [style]\ncolor = \"#7aa2f7\"\n\n[effects.blink]\nenabled = true\n"
         );
         assert_eq!(read_back(&after), Ok(live));
     }

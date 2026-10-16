@@ -6,7 +6,7 @@
 //! does ([`super::help`]). From a session, or the picker floating over one,
 //! it floats over the session instead, in a panel the relay draws and gives
 //! its keys to ([`Panel`], and see `crate::pty::panel`), and the session goes
-//! on behind it — unless `[theme] float` is off, or the terminal is too small
+//! on behind it — unless `[style] float` is off, or the terminal is too small
 //! for a panel ([`panel_area`]), where it takes the terminal as from the
 //! picker and hands the same client back afterwards.
 //! Either way the screen is the same: its rows are
@@ -100,7 +100,7 @@ const CURSOR: &str = "▋";
 /// Where a value too long for its room is cut.
 const ELLIPSIS: &str = "…";
 
-/// The terminal's own colours `←` and `→` step `[theme] color` through after
+/// The terminal's own colours `←` and `→` step `[style] color` through after
 /// `terminal`, by their ANSI indices 1 to 6, and what each is called.
 const COLOUR_NAMES: [&str; 6] = ["red", "green", "yellow", "blue", "magenta", "cyan"];
 
@@ -223,7 +223,7 @@ struct State {
     /// The settings a save was refused for because the file had changed the
     /// same ones: a second `w` with nothing changed since overwrites them.
     clash: Option<Settings>,
-    /// The terminal's colours 1 to 6, for `[theme] color`.
+    /// The terminal's colours 1 to 6, for `[style] color`.
     colours: [Rgb; 6],
     /// The row the bar last left, fading back from it. See [`State::tick`].
     glow: Option<Glow>,
@@ -721,7 +721,7 @@ impl State {
         }
     }
 
-    /// What `←` and `→` step `[theme] color` through: the terminal's own,
+    /// What `←` and `→` step `[style] color` through: the terminal's own,
     /// and then its colours.
     fn colour_options(&self) -> Vec<ThemeColor> {
         std::iter::once(ThemeColor::Terminal)
@@ -2258,8 +2258,8 @@ mod tests {
     #[test]
     fn a_click_on_a_tab_opens_it() {
         let mut s = state();
-        mouse(&mut s, Gesture::Press(Some(Hit::Tab(Tab::Theme))));
-        assert_eq!((s.tab, s.selected), (Tab::Theme, 0));
+        mouse(&mut s, Gesture::Press(Some(Hit::Tab(Tab::Style))));
+        assert_eq!((s.tab, s.selected), (Tab::Style, 0));
     }
 
     /// A click ends an edit, keeping nothing; the wheel does not.
@@ -2286,7 +2286,7 @@ mod tests {
         let lines = render(&s, 80, 24);
         assert_eq!(
             lines[1].trim(),
-            "keys   session   client   theme   effects",
+            "keys   session   client   style   effects",
             "{lines:#?}"
         );
         assert!(line_of(&lines, "ui").contains("▸ ui"), "{lines:#?}");
@@ -2389,9 +2389,9 @@ mod tests {
         assert_eq!(hit(&s, area, 0, y), Some(Hit::Row(lazy)));
         assert_eq!(hit(&s, area, 79, y), Some(Hit::Row(lazy)));
         assert_eq!(hit(&s, area, 40, 22), None, "the help is nothing");
-        let x = column(&lines[1], "theme");
-        assert_eq!(hit(&s, area, x - 1, 1), Some(Hit::Tab(Tab::Theme)));
-        assert_eq!(hit(&s, area, x + 5, 1), Some(Hit::Tab(Tab::Theme)));
+        let x = column(&lines[1], "style");
+        assert_eq!(hit(&s, area, x - 1, 1), Some(Hit::Tab(Tab::Style)));
+        assert_eq!(hit(&s, area, x + 5, 1), Some(Hit::Tab(Tab::Style)));
         assert_eq!(hit(&s, area, 0, 1), None);
     }
 

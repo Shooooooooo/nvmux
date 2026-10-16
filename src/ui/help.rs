@@ -6,7 +6,7 @@
 //! instead, as the settings do too: in a panel the relay draws and gives its
 //! keys to ([`Panel`], and see `crate::pty::panel`), the session going on
 //! behind it, dimmed. The panel is the table's size, the table being one that
-//! does not scroll. With `[theme] float` off, or on a terminal with no room
+//! does not scroll. With `[style] float` off, or on a terminal with no room
 //! for the panel and some of the session round it ([`Floating::area`]), the
 //! help is full screen, as from the picker, handing the same client back
 //! afterwards.

@@ -19,7 +19,7 @@
 //!
 //! its sign in the colour the editor has for its kind — `WarningMsg`'s for a
 //! notification, `ErrorMsg`'s for a failure, `OkMsg`'s for a command that
-//! finished ([`Signs`]) — or in `[theme] color`, which takes their place; the
+//! finished ([`Signs`]) — or in `[style] color`, which takes their place; the
 //! session's name bold, in the editor's text colour or the theme's; its age
 //! counting on, faint; and what happened in italics, softer than the text.
 //! The newest on top, a row between one and the next, as many as there is

@@ -180,7 +180,7 @@ fn relay_child() {
     // The picker full screen, which ends the relay: where these tests park a
     // kept client, and what a moved picker key is seen to do. Floating, it
     // would stay in the relay, over the session.
-    settings.theme.float = false;
+    settings.style.float = false;
     if let Ok(bind) = std::env::var(CHILD_BIND) {
         let moved: nvmux::config::Settings =
             toml::from_str(&format!("[keys.bind]\n{bind}\n")).expect("a [keys.bind] table");

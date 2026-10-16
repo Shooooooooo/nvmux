@@ -21,7 +21,7 @@
 //! # What it does not do floating
 //!
 //! A rename asks for the name on a screen of its own: the panel goes, and the
-//! picker comes up full screen, as `<prefix> Space` brings it with `[theme]
+//! picker comes up full screen, as `<prefix> Space` brings it with `[style]
 //! float` off ([`Leave::Picker`]). On a terminal with no room for the panel
 //! and the session round it, `<prefix> Space` has the picker full screen too.
 

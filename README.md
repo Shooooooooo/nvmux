@@ -107,7 +107,7 @@ under `[keys.bind]` — `detach = "x"` makes it `<prefix> x` — as
 | `settings` | `<prefix>` `,` | change nvmux's settings while it runs, over the session — `Esc` goes back |
 
 The picker, the help and the settings float over the session, which goes on
-running behind them, dimmed; `float = false` under `[theme]` has each take
+running behind them, dimmed; `float = false` under `[style]` has each take
 the whole screen instead.
 
 Two keys after the prefix are not commands, and stay where they are: a number
@@ -262,7 +262,7 @@ centre       = false    # on a wide terminal, each window's text in the middle o
 window_width = 120      # with centre on, how many columns a window's text gets; 0 for no limit
 smart_width  = true     # or as many as what it shows wants: its 'textwidth', its long lines
 
-[theme]
+[style]
 color = "terminal"   # or "#rrggbb": nvmux's text and bars in that colour; dim text stays dim
 float = true         # the picker, settings and help over the session; false takes the screen
 
