@@ -2832,6 +2832,10 @@ fn spawn_client_with(
         .openpty(size)
         .map_err(|e| NvmuxError::Io(std::io::Error::other(e.to_string())))?;
 
+    // Before the child starts on it, so that no moment of its life finds the
+    // pty echoing what the relay writes in.
+    take_input_as_written(pair.master.as_ref());
+
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -2884,6 +2888,50 @@ fn spawn_client_with(
         opening: Vec::new(),
         landed_since: None,
     })
+}
+
+/// Have the pty hand the client its input exactly as the relay writes it:
+/// nothing echoed back, nothing kept for the end of a line or edited on the
+/// way, no key made a signal and no `CR` a `NL` — the raw input a client sets
+/// its terminal to as it starts, set before it starts. What the client writes
+/// is left as the pty has it until the client makes that raw too, so nothing
+/// it says reads any differently.
+///
+/// A pty opens cooked, and a fresh client is milliseconds from making it raw
+/// — an exec, a config file, a socket to connect to — where its relay may
+/// write at once: with no first paint held for a fade (see [`Hold`]), the
+/// card it opens with goes in as it starts (see
+/// [`Attachment::put_in_opening`]). A cooked pty echoed that card straight
+/// back, its `ESC`s spelt `^[`, and the relay passed the echo on as the
+/// client's own output: onto the primary screen it had just cleared for the
+/// client, which had yet to leave it for the alternate one — the screen a
+/// detach goes back to, where the shell's prompt came up under rows of hex. A
+/// key typed in that moment went the same way, a `Ctrl-C` killed the client,
+/// and an `Enter` reached it as `Ctrl-J`.
+///
+/// A client leaving puts back the terminal it was handed — this one — so the
+/// same holds once it has, for whatever is still on its way in.
+///
+/// Through the master, which sets the slave's termios on Linux and macOS
+/// both: portable-pty hands back no descriptor for the slave. A pty that will
+/// not take it is used as it came.
+fn take_input_as_written(master: &dyn MasterPty) {
+    use nix::sys::termios::{self, SetArg};
+
+    let Some(fd) = master.as_raw_fd() else {
+        return;
+    };
+    // SAFETY: the master's own descriptor, which outlives this call.
+    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    let made = termios::tcgetattr(fd).and_then(|opened| {
+        let mut raw = opened.clone();
+        termios::cfmakeraw(&mut raw);
+        raw.output_flags = opened.output_flags;
+        termios::tcsetattr(fd, SetArg::TCSANOW, &raw)
+    });
+    if let Err(e) = made {
+        tracing::warn!(error = %e, "could not make a client's input raw; it may be echoed");
+    }
 }
 
 /// Relay bytes between the terminal and the child until something interrupts it.
@@ -6020,6 +6068,49 @@ mod tests {
         assert!(
             !wait_briefly_for(&a, b'|'),
             "a report reached a client that asked for none"
+        );
+    }
+
+    /// **The regression test for the hex above the shell's prompt.** Nothing
+    /// written into a client's input comes back out of its pty: not before the
+    /// client has made its terminal raw, which is when a fresh relay puts its
+    /// first card in, and not once it has put it back on its way out. What
+    /// comes out is read as the client's own output, and relayed as that (see
+    /// [`take_input_as_written`]).
+    #[test]
+    fn nothing_written_into_a_clients_input_comes_back_out() {
+        for (when, script) in [
+            (
+                "before the client made its terminal raw",
+                "printf r; exec sleep 30",
+            ),
+            (
+                "once the client had put its terminal back",
+                r#"t=$(stty -g); stty raw -echo; stty "$t"; printf r; exec sleep 30"#,
+            ),
+        ] {
+            let mut a = attached_to(script);
+            wait_until_ready(&a);
+            a.tell_client(&card::Command::Clear);
+            assert!(!wait_briefly_for(&a, b'_'), "the card came back out {when}");
+        }
+    }
+
+    /// And what is written in reaches the client as it was written, whatever
+    /// the client has made of its terminal yet: not held for the end of a
+    /// line, not edited by a `DEL`, and a `CR` still a `CR`.
+    #[test]
+    fn what_is_written_into_a_clients_input_reaches_it_as_written() {
+        let mut a = attached_to(
+            r#"printf r; head -c 3 | od -An -c | tr -d ' \n'; printf '|'; exec sleep 30"#,
+        );
+        wait_until_ready(&a);
+        a.writer.write_all(b"a\r\x7f").expect("write");
+        a.writer.flush().expect("flush");
+        let heard = read_until(&a, b'|');
+        assert!(
+            heard.ends_with("a\\r177|"),
+            "the client read something else: {heard:?}"
         );
     }
 

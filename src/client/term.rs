@@ -74,7 +74,8 @@ pub fn title(text: &str) -> Vec<u8> {
 
 /// The pty in raw mode for as long as this lives: keys arrive as bytes, a
 /// `Ctrl-C` is a key rather than a signal, and nothing is echoed or
-/// translated on the way in or out. Put back as it was when dropped.
+/// translated on the way in or out. Put back as it was when dropped: as nvmux
+/// handed it over, its input raw already (see `pty::take_input_as_written`).
 pub struct Raw {
     saved: Option<Termios>,
 }

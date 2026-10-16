@@ -23,10 +23,13 @@
 //! terminal sends — an APC opened by [`OPEN`] — which the client keeps for
 //! itself rather than typing (see [`crate::client::input`]). One write, and
 //! never inside a paste or a sequence of the terminal's own the relay is
-//! passing on (see [`Forwarded`]). What it carries is a [`Command`] as JSON,
-//! hex-encoded: plain ASCII, so that nothing in a name or a notification —
-//! an `ESC`, a `BEL`, a UTF-8 byte that is a C1 control on its own — can end
-//! the sequence early or reach the terminal.
+//! passing on (see [`Forwarded`]). Never echoed back out, either: the client's
+//! pty passes its input on untouched from before the client starts on it, so
+//! a card that goes in before the client is reading waits there until it is
+//! (see `pty::take_input_as_written`). What it carries is a [`Command`] as
+//! JSON, hex-encoded: plain ASCII, so that nothing in a name or a
+//! notification — an `ESC`, a `BEL`, a UTF-8 byte that is a C1 control on its
+//! own — can end the sequence early or reach the terminal.
 //!
 //! # From the notifier
 //!
