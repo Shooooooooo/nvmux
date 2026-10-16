@@ -1028,6 +1028,10 @@ pub struct App {
     /// The window grids asked to be narrower than their windows, and how
     /// wide: see [`wide`].
     narrowed: HashMap<u64, usize>,
+    /// The window grids the client has cut to the width it asked for, which
+    /// Neovim has not resized since, and how wide Neovim last had each: see
+    /// [`App::narrow_windows`].
+    cut: HashMap<u64, usize>,
     /// What each window of the tab page in front wants, by window, as the
     /// measure last said (see [`wide::MEASURE_LUA`]).
     wants: BTreeMap<i64, usize>,
@@ -1086,6 +1090,7 @@ impl App {
             smart: false,
             measuring: false,
             narrowed: HashMap::new(),
+            cut: HashMap::new(),
             wants: BTreeMap::new(),
             looked: HashSet::new(),
         }
@@ -1250,7 +1255,31 @@ impl App {
         }
         asks.sort_unstable();
         asks.dedup();
-        self.narrowed = want;
+        // An ask that would put a grid the client cut itself (see below)
+        // back as wide as Neovim last had it waits for Neovim to have resized
+        // it: taking both asks between one redraw and the next, Neovim would
+        // find its grid as wide as it was and say nothing, leaving the
+        // client's copy cut and what is past the cut never sent again. The
+        // pass after that resize asks it.
+        let mut narrowed = want;
+        asks.retain(|&(grid, width)| {
+            let Some(&before) = self.cut.get(&grid) else {
+                return true;
+            };
+            let to = match self.model.layout.get(&grid).map(|p| &p.place) {
+                Some(Place::Window { width: whole, .. }) if width == 0 => *whole,
+                _ => width,
+            };
+            if to != before {
+                return true;
+            }
+            match self.narrowed.get(&grid) {
+                Some(&w) => narrowed.insert(grid, w),
+                None => narrowed.remove(&grid),
+            };
+            false
+        });
+        self.narrowed = narrowed;
         let asked = !asks.is_empty();
         for (grid, width) in asks {
             // What Neovim does to its own copy of the grid once it has the
@@ -1267,6 +1296,7 @@ impl App {
                 .get_mut(&grid)
                 .filter(|g| width > 0 && width < g.width())
             {
+                self.cut.entry(grid).or_insert(g.width());
                 g.resize(width, g.height());
                 self.dirty = true;
             }
@@ -1296,6 +1326,9 @@ impl App {
     /// client goes: another UI of the session is to see the windows whole.
     /// Says whether there were any.
     pub fn let_windows_go(&mut self, now: Instant) -> bool {
+        // Nothing waits on Neovim's resizing a grid the client cut: its own
+        // copy no longer matters, and the windows are to be whole.
+        self.cut.clear();
         let window_width = std::mem::take(&mut self.window_width);
         let asked = self.narrow_windows(now);
         self.window_width = window_width;
@@ -1341,6 +1374,7 @@ impl App {
         // Asked and looked at afresh by this attach, which may not have the
         // windows the last one had grids for.
         self.narrowed.clear();
+        self.cut.clear();
         self.looked.clear();
         let mut opts = vec![
             ("rgb", Arg::Bool(true)),
@@ -1910,6 +1944,13 @@ impl App {
     fn apply(&mut self, batch: Vec<Event>, animate: bool, switched: &[u64], now: Instant) {
         let multigrid = self.multigrid();
         let before = self.anim.before(&self.model, &batch, multigrid, switched);
+        // A grid Neovim resizes is as wide as Neovim has it again, whatever
+        // the client cut it to (see `narrow_windows`).
+        for event in &batch {
+            if let Event::GridResize { grid, .. } | Event::GridDestroy { grid } = event {
+                self.cut.remove(grid);
+            }
+        }
         let mut changes = Changes::default();
         for event in batch {
             self.model.apply(event, &mut changes);
@@ -4475,6 +4516,55 @@ mod tests {
         );
         redraw(&mut a, vec![resize(2, 20, 5)], t0);
         assert!(narrowed(&calls(&mut a)).is_empty(), "and left be");
+    }
+
+    /// A window wanting its whole width again before Neovim has resized the
+    /// grid the client cut for it is asked for it once Neovim has: asked at
+    /// once, Neovim could take both asks before it redraws, find its grid
+    /// as wide as it was and say nothing, and the client's copy would stay
+    /// cut, with what is past the cut never sent again.
+    #[test]
+    fn a_grid_cut_is_asked_back_whole_once_neovim_has_cut_it() {
+        let t0 = Instant::now();
+        let (mut a, _) = wide_app(t0);
+        let n = Value::from;
+        redraw(
+            &mut a,
+            vec![
+                resize(1, 20, 6),
+                resize(2, 20, 5),
+                ("win_pos", vec![n(2), n(1000), n(0), n(0), n(20), n(5)]),
+                viewport(2, 1000),
+            ],
+            t0,
+        );
+        let resized = |calls: &[Call], width: i64| {
+            calls.iter().any(|(_, m, args)| {
+                m == "nvim_ui_try_resize_grid" && args[..] == [n(2), n(width), n(0)]
+            })
+        };
+        assert!(resized(&calls(&mut a), 8), "narrowed");
+        assert_eq!(a.model.grids[&2].width(), 8, "cut as asked");
+
+        let whole = Value::Array(vec![Value::Array(vec![n(1000), n(1 << 30)])]);
+        notify(
+            &mut a,
+            "nvmux_client",
+            vec!["measure".into(), 2.into(), whole],
+            t0,
+        );
+        assert!(
+            !resized(&calls(&mut a), 0),
+            "asked back before Neovim has cut it"
+        );
+        redraw(&mut a, vec![resize(2, 8, 5)], t0);
+        assert!(resized(&calls(&mut a), 0), "not asked back once it has");
+        redraw(&mut a, vec![resize(2, 20, 5)], t0);
+        assert_eq!(
+            (a.model.grids[&2].width(), a.model.inset(2)),
+            (20, 0),
+            "whole"
+        );
     }
 
     /// With nothing centred, nothing is measured, and nothing left in the
