@@ -18,50 +18,35 @@ detach, come back: the sessions, their windows and their buffers are still
 running on the host, where you left them — and nvmux's own client animates the
 scrolls, splits and switches on the way.
 
-[Who it's for](#who-its-for) · [Why not tmux?](#why-not-tmux) · [Install](#install) · [Use](#use) · [How it works](#how-it-works) · [Configuration](#configuration)
+[Who it's for](#who-its-for) · [Install](#install) · [Use](#use) · [How it works](#how-it-works) · [Configuration](#configuration)
 
 ## Who it's for
 
-nvmux is a very opinionated program. It suits folks who already run their
-terminal programs — shells, REPLs, coding agents — in Neovim terminal buffers,
-so that a Neovim session *is* the workspace, and nvmux only has to keep that
-session alive and get you back into it.
+nvmux is opinionated: it is for people who run their shells, REPLs and coding
+agents in Neovim terminal buffers. The session *is* the workspace; nvmux keeps
+it alive and gets you back into it.
 
-Pair it with [agent.nvim](https://github.com/Shooooooooo/agent.nvim) and a
-coding agent running in one of those buffers gains access to all your Neovim
-buffers, making it more powerful than the same agent in a standalone terminal.
+### Why not tmux?
 
-## Why not tmux?
+tmux redraws Neovim from its own grid, and your terminal's features have to
+survive the trip through it. In nvmux, a Neovim client draws straight to your
+terminal. The trade: nvmux holds Neovim sessions and nothing else. It is not a
+tmux replacement.
 
-| | tmux over ssh | nvmux |
-|---|---|---|
-| Who draws the screen | tmux re-renders the editor from its own grid | a Neovim client: nvmux's own, animated, or Neovim's, straight to your terminal |
-| Terminal features | have to survive a trip through tmux; some need coaxing | negotiated by that client with your terminal, through a relay that never rewrites them |
-| What it holds | any program, in panes and windows | Neovim sessions, and nothing else |
+Inside a session, your programs run in terminal buffers, not panes:
 
-That last row is the trade: nvmux is not a tmux replacement. It does one thing,
-which is why it can draw Neovim from Neovim's own account of its screen — or
-hand Neovim your terminal outright — rather than an imitation of one.
+- **They are text.** Search, yank and move through them with your own keys,
+  not a copy mode's.
+- **They are windows.** Split, float or tab them with the keys you edit with.
+- **They reach the editor.** A program in one can drive Neovim through
+  `$NVIM`. [agent.nvim](https://github.com/Shooooooooo/agent.nvim) uses this to
+  give a coding agent all your buffers.
+- **They report back.** Notifications and exit codes reach Lua, so nvmux knows
+  when a build finishes.
 
-### Terminal buffers, not panes
-
-What tmux holds in panes, nvmux leaves to terminal buffers. Over a pane, a
-terminal buffer:
-
-- **Is text.** Search it, yank from it and move through it with your own keys,
-  registers and plugins. There is no copy mode.
-- **Is a window.** Split it, float it or open it in a tab with the keys you
-  edit with. There is no second set of bindings.
-- **Reaches the editor.** Neovim sets `$NVIM` in it, so a program there can
-  open files and read buffers in its own session.
-- **Reports back.** Neovim hands a program's notifications and its shell's
-  exit codes to Lua. That is how nvmux knows a build has finished.
-
-The catch is libvterm, the emulator behind terminal buffers. It lags modern
-terminals: scrollback does not reflow on resize, for one. Neovim plans to
-replace it with Ghostty's libghostty-vt
-([neovim#33155](https://github.com/neovim/neovim/issues/33155), with a draft in
-[neovim#39773](https://github.com/neovim/neovim/pull/39773)).
+Their weak spot is libvterm, the emulator behind them: it does not reflow
+scrollback on resize. Neovim plans to replace it with Ghostty's libghostty-vt
+([neovim#33155](https://github.com/neovim/neovim/issues/33155)).
 
 ## Install
 
