@@ -242,7 +242,7 @@ command = "nvim --headless --listen {sock}"   # {sock} is required
 [client]
 ui           = "nvmux"  # who draws a session: nvmux's own client, animated; or "nvim"
 per_session  = true     # keep each session's client; a switch back reuses it
-lazy         = true     # start a client on its first visit; false starts all at launch
+lazy         = false    # start every client at launch; true waits for each session's first visit
 predict      = true     # over a slow link, scrolls show before Neovim answers
 centre       = false    # on a wide terminal, each window's text in the middle of the window
 window_width = 120      # with centre on, how many columns a window's text gets; 0 for no limit

@@ -143,18 +143,18 @@ pub struct ClientSettings {
     /// Start a session's client on its first visit, rather than every
     /// session's at once as nvmux starts.
     ///
-    /// On, the default, a session has no client until it is first attached
-    /// to — a fork, a probe, and a first paint to wait for, as on a switch to
-    /// it with `per_session` off. Off, nvmux starts one for every session
-    /// there is before the picker goes up, and holds each out of sight until
-    /// its session is first visited (see
-    /// [`crate::pty::Attachment::start_ahead`]). That visit then waits for
-    /// nothing: what the client drew meanwhile goes onto the terminal as it
-    /// was written, its questions to the terminal with it, and the terminal's
-    /// answers come back to it then. A session created after nvmux started is
-    /// started on its first visit either way.
+    /// Off, the default, nvmux starts one for every session there is before
+    /// the picker goes up, and holds each out of sight until its session is
+    /// first visited (see [`crate::pty::Attachment::start_ahead`]). That
+    /// visit then waits for nothing: what the client drew meanwhile goes onto
+    /// the terminal as it was written, its questions to the terminal with it,
+    /// and the terminal's answers come back to it then. On, a session has no
+    /// client until it is first attached to — a fork, a probe, and a first
+    /// paint to wait for, as on a switch to it with `per_session` off. A
+    /// session created after nvmux started is started on its first visit
+    /// either way.
     ///
-    /// What off costs:
+    /// What off costs, and so the reasons to turn it on:
     ///
     /// - Every session has a client — a UI of its server, with all that
     ///   `per_session` says that costs — from the moment nvmux starts, not
@@ -212,7 +212,7 @@ impl Default for ClientSettings {
         Self {
             ui: Ui::Nvmux,
             per_session: true,
-            lazy: true,
+            lazy: false,
             predict: true,
             centre: false,
             window_width: 120,
@@ -1113,7 +1113,7 @@ fn render_default_config(prefix: u8) -> String {
          [client]\n\
          # ui           = {ui:<8}   # nvmux's own animated client, or \"nvim\" for Neovim's\n\
          # per_session  = {per_session:<8}   # keep each session's client; a switch back reuses it\n\
-         # lazy         = {lazy:<8}   # start a client on its first visit, not at launch\n\
+         # lazy         = {lazy:<8}   # start every client at launch; true waits for each session's first visit\n\
          # predict      = {predict:<8}   # over a slow link, scrolls show before Neovim answers\n\
          # centre       = {centre:<8}   # on a wide terminal, each window's text in the middle of the window\n\
          # window_width = {window_width:<8}   # with centre on, how many columns a window's text gets; 0 for no limit\n\
@@ -1316,7 +1316,7 @@ mod tests {
             [client]\n\
             ui = \"nvmux\"\n\
             per_session = true\n\
-            lazy = true\n\
+            lazy = false\n\
             predict = true\n\
             [theme]\n\
             color = \"terminal\"\n\
@@ -1478,17 +1478,18 @@ mod tests {
         assert_eq!(s.session, SessionSettings::default());
     }
 
-    /// Lazy unless turned off, and turning it off leaves `per_session` as it
-    /// was: the two are independent, and either can be set alone.
+    /// Started at launch unless made lazy, and making them lazy leaves
+    /// `per_session` as it was: the two are independent, and either can be
+    /// set alone.
     #[test]
-    fn clients_start_on_their_first_visit_unless_turned_off() {
-        assert!(Settings::default().client.lazy);
-        let s: Settings = toml::from_str("[client]\nlazy = false\n").expect("valid");
-        assert!(!s.client.lazy);
+    fn clients_start_at_launch_unless_made_lazy() {
+        assert!(!Settings::default().client.lazy);
+        let s: Settings = toml::from_str("[client]\nlazy = true\n").expect("valid");
+        assert!(s.client.lazy);
         assert!(s.client.per_session, "and the clients are still kept");
         let s: Settings =
-            toml::from_str("[client]\nper_session = false\nlazy = false\n").expect("valid");
-        assert!(!s.client.lazy && !s.client.per_session);
+            toml::from_str("[client]\nper_session = false\nlazy = true\n").expect("valid");
+        assert!(s.client.lazy && !s.client.per_session);
     }
 
     /// Scrolls are predicted over a slow link unless turned off.
@@ -1497,7 +1498,7 @@ mod tests {
         assert!(Settings::default().client.predict);
         let s: Settings = toml::from_str("[client]\npredict = false\n").expect("valid");
         assert!(!s.client.predict);
-        assert!(s.client.per_session && s.client.lazy, "the rest as it was");
+        assert!(s.client.per_session && !s.client.lazy, "the rest as it was");
     }
 
     /// A wide terminal is left alone unless told otherwise, and each window's
@@ -1534,7 +1535,7 @@ mod tests {
         assert_eq!(Settings::default().client.ui, Ui::Nvmux);
         let s: Settings = toml::from_str("[client]\nui = \"nvim\"\n").expect("valid");
         assert_eq!(s.client.ui, Ui::Nvim);
-        assert!(s.client.per_session && s.client.lazy, "the rest as it was");
+        assert!(s.client.per_session && !s.client.lazy, "the rest as it was");
     }
 
     /// The terminal's own colours unless told otherwise; a colour is a line
@@ -1966,7 +1967,7 @@ mod tests {
         );
         for line in [
             "# per_session  = true",
-            "# lazy         = true",
+            "# lazy         = false",
             "# ui           = \"nvmux\"",
             "# predict      = true",
             "# centre       = false",
