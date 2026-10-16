@@ -164,7 +164,7 @@ pub fn colours() -> Option<Colours> {
 /// should be asked what its colours are even with the fade switched off.
 /// `NO_COLOR` answers no for all of them, as it does for the fade.
 pub fn want_palette() -> bool {
-    let effects = &crate::config::get().effects;
+    let effects = crate::config::get().effects;
     let wanted = effects.cursor_enabled()
         || effects.move_enabled()
         || effects.filter_enabled()

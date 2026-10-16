@@ -292,6 +292,18 @@ impl App {
         }
     }
 
+    /// Read the effects the picker keeps a copy of again, from the settings
+    /// as they now are: what the settings screen changed comes back with the
+    /// picker it closes onto (see [`crate::ui::settings`]).
+    pub fn reload_effects(&mut self) {
+        let effects = crate::config::get().effects;
+        self.trail = effects.move_enabled();
+        self.lights = effects.cursor_enabled();
+        self.sift = effects.filter_enabled();
+        self.kill = effects.kill_enabled();
+        self.create = effects.create_enabled();
+    }
+
     /// What every session has to report, as the latest round of reads found
     /// it (see [`crate::notes::Poller`]). A session missing from it has
     /// nothing to say.

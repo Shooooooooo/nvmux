@@ -27,10 +27,22 @@
 //! falls back to [`Settings::default`] when nothing has been initialised, so a
 //! unit test that never calls `init` reads the compiled defaults rather than a
 //! developer's real `~/.config/nvmux/config.toml`.
+//!
+//! # Live
+//!
+//! What `get` hands out is the settings nvmux is running on *now*: the
+//! settings screen ([`crate::ui::settings`]) changes them with [`apply`] while
+//! nvmux runs, and every change counts a [`generation`], which is how a reader
+//! that copied what it needed can tell its copy is stale. What the file holds
+//! is kept beside them ([`saved`]), so that what differs between the two is
+//! what is unsaved — and what a save writes. Each reader asks `get` when it
+//! needs a value rather than holding one, so most of nvmux follows a change
+//! with no more than that.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -50,7 +62,7 @@ use crate::palette::Rgb;
 /// (`[client] ui = "nvmux"`, see [`crate::client`]).
 ///
 /// Not `Copy`: `[session] command` owns a `String`. Nothing reads it by value —
-/// [`get`] hands out a `&'static Settings` — so this costs nothing.
+/// [`get`] hands out an `Arc` of it — so this costs nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
@@ -230,6 +242,19 @@ pub enum Ui {
     /// `nvmux --client`: nvmux's own, animated (see [`crate::client`]).
     #[default]
     Nvmux,
+}
+
+impl Ui {
+    /// Every client, in the order the settings screen steps through them.
+    pub const ALL: [Ui; 2] = [Ui::Nvmux, Ui::Nvim];
+
+    /// The client as the file spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Ui::Nvim => "nvim",
+            Ui::Nvmux => "nvmux",
+        }
+    }
 }
 
 /// The colour nvmux's own screens are drawn in (see [`crate::theme`]).
@@ -467,6 +492,16 @@ pub enum ParticleMode {
 }
 
 impl ParticleMode {
+    /// Every mode, in the order the settings screen steps through them.
+    pub const ALL: [ParticleMode; 6] = [
+        ParticleMode::Railgun,
+        ParticleMode::Torpedo,
+        ParticleMode::Pixiedust,
+        ParticleMode::Sonicboom,
+        ParticleMode::Ripple,
+        ParticleMode::Wireframe,
+    ];
+
     /// The mode as the file spells it.
     pub fn name(self) -> &'static str {
         match self {
@@ -887,17 +922,17 @@ impl<'de> Deserialize<'de> for CommandKey {
 
 /// Ceiling for `keys.timeout_ms`. Generous but finite: the value goes into a
 /// `poll` timeout as a `c_int`, and an absurd one is a hang, not a long wait.
-const MAX_TIMEOUT_MS: u64 = 60_000;
+pub(crate) const MAX_TIMEOUT_MS: u64 = 60_000;
 
 /// Ceiling for `effects.fade.duration_ms`. Two seconds is already a transition nobody
 /// wants to sit through, and a switch sits through one at every change of
 /// session; past it the value is a hang with a name.
-const MAX_FADE_MS: u64 = 2_000;
+pub(crate) const MAX_FADE_MS: u64 = 2_000;
 
 impl Settings {
     /// Rules that the deserializer cannot express. Kept minimal: only values that
     /// would misbehave at runtime, not taste.
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if self.keys.timeout_ms == 0 {
             // A zero poll timeout spins the relay at full speed while a prefix
             // is armed, and a number could never be typed.
@@ -1067,7 +1102,7 @@ pub fn with_prefix(prefix: u8) -> Settings {
 ///
 /// A line each, as the README's list of every setting has them: the long
 /// account of an option, what it costs included, is on its field here.
-fn render_default_config(prefix: u8) -> String {
+pub(crate) fn render_default_config(prefix: u8) -> String {
     let k = KeySettings::default();
     let s = SessionSettings::default();
     let c = ClientSettings::default();
@@ -1185,10 +1220,7 @@ fn render_default_config(prefix: u8) -> String {
         kill_enabled = e.kill.enabled,
         filter_enabled = e.filter.enabled,
         create_enabled = e.create.enabled,
-        ui = quoted(match c.ui {
-            Ui::Nvim => "nvim",
-            Ui::Nvmux => "nvmux",
-        }),
+        ui = quoted(c.ui.name()),
         smear_enabled = e.smear.enabled,
         particles_enabled = e.particles.enabled,
         particles_mode = quoted(e.particles.mode.name()),
@@ -1213,22 +1245,124 @@ pub fn write_default(path: &Path, prefix: u8) -> Result<(), ConfigError> {
     crate::paths::write_atomic(path, render_default_config(prefix).as_bytes()).map_err(err)
 }
 
-static SETTINGS: OnceLock<Settings> = OnceLock::new();
+/// The settings a process runs on, and what its file is known to hold.
+///
+/// One of these is the process-global behind [`get`]; tests make their own,
+/// so that a change one of them applies is never what another reads.
+struct Store {
+    /// What [`get`] hands out: the file's settings as loaded, and whatever has
+    /// been changed since.
+    live: RwLock<Arc<Settings>>,
+    /// What the file holds, as far as this process knows: as loaded, and then
+    /// as last saved. What differs from `live` is unsaved.
+    saved: RwLock<Arc<Settings>>,
+    /// How many changes `live` has seen. See [`generation`].
+    generation: AtomicU64,
+    /// Whether [`Store::init`] has run.
+    initialised: AtomicBool,
+}
+
+impl Store {
+    fn new() -> Self {
+        let defaults = Arc::new(Settings::default());
+        Self {
+            live: RwLock::new(defaults.clone()),
+            saved: RwLock::new(defaults),
+            generation: AtomicU64::new(0),
+            initialised: AtomicBool::new(false),
+        }
+    }
+
+    fn init(&self, settings: Settings) {
+        if self.initialised.swap(true, Ordering::SeqCst) {
+            tracing::warn!("settings initialised more than once; keeping the first");
+            return;
+        }
+        let settings = Arc::new(settings);
+        *write(&self.saved) = settings.clone();
+        *write(&self.live) = settings;
+    }
+
+    fn get(&self) -> Arc<Settings> {
+        read(&self.live).clone()
+    }
+
+    fn apply(&self, settings: Settings) -> Result<(), String> {
+        settings.validate()?;
+        let mut live = write(&self.live);
+        if **live != settings {
+            *live = Arc::new(settings);
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    fn saved(&self) -> Arc<Settings> {
+        read(&self.saved).clone()
+    }
+
+    fn set_saved(&self, settings: Settings) {
+        *write(&self.saved) = Arc::new(settings);
+    }
+}
+
+/// A lock that a panic elsewhere left poisoned still holds whole settings: a
+/// value is only ever swapped in whole, never edited in place.
+fn read(lock: &RwLock<Arc<Settings>>) -> std::sync::RwLockReadGuard<'_, Arc<Settings>> {
+    lock.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn write(lock: &RwLock<Arc<Settings>>) -> std::sync::RwLockWriteGuard<'_, Arc<Settings>> {
+    lock.write().unwrap_or_else(|e| e.into_inner())
+}
+
+static STORE: LazyLock<Store> = LazyLock::new(Store::new);
 
 /// Install the loaded settings, once, before anything reads them. `main` calls
 /// this at startup, and the relay tests' child process does the same; a second
 /// call in one process is a bug, so it warns and keeps the first.
+///
+/// They are what the file holds, too, as far as nvmux knows: see [`saved`].
 pub fn init(settings: Settings) {
-    if SETTINGS.set(settings).is_err() {
-        tracing::warn!("settings initialised more than once; keeping the first");
-    }
+    STORE.init(settings);
 }
 
-/// The active settings. Falls back to the defaults when [`init`] has not run —
-/// which is what keeps unit tests reading the compiled defaults, never a real
-/// user's file.
-pub fn get() -> &'static Settings {
-    SETTINGS.get_or_init(Settings::default)
+/// The settings nvmux is running on: those loaded, as the settings screen has
+/// changed them since. The defaults when [`init`] has not run — which is what
+/// keeps unit tests reading the compiled defaults, never a real user's file.
+///
+/// Asked for each time a value is needed rather than kept, so that a change
+/// reaches its reader: the `Arc` is a snapshot, as current as the moment it
+/// was taken.
+pub fn get() -> Arc<Settings> {
+    STORE.get()
+}
+
+/// Run on `settings` from now on, if they are valid — the rules [`load`]
+/// holds a file to — and count the change (see [`generation`]). Applying the
+/// settings already running changes nothing and counts nothing.
+pub fn apply(settings: Settings) -> Result<(), String> {
+    STORE.apply(settings)
+}
+
+/// How many changes [`apply`] has made since nvmux started. A reader that
+/// copied what it needed — a client told its settings, the picker its
+/// effects — notes the generation it copied at, and knows its copy is stale
+/// when this has moved on.
+pub fn generation() -> u64 {
+    STORE.generation.load(Ordering::SeqCst)
+}
+
+/// What the file holds, as far as nvmux knows: what [`init`] was given, until
+/// a save says otherwise ([`set_saved`]). Whatever [`get`] differs from it in
+/// is unsaved.
+pub fn saved() -> Arc<Settings> {
+    STORE.saved()
+}
+
+/// Record that the file now holds `settings`, once a save has written them.
+pub fn set_saved(settings: Settings) {
+    STORE.set_saved(settings);
 }
 
 #[cfg(test)]
@@ -2011,6 +2145,72 @@ mod tests {
         let ours: toml::Table = toml::from_str(&uncommented).expect("valid toml");
         let readme: toml::Table = toml::from_str(readme_settings()).expect("valid toml");
         assert_eq!(ours, readme, "not the README's settings: {uncommented}");
+    }
+
+    // --- live settings (each test its own store) ---------------------------
+
+    fn generation_of(store: &Store) -> u64 {
+        store.generation.load(Ordering::SeqCst)
+    }
+
+    /// A change is what `get` hands out from then on, and counts one
+    /// generation; the file is as it was until a save says otherwise.
+    #[test]
+    fn a_change_is_what_get_hands_out_and_counts_a_generation() {
+        let store = Store::new();
+        store.init(Settings::default());
+        let mut changed = Settings::default();
+        changed.keys.timeout_ms = 1500;
+        changed.effects.smear.enabled = true;
+
+        store.apply(changed.clone()).expect("valid");
+        assert_eq!(*store.get(), changed);
+        assert_eq!(generation_of(&store), 1);
+        assert_eq!(*store.saved(), Settings::default(), "the file is as it was");
+
+        store.apply(changed.clone()).expect("valid");
+        assert_eq!(
+            generation_of(&store),
+            1,
+            "the same settings again are no change"
+        );
+
+        store.set_saved(changed.clone());
+        assert_eq!(*store.saved(), changed);
+        assert_eq!(generation_of(&store), 1, "a save changes nothing that runs");
+    }
+
+    /// What a file would be refused for, a change is refused for, with the
+    /// same words, and nothing changes.
+    #[test]
+    fn a_change_a_file_would_be_refused_for_is_refused() {
+        let store = Store::new();
+        store.init(Settings::default());
+        let mut zero = Settings::default();
+        zero.keys.timeout_ms = 0;
+        let err = store.apply(zero).expect_err("a zero timeout");
+        assert!(err.contains("keys.timeout_ms"), "{err}");
+
+        let mut clash = Settings::default();
+        assert!(clash.keys.bind.bind("detach", b'c'));
+        let err = store.apply(clash).expect_err("two commands on one key");
+        assert!(err.contains("keys.bind.detach"), "{err}");
+
+        assert_eq!(*store.get(), Settings::default());
+        assert_eq!(generation_of(&store), 0);
+    }
+
+    /// The settings loaded are both what runs and what the file holds, and a
+    /// second load in one process is a mistake that changes neither.
+    #[test]
+    fn a_second_init_keeps_the_first() {
+        let store = Store::new();
+        let mut first = Settings::default();
+        first.client.lazy = !first.client.lazy;
+        store.init(first.clone());
+        store.init(Settings::default());
+        assert_eq!(*store.get(), first);
+        assert_eq!(*store.saved(), first);
     }
 
     // --- path resolution (pure) --------------------------------------------

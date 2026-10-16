@@ -51,6 +51,7 @@ pub mod pty;
 pub mod reconnect;
 pub mod rpc;
 pub mod session;
+pub mod settings;
 pub mod shadow;
 pub mod shell;
 pub mod ssh;
