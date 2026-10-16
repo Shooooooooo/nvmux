@@ -312,8 +312,9 @@ pub struct ThemeSettings {
     ///
     /// `"terminal"`, the default, sets no colour at all, so the screens are in
     /// the terminal's own foreground on its own background, shaded with dim,
-    /// bold and reverse. A colour, `"#rrggbb"` or `"#rgb"`, draws what they
-    /// draw at full strength in that one instead: the names and what is
+    /// bold and reverse. A colour, `"#rrggbb"` or `"#rgb"` or one xterm knows
+    /// by name like `"SteelBlue"` ([`crate::x11`]), draws what they draw at
+    /// full strength in that one instead: the names and what is
     /// typed, and the selection's bar, with the name standing out of it in the
     /// background's colour — every fade and effect over them taking it from
     /// that colour. What they draw dim — the session numbers, the notes, the
@@ -336,35 +337,57 @@ pub enum ThemeColor {
     Terminal,
     /// Shades of this one colour.
     Mono(Rgb),
+    /// Shades of a colour xterm knows by name: the name as X spells it, which
+    /// is what the file is given back, and the colour.
+    Named(&'static str, Rgb),
 }
 
 impl ThemeColor {
-    /// The value as the file spells it: `terminal`, or the colour as
-    /// `#rrggbb`.
+    /// The colour itself, or `None` for the terminal's own.
+    pub fn rgb(self) -> Option<Rgb> {
+        match self {
+            ThemeColor::Terminal => None,
+            ThemeColor::Mono(rgb) | ThemeColor::Named(_, rgb) => Some(rgb),
+        }
+    }
+
+    /// The value as the file spells it: `terminal`, a named colour by its
+    /// name, or any other as `#rrggbb`.
     pub fn name(self) -> String {
         match self {
             ThemeColor::Terminal => "terminal".to_string(),
             ThemeColor::Mono(Rgb(r, g, b)) => format!("#{r:02x}{g:02x}{b:02x}"),
+            ThemeColor::Named(name, _) => name.to_string(),
         }
     }
 
-    /// Read a value as the file spells it: `terminal`, or a colour as
-    /// `#rrggbb` or `#rgb`, the digits in either case.
+    /// Read a value as the file spells it: `terminal`; a colour as `#rrggbb`
+    /// or `#rgb`, the digits in either case; or one xterm knows by name, in
+    /// any case, with or without its spaces — `SteelBlue`, `steel blue`.
     ///
-    /// Those two are the spellings of a colour a terminal can answer in that
-    /// a person also writes, so they are read by the parser that reads the
-    /// terminal's answers ([`crate::palette`]), and `#f80` means `#ff8800`
+    /// The two in hex are the spellings of a colour a terminal can answer in
+    /// that a person also writes, so they are read by the parser that reads
+    /// the terminal's answers ([`crate::palette`]), and `#f80` means `#ff8800`
     /// there as it does here. Its other spellings — `rgb:ff/88/00`, and
-    /// twelve digits — are a terminal's, and are refused here.
+    /// twelve digits — are a terminal's, and are refused here. A name is read
+    /// as xterm reads one, as one of X11's ([`crate::x11`]), and kept by its
+    /// name as X spells it, so that a save writes the name back rather than
+    /// its hex.
     pub fn parse(s: &str) -> Result<ThemeColor, String> {
         if s == "terminal" {
             return Ok(ThemeColor::Terminal);
         }
-        s.strip_prefix('#')
+        let hex = s
+            .strip_prefix('#')
             .filter(|digits| matches!(digits.len(), 3 | 6))
             .and_then(|_| crate::palette::parse_colour(s))
-            .map(ThemeColor::Mono)
-            .ok_or_else(|| format!("color {s:?} must be \"terminal\" or a colour like \"#7aa2f7\""))
+            .map(ThemeColor::Mono);
+        hex.or_else(|| crate::x11::colour(s).map(|(name, rgb)| ThemeColor::Named(name, rgb)))
+            .ok_or_else(|| {
+                format!(
+                    "color {s:?} must be \"terminal\" or a colour like \"#7aa2f7\" or \"SteelBlue\""
+                )
+            })
     }
 }
 
@@ -1201,7 +1224,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          # smart_width  = {smart_width:<8}   # or as many as what it shows wants: its 'textwidth', its long lines\n\
          \n\
          [theme]\n\
-         # color = {theme_color}   # or \"#rrggbb\": nvmux's text and bars in that colour\n\
+         # color = {theme_color}   # or \"#rrggbb\" or \"SteelBlue\": nvmux's text and bars in that colour\n\
          \n\
          [effects]\n\
          # enabled = {effects_enabled}   # master switch: false turns every effect below off\n\
@@ -2278,13 +2301,49 @@ mod tests {
         assert_eq!(s, Settings::default(), "the default, said out loud");
     }
 
+    /// A colour xterm knows by name is a line away too, in any case and with
+    /// or without its spaces, and is spelt back as X spells it: by the name,
+    /// not its hex, so that a save keeps the name.
+    #[test]
+    fn a_colour_xterm_knows_by_name_is_kept_by_its_name() {
+        let steel = Rgb(0x46, 0x82, 0xb4);
+        for spelt in ["SteelBlue", "steelblue", "steel blue", "STEEL BLUE"] {
+            let s: Settings =
+                toml::from_str(&format!("[theme]\ncolor = \"{spelt}\"\n")).expect(spelt);
+            assert_eq!(
+                s.theme.color,
+                ThemeColor::Named("SteelBlue", steel),
+                "{spelt}"
+            );
+            assert_eq!(s.theme.color.name(), "SteelBlue", "{spelt}");
+            assert_eq!(s.theme.color.rgb(), Some(steel), "{spelt}");
+            assert_eq!(
+                ThemeColor::parse(&s.theme.color.name()),
+                Ok(s.theme.color),
+                "{spelt} round trips"
+            );
+        }
+        assert_ne!(
+            ThemeColor::parse("SteelBlue"),
+            ThemeColor::parse("#4682b4"),
+            "one colour, but the file spells one of them by its name"
+        );
+        assert_eq!(
+            ThemeColor::parse("red").map(ThemeColor::rgb),
+            Ok(Some(Rgb(0xff, 0x00, 0x00))),
+            "X's red, which is xterm's bright red"
+        );
+    }
+
     /// A colour that is not one is refused with the key it was in and the
     /// spellings that would have done.
     #[test]
     fn a_colour_that_is_not_one_says_what_would_be() {
         for bad in [
             "",
-            "blue",
+            "bleu",
+            "steel_blue",
+            "SteelBlue5",
             "Terminal",
             "7aa2f7",
             "#7aa2f",
@@ -2297,7 +2356,9 @@ mod tests {
         ] {
             let err = ThemeColor::parse(bad).expect_err(bad);
             assert!(
-                err.starts_with("color ") && err.contains("\"#7aa2f7\""),
+                err.starts_with("color ")
+                    && err.contains("\"#7aa2f7\"")
+                    && err.contains("\"SteelBlue\""),
                 "{bad:?} -> {err:?}"
             );
         }
@@ -2448,7 +2509,7 @@ mod tests {
             ("an unknown fade key", "[effects.fade]\nduration = 40\n"),
             ("an unknown client key", "[client]\nkeep = true\n"),
             ("an unknown theme key", "[theme]\ncolour = \"#7aa2f7\"\n"),
-            ("a colour by name", "[theme]\ncolor = \"blue\"\n"),
+            ("a name xterm does not know", "[theme]\ncolor = \"bleu\"\n"),
             ("a colour with no #", "[theme]\ncolor = \"7aa2f7\"\n"),
             ("a colour as a number", "[theme]\ncolor = 0x7aa2f7\n"),
             (
@@ -2878,6 +2939,25 @@ mod tests {
             vec!["# timeout_ms = 1000     # how long a lone prefix or half-typed number waits"]
         );
         assert_eq!(before.lines().count(), after.lines().count());
+        assert_eq!(read_back(&after), Ok(live));
+    }
+
+    /// A colour chosen by name is saved by its name, as X spells it however
+    /// it was typed, and reads back as the colour it was.
+    #[test]
+    fn a_colour_chosen_by_name_is_saved_by_its_name() {
+        let before = template();
+        let named = ThemeColor::parse("steel blue").expect("a name xterm knows");
+        let live = with(&Settings::default(), "theme.color", Value::Colour(named));
+        let (after, count) = save_over(Some(&before), &Settings::default(), &live);
+        assert_eq!(count, 1);
+        let (added, _) = diff(&before, &after);
+        assert_eq!(
+            added,
+            vec![
+                "color = \"SteelBlue\"  # or \"#rrggbb\" or \"SteelBlue\": nvmux's text and bars in that colour"
+            ]
+        );
         assert_eq!(read_back(&after), Ok(live));
     }
 

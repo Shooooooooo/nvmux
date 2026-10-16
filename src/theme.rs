@@ -74,10 +74,7 @@ pub fn ink() -> Option<Rgb> {
 /// wins over the config, as it does for the fade: honouring it means setting
 /// no colour whatever the file asks for.
 fn configured(color: ThemeColor, no_color: bool) -> Option<Rgb> {
-    match color {
-        ThemeColor::Mono(ink) if !no_color => Some(ink),
-        ThemeColor::Mono(_) | ThemeColor::Terminal => None,
-    }
+    color.rgb().filter(|_| !no_color)
 }
 
 /// Draw everything on `buf` that is at full strength and has no colour of its
@@ -120,12 +117,15 @@ mod tests {
         Color::Rgb(c.0, c.1, c.2)
     }
 
-    /// The config's colour, unless `NO_COLOR` says none at all; and none for
-    /// the terminal's own whatever `NO_COLOR` says.
+    /// The config's colour, by its hex or its name, unless `NO_COLOR` says
+    /// none at all; and none for the terminal's own whatever `NO_COLOR` says.
     #[test]
     fn the_ink_is_the_configured_colour_unless_no_color_says_none() {
+        let named = ThemeColor::parse("SteelBlue").expect("a name xterm knows");
         assert_eq!(configured(ThemeColor::Mono(INK), false), Some(INK));
         assert_eq!(configured(ThemeColor::Mono(INK), true), None);
+        assert_eq!(configured(named, false), Some(Rgb(0x46, 0x82, 0xb4)));
+        assert_eq!(configured(named, true), None);
         assert_eq!(configured(ThemeColor::Terminal, false), None);
         assert_eq!(configured(ThemeColor::Terminal, true), None);
     }

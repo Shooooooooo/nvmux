@@ -551,9 +551,9 @@ impl State {
             (Kind::Key(_), _) => Mode::Key,
             (_, Value::Number(n)) => Mode::Text(Field::with(n.to_string())),
             (_, Value::Text(command)) => Mode::Text(Field::with(command)),
-            // A colour of the terminal's own is a hex once it is typed at:
-            // `#` alone where nothing is chosen, to type after.
-            (_, Value::Colour(ThemeColor::Terminal)) => Mode::Text(Field::with("#".into())),
+            // Nothing where nothing is chosen, for a hex or a name to be
+            // typed in; otherwise the colour as the file has it.
+            (_, Value::Colour(ThemeColor::Terminal)) => Mode::Text(Field::with(String::new())),
             (_, Value::Colour(colour)) => Mode::Text(Field::with(colour.name())),
             _ => Mode::Browse,
         };
@@ -806,6 +806,12 @@ impl State {
             Value::Key(byte) => keys::key_label(*byte),
             Value::Text(text) => text.clone(),
             Value::Colour(ThemeColor::Terminal) => ThemeColor::Terminal.name(),
+            // One xterm knows by name by that name, which is what the file
+            // gets, with its hex. It is X's colour, not the terminal's: typed
+            // `red` is `#ff0000`, where the terminal's own red is colour 1.
+            Value::Colour(colour @ ThemeColor::Named(_, rgb)) => {
+                format!("{} ({})", colour.name(), ThemeColor::Mono(*rgb).name())
+            }
             // One of the terminal's own by its name, with the hex the file
             // gets; any other by its hex.
             Value::Colour(colour @ ThemeColor::Mono(rgb)) => {
@@ -1644,6 +1650,9 @@ fn hints(state: &State, current: Option<&Setting>, width: usize) -> (String, boo
             Some(Kind::Number { lo, hi, unit, .. }) => {
                 format!("{lo}–{hi}{unit}  ⏎ done  esc cancel")
             }
+            Some(Kind::Colour) => {
+                "#rrggbb or a name like SteelBlue  ⏎ done  esc cancel".to_string()
+            }
             _ => "⏎ done  esc cancel".to_string(),
         },
         Mode::Browse if state.find.is_some() => {
@@ -1901,6 +1910,42 @@ mod tests {
             s.error.as_deref().is_some_and(|e| e.starts_with("color ")),
             "{:?}",
             s.error
+        );
+    }
+
+    /// A colour xterm knows by name is typed in as a person writes it, from
+    /// nothing where nothing is chosen, and shown and opened again by its
+    /// name as X spells it — what the file gets — with its hex beside it.
+    #[test]
+    fn a_colour_is_typed_by_its_name_from_nothing() {
+        let mut s = state();
+        let colour = to(&mut s, "color");
+        key(&mut s, KeyCode::Enter);
+        assert_eq!(s.mode, Mode::Text(Field::with(String::new())));
+        assert_eq!(
+            hints(&s, s.current(), 80).0,
+            "#rrggbb or a name like SteelBlue  ⏎ done  esc cancel",
+            "what can be typed"
+        );
+        typed(&mut s, "steel blue");
+        key(&mut s, KeyCode::Enter);
+        assert_eq!(s.mode, Mode::Browse);
+        let named = colour.value(&s.live);
+        assert_eq!(s.shown(colour, &named), "SteelBlue (#4682b4)");
+        assert_eq!(named.toml().to_string(), "\"SteelBlue\"", "the file's");
+        assert!(
+            line_of(&render(&s, 80, 24), "color").contains("SteelBlue (#4682b4)"),
+            "on its row"
+        );
+
+        key(&mut s, KeyCode::Enter);
+        assert_eq!(s.mode, Mode::Text(Field::with("SteelBlue".into())));
+        key(&mut s, KeyCode::Esc);
+        key(&mut s, KeyCode::Right);
+        assert_eq!(
+            colour.value(&s.live),
+            Value::Colour(ThemeColor::Terminal),
+            "a step from a typed colour starts the terminal's over"
         );
     }
 

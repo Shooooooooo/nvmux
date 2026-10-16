@@ -67,6 +67,7 @@ pub mod theme;
 pub mod transport;
 pub mod ui;
 pub mod winch;
+pub mod x11;
 
 #[cfg(test)]
 pub(crate) mod test_support;

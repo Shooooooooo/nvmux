@@ -258,7 +258,7 @@ window_width = 120      # with centre on, how many columns a window's text gets;
 smart_width  = true     # or as many as what it shows wants: its 'textwidth', its long lines
 
 [theme]
-color = "terminal"   # or "#rrggbb": nvmux's text and bars in that colour; dim text stays dim
+color = "terminal"   # or "#rrggbb" or "SteelBlue": nvmux's text and bars in it; dim text stays dim
 
 [effects]
 enabled = true   # master switch: false turns every effect below off
