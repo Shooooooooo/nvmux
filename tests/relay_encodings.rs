@@ -1685,6 +1685,40 @@ fn a_fresh_client_is_announced_by_a_card() {
     assert_eq!(detach(&mut term), Some(0), "the child did not detach");
 }
 
+/// A detach hands the shell back a clean screen, with nothing on it of what
+/// the relay told the client. With the fade off, a fresh client is told where
+/// it landed the moment its relay starts — before it has made its pty raw, on
+/// the primary screen the relay has just cleared, which is the one a detach
+/// goes back to — and a pty that echoed the card left it there, as hex.
+#[test]
+fn a_detach_leaves_nothing_of_the_cards_behind() {
+    require_nvim!();
+    let tag = "card-detach";
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(&common::unique(tag), &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    let label = "leaves no trace";
+
+    let mut term = spawn_own(&sock, &session.id, label, Asks::default());
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| carded(out, label)),
+        "no card said which session this is; the screen: {:#?}",
+        screen_rows(&term.output)
+    );
+    assert_eq!(detach(&mut term), Some(0), "the child did not detach");
+    // What the child wrote last can still be on its way when its exit is
+    // seen.
+    term.pump_until(Duration::from_millis(200), |_| false);
+    let left: Vec<String> = screen_rows(&term.output)
+        .into_iter()
+        .filter(|row| !row.trim().is_empty())
+        .collect();
+    assert!(left.is_empty(), "the detach left the shell this: {left:#?}");
+}
+
 /// A kept client coming back has the card drawn before its screen dissolves
 /// in, and the card stands as the screen comes in: on it, at its full colour,
 /// half way through the fade in, before anything the client draws after the
