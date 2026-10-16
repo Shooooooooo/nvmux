@@ -215,17 +215,12 @@ has.
 
 ## Configuration
 
-nvmux needs no configuration. An optional TOML file — `$NVMUX_CONFIG` if set,
-else `$XDG_CONFIG_HOME/nvmux/config.toml`, else `~/.config/nvmux/config.toml` —
-overrides the defaults below; an unknown key or a bad value is a startup error.
-The first run asks for a prefix and writes that file; `Esc` skips.
+nvmux needs no configuration. To change a setting, press `,` in the picker or
+`<prefix> ,` in a session; changes apply at once, and `w` saves them.
 
-Or change them while nvmux runs: `,` in the picker opens the settings full
-screen, a tab per table; `<prefix> ,` opens them in a panel over the session
-(full screen on terminals under 72×20). Changes take effect at once, or on
-next use, and are marked `•` until `w` saves them — only what changed, with
-the file's comments kept and any setting reset to its default commented back
-out. Quitting or detaching with unsaved changes asks first.
+Settings are saved as TOML to `$NVMUX_CONFIG`, else
+`$XDG_CONFIG_HOME/nvmux/config.toml`, else `~/.config/nvmux/config.toml`,
+which you can also edit by hand.
 
 <details>
 <summary>Every setting, at its default</summary>
