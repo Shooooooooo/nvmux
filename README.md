@@ -43,6 +43,26 @@ That last row is the trade: nvmux is not a tmux replacement. It does one thing,
 which is why it can draw Neovim from Neovim's own account of its screen — or
 hand Neovim your terminal outright — rather than an imitation of one.
 
+### Terminal buffers, not panes
+
+What tmux holds in panes, nvmux leaves to terminal buffers. Over a pane, a
+terminal buffer:
+
+- **Is text.** Search it, yank from it and move through it with your own keys,
+  registers and plugins. There is no copy mode.
+- **Is a window.** Split it, float it or open it in a tab with the keys you
+  edit with. There is no second set of bindings.
+- **Reaches the editor.** Neovim sets `$NVIM` in it, so a program there can
+  open files and read buffers in its own session.
+- **Reports back.** Neovim hands a program's notifications and its shell's
+  exit codes to Lua. That is how nvmux knows a build has finished.
+
+The catch is libvterm, the emulator behind terminal buffers. It lags modern
+terminals: scrollback does not reflow on resize, for one. Neovim plans to
+replace it with Ghostty's libghostty-vt
+([neovim#33155](https://github.com/neovim/neovim/issues/33155), with a draft in
+[neovim#39773](https://github.com/neovim/neovim/pull/39773)).
+
 ## Install
 
 ### Requirements
