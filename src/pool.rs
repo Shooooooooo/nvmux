@@ -17,11 +17,11 @@
 //! take.
 //!
 //! It also holds the clients started ahead of their session's first visit —
-//! `[client] lazy = false`, which starts one for every session as nvmux
-//! starts (see [`Pool::start_ahead`]) — whichever way `per_session` is set:
-//! taken back like a parked one, they are relayed for the first time rather
-//! than resumed (see [`crate::pty::Attachment::start_ahead`]), and leave the
-//! front afterwards as every other client does.
+//! `[client] lazy = false`, the default, which starts one for every session
+//! as nvmux starts (see [`Pool::start_ahead`]) — whichever way `per_session`
+//! is set: taken back like a parked one, they are relayed for the first time
+//! rather than resumed (see [`crate::pty::Attachment::start_ahead`]), and
+//! leave the front afterwards as every other client does.
 
 use crate::pty::{Attachment, Parked, Probe};
 use crate::session::Session;
