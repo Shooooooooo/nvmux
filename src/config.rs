@@ -47,7 +47,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::error::ConfigError;
+use crate::error::{ConfigError, SaveError};
 use crate::palette::Rgb;
 
 /// The whole configuration. Each field is a table of its own, so the file reads
@@ -1256,6 +1256,528 @@ pub fn write_default(path: &Path, prefix: u8) -> Result<(), ConfigError> {
     crate::paths::write_atomic(path, render_default_config(prefix).as_bytes()).map_err(err)
 }
 
+// --- saving ---------------------------------------------------------------
+
+/// The file a save writes: the one [`load`] reads, or would read — so
+/// `$NVMUX_CONFIG` when it is set. The first run never writes there, but a
+/// save is something the user asked for.
+fn config_path() -> Option<PathBuf> {
+    let nvmux_config = std::env::var_os("NVMUX_CONFIG");
+    let xdg = std::env::var_os("XDG_CONFIG_HOME");
+    let home = std::env::var_os("HOME");
+    match resolve_config_path(nvmux_config.as_deref(), xdg.as_deref(), home.as_deref()) {
+        ConfigSource::Explicit(path) | ConfigSource::Default(path) => Some(path),
+        ConfigSource::None => None,
+    }
+}
+
+/// A path the way the user would type it: under their home, `~/` and the
+/// rest.
+pub(crate) fn shown(path: &Path) -> String {
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
+    match home.and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf)) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// What a save wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Saved {
+    /// The config file.
+    pub path: PathBuf,
+    /// How many settings it changed in it: none when it already said what
+    /// was being saved.
+    pub count: usize,
+}
+
+impl std::fmt::Display for Saved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.count {
+            0 => write!(f, "nothing to write: {} already says so", shown(&self.path)),
+            1 => write!(f, "saved 1 change to {}", shown(&self.path)),
+            n => write!(f, "saved {n} changes to {}", shown(&self.path)),
+        }
+    }
+}
+
+/// Write what `live` has changed from `saved` — what the file was last known
+/// to hold — into the config file, and nothing else.
+///
+/// The file is read again first, since it may have been edited by hand while
+/// nvmux ran: one that no longer reads is not written over, and a setting
+/// being saved that the file has changed too is not overwritten unless
+/// `overwrite` says so. Each setting is written where the file has it,
+/// comments and all: in place if it is set, by uncommenting the template's
+/// line for it if it is not, and otherwise at the end of its table. One set
+/// back to its default is commented back out, so the file follows the default
+/// again. With no file yet, the first-run template is written with the
+/// changes in it.
+///
+/// Through a symlink to the file it names, keeping that file's mode (see
+/// [`crate::paths::write_through`]).
+pub fn save(live: &Settings, saved: &Settings, overwrite: bool) -> Result<Saved, SaveError> {
+    let path = config_path().ok_or(SaveError::Nowhere)?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(SaveError::Read { path, error }),
+    };
+    let (contents, count) = match saved_text(text.as_deref(), live, saved, overwrite) {
+        Ok(edited) => edited,
+        Err(Refusal::Unreadable(message)) => return Err(SaveError::Unreadable { path, message }),
+        Err(Refusal::Changed(settings)) => return Err(SaveError::Changed { path, settings }),
+        Err(Refusal::Unedited) => return Err(SaveError::Unedited { path }),
+    };
+    if count > 0 {
+        let write = |error| SaveError::Write {
+            path: path.clone(),
+            error,
+        };
+        if text.is_none() {
+            crate::paths::create_private_parent(&path).map_err(write)?;
+        }
+        crate::paths::write_through(&path, contents.as_bytes()).map_err(write)?;
+    }
+    Ok(Saved { path, count })
+}
+
+/// Why [`saved_text`] edited nothing.
+#[derive(Debug, PartialEq, Eq)]
+enum Refusal {
+    /// The text no longer reads as a config: where, and why, in a line.
+    Unreadable(String),
+    /// Settings being saved, by path, that the text has changed too.
+    Changed(Vec<String>),
+    /// No edit came out holding what was to be saved.
+    Unedited,
+}
+
+/// The config file's `text` — `None` when there is none — with what `live`
+/// has changed from `saved` written into it, and how many settings that
+/// changed in it. See [`save`].
+fn saved_text(
+    text: Option<&str>,
+    live: &Settings,
+    saved: &Settings,
+    overwrite: bool,
+) -> Result<(String, usize), Refusal> {
+    let on_disk = match text {
+        Some(text) => read_back(text).map_err(Refusal::Unreadable)?,
+        None => Settings::default(),
+    };
+    let changed = crate::settings::changed(live, saved);
+    // Changed in the file as well, to something other than what is being
+    // saved: somebody's edit, which a save would quietly undo.
+    let clashing: Vec<String> = changed
+        .iter()
+        .filter(|s| {
+            let disk = s.value(&on_disk);
+            disk != s.value(saved) && disk != s.value(live)
+        })
+        .map(|s| s.path())
+        .collect();
+    if !clashing.is_empty() && !overwrite {
+        return Err(Refusal::Changed(clashing));
+    }
+
+    // What the file is to hold: what it holds now, with each change made.
+    let mut target = on_disk.clone();
+    let mut edits = Vec::new();
+    for setting in changed {
+        let value = setting.value(live);
+        if setting.value(&on_disk) == value {
+            continue;
+        }
+        setting.set(&mut target, &value);
+        edits.push(Edit {
+            table: setting.table,
+            key: setting.key,
+            value: value.toml().to_string(),
+            default: value == setting.default_value(),
+        });
+    }
+    let base = match text {
+        Some(text) => text.to_string(),
+        None if edits.is_empty() => String::new(),
+        None => render_default_config(crate::keys::PREFIX),
+    };
+    if edits.is_empty() {
+        return Ok((base, 0));
+    }
+    let holds = |text: &String| read_back(text).is_ok_and(|s| s == target);
+    edit_in_place(&base, &edits)
+        .filter(holds)
+        .or_else(|| edit_structure(&base, &edits).filter(holds))
+        .map(|text| (text, edits.len()))
+        .ok_or(Refusal::Unedited)
+}
+
+/// `text` as nvmux would load it, or why not, in a line.
+fn read_back(text: &str) -> Result<Settings, String> {
+    let settings: Settings = toml::from_str(text).map_err(|e| {
+        let at = e
+            .span()
+            .map(|span| text[..span.start.min(text.len())].matches('\n').count() + 1);
+        match at {
+            Some(line) => format!("line {line}: {}", e.message()),
+            None => e.message().to_string(),
+        }
+    })?;
+    settings.validate()?;
+    Ok(settings)
+}
+
+/// One setting to write: where, what, and whether that is its default.
+#[derive(Debug)]
+struct Edit {
+    table: &'static str,
+    key: &'static str,
+    /// As the file spells it, `true` or `"Ctrl-a"`.
+    value: String,
+    default: bool,
+}
+
+/// [`Edit`]s made to the text where they belong and nowhere else: every byte
+/// not part of a change kept as it was.
+///
+/// A setting the file sets has its value replaced where it stands, its note
+/// kept in its column — or, put back to its default, its line commented out.
+/// One it does not set is uncommented where its table has it as a comment, as
+/// the template does every setting, and otherwise added after its table's
+/// last setting, or in a table of its own at the end. `None` where the file
+/// is laid out in a way this does not edit — a table only spelt inline or in
+/// dotted keys — which [`edit_structure`] is for.
+fn edit_in_place(text: &str, edits: &[Edit]) -> Option<String> {
+    let doc = toml_edit::Document::parse(text).ok()?;
+    let headers = headers(doc.as_table());
+    // (where, replacing how much, with what), all against the original text.
+    let mut changes: Vec<(usize, usize, String)> = Vec::new();
+    let mut after: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut tables: Vec<(&str, Vec<String>)> = Vec::new();
+    for edit in edits {
+        let line = format!("{} = {}", edit.key, edit.value);
+        let path: Vec<&str> = edit.table.split('.').collect();
+        if let Some((span, inline)) = active(doc.as_item(), &path, edit.key) {
+            let (start, end) = line_around(text, span.start, span.end);
+            let rest = &text[span.end..end];
+            let old = &text[span.clone()];
+            if edit.default && !inline {
+                // Commented back out, at its default, as the template has it.
+                let head = &text[start..span.start];
+                let indent = &head[..head.len() - head.trim_start().len()];
+                let kept = realigned(rest, old, &edit.value).unwrap_or_else(|| rest.to_string());
+                changes.push((
+                    start,
+                    end - start,
+                    format!("{indent}# {}{}{kept}", head.trim_start(), edit.value),
+                ));
+            } else {
+                match realigned(rest, old, &edit.value) {
+                    Some(kept) => changes.push((
+                        span.start,
+                        end - span.start,
+                        format!("{}{kept}", edit.value),
+                    )),
+                    None => changes.push((span.start, span.len(), edit.value.clone())),
+                }
+            }
+            continue;
+        }
+        if edit.default {
+            // Nothing pins it: the file already follows the default.
+            continue;
+        }
+        match region(text, &headers, edit.table) {
+            Some(region) => match commented(text, region.body.clone(), edit.key) {
+                Some((start, end)) => {
+                    changes.push((
+                        start,
+                        end - start,
+                        uncommented(&text[start..end], &edit.value),
+                    ));
+                }
+                None => {
+                    let at = last_setting_end(text, region);
+                    match after.iter_mut().find(|(here, _)| *here == at) {
+                        Some((_, lines)) => lines.push(line),
+                        None => after.push((at, vec![line])),
+                    }
+                }
+            },
+            // A table the file spells some other way than a header of its
+            // own: not one to add a header for.
+            None if defined(doc.as_item(), &path) => return None,
+            None => match tables.iter_mut().find(|(table, _)| *table == edit.table) {
+                Some((_, lines)) => lines.push(line),
+                None => tables.push((edit.table, vec![line])),
+            },
+        }
+    }
+    for (at, lines) in after {
+        changes.push((at, 0, lines.iter().map(|l| format!("\n{l}")).collect()));
+    }
+    changes.sort_by_key(|(at, _, _)| std::cmp::Reverse(*at));
+    let mut out = text.to_string();
+    let mut limit = out.len();
+    for (at, len, with) in changes {
+        // Edits never meet: each is a line, or a point after one.
+        if at + len > limit {
+            return None;
+        }
+        out.replace_range(at..at + len, &with);
+        limit = at;
+    }
+    for (table, lines) in tables {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.is_empty() && !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+        out.push_str(&format!("[{table}]\n"));
+        for line in lines {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    Some(out)
+}
+
+/// Where the value of `key` in the table at `path` is in the original text,
+/// and whether it is in an inline table — where a line cannot be commented
+/// out — or `None` when the file does not set it.
+fn active(
+    root: &toml_edit::Item,
+    path: &[&str],
+    key: &str,
+) -> Option<(std::ops::Range<usize>, bool)> {
+    let mut at = root;
+    let mut inline = false;
+    for part in path {
+        inline |= at.is_inline_table();
+        at = at.as_table_like()?.get(part)?;
+    }
+    inline |= at.is_inline_table();
+    let value = at.as_table_like()?.get(key)?.as_value()?;
+    Some((value.span()?, inline))
+}
+
+/// Whether the table at `path` is in the file spelt some other way than a
+/// header of its own: inline, or in dotted keys. A table that is only there
+/// because a table under it is — `[effects]` with only `[effects.fade]` in
+/// the file — is not: TOML lets its header be added after.
+fn defined(root: &toml_edit::Item, path: &[&str]) -> bool {
+    let mut at = root;
+    for part in path {
+        match at.as_table_like().and_then(|t| t.get(part)) {
+            Some(item) => at = item,
+            None => return false,
+        }
+    }
+    !at.as_table().is_some_and(toml_edit::Table::is_implicit)
+}
+
+/// Every table header in the file — `[effects.fade]` — by its path, with
+/// where it starts.
+fn headers(root: &toml_edit::Table) -> Vec<(String, usize)> {
+    fn walk(table: &toml_edit::Table, at: &str, out: &mut Vec<(String, usize)>) {
+        for (key, item) in table.iter() {
+            let path = if at.is_empty() {
+                key.to_string()
+            } else {
+                format!("{at}.{key}")
+            };
+            let tables: Vec<&toml_edit::Table> = match item {
+                toml_edit::Item::Table(t) => vec![t],
+                toml_edit::Item::ArrayOfTables(a) => a.iter().collect(),
+                _ => continue,
+            };
+            for t in tables {
+                if !t.is_implicit() && !t.is_dotted() {
+                    if let Some(span) = t.span() {
+                        out.push((path.clone(), span.start));
+                    }
+                }
+                walk(t, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, "", &mut out);
+    out
+}
+
+/// The table `table`'s header line, where it ends, and the lines under it
+/// and over the next header — or `None` when the file has no header for it.
+fn region(text: &str, headers: &[(String, usize)], table: &str) -> Option<Region> {
+    let start = headers.iter().find(|(path, _)| path == table)?.1;
+    let header_end = line_around(text, start, start).1;
+    let body = (header_end + 1).min(text.len());
+    let end = headers
+        .iter()
+        .map(|(_, at)| *at)
+        .filter(|at| *at > start)
+        .min()
+        .map_or(text.len(), |at| line_around(text, at, at).0);
+    Some(Region {
+        header_end,
+        body: body..end.max(body),
+    })
+}
+
+/// See [`region`].
+#[derive(Debug, Clone)]
+struct Region {
+    /// The end of the header's line, short of its newline.
+    header_end: usize,
+    body: std::ops::Range<usize>,
+}
+
+/// The start of the line `from` is on, and the end of the line `to` is on,
+/// short of its newline.
+fn line_around(text: &str, from: usize, to: usize) -> (usize, usize) {
+    let start = text[..from].rfind('\n').map_or(0, |at| at + 1);
+    let end = text[to..].find('\n').map_or(text.len(), |at| to + at);
+    (start, end)
+}
+
+/// A line in `region` that is `key` commented out, `# key = …`, as the
+/// template has every setting: where it starts and ends.
+fn commented(text: &str, region: std::ops::Range<usize>, key: &str) -> Option<(usize, usize)> {
+    let mut at = region.start;
+    for line in text[region.clone()].split_inclusive('\n') {
+        let start = at;
+        at += line.len();
+        let rest = line.trim_start().strip_prefix('#').map(str::trim_start);
+        let is_key = rest
+            .and_then(|r| r.strip_prefix(key))
+            .is_some_and(|r| r.trim_start().starts_with('='));
+        if is_key {
+            return Some((start, start + line.trim_end_matches(['\n', '\r']).len()));
+        }
+    }
+    None
+}
+
+/// `# key = old   # note` as `key = new   # note`: the key, its `=` and
+/// the note as they were written, the note in its column relative to them.
+fn uncommented(line: &str, value: &str) -> String {
+    let indent = &line[..line.len() - line.trim_start().len()];
+    let rest = line.trim_start().trim_start_matches('#').trim_start();
+    // [`commented`] found the key with an `=` after it, so there is one.
+    let eq = rest.find('=').unwrap_or(rest.len().saturating_sub(1));
+    let after = &rest[eq + 1..];
+    let value_at = after.len() - after.trim_start().len();
+    let old = old_value(&after[value_at..]);
+    let tail = &after[value_at + old.len()..];
+    let kept = realigned(tail, old, value).unwrap_or_default();
+    format!(
+        "{indent}{}{}{value}{kept}",
+        &rest[..=eq],
+        &after[..value_at]
+    )
+}
+
+/// The value at the start of `text`: a quoted string to its closing quote, or
+/// anything else to the first blank or `#`.
+fn old_value(text: &str) -> &str {
+    let mut chars = text.char_indices();
+    match chars.next() {
+        Some((_, quote @ ('"' | '\''))) => {
+            let mut escaped = false;
+            for (i, c) in chars {
+                match c {
+                    '\\' if quote == '"' && !escaped => escaped = true,
+                    c if c == quote && !escaped => return &text[..i + 1],
+                    _ => escaped = false,
+                }
+            }
+            text
+        }
+        _ => {
+            let end = text
+                .find(|c: char| c.is_whitespace() || c == '#')
+                .unwrap_or(text.len());
+            &text[..end]
+        }
+    }
+}
+
+/// What follows a value on its line, when it is a note — blanks then a `#`
+/// comment — with the blanks made up for the new value's length, so the note
+/// keeps its column. `None` when it is not a note.
+fn realigned(rest: &str, old: &str, new: &str) -> Option<String> {
+    let note = rest.trim_start_matches([' ', '\t']);
+    if !note.starts_with('#') {
+        return None;
+    }
+    let gap = rest.len() - note.len();
+    let width = (gap + old.chars().count())
+        .saturating_sub(new.chars().count())
+        .max(1);
+    Some(format!("{}{note}", " ".repeat(width)))
+}
+
+/// Where a line added to a table goes: after its last setting, or straight
+/// under its header when it has none — before any comments that lead into the
+/// next table.
+fn last_setting_end(text: &str, region: Region) -> usize {
+    let mut end = region.header_end;
+    let mut at = region.body.start;
+    for line in text[region.body].split_inclusive('\n') {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            end = at + line.trim_end_matches(['\n', '\r']).len();
+        }
+        at += line.len();
+    }
+    end
+}
+
+/// The edits made through `toml_edit`'s model of the file rather than its
+/// text: for a table spelt inline or in dotted keys, which [`edit_in_place`]
+/// leaves alone. Comments survive this too, though a value set back to its
+/// default is removed rather than commented out.
+fn edit_structure(text: &str, edits: &[Edit]) -> Option<String> {
+    let mut doc: toml_edit::DocumentMut = text.parse().ok()?;
+    for edit in edits {
+        let mut item = doc.as_item_mut();
+        for part in edit.table.split('.') {
+            item = item
+                .as_table_like_mut()?
+                .entry(part)
+                .or_insert(toml_edit::table());
+        }
+        // A table only there for one under it gets a header now it has a
+        // setting of its own.
+        if let Some(table) = item.as_table_mut() {
+            table.set_implicit(false);
+        }
+        let table = item.as_table_like_mut()?;
+        if edit.default {
+            table.remove(edit.key);
+        } else {
+            let value: toml_edit::Value = edit.value.parse().ok()?;
+            match table
+                .get_mut(edit.key)
+                .and_then(toml_edit::Item::as_value_mut)
+            {
+                // Its decor kept: the note after it stays.
+                Some(old) => {
+                    let decor = old.decor().clone();
+                    *old = value;
+                    *old.decor_mut() = decor;
+                }
+                None => {
+                    table.insert(edit.key, toml_edit::Item::Value(value));
+                }
+            }
+        }
+    }
+    Some(doc.to_string())
+}
+
 /// The settings a process runs on, and what its file is known to hold.
 ///
 /// One of these is the process-global behind [`get`]; tests make their own,
@@ -2229,6 +2751,330 @@ mod tests {
         assert_eq!(*store.saved(), first);
     }
 
+    // --- saving (pure) ------------------------------------------------------
+
+    /// The first-run template, as a first run with the default prefix wrote it.
+    fn template() -> String {
+        render_default_config(crate::keys::PREFIX)
+    }
+
+    /// `settings` with the row at `path` set to `value`.
+    fn with(settings: &Settings, path: &str, value: crate::settings::Value) -> Settings {
+        let mut next = settings.clone();
+        crate::settings::find(path)
+            .unwrap_or_else(|| panic!("no setting {path}"))
+            .set(&mut next, &value);
+        next
+    }
+
+    /// Save `live` over `text`, the file having held `saved`.
+    fn save_over(text: Option<&str>, saved: &Settings, live: &Settings) -> (String, usize) {
+        saved_text(text, live, saved, false).expect("saved")
+    }
+
+    /// The lines of `after` that are not lines of `before`, and the other way
+    /// round: what a save changed.
+    fn diff(before: &str, after: &str) -> (Vec<String>, Vec<String>) {
+        let was: Vec<&str> = before.lines().collect();
+        let now: Vec<&str> = after.lines().collect();
+        (
+            now.iter()
+                .filter(|l| !was.contains(l))
+                .map(|l| l.to_string())
+                .collect(),
+            was.iter()
+                .filter(|l| !now.contains(l))
+                .map(|l| l.to_string())
+                .collect(),
+        )
+    }
+
+    use crate::settings::Value;
+
+    /// A setting the template has as a comment is uncommented where it is,
+    /// its note after it, and not a byte else changes.
+    #[test]
+    fn a_setting_the_template_comments_is_uncommented_in_place() {
+        let before = template();
+        let live = with(&Settings::default(), "keys.timeout_ms", Value::Number(1500));
+        let (after, count) = save_over(Some(&before), &Settings::default(), &live);
+        assert_eq!(count, 1);
+        let (added, removed) = diff(&before, &after);
+        // The note where it was, against the setting: the template pads the
+        // number to six.
+        assert_eq!(
+            added,
+            vec!["timeout_ms = 1500     # how long a lone prefix or half-typed number waits"]
+        );
+        assert_eq!(
+            removed,
+            vec!["# timeout_ms = 1000     # how long a lone prefix or half-typed number waits"]
+        );
+        assert_eq!(before.lines().count(), after.lines().count());
+        assert_eq!(read_back(&after), Ok(live));
+    }
+
+    /// Set back to its default, a setting is commented back out, so the file
+    /// stops pinning it and follows the default again.
+    #[test]
+    fn a_setting_back_at_its_default_is_commented_back_out() {
+        let saved = with(&Settings::default(), "client.centre", Value::Switch(true));
+        let (before, _) = save_over(Some(&template()), &Settings::default(), &saved);
+        assert!(before.contains("\ncentre       = true "), "{before}");
+
+        let (after, count) = save_over(Some(&before), &saved, &Settings::default());
+        assert_eq!(count, 1);
+        assert_eq!(after, template(), "back to the template, byte for byte");
+    }
+
+    /// A setting the file sets is changed where it is, its note kept in its
+    /// column.
+    #[test]
+    fn a_setting_the_file_sets_is_changed_where_it_is() {
+        let before = "[keys]\nprefix = \"Ctrl-Space\"   # mine\n\n[client]\nlazy = true\n";
+        let saved: Settings = toml::from_str(before).expect("valid");
+        let live = with(&saved, "keys.prefix", Value::Prefix(0x01));
+        let live = with(&live, "client.lazy", Value::Switch(false));
+        let (after, count) = save_over(Some(before), &saved, &live);
+        assert_eq!(count, 2);
+        assert_eq!(
+            after,
+            "[keys]\nprefix = \"Ctrl-a\"       # mine\n\n[client]\n# lazy = false\n"
+        );
+    }
+
+    /// With no file, the template is written with the change in it.
+    #[test]
+    fn with_no_file_the_template_is_written_with_the_change() {
+        let live = with(
+            &Settings::default(),
+            "effects.smear.enabled",
+            Value::Switch(true),
+        );
+        let (after, count) = save_over(None, &Settings::default(), &live);
+        assert_eq!(count, 1);
+        let (added, _) = diff(&template(), &after);
+        assert_eq!(
+            added,
+            vec!["enabled = true    # the cursor travels between cells rather than jumping"]
+        );
+        assert_eq!(read_back(&after), Ok(live));
+
+        let (nothing, count) = save_over(None, &Settings::default(), &Settings::default());
+        assert_eq!(
+            (nothing.as_str(), count),
+            ("", 0),
+            "and nothing, with nothing changed"
+        );
+    }
+
+    /// A setting with no line anywhere goes after its table's last setting —
+    /// and a table the file does not have goes at the end.
+    #[test]
+    fn a_setting_with_no_line_is_added_to_its_table() {
+        let before =
+            "[client]\nlazy = false\n# a note about the client\n\n[theme]\ncolor = \"#7aa2f7\"";
+        let saved: Settings = toml::from_str(before).expect("valid");
+        let live = with(&saved, "client.centre", Value::Switch(true));
+        let live = with(&live, "effects.blink.enabled", Value::Switch(true));
+        let live = with(&live, "client.window_width", Value::Number(100));
+        let (after, count) = save_over(Some(before), &saved, &live);
+        assert_eq!(count, 3);
+        assert_eq!(
+            after,
+            "[client]\nlazy = false\ncentre = true\nwindow_width = 100\n# a note about the client\n\n\
+             [theme]\ncolor = \"#7aa2f7\"\n\n[effects.blink]\nenabled = true\n"
+        );
+        assert_eq!(read_back(&after), Ok(live));
+    }
+
+    /// A file written by hand, with comments, an inline table and dotted keys,
+    /// keeps everything the save did not change.
+    #[test]
+    fn a_hand_written_file_keeps_everything_a_save_did_not_change() {
+        let before = "\
+# My nvmux.
+[keys]
+bind = { detach = \"x\", new = \"N\" }   # moved off d and c
+
+[effects]
+fade.enabled = false   # too slow over ssh
+fade.session = false
+";
+        let saved: Settings = toml::from_str(before).expect("valid");
+        let live = with(&saved, "keys.bind.detach", Value::Key(b'z'));
+        let live = with(&live, "effects.fade.session", Value::Switch(true));
+        let (after, count) = save_over(Some(before), &saved, &live);
+        assert_eq!(count, 2);
+        assert_eq!(
+            after,
+            "\
+# My nvmux.
+[keys]
+bind = { detach = \"z\", new = \"N\" }   # moved off d and c
+
+[effects]
+fade.enabled = false   # too slow over ssh
+# fade.session = true
+"
+        );
+
+        // A table spelt in dotted keys takes a setting it did not have.
+        let live = with(&saved, "effects.fade.duration_ms", Value::Number(100));
+        let (after, count) = save_over(Some(before), &saved, &live);
+        assert_eq!(count, 1);
+        assert_eq!(read_back(&after), Ok(live));
+        for kept in ["# My nvmux.", "# moved off d and c", "# too slow over ssh"] {
+            assert!(after.contains(kept), "lost {kept:?}: {after}");
+        }
+    }
+
+    /// A table there only for one under it gets a header of its own.
+    #[test]
+    fn a_table_there_only_for_one_under_it_gets_a_header() {
+        let before = "[effects.fade]\nenabled = false\n";
+        let saved: Settings = toml::from_str(before).expect("valid");
+        let live = with(&saved, "effects.enabled", Value::Switch(false));
+        let (after, _) = save_over(Some(before), &saved, &live);
+        assert_eq!(
+            after,
+            "[effects.fade]\nenabled = false\n\n[effects]\nenabled = false\n"
+        );
+        assert_eq!(read_back(&after), Ok(live));
+    }
+
+    /// A setting being saved that the file changed too, since nvmux read it,
+    /// is not overwritten unless asked again; one changed to the very value
+    /// being saved is no clash at all.
+    #[test]
+    fn a_setting_the_file_changed_too_is_overwritten_only_when_asked() {
+        let saved = Settings::default();
+        let live = with(&saved, "keys.timeout_ms", Value::Number(1500));
+        let edited = "[keys]\ntimeout_ms = 2000\n";
+        assert_eq!(
+            saved_text(Some(edited), &live, &saved, false),
+            Err(Refusal::Changed(vec!["keys.timeout_ms".into()]))
+        );
+        let (after, count) = saved_text(Some(edited), &live, &saved, true).expect("overwritten");
+        assert_eq!((after.as_str(), count), ("[keys]\ntimeout_ms = 1500\n", 1));
+
+        let same = "[keys]\ntimeout_ms = 1500\n";
+        let (after, count) = saved_text(Some(same), &live, &saved, false).expect("saved");
+        assert_eq!((after.as_str(), count), (same, 0), "already so");
+
+        // A hand edit to another setting is no clash, and stays.
+        let other = "[client]\nlazy = true\n";
+        let (after, _) = saved_text(Some(other), &live, &saved, false).expect("saved");
+        assert_eq!(
+            after,
+            "[client]\nlazy = true\n\n[keys]\ntimeout_ms = 1500\n"
+        );
+    }
+
+    /// A file that no longer reads is not written over, and the refusal says
+    /// where it stopped reading.
+    #[test]
+    fn a_file_that_no_longer_reads_is_not_written_over() {
+        let live = with(&Settings::default(), "client.lazy", Value::Switch(true));
+        for (text, line) in [
+            ("[keys]\nprefx = \"C-a\"\n", "line 2:"),
+            ("[keys\n", "line 1:"),
+        ] {
+            match saved_text(Some(text), &live, &Settings::default(), true) {
+                Err(Refusal::Unreadable(why)) => assert!(why.starts_with(line), "{why}"),
+                other => panic!("{text:?}: {other:?}"),
+            }
+        }
+        match saved_text(
+            Some("[keys]\ntimeout_ms = 0\n"),
+            &live,
+            &Settings::default(),
+            true,
+        ) {
+            Err(Refusal::Unreadable(why)) => assert!(why.contains("keys.timeout_ms"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Every setting, changed from the template and back, comes out of the
+    /// file as nvmux would load it — and back at the template.
+    #[test]
+    fn every_setting_saves_and_saves_back_to_the_template() {
+        for setting in crate::settings::all() {
+            let changed = match setting.default_value() {
+                Value::Switch(on) => Value::Switch(!on),
+                Value::Number(n) => Value::Number(n + 1),
+                Value::Choice(name) => {
+                    let crate::settings::Kind::Choice { options, .. } = setting.kind else {
+                        unreachable!()
+                    };
+                    Value::Choice(options.iter().find(|o| **o != name).expect("another"))
+                }
+                Value::Prefix(_) => Value::Prefix(0x14),
+                Value::Key(_) => Value::Key(b'Z'),
+                // Short enough for its note to keep its column both ways.
+                Value::Text(_) => Value::Text("nvim -u NONE --listen {sock}".into()),
+                Value::Colour(_) => Value::Colour(ThemeColor::Mono(Rgb(1, 2, 3))),
+            };
+            let live = with(&Settings::default(), &setting.path(), changed);
+            let (after, count) = save_over(Some(&template()), &Settings::default(), &live);
+            assert_eq!(count, 1, "{}", setting.path());
+            assert_eq!(
+                read_back(&after).as_ref(),
+                Ok(&live),
+                "{}: {after}",
+                setting.path()
+            );
+            let (back, _) = save_over(Some(&after), &live, &Settings::default());
+            assert_eq!(
+                read_back(&back),
+                Ok(Settings::default()),
+                "{}",
+                setting.path()
+            );
+            // The prefix is the one line the template has set rather than
+            // commented: back at its default, it is commented out as any is.
+            let want = match setting.path().as_str() {
+                "keys.prefix" => template().replace("\nprefix = ", "\n# prefix = "),
+                _ => template(),
+            };
+            assert_eq!(back, want, "{}", setting.path());
+        }
+    }
+
+    /// A command with quotes in it is written as TOML can spell it — a
+    /// literal string, which needs no escapes — and reads back as typed.
+    #[test]
+    fn a_command_with_quotes_reads_back_as_typed() {
+        let typed = "nvim -u \"my init.lua\" --listen {sock}";
+        let live = with(
+            &Settings::default(),
+            "session.command",
+            Value::Text(typed.into()),
+        );
+        let (after, _) = save_over(Some(&template()), &Settings::default(), &live);
+        assert!(
+            after.contains(
+                r#"command = 'nvim -u "my init.lua" --listen {sock}' # {sock} is required"#
+            ),
+            "{after}"
+        );
+        assert_eq!(
+            read_back(&after).map(|s| s.session.command),
+            Ok(typed.to_string())
+        );
+    }
+
+    /// The edit keeps a file's line endings, notes and all.
+    #[test]
+    fn a_file_with_crlf_line_endings_keeps_them() {
+        let before = "[client]\r\nlazy = true    # mine\r\n";
+        let saved: Settings = toml::from_str(before).expect("valid");
+        let live = with(&saved, "client.lazy", Value::Switch(false));
+        let (after, _) = save_over(Some(before), &saved, &live);
+        assert_eq!(after, "[client]\r\n# lazy = false   # mine\r\n");
+    }
+
     // --- path resolution (pure) --------------------------------------------
 
     #[test]
@@ -2415,6 +3261,38 @@ mod tests {
         );
         std::fs::remove_dir_all(&xdg).ok();
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A save writes the file a load reads: `$NVMUX_CONFIG` when it is set,
+    /// which the first run never writes but a save, being asked for, does.
+    #[test]
+    fn a_save_writes_the_file_a_load_reads() {
+        let _lock = guard();
+        let env = ScrubbedEnv::new();
+        let dir = scratch("save-explicit");
+        let file = dir.join("mine.toml");
+        std::fs::write(&file, "[client]\nlazy = true\n").expect("write");
+        env.set("NVMUX_CONFIG", &file);
+
+        let saved = load().expect("load");
+        let live = with(&saved, "effects.smear.enabled", Value::Switch(true));
+        assert_eq!(
+            save(&live, &saved, false).expect("saved"),
+            Saved {
+                path: file.clone(),
+                count: 1
+            }
+        );
+        assert_eq!(load().expect("reload"), live);
+        std::fs::remove_dir_all(&dir).ok();
+
+        // With no $HOME there is nowhere to keep one.
+        env.set("NVMUX_CONFIG", "");
+        env.set("HOME", "");
+        assert!(matches!(
+            save(&live, &saved, false),
+            Err(SaveError::Nowhere)
+        ));
     }
 
     #[test]

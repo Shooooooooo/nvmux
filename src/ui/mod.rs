@@ -403,6 +403,7 @@ fn run_loop(
     notifier: &crate::tell::Notifier,
 ) -> Result<Outcome> {
     let mut app = App::new(transport.list_sessions()?);
+    app.set_unsaved(unsaved());
     // What each session has to report: read on a thread of its own (see
     // `crate::notes::Poller`), each session handed to it once the loop has
     // its socket, and what they said taken up on every pass.
@@ -660,6 +661,18 @@ fn run_loop(
             Request::Settings => {
                 settings::run_on(terminal, false)?;
                 app.reload_effects();
+                app.set_unsaved(unsaved());
+            }
+
+            Request::SaveAndQuit { overwrite } => {
+                let live = crate::config::get();
+                match crate::config::save(&live, &crate::config::saved(), overwrite) {
+                    Ok(_) => {
+                        crate::config::set_saved((*live).clone());
+                        return Ok(Outcome::Quit);
+                    }
+                    Err(e) => app.not_saved(e.to_string(), e.changed_in_file().is_some()),
+                }
             }
         }
     }
@@ -697,6 +710,11 @@ fn caught_up() -> bool {
             false
         }
     }
+}
+
+/// How many settings are changed and not saved, for quitting to ask about.
+fn unsaved() -> usize {
+    crate::settings::changed(&crate::config::get(), &crate::config::saved()).len()
 }
 
 /// Move whatever is passing on the picker on to now.

@@ -277,13 +277,25 @@ pub fn client_log(dir: &Path) -> PathBuf {
 /// The temp name keeps the target's extension in front of `.tmp<pid>`, so a
 /// glob on the extension does not pick the temp file up as a real one.
 pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    write_atomic_as(path, contents, None)
+}
+
+/// [`write_atomic`], the new file given `mode` where there is one, set on the
+/// temp file before the rename so the file is never seen without it.
+fn write_atomic_as(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io::Result<()> {
     use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
     let tmp = path.with_extension(match path.extension() {
         Some(ext) => format!("{}.tmp{}", ext.to_string_lossy(), std::process::id()),
         None => format!("tmp{}", std::process::id()),
     });
     let write = || -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
+        if let Some(mode) = mode {
+            // `fchmod`, which the umask has no say in: the mode is the one the
+            // file had, which is the user's.
+            f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
         f.write_all(contents)?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)
@@ -291,6 +303,47 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> 
     write().inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
+}
+
+/// Write `contents` over the file at `path` as the user has it: through the
+/// symlink it may be to the file the link names, and with the mode that file
+/// has — atomically, as [`write_atomic`] writes.
+///
+/// For the one file nvmux rewrites that it did not write in the first place,
+/// the config. A rename over `path` itself would replace a link into a
+/// dotfiles repository with a plain file, and give a file that was `0644` the
+/// `0600` nvmux's own umask makes. With no file there yet, a new one is
+/// written at the end of the links, as the first run would write it.
+pub(crate) fn write_through(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let target = follow_links(path)?;
+    let mode = match std::fs::metadata(&target) {
+        Ok(meta) => Some(meta.permissions().mode() & 0o7777),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    write_atomic_as(&target, contents, mode)
+}
+
+/// The file `path` names once its last component's symlinks are followed —
+/// to wherever they lead, whether or not anything is there yet.
+fn follow_links(path: &Path) -> std::io::Result<PathBuf> {
+    // The kernel's own limit, so a loop of links ends here as it would there.
+    const MAX_LINKS: usize = 40;
+    let mut at = path.to_path_buf();
+    for _ in 0..MAX_LINKS {
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let to = std::fs::read_link(&at)?;
+                at = match at.parent() {
+                    Some(dir) if to.is_relative() => dir.join(to),
+                    _ => to,
+                };
+            }
+            _ => return Ok(at),
+        }
+    }
+    Err(std::io::Error::other("too many levels of symbolic links"))
 }
 
 /// Create `path`'s parent directory, private to the user, if it is missing.
@@ -509,6 +562,60 @@ mod tests {
         std::fs::create_dir(&path).expect("a directory in the way");
         assert!(write_atomic(&path, b"{}").is_err());
         assert!(strays(&dir).is_empty(), "left temp files behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A config kept in a dotfiles repository and linked into place stays a
+    /// link, and the file it names gets the new contents, at the mode it had.
+    #[test]
+    fn a_write_through_a_link_keeps_the_link_and_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = umask_lock();
+        let dir = crate::test_support::scratch_dir("paths-through");
+        let repo = dir.join("dotfiles");
+        std::fs::create_dir(&repo).expect("mkdir");
+        let real = repo.join("config.toml");
+        std::fs::write(&real, "old").expect("write");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let link = dir.join("config.toml");
+        std::os::unix::fs::symlink("dotfiles/config.toml", &link).expect("link");
+
+        write_through(&link, b"new").expect("write");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the link was replaced"
+        );
+        assert_eq!(std::fs::read_to_string(&real).expect("read"), "new");
+        let mode = std::fs::metadata(&real).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "the mode changed");
+        assert!(strays(&repo).is_empty(), "left temp files behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With nothing there, and with a link to nothing, a new file is made
+    /// where the path leads.
+    #[test]
+    fn a_write_through_to_nothing_makes_the_file() {
+        let _guard = umask_lock();
+        let dir = crate::test_support::scratch_dir("paths-through-new");
+        let plain = dir.join("a.toml");
+        write_through(&plain, b"a").expect("write");
+        assert_eq!(std::fs::read_to_string(&plain).expect("read"), "a");
+
+        let link = dir.join("b.toml");
+        std::os::unix::fs::symlink("elsewhere.toml", &link).expect("link");
+        write_through(&link, b"b").expect("write");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("elsewhere.toml")).expect("read"),
+            "b"
+        );
+        assert!(std::fs::symlink_metadata(&link)
+            .expect("stat")
+            .file_type()
+            .is_symlink());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

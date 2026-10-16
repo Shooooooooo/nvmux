@@ -138,6 +138,10 @@ const DIGITS: &str = "1-n session";
 /// the same CSI rather than following it.
 const SGR: &str = "\x1b[0;2m";
 
+/// A reset alone: a question on the row is something being asked, which the
+/// picker's hint row draws at full weight as well.
+const QUESTION_SGR: &str = "\x1b[0m";
+
 /// The shortest screen the bar will draw on. Two, so it is never a session's
 /// only row: an editor left with nothing but nvmux's hints is worse than a user
 /// left to find `<prefix> ?`.
@@ -244,6 +248,30 @@ fn text(pending: Pending, keymap: &Keymap, go: bool, cols: u16) -> Option<String
     (!row.is_empty() && row.width() <= cols).then_some(row)
 }
 
+/// [`overlay`] for a question rather than the commands: `text`, cut to the
+/// screen, centred on the last row.
+fn question_overlay(text: &str, size: PtySize) -> Option<Over> {
+    if size.rows < MIN_ROWS || size.cols == 0 {
+        return None;
+    }
+    let cols = usize::from(size.cols);
+    let mut cut = String::new();
+    for c in text.chars() {
+        if cut.width() + c.to_string().width() > cols {
+            break;
+        }
+        cut.push(c);
+    }
+    let left = (cols - cut.width()) / 2;
+    let right = cols - cut.width() - left;
+    Some(Over {
+        top: size.rows - 1,
+        left: 0,
+        width: size.cols,
+        rows: vec![format!("{}{cut}{}", " ".repeat(left), " ".repeat(right))],
+    })
+}
+
 /// Where the bar goes and what it says: the whole of the last row, with the text
 /// centred on it.
 ///
@@ -326,6 +354,10 @@ pub struct Bar {
     /// the relay, from the same settings its prefix machine was built with,
     /// rather than read here — for the reason the palette is.
     keymap: Keymap,
+    /// A question the relay has put on the row in place of the commands —
+    /// `<prefix> d` with settings unsaved — up, whatever the prefix machine
+    /// says, until the relay takes it down (see [`Bar::ask`]).
+    question: Option<String>,
 }
 
 impl Bar {
@@ -348,7 +380,15 @@ impl Bar {
             size: (size.rows, size.cols),
             palette,
             keymap,
+            question: None,
         }
+    }
+
+    /// Put `question` on the row in place of the commands, or with `None`
+    /// take it down. It is drawn, kept up and put back as the bar is, at full
+    /// weight rather than dim, being a question.
+    pub fn ask(&mut self, question: Option<String>) {
+        self.question = question;
     }
 
     /// Whether the bar is on the screen, or wants to be: what the relay
@@ -425,7 +465,10 @@ impl Bar {
         // Before the lull, not after it: the bar has to know a write is owed in
         // order to ask to be woken to make it, and the pass that reads the
         // prefix is often one the child is still talking on.
-        let want = pending.and_then(|p| overlay(p, &self.keymap, go, size));
+        let want = match &self.question {
+            Some(question) => question_overlay(question, size),
+            None => pending.and_then(|p| overlay(p, &self.keymap, go, size)),
+        };
         if want != self.want {
             self.want = want;
             self.agreed = false;
@@ -455,7 +498,12 @@ impl Bar {
         self.agreed = true;
         match self.want.clone() {
             Some(over) => {
-                let bytes = announce::placed(&over, SGR);
+                let sgr = if self.question.is_some() {
+                    QUESTION_SGR
+                } else {
+                    SGR
+                };
+                let bytes = announce::placed(&over, sgr);
                 self.shown = Some(over);
                 Act::Write(bytes)
             }
@@ -872,6 +920,50 @@ mod tests {
                 "the row is not {cols} columns wide"
             );
         }
+    }
+
+    /// A question the relay asks goes up in place of the commands, prefix or
+    /// none, at full weight, and comes down when the relay takes it down —
+    /// the row put back as the bar's always is.
+    #[test]
+    fn a_question_takes_the_row_until_it_is_taken_down() {
+        let size = big();
+        let mut d = Driver::restoring(size);
+        d.bar
+            .ask(Some("1 unsaved setting — w save and detach".into()));
+        let Act::Write(bytes) = d.quiet(None, size) else {
+            panic!("the question did not go up");
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("1 unsaved setting — w save and detach"),
+            "{text:?}"
+        );
+        assert!(
+            text.contains(QUESTION_SGR) && !text.contains(SGR),
+            "dim: {text:?}"
+        );
+        assert_eq!(
+            d.quiet(Some(Pending::Command), size),
+            Act::Idle,
+            "nothing else takes it"
+        );
+        d.bar.ask(None);
+        assert!(
+            matches!(d.quiet(None, size), Act::Write(_)),
+            "the row is put back"
+        );
+        assert!(!d.bar.is_up());
+    }
+
+    /// A question too wide for the screen is cut to it, and centred.
+    #[test]
+    fn a_question_is_cut_to_the_screen() {
+        let over = question_overlay("abcdefghij", size(6, 3)).expect("a row");
+        assert_eq!(over.rows, vec!["abcdef".to_string()]);
+        let over = question_overlay("ab", size(6, 3)).expect("a row");
+        assert_eq!(over.rows, vec!["  ab  ".to_string()]);
+        assert_eq!(question_overlay("ab", size(6, 1)), None, "no room");
     }
 
     /// Centred, like every other nvmux hint row — on a screen with room either

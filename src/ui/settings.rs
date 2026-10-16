@@ -118,6 +118,8 @@ struct Find {
 enum Step {
     Stay,
     Close,
+    /// `w`: write what is unsaved to the file.
+    Save,
 }
 
 /// One key as the screen reads it: as every screen does, and as the chord the
@@ -201,6 +203,9 @@ struct State {
     pressed: Option<(usize, bool)>,
     /// The prefix has been pressed: the next key is swallowed.
     armed: bool,
+    /// The settings a save was refused for because the file had changed the
+    /// same ones: a second `w` with nothing changed since overwrites them.
+    clash: Option<Settings>,
     /// The terminal's colours 1 to 6, for `[theme] color`.
     colours: [Rgb; 6],
 }
@@ -218,6 +223,7 @@ impl State {
             error: None,
             pressed: None,
             armed: false,
+            clash: None,
             colours,
         }
     }
@@ -280,6 +286,36 @@ impl State {
 
     fn changed(&self, setting: &Setting) -> bool {
         setting.value(&self.live) != setting.value(&self.saved)
+    }
+
+    /// Whether a save now should overwrite what the file changed too: asked
+    /// for by a second `w`, with nothing changed since the first.
+    fn overwrite(&self) -> bool {
+        self.clash.as_ref() == Some(&self.live)
+    }
+
+    /// What came of a save: on the hint row, whatever it was; and saved, the
+    /// file holds what runs.
+    fn report_save(&mut self, result: std::result::Result<config::Saved, crate::error::SaveError>) {
+        self.clash = None;
+        match result {
+            Ok(saved) => {
+                self.saved = self.live.clone();
+                self.message = Some(saved.to_string());
+            }
+            Err(e) => {
+                self.message = Some(match e.changed_in_file() {
+                    Some(n) => {
+                        self.clash = Some(self.live.clone());
+                        format!(
+                            "{e} — w again overwrites {}",
+                            if n == 1 { "it" } else { "them" }
+                        )
+                    }
+                    None => e.to_string(),
+                });
+            }
+        }
     }
 
     /// The prefix's wait ran out with no key after it.
@@ -347,6 +383,10 @@ impl State {
             // the picker's.
             Key::Esc | Key::Char('q') | Key::CtrlC => return Step::Close,
             Key::Char('/') => self.find = Some(Find::default()),
+            Key::Char('w') if self.unsaved().is_empty() => {
+                self.message = Some("nothing to save: every setting is as the file has it".into());
+            }
+            Key::Char('w') => return Step::Save,
             _ => {
                 let Some(setting) = self.current() else {
                     return Step::Stay;
@@ -838,6 +878,14 @@ pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> 
             }
         }
 
+        if step == Step::Save {
+            let result = config::save(&state.live, &state.saved, state.overwrite());
+            if result.is_ok() {
+                config::set_saved(state.live.clone());
+            }
+            state.report_save(result);
+        }
+
         if step == Step::Close {
             state.remember();
             if animate {
@@ -1261,6 +1309,7 @@ fn hints(state: &State, current: Option<&Setting>, width: usize) -> (String, boo
                             .then_some("r reset"),
                         7,
                     ),
+                    ((!state.unsaved().is_empty()).then_some("w save"), 2),
                     (Some("esc back"), 3),
                 ],
                 width,
@@ -1726,6 +1775,55 @@ mod tests {
         typed(&mut s, "blink");
         key(&mut s, KeyCode::Esc);
         assert_eq!((s.tab, s.selected, s.find.clone()), (Tab::Client, 1, None));
+    }
+
+    // --- saving -------------------------------------------------------------
+
+    #[test]
+    fn w_saves_what_is_unsaved_and_says_so_when_nothing_is() {
+        let mut s = state();
+        assert_eq!(key(&mut s, KeyCode::Char('w')), Step::Stay);
+        assert_eq!(
+            s.message.as_deref(),
+            Some("nothing to save: every setting is as the file has it")
+        );
+        to(&mut s, "lazy");
+        key(&mut s, KeyCode::Right);
+        assert!(hints(&s, s.current(), 78).0.contains("w save"));
+        assert_eq!(key(&mut s, KeyCode::Char('w')), Step::Save);
+
+        s.report_save(Ok(config::Saved {
+            path: "/x/config.toml".into(),
+            count: 1,
+        }));
+        assert!(s.unsaved().is_empty(), "the file holds what runs");
+        assert_eq!(
+            s.message.as_deref(),
+            Some("saved 1 change to /x/config.toml")
+        );
+        assert!(!hints(&s, s.current(), 78).0.contains("w save"));
+    }
+
+    /// A setting the file changed too is not overwritten until a second `w`,
+    /// with nothing changed in between.
+    #[test]
+    fn a_second_w_overwrites_what_the_file_changed_too() {
+        let mut s = state();
+        to(&mut s, "lazy");
+        key(&mut s, KeyCode::Right);
+        assert!(!s.overwrite());
+        s.report_save(Err(crate::error::SaveError::Changed {
+            path: "/x/config.toml".into(),
+            settings: vec!["client.lazy".into()],
+        }));
+        assert_eq!(
+            s.message.as_deref(),
+            Some("client.lazy changed in config.toml too — w again overwrites it")
+        );
+        assert!(s.overwrite(), "the next w overwrites");
+        key(&mut s, KeyCode::Down);
+        key(&mut s, KeyCode::Right);
+        assert!(!s.overwrite(), "not once anything has changed since");
     }
 
     // --- the mouse ----------------------------------------------------------

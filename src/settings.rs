@@ -112,6 +112,21 @@ pub enum Needs {
     Particles,
 }
 
+impl Value {
+    /// The value as the file spells it: what a save writes after the `=`.
+    pub fn toml(&self) -> toml_edit::Value {
+        match self {
+            Value::Switch(on) => (*on).into(),
+            Value::Number(n) => i64::try_from(*n).unwrap_or(i64::MAX).into(),
+            Value::Choice(name) => (*name).into(),
+            Value::Prefix(byte) => crate::keys::prefix_label(*byte).into(),
+            Value::Key(byte) => crate::keys::key_label(*byte).into(),
+            Value::Text(text) => text.as_str().into(),
+            Value::Colour(colour) => colour.name().into(),
+        }
+    }
+}
+
 /// One setting: a key of the file, as the screen shows it.
 #[derive(Debug, Clone, Copy)]
 pub struct Setting {

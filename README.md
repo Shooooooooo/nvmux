@@ -220,6 +220,14 @@ else `$XDG_CONFIG_HOME/nvmux/config.toml`, else `~/.config/nvmux/config.toml` �
 overrides the defaults below; an unknown key or a bad value is a startup error.
 The first run asks for a prefix and writes that file; `Esc` skips.
 
+Or change them while nvmux runs: `,` in the picker, or `<prefix> ,` in a
+session, opens every setting on a screen of its own, a tab for each table. A
+change applies at once — the colour to that screen itself, the rest as each
+is next used — and stays unsaved, marked `•`, until `w` writes it into the
+file: only what changed, where the file has it, comments and all, with a
+setting put back to its default commented back out. Quitting the picker or
+detaching with changes unsaved asks first.
+
 <details>
 <summary>Every setting, at its default</summary>
 

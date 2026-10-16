@@ -735,7 +735,7 @@ fn draw_trail(frame: &mut Frame, area: Rect, spans: Vec<Span<'static>>) {
 /// asked or typed, and otherwise the thing being asked or typed, at full weight.
 fn hint_line(app: &App) -> (String, bool) {
     match app.mode() {
-        Mode::Confirm { prompt, .. } => (prompt.clone(), false),
+        Mode::Confirm { prompt, .. } | Mode::Leave { prompt, .. } => (prompt.clone(), false),
         Mode::Filter => (format!("/{}{CURSOR}", app.filter()), false),
         // The query comes too, when there is one. A move of one visible row can
         // carry a session past several the filter is hiding, and that is the one

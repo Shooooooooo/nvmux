@@ -40,6 +40,14 @@ pub enum Mode {
         id: String,
         was: Vec<(String, u32)>,
     },
+    /// Asking before quitting with settings changed and unsaved (see
+    /// [`App::set_unsaved`]): `w` saves first, `q` quits anyway, `Esc`
+    /// stays. `prompt` is the question on the hint row; `overwrite`, that the
+    /// file has changed the same settings and `w` overwrites them.
+    Leave {
+        prompt: String,
+        overwrite: bool,
+    },
 }
 
 /// Work the picker wants the caller to do.
@@ -77,6 +85,11 @@ pub enum Request {
     Help,
     /// Show the settings, on their own screen ([`super::settings`]).
     Settings,
+    /// Save the settings that are unsaved, and quit if that worked —
+    /// overwriting what the file changed of them too, if `overwrite`.
+    SaveAndQuit {
+        overwrite: bool,
+    },
     Quit,
 }
 
@@ -159,6 +172,9 @@ pub struct App {
     /// all that says which of its frames is up. Moved on whether or not one is
     /// on screen: a spinner that comes up starts wherever this has got to.
     spin: Duration,
+    /// How many settings are changed and not saved, which quitting asks about
+    /// first (see [`Mode::Leave`]).
+    unsaved: usize,
 }
 
 /// The id of the row standing in the gap [`App::make_room`] opens: no session's,
@@ -291,6 +307,70 @@ impl App {
             room: None,
             notes: HashMap::new(),
             spin: Duration::ZERO,
+            unsaved: 0,
+        }
+    }
+
+    /// How many settings are changed and not saved: told by the caller, who
+    /// reads the settings, as the picker reads nothing.
+    pub fn set_unsaved(&mut self, unsaved: usize) {
+        self.unsaved = unsaved;
+    }
+
+    /// The save asked for on the way out did not happen, for the reason
+    /// `why`. Settings the file has changed too keep the question up, saying
+    /// so, for a second `w` to overwrite them; anything else puts the picker
+    /// back, saying why.
+    pub fn not_saved(&mut self, why: String, clash: bool) {
+        if clash {
+            self.mode = Mode::Leave {
+                prompt: format!("{why} — w overwrites and quits  q quit anyway  esc stay"),
+                overwrite: true,
+            };
+        } else {
+            self.mode = Mode::Normal;
+            self.set_message(why);
+        }
+    }
+
+    /// `q`, or `Ctrl-c` wherever the picker is: quit — but with settings
+    /// changed and unsaved, ask first on the hint row, whatever was open put
+    /// away as `Esc` would put it.
+    fn quit(&mut self) -> Request {
+        if self.unsaved == 0 {
+            return Request::Quit;
+        }
+        match self.mode.clone() {
+            Mode::Reorder { id, was } => self.restore(&was, &id),
+            Mode::Confirm { .. } => self.decline(),
+            Mode::Normal | Mode::Filter | Mode::Leave { .. } => {}
+        }
+        self.pending = None;
+        let n = self.unsaved;
+        self.mode = Mode::Leave {
+            prompt: format!(
+                "{n} unsaved setting{} — w save and quit  q quit anyway  esc stay",
+                if n == 1 { "" } else { "s" }
+            ),
+            overwrite: false,
+        };
+        Request::None
+    }
+
+    /// The question before quitting: only its three keys answer it.
+    fn on_key_leave(&mut self, key: Key) -> Request {
+        let Mode::Leave { overwrite, .. } = &self.mode else {
+            return Request::None;
+        };
+        let overwrite = *overwrite;
+        match key {
+            Key::Char('w') => Request::SaveAndQuit { overwrite },
+            Key::Char('q') | Key::CtrlC => Request::Quit,
+            Key::Esc => {
+                self.mode = Mode::Normal;
+                Request::None
+            }
+            _ => Request::None,
         }
     }
 
@@ -1070,6 +1150,7 @@ impl App {
             Mode::Filter => self.on_key_filter(key),
             Mode::Confirm { .. } => self.on_key_confirm(key),
             Mode::Reorder { .. } => self.on_key_reorder(key),
+            Mode::Leave { .. } => self.on_key_leave(key),
         };
         self.glow_from(was);
         self.note_dropped(visible);
@@ -1257,6 +1338,14 @@ impl App {
                 Request::None
             }
             Mode::Reorder { .. } => self.on_mouse_reorder(mouse),
+            // A click stays, as it declines a `[y/N]`; the wheel does not.
+            Mode::Leave { .. } => {
+                if matches!(mouse, Mouse::Press(_)) {
+                    self.mode = Mode::Normal;
+                    self.pressed = None;
+                }
+                Request::None
+            }
         }
     }
 
@@ -1419,7 +1508,7 @@ impl App {
                 }
                 self.dismiss()
             }
-            Key::Char('q') | Key::CtrlC => Request::Quit,
+            Key::Char('q') | Key::CtrlC => self.quit(),
             _ => Request::None,
         }
     }
@@ -1456,7 +1545,7 @@ impl App {
                 self.clamp_selection();
                 Request::None
             }
-            Key::CtrlC => Request::Quit,
+            Key::CtrlC => self.quit(),
             _ => Request::None,
         }
     }
@@ -1522,7 +1611,7 @@ impl App {
                 self.mode = Mode::Normal;
                 Request::None
             }
-            Key::CtrlC => Request::Quit,
+            Key::CtrlC => self.quit(),
             _ => Request::None,
         }
     }
@@ -1541,7 +1630,7 @@ impl App {
                 self.strike = None;
                 Request::Kill(id)
             }
-            Key::CtrlC => Request::Quit,
+            Key::CtrlC => self.quit(),
             _ => {
                 self.decline();
                 Request::None
@@ -1682,6 +1771,88 @@ mod tests {
         assert_eq!(app(&["x"]).on_key(Key::Char('q')), Request::Quit);
         assert_eq!(app(&["x"]).on_key(Key::CtrlC), Request::Quit);
         assert_eq!(app(&["x"]).on_key(Key::Char('?')), Request::Help);
+        assert_eq!(app(&["x"]).on_key(Key::Char(',')), Request::Settings);
+    }
+
+    /// With settings unsaved, quitting asks first, on the hint row: `w`
+    /// saves and quits, a second `q` quits anyway, and `Esc` stays.
+    #[test]
+    fn quitting_with_settings_unsaved_asks_first() {
+        let mut a = app(&["x"]);
+        a.set_unsaved(2);
+        assert_eq!(a.on_key(Key::Char('q')), Request::None);
+        assert_eq!(
+            a.mode(),
+            &Mode::Leave {
+                prompt: "2 unsaved settings — w save and quit  q quit anyway  esc stay".into(),
+                overwrite: false
+            }
+        );
+        assert_eq!(
+            a.on_key(Key::Char('x')),
+            Request::None,
+            "only its keys answer"
+        );
+        assert_eq!(
+            a.on_key(Key::Char('w')),
+            Request::SaveAndQuit { overwrite: false }
+        );
+        assert_eq!(a.on_key(Key::Char('q')), Request::Quit);
+
+        let mut a = app(&["x"]);
+        a.set_unsaved(1);
+        assert_eq!(a.on_key(Key::CtrlC), Request::None);
+        assert_eq!(a.on_key(Key::Esc), Request::None);
+        assert_eq!(a.mode(), &Mode::Normal, "esc stays");
+        assert_eq!(a.on_key(Key::Char('q')), Request::None, "and asks again");
+        assert_eq!(a.on_key(Key::CtrlC), Request::Quit, "Ctrl-c quits anyway");
+    }
+
+    /// A save on the way out that the file had changed under keeps the
+    /// question up, for a second `w` to overwrite; one that failed otherwise
+    /// puts the picker back with the reason.
+    #[test]
+    fn a_save_on_the_way_out_that_did_not_happen_says_why() {
+        let mut a = app(&["x"]);
+        a.set_unsaved(1);
+        a.on_key(Key::Char('q'));
+        a.not_saved("client.lazy changed in config.toml too".into(), true);
+        assert_eq!(
+            a.mode(),
+            &Mode::Leave {
+                prompt: "client.lazy changed in config.toml too — w overwrites and quits  \
+                         q quit anyway  esc stay"
+                    .into(),
+                overwrite: true
+            }
+        );
+        assert_eq!(
+            a.on_key(Key::Char('w')),
+            Request::SaveAndQuit { overwrite: true }
+        );
+        a.not_saved("not saved: it no longer reads".into(), false);
+        assert_eq!(a.mode(), &Mode::Normal);
+        assert_eq!(a.message(), Some("not saved: it no longer reads"));
+    }
+
+    /// Whatever was open is put away as `Esc` would put it, and a click
+    /// stays, as it declines a `[y/N]`.
+    #[test]
+    fn quitting_mid_move_puts_the_move_back_and_a_click_stays() {
+        let mut a = app(&["one", "two"]);
+        a.set_unsaved(1);
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Char('j'));
+        assert_eq!(a.on_key(Key::CtrlC), Request::None);
+        assert!(matches!(a.mode(), Mode::Leave { .. }));
+        assert_eq!(a.visible()[0].name, "one", "the move was put back");
+        a.on_mouse(Mouse::ScrollDown);
+        assert!(
+            matches!(a.mode(), Mode::Leave { .. }),
+            "the wheel does not stay"
+        );
+        a.on_mouse(Mouse::Press(None));
+        assert_eq!(a.mode(), &Mode::Normal);
     }
 
     #[test]

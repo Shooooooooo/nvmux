@@ -106,10 +106,10 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair};
 
 use crate::error::{NvmuxError, Result};
 use crate::handoff::HandOff;
-use crate::keys::{Action, Pending, Prefix, Step, Wait};
+use crate::keys::{self, Action, Pending, Prefix, Step, Wait};
 use crate::ledger::Ledger;
 use crate::term::write_stdout;
-use crate::{announce, boundary, card, fade, hint, rpc, shadow, term, winch};
+use crate::{announce, boundary, card, config, fade, hint, keyseq, rpc, shadow, term, winch};
 
 /// Neovim aborts on the seventeenth attached UI rather than returning an error
 /// (`src/nvim/ui.c`: `if (ui_count == MAX_UI_COUNT) { abort(); }`), which would
@@ -3340,6 +3340,9 @@ fn pump(
     // which comes in with one already asked for.
     // The row that says what the next key does while a `<prefix>` waits.
     let mut bar = hint::Bar::new(Instant::now(), term::terminal_size(), keys.bind);
+    // `<prefix> d` with settings changed and unsaved asks first, on the bar's
+    // row, and takes the keyboard until it is answered.
+    let mut leaving: Option<Leaving> = None;
     let mut buf = [0u8; 8192];
     // Diagnostics only, and what makes a switch that felt slow attributable:
     // everything before this is nvmux's own work and is timed where it happens,
@@ -3598,11 +3601,53 @@ fn pump(
             match read_fd(stdin_fd, &mut buf) {
                 Ok(0) => return Ok(Outcome::StdinClosed),
                 Err(e) => return Err(NvmuxError::Io(e)),
+                Ok(len) if leaving.is_some() => {
+                    let Some(mut leave) = leaving else {
+                        unreachable!("guarded");
+                    };
+                    match reply(&buf[..len], leave.detach) {
+                        Some(Reply::Detach) => return Ok(Outcome::Detached),
+                        Some(Reply::Save) => {
+                            let live = config::get();
+                            match config::save(&live, &config::saved(), leave.overwrite) {
+                                Ok(_) => {
+                                    config::set_saved((*live).clone());
+                                    return Ok(Outcome::Detached);
+                                }
+                                Err(e) => {
+                                    bar.ask(Some(leave.not_saved(&e)));
+                                    leaving = Some(leave);
+                                }
+                            }
+                        }
+                        Some(Reply::Stay) => {
+                            leaving = None;
+                            bar.ask(None);
+                        }
+                        None => {}
+                    }
+                }
                 Ok(len) => {
                     // Deliberately NOT logged: every keystroke the user types,
                     // into a /tmp file that outlives the session.
                     for step in prefix.feed(&buf[..len]) {
                         if let Some(outcome) = take_step(attachment, step)? {
+                            // With settings unsaved, a detach asks first; what
+                            // else was typed in the same read goes with the key.
+                            if outcome == Outcome::Detached {
+                                let unsaved =
+                                    crate::settings::changed(&config::get(), &config::saved())
+                                        .len();
+                                if unsaved > 0 {
+                                    let leave = Leaving {
+                                        detach: keys.bind.key(Action::Detach).unwrap_or(b'd'),
+                                        overwrite: false,
+                                    };
+                                    bar.ask(Some(leave.question(unsaved)));
+                                    leaving = Some(leave);
+                                    break;
+                                }
+                            }
                             return Ok(outcome);
                         }
                     }
@@ -3743,6 +3788,143 @@ fn pump(
             return Ok(Outcome::ChildExited);
         }
     }
+}
+
+/// `<prefix> d` with settings changed and unsaved: the question on the
+/// bottom row, up until it is answered (see [`reply`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Leaving {
+    /// The key that detaches, which answers "detach anyway".
+    detach: u8,
+    /// That the file has changed what is being saved, and `w` overwrites it.
+    overwrite: bool,
+}
+
+impl Leaving {
+    /// The question, for `unsaved` settings.
+    fn question(&self, unsaved: usize) -> String {
+        format!(
+            "{unsaved} unsaved setting{} — w save and detach  {} detach anyway  esc stay",
+            if unsaved == 1 { "" } else { "s" },
+            keys::key_glyph(self.detach)
+        )
+    }
+
+    /// The question again after a save that did not happen, saying why: the
+    /// file changed what is being saved too, which a second `w` overwrites,
+    /// or something no second `w` can help.
+    fn not_saved(&mut self, e: &crate::error::SaveError) -> String {
+        let detach = keys::key_glyph(self.detach);
+        self.overwrite = e.changed_in_file().is_some();
+        if self.overwrite {
+            format!("{e} — w overwrites and detaches  {detach} detach anyway  esc stay")
+        } else {
+            format!("{e} — {detach} detach anyway  esc stay")
+        }
+    }
+}
+
+/// A reply to the question [`Leaving`] asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reply {
+    Save,
+    Detach,
+    Stay,
+}
+
+/// The first thing in a read of stdin that answers [`Leaving`]'s question:
+/// `w`, the key that detaches, `Esc`, or a click, which stays as it declines
+/// the picker's questions. Anything else answers nothing and goes nowhere —
+/// not to the editor, whose screen the question is up over.
+///
+/// A key arrives as the text it types, or in the kitty protocol's report of
+/// it, which Neovim has the terminal send for `Esc`; key releases and
+/// repeats, and every other report, are passed over — the release of the
+/// very `d` that asked is one. A click arrives as the mouse report the
+/// editor asked the terminal for, in SGR's spelling or X10's.
+fn reply(bytes: &[u8], detach: u8) -> Option<Reply> {
+    let key = |code: u32| match code {
+        27 => Some(Reply::Stay),
+        c if c == u32::from(b'w') => Some(Reply::Save),
+        c if c == u32::from(detach) => Some(Reply::Detach),
+        _ => None,
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        if rest[0] != keyseq::ESC {
+            if let Some(reply) = key(u32::from(rest[0])).filter(|r| *r != Reply::Stay) {
+                return Some(reply);
+            }
+            i += 1;
+            continue;
+        }
+        if rest.len() == 1 {
+            return Some(Reply::Stay);
+        }
+        let Some(len) = csi_len(rest) else {
+            // Not a sequence of the kinds here, or not all of one: it answers
+            // nothing, and neither does anything after it in this read.
+            return None;
+        };
+        let seq = &rest[..len];
+        if seq == b"\x1b[M" {
+            // X10: a button and two coordinates, each a byte plus 32, after
+            // the sequence proper.
+            let button = rest.get(len).map(|b| b.wrapping_sub(32));
+            if button.is_some_and(|b| b & 0b11 != 3 && b & (32 | 64) == 0) {
+                return Some(Reply::Stay);
+            }
+            i += len + 3;
+            continue;
+        }
+        if let Some(button) = sgr_press(seq) {
+            if button & 0b11 != 3 && button & (32 | 64) == 0 {
+                return Some(Reply::Stay);
+            }
+        } else if let Some(reply) = kitty_press(seq).and_then(key) {
+            return Some(reply);
+        }
+        i += len;
+    }
+    None
+}
+
+/// How long the `CSI` sequence at the start of `bytes` is, to its final byte,
+/// or `None` when it is not one or not all of one is here.
+fn csi_len(bytes: &[u8]) -> Option<usize> {
+    let body = bytes.strip_prefix(b"\x1b[")?;
+    let end = body.iter().position(|b| (0x40..=0x7e).contains(b))?;
+    Some(2 + end + 1)
+}
+
+/// The button of an SGR mouse report that is a press — `CSI < button ; x ;
+/// y M` — or `None` for anything else, a release (`m`) included.
+fn sgr_press(seq: &[u8]) -> Option<u32> {
+    let body = seq.strip_prefix(b"\x1b[<")?.strip_suffix(b"M")?;
+    let button = body.split(|b| *b == b';').next()?;
+    std::str::from_utf8(button).ok()?.parse().ok()
+}
+
+/// The key of a kitty-protocol key report that is a press of it alone —
+/// `CSI code [: alternates] [; modifiers [: event]] u`, with no modifier but
+/// the locks and an event of 1 or none — or `None` for anything else.
+fn kitty_press(seq: &[u8]) -> Option<u32> {
+    let body = std::str::from_utf8(seq.strip_prefix(b"\x1b[")?.strip_suffix(b"u")?).ok()?;
+    let mut fields = body.split(';');
+    let code = fields.next()?.split(':').next()?.parse().ok()?;
+    if let Some(modifiers) = fields.next() {
+        let mut parts = modifiers.split(':');
+        let held: u32 = parts.next()?.parse().ok()?;
+        // One plus a bitmask; caps lock (64) and num lock (128) change nothing.
+        if held.checked_sub(1)? & !(64 | 128) != 0 {
+            return None;
+        }
+        if parts.next().is_some_and(|event| event != "1") {
+            return None;
+        }
+    }
+    Some(code)
 }
 
 /// Carry out one instruction from the prefix machine: forward bytes to the
@@ -4823,6 +5005,81 @@ mod tests {
         let r = act(&mut out, Step::Forward(b"hello".to_vec())).expect("write");
         assert_eq!(r, None);
         assert_eq!(out, b"hello");
+    }
+
+    /// What answers the question `<prefix> d` asks with settings unsaved:
+    /// `w`, the detach key, and `Esc` or a click, however the terminal spells
+    /// them — and nothing else, a key's release least of all.
+    #[test]
+    fn the_question_before_detaching_is_answered_by_its_keys_alone() {
+        let d = b'd';
+        for (bytes, want) in [
+            (&b"w"[..], Some(Reply::Save)),
+            (b"d", Some(Reply::Detach)),
+            (b"\x1b", Some(Reply::Stay)),
+            (b"x", None),
+            (b"xyz", None),
+            // kitty: Esc, a release of the `d` that asked, a press of `w`.
+            (b"\x1b[27u", Some(Reply::Stay)),
+            (b"\x1b[100;1:3u", None),
+            (b"\x1b[100;1:3uw", Some(Reply::Save)),
+            (b"\x1b[119u", Some(Reply::Save)),
+            (b"\x1b[119;5u", None),
+            (b"\x1b[100;65u", Some(Reply::Detach)),
+            // SGR: a press stays; a release, motion and the wheel do not.
+            (b"\x1b[<0;10;5M", Some(Reply::Stay)),
+            (b"\x1b[<0;10;5m", None),
+            (b"\x1b[<32;10;5M", None),
+            (b"\x1b[<64;10;5M", None),
+            // X10: a press stays, and its coordinates are not keys.
+            (b"\x1b[M !!", Some(Reply::Stay)),
+            (b"\x1b[M#ww", None),
+            // Cut off: nothing yet.
+            (b"\x1b[", None),
+        ] {
+            assert_eq!(
+                reply(bytes, d),
+                want,
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+        assert_eq!(
+            reply(b"x", b'x'),
+            Some(Reply::Detach),
+            "the detach key as moved"
+        );
+        assert_eq!(reply(b"d", b'x'), None);
+    }
+
+    /// The question names the key that detaches, and how many settings.
+    #[test]
+    fn the_question_names_the_detach_key() {
+        let leave = Leaving {
+            detach: b' ',
+            overwrite: false,
+        };
+        assert_eq!(
+            leave.question(2),
+            "2 unsaved settings — w save and detach  ␣ detach anyway  esc stay"
+        );
+        let mut leave = Leaving {
+            detach: b'd',
+            overwrite: false,
+        };
+        let clash = crate::error::SaveError::Changed {
+            path: "/x/config.toml".into(),
+            settings: vec!["client.lazy".into()],
+        };
+        assert_eq!(
+            leave.not_saved(&clash),
+            "client.lazy changed in config.toml too — w overwrites and detaches  d detach anyway  esc stay"
+        );
+        assert!(leave.overwrite);
+        assert!(leave
+            .not_saved(&crate::error::SaveError::Nowhere)
+            .ends_with("— d detach anyway  esc stay"));
+        assert!(!leave.overwrite);
     }
 
     #[test]
