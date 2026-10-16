@@ -9,7 +9,9 @@
 #![allow(dead_code)]
 
 use std::io::Read;
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
+use std::process::{Child, ExitStatus};
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::Signal;
@@ -20,7 +22,7 @@ use nvmux::rpc::Client;
 use nvmux::session::Session;
 use nvmux::transport::local::LocalTransport;
 use nvmux::transport::Transport;
-use portable_pty::{CommandBuilder, PtySize};
+use pty_process::blocking::{Command, Pty};
 
 /// What a session is launched with unless the test is about the command
 /// itself: the built-in default, which is what nvmux ran before the command
@@ -284,36 +286,30 @@ pub fn block_editor(sock: &Path, cmd: &'static str, settle: Duration) {
 /// The prompt outlives this client — it is the *server* that is waiting — so
 /// a test that wants it ended must [`press_enter`] itself.
 pub struct HitEnter {
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: Child,
     // Held so the pty outlives the client; dropped last.
-    _master: Box<dyn portable_pty::MasterPty>,
+    _master: Pty,
 }
 
 impl HitEnter {
     pub fn open(sock: &Path) -> Self {
-        let pair = portable_pty::native_pty_system()
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("openpty");
-        let mut cmd = CommandBuilder::new("nvim");
-        cmd.arg("--server");
-        cmd.arg(sock);
-        cmd.arg("--remote-ui");
-        cmd.env("TERM", "xterm-256color");
-        let child = pair
-            .slave
-            .spawn_command(cmd)
+        let (master, pts) = pty_process::blocking::open().expect("open a pty");
+        master
+            .resize(pty_process::Size::new(24, 80))
+            .expect("size the pty");
+        let child = Command::new("nvim")
+            .arg("--server")
+            .arg(sock)
+            .arg("--remote-ui")
+            .env("TERM", "xterm-256color")
+            // Takes the slave, or the master would never see EOF once the
+            // client exits.
+            .spawn(pts)
             .expect("spawn remote-ui client");
-        // Or the master would never see EOF once the client exits.
-        drop(pair.slave);
 
         // Drain what the client draws: on a full pty it blocks mid-write and
         // stops talking to the server.
-        let mut reader = pair.master.try_clone_reader().expect("reader");
+        let mut reader = reader(&master);
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             while matches!(reader.read(&mut buf), Ok(n) if n > 0) {}
@@ -321,7 +317,7 @@ impl HitEnter {
 
         let this = Self {
             child,
-            _master: pair.master,
+            _master: master,
         };
 
         // The UI has to be attached before the prompt can exist. A deferred
@@ -350,9 +346,47 @@ impl HitEnter {
 
 impl Drop for HitEnter {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        hang_up_and_reap(&mut self.child);
     }
+}
+
+/// A second handle on a pty's master, for a thread to read the child from. A
+/// read once the child has gone ends in EOF on macOS and EIO on Linux.
+pub fn reader(master: &Pty) -> std::fs::File {
+    let fd = master
+        .as_fd()
+        .try_clone_to_owned()
+        .expect("clone the pty master");
+    std::fs::File::from(fd)
+}
+
+/// End a child as the tests have always ended one, which is how portable-pty's
+/// `kill` did: a hangup, a moment to act on it, and SIGKILL only for a child
+/// still there after that. Waited for either way; one already waited for is
+/// left alone, since its pid may be someone else's by now.
+pub fn hang_up_and_reap(child: &mut Child) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    let pid = Pid::from_raw(child.id() as i32);
+    if nix::sys::signal::kill(pid, Signal::SIGHUP).is_ok() {
+        for attempt in 0..5 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// How a child exited, as the tests compare it: its exit code, or 1 for one a
+/// signal ended.
+pub fn exit_code(status: ExitStatus) -> u32 {
+    status.code().map_or(1, |code| code as u32)
 }
 
 /// Whether the server behind `sock` is at a hit-enter prompt right now. A
