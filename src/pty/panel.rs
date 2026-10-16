@@ -1,8 +1,10 @@
-//! The settings, floating over the session: `<prefix> ,`.
+//! The settings and the help, floating over the session: `<prefix> ,` and
+//! `<prefix> ?`.
 //!
-//! The settings screen ([`crate::ui::settings`]) used to take the terminal,
-//! the session dissolving out under it and back in after. Here it comes up in
-//! a panel in the middle of the session instead, and the session stays
+//! Each screen ([`crate::ui::settings`], [`crate::ui::help`]) used to take
+//! the terminal, the session dissolving out under it and back in after. Here
+//! it comes up in a panel in the middle of the session instead (see
+//! [`crate::ui::float`]), and the session stays
 //! behind it: all of it dimmed half way to the terminal's background, and
 //! further the nearer it is to the panel — the cards' falloff
 //! ([`crate::falloff`]), so the panel stands in a clearing the way a card in
@@ -38,9 +40,9 @@
 //! In nvmux's fade, the way a card comes: over the first half the session
 //! dims, and empties where the panel will be; over the second the panel
 //! comes up out of the background. Going, the other way round. With the fade
-//! off it is at once. While it is up, the row the bar leaves fades back from
-//! it as the picker's does (see [`crate::ui::settings`]), and frames come at
-//! the fade's pace until it has.
+//! off it is at once. While it is up, whatever moves on it — the settings'
+//! bar, whose row it leaves fades back from it as the picker's does (see
+//! [`crate::ui::settings`]) — has frames at the fade's pace until it stops.
 //!
 //! # Where it does not float
 //!
@@ -48,9 +50,10 @@
 //! said — nothing can be taken toward a background nvmux does not know. The
 //! session is drawn faint instead, which dims its text and not its
 //! backgrounds, and the panel stands on a margin of blank cells; and nothing
-//! fades. On a terminal too small for a panel and the session round it, and
-//! for a session nvmux keeps no copy of, the settings take the screen as they
-//! always did ([`Outcome::ShowSettings`]).
+//! fades. On a terminal too small for a panel and the session round it — each
+//! screen says how big a one it needs ([`Floating::area`]) — and for a
+//! session nvmux keeps no copy of, the screen takes the terminal as it always
+//! did ([`Outcome::ShowSettings`], [`Outcome::ShowHelp`]).
 
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
@@ -68,7 +71,8 @@ use crate::keys::Step;
 use crate::palette::Palette;
 use crate::shadow::{Cursor, Laid, Shade, Shadow};
 use crate::term::{self, write_stdout, MouseReporting};
-use crate::ui::settings::{self, Did, Panel};
+use crate::ui::float::{Did, Floating};
+use crate::ui::{help, settings};
 use crate::{card, config, fade, falloff, winch};
 
 /// How far the whole session goes toward the background behind the panel:
@@ -136,6 +140,48 @@ impl Look {
     }
 }
 
+/// What floats over the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum What {
+    /// `<prefix> ,`.
+    Settings,
+    /// `<prefix> ?`.
+    Help,
+}
+
+impl What {
+    /// What floats in place of the screen `outcome` would show full screen,
+    /// if it shows one that floats.
+    pub(super) fn of(outcome: Outcome) -> Option<Self> {
+        match outcome {
+            Outcome::ShowSettings => Some(What::Settings),
+            Outcome::ShowHelp => Some(What::Help),
+            Outcome::ToPicker
+            | Outcome::Detached
+            | Outcome::CreateNew
+            | Outcome::Resettle
+            | Outcome::Switch(_)
+            | Outcome::ChildExited
+            | Outcome::StdinClosed => None,
+        }
+    }
+
+    fn open(self) -> Box<dyn Floating> {
+        match self {
+            What::Settings => Box::new(settings::Panel::open()),
+            What::Help => Box::new(help::Panel::open()),
+        }
+    }
+
+    /// The same screen full screen, where it cannot float.
+    fn full_screen(self) -> Outcome {
+        match self {
+            What::Settings => Outcome::ShowSettings,
+            What::Help => Outcome::ShowHelp,
+        }
+    }
+}
+
 /// How far the panel has come: 0 the session as it is, 1 the panel up.
 #[derive(Debug, Clone, Copy)]
 struct Coming {
@@ -171,22 +217,24 @@ impl Coming {
     }
 }
 
-/// The settings over the session until they are taken down: `None` to go on
-/// relaying the session, and otherwise how the relay ends — the settings
-/// full screen where they cannot float, the client gone, the terminal gone,
-/// or the clients to settle for a change of `client.ui` or
+/// `what` over the session until it is taken down: `None` to go on relaying
+/// the session, and otherwise how the relay ends — the screen full screen
+/// where it cannot float, the client gone, the terminal gone, or the clients
+/// to settle for a change the settings made to `client.ui` or
 /// `client.per_session` (see `main`'s `settle`).
 pub(super) fn float(
     a: &mut Attachment,
     master_fd: RawFd,
     winch: &winch::Winch,
+    what: What,
 ) -> Result<Option<Outcome>> {
+    let mut panel = what.open();
     let size = term::terminal_size();
-    let Some(mut area) = settings::panel_area(Rect::new(0, 0, size.cols, size.rows)) else {
-        return Ok(Some(Outcome::ShowSettings));
+    let Some(mut area) = panel.area(Rect::new(0, 0, size.cols, size.rows)) else {
+        return Ok(Some(what.full_screen()));
     };
     if !a.copy().is_some_and(|c| c.is_usable()) {
-        return Ok(Some(Outcome::ShowSettings));
+        return Ok(Some(what.full_screen()));
     }
     // Whatever is still owed the terminal goes first: a first paint still
     // held, and what the hint bar was keeping back.
@@ -200,7 +248,6 @@ pub(super) fn float(
         Some(palette) => Look::Dimmed(palette),
         None => Look::Faint,
     };
-    let mut panel = Panel::open();
     let mut decoder = Decoder::new();
     let mut boundary = Boundary::new();
     // What the client has written since the last frame, owed to the terminal.
@@ -276,17 +323,17 @@ pub(super) fn float(
             winch.drain();
             let size = term::terminal_size();
             a.resize_to(size);
-            match settings::panel_area(Rect::new(0, 0, size.cols, size.rows)) {
+            match panel.area(Rect::new(0, 0, size.cols, size.rows)) {
                 Some(fits) => {
                     area = fits;
                     owed = true;
                 }
                 // Too small to float any longer: the session back as it is,
-                // and the settings full screen.
+                // and the screen full screen.
                 None => {
                     panel.close();
                     put_back(a, master_fd, &mut held, &mut boundary)?;
-                    return Ok(Some(Outcome::ShowSettings));
+                    return Ok(Some(what.full_screen()));
                 }
             }
         }
@@ -360,7 +407,15 @@ pub(super) fn float(
             // A frame that could not go out is tried again a frame later.
             last_frame = Some(now);
             let there = coming.at(now);
-            if paint(a, look, &mut panel, area, there, &mut held, &mut boundary)? {
+            if paint(
+                a,
+                look,
+                panel.as_mut(),
+                area,
+                there,
+                &mut held,
+                &mut boundary,
+            )? {
                 owed = false;
                 session_drew = false;
                 drawn_at = there;
@@ -404,7 +459,7 @@ fn hold(a: &mut Attachment, chunk: &[u8], held: &mut Vec<u8>, boundary: &mut Bou
 fn paint(
     a: &mut Attachment,
     look: Look,
-    panel: &mut Panel,
+    panel: &mut dyn Floating,
     area: Rect,
     there: f32,
     held: &mut Vec<u8>,
@@ -701,6 +756,29 @@ mod tests {
         assert_eq!(count(&out, fade::SYNC_END), 1, "the paint's own close only");
         let end = [fade::SYNC_END, b"\x1b]2;tit"].concat();
         assert!(out.ends_with(&end), "{:?}", String::from_utf8_lossy(&out));
+    }
+
+    /// The settings and the help float, each in place of its own screen and
+    /// full screen as itself where it cannot; nothing else floats.
+    #[test]
+    fn the_settings_and_the_help_float_and_nothing_else() {
+        for (outcome, what) in [
+            (Outcome::ShowSettings, What::Settings),
+            (Outcome::ShowHelp, What::Help),
+        ] {
+            assert_eq!(What::of(outcome), Some(what));
+            assert_eq!(what.full_screen(), outcome);
+        }
+        for outcome in [
+            Outcome::ToPicker,
+            Outcome::Detached,
+            Outcome::CreateNew,
+            Outcome::Resettle,
+            Outcome::ChildExited,
+            Outcome::StdinClosed,
+        ] {
+            assert_eq!(What::of(outcome), None, "{outcome:?}");
+        }
     }
 
     /// The way in takes as much of the fade as the way is long, and ends

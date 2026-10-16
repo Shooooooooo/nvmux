@@ -1,9 +1,13 @@
-//! The key-binding help — a third screen, shown by `<prefix> ?`.
+//! The key-binding help — a third screen, shown by `?` on the picker and by
+//! `<prefix> ?` in a session.
 //!
-//! A whole screen rather than a popup for a harder reason than taste: what a
-//! popup would cover is Neovim's screen, and [`crate::pty`] never writes into
-//! the child's output. So this takes the terminal the way the prompt does,
-//! draws, and hands the same client back to repaint on resume.
+//! From the picker it takes the terminal, as the settings do. From a session
+//! it floats over the session instead, as the settings do too: in a panel the
+//! relay draws and gives its keys to ([`Panel`], and see `crate::pty::panel`),
+//! the session going on behind it, dimmed. The panel is the table's size, the
+//! table being one that does not scroll, and a terminal with no room for that
+//! and some of the session round it ([`Floating::area`]) has the help full
+//! screen, as from the picker, handing the same client back afterwards.
 //!
 //! Every command row comes from [`keys::BINDINGS`] as the user has it — the
 //! [`Keymap`] [`keys::Prefix::feed`] runs on — so this screen cannot claim
@@ -21,14 +25,19 @@
 //! space bar, `d`, `c` and `Other` do nothing, and only `Esc`, `q`, `Enter`,
 //! `?` and `Ctrl-c` close it. Nothing typed on this screen is ever forwarded.
 
+use std::time::Instant;
+
+use ratatui::buffer::Buffer;
+use ratatui::crossterm::event::{KeyEvent, KeyEventKind, MouseEvent};
 use ratatui::layout::Rect;
 use ratatui::text::Line;
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Widget};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use super::app::Key;
 use super::draw;
+use super::float::{self, Did, Floating};
 use crate::error::Result;
 use crate::keys::{self, Keymap};
 
@@ -38,6 +47,12 @@ const HINTS: &str = "esc back";
 
 /// Columns between the key column and the description.
 const GAP: usize = 3;
+
+/// The least of the session the help leaves showing round it when it floats:
+/// columns either side, and rows above and below. Less than the settings
+/// leave, the help being as wide as its widest row and no narrower.
+const SESSION_COLS: u16 = 2;
+const SESSION_ROWS: u16 = 1;
 
 /// One line of the table.
 #[derive(Debug)]
@@ -131,9 +146,29 @@ pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> 
 }
 
 fn draw(frame: &mut Frame, rows: &[Row]) {
-    draw::screen(frame, HINTS, true, |frame, body| {
-        draw_table(frame, rows, body)
-    });
+    let area = frame.area();
+    draw_on(frame.buffer_mut(), area, rows);
+}
+
+/// The help drawn on `area` of `buf`, as every screen is laid out (see
+/// [`draw::screen`]): the table in the middle of all but the last row, and
+/// the hint row on that. The whole terminal, or the inside of the panel
+/// floating over a session.
+fn draw_on(buf: &mut Buffer, area: Rect, rows: &[Row]) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let (body, hint) = draw::split_hint_row(area);
+    draw_table(buf, rows, body);
+    draw::hint_row_on(buf, hint, HINTS, true);
+}
+
+/// How big the table is: its widest key, the gap and its widest line of
+/// help across, and a row a row.
+fn table_size(rows: &[Row]) -> (u16, u16) {
+    let key_width = rows.iter().map(|r| r.keys.width()).max().unwrap_or(0);
+    let what_width = rows.iter().map(|r| r.what.width()).max().unwrap_or(0);
+    ((key_width + GAP + what_width) as u16, rows.len() as u16)
 }
 
 /// One left-aligned block, centred on both axes.
@@ -141,17 +176,13 @@ fn draw(frame: &mut Frame, rows: &[Row]) {
 /// Keys are padded to the widest key by *display* width rather than `{:<w$}`,
 /// so a non-ASCII key label would still line up. Rows are truncated to the
 /// block and never wrapped, which is what keeps the hint row where it is.
-fn draw_table(frame: &mut Frame, rows: &[Row], area: Rect) {
+fn draw_table(buf: &mut Buffer, rows: &[Row], area: Rect) {
     if area.height == 0 || area.width == 0 || rows.is_empty() {
         return;
     }
     let key_width = rows.iter().map(|r| r.keys.width()).max().unwrap_or(0);
-    let what_width = rows.iter().map(|r| r.what.width()).max().unwrap_or(0);
-    let block = draw::centre(
-        area,
-        (key_width + GAP + what_width) as u16,
-        rows.len() as u16,
-    );
+    let (width, height) = table_size(rows);
+    let block = draw::centre(area, width, height);
 
     let lines: Vec<Line> = rows
         .iter()
@@ -164,7 +195,89 @@ fn draw_table(frame: &mut Frame, rows: &[Row], area: Rect) {
             ))
         })
         .collect();
-    frame.render_widget(Paragraph::new(lines), block);
+    Paragraph::new(lines).render(block, buf);
+}
+
+/// The help floating over a session (see `crate::pty::panel`): the same
+/// table and the same keys closing it, in a panel the table's size — with a
+/// column of room either side of it and a row over and under it, the hint
+/// row, and the panel's own margin ([`float::inside`]) — rather than the
+/// whole terminal.
+#[derive(Debug)]
+pub struct Panel {
+    rows: Vec<Row>,
+}
+
+impl Panel {
+    /// The keys as nvmux has them now.
+    pub fn open() -> Self {
+        let settings = crate::config::get().keys;
+        Self {
+            rows: rows(&keys::prefix_label(settings.prefix), &settings.bind),
+        }
+    }
+
+    /// How big the panel is.
+    fn size(&self) -> (u16, u16) {
+        let (width, height) = table_size(&self.rows);
+        (width + 4, height + 4)
+    }
+}
+
+impl Floating for Panel {
+    /// In the middle, the panel's size, where that leaves [`SESSION_COLS`]
+    /// either side and [`SESSION_ROWS`] above and below; nowhere on a screen
+    /// that does not, which has the help full screen.
+    fn area(&self, screen: Rect) -> Option<Rect> {
+        let (width, height) = self.size();
+        if screen.width < width + 2 * SESSION_COLS || screen.height < height + 2 * SESSION_ROWS {
+            return None;
+        }
+        Some(Rect::new(
+            screen.x + (screen.width - width) / 2,
+            screen.y + (screen.height - height) / 2,
+            width,
+            height,
+        ))
+    }
+
+    /// The keys that close the help full screen close it here; releases are
+    /// no keys, and the rest do nothing (see [`closes`]).
+    fn on_key(&mut self, key: KeyEvent, _now: Instant) -> Did {
+        if key.kind != KeyEventKind::Release && closes(super::translate(key)) {
+            Did::Close
+        } else {
+            Did::Stay
+        }
+    }
+
+    /// Nothing on it to point at. A press outside takes it down, which is the
+    /// relay's to see.
+    fn on_mouse(&mut self, _mouse: MouseEvent, _now: Instant) -> Did {
+        Did::Stay
+    }
+
+    fn wake_at(&self) -> Option<Instant> {
+        None
+    }
+
+    fn tick(&mut self, _now: Instant) -> bool {
+        false
+    }
+
+    fn moving(&self) -> bool {
+        false
+    }
+
+    /// The help drawn into `area`, in the theme's colour where it has one.
+    fn draw(&mut self, area: Rect) -> Buffer {
+        let mut buf = Buffer::empty(area);
+        draw_on(&mut buf, float::inside(area), &self.rows);
+        crate::theme::paint(&mut buf);
+        buf
+    }
+
+    fn close(&self) {}
 }
 
 #[cfg(test)]
@@ -471,5 +584,113 @@ mod tests {
     fn nothing_sets_a_colour() {
         let rows = rows(PREFIX_LABEL);
         test_support::assert_no_colour(WIDE, 11, |f| draw(f, &rows));
+    }
+
+    /// The help as it floats, on the table's own keys rather than whatever
+    /// the config of the moment has.
+    fn panel() -> Panel {
+        Panel {
+            rows: rows(PREFIX_LABEL),
+        }
+    }
+
+    /// The text of a buffer's rows.
+    fn rows_of(buf: &Buffer) -> Vec<String> {
+        let area = buf.area;
+        (area.y..area.y + area.height)
+            .map(|y| {
+                (area.x..area.x + area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Floating, the help is the table's size and a little — a column of
+    /// room and the panel's margin either side, a row over and under the
+    /// table, the hint row and the panel's last — in the middle, wherever
+    /// that leaves some of the session round it; and nowhere it does not.
+    #[test]
+    fn the_panel_is_the_tables_size_in_the_middle() {
+        let panel = panel();
+        let (w, h) = table_size(&panel.rows);
+        let (pw, ph) = (w + 4, h + 4);
+        let screen = |cols, rows| Rect::new(0, 0, cols, rows);
+        assert_eq!(
+            panel.area(screen(120, 36)),
+            Some(Rect::new((120 - pw) / 2, (36 - ph) / 2, pw, ph))
+        );
+        let on_80 = panel.area(screen(80, 24)).expect("floats on 80x24");
+        assert!(on_80.x >= SESSION_COLS && on_80.right() <= 80 - SESSION_COLS);
+        assert!(on_80.y >= SESSION_ROWS && on_80.bottom() <= 24 - SESSION_ROWS);
+        let fits = (pw + 2 * SESSION_COLS, ph + 2 * SESSION_ROWS);
+        assert!(panel.area(screen(fits.0, fits.1)).is_some(), "just fits");
+        assert_eq!(panel.area(screen(fits.0 - 1, 40)), None, "too narrow");
+        assert_eq!(panel.area(screen(200, fits.1 - 1)), None, "too short");
+    }
+
+    /// Drawn into its area, every row is there whole — the help does not
+    /// scroll, so none may be cut — with a clear row over and under the
+    /// table, the hint on the row above the last, the last row clear, and a
+    /// clear column either side.
+    #[test]
+    fn the_panel_draws_every_row_whole_and_its_hint() {
+        let mut panel = panel();
+        let area = panel.area(Rect::new(0, 0, 80, 24)).expect("floats");
+        let buf = panel.draw(area);
+        assert_eq!(buf.area, area);
+        let lines = rows_of(&buf);
+        let last = lines.len() - 1;
+        assert!(lines[0].trim().is_empty(), "a clear row over the table");
+        for row in &panel.rows {
+            let line = line_for(&lines, row);
+            assert!(line.contains(&row.what), "{row:?} cut: {line:?}");
+        }
+        assert!(lines[last - 2].trim().is_empty(), "a clear row under it");
+        assert_eq!(lines[last - 1].trim(), HINTS);
+        assert!(lines[last].trim().is_empty(), "the last row clear");
+        for y in area.y..area.y + area.height {
+            assert_eq!(buf[(area.x, y)].symbol(), " ", "the left margin");
+            assert_eq!(buf[(area.right() - 1, y)].symbol(), " ", "the right");
+        }
+    }
+
+    /// Floating, the keys that close the help full screen close it, and
+    /// nothing else does: not the prefix, not a command's key after it, not a
+    /// key coming up, and not the mouse.
+    #[test]
+    fn the_panel_closes_on_the_screens_keys_only() {
+        use ratatui::crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
+        let now = Instant::now();
+        let mut panel = panel();
+        let press = |code, modifiers| KeyEvent::new(code, modifiers);
+        for code in [
+            KeyCode::Esc,
+            KeyCode::Char('q'),
+            KeyCode::Char('?'),
+            KeyCode::Enter,
+        ] {
+            assert_eq!(
+                panel.on_key(press(code, KeyModifiers::NONE), now),
+                Did::Close,
+                "{code:?}"
+            );
+        }
+        let ctrl_c = press(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(panel.on_key(ctrl_c, now), Did::Close);
+        let prefix = press(KeyCode::Char(' '), KeyModifiers::CONTROL);
+        assert_eq!(panel.on_key(prefix, now), Did::Stay, "the prefix");
+        let d = press(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert_eq!(panel.on_key(d, now), Did::Stay, "a command's key");
+        let up = KeyEvent::new_with_kind(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Release);
+        assert_eq!(panel.on_key(up, now), Did::Stay, "a release");
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(panel.on_mouse(click, now), Did::Stay);
+        assert!(!panel.moving() && panel.wake_at().is_none() && !panel.tick(now));
     }
 }

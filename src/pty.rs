@@ -147,7 +147,9 @@ pub enum Outcome {
     /// `<prefix> c` — prompt for a name and create a new session. The child keeps
     /// running, so a cancelled prompt puts the user straight back.
     CreateNew,
-    /// `<prefix> ?` — show the key bindings. The child keeps running.
+    /// `<prefix> ?` on a terminal too small for the help to float over the
+    /// session, or a session nvmux keeps no copy of: show the key bindings
+    /// full screen. The child keeps running.
     ShowHelp,
     /// `<prefix> ,` on a terminal too small for the settings to float over
     /// the session, or a session nvmux keeps no copy of: show them full
@@ -3682,27 +3684,29 @@ fn pump(
                     }
                 }
                 Ok(len) => {
-                    // Whether the settings floated over the session and went,
-                    // which may have changed the keys this relay runs on.
+                    // Whether the settings or the help floated over the
+                    // session and went, which may have changed the keys this
+                    // relay runs on.
                     let mut floated = false;
                     // Deliberately NOT logged: every keystroke the user types,
                     // into a /tmp file that outlives the session.
                     for step in prefix.feed(&buf[..len]) {
                         if let Some(outcome) = take_step(attachment, step)? {
-                            // `<prefix> ,`: the settings, over the session, and
-                            // back to it once they are taken down — unless they
-                            // cannot float, or what they changed needs the
-                            // session loop.
-                            let outcome = if outcome == Outcome::ShowSettings {
-                                match panel::float(attachment, master_fd, winch)? {
-                                    Some(outcome) => outcome,
-                                    None => {
-                                        floated = true;
-                                        continue;
+                            // `<prefix> ,` or `<prefix> ?`: the settings or the
+                            // help, over the session, and back to it once they
+                            // are taken down — unless they cannot float, or
+                            // what the settings changed needs the session loop.
+                            let outcome = match panel::What::of(outcome) {
+                                Some(what) => {
+                                    match panel::float(attachment, master_fd, winch, what)? {
+                                        Some(outcome) => outcome,
+                                        None => {
+                                            floated = true;
+                                            continue;
+                                        }
                                     }
                                 }
-                            } else {
-                                outcome
+                                None => outcome,
                             };
                             // With settings unsaved, a detach asks first; what
                             // else was typed in the same read goes with the key.
