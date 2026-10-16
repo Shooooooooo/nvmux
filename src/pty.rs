@@ -166,20 +166,23 @@ const WAITING: &str = " — press a key";
 /// How the relay ended. The attachment is handed back separately by [`relay`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// `<prefix> Space` — show the picker. The child keeps running.
+    /// `<prefix> Space` with `[style] float` off, on a terminal too small for
+    /// the picker to float over the session, or for a session nvmux keeps no
+    /// copy of; or a rename from the picker floating: show the picker full
+    /// screen. The child keeps running.
     ToPicker,
     /// `<prefix> d` — detach and exit, leaving the session running.
     Detached,
     /// `<prefix> c` — prompt for a name and create a new session. The child keeps
     /// running, so a cancelled prompt puts the user straight back.
     CreateNew,
-    /// `<prefix> ?` on a terminal too small for the help to float over the
-    /// session, or a session nvmux keeps no copy of: show the key bindings
-    /// full screen. The child keeps running.
+    /// `<prefix> ?` with `[style] float` off, on a terminal too small for the
+    /// help to float over the session, or a session nvmux keeps no copy of:
+    /// show the key bindings full screen. The child keeps running.
     ShowHelp,
-    /// `<prefix> ,` on a terminal too small for the settings to float over
-    /// the session, or a session nvmux keeps no copy of: show them full
-    /// screen. The child keeps running.
+    /// `<prefix> ,` with `[style] float` off, on a terminal too small for the
+    /// settings to float over the session, or a session nvmux keeps no copy
+    /// of: show them full screen. The child keeps running.
     ShowSettings,
     /// The settings over the session changed which client draws a session
     /// (`client.ui`), or whether clients are kept (`client.per_session`):
@@ -390,6 +393,11 @@ pub struct Attachment {
     /// left it standing (see [`HandOff::up_since`]): what it goes in timed
     /// from.
     landed_since: Option<Instant>,
+    /// Set by a panel that went somewhere other than back to the session —
+    /// the picker's `Enter` on another session, say — taking the session out
+    /// to the background with it (see `panel`): the relay's own fade out has
+    /// nothing left to dissolve.
+    dark: bool,
 }
 
 /// How many clients have had their exit sequences relayed to the terminal:
@@ -2917,6 +2925,7 @@ fn spawn_client_with(
         left_standing: None,
         opening: Vec::new(),
         landed_since: None,
+        dark: false,
     })
 }
 
@@ -3353,7 +3362,9 @@ pub fn relay(
             let kept = stood
                 .as_ref()
                 .map_or_else(shadow::Kept::default, |(kept, _)| kept.clone());
-            let faded = attachment.fade_out(&kept);
+            // A panel that took the session out with it has left the screen
+            // as a fade out would.
+            let faded = std::mem::take(&mut attachment.dark) || attachment.fade_out(&kept);
             raw.restore();
             // Clear here rather than leaving it to the next `relay`, which runs
             // on the far side of the client spawn: what is on the terminal until
@@ -3749,11 +3760,14 @@ fn pump(
                     // into a /tmp file that outlives the session.
                     for step in prefix.feed(&buf[..len]) {
                         if let Some(outcome) = take_step(attachment, step)? {
-                            // `<prefix> ,` or `<prefix> ?`: the settings or the
-                            // help, over the session, and back to it once they
-                            // are taken down — unless they cannot float, or
-                            // what the settings changed needs the session loop.
-                            let outcome = match panel::What::of(outcome) {
+                            // `<prefix> ,`, `<prefix> ?` or `<prefix> Space`:
+                            // the settings, the help or the picker, over the
+                            // session, and back to it once they are taken down —
+                            // unless they cannot float or are not to
+                            // (`[style] float`), or where they lead needs the
+                            // session loop.
+                            let float = config::get().style.float;
+                            let outcome = match panel::What::of(outcome, float) {
                                 Some(what) => {
                                     match panel::float(attachment, master_fd, winch, what)? {
                                         Some(outcome) => outcome,

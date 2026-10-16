@@ -1,13 +1,15 @@
 //! The key-binding help — a third screen, shown by `?` on the picker and by
 //! `<prefix> ?` in a session.
 //!
-//! From the picker it takes the terminal, as the settings do. From a session
-//! it floats over the session instead, as the settings do too: in a panel the
-//! relay draws and gives its keys to ([`Panel`], and see `crate::pty::panel`),
-//! the session going on behind it, dimmed. The panel is the table's size, the
-//! table being one that does not scroll, and a terminal with no room for that
-//! and some of the session round it ([`Floating::area`]) has the help full
-//! screen, as from the picker, handing the same client back afterwards.
+//! From the picker full screen it takes the terminal, as the settings do. From
+//! a session, or the picker floating over one, it floats over the session
+//! instead, as the settings do too: in a panel the relay draws and gives its
+//! keys to ([`Panel`], and see `crate::pty::panel`), the session going on
+//! behind it, dimmed. The panel is the table's size, the table being one that
+//! does not scroll. With `[style] float` off, or on a terminal with no room
+//! for the panel and some of the session round it ([`Floating::area`]), the
+//! help is full screen, as from the picker, handing the same client back
+//! afterwards.
 //!
 //! Every command row comes from [`keys::BINDINGS`] as the user has it — the
 //! [`Keymap`] [`keys::Prefix::feed`] runs on — so this screen cannot claim

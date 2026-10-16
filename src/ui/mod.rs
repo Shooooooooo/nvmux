@@ -47,7 +47,7 @@
 //! are the only things that paint a colour on these screens, and they do so as
 //! a post-pass over a finished frame, never inside a `draw`: a screen's own
 //! drawing stays colourless, and its tests say so. So does the theme, when
-//! `[theme] color` names one ([`crate::theme`]): it is the first pass over
+//! `[style] color` names one ([`crate::theme`]): it is the first pass over
 //! every frame once the screen has drawn it, giving what is drawn at full
 //! strength its ink and leaving what is drawn dim the terminal's own, so the
 //! effects and the fade after it take each cell from the colour it is drawn
@@ -64,6 +64,7 @@ pub mod float;
 pub mod help;
 pub mod landing;
 pub mod note;
+pub mod picker;
 pub mod prompt;
 pub mod settings;
 pub mod setup;

@@ -2,8 +2,8 @@
 //!
 //! nvmux's screens set no colour of their own (see [`crate::ui`]): their text
 //! is the terminal's foreground, shaded with dim, bold and reverse, on the
-//! terminal's background. `[theme] color` names one colour to draw them in
-//! instead (see [`crate::config::ThemeSettings`]), and this module is where
+//! terminal's background. `[style] color` names one colour to draw them in
+//! instead (see [`crate::config::StyleSettings`]), and this module is where
 //! that colour — the *ink* — goes on.
 //!
 //! # What is drawn in it, and what is not
@@ -62,10 +62,10 @@ use crate::config::ThemeColor;
 use crate::palette::Rgb;
 
 /// The colour nvmux's own screens are drawn in, or `None` for the terminal's
-/// own: no `[theme] color`, or `NO_COLOR`.
+/// own: no `[style] color`, or `NO_COLOR`.
 pub fn ink() -> Option<Rgb> {
     configured(
-        crate::config::get().theme.color,
+        crate::config::get().style.color,
         std::env::var_os("NO_COLOR").is_some(),
     )
 }

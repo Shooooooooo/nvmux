@@ -132,7 +132,7 @@ pub struct Card {
     /// nvmux's own fade one way, in milliseconds (see [`crate::fade`]), and 0
     /// where that is off: what the card's comings and goings are timed in.
     pub fade_ms: u64,
-    /// `[theme] color` (see [`crate::theme`]): the colour of its sign and its
+    /// `[style] color` (see [`crate::theme`]): the colour of its sign and its
     /// session's name, in place of the editor's; `None` for the editor's own.
     pub ink: Option<(u8, u8, u8)>,
     /// No colour of nvmux's own, under `NO_COLOR`: its sign in the editor's
