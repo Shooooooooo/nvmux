@@ -103,6 +103,18 @@ fn active() -> Option<&'static Palette> {
     }
 }
 
+/// The terminal's colours, to take the session's toward its background with
+/// outside a fade: the settings floating over a session dim it through
+/// these whether or not the fade is on. `None` under `NO_COLOR`, which asks
+/// for no colour of nvmux's own, or where the terminal never said.
+pub fn colours() -> Option<&'static Palette> {
+    if std::env::var_os("NO_COLOR").is_some() {
+        None
+    } else {
+        palette::get()
+    }
+}
+
 /// Whether an attached session is watched so it can dissolve out.
 pub fn session() -> bool {
     crate::config::get().effects.fade.session

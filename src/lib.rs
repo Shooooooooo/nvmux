@@ -13,7 +13,10 @@
 //! watcher left in it ([`notes`]). Notes in the margin are the rest
 //! ([`card`]), drawn by nvmux's own client: on a change of session which one
 //! you landed in, and as it happens what the others have to report ([`tell`])
-//! — the notice once a box of nvmux's own, which is kept ([`announce`]). All of what
+//! — the notice once a box of nvmux's own, which is kept ([`announce`]) — and
+//! its settings, changed while it runs, floating over the session
+//! ([`ui::settings`]) with the session dimmed round them as a note's margin is
+//! ([`falloff`]). All of what
 //! nvmux draws itself is in the terminal's own colours, or with its text in
 //! one colour of the user's ([`theme`]).
 //!
@@ -32,9 +35,11 @@ pub mod config;
 pub mod dirs;
 pub mod error;
 pub mod fade;
+pub mod falloff;
 pub mod handoff;
 pub mod hint;
 pub mod ids;
+pub mod input;
 pub mod keys;
 pub mod keyseq;
 pub mod launch;
@@ -51,6 +56,7 @@ pub mod pty;
 pub mod reconnect;
 pub mod rpc;
 pub mod session;
+pub mod settings;
 pub mod shadow;
 pub mod shell;
 pub mod ssh;

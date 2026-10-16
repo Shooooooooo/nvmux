@@ -2,12 +2,13 @@
 //! last row. No borders, no popups — the hint line *is* the picker's help, and
 //! the filter and kill confirm replace it in place.
 //!
-//! [`prompt`] and [`help`] are the other two screens. Both take the whole
-//! terminal rather than drawing over anything, share the same vocabulary
-//! (centred content, one dim hint row, no borders, no colour), and hand the
-//! same client back afterwards. `prompt::run` owns a terminal for `<prefix> c`,
-//! which arrives with none; `prompt::run_on` borrows the picker's — nesting the
-//! two would enter the alternate screen twice and leave it once.
+//! [`prompt`], [`help`] and [`settings`] are the other three screens. Each
+//! takes the whole terminal rather than drawing over anything, shares the same
+//! vocabulary (centred content, one dim hint row, no borders, no colour), and
+//! hands the same client back afterwards. `prompt::run` owns a terminal for
+//! `<prefix> c`, which arrives with none; `prompt::run_on` borrows the
+//! picker's — nesting the two would enter the alternate screen twice and leave
+//! it once. The help and the settings are reached the same two ways.
 //!
 //! [`attaching`] is a fourth, and the odd one out: not a screen the user works
 //! on but the wait between the picker (or a `<prefix>` switch) and the session,
@@ -63,6 +64,7 @@ pub mod help;
 pub mod landing;
 pub mod note;
 pub mod prompt;
+pub mod settings;
 pub mod setup;
 pub mod sonar;
 pub mod starfield;
@@ -401,6 +403,7 @@ fn run_loop(
     notifier: &crate::tell::Notifier,
 ) -> Result<Outcome> {
     let mut app = App::new(transport.list_sessions()?);
+    app.set_unsaved(unsaved());
     // What each session has to report: read on a thread of its own (see
     // `crate::notes::Poller`), each session handed to it once the loop has
     // its socket, and what they said taken up on every pass.
@@ -652,6 +655,26 @@ fn run_loop(
             }
 
             Request::Help => help::run_on(terminal, false)?,
+
+            // What changed there runs from here: the picker's own copies of
+            // its effects are read again, and the rest it reads as it goes.
+            Request::Settings => {
+                let remote = matches!(transport.location(), crate::transport::Location::Ssh(_));
+                settings::run_on(terminal, false, remote)?;
+                app.reload_effects();
+                app.set_unsaved(unsaved());
+            }
+
+            Request::SaveAndQuit { overwrite } => {
+                let live = crate::config::get();
+                match crate::config::save(&live, &crate::config::saved(), overwrite) {
+                    Ok(_) => {
+                        crate::config::set_saved((*live).clone());
+                        return Ok(Outcome::Quit);
+                    }
+                    Err(e) => app.not_saved(e.to_string(), e.changed_in_file().is_some()),
+                }
+            }
         }
     }
 }
@@ -688,6 +711,11 @@ fn caught_up() -> bool {
             false
         }
     }
+}
+
+/// How many settings are changed and not saved, for quitting to ask about.
+fn unsaved() -> usize {
+    crate::settings::changed(&crate::config::get(), &crate::config::saved()).len()
 }
 
 /// Move whatever is passing on the picker on to now.
@@ -950,6 +978,7 @@ fn translate(k: KeyEvent) -> Key {
         KeyCode::Left => Key::Left,
         KeyCode::Right => Key::Right,
         KeyCode::Tab => Key::Tab,
+        KeyCode::BackTab => Key::BackTab,
         KeyCode::Home => Key::Home,
         KeyCode::End => Key::End,
         _ => Key::Other,

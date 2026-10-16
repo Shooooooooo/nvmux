@@ -244,7 +244,11 @@ enum Step {
 
 /// One labelled field: what has been typed in it, where the cursor is, and what
 /// enter would submit if nothing had been.
-struct Field {
+///
+/// The settings screen types its values in one too ([`super::settings`]),
+/// with no label and no default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Field {
     /// What the field is for, in front of it. A `label: value` line rather than
     /// a heading, because this screen covers whatever you were looking at and
     /// has to say both what is happening and what to type.
@@ -267,16 +271,32 @@ impl Field {
         }
     }
 
+    /// A field with `input` in it and the cursor at its end: no label, and
+    /// no default to stand in for nothing typed.
+    pub(super) fn with(input: String) -> Self {
+        Self::new(String::new(), input, String::new())
+    }
+
+    /// What has been typed.
+    pub(super) fn input(&self) -> &str {
+        &self.input
+    }
+
+    /// Where the cursor is, in characters.
+    pub(super) fn cursor(&self) -> usize {
+        self.cursor
+    }
+
     fn len(&self) -> usize {
         self.input.chars().count()
     }
 
-    fn insert(&mut self, c: char) {
+    pub(super) fn insert(&mut self, c: char) {
         self.input.insert(byte_at(&self.input, self.cursor), c);
         self.cursor += 1;
     }
 
-    fn backspace(&mut self) {
+    pub(super) fn backspace(&mut self) {
         if self.cursor == 0 {
             return;
         }
@@ -284,22 +304,22 @@ impl Field {
         self.cursor -= 1;
     }
 
-    fn left(&mut self) {
+    pub(super) fn left(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
     }
 
-    fn right(&mut self) {
+    pub(super) fn right(&mut self) {
         if self.adopt_default() {
             return;
         }
         self.cursor = (self.cursor + 1).min(self.len());
     }
 
-    fn home(&mut self) {
+    pub(super) fn home(&mut self) {
         self.cursor = 0;
     }
 
-    fn end(&mut self) {
+    pub(super) fn end(&mut self) {
         self.adopt_default();
         self.cursor = self.len();
     }

@@ -72,6 +72,16 @@
 //! update, an absolute placement per row and never a newline, the cursor put
 //! back where the session had it.
 //!
+//! # What a frame under the settings paints
+//!
+//! [`Shadow::frame_under`] is a frame of the session with the settings
+//! floating over it (see `crate::pty::panel`): the panel's own cells where it
+//! stands, as the settings screen drew them, and every other cell as the
+//! caller says — taken toward the background through the palette, each cell
+//! as far as the falloff round the panel takes it; drawn faint where there is
+//! no palette; or emptied. A diff, as a fade's frames are, and the same rules
+//! as theirs.
+//!
 //! # The cursor
 //!
 //! Hiding the cursor is a debt. The client's own frames pay it back — Neovim
@@ -91,8 +101,9 @@ use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};
 
 use crate::fade::{SYNC_BEGIN, SYNC_END};
+use crate::falloff;
 use crate::palette::{Palette, Rgb};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
@@ -237,6 +248,84 @@ impl Kept {
     }
 }
 
+/// What a frame with the settings over the session does with one of the
+/// session's cells (see [`Shadow::frame_under`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Shade {
+    /// Its colours this far toward the terminal's background, as a fade takes
+    /// them, through the terminal's palette; emptied from
+    /// [`falloff::EMPTIED`] on.
+    Toward(f32),
+    /// Drawn faint, in its own colours: where nvmux knows no colours to take
+    /// it toward. Faint dims a cell's text and not its background.
+    Faint,
+    /// Emptied: the terminal's own background.
+    Blank,
+}
+
+/// A rectangle nvmux draws over the session in place of what is there: the
+/// settings, floating over it (see `crate::pty::panel`), as their screen drew
+/// them into a buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Laid {
+    top: u16,
+    left: u16,
+    width: u16,
+    height: u16,
+    /// Row by row, what each cell shows and in what; `None` for the second
+    /// half of a wide character, which its first half writes.
+    cells: Vec<Option<(String, Pen)>>,
+}
+
+impl Laid {
+    /// `buf`'s cells, where its area is on the screen. Its colours are the
+    /// true ones a theme or a fade gave it, or the terminal's own.
+    pub fn from_buffer(buf: &ratatui::buffer::Buffer) -> Self {
+        let area = buf.area;
+        let mut cells = Vec::with_capacity(buf.content.len());
+        for row in buf.content.chunks(usize::from(area.width).max(1)) {
+            let mut skip = 0;
+            for cell in row {
+                if skip > 0 {
+                    skip -= 1;
+                    cells.push(None);
+                    continue;
+                }
+                let symbol = match cell.symbol() {
+                    "" => " ",
+                    symbol => symbol,
+                };
+                skip = UnicodeWidthStr::width(symbol).max(1) - 1;
+                cells.push(Some((symbol.to_string(), Pen::of_buffer(cell))));
+            }
+        }
+        Self {
+            top: area.y,
+            left: area.x,
+            width: area.width,
+            height: area.height,
+            cells,
+        }
+    }
+
+    /// The cell at (`row`, `col`) of the screen, if the rectangle covers it.
+    fn at(&self, row: u16, col: u16) -> Option<&Option<(String, Pen)>> {
+        if row < self.top || col < self.left {
+            return None;
+        }
+        let (r, c) = (row - self.top, col - self.left);
+        if r >= self.height || c >= self.width {
+            return None;
+        }
+        self.cells
+            .get(usize::from(r) * usize::from(self.width) + usize::from(c))
+    }
+
+    fn holds(&self, row: u16, col: u16) -> bool {
+        self.at(row, col).is_some()
+    }
+}
+
 /// A cell as a frame paints it: its interpolated colours and the attributes
 /// that change how its glyph is drawn. What one frame compares against the
 /// last.
@@ -264,6 +353,10 @@ pub struct Shadow {
     /// or empty, when the screen has changed since and the next frame must
     /// paint every cell.
     painted: Vec<Painted>,
+    /// What the last frame with the settings over the session painted (see
+    /// [`Shadow::frame_under`]), one entry per cell, as `painted` is for a
+    /// fade's frames — or empty, when the next must paint every cell.
+    under: Vec<Option<(String, Pen)>>,
     /// The parser panicked on something the session wrote, so its grid can no
     /// longer be trusted: nothing more is fed to it, and a frame paints
     /// nothing. See [`Shadow::feed`].
@@ -287,6 +380,7 @@ impl Shadow {
         Self {
             parser: vt100::Parser::new(rows.max(MIN_SIZE), cols.max(MIN_SIZE), 0),
             painted: Vec::new(),
+            under: Vec::new(),
             broken: false,
         }
     }
@@ -304,7 +398,7 @@ impl Shadow {
             return;
         }
         self.guard(|parser| parser.process(bytes));
-        self.painted.clear();
+        self.invalidate();
     }
 
     /// The terminal changed size, so the grid does too; the client is about
@@ -318,7 +412,7 @@ impl Shadow {
                 .screen_mut()
                 .set_size(rows.max(MIN_SIZE), cols.max(MIN_SIZE));
         });
-        self.painted.clear();
+        self.invalidate();
     }
 
     /// Run `f` on the parser, and retire the shadow if it panics.
@@ -333,6 +427,25 @@ impl Shadow {
     /// `(rows, cols)`.
     pub fn size(&self) -> (u16, u16) {
         self.parser.screen().size()
+    }
+
+    /// What the session has the terminal report of the mouse, as far as its
+    /// bytes have said: what to put back after nvmux has had the mouse for
+    /// something of its own over the session (see `crate::pty::panel`).
+    /// Nothing, for a retired shadow, which can no longer say.
+    pub fn mouse(&self) -> Option<crate::term::MouseReporting> {
+        use crate::term::MouseReporting;
+        use vt100::MouseProtocolMode;
+        if self.broken {
+            return None;
+        }
+        Some(match self.parser.screen().mouse_protocol_mode() {
+            MouseProtocolMode::None => MouseReporting::Off,
+            MouseProtocolMode::AnyMotion => MouseReporting::Motion,
+            MouseProtocolMode::Press
+            | MouseProtocolMode::PressRelease
+            | MouseProtocolMode::ButtonMotion => MouseReporting::Buttons,
+        })
     }
 
     /// Whether a frame from this shadow would paint anything: false once the
@@ -363,6 +476,7 @@ impl Shadow {
     /// the last one left.
     pub fn invalidate(&mut self) {
         self.painted.clear();
+        self.under.clear();
     }
 
     /// The bytes that paint the screen `t` of the way to `palette.bg`, as a
@@ -463,6 +577,7 @@ impl Shadow {
         }
         out.extend_from_slice(SYNC_END);
         self.painted = next;
+        self.under.clear();
         out
     }
 
@@ -748,6 +863,137 @@ impl Shadow {
     }
 }
 
+impl Shadow {
+    /// A frame of the session with `laid` over it — the settings floating
+    /// over a session (see `crate::pty::panel`) — and every other cell as
+    /// `shade` says: taken toward the background through `palette`, drawn
+    /// faint, or emptied. With no `laid` the session's cells under where it
+    /// goes are shaded too, which is how they empty for it to come up on.
+    ///
+    /// A diff against the frame before, as [`Shadow::frame`]'s are, and in
+    /// full after a [`feed`], a [`resize`] or an [`invalidate`] — which is
+    /// every frame after the session has drawn, since what it drew reached the
+    /// terminal behind this one's back. Always at least the sync span, the
+    /// cursor hide and a trailing SGR reset, and the cursor left as `cursor`
+    /// says.
+    ///
+    /// A wide character either edge of the rectangle cuts is blanked rather
+    /// than written in half. `Shade::Toward` with no palette is drawn faint:
+    /// there is nothing to take it toward.
+    ///
+    /// [`feed`]: Shadow::feed
+    /// [`resize`]: Shadow::resize
+    /// [`invalidate`]: Shadow::invalidate
+    pub fn frame_under(
+        &mut self,
+        shade: &dyn Fn(u16, u16) -> Shade,
+        palette: Option<&Palette>,
+        laid: Option<&Laid>,
+        cursor: Cursor,
+    ) -> Vec<u8> {
+        let screen = self.parser.screen();
+        let (rows, cols) = if self.broken { (0, 0) } else { screen.size() };
+        let total = usize::from(rows) * usize::from(cols);
+        let diff = self.under.len() == total;
+        let mut next: Vec<Option<(String, Pen)>> = Vec::with_capacity(total);
+        let mut out = Vec::new();
+        out.extend_from_slice(SYNC_BEGIN);
+        out.extend_from_slice(HIDE_CURSOR);
+        let mut pen: Option<Pen> = None;
+        for row in 0..rows {
+            let mut at: Option<u16> = None;
+            // Whether the cell before was a wide character of the session's
+            // written whole, whose second half is this one.
+            let mut wide_before = false;
+            for col in 0..cols {
+                let cell = screen.cell(row, col);
+                let drawn = match laid.and_then(|l| l.at(row, col)) {
+                    Some(inside) => {
+                        wide_before = false;
+                        inside.clone()
+                    }
+                    None if cell.is_some_and(vt100::Cell::is_wide_continuation) => {
+                        let written = std::mem::take(&mut wide_before);
+                        (!written).then(|| (" ".to_string(), Pen::BLANK))
+                    }
+                    None => {
+                        let wide = cell.is_some_and(vt100::Cell::is_wide);
+                        let cut =
+                            wide && (col + 2 > cols || laid.is_some_and(|l| l.holds(row, col + 1)));
+                        wide_before = wide && !cut;
+                        Some(shaded(cell, shade(row, col), palette, cut))
+                    }
+                };
+                let index = next.len();
+                next.push(drawn);
+                let Some((text, this)) = &next[index] else {
+                    continue;
+                };
+                if diff && self.under[index] == next[index] {
+                    continue;
+                }
+                if at != Some(col) {
+                    let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
+                }
+                if pen != Some(*this) {
+                    this.write(&mut out);
+                    pen = Some(*this);
+                }
+                out.extend_from_slice(text.as_bytes());
+                let width =
+                    u16::try_from(UnicodeWidthStr::width(text.as_str()).max(1)).unwrap_or(1);
+                at = Some(col + width);
+            }
+        }
+        out.extend_from_slice(RESET_SGR);
+        if cursor == Cursor::Restored && !self.broken && !screen.hide_cursor() {
+            let (row, col) = screen.cursor_position();
+            let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
+            out.extend_from_slice(SHOW_CURSOR);
+        }
+        out.extend_from_slice(SYNC_END);
+        self.under = next;
+        // Written behind a fade's diff, which must start again.
+        self.painted.clear();
+        out
+    }
+}
+
+/// A session's cell as a frame with the settings over it draws it (see
+/// [`Shadow::frame_under`]): its text, blanked where `cut` — a wide
+/// character the rectangle's edge cuts — and its pen as `shade` says.
+fn shaded(
+    cell: Option<&vt100::Cell>,
+    shade: Shade,
+    palette: Option<&Palette>,
+    cut: bool,
+) -> (String, Pen) {
+    let text = match cell {
+        Some(c) if c.has_contents() && !cut => c.contents().to_string(),
+        _ => " ".to_string(),
+    };
+    match (shade, palette) {
+        (Shade::Blank, _) => (" ".to_string(), Pen::BLANK),
+        (Shade::Toward(t), _) if t >= falloff::EMPTIED => (" ".to_string(), Pen::BLANK),
+        (Shade::Toward(t), Some(palette)) => {
+            let pen = Pen::painted(resolve(cell, palette, t));
+            // A space shows no colour of its own, unless it is underlined or
+            // has a background: so many cells of a screen are written spaces
+            // that each in its own shade of the falloff would cost a colour
+            // apiece for nothing.
+            let bare = text == " " && !pen.underline && pen.bg == vt100::Color::Default;
+            (text, if bare { Pen::BLANK } else { pen })
+        }
+        // Faint, or toward a background nvmux does not know: the cell's own
+        // colours, its text faint.
+        (Shade::Toward(_) | Shade::Faint, _) => {
+            let mut pen = Pen::of(cell);
+            pen.dim |= cell.is_some_and(vt100::Cell::has_contents);
+            (text, pen)
+        }
+    }
+}
+
 /// A cell's colours and attributes as the session gave them: what
 /// [`Shadow::paint`] writes, and compares to know when to write it again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -762,6 +1008,69 @@ struct Pen {
 }
 
 impl Pen {
+    /// The terminal's own colours and no attributes: an emptied cell.
+    const BLANK: Pen = Pen {
+        fg: vt100::Color::Default,
+        bg: vt100::Color::Default,
+        bold: false,
+        dim: false,
+        italic: false,
+        underline: false,
+        inverse: false,
+    };
+
+    /// A cell as a fade paints it, in its interpolated colours: the
+    /// background left to the terminal where it is the terminal's.
+    fn painted(p: Painted) -> Self {
+        let rgb = |c: Rgb| vt100::Color::Rgb(c.0, c.1, c.2);
+        Pen {
+            fg: rgb(p.fg),
+            bg: p.bg.map_or(vt100::Color::Default, rgb),
+            bold: p.bold,
+            dim: p.dim,
+            italic: p.italic,
+            underline: p.underline,
+            inverse: false,
+        }
+    }
+
+    /// A cell of a screen of nvmux's own, as ratatui drew it: modifiers, and
+    /// the true colours a theme or a fade gave it, if any.
+    fn of_buffer(cell: &ratatui::buffer::Cell) -> Self {
+        use ratatui::style::{Color, Modifier};
+        let colour = |c: Color| match c {
+            Color::Reset => vt100::Color::Default,
+            Color::Rgb(r, g, b) => vt100::Color::Rgb(r, g, b),
+            Color::Indexed(n) => vt100::Color::Idx(n),
+            Color::Black => vt100::Color::Idx(0),
+            Color::Red => vt100::Color::Idx(1),
+            Color::Green => vt100::Color::Idx(2),
+            Color::Yellow => vt100::Color::Idx(3),
+            Color::Blue => vt100::Color::Idx(4),
+            Color::Magenta => vt100::Color::Idx(5),
+            Color::Cyan => vt100::Color::Idx(6),
+            Color::Gray => vt100::Color::Idx(7),
+            Color::DarkGray => vt100::Color::Idx(8),
+            Color::LightRed => vt100::Color::Idx(9),
+            Color::LightGreen => vt100::Color::Idx(10),
+            Color::LightYellow => vt100::Color::Idx(11),
+            Color::LightBlue => vt100::Color::Idx(12),
+            Color::LightMagenta => vt100::Color::Idx(13),
+            Color::LightCyan => vt100::Color::Idx(14),
+            Color::White => vt100::Color::Idx(15),
+        };
+        let m = cell.modifier;
+        Pen {
+            fg: colour(cell.fg),
+            bg: colour(cell.bg),
+            bold: m.contains(Modifier::BOLD),
+            dim: m.contains(Modifier::DIM),
+            italic: m.contains(Modifier::ITALIC),
+            underline: m.contains(Modifier::UNDERLINED),
+            inverse: m.contains(Modifier::REVERSED),
+        }
+    }
+
     /// The cell's own, or the terminal's defaults for a cell past the grid.
     fn of(cell: Option<&vt100::Cell>) -> Self {
         match cell {
@@ -2014,6 +2323,249 @@ mod tests {
         assert_eq!(
             s.paint(),
             [SYNC_BEGIN, HIDE_CURSOR, RESET_SGR, SYNC_END].concat()
+        );
+    }
+
+    /// The settings as their screen drew them: `text` on the first row of a
+    /// rectangle `width` by `height` at 0-based (`left`, `top`), the rest of
+    /// it spaces.
+    fn laid(left: u16, top: u16, width: u16, height: u16, text: &str) -> Laid {
+        let area = ratatui::layout::Rect::new(left, top, width, height);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        buf.set_string(left, top, text, ratatui::style::Style::default());
+        Laid::from_buffer(&buf)
+    }
+
+    /// Every cell of a frame by where it is, 1-based: what it was last
+    /// painted with, and with what.
+    fn screen_of(bytes: &[u8]) -> std::collections::BTreeMap<(usize, usize), (String, String)> {
+        painted_cells(bytes)
+            .into_iter()
+            .map(|(at, sgr, glyph)| (at, (sgr, glyph)))
+            .collect()
+    }
+
+    /// A screen of the alphabet in a grey on the terminal's background.
+    fn lettered() -> Shadow {
+        let mut shadow = Shadow::new(6, 20);
+        for row in 1..=6 {
+            shadow.feed(
+                format!("\x1b[{row};1H\x1b[0;38;2;100;100;100mabcdefghijklmnopqrst").as_bytes(),
+            );
+        }
+        shadow
+    }
+
+    /// The settings stand where they are, in what their screen drew them in,
+    /// and the session's cells everywhere else as far toward the background
+    /// as each is told; nothing of the session shows through them.
+    #[test]
+    fn the_settings_stand_over_the_session_taken_toward_the_background() {
+        let mut shadow = lettered();
+        let panel = laid(5, 2, 6, 2, "panel");
+        let shade = |row: u16, _col: u16| Shade::Toward(if row == 0 { 0.5 } else { 0.25 });
+        let frame = shadow.frame_under(&shade, Some(&palette()), Some(&panel), Cursor::Hidden);
+        let cells = screen_of(&frame);
+        let shown: String = (6..=11).map(|col| cells[&(3, col)].1.clone()).collect();
+        assert_eq!(shown, "panel ");
+        assert!(
+            (6..=11).all(|col| cells[&(3, col)].0 == "0"),
+            "in the terminal's own"
+        );
+        let under: String = (6..=11).map(|col| cells[&(4, col)].1.clone()).collect();
+        assert_eq!(under, "      ", "nothing of the session under it");
+        assert_eq!(
+            cells[&(1, 1)],
+            ("0;38;2;50;50;50".into(), "a".into()),
+            "half way"
+        );
+        assert_eq!(
+            cells[&(3, 5)],
+            ("0;38;2;75;75;75".into(), "e".into()),
+            "a quarter"
+        );
+        assert_eq!(cells[&(3, 12)].1, "l", "the session again past its edge");
+    }
+
+    /// Emptied cells are the terminal's own background; faint ones keep the
+    /// session's own colours, as indices where it gave indices, and dim only
+    /// their text; and taken toward a background nvmux does not know, a cell
+    /// is drawn faint.
+    #[test]
+    fn a_cell_is_emptied_or_drawn_faint() {
+        let mut shadow = Shadow::new(2, 6);
+        // An erase in a background leaves cells with nothing written on them.
+        shadow.feed(b"\x1b[31;44mab\x1b[0m\x1b[2;1H\x1b[44m\x1b[K\x1b[0m");
+        let blank = shadow.frame_under(&|_, _| Shade::Blank, None, None, Cursor::Hidden);
+        let cells = screen_of(&blank);
+        assert_eq!(cells[&(1, 1)], ("0".into(), " ".into()));
+        let faint = shadow.frame_under(&|_, _| Shade::Faint, None, None, Cursor::Hidden);
+        let cells = screen_of(&faint);
+        assert_eq!(
+            cells[&(1, 1)],
+            ("0;2;31;44".into(), "a".into()),
+            "text faint"
+        );
+        assert_eq!(
+            cells[&(2, 1)],
+            ("0;44".into(), " ".into()),
+            "a background is not"
+        );
+        // The same frame as the last, so a diff would paint nothing.
+        shadow.invalidate();
+        let toward = shadow.frame_under(&|_, _| Shade::Toward(0.5), None, None, Cursor::Hidden);
+        assert_eq!(
+            screen_of(&toward)[&(1, 2)].0,
+            "0;2;31;44",
+            "no palette: faint"
+        );
+        let gone = shadow.frame_under(
+            &|_, _| Shade::Toward(falloff::EMPTIED),
+            Some(&palette()),
+            None,
+            Cursor::Hidden,
+        );
+        assert_eq!(
+            screen_of(&gone)[&(1, 1)],
+            ("0".into(), " ".into()),
+            "emptied"
+        );
+    }
+
+    /// The frames are diffs: the same again paints nothing, the settings
+    /// changing paints what changed, and what the session draws repaints it
+    /// all — it reached the terminal behind the frame's back.
+    #[test]
+    fn a_frame_under_the_settings_paints_only_what_changed() {
+        let mut shadow = lettered();
+        let shade = |_: u16, _: u16| Shade::Toward(0.5);
+        let p = palette();
+        let first = shadow.frame_under(
+            &shade,
+            Some(&p),
+            Some(&laid(5, 2, 6, 2, "one")),
+            Cursor::Hidden,
+        );
+        assert_eq!(screen_of(&first).len(), 6 * 20);
+        let again = shadow.frame_under(
+            &shade,
+            Some(&p),
+            Some(&laid(5, 2, 6, 2, "one")),
+            Cursor::Hidden,
+        );
+        assert!(wrapper_only(&again), "{:?}", text(&again));
+        let changed = shadow.frame_under(
+            &shade,
+            Some(&p),
+            Some(&laid(5, 2, 6, 2, "ono")),
+            Cursor::Hidden,
+        );
+        let cells = screen_of(&changed);
+        assert_eq!(cells.len(), 1, "the last letter: {cells:?}");
+        shadow.feed(b"\x1b[1;1Hz");
+        let after = shadow.frame_under(
+            &shade,
+            Some(&p),
+            Some(&laid(5, 2, 6, 2, "ono")),
+            Cursor::Hidden,
+        );
+        assert_eq!(screen_of(&after).len(), 6 * 20, "all of it again");
+    }
+
+    /// A wide character the rectangle's edge cuts is blanked, and one it does
+    /// not is written once.
+    #[test]
+    fn a_wide_character_the_settings_cut_is_blanked() {
+        let mut shadow = Shadow::new(2, 12);
+        shadow.feed("ab漢cd漢".as_bytes());
+        // Columns 3..6, 0-based: the first 漢 is at 2 and 3, the second at 6 and 7.
+        let panel = laid(3, 0, 3, 1, "xyz");
+        let frame = shadow.frame_under(
+            &|_, _| Shade::Toward(0.0),
+            Some(&palette()),
+            Some(&panel),
+            Cursor::Hidden,
+        );
+        let cells = screen_of(&frame);
+        assert_eq!(cells[&(1, 3)].1, " ", "cut by the left edge");
+        assert_eq!(cells[&(1, 4)].1, "x");
+        assert_eq!(cells[&(1, 7)].1, "漢", "clear of it, whole");
+        assert!(
+            !cells.contains_key(&(1, 8)),
+            "its second half is not written"
+        );
+    }
+
+    /// A frame under the settings can put the cursor back where the session
+    /// had it, as the last of a fade in does.
+    #[test]
+    fn a_frame_under_the_settings_can_put_the_cursor_back() {
+        let mut shadow = lettered();
+        shadow.feed(b"\x1b[4;7H");
+        let hidden = shadow.frame_under(&|_, _| Shade::Blank, None, None, Cursor::Hidden);
+        assert!(!text(&hidden).contains("\x1b[?25h"));
+        let back = shadow.frame_under(
+            &|_, _| Shade::Toward(0.0),
+            Some(&palette()),
+            None,
+            Cursor::Restored,
+        );
+        assert!(
+            text(&back).ends_with("\x1b[4;7H\x1b[?25h\x1b[?2026l"),
+            "{:?}",
+            text(&back)
+        );
+    }
+
+    /// What the settings' screen drew is laid as it drew it: its modifiers,
+    /// and a theme's colour where it gave one.
+    #[test]
+    fn the_settings_are_laid_in_their_modifiers_and_colours() {
+        use ratatui::style::{Color, Modifier, Style};
+        let area = ratatui::layout::Rect::new(0, 0, 4, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        buf.set_string(
+            0,
+            0,
+            "ab",
+            Style::new()
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                .fg(Color::Rgb(1, 2, 3)),
+        );
+        buf.set_string(
+            2,
+            0,
+            "c",
+            Style::new().add_modifier(Modifier::DIM | Modifier::UNDERLINED),
+        );
+        let mut shadow = Shadow::new(1, 4);
+        let frame = shadow.frame_under(
+            &|_, _| Shade::Blank,
+            None,
+            Some(&Laid::from_buffer(&buf)),
+            Cursor::Hidden,
+        );
+        let cells = screen_of(&frame);
+        assert_eq!(cells[&(1, 1)], ("0;1;7;38;2;1;2;3".into(), "a".into()));
+        assert_eq!(cells[&(1, 3)], ("0;2;4".into(), "c".into()));
+    }
+
+    /// The mouse as the session last had the terminal report it: off, its
+    /// buttons, or every motion too.
+    #[test]
+    fn the_mouse_is_as_the_session_last_set_it() {
+        use crate::term::MouseReporting;
+        let mut s = Shadow::new(2, 4);
+        assert_eq!(s.mouse(), Some(MouseReporting::Off));
+        s.feed(b"\x1b[?1002h\x1b[?1006h");
+        assert_eq!(s.mouse(), Some(MouseReporting::Buttons));
+        s.feed(b"\x1b[?1003h");
+        assert_eq!(s.mouse(), Some(MouseReporting::Motion));
+        s.feed(b"\x1b[?1003l");
+        assert_eq!(
+            s.mouse(),
+            Some(MouseReporting::Off),
+            "one off is all of it off"
         );
     }
 }

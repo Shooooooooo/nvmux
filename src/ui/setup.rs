@@ -33,9 +33,10 @@ pub enum Outcome {
 }
 
 /// What one keypress meant. Split out so the decision is testable without a
-/// terminal.
-#[derive(Debug, PartialEq, Eq)]
-enum Step {
+/// terminal — and so the settings screen, which changes the prefix the same
+/// way, reads a chord as this screen does ([`super::settings`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Step {
     /// A valid prefix chord: this control byte.
     Choose(u8),
     /// A chord that cannot be a prefix; carries the reason to show.
@@ -55,7 +56,7 @@ enum Step {
 /// validator, so the screen and the file agree — which is why the space bar is
 /// named rather than sent as itself: `Ctrl-Space` is the default prefix, and
 /// `"Ctrl- "` is not a spelling [`crate::keys::parse_prefix`] knows.
-fn interpret(code: KeyCode, ctrl: bool) -> Step {
+pub(super) fn interpret(code: KeyCode, ctrl: bool) -> Step {
     match code {
         KeyCode::Enter => Step::Confirm,
         KeyCode::Esc => Step::Skip,

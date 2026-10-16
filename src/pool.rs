@@ -160,6 +160,26 @@ impl Pool {
         self.parked.is_empty()
     }
 
+    /// Follow `[client] per_session` as it is now, changed on the settings
+    /// screen: turned off, every client held here is retired — those started
+    /// ahead with the rest — and every one from here on handed straight
+    /// back; turned on, the next to leave the front is kept.
+    pub fn keep(&mut self, keeps: bool) {
+        if self.keeps && !keeps {
+            self.retire_all();
+        }
+        self.keeps = keeps;
+    }
+
+    /// Retire every client held here: they are of the kind `[client] ui` no
+    /// longer names, and the next visit to each session starts the other.
+    pub fn retire_all(&mut self) {
+        for parked in &mut self.parked {
+            parked.tell_to_retire();
+        }
+        self.parked.clear();
+    }
+
     /// Retire the client parked for this session, if there is one.
     fn retire(&mut self, session_id: &str) {
         self.parked.retain(|p| p.session_id() != session_id);
@@ -173,10 +193,7 @@ impl Pool {
 /// nothing reads it but `reap`, which throws it away.
 impl Drop for Pool {
     fn drop(&mut self) {
-        for parked in &mut self.parked {
-            parked.tell_to_retire();
-        }
-        self.parked.clear();
+        self.retire_all();
     }
 }
 
@@ -212,6 +229,27 @@ mod tests {
         assert_eq!(back.pid_for_test(), pid);
         assert!(pool.is_empty());
         assert!(pool.set_aside(None).is_none());
+    }
+
+    /// Turned off on the settings screen, the pool retires what it keeps and
+    /// keeps nothing more; turned back on, it keeps the next.
+    #[test]
+    fn a_pool_turned_off_retires_what_it_keeps_and_on_keeps_again() {
+        let mut pool = Pool::new(true);
+        let a = kept_standin("s1", "exec sleep 30");
+        let pid = a.pid_for_test();
+        assert!(pool.set_aside(Some(a)).is_none(), "parked");
+        pool.keep(false);
+        assert!(pool.is_empty());
+        assert!(gone(pid), "the kept client was not retired");
+        let b = kept_standin("s2", "exec sleep 30");
+        assert!(pool.set_aside(Some(b)).is_some(), "handed back");
+        pool.keep(true);
+        let c = kept_standin("s3", "exec sleep 30");
+        assert!(pool.set_aside(Some(c)).is_none(), "kept again");
+        assert!(pool.holds("s3"));
+        pool.retire_all();
+        assert!(pool.is_empty());
     }
 
     /// On, a kept client is parked under its session and taken back by it —

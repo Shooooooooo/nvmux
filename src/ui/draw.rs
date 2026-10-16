@@ -83,16 +83,18 @@ const PAD: &str = " ";
 /// selection's bold never meets it: bold and dim share one reset.
 const SIGN_OUT: u16 = 2;
 
-/// Sixty-nine columns, and it used to be sixty exactly — the widest row that
-/// still fits a small terminal without truncation. `␣ order` is what that budget
-/// was spent on: reordering is the one picker command nobody would find unaided,
-/// since it leaves no trace on screen until it is used and `?` shows the
-/// `<prefix>` keys rather than these.
+/// Seventy-nine columns, so it fits the eighty a terminal opens at, and it
+/// used to be sixty exactly — the widest row that still fit a small terminal
+/// without truncation. `␣ order` is what that budget was first spent on:
+/// reordering is the one picker command nobody would find unaided, since it
+/// leaves no trace on screen until it is used and `?` shows the `<prefix>` keys
+/// rather than these. `, settings` is the rest of it, for the same reason, and
+/// `/ filter` became `/ find` to make room.
 ///
-/// So below sixty-nine columns this row now truncates from the right, where
-/// before it never did. `q quit` is therefore the first entry to go, which is
-/// the order to want: quitting is the one thing every user of a full-screen
-/// program tries unprompted, and `Ctrl-c` quits as well.
+/// So below seventy-nine columns this row truncates from the right. `q quit` is
+/// therefore the first entry to go, which is the order to want: quitting is the
+/// one thing every user of a full-screen program tries unprompted, and `Ctrl-c`
+/// quits as well.
 ///
 /// The space bar is `␣` — [`crate::keys::SPACE_GLYPH`], where that decision now
 /// lives — rather than the `Space` that [`crate::keys::key_label`] spells it in
@@ -103,7 +105,8 @@ const SIGN_OUT: u16 = 2;
 /// spells its keys the same way. A test below keeps the two rows agreeing.
 ///
 /// `?` is still not listed, for the reason above.
-const HINTS: &str = "↑↓ move  ⏎ attach  c new  r rename  x kill  ␣ order  / filter  q quit";
+const HINTS: &str =
+    "↑↓ move  ⏎ attach  c new  r rename  x kill  ␣ order  / find  , settings  q quit";
 const EMPTY: &str = "no sessions — press c to create one";
 
 /// What the hint row says while a session is in flight. Dim, like the hints it
@@ -732,7 +735,7 @@ fn draw_trail(frame: &mut Frame, area: Rect, spans: Vec<Span<'static>>) {
 /// asked or typed, and otherwise the thing being asked or typed, at full weight.
 fn hint_line(app: &App) -> (String, bool) {
     match app.mode() {
-        Mode::Confirm { prompt, .. } => (prompt.clone(), false),
+        Mode::Confirm { prompt, .. } | Mode::Leave { prompt, .. } => (prompt.clone(), false),
         Mode::Filter => (format!("/{}{CURSOR}", app.filter()), false),
         // The query comes too, when there is one. A move of one visible row can
         // carry a session past several the filter is hiding, and that is the one
@@ -1006,12 +1009,12 @@ mod tests {
 
     #[test]
     fn the_whole_screen_is_a_centred_list_and_one_hint_line() {
-        // Seventy columns because `HINTS` is sixty-nine: narrower and the row
+        // Eighty columns because `HINTS` is seventy-nine: narrower and the row
         // is truncated, and "the hints are on the last row" would be asserted
         // against whatever happened to survive.
         let lines = render(
             &app(&["api-server", "dotfiles", "scratch", "notes"]),
-            70,
+            80,
             11,
         );
 
@@ -1234,7 +1237,7 @@ mod tests {
 
     #[test]
     fn the_empty_state_is_one_dimmed_line_with_hints_still_below() {
-        let lines = render(&app(&[]), 70, 9);
+        let lines = render(&app(&[]), 80, 9);
         let content: Vec<&String> = lines[..8].iter().filter(|l| !l.is_empty()).collect();
         assert_eq!(content.len(), 1, "expected one line, got {content:?}");
         assert!(content[0].contains("no sessions"), "got {:?}", content[0]);

@@ -321,6 +321,11 @@ pub enum Command {
     /// The prefix is held, or it is not any more: while it is, the card the
     /// key acts on says so.
     Keys { held: bool },
+    /// Draw with these settings from now on: the settings screen has
+    /// changed them since the client was started, or was last told (see
+    /// [`crate::config::Drawing`]). Not a card's business, though it comes
+    /// the cards' way.
+    Settings(crate::config::Drawing),
 }
 
 /// `cmd` as it goes into the client's input: see the module docs.
@@ -1002,8 +1007,24 @@ mod tests {
                 Command::Drop { id } => format!("drop {id}"),
                 Command::Clear => "clear".to_string(),
                 Command::Keys { held } => format!("keys {held}"),
+                Command::Settings(_) => "settings".to_string(),
             })
             .collect()
+    }
+
+    /// Settings go to the client as every command does, and come back as
+    /// they went.
+    #[test]
+    fn settings_go_to_the_client_and_come_back_as_they_went() {
+        let mut drawing = crate::config::Drawing::default();
+        drawing.client.centre = true;
+        drawing.client.window_width = 100;
+        drawing.effects.smear.enabled = true;
+        drawing.effects.particles.mode = crate::config::ParticleMode::Ripple;
+        let cmd = Command::Settings(drawing);
+        let wire = encode(&cmd);
+        let body = &wire[OPEN.len()..wire.len() - CLOSE.len()];
+        assert_eq!(decode(body), Some(cmd));
     }
 
     /// A relay opens with a clear and where the switch landed; takes what was

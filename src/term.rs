@@ -159,11 +159,18 @@ pub fn enable_mouse() {
 /// that set its own. See [`crate::pty`], which takes it from a kept client's
 /// ledger or asks a held client's server.
 pub fn set_mouse_reporting(reporting: MouseReporting) {
-    let _ = write_stdout(match reporting {
+    let _ = write_stdout(mouse_reporting_bytes(reporting));
+}
+
+/// What [`set_mouse_reporting`] writes, for a caller writing it among other
+/// things of its own: the settings over a session, which report the mouse
+/// while they are up and put the session's back as they go.
+pub fn mouse_reporting_bytes(reporting: MouseReporting) -> &'static [u8] {
+    match reporting {
         MouseReporting::Off => MOUSE_OFF,
         MouseReporting::Buttons => MOUSE_BUTTONS,
         MouseReporting::Motion => MOUSE_ON,
-    });
+    }
 }
 
 /// Turn mouse reporting off again, for the screen that turned it on.

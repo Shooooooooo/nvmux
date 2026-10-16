@@ -170,6 +170,12 @@ fn wants(v: Option<&ValueRef<'_>>) -> Option<BTreeMap<i64, usize>> {
 /// cannot ask the terminal itself without the answers racing the user's keys.
 pub const PALETTE_ENV: &str = "NVMUX_PALETTE";
 
+/// The variable the settings a client draws with come in, from the nvmux
+/// that started it: those nvmux runs on, which the file the client would
+/// otherwise read does not have where the settings screen has changed them
+/// and not saved (see [`crate::config::Drawing`]).
+pub const SETTINGS_ENV: &str = "NVMUX_CLIENT";
+
 /// The least time between two frames drawn for Neovim's flushes: a burst of
 /// them — a `:terminal` running something — is drawn at most this often, the
 /// last of them always.
@@ -1478,6 +1484,86 @@ impl App {
         }
     }
 
+    /// Draw with `drawing` from here on, as nvmux has changed its settings
+    /// (see [`crate::card::Command::Settings`]).
+    ///
+    /// The effects change at once: what is moving moves on to its end, and
+    /// nothing turned off starts again. The rest are things this attach has
+    /// told Neovim, and are told it again: whether the windows have grids of
+    /// their own, and what the agent left in the editor predicts, by
+    /// attaching again — as the client does when the UIs attached change —
+    /// and how wide each window's text is to be, by measuring again.
+    pub fn reconfigure(&mut self, drawing: &crate::config::Drawing, now: Instant) {
+        let effects = Effects::from_settings(&drawing.settings());
+        let client = drawing.client;
+        let wanted = effects.want_multigrid() || client.predict;
+        let predicting = self.predict.is_some();
+        self.anim.set_effects(effects);
+        self.dirty = true;
+        if client.predict != predicting {
+            self.predict = client.predict.then(|| {
+                let mut p = Predictor::default();
+                p.typed.attached();
+                p
+            });
+        }
+        let flipped = wanted != self.multigrid_wanted;
+        self.multigrid_wanted = wanted;
+        if flipped {
+            self.client_info();
+        }
+        let centred = (self.centre, self.window_width, self.smart);
+        self.centre = client.centre;
+        self.window_width = usize::from(client.window_width);
+        self.smart = client.smart_width;
+
+        let again = match self.attach {
+            // Windows of their own wanted now: whether they can be had is
+            // who else is attached, which the answer decides as it does at
+            // the start.
+            Attach::Attached { multigrid: false } if flipped && wanted => {
+                self.ask_uis();
+                false
+            }
+            // Not wanted any more; or the agent to be told it predicts, or
+            // that it does not.
+            Attach::Attached { multigrid: true } if !wanted || client.predict != predicting => {
+                self.leave(wanted, now);
+                true
+            }
+            Attach::Leaving { multigrid } => {
+                self.attach = Attach::Leaving {
+                    multigrid: multigrid && wanted,
+                };
+                true
+            }
+            Attach::Asking | Attach::Attached { .. } => false,
+        };
+        // An attach to come leaves the agent and the measure as they now
+        // are; this one is told here.
+        if again {
+            return;
+        }
+        self.leave_agent();
+        if centred != (self.centre, self.window_width, self.smart) {
+            if self.centring() {
+                // A measure left in the editor is replaced by the next.
+                self.measuring = false;
+                self.leave_measure();
+            } else if let Some(chan) = self.chan.filter(|_| self.measuring) {
+                self.measuring = false;
+                self.outbox.notify(
+                    "nvim_exec_lua",
+                    &[
+                        Arg::str(wide::UNMEASURE_LUA),
+                        Arg::Array(vec![Arg::Int(chan as i64)]),
+                    ],
+                );
+            }
+            self.narrow_windows(now);
+        }
+    }
+
     /// Detach, to attach again as `multigrid` says once Neovim has done it:
     /// the windows let go of first, while Neovim still takes it of this UI.
     fn leave(&mut self, multigrid: bool, now: Instant) {
@@ -1975,6 +2061,9 @@ impl App {
                 Input::Focus(on) => self.outbox.notify("nvim_ui_set_focus", &[Arg::Bool(on)]),
                 Input::Reply(reply) => self.reply(reply),
                 Input::Card(body) => match crate::card::decode(&body) {
+                    Some(crate::card::Command::Settings(drawing)) => {
+                        self.reconfigure(&drawing, now);
+                    }
                     Some(cmd) => {
                         if self.cards.apply(cmd, now) {
                             self.dirty = true;
@@ -2715,7 +2804,11 @@ impl App {
 /// Run the client on its pty, for the session at `sock`, until the session or
 /// the client is done. See the module docs.
 pub fn run(sock: &Path) -> anyhow::Result<()> {
-    let settings = crate::config::load().unwrap_or_default();
+    let settings = std::env::var(SETTINGS_ENV)
+        .ok()
+        .and_then(|text| crate::config::Drawing::from_env(&text))
+        .map(|drawing| drawing.settings())
+        .unwrap_or_else(|| crate::config::load().unwrap_or_default());
     let effects = Effects::from_settings(&settings);
     let term = palette_from_env().unwrap_or(FALLBACK);
 
@@ -3237,6 +3330,118 @@ mod tests {
         redraw(&mut a, vec![resize(1, 20, 6)], t0);
         calls(&mut a);
         a
+    }
+
+    /// The settings the test clients start with, as nvmux would tell them:
+    /// windows animated, and nothing predicted or centred.
+    fn drawing() -> crate::config::Drawing {
+        let mut d = crate::config::Drawing::default();
+        d.client.predict = false;
+        d.effects.scroll.enabled = false;
+        d
+    }
+
+    /// Whether `calls` has the Lua that starts with `lua`, asked or told.
+    fn runs_lua(calls: &[Call], lua: &str) -> bool {
+        calls.iter().any(|(_, m, args)| {
+            m == "nvim_exec_lua"
+                && args
+                    .first()
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.starts_with(lua))
+        })
+    }
+
+    /// Told settings whose effects want no windows of their own, a client
+    /// attached with them attaches again without.
+    #[test]
+    fn a_client_told_it_needs_no_windows_of_their_own_attaches_again_without() {
+        let t0 = Instant::now();
+        let mut a = attached(false, t0);
+        let mut d = drawing();
+        d.effects.windows.enabled = false;
+        a.reconfigure(&d, t0);
+        let sent = calls(&mut a);
+        let detach = request(&sent, "nvim_ui_detach", "");
+        answer(&mut a, detach, Value::Nil, t0);
+        assert_eq!(attached_with_multigrid(&calls(&mut a)), Some(false));
+    }
+
+    /// Told settings that want windows of their own, a client attached
+    /// without asks who else is attached, and attaches again with them where
+    /// nothing stops it — as it would have from the start.
+    #[test]
+    fn a_client_told_it_wants_windows_of_their_own_asks_after_the_uis() {
+        let t0 = Instant::now();
+        let mut a = app(false);
+        a.start();
+        let sent = calls(&mut a);
+        answer(
+            &mut a,
+            request(&sent, "nvim_get_api_info", ""),
+            Value::Array(vec![7.into()]),
+            t0,
+        );
+        assert_eq!(attached_with_multigrid(&sent), Some(false));
+        a.reconfigure(&drawing(), t0);
+        let sent = calls(&mut a);
+        answer(&mut a, asks_uis(&sent), uis(false, false), t0);
+        let sent = calls(&mut a);
+        let detach = request(&sent, "nvim_ui_detach", "");
+        answer(&mut a, detach, Value::Nil, t0);
+        assert_eq!(attached_with_multigrid(&calls(&mut a)), Some(true));
+    }
+
+    /// Told to predict, or not to, a client attaches again, so the agent it
+    /// leaves in the editor is left as the prediction now needs.
+    #[test]
+    fn a_client_told_to_predict_attaches_again_for_the_agent() {
+        let t0 = Instant::now();
+        let mut a = attached(false, t0);
+        let mut d = drawing();
+        d.client.predict = true;
+        a.reconfigure(&d, t0);
+        assert!(a.predict.is_some());
+        let sent = calls(&mut a);
+        request(&sent, "nvim_ui_detach", "");
+        assert!(
+            !runs_lua(&sent, AGENT_LUA),
+            "the agent waits for the attach"
+        );
+    }
+
+    /// Told to centre each window's text, a client measures the windows; told
+    /// not to any more, it takes the measure back out of the editor. Neither
+    /// attaches again.
+    #[test]
+    fn a_client_told_to_centre_measures_and_told_not_to_stops() {
+        let t0 = Instant::now();
+        let mut a = attached(false, t0);
+        let mut d = drawing();
+        d.client.centre = true;
+        a.reconfigure(&d, t0);
+        let sent = calls(&mut a);
+        assert!(runs_lua(&sent, "local most"), "measured: {sent:?}");
+        assert!(!sent.iter().any(|(_, m, _)| m == "nvim_ui_detach"));
+
+        d.client.centre = false;
+        a.reconfigure(&d, t0);
+        let sent = calls(&mut a);
+        assert!(runs_lua(&sent, wide::UNMEASURE_LUA), "{sent:?}");
+        assert!(!sent.iter().any(|(_, m, _)| m == "nvim_ui_detach"));
+    }
+
+    /// Settings come in the card's way, in the client's input, and go to the
+    /// client rather than to the cards.
+    #[test]
+    fn settings_in_the_input_reconfigure_the_client() {
+        let t0 = Instant::now();
+        let mut a = attached(false, t0);
+        let mut d = drawing();
+        d.client.centre = true;
+        a.keys(&crate::card::encode(&crate::card::Command::Settings(d)), t0);
+        assert!(a.centre);
+        assert!(runs_lua(&calls(&mut a), "local most"));
     }
 
     /// A card is a frame when it comes, and another each time it looks

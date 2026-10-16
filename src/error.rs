@@ -269,6 +269,73 @@ pub enum ConfigError {
     },
 }
 
+/// Why a save of the settings wrote nothing (see [`crate::config::save`]).
+///
+/// Each is one line, for the hint row it is shown on, with the file named the
+/// way the user would type it — `~/.config/nvmux/config.toml`.
+#[derive(Debug, thiserror::Error)]
+pub enum SaveError {
+    /// No config path can be formed: no `$HOME`, and no `$XDG_CONFIG_HOME`.
+    #[error("not saved: there is no $HOME to keep a config file in")]
+    Nowhere,
+
+    /// The file is there and could not be read.
+    #[error("not saved: could not read {}: {error}", crate::config::shown(.path))]
+    Read {
+        path: PathBuf,
+        error: std::io::Error,
+    },
+
+    /// The file no longer reads as a config — edited by hand since nvmux read
+    /// it — so nothing in it is written over. `message` says where and why.
+    #[error("not saved: {} no longer reads: {message}", crate::config::shown(.path))]
+    Unreadable { path: PathBuf, message: String },
+
+    /// What is being saved was changed in the file as well, since nvmux read
+    /// it; `settings` names them. Saved anyway when asked again.
+    #[error("{}", changed_too(.settings, .path))]
+    Changed {
+        path: PathBuf,
+        settings: Vec<String>,
+    },
+
+    /// The new contents could not be written.
+    #[error("not saved: could not write {}: {error}", crate::config::shown(.path))]
+    Write {
+        path: PathBuf,
+        error: std::io::Error,
+    },
+
+    /// The file could not be edited into one holding what is being saved: a
+    /// layout the edit does not know, which a hand edit can always fix.
+    #[error("not saved: {} could not be edited to hold the change", crate::config::shown(.path))]
+    Unedited { path: PathBuf },
+}
+
+/// `keys.timeout_ms changed in config.toml too`, or with several, how many.
+fn changed_too(settings: &[String], path: &std::path::Path) -> String {
+    let what = match settings {
+        [one] => one.clone(),
+        many => format!("{} settings", many.len()),
+    };
+    let file = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    format!("{what} changed in {file} too")
+}
+
+impl SaveError {
+    /// Whether this is [`SaveError::Changed`]: settings a second save would
+    /// overwrite in the file, rather than a reason it cannot be saved at all.
+    pub fn changed_in_file(&self) -> Option<usize> {
+        match self {
+            SaveError::Changed { settings, .. } => Some(settings.len()),
+            _ => None,
+        }
+    }
+}
+
 /// The error type crossing the [`crate::transport::Transport`] boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum NvmuxError {

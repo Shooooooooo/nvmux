@@ -1,5 +1,6 @@
 //! The picker's passing effects: the afterglow the cursor leaves behind (and a
-//! session in flight leaves on the rows it crosses, see [`super::swap`]), the
+//! session in flight leaves on the rows it crosses, see [`super::swap`], and
+//! the settings' bar on the row it leaves, see [`super::settings`]), the
 //! rows a filter keystroke drops fading out where they stood, the line struck
 //! through a name a `[y/N]` is asking about, and the row `c` stands in the gap
 //! it opens, coming up out of the background.
@@ -164,7 +165,7 @@ pub fn colours() -> Option<Colours> {
 /// should be asked what its colours are even with the fade switched off.
 /// `NO_COLOR` answers no for all of them, as it does for the fade.
 pub fn want_palette() -> bool {
-    let effects = &crate::config::get().effects;
+    let effects = crate::config::get().effects;
     let wanted = effects.cursor_enabled()
         || effects.move_enabled()
         || effects.filter_enabled()
@@ -228,8 +229,9 @@ pub fn paint(frame: &mut Frame, app: &App, colours: Option<&Colours>) {
 
 /// The row the cursor left, `progress` of the way back to plain: the bar it
 /// had sinking into the background, and each cell's text coming up out of it
-/// to the colour the plain row draws it in.
-fn glow(buf: &mut Buffer, rect: Rect, colours: Option<&Colours>, progress: f32) {
+/// to the colour the plain row draws it in. The settings' bar leaves the same
+/// (see [`super::settings`]).
+pub(super) fn glow(buf: &mut Buffer, rect: Rect, colours: Option<&Colours>, progress: f32) {
     match colours {
         Some(c) => {
             let t = ease_out(progress);

@@ -25,18 +25,20 @@
 //!
 //! Two readers of this direction. The shadow grid ([`crate::shadow`]) is
 //! shown a *copy* and can neither alter a write nor make one depend on what it
-//! saw; it exists for the fade, and is off with it. The boundary
-//! ([`crate::boundary`]) is shown the bytes as they go and keeps back the few
-//! at the end of a write that would leave the terminal's parser inside a
-//! sequence — a delay of microseconds, until the client writes the rest of
-//! them, and only while there is a notice or a hint bar on screen to protect.
+//! saw; it exists for the fade, and with the fade off a copy of the same kind
+//! stands in for it (see below). The boundary ([`crate::boundary`]) is shown
+//! the bytes as they go and keeps back the few at the end of a write that
+//! would leave the terminal's parser inside a sequence — a delay of
+//! microseconds, until the client writes the rest of them, and only while
+//! there is a notice, a hint bar or the settings on screen to protect.
 //!
-//! A kept client (`[client] per_session`, the default) is watched by two more,
-//! each shown a copy as the shadow is. Its ledger ([`crate::ledger`]) notes
-//! what the client told the terminal, so that it can be told again — the
-//! client's own sequences, replayed, never rewritten — when the client comes
-//! back to the front (see [`Attachment::put_back_what_it_told`]). And, with
-//! the fade off, a copy of its screen stands in for the shadow.
+//! A kept client (`[client] per_session`, the default) is watched by one more,
+//! shown a copy as the shadow is: its ledger ([`crate::ledger`]) notes what
+//! the client told the terminal, so that it can be told again — the client's
+//! own sequences, replayed, never rewritten — when the client comes back to
+//! the front (see [`Attachment::put_back_what_it_told`]). And with the fade
+//! off, every client's own copy of its screen stands in for the shadow: for a
+//! kept client to come back with, and for the settings to float over.
 //!
 //! The direction is also *held* once per relay: with the fade on, a session's
 //! first paint is kept back from the terminal until it has settled, so the
@@ -77,6 +79,10 @@
 //! And a kept client's screen, painted back from its copy as the client
 //! returns to the front with no fade to dissolve it in (see
 //! [`Attachment::paint_kept_screen`]).
+//! And the settings, floating over the session ([`panel`]): while they are
+//! up the client's bytes are held, a frame at a time, and go to the terminal
+//! at the front of the frame that paints the session dimmed under them again
+//! — every byte, in order, in one synchronized update with it.
 //!
 //! None of them is ever fed back to the shadow. All four are nvmux's own
 //! picture of the screen rather than the session's bytes, and the notice's
@@ -106,10 +112,12 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair};
 
 use crate::error::{NvmuxError, Result};
 use crate::handoff::HandOff;
-use crate::keys::{Action, Pending, Prefix, Step, Wait};
+use crate::keys::{self, Action, Pending, Prefix, Step, Wait};
 use crate::ledger::Ledger;
 use crate::term::write_stdout;
-use crate::{announce, boundary, card, fade, hint, rpc, shadow, term, winch};
+use crate::{announce, boundary, card, config, fade, hint, keyseq, rpc, shadow, term, winch};
+
+mod panel;
 
 /// Neovim aborts on the seventeenth attached UI rather than returning an error
 /// (`src/nvim/ui.c`: `if (ui_count == MAX_UI_COUNT) { abort(); }`), which would
@@ -141,6 +149,15 @@ pub enum Outcome {
     CreateNew,
     /// `<prefix> ?` — show the key bindings. The child keeps running.
     ShowHelp,
+    /// `<prefix> ,` on a terminal too small for the settings to float over
+    /// the session, or a session nvmux keeps no copy of: show them full
+    /// screen. The child keeps running.
+    ShowSettings,
+    /// The settings over the session changed which client draws a session
+    /// (`client.ui`), or whether clients are kept (`client.per_session`):
+    /// the session loop settles that, and attaches again. The child keeps
+    /// running.
+    Resettle,
     /// `<prefix> <number>`, `<prefix> n` or `<prefix> p` — attach to the session
     /// this names. The child keeps running, so a switch that names nothing puts
     /// the user straight back.
@@ -158,16 +175,17 @@ impl Outcome {
     /// Whether this leads from one relay straight into the next, with no
     /// [`crate::ui`] screen in between to clear the outgoing frame on the way.
     ///
-    /// Only a switch does — by number or by step. `ToPicker`, `CreateNew` and
-    /// `ShowHelp` all open a screen, and a screen clears as it opens; the rest
-    /// end the relay for good.
+    /// Only a switch does — by number or by step. `ToPicker`, `CreateNew`,
+    /// `ShowHelp` and `ShowSettings` all open a screen, and a screen clears as
+    /// it opens; `Resettle` comes back to the session by the session loop;
+    /// the rest end the relay for good.
     fn leads_straight_into_another_relay(self) -> bool {
         matches!(self, Outcome::Switch(_))
     }
 
     /// The session this outcome names, for the caller that starts the next
     /// attachment while the outgoing one dissolves (see [`relay`]). `None` for
-    /// every other way a relay can end: the three that open a screen have
+    /// every other way a relay can end: the four that open a screen have
     /// nothing to start yet, and the three that end it have nowhere to go.
     ///
     /// Its own accessor rather than a `matches!` at the call site, so the one
@@ -181,6 +199,8 @@ impl Outcome {
             | Outcome::Detached
             | Outcome::CreateNew
             | Outcome::ShowHelp
+            | Outcome::ShowSettings
+            | Outcome::Resettle
             | Outcome::ChildExited
             | Outcome::StdinClosed => None,
         }
@@ -237,15 +257,16 @@ pub struct Attachment {
     reaped: bool,
     /// The session's screen as its bytes have described it, kept so the
     /// session can be dissolved in and out (see [`crate::shadow`]). `None`
-    /// with the fade off or `effects.fade.session` false, and then nothing is parsed
-    /// unless the client is kept, which parses into `screen` instead.
+    /// with the fade off or `effects.fade.session` false, and then the client
+    /// parses into `screen` instead.
     shadow: Option<shadow::Shadow>,
-    /// A kept client's copy of its screen, where there is no shadow to be one:
+    /// The client's copy of its screen, where there is no shadow to be one:
     /// fed exactly as the shadow is, by [`Attachment::shadow_saw`], and used
-    /// for one thing only — to put the screen back the moment the client
+    /// for two things — to put a kept client's screen back the moment it
     /// returns to the front (see [`Attachment::paint_kept_screen`]), where
-    /// the shadow would have dissolved it in. `None` whenever there is a
-    /// shadow, or the client is not kept.
+    /// the shadow would have dissolved it in; and to draw the session behind
+    /// the settings when they float over it (see [`panel`]). `None` whenever
+    /// there is a shadow.
     screen: Option<shadow::Shadow>,
     /// The first paint, while it is being kept back from the terminal so it
     /// can dissolve in. `None` once released, and always without a shadow.
@@ -309,6 +330,12 @@ pub struct Attachment {
     /// Whether the client is nvmux's own, which draws cards (see
     /// [`crate::card`]): Neovim's would be typed what tells it to.
     draws_cards: bool,
+    /// The settings generation the client last heard (see
+    /// [`crate::config::generation`]): the one it was started with, and then
+    /// the one it was last told. A relay that finds it stale tells it the
+    /// settings as they are now, before anything else (see
+    /// [`Attachment::open_desk`]).
+    heard: u64,
     /// What this relay has told its client to show, and what waits to go in:
     /// one a relay, and only for a client that draws cards.
     desk: Option<card::Desk>,
@@ -1133,6 +1160,15 @@ impl Attachment {
             shadow::Kept::arrival(card, size.cols, size.rows)
         });
         self.opening = desk.open(arrival);
+        // A client that last heard the settings before they changed — on
+        // the settings screen this relay is back from, or while it was kept —
+        // is told them as they are now, ahead of anything it is to show.
+        let generation = crate::config::generation();
+        if self.heard != generation {
+            self.heard = generation;
+            self.opening
+                .insert(0, card::Command::Settings(crate::config::get().drawing()));
+        }
         self.landed_since = self.hand_off.as_ref().and_then(HandOff::up_since);
         self.desk = Some(desk);
         landed
@@ -1416,6 +1452,12 @@ impl Attachment {
         Ok(())
     }
 
+    /// The session's screen as nvmux keeps it: the shadow, or where there is
+    /// none the client's own copy (see [`Attachment::screen`]).
+    fn copy(&mut self) -> Option<&mut shadow::Shadow> {
+        self.shadow.as_mut().or(self.screen.as_mut())
+    }
+
     /// Whether the shadow has a glyph anywhere yet — what a lull needs before
     /// it counts as the first paint being over.
     fn drawn(&self) -> bool {
@@ -1616,6 +1658,11 @@ impl Attachment {
     /// repaint up, the user is looking at the session rather than at a blank
     /// screen.
     fn paint_kept_screen(&mut self) -> bool {
+        // A client that was not kept was not read while it was away, and its
+        // copy is of a screen it has drawn over since.
+        if !self.is_kept() {
+            return false;
+        }
         let Some(screen) = self
             .screen
             .as_ref()
@@ -2463,6 +2510,11 @@ fn own_client(exe: &Path, sock: &Path) -> CommandBuilder {
     if let Some(palette) = crate::palette::get() {
         cmd.env(crate::client::PALETTE_ENV, palette.to_env());
     }
+    // The settings nvmux runs on, which may not be the file's.
+    cmd.env(
+        crate::client::SETTINGS_ENV,
+        crate::config::get().drawing().to_env(),
+    );
     in_place(cmd)
 }
 
@@ -2865,9 +2917,10 @@ fn spawn_client_with(
         resumed: false,
         reaped: false,
         // Only when it will be used: a shadow costs a parse of everything the
-        // client writes.
+        // client writes. One or the other is always there, for the settings
+        // to float over (see `panel`).
         shadow,
-        screen: (kept && !fades).then(|| shadow::Shadow::new(size.rows, size.cols)),
+        screen: (!fades).then(|| shadow::Shadow::new(size.rows, size.cols)),
         hold: None,
         // Set by `relay`, which knows whether there is a notice to write.
         boundary: None,
@@ -2881,6 +2934,9 @@ fn spawn_client_with(
         unshown: None,
         probe: None,
         draws_cards,
+        // What its environment was given (see `own_client`), built on this
+        // thread a moment ago with nothing changed since.
+        heard: crate::config::generation(),
         desk: None,
         row: None,
         kept: shadow::Kept::default(),
@@ -3216,8 +3272,12 @@ pub fn relay(
 
     match outcome {
         Ok(
-            held
-            @ (Outcome::ToPicker | Outcome::CreateNew | Outcome::ShowHelp | Outcome::Switch(_)),
+            held @ (Outcome::ToPicker
+            | Outcome::CreateNew
+            | Outcome::ShowHelp
+            | Outcome::ShowSettings
+            | Outcome::Resettle
+            | Outcome::Switch(_)),
         ) => {
             // Dissolve the session out first: before the modes go back, so a
             // key typed during it is not echoed, and before the hand-off
@@ -3318,9 +3378,9 @@ fn pump(
     mut erasing: Option<Erasing>,
 ) -> Result<Outcome> {
     let stdin_fd = std::io::stdin().as_raw_fd();
-    let keys = crate::config::get().keys;
+    let mut keys = crate::config::get().keys;
     let mut prefix = Prefix::with_keys(highest_session_num, keys.prefix, keys.bind);
-    let prefix_timeout = Duration::from_millis(keys.timeout_ms);
+    let mut prefix_timeout = Duration::from_millis(keys.timeout_ms);
     // When a pending prefix, half-typed number or cut-off escape sequence must
     // be settled. An instant rather than a per-poll timeout on purpose: a child
     // that keeps producing output keeps `poll` returning early, and a timeout
@@ -3334,6 +3394,9 @@ fn pump(
     // which comes in with one already asked for.
     // The row that says what the next key does while a `<prefix>` waits.
     let mut bar = hint::Bar::new(Instant::now(), term::terminal_size(), keys.bind);
+    // `<prefix> d` with settings changed and unsaved asks first, on the bar's
+    // row, and takes the keyboard until it is answered.
+    let mut leaving: Option<Leaving> = None;
     let mut buf = [0u8; 8192];
     // Diagnostics only, and what makes a switch that felt slow attributable:
     // everything before this is nvmux's own work and is timed where it happens,
@@ -3592,13 +3655,79 @@ fn pump(
             match read_fd(stdin_fd, &mut buf) {
                 Ok(0) => return Ok(Outcome::StdinClosed),
                 Err(e) => return Err(NvmuxError::Io(e)),
+                Ok(len) if leaving.is_some() => {
+                    let Some(mut leave) = leaving else {
+                        unreachable!("guarded");
+                    };
+                    match reply(&buf[..len], leave.detach) {
+                        Some(Reply::Detach) => return Ok(Outcome::Detached),
+                        Some(Reply::Save) => {
+                            let live = config::get();
+                            match config::save(&live, &config::saved(), leave.overwrite) {
+                                Ok(_) => {
+                                    config::set_saved((*live).clone());
+                                    return Ok(Outcome::Detached);
+                                }
+                                Err(e) => {
+                                    bar.ask(Some(leave.not_saved(&e)));
+                                    leaving = Some(leave);
+                                }
+                            }
+                        }
+                        Some(Reply::Stay) => {
+                            leaving = None;
+                            bar.ask(None);
+                        }
+                        None => {}
+                    }
+                }
                 Ok(len) => {
+                    // Whether the settings floated over the session and went,
+                    // which may have changed the keys this relay runs on.
+                    let mut floated = false;
                     // Deliberately NOT logged: every keystroke the user types,
                     // into a /tmp file that outlives the session.
                     for step in prefix.feed(&buf[..len]) {
                         if let Some(outcome) = take_step(attachment, step)? {
+                            // `<prefix> ,`: the settings, over the session, and
+                            // back to it once they are taken down — unless they
+                            // cannot float, or what they changed needs the
+                            // session loop.
+                            let outcome = if outcome == Outcome::ShowSettings {
+                                match panel::float(attachment, master_fd, winch)? {
+                                    Some(outcome) => outcome,
+                                    None => {
+                                        floated = true;
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                outcome
+                            };
+                            // With settings unsaved, a detach asks first; what
+                            // else was typed in the same read goes with the key.
+                            if outcome == Outcome::Detached {
+                                let unsaved =
+                                    crate::settings::changed(&config::get(), &config::saved())
+                                        .len();
+                                if unsaved > 0 {
+                                    let leave = Leaving {
+                                        detach: keys.bind.key(Action::Detach).unwrap_or(b'd'),
+                                        overwrite: false,
+                                    };
+                                    bar.ask(Some(leave.question(unsaved)));
+                                    leaving = Some(leave);
+                                    break;
+                                }
+                            }
                             return Ok(outcome);
                         }
+                    }
+                    if floated {
+                        keys = crate::config::get().keys;
+                        prefix = Prefix::with_keys(highest_session_num, keys.prefix, keys.bind);
+                        prefix_timeout = Duration::from_millis(keys.timeout_ms);
+                        bar = hint::Bar::new(Instant::now(), term::terminal_size(), keys.bind);
                     }
                     // Every keystroke restarts the clock, so a number typed at
                     // a human pace is one number.
@@ -3739,6 +3868,143 @@ fn pump(
     }
 }
 
+/// `<prefix> d` with settings changed and unsaved: the question on the
+/// bottom row, up until it is answered (see [`reply`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Leaving {
+    /// The key that detaches, which answers "detach anyway".
+    detach: u8,
+    /// That the file has changed what is being saved, and `w` overwrites it.
+    overwrite: bool,
+}
+
+impl Leaving {
+    /// The question, for `unsaved` settings.
+    fn question(&self, unsaved: usize) -> String {
+        format!(
+            "{unsaved} unsaved setting{} — w save and detach  {} detach anyway  esc stay",
+            if unsaved == 1 { "" } else { "s" },
+            keys::key_glyph(self.detach)
+        )
+    }
+
+    /// The question again after a save that did not happen, saying why: the
+    /// file changed what is being saved too, which a second `w` overwrites,
+    /// or something no second `w` can help.
+    fn not_saved(&mut self, e: &crate::error::SaveError) -> String {
+        let detach = keys::key_glyph(self.detach);
+        self.overwrite = e.changed_in_file().is_some();
+        if self.overwrite {
+            format!("{e} — w overwrites and detaches  {detach} detach anyway  esc stay")
+        } else {
+            format!("{e} — {detach} detach anyway  esc stay")
+        }
+    }
+}
+
+/// A reply to the question [`Leaving`] asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reply {
+    Save,
+    Detach,
+    Stay,
+}
+
+/// The first thing in a read of stdin that answers [`Leaving`]'s question:
+/// `w`, the key that detaches, `Esc`, or a click, which stays as it declines
+/// the picker's questions. Anything else answers nothing and goes nowhere —
+/// not to the editor, whose screen the question is up over.
+///
+/// A key arrives as the text it types, or in the kitty protocol's report of
+/// it, which Neovim has the terminal send for `Esc`; key releases and
+/// repeats, and every other report, are passed over — the release of the
+/// very `d` that asked is one. A click arrives as the mouse report the
+/// editor asked the terminal for, in SGR's spelling or X10's.
+fn reply(bytes: &[u8], detach: u8) -> Option<Reply> {
+    let key = |code: u32| match code {
+        27 => Some(Reply::Stay),
+        c if c == u32::from(b'w') => Some(Reply::Save),
+        c if c == u32::from(detach) => Some(Reply::Detach),
+        _ => None,
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        if rest[0] != keyseq::ESC {
+            if let Some(reply) = key(u32::from(rest[0])).filter(|r| *r != Reply::Stay) {
+                return Some(reply);
+            }
+            i += 1;
+            continue;
+        }
+        if rest.len() == 1 {
+            return Some(Reply::Stay);
+        }
+        let Some(len) = csi_len(rest) else {
+            // Not a sequence of the kinds here, or not all of one: it answers
+            // nothing, and neither does anything after it in this read.
+            return None;
+        };
+        let seq = &rest[..len];
+        if seq == b"\x1b[M" {
+            // X10: a button and two coordinates, each a byte plus 32, after
+            // the sequence proper.
+            let button = rest.get(len).map(|b| b.wrapping_sub(32));
+            if button.is_some_and(|b| b & 0b11 != 3 && b & (32 | 64) == 0) {
+                return Some(Reply::Stay);
+            }
+            i += len + 3;
+            continue;
+        }
+        if let Some(button) = sgr_press(seq) {
+            if button & 0b11 != 3 && button & (32 | 64) == 0 {
+                return Some(Reply::Stay);
+            }
+        } else if let Some(reply) = kitty_press(seq).and_then(key) {
+            return Some(reply);
+        }
+        i += len;
+    }
+    None
+}
+
+/// How long the `CSI` sequence at the start of `bytes` is, to its final byte,
+/// or `None` when it is not one or not all of one is here.
+fn csi_len(bytes: &[u8]) -> Option<usize> {
+    let body = bytes.strip_prefix(b"\x1b[")?;
+    let end = body.iter().position(|b| (0x40..=0x7e).contains(b))?;
+    Some(2 + end + 1)
+}
+
+/// The button of an SGR mouse report that is a press — `CSI < button ; x ;
+/// y M` — or `None` for anything else, a release (`m`) included.
+fn sgr_press(seq: &[u8]) -> Option<u32> {
+    let body = seq.strip_prefix(b"\x1b[<")?.strip_suffix(b"M")?;
+    let button = body.split(|b| *b == b';').next()?;
+    std::str::from_utf8(button).ok()?.parse().ok()
+}
+
+/// The key of a kitty-protocol key report that is a press of it alone —
+/// `CSI code [: alternates] [; modifiers [: event]] u`, with no modifier but
+/// the locks and an event of 1 or none — or `None` for anything else.
+fn kitty_press(seq: &[u8]) -> Option<u32> {
+    let body = std::str::from_utf8(seq.strip_prefix(b"\x1b[")?.strip_suffix(b"u")?).ok()?;
+    let mut fields = body.split(';');
+    let code = fields.next()?.split(':').next()?.parse().ok()?;
+    if let Some(modifiers) = fields.next() {
+        let mut parts = modifiers.split(':');
+        let held: u32 = parts.next()?.parse().ok()?;
+        // One plus a bitmask; caps lock (64) and num lock (128) change nothing.
+        if held.checked_sub(1)? & !(64 | 128) != 0 {
+            return None;
+        }
+        if parts.next().is_some_and(|event| event != "1") {
+            return None;
+        }
+    }
+    Some(code)
+}
+
 /// Carry out one instruction from the prefix machine: forward bytes to the
 /// child, or turn a command into the [`Outcome`] that ends the relay.
 ///
@@ -3756,6 +4022,7 @@ fn act(writer: &mut dyn Write, step: Step) -> Result<Option<Outcome>> {
         Step::Act(Action::Detach) => Some(Outcome::Detached),
         Step::Act(Action::Create) => Some(Outcome::CreateNew),
         Step::Act(Action::Help) => Some(Outcome::ShowHelp),
+        Step::Act(Action::Settings) => Some(Outcome::ShowSettings),
         Step::Act(Action::Switch(num)) => Some(Outcome::Switch(Target::Number(num))),
         Step::Act(Action::Cycle(dir)) => Some(Outcome::Switch(Target::Step(dir))),
         // The relay's, which knows the cards up: see `take_step`.
@@ -4818,6 +5085,104 @@ mod tests {
         assert_eq!(out, b"hello");
     }
 
+    /// What answers the question `<prefix> d` asks with settings unsaved:
+    /// `w`, the detach key, and `Esc` or a click, however the terminal spells
+    /// them — and nothing else, a key's release least of all.
+    #[test]
+    fn the_question_before_detaching_is_answered_by_its_keys_alone() {
+        let d = b'd';
+        for (bytes, want) in [
+            (&b"w"[..], Some(Reply::Save)),
+            (b"d", Some(Reply::Detach)),
+            (b"\x1b", Some(Reply::Stay)),
+            (b"x", None),
+            (b"xyz", None),
+            // kitty: Esc, a release of the `d` that asked, a press of `w`.
+            (b"\x1b[27u", Some(Reply::Stay)),
+            (b"\x1b[100;1:3u", None),
+            (b"\x1b[100;1:3uw", Some(Reply::Save)),
+            (b"\x1b[119u", Some(Reply::Save)),
+            (b"\x1b[119;5u", None),
+            (b"\x1b[100;65u", Some(Reply::Detach)),
+            // SGR: a press stays; a release, motion and the wheel do not.
+            (b"\x1b[<0;10;5M", Some(Reply::Stay)),
+            (b"\x1b[<0;10;5m", None),
+            (b"\x1b[<32;10;5M", None),
+            (b"\x1b[<64;10;5M", None),
+            // X10: a press stays, and its coordinates are not keys.
+            (b"\x1b[M !!", Some(Reply::Stay)),
+            (b"\x1b[M#ww", None),
+            // Cut off: nothing yet.
+            (b"\x1b[", None),
+        ] {
+            assert_eq!(
+                reply(bytes, d),
+                want,
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+        assert_eq!(
+            reply(b"x", b'x'),
+            Some(Reply::Detach),
+            "the detach key as moved"
+        );
+        assert_eq!(reply(b"d", b'x'), None);
+    }
+
+    /// The question names the key that detaches, and how many settings.
+    #[test]
+    fn the_question_names_the_detach_key() {
+        let leave = Leaving {
+            detach: b' ',
+            overwrite: false,
+        };
+        assert_eq!(
+            leave.question(2),
+            "2 unsaved settings — w save and detach  ␣ detach anyway  esc stay"
+        );
+        let mut leave = Leaving {
+            detach: b'd',
+            overwrite: false,
+        };
+        let clash = crate::error::SaveError::Changed {
+            path: "/x/config.toml".into(),
+            settings: vec!["client.lazy".into()],
+        };
+        assert_eq!(
+            leave.not_saved(&clash),
+            "client.lazy changed in config.toml too — w overwrites and detaches  d detach anyway  esc stay"
+        );
+        assert!(leave.overwrite);
+        assert!(leave
+            .not_saved(&crate::error::SaveError::Nowhere)
+            .ends_with("— d detach anyway  esc stay"));
+        assert!(!leave.overwrite);
+    }
+
+    /// A client that last heard the settings before they changed is told
+    /// them as they are, ahead of anything else the relay opens with; one
+    /// that heard them last is told nothing.
+    #[test]
+    fn a_relay_opens_by_telling_a_stale_client_the_settings() {
+        let mut a = attached_to("exec sleep 30");
+        a.draws_cards = true;
+        a.heard = crate::config::generation().wrapping_add(1);
+        a.open_desk();
+        assert_eq!(
+            a.opening.first(),
+            Some(&card::Command::Settings(crate::config::get().drawing()))
+        );
+        assert_eq!(a.heard, crate::config::generation());
+        a.open_desk();
+        assert!(
+            !a.opening
+                .iter()
+                .any(|c| matches!(c, card::Command::Settings(_))),
+            "told twice"
+        );
+    }
+
     #[test]
     fn every_action_maps_to_its_outcome() {
         let mut out = Vec::new();
@@ -4826,6 +5191,7 @@ mod tests {
             (Action::Detach, Outcome::Detached),
             (Action::Create, Outcome::CreateNew),
             (Action::Help, Outcome::ShowHelp),
+            (Action::Settings, Outcome::ShowSettings),
             (Action::Switch(7), Outcome::Switch(Target::Number(7))),
             (
                 Action::Cycle(Direction::Next),
@@ -4945,6 +5311,8 @@ mod tests {
             Outcome::ToPicker,
             Outcome::CreateNew,
             Outcome::ShowHelp,
+            Outcome::ShowSettings,
+            Outcome::Resettle,
             Outcome::Detached,
             Outcome::ChildExited,
             Outcome::StdinClosed,
@@ -4971,13 +5339,15 @@ mod tests {
             Outcome::ToPicker,
             Outcome::CreateNew,
             Outcome::ShowHelp,
+            Outcome::ShowSettings,
+            Outcome::Resettle,
             Outcome::Detached,
             Outcome::ChildExited,
             Outcome::StdinClosed,
         ] {
             assert!(
                 !other.leads_straight_into_another_relay(),
-                "{other:?} either opens a screen or ends the relay"
+                "{other:?} opens a screen, goes back by the session loop, or ends the relay"
             );
         }
     }

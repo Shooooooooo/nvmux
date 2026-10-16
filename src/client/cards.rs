@@ -81,6 +81,7 @@ use super::grid::Text;
 use super::model::Model;
 use super::style::{mix, Color, Colors, Style, Underline};
 use crate::card::{Card, Command, Kind};
+use crate::falloff::{self, ease, ASPECT, EMPTIED, PEAK, REACH};
 use crate::palette::Rgb;
 
 /// The widest a card's line is: the width the design was drawn at, which takes
@@ -124,17 +125,12 @@ const MARKED: f32 = 0.5;
 /// Columns between the names on an arrival's row.
 const GAP: usize = 3;
 
-/// The dimming under the cards: how far it reaches from a line, in columns,
-/// and how far it takes what is right beside one toward the background — a
-/// tenth of what was there left — less, and not as far, around a sign. A row
-/// counts as [`ASPECT`] columns; and under a line, at its full strength, what
-/// was there is emptied ([`EMPTIED`]).
-const REACH: f32 = 18.0;
-const PEAK: f32 = 0.9;
+/// The dimming under the cards is [`crate::falloff`]'s, shared with the
+/// settings when they float over a session: how far it reaches from a line,
+/// and how far it takes what is right beside one toward the background. Less,
+/// and not as far, around a sign.
 const SIGN_REACH: f32 = REACH * 0.45;
 const SIGN_PEAK: f32 = 0.7;
-const ASPECT: f32 = 2.1;
-const EMPTIED: f32 = 0.98;
 
 /// When each piece of a card comes and goes, in fades — nvmux's fade one way,
 /// the card's [`Card::fade_ms`] — each a start and a length.
@@ -281,11 +277,6 @@ fn ramp(t: f32, (start, len): (f32, f32)) -> f32 {
     } else {
         ease((t - start) / len)
     }
-}
-
-fn ease(x: f32) -> f32 {
-    let x = x.clamp(0.0, 1.0);
-    x * x * (3.0 - 2.0 * x)
 }
 
 fn percent(x: f32) -> u8 {
@@ -525,6 +516,8 @@ impl Cards {
                 let was = std::mem::replace(&mut self.held, held);
                 was != held && self.keyed().is_some()
             }
+            // The client's, not the cards': see `App::reconfigure`.
+            Command::Settings(_) => false,
         }
     }
 
@@ -1224,7 +1217,7 @@ impl Sheet {
                     let amount = if d == 0.0 {
                         part.there
                     } else {
-                        part.there * part.peak * (1.0 - ease(d / part.reach))
+                        part.there * falloff::around(d, part.peak, part.reach)
                     };
                     let cell = &mut amounts[r * width + c];
                     *cell = cell.max(amount);

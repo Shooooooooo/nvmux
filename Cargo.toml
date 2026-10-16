@@ -44,6 +44,12 @@ toml = { version = "1", default-features = false, features = [
     "display",
     "serde",
 ] }
+# What the settings screen saves with: it edits the user's config.toml in
+# place, keeping every comment, blank line and key it did not change, which
+# `toml` cannot do — it reads a document into values and writes values back.
+# Its parser, writer and datetime crates are `toml`'s own, already in the
+# tree, so it adds itself and nothing else.
+toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 unicode-width = "0.2.2"
