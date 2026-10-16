@@ -99,6 +99,7 @@ under `[keys.bind]` — `detach = "x"` makes it `<prefix> x` — as
 | `new` | `<prefix>` `c` | set up a new session and attach to it — `Esc` goes back |
 | `go` | `<prefix>` `Enter` | go where the newest note in the margin is about: its session, or a terminal of this one |
 | `help` | `<prefix>` `?` | show these keys, as you have them — `Esc` goes back |
+| `settings` | `<prefix>` `,` | change nvmux's settings while it runs — `Esc` goes back |
 
 Two keys after the prefix are not commands, and stay where they are: a number
 — `<prefix> 1`, `<prefix> 12` — switches straight to that session, and
@@ -227,14 +228,15 @@ The first run asks for a prefix and writes that file; `Esc` skips.
 prefix     = "Ctrl-Space"   # Ctrl-Space, or a Ctrl-<letter> chord
 timeout_ms = 1000           # how long a lone prefix or half-typed number waits
 
-[keys.bind]        # the key after the prefix: one character, "Space" or "Enter"
-picker = "Space"   # back to the picker, session still attached
-detach = "d"       # detach, leaving the session running
-new    = "c"       # set up a new session and attach to it
-next   = "n"       # the next session by number, wrapping
-prev   = "p"       # the previous session by number, wrapping
-go     = "Enter"   # where the newest note in the margin is about
-help   = "?"       # show these keys
+[keys.bind]          # the key after the prefix: one character, "Space" or "Enter"
+picker   = "Space"   # back to the picker, session still attached
+detach   = "d"       # detach, leaving the session running
+new      = "c"       # set up a new session and attach to it
+next     = "n"       # the next session by number, wrapping
+prev     = "p"       # the previous session by number, wrapping
+go       = "Enter"   # where the newest note in the margin is about
+help     = "?"       # show these keys
+settings = ","       # change nvmux's settings while it runs
 
 [session]
 command = "nvim --headless --listen {sock}"   # {sock} is required

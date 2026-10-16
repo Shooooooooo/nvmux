@@ -2,12 +2,13 @@
 //! last row. No borders, no popups — the hint line *is* the picker's help, and
 //! the filter and kill confirm replace it in place.
 //!
-//! [`prompt`] and [`help`] are the other two screens. Both take the whole
-//! terminal rather than drawing over anything, share the same vocabulary
-//! (centred content, one dim hint row, no borders, no colour), and hand the
-//! same client back afterwards. `prompt::run` owns a terminal for `<prefix> c`,
-//! which arrives with none; `prompt::run_on` borrows the picker's — nesting the
-//! two would enter the alternate screen twice and leave it once.
+//! [`prompt`], [`help`] and [`settings`] are the other three screens. Each
+//! takes the whole terminal rather than drawing over anything, shares the same
+//! vocabulary (centred content, one dim hint row, no borders, no colour), and
+//! hands the same client back afterwards. `prompt::run` owns a terminal for
+//! `<prefix> c`, which arrives with none; `prompt::run_on` borrows the
+//! picker's — nesting the two would enter the alternate screen twice and leave
+//! it once. The help and the settings are reached the same two ways.
 //!
 //! [`attaching`] is a fourth, and the odd one out: not a screen the user works
 //! on but the wait between the picker (or a `<prefix>` switch) and the session,
@@ -63,6 +64,7 @@ pub mod help;
 pub mod landing;
 pub mod note;
 pub mod prompt;
+pub mod settings;
 pub mod setup;
 pub mod sonar;
 pub mod starfield;
@@ -652,6 +654,13 @@ fn run_loop(
             }
 
             Request::Help => help::run_on(terminal, false)?,
+
+            // What changed there runs from here: the picker's own copies of
+            // its effects are read again, and the rest it reads as it goes.
+            Request::Settings => {
+                settings::run_on(terminal, false)?;
+                app.reload_effects();
+            }
         }
     }
 }
@@ -950,6 +959,7 @@ fn translate(k: KeyEvent) -> Key {
         KeyCode::Left => Key::Left,
         KeyCode::Right => Key::Right,
         KeyCode::Tab => Key::Tab,
+        KeyCode::BackTab => Key::BackTab,
         KeyCode::Home => Key::Home,
         KeyCode::End => Key::End,
         _ => Key::Other,

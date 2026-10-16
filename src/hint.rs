@@ -874,10 +874,11 @@ mod tests {
         }
     }
 
-    /// Centred, like every other nvmux hint row.
+    /// Centred, like every other nvmux hint row — on a screen with room either
+    /// side of it, which at eighty columns every entry leaves none of.
     #[test]
     fn the_text_is_centred_on_the_row() {
-        let row = row(Pending::Command, big());
+        let row = row(Pending::Command, size(100, 24));
         let before = row.len() - row.trim_start().len();
         let after = row.len() - row.trim_end().len();
         assert!(before > 0 && after > 0, "not centred: {row:?}");

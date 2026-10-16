@@ -435,7 +435,10 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 pty::Outcome::Detached | pty::Outcome::StdinClosed => {
                     nvmux::notes::seen_within(sock, SEEN_ON_THE_WAY_OUT);
                 }
-                pty::Outcome::CreateNew | pty::Outcome::ShowHelp | pty::Outcome::Switch(_) => {
+                pty::Outcome::CreateNew
+                | pty::Outcome::ShowHelp
+                | pty::Outcome::ShowSettings
+                | pty::Outcome::Switch(_) => {
                     nvmux::notes::later(sock, nvmux::notes::seen);
                 }
                 _ => {}
@@ -500,6 +503,11 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 (pty::Outcome::ShowHelp, held) => {
                     attached = pool.set_aside(held);
                     ui::help::run()?;
+                    continue;
+                }
+                (pty::Outcome::ShowSettings, held) => {
+                    attached = pool.set_aside(held);
+                    ui::settings::run()?;
                     continue;
                 }
                 (pty::Outcome::Switch(target), mut held) => {

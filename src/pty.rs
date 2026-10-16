@@ -141,6 +141,8 @@ pub enum Outcome {
     CreateNew,
     /// `<prefix> ?` — show the key bindings. The child keeps running.
     ShowHelp,
+    /// `<prefix> ,` — show the settings. The child keeps running.
+    ShowSettings,
     /// `<prefix> <number>`, `<prefix> n` or `<prefix> p` — attach to the session
     /// this names. The child keeps running, so a switch that names nothing puts
     /// the user straight back.
@@ -158,16 +160,16 @@ impl Outcome {
     /// Whether this leads from one relay straight into the next, with no
     /// [`crate::ui`] screen in between to clear the outgoing frame on the way.
     ///
-    /// Only a switch does — by number or by step. `ToPicker`, `CreateNew` and
-    /// `ShowHelp` all open a screen, and a screen clears as it opens; the rest
-    /// end the relay for good.
+    /// Only a switch does — by number or by step. `ToPicker`, `CreateNew`,
+    /// `ShowHelp` and `ShowSettings` all open a screen, and a screen clears as
+    /// it opens; the rest end the relay for good.
     fn leads_straight_into_another_relay(self) -> bool {
         matches!(self, Outcome::Switch(_))
     }
 
     /// The session this outcome names, for the caller that starts the next
     /// attachment while the outgoing one dissolves (see [`relay`]). `None` for
-    /// every other way a relay can end: the three that open a screen have
+    /// every other way a relay can end: the four that open a screen have
     /// nothing to start yet, and the three that end it have nowhere to go.
     ///
     /// Its own accessor rather than a `matches!` at the call site, so the one
@@ -181,6 +183,7 @@ impl Outcome {
             | Outcome::Detached
             | Outcome::CreateNew
             | Outcome::ShowHelp
+            | Outcome::ShowSettings
             | Outcome::ChildExited
             | Outcome::StdinClosed => None,
         }
@@ -3216,8 +3219,11 @@ pub fn relay(
 
     match outcome {
         Ok(
-            held
-            @ (Outcome::ToPicker | Outcome::CreateNew | Outcome::ShowHelp | Outcome::Switch(_)),
+            held @ (Outcome::ToPicker
+            | Outcome::CreateNew
+            | Outcome::ShowHelp
+            | Outcome::ShowSettings
+            | Outcome::Switch(_)),
         ) => {
             // Dissolve the session out first: before the modes go back, so a
             // key typed during it is not echoed, and before the hand-off
@@ -3756,6 +3762,7 @@ fn act(writer: &mut dyn Write, step: Step) -> Result<Option<Outcome>> {
         Step::Act(Action::Detach) => Some(Outcome::Detached),
         Step::Act(Action::Create) => Some(Outcome::CreateNew),
         Step::Act(Action::Help) => Some(Outcome::ShowHelp),
+        Step::Act(Action::Settings) => Some(Outcome::ShowSettings),
         Step::Act(Action::Switch(num)) => Some(Outcome::Switch(Target::Number(num))),
         Step::Act(Action::Cycle(dir)) => Some(Outcome::Switch(Target::Step(dir))),
         // The relay's, which knows the cards up: see `take_step`.
@@ -4826,6 +4833,7 @@ mod tests {
             (Action::Detach, Outcome::Detached),
             (Action::Create, Outcome::CreateNew),
             (Action::Help, Outcome::ShowHelp),
+            (Action::Settings, Outcome::ShowSettings),
             (Action::Switch(7), Outcome::Switch(Target::Number(7))),
             (
                 Action::Cycle(Direction::Next),
@@ -4945,6 +4953,7 @@ mod tests {
             Outcome::ToPicker,
             Outcome::CreateNew,
             Outcome::ShowHelp,
+            Outcome::ShowSettings,
             Outcome::Detached,
             Outcome::ChildExited,
             Outcome::StdinClosed,
@@ -4971,6 +4980,7 @@ mod tests {
             Outcome::ToPicker,
             Outcome::CreateNew,
             Outcome::ShowHelp,
+            Outcome::ShowSettings,
             Outcome::Detached,
             Outcome::ChildExited,
             Outcome::StdinClosed,

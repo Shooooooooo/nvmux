@@ -113,6 +113,9 @@ pub enum Action {
     /// the session it came from, or the terminal of this one it came from
     /// (see [`crate::card`]). Nothing, with no such note up.
     Go,
+    /// `<prefix> ,` — change nvmux's settings while it runs (see
+    /// [`crate::ui::settings`]). The child stays alive.
+    Settings,
 }
 
 /// One instruction from the machine, in order.
@@ -194,6 +197,13 @@ pub const BINDINGS: &[Binding] = &[
         action: Action::Help,
         help: "show these keys",
         hint: "help",
+    },
+    // Last: the newest, and the one a narrow hint bar can best do without.
+    Binding {
+        key: b',',
+        action: Action::Settings,
+        help: "change nvmux's settings while it runs",
+        hint: "settings",
     },
 ];
 
@@ -1752,6 +1762,7 @@ mod tests {
             Action::Cycle(Direction::Prev),
             Action::Go,
             Action::Help,
+            Action::Settings,
         ];
         for action in all {
             match action {
@@ -1762,7 +1773,8 @@ mod tests {
                 | Action::Create
                 | Action::Cycle(_)
                 | Action::Go
-                | Action::Help => {}
+                | Action::Help
+                | Action::Settings => {}
                 // Not in `all`: it carries a number, so it has no fixed key.
                 Action::Switch(_) => unreachable!("Switch is not a table action"),
             }

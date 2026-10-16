@@ -1122,10 +1122,11 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
         .iter()
         .map(|b| {
             format!(
-                "# {:<6} = {:<7}   # {}\n",
+                "# {:<name$} = {:<7}   # {}\n",
                 b.hint,
                 quoted(&crate::keys::key_label(b.key)),
-                b.help
+                b.help,
+                name = command_width(),
             )
         })
         .collect();
@@ -1228,6 +1229,16 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
         windows_enabled = e.windows.enabled,
         blink_enabled = e.blink.enabled,
     )
+}
+
+/// How wide the template pads a command's name under `[keys.bind]`: as wide
+/// as the longest, so their keys line up.
+fn command_width() -> usize {
+    crate::keys::BINDINGS
+        .iter()
+        .map(|b| b.hint.len())
+        .max()
+        .unwrap_or(0)
 }
 
 /// Write the first-run config to `path`, creating its parent directory.
@@ -2057,7 +2068,12 @@ mod tests {
         assert!(rendered.contains("\n[keys.bind]   # "), "{rendered:?}");
         let mut rest = rendered.as_str();
         for b in crate::keys::BINDINGS {
-            let line = format!("\n# {:<6} = {:?}", b.hint, crate::keys::key_label(b.key));
+            let line = format!(
+                "\n# {:<name$} = {:?}",
+                b.hint,
+                crate::keys::key_label(b.key),
+                name = command_width()
+            );
             let at = rest.find(&line).unwrap_or_else(|| {
                 panic!("the template must document {line:?}, in order: {rendered:?}")
             });

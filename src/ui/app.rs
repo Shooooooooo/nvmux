@@ -75,6 +75,8 @@ pub enum Request {
     Reorder(Vec<(String, u32)>),
     /// Show the key bindings; help happens on its own screen.
     Help,
+    /// Show the settings, on their own screen ([`super::settings`]).
+    Settings,
     Quit,
 }
 
@@ -1401,6 +1403,7 @@ impl App {
                 Request::None
             }
             Key::Char('?') => Request::Help,
+            Key::Char(',') => Request::Settings,
             // One layer at a time, innermost first: a half-typed number, then
             // a filter narrowing the list, then the picker itself. Each of the
             // first two is something the user put there and can see, and would
@@ -1563,6 +1566,8 @@ pub enum Key {
     Left,
     Right,
     Tab,
+    /// Shift-Tab: the settings screen's way back along its tabs.
+    BackTab,
     Home,
     End,
     CtrlC,

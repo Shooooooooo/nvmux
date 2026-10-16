@@ -334,7 +334,7 @@ fn notation(key: Key) -> Option<String> {
         Key::Down => Some("<Down>".into()),
         Key::Left => Some("<Left>".into()),
         Key::Right => Some("<Right>".into()),
-        Key::Home | Key::End | Key::CtrlN | Key::CtrlP | Key::Other => None,
+        Key::Home | Key::End | Key::BackTab | Key::CtrlN | Key::CtrlP | Key::Other => None,
         // Never reached: both are the way out, taken before this is asked.
         Key::Esc | Key::CtrlC => None,
     }
