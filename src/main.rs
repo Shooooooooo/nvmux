@@ -98,7 +98,7 @@ fn run(cli: &Cli) -> Result<()> {
     }
 
     let transport = transport::open(location.clone())?;
-    session_loop(transport.as_ref())
+    session_loop(&transport)
 }
 
 /// The local `nvim`: on `$PATH`, and new enough.
@@ -152,15 +152,25 @@ fn establish_settings() -> Result<config::Settings> {
 /// Each session put in front is given the watcher its notes come from, and
 /// what it kept is cleared, and again as it leaves: it has been looked at (see
 /// [`nvmux::notes`]).
-fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
+///
+/// The picker opens on the rows it is handed, where there are any (see
+/// [`ui::Listing`]): after `<prefix> Space` the ones this loop has in hand,
+/// with a listing begun behind them on a thread `shared` is lent to.
+fn session_loop(shared: &transport::Shared) -> Result<()> {
+    let transport: &dyn transport::Transport = shared.as_ref();
     let mut attached: Option<pty::Attachment> = None;
     // Empty, and handing every client straight back, unless clients are kept
     // one per session or started ahead. Dropped on every way out of here,
     // which retires what it holds.
     let mut pool = pool::Pool::configured();
-    if !config::get().client.lazy {
-        start_every_client(transport, &mut pool);
-    }
+    // What the next picker opens on: the listing the clients were started
+    // ahead from, the first time, and after that the rows in hand on the way
+    // back from a session, or a listing of its own.
+    let mut opening = if config::get().client.lazy {
+        ui::Listing::Ask
+    } else {
+        start_every_client(transport, &mut pool).map_or(ui::Listing::Ask, ui::Listing::Fresh)
+    };
     // The client settings the clients in hand were started under, for what
     // the settings screen changes of them that telling cannot reach (see
     // `settle`).
@@ -198,6 +208,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
         let seen = looked_at.take();
         let (mut current, mut listing, mut hand_off) = match ui::run(
             transport,
+            std::mem::take(&mut opening),
             message.take(),
             focus.as_deref(),
             attached.is_some() || focus.as_deref().is_some_and(|id| pool.holds(id)),
@@ -456,6 +467,14 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
             match ended {
                 (pty::Outcome::ToPicker, held) => {
                     attached = pool.set_aside(held);
+                    // The picker opens on the rows the user last left it with,
+                    // as this loop has kept them since — a session made with
+                    // `<prefix> c` added, a switch's re-listing taken — and
+                    // lists afresh behind them on a thread of its own. Over ssh
+                    // that listing is a round trip to the host, which the
+                    // picker's first frame no longer waits for (see
+                    // `ui::Listing`).
+                    opening = ui::Listing::in_hand(std::mem::take(&mut listing), shared);
                     break;
                 }
                 // The session keeps running either way: on `<prefix> d`
@@ -948,17 +967,25 @@ fn begin_attachment(
 /// and for a fork and — over SSH — a forward per session, and not for a
 /// single round trip more.
 ///
+/// The listing is handed back for the picker to open on. Over SSH it is the
+/// one the greeting carried, which the first listing takes (see
+/// `SshTransport::first_listing`): the picker's own would be a second script
+/// run over the link, for the same answer.
+///
 /// Nothing here is reported. A listing that fails is the picker's to report a
 /// moment later, from the same call; a client that cannot be started leaves
 /// its session to be attached on its first visit as if this had not run, where
 /// a failure has a screen to land on and a message written for it.
-fn start_every_client(transport: &dyn transport::Transport, pool: &mut pool::Pool) {
+fn start_every_client(
+    transport: &dyn transport::Transport,
+    pool: &mut pool::Pool,
+) -> Option<Vec<nvmux::session::Session>> {
     let t_start = std::time::Instant::now();
     let listing = match transport.list_sessions() {
         Ok(listing) => listing,
         Err(e) => {
             tracing::debug!(error = %e, "could not list the sessions to start their clients");
-            return;
+            return None;
         }
     };
     for session in &listing {
@@ -976,6 +1003,7 @@ fn start_every_client(transport: &dyn transport::Transport, pool: &mut pool::Poo
         sessions = listing.len(),
         "timing: clients started ahead"
     );
+    Some(listing)
 }
 
 /// Wait, on the attaching screen, for the session to take the client
