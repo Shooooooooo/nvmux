@@ -60,6 +60,7 @@ pub mod backspace;
 pub mod complete;
 pub mod draw;
 pub mod effects;
+pub mod float;
 pub mod help;
 pub mod landing;
 pub mod note;

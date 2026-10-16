@@ -65,6 +65,7 @@ use unicode_width::UnicodeWidthStr;
 use super::app::Key;
 use super::draw;
 use super::effects::{self, AFTERGLOW};
+use super::float::{inside, Did, Floating};
 use super::prompt::Field;
 use super::setup;
 use crate::config::{self, Settings, ThemeColor};
@@ -1061,26 +1062,6 @@ pub fn panel_area(screen: Rect) -> Option<Rect> {
     ))
 }
 
-/// Where the screen's parts go in the panel: all of it but a column either
-/// side and the row at the bottom, which keep its text off the session's.
-fn inside(panel: Rect) -> Rect {
-    Rect::new(
-        panel.x + 1,
-        panel.y,
-        panel.width.saturating_sub(2),
-        panel.height.saturating_sub(1),
-    )
-}
-
-/// What a key or a gesture on the settings over a session leaves for the
-/// relay to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Did {
-    Stay,
-    /// `Esc`, `q` or `<prefix> ,`: take the settings down.
-    Close,
-}
-
 /// The settings floating over a session (see `crate::pty::panel`): the
 /// screen's state, given its keys and the mouse by the relay — which reads
 /// the terminal, the screen being drawn over a session that has it — and
@@ -1112,35 +1093,6 @@ impl Panel {
         }
     }
 
-    /// A key, as the terminal reported it. Releases are no keys.
-    pub fn on_key(&mut self, key: KeyEvent, now: Instant) -> Did {
-        if key.kind == KeyEventKind::Release {
-            return Did::Stay;
-        }
-        // Up to the key, so a glow it starts starts from nothing.
-        self.move_on(now);
-        let step = self.state.on_key(press(key));
-        self.after(step, now)
-    }
-
-    /// A mouse report, by the screen's rules; where it is was the relay's to
-    /// say, and a press outside the panel is the relay's too.
-    pub fn on_mouse(&mut self, mouse: MouseEvent, now: Instant) -> Did {
-        let at = hit(&self.state, self.drawn, mouse.column, mouse.row);
-        let Some(g) = gesture(mouse, at) else {
-            return Did::Stay;
-        };
-        self.move_on(now);
-        let step = self.state.on_mouse(g);
-        self.after(step, now)
-    }
-
-    /// Whether anything on the panel is moving — a row fading back from the
-    /// bar — so frames come at a frame's pace until it is done.
-    pub fn moving(&self) -> bool {
-        self.state.glowing()
-    }
-
     /// The row the bar left moved on to `now`.
     fn move_on(&mut self, now: Instant) {
         self.state.tick(now.saturating_duration_since(self.ticked));
@@ -1161,16 +1113,47 @@ impl Panel {
             Did::Stay
         }
     }
+}
+
+impl Floating for Panel {
+    /// See [`panel_area`].
+    fn area(&self, screen: Rect) -> Option<Rect> {
+        panel_area(screen)
+    }
+
+    /// A key, as the terminal reported it. Releases are no keys. `Esc`, `q`
+    /// and `<prefix> ,` close.
+    fn on_key(&mut self, key: KeyEvent, now: Instant) -> Did {
+        if key.kind == KeyEventKind::Release {
+            return Did::Stay;
+        }
+        // Up to the key, so a glow it starts starts from nothing.
+        self.move_on(now);
+        let step = self.state.on_key(press(key));
+        self.after(step, now)
+    }
+
+    /// A mouse report, by the screen's rules; where it is was the relay's to
+    /// say, and a press outside the panel is the relay's too.
+    fn on_mouse(&mut self, mouse: MouseEvent, now: Instant) -> Did {
+        let at = hit(&self.state, self.drawn, mouse.column, mouse.row);
+        let Some(g) = gesture(mouse, at) else {
+            return Did::Stay;
+        };
+        self.move_on(now);
+        let step = self.state.on_mouse(g);
+        self.after(step, now)
+    }
 
     /// When the prefix's wait runs out, if it is armed.
-    pub fn wake_at(&self) -> Option<Instant> {
+    fn wake_at(&self) -> Option<Instant> {
         self.armed_until
     }
 
     /// The panel moved on to `now`: the row the bar left a little further
     /// back from it, and the prefix's wait run out with no key after it, if
     /// it has by then. Whether that changed anything.
-    pub fn tick(&mut self, now: Instant) -> bool {
+    fn tick(&mut self, now: Instant) -> bool {
         let glowed = self.state.glowing();
         self.move_on(now);
         if self.armed_until.is_some_and(|until| now >= until) {
@@ -1181,9 +1164,15 @@ impl Panel {
         glowed
     }
 
+    /// Whether anything on the panel is moving — a row fading back from the
+    /// bar — so frames come at a frame's pace until it is done.
+    fn moving(&self) -> bool {
+        self.state.glowing()
+    }
+
     /// The settings drawn into `area`, a buffer of that area, in the theme's
     /// colour where it has one, and the row the bar left fading back from it.
-    pub fn draw(&mut self, area: Rect) -> Buffer {
+    fn draw(&mut self, area: Rect) -> Buffer {
         let mut buf = Buffer::empty(area);
         self.drawn = inside(area);
         paint_on(&mut buf, self.drawn, &self.state);
@@ -1191,7 +1180,7 @@ impl Panel {
     }
 
     /// Keep where the settings are for the next time they open.
-    pub fn close(&self) {
+    fn close(&self) {
         self.state.remember();
     }
 }

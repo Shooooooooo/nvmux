@@ -98,7 +98,7 @@ under `[keys.bind]` — `detach = "x"` makes it `<prefix> x` — as
 | `prev` | `<prefix>` `p` | the previous session by number (wraps) |
 | `new` | `<prefix>` `c` | set up a new session and attach to it — `Esc` goes back |
 | `go` | `<prefix>` `Enter` | go where the newest note in the margin is about: its session, or a terminal of this one |
-| `help` | `<prefix>` `?` | show these keys, as you have them — `Esc` goes back |
+| `help` | `<prefix>` `?` | show these keys, as you have them, over the session — `Esc` goes back |
 | `settings` | `<prefix>` `,` | change nvmux's settings while it runs, over the session — `Esc` goes back |
 
 Two keys after the prefix are not commands, and stay where they are: a number

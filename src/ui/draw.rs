@@ -19,7 +19,7 @@ use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Widget};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
@@ -173,14 +173,21 @@ pub(super) fn split_hint_row(area: Rect) -> (Rect, Rect) {
 /// picker's "no sessions", and the attaching screen's status. Each stands in
 /// for a list that is not there, on the row [`centre_vertically`] picks.
 pub(super) fn draw_hint_row(frame: &mut Frame, area: Rect, text: &str, dim: bool) {
+    hint_row_on(frame.buffer_mut(), area, text, dim);
+}
+
+/// [`draw_hint_row`] on a buffer: how a screen floating over a session, drawn
+/// into a buffer of its own, draws its hint row (see [`super::float`]).
+pub(super) fn hint_row_on(buf: &mut Buffer, area: Rect, text: &str, dim: bool) {
     let text = truncate(text, area.width as usize);
     let style = if dim {
         Style::default().add_modifier(Modifier::DIM)
     } else {
         Style::default()
     };
-    let para = Paragraph::new(Line::from(Span::styled(text, style))).alignment(Alignment::Center);
-    frame.render_widget(para, area);
+    Paragraph::new(Line::from(Span::styled(text, style)))
+        .alignment(Alignment::Center)
+        .render(area, buf);
 }
 
 fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
