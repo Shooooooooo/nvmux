@@ -207,6 +207,46 @@ impl Boundary {
         ready
     }
 
+    /// What may go to the terminal now, given that `chunk` has just been read
+    /// from the client — as [`Boundary::relay`] hands it out, but with no
+    /// patience, and no frame close kept: everything up to the last point
+    /// that leaves the parser between sequences, and a tail that would leave
+    /// it inside a character or a sequence kept for the bytes that finish it,
+    /// however long they take, short of [`KEPT_MAX`].
+    ///
+    /// For a caller that holds the session's output back anyway, and writes
+    /// it only in front of a frame of its own, in one synchronized update
+    /// with it: the settings floating over a session (see `crate::pty::panel`).
+    /// A tail handed out unfinished would leave no place to put that frame,
+    /// and the session's bytes would go out without it — drawn over the panel
+    /// until the next frame came. Nothing these bytes wait for is helped by
+    /// patience: they reach the terminal with the next frame either way, and
+    /// a client cannot be waiting for the answer to a question it has not
+    /// finished asking.
+    pub fn relay_whole(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.kept.extend_from_slice(chunk);
+        self.closing = None;
+        self.since = None;
+        let scan = self.parser.scan(&self.kept);
+        let cut = if self.kept.len() - scan.rest >= KEPT_MAX {
+            // A string with no end in sight, an OSC 52 clipboard write: out it
+            // goes, unfinished, rather than be gathered here as it runs.
+            self.parser.feed(&self.kept);
+            self.kept.len()
+        } else {
+            self.parser.take(scan.rest, scan.counters, scan.brackets);
+            scan.rest
+        };
+        self.kept.drain(..cut).collect()
+    }
+
+    /// Whether anything the session wrote is kept back here, still to go to
+    /// the terminal: after [`Boundary::relay_whole`], a tail waiting for the
+    /// rest of its character or sequence.
+    pub fn keeping(&self) -> bool {
+        !self.kept.is_empty()
+    }
+
     /// Whether what is kept back begins with the session's own frame close,
     /// which is the moment nvmux's box belongs in.
     ///
@@ -1083,6 +1123,71 @@ mod tests {
             !boundary.between_sequences(),
             "an unfinished sequence is still unfinished once it is written"
         );
+    }
+
+    /// Without patience, a tail is kept however long the rest of it takes,
+    /// and what is handed out always leaves the terminal between sequences:
+    /// there is always a place to put a frame after it.
+    #[test]
+    fn a_whole_relay_keeps_an_unfinished_tail_for_as_long_as_it_takes() {
+        let mut boundary = Boundary::new();
+        assert_eq!(boundary.relay_whole(b"text\x1b[38;2"), b"text");
+        assert!(!boundary.mid_sequence(), "nothing unfinished has gone out");
+        assert!(boundary.keeping(), "it is kept here instead");
+        assert_eq!(boundary.due(), None, "and no clock is running on it");
+        assert!(boundary.relay_whole(b"").is_empty());
+        assert_eq!(boundary.relay_whole(b";1;2;3mX"), b"\x1b[38;2;1;2;3mX");
+        assert!(!boundary.mid_sequence());
+        assert!(!boundary.keeping());
+        let whole = frame();
+        let mut out = Vec::new();
+        for piece in whole.chunks(7) {
+            out.extend_from_slice(&boundary.relay_whole(piece));
+            assert!(!boundary.mid_sequence(), "handed out mid-sequence");
+        }
+        assert_eq!(out, whole, "all of it, in order, once the last piece came");
+    }
+
+    /// A frame close is no reason to stop a whole relay short: its caller
+    /// writes the frame of its own after all of what it hands out.
+    #[test]
+    fn a_whole_relay_hands_out_a_frame_close_with_the_rest() {
+        let mut boundary = Boundary::new();
+        let framed = b"\x1b[?2026hpaint\x1b[?2026lmore";
+        assert_eq!(boundary.relay_whole(framed), framed);
+        assert!(boundary.release_the_sessions_close().is_empty());
+    }
+
+    /// A string with no end in sight goes out once there is [`KEPT_MAX`] of
+    /// it, unfinished, as it does from a patient relay; and what came before
+    /// it goes out at once, whatever follows it in the read.
+    #[test]
+    fn a_whole_relay_lets_a_string_with_no_end_go() {
+        let mut boundary = Boundary::new();
+        let mut out = boundary.relay_whole(b"before\x1b]52;c;");
+        assert_eq!(out, b"before");
+        let mut written = 0usize;
+        while written < 4 * KEPT_MAX {
+            let chunk = vec![b'A'; 8192];
+            written += chunk.len();
+            out.extend_from_slice(&boundary.relay_whole(&chunk));
+        }
+        assert!(boundary.mid_sequence(), "gone out inside the string");
+        assert!(
+            out.len() > written - KEPT_MAX,
+            "{} of {written} bytes are still being kept",
+            written - out.len()
+        );
+        let mut whole = [frame(), frame(), frame()].concat();
+        assert!(whole.len() > KEPT_MAX);
+        whole.extend_from_slice(b"\x1b[38;2");
+        let mut boundary = Boundary::new();
+        assert_eq!(
+            boundary.relay_whole(&whole),
+            &whole[..whole.len() - 6],
+            "a long read is no unfinished string"
+        );
+        assert!(!boundary.mid_sequence());
     }
 
     /// An OSC 52 clipboard write has no length limit, and accumulating one

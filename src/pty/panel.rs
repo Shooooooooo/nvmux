@@ -23,8 +23,10 @@
 //! the terminal with the next frame, at the front of it, inside the one
 //! synchronized update that ends with the session painted under the panel
 //! again. So the terminal hears everything the client said, in order and
-//! whole — cut only between its sequences (see [`crate::boundary`]) — and
-//! presents none of it but under the panel.
+//! whole — cut only between its sequences, however long the rest of one
+//! takes to come (see [`crate::boundary::Boundary::relay_whole`]) — and on a
+//! terminal with synchronized updates presents none of it but under the
+//! panel: the session drawing as fast as it likes never shows through.
 //!
 //! Keys go to the panel, read by [`crate::input`]; what the terminal answers
 //! the client goes on to the client, as it came. The mouse is reported while
@@ -54,13 +56,15 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 
-use super::{pollfd, read_fd, ready, take_step, unsynced, Attachment, Outcome, SEQUENCE_TIMEOUT};
+use super::{
+    pollfd, read_fd, ready, take_step, unsynced, Attachment, Outcome, FRAME_WAIT, SEQUENCE_TIMEOUT,
+};
 use crate::boundary::Boundary;
 use crate::error::{NvmuxError, Result};
 use crate::input::{Decoder, Input};
 use crate::keys::Step;
 use crate::palette::Palette;
-use crate::shadow::{Cursor, Laid, Shade};
+use crate::shadow::{Cursor, Laid, Shade, Shadow};
 use crate::term::{self, write_stdout, MouseReporting};
 use crate::ui::settings::{self, Did, Panel};
 use crate::{card, config, fade, falloff, winch};
@@ -72,6 +76,11 @@ const BEHIND: f32 = 0.5;
 /// The fewest milliseconds between two frames drawn because the session
 /// drew: what it draws is repainted under the panel whole, every frame.
 const SESSION_FRAME: Duration = Duration::from_millis(33);
+
+/// The most of the session's output held while it is half way through one
+/// sequence, which no frame can follow: past this — a sequence that never
+/// ends — it goes out as it is, rather than be gathered for ever.
+const HELD_MAX: usize = 8 << 20;
 
 /// Without the terminal's colours, the blank cells round the panel: columns
 /// either side, and rows above and below.
@@ -221,7 +230,7 @@ pub(super) fn float(
             };
             last_frame.map_or(now, |last| last + gap)
         });
-        let next = [frame_due, sequence_due, panel.wake_at(), boundary.due()]
+        let next = [frame_due, sequence_due, panel.wake_at()]
             .into_iter()
             .flatten()
             .min();
@@ -251,19 +260,11 @@ pub(super) fn float(
                     return Ok(Some(Outcome::ChildExited));
                 }
                 Ok(len) => {
-                    let chunk = &buf[..len];
-                    a.ledger_saw(chunk);
-                    a.shadow_saw(chunk);
-                    held.extend(boundary.relay(chunk, now));
-                    held.extend(boundary.release_the_sessions_close());
+                    hold(a, &buf[..len], &mut held, &mut boundary);
                     owed = true;
                     session_drew = true;
                 }
             }
-        }
-        if boundary.due().is_some_and(|due| now >= due) {
-            held.extend(boundary.give_up());
-            owed = true;
         }
 
         if n > 0 && ready(&fds[2]) {
@@ -279,7 +280,7 @@ pub(super) fn float(
                 // and the settings full screen.
                 None => {
                     panel.close();
-                    put_back(a, &mut held, &mut boundary)?;
+                    put_back(a, master_fd, &mut held, &mut boundary)?;
                     return Ok(Some(Outcome::ShowSettings));
                 }
             }
@@ -336,7 +337,7 @@ pub(super) fn float(
         // Gone the whole way out: the session back as it is, at once.
         if going && !moving {
             panel.close();
-            put_back(a, &mut held, &mut boundary)?;
+            put_back(a, master_fd, &mut held, &mut boundary)?;
             let client = config::get().client;
             let settle = client.ui != was.ui || client.per_session != was.per_session;
             return Ok(settle.then_some(Outcome::Resettle));
@@ -383,11 +384,17 @@ fn tell_the_client(a: &mut Attachment) {
     }
 }
 
-/// A frame: what the client wrote since the last, its own frame closes taken
-/// out so it is presented with this one; the mouse as the panel wants it; and
-/// the session under the panel, `there` of the way in. Says whether it went
-/// out: not while the session is half way through a sequence — what it owes
-/// the terminal goes out on its own then, and the frame waits for the rest.
+/// What the client wrote: to its copy of the screen and its ledger now, and
+/// to the terminal with the next frame — as much of it as ends between its
+/// sequences.
+fn hold(a: &mut Attachment, chunk: &[u8], held: &mut Vec<u8>, boundary: &mut Boundary) {
+    a.ledger_saw(chunk);
+    a.shadow_saw(chunk);
+    held.extend(boundary.relay_whole(chunk));
+}
+
+/// A frame, `there` of the way in, if one can go out now (see
+/// [`frame_bytes`]). Says whether it did.
 fn paint(
     a: &mut Attachment,
     look: Look,
@@ -397,12 +404,16 @@ fn paint(
     held: &mut Vec<u8>,
     boundary: &mut Boundary,
 ) -> Result<bool> {
+    // No frame can go out inside a sequence (see `frame_bytes`). Only one
+    // that never ends keeps the terminal in it for long: past the most that
+    // is held for it, out it goes as it is.
     if boundary.mid_sequence() {
-        write_stdout(held)?;
-        held.clear();
+        if held.len() > HELD_MAX {
+            write_stdout(held)?;
+            held.clear();
+        }
         return Ok(false);
     }
-    let dim = falloff::ease(there * 2.0);
     let text = falloff::ease(there * 2.0 - 1.0);
     let laid = (text > 0.0).then(|| {
         let mut buf = panel.draw(area);
@@ -411,28 +422,84 @@ fn paint(
         }
         Laid::from_buffer(&buf)
     });
-    let shade = |row: u16, col: u16| look.shade(row, col, area, dim);
     let Some(copy) = a.copy() else {
         return Ok(false);
     };
-    let frame = copy.frame_under(&shade, look.palette(), laid.as_ref(), Cursor::Hidden);
+    let dim = falloff::ease(there * 2.0);
+    let Some(out) = frame_bytes(copy, look, laid.as_ref(), area, dim, held, boundary) else {
+        return Ok(false);
+    };
+    write_stdout(&out)?;
+    held.clear();
+    Ok(true)
+}
+
+/// The bytes of a frame: what the client wrote since the last, its own frame
+/// closes taken out so that it is presented with this one and no sooner; the
+/// mouse as the panel wants it; and the session under the panel — `laid`,
+/// the session dimmed `dim` of the way in round it — painted over all of it,
+/// in one synchronized update that this frame ends.
+///
+/// `None` while the session is half way through a sequence, where nothing of
+/// nvmux's can be written: then nothing goes out at all, the session's bytes
+/// included, until the rest of the sequence comes and a frame can go out
+/// after it. The session's bytes never reach the terminal without a frame
+/// after them, which is what keeps them from showing through the panel.
+fn frame_bytes(
+    copy: &mut Shadow,
+    look: Look,
+    laid: Option<&Laid>,
+    area: Rect,
+    dim: f32,
+    held: &[u8],
+    boundary: &mut Boundary,
+) -> Option<Vec<u8>> {
+    if boundary.mid_sequence() {
+        return None;
+    }
+    let shade = |row: u16, col: u16| look.shade(row, col, area, dim);
+    let frame = copy.frame_under(&shade, look.palette(), laid, Cursor::Hidden);
     let mut out = fade::SYNC_BEGIN.to_vec();
     out.extend_from_slice(&unsynced(held));
     let ours = out.len();
     out.extend_from_slice(term::mouse_reporting_bytes(MouseReporting::Motion));
     out.extend_from_slice(&frame);
-    write_stdout(&out)?;
     boundary.saw_own(fade::SYNC_BEGIN);
     boundary.saw_own(&out[ours..]);
-    held.clear();
-    Ok(true)
+    Some(out)
 }
 
 /// The session back as it is, the panel gone: what the client wrote since the
 /// last frame, then every cell painted back as the session drew it, its
-/// mouse, pen and cursor as it had them — one update.
-fn put_back(a: &mut Attachment, held: &mut Vec<u8>, boundary: &mut Boundary) -> Result<()> {
-    held.extend(boundary.give_up());
+/// mouse, pen and cursor as it had them — one update. A client caught half
+/// way through a sequence is let finish it first, for a moment, as a resume
+/// lets one finish its frame ([`FRAME_WAIT`]): the paint has to go in between
+/// its sequences.
+fn put_back(
+    a: &mut Attachment,
+    master_fd: RawFd,
+    held: &mut Vec<u8>,
+    boundary: &mut Boundary,
+) -> Result<()> {
+    let deadline = Instant::now() + FRAME_WAIT;
+    let mut buf = [0u8; 8192];
+    while boundary.mid_sequence() || boundary.keeping() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let mut p = [pollfd(master_fd)];
+        let ms = left.as_micros().div_ceil(1000) as libc::c_int;
+        let n = unsafe { libc::poll(p.as_mut_ptr(), 1, ms) };
+        if n <= 0 || !ready(&p[0]) {
+            break;
+        }
+        match read_fd(master_fd, &mut buf) {
+            Ok(len) if len > 0 => hold(a, &buf[..len], held, boundary),
+            _ => break,
+        }
+    }
+    let unfinished = boundary.give_up();
     let mouse = a
         .ledger
         .as_ref()
@@ -440,18 +507,37 @@ fn put_back(a: &mut Attachment, held: &mut Vec<u8>, boundary: &mut Boundary) -> 
         .map(crate::ledger::Ledger::mouse)
         .or_else(|| a.copy().and_then(|c| c.mouse()))
         .unwrap_or(MouseReporting::Buttons);
-    let mut out = fade::SYNC_BEGIN.to_vec();
-    out.extend_from_slice(&unsynced(held));
-    out.extend_from_slice(term::mouse_reporting_bytes(mouse));
+    let out = put_back_bytes(a.copy().as_deref(), held, mouse, &unfinished);
     if let Some(copy) = a.copy() {
-        out.extend_from_slice(&copy.paint());
         copy.invalidate();
-    } else {
-        out.extend_from_slice(fade::SYNC_END);
     }
     held.clear();
     write_stdout(&out)?;
     Ok(())
+}
+
+/// The bytes that put the session back: `held`, its frame closes taken out;
+/// the session's own `mouse`; every cell of `copy` painted back, its pen and
+/// cursor as the session left them, which ends the update; and after it
+/// `unfinished`, from a client stopped half way through a sequence for longer
+/// than [`put_back`] waits. That goes last, where the rest of it will follow
+/// it: the copy has not drawn it yet either, and in front of the paint it
+/// would have the paint written into the middle of it.
+fn put_back_bytes(
+    copy: Option<&Shadow>,
+    held: &[u8],
+    mouse: MouseReporting,
+    unfinished: &[u8],
+) -> Vec<u8> {
+    let mut out = fade::SYNC_BEGIN.to_vec();
+    out.extend_from_slice(&unsynced(held));
+    out.extend_from_slice(term::mouse_reporting_bytes(mouse));
+    match copy {
+        Some(copy) => out.extend_from_slice(&copy.paint()),
+        None => out.extend_from_slice(fade::SYNC_END),
+    }
+    out.extend_from_slice(unfinished);
+    out
 }
 
 /// What the client wrote and the terminal has not had yet, on a way out with
@@ -505,6 +591,110 @@ mod tests {
         assert_eq!(shade(29, 30), Shade::Blank, "and below");
         assert_eq!(shade(10, 21), Shade::Faint);
         assert_eq!(shade(4, 30), Shade::Faint);
+    }
+
+    fn count(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count()
+    }
+
+    /// What the session writes goes to the terminal only at the front of a
+    /// frame, in the one update the frame ends: its own frame closes taken
+    /// out, and a tail half way through a sequence kept back for the rest of
+    /// it. So there is always a frame after it, and it never shows through.
+    #[test]
+    fn the_sessions_bytes_go_out_only_in_front_of_a_frame() {
+        let area = Rect::new(8, 3, 64, 18);
+        let look = Look::Dimmed(palette());
+        let mut copy = Shadow::new(24, 80);
+        let mut boundary = Boundary::new();
+        let chunk = b"\x1b[?2026h\x1b[5;10Hbusy\x1b[?2026l\x1b]2;tit";
+        copy.feed(chunk);
+        let held = boundary.relay_whole(chunk);
+        let out = frame_bytes(&mut copy, look, None, area, 1.0, &held, &mut boundary)
+            .expect("a frame, between sequences");
+        let front = [fade::SYNC_BEGIN, b"\x1b[?2026h\x1b[5;10Hbusy"].concat();
+        assert!(
+            out.starts_with(&front),
+            "{:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert_eq!(count(&out, fade::SYNC_END), 1, "the frame's own close only");
+        assert!(out.ends_with(fade::SYNC_END), "which ends it");
+        assert_eq!(count(&out, b"\x1b]"), 0, "the tail waits for its rest");
+
+        let rest = b"le\x07";
+        copy.feed(rest);
+        let held = boundary.relay_whole(rest);
+        let out = frame_bytes(&mut copy, look, None, area, 1.0, &held, &mut boundary)
+            .expect("the next frame");
+        let front = [fade::SYNC_BEGIN, b"\x1b]2;title\x07"].concat();
+        assert!(
+            out.starts_with(&front),
+            "{:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// Once the terminal has had part of a sequence — a string with no end in
+    /// sight, gone out unfinished — no frame can follow it, and nothing goes
+    /// out at all, the session's bytes included, until the string ends.
+    #[test]
+    fn nothing_goes_out_half_way_through_a_sequence() {
+        let area = Rect::new(8, 3, 64, 18);
+        let mut copy = Shadow::new(24, 80);
+        let mut boundary = Boundary::new();
+        let mut held = boundary.relay_whole(b"\x1b[1;1Hbefore\x1b]52;c;");
+        held.extend(boundary.relay_whole(&vec![b'A'; 128 * 1024]));
+        assert!(boundary.mid_sequence());
+        let frame = frame_bytes(
+            &mut copy,
+            Look::Faint,
+            None,
+            area,
+            1.0,
+            &held,
+            &mut boundary,
+        );
+        assert!(frame.is_none(), "a frame inside the string");
+        held.extend(boundary.relay_whole(b"\x1b\\after"));
+        let out = frame_bytes(
+            &mut copy,
+            Look::Faint,
+            None,
+            area,
+            1.0,
+            &held,
+            &mut boundary,
+        )
+        .expect("a frame once it has ended");
+        let front = [fade::SYNC_BEGIN, b"\x1b[1;1Hbefore\x1b]52;c;AAAA"].concat();
+        assert!(out.starts_with(&front));
+        assert_eq!(count(&out, b"\x1b\\after"), 1);
+        assert_eq!(count(&out, fade::SYNC_END), 1);
+    }
+
+    /// Put back, the session's bytes go first and the paint after them, in one
+    /// update; and a tail the client has still to finish goes after the paint,
+    /// where the rest of it will follow, rather than have the paint written
+    /// into the middle of it.
+    #[test]
+    fn the_paint_that_puts_the_session_back_goes_between_its_sequences() {
+        let mut copy = Shadow::new(24, 80);
+        copy.feed(b"\x1b[1;1Hhello\x1b[?2026l\x1b]2;tit");
+        let held = b"\x1b[1;1Hhello\x1b[?2026l";
+        let out = put_back_bytes(Some(&copy), held, MouseReporting::Off, b"\x1b]2;tit");
+        let front = [fade::SYNC_BEGIN, b"\x1b[1;1Hhello"].concat();
+        assert!(
+            out.starts_with(&front),
+            "{:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert_eq!(count(&out, fade::SYNC_END), 1, "the paint's own close only");
+        let end = [fade::SYNC_END, b"\x1b]2;tit"].concat();
+        assert!(out.ends_with(&end), "{:?}", String::from_utf8_lossy(&out));
     }
 
     /// The way in takes as much of the fade as the way is long, and ends
