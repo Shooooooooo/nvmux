@@ -64,6 +64,7 @@ pub mod float;
 pub mod help;
 pub mod landing;
 pub mod note;
+pub mod picker;
 pub mod prompt;
 pub mod settings;
 pub mod setup;

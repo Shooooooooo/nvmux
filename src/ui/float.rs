@@ -1,6 +1,6 @@
 //! What floats over a session in a panel the relay draws (see
-//! `crate::pty::panel`): the settings ([`super::settings::Panel`]) and the
-//! help ([`super::help::Panel`]).
+//! `crate::pty::panel`): the settings ([`super::settings::Panel`]), the
+//! help ([`super::help::Panel`]) and the picker ([`super::picker::Panel`]).
 //!
 //! The relay reads the terminal while one is up, the screen being drawn over a
 //! session that has it, and hands each its keys and the mouse; it asks where
@@ -21,6 +21,25 @@ pub enum Did {
     Stay,
     /// The key that closes the screen: take it down.
     Close,
+}
+
+/// Where a screen floating over a session goes once it is taken down, when
+/// that is not back to the session it floats over: what the picker's keys
+/// lead to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leave {
+    /// To another session: `Enter` on its row.
+    Switch(crate::ids::Id),
+    /// To set up a new session: `c`.
+    New,
+    /// Out of nvmux, every session left running: `q`.
+    Quit,
+    /// To the picker full screen, for what it does not do floating: rename.
+    Picker,
+    /// The help, over the session in its place: `?`.
+    Help,
+    /// The settings, over the session in its place: `,`.
+    Settings,
 }
 
 /// A screen that floats over a session.
@@ -50,6 +69,17 @@ pub trait Floating {
 
     /// Taken down.
     fn close(&self);
+
+    /// Where it goes once it is down, if not back to the session.
+    fn leave(&self) -> Option<Leave> {
+        None
+    }
+
+    /// Whether it has asked to be taken down with no key or gesture to say
+    /// so: the picker's half-typed number, settled by the clock.
+    fn closing(&self) -> bool {
+        false
+    }
 }
 
 /// Where a screen's parts go in the panel it floats in: all of it but a

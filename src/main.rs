@@ -178,6 +178,8 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
     let remote = matches!(transport.location(), transport::Location::Ssh(_));
     // For the settings when they float over a session, which the relay opens.
     ui::settings::sessions_are_remote(remote);
+    // And for the picker, which lists, kills and renumbers as it floats.
+    ui::picker::lend(shared);
     let mut message: Option<String> = None;
     // The session the last trip through the picker led to, so the next one
     // opens with the cursor on it rather than on the first row.
@@ -386,6 +388,10 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
             notifier.watch(&current.id, &current.name, sock.clone());
             notifier.front(Some(&current.id));
 
+            // The rows the picker opens on if it floats over this session; what
+            // it left of them, if it changed them, is taken back below.
+            ui::picker::hand(&listing);
+
             // The relay, with the chance to start the next client while this
             // session is still dissolving: `begin_next` fires on a `<prefix>`
             // switch, before the fade, and what it leaves in `begun` is waited
@@ -442,6 +448,13 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                 };
                 pty::relay(attachment, highest, &mut begin_next)?
             };
+            // The rows as a picker floating over the session left them: a kill,
+            // a move, a session another nvmux made.
+            if let Some(rows) = ui::picker::take_changed() {
+                listing = rows;
+                highest = ui::highest_num(&listing);
+                pool.keep_only(&listing);
+            }
             // Out of the session: whatever comes next — the picker, the help,
             // the prompt, another session, or the shell — nobody is in front
             // to be told until the next attach says who is.

@@ -1,5 +1,5 @@
-//! The settings and the help, floating over the session: `<prefix> ,` and
-//! `<prefix> ?`.
+//! The settings, the help and the picker, floating over the session:
+//! `<prefix> ,`, `<prefix> ?` and `<prefix> Space`.
 //!
 //! Each screen ([`crate::ui::settings`], [`crate::ui::help`]) used to take
 //! the terminal, the session dissolving out under it and back in after. Here
@@ -44,6 +44,12 @@
 //! bar, whose row it leaves fades back from it as the picker's does (see
 //! [`crate::ui::settings`]) — has frames at the fade's pace until it stops.
 //!
+//! The picker can go two other ways ([`Leave`]). To another session, or to a
+//! screen of its own, it goes out with the session, the two into the
+//! background together, and the relay has nothing left to dissolve. To the
+//! help or the settings, it goes out alone, and the other comes up in its
+//! place over the session as it stands, dimmed.
+//!
 //! # Where it does not float
 //!
 //! Without the terminal's colours — `NO_COLOR`, or a terminal that never
@@ -62,7 +68,8 @@ use ratatui::crossterm::event::{MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 
 use super::{
-    pollfd, read_fd, ready, take_step, unsynced, Attachment, Outcome, FRAME_WAIT, SEQUENCE_TIMEOUT,
+    pollfd, read_fd, ready, take_step, unsynced, Attachment, Outcome, Target, FRAME_WAIT,
+    SEQUENCE_TIMEOUT,
 };
 use crate::boundary::Boundary;
 use crate::error::{NvmuxError, Result};
@@ -71,8 +78,8 @@ use crate::keys::Step;
 use crate::palette::Palette;
 use crate::shadow::{Cursor, Laid, Shade, Shadow};
 use crate::term::{self, write_stdout, MouseReporting};
-use crate::ui::float::{Did, Floating};
-use crate::ui::{help, settings};
+use crate::ui::float::{Did, Floating, Leave};
+use crate::ui::{help, picker, settings};
 use crate::{card, config, fade, falloff, winch};
 
 /// How far the whole session goes toward the background behind the panel:
@@ -111,8 +118,10 @@ impl Look {
     }
 
     /// What becomes of the session's cell at (`row`, `col`) with the panel
-    /// at `panel`, the dimming `dim` of the way in.
-    fn shade(self, row: u16, col: u16, panel: Rect, dim: f32) -> Shade {
+    /// at `panel`, the dimming `dim` of the way in — and the whole of it
+    /// `away` of the rest of the way to the background, under a panel going
+    /// somewhere other than back to the session.
+    fn shade(self, row: u16, col: u16, panel: Rect, dim: f32, away: f32) -> Shade {
         match self {
             Look::Dimmed(_) => {
                 let d = falloff::distance(col, row, panel.x, panel.y, panel.width, panel.height);
@@ -121,8 +130,10 @@ impl Look {
                 } else {
                     1.0 - (1.0 - BEHIND) * (1.0 - falloff::around(d, falloff::PEAK, falloff::REACH))
                 };
-                Shade::Toward(amount * dim)
+                let dimmed = amount * dim;
+                Shade::Toward(dimmed + (1.0 - dimmed) * away)
             }
+            Look::Faint if away > 0.0 => Shade::Blank,
             Look::Faint => {
                 let left = panel.x.saturating_sub(MARGIN_COLS);
                 let top = panel.y.saturating_sub(MARGIN_ROWS);
@@ -147,15 +158,19 @@ pub(super) enum What {
     Settings,
     /// `<prefix> ?`.
     Help,
+    /// `<prefix> Space`.
+    Picker,
 }
 
 impl What {
     /// What floats in place of the screen `outcome` would show full screen,
-    /// if it shows one that floats.
+    /// if it shows one that floats — the picker only where it is asked to
+    /// (see [`picker::floats`]).
     pub(super) fn of(outcome: Outcome) -> Option<Self> {
         match outcome {
             Outcome::ShowSettings => Some(What::Settings),
             Outcome::ShowHelp => Some(What::Help),
+            Outcome::ToPicker if picker::floats() => Some(What::Picker),
             Outcome::ToPicker
             | Outcome::Detached
             | Outcome::CreateNew
@@ -166,10 +181,12 @@ impl What {
         }
     }
 
-    fn open(self) -> Box<dyn Floating> {
+    /// The screen, opened over session `behind`.
+    fn open(self, behind: &str) -> Box<dyn Floating> {
         match self {
             What::Settings => Box::new(settings::Panel::open()),
             What::Help => Box::new(help::Panel::open()),
+            What::Picker => Box::new(picker::Panel::open(behind)),
         }
     }
 
@@ -178,7 +195,45 @@ impl What {
         match self {
             What::Settings => Outcome::ShowSettings,
             What::Help => Outcome::ShowHelp,
+            What::Picker => Outcome::ToPicker,
         }
+    }
+}
+
+/// How a panel goes once it is taken down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Way {
+    /// Back to the session, which comes back as it is.
+    Back,
+    /// Out with the session, the two into the background together: to
+    /// another session, or to a screen of its own.
+    Away,
+    /// Out alone, for another to come up in its place over the session.
+    Across(What),
+}
+
+impl Way {
+    fn of(leave: Option<Leave>) -> Self {
+        match leave {
+            None | Some(Leave::Quit) => Way::Back,
+            Some(Leave::Switch(_) | Leave::New | Leave::Picker) => Way::Away,
+            Some(Leave::Help) => Way::Across(What::Help),
+            Some(Leave::Settings) => Way::Across(What::Settings),
+        }
+    }
+}
+
+/// What ends the relay once a panel that is going somewhere is down: the
+/// session to switch to, the create prompt, the picker full screen, or out.
+/// `None` for the ways that keep the relay: back to the session, or across
+/// to another panel.
+fn ends_in(leave: Leave) -> Option<Outcome> {
+    match leave {
+        Leave::Switch(id) => Some(Outcome::Switch(Target::Session(id))),
+        Leave::New => Some(Outcome::CreateNew),
+        Leave::Picker => Some(Outcome::ToPicker),
+        Leave::Quit => Some(Outcome::Detached),
+        Leave::Help | Leave::Settings => None,
     }
 }
 
@@ -219,18 +274,21 @@ impl Coming {
 
 /// `what` over the session until it is taken down: `None` to go on relaying
 /// the session, and otherwise how the relay ends — the screen full screen
-/// where it cannot float, the client gone, the terminal gone, or the clients
+/// where it cannot float, the client gone, the terminal gone, the clients
 /// to settle for a change the settings made to `client.ui` or
-/// `client.per_session` (see `main`'s `settle`).
+/// `client.per_session` (see `main`'s `settle`), or wherever the picker
+/// went (see [`ends_in`]).
 pub(super) fn float(
     a: &mut Attachment,
     master_fd: RawFd,
     winch: &winch::Winch,
     what: What,
 ) -> Result<Option<Outcome>> {
-    let mut panel = what.open();
+    let mut what = what;
+    let mut panel = what.open(&a.session_id);
     let size = term::terminal_size();
-    let Some(mut area) = panel.area(Rect::new(0, 0, size.cols, size.rows)) else {
+    let mut screen = Rect::new(0, 0, size.cols, size.rows);
+    let Some(mut area) = panel.area(screen) else {
         return Ok(Some(what.full_screen()));
     };
     if !a.copy().is_some_and(|c| c.is_usable()) {
@@ -255,20 +313,27 @@ pub(super) fn float(
     let mut buf = [0u8; 8192];
     let mut coming = Coming::to(0.0, 1.0, fade_length(look), Instant::now());
     let mut going = false;
+    // How the panel goes, once it is going (see `Way`), and for one going
+    // away, how far the session has gone with it: 0 as the panel has it, 1
+    // the background.
+    let mut way = Way::Back;
+    let mut away = Coming::to(0.0, 0.0, Duration::ZERO, Instant::now());
     // A frame is owed: for the panel, or for the session behind it.
     let mut owed = true;
     let mut session_drew = false;
     let mut last_frame: Option<Instant> = None;
-    // How far in the last frame drawn had the panel: the way in or out ends
-    // on a frame drawn where it was going, however the frames fell.
+    // How far in the last frame drawn had the panel, and the session away:
+    // the way in or out ends on a frame drawn where it was going, however
+    // the frames fell.
     let mut drawn_at = f32::NAN;
+    let mut drawn_away = 0.0;
     let mut sequence_due: Option<Instant> = None;
     let stdin_fd = std::io::stdin().as_raw_fd();
 
     loop {
         let now = Instant::now();
-        let moving = !coming.done(now);
-        if !moving && drawn_at != coming.to {
+        let moving = !coming.done(now) || !away.done(now);
+        if !moving && (drawn_at != coming.to || drawn_away != away.to) {
             owed = true;
         }
         // Frames at a frame's pace while anything moves: the panel coming or
@@ -323,7 +388,8 @@ pub(super) fn float(
             winch.drain();
             let size = term::terminal_size();
             a.resize_to(size);
-            match panel.area(Rect::new(0, 0, size.cols, size.rows)) {
+            screen = Rect::new(0, 0, size.cols, size.rows);
+            match panel.area(screen) {
                 Some(fits) => {
                     area = fits;
                     owed = true;
@@ -354,6 +420,8 @@ pub(super) fn float(
             sequence_due = None;
             inputs.extend(decoder.flush());
         }
+        // Whether the panel was taken down by what came in, or by the clock.
+        let was_going = going;
         for input in inputs {
             match input {
                 Input::Client(bytes) => {
@@ -375,21 +443,79 @@ pub(super) fn float(
                     going = (outside && press) || panel.on_mouse(mouse, now) == Did::Close;
                 }
             }
-            if going && coming.to > 0.0 {
-                let there = coming.at(now);
-                coming = Coming::to(there, 0.0, fade_length(look), now);
-            }
         }
         if panel.tick(now) {
             owed = true;
         }
+        going |= panel.closing();
+        // Taken down just now: the way out the panel says, from wherever
+        // the way in has got to.
+        if going && !was_going {
+            way = Way::of(panel.leave());
+            let there = coming.at(now);
+            let length = fade_length(look);
+            match way {
+                Way::Back => coming = Coming::to(there, 0.0, length, now),
+                // The panel and the session go out together: the panel's text
+                // as the session's way in left it, both over the whole fade.
+                Way::Away => away = Coming::to(0.0, 1.0, length, now),
+                // The session dims the rest of the way, if it has any left,
+                // as the panel goes; and stays dimmed for the next.
+                Way::Across(_) => coming = Coming::to(there, 0.5, length, now),
+            }
+        }
         tell_the_client(a);
 
-        let moving = !coming.done(now);
-        // Gone the whole way out: the session back as it is, at once.
+        let moving = !coming.done(now) || !away.done(now);
+        // Gone the whole way out.
         if going && !moving {
             panel.close();
-            put_back(a, master_fd, &mut held, &mut boundary)?;
+            match way {
+                // The next panel comes up in its place, out of the
+                // background, over the session as it stands, dimmed.
+                Way::Across(next) => {
+                    what = next;
+                    panel = what.open(&a.session_id);
+                    match panel.area(screen) {
+                        Some(fits) => area = fits,
+                        None => {
+                            put_back(a, master_fd, &mut held, &mut boundary)?;
+                            return Ok(Some(what.full_screen()));
+                        }
+                    }
+                    coming = Coming::to(0.5, 1.0, fade_length(look), now);
+                    going = false;
+                    way = Way::Back;
+                    owed = true;
+                    continue;
+                }
+                // The session gone out with the panel: the last frame, all of
+                // it the background, with whatever the client has written
+                // since the one before in front of it; the session's own
+                // mouse back; and the relay has nothing left to dissolve.
+                Way::Away => {
+                    let painted = paint(
+                        a,
+                        look,
+                        panel.as_mut(),
+                        area,
+                        coming.to,
+                        1.0,
+                        &mut held,
+                        &mut boundary,
+                    )?;
+                    if !painted {
+                        owe_out(&mut held, &mut boundary)?;
+                    }
+                    write_stdout(term::mouse_reporting_bytes(session_mouse(a)))?;
+                    a.dark = true;
+                }
+                // The session back as it is, at once.
+                Way::Back => put_back(a, master_fd, &mut held, &mut boundary)?,
+            }
+            if let Some(ends) = panel.leave().and_then(ends_in) {
+                return Ok(Some(ends));
+            }
             let client = config::get().client;
             let settle = client.ui != was.ui || client.per_session != was.per_session;
             return Ok(settle.then_some(Outcome::Resettle));
@@ -406,19 +532,27 @@ pub(super) fn float(
         if (lively || owed) && due {
             // A frame that could not go out is tried again a frame later.
             last_frame = Some(now);
+            // Where the panel goes on the screen as it is now: the picker's
+            // is as big as its rows.
+            if let Some(fits) = panel.area(screen) {
+                area = fits;
+            }
             let there = coming.at(now);
+            let gone = away.at(now);
             if paint(
                 a,
                 look,
                 panel.as_mut(),
                 area,
                 there,
+                gone,
                 &mut held,
                 &mut boundary,
             )? {
                 owed = false;
                 session_drew = false;
                 drawn_at = there;
+                drawn_away = gone;
             }
         }
     }
@@ -454,14 +588,17 @@ fn hold(a: &mut Attachment, chunk: &[u8], held: &mut Vec<u8>, boundary: &mut Bou
     held.extend(boundary.relay_whole(chunk));
 }
 
-/// A frame, `there` of the way in, if one can go out now (see
-/// [`frame_bytes`]). Says whether it did.
+/// A frame, `there` of the way in and `away` of the way out to the
+/// background, if one can go out now (see [`frame_bytes`]). Says whether it
+/// did.
+#[allow(clippy::too_many_arguments)]
 fn paint(
     a: &mut Attachment,
     look: Look,
     panel: &mut dyn Floating,
     area: Rect,
     there: f32,
+    away: f32,
     held: &mut Vec<u8>,
     boundary: &mut Boundary,
 ) -> Result<bool> {
@@ -475,7 +612,8 @@ fn paint(
         }
         return Ok(false);
     }
-    let text = falloff::ease(there * 2.0 - 1.0);
+    let away = falloff::ease(away);
+    let text = falloff::ease(there * 2.0 - 1.0) * (1.0 - away);
     let laid = (text > 0.0).then(|| {
         let mut buf = panel.draw(area);
         if let (Some(palette), true) = (look.palette(), text < 1.0) {
@@ -487,7 +625,7 @@ fn paint(
         return Ok(false);
     };
     let dim = falloff::ease(there * 2.0);
-    let Some(out) = frame_bytes(copy, look, laid.as_ref(), area, dim, held, boundary) else {
+    let Some(out) = frame_bytes(copy, look, laid.as_ref(), area, dim, away, held, boundary) else {
         return Ok(false);
     };
     write_stdout(&out)?;
@@ -506,19 +644,21 @@ fn paint(
 /// included, until the rest of the sequence comes and a frame can go out
 /// after it. The session's bytes never reach the terminal without a frame
 /// after them, which is what keeps them from showing through the panel.
+#[allow(clippy::too_many_arguments)]
 fn frame_bytes(
     copy: &mut Shadow,
     look: Look,
     laid: Option<&Laid>,
     area: Rect,
     dim: f32,
+    away: f32,
     held: &[u8],
     boundary: &mut Boundary,
 ) -> Option<Vec<u8>> {
     if boundary.mid_sequence() {
         return None;
     }
-    let shade = |row: u16, col: u16| look.shade(row, col, area, dim);
+    let shade = |row: u16, col: u16| look.shade(row, col, area, dim, away);
     let frame = copy.frame_under(&shade, look.palette(), laid, Cursor::Hidden);
     let mut out = fade::SYNC_BEGIN.to_vec();
     out.extend_from_slice(&unsynced(held));
@@ -561,13 +701,7 @@ fn put_back(
         }
     }
     let unfinished = boundary.give_up();
-    let mouse = a
-        .ledger
-        .as_ref()
-        .filter(|l| l.is_usable())
-        .map(crate::ledger::Ledger::mouse)
-        .or_else(|| a.copy().and_then(|c| c.mouse()))
-        .unwrap_or(MouseReporting::Buttons);
+    let mouse = session_mouse(a);
     let out = put_back_bytes(a.copy().as_deref(), held, mouse, &unfinished);
     if let Some(copy) = a.copy() {
         copy.invalidate();
@@ -575,6 +709,17 @@ fn put_back(
     held.clear();
     write_stdout(&out)?;
     Ok(())
+}
+
+/// The mouse as the session had it, which the panel took for its own: as the
+/// client last told the terminal, or as its copy of the screen has it.
+fn session_mouse(a: &mut Attachment) -> MouseReporting {
+    a.ledger
+        .as_ref()
+        .filter(|l| l.is_usable())
+        .map(crate::ledger::Ledger::mouse)
+        .or_else(|| a.copy().and_then(|c| c.mouse()))
+        .unwrap_or(MouseReporting::Buttons)
 }
 
 /// The bytes that put the session back: `held`, its frame closes taken out;
@@ -625,7 +770,7 @@ mod tests {
     fn the_session_dims_round_the_panel_by_the_cards_falloff() {
         let panel = Rect::new(24, 6, 72, 23);
         let look = Look::Dimmed(palette());
-        let amount = |row, col| match look.shade(row, col, panel, 1.0) {
+        let amount = |row, col| match look.shade(row, col, panel, 1.0, 0.0) {
             Shade::Toward(t) => t,
             other => panic!("{other:?}"),
         };
@@ -636,7 +781,11 @@ mod tests {
         assert!(beside > 0.9, "beside it, nearly gone: {beside}");
         let near = amount(10, 18);
         assert!(beside > near && near > far, "{beside} {near} {far}");
-        assert_eq!(look.shade(0, 0, panel, 0.0), Shade::Toward(0.0), "not yet");
+        assert_eq!(
+            look.shade(0, 0, panel, 0.0, 0.0),
+            Shade::Toward(0.0),
+            "not yet"
+        );
     }
 
     /// Without colours: blank under the panel and two columns and a row round
@@ -644,7 +793,7 @@ mod tests {
     #[test]
     fn without_colours_the_panel_stands_on_a_blank_margin() {
         let panel = Rect::new(24, 6, 72, 23);
-        let shade = |row, col| Look::Faint.shade(row, col, panel, 1.0);
+        let shade = |row, col| Look::Faint.shade(row, col, panel, 1.0, 0.0);
         assert_eq!(shade(10, 30), Shade::Blank);
         assert_eq!(shade(10, 22), Shade::Blank, "the margin, left");
         assert_eq!(shade(10, 97), Shade::Blank, "and right");
@@ -674,7 +823,7 @@ mod tests {
         let chunk = b"\x1b[?2026h\x1b[5;10Hbusy\x1b[?2026l\x1b]2;tit";
         copy.feed(chunk);
         let held = boundary.relay_whole(chunk);
-        let out = frame_bytes(&mut copy, look, None, area, 1.0, &held, &mut boundary)
+        let out = frame_bytes(&mut copy, look, None, area, 1.0, 0.0, &held, &mut boundary)
             .expect("a frame, between sequences");
         let front = [fade::SYNC_BEGIN, b"\x1b[?2026h\x1b[5;10Hbusy"].concat();
         assert!(
@@ -689,7 +838,7 @@ mod tests {
         let rest = b"le\x07";
         copy.feed(rest);
         let held = boundary.relay_whole(rest);
-        let out = frame_bytes(&mut copy, look, None, area, 1.0, &held, &mut boundary)
+        let out = frame_bytes(&mut copy, look, None, area, 1.0, 0.0, &held, &mut boundary)
             .expect("the next frame");
         let front = [fade::SYNC_BEGIN, b"\x1b]2;title\x07"].concat();
         assert!(
@@ -716,6 +865,7 @@ mod tests {
             None,
             area,
             1.0,
+            0.0,
             &held,
             &mut boundary,
         );
@@ -727,6 +877,7 @@ mod tests {
             None,
             area,
             1.0,
+            0.0,
             &held,
             &mut boundary,
         )
@@ -758,10 +909,11 @@ mod tests {
         assert!(out.ends_with(&end), "{:?}", String::from_utf8_lossy(&out));
     }
 
-    /// The settings and the help float, each in place of its own screen and
-    /// full screen as itself where it cannot; nothing else floats.
+    /// The settings and the help float, and the picker where it is asked to,
+    /// each in place of its own screen and full screen as itself where it
+    /// cannot; nothing else floats.
     #[test]
-    fn the_settings_and_the_help_float_and_nothing_else() {
+    fn the_settings_the_help_and_the_picker_float_and_nothing_else() {
         for (outcome, what) in [
             (Outcome::ShowSettings, What::Settings),
             (Outcome::ShowHelp, What::Help),
@@ -769,8 +921,12 @@ mod tests {
             assert_eq!(What::of(outcome), Some(what));
             assert_eq!(what.full_screen(), outcome);
         }
+        assert_eq!(
+            What::of(Outcome::ToPicker),
+            picker::floats().then_some(What::Picker)
+        );
+        assert_eq!(What::Picker.full_screen(), Outcome::ToPicker);
         for outcome in [
-            Outcome::ToPicker,
             Outcome::Detached,
             Outcome::CreateNew,
             Outcome::Resettle,
@@ -779,6 +935,49 @@ mod tests {
         ] {
             assert_eq!(What::of(outcome), None, "{outcome:?}");
         }
+    }
+
+    /// Going away, the whole session goes the rest of the way to the
+    /// background, under the panel and round it: nothing is left at the end.
+    #[test]
+    fn going_away_takes_the_whole_session_to_the_background() {
+        let panel = Rect::new(24, 6, 72, 23);
+        let look = Look::Dimmed(palette());
+        for (row, col) in [(0, 0), (10, 18), (10, 30), (40, 119)] {
+            assert_eq!(look.shade(row, col, panel, 1.0, 1.0), Shade::Toward(1.0));
+            let Shade::Toward(half) = look.shade(row, col, panel, 1.0, 0.5) else {
+                panic!("not toward");
+            };
+            let Shade::Toward(none) = look.shade(row, col, panel, 1.0, 0.0) else {
+                panic!("not toward");
+            };
+            assert!(half >= none, "({row}, {col}): {half} < {none}");
+        }
+        assert_eq!(Look::Faint.shade(0, 0, panel, 1.0, 1.0), Shade::Blank);
+    }
+
+    /// Where the picker's keys lead: to another session, the prompt and the
+    /// picker full screen out with the session; to the help and the settings
+    /// across, over it; and out of nvmux, or nowhere, back to it first.
+    #[test]
+    fn the_pickers_ways_out() {
+        let id = crate::ids::Id::new("abcd2345").expect("an id");
+        assert_eq!(Way::of(None), Way::Back);
+        assert_eq!(Way::of(Some(Leave::Quit)), Way::Back);
+        for leave in [Leave::Switch(id), Leave::New, Leave::Picker] {
+            assert_eq!(Way::of(Some(leave)), Way::Away, "{leave:?}");
+        }
+        assert_eq!(Way::of(Some(Leave::Help)), Way::Across(What::Help));
+        assert_eq!(Way::of(Some(Leave::Settings)), Way::Across(What::Settings));
+        assert_eq!(
+            ends_in(Leave::Switch(id)),
+            Some(Outcome::Switch(Target::Session(id)))
+        );
+        assert_eq!(ends_in(Leave::New), Some(Outcome::CreateNew));
+        assert_eq!(ends_in(Leave::Picker), Some(Outcome::ToPicker));
+        assert_eq!(ends_in(Leave::Quit), Some(Outcome::Detached));
+        assert_eq!(ends_in(Leave::Help), None);
+        assert_eq!(ends_in(Leave::Settings), None);
     }
 
     /// The way in takes as much of the fade as the way is long, and ends

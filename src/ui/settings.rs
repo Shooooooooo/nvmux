@@ -1688,8 +1688,9 @@ fn hints(state: &State, current: Option<&Setting>, width: usize) -> (String, boo
 }
 
 /// The entries that fit `width`, dropping the one least needed — the
-/// highest number — whole, one at a time, as the hint bar drops its own.
-fn fit(entries: &[(Option<&str>, u8)], width: usize) -> String {
+/// highest number — whole, one at a time, as the hint bar drops its own. The
+/// picker floating over a session fits its own the same way.
+pub(super) fn fit(entries: &[(Option<&str>, u8)], width: usize) -> String {
     let mut kept: Vec<(&str, u8)> = entries
         .iter()
         .filter_map(|(text, rank)| text.map(|t| (t, *rank)))

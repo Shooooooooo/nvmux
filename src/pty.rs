@@ -390,6 +390,11 @@ pub struct Attachment {
     /// left it standing (see [`HandOff::up_since`]): what it goes in timed
     /// from.
     landed_since: Option<Instant>,
+    /// Set by a panel that went somewhere other than back to the session —
+    /// the picker's `Enter` on another session, say — taking the session out
+    /// to the background with it (see `panel`): the relay's own fade out has
+    /// nothing left to dissolve.
+    dark: bool,
 }
 
 /// How many clients have had their exit sequences relayed to the terminal:
@@ -2917,6 +2922,7 @@ fn spawn_client_with(
         left_standing: None,
         opening: Vec::new(),
         landed_since: None,
+        dark: false,
     })
 }
 
@@ -3353,7 +3359,9 @@ pub fn relay(
             let kept = stood
                 .as_ref()
                 .map_or_else(shadow::Kept::default, |(kept, _)| kept.clone());
-            let faded = attachment.fade_out(&kept);
+            // A panel that took the session out with it has left the screen
+            // as a fade out would.
+            let faded = std::mem::take(&mut attachment.dark) || attachment.fade_out(&kept);
             raw.restore();
             // Clear here rather than leaving it to the next `relay`, which runs
             // on the far side of the client spawn: what is on the terminal until

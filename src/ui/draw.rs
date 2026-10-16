@@ -125,7 +125,14 @@ const EMPTY: &str = "no sessions — press c to create one";
 const REORDER_HINTS: &str = "↑↓ move  ⏎ place  esc cancel";
 
 pub fn draw(frame: &mut Frame, app: &App) {
-    let (text, dim) = hint_line(app);
+    draw_with(frame, app, HINTS);
+}
+
+/// [`draw`], with `hints` on the hint row where the picker is at rest with
+/// nothing else to say there: the picker floating over a session, in a panel
+/// narrower than [`HINTS`] (see [`super::picker`]).
+pub(super) fn draw_with(frame: &mut Frame, app: &App, hints: &str) {
+    let (text, dim) = hint_line(app, hints);
     screen(frame, &text, dim, |frame, body| draw_list(frame, app, body));
 }
 
@@ -740,7 +747,7 @@ fn draw_trail(frame: &mut Frame, area: Rect, spans: Vec<Span<'static>>) {
 
 /// What the hint row says, and whether it is dim: a hint when nothing is being
 /// asked or typed, and otherwise the thing being asked or typed, at full weight.
-fn hint_line(app: &App) -> (String, bool) {
+fn hint_line(app: &App, hints: &str) -> (String, bool) {
     match app.mode() {
         Mode::Confirm { prompt, .. } | Mode::Leave { prompt, .. } => (prompt.clone(), false),
         Mode::Filter => (format!("/{}{CURSOR}", app.filter()), false),
@@ -762,7 +769,7 @@ fn hint_line(app: &App) -> (String, bool) {
                     // Or the list silently looks shorter than it is.
                     (format!("/{}", app.filter()), true)
                 }
-                None => (HINTS.to_string(), true),
+                None => (hints.to_string(), true),
             },
         },
     }
@@ -782,25 +789,8 @@ fn list_layout(app: &App, area: Rect) -> Option<ListLayout> {
     if area.height == 0 || rows.is_empty() {
         return None;
     }
-    let widest = rows
-        .iter()
-        .map(|r| r.session.name.width())
-        .max()
-        .unwrap_or(0) as u16;
-    // Right-aligned in a column as wide as the longest number, so the names stay
-    // in one column once the list runs past nine.
-    let num_width = rows
-        .iter()
-        .map(|r| r.num.to_string().len())
-        .max()
-        .unwrap_or(1);
-    let width = (widest
-        + MARKER.width() as u16
-        + num_width as u16
-        + NUM_GAP.width() as u16
-        + PAD.width() as u16)
-        .clamp(MIN_LIST_WIDTH, MAX_LIST_WIDTH)
-        .min(area.width);
+    let (width, num_width) = list_columns(&rows);
+    let width = width.min(area.width);
 
     let height = (rows.len() as u16).min(area.height);
     let mut block = centre(area, width, height);
@@ -827,6 +817,38 @@ fn list_layout(app: &App, area: Rect) -> Option<ListLayout> {
         offset,
         num_width,
     })
+}
+
+/// How wide the list is with the whole screen to be drawn on, and how wide
+/// its number column is: its longest name, with the marker, the number, the
+/// gap and the pad, between the list's least and most.
+fn list_columns(rows: &[super::app::Row]) -> (u16, usize) {
+    let widest = rows
+        .iter()
+        .map(|r| r.session.name.width())
+        .max()
+        .unwrap_or(0) as u16;
+    // Right-aligned in a column as wide as the longest number, so the names stay
+    // in one column once the list runs past nine.
+    let num_width = rows
+        .iter()
+        .map(|r| r.num.to_string().len())
+        .max()
+        .unwrap_or(1);
+    let width = (widest
+        + MARKER.width() as u16
+        + num_width as u16
+        + NUM_GAP.width() as u16
+        + PAD.width() as u16)
+        .clamp(MIN_LIST_WIDTH, MAX_LIST_WIDTH);
+    (width, num_width)
+}
+
+/// How wide the list is drawn where there is room for all of it: what the
+/// picker floating over a session sizes its panel by (see
+/// [`super::picker`]).
+pub(super) fn list_width(app: &App) -> u16 {
+    list_columns(&app.rows()).0
 }
 
 /// See [`list_layout`].
