@@ -1003,9 +1003,15 @@ fn the_hint_row_stays_over_a_last_row_that_keeps_changing(tag: &str, own: bool) 
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() && row.starts_with(b as char))
     };
+    // And not before the client's first paint has been let through. With the
+    // fade on, the row is on the screen first in the fade's frames, drawn from
+    // the shadow while the relay is still dissolving the paint in and reading
+    // no keys; the DA1 in the paint goes by only after them. Waiting on the
+    // row alone, the ticks were started and the prefix pressed in the middle
+    // of the fade, and the prefix was not read until the fade was over.
     assert!(
         term.pump_until(Duration::from_secs(15), |out| {
-            ticking(&row_on_screen(out, ROWS - 1))
+            find(out, DA1).is_some() && ticking(&row_on_screen(out, ROWS - 1))
         }),
         "the statusline never reached the last row; it says {:?}, and the child wrote: {}",
         row_on_screen(&term.output, ROWS - 1),

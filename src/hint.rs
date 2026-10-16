@@ -153,8 +153,9 @@ const MIN_ROWS: u16 = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pass {
     /// The child had something for the terminal, or is having its first paint
-    /// held: either way whatever the bar had on the row may have been drawn
-    /// over, and a lull, if one is being waited for, starts again.
+    /// held, or has just had it let through: whatever the bar had on the row
+    /// may have been drawn over, and a lull, if one is being waited for, is
+    /// measured from this pass.
     pub wrote: bool,
     /// Where the terminal's parser stands, when the relay is following it
     /// (see [`crate::boundary`]): `Some(true)` between the session's
@@ -287,11 +288,17 @@ pub fn overlay(pending: Pending, keymap: &Keymap, go: bool, size: PtySize) -> Op
 /// they match, and a write is owed whenever they do not.
 #[derive(Debug)]
 pub struct Bar {
-    /// When the child was last seen with nothing to say, or `None` if it spoke
-    /// on the last pass. Kept from the start of the relay rather than from the
-    /// moment the prefix arms, so the lull is already behind us when it does and
-    /// the bar goes up on that pass instead of a wake-up later.
-    quiet_since: Option<Instant>,
+    /// The last pass the child was seen to write on, or the start of the
+    /// relay before it has: where the lull it owes the bar is counted from.
+    /// Kept from the start of the relay rather than from the moment the
+    /// prefix arms, so the lull is already behind us when it does and the bar
+    /// goes up on that pass instead of a wake-up later.
+    ///
+    /// From the write, and not from the first pass that finds the child
+    /// quiet. That pass is the wake-up [`Bar::wake_at`] asks for, a lull after
+    /// the write, so a lull counted from it is two lulls long: see
+    /// `a_child_writing_every_other_lull_leaves_room_for_the_bar`.
+    spoke: Instant,
     /// The rectangle on the terminal now, or `None` when the bar is down. Kept,
     /// rather than worked out again at the time, because the erase has to put
     /// back the cells the bar *covered* and not whichever cells the last row is
@@ -333,7 +340,7 @@ impl Bar {
     /// the tests reach the restoring path at all.
     fn with_palette(now: Instant, size: PtySize, keymap: Keymap, palette: Option<Palette>) -> Self {
         Self {
-            quiet_since: Some(now),
+            spoke: now,
             shown: None,
             want: None,
             agreed: true,
@@ -374,11 +381,11 @@ impl Bar {
     /// the lull instead would be asking, once it had passed, for a wake-up
     /// already due — on every pass, for as long as the session sat in the
     /// middle of a sequence of its own.
-    pub fn wake_at(&self, now: Instant) -> Option<Instant> {
+    pub fn wake_at(&self) -> Option<Instant> {
         if self.agreed || self.watched {
             return None;
         }
-        Some(self.quiet_since.unwrap_or(now) + SETTLE)
+        Some(self.spoke + SETTLE)
     }
 
     /// Something that is not the child has written over the session's screen —
@@ -425,10 +432,8 @@ impl Bar {
         }
 
         if pass.wrote {
-            self.quiet_since = None;
+            self.spoke = now;
             self.may_have_been_covered();
-        } else {
-            self.quiet_since.get_or_insert(now);
         }
 
         // The parser's word, where there is one, is the whole of it: between
@@ -437,10 +442,9 @@ impl Bar {
         // can present that frame without the bar — and in the middle of one it
         // does not go in at all, however long the session has been quiet.
         self.watched = pass.between.is_some();
-        let free = pass.between.unwrap_or_else(|| {
-            self.quiet_since
-                .is_some_and(|quiet| now.duration_since(quiet) >= SETTLE)
-        });
+        let free = pass
+            .between
+            .unwrap_or_else(|| now.duration_since(self.spoke) >= SETTLE);
         if !free || self.agreed {
             return Act::Idle;
         }
@@ -537,10 +541,10 @@ mod tests {
 
     /// A bar and the clock it is told, advanced a lull at a time.
     ///
-    /// The clock has to be the test's, not `Instant::now()`: a lull *starts* on
-    /// the first quiet pass and has passed by the next one, so two calls that
-    /// read the same clock are indistinguishable from a child that has only just
-    /// stopped talking.
+    /// The clock has to be the test's, not `Instant::now()`: a lull starts on
+    /// the last pass the child wrote on and has passed by the next one, so two
+    /// calls that read the same clock are indistinguishable from a child that
+    /// has only just stopped talking.
     struct Driver {
         bar: Bar,
         now: Instant,
@@ -617,7 +621,7 @@ mod tests {
         }
 
         fn wake_at(&self) -> Option<Instant> {
-            self.bar.wake_at(self.now)
+            self.bar.wake_at()
         }
     }
 
@@ -917,9 +921,11 @@ mod tests {
     /// child's output only while the attach notice is up, so for the bar any
     /// other moment could be the middle of one of its escape sequences.
     ///
-    /// And it waits out the lull rather than writing on the first quiet pass:
-    /// that pass is where the lull *starts*, and a child whose own write blocked
-    /// on a full pty buffer is momentarily unreadable in the middle of a frame.
+    /// And it waits out the lull rather than writing on the first quiet pass
+    /// that comes along: a child whose own write blocked on a full pty buffer
+    /// is momentarily unreadable in the middle of a frame, so a pass that finds
+    /// it silent sooner than [`SETTLE`] after the last pass it wrote on has
+    /// found no lull. The one at the wake-up the bar asked for has.
     #[test]
     fn the_bar_waits_for_a_lull() {
         let mut d = Driver::new(big());
@@ -935,15 +941,77 @@ mod tests {
                 "a write is owed, so a wake-up is asked for"
             );
         }
+        let quiet = Pass {
+            wrote: false,
+            between: None,
+        };
+        let wrote = d.now;
         assert_eq!(
-            d.quiet(Some(Pending::Command), big()),
+            d.bar.step(
+                wrote + SETTLE / 2,
+                quiet,
+                big(),
+                Some(Pending::Command),
+                true,
+                None
+            ),
             Act::Idle,
-            "the lull starts on this pass, it has not passed yet"
+            "wrote in a gap in the middle of the child's write"
+        );
+        assert_eq!(
+            d.wake_at(),
+            Some(wrote + SETTLE),
+            "the lull is not counted from the child's last write"
         );
         assert!(matches!(
             d.quiet(Some(Pending::Command), big()),
             Act::Write(_)
         ));
+    }
+
+    /// The lull is counted from the child's last write, so a child that leaves
+    /// one between two writes has the bar go up in it: the wake-up the bar
+    /// asks for after a write comes before the next, and the pass it brings is
+    /// the one that writes.
+    ///
+    /// It used to be counted from the first pass that found the child quiet —
+    /// which is that same wake-up, a lull after the write — so the bar needed
+    /// two lulls of silence, not one. A statusline redrawn every two of them,
+    /// as a language server's progress is, then had the relay waking in step
+    /// with it, each time a moment before the next redraw, and the bar went up
+    /// only when the scheduler happened to drift.
+    #[test]
+    fn a_child_writing_every_other_lull_leaves_room_for_the_bar() {
+        let size = big();
+        let start = Instant::now();
+        let mut bar = Bar::new(start, size, Keymap::default());
+        let pending = Some(Pending::Command);
+        let busy = Pass {
+            wrote: true,
+            between: None,
+        };
+        let quiet = Pass {
+            wrote: false,
+            between: None,
+        };
+        assert_eq!(
+            bar.step(start, busy, size, pending, true, None),
+            Act::Idle,
+            "wrote over a talking child"
+        );
+        let wake = bar.wake_at().expect("a write is owed");
+        assert!(
+            wake < start + 2 * SETTLE,
+            "the relay is not woken until the next redraw, {:?} after this one",
+            wake - start
+        );
+        assert!(
+            matches!(
+                bar.step(wake, quiet, size, pending, true, None),
+                Act::Write(_)
+            ),
+            "the bar did not go up in the lull between two redraws"
+        );
     }
 
     /// An armed prefix is drawn once, not once per pass: the row does not change
@@ -983,9 +1051,6 @@ mod tests {
                     Act::Idle,
                     "{cover}: not while it is still talking"
                 );
-                // The pass that ends the burst starts the lull; the next one is
-                // past it.
-                assert_eq!(d.quiet(Some(Pending::Command), big()), Act::Idle);
             } else {
                 d.bar.overdrawn();
             }
@@ -1123,9 +1188,6 @@ mod tests {
         assert!(!d.bar.is_up(), "up before anything was asked of it");
         assert_eq!(d.busy(Some(Pending::Command), big()), Act::Idle);
         assert!(d.bar.is_up(), "a bar waiting for its lull is not up");
-        // The pass that ends the burst starts the lull; the next one is past
-        // it.
-        assert_eq!(d.quiet(Some(Pending::Command), big()), Act::Idle);
         assert!(matches!(
             d.quiet(Some(Pending::Command), big()),
             Act::Write(_)
