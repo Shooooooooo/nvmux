@@ -98,13 +98,17 @@ under `[keys.bind]` — `detach = "x"` makes it `<prefix> x` — as
 | Command | Default key | Action |
 |---|---|---|
 | `detach` | `<prefix>` `d` | leave the session running and exit nvmux |
-| `picker` | `<prefix>` `Space` | back to the picker, session still attached — `Esc` goes back |
+| `picker` | `<prefix>` `Space` | the picker, over the session — `Esc` goes back |
 | `next` | `<prefix>` `n` | the next session by number (wraps) |
 | `prev` | `<prefix>` `p` | the previous session by number (wraps) |
 | `new` | `<prefix>` `c` | set up a new session and attach to it — `Esc` goes back |
 | `go` | `<prefix>` `Enter` | go where the newest note in the margin is about: its session, or a terminal of this one |
 | `help` | `<prefix>` `?` | show these keys, as you have them, over the session — `Esc` goes back |
 | `settings` | `<prefix>` `,` | change nvmux's settings while it runs, over the session — `Esc` goes back |
+
+The picker, the help and the settings float over the session, which goes on
+running behind them, dimmed; `float = false` under `[theme]` has each take
+the whole screen instead.
 
 Two keys after the prefix are not commands, and stay where they are: a number
 — `<prefix> 1`, `<prefix> 12` — switches straight to that session, and
@@ -260,6 +264,7 @@ smart_width  = true     # or as many as what it shows wants: its 'textwidth', it
 
 [theme]
 color = "terminal"   # or "#rrggbb": nvmux's text and bars in that colour; dim text stays dim
+float = true         # the picker, settings and help over the session; false takes the screen
 
 [effects]
 enabled = true   # master switch: false turns every effect below off

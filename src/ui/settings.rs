@@ -2,12 +2,13 @@
 //! `<prefix> ,` in a session: every setting the file has, a tab a table,
 //! changed on the spot.
 //!
-//! From the picker it takes the terminal the way the help screen does
-//! ([`super::help`]). From a session it floats over the session instead, in a
-//! panel the relay draws and gives its keys to ([`Panel`], and see
-//! `crate::pty::panel`), and the session goes on behind it — unless the
-//! terminal is too small for a panel ([`panel_area`]), where it takes the
-//! terminal as from the picker and hands the same client back afterwards.
+//! From the picker full screen it takes the terminal the way the help screen
+//! does ([`super::help`]). From a session, or the picker floating over one,
+//! it floats over the session instead, in a panel the relay draws and gives
+//! its keys to ([`Panel`], and see `crate::pty::panel`), and the session goes
+//! on behind it — unless `[theme] float` is off, or the terminal is too small
+//! for a panel ([`panel_area`]), where it takes the terminal as from the
+//! picker and hands the same client back afterwards.
 //! Either way the screen is the same: its rows are
 //! [`crate::settings`]' — one per setting, so the screen cannot leave one out
 //! — and every change it makes is applied as it is made ([`config::apply`]):

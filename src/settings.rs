@@ -391,6 +391,13 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
             Kind::Colour,
         ),
         row(
+            "theme",
+            "float",
+            Tab::Theme,
+            "the picker, settings and help float over the session; off, full screen",
+            switch!(theme.float),
+        ),
+        row(
             "effects",
             "enabled",
             Tab::Effects,

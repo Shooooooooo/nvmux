@@ -59,7 +59,9 @@
 //! fades. On a terminal too small for a panel and the session round it — each
 //! screen says how big a one it needs ([`Floating::area`]) — and for a
 //! session nvmux keeps no copy of, the screen takes the terminal as it always
-//! did ([`Outcome::ShowSettings`], [`Outcome::ShowHelp`]).
+//! did ([`Outcome::ShowSettings`], [`Outcome::ShowHelp`],
+//! [`Outcome::ToPicker`]). With `[theme] float` off, none of them floats:
+//! each takes the terminal, wherever it could have floated.
 
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
@@ -164,15 +166,16 @@ pub(super) enum What {
 
 impl What {
     /// What floats in place of the screen `outcome` would show full screen,
-    /// if it shows one that floats — the picker only where it is asked to
-    /// (see [`picker::floats`]).
-    pub(super) fn of(outcome: Outcome) -> Option<Self> {
+    /// if it shows one that floats and they `float` (`[theme] float`).
+    pub(super) fn of(outcome: Outcome, float: bool) -> Option<Self> {
+        if !float {
+            return None;
+        }
         match outcome {
             Outcome::ShowSettings => Some(What::Settings),
             Outcome::ShowHelp => Some(What::Help),
-            Outcome::ToPicker if picker::floats() => Some(What::Picker),
-            Outcome::ToPicker
-            | Outcome::Detached
+            Outcome::ToPicker => Some(What::Picker),
+            Outcome::Detached
             | Outcome::CreateNew
             | Outcome::Resettle
             | Outcome::Switch(_)
@@ -909,23 +912,20 @@ mod tests {
         assert!(out.ends_with(&end), "{:?}", String::from_utf8_lossy(&out));
     }
 
-    /// The settings and the help float, and the picker where it is asked to,
-    /// each in place of its own screen and full screen as itself where it
-    /// cannot; nothing else floats.
+    /// The settings, the help and the picker float, each in place of its own
+    /// screen and full screen as itself where it cannot; nothing else floats.
+    /// With `[theme] float` off, none of them does.
     #[test]
     fn the_settings_the_help_and_the_picker_float_and_nothing_else() {
         for (outcome, what) in [
             (Outcome::ShowSettings, What::Settings),
             (Outcome::ShowHelp, What::Help),
+            (Outcome::ToPicker, What::Picker),
         ] {
-            assert_eq!(What::of(outcome), Some(what));
+            assert_eq!(What::of(outcome, true), Some(what));
+            assert_eq!(What::of(outcome, false), None, "{outcome:?}, off");
             assert_eq!(what.full_screen(), outcome);
         }
-        assert_eq!(
-            What::of(Outcome::ToPicker),
-            picker::floats().then_some(What::Picker)
-        );
-        assert_eq!(What::Picker.full_screen(), Outcome::ToPicker);
         for outcome in [
             Outcome::Detached,
             Outcome::CreateNew,
@@ -933,7 +933,7 @@ mod tests {
             Outcome::ChildExited,
             Outcome::StdinClosed,
         ] {
-            assert_eq!(What::of(outcome), None, "{outcome:?}");
+            assert_eq!(What::of(outcome, true), None, "{outcome:?}");
         }
     }
 

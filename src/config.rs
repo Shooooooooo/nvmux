@@ -52,8 +52,9 @@ use crate::palette::Rgb;
 
 /// The whole configuration. Each field is a table of its own, so the file reads
 /// as `[keys]`-style sections — `[keys.bind]` inside `[keys]` for the key after
-/// the prefix that runs each command, `[theme]` for the colour nvmux's own
-/// screens are drawn in, and `[effects]` with a table inside it for each
+/// the prefix that runs each command, `[theme]` for how nvmux's own screens
+/// look — the colour they are drawn in, and whether they float over a session
+/// — and `[effects]` with a table inside it for each
 /// effect: `[effects.fade]`, `[effects.move]`, `[effects.cursor]`,
 /// `[effects.attach]`, `[effects.kill]`,
 /// `[effects.filter]` and `[effects.create]` for nvmux's own screens, and
@@ -305,8 +306,10 @@ impl Ui {
     }
 }
 
-/// The colour nvmux's own screens are drawn in (see [`crate::theme`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+/// How nvmux's own screens look: the colour they are drawn in (see
+/// [`crate::theme`]), and whether the ones a key brings up over a session
+/// float over it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ThemeSettings {
     /// What nvmux draws its own screens in: the picker, the prompt, the help
@@ -329,6 +332,27 @@ pub struct ThemeSettings {
     /// this from. And `NO_COLOR` keeps every screen in the terminal's own
     /// colours, whatever this says.
     pub color: ThemeColor,
+    /// Whether the picker (`<prefix> Space`), the settings (`<prefix> ,`)
+    /// and the help (`<prefix> ?`) float over the session they are brought
+    /// up from, in a panel in the middle of it, the session going on behind
+    /// them dimmed (see `crate::pty::panel`).
+    ///
+    /// On, the default. Off, each takes the whole terminal, the session
+    /// dissolving out under it and back in after, as the picker always did.
+    /// The picker's own `?` and `,` follow the picker: over the session in
+    /// its place where it floats, and on the terminal it has where it does
+    /// not. On a terminal too small for a panel and some of the session round
+    /// it, one that would float takes the terminal too.
+    pub float: bool,
+}
+
+impl Default for ThemeSettings {
+    fn default() -> Self {
+        Self {
+            color: ThemeColor::Terminal,
+            float: true,
+        }
+    }
 }
 
 /// `[theme] color`: whose colour nvmux's own screens are drawn in.
@@ -1204,7 +1228,8 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          # smart_width  = {smart_width:<8}   # or as many as what it shows wants: its 'textwidth', its long lines\n\
          \n\
          [theme]\n\
-         # color = {theme_color}   # or \"#rrggbb\": nvmux's text and bars in that colour\n\
+         # color = {theme_color:<10}   # or \"#rrggbb\": nvmux's text and bars in that colour\n\
+         # float = {theme_float:<10}   # the picker, settings and help over the session; false takes the screen\n\
          \n\
          [effects]\n\
          # enabled = {effects_enabled}   # master switch: false turns every effect below off\n\
@@ -1259,6 +1284,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
         window_width = c.window_width,
         smart_width = c.smart_width,
         theme_color = quoted(&t.color.name()),
+        theme_float = t.float,
         fade_enabled = f.enabled,
         fade_duration = f.duration_ms,
         fade_session = f.session,
@@ -2035,6 +2061,7 @@ mod tests {
             predict = true\n\
             [theme]\n\
             color = \"terminal\"\n\
+            float = true\n\
             [effects]\n\
             enabled = true\n\
             [effects.fade]\n\
@@ -2279,6 +2306,23 @@ mod tests {
         }
         let s: Settings = toml::from_str("[theme]\ncolor = \"terminal\"\n").expect("valid");
         assert_eq!(s, Settings::default(), "the default, said out loud");
+    }
+
+    /// The picker, the settings and the help float over the session unless
+    /// told otherwise; full screen is a line away, and leaves the colour as it
+    /// was.
+    #[test]
+    fn the_screens_float_over_the_session_unless_told() {
+        assert!(Settings::default().theme.float);
+        let s: Settings = toml::from_str("[theme]\nfloat = false\n").expect("valid");
+        assert!(!s.theme.float);
+        assert_eq!(s.theme.color, ThemeColor::Terminal, "the colour as it was");
+        let s: Settings = toml::from_str("[theme]\nfloat = true\n").expect("valid");
+        assert_eq!(s, Settings::default(), "the default, said out loud");
+        assert!(
+            toml::from_str::<Settings>("[theme]\nfloat = \"yes\"\n").is_err(),
+            "a switch is true or false"
+        );
     }
 
     /// A colour that is not one is refused with the key it was in and the
@@ -2694,6 +2738,7 @@ mod tests {
             "# window_width = 120",
             "# smart_width  = true",
             "# color = \"terminal\"",
+            "# float = true ",
             "# enabled     = true",
             "# duration_ms = 200",
             "# session     = true",

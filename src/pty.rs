@@ -166,20 +166,23 @@ const WAITING: &str = " — press a key";
 /// How the relay ended. The attachment is handed back separately by [`relay`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// `<prefix> Space` — show the picker. The child keeps running.
+    /// `<prefix> Space` with `[theme] float` off, on a terminal too small for
+    /// the picker to float over the session, or for a session nvmux keeps no
+    /// copy of; or a rename from the picker floating: show the picker full
+    /// screen. The child keeps running.
     ToPicker,
     /// `<prefix> d` — detach and exit, leaving the session running.
     Detached,
     /// `<prefix> c` — prompt for a name and create a new session. The child keeps
     /// running, so a cancelled prompt puts the user straight back.
     CreateNew,
-    /// `<prefix> ?` on a terminal too small for the help to float over the
-    /// session, or a session nvmux keeps no copy of: show the key bindings
-    /// full screen. The child keeps running.
+    /// `<prefix> ?` with `[theme] float` off, on a terminal too small for the
+    /// help to float over the session, or a session nvmux keeps no copy of:
+    /// show the key bindings full screen. The child keeps running.
     ShowHelp,
-    /// `<prefix> ,` on a terminal too small for the settings to float over
-    /// the session, or a session nvmux keeps no copy of: show them full
-    /// screen. The child keeps running.
+    /// `<prefix> ,` with `[theme] float` off, on a terminal too small for the
+    /// settings to float over the session, or a session nvmux keeps no copy
+    /// of: show them full screen. The child keeps running.
     ShowSettings,
     /// The settings over the session changed which client draws a session
     /// (`client.ui`), or whether clients are kept (`client.per_session`):
@@ -3757,11 +3760,14 @@ fn pump(
                     // into a /tmp file that outlives the session.
                     for step in prefix.feed(&buf[..len]) {
                         if let Some(outcome) = take_step(attachment, step)? {
-                            // `<prefix> ,` or `<prefix> ?`: the settings or the
-                            // help, over the session, and back to it once they
-                            // are taken down — unless they cannot float, or
-                            // what the settings changed needs the session loop.
-                            let outcome = match panel::What::of(outcome) {
+                            // `<prefix> ,`, `<prefix> ?` or `<prefix> Space`:
+                            // the settings, the help or the picker, over the
+                            // session, and back to it once they are taken down —
+                            // unless they cannot float or are not to
+                            // (`[theme] float`), or where they lead needs the
+                            // session loop.
+                            let float = config::get().theme.float;
+                            let outcome = match panel::What::of(outcome, float) {
                                 Some(what) => {
                                     match panel::float(attachment, master_fd, winch, what)? {
                                         Some(outcome) => outcome,

@@ -21,15 +21,9 @@
 //! # What it does not do floating
 //!
 //! A rename asks for the name on a screen of its own: the panel goes, and the
-//! picker comes up full screen, as `<prefix> Space` used to bring it
-//! ([`Leave::Picker`]). On a terminal with no room for the panel and the
-//! session round it, `<prefix> Space` has the picker full screen too.
-//!
-//! # A prototype
-//!
-//! It floats only with `NVMUX_FLOAT_PICKER=1` in nvmux's environment
-//! ([`floats`]); otherwise `<prefix> Space` brings the picker full screen, as
-//! it always has.
+//! picker comes up full screen, as `<prefix> Space` brings it with `[theme]
+//! float` off ([`Leave::Picker`]). On a terminal with no room for the panel
+//! and the session round it, `<prefix> Space` has the picker full screen too.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -99,13 +93,6 @@ static CHANGED: Mutex<Option<Vec<Session>>> = Mutex::new(None);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Whether `<prefix> Space` floats the picker over the session: with
-/// `NVMUX_FLOAT_PICKER=1` in nvmux's environment, read once.
-pub fn floats() -> bool {
-    static FLOATS: OnceLock<bool> = OnceLock::new();
-    *FLOATS.get_or_init(|| std::env::var_os("NVMUX_FLOAT_PICKER").is_some_and(|v| v == "1"))
 }
 
 /// Lend the panel the transport, once, as nvmux starts.
