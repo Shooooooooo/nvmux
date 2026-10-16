@@ -25,18 +25,20 @@
 //!
 //! Two readers of this direction. The shadow grid ([`crate::shadow`]) is
 //! shown a *copy* and can neither alter a write nor make one depend on what it
-//! saw; it exists for the fade, and is off with it. The boundary
-//! ([`crate::boundary`]) is shown the bytes as they go and keeps back the few
-//! at the end of a write that would leave the terminal's parser inside a
-//! sequence — a delay of microseconds, until the client writes the rest of
-//! them, and only while there is a notice or a hint bar on screen to protect.
+//! saw; it exists for the fade, and with the fade off a copy of the same kind
+//! stands in for it (see below). The boundary ([`crate::boundary`]) is shown
+//! the bytes as they go and keeps back the few at the end of a write that
+//! would leave the terminal's parser inside a sequence — a delay of
+//! microseconds, until the client writes the rest of them, and only while
+//! there is a notice, a hint bar or the settings on screen to protect.
 //!
-//! A kept client (`[client] per_session`, the default) is watched by two more,
-//! each shown a copy as the shadow is. Its ledger ([`crate::ledger`]) notes
-//! what the client told the terminal, so that it can be told again — the
-//! client's own sequences, replayed, never rewritten — when the client comes
-//! back to the front (see [`Attachment::put_back_what_it_told`]). And, with
-//! the fade off, a copy of its screen stands in for the shadow.
+//! A kept client (`[client] per_session`, the default) is watched by one more,
+//! shown a copy as the shadow is: its ledger ([`crate::ledger`]) notes what
+//! the client told the terminal, so that it can be told again — the client's
+//! own sequences, replayed, never rewritten — when the client comes back to
+//! the front (see [`Attachment::put_back_what_it_told`]). And with the fade
+//! off, every client's own copy of its screen stands in for the shadow: for a
+//! kept client to come back with, and for the settings to float over.
 //!
 //! The direction is also *held* once per relay: with the fade on, a session's
 //! first paint is kept back from the terminal until it has settled, so the
@@ -77,6 +79,10 @@
 //! And a kept client's screen, painted back from its copy as the client
 //! returns to the front with no fade to dissolve it in (see
 //! [`Attachment::paint_kept_screen`]).
+//! And the settings, floating over the session ([`panel`]): while they are
+//! up the client's bytes are held, a frame at a time, and go to the terminal
+//! at the front of the frame that paints the session dimmed under them again
+//! — every byte, in order, in one synchronized update with it.
 //!
 //! None of them is ever fed back to the shadow. All four are nvmux's own
 //! picture of the screen rather than the session's bytes, and the notice's
@@ -111,6 +117,8 @@ use crate::ledger::Ledger;
 use crate::term::write_stdout;
 use crate::{announce, boundary, card, config, fade, hint, keyseq, rpc, shadow, term, winch};
 
+mod panel;
+
 /// Neovim aborts on the seventeenth attached UI rather than returning an error
 /// (`src/nvim/ui.c`: `if (ui_count == MAX_UI_COUNT) { abort(); }`), which would
 /// SIGABRT the whole server and destroy the session. Refuse well before that.
@@ -141,8 +149,15 @@ pub enum Outcome {
     CreateNew,
     /// `<prefix> ?` — show the key bindings. The child keeps running.
     ShowHelp,
-    /// `<prefix> ,` — show the settings. The child keeps running.
+    /// `<prefix> ,` on a terminal too small for the settings to float over
+    /// the session, or a session nvmux keeps no copy of: show them full
+    /// screen. The child keeps running.
     ShowSettings,
+    /// The settings over the session changed which client draws a session
+    /// (`client.ui`), or whether clients are kept (`client.per_session`):
+    /// the session loop settles that, and attaches again. The child keeps
+    /// running.
+    Resettle,
     /// `<prefix> <number>`, `<prefix> n` or `<prefix> p` — attach to the session
     /// this names. The child keeps running, so a switch that names nothing puts
     /// the user straight back.
@@ -162,7 +177,8 @@ impl Outcome {
     ///
     /// Only a switch does — by number or by step. `ToPicker`, `CreateNew`,
     /// `ShowHelp` and `ShowSettings` all open a screen, and a screen clears as
-    /// it opens; the rest end the relay for good.
+    /// it opens; `Resettle` comes back to the session by the session loop;
+    /// the rest end the relay for good.
     fn leads_straight_into_another_relay(self) -> bool {
         matches!(self, Outcome::Switch(_))
     }
@@ -184,6 +200,7 @@ impl Outcome {
             | Outcome::CreateNew
             | Outcome::ShowHelp
             | Outcome::ShowSettings
+            | Outcome::Resettle
             | Outcome::ChildExited
             | Outcome::StdinClosed => None,
         }
@@ -240,15 +257,16 @@ pub struct Attachment {
     reaped: bool,
     /// The session's screen as its bytes have described it, kept so the
     /// session can be dissolved in and out (see [`crate::shadow`]). `None`
-    /// with the fade off or `effects.fade.session` false, and then nothing is parsed
-    /// unless the client is kept, which parses into `screen` instead.
+    /// with the fade off or `effects.fade.session` false, and then the client
+    /// parses into `screen` instead.
     shadow: Option<shadow::Shadow>,
-    /// A kept client's copy of its screen, where there is no shadow to be one:
+    /// The client's copy of its screen, where there is no shadow to be one:
     /// fed exactly as the shadow is, by [`Attachment::shadow_saw`], and used
-    /// for one thing only — to put the screen back the moment the client
+    /// for two things — to put a kept client's screen back the moment it
     /// returns to the front (see [`Attachment::paint_kept_screen`]), where
-    /// the shadow would have dissolved it in. `None` whenever there is a
-    /// shadow, or the client is not kept.
+    /// the shadow would have dissolved it in; and to draw the session behind
+    /// the settings when they float over it (see [`panel`]). `None` whenever
+    /// there is a shadow.
     screen: Option<shadow::Shadow>,
     /// The first paint, while it is being kept back from the terminal so it
     /// can dissolve in. `None` once released, and always without a shadow.
@@ -1434,6 +1452,12 @@ impl Attachment {
         Ok(())
     }
 
+    /// The session's screen as nvmux keeps it: the shadow, or where there is
+    /// none the client's own copy (see [`Attachment::screen`]).
+    fn copy(&mut self) -> Option<&mut shadow::Shadow> {
+        self.shadow.as_mut().or(self.screen.as_mut())
+    }
+
     /// Whether the shadow has a glyph anywhere yet — what a lull needs before
     /// it counts as the first paint being over.
     fn drawn(&self) -> bool {
@@ -1634,6 +1658,11 @@ impl Attachment {
     /// repaint up, the user is looking at the session rather than at a blank
     /// screen.
     fn paint_kept_screen(&mut self) -> bool {
+        // A client that was not kept was not read while it was away, and its
+        // copy is of a screen it has drawn over since.
+        if !self.is_kept() {
+            return false;
+        }
         let Some(screen) = self
             .screen
             .as_ref()
@@ -2888,9 +2917,10 @@ fn spawn_client_with(
         resumed: false,
         reaped: false,
         // Only when it will be used: a shadow costs a parse of everything the
-        // client writes.
+        // client writes. One or the other is always there, for the settings
+        // to float over (see `panel`).
         shadow,
-        screen: (kept && !fades).then(|| shadow::Shadow::new(size.rows, size.cols)),
+        screen: (!fades).then(|| shadow::Shadow::new(size.rows, size.cols)),
         hold: None,
         // Set by `relay`, which knows whether there is a notice to write.
         boundary: None,
@@ -3246,6 +3276,7 @@ pub fn relay(
             | Outcome::CreateNew
             | Outcome::ShowHelp
             | Outcome::ShowSettings
+            | Outcome::Resettle
             | Outcome::Switch(_)),
         ) => {
             // Dissolve the session out first: before the modes go back, so a
@@ -3347,9 +3378,9 @@ fn pump(
     mut erasing: Option<Erasing>,
 ) -> Result<Outcome> {
     let stdin_fd = std::io::stdin().as_raw_fd();
-    let keys = crate::config::get().keys;
+    let mut keys = crate::config::get().keys;
     let mut prefix = Prefix::with_keys(highest_session_num, keys.prefix, keys.bind);
-    let prefix_timeout = Duration::from_millis(keys.timeout_ms);
+    let mut prefix_timeout = Duration::from_millis(keys.timeout_ms);
     // When a pending prefix, half-typed number or cut-off escape sequence must
     // be settled. An instant rather than a per-poll timeout on purpose: a child
     // that keeps producing output keeps `poll` returning early, and a timeout
@@ -3651,10 +3682,28 @@ fn pump(
                     }
                 }
                 Ok(len) => {
+                    // Whether the settings floated over the session and went,
+                    // which may have changed the keys this relay runs on.
+                    let mut floated = false;
                     // Deliberately NOT logged: every keystroke the user types,
                     // into a /tmp file that outlives the session.
                     for step in prefix.feed(&buf[..len]) {
                         if let Some(outcome) = take_step(attachment, step)? {
+                            // `<prefix> ,`: the settings, over the session, and
+                            // back to it once they are taken down — unless they
+                            // cannot float, or what they changed needs the
+                            // session loop.
+                            let outcome = if outcome == Outcome::ShowSettings {
+                                match panel::float(attachment, master_fd, winch)? {
+                                    Some(outcome) => outcome,
+                                    None => {
+                                        floated = true;
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                outcome
+                            };
                             // With settings unsaved, a detach asks first; what
                             // else was typed in the same read goes with the key.
                             if outcome == Outcome::Detached {
@@ -3673,6 +3722,12 @@ fn pump(
                             }
                             return Ok(outcome);
                         }
+                    }
+                    if floated {
+                        keys = crate::config::get().keys;
+                        prefix = Prefix::with_keys(highest_session_num, keys.prefix, keys.bind);
+                        prefix_timeout = Duration::from_millis(keys.timeout_ms);
+                        bar = hint::Bar::new(Instant::now(), term::terminal_size(), keys.bind);
                     }
                     // Every keystroke restarts the clock, so a number typed at
                     // a human pace is one number.
@@ -5257,6 +5312,7 @@ mod tests {
             Outcome::CreateNew,
             Outcome::ShowHelp,
             Outcome::ShowSettings,
+            Outcome::Resettle,
             Outcome::Detached,
             Outcome::ChildExited,
             Outcome::StdinClosed,
@@ -5284,13 +5340,14 @@ mod tests {
             Outcome::CreateNew,
             Outcome::ShowHelp,
             Outcome::ShowSettings,
+            Outcome::Resettle,
             Outcome::Detached,
             Outcome::ChildExited,
             Outcome::StdinClosed,
         ] {
             assert!(
                 !other.leads_straight_into_another_relay(),
-                "{other:?} either opens a screen or ends the relay"
+                "{other:?} opens a screen, goes back by the session loop, or ends the relay"
             );
         }
     }

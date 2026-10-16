@@ -2,8 +2,13 @@
 //! `<prefix> ,` in a session: every setting the file has, a tab a table,
 //! changed on the spot.
 //!
-//! It takes the terminal the way the help screen does ([`super::help`]), and
-//! hands the same client back afterwards. Its rows are
+//! From the picker it takes the terminal the way the help screen does
+//! ([`super::help`]). From a session it floats over the session instead, in a
+//! panel the relay draws and gives its keys to ([`Panel`], and see
+//! `crate::pty::panel`), and the session goes on behind it — unless the
+//! terminal is too small for a panel ([`panel_area`]), where it takes the
+//! terminal as from the picker and hands the same client back afterwards.
+//! Either way the screen is the same: its rows are
 //! [`crate::settings`]' — one per setting, so the screen cannot leave one out
 //! — and every change it makes is applied as it is made ([`config::apply`]):
 //! the theme shows on the screen itself on the next frame, the picker's
@@ -36,6 +41,7 @@
 //! ends. A click on a tab opens it. A click ends an edit without keeping it, as
 //! `Esc` does, and the wheel does not. Nothing is dragged.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -869,30 +875,7 @@ pub(super) fn run_on(
             },
             _ => continue,
         };
-        armed_until = state.armed.then(|| {
-            armed_until.unwrap_or_else(|| {
-                Instant::now() + Duration::from_millis(state.live.keys.timeout_ms)
-            })
-        });
-
-        // What the key changed, nvmux runs on from now: the next frame
-        // already shows a new theme.
-        let running = config::get();
-        if state.live != *running {
-            if let Err(why) = runnable(&state.live, &running, remote)
-                .and_then(|()| config::apply(state.live.clone()))
-            {
-                state.refused(why, (*running).clone());
-            }
-        }
-
-        if step == Step::Save {
-            let result = config::save(&state.live, &state.saved, state.overwrite());
-            if result.is_ok() {
-                config::set_saved(state.live.clone());
-            }
-            state.report_save(result);
-        }
+        follow(&mut state, step, remote, &mut armed_until, Instant::now());
 
         if step == Step::Close {
             state.remember();
@@ -901,6 +884,197 @@ pub(super) fn run_on(
             }
             return Ok(());
         }
+    }
+}
+
+/// What follows every key or gesture, wherever the screen is up: the
+/// prefix's wait clocked from the key that armed it, what was changed run on
+/// from now — the next frame already shows a new theme — and `w`'s save made.
+fn follow(
+    state: &mut State,
+    step: Step,
+    remote: bool,
+    armed_until: &mut Option<Instant>,
+    now: Instant,
+) {
+    *armed_until = state.armed.then(|| {
+        armed_until.unwrap_or_else(|| now + Duration::from_millis(state.live.keys.timeout_ms))
+    });
+    let running = config::get();
+    if state.live != *running {
+        if let Err(why) =
+            runnable(&state.live, &running, remote).and_then(|()| config::apply(state.live.clone()))
+        {
+            state.refused(why, (*running).clone());
+        }
+    }
+    if step == Step::Save {
+        let result = config::save(&state.live, &state.saved, state.overwrite());
+        if result.is_ok() {
+            config::set_saved(state.live.clone());
+        }
+        state.report_save(result);
+    }
+}
+
+/// Whether the sessions are another machine's, where Neovim's own client
+/// takes an `nvim` on this one: what [`Panel`] checks a change of
+/// `client.ui` against, as `run` is told it.
+static REMOTE: AtomicBool = AtomicBool::new(false);
+
+/// Say once, as nvmux starts, whether the sessions are another machine's —
+/// what the settings floating over a session check a change of `client.ui`
+/// against, being opened by the relay rather than by `main`.
+pub fn sessions_are_remote(remote: bool) {
+    REMOTE.store(remote, Ordering::Relaxed);
+}
+
+/// The widest and the tallest the settings are when they float over a
+/// session: room for every row of the longest section, and for the longest
+/// help.
+const PANEL_WIDTH: u16 = 72;
+const PANEL_HEIGHT: u16 = 23;
+
+/// How much of the session is left showing round the settings, at the least:
+/// columns either side together, and rows above and below.
+const PANEL_SIDES: u16 = 16;
+const PANEL_ENDS: u16 = 6;
+
+/// The smallest screen the settings float on: under this, there is no room
+/// for the rows and a session round them, and they take the screen instead.
+const FLOAT_COLS: u16 = 72;
+const FLOAT_ROWS: u16 = 20;
+
+/// Where the settings float over a session on `screen`: in the middle,
+/// [`PANEL_WIDTH`] by [`PANEL_HEIGHT`] where there is room for that and the
+/// session round it, and smaller where there is not; nowhere on a screen
+/// under [`FLOAT_COLS`] by [`FLOAT_ROWS`], which has them full screen.
+pub fn panel_area(screen: Rect) -> Option<Rect> {
+    if screen.width < FLOAT_COLS || screen.height < FLOAT_ROWS {
+        return None;
+    }
+    let width = PANEL_WIDTH.min(screen.width - PANEL_SIDES);
+    let height = PANEL_HEIGHT.min(screen.height - PANEL_ENDS);
+    Some(Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    ))
+}
+
+/// Where the screen's parts go in the panel: all of it but a column either
+/// side and the row at the bottom, which keep its text off the session's.
+fn inside(panel: Rect) -> Rect {
+    Rect::new(
+        panel.x + 1,
+        panel.y,
+        panel.width.saturating_sub(2),
+        panel.height.saturating_sub(1),
+    )
+}
+
+/// What a key or a gesture on the settings over a session leaves for the
+/// relay to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Did {
+    Stay,
+    /// `Esc`, `q` or `<prefix> ,`: take the settings down.
+    Close,
+}
+
+/// The settings floating over a session (see `crate::pty::panel`): the
+/// screen's state, given its keys and the mouse by the relay — which reads
+/// the terminal, the screen being drawn over a session that has it — and
+/// drawn into whatever area the relay gives it. The rules are the screen's
+/// own, every one: what changes is where it is drawn.
+#[derive(Debug)]
+pub struct Panel {
+    state: State,
+    remote: bool,
+    /// When the prefix's wait runs out, while it is armed (see `run_on`).
+    armed_until: Option<Instant>,
+    /// Where the screen's parts were last drawn, which a click is resolved
+    /// against: the one the user clicked on.
+    drawn: Rect,
+}
+
+impl Panel {
+    /// The settings as nvmux has them now, on the section and row they were
+    /// last left on.
+    pub fn open() -> Self {
+        Self {
+            state: State::open(),
+            remote: REMOTE.load(Ordering::Relaxed),
+            armed_until: None,
+            drawn: Rect::default(),
+        }
+    }
+
+    /// A key, as the terminal reported it. Releases are no keys.
+    pub fn on_key(&mut self, key: KeyEvent, now: Instant) -> Did {
+        if key.kind == KeyEventKind::Release {
+            return Did::Stay;
+        }
+        let step = self.state.on_key(press(key));
+        self.after(step, now)
+    }
+
+    /// A mouse report, by the screen's rules; where it is was the relay's to
+    /// say, and a press outside the panel is the relay's too.
+    pub fn on_mouse(&mut self, mouse: MouseEvent, now: Instant) -> Did {
+        let at = hit(&self.state, self.drawn, mouse.column, mouse.row);
+        let Some(g) = gesture(mouse, at) else {
+            return Did::Stay;
+        };
+        let step = self.state.on_mouse(g);
+        self.after(step, now)
+    }
+
+    fn after(&mut self, step: Step, now: Instant) -> Did {
+        follow(
+            &mut self.state,
+            step,
+            self.remote,
+            &mut self.armed_until,
+            now,
+        );
+        if step == Step::Close {
+            Did::Close
+        } else {
+            Did::Stay
+        }
+    }
+
+    /// When the prefix's wait runs out, if it is armed.
+    pub fn wake_at(&self) -> Option<Instant> {
+        self.armed_until
+    }
+
+    /// The prefix's wait ran out with no key after it, if it has by `now`:
+    /// whether that changed anything.
+    pub fn tick(&mut self, now: Instant) -> bool {
+        if self.armed_until.is_some_and(|until| now >= until) {
+            self.armed_until = None;
+            self.state.disarm();
+            return true;
+        }
+        false
+    }
+
+    /// The settings drawn into `area`, a buffer of that area, in the theme's
+    /// colour where it has one.
+    pub fn draw(&mut self, area: Rect) -> Buffer {
+        let mut buf = Buffer::empty(area);
+        self.drawn = inside(area);
+        draw_on(&mut buf, self.drawn, &self.state);
+        crate::theme::paint(&mut buf);
+        buf
+    }
+
+    /// Keep where the settings are for the next time they open.
+    pub fn close(&self) {
+        self.state.remember();
     }
 }
 
@@ -1072,12 +1246,17 @@ fn hit(state: &State, area: Rect, column: u16, row: u16) -> Option<Hit> {
 
 fn draw(frame: &mut Frame, state: &State) {
     let area = frame.area();
+    draw_on(frame.buffer_mut(), area, state);
+}
+
+/// The screen, drawn on `area` of `buf`: the whole of the terminal, or the
+/// inside of the panel floating over a session.
+fn draw_on(buf: &mut Buffer, area: Rect, state: &State) {
     let Some(l) = layout(area) else {
         return;
     };
     let current = state.current();
     {
-        let buf = frame.buffer_mut();
         if let Some(y) = l.tabs {
             match &state.find {
                 Some(find) => centred(
@@ -1100,7 +1279,17 @@ fn draw(frame: &mut Frame, state: &State) {
         }
     }
     let (text, dim) = hints(state, current, usize::from(area.width.saturating_sub(2)));
-    draw::draw_hint_row(frame, l.hint, &text, dim);
+    hint_row(buf, l.hint, &text, dim);
+}
+
+/// The hint row as every screen draws it (see [`draw::draw_hint_row`]):
+/// centred, cut rather than wrapped, and dim when it is hints rather than
+/// something being said.
+fn hint_row(buf: &mut Buffer, row: Rect, text: &str, dim: bool) {
+    let text = draw::truncate(text, usize::from(row.width));
+    let style = if dim { DIM } else { Style::new() };
+    let x = row.x + row.width.saturating_sub(text.width() as u16) / 2;
+    buf.set_stringn(x, row.y, &text, usize::from(row.width), style);
 }
 
 /// `text` centred on row `y`, cut to the screen with a `…` where it is cut.
@@ -2105,5 +2294,107 @@ mod tests {
         to(&mut s, "smear");
         key(&mut s, KeyCode::Right);
         test_support::assert_no_colour(80, 24, |f| draw(f, &s));
+    }
+
+    /// The settings float in the middle, at most 72 by 23 and leaving at
+    /// least eight columns either side and three rows above and below; on a
+    /// screen under 72 by 20 they do not float at all.
+    #[test]
+    fn the_panel_floats_in_the_middle_with_the_session_round_it() {
+        let screen = |w, h| Rect::new(0, 0, w, h);
+        assert_eq!(panel_area(screen(120, 36)), Some(Rect::new(24, 6, 72, 23)));
+        assert_eq!(panel_area(screen(80, 24)), Some(Rect::new(8, 3, 64, 18)));
+        assert_eq!(panel_area(screen(200, 60)), Some(Rect::new(64, 18, 72, 23)));
+        assert_eq!(panel_area(screen(72, 20)), Some(Rect::new(8, 3, 56, 14)));
+        assert_eq!(panel_area(screen(71, 40)), None, "too narrow");
+        assert_eq!(panel_area(screen(120, 19)), None, "too short");
+    }
+
+    /// The text of a buffer's rows, as the screen tests read a frame.
+    fn rows_of(buf: &Buffer) -> Vec<String> {
+        let area = buf.area;
+        (area.y..area.y + area.height)
+            .map(|y| {
+                (area.x..area.x + area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Drawn into its area, the panel is the screen with a column clear
+    /// either side and its last row clear: the sections on its second row,
+    /// the hints on the row above the last.
+    #[test]
+    fn the_panel_is_the_screen_inside_a_margin() {
+        let mut panel = Panel::open();
+        let area = Rect::new(8, 3, 64, 18);
+        let buf = panel.draw(area);
+        assert_eq!(buf.area, area);
+        let rows = rows_of(&buf);
+        assert_eq!(rows.len(), 18);
+        assert!(rows[0].is_empty(), "a clear row over the sections");
+        assert!(
+            rows[1].contains("keys") && rows[1].contains("effects"),
+            "{rows:?}"
+        );
+        assert!(rows[16].contains("esc"), "the hints: {rows:?}");
+        assert!(rows[17].is_empty(), "a clear row under them");
+        for y in area.y..area.y + area.height {
+            assert_eq!(buf[(area.x, y)].symbol(), " ", "the left margin");
+            assert_eq!(buf[(area.x + area.width - 1, y)].symbol(), " ", "the right");
+        }
+    }
+
+    /// The panel's keys are the screen's: Tab moves on a section, a release
+    /// is no key, and Esc closes.
+    #[test]
+    fn the_panel_takes_the_screens_keys() {
+        let now = Instant::now();
+        let mut panel = Panel::open();
+        let was = panel.state.tab;
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(panel.on_key(tab, now), Did::Stay);
+        assert_ne!(panel.state.tab, was);
+        let released =
+            KeyEvent::new_with_kind(KeyCode::Tab, KeyModifiers::NONE, KeyEventKind::Release);
+        let turned = panel.state.tab;
+        assert_eq!(panel.on_key(released, now), Did::Stay);
+        assert_eq!(panel.state.tab, turned, "a release moves nothing");
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(panel.on_key(esc, now), Did::Close);
+    }
+
+    /// A click lands on what the panel drew there, and the prefix's wait runs
+    /// out on its own clock.
+    #[test]
+    fn the_panel_answers_the_mouse_where_it_drew_and_its_prefix_times_out() {
+        let now = Instant::now();
+        let mut panel = Panel::open();
+        panel.state.tab = Tab::Effects;
+        panel.state.selected = 0;
+        let area = Rect::new(8, 3, 64, 18);
+        let buf = panel.draw(area);
+        let rows = rows_of(&buf);
+        let y = rows
+            .iter()
+            .position(|r| r.contains("smear"))
+            .expect("smear is drawn") as u16;
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 20,
+            row: area.y + y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(panel.on_mouse(click, now), Did::Stay);
+        assert_eq!(panel.state.current().map(|s| s.name), Some("smear"));
+        let prefix = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL);
+        panel.on_key(prefix, now);
+        let until = panel.wake_at().expect("armed");
+        assert!(!panel.tick(until - Duration::from_millis(1)));
+        assert!(panel.tick(until));
+        assert_eq!(panel.wake_at(), None);
     }
 }

@@ -99,7 +99,7 @@ under `[keys.bind]` — `detach = "x"` makes it `<prefix> x` — as
 | `new` | `<prefix>` `c` | set up a new session and attach to it — `Esc` goes back |
 | `go` | `<prefix>` `Enter` | go where the newest note in the margin is about: its session, or a terminal of this one |
 | `help` | `<prefix>` `?` | show these keys, as you have them — `Esc` goes back |
-| `settings` | `<prefix>` `,` | change nvmux's settings while it runs — `Esc` goes back |
+| `settings` | `<prefix>` `,` | change nvmux's settings while it runs, over the session — `Esc` goes back |
 
 Two keys after the prefix are not commands, and stay where they are: a number
 — `<prefix> 1`, `<prefix> 12` — switches straight to that session, and
@@ -220,13 +220,16 @@ else `$XDG_CONFIG_HOME/nvmux/config.toml`, else `~/.config/nvmux/config.toml` �
 overrides the defaults below; an unknown key or a bad value is a startup error.
 The first run asks for a prefix and writes that file; `Esc` skips.
 
-Or change them while nvmux runs: `,` in the picker, or `<prefix> ,` in a
-session, opens every setting on a screen of its own, a tab for each table. A
-change applies at once — the colour to that screen itself, the rest as each
-is next used — and stays unsaved, marked `•`, until `w` writes it into the
-file: only what changed, where the file has it, comments and all, with a
-setting put back to its default commented back out. Quitting the picker or
-detaching with changes unsaved asks first.
+Or change them while nvmux runs: `,` in the picker opens every setting on a
+screen of its own, a tab for each table, and `<prefix> ,` in a session opens
+the same in a panel over the session, which dims behind it — further the
+nearer it is, as around a note in the margin. A change applies at once — the
+colour to the settings themselves, what the editor shows behind the panel as
+you make it, the rest as each is next used — and stays unsaved, marked `•`,
+until `w` writes it into the file: only what changed, where the file has it,
+comments and all, with a setting put back to its default commented back out.
+Quitting the picker or detaching with changes unsaved asks first. On a
+terminal under 72 columns or 20 rows, the panel takes the screen instead.
 
 <details>
 <summary>Every setting, at its default</summary>

@@ -166,6 +166,8 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
     // `settle`).
     let mut clients = config::get().client;
     let remote = matches!(transport.location(), transport::Location::Ssh(_));
+    // For the settings when they float over a session, which the relay opens.
+    ui::settings::sessions_are_remote(remote);
     let mut message: Option<String> = None;
     // The session the last trip through the picker led to, so the next one
     // opens with the cursor on it rather than on the first row.
@@ -445,6 +447,7 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 pty::Outcome::CreateNew
                 | pty::Outcome::ShowHelp
                 | pty::Outcome::ShowSettings
+                | pty::Outcome::Resettle
                 | pty::Outcome::Switch(_) => {
                     nvmux::notes::later(sock, nvmux::notes::seen);
                 }
@@ -515,6 +518,14 @@ fn session_loop(transport: &dyn transport::Transport) -> Result<()> {
                 (pty::Outcome::ShowSettings, held) => {
                     attached = pool.set_aside(held);
                     ui::settings::run(remote)?;
+                    settle(&mut clients, &mut attached, &mut pool);
+                    continue;
+                }
+                // The settings floated over the session and changed what kind
+                // of client draws it, or whether clients are kept: settled
+                // here, and the session attached again.
+                (pty::Outcome::Resettle, held) => {
+                    attached = pool.set_aside(held);
                     settle(&mut clients, &mut attached, &mut pool);
                     continue;
                 }
