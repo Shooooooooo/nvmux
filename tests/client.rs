@@ -739,11 +739,18 @@ fn slow_link(dir: &Path, to: &Path, delay: Duration) -> PathBuf {
     counted_link(dir, to, delay).0
 }
 
-/// [`slow_link`], and a count of the bytes it has carried back from `to`.
-fn counted_link(dir: &Path, to: &Path, delay: Duration) -> (PathBuf, Arc<AtomicUsize>) {
+/// [`slow_link`], and what it carries (see [`Link`]).
+fn counted_link(dir: &Path, to: &Path, delay: Duration) -> (PathBuf, Link) {
     use std::os::unix::net::{UnixListener, UnixStream};
-    /// One direction: read as it comes, written `delay` after.
-    fn carry(mut from: UnixStream, mut to: UnixStream, delay: Duration, count: Arc<AtomicUsize>) {
+    /// One direction of connection `conn`, back from `to` or not: read as it
+    /// comes, written `delay` after.
+    fn carry(
+        mut from: UnixStream,
+        mut to: UnixStream,
+        count: Arc<AtomicUsize>,
+        (trace, conn, back): (Trace, usize, bool),
+    ) {
+        let delay = trace.delay;
         let (tx, rx) = mpsc::channel::<(Instant, Vec<u8>)>();
         std::thread::spawn(move || {
             let mut buf = vec![0u8; 64 * 1024];
@@ -763,6 +770,13 @@ fn counted_link(dir: &Path, to: &Path, delay: Duration) -> (PathBuf, Arc<AtomicU
                 if to.write_all(&bytes).is_err() {
                     return;
                 }
+                trace.carried.lock().expect("the trace").push(Carried {
+                    conn,
+                    back,
+                    read: at - delay,
+                    written: Instant::now(),
+                    bytes,
+                });
             }
             let _ = to.shutdown(std::net::Shutdown::Write);
         });
@@ -771,21 +785,114 @@ fn counted_link(dir: &Path, to: &Path, delay: Duration) -> (PathBuf, Arc<AtomicU
     let path = dir.join("slow.sock");
     let listener = UnixListener::bind(&path).expect("bind the slow link");
     let to = to.to_path_buf();
-    let back = Arc::new(AtomicUsize::new(0));
-    let count = Arc::clone(&back);
+    let link = Link {
+        back: Arc::new(AtomicUsize::new(0)),
+        trace: Trace {
+            delay,
+            carried: Arc::default(),
+        },
+    };
+    let (count, trace) = (Arc::clone(&link.back), link.trace.clone());
     std::thread::spawn(move || {
-        for near in listener.incoming() {
+        for (conn, near) in listener.incoming().enumerate() {
             let (Ok(near), Ok(far)) = (near, UnixStream::connect(&to)) else {
                 return;
             };
             let (Ok(near2), Ok(far2)) = (near.try_clone(), far.try_clone()) else {
                 return;
             };
-            carry(near, far, delay, Arc::new(AtomicUsize::new(0)));
-            carry(far2, near2, delay, Arc::clone(&count));
+            carry(
+                near,
+                far,
+                Arc::new(AtomicUsize::new(0)),
+                (trace.clone(), conn, false),
+            );
+            carry(far2, near2, Arc::clone(&count), (trace.clone(), conn, true));
         }
     });
-    (path, back)
+    (path, link)
+}
+
+/// What a test knows of a slow link it made: how many bytes it has carried
+/// back from the session, and everything it carried either way.
+struct Link {
+    back: Arc<AtomicUsize>,
+    trace: Trace,
+}
+
+/// What a slow link passed on, each way, `delay` late: for a test that times
+/// what a client draws to say, when it is late, where the time went.
+#[derive(Clone)]
+struct Trace {
+    delay: Duration,
+    carried: Arc<std::sync::Mutex<Vec<Carried>>>,
+}
+
+/// One read a slow link passed on.
+struct Carried {
+    /// Which of the link's connections, counted from nought.
+    conn: usize,
+    /// From the session to the client, or the other way.
+    back: bool,
+    /// When it was read, and when written on.
+    read: Instant,
+    written: Instant,
+    bytes: Vec<u8>,
+}
+
+impl Trace {
+    /// The messages passed one way, each with when the link read the last
+    /// of it and when it wrote that on; every connection's, in the order
+    /// they were written.
+    fn messages(&self, back: bool) -> Vec<(Instant, Instant, Value)> {
+        let carried = self.carried.lock().expect("the trace");
+        let mut pending: std::collections::HashMap<usize, Vec<u8>> = Default::default();
+        let mut out = Vec::new();
+        for c in carried.iter().filter(|c| c.back == back) {
+            let bytes = pending.entry(c.conn).or_default();
+            bytes.extend_from_slice(&c.bytes);
+            let mut rest = &bytes[..];
+            loop {
+                let mut tried = rest;
+                match rmpv::decode::read_value(&mut tried) {
+                    Ok(value) => {
+                        rest = tried;
+                        out.push((c.read, c.written, value));
+                    }
+                    // A message the read ends in the middle of waits for the
+                    // next.
+                    Err(_) => break,
+                }
+            }
+            let used = bytes.len() - rest.len();
+            bytes.drain(..used);
+        }
+        out
+    }
+
+    /// The most the link was late passing anything on, each way: to the
+    /// session, and back from it.
+    fn lateness(&self) -> (Duration, Duration) {
+        let carried = self.carried.lock().expect("the trace");
+        let late = |back: bool| {
+            carried
+                .iter()
+                .filter(|c| c.back == back)
+                .map(|c| (c.written - c.read).saturating_sub(self.delay))
+                .max()
+                .unwrap_or_default()
+        };
+        (late(false), late(true))
+    }
+}
+
+/// A notification's method and arguments.
+fn notification(v: &Value) -> Option<(&str, &[Value])> {
+    let v = v.as_array()?;
+    if v.first()?.as_u64()? != 2 {
+        return None;
+    }
+    Some((v.get(1)?.as_str()?, v.get(2)?.as_array()?))
 }
 
 /// The number of the line at the top of a screen of `line N`s.
@@ -908,7 +1015,7 @@ const SLOW: Duration = Duration::from_millis(250);
 /// a client over a slow link, scrolls jumping rather than sliding so that
 /// what a prediction shows can be read off the screen at once.
 ///
-/// With it, how many bytes have come back over the link from Neovim.
+/// With it, the link (see [`Link`]).
 fn drawn_slowly(
     scratch: &Scratch,
     tag: &str,
@@ -916,13 +1023,13 @@ fn drawn_slowly(
 ) -> (
     nvmux::rpc::Client<std::os::unix::net::UnixStream>,
     Terminal,
-    Arc<AtomicUsize>,
+    Link,
 ) {
     let (sock, mut rpc, config) = session(scratch, tag);
     rpc.command(&format!("setlocal noswapfile | {setline}"))
         .expect("setline");
     std::fs::write(&config, "[effects.scroll]\nenabled = false\n").expect("config");
-    let (slow, back) = counted_link(&scratch.0.join("link"), &sock, SLOW);
+    let (slow, link) = counted_link(&scratch.0.join("link"), &sock, SLOW);
 
     let mut term = Terminal::spawn(&slow, &config);
     assert!(
@@ -932,7 +1039,7 @@ fn drawn_slowly(
     );
     // The agent's lines, and the answer to the attach's fence.
     term.pump_until(Duration::from_secs(3), |_| false);
-    (rpc, term, back)
+    (rpc, term, link)
 }
 
 /// Type `keys`, a scroll the client predicts: it is on the screen before
@@ -1140,18 +1247,22 @@ fn every_scroll_sideways_predicted_is_the_one_neovim_makes() {
     typed(&mut term, b"\x1b");
 }
 
+/// The first line of the `k`th page down a window of `line N`s 24 rows
+/// tall: a page is the window less two lines, 20.
+fn page(k: usize) -> u32 {
+    1 + 20 * k as u32
+}
+
 /// Type `presses` pages, `gap` apart, into a window of `line N`s drawn over
-/// a slow link: say how long after its key each page was first on the
-/// screen, after making sure the view never went back and ended where
-/// Neovim's did.
+/// `link`: when each was typed and first on the screen, after making sure
+/// the view never went back and ended where Neovim's did.
 fn pages(
     rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
     term: &mut Terminal,
+    link: &Link,
     gap: Duration,
     presses: usize,
-) -> Vec<Option<Duration>> {
-    // A page is the window less two lines: 20.
-    let page = |k: usize| 1 + 20 * k as u32;
+) -> Paging {
     let t0 = Instant::now();
     let mut typed = Vec::new();
     let mut drawn: Vec<Option<Instant>> = vec![None; presses];
@@ -1180,21 +1291,132 @@ fn pages(
         watch(term, t0 + gap * (k as u32 + 1), &mut drawn);
     }
     let tops = watch(term, Instant::now() + 4 * SLOW, &mut drawn);
+    let run = Paging {
+        t0,
+        typed,
+        drawn,
+        trace: link.trace.clone(),
+    };
     assert!(
         tops.windows(2).all(|w| w[0] < w[1]),
-        "it went back: {tops:?}"
+        "it went back: {tops:?}\n{}",
+        run.timeline(presses)
     );
-    assert_eq!(tops.last(), Some(&page(presses)), "{tops:?}");
+    assert_eq!(
+        tops.last(),
+        Some(&page(presses)),
+        "{tops:?}\n{}",
+        run.timeline(presses)
+    );
     assert_eq!(
         rpc.eval("line('w0')").ok().and_then(|v| v.as_u64()),
         Some(u64::from(page(presses))),
-        "Neovim went elsewhere"
+        "Neovim went elsewhere\n{}",
+        run.timeline(presses)
     );
-    typed
-        .iter()
-        .zip(&drawn)
-        .map(|(typed, drawn)| drawn.map(|d| d - *typed))
-        .collect()
+    run
+}
+
+/// A run of pages typed (see [`pages`]): when each was typed and first on
+/// the screen, and what the link carried meanwhile.
+struct Paging {
+    t0: Instant,
+    typed: Vec<Instant>,
+    drawn: Vec<Option<Instant>>,
+    trace: Trace,
+}
+
+impl Paging {
+    /// How long after its key each page was first on the screen.
+    fn late(&self) -> Vec<Option<Duration>> {
+        self.typed
+            .iter()
+            .zip(&self.drawn)
+            .map(|(typed, drawn)| drawn.map(|d| d - *typed))
+            .collect()
+    }
+
+    /// Where the time went, page by page about the `around`th, for a test
+    /// to say when a page is late: when it was typed; when its key left the
+    /// client and reached Neovim; when Neovim's view got to it and reached
+    /// the client, and the lines it shows; and when it was drawn. Each in
+    /// ms from the first page typed, as the link read it and wrote it on.
+    fn timeline(&self, around: usize) -> String {
+        // What was still on its way when a page was found late — Neovim's
+        // frame that lands it, perhaps — given the time to come: the link
+        // goes on keeping what it carries meanwhile.
+        std::thread::sleep(4 * self.trace.delay);
+        let ms = |t: Instant| match t.checked_duration_since(self.t0) {
+            Some(d) => d.as_millis().to_string(),
+            None => format!("-{}", (self.t0 - t).as_millis()),
+        };
+        let way = |e: Option<&(Instant, Instant, u32)>| {
+            e.map_or_else(|| "-".into(), |(r, w, _)| format!("{}→{}", ms(*r), ms(*w)))
+        };
+        // Each `<C-f>` the client sent; where Neovim's view got to; and how
+        // far down the lines it sent went.
+        let mut keys = Vec::new();
+        for (read, written, v) in self.trace.messages(false) {
+            if let Some(("nvim_input", [keys_typed, ..])) = notification(&v) {
+                let n = keys_typed
+                    .as_str()
+                    .map_or(0, |k| k.to_lowercase().matches("<c-f>").count());
+                keys.extend(std::iter::repeat_n((read, written, 0), n));
+            }
+        }
+        let (mut views, mut lines) = (Vec::new(), Vec::new());
+        for (read, written, v) in self.trace.messages(true) {
+            match notification(&v) {
+                Some(("redraw", events)) => {
+                    for event in events.iter().filter_map(Value::as_array) {
+                        if event.first().and_then(Value::as_str) != Some("win_viewport") {
+                            continue;
+                        }
+                        for args in event[1..].iter().filter_map(Value::as_array) {
+                            if let Some(top) = args.get(2).and_then(Value::as_u64) {
+                                views.push((read, written, top as u32 + 1));
+                            }
+                        }
+                    }
+                }
+                Some(("nvmux_client", [kind, _, _, _, first, sent, ..]))
+                    if kind.as_str() == Some("lines") =>
+                {
+                    let end =
+                        first.as_u64().unwrap_or(0) as usize + sent.as_array().map_or(0, Vec::len);
+                    lines.push((read, written, end as u32));
+                }
+                _ => {}
+            }
+        }
+        let n = self.typed.len();
+        let shown = if n <= 40 {
+            1..=n
+        } else {
+            around.saturating_sub(10).max(1)..=(around + 10).min(n)
+        };
+        let (to, back) = self.trace.lateness();
+        let mut out = format!(
+            "where the time went, in ms from the first page typed, as the link read and \
+             wrote it on ({} ms each way, at worst {} ms late to Neovim and {} ms back):",
+            self.trace.delay.as_millis(),
+            to.as_millis(),
+            back.as_millis()
+        );
+        for k in shown {
+            let top = page(k);
+            out += &format!(
+                "\n  page {k}: typed {}, key {}, Neovim's view {}, its lines {}, drawn {}",
+                ms(self.typed[k - 1]),
+                way(keys.get(k - 1)),
+                way(views.iter().find(|v| v.2 >= top)),
+                // The window's 22 lines from the page's first.
+                way(lines.iter().find(|l| l.2 >= top + 21)),
+                self.drawn[k - 1].map_or_else(|| "never".into(), ms)
+            );
+        }
+        out
+    }
 }
 
 /// Pages typed faster than a slow link answers: each is on the screen before
@@ -1204,17 +1426,18 @@ fn pages(
 fn pages_typed_faster_than_the_link_answers_keep_up() {
     require_nvim!();
     let scratch = Scratch::new("client-burst");
-    let (mut rpc, mut term, _) = drawn_slowly(
+    let (mut rpc, mut term, link) = drawn_slowly(
         &scratch,
         "client-burst",
         "call setline(1, map(range(1, 2000), '\"line \" . v:val'))",
     );
-    let late = pages(&mut rpc, &mut term, Duration::from_millis(100), 10);
-    for (k, late) in late.iter().enumerate() {
+    let run = pages(&mut rpc, &mut term, &link, Duration::from_millis(100), 10);
+    for (k, late) in run.late().iter().enumerate() {
         assert!(
             late.is_some_and(|l| l < SLOW),
-            "page {} waited: {late:?}",
-            k + 1
+            "page {} waited: {late:?}\n{}",
+            k + 1,
+            run.timeline(k + 1)
         );
     }
 }
@@ -1226,7 +1449,7 @@ fn pages_typed_faster_than_the_link_answers_keep_up() {
 fn pages_typed_further_ahead_than_lines_go_wait_only_for_them() {
     require_nvim!();
     let scratch = Scratch::new("client-run");
-    let (mut rpc, mut term, _) = drawn_slowly(
+    let (mut rpc, mut term, link) = drawn_slowly(
         &scratch,
         "client-run",
         "call setline(1, map(range(1, 2000), '\"line \" . v:val'))",
@@ -1234,12 +1457,13 @@ fn pages_typed_further_ahead_than_lines_go_wait_only_for_them() {
     // A round trip of this link types fifty pages, more than the most
     // windows of lines it keeps either way (twenty-four, some twenty-seven
     // pages); thirty-two are as far ahead as a view may go.
-    let late = pages(&mut rpc, &mut term, Duration::from_millis(10), 32);
-    for (k, late) in late.iter().enumerate() {
+    let run = pages(&mut rpc, &mut term, &link, Duration::from_millis(10), 32);
+    for (k, late) in run.late().iter().enumerate() {
         assert!(
             late.is_some_and(|l| l < 2 * SLOW),
-            "page {} waited for Neovim: {late:?}",
-            k + 1
+            "page {} waited for Neovim: {late:?}\n{}",
+            k + 1,
+            run.timeline(k + 1)
         );
     }
 }
@@ -1260,7 +1484,7 @@ fn pages_typed_faster_than_neovim_scrolls_bring_their_lines_as_it_goes() {
     // so as not to take a core from the client and the link on a machine
     // with few.
     const SCROLL: Duration = Duration::from_millis(30);
-    let (mut rpc, mut term, _) = drawn_slowly(
+    let (mut rpc, mut term, link) = drawn_slowly(
         &scratch,
         "client-behind",
         &format!(
@@ -1274,13 +1498,14 @@ fn pages_typed_faster_than_neovim_scrolls_bring_their_lines_as_it_goes() {
     // Those past them would wait as well for its views further on, each
     // further behind the keys than the last, and further still on a busy
     // machine. A page is late halfway between the two.
-    let late = pages(&mut rpc, &mut term, Duration::from_millis(10), 28);
+    let run = pages(&mut rpc, &mut term, &link, Duration::from_millis(10), 28);
     let within = SLOW + 15 * SCROLL;
-    for (k, late) in late.iter().enumerate() {
+    for (k, late) in run.late().iter().enumerate() {
         assert!(
             late.is_some_and(|l| l < within),
-            "page {} waited for Neovim: {late:?}",
-            k + 1
+            "page {} waited for Neovim: {late:?}\n{}",
+            k + 1,
+            run.timeline(k + 1)
         );
     }
     // Neovim's frame, which may come after `pages` stops watching, and as
@@ -1382,18 +1607,19 @@ fn a_page_neovim_does_not_turn_is_given_up_in_time() {
 fn a_long_run_of_pages_lets_go_of_the_lines_behind() {
     require_nvim!();
     let scratch = Scratch::new("client-long-run");
-    let (mut rpc, mut term, _) = drawn_slowly(
+    let (mut rpc, mut term, link) = drawn_slowly(
         &scratch,
         "client-long-run",
         "call setline(1, map(range(1, 6000), '\"line \" . v:val'))",
     );
     // Past the 4000 lines the client keeps at most, before the end.
-    let late = pages(&mut rpc, &mut term, Duration::from_millis(30), 200);
-    for (k, late) in late.iter().enumerate() {
+    let run = pages(&mut rpc, &mut term, &link, Duration::from_millis(30), 200);
+    for (k, late) in run.late().iter().enumerate() {
         assert!(
             late.is_some_and(|l| l < SLOW),
-            "page {} waited: {late:?}",
-            k + 1
+            "page {} waited: {late:?}\n{}",
+            k + 1,
+            run.timeline(k + 1)
         );
     }
     // Above the view, among the lines kept, and in it.
@@ -1413,15 +1639,15 @@ fn edits_reach_the_client_as_what_they_changed() {
     require_nvim!();
     let scratch = Scratch::new("client-edits");
     // Long enough lines that sending them all again shows.
-    let (mut rpc, mut term, back) = drawn_slowly(
+    let (mut rpc, mut term, link) = drawn_slowly(
         &scratch,
         "client-edits",
         "call setline(1, map(range(1, 600), \
          '\"line \" . v:val . \" \" . repeat(\"abcdefghij\", 6)'))",
     );
-    let before = back.load(Ordering::Relaxed);
+    let before = link.back.load(Ordering::Relaxed);
     typed(&mut term, b"x");
-    let cost = back.load(Ordering::Relaxed) - before;
+    let cost = link.back.load(Ordering::Relaxed) - before;
     assert!(cost < 2000, "an edit of a character cost {cost} bytes");
 
     // Below the view, as a formatter or a language server would: the
@@ -1559,7 +1785,7 @@ fn predicted_rows_wear_the_colours_neovim_gives_them() {
 fn a_session_left_alone_falls_quiet_whatever_highlights_it() {
     require_nvim!();
     let scratch = Scratch::new("client-quiet");
-    let (_rpc, mut term, back) = drawn_slowly(
+    let (_rpc, mut term, link) = drawn_slowly(
         &scratch,
         "client-quiet",
         "call setline(1, map(range(1, 600), 'v:val % 3 \
@@ -1569,9 +1795,9 @@ fn a_session_left_alone_falls_quiet_whatever_highlights_it() {
     );
     // What a first push leaves to a moment later, and its colours.
     term.pump_until(4 * SLOW, |_| false);
-    let before = back.load(Ordering::Relaxed);
+    let before = link.back.load(Ordering::Relaxed);
     term.pump_until(Duration::from_secs(3), |_| false);
-    let sent = back.load(Ordering::Relaxed) - before;
+    let sent = link.back.load(Ordering::Relaxed) - before;
     assert!(
         sent < 4096,
         "Neovim sent {sent} bytes in 3 s with nothing typed and nothing to draw"
