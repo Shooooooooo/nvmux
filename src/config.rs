@@ -183,6 +183,26 @@ pub struct ClientSettings {
     /// With `per_session` off as well, a client started ahead is retired when
     /// it first leaves the front, like every other.
     pub lazy: bool,
+    /// Draw a session nobody sees — its client kept out of sight, or started
+    /// ahead of its first visit — at most once a second, with nothing in it
+    /// animating, until it is back in front (see
+    /// [`crate::card::Command::Away`]). nvmux's own client only.
+    ///
+    /// Off, the default, such a client draws everything its session does as
+    /// if it were in front, into nvmux's copy of its screen. On, a session
+    /// that draws all the while out of sight — a `:terminal` running a build,
+    /// a log — costs nvmux a third of the CPU it did, or less; and a client
+    /// started ahead of one is kept to its first visit, rather than let go
+    /// for writing more than [`crate::pty::AHEAD_MAX`] before it.
+    ///
+    /// What on costs: nvmux's copy of a session out of sight is up to a
+    /// second old. A switch to it from another session waits for its client
+    /// to draw the card the switch lands with, and the client brings the rest
+    /// up to date in the same frame; but coming back to it with no card —
+    /// from a cancelled `<prefix> c`, or with `[style] float` off from the
+    /// picker, the help or the settings — fades it in from that copy, and the
+    /// screen jumps to the present after.
+    pub throttle: bool,
     /// Scroll ahead of a slow link: a key that scrolls — `<C-e>`, `<C-d>`,
     /// `<C-f>`, `zz`, `zl` and their kind, in Normal mode or Insert — or a
     /// turn of the mouse wheel, either way, scrolls the window at once,
@@ -229,6 +249,7 @@ impl Default for ClientSettings {
             ui: Ui::Nvmux,
             per_session: true,
             lazy: false,
+            throttle: false,
             predict: true,
             centre: false,
             window_width: 120,
@@ -1222,6 +1243,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          # ui           = {ui:<8}   # nvmux's own animated client, or \"nvim\" for Neovim's\n\
          # per_session  = {per_session:<8}   # keep each session's client; a switch back reuses it\n\
          # lazy         = {lazy:<8}   # start every client at launch; true waits for each session's first visit\n\
+         # throttle     = {throttle:<8}   # true draws a session out of sight once a second, not as it changes\n\
          # predict      = {predict:<8}   # over a slow link, scrolls show before Neovim answers\n\
          # centre       = {centre:<8}   # on a wide terminal, each window's text in the middle of the window\n\
          # window_width = {window_width:<8}   # with centre on, how many columns a window's text gets; 0 for no limit\n\
@@ -1279,6 +1301,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
         command = quoted(&s.command),
         per_session = c.per_session,
         lazy = c.lazy,
+        throttle = c.throttle,
         predict = c.predict,
         centre = c.centre,
         window_width = c.window_width,
@@ -2261,6 +2284,16 @@ mod tests {
         assert!(toml::from_str::<Settings>("[client]\nwindow_width = -1\n").is_err());
     }
 
+    /// A session out of sight drawn as it changes unless told otherwise; a
+    /// frame a second is a line away.
+    #[test]
+    fn a_session_out_of_sight_is_drawn_as_it_changes_unless_told() {
+        assert!(!Settings::default().client.throttle);
+        let s: Settings = toml::from_str("[client]\nthrottle = true\n").expect("valid");
+        assert!(s.client.throttle);
+        assert!(s.client.per_session, "the rest as it was");
+    }
+
     /// Each window's text as wide as what it shows wants unless told
     /// otherwise; `window_width` for every one of them is a line away.
     #[test]
@@ -2736,6 +2769,7 @@ mod tests {
         for line in [
             "# per_session  = true",
             "# lazy         = false",
+            "# throttle     = false",
             "# ui           = \"nvmux\"",
             "# predict      = true",
             "# centre       = false",

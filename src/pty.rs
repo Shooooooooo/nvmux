@@ -362,6 +362,9 @@ pub struct Attachment {
     /// Whether the client is nvmux's own, which draws cards (see
     /// [`crate::card`]): Neovim's would be typed what tells it to.
     draws_cards: bool,
+    /// The client has been told it is out of sight, and not yet that it is
+    /// back in front (see [`Attachment::go_away`]).
+    away: bool,
     /// The settings generation the client last heard (see
     /// [`crate::config::generation`]): the one it was started with, and then
     /// the one it was last told. A relay that finds it stale tells it the
@@ -1889,9 +1892,13 @@ impl Attachment {
     /// Put a kept client aside while something else has the front: see
     /// [`Parked`]. `None` if it could not be parked — no stop channel or no
     /// thread to be had for it — in which case it has been retired and the
-    /// next attach to its session is a fresh one.
-    pub fn park(mut self) -> Option<Parked> {
+    /// next attach to its session is a fresh one. Told to draw at a crawl
+    /// meanwhile if `throttle` (see [`Attachment::go_away`]).
+    pub fn park(mut self, throttle: bool) -> Option<Parked> {
         self.exits_seen = EXITS_RELAYED.load(std::sync::atomic::Ordering::Relaxed);
+        if throttle {
+            self.go_away();
+        }
         self.put_aside("nvmux-parked", keep_parked)
     }
 
@@ -1899,7 +1906,8 @@ impl Attachment {
     /// visited: `[client] lazy = false`, which starts one for every session as
     /// nvmux starts. `probe` is its attach probe, if that has still to answer.
     /// `None` if it could not be held, in which case it has been retired, as
-    /// by [`Attachment::park`].
+    /// by [`Attachment::park`]; and told to draw at a crawl, as that is, if
+    /// `throttle`.
     ///
     /// Held as a parked client is — in a [`Parked`], on a thread that owns it
     /// and reads it — but kept differently, because it is read for a
@@ -1921,10 +1929,27 @@ impl Attachment {
     /// is: a client nobody reads stops in its write while its server keeps
     /// every frame for it, without bound. Kept whole, the bound is nvmux's
     /// instead — see [`keep_unshown`].
-    pub fn start_ahead(mut self, probe: Option<Probe>) -> Option<Parked> {
+    pub fn start_ahead(mut self, probe: Option<Probe>, throttle: bool) -> Option<Parked> {
         self.unshown = Some(Vec::new());
         self.probe = probe;
+        if throttle {
+            self.go_away();
+        }
         self.put_aside("nvmux-ahead", keep_unshown)
+    }
+
+    /// Tell a client that draws cards that it is going to the back, where
+    /// nothing it draws is seen: it stops animating, and draws at a crawl,
+    /// until the relay that brings it back to the front says so with the
+    /// [`card::Command::Clear`] it opens with (see [`card::Command::Away`]
+    /// and `[client] throttle`). Here and not as its relay ends, where a
+    /// switch has it draw the card the switch lands with first
+    /// ([`Attachment::stand_landing`]).
+    fn go_away(&mut self) {
+        if self.draws_cards {
+            self.tell_client(&card::Command::Away);
+            self.away = true;
+        }
     }
 
     /// Whether this client was started ahead of its session's first visit
@@ -2916,6 +2941,7 @@ fn spawn_client_with(
         unshown: None,
         probe: None,
         draws_cards,
+        away: false,
         // What its environment was given (see `own_client`), built on this
         // thread a moment ago with nothing changed since.
         heard: crate::config::generation(),
@@ -3152,7 +3178,16 @@ pub fn relay(
         // them. It takes its size from the pty, as every client does until
         // the terminal has said whether it reports sizes in band — which this
         // one has yet to ask it.
+        //
+        // Told it is back in front before that, if it was told it was away
+        // (see `Attachment::go_away`): away, a client draws at a crawl, and
+        // that redraw would come long after the held paint it belongs in had
+        // been let through without it. The opening says so too, but only as
+        // the paint is let through.
         if attachment.started_ahead() {
+            if std::mem::take(&mut attachment.away) {
+                attachment.tell_client(&card::Command::Clear);
+            }
             let size = term::terminal_size();
             if pty_size(&attachment.master) != Some(size) {
                 attachment.resize_to(size);
@@ -3283,6 +3318,9 @@ pub fn relay(
         }
     }
     attachment.resumed = true;
+    // Back in front as far as the client knows: one started ahead was told
+    // so above, and one resumed by the Clear the opening put in, above too.
+    attachment.away = false;
     if fresh && attachment.shadow.is_some() {
         attachment.hold = Some(Hold::new(Instant::now()));
     }
@@ -6255,7 +6293,7 @@ mod tests {
             r#"head -c 200000 /dev/zero | tr '\0' x; printf '\033]0;said it all\007'; exec sleep 30"#,
         );
         let pid = pid_of(&a);
-        let parked = a.park().expect("parked");
+        let parked = a.park(false).expect("parked");
         // Two hundred kilobytes read in pieces take a few milliseconds; a
         // client nobody reads would still be stuck a second later.
         std::thread::sleep(Duration::from_secs(1));
@@ -6275,7 +6313,7 @@ mod tests {
         let a = kept("printf r; exec sleep 30");
         wait_until_ready(&a);
         let pid = pid_of(&a);
-        let parked = a.park().expect("parked");
+        let parked = a.park(false).expect("parked");
         assert!(parked.is_alive());
         let back = parked.unpark().expect("handed back");
         assert_eq!(pid_of(&back), pid);
@@ -6292,7 +6330,7 @@ mod tests {
     fn a_client_that_leaves_while_parked_is_not_handed_back() {
         let a = kept("sleep 0.2; exit 0");
         let pid = pid_of(&a);
-        let parked = a.park().expect("parked");
+        let parked = a.park(false).expect("parked");
         assert!(
             settle_parked(&parked),
             "the thread never noticed its client go"
@@ -6314,7 +6352,7 @@ mod tests {
         );
         wait_until_ready(&a);
         let pid = pid_of(&a);
-        let parked = a.park().expect("parked");
+        let parked = a.park(false).expect("parked");
         let start = Instant::now();
         assert!(settle_parked(&parked), "the finishing client was kept");
         assert!(
@@ -6335,7 +6373,7 @@ mod tests {
         let a = kept("printf r; exec sleep 30");
         wait_until_ready(&a);
         let pid = pid_of(&a);
-        drop(a.park().expect("parked"));
+        drop(a.park(false).expect("parked"));
         assert!(reaped(pid), "the client outlived its parking");
     }
 
@@ -6351,7 +6389,7 @@ mod tests {
             r#"printf '\033[?1049hhello\033['; sleep 0.1; printf 'c\033]0;a title\007\033[c'; exec sleep 30"#,
         );
         let pid = pid_of(&a);
-        let held = a.start_ahead(None).expect("held");
+        let held = a.start_ahead(None, false).expect("held");
         std::thread::sleep(Duration::from_millis(400));
         assert!(held.is_alive(), "its startup was taken for an exit");
         let back = held.unpark().expect("handed back");
@@ -6369,6 +6407,57 @@ mod tests {
         );
     }
 
+    /// A client put aside — parked, or started ahead — with `[client]
+    /// throttle` on is told it has gone to the back, if it is one that draws
+    /// cards: in its input, whole, as it goes (see [`card::Command::Away`]).
+    /// With it off, the default, or for Neovim's own client, which could not
+    /// read it, nothing is put in.
+    #[test]
+    fn a_client_put_aside_is_told_it_is_away_only_if_throttled() {
+        let away = card::encode(&card::Command::Away);
+        // What the client reads of its input, said back as a title in hex.
+        let script = format!(
+            r#"printf r; heard=$(head -c {} | od -An -tx1 | tr -d ' \n'); printf '\033]0;%s\007' "$heard"; exec sleep 30"#,
+            away.len()
+        );
+        let mut heard = b"\x1b]0;".to_vec();
+        for b in &away {
+            heard.extend_from_slice(format!("{b:02x}").as_bytes());
+        }
+        heard.push(0x07);
+        for (throttle, draws_cards) in [(true, true), (true, false), (false, true)] {
+            let told = throttle && draws_cards;
+            let mut a = kept(&script);
+            a.draws_cards = draws_cards;
+            wait_until_ready(&a);
+            let parked = a.park(throttle).expect("parked");
+            std::thread::sleep(Duration::from_millis(500));
+            let back = parked.unpark().expect("handed back");
+            assert_eq!(
+                back.ledger.as_ref().and_then(Ledger::title),
+                told.then_some(&heard[..]),
+                "parked, throttled: {throttle}, drawing cards: {draws_cards}"
+            );
+            assert_eq!(back.away, told);
+
+            let mut a = kept(&script);
+            a.draws_cards = draws_cards;
+            let held = a.start_ahead(None, throttle).expect("held");
+            std::thread::sleep(Duration::from_millis(500));
+            let back = held.unpark().expect("handed back");
+            let mut unshown = b"r".to_vec();
+            if told {
+                unshown.extend_from_slice(&heard);
+            }
+            assert_eq!(
+                back.unshown.as_deref(),
+                Some(&unshown[..]),
+                "started ahead, throttled: {throttle}, drawing cards: {draws_cards}"
+            );
+            assert_eq!(back.away, told);
+        }
+    }
+
     /// A client started ahead that leaves the alternate screen is on its way
     /// out — its exit or its suspend — and is retired, as a parked one is,
     /// however the reads split the sequence.
@@ -6382,7 +6471,7 @@ mod tests {
                 r#"stty raw -echo; trap 'exit 0' HUP; printf '\033[c'; sleep 0.2; {finish}; while :; do sleep 0.05; done"#
             ));
             let pid = pid_of(&a);
-            let held = a.start_ahead(None).expect("held");
+            let held = a.start_ahead(None, false).expect("held");
             assert!(settle_parked(&held), "{tag}: the finishing client was kept");
             assert!(
                 held.unpark().is_none(),
@@ -6401,7 +6490,7 @@ mod tests {
             AHEAD_MAX + 1
         ));
         let pid = pid_of(&a);
-        let held = a.start_ahead(None).expect("held");
+        let held = a.start_ahead(None, false).expect("held");
         assert!(settle_parked(&held), "a client past the bound was kept");
         assert!(held.unpark().is_none());
         assert!(reaped(pid), "and it was not reaped");
@@ -6427,7 +6516,7 @@ mod tests {
             let probe = Probe::start(tag, &sock).expect("connected");
             let a = kept("printf r; exec sleep 30");
             let pid = pid_of(&a);
-            let held = a.start_ahead(Some(probe)).expect("held");
+            let held = a.start_ahead(Some(probe), false).expect("held");
             if keeps {
                 // One round trip on a local socket, long since answered, and
                 // a few of the thread's looks for the answer.
@@ -6455,7 +6544,7 @@ mod tests {
         let server = recording_server_stalling_on(&sock, "nvim_list_uis");
         let probe = Probe::start("busy", &sock).expect("connected");
         let held = kept("printf r; exec sleep 30")
-            .start_ahead(Some(probe))
+            .start_ahead(Some(probe), false)
             .expect("held");
         std::thread::sleep(Duration::from_millis(100));
         let mut back = held.unpark().expect("handed back");

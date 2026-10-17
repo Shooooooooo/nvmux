@@ -99,6 +99,12 @@
 //! off it is a refresh, which blocks on a connection of its own for as long
 //! as Neovim takes to draw for it, and has nothing to tell the loop: its work
 //! arrives on the client's own socket ([`refresh`]).
+//!
+//! Nor, with `[client] throttle` on, while nobody sees it: a client nvmux has
+//! put aside — parked, or started ahead of its session's first visit — is
+//! told so ([`crate::card::Command::Away`]), and until it is back in front it
+//! animates nothing and draws what changes at most once every
+//! [`AWAY_FRAME_GAP`], however busy its session is.
 
 pub mod anim;
 pub mod cards;
@@ -181,6 +187,14 @@ pub const SETTINGS_ENV: &str = "NVMUX_CLIENT";
 /// last of them always. All but the second frame after a quiet spell, which
 /// is drawn at once: see [`App::dirty_due`].
 const MIN_FRAME_GAP: Duration = Duration::from_millis(4);
+
+/// The least time between two frames while the client is away: parked or
+/// started ahead, its screen seen by nobody (see
+/// [`crate::card::Command::Away`]). Drawn at all only for what nvmux keeps of
+/// the screen meanwhile, which the client brings up to date the moment it is
+/// back in front; and a session that draws all the while — a build, a log —
+/// is then a frame a second, not one every few milliseconds.
+const AWAY_FRAME_GAP: Duration = Duration::from_secs(1);
 
 /// How long drawing waits for what a multigrid attach lacks — where its
 /// windows are, what is on them, the other UIs to settle — before drawing
@@ -1060,6 +1074,8 @@ pub struct App {
     /// This attach has had its first flush: before it, nothing animates or
     /// is drawn.
     flushed: bool,
+    /// Put aside, and not back in front yet: see [`AWAY_FRAME_GAP`].
+    away: bool,
     /// What to write to the terminal before the next frame — the bell, the
     /// title, the server's own bytes — in order.
     say: Vec<u8>,
@@ -1144,6 +1160,7 @@ impl App {
             last_frame: None,
             frame_before: None,
             flushed: false,
+            away: false,
             say: Vec::new(),
             done: false,
             predict: predict.then(Predictor::default),
@@ -1599,6 +1616,16 @@ impl App {
         }
     }
 
+    /// Gone to the back (see [`crate::card::Command::Away`]): what moves
+    /// stops where it is going, and nothing starts to until the client is
+    /// back in front. What is left to draw, or changes from here on, is drawn
+    /// as [`AWAY_FRAME_GAP`] allows.
+    fn go_away(&mut self) {
+        self.away = true;
+        self.anim.reset();
+        self.dirty = true;
+    }
+
     /// Draw with `drawing` from here on, as nvmux has changed its settings
     /// (see [`crate::card::Command::Settings`]).
     ///
@@ -1995,7 +2022,7 @@ impl App {
         {
             self.uis_changed(now);
         }
-        let animate = self.flushed && !self.holding(now);
+        let animate = self.flushed && !self.holding(now) && !self.away;
         // The windows that took another buffer since the last flush, by grid:
         // this batch is the one that draws them.
         let switched: Vec<u64> = std::mem::take(&mut self.switched)
@@ -2186,7 +2213,11 @@ impl App {
                     Some(crate::card::Command::Settings(drawing)) => {
                         self.reconfigure(&drawing, now);
                     }
+                    Some(crate::card::Command::Away) => self.go_away(),
                     Some(cmd) => {
+                        if matches!(cmd, crate::card::Command::Clear) {
+                            self.away = false;
+                        }
                         if self.cards.apply(cmd, now) {
                             self.dirty = true;
                         }
@@ -2841,6 +2872,8 @@ impl App {
                 .filter(|&at| at > now)
         } else if self.dirty {
             Some(self.dirty_due(now))
+        } else if self.away {
+            None
         } else {
             [
                 self.anim.next_frame(&self.model, now),
@@ -2864,6 +2897,9 @@ impl App {
         if self.dirty {
             return now >= self.dirty_due(now);
         }
+        if self.away {
+            return false;
+        }
         [
             self.anim.next_frame(&self.model, now),
             self.cards_change(now),
@@ -2880,11 +2916,15 @@ impl App {
     /// with `'showcmd'` on, as it is unless turned off: the key shown, and
     /// what it did. Held apart by the gap, what it did would come those
     /// milliseconds late, as most keys' would. A burst still comes no more
-    /// often than the gap allows, all but its first two frames.
+    /// often than the gap allows, all but its first two frames. Away, no
+    /// sooner than [`AWAY_FRAME_GAP`] after the last, whatever came before.
     fn dirty_due(&self, now: Instant) -> Instant {
         let Some(last) = self.last_frame else {
             return now;
         };
+        if self.away {
+            return (last + AWAY_FRAME_GAP).max(now);
+        }
         let quiet = self
             .frame_before
             .is_none_or(|before| last.saturating_duration_since(before) >= anim::FRAME);
@@ -3680,6 +3720,215 @@ mod tests {
         a.frame(marked);
         assert!(!a.cards.is_empty(), "its mark stays");
         assert_eq!(a.cards_change(marked), None, "and is still");
+    }
+
+    /// Tell the client what nvmux would, in its input.
+    fn told(a: &mut App, cmd: &crate::card::Command, now: Instant) {
+        a.keys(&crate::card::encode(cmd), now);
+    }
+
+    fn goto(row: u64, col: u64) -> (&'static str, Vec<Value>) {
+        ("grid_cursor_goto", vec![1.into(), row.into(), col.into()])
+    }
+
+    /// Away, a client draws no sooner than [`AWAY_FRAME_GAP`] after its last
+    /// frame: what it had still to draw as it went, and then a session that
+    /// draws all the while, a frame a gap, the last of it always. Back in
+    /// front, what is left is drawn at once, and from then on as in front.
+    #[test]
+    fn a_client_away_draws_at_a_crawl_and_back_in_front_at_once() {
+        use crate::card::Command::{Away, Clear};
+        let t0 = Instant::now();
+        let mut a = attached(true, t0);
+        a.frame(t0);
+        let gone = t0 + Duration::from_millis(10);
+        told(&mut a, &Away, gone);
+        assert!(!a.due(gone), "drawn a moment ago");
+        assert_eq!(a.wake_at(gone), Some(t0 + AWAY_FRAME_GAP));
+        let first = t0 + AWAY_FRAME_GAP;
+        assert!(a.due(first));
+        a.frame(first);
+        assert_eq!(a.wake_at(first), None, "nothing more to wake for");
+
+        let busy = first + Duration::from_millis(1);
+        redraw(&mut a, vec![line(1, 0, "a")], busy);
+        assert!(!a.due(busy), "held");
+        let more = busy + Duration::from_millis(300);
+        redraw(&mut a, vec![line(1, 1, "b")], more);
+        assert!(!a.due(more), "held with it");
+        let second = first + AWAY_FRAME_GAP;
+        assert_eq!(a.wake_at(more), Some(second));
+        assert!(!a.due(second - Duration::from_millis(1)));
+        assert!(a.due(second), "both, a gap on");
+        a.frame(second);
+        // A change after as long as the gap, quiet, is drawn when it comes.
+        let late = second + 3 * AWAY_FRAME_GAP;
+        redraw(&mut a, vec![line(1, 2, "c")], late);
+        assert!(a.due(late));
+        a.frame(late);
+
+        let left = late + Duration::from_millis(100);
+        redraw(&mut a, vec![line(1, 3, "d")], left);
+        assert!(!a.due(left));
+        let front = left + Duration::from_millis(5);
+        told(&mut a, &Clear, front);
+        assert_eq!(a.wake_at(front), Some(front));
+        assert!(a.due(front), "back in front: at once");
+        a.frame(front);
+        // A key's two flushes, after a quiet spell: both at once.
+        let shown = front + Duration::from_millis(100);
+        redraw(&mut a, vec![line(1, 4, "k")], shown);
+        assert!(a.due(shown));
+        a.frame(shown);
+        let did = shown + Duration::from_micros(500);
+        redraw(&mut a, vec![line(1, 5, "did")], did);
+        assert!(a.due(did), "drawn as in front");
+    }
+
+    /// A blinking cursor wakes the client on a clock of its own, a frame at
+    /// a time while it fades: not away, where nobody would see it fade.
+    #[test]
+    fn a_client_away_blinks_no_more() {
+        use crate::card::Command::{Away, Clear};
+        let t0 = Instant::now();
+        let mut a = attached(true, t0);
+        a.anim.set_effects(Effects {
+            blink: true,
+            ..Effects::none()
+        });
+        let block = Value::Map(vec![
+            ("name".into(), "normal".into()),
+            ("cursor_shape".into(), "block".into()),
+            ("blinkwait".into(), 700.into()),
+            ("blinkon".into(), 400.into()),
+            ("blinkoff".into(), 250.into()),
+        ]);
+        redraw(
+            &mut a,
+            vec![
+                (
+                    "mode_info_set",
+                    vec![true.into(), Value::Array(vec![block])],
+                ),
+                ("mode_change", vec!["normal".into(), 0.into()]),
+            ],
+            t0,
+        );
+        a.frame(t0);
+        assert!(a.wake_at(t0).is_some(), "it blinks");
+
+        let gone = t0 + Duration::from_secs(5);
+        told(&mut a, &Away, gone);
+        assert!(a.due(gone));
+        a.frame(gone);
+        assert_eq!(a.wake_at(gone), None, "away, it blinks no more");
+        for later in [
+            gone + Duration::from_secs(1),
+            gone + Duration::from_secs(10),
+        ] {
+            assert!(!a.due(later), "nor is it drawn");
+        }
+
+        let front = gone + Duration::from_secs(20);
+        told(&mut a, &Clear, front);
+        assert!(a.wake_at(front).is_some(), "back in front, it blinks again");
+    }
+
+    /// A card up as the client goes — the one a switch lands with, drawn on
+    /// the screen it leaves — has a clock of its own, its age ticking and its
+    /// words going: away, nobody is there to see it, and it is let go of with
+    /// the rest as the client comes back.
+    #[test]
+    fn a_client_away_draws_no_card_on_its_clock() {
+        use crate::card::Command::{Away, Clear, Show};
+        let t0 = Instant::now();
+        let mut a = attached(true, t0);
+        a.frame(t0);
+        let card = crate::card::Card {
+            life_ms: 2500,
+            fade_ms: 0,
+            ..crate::card::Card::news(1, crate::card::Kind::Finished, "s", "done", 3, "")
+        };
+        told(&mut a, &Show(card), t0);
+        let came = t0 + MIN_FRAME_GAP;
+        a.frame(came);
+        assert!(a.cards_change(came).is_some(), "its age ticks");
+
+        let gone = came + Duration::from_millis(100);
+        told(&mut a, &Away, gone);
+        let drawn = came + AWAY_FRAME_GAP;
+        assert!(a.due(drawn));
+        a.frame(drawn);
+        assert_eq!(a.wake_at(drawn), None, "nothing on its clock");
+        for later in [
+            drawn + Duration::from_millis(500),
+            came + Duration::from_secs(2),
+        ] {
+            assert!(!a.due(later), "nor is it drawn");
+        }
+
+        let front = came + Duration::from_secs(10);
+        told(&mut a, &Clear, front);
+        assert!(a.due(front), "taken down at once");
+        a.frame(front);
+        assert!(a.cards.is_empty());
+    }
+
+    /// The cursor travels where it moves in front. Away, whatever was on its
+    /// way stops where it was going, and nothing sets off.
+    #[test]
+    fn a_client_away_moves_nothing() {
+        use crate::card::Command::{Away, Clear};
+        let t0 = Instant::now();
+        let mut a = attached(true, t0);
+        a.anim.set_effects(Effects {
+            smear: Some(anim::smear::Settings {
+                duration: 0.1,
+                short: 0.04,
+                trail: 0.4,
+                gradient: 1.0,
+            }),
+            ..Effects::none()
+        });
+        redraw(&mut a, vec![goto(0, 0)], t0);
+        a.frame(t0);
+        let moved = t0 + Duration::from_secs(1);
+        redraw(&mut a, vec![goto(4, 10)], moved);
+        a.frame(moved);
+        assert!(a.anim.next_frame(&a.model, moved).is_some(), "it travels");
+
+        let gone = moved + Duration::from_millis(5);
+        told(&mut a, &Away, gone);
+        assert!(a.anim.next_frame(&a.model, gone).is_none(), "stopped");
+        let drawn = moved + AWAY_FRAME_GAP;
+        assert_eq!(
+            a.wake_at(gone),
+            Some(drawn),
+            "where it was going, at a crawl"
+        );
+        a.frame(drawn);
+        // The first move after the stop only places it, as the first ever
+        // does; it is the next that would travel.
+        let again = drawn + Duration::from_secs(5);
+        redraw(&mut a, vec![goto(0, 0)], again);
+        a.frame(again);
+        let further = again + Duration::from_secs(5);
+        redraw(&mut a, vec![goto(4, 10)], further);
+        assert!(
+            a.anim.next_frame(&a.model, further).is_none(),
+            "a move away sets nothing off"
+        );
+        a.frame(further);
+        assert_eq!(a.wake_at(further), None);
+
+        let front = further + Duration::from_secs(1);
+        told(&mut a, &Clear, front);
+        redraw(&mut a, vec![goto(0, 0)], front);
+        a.frame(front);
+        assert!(
+            a.anim.next_frame(&a.model, front).is_some(),
+            "back in front, it travels again"
+        );
     }
 
     /// A multigrid attach leaves the agent in the editor, given the client's
