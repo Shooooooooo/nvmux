@@ -155,6 +155,44 @@ struct Watched {
     /// Whether a card about it is up in front, which leaves its mark: to be
     /// let go of once it has nothing to say.
     marked: bool,
+    /// How many reads in a row have found nothing new, up to [`QUIETEST`].
+    quiet: u32,
+    /// How many rounds it sits out before its next read: none, unless
+    /// `[client] back_off` is on and its last read found nothing new (see
+    /// [`Watched::rest`]).
+    resting: u32,
+}
+
+/// The most reads in a row with nothing new that [`Watched::quiet`] counts:
+/// with `[client] back_off` on, a session that quiet sits out seven rounds,
+/// and is read every sixteen seconds.
+const QUIETEST: u32 = 3;
+
+impl Watched {
+    fn new(id: String, name: String, sock: PathBuf) -> Self {
+        Self {
+            id,
+            name,
+            sock,
+            heard: None,
+            marked: false,
+            quiet: 0,
+            resting: 0,
+        }
+    }
+
+    /// After a read, which found something new or did not: the rounds to sit
+    /// out before the next. None after news, or with `back_off` off; then
+    /// one, three and seven, for one, two and three reads in a row with
+    /// nothing new — read every four, eight and sixteen seconds.
+    fn rest(&mut self, news: bool, back_off: bool) {
+        self.quiet = if news {
+            0
+        } else {
+            (self.quiet + 1).min(QUIETEST)
+        };
+        self.resting = if back_off { (1 << self.quiet) - 1 } else { 0 };
+    }
 }
 
 /// Posts, as it happens, cards with what the other sessions have to report —
@@ -162,10 +200,11 @@ struct Watched {
 /// the relay in front to have its client draw.
 ///
 /// It reads every session it is handed every [`notes::POLL`] while a session
-/// is in front, and none while one of nvmux's own screens is: the picker has
-/// a reader of its own, and shows it all. So coming back from one of those,
-/// what was said meanwhile counts as told, and the first round only finds out
-/// how far each session has got.
+/// is in front — with `[client] back_off` on, one that has had nothing new
+/// less often ([`Watched::rest`]) — and none while one of nvmux's own screens
+/// is: the picker has a reader of its own, and shows it all. So coming back
+/// from one of those, what was said meanwhile counts as told, and the first
+/// round only finds out how far each session has got.
 ///
 /// The reads are [`notes::hear`]'s, which ask nothing of an editor waiting for
 /// a key — this runs for as long as nvmux does, and a session may wait for its
@@ -238,13 +277,7 @@ fn run(inbox: &Receiver<Command>, settings: KeySettings) {
                         w.name = name;
                         w.sock = sock;
                     }
-                    None => watched.push(Watched {
-                        id,
-                        name,
-                        sock,
-                        heard: None,
-                        marked: false,
-                    }),
+                    None => watched.push(Watched::new(id, name, sock)),
                 }
             }
             Ok(Command::Front(id)) => {
@@ -253,19 +286,23 @@ fn run(inbox: &Receiver<Command>, settings: KeySettings) {
                 }
                 // Back from one of nvmux's own screens: what was said while it
                 // was up was on it, or is old by now. And whatever is in front
-                // now has come up with nothing on it.
+                // now has come up with nothing on it. Every session is read in
+                // the first round, however quiet it had been.
                 for w in &mut watched {
                     if front.is_none() {
                         w.heard = None;
                     }
                     w.marked = false;
+                    w.quiet = 0;
+                    w.resting = 0;
                 }
                 front = id;
                 due = front.is_some().then(|| Instant::now() + SETTLE);
             }
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(id) = front.as_deref() {
-                    round(&mut watched, id, settings);
+                    let back_off = crate::config::get().client.back_off;
+                    round(&mut watched, id, settings, back_off);
                 }
                 due = front.is_some().then(|| Instant::now() + notes::POLL);
             }
@@ -279,12 +316,24 @@ fn run(inbox: &Receiver<Command>, settings: KeySettings) {
 /// ([`oldest_first`]). On a first read, which says only how far a session
 /// has got, what another keeps is its mark alone; and of one that keeps
 /// nothing any more, or is gone, the mark is let go of. One gone for good,
-/// its socket with it ([`vanished`]), is read no more.
-fn round(watched: &mut Vec<Watched>, front: &str, settings: KeySettings) {
+/// its socket with it ([`vanished`]), is read no more. With `back_off` on,
+/// one that has had nothing new sits out rounds ([`Watched::rest`]).
+fn round(watched: &mut Vec<Watched>, front: &str, settings: KeySettings, back_off: bool) {
+    let due: Vec<bool> = watched
+        .iter_mut()
+        .map(|w| {
+            if !back_off || w.resting == 0 {
+                return true;
+            }
+            w.resting -= 1;
+            false
+        })
+        .collect();
     let heard: Vec<(usize, Heard)> = std::thread::scope(|s| {
         let reads: Vec<_> = watched
             .iter()
             .enumerate()
+            .filter(|&(i, _)| due[i])
             .map(|(i, w)| {
                 let sock = &w.sock;
                 s.spawn(move || (i, notes::hear(sock)))
@@ -310,9 +359,13 @@ fn round(watched: &mut Vec<Watched>, front: &str, settings: KeySettings) {
                 if vanished(&w.sock) {
                     ended.push(w.id.clone());
                 }
+                w.rest(false, back_off);
                 continue;
             }
-            Heard::Unknown => continue,
+            Heard::Unknown => {
+                w.rest(false, back_off);
+                continue;
+            }
         };
         let here = w.id == front;
         let from = (!here).then_some((w.id.as_str(), w.name.as_str()));
@@ -342,6 +395,7 @@ fn round(watched: &mut Vec<Watched>, front: &str, settings: KeySettings) {
             forgot.push(w.id.clone());
         }
         let top = news.iter().map(|n| n.seq).max().unwrap_or(0);
+        w.rest(w.heard.is_none_or(|h| top > h), back_off);
         w.heard = Some(w.heard.map_or(top, |h| h.max(top)));
     }
     for id in forgot {
@@ -563,20 +617,63 @@ mod tests {
     fn a_session_gone_with_its_socket_is_read_no_more() {
         let left = crate::test_support::scratch_sock("tell-left");
         drop(std::os::unix::net::UnixListener::bind(&left).expect("bind"));
-        let watched = |id: &str, sock| Watched {
-            id: id.to_string(),
-            name: id.to_string(),
-            sock,
-            heard: None,
-            marked: false,
-        };
+        let watched = |id: &str, sock| Watched::new(id.to_string(), id.to_string(), sock);
         let mut all = vec![
             watched("quit2345", crate::test_support::scratch_sock("tell-quit")),
             watched("left2345", left.clone()),
         ];
-        round(&mut all, "front234", prefixed(0));
+        round(&mut all, "front234", prefixed(0), false);
         let ids: Vec<&str> = all.iter().map(|w| w.id.as_str()).collect();
         assert_eq!(ids, ["left2345"], "the one with its socket still there");
+        let _ = std::fs::remove_file(&left);
+    }
+
+    /// With `[client] back_off` on, a session with nothing new sits out one
+    /// round, then three, then seven — read every 4, 8 and 16 seconds — and
+    /// none again from its next news. Off, it sits out none.
+    #[test]
+    fn a_quiet_session_sits_out_rounds_only_if_told() {
+        let mut w = Watched::new("abcd2345".into(), "x".into(), PathBuf::new());
+        let rested: Vec<u32> = (0..5)
+            .map(|_| {
+                w.rest(false, true);
+                w.resting
+            })
+            .collect();
+        assert_eq!(rested, [1, 3, 7, 7, 7]);
+        w.rest(true, true);
+        assert_eq!(w.resting, 0, "news: every round again");
+
+        let mut w = Watched::new("abcd2345".into(), "x".into(), PathBuf::new());
+        for _ in 0..5 {
+            w.rest(false, false);
+            assert_eq!(w.resting, 0, "off: every round, however quiet");
+        }
+    }
+
+    /// A round reads only the sessions that are due: with `back_off` on, a
+    /// quiet one rests in between; off, or turned off while it rests, it is
+    /// read every round.
+    #[test]
+    fn a_round_reads_a_resting_session_only_once_it_is_due() {
+        // Refusing but still there: read as gone, and kept.
+        let left = crate::test_support::scratch_sock("tell-rests");
+        drop(std::os::unix::net::UnixListener::bind(&left).expect("bind"));
+        let mut all = vec![Watched::new("left2345".into(), "x".into(), left.clone())];
+        let reads = |all: &mut Vec<Watched>, back_off| {
+            (0..4)
+                .map(|_| {
+                    round(all, "front234", prefixed(0), back_off);
+                    all[0].quiet
+                })
+                .collect::<Vec<u32>>()
+        };
+        assert_eq!(reads(&mut all, true), [1, 1, 2, 2], "read, rested, read");
+        assert_eq!(all[0].resting, 2, "two more rounds to sit out");
+        // Counted afresh, so that each read shows; still resting, so that
+        // turning it off shows.
+        all[0].quiet = 0;
+        assert_eq!(reads(&mut all, false), [1, 2, 3, 3], "read every round");
         let _ = std::fs::remove_file(&left);
     }
 

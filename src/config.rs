@@ -203,6 +203,21 @@ pub struct ClientSettings {
     /// picker, the help or the settings — fades it in from that copy, and the
     /// screen jumps to the present after.
     pub throttle: bool,
+    /// Ask a session that has had nothing new to say for its news less and
+    /// less often: every 4 seconds after one read with nothing new, every 8
+    /// after two, and every 16 after three, rather than every 2 (see
+    /// [`crate::tell`]). nvmux's own client only, as are the cards it is for.
+    ///
+    /// Off, the default, while a session is in front every session is asked
+    /// every two seconds for as long as nvmux runs, and an editor doing
+    /// nothing else wakes for nothing else. On, an idle one is asked eight
+    /// times less often.
+    ///
+    /// What on costs: news from a session that has been quiet comes up in the
+    /// margin as much as sixteen seconds after it happened, rather than two.
+    /// A session is asked every two seconds again from its next news, and
+    /// every session is at each switch and on the way back from the picker.
+    pub back_off: bool,
     /// Scroll ahead of a slow link: a key that scrolls — `<C-e>`, `<C-d>`,
     /// `<C-f>`, `zz`, `zl` and their kind, in Normal mode or Insert — or a
     /// turn of the mouse wheel, either way, scrolls the window at once,
@@ -250,6 +265,7 @@ impl Default for ClientSettings {
             per_session: true,
             lazy: false,
             throttle: false,
+            back_off: false,
             predict: true,
             centre: false,
             window_width: 120,
@@ -1244,6 +1260,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          # per_session  = {per_session:<8}   # keep each session's client; a switch back reuses it\n\
          # lazy         = {lazy:<8}   # start every client at launch; true waits for each session's first visit\n\
          # throttle     = {throttle:<8}   # true draws a session out of sight once a second, not as it changes\n\
+         # back_off     = {back_off:<8}   # true asks a quiet session for news less often, down to every 16s\n\
          # predict      = {predict:<8}   # over a slow link, scrolls show before Neovim answers\n\
          # centre       = {centre:<8}   # on a wide terminal, each window's text in the middle of the window\n\
          # window_width = {window_width:<8}   # with centre on, how many columns a window's text gets; 0 for no limit\n\
@@ -1302,6 +1319,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
         per_session = c.per_session,
         lazy = c.lazy,
         throttle = c.throttle,
+        back_off = c.back_off,
         predict = c.predict,
         centre = c.centre,
         window_width = c.window_width,
@@ -2294,6 +2312,16 @@ mod tests {
         assert!(s.client.per_session, "the rest as it was");
     }
 
+    /// Every session asked for its news every two seconds unless told
+    /// otherwise; less often while it is quiet is a line away.
+    #[test]
+    fn a_session_is_asked_for_news_every_two_seconds_unless_told() {
+        assert!(!Settings::default().client.back_off);
+        let s: Settings = toml::from_str("[client]\nback_off = true\n").expect("valid");
+        assert!(s.client.back_off);
+        assert!(!s.client.throttle, "the rest as it was");
+    }
+
     /// Each window's text as wide as what it shows wants unless told
     /// otherwise; `window_width` for every one of them is a line away.
     #[test]
@@ -2770,6 +2798,7 @@ mod tests {
             "# per_session  = true",
             "# lazy         = false",
             "# throttle     = false",
+            "# back_off     = false",
             "# ui           = \"nvmux\"",
             "# predict      = true",
             "# centre       = false",

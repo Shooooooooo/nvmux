@@ -258,6 +258,7 @@ ui           = "nvmux"  # who draws a session: nvmux's own client, animated; or 
 per_session  = true     # keep each session's client; a switch back reuses it
 lazy         = false    # start every client at launch; true waits for each session's first visit
 throttle     = false    # true draws a session out of sight once a second, not as it changes
+back_off     = false    # true asks a quiet session for news less often, down to every 16s
 predict      = true     # over a slow link, scrolls show before Neovim answers
 centre       = false    # on a wide terminal, each window's text in the middle of the window
 window_width = 120      # with centre on, how many columns a window's text gets; 0 for no limit
