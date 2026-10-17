@@ -494,7 +494,7 @@ if predict then
   end
   -- Rows of a buffer whose colours may have changed since they were sent,
   -- a few runs of them: its tree-sitter tree changed there, or the lines did.
-  local stale, followed = {}, {}
+  local stale, followed, pushed = {}, {}, {}
   local function spoil(buf, lo, hi)
     local runs, merged = stale[buf] or {}, { lo, hi }
     local kept = {}
@@ -522,17 +522,43 @@ if predict then
     end
     local tree = hl.tree
     followed[buf] = tree
+    -- A parse reports as changed not only what an edit changed but every row
+    -- whose injected trees it made or let go of; and a parse of other rows
+    -- than the last lets go of the last one's. The agent's parse of the rows
+    -- it colours and the highlighter's of the view would report each other's
+    -- rows for good, each report a push and each push a parse: an editor
+    -- busy for as long as the client is there, a C file's macros enough.
+    -- Only an edit changes what colours a row has. So of the reports at one
+    -- b:changedtick, those up to the end of the first push to end after the
+    -- first of them are heard, and none after. Not only those of the parse
+    -- that took the edit, which the highlighter makes a few milliseconds at
+    -- a time: what an edit did to a tree injected into the buffer — a
+    -- markdown code block's, where a comment opened colours rows well past
+    -- the edit — that tree alone reports, and it is often parsed first by
+    -- that push's own parse of the rows edited. Those the edit itself
+    -- changed are sent again whatever is heard (see flush).
+    local heard, hearing
     tree:register_cbs({
       on_changedtree = function(ranges)
         if gone or followed[buf] ~= tree then
           return
         end
+        local tick = api.nvim_buf_get_changedtick(buf)
+        if heard == tick then
+          return
+        end
+        hearing = tick
         for _, r in ipairs(ranges) do
           spoil(buf, r[1], r[4] + 1)
         end
         soon()
       end,
     }, true)
+    pushed[buf] = function()
+      if followed[buf] == tree and hearing == api.nvim_buf_get_changedtick(buf) then
+        heard = hearing
+      end
+    end
   end
   -- Edits to a buffer since the client was sent its lines, in order: each
   -- left lines a to b of the buffer as it was before it as lines a to c,
@@ -771,6 +797,11 @@ if predict then
           push(win, spoilt)
         end)
       end
+    end
+    -- What was heard at a b:changedtick is all there is to hear at it: see
+    -- follow.
+    for _, done in pairs(pushed) do
+      done()
     end
   end
   soon = function()
@@ -2765,7 +2796,13 @@ impl App {
         let frame = if !self.flushed {
             None
         } else if self.holding(now) {
-            self.hold_since.map(|since| since + HOLD_LIMIT)
+            // Not a time gone by: an attach asked for, or a detach, waits
+            // for its answer however long the hold has been, and a wait
+            // already over would have the loop poll without waiting, round
+            // and round until the answer came.
+            self.hold_since
+                .map(|since| since + HOLD_LIMIT)
+                .filter(|&at| at > now)
         } else if self.dirty {
             Some(
                 self.last_frame
@@ -3788,6 +3825,42 @@ mod tests {
         assert!(!a.due(t0));
         assert_eq!(a.wake_at(t0), Some(t0 + HOLD_LIMIT));
         assert!(a.due(t0 + HOLD_LIMIT));
+    }
+
+    /// A client attaching again, asked to while a hold was still waiting,
+    /// waits for Neovim's answer without waking for a hold long over: a
+    /// wake time already gone would have its loop poll without waiting,
+    /// round and round, for as long as Neovim takes to answer.
+    #[test]
+    fn a_detach_answered_late_is_waited_for_without_spinning() {
+        let t0 = Instant::now();
+        let mut a = attached(false, t0);
+        // Who else is attached changed, and the answer has yet to come: the
+        // hold begins.
+        redraw(&mut a, vec![ui_change()], t0);
+        calls(&mut a);
+        // Told to predict meanwhile, the client detaches to attach again.
+        let mut d = drawing();
+        d.client.predict = true;
+        a.reconfigure(&d, t0 + Duration::from_millis(100));
+        let sent = calls(&mut a);
+        let detach = request(&sent, "nvim_ui_detach", "");
+        // The hold is there, its end still to come.
+        assert_eq!(
+            a.wake_at(t0 + Duration::from_millis(100)),
+            Some(t0 + HOLD_LIMIT)
+        );
+        // Long past the hold, with no answer yet.
+        let late = t0 + 2 * HOLD_LIMIT;
+        assert!(!a.due(late));
+        assert!(
+            a.wake_at(late).is_none_or(|at| at > late),
+            "woken at once, for a hold long over: {:?}",
+            a.wake_at(late).map(|at| late.saturating_duration_since(at))
+        );
+        // The answer still ends the wait.
+        answer(&mut a, detach, Value::Nil, late);
+        assert_eq!(attached_with_multigrid(&calls(&mut a)), Some(true));
     }
 
     /// A UI that keeps windows on grid 1 attaching has the client detach
