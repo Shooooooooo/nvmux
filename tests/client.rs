@@ -1252,22 +1252,29 @@ fn pages_typed_further_ahead_than_lines_go_wait_only_for_them() {
 fn pages_typed_faster_than_neovim_scrolls_bring_their_lines_as_it_goes() {
     require_nvim!();
     let scratch = Scratch::new("client-behind");
-    // Each scroll takes Neovim 15 ms, and a page is typed every 10.
+    // Each scroll takes Neovim this long, and a page is typed every 10 ms.
+    // It sleeps rather than spins, so as not to take a core from the client
+    // and the link on a machine with few.
+    const SCROLL: Duration = Duration::from_millis(25);
     let (mut rpc, mut term, _) = drawn_slowly(
         &scratch,
         "client-behind",
-        "call setline(1, map(range(1, 2000), '\"line \" . v:val')) | \
-         autocmd WinScrolled * lua local t = vim.uv.hrtime() \
-         while vim.uv.hrtime() - t < 15e6 do end",
+        &format!(
+            "call setline(1, map(range(1, 2000), '\"line \" . v:val')) | \
+             autocmd WinScrolled * lua vim.uv.sleep({})",
+            SCROLL.as_millis()
+        ),
     );
     // Two pages past the lines in hand, whose lines come with Neovim's second
-    // view. Those past them would wait as well for its views further on, each
+    // view, or without a push at each scroll only once it has made all 28.
+    // Those past them would wait as well for its views further on, each
     // further behind the keys than the last, and further still on a busy
-    // machine.
+    // machine. A page is late halfway between the two.
     let late = pages(&mut rpc, &mut term, Duration::from_millis(10), 28);
+    let within = SLOW + 15 * SCROLL;
     for (k, late) in late.iter().enumerate() {
         assert!(
-            late.is_some_and(|l| l < 2 * SLOW),
+            late.is_some_and(|l| l < within),
             "page {} waited for Neovim: {late:?}",
             k + 1
         );
