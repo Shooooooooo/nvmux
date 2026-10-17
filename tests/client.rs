@@ -1541,6 +1541,79 @@ fn a_comment_typed_into_a_code_block_colours_the_rows_held_below_it() {
     );
 }
 
+/// What the client's agent sends, counted by kind in the editor as it goes:
+/// a `:lua` command, the last of a line of them.
+const COUNT_SENT: &str = "lua local send = vim.rpcnotify; _G.nvmux_sent = {}; \
+     vim.rpcnotify = function(chan, method, kind, ...) \
+       if method == 'nvmux_client' then \
+         _G.nvmux_sent[kind] = (_G.nvmux_sent[kind] or 0) + 1 \
+       end \
+       return send(chan, method, kind, ...) \
+     end";
+
+/// How many of each kind the agent has sent: see [`COUNT_SENT`].
+fn sent_by_kind(
+    rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+) -> std::collections::HashMap<String, i64> {
+    let sent = rpc.eval("luaeval('_G.nvmux_sent')").expect("the count");
+    sent.as_map()
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_i64()?)))
+        .collect()
+}
+
+/// What predictions are drawn from — the lines either side of a view, their
+/// colours, how a window scrolls — is sent only over a link slow enough to
+/// predict over. A session on this machine scrolled page by page is sent
+/// none of it; the same over a slow link is.
+#[test]
+fn only_a_link_slow_enough_to_predict_over_is_sent_lines() {
+    require_nvim!();
+    let setline =
+        format!("call setline(1, map(range(1, 600), '\"line \" . v:val')) | {COUNT_SENT}");
+    let pages = |term: &mut Terminal| {
+        for _ in 0..3 {
+            typed(term, b"\x06");
+        }
+    };
+    let predictions = ["lines", "spans", "shape", "keep", "splice"];
+
+    let fast = Scratch::new("client-fastlines");
+    let (sock, mut rpc, config) = session(&fast, "client-fastlines");
+    rpc.command(&format!("setlocal noswapfile | {setline}"))
+        .expect("setline");
+    let mut term = Terminal::spawn(&sock, &config);
+    assert!(
+        term.pump_until(Duration::from_secs(20), |s| s.contains("line 1")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    pages(&mut term);
+    assert!(
+        top_line(&term.text()).is_some_and(|top| top > 40),
+        "not paged down:\n{}",
+        term.text()
+    );
+    let sent = sent_by_kind(&mut rpc);
+    for kind in predictions {
+        assert_eq!(
+            sent.get(kind),
+            None,
+            "a fast link was sent {kind}: {sent:?}"
+        );
+    }
+
+    let slow = Scratch::new("client-slowlines");
+    let (mut rpc, mut term, _) = drawn_slowly(&slow, "client-slowlines", &setline);
+    pages(&mut term);
+    let sent = sent_by_kind(&mut rpc);
+    assert!(
+        sent.get("lines").is_some_and(|&n| n > 0) && sent.get("shape").is_some_and(|&n| n > 0),
+        "a slow link was not sent its lines: {sent:?}"
+    );
+}
+
 /// A config for a wide terminal: every window's text centred, up to 60
 /// columns of it. A session in one window, its status line its own colour,
 /// and a terminal 160 columns wide.

@@ -1516,6 +1516,18 @@ impl Predictor {
         i64::try_from(pages).map_or(MOST_REACH, |p| (p + 2).clamp(2, MOST_REACH))
     }
 
+    /// How far the agent is to keep lines either side of a view: as far as
+    /// [`Predictor::reach`] says while the link is slow enough to predict
+    /// over, and not at all while it is not — no lines, colours or shapes
+    /// sent for predictions none are made from (see [`ON`]).
+    pub fn agent_reach(&self) -> i64 {
+        if self.on {
+            self.reach()
+        } else {
+            0
+        }
+    }
+
     /// When a prediction made `now` is given up on, unconfirmed.
     pub fn deadline(&self, now: Instant) -> Instant {
         now + self.srtt.unwrap_or_default() * 2 + GRACE
