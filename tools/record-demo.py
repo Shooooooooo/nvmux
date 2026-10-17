@@ -154,6 +154,12 @@ SESSIONS = [
 # And the one made on camera, which the take then moves to the end of the list.
 NEW_NAME = "blog"
 
+# What the take sets nvmux's colour to on the settings screen: the terminal's
+# colour 4, its blue. `→` steps `[style] color` from `terminal` through the
+# terminal's colours 1 to 6 (`colour_options` in src/ui/settings.rs), so this
+# is also how many presses it is away.
+COLOUR = 4
+
 # The files those sessions open. Written under the run's temporary directory,
 # so nothing of them outlives the script.
 PROJECTS = {
@@ -537,6 +543,8 @@ ENTER = b"\r"
 ESCAPE = b"\x1b"
 DOWN = b"\x1b[B"
 UP = b"\x1b[A"
+RIGHT = b"\x1b[C"
+BACKTAB = b"\x1b[Z"
 PREFIX = b"\x00"
 # Ctrl-L, which is readline's clear-screen: it reprints PS1, and whatever is
 # typed after it, and echoes nothing of its own. `shell` uses it to put the
@@ -1414,9 +1422,35 @@ def perform(env, built):
     term.expect("HISTFILE", "the other buffer")
     time.sleep(0.8)
 
-    # 8. the build finishes: a note in the margin says so; the prefix key held
-    # says the key under it, and Enter goes there, to the build as it ended
+    # 8. the settings, floating over the session while it builds: back a
+    # section to the effects and on to the style, nvmux's colour stepped
+    # through the terminal's -- the panel takes each as it comes -- and
+    # saved. The note next is in it, and so is the picker after the detach.
+    term.write(PREFIX + b",", show=(("Ctrl-Space", ","), "settings"))
+    term.expect("esc back", "the settings over the session")
+    time.sleep(0.8)
+    term.write(BACKTAB, wait=0.7, show=(("Shift-Tab",), "section"))
+    term.write(BACKTAB, show=(("Shift-Tab",), "section"))
+    term.expect("bars in that colour", "the style section, on its colour")
+    time.sleep(0.4)
+    for _ in range(COLOUR):
+        term.write(RIGHT, wait=0.4, show=(("\u2192",), "colour"))
+    colour = THEME["palette"].split(":")[COLOUR]
+    term.expect(colour, "nvmux's colour set to %s" % colour)
+    time.sleep(0.3)
+    term.write(b"w", show=(("w",), "save"))
+    term.expect("saved 1 change", "the save")
+    time.sleep(0.5)
+    # The build is let finish with the settings still up: what it prints
+    # takes a second or two to be a note, which then comes in just after
+    # they have gone rather than after a wait on a still screen.
     open(built, "w").close()
+    time.sleep(0.5)
+    term.write(ESCAPE, show=(("Esc",), "back"))
+    term.expect_gone("saved 1 change", "the settings")
+
+    # 9. the build finishes: a note in the margin says so; the prefix key held
+    # says the key under it, and Enter goes there, to the build as it ended
     term.expect("exited with code 0", "the note in the margin")
     time.sleep(2.0)
     term.write(PREFIX, show=(("Ctrl-Space",), "prefix"))
@@ -1426,7 +1460,7 @@ def perform(env, built):
     term.expect("Finished", "api-server, its build done")
     time.sleep(1.6)
 
-    # 9. detach: the sessions keep running on devbox, nvmux exits
+    # 10. detach: the sessions keep running on devbox, nvmux exits
     term.write(PREFIX + b"d", show=(("Ctrl-Space", "d"), "detach"))
     # The editor has to be gone, and waiting for the prompt does not say that:
     # leaving the alternate screen restores the shell's screen, which already
@@ -1437,8 +1471,8 @@ def perform(env, built):
     term.expect("$", "the shell prompt back")
     time.sleep(0.8)
 
-    # 10. come back: the order is kept, and the build's split is where it
-    # was left
+    # 11. come back: the order is kept, the colour saved, and the build's
+    # split is where it was left
     term.type("nvmux %s" % HOST, per_char=0.07, wait=0.3)
     term.write(ENTER, show=(("\u23ce",), "connect"))
     term.expect("attach", "the picker again")
@@ -1929,7 +1963,13 @@ def main():
         os.remove(os.path.join(RUNTIME, "nvmux.log"))
 
     tmp = tempfile.mkdtemp(prefix="nvmux-demo-")
-    cfg = os.path.join(tmp, "config.toml")
+    # The config is where yours would be, under a home of the run's own: the
+    # settings screen says where a save went by its path from HOME, and the
+    # take saves, so the screen says ~/.config/nvmux/config.toml rather than
+    # naming a temporary directory.
+    home = os.path.join(tmp, "home")
+    cfg = os.path.join(home, ".config", "nvmux", "config.toml")
+    os.makedirs(os.path.dirname(cfg))
     with open(cfg, "w") as f:
         f.write('[keys]\nprefix = "Ctrl-Space"\n')
     tools = os.path.join(tmp, "tools")
@@ -1947,6 +1987,7 @@ def main():
     env = os.environ.copy()
     env["PATH"] = os.pathsep.join([devbox.bin, os.path.join(ROOT, "target", "release"),
                                    env["PATH"]])
+    env["HOME"] = home
     env["NVMUX_CONFIG"] = cfg
     # nvmux remembers each host's launch command under XDG_STATE_HOME; the
     # demo's is no business of yours.
