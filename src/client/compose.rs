@@ -63,6 +63,22 @@ impl Frame {
         }
     }
 
+    /// Made [`Frame::new`] again, `width` by `height` and every cell blank in
+    /// `blank`, in the buffer this one has: a frame a screen big is a few
+    /// hundred kilobytes, asked of the allocator — and faulted in — afresh
+    /// sixty times a second otherwise.
+    pub fn reset(&mut self, width: usize, height: usize, blank: Style) {
+        let blank = Out::blank(blank);
+        let n = width * height;
+        self.width = width;
+        self.height = height;
+        self.cells.truncate(n);
+        for cell in &mut self.cells {
+            cell.clone_from(&blank);
+        }
+        self.cells.resize(n, blank);
+    }
+
     pub fn get(&self, row: usize, col: usize) -> Option<&Out> {
         (row < self.height && col < self.width).then(|| &self.cells[row * self.width + col])
     }
@@ -159,35 +175,65 @@ impl View for Still {
 
 /// Put the frame together. See the module docs.
 pub fn compose(model: &Model, view: &dyn View, width: usize, height: usize) -> Frame {
-    let mut frame = Frame::new(width, height, model.style(0));
-    draw(&mut frame, model, view, 1, (0, 0), Within::default(), false);
+    let mut frame = Frame::new(0, 0, Style::default());
+    compose_into(&mut frame, model, view, width, height, true);
+    frame
+}
+
+/// [`compose`], in the buffer `frame` already has, and mended only where
+/// `mend` says: a caller that paints over it before it goes out, mending it
+/// after, mends it once (see [`Frame::mend`]) — before, too, only where what
+/// it paints reads the cells under it.
+pub fn compose_into(
+    frame: &mut Frame,
+    model: &Model,
+    view: &dyn View,
+    width: usize,
+    height: usize,
+    mend: bool,
+) {
+    frame.reset(width, height, model.style(0));
+    // The windows' places, where grid 1 has whatever Neovim drew there
+    // before the window was — nothing meant to be seen, and what a window
+    // sliding away from its place would uncover. Blank, as the frame starts:
+    // grid 1 is not drawn there.
+    let places: Vec<_> = model
+        .layout
+        .iter()
+        .filter(|(g, p)| !p.hidden && **g != 1)
+        .filter_map(|(g, _)| model.window_cells(*g))
+        .collect();
+    draw(
+        frame,
+        model,
+        view,
+        1,
+        (0, 0),
+        Within::default(),
+        false,
+        &places,
+    );
 
     // A window's status line stands over its text, where that is drawn
-    // narrower than the window (see `super::wide`).
-    status_lines_over_text(&mut frame, model, view);
-
-    // Windows next: they never overlap one another, so their order is
-    // nobody's business. Under each, grid 1 has whatever Neovim drew there
-    // before the window was — nothing meant to be seen, and what a window
-    // sliding away from its place would uncover — so it is blanked first:
-    // the whole of the window's place, of which a grid narrower than it
-    // fills the middle.
-    let blank = Out::blank(model.style(0));
-    for (&grid, p) in &model.layout {
-        if p.hidden || grid == 1 {
-            continue;
-        }
-        let Some((row, col, width, height)) = model.window_cells(grid) else {
-            continue;
-        };
-        for r in 0..height {
-            for c in 0..width {
-                if let Some(cell) = frame.at((row + r) as i64, (col + c) as i64) {
-                    *cell = blank.clone();
+    // narrower than the window (see `super::wide`). It is grid 1's, under
+    // the window, and never in a window's place; but should one be laid over
+    // one, the place is blanked again, as the whole of it always was.
+    if status_lines_over_text(frame, model, view) {
+        let blank = Out::blank(model.style(0));
+        for &(row, col, width, height) in &places {
+            for r in 0..height {
+                for c in 0..width {
+                    if let Some(cell) = frame.at((row + r) as i64, (col + c) as i64) {
+                        *cell = blank.clone();
+                    }
                 }
             }
         }
     }
+
+    // Windows next: they never overlap one another, so their order is
+    // nobody's business. Each fills its place, of which a grid narrower than
+    // it fills the middle.
     for (&grid, p) in &model.layout {
         if p.hidden || grid == 1 {
             continue;
@@ -208,17 +254,18 @@ pub fn compose(model: &Model, view: &dyn View, width: usize, height: usize) -> F
                 ..Within::default()
             };
             draw(
-                &mut frame,
+                frame,
                 model,
                 view,
                 grid,
                 (at.0, at.1 + shift),
                 within,
                 false,
+                &[],
             );
         }
     }
-    view.over_windows(&mut frame, model);
+    view.over_windows(frame, model);
 
     let mut layers: Vec<_> = model
         .layout
@@ -233,32 +280,30 @@ pub fn compose(model: &Model, view: &dyn View, width: usize, height: usize) -> F
             // One anchored to a window goes with the window's text.
             Place::Float { .. } => {
                 let at = (at.0, at.1 + view.shift(grid));
-                draw(&mut frame, model, view, grid, at, Within::default(), true);
+                draw(frame, model, view, grid, at, Within::default(), true, &[]);
             }
             Place::Message { scrolled, sep, .. } => {
                 // The message area covers the screen from its row down, and
                 // no further whatever its grid's height.
                 let rows = (height as i64 - at.0).max(0) as usize;
                 if *scrolled && at.0 > 0 {
-                    separator(&mut frame, model, at.0 - 1, sep);
+                    separator(frame, model, at.0 - 1, sep);
                 }
                 let within = Within {
                     rows: Some(rows),
                     ..Within::default()
                 };
-                draw(&mut frame, model, view, grid, at, within, true);
+                draw(frame, model, view, grid, at, within, true, &[]);
             }
             Place::Window { .. } => {}
         }
     }
 
-    frame.mend();
-    frame
+    if mend {
+        frame.mend();
+    }
 }
 
-/// Draw grid `grid` with its top left at `at`, its first `rows` rows if that
-/// is given, mixing it into what is under it where `blends` and its
-/// highlights say to.
 /// How much of a grid [`draw`] puts on the frame: rows from its top, and the
 /// columns of the frame it may cover — all of either where not said.
 #[derive(Debug, Clone, Copy, Default)]
@@ -267,6 +312,15 @@ struct Within {
     cols: Option<(i64, i64)>,
 }
 
+/// Draw grid `grid` with its top left at `at`, as much of it as `within`
+/// says and none of it on the cells of `skip` — rectangles of the frame, its
+/// top row, first column, and how many of each — mixing it into what is
+/// under it where `blends` and its highlights say to.
+///
+/// Row by row: the columns of a row that land on the frame are worked out
+/// once for it, and the colours of a highlight once a run of it — a frame is
+/// tens of thousands of cells, and redrawn whole for a cursor that moved.
+#[allow(clippy::too_many_arguments)]
 fn draw(
     frame: &mut Frame,
     model: &Model,
@@ -275,6 +329,7 @@ fn draw(
     at: (i64, i64),
     within: Within,
     blends: bool,
+    skip: &[(usize, usize, usize, usize)],
 ) {
     let Some(g) = model.grids.get(&grid) else {
         return;
@@ -283,11 +338,25 @@ fn draw(
     let scroll = view.scroll(grid);
     let blank = Cell::default();
     let height = within.rows.map_or(g.height(), |n| n.min(g.height()));
+    // The grid's columns on the frame, and within what it is kept to.
+    let width = frame.width as i64;
+    let (mut lo, mut hi) = ((-at.1).max(0), (g.width() as i64).min(width - at.1));
+    if let Some((from, to)) = within.cols {
+        lo = lo.max(from - at.1);
+        hi = hi.min(to - at.1);
+    }
+    if lo >= hi {
+        return;
+    }
+    // The last highlight resolved, and its style and blend.
+    let mut last: Option<(u32, Style, u8)> = None;
+    let (mut runs, mut cut) = (Vec::with_capacity(4), Vec::with_capacity(4));
     for r in 0..height {
         let y = at.0 + r as i64;
         if y < 0 || y >= frame.height as i64 {
             continue;
         }
+        let y = y as usize;
         let own = g.row(r);
         // Inside a scroll's rectangle the row is the scroll's; outside it, the
         // grid's own.
@@ -297,47 +366,72 @@ fn draw(
                 .contains(&r)
                 .then(|| (left, right, s.row(r - top)))
         });
-        for c in 0..g.width() {
-            let x = at.1 + c as i64;
-            let outside = within.cols.is_some_and(|(lo, hi)| x < lo || x >= hi);
-            if x < 0 || x >= frame.width as i64 || outside {
+        // The grid's columns that land on this row, less those of the
+        // rectangles skipped across it.
+        runs.clear();
+        runs.push((lo, hi));
+        for &(top, left, cols, rows) in skip {
+            if y < top || y >= top + rows {
                 continue;
             }
-            let (cell, wide) = match scrolled {
-                Some((left, right, line)) if (left..right).contains(&c) => {
-                    let i = c - left;
-                    let line = line.unwrap_or(&[]);
-                    let cell = line.get(i).unwrap_or(&blank);
-                    let wide = line.get(i + 1).is_some_and(|n| n.text == Text::Half);
-                    (cell, wide)
+            let (a, b) = (left as i64 - at.1, (left + cols) as i64 - at.1);
+            cut.clear();
+            for &(s, e) in &runs {
+                if b <= s || a >= e {
+                    cut.push((s, e));
+                    continue;
                 }
-                _ => (
-                    &own[c],
-                    own.get(c + 1).is_some_and(|n| n.text == Text::Half),
-                ),
-            };
-            let style = model.style(cell.hl);
-            let blend = if blends { model.blend(cell.hl) } else { 0 };
-            let Some(under) = frame.at(y, x) else {
-                continue;
-            };
-            if blend == 0 {
-                *under = Out {
-                    text: cell.text.clone(),
-                    style,
-                    wide,
-                };
-                continue;
+                if s < a {
+                    cut.push((s, a));
+                }
+                if b < e {
+                    cut.push((b, e));
+                }
             }
-            // A blank lets what is under it through — unless what is under
-            // it is the right half of something wide, which has nothing of
-            // its own to show.
-            if cell.text.is_blank() && under.text != Text::Half {
-                under.style = style::blend_through(&colors, &under.style, &style, blend);
-            } else {
-                under.style = style::blend_over(&colors, &under.style, &style, blend);
-                under.text = cell.text.clone();
-                under.wide = wide;
+            std::mem::swap(&mut runs, &mut cut);
+        }
+        let row = &mut frame.cells[y * frame.width..(y + 1) * frame.width];
+        for &(s, e) in &runs {
+            for c in s as usize..e as usize {
+                let (cell, wide) = match scrolled {
+                    Some((left, right, line)) if (left..right).contains(&c) => {
+                        let i = c - left;
+                        let line = line.unwrap_or(&[]);
+                        let cell = line.get(i).unwrap_or(&blank);
+                        let wide = line.get(i + 1).is_some_and(|n| n.text == Text::Half);
+                        (cell, wide)
+                    }
+                    _ => (
+                        &own[c],
+                        own.get(c + 1).is_some_and(|n| n.text == Text::Half),
+                    ),
+                };
+                let (style, blend) = match last {
+                    Some((hl, style, blend)) if hl == cell.hl => (style, blend),
+                    _ => {
+                        let style = model.style(cell.hl);
+                        let blend = if blends { model.blend(cell.hl) } else { 0 };
+                        last = Some((cell.hl, style, blend));
+                        (style, blend)
+                    }
+                };
+                let under = &mut row[(at.1 + c as i64) as usize];
+                if blend == 0 {
+                    under.text.clone_from(&cell.text);
+                    under.style = style;
+                    under.wide = wide;
+                    continue;
+                }
+                // A blank lets what is under it through — unless what is
+                // under it is the right half of something wide, which has
+                // nothing of its own to show.
+                if cell.text.is_blank() && under.text != Text::Half {
+                    under.style = style::blend_through(&colors, &under.style, &style, blend);
+                } else {
+                    under.style = style::blend_over(&colors, &under.style, &style, blend);
+                    under.text = cell.text.clone();
+                    under.wide = wide;
+                }
             }
         }
     }
@@ -348,11 +442,12 @@ fn draw(
 /// the windows that have one of their own, as `'laststatus'` says — every
 /// window at 2; at 1 every window where there are two or more; and at 0 the
 /// ones with another window under them. None where it is 3, one line across
-/// the whole screen, or where it is not known.
-fn status_lines_over_text(frame: &mut Frame, model: &Model, view: &dyn View) {
+/// the whole screen, or where it is not known. Says whether it laid any.
+fn status_lines_over_text(frame: &mut Frame, model: &Model, view: &dyn View) -> bool {
     let Some(laststatus) = model.laststatus.filter(|l| *l != 3) else {
-        return;
+        return false;
     };
+    let mut laid = false;
     let windows: Vec<(u64, (usize, usize, usize, usize))> = model
         .layout
         .iter()
@@ -382,7 +477,9 @@ fn status_lines_over_text(frame: &mut Frame, model: &Model, view: &dyn View) {
         let start = below * frame.width + col;
         let end = start + width.min(frame.width - col);
         super::wide::realign(&mut frame.cells[start..end], inset as usize, g.width());
+        laid = true;
     }
+    laid
 }
 
 /// The row above messages that have pushed up over the windows: `sep` across
@@ -622,6 +719,106 @@ mod tests {
         let f = compose(&m, &Still, 4, 1);
         assert_eq!(f.text(), " Fxx");
         assert!(!f.cells[0].wide);
+    }
+
+    /// A frame put together in the buffer of another, of any size and
+    /// whatever it held, is the frame put together afresh.
+    #[test]
+    fn a_frame_put_together_in_another_s_buffer_is_the_same() {
+        let m = model(vec![
+            resize(1, 6, 3),
+            line(1, 2, "status", 0),
+            resize(2, 6, 2),
+            line(2, 0, "aaaaaa", 0),
+            line(2, 1, "bbbbbb", 0),
+            Event::WinPos {
+                grid: 2,
+                win: Some(1000),
+                row: 0,
+                col: 0,
+                width: 6,
+                height: 2,
+            },
+            resize(4, 2, 1),
+            line(4, 0, "FF", 0),
+            float(4, 1, 2, 50),
+        ]);
+        let fresh = compose(&m, &Still, 6, 3);
+        for (w, h) in [(9, 5), (6, 3), (2, 1)] {
+            let mut frame = compose(&m, &Still, w, h);
+            frame.cells[0].text = Text::Char('?');
+            compose_into(&mut frame, &m, &Still, 6, 3, true);
+            assert_eq!(frame, fresh, "in the buffer of a {w}x{h} frame");
+        }
+    }
+
+    /// A wide character of grid 1 that a window's place cuts in two, either
+    /// way, leaves the half outside it as a blank.
+    #[test]
+    fn a_wide_character_cut_by_a_windows_place_is_mended() {
+        let wide = |col| {
+            let cell = |text, n| LineCell {
+                text,
+                hl: Some(0),
+                repeat: n,
+            };
+            vec![
+                resize(1, 4, 1),
+                Event::GridLine {
+                    grid: 1,
+                    row: 0,
+                    col: 0,
+                    cells: vec![
+                        cell(Text::Char('x'), 1),
+                        cell(Text::Char('中'), 1),
+                        cell(Text::Half, 1),
+                        cell(Text::Char('y'), 1),
+                    ],
+                },
+                resize(2, 2, 1),
+                line(2, 0, "ww", 0),
+                Event::WinPos {
+                    grid: 2,
+                    win: Some(1000),
+                    row: 0,
+                    col,
+                    width: 2,
+                    height: 1,
+                },
+            ]
+        };
+        // Its right half in the place, then its left.
+        let f = compose(&model(wide(2)), &Still, 4, 1);
+        assert_eq!(f.text(), "x ww");
+        assert!(!f.cells[1].wide);
+        let f = compose(&model(wide(0)), &Still, 4, 1);
+        assert_eq!(f.text(), "ww y");
+    }
+
+    /// A window's status line laid over its text, narrower than the window
+    /// and in its middle, leaves the rest of the window's place blank: none
+    /// of what grid 1 has there shows either side of the text.
+    #[test]
+    fn a_status_line_over_centred_text_leaves_the_place_blank() {
+        let mut m = model(vec![
+            resize(1, 6, 3),
+            line(1, 0, "######", 0),
+            line(1, 1, "######", 0),
+            line(1, 2, "ab  cd", 0),
+            resize(2, 4, 2),
+            line(2, 0, "WWWW", 0),
+            line(2, 1, "WWWW", 0),
+            Event::WinPos {
+                grid: 2,
+                win: Some(1000),
+                row: 0,
+                col: 0,
+                width: 6,
+                height: 2,
+            },
+        ]);
+        m.laststatus = Some(2);
+        assert_eq!(compose(&m, &Still, 6, 3).text(), " WWWW \n WWWW \n abcd ");
     }
 
     /// What grid 1 has under a window is never seen, not even when the
