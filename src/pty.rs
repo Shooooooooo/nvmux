@@ -3457,13 +3457,19 @@ fn pump(
     // that restarted on every wake-up would never fire while a spinner is
     // running. It is set when the machine arms and cleared when it settles.
     let mut deadline: Option<Instant> = None;
+    // The terminal's size: read here, and again whenever it may have changed —
+    // a `SIGWINCH`, drained below, or one the settings or the help took while
+    // they floated — rather than on every pass, as it once was for the bar.
+    // Asking it is two opens of `/dev/tty`, two `ioctl`s and two closes, three
+    // times the system calls of the rest of a pass.
+    let mut size = term::terminal_size();
     // The notice's repaint while it is in flight; see [`Erasing`]. Shared with
     // the hint bar, which wants the same repaint for the same reason and only
     // when this slot is free: a `:mode` in flight repaints the whole screen and
     // covers the bar's row on its way past. And with a kept client's return,
     // which comes in with one already asked for.
     // The row that says what the next key does while a `<prefix>` waits.
-    let mut bar = hint::Bar::new(Instant::now(), term::terminal_size(), keys.bind);
+    let mut bar = hint::Bar::new(Instant::now(), size, keys.bind);
     // `<prefix> d` with settings changed and unsaved asks first, on the bar's
     // row, and takes the keyboard until it is answered.
     let mut leaving: Option<Leaving> = None;
@@ -3598,16 +3604,17 @@ fn pump(
 
         if n > 0 && ready(&fds[2]) {
             winch.drain();
+            size = term::terminal_size();
             // Enough on its own: the kernel signals the pty's foreground group
             // and the client calls try_resize.
-            attachment.resize_to(term::terminal_size());
+            attachment.resize_to(size);
         }
 
         // After the frame it sits on and before any keystroke is acted on. The
-        // size is read here rather than once outside the loop, so every frame
-        // of the notice — it dissolves in and out, so there are many — is
-        // drawn for the screen as it is now, and a resize between the drawing
-        // and the erasing is seen by both.
+        // size is the terminal's as it is now, read again on a resize, so
+        // every frame of the notice — it dissolves in and out, so there are
+        // many — is drawn for the screen as it is, and a resize between the
+        // drawing and the erasing is seen by both.
         if let Some(p) = popup.as_mut() {
             // A held first paint counts as the child still talking, even
             // though the terminal has not heard a word of it. The box must not
@@ -3636,12 +3643,7 @@ fn pump(
                 // behind it, and waits for the client like any other.
                 between: (first_byte.is_some() || dissolved) && attachment.between_sequences(),
             };
-            let act = p.step(
-                Instant::now(),
-                pass,
-                term::terminal_size(),
-                attachment.shadow.as_ref(),
-            );
+            let act = p.step(Instant::now(), pass, size, attachment.shadow.as_ref());
             match act {
                 announce::Act::Idle => {}
                 announce::Act::Paint(bytes) => {
@@ -3665,7 +3667,7 @@ fn pump(
                     // has a session to keep running while the answer comes
                     // (see [`Erasing`]). The size goes first, as it does for a
                     // resume, and on this thread, where a `resize` belongs.
-                    attachment.resize_to(term::terminal_size());
+                    attachment.resize_to(size);
                     match Erasing::start(&attachment.sock) {
                         Ok(started) => erasing = Some(started),
                         // No thread to ask from: the fallback is what a server
@@ -3802,7 +3804,10 @@ fn pump(
                         keys = crate::config::get().keys;
                         prefix = Prefix::with_keys(highest_session_num, keys.prefix, keys.bind);
                         prefix_timeout = Duration::from_millis(keys.timeout_ms);
-                        bar = hint::Bar::new(Instant::now(), term::terminal_size(), keys.bind);
+                        // A resize while they floated was theirs to take, and
+                        // its signal with it.
+                        size = term::terminal_size();
+                        bar = hint::Bar::new(Instant::now(), size, keys.bind);
                     }
                     // Every keystroke restarts the clock, so a number typed at
                     // a human pace is one number.
@@ -3855,7 +3860,7 @@ fn pump(
         match bar.step(
             now,
             pass,
-            term::terminal_size(),
+            size,
             prefix.pending(),
             go,
             attachment.shadow.as_ref(),
@@ -3881,7 +3886,7 @@ fn pump(
                 // since a `:mode` repaints the whole screen and this row with it.
                 attachment.write_over_session(&bytes)?;
                 if erasing.is_none() {
-                    attachment.resize_to(term::terminal_size());
+                    attachment.resize_to(size);
                     match Erasing::start(&attachment.sock) {
                         Ok(started) => erasing = Some(started),
                         Err(e) => {
