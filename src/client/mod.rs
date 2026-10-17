@@ -273,7 +273,9 @@ return out";
 /// argument says the client may scroll ahead, or a `User` autocommand
 /// `nvmux_client_reach_<chan>` says since, with the number as its data; two
 /// at first, the rest a moment later, no more than a few hundred lines at a
-/// time — and the view's own (`lines`, window, buffer, `b:changedtick`,
+/// time; and none at all while that number is 0, as it is while the link is
+/// too fast for predictions (see [`Predictor::agent_reach`]), what was sent
+/// let go of — and the view's own (`lines`, window, buffer, `b:changedtick`,
 /// first line, lines, whether they replace what the client has, the most
 /// bytes of a line sent), only those the client does not have, by the same
 /// rule as [`predict`] keeps them by, and each no longer than the window
@@ -783,6 +785,13 @@ if predict then
   end
   local queued, scrolled = false, false
   local function push_all()
+    -- Nothing at all while the client keeps no lines, its link too fast for
+    -- predictions: what was sent is let go of, to be sent afresh should the
+    -- link slow. Before anything else, as a scroll pushes.
+    if reach <= 0 then
+      have, shapes, edits, stale = {}, {}, {}, {}
+      return
+    end
     if not pcall(api.nvim_get_autocmds, { group = group }) then
       return
     end
@@ -1453,7 +1462,7 @@ impl App {
             return;
         }
         self.agent = true;
-        self.reach = self.predict.as_ref().map_or(2, Predictor::reach);
+        self.reach = self.predict.as_ref().map_or(2, Predictor::agent_reach);
         let (keys, ikeys) = (predict::keys(), predict::insert_keys());
         fn list(keys: &[String]) -> Arg<'_> {
             Arg::Array(keys.iter().map(|k| Arg::str(k)).collect())
@@ -1475,14 +1484,21 @@ impl App {
     }
 
     /// Tell the agent how far either side of a view to keep lines, should
-    /// the round trip have moved it: see [`Predictor::reach`].
+    /// the round trip have moved it: see [`Predictor::agent_reach`].
     fn tell_reach(&mut self) {
-        let (Some(chan), Some(p)) = (self.chan, self.predict.as_ref()) else {
+        let (Some(chan), Some(p)) = (self.chan, self.predict.as_mut()) else {
             return;
         };
-        let reach = p.reach();
+        let reach = p.agent_reach();
         if !self.agent || reach == self.reach {
             return;
+        }
+        // None: the link too fast for predictions now, the agent sends
+        // nothing more and lets go of what it sent, and what the client
+        // keeps of it goes too — no edit reaches it from here on — till the
+        // agent sends it all afresh, with a slow link back.
+        if reach == 0 {
+            p.reset();
         }
         self.reach = reach;
         let pattern = format!("nvmux_client_reach_{chan}");
@@ -4311,16 +4327,91 @@ mod tests {
         assert!(measure(&mut a, rtt).is_empty(), "the same round trip");
         // A second, smoothed to 300 ms: fifteen pages.
         assert_eq!(measure(&mut a, Duration::from_secs(1)), [17]);
-        // Faster again, down to a link no page outruns: one, and two over.
+        // Faster again, down to a link no page outruns, and on to one too
+        // fast to predict over: no lines at all.
         let mut told = Vec::new();
         for _ in 0..60 {
             told.extend(measure(&mut a, Duration::ZERO));
         }
-        assert_eq!(told.last(), Some(&3));
+        assert_eq!(told.last(), Some(&0));
         assert!(
             told.windows(2).all(|w| w[0] > w[1]),
             "only as it moved: {told:?}"
         );
+    }
+
+    /// Over a link too fast to predict over, the agent keeps no lines: it
+    /// is left told to keep none, and told how far once the link slows.
+    #[test]
+    fn the_agent_keeps_no_lines_for_a_link_too_fast_to_predict_over() {
+        let t0 = Instant::now();
+        let mut a = App::new(palette(), Effects::none(), true, (20, 6));
+        a.start();
+        let sent = calls(&mut a);
+        let rtt = Duration::from_millis(1);
+        answer(
+            &mut a,
+            request(&sent, "nvim_get_api_info", ""),
+            Value::Array(vec![7.into()]),
+            t0 + rtt,
+        );
+        answer(&mut a, asks_uis(&sent), uis(false, false), t0 + rtt);
+        let sent = calls(&mut a);
+        let agent = request(&sent, "nvim_exec_lua", "local chan");
+        let (_, _, args) = sent
+            .iter()
+            .find(|(id, ..)| *id == Some(agent))
+            .expect("agent");
+        let args = args[1].as_array().expect("its arguments");
+        assert_eq!(args[1], true.into(), "left to predict");
+        assert_eq!(args[4], 0.into(), "but keeping no lines yet");
+
+        // The link slows: the agent is told how far, and sends them.
+        let t1 = t0 + Duration::from_secs(1);
+        a.keys(b"j", t1);
+        a.tick(t1 + PING_EVERY);
+        let ping = request(&calls(&mut a), "nvim_get_mode", "");
+        answer(
+            &mut a,
+            ping,
+            Value::Nil,
+            t1 + PING_EVERY + Duration::from_secs(1),
+        );
+        let told = calls(&mut a);
+        assert!(
+            told.iter().any(|(_, m, _)| m == "nvim_exec_autocmds"),
+            "told how far: {told:?}"
+        );
+    }
+
+    /// A link fast again stops the predictions, and the agent sending what
+    /// they are made from: what the client kept of it goes too, since no
+    /// edit reaches it from then on.
+    #[test]
+    fn a_link_fast_again_lets_go_of_the_lines_kept() {
+        let mut a = predicting(Duration::from_millis(200));
+        assert!(a.predict.as_ref().is_some_and(|p| p.shape(1000).is_some()));
+        let mut t = Instant::now() + Duration::from_secs(1);
+        let mut told = Vec::new();
+        for _ in 0..60 {
+            t += PING_EVERY;
+            a.keys(b"j", t);
+            a.tick(t);
+            let ping = request(&calls(&mut a), "nvim_get_mode", "");
+            answer(&mut a, ping, Value::Nil, t);
+            told.extend(
+                calls(&mut a)
+                    .into_iter()
+                    .filter(|(_, m, _)| m == "nvim_exec_autocmds"),
+            );
+        }
+        assert!(!told.is_empty(), "the agent told");
+        let p = a.predict.as_ref().expect("predicting");
+        assert!(!p.active(), "a fast link");
+        assert!(p.shape(1000).is_none(), "the window's shape let go of");
+        // Nothing to predict from: a turn of the wheel goes to Neovim.
+        a.keys(b"\x1b[<65;3;2M", t);
+        assert_eq!(top_row(&a), "line 0");
     }
 
     /// The device attributes that close the kitty question are the client's
