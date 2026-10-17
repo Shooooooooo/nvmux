@@ -1482,28 +1482,38 @@ fn pages_typed_faster_than_neovim_scrolls_bring_their_lines_as_it_goes() {
     // its 28 scrolls put its frame past two round trips of the link and a
     // quarter of a second after the first page. It sleeps rather than spins,
     // so as not to take a core from the client and the link on a machine
-    // with few.
+    // with few; and notes when it made each, once asked to.
     const SCROLL: Duration = Duration::from_millis(30);
     let (mut rpc, mut term, link) = drawn_slowly(
         &scratch,
         "client-behind",
         &format!(
             "call setline(1, map(range(1, 2000), '\"line \" . v:val')) | \
-             autocmd WinScrolled * lua vim.uv.sleep({})",
+             autocmd WinScrolled * lua vim.uv.sleep({}) \
+             table.insert(scrolled_at or {{}}, vim.uv.hrtime())",
             SCROLL.as_millis()
         ),
     );
+    rpc.command("lua scrolled_at = {}")
+        .expect("note the scrolls");
     // Two pages past the lines in hand, whose lines come with Neovim's second
     // view, or without a push at each scroll only once it has made all 28.
     // Those past them would wait as well for its views further on, each
     // further behind the keys than the last, and further still on a busy
-    // machine. A page is late halfway between the two.
+    // machine. A page is late halfway between the two, in scrolls as long as
+    // Neovim's were here: on a busy machine, longer than it sleeps.
     let run = pages(&mut rpc, &mut term, &link, Duration::from_millis(10), 28);
-    let within = SLOW + 15 * SCROLL;
+    let scroll = rpc
+        .eval("luaeval('(scrolled_at[#scrolled_at] - scrolled_at[1]) / (#scrolled_at - 1)')")
+        .ok()
+        .and_then(|ns| ns.as_f64().or_else(|| ns.as_u64().map(|ns| ns as f64)))
+        .map(|ns| Duration::from_nanos(ns as u64))
+        .expect("how long a scroll took Neovim");
+    let within = SLOW + 15 * scroll;
     for (k, late) in run.late().iter().enumerate() {
         assert!(
             late.is_some_and(|l| l < within),
-            "page {} waited for Neovim: {late:?}\n{}",
+            "page {} waited for Neovim: {late:?}, a scroll taking it {scroll:?}\n{}",
             k + 1,
             run.timeline(k + 1)
         );
