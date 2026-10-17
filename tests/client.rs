@@ -1254,14 +1254,17 @@ fn pages_typed_faster_than_neovim_scrolls_bring_their_lines_as_it_goes() {
     let scratch = Scratch::new("client-behind");
     // Each scroll takes Neovim this long, and a page is typed every 10 ms.
     // It sleeps rather than spins, so as not to take a core from the client
-    // and the link on a machine with few.
+    // and the link on a machine with few. And it draws as it goes, which a
+    // Neovim behind on its keys does not: the client gives up on scrolls
+    // Neovim has not drawn in two round trips and a little more, which here
+    // would be before Neovim had caught up.
     const SCROLL: Duration = Duration::from_millis(25);
     let (mut rpc, mut term, _) = drawn_slowly(
         &scratch,
         "client-behind",
         &format!(
             "call setline(1, map(range(1, 2000), '\"line \" . v:val')) | \
-             autocmd WinScrolled * lua vim.uv.sleep({})",
+             autocmd WinScrolled * lua vim.uv.sleep({}) vim.cmd.redraw()",
             SCROLL.as_millis()
         ),
     );
