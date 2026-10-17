@@ -1296,8 +1296,8 @@ fn pages_typed_faster_than_neovim_scrolls_bring_their_lines_as_it_goes() {
 /// A page Neovim does not turn — a key it throws away, which nothing the
 /// client can see says it will — is given up on in time, and the view goes
 /// back to Neovim's: typed among pages Neovim is still at work on, as long
-/// after Neovim's frame as one typed then would be, and no sooner; the
-/// pages around it kept.
+/// after Neovim has caught up as one typed then would be, and no sooner;
+/// the pages around it kept.
 #[test]
 fn a_page_neovim_does_not_turn_is_given_up_in_time() {
     require_nvim!();
@@ -1322,6 +1322,8 @@ fn a_page_neovim_does_not_turn_is_given_up_in_time() {
     .expect("on_key");
     let t0 = Instant::now();
     let mut seen: Vec<(u32, Instant)> = Vec::new();
+    // The view's top line each time it changes, and when, till `until` or
+    // till the view goes back.
     let mut watch = |term: &mut Terminal, until: Instant| loop {
         let now = Instant::now();
         let mut last = seen.last().map(|&(top, _)| top);
@@ -1329,7 +1331,7 @@ fn a_page_neovim_does_not_turn_is_given_up_in_time() {
             seen.push((top, now));
             last = Some(top);
         }
-        if now >= until {
+        if now >= until || seen.windows(2).any(|w| w[1].0 < w[0].0) {
             return;
         }
         term.pump(until - now, |t| top_line(&t.text()) != last);
@@ -1338,31 +1340,37 @@ fn a_page_neovim_does_not_turn_is_given_up_in_time() {
         term.type_bytes(b"\x06");
         watch(&mut term, t0 + Duration::from_millis(10) * k);
     }
-    // The soonest Neovim's frame can come, once it has turned the other 27
-    // pages. The page it did not turn is given up on two round trips and a
-    // quarter of a second after that, give or take; twice as long is waited,
-    // for a busy machine.
-    let frame = t0 + 2 * SLOW + 27 * SCROLL;
-    let by = frame + 2 * (4 * SLOW + Duration::from_millis(250));
-    watch(&mut term, by);
-    let tops: Vec<u32> = seen.iter().map(|(top, _)| *top).collect();
+    // Neovim's view once it has taken them all, and when that was: asked once
+    // they have all reached it, it answers only then, taking keys typed
+    // before anything asked of it. On a busy machine that is later than its
+    // sleeps alone would make it, so it is not worked out from them.
+    watch(&mut term, Instant::now() + SLOW + Duration::from_millis(50));
+    let asked = std::thread::spawn(move || {
+        let w0 = rpc.eval("line('w0')").map(|v| v.as_u64());
+        (w0.map_err(|e| e.to_string()), Instant::now())
+    });
+    watch(&mut term, t0 + Duration::from_secs(20));
+    let (w0, caught_up) = asked.join().expect("asked Neovim");
+    let caught = caught_up - t0;
+    let when: Vec<(u32, Duration)> = seen.iter().map(|&(top, at)| (top, at - t0)).collect();
+    let tops: Vec<u32> = seen.iter().map(|&(top, _)| top).collect();
     let back: Vec<&[u32]> = tops.windows(2).filter(|w| w[0] > w[1]).collect();
     assert_eq!(
         back,
         [&[561, 541][..]],
-        "not back by that page alone: {tops:?}"
+        "not back by that page alone, Neovim at {w0:?} once caught up at {caught:?}: {when:?}"
     );
-    assert_eq!(tops.last(), Some(&541), "{tops:?}");
-    assert_eq!(
-        rpc.eval("line('w0')").ok().and_then(|v| v.as_u64()),
-        Some(541),
-        "Neovim went elsewhere"
-    );
-    let at = seen.last().map(|(_, at)| *at).expect("seen");
+    assert_eq!(w0, Ok(Some(541)), "Neovim went elsewhere");
+    // No sooner than Neovim's frame, a way of the link after it caught up,
+    // and as long after that as a page typed then would wait — two round
+    // trips and a quarter of a second, give or take — or twice that on a
+    // busy machine.
+    let at = seen.last().map(|&(_, at)| at).expect("seen");
+    let wait = 4 * SLOW + Duration::from_millis(250);
     assert!(
-        at > frame,
-        "given up on before Neovim could say: {:?}",
-        at - t0
+        at > caught_up + SLOW && at < caught_up + SLOW + 2 * wait,
+        "given up on {:?} after Neovim caught up at {caught:?}: {when:?}",
+        at.saturating_duration_since(caught_up)
     );
 }
 
