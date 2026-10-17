@@ -1244,6 +1244,32 @@ fn pages_typed_further_ahead_than_lines_go_wait_only_for_them() {
     }
 }
 
+/// The same pages typed faster than Neovim scrolls, as on a busy machine:
+/// Neovim takes the keys typed ahead before anything scheduled, and the
+/// lines still come as its view moves, not once it has caught up with the
+/// last of them.
+#[test]
+fn pages_typed_faster_than_neovim_scrolls_bring_their_lines_as_it_goes() {
+    require_nvim!();
+    let scratch = Scratch::new("client-behind");
+    // Each scroll takes Neovim 12 ms, and a page is typed every 10.
+    let (mut rpc, mut term, _) = drawn_slowly(
+        &scratch,
+        "client-behind",
+        "call setline(1, map(range(1, 2000), '\"line \" . v:val')) | \
+         autocmd WinScrolled * lua local t = vim.uv.hrtime() \
+         while vim.uv.hrtime() - t < 12e6 do end",
+    );
+    let late = pages(&mut rpc, &mut term, Duration::from_millis(10), 32);
+    for (k, late) in late.iter().enumerate() {
+        assert!(
+            late.is_some_and(|l| l < 2 * SLOW),
+            "page {} waited for Neovim: {late:?}",
+            k + 1
+        );
+    }
+}
+
 /// A run of pages longer than the lines the client keeps lets go of those
 /// furthest behind rather than start again from two windows: every page of
 /// it is on the screen before Neovim could have heard of it. And edits after

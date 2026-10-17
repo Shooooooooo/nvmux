@@ -755,9 +755,8 @@ if predict then
     -- took, which they have.
     follow(buf)
   end
-  local queued = false
+  local queued, scrolled = false, false
   local function push_all()
-    queued = false
     if not pcall(api.nvim_get_autocmds, { group = group }) then
       return
     end
@@ -777,12 +776,27 @@ if predict then
   soon = function()
     if not queued then
       queued = true
-      vim.schedule(push_all)
+      vim.schedule(function()
+        queued, scrolled = false, false
+        push_all()
+      end)
     end
   end
   local timer = vim.uv.new_timer()
-  au({ 'WinScrolled', 'WinResized', 'BufWinEnter', 'WinNew', 'TabEnter', 'VimResized',
-    'CursorHold', 'CursorHoldI' }, {}, function()
+  au({ 'WinResized', 'BufWinEnter', 'WinNew', 'TabEnter', 'VimResized', 'CursorHold',
+    'CursorHoldI' }, {}, function()
+    soon()
+  end)
+  -- A view moved while Neovim is behind on the keys typed: it takes them
+  -- before anything scheduled, so a push asked for at one scroll and not yet
+  -- made at the next would wait for the last of them, and the pages typed
+  -- ahead for their lines. Pushed with each scroll instead, till it has
+  -- caught up.
+  au('WinScrolled', {}, function()
+    if scrolled then
+      push_all()
+    end
+    scrolled = true
     soon()
   end)
   -- A view moved sideways, said at once: Neovim draws it next, and nothing
