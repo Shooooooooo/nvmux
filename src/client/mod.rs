@@ -2868,22 +2868,31 @@ impl App {
     pub fn frame(&mut self, now: Instant) -> Vec<u8> {
         self.anim.advance(now);
         let (w, h) = self.size;
-        let mut frame = compose::compose(&self.model, &self.anim, w, h);
+        // Put together in the buffer of a frame done with; and mended once,
+        // last — and before what is painted over it too, where that reads
+        // the cells under it: a card, or the cursor's smear, sparks or blink.
+        self.cards.expire(now);
+        let over = self.anim.paints_over() || !self.cards.is_empty();
+        let mut frame = self.screen.take_spare();
+        compose::compose_into(&mut frame, &self.model, &self.anim, w, h, over);
         let cursor = self.anim.paint(&mut frame, &self.model, now);
         // Last, over everything the editor has: see [`cards`].
-        self.cards.expire(now);
-        let signs = cards::Signs::of(&self.model);
-        self.cards.paint(
-            &mut frame,
-            self.model.style(0),
-            &self.model.colors(),
-            &signs,
-            now,
-        );
+        if !self.cards.is_empty() {
+            let signs = cards::Signs::of(&self.model);
+            self.cards.paint(
+                &mut frame,
+                self.model.style(0),
+                &self.model.colors(),
+                &signs,
+                now,
+            );
+        }
         frame.mend();
         let sync = self.model.options.termsync;
         let mut out = std::mem::take(&mut self.say);
-        out.extend_from_slice(&self.screen.draw(frame, &cursor, sync, self.model.links()));
+        out.reserve(4096);
+        self.screen
+            .draw_into(&mut out, frame, &cursor, sync, self.model.links());
         self.dirty = false;
         self.last_frame = Some(now);
         out

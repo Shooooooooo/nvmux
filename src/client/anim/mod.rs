@@ -827,6 +827,15 @@ impl Animator {
         self.switches.retain(|_, s| s.step(dt));
     }
 
+    /// Whether [`Animator::paint`] may paint over the frame, rather than only
+    /// say where the cursor goes: what it paints reads the cells under it,
+    /// and so wants them mended first.
+    pub fn paints_over(&self) -> bool {
+        (self.effects.vfx.is_some() && self.vfx.moving())
+            || (self.effects.smear.is_some() && self.smear.moving())
+            || self.effects.blink
+    }
+
     /// Paint the cursor and what flies off it over a composed frame, and say
     /// how the terminal's own cursor is to be left.
     pub fn paint(&self, frame: &mut Frame, model: &Model, now: Instant) -> Cursor {

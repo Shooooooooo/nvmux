@@ -65,6 +65,10 @@ const LINK_END: &[u8] = b"\x1b]8;;\x1b\\";
 #[derive(Debug)]
 pub struct Screen {
     shown: Option<Frame>,
+    /// A frame done with — the one shown before `shown`, or one forgotten —
+    /// kept for the buffer the next is put together in (see
+    /// [`Screen::take_spare`]).
+    spare: Option<Frame>,
     /// The cursor's shape and colour as last set, so they are only set again
     /// when they change — setting the shape restarts its blink.
     shape: Option<u8>,
@@ -81,15 +85,26 @@ impl Screen {
     pub fn new() -> Self {
         Self {
             shown: None,
+            spare: None,
             shape: None,
             color: None,
         }
     }
 
+    /// A frame done with, to put the next together in its buffer (see
+    /// [`super::compose::compose_into`]); an empty one at first.
+    pub fn take_spare(&mut self) -> Frame {
+        self.spare
+            .take()
+            .unwrap_or_else(|| Frame::new(0, 0, Style::default()))
+    }
+
     /// Forget what the terminal shows: the next frame paints every cell, and
     /// sets the cursor's shape and colour afresh.
     pub fn invalidate(&mut self) {
-        self.shown = None;
+        if let Some(shown) = self.shown.take() {
+            self.spare = Some(shown);
+        }
         self.shape = None;
         self.color = None;
     }
@@ -105,13 +120,26 @@ impl Screen {
         links: &[Box<str>],
     ) -> Vec<u8> {
         let mut out = Vec::with_capacity(4096);
+        self.draw_into(&mut out, frame, cursor, sync, links);
+        out
+    }
+
+    /// [`Screen::draw`], onto the end of `out`.
+    pub fn draw_into(
+        &mut self,
+        out: &mut Vec<u8>,
+        frame: Frame,
+        cursor: &Cursor,
+        sync: bool,
+        links: &[Box<str>],
+    ) {
         if sync {
             out.extend_from_slice(SYNC_BEGIN);
         }
         out.extend_from_slice(b"\x1b[?25l");
-        let old = self
-            .shown
-            .take()
+        let shown = self.shown.take();
+        let old = shown
+            .as_ref()
             .filter(|old| (old.width, old.height) == (frame.width, frame.height));
         let mut pen: Option<Style> = None;
         let mut at: Option<(usize, usize)> = None;
@@ -120,11 +148,17 @@ impl Screen {
         // where it was left and where the next is drawn.
         let mut link = 0;
         for r in 0..frame.height {
+            // A row as it was is nothing to write, as none of its cells is:
+            // told apart at once, as most rows of most frames are.
+            let row = r * frame.width..(r + 1) * frame.width;
+            if old.is_some_and(|old| old.cells[row.clone()] == frame.cells[row]) {
+                continue;
+            }
             let mut c = 0;
             while c < frame.width {
                 let cell = &frame.cells[r * frame.width + c];
                 let span = if cell.wide { 2 } else { 1 };
-                let same = old.as_ref().is_some_and(|old| {
+                let same = old.is_some_and(|old| {
                     (c..(c + span).min(frame.width))
                         .all(|k| old.cells[r * frame.width + k] == frame.cells[r * frame.width + k])
                 });
@@ -147,7 +181,7 @@ impl Screen {
                     ..cell.style
                 };
                 if pen != Some(style) {
-                    sgr(&mut out, &style);
+                    sgr(out, &style);
                     pen = Some(style);
                 }
                 if cell.style.link != link {
@@ -164,7 +198,7 @@ impl Screen {
                     }
                     link = cell.style.link;
                 }
-                cell.text.push_to(&mut out);
+                cell.text.push_to(out);
                 c += span;
                 at = Some((r, c));
             }
@@ -197,7 +231,7 @@ impl Screen {
             out.extend_from_slice(SYNC_END);
         }
         self.shown = Some(frame);
-        out
+        self.spare = shown;
     }
 }
 
@@ -335,6 +369,34 @@ mod tests {
         s.invalidate();
         let again = s.draw(frame(&["ab"]), &hidden(), false, &[]);
         assert_eq!(shown(&again, 2, 1), "ab");
+    }
+
+    /// A frame the same as the one shown writes nothing but the cursor's
+    /// hiding: no cell, no move, no colour.
+    #[test]
+    fn a_frame_as_it_was_writes_no_cell() {
+        let mut s = Screen::new();
+        s.draw(frame(&["ab", "cd"]), &hidden(), false, &[]);
+        let again = s.draw(frame(&["ab", "cd"]), &hidden(), false, &[]);
+        assert_eq!(again, b"\x1b[?25l");
+    }
+
+    /// The frame shown before the last is kept for its buffer, and so is one
+    /// forgotten; drawn onto the end of what is already to be written.
+    #[test]
+    fn a_frame_done_with_is_kept_for_the_next() {
+        let mut s = Screen::new();
+        assert_eq!(s.take_spare().cells.len(), 0, "none at first");
+        let mut out = b"said".to_vec();
+        s.draw_into(&mut out, frame(&["ab"]), &hidden(), false, &[]);
+        assert!(out.starts_with(b"said"), "{out:?}");
+        assert_eq!(shown(&out[4..], 2, 1), "ab");
+        s.draw(frame(&["abc", "def"]), &hidden(), false, &[]);
+        let spare = s.take_spare();
+        assert_eq!((spare.width, spare.height), (2, 1), "the one before");
+        s.invalidate();
+        let spare = s.take_spare();
+        assert_eq!((spare.width, spare.height), (3, 2), "the one forgotten");
     }
 
     /// The frame is bracketed when asked, and the cursor is hidden while it
