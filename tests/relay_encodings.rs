@@ -602,9 +602,29 @@ impl Terminal {
         // In the order the client asked, which is the order it expects.
         replies.sort_by_key(|&(i, _)| i);
         for (_, reply) in replies {
-            self.type_bytes(reply);
+            self.reply(reply);
         }
         self.answered = self.output.len();
+    }
+
+    /// Answer the child as its terminal would, and not at all once it has
+    /// gone: what it asks on its way out it does not wait for, and may be
+    /// read only after, when a write to the pty fails on macOS.
+    fn reply(&mut self, bytes: &[u8]) {
+        if self.exited.is_some() {
+            return;
+        }
+        if let Err(err) = self.pty.write_all(bytes).and_then(|()| self.pty.flush()) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if let Ok(Some(status)) = self.child.try_wait() {
+                    self.exited = Some(common::exit_code(status));
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("write to pty: {err}");
+        }
     }
 
     fn type_bytes(&mut self, bytes: &[u8]) {
@@ -612,7 +632,8 @@ impl Terminal {
         self.pty.flush().expect("flush pty");
     }
 
-    /// The child's exit code, if it exits within `within`.
+    /// The child's exit code, if it exits within `within`, with all it wrote
+    /// on its way out read.
     fn exit_code(&mut self, within: Duration) -> Option<u32> {
         let deadline = Instant::now() + within;
         while self.exited.is_none() && Instant::now() < deadline {
@@ -622,6 +643,12 @@ impl Terminal {
             }
             // Keep answering: the client's own exit waits on a DA1 reply.
             self.pump_until(Duration::from_millis(50), |_| false);
+        }
+        // Its last frames can still be on their way from the pty when it is
+        // seen to have gone: read on to the end of what it wrote, which the
+        // reader comes to once nothing has the pty's slave open.
+        if self.exited.is_some() {
+            self.pump_until(Duration::from_secs(5), |_| false);
         }
         self.exited
     }
