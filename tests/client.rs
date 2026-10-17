@@ -1247,24 +1247,25 @@ fn pages_typed_further_ahead_than_lines_go_wait_only_for_them() {
 /// The same pages typed faster than Neovim scrolls, as on a busy machine:
 /// Neovim takes the keys typed ahead before anything scheduled, and the
 /// lines still come as its view moves, not once it has caught up with the
-/// last of them.
+/// last of them. Its first frame, which lands the pages, comes no sooner —
+/// later than the first page would be given up on, did the client not hear
+/// that Neovim is still at work on them: the view never goes back.
 #[test]
 fn pages_typed_faster_than_neovim_scrolls_bring_their_lines_as_it_goes() {
     require_nvim!();
     let scratch = Scratch::new("client-behind");
-    // Each scroll takes Neovim this long, and a page is typed every 10 ms.
-    // It sleeps rather than spins, so as not to take a core from the client
-    // and the link on a machine with few. And it draws as it goes, which a
-    // Neovim behind on its keys does not: the client gives up on scrolls
-    // Neovim has not drawn in two round trips and a little more, which here
-    // would be before Neovim had caught up.
-    const SCROLL: Duration = Duration::from_millis(25);
+    // Each scroll takes Neovim this long, and a page is typed every 10 ms:
+    // its 28 scrolls put its frame past two round trips of the link and a
+    // quarter of a second after the first page. It sleeps rather than spins,
+    // so as not to take a core from the client and the link on a machine
+    // with few.
+    const SCROLL: Duration = Duration::from_millis(30);
     let (mut rpc, mut term, _) = drawn_slowly(
         &scratch,
         "client-behind",
         &format!(
             "call setline(1, map(range(1, 2000), '\"line \" . v:val')) | \
-             autocmd WinScrolled * lua vim.uv.sleep({}) vim.cmd.redraw()",
+             autocmd WinScrolled * lua vim.uv.sleep({})",
             SCROLL.as_millis()
         ),
     );
@@ -1282,6 +1283,95 @@ fn pages_typed_faster_than_neovim_scrolls_bring_their_lines_as_it_goes() {
             k + 1
         );
     }
+    // Neovim's frame, which may come after `pages` stops watching, and as
+    // long again as a page would wait for one: nothing moves.
+    let top = top_line(&term.text());
+    assert!(
+        !term.pump_until(8 * SLOW, |s| top_line(s) != top),
+        "it moved once Neovim drew:\n{}",
+        term.text()
+    );
+}
+
+/// A page Neovim does not turn — a key it throws away, which nothing the
+/// client can see says it will — is given up on in time, and the view goes
+/// back to Neovim's: typed among pages Neovim is still at work on, as long
+/// after Neovim has caught up as one typed then would be, and no sooner;
+/// the pages around it kept.
+#[test]
+fn a_page_neovim_does_not_turn_is_given_up_in_time() {
+    require_nvim!();
+    let scratch = Scratch::new("client-unturned");
+    // Neovim behind on pages typed every 10 ms, its frame past when the
+    // first would be given up on, as in the test before.
+    const SCROLL: Duration = Duration::from_millis(30);
+    let (mut rpc, mut term, _) = drawn_slowly(
+        &scratch,
+        "client-unturned",
+        &format!(
+            "call setline(1, map(range(1, 2000), '\"line \" . v:val')) | \
+             autocmd WinScrolled * lua vim.uv.sleep({})",
+            SCROLL.as_millis()
+        ),
+    );
+    // The fifth of them thrown away.
+    rpc.command(
+        "lua local n = 0 vim.on_key(function(key) \
+         if key == '\\6' then n = n + 1 if n == 5 then return '' end end end)",
+    )
+    .expect("on_key");
+    let t0 = Instant::now();
+    let mut seen: Vec<(u32, Instant)> = Vec::new();
+    // The view's top line each time it changes, and when, till `until` or
+    // till the view goes back.
+    let mut watch = |term: &mut Terminal, until: Instant| loop {
+        let now = Instant::now();
+        let mut last = seen.last().map(|&(top, _)| top);
+        if let Some(top) = top_line(&term.text()).filter(|&top| Some(top) != last) {
+            seen.push((top, now));
+            last = Some(top);
+        }
+        if now >= until || seen.windows(2).any(|w| w[1].0 < w[0].0) {
+            return;
+        }
+        term.pump(until - now, |t| top_line(&t.text()) != last);
+    };
+    for k in 1..=28 {
+        term.type_bytes(b"\x06");
+        watch(&mut term, t0 + Duration::from_millis(10) * k);
+    }
+    // Neovim's view once it has taken them all, and when that was: asked once
+    // they have all reached it, it answers only then, taking keys typed
+    // before anything asked of it. On a busy machine that is later than its
+    // sleeps alone would make it, so it is not worked out from them.
+    watch(&mut term, Instant::now() + SLOW + Duration::from_millis(50));
+    let asked = std::thread::spawn(move || {
+        let w0 = rpc.eval("line('w0')").map(|v| v.as_u64());
+        (w0.map_err(|e| e.to_string()), Instant::now())
+    });
+    watch(&mut term, t0 + Duration::from_secs(20));
+    let (w0, caught_up) = asked.join().expect("asked Neovim");
+    let caught = caught_up - t0;
+    let when: Vec<(u32, Duration)> = seen.iter().map(|&(top, at)| (top, at - t0)).collect();
+    let tops: Vec<u32> = seen.iter().map(|&(top, _)| top).collect();
+    let back: Vec<&[u32]> = tops.windows(2).filter(|w| w[0] > w[1]).collect();
+    assert_eq!(
+        back,
+        [&[561, 541][..]],
+        "not back by that page alone, Neovim at {w0:?} once caught up at {caught:?}: {when:?}"
+    );
+    assert_eq!(w0, Ok(Some(541)), "Neovim went elsewhere");
+    // No sooner than Neovim's frame, a way of the link after it caught up,
+    // and as long after that as a page typed then would wait — two round
+    // trips and a quarter of a second, give or take — or twice that on a
+    // busy machine.
+    let at = seen.last().map(|&(_, at)| at).expect("seen");
+    let wait = 4 * SLOW + Duration::from_millis(250);
+    assert!(
+        at > caught_up + SLOW && at < caught_up + SLOW + 2 * wait,
+        "given up on {:?} after Neovim caught up at {caught:?}: {when:?}",
+        at.saturating_duration_since(caught_up)
+    );
 }
 
 /// A run of pages longer than the lines the client keeps lets go of those

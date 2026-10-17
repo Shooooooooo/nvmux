@@ -640,6 +640,17 @@ impl Animator {
         }
     }
 
+    /// Give up on no scroll made ahead of Neovim, up or down or sideways,
+    /// before `until`: Neovim is still at work on the keys that make them.
+    pub fn defer(&mut self, until: Instant) {
+        for s in self.scrolls.values_mut() {
+            s.defer(until);
+        }
+        for s in self.sides.values_mut() {
+            s.defer(until);
+        }
+    }
+
     /// How many rows window grid `grid` is ahead of Neovim, and how many
     /// lines its cursor is.
     pub fn ahead(&self, grid: u64) -> (i64, i64) {

@@ -300,8 +300,11 @@ return out";
 /// scrolls go, when that changes (`shape`, window, see [`predict::Shape`]) —
 /// among it, which of the keys the client follows, given it as the agent's
 /// third argument and those in insert mode as its fourth, something maps in
-/// the window's buffer; and a view moved sideways, as Neovim moves it
-/// (`leftcol`, window, its first column).
+/// the window's buffer; a view moved sideways, as Neovim moves it (`leftcol`,
+/// window, its first column); and each time Neovim moves a view while it is
+/// behind on the keys typed (`behind`), which it sends no frame for till it
+/// has caught up — what the client scrolled ahead of it waits for it
+/// meanwhile (see [`Predictor::deadline`]).
 const AGENT_LUA: &str = "local chan, predict, keys, ikeys, reach = ...
 local api = vim.api
 local group = api.nvim_create_augroup('nvmux_client_' .. chan, { clear = true })
@@ -832,9 +835,14 @@ if predict then
   -- before anything scheduled, so a push asked for at one scroll and not yet
   -- made at the next would wait for the last of them, and the pages typed
   -- ahead for their lines. Pushed with each scroll instead, till it has
-  -- caught up.
+  -- caught up. Nor does it send a frame till then, and a frame is what
+  -- lands the scrolls the client made ahead of it: so the client is told,
+  -- with each scroll, that Neovim is still at work on them.
   au('WinScrolled', {}, function()
     if scrolled then
+      if reach > 0 then
+        send('behind')
+      end
       push_all()
     end
     scrolled = true
@@ -1568,6 +1576,14 @@ impl App {
             Some("leftcol") => {
                 if let (Some(win), Some(left)) = (int(1), int(2)) {
                     self.lefts.push((win, usize::try_from(left).unwrap_or(0)));
+                }
+            }
+            // Neovim is still at work on keys typed ahead of it, and will
+            // send no frame till it has caught up: what it has yet to land
+            // waits for it as long as a scroll made now would.
+            Some("behind") => {
+                if let Some(p) = self.predict.as_ref() {
+                    self.anim.defer(p.deadline(now));
                 }
             }
             Some(what) => {
@@ -4302,6 +4318,39 @@ mod tests {
         );
         a.keys(b"\x1b[<65;3;2M", t1);
         assert_eq!(top_row(&a), "line 0", "the command line");
+    }
+
+    /// Neovim behind on the keys typed sends no frame till it has taken the
+    /// last of them, and nothing lands what the client scrolled ahead of it
+    /// meanwhile: its agent says it is still at work as it moves each view,
+    /// and each time, what is ahead waits as long again as a scroll made then
+    /// would — the loop woken for it then. Not heard from, a scroll is given
+    /// up on as ever, two round trips and a little more after it was made.
+    #[test]
+    fn scrolls_ahead_wait_while_neovim_is_at_work_on_the_keys() {
+        let ms = Duration::from_millis;
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let behind = |a: &mut App, now| notify(a, "nvmux_client", vec!["behind".into()], now);
+        let mut a = predicting(ms(200));
+        a.keys(b"\x1b[<65;3;2M\x1b[<65;3;2M", t1);
+        assert_eq!(top_row(&a), "line 6");
+        let p = a.predict.as_ref().expect("predicting");
+        let (made, heard) = (p.deadline(t1), p.deadline(t1 + ms(500)));
+        behind(&mut a, t1 + ms(500));
+        a.frame(made);
+        assert_eq!(a.anim.ahead(2), (6, 6), "still waited for");
+        assert_eq!(a.wake_at(made), Some(heard), "and woken for");
+        a.frame(heard);
+        assert_eq!(a.anim.ahead(2), (0, 0), "given up on");
+        assert_eq!(top_row(&a), "line 0");
+
+        let mut a = predicting(ms(200));
+        a.keys(b"\x1b[<65;3;2M", t1);
+        let made = a.predict.as_ref().expect("predicting").deadline(t1);
+        a.frame(made - ms(1));
+        assert_eq!(a.anim.ahead(2), (3, 3));
+        a.frame(made);
+        assert_eq!(a.anim.ahead(2), (0, 0), "not heard from");
     }
 
     /// The round trip is measured again while the user is at work, and not
