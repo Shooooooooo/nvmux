@@ -147,13 +147,34 @@ impl Host for LocalTransport {
     /// The script's liveness hint is only a hint; the socket is right here,
     /// so it is replaced with the real answer, and a session found dead is
     /// reaped on the spot.
+    ///
+    /// Every session is asked at once, each on a thread of its own. A busy
+    /// one holds its probe for the whole of [`rpc::PROBE_TIMEOUT`], and asked
+    /// one after another they held the listing for that long each: two
+    /// sessions in a `:!make` were six seconds before the picker came up.
+    /// Together they hold it for one budget, however many there are.
     fn settle(&self, listed: Vec<Session>) -> Result<Vec<Session>> {
         let t_probe = std::time::Instant::now();
         let probed = listed.len();
+        let paths = listed
+            .iter()
+            .map(|s| self.paths(&s.id))
+            .collect::<Result<Vec<_>>>()?;
+        let found: Vec<Liveness> = std::thread::scope(|scope| {
+            let probes: Vec<_> = paths
+                .iter()
+                .map(|p| scope.spawn(move || rpc::probe(&p.sock)))
+                .collect();
+            // A probe that panicked proved nothing, and nothing is reaped on
+            // that.
+            probes
+                .into_iter()
+                .map(|p| p.join().unwrap_or(Liveness::Busy))
+                .collect()
+        });
         let mut alive = Vec::with_capacity(listed.len());
-        for mut s in listed {
-            let paths = self.paths(&s.id)?;
-            s.state.liveness = rpc::probe(&paths.sock);
+        for ((mut s, paths), liveness) in listed.into_iter().zip(paths).zip(found) {
+            s.state.liveness = liveness;
             match s.state.liveness {
                 // Never reap a busy session: blocked in `:!make` it is
                 // reachable but cannot answer a deferred call.
