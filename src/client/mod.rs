@@ -494,7 +494,7 @@ if predict then
   end
   -- Rows of a buffer whose colours may have changed since they were sent,
   -- a few runs of them: its tree-sitter tree changed there, or the lines did.
-  local stale, followed = {}, {}
+  local stale, followed, pushed = {}, {}, {}
   local function spoil(buf, lo, hi)
     local runs, merged = stale[buf] or {}, { lo, hi }
     local kept = {}
@@ -528,10 +528,15 @@ if predict then
     -- it colours and the highlighter's of the view would report each other's
     -- rows for good, each report a push and each push a parse: an editor
     -- busy for as long as the client is there, a C file's macros enough.
-    -- Only an edit changes what colours a row has, so of the reports at one
-    -- b:changedtick only those that come before the loop next turns are
-    -- heard — the parse that took the edit's — and none after: the rows the
-    -- edit itself changed are sent again whatever is heard (see flush).
+    -- Only an edit changes what colours a row has. So of the reports at one
+    -- b:changedtick, those up to the end of the first push to end after the
+    -- first of them are heard, and none after. Not only those of the parse
+    -- that took the edit, which the highlighter makes a few milliseconds at
+    -- a time: what an edit did to a tree injected into the buffer — a
+    -- markdown code block's, where a comment opened colours rows well past
+    -- the edit — that tree alone reports, and it is often parsed first by
+    -- that push's own parse of the rows edited. Those the edit itself
+    -- changed are sent again whatever is heard (see flush).
     local heard, hearing
     tree:register_cbs({
       on_changedtree = function(ranges)
@@ -542,18 +547,18 @@ if predict then
         if heard == tick then
           return
         end
-        if hearing ~= tick then
-          hearing = tick
-          vim.schedule(function()
-            heard = tick
-          end)
-        end
+        hearing = tick
         for _, r in ipairs(ranges) do
           spoil(buf, r[1], r[4] + 1)
         end
         soon()
       end,
     }, true)
+    pushed[buf] = function()
+      if followed[buf] == tree and hearing == api.nvim_buf_get_changedtick(buf) then
+        heard = hearing
+      end
+    end
   end
   -- Edits to a buffer since the client was sent its lines, in order: each
   -- left lines a to b of the buffer as it was before it as lines a to c,
@@ -792,6 +797,11 @@ if predict then
           push(win, spoilt)
         end)
       end
+    end
+    -- What was heard at a b:changedtick is all there is to hear at it: see
+    -- follow.
+    for _, done in pairs(pushed) do
+      done()
     end
   end
   soon = function()
@@ -3835,6 +3845,11 @@ mod tests {
         a.reconfigure(&d, t0 + Duration::from_millis(100));
         let sent = calls(&mut a);
         let detach = request(&sent, "nvim_ui_detach", "");
+        // The hold is there, its end still to come.
+        assert_eq!(
+            a.wake_at(t0 + Duration::from_millis(100)),
+            Some(t0 + HOLD_LIMIT)
+        );
         // Long past the hold, with no answer yet.
         let late = t0 + 2 * HOLD_LIMIT;
         assert!(!a.due(late));

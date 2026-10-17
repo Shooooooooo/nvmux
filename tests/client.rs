@@ -1478,6 +1478,62 @@ fn a_session_left_alone_falls_quiet_whatever_highlights_it() {
     );
 }
 
+/// A markdown file's lua code block, a long comment opened at its top by
+/// keys typed one at a time: the rows of the block below the view, which the
+/// client holds, are a comment in Neovim, and a page down predicted ahead of
+/// it shows them as Neovim does. Only the code block's own tree, injected
+/// into the markdown, says those rows changed, and it is parsed after the
+/// markdown's: by the agent's push of the line edited, or by a later slice
+/// of the highlighter's parse.
+#[test]
+fn a_comment_typed_into_a_code_block_colours_the_rows_held_below_it() {
+    require_nvim!();
+    let scratch = Scratch::new("client-md-block");
+    let (_rpc, mut term, _) = drawn_slowly(
+        &scratch,
+        "client-md-block",
+        "call setline(1, map(range(1, 360), 'v:val % 6 == 1 ? \"## line \" . v:val \
+         : v:val % 6 == 3 ? \"Some *text* with `code` and **bold**, line \" . v:val \
+         : v:val % 6 == 5 ? \"- item \" . v:val : \"\"')) | \
+         call append(60, ['```lua'] + map(range(1, 80), 'v:val == 50 \
+         ? \"x = 1 -- ]] closes\" : \"local v\" . v:val . \" = \" . v:val . \" -- code \" . v:val') \
+         + ['```']) | \
+         set termguicolors filetype=markdown | lua vim.treesitter.start(0, 'markdown')",
+    );
+    typed(&mut term, b":62\r");
+    term.pump_until(Duration::from_secs(2), |_| false);
+    // As typed: each key a change of its own, Neovim's redraw after it.
+    for k in [b"O", b"-", b"-", b"[", b"["] {
+        term.type_bytes(k);
+        term.pump_until(Duration::from_millis(300), |_| false);
+    }
+    typed(&mut term, b"\x1b");
+    term.pump_until(Duration::from_secs(2), |_| false);
+    let before = window(&term);
+    term.type_bytes(b"\x06");
+    assert!(
+        term.pump(SLOW, |t| window(t) != before),
+        "<C-f> waited for Neovim:\n{}",
+        term.text()
+    );
+    term.pump_until(Duration::from_millis(30), |_| false);
+    let predicted = (window(&term), colours(&term));
+    term.pump_until(4 * SLOW, |_| false);
+    let landed = (window(&term), colours(&term));
+    assert_eq!(predicted.0, landed.0, "the text moved");
+    let mut wrong = Vec::new();
+    for (r, (p, l)) in predicted.1.iter().zip(&landed.1).enumerate() {
+        if p != l {
+            wrong.push((r, landed.0 .0[r].clone()));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} predicted rows changed colour when Neovim's landed: {wrong:#?}",
+        wrong.len()
+    );
+}
+
 /// A config for a wide terminal: every window's text centred, up to 60
 /// columns of it. A session in one window, its status line its own colour,
 /// and a terminal 160 columns wide.
