@@ -2765,7 +2765,13 @@ impl App {
         let frame = if !self.flushed {
             None
         } else if self.holding(now) {
-            self.hold_since.map(|since| since + HOLD_LIMIT)
+            // Not a time gone by: an attach asked for, or a detach, waits
+            // for its answer however long the hold has been, and a wait
+            // already over would have the loop poll without waiting, round
+            // and round until the answer came.
+            self.hold_since
+                .map(|since| since + HOLD_LIMIT)
+                .filter(|&at| at > now)
         } else if self.dirty {
             Some(
                 self.last_frame
@@ -3788,6 +3794,37 @@ mod tests {
         assert!(!a.due(t0));
         assert_eq!(a.wake_at(t0), Some(t0 + HOLD_LIMIT));
         assert!(a.due(t0 + HOLD_LIMIT));
+    }
+
+    /// A client attaching again, asked to while a hold was still waiting,
+    /// waits for Neovim's answer without waking for a hold long over: a
+    /// wake time already gone would have its loop poll without waiting,
+    /// round and round, for as long as Neovim takes to answer.
+    #[test]
+    fn a_detach_answered_late_is_waited_for_without_spinning() {
+        let t0 = Instant::now();
+        let mut a = attached(false, t0);
+        // Who else is attached changed, and the answer has yet to come: the
+        // hold begins.
+        redraw(&mut a, vec![ui_change()], t0);
+        calls(&mut a);
+        // Told to predict meanwhile, the client detaches to attach again.
+        let mut d = drawing();
+        d.client.predict = true;
+        a.reconfigure(&d, t0 + Duration::from_millis(100));
+        let sent = calls(&mut a);
+        let detach = request(&sent, "nvim_ui_detach", "");
+        // Long past the hold, with no answer yet.
+        let late = t0 + 2 * HOLD_LIMIT;
+        assert!(!a.due(late));
+        assert!(
+            a.wake_at(late).is_none_or(|at| at > late),
+            "woken at once, for a hold long over: {:?}",
+            a.wake_at(late).map(|at| late.saturating_duration_since(at))
+        );
+        // The answer still ends the wait.
+        answer(&mut a, detach, Value::Nil, late);
+        assert_eq!(attached_with_multigrid(&calls(&mut a)), Some(true));
     }
 
     /// A UI that keeps windows on grid 1 attaching has the client detach
