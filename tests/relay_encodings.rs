@@ -78,6 +78,14 @@ const AHEAD_FOR: Duration = Duration::from_secs(2);
 /// What that child writes once its client has been started ahead.
 const AHEAD: &[u8] = b"\x1b]9999;ahead\x07";
 
+/// How long, in milliseconds, that child holds its client, where it is not
+/// [`AHEAD_FOR`].
+const CHILD_AHEAD_MS: &str = "NVMUX_TEST_RELAY_AHEAD_MS";
+
+/// Set on a child whose clients, out of sight, draw at a crawl: `[client]
+/// throttle`, which is off by default.
+const CHILD_THROTTLE: &str = "NVMUX_TEST_RELAY_THROTTLE";
+
 /// What the child's relay announces the session as — on a card nvmux's own
 /// client draws (see [`nvmux::card`]), and Neovim's draws none — on its first
 /// attach and, kept, on every return to the front: as a switch would. Unset,
@@ -177,6 +185,7 @@ fn relay_child() {
     }
     let keep = std::env::var_os(CHILD_KEEP).is_some();
     settings.client.per_session = keep;
+    settings.client.throttle = std::env::var_os(CHILD_THROTTLE).is_some();
     // The picker full screen, which ends the relay: where these tests park a
     // kept client, and what a moved picker key is seen to do. Floating, it
     // would stay in the relay, over the session.
@@ -213,7 +222,7 @@ fn relay_child() {
     let label = std::env::var(CHILD_LABEL).unwrap_or_default();
     let mut pool = nvmux::pool::Pool::configured();
     let mut attachment = if std::env::var_os(CHILD_AHEAD).is_some() {
-        start_ahead(&mut pool, &id, Path::new(&sock))
+        start_ahead(&mut pool, &id, Path::new(&sock), own)
     } else if own {
         let exe = Path::new(env!("CARGO_BIN_EXE_nvmux"));
         nvmux::pty::spawn_own_client(&id, Path::new(&sock), &label, exe).expect("attach")
@@ -306,16 +315,31 @@ fn relay_child() {
 }
 
 /// A client started as `main` starts one ahead, held by the pool for
-/// [`AHEAD_FOR`] and then taken back, never yet relayed — with its probe
-/// answered, which a local server does in well under that.
-fn start_ahead(pool: &mut nvmux::pool::Pool, id: &str, sock: &Path) -> nvmux::pty::Attachment {
-    let attachment = nvmux::pty::spawn_client(id, sock, "").expect("start");
+/// [`AHEAD_FOR`] — or [`CHILD_AHEAD_MS`] — and then taken back, never yet
+/// relayed, with its probe answered, which a local server does in well under
+/// that. nvmux's own if `own`.
+fn start_ahead(
+    pool: &mut nvmux::pool::Pool,
+    id: &str,
+    sock: &Path,
+    own: bool,
+) -> nvmux::pty::Attachment {
+    let attachment = if own {
+        let exe = Path::new(env!("CARGO_BIN_EXE_nvmux"));
+        nvmux::pty::spawn_own_client(id, sock, "", exe).expect("start")
+    } else {
+        nvmux::pty::spawn_client(id, sock, "").expect("start")
+    };
     let probe = nvmux::pty::Probe::start(id, sock).expect("probe");
     pool.start_ahead(attachment, Some(probe));
     let mut out = std::io::stdout();
     let _ = out.write_all(AHEAD);
     let _ = out.flush();
-    std::thread::sleep(AHEAD_FOR);
+    let held_for = std::env::var(CHILD_AHEAD_MS)
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map_or(AHEAD_FOR, Duration::from_millis);
+    std::thread::sleep(held_for);
     let mut back = match pool.take(id) {
         nvmux::pool::Taken::Kept(back) => *back,
         other => panic!("the client started ahead did not come back: {other:?}"),
@@ -368,6 +392,10 @@ struct Asks {
     in_band: bool,
     /// [`CHILD_AHEAD`].
     ahead: bool,
+    /// [`CHILD_AHEAD_MS`].
+    ahead_ms: Option<u64>,
+    /// [`CHILD_THROTTLE`].
+    throttle: bool,
     /// [`CHILD_LABEL`].
     label: Option<&'static str>,
     /// [`CHILD_FADE_MS`].
@@ -460,6 +488,8 @@ impl Terminal {
             keep,
             in_band,
             ahead,
+            ahead_ms,
+            throttle,
             label,
             fade_ms,
             own,
@@ -499,6 +529,12 @@ impl Terminal {
         }
         if ahead {
             cmd = cmd.env(CHILD_AHEAD, "1");
+        }
+        if let Some(ms) = ahead_ms {
+            cmd = cmd.env(CHILD_AHEAD_MS, ms.to_string());
+        }
+        if throttle {
+            cmd = cmd.env(CHILD_THROTTLE, "1");
         }
         if let Some(ms) = fade_ms {
             cmd = cmd.env(CHILD_FADE_MS, ms.to_string());
@@ -1708,6 +1744,197 @@ fn a_client_started_ahead_negotiates_on_its_first_visit_through_the_pty() {
 #[test]
 fn a_client_started_ahead_is_dissolved_in_on_its_first_visit() {
     a_client_started_ahead_negotiates_on_its_first_visit("ahead-fade", true);
+}
+
+/// With `[client] throttle` on, a client started ahead of a session that
+/// draws all the while — a build running in a `:terminal`, a log — is kept to
+/// its first visit. Away, it draws a frame a second rather than every change
+/// (see `nvmux::card::Command::Away`), and what it writes for the terminal
+/// stays far under what would have it retired as having said too much (see
+/// `nvmux::pty::AHEAD_MAX`). And on that visit the session is drawn as it is
+/// by then, not as it was the last time it was drawn away.
+#[test]
+fn a_client_started_ahead_of_a_busy_session_is_kept_to_its_first_visit() {
+    require_nvim!();
+    let tag = "ahead-busy";
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(
+            &common::unique(tag),
+            &common::launch_with("--clean"),
+            common::anywhere(),
+        )
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    let mut rpc = nvmux::rpc::Client::connect(&sock, Duration::from_secs(3)).expect("connect");
+    // Every row of the screen rewritten every 5 ms: a frame of several
+    // kilobytes each time, a megabyte in well under the time it is held.
+    rpc.command(
+        "setlocal noswapfile | lua vim.g.ticks = 0; vim.fn.timer_start(5, function() \
+         vim.g.ticks = vim.g.ticks + 1; local d = tostring(vim.g.ticks % 10); \
+         local lines = { 'tick ' .. vim.g.ticks }; \
+         for _ = 2, 36 do lines[#lines + 1] = string.rep(d, 110) end; \
+         vim.api.nvim_buf_set_lines(0, 0, -1, false, lines) \
+         end, { ['repeat'] = -1 })",
+    )
+    .expect("start the ticks");
+
+    let mut term = Terminal::spawn_child(
+        &sock,
+        &session.id,
+        Protocol::Kitty,
+        Asks {
+            keep: true,
+            ahead: true,
+            throttle: true,
+            own: true,
+            ..Asks::default()
+        },
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| find(out, AHEAD).is_some()),
+        "the child never started its client; it wrote: {}",
+        term.since(0)
+    );
+    let started = term.output.len();
+    let tick = |out: &[u8]| -> Option<u64> {
+        row_on_screen(out, 0)
+            .strip_prefix("tick ")
+            .and_then(|n| n.parse().ok())
+    };
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| tick(out).is_some()),
+        "the session's screen never came up; the child wrote: {}",
+        term.since(started)
+    );
+    // And kept as it is from then on, as in front: never a second behind,
+    // which is two hundred ticks. Neovim asked first, and the screen read
+    // after, so that the time the reading takes — megabytes of frames by
+    // then, on a slow machine — is not counted against the client.
+    term.pump_until(Duration::from_millis(300), |_| false);
+    let mut screen = vt100::Parser::new(ROWS, COLS, 0);
+    let mut read = 0;
+    for _ in 0..5 {
+        term.pump_until(Duration::from_millis(100), |_| false);
+        let now = rpc
+            .eval("g:ticks")
+            .ok()
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        screen.process(&term.output[read..]);
+        read = term.output.len();
+        let shown = row_of(screen.screen(), 0)
+            .strip_prefix("tick ")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        assert!(
+            now.saturating_sub(shown) < 40,
+            "the screen says tick {shown} of {now}"
+        );
+    }
+    assert_eq!(detach(&mut term), Some(0), "the child did not detach");
+}
+
+/// A client started ahead, drawing at a crawl out of sight (`[client]
+/// throttle`), was sized for the terminal as it was then. Made shorter since,
+/// the terminal has the client resized on the first visit, and the paint that
+/// visit holds and dissolves in is drawn for the size it has now — not the old
+/// screen cut short. The client is told it is back in front before it is
+/// resized: away, its redraw would come at the crawl it draws at there (see
+/// `nvmux::card::Command::Away`), after the held paint had gone out without
+/// it.
+///
+/// Held for a time that is no whole number of seconds: away, a client draws
+/// a frame a second at most, counted from its first, and a visit on the
+/// second finds it free to draw whatever it is told then.
+///
+/// And the session draws all the while, a line rewritten every 10 ms, so
+/// that a client left at the crawl has drawn within the last second whenever
+/// the visit comes, and its redraw for the size waits: the paint goes out
+/// without it. A client back in front draws it at once, and what it draws as
+/// the session goes keeps the held paint waiting the longer. Neovim's own
+/// redraw for the size may still come after the paint on a slow machine,
+/// which is why the first frame is held only to being drawn for the size.
+#[test]
+fn a_client_started_ahead_is_dissolved_in_at_the_size_of_its_first_visit() {
+    require_nvim!();
+    let tag = "ahead-size";
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(
+            &common::unique(tag),
+            &common::launch_with("--clean"),
+            common::anywhere(),
+        )
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
+        .expect("connect")
+        .command(
+            "setlocal noswapfile | lua vim.g.ticks = 0; vim.fn.timer_start(10, function() \
+             vim.g.ticks = vim.g.ticks + 1; \
+             vim.api.nvim_buf_set_lines(0, 0, 1, false, { 'tick ' .. vim.g.ticks }) \
+             end, { ['repeat'] = -1 })",
+        )
+        .expect("start the ticks");
+
+    let mut term = Terminal::spawn_child(
+        &sock,
+        &session.id,
+        Protocol::Kitty,
+        Asks {
+            shadow: true,
+            keep: true,
+            ahead: true,
+            ahead_ms: Some(2_500),
+            throttle: true,
+            own: true,
+            ..Asks::default()
+        },
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| find(out, AHEAD).is_some()),
+        "the child never started its client; it wrote: {}",
+        term.since(0)
+    );
+    let rows = ROWS - 10;
+    let at = term.output.len();
+    term.pty
+        .resize(pty_process::Size::new(rows, COLS))
+        .expect("resize the terminal");
+    // The first frame the session is on: the fade's, all of it there at once.
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| {
+            row_on_resized_screen(out, at, rows, 0).starts_with("tick ")
+        }),
+        "the session's screen never came up; the child wrote: {}",
+        term.since(at)
+    );
+    // Drawn for the new size: the session's status line above its last row,
+    // or, where Neovim has yet to redraw for the size, the client's own frame
+    // for it — its window running on to the last row, or ending two rows
+    // above it, over the rows Neovim has still to draw. Not the old screen cut
+    // short: its window's `~` rows running on to the row above the last, and
+    // the rows below that — its status line, its command line — all written
+    // onto the last.
+    let above = row_on_resized_screen(&term.output, at, rows, rows - 2);
+    let last = row_on_resized_screen(&term.output, at, rows, rows - 1);
+    assert!(
+        !(above == "~" && last != "~"),
+        "the first frame is the old screen cut short: {above:?} over {last:?}, and the child wrote: {}",
+        term.since(at)
+    );
+    // And the status line where it goes, soon after if not at once.
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| {
+            row_on_resized_screen(out, at, rows, rows - 2).contains("[No Name]")
+        }),
+        "no status line above the last row: {:?}",
+        row_on_resized_screen(&term.output, at, rows, rows - 2)
+    );
+    assert_eq!(detach(&mut term), Some(0), "the child did not detach");
 }
 
 /// The session's `:messages`.

@@ -1785,6 +1785,83 @@ fn predicted_rows_wear_the_colours_neovim_gives_them() {
     step(&mut term, "<C-b> back over it", b"\x02");
 }
 
+/// The frames the client wrote from `from` on: each hides the cursor first.
+fn frames_since(term: &Terminal, from: usize) -> usize {
+    term.output[from..]
+        .windows(HIDE_CURSOR.len())
+        .filter(|w| *w == HIDE_CURSOR)
+        .count()
+}
+
+const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
+
+/// A client nvmux has put aside (see `nvmux::card::Command::Away`) draws a
+/// session that changes all the while about once a second, where in front it
+/// draws every change it can; and told it is back in front, it draws as it
+/// did at once.
+#[test]
+fn a_client_away_draws_a_busy_session_at_a_crawl() {
+    require_nvim!();
+    let scratch = Scratch::new("client-away");
+    let (sock, mut rpc, config) = session(&scratch, "client-away");
+    rpc.command("setlocal noswapfile | call setline(1, 'ready')")
+        .expect("setline");
+    let mut term = Terminal::spawn(&sock, &config);
+    assert!(
+        term.pump_until(Duration::from_secs(10), |s| s.contains("ready")),
+        "the session never painted: {}",
+        term.text()
+    );
+    // The first line, changed every 20 ms for as long as the test runs.
+    rpc.command(
+        "lua vim.g.ticks = 0; vim.fn.timer_start(20, function() \
+         vim.g.ticks = vim.g.ticks + 1; \
+         vim.api.nvim_buf_set_lines(0, 0, 1, false, { 'tick ' .. vim.g.ticks }) \
+         end, { ['repeat'] = -1 })",
+    )
+    .expect("start the ticks");
+    let mark = term.output.len();
+    term.pump_until(Duration::from_secs(1), |_| false);
+    let front = frames_since(&term, mark);
+    assert!(front >= 10, "in front, {front} frames in a second of ticks");
+
+    term.type_bytes(&nvmux::card::encode(&nvmux::card::Command::Away));
+    // What was on its way as the client was told.
+    term.pump_until(Duration::from_millis(100), |_| false);
+    let mark = term.output.len();
+    term.pump_until(Duration::from_secs(3), |_| false);
+    let away = frames_since(&term, mark);
+    assert!(
+        (2..=5).contains(&away),
+        "away, {away} frames in three seconds of ticks"
+    );
+
+    term.type_bytes(&nvmux::card::encode(&nvmux::card::Command::Clear));
+    let mark = term.output.len();
+    term.pump_until(Duration::from_secs(1), |_| false);
+    let back = frames_since(&term, mark);
+    assert!(
+        back >= 10,
+        "back in front, {back} frames in a second of ticks"
+    );
+    let ticks = rpc
+        .eval("g:ticks")
+        .ok()
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let shown: u64 = term
+        .text()
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("tick "))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    assert!(
+        ticks.saturating_sub(shown) < 10,
+        "back in front, the screen says tick {shown} of {ticks}"
+    );
+}
+
 /// A C file highlighted by tree-sitter, its macros each a tree injected into
 /// it, drawn over a slow link: once it is all drawn and nothing is typed,
 /// Neovim falls quiet. Every parse of other rows than the last remakes or

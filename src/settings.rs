@@ -343,6 +343,13 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
         ),
         own(row(
             "client",
+            "throttle",
+            Tab::Client,
+            "draw a session out of sight once a second, not as it changes",
+            switch!(client.throttle),
+        )),
+        own(row(
+            "client",
             "predict",
             Tab::Client,
             "over a slow link, scrolls show before Neovim answers",

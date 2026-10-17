@@ -69,8 +69,10 @@ impl Pool {
 
     /// Take a client that has just left the front.
     ///
-    /// Kept clients are parked, and `None` comes back; anything else comes
-    /// back as it went in, for the caller to hold as it always has — which is
+    /// Kept clients are parked — to draw at a crawl while they are, if
+    /// `[client] throttle` says so as it stands now — and `None` comes back;
+    /// anything else comes back as it went in, for the caller to hold as it
+    /// always has — which is
     /// also where a kept client goes that left the front before its startup
     /// was over (see `pty::Attachment::is_parkable`), to be replaced on the
     /// next switch as a client that is not kept would be. A client already
@@ -85,7 +87,7 @@ impl Pool {
         }
         let id = attachment.session_id.clone();
         self.retire(&id);
-        if let Some(parked) = attachment.park() {
+        if let Some(parked) = attachment.park(crate::config::get().client.throttle) {
             tracing::debug!(id = %id, parked = self.parked.len() + 1, "client parked");
             self.parked.push(parked);
         }
@@ -94,13 +96,13 @@ impl Pool {
 
     /// Hold a client started ahead of its session's first visit, with its
     /// attach probe if that has still to answer (see
-    /// [`Attachment::start_ahead`]). Whether or not clients are kept: this
-    /// one has not been in front yet, and `per_session` is about what happens
-    /// when one leaves it.
+    /// [`Attachment::start_ahead`]), at a crawl if `[client] throttle` says so.
+    /// Whether or not clients are kept: this one has not been in front yet,
+    /// and `per_session` is about what happens when one leaves it.
     pub fn start_ahead(&mut self, attachment: Attachment, probe: Option<Probe>) {
         let id = attachment.session_id.clone();
         self.retire(&id);
-        if let Some(held) = attachment.start_ahead(probe) {
+        if let Some(held) = attachment.start_ahead(probe, crate::config::get().client.throttle) {
             tracing::debug!(id = %id, held = self.parked.len() + 1, "client started ahead");
             self.parked.push(held);
         }

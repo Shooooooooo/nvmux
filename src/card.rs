@@ -316,8 +316,15 @@ pub enum Command {
     /// more to say.
     Drop { id: u64 },
     /// Let them all go: this client has just come back to the front, and
-    /// whatever it was showing when it left is old.
+    /// whatever it was showing when it left is old. Back from
+    /// [`Command::Away`], if it was there.
     Clear,
+    /// This client has gone to the back — parked, or started ahead of its
+    /// session's first visit — and nothing it draws is seen until it is told
+    /// [`Command::Clear`]: it stops animating, and draws what changes at most
+    /// once in a while, for what nvmux keeps of its screen meanwhile. Told
+    /// only with `[client] throttle` on.
+    Away,
     /// The prefix is held, or it is not any more: while it is, the card the
     /// key acts on says so.
     Keys { held: bool },
@@ -805,6 +812,7 @@ mod tests {
             Command::Show(Card::arrival(8, "blog", true).in_row(row)),
             Command::Drop { id: 7 },
             Command::Clear,
+            Command::Away,
             Command::Keys { held: true },
         ] {
             let wire = encode(&cmd);
@@ -1006,6 +1014,7 @@ mod tests {
                 Command::Show(card) => format!("show {}", card.id),
                 Command::Drop { id } => format!("drop {id}"),
                 Command::Clear => "clear".to_string(),
+                Command::Away => "away".to_string(),
                 Command::Keys { held } => format!("keys {held}"),
                 Command::Settings(_) => "settings".to_string(),
             })
