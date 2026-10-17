@@ -1252,15 +1252,19 @@ fn pages_typed_further_ahead_than_lines_go_wait_only_for_them() {
 fn pages_typed_faster_than_neovim_scrolls_bring_their_lines_as_it_goes() {
     require_nvim!();
     let scratch = Scratch::new("client-behind");
-    // Each scroll takes Neovim 12 ms, and a page is typed every 10.
+    // Each scroll takes Neovim 15 ms, and a page is typed every 10.
     let (mut rpc, mut term, _) = drawn_slowly(
         &scratch,
         "client-behind",
         "call setline(1, map(range(1, 2000), '\"line \" . v:val')) | \
          autocmd WinScrolled * lua local t = vim.uv.hrtime() \
-         while vim.uv.hrtime() - t < 12e6 do end",
+         while vim.uv.hrtime() - t < 15e6 do end",
     );
-    let late = pages(&mut rpc, &mut term, Duration::from_millis(10), 32);
+    // Two pages past the lines in hand, whose lines come with Neovim's second
+    // view. Those past them would wait as well for its views further on, each
+    // further behind the keys than the last, and further still on a busy
+    // machine.
+    let late = pages(&mut rpc, &mut term, Duration::from_millis(10), 28);
     for (k, late) in late.iter().enumerate() {
         assert!(
             late.is_some_and(|l| l < 2 * SLOW),
