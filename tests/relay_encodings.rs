@@ -926,6 +926,87 @@ fn a_prefix_raises_the_hint_row_and_the_next_key_takes_it_off() {
     the_hint_row_goes_up_and_comes_down("hint", true);
 }
 
+/// One row of the screen the child's output describes, the terminal made
+/// `rows` tall `at` that far into it, as the test made it.
+fn row_on_resized_screen(out: &[u8], at: usize, rows: u16, row: u16) -> String {
+    let at = at.min(out.len());
+    let mut parser = vt100::Parser::new(ROWS, COLS, 0);
+    parser.process(&out[..at]);
+    parser.screen_mut().set_size(rows, COLS);
+    parser.process(&out[at..]);
+    row_of(parser.screen(), row)
+}
+
+/// The terminal made taller while a session is attached: the hint row the
+/// prefix puts up goes on its new last row. The relay reads the terminal's
+/// size when it starts and again on each `SIGWINCH`, not on every pass, so a
+/// size not read again would put the bar on the old last row, now rows above
+/// the bottom.
+#[test]
+fn the_hint_row_goes_on_the_last_row_of_a_terminal_made_taller() {
+    require_nvim!();
+    let tag = "hint-taller";
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(&common::unique(tag), &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    // No 'showcmd', as for the bar above: the key Neovim shows would be on
+    // the row this reads.
+    nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
+        .expect("connect")
+        .command("set noshowcmd")
+        .expect("noshowcmd");
+
+    let mut term = Terminal::spawn_with(&sock, &session.id, Protocol::Kitty, true);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| {
+            kitty_push_flags(out).is_some()
+        }),
+        "the client never started; got: {}",
+        term.since(0)
+    );
+    term.pump_until(Duration::from_secs(2), |out| {
+        !row_on_screen(out, 0).is_empty()
+    });
+
+    // Four rows taller, while attached, and the editor redrawn for it.
+    let taller = ROWS + 4;
+    let resized = term.output.len();
+    term.pty
+        .resize(pty_process::Size::new(taller, COLS))
+        .expect("resize the terminal");
+    term.pump_until(Duration::from_millis(500), |_| false);
+
+    term.type_bytes(&[nvmux::keys::PREFIX]);
+    let mark = term.output.len();
+    assert!(
+        term.pump_until(Duration::from_secs(10), |out| {
+            row_on_resized_screen(out, resized, taller, taller - 1).contains("␣ picker")
+        }),
+        "the prefix put no hint row on the new last row, {taller}; it says {:?}, row {ROWS} \
+         says {:?}, and the child wrote: {}",
+        row_on_resized_screen(&term.output, resized, taller, taller - 1),
+        row_on_resized_screen(&term.output, resized, taller, ROWS - 1),
+        term.since(mark)
+    );
+
+    // And the relay goes on: a literal prefix takes the bar down, and the
+    // prefix still detaches.
+    term.type_bytes(&[nvmux::keys::PREFIX]);
+    term.pump_until(Duration::from_millis(300), |_| false);
+    term.type_bytes(&[nvmux::keys::PREFIX]);
+    term.pump_until(Duration::from_millis(150), |_| false);
+    term.type_bytes(b"d");
+    assert_eq!(
+        term.exit_code(Duration::from_secs(10)),
+        Some(0),
+        "the relay did not detach after the resize; the child wrote: {}",
+        term.since(mark)
+    );
+}
+
 /// And with the fade off there is no shadow, so the bar blanks its row and the
 /// relay asks the server for what was under it — the one path on which taking
 /// the bar down costs a round trip, and the one a `NO_COLOR` user is on.
