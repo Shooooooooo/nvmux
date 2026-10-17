@@ -522,10 +522,31 @@ if predict then
     end
     local tree = hl.tree
     followed[buf] = tree
+    -- A parse reports as changed not only what an edit changed but every row
+    -- whose injected trees it made or let go of; and a parse of other rows
+    -- than the last lets go of the last one's. The agent's parse of the rows
+    -- it colours and the highlighter's of the view would report each other's
+    -- rows for good, each report a push and each push a parse: an editor
+    -- busy for as long as the client is there, a C file's macros enough.
+    -- Only an edit changes what colours a row has, so of the reports at one
+    -- b:changedtick only those that come before the loop next turns are
+    -- heard — the parse that took the edit's — and none after: the rows the
+    -- edit itself changed are sent again whatever is heard (see flush).
+    local heard, hearing
     tree:register_cbs({
       on_changedtree = function(ranges)
         if gone or followed[buf] ~= tree then
           return
+        end
+        local tick = api.nvim_buf_get_changedtick(buf)
+        if heard == tick then
+          return
+        end
+        if hearing ~= tick then
+          hearing = tick
+          vim.schedule(function()
+            heard = tick
+          end)
         end
         for _, r in ipairs(ranges) do
           spoil(buf, r[1], r[4] + 1)

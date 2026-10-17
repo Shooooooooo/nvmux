@@ -1449,6 +1449,35 @@ fn predicted_rows_wear_the_colours_neovim_gives_them() {
     step(&mut term, "<C-b> back over it", b"\x02");
 }
 
+/// A C file highlighted by tree-sitter, its macros each a tree injected into
+/// it, drawn over a slow link: once it is all drawn and nothing is typed,
+/// Neovim falls quiet. Every parse of other rows than the last remakes or
+/// lets go of the injected trees of both, and says so; the agent's parse of
+/// the rows it colours and the highlighter's of the view must not keep each
+/// other going, an editor busy for as long as the client is there.
+#[test]
+fn a_session_left_alone_falls_quiet_whatever_highlights_it() {
+    require_nvim!();
+    let scratch = Scratch::new("client-quiet");
+    let (_rpc, mut term, back) = drawn_slowly(
+        &scratch,
+        "client-quiet",
+        "call setline(1, map(range(1, 600), 'v:val % 3 \
+         ? \"int v\" . v:val . \" = \" . v:val . \"; // line \" . v:val \
+         : \"#define M\" . v:val . \" (\" . v:val . \" + 1) // line \" . v:val')) | \
+         set filetype=c | lua vim.treesitter.start(0, 'c')",
+    );
+    // What a first push leaves to a moment later, and its colours.
+    term.pump_until(4 * SLOW, |_| false);
+    let before = back.load(Ordering::Relaxed);
+    term.pump_until(Duration::from_secs(3), |_| false);
+    let sent = back.load(Ordering::Relaxed) - before;
+    assert!(
+        sent < 4096,
+        "Neovim sent {sent} bytes in 3 s with nothing typed and nothing to draw"
+    );
+}
+
 /// A config for a wide terminal: every window's text centred, up to 60
 /// columns of it. A session in one window, its status line its own colour,
 /// and a terminal 160 columns wide.
