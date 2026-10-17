@@ -178,7 +178,8 @@ pub const SETTINGS_ENV: &str = "NVMUX_CLIENT";
 
 /// The least time between two frames drawn for Neovim's flushes: a burst of
 /// them — a `:terminal` running something — is drawn at most this often, the
-/// last of them always.
+/// last of them always. All but the second frame after a quiet spell, which
+/// is drawn at once: see [`App::dirty_due`].
 const MIN_FRAME_GAP: Duration = Duration::from_millis(4);
 
 /// How long drawing waits for what a multigrid attach lacks — where its
@@ -1046,6 +1047,8 @@ pub struct App {
     /// A frame is wanted: something changed.
     dirty: bool,
     last_frame: Option<Instant>,
+    /// When the frame before the last was drawn.
+    frame_before: Option<Instant>,
     /// This attach has had its first flush: before it, nothing animates or
     /// is drawn.
     flushed: bool,
@@ -1131,6 +1134,7 @@ impl App {
             mouse: (false, false),
             dirty: false,
             last_frame: None,
+            frame_before: None,
             flushed: false,
             say: Vec::new(),
             done: false,
@@ -2820,10 +2824,7 @@ impl App {
                 .map(|since| since + HOLD_LIMIT)
                 .filter(|&at| at > now)
         } else if self.dirty {
-            Some(
-                self.last_frame
-                    .map_or(now, |last| (last + MIN_FRAME_GAP).max(now)),
-            )
+            Some(self.dirty_due(now))
         } else {
             [
                 self.anim.next_frame(&self.model, now),
@@ -2845,9 +2846,7 @@ impl App {
             return false;
         }
         if self.dirty {
-            return self
-                .last_frame
-                .is_none_or(|last| now >= last + MIN_FRAME_GAP);
+            return now >= self.dirty_due(now);
         }
         [
             self.anim.next_frame(&self.model, now),
@@ -2856,6 +2855,27 @@ impl App {
         .into_iter()
         .flatten()
         .any(|at| at <= now)
+    }
+
+    /// When a frame for something that changed may be drawn, `now` or later:
+    /// [`MIN_FRAME_GAP`] after the last — but at once where the last came
+    /// after a quiet spell, a frame's time or more without one. A key in
+    /// normal mode has Neovim flush twice, a fraction of a millisecond apart
+    /// with `'showcmd'` on, as it is unless turned off: the key shown, and
+    /// what it did. Held apart by the gap, what it did would come those
+    /// milliseconds late, as most keys' would. A burst still comes no more
+    /// often than the gap allows, all but its first two frames.
+    fn dirty_due(&self, now: Instant) -> Instant {
+        let Some(last) = self.last_frame else {
+            return now;
+        };
+        let quiet = self
+            .frame_before
+            .is_none_or(|before| last.saturating_duration_since(before) >= anim::FRAME);
+        if quiet {
+            return now;
+        }
+        (last + MIN_FRAME_GAP).max(now)
     }
 
     /// When the cards next change from how the last frame showed them.
@@ -2894,7 +2914,7 @@ impl App {
         self.screen
             .draw_into(&mut out, frame, &cursor, sync, self.model.links());
         self.dirty = false;
-        self.last_frame = Some(now);
+        self.frame_before = self.last_frame.replace(now);
         out
     }
 
@@ -3559,6 +3579,40 @@ mod tests {
         a.keys(&crate::card::encode(&crate::card::Command::Settings(d)), t0);
         assert!(a.centre);
         assert!(runs_lua(&calls(&mut a), "local most"));
+    }
+
+    /// A key in normal mode has Neovim flush twice a fraction of a
+    /// millisecond apart, the key shown with `'showcmd'` and then what it
+    /// did: after a quiet spell both are drawn at once, and a burst after
+    /// them no more often than [`MIN_FRAME_GAP`].
+    #[test]
+    fn what_a_key_did_is_drawn_at_once_after_a_quiet_spell() {
+        let t0 = Instant::now();
+        let mut a = attached(true, t0);
+        a.frame(t0);
+        // Quiet, and then the key shown...
+        let shown = t0 + Duration::from_secs(1);
+        redraw(&mut a, vec![line(1, 0, "k")], shown);
+        assert!(a.due(shown), "the key shown, at once");
+        a.frame(shown);
+        // ...and what it did, half a millisecond after: at once too.
+        let did = shown + Duration::from_micros(500);
+        redraw(&mut a, vec![line(1, 1, "did")], did);
+        assert_eq!(a.wake_at(did), Some(did));
+        assert!(a.due(did), "what the key did, at once");
+        a.frame(did);
+        // A burst from there: a frame no sooner than the gap allows.
+        let more = did + Duration::from_micros(500);
+        redraw(&mut a, vec![line(1, 2, "more")], more);
+        assert!(!a.due(more), "the third, held");
+        assert_eq!(a.wake_at(more), Some(did + MIN_FRAME_GAP));
+        let third = did + MIN_FRAME_GAP;
+        assert!(a.due(third));
+        a.frame(third);
+        let again = third + Duration::from_micros(500);
+        redraw(&mut a, vec![line(1, 3, "again")], again);
+        assert!(!a.due(again), "and the fourth");
+        assert_eq!(a.wake_at(again), Some(third + MIN_FRAME_GAP));
     }
 
     /// A card is a frame when it comes, and another each time it looks
