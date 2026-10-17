@@ -598,6 +598,50 @@ fn a_busy_session_is_never_reaped() {
     assert!(sock.exists(), "a busy session must never be reaped");
 }
 
+/// Busy sessions hold their probes for the whole of the probe's budget, and
+/// are probed together: two of them blocked at once are listed in about one
+/// budget, not one each, and both still busy and kept.
+#[test]
+fn busy_sessions_are_probed_together() {
+    require_nvim!();
+    let scratch = Scratch::new("busytwo");
+    let t = scratch.transport();
+
+    let socks: Vec<_> = ["building", "testing"]
+        .into_iter()
+        .map(|name| {
+            let session = t
+                .create_session(name, &common::launch(), common::anywhere())
+                .expect("create");
+            t.local_socket_for(&session).expect("socket")
+        })
+        .collect();
+    // Longer than both budgets together, so that one after another the
+    // second probe is held as long as the first.
+    for sock in &socks {
+        common::block_editor(sock, "call system('sleep 10')", Duration::ZERO);
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    let started = Instant::now();
+    let listed = t.list_sessions().expect("list");
+    let took = started.elapsed();
+
+    assert_eq!(listed.len(), 2, "both busy sessions must still be listed");
+    assert!(
+        listed.iter().all(|s| s.state.liveness == Liveness::Busy),
+        "blocked-but-reachable must read as Busy: {listed:?}"
+    );
+    assert!(
+        socks.iter().all(|s| s.exists()),
+        "a busy session must never be reaped"
+    );
+    assert!(
+        took < nvmux::rpc::PROBE_TIMEOUT + Duration::from_secs(2),
+        "two busy sessions held the listing {took:?}: a budget each, one after another"
+    );
+}
+
 #[test]
 fn names_with_shell_metacharacters_survive_a_round_trip() {
     require_nvim!();

@@ -660,9 +660,9 @@ pub fn probe(path: &Path) -> Liveness {
     // Before anything deferred: a session waiting for a key with its event
     // queue off — at a hit-enter prompt, most often — would hold the deferred
     // call for the whole budget, and it is the picker that waits with it, on
-    // a cleared screen, once per such session. The mode is a fast call and
-    // says so in a millisecond. Busy, not a state of its own: like a `:!make`
-    // it is reachable and must never be reaped.
+    // a cleared screen. The mode is a fast call and says so in a millisecond.
+    // Busy, not a state of its own: like a `:!make` it is reachable and must
+    // never be reaped.
     match client.get_mode() {
         Ok(mode) if mode.blocking => {
             tracing::debug!(
