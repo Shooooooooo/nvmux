@@ -279,9 +279,17 @@ impl<S: Read + Write> Client<S> {
             Value::Array(params),
         ]);
 
-        rmpv::encode::write_value(self.io.get_mut(), &request)
+        // Encoded whole, then written once. rmpv writes each marker and value
+        // on its own, and on a bare socket every one of those was a syscall,
+        // and a wake-up of the session reading it: seventeen for a read of a
+        // session's notes, every two seconds, for every session. A write the
+        // session refuses is told as the flush's error was, a reset where it
+        // has hung up, as a read would find it — not as a failure to encode.
+        let mut bytes = Vec::with_capacity(64);
+        rmpv::encode::write_value(&mut bytes, &request)
             .map_err(|e| self.poison(format!("encoding {method}: {e}")))?;
-        if let Err(e) = self.io.get_mut().flush() {
+        let sent = self.io.get_mut().write_all(&bytes);
+        if let Err(e) = sent.and_then(|()| self.io.get_mut().flush()) {
             let mapped = map_io(e, self.read_timeout);
             return Err(self.poison_if_fatal(mapped, method));
         }
@@ -734,10 +742,11 @@ mod tests {
     }
 
     /// A peer that answers every request with one canned frame, and keeps
-    /// what was sent to it.
+    /// what was sent to it, and in how many writes.
     struct Canned {
         reply: std::io::Cursor<Vec<u8>>,
         sent: Vec<u8>,
+        writes: usize,
     }
 
     impl Read for Canned {
@@ -749,6 +758,7 @@ mod tests {
     impl Write for Canned {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.sent.extend_from_slice(buf);
+            self.writes += 1;
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -779,6 +789,7 @@ mod tests {
         Client::new(Canned {
             reply: std::io::Cursor::new(bytes),
             sent: Vec::new(),
+            writes: 0,
         })
     }
 
@@ -919,6 +930,47 @@ mod tests {
         let sent = rmpv::decode::read_value(&mut &c.io.get_ref().sent[..]).expect("request");
         assert_eq!(sent[2].as_str(), Some("nvim_input"));
         assert_eq!(sent[3][0].as_str(), Some("<CR>"));
+    }
+
+    /// A request goes to the session in one write, however many markers it
+    /// is made of: on a socket each write is a syscall, and the session wakes
+    /// for each. A read of a session's notes was seventeen of them.
+    #[test]
+    fn a_request_is_written_once() {
+        let mut c = answering(Value::Nil);
+        let code = vec![Value::from("return 1"), Value::Array(vec![Value::from(8)])];
+        c.call("nvim_exec_lua", code).expect("answered");
+        assert_eq!(c.io.get_ref().writes, 1, "one write per request");
+        let sent = rmpv::decode::read_value(&mut &c.io.get_ref().sent[..]).expect("request");
+        assert_eq!(sent[2].as_str(), Some("nvim_exec_lua"));
+        assert_eq!(sent[3][0].as_str(), Some("return 1"));
+    }
+
+    /// A peer that has hung up: nothing to read, and a write refused.
+    struct HungUp;
+
+    impl Read for HungUp {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for HungUp {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A session that hung up before the request was written is reset, as a
+    /// read would have found it a moment later: gone, not speaking another
+    /// protocol.
+    #[test]
+    fn a_request_to_a_session_that_hung_up_is_a_reset() {
+        let e = Client::new(HungUp).get_mode().expect_err("refused");
+        assert!(matches!(e, RpcError::Reset), "want Reset, got {e:?}");
     }
 
     #[test]
