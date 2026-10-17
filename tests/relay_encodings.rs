@@ -1839,16 +1839,23 @@ fn a_client_started_ahead_of_a_busy_session_is_kept_to_its_first_visit() {
 /// A client started ahead, drawing at a crawl out of sight (`[client]
 /// throttle`), was sized for the terminal as it was then. Made shorter since,
 /// the terminal has the client resized on the first visit, and the paint that
-/// visit holds and dissolves in is the session redrawn for the size it has
-/// now — its status line on the row above the new last one — not the old
+/// visit holds and dissolves in is drawn for the size it has now — not the old
 /// screen cut short. The client is told it is back in front before it is
-/// resized: away, the redraw would come at the crawl it draws at there (see
+/// resized: away, its redraw would come at the crawl it draws at there (see
 /// `nvmux::card::Command::Away`), after the held paint had gone out without
 /// it.
 ///
 /// Held for a time that is no whole number of seconds: away, a client draws
 /// a frame a second at most, counted from its first, and a visit on the
 /// second finds it free to draw whatever it is told then.
+///
+/// And the session draws all the while, a line rewritten every 10 ms, so
+/// that a client left at the crawl has drawn within the last second whenever
+/// the visit comes, and its redraw for the size waits: the paint goes out
+/// without it. A client back in front draws it at once, and what it draws as
+/// the session goes keeps the held paint waiting the longer. Neovim's own
+/// redraw for the size may still come after the paint on a slow machine,
+/// which is why the first frame is held only to being drawn for the size.
 #[test]
 fn a_client_started_ahead_is_dissolved_in_at_the_size_of_its_first_visit() {
     require_nvim!();
@@ -1863,13 +1870,15 @@ fn a_client_started_ahead_is_dissolved_in_at_the_size_of_its_first_visit() {
         )
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket path");
-    let marker = "started ahead, and shown at its size";
     nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
         .expect("connect")
-        .command(&format!(
-            "setlocal noswapfile | call setline(1, '{marker}')"
-        ))
-        .expect("setline");
+        .command(
+            "setlocal noswapfile | lua vim.g.ticks = 0; vim.fn.timer_start(10, function() \
+             vim.g.ticks = vim.g.ticks + 1; \
+             vim.api.nvim_buf_set_lines(0, 0, 1, false, { 'tick ' .. vim.g.ticks }) \
+             end, { ['repeat'] = -1 })",
+        )
+        .expect("start the ticks");
 
     let mut term = Terminal::spawn_child(
         &sock,
@@ -1898,16 +1907,32 @@ fn a_client_started_ahead_is_dissolved_in_at_the_size_of_its_first_visit() {
     // The first frame the session is on: the fade's, all of it there at once.
     assert!(
         term.pump_until(Duration::from_secs(15), |out| {
-            row_on_resized_screen(out, at, rows, 0).contains(marker)
+            row_on_resized_screen(out, at, rows, 0).starts_with("tick ")
         }),
         "the session's screen never came up; the child wrote: {}",
         term.since(at)
     );
-    let status = row_on_resized_screen(&term.output, at, rows, rows - 2);
+    // Drawn for the new size: the session's status line above its last row,
+    // or, where Neovim has yet to redraw for the size, the client's own frame
+    // for it — its window running on to the last row, or ending two rows
+    // above it, over the rows Neovim has still to draw. Not the old screen cut
+    // short: its window's `~` rows running on to the row above the last, and
+    // the rows below that — its status line, its command line — all written
+    // onto the last.
+    let above = row_on_resized_screen(&term.output, at, rows, rows - 2);
+    let last = row_on_resized_screen(&term.output, at, rows, rows - 1);
     assert!(
-        status.contains("[No Name]"),
-        "the first frame has no status line above its last row: {status:?}, and the child wrote: {}",
+        !(above == "~" && last != "~"),
+        "the first frame is the old screen cut short: {above:?} over {last:?}, and the child wrote: {}",
         term.since(at)
+    );
+    // And the status line where it goes, soon after if not at once.
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| {
+            row_on_resized_screen(out, at, rows, rows - 2).contains("[No Name]")
+        }),
+        "no status line above the last row: {:?}",
+        row_on_resized_screen(&term.output, at, rows, rows - 2)
     );
     assert_eq!(detach(&mut term), Some(0), "the child did not detach");
 }
