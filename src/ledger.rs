@@ -147,10 +147,10 @@ impl Ledger {
             return;
         }
         let (parser, told, stream) = (&mut self.parser, &mut self.told, &mut self.stream);
-        let fed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let fed = crate::panics::caught(|| {
             parser.advance(told, bytes);
             stream.saw_session(bytes);
-        }));
+        });
         if fed.is_err() {
             tracing::warn!(
                 "the ledger's parser panicked; the client's settings will not be put back"

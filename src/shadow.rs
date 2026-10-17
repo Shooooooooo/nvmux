@@ -98,7 +98,6 @@
 //! a fresh client, a fade in — shows it for itself.
 
 use std::io::Write;
-use std::panic::{self, AssertUnwindSafe};
 
 use crate::fade::{SYNC_BEGIN, SYNC_END};
 use crate::falloff;
@@ -418,7 +417,7 @@ impl Shadow {
     /// Run `f` on the parser, and retire the shadow if it panics.
     fn guard(&mut self, f: impl FnOnce(&mut vt100::Parser)) {
         let parser = &mut self.parser;
-        if panic::catch_unwind(AssertUnwindSafe(|| f(parser))).is_err() {
+        if crate::panics::caught(|| f(parser)).is_err() {
             tracing::warn!("the shadow grid's parser panicked; the session will not dissolve");
             self.broken = true;
         }
@@ -1275,6 +1274,7 @@ fn write_sgr(out: &mut Vec<u8>, p: Painted) {
 mod tests {
     use super::*;
     use crate::test_support::contains;
+    use std::panic;
 
     fn palette() -> Palette {
         Palette {

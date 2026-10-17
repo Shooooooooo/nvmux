@@ -49,6 +49,7 @@ pub mod nested;
 pub mod notes;
 pub mod nvim;
 pub mod palette;
+pub mod panics;
 pub mod paths;
 pub mod pool;
 pub mod proc;

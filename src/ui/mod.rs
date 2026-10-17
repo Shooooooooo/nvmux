@@ -205,9 +205,10 @@ const BUSY_TICK: Duration = Duration::from_millis(16);
 
 /// A ratatui screen that is guaranteed to be given back.
 ///
-/// `ratatui::try_init` enables raw mode and enters the alternate screen, and
-/// nothing undoes that on `Drop` — so every `?` between init and restore was a
-/// way to leave the user's shell with no echo. This guard owns the terminal
+/// Taking the terminal ([`init`]: `ratatui::try_init` but for its panic hook)
+/// enables raw mode and enters the alternate screen, and nothing undoes that
+/// on `Drop` — so every `?` between init and restore was a way to leave the
+/// user's shell with no echo. This guard owns the terminal
 /// for one screen; dropping it restores, whatever path led there. The picker,
 /// the prompt, the help and the first-run screen all open through here.
 pub(crate) struct Screen {
@@ -253,7 +254,7 @@ impl Screen {
         crate::term::reset_inherited_attributes();
 
         let mut screen = Self {
-            terminal: ratatui::try_init()?,
+            terminal: init()?,
             closed: false,
         };
         // A second "enter alternate screen" is a no-op on xterm and kitty, and
@@ -332,6 +333,21 @@ impl Drop for Screen {
             ratatui::restore();
         }
     }
+}
+
+/// What `ratatui::try_init` does — raw mode, the alternate screen — but for
+/// the panic hook it puts in as well, one more on every call and never taken
+/// out, which ran for the panics nvmux catches too: nvmux has the one hook of
+/// its own instead (see [`crate::panics`]), put in here for a caller that never
+/// went through `main`.
+fn init() -> std::io::Result<ratatui::DefaultTerminal> {
+    crate::panics::install();
+    ratatui::crossterm::terminal::enable_raw_mode()?;
+    ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::terminal::EnterAlternateScreen
+    )?;
+    ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
 }
 
 /// Take the terminal for one screen, run `f` on it, and give it back.

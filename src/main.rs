@@ -40,8 +40,11 @@ fn main() -> Result<()> {
     paths::restrict_umask();
 
     // Before any screen is drawn, so a `kill` during the picker — not only
-    // during an attached session — hands back a usable terminal.
+    // during an attached session — hands back a usable terminal; and a panic
+    // that ends nvmux does the same, while one it catches leaves the screen
+    // as it is (see `nvmux::panics`).
     nvmux::term::install_signal_safety_net();
+    nvmux::panics::install();
 
     if let Err(e) = run(&cli) {
         // A plain message, no backtrace: every error here is meant to be
