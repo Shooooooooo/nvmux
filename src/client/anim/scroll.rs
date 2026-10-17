@@ -92,7 +92,9 @@ pub struct Ahead {
     pub col: Option<(usize, usize)>,
     /// Where `col` is yet to be worked out: see [`Land`].
     pub land: Option<Land>,
-    /// When it is given up on, if Neovim has not made it by then.
+    /// When it is given up on, if Neovim has not made it by then — put off
+    /// while Neovim is still at work on the keys typed ahead of it (see
+    /// [`Scroll::defer`]).
     pub until: Instant,
     /// `'scrolloff'`: how near the window's edges Neovim lets the cursor be.
     pub scrolloff: usize,
@@ -450,6 +452,14 @@ impl Scroll {
         }
     }
 
+    /// Give up on none of the scrolls ahead before `until`: Neovim is still
+    /// at work on the keys that make them.
+    pub fn defer(&mut self, until: Instant) {
+        for a in &mut self.ahead {
+            a.until = a.until.max(until);
+        }
+    }
+
     /// Move on `dt` seconds of a scroll that settles in `duration`. Says
     /// whether it is still wanted: going, or ahead of Neovim.
     ///
@@ -680,6 +690,29 @@ mod tests {
             "back from there, a row at once"
         );
         while s.step(0.01, 0.3) {}
+        assert_eq!(shows(&s), [10, 11, 12, 13, 14].map(Some));
+    }
+
+    /// Neovim heard still at work on the keys typed ahead of it, its
+    /// predictions are given up on no sooner than it says — never sooner than
+    /// they would have been — and then all the same, and all together.
+    #[test]
+    fn a_prediction_waits_while_neovim_is_at_work_on_its_key() {
+        let t0 = Instant::now();
+        let ms = std::time::Duration::from_millis;
+        let mut s = Scroll::still((0, 5, 0, 1), lines(10..15), false);
+        for until in [t0 + ms(500), t0 + ms(510)] {
+            let go = Ahead { until, ..go(2) };
+            assert!(s.predict(go, &mut fill(10, 99), &mut |_, _| None));
+        }
+        s.defer(t0 + ms(900));
+        s.expire(t0 + ms(500));
+        assert_eq!(s.ahead(), 4, "still at work");
+        s.defer(t0 + ms(100));
+        s.expire(t0 + ms(899));
+        assert_eq!(s.ahead(), 4, "not brought sooner");
+        s.expire(t0 + ms(900));
+        assert_eq!(s.ahead(), 0, "given up on");
         assert_eq!(shows(&s), [10, 11, 12, 13, 14].map(Some));
     }
 

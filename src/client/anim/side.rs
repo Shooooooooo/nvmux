@@ -89,6 +89,14 @@ impl Side {
         self.ahead.front().map(|(_, until)| *until)
     }
 
+    /// Give up on none of the scrolls ahead before `until`: Neovim is still
+    /// at work on the keys that make them.
+    pub fn defer(&mut self, until: Instant) {
+        for (_, at) in &mut self.ahead {
+            *at = (*at).max(until);
+        }
+    }
+
     /// Where the cursor is drawn in its grid, if this window has it.
     pub fn cursor(&self) -> Option<(usize, usize)> {
         self.cursor
@@ -124,5 +132,22 @@ mod tests {
         s.push(Vec::new(), 3, t, None);
         assert!(!s.landed(5), "not one the client made");
         assert_eq!(s.left(), None);
+    }
+
+    /// Neovim heard still at work on the keys typed ahead of it, a scroll
+    /// sideways waits for it as long as it says, and never less.
+    #[test]
+    fn a_scroll_sideways_waits_while_neovim_is_at_work_on_its_key() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut s = Side::new((0, 2, 0, 4));
+        s.push(Vec::new(), 1, t0 + ms(500), None);
+        s.push(Vec::new(), 7, t0 + ms(510), None);
+        s.defer(t0 + ms(900));
+        assert_eq!(s.until(), Some(t0 + ms(900)));
+        s.defer(t0 + ms(100));
+        assert_eq!(s.until(), Some(t0 + ms(900)), "not brought sooner");
+        assert!(s.landed(1));
+        assert_eq!(s.until(), Some(t0 + ms(900)), "the next as well");
     }
 }

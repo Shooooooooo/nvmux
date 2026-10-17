@@ -82,7 +82,11 @@
 //! Neovim always has the last word. What it scrolls is taken off what the
 //! client is ahead by; a prediction it has not confirmed in two round trips
 //! and a little more is let go, and the view goes back to Neovim's (see
-//! `super::anim::scroll`).
+//! `super::anim::scroll`). Neovim behind on the keys typed — on a busy
+//! machine, or a buffer slow to scroll — confirms nothing till it has taken
+//! the last of them, though: it sends no frame before. So the agent says when
+//! Neovim moves a view working through them, and the predictions waiting for
+//! it are given as long again from then as one made then would be.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -1528,7 +1532,9 @@ impl Predictor {
         }
     }
 
-    /// When a prediction made `now` is given up on, unconfirmed.
+    /// When a prediction made `now` is given up on, unconfirmed — and one
+    /// made before, Neovim heard `now` still at work on the keys typed ahead
+    /// of it.
     pub fn deadline(&self, now: Instant) -> Instant {
         now + self.srtt.unwrap_or_default() * 2 + GRACE
     }
