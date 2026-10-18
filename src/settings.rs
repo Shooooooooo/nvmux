@@ -13,7 +13,9 @@
 
 use std::sync::LazyLock;
 
-use crate::config::{ParticleMode, Settings, ThemeColor, Ui, MAX_FADE_MS, MAX_TIMEOUT_MS};
+use crate::config::{
+    Centre, ParticleMode, Predict, Settings, ThemeColor, Ui, MAX_FADE_MS, MAX_TIMEOUT_MS,
+};
 use crate::keys::BINDINGS;
 
 /// The screen's tabs. Each is a table of the file, but for the keys: their
@@ -212,7 +214,7 @@ impl Setting {
         }
         match self.needs? {
             Needs::Fade if !settings.effects.fade.enabled => Some("needs fade"),
-            Needs::Centre if !settings.client.centre => Some("needs centre"),
+            Needs::Centre if settings.client.centre == Centre::Off => Some("needs centre"),
             Needs::Particles if !settings.effects.particles.enabled => Some("needs particles"),
             _ => None,
         }
@@ -359,15 +361,31 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
             "client",
             "predict",
             Tab::Client,
-            "over a slow link, scrolls show before Neovim answers",
-            switch!(client.predict),
+            "over a slow link, scrolls show before Neovim answers; auto: over ssh",
+            Kind::Choice {
+                options: &["auto", "on", "off"],
+                get: |s| s.client.predict.name(),
+                set: |s, name| {
+                    if let Some(way) = Predict::ALL.into_iter().find(|w| w.name() == name) {
+                        s.client.predict = way;
+                    }
+                },
+            },
         )),
         own(row(
             "client",
             "centre",
             Tab::Client,
-            "on a wide terminal, each window's text in the middle of the window",
-            switch!(client.centre),
+            "each window's text in its middle: smart as wide as it wants, or fixed",
+            Kind::Choice {
+                options: &["off", "smart", "fixed"],
+                get: |s| s.client.centre.name(),
+                set: |s, name| {
+                    if let Some(way) = Centre::ALL.into_iter().find(|w| w.name() == name) {
+                        s.client.centre = way;
+                    }
+                },
+            },
         )),
         own(needs(
             Needs::Centre,
@@ -385,16 +403,6 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
                     unit: "",
                     zero: Some("no limit"),
                 },
-            ),
-        )),
-        own(needs(
-            Needs::Centre,
-            row(
-                "client",
-                "smart_width",
-                Tab::Client,
-                "or as many as what it shows wants: its 'textwidth', its long lines",
-                switch!(client.smart_width),
             ),
         )),
         own(row(
@@ -788,7 +796,7 @@ mod tests {
             .collect()
     }
 
-    /// At the defaults only what waits on two switches that start off —
+    /// At the defaults only what waits on two settings that start off —
     /// `centre` and the particles — has no effect.
     #[test]
     fn at_the_defaults_only_what_waits_on_a_switch_that_starts_off_is_silent() {
@@ -796,7 +804,6 @@ mod tests {
             inert_paths(&Settings::default()),
             vec![
                 ("client.window_width".to_string(), "needs centre"),
-                ("client.smart_width".to_string(), "needs centre"),
                 ("effects.particles.mode".to_string(), "needs particles"),
             ]
         );
@@ -824,7 +831,7 @@ mod tests {
     fn neovims_client_silences_nvmuxs_clients_settings() {
         let mut settings = Settings::default();
         settings.client.ui = Ui::Nvim;
-        settings.client.centre = true;
+        settings.client.centre = Centre::Smart;
         let silenced: Vec<String> = inert_paths(&settings).into_iter().map(|(p, _)| p).collect();
         let own: Vec<String> = all().iter().filter(|s| s.own).map(Setting::path).collect();
         assert_eq!(silenced, own);
@@ -833,19 +840,24 @@ mod tests {
             .all(|(_, why)| *why == "nvmux client only"));
     }
 
-    /// A switch a setting needs, off, silences it and only it.
+    /// A switch a setting needs, off, silences it and only it; and `centre`
+    /// silences `window_width` only off, either way of centring giving it a
+    /// say.
     #[test]
     fn a_switch_a_setting_needs_silences_it() {
-        let mut settings = Settings::default();
-        settings.client.centre = true;
-        settings.effects.fade.enabled = false;
-        assert_eq!(
-            inert_paths(&settings),
-            vec![
-                ("effects.fade.duration_ms".to_string(), "needs fade"),
-                ("effects.fade.session".to_string(), "needs fade"),
-                ("effects.particles.mode".to_string(), "needs particles"),
-            ]
-        );
+        for centre in [Centre::Smart, Centre::Fixed] {
+            let mut settings = Settings::default();
+            settings.client.centre = centre;
+            settings.effects.fade.enabled = false;
+            assert_eq!(
+                inert_paths(&settings),
+                vec![
+                    ("effects.fade.duration_ms".to_string(), "needs fade"),
+                    ("effects.fade.session".to_string(), "needs fade"),
+                    ("effects.particles.mode".to_string(), "needs particles"),
+                ],
+                "{centre:?}"
+            );
+        }
     }
 }

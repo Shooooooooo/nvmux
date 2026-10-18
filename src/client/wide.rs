@@ -39,7 +39,8 @@ use super::grid::Text;
 
 /// What each window of the tab page in front wants, given how wide a
 /// window's text is (the first argument) and whether to judge each by what
-/// it shows (the second: see [`crate::config::ClientSettings::smart_width`]).
+/// it shows (the second: `[client] centre = "smart"`, see
+/// [`crate::config::ClientSettings::centre`]).
 ///
 /// A window showing a terminal wants the whole terminal, more than any is
 /// wide — the program in it is told its window's width. So does one whose

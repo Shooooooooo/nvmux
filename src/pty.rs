@@ -6333,6 +6333,14 @@ mod tests {
         a.hang_up();
         let took = start.elapsed();
 
+        // A shell may hold the trap of a signal that lands as it goes into
+        // `read`, to run once the `read` returns: bash 3.2, macOS's `sh`, runs
+        // one at once only while `read` is waiting, and otherwise between
+        // commands. A line ends the `read` either way, and prints nothing of
+        // its own: the `H` is still the trap's alone.
+        a.master.write_all(b"\n").expect("write");
+        a.master.flush().expect("flush");
+
         assert!(
             wait_for(&a, b'H'),
             "the client never reported a hangup, so none was delivered"

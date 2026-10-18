@@ -138,6 +138,7 @@ use self::predict::{Command, Mode, Predictor, Side};
 use self::redraw::Event;
 use self::screen::Screen;
 use self::wire::{Arg, Inbox, Outbox};
+use crate::config::Centre;
 use crate::palette::{Palette, Rgb};
 
 /// The options that lay windows out, as the agent gives them: `'laststatus'`,
@@ -179,7 +180,8 @@ pub const PALETTE_ENV: &str = "NVMUX_PALETTE";
 /// The variable the settings a client draws with come in, from the nvmux
 /// that started it: those nvmux runs on, which the file the client would
 /// otherwise read does not have where the settings screen has changed them
-/// and not saved (see [`crate::config::Drawing`]).
+/// and not saved, and whether its session is on another machine, which the
+/// file never has (see [`crate::config::Drawing`]).
 pub const SETTINGS_ENV: &str = "NVMUX_CLIENT";
 
 /// The least time between two frames drawn for Neovim's flushes: a burst of
@@ -1096,14 +1098,12 @@ pub struct App {
     /// [`cards`].
     cards: cards::Cards,
     /// `[client] centre`: each window's text in the middle of the window, on
-    /// a terminal wider than it needs (see [`wide`]).
-    centre: bool,
+    /// a terminal wider than it needs, its width judged by what it shows or
+    /// `window_width` for all of them (see [`wide`]).
+    centre: Centre,
     /// `[client] window_width`: how many columns a window's text gets with
     /// it centred; 0 for no limit.
     window_width: usize,
-    /// `[client] smart_width`: each window's width judged by what it shows,
-    /// rather than `window_width` for all of them (see [`wide::MEASURE_LUA`]).
-    smart: bool,
     /// The measure has been left in the editor, this attach.
     measuring: bool,
     /// The window grids asked to be narrower than their windows, and how
@@ -1168,9 +1168,8 @@ impl App {
             typed: None,
             lefts: Vec::new(),
             cards: cards::Cards::default(),
-            centre: false,
+            centre: Centre::Off,
             window_width: 0,
-            smart: false,
             measuring: false,
             narrowed: HashMap::new(),
             cut: HashMap::new(),
@@ -1179,16 +1178,19 @@ impl App {
         }
     }
 
-    /// This client, with each window's text in the middle of the window if
-    /// `centre`, `window_width` wide — or, `smart`, as wide as what it shows
-    /// wants (see [`wide`]).
-    pub fn with_centre(self, centre: bool, window_width: usize, smart: bool) -> Self {
-        Self {
+    /// This client, with each window's text in the middle of the window as
+    /// `centre` says: `window_width` wide, or as wide as what it shows wants
+    /// (see [`wide`]).
+    pub fn with_centre(self, centre: Centre, window_width: usize) -> Self {
+        let mut app = Self {
             centre,
             window_width,
-            smart,
             ..self
-        }
+        };
+        // A grid narrower than its window is a window's: windows of their
+        // own are wanted.
+        app.multigrid_wanted |= app.centring();
+        app
     }
 
     /// This client, writing each frame in as few bytes as it takes if `lean`
@@ -1201,7 +1203,7 @@ impl App {
     /// Whether each window's text is centred, as it stands: not with no
     /// limit on a window's width.
     fn centring(&self) -> bool {
-        self.centre && self.window_width != 0
+        self.centre != Centre::Off && self.window_width != 0
     }
 
     /// Say who this client is, and attach — once it is known who else is
@@ -1232,7 +1234,8 @@ impl App {
     /// [`wide::MEASURE_LUA`]); given this client's channel, the measure stays
     /// and says so again whenever that changes.
     fn measure(&mut self, chan: Option<u64>) {
-        let mut args = vec![Arg::Int(self.window_width as i64), Arg::Bool(self.smart)];
+        let smart = self.centre == Centre::Smart;
+        let mut args = vec![Arg::Int(self.window_width as i64), Arg::Bool(smart)];
         if let Some(chan) = chan {
             args.push(Arg::Int(chan as i64));
         }
@@ -1646,13 +1649,17 @@ impl App {
     pub fn reconfigure(&mut self, drawing: &crate::config::Drawing, now: Instant) {
         let effects = Effects::from_settings(&drawing.settings());
         let client = drawing.client;
-        let wanted = effects.want_multigrid() || client.predict;
+        let predict = client.predicts(drawing.remote);
         let predicting = self.predict.is_some();
+        let centred = (self.centre, self.window_width);
+        self.centre = client.centre;
+        self.window_width = usize::from(client.window_width);
+        let wanted = effects.want_multigrid() || predict || self.centring();
         self.anim.set_effects(effects);
         self.screen.set_lean(client.lean_output);
         self.dirty = true;
-        if client.predict != predicting {
-            self.predict = client.predict.then(|| {
+        if predict != predicting {
+            self.predict = predict.then(|| {
                 let mut p = Predictor::default();
                 p.typed.attached();
                 p
@@ -1663,10 +1670,6 @@ impl App {
         if flipped {
             self.client_info();
         }
-        let centred = (self.centre, self.window_width, self.smart);
-        self.centre = client.centre;
-        self.window_width = usize::from(client.window_width);
-        self.smart = client.smart_width;
 
         let again = match self.attach {
             // Windows of their own wanted now: whether they can be had is
@@ -1678,7 +1681,7 @@ impl App {
             }
             // Not wanted any more; or the agent to be told it predicts, or
             // that it does not.
-            Attach::Attached { multigrid: true } if !wanted || client.predict != predicting => {
+            Attach::Attached { multigrid: true } if !wanted || predict != predicting => {
                 self.leave(wanted, now);
                 true
             }
@@ -1696,7 +1699,7 @@ impl App {
             return;
         }
         self.leave_agent();
-        if centred != (self.centre, self.window_width, self.smart) {
+        if centred != (self.centre, self.window_width) {
             if self.centring() {
                 // A measure left in the editor is replaced by the next.
                 self.measuring = false;
@@ -3009,11 +3012,14 @@ impl App {
 /// Run the client on its pty, for the session at `sock`, until the session or
 /// the client is done. See the module docs.
 pub fn run(sock: &Path) -> anyhow::Result<()> {
-    let settings = std::env::var(SETTINGS_ENV)
+    // Read from the file only by a client nvmux did not start, which is told
+    // nothing of where its session is either: a session on this machine, as
+    // far as it knows.
+    let drawing = std::env::var(SETTINGS_ENV)
         .ok()
         .and_then(|text| crate::config::Drawing::from_env(&text))
-        .map(|drawing| drawing.settings())
-        .unwrap_or_else(|| crate::config::load().unwrap_or_default());
+        .unwrap_or_else(|| crate::config::load().unwrap_or_default().drawing());
+    let settings = drawing.settings();
     let effects = Effects::from_settings(&settings);
     let term = palette_from_env().unwrap_or(FALLBACK);
 
@@ -3026,11 +3032,11 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
     let winch = crate::winch::Winch::install()?;
     crate::term::write_stdout(term::OPENING)?;
 
-    let mut app = App::new(term, effects, settings.client.predict, term::size())
+    let predict = settings.client.predicts(drawing.remote);
+    let mut app = App::new(term, effects, predict, term::size())
         .with_centre(
             settings.client.centre,
             usize::from(settings.client.window_width),
-            settings.client.smart_width,
         )
         .with_lean_output(settings.client.lean_output);
     app.start();
@@ -3330,6 +3336,7 @@ const FALLBACK: Palette = Palette {
 mod tests {
     use super::*;
     use crate::client::predict::PING_EVERY;
+    use crate::config::Predict;
     use rmpv::Value;
 
     type Call = (Option<u64>, String, Vec<Value>);
@@ -3543,7 +3550,7 @@ mod tests {
     /// windows animated, and nothing predicted or centred.
     fn drawing() -> crate::config::Drawing {
         let mut d = crate::config::Drawing::default();
-        d.client.predict = false;
+        d.client.predict = Predict::Off;
         d.effects.scroll.enabled = false;
         d
     }
@@ -3606,7 +3613,7 @@ mod tests {
         let t0 = Instant::now();
         let mut a = attached(false, t0);
         let mut d = drawing();
-        d.client.predict = true;
+        d.client.predict = Predict::On;
         a.reconfigure(&d, t0);
         assert!(a.predict.is_some());
         let sent = calls(&mut a);
@@ -3617,25 +3624,110 @@ mod tests {
         );
     }
 
-    /// Told to centre each window's text, a client measures the windows; told
-    /// not to any more, it takes the measure back out of the editor. Neither
-    /// attaches again.
+    /// Told to predict as `"auto"` has it, a client predicts for a session
+    /// on another machine, and attaches again for the agent; for a session
+    /// on this one it predicts nothing, and attaches as it was.
+    #[test]
+    fn a_client_told_to_predict_automatically_predicts_only_over_ssh() {
+        let t0 = Instant::now();
+        let mut d = drawing();
+        d.client.predict = Predict::Auto;
+
+        let mut here = attached(false, t0);
+        here.reconfigure(&d, t0);
+        assert!(here.predict.is_none(), "predicting on this machine");
+        let sent = calls(&mut here);
+        assert!(!sent.iter().any(|(_, m, _)| m == "nvim_ui_detach"));
+
+        d.remote = true;
+        let mut there = attached(false, t0);
+        there.reconfigure(&d, t0);
+        assert!(there.predict.is_some(), "not predicting over ssh");
+        request(&calls(&mut there), "nvim_ui_detach", "");
+    }
+
+    /// Whether the measure is to judge each window by what it shows: its
+    /// second argument, in `calls`.
+    fn measured_smart(calls: &[Call]) -> Option<bool> {
+        let (_, _, args) = calls.iter().find(|(_, m, args)| {
+            m == "nvim_exec_lua"
+                && args
+                    .first()
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.starts_with("local most"))
+        })?;
+        args.get(1)?.as_array()?.get(1)?.as_bool()
+    }
+
+    /// Told to centre each window's text, a client measures the windows, by
+    /// what each shows; told to give each the same width, it measures them
+    /// again, by nothing; told not to centre any more, it takes the measure
+    /// back out of the editor. None of it attaches again.
     #[test]
     fn a_client_told_to_centre_measures_and_told_not_to_stops() {
         let t0 = Instant::now();
         let mut a = attached(false, t0);
         let mut d = drawing();
-        d.client.centre = true;
+        d.client.centre = Centre::Smart;
         a.reconfigure(&d, t0);
         let sent = calls(&mut a);
-        assert!(runs_lua(&sent, "local most"), "measured: {sent:?}");
+        assert_eq!(measured_smart(&sent), Some(true), "measured: {sent:?}");
         assert!(!sent.iter().any(|(_, m, _)| m == "nvim_ui_detach"));
 
-        d.client.centre = false;
+        d.client.centre = Centre::Fixed;
+        a.reconfigure(&d, t0);
+        let sent = calls(&mut a);
+        assert_eq!(measured_smart(&sent), Some(false), "measured: {sent:?}");
+        assert!(!sent.iter().any(|(_, m, _)| m == "nvim_ui_detach"));
+
+        d.client.centre = Centre::Off;
         a.reconfigure(&d, t0);
         let sent = calls(&mut a);
         assert!(runs_lua(&sent, wide::UNMEASURE_LUA), "{sent:?}");
         assert!(!sent.iter().any(|(_, m, _)| m == "nvim_ui_detach"));
+    }
+
+    /// A grid narrower than its window is a window's, so a client centring
+    /// each window's text wants windows of their own, with no effect and
+    /// nothing predicted wanting them: started so, it asks after the UIs
+    /// before it attaches; told so, it attaches again with them, and told
+    /// not to centre any more, without.
+    #[test]
+    fn a_client_centring_wants_windows_of_their_own() {
+        let t0 = Instant::now();
+        let mut a = app(false).with_centre(Centre::Smart, 8);
+        a.start();
+        let sent = calls(&mut a);
+        asks_uis(&sent);
+        assert_eq!(attached_with_multigrid(&sent), None, "attached at once");
+
+        let mut a = app(false);
+        a.start();
+        let sent = calls(&mut a);
+        answer(
+            &mut a,
+            request(&sent, "nvim_get_api_info", ""),
+            Value::Array(vec![7.into()]),
+            t0,
+        );
+        assert_eq!(attached_with_multigrid(&sent), Some(false));
+        let mut d = drawing();
+        d.effects.windows.enabled = false;
+        d.client.centre = Centre::Smart;
+        a.reconfigure(&d, t0);
+        let sent = calls(&mut a);
+        answer(&mut a, asks_uis(&sent), uis(false, false), t0);
+        let sent = calls(&mut a);
+        let detach = request(&sent, "nvim_ui_detach", "");
+        answer(&mut a, detach, Value::Nil, t0);
+        assert_eq!(attached_with_multigrid(&calls(&mut a)), Some(true));
+
+        d.client.centre = Centre::Off;
+        a.reconfigure(&d, t0);
+        let sent = calls(&mut a);
+        let detach = request(&sent, "nvim_ui_detach", "");
+        answer(&mut a, detach, Value::Nil, t0);
+        assert_eq!(attached_with_multigrid(&calls(&mut a)), Some(false));
     }
 
     /// A client writes each frame lean until told not to, then each whole
@@ -3673,9 +3765,9 @@ mod tests {
         let t0 = Instant::now();
         let mut a = attached(false, t0);
         let mut d = drawing();
-        d.client.centre = true;
+        d.client.centre = Centre::Smart;
         a.keys(&crate::card::encode(&crate::card::Command::Settings(d)), t0);
-        assert!(a.centre);
+        assert_eq!(a.centre, Centre::Smart);
         assert!(runs_lua(&calls(&mut a), "local most"));
     }
 
@@ -4227,7 +4319,7 @@ mod tests {
         calls(&mut a);
         // Told to predict meanwhile, the client detaches to attach again.
         let mut d = drawing();
-        d.client.predict = true;
+        d.client.predict = Predict::On;
         a.reconfigure(&d, t0 + Duration::from_millis(100));
         let sent = calls(&mut a);
         let detach = request(&sent, "nvim_ui_detach", "");
@@ -4890,7 +4982,7 @@ mod tests {
     /// Started with each window's text centred, up to 8 columns of it;
     /// attached, and what it sent let go of.
     fn wide_app(t0: Instant) -> (App, Vec<Call>) {
-        let mut a = app(true).with_centre(true, 8, false);
+        let mut a = app(true).with_centre(Centre::Fixed, 8);
         a.start();
         let sent = calls(&mut a);
         let measure = request(&sent, "nvim_exec_lua", "local most");
@@ -5153,7 +5245,7 @@ mod tests {
     #[test]
     fn nothing_centred_measures_nothing() {
         let t0 = Instant::now();
-        let mut a = app(true).with_centre(false, 8, true);
+        let mut a = app(true).with_centre(Centre::Off, 8);
         a.start();
         let sent = calls(&mut a);
         answer(
