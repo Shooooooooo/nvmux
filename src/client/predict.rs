@@ -435,6 +435,10 @@ pub struct Look {
     /// highlight to draw one in.
     pub eob: Option<Vec<Cell>>,
     pub eob_hl: u32,
+    /// What a character two cells wide cut in two at the edge of a window
+    /// that does not wrap is drawn in, as `>` or `<` (see [`line`]):
+    /// `NonText`, or the text's highlight where the editor has not said.
+    pub nontext: u32,
 }
 
 impl Look {
@@ -442,13 +446,14 @@ impl Look {
     /// first `lines` show the buffer's lines and the rest are past its end —
     /// leaving out the row at `skip`, the cursor's, which `'cursorline'`
     /// draws differently. `eob_hl` is `EndOfBuffer`, for a window that shows
-    /// no row past the end.
+    /// no row past the end, and `nontext` `NonText`, if the editor has said.
     pub fn of(
         rows: &[Vec<Cell>],
         lines: usize,
         textoff: usize,
         skip: Option<usize>,
         eob_hl: u32,
+        nontext: Option<u32>,
     ) -> Self {
         let text_rows: Vec<&Vec<Cell>> = rows
             .iter()
@@ -471,6 +476,7 @@ impl Look {
             text,
             eob,
             eob_hl,
+            nontext: nontext.unwrap_or(text),
         }
     }
 }
@@ -540,7 +546,7 @@ pub fn render(
         }
     }
     let room = width - textoff;
-    let fits = line(text, spans, shape, look.text, room, &mut row);
+    let fits = line(text, spans, shape, look, room, &mut row);
     if shape.wrap && !fits {
         return None;
     }
@@ -554,15 +560,24 @@ pub fn render(
     Some(row)
 }
 
-/// Append the cells of a line's text in highlight `base` — or where `spans`
-/// colour it, their groups laid over it — from display column
+/// Append the cells of a line's text in the window's text highlight — or
+/// where `spans` colour it, their groups laid over it — from display column
 /// `shape.leftcol`, `room` of them at most. Says whether the whole line fits
 /// in `room`.
+///
+/// A character two cells wide that an edge of the view cuts in two is drawn
+/// as Neovim draws it: a `>` in the last column, a `<` in the first, in
+/// `NonText`. Its left half on its own would still be drawn two cells wide,
+/// by a terminal that knows nothing of the cut, and the rest of its row a
+/// cell to the right of where the frame has it (see `super::grid`). Neovim
+/// lays `NonText` over a window's own `Normal` where it has one, and the
+/// `<`'s over the character's own colours as well: highlights of its own
+/// making, which the client has no id for, and are left out.
 fn line(
     text: &str,
     spans: &[Span],
     shape: &Shape,
-    base: u32,
+    look: &Look,
     room: usize,
     row: &mut Vec<Cell>,
 ) -> bool {
@@ -573,6 +588,9 @@ fn line(
             row.push(Cell { text, hl });
         }
     };
+    let cut = |row: &mut Vec<Cell>, vcol: usize, mark: char| {
+        put(row, vcol, Text::Char(mark), look.nontext);
+    };
     let mut vcol = 0usize;
     // Where the last character went, for a combining mark after it.
     let mut last: Option<usize> = None;
@@ -581,7 +599,7 @@ fn line(
             .iter()
             .rev()
             .find(|s| s.start <= at && at < s.end)
-            .map_or(base, |s| super::model::syntax_hl(base, s.group));
+            .map_or(look.text, |s| super::model::syntax_hl(look.text, s.group));
         let put = |row: &mut Vec<Cell>, vcol: usize, text: Text| put(row, vcol, text, hl);
         if c.width() != Some(0) {
             last = shown(vcol).then_some(row.len());
@@ -632,9 +650,18 @@ fn line(
                     }
                 }
                 Some(w) => {
-                    put(row, vcol, Text::Char(c));
-                    for i in 1..w {
-                        put(row, vcol + i, Text::Half);
+                    let (left, right) = (shown(vcol), shown(vcol + w - 1));
+                    if left && !right {
+                        // Its combining marks go with it.
+                        cut(row, vcol, '>');
+                        last = None;
+                    } else if right && !left {
+                        cut(row, from, '<');
+                    } else {
+                        put(row, vcol, Text::Char(c));
+                        for i in 1..w {
+                            put(row, vcol + i, Text::Half);
+                        }
                     }
                     vcol += w;
                 }
@@ -1033,7 +1060,11 @@ pub fn known<'a>(
 /// column `from`, moved to show the text from column `to`: what was in view
 /// and still is keeps its colours, and what comes into view is drawn from
 /// `text` — the row's line, `None` past the buffer's end — in the window's
-/// own colours. `None` where a line was not sent.
+/// own colours. So is a character two cells wide that the edge of one view
+/// cuts in two and not the other's, whole or cut as the new one has it (see
+/// [`line`]): Neovim's `<` or `>` for an edge that has moved, or a half whose
+/// other half the new view's edge leaves out, is not what Neovim will draw.
+/// `None` where a line was not sent.
 pub fn shifted<'a>(
     rows: &[Vec<Cell>],
     from: usize,
@@ -1055,13 +1086,23 @@ pub fn shifted<'a>(
             let width = row.len();
             let tw = width.saturating_sub(shape.textoff);
             let fresh = render(Some(line), &moved, 0, width, look, 0)?;
+            let half =
+                |cells: &[Cell], c: usize| cells.get(c).is_some_and(|x| x.text == Text::Half);
             let mut out = row.clone();
             for c in shape.textoff..width {
                 let v = to + (c - shape.textoff);
-                out[c] = if (from..from + tw).contains(&v) {
-                    row[shape.textoff + v - from].clone()
-                } else {
-                    fresh[c].clone()
+                // A cell is kept where the two rows agree on which cells
+                // are halves, there and just after it: where they do not, an
+                // edge cuts a character in one and not the other.
+                let kept = (from..from + tw)
+                    .contains(&v)
+                    .then(|| shape.textoff + v - from)
+                    .filter(|&o| {
+                        half(row, o) == half(&fresh, c) && half(row, o + 1) == half(&fresh, c + 1)
+                    });
+                out[c] = match kept {
+                    Some(o) => row[o].clone(),
+                    None => fresh[c].clone(),
                 };
             }
             Some(out)
@@ -1797,6 +1838,7 @@ mod tests {
             text: 0,
             eob: None,
             eob_hl: 18,
+            nontext: 19,
         }
     }
 
@@ -1912,6 +1954,100 @@ mod tests {
         assert_eq!(text(&row), "cdef");
     }
 
+    /// A character two cells wide that the edge of a window that does not
+    /// wrap cuts in two is drawn as Neovim 0.12 drew one, in `NonText`
+    /// whatever the character's own colours: twelve columns wide,
+    /// `abcdefghijk日x` was `abcdefghijk>`, and from `leftcol` 1,
+    /// `日abcdefghijklmn` was `<abcdefghijk`. Never half of it on its own.
+    #[test]
+    fn a_wide_character_the_edge_cuts_is_drawn_as_neovim_draws_it() {
+        let s = Shape {
+            textoff: 0,
+            wrap: false,
+            ..shape()
+        };
+        let mark = |c| Cell {
+            text: Text::Char(c),
+            hl: 19,
+        };
+        let row = render(plain("abc日x"), &s, 0, 4, &look(), 0).unwrap();
+        assert_eq!(text(&row), "abc>");
+        assert_eq!(row[3], mark('>'));
+        let from1 = Shape {
+            leftcol: 1,
+            ..s.clone()
+        };
+        let row = render(plain("日abcd"), &from1, 0, 4, &look(), 0).unwrap();
+        assert_eq!(text(&row), "<abc");
+        assert_eq!(row[0], mark('<'));
+        // Coloured by the editor's highlighting, and with a combining mark,
+        // which goes with the character.
+        let spans = [Span {
+            start: 0,
+            end: usize::MAX,
+            group: 40,
+        }];
+        let row = render(Some(("abc日\u{301}x", &spans)), &s, 0, 4, &look(), 0).unwrap();
+        assert_eq!(row[3], mark('>'));
+        // Past a gutter, in the window's last column and its text's first.
+        let gutter = Shape {
+            textoff: 4,
+            number: true,
+            ..s.clone()
+        };
+        let row = render(plain("abc日x"), &gutter, 6, 8, &look(), 0).unwrap();
+        assert_eq!(text(&row), "  7 abc>");
+        let gutter = Shape {
+            leftcol: 1,
+            ..gutter
+        };
+        let row = render(plain("日abcd"), &gutter, 6, 8, &look(), 0).unwrap();
+        assert_eq!(text(&row), "  7 <abc");
+        // A column of text and no more, cut either way.
+        let row = render(plain("日"), &s, 0, 1, &look(), 0).unwrap();
+        assert_eq!(row, [mark('>')]);
+        let row = render(plain("日"), &from1, 0, 1, &look(), 0).unwrap();
+        assert_eq!(row, [mark('<')]);
+    }
+
+    /// A character two cells wide that fits is drawn whole, as ever: up to a
+    /// window's right edge, or from its left; and a window that wraps still
+    /// takes no line too long for it.
+    #[test]
+    fn a_wide_character_that_fits_is_drawn_whole() {
+        let s = Shape {
+            textoff: 0,
+            wrap: false,
+            ..shape()
+        };
+        let whole = [
+            Cell {
+                text: Text::Char('日'),
+                hl: 0,
+            },
+            Cell {
+                text: Text::Half,
+                hl: 0,
+            },
+        ];
+        let row = render(plain("ab日x"), &s, 0, 4, &look(), 0).unwrap();
+        assert_eq!(text(&row), "ab日");
+        assert_eq!(row[2..], whole, "up to the right edge");
+        let from1 = Shape {
+            leftcol: 1,
+            ..s.clone()
+        };
+        let row = render(plain("a日bc"), &from1, 0, 4, &look(), 0).unwrap();
+        assert_eq!(text(&row), "日bc");
+        assert_eq!(row[..2], whole, "from the left");
+        let wraps = Shape { wrap: true, ..s };
+        assert_eq!(render(plain("abc日"), &wraps, 0, 4, &look(), 0), None);
+        assert_eq!(
+            text(&render(plain("ab日"), &wraps, 0, 4, &look(), 0).unwrap()),
+            "ab日"
+        );
+    }
+
     /// Past the buffer's end, a row as the window draws one: its own if it
     /// shows one, else `'fillchars'`' `eob` in `EndOfBuffer`.
     #[test]
@@ -1935,7 +2071,8 @@ mod tests {
 
     /// The colours are read off the rows the window has: the gutter column
     /// by column, the text by how its rows end, the cursor's row and those
-    /// past the end left out of both.
+    /// past the end left out of both. `NonText` is the editor's to say, and
+    /// the text's own where it has not.
     #[test]
     fn the_colours_are_the_windows_own() {
         let cell = |hl| Cell {
@@ -1944,12 +2081,15 @@ mod tests {
         };
         let row = |g: u32, t: u32| vec![cell(g), cell(g), cell(t), cell(t)];
         let rows = vec![row(5, 0), row(9, 9), row(5, 0), row(5, 0), row(3, 3)];
-        let l = Look::of(&rows, 4, 2, Some(1), 18);
+        let l = Look::of(&rows, 4, 2, Some(1), 18, Some(19));
         assert_eq!(l.gutter, vec![5, 5]);
         assert_eq!(l.text, 0);
         assert_eq!(l.eob, Some(row(3, 3)));
         assert_eq!(l.eob_hl, 3);
-        assert_eq!(Look::of(&rows, 5, 2, None, 18).eob_hl, 18);
+        assert_eq!(l.nontext, 19);
+        assert_eq!(Look::of(&rows, 5, 2, None, 18, None).eob_hl, 18);
+        let l = Look::of(&[row(5, 7)], 1, 2, None, 18, None);
+        assert_eq!(l.nontext, 7, "not said: the text's own");
     }
 
     /// What Neovim 0.12 did, found by running each command in a window of
@@ -2410,6 +2550,77 @@ mod tests {
             "the gutter and what stayed in view, then plain"
         );
         assert_eq!(moved[1], rows[1], "past the end: as it was");
+    }
+
+    /// Moved sideways, a character two cells wide is drawn as the new view
+    /// cuts it: whole where only the old view's edge cut it, marked where
+    /// only the new one's does — never Neovim's `<` or `>` where its edge
+    /// was, nor a half on its own. One whole in both keeps its colours.
+    #[test]
+    fn rows_moved_sideways_cut_wide_characters_as_the_new_view_does() {
+        let s = Shape {
+            textoff: 0,
+            wrap: false,
+            ..shape()
+        };
+        // A row as Neovim drew it, `_` the right half of the character
+        // before it, each cell in a highlight of its own.
+        let drawn = |s: &str| -> Vec<Cell> {
+            s.chars()
+                .enumerate()
+                .map(|(i, c)| Cell {
+                    text: if c == '_' { Text::Half } else { Text::Char(c) },
+                    hl: 10 + i as u32,
+                })
+                .collect()
+        };
+        let cell = |c, hl| Cell {
+            text: Text::Char(c),
+            hl,
+        };
+        let half = |hl| Cell {
+            text: Text::Half,
+            hl,
+        };
+        // `日` at columns 1 and 2, `本` at 6 and 7.
+        let line = |_: usize| Some(Some(("a日bcd本e", &[][..])));
+        let moved = shifted(&[drawn("日_bcd>")], 1, 2, &s, &look(), line).unwrap();
+        assert_eq!(
+            moved[0],
+            [
+                cell('<', 19),
+                cell('b', 12),
+                cell('c', 13),
+                cell('d', 14),
+                cell('本', 0),
+                half(0)
+            ]
+        );
+        let moved = shifted(&[drawn("<bcd本_")], 2, 1, &s, &look(), line).unwrap();
+        assert_eq!(
+            moved[0],
+            [
+                cell('日', 0),
+                half(0),
+                cell('b', 11),
+                cell('c', 12),
+                cell('d', 13),
+                cell('>', 19)
+            ]
+        );
+        let line = |_: usize| Some(Some(("ab日cdefg", &[][..])));
+        let moved = shifted(&[drawn("ab日_cd")], 0, 1, &s, &look(), line).unwrap();
+        assert_eq!(
+            moved[0],
+            [
+                cell('b', 11),
+                cell('日', 12),
+                half(13),
+                cell('c', 14),
+                cell('d', 15),
+                cell('e', 0)
+            ]
+        );
     }
 
     #[test]
