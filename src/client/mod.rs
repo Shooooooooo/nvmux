@@ -1191,6 +1191,13 @@ impl App {
         }
     }
 
+    /// This client, writing each frame in as few bytes as it takes if `lean`
+    /// (see [`screen`]).
+    pub fn with_lean_output(mut self, lean: bool) -> Self {
+        self.screen.set_lean(lean);
+        self
+    }
+
     /// Whether each window's text is centred, as it stands: not with no
     /// limit on a window's width.
     fn centring(&self) -> bool {
@@ -1630,7 +1637,8 @@ impl App {
     /// (see [`crate::card::Command::Settings`]).
     ///
     /// The effects change at once: what is moving moves on to its end, and
-    /// nothing turned off starts again. The rest are things this attach has
+    /// nothing turned off starts again. So does how a frame is written, from
+    /// the next on (see [`screen`]). The rest are things this attach has
     /// told Neovim, and are told it again: whether the windows have grids of
     /// their own, and what the agent left in the editor predicts, by
     /// attaching again — as the client does when the UIs attached change —
@@ -1641,6 +1649,7 @@ impl App {
         let wanted = effects.want_multigrid() || client.predict;
         let predicting = self.predict.is_some();
         self.anim.set_effects(effects);
+        self.screen.set_lean(client.lean_output);
         self.dirty = true;
         if client.predict != predicting {
             self.predict = client.predict.then(|| {
@@ -3014,11 +3023,13 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
     let winch = crate::winch::Winch::install()?;
     crate::term::write_stdout(term::OPENING)?;
 
-    let mut app = App::new(term, effects, settings.client.predict, term::size()).with_centre(
-        settings.client.centre,
-        usize::from(settings.client.window_width),
-        settings.client.smart_width,
-    );
+    let mut app = App::new(term, effects, settings.client.predict, term::size())
+        .with_centre(
+            settings.client.centre,
+            usize::from(settings.client.window_width),
+            settings.client.smart_width,
+        )
+        .with_lean_output(settings.client.lean_output);
     app.start();
     let mut inbox = Inbox::default();
     let stdin = std::io::stdin();
@@ -3622,6 +3633,28 @@ mod tests {
         let sent = calls(&mut a);
         assert!(runs_lua(&sent, wide::UNMEASURE_LUA), "{sent:?}");
         assert!(!sent.iter().any(|(_, m, _)| m == "nvim_ui_detach"));
+    }
+
+    /// Told to write each frame lean, a client does so from the next frame
+    /// on, and told not to, stops: the next of two rows changed one under the
+    /// other is reached by CR LF, and then by a CUP.
+    #[test]
+    fn a_client_told_to_write_lean_frames_does_and_told_not_to_stops() {
+        let t0 = Instant::now();
+        let mut a = attached(false, t0);
+        a.frame(t0);
+        let mut d = drawing();
+        d.client.lean_output = true;
+        a.reconfigure(&d, t0);
+        redraw(&mut a, vec![line(1, 1, "ab"), line(1, 2, "cd")], t0);
+        let lean = String::from_utf8_lossy(&a.frame(t0)).into_owned();
+        assert!(lean.contains("ab\r\ncd"), "{lean:?}");
+
+        d.client.lean_output = false;
+        a.reconfigure(&d, t0);
+        redraw(&mut a, vec![line(1, 1, "ef"), line(1, 2, "gh")], t0);
+        let whole = String::from_utf8_lossy(&a.frame(t0)).into_owned();
+        assert!(whole.contains("ef\x1b[3;1Hgh"), "{whole:?}");
     }
 
     /// Settings come in the card's way, in the client's input, and go to the

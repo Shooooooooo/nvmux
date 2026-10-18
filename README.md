@@ -263,6 +263,7 @@ predict      = true     # over a slow link, scrolls show before Neovim answers
 centre       = false    # on a wide terminal, each window's text in the middle of the window
 window_width = 120      # with centre on, how many columns a window's text gets; 0 for no limit
 smart_width  = true     # or as many as what it shows wants: its 'textwidth', its long lines
+lean_output  = false    # true writes each frame in fewer bytes, the screen the same
 
 [style]
 color = "terminal"   # or "#rrggbb": nvmux's text and bars in that colour; dim text stays dim

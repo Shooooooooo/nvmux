@@ -397,6 +397,13 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
                 switch!(client.smart_width),
             ),
         )),
+        own(row(
+            "client",
+            "lean_output",
+            Tab::Client,
+            "write each frame in fewer bytes; the screen is the same",
+            switch!(client.lean_output),
+        )),
         row(
             "style",
             "color",
