@@ -8,13 +8,13 @@
 //!
 //! # Every frame stands alone
 //!
-//! A frame assumes nothing about where the terminal's cursor is or what its
-//! pen is set to: the first cell it writes is moved to, and its colours set,
-//! from nothing. Nor, where it moves down a row by LF, what scroll region is
-//! set: it sets the whole screen first (see [`move_to`]). nvmux writes over the session between frames — the hint row,
-//! the attach notice, the fade's frames — and puts the pen back as it was
-//! where it can, but a frame that never relies on it cannot be caught out
-//! where it cannot.
+//! A frame assumes nothing about where the terminal's cursor is or what its pen
+//! is set to: the first cell it writes is moved to, and its colours set, from
+//! nothing. Nor, where it moves down a row by LF, what scroll region is set: it
+//! sets the whole screen first (see [`move_to`]). nvmux writes over the session
+//! between frames — the hint row, the attach notice, the fade's frames — and
+//! puts the pen back as it was where it can, but a frame that never relies on
+//! it cannot be caught out where it cannot.
 //!
 //! # What the cells carry
 //!
@@ -27,17 +27,17 @@
 //!
 //! # In as few bytes as it takes
 //!
-//! With `[client] lean_output` on (see [`Screen::set_lean`]), a frame goes on
-//! from where its last cell left the cursor and the pen: every move, and
-//! every change of colour, made by the shortest of the ways a terminal
-//! understands (see [`move_to`] and [`recolour`]), as Neovim's own TUI makes
-//! them. Each of those is the same screen as the absolute move and the reset
-//! would have been. A move is made from where the cursor is only where the
-//! terminal cannot have put it anywhere else: after a character a terminal
-//! may take for wider or narrower than Neovim does, or one written to the
-//! last column, where terminals part ways on what comes next, the next move
-//! is absolute again. Off, the default, every jump of the cursor is absolute
-//! and every change of the pen a reset and the whole pen.
+//! With `[client] lean_output` on, the default (see [`Screen::set_lean`]), a
+//! frame goes on from where its last cell left the cursor and the pen: every
+//! move, and every change of colour, made by the shortest of the ways a
+//! terminal understands (see [`move_to`] and [`recolour`]), as Neovim's own TUI
+//! makes them. Each of those is the same screen as the absolute move and the
+//! reset would have been. A move is made from where the cursor is only where
+//! the terminal cannot have put it anywhere else: after a character a terminal
+//! may take for wider or narrower than Neovim does, or one written to the last
+//! column, where terminals part ways on what comes next, the next move is
+//! absolute again. Off, every jump of the cursor is absolute and every change
+//! of the pen a reset and the whole pen.
 //!
 //! # Synchronized
 //!
@@ -93,7 +93,8 @@ pub struct Screen {
     /// when they change — setting the shape restarts its blink.
     shape: Option<u8>,
     color: Option<Option<Rgb>>,
-    /// Each frame in as few bytes as it takes: see [`Screen::set_lean`].
+    /// Each frame in as few bytes as it takes, as from the start: see
+    /// [`Screen::set_lean`].
     lean: bool,
 }
 
@@ -110,14 +111,15 @@ impl Screen {
             spare: None,
             shape: None,
             color: None,
-            lean: false,
+            lean: true,
         }
     }
 
-    /// Write each frame from here on in as few bytes as it takes, `lean`, or
-    /// with every jump of the cursor absolute and every change of the pen a
-    /// reset (see the module docs). The screen is the same either way; each
-    /// frame stands alone, so the next is the first written the new way.
+    /// Write each frame from here on in as few bytes as it takes, `lean` — as
+    /// a screen does until told otherwise — or with every jump of the cursor
+    /// absolute and every change of the pen a reset (see the module docs).
+    /// The screen is the same either way; each frame stands alone, so the
+    /// next is the first written the new way.
     pub fn set_lean(&mut self, lean: bool) {
         self.lean = lean;
     }
@@ -734,11 +736,9 @@ mod tests {
         assert_eq!(shown(&bytes, 8, 2), "see here\n  and x ");
     }
 
-    /// What the second of two frames writes over the first, as text, with
-    /// `[client] lean_output` on.
+    /// What the second of two frames writes over the first, as text.
     fn over(first: Frame, second: Frame) -> String {
         let mut s = Screen::new();
-        s.set_lean(true);
         s.draw(first, &hidden(), false, &[]);
         String::from_utf8_lossy(&s.draw(second, &hidden(), false, &[])).into_owned()
     }
@@ -828,8 +828,8 @@ mod tests {
         assert_eq!(text, "\x1b[?25l\x1b[1;2H\x1b[0mX\x1b[2;1HY\x1b[0m");
     }
 
-    /// Off, the default, every jump of the cursor is a CUP and every change
-    /// of the pen a reset and the whole pen.
+    /// Off, every jump of the cursor is a CUP and every change of the pen a
+    /// reset and the whole pen.
     #[test]
     fn off_every_move_is_absolute_and_every_pen_whole() {
         let red = Style {
@@ -839,6 +839,7 @@ mod tests {
         let mut after = frame(&["XbcY", "Zfgh"]);
         after.cells[3].style = red;
         let mut s = Screen::new();
+        s.set_lean(false);
         s.draw(frame(&["abcd", "efgh"]), &hidden(), false, &[]);
         let text = String::from_utf8_lossy(&s.draw(after, &hidden(), false, &[])).into_owned();
         assert_eq!(
@@ -878,9 +879,8 @@ mod tests {
         let mut f = frame(&["abc"]);
         f.cells[1].style = red;
         f.cells[2].style = bold;
-        let mut s = Screen::new();
-        s.set_lean(true);
-        let text = String::from_utf8_lossy(&s.draw(f, &hidden(), false, &[])).into_owned();
+        let text =
+            String::from_utf8_lossy(&Screen::new().draw(f, &hidden(), false, &[])).into_owned();
         assert_eq!(
             text,
             "\x1b[?25l\x1b[1;1H\x1b[0ma\x1b[31mb\x1b[0;1;31mc\x1b[0m"
@@ -974,7 +974,9 @@ mod tests {
         for round in 0..300 {
             let first = random(None);
             let second = random(Some(&first));
-            let fresh = screen_of(&Screen::new().draw(second.clone(), &hidden(), false, &[]));
+            let mut whole = Screen::new();
+            whole.set_lean(false);
+            let fresh = screen_of(&whole.draw(second.clone(), &hidden(), false, &[]));
             for lean in [false, true] {
                 let mut s = Screen::new();
                 s.set_lean(lean);
@@ -994,7 +996,6 @@ mod tests {
     #[test]
     fn a_scroll_region_left_set_scrolls_nothing() {
         let mut s = Screen::new();
-        s.set_lean(true);
         let mut bytes = s.draw(frame(&["abc", "def", "ghi", "jkl"]), &hidden(), false, &[]);
         bytes.extend_from_slice(b"\x1b[1;2r");
         let next = s.draw(frame(&["aXc", "Yef", "Zhi", "jkl"]), &hidden(), false, &[]);

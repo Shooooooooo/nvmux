@@ -3635,26 +3635,32 @@ mod tests {
         assert!(!sent.iter().any(|(_, m, _)| m == "nvim_ui_detach"));
     }
 
-    /// Told to write each frame lean, a client does so from the next frame
-    /// on, and told not to, stops: the next of two rows changed one under the
-    /// other is reached by CR LF, and then by a CUP.
+    /// A client writes each frame lean until told not to, then each whole
+    /// from the next frame on, and lean again once told to: the next of two
+    /// rows changed one under the other reached by CR LF, then by a CUP, and
+    /// then by CR LF.
     #[test]
-    fn a_client_told_to_write_lean_frames_does_and_told_not_to_stops() {
+    fn a_client_writes_lean_frames_until_told_not_to() {
         let t0 = Instant::now();
         let mut a = attached(false, t0);
         a.frame(t0);
-        let mut d = drawing();
-        d.client.lean_output = true;
-        a.reconfigure(&d, t0);
-        redraw(&mut a, vec![line(1, 1, "ab"), line(1, 2, "cd")], t0);
-        let lean = String::from_utf8_lossy(&a.frame(t0)).into_owned();
-        assert!(lean.contains("ab\r\ncd"), "{lean:?}");
+        let drawn = |a: &mut App, top: &str, under: &str| {
+            redraw(a, vec![line(1, 1, top), line(1, 2, under)], t0);
+            String::from_utf8_lossy(&a.frame(t0)).into_owned()
+        };
+        let text = drawn(&mut a, "ab", "cd");
+        assert!(text.contains("ab\r\ncd"), "{text:?}");
 
+        let mut d = drawing();
         d.client.lean_output = false;
         a.reconfigure(&d, t0);
-        redraw(&mut a, vec![line(1, 1, "ef"), line(1, 2, "gh")], t0);
-        let whole = String::from_utf8_lossy(&a.frame(t0)).into_owned();
-        assert!(whole.contains("ef\x1b[3;1Hgh"), "{whole:?}");
+        let text = drawn(&mut a, "ef", "gh");
+        assert!(text.contains("ef\x1b[3;1Hgh"), "{text:?}");
+
+        d.client.lean_output = true;
+        a.reconfigure(&d, t0);
+        let text = drawn(&mut a, "ij", "kl");
+        assert!(text.contains("ij\r\nkl"), "{text:?}");
     }
 
     /// Settings come in the card's way, in the client's input, and go to the

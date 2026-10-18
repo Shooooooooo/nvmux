@@ -610,7 +610,7 @@ fn a_lean_client_draws_the_screen_a_fresh_one_does() {
         "the lean client stayed attached"
     );
 
-    std::fs::write(&config, "").expect("write the config");
+    std::fs::write(&config, "[client]\nlean_output = false\n").expect("write the config");
     let mut fresh = Terminal::spawn(&sock, &config);
     assert!(
         fresh.pump_until(Duration::from_secs(15), |s| s.contains("é ─ ab cd")),

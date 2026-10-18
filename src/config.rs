@@ -260,18 +260,18 @@ pub struct ClientSettings {
     /// whose text is in its middle already, keeps its whole width either way
     /// (see `crate::client::wide`).
     pub smart_width: bool,
-    /// Write each frame to the terminal in fewer bytes, as Neovim's own TUI
-    /// does: the cursor moved on from where the last cell left it — along a
-    /// row by CUF, or by writing a few cells again, and to the next row by
-    /// CR LF — and a change of colours alone made by the colours. nvmux's own
-    /// client only (see [`crate::client::screen`]).
+    /// Write each frame to the terminal in as few bytes as it takes, as
+    /// Neovim's own TUI does: the cursor moved on from where the last cell
+    /// left it — along a row by CUF, or by writing a few cells again, and to
+    /// the next row by CR LF — and a change of colours alone made by the
+    /// colours. nvmux's own client only (see [`crate::client::screen`]).
     ///
-    /// Off, the default, every run of cells has the cursor placed and the pen
-    /// set from nothing. The screen is the same either way: a move is made
-    /// from where the cursor is only where the terminal cannot have put it
-    /// anywhere else. On saves a seventh to a third of the bytes each frame
-    /// takes, and a sixth to a third of what nvmux spends parsing them as it
-    /// relays them.
+    /// On, the default, a move is made from where the cursor is only where
+    /// the terminal cannot have put it anywhere else, so the screen is the
+    /// one off draws, in a seventh to a third fewer bytes, and with a sixth
+    /// to a third less of what nvmux spends parsing them as it relays them.
+    /// Off, every run of cells has the cursor placed and the pen set from
+    /// nothing.
     ///
     /// What on risks: a frame written for the size the terminal had, landing
     /// as it is made smaller, can scroll the screen where off would cut it
@@ -291,7 +291,7 @@ impl Default for ClientSettings {
             centre: false,
             window_width: 120,
             smart_width: true,
-            lean_output: false,
+            lean_output: true,
         }
     }
 }
@@ -1287,7 +1287,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          # centre       = {centre:<8}   # on a wide terminal, each window's text in the middle of the window\n\
          # window_width = {window_width:<8}   # with centre on, how many columns a window's text gets; 0 for no limit\n\
          # smart_width  = {smart_width:<8}   # or as many as what it shows wants: its 'textwidth', its long lines\n\
-         # lean_output  = {lean_output:<8}   # true writes each frame in fewer bytes, the screen the same\n\
+         # lean_output  = {lean_output:<8}   # fewer bytes per frame, the same screen; false makes every move absolute\n\
          \n\
          [style]\n\
          # color = {style_color:<10}   # or \"#rrggbb\": nvmux's text and bars in that colour\n\
@@ -2347,13 +2347,13 @@ mod tests {
         assert!(!s.client.lazy, "the rest as it was");
     }
 
-    /// Each frame written with every jump of the cursor absolute unless told
-    /// otherwise; in as few bytes as it takes is a line away.
+    /// Each frame written in as few bytes as it takes unless told otherwise;
+    /// with every jump of the cursor absolute is a line away.
     #[test]
-    fn frames_are_written_whole_unless_told() {
-        assert!(!Settings::default().client.lean_output);
-        let s: Settings = toml::from_str("[client]\nlean_output = true\n").expect("valid");
-        assert!(s.client.lean_output);
+    fn frames_are_written_lean_unless_told() {
+        assert!(Settings::default().client.lean_output);
+        let s: Settings = toml::from_str("[client]\nlean_output = false\n").expect("valid");
+        assert!(!s.client.lean_output);
         assert!(s.client.smart_width, "the rest as it was");
     }
 
@@ -2839,7 +2839,7 @@ mod tests {
             "# centre       = false",
             "# window_width = 120",
             "# smart_width  = true",
-            "# lean_output  = false",
+            "# lean_output  = true",
             "# color = \"terminal\"",
             "# float = true ",
             "# enabled     = true",
