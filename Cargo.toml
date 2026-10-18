@@ -23,8 +23,10 @@ libc = "0.2"
 # The fixed strings the relay looks for in what goes through it (see
 # `src/pty.rs`): a finishing client's DA1 request and its leaving the
 # alternate screen, the frame closes taken out of a held first paint, the
-# terminal's answers. Already in the tree for `vte` and `nucleo-matcher`, so
-# it adds no crate to the build graph. 2.4 is the first with `memmem`.
+# terminal's answers; and the `ESC ]` that opens an OSC, which the shadow's
+# and the ledger's parsers are shown only so much of (see `src/ledger.rs`).
+# Already in the tree for `vte` and `nucleo-matcher`, so it adds no crate to
+# the build graph. 2.4 is the first with `memmem`.
 memchr = "2.4"
 # Ranks the create prompt's directory completions. Its own two dependencies,
 # `memchr` and `unicode-segmentation`, were already in this tree, so it adds
@@ -60,8 +62,12 @@ toml = { version = "1", default-features = false, features = [
 # Its parser, writer and datetime crates are `toml`'s own, already in the
 # tree, so it adds itself and nothing else.
 toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+# Not `attributes`: nvmux has no `#[instrument]`, and its proc-macro is build
+# time for nothing.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+# Not `env-filter`: `$NVMUX_LOG` is read as a `filter::Targets` (see
+# `src/logging.rs`), and `EnvFilter` is what links a regex engine in.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 unicode-width = "0.2.2"
 # The decoder `src/ledger.rs` reads a kept client's output with, for the few
 # terminal settings it would not send again. Already in the tree as `vt100`'s
@@ -78,3 +84,11 @@ vt100 = "0.16"
 [profile.release]
 lto = "thin"
 strip = true
+
+# For profiling the optimised build: the release profile with its symbols and
+# line tables kept, so that callgrind, DHAT, massif and perf can name what
+# they measure. `cargo build --profile profiling`; what ships is unchanged.
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = "line-tables-only"

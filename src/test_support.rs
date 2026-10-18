@@ -104,3 +104,123 @@ pub(crate) fn screen(rows: u16, cols: u16) -> Shadow {
     }
     shadow
 }
+
+/// What a client might write, heavy on what [`crate::ledger::OscCap`] has to
+/// get right, and the sizes of the reads it comes in; `seed` decides both.
+///
+/// Text, narrow and wide and cut part way through a character; escape
+/// sequences the ledger keeps and some it does not; DCS and APC strings,
+/// some left open for whatever comes next to end; lone and doubled `ESC`s,
+/// and an `ESC` with a C0 control before its `]`, which vte still opens an
+/// OSC on. And OSCs of every kind the ledger keeps and some it does not —
+/// short, about [`crate::ledger::OSC_SHOWN`] and far past it, with `;`s, C0
+/// controls, C1 bytes and UTF-8 in them — ended every way vte ends one, by
+/// the `ESC` of another, or left open. Reads run from a byte to more than a
+/// whole OSC.
+pub(crate) fn osc_noise(seed: u64) -> (Vec<u8>, Vec<usize>) {
+    // xorshift64*, as `ui::starfield` has it.
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    let mut below = move |n: usize| {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        (state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 32) as usize % n
+    };
+    let shown = crate::ledger::OSC_SHOWN;
+    let mut out = Vec::new();
+    for _ in 0..1 + below(12) {
+        let pick =
+            |below: &mut dyn FnMut(usize) -> usize, of: &[&'static [u8]]| of[below(of.len())];
+        match below(10) {
+            0 | 1 => out.extend_from_slice(pick(
+                &mut below,
+                &[
+                    b"some text ",
+                    "é─漢😀".as_bytes(),
+                    b"\r\n",
+                    b"\xe2\x94",
+                    b"\xc3",
+                    b"\x9c\x9d",
+                ],
+            )),
+            2 => out.extend_from_slice(pick(
+                &mut below,
+                &[
+                    b"\x1b[1;31m",
+                    b"\x1b[3;5H",
+                    b"\x1b[?1000h",
+                    b"\x1b[?1002l",
+                    b"\x1b[?2004h",
+                    b"\x1b[?1049h",
+                    b"\x1b[5 q",
+                    b"\x1b[>3u",
+                    b"\x1b[<u",
+                    b"\x1b[>4;2m",
+                ],
+            )),
+            3 => out.extend_from_slice(pick(
+                &mut below,
+                &[
+                    b"\x1bP1$r0m\x1b\\",
+                    b"\x1b_Gf=24;AAAA\x1b\\",
+                    b"\x1bPq#0",
+                    b"\x1b_x",
+                ],
+            )),
+            4 => out.extend_from_slice(pick(
+                &mut below,
+                &[b"\x1b", b"\x1b\x1b", b"\x1b=", b"\x1b>", b"\x1b\n]0;t\x07"],
+            )),
+            _ => {
+                out.extend_from_slice(pick(
+                    &mut below,
+                    &[
+                        b"\x1b]0;",
+                        b"\x1b]2;",
+                        b"\x1b]1;",
+                        b"\x1b]12;",
+                        b"\x1b]112",
+                        b"\x1b]52;c;",
+                        b"\x1b]8;;",
+                        b"\x1b]",
+                    ],
+                ));
+                let len = match below(4) {
+                    0 => below(40),
+                    1 => shown / 4 - 8 + below(16),
+                    2 => shown - 8 + below(16),
+                    _ => shown + below(4 * shown),
+                };
+                for _ in 0..len {
+                    out.push(match below(64) {
+                        0 => b';',
+                        1 => 0x01,
+                        2 => b'\n',
+                        3 => 0x9c,
+                        4 => 0xc3,
+                        5 => 0xa9,
+                        6 => 0x7f,
+                        n => b'A' + (n % 26) as u8,
+                    });
+                }
+                out.extend_from_slice(pick(
+                    &mut below,
+                    &[b"\x07", b"\x1b\\", b"\x18", b"\x1a", b"\x1b", b"\x1b]", b""],
+                ));
+            }
+        }
+    }
+    let mut reads = Vec::new();
+    let mut left = out.len();
+    while left > 0 {
+        let read = match below(4) {
+            0 => 1 + below(3),
+            1 => 1 + below(64),
+            2 => 4095,
+            _ => 1 + below(3 * shown),
+        };
+        reads.push(read.min(left));
+        left -= read.min(left);
+    }
+    (out, reads)
+}

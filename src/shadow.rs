@@ -390,6 +390,10 @@ impl Painted {
 /// The session's screen, as far as its bytes have said.
 pub struct Shadow {
     parser: vt100::Parser,
+    /// What keeps the parser's OSC buffer small: the parser does nothing with
+    /// an OSC, and an `OSC 52` copy would otherwise stay in it for as long
+    /// as the client lives (see [`crate::ledger::OscCap`]).
+    osc: crate::ledger::OscCap,
     /// The start of a character the bytes last fed ended part way through,
     /// held back from the parser till the rest of it comes: see [`whole`].
     cut: Vec<u8>,
@@ -426,6 +430,7 @@ impl Shadow {
     pub fn new(rows: u16, cols: u16) -> Self {
         Self {
             parser: vt100::Parser::new(rows.max(MIN_SIZE), cols.max(MIN_SIZE), 0),
+            osc: crate::ledger::OscCap::default(),
             cut: Vec::new(),
             painted: Vec::new(),
             under: Vec::new(),
@@ -437,7 +442,8 @@ impl Shadow {
     /// Watch these bytes go by. Whatever they were — a frame, half a frame, a
     /// query the terminal will answer — the parser takes them as the terminal
     /// did, but for the start of a character they end part way through,
-    /// which waits for the rest of it (see [`whole`]).
+    /// which waits for the rest of it (see [`whole`]), and the payload of an
+    /// OSC past [`crate::ledger::OSC_SHOWN`], which it would only store.
     ///
     /// The one thing the shadow must never do is take the relay down. The
     /// parser is somebody else's code fed the whole of what an editor can
@@ -447,12 +453,13 @@ impl Shadow {
         if self.broken {
             return;
         }
+        let shown = self.osc.cap(bytes);
         // After the character the bytes before cut in two, which these finish.
         let joined;
         let bytes = if self.cut.is_empty() {
-            bytes
+            &shown[..]
         } else {
-            joined = [std::mem::take(&mut self.cut).as_slice(), bytes].concat();
+            joined = [std::mem::take(&mut self.cut).as_slice(), &shown].concat();
             joined.as_slice()
         };
         let end = whole(bytes);
@@ -542,8 +549,14 @@ impl Shadow {
     /// had already seen, replayed, or a frame of nvmux's own painted over the
     /// screen — so the next frame must paint every cell rather than trust what
     /// the last one left.
+    ///
+    /// A fade's diff is let go of rather than emptied: each of its frames
+    /// builds its own, so what emptying would keep is never used again —
+    /// eleven bytes a cell, for as long as a kept client stays parked. The
+    /// settings' is kept for their next frame to write over in place, until
+    /// they are down ([`Shadow::forget_under`]).
     pub fn invalidate(&mut self) {
-        self.painted.clear();
+        self.painted = Vec::new();
         self.under_valid = false;
     }
 
@@ -1069,7 +1082,7 @@ impl Shadow {
         out.extend_from_slice(SYNC_END);
         self.under_valid = true;
         // Written behind a fade's diff, which must start again.
-        self.painted.clear();
+        self.painted = Vec::new();
         out
     }
 }
@@ -2474,6 +2487,59 @@ mod tests {
             cursor_tail(&s.frame(0.0, &palette(), Cursor::Restored)),
             b"\x1b[2;7H\x1b[?25h"
         );
+    }
+
+    /// A clipboard write far longer than the parser is shown leaves the grid
+    /// as it would have been, the text after it included.
+    #[test]
+    fn a_long_clipboard_write_leaves_the_grid_alone() {
+        let mut s = Shadow::new(4, 10);
+        s.feed(b"ab");
+        let mut osc = b"\x1b]52;c;".to_vec();
+        osc.extend(std::iter::repeat_n(b'Q', 100_000));
+        osc.extend_from_slice(b"\x1b\\cd");
+        for chunk in osc.chunks(4095) {
+            s.feed(chunk);
+        }
+        assert_eq!(s.parser.screen().contents(), "abcd");
+        assert_eq!(s.parser.screen().cursor_position(), (0, 4));
+    }
+
+    /// Whatever a client writes and however it is read, the shadow's screen
+    /// is the one a parser shown all of it at once has: what the cap keeps
+    /// from the parser is only ever what it would have stored, and what is
+    /// held back of a cut character only waits.
+    #[test]
+    fn what_the_parser_is_spared_changes_nothing_on_screen() {
+        for seed in 0..200 {
+            let (stream, reads) = crate::test_support::osc_noise(seed);
+            let mut s = Shadow::new(6, 20);
+            let mut at = 0;
+            for read in reads {
+                s.feed(&stream[at..at + read]);
+                at += read;
+            }
+            let mut whole = vt100::Parser::new(6, 20, 0);
+            whole.process(&stream);
+            assert!(s.is_usable(), "seed {seed}");
+            assert!(
+                s.parser.screen().state_formatted() == whole.screen().state_formatted(),
+                "seed {seed}: the shadow's screen is not the whole stream's"
+            );
+        }
+    }
+
+    /// Letting go of a fade's diff is all an invalidation does to it: the
+    /// next frame paints every cell, as it would after any other.
+    #[test]
+    fn an_invalidated_shadow_paints_every_cell_again() {
+        let mut s = Shadow::new(4, 10);
+        s.feed(b"abc");
+        let first = s.frame(0.5, &palette(), Cursor::Hidden);
+        assert!(s.painted.capacity() > 0);
+        s.invalidate();
+        assert_eq!(s.painted.capacity(), 0);
+        assert_eq!(s.frame(0.5, &palette(), Cursor::Hidden), first);
     }
 
     /// A retired shadow has no cursor to speak of either.
