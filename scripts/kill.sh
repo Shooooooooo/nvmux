@@ -43,14 +43,20 @@ gone() {
   is_zombie "$1"
 }
 
-# Poll for up to $2 tenths of a second. `sleep 0.1` is not POSIX, so fall back
-# to a whole second where it is rejected.
+# Poll for up to $2 tenths of a second: every hundredth for the first tenth,
+# when most sessions go. Neither sleep is POSIX, so fall back to a whole second
+# where they are rejected.
 wait_gone() {
   i=0
-  while [ "$i" -lt "$2" ]; do
+  while [ "$i" -lt "$(($2 * 10))" ]; do
     gone "$1" && return 0
-    sleep 0.1 2>/dev/null || sleep 1
-    i=$((i + 1))
+    if [ "$i" -lt 10 ]; then
+      sleep 0.01 2>/dev/null || sleep 1
+      i=$((i + 1))
+    else
+      sleep 0.1 2>/dev/null || sleep 1
+      i=$((i + 10))
+    fi
   done
   gone "$1"
 }

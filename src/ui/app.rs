@@ -107,6 +107,10 @@ pub struct App {
     /// The session the picker was opened from and can be dismissed back to.
     /// See [`App::set_came_from`].
     came_from: Option<String>,
+    /// The session the cursor was asked onto while the rows did not have it,
+    /// and the row it stayed on instead, for a listing to bring it. See
+    /// [`App::select_session`].
+    wanted: Option<(String, usize)>,
     /// What the left button last went down on, until it comes up. See
     /// [`App::on_mouse`].
     pressed: Option<Pressed>,
@@ -289,6 +293,7 @@ impl App {
             message: None,
             pending: None,
             came_from: None,
+            wanted: None,
             pressed: None,
             matcher: RefCell::new(Matcher::new(Config::DEFAULT)),
             trail: crate::config::get().effects.move_enabled(),
@@ -426,6 +431,11 @@ impl App {
     /// over the old ones — an erased row, a glow, a fade — ends with it.
     pub fn set_sessions(&mut self, sessions: Vec<Session>) {
         let previously = self.selected_id();
+        let wanted = self
+            .wanted
+            .take()
+            .filter(|(_, at)| *at == self.selected)
+            .map(|(id, _)| id);
         self.backspace = None;
         self.strike = None;
         self.glow = None;
@@ -434,8 +444,10 @@ impl App {
         self.swap.clear();
         self.room = None;
         self.sessions = sessions;
-        self.selected = previously
-            .and_then(|id| self.visible().iter().position(|s| s.id == id))
+        let at = |app: &Self, id: &str| app.visible().iter().position(|s| s.id == id);
+        self.selected = wanted
+            .and_then(|id| at(self, &id))
+            .or_else(|| previously.and_then(|id| at(self, &id)))
             .unwrap_or_else(|| self.selected.min(self.visible().len().saturating_sub(1)));
     }
 
@@ -445,10 +457,21 @@ impl App {
     /// on the first row: `<prefix> Space` leaves the client running, so coming
     /// back to a cursor on row one throws away the one thing the picker already
     /// knew. A session that has since gone — killed elsewhere, or the child
-    /// exited — simply leaves the cursor where it was.
+    /// exited — leaves the cursor where it was.
+    ///
+    /// Gone from the rows is not always gone: the rows in hand on the way back
+    /// from a session whose client exited leave that session out, and its
+    /// client may have been ended by `:detach` with the session still there
+    /// (see `main`). So one not found is looked for in the next listing the
+    /// picker takes, which puts the cursor on it if it is there and nothing
+    /// has been pressed, clicked or scrolled since.
     pub fn select_session(&mut self, id: &str) {
-        if let Some(at) = self.visible().iter().position(|s| s.id == id) {
-            self.selected = at;
+        match self.visible().iter().position(|s| s.id == id) {
+            Some(at) => {
+                self.selected = at;
+                self.wanted = None;
+            }
+            None => self.wanted = Some((id.to_string(), self.selected)),
         }
     }
 
@@ -1139,6 +1162,8 @@ impl App {
     pub fn on_key(&mut self, key: Key) -> Request {
         // A stale message must not linger over an unrelated action.
         self.message = None;
+        // Nor a session the cursor was waiting for: the user has taken over.
+        self.wanted = None;
         // Nor the rows the last keystroke dropped: the list is the query's
         // again, so a fast typist never waits on rows ruled out a letter ago.
         self.leaving = None;
@@ -1316,6 +1341,7 @@ impl App {
         if matches!(mouse, Mouse::Press(_) | Mouse::ScrollUp | Mouse::ScrollDown) {
             self.message = None;
             self.pending = None;
+            self.wanted = None;
         }
         let was = self.cursor();
         let request = self.on_mouse_mode(mouse);

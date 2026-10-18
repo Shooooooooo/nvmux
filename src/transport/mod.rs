@@ -266,7 +266,7 @@ pub(crate) fn list(h: &impl Host) -> Result<Vec<Session>> {
 
 /// Spawn a session and wait for it to answer; see [`Transport::create_session`].
 pub(crate) fn create(
-    h: &impl Host,
+    h: &(impl Host + Sync),
     name: &str,
     launch: &Launch,
     directory: &str,
@@ -311,31 +311,50 @@ pub(crate) fn create(
         return Err(not_ready(out.stderr.trim().to_string()));
     }
 
+    let mut session = Session::new(id.clone(), name.to_string(), spawned.pid.unwrap_or(0), rank)
+        .launched_with(launch.line())
+        .started_in(directory);
+
     // Over ssh this is the forward, and proves it works before the user tries
     // to attach; a forward that cannot be made leaves no session behind either.
-    let local = h
-        .reach(&id, &host_sock)
-        .inspect_err(|_| discard(h, &id, spawned.pid))?;
+    // The metadata is written meanwhile: a round trip to the host of its own,
+    // which the answer does not wait for. A session that never answers is
+    // ended by the kill script, which takes the metadata away with the rest,
+    // and that only once both are done.
+    let (local, reached, written) = std::thread::scope(|scope| {
+        let writing = std::thread::Builder::new()
+            .name("nvmux-meta".into())
+            .spawn_scoped(scope, || h.write_meta(&session));
+        let local = h.reach(&id, &host_sock);
+        let reached = local
+            .as_ref()
+            .is_ok_and(|local| reachable(local, REACHABLE_TIMEOUT));
+        let written = match writing {
+            Ok(thread) => thread
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            Err(_) => h.write_meta(&session),
+        };
+        (local, reached, written)
+    });
+    if let Err(e) = local {
+        discard(h, &id, spawned.pid);
+        return Err(e);
+    }
 
-    if !wait_until_reachable(&local, REACHABLE_TIMEOUT) {
+    if !reached {
         // A forward succeeding proves nothing on its own: `ssh -O forward` to
         // a nonexistent remote socket still exits 0 and creates a working
         // local socket. Only an answer through it does.
         return Err(not_ready("the session never answered".into()));
     }
-
-    let mut session = Session::new(id, name.to_string(), spawned.pid.unwrap_or(0), rank)
-        .launched_with(launch.line())
-        .started_in(directory);
-    h.write_meta(&session)?;
+    written?;
     // The caller attaches to this without re-listing, so give it the same
     // resolved number a listing would have. Numbers are positions now, so that
     // is a question only the whole list can answer: hand `finish_listing` the
     // listing this create was planned from with the new session in it, and
     // read back the place it takes.
     session.state.num = numbered_in(existing, &session);
-
-    install_detach_alias(&local);
 
     tracing::info!(host = %h.location(), id = %session.id, name, pid = session.pid, "session ready");
     Ok(session)
@@ -456,15 +475,41 @@ const REACHABLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 const REACHABLE_POLL: Duration = Duration::from_millis(25);
 
-/// Wait until the socket accepts a connection and a real Neovim answers.
-/// Deliberately *not* a deferred call — see [`crate::rpc`]. Over SSH `sock` is
-/// the local end of the forward, which also proves the forward works.
-fn wait_until_reachable(sock: &Path, timeout: Duration) -> bool {
+/// Wait until the socket accepts a connection and a real Neovim answers:
+/// `nvim_get_mode`, a fast call whose answer is a few bytes. Deliberately
+/// *not* a deferred call — see [`crate::rpc`]. Over SSH `sock` is the local
+/// end of the forward, which also proves the forward works.
+///
+/// The `:Detach` alias ([`DETACH_ALIAS`]) is asked for on the same connection,
+/// sent behind the mode before its answer is read, so it costs no connection
+/// and no round trip of its own. It is a deferred call, so it is not waited
+/// for while the editor waits for a key, and otherwise for no longer than a
+/// call on a connection of its own, [`rpc::CONNECT_TIMEOUT`].
+fn reachable(sock: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Ok(mut client) = rpc::Client::connect(sock, rpc::PROBE_TIMEOUT) {
-            if client.api_info().is_ok() {
-                return true;
+            if let Ok(mode) = client.ask_mode() {
+                let alias = client.ask("nvim_command", vec![rmpv::Value::from(DETACH_ALIAS)]);
+                if let Ok(mode) = client.mode_reply(mode) {
+                    match alias {
+                        Ok(alias) if !mode.blocking => {
+                            let answered = client
+                                .set_read_timeout(rpc::CONNECT_TIMEOUT)
+                                .and_then(|()| client.reply_to(alias));
+                            if let Err(e) = answered {
+                                tracing::debug!(error = %e, "could not install the :Detach alias");
+                            }
+                        }
+                        // Run by the editor once it has its key, with nobody
+                        // left to read the answer.
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::debug!(error = %e, "could not ask for the :Detach alias");
+                        }
+                    }
+                    return true;
+                }
             }
         }
         std::thread::sleep(REACHABLE_POLL);
@@ -547,16 +592,10 @@ fn kill_outcome(outcome: protocol::KillOutcome, name: &str) -> Result<()> {
     }
 }
 
-/// Give a new session a way out that is not `:q`. `command!` requires an
-/// uppercase name (`command! q` is E183), so this cannot shadow `:q` itself.
-/// Failure is not worth failing the create over.
-fn install_detach_alias(sock: &Path) {
-    if let Ok(mut client) = rpc::Client::connect(sock, rpc::CONNECT_TIMEOUT) {
-        if let Err(e) = client.command("command! -bar Detach detach") {
-            tracing::debug!(error = %e, "could not install the :Detach alias");
-        }
-    }
-}
+/// A new session's way out that is not `:q`, put in by [`reachable`].
+/// `command!` requires an uppercase name (`command! q` is E183), so this
+/// cannot shadow `:q` itself. Failure is not worth failing the create over.
+const DETACH_ALIAS: &str = "command! -bar Detach detach";
 
 /// Shared by both transports: put the sessions in order, then number them by
 /// the position each one landed in.

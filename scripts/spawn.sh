@@ -132,11 +132,13 @@ else
   disown 2>/dev/null || true
 fi
 
-# Wait for the socket to appear. Readiness is a *separate* question the caller
-# settles with a deferred RPC call -- see src/rpc.rs.
+# Wait for the socket to appear, for five seconds counted in hundredths: every
+# hundredth for the first tenth, which is when Neovim usually binds it, and
+# every twentieth after. Readiness is a *separate* question the caller settles
+# with a deferred RPC call -- see src/rpc.rs.
 sock_state=timeout
 i=0
-while [ "$i" -lt 100 ]; do
+while [ "$i" -lt 500 ]; do
   if [ -S "$sock" ]; then
     # The socket's own control, and now the only one it has besides the
     # directory: never trust the caller's mask.
@@ -144,9 +146,14 @@ while [ "$i" -lt 100 ]; do
     sock_state=ok
     break
   fi
-  # `sleep 0.05` is not POSIX; fall back to a whole second rather than spin.
-  sleep 0.05 2>/dev/null || sleep 1
-  i=$((i + 1))
+  # Neither sleep is POSIX; fall back to a whole second rather than spin.
+  if [ "$i" -lt 10 ]; then
+    sleep 0.01 2>/dev/null || sleep 1
+    i=$((i + 1))
+  else
+    sleep 0.05 2>/dev/null || sleep 1
+    i=$((i + 5))
+  fi
 done
 
 # Confirm the pid really is the nvim serving *this* socket before reporting it.

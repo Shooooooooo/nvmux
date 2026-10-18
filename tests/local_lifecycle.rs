@@ -83,6 +83,44 @@ fn create_list_and_kill_a_session() {
     assert!(!sock.exists(), "kill must unlink the socket");
 }
 
+/// A session is ready when its create returns: it answers, it has the
+/// `:Detach` alias, asked for on the connection that found it answering, and
+/// its metadata, written while that connection was being made.
+#[test]
+fn a_created_session_answers_and_has_its_alias_and_its_metadata() {
+    require_nvim!();
+    let scratch = Scratch::new("ready");
+    let t = scratch.transport();
+
+    let session = t
+        .create_session("ready", &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    let mut client = nvmux::rpc::Client::connect(&sock, Duration::from_secs(2)).expect("connect");
+    assert_eq!(
+        client.eval("exists(':Detach')").expect("eval"),
+        rmpv::Value::from(2),
+        "no :Detach command"
+    );
+    let defined = client
+        .eval("execute('command Detach')")
+        .expect("eval")
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_default();
+    assert!(defined.contains("detach"), "{defined:?}");
+    drop(client);
+
+    let listed = t.list_sessions().expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].name, "ready",
+        "no metadata: listed {:?}",
+        listed[0]
+    );
+    t.kill_session(&session).expect("kill");
+}
+
 /// The shell nvmux runs its scripts in — and so `scripts/spawn.sh`, and so the
 /// editor `spawn.sh` launches — runs under the mask nvmux was launched with,
 /// not the 0077 nvmux clamps itself to.
