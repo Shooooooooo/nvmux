@@ -30,7 +30,11 @@
 //! — with `'scrolloff'` keeping the cursor in from the edges, and a count
 //! where Neovim takes one; one after another, as fast as they are typed —
 //! as far as thirty-two windows ahead of Neovim, as soon as the lines they
-//! show have come (see `super::anim::scroll::HOLD`).
+//! show have come (see `super::anim::scroll::HOLD`). A scroll that takes the
+//! cursor to another line lands it in the column it wants, which Neovim
+//! keeps through moves up and down (`curswant`) and the agent says
+//! ([`Predictor::want`]), not the one it is in: further left, at the end of
+//! a line too short for it, or on a character two cells wide.
 //!
 //! Most of the rows a scroll shows are rows the window already shows, moved.
 //! What the client does not have is the lines it uncovers. So the agent the
@@ -1553,6 +1557,9 @@ pub struct Predictor {
     on: bool,
     shapes: HashMap<i64, Shape>,
     lines: HashMap<i64, Lines>,
+    /// The display column the cursor wants in each window, as the agent
+    /// last said: see [`Predictor::want`].
+    wants: HashMap<i64, usize>,
     /// When the round trip was last asked after.
     pinged: Option<Instant>,
     /// What the client makes of the keys it sends.
@@ -1617,8 +1624,8 @@ impl Predictor {
         self.pinged = Some(now);
     }
 
-    /// What the agent says that is the predictions': `lines` and `shape`.
-    /// Says whether it was.
+    /// What the agent says that is the predictions': `lines` and what goes
+    /// with them, `shape` and `want`. Says whether it was.
     pub fn said(&mut self, what: &str, v: &[ValueRef<'_>]) -> bool {
         let int = |i: usize| v.get(i).and_then(redraw::int);
         match what {
@@ -1714,6 +1721,12 @@ impl Predictor {
                 }
                 true
             }
+            "want" => {
+                if let (Some(win), Some(col)) = (int(0), int(1)) {
+                    self.wants.insert(win, usize::try_from(col).unwrap_or(0));
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -1722,12 +1735,23 @@ impl Predictor {
     pub fn closed(&mut self, win: i64) {
         self.shapes.remove(&win);
         self.lines.remove(&win);
+        self.wants.remove(&win);
     }
 
     /// A fresh attach: its agent will say everything again.
     pub fn reset(&mut self) {
         self.shapes.clear();
         self.lines.clear();
+        self.wants.clear();
+    }
+
+    /// The display column the cursor wants in window `win`, as Neovim keeps
+    /// it (`curswant`) and the agent last said: where a scroll that takes
+    /// the cursor to another line lands it ([`landing`]), wherever on its
+    /// own line it is now — further left at the end of a line too short for
+    /// it, or on a character two cells wide that starts before it.
+    pub fn want(&self, win: i64) -> Option<usize> {
+        self.wants.get(&win).copied()
     }
 
     pub fn shape(&self, win: i64) -> Option<&Shape> {
@@ -3131,6 +3155,27 @@ mod tests {
         assert_eq!(row(&p, 8), None);
         p.closed(1000);
         assert_eq!(row(&p, 1), None);
+    }
+
+    /// The column the agent says the cursor wants is its window's, till it
+    /// says another; it goes with the window, and with an attach afresh,
+    /// whose agent says it again.
+    #[test]
+    fn the_column_the_cursor_wants_is_kept_for_its_window() {
+        let mut p = Predictor::default();
+        assert_eq!(p.want(1000), None, "not said");
+        said(&mut p, "want", vec![1000.into(), 40.into()]);
+        said(&mut p, "want", vec![1001.into(), 3.into()]);
+        assert_eq!((p.want(1000), p.want(1001)), (Some(40), Some(3)));
+        said(&mut p, "want", vec![1000.into(), 7.into()]);
+        assert_eq!(p.want(1000), Some(7), "said again");
+        // Past the end of every line, as `$` leaves it.
+        said(&mut p, "want", vec![1000.into(), 2_147_483_647.into()]);
+        assert_eq!(p.want(1000), Some(2_147_483_647));
+        p.closed(1000);
+        assert_eq!((p.want(1000), p.want(1001)), (None, Some(3)));
+        p.reset();
+        assert_eq!(p.want(1001), None);
     }
 
     /// Predictions start past [`ON`] and stop under [`OFF`], the round trip

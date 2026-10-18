@@ -1325,6 +1325,41 @@ fn every_scroll_predicted_is_the_one_neovim_makes() {
     }
 }
 
+/// Lines long and short, and the cursor at the end of a short one, come to
+/// from column 40 of a long one: each scroll that takes it to another line
+/// puts it in column 40 of a line long enough, as Neovim does — where it
+/// wants to be, not where it is — and after `$`, at the end of each line,
+/// however long.
+#[test]
+fn a_scroll_takes_the_cursor_to_the_column_it_wants() {
+    require_nvim!();
+    let scratch = Scratch::new("client-want");
+    let (_rpc, mut term, _) = drawn_slowly(
+        &scratch,
+        "client-want",
+        "call setline(1, map(range(1, 200), \
+         'v:val % 3 ? \"line \" . v:val . \" \" . repeat(\"abcdefghij\", 6) : \"line \" . v:val'))",
+    );
+    // Down from column 40 of line 1 to the end of line 3.
+    typed(&mut term, b"40l");
+    typed(&mut term, b"jj");
+    for (name, keys) in [
+        ("<C-d> from the end of a short line", &b"\x04"[..]),
+        ("3<C-e> to the end of one again", b"3\x05"),
+        ("<C-e> out to column 40", b"\x05"),
+    ] {
+        predicted(&mut term, name, keys);
+    }
+    typed(&mut term, b"$");
+    for (name, keys) in [
+        ("<C-e> after $", &b"\x05"[..]),
+        ("<C-e> after $, to a short line", b"\x05"),
+        ("<C-e> after $, to a long one", b"\x05"),
+    ] {
+        predicted(&mut term, name, keys);
+    }
+}
+
 /// A window that does not wrap, scrolled sideways over a slow link to a real
 /// Neovim: each scroll is on the screen before Neovim could have heard of
 /// it, and is the one Neovim makes.
@@ -1404,8 +1439,10 @@ fn every_scroll_sideways_predicted_is_the_one_neovim_makes() {
 /// other one a column further in, so that the window's edges cut one in two
 /// on every other row: each scroll, sideways or down, is drawn ahead of
 /// Neovim with a `>` where one does not fit at the right and a `<` where the
-/// view starts in the middle of one, as Neovim draws them — and nothing moves
-/// when Neovim's own rows come.
+/// view starts in the middle of one, as Neovim draws them; and the cursor,
+/// scroll after scroll, on the character that covers the column it wants,
+/// which on every other row starts a column before it, as Neovim puts it —
+/// and nothing moves when Neovim's own rows come.
 #[test]
 fn scrolls_over_wide_characters_cut_at_the_edges_are_the_ones_neovim_makes() {
     require_nvim!();
@@ -1423,6 +1460,8 @@ fn scrolls_over_wide_characters_cut_at_the_edges_are_the_ones_neovim_makes() {
         ("the wheel right", b"\x1b[<67;10;5M"),
         ("the wheel left", b"\x1b[<66;10;5M"),
         ("<C-f> among them", b"\x06"),
+        ("<C-e>", b"\x05"),
+        ("<C-b>", b"\x02"),
     ] {
         predicted(&mut term, name, keys);
     }

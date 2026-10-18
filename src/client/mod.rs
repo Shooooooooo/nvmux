@@ -317,7 +317,9 @@ return out";
 /// among it, which of the keys the client follows, given it as the agent's
 /// third argument and those in insert mode as its fourth, something maps in
 /// the window's buffer; a view moved sideways, as Neovim moves it (`leftcol`,
-/// window, its first column); and each time Neovim moves a view while it is
+/// window, its first column); the display column the cursor wants in the
+/// window that has it, Neovim's `curswant`, when that or the window changes
+/// (`want`, window, column); and each time Neovim moves a view while it is
 /// behind on the keys typed (`behind`), which it sends no frame for till it
 /// has caught up — what the client scrolled ahead of it waits for it
 /// meanwhile (see [`Predictor::deadline`]).
@@ -872,6 +874,24 @@ if predict then
       if win and d.leftcol ~= 0 and api.nvim_win_is_valid(win) then
         send('leftcol', win, vim.fn.getwininfo(win)[1].leftcol)
       end
+    end
+  end)
+  -- The column the cursor wants in the window that has it: Neovim's
+  -- curswant, which a scroll that takes the cursor to another line lands it
+  -- on, wherever on its own line it is now. Said when it or the window
+  -- changes, as Neovim goes to wait for a key — once it has taken those
+  -- typed ahead, and before the frame that shows what they did; not while
+  -- the link is too fast for predictions, and afresh after, as the lines.
+  local wanted
+  au('SafeState', {}, function()
+    if reach <= 0 then
+      wanted = nil
+      return
+    end
+    local win, col = api.nvim_get_current_win(), vim.fn.winsaveview().curswant
+    if not wanted or wanted[1] ~= win or wanted[2] ~= col then
+      wanted = { win, col }
+      send('want', win, col)
     end
   end)
   -- New colours for every group the client knows.
@@ -2536,7 +2556,7 @@ impl App {
             scrolloff: shape.scrolloff,
         };
         let mut fill = |i: i64| p.row(win, view.topline + i, width, &look, to.cursor);
-        let wants = self.wants(shape);
+        let wants = self.wants(win, shape);
         let mut land =
             |l, want: Option<usize>| landed(p, win, shape, l, want.unwrap_or(wants), width);
         let made = self
@@ -2571,10 +2591,16 @@ impl App {
         ))
     }
 
-    /// The display column the cursor wants, as far as Neovim's cursor says:
-    /// the one it is in.
-    fn wants(&self, shape: &predict::Shape) -> usize {
-        (self.model.cursor.col + shape.leftcol).saturating_sub(shape.textoff)
+    /// The display column the cursor wants in window `win`: Neovim's
+    /// `curswant`, as its agent last said (see [`Predictor::want`]) — or,
+    /// where it has not, the one the cursor is in.
+    fn wants(&self, win: i64, shape: &predict::Shape) -> usize {
+        self.predict
+            .as_ref()
+            .and_then(|p| p.want(win))
+            .unwrap_or_else(|| {
+                (self.model.cursor.col + shape.leftcol).saturating_sub(shape.textoff)
+            })
     }
 
     /// Draw what windows scrolled ahead of Neovim could not show before, now
@@ -2622,7 +2648,7 @@ impl App {
         let width = right - left;
         let cursor = view.curline + self.anim.ahead(grid).1;
         let mut fill = |i: i64| p.row(win, view.topline + i, width, &look, cursor);
-        let wants = self.wants(shape);
+        let wants = self.wants(win, shape);
         let mut land =
             |l, want: Option<usize>| landed(p, win, shape, l, want.unwrap_or(wants), width);
         self.anim
@@ -4627,6 +4653,53 @@ mod tests {
         a.keys(b"\x1b[<81;3;2M", t2);
         assert_eq!(top_row(&a), "line 3");
         assert_eq!(a.anim.cursor_at(&a.model), (0, 0));
+    }
+
+    /// A scroll that takes the cursor to another line lands it in the
+    /// column the agent says it wants, Neovim's `curswant` — not the one it
+    /// is in, at the end of a line too short for it; where the agent has not
+    /// said, in the one it is in.
+    #[test]
+    fn a_scroll_lands_the_cursor_in_the_column_it_wants() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let land = |want: Option<i64>| {
+            let mut a = predicting(Duration::from_millis(200));
+            // `line 0` short, the cursor at its end; the rest long.
+            let text: Vec<String> = (0..20)
+                .map(|n| match n {
+                    0 => "line 0".to_string(),
+                    _ => format!("line {n} and on and on"),
+                })
+                .collect();
+            let lines = vec![
+                "lines".into(),
+                1000.into(),
+                1.into(),
+                1.into(),
+                0.into(),
+                Value::Array(text.iter().map(|t| Value::from(t.as_str())).collect()),
+                true.into(),
+            ];
+            notify(&mut a, "nvmux_client", lines, t1);
+            let mut events = whole(2, 20, 5, &text[..5]);
+            events.push(("grid_cursor_goto", vec![2.into(), 0.into(), 5.into()]));
+            redraw(&mut a, events, t1);
+            if let Some(col) = want {
+                notify(
+                    &mut a,
+                    "nvmux_client",
+                    vec!["want".into(), 1000.into(), col.into()],
+                    t1,
+                );
+            }
+            // The wheel, three lines down: the cursor goes with the top.
+            a.keys(b"\x1b[<65;3;2M", t1);
+            assert_eq!(top_row(&a), "line 3 and on and on");
+            a.anim.cursor_at(&a.model)
+        };
+        assert_eq!(land(Some(12)), (0, 12), "where it wants to be");
+        assert_eq!(land(Some(2_147_483_647)), (0, 19), "as `$` has it");
+        assert_eq!(land(None), (0, 5), "where it is, as far as is known");
     }
 
     /// Keys that scroll, over a slow link, once Neovim has caught up with
