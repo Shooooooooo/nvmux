@@ -6,6 +6,19 @@
 //! message area and every float (the popup menu among them) has a grid of its
 //! own as well, and where each goes is the compositor's to say (see
 //! [`super::compose`]).
+//!
+//! A character two cells wide is its own cell and the [`Text::Half`] after
+//! it. Where the right edge cuts one in two, its left half is made a blank in
+//! its own highlight, as [`super::compose::Frame::mend`] makes one a float
+//! cuts, and Neovim's compositor too: on its own it would still be drawn two
+//! cells wide, by a terminal that knows nothing of the cut, and the rest of
+//! its row a cell to the right of where the frame has it. The edge cuts one
+//! where a grid is made narrower — as the client makes its own copy of one it
+//! asks Neovim to narrow (see [`super::wide`]) — and where a line drawn for
+//! the grid as wide as it was comes after, one Neovim sent before it had the
+//! ask. Neovim's own grid keeps the half as it was, but draws that cell again
+//! with the rest of its row at the new width: it has no room for a character
+//! two cells wide in a row's last column.
 
 use super::redraw::LineCell;
 
@@ -114,7 +127,8 @@ impl Grid {
     /// Change size, keeping what is in the top left as Neovim keeps it, and
     /// which of it was drawn. What a resize adds is blank, and not drawn until
     /// Neovim draws it, which it does straight after; of what the grid kept,
-    /// it sends only what has changed.
+    /// it sends only what has changed. A character two cells wide that a
+    /// narrower grid cuts in two is left a blank: see the module docs.
     pub fn resize(&mut self, width: usize, height: usize) {
         if (width, height) == (self.width, self.height) {
             return;
@@ -126,6 +140,10 @@ impl Grid {
             let (to, from) = (r * width, r * self.width);
             cells[to..to + n].clone_from_slice(&self.cells[from..from + n]);
             drawn[to..to + n].copy_from_slice(&self.drawn[from..from + n]);
+            // A character two cells wide in the last column kept, cut in two.
+            if n > 0 && self.is_wide(r, n - 1) {
+                cells[to + n - 1].text = Text::Char(' ');
+            }
         }
         self.width = width;
         self.height = height;
@@ -161,7 +179,9 @@ impl Grid {
     }
 
     /// A `grid_line`: runs of cells from `col` on, each in the highlight it
-    /// names or the one before it. What would fall past the edge is dropped.
+    /// names or the one before it. What would fall past the edge is dropped,
+    /// and a character two cells wide cut in two there is left a blank: see
+    /// the module docs.
     pub fn put(&mut self, row: usize, col: usize, runs: &[LineCell]) {
         if row >= self.height || col >= self.width {
             return;
@@ -175,6 +195,11 @@ impl Grid {
             }
             for _ in 0..run.repeat {
                 if c >= self.width {
+                    // Cut in two: the first cell dropped is the right half
+                    // of the last one put.
+                    if run.text == Text::Half {
+                        self.cells[base + c - 1].text = Text::Char(' ');
+                    }
                     break 'runs;
                 }
                 let cell = &mut self.cells[base + c];
@@ -452,6 +477,90 @@ mod tests {
         assert!(g.is_wide(0, 0));
         assert!(!g.is_wide(0, 2));
         assert!(!g.is_wide(0, 3));
+    }
+
+    /// `x`, then two characters two cells wide, each in a highlight of its
+    /// own: five cells, every one drawn.
+    fn two_wide() -> Grid {
+        let mut g = Grid::new(5, 1);
+        g.put(
+            0,
+            0,
+            &[
+                run("x", Some(1), 1),
+                run("中", Some(2), 1),
+                run("", None, 1),
+                run("文", Some(3), 1),
+                run("", None, 1),
+            ],
+        );
+        g
+    }
+
+    /// A character two cells wide that a narrower grid cuts in two leaves a
+    /// blank in the last column, in its highlight, and drawn as it was.
+    #[test]
+    fn a_resize_cutting_a_wide_character_in_two_leaves_a_blank() {
+        for (width, text, hl) in [(2, "x ", 2), (4, "x中 ", 3)] {
+            let mut g = two_wide();
+            g.resize(width, 1);
+            assert_eq!(g.text(), text);
+            assert_eq!(
+                g.cell(0, width - 1),
+                Some(&Cell {
+                    text: Text::Char(' '),
+                    hl,
+                })
+            );
+            assert!(g.whole(), "{width} wide: drawn, as it was");
+        }
+    }
+
+    /// A resize that cuts no character in two keeps every cell it keeps as
+    /// it was: cut before one or after one, or none at all, the grid made
+    /// taller or wider.
+    #[test]
+    fn a_resize_between_characters_changes_nothing() {
+        let before = two_wide();
+        for (width, height) in [(0, 1), (1, 1), (3, 1), (5, 2), (7, 1)] {
+            let mut g = before.clone();
+            g.resize(width, height);
+            let n = width.min(5);
+            assert_eq!(g.row(0)[..n], before.row(0)[..n], "{width}x{height}");
+        }
+    }
+
+    /// A line cut at the edge through a character two cells wide, as one
+    /// Neovim drew for a grid the client has since made narrower is, leaves
+    /// a blank in the last column, in its highlight, and drawn with the rest
+    /// of the line. Cut before one or after one, it is put as it came.
+    #[test]
+    fn a_line_cut_through_a_wide_character_leaves_a_blank() {
+        let line = [
+            run("x", Some(1), 1),
+            run("中", Some(2), 1),
+            run("", None, 1),
+            run("y", None, 1),
+        ];
+        let mut g = Grid::new(3, 1);
+        g.put(0, 0, &[run("a", Some(1), 1)]);
+        g.put(0, 1, &line);
+        assert_eq!(g.text(), "ax ");
+        assert_eq!(
+            g.cell(0, 2),
+            Some(&Cell {
+                text: Text::Char(' '),
+                hl: 2,
+            })
+        );
+        assert!(g.whole(), "drawn with the rest of the line");
+
+        for (width, text) in [(2, "ax"), (4, "ax中")] {
+            let mut g = Grid::new(width, 1);
+            g.put(0, 0, &[run("a", Some(1), 1)]);
+            g.put(0, 1, &line);
+            assert_eq!(g.text(), text, "{width} wide");
+        }
     }
 
     #[test]
