@@ -219,8 +219,12 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
         // picker for the session to take down (see `nvmux::handoff`). Whoever
         // ends the attach first takes it down: the relay, the attaching
         // screen, or one of the ways out below that never reach either.
+        // `float_settings` is the settings, turned to float as they had the
+        // terminal: to come up floating over the session as the next relay
+        // brings it back (see `ui::settings::Outcome::Float`). Turned so on
+        // the picker's `,`, it is the session the picker came up from.
         let seen = looked_at.take();
-        let (mut current, mut listing, mut hand_off) = match ui::run(
+        let (mut current, mut listing, mut hand_off, mut float_settings) = match ui::run(
             transport,
             std::mem::take(&mut opening),
             message.take(),
@@ -247,7 +251,8 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                 session,
                 sessions,
                 hand_off,
-            } => (session, sessions, hand_off),
+                float_settings,
+            } => (session, sessions, hand_off, float_settings),
         };
         // A session the listing no longer has has nothing to come back to.
         pool.keep_only(&listing);
@@ -424,6 +429,9 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
             // The rows the picker opens on if it floats over this session; what
             // it left of them, if it changed them, is taken back below.
             ui::picker::hand(&listing);
+            if std::mem::take(&mut float_settings) {
+                attachment.float_the_settings();
+            }
 
             // The relay, with the chance to start the next client while this
             // session is still dissolving: `begin_next` fires on a `<prefix>`
@@ -607,8 +615,11 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                 }
                 (pty::Outcome::ShowSettings, held) => {
                     attached = pool.set_aside(held);
-                    ui::settings::run(remote)?;
+                    let left = ui::settings::run(remote)?;
                     settle(&mut clients, &mut attached, &mut pool);
+                    // Turned to float: back up over the session, floating,
+                    // as it comes back.
+                    float_settings = left == ui::settings::Outcome::Float;
                     continue;
                 }
                 // The settings floated over the session and changed what kind

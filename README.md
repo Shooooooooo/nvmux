@@ -108,7 +108,7 @@ under `[keys.bind]` — `detach = "x"` makes it `<prefix> x` — as
 
 The picker, the help and the settings float over the session, which goes on
 running behind them, dimmed; `float = false` under `[style]` has each take
-the whole screen instead.
+the whole screen instead. Flipped in the settings, it moves them at once.
 
 Two keys after the prefix are not commands, and stay where they are: a number
 — `<prefix> 1`, `<prefix> 12` — switches straight to that session, and

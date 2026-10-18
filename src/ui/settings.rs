@@ -8,7 +8,12 @@
 //! its keys to ([`Panel`], and see `crate::pty::panel`), and the session goes
 //! on behind it — unless `[style] float` is off, or the terminal is too small
 //! for a panel ([`panel_area`]), where it takes the terminal as from the
-//! picker and hands the same client back afterwards.
+//! picker and hands the same client back afterwards. And `[style] float`,
+//! flipped on the screen itself, moves it at once: off where it floats, it
+//! goes out with the session and comes up full screen in its place; on where
+//! it is full screen over a session — brought up from one, or from the picker
+//! brought up over one — it goes, and the session comes back with it
+//! floating over it ([`Outcome::Float`]).
 //! Either way the screen is the same: its rows are
 //! [`crate::settings`]' — one per setting, so the screen cannot leave one out
 //! — and every change it makes is applied as it is made ([`config::apply`]):
@@ -906,23 +911,39 @@ fn best(query: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// How the settings full screen were left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Closed: back to what they were brought up from.
+    Closed,
+    /// Turned to float (`[style] float`), with a session behind them and room
+    /// on the terminal to float over it: gone, dissolving out, to come up
+    /// again floating over the session as it comes back.
+    Float,
+}
+
 /// Show the settings until the user closes them, on a terminal of its own,
-/// handing the session back afterwards. `remote` is whether the sessions
-/// are another machine's, where Neovim's own client takes an `nvim` on this
-/// one.
-pub fn run(remote: bool) -> Result<()> {
+/// handing the session back afterwards — or until they are turned to float
+/// over it ([`Outcome::Float`]). `remote` is whether the sessions are another
+/// machine's, where Neovim's own client takes an `nvim` on this one.
+pub fn run(remote: bool) -> Result<Outcome> {
     // Reached from a session that has just dissolved out, so dissolve in.
-    super::owning(|terminal| run_on(terminal, true, remote))
+    super::owning(|terminal| run_on(terminal, true, remote, true))
 }
 
 /// Show the settings on a terminal the caller already owns — how the picker
 /// answers `,`. `animate` is whether to dissolve in on the way in and out on
 /// the way out; from the picker the screen is already up, so it does not.
+/// `over_session` is whether a session is behind them, for them to float over
+/// once they are turned to: from a session, and from the picker where it came
+/// up over one. Turned to float, they dissolve out whichever way they came,
+/// for the session to come back with them floating over it.
 pub(super) fn run_on(
     terminal: &mut ratatui::DefaultTerminal,
     animate: bool,
     remote: bool,
-) -> Result<()> {
+    over_session: bool,
+) -> Result<Outcome> {
     let mut state = State::open();
     if animate {
         crate::fade::fade_in(terminal, |f| draw(f, &state))?;
@@ -932,6 +953,9 @@ pub(super) fn run_on(
     // when the row the bar left was last moved on, for the same reason.
     let mut armed_until: Option<Instant> = None;
     let mut ticked = Instant::now();
+    // `[style] float` as it was before the last key, which a key that turns
+    // it on is told apart by.
+    let mut floating = state.live.style.float;
     loop {
         tick(&mut state, &mut ticked);
         // The area kept for the mouse: a click is resolved against the screen
@@ -970,14 +994,31 @@ pub(super) fn run_on(
         };
         follow(&mut state, step, remote, &mut armed_until, Instant::now());
 
+        let turned = turned_to_float(floating, &state.live, over_session, area);
+        floating = state.live.style.float;
+        if turned {
+            state.remember();
+            // Whatever they came up from, what comes next is the session.
+            crate::fade::fade_out(terminal, |f| draw(f, &state))?;
+            return Ok(Outcome::Float);
+        }
         if step == Step::Close {
             state.remember();
             if animate {
                 crate::fade::fade_out(terminal, |f| draw(f, &state))?;
             }
-            return Ok(());
+            return Ok(Outcome::Closed);
         }
     }
+}
+
+/// Whether the settings full screen go, for the session behind them to come
+/// back with them floating over it: `[style] float` turned on, from `was`
+/// before to on in `live`, with a session behind them to float over, and room
+/// on `screen` for them to ([`panel_area`]). Where there is no room they stay,
+/// as they would have come up full screen there anyway.
+fn turned_to_float(was: bool, live: &Settings, over_session: bool, screen: Rect) -> bool {
+    !was && live.style.float && over_session && panel_area(screen).is_some()
 }
 
 /// Move whatever is passing on the screen on to now.
@@ -2463,6 +2504,39 @@ mod tests {
         assert_eq!(panel_area(screen(72, 20)), Some(Rect::new(8, 3, 56, 14)));
         assert_eq!(panel_area(screen(71, 40)), None, "too narrow");
         assert_eq!(panel_area(screen(120, 19)), None, "too short");
+    }
+
+    /// `[style] float` turned on takes the settings full screen away for the
+    /// session to come back with them floating over it — only as it goes from
+    /// off to on, only with a session behind them, and only where there is
+    /// room for them to float; anywhere else they stay where they are.
+    #[test]
+    fn turned_to_float_they_go_to_float_over_the_session() {
+        let screen = |w, h| Rect::new(0, 0, w, h);
+        let mut s = state();
+        s.live.style.float = false;
+        to(&mut s, "float");
+        assert_eq!(key(&mut s, KeyCode::Right), Step::Stay);
+        assert!(s.live.style.float, "turned on");
+        assert!(turned_to_float(false, &s.live, true, screen(120, 36)));
+        assert!(
+            !turned_to_float(false, &s.live, false, screen(120, 36)),
+            "no session behind them"
+        );
+        assert!(
+            !turned_to_float(false, &s.live, true, screen(71, 40)),
+            "no room to float"
+        );
+        assert!(
+            !turned_to_float(true, &s.live, true, screen(120, 36)),
+            "on already: some other key"
+        );
+        key(&mut s, KeyCode::Right);
+        assert!(!s.live.style.float);
+        assert!(
+            !turned_to_float(true, &s.live, true, screen(120, 36)),
+            "turned off"
+        );
     }
 
     /// Moving the bar leaves the row it was on fading back from it, for the
