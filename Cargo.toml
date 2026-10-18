@@ -20,6 +20,12 @@ clap = { version = "4", default-features = false, features = [
 ] }
 getrandom = "0.4"
 libc = "0.2"
+# The fixed strings the relay looks for in what goes through it (see
+# `src/pty.rs`): a finishing client's DA1 request and its leaving the
+# alternate screen, the frame closes taken out of a held first paint, the
+# terminal's answers. Already in the tree for `vte` and `nucleo-matcher`, so
+# it adds no crate to the build graph. 2.4 is the first with `memmem`.
+memchr = "2.4"
 # Ranks the create prompt's directory completions. Its own two dependencies,
 # `memchr` and `unicode-segmentation`, were already in this tree, so it adds
 # exactly one crate to the build graph -- which is what made it worth taking

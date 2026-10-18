@@ -518,6 +518,7 @@ dependencies = [
  "clap",
  "getrandom",
  "libc",
+ "memchr",
  "nix",
  "nucleo-matcher",
  "pty-process",

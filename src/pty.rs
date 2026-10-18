@@ -103,6 +103,7 @@ use std::process::Child;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use memchr::memmem;
 use pty_process::blocking::{Command, Pty};
 
 use crate::error::{NvmuxError, Result};
@@ -525,10 +526,7 @@ impl Hold {
 /// whose `TERM` has no `smcup` draws on the primary screen, and so do the
 /// frames then.
 fn split_at_alt_screen_entry(bytes: &[u8]) -> usize {
-    bytes
-        .windows(ALT_SCREEN_ENTER.len())
-        .position(|w| w == ALT_SCREEN_ENTER)
-        .map_or(0, |i| i + ALT_SCREEN_ENTER.len())
+    memmem::find(bytes, ALT_SCREEN_ENTER).map_or(0, |i| i + ALT_SCREEN_ENTER.len())
 }
 
 /// `bytes` with the ends of the synchronized updates in them taken out, so
@@ -536,17 +534,23 @@ fn split_at_alt_screen_entry(bytes: &[u8]) -> usize {
 /// a held first paint, which a client draws a frame at a time, each in an
 /// update of its own (see [`Attachment::release_hold`]).
 fn unsynced(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
-    let end = fade::SYNC_END;
-    if !bytes.windows(end.len()).any(|w| w == end) {
+    without(bytes, fade::SYNC_END)
+}
+
+/// `bytes` with every `needle` in them taken out and nothing else touched —
+/// the very bytes, borrowed, where there is none.
+fn without<'a>(bytes: &'a [u8], needle: &[u8]) -> std::borrow::Cow<'a, [u8]> {
+    let mut found = memmem::find_iter(bytes, needle).peekable();
+    if found.peek().is_none() {
         return std::borrow::Cow::Borrowed(bytes);
     }
     let mut out = Vec::with_capacity(bytes.len());
-    let mut rest = bytes;
-    while let Some(i) = rest.windows(end.len()).position(|w| w == end) {
-        out.extend_from_slice(&rest[..i]);
-        rest = &rest[i + end.len()..];
+    let mut from = 0;
+    for at in found {
+        out.extend_from_slice(&bytes[from..at]);
+        from = at + needle.len();
     }
-    out.extend_from_slice(rest);
+    out.extend_from_slice(&bytes[from..]);
     std::borrow::Cow::Owned(out)
 }
 
@@ -1293,6 +1297,21 @@ impl Attachment {
         let _ = unsafe { libc::poll(p.as_mut_ptr(), 1, ms) };
     }
 
+    /// Pass on what the client wrote ([`Attachment::show_output`]), and only
+    /// then show the ledger it.
+    ///
+    /// The ledger only watches, like the shadow, and no more than the shadow
+    /// may it hold up what the user sees: what it makes of a chunk is read
+    /// when the client is parked and when it is resumed, never on the way to
+    /// the terminal. It is shown the chunk as the client wrote it, all of it,
+    /// whether the terminal was written to, the boundary kept a tail back, the
+    /// first paint is held — or the write failed.
+    fn relay_output(&mut self, chunk: &[u8], now: Instant) -> std::io::Result<()> {
+        let shown = self.show_output(chunk, now);
+        self.ledger_saw(chunk);
+        shown
+    }
+
     /// Show the terminal what the client wrote — or, while its first paint is
     /// held, keep it and show only the shadow.
     ///
@@ -1303,8 +1322,7 @@ impl Attachment {
     /// worth it: it is what lets the notice, or the bar, go back up after
     /// *every* write rather than after the one read in six that happens to end
     /// where a sequence does.
-    fn relay_output(&mut self, chunk: &[u8], now: Instant) -> std::io::Result<()> {
-        self.ledger_saw(chunk);
+    fn show_output(&mut self, chunk: &[u8], now: Instant) -> std::io::Result<()> {
         if let Some(hold) = self.hold.as_mut() {
             hold.take(chunk, now);
             if let Some(shadow) = self.shadow.as_mut() {
@@ -1509,16 +1527,23 @@ impl Attachment {
     }
 
     /// Whether the held first paint is over and should be released now.
+    ///
+    /// Asked on every pass of the relay, and a hold is there only while a
+    /// first paint is, so the hold is looked for first: [`Attachment::drawn`]
+    /// searches the screen for a glyph, and on a screen with nothing at its
+    /// top — a `ui = "nvim"` client's, which leaves the rows a clear blanked
+    /// unwritten — that is most of the screen.
     fn hold_is_due(&self, now: Instant) -> bool {
-        let drawn = self.drawn();
-        self.hold.as_ref().is_some_and(|hold| hold.due(now, drawn))
+        let Some(hold) = self.hold.as_ref() else {
+            return false;
+        };
+        hold.due(now, self.drawn())
     }
 
     /// When the relay must next wake up for the held first paint, if it is
-    /// holding one.
+    /// holding one. The hold first, as in [`Attachment::hold_is_due`].
     fn hold_wake_at(&self) -> Option<Instant> {
-        let drawn = self.drawn();
-        self.hold.as_ref().and_then(|hold| hold.wake_at(drawn))
+        self.hold.as_ref()?.wake_at(self.drawn())
     }
 
     /// Let the held first paint through: dissolve the shadow in, when asked
@@ -2304,9 +2329,7 @@ fn keep_parked(mut attachment: Attachment, stop: UnixStream) -> Option<Attachmen
 /// [`keep_parked`]). Written in one flush with the rest of the exit sequence,
 /// so, like the DA1 request, it arrives whole.
 fn leaves_alt_screen(chunk: &[u8]) -> bool {
-    chunk
-        .windows(ALT_SCREEN_LEAVE.len())
-        .any(|w| w == ALT_SCREEN_LEAVE)
+    memmem::find(chunk, ALT_SCREEN_LEAVE).is_some()
 }
 
 /// The most a client started ahead may write before its first visit (see
@@ -4497,7 +4520,7 @@ fn discard_pending(fd: RawFd) -> bool {
 /// it used to cost every time. Neovim writes its whole shutdown sequence in one
 /// `flush_buf`, so in practice the request arrives whole.
 fn asks_for_device_attributes(chunk: &[u8]) -> bool {
-    chunk.windows(DA1_REQUEST.len()).any(|w| w == DA1_REQUEST)
+    memmem::find(chunk, DA1_REQUEST).is_some()
 }
 
 /// Where in these bytes, on their way from the terminal to a client, an
@@ -4507,7 +4530,7 @@ fn asks_for_device_attributes(chunk: &[u8]) -> bool {
 /// the key parser passes on a sequence (see [`crate::keys`]).
 fn find_size_report(bytes: &[u8]) -> Option<(std::ops::Range<usize>, u16, u16)> {
     const START: &[u8] = b"\x1b[48;";
-    let at = bytes.windows(START.len()).position(|w| w == START)?;
+    let at = memmem::find(bytes, START)?;
     let params = &bytes[at + START.len()..];
     let len = params
         .iter()
@@ -4526,23 +4549,15 @@ fn find_size_report(bytes: &[u8]) -> Option<(std::ops::Range<usize>, u16, u16)> 
 /// terminal's answer to DA1: `CSI ? Ps ; … c`. What says a client's opening
 /// questions have all been answered (see `Attachment::startup_answered`).
 fn answers_device_attributes(bytes: &[u8]) -> bool {
-    let mut from = 0;
-    while let Some(at) = bytes[from..]
-        .windows(3)
-        .position(|w| w == b"\x1b[?")
-        .map(|i| from + i + 3)
-    {
-        let rest = &bytes[at..];
+    const START: &[u8] = b"\x1b[?";
+    memmem::find_iter(bytes, START).any(|at| {
+        let rest = &bytes[at + START.len()..];
         let params = rest
             .iter()
             .take_while(|b| b.is_ascii_digit() || **b == b';')
             .count();
-        if params > 0 && rest.get(params) == Some(&b'c') {
-            return true;
-        }
-        from = at;
-    }
-    false
+        params > 0 && rest.get(params) == Some(&b'c')
+    })
 }
 
 /// The chunk with every DA1 request taken out, and nothing else touched. See
@@ -4552,20 +4567,7 @@ fn answers_device_attributes(bytes: &[u8]) -> bool {
 /// Exact bytes only: `ESC [ c` is the request, and neither the reply shape
 /// (`ESC [ ? … c`) nor DA2 (`ESC [ > c`) contains it.
 fn without_device_attributes_request(chunk: &[u8]) -> std::borrow::Cow<'_, [u8]> {
-    if !asks_for_device_attributes(chunk) {
-        return std::borrow::Cow::Borrowed(chunk);
-    }
-    let mut out = Vec::with_capacity(chunk.len());
-    let mut i = 0;
-    while i < chunk.len() {
-        if chunk[i..].starts_with(DA1_REQUEST) {
-            i += DA1_REQUEST.len();
-        } else {
-            out.push(chunk[i]);
-            i += 1;
-        }
-    }
-    std::borrow::Cow::Owned(out)
+    without(chunk, DA1_REQUEST)
 }
 
 /// Paint the screen again after one of nvmux's own screens cleared it.
@@ -5585,6 +5587,8 @@ mod tests {
             &*unsynced(frames),
             b"\x1b[?2026h\x1b[1;1Ha\x1b[?2026h\x1b[1;1Hb~"
         );
+        // At either end, and back to back.
+        assert_eq!(&*unsynced(b"\x1b[?2026l\x1b[?2026la\x1b[?2026l"), b"a");
         assert!(
             matches!(unsynced(b"\x1b[2J~"), std::borrow::Cow::Borrowed(_)),
             "nothing to take out"
