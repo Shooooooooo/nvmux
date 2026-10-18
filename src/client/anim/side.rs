@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use crate::client::compose::Scrolling;
-use crate::client::grid::Cell;
+use crate::client::grid::{Cell, Grid};
 use crate::client::model::Held;
 
 /// One window's rows, as they will be once Neovim has made the scrolls
@@ -117,7 +117,7 @@ impl Scrolling for Side {
         self.rect
     }
 
-    fn row(&self, r: usize) -> Option<&[Cell]> {
+    fn row<'a>(&'a self, r: usize, _grid: &'a Grid) -> Option<&'a [Cell]> {
         self.rows.get(r).map(Vec::as_slice)
     }
 }

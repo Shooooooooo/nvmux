@@ -22,7 +22,7 @@
 //! so [`Frame::mend`] turns that half into a blank in its own colours, which is
 //! what Neovim's compositor does too. It runs after every overlay.
 
-use super::grid::{Cell, Text};
+use super::grid::{Cell, Grid, Text};
 use super::model::{Model, Place};
 use super::style::{self, Color, Style};
 use crate::palette::Rgb;
@@ -156,8 +156,10 @@ pub trait Scrolling {
 
     /// What row `r` of the rectangle shows now, counted from its top: a line
     /// of the rectangle's width, or `None` for a row the scroll has nothing
-    /// for, which is drawn blank.
-    fn row(&self, r: usize) -> Option<&[Cell]>;
+    /// for, which is drawn blank. `grid` is the grid the rectangle is in, as
+    /// it is now: a row of the rectangle's own may be lent from it, rather
+    /// than kept.
+    fn row<'a>(&'a self, r: usize, grid: &'a Grid) -> Option<&'a [Cell]>;
 }
 
 /// Nothing moving: everything where the editor put it.
@@ -364,7 +366,7 @@ fn draw(
             let (top, bot, left, right) = s.rect();
             (top..bot)
                 .contains(&r)
-                .then(|| (left, right, s.row(r - top)))
+                .then(|| (left, right, s.row(r - top, g)))
         });
         // The grid's columns that land on this row, less those of the
         // rectangles skipped across it.

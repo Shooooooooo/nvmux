@@ -2119,6 +2119,8 @@ impl App {
             self.done = true;
         }
         self.anim
+            .set_predicting(self.predict.as_ref().is_some_and(Predictor::active));
+        self.anim
             .after(before, &self.model, &changes, multigrid, animate, now);
         // After the animations have taken what they keep of the batch: what
         // was kept from before it is theirs now, or gone.
