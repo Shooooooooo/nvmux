@@ -62,7 +62,9 @@ pub type Fill<'a> = dyn FnMut(i64) -> Option<Vec<Cell>> + 'a;
 /// What works out the cursor's column where a scroll ahead lands it (see
 /// [`Land`]), given the display column it wants, if a scroll before says:
 /// the grid column and the display column it wants from then on — `None`
-/// for one outside the window — or nothing yet, for a line not yet sent.
+/// where Neovim moves the view sideways to show it there, which lets the
+/// scroll go (see [`Scroll::predict`]) — or nothing yet, for a line not yet
+/// sent.
 pub type Lander<'a> = dyn FnMut(Land, Option<usize>) -> Option<Option<(usize, usize)>> + 'a;
 
 /// Where a scroll ahead leaves the cursor, its column to be worked out
@@ -348,7 +350,10 @@ impl Scroll {
     /// the rectangle is tall. `fill` draws the lines it uncovers, and `land`
     /// works out where it leaves the cursor; where either cannot yet, it is
     /// made but not drawn till [`Scroll::fill_in`] can. Says whether it was
-    /// made.
+    /// made: not where it, or one before it held back till now, leaves the
+    /// cursor where Neovim moves the view sideways to show it — a view moved
+    /// as a scroll up or down cannot draw it — which is let go, and those
+    /// after it with it, for Neovim to draw.
     pub fn predict(&mut self, go: Ahead, fill: &mut Fill, land: &mut Lander) -> bool {
         let h = self.current.len() as i64;
         let target = self.ahead() + go.rows;
@@ -357,13 +362,13 @@ impl Scroll {
         }
         self.ahead.push_back(go);
         self.reach(fill);
-        self.advance(land);
-        true
+        !self.advance(land)
     }
 
     /// Draw what the scrolls ahead uncovered that `fill` could not before,
-    /// and the scrolls it was holding back, as far as it can now (see
-    /// [`Scroll::predict`]). Says whether the view shows more of them.
+    /// and the scrolls it was holding back, as far as it can now, letting go
+    /// of one that moves the view sideways as [`Scroll::predict`] does. Says
+    /// whether the view shows more of them.
     pub fn fill_in(&mut self, fill: &mut Fill, land: &mut Lander) -> bool {
         let h = self.current.len() as i64;
         for (k, line) in self.below.iter_mut().enumerate() {
@@ -417,9 +422,12 @@ impl Scroll {
     /// Draw the scrolls ahead the view does not show yet, oldest first, as
     /// far as their lines are known and `land` can say where the cursor
     /// goes: each from the column the cursor wants after the one before.
-    fn advance(&mut self, land: &mut Lander) {
+    /// Says whether it let one go, and those after it (see
+    /// [`Scroll::predict`]).
+    fn advance(&mut self, land: &mut Lander) -> bool {
         let mut at = self.shown_ahead();
         let mut want = self.shown_col().map(|(_, want)| want);
+        let mut let_go = false;
         while let Some(a) = self.ahead.get(self.drawn).copied() {
             if !self.known(at + a.rows) {
                 break;
@@ -429,6 +437,11 @@ impl Scroll {
                 let Some(landed) = land(l, want) else {
                     break;
                 };
+                if landed.is_none() {
+                    self.ahead.truncate(self.drawn);
+                    let_go = true;
+                    break;
+                }
                 col = landed;
                 let a = &mut self.ahead[self.drawn];
                 (a.col, a.land) = (col, None);
@@ -443,6 +456,35 @@ impl Scroll {
             }
         }
         self.shown = self.glide.cells();
+        let_go
+    }
+
+    /// The rows the view shows ahead of Neovim's, as they are once it has
+    /// stopped sliding: `None` for one not known.
+    pub fn rows_ahead(&self) -> Option<Vec<Vec<Cell>>> {
+        let at = self.shown_ahead();
+        (0..self.current.len() as i64)
+            .map(|r| self.line(r + at).map(<[Cell]>::to_vec))
+            .collect()
+    }
+
+    /// Stop sliding: the view is where it is going at once.
+    pub fn settle(&mut self) {
+        self.glide = Glide::default();
+        self.shown = 0;
+    }
+
+    /// The line `i` rows down from the rectangle's top as Neovim has it,
+    /// of those kept: `None` for one not known.
+    fn line(&self, i: i64) -> Option<&[Cell]> {
+        let h = self.current.len() as i64;
+        if i < 0 {
+            self.above.get((-i - 1) as usize)?.as_deref()
+        } else if i >= h {
+            self.below.get((i - h) as usize)?.as_deref()
+        } else {
+            self.current.get(i as usize).map(Vec::as_slice)
+        }
     }
 
     /// Stop being ahead of Neovim: the view goes back to Neovim's, sliding
@@ -500,15 +542,7 @@ impl Scrolling for Scroll {
     }
 
     fn row(&self, r: usize) -> Option<&[Cell]> {
-        let h = self.current.len() as i64;
-        let i = r as i64 - self.shown + self.shown_ahead();
-        if i < 0 {
-            self.above.get((-i - 1) as usize)?.as_deref()
-        } else if i >= h {
-            self.below.get((i - h) as usize)?.as_deref()
-        } else {
-            self.current.get(i as usize).map(Vec::as_slice)
-        }
+        self.line(r as i64 - self.shown + self.shown_ahead())
     }
 }
 
@@ -829,6 +863,56 @@ mod tests {
             ],
             "asked again till it can say, each from the one before"
         );
+    }
+
+    /// A scroll whose landing Neovim moves the view sideways for is let go
+    /// — not made, if it is the one being made — and those held back after
+    /// it with it; those before it stay drawn.
+    #[test]
+    fn a_scroll_that_moves_the_view_sideways_is_let_go() {
+        let mut s = Scroll::still((0, 5, 0, 1), lines(10..15), false);
+        let landing = |line| Ahead {
+            land: Some(Land {
+                line,
+                first: false,
+                insert: false,
+            }),
+            ..go(5)
+        };
+        // Line 20 lands out of view.
+        let mut land = |l: Land, _| Some((l.line != 20).then_some((0, 0)));
+        assert!(s.predict(landing(15), &mut fill(10, 99), &mut land));
+        assert!(!s.predict(landing(20), &mut fill(10, 99), &mut land));
+        assert_eq!((s.ahead(), s.shown_ahead()), (5, 5));
+        assert_eq!(shows(&s), [15, 16, 17, 18, 19].map(Some));
+        // Held back for its lines, and one after it: both go when they come.
+        let mut s = Scroll::still((0, 5, 0, 1), lines(10..15), false);
+        assert!(s.predict(landing(15), &mut fill(10, 99), &mut land));
+        assert!(s.predict(landing(20), &mut fill(10, 19), &mut land));
+        assert!(s.predict(landing(25), &mut fill(10, 19), &mut land));
+        assert_eq!((s.ahead(), s.shown_ahead()), (15, 5));
+        assert!(!s.fill_in(&mut fill(10, 99), &mut land));
+        assert_eq!((s.ahead(), s.shown_ahead()), (5, 5));
+        assert!(!s.held());
+    }
+
+    /// The rows a view sliding to where it is ahead of Neovim shows once it
+    /// is there; and stopped, it is there at once.
+    #[test]
+    fn the_rows_ahead_are_where_the_view_is_going() {
+        let mut s = Scroll::still((0, 5, 0, 1), lines(10..15), true);
+        assert!(s.predict(go(3), &mut fill(10, 99), &mut |_, _| None));
+        assert_ne!(shows(&s), [13, 14, 15, 16, 17].map(Some), "sliding");
+        let ahead: Vec<_> = s
+            .rows_ahead()
+            .expect("all known")
+            .iter()
+            .map(|r| r[0].hl)
+            .collect();
+        assert_eq!(ahead, [13, 14, 15, 16, 17]);
+        s.settle();
+        assert!(!s.moving());
+        assert_eq!(shows(&s), [13, 14, 15, 16, 17].map(Some));
     }
 
     /// A jump further than the window is tall, made ahead of Neovim, is
