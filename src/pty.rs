@@ -1940,6 +1940,13 @@ impl Attachment {
     /// meanwhile if `throttle` (see [`Attachment::go_away`]).
     pub fn park(mut self, throttle: bool) -> Option<Parked> {
         self.exits_seen = EXITS_RELAYED.load(std::sync::atomic::Ordering::Relaxed);
+        // The last fade's diff describes a terminal another session is about
+        // to have, and the resize that brings the client back throws it out
+        // anyway: it goes now, rather than with the client's next byte, which
+        // an idle session may never write.
+        if let Some(copy) = self.copy() {
+            copy.invalidate();
+        }
         if throttle {
             self.go_away();
         }

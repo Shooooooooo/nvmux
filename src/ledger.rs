@@ -38,6 +38,95 @@ use crate::term::MouseReporting;
 /// OSC, and not worth holding on to for every parked session.
 const MAX_OSC: usize = 1024;
 
+/// How much of one OSC's payload a watcher's parser is shown: past it the
+/// rest is dropped, up to the byte that ends it (see [`OscCap`]).
+///
+/// vte keeps an OSC's payload in a buffer that grows without a limit and is
+/// only ever emptied, never shrunk, so a 2 MB `OSC 52` copy leaves 2 MB or
+/// more in it for as long as its client lives — twice over, the ledger's
+/// parser and the shadow's. Nothing either keeps is anywhere near this long:
+/// the ledger keeps titles and colours of [`MAX_OSC`] at most, and the
+/// shadow's parser does nothing with an OSC at all.
+pub const OSC_SHOWN: usize = 4 * MAX_OSC;
+
+/// What opens an OSC: `ESC ]`.
+static OSC_START: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
+    std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"\x1b]"));
+
+/// Cuts every OSC down to [`OSC_SHOWN`] bytes of payload on its way to a
+/// parser, carried across reads, so the parser's OSC buffer stays that size.
+///
+/// Its idea of an OSC is vte's: `ESC ]`, from whatever state the parser is
+/// in, then payload up to `BEL`, `CAN`, `SUB` or `ESC` (the start of `ST`).
+/// Those enders always go through, so the parser leaves the string exactly
+/// where it would have; only payload bytes past the cap — which vte would
+/// have done nothing with but store — go. The one OSC vte would see that
+/// this does not, with a C0 control between its `ESC` and its `]`, goes
+/// through whole.
+#[derive(Debug, Default, Clone)]
+pub struct OscCap {
+    /// The last byte seen was an `ESC`, so a `]` next opens an OSC.
+    esc: bool,
+    /// Inside an OSC, with this many bytes of its payload shown.
+    osc: Option<usize>,
+}
+
+impl OscCap {
+    /// `bytes` as the parser is to see them: the same slice unless an OSC in
+    /// it ran past the cap.
+    pub fn cap<'a>(&mut self, bytes: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        let ender = |b: &u8| matches!(*b, 0x07 | 0x18 | 0x1a | 0x1b);
+        let mut out: Option<Vec<u8>> = None;
+        let mut i = 0;
+        while i < bytes.len() {
+            match self.osc {
+                None => {
+                    // Up to and including the next `ESC ]`, all shown: one
+                    // vectorised search a read, as OSCs are rare.
+                    let from = i;
+                    if std::mem::take(&mut self.esc) && bytes[i] == b']' {
+                        self.osc = Some(0);
+                        i += 1;
+                    } else if let Some(k) = OSC_START.find(&bytes[i..]) {
+                        self.osc = Some(0);
+                        i += k + 2;
+                    } else {
+                        i = bytes.len();
+                        self.esc = bytes.last() == Some(&0x1b);
+                    }
+                    if let Some(out) = out.as_mut() {
+                        out.extend_from_slice(&bytes[from..i]);
+                    }
+                }
+                Some(shown) => {
+                    let run = bytes[i..].iter().position(ender).unwrap_or(bytes.len() - i);
+                    let keep = run.min(OSC_SHOWN.saturating_sub(shown));
+                    if keep < run && out.is_none() {
+                        out = Some(bytes[..i + keep].to_vec());
+                    } else if let Some(out) = out.as_mut() {
+                        out.extend_from_slice(&bytes[i..i + keep]);
+                    }
+                    self.osc = Some(shown + keep);
+                    i += run;
+                    if let Some(&end) = bytes.get(i) {
+                        // The ender itself, shown; an `ESC` may begin the next.
+                        self.osc = None;
+                        self.esc = end == 0x1b;
+                        if let Some(out) = out.as_mut() {
+                            out.push(end);
+                        }
+                        i += 1;
+                    }
+                }
+            }
+        }
+        match out {
+            Some(out) => std::borrow::Cow::Owned(out),
+            None => std::borrow::Cow::Borrowed(bytes),
+        }
+    }
+}
+
 /// The DEC private modes a Neovim client sets once, for the whole terminal,
 /// and that another client's exit turns off: application cursor keys,
 /// focus reports, bracketed paste, grapheme clusters, colour-scheme reports
@@ -56,6 +145,8 @@ const CURSOR_COLOUR_RESET: &[u8] = b"\x1b]112\x07";
 /// again. See the module docs.
 pub struct Ledger {
     parser: vte::Parser,
+    /// What keeps `parser`'s OSC buffer small (see [`OscCap`]).
+    osc: OscCap,
     told: Told,
     /// Where the client's output stands, as the terminal's parser would see
     /// it had it been shown every byte — which this has.
@@ -123,6 +214,7 @@ impl Ledger {
     pub fn new() -> Self {
         Self {
             parser: vte::Parser::new(),
+            osc: OscCap::default(),
             told: Told::default(),
             stream: Boundary::new(),
             broken: false,
@@ -137,7 +229,8 @@ impl Ledger {
     }
 
     /// Watch these bytes go by. A sequence cut in half by a read is carried
-    /// over to the next call by the parser itself.
+    /// over to the next call by the parser itself. The parser is spared the
+    /// payload of an OSC past [`OSC_SHOWN`]; the boundary sees every byte.
     ///
     /// Like the shadow's, never allowed to take the relay down: a panic in
     /// here — somebody else's parser, fed whatever an editor writes — is
@@ -147,8 +240,9 @@ impl Ledger {
             return;
         }
         let (parser, told, stream) = (&mut self.parser, &mut self.told, &mut self.stream);
+        let shown = self.osc.cap(bytes);
         let fed = crate::panics::caught(|| {
-            parser.advance(told, bytes);
+            parser.advance(told, &shown);
             stream.saw_session(bytes);
         });
         if fed.is_err() {
@@ -619,5 +713,118 @@ mod tests {
         let mut l = fed(b"\x1b]0;title\x07\x1b[>3u");
         l.broken = true;
         assert!(l.put_back(true).is_empty());
+    }
+
+    /// `stream` through one cap, in reads of `piece` bytes.
+    fn capped(stream: &[u8], piece: usize) -> Vec<u8> {
+        let mut cap = OscCap::default();
+        let mut out = Vec::new();
+        for chunk in stream.chunks(piece) {
+            out.extend_from_slice(&cap.cap(chunk));
+        }
+        out
+    }
+
+    /// Nothing but an OSC past the cap is touched — not escapes, not short
+    /// OSCs of either ending, not text — and a read that needs nothing cut is
+    /// handed on as it came, without a copy.
+    #[test]
+    fn the_osc_cap_leaves_ordinary_output_alone() {
+        let stream: &[u8] = b"text\x1b[1;2H\x1b]0;title\x07\x1b]12;#ff0000\x1b\\\x1b\x1b]2;t\x07\xe2\x94\x80\x1b[?2026l";
+        for piece in [1, 2, 3, 7, stream.len()] {
+            assert_eq!(capped(stream, piece), stream, "in pieces of {piece}");
+        }
+        assert!(matches!(
+            OscCap::default().cap(stream),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    /// A clipboard write of any length reaches the parser as its first
+    /// `OSC_SHOWN` bytes and its ender, whichever way it ends and however it
+    /// is cut up, and what follows it is untouched.
+    #[test]
+    fn the_osc_cap_cuts_a_long_osc_down_to_the_cap() {
+        let payload: Vec<u8> = (0..OSC_SHOWN * 3).map(|i| b'A' + (i % 26) as u8).collect();
+        for end in [&b"\x07"[..], b"\x1b\\", b"\x18", b"\x1a"] {
+            let stream = [b"a\x1b]52;c;", &payload[..], end, b"\x1b[1mb"].concat();
+            let want = [b"a\x1b]52;c;", &payload[..OSC_SHOWN - 5], end, b"\x1b[1mb"].concat();
+            for piece in [1, 5, 4095, stream.len()] {
+                assert_eq!(capped(&stream, piece), want, "in pieces of {piece}");
+            }
+        }
+    }
+
+    /// Whatever a client writes and however it is read, the cap drops the
+    /// payload past `OSC_SHOWN` of every OSC and nothing else — and the
+    /// ledger it spares that payload holds all the same what one shown
+    /// every byte would.
+    #[test]
+    fn the_osc_cap_drops_only_what_nothing_keeps() {
+        for seed in 0..200 {
+            let (stream, reads) = crate::test_support::osc_noise(seed);
+            // The cap a byte at a time: inside an OSC from its `ESC ]` to
+            // its ender, and showing the first `OSC_SHOWN` of its payload.
+            let mut want = Vec::new();
+            let (mut esc, mut osc) = (false, None);
+            for &b in &stream {
+                match osc {
+                    Some(_) if matches!(b, 0x07 | 0x18 | 0x1a | 0x1b) => {
+                        (esc, osc) = (b == 0x1b, None);
+                        want.push(b);
+                    }
+                    Some(shown) => {
+                        if shown < OSC_SHOWN {
+                            want.push(b);
+                        }
+                        osc = Some(shown + 1);
+                    }
+                    None => {
+                        if esc && b == b']' {
+                            osc = Some(0);
+                        }
+                        esc = b == 0x1b;
+                        want.push(b);
+                    }
+                }
+            }
+            let mut cap = OscCap::default();
+            let mut got = Vec::new();
+            let mut ledger = Ledger::new();
+            let (mut parser, mut told) = (vte::Parser::new(), Told::default());
+            let mut at = 0;
+            for read in reads {
+                let chunk = &stream[at..at + read];
+                at += read;
+                got.extend_from_slice(&cap.cap(chunk));
+                ledger.saw(chunk);
+                parser.advance(&mut told, chunk);
+            }
+            assert!(
+                got == want,
+                "seed {seed}: the cap is not the byte-at-a-time one"
+            );
+            assert_eq!(ledger.told, told, "seed {seed}");
+            assert!(ledger.is_usable(), "seed {seed}");
+        }
+    }
+
+    /// The ledger after a long clipboard write is the ledger it would have
+    /// been: it goes on keeping titles, and the write is not one.
+    #[test]
+    fn a_long_clipboard_write_changes_nothing_the_ledger_keeps() {
+        let mut l = Ledger::new();
+        l.saw(b"\x1b]0;before\x07");
+        let mut osc = b"\x1b]52;c;".to_vec();
+        osc.extend(std::iter::repeat_n(b'Q', 100_000));
+        osc.push(0x07);
+        for chunk in osc.chunks(4095) {
+            l.saw(chunk);
+        }
+        assert_eq!(l.title(), Some(&b"\x1b]0;before\x07"[..]));
+        assert!(l.between_frames());
+        l.saw(b"\x1b]2;after\x1b\\\x1b[?1000h");
+        assert_eq!(l.title(), Some(&b"\x1b]2;after\x1b\\"[..]));
+        assert_eq!(l.mouse(), MouseReporting::Buttons);
     }
 }
