@@ -544,6 +544,91 @@ fn a_client_after_another_is_shown_every_window() {
     );
 }
 
+/// Take what the client draws until it has drawn nothing for `quiet`, for up
+/// to `within`. Says whether it went quiet.
+fn settle(term: &mut Terminal, quiet: Duration, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        let before = term.output.len();
+        term.pump_until(quiet, |_| false);
+        if term.output.len() == before {
+            return true;
+        }
+    }
+    false
+}
+
+/// With `[client] lean_output` on, a client draws a session as it changes —
+/// scrolled, typed into, in colours that change along the line, with
+/// characters two cells wide — into the very screen a client drawing it
+/// afresh with it off shows: every cell, with its colours and attributes.
+#[test]
+fn a_lean_client_draws_the_screen_a_fresh_one_does() {
+    require_nvim!();
+    let scratch = Scratch::new("client-lean");
+    let (sock, mut rpc, config) = session(&scratch, "client-lean");
+    rpc.command(
+        "setlocal noswapfile number cursorline | \
+         call setline(1, map(range(1, 300), \
+         {_, n -> printf('%d 漢字 é ─ %s', n, repeat('ab cd ', n % 9))})) | \
+         call matchadd('Error', 'ab')",
+    )
+    .expect("setline");
+    std::fs::write(&config, "[client]\nlean_output = true\n").expect("write the config");
+    let rows = |t: &Terminal| {
+        t.parser
+            .screen()
+            .rows_formatted(0, COLS)
+            .collect::<Vec<_>>()
+    };
+
+    let mut lean = Terminal::spawn(&sock, &config);
+    assert!(
+        lean.pump_until(Duration::from_secs(15), |s| s.contains("é ─ ab cd")),
+        "never drawn:\n{}",
+        lean.text()
+    );
+    for keys in [&b"\x04"[..], b"jjjj", b"A typed here\x1b", b"\x06", b"\x15"] {
+        lean.type_bytes(keys);
+        assert!(
+            settle(
+                &mut lean,
+                Duration::from_millis(400),
+                Duration::from_secs(10)
+            ),
+            "never settled after {keys:?}"
+        );
+    }
+    assert!(
+        find(&lean.output, b"\x1b[r").is_some(),
+        "no frame of the lean client's moved down by LF"
+    );
+    let (drawn, text) = (rows(&lean), lean.text());
+    assert_eq!(lean.hang_up(), Some(0));
+    assert!(
+        common::wait_until(Duration::from_secs(5), || rpc.list_uis().ok() == Some(0)),
+        "the lean client stayed attached"
+    );
+
+    std::fs::write(&config, "[client]\nlean_output = false\n").expect("write the config");
+    let mut fresh = Terminal::spawn(&sock, &config);
+    assert!(
+        fresh.pump_until(Duration::from_secs(15), |s| s.contains("é ─ ab cd")),
+        "never drawn afresh:\n{}",
+        fresh.text()
+    );
+    assert!(settle(
+        &mut fresh,
+        Duration::from_millis(400),
+        Duration::from_secs(10)
+    ));
+    assert!(
+        drawn == rows(&fresh),
+        "the lean client's screen:\n{text}\nis not the fresh one's:\n{}",
+        fresh.text()
+    );
+}
+
 /// A yank to `+` reaches the terminal's clipboard as OSC 52. Neovim turns its
 /// OSC 52 clipboard on only for a terminal it has asked whether it takes it,
 /// and asks only through a UI that says it is on a tty, as the client does;
