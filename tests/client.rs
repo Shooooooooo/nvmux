@@ -62,6 +62,9 @@ struct Terminal {
     /// Everything the client has written, in order, and the screen it makes.
     output: Vec<u8>,
     parser: vt100::Parser,
+    /// How far into `output` the parser has had: all of it but the start of
+    /// a character the last read ended part way through (see [`whole`]).
+    fed: usize,
     /// How far `output` has been scanned for queries.
     answered: usize,
     /// What this terminal answers a DA1 with.
@@ -144,6 +147,7 @@ impl Terminal {
             pty,
             output: Vec::new(),
             parser: vt100::Parser::new(size.1, size.0, 0),
+            fed: 0,
             answered: 0,
             da1,
             size,
@@ -175,8 +179,8 @@ impl Terminal {
             }
             match self.incoming.recv_timeout(left) {
                 Ok(bytes) => {
-                    self.parser.process(&bytes);
                     self.output.extend_from_slice(&bytes);
+                    self.feed();
                     self.answer();
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -185,14 +189,20 @@ impl Terminal {
         }
     }
 
+    /// Give the parser what has come that it has not had, as far as it is
+    /// whole characters.
+    fn feed(&mut self) {
+        let end = self.fed + whole(&self.output[self.fed..]);
+        self.parser.process(&self.output[self.fed..end]);
+        self.fed = end;
+    }
+
     /// Take what the client draws for up to `within`, answering its questions
     /// as a terminal would, and hand `each` the screen as every frame leaves
     /// it — not as a read happens to, part way through one — until it says
     /// that is enough. Says whether it did.
     fn frames(&mut self, within: Duration, mut each: impl FnMut(&vt100::Screen) -> bool) -> bool {
         let deadline = Instant::now() + within;
-        // What the parser has had: up to the end of the last frame.
-        let mut fed = self.output.len();
         let enough = loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -203,10 +213,12 @@ impl Terminal {
                     self.output.extend_from_slice(&bytes);
                     self.answer();
                     let mut enough = false;
-                    while let Some(i) = find(&self.output[fed..], SYNC_END) {
-                        let end = fed + i + SYNC_END.len();
-                        self.parser.process(&self.output[fed..end]);
-                        fed = end;
+                    // Up to the end of each frame, which is never part way
+                    // through a character.
+                    while let Some(i) = find(&self.output[self.fed..], SYNC_END) {
+                        let end = self.fed + i + SYNC_END.len();
+                        self.parser.process(&self.output[self.fed..end]);
+                        self.fed = end;
                         enough |= each(self.parser.screen());
                     }
                     if enough {
@@ -217,7 +229,7 @@ impl Terminal {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break false,
             }
         };
-        self.parser.process(&self.output[fed..]);
+        self.feed();
         enough
     }
 
@@ -312,6 +324,32 @@ impl Drop for Terminal {
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// How much of `bytes` is whole characters: all of it but the start of a
+/// character it ends part way through, which waits for the rest. `vte`, under
+/// `vt100`, finishes such a character with up to three bytes of what comes
+/// next, and should that run on into the start of another, drops whatever
+/// came between the two: a read that ends inside the `é` of `é ─`, as reads
+/// of a pty on macOS do, loses the space and draws the rest of the row a cell
+/// to the left of where the client put it.
+fn whole(bytes: &[u8]) -> usize {
+    let n = bytes.len();
+    // The last character's first byte, at most four back.
+    for back in 1..=n.min(4) {
+        let b = bytes[n - back];
+        if b & 0xc0 == 0x80 {
+            continue;
+        }
+        let len = match b {
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            _ => 1,
+        };
+        return if back < len { n - back } else { n };
+    }
+    n
 }
 
 /// A session of its own for a test, a connection to it, and a config file
@@ -686,6 +724,33 @@ fn a_lean_client_draws_the_screen_a_fresh_one_does() {
     );
 }
 
+/// What a client writes is drawn as it would be in one read, however the
+/// reads of it fall: one that ends part way through a character waits for
+/// the rest of it (see [`whole`]).
+#[test]
+fn reads_that_cut_a_character_in_two_draw_it_whole() {
+    let written = "漢字 é ─ ab".as_bytes();
+    let screen = |reads: &[&[u8]]| {
+        let mut parser = vt100::Parser::new(1, 20, 0);
+        let (mut output, mut fed) = (Vec::new(), 0);
+        for read in reads {
+            output.extend_from_slice(read);
+            let end = fed + whole(&output[fed..]);
+            parser.process(&output[fed..end]);
+            fed = end;
+        }
+        parser.screen().rows_formatted(0, 20).collect::<Vec<_>>()
+    };
+    let at_once = screen(&[written]);
+    for k in 1..written.len() {
+        assert_eq!(
+            screen(&[&written[..k], &written[k..]]),
+            at_once,
+            "read in two at byte {k}"
+        );
+    }
+}
+
 /// A yank to `+` reaches the terminal's clipboard as OSC 52. Neovim turns its
 /// OSC 52 clipboard on only for a terminal it has asked whether it takes it,
 /// and asks only through a UI that says it is on a tty, as the client does;
@@ -970,6 +1035,10 @@ struct Trace {
     carried: Arc<std::sync::Mutex<Vec<Carried>>>,
 }
 
+/// A line number from Neovim's side of a slow link, with when the link read
+/// it and wrote it on (see [`Trace::views_and_lines`]).
+type Said = (Instant, Instant, u32);
+
 /// One read a slow link passed on.
 struct Carried {
     /// Which of the link's connections, counted from nought.
@@ -1010,6 +1079,38 @@ impl Trace {
             bytes.drain(..used);
         }
         out
+    }
+
+    /// What came back of a run of pages, each with when the link read it and
+    /// wrote it on: the top line of each view Neovim drew, and how far down
+    /// each push of the agent's lines went.
+    fn views_and_lines(&self) -> (Vec<Said>, Vec<Said>) {
+        let (mut views, mut lines) = (Vec::new(), Vec::new());
+        for (read, written, v) in self.messages(true) {
+            match notification(&v) {
+                Some(("redraw", events)) => {
+                    for event in events.iter().filter_map(Value::as_array) {
+                        if event.first().and_then(Value::as_str) != Some("win_viewport") {
+                            continue;
+                        }
+                        for args in event[1..].iter().filter_map(Value::as_array) {
+                            if let Some(top) = args.get(2).and_then(Value::as_u64) {
+                                views.push((read, written, top as u32 + 1));
+                            }
+                        }
+                    }
+                }
+                Some(("nvmux_client", [kind, _, _, _, first, sent, ..]))
+                    if kind.as_str() == Some("lines") =>
+                {
+                    let end =
+                        first.as_u64().unwrap_or(0) as usize + sent.as_array().map_or(0, Vec::len);
+                    lines.push((read, written, end as u32));
+                }
+                _ => {}
+            }
+        }
+        (views, lines)
     }
 
     /// The most the link was late passing anything on, each way: to the
@@ -1475,7 +1576,11 @@ fn page(k: usize) -> u32 {
 
 /// Type `presses` pages, `gap` apart, into a window of `line N`s drawn over
 /// `link`: when each was typed and first on the screen, after making sure
-/// the view never went back and ended where Neovim's did.
+/// the view never went back and ended where Neovim's did. Each goes a gap
+/// after the one before, however late that one was: a test held up on a busy
+/// machine goes on from there, as a key held down repeats, rather than make
+/// up the time with pages typed all at once, faster than any key repeats and
+/// further ahead than the lines kept go.
 fn pages(
     rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
     term: &mut Terminal,
@@ -1505,10 +1610,11 @@ fn pages(
         let last = tops.last().copied();
         term.pump(until - now, |t| top_line(&t.text()) != last);
     };
-    for k in 0..presses {
-        typed.push(Instant::now());
+    for _ in 0..presses {
+        let at = Instant::now();
+        typed.push(at);
         term.type_bytes(b"\x06");
-        watch(term, t0 + gap * (k as u32 + 1), &mut drawn);
+        watch(term, at + gap, &mut drawn);
     }
     let tops = watch(term, Instant::now() + 4 * SLOW, &mut drawn);
     let run = Paging {
@@ -1556,6 +1662,24 @@ impl Paging {
             .collect()
     }
 
+    /// When Neovim's own frame first showing each page reached the client,
+    /// as the link wrote it on: what a page waiting for Neovim would have
+    /// waited for. The last may be on its way yet, and is waited for as long
+    /// as it takes the link to come back.
+    fn frames(&self) -> Vec<Option<Instant>> {
+        let deadline = Instant::now() + 4 * self.trace.delay;
+        loop {
+            let (views, _) = self.trace.views_and_lines();
+            let frames: Vec<Option<Instant>> = (1..=self.typed.len())
+                .map(|k| views.iter().find(|v| v.2 >= page(k)).map(|v| v.1))
+                .collect();
+            if frames.iter().all(Option::is_some) || Instant::now() >= deadline {
+                return frames;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Where the time went, page by page about the `around`th, for a test
     /// to say when a page is late: when it was typed; when its key left the
     /// client and reached Neovim; when Neovim's view got to it and reached
@@ -1584,31 +1708,7 @@ impl Paging {
                 keys.extend(std::iter::repeat_n((read, written, 0), n));
             }
         }
-        let (mut views, mut lines) = (Vec::new(), Vec::new());
-        for (read, written, v) in self.trace.messages(true) {
-            match notification(&v) {
-                Some(("redraw", events)) => {
-                    for event in events.iter().filter_map(Value::as_array) {
-                        if event.first().and_then(Value::as_str) != Some("win_viewport") {
-                            continue;
-                        }
-                        for args in event[1..].iter().filter_map(Value::as_array) {
-                            if let Some(top) = args.get(2).and_then(Value::as_u64) {
-                                views.push((read, written, top as u32 + 1));
-                            }
-                        }
-                    }
-                }
-                Some(("nvmux_client", [kind, _, _, _, first, sent, ..]))
-                    if kind.as_str() == Some("lines") =>
-                {
-                    let end =
-                        first.as_u64().unwrap_or(0) as usize + sent.as_array().map_or(0, Vec::len);
-                    lines.push((read, written, end as u32));
-                }
-                _ => {}
-            }
-        }
+        let (views, lines) = self.trace.views_and_lines();
         let n = self.typed.len();
         let shown = if n <= 40 {
             1..=n
@@ -1678,10 +1778,15 @@ fn pages_typed_further_ahead_than_lines_go_wait_only_for_them() {
     // windows of lines it keeps either way (twenty-four, some twenty-seven
     // pages); thirty-two are as far ahead as a view may go.
     let run = pages(&mut rpc, &mut term, &link, Duration::from_millis(10), 32);
-    for (k, late) in run.late().iter().enumerate() {
+    // Its own frame takes the key there and the frame back, which on a busy
+    // machine is longer than the link's delay says: each page is drawn
+    // before the frame that shows it has come.
+    let frames = run.frames();
+    for (k, (late, frame)) in run.late().into_iter().zip(frames).enumerate() {
+        let own = frame.map(|f| f - run.typed[k]);
         assert!(
-            late.is_some_and(|l| l < 2 * SLOW),
-            "page {} waited for Neovim: {late:?}\n{}",
+            late.zip(own).is_some_and(|(late, own)| late < own),
+            "page {} waited for Neovim: {late:?}, its own frame taking {own:?}\n{}",
             k + 1,
             run.timeline(k + 1)
         );
