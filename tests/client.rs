@@ -1470,7 +1470,11 @@ fn page(k: usize) -> u32 {
 
 /// Type `presses` pages, `gap` apart, into a window of `line N`s drawn over
 /// `link`: when each was typed and first on the screen, after making sure
-/// the view never went back and ended where Neovim's did.
+/// the view never went back and ended where Neovim's did. Each goes a gap
+/// after the one before, however late that one was: a test held up on a busy
+/// machine goes on from there, as a key held down repeats, rather than make
+/// up the time with pages typed all at once, faster than any key repeats and
+/// further ahead than the lines kept go.
 fn pages(
     rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
     term: &mut Terminal,
@@ -1500,10 +1504,11 @@ fn pages(
         let last = tops.last().copied();
         term.pump(until - now, |t| top_line(&t.text()) != last);
     };
-    for k in 0..presses {
-        typed.push(Instant::now());
+    for _ in 0..presses {
+        let at = Instant::now();
+        typed.push(at);
         term.type_bytes(b"\x06");
-        watch(term, t0 + gap * (k as u32 + 1), &mut drawn);
+        watch(term, at + gap, &mut drawn);
     }
     let tops = watch(term, Instant::now() + 4 * SLOW, &mut drawn);
     let run = Paging {
