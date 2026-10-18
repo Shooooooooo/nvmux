@@ -32,6 +32,7 @@ use std::time::Instant;
 use super::glide::Glide;
 use crate::client::compose::Scrolling;
 use crate::client::grid::Cell;
+use crate::client::model::Held;
 
 /// A line of a scroll's rectangle, or `None` for one nothing is known of.
 type Line = Option<Vec<Cell>>;
@@ -168,6 +169,17 @@ impl Scroll {
 
     pub fn rect(&self) -> (usize, usize, usize, usize) {
         self.rect
+    }
+
+    /// Every line it keeps holds its highlights: see
+    /// [`crate::client::model::Model::reclaim`].
+    pub fn hold(&self, held: &mut Held) {
+        for line in self.above.iter().chain(&self.below).flatten() {
+            held.cells(line);
+        }
+        for line in &self.current {
+            held.cells(line);
+        }
     }
 
     /// How many rows the view is ahead of Neovim's, drawn or not.

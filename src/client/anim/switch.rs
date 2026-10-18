@@ -16,7 +16,7 @@
 use super::layout::{background, fade_cell, percent, Easing};
 use crate::client::compose::{Frame, Out};
 use crate::client::grid::{Cell, Text};
-use crate::client::model::{Model, Place};
+use crate::client::model::{Held, Model, Place};
 
 /// More windows than this switching at once fade none of them.
 pub const MAX_BURST: usize = 3;
@@ -91,6 +91,15 @@ impl Switch {
 
     pub fn grid(&self) -> u64 {
         self.was.grid
+    }
+
+    /// What the window showed, and the background it fades through, hold
+    /// their highlights: see [`crate::client::model::Model::reclaim`].
+    pub fn hold(&self, held: &mut Held) {
+        for row in &self.was.rows {
+            held.cells(row);
+        }
+        held.mark(self.bg);
     }
 
     /// Whether its window is still where it was: one moved or resized since

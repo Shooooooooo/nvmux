@@ -17,6 +17,7 @@ use std::time::Instant;
 
 use crate::client::compose::Scrolling;
 use crate::client::grid::Cell;
+use crate::client::model::Held;
 
 /// One window's rows, as they will be once Neovim has made the scrolls
 /// sideways the client has made ahead of it.
@@ -44,6 +45,14 @@ impl Side {
 
     pub fn rect(&self) -> (usize, usize, usize, usize) {
         self.rect
+    }
+
+    /// Its rows hold their highlights: see
+    /// [`crate::client::model::Model::reclaim`].
+    pub fn hold(&self, held: &mut Held) {
+        for row in &self.rows {
+            held.cells(row);
+        }
     }
 
     /// One more scroll sideways, to first column `left`, given up on
