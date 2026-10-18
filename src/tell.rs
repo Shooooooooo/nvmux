@@ -17,7 +17,7 @@
 //! doing and however far away it is; and they are nvmux's, with nothing of
 //! them left in the editor once they go.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
@@ -278,8 +278,9 @@ fn run(inbox: &Receiver<Command>, settings: KeySettings) {
 /// front, `front`, of what is news — oldest first, whichever session said it
 /// ([`oldest_first`]). On a first read, which says only how far a session
 /// has got, what another keeps is its mark alone; and of one that keeps
-/// nothing any more, or is gone, the mark is let go of.
-fn round(watched: &mut [Watched], front: &str, settings: KeySettings) {
+/// nothing any more, or is gone, the mark is let go of. One gone for good,
+/// its socket with it ([`vanished`]), is read no more.
+fn round(watched: &mut Vec<Watched>, front: &str, settings: KeySettings) {
     let heard: Vec<(usize, Heard)> = std::thread::scope(|s| {
         let reads: Vec<_> = watched
             .iter()
@@ -297,6 +298,7 @@ fn round(watched: &mut [Watched], front: &str, settings: KeySettings) {
     };
     let mut told = Vec::new();
     let mut forgot = Vec::new();
+    let mut ended = Vec::new();
     for (i, heard) in heard {
         let w = &mut watched[i];
         let news = match heard {
@@ -304,6 +306,9 @@ fn round(watched: &mut [Watched], front: &str, settings: KeySettings) {
             Heard::Gone => {
                 if std::mem::take(&mut w.marked) {
                     forgot.push(w.id.clone());
+                }
+                if vanished(&w.sock) {
+                    ended.push(w.id.clone());
                 }
                 continue;
             }
@@ -345,6 +350,22 @@ fn round(watched: &mut [Watched], front: &str, settings: KeySettings) {
     for p in oldest_first(told) {
         card::board().post(p);
     }
+    watched.retain(|w| !ended.contains(&w.id));
+}
+
+/// Whether nothing is at `sock` any more, which of a session read as gone
+/// means gone for good, and not worth a connect every two seconds for as long
+/// as nvmux runs. A socket goes only with its session: the editor's own as it
+/// quits or is reaped, and a forward as nvmux takes it down, for a session
+/// killed or no longer listed. One still there that refuses may yet answer:
+/// a forward that a dropped link left behind does, once it is made again,
+/// and the picker floating over a session makes it again for its own reads
+/// of notes, without handing the session here.
+fn vanished(sock: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(sock),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
 }
 
 /// What a round tells, `(age, post)` as the sessions were read, in the order
@@ -533,6 +554,30 @@ mod tests {
             3,
             "from elsewhere, all"
         );
+    }
+
+    /// A session read as gone with its socket gone too is read no more. One
+    /// whose socket is still there, refusing, is kept: so is a forward that a
+    /// dropped link left behind, which answers again once it is made anew.
+    #[test]
+    fn a_session_gone_with_its_socket_is_read_no_more() {
+        let left = crate::test_support::scratch_sock("tell-left");
+        drop(std::os::unix::net::UnixListener::bind(&left).expect("bind"));
+        let watched = |id: &str, sock| Watched {
+            id: id.to_string(),
+            name: id.to_string(),
+            sock,
+            heard: None,
+            marked: false,
+        };
+        let mut all = vec![
+            watched("quit2345", crate::test_support::scratch_sock("tell-quit")),
+            watched("left2345", left.clone()),
+        ];
+        round(&mut all, "front234", prefixed(0));
+        let ids: Vec<&str> = all.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["left2345"], "the one with its socket still there");
+        let _ = std::fs::remove_file(&left);
     }
 
     /// What a round tells is posted oldest first, so that the newest card is
