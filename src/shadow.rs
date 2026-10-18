@@ -53,6 +53,16 @@
 //! any screen. The whole fade then costs about one full repaint plus the cells
 //! that change colour, and nvmux already emits a full repaint on every resize.
 //!
+//! And a cell that shows nothing — blank, or a space with no background and
+//! no underline — is not written a space at a time where there are many of
+//! them together: a stretch of them is erased, to the row's end with `EL` and
+//! short of it with `ECH`, neither of which moves the cursor, and under a pen
+//! with no background, so that the cells come out the terminal's own
+//! background whether the terminal erases in the pen's or in its own. A few
+//! are written as spaces, and a few the cursor has to cross to reach the next
+//! cell are written over rather than jumped. A row of 200 blank columns was
+//! 200 spaces; it is an `EL`.
+//!
 //! What a frame must get right is the same list as the attach notice's
 //! ([`crate::announce`]): a synchronized-update span around the whole thing,
 //! an absolute cursor position for every run of cells and never a newline or
@@ -271,9 +281,12 @@ pub struct Laid {
     left: u16,
     width: u16,
     height: u16,
-    /// Row by row, what each cell shows and in what; `None` for the second
-    /// half of a wide character, which its first half writes.
-    cells: Vec<Option<(String, Pen)>>,
+    /// Every cell's text, one after another: one string for them all rather
+    /// than one each, which a frame would make over again every time.
+    text: String,
+    /// Row by row, where in `text` each cell's is, and in what pen; `None`
+    /// for the second half of a wide character, which its first half writes.
+    cells: Vec<Option<(u32, u32, Pen)>>,
 }
 
 impl Laid {
@@ -282,6 +295,7 @@ impl Laid {
     pub fn from_buffer(buf: &ratatui::buffer::Buffer) -> Self {
         let area = buf.area;
         let mut cells = Vec::with_capacity(buf.content.len());
+        let mut text = String::with_capacity(buf.content.len());
         for row in buf.content.chunks(usize::from(area.width).max(1)) {
             let mut skip = 0;
             for cell in row {
@@ -295,7 +309,9 @@ impl Laid {
                     symbol => symbol,
                 };
                 skip = UnicodeWidthStr::width(symbol).max(1) - 1;
-                cells.push(Some((symbol.to_string(), Pen::of_buffer(cell))));
+                let from = text.len() as u32;
+                text.push_str(symbol);
+                cells.push(Some((from, text.len() as u32, Pen::of_buffer(cell))));
             }
         }
         Self {
@@ -303,12 +319,15 @@ impl Laid {
             left: area.x,
             width: area.width,
             height: area.height,
+            text,
             cells,
         }
     }
 
-    /// The cell at (`row`, `col`) of the screen, if the rectangle covers it.
-    fn at(&self, row: u16, col: u16) -> Option<&Option<(String, Pen)>> {
+    /// The cell at (`row`, `col`) of the screen, if the rectangle covers it:
+    /// what it shows and in what, or `None` for the second half of a wide
+    /// character.
+    fn at(&self, row: u16, col: u16) -> Option<Option<(&str, Pen)>> {
         if row < self.top || col < self.left {
             return None;
         }
@@ -316,8 +335,10 @@ impl Laid {
         if r >= self.height || c >= self.width {
             return None;
         }
-        self.cells
-            .get(usize::from(r) * usize::from(self.width) + usize::from(c))
+        let cell = self
+            .cells
+            .get(usize::from(r) * usize::from(self.width) + usize::from(c))?;
+        Some(cell.map(|(from, to, pen)| (&self.text[from as usize..to as usize], pen)))
     }
 
     fn holds(&self, row: u16, col: u16) -> bool {
@@ -345,6 +366,27 @@ struct Painted {
     underline: bool,
 }
 
+impl Painted {
+    /// A cell nothing is written on: the background as its foreground, since
+    /// it has none to speak of, and no attributes — the same at any `t`.
+    fn blank(palette: &Palette) -> Self {
+        Painted {
+            fg: palette.bg,
+            bg: None,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+        }
+    }
+
+    /// Whether a space shows nothing at all in this pen: the terminal's own
+    /// background, and no underline, are all there is of it to see.
+    fn shows_nothing(&self) -> bool {
+        self.bg.is_none() && !self.underline
+    }
+}
+
 /// The session's screen, as far as its bytes have said.
 pub struct Shadow {
     parser: vt100::Parser,
@@ -357,8 +399,11 @@ pub struct Shadow {
     painted: Vec<Painted>,
     /// What the last frame with the settings over the session painted (see
     /// [`Shadow::frame_under`]), one entry per cell, as `painted` is for a
-    /// fade's frames — or empty, when the next must paint every cell.
-    under: Vec<Option<(String, Pen)>>,
+    /// fade's frames: to be trusted only while `under_valid` says so, and
+    /// kept when it does not, for the next frame to write over in place. Let
+    /// go of once the settings are down ([`Shadow::forget_under`]).
+    under: Vec<Drawn>,
+    under_valid: bool,
     /// The parser panicked on something the session wrote, so its grid can no
     /// longer be trusted: nothing more is fed to it, and a frame paints
     /// nothing. See [`Shadow::feed`].
@@ -384,6 +429,7 @@ impl Shadow {
             cut: Vec::new(),
             painted: Vec::new(),
             under: Vec::new(),
+            under_valid: false,
             broken: false,
         }
     }
@@ -498,7 +544,15 @@ impl Shadow {
     /// the last one left.
     pub fn invalidate(&mut self) {
         self.painted.clear();
-        self.under.clear();
+        self.under_valid = false;
+    }
+
+    /// The settings are down: what their frames were diffed against goes
+    /// with them, rather than stay as long as the client does — a kept one
+    /// for the rest of the run.
+    pub fn forget_under(&mut self) {
+        self.under = Vec::new();
+        self.under_valid = false;
     }
 
     /// The bytes that paint the screen `t` of the way to `palette.bg`, as a
@@ -550,9 +604,12 @@ impl Shadow {
         // change, and where the cursor is known to be after the last cell
         // written on the row — `None` until one is.
         let mut sgr: Option<Painted> = None;
+        // Which of the row's cells show nothing (see `Run`).
+        let mut bare = vec![false; usize::from(cols)];
         for row in 0..rows {
             let t = dissolve(row);
             let mut at: Option<u16> = None;
+            let mut run = Run::default();
             for col in 0..cols {
                 let cell = screen.cell(row, col);
                 let index = next.len();
@@ -564,26 +621,39 @@ impl Shadow {
                 next.push(painted);
                 // The second half of the wide character before it, which the
                 // first half already covered.
-                if cell.is_some_and(vt100::Cell::is_wide_continuation) {
+                let wide_rest = cell.is_some_and(vt100::Cell::is_wide_continuation);
+                let (text, width) = match cell {
+                    Some(c) if c.has_contents() => (c.contents(), if c.is_wide() { 2 } else { 1 }),
+                    _ => (" ", 1),
+                };
+                let same = diff && self.painted[index] == painted;
+                bare[usize::from(col)] = !wide_rest && text == " " && painted.shows_nothing();
+                // Once a run is owed it takes the unchanged blank cells after
+                // it as well: one erase rather than several.
+                if bare[usize::from(col)] && (!same || !run.is_empty()) {
+                    run.push(col);
                     continue;
                 }
-                if diff && self.painted[index] == painted {
+                run.flush(&mut out, (row, cols), &mut at, |out| {
+                    blank_sgr(out, &mut sgr, palette);
+                });
+                if wide_rest || same {
                     continue;
                 }
                 if at != Some(col) {
-                    let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
+                    let over = sgr.is_some_and(|p| p.shows_nothing());
+                    move_to(&mut out, (row, col), at, over, &bare);
                 }
                 if sgr != Some(painted) {
                     write_sgr(&mut out, painted);
                     sgr = Some(painted);
                 }
-                let (text, width) = match cell {
-                    Some(c) if c.has_contents() => (c.contents(), if c.is_wide() { 2 } else { 1 }),
-                    _ => (" ", 1),
-                };
                 out.extend_from_slice(text.as_bytes());
                 at = Some(col + width);
             }
+            run.flush(&mut out, (row, cols), &mut at, |out| {
+                blank_sgr(out, &mut sgr, palette);
+            });
         }
         if let Some((over, ink, ot)) = over.filter(|_| !self.broken) {
             self.paint_under(&mut out, over, palette, ink, ot, &dissolve);
@@ -599,7 +669,7 @@ impl Shadow {
         }
         out.extend_from_slice(SYNC_END);
         self.painted = next;
-        self.under.clear();
+        self.under_valid = false;
         out
     }
 
@@ -916,14 +986,20 @@ impl Shadow {
         let screen = self.parser.screen();
         let (rows, cols) = if self.broken { (0, 0) } else { screen.size() };
         let total = usize::from(rows) * usize::from(cols);
-        let diff = self.under.len() == total;
-        let mut next: Vec<Option<(String, Pen)>> = Vec::with_capacity(total);
+        let diff = self.under_valid && self.under.len() == total;
+        if self.under.len() != total {
+            self.under.clear();
+            self.under.resize(total, Drawn::NOTHING);
+        }
         let mut out = Vec::new();
         out.extend_from_slice(SYNC_BEGIN);
         out.extend_from_slice(HIDE_CURSOR);
         let mut pen: Option<Pen> = None;
+        // Which of the row's cells show nothing (see `Run`).
+        let mut bare = vec![false; usize::from(cols)];
         for row in 0..rows {
             let mut at: Option<u16> = None;
+            let mut run = Run::default();
             // Whether the cell before was a wide character of the session's
             // written whole, whose second half is this one.
             let mut wide_before = false;
@@ -932,11 +1008,11 @@ impl Shadow {
                 let drawn = match laid.and_then(|l| l.at(row, col)) {
                     Some(inside) => {
                         wide_before = false;
-                        inside.clone()
+                        inside
                     }
                     None if cell.is_some_and(vt100::Cell::is_wide_continuation) => {
                         let written = std::mem::take(&mut wide_before);
-                        (!written).then(|| (" ".to_string(), Pen::BLANK))
+                        (!written).then_some((" ", Pen::BLANK))
                     }
                     None => {
                         let wide = cell.is_some_and(vt100::Cell::is_wide);
@@ -946,26 +1022,43 @@ impl Shadow {
                         Some(shaded(cell, shade(row, col), palette, cut))
                     }
                 };
-                let index = next.len();
-                next.push(drawn);
-                let Some((text, this)) = &next[index] else {
+                let index = usize::from(row) * usize::from(cols) + usize::from(col);
+                let same = diff && self.under[index].is(drawn);
+                if !same {
+                    self.under[index] = Drawn::of(drawn);
+                }
+                bare[usize::from(col)] =
+                    drawn.is_some_and(|(text, this)| text == " " && this.shows_nothing());
+                // Once a run is owed it takes the unchanged blank cells after
+                // it as well: one erase rather than several.
+                if bare[usize::from(col)] && (!same || !run.is_empty()) {
+                    run.push(col);
+                    continue;
+                }
+                run.flush(&mut out, (row, cols), &mut at, |out| {
+                    blank_pen(out, &mut pen)
+                });
+                let Some((text, this)) = drawn else {
                     continue;
                 };
-                if diff && self.under[index] == next[index] {
+                if same {
                     continue;
                 }
                 if at != Some(col) {
-                    let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
+                    let over = pen.is_some_and(|p| p.shows_nothing());
+                    move_to(&mut out, (row, col), at, over, &bare);
                 }
-                if pen != Some(*this) {
+                if pen != Some(this) {
                     this.write(&mut out);
-                    pen = Some(*this);
+                    pen = Some(this);
                 }
                 out.extend_from_slice(text.as_bytes());
-                let width =
-                    u16::try_from(UnicodeWidthStr::width(text.as_str()).max(1)).unwrap_or(1);
+                let width = u16::try_from(UnicodeWidthStr::width(text).max(1)).unwrap_or(1);
                 at = Some(col + width);
             }
+            run.flush(&mut out, (row, cols), &mut at, |out| {
+                blank_pen(out, &mut pen)
+            });
         }
         out.extend_from_slice(RESET_SGR);
         if cursor == Cursor::Restored && !self.broken && !screen.hide_cursor() {
@@ -974,7 +1067,7 @@ impl Shadow {
             out.extend_from_slice(SHOW_CURSOR);
         }
         out.extend_from_slice(SYNC_END);
-        self.under = next;
+        self.under_valid = true;
         // Written behind a fade's diff, which must start again.
         self.painted.clear();
         out
@@ -984,19 +1077,29 @@ impl Shadow {
 /// A session's cell as a frame with the settings over it draws it (see
 /// [`Shadow::frame_under`]): its text, blanked where `cut` — a wide
 /// character the rectangle's edge cuts — and its pen as `shade` says.
-fn shaded(
-    cell: Option<&vt100::Cell>,
+fn shaded<'a>(
+    cell: Option<&'a vt100::Cell>,
     shade: Shade,
     palette: Option<&Palette>,
     cut: bool,
-) -> (String, Pen) {
+) -> (&'a str, Pen) {
     let text = match cell {
-        Some(c) if c.has_contents() && !cut => c.contents().to_string(),
-        _ => " ".to_string(),
+        Some(c) if c.has_contents() && !cut => c.contents(),
+        _ => " ",
     };
+    // A space that would come out of `resolve` with no background and no
+    // underline, whatever `t`: most of the cells of a screen, and the blank
+    // pen below for every one of them, so there is no colour to work out.
+    let bare = text == " "
+        && cell.is_none_or(|c| {
+            c.bgcolor() == vt100::Color::Default
+                && !c.inverse()
+                && !(c.underline() && c.has_contents())
+        });
     match (shade, palette) {
-        (Shade::Blank, _) => (" ".to_string(), Pen::BLANK),
-        (Shade::Toward(t), _) if t >= falloff::EMPTIED => (" ".to_string(), Pen::BLANK),
+        (Shade::Blank, _) => (" ", Pen::BLANK),
+        (Shade::Toward(t), _) if t >= falloff::EMPTIED => (" ", Pen::BLANK),
+        (Shade::Toward(_), Some(_)) if bare => (" ", Pen::BLANK),
         (Shade::Toward(t), Some(palette)) => {
             let pen = Pen::painted(resolve(cell, palette, t));
             // A space shows no colour of its own, unless it is underlined or
@@ -1040,6 +1143,12 @@ impl Pen {
         underline: false,
         inverse: false,
     };
+
+    /// Whether a space shows nothing at all in this pen: the terminal's own
+    /// background, not swapped with the foreground, and no underline.
+    fn shows_nothing(&self) -> bool {
+        self.bg == vt100::Color::Default && !self.underline && !self.inverse
+    }
 
     /// A cell as a fade paints it, in its interpolated colours: the
     /// background left to the terminal where it is the terminal's.
@@ -1139,6 +1248,172 @@ impl Pen {
     }
 }
 
+/// What a frame with the settings over the session last painted in a cell
+/// (see [`Shadow::frame_under`]): its text, kept in place rather than in a
+/// string of its own, and its pen. Kept for every cell from one frame to the
+/// next, so a frame allocates nothing per cell.
+#[derive(Debug, Clone, Copy)]
+struct Drawn {
+    /// How many bytes of `text` are the cell's; [`Drawn::NONE`] for nothing
+    /// written, [`Drawn::LONG`] for more than there is room for.
+    len: u8,
+    /// As much as a `vt100` cell holds, which is all the session's text.
+    text: [u8; DRAWN_BYTES],
+    pen: Pen,
+}
+
+/// The most text a `vt100` cell holds.
+const DRAWN_BYTES: usize = 22;
+
+impl Drawn {
+    /// The second half of a wide character, which its first half wrote.
+    const NONE: u8 = u8::MAX;
+    /// Text too long to keep — a cluster of the settings' own, if any is —
+    /// which no cell is taken to be the same as, so it is always written.
+    const LONG: u8 = u8::MAX - 1;
+    const NOTHING: Drawn = Drawn {
+        len: Self::NONE,
+        text: [0; DRAWN_BYTES],
+        pen: Pen::BLANK,
+    };
+
+    fn of(cell: Option<(&str, Pen)>) -> Self {
+        let Some((text, pen)) = cell else {
+            return Self::NOTHING;
+        };
+        let mut kept = [0; DRAWN_BYTES];
+        let len = match kept.get_mut(..text.len()) {
+            Some(room) => {
+                room.copy_from_slice(text.as_bytes());
+                text.len() as u8
+            }
+            None => Self::LONG,
+        };
+        Drawn {
+            len,
+            text: kept,
+            pen,
+        }
+    }
+
+    /// Whether `cell` is what was painted here.
+    fn is(&self, cell: Option<(&str, Pen)>) -> bool {
+        match cell {
+            None => self.len == Self::NONE,
+            Some((text, pen)) => {
+                usize::from(self.len) == text.len()
+                    && self.pen == pen
+                    && self.text.get(..text.len()) == Some(text.as_bytes())
+            }
+        }
+    }
+}
+
+/// The fewest cells that show nothing erased with `ECH` rather than written
+/// as spaces: an erase leaves the cursor where it began, and the `CUP` the
+/// next cell written then needs costs about this many spaces with it.
+const ECH_FROM: u16 = 12;
+
+/// The most cells that show nothing written over as spaces to reach the next
+/// cell on the row, rather than jumped with a `CUP`, which costs about as
+/// much.
+const GAP: u16 = 7;
+
+/// Cells a frame owes the terminal that show nothing — a space with no
+/// background and no underline, which is most of a screen — and has yet to
+/// write: from a column, how many, one after another along the row. Written
+/// together, once a cell that shows something comes or the row ends (see
+/// [`Run::flush`]): where there are many, as one erase.
+///
+/// An erase fills the cells with the pen's background, so the pen is first
+/// made one with none, whatever it was: the terminal's own background is
+/// what goes in them either way, and it is the same on a terminal that
+/// erases in the pen's background as on one that erases in its own.
+#[derive(Debug, Default)]
+struct Run(Option<(u16, u16)>);
+
+impl Run {
+    /// The column after the run owed too, or the first of a new one.
+    fn push(&mut self, col: u16) {
+        match &mut self.0 {
+            Some((_, n)) => *n += 1,
+            None => self.0 = Some((col, 1)),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+
+    /// Write what is owed on `row` of a screen `cols` wide, from `at`, where
+    /// the cursor is, leaving `at` where it then is: as spaces where it is
+    /// short, and otherwise erased — to the row's end with `EL`, short of it
+    /// with `ECH` — neither of which moves the cursor. `blank` makes the pen
+    /// one that shows nothing first.
+    fn flush(
+        &mut self,
+        out: &mut Vec<u8>,
+        (row, cols): (u16, u16),
+        at: &mut Option<u16>,
+        blank: impl FnOnce(&mut Vec<u8>),
+    ) {
+        let Some((start, n)) = self.0.take() else {
+            return;
+        };
+        if *at != Some(start) {
+            let _ = write!(out, "\x1b[{};{}H", row + 1, start + 1);
+        }
+        blank(out);
+        if start + n == cols && n > 3 {
+            out.extend_from_slice(b"\x1b[K");
+            *at = Some(start);
+        } else if n >= ECH_FROM {
+            let _ = write!(out, "\x1b[{n}X");
+            *at = Some(start);
+        } else {
+            out.extend(std::iter::repeat_n(b' ', usize::from(n)));
+            *at = Some(start + n);
+        }
+    }
+}
+
+/// Put the cursor, at `at` on `row`, on its column `col`: by writing spaces
+/// over the cells between where they all show nothing, as the pen does
+/// (`over`), and there are no more than [`GAP`] of them; otherwise with a
+/// `CUP`. `bare` says which of the row's cells show nothing.
+fn move_to(out: &mut Vec<u8>, (row, col): (u16, u16), at: Option<u16>, over: bool, bare: &[bool]) {
+    let gap = at.filter(|&from| {
+        over && from < col
+            && col - from <= GAP
+            && bare[usize::from(from)..usize::from(col)].iter().all(|&b| b)
+    });
+    match gap {
+        Some(from) => out.extend(std::iter::repeat_n(b' ', usize::from(col - from))),
+        None => {
+            let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
+        }
+    }
+}
+
+/// The stream's SGR, made one a fade's blank cells can be written or erased
+/// in — as it is, if it shows nothing already.
+fn blank_sgr(out: &mut Vec<u8>, sgr: &mut Option<Painted>, palette: &Palette) {
+    if !sgr.is_some_and(|p| p.shows_nothing()) {
+        let blank = Painted::blank(palette);
+        write_sgr(out, blank);
+        *sgr = Some(blank);
+    }
+}
+
+/// The pen, made one blank cells under the settings can be written or erased
+/// in — as it is, if it shows nothing already.
+fn blank_pen(out: &mut Vec<u8>, pen: &mut Option<Pen>) {
+    if !pen.is_some_and(|p| p.shows_nothing()) {
+        Pen::BLANK.write(out);
+        *pen = Some(Pen::BLANK);
+    }
+}
+
 /// A colour as SGR parameters: the eight as `base + n`, the bright eight as
 /// `bright + n`, the rest of the 256 as `extended;5;n`, and a true colour as
 /// `extended;2;r;g;b`. Nothing for the default.
@@ -1165,9 +1440,10 @@ fn write_colour(out: &mut Vec<u8>, colour: vt100::Color, base: u8, bright: u8, e
 /// A blank cell has no foreground to speak of, so it is given the background
 /// as one, and no attributes: then its `Painted` does not change from frame to
 /// frame and the diff leaves it alone. Blank is a cell nothing was written to
-/// since it was erased; a space the session wrote is a glyph like any other,
-/// which is how an underline under one is kept — Neovim writes spaces for an
-/// underlined stretch, since terminals do not underline an erase.
+/// since it was erased, and a space the session wrote that shows nothing
+/// either: no background, no underline. A space with one is a glyph like any
+/// other, which is how an underline under one is kept — Neovim writes spaces
+/// for an underlined stretch, since terminals do not underline an erase.
 ///
 /// Inverse video is applied here — the cell's colours swapped, a default
 /// background standing in as the terminal's background colour — so the
@@ -1183,14 +1459,7 @@ fn standing(cell: Option<&vt100::Cell>, palette: &Palette, t: f32) -> Painted {
 
 fn resolve(cell: Option<&vt100::Cell>, palette: &Palette, t: f32) -> Painted {
     let Some(cell) = cell else {
-        return Painted {
-            fg: palette.bg,
-            bg: None,
-            bold: false,
-            dim: false,
-            italic: false,
-            underline: false,
-        };
+        return Painted::blank(palette);
     };
     let fg = match cell.fgcolor() {
         vt100::Color::Default => palette.fg,
@@ -1207,7 +1476,8 @@ fn resolve(cell: Option<&vt100::Cell>, palette: &Palette, t: f32) -> Painted {
     } else {
         (fg, bg)
     };
-    let blank = !cell.has_contents();
+    let blank =
+        !cell.has_contents() || (cell.contents() == " " && bg.is_none() && !cell.underline());
     Painted {
         fg: if blank {
             palette.bg
@@ -2468,10 +2738,28 @@ mod tests {
     fn a_cell_is_emptied_or_drawn_faint() {
         let mut shadow = Shadow::new(2, 6);
         // An erase in a background leaves cells with nothing written on them.
-        shadow.feed(b"\x1b[31;44mab\x1b[0m\x1b[2;1H\x1b[44m\x1b[K\x1b[0m");
+        let session = b"\x1b[31;44mab\x1b[0m\x1b[2;1H\x1b[44m\x1b[K\x1b[0m";
+        shadow.feed(session);
+        // Every cell of a terminal showing the session, after `frame`: its
+        // text gone, and its background the terminal's own.
+        let emptied = |frame: &[u8]| {
+            let mut terminal = vt100::Parser::new(2, 6, 0);
+            terminal.process(session);
+            terminal.process(frame);
+            let screen = terminal.screen();
+            (0..2).all(|row| {
+                (0..6).all(|col| {
+                    screen.cell(row, col).is_some_and(|c| {
+                        c.contents().trim().is_empty()
+                            && c.bgcolor() == vt100::Color::Default
+                            && !c.inverse()
+                            && !c.underline()
+                    })
+                })
+            })
+        };
         let blank = shadow.frame_under(&|_, _| Shade::Blank, None, None, Cursor::Hidden);
-        let cells = screen_of(&blank);
-        assert_eq!(cells[&(1, 1)], ("0".into(), " ".into()));
+        assert!(emptied(&blank));
         let faint = shadow.frame_under(&|_, _| Shade::Faint, None, None, Cursor::Hidden);
         let cells = screen_of(&faint);
         assert_eq!(
@@ -2498,11 +2786,143 @@ mod tests {
             None,
             Cursor::Hidden,
         );
-        assert_eq!(
-            screen_of(&gone)[&(1, 1)],
-            ("0".into(), " ".into()),
-            "emptied"
+        assert!(emptied(&gone), "emptied");
+    }
+
+    /// A terminal `rows` by `cols` showing `frame`, written over a screen of
+    /// `#` on a background: a cell the frame did not see to shows as one.
+    fn over_marks(frame: &[u8], rows: u16, cols: u16) -> vt100::Parser {
+        let mut terminal = vt100::Parser::new(rows, cols, 0);
+        terminal.process(b"\x1b[41m");
+        for row in 1..=rows {
+            terminal.process(format!("\x1b[{row};1H{}", "#".repeat(usize::from(cols))).as_bytes());
+        }
+        terminal.process(b"\x1b[0m");
+        terminal.process(frame);
+        terminal
+    }
+
+    /// The cells of a terminal's row that show something, as `(column,
+    /// text)`; and whether every other cell of the row shows nothing — no
+    /// text, the terminal's own background, nothing under or inverted.
+    fn shown_on(terminal: &vt100::Parser, row: u16) -> (Vec<(u16, String)>, bool) {
+        let screen = terminal.screen();
+        let mut text = Vec::new();
+        let mut rest_blank = true;
+        for col in 0..screen.size().1 {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            if !cell.contents().trim().is_empty() {
+                text.push((col, cell.contents().to_string()));
+            } else if cell.bgcolor() != vt100::Color::Default || cell.inverse() || cell.underline()
+            {
+                rest_blank = false;
+            }
+        }
+        (text, rest_blank)
+    }
+
+    /// A stretch of cells that show nothing is erased rather than written a
+    /// space at a time — to the row's end with `EL`, short of it with `ECH` —
+    /// and a short one written as spaces. A frame from the settings writes
+    /// them as a fade's does; either way the terminal shows them blank.
+    #[test]
+    fn a_stretch_of_blank_cells_is_erased() {
+        let mut shadow = Shadow::new(3, 40);
+        // A word and nothing after it; a word, twenty blanks and a word; and
+        // two words three written spaces apart.
+        shadow.feed(b"\x1b[1;1Hab\x1b[2;1Hx\x1b[2;22Hy\x1b[3;1Ha   b");
+        let fade = shadow.frame(0.5, &palette(), Cursor::Hidden);
+        let under = shadow.frame_under(
+            &|_, _| Shade::Toward(0.5),
+            Some(&palette()),
+            None,
+            Cursor::Hidden,
         );
+        for frame in [fade, under] {
+            let csi = csis(&frame);
+            assert!(csi.contains(&(String::new(), 'K')), "{:?}", text(&frame));
+            assert!(csi.contains(&("20".into(), 'X')), "{:?}", text(&frame));
+            assert!(contains(&frame, b"a   b"), "a short stretch written");
+            let terminal = over_marks(&frame, 3, 40);
+            let ab = vec![(0, "a".into()), (1, "b".into())];
+            assert_eq!(shown_on(&terminal, 0), (ab, true));
+            assert_eq!(
+                shown_on(&terminal, 1),
+                (vec![(0, "x".into()), (21, "y".into())], true)
+            );
+            assert_eq!(
+                shown_on(&terminal, 2),
+                (vec![(0, "a".into()), (4, "b".into())], true)
+            );
+        }
+    }
+
+    /// An erase fills with the pen's background, so a pen with one is put
+    /// aside first, and the cells come out the terminal's own background —
+    /// as they do on a terminal that erases in its own and not the pen's.
+    #[test]
+    fn an_erase_is_never_made_in_a_background() {
+        let mut shadow = Shadow::new(2, 30);
+        // A word on a background, nothing after it, and the same in the
+        // middle of a row.
+        shadow.feed(b"\x1b[1;1H\x1b[44mab\x1b[0m\x1b[2;1H\x1b[44mcd\x1b[0m\x1b[2;30Hz");
+        let fade = shadow.frame(0.25, &palette(), Cursor::Hidden);
+        // Under the settings, a panel's own cells on a background with blank
+        // ones after them, and the session's.
+        let area = ratatui::layout::Rect::new(0, 0, 20, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        buf.set_string(
+            0,
+            0,
+            "on-blue",
+            ratatui::style::Style::default().bg(ratatui::style::Color::Blue),
+        );
+        let panel = Laid::from_buffer(&buf);
+        let under = shadow.frame_under(
+            &|_, _| Shade::Toward(0.25),
+            Some(&palette()),
+            Some(&panel),
+            Cursor::Hidden,
+        );
+        for frame in [fade, under] {
+            let terminal = over_marks(&frame, 2, 30);
+            assert!(shown_on(&terminal, 0).1, "{:?}", text(&frame));
+            assert!(shown_on(&terminal, 1).1, "{:?}", text(&frame));
+        }
+    }
+
+    /// What a frame under the settings keeps of a cell, to know it next time:
+    /// the text and pen it drew, and text too long to keep never taken to be
+    /// the same.
+    #[test]
+    fn a_cell_drawn_under_the_settings_is_known_again() {
+        let pen = Pen::BLANK;
+        let kept = Drawn::of(Some(("é", pen)));
+        assert!(kept.is(Some(("é", pen))));
+        assert!(!kept.is(Some(("e", pen))));
+        assert!(!kept.is(Some(("é", Pen { bold: true, ..pen }))));
+        assert!(!kept.is(None));
+        assert!(Drawn::of(None).is(None));
+        let long = format!("e{}", "\u{301}".repeat(11));
+        let long = long.as_str();
+        assert!(long.len() > DRAWN_BYTES);
+        assert!(!Drawn::of(Some((long, pen))).is(Some((long, pen))));
+    }
+
+    /// The settings down, what their frames were diffed against goes, and
+    /// the next frame under them paints every cell again.
+    #[test]
+    fn what_the_settings_were_drawn_against_goes_with_them() {
+        let mut shadow = lettered();
+        let shade = |_: u16, _: u16| Shade::Toward(0.5);
+        shadow.frame_under(&shade, Some(&palette()), None, Cursor::Hidden);
+        assert!(shadow.under.capacity() > 0);
+        shadow.forget_under();
+        assert_eq!(shadow.under.capacity(), 0);
+        let again = shadow.frame_under(&shade, Some(&palette()), None, Cursor::Hidden);
+        assert_eq!(screen_of(&again).len(), 6 * 20);
     }
 
     /// The frames are diffs: the same again paints nothing, the settings

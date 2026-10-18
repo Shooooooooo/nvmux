@@ -4310,7 +4310,15 @@ fn float_over(
 ) -> Result<Option<Outcome>> {
     attachment.float_settings = false;
     match panel::What::of(outcome, config::get().style.float) {
-        Some(what) => panel::float(attachment, master_fd, winch, what),
+        Some(what) => {
+            let floated = panel::float(attachment, master_fd, winch, what);
+            // Down, however it was taken down: what its frames were diffed
+            // against goes with it, and is not kept with the client.
+            if let Some(copy) = attachment.copy() {
+                copy.forget_under();
+            }
+            floated
+        }
         None => Ok(Some(outcome)),
     }
 }
