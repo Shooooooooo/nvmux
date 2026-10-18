@@ -93,6 +93,10 @@ pub struct Screen {
     /// when they change — setting the shape restarts its blink.
     shape: Option<u8>,
     color: Option<Option<Rgb>>,
+    /// The cursor as the last frame written left it: a frame that writes no
+    /// cell and leaves the cursor as it is writes nothing at all (see
+    /// [`Screen::draw_into`]).
+    cursor: Option<Cursor>,
     /// Each frame in as few bytes as it takes, as from the start: see
     /// [`Screen::set_lean`].
     lean: bool,
@@ -111,6 +115,7 @@ impl Screen {
             spare: None,
             shape: None,
             color: None,
+            cursor: None,
             lean: true,
         }
     }
@@ -133,13 +138,14 @@ impl Screen {
     }
 
     /// Forget what the terminal shows: the next frame paints every cell, and
-    /// sets the cursor's shape and colour afresh.
+    /// sets the cursor, its shape and its colour afresh.
     pub fn invalidate(&mut self) {
         if let Some(shown) = self.shown.take() {
             self.spare = Some(shown);
         }
         self.shape = None;
         self.color = None;
+        self.cursor = None;
     }
 
     /// The bytes that turn what the terminal shows into `frame`, with the
@@ -158,6 +164,15 @@ impl Screen {
     }
 
     /// [`Screen::draw`], onto the end of `out`.
+    ///
+    /// A frame that writes no cell, and leaves the cursor where, and as, the
+    /// last frame written left it, writes nothing: the terminal shows it
+    /// already. Its envelope alone — the synchronized update, the cursor
+    /// hidden and shown again — would wake nvmux's relay and the terminal for
+    /// nothing, which an animation's frames that round to the last do, and
+    /// output that leaves a `:terminal` looking as it did, forty times a
+    /// second. Every frame still stands alone: nvmux puts the cursor back
+    /// itself after anything it writes over the session.
     pub fn draw_into(
         &mut self,
         out: &mut Vec<u8>,
@@ -166,6 +181,10 @@ impl Screen {
         sync: bool,
         links: &[Box<str>],
     ) {
+        // Where this frame's bytes begin, for them to be taken back if they
+        // change nothing.
+        let start = out.len();
+        let mut drew = false;
         if sync {
             out.extend_from_slice(SYNC_BEGIN);
         }
@@ -251,6 +270,7 @@ impl Screen {
                     link = cell.style.link;
                 }
                 cell.text.push_to(out);
+                drew = true;
                 c += span;
                 at = Some((r, c));
                 sure &= c < frame.width && plain(cell);
@@ -286,6 +306,10 @@ impl Screen {
         if sync {
             out.extend_from_slice(SYNC_END);
         }
+        if !drew && self.cursor == Some(*cursor) {
+            out.truncate(start);
+        }
+        self.cursor = Some(*cursor);
         self.shown = Some(frame);
         self.spare = shown;
     }
@@ -595,14 +619,40 @@ mod tests {
         assert_eq!(shown(&again, 2, 1), "ab");
     }
 
-    /// A frame the same as the one shown writes nothing but the cursor's
-    /// hiding: no cell, no move, no colour.
+    /// A frame the same as the one shown, with the cursor where it was,
+    /// writes nothing at all; one with the cursor moved, shown or hidden
+    /// writes that and no cell; and one after the screen is forgotten writes
+    /// everything again. What was waiting ahead of a frame that writes
+    /// nothing is left as it was.
     #[test]
-    fn a_frame_as_it_was_writes_no_cell() {
+    fn a_frame_that_changes_nothing_writes_nothing() {
+        let at = |row, col| Cursor {
+            visible: true,
+            row,
+            col,
+            shape: 2,
+            color: None,
+        };
         let mut s = Screen::new();
-        s.draw(frame(&["ab", "cd"]), &hidden(), false, &[]);
+        s.draw(frame(&["ab", "cd"]), &at(0, 1), true, &[]);
+        assert_eq!(s.draw(frame(&["ab", "cd"]), &at(0, 1), true, &[]), b"");
+
+        let mut out = b"said".to_vec();
+        s.draw_into(&mut out, frame(&["ab", "cd"]), &at(0, 1), true, &[]);
+        assert_eq!(out, b"said", "nothing of its own");
+
+        let moved = s.draw(frame(&["ab", "cd"]), &at(1, 0), false, &[]);
+        assert_eq!(
+            moved, b"\x1b[?25l\x1b[2;1H\x1b[?25h",
+            "the cursor, and no cell"
+        );
+        let gone = s.draw(frame(&["ab", "cd"]), &hidden(), false, &[]);
+        assert_eq!(gone, b"\x1b[?25l", "hidden, and no cell");
+        assert_eq!(s.draw(frame(&["ab", "cd"]), &hidden(), false, &[]), b"");
+
+        s.invalidate();
         let again = s.draw(frame(&["ab", "cd"]), &hidden(), false, &[]);
-        assert_eq!(again, b"\x1b[?25l");
+        assert_eq!(shown(&again, 2, 2), "ab\ncd", "every cell again");
     }
 
     /// The frame shown before the last is kept for its buffer, and so is one

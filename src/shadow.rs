@@ -348,6 +348,9 @@ struct Painted {
 /// The session's screen, as far as its bytes have said.
 pub struct Shadow {
     parser: vt100::Parser,
+    /// The start of a character the bytes last fed ended part way through,
+    /// held back from the parser till the rest of it comes: see [`whole`].
+    cut: Vec<u8>,
     /// What the last frame painted, one entry per cell in row-major order —
     /// or empty, when the screen has changed since and the next frame must
     /// paint every cell.
@@ -378,6 +381,7 @@ impl Shadow {
     pub fn new(rows: u16, cols: u16) -> Self {
         Self {
             parser: vt100::Parser::new(rows.max(MIN_SIZE), cols.max(MIN_SIZE), 0),
+            cut: Vec::new(),
             painted: Vec::new(),
             under: Vec::new(),
             broken: false,
@@ -386,7 +390,8 @@ impl Shadow {
 
     /// Watch these bytes go by. Whatever they were — a frame, half a frame, a
     /// query the terminal will answer — the parser takes them as the terminal
-    /// did.
+    /// did, but for the start of a character they end part way through,
+    /// which waits for the rest of it (see [`whole`]).
     ///
     /// The one thing the shadow must never do is take the relay down. The
     /// parser is somebody else's code fed the whole of what an editor can
@@ -396,7 +401,17 @@ impl Shadow {
         if self.broken {
             return;
         }
-        self.guard(|parser| parser.process(bytes));
+        // After the character the bytes before cut in two, which these finish.
+        let joined;
+        let bytes = if self.cut.is_empty() {
+            bytes
+        } else {
+            joined = [std::mem::take(&mut self.cut).as_slice(), bytes].concat();
+            joined.as_slice()
+        };
+        let end = whole(bytes);
+        self.cut.extend_from_slice(&bytes[end..]);
+        self.guard(|parser| parser.process(&bytes[..end]));
         self.invalidate();
     }
 
@@ -1234,6 +1249,32 @@ fn laid_out(row: &str, width: u16) -> Vec<Option<String>> {
         col += w;
     }
     out
+}
+
+/// How much of `bytes` is whole characters: all of it but the start of a
+/// character it ends part way through, which waits for the rest. `vte`, under
+/// `vt100`, finishes such a character with up to three bytes of what comes
+/// next, and should that run on into the start of another, drops whatever
+/// came between the two: a read of the session's output that ends inside the
+/// `é` of `é ─` loses the space, and the shadow has the rest of the row a cell
+/// to the left of where the terminal has it.
+fn whole(bytes: &[u8]) -> usize {
+    let n = bytes.len();
+    // The last character's first byte, at most four back.
+    for back in 1..=n.min(4) {
+        let b = bytes[n - back];
+        if b & 0xc0 == 0x80 {
+            continue;
+        }
+        let len = match b {
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            _ => 1,
+        };
+        return if back < len { n - back } else { n };
+    }
+    n
 }
 
 /// What an overlay's glyph occupies, never zero — it was laid out by width, so
@@ -2192,6 +2233,30 @@ mod tests {
         assert!(!s.is_usable());
         s.feed(b"more");
         assert!(wrapper_only(&s.frame(0.5, &palette(), Cursor::Hidden)));
+    }
+
+    /// A character the session's output is read in two inside goes to the
+    /// parser whole, so the shadow is the screen the terminal drew however
+    /// the reads fell: `vte` on its own loses the space of `é ─` read in two
+    /// inside the `é`, and has the rest of the row a cell to the left.
+    #[test]
+    fn a_character_read_in_two_is_taken_whole() {
+        let written = "漢字 é ─ ab".as_bytes();
+        let screen = |reads: &[&[u8]]| {
+            let mut s = Shadow::new(2, 20);
+            for read in reads {
+                s.feed(read);
+            }
+            s.parser.screen().rows_formatted(0, 20).collect::<Vec<_>>()
+        };
+        let at_once = screen(&[written]);
+        for k in 1..written.len() {
+            assert_eq!(
+                screen(&[&written[..k], &written[k..]]),
+                at_once,
+                "read in two at byte {k}"
+            );
+        }
     }
 
     /// Nothing about a frame depends on the size being sane.

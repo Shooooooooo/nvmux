@@ -694,6 +694,28 @@ impl Animator {
         self.scrolls.get(&grid).and_then(Scroll::col)
     }
 
+    /// Whether window grid `grid` has been scrolled up or down ahead of
+    /// Neovim, drawn or not.
+    pub fn scrolled_ahead(&self, grid: u64) -> bool {
+        self.scrolls.get(&grid).is_some_and(|s| s.until().is_some())
+    }
+
+    /// The rows window grid `grid` shows scrolled up or down ahead of
+    /// Neovim, as they are once they stop sliding, and how many rows ahead
+    /// of Neovim's view they are: `None` where it shows none ahead.
+    pub fn rows_ahead(&self, model: &Model, grid: u64) -> Option<(Vec<Vec<Cell>>, i64)> {
+        let s = self.scrolls.get(&grid).filter(|s| s.shown_ahead() != 0)?;
+        Some((s.rows_ahead(model.grids.get(&grid)?)?, s.shown_ahead()))
+    }
+
+    /// Window grid `grid` scrolled up or down ahead of Neovim stops sliding:
+    /// see [`Scroll::settle`].
+    pub fn settle(&mut self, grid: u64) {
+        if let Some(s) = self.scrolls.get_mut(&grid) {
+            s.settle();
+        }
+    }
+
     /// Scroll window grid `grid` sideways ahead of Neovim, to first column
     /// `left`, given up on `until` then: its text rectangle shows `rows`,
     /// and the cursor is at `cursor` in its grid if it has it. See [`side`].
