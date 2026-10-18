@@ -350,6 +350,13 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
         )),
         own(row(
             "client",
+            "back_off",
+            Tab::Client,
+            "ask a quiet session for news less often, down to every 16s",
+            switch!(client.back_off),
+        )),
+        own(row(
+            "client",
             "predict",
             Tab::Client,
             "over a slow link, scrolls show before Neovim answers",
