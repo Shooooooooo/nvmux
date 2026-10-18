@@ -1467,6 +1467,59 @@ fn scrolls_over_wide_characters_cut_at_the_edges_are_the_ones_neovim_makes() {
     }
 }
 
+/// Lines long and short in a window that does not wrap, scrolled sideways:
+/// a scroll that lands the cursor out of view moves the view sideways to
+/// show it, as Neovim does — as far as it is out of view, or centred on it
+/// from half the view away and more — and is drawn so ahead of Neovim.
+#[test]
+fn a_scroll_landing_out_of_view_moves_the_view_sideways_as_neovim_does() {
+    require_nvim!();
+    let scratch = Scratch::new("client-aside");
+    let (_rpc, mut term, _) = drawn_slowly(
+        &scratch,
+        "client-aside",
+        "setlocal nowrap | call setline(1, map(range(1, 200), \
+         'v:val % 3 ? \"line \" . v:val . \" \" . repeat(\"abcdefghij\", 12) : \"line \" . v:val'))",
+    );
+    for (name, keys) in [
+        ("zL", &b"zL"[..]),
+        ("2<C-e> to a short line, out of view", b"2\x05"),
+        ("<C-e> to a long one, in view", b"\x05"),
+    ] {
+        predicted(&mut term, name, keys);
+    }
+    // The cursor wants the end of every line from here on.
+    typed(&mut term, b"$");
+    for (name, keys) in [
+        ("<C-e> after $, in view", &b"\x05"[..]),
+        ("<C-e> after $ to a short line, far out of view", b"\x05"),
+        ("<C-e> after $ to the end of a long line, far out", b"\x05"),
+    ] {
+        predicted(&mut term, name, keys);
+    }
+}
+
+/// A scroll that lands the cursor on a character two cells wide that the
+/// view's left edge cuts in two: Neovim moves the view a column to show it
+/// whole, and the client draws it so ahead of Neovim.
+#[test]
+fn a_scroll_onto_a_wide_character_the_edge_cuts_moves_the_view_a_column() {
+    require_nvim!();
+    let scratch = Scratch::new("client-wide-cut");
+    let (_rpc, mut term, _) = drawn_slowly(
+        &scratch,
+        "client-wide-cut",
+        "setlocal nowrap | call setline(1, map(range(1, 200), \
+         'repeat(\" \", v:val % 2) . \"line \" . v:val . \" \" . repeat(\"日本\", 50)'))",
+    );
+    for (name, keys) in [
+        ("zL into them", &b"zL"[..]),
+        ("<C-f> onto one the left edge cuts", b"\x06"),
+    ] {
+        predicted(&mut term, name, keys);
+    }
+}
+
 /// The first line of the `k`th page down a window of `line N`s 24 rows
 /// tall: a page is the window less two lines, 20.
 fn page(k: usize) -> u32 {

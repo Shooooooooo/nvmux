@@ -939,9 +939,32 @@ for _, w in ipairs(api.nvim_list_wins()) do
 end
 return { vim.o.laststatus, vim.o.splitright, vim.o.splitbelow, wins }";
 
+/// Where a scroll ahead of Neovim lands the cursor: see [`landed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Landed {
+    /// The display column it lands on, and the one it wants from then on.
+    vcol: usize,
+    want: usize,
+    /// The first display column Neovim then shows the view from, having
+    /// moved it to show the cursor if that was out of view or too near an
+    /// edge (see [`predict::showing`]); `None` where the client cannot say,
+    /// the cursor at the end of a line sent cut short, which goes on.
+    left: Option<usize>,
+}
+
+impl Landed {
+    /// The grid column the cursor is in, in a view from first display
+    /// column `left` of a window `width` columns wide: `None` out of it.
+    fn col(&self, left: usize, shape: &predict::Shape, width: usize) -> Option<usize> {
+        self.vcol
+            .checked_sub(left)
+            .map(|c| shape.textoff + c)
+            .filter(|&col| col < width)
+    }
+}
+
 /// Where a scroll ahead lands the cursor in window `win`, `width` columns
-/// wide, as [`anim::Lander`] has it: from display column `want`, on a line
-/// the client has been sent.
+/// wide: from display column `want`, on a line the client has been sent.
 fn landed(
     p: &Predictor,
     win: i64,
@@ -949,7 +972,7 @@ fn landed(
     l: anim::Land,
     want: usize,
     width: usize,
-) -> Option<Option<(usize, usize)>> {
+) -> Option<Landed> {
     let text = p.text(win, l.line)?;
     let (vcol, want) = if l.first {
         let v = predict::first_nonblank(text, shape);
@@ -957,12 +980,39 @@ fn landed(
     } else {
         (predict::landing(text, shape, want, l.insert), want)
     };
-    Some(
-        (vcol + shape.textoff)
-            .checked_sub(shape.leftcol)
-            .filter(|&col| col < width)
-            .map(|col| (col, want)),
-    )
+    let left = (!p.cut(win, l.line) || !predict::at_end(text, shape, vcol))
+        .then(|| predict::showing(text, shape, vcol, shape.leftcol, width));
+    Some(Landed { vcol, want, left })
+}
+
+/// Whether the client has what it takes to draw window `win`'s view of
+/// lines `shown` from first display column `left`, `width` columns wide,
+/// the cursor on line `line`: every line, and those sent cut short reaching
+/// past the view's right edge (see [`predict::known`]).
+fn drawable(
+    p: &Predictor,
+    win: i64,
+    shape: &predict::Shape,
+    shown: std::ops::Range<i64>,
+    line: i64,
+    left: usize,
+    width: usize,
+) -> bool {
+    let at = predict::Across {
+        left,
+        line,
+        vcol: 0,
+    };
+    shown.clone().all(|l| p.coloured(win, l).is_some())
+        && predict::known(
+            at,
+            at,
+            width,
+            shape,
+            |l| p.text(win, l),
+            |l| p.cut(win, l),
+            shown,
+        )
 }
 
 /// What the client has asked and not been answered.
@@ -2557,15 +2607,50 @@ impl App {
         };
         let mut fill = |i: i64| p.row(win, view.topline + i, width, &look, to.cursor);
         let wants = self.wants(win, shape);
-        let mut land =
-            |l, want: Option<usize>| landed(p, win, shape, l, want.unwrap_or(wants), width);
+        // Where the cursor lands out of view, or too near an edge, Neovim
+        // moves the view sideways to show it. That is drawn too, for a scroll
+        // alone ahead of Neovim whose lines are all known: what it shows,
+        // moved (see `side_rows`). Any other is let go, for Neovim to draw.
+        let alone = !self.anim.scrolled_ahead(grid);
+        let shown = to.top..to.top + (view.line_count - to.top).clamp(0, h);
+        let mut aside = None;
+        let mut land = |l: anim::Land, want: Option<usize>| {
+            let at = landed(p, win, shape, l, want.unwrap_or(wants), width)?;
+            let left = match at.left {
+                Some(left) if left == shape.leftcol => left,
+                Some(left)
+                    if alone && drawable(p, win, shape, shown.clone(), l.line, left, width) =>
+                {
+                    aside = Some((left, at.vcol));
+                    left
+                }
+                _ => return Some(None),
+            };
+            Some(at.col(left, shape, width).map(|col| (col, at.want)))
+        };
         let made = self
             .anim
             .predict(&self.model, grid, go, (&mut fill, &mut land), now);
-        if made {
-            self.dirty = true;
+        if !made {
+            return false;
         }
-        made
+        self.dirty = true;
+        if let Some((left, vcol)) = aside {
+            let cursor = (
+                top + (to.cursor - to.top) as usize,
+                shape.textoff + vcol - left,
+            );
+            let until = p.deadline(now);
+            let Some(rows) = self.side_rows(grid, left) else {
+                self.anim.give_up(grid);
+                return false;
+            };
+            // Under rows moved sideways, nothing slides.
+            self.anim.settle(grid);
+            self.anim
+                .side(&self.model, grid, rows, (left, until), Some(cursor), now);
+        }
+        true
     }
 
     /// The colours window grid `grid`'s rows are drawn in, read off those
@@ -2649,10 +2734,25 @@ impl App {
         let cursor = view.curline + self.anim.ahead(grid).1;
         let mut fill = |i: i64| p.row(win, view.topline + i, width, &look, cursor);
         let wants = self.wants(win, shape);
-        let mut land =
-            |l, want: Option<usize>| landed(p, win, shape, l, want.unwrap_or(wants), width);
+        // One held back that lands the cursor where Neovim moves the view
+        // sideways is let go, and those after it: the keys after them wait
+        // for Neovim, as after any other it did not predict.
+        let mut let_go = false;
+        let mut land = |l, want: Option<usize>| {
+            let at = landed(p, win, shape, l, want.unwrap_or(wants), width)?;
+            let kept = at
+                .left
+                .filter(|&left| left == shape.leftcol)
+                .and_then(|left| at.col(left, shape, width))
+                .map(|col| (col, at.want));
+            let_go |= kept.is_none();
+            Some(kept)
+        };
         self.anim
             .fill_in(&self.model, grid, (&mut fill, &mut land), now);
+        if let (true, Some(p)) = (let_go, self.predict.as_mut()) {
+            p.typed.missed();
+        }
         true
     }
 
@@ -2757,8 +2857,9 @@ impl App {
         true
     }
 
-    /// The rows of window grid `grid` as Neovim drew them, moved to show its
-    /// text from display column `to`. See [`predict::shifted`].
+    /// The rows of window grid `grid` as it shows them — as Neovim drew
+    /// them, or scrolled up or down ahead of Neovim — moved to show its text
+    /// from display column `to`. See [`predict::shifted`].
     fn side_rows(&self, grid: u64, to: usize) -> Option<Vec<Vec<Cell>>> {
         let p = self.predict.as_ref()?;
         let win = *self.model.wins.get(&grid)?;
@@ -2766,12 +2867,18 @@ impl App {
         let shape = p.shape(win)?;
         let rect = anim::text_rect(&self.model, grid)?;
         let (top, bot, left, right) = rect;
-        let rows = self.model.grids.get(&grid)?.lines(top, bot, left, right);
-        let lines = view.lines_shown(bot - top);
+        let (rows, topline) = match self.anim.rows_ahead(grid) {
+            Some((rows, ahead)) => (rows, view.topline + ahead),
+            None => (
+                self.model.grids.get(&grid)?.lines(top, bot, left, right),
+                view.topline,
+            ),
+        };
+        let lines = (view.line_count - topline).clamp(0, (bot - top) as i64) as usize;
         let look = self.look(grid, rect, view, shape)?;
         predict::shifted(&rows, shape.leftcol, to, shape, &look, |r| {
             if r < lines {
-                Some(Some(p.coloured(win, view.topline + r as i64)?))
+                Some(Some(p.coloured(win, topline + r as i64)?))
             } else {
                 Some(None)
             }
@@ -4700,6 +4807,109 @@ mod tests {
         assert_eq!(land(Some(12)), (0, 12), "where it wants to be");
         assert_eq!(land(Some(2_147_483_647)), (0, 19), "as `$` has it");
         assert_eq!(land(None), (0, 5), "where it is, as far as is known");
+    }
+
+    /// In a window that does not wrap, shown from column 8, a scroll that
+    /// lands the cursor out of view is drawn as Neovim draws it, the view
+    /// moved sideways to show the cursor — alone ahead of Neovim; behind
+    /// another, it is left to Neovim. And Neovim's own frame, when it comes,
+    /// moves nothing.
+    #[test]
+    fn a_scroll_landing_out_of_view_moves_the_view_sideways() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let from = |left: usize, text: &[String]| -> Vec<String> {
+            text.iter()
+                .map(|t| t.chars().skip(left).collect())
+                .collect()
+        };
+        // Lines 0 to 19, `abc` where `short` says, the cursor on line 0 in
+        // column 10, wanting to be there.
+        let sideways = |short: i64| {
+            let mut a = predicting(Duration::from_millis(200));
+            let text: Vec<String> = (0..20)
+                .map(|n| match n {
+                    n if n == short => "abc".to_string(),
+                    _ => format!("line {n:02} and on and on and on"),
+                })
+                .collect();
+            let shape: Vec<Value> = vec![
+                1.into(),
+                50.into(),
+                0.into(),
+                8.into(),
+                false.into(),
+                false.into(),
+                true.into(),
+                false.into(),
+                8.into(),
+                true.into(),
+                0.into(),
+                3.into(),
+                "~".into(),
+                false.into(),
+                "".into(),
+                2.into(),
+                0.into(),
+                false.into(),
+                Value::Array(vec![]),
+            ];
+            let lines = vec![
+                "lines".into(),
+                1000.into(),
+                1.into(),
+                1.into(),
+                0.into(),
+                Value::Array(text.iter().map(|t| Value::from(t.as_str())).collect()),
+                true.into(),
+            ];
+            notify(
+                &mut a,
+                "nvmux_client",
+                vec!["shape".into(), 1000.into(), Value::Array(shape)],
+                t1,
+            );
+            notify(&mut a, "nvmux_client", lines, t1);
+            let mut events = whole(2, 20, 5, &from(8, &text[..5]));
+            events.push(("grid_cursor_goto", vec![2.into(), 0.into(), 2.into()]));
+            redraw(&mut a, events, t1);
+            let want = vec!["want".into(), 1000.into(), 10.into()];
+            notify(&mut a, "nvmux_client", want, t1);
+            (a, text)
+        };
+        let wheel = |a: &mut App| a.keys(b"\x1b[<65;3;2M", t1);
+
+        // Down three, to `abc`: its `c` is six columns left of the view, which
+        // moves as far.
+        let (mut a, text) = sideways(3);
+        wheel(&mut a);
+        assert_eq!(a.anim.ahead(2), (3, 3));
+        assert_eq!(a.anim.side_left(2), Some(2));
+        assert_eq!(top_row(&a), "c");
+        assert_eq!(a.anim.cursor_at(&a.model), (0, 0), "on its `c`");
+        wheel(&mut a);
+        assert_eq!(a.anim.ahead(2), (3, 3), "the next waits for Neovim");
+        // A frame of Neovim's before the scroll's, drawing nothing of it:
+        // what is drawn again is the scroll's rows, moved, not Neovim's.
+        redraw(&mut a, vec![], t1);
+        assert_eq!(top_row(&a), "c");
+        // Neovim's frame: it moved the view as far, said just before.
+        let left = vec!["leftcol".into(), 1000.into(), 2.into()];
+        notify(&mut a, "nvmux_client", left, t1);
+        let mut events = vec![at(3, 3, 3)];
+        events.extend(whole(2, 20, 5, &from(2, &text[3..8])));
+        events.push(("grid_cursor_goto", vec![2.into(), 0.into(), 0.into()]));
+        redraw(&mut a, events, t1);
+        assert_eq!((a.anim.ahead(2), a.anim.side_left(2)), ((0, 0), None));
+        assert_eq!(top_row(&a), "c");
+        assert_eq!(a.anim.cursor_at(&a.model), (0, 0));
+
+        // Down three, in view; three more, to `abc`, behind it: let go.
+        let (mut a, _) = sideways(6);
+        wheel(&mut a);
+        wheel(&mut a);
+        assert_eq!(a.anim.ahead(2), (3, 3));
+        assert_eq!(a.anim.side_left(2), None);
+        assert_eq!(top_row(&a), "and on and on and on", "line 3, from column 8");
     }
 
     /// Keys that scroll, over a slow link, once Neovim has caught up with

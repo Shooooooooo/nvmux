@@ -34,7 +34,10 @@
 //! cursor to another line lands it in the column it wants, which Neovim
 //! keeps through moves up and down (`curswant`) and the agent says
 //! ([`Predictor::want`]), not the one it is in: further left, at the end of
-//! a line too short for it, or on a character two cells wide.
+//! a line too short for it, or on a character two cells wide. Where that is
+//! out of view, or too near its edge, Neovim moves the view sideways to show
+//! it ([`showing`]), and a scroll alone ahead of Neovim is drawn moved so;
+//! one behind others is left to Neovim, and those after it with it.
 //!
 //! Most of the rows a scroll shows are rows the window already shows, moved.
 //! What the client does not have is the lines it uncovers. So the agent the
@@ -1061,6 +1064,56 @@ pub fn across<'a>(
 /// The display column a line's text ends at.
 fn end(cols: &[(usize, usize, char)]) -> usize {
     cols.last().map_or(0, |(s, w, _)| s + w)
+}
+
+/// Where Neovim shows a view that does not wrap from — its first display
+/// column — once it draws the cursor on display column `vcol` of a line of
+/// `text`, the view `width` columns wide, its gutter and all, and shown from
+/// column `left` till then: as its `curs_columns` does, and as Neovim 0.12
+/// was found to. A view the cursor is not wholly in, `'sidescrolloff'` from
+/// its edges — out of it, or on a character two cells wide that an edge
+/// cuts — moves `'sidescroll'` columns at least to show it; or, with that
+/// nought or the cursor half the view or more away, is centred on it, as
+/// near as the first column lets it be. `left` where it need not move.
+pub fn showing(text: &str, shape: &Shape, vcol: usize, left: usize, width: usize) -> usize {
+    let tw = width.saturating_sub(shape.textoff) as i64;
+    if shape.wrap || tw == 0 {
+        return left;
+    }
+    let cols = columns(text, shape);
+    // Past the end of the line, as in Insert mode, the cursor is a cell of
+    // nothing.
+    let (first, last) = if vcol >= end(&cols) {
+        (vcol, vcol)
+    } else {
+        span(&cols, vcol)
+    };
+    let (first, last, from) = (first as i64, last as i64, left as i64);
+    let siso = shape.sidescrolloff as i64;
+    let off_left = first - from - siso;
+    let off_right = last + 1 - from - (tw - siso);
+    if off_left >= 0 && off_right <= 0 {
+        return left;
+    }
+    let diff = if off_left < 0 { -off_left } else { off_right };
+    let by = diff.max(shape.sidescroll as i64);
+    let to = if shape.sidescroll == 0 || diff >= tw / 2 || off_right >= off_left {
+        vcol as i64 - tw / 2
+    } else if off_left < 0 {
+        from - by
+    } else {
+        from + by
+    };
+    to.max(0) as usize
+}
+
+/// Whether display column `vcol` of a line of `text` is on its last
+/// character, or past it: on a line sent cut short, where the line goes on
+/// past what the client has.
+pub fn at_end(text: &str, shape: &Shape, vcol: usize) -> bool {
+    columns(text, shape)
+        .last()
+        .is_none_or(|&(start, ..)| vcol >= start)
 }
 
 /// Whether the client knows enough of the lines to scroll a view sideways
@@ -2610,6 +2663,78 @@ mod tests {
             ),
             Some(at)
         );
+    }
+
+    /// What Neovim 0.12 did with a view 80 columns wide that does not wrap,
+    /// once a scroll had left the cursor on display column `vcol` of a line
+    /// with the view from column `left`: the column it then showed the view
+    /// from. Over `line 3`; a line of `abcdefghij` 207 long; `line 21` in
+    /// Insert mode, the cursor past its end; `line 102 ` and `日本` on, a
+    /// character two cells wide starting on each odd column; and a tab.
+    #[test]
+    fn a_view_moves_sideways_to_show_the_cursor_as_neovim_moves_it() {
+        let long = format!("line 2 {}", "abcdefghij".repeat(20));
+        let wide = format!("line 102 {}", "日本".repeat(60));
+        // The line, 'sidescrolloff', 'sidescroll', the gutter, (vcol, left),
+        // and the column the view is shown from.
+        type Case<'a> = (&'a str, usize, usize, usize, (usize, usize), usize);
+        #[rustfmt::skip]
+        let cases: &[Case] = &[
+            // In view, nothing moves.
+            (&long, 0, 1, 0, (50, 40), 40),
+            // Left of it: by as far, or from half the view away and more,
+            // centred, no further than the first column.
+            ("line 3", 0, 1, 0, (5, 40), 5),
+            ("line 3", 0, 1, 0, (5, 100), 0),
+            (&long, 0, 1, 0, (150, 200), 110),
+            // Right of it.
+            (&long, 0, 1, 0, (100, 5), 21),
+            // A character two cells wide that an edge cuts.
+            (&wide, 0, 1, 0, (39, 40), 39),
+            (&wide, 0, 1, 0, (79, 0), 1),
+            // 'sidescrolloff' from the edges.
+            (&long, 5, 1, 0, (42, 40), 37),
+            // 'sidescroll' columns at least, or with it nought, centred.
+            (&wide, 0, 10, 0, (39, 40), 30),
+            ("line 3", 0, 0, 0, (5, 40), 0),
+            // Past the end of the line, in Insert mode.
+            ("line 21", 0, 1, 0, (7, 30), 7),
+            ("line 21", 0, 1, 0, (7, 167), 0),
+            // A tab, the cursor on its last column, wholly in view.
+            ("\tabc", 0, 1, 0, (7, 4), 0),
+            // A gutter four columns wide: 76 of text.
+            ("line 3", 0, 1, 4, (5, 40), 5),
+            ("line 3", 0, 1, 4, (5, 100), 0),
+            (&long, 0, 1, 4, (100, 5), 25),
+        ];
+        for &(text, siso, ss, textoff, (vcol, left), want) in cases {
+            let s = Shape {
+                textoff,
+                wrap: false,
+                sidescrolloff: siso,
+                sidescroll: ss,
+                ..shape()
+            };
+            assert_eq!(
+                showing(text, &s, vcol, left, 80),
+                want,
+                "{text:.12?} at {vcol} from {left}; siso={siso}, ss={ss}, gutter {textoff}"
+            );
+        }
+        // Wrapping, nothing moves.
+        assert_eq!(showing("line 3", &shape(), 5, 0, 80), 0);
+    }
+
+    /// The last character of a line, and past it, are its end.
+    #[test]
+    fn a_column_on_a_lines_last_character_is_at_its_end() {
+        let s = shape();
+        assert!(!at_end("abc", &s, 1));
+        assert!(at_end("abc", &s, 2));
+        assert!(at_end("abc", &s, 9));
+        assert!(!at_end("a日", &s, 0));
+        assert!(at_end("a日", &s, 1), "a character two cells wide");
+        assert!(at_end("", &s, 0), "an empty line");
     }
 
     /// The wheel past the end of the cursor's line takes the cursor to the

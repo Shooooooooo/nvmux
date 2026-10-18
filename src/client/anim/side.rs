@@ -9,6 +9,11 @@
 //! just before Neovim draws it moved (see `super::super::App`), and that is
 //! what lands a prediction.
 //!
+//! So too a scroll up or down ahead of Neovim that leaves the cursor where
+//! Neovim moves the view sideways to show it (see `predict::showing`): the
+//! rows that scroll shows, moved, are drawn over it, till Neovim's scroll
+//! comes, the view moved with it.
+//!
 //! Nothing slides: a terminal's columns are as coarse as its rows, and
 //! nobody animates a scroll sideways.
 
