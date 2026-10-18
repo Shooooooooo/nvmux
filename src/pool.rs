@@ -108,6 +108,36 @@ impl Pool {
         }
     }
 
+    /// Hold a client started ahead somewhere else — on the thread that starts
+    /// again the clients a dropped link took (`[client] revive`) — in place
+    /// of one for the same session that has left. One there alive is the
+    /// client the user has been to since, which has a screen to resume, and
+    /// it stays: the newcomer comes back, for the caller to let go of.
+    pub fn adopt(&mut self, held: Parked) -> Option<Parked> {
+        if self.holds(held.session_id()) {
+            return Some(held);
+        }
+        self.retire(held.session_id());
+        tracing::debug!(id = %held.session_id(), held = self.parked.len() + 1, "client started ahead again");
+        self.parked.push(held);
+        None
+    }
+
+    /// Let go of every client that has left while held here, and say whose
+    /// they were: after a dropped link, the sessions whose clients it took
+    /// with it (see `[client] revive`). The ones still there stay.
+    pub fn take_left(&mut self) -> Vec<String> {
+        let mut left = Vec::new();
+        self.parked.retain(|p| {
+            if p.is_alive() {
+                return true;
+            }
+            left.push(p.session_id().to_string());
+            false
+        });
+        left
+    }
+
     /// The client parked for this session, taken back to be resumed; see
     /// [`Taken`] for what else it can find.
     pub fn take(&mut self, session_id: &str) -> Taken {
@@ -345,6 +375,67 @@ mod tests {
             "a client that left is not told apart from none at all"
         );
         assert!(matches!(pool.take("s1"), Taken::Absent));
+    }
+
+    /// The clients that have left are let go of and named, the rest kept:
+    /// after a dropped link, the sessions to start clients for again.
+    #[test]
+    fn the_clients_that_left_are_let_go_of_and_named() {
+        let mut pool = Pool::new(true);
+        pool.set_aside(Some(kept_standin("s1", "sleep 0.1; exit 0")));
+        pool.set_aside(Some(kept_standin("s2", "exec sleep 30")));
+        pool.start_ahead(kept_standin("s3", "sleep 0.1; exit 0"), None);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (pool.holds("s1") || pool.holds("s3")) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut left = pool.take_left();
+        left.sort();
+        assert_eq!(left, ["s1", "s3"], "parked and started ahead alike");
+        assert!(!pool.has("s1") && !pool.has("s3"), "named, and still held");
+        assert!(pool.holds("s2"), "one still there was let go of");
+        assert!(pool.take_left().is_empty(), "named twice");
+    }
+
+    /// A client started again elsewhere takes the place of the one that left
+    /// for its session, and is taken back as one never yet shown; where the
+    /// one there is alive — a session visited since — that one stays, and the
+    /// newcomer comes back.
+    #[test]
+    fn a_client_started_again_replaces_one_that_left_and_not_one_alive() {
+        let mut pool = Pool::new(true);
+        pool.set_aside(Some(kept_standin("s1", "sleep 0.1; exit 0")));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pool.holds("s1") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let again = kept_standin("s1", "exec sleep 30");
+        let again_pid = again.pid_for_test();
+        let held = again.start_ahead(None, false).expect("held");
+        assert!(
+            pool.adopt(held).is_none(),
+            "turned away in place of one that left"
+        );
+        assert_eq!(pool.len(), 1, "the one that left is still held beside it");
+        let Taken::Kept(back) = pool.take("s1") else {
+            panic!("not taken back");
+        };
+        assert_eq!(back.pid_for_test(), again_pid);
+        assert!(back.started_ahead());
+
+        let visited = kept_standin("s2", "exec sleep 30");
+        let visited_pid = visited.pid_for_test();
+        pool.set_aside(Some(visited));
+        let late = kept_standin("s2", "exec sleep 30");
+        let late_pid = late.pid_for_test();
+        let held = late.start_ahead(None, false).expect("held");
+        let turned_away = pool.adopt(held).expect("held in place of one alive");
+        drop(turned_away);
+        assert!(gone(late_pid), "the newcomer turned away lived on");
+        let Taken::Kept(back) = pool.take("s2") else {
+            panic!("the one visited was let go of");
+        };
+        assert_eq!(back.pid_for_test(), visited_pid);
     }
 
     /// A listing that no longer has a session lets go of its client.

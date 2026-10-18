@@ -183,6 +183,25 @@ pub struct ClientSettings {
     /// With `per_session` off as well, a client started ahead is retired when
     /// it first leaves the front, like every other.
     pub lazy: bool,
+    /// Start again, once a dropped link is back, the clients out of sight it
+    /// took with it. Each client kept for a session not in front, parked or
+    /// started ahead, rides the link to its session, and leaves when the link
+    /// does. Over SSH only: a session on this machine has no link to lose.
+    ///
+    /// Off, the default, the session in front is attached again as the link
+    /// comes back, and every other is attached afresh on its next visit: a
+    /// fork, a forward, a probe and a first paint, the last two each a round
+    /// trip or more over the link that has only just come back. On, they are
+    /// started ahead again (see [`crate::pty::Attachment::start_ahead`]) on a
+    /// thread of their own, once the session in front has painted, and the
+    /// next visit to each finds its client waiting, as after nvmux's start
+    /// with `lazy` off.
+    ///
+    /// What on costs: in the moments after the link comes back, a fork and an
+    /// ssh forward per session, and each session's screen sent over the link
+    /// once more, while the session in front is in use. On a slow link its
+    /// next frames share the link with those.
+    pub revive: bool,
     /// Draw a session nobody sees — its client kept out of sight, or started
     /// ahead of its first visit — at most once a second, with nothing in it
     /// animating, until it is back in front (see
@@ -249,6 +268,7 @@ impl Default for ClientSettings {
             ui: Ui::Nvmux,
             per_session: true,
             lazy: false,
+            revive: false,
             throttle: false,
             predict: true,
             centre: false,
@@ -1243,6 +1263,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          # ui           = {ui:<8}   # nvmux's own animated client, or \"nvim\" for Neovim's\n\
          # per_session  = {per_session:<8}   # keep each session's client; a switch back reuses it\n\
          # lazy         = {lazy:<8}   # start every client at launch; true waits for each session's first visit\n\
+         # revive       = {revive:<8}   # true starts again, once a dropped link is back, the clients it took\n\
          # throttle     = {throttle:<8}   # true draws a session out of sight once a second, not as it changes\n\
          # predict      = {predict:<8}   # over a slow link, scrolls show before Neovim answers\n\
          # centre       = {centre:<8}   # on a wide terminal, each window's text in the middle of the window\n\
@@ -1301,6 +1322,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
         command = quoted(&s.command),
         per_session = c.per_session,
         lazy = c.lazy,
+        revive = c.revive,
         throttle = c.throttle,
         predict = c.predict,
         centre = c.centre,
@@ -2294,6 +2316,17 @@ mod tests {
         assert!(s.client.per_session, "the rest as it was");
     }
 
+    /// The clients out of sight a dropped link took are started on their next
+    /// visits unless told otherwise; started again as the link comes back is
+    /// a line away.
+    #[test]
+    fn the_clients_a_dropped_link_took_wait_for_their_visits_unless_told() {
+        assert!(!Settings::default().client.revive);
+        let s: Settings = toml::from_str("[client]\nrevive = true\n").expect("valid");
+        assert!(s.client.revive);
+        assert!(!s.client.lazy, "the rest as it was");
+    }
+
     /// Each window's text as wide as what it shows wants unless told
     /// otherwise; `window_width` for every one of them is a line away.
     #[test]
@@ -2769,6 +2802,7 @@ mod tests {
         for line in [
             "# per_session  = true",
             "# lazy         = false",
+            "# revive       = false",
             "# throttle     = false",
             "# ui           = \"nvmux\"",
             "# predict      = true",

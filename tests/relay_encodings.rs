@@ -118,6 +118,15 @@ const CHILD_BIND: &str = "NVMUX_TEST_RELAY_BIND";
 /// How long into the first relay that card is posted: after the first paint.
 const POST_AFTER: Duration = Duration::from_millis(1500);
 
+/// Set on a child that asks its relay to say when the session has painted
+/// (see `nvmux::pty::Attachment::tell_when_painted`), and writes [`PAINTED`]
+/// when told — or [`UNPAINTED`] if it is let go of untold.
+const CHILD_PAINTED: &str = "NVMUX_TEST_RELAY_PAINTED";
+
+/// What that child writes when told, and when let go of untold.
+const PAINTED: &[u8] = b"\x1b]9999;painted\x07";
+const UNPAINTED: &[u8] = b"\x1b]9999;unpainted\x07";
+
 /// What a posted card says, so that the parent can find it on the screen.
 const POSTED: &str = "posted for the session in front";
 
@@ -258,6 +267,18 @@ fn relay_child() {
         keep,
         "[client] per_session = {keep} was not honoured"
     );
+    if std::env::var_os(CHILD_PAINTED).is_some() {
+        let painted = attachment.tell_when_painted();
+        std::thread::spawn(move || {
+            let said = match painted.recv_timeout(Duration::from_secs(30)) {
+                Ok(()) => PAINTED,
+                Err(_) => UNPAINTED,
+            };
+            let mut out = std::io::stdout();
+            let _ = out.write_all(said);
+            let _ = out.flush();
+        });
+    }
     let lands = std::env::var(CHILD_LANDS).ok();
     let steps = std::env::var_os(CHILD_STEPS).is_some();
     let mut landing = |_| {
@@ -410,6 +431,8 @@ struct Asks {
     steps: bool,
     /// [`CHILD_BIND`]: the commands moved, as a `[keys.bind]` table says it.
     bind: Option<&'static str>,
+    /// [`CHILD_PAINTED`].
+    painted: bool,
 }
 
 impl Terminal {
@@ -497,6 +520,7 @@ impl Terminal {
             lands,
             steps,
             bind,
+            painted,
         } = asks;
         let (pty, pts) = pty_process::blocking::open().expect("open a pty");
         pty.resize(pty_process::Size::new(ROWS, COLS))
@@ -553,6 +577,9 @@ impl Terminal {
         }
         if let Some(bind) = bind {
             cmd = cmd.env(CHILD_BIND, bind);
+        }
+        if painted {
+            cmd = cmd.env(CHILD_PAINTED, "1");
         }
         // Takes the slave, or the master would never see EOF once the child
         // exits.
@@ -1744,6 +1771,77 @@ fn a_client_started_ahead_negotiates_on_its_first_visit_through_the_pty() {
 #[test]
 fn a_client_started_ahead_is_dissolved_in_on_its_first_visit() {
     a_client_started_ahead_negotiates_on_its_first_visit("ahead-fade", true);
+}
+
+/// A relay says when its session has painted, once, and only after the
+/// session's screen has reached the terminal — with the first paint held and
+/// dissolved in if `fade`, and relayed as it comes if not. It is what the
+/// clients a dropped link took wait for before they are started again behind
+/// the session in front (`[client] revive`): each has its session's screen
+/// sent over the same link.
+fn a_relay_says_when_its_session_has_painted(tag: &str, fade: bool) {
+    require_nvim!();
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(&common::unique(tag), &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    let marker = "on the screen before the paint was said";
+    nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
+        .expect("connect")
+        .command(&format!(
+            "setlocal noswapfile | call setline(1, '{marker}')"
+        ))
+        .expect("setline");
+
+    let mut term = Terminal::spawn_child(
+        &sock,
+        &session.id,
+        Protocol::Kitty,
+        Asks {
+            shadow: fade,
+            painted: true,
+            ..Asks::default()
+        },
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| {
+            find(out, PAINTED).is_some() || find(out, UNPAINTED).is_some()
+        }),
+        "the relay never said its session had painted; the child wrote: {}",
+        term.since(0)
+    );
+    let said = find(&term.output, PAINTED).unwrap_or_else(|| {
+        panic!(
+            "let go of without being told; the child wrote: {}",
+            term.since(0)
+        )
+    });
+    assert!(
+        find(&term.output[..said], marker.as_bytes()).is_some(),
+        "said to have painted before the session's screen had reached the terminal: {}",
+        term.since(0)
+    );
+    // Once: nothing else is said, however long the session goes on.
+    term.pump_until(Duration::from_millis(500), |_| false);
+    assert!(
+        find(&term.output[said + PAINTED.len()..], PAINTED).is_none()
+            && find(&term.output, UNPAINTED).is_none(),
+        "said more than once: {}",
+        term.since(0)
+    );
+    assert_eq!(detach(&mut term), Some(0), "{}", term.since(0));
+}
+
+#[test]
+fn a_relay_says_when_its_session_has_painted_through_the_pty() {
+    a_relay_says_when_its_session_has_painted("painted", false);
+}
+
+#[test]
+fn a_relay_says_when_its_session_has_painted_once_dissolved_in() {
+    a_relay_says_when_its_session_has_painted("painted-fade", true);
 }
 
 /// With `[client] throttle` on, a client started ahead of a session that
