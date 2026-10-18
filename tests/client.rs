@@ -1369,6 +1369,34 @@ fn every_scroll_sideways_predicted_is_the_one_neovim_makes() {
     typed(&mut term, b"\x1b");
 }
 
+/// Lines of characters two cells wide in a window that does not wrap, every
+/// other one a column further in, so that the window's edges cut one in two
+/// on every other row: each scroll, sideways or down, is drawn ahead of
+/// Neovim with a `>` where one does not fit at the right and a `<` where the
+/// view starts in the middle of one, as Neovim draws them — and nothing moves
+/// when Neovim's own rows come.
+#[test]
+fn scrolls_over_wide_characters_cut_at_the_edges_are_the_ones_neovim_makes() {
+    require_nvim!();
+    let scratch = Scratch::new("client-wide");
+    let (_rpc, mut term, _) = drawn_slowly(
+        &scratch,
+        "client-wide",
+        "setlocal nowrap | call setline(1, map(range(1, 200), \
+         'repeat(\" \", v:val % 2) . \"line \" . v:val . \" \" . repeat(\"日本\", 50)'))",
+    );
+    for (name, keys) in [
+        ("zL into them", &b"zL"[..]),
+        ("zl", b"zl"),
+        ("zh", b"zh"),
+        ("the wheel right", b"\x1b[<67;10;5M"),
+        ("the wheel left", b"\x1b[<66;10;5M"),
+        ("<C-f> among them", b"\x06"),
+    ] {
+        predicted(&mut term, name, keys);
+    }
+}
+
 /// The first line of the `k`th page down a window of `line N`s 24 rows
 /// tall: a page is the window less two lines, 20.
 fn page(k: usize) -> u32 {

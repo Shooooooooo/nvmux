@@ -2566,6 +2566,7 @@ impl App {
             shape.textoff,
             cursor_row,
             eob,
+            self.model.groups.get("NonText").copied(),
         ))
     }
 
@@ -2743,7 +2744,8 @@ impl App {
             .then(|| self.model.cursor.row.checked_sub(top))
             .flatten();
         let eob = self.model.groups.get("EndOfBuffer").copied().unwrap_or(0);
-        let look = predict::Look::of(&rows, lines, shape.textoff, cursor, eob);
+        let nontext = self.model.groups.get("NonText").copied();
+        let look = predict::Look::of(&rows, lines, shape.textoff, cursor, eob, nontext);
         predict::shifted(&rows, shape.leftcol, to, shape, &look, |r| {
             if r < lines {
                 Some(Some(p.coloured(win, view.topline + r as i64)?))
