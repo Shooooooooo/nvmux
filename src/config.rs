@@ -402,6 +402,10 @@ pub struct StyleSettings {
     /// its place where it floats, and on the terminal it has where it does
     /// not. On a terminal too small for a panel and some of the session round
     /// it, one that would float takes the terminal too.
+    ///
+    /// Flipped in the settings, it moves them at once: floating, they come up
+    /// full screen; full screen over a session, they come up floating over
+    /// it.
     pub float: bool,
 }
 

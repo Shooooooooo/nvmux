@@ -487,6 +487,13 @@ impl App {
         self.came_from = Some(id.to_string());
     }
 
+    /// The session the picker was opened from, while the list still has it:
+    /// what `Esc` goes back to, and what the settings float over once they
+    /// are turned to on the picker's `,`. See [`App::set_came_from`].
+    pub fn came_from(&self) -> Option<&Session> {
+        self.came_from.as_deref().and_then(|id| self.session(id))
+    }
+
     pub fn mode(&self) -> &Mode {
         &self.mode
     }
@@ -1308,10 +1315,8 @@ impl App {
     /// dismissing it would leave the user looking at a terminal with nothing in
     /// it. `q` is how you leave for good.
     fn dismiss(&self) -> Request {
-        match &self.came_from {
-            Some(id) if self.session(id).is_some() => Request::Attach(id.clone()),
-            _ => Request::None,
-        }
+        self.came_from()
+            .map_or(Request::None, |s| Request::Attach(s.id.clone()))
     }
 
     /// Handle one mouse gesture. Returns whatever the caller now has to do.
@@ -2053,6 +2058,11 @@ mod tests {
         let mut a = app(&["one", "two", "three"]);
         a.set_came_from("id000001");
         a.on_key(Key::Char('G')); // the cursor need not be on it
+        assert_eq!(
+            a.came_from().map(|s| s.id.as_str()),
+            Some("id000001"),
+            "and the settings float over it, turned to"
+        );
         assert_eq!(a.on_key(Key::Esc), Request::Attach("id000001".into()));
     }
 
@@ -2062,6 +2072,10 @@ mod tests {
     #[test]
     fn esc_does_nothing_when_the_picker_was_not_opened_from_a_session() {
         let mut a = app(&["one", "two"]);
+        assert!(
+            a.came_from().is_none(),
+            "nothing to float the settings over"
+        );
         assert_eq!(a.on_key(Key::Esc), Request::None);
     }
 
@@ -2076,6 +2090,7 @@ mod tests {
         assert_eq!(a.on_key(Key::Char('y')), Request::Kill("id000000".into()));
         a.set_sessions(vec![]);
 
+        assert!(a.came_from().is_none());
         assert_eq!(a.on_key(Key::Esc), Request::None);
     }
 

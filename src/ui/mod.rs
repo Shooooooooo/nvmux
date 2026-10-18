@@ -96,6 +96,10 @@ pub enum Outcome {
         /// session to take down as it dissolves in — or `None`, the screen
         /// left empty (see [`crate::handoff`]).
         hand_off: Option<HandOff>,
+        /// Whether the settings come up floating over the session as it comes
+        /// back: turned to float on the picker's `,`, where the picker came
+        /// up over this session (see [`settings::Outcome::Float`]).
+        float_settings: bool,
     },
     /// The user quit.
     Quit,
@@ -694,6 +698,7 @@ fn run_loop(
                             session,
                             sessions,
                             hand_off: None,
+                            float_settings: false,
                         });
                     }
                     prompt::Outcome::Cancelled => {
@@ -757,9 +762,28 @@ fn run_loop(
             // its effects are read again, and the rest it reads as it goes.
             Request::Settings => {
                 let remote = matches!(transport.location(), crate::transport::Location::Ssh(_));
-                settings::run_on(terminal, false, remote)?;
-                app.reload_effects();
-                app.set_unsaved(unsaved());
+                let behind = app.came_from().cloned();
+                match (
+                    settings::run_on(terminal, false, remote, behind.is_some())?,
+                    behind,
+                ) {
+                    // Turned to float, over the session the picker came up
+                    // from: back to it, with them floating over it, as they
+                    // float in the picker's place where the picker floats.
+                    // They have dissolved out on their way.
+                    (settings::Outcome::Float, Some(session)) => {
+                        return Ok(Outcome::Attach {
+                            session,
+                            sessions: app.sessions().to_vec(),
+                            hand_off: None,
+                            float_settings: true,
+                        });
+                    }
+                    _ => {
+                        app.reload_effects();
+                        app.set_unsaved(unsaved());
+                    }
+                }
             }
 
             Request::SaveAndQuit { overwrite } => {
@@ -974,6 +998,7 @@ fn leave_to_session(
         session,
         sessions: app.sessions().to_vec(),
         hand_off,
+        float_settings: false,
     })
 }
 
@@ -1316,6 +1341,7 @@ mod tests {
             session: session.clone(),
             sessions: vec![session],
             hand_off: None,
+            float_settings: false,
         }
         .attaches());
         assert!(!Outcome::Quit.attaches());
@@ -1346,12 +1372,14 @@ mod tests {
             session: session.clone(),
             sessions: vec![session.clone()],
             hand_off: HandOff::new("a", 3, 4, 10),
+            float_settings: false,
         };
         assert_eq!(with.leaves(), HandOff::new("a", 3, 4, 10).unwrap().show());
         let without = Outcome::Attach {
             session: session.clone(),
             sessions: vec![session],
             hand_off: None,
+            float_settings: false,
         };
         assert!(without.leaves().is_empty());
         assert!(Outcome::Quit.leaves().is_empty());

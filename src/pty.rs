@@ -182,7 +182,8 @@ pub enum Outcome {
     ShowHelp,
     /// `<prefix> ,` with `[style] float` off, on a terminal too small for the
     /// settings to float over the session, or a session nvmux keeps no copy
-    /// of: show them full screen. The child keeps running.
+    /// of; or the settings floating over the session, turned not to: show
+    /// them full screen. The child keeps running.
     ShowSettings,
     /// The settings over the session changed which client draws a session
     /// (`client.ui`), or whether clients are kept (`client.per_session`):
@@ -396,16 +397,23 @@ pub struct Attachment {
     /// left it standing (see [`HandOff::up_since`]): what it goes in timed
     /// from.
     landed_since: Option<Instant>,
+    /// The terminal is the background, with nothing of the session on it.
     /// Set by a panel that went somewhere other than back to the session —
     /// the picker's `Enter` on another session, say — taking the session out
     /// to the background with it (see `panel`): the relay's own fade out has
-    /// nothing left to dissolve.
+    /// nothing left to dissolve. And set by a resume that leaves it to the
+    /// settings, to float over the session at once, to bring the session in
+    /// with them (see [`Attachment::float_the_settings`]).
     dark: bool,
     /// Who is waiting for the session to have painted in front, told on the
     /// first lull after the next relay has relayed anything — and let go,
     /// untold, by a relay that ends before then (see
     /// [`Attachment::tell_when_painted`]).
     painted: Option<mpsc::Sender<()>>,
+    /// The settings are to come up floating over the session as soon as the
+    /// next relay has the session's screen back, as `<prefix> ,` brings them
+    /// (see [`Attachment::float_the_settings`]).
+    float_settings: bool,
 }
 
 /// How many clients have had their exit sequences relayed to the terminal:
@@ -1990,6 +1998,34 @@ impl Attachment {
         rx
     }
 
+    /// Have the settings come up floating over the session on this client's
+    /// next relay, as soon as it has the session's screen back, as `<prefix>
+    /// ,` brings them: for the settings full screen, turned to float (see
+    /// `ui::settings::Outcome::Float`). A relay that ends before then, or
+    /// where a command brings up something else first, forgets it.
+    pub fn float_the_settings(&mut self) {
+        self.float_settings = true;
+    }
+
+    /// Whether the session's screen is back for the settings to float over
+    /// (see [`Attachment::float_the_settings`]): nothing of a first paint held
+    /// back, and the client on the screen it draws on — the alternate screen,
+    /// which a resumed client was put back on as the relay began and a fresh
+    /// one enters as it starts, or for a client that draws on the primary
+    /// screen, something drawn there. Not before: frames drawn ahead of a
+    /// fresh client's entry would stay on the primary screen, which the shell
+    /// comes back to. A copy that cannot say has nothing to float over, and
+    /// the panel says so for itself.
+    fn screen_is_back(&self) -> bool {
+        if self.hold.is_some() {
+            return false;
+        }
+        match self.shadow.as_ref().or(self.screen.as_ref()) {
+            Some(copy) if copy.is_usable() => copy.on_alternate_screen() || copy.has_contents(),
+            _ => true,
+        }
+    }
+
     /// The socket the client was attached through — locally the session's
     /// own, over SSH the local end of the forward.
     pub fn sock(&self) -> &Path {
@@ -2991,6 +3027,7 @@ fn spawn_client_with(
         landed_since: None,
         dark: false,
         painted: None,
+        float_settings: false,
     })
 }
 
@@ -3317,11 +3354,22 @@ pub fn relay(
         if early {
             erasing = kept_clients_repaint(&mut attachment);
         }
-        dissolved = attachment.dissolve_in();
+        // Settings to float over the session as it comes back bring it in
+        // with them, out of the background (see `panel`), rather than have it
+        // dissolve in only to be dimmed again round them: the screen stays
+        // the background the erase made it, and the shadow as it is, for the
+        // panel to draw the session from.
+        attachment.dark = attachment.float_settings
+            && attachment.hand_off.is_none()
+            && attachment
+                .shadow
+                .as_ref()
+                .is_some_and(shadow::Shadow::has_contents);
+        dissolved = !attachment.dark && attachment.dissolve_in();
         // Off the primary screen since the switch, and on the session's only
         // as long as the dissolve drew it.
         let carried = attachment.hand_off.take().is_some();
-        let on_screen = dissolved || attachment.paint_kept_screen();
+        let on_screen = attachment.dark || dissolved || attachment.paint_kept_screen();
         if !on_screen {
             // The span the switch opened for the dissolve, with no frame to
             // close it.
@@ -3391,6 +3439,9 @@ pub fn relay(
     // Told by this relay or by none: a paint waited for that did not come is
     // not one the next relay of this client makes.
     attachment.painted = None;
+    // Up over this relay's session, or not to come up at all: the settings
+    // were asked to float over the session they were turned to float from.
+    attachment.float_settings = false;
     // From here on nothing the client writes reaches the terminal until it is
     // relayed again: what the ledger hears next is news to the terminal.
     if let Some(ledger) = attachment.ledger.as_mut() {
@@ -3579,6 +3630,25 @@ fn pump(
     }
 
     loop {
+        // The settings, turned to float while they had the terminal to
+        // themselves: up over the session as soon as its screen is back, as
+        // `<prefix> ,` brings them, and before a key is read, so that what was
+        // typed as they went goes to them.
+        if attachment.float_settings && attachment.screen_is_back() {
+            if let Some(outcome) = float_over(attachment, master_fd, winch, Outcome::ShowSettings)?
+            {
+                return Ok(outcome);
+            }
+            // What they may have changed, read again as after `<prefix> ,`
+            // (below).
+            keys = crate::config::get().keys;
+            prefix = Prefix::with_keys(highest_session_num, keys.prefix, keys.bind);
+            prefix_timeout = Duration::from_millis(keys.timeout_ms);
+            deadline = None;
+            size = term::terminal_size();
+            bar = hint::Bar::new(Instant::now(), size, keys.bind);
+        }
+
         // The attach notice has a clock of its own — a life to end, and a
         // dissolve to pace — and so do a held first paint and a tail kept back
         // to keep a sequence whole; all of it is folded in here so it is
@@ -3851,18 +3921,12 @@ fn pump(
                             // unless they cannot float or are not to
                             // (`[style] float`), or where they lead needs the
                             // session loop.
-                            let float = config::get().style.float;
-                            let outcome = match panel::What::of(outcome, float) {
-                                Some(what) => {
-                                    match panel::float(attachment, master_fd, winch, what)? {
-                                        Some(outcome) => outcome,
-                                        None => {
-                                            floated = true;
-                                            continue;
-                                        }
-                                    }
+                            let outcome = match float_over(attachment, master_fd, winch, outcome)? {
+                                Some(outcome) => outcome,
+                                None => {
+                                    floated = true;
+                                    continue;
                                 }
-                                None => outcome,
                             };
                             // With settings unsaved, a detach asks first; what
                             // else was typed in the same read goes with the key.
@@ -4206,6 +4270,26 @@ fn take_step(attachment: &mut Attachment, mut step: Step) -> Result<Option<Outco
         desk.forwarded.saw(bytes, Instant::now());
     }
     act(&mut attachment.master, step)
+}
+
+/// What a command leads to, `outcome`, over the session where it is one of
+/// the screens that float there — the settings, the help or the picker — and
+/// they are to (`[style] float`): `None` once it has been taken down and the
+/// relay goes on, and otherwise how the relay ends, which is `outcome` itself
+/// where nothing floats. Either way, settings that were to come up floating
+/// of their own accord have had their turn (see
+/// [`Attachment::float_the_settings`]).
+fn float_over(
+    attachment: &mut Attachment,
+    master_fd: RawFd,
+    winch: &winch::Winch,
+    outcome: Outcome,
+) -> Result<Option<Outcome>> {
+    attachment.float_settings = false;
+    match panel::What::of(outcome, config::get().style.float) {
+        Some(what) => panel::float(attachment, master_fd, winch, what),
+        None => Ok(Some(outcome)),
+    }
 }
 
 /// How long an escape sequence cut short by the end of a read waits for the
@@ -5413,6 +5497,39 @@ mod tests {
         hold.take(b"~", t0 + Duration::from_millis(30));
         assert!(!hold.due(quiet, true));
         assert!(hold.due(t0 + Duration::from_millis(30) + HOLD_SETTLE, true));
+    }
+
+    /// Settings turned to float come up over the session only once its screen
+    /// is back: nothing of a first paint held, and the client on the screen it
+    /// draws on — the alternate one, or the primary with something on it — so
+    /// that none of their frames is left on the primary screen the shell comes
+    /// back to. With no copy of the screen they come up at once, and the panel
+    /// says for itself that it has nothing to float over.
+    #[test]
+    fn settings_turned_to_float_wait_for_the_sessions_screen() {
+        let mut a = attached_to("exit 0");
+        assert!(a.screen_is_back(), "no copy: the panel's to say");
+
+        // A fresh client's copy, as the relay begins: the primary screen,
+        // cleared.
+        let mut copy = shadow::Shadow::new(8, 40);
+        copy.feed(term::HANDOVER);
+        a.shadow = Some(copy);
+        assert!(!a.screen_is_back(), "on the primary screen, nothing drawn");
+        a.shadow_saw(b"\x1b[?1049h");
+        assert!(a.screen_is_back(), "on its alternate screen");
+        a.hold = Some(Hold::new(Instant::now()));
+        assert!(!a.screen_is_back(), "its first paint still held");
+        a.hold = None;
+
+        // A client that draws on the primary screen, with no shadow.
+        let mut copy = shadow::Shadow::new(8, 40);
+        copy.feed(term::HANDOVER);
+        a.shadow = None;
+        a.screen = Some(copy);
+        assert!(!a.screen_is_back());
+        a.shadow_saw(b"\x1b[1;1H$ ");
+        assert!(a.screen_is_back(), "something drawn on the primary screen");
     }
 
     /// A client that never stops drawing is released at the cap, drawn or

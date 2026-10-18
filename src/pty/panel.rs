@@ -50,6 +50,11 @@
 //! help or the settings, it goes out alone, and the other comes up in its
 //! place over the session as it stands, dimmed.
 //!
+//! And the settings can come the other way: from their screen full screen,
+//! turned to float, they come up over the session as the relay brings it
+//! back — with it, the two out of the background together, as the picker
+//! goes out to a screen of its own the other way round.
+//!
 //! # Where it does not float
 //!
 //! Without the terminal's colours — `NO_COLOR`, or a terminal that never
@@ -61,7 +66,12 @@
 //! session nvmux keeps no copy of, the screen takes the terminal as it always
 //! did ([`Outcome::ShowSettings`], [`Outcome::ShowHelp`],
 //! [`Outcome::ToPicker`]). With `[style] float` off, none of them floats:
-//! each takes the terminal, wherever it could have floated.
+//! each takes the terminal, wherever it could have floated. Turned off by the
+//! settings as they float, they go out with the session, as the picker goes
+//! to a screen of its own, and come up full screen in their place; and turned
+//! on by the settings full screen over a session, they come up floating over
+//! it as soon as the relay has it back ([`Attachment::float_the_settings`],
+//! and see above).
 
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
@@ -314,13 +324,20 @@ pub(super) fn float(
     // What the client has written since the last frame, owed to the terminal.
     let mut held: Vec<u8> = Vec::new();
     let mut buf = [0u8; 8192];
-    let mut coming = Coming::to(0.0, 1.0, fade_length(look), Instant::now());
+    // The way in (see `way_in`): out of the background with the session,
+    // where the terminal has nothing of it on it yet — settings floating over
+    // it as it comes back (see `relay`).
+    let (mut coming, mut away) = way_in(
+        std::mem::take(&mut a.dark),
+        fade_length(look),
+        Instant::now(),
+    );
     let mut going = false;
-    // How the panel goes, once it is going (see `Way`), and for one going
-    // away, how far the session has gone with it: 0 as the panel has it, 1
-    // the background.
+    // Whether it is going because `[style] float` was turned off under it, for
+    // its screen to come up full screen in its place.
+    let mut unfloated = false;
+    // How the panel goes, once it is going (see `Way`).
     let mut way = Way::Back;
-    let mut away = Coming::to(0.0, 0.0, Duration::ZERO, Instant::now());
     // A frame is owed: for the panel, or for the session behind it.
     let mut owed = true;
     let mut session_drew = false;
@@ -451,17 +468,30 @@ pub(super) fn float(
             owed = true;
         }
         going |= panel.closing();
+        // `[style] float` turned off, as the settings floating here can turn
+        // it: from now on none of the screens floats, this one included. It
+        // goes out with the session, as a rename from the picker does, and
+        // comes up full screen.
+        if !going && !config::get().style.float {
+            going = true;
+            unfloated = true;
+        }
         // Taken down just now: the way out the panel says, from wherever
         // the way in has got to.
         if going && !was_going {
-            way = Way::of(panel.leave());
+            way = if unfloated {
+                Way::Away
+            } else {
+                Way::of(panel.leave())
+            };
             let there = coming.at(now);
             let length = fade_length(look);
             match way {
                 Way::Back => coming = Coming::to(there, 0.0, length, now),
                 // The panel and the session go out together: the panel's text
-                // as the session's way in left it, both over the whole fade.
-                Way::Away => away = Coming::to(0.0, 1.0, length, now),
+                // as the session's way in left it, both over the whole fade —
+                // or what is left of it, where the two were still coming in.
+                Way::Away => away = Coming::to(away.at(now), 1.0, length, now),
                 // The session dims the rest of the way, if it has any left,
                 // as the panel goes; and stays dimmed for the next.
                 Way::Across(_) => coming = Coming::to(there, 0.5, length, now),
@@ -516,6 +546,9 @@ pub(super) fn float(
                 // The session back as it is, at once.
                 Way::Back => put_back(a, master_fd, &mut held, &mut boundary)?,
             }
+            if unfloated {
+                return Ok(Some(what.full_screen()));
+            }
             if let Some(ends) = panel.leave().and_then(ends_in) {
                 return Ok(Some(ends));
             }
@@ -559,6 +592,36 @@ pub(super) fn float(
             }
         }
     }
+}
+
+/// The way in, and how far the session is toward the background behind the
+/// panel besides the dimming — 0 as the panel has it, 1 the background — over
+/// a fade `length` long from `now`. A panel comes up over the session as it
+/// stands, which dims round it; over a terminal with nothing of the session on
+/// it yet (`dark`), the two come in together out of the background, the way a
+/// panel going away goes out.
+fn way_in(dark: bool, length: Duration, now: Instant) -> (Coming, Coming) {
+    if dark {
+        (
+            Coming::to(1.0, 1.0, Duration::ZERO, now),
+            Coming::to(1.0, 0.0, length, now),
+        )
+    } else {
+        (
+            Coming::to(0.0, 1.0, length, now),
+            Coming::to(0.0, 0.0, Duration::ZERO, now),
+        )
+    }
+}
+
+/// What a frame `there` of the way in and `away` of the way out to the
+/// background makes of the panel and the session, each eased: how much of the
+/// panel's text is up, how far the session round it is dimmed, and how far
+/// the whole of it is gone to the background besides.
+fn levels(there: f32, away: f32) -> (f32, f32, f32) {
+    let away = falloff::ease(away);
+    let text = falloff::ease(there * 2.0 - 1.0) * (1.0 - away);
+    (text, falloff::ease(there * 2.0), away)
 }
 
 /// How long the panel's whole way in takes, the session dimming and then the
@@ -615,8 +678,7 @@ fn paint(
         }
         return Ok(false);
     }
-    let away = falloff::ease(away);
-    let text = falloff::ease(there * 2.0 - 1.0) * (1.0 - away);
+    let (text, dim, away) = levels(there, away);
     let laid = (text > 0.0).then(|| {
         let mut buf = panel.draw(area);
         if let (Some(palette), true) = (look.palette(), text < 1.0) {
@@ -627,7 +689,6 @@ fn paint(
     let Some(copy) = a.copy() else {
         return Ok(false);
     };
-    let dim = falloff::ease(there * 2.0);
     let Some(out) = frame_bytes(copy, look, laid.as_ref(), area, dim, away, held, boundary) else {
         return Ok(false);
     };
@@ -954,6 +1015,45 @@ mod tests {
             assert!(half >= none, "({row}, {col}): {half} < {none}");
         }
         assert_eq!(Look::Faint.shade(0, 0, panel, 1.0, 1.0), Shade::Blank);
+    }
+
+    /// Settings that come up over a session not yet on the screen come in
+    /// with it, out of the background: the first frame is the background
+    /// everywhere, with nothing of the panel, and the last is the panel up
+    /// over the session dimmed round it, as the last of an ordinary way in
+    /// is — never the session undimmed in between.
+    #[test]
+    fn out_of_the_dark_the_panel_and_the_session_come_in_together() {
+        let t0 = Instant::now();
+        let whole = Duration::from_millis(200);
+        let panel = Rect::new(24, 6, 72, 23);
+        let look = Look::Dimmed(palette());
+        let frame = |(coming, away): (Coming, Coming), at| levels(coming.at(at), away.at(at));
+
+        let dark = way_in(true, whole, t0);
+        let (text, dim, away) = frame(dark, t0);
+        assert_eq!(text, 0.0, "nothing of the panel yet");
+        for (row, col) in [(0, 0), (10, 18), (10, 30), (40, 119)] {
+            assert_eq!(
+                look.shade(row, col, panel, dim, away),
+                Shade::Toward(1.0),
+                "({row}, {col}) is the background"
+            );
+        }
+        let (text, dim, away) = frame(dark, t0 + whole / 2);
+        assert!(text > 0.0 && text < 1.0, "the panel half up: {text}");
+        assert_eq!(dim, 1.0, "the session as dimmed as it goes, all the way");
+        assert!(
+            away > 0.0 && away < 1.0,
+            "half out of the background: {away}"
+        );
+        assert_eq!(frame(dark, t0 + whole), (1.0, 1.0, 0.0), "up");
+        assert_eq!(
+            frame(dark, t0 + whole),
+            frame(way_in(false, whole, t0), t0 + whole),
+            "as an ordinary way in ends"
+        );
+        assert_eq!(frame(way_in(false, whole, t0), t0), (0.0, 0.0, 0.0));
     }
 
     /// Where the picker's keys lead: to another session, the prompt and the

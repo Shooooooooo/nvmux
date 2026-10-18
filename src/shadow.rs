@@ -454,6 +454,14 @@ impl Shadow {
         !self.broken
     }
 
+    /// Whether the session has the terminal on its alternate screen, as far
+    /// as its bytes have said: where a client draws once it has entered it,
+    /// which a fresh one does as it starts. False for a retired shadow, which
+    /// can no longer say.
+    pub fn on_alternate_screen(&self) -> bool {
+        !self.broken && self.parser.screen().alternate_screen()
+    }
+
     /// Whether anything has been drawn on the screen: a glyph in any cell.
     /// What a hold on a session's first paint waits for before a lull counts
     /// as the paint being over — a client's startup queries come first, and a
