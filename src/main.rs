@@ -1043,8 +1043,8 @@ fn begin_attachment(
 /// Begun as a switch begins one under its fade (see [`begin_attachment`]), and
 /// not waited for: each probe is answered on its client's own thread, which
 /// retires a client its probe refuses. So the picker waits for the listing,
-/// and for a fork and — over SSH — a forward per session, and not for a
-/// single round trip more.
+/// for a fork per session and — over SSH — one forward for them all (see
+/// [`transport::Transport::reach_all`]), and not for a single round trip more.
 ///
 /// The listing is handed back for the picker to open on. Over SSH it is the
 /// one the greeting carried, which the first listing takes (see
@@ -1067,6 +1067,7 @@ fn start_every_client(
             return None;
         }
     };
+    transport.reach_all(&listing);
     for session in &listing {
         match begin_attachment(transport, session) {
             Ok(begun) => pool.start_ahead(begun.attachment, Some(begun.probe)),
@@ -1101,12 +1102,12 @@ const REVIVE_AFTER_AT_MOST: std::time::Duration = std::time::Duration::from_secs
 /// the host is. With it they are started ahead again, as [`start_every_client`]
 /// starts them as nvmux starts, and held by the pool until those visits.
 ///
-/// On a thread, because each is a fork and an ssh forward, and the session in
-/// front would otherwise wait for them all to have been made before the relay
-/// that brings it back began. And not before that session has painted
-/// (see [`pty::Attachment::tell_when_painted`]), because each client started
-/// has its session's whole screen sent to it over the link the screen in front
-/// is coming back over.
+/// On a thread, because each is a fork, and their forwards an ssh command
+/// besides, and the session in front would otherwise wait for them all to have
+/// been made before the relay that brings it back began. And not before that
+/// session has painted (see [`pty::Attachment::tell_when_painted`]), because
+/// each client started has its session's whole screen sent to it over the link
+/// the screen in front is coming back over.
 ///
 /// The thread hands over each client as it is held; [`Revival::collect`] takes
 /// them into the pool, where the next attach and the next switch look first.
@@ -1148,6 +1149,10 @@ impl Revival {
         let spawned = std::thread::Builder::new()
             .name("nvmux-revive".into())
             .spawn(move || {
+                // All their forwards in one, while the session in front
+                // paints: a forward sends nothing over the link until a
+                // client connects through it.
+                transport.reach_all(&sessions);
                 revive(&sessions, &painted, &stopped, &handing, |session| {
                     let Begun {
                         attachment, probe, ..

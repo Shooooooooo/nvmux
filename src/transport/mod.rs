@@ -128,6 +128,14 @@ pub trait Transport {
     /// is identical in both cases.
     fn local_socket_for(&self, s: &Session) -> Result<PathBuf>;
 
+    /// Make whatever [`Self::local_socket_for`] would make for each of these
+    /// sessions, all at once, ahead of it being asked for each: over ssh one
+    /// `-O forward` for them all rather than one apiece. Whatever this could
+    /// not make, `local_socket_for` makes as it always has, and reports; so
+    /// nothing here is reported, and locally, where there is nothing to make,
+    /// it does nothing.
+    fn reach_all(&self, _sessions: &[Session]) {}
+
     /// Bring the link to the host back if it has gone, and say whether it had.
     ///
     /// Asked once a client has exited on its own, which over ssh is what a

@@ -284,11 +284,15 @@ impl Panel {
     /// The sessions the reader of notes has not been given, given it — a few
     /// milliseconds' worth at a time, as the picker hands them over.
     fn hand_over(&mut self, transport: &Shared) {
-        for s in self.app.sessions() {
-            if self.handed.insert(s.id.clone()) {
-                self.unread.push_back(s.clone());
-            }
-        }
+        let fresh: Vec<Session> = self
+            .app
+            .sessions()
+            .iter()
+            .filter(|s| self.handed.insert(s.id.clone()))
+            .cloned()
+            .collect();
+        transport.reach_all(&fresh);
+        self.unread.extend(fresh);
         let started = Instant::now();
         while let Some(s) = self.unread.pop_front() {
             match transport.local_socket_for(&s) {

@@ -86,13 +86,12 @@ impl SshTransport {
         let host_token = ids::host_token(&host);
         let control_path = paths::control_path(&local_dir, &host_token)?;
 
-        // Checked before connecting, so the error names the real problem.
-        crate::ssh::check_local()?;
+        // Asked while the connection is made, and judged before anything that
+        // came of it, so the error names the real problem: an `ssh` too old
+        // for nvmux fails at the master's options too, in its own words.
+        let version = crate::ssh::check_local();
 
         let ssh = Ssh::new(host.clone(), control_path);
-        ssh.ensure_master()?;
-        let mut shell = ssh.start_shell()?;
-
         // One round trip for the runtime directory, the remote Neovim version
         // *and* the sessions the picker is about to draw — the shell's first,
         // so it also absorbs whatever the login shell prints on the way up.
@@ -103,7 +102,14 @@ impl SshTransport {
         // `list.sh` removes a socket nothing serves and metadata with no socket
         // — so the sweep is the one it would have done on the next successful
         // run anyway.
-        let out = checked_script(&host, &mut shell, shell::HELLO_SCRIPT, &[])?;
+        let greeted = (|| {
+            ssh.ensure_master()?;
+            let mut shell = ssh.start_shell()?;
+            let out = checked_script(&host, &mut shell, shell::HELLO_SCRIPT, &[])?;
+            Ok::<_, SshError>((shell, out))
+        })();
+        version.verdict()?;
+        let (shell, out) = greeted?;
         let probe = protocol::parse_probe(&out.stdout)?;
 
         // An empty banner is `hello.sh`'s way of saying nvim is not on the
@@ -548,6 +554,47 @@ impl Transport for SshTransport {
         }
 
         self.reach(&s.id, &remote)
+    }
+
+    /// One `ssh -O forward` for every session not forwarded already, where
+    /// [`Self::local_socket_for`] would run one apiece as it came to each:
+    /// every `ssh` is a fork and a few milliseconds of starting up before it
+    /// says a word to the master, and a picker over eight sessions waited for
+    /// eight of them.
+    ///
+    /// A forward is believed in only where ssh said they were all made and its
+    /// local socket is there to show for it. A pair the master was forwarding
+    /// already is the same silent no-op [`Ssh::forward`] is wary of, socket or
+    /// none; and a pair refused fails the command with no word of which it
+    /// was, so a socket there then may be the dead one that was in its way.
+    /// Whatever is not believed in is left to `local_socket_for`, which makes
+    /// it one at a time, as before — bringing back a master that has gone
+    /// included.
+    ///
+    /// Fewer than two is what `local_socket_for` does anyway.
+    fn reach_all(&self, sessions: &[Session]) {
+        if sessions.len() < 2 || self.reconnect_if_needed(None).is_err() {
+            return;
+        }
+        let known = self.forwarded.lock().map(|f| f.clone()).unwrap_or_default();
+        let (ids, pairs): (Vec<&str>, Vec<(PathBuf, PathBuf)>) = sessions
+            .iter()
+            .filter(|s| !known.contains(&s.id))
+            .filter_map(|s| {
+                let pair = (self.local_sock(&s.id).ok()?, self.remote_sock(&s.id).ok()?);
+                Some((s.id.as_str(), pair))
+            })
+            .unzip();
+        if pairs.len() < 2 || !self.ssh.forward_all(&pairs) {
+            return;
+        }
+        if let Ok(mut forwarded) = self.forwarded.lock() {
+            for (id, (local, _)) in ids.iter().zip(&pairs) {
+                if local.exists() {
+                    forwarded.insert((*id).to_string());
+                }
+            }
+        }
     }
 
     /// Bounded, because it is retried: the attempt gets

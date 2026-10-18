@@ -174,6 +174,115 @@ fn a_forward_can_be_torn_down_and_rebuilt() {
     client.api_info().expect("usable after re-forward");
 }
 
+/// `count` sessions, made through the runtime directory's master, for a
+/// transport of a test's own to forward.
+fn sessions(tag: &str, count: usize) -> (Vec<nvmux::session::Session>, Cleanup) {
+    let names: Vec<String> = (0..count).map(|i| unique(&format!("{tag}{i}"))).collect();
+    let guard = Cleanup::of(&names);
+    let t = SshTransport::new(host()).expect("connect");
+    let made = names
+        .iter()
+        .map(|name| {
+            t.create_session(name, &common::launch(), common::anywhere())
+                .expect("create")
+        })
+        .collect();
+    (made, guard)
+}
+
+/// Where a transport keeping its end of the link in `dir` forwards `s` to.
+fn forwarded_sock(dir: &Path, s: &nvmux::session::Session) -> PathBuf {
+    nvmux::paths::forwarded_sock(dir, &nvmux::ids::host_token(&host()), &s.id).expect("path")
+}
+
+/// The sessions a picker opens on, and the clients started ahead of it, are
+/// forwarded by one `ssh -O forward` rather than one apiece, and each answers
+/// through its socket as one forwarded alone does. In a directory of the
+/// test's own, so that no forward another test made passes for one made here.
+#[test]
+fn sessions_wanted_together_are_forwarded_together() {
+    require_ssh!();
+    let (sessions, _guard) = sessions("together", 3);
+    let dir = PrivateDir::new("together");
+    let t = SshTransport::with_dir(host(), dir.0.clone()).expect("connect");
+    let socks: Vec<PathBuf> = sessions.iter().map(|s| forwarded_sock(&dir.0, s)).collect();
+
+    t.reach_all(&sessions);
+    for sock in &socks {
+        assert!(
+            sock.exists(),
+            "not forwarded with the rest: {}",
+            sock.display()
+        );
+    }
+    for (s, sock) in sessions.iter().zip(&socks) {
+        assert_eq!(&t.local_socket_for(s).expect("forward"), sock);
+        let mut client =
+            nvmux::rpc::Client::connect(sock, nvmux::rpc::PROBE_TIMEOUT).expect("connect");
+        client
+            .list_bufs()
+            .expect("a deferred call through the forward");
+    }
+}
+
+/// A forward the master still holds, with its socket gone from under it, is
+/// made again whether it is wanted with others or alone: the master answers
+/// `-O forward` of a pair it holds with a yes and makes nothing, so a yes is
+/// believed only where a socket shows for it.
+#[test]
+fn a_forward_whose_socket_has_gone_is_made_again() {
+    require_ssh!();
+    let (sessions, _guard) = sessions("regone", 2);
+    let dir = PrivateDir::new("regone");
+    let t = SshTransport::with_dir(host(), dir.0.clone()).expect("connect");
+    let socks: Vec<PathBuf> = sessions.iter().map(|s| forwarded_sock(&dir.0, s)).collect();
+    t.reach_all(&sessions);
+    assert!(socks.iter().all(|s| s.exists()), "forwarded together");
+    std::fs::remove_file(&socks[0]).expect("take a socket away");
+
+    // A transport with no memory of either, over the master that holds both.
+    let t2 = SshTransport::with_dir(host(), dir.0.clone()).expect("connect");
+    t2.reach_all(&sessions);
+    assert!(
+        !socks[0].exists(),
+        "the master was to say yes to a forward it holds and make nothing"
+    );
+    for (s, sock) in sessions.iter().zip(&socks) {
+        assert_eq!(&t2.local_socket_for(s).expect("forward"), sock);
+        let mut client =
+            nvmux::rpc::Client::connect(sock, nvmux::rpc::PROBE_TIMEOUT).expect("connect");
+        client.api_info().expect("usable through the forward");
+    }
+}
+
+/// What one pair refused does to the forwards asked for with it: nothing. The
+/// command fails, every other pair is made, and nothing says which was
+/// refused — so after a batch that failed, a socket that is there may be the
+/// dead one that stood in the refused pair's way, and none is believed in.
+#[test]
+fn a_pair_refused_fails_the_batch_and_stops_none_of_the_rest() {
+    require_ssh!();
+    let m = PrivateMaster::up("refused");
+    let remote = PathBuf::from("/tmp/nvmux-no-such.sock");
+    let pairs = [
+        (m.dir.0.join("a.sock"), remote.clone()),
+        (m.dir.0.join("no-such-dir/b.sock"), remote.clone()),
+        (m.dir.0.join("c.sock"), remote.clone()),
+    ];
+    assert!(
+        !m.ssh.forward_all(&pairs),
+        "a pair refused fails the command"
+    );
+    assert!(
+        pairs[0].0.exists() && pairs[2].0.exists(),
+        "and the pairs either side of it are made all the same"
+    );
+    assert!(
+        m.ssh.forward_all(&[pairs[0].clone(), pairs[2].clone()]),
+        "asking again for pairs the master holds is a yes"
+    );
+}
+
 #[test]
 fn renaming_a_remote_session_moves_no_socket() {
     require_ssh!();
