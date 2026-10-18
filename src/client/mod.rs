@@ -2567,6 +2567,7 @@ impl App {
             cursor_row,
             eob,
             self.model.groups.get("NonText").copied(),
+            self.model.groups.get("SpecialKey").copied(),
         ))
     }
 
@@ -2737,15 +2738,11 @@ impl App {
         let win = *self.model.wins.get(&grid)?;
         let view = self.model.viewports.get(&grid)?;
         let shape = p.shape(win)?;
-        let (top, bot, left, right) = anim::text_rect(&self.model, grid)?;
+        let rect = anim::text_rect(&self.model, grid)?;
+        let (top, bot, left, right) = rect;
         let rows = self.model.grids.get(&grid)?.lines(top, bot, left, right);
         let lines = view.lines_shown(bot - top);
-        let cursor = (self.model.cursor.grid == grid)
-            .then(|| self.model.cursor.row.checked_sub(top))
-            .flatten();
-        let eob = self.model.groups.get("EndOfBuffer").copied().unwrap_or(0);
-        let nontext = self.model.groups.get("NonText").copied();
-        let look = predict::Look::of(&rows, lines, shape.textoff, cursor, eob, nontext);
+        let look = self.look(grid, rect, view, shape)?;
         predict::shifted(&rows, shape.leftcol, to, shape, &look, |r| {
             if r < lines {
                 Some(Some(p.coloured(win, view.topline + r as i64)?))

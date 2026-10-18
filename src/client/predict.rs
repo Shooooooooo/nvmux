@@ -439,6 +439,10 @@ pub struct Look {
     /// that does not wrap is drawn in, as `>` or `<` (see [`line`]):
     /// `NonText`, or the text's highlight where the editor has not said.
     pub nontext: u32,
+    /// What a character shown as something it is not — `^X`, `<xx>` — is
+    /// drawn in (see [`line`]): `SpecialKey`, or the text's highlight where
+    /// the editor has not said.
+    pub specialkey: u32,
 }
 
 impl Look {
@@ -446,7 +450,8 @@ impl Look {
     /// first `lines` show the buffer's lines and the rest are past its end —
     /// leaving out the row at `skip`, the cursor's, which `'cursorline'`
     /// draws differently. `eob_hl` is `EndOfBuffer`, for a window that shows
-    /// no row past the end, and `nontext` `NonText`, if the editor has said.
+    /// no row past the end; `nontext` and `specialkey` are `NonText` and
+    /// `SpecialKey`, if the editor has said.
     pub fn of(
         rows: &[Vec<Cell>],
         lines: usize,
@@ -454,6 +459,7 @@ impl Look {
         skip: Option<usize>,
         eob_hl: u32,
         nontext: Option<u32>,
+        specialkey: Option<u32>,
     ) -> Self {
         let text_rows: Vec<&Vec<Cell>> = rows
             .iter()
@@ -477,6 +483,7 @@ impl Look {
             eob,
             eob_hl,
             nontext: nontext.unwrap_or(text),
+            specialkey: specialkey.unwrap_or(text),
         }
     }
 }
@@ -569,10 +576,14 @@ pub fn render(
 /// as Neovim draws it: a `>` in the last column, a `<` in the first, in
 /// `NonText`. Its left half on its own would still be drawn two cells wide,
 /// by a terminal that knows nothing of the cut, and the rest of its row a
-/// cell to the right of where the frame has it (see `super::grid`). Neovim
-/// lays `NonText` over a window's own `Normal` where it has one, and the
-/// `<`'s over the character's own colours as well: highlights of its own
-/// making, which the client has no id for, and are left out.
+/// cell to the right of where the frame has it (see `super::grid`). And a
+/// character Neovim shows as something it is not — a control character as
+/// `^X`, a tab as `^I` where `'list'` has no `tab:` for it, an unprintable
+/// one as `<xx>` — is in `SpecialKey`, as Neovim draws it. Neovim lays
+/// either over a window's own `Normal` where it has one, and `SpecialKey`
+/// and the `<`'s `NonText` over the character's own colours as well:
+/// highlights of its own making, which the client has no id for, and are
+/// left out.
 fn line(
     text: &str,
     spans: &[Span],
@@ -591,6 +602,9 @@ fn line(
     let cut = |row: &mut Vec<Cell>, vcol: usize, mark: char| {
         put(row, vcol, Text::Char(mark), look.nontext);
     };
+    let special = |row: &mut Vec<Cell>, vcol: usize, shown_as: char| {
+        put(row, vcol, Text::Char(shown_as), look.specialkey);
+    };
     let mut vcol = 0usize;
     // Where the last character went, for a combining mark after it.
     let mut last: Option<usize> = None;
@@ -606,8 +620,8 @@ fn line(
         }
         match c {
             '\t' if shape.list && shape.tab.is_empty() => {
-                put(row, vcol, Text::Char('^'));
-                put(row, vcol + 1, Text::Char('I'));
+                special(row, vcol, '^');
+                special(row, vcol + 1, 'I');
                 vcol += 2;
             }
             '\t' => {
@@ -627,14 +641,14 @@ fn line(
             // The C0 controls and DEL as `^X`, the C1 as `<xx>`, as Neovim
             // shows them.
             '\0'..='\x1f' | '\x7f' => {
-                put(row, vcol, Text::Char('^'));
-                put(row, vcol + 1, Text::Char((c as u8 ^ 0x40) as char));
+                special(row, vcol, '^');
+                special(row, vcol + 1, (c as u8 ^ 0x40) as char);
                 vcol += 2;
             }
             _ => match c.width() {
                 None => {
                     for ch in format!("<{:02x}>", c as u32).chars() {
-                        put(row, vcol, Text::Char(ch));
+                        special(row, vcol, ch);
                         vcol += 1;
                     }
                 }
@@ -1839,6 +1853,7 @@ mod tests {
             eob: None,
             eob_hl: 18,
             nontext: 19,
+            specialkey: 20,
         }
     }
 
@@ -1934,6 +1949,63 @@ mod tests {
         };
         let row = render(plain("\tx"), &listed, 0, 6, &look(), 0).unwrap();
         assert_eq!(text(&row), ">---x ");
+    }
+
+    /// What Neovim shows as something it is not is in `SpecialKey`, every
+    /// cell of it, as Neovim 0.12 drew it: `a^Ab^?c`, `x<80>y`, a tab as
+    /// `^I` under `'list'` with no `tab:` for it — whatever colours the
+    /// editor's highlighting gives the character — and, from `'leftcol'` 1,
+    /// what is left of one: the `A` of `^A`, the `80>` of `<80>`. A tab
+    /// drawn with `'listchars'` is not one: Neovim has `Whitespace` for it.
+    #[test]
+    fn what_neovim_shows_as_something_else_is_in_specialkey() {
+        use crate::client::model::syntax_hl;
+        let s = Shape {
+            textoff: 0,
+            tabstop: 4,
+            ..shape()
+        };
+        let hls = |row: &[Cell]| row.iter().map(|c| c.hl).collect::<Vec<_>>();
+        let row = render(plain("a\x01b\x7fc"), &s, 0, 7, &look(), 0).unwrap();
+        assert_eq!(text(&row), "a^Ab^?c");
+        assert_eq!(hls(&row), [0, 20, 20, 0, 20, 20, 0]);
+        let row = render(plain("x\u{80}y"), &s, 0, 6, &look(), 0).unwrap();
+        assert_eq!(text(&row), "x<80>y");
+        assert_eq!(hls(&row), [0, 20, 20, 20, 20, 0]);
+        let listed = Shape {
+            list: true,
+            ..s.clone()
+        };
+        let row = render(plain("p\tq"), &listed, 0, 4, &look(), 0).unwrap();
+        assert_eq!(text(&row), "p^Iq");
+        assert_eq!(hls(&row), [0, 20, 20, 0]);
+        let spans = [Span {
+            start: 0,
+            end: usize::MAX,
+            group: 40,
+        }];
+        let row = render(Some(("a\x01b", &spans)), &s, 0, 4, &look(), 0).unwrap();
+        let word = syntax_hl(0, 40);
+        assert_eq!(hls(&row), [word, 20, 20, word]);
+        let from1 = Shape {
+            wrap: false,
+            leftcol: 1,
+            ..s.clone()
+        };
+        let row = render(plain("\x01bc"), &from1, 0, 3, &look(), 0).unwrap();
+        assert_eq!(text(&row), "Abc");
+        assert_eq!(hls(&row), [20, 0, 0]);
+        let row = render(plain("\u{80}bc"), &from1, 0, 5, &look(), 0).unwrap();
+        assert_eq!(text(&row), "80>bc");
+        assert_eq!(hls(&row), [20, 20, 20, 0, 0]);
+        let tabbed = Shape {
+            list: true,
+            tab: vec!['>', '-'],
+            ..s
+        };
+        let row = render(plain("\tx"), &tabbed, 0, 5, &look(), 0).unwrap();
+        assert_eq!(text(&row), ">---x");
+        assert!(!hls(&row).contains(&20), "Whitespace's, not SpecialKey's");
     }
 
     /// A window that wraps takes no line longer than it is wide; one that
@@ -2071,8 +2143,8 @@ mod tests {
 
     /// The colours are read off the rows the window has: the gutter column
     /// by column, the text by how its rows end, the cursor's row and those
-    /// past the end left out of both. `NonText` is the editor's to say, and
-    /// the text's own where it has not.
+    /// past the end left out of both. `NonText` and `SpecialKey` are the
+    /// editor's to say, and the text's own where it has not.
     #[test]
     fn the_colours_are_the_windows_own() {
         let cell = |hl| Cell {
@@ -2081,15 +2153,19 @@ mod tests {
         };
         let row = |g: u32, t: u32| vec![cell(g), cell(g), cell(t), cell(t)];
         let rows = vec![row(5, 0), row(9, 9), row(5, 0), row(5, 0), row(3, 3)];
-        let l = Look::of(&rows, 4, 2, Some(1), 18, Some(19));
+        let l = Look::of(&rows, 4, 2, Some(1), 18, Some(19), Some(20));
         assert_eq!(l.gutter, vec![5, 5]);
         assert_eq!(l.text, 0);
         assert_eq!(l.eob, Some(row(3, 3)));
         assert_eq!(l.eob_hl, 3);
-        assert_eq!(l.nontext, 19);
-        assert_eq!(Look::of(&rows, 5, 2, None, 18, None).eob_hl, 18);
-        let l = Look::of(&[row(5, 7)], 1, 2, None, 18, None);
-        assert_eq!(l.nontext, 7, "not said: the text's own");
+        assert_eq!((l.nontext, l.specialkey), (19, 20));
+        assert_eq!(Look::of(&rows, 5, 2, None, 18, None, None).eob_hl, 18);
+        let l = Look::of(&[row(5, 7)], 1, 2, None, 18, None, None);
+        assert_eq!(
+            (l.nontext, l.specialkey),
+            (7, 7),
+            "not said: the text's own"
+        );
     }
 
     /// What Neovim 0.12 did, found by running each command in a window of
