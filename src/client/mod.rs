@@ -398,6 +398,17 @@ if predict then
       siso = vim.go.sidescrolloff
     end
     local nmaps, imaps = mapped(buf)
+    -- 'listchars' but its tab, as predict::Listchars::read has them; and
+    -- whether Neovim looks at every character of a line for highlighting of
+    -- its own, and so at its blanks (see predict::Blanks).
+    local lcs = {}
+    if vim.wo.list then
+      local l = vim.opt.listchars:get()
+      for i, k in ipairs({ 'space', 'multispace', 'lead', 'leadmultispace', 'trail', 'nbsp',
+          'eol', 'extends', 'precedes', 'leadtab' }) do
+        lcs[i] = l[k] or ''
+      end
+    end
     return { buf, api.nvim_buf_line_count(buf), info.textoff, vim.bo[buf].tabstop,
       vim.wo.number, vim.wo.relativenumber, vim.wo.statuscolumn == '', vim.wo.wrap,
       vim.fn.winsaveview().leftcol, ok, so,
@@ -405,7 +416,8 @@ if predict then
       vim.opt.fillchars:get().eob or '~', vim.wo.list,
       vim.wo.list and vim.opt.listchars:get().tab or '', vim.wo.scroll, page,
       vim.o.startofline, nmaps, imaps, siso, vim.o.sidescroll,
-      tonumber(vim.o.mousescroll:match('hor:(%d+)')) or 6 }
+      tonumber(vim.o.mousescroll:match('hor:(%d+)')) or 6, lcs,
+      vim.wo.linebreak or vim.wo.spell or vim.b[buf].current_syntax ~= nil }
   end
   -- No more of a line than could be shown, and a cell over for the client
   -- to see it would not fit: a minified file is a line a megabyte long.
@@ -753,6 +765,7 @@ if predict then
     local key = table.concat(vim.tbl_map(tostring, { unpack(s, 1, 18) }), '\\0')
       .. '\\0' .. table.concat(s[19], ' ') .. '\\0' .. table.concat(s[20], ' ')
       .. '\\0' .. table.concat({ s[21], s[22], s[23] }, ',')
+      .. '\\0' .. table.concat(s[24], '\\0') .. '\\0' .. tostring(s[25])
     if shapes[win] ~= key then
       shapes[win] = key
       send('shape', win, s)
@@ -914,7 +927,8 @@ if predict then
   au('OptionSet', { pattern = { 'number', 'relativenumber', 'statuscolumn', 'wrap',
     'tabstop', 'list', 'listchars', 'fillchars', 'scrolloff', 'mousescroll', 'foldenable',
     'foldcolumn', 'signcolumn', 'numberwidth', 'diff', 'buftype', 'scroll', 'window',
-    'startofline', 'sidescrolloff', 'sidescroll' } }, function()
+    'startofline', 'sidescrolloff', 'sidescroll', 'linebreak', 'spell',
+    'syntax' } }, function()
     soon()
   end)
   au('WinClosed', {}, function(ev)

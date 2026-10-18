@@ -159,9 +159,15 @@ pub struct Shape {
     pub step: i64,
     /// `'fillchars'`' `eob`: what a row past the buffer's end starts with.
     pub eob: Text,
-    /// `'list'`, and its `'listchars'` `tab`, empty for none.
+    /// `'list'`, and its `'listchars'` `tab`, empty for none, and the rest
+    /// of them.
     pub list: bool,
     pub tab: Vec<char>,
+    pub lcs: Listchars,
+    /// Whether Neovim looks at every character of a line it draws for some
+    /// highlighting of its own — `'linebreak'`, `'spell'`, syntax items —
+    /// and so at its blanks, whatever `'listchars'` has: see [`Blanks`].
+    pub checks: bool,
     /// `'scroll'`: how far `<C-d>` and `<C-u>` go.
     pub scroll: i64,
     /// How far a page goes when `'window'` says, not the window's height:
@@ -188,7 +194,8 @@ impl Shape {
     /// As the agent sends it: `[buf, line_count, textoff, tabstop, number,
     /// relativenumber, plain_gutter, wrap, leftcol, predictable, scrolloff,
     /// step, eob, list, tab, scroll, page, startofline, mapped, imapped,
-    /// sidescrolloff, sidescroll, hor]`.
+    /// sidescrolloff, sidescroll, hor, lcs, checks]` — `lcs` as
+    /// [`Listchars::read`] has it.
     fn read(v: &[ValueRef<'_>]) -> Option<Self> {
         let int = |i: usize| v.get(i).and_then(redraw::int);
         let size = |i: usize| int(i).and_then(|n| usize::try_from(n).ok());
@@ -213,6 +220,8 @@ impl Shape {
             },
             list: flag(13),
             tab: text(14).chars().collect(),
+            lcs: Listchars::read(&strings(v.get(23))),
+            checks: flag(24),
             scroll: int(15).unwrap_or(0),
             page: int(16).unwrap_or(0),
             startofline: flag(17),
@@ -222,6 +231,70 @@ impl Shape {
             sidescroll: size(21).unwrap_or(1),
             hor: int(22).unwrap_or(6),
         })
+    }
+
+    /// Whether `'listchars'` would draw the blanks of a line sent cut short,
+    /// whose text the client has is `text`, by what was cut off: by where a
+    /// run of blanks at the line's end starts, where its text ends in one,
+    /// or where a run at its start ends, where its text is all blanks.
+    fn unsure(&self, text: &str) -> bool {
+        let l = &self.lcs;
+        let blank = |c: char| matches!(c, ' ' | '\t');
+        self.list
+            && ((l.trail.is_some() && text.ends_with(blank))
+                || (l.leads() && text.chars().all(blank)))
+    }
+}
+
+/// What `'listchars'` shows besides a tab (see [`Shape::tab`]), as the agent
+/// last said it — none of it where `'list'` is not set — each as Neovim 0.12
+/// was found to draw it: the blanks in `Whitespace`, the rest in `NonText`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listchars {
+    /// A space; and one of a run of two or more, through these in turn.
+    pub space: Option<char>,
+    pub multispace: Vec<char>,
+    /// A space before a line's first other character, one of a run of them,
+    /// and a tab there, as `tab` draws one.
+    pub lead: Option<char>,
+    pub leadmultispace: Vec<char>,
+    pub leadtab: Vec<char>,
+    /// A space after a line's last other character.
+    pub trail: Option<char>,
+    /// A no-break space, U+00A0 or U+202F.
+    pub nbsp: Option<char>,
+    /// After a line's text; and, in a view that does not wrap, in its last
+    /// column where its line goes on past it, and in its first where it is
+    /// scrolled sideways.
+    pub eol: Option<char>,
+    pub extends: Option<char>,
+    pub precedes: Option<char>,
+}
+
+impl Listchars {
+    /// As the agent sends them: `[space, multispace, lead, leadmultispace,
+    /// trail, nbsp, eol, extends, precedes, leadtab]`, empty for none.
+    fn read(v: &[String]) -> Self {
+        let many = |i: usize| -> Vec<char> { v.get(i).map_or(Vec::new(), |s| s.chars().collect()) };
+        let one = |i: usize| many(i).first().copied();
+        Self {
+            space: one(0),
+            multispace: many(1),
+            lead: one(2),
+            leadmultispace: many(3),
+            trail: one(4),
+            nbsp: one(5),
+            eol: one(6),
+            extends: one(7),
+            precedes: one(8),
+            leadtab: many(9),
+        }
+    }
+
+    /// Whether these draw blanks by where a line's run of them at its start
+    /// ends.
+    fn leads(&self) -> bool {
+        self.lead.is_some() || !self.leadmultispace.is_empty() || !self.leadtab.is_empty()
     }
 }
 
@@ -581,7 +654,7 @@ pub fn render(
 /// Append the cells of a line's text in the window's text highlight — or
 /// where `spans` colour it, their groups laid over it — from display column
 /// `shape.leftcol`, `room` of them at most. Says whether the whole line fits
-/// in `room`.
+/// in `room`, and its end with it where `'listchars'` shows that.
 ///
 /// A character two cells wide that an edge of the view cuts in two is drawn
 /// as Neovim draws it: a `>` in the last column, a `<` in the first, in
@@ -590,10 +663,17 @@ pub fn render(
 /// cell to the right of where the frame has it (see `super::grid`). A
 /// character Neovim shows as something it is not — a control character as
 /// `^X`, a tab as `^I` where `'list'` has no `tab:` for it, an unprintable
-/// one as `<xx>` — is in `SpecialKey`, and a tab `'list'` shows with its
-/// `tab:` in `Whitespace`, as Neovim draws them. Neovim lays each of these
-/// over a window's own `Normal` where it has one, and all but the `>` over
-/// the character's own colours as well: highlights of its own making,
+/// one as `<xx>` — is in `SpecialKey`; and what `'list'` shows with its
+/// `'listchars'` as Neovim draws it (see [`Listchars`] and [`Blanks`]): a
+/// tab, a space or a no-break space in `Whitespace`, and in `NonText` the
+/// line's end — in the first column of a view that does not wrap scrolled
+/// past it — and, in such a view, `precedes` in place of whatever is in its
+/// first column where it is scrolled sideways, the other half of a
+/// character two cells wide there a `<`, and `extends` in place of whatever
+/// is in its last where more of the line follows, but for a character two
+/// cells wide that ends there. Neovim lays each of these over a window's own
+/// `Normal` where it has one, and all but the `>`, `precedes` and `extends`
+/// over the character's own colours as well: highlights of its own making,
 /// which the client has no id for, and are left out.
 fn line(
     text: &str,
@@ -604,6 +684,9 @@ fn line(
     row: &mut Vec<Cell>,
 ) -> bool {
     let from = shape.leftcol;
+    let base = row.len();
+    let lcs = &shape.lcs;
+    let mut blanks = Blanks::of(text, spans, shape);
     let shown = |vcol: usize| vcol >= from && vcol - from < room;
     let put = |row: &mut Vec<Cell>, vcol: usize, text: Text, hl: u32| {
         if shown(vcol) {
@@ -622,6 +705,7 @@ fn line(
     let mut vcol = 0usize;
     // Where the last character went, for a combining mark after it.
     let mut last: Option<usize> = None;
+    let mut prev = None;
     for (at, c) in text.char_indices() {
         let hl = spans
             .iter()
@@ -632,6 +716,13 @@ fn line(
         if c.width() != Some(0) {
             last = shown(vcol).then_some(row.len());
         }
+        let blank = blanks.draw(at, c, prev);
+        prev = Some(c);
+        if let Some(shown_as) = blank {
+            listed(row, vcol, shown_as);
+            vcol += 1;
+            continue;
+        }
         match c {
             '\t' if shape.list && shape.tab.is_empty() => {
                 special(row, vcol, '^');
@@ -640,10 +731,17 @@ fn line(
             }
             '\t' => {
                 let n = shape.tabstop - vcol % shape.tabstop;
+                // `leadtab` in place of `tab` before the line's first other
+                // character.
+                let tab = if blanks.leading(at) && !lcs.leadtab.is_empty() {
+                    &lcs.leadtab
+                } else {
+                    &shape.tab
+                };
                 for i in 0..n {
                     // A `tab:` of three ends in its third, a tab one cell
                     // wide in that alone.
-                    let ch = match (shape.list, shape.tab.as_slice()) {
+                    let ch = match (shape.list, tab.as_slice()) {
                         (false, _) | (true, []) => ' ',
                         (true, [_, _, last]) if i == n - 1 => *last,
                         (true, [first, ..]) if i == 0 => *first,
@@ -702,7 +800,139 @@ fn line(
             },
         }
     }
-    vcol <= room
+    // The line's end; in the first column of a view that does not wrap,
+    // where that is scrolled past it.
+    let eol = lcs.eol.filter(|_| shape.list);
+    if let Some(e) = eol {
+        let at = if shape.wrap { vcol } else { vcol.max(from) };
+        put(row, at, Text::Char(e), look.nontext);
+    }
+    let end = vcol + usize::from(eol.is_some());
+    if shape.list && !shape.wrap {
+        let nontext = |c: char| Cell {
+            text: Text::Char(c),
+            hl: look.nontext,
+        };
+        if let Some(p) = lcs.precedes.filter(|_| from > 0 && row.len() > base) {
+            if row.get(base + 1).is_some_and(|c| c.text == Text::Half) {
+                row[base + 1] = nontext('<');
+            }
+            row[base] = nontext(p);
+        }
+        // Applied after `precedes`, as Neovim does, for a view a column wide.
+        if let Some(x) = lcs.extends.filter(|_| room > 0 && end > from + room) {
+            if let Some(cell) = row.get_mut(base + room - 1) {
+                if cell.text != Text::Half {
+                    *cell = nontext(x);
+                }
+            }
+        }
+    }
+    end <= room
+}
+
+/// How `'list'` draws a line's blanks with the `'listchars'` for them, as
+/// Neovim's `win_line` does, and as Neovim 0.12 was found to:
+///
+/// - a space after the line's last character other than a blank as `trail`,
+///   where that is set;
+/// - one before its first, where `lead`, `leadmultispace` or `leadtab` is: in
+///   a run of two or more as `leadmultispace`'s characters in turn, else as
+///   `lead`, else as `space`, else as itself — in `Whitespace` all the same;
+/// - any other in a run as `multispace`'s in turn, else as `space`;
+/// - a no-break space as `nbsp`;
+/// - none of them followed by a combining mark;
+/// - and a tab before the first character other than a blank as `leadtab`
+///   draws it, where that is set, else as `tab` does.
+///
+/// Neovim looks at a line's blanks only where `'listchars'` has something for
+/// them but `leadtab`, or where it looks at every character of the line for
+/// highlighting of its own anyway: for the window's (see [`Shape::checks`]),
+/// or for decorations on the line, such as tree-sitter's colours. So where
+/// `leadtab` is all it has for blanks, a space before a line's first
+/// character other than a blank is in `Whitespace` on some lines and not on
+/// others. The client takes the colours the agent sent with a line for its
+/// decorations: it is wrong on a line whose decorations have none, such as
+/// virtual text.
+struct Blanks<'a> {
+    text: &'a str,
+    lcs: &'a Listchars,
+    on: bool,
+    /// Where the line's first character other than a blank is, in bytes,
+    /// where `'listchars'` has something for those before it — none for a
+    /// line all blanks; and where the run of blanks at its end starts, where
+    /// it has `trail`.
+    first: Option<usize>,
+    trail: Option<usize>,
+    /// How far through `multispace` or `leadmultispace` a run of spaces is.
+    run: usize,
+}
+
+impl<'a> Blanks<'a> {
+    fn of(text: &'a str, spans: &[Span], shape: &'a Shape) -> Self {
+        let lcs = &shape.lcs;
+        let blank = |c: char| matches!(c, ' ' | '\t');
+        let any = lcs.space.is_some()
+            || !lcs.multispace.is_empty()
+            || lcs.lead.is_some()
+            || !lcs.leadmultispace.is_empty()
+            || lcs.trail.is_some()
+            || lcs.nbsp.is_some();
+        Self {
+            text,
+            lcs,
+            on: shape.list && (any || shape.checks || !spans.is_empty()),
+            first: text
+                .find(|c| !blank(c))
+                .filter(|_| shape.list && lcs.leads()),
+            trail: (shape.list && lcs.trail.is_some()).then(|| text.trim_end_matches(blank).len()),
+            run: 0,
+        }
+    }
+
+    /// Whether byte `at` is before the line's first character other than a
+    /// blank, where `'listchars'` has something for those.
+    fn leading(&self, at: usize) -> bool {
+        self.first.is_some_and(|f| at < f)
+    }
+
+    /// What character `c`, at byte `at`, `prev` before it, is drawn as: `None`
+    /// for one `'listchars'` leaves as it is.
+    fn draw(&mut self, at: usize, c: char, prev: Option<char>) -> Option<char> {
+        // A combining mark goes with the character before it.
+        if !self.on || c.width() == Some(0) {
+            return None;
+        }
+        let rest = &self.text[at + c.len_utf8()..];
+        let marked = rest.chars().next().is_some_and(|n| n.width() == Some(0));
+        let next = rest.chars().find(|n| n.width() != Some(0));
+        let multi = c == ' ' && (next == Some(' ') || prev == Some(' '));
+        if !multi {
+            self.run = 0;
+        }
+        if marked {
+            return None;
+        }
+        let leading = self.leading(at);
+        let trailing = self.trail.is_some_and(|t| at >= t);
+        let lcs = self.lcs;
+        let mut turn = |list: &[char]| {
+            let ch = list[self.run % list.len()];
+            self.run = (self.run + 1) % list.len();
+            ch
+        };
+        match c {
+            '\u{a0}' | '\u{202f}' => lcs.nbsp,
+            ' ' if leading && multi && !lcs.leadmultispace.is_empty() => {
+                Some(turn(&lcs.leadmultispace))
+            }
+            ' ' if trailing => lcs.trail,
+            ' ' if leading => Some(lcs.lead.or(lcs.space).unwrap_or(' ')),
+            ' ' if multi && !lcs.multispace.is_empty() => Some(turn(&lcs.multispace)),
+            ' ' => lcs.space,
+            _ => None,
+        }
+    }
 }
 
 /// A scroll as Neovim will make it, from a key and a count and the window's
@@ -1148,7 +1378,9 @@ pub fn known<'a>(
 /// cuts in two and not the other's, whole or cut as the new one has it (see
 /// [`line`]): Neovim's `<` or `>` for an edge that has moved, or a half whose
 /// other half the new view's edge leaves out, is not what Neovim will draw.
-/// `None` where a line was not sent.
+/// And so are both views' first and last columns where `'listchars'` may
+/// draw something of its own there (see [`line`]). `None` where a line was
+/// not sent.
 pub fn shifted<'a>(
     rows: &[Vec<Cell>],
     from: usize,
@@ -1161,6 +1393,8 @@ pub fn shifted<'a>(
         leftcol: to,
         ..shape.clone()
     };
+    let l = &shape.lcs;
+    let edges = shape.list && (l.eol.is_some() || l.extends.is_some() || l.precedes.is_some());
     rows.iter()
         .enumerate()
         .map(|(r, row)| {
@@ -1172,6 +1406,7 @@ pub fn shifted<'a>(
             let fresh = render(Some(line), &moved, 0, width, look, 0)?;
             let half =
                 |cells: &[Cell], c: usize| cells.get(c).is_some_and(|x| x.text == Text::Half);
+            let edge = |c: usize| edges && (c == shape.textoff || c + 1 == width);
             let mut out = row.clone();
             for c in shape.textoff..width {
                 let v = to + (c - shape.textoff);
@@ -1183,7 +1418,8 @@ pub fn shifted<'a>(
                     .then(|| shape.textoff + v - from)
                     .filter(|&o| {
                         half(row, o) == half(&fresh, c) && half(row, o + 1) == half(&fresh, c + 1)
-                    });
+                    })
+                    .filter(|&o| !edge(o) && !edge(c));
                 out[c] = match kept {
                     Some(o) => row[o].clone(),
                     None => fresh[c].clone(),
@@ -1856,16 +2092,24 @@ impl Predictor {
     }
 
     /// The text of buffer line `lnum` of window `win`, and the colours the
-    /// editor's highlighting gives it, as the agent sent them.
+    /// editor's highlighting gives it, as the agent sent them: `None` where
+    /// it has not, or where the line was sent cut short and the client cannot
+    /// say how `'listchars'` draws the blanks it has (see
+    /// [`Shape::unsure`]).
     pub fn coloured(&self, win: i64, lnum: i64) -> Option<(&str, &[Span])> {
         let shape = self.shapes.get(&win)?;
-        let line = self.lines.get(&win)?.line(shape.buf, lnum)?;
+        let lines = self.lines.get(&win)?;
+        let line = lines.line(shape.buf, lnum)?;
+        if lines.cut(shape.buf, lnum) && shape.unsure(&line.text) {
+            return None;
+        }
         Some((line.text.as_str(), line.spans.as_slice()))
     }
 
     /// Buffer line `lnum` of window `win` as a row of it would draw it — see
     /// [`render`] — or `None` where the client cannot say: a line the agent
-    /// has not sent. Its text is in the colours the agent sent with it.
+    /// has not sent, or one [`Predictor::coloured`] has none for. Its text is
+    /// in the colours the agent sent with it.
     pub fn row(
         &self,
         win: i64,
@@ -1881,8 +2125,7 @@ impl Predictor {
         let text = if lnum >= shape.line_count {
             None
         } else {
-            let line = self.lines.get(&win)?.line(shape.buf, lnum)?;
-            Some((line.text.as_str(), line.spans.as_slice()))
+            Some(self.coloured(win, lnum)?)
         };
         render(text, shape, lnum, width, look, cursor)
     }
@@ -1920,6 +2163,8 @@ mod tests {
             eob: Text::Char('~'),
             list: false,
             tab: Vec::new(),
+            lcs: Listchars::default(),
+            checks: false,
             scroll: 11,
             page: 0,
             startofline: false,
@@ -2161,6 +2406,370 @@ mod tests {
         assert_eq!(hls, ws(8), "coloured by the editor's highlighting");
         let off = Shape { list: false, ..two };
         assert_eq!(cells("\tx", &off, 9), ("        x".to_string(), vec![0; 9]));
+    }
+
+    /// A window that does not wrap, `'list'` set and `'listchars'` as
+    /// Neovim's option has it.
+    fn listing(option: &str) -> Shape {
+        const KEYS: [&str; 10] = [
+            "space",
+            "multispace",
+            "lead",
+            "leadmultispace",
+            "trail",
+            "nbsp",
+            "eol",
+            "extends",
+            "precedes",
+            "leadtab",
+        ];
+        let mut sent = vec![String::new(); KEYS.len()];
+        let mut tab = Vec::new();
+        for (key, value) in option.split(',').filter_map(|o| o.split_once(':')) {
+            match KEYS.iter().position(|k| *k == key) {
+                Some(i) => sent[i] = value.into(),
+                None => tab = value.chars().collect(),
+            }
+        }
+        Shape {
+            textoff: 0,
+            wrap: false,
+            list: true,
+            tab,
+            lcs: Listchars::read(&sent),
+            ..shape()
+        }
+    }
+
+    /// A line as a row of a window of `shape` `width` cells wide draws it,
+    /// and its colours a letter a cell — `.` the window's own, `n` NonText,
+    /// `s` SpecialKey, `w` Whitespace — less the blanks the row ends in.
+    fn seen(line: &str, shape: &Shape, width: usize) -> (String, String) {
+        let mut row = render(plain(line), shape, 0, width, &look(), 0).unwrap();
+        while row
+            .last()
+            .is_some_and(|c| c.text == Text::Char(' ') && c.hl == 0)
+        {
+            row.pop();
+        }
+        let hls = row
+            .iter()
+            .map(|c| match c.hl {
+                0 => '.',
+                19 => 'n',
+                20 => 's',
+                21 => 'w',
+                _ => '?',
+            })
+            .collect();
+        (text(&row), hls)
+    }
+
+    fn pair(text: &str, hls: &str) -> (String, String) {
+        (text.into(), hls.into())
+    }
+
+    /// Spaces and no-break spaces as Neovim 0.12 drew them, twenty columns
+    /// wide, with each `'listchars'` given: whatever stands for them in
+    /// `Whitespace`, and those it leaves alone as they are.
+    #[test]
+    fn blanks_are_drawn_with_listchars_as_neovim_draws_them() {
+        let (spaced, nbsp, blank, tabbed, led) = (
+            "  a b  c   ",
+            "\u{a0}x\u{202f}y",
+            "    ",
+            "\t a",
+            "     x  y",
+        );
+        let s = listing("tab:> ,trail:-,nbsp:+");
+        assert_eq!(seen(spaced, &s, 20), pair("  a b  c---", "........www"));
+        assert_eq!(seen(nbsp, &s, 20), pair("+x+y", "w.w."));
+        assert_eq!(seen(blank, &s, 20), pair("----", "wwww"));
+        assert_eq!(seen(tabbed, &s, 20), pair(">        a", "wwwwwwww.."));
+        assert_eq!(seen(led, &s, 20), pair(led, "........."));
+        let s = listing("space:.");
+        assert_eq!(seen(spaced, &s, 20), pair("..a.b..c...", "ww.w.ww.www"));
+        assert_eq!(seen(nbsp, &s, 20), pair(nbsp, "...."), "no nbsp:");
+        assert_eq!(seen(blank, &s, 20), pair("....", "wwww"));
+        assert_eq!(seen(tabbed, &s, 20), pair("^I.a", "ssw."));
+        assert_eq!(seen(led, &s, 20), pair(".....x..y", "wwwww.ww."));
+        let s = listing("space:.,lead:_,trail:-");
+        assert_eq!(seen(spaced, &s, 20), pair("__a.b..c---", "ww.w.ww.www"));
+        assert_eq!(seen(blank, &s, 20), pair("----", "wwww"), "all trailing");
+        assert_eq!(seen(tabbed, &s, 20), pair("^I_a", "ssw."));
+        assert_eq!(seen(led, &s, 20), pair("_____x..y", "wwwww.ww."));
+        let s = listing("multispace:ab");
+        assert_eq!(seen(spaced, &s, 20), pair("aba babcaba", "ww...ww.www"));
+        assert_eq!(seen(blank, &s, 20), pair("abab", "wwww"));
+        assert_eq!(seen(tabbed, &s, 20), pair("^I a", "ss.."));
+        assert_eq!(seen(led, &s, 20), pair("ababaxaby", "wwwww.ww."));
+        let s = listing("multispace:abc,space:.");
+        assert_eq!(seen(spaced, &s, 20), pair("aba.babcabc", "ww.w.ww.www"));
+        assert_eq!(seen(blank, &s, 20), pair("abca", "wwww"));
+        let s = listing("leadmultispace:12,space:.");
+        assert_eq!(seen(spaced, &s, 20), pair("12a.b..c...", "ww.w.ww.www"));
+        assert_eq!(seen(blank, &s, 20), pair("....", "wwww"), "none leading");
+        assert_eq!(seen(tabbed, &s, 20), pair("^I.a", "ssw."));
+        assert_eq!(seen(led, &s, 20), pair("12121x..y", "wwwww.ww."));
+        let s = listing("leadmultispace:12,multispace:ab,trail:-");
+        assert_eq!(seen(spaced, &s, 20), pair("12a babc---", "ww...ww.www"));
+        assert_eq!(seen(blank, &s, 20), pair("----", "wwww"));
+        assert_eq!(
+            seen(tabbed, &s, 20),
+            pair("^I a", "ssw."),
+            "leading, and nothing for one alone: itself in Whitespace"
+        );
+        assert_eq!(seen(led, &s, 20), pair("12121xaby", "wwwww.ww."));
+        let s = listing("lead:_");
+        assert_eq!(seen(spaced, &s, 20), pair("__a b  c", "ww......"));
+        assert_eq!(seen(blank, &s, 20), pair("", ""));
+        assert_eq!(seen(tabbed, &s, 20), pair("^I_a", "ssw."));
+        assert_eq!(seen(led, &s, 20), pair("_____x  y", "wwwww...."));
+        let s = listing("nbsp:+,space:.");
+        assert_eq!(seen(nbsp, &s, 20), pair("+x+y", "w.w."));
+        let s = listing("leadmultispace:12");
+        assert_eq!(seen(" \tx", &s, 20), pair(" ^Ix", "wss."));
+        let off = Shape {
+            list: false,
+            ..listing("space:.,trail:-,nbsp:+")
+        };
+        assert_eq!(seen(spaced, &off, 20), pair("  a b  c", "........"));
+        assert_eq!(seen(nbsp, &off, 20), pair(nbsp, "...."));
+    }
+
+    /// A run of spaces goes through `multispace` or `leadmultispace` from the
+    /// line's start, whatever the view shows of it, as Neovim 0.12 drew it:
+    /// from column 2 with `multispace:abc`, and from 3 with
+    /// `leadmultispace:123,multispace:ab` and `precedes:<` — a tab, or any
+    /// other character, starting it again. A space with a combining mark on
+    /// it is drawn as it is, and keeps the run going; a no-break space with
+    /// one is drawn as it is.
+    #[test]
+    fn a_run_of_spaces_goes_through_its_listchars_from_the_lines_start() {
+        let (lead, run, mixed) = ("      x", "a      b      c", "  \t  x \t ");
+        let s = Shape {
+            leftcol: 2,
+            ..listing("multispace:abc")
+        };
+        assert_eq!(seen(lead, &s, 20), pair("cabcx", "wwww."));
+        assert_eq!(seen(run, &s, 20), pair("bcabcbabcabcc", "wwwww.wwwwww."));
+        let s = Shape {
+            leftcol: 3,
+            ..listing("tab:>-,leadtab:|.,precedes:<,leadmultispace:123,multispace:ab")
+        };
+        assert_eq!(seen(lead, &s, 20), pair("<23x", "nww."));
+        assert_eq!(seen(run, &s, 20), pair("<babbabababc", "nwww.wwwwww."));
+        assert_eq!(seen(mixed, &s, 20), pair("<....12x >---", "nwwwwww..wwww"));
+        let s = listing("leadmultispace:12");
+        assert_eq!(seen(mixed, &s, 20), pair("12^I12x ^I", "wwssww..ss"));
+        let marked = "a  \u{301}  b";
+        let s = listing("tab:>-,trail:~,lead:_,multispace:ab,space:.");
+        assert_eq!(seen(marked, &s, 20), pair("aa \u{301}bab", ".w.ww."));
+        let nbsp = "\u{a0}\u{301}x \u{a0}";
+        assert_eq!(seen(nbsp, &s, 20), pair("\u{a0}\u{301}x.\u{a0}", "..w."));
+        let s = listing("space:.,nbsp:+,multispace:ab");
+        assert_eq!(seen(marked, &s, 20), pair("aa \u{301}bab", ".w.ww."));
+        assert_eq!(seen(nbsp, &s, 20), pair("\u{a0}\u{301}x.+", "..ww"));
+        // The space after a mark is in the run by the one after it.
+        let s = listing("multispace:abcde");
+        assert_eq!(
+            seen("x  \u{301} \u{301}  y", &s, 20),
+            pair("xa \u{301} \u{301}bcy", ".w..ww.")
+        );
+    }
+
+    /// A tab before a line's first other character is drawn with `leadtab`,
+    /// as Neovim 0.12 drew `leadtab:|.-` and `leadtab:|.`, from the line's
+    /// start and from column 3. Where that is all `'listchars'` has for
+    /// blanks, Neovim draws a space before that character in `Whitespace`
+    /// only where it looks at the line's characters for some highlighting of
+    /// its own: for the window's, or where the line has colours of its own.
+    #[test]
+    fn a_leading_tab_is_drawn_with_leadtab_as_neovim_draws_it() {
+        let (mixed, tabs, one, lead) = ("  \t  x \t ", "\t\tx\ty", " \tx", "      x");
+        let s = listing("tab:>-,leadtab:|.-,lead:_,trail:~");
+        assert_eq!(
+            seen(mixed, &s, 20),
+            pair("__|....-__x~>---~", "wwwwwwwwww.wwwwww")
+        );
+        assert_eq!(
+            seen(tabs, &s, 20),
+            pair("|......-|......-x>--", "wwwwwwwwwwwwwwww.www")
+        );
+        assert_eq!(seen(one, &s, 20), pair("_|.....-x", "wwwwwwww."));
+        let s = listing("tab:>-,leadtab:|.");
+        assert_eq!(
+            seen(mixed, &s, 20),
+            pair("  |.....  x >---", "..wwwwww....wwww")
+        );
+        assert_eq!(seen(one, &s, 20), pair(" |......x", ".wwwwwww."));
+        assert_eq!(seen(lead, &s, 20), pair(lead, "......."));
+        let from3 = Shape {
+            leftcol: 3,
+            ..s.clone()
+        };
+        assert_eq!(
+            seen(tabs, &from3, 20),
+            pair(".....|.......x>-----", "wwwwwwwwwwwww.wwwwww")
+        );
+        assert_eq!(seen(one, &from3, 20), pair(".....x", "wwwww."));
+        let checks = Shape {
+            checks: true,
+            ..s.clone()
+        };
+        assert_eq!(
+            seen(mixed, &checks, 20),
+            pair("  |.....  x >---", "wwwwwwwwww..wwww")
+        );
+        assert_eq!(seen(lead, &checks, 20), pair(lead, "wwwwww."));
+        let spans = [Span {
+            start: 6,
+            end: 7,
+            group: 40,
+        }];
+        let row = render(Some((lead, &spans)), &s, 0, 7, &look(), 0).unwrap();
+        assert!(row[..6].iter().all(|c| c.hl == 21), "colours of its own");
+        let trail = listing("tab:>-,leadtab:|.,trail:~");
+        assert_eq!(seen(lead, &trail, 20), pair(lead, "wwwwww."));
+    }
+
+    /// The end of a line and the edges of a view that does not wrap, as
+    /// Neovim 0.12 drew them twenty columns wide: `eol` after the line, or in
+    /// the first column scrolled past it; `extends` in the last column where
+    /// more of the line follows — even only its end, or the rest of a tab or
+    /// a `^A` — but not on the half of a character two cells wide; and
+    /// `precedes` in the first column scrolled sideways, whatever is there,
+    /// the other half of a character two cells wide a `<`. All in
+    /// `NonText`.
+    #[test]
+    fn a_lines_end_and_edges_are_drawn_as_neovim_draws_them() {
+        let x = |n: usize| "x".repeat(n);
+        let dots = |n: usize| ".".repeat(n);
+        let wide = "日本".repeat(7);
+        let (cut_wide, tab, ctrl) = (
+            format!("{}日z", x(19)),
+            format!("{}\ty", x(16)),
+            format!("{}\x01z", x(19)),
+        );
+        let s = listing("eol:¶,extends:»,precedes:«,tab:>-");
+        assert_eq!(
+            seen(&x(20), &s, 20),
+            (format!("{}»", x(19)), format!("{}n", dots(19))),
+            "only its end follows"
+        );
+        assert_eq!(seen(&cut_wide, &s, 20).0, format!("{}»", x(19)));
+        assert_eq!(seen(&wide, &s, 20), ("日本".repeat(5), dots(20)));
+        assert_eq!(seen("abc", &s, 20), pair("abc¶", "...n"));
+        assert_eq!(
+            seen(&tab, &s, 20),
+            (format!("{}>--»", x(16)), format!("{}wwwn", dots(16)))
+        );
+        assert_eq!(seen(&ctrl, &s, 20).0, format!("{}»", x(19)));
+        assert_eq!(seen("", &s, 20), pair("¶", "n"));
+        let from = |left: usize, s: &Shape| Shape {
+            leftcol: left,
+            ..s.clone()
+        };
+        let s1 = from(1, &s);
+        assert_eq!(
+            seen(&x(20), &s1, 20),
+            (format!("«{}¶", x(18)), format!("n{}n", dots(18)))
+        );
+        assert_eq!(
+            seen(&cut_wide, &s1, 20),
+            (format!("«{}日", x(17)), format!("n{}", dots(19))),
+            "the half of 日 in the last column"
+        );
+        assert_eq!(
+            seen(&wide, &s1, 20),
+            (
+                format!("«{}»", "本日".repeat(4) + "本"),
+                format!("n{}n", dots(18))
+            )
+        );
+        let ab = format!("ab{}", "日本".repeat(5));
+        assert_eq!(seen(&ab, &s1, 20).0, format!("«{}日»", "日本".repeat(4)));
+        assert_eq!(seen("abc", &s1, 20), pair("«c¶", "n.n"));
+        assert_eq!(
+            seen(&tab, &s1, 20),
+            (format!("«{}>---»", x(14)), format!("n{}wwwwn", dots(14)))
+        );
+        assert_eq!(
+            seen(&ctrl, &s1, 20),
+            (format!("«{}^»", x(17)), format!("n{}sn", dots(17)))
+        );
+        assert_eq!(seen("", &s1, 20), pair("«", "n"));
+        let s2 = from(2, &s);
+        assert_eq!(
+            seen(&wide, &s2, 20),
+            (
+                format!("«<{}", "日本".repeat(4) + "日"),
+                format!("nn{}", dots(18))
+            )
+        );
+        assert_eq!(seen("abc", &s2, 20), pair("«¶", "nn"));
+        assert_eq!(
+            seen(&cut_wide, &s2, 20),
+            (format!("«{}日»", x(16)), format!("n{}..n", dots(16)))
+        );
+        let eol = from(5, &listing("eol:¶"));
+        assert_eq!(seen("abc", &eol, 20), pair("¶", "n"), "scrolled past");
+        assert_eq!(seen("abcde", &eol, 20), pair("¶", "n"));
+        assert_eq!(seen("", &eol, 20), pair("¶", "n"));
+        assert_eq!(
+            seen(&wide, &eol, 20),
+            (
+                format!("<{}>", "本日".repeat(4) + "本"),
+                format!("n{}n", dots(18))
+            ),
+            "cut as ever"
+        );
+        let precedes = from(5, &listing("precedes:«"));
+        assert_eq!(seen("abc", &precedes, 20), pair("", ""), "nothing there");
+        assert_eq!(seen(&x(20), &precedes, 20).0, format!("«{}", x(14)));
+        assert_eq!(
+            seen("abc", &from(6, &listing("eol:¶,precedes:«")), 20),
+            pair("«", "n")
+        );
+        let extends = listing("extends:»");
+        assert_eq!(seen(&x(20), &extends, 20).0, x(20), "nothing follows");
+        assert_eq!(
+            seen(&"y".repeat(30), &extends, 20).0,
+            format!("{}»", "y".repeat(19))
+        );
+        assert_eq!(
+            seen(&tab, &extends, 20),
+            (format!("{}^Iy", x(16)), format!("{}ss.", dots(16)))
+        );
+        let tabbed = from(2, &listing("tab:>-,precedes:<,lead:_,trail:-"));
+        assert_eq!(
+            seen("\tabcdefghijklmnopqrstuvw", &tabbed, 20),
+            (
+                "<-----abcdefghijklmn".to_string(),
+                format!("nwwwww{}", dots(14))
+            )
+        );
+        assert_eq!(seen("  ab  ", &tabbed, 20), pair("<b--", "n.ww"));
+        let led = from(1, &listing("lead:_,trail:-,precedes:<"));
+        assert_eq!(seen("  ab  ", &led, 20), pair("<ab--", "n..ww"));
+    }
+
+    /// A line's end where `'listchars'` shows it takes a cell: in a window
+    /// that wraps, a line as wide as the window takes two rows of it, as
+    /// Neovim 0.12 drew it.
+    #[test]
+    fn a_lines_end_takes_a_cell_of_a_window_that_wraps() {
+        let s = Shape {
+            wrap: true,
+            ..listing("eol:$,nbsp:+,space:.")
+        };
+        let row = render(plain(&"x".repeat(19)), &s, 0, 20, &look(), 0).unwrap();
+        assert_eq!(text(&row), format!("{}$", "x".repeat(19)));
+        assert_eq!(render(plain(&"x".repeat(20)), &s, 0, 20, &look(), 0), None);
+        let row = render(plain("a\u{a0}\u{301}b c"), &s, 0, 20, &look(), 0).unwrap();
+        assert_eq!(text(&row[..6]), "a\u{a0}\u{301}b.c$");
+        let off = Shape { list: false, ..s };
+        assert!(render(plain(&"x".repeat(20)), &off, 0, 20, &look(), 0).is_some());
     }
 
     /// A window that wraps takes no line longer than it is wide; one that
@@ -2931,6 +3540,152 @@ mod tests {
                 cell('d', 15),
                 cell('e', 0)
             ]
+        );
+    }
+
+    /// Moved sideways, the first and last columns of both views are drawn
+    /// afresh where `'listchars'` draws something of its own at the edges:
+    /// `precedes` and `extends` stay where they are, and the end of a line
+    /// scrolled past is not kept where it was drawn.
+    #[test]
+    fn rows_moved_sideways_draw_the_edges_listchars_marks_afresh() {
+        let s = listing("eol:¶,extends:»,precedes:«");
+        let drawn = |s: &str| -> Vec<Cell> {
+            s.chars()
+                .enumerate()
+                .map(|(i, c)| Cell {
+                    text: Text::Char(c),
+                    hl: 10 + i as u32,
+                })
+                .collect()
+        };
+        let cell = |c, hl| Cell {
+            text: Text::Char(c),
+            hl,
+        };
+        let line = |_: usize| Some(Some(("abcdefghij", &[][..])));
+        let from1 = [drawn("«cdef»")];
+        let moved = shifted(&from1, 1, 2, &s, &look(), line).unwrap();
+        assert_eq!(
+            moved[0],
+            [
+                cell('«', 19),
+                cell('d', 12),
+                cell('e', 13),
+                cell('f', 14),
+                cell('g', 0),
+                cell('»', 19)
+            ]
+        );
+        let moved = shifted(&from1, 1, 0, &s, &look(), line).unwrap();
+        assert_eq!(
+            moved[0],
+            [
+                cell('a', 0),
+                cell('b', 0),
+                cell('c', 11),
+                cell('d', 12),
+                cell('e', 13),
+                cell('»', 19)
+            ]
+        );
+        let short = |_: usize| Some(Some(("ab", &[][..])));
+        let moved = shifted(&[drawn("¶     ")], 4, 0, &s, &look(), short).unwrap();
+        assert_eq!(text(&moved[0]), "ab¶   ");
+        let plain = Shape {
+            lcs: Listchars::default(),
+            ..s.clone()
+        };
+        let moved = shifted(&[drawn("bcdefg")], 1, 2, &plain, &look(), line).unwrap();
+        assert_eq!(
+            moved[0][0],
+            cell('c', 11),
+            "no listchars at the edges: kept"
+        );
+    }
+
+    /// A line the agent sent cut short is not drawn where `'listchars'`
+    /// draws its blanks by what was cut off: blanks the text it has ends in,
+    /// which may be the line's last, where `trail` is set; and a text all
+    /// blanks, where what draws those before the first other character is.
+    #[test]
+    fn lines_cut_short_are_not_drawn_where_their_blanks_turn_on_the_rest() {
+        let listed = |lcs: &[&str]| -> Vec<Value> {
+            let mut args = shape_args(10);
+            if let Some(Value::Array(v)) = args.get_mut(1) {
+                v[13] = true.into();
+                v.resize(23, Value::from(0));
+                v.push(Value::Array(lcs.iter().map(|s| Value::from(*s)).collect()));
+            }
+            args
+        };
+        let texts = ["abcdefg   ", "abcdefghij", "          ", "  abcdefgh"];
+        let drawn = |args: Vec<Value>| -> Vec<bool> {
+            let mut p = Predictor::default();
+            said(&mut p, "shape", args);
+            let mut run = lines(1000, 5, 0, &texts, true);
+            run.push(10.into());
+            said(&mut p, "lines", run);
+            (0..4)
+                .map(|l| {
+                    assert_eq!(
+                        p.coloured(1000, l).is_some(),
+                        p.row(1000, l, 12, &look(), 0).is_some()
+                    );
+                    p.coloured(1000, l).is_some()
+                })
+                .collect()
+        };
+        let trail = ["", "", "", "", "-", "", "", "", "", ""];
+        assert_eq!(drawn(listed(&trail)), [false, true, false, true]);
+        let lead = ["", "", "_", "", "", "", "", "", "", ""];
+        assert_eq!(drawn(listed(&lead)), [true, true, false, true]);
+        let space = [".", "", "", "", "", "", "", "", "", ""];
+        assert_eq!(
+            drawn(listed(&space)),
+            [true; 4],
+            "nothing turns on the rest"
+        );
+        assert_eq!(drawn(shape_args(10)), [true; 4], "'list' off");
+    }
+
+    /// The agent sends `'listchars'` but its `tab` in a list of its own, and
+    /// whether Neovim looks at every character for highlighting of its own.
+    #[test]
+    fn listchars_come_with_the_shape() {
+        let mut p = Predictor::default();
+        let mut args = shape_args(10);
+        if let Some(Value::Array(v)) = args.get_mut(1) {
+            v[13] = true.into();
+            v.resize(23, Value::from(0));
+            let lcs = [".", "ab", "_", "12", "-", "+", "$", ">", "<", "|."];
+            v.push(Value::Array(lcs.iter().map(|s| Value::from(*s)).collect()));
+            v.push(true.into());
+        }
+        said(&mut p, "shape", args);
+        let s = p.shape(1000).unwrap();
+        assert_eq!(
+            s.lcs,
+            Listchars {
+                space: Some('.'),
+                multispace: vec!['a', 'b'],
+                lead: Some('_'),
+                leadmultispace: vec!['1', '2'],
+                leadtab: vec!['|', '.'],
+                trail: Some('-'),
+                nbsp: Some('+'),
+                eol: Some('$'),
+                extends: Some('>'),
+                precedes: Some('<'),
+            }
+        );
+        assert!(s.checks);
+        said(&mut p, "shape", shape_args(10));
+        let s = p.shape(1000).unwrap();
+        assert_eq!(
+            (&s.lcs, s.checks),
+            (&Listchars::default(), false),
+            "none said"
         );
     }
 

@@ -2123,6 +2123,99 @@ fn predicted_rows_show_what_neovim_shows_as_something_else_in_its_colours() {
     }
 }
 
+/// Rows a scroll uncovers or moves sideways ahead of Neovim show what
+/// `'listchars'` draws as Neovim draws it: blanks — spaces alone and in runs,
+/// before a line's text and after it, no-break spaces, tabs before the text
+/// and in it — and the line's end, and the edges of a view that does not
+/// wrap: the last column where the line goes on, the first where the view is
+/// scrolled sideways. With `'linebreak'`, the spaces before a line's text are
+/// in `Whitespace` though `leadtab` is all there is for them. When Neovim's
+/// own rows land, not a cell of the window changes, text or colour.
+#[test]
+fn predicted_rows_show_listchars_as_neovim_draws_them() {
+    require_nvim!();
+    let scratch = Scratch::new("client-listchars");
+    // Four kinds of line, the fourth 77 columns wide: as wide as a window
+    // that wraps fits, its end and all, and wider than one with a gutter.
+    let (mut rpc, mut term, _) = drawn_slowly(
+        &scratch,
+        "client-listchars",
+        r"lua local t = {} for i = 1, 200 do local k = i % 4 t[i] = k == 0 and ('  line ' .. i .. '  with  runs   ') or k == 1 and ('\t\tline ' .. i .. '\tend ') or k == 2 and (' \194\160line ' .. i .. '\226\128\175x ') or ('    line ' .. string.format('%-3d', i) .. ' ' .. string.rep('ab  ', 16)) end vim.api.nvim_buf_set_lines(0, 0, -1, false, t)",
+    );
+    rpc.command(
+        "set termguicolors list \
+         listchars=tab:>-,leadtab:\\|.,space:.,multispace:ab,lead:_,leadmultispace:12,\
+         trail:~,nbsp:+,eol:$,extends:>,precedes:< \
+         | hi Whitespace guifg=#5f87ff | hi NonText guifg=#87d75f",
+    )
+    .expect("listchars");
+    term.pump_until(4 * SLOW, |_| false);
+    let step = |term: &mut Terminal, name: &str, keys: &[u8]| {
+        let before = window(term);
+        term.type_bytes(keys);
+        assert!(
+            term.pump(SLOW, |t| window(t) != before),
+            "{name} waited for Neovim:\n{}",
+            term.text()
+        );
+        term.pump_until(Duration::from_millis(30), |_| false);
+        let predicted = (window(term), colours(term));
+        term.pump_until(4 * SLOW, |_| false);
+        let landed = (window(term), colours(term));
+        assert_eq!(predicted.0, landed.0, "{name}: the text moved");
+        for (r, (p, l)) in predicted.1.iter().zip(&landed.1).enumerate() {
+            assert_eq!(p, l, "{name}: row {r} changed colour when Neovim's landed");
+        }
+        landed.0 .0
+    };
+    for (name, keys) in [
+        ("<C-f>", &b"\x06"[..]),
+        ("<C-b>", b"\x02"),
+        ("the wheel", b"\x1b[<65;10;5M"),
+        ("3<C-e>", b"3\x05"),
+        ("<C-y>", b"\x19"),
+    ] {
+        step(&mut term, name, keys);
+    }
+    // Without wrapping, with a gutter, on a line as wide as any: from column
+    // 1, down and back; and sideways, past the end of the shorter lines.
+    rpc.command("set nowrap number | call cursor(39, 1)")
+        .expect("nowrap");
+    term.pump_until(4 * SLOW, |_| false);
+    let mut seen = Vec::new();
+    for (name, keys) in [
+        ("zl", &b"zl"[..]),
+        ("<C-f> from column 1", b"\x06"),
+        ("<C-b> from column 1", b"\x02"),
+    ] {
+        seen.extend(step(&mut term, name, keys));
+    }
+    rpc.command("call winrestview({'lnum': 39, 'col': 1, 'leftcol': 1})")
+        .expect("view");
+    term.pump_until(4 * SLOW, |_| false);
+    for (name, keys) in [("zL", &b"zL"[..]), ("zH", b"zH"), ("zh", b"zh")] {
+        seen.extend(step(&mut term, name, keys));
+    }
+    // Neovim drew both edges: `>` in the last column, `<` in the first after
+    // the gutter.
+    for (what, col, mark) in [("extends", COLS - 1, '>'), ("precedes", 4, '<')] {
+        assert!(
+            seen.iter()
+                .any(|row| row.chars().nth(col.into()) == Some(mark)),
+            "no {what} drawn: {seen:#?}"
+        );
+    }
+    rpc.command("set listchars=tab:>-,leadtab:\\|.,eol:$ linebreak wrap nonumber")
+        .expect("linebreak");
+    term.pump_until(4 * SLOW, |_| false);
+    for (name, keys) in [
+        ("<C-f> with linebreak", &b"\x06"[..]),
+        ("<C-b> with linebreak", b"\x02"),
+    ] {
+        step(&mut term, name, keys);
+    }
+}
+
 /// The frames the client wrote from `from` on: each hides the cursor first.
 fn frames_since(term: &Terminal, from: usize) -> usize {
     term.output[from..]
