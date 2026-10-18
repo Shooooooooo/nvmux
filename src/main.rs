@@ -504,7 +504,13 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
             match &ended.0 {
                 pty::Outcome::ToPicker => looked_at = Some(current.id.clone()),
                 pty::Outcome::Detached | pty::Outcome::StdinClosed => {
-                    nvmux::notes::seen_within(sock, SEEN_ON_THE_WAY_OUT);
+                    // Said while the clients kept out of sight are retired,
+                    // which has nothing to wait for from it, and waited for
+                    // once they are, for what is left of its budget.
+                    let deadline = std::time::Instant::now() + SEEN_ON_THE_WAY_OUT;
+                    let seeing = nvmux::notes::seen_begin(sock);
+                    pool.retire_all();
+                    seeing.wait_until(deadline);
                 }
                 pty::Outcome::CreateNew
                 | pty::Outcome::ShowHelp
@@ -551,7 +557,18 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                         std::thread::sleep,
                     );
                     match verdict {
-                        reconnect::Verdict::Unneeded => break,
+                        // The session ended, as `:q` ends one: the picker opens
+                        // on the rows in hand without it, and lists afresh
+                        // behind them, as after `<prefix> Space` — the round
+                        // trip a listing is, no longer between the session and
+                        // the picker. A client ended by `:detach` leaves its
+                        // session running, and the listing brings that back,
+                        // with the cursor on it (see `App::select_session`).
+                        reconnect::Verdict::Unneeded => {
+                            listing.retain(|s| s.id != current.id);
+                            opening = ui::Listing::in_hand(std::mem::take(&mut listing), shared);
+                            break;
+                        }
                         reconnect::Verdict::Restored => {
                             after_a_drop = true;
                             continue;

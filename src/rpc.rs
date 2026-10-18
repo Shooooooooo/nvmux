@@ -176,6 +176,17 @@ impl Client<UnixStream> {
         Ok(client)
     }
 
+    /// Bound each reply from here on by `read_timeout`, in place of the budget
+    /// the connection was made with: for a deferred call sent behind a fast
+    /// one, waited for no longer than it would be on a connection of its own.
+    pub fn set_read_timeout(&mut self, read_timeout: Duration) -> Result<(), RpcError> {
+        let stream = self.io.get_ref();
+        stream.set_read_timeout(Some(read_timeout))?;
+        stream.set_write_timeout(Some(read_timeout))?;
+        self.read_timeout = Some(read_timeout);
+        Ok(())
+    }
+
     /// A second handle on this connection, for ending a call in progress from
     /// another thread. See [`Interrupt`].
     pub fn interrupt(&self) -> std::io::Result<Interrupt> {

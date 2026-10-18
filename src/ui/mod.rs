@@ -1470,6 +1470,64 @@ mod tests {
         assert_eq!(host.asked(), 1);
     }
 
+    /// **What a session that exited used to wait for.** On the way back from
+    /// one, the picker opens at once on the rows in hand less that session,
+    /// the cursor on the first row while its own is not there. A session still
+    /// there — its client ended by `:detach` — is in the listing behind them,
+    /// which puts the cursor back on it; one that is gone is not, and the
+    /// cursor stays. A key pressed meanwhile leaves the cursor the user's.
+    #[test]
+    fn the_cursor_goes_back_to_a_session_whose_client_exited_if_it_is_still_there() {
+        let wait = Duration::from_millis(300);
+        let all = rows(&["one", "two", "three"]);
+        let without_two =
+            || -> Vec<Session> { all.iter().filter(|s| s.id != "id000001").cloned().collect() };
+        let opened = |listed: Vec<Session>| {
+            let host = std::sync::Arc::new(Lister::new(listed, wait));
+            let shared: crate::transport::Shared = host.clone();
+            let started = Instant::now();
+            let picker = open(
+                host.as_ref(),
+                Listing::in_hand(without_two(), &shared),
+                None,
+                Some("id000001"),
+                false,
+            )
+            .expect("open");
+            assert!(
+                started.elapsed() < wait,
+                "opened {:?} after it was asked, the host's time",
+                started.elapsed()
+            );
+            picker
+        };
+
+        let (mut app, mut behind) = opened(all.clone());
+        assert_eq!(names(&app), ["one", "three"]);
+        assert_eq!(cursor(&app), "id000000");
+        take_up(&mut app, &mut behind, Duration::from_secs(10));
+        assert_eq!(names(&app), ["one", "two", "three"]);
+        assert_eq!(cursor(&app), "id000001", "the listing brought it back");
+
+        let (mut app, mut behind) = opened(without_two());
+        take_up(&mut app, &mut behind, Duration::from_secs(10));
+        assert_eq!(names(&app), ["one", "three"]);
+        assert_eq!(cursor(&app), "id000000", "gone, and the cursor stays");
+
+        let (mut app, mut behind) = opened(all.clone());
+        app.on_key(Key::Down);
+        app.on_key(Key::Up);
+        // The rows are taken up at rest: the moves' glow run out first.
+        app.tick(Duration::from_secs(5));
+        take_up(&mut app, &mut behind, Duration::from_secs(10));
+        assert_eq!(names(&app), ["one", "two", "three"]);
+        assert_eq!(
+            cursor(&app),
+            "id000000",
+            "the cursor was taken over, and taken from its owner"
+        );
+    }
+
     /// A listing taken a moment ago is opened on as it is, and the host is
     /// asked nothing: the one nvmux started its clients ahead from. With no
     /// rows in hand the picker lists, and opens on the answer.

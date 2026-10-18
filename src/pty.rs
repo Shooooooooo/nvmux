@@ -554,6 +554,12 @@ impl std::fmt::Debug for Attachment {
 /// How long a hung-up client gets to exit before it is killed outright.
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How often a hung-up client is looked at, and what it wrote thrown away,
+/// until it has exited. A client hung up goes in a few milliseconds, and every
+/// step of this past that is time the user waits: on a switch with clients not
+/// kept, and on the way out of nvmux, for every client kept out of sight.
+const REAP_STEP: Duration = Duration::from_millis(1);
+
 /// How long the teardown paths relay a departing client's restore sequence.
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -1736,7 +1742,7 @@ impl Attachment {
                 owed = !self.answer_device_attributes();
             }
             match self.child.try_wait() {
-                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Ok(None) => std::thread::sleep(REAP_STEP),
                 // Exited, or already reaped by someone else.
                 _ => return,
             }
@@ -2117,13 +2123,22 @@ impl Parked {
     /// not is left to finish by itself: what it holds is its own to drop.
     fn join_within(&mut self, wait: Duration) -> Option<Attachment> {
         let thread = self.thread.take()?;
-        let deadline = Instant::now() + wait;
+        let started = Instant::now();
+        let deadline = started + wait;
         while !thread.is_finished() {
             if Instant::now() >= deadline {
                 tracing::debug!(id = %self.session_id, "a parked client's thread is still busy");
                 return None;
             }
-            std::thread::sleep(Duration::from_millis(1));
+            // A thread in its `poll` hands the client back in microseconds,
+            // and the first look comes too soon for it: a millisecond's sleep
+            // is most of a switch to a kept client. So it is only slept for
+            // once the thread has had half of one.
+            if started.elapsed() < UNPARK_SPIN {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
         // A panic on the thread dropped the client on its way out, and a
         // dropped client is a retired one.
@@ -2131,13 +2146,17 @@ impl Parked {
     }
 }
 
+/// How long a parked client's thread is waited for without sleeping: see
+/// [`Parked::join_within`].
+const UNPARK_SPIN: Duration = Duration::from_micros(500);
+
 /// How long a switch waits for a parked client's thread to hand it back.
 /// Instant for a thread in its `poll`; this bounds only one caught retiring a
 /// client that was on its way out, which the switch then treats as gone.
 const UNPARK_WAIT: Duration = Duration::from_millis(50);
 
 /// How long letting go of a parked client waits for its thread to have
-/// retired it. A client that goes quietly takes about 10 ms.
+/// retired it. A client that goes quietly takes a few milliseconds.
 const RETIRE_WAIT: Duration = Duration::from_millis(100);
 
 /// Dropping one retires the client — hung up and reaped on its own thread, as

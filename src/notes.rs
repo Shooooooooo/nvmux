@@ -600,9 +600,10 @@ pub fn later(sock: PathBuf, what: fn(&Path)) {
     }
 }
 
-/// [`seen`], waited for, but no longer than `within`: for the way out of
-/// nvmux, which would otherwise end the thread before it had said anything.
-pub fn seen_within(sock: PathBuf, within: Duration) {
+/// [`seen`], begun on a thread of its own for the way out of nvmux, which
+/// waits for it with [`Seeing::wait_until`] once it has done whatever else it
+/// has to: the two then take as long as the longer of them, not both.
+pub fn seen_begin(sock: PathBuf) -> Seeing {
     let (done, finished) = mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("nvmux-notes-seen".into())
@@ -610,8 +611,20 @@ pub fn seen_within(sock: PathBuf, within: Duration) {
             seen(&sock);
             let _ = done.send(());
         });
-    if spawned.is_ok() {
-        let _ = finished.recv_timeout(within);
+    Seeing(spawned.is_ok().then_some(finished))
+}
+
+/// [`seen`] under way on its thread: see [`seen_begin`]. `None` where no
+/// thread could be had, which leaves nothing to wait for.
+pub struct Seeing(Option<mpsc::Receiver<()>>);
+
+impl Seeing {
+    /// Wait for it to have been said, but not past `deadline`: the way out of
+    /// nvmux would otherwise end the thread before it had said anything.
+    pub fn wait_until(self, deadline: Instant) {
+        if let Some(said) = self.0 {
+            let _ = said.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
     }
 }
 
@@ -867,6 +880,36 @@ mod tests {
                 .map(|(k, v)| (Value::from(k), v))
                 .collect(),
         )
+    }
+
+    /// On the way out of nvmux, what is said is waited for until its deadline
+    /// and no longer: a session that takes the connection and never answers
+    /// holds the way out for the deadline alone, and one that is not there at
+    /// all holds it for nothing.
+    #[test]
+    fn the_way_out_waits_for_seen_until_its_deadline_and_no_longer() {
+        let path = crate::test_support::scratch_sock("notes-seen-deadline");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let started = Instant::now();
+        let seeing = seen_begin(path.clone());
+        // Accepted, and never answered.
+        let (_server, _) = listener.accept().expect("accept");
+        seeing.wait_until(started + Duration::from_millis(150));
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(150) && took < Duration::from_secs(1),
+            "waited {took:?} for a deadline 150 ms out"
+        );
+        let _ = std::fs::remove_file(&path);
+
+        let gone = crate::test_support::scratch_sock("notes-seen-gone");
+        let started = Instant::now();
+        seen_begin(gone).wait_until(started + Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited {:?} for a session that is not there",
+            started.elapsed()
+        );
     }
 
     /// A notification or a failure waits for you, so it is the note even
