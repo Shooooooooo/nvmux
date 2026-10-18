@@ -152,7 +152,7 @@ impl Effects {
 pub struct Before {
     /// Where every grid on show was.
     origins: HashMap<u64, (i64, i64)>,
-    /// The lines of each rectangle about to scroll, with how far.
+    /// The rows each rectangle about to scroll is to lose, with how far.
     scrolls: Vec<Snap>,
     /// The split windows and what they showed, where the batch may move
     /// them.
@@ -170,8 +170,23 @@ pub struct Before {
 struct Snap {
     grid: u64,
     rect: (usize, usize, usize, usize),
-    lines: Vec<Vec<Cell>>,
+    /// The rows the scroll takes out of view, as they were: see
+    /// [`scroll::leaving`].
+    gone: Vec<Vec<Cell>>,
     delta: i64,
+}
+
+impl Snap {
+    /// Of a scroll of `delta` over `rect` in `g`, about to be applied.
+    fn take(grid: u64, g: &Grid, rect: (usize, usize, usize, usize), delta: i64) -> Self {
+        let (top, bot) = scroll::leaving(rect, delta);
+        Self {
+            grid,
+            rect,
+            gone: g.lines(top, bot, rect.2, rect.3),
+            delta,
+        }
+    }
 }
 
 /// A grid as [`Animator::insets`] last saw it: where the editor put it, how
@@ -214,6 +229,9 @@ pub struct Animator {
     /// The mode it was last in: a change of mode starts the blink's wait
     /// again.
     mode: usize,
+    /// Whether the client scrolls ahead of Neovim over the link as it is:
+    /// see [`Animator::set_predicting`].
+    predicting: bool,
 }
 
 impl Animator {
@@ -234,6 +252,7 @@ impl Animator {
             last: None,
             cell: None,
             mode: 0,
+            predicting: false,
         }
     }
 
@@ -241,6 +260,16 @@ impl Animator {
     /// end, and nothing turned off starts again.
     pub fn set_effects(&mut self, effects: Effects) {
         self.effects = effects;
+    }
+
+    /// Whether the client scrolls ahead of Neovim over the link as it is
+    /// (see [`crate::client::predict::Predictor::active`]). The windows
+    /// scrolling keep the lines they pass further than a slide shows them
+    /// only while it does, for a scroll ahead to come back over (see
+    /// [`Scroll::scrolled`]): many times a window's height, which on a large
+    /// terminal is tens of megabytes for as long as a key is held.
+    pub fn set_predicting(&mut self, on: bool) {
+        self.predicting = on;
     }
 
     /// Stop everything, and forget where the cursor was: the next batch
@@ -333,12 +362,7 @@ impl Animator {
                         continue;
                     }
                     if let Some(rect) = inner(g, model.margins(grid)) {
-                        scrolls.push(Snap {
-                            grid,
-                            rect,
-                            lines: g.lines(rect.0, rect.1, rect.2, rect.3),
-                            delta,
-                        });
+                        scrolls.push(Snap::take(grid, g, rect, delta));
                     }
                 }
             } else if let Some(snap) =
@@ -498,7 +522,6 @@ impl Animator {
         // Scrolls.
         if self.effects.scroll.is_some() || !self.scrolls.is_empty() {
             let far = self.effects.scroll.map_or(0, |(_, far)| far);
-            let mut started = Vec::new();
             for snap in before.scrolls {
                 let Some(g) = model.grids.get(&snap.grid) else {
                     continue;
@@ -518,32 +541,23 @@ impl Animator {
                     self.scrolls.remove(&snap.grid);
                     continue;
                 }
-                let (top, bot, left, right) = snap.rect;
-                let lines = g.lines(top, bot, left, right);
                 match self.scrolls.get_mut(&snap.grid) {
-                    Some(s) if s.rect() == snap.rect => s.scrolled(lines, snap.delta, far),
+                    Some(s) if s.rect() == snap.rect => {
+                        s.scrolled(snap.gone, snap.delta, far, self.predicting);
+                    }
                     _ if self.effects.scroll.is_some() => {
                         self.scrolls.insert(
                             snap.grid,
-                            Scroll::new(snap.rect, snap.lines, lines, snap.delta, far),
+                            Scroll::new(snap.rect, snap.gone, snap.delta, far),
                         );
                     }
                     _ => {
                         self.scrolls.remove(&snap.grid);
                     }
                 }
-                started.push(snap.grid);
             }
-            // The rest are redrawn under their scroll as they are.
-            for (grid, s) in &mut self.scrolls {
-                if started.contains(grid) {
-                    continue;
-                }
-                if let Some(g) = model.grids.get(grid) {
-                    let (top, bot, left, right) = s.rect();
-                    s.refresh(g.lines(top, bot, left, right));
-                }
-            }
+            // The rest are redrawn under their scroll as they are: what is in
+            // view is the grid's own, and read from it.
             if multigrid {
                 self.scrolls
                     .retain(|g, _| model.layout.get(g).is_some_and(|p| !p.hidden));
@@ -594,7 +608,7 @@ impl Animator {
         (fill, land): (&mut Fill, &mut Lander),
         now: Instant,
     ) -> bool {
-        let (Some(g), Some(rect)) = (model.grids.get(&grid), text_rect(model, grid)) else {
+        let Some(rect) = text_rect(model, grid) else {
             return false;
         };
         if !self.animating(model, now) {
@@ -604,9 +618,7 @@ impl Animator {
         let s = match self.scrolls.get_mut(&grid) {
             Some(s) if s.rect() == rect => s,
             _ => {
-                let (top, bot, left, right) = rect;
-                let s = Scroll::still(rect, g.lines(top, bot, left, right), animate);
-                self.scrolls.insert(grid, s);
+                self.scrolls.insert(grid, Scroll::still(rect, animate));
                 self.scrolls.get_mut(&grid).expect("just put there")
             }
         };
@@ -691,9 +703,9 @@ impl Animator {
     /// The rows window grid `grid` shows scrolled up or down ahead of
     /// Neovim, as they are once they stop sliding, and how many rows ahead
     /// of Neovim's view they are: `None` where it shows none ahead.
-    pub fn rows_ahead(&self, grid: u64) -> Option<(Vec<Vec<Cell>>, i64)> {
+    pub fn rows_ahead(&self, model: &Model, grid: u64) -> Option<(Vec<Vec<Cell>>, i64)> {
         let s = self.scrolls.get(&grid).filter(|s| s.shown_ahead() != 0)?;
-        Some((s.rows_ahead()?, s.shown_ahead()))
+        Some((s.rows_ahead(model.grids.get(&grid)?)?, s.shown_ahead()))
     }
 
     /// Window grid `grid` scrolled up or down ahead of Neovim stops sliding:
@@ -1057,13 +1069,7 @@ fn linegrid_scroll(model: &Model, batch: &[Event]) -> Option<Snap> {
         return None;
     }
     let (rect, _) = rects.into_iter().find(|(_, sum)| *sum == delta)?;
-    let g = model.grids.get(&1)?;
-    Some(Snap {
-        grid: 1,
-        rect,
-        lines: g.lines(rect.0, rect.1, rect.2, rect.3),
-        delta,
-    })
+    Some(Snap::take(1, model.grids.get(&1)?, rect, delta))
 }
 
 /// The cursor's rectangle on the screen at `(row, col)`, in its mode's

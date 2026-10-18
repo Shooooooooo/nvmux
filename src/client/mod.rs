@@ -2183,6 +2183,8 @@ impl App {
             self.done = true;
         }
         self.anim
+            .set_predicting(self.predict.as_ref().is_some_and(Predictor::active));
+        self.anim
             .after(before, &self.model, &changes, multigrid, animate, now);
         // After the animations have taken what they keep of the batch: what
         // was kept from before it is theirs now, or gone.
@@ -2881,7 +2883,7 @@ impl App {
         let shape = p.shape(win)?;
         let rect = anim::text_rect(&self.model, grid)?;
         let (top, bot, left, right) = rect;
-        let (rows, topline) = match self.anim.rows_ahead(grid) {
+        let (rows, topline) = match self.anim.rows_ahead(&self.model, grid) {
             Some((rows, ahead)) => (rows, view.topline + ahead),
             None => (
                 self.model.grids.get(&grid)?.lines(top, bot, left, right),
