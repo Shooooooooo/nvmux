@@ -6,8 +6,9 @@
 //! mechanism here.
 //!
 //! One `ControlMaster` per host, brought up by [`master_args`]; each session
-//! then adds a unix-socket forward onto that existing master with `-O forward`,
-//! removed with `-O cancel`, tested with `-O check`.
+//! then adds a unix-socket forward onto that existing master with `-O forward`
+//! — the sessions wanted at once all in one — removed with `-O cancel`, tested
+//! with `-O check`.
 //!
 //! `ControlPath` is computed by nvmux rather than left to ssh's `%C`/`%h%p%r`
 //! tokens, which expand to unpredictable lengths — see [`crate::paths`]. It is
@@ -45,13 +46,36 @@ fn parse_ssh_version(banner: &str) -> Option<(u64, u64)> {
     Some((major, minor))
 }
 
-/// Refuse early if the local `ssh` is missing or too old, so the error names
-/// the real problem rather than surfacing later as a failed forward.
-pub fn check_local() -> Result<(), SshError> {
-    let out = Command::new("ssh")
-        .arg("-V")
-        .output()
-        .map_err(|_| SshError::NotFound)?;
+/// Ask the local `ssh` its version, to refuse early where it is missing or
+/// too old, so the error names the real problem rather than surfacing later
+/// as a failed forward. Asked now and judged by [`LocalCheck::verdict`]
+/// later: what is done meanwhile need not wait for it.
+pub fn check_local() -> LocalCheck {
+    LocalCheck(
+        Command::new("ssh")
+            .arg("-V")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn(),
+    )
+}
+
+/// An `ssh -V` under way: see [`check_local`].
+pub struct LocalCheck(std::io::Result<std::process::Child>);
+
+impl LocalCheck {
+    /// Wait for the answer, and judge it.
+    pub fn verdict(self) -> Result<(), SshError> {
+        let out = self
+            .0
+            .and_then(std::process::Child::wait_with_output)
+            .map_err(|_| SshError::NotFound)?;
+        judge_version(&out)
+    }
+}
+
+fn judge_version(out: &std::process::Output) -> Result<(), SshError> {
     // `ssh -V` writes to stderr.
     let banner = if out.stderr.is_empty() {
         String::from_utf8_lossy(&out.stdout).into_owned()
@@ -187,6 +211,20 @@ fn forward_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<Stri
 /// Remove a forward.
 fn cancel_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<String> {
     forward_op("cancel", host, ctl, local, remote)
+}
+
+/// Add every one of these forwards to the existing master, in one command.
+fn forward_all_args(host: &str, ctl: &Path, pairs: &[(PathBuf, PathBuf)]) -> Vec<String> {
+    let mut args = common(ctl);
+    args.extend(["-O".into(), "forward".into()]);
+    for (local, remote) in pairs {
+        args.extend([
+            "-L".into(),
+            format!("{}:{}", local.display(), remote.display()),
+        ]);
+    }
+    args.push(host.to_string());
+    args
 }
 
 /// Arguments for starting the host's shell — the one `sh` that
@@ -353,7 +391,7 @@ impl Ssh {
             .unwrap_or(false)
     }
 
-    /// Bring up a master connection, or confirm the existing one. Reusing a live
+    /// Bring up a master connection, or find the existing one. Reusing a live
     /// master is what makes per-session forwards cheap.
     pub fn ensure_master(&self) -> Result<(), SshError> {
         self.ensure_master_within(None)
@@ -383,10 +421,12 @@ impl Ssh {
     /// Which leaves every master's linked name behind when it exits: a socket
     /// nothing listens on, cleared by [`Self::clear_control_path`] before the
     /// next master is linked there.
+    ///
+    /// A master already there is found by [`Self::clear_control_path`], which
+    /// connects to the `ControlPath` before it clears anything: a socket that
+    /// accepts is a live master. Asking `ssh -O check` first would be a fork to
+    /// learn the same thing.
     pub fn ensure_master_within(&self, connect_timeout: Option<u64>) -> Result<(), SshError> {
-        if self.is_master_alive() {
-            return Ok(());
-        }
         if self.clear_control_path()? == Cleared::Taken {
             return Ok(());
         }
@@ -410,8 +450,8 @@ impl Ssh {
         self.publish(&own)
     }
 
-    /// Make way on the `ControlPath` for a new master — or find that one has
-    /// arrived there since `ssh -O check` looked.
+    /// Make way on the `ControlPath` for a new master — or find one there
+    /// already, to be used rather than joined by a second.
     ///
     /// What a dead master leaves there, cleanly or killed outright, is a
     /// socket nothing listens on, and a name taken is a name no new master can
@@ -505,16 +545,26 @@ impl Ssh {
 
     /// Point a local socket at a remote one, idempotently.
     ///
-    /// Cancelling first is what makes that hold. If the master already believes
-    /// it is forwarding this pair, a second `-O forward` is a **silent no-op**:
-    /// it exits 0 and does not recreate the socket file. A local socket that
-    /// went missing while the forward was still registered would otherwise leave
-    /// a forward that reports success and cannot be connected to.
+    /// Asked for outright first, which is one `ssh` whether the forward is new
+    /// or one the master holds already — a master outlives the nvmux that
+    /// brought it up by `ControlPersist`, forwards and all. But if the master
+    /// already believes it is forwarding this pair, `-O forward` is a **silent
+    /// no-op**: it exits 0 and does not recreate the socket file. So the
+    /// answer is only taken where the socket is there to show for it;
+    /// otherwise the forward is cancelled and made again, which is what makes
+    /// this idempotent. A local socket that went missing while the forward was
+    /// still registered would otherwise leave a forward that reports success
+    /// and cannot be connected to.
     ///
     /// No master to forward on is [`SshError::NoMaster`] rather than a failed
     /// forward, because it is the one failure a caller can do something about:
     /// bring a master back, and ask again.
     pub fn forward(&self, local: &Path, remote: &Path) -> Result<(), SshError> {
+        match self.forward_once(local, remote) {
+            Ok(()) if local.exists() => return Ok(()),
+            Err(SshError::NoMaster(host)) => return Err(SshError::NoMaster(host)),
+            _ => {}
+        }
         // Cancelling a forward that does not exist fails; that is the common
         // case, not a problem.
         let _ = self.run(&cancel_args(&self.host, &self.control_path, local, remote));
@@ -527,7 +577,11 @@ impl Ssh {
                 tracing::warn!(path = %local.display(), error = %e, "could not clear local socket");
             }
         }
+        self.forward_once(local, remote)
+    }
 
+    /// One `-O forward`, its failure classified: see [`Self::forward`].
+    fn forward_once(&self, local: &Path, remote: &Path) -> Result<(), SshError> {
         let out = self
             .run(&forward_args(&self.host, &self.control_path, local, remote))
             .map_err(|e| spawn_error(e, &self.host))?;
@@ -544,6 +598,33 @@ impl Ssh {
             });
         }
         Ok(())
+    }
+
+    /// Every pair forwarded by one `ssh -O forward`, rather than one each, and
+    /// whether ssh said they all were. Each local socket is still the caller's
+    /// to look for: a pair the master was already forwarding is the same
+    /// silent no-op as in [`Self::forward`]. And a pair the master refuses
+    /// fails the command without stopping it — every other pair is made, and
+    /// nothing says which was refused. Verified.
+    pub fn forward_all(&self, pairs: &[(PathBuf, PathBuf)]) -> bool {
+        if pairs.is_empty() {
+            return true;
+        }
+        match self.run(&forward_all_args(&self.host, &self.control_path, pairs)) {
+            Ok(out) if out.status.success() => true,
+            Ok(out) => {
+                tracing::debug!(
+                    host = %self.host,
+                    stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                    "could not forward the sessions together"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::debug!(host = %self.host, error = %e, "could not forward the sessions together");
+                false
+            }
+        }
     }
 
     /// Remove a forward and the local socket it left behind.
@@ -806,6 +887,54 @@ mod tests {
         assert!(err.to_string().contains("not a socket"), "{err}");
         assert_eq!(std::fs::read(&ctl).expect("still there"), b"not a socket");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What the master is asked for in one command is what it would have been
+    /// asked for in one apiece: each pair its own `-L`, as a single forward
+    /// spells it.
+    #[test]
+    fn forwards_wanted_together_are_one_command_of_single_forwards() {
+        let pairs = [
+            (PathBuf::from("/tmp/a.sock"), PathBuf::from("/r/a.sock")),
+            (PathBuf::from("/tmp/b.sock"), PathBuf::from("/r/b.sock")),
+        ];
+        assert_eq!(
+            joined(&forward_all_args("h", Path::new(CTL), &pairs)),
+            format!(
+                "-o ControlPath={CTL} -O forward \
+                 -L /tmp/a.sock:/r/a.sock -L /tmp/b.sock:/r/b.sock h"
+            )
+        );
+        assert_eq!(
+            forward_all_args("h", Path::new(CTL), &pairs[..1]),
+            forward_args("h", Path::new(CTL), &pairs[0].0, &pairs[0].1)
+        );
+    }
+
+    /// `ssh -V` is judged by its banner, wherever it printed it, and only a
+    /// banner it can read refuses anything. No `ssh` at all is its own error.
+    #[test]
+    fn the_local_ssh_is_judged_by_what_it_says_its_version_is() {
+        use std::os::unix::process::ExitStatusExt;
+        let said = |stdout: &str, stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        };
+        let current = said("", "OpenSSH_9.6p1 Ubuntu-3ubuntu13.19, OpenSSL 3.0.13\n");
+        assert!(judge_version(&current).is_ok());
+        assert!(matches!(
+            judge_version(&said("", "OpenSSH_6.6p1, OpenSSL 1.0.1f 6 Jan 2014\n")),
+            Err(SshError::TooOld { .. })
+        ));
+        assert!(matches!(
+            judge_version(&said("OpenSSH_5.3p1\n", "")),
+            Err(SshError::TooOld { .. })
+        ));
+        assert!(judge_version(&said("", "Dropbear v2022.83\n")).is_ok());
+
+        let missing = LocalCheck(Err(std::io::Error::from(ErrorKind::NotFound)));
+        assert!(matches!(missing.verdict(), Err(SshError::NotFound)));
     }
 
     #[test]

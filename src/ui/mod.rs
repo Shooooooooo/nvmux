@@ -548,14 +548,18 @@ fn run_loop(
         take_listing(&mut app, &mut behind);
 
         // Every session the listing has that the reader has not been given —
-        // all of them at first, and whatever a later listing adds — handed
-        // over a few milliseconds' worth at a time; and whatever they said
-        // since the last pass, taken up before it is drawn.
-        for s in app.sessions() {
-            if handed.insert(s.id.clone()) {
-                unread.push_back(s.clone());
-            }
-        }
+        // all of them at first, and whatever a later listing adds — made
+        // reachable together, then handed over a few milliseconds' worth at a
+        // time; and whatever they said since the last pass, taken up before
+        // it is drawn.
+        let fresh: Vec<Session> = app
+            .sessions()
+            .iter()
+            .filter(|s| handed.insert(s.id.clone()))
+            .cloned()
+            .collect();
+        transport.reach_all(&fresh);
+        unread.extend(fresh);
         hand_over(transport, &poller, notifier, &mut unread);
         if let Some(notes) = poller.take() {
             app.set_notes(notes);
