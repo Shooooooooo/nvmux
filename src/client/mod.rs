@@ -2559,15 +2559,12 @@ impl App {
         let cursor_row = (self.model.cursor.grid == grid)
             .then(|| self.model.cursor.row.checked_sub(top))
             .flatten();
-        let eob = self.model.groups.get("EndOfBuffer").copied().unwrap_or(0);
         Some(predict::Look::of(
             &rows,
             view.lines_shown(bot - top),
             shape.textoff,
             cursor_row,
-            eob,
-            self.model.groups.get("NonText").copied(),
-            self.model.groups.get("SpecialKey").copied(),
+            |name| self.model.groups.get(name).copied(),
         ))
     }
 

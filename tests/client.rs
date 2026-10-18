@@ -1938,26 +1938,22 @@ fn predicted_rows_wear_the_colours_neovim_gives_them() {
 /// Rows a scroll uncovers ahead of Neovim show what Neovim shows as
 /// something it is not — a control character as `^X`, a tab as `^I` under
 /// `'list'` with no `tab:` for it, an unprintable character as `<xx>` — in
-/// the colours Neovim does, `SpecialKey`'s: when Neovim's own rows land, not
-/// a cell of the window changes, text or colour.
+/// the colours Neovim does, `SpecialKey`'s, and a tab `'list'` shows with
+/// its `tab:` in `Whitespace`'s: when Neovim's own rows land, not a cell of
+/// the window changes, text or colour.
 #[test]
 fn predicted_rows_show_what_neovim_shows_as_something_else_in_its_colours() {
     require_nvim!();
     let scratch = Scratch::new("client-special");
-    let (_rpc, mut term, _) = drawn_slowly(
+    let (mut rpc, mut term, _) = drawn_slowly(
         &scratch,
         "client-special",
         "call setline(1, map(range(1, 200), \
          '\"line \" . v:val . \" \\x01 \\x7f \\t \\u0080 end\"')) | \
          set termguicolors list listchars=nbsp:+",
     );
-    for (name, keys) in [
-        ("<C-f>", &b"\x06"[..]),
-        ("<C-b>", b"\x02"),
-        ("the wheel", b"\x1b[<65;10;5M"),
-        ("3<C-e>", b"3\x05"),
-    ] {
-        let before = window(&term);
+    let step = |term: &mut Terminal, name: &str, keys: &[u8]| {
+        let before = window(term);
         term.type_bytes(keys);
         assert!(
             term.pump(SLOW, |t| window(t) != before),
@@ -1965,9 +1961,8 @@ fn predicted_rows_show_what_neovim_shows_as_something_else_in_its_colours() {
             term.text()
         );
         term.pump_until(Duration::from_millis(30), |_| false);
-        let predicted = (window(&term), colours(&term));
-        // Not one colour: `^A`, `^?`, `^I` and `<80>` in another, on every
-        // row.
+        let predicted = (window(term), colours(term));
+        // Not one colour: `^A`, `^?` and `<80>` in another, on every row.
         let two = predicted
             .1
             .iter()
@@ -1979,11 +1974,29 @@ fn predicted_rows_show_what_neovim_shows_as_something_else_in_its_colours() {
             .count();
         assert_eq!(two, 22, "{name}: {two} rows of 22 in more than one colour");
         term.pump_until(4 * SLOW, |_| false);
-        let landed = (window(&term), colours(&term));
+        let landed = (window(term), colours(term));
         assert_eq!(predicted.0, landed.0, "{name}: the text moved");
         for (r, (p, l)) in predicted.1.iter().zip(&landed.1).enumerate() {
             assert_eq!(p, l, "{name}: row {r} changed colour when Neovim's landed");
         }
+    };
+    for (name, keys) in [
+        ("<C-f>", &b"\x06"[..]),
+        ("<C-b>", b"\x02"),
+        ("the wheel", b"\x1b[<65;10;5M"),
+        ("3<C-e>", b"3\x05"),
+    ] {
+        step(&mut term, name, keys);
+    }
+    // The tab shown with 'listchars' now, as `>---`.
+    rpc.command("set listchars=tab:>-,nbsp:+")
+        .expect("listchars");
+    term.pump_until(4 * SLOW, |_| false);
+    for (name, keys) in [
+        ("<C-f> with tab:>-", &b"\x06"[..]),
+        ("<C-b> with tab:>-", b"\x02"),
+    ] {
+        step(&mut term, name, keys);
     }
 }
 
