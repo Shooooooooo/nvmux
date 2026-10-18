@@ -1840,6 +1840,16 @@ impl App {
 
     /// Take a whole msgpack-RPC frame from the server.
     pub fn message(&mut self, frame: &[u8], now: Instant) {
+        // Nearly every frame: read from its bytes (see `redraw::decode_bytes`).
+        if let Some(params) = redraw::redraw_params(frame) {
+            // Between a detach and its answer, what is drawn is the old
+            // attach's, and the next one starts from nothing.
+            if !matches!(self.attach, Attach::Leaving { .. }) {
+                redraw::decode_bytes(params, &mut self.batch);
+                self.take_flushes(now);
+            }
+            return;
+        }
         let mut rd = frame;
         let Ok(v) = rmpv::decode::read_value_ref(&mut rd) else {
             tracing::debug!("client: a frame that would not decode");
@@ -1850,14 +1860,8 @@ impl App {
             Some(wire::NOTIFICATION) => {
                 let method = msg.get(1).and_then(redraw::as_str);
                 let params = msg.get(2);
+                // A `redraw` never gets here: it was read from its bytes above.
                 match (method, params) {
-                    // Between a detach and its answer, what is drawn is the
-                    // old attach's, and the next one starts from nothing.
-                    (Some("redraw"), Some(_)) if matches!(self.attach, Attach::Leaving { .. }) => {}
-                    (Some("redraw"), Some(params)) => {
-                        redraw::decode(params, &mut self.batch);
-                        self.take_flushes(now);
-                    }
                     (Some("nvim_error_event"), Some(params)) => {
                         tracing::warn!(error = %params.to_owned(), "client: the server reported an error");
                     }
@@ -3251,7 +3255,7 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
             }
             loop {
                 match inbox.take_frame() {
-                    Ok(Some(frame)) => app.message(&frame, now),
+                    Ok(Some(frame)) => app.message(frame, now),
                     Ok(None) => break,
                     Err(e) => {
                         break 'session Err(
@@ -3442,7 +3446,12 @@ impl Line {
                 .take_frame()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
             {
-                let mut rd = &frame[..];
+                // What else comes is passed over unread: a whole screen's
+                // redraw, for a refresh.
+                if redraw::response_id(frame) != Some(u64::from(id)) {
+                    continue;
+                }
+                let mut rd = frame;
                 let Ok(v) = rmpv::decode::read_value_ref(&mut rd) else {
                     continue;
                 };
