@@ -1015,6 +1015,10 @@ struct Trace {
     carried: Arc<std::sync::Mutex<Vec<Carried>>>,
 }
 
+/// A line number from Neovim's side of a slow link, with when the link read
+/// it and wrote it on (see [`Trace::views_and_lines`]).
+type Said = (Instant, Instant, u32);
+
 /// One read a slow link passed on.
 struct Carried {
     /// Which of the link's connections, counted from nought.
@@ -1055,6 +1059,38 @@ impl Trace {
             bytes.drain(..used);
         }
         out
+    }
+
+    /// What came back of a run of pages, each with when the link read it and
+    /// wrote it on: the top line of each view Neovim drew, and how far down
+    /// each push of the agent's lines went.
+    fn views_and_lines(&self) -> (Vec<Said>, Vec<Said>) {
+        let (mut views, mut lines) = (Vec::new(), Vec::new());
+        for (read, written, v) in self.messages(true) {
+            match notification(&v) {
+                Some(("redraw", events)) => {
+                    for event in events.iter().filter_map(Value::as_array) {
+                        if event.first().and_then(Value::as_str) != Some("win_viewport") {
+                            continue;
+                        }
+                        for args in event[1..].iter().filter_map(Value::as_array) {
+                            if let Some(top) = args.get(2).and_then(Value::as_u64) {
+                                views.push((read, written, top as u32 + 1));
+                            }
+                        }
+                    }
+                }
+                Some(("nvmux_client", [kind, _, _, _, first, sent, ..]))
+                    if kind.as_str() == Some("lines") =>
+                {
+                    let end =
+                        first.as_u64().unwrap_or(0) as usize + sent.as_array().map_or(0, Vec::len);
+                    lines.push((read, written, end as u32));
+                }
+                _ => {}
+            }
+        }
+        (views, lines)
     }
 
     /// The most the link was late passing anything on, each way: to the
@@ -1556,6 +1592,24 @@ impl Paging {
             .collect()
     }
 
+    /// When Neovim's own frame first showing each page reached the client,
+    /// as the link wrote it on: what a page waiting for Neovim would have
+    /// waited for. The last may be on its way yet, and is waited for as long
+    /// as it takes the link to come back.
+    fn frames(&self) -> Vec<Option<Instant>> {
+        let deadline = Instant::now() + 4 * self.trace.delay;
+        loop {
+            let (views, _) = self.trace.views_and_lines();
+            let frames: Vec<Option<Instant>> = (1..=self.typed.len())
+                .map(|k| views.iter().find(|v| v.2 >= page(k)).map(|v| v.1))
+                .collect();
+            if frames.iter().all(Option::is_some) || Instant::now() >= deadline {
+                return frames;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Where the time went, page by page about the `around`th, for a test
     /// to say when a page is late: when it was typed; when its key left the
     /// client and reached Neovim; when Neovim's view got to it and reached
@@ -1584,31 +1638,7 @@ impl Paging {
                 keys.extend(std::iter::repeat_n((read, written, 0), n));
             }
         }
-        let (mut views, mut lines) = (Vec::new(), Vec::new());
-        for (read, written, v) in self.trace.messages(true) {
-            match notification(&v) {
-                Some(("redraw", events)) => {
-                    for event in events.iter().filter_map(Value::as_array) {
-                        if event.first().and_then(Value::as_str) != Some("win_viewport") {
-                            continue;
-                        }
-                        for args in event[1..].iter().filter_map(Value::as_array) {
-                            if let Some(top) = args.get(2).and_then(Value::as_u64) {
-                                views.push((read, written, top as u32 + 1));
-                            }
-                        }
-                    }
-                }
-                Some(("nvmux_client", [kind, _, _, _, first, sent, ..]))
-                    if kind.as_str() == Some("lines") =>
-                {
-                    let end =
-                        first.as_u64().unwrap_or(0) as usize + sent.as_array().map_or(0, Vec::len);
-                    lines.push((read, written, end as u32));
-                }
-                _ => {}
-            }
-        }
+        let (views, lines) = self.trace.views_and_lines();
         let n = self.typed.len();
         let shown = if n <= 40 {
             1..=n
@@ -1678,10 +1708,15 @@ fn pages_typed_further_ahead_than_lines_go_wait_only_for_them() {
     // windows of lines it keeps either way (twenty-four, some twenty-seven
     // pages); thirty-two are as far ahead as a view may go.
     let run = pages(&mut rpc, &mut term, &link, Duration::from_millis(10), 32);
-    for (k, late) in run.late().iter().enumerate() {
+    // Its own frame takes the key there and the frame back, which on a busy
+    // machine is longer than the link's delay says: each page is drawn
+    // before the frame that shows it has come.
+    let frames = run.frames();
+    for (k, (late, frame)) in run.late().into_iter().zip(frames).enumerate() {
+        let own = frame.map(|f| f - run.typed[k]);
         assert!(
-            late.is_some_and(|l| l < 2 * SLOW),
-            "page {} waited for Neovim: {late:?}\n{}",
+            late.zip(own).is_some_and(|(late, own)| late < own),
+            "page {} waited for Neovim: {late:?}, its own frame taking {own:?}\n{}",
             k + 1,
             run.timeline(k + 1)
         );
