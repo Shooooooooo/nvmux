@@ -401,6 +401,11 @@ pub struct Attachment {
     /// to the background with it (see `panel`): the relay's own fade out has
     /// nothing left to dissolve.
     dark: bool,
+    /// Who is waiting for the session to have painted in front, told on the
+    /// first lull after the next relay has relayed anything — and let go,
+    /// untold, by a relay that ends before then (see
+    /// [`Attachment::tell_when_painted`]).
+    painted: Option<mpsc::Sender<()>>,
 }
 
 /// How many clients have had their exit sequences relayed to the terminal:
@@ -1965,6 +1970,20 @@ impl Attachment {
         self.probe.take()
     }
 
+    /// Be told when the session has painted on this client's next relay: on
+    /// the first lull after the relay has relayed anything, the moment
+    /// `timing: session painted` is logged. A relay that ends before then
+    /// lets the receiver go, untold, rather than leave it for a later one.
+    ///
+    /// For what must not compete with that screen for the link it comes
+    /// over: the clients a dropped link took, started again behind it (see
+    /// `[client] revive`).
+    pub fn tell_when_painted(&mut self) -> mpsc::Receiver<()> {
+        let (tx, rx) = mpsc::channel();
+        self.painted = Some(tx);
+        rx
+    }
+
     /// The socket the client was attached through — locally the session's
     /// own, over SSH the local end of the forward.
     pub fn sock(&self) -> &Path {
@@ -2952,6 +2971,7 @@ fn spawn_client_with(
         opening: Vec::new(),
         landed_since: None,
         dark: false,
+        painted: None,
     })
 }
 
@@ -3349,6 +3369,9 @@ pub fn relay(
     // never left has nothing to announce. The desk is this relay's alone.
     attachment.announce = None;
     attachment.desk = None;
+    // Told by this relay or by none: a paint waited for that did not come is
+    // not one the next relay of this client makes.
+    attachment.painted = None;
     // From here on nothing the client writes reaches the terminal until it is
     // relayed again: what the ledger hears next is news to the terminal.
     if let Some(ledger) = attachment.ledger.as_mut() {
@@ -3638,6 +3661,9 @@ fn pump(
                 bytes = painted_bytes,
                 "timing: session painted"
             );
+            if let Some(waiting) = attachment.painted.take() {
+                let _ = waiting.send(());
+            }
         }
 
         if n > 0 && ready(&fds[2]) {

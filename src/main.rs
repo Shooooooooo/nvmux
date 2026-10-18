@@ -1,5 +1,8 @@
 //! Binary entry point.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+
 use anyhow::{Context, Result};
 use clap::Parser;
 
@@ -199,6 +202,12 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
     // to report as it happens (see `nvmux::tell`). Handed each session's
     // socket as the picker finds it, and each attached one's here.
     let notifier = nvmux::tell::Notifier::start();
+    // The clients a dropped link took, started again behind the session in
+    // front (`[client] revive`; see `Revival`), and whether the next attach is
+    // the first since a dropped link: the link came back under the session in
+    // front, or a kept client was found to have left with it.
+    let mut revival: Option<Revival> = None;
+    let mut after_a_drop = false;
 
     loop {
         // `<prefix> c` moves this to the session it just created. A client held
@@ -278,6 +287,14 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
             // Whether the client is one kept for this session, resumed rather
             // than started.
             let mut warm = false;
+            // The clients started again since last asked, where the attach
+            // below looks first.
+            if revival
+                .as_ref()
+                .is_some_and(|r| !r.collect(&mut pool, None))
+            {
+                revival = None;
+            }
             let opened = match attached.take() {
                 Some(a) if a.session_id == current.id => Ok(Some(a)),
                 // Retiring the old client leaves its server running: killing a
@@ -299,6 +316,7 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                         started,
                         &mut warm,
                         &mut hand_off,
+                        &mut after_a_drop,
                     )?;
                     // Explicitly, rather than by falling out of the arm: this is
                     // the wait the hangup deferred, and leaving it to a binding's
@@ -315,6 +333,7 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                     started,
                     &mut warm,
                     &mut hand_off,
+                    &mut after_a_drop,
                 )?,
             };
 
@@ -380,6 +399,17 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
             from_picker = false;
             shown = Some(current.id.clone());
 
+            // The first attach since a dropped link: the clients it took are
+            // started again behind this one, once it has painted, if `[client]
+            // revive` says so. Those of a revival still going are collected
+            // first, so that the ones the link took again are among them.
+            if std::mem::take(&mut after_a_drop) && remote && config::get().client.revive {
+                if let Some(earlier) = revival.take() {
+                    earlier.collect(&mut pool, Some(&current.id));
+                }
+                revival = Revival::begin(shared, &mut pool, &listing, &current.id, &mut attachment);
+            }
+
             // The session is about to be looked at: its watcher put in if it
             // has none yet, so it records from now on, and what it kept
             // cleared. On a thread, so the session is in front at once (see
@@ -433,7 +463,12 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                     // to start: the switch resumes that one. Nor for one whose
                     // kept client has left, which may have left with the link:
                     // the switch recovers that first, and a start here would
-                    // go over it before then (see `resume_or_attach`).
+                    // go over it before then (see `resume_or_attach`). Asked
+                    // after the clients started again behind this session are
+                    // in, so that one back already counts as kept.
+                    if let Some(r) = &revival {
+                        r.collect(&mut pool, Some(&current.id));
+                    }
                     if !pool.has(&session.id) {
                         match begin_attachment(transport, session) {
                             Ok(b) => begun = Some(b),
@@ -517,7 +552,10 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                     );
                     match verdict {
                         reconnect::Verdict::Unneeded => break,
-                        reconnect::Verdict::Restored => continue,
+                        reconnect::Verdict::Restored => {
+                            after_a_drop = true;
+                            continue;
+                        }
                         // Out, not back to the picker. The picker's first act
                         // is a listing over the very link that just failed
                         // seven times, on an unbounded connect this time, and
@@ -699,6 +737,11 @@ fn settle(
 /// `hand_off` is the name the picker left standing, if it did; see
 /// [`attach`]. The link's recovery prints to the screen it stands on, so it is
 /// taken down before that.
+///
+/// `after_a_drop` is set when the client kept for the session had left, which
+/// a session still there to be attached afresh says it did with the link:
+/// the attach is then the first since a dropped link (see [`Revival`]).
+#[allow(clippy::too_many_arguments)]
 fn resume_or_attach(
     transport: &dyn transport::Transport,
     pool: &mut pool::Pool,
@@ -706,6 +749,7 @@ fn resume_or_attach(
     begun: Option<Begun>,
     warm: &mut bool,
     hand_off: &mut Option<HandOff>,
+    after_a_drop: &mut bool,
 ) -> Result<nvmux::Result<Option<pty::Attachment>>> {
     Ok(match pool.take(&session.id) {
         // Its notice was written when it was started, under the name the
@@ -744,7 +788,9 @@ fn resume_or_attach(
                 h.take_down();
             }
             recover_the_link(transport)?;
-            attach(transport, session, begun, hand_off)
+            let attached = attach(transport, session, begun, hand_off);
+            *after_a_drop |= matches!(attached, Ok(Some(_)));
+            attached
         }
         pool::Taken::Absent => attach(transport, session, begun, hand_off),
     })
@@ -1022,6 +1068,193 @@ fn start_every_client(
     Some(listing)
 }
 
+/// The longest a [`Revival`] waits for the session in front to have painted
+/// before it starts the clients behind it anyway: one waiting for a key may
+/// paint nothing until it has one.
+const REVIVE_AFTER_AT_MOST: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The clients a dropped link took with it, started again behind the session
+/// in front, once that has painted: `[client] revive`.
+///
+/// Every client nvmux holds for a session not in front, parked or started
+/// ahead, rides the link to its session's server, and leaves with it. As the
+/// link comes back the session in front is attached again, and without this
+/// the rest are each attached afresh on their next visit: a fork, a forward,
+/// a probe and a first paint, over a link that has just shown how far away
+/// the host is. With it they are started ahead again, as [`start_every_client`]
+/// starts them as nvmux starts, and held by the pool until those visits.
+///
+/// On a thread, because each is a fork and an ssh forward, and the session in
+/// front would otherwise wait for them all to have been made before the relay
+/// that brings it back began. And not before that session has painted
+/// (see [`pty::Attachment::tell_when_painted`]), because each client started
+/// has its session's whole screen sent to it over the link the screen in front
+/// is coming back over.
+///
+/// The thread hands over each client as it is held; [`Revival::collect`] takes
+/// them into the pool, where the next attach and the next switch look first.
+/// Dropped, a revival starts no more, and lets go of what it had not handed
+/// over.
+struct Revival {
+    held: mpsc::Receiver<pty::Parked>,
+    stop: Arc<AtomicBool>,
+    /// The kind of client they are started as, which the settings screen can
+    /// change before they are all in: a client of the other kind is let go.
+    ui: config::Ui,
+}
+
+impl Revival {
+    /// Start again, behind `attachment`, the clients that have left the pool —
+    /// after a dropped link, the clients it took — for the sessions the
+    /// listing still has, the one in front aside. `None` with none to start.
+    fn begin(
+        shared: &transport::Shared,
+        pool: &mut pool::Pool,
+        listing: &[nvmux::session::Session],
+        front: &str,
+        attachment: &mut pty::Attachment,
+    ) -> Option<Self> {
+        let left = pool.take_left();
+        let sessions = in_visiting_order(listing, front, &left);
+        if sessions.is_empty() {
+            return None;
+        }
+        tracing::debug!(
+            sessions = sessions.len(),
+            "starting again the clients the link took"
+        );
+        let painted = attachment.tell_when_painted();
+        let (handing, held) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let transport = Arc::clone(shared);
+        let spawned = std::thread::Builder::new()
+            .name("nvmux-revive".into())
+            .spawn(move || {
+                revive(&sessions, &painted, &stopped, &handing, |session| {
+                    let Begun {
+                        attachment, probe, ..
+                    } = begin_attachment(transport.as_ref(), session)?;
+                    Ok(attachment.start_ahead(Some(probe), config::get().client.throttle))
+                });
+            });
+        if let Err(e) = spawned {
+            tracing::debug!(error = %e, "could not start again the clients the link took");
+            return None;
+        }
+        Some(Self {
+            held,
+            stop,
+            ui: config::get().client.ui,
+        })
+    }
+
+    /// Take into the pool every client held since last asked, and say whether
+    /// more may come. Let go of instead: one for `front`, the session in
+    /// front, attached afresh since this began; one for a session visited
+    /// since, whose own client the pool keeps (see [`pool::Pool::adopt`]); and
+    /// every one, once the settings screen has changed the kind of client.
+    fn collect(&self, pool: &mut pool::Pool, front: Option<&str>) -> bool {
+        let other_kind = config::get().client.ui != self.ui;
+        if other_kind {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+        loop {
+            let held = match self.held.try_recv() {
+                Ok(held) => held,
+                Err(mpsc::TryRecvError::Empty) => return !other_kind,
+                Err(mpsc::TryRecvError::Disconnected) => return false,
+            };
+            let unwanted = other_kind || front == Some(held.session_id());
+            if let Some(held) = if unwanted {
+                Some(held)
+            } else {
+                pool.adopt(held)
+            } {
+                let_go(held);
+            }
+        }
+    }
+}
+
+/// Every client held and not handed over is told to retire, and then let go
+/// of: side by side, as the pool lets go of its own (see `pool::Pool`'s
+/// `Drop`).
+impl Drop for Revival {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let mut held: Vec<pty::Parked> = self.held.try_iter().collect();
+        for one in &mut held {
+            one.tell_to_retire();
+        }
+    }
+}
+
+/// The sessions of `left` the listing still has, `front` aside, in the order
+/// `<prefix> n` visits them from `front`: the likeliest next first.
+fn in_visiting_order(
+    listing: &[nvmux::session::Session],
+    front: &str,
+    left: &[String],
+) -> Vec<nvmux::session::Session> {
+    let after = listing
+        .iter()
+        .position(|s| s.id == front)
+        .map_or(0, |at| at + 1);
+    listing[after..]
+        .iter()
+        .chain(&listing[..after])
+        .filter(|s| s.id != front && left.contains(&s.id))
+        .cloned()
+        .collect()
+}
+
+/// What a [`Revival`]'s thread does, but for how a client is started: wait for
+/// the session in front to have painted — or to have been let go of, or for
+/// [`REVIVE_AFTER_AT_MOST`] — and then start one for each of `sessions` in
+/// turn, and hand each over as it is held, until `stop` is set or nobody is
+/// left to hand them to. One that cannot be started is left to its visit.
+fn revive<T>(
+    sessions: &[nvmux::session::Session],
+    painted: &mpsc::Receiver<()>,
+    stop: &AtomicBool,
+    handing: &mpsc::Sender<T>,
+    mut start: impl FnMut(&nvmux::session::Session) -> nvmux::Result<Option<T>>,
+) {
+    // Told, let go of, or waited out: any way, the screen in front is as far
+    // along as it will get on its own.
+    let _ = painted.recv_timeout(REVIVE_AFTER_AT_MOST);
+    for session in sessions {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match start(session) {
+            Ok(Some(held)) => {
+                if handing.send(held).is_err() {
+                    return;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::debug!(
+                id = %session.id,
+                error = %e,
+                "could not start a client again"
+            ),
+        }
+    }
+}
+
+/// Retire a client held out of sight without waiting for it here: letting go
+/// of one waits for its thread to hand the client over, which a switch about
+/// to fade has no time for.
+fn let_go(held: pty::Parked) {
+    // A thread that cannot be had takes the client down with it: dropped, and
+    // so retired, here after all.
+    let _ = std::thread::Builder::new()
+        .name("nvmux-let-go".into())
+        .spawn(move || drop(held));
+}
+
 /// Wait, on the attaching screen, for the session to take the client
 /// [`begin_attachment`] started. `None` is the user giving up on that wait.
 ///
@@ -1291,5 +1524,137 @@ mod tests {
         let msg = describe_listing_failure(&e);
         assert!(msg.contains("could not list sessions"), "{msg}");
         assert!(msg.contains("is not owned by us"), "{msg}");
+    }
+
+    fn ids(sessions: Vec<nvmux::session::Session>) -> Vec<String> {
+        sessions.into_iter().map(|s| s.id).collect()
+    }
+
+    /// The clients a dropped link took are started again in the order
+    /// `<prefix> n` visits their sessions from the one in front, round the
+    /// end; none for the one in front, nor for a session the listing no
+    /// longer has.
+    #[test]
+    fn the_clients_a_link_took_are_started_again_in_the_order_n_visits_them() {
+        let listing = listing_of(&[
+            (1, "id000001"),
+            (2, "id000002"),
+            (3, "id000003"),
+            (4, "id000004"),
+        ]);
+        let left = ["id000001", "id000003", "id000004", "id000009"].map(String::from);
+        assert_eq!(
+            ids(in_visiting_order(&listing, "id000002", &left)),
+            ["id000003", "id000004", "id000001"]
+        );
+        assert_eq!(
+            ids(in_visiting_order(&listing, "id000003", &left)),
+            ["id000004", "id000001"],
+            "the one in front was started again"
+        );
+    }
+
+    /// Nothing is started again before the session in front has painted, and
+    /// then each in turn, handed over as it is held.
+    #[test]
+    fn nothing_is_started_again_before_the_session_in_front_has_painted() {
+        let sessions = listing_of(&[(1, "id000001"), (2, "id000002"), (3, "id000003")]);
+        let (told, painted) = mpsc::channel();
+        let (handing, handed) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            revive(
+                &sessions,
+                &painted,
+                &AtomicBool::new(false),
+                &handing,
+                |s| Ok(Some(s.id.clone())),
+            );
+        });
+        assert!(
+            handed
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "a client was started before the session in front had painted"
+        );
+        told.send(()).expect("still waiting to be told");
+        assert_eq!(
+            handed.iter().collect::<Vec<_>>(),
+            ["id000001", "id000002", "id000003"]
+        );
+        worker.join().expect("the revival panicked");
+    }
+
+    /// A session in front whose relay ended before it painted holds nothing
+    /// back: there is no paint coming to wait for.
+    #[test]
+    fn a_session_in_front_let_go_of_unpainted_holds_nothing_back() {
+        let sessions = listing_of(&[(1, "id000001")]);
+        let (told, painted) = mpsc::channel::<()>();
+        drop(told);
+        let (handing, handed) = mpsc::channel();
+        let start = std::time::Instant::now();
+        revive(
+            &sessions,
+            &painted,
+            &AtomicBool::new(false),
+            &handing,
+            |s| Ok(Some(s.id.clone())),
+        );
+        assert!(
+            start.elapsed() < REVIVE_AFTER_AT_MOST / 2,
+            "waited for a paint that could not come"
+        );
+        assert_eq!(handed.try_recv().as_deref(), Ok("id000001"));
+    }
+
+    /// Told to stop, a revival starts nothing; with nobody left to hand its
+    /// clients to, it stops at the first it could not hand over; and one it
+    /// cannot start is left to its visit, and the next started.
+    #[test]
+    fn a_revival_stops_when_told_or_unheard_and_passes_over_a_failure() {
+        let sessions = listing_of(&[(1, "id000001"), (2, "id000002"), (3, "id000003")]);
+        let (told, painted) = mpsc::channel::<()>();
+        drop(told);
+
+        let (handing, handed) = mpsc::channel::<String>();
+        let mut starts = 0;
+        revive(&sessions, &painted, &AtomicBool::new(true), &handing, |s| {
+            starts += 1;
+            Ok(Some(s.id.clone()))
+        });
+        assert_eq!(starts, 0, "started a client after it was told to stop");
+        assert!(handed.try_recv().is_err());
+
+        let (handing, handed) = mpsc::channel::<String>();
+        drop(handed);
+        let mut starts = 0;
+        revive(
+            &sessions,
+            &painted,
+            &AtomicBool::new(false),
+            &handing,
+            |s| {
+                starts += 1;
+                Ok(Some(s.id.clone()))
+            },
+        );
+        assert_eq!(starts, 1, "went on starting clients nobody would take");
+
+        let (handing, handed) = mpsc::channel::<String>();
+        revive(
+            &sessions,
+            &painted,
+            &AtomicBool::new(false),
+            &handing,
+            |s| {
+                if s.id == "id000002" {
+                    Err(refused())
+                } else {
+                    Ok(Some(s.id.clone()))
+                }
+            },
+        );
+        drop(handing);
+        assert_eq!(handed.iter().collect::<Vec<_>>(), ["id000001", "id000003"]);
     }
 }
