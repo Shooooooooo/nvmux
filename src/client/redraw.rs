@@ -11,7 +11,9 @@
 //! is something a newer Neovim says that an older client has no use for.
 //!
 //! Decoded from borrowed values ([`rmpv::ValueRef`]), so the text of a cell is
-//! copied once, into the cell, and nowhere else.
+//! copied once, into the cell, and nowhere else — and a `grid_line`, nearly
+//! all of what Neovim sends, straight from the notification's bytes, without
+//! a value tree at all ([`decode_bytes`]).
 
 use rmpv::ValueRef;
 
@@ -245,6 +247,277 @@ pub fn decode(params: &ValueRef<'_>, into: &mut Vec<Event>) -> usize {
         }
     }
     dropped
+}
+
+/// [`decode`], straight from the bytes of a `redraw` notification's
+/// parameters: what [`decode`] makes of them, event for event and drop for
+/// drop, without building a value tree for the whole notification. A
+/// `grid_line` — nearly all of what Neovim sends — is read from the bytes as
+/// it stands; every other event is decoded on its own, from the bytes of its
+/// own argument list, and read by [`event`] as before.
+///
+/// The one notification the two read differently is one nested deeper than
+/// rmpv will follow, which [`decode`] never gets to see at all: this reads
+/// what it can of it.
+pub fn decode_bytes(params: &[u8], into: &mut Vec<Event>) -> usize {
+    let mut rd = Cursor { buf: params, at: 0 };
+    let Some(batches) = rd.array_len() else {
+        return slow(params, into);
+    };
+    let mut dropped = 0;
+    for _ in 0..batches {
+        let start = rd.at;
+        let Some(len) = rd.array_len() else {
+            dropped += 1;
+            if rd.skip_from(start).is_none() {
+                return dropped;
+            }
+            continue;
+        };
+        let name = match (len, rd.str_value()) {
+            (1.., Some(Ok(name))) => name,
+            _ => {
+                dropped += 1;
+                if rd.skip_from(start).is_none() {
+                    return dropped;
+                }
+                continue;
+            }
+        };
+        let line = name == "grid_line";
+        for _ in 1..len {
+            let start = rd.at;
+            if line {
+                match rd.grid_line() {
+                    Some(Some(event)) => {
+                        into.push(event);
+                        continue;
+                    }
+                    // Not an array at all: dropped as `decode` drops it.
+                    Some(None) => {
+                        dropped += 1;
+                        if rd.skip_from(start).is_none() {
+                            return dropped;
+                        }
+                        continue;
+                    }
+                    // Anything else odd: read the slow way, which says what it is.
+                    None => rd.at = start,
+                }
+            }
+            let Some(end) = rd.skip_from(start) else {
+                return dropped + 1;
+            };
+            let mut sub = &params[start..end];
+            let Ok(args) = rmpv::decode::read_value_ref(&mut sub) else {
+                dropped += 1;
+                continue;
+            };
+            let Some(args) = args.as_array() else {
+                dropped += 1;
+                continue;
+            };
+            match event(name, args) {
+                Some(Some(event)) => into.push(event),
+                Some(None) => {}
+                None => {
+                    tracing::debug!(name, "dropped a redraw event the client could not read");
+                    dropped += 1;
+                }
+            }
+        }
+    }
+    dropped
+}
+
+/// The bytes of a `redraw` notification's parameters, if `frame` is one:
+/// `[2, "redraw", params, …]`, read as `super::App::message` reads it.
+pub fn redraw_params(frame: &[u8]) -> Option<&[u8]> {
+    let mut rd = Cursor { buf: frame, at: 0 };
+    if rd.array_len()? < 3 || rd.uint()? != super::wire::NOTIFICATION {
+        return None;
+    }
+    match rd.str_value()? {
+        Ok("redraw") => Some(&frame[rd.at..]),
+        _ => None,
+    }
+}
+
+/// The id of the request `frame` answers, if it is a response: `[1, id, …]`,
+/// with the kind and the id read as values, however they are written.
+pub fn response_id(frame: &[u8]) -> Option<u64> {
+    let mut rd = Cursor { buf: frame, at: 0 };
+    if rd.array_len()? < 2 || rd.uint()? != super::wire::RESPONSE {
+        return None;
+    }
+    rd.uint()
+}
+
+fn slow(params: &[u8], into: &mut Vec<Event>) -> usize {
+    let mut rd = params;
+    match rmpv::decode::read_value_ref(&mut rd) {
+        Ok(v) => decode(&v, into),
+        Err(_) => 1,
+    }
+}
+
+/// A place in a msgpack value's bytes.
+struct Cursor<'a> {
+    buf: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn byte(&mut self) -> Option<u8> {
+        let b = *self.buf.get(self.at)?;
+        self.at += 1;
+        Some(b)
+    }
+
+    fn be(&mut self, width: usize) -> Option<u64> {
+        let bytes = self.buf.get(self.at..self.at + width)?;
+        self.at += width;
+        Some(bytes.iter().fold(0u64, |n, &b| (n << 8) | u64::from(b)))
+    }
+
+    /// An array's length, the cursor past its header.
+    fn array_len(&mut self) -> Option<usize> {
+        let save = self.at;
+        let n = match self.byte()? {
+            m @ 0x90..=0x9f => Some(usize::from(m & 0x0f)),
+            0xdc => self.be(2).map(|n| n as usize),
+            0xdd => self.be(4).map(|n| n as usize),
+            _ => None,
+        };
+        if n.is_none() {
+            self.at = save;
+        }
+        n
+    }
+
+    /// A `str`: its text, or its bytes when they are not UTF-8. `None`, and
+    /// the cursor where it was, for anything else.
+    fn str_value(&mut self) -> Option<Result<&'a str, &'a [u8]>> {
+        let save = self.at;
+        let len = match self.byte()? {
+            m @ 0xa0..=0xbf => Some(usize::from(m & 0x1f)),
+            0xd9 => self.be(1).map(|n| n as usize),
+            0xda => self.be(2).map(|n| n as usize),
+            0xdb => self.be(4).map(|n| n as usize),
+            _ => None,
+        };
+        let Some(bytes) = len.and_then(|len| self.buf.get(self.at..self.at.checked_add(len)?))
+        else {
+            self.at = save;
+            return None;
+        };
+        self.at += bytes.len();
+        Some(std::str::from_utf8(bytes).map_err(|_| bytes))
+    }
+
+    /// An integer as [`ValueRef::as_u64`] reads one: any non-negative one,
+    /// however it is written. `None`, and the cursor where it was, otherwise.
+    fn uint(&mut self) -> Option<u64> {
+        let save = self.at;
+        let n = match self.byte()? {
+            m @ 0x00..=0x7f => Some(u64::from(m)),
+            0xcc => self.be(1),
+            0xcd => self.be(2),
+            0xce => self.be(4),
+            0xcf => self.be(8),
+            0xd0 => self
+                .be(1)
+                .map(|n| n as u8 as i8 as i64)
+                .and_then(|n| u64::try_from(n).ok()),
+            0xd1 => self
+                .be(2)
+                .map(|n| n as u16 as i16 as i64)
+                .and_then(|n| u64::try_from(n).ok()),
+            0xd2 => self
+                .be(4)
+                .map(|n| n as u32 as i32 as i64)
+                .and_then(|n| u64::try_from(n).ok()),
+            0xd3 => self
+                .be(8)
+                .map(|n| n as i64)
+                .and_then(|n| u64::try_from(n).ok()),
+            _ => None,
+        };
+        if n.is_none() {
+            self.at = save;
+        }
+        n
+    }
+
+    /// Past the value that starts at `start`, wherever the cursor is now.
+    fn skip_from(&mut self, start: usize) -> Option<usize> {
+        let n = super::wire::frame_len(&self.buf[start..]).ok()??;
+        self.at = start + n;
+        Some(self.at)
+    }
+
+    /// Past `n` values from here.
+    fn skip_n(&mut self, n: usize) -> Option<()> {
+        for _ in 0..n {
+            self.skip_from(self.at)?;
+        }
+        Some(())
+    }
+
+    /// One `grid_line` argument list: `Some(Some(_))` read, `Some(None)` not
+    /// an array, `None` for anything else this does not read the way
+    /// [`event`] would (it is then read by [`event`]).
+    fn grid_line(&mut self) -> Option<Option<Event>> {
+        let Some(len) = self.array_len() else {
+            return Some(None);
+        };
+        if len < 4 {
+            return None;
+        }
+        let grid = self.uint()?;
+        let row = usize::try_from(self.uint()?).ok()?;
+        let col = usize::try_from(self.uint()?).ok()?;
+        let runs = self.array_len()?;
+        let mut cells = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let n = self.array_len()?;
+            if n == 0 {
+                return None;
+            }
+            // Nearly every cell: one ASCII character, `fixstr` of one byte.
+            let text = match self.buf.get(self.at..self.at + 2) {
+                Some(&[0xa1, c]) if c < 0x80 => {
+                    self.at += 2;
+                    Text::Char(char::from(c))
+                }
+                _ => match self.str_value()? {
+                    Ok(s) => Text::new(s),
+                    Err(b) => Text::new(&String::from_utf8_lossy(b)),
+                },
+            };
+            let hl = if n >= 2 {
+                Some(u32::try_from(self.uint()?).ok()?)
+            } else {
+                None
+            };
+            let repeat = if n >= 3 {
+                usize::try_from(self.uint()?).ok()?
+            } else {
+                1
+            };
+            if n > 3 {
+                self.skip_n(n - 3)?;
+            }
+            cells.push(LineCell { text, hl, repeat });
+        }
+        self.skip_n(len - 4)?;
+        Some(Some(Event::GridLine {
+            grid,
+            row,
+            col,
+            cells,
+        }))
+    }
 }
 
 /// One event: `None` for one that could not be read, `Some(None)` for one
@@ -574,7 +847,168 @@ mod tests {
         let v = rmpv::decode::read_value_ref(&mut rd).expect("decode");
         let mut out = Vec::new();
         let dropped = decode(&v, &mut out);
+        // The fast path reads the same bytes the same way.
+        let mut fast = Vec::new();
+        let fast_dropped = decode_bytes(&buf, &mut fast);
+        assert_eq!(
+            (&fast, fast_dropped),
+            (&out, dropped),
+            "decode_bytes differs"
+        );
         (out, dropped)
+    }
+
+    /// Every way a grid_line can be odd reads the same from the bytes as from
+    /// the tree: random mutations of a real batch.
+    #[test]
+    fn decode_bytes_matches_decode_on_mutated_batches() {
+        let line = |hl: Value, text: Value, rep: Value| {
+            arr(vec![
+                Value::from(2),
+                Value::from(3),
+                Value::from(4),
+                arr(vec![
+                    arr(vec![Value::from("a"), Value::from(7)]),
+                    arr(vec![text, hl, rep, Value::from("extra")]),
+                    arr(vec![Value::from("é")]),
+                ]),
+                Value::from(false),
+                Value::from("more"),
+            ])
+        };
+        let odd = [
+            Value::Nil,
+            Value::from(-1),
+            Value::from(i64::from(u32::MAX) + 1),
+            Value::from(1.5),
+            Value::from("x"),
+            Value::Binary(vec![b'a']),
+            // Patched to bytes that are not UTF-8 below, the one byte long
+            // as well: past what is read as one ASCII character.
+            Value::from("\u{1}\u{2}"),
+            Value::from("\u{4}"),
+            Value::from(5),
+            arr(vec![]),
+        ];
+        let mut cases = Vec::new();
+        for a in &odd {
+            cases.push(line(a.clone(), Value::from("b"), Value::from(2)));
+            cases.push(line(Value::from(1), a.clone(), Value::from(2)));
+            cases.push(line(Value::from(1), Value::from("b"), a.clone()));
+            cases.push(arr(vec![
+                a.clone(),
+                Value::from(0),
+                Value::from(0),
+                arr(vec![]),
+            ]));
+            cases.push(a.clone());
+        }
+        cases.push(arr(vec![Value::from(1), Value::from(0)]));
+        // A line whose last run has a highlight and no repeat: what is read
+        // of it is all there is to read before the next line.
+        cases.push(arr(vec![
+            Value::from(1),
+            Value::from(2),
+            Value::from(0),
+            arr(vec![arr(vec![Value::from("b"), Value::from(3)])]),
+        ]));
+        cases.push(arr(vec![
+            Value::from(1),
+            Value::from(0),
+            Value::from(0),
+            arr(vec![arr(vec![])]),
+        ]));
+        let mut b = vec![Value::from("grid_line")];
+        b.extend(cases);
+        let batches = arr(vec![
+            Value::Array(b),
+            Value::from(3),
+            arr(vec![]),
+            arr(vec![Value::from(4), arr(vec![])]),
+            batch(
+                "grid_cursor_goto",
+                vec![arr(vec![Value::from(1), Value::from(2), Value::from(3)])],
+            ),
+            batch("flush", vec![arr(vec![])]),
+        ]);
+        let (_, dropped) = events(batches.clone());
+        assert!(dropped > 0);
+        // And with text that is not UTF-8, in a cell and as a name.
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &batches).expect("encode");
+        let mut patched = Vec::new();
+        let mut i = 0;
+        while i < buf.len() {
+            if buf[i..].starts_with(&[0xa2, 0x01, 0x02]) {
+                patched.extend_from_slice(&[0xa2, 0xff, 0xfe]);
+                i += 3;
+            } else if buf[i..].starts_with(&[0xa1, 0x04]) {
+                patched.extend_from_slice(&[0xa1, 0x80]);
+                i += 2;
+            } else {
+                patched.push(buf[i]);
+                i += 1;
+            }
+        }
+        assert_ne!(patched, buf);
+        let mut rd = &patched[..];
+        let v = rmpv::decode::read_value_ref(&mut rd).expect("decode");
+        let mut out = Vec::new();
+        let dropped = decode(&v, &mut out);
+        let mut fast = Vec::new();
+        let fast_dropped = decode_bytes(&patched, &mut fast);
+        assert_eq!((fast, fast_dropped), (out, dropped));
+    }
+
+    fn encoded(v: &Value) -> Vec<u8> {
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, v).expect("encode");
+        buf
+    }
+
+    /// A `redraw` is known by its header, written however msgpack lets it
+    /// be, and nothing else is taken for one.
+    #[test]
+    fn a_redraw_is_known_from_its_bytes() {
+        let params = arr(vec![batch("flush", vec![arr(vec![])])]);
+        let frame = encoded(&arr(vec![
+            Value::from(2),
+            Value::from("redraw"),
+            params.clone(),
+        ]));
+        assert_eq!(redraw_params(&frame), Some(&encoded(&params)[..]));
+        // The kind as a signed byte, as a peer may write it.
+        let mut signed = frame.clone();
+        signed.splice(1..2, [0xd0, 0x02]);
+        assert_eq!(redraw_params(&signed), Some(&encoded(&params)[..]));
+        for other in [
+            arr(vec![
+                Value::from(2),
+                Value::from("nvmux_client"),
+                params.clone(),
+            ]),
+            arr(vec![Value::from(1), Value::from("redraw"), params.clone()]),
+            arr(vec![Value::from(2), Value::from("redraw")]),
+            arr(vec![Value::from(-2), Value::from("redraw"), params.clone()]),
+            Value::from("redraw"),
+        ] {
+            assert_eq!(redraw_params(&encoded(&other)), None, "{other}");
+        }
+    }
+
+    /// A response's id is read from its header, whatever width it is
+    /// written in; anything that is not a response has none.
+    #[test]
+    fn a_response_is_known_from_its_bytes() {
+        let answer =
+            |id: Value| encoded(&arr(vec![Value::from(1), id, Value::Nil, Value::from(5)]));
+        assert_eq!(response_id(&answer(Value::from(7))), Some(7));
+        assert_eq!(response_id(&answer(Value::from(70_000))), Some(70_000));
+        assert_eq!(response_id(&answer(Value::from(-1))), None);
+        assert_eq!(response_id(&answer(Value::from("7"))), None);
+        let note = encoded(&arr(vec![Value::from(2), Value::from(7), Value::Nil]));
+        assert_eq!(response_id(&note), None);
+        assert_eq!(response_id(&encoded(&Value::from(1))), None);
     }
 
     fn batch(name: &str, calls: Vec<Value>) -> Value {

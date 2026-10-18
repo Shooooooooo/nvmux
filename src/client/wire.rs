@@ -15,7 +15,7 @@
 //! anything, by counting the values still owed — one to start with, minus one
 //! for every value read, plus however many an array or a map announces — so a
 //! frame is whole the moment that count reaches zero, however it is nested.
-//! Only a whole frame is ever decoded, and it is decoded from a copy of its own
+//! Only a whole frame is ever decoded, and it is decoded from its own
 //! bytes, so a frame split across reads is simply waited for.
 //!
 //! # Writing
@@ -139,10 +139,22 @@ fn len_at(buf: &[u8], at: usize, width: usize) -> Option<usize> {
 /// What the socket has said, kept until it makes whole frames.
 #[derive(Debug, Default)]
 pub struct Inbox {
+    /// Room to read into, zeroed once as it is added rather than on every
+    /// read: what has been read is `buf[..end]`, and a read lands on what
+    /// earlier reads left.
     buf: Vec<u8>,
     /// Where the bytes not yet handed out as a frame start.
     start: usize,
+    /// Where what has been read ends.
+    end: usize,
 }
+
+/// How much room an inbox keeps once every frame in it has been taken. A
+/// frame larger than this — a whole file copied to the clipboard comes as
+/// one `redraw` — makes it grow for as long as the frame takes to arrive;
+/// what it grew by goes as soon as the frame has been taken, rather than
+/// staying with the client for the rest of its life.
+const KEEP: usize = 4 * READ_CHUNK;
 
 /// How much one read asks for. A full redraw of a large screen is a few
 /// hundred kilobytes; reading it in pieces this size keeps the number of
@@ -155,26 +167,27 @@ impl Inbox {
     pub fn fill(&mut self, from: &mut impl Read) -> io::Result<bool> {
         // Compact first, so the buffer does not grow by every frame ever read.
         if self.start > 0 {
-            self.buf.drain(..self.start);
+            self.buf.copy_within(self.start..self.end, 0);
+            self.end -= self.start;
             self.start = 0;
         }
         loop {
-            let len = self.buf.len();
-            self.buf.resize(len + READ_CHUNK, 0);
-            match from.read(&mut self.buf[len..]) {
+            let len = self.end;
+            if self.buf.len() < len + READ_CHUNK {
+                self.buf.resize(len + READ_CHUNK, 0);
+            }
+            match from.read(&mut self.buf[len..len + READ_CHUNK]) {
                 Ok(0) => {
-                    self.buf.truncate(len);
                     return Ok(false);
                 }
                 Ok(n) => {
-                    self.buf.truncate(len + n);
+                    self.end = len + n;
                     // A short read is everything there was.
                     if n < READ_CHUNK {
                         return Ok(true);
                     }
                 }
                 Err(e) => {
-                    self.buf.truncate(len);
                     return match e.kind() {
                         io::ErrorKind::WouldBlock => Ok(true),
                         io::ErrorKind::Interrupted => continue,
@@ -185,16 +198,26 @@ impl Inbox {
         }
     }
 
-    /// The next whole frame's bytes, if one has arrived.
-    pub fn take_frame(&mut self) -> Result<Option<Vec<u8>>, Malformed> {
-        let rest = &self.buf[self.start..];
-        match frame_len(rest) {
+    /// The next whole frame's bytes, if one has arrived: lent, not copied,
+    /// until the inbox is next used.
+    pub fn take_frame(&mut self) -> Result<Option<&[u8]>, Malformed> {
+        match frame_len(&self.buf[self.start..self.end]) {
             Ok(Some(n)) => {
-                let frame = rest[..n].to_vec();
+                let at = self.start;
                 self.start += n;
-                Ok(Some(frame))
+                Ok(Some(&self.buf[at..at + n]))
             }
-            Ok(None) => Ok(None),
+            Ok(None) => {
+                // Every frame read has been taken: what a big one made the
+                // room grow to goes now (see [`KEEP`]).
+                if self.start == self.end {
+                    (self.start, self.end) = (0, 0);
+                    if self.buf.len() > KEEP {
+                        self.buf = Vec::new();
+                    }
+                }
+                Ok(None)
+            }
             Err(Malformed { at }) => Err(Malformed {
                 at: self.start + at,
             }),
@@ -503,11 +526,58 @@ mod tests {
         let mut inbox = Inbox::default();
         let (first, second) = all.split_at(a.len() + 1);
         inbox.fill(&mut &first[..]).expect("read");
-        assert_eq!(inbox.take_frame(), Ok(Some(a.clone())));
+        assert_eq!(inbox.take_frame(), Ok(Some(&a[..])));
         assert_eq!(inbox.take_frame(), Ok(None), "b is not all here yet");
         inbox.fill(&mut &second[..]).expect("read");
-        assert_eq!(inbox.take_frame(), Ok(Some(b.clone())));
+        assert_eq!(inbox.take_frame(), Ok(Some(&b[..])));
         assert_eq!(inbox.take_frame(), Ok(None));
+    }
+
+    /// Reads land in the room the first one made: frames coming one after
+    /// another never grow it, or move it.
+    #[test]
+    fn the_inbox_reads_into_the_room_it_has() {
+        let frame = encoded(&Value::Array(vec![Value::from(2), Value::from("x")]));
+        let mut inbox = Inbox::default();
+        inbox.fill(&mut &frame[..]).expect("read");
+        let room = inbox.buf.as_ptr();
+        for _ in 0..1000 {
+            assert_eq!(inbox.take_frame(), Ok(Some(&frame[..])));
+            assert_eq!(inbox.take_frame(), Ok(None));
+            inbox.fill(&mut &frame[..]).expect("read");
+        }
+        assert_eq!(inbox.buf.len(), READ_CHUNK);
+        assert_eq!(inbox.buf.as_ptr(), room);
+    }
+
+    /// A frame too big for the room an inbox keeps — a big copy to the
+    /// clipboard — makes it grow, and once that frame has been taken the room
+    /// goes back; the start of the frame after it, read with it, is kept.
+    #[test]
+    fn a_big_frame_gives_back_its_room_once_taken() {
+        let big = encoded(&Value::Array(vec![
+            Value::from(2),
+            Value::from("redraw"),
+            Value::from("x".repeat(3 * KEEP)),
+        ]));
+        let small = encoded(&Value::Array(vec![Value::from(2), Value::from("y")]));
+        let mut bytes = big.clone();
+        bytes.extend_from_slice(&small[..2]);
+        let mut inbox = Inbox::default();
+        inbox.fill(&mut &bytes[..]).expect("read");
+        assert!(inbox.buf.len() > KEEP);
+        assert_eq!(inbox.take_frame(), Ok(Some(&big[..])));
+        assert_eq!(
+            inbox.take_frame(),
+            Ok(None),
+            "the small one is still arriving"
+        );
+        inbox.fill(&mut &small[2..]).expect("read");
+        assert_eq!(inbox.take_frame(), Ok(Some(&small[..])));
+        assert_eq!(inbox.take_frame(), Ok(None));
+        assert!(inbox.buf.capacity() <= KEEP, "{}", inbox.buf.capacity());
+        inbox.fill(&mut &small[..]).expect("read");
+        assert_eq!(inbox.take_frame(), Ok(Some(&small[..])));
     }
 
     /// The far end closing is what the caller ends on.
