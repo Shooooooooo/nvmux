@@ -3151,9 +3151,14 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
             app.escape_timeout(now);
         }
         if app.due(now) {
+            // Nothing at all, for a frame that changes nothing on the screen
+            // and had nothing waiting to go ahead of it: see
+            // `Screen::draw_into`.
             let bytes = app.frame(now);
-            if let Err(e) = crate::term::write_stdout(&bytes) {
-                break Err(e.into());
+            if !bytes.is_empty() {
+                if let Err(e) = crate::term::write_stdout(&bytes) {
+                    break Err(e.into());
+                }
             }
         }
         if app.done {
