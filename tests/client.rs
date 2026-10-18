@@ -62,6 +62,9 @@ struct Terminal {
     /// Everything the client has written, in order, and the screen it makes.
     output: Vec<u8>,
     parser: vt100::Parser,
+    /// How far into `output` the parser has had: all of it but the start of
+    /// a character the last read ended part way through (see [`whole`]).
+    fed: usize,
     /// How far `output` has been scanned for queries.
     answered: usize,
     /// What this terminal answers a DA1 with.
@@ -124,6 +127,7 @@ impl Terminal {
             pty,
             output: Vec::new(),
             parser: vt100::Parser::new(size.1, size.0, 0),
+            fed: 0,
             answered: 0,
             da1,
             size,
@@ -155,8 +159,8 @@ impl Terminal {
             }
             match self.incoming.recv_timeout(left) {
                 Ok(bytes) => {
-                    self.parser.process(&bytes);
                     self.output.extend_from_slice(&bytes);
+                    self.feed();
                     self.answer();
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -165,14 +169,20 @@ impl Terminal {
         }
     }
 
+    /// Give the parser what has come that it has not had, as far as it is
+    /// whole characters.
+    fn feed(&mut self) {
+        let end = self.fed + whole(&self.output[self.fed..]);
+        self.parser.process(&self.output[self.fed..end]);
+        self.fed = end;
+    }
+
     /// Take what the client draws for up to `within`, answering its questions
     /// as a terminal would, and hand `each` the screen as every frame leaves
     /// it — not as a read happens to, part way through one — until it says
     /// that is enough. Says whether it did.
     fn frames(&mut self, within: Duration, mut each: impl FnMut(&vt100::Screen) -> bool) -> bool {
         let deadline = Instant::now() + within;
-        // What the parser has had: up to the end of the last frame.
-        let mut fed = self.output.len();
         let enough = loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -183,10 +193,12 @@ impl Terminal {
                     self.output.extend_from_slice(&bytes);
                     self.answer();
                     let mut enough = false;
-                    while let Some(i) = find(&self.output[fed..], SYNC_END) {
-                        let end = fed + i + SYNC_END.len();
-                        self.parser.process(&self.output[fed..end]);
-                        fed = end;
+                    // Up to the end of each frame, which is never part way
+                    // through a character.
+                    while let Some(i) = find(&self.output[self.fed..], SYNC_END) {
+                        let end = self.fed + i + SYNC_END.len();
+                        self.parser.process(&self.output[self.fed..end]);
+                        self.fed = end;
                         enough |= each(self.parser.screen());
                     }
                     if enough {
@@ -197,7 +209,7 @@ impl Terminal {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break false,
             }
         };
-        self.parser.process(&self.output[fed..]);
+        self.feed();
         enough
     }
 
@@ -292,6 +304,32 @@ impl Drop for Terminal {
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// How much of `bytes` is whole characters: all of it but the start of a
+/// character it ends part way through, which waits for the rest. `vte`, under
+/// `vt100`, finishes such a character with up to three bytes of what comes
+/// next, and should that run on into the start of another, drops whatever
+/// came between the two: a read that ends inside the `é` of `é ─`, as reads
+/// of a pty on macOS do, loses the space and draws the rest of the row a cell
+/// to the left of where the client put it.
+fn whole(bytes: &[u8]) -> usize {
+    let n = bytes.len();
+    // The last character's first byte, at most four back.
+    for back in 1..=n.min(4) {
+        let b = bytes[n - back];
+        if b & 0xc0 == 0x80 {
+            continue;
+        }
+        let len = match b {
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            _ => 1,
+        };
+        return if back < len { n - back } else { n };
+    }
+    n
 }
 
 /// A session of its own for a test, a connection to it, and a config file
@@ -664,6 +702,33 @@ fn a_lean_client_draws_the_screen_a_fresh_one_does() {
         "the lean client's screen:\n{text}\nis not the fresh one's:\n{}",
         fresh.text()
     );
+}
+
+/// What a client writes is drawn as it would be in one read, however the
+/// reads of it fall: one that ends part way through a character waits for
+/// the rest of it (see [`whole`]).
+#[test]
+fn reads_that_cut_a_character_in_two_draw_it_whole() {
+    let written = "漢字 é ─ ab".as_bytes();
+    let screen = |reads: &[&[u8]]| {
+        let mut parser = vt100::Parser::new(1, 20, 0);
+        let (mut output, mut fed) = (Vec::new(), 0);
+        for read in reads {
+            output.extend_from_slice(read);
+            let end = fed + whole(&output[fed..]);
+            parser.process(&output[fed..end]);
+            fed = end;
+        }
+        parser.screen().rows_formatted(0, 20).collect::<Vec<_>>()
+    };
+    let at_once = screen(&[written]);
+    for k in 1..written.len() {
+        assert_eq!(
+            screen(&[&written[..k], &written[k..]]),
+            at_once,
+            "read in two at byte {k}"
+        );
+    }
 }
 
 /// A yank to `+` reaches the terminal's clipboard as OSC 52. Neovim turns its
