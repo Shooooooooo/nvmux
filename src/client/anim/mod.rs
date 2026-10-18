@@ -42,7 +42,7 @@ use self::switch::Switch;
 use self::vfx::Vfx;
 use super::compose::{Frame, Scrolling, View};
 use super::grid::{Cell, Grid};
-use super::model::{Changes, Margins, Model, Place};
+use super::model::{Changes, Held, Margins, Model, Place};
 use super::redraw::{Event, Shape};
 use super::screen::Cursor;
 use super::style::{self, Color};
@@ -268,6 +268,23 @@ impl Animator {
     /// Neovim's options that lay the windows out, as the agent says them.
     pub fn set_options(&mut self, options: layout::Options) {
         self.options = options;
+    }
+
+    /// Every cell an animation keeps of a moment ago holds its highlight,
+    /// which a sweep may not give out again: see [`Model::reclaim`].
+    pub fn hold(&self, held: &mut Held) {
+        for s in self.scrolls.values() {
+            s.hold(held);
+        }
+        for s in self.sides.values() {
+            s.hold(held);
+        }
+        if let Some(t) = &self.transition {
+            t.hold(held);
+        }
+        for s in self.switches.values() {
+            s.hold(held);
+        }
     }
 
     /// A key was typed: the cursor is not left faded out under it.
@@ -1173,6 +1190,11 @@ mod tests {
     }
 
     fn lines(grid: u64, from: usize, rows: usize) -> Vec<Event> {
+        lines_in(grid, from, rows, 0)
+    }
+
+    /// [`lines`], in Neovim's highlight `hl`.
+    fn lines_in(grid: u64, from: usize, rows: usize, hl: u32) -> Vec<Event> {
         (0..rows)
             .map(|r| Event::GridLine {
                 grid,
@@ -1180,7 +1202,7 @@ mod tests {
                 col: 0,
                 cells: vec![LineCell {
                     text: Text::Char(char::from_digit(((from + r) % 10) as u32, 10).unwrap()),
-                    hl: Some(0),
+                    hl: Some(hl),
                     repeat: 1,
                 }],
             })
@@ -1358,6 +1380,73 @@ mod tests {
             frame.get(0, 0).map(|c| c.text.clone()),
             Some(Text::Char('3'))
         );
+    }
+
+    /// Neovim's highlight `id`, its foreground `0xRRGGBB`.
+    fn coloured(id: u32, fg: u32) -> Event {
+        Event::HlAttr {
+            id,
+            rgb: style::Attrs {
+                fg: Some(fg),
+                ..style::Attrs::default()
+            },
+            cterm: style::Attrs::default(),
+        }
+    }
+
+    /// A window scrolling slides from the lines it showed in the colours they
+    /// were drawn in, whatever Neovim has given their highlight's id to since
+    /// — and a sweep while it slides gives none of what it shows out again.
+    #[test]
+    fn a_scroll_slides_from_its_lines_in_the_colours_they_were_drawn_in() {
+        let (mut a, mut m, t0) = (Animator::new(effects()), model(), Instant::now());
+        setup(&mut a, &mut m, t0);
+        let mut events = vec![
+            Event::OptionSet {
+                name: "termguicolors".into(),
+                value: OptionValue::Bool(true),
+            },
+            coloured(5, 0xff0000),
+        ];
+        events.extend(lines_in(2, 0, 10, 5));
+        batch(&mut a, &mut m, events, true, t0);
+        // Neovim's table full: id 5 given to another highlight, the window
+        // scrolled and drawn in it.
+        let mut events = vec![
+            coloured(5, 0x0000ff),
+            Event::GridScroll {
+                grid: 2,
+                top: 0,
+                bot: 10,
+                left: 0,
+                right: 10,
+                rows: 3,
+            },
+        ];
+        events.extend(lines_in(2, 3, 10, 5));
+        events.push(viewport(3, 3, 3));
+        batch(&mut a, &mut m, events, true, t0);
+        let mut held = m.held();
+        a.hold(&mut held);
+        m.reclaim(&held);
+        // Had the old lines' id been given back, the next highlight Neovim
+        // defines anew would be given it.
+        batch(
+            &mut a,
+            &mut m,
+            vec![coloured(6, 0x00ff00), coloured(6, 0xffff00)],
+            true,
+            t0,
+        );
+        let top = |a: &Animator, m: &Model| {
+            let frame = compose::compose(m, a, 30, 12);
+            let cell = frame.get(0, 0).expect("on the frame").clone();
+            (cell.text, cell.style.fg)
+        };
+        let colour = |n| Color::Rgb(style::rgb(n));
+        assert_eq!(top(&a, &m), (Text::Char('1'), colour(0xff0000)));
+        a.advance(t0 + Duration::from_secs(1));
+        assert_eq!(top(&a, &m), (Text::Char('3'), colour(0x0000ff)));
     }
 
     fn viewport(topline: i64, curline: i64, scroll_delta: i64) -> Event {

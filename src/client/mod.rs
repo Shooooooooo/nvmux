@@ -2088,6 +2088,13 @@ impl App {
         }
         self.anim
             .after(before, &self.model, &changes, multigrid, animate, now);
+        // After the animations have taken what they keep of the batch: what
+        // was kept from before it is theirs now, or gone.
+        if self.model.reclaiming() {
+            let mut held = self.model.held();
+            self.anim.hold(&mut held);
+            self.model.reclaim(&held);
+        }
         self.dirty = true;
     }
 

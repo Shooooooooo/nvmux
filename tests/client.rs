@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use common::Scratch;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
+use nvmux::fade::SYNC_END;
 use nvmux::transport::Transport;
 use pty_process::blocking::{Command, Pty};
 use rmpv::Value;
@@ -162,6 +163,42 @@ impl Terminal {
                 Err(mpsc::RecvTimeoutError::Disconnected) => return done(self),
             }
         }
+    }
+
+    /// Take what the client draws for up to `within`, answering its questions
+    /// as a terminal would, and hand `each` the screen as every frame leaves
+    /// it — not as a read happens to, part way through one — until it says
+    /// that is enough. Says whether it did.
+    fn frames(&mut self, within: Duration, mut each: impl FnMut(&vt100::Screen) -> bool) -> bool {
+        let deadline = Instant::now() + within;
+        // What the parser has had: up to the end of the last frame.
+        let mut fed = self.output.len();
+        let enough = loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break false;
+            }
+            match self.incoming.recv_timeout(left) {
+                Ok(bytes) => {
+                    self.output.extend_from_slice(&bytes);
+                    self.answer();
+                    let mut enough = false;
+                    while let Some(i) = find(&self.output[fed..], SYNC_END) {
+                        let end = fed + i + SYNC_END.len();
+                        self.parser.process(&self.output[fed..end]);
+                        fed = end;
+                        enough |= each(self.parser.screen());
+                    }
+                    if enough {
+                        break true;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break false,
+            }
+        };
+        self.parser.process(&self.output[fed..]);
+        enough
     }
 
     /// Answer every query not yet answered, in the order they were asked. A
@@ -2699,4 +2736,114 @@ fn a_client_taller_than_the_last_draws_every_window_whole() {
 fn a_client_wider_than_the_last_draws_its_window_whole() {
     require_nvim!();
     drawn_again_at("client-wider", 1, (160, 12), (200, 12));
+}
+
+/// A program for a `:terminal`: frame after frame, every cell in a background
+/// whose red and green are its own row and column and whose blue is the
+/// frame — but for the first ten columns, which keep a blue of 255 and never
+/// change. Every other cell of every frame is a pair of colours Neovim has not
+/// seen, and so a highlight of its own: its table of them fills in a few
+/// dozen frames, and full, Neovim clears it and gives its ids out again, part
+/// way through drawing a frame as often as not. The cells that never change
+/// it does not draw again then, and they go on naming ids it has given out.
+const REFILL_LUA: &str = r"
+local w, h = 80, 22
+local tty = vim.uv.new_tty(1, false)
+if tty then
+  local tw, th = tty:get_winsize()
+  w, h = tw or w, th or h
+end
+io.write('\27[?25l\27[?7l')
+for f = 0, 249 do
+  local out = {}
+  for r = 0, h - 1 do
+    out[#out + 1] = ('\27[%d;1H'):format(r + 1)
+    for c = 0, w - 1 do
+      out[#out + 1] = ('\27[48;2;%d;%d;%dm '):format(r, c, c < 10 and 255 or f)
+    end
+  end
+  io.write(table.concat(out))
+  io.flush()
+  vim.uv.sleep(15)
+end
+";
+
+/// Every frame the client draws of a `:terminal` filling Neovim's table of
+/// highlights again and again (see [`REFILL_LUA`]) has each of the program's
+/// cells in the colours the program gave it — the cells that never change
+/// among them. Neovim's own TUI writes a cell's colours as the cell comes;
+/// this client draws once a flush is whole, and drew a cell Neovim had not
+/// drawn again since giving out its id in whatever the id had come to mean:
+/// a flash of another cell's colours, every time the table was cleared.
+#[test]
+fn a_terminal_that_fills_neovims_highlights_is_drawn_in_its_own_colours() {
+    require_nvim!();
+    let scratch = Scratch::new("client-refill");
+    let (sock, mut rpc, config) = session(&scratch, "client-refill");
+    // Nothing fading or sliding: every colour on the screen is the program's.
+    std::fs::write(&config, "[effects]\nenabled = false\n").expect("config");
+    let program = scratch.0.join("refill.lua");
+    std::fs::write(&program, REFILL_LUA).expect("write the program");
+    rpc.command("setlocal noswapfile | set termguicolors | call setline(1, 'before the program')")
+        .expect("setline");
+    // The editor's own background, which is no colour of the program's.
+    let normal = rpc
+        .eval("synIDattr(synIDtrans(hlID('Normal')), 'bg#')")
+        .expect("Normal's background");
+    let normal = normal
+        .as_str()
+        .and_then(|bg| u32::from_str_radix(bg.trim_start_matches('#'), 16).ok());
+    let mut term = Terminal::spawn(&sock, &config);
+    let drawn = |s: &str| s.contains("before the program");
+    assert!(
+        term.pump_until(Duration::from_secs(20), drawn),
+        "never drawn:\n{}",
+        term.text()
+    );
+    rpc.command(&format!("terminal nvim --clean -l {}", program.display()))
+        .expect("start the program");
+    let (mut frames, mut seen, mut wrong) = (0, std::collections::HashSet::new(), Vec::new());
+    let finished = term.frames(Duration::from_secs(60), |screen| {
+        frames += 1;
+        // The window's rows: the status line and the command line below
+        // them are the editor's.
+        for r in 0..ROWS - 2 {
+            for c in 0..COLS {
+                let Some(vt100::Color::Rgb(red, green, blue)) =
+                    screen.cell(r, c).map(|cell| cell.bgcolor())
+                else {
+                    continue;
+                };
+                let rgb = u32::from(red) << 16 | u32::from(green) << 8 | u32::from(blue);
+                if Some(rgb) == normal {
+                    continue;
+                }
+                if (u16::from(red), u16::from(green)) != (r, c) {
+                    wrong.push((frames, r, c, (red, green, blue)));
+                } else if blue != 255 {
+                    seen.insert(blue);
+                }
+            }
+        }
+        seen.contains(&249)
+    });
+    assert!(
+        finished,
+        "the program never drew its last frame: {} of its frames drawn",
+        seen.len()
+    );
+    assert!(
+        wrong.is_empty(),
+        "{} cells of {frames} frames drawn in another cell's colours, the first \
+         (frame, row, column, colour): {:?}",
+        wrong.len(),
+        &wrong[..wrong.len().min(8)]
+    );
+    // A highlight a cell for 70 cells a row, 22 rows a frame: some 43
+    // frames fill Neovim's table.
+    assert!(
+        seen.len() >= 100,
+        "only {} of the program's 250 frames were drawn: too few to fill Neovim's table twice",
+        seen.len()
+    );
 }

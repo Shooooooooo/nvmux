@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use super::grid::Grid;
+use super::grid::{Cell, Grid};
 use super::redraw::{Event, ModeInfo, OptionValue};
 use super::style::{Attrs, Colors, DefaultColors, Style};
 use crate::palette::Palette;
@@ -193,13 +193,139 @@ pub struct Changes {
     pub exit: Option<i64>,
 }
 
-/// The highlights Neovim has defined, by id.
+/// What [`Highlights::ids`] holds for one of Neovim's ids it has yet to
+/// define.
+const UNDEFINED: u32 = u32::MAX;
+
+/// How many of the client's ids are retired (see [`Highlights`]) past those
+/// the last sweep found still held before the next sweep is made. A sweep
+/// reads every cell the client keeps, and a `:terminal` playing an animation
+/// in truecolour has Neovim give out thousands of ids again a frame.
+const RECLAIM_AT: usize = 4096;
+
+/// The highlights Neovim has defined, under the ids the client's cells hold
+/// them by.
+///
+/// That is Neovim's own id for each, until Neovim gives the id to another
+/// highlight. It keeps 65 535 of them, and a `:terminal` drawing in truecolour
+/// fills that fast — every pair of colours its cells are in is a highlight of
+/// its own, thousands a frame for an animation — after which it clears the
+/// table and gives the same ids out again: part way through drawing a frame as
+/// often as not, the cells it drew before that still naming them until it
+/// draws them again, in a later flush. Neovim's own TUI writes a cell's
+/// colours out as the cell comes, so what it has written keeps them. This
+/// client resolves its cells once a batch is whole (see `super::App`), and
+/// keeps them besides in what its animations show of a moment ago: so an id
+/// Neovim defines anew is given another of the client's own, and a cell drawn
+/// before keeps the id it had, and what that meant. Left to mean the new
+/// highlight, every such cell took its colours for a flush — a flash of wrong
+/// colours over a truecolour animation in a `:terminal`, several times a
+/// second.
+///
+/// The client's id a highlight had before is retired, and given out again
+/// once nothing holds it: see [`Model::reclaim`].
 #[derive(Debug, Default)]
 struct Highlights {
+    /// Every highlight by the client's id for it; none for an id never used.
     defs: Vec<Option<(Attrs, Attrs)>>,
+    /// The client's id for each of Neovim's, by Neovim's: its own until
+    /// Neovim defines it anew, and [`UNDEFINED`] until it defines it at all.
+    ids: Vec<u32>,
+    /// Retired: the client's ids for highlights whose ids Neovim has since
+    /// given to others, which cells drawn before may still hold.
+    retired: Vec<u32>,
+    /// How many of those the last sweep found still held.
+    kept: usize,
+    /// Ids nothing holds, to be given out again.
+    free: Vec<u32>,
+    /// Ids defined since the styles were last resolved.
+    fresh: Vec<u32>,
     /// The editor's highlight groups the client colours its own rows with,
     /// by group id, as the agent sends them: see [`syntax_hl`].
     groups: HashMap<u32, (Attrs, Attrs)>,
+}
+
+impl Highlights {
+    /// The client's id for Neovim's highlight `id`. One never defined is its
+    /// own, as a cell in it is drawn: in the default colours.
+    fn client(&self, id: u32) -> u32 {
+        match self.ids.get(id as usize) {
+            Some(&k) if k != UNDEFINED => k,
+            _ => id,
+        }
+    }
+
+    /// Neovim defines its highlight `id` as `def`, for the first time or
+    /// anew.
+    fn define(&mut self, id: u32, def: (Attrs, Attrs)) {
+        let i = id as usize;
+        if self.ids.len() <= i {
+            self.ids.resize(i + 1, UNDEFINED);
+        }
+        let k = match self.ids[i] {
+            // The default, whatever is sent for it: not a cell's to keep.
+            _ if id == 0 => 0,
+            UNDEFINED if self.unused(id) => id,
+            UNDEFINED => self.take(),
+            // Sent again as it was: a UI attaching is sent every highlight.
+            k if self.defs[k as usize].as_ref() == Some(&def) => return,
+            k => {
+                self.retired.push(k);
+                self.take()
+            }
+        };
+        self.ids[i] = k;
+        let n = k as usize;
+        if self.defs.len() <= n {
+            self.defs.resize(n + 1, None);
+        }
+        self.defs[n] = Some(def);
+        self.fresh.push(k);
+    }
+
+    /// Whether the client has never used id `k`, which Neovim's id of the
+    /// same number may then have.
+    fn unused(&self, k: u32) -> bool {
+        self.defs.get(k as usize).is_none_or(Option::is_none)
+    }
+
+    /// An id for a highlight Neovim defines anew: one nothing holds any
+    /// more, or one past every id used.
+    fn take(&mut self) -> u32 {
+        self.free.pop().unwrap_or_else(|| {
+            self.defs.push(None);
+            (self.defs.len() - 1) as u32
+        })
+    }
+}
+
+/// The highlight ids something holds: a cell, a highlight group, a mode's
+/// cursor — what a sweep may not give out again (see [`Model::reclaim`]).
+#[derive(Debug)]
+pub struct Held(Vec<u64>);
+
+impl Held {
+    /// Highlight `hl` is held — the one under it, for a group laid over one
+    /// (see [`syntax_hl`]).
+    pub fn mark(&mut self, hl: u32) {
+        let hl = if hl & SYNTAX != 0 { hl & 0xffff } else { hl };
+        if let Some(word) = self.0.get_mut(hl as usize / 64) {
+            *word |= 1 << (hl % 64);
+        }
+    }
+
+    /// Every one of `cells`' highlights is held.
+    pub fn cells<'a>(&mut self, cells: impl IntoIterator<Item = &'a Cell>) {
+        for cell in cells {
+            self.mark(cell.hl);
+        }
+    }
+
+    fn holds(&self, hl: u32) -> bool {
+        self.0
+            .get(hl as usize / 64)
+            .is_some_and(|word| word & (1 << (hl % 64)) != 0)
+    }
 }
 
 /// Set in a cell's highlight id that is not Neovim's: a highlight group of
@@ -259,6 +385,8 @@ pub struct Model {
     /// before it places a window, and not again when it places it anew.
     pub margins: HashMap<u64, Margins>,
     pub cursor: CursorPos,
+    /// `mode_info_set`'s modes, each cursor's highlight by the client's id
+    /// for it.
     pub modes: Vec<ModeInfo>,
     pub mode: usize,
     pub mode_name: String,
@@ -270,18 +398,20 @@ pub struct Model {
     pub mouse: bool,
     pub title: String,
     pub defaults: DefaultColors,
-    /// `hl_group_set`: the highlight ids of the groups the UI draws itself.
+    /// `hl_group_set`: the highlights of the groups the UI draws itself, by
+    /// the client's ids for them (see [`Highlights`]).
     pub groups: HashMap<String, u32>,
     /// `'laststatus'`, as the editor's measure says it (see
     /// [`super::wide::MEASURE_LUA`]): which windows have a status line of
     /// their own. `None` until it has said.
     pub laststatus: Option<i64>,
     highlights: Highlights,
-    /// Every highlight resolved for drawing, by id, and its blend: rebuilt when
-    /// a highlight, the defaults or `'termguicolors'` change (see
-    /// [`Model::colors`]).
+    /// Every highlight resolved for drawing, by id, and its blend: each as it
+    /// is defined, and all of them again when the defaults or
+    /// `'termguicolors'` change (see [`Model::colors`]).
     styles: Vec<Style>,
     blends: Vec<u8>,
+    /// The defaults or `'termguicolors'` have changed since.
     styles_stale: bool,
     term: Palette,
     /// Every hyperlink a highlight has named, in the order they came: link
@@ -334,7 +464,8 @@ impl Model {
         }
     }
 
-    /// Highlight `id` resolved for drawing; an id never defined is the
+    /// Highlight `id` resolved for drawing, by the client's id for it, as a
+    /// cell holds it (see [`Highlights`]); an id never defined is the
     /// default.
     pub fn style(&self, id: u32) -> Style {
         if id & SYNTAX != 0 {
@@ -366,7 +497,8 @@ impl Model {
         self.highlights.groups.insert(group, (rgb, cterm));
     }
 
-    /// Highlight `id` as Neovim defined it, in both its forms.
+    /// Highlight `id` as Neovim defined it, in both its forms, by the
+    /// client's id for it.
     pub fn attrs(&self, id: u32) -> Option<&(Attrs, Attrs)> {
         self.highlights.defs.get(id as usize)?.as_ref()
     }
@@ -503,8 +635,13 @@ impl Model {
                 grid,
                 row,
                 col,
-                cells,
+                mut cells,
             } => {
+                for run in &mut cells {
+                    if let Some(hl) = &mut run.hl {
+                        *hl = self.highlights.client(*hl);
+                    }
+                }
                 if let Some(g) = self.grids.get_mut(&grid) {
                     g.put(row, col, &cells);
                 }
@@ -531,17 +668,9 @@ impl Model {
                 self.defaults = d;
                 self.styles_stale = true;
             }
-            Event::HlAttr { id, rgb, cterm } => {
-                let defs = &mut self.highlights.defs;
-                let i = id as usize;
-                if defs.len() <= i {
-                    defs.resize(i + 1, None);
-                }
-                defs[i] = Some((rgb, cterm));
-                self.styles_stale = true;
-            }
+            Event::HlAttr { id, rgb, cterm } => self.highlights.define(id, (rgb, cterm)),
             Event::HlGroup { name, id } => {
-                self.groups.insert(name, id);
+                self.groups.insert(name, self.highlights.client(id));
             }
             Event::WinPos {
                 grid,
@@ -669,7 +798,10 @@ impl Model {
                     },
                 );
             }
-            Event::ModeInfoSet { enabled, modes } => {
+            Event::ModeInfoSet { enabled, mut modes } => {
+                for m in &mut modes {
+                    m.attr_id = self.highlights.client(m.attr_id);
+                }
                 self.cursor_styled = enabled;
                 self.modes = modes;
             }
@@ -779,50 +911,92 @@ impl Model {
         }
     }
 
-    /// Resolve every highlight again, if anything they depend on changed.
-    /// Says whether it did: every cell may look different now.
+    /// Resolve the highlights defined since — or every one again, if what
+    /// they all depend on changed. Says whether it did: cells may look
+    /// different now.
+    ///
+    /// One by one otherwise: Neovim defines thousands a frame for a
+    /// `:terminal` playing an animation in truecolour (see [`Highlights`]),
+    /// and resolving the whole table again for each frame of them took the
+    /// client longer than drawing the frame.
     pub fn refresh_styles(&mut self) -> bool {
-        if !self.styles_stale {
+        let fresh = std::mem::take(&mut self.highlights.fresh);
+        if !self.styles_stale && fresh.is_empty() {
             return false;
         }
-        self.styles_stale = false;
         let colors = self.colors();
-        let rgb = self.options.termguicolors;
         let plain = colors.default_style();
-        // Id 0 is never defined, and is the default whatever is sent for it.
         let n = self.highlights.defs.len().max(1);
-        self.styles = (0..n)
-            .map(|id| match self.highlights.defs.get(id) {
-                Some(Some((g, c))) if id > 0 => colors.style(g, c),
-                _ => plain,
-            })
-            .collect();
+        if self.styles_stale {
+            self.styles_stale = false;
+            self.styles.clear();
+            self.blends.clear();
+        }
+        let resolved = self.styles.len();
+        self.styles.resize(n, plain);
+        self.blends.resize(n, 0);
+        if resolved == 0 {
+            for id in 1..n {
+                self.resolve(id, &colors);
+            }
+        } else {
+            for id in fresh {
+                self.resolve(id as usize, &colors);
+            }
+        }
+        true
+    }
+
+    /// Resolve highlight `id` for drawing, as `colors` say. Id 0 is never
+    /// defined, and is the default whatever is sent for it.
+    fn resolve(&mut self, id: usize, colors: &Colors) {
+        let Some(Some((rgb, cterm))) = self.highlights.defs.get(id).filter(|_| id > 0) else {
+            return;
+        };
+        let style = colors.style(rgb, cterm);
+        let blend = if colors.rgb { rgb.blend } else { cterm.blend };
         // A hyperlink comes with the GUI form only, and is one whichever form
         // is drawn.
-        let urls: Vec<(usize, Box<str>)> = self
-            .highlights
-            .defs
-            .iter()
-            .enumerate()
-            .filter_map(|(id, def)| Some((id, def.as_ref()?.0.url.clone()?)))
-            .filter(|(id, _)| *id > 0)
-            .collect();
-        for (id, url) in urls {
-            self.styles[id].link = self.link_number(&url);
+        let link = rgb.url.clone().map_or(0, |url| self.link_number(&url));
+        self.styles[id] = Style { link, ..style };
+        self.blends[id] = blend;
+    }
+
+    /// Whether enough of the client's ids are retired that a sweep is due:
+    /// see [`Model::reclaim`].
+    pub fn reclaiming(&self) -> bool {
+        let h = &self.highlights;
+        h.retired.len() >= h.kept + RECLAIM_AT
+    }
+
+    /// The highlights the model holds itself — in its grids, its highlight
+    /// groups and its modes' cursors — to which whatever else keeps cells
+    /// across a flush adds its own before a sweep: see [`Model::reclaim`].
+    pub fn held(&self) -> Held {
+        let mut held = Held(vec![0; self.highlights.defs.len().div_ceil(64)]);
+        for g in self.grids.values() {
+            for r in 0..g.height() {
+                held.cells(g.row(r));
+            }
         }
-        self.blends = (0..n)
-            .map(|id| match self.highlights.defs.get(id) {
-                Some(Some((g, c))) if id > 0 => {
-                    if rgb {
-                        g.blend
-                    } else {
-                        c.blend
-                    }
-                }
-                _ => 0,
-            })
-            .collect();
-        true
+        for hl in self.groups.values() {
+            held.mark(*hl);
+        }
+        for mode in &self.modes {
+            held.mark(mode.attr_id);
+        }
+        held
+    }
+
+    /// Give out again every retired id nothing in `held` holds: no cell, in
+    /// the model or in anything that keeps cells across a flush, can be drawn
+    /// in it any more. See [`Highlights`].
+    pub fn reclaim(&mut self, held: &Held) {
+        let h = &mut self.highlights;
+        let (kept, free): (Vec<u32>, Vec<u32>) = h.retired.iter().partition(|k| held.holds(**k));
+        h.free.extend(free);
+        h.kept = kept.len();
+        h.retired = kept;
     }
 }
 
@@ -831,6 +1005,7 @@ mod tests {
     use super::*;
     use crate::client::grid::Text;
     use crate::client::redraw::LineCell;
+    use crate::client::style::Color;
     use crate::palette::Rgb;
 
     fn model() -> Model {
@@ -1286,5 +1461,253 @@ mod tests {
         assert!(!m.grids.contains_key(&4));
         assert!(!m.layout.contains_key(&4));
         assert!(changes.reshaped.contains(&4));
+    }
+
+    /// Neovim's highlight `id`, its foreground `0xRRGGBB`.
+    fn coloured(id: u32, fg: u32) -> Event {
+        Event::HlAttr {
+            id,
+            rgb: Attrs {
+                fg: Some(fg),
+                ..Attrs::default()
+            },
+            cterm: Attrs::default(),
+        }
+    }
+
+    /// Row `row` of grid 1, all three cells of it, in Neovim's highlight
+    /// `hl`.
+    fn row_in(row: usize, hl: u32) -> Event {
+        Event::GridLine {
+            grid: 1,
+            row,
+            col: 0,
+            cells: vec![LineCell {
+                text: Text::Char('x'),
+                hl: Some(hl),
+                repeat: 3,
+            }],
+        }
+    }
+
+    /// A model drawing in RGB, its grid 1 three cells by two.
+    fn in_rgb() -> Model {
+        let mut m = model();
+        apply(
+            &mut m,
+            vec![
+                Event::OptionSet {
+                    name: "termguicolors".into(),
+                    value: OptionValue::Bool(true),
+                },
+                Event::GridResize {
+                    grid: 1,
+                    width: 3,
+                    height: 2,
+                },
+            ],
+        );
+        m
+    }
+
+    /// The foreground each of `cells` is drawn in.
+    fn fgs(m: &Model, cells: &[Cell]) -> Vec<Color> {
+        cells.iter().map(|c| m.style(c.hl).fg).collect()
+    }
+
+    fn fg(n: u32) -> Color {
+        Color::Rgb(crate::client::style::rgb(n))
+    }
+
+    /// Neovim's table of highlights full, it clears it part way through
+    /// drawing a frame and gives the same ids out again, the cells it drew
+    /// before still naming them until it draws them again. They keep the
+    /// colours their id had when they were drawn — and so does a copy of
+    /// them kept of a moment ago, as an animation keeps one.
+    #[test]
+    fn a_cell_keeps_the_colours_its_highlight_had_when_it_was_drawn() {
+        let (red, blue, green) = (fg(0xff0000), fg(0x0000ff), fg(0x00ff00));
+        let mut m = in_rgb();
+        apply(
+            &mut m,
+            vec![
+                coloured(5, 0xff0000),
+                row_in(0, 5),
+                coloured(5, 0x0000ff),
+                row_in(1, 5),
+            ],
+        );
+        m.refresh_styles();
+        assert_eq!(fgs(&m, m.grids[&1].row(0)), vec![red; 3], "drawn before");
+        assert_eq!(fgs(&m, m.grids[&1].row(1)), vec![blue; 3], "drawn after");
+        let kept = m.grids[&1].lines(0, 1, 0, 3);
+        apply(&mut m, vec![coloured(5, 0x00ff00), row_in(0, 5)]);
+        m.refresh_styles();
+        assert_eq!(fgs(&m, &kept[0]), vec![red; 3], "kept of a moment ago");
+        assert_eq!(fgs(&m, m.grids[&1].row(0)), vec![green; 3]);
+        assert_eq!(fgs(&m, m.grids[&1].row(1)), vec![blue; 3]);
+    }
+
+    /// A highlight sent again as it was — every one is, to a UI attaching —
+    /// keeps its id, and gives none up.
+    #[test]
+    fn a_highlight_sent_again_as_it_was_keeps_its_id() {
+        let mut m = in_rgb();
+        apply(
+            &mut m,
+            vec![
+                coloured(5, 0xff0000),
+                row_in(0, 5),
+                coloured(5, 0xff0000),
+                row_in(1, 5),
+            ],
+        );
+        let g = &m.grids[&1];
+        assert!(g.row(0).iter().chain(g.row(1)).all(|c| c.hl == 5));
+        assert!(m.highlights.retired.is_empty());
+    }
+
+    /// What names a highlight as it is now — a group the client draws its
+    /// own rows in, a mode's cursor — names what Neovim last defined.
+    #[test]
+    fn groups_and_cursors_are_in_the_highlight_last_defined() {
+        let mut m = in_rgb();
+        apply(
+            &mut m,
+            vec![
+                coloured(5, 0xff0000),
+                row_in(0, 5),
+                coloured(5, 0x0000ff),
+                Event::HlGroup {
+                    name: "EndOfBuffer".into(),
+                    id: 5,
+                },
+                Event::ModeInfoSet {
+                    enabled: true,
+                    modes: vec![ModeInfo {
+                        attr_id: 5,
+                        ..ModeInfo::default()
+                    }],
+                },
+            ],
+        );
+        m.refresh_styles();
+        assert_eq!(m.style(m.groups["EndOfBuffer"]).fg, fg(0x0000ff));
+        assert_eq!(m.style(m.modes[0].attr_id).fg, fg(0x0000ff));
+        assert_eq!(m.style(m.grids[&1].row(0)[0].hl).fg, fg(0xff0000));
+    }
+
+    /// A session whose table of highlights is cleared and filled again every
+    /// few frames, for good, holds no more ids than its table has and its
+    /// cells hold: one Neovim has given out again is given back once nothing
+    /// holds it, and out again. One a cell holds — or anything else that
+    /// keeps cells, as an animation does — is not.
+    #[test]
+    fn an_id_is_given_out_again_once_nothing_holds_it() {
+        // Neovim's table cleared and filled again: ids 1 to 4 given to
+        // highlights in colours of the `n`th time.
+        fn refill(n: u32) -> Vec<Event> {
+            (1..=4).map(|id| coloured(id, n << 8 | id)).collect()
+        }
+        let mut m = in_rgb();
+        for n in 0..100 {
+            let mut events = refill(n);
+            events.extend([row_in(0, 1), row_in(1, 4)]);
+            apply(&mut m, events);
+            let held = m.held();
+            m.reclaim(&held);
+        }
+        m.refresh_styles();
+        assert_eq!(fgs(&m, m.grids[&1].row(0)), vec![fg(99 << 8 | 1); 3]);
+        assert_eq!(fgs(&m, m.grids[&1].row(1)), vec![fg(99 << 8 | 4); 3]);
+        assert!(
+            m.highlights.defs.len() <= 9,
+            "{} ids for a table of 4",
+            m.highlights.defs.len()
+        );
+
+        // Given out again with cells still drawn in them, and given out again
+        // once more after they are drawn anew — but kept, as an animation
+        // keeps them: they keep their colours through a third time.
+        let kept = m.grids[&1].lines(0, 2, 0, 3);
+        let shown: Vec<Vec<Color>> = kept.iter().map(|row| fgs(&m, row)).collect();
+        apply(&mut m, refill(200));
+        let held = m.held();
+        m.reclaim(&held);
+        let mut events = refill(201);
+        events.extend([row_in(0, 1), row_in(1, 4)]);
+        apply(&mut m, events);
+        let mut held = m.held();
+        for row in &kept {
+            held.cells(row);
+        }
+        m.reclaim(&held);
+        apply(&mut m, refill(202));
+        m.refresh_styles();
+        let now: Vec<Vec<Color>> = kept.iter().map(|row| fgs(&m, row)).collect();
+        assert_eq!(now, shown);
+    }
+
+    /// A sweep waits for [`RECLAIM_AT`] ids to be given out again past those
+    /// the last one found still held; a group laid over a highlight holds
+    /// the highlight.
+    #[test]
+    fn a_sweep_waits_for_enough_ids_to_have_been_given_out_again() {
+        let mut m = in_rgb();
+        let n = RECLAIM_AT as u32;
+        apply(&mut m, (1..=n).map(|id| coloured(id, 1)).collect());
+        apply(&mut m, vec![row_in(0, 1)]);
+        apply(&mut m, (1..n).map(|id| coloured(id, 2)).collect());
+        assert!(!m.reclaiming(), "one short");
+        apply(&mut m, vec![coloured(n, 2)]);
+        assert!(m.reclaiming());
+        let mut held = m.held();
+        held.mark(syntax_hl(2, 40));
+        m.reclaim(&held);
+        assert_eq!(
+            m.highlights.retired,
+            vec![1, 2],
+            "held by a cell and by a group laid over it"
+        );
+        assert!(!m.reclaiming());
+        apply(&mut m, (1..n).map(|id| coloured(id, 3)).collect());
+        assert!(!m.reclaiming(), "the two still held do not count");
+        apply(&mut m, vec![coloured(n, 3)]);
+        assert!(m.reclaiming());
+    }
+
+    /// Highlights resolved one by one as they come resolve as they would all
+    /// at once: their colours, blends and links.
+    #[test]
+    fn highlights_resolved_as_they_come_are_as_resolved_all_at_once() {
+        let mut m = in_rgb();
+        let def = |id: u32, n: u32| Event::HlAttr {
+            id,
+            rgb: Attrs {
+                fg: Some(n),
+                blend: (n % 100) as u8,
+                url: n
+                    .is_multiple_of(3)
+                    .then(|| format!("https://example.com/{}", n % 7).into()),
+                ..Attrs::default()
+            },
+            cterm: Attrs {
+                fg: Some(n % 256),
+                ..Attrs::default()
+            },
+        };
+        for round in 0..5 {
+            apply(
+                &mut m,
+                (1..=40).map(|id| def(id, round * 100 + id)).collect(),
+            );
+            apply(&mut m, vec![row_in(0, 1 + round)]);
+            m.refresh_styles();
+        }
+        let (styles, blends) = (m.styles.clone(), m.blends.clone());
+        m.styles_stale = true;
+        m.refresh_styles();
+        assert_eq!(m.styles, styles);
+        assert_eq!(m.blends, blends);
     }
 }

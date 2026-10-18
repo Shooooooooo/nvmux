@@ -52,7 +52,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use super::Windows;
 use crate::client::compose::{self, Frame, Out};
 use crate::client::grid::{Cell, Grid, Text};
-use crate::client::model::{Model, Place};
+use crate::client::model::{Held, Model, Place};
 use crate::client::redraw::Event;
 use crate::client::style::Colors;
 use crate::palette::Rgb;
@@ -1173,6 +1173,25 @@ impl Transition {
     /// Whether window grid `grid` is one of those moving.
     pub fn involves(&self, grid: u64) -> bool {
         self.wins.contains_key(&grid)
+    }
+
+    /// What the windows showed before, the veil a window opened fades in
+    /// out of, and every ghost of windows closed hold their highlights: see
+    /// [`crate::client::model::Model::reclaim`].
+    pub fn hold(&self, held: &mut Held) {
+        for row in self.rows.values().flatten() {
+            held.cells(row);
+        }
+        if let Some((_, veil)) = self.veil {
+            held.mark(veil);
+        }
+        for ghost in self.ghosts.iter().flat_map(|g| &g.list) {
+            for row in &ghost.picture {
+                held.cells(row);
+            }
+            held.mark(ghost.bg);
+            held.cells(std::iter::once(&ghost.line).chain(&ghost.corner));
+        }
     }
 
     /// Where each window is this frame.
