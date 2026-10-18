@@ -226,9 +226,15 @@ pub struct ClientSettings {
     /// `<C-f>`, `zz`, `zl` and their kind, in Normal mode or Insert — or a
     /// turn of the mouse wheel, either way, scrolls the window at once,
     /// before Neovim has heard of it, once the round trip to
-    /// the session is long enough to be worth it — about 30 ms, which a
-    /// session on this machine never is. nvmux's own client only (see
-    /// [`crate::client::predict`]).
+    /// the session is long enough to be worth it — about 30 ms. nvmux's own
+    /// client only (see [`crate::client::predict`]).
+    ///
+    /// `"auto"`, the default, scrolls ahead for sessions on another machine,
+    /// over ssh, and not for this machine's, whose round trip never is that
+    /// long: their clients neither leave the editor anything to predict with
+    /// nor time its answers. `"on"` scrolls ahead for any session once its
+    /// round trip is long enough, and `"off"` for none: every scroll waits
+    /// for Neovim.
     ///
     /// What it costs: the rows a scroll uncovers are drawn without their
     /// signs or virtual text until Neovim's own arrive, a round trip later,
@@ -236,30 +242,30 @@ pub struct ClientSettings {
     /// but not `:syntax`'s; and the agent the client leaves in the editor
     /// sends the text of the lines around each window's view over the link,
     /// and those colours, as the view moves — more of them the slower the
-    /// link. Off, every scroll waits for Neovim.
-    pub predict: bool,
+    /// link.
+    pub predict: Predict,
     /// On a terminal wider than a window's text needs, draw the text in the
     /// middle of the window: a window wider than its text wants has it that
     /// wide, its lines wrapping there and its status line's words standing
-    /// over it. A window showing a terminal keeps its whole width: the
+    /// over it. nvmux's own client only (see `crate::client::wide`).
+    ///
+    /// `"off"`, the default, has every window's text as wide as the window,
+    /// as Neovim's own client draws it. `"smart"` judges how wide each
+    /// window's text is to be by what it shows: its buffer's `'textwidth'`
+    /// where it has one, and room for its long lines where they are not
+    /// wrapped — all of them with `'wrap'` off, and with it on those of a
+    /// Markdown table or code block. `"fixed"` gives every window's text
+    /// `window_width`.
+    ///
+    /// Either way, a window showing a terminal keeps its whole width: the
     /// program in it is told its window's width. So does a window whose
     /// text is in its middle already, as a start screen lays itself out.
-    /// Off, the default, every window's text is as wide as the window, as
-    /// Neovim's own client draws it. nvmux's own client only (see
-    /// `crate::client::wide`).
-    pub centre: bool,
-    /// How many columns a window's text gets with `centre` on, where
-    /// `smart_width` does not judge otherwise. 0 for no limit, which is
-    /// `centre` off whatever that says.
+    pub centre: Centre,
+    /// How many columns a window's text gets with `centre` on: every
+    /// window's with `"fixed"`, and with `"smart"` one whose buffer has no
+    /// `'textwidth'`, unless its long lines want more. 0 for no limit, which
+    /// is `centre = "off"` whatever that says.
     pub window_width: u16,
-    /// With `centre` on, judge how wide each window's text is to be by what
-    /// it shows, rather than give every window `window_width`: its buffer's
-    /// `'textwidth'` where it has one, and room for its long lines where they
-    /// are not wrapped — all of them with `'wrap'` off, and with it on those
-    /// of a Markdown table or code block. A window showing a terminal, or
-    /// whose text is in its middle already, keeps its whole width either way
-    /// (see `crate::client::wide`).
-    pub smart_width: bool,
     /// Write each frame to the terminal in as few bytes as it takes, as
     /// Neovim's own TUI does: the cursor moved on from where the last cell
     /// left it — along a row by CUF, or by writing a few cells again, and to
@@ -287,26 +293,163 @@ impl Default for ClientSettings {
             lazy: false,
             revive: false,
             throttle: false,
-            predict: true,
-            centre: false,
+            predict: Predict::Auto,
+            centre: Centre::Off,
             window_width: 120,
-            smart_width: true,
             lean_output: true,
         }
     }
 }
 
+impl ClientSettings {
+    /// Whether a client scrolls ahead of a slow link, as `predict` says, for
+    /// a session on another machine if `remote`, and on this one if not.
+    pub fn predicts(&self, remote: bool) -> bool {
+        match self.predict {
+            Predict::Auto => remote,
+            Predict::On => true,
+            Predict::Off => false,
+        }
+    }
+}
+
+/// `[client] predict`: which sessions' clients scroll ahead of a slow link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Predict {
+    /// Those of sessions on another machine, over ssh.
+    #[default]
+    Auto,
+    /// Any session's, once its round trip is long enough.
+    On,
+    /// None.
+    Off,
+}
+
+impl Predict {
+    /// Every way, in the order the settings screen steps through them.
+    pub const ALL: [Predict; 3] = [Predict::Auto, Predict::On, Predict::Off];
+
+    /// The way as the file spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Predict::Auto => "auto",
+            Predict::On => "on",
+            Predict::Off => "off",
+        }
+    }
+}
+
+/// `[client] centre`: each window's text in the middle of a window wider
+/// than it needs, or not, and how wide it is there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Centre {
+    /// As wide as the window, as Neovim's own client draws it.
+    #[default]
+    Off,
+    /// In the middle, as wide as what the window shows wants.
+    Smart,
+    /// In the middle, `window_width` wide.
+    Fixed,
+}
+
+impl Centre {
+    /// Every way, in the order the settings screen steps through them.
+    pub const ALL: [Centre; 3] = [Centre::Off, Centre::Smart, Centre::Fixed];
+
+    /// The way as the file spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Centre::Off => "off",
+            Centre::Smart => "smart",
+            Centre::Fixed => "fixed",
+        }
+    }
+}
+
+// Read as the words the file spells them with (see `de_way`): anything else,
+// the switch each of them once was among it, is refused with the words that
+// would do.
+
+impl<'de> Deserialize<'de> for Predict {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        de_way(deserializer, &Predict::ALL, Predict::name)
+    }
+}
+
+impl<'de> Deserialize<'de> for Centre {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        de_way(deserializer, &Centre::ALL, Centre::name)
+    }
+}
+
+/// One of `all`, read from the word `name` spells it with. Anything else is
+/// refused in words that say which words would do — `expected "off",
+/// "smart" or "fixed"` — where TOML's own for a setting that is no word at
+/// all, `true` say, is "wanted string or table".
+fn de_way<'de, D, T>(
+    deserializer: D,
+    all: &'static [T],
+    name: fn(T) -> &'static str,
+) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Copy + 'static,
+{
+    struct Way<T: 'static> {
+        all: &'static [T],
+        name: fn(T) -> &'static str,
+    }
+
+    impl<T: Copy + 'static> serde::de::Visitor<'_> for Way<T> {
+        type Value = T;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            for (i, way) in self.all.iter().enumerate() {
+                let between = match i {
+                    0 => "",
+                    i if i + 1 == self.all.len() => " or ",
+                    _ => ", ",
+                };
+                write!(f, "{between}{:?}", (self.name)(*way))?;
+            }
+            Ok(())
+        }
+
+        fn visit_str<E: serde::de::Error>(self, word: &str) -> Result<T, E> {
+            self.all
+                .iter()
+                .copied()
+                .find(|way| (self.name)(*way) == word)
+                .ok_or_else(|| E::invalid_value(serde::de::Unexpected::Str(word), &self))
+        }
+    }
+
+    deserializer.deserialize_str(Way { all, name })
+}
+
 /// What nvmux's own client draws with: `[client]` and `[effects]`, of the
-/// settings nvmux is running on.
+/// settings nvmux is running on, and whether the sessions are another
+/// machine's, which `[client] predict = "auto"` goes by.
 ///
 /// Handed to a client as it starts, in its environment ([`Drawing::to_env`]),
 /// and told again whenever they change (`card::Command::Settings`), rather
 /// than read from the file by the client itself: the file does not have
-/// what the settings screen has changed and not saved.
+/// what the settings screen has changed and not saved, nor where the
+/// sessions are, which is the command line's to say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Drawing {
     pub client: ClientSettings,
     pub effects: EffectsSettings,
+    /// The sessions are on another machine, over ssh: see [`remote`].
+    pub remote: bool,
 }
 
 impl Drawing {
@@ -332,11 +475,13 @@ impl Drawing {
 }
 
 impl Settings {
-    /// What nvmux's own client draws with, of these settings.
+    /// What nvmux's own client draws with, of these settings, for the
+    /// sessions this nvmux runs.
     pub fn drawing(&self) -> Drawing {
         Drawing {
             client: self.client,
             effects: self.effects,
+            remote: remote(),
         }
     }
 }
@@ -1283,10 +1428,9 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          # lazy         = {lazy:<8}   # start every client at launch; true waits for each session's first visit\n\
          # revive       = {revive:<8}   # true starts again, once a dropped link is back, the clients it took\n\
          # throttle     = {throttle:<8}   # true draws a session out of sight once a second, not as it changes\n\
-         # predict      = {predict:<8}   # over a slow link, scrolls show before Neovim answers\n\
-         # centre       = {centre:<8}   # on a wide terminal, each window's text in the middle of the window\n\
+         # predict      = {predict:<8}   # over ssh, scrolls show before Neovim answers; \"on\" over any slow link\n\
+         # centre       = {centre:<8}   # on a wide terminal, each window's text in its middle: \"smart\" or \"fixed\"\n\
          # window_width = {window_width:<8}   # with centre on, how many columns a window's text gets; 0 for no limit\n\
-         # smart_width  = {smart_width:<8}   # or as many as what it shows wants: its 'textwidth', its long lines\n\
          # lean_output  = {lean_output:<8}   # fewer bytes per frame, the same screen; false makes every move absolute\n\
          \n\
          [style]\n\
@@ -1343,10 +1487,9 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
         lazy = c.lazy,
         revive = c.revive,
         throttle = c.throttle,
-        predict = c.predict,
-        centre = c.centre,
+        predict = quoted(c.predict.name()),
+        centre = quoted(c.centre.name()),
         window_width = c.window_width,
-        smart_width = c.smart_width,
         lean_output = c.lean_output,
         style_color = quoted(&t.color.name()),
         style_float = t.float,
@@ -2037,6 +2180,23 @@ pub fn set_saved(settings: Settings) {
     STORE.set_saved(settings);
 }
 
+/// Whether the sessions this nvmux runs are on another machine, over ssh.
+static REMOTE: AtomicBool = AtomicBool::new(false);
+
+/// Say whether the sessions are on another machine, over ssh, as `main`
+/// does once, before it starts a client: what each client is told with its
+/// settings, for `[client] predict = "auto"` (see [`Drawing`]), and what the
+/// settings screen checks a change of `[client] ui` against.
+pub fn set_remote(remote: bool) {
+    REMOTE.store(remote, Ordering::Relaxed);
+}
+
+/// Whether the sessions are on another machine, as [`set_remote`] said: not
+/// until it has, which is a unit test's case, and a client's own.
+pub fn remote() -> bool {
+    REMOTE.load(Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2123,7 +2283,8 @@ mod tests {
             ui = \"nvmux\"\n\
             per_session = true\n\
             lazy = false\n\
-            predict = true\n\
+            predict = \"auto\"\n\
+            centre = \"off\"\n\
             [style]\n\
             color = \"terminal\"\n\
             float = true\n\
@@ -2299,31 +2460,68 @@ mod tests {
         assert!(s.client.lazy && !s.client.per_session);
     }
 
-    /// Scrolls are predicted over a slow link unless turned off.
+    /// Scrolls are predicted for sessions over ssh unless told otherwise, and
+    /// not for this machine's; for every session, or for none, is a word
+    /// away, spelt as the template spells it. The switch it was is an error.
     #[test]
-    fn scrolls_are_predicted_unless_turned_off() {
-        assert!(Settings::default().client.predict);
-        let s: Settings = toml::from_str("[client]\npredict = false\n").expect("valid");
-        assert!(!s.client.predict);
-        assert!(s.client.per_session && !s.client.lazy, "the rest as it was");
+    fn scrolls_are_predicted_over_ssh_unless_told() {
+        let c = Settings::default().client;
+        assert_eq!(c.predict, Predict::Auto);
+        assert!(c.predicts(true), "a session over ssh");
+        assert!(!c.predicts(false), "a session on this machine");
+        for way in Predict::ALL {
+            let doc = format!("[client]\npredict = \"{}\"\n", way.name());
+            let s: Settings = toml::from_str(&doc).expect("valid");
+            assert_eq!(s.client.predict, way);
+            assert!(s.client.per_session && !s.client.lazy, "the rest as it was");
+        }
+        let at = |predict| ClientSettings {
+            predict,
+            ..ClientSettings::default()
+        };
+        assert!(at(Predict::On).predicts(false) && at(Predict::On).predicts(true));
+        assert!(!at(Predict::Off).predicts(false) && !at(Predict::Off).predicts(true));
+        for old in ["true", "false"] {
+            let doc = format!("[client]\npredict = {old}\n");
+            let msg = toml::from_str::<Settings>(&doc)
+                .expect_err(&doc)
+                .to_string();
+            assert!(msg.contains(r#"expected "auto", "on" or "off""#), "{msg}");
+        }
     }
 
     /// A wide terminal is left alone unless told otherwise, and each window's
-    /// text centred up to 120 columns when it is: a switch, on or off, and
-    /// anything else an error.
+    /// text centred when it is, up to 120 columns or as wide as it wants:
+    /// each way a word away, spelt as the template spells it. The switches
+    /// they were, `centre` itself and `smart_width`, are errors.
     #[test]
     fn nothing_is_centred_unless_told() {
         let c = Settings::default().client;
-        assert_eq!((c.centre, c.window_width), (false, 120));
-        for on in [false, true] {
-            let s: Settings = toml::from_str(&format!("[client]\ncentre = {on}\n")).expect("valid");
-            assert_eq!(s.client.centre, on);
+        assert_eq!((c.centre, c.window_width), (Centre::Off, 120));
+        for way in Centre::ALL {
+            let doc = format!("[client]\ncentre = \"{}\"\n", way.name());
+            let s: Settings = toml::from_str(&doc).expect("valid");
+            assert_eq!(s.client.centre, way);
             assert_eq!(s.client.window_width, 120, "the rest as it was");
         }
         let s: Settings = toml::from_str("[client]\nwindow_width = 0\n").expect("valid");
         assert_eq!(s.client.window_width, 0);
-        assert!(toml::from_str::<Settings>("[client]\ncentre = \"windows\"\n").is_err());
-        assert!(toml::from_str::<Settings>("[client]\nwindow_width = -1\n").is_err());
+        for doc in [
+            "[client]\ncentre = true\n",
+            "[client]\ncentre = \"windows\"\n",
+        ] {
+            let msg = toml::from_str::<Settings>(doc).expect_err(doc).to_string();
+            assert!(
+                msg.contains(r#"expected "off", "smart" or "fixed""#),
+                "{msg}"
+            );
+        }
+        for doc in [
+            "[client]\nsmart_width = true\n",
+            "[client]\nwindow_width = -1\n",
+        ] {
+            assert!(toml::from_str::<Settings>(doc).is_err(), "{doc:?}");
+        }
     }
 
     /// A session out of sight drawn as it changes unless told otherwise; a
@@ -2354,16 +2552,6 @@ mod tests {
         assert!(Settings::default().client.lean_output);
         let s: Settings = toml::from_str("[client]\nlean_output = false\n").expect("valid");
         assert!(!s.client.lean_output);
-        assert!(s.client.smart_width, "the rest as it was");
-    }
-
-    /// Each window's text as wide as what it shows wants unless told
-    /// otherwise; `window_width` for every one of them is a line away.
-    #[test]
-    fn widths_are_judged_unless_told() {
-        assert!(Settings::default().client.smart_width);
-        let s: Settings = toml::from_str("[client]\nsmart_width = false\n").expect("valid");
-        assert!(!s.client.smart_width);
         assert_eq!(s.client.window_width, 120, "the rest as it was");
     }
 
@@ -2835,10 +3023,9 @@ mod tests {
             "# revive       = false",
             "# throttle     = false",
             "# ui           = \"nvmux\"",
-            "# predict      = true",
-            "# centre       = false",
+            "# predict      = \"auto\"",
+            "# centre       = \"off\"",
             "# window_width = 120",
-            "# smart_width  = true",
             "# lean_output  = true",
             "# color = \"terminal\"",
             "# float = true ",
@@ -2882,16 +3069,23 @@ mod tests {
     }
 
     /// What a client draws with goes to it in its environment and comes back
-    /// as it went, the rest of its settings the defaults.
+    /// as it went, where its sessions are included, the rest of its settings
+    /// the defaults.
     #[test]
     fn what_a_client_draws_with_survives_its_environment() {
         let mut settings = Settings::default();
         settings.client.ui = Ui::Nvim;
+        settings.client.predict = Predict::Off;
+        settings.client.centre = Centre::Fixed;
         settings.client.window_width = 0;
         settings.effects.enabled = false;
         settings.effects.blink.enabled = true;
         settings.keys.timeout_ms = 1500;
-        let drawing = settings.drawing();
+        assert!(!settings.drawing().remote, "nothing has said otherwise");
+        let drawing = Drawing {
+            remote: true,
+            ..settings.drawing()
+        };
         assert_eq!(Drawing::from_env(&drawing.to_env()), Some(drawing));
         assert_eq!(drawing.settings().client, settings.client);
         assert_eq!(drawing.settings().effects, settings.effects);
@@ -3036,9 +3230,13 @@ mod tests {
     /// stops pinning it and follows the default again.
     #[test]
     fn a_setting_back_at_its_default_is_commented_back_out() {
-        let saved = with(&Settings::default(), "client.centre", Value::Switch(true));
+        let saved = with(
+            &Settings::default(),
+            "client.centre",
+            Value::Choice("smart"),
+        );
         let (before, _) = save_over(Some(&template()), &Settings::default(), &saved);
-        assert!(before.contains("\ncentre       = true "), "{before}");
+        assert!(before.contains("\ncentre       = \"smart\" "), "{before}");
 
         let (after, count) = save_over(Some(&before), &saved, &Settings::default());
         assert_eq!(count, 1);
@@ -3093,14 +3291,14 @@ mod tests {
         let before =
             "[client]\nlazy = false\n# a note about the client\n\n[style]\ncolor = \"#7aa2f7\"";
         let saved: Settings = toml::from_str(before).expect("valid");
-        let live = with(&saved, "client.centre", Value::Switch(true));
+        let live = with(&saved, "client.centre", Value::Choice("smart"));
         let live = with(&live, "effects.blink.enabled", Value::Switch(true));
         let live = with(&live, "client.window_width", Value::Number(100));
         let (after, count) = save_over(Some(before), &saved, &live);
         assert_eq!(count, 3);
         assert_eq!(
             after,
-            "[client]\nlazy = false\ncentre = true\nwindow_width = 100\n# a note about the client\n\n\
+            "[client]\nlazy = false\ncentre = \"smart\"\nwindow_width = 100\n# a note about the client\n\n\
              [style]\ncolor = \"#7aa2f7\"\n\n[effects.blink]\nenabled = true\n"
         );
         assert_eq!(read_back(&after), Ok(live));

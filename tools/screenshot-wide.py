@@ -4,9 +4,9 @@
     python3 tools/screenshot-wide.py        # writes assets/wide-*.png
 
 One session, on a terminal wider than its two windows need, shot with
-`[client] centre` off and on: nvmux is run twice at a prompt, each time with
-a config of its own, and attaches to the session each time -- off, the
-default, then on. Each shot is drawn by agg from what nvmux had written up
+`[client] centre` off and smart: nvmux is run twice at a prompt, each time
+with a config of its own, and attaches to the session each time -- off, the
+default, then smart. Each shot is drawn by agg from what nvmux had written up
 to that moment, and set in the demo's window. The README says which is
 which: a label in the picture would be too small to read at the width a
 page shows it.
@@ -14,8 +14,8 @@ page shows it.
 **The terminal is a whole ultra-wide monitor's:** 3440 by 1440 pixels, the
 commonest, filled by a terminal in the demo's font at the demo's size --
 COLS by ROWS below -- with each window's text as wide as what it shows
-wants, as `smart_width` has it by default: the code its `'textwidth'`, and
-the prose `window_width`. It is drawn at that size, and not at the half as big again
+wants, as `"smart"` has it: the code its `'textwidth'`, and the prose
+`window_width`. It is drawn at that size, and not at the half as big again
 the demo is drawn at (see SCALE there): a page shows the picture a quarter
 as wide, where its text is not for reading but where it stands is.
 
@@ -73,8 +73,8 @@ NAME = "api-server"
 # right one short of that, for the separator between them.
 LEFT, RIGHT = COLS // 2, COLS - 1 - COLS // 2
 SHOTS = [
-    ("off", False, [COLS, [LEFT, RIGHT], [LEFT, RIGHT]]),
-    ("on", True, [COLS, [CODE_WIDTH, WIDTH], [LEFT, RIGHT]]),
+    ("off", "off", [COLS, [LEFT, RIGHT], [LEFT, RIGHT]]),
+    ("on", "smart", [COLS, [CODE_WIDTH, WIDTH], [LEFT, RIGHT]]),
 ]
 
 # The project's, in the demo's api-server: some code, and the page of prose
@@ -275,9 +275,9 @@ WIDTHS = ("json_encode([&columns, map(range(1, winnr('$')), 'winwidth(v:val)'),"
           " map(nvim_tabpage_list_wins(0), 'nvim_win_get_width(v:val)')])")
 
 
-def toml(on):
-    """A switch as the config file spells it."""
-    return "true" if on else "false"
+def toml(way):
+    """A way of `[client] centre` as the config file spells it."""
+    return '"%s"' % way
 
 
 def widths(sock):

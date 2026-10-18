@@ -50,7 +50,6 @@
 //! left fades: a held key moves the fade along with the bar rather than
 //! leaving a tail of them.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -1017,18 +1016,6 @@ fn follow(
     }
 }
 
-/// Whether the sessions are another machine's, where Neovim's own client
-/// takes an `nvim` on this one: what [`Panel`] checks a change of
-/// `client.ui` against, as `run` is told it.
-static REMOTE: AtomicBool = AtomicBool::new(false);
-
-/// Say once, as nvmux starts, whether the sessions are another machine's —
-/// what the settings floating over a session check a change of `client.ui`
-/// against, being opened by the relay rather than by `main`.
-pub fn sessions_are_remote(remote: bool) {
-    REMOTE.store(remote, Ordering::Relaxed);
-}
-
 /// The widest and the tallest the settings are when they float over a
 /// session: room for every row of the longest section, and for the longest
 /// help.
@@ -1083,11 +1070,13 @@ pub struct Panel {
 
 impl Panel {
     /// The settings as nvmux has them now, on the section and row they were
-    /// last left on.
+    /// last left on. Opened by the relay rather than by `main`, they check a
+    /// change of `client.ui` against where the sessions are as `main` said
+    /// at the start ([`config::remote`]).
     pub fn open() -> Self {
         Self {
             state: State::open(),
-            remote: REMOTE.load(Ordering::Relaxed),
+            remote: config::remote(),
             armed_until: None,
             drawn: Rect::default(),
             ticked: Instant::now(),
@@ -2107,21 +2096,21 @@ mod tests {
     fn find_searches_every_tab_and_goes_to_the_setting() {
         let mut s = state();
         key(&mut s, KeyCode::Char('/'));
-        typed(&mut s, "sm");
+        typed(&mut s, "wi");
         let found: Vec<&str> = s.rows().iter().map(|r| r.name).collect();
-        assert!(found.contains(&"smear"), "{found:?}");
-        assert!(found.contains(&"smart_width"), "{found:?}");
+        assert!(found.contains(&"windows"), "{found:?}");
+        assert!(found.contains(&"window_width"), "{found:?}");
         assert_eq!(
             s.current().map(|r| r.name),
-            Some("smart_width"),
+            Some("window_width"),
             "the first that starts so"
         );
-        typed(&mut s, "e");
-        assert_eq!(s.current().map(|r| r.name), Some("smear"));
+        typed(&mut s, "s");
+        assert_eq!(s.current().map(|r| r.name), Some("windows"));
         key(&mut s, KeyCode::Enter);
         assert_eq!(s.find, None);
         assert_eq!(s.tab, Tab::Effects);
-        assert_eq!(s.current().map(|r| r.name), Some("smear"));
+        assert_eq!(s.current().map(|r| r.name), Some("windows"));
     }
 
     /// A query matches names alone, so a few letters do not match every
@@ -2204,7 +2193,7 @@ mod tests {
         live.client.ui = config::Ui::Nvim;
         assert_eq!(runnable(&live, &running, false), Ok(()), "sessions here");
         let mut other = Settings::default();
-        other.client.centre = true;
+        other.client.centre = config::Centre::Smart;
         assert_eq!(runnable(&other, &running, true), Ok(()), "anything else");
         assert_eq!(runnable(&live, &live, true), Ok(()), "already so");
     }

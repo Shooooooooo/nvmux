@@ -66,6 +66,9 @@ fn run(cli: &Cli) -> Result<()> {
 
     let location = cli.location();
     let remote = matches!(location, transport::Location::Ssh(_));
+    // Before any client is started: each is told it with its settings, which
+    // is what `[client] predict = "auto"` goes by.
+    config::set_remote(remote);
 
     // The local nvim, checked up front rather than surfacing later as an
     // unexplained connection failure. It runs every local session, and draws
@@ -182,9 +185,7 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
     // `settle`).
     let mut clients = config::get().client;
     let remote = matches!(transport.location(), transport::Location::Ssh(_));
-    // For the settings when they float over a session, which the relay opens.
-    ui::settings::sessions_are_remote(remote);
-    // And for the picker, which lists, kills and renumbers as it floats.
+    // For the picker, which lists, kills and renumbers as it floats.
     ui::picker::lend(shared);
     let mut message: Option<String> = None;
     // The session the last trip through the picker led to, so the next one

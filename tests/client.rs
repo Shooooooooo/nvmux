@@ -85,10 +85,27 @@ impl Terminal {
     /// [`Terminal::spawn_answering`], on a terminal `size` big: columns,
     /// rows.
     fn spawn_sized(sock: &Path, config: &Path, da1: &'static [u8], size: (u16, u16)) -> Self {
+        Self::start(sock, config, None, da1, size)
+    }
+
+    /// [`Terminal::spawn`], told what nvmux tells a client it starts, which
+    /// it goes by rather than the config: the settings to draw with, and
+    /// whether the session is on another machine.
+    fn spawn_told(sock: &Path, config: &Path, told: &nvmux::config::Drawing) -> Self {
+        Self::start(sock, config, Some(told), DA1_REPLY, (COLS, ROWS))
+    }
+
+    fn start(
+        sock: &Path,
+        config: &Path,
+        told: Option<&nvmux::config::Drawing>,
+        da1: &'static [u8],
+        size: (u16, u16),
+    ) -> Self {
         let (pty, pts) = pty_process::blocking::open().expect("open a pty");
         pty.resize(pty_process::Size::new(size.1, size.0))
             .expect("size the pty");
-        let child = Command::new(env!("CARGO_BIN_EXE_nvmux"))
+        let cmd = Command::new(env!("CARGO_BIN_EXE_nvmux"))
             .arg("--client")
             .arg(sock)
             .env("NVMUX_CONFIG", config)
@@ -96,11 +113,14 @@ impl Terminal {
             // The colours a parent nvmux would hand down: none, so the client
             // falls back on its own, whatever the environment running the
             // tests.
-            .env_remove(nvmux::client::PALETTE_ENV)
-            // Takes the slave, or the master would never see EOF once the
-            // child exits.
-            .spawn(pts)
-            .expect("spawn the client");
+            .env_remove(nvmux::client::PALETTE_ENV);
+        let cmd = match told {
+            Some(drawing) => cmd.env(nvmux::client::SETTINGS_ENV, drawing.to_env()),
+            None => cmd.env_remove(nvmux::client::SETTINGS_ENV),
+        };
+        // Takes the slave, or the master would never see EOF once the child
+        // exits.
+        let child = cmd.spawn(pts).expect("spawn the client");
 
         let mut reader = common::reader(&pty);
         let (tx, incoming) = mpsc::channel();
@@ -1036,6 +1056,7 @@ fn a_turn_of_the_wheel_over_a_slow_link_scrolls_before_neovim_answers() {
     require_nvim!();
     let scratch = Scratch::new("client-predict");
     let (sock, mut rpc, config) = session(&scratch, "client-predict");
+    std::fs::write(&config, PREDICT_ON).expect("write the config");
     rpc.command("setlocal noswapfile | call setline(1, map(range(1, 200), '\"line \" . v:val'))")
         .expect("setline");
     // A second each way and back: Neovim's answer to the wheel cannot be on
@@ -1133,9 +1154,15 @@ fn window(term: &Terminal) -> (Vec<String>, (u16, u16)) {
 /// ahead of it.
 const SLOW: Duration = Duration::from_millis(250);
 
+/// A config that has a client predict wherever the link is slow enough, as
+/// it does over ssh unless told otherwise: the sessions of these tests are on
+/// this machine, and only a link of the test's own makes them slow.
+const PREDICT_ON: &str = "[client]\npredict = \"on\"\n";
+
 /// A session whose one window shows the text `setline` puts there, drawn by
-/// a client over a slow link, scrolls jumping rather than sliding so that
-/// what a prediction shows can be read off the screen at once.
+/// a client over a slow link, told to predict over it, scrolls jumping
+/// rather than sliding so that what a prediction shows can be read off the
+/// screen at once.
 ///
 /// With it, the link (see [`Link`]).
 fn drawn_slowly(
@@ -1150,7 +1177,11 @@ fn drawn_slowly(
     let (sock, mut rpc, config) = session(scratch, tag);
     rpc.command(&format!("setlocal noswapfile | {setline}"))
         .expect("setline");
-    std::fs::write(&config, "[effects.scroll]\nenabled = false\n").expect("config");
+    std::fs::write(
+        &config,
+        format!("{PREDICT_ON}\n[effects.scroll]\nenabled = false\n"),
+    )
+    .expect("config");
     let (slow, link) = counted_link(&scratch.0.join("link"), &sock, SLOW);
 
     let mut term = Terminal::spawn(&slow, &config);
@@ -2094,7 +2125,8 @@ fn sent_by_kind(
 /// What predictions are drawn from — the lines either side of a view, their
 /// colours, how a window scrolls — is sent only over a link slow enough to
 /// predict over. A session on this machine scrolled page by page is sent
-/// none of it; the same over a slow link is.
+/// none of it, its client told to predict wherever the link is; the same
+/// over a slow link is.
 #[test]
 fn only_a_link_slow_enough_to_predict_over_is_sent_lines() {
     require_nvim!();
@@ -2109,6 +2141,7 @@ fn only_a_link_slow_enough_to_predict_over_is_sent_lines() {
 
     let fast = Scratch::new("client-fastlines");
     let (sock, mut rpc, config) = session(&fast, "client-fastlines");
+    std::fs::write(&config, PREDICT_ON).expect("write the config");
     rpc.command(&format!("setlocal noswapfile | {setline}"))
         .expect("setline");
     let mut term = Terminal::spawn(&sock, &config);
@@ -2142,9 +2175,81 @@ fn only_a_link_slow_enough_to_predict_over_is_sent_lines() {
     );
 }
 
-/// A config for a wide terminal: every window's text centred, up to 60
-/// columns of it. A session in one window, its status line its own colour,
-/// and a terminal 160 columns wide.
+/// How many autocommands the client's agent has in the editor, and how many
+/// of them wait to be told how far either side of a view to send lines —
+/// which only an agent left to predict with does.
+const AGENT_AUTOCMDS: &str = "local all = vim.tbl_filter(function(a) \
+       return vim.startswith(a.group_name or '', 'nvmux_client_') \
+     end, vim.api.nvim_get_autocmds({})) \
+     local reach = vim.tbl_filter(function(a) \
+       return vim.startswith(a.pattern or '', 'nvmux_client_reach_') \
+     end, all) \
+     return { #all, #reach }";
+
+/// See [`AGENT_AUTOCMDS`].
+fn agent_autocmds(rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>) -> (i64, i64) {
+    let v = rpc
+        .call(
+            "nvim_exec_lua",
+            vec![AGENT_AUTOCMDS.into(), Value::Array(vec![])],
+        )
+        .expect("ask the editor");
+    let n = |i: usize| {
+        v.as_array()
+            .and_then(|a| a.get(i))
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+    };
+    (n(0), n(1))
+}
+
+/// Scrolls are predicted for a session over ssh unless told otherwise. A
+/// client that nvmux says nothing to of where its session is — on this
+/// machine — leaves its agent in the editor with nothing to predict with,
+/// `predict` at its default; told `"on"`, it leaves it the means, as it does
+/// at the default for a session it is told is on another machine.
+#[test]
+fn scrolls_are_predicted_for_a_session_over_ssh_unless_told() {
+    require_nvim!();
+    let over_ssh = nvmux::config::Drawing {
+        remote: true,
+        ..nvmux::config::Settings::default().drawing()
+    };
+    for (tag, config, told, predicting) in [
+        ("client-auto-here", "", None, false),
+        ("client-on-here", PREDICT_ON, None, true),
+        ("client-auto-there", "", Some(&over_ssh), true),
+    ] {
+        let scratch = Scratch::new(tag);
+        let (sock, mut rpc, path) = session(&scratch, tag);
+        std::fs::write(&path, config).expect("write the config");
+        rpc.command("setlocal noswapfile | call setline(1, 'drawn by the client')")
+            .expect("setline");
+        let mut term = match told {
+            Some(drawing) => Terminal::spawn_told(&sock, &path, drawing),
+            None => Terminal::spawn(&sock, &path),
+        };
+        let drawn = |s: &str| s.contains("drawn by the client");
+        assert!(
+            term.pump_until(Duration::from_secs(20), drawn),
+            "{tag}: never drawn:\n{}",
+            term.text()
+        );
+        assert!(
+            common::wait_until(Duration::from_secs(5), || {
+                term.pump_until(Duration::from_millis(20), |_| false);
+                agent_autocmds(&mut rpc).0 > 0
+            }),
+            "{tag}: no agent in the editor"
+        );
+        assert_eq!(agent_autocmds(&mut rpc).1 > 0, predicting, "{tag}");
+        assert_eq!(term.hang_up(), Some(0), "{tag}: the client's exit");
+    }
+}
+
+/// A config for a wide terminal: every window's text centred, as wide as
+/// what it shows wants, or else 60 columns of it. A session in one window,
+/// its status line its own colour, and a terminal 160 columns wide.
 fn wide(
     scratch: &Scratch,
     tag: &str,
@@ -2153,14 +2258,14 @@ fn wide(
     nvmux::rpc::Client<std::os::unix::net::UnixStream>,
     PathBuf,
 ) {
-    wide_with(scratch, tag, "")
+    wide_with(scratch, tag, "smart")
 }
 
-/// [`wide`], with `more` in the config's `[client]` as well.
+/// [`wide`], centred the way `centre` says.
 fn wide_with(
     scratch: &Scratch,
     tag: &str,
-    more: &str,
+    centre: &str,
 ) -> (
     Terminal,
     nvmux::rpc::Client<std::os::unix::net::UnixStream>,
@@ -2169,7 +2274,7 @@ fn wide_with(
     let (sock, mut rpc, config) = session(scratch, tag);
     std::fs::write(
         &config,
-        format!("[client]\ncentre = true\nwindow_width = 60\n{more}"),
+        format!("[client]\ncentre = \"{centre}\"\nwindow_width = 60\n"),
     )
     .expect("write the config");
     rpc.command(
@@ -2332,7 +2437,7 @@ fn the_next_client_draws_whole_what_a_centring_one_left() {
     );
 
     let config = scratch.0.join("config.toml");
-    std::fs::write(&config, "[client]\ncentre = false\n").expect("write the config");
+    std::fs::write(&config, "[client]\ncentre = \"off\"\n").expect("write the config");
     let mut term = Terminal::spawn_sized(&sock, &config, DA1_REPLY, (160, 12));
     let whole = |s: &str| {
         let lines: Vec<&str> = s.lines().collect();
@@ -2394,7 +2499,7 @@ fn the_next_client_gives_back_the_width_a_killed_one_took() {
     );
 
     let config = scratch.0.join("config.toml");
-    std::fs::write(&config, "[client]\ncentre = false\n").expect("write the config");
+    std::fs::write(&config, "[client]\ncentre = \"off\"\n").expect("write the config");
     let mut term = Terminal::spawn_sized(&sock, &config, DA1_REPLY, (160, 12));
     let whole = |w: &Value| -> Option<Vec<usize>> {
         let ws: Vec<usize> = w
@@ -2446,8 +2551,11 @@ fn a_split_over_a_slow_link_is_centred_from_its_first_frame() {
     require_nvim!();
     let scratch = Scratch::new("client-centre-slow");
     let (sock, mut rpc, config) = session(&scratch, "client-centre-slow");
-    std::fs::write(&config, "[client]\ncentre = true\nwindow_width = 60\n")
-        .expect("write the config");
+    std::fs::write(
+        &config,
+        format!("{PREDICT_ON}centre = \"smart\"\nwindow_width = 60\n"),
+    )
+    .expect("write the config");
     rpc.command(
         "setlocal noswapfile | set splitright \
          | call setline(1, map(range(1, 10), '\"MARK \" . v:val'))",
@@ -2624,9 +2732,9 @@ fn a_windows_text_is_as_wide_as_what_it_shows_wants() {
 /// what it shows or not: on a grid narrower, it would be centred twice
 /// over, and so off to the right. Lines set in from the left but not to the
 /// middle, and lines not set in at all, are narrowed as any are.
-fn a_window_centred_already_keeps_its_width(tag: &str, more: &str) {
+fn a_window_centred_already_keeps_its_width(tag: &str, centre: &str) {
     let scratch = Scratch::new(tag);
-    let (mut term, mut rpc, _) = wide_with(&scratch, tag, more);
+    let (mut term, mut rpc, _) = wide_with(&scratch, tag, centre);
     assert!(
         term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
         "never drawn:\n{}",
@@ -2670,13 +2778,13 @@ fn a_window_centred_already_keeps_its_width(tag: &str, more: &str) {
 #[test]
 fn a_window_centred_already_keeps_its_width_judged_by_what_it_shows() {
     require_nvim!();
-    a_window_centred_already_keeps_its_width("client-centred", "");
+    a_window_centred_already_keeps_its_width("client-centred", "smart");
 }
 
 #[test]
 fn a_window_centred_already_keeps_its_width_judged_by_nothing() {
     require_nvim!();
-    a_window_centred_already_keeps_its_width("client-centred-off", "smart_width = false\n");
+    a_window_centred_already_keeps_its_width("client-centred-fx", "fixed");
 }
 
 /// Its width judged as a window's text always is, a Markdown window's is as
@@ -2727,19 +2835,48 @@ fn a_markdown_window_has_room_for_its_tables() {
     assert_eq!(term.hang_up(), Some(0), "the client's exit");
 }
 
-/// Judged as nothing but `window_width`, with `smart_width` off: a
+/// Judged as nothing but `window_width`, with `centre = "fixed"`: a
 /// `'textwidth'` is the buffer's own business.
 #[test]
 fn widths_judged_by_nothing_are_window_width() {
     require_nvim!();
-    let scratch = Scratch::new("client-smart-off");
-    let (mut term, mut rpc, _) = wide_with(&scratch, "client-smart-off", "smart_width = false\n");
+    let scratch = Scratch::new("client-fixed");
+    let (mut term, mut rpc, _) = wide_with(&scratch, "client-fixed", "fixed");
     assert!(
         term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
         "never drawn:\n{}",
         term.text()
     );
     rpc.command("setlocal textwidth=40").expect("a textwidth");
+    assert!(
+        until_widths(&mut term, &mut rpc, &columns(160, &[60])),
+        "{}",
+        widths(&mut rpc)
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
+/// With every effect off and nothing predicted, a window's text is centred
+/// all the same: a grid narrower than its window is a grid of the window's
+/// own, which the client asks for with nothing else wanting them.
+#[test]
+fn a_windows_text_is_centred_with_every_effect_off() {
+    require_nvim!();
+    let scratch = Scratch::new("client-centre-bare");
+    let (sock, mut rpc, config) = session(&scratch, "client-centre-bare");
+    std::fs::write(
+        &config,
+        "[client]\ncentre = \"fixed\"\nwindow_width = 60\n\n[effects]\nenabled = false\n",
+    )
+    .expect("write the config");
+    rpc.command("setlocal noswapfile | call setline(1, ['the left window'])")
+        .expect("set the session up");
+    let mut term = Terminal::spawn_sized(&sock, &config, DA1_REPLY, (160, 12));
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
     assert!(
         until_widths(&mut term, &mut rpc, &columns(160, &[60])),
         "{}",
