@@ -315,6 +315,13 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
             Kind::Command,
         ),
         row(
+            "session",
+            "quick_list",
+            Tab::Session,
+            "list sessions without waiting three seconds on a busy one",
+            switch!(session.quick_list),
+        ),
+        row(
             "client",
             "ui",
             Tab::Client,

@@ -83,6 +83,14 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 /// created session to answer.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// The read timeout for a listing's probes with `[session] quick_list` on, in
+/// place of [`PROBE_TIMEOUT`]: an idle editor answers in a millisecond or two,
+/// many times over in this, and one that cannot answer — in a `:!make`, or in
+/// CPU-bound Lua — is busy at the end of it, as at the end of the longer one.
+/// Busy is never reaped, so the wait only ever decided whether a session that
+/// died during it was listed.
+pub const QUICK_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// A connected RPC channel, generic over the byte stream so the same code serves
 /// a local socket, the local end of an SSH forward, and a pipe in tests.
 pub struct Client<S: Read + Write> {
@@ -655,7 +663,13 @@ fn map_io(e: std::io::Error, timeout: Option<Duration>) -> RpcError {
 /// *not* answered during CPU-bound Lua, measured at 3.7s, so a plain `nvmux`
 /// invocation unlinked the socket of a session that was merely busy.
 pub fn probe(path: &Path) -> Liveness {
-    let mut client = match Client::connect(path, PROBE_TIMEOUT) {
+    probe_within(path, PROBE_TIMEOUT)
+}
+
+/// [`probe`], each call given `budget` to be answered in, rather than
+/// [`PROBE_TIMEOUT`].
+pub fn probe_within(path: &Path, budget: Duration) -> Liveness {
+    let mut client = match Client::connect(path, budget) {
         Ok(c) => c,
         Err(e) if e.is_definitely_dead() => return Liveness::Dead,
         Err(e) => {
@@ -1018,6 +1032,26 @@ mod tests {
         let liveness = probe(&path);
         let _ = std::fs::remove_file(&path);
         assert_eq!(liveness, Liveness::Dead);
+    }
+
+    /// A session that takes the connection and says nothing — busy in a
+    /// `:!make`, or in CPU-bound Lua — is busy at the end of whatever budget
+    /// its probe is given, and never dead: a quarter of a second's as much as
+    /// three seconds'.
+    #[test]
+    fn a_silent_session_is_busy_at_the_end_of_a_short_budget() {
+        let path = crate::test_support::scratch_sock("rpc-silent");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let started = std::time::Instant::now();
+        let liveness = probe_within(&path, QUICK_PROBE_TIMEOUT);
+        let took = started.elapsed();
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(liveness, Liveness::Busy);
+        assert!(
+            took < Duration::from_secs(1),
+            "a quarter of a second's budget took {took:?}"
+        );
     }
 
     /// The attach probe has no budget, so the only thing that can end a call

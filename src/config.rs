@@ -103,6 +103,20 @@ pub struct SessionSettings {
     /// The command line, with `{sock}` standing in for the session's socket.
     /// Parsed by [`crate::launch::Launch`], which is also what rejects a bad one.
     pub command: String,
+    /// List this machine's sessions without waiting more than a quarter of a
+    /// second on any one of them: for the picker, `<prefix> c` and a switch
+    /// (see [`crate::rpc::QUICK_PROBE_TIMEOUT`]).
+    ///
+    /// Off, the default, a session busy in a `:!make` or in CPU-bound Lua,
+    /// which cannot answer, holds every listing three seconds — the picker
+    /// comes up that much later, on a cleared screen — and is then listed as
+    /// one that answered is. On, it is listed after a quarter of a second,
+    /// the same.
+    ///
+    /// What on risks: a session that dies within those three seconds is
+    /// listed until the next listing, where the longer wait would have found
+    /// it gone and not listed it.
+    pub quick_list: bool,
 }
 
 /// The client that draws a session, on the pty nvmux relays (see
@@ -1131,6 +1145,7 @@ impl Default for SessionSettings {
             // Not a literal, for the same reason as the prefix above: the
             // prompt shows this before any config has necessarily been read.
             command: crate::launch::DEFAULT.to_string(),
+            quick_list: false,
         }
     }
 }
@@ -1461,6 +1476,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          \n\
          [session]\n\
          # command = {command}   # {{sock}} is required\n\
+         # quick_list = {quick_list}   # true lists sessions without waiting three seconds on a busy one\n\
          \n\
          [client]\n\
          # ui             = {ui:<8}   # nvmux's own animated client, or \"nvim\" for Neovim's\n\
@@ -1525,6 +1541,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
         prefix = quoted(&crate::keys::prefix_label(prefix)),
         timeout = k.timeout_ms,
         command = quoted(&s.command),
+        quick_list = s.quick_list,
         per_session = c.per_session,
         lazy = c.lazy,
         revive = c.revive,
@@ -2619,6 +2636,20 @@ mod tests {
         assert!(!s.client.scroll_regions, "the rest as it was");
     }
 
+    /// A listing waits on a busy session as long as it ever did unless told
+    /// otherwise; a quarter of a second is a line away.
+    #[test]
+    fn a_listing_waits_on_busy_sessions_unless_told() {
+        assert!(!Settings::default().session.quick_list);
+        let s: Settings = toml::from_str("[session]\nquick_list = true\n").expect("valid");
+        assert!(s.session.quick_list);
+        assert_eq!(
+            s.session.command,
+            SessionSettings::default().command,
+            "the rest as it was"
+        );
+    }
+
     /// nvmux's own client unless told otherwise; Neovim's is a line away.
     #[test]
     fn a_session_is_drawn_by_nvmuxs_client_unless_told() {
@@ -3093,6 +3124,7 @@ mod tests {
             "# lean_output    = true",
             "# scroll_regions = false",
             "# partial_frames = false",
+            "# quick_list = false",
             "# color = \"terminal\"",
             "# float = true ",
             "# enabled     = true",
