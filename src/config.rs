@@ -330,10 +330,10 @@ pub struct ClientSettings {
     /// rest of the frame is written as ever. nvmux's own client only (see
     /// [`crate::client::region`]).
     ///
-    /// Off, the default, every row a frame changed is written, moved or not.
-    /// On, the screen is the same, and a scroll is written in a fraction of
-    /// the bytes: what a link to a terminal far away carries, and what the
-    /// terminal and nvmux's relay each parse.
+    /// On, the default, the screen is the one off draws, and a scroll is
+    /// written in a fraction of the bytes: what a link to a terminal far away
+    /// carries, and what the terminal and nvmux's relay each parse. Off,
+    /// every row a frame changed is written, moved or not.
     ///
     /// What on risks: a terminal that gets scroll regions wrong shows the
     /// rows a scroll moved wrong, until each is next written. A frame written
@@ -349,8 +349,8 @@ pub struct ClientSettings {
     /// moving or a card over the screen has the frame put together whole, as
     /// ever. nvmux's own client only (see [`crate::client::App::frame`]).
     ///
-    /// Off, the default, every frame is put together whole. On, the screen
-    /// is the same, for less of the client's CPU per key typed.
+    /// On, the default, the screen is the one off draws, for less of the
+    /// client's CPU per key typed. Off, every frame is put together whole.
     ///
     /// What on risks: a row the editor changed in a way the client does not
     /// count as a change would be left as it was, until it next changes.
@@ -369,8 +369,8 @@ impl Default for ClientSettings {
             centre: Centre::Off,
             window_width: 120,
             lean_output: true,
-            scroll_regions: false,
-            partial_frames: false,
+            scroll_regions: true,
+            partial_frames: true,
         }
     }
 }
@@ -1515,8 +1515,8 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          # centre         = {centre:<8}   # on a wide terminal, each window's text in its middle: \"smart\" or \"fixed\"\n\
          # window_width   = {window_width:<8}   # with centre on, how many columns a window's text gets; 0 for no limit\n\
          # lean_output    = {lean_output:<8}   # fewer bytes per frame, the same screen; false makes every move absolute\n\
-         # scroll_regions = {scroll_regions:<8}   # true has the terminal move the rows a scroll moved; the same screen\n\
-         # partial_frames = {partial_frames:<8}   # true puts a frame together from the rows that changed alone; the same screen\n\
+         # scroll_regions = {scroll_regions:<8}   # the terminal moves the rows a scroll moved, the same screen; false writes them\n\
+         # partial_frames = {partial_frames:<8}   # frames from the rows that changed alone, the same screen; false, from every row\n\
          \n\
          [style]\n\
          # color = {style_color:<10}   # or \"#rrggbb\": nvmux's text and bars in that colour\n\
@@ -2644,24 +2644,24 @@ mod tests {
         assert_eq!(s.client.window_width, 120, "the rest as it was");
     }
 
-    /// Every row a frame changed written, moved or not, unless told
-    /// otherwise; the terminal moving the rows a scroll moved is a line away.
+    /// The terminal moves the rows a scroll moved unless told otherwise;
+    /// every row a frame changed written, moved or not, is a line away.
     #[test]
-    fn rows_a_frame_moved_are_written_again_unless_told() {
-        assert!(!Settings::default().client.scroll_regions);
-        let s: Settings = toml::from_str("[client]\nscroll_regions = true\n").expect("valid");
-        assert!(s.client.scroll_regions);
-        assert!(s.client.lean_output, "the rest as it was");
+    fn the_terminal_moves_the_rows_a_frame_moved_unless_told() {
+        assert!(Settings::default().client.scroll_regions);
+        let s: Settings = toml::from_str("[client]\nscroll_regions = false\n").expect("valid");
+        assert!(!s.client.scroll_regions);
+        assert!(s.client.partial_frames, "the rest as it was");
     }
 
-    /// Every frame put together whole unless told otherwise; from only the
-    /// rows that changed is a line away.
+    /// Frames put together from only the rows that changed unless told
+    /// otherwise; every frame whole is a line away.
     #[test]
-    fn frames_are_put_together_whole_unless_told() {
-        assert!(!Settings::default().client.partial_frames);
-        let s: Settings = toml::from_str("[client]\npartial_frames = true\n").expect("valid");
-        assert!(s.client.partial_frames);
-        assert!(!s.client.scroll_regions, "the rest as it was");
+    fn frames_are_put_together_from_the_rows_that_changed_unless_told() {
+        assert!(Settings::default().client.partial_frames);
+        let s: Settings = toml::from_str("[client]\npartial_frames = false\n").expect("valid");
+        assert!(!s.client.partial_frames);
+        assert!(s.client.scroll_regions, "the rest as it was");
     }
 
     /// A listing waits a quarter of a second on a busy session unless told
@@ -3164,8 +3164,8 @@ mod tests {
             "# centre         = \"off\"",
             "# window_width   = 120",
             "# lean_output    = true",
-            "# scroll_regions = false",
-            "# partial_frames = false",
+            "# scroll_regions = true",
+            "# partial_frames = true",
             "# quick_list = true",
             "# push_news  = true",
             "# color = \"terminal\"",

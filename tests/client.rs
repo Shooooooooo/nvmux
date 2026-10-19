@@ -281,6 +281,36 @@ impl Terminal {
             .join("\n")
     }
 
+    /// Every cell on the screen, a row at a time: its text — a blank where
+    /// it has none, as a terminal shows a cell it erased — and its colours
+    /// and attributes.
+    fn cells(&self) -> Vec<String> {
+        let screen = self.parser.screen();
+        let mut cells = Vec::new();
+        for row in 0..self.size.1 {
+            for col in 0..self.size.0 {
+                let cell = screen.cell(row, col).expect("on the screen");
+                let text = if cell.has_contents() {
+                    cell.contents()
+                } else {
+                    " "
+                };
+                cells.push(format!(
+                    "{text}{:?}{:?}{}{}{}{}{}{}",
+                    cell.fgcolor(),
+                    cell.bgcolor(),
+                    cell.bold(),
+                    cell.dim(),
+                    cell.italic(),
+                    cell.underline(),
+                    cell.inverse(),
+                    cell.is_wide()
+                ));
+            }
+        }
+        cells
+    }
+
     /// Hang the client up as nvmux retires one, and say how it exited.
     fn hang_up(&mut self) -> Option<u32> {
         self.signal(Signal::SIGHUP)
@@ -657,6 +687,9 @@ fn settle(term: &mut Terminal, quiet: Duration, within: Duration) -> bool {
 /// scrolled, typed into, in colours that change along the line, with
 /// characters two cells wide — into the very screen a client drawing it
 /// afresh with it off shows: every cell, with its colours and attributes.
+/// The terminal moves the rows a scroll moved, as `[client] scroll_regions`
+/// has it do by default; a cell it blanked doing so is as blank as a space
+/// written there.
 #[test]
 fn a_lean_client_draws_the_screen_a_fresh_one_does() {
     require_nvim!();
@@ -670,12 +703,6 @@ fn a_lean_client_draws_the_screen_a_fresh_one_does() {
     )
     .expect("setline");
     std::fs::write(&config, "[client]\nlean_output = true\n").expect("write the config");
-    let rows = |t: &Terminal| {
-        t.parser
-            .screen()
-            .rows_formatted(0, COLS)
-            .collect::<Vec<_>>()
-    };
 
     let mut lean = Terminal::spawn(&sock, &config);
     assert!(
@@ -698,7 +725,11 @@ fn a_lean_client_draws_the_screen_a_fresh_one_does() {
         find(&lean.output, b"\x1b[r").is_some(),
         "no frame of the lean client's moved down by LF"
     );
-    let (drawn, text) = (rows(&lean), lean.text());
+    assert!(
+        find(&lean.output, b"M\x1b[r").is_some(),
+        "no rows of the lean client's moved by the terminal"
+    );
+    let (drawn, text) = (lean.cells(), lean.text());
     assert_eq!(lean.hang_up(), Some(0));
     assert!(
         common::wait_until(Duration::from_secs(5), || rpc.list_uis().ok() == Some(0)),
@@ -718,7 +749,7 @@ fn a_lean_client_draws_the_screen_a_fresh_one_does() {
         Duration::from_secs(10)
     ));
     assert!(
-        drawn == rows(&fresh),
+        drawn == fresh.cells(),
         "the lean client's screen:\n{text}\nis not the fresh one's:\n{}",
         fresh.text()
     );
