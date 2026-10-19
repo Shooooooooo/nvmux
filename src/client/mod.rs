@@ -214,6 +214,12 @@ const REPLY_WAIT: Duration = Duration::from_secs(1);
 /// through grid 1: another nvmux client's refresh, or one attaching again.
 const RECHECK: Duration = Duration::from_millis(30);
 
+/// How long what the editor says runs past the grids' edges waits for the
+/// `flush` it was said ahead of (see [`wide::TAILS_LUA`]), before it is
+/// taken without one: a redraw that changed nothing on the screen but that
+/// sends none.
+const TAILS_WAIT: Duration = Duration::from_millis(25);
+
 /// How long a refresh is given to be answered before it is given up, and how
 /// long before one that came to nothing is tried again.
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1203,6 +1209,11 @@ pub struct App {
     /// What each window of the tab page in front wants, by window, as the
     /// measure last said (see [`wide::MEASURE_LUA`]).
     wants: BTreeMap<i64, usize>,
+    /// What runs past the grid's edge of each window the editor has said it
+    /// of since the last `flush`, by window, and since when: taken with the
+    /// `flush` it was said ahead of (see [`wide::TAILS_LUA`]).
+    tails: Vec<(i64, BTreeMap<usize, wide::Tail>)>,
+    tails_since: Option<Instant>,
     /// The window grids this attach has looked at for a width another
     /// client asked for, each once: see [`App::narrow_windows`].
     looked: HashSet<u64>,
@@ -1282,6 +1293,8 @@ impl App {
             narrowed: HashMap::new(),
             cut: HashMap::new(),
             wants: BTreeMap::new(),
+            tails: Vec::new(),
+            tails_since: None,
             looked: HashSet::new(),
             partial: None,
         }
@@ -1379,7 +1392,8 @@ impl App {
     }
 
     /// Leave the measure in the editor for this attach, once the client knows
-    /// its own channel.
+    /// its own channel; and with it, what says what runs past the edges of
+    /// the grids it narrows (see [`wide::TAILS_LUA`]).
     fn leave_measure(&mut self) {
         if !self.centring() || self.measuring || self.attach == Attach::Asking {
             return;
@@ -1387,6 +1401,13 @@ impl App {
         if let Some(chan) = self.chan {
             self.measuring = true;
             self.measure(Some(chan));
+            self.outbox.notify(
+                "nvim_exec_lua",
+                &[
+                    Arg::str(wide::TAILS_LUA),
+                    Arg::Array(vec![Arg::Int(chan as i64)]),
+                ],
+            );
         }
     }
 
@@ -1524,6 +1545,9 @@ impl App {
                 self.cut.entry(grid).or_insert(g.width());
                 g.resize(width, g.height());
                 self.dirty = true;
+                // What its rows ran on with past its edge was said of the
+                // width it had; it is said again as Neovim draws it at this.
+                self.model.forget_tails(grid);
             }
             // A height of nought asks for none: the window's own.
             self.outbox.notify(
@@ -1712,6 +1736,15 @@ impl App {
             }
             Some("options") => self.anim.set_options(options(&params[1..])),
             Some("measure") => self.measured(int(1), wants(params.get(2)), now),
+            // Said as Neovim draws what it says of, ahead of the `flush`:
+            // taken with that frame.
+            Some("tails") => {
+                if let Some(win) = int(1) {
+                    let sure = !matches!(params.get(2), Some(ValueRef::Boolean(false)));
+                    self.tails.push((win, wide::tails(params.get(3), sure)));
+                    self.tails_since.get_or_insert(now);
+                }
+            }
             // The attributes of the editor's highlight groups the colours
             // of the lines it sends name.
             Some("colours") => {
@@ -2152,6 +2185,8 @@ impl App {
         let term = self.model.colors().term;
         self.model = Model::new(term);
         self.batch.clear();
+        self.tails.clear();
+        self.tails_since = None;
         self.anim.reset();
         self.flushed = false;
         self.unsettled = false;
@@ -2199,6 +2234,7 @@ impl App {
         self.apply(batch, animate, &switched, now);
         self.flushed = true;
         self.landed_sideways();
+        self.take_tails();
         self.fill_in(now);
         if let Some(p) = self.predict.as_mut() {
             p.typed.settle(Mode::of(&self.model.mode_name));
@@ -2975,6 +3011,20 @@ impl App {
         })
     }
 
+    /// What the editor has said runs past the edges of the windows' grids,
+    /// into the model: with the batch it was said ahead of, or once it has
+    /// waited [`TAILS_WAIT`] for one. Said of a window gone, it is dropped.
+    fn take_tails(&mut self) {
+        self.tails_since = None;
+        for (win, tails) in std::mem::take(&mut self.tails) {
+            if let Some((&grid, _)) = self.model.wins.iter().find(|(_, w)| **w == win) {
+                if self.model.set_tails(grid, tails) {
+                    self.dirty = true;
+                }
+            }
+        }
+    }
+
     /// Neovim has drawn: a window it moved sideways lands the scrolls ahead
     /// up to it, and one still ahead is drawn again from Neovim's rows.
     fn landed_sideways(&mut self) {
@@ -3088,6 +3138,12 @@ impl App {
                 self.ask_uis();
             }
         }
+        if self
+            .tails_since
+            .is_some_and(|since| since + TAILS_WAIT <= now)
+        {
+            self.take_tails();
+        }
     }
 
     /// Whether a refresh is to be started now (see [`refresh`]). Asking says
@@ -3121,10 +3177,15 @@ impl App {
             .flatten()
             .min()
         };
-        [self.escape_deadline(), frame, self.recheck_at]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.escape_deadline(),
+            frame,
+            self.recheck_at,
+            self.tails_since.map(|since| since + TAILS_WAIT),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Whether a frame is to be drawn now.
@@ -6240,6 +6301,138 @@ mod tests {
             "            abcdefgh",
             "2 in, to the screen's edge and not past it"
         );
+    }
+
+    /// A `tails` notification for window 1000's row `row`: its tail, `text`
+    /// from column `start`.
+    fn tails_of(row: i64, start: i64, text: &str) -> Vec<Value> {
+        let piece = Value::Array(vec![text.into(), 0.into()]);
+        let row = Value::Array(vec![row.into(), start.into(), Value::Array(vec![piece])]);
+        vec![
+            "tails".into(),
+            1000.into(),
+            true.into(),
+            Value::Array(vec![row]),
+        ]
+    }
+
+    /// A window narrowed to 8 of its 20 columns, its text 6 in, with
+    /// `text` on its first row.
+    fn narrowed_with(text: &str, t0: Instant) -> App {
+        let (mut a, _) = wide_app(t0);
+        redraw(
+            &mut a,
+            vec![
+                resize(1, 20, 6),
+                resize(2, 20, 5),
+                place(2, 1000, 0, 0, 20, 5),
+                viewport(2, 1000),
+            ],
+            t0,
+        );
+        redraw(&mut a, vec![resize(2, 8, 5), line(2, 0, text)], t0);
+        a
+    }
+
+    /// What the editor says runs past a narrowed grid's edge is drawn on in
+    /// the window's margin, as far as the window goes: with the flush the
+    /// editor said it ahead of, not before it.
+    #[test]
+    fn what_runs_past_a_grids_edge_is_drawn_in_the_margin() {
+        let t0 = Instant::now();
+        let mut a = narrowed_with("abc ■ de", t0);
+        notify(&mut a, "nvmux_client", tails_of(0, 4, "■ defgh-and-on"), t0);
+        assert_eq!(shown(&mut a, t0)[0], "      abc ■ de", "not yet");
+        redraw(&mut a, vec![], t0);
+        a.screen.invalidate();
+        assert_eq!(
+            shown(&mut a, t0)[0],
+            "      abc ■ defgh-an",
+            "on in the margin, to the window's edge"
+        );
+        notify(&mut a, "nvmux_client", tails_of(0, 4, ""), t0);
+        redraw(&mut a, vec![], t0);
+        a.screen.invalidate();
+        assert_eq!(shown(&mut a, t0)[0], "      abc ■ de", "said gone");
+    }
+
+    /// Said where no flush follows — what changed past the edge changed
+    /// nothing on the screen — it is drawn once it has waited for one.
+    #[test]
+    fn what_runs_past_a_grids_edge_is_drawn_without_a_flush_in_time() {
+        let t0 = Instant::now();
+        let mut a = narrowed_with("abc ■ de", t0);
+        notify(&mut a, "nvmux_client", tails_of(0, 4, "■ defgh"), t0);
+        assert_eq!(a.wake_at(t0), Some(t0 + TAILS_WAIT));
+        a.tick(t0 + TAILS_WAIT / 2);
+        assert_eq!(shown(&mut a, t0)[0], "      abc ■ de", "still waiting");
+        a.tick(t0 + TAILS_WAIT);
+        a.screen.invalidate();
+        assert_eq!(shown(&mut a, t0)[0], "      abc ■ defgh");
+        assert_eq!(a.tails_since, None, "nothing waits");
+    }
+
+    /// What runs past a row's end slides with its row as the window
+    /// scrolls, and lands with it.
+    #[test]
+    fn what_runs_past_a_grids_edge_slides_with_its_row() {
+        let t0 = Instant::now();
+        let mut a = narrowed_with("line 0", t0);
+        let mut rows: Vec<_> = (1..5).map(|r| line(2, r, &format!("line {r}"))).collect();
+        rows.push(line(2, 3, "line 3 ■"));
+        redraw(&mut a, rows, t0);
+        notify(&mut a, "nvmux_client", tails_of(3, 7, "■ tail"), t0);
+        redraw(&mut a, vec![], t0);
+        let t1 = t0 + Duration::from_secs(1);
+        a.anim.set_effects(Effects {
+            scroll: Some((0.1, 1)),
+            ..Effects::none()
+        });
+        let shows = |a: &mut App, now: Instant| -> Vec<String> {
+            a.frame(now);
+            let f = compose::compose(&a.model, &a.anim, 20, 6);
+            f.text().lines().map(|l| l.trim_end().to_string()).collect()
+        };
+        assert_eq!(shows(&mut a, t1)[3], "      line 3 ■ tail");
+
+        let up = (
+            "grid_scroll",
+            vec![2, 0, 5, 0, 8, 2, 0]
+                .into_iter()
+                .map(Value::from)
+                .collect(),
+        );
+        redraw(
+            &mut a,
+            vec![up, at(2, 2, 2), line(2, 3, "line 5"), line(2, 4, "line 6")],
+            t1,
+        );
+        let sliding = shows(&mut a, t1);
+        assert_eq!(sliding[1], "      line 2", "a row behind");
+        assert_eq!(sliding[2], "      line 3 ■ tail", "with its row");
+        let landed = shows(&mut a, t1 + Duration::from_secs(1));
+        assert_eq!(landed[1], "      line 3 ■ tail", "landed with it");
+        assert_eq!(landed[2], "      line 4");
+    }
+
+    /// A grid the client cuts narrower lets go of what its rows ran on with:
+    /// that was said of the width it had.
+    #[test]
+    fn a_grid_cut_narrower_lets_go_of_what_ran_past_its_edge() {
+        let t0 = Instant::now();
+        let mut a = narrowed_with("abc ■ de", t0);
+        notify(&mut a, "nvmux_client", tails_of(0, 4, "■ defgh"), t0);
+        redraw(&mut a, vec![], t0);
+        assert!(a.model.tails.contains_key(&2));
+        let narrower = Value::Array(vec![Value::Array(vec![1000.into(), 6.into()])]);
+        notify(
+            &mut a,
+            "nvmux_client",
+            vec!["measure".into(), 2.into(), narrower],
+            t0,
+        );
+        assert_eq!(a.model.grids[&2].width(), 6, "cut");
+        assert!(!a.model.tails.contains_key(&2), "let go of");
     }
 
     /// Attaching again without `ext_multigrid` for a UI that keeps windows on

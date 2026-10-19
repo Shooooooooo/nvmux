@@ -226,6 +226,10 @@ terminal keeps its whole width either way, since that is the width the
 program in it is told it has; so does a window whose text is in its middle
 already, as a start screen's is, since it was laid out for the whole window.
 
+What Neovim draws after the end of a line, such as a language server's
+diagnostic, runs on into the margin as far as the window goes, rather than
+stopping where the text does.
+
 ## Configuration
 
 nvmux needs no configuration. To change a setting, press `,` in the picker or
