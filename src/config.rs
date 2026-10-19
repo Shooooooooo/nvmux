@@ -285,6 +285,25 @@ pub struct ClientSettings {
     /// as it is made smaller, can scroll the screen where off would cut it
     /// short, until the repaint the new size brings, a moment later.
     pub lean_output: bool,
+    /// Have the terminal move the rows a frame moved, rather than write them
+    /// again: a window scrolling, by Neovim or by `[effects.scroll]`'s slide,
+    /// and a line opened or deleted with the rest of its window moving. A
+    /// scroll region is set round the rows (`DECSTBM`) and they are deleted
+    /// or inserted at its top (`DL`, `IL`), as Neovim's own TUI scrolls; the
+    /// rest of the frame is written as ever. nvmux's own client only (see
+    /// [`crate::client::region`]).
+    ///
+    /// Off, the default, every row a frame changed is written, moved or not.
+    /// On, the screen is the same, and a scroll is written in a fraction of
+    /// the bytes: what a link to a terminal far away carries, and what the
+    /// terminal and nvmux's relay each parse.
+    ///
+    /// What on risks: a terminal that gets scroll regions wrong shows the
+    /// rows a scroll moved wrong, until each is next written. A frame written
+    /// for the size the terminal had, landing as it is made smaller, can move
+    /// rows the region no longer fits, until the repaint the new size brings,
+    /// a moment later.
+    pub scroll_regions: bool,
 }
 
 impl Default for ClientSettings {
@@ -299,6 +318,7 @@ impl Default for ClientSettings {
             centre: Centre::Off,
             window_width: 120,
             lean_output: true,
+            scroll_regions: false,
         }
     }
 }
@@ -1430,15 +1450,16 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          # command = {command}   # {{sock}} is required\n\
          \n\
          [client]\n\
-         # ui           = {ui:<8}   # nvmux's own animated client, or \"nvim\" for Neovim's\n\
-         # per_session  = {per_session:<8}   # keep each session's client; a switch back reuses it\n\
-         # lazy         = {lazy:<8}   # start every client at launch; true waits for each session's first visit\n\
-         # revive       = {revive:<8}   # true starts again, once a dropped link is back, the clients it took\n\
-         # throttle     = {throttle:<8}   # true draws a session out of sight once a second, not as it changes\n\
-         # predict      = {predict:<8}   # over ssh, scrolls show before Neovim answers; \"on\" over any slow link\n\
-         # centre       = {centre:<8}   # on a wide terminal, each window's text in its middle: \"smart\" or \"fixed\"\n\
-         # window_width = {window_width:<8}   # with centre on, how many columns a window's text gets; 0 for no limit\n\
-         # lean_output  = {lean_output:<8}   # fewer bytes per frame, the same screen; false makes every move absolute\n\
+         # ui             = {ui:<8}   # nvmux's own animated client, or \"nvim\" for Neovim's\n\
+         # per_session    = {per_session:<8}   # keep each session's client; a switch back reuses it\n\
+         # lazy           = {lazy:<8}   # start every client at launch; true waits for each session's first visit\n\
+         # revive         = {revive:<8}   # true starts again, once a dropped link is back, the clients it took\n\
+         # throttle       = {throttle:<8}   # true draws a session out of sight once a second, not as it changes\n\
+         # predict        = {predict:<8}   # over ssh, scrolls show before Neovim answers; \"on\" over any slow link\n\
+         # centre         = {centre:<8}   # on a wide terminal, each window's text in its middle: \"smart\" or \"fixed\"\n\
+         # window_width   = {window_width:<8}   # with centre on, how many columns a window's text gets; 0 for no limit\n\
+         # lean_output    = {lean_output:<8}   # fewer bytes per frame, the same screen; false makes every move absolute\n\
+         # scroll_regions = {scroll_regions:<8}   # true has the terminal move the rows a scroll moved; the same screen\n\
          \n\
          [style]\n\
          # color = {style_color:<10}   # or \"#rrggbb\": nvmux's text and bars in that colour\n\
@@ -1498,6 +1519,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
         centre = quoted(c.centre.name()),
         window_width = c.window_width,
         lean_output = c.lean_output,
+        scroll_regions = c.scroll_regions,
         style_color = quoted(&t.color.name()),
         style_float = t.float,
         fade_enabled = f.enabled,
@@ -2562,6 +2584,16 @@ mod tests {
         assert_eq!(s.client.window_width, 120, "the rest as it was");
     }
 
+    /// Every row a frame changed written, moved or not, unless told
+    /// otherwise; the terminal moving the rows a scroll moved is a line away.
+    #[test]
+    fn rows_a_frame_moved_are_written_again_unless_told() {
+        assert!(!Settings::default().client.scroll_regions);
+        let s: Settings = toml::from_str("[client]\nscroll_regions = true\n").expect("valid");
+        assert!(s.client.scroll_regions);
+        assert!(s.client.lean_output, "the rest as it was");
+    }
+
     /// nvmux's own client unless told otherwise; Neovim's is a line away.
     #[test]
     fn a_session_is_drawn_by_nvmuxs_client_unless_told() {
@@ -3025,15 +3057,16 @@ mod tests {
             "the cursor's travel, the particles and the smooth blink: {rendered:?}"
         );
         for line in [
-            "# per_session  = true",
-            "# lazy         = false",
-            "# revive       = false",
-            "# throttle     = false",
-            "# ui           = \"nvmux\"",
-            "# predict      = \"auto\"",
-            "# centre       = \"off\"",
-            "# window_width = 120",
-            "# lean_output  = true",
+            "# per_session    = true",
+            "# lazy           = false",
+            "# revive         = false",
+            "# throttle       = false",
+            "# ui             = \"nvmux\"",
+            "# predict        = \"auto\"",
+            "# centre         = \"off\"",
+            "# window_width   = 120",
+            "# lean_output    = true",
+            "# scroll_regions = false",
             "# color = \"terminal\"",
             "# float = true ",
             "# enabled     = true",
@@ -3243,7 +3276,7 @@ mod tests {
             Value::Choice("smart"),
         );
         let (before, _) = save_over(Some(&template()), &Settings::default(), &saved);
-        assert!(before.contains("\ncentre       = \"smart\" "), "{before}");
+        assert!(before.contains("\ncentre         = \"smart\" "), "{before}");
 
         let (after, count) = save_over(Some(&before), &saved, &Settings::default());
         assert_eq!(count, 1);

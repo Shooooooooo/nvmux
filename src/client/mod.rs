@@ -116,6 +116,7 @@ pub mod input;
 pub mod model;
 pub mod predict;
 pub mod redraw;
+pub mod region;
 pub mod screen;
 pub mod style;
 pub mod term;
@@ -1286,6 +1287,13 @@ impl App {
         self
     }
 
+    /// This client, having the terminal move the rows a frame moved if `on`
+    /// (see [`region`]).
+    pub fn with_scroll_regions(mut self, on: bool) -> Self {
+        self.screen.set_regions(on);
+        self
+    }
+
     /// Whether each window's text is centred, as it stands: not with no
     /// limit on a window's width.
     fn centring(&self) -> bool {
@@ -1744,6 +1752,7 @@ impl App {
         let wanted = effects.want_multigrid() || predict || self.centring();
         self.anim.set_effects(effects);
         self.screen.set_lean(client.lean_output);
+        self.screen.set_regions(client.scroll_regions);
         self.dirty = true;
         if predict != predicting {
             self.predict = predict.then(|| {
@@ -3201,7 +3210,8 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
             settings.client.centre,
             usize::from(settings.client.window_width),
         )
-        .with_lean_output(settings.client.lean_output);
+        .with_lean_output(settings.client.lean_output)
+        .with_scroll_regions(settings.client.scroll_regions);
     app.start();
     let mut inbox = Inbox::default();
     let stdin = std::io::stdin();
@@ -3929,6 +3939,55 @@ mod tests {
         a.reconfigure(&d, t0);
         let text = drawn(&mut a, "ij", "kl");
         assert!(text.contains("ij\r\nkl"), "{text:?}");
+    }
+
+    /// A client told to has the terminal move the rows Neovim scrolled, and
+    /// writes only the line the scroll uncovered; told not to, it writes the
+    /// rows again — from the next frame on, either way.
+    #[test]
+    fn a_client_moves_the_rows_neovim_scrolled_once_told_to() {
+        let t0 = Instant::now();
+        let mut a = attached(false, t0);
+        let lines = (0..5).map(|r| line(1, r, &format!("line {r}"))).collect();
+        redraw(&mut a, lines, t0);
+        a.frame(t0);
+        let scrolled = |a: &mut App, uncovered: &str| {
+            let up = (
+                "grid_scroll",
+                vec![
+                    1.into(),
+                    0.into(),
+                    5.into(),
+                    0.into(),
+                    20.into(),
+                    1.into(),
+                    0.into(),
+                ],
+            );
+            redraw(a, vec![up, line(1, 4, uncovered)], t0);
+            String::from_utf8_lossy(&a.frame(t0)).into_owned()
+        };
+        let text = scrolled(&mut a, "line 5");
+        assert!(!text.contains("\x1b[M"), "not until told: {text:?}");
+
+        let mut d = drawing();
+        d.client.scroll_regions = true;
+        a.reconfigure(&d, t0);
+        let text = scrolled(&mut a, "line 6");
+        assert!(
+            text.contains("\x1b[0m\x1b[1;5r\x1b[M\x1b[r\x1b[5;1H"),
+            "{text:?}"
+        );
+        assert!(text.contains("line 6"), "{text:?}");
+        assert!(
+            !text.contains("line 5"),
+            "a row moved is not written: {text:?}"
+        );
+
+        d.client.scroll_regions = false;
+        a.reconfigure(&d, t0);
+        let text = scrolled(&mut a, "line 7");
+        assert!(!text.contains("\x1b[M"), "{text:?}");
     }
 
     /// Settings come in the card's way, in the client's input, and go to the

@@ -254,15 +254,16 @@ settings = ","       # change nvmux's settings while it runs
 command = "nvim --headless --listen {sock}"   # {sock} is required
 
 [client]
-ui           = "nvmux"  # who draws a session: nvmux's own client, animated; or "nvim"
-per_session  = true     # keep each session's client; a switch back reuses it
-lazy         = false    # start every client at launch; true waits for each session's first visit
-revive       = false    # true starts again, once a dropped link is back, the clients it took
-throttle     = false    # true draws a session out of sight once a second, not as it changes
-predict      = "auto"   # over ssh, scrolls show before Neovim answers; "on" over any slow link
-centre       = "off"    # on a wide terminal, each window's text in its middle: "smart" or "fixed"
-window_width = 120      # with centre on, how many columns a window's text gets; 0 for no limit
-lean_output  = true     # fewer bytes per frame, the same screen; false makes every move absolute
+ui             = "nvmux"  # who draws a session: nvmux's own client, animated; or "nvim"
+per_session    = true     # keep each session's client; a switch back reuses it
+lazy           = false    # start every client at launch; true waits for each session's first visit
+revive         = false    # true starts again, once a dropped link is back, the clients it took
+throttle       = false    # true draws a session out of sight once a second, not as it changes
+predict        = "auto"   # over ssh, scrolls show before Neovim answers; "on" over any slow link
+centre         = "off"    # on a wide terminal, each window's text in its middle: "smart" or "fixed"
+window_width   = 120      # with centre on, how many columns a window's text gets; 0 for no limit
+lean_output    = true     # fewer bytes per frame, the same screen; false makes every move absolute
+scroll_regions = false    # true has the terminal move the rows a scroll moved; the same screen
 
 [style]
 color = "terminal"   # or "#rrggbb": nvmux's text and bars in that colour; dim text stays dim
