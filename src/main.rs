@@ -412,10 +412,10 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
             // The first attach since a dropped link, or since the settings
             // changed the kind of client: the clients the link took, or every
             // other session's of the new kind, are started again behind this
-            // one, once it has painted, as `[client] revive` and `[client]
-            // lazy` say (see `Again`). Those of a revival still going are
-            // collected first, so that the ones the link took again are among
-            // them.
+            // one, once it has painted, unless `[client] lazy` says to wait
+            // for their visits (see `Again`). Those of a revival still going
+            // are collected first, so that the ones the link took again are
+            // among them.
             let dropped = std::mem::take(&mut after_a_drop);
             let changed = std::mem::take(&mut new_kind);
             if let Some(again) = Again::after(dropped, changed, remote, config::get().client) {
@@ -1123,10 +1123,9 @@ fn start_every_client(
 /// paint nothing until it has one.
 const REVIVE_AFTER_AT_MOST: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Clients started again behind the session in front, once that has painted:
-/// the ones a dropped link took with it, with `[client] revive`, or every
-/// session's after the settings changed the kind of client, with `[client]
-/// lazy` off (see [`Again`]).
+/// Clients started again behind the session in front, once that has painted,
+/// with `[client] lazy` off: the ones a dropped link took with it, or every
+/// session's after the settings changed the kind of client (see [`Again`]).
 ///
 /// Every client nvmux holds for a session not in front, parked or started
 /// ahead, rides the link to its session's server, and leaves with it. As the
@@ -1258,31 +1257,32 @@ impl Drop for Revival {
 /// dropped link or since the settings changed the kind of client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Again {
-    /// The ones a dropped link took, which have left the pool: `[client]
-    /// revive`, over SSH, where there is a link to drop.
+    /// The ones a dropped link took, which have left the pool: over SSH,
+    /// where there is a link to drop.
     Taken,
     /// Every session's the pool has no client for, as the kind the settings
     /// have just changed to: after that change, which retires every client
-    /// there is, every session's. `[client] lazy` off, which has every
-    /// session's client started as nvmux starts, has them started again.
-    /// Those a link that dropped as well took are among them, `revive` or not.
+    /// there is, every session's. Those a link that dropped as well took are
+    /// among them.
     Every,
 }
 
 impl Again {
     /// What the first attach since a dropped link (`dropped`), or since the
     /// settings changed the kind of client (`new_kind`), starts again behind
-    /// it, as the client settings now say: nothing, with neither, or with
-    /// what they ask for turned off.
+    /// it, as the client settings now say: nothing with neither, nor with
+    /// `[client] lazy` on, which starts each client on its session's visit.
     fn after(
         dropped: bool,
         new_kind: bool,
         remote: bool,
         client: config::ClientSettings,
     ) -> Option<Self> {
-        if new_kind && !client.lazy {
+        if client.lazy {
+            None
+        } else if new_kind {
             Some(Self::Every)
-        } else if dropped && remote && client.revive {
+        } else if dropped && remote {
             Some(Self::Taken)
         } else {
             None
@@ -1695,54 +1695,43 @@ mod tests {
             .is_empty());
     }
 
-    /// A change of the kind of client starts every session's again, with
-    /// `lazy` off, wherever the sessions are and whether or not the link
-    /// dropped as well, `revive` or not; with `lazy` on, none, but the ones a
-    /// link that dropped took, with `revive` on. A dropped link alone starts
-    /// the ones it took, over SSH with `revive` on, and nothing else starts
-    /// anything.
+    /// With `lazy` off, a change of the kind of client starts every session's
+    /// again, wherever the sessions are and whether or not the link dropped
+    /// as well; a dropped link alone starts the ones it took, over SSH; and
+    /// nothing else starts anything. With `lazy` on, nothing does.
     #[test]
-    fn a_new_kind_of_client_is_started_for_every_session_unless_lazy() {
-        let client = |lazy, revive| config::ClientSettings {
+    fn clients_are_started_again_unless_lazy() {
+        let client = |lazy| config::ClientSettings {
             lazy,
-            revive,
             ..config::ClientSettings::default()
         };
         for remote in [false, true] {
             for dropped in [false, true] {
-                for revive in [false, true] {
+                assert_eq!(
+                    Again::after(dropped, true, remote, client(false)),
+                    Some(Again::Every),
+                    "remote {remote}, dropped {dropped}"
+                );
+                for new_kind in [false, true] {
                     assert_eq!(
-                        Again::after(dropped, true, remote, client(false, revive)),
-                        Some(Again::Every),
-                        "remote {remote}, dropped {dropped}, revive {revive}"
+                        Again::after(dropped, new_kind, remote, client(true)),
+                        None,
+                        "lazy, remote {remote}, dropped {dropped}, new kind {new_kind}"
                     );
                 }
             }
-            assert_eq!(
-                Again::after(false, true, remote, client(true, true)),
-                None,
-                "lazy, remote {remote}"
-            );
         }
         assert_eq!(
-            Again::after(true, true, true, client(true, true)),
+            Again::after(true, false, true, client(false)),
             Some(Again::Taken)
         );
         assert_eq!(
-            Again::after(true, false, true, client(false, true)),
-            Some(Again::Taken)
-        );
-        assert_eq!(
-            Again::after(true, false, true, client(false, false)),
-            None,
-            "revive off"
-        );
-        assert_eq!(
-            Again::after(true, false, false, client(false, true)),
+            Again::after(true, false, false, client(false)),
             None,
             "no link to drop"
         );
-        assert_eq!(Again::after(false, false, true, client(false, true)), None);
+        assert_eq!(Again::after(false, false, true, client(false)), None);
+        assert_eq!(Again::after(false, false, false, client(false)), None);
     }
 
     /// Settling says when the kind of client changed, and only once: what it

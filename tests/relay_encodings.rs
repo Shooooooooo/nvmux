@@ -1791,7 +1791,7 @@ fn a_client_started_ahead_is_dissolved_in_on_its_first_visit() {
 /// session's screen has reached the terminal — with the first paint held and
 /// dissolved in if `fade`, and relayed as it comes if not. It is what the
 /// clients a dropped link took wait for before they are started again behind
-/// the session in front (`[client] revive`): each has its session's screen
+/// the session in front (`[client] lazy` off): each has its session's screen
 /// sent over the same link.
 fn a_relay_says_when_its_session_has_painted(tag: &str, fade: bool) {
     require_nvim!();
