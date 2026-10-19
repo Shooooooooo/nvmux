@@ -120,17 +120,17 @@ pub struct SessionSettings {
     /// Have the sessions say when they have news for the cards in the margin,
     /// rather than be asked for it every two seconds (see [`crate::tell`]).
     ///
-    /// Off, the default, nvmux reads every session every two seconds for as
-    /// long as you are in one — a connection to each, and its editor woken,
-    /// thirty times a minute — and a card comes up to two seconds after what
-    /// it tells. On, nvmux holds a connection open to each session, and the
-    /// session says down it when it has news: the card comes as it happens,
-    /// and each session is read twice a minute besides, for anything missed.
-    ///
-    /// What on risks: a connection and a thread held for every session for
+    /// On, the default, nvmux holds a connection open to each session, and
+    /// the session says down it when it has news: the card comes as it
+    /// happens, and each session is read twice a minute besides, for anything
+    /// missed. That is a connection and a thread held for every session for
     /// as long as nvmux runs, over ssh a forwarded connection; and news that a
     /// connection gone quiet without closing, over a link that dropped, does
     /// not bring is told up to thirty seconds late.
+    ///
+    /// Off, nvmux reads every session every two seconds for as long as you
+    /// are in one — a connection to each, and its editor woken, thirty times
+    /// a minute — and a card comes up to two seconds after what it tells.
     pub push_news: bool,
 }
 
@@ -194,7 +194,13 @@ pub struct ClientSettings {
     /// client until it is first attached to — a fork, a probe, and a first
     /// paint to wait for, as on a switch to it with `per_session` off. A
     /// session created after nvmux started is started on its first visit
-    /// either way.
+    /// either way, unless a change of `ui` comes first.
+    ///
+    /// A change of `ui` on the settings screen retires every client there is,
+    /// for the next attach to start the new kind. Off, the client of every
+    /// other session in the listing is then started as the new kind, behind
+    /// that one once it has painted, as `revive` starts again the ones a
+    /// dropped link took; on, each is started on its next visit.
     ///
     /// What off costs, and so the reasons to turn it on:
     ///
@@ -203,8 +209,9 @@ pub struct ClientSettings {
     ///   from its first visit.
     /// - nvmux's start pays a listing and, per session, a fork and an ssh
     ///   forward, before the picker is drawn.
-    /// - Every session is probed as nvmux starts, which ends a hit-enter
-    ///   prompt in each, as a visit would (see `pty::probe_on`).
+    /// - Every session is probed as nvmux starts, and again after a change of
+    ///   `ui`, which ends a hit-enter prompt in each, as a visit would (see
+    ///   `pty::probe_on`).
     /// - A client that writes more than [`crate::pty::AHEAD_MAX`] before its
     ///   first visit — a `:terminal` running something — is let go, and its
     ///   session is started on its first visit after all.
@@ -1164,7 +1171,7 @@ impl Default for SessionSettings {
             // prompt shows this before any config has necessarily been read.
             command: crate::launch::DEFAULT.to_string(),
             quick_list: true,
-            push_news: false,
+            push_news: true,
         }
     }
 }
@@ -1496,7 +1503,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          [session]\n\
          # command = {command}   # {{sock}} is required\n\
          # quick_list = {quick_list}   # a busy session holds a listing a quarter of a second; false waits three\n\
-         # push_news  = {push_news}   # true has the sessions say when they have news, not be asked every two seconds\n\
+         # push_news  = {push_news}   # sessions say when they have news; false asks each one every two seconds\n\
          \n\
          [client]\n\
          # ui             = {ui:<8}   # nvmux's own animated client, or \"nvim\" for Neovim's\n\
@@ -2671,13 +2678,13 @@ mod tests {
         );
     }
 
-    /// The sessions are asked for their news every two seconds unless told
-    /// otherwise; having them say it is a line away.
+    /// The sessions say when they have news unless told otherwise; asking
+    /// them for it every two seconds is a line away.
     #[test]
-    fn the_sessions_are_asked_for_their_news_unless_told() {
-        assert!(!Settings::default().session.push_news);
-        let s: Settings = toml::from_str("[session]\npush_news = true\n").expect("valid");
-        assert!(s.session.push_news);
+    fn the_sessions_say_when_they_have_news_unless_told() {
+        assert!(Settings::default().session.push_news);
+        let s: Settings = toml::from_str("[session]\npush_news = false\n").expect("valid");
+        assert!(!s.session.push_news);
         assert_eq!(
             s.session.quick_list,
             SessionSettings::default().quick_list,
@@ -3160,7 +3167,7 @@ mod tests {
             "# scroll_regions = false",
             "# partial_frames = false",
             "# quick_list = true",
-            "# push_news  = false",
+            "# push_news  = true",
             "# color = \"terminal\"",
             "# float = true ",
             "# enabled     = true",

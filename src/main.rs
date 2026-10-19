@@ -156,7 +156,9 @@ fn establish_settings() -> Result<config::Settings> {
 ///
 /// With `[client] lazy = false` the pool starts out holding a client for every
 /// session, started before the picker is drawn (see [`start_every_client`]),
-/// so a first visit takes one out of it as a switch back does.
+/// so a first visit takes one out of it as a switch back does — and holds one
+/// again for every session but the one in front once the settings have changed
+/// the kind of client, which retires them all (see [`Again::Every`]).
 ///
 /// Each session put in front is given the watcher its notes come from, and
 /// what it kept is cleared, and again as it leaves: it has been looked at (see
@@ -203,12 +205,14 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
     // to report as it happens (see `nvmux::tell`). Handed each session's
     // socket as the picker finds it, and each attached one's here.
     let notifier = nvmux::tell::Notifier::start();
-    // The clients a dropped link took, started again behind the session in
-    // front (`[client] revive`; see `Revival`), and whether the next attach is
-    // the first since a dropped link: the link came back under the session in
-    // front, or a kept client was found to have left with it.
+    // The clients started again behind the session in front (see `Revival`);
+    // whether the next attach is the first since a dropped link — the link
+    // came back under the session in front, or a kept client was found to have
+    // left with it; and whether it is the first since the settings changed the
+    // kind of client (see `settle`). Those two say which clients (see `Again`).
     let mut revival: Option<Revival> = None;
     let mut after_a_drop = false;
+    let mut new_kind = false;
 
     loop {
         // `<prefix> c` moves this to the session it just created. A client held
@@ -258,7 +262,7 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
         // A session the listing no longer has has nothing to come back to.
         pool.keep_only(&listing);
         // The picker may have had the settings changed.
-        settle(&mut clients, &mut attached, &mut pool);
+        new_kind |= settle(&mut clients, &mut attached, &mut pool);
         // Derived rather than carried: one fewer thing for the picker to keep
         // in step, and the listing it handed over is what it would be derived
         // from anyway.
@@ -405,15 +409,27 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
             from_picker = false;
             shown = Some(current.id.clone());
 
-            // The first attach since a dropped link: the clients it took are
-            // started again behind this one, once it has painted, if `[client]
-            // revive` says so. Those of a revival still going are collected
-            // first, so that the ones the link took again are among them.
-            if std::mem::take(&mut after_a_drop) && remote && config::get().client.revive {
+            // The first attach since a dropped link, or since the settings
+            // changed the kind of client: the clients the link took, or every
+            // other session's of the new kind, are started again behind this
+            // one, once it has painted, as `[client] revive` and `[client]
+            // lazy` say (see `Again`). Those of a revival still going are
+            // collected first, so that the ones the link took again are among
+            // them.
+            let dropped = std::mem::take(&mut after_a_drop);
+            let changed = std::mem::take(&mut new_kind);
+            if let Some(again) = Again::after(dropped, changed, remote, config::get().client) {
                 if let Some(earlier) = revival.take() {
                     earlier.collect(&mut pool, Some(&current.id));
                 }
-                revival = Revival::begin(shared, &mut pool, &listing, &current.id, &mut attachment);
+                revival = Revival::begin(
+                    shared,
+                    &mut pool,
+                    &listing,
+                    &current.id,
+                    again,
+                    &mut attachment,
+                );
             }
 
             // The session is about to be looked at: its watcher put in if it
@@ -617,7 +633,7 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                 (pty::Outcome::ShowSettings, held) => {
                     attached = pool.set_aside(held);
                     let left = ui::settings::run(remote)?;
-                    settle(&mut clients, &mut attached, &mut pool);
+                    new_kind |= settle(&mut clients, &mut attached, &mut pool);
                     // Turned to float: back up over the session, floating,
                     // as it comes back.
                     float_settings = left == ui::settings::Outcome::Float;
@@ -628,7 +644,7 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                 // here, and the session attached again.
                 (pty::Outcome::Resettle, held) => {
                     attached = pool.set_aside(held);
-                    settle(&mut clients, &mut attached, &mut pool);
+                    new_kind |= settle(&mut clients, &mut attached, &mut pool);
                     continue;
                 }
                 (pty::Outcome::Switch(target), mut held) => {
@@ -729,18 +745,21 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
 }
 
 /// What the settings screen changed of the clients that they cannot follow by
-/// being told (for what they can, see `pty::Attachment::open_desk`). The
-/// other kind of client, `[client] ui`, retires every one there is — the one
-/// held across the screen and those kept — for each session's next attach to
-/// start the new kind; clients no longer kept, `[client] per_session`, retire
-/// those kept, and kept ones are kept again from the next to leave the front.
+/// being told (for what they can, see `pty::Attachment::open_desk`), and
+/// whether that was the kind of client. The other kind, `[client] ui`, retires
+/// every one there is — the one held across the screen and those kept — for
+/// the next attach to start the new kind, and the other sessions' to be
+/// started behind it or on their own next attaches (see [`Again::Every`]);
+/// clients no longer kept, `[client] per_session`, retire those kept, and kept
+/// ones are kept again from the next to leave the front.
 fn settle(
     was: &mut config::ClientSettings,
     attached: &mut Option<pty::Attachment>,
     pool: &mut pool::Pool,
-) {
+) -> bool {
     let now = config::get().client;
-    if now.ui != was.ui {
+    let new_kind = now.ui != was.ui;
+    if new_kind {
         if let Some(a) = attached.take() {
             a.terminate();
         }
@@ -748,6 +767,7 @@ fn settle(
     }
     pool.keep(now.per_session);
     *was = now;
+    new_kind
 }
 
 /// The attachment to relay next, from the pool if it has one for the session
@@ -1103,8 +1123,10 @@ fn start_every_client(
 /// paint nothing until it has one.
 const REVIVE_AFTER_AT_MOST: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// The clients a dropped link took with it, started again behind the session
-/// in front, once that has painted: `[client] revive`.
+/// Clients started again behind the session in front, once that has painted:
+/// the ones a dropped link took with it, with `[client] revive`, or every
+/// session's after the settings changed the kind of client, with `[client]
+/// lazy` off (see [`Again`]).
 ///
 /// Every client nvmux holds for a session not in front, parked or started
 /// ahead, rides the link to its session's server, and leaves with it. As the
@@ -1113,6 +1135,12 @@ const REVIVE_AFTER_AT_MOST: std::time::Duration = std::time::Duration::from_secs
 /// a probe and a first paint, over a link that has just shown how far away
 /// the host is. With it they are started ahead again, as [`start_every_client`]
 /// starts them as nvmux starts, and held by the pool until those visits.
+///
+/// A change of the kind of client retires every client there is, of the kind
+/// no longer named (see [`settle`]), and the session in front is attached
+/// again as the new kind. Without this the rest would wait for their next
+/// visits too, as if `lazy` were on; with it they are started again, as the
+/// new kind, as nvmux's start started them as the old.
 ///
 /// On a thread, because each is a fork, and their forwards an ssh command
 /// besides, and the session in front would otherwise wait for them all to have
@@ -1134,24 +1162,26 @@ struct Revival {
 }
 
 impl Revival {
-    /// Start again, behind `attachment`, the clients that have left the pool —
-    /// after a dropped link, the clients it took — for the sessions the
-    /// listing still has, the one in front aside. `None` with none to start.
+    /// Start again, behind `attachment`, the clients `again` says, for the
+    /// sessions the listing still has, the one in front aside: those that
+    /// have left the pool — after a dropped link, the clients it took — or
+    /// every one the pool has no client for. `None` with none to start.
     fn begin(
         shared: &transport::Shared,
         pool: &mut pool::Pool,
         listing: &[nvmux::session::Session],
         front: &str,
+        again: Again,
         attachment: &mut pty::Attachment,
     ) -> Option<Self> {
-        let left = pool.take_left();
-        let sessions = in_visiting_order(listing, front, &left);
+        let sessions = again.sessions(pool, listing, front);
         if sessions.is_empty() {
             return None;
         }
         tracing::debug!(
             sessions = sessions.len(),
-            "starting again the clients the link took"
+            ?again,
+            "starting clients again behind the session in front"
         );
         let painted = attachment.tell_when_painted();
         let (handing, held) = mpsc::channel();
@@ -1173,7 +1203,7 @@ impl Revival {
                 });
             });
         if let Err(e) = spawned {
-            tracing::debug!(error = %e, "could not start again the clients the link took");
+            tracing::debug!(error = %e, "could not start the clients again");
             return None;
         }
         Some(Self {
@@ -1224,12 +1254,66 @@ impl Drop for Revival {
     }
 }
 
-/// The sessions of `left` the listing still has, `front` aside, in the order
-/// `<prefix> n` visits them from `front`: the likeliest next first.
+/// Which clients a [`Revival`] starts again, behind the first attach since a
+/// dropped link or since the settings changed the kind of client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Again {
+    /// The ones a dropped link took, which have left the pool: `[client]
+    /// revive`, over SSH, where there is a link to drop.
+    Taken,
+    /// Every session's the pool has no client for, as the kind the settings
+    /// have just changed to: after that change, which retires every client
+    /// there is, every session's. `[client] lazy` off, which has every
+    /// session's client started as nvmux starts, has them started again.
+    /// Those a link that dropped as well took are among them, `revive` or not.
+    Every,
+}
+
+impl Again {
+    /// What the first attach since a dropped link (`dropped`), or since the
+    /// settings changed the kind of client (`new_kind`), starts again behind
+    /// it, as the client settings now say: nothing, with neither, or with
+    /// what they ask for turned off.
+    fn after(
+        dropped: bool,
+        new_kind: bool,
+        remote: bool,
+        client: config::ClientSettings,
+    ) -> Option<Self> {
+        if new_kind && !client.lazy {
+            Some(Self::Every)
+        } else if dropped && remote && client.revive {
+            Some(Self::Taken)
+        } else {
+            None
+        }
+    }
+
+    /// The sessions of the listing to start a client for, `front` aside, in
+    /// the order `<prefix> n` visits them from it. For the ones a link took,
+    /// the pool lets go of every client that has left it, and names them.
+    fn sessions(
+        self,
+        pool: &mut pool::Pool,
+        listing: &[nvmux::session::Session],
+        front: &str,
+    ) -> Vec<nvmux::session::Session> {
+        match self {
+            Self::Taken => {
+                let left = pool.take_left();
+                in_visiting_order(listing, front, |id| left.iter().any(|l| l == id))
+            }
+            Self::Every => in_visiting_order(listing, front, |id| !pool.holds(id)),
+        }
+    }
+}
+
+/// The sessions the listing has that `wanted` picks by id, `front` aside, in
+/// the order `<prefix> n` visits them from `front`: the likeliest next first.
 fn in_visiting_order(
     listing: &[nvmux::session::Session],
     front: &str,
-    left: &[String],
+    wanted: impl Fn(&str) -> bool,
 ) -> Vec<nvmux::session::Session> {
     let after = listing
         .iter()
@@ -1238,7 +1322,7 @@ fn in_visiting_order(
     listing[after..]
         .iter()
         .chain(&listing[..after])
-        .filter(|s| s.id != front && left.contains(&s.id))
+        .filter(|s| s.id != front && wanted(&s.id))
         .cloned()
         .collect()
 }
@@ -1577,14 +1661,113 @@ mod tests {
             (4, "id000004"),
         ]);
         let left = ["id000001", "id000003", "id000004", "id000009"].map(String::from);
+        let took = |id: &str| left.iter().any(|l| l == id);
         assert_eq!(
-            ids(in_visiting_order(&listing, "id000002", &left)),
+            ids(in_visiting_order(&listing, "id000002", took)),
             ["id000003", "id000004", "id000001"]
         );
         assert_eq!(
-            ids(in_visiting_order(&listing, "id000003", &left)),
+            ids(in_visiting_order(&listing, "id000003", took)),
             ["id000004", "id000001"],
             "the one in front was started again"
+        );
+    }
+
+    /// After a change of the kind of client the pool holds none, and every
+    /// session's is started again, in the order `<prefix> n` visits them from
+    /// the one in front, round the end, but the one in front's; where a link
+    /// that dropped would start none, having taken none.
+    #[test]
+    fn every_client_but_the_one_in_front_is_started_again_as_the_new_kind() {
+        let listing = listing_of(&[
+            (1, "id000001"),
+            (2, "id000002"),
+            (3, "id000003"),
+            (4, "id000004"),
+        ]);
+        let mut pool = pool::Pool::new(true);
+        assert_eq!(
+            ids(Again::Every.sessions(&mut pool, &listing, "id000003")),
+            ["id000004", "id000001", "id000002"]
+        );
+        assert!(Again::Taken
+            .sessions(&mut pool, &listing, "id000003")
+            .is_empty());
+    }
+
+    /// A change of the kind of client starts every session's again, with
+    /// `lazy` off, wherever the sessions are and whether or not the link
+    /// dropped as well, `revive` or not; with `lazy` on, none, but the ones a
+    /// link that dropped took, with `revive` on. A dropped link alone starts
+    /// the ones it took, over SSH with `revive` on, and nothing else starts
+    /// anything.
+    #[test]
+    fn a_new_kind_of_client_is_started_for_every_session_unless_lazy() {
+        let client = |lazy, revive| config::ClientSettings {
+            lazy,
+            revive,
+            ..config::ClientSettings::default()
+        };
+        for remote in [false, true] {
+            for dropped in [false, true] {
+                for revive in [false, true] {
+                    assert_eq!(
+                        Again::after(dropped, true, remote, client(false, revive)),
+                        Some(Again::Every),
+                        "remote {remote}, dropped {dropped}, revive {revive}"
+                    );
+                }
+            }
+            assert_eq!(
+                Again::after(false, true, remote, client(true, true)),
+                None,
+                "lazy, remote {remote}"
+            );
+        }
+        assert_eq!(
+            Again::after(true, true, true, client(true, true)),
+            Some(Again::Taken)
+        );
+        assert_eq!(
+            Again::after(true, false, true, client(false, true)),
+            Some(Again::Taken)
+        );
+        assert_eq!(
+            Again::after(true, false, true, client(false, false)),
+            None,
+            "revive off"
+        );
+        assert_eq!(
+            Again::after(true, false, false, client(false, true)),
+            None,
+            "no link to drop"
+        );
+        assert_eq!(Again::after(false, false, true, client(false, true)), None);
+    }
+
+    /// Settling says when the kind of client changed, and only once: what it
+    /// settles to is what it compares with next. Whether clients are kept is
+    /// no change of kind.
+    #[test]
+    fn settling_says_when_the_kind_of_client_changed() {
+        let running = config::get().client;
+        let other = config::Ui::ALL
+            .into_iter()
+            .find(|ui| *ui != running.ui)
+            .expect("two kinds of client");
+        let mut attached = None;
+        let mut pool = pool::Pool::new(running.per_session);
+        let mut was = config::ClientSettings {
+            ui: other,
+            ..running
+        };
+        assert!(settle(&mut was, &mut attached, &mut pool), "a new kind");
+        assert_eq!(was, running);
+        assert!(!settle(&mut was, &mut attached, &mut pool), "settled twice");
+        was.per_session = !was.per_session;
+        assert!(
+            !settle(&mut was, &mut attached, &mut pool),
+            "clients kept or not"
         );
     }
 
