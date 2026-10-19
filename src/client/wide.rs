@@ -326,17 +326,18 @@ local function untab(text, col, ts)
   return table.concat(out)
 end
 -- Each row of a window whose text after its line's end runs past its grid's
--- edge, as { row, start, pieces }: the window's grid narrower than it.
+-- edge, as { row, start, pieces }: the window's grid narrower than it. Where
+-- a line could be no wider than the grid, text and all, it is left at that:
+-- concealed text would only make it narrower.
 local function tails(win, fresh)
   local width = vim.fn.winwidth(win)
   if api.nvim_win_get_config(win).relative ~= '' or width >= api.nvim_win_get_width(win) then
     return {}
   end
   local buf = api.nvim_win_get_buf(win)
-  local info = vim.fn.getwininfo(win)[1]
   local lines = {}
-  local marks = api.nvim_buf_get_extmarks(buf, -1, { info.topline - 1, 0 },
-    { info.botline - 1, -1 }, { details = true, type = 'virt_text' })
+  local marks = api.nvim_buf_get_extmarks(buf, -1, { vim.fn.line('w0', win) - 1, 0 },
+    { vim.fn.line('w$', win) - 1, -1 }, { details = true, type = 'virt_text' })
   for i, m in ipairs(marks) do
     local d = m[4]
     if not d.invalid and (d.virt_text_pos == 'eol' or d.virt_text_pos == 'inline') then
@@ -349,26 +350,45 @@ local function tails(win, fresh)
       end
     end
   end
+  if next(lines) == nil then
+    return {}
+  end
+  local function wide(chunks)
+    local n = 0
+    for _, c in ipairs(chunks) do
+      n = n + vim.fn.strdisplaywidth(c[1])
+    end
+    return n
+  end
+  local info = vim.fn.getwininfo(win)[1]
+  local left = vim.wo[win].wrap and 0 or info.leftcol
   local at = api.nvim_win_get_position(win)
   local ts = vim.bo[buf].tabstop
   local out = {}
   api.nvim_win_call(win, function()
     for r, l in pairs(lines) do
-      if #l.ends > 0 and vim.fn.foldclosed(r + 1) == -1 then
-        local line = api.nvim_buf_get_lines(buf, r, r + 1, false)[1] or ''
+      local line = #l.ends > 0 and api.nvim_buf_get_lines(buf, r, r + 1, false)[1]
+      -- What is put in at the line's end, which the text after it follows;
+      -- and as wide as the line could be, text and all.
+      local inline, most = 0, 0
+      if line then
+        for _, i in ipairs(l.inline) do
+          if i[1] >= #line then
+            inline = inline + wide(i[2])
+          end
+        end
+        most = info.textoff + vim.fn.strdisplaywidth(line) + inline - left + #l.ends
+        for _, e in ipairs(l.ends) do
+          most = most + wide(e[4])
+        end
+      end
+      if line and most > width and vim.fn.foldclosed(r + 1) == -1 then
         -- The line's end is the cell after its last character, as far as
         -- screenpos() sees, even past the window's edge where the line fills
         -- it; the text after it starts a cell on, past any put in there.
         local p = vim.fn.screenpos(win, r + 1, math.max(#line, 1))
-        local col = line == '' and p.col - at[2] or p.endcol - at[2] + 1
+        local col = (line == '' and p.col - at[2] or p.endcol - at[2] + 1) + inline
         if p.row > 0 then
-          for _, i in ipairs(l.inline) do
-            if i[1] >= #line then
-              for _, c in ipairs(i[2]) do
-                col = col + vim.fn.strdisplaywidth(c[1])
-              end
-            end
-          end
           table.sort(l.ends, function(x, y)
             if x[1] ~= y[1] then
               return x[1] < y[1]
