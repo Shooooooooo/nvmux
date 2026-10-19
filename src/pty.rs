@@ -1936,8 +1936,9 @@ impl Attachment {
     /// Put a kept client aside while something else has the front: see
     /// [`Parked`]. `None` if it could not be parked — no stop channel or no
     /// thread to be had for it — in which case it has been retired and the
-    /// next attach to its session is a fresh one. Told to draw at a crawl
-    /// meanwhile if `throttle` (see [`Attachment::go_away`]).
+    /// next attach to its session is a fresh one. Told it is out of sight:
+    /// to draw at a crawl meanwhile if `throttle`, and to hold its cursor's
+    /// blink if not (see [`Attachment::go_away`]).
     pub fn park(mut self, throttle: bool) -> Option<Parked> {
         self.exits_seen = EXITS_RELAYED.load(std::sync::atomic::Ordering::Relaxed);
         // The last fade's diff describes a terminal another session is about
@@ -1947,9 +1948,7 @@ impl Attachment {
         if let Some(copy) = self.copy() {
             copy.invalidate();
         }
-        if throttle {
-            self.go_away();
-        }
+        self.go_away(throttle);
         self.put_aside("nvmux-parked", keep_parked)
     }
 
@@ -1957,8 +1956,7 @@ impl Attachment {
     /// visited: `[client] lazy = false`, which starts one for every session as
     /// nvmux starts. `probe` is its attach probe, if that has still to answer.
     /// `None` if it could not be held, in which case it has been retired, as
-    /// by [`Attachment::park`]; and told to draw at a crawl, as that is, if
-    /// `throttle`.
+    /// by [`Attachment::park`]; and told it is out of sight, as that is.
     ///
     /// Held as a parked client is — in a [`Parked`], on a thread that owns it
     /// and reads it — but kept differently, because it is read for a
@@ -1983,22 +1981,26 @@ impl Attachment {
     pub fn start_ahead(mut self, probe: Option<Probe>, throttle: bool) -> Option<Parked> {
         self.unshown = Some(Vec::new());
         self.probe = probe;
-        if throttle {
-            self.go_away();
-        }
+        self.go_away(throttle);
         self.put_aside("nvmux-ahead", keep_unshown)
     }
 
     /// Tell a client that draws cards that it is going to the back, where
-    /// nothing it draws is seen: it stops animating, and draws at a crawl,
-    /// until the relay that brings it back to the front says so with the
-    /// [`card::Command::Clear`] it opens with (see [`card::Command::Away`]
-    /// and `[client] throttle`). Here and not as its relay ends, where a
+    /// nothing it draws is seen, until the relay that brings it back to the
+    /// front says so with the [`card::Command::Clear`] it opens with. If
+    /// `throttle`, it stops animating and draws at a crawl
+    /// ([`card::Command::Away`], and `[client] throttle`); if not, it draws
+    /// as it would in front but for its cursor's blink, which holds still
+    /// ([`card::Command::Unseen`]). Here and not as its relay ends, where a
     /// switch has it draw the card the switch lands with first
     /// ([`Attachment::stand_landing`]).
-    fn go_away(&mut self) {
+    fn go_away(&mut self, throttle: bool) {
         if self.draws_cards {
-            self.tell_client(&card::Command::Away);
+            self.tell_client(if throttle {
+                &card::Command::Away
+            } else {
+                &card::Command::Unseen
+            });
             self.away = true;
         }
     }
@@ -3286,10 +3288,10 @@ pub fn relay(
         // one has yet to ask it.
         //
         // Told it is back in front before that, if it was told it was away
-        // (see `Attachment::go_away`): away, a client draws at a crawl, and
-        // that redraw would come long after the held paint it belongs in had
-        // been let through without it. The opening says so too, but only as
-        // the paint is let through.
+        // (see `Attachment::go_away`): away and throttled, a client draws at
+        // a crawl, and that redraw would come long after the held paint it
+        // belongs in had been let through without it. The opening says so
+        // too, but only as the paint is let through.
         if attachment.started_ahead() {
             if std::mem::take(&mut attachment.away) {
                 attachment.tell_client(&card::Command::Clear);
@@ -6596,26 +6598,32 @@ mod tests {
         );
     }
 
-    /// A client put aside — parked, or started ahead — with `[client]
-    /// throttle` on is told it has gone to the back, if it is one that draws
-    /// cards: in its input, whole, as it goes (see [`card::Command::Away`]).
-    /// With it off, the default, or for Neovim's own client, which could not
-    /// read it, nothing is put in.
+    /// A client put aside — parked, or started ahead — is told it has gone
+    /// to the back, if it is one that draws cards: in its input, whole, as it
+    /// goes. With `[client] throttle` on that it is away, to draw at a crawl
+    /// ([`card::Command::Away`]); with it off, the default, that it is out of
+    /// sight, to hold its cursor's blink ([`card::Command::Unseen`]). Neovim's
+    /// own client, which could not read either, is told nothing.
     #[test]
-    fn a_client_put_aside_is_told_it_is_away_only_if_throttled() {
-        let away = card::encode(&card::Command::Away);
-        // What the client reads of its input, said back as a title in hex.
-        let script = format!(
-            r#"printf r; heard=$(head -c {} | od -An -tx1 | tr -d ' \n'); printf '\033]0;%s\007' "$heard"; exec sleep 30"#,
-            away.len()
-        );
-        let mut heard = b"\x1b]0;".to_vec();
-        for b in &away {
-            heard.extend_from_slice(format!("{b:02x}").as_bytes());
-        }
-        heard.push(0x07);
-        for (throttle, draws_cards) in [(true, true), (true, false), (false, true)] {
-            let told = throttle && draws_cards;
+    fn a_client_put_aside_is_told_it_is_out_of_sight() {
+        for (throttle, draws_cards) in [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let said = card::encode(if throttle {
+                &card::Command::Away
+            } else {
+                &card::Command::Unseen
+            });
+            // What the client reads of its input, said back as a title in hex.
+            let script = format!(
+                r#"printf r; heard=$(head -c {} | od -An -tx1 | tr -d ' \n'); printf '\033]0;%s\007' "$heard"; exec sleep 30"#,
+                said.len()
+            );
+            let mut heard = b"\x1b]0;".to_vec();
+            for b in &said {
+                heard.extend_from_slice(format!("{b:02x}").as_bytes());
+            }
+            heard.push(0x07);
+            let told = draws_cards;
             let mut a = kept(&script);
             a.draws_cards = draws_cards;
             wait_until_ready(&a);

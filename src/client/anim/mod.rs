@@ -43,7 +43,7 @@ use self::vfx::Vfx;
 use super::compose::{Frame, Scrolling, View};
 use super::grid::{Cell, Grid};
 use super::model::{Changes, Held, Margins, Model, Place};
-use super::redraw::{Event, Shape};
+use super::redraw::{Event, ModeInfo, Shape};
 use super::screen::Cursor;
 use super::style::{self, Color};
 use crate::palette::Rgb;
@@ -222,6 +222,9 @@ pub struct Animator {
     /// Neovim's options that lay the windows out.
     options: layout::Options,
     blink: Blink,
+    /// The blink is held, the cursor shown whole: nobody sees this client
+    /// (see [`Animator::hold_blink`]).
+    blink_held: bool,
     /// When the animations were last moved on.
     last: Option<Instant>,
     /// The cell the cursor was last in, which particles fly from.
@@ -249,6 +252,7 @@ impl Animator {
             switches: HashMap::new(),
             options: layout::Options::default(),
             blink: Blink::new(Instant::now()),
+            blink_held: false,
             last: None,
             cell: None,
             mode: 0,
@@ -319,6 +323,18 @@ impl Animator {
     /// A key was typed: the cursor is not left faded out under it.
     pub fn typed(&mut self, now: Instant) {
         self.blink.reset(now);
+    }
+
+    /// Hold a blinking cursor still and whole while nobody sees the client
+    /// — parked, or started ahead of its session's first visit — or let it
+    /// blink again, from the start of its wait, as it comes back in front:
+    /// a blink is all frames, a fade's worth at a time, for an eye that is
+    /// not there.
+    pub fn hold_blink(&mut self, held: bool, now: Instant) {
+        if self.blink_held && !held {
+            self.blink.reset(now);
+        }
+        self.blink_held = held;
     }
 
     /// Look at a batch before it is applied: see the module docs. `switched`
@@ -417,7 +433,7 @@ impl Animator {
         drawn: bool,
         now: Instant,
     ) {
-        if !self.animating(model, now) {
+        if !self.moving() {
             self.last = Some(now);
         }
         for grid in &changes.reshaped {
@@ -611,7 +627,7 @@ impl Animator {
         let Some(rect) = text_rect(model, grid) else {
             return false;
         };
-        if !self.animating(model, now) {
+        if !self.moving() {
             self.last = Some(now);
         }
         let animate = self.effects.scroll.is_some();
@@ -654,7 +670,7 @@ impl Animator {
             return;
         };
         if s.fill_in(fill, land) {
-            if !self.animating(model, now) {
+            if !self.moving() {
                 self.last = Some(now);
             }
             self.cursor_moved(model, true, now);
@@ -817,8 +833,11 @@ impl Animator {
         (row + at - (c.row as i64 - top as i64), col)
     }
 
-    /// Whether anything is moving: a frame is wanted.
-    fn animating(&self, model: &Model, now: Instant) -> bool {
+    /// Whether anything is moving: a frame is wanted, and the next is a step
+    /// on from the last. Not the blink, which is a matter of the clock rather
+    /// than of steps: counted, it would keep [`Animator::advance`] stepping
+    /// what starts to move after a quiet spell by the whole of the spell.
+    fn moving(&self) -> bool {
         self.smear.moving()
             || self.vfx.moving()
             || self.scrolls.values().any(Scroll::moving)
@@ -826,31 +845,36 @@ impl Animator {
             || !self.shifts.is_empty()
             || self.transition.is_some()
             || !self.switches.is_empty()
-            || self.blink_due(model, now).is_some()
     }
 
-    /// When a blink fading in or out wants its next frame.
+    /// Whether the cursor is one this blinks: a block `'guicursor'` makes
+    /// blink, with the effect on.
+    pub fn blinks(&self, model: &Model) -> bool {
+        self.blinking_mode(model).is_some()
+    }
+
+    /// The mode whose cursor this blinks, if the cursor is one.
+    fn blinking_mode<'a>(&self, model: &'a Model) -> Option<&'a ModeInfo> {
+        model
+            .mode_info()
+            .filter(|m| self.effects.blink && m.blinks() && m.shape == Some(Shape::Block))
+    }
+
+    /// When a blink fading in or out wants its next frame: none while it is
+    /// held (see [`Animator::hold_blink`]).
     fn blink_due(&self, model: &Model, now: Instant) -> Option<Instant> {
-        if !self.effects.blink {
+        if self.blink_held {
             return None;
         }
-        let mode = model.mode_info()?;
-        if mode.shape != Some(Shape::Block) {
-            return None;
-        }
-        self.blink.next_change(mode, now, FRAME)
+        self.blink
+            .next_change(self.blinking_mode(model)?, now, self.last, FRAME)
     }
 
     /// When the next frame is due, if anything moves.
     pub fn next_frame(&self, model: &Model, now: Instant) -> Option<Instant> {
-        let moving = self.smear.moving()
-            || self.vfx.moving()
-            || self.scrolls.values().any(Scroll::moving)
-            || !self.motions.is_empty()
-            || !self.shifts.is_empty()
-            || self.transition.is_some()
-            || !self.switches.is_empty();
-        let frame = moving.then(|| self.last.map_or(now, |last| last + FRAME));
+        let frame = self
+            .moving()
+            .then(|| self.last.map_or(now, |last| last + FRAME));
         // A prediction Neovim has not confirmed is given up on in a frame.
         let expiry = self
             .scrolls
@@ -922,11 +946,12 @@ impl Animator {
         if let (true, Some(s)) = (self.smear.moving(), self.effects.smear) {
             self.smear.paint(frame, &colors, color, text, &s);
             cursor.visible = false;
-        } else if let Some(mode) = model
-            .mode_info()
-            .filter(|m| self.effects.blink && m.blinks() && m.shape == Some(Shape::Block))
-        {
-            let o = self.blink.opacity(mode, now);
+        } else if let Some(mode) = self.blinking_mode(model) {
+            let o = if self.blink_held {
+                1.0
+            } else {
+                self.blink.opacity(mode, now)
+            };
             if let Some(cell) = frame.get_mut(cursor.row, cursor.col) {
                 let pct = (o * 100.0) as u8;
                 let fg = colors.visual_fg(&cell.style);
@@ -949,7 +974,7 @@ impl Animator {
     /// is simply where it goes: a window's own animation takes it there.
     pub fn insets(&mut self, model: &Model, now: Instant) {
         // Moved on from now, not from whenever the last animation ended.
-        if !self.animating(model, now) {
+        if !self.moving() {
             self.last = Some(now);
         }
         let mut seen = HashMap::new();
