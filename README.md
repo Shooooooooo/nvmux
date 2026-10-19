@@ -271,8 +271,8 @@ predict        = "auto"   # over ssh, scrolls show before Neovim answers; "on" o
 centre         = "off"    # on a wide terminal, each window's text in its middle: "smart" or "fixed"
 window_width   = 120      # with centre on, how many columns a window's text gets; 0 for no limit
 lean_output    = true     # fewer bytes per frame, the same screen; false makes every move absolute
-scroll_regions = false    # true has the terminal move the rows a scroll moved; the same screen
-partial_frames = false    # true puts a frame together from the rows that changed alone; the same screen
+scroll_regions = true     # the terminal moves the rows a scroll moved, the same screen; false writes them
+partial_frames = true     # frames from the rows that changed alone, the same screen; false, from every row
 
 [style]
 color = "terminal"   # or "#rrggbb": nvmux's text and bars in that colour; dim text stays dim
