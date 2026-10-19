@@ -87,7 +87,7 @@ const AHEAD: &[u8] = b"\x1b]9999;ahead\x07";
 const CHILD_AHEAD_MS: &str = "NVMUX_TEST_RELAY_AHEAD_MS";
 
 /// Set on a child whose clients, out of sight, draw at a crawl: `[client]
-/// throttle`, which is off by default.
+/// throttle`, which is on by default, and which a child without this has off.
 const CHILD_THROTTLE: &str = "NVMUX_TEST_RELAY_THROTTLE";
 
 /// What the child's relay announces the session as — on a card nvmux's own
