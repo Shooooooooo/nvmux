@@ -117,6 +117,21 @@ pub struct SessionSettings {
     /// comes up that much later, on a cleared screen — and one that dies in
     /// them is found gone, and not listed.
     pub quick_list: bool,
+    /// Have the sessions say when they have news for the cards in the margin,
+    /// rather than be asked for it every two seconds (see [`crate::tell`]).
+    ///
+    /// Off, the default, nvmux reads every session every two seconds for as
+    /// long as you are in one — a connection to each, and its editor woken,
+    /// thirty times a minute — and a card comes up to two seconds after what
+    /// it tells. On, nvmux holds a connection open to each session, and the
+    /// session says down it when it has news: the card comes as it happens,
+    /// and each session is read twice a minute besides, for anything missed.
+    ///
+    /// What on risks: a connection and a thread held for every session for
+    /// as long as nvmux runs, over ssh a forwarded connection; and news that a
+    /// connection gone quiet without closing, over a link that dropped, does
+    /// not bring is told up to thirty seconds late.
+    pub push_news: bool,
 }
 
 /// The client that draws a session, on the pty nvmux relays (see
@@ -1146,6 +1161,7 @@ impl Default for SessionSettings {
             // prompt shows this before any config has necessarily been read.
             command: crate::launch::DEFAULT.to_string(),
             quick_list: true,
+            push_news: false,
         }
     }
 }
@@ -1477,6 +1493,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          [session]\n\
          # command = {command}   # {{sock}} is required\n\
          # quick_list = {quick_list}   # a busy session holds a listing a quarter of a second; false waits three\n\
+         # push_news  = {push_news}   # true has the sessions say when they have news, not be asked every two seconds\n\
          \n\
          [client]\n\
          # ui             = {ui:<8}   # nvmux's own animated client, or \"nvim\" for Neovim's\n\
@@ -1542,6 +1559,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
         timeout = k.timeout_ms,
         command = quoted(&s.command),
         quick_list = s.quick_list,
+        push_news = s.push_news,
         per_session = c.per_session,
         lazy = c.lazy,
         revive = c.revive,
@@ -2650,6 +2668,20 @@ mod tests {
         );
     }
 
+    /// The sessions are asked for their news every two seconds unless told
+    /// otherwise; having them say it is a line away.
+    #[test]
+    fn the_sessions_are_asked_for_their_news_unless_told() {
+        assert!(!Settings::default().session.push_news);
+        let s: Settings = toml::from_str("[session]\npush_news = true\n").expect("valid");
+        assert!(s.session.push_news);
+        assert_eq!(
+            s.session.quick_list,
+            SessionSettings::default().quick_list,
+            "the rest as it was"
+        );
+    }
+
     /// nvmux's own client unless told otherwise; Neovim's is a line away.
     #[test]
     fn a_session_is_drawn_by_nvmuxs_client_unless_told() {
@@ -3125,6 +3157,7 @@ mod tests {
             "# scroll_regions = false",
             "# partial_frames = false",
             "# quick_list = true",
+            "# push_news  = false",
             "# color = \"terminal\"",
             "# float = true ",
             "# enabled     = true",

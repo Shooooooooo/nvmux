@@ -8,7 +8,10 @@
 //!
 //! Synchronous because Neovim never pushes unsolicited traffic on a bare RPC
 //! channel: only one that has attached a UI or registered for autocmds gets
-//! notifications, so there is nothing to demultiplex in the background.
+//! notifications, so there is nothing to demultiplex in the background. The
+//! one channel nvmux asks for any on is a listener's, which a session's
+//! watcher tells its news to, and which waits for nothing else: see
+//! [`Client::next_notification`].
 //!
 //! Synchronous is not the same as one call at a time. [`Client::ask`] sends a
 //! request without waiting for it, so two calls whose answers are both wanted
@@ -200,6 +203,18 @@ impl Client<UnixStream> {
     pub fn interrupt(&self) -> std::io::Result<Interrupt> {
         Ok(Interrupt(self.io.get_ref().try_clone()?))
     }
+
+    /// The budget from here on: `None` for none, as [`Client::connect_with`]
+    /// takes it. What a channel held open for what the server pushes needs
+    /// once the calls that set it up have had theirs (see
+    /// [`crate::notes::listen`]).
+    pub fn set_budget(&mut self, budget: Option<Duration>) -> std::io::Result<()> {
+        let stream = self.io.get_ref();
+        stream.set_read_timeout(budget)?;
+        stream.set_write_timeout(budget)?;
+        self.read_timeout = budget;
+        Ok(())
+    }
 }
 
 /// A way to end a call in progress on another thread.
@@ -217,6 +232,7 @@ impl Client<UnixStream> {
 ///
 /// Unconditional: the connection is unusable afterwards, which is what the
 /// holder wanted.
+#[derive(Debug)]
 pub struct Interrupt(UnixStream);
 
 impl Interrupt {
@@ -423,6 +439,41 @@ impl<S: Read + Write> Client<S> {
                 Ok(None)
             }
             other => Err(self.poison(format!("unknown msgpack-rpc message type {other:?}"))),
+        }
+    }
+
+    /// Wait for the next notification the server sends on this channel —
+    /// one it was asked for, as a session's watcher sends its news (see
+    /// [`crate::notes::listen`]) — and hand back its method and arguments. A
+    /// reply that comes meanwhile is kept for its waiter, as
+    /// [`Client::reply_to`] keeps one, and a request is not answered. Bounded
+    /// by the connection's budget, where it has one.
+    pub fn next_notification(&mut self) -> Result<(String, Vec<Value>), RpcError> {
+        if let Some(why) = &self.poisoned {
+            return Err(RpcError::Protocol(format!("connection poisoned: {why}")));
+        }
+        let budget = self.read_timeout;
+        loop {
+            let decoded = rmpv::decode::read_value(&mut self.io).map_err(|e| match e {
+                rmpv::decode::Error::InvalidMarkerRead(io)
+                | rmpv::decode::Error::InvalidDataRead(io) => map_io(io, budget),
+                other => RpcError::Protocol(format!("decoding a notification: {other}")),
+            });
+            let value = match decoded {
+                Ok(v) => v,
+                Err(e) => return Err(self.poison_if_fatal(e, "a notification")),
+            };
+            let notified = value
+                .as_array()
+                .filter(|a| a.first().and_then(Value::as_u64) == Some(NOTIFICATION));
+            if let Some(a) = notified {
+                let method = a.get(1).and_then(Value::as_str).unwrap_or_default();
+                let args = a.get(2).and_then(Value::as_array).cloned();
+                return Ok((method.to_string(), args.unwrap_or_default()));
+            }
+            // A reply or a request, sorted as any other read sorts one: no
+            // reply is to 0, the ids starting at 1.
+            self.classify(value, 0)?;
         }
     }
 

@@ -322,6 +322,13 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
             switch!(session.quick_list),
         ),
         row(
+            "session",
+            "push_news",
+            Tab::Session,
+            "have sessions say when they have news, not be asked every two seconds",
+            switch!(session.push_news),
+        ),
+        row(
             "client",
             "ui",
             Tab::Client,

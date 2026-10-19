@@ -61,6 +61,19 @@
 //! nothing of you, so that a notification or a failure comes before it.
 //! Whether something is busy is not news but state, and is shown for as long
 //! as it lasts.
+//!
+//! # Told, where asked
+//!
+//! The cards that tell the session in front what the others say
+//! ([`crate::tell`]) are read for as long as nvmux runs, not just while the
+//! picker is up; with `[session] push_news` on, they are not asked for every
+//! two seconds but listened for ([`listen`]). A listener holds a connection to
+//! the session open, and the watcher sends a notification down it whenever
+//! what it keeps changes — news comes, or is seen — for the listener's nvmux
+//! to read. A read names the listener's channel ([`hear`]), which is what has
+//! the watcher tell it from then on, and says whether it was being told
+//! already: a watcher put in by a read that named nobody, or by an nvmux of
+//! another version, tells nobody until a read names the listener.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -75,7 +88,7 @@ use crate::rpc;
 
 /// The watcher's version. A session holding an older one is given this one,
 /// the record it kept carried over; a newer nvmux does the same to this one.
-pub const VERSION: i64 = 8;
+pub const VERSION: i64 = 9;
 
 /// How long the picker waits between reads of its sessions.
 pub const POLL: Duration = Duration::from_secs(2);
@@ -139,7 +152,16 @@ const SETTLE: Duration = Duration::from_millis(30);
 /// so a read never finds one running — and a write that fails never says it
 /// has ended, nor does a scan, which would leave the session busy for good.
 /// An older watcher kept them, so they go from the record on the way in.
-const WATCHER: &str = r#"local version = ...
+///
+/// Whenever one of those two comes, or [`SEEN`] clears what there was, it
+/// tells the listeners a read has named ([`READ`], [`listen`]): a
+/// notification, [`NEWS`], on each one's channel. A channel that cannot be
+/// told any more is let go of — channels are never numbered twice, so one
+/// gone is never another listener — and the listeners are kept when the
+/// watcher is put in again. Given a listener's channel after its version, as
+/// a read is, it is told from now on; but the record does not say it was,
+/// since the watcher this one replaced may have told it nothing.
+const WATCHER: &str = r#"local version, listener = ...
 local api = vim.api
 local N = package.loaded['nvmux.notes']
 if type(N) ~= 'table' then
@@ -155,6 +177,7 @@ for key in pairs(N.progress) do
 end
 N.lsp = {}
 N.seq = type(N.seq) == 'number' and N.seq or 0
+N.listeners = type(N.listeners) == 'table' and N.listeners or {}
 local group = api.nvim_create_augroup('nvmux_notes', { clear = true })
 local function clean(s)
   if type(s) == 'table' then
@@ -181,6 +204,13 @@ local function shown(buf)
   end
   return false
 end
+local function tell()
+  for chan in pairs(N.listeners) do
+    if not pcall(vim.rpcnotify, chan, 'nvmux_news') then
+      N.listeners[chan] = nil
+    end
+  end
+end
 local function note(kind, title, body, buf)
   title, body = clean(title), clean(body)
   if title ~= '' or body ~= '' then
@@ -199,6 +229,7 @@ local function note(kind, title, body, buf)
     else
       N.note = kept
     end
+    tell()
   end
 end
 pcall(api.nvim_create_autocmd, 'Progress', {
@@ -391,8 +422,15 @@ function N.snapshot()
   return out
 end
 function N.seen()
+  local kept = N.note or N.finished
   N.note = nil
   N.finished = nil
+  if kept then
+    tell()
+  end
+end
+if listener then
+  N.listeners[listener] = true
 end
 return N.snapshot()
 "#;
@@ -405,13 +443,26 @@ return N.snapshot()
 /// one, and those two with their number (`seq`) and, where they came from a
 /// terminal buffer, whether it was on the screen (`shown`). `false` where
 /// there is no watcher, or one older or newer than this nvmux's.
-const READ: &str = r#"local version = ...
+///
+/// Given a listener's channel as well ([`listen`]), it has the watcher tell
+/// that listener its news from now on, and says whether it was already
+/// (`listening`).
+const READ: &str = r#"local version, listener = ...
 local N = package.loaded['nvmux.notes']
 if type(N) ~= 'table' or N.version ~= version or type(N.snapshot) ~= 'function' then
   return false
 end
-return N.snapshot()
+local out = N.snapshot()
+if listener then
+  out.listening = N.listeners[listener] == true
+  N.listeners[listener] = true
+end
+return out
 "#;
+
+/// The notification the watcher sends its listeners when what it keeps has
+/// changed (see [`listen`]).
+const NEWS: &str = "nvmux_news";
 
 /// Clear what the session was keeping: the notification, or failure, and the
 /// command that finished.
@@ -522,8 +573,10 @@ pub struct News {
 /// What a careful read of one session came to (see [`hear`]).
 #[derive(Debug, PartialEq, Eq)]
 pub enum Heard {
-    /// What it is keeping, oldest first: none, one or both of the two.
-    Said(Vec<News>),
+    /// What it is keeping, oldest first: none, one or both of the two; and
+    /// whether the listener the read named was being told its news already,
+    /// which it is from now on.
+    Said { news: Vec<News>, listening: bool },
     /// It could not say just now, and nothing was left with it to run later.
     Unknown,
     /// Nothing is listening on its socket any more.
@@ -532,7 +585,8 @@ pub enum Heard {
 
 /// Read the news the session on `sock` is keeping, giving it the watcher first
 /// where it has none, or another version's — and asking nothing of an editor
-/// waiting for a key.
+/// waiting for a key. With `listener`, the channel of one listening to the
+/// session ([`listen`]), the watcher tells it the news from now on.
 ///
 /// [`read`] asks the mode and the record together, and leaves the record to be
 /// read when the key comes, which costs nothing for the minutes the picker is
@@ -540,14 +594,18 @@ pub enum Heard {
 /// that may wait for its key all night, so the record is asked for only once
 /// the mode says the editor can answer: a round trip more, and nothing piled
 /// up in the session for the morning.
-pub fn hear(sock: &Path) -> Heard {
+pub fn hear(sock: &Path, listener: Option<u64>) -> Heard {
     let mut client = match rpc::Client::connect(sock, BUDGET) {
         Ok(c) => c,
         Err(e) if e.is_definitely_dead() => return Heard::Gone,
         Err(_) => return Heard::Unknown,
     };
-    match carefully(&mut client) {
-        Ok(Some(v)) => Heard::Said(news_of(&v)),
+    match carefully(&mut client, listener) {
+        Ok(Some(v)) => Heard::Said {
+            news: news_of(&v),
+            listening: listener.is_some()
+                && field(&v, "listening").and_then(Value::as_bool) == Some(true),
+        },
         Ok(None) => Heard::Unknown,
         Err(e) if e.is_definitely_dead() => Heard::Gone,
         Err(_) => Heard::Unknown,
@@ -555,16 +613,72 @@ pub fn hear(sock: &Path) -> Heard {
 }
 
 /// [`snapshot`], one question at a time: `None`, and nothing asked, of an
-/// editor waiting for a key.
-fn carefully<S: Read + Write>(client: &mut rpc::Client<S>) -> Result<Option<Value>, RpcError> {
+/// editor waiting for a key. The listener is named to a watcher put in afresh
+/// too, whose record does not say it was being told.
+fn carefully<S: Read + Write>(
+    client: &mut rpc::Client<S>,
+    listener: Option<u64>,
+) -> Result<Option<Value>, RpcError> {
     if client.get_mode()?.blocking {
         return Ok(None);
     }
-    let record = client.call("nvim_exec_lua", lua(READ))?;
+    let record = client.call("nvim_exec_lua", lua_naming(READ, listener))?;
     if record == Value::Boolean(false) {
-        return client.call("nvim_exec_lua", lua(WATCHER)).map(Some);
+        return client
+            .call("nvim_exec_lua", lua_naming(WATCHER, listener))
+            .map(Some);
     }
     Ok(Some(record))
+}
+
+/// What a listener hears from its session (see [`listen`]).
+#[derive(Debug)]
+pub enum Pushed {
+    /// It is connected, as the session's channel `chan`: what a read is to
+    /// name for the watcher to tell it ([`hear`]). `stop` ends the listening,
+    /// from any thread.
+    Listening { chan: u64, stop: rpc::Interrupt },
+    /// What the session keeps has changed: news has come, or been seen. A
+    /// read says which.
+    News,
+}
+
+/// Listen to the session on `sock`, handing `heard` what it hears for as long
+/// as it returns `true`, the session is there and the connection is not
+/// stopped: first that it is listening, and on which channel, then each time
+/// the session's news changes.
+///
+/// The connection is held open, with no budget once it is: a session says
+/// nothing for as long as it has no news, which may be all day. The channel is
+/// asked for with the mode, as [`read`] asks for the record, and an editor
+/// waiting for a key, which would not answer before the key comes, is not
+/// listened to: this returns at once, having heard nothing, to be tried again
+/// later. Nothing else is asked of the session: what has the watcher tell the
+/// channel is a read that names it ([`hear`]).
+pub fn listen(sock: &Path, mut heard: impl FnMut(Pushed) -> bool) -> Result<(), RpcError> {
+    let mut client = rpc::Client::connect(sock, BUDGET)?;
+    let mode = client.ask_mode()?;
+    // `0` is the channel asking, which a call through `nvim_exec_lua` is not:
+    // there it is the session's own, and has no number.
+    let asked = client.ask("nvim_get_chan_info", vec![Value::from(0)])?;
+    if client.mode_reply(mode)?.blocking {
+        return Ok(());
+    }
+    let info = client.reply_to(asked)?;
+    let chan = field(&info, "id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| RpcError::Protocol("a channel with no number".into()))?;
+    let stop = client.interrupt()?;
+    client.set_budget(None)?;
+    if !heard(Pushed::Listening { chan, stop }) {
+        return Ok(());
+    }
+    loop {
+        let (method, _) = client.next_notification()?;
+        if method == NEWS && !heard(Pushed::News) {
+            return Ok(());
+        }
+    }
 }
 
 /// A session coming to the front: the watcher put in where it is missing, and
@@ -665,7 +779,14 @@ fn unblocked(sock: &Path, code: &'static str) -> Result<(), RpcError> {
 /// The arguments of `nvim_exec_lua` for one of the chunks above: the chunk,
 /// and the version as its one argument.
 fn lua(code: &str) -> Vec<Value> {
-    vec![Value::from(code), Value::Array(vec![Value::from(VERSION)])]
+    lua_naming(code, None)
+}
+
+/// [`lua`], and a listener's channel after the version, where there is one.
+fn lua_naming(code: &str, listener: Option<u64>) -> Vec<Value> {
+    let mut args = vec![Value::from(VERSION)];
+    args.extend(listener.map(Value::from));
+    vec![Value::from(code), Value::Array(args)]
 }
 
 /// The note a record comes to, if any: the notification or failure it keeps
