@@ -296,6 +296,9 @@ pub struct ClientSettings {
     /// Either way, a window showing a terminal keeps its whole width: the
     /// program in it is told its window's width. So does a window whose
     /// text is in its middle already, as a start screen lays itself out.
+    /// What Neovim draws after the end of a line — a language server's
+    /// diagnostic, a blame — runs on into the window's margin, as far as
+    /// the window goes, rather than stopping where the text does.
     pub centre: Centre,
     /// How many columns a window's text gets with `centre` on: every
     /// window's with `"fixed"`, and with `"smart"` one whose buffer has no

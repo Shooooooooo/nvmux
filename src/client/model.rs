@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 use super::grid::{Cell, Grid};
 use super::redraw::{Event, ModeInfo, OptionValue};
 use super::style::{Attrs, Colors, DefaultColors, Style};
+use super::wide::Tail;
 use crate::palette::Palette;
 
 /// Where a grid goes on the screen.
@@ -405,6 +406,11 @@ pub struct Model {
     /// [`super::wide::MEASURE_LUA`]): which windows have a status line of
     /// their own. `None` until it has said.
     pub laststatus: Option<i64>,
+    /// What Neovim draws after the line's end on rows of window grids
+    /// narrower than their windows, where the grid has no room for all of
+    /// it, by grid and row, as the editor says it (see [`super::wide`]):
+    /// kept with each row as its grid scrolls, till the editor says again.
+    pub tails: HashMap<u64, BTreeMap<usize, Tail>>,
     highlights: Highlights,
     /// Every highlight resolved for drawing, by id, and its blend: each as it
     /// is defined, and all of them again when the defaults or
@@ -450,6 +456,7 @@ impl Model {
             defaults: DefaultColors::default(),
             groups: HashMap::new(),
             laststatus: None,
+            tails: HashMap::new(),
             highlights: Highlights::default(),
             styles: Vec::new(),
             blends: Vec::new(),
@@ -520,6 +527,34 @@ impl Model {
         }
     }
 
+    /// The rows of window grid `grid` end in `tails`, all that run past its
+    /// edge, as the editor says it (see [`Model::tails`]). Says whether that
+    /// is any different.
+    pub fn set_tails(&mut self, grid: u64, tails: BTreeMap<usize, Tail>) -> bool {
+        if self
+            .tails
+            .get(&grid)
+            .map_or(tails.is_empty(), |t| *t == tails)
+        {
+            return false;
+        }
+        if tails.is_empty() {
+            self.tails.remove(&grid);
+        } else {
+            self.tails.insert(grid, tails);
+        }
+        self.changed = super::grid::tick();
+        true
+    }
+
+    /// Forget what the rows of grid `grid` end in: it is no longer the width
+    /// it was said of.
+    pub fn forget_tails(&mut self, grid: u64) {
+        if self.tails.remove(&grid).is_some() {
+            self.changed = super::grid::tick();
+        }
+    }
+
     /// Highlight `id` as Neovim defined it, in both its forms, by the
     /// client's id for it.
     pub fn attrs(&self, id: u32) -> Option<&(Attrs, Attrs)> {
@@ -572,8 +607,9 @@ impl Model {
 
     /// How far in from where the editor put it grid `grid` is drawn: a
     /// window's grid narrower than the window in the middle of it, and a
-    /// float anchored to that window as far in as its text (see
-    /// [`super::wide`]). Nought for anything else.
+    /// float anchored to that window as far in as its text, but no further
+    /// than keeps the float on the screen (see [`super::wide`]). Nought for
+    /// anything else.
     pub fn inset(&self, grid: u64) -> usize {
         let window = |grid: u64| match self.layout.get(&grid).map(|p| &p.place) {
             Some(Place::Window { width, .. }) => self
@@ -584,10 +620,21 @@ impl Model {
         };
         match self.layout.get(&grid).map(|p| &p.place) {
             Some(Place::Window { .. }) => window(grid),
+            // Neovim fitted the float to the screen where it put it, beside
+            // the window's grid as it has it, at the window's edge. As far
+            // in as the text, one near the right of the screen — a
+            // diagnostic's, hover's, the completion menu — would be past
+            // the screen's edge, its end and its border cut off.
             Some(Place::Float {
                 anchor: Some(anchor),
+                col,
                 ..
-            }) if *anchor != grid => window(*anchor),
+            }) if *anchor != grid => {
+                let screen = self.grids.get(&1).map_or(0, Grid::width) as i64;
+                let width = self.grids.get(&grid).map_or(0, Grid::width) as i64;
+                let room = usize::try_from(screen - col - width).unwrap_or(0);
+                window(*anchor).min(room)
+            }
             _ => 0,
         }
     }
@@ -661,12 +708,21 @@ impl Model {
                 if (g.width(), g.height()) != (width, height) {
                     changes.reshaped.push(grid);
                 }
+                // A row's tail starts where the editor said for the width
+                // the grid had then: made wider or narrower, Neovim draws
+                // every row again, and the editor says again.
+                if g.width() != width {
+                    self.tails.remove(&grid);
+                } else if let Some(tails) = self.tails.get_mut(&grid) {
+                    tails.retain(|&r, _| r < height);
+                }
                 g.resize(width, height);
             }
             Event::GridClear { grid } => {
                 if let Some(g) = self.grids.get_mut(&grid) {
                     g.clear();
                 }
+                self.tails.remove(&grid);
                 if grid == 1 {
                     changes.repaint = true;
                 }
@@ -677,6 +733,7 @@ impl Model {
                 self.wins.remove(&grid);
                 self.viewports.remove(&grid);
                 self.margins.remove(&grid);
+                self.tails.remove(&grid);
                 changes.reshaped.push(grid);
             }
             Event::GridLine {
@@ -705,6 +762,7 @@ impl Model {
                 if let Some(g) = self.grids.get_mut(&grid) {
                     g.scroll(top, bot, left, right, rows);
                 }
+                self.scroll_tails(grid, (top, bot, left, right), rows);
                 changes
                     .region_scrolls
                     .push((grid, top, bot, left, right, rows));
@@ -882,6 +940,28 @@ impl Model {
         }
     }
 
+    /// A `grid_scroll` of the rectangle `rect` by `rows`, as it moves the
+    /// tails of the rows it moves (see [`Model::tails`]): a row's goes with
+    /// it, across the grid's whole width; one the scroll takes out of the
+    /// rectangle goes, and so does one of a row moved only in part.
+    fn scroll_tails(&mut self, grid: u64, rect: (usize, usize, usize, usize), rows: i64) {
+        let (top, bot, left, right) = rect;
+        let whole = left == 0 && self.grids.get(&grid).is_some_and(|g| right >= g.width());
+        let Some(tails) = self.tails.get_mut(&grid) else {
+            return;
+        };
+        *tails = std::mem::take(tails)
+            .into_iter()
+            .filter_map(|(r, tail)| {
+                if !(top..bot).contains(&r) {
+                    return Some((r, tail));
+                }
+                let to = r as i64 - rows;
+                (whole && to >= top as i64 && to < bot as i64).then_some((to as usize, tail))
+            })
+            .collect();
+    }
+
     /// Give a grid somewhere to be. Being placed is what makes it seen again
     /// after a `win_hide`.
     fn place(&mut self, grid: u64, win: Option<i64>, place: Place) {
@@ -1026,6 +1106,9 @@ impl Model {
             for r in 0..g.height() {
                 held.cells(g.row(r));
             }
+        }
+        for tail in self.tails.values().flat_map(BTreeMap::values) {
+            held.cells(&tail.cells);
         }
         for hl in self.groups.values() {
             held.mark(*hl);
@@ -1443,6 +1526,72 @@ mod tests {
         assert!(!changes.repaint);
         let changes = apply(&mut m, vec![Event::GridClear { grid: 1 }]);
         assert!(changes.repaint);
+    }
+
+    /// What runs past a window grid's edge goes with its row as the grid
+    /// scrolls across its whole width, and goes with a row scrolled out of
+    /// the rectangle, or moved only in part; and with every row, as the grid
+    /// is made wider or narrower or is cleared. Made shorter, it keeps what
+    /// the rows left have. Each new say changes the model.
+    #[test]
+    fn what_runs_past_a_grids_edge_goes_with_its_row() {
+        let mut m = model();
+        let resize = |width, height| Event::GridResize {
+            grid: 2,
+            width,
+            height,
+        };
+        let scroll = |top, bot, right, rows| Event::GridScroll {
+            grid: 2,
+            top,
+            bot,
+            left: 0,
+            right,
+            rows,
+        };
+        let tail = |row: usize| Tail {
+            start: 10,
+            cells: vec![
+                Cell {
+                    text: Text::Char('x'),
+                    hl: row as u32,
+                };
+                3
+            ],
+            sure: true,
+        };
+        let rows = |m: &Model| -> Vec<(usize, u32)> {
+            m.tails
+                .get(&2)
+                .map(|t| t.iter().map(|(r, tail)| (*r, tail.cells[0].hl)).collect())
+                .unwrap_or_default()
+        };
+        apply(&mut m, vec![resize(10, 6)]);
+        let since = tick();
+        assert!(m.set_tails(2, BTreeMap::from([(1, tail(1)), (4, tail(4))])));
+        assert!(!m.unchanged_since(since), "a change");
+        assert!(!m.set_tails(2, BTreeMap::from([(1, tail(1)), (4, tail(4))])));
+
+        apply(&mut m, vec![scroll(0, 6, 10, 1)]);
+        assert_eq!(rows(&m), [(0, 1), (3, 4)], "up a row with theirs");
+        apply(&mut m, vec![scroll(0, 6, 10, 1)]);
+        assert_eq!(rows(&m), [(2, 4)], "the top one out");
+        apply(&mut m, vec![scroll(1, 4, 10, -1)]);
+        assert_eq!(rows(&m), [(3, 4)], "down, in a rectangle");
+        apply(&mut m, vec![scroll(0, 6, 6, 1)]);
+        assert_eq!(rows(&m), [], "moved in part");
+
+        m.set_tails(2, BTreeMap::from([(1, tail(1)), (4, tail(4))]));
+        apply(&mut m, vec![resize(10, 3)]);
+        assert_eq!(rows(&m), [(1, 1)], "shorter");
+        apply(&mut m, vec![resize(12, 3)]);
+        assert_eq!(rows(&m), [], "wider");
+        m.set_tails(2, BTreeMap::from([(1, tail(1))]));
+        apply(&mut m, vec![Event::GridClear { grid: 2 }]);
+        assert_eq!(rows(&m), [], "cleared");
+        m.set_tails(2, BTreeMap::from([(1, tail(1))]));
+        apply(&mut m, vec![Event::GridDestroy { grid: 2 }]);
+        assert!(m.tails.is_empty(), "gone");
     }
 
     /// A highlight group of the editor's laid over one of Neovim's: its

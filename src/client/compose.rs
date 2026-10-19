@@ -171,6 +171,14 @@ pub trait Scrolling {
     /// it is now: a row of the rectangle's own may be lent from it, rather
     /// than kept.
     fn row<'a>(&'a self, r: usize, grid: &'a Grid) -> Option<&'a [Cell]>;
+
+    /// Which of the rectangle's own rows of the grid row `r` shows now, both
+    /// counted from its top: `None` for one it shows a line of its own for,
+    /// kept or drawn ahead of Neovim. What runs on past a row's end goes
+    /// with the grid's rows (see `super::wide`), and such a line has none.
+    fn own_row(&self, _r: usize) -> Option<usize> {
+        None
+    }
 }
 
 /// Nothing moving: everything where the editor put it.
@@ -285,17 +293,17 @@ fn put_together(
         }
         if let Place::Window { .. } = p.place {
             let at = view.origin(grid, model.drawn_origin(grid));
-            // Its text on its way across the window, should it be, and kept
-            // to the window as it goes.
+            // Its text on its way across the window, should it be, kept to
+            // the window's place as it goes; and what runs past the grid's
+            // edge drawn on that place, as far as it goes.
             let shift = view.shift(grid);
+            let place = model.window_cells(grid).map(|(_, _, width, _)| {
+                let left = at.1 - model.inset(grid) as i64;
+                (left, left + width as i64)
+            });
             let within = Within {
-                cols: model
-                    .window_cells(grid)
-                    .filter(|_| shift != 0)
-                    .map(|(_, _, width, _)| {
-                        let left = at.1 - model.inset(grid) as i64;
-                        (left, left + width as i64)
-                    }),
+                cols: place.filter(|_| shift != 0),
+                place,
                 ..Within::default()
             };
             draw(
@@ -371,11 +379,14 @@ fn wanted(rows: Option<&[bool]>, row: usize) -> bool {
 }
 
 /// How much of a grid [`draw`] puts on the frame: rows from its top, and the
-/// columns of the frame it may cover — all of either where not said.
+/// columns of the frame it may cover — all of either where not said; and of
+/// a window, the columns of its place, which what runs past its grid's edge
+/// may cover (see `super::wide`).
 #[derive(Debug, Clone, Copy, Default)]
 struct Within {
     rows: Option<usize>,
     cols: Option<(i64, i64)>,
+    place: Option<(i64, i64)>,
 }
 
 /// Draw grid `grid` with its top left at `at`, as much of it as `within`
@@ -416,6 +427,10 @@ fn draw(
     if lo >= hi {
         return;
     }
+    // What runs past the grid's right edge, on the window's place.
+    let tails = within
+        .place
+        .and_then(|place| Some((place, model.tails.get(&grid)?)));
     // The last highlight resolved, and its style and blend.
     let mut last: Option<(u32, Style, u8)> = None;
     let (mut runs, mut cut) = (Vec::with_capacity(4), Vec::with_capacity(4));
@@ -501,6 +516,47 @@ fn draw(
                     under.wide = wide;
                 }
             }
+        }
+        // The rest of what Neovim draws after the line's end, which it cut
+        // at the grid's edge (see `super::wide`): the tail of the grid's
+        // row this one shows — its own, or the one a scroll has brought
+        // here; none for a line a scroll keeps of its own.
+        let Some(((from, to), tails)) = tails else {
+            continue;
+        };
+        let shows = match scroll.map(|s| (s, s.rect())) {
+            Some((s, (top, bot, left, right))) if (top..bot).contains(&r) => (left == 0
+                && right >= g.width())
+            .then(|| s.own_row(r - top))
+            .flatten()
+            .map(|i| top + i),
+            _ => Some(r),
+        };
+        let Some((start, cells)) = shows
+            .and_then(|s| Some((s, tails.get(&s)?)))
+            .and_then(|(s, tail)| super::wide::past(g.row(s), tail))
+        else {
+            continue;
+        };
+        // Past the grid's edge, on the window's place and on the frame.
+        let (from, to) = (from.max(at.1 + g.width() as i64).max(0), to.min(width));
+        for (i, cell) in cells.iter().enumerate() {
+            let x = at.1 + (start + i) as i64;
+            if x < from || x >= to {
+                continue;
+            }
+            let style = match last {
+                Some((hl, style, _)) if hl == cell.hl => style,
+                _ => {
+                    let style = model.style(cell.hl);
+                    last = Some((cell.hl, style, 0));
+                    style
+                }
+            };
+            let out = &mut row[x as usize];
+            out.text.clone_from(&cell.text);
+            out.style = style;
+            out.wide = cells.get(i + 1).is_some_and(|n| n.text == Text::Half);
         }
     }
 }

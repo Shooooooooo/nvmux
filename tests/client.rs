@@ -3062,6 +3062,153 @@ fn a_window_showing_a_terminal_keeps_its_width() {
     assert_eq!(term.hang_up(), Some(0), "the client's exit");
 }
 
+/// What Neovim draws after a line's end on a window whose text is centred —
+/// a diagnostic's message — and cuts at the grid's edge runs on past it in
+/// the window's margin: of a line about as long as the text is wide, all of
+/// it, which Neovim had no room for; of a line wrapped, after its last row.
+/// A line added above moves it down with its row. The client gone, what
+/// told it what to draw has gone from the editor too.
+#[test]
+fn a_diagnostic_cut_at_the_grids_edge_runs_on_in_the_margin() {
+    require_nvim!();
+    let scratch = Scratch::new("client-centre-tails");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-centre-tails");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    // Neither leaves anything of its message on the grid's 60 columns but
+    // the blanks before it.
+    rpc.command(
+        "lua vim.diagnostic.config({ virtual_text = true, signs = false }) \
+         vim.api.nvim_buf_set_lines(0, 0, -1, false, \
+           { string.rep('x', 56), string.rep('y', 60) .. string.rep('z', 55) }) \
+         local ns = vim.api.nvim_create_namespace('test') \
+         vim.diagnostic.set(ns, 0, { \
+           { lnum = 0, col = 0, message = 'the end of the first' }, \
+           { lnum = 1, col = 0, message = 'the end of the second' } })",
+    )
+    .expect("diagnostics");
+    let first = format!(
+        "{}{}     ■ the end of the first",
+        " ".repeat(50),
+        "x".repeat(56)
+    );
+    let second = format!(
+        "{}{}     ■ the end of the second",
+        " ".repeat(50),
+        "z".repeat(55)
+    );
+    let laid = |s: &str, from: usize| {
+        let rows: Vec<&str> = s.lines().collect();
+        rows.get(from).is_some_and(|l| *l == first)
+            && rows.get(from + 2).is_some_and(|l| *l == second)
+    };
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| laid(s, 0)),
+        "not in the margin:\n{}",
+        term.text()
+    );
+    rpc.command("call append(0, 'above')")
+        .expect("a line above");
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| laid(s, 1)),
+        "not moved with its row:\n{}",
+        term.text()
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+    let left = |rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>| {
+        rpc.eval(
+            "luaeval('#vim.tbl_filter(function(a) \
+               return (a.group_name or \"\"):find(\"^nvmux_tails_\") ~= nil end, \
+               vim.api.nvim_get_autocmds({}))')",
+        )
+        .expect("ask the editor")
+    };
+    assert!(
+        common::wait_until(Duration::from_secs(5), || left(&mut rpc) == Value::from(0)),
+        "left in the editor: {}",
+        left(&mut rpc)
+    );
+}
+
+/// In a window that conceals text, a line's end is left of where the editor
+/// sees it: what runs past the grid's edge is drawn on from where the row
+/// has the message, not where the editor says.
+#[test]
+fn a_diagnostic_after_concealed_text_runs_on_from_where_neovim_drew_it() {
+    require_nvim!();
+    let scratch = Scratch::new("client-conceal");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-conceal");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    // 55 characters, 35 of them shown; the cursor on the line after, whose
+    // own text is not concealed.
+    rpc.command(
+        "lua vim.diagnostic.config({ virtual_text = true, signs = false }) \
+         vim.wo.conceallevel = 2 \
+         vim.api.nvim_buf_set_lines(0, 0, -1, false, \
+           { string.rep('a', 20) .. string.rep('z', 20) .. string.rep('b', 15), 'here' }) \
+         local ns = vim.api.nvim_create_namespace('test') \
+         vim.api.nvim_buf_set_extmark(0, ns, 0, 20, { end_col = 40, conceal = '' }) \
+         vim.api.nvim_win_set_cursor(0, { 2, 0 }) \
+         vim.diagnostic.set(ns, 0, { { lnum = 0, col = 0, \
+           message = 'a message long enough to be cut at the edge' } })",
+    )
+    .expect("a diagnostic after concealed text");
+    let whole = format!(
+        "{}{}{}     ■ a message long enough to be cut at the edge",
+        " ".repeat(50),
+        "a".repeat(20),
+        "b".repeat(15)
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| s.starts_with(&whole)),
+        "not in the margin from where it is:\n{}",
+        term.text()
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
+/// A float on a window whose text is centred goes in with the text, but no
+/// further than keeps it on the screen: a diagnostic's, opened at the end of
+/// a long line, which Neovim fits to the screen beside the window's grid, is
+/// drawn whole — its message and its border — not past the screen's edge.
+#[test]
+fn a_float_by_centred_text_stays_on_the_screen() {
+    require_nvim!();
+    let scratch = Scratch::new("client-centre-float");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-centre-float");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    rpc.command(
+        "lua vim.diagnostic.config({ signs = false, float = { border = 'single' } }) \
+         vim.api.nvim_buf_set_lines(0, 0, -1, false, { string.rep('x', 56) }) \
+         vim.diagnostic.set(vim.api.nvim_create_namespace('test'), 0, \
+           { { lnum = 0, col = 0, message = string.rep('m', 80) .. ' end' } }) \
+         vim.api.nvim_win_set_cursor(0, { 1, 55 })",
+    )
+    .expect("a diagnostic");
+    // Left open however the cursor moves, as the move above has it.
+    rpc.command("lua vim.diagnostic.open_float({ close_events = {} })")
+        .expect("its float");
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| s
+            .lines()
+            .any(|l| l.ends_with(" end│"))),
+        "the float is not on the screen whole:\n{}",
+        term.text()
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
 /// Wait for the editor to say `want` of itself (see [`widths`]), drawing
 /// what the client sends as it does.
 fn until_widths(

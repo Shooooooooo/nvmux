@@ -6,14 +6,15 @@
 //! that wide (`nvim_ui_try_resize_grid`, which only a UI with `ext_multigrid`
 //! can ask): Neovim draws its text to that width — wraps its lines there,
 //! ends its cursor line there — and the client puts it in the middle of the
-//! window ([`inset`]), a float anchored to it with it. The status line under
-//! it is still the window's width, as Neovim draws it, and has its words
-//! moved in to stand over the text ([`realign`]). A window showing a terminal
-//! wants the whole terminal, so it is not asked: its grid is as wide as
-//! Neovim tells the program in it its terminal is. A grid asked for is the
-//! window's for every UI of the session: as the client goes, it asks for each
-//! window's own width back, and waits a moment for Neovim to have done it
-//! ([`super::run`]).
+//! window ([`inset`]), a float anchored to it with it, as far as keeps the
+//! float on the screen (see [`super::model::Model::inset`]). The status line
+//! under it is still the window's width, as Neovim draws it, and has its
+//! words moved in to stand over the text ([`realign`]). A window showing a
+//! terminal wants the whole terminal, so it is not asked: its grid is as
+//! wide as Neovim tells the program in it its terminal is. A grid asked for
+//! is the window's for every UI of the session: as the client goes, it asks
+//! for each window's own width back, and waits a moment for Neovim to have
+//! done it ([`super::run`]).
 //!
 //! The client cuts its own copy of a grid to the width it asks for as it
 //! asks, as Neovim cuts its own once it has the ask: a window split off
@@ -33,9 +34,28 @@
 //! on a grid not its width whole, unless it narrows that window itself. Two
 //! clients attached at once share the grids: the one to attach last has the
 //! windows as it wants them, and the other draws them as they are.
+//!
+//! What Neovim draws after a line's end — the text of a mark at its end, a
+//! language server's diagnostic or a blame — it cuts at the grid's edge,
+//! which on a grid narrower than its window is where the window has room for
+//! more of it: a line about as long as the text is wide had all of its
+//! diagnostic cut. So the editor says, as it draws, what each row of such a
+//! window has after its line's end, and where Neovim put that ([`TAILS_LUA`]);
+//! and the client draws what Neovim cut on in the margin past the grid's
+//! edge, as far as the window goes ([`past`]), and with its row as that
+//! moves. Where it is on the row is checked against what Neovim drew there,
+//! and where the window conceals text, which moves a line's end where the
+//! editor cannot see, it is found there ([`place`]).
+
+use std::collections::BTreeMap;
+
+use rmpv::ValueRef;
+use unicode_width::UnicodeWidthChar;
 
 use super::compose::Out;
-use super::grid::Text;
+use super::grid::{Cell, Text};
+use super::model::syntax_hl;
+use super::redraw;
 
 /// What each window of the tab page in front wants, given how wide a
 /// window's text is (the first argument) and whether to judge each by what
@@ -227,10 +247,249 @@ if chan then
 end
 return last";
 
-/// What takes [`MEASURE_LUA`] back out of the editor, given the client's
-/// channel: once nothing is centred, nothing is to be measured.
-pub const UNMEASURE_LUA: &str =
-    "pcall(vim.api.nvim_del_augroup_by_name, 'nvmux_centre_' .. select(1, ...))";
+/// What takes [`MEASURE_LUA`] and [`TAILS_LUA`] back out of the editor,
+/// given the client's channel: once nothing is centred, nothing is to be
+/// measured, and no grid is narrower than its window.
+pub const UNMEASURE_LUA: &str = "local chan = ...
+local tails = 'nvmux_tails_' .. chan
+pcall(vim.api.nvim_del_augroup_by_name, 'nvmux_centre_' .. chan)
+pcall(vim.api.nvim_del_augroup_by_name, tails)
+pcall(vim.api.nvim_set_decoration_provider, vim.api.nvim_create_namespace(tails), {})";
+
+/// What tells the client, given its channel, what Neovim draws after the
+/// end of the lines of each window whose grid is narrower than the window —
+/// the text of the marks at their ends, which Neovim cuts at the grid's
+/// edge: for each row with more of it than the grid has room for, the row,
+/// the column the text starts in, as `screenpos()` has the line's end — past
+/// the grid's width where none of it fits — and all of it, a list of pieces
+/// of one highlight group each, the marks' texts in the order Neovim draws
+/// them with a blank between each two. Said as an `nvmux_client`
+/// notification (`tails`, the window, whether the window conceals no text,
+/// the rows), each time a redraw of the window changes it; before it, the
+/// attributes of each group the client has not been sent (`colours`, as the
+/// agent sends them), and all of them again with a new colour scheme.
+///
+/// Said at the end of the redraw, from a decoration provider: ahead of the
+/// `flush` that ends what Neovim sends of it, which the client takes it
+/// with. Not the text of a line in a closed fold, which Neovim does not draw;
+/// and of a line with text put in at its end (inline), from after that. It
+/// goes when this client's UI does, or the first time it finds the channel
+/// gone.
+pub const TAILS_LUA: &str = "local chan = ...
+local api = vim.api
+local name = 'nvmux_tails_' .. chan
+local ns = api.nvim_create_namespace(name)
+local group = api.nvim_create_augroup(name, { clear = true })
+-- The windows drawn since the last redraw ended, what was last said of
+-- each, and the groups the client has the attributes of.
+local drawn, said, sent = {}, {}, {}
+local function stop()
+  pcall(api.nvim_set_decoration_provider, ns, {})
+  pcall(api.nvim_del_augroup_by_id, group)
+end
+local function send(...)
+  if not pcall(vim.rpcnotify, chan, 'nvmux_client', ...) then
+    stop()
+  end
+end
+local function attrs(gid)
+  local a = api.nvim_get_hl(0, { id = gid, link = false })
+  local function flags(from, into)
+    for _, k in ipairs({ 'bold', 'italic', 'underline', 'undercurl', 'underdouble',
+        'underdotted', 'underdashed', 'strikethrough', 'reverse', 'altfont' }) do
+      if from[k] then
+        into[k] = true
+      end
+    end
+    return into
+  end
+  local rgb = flags(a, vim.empty_dict())
+  rgb.foreground, rgb.background, rgb.special = a.fg, a.bg, a.sp
+  local cterm = flags(a.cterm or {}, vim.empty_dict())
+  cterm.foreground, cterm.background = a.ctermfg, a.ctermbg
+  return { gid, rgb, cterm }
+end
+-- Text as Neovim draws it from column col: each tab out to the next stop.
+local function untab(text, col, ts)
+  if not text:find('\\t', 1, true) then
+    return text
+  end
+  local out = {}
+  for piece, tab in text:gmatch('([^\\t]*)(\\t?)') do
+    out[#out + 1] = piece
+    col = col + vim.fn.strdisplaywidth(piece)
+    if tab ~= '' then
+      out[#out + 1] = string.rep(' ', ts - col % ts)
+      col = col + ts - col % ts
+    end
+  end
+  return table.concat(out)
+end
+-- Each row of a window whose text after its line's end runs past its grid's
+-- edge, as { row, start, pieces }: the window's grid narrower than it. Where
+-- a line could be no wider than the grid, text and all, it is left at that:
+-- concealed text would only make it narrower.
+local function tails(win, fresh)
+  local width = vim.fn.winwidth(win)
+  if api.nvim_win_get_config(win).relative ~= '' or width >= api.nvim_win_get_width(win) then
+    return {}
+  end
+  local buf = api.nvim_win_get_buf(win)
+  local lines = {}
+  local marks = api.nvim_buf_get_extmarks(buf, -1, { vim.fn.line('w0', win) - 1, 0 },
+    { vim.fn.line('w$', win) - 1, -1 }, { details = true, type = 'virt_text' })
+  for i, m in ipairs(marks) do
+    local d = m[4]
+    if not d.invalid and (d.virt_text_pos == 'eol' or d.virt_text_pos == 'inline') then
+      local l = lines[m[2]] or { ends = {}, inline = {} }
+      lines[m[2]] = l
+      if d.virt_text_pos == 'eol' then
+        l.ends[#l.ends + 1] = { d.priority or 4096, m[3], i, d.virt_text }
+      else
+        l.inline[#l.inline + 1] = { m[3], d.virt_text }
+      end
+    end
+  end
+  if next(lines) == nil then
+    return {}
+  end
+  local function wide(chunks)
+    local n = 0
+    for _, c in ipairs(chunks) do
+      n = n + vim.fn.strdisplaywidth(c[1])
+    end
+    return n
+  end
+  local info = vim.fn.getwininfo(win)[1]
+  local left = vim.wo[win].wrap and 0 or info.leftcol
+  local at = api.nvim_win_get_position(win)
+  local ts = vim.bo[buf].tabstop
+  local out = {}
+  api.nvim_win_call(win, function()
+    for r, l in pairs(lines) do
+      local line = #l.ends > 0 and api.nvim_buf_get_lines(buf, r, r + 1, false)[1]
+      -- What is put in at the line's end, which the text after it follows;
+      -- and as wide as the line could be, text and all.
+      local inline, most = 0, 0
+      if line then
+        for _, i in ipairs(l.inline) do
+          if i[1] >= #line then
+            inline = inline + wide(i[2])
+          end
+        end
+        most = info.textoff + vim.fn.strdisplaywidth(line) + inline - left + #l.ends
+        for _, e in ipairs(l.ends) do
+          most = most + wide(e[4])
+        end
+      end
+      if line and most > width and vim.fn.foldclosed(r + 1) == -1 then
+        -- The line's end is the cell after its last character, as far as
+        -- screenpos() sees, even past the window's edge where the line fills
+        -- it; the text after it starts a cell on, past any put in there.
+        local p = vim.fn.screenpos(win, r + 1, math.max(#line, 1))
+        local col = (line == '' and p.col - at[2] or p.endcol - at[2] + 1) + inline
+        if p.row > 0 then
+          table.sort(l.ends, function(x, y)
+            if x[1] ~= y[1] then
+              return x[1] < y[1]
+            elseif x[2] ~= y[2] then
+              return x[2] < y[2]
+            end
+            return x[3] < y[3]
+          end)
+          local start, pieces = col, {}
+          for k, e in ipairs(l.ends) do
+            if k > 1 then
+              pieces[#pieces + 1] = { ' ', 0 }
+              col = col + 1
+            end
+            for _, c in ipairs(e[4]) do
+              local hl = c[2]
+              if type(hl) == 'table' then
+                hl = hl[#hl]
+              end
+              local gid = hl and vim.fn.hlID(hl) or 0
+              if gid > 0 and not sent[gid] then
+                sent[gid] = true
+                fresh[#fresh + 1] = attrs(gid)
+              end
+              local text = untab(c[1], col, ts)
+              pieces[#pieces + 1] = { text, gid }
+              col = col + vim.fn.strdisplaywidth(text)
+            end
+          end
+          if col > width then
+            out[#out + 1] = { p.row - 1 - at[1], start, pieces }
+          end
+        end
+      end
+    end
+  end)
+  return out
+end
+local function report()
+  local wins = drawn
+  drawn = {}
+  local fresh, told = {}, {}
+  for win in pairs(wins) do
+    if api.nvim_win_is_valid(win) then
+      local ok, rows = pcall(tails, win, fresh)
+      local now = { vim.wo[win].conceallevel == 0, ok and rows or {} }
+      if not vim.deep_equal(now, said[win] or { true, {} }) then
+        said[win] = now
+        told[#told + 1] = { win, now[1], now[2] }
+      end
+    else
+      said[win] = nil
+    end
+  end
+  if #fresh > 0 then
+    send('colours', fresh)
+  end
+  for _, t in ipairs(told) do
+    send('tails', t[1], t[2], t[3])
+  end
+end
+api.nvim_set_decoration_provider(ns, {
+  on_win = function(_, win)
+    drawn[win] = true
+  end,
+  on_end = function()
+    if next(drawn) ~= nil then
+      pcall(report)
+    end
+  end,
+})
+api.nvim_create_autocmd('WinClosed', {
+  group = group,
+  callback = function(ev)
+    said[tonumber(ev.match)] = nil
+  end,
+})
+api.nvim_create_autocmd('ColorScheme', {
+  group = group,
+  callback = function()
+    local again = {}
+    for gid in pairs(sent) do
+      again[#again + 1] = attrs(gid)
+    end
+    if #again > 0 then
+      send('colours', again)
+    end
+  end,
+})
+api.nvim_create_autocmd('UILeave', {
+  group = group,
+  callback = function()
+    if vim.v.event.chan == chan then
+      stop()
+    end
+  end,
+})
+for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
+  drawn[win] = true
+end
+pcall(report)";
 
 /// How far into a window `slot` columns wide its grid `grid` columns wide is
 /// drawn: in its middle, odd slack to the right; nowhere in for a grid as
@@ -285,6 +544,153 @@ pub fn realign(row: &mut [Out], inset: usize, text: usize) {
             words[k - inset].clone()
         };
     }
+}
+
+/// What Neovim draws after the end of the line a row of a window grid
+/// shows — the text of the marks at its end — all of it, as the editor says
+/// it (see [`TAILS_LUA`]): the grid has room for only so much of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tail {
+    /// The column its first cell goes in, as the editor works it out: past
+    /// the grid's width where none of it fits.
+    pub start: usize,
+    pub cells: Vec<Cell>,
+    /// Whether `start` holds even where the row has only blanks of the tail
+    /// to say so: not in a window that conceals text, which the editor does
+    /// not see, and which puts the line's end left of where it says.
+    pub sure: bool,
+}
+
+/// What a `tails` notification says of a window's rows (see [`TAILS_LUA`]),
+/// `sure` as it says it of the window: each row's tail, by row.
+pub fn tails(rows: Option<&ValueRef<'_>>, sure: bool) -> BTreeMap<usize, Tail> {
+    let rows = rows
+        .and_then(ValueRef::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    rows.iter()
+        .filter_map(|row| {
+            let row = row.as_array()?;
+            let at = |i: usize| usize::try_from(redraw::int(row.get(i)?)?).ok();
+            let pieces = row.get(2)?.as_array()?.iter().filter_map(|piece| {
+                let piece = piece.as_array()?;
+                let group = redraw::int(piece.get(1)?).and_then(|g| u32::try_from(g).ok());
+                Some((redraw::as_str(piece.first()?)?, group.unwrap_or(0)))
+            });
+            let tail = Tail {
+                start: at(1)?,
+                cells: cells(pieces),
+                sure,
+            };
+            Some((at(0)?, tail))
+        })
+        .collect()
+}
+
+/// Pieces of text, each in a highlight group of the editor's, as the cells
+/// Neovim draws them in: each group laid over the default highlight, as the
+/// margin they are drawn in has it (see [`syntax_hl`]); a character two
+/// cells wide a cell and the half after it, a combining mark in with the
+/// character before it, and a control character as Neovim shows one.
+fn cells<'a>(pieces: impl Iterator<Item = (&'a str, u32)>) -> Vec<Cell> {
+    let mut out: Vec<Cell> = Vec::new();
+    for (text, group) in pieces {
+        let hl = syntax_hl(0, group);
+        for c in text.chars() {
+            match c {
+                '\0'..='\x1f' | '\x7f' => {
+                    out.push(Cell {
+                        text: Text::Char('^'),
+                        hl,
+                    });
+                    out.push(Cell {
+                        text: Text::Char((c as u8 ^ 0x40) as char),
+                        hl,
+                    });
+                }
+                _ => match c.width() {
+                    Some(0) => {
+                        if let Some(cell) = out.iter_mut().rev().find(|c| c.text != Text::Half) {
+                            let mut b = Vec::new();
+                            cell.text.push_to(&mut b);
+                            let mut s = String::from_utf8(b).unwrap_or_default();
+                            s.push(c);
+                            cell.text = Text::Cluster(s.into());
+                        }
+                    }
+                    Some(w) => {
+                        out.push(Cell {
+                            text: Text::Char(c),
+                            hl,
+                        });
+                        for _ in 1..w {
+                            out.push(Cell {
+                                text: Text::Half,
+                                hl,
+                            });
+                        }
+                    }
+                    None => out.extend(format!("<{:02x}>", c as u32).chars().map(|ch| Cell {
+                        text: Text::Char(ch),
+                        hl,
+                    })),
+                },
+            }
+        }
+    }
+    out
+}
+
+/// The column `tail` starts in on `row`, a row of a grid as Neovim drew it:
+/// where the editor says, if the row has the tail's start there — or, sure
+/// of it, if nothing but blanks of the tail are on the row to say; else the
+/// rightmost column after a blank from which the row has more than blanks of
+/// the tail's start, as it has where the window conceals text before it.
+/// Past the row's end where none of it is on the row. `None` where neither
+/// is: the row does not have the tail anywhere it can be told.
+pub fn place(row: &[Cell], tail: &Tail) -> Option<usize> {
+    let (w, v) = (row.len(), &tail.cells);
+    // Whether the row has the tail's start from column `at`, and whether
+    // more than blanks of it: all of it that fits, but a character two cells
+    // wide in the row's last column, which Neovim has no room for there.
+    let has = |at: usize| -> Option<bool> {
+        let n = v.len().min(w.saturating_sub(at));
+        let mut ink = false;
+        for (i, c) in v[..n].iter().enumerate() {
+            if at + i + 1 == w && v.get(i + 1).is_some_and(|n| n.text == Text::Half) {
+                break;
+            }
+            if row[at + i].text != c.text {
+                return None;
+            }
+            ink |= !c.text.is_blank();
+        }
+        Some(ink)
+    };
+    if v.is_empty() {
+        return None;
+    }
+    if has(tail.start).is_some_and(|ink| ink || tail.sure) {
+        return Some(tail.start);
+    }
+    (1..w)
+        .rev()
+        .find(|&at| row[at - 1].text.is_blank() && has(at) == Some(true))
+}
+
+/// What of `tail` runs past the end of `row`, a row of a grid as Neovim
+/// drew it (see [`place`]): the cells the row has no room for, and the
+/// column the first goes in — past the row's end, and a character two cells
+/// wide the row's last column cut drawn whole after it. Nothing where the
+/// row has all of it, or does not have it where it can be told.
+pub fn past<'a>(row: &[Cell], tail: &'a Tail) -> Option<(usize, &'a [Cell])> {
+    let start = place(row, tail)?;
+    let w = row.len();
+    let mut on = w.saturating_sub(start).min(tail.cells.len());
+    if tail.cells.get(on).is_some_and(|c| c.text == Text::Half) {
+        on = on.saturating_sub(1);
+    }
+    let rest = &tail.cells[on..];
+    (!rest.is_empty()).then_some(((start + on).max(w), rest))
 }
 
 #[cfg(test)]
@@ -363,6 +769,148 @@ mod tests {
             styles,
             [b, a, a, a],
             "the five in one colour closed up, not the three"
+        );
+    }
+
+    /// A row of a grid as Neovim drew it, a cell a character; or a tail's
+    /// cells, in highlight group 7.
+    fn drawn(text: &str) -> Vec<Cell> {
+        cells(std::iter::once((text, 0)))
+    }
+
+    fn tail(start: usize, text: &str, sure: bool) -> Tail {
+        Tail {
+            start,
+            cells: cells(std::iter::once((text, 7))),
+            sure,
+        }
+    }
+
+    fn said(cells: &[Cell]) -> String {
+        let mut out = Vec::new();
+        for c in cells {
+            c.text.push_to(&mut out);
+        }
+        String::from_utf8(out).expect("utf-8")
+    }
+
+    fn past_of(row: &[Cell], tail: &Tail) -> Option<(usize, String)> {
+        past(row, tail).map(|(at, cells)| (at, said(cells)))
+    }
+
+    /// What Neovim cut at the grid's edge runs on past it, from the first
+    /// column past the edge; a tail all on the row has nothing past it; and
+    /// one that starts past the row's end — the line filling the row — all
+    /// of it, from where it starts.
+    #[test]
+    fn what_neovim_cut_at_the_edge_runs_on_past_it() {
+        let msg = "    ■ mismatched";
+        let row = drawn("let x = 1;     ■ mis");
+        assert_eq!(
+            past_of(&row, &tail(11, msg, true)),
+            Some((20, "matched".into()))
+        );
+        let row = drawn("let x = 1;     ■ mismatched    ");
+        assert_eq!(past_of(&row, &tail(11, msg, true)), None, "all on it");
+        let row = drawn("let x = 10;");
+        assert_eq!(
+            past_of(&row, &tail(12, msg, true)),
+            Some((12, msg.into())),
+            "past the line's end"
+        );
+    }
+
+    /// Where the row has only blanks of the tail, nothing says where it
+    /// starts but the editor: taken as it says where it is sure, and not
+    /// where the window conceals text.
+    #[test]
+    fn a_tail_shown_only_in_blanks_is_placed_only_where_the_editor_is_sure() {
+        let row = drawn("let x = 1;   ");
+        assert_eq!(
+            past_of(&row, &tail(11, "    ■ x", true)),
+            Some((13, "  ■ x".into()))
+        );
+        assert_eq!(past_of(&row, &tail(11, "    ■ x", false)), None);
+        let full = drawn("let x = 12;");
+        assert_eq!(past_of(&full, &tail(12, "■ x", false)), None);
+    }
+
+    /// Text concealed before a line's end puts the end left of where the
+    /// editor says: the tail is found where the row has it, more than blanks
+    /// of it after a blank, and what runs past the edge runs on from there.
+    /// A row with none of it anywhere has nothing past it.
+    #[test]
+    fn a_tail_not_where_the_editor_says_is_found_where_the_row_has_it() {
+        // `see [the link](https://…)` concealed down to `see the link`.
+        let row = drawn("see the link     ■ broke");
+        assert_eq!(
+            past_of(&row, &tail(40, "    ■ broken link", false)),
+            Some((24, "n link".into()))
+        );
+        assert_eq!(
+            past_of(&row, &tail(40, "    ■ broken link", true)),
+            Some((40, "    ■ broken link".into())),
+            "sure, the row's blanks there say nothing against it"
+        );
+        let row = drawn("see the link     ■ fixed");
+        assert_eq!(past_of(&row, &tail(13, "    ■ broken link", true)), None);
+    }
+
+    /// A character two cells wide that the row's last column had no room
+    /// for runs on whole past the edge, where Neovim left a blank.
+    #[test]
+    fn a_wide_character_the_edge_cut_runs_on_whole() {
+        let row = drawn("abcdef ■  ");
+        assert_eq!(
+            past_of(&row, &tail(7, "■ 日本", true)),
+            Some((10, "日本".into()))
+        );
+    }
+
+    /// The rows the editor says of, each as its tail's start and cells: each
+    /// piece in its group laid over the default highlight, a character two
+    /// cells wide a cell and a half, a combining mark in with the character
+    /// before it, a control character as Neovim shows one.
+    #[test]
+    fn tails_are_read_as_the_editor_says_them() {
+        use rmpv::Value;
+        let piece = |text: &str, group: i64| Value::Array(vec![text.into(), group.into()]);
+        let rows = Value::Array(vec![
+            Value::Array(vec![
+                3.into(),
+                12.into(),
+                Value::Array(vec![piece("  ", 0), piece("■ x", 41)]),
+            ]),
+            Value::Array(vec![
+                5.into(),
+                20.into(),
+                Value::Array(vec![piece("日a\u{301}", 7), piece("\u{1}", 0)]),
+            ]),
+        ]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &rows).expect("encode");
+        let v = rmpv::decode::read_value_ref(&mut &bytes[..]).expect("decode");
+        let got = tails(Some(&v), false);
+        assert_eq!(got.keys().copied().collect::<Vec<_>>(), [3, 5]);
+        let three = &got[&3];
+        assert_eq!(
+            (three.start, three.sure, said(&three.cells)),
+            (12, false, "  ■ x".into())
+        );
+        assert_eq!(
+            three.cells.iter().map(|c| c.hl).collect::<Vec<_>>(),
+            [0, 0, syntax_hl(0, 41), syntax_hl(0, 41), syntax_hl(0, 41)]
+        );
+        let texts: Vec<Text> = got[&5].cells.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(
+            texts,
+            [
+                Text::Char('日'),
+                Text::Half,
+                Text::Cluster("a\u{301}".into()),
+                Text::Char('^'),
+                Text::Char('A'),
+            ]
         );
     }
 }

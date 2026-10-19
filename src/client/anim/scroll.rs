@@ -568,6 +568,11 @@ impl Scrolling for Scroll {
     fn row<'a>(&'a self, r: usize, grid: &'a Grid) -> Option<&'a [Cell]> {
         self.line(r as i64 - self.shown + self.shown_ahead(), grid)
     }
+
+    fn own_row(&self, r: usize) -> Option<usize> {
+        let i = r as i64 - self.shown + self.shown_ahead();
+        (0..self.height()).contains(&i).then_some(i as usize)
+    }
 }
 
 #[cfg(test)]
@@ -645,6 +650,25 @@ mod tests {
                 [13, 14, 15, 16, 17].map(Some).to_vec(),
             ]
         );
+    }
+
+    /// Of the rows of a view sliding, each it lends from the grid is the
+    /// grid's own row it names, and one it keeps a line of its own for names
+    /// none: what runs past a row's end goes with the grid's rows (see
+    /// `crate::client::wide`).
+    #[test]
+    fn a_sliding_view_names_the_grids_rows_it_shows() {
+        let view = lines(13..18);
+        let g = grid(&view);
+        let s = Scroll::new((0, 5, 0, 1), gone((0, 5, 0, 1), &lines(10..15), 3), 3, 1);
+        assert_eq!(shows(&s, &view), [11, 12, 13, 14, 15].map(Some));
+        let own: Vec<Option<usize>> = (0..5).map(|r| s.own_row(r)).collect();
+        assert_eq!(own, [None, None, Some(0), Some(1), Some(2)]);
+        for r in 0..5 {
+            if let Some(i) = s.own_row(r) {
+                assert_eq!(s.row(r, &g), Some(g.row(i)), "row {r}");
+            }
+        }
     }
 
     /// What a scroll takes out of view is all it keeps of the view as it
