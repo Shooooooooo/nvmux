@@ -255,7 +255,7 @@ settings = ","       # change nvmux's settings while it runs
 
 [session]
 command = "nvim --headless --listen {sock}"   # {sock} is required
-quick_list = false   # true lists sessions without waiting three seconds on a busy one
+quick_list = true    # a busy session holds a listing a quarter of a second; false waits three
 push_news  = false   # true has the sessions say when they have news, not be asked every two seconds
 
 [client]
@@ -263,7 +263,7 @@ ui             = "nvmux"  # who draws a session: nvmux's own client, animated; o
 per_session    = true     # keep each session's client; a switch back reuses it
 lazy           = false    # start every client at launch; true waits for each session's first visit
 revive         = false    # true starts again, once a dropped link is back, the clients it took
-throttle       = false    # true draws a session out of sight once a second, not as it changes
+throttle       = true     # a session out of sight is drawn once a second; false draws it as it changes
 predict        = "auto"   # over ssh, scrolls show before Neovim answers; "on" over any slow link
 centre         = "off"    # on a wide terminal, each window's text in its middle: "smart" or "fixed"
 window_width   = 120      # with centre on, how many columns a window's text gets; 0 for no limit
