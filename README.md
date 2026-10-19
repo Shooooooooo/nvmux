@@ -252,6 +252,7 @@ settings = ","       # change nvmux's settings while it runs
 
 [session]
 command = "nvim --headless --listen {sock}"   # {sock} is required
+quick_list = false   # true lists sessions without waiting three seconds on a busy one
 
 [client]
 ui             = "nvmux"  # who draws a session: nvmux's own client, animated; or "nvim"

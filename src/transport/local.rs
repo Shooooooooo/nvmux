@@ -152,9 +152,16 @@ impl Host for LocalTransport {
     /// one holds its probe for the whole of [`rpc::PROBE_TIMEOUT`], and asked
     /// one after another they held the listing for that long each: two
     /// sessions in a `:!make` were six seconds before the picker came up.
-    /// Together they hold it for one budget, however many there are.
+    /// Together they hold it for one budget, however many there are — and
+    /// with `[session] quick_list` on, a quarter of a second of one
+    /// ([`rpc::QUICK_PROBE_TIMEOUT`]).
     fn settle(&self, listed: Vec<Session>) -> Result<Vec<Session>> {
         let t_probe = std::time::Instant::now();
+        let budget = if crate::config::get().session.quick_list {
+            rpc::QUICK_PROBE_TIMEOUT
+        } else {
+            rpc::PROBE_TIMEOUT
+        };
         let probed = listed.len();
         let paths = listed
             .iter()
@@ -163,7 +170,7 @@ impl Host for LocalTransport {
         let found: Vec<Liveness> = std::thread::scope(|scope| {
             let probes: Vec<_> = paths
                 .iter()
-                .map(|p| scope.spawn(move || rpc::probe(&p.sock)))
+                .map(|p| scope.spawn(move || rpc::probe_within(&p.sock, budget)))
                 .collect();
             // A probe that panicked proved nothing, and nothing is reaped on
             // that.
