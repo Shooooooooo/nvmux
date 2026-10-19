@@ -323,7 +323,9 @@ pub enum Command {
     /// session's first visit — and nothing it draws is seen until it is told
     /// [`Command::Clear`]: it stops animating, and draws what changes at most
     /// once in a while, for what nvmux keeps of its screen meanwhile. Told
-    /// only with `[client] throttle` on.
+    /// that, it draws at once, and something even where nothing changed: a
+    /// frame the relay waits for, to bring the screen back as it is now.
+    /// Told only with `[client] throttle` on.
     Away,
     /// This client has gone to the back as for [`Command::Away`], with
     /// `[client] throttle` off: it draws as it would in front, for what nvmux
