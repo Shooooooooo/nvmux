@@ -23,14 +23,31 @@ use std::time::{Duration, Instant};
 
 use crate::card::{self, Card, Go, Post, Posted};
 use crate::config::KeySettings;
-use crate::notes::{self, Heard, Kind, News};
+use crate::notes::{self, Heard, Kind, News, Pushed};
 use crate::ui::note;
-use crate::{ids, keys};
+use crate::{ids, keys, rpc};
 
 /// How long the notifier waits, once a session is in front, before its first
 /// round of reads: long enough for the sessions handed to it at the same
-/// moment to be read in that round.
+/// moment to be read in that round. And how long it waits to read a session
+/// that has said its news changed: long enough for the rest of what one event
+/// brings — a command's end, said by its shell and by its terminal closing —
+/// to be read with it.
 const SETTLE: Duration = Duration::from_millis(30);
+
+/// How long a session that tells the notifier its news goes between reads all
+/// the same, with `[session] push_news` on: for what a push could miss, over
+/// a connection gone quiet without closing.
+const SAFETY: Duration = Duration::from_secs(30);
+
+/// The least time between two reads of a session that its pushes bring on: a
+/// program that sends notification after notification has its session read
+/// four times a second, not as often as it sends.
+const SPACING: Duration = Duration::from_millis(250);
+
+/// How long a session whose listener stopped, though the session may still be
+/// there, waits for another: it is read every [`notes::POLL`] meanwhile.
+const RELISTEN: Duration = Duration::from_secs(10);
 
 /// The card that tells `news`, from the session with this id and name — or,
 /// with `None`, from the session in front itself — and where acting on it
@@ -142,6 +159,13 @@ enum Command {
     },
     /// This session is in front now; `None`, one of nvmux's own screens is.
     Front(Option<String>),
+    /// What the listener with this number heard from its session.
+    Pushed(u64, Pushed),
+    /// The listener with this number has stopped: its session went, or its
+    /// connection did, or the session could not be listened to.
+    Stopped(u64),
+    /// The notifier was dropped: stop, and every listener with it.
+    Quit,
 }
 
 /// One session the notifier reads.
@@ -155,6 +179,65 @@ struct Watched {
     /// Whether a card about it is up in front, which leaves its mark: to be
     /// let go of once it has nothing to say.
     marked: bool,
+    /// When it is to be read next, while a session is in front.
+    next: Instant,
+    /// When it was last read: a read a push brings on comes no sooner than
+    /// [`SPACING`] after.
+    last: Option<Instant>,
+    /// The listener on it, with `[session] push_news` on.
+    ear: Option<Ear>,
+    /// Whether its watcher tells the listener its news, by the last read, and
+    /// has not been found to have missed any: read every [`SAFETY`] while it
+    /// does, and every [`notes::POLL`] otherwise.
+    told: bool,
+    /// Whether it has said its news changed since it was last read.
+    pushed: bool,
+    /// When a listener may be started on it again, after one stopped.
+    relisten: Option<Instant>,
+}
+
+impl Watched {
+    fn new(id: String, name: String, sock: PathBuf, next: Instant) -> Self {
+        Self {
+            id,
+            name,
+            sock,
+            heard: None,
+            marked: false,
+            next,
+            last: None,
+            ear: None,
+            told: false,
+            pushed: false,
+            relisten: None,
+        }
+    }
+}
+
+/// A listener on a session ([`notes::listen`]), on a thread of its own, and
+/// numbered: what an earlier one on the session says is not taken for what
+/// this one does. Dropped, it stops.
+struct Ear {
+    number: u64,
+    /// Its channel, and the way to stop it, once it is connected.
+    on: Option<(u64, rpc::Interrupt)>,
+}
+
+impl Ear {
+    /// The channel a read names for the watcher to tell this listener.
+    fn chan(&self) -> Option<u64> {
+        self.on.as_ref().map(|(chan, _)| *chan)
+    }
+}
+
+impl Drop for Ear {
+    fn drop(&mut self) {
+        // One still connecting stops as soon as it says it is listening, to
+        // a notifier that no longer has it.
+        if let Some((_, stop)) = &self.on {
+            stop.fire();
+        }
+    }
 }
 
 /// Posts, as it happens, cards with what the other sessions have to report —
@@ -171,6 +254,16 @@ struct Watched {
 /// a key — this runs for as long as nvmux does, and a session may wait for its
 /// key all night.
 ///
+/// With `[session] push_news` on, it listens to every session as well
+/// ([`notes::listen`]), each on a thread of its own, and reads one as soon as
+/// it says its news has changed, though no sooner than [`SPACING`] after the
+/// last read of it. A session whose watcher a read has found telling its
+/// listener is read every [`SAFETY`] besides, rather than every
+/// [`notes::POLL`]: the rest — one not listened to yet, or whose listener
+/// stopped, or whose watcher was put in afresh — are read as often as ever,
+/// and a read names the listener to the watcher. A read the timer brought on
+/// that finds news a told listener never heard of starts the listener again.
+///
 /// With `[client] ui = "nvim"` there is no client to draw a card, and nothing
 /// is read. Dropping it stops the thread without waiting for it, as with
 /// [`notes::Poller`]: a read in flight finishes to nobody.
@@ -186,9 +279,10 @@ impl Notifier {
         }
         let settings = crate::config::get().keys;
         let (commands, inbox) = mpsc::channel();
+        let ears = commands.clone();
         let spawned = std::thread::Builder::new()
             .name("nvmux-notifier".into())
-            .spawn(move || run(&inbox, settings));
+            .spawn(move || run(&inbox, &ears, settings));
         if let Err(e) = spawned {
             tracing::warn!(error = %e, "tell: no thread to read the sessions on");
         }
@@ -222,29 +316,46 @@ impl Notifier {
     }
 }
 
-fn run(inbox: &Receiver<Command>, settings: KeySettings) {
+impl Drop for Notifier {
+    /// The thread hands its listeners what to say back on, so it never finds
+    /// itself alone on its channel: it is told to stop.
+    fn drop(&mut self) {
+        self.send(Command::Quit);
+    }
+}
+
+/// The notifier's thread: `inbox` is what it is handed, and `ears` where its
+/// listeners say what they hear.
+fn run(inbox: &Receiver<Command>, ears: &Sender<Command>, settings: KeySettings) {
     let mut watched: Vec<Watched> = Vec::new();
     let mut front: Option<String> = None;
-    let mut due: Option<Instant> = None;
+    let mut numbered: u64 = 0;
     loop {
+        // Nothing is read while nvmux's own screens are up.
+        let due = front
+            .as_ref()
+            .and_then(|_| watched.iter().map(|w| w.next).min());
         let next = match due {
             Some(at) => inbox.recv_timeout(at.saturating_duration_since(Instant::now())),
             None => inbox.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
+        let now = Instant::now();
         match next {
             Ok(Command::Watch { id, name, sock }) => {
                 match watched.iter_mut().find(|w| w.id == id) {
                     Some(w) => {
                         w.name = name;
-                        w.sock = sock;
+                        if w.sock != sock {
+                            // A listener on the old socket hears nothing of
+                            // the new one.
+                            w.sock = sock;
+                            w.ear = None;
+                            w.told = false;
+                            w.relisten = None;
+                            w.next = w.next.min(now + notes::POLL);
+                        }
                     }
-                    None => watched.push(Watched {
-                        id,
-                        name,
-                        sock,
-                        heard: None,
-                        marked: false,
-                    }),
+                    None => watched.push(Watched::new(id, name, sock, now + SETTLE)),
                 }
             }
             Ok(Command::Front(id)) => {
@@ -259,39 +370,124 @@ fn run(inbox: &Receiver<Command>, settings: KeySettings) {
                         w.heard = None;
                     }
                     w.marked = false;
+                    w.next = now + SETTLE;
                 }
                 front = id;
-                due = front.is_some().then(|| Instant::now() + SETTLE);
+            }
+            Ok(Command::Pushed(number, pushed)) => {
+                let w = watched
+                    .iter_mut()
+                    .find(|w| w.ear.as_ref().is_some_and(|e| e.number == number));
+                match (w, pushed) {
+                    (Some(w), Pushed::Listening { chan, stop }) => {
+                        if let Some(ear) = w.ear.as_mut() {
+                            ear.on = Some((chan, stop));
+                        }
+                    }
+                    (Some(w), Pushed::News) => {
+                        w.pushed = true;
+                        let spaced = w.last.map_or(now, |at| at + SPACING);
+                        w.next = w.next.min((now + SETTLE).max(spaced));
+                    }
+                    // An earlier listener's, or one on a session no longer
+                    // read.
+                    (None, Pushed::Listening { stop, .. }) => stop.fire(),
+                    (None, Pushed::News) => {}
+                }
+            }
+            Ok(Command::Stopped(number)) => {
+                let w = watched
+                    .iter_mut()
+                    .find(|w| w.ear.as_ref().is_some_and(|e| e.number == number));
+                if let Some(w) = w {
+                    w.ear = None;
+                    w.told = false;
+                    w.relisten = Some(now + RELISTEN);
+                    // Gone, perhaps: read soon, to let go of its mark.
+                    w.next = w.next.min(now + SETTLE);
+                }
             }
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(id) = front.as_deref() {
-                    round(&mut watched, id, settings);
+                    round(&mut watched, id, settings, now);
                 }
-                due = front.is_some().then(|| Instant::now() + notes::POLL);
             }
-            Err(RecvTimeoutError::Disconnected) => return,
+            Ok(Command::Quit) | Err(RecvTimeoutError::Disconnected) => return,
+        }
+        listeners(&mut watched, ears, &mut numbered, now);
+    }
+}
+
+/// With `[session] push_news` on, a listener on every session without one,
+/// but for one whose listener stopped a moment ago; with it off, none. Each is
+/// numbered from `numbered`, and says what it hears on `ears`.
+fn listeners(watched: &mut [Watched], ears: &Sender<Command>, numbered: &mut u64, now: Instant) {
+    let push = crate::config::get().session.push_news;
+    for w in watched {
+        if !push {
+            if w.ear.take().is_some() {
+                w.told = false;
+                w.next = w.next.min(now + notes::POLL);
+            }
+            continue;
+        }
+        if w.ear.is_some() || w.relisten.is_some_and(|at| at > now) {
+            continue;
+        }
+        *numbered += 1;
+        if listen(*numbered, w.sock.clone(), ears.clone()) {
+            w.ear = Some(Ear {
+                number: *numbered,
+                on: None,
+            });
+        } else {
+            w.relisten = Some(now + RELISTEN);
         }
     }
 }
 
-/// Read every session, all at a time, and post a card for the session in
-/// front, `front`, of what is news — oldest first, whichever session said it
-/// ([`oldest_first`]). On a first read, which says only how far a session
-/// has got, what another keeps is its mark alone; and of one that keeps
-/// nothing any more, or is gone, the mark is let go of. One gone for good,
-/// its socket with it ([`vanished`]), is read no more.
-fn round(watched: &mut Vec<Watched>, front: &str, settings: KeySettings) {
+/// Start listener `number` on the session on `sock`, on a thread of its own,
+/// saying what it hears, and when it stops, on `ears`. Whether there was a
+/// thread for it.
+fn listen(number: u64, sock: PathBuf, ears: Sender<Command>) -> bool {
+    let spawned = std::thread::Builder::new()
+        .name("nvmux-listener".into())
+        .spawn(move || {
+            let heard = |pushed| ears.send(Command::Pushed(number, pushed)).is_ok();
+            if let Err(e) = notes::listen(&sock, heard) {
+                tracing::debug!(sock = %sock.display(), error = %e, "tell: stopped listening");
+            }
+            let _ = ears.send(Command::Stopped(number));
+        });
+    if let Err(e) = &spawned {
+        tracing::debug!(error = %e, "tell: no thread to listen on");
+    }
+    spawned.is_ok()
+}
+
+/// Read every session due by `now`, all at a time, and post a card for the
+/// session in front, `front`, of what is news — oldest first, whichever
+/// session said it ([`oldest_first`]). On a first read, which says only how
+/// far a session has got, what another keeps is its mark alone; and of one
+/// that keeps nothing any more, or is gone, the mark is let go of. One gone
+/// for good, its socket with it ([`vanished`]), is read no more. Each read
+/// names the session's listener, where it has one, and says when it is to be
+/// read next.
+fn round(watched: &mut Vec<Watched>, front: &str, settings: KeySettings, now: Instant) {
     let heard: Vec<(usize, Heard)> = std::thread::scope(|s| {
         let reads: Vec<_> = watched
             .iter()
             .enumerate()
+            .filter(|(_, w)| w.next <= now)
             .map(|(i, w)| {
                 let sock = &w.sock;
-                s.spawn(move || (i, notes::hear(sock)))
+                let listener = w.ear.as_ref().and_then(Ear::chan);
+                s.spawn(move || (i, notes::hear(sock, listener)))
             })
             .collect();
         reads.into_iter().filter_map(|r| r.join().ok()).collect()
     });
+    let read_at = Instant::now();
     let post = |what| Post {
         front: front.to_string(),
         what,
@@ -301,9 +497,13 @@ fn round(watched: &mut Vec<Watched>, front: &str, settings: KeySettings) {
     let mut ended = Vec::new();
     for (i, heard) in heard {
         let w = &mut watched[i];
-        let news = match heard {
-            Heard::Said(news) => news,
+        w.last = Some(read_at);
+        let pushed = std::mem::take(&mut w.pushed);
+        let (news, listening) = match heard {
+            Heard::Said { news, listening } => (news, listening),
             Heard::Gone => {
+                w.told = false;
+                w.next = read_at + notes::POLL;
                 if std::mem::take(&mut w.marked) {
                     forgot.push(w.id.clone());
                 }
@@ -312,8 +512,30 @@ fn round(watched: &mut Vec<Watched>, front: &str, settings: KeySettings) {
                 }
                 continue;
             }
-            Heard::Unknown => continue,
+            Heard::Unknown => {
+                // What it said it has is still to be read, and soon: it will
+                // not say so again.
+                w.pushed = pushed;
+                let wait = if w.told && !pushed {
+                    SAFETY
+                } else {
+                    notes::POLL
+                };
+                w.next = read_at + wait;
+                continue;
+            }
         };
+        // News that a listener being told since the last read never heard
+        // of: its connection is not bringing what the watcher says. Started
+        // again, in `listeners`.
+        let missed =
+            listening && !pushed && w.heard.is_some_and(|h| news.iter().any(|n| n.seq > h));
+        if missed {
+            tracing::debug!(id = %w.id, "tell: news came that the listener did not hear");
+            w.ear = None;
+        }
+        w.told = listening && !missed;
+        w.next = read_at + if w.told { SAFETY } else { notes::POLL };
         let here = w.id == front;
         let from = (!here).then_some((w.id.as_str(), w.name.as_str()));
         let marks = marking(&news);
@@ -563,18 +785,13 @@ mod tests {
     fn a_session_gone_with_its_socket_is_read_no_more() {
         let left = crate::test_support::scratch_sock("tell-left");
         drop(std::os::unix::net::UnixListener::bind(&left).expect("bind"));
-        let watched = |id: &str, sock| Watched {
-            id: id.to_string(),
-            name: id.to_string(),
-            sock,
-            heard: None,
-            marked: false,
-        };
+        let now = Instant::now();
+        let watched = |id: &str, sock| Watched::new(id.to_string(), id.to_string(), sock, now);
         let mut all = vec![
             watched("quit2345", crate::test_support::scratch_sock("tell-quit")),
             watched("left2345", left.clone()),
         ];
-        round(&mut all, "front234", prefixed(0));
+        round(&mut all, "front234", prefixed(0), now);
         let ids: Vec<&str> = all.iter().map(|w| w.id.as_str()).collect();
         assert_eq!(ids, ["left2345"], "the one with its socket still there");
         let _ = std::fs::remove_file(&left);

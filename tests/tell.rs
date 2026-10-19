@@ -11,85 +11,15 @@
 #[macro_use]
 mod common;
 
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use common::{wait_until, Scratch};
-use nvmux::card::{self, Card, Go, Post, Posted};
+use common::{
+    a_job_that_exits, a_session, in_a_terminal, lua, posts_until, shown, wait_until, Scratch,
+};
+use nvmux::card::{self, Go, Post, Posted};
 use nvmux::notes::{self, Heard, Kind};
 use nvmux::rpc::Client;
 use nvmux::tell::Notifier;
-use nvmux::transport::Transport;
-use rmpv::Value;
-
-/// Run Lua in the session, as a test's own stand-in for whatever a plugin or
-/// a terminal program would have done there.
-fn lua(sock: &Path, code: &str) -> Value {
-    let mut client = Client::connect(sock, Duration::from_secs(5)).expect("connect");
-    client
-        .call(
-            "nvim_exec_lua",
-            vec![Value::from(code), Value::Array(Vec::new())],
-        )
-        .expect("nvim_exec_lua")
-}
-
-/// A program in a hidden terminal buffer, printing `printf`'s format and
-/// staying up a while, as an agent at a prompt does.
-fn in_a_terminal(sock: &Path, printf: &str) {
-    lua(
-        sock,
-        &format!(
-            r#"local buf = vim.api.nvim_create_buf(true, false)
-vim.api.nvim_buf_call(buf, function()
-  vim.fn.jobstart({{ 'sh', '-c', [=[printf '{printf}'; sleep 30]=] }}, {{ term = true }})
-end)"#
-        ),
-    );
-}
-
-/// A job that runs `script` and exits, in a terminal buffer no window shows —
-/// or, `on_screen`, in the current window — waited for until its `TermClose`
-/// has been, so that the watcher has seen it go. Says which buffer it was.
-fn a_job_that_exits(sock: &Path, script: &str, on_screen: bool) -> i64 {
-    let place = if on_screen {
-        "vim.cmd('enew')\nlocal buf = vim.api.nvim_get_current_buf()"
-    } else {
-        "local buf = vim.api.nvim_create_buf(true, false)"
-    };
-    lua(
-        sock,
-        &format!(
-            r#"local closed = false
-{place}
-vim.api.nvim_create_autocmd('TermClose', {{
-  buffer = buf,
-  once = true,
-  callback = function()
-    closed = true
-  end,
-}})
-vim.api.nvim_buf_call(buf, function()
-  vim.fn.jobstart({{ 'sh', '-c', [=[{script}]=] }}, {{ term = true }})
-end)
-vim.wait(5000, function()
-  return closed
-end)
-return buf"#
-        ),
-    )
-    .as_i64()
-    .expect("the buffer")
-}
-
-fn a_session(scratch: &Scratch, name: &str) -> (nvmux::session::Session, PathBuf) {
-    let t = scratch.transport();
-    let s = t
-        .create_session(name, &common::launch(), common::anywhere())
-        .expect("create");
-    let sock = t.local_socket_for(&s).expect("socket path");
-    (s, sock)
-}
 
 /// A careful read, of an editor waiting for a key, says nothing and asks
 /// nothing; and what the watcher keeps is numbered as it comes, says whether
@@ -101,15 +31,18 @@ fn the_watcher_numbers_what_it_keeps_and_knows_where_its_terminal_is() {
     let scratch = Scratch::new("tell-heard");
     let (_, sock) = a_session(&scratch, "heard");
     assert_eq!(
-        notes::hear(&sock),
-        Heard::Said(Vec::new()),
+        notes::hear(&sock, None),
+        Heard::Said {
+            news: Vec::new(),
+            listening: false
+        },
         "given the watcher"
     );
 
     // First, while the current window still holds a buffer of its own: in a
     // terminal's, the editor's mode is `nt`, not the `n` the wait looks for.
     common::block_on_a_key(&sock);
-    assert_eq!(notes::hear(&sock), Heard::Unknown);
+    assert_eq!(notes::hear(&sock, None), Heard::Unknown);
     Client::connect(&sock, Duration::from_secs(2))
         .expect("connect")
         .input("<Esc>")
@@ -122,7 +55,7 @@ fn the_watcher_numbers_what_it_keeps_and_knows_where_its_terminal_is() {
 
     let hidden = a_job_that_exits(&sock, "exit 3", false);
     let shown = a_job_that_exits(&sock, "exit 0", true);
-    let Heard::Said(news) = notes::hear(&sock) else {
+    let Heard::Said { news, .. } = notes::hear(&sock, None) else {
         panic!("the session said nothing");
     };
     assert_eq!(
@@ -141,32 +74,91 @@ fn the_watcher_numbers_what_it_keeps_and_knows_where_its_terminal_is() {
         &sock,
         &format!("vim.api.nvim_buf_delete({hidden}, {{ force = true }})"),
     );
-    let Heard::Said(news) = notes::hear(&sock) else {
+    let Heard::Said { news, .. } = notes::hear(&sock, None) else {
         panic!("the session said nothing");
     };
     assert_eq!(news[0].buf, None, "a buffer that is gone is none: {news:?}");
 }
 
-/// The card a post shows, and where acting on it goes: none for one that lets
-/// go of what is up.
-fn shown(post: &Post) -> Option<(&Card, Option<Go>)> {
-    match &post.what {
-        Posted::Card(card, go) => Some((card, *go)),
-        Posted::Forget(_) => None,
-    }
-}
+/// A listener on a session hears from its watcher once a read has named it,
+/// and not before: each time news comes, and when what was kept is seen —
+/// but not a `seen` with nothing to clear. A read says whether the listener
+/// was being told already. Stopped, it goes, and the watcher lets go of its
+/// channel the next time it has news.
+#[test]
+fn a_listener_hears_the_news_once_a_read_names_it() {
+    require_nvim!();
+    let scratch = Scratch::new("tell-listen");
+    let (_, sock) = a_session(&scratch, "listened");
+    let (heard, hearing) = std::sync::mpsc::channel();
+    let listening = std::thread::spawn({
+        let sock = sock.clone();
+        move || notes::listen(&sock, |pushed| heard.send(pushed).is_ok())
+    });
+    let within = Duration::from_secs(5);
+    let (chan, stop) = match hearing.recv_timeout(within) {
+        Ok(notes::Pushed::Listening { chan, stop }) => (chan, stop),
+        other => panic!("not listening: {other:?}"),
+    };
+    let listening_by = |read: Heard| match read {
+        Heard::Said { listening, .. } => listening,
+        other => panic!("the session said nothing: {other:?}"),
+    };
+    let nothing_more = |what: &str| {
+        let more = hearing.recv_timeout(Duration::from_millis(300));
+        assert!(more.is_err(), "{what}: {more:?}");
+    };
 
-/// Wait up to `within` for posts on the board that `want` says are the ones,
-/// and hand back every post taken meanwhile.
-fn posts_until(within: Duration, want: impl Fn(&[Post]) -> bool) -> Vec<Post> {
-    let deadline = Instant::now() + within;
-    let mut taken = Vec::new();
-    while Instant::now() < deadline && !want(&taken) {
-        taken.extend(card::board().take());
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    taken.extend(card::board().take());
-    taken
+    // A read that names nobody gives the session the watcher, which tells
+    // nobody; nor does news before a read has named the listener.
+    assert!(!listening_by(notes::hear(&sock, None)));
+    a_job_that_exits(&sock, "exit 1", false);
+    nothing_more("told before it was named");
+    assert!(
+        !listening_by(notes::hear(&sock, Some(chan))),
+        "named by this read, not before it"
+    );
+    assert!(listening_by(notes::hear(&sock, Some(chan))));
+    assert!(
+        !listening_by(notes::hear(&sock, None)),
+        "a read naming nobody"
+    );
+
+    let started = Instant::now();
+    a_job_that_exits(&sock, "exit 3", false);
+    assert!(
+        matches!(hearing.recv_timeout(within), Ok(notes::Pushed::News)),
+        "news not told"
+    );
+    let took = started.elapsed();
+    notes::seen(&sock);
+    assert!(
+        matches!(hearing.recv_timeout(within), Ok(notes::Pushed::News)),
+        "what was kept was seen, and not told"
+    );
+    notes::seen(&sock);
+    nothing_more("told of a seen with nothing to clear");
+    eprintln!("told {took:?} after the job was started");
+
+    // A watcher put in afresh by a read that names the listener tells it,
+    // though the read does not say it was being told.
+    lua(&sock, "package.loaded['nvmux.notes'] = nil");
+    assert!(!listening_by(notes::hear(&sock, Some(chan))));
+    a_job_that_exits(&sock, "exit 5", false);
+    assert!(
+        matches!(hearing.recv_timeout(within), Ok(notes::Pushed::News)),
+        "a watcher put in afresh did not tell the listener it was given"
+    );
+
+    stop.fire();
+    let ended = listening.join().expect("the listener panicked");
+    assert!(ended.is_err(), "stopped, it says why: {ended:?}");
+    // Told no more: the watcher found the channel gone and let it go.
+    a_job_that_exits(&sock, "exit 4", false);
+    assert!(
+        !listening_by(notes::hear(&sock, Some(chan))),
+        "the watcher kept a channel that had gone"
+    );
 }
 
 /// The session in front is posted a card for what another session's

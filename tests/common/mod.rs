@@ -17,12 +17,14 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::Signal;
 use nix::sys::stat::Mode;
 use nix::unistd::Pid;
+use nvmux::card::{Card, Go, Post, Posted};
 use nvmux::launch::Launch;
 use nvmux::rpc::Client;
 use nvmux::session::Session;
 use nvmux::transport::local::LocalTransport;
 use nvmux::transport::Transport;
 use pty_process::blocking::{Command, Pty};
+use rmpv::Value;
 
 /// What a session is launched with unless the test is about the command
 /// itself: the built-in default, which is what nvmux ran before the command
@@ -435,4 +437,98 @@ pub fn press_enter(sock: &Path) {
         .expect("connect")
         .input("<CR>")
         .expect("press enter");
+}
+
+// What the tests of the notifier, and of the sessions telling it their news,
+// share: a session, what happens in it, and the cards it brings.
+
+/// Run Lua in the session, as a test's own stand-in for whatever a plugin or
+/// a terminal program would have done there.
+pub fn lua(sock: &Path, code: &str) -> Value {
+    let mut client = Client::connect(sock, Duration::from_secs(5)).expect("connect");
+    client
+        .call(
+            "nvim_exec_lua",
+            vec![Value::from(code), Value::Array(Vec::new())],
+        )
+        .expect("nvim_exec_lua")
+}
+
+/// A program in a hidden terminal buffer, printing `printf`'s format and
+/// staying up a while, as an agent at a prompt does.
+pub fn in_a_terminal(sock: &Path, printf: &str) {
+    lua(
+        sock,
+        &format!(
+            r#"local buf = vim.api.nvim_create_buf(true, false)
+vim.api.nvim_buf_call(buf, function()
+  vim.fn.jobstart({{ 'sh', '-c', [=[printf '{printf}'; sleep 30]=] }}, {{ term = true }})
+end)"#
+        ),
+    );
+}
+
+/// A job that runs `script` and exits, in a terminal buffer no window shows —
+/// or, `on_screen`, in the current window — waited for until its `TermClose`
+/// has been, so that the watcher has seen it go. Says which buffer it was.
+pub fn a_job_that_exits(sock: &Path, script: &str, on_screen: bool) -> i64 {
+    let place = if on_screen {
+        "vim.cmd('enew')\nlocal buf = vim.api.nvim_get_current_buf()"
+    } else {
+        "local buf = vim.api.nvim_create_buf(true, false)"
+    };
+    lua(
+        sock,
+        &format!(
+            r#"local closed = false
+{place}
+vim.api.nvim_create_autocmd('TermClose', {{
+  buffer = buf,
+  once = true,
+  callback = function()
+    closed = true
+  end,
+}})
+vim.api.nvim_buf_call(buf, function()
+  vim.fn.jobstart({{ 'sh', '-c', [=[{script}]=] }}, {{ term = true }})
+end)
+vim.wait(5000, function()
+  return closed
+end)
+return buf"#
+        ),
+    )
+    .as_i64()
+    .expect("the buffer")
+}
+
+pub fn a_session(scratch: &Scratch, name: &str) -> (nvmux::session::Session, PathBuf) {
+    let t = scratch.transport();
+    let s = t
+        .create_session(name, &launch(), anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&s).expect("socket path");
+    (s, sock)
+}
+
+/// The card a post shows, and where acting on it goes: none for one that lets
+/// go of what is up.
+pub fn shown(post: &Post) -> Option<(&Card, Option<Go>)> {
+    match &post.what {
+        Posted::Card(card, go) => Some((card, *go)),
+        Posted::Forget(_) => None,
+    }
+}
+
+/// Wait up to `within` for posts on the board that `want` says are the ones,
+/// and hand back every post taken meanwhile.
+pub fn posts_until(within: Duration, want: impl Fn(&[Post]) -> bool) -> Vec<Post> {
+    let deadline = Instant::now() + within;
+    let mut taken = Vec::new();
+    while Instant::now() < deadline && !want(&taken) {
+        taken.extend(nvmux::card::board().take());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    taken.extend(nvmux::card::board().take());
+    taken
 }
