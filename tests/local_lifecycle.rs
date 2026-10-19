@@ -626,9 +626,7 @@ fn a_busy_session_is_never_reaped() {
     // pump the event loop, so deferred RPC calls stop answering entirely.
     common::block_editor(&sock, "call system('sleep 8')", Duration::from_millis(500));
 
-    let started = Instant::now();
     let listed = t.list_sessions().expect("list");
-    let took = started.elapsed();
     assert_eq!(listed.len(), 1, "a busy session must still be listed");
     assert_eq!(
         listed[0].state.liveness,
@@ -636,12 +634,6 @@ fn a_busy_session_is_never_reaped() {
         "blocked-but-reachable must read as Busy, not Dead"
     );
     assert!(sock.exists(), "a busy session must never be reaped");
-    // For the whole of the probe's budget, without `[session] quick_list`
-    // (see `tests/quick_list.rs`).
-    assert!(
-        took >= nvmux::rpc::PROBE_TIMEOUT - Duration::from_millis(500),
-        "the listing gave up on a busy session after {took:?}"
-    );
 }
 
 /// Busy sessions hold their probes for the whole of the probe's budget, and

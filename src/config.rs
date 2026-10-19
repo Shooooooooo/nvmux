@@ -107,15 +107,15 @@ pub struct SessionSettings {
     /// second on any one of them: for the picker, `<prefix> c` and a switch
     /// (see [`crate::rpc::QUICK_PROBE_TIMEOUT`]).
     ///
-    /// Off, the default, a session busy in a `:!make` or in CPU-bound Lua,
-    /// which cannot answer, holds every listing three seconds — the picker
-    /// comes up that much later, on a cleared screen — and is then listed as
-    /// one that answered is. On, it is listed after a quarter of a second,
-    /// the same.
+    /// On, the default, a session busy in a `:!make` or in CPU-bound Lua,
+    /// which cannot answer, holds a listing a quarter of a second, and is
+    /// then listed as one that answered is. A session that dies within the
+    /// three seconds a listing waits without this is listed until the next
+    /// listing.
     ///
-    /// What on risks: a session that dies within those three seconds is
-    /// listed until the next listing, where the longer wait would have found
-    /// it gone and not listed it.
+    /// Off, such a session holds every listing three seconds — the picker
+    /// comes up that much later, on a cleared screen — and one that dies in
+    /// them is found gone, and not listed.
     pub quick_list: bool,
 }
 
@@ -221,20 +221,20 @@ pub struct ClientSettings {
     /// animating, until it is back in front (see
     /// [`crate::card::Command::Away`]). nvmux's own client only.
     ///
-    /// Off, the default, such a client draws everything its session does as
-    /// if it were in front, into nvmux's copy of its screen — but for a
-    /// blinking cursor, which holds still out of sight either way. On, a
-    /// session
-    /// that draws all the while out of sight — a `:terminal` running a build,
-    /// a log — costs nvmux a third of the CPU it did, or less; and a client
-    /// started ahead of one is kept to its first visit, rather than let go
-    /// for writing more than [`crate::pty::AHEAD_MAX`] before it.
+    /// On, the default, a session that draws all the while out of sight — a
+    /// `:terminal` running a build, a log — costs nvmux a third of the CPU it
+    /// would, or less; and a client started ahead of one is kept to its first
+    /// visit, rather than let go for writing more than
+    /// [`crate::pty::AHEAD_MAX`] before it. nvmux's copy of a session out of
+    /// sight is up to a second old, and is brought up to date as the session
+    /// comes back to the front, before it is shown: the client draws what it
+    /// had yet to, and the return waits for that frame — a millisecond or so,
+    /// and never more than 30 for a client busy with something else — card
+    /// or none.
     ///
-    /// What on costs: nvmux's copy of a session out of sight is up to a
-    /// second old, and is brought up to date as the session comes back to
-    /// the front, before it is shown: the client draws what it had yet to,
-    /// and the return waits for that frame — a millisecond or so, and never
-    /// more than 30 for a client busy with something else — card or none.
+    /// Off, such a client draws everything its session does as if it were in
+    /// front, into nvmux's copy of its screen — but for a blinking cursor,
+    /// which holds still out of sight either way.
     pub throttle: bool,
     /// Scroll ahead of a slow link: a key that scrolls — `<C-e>`, `<C-d>`,
     /// `<C-f>`, `zz`, `zl` and their kind, in Normal mode or Insert — or a
@@ -339,7 +339,7 @@ impl Default for ClientSettings {
             per_session: true,
             lazy: false,
             revive: false,
-            throttle: false,
+            throttle: true,
             predict: Predict::Auto,
             centre: Centre::Off,
             window_width: 120,
@@ -1145,7 +1145,7 @@ impl Default for SessionSettings {
             // Not a literal, for the same reason as the prefix above: the
             // prompt shows this before any config has necessarily been read.
             command: crate::launch::DEFAULT.to_string(),
-            quick_list: false,
+            quick_list: true,
         }
     }
 }
@@ -1476,14 +1476,14 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          \n\
          [session]\n\
          # command = {command}   # {{sock}} is required\n\
-         # quick_list = {quick_list}   # true lists sessions without waiting three seconds on a busy one\n\
+         # quick_list = {quick_list}   # a busy session holds a listing a quarter of a second; false waits three\n\
          \n\
          [client]\n\
          # ui             = {ui:<8}   # nvmux's own animated client, or \"nvim\" for Neovim's\n\
          # per_session    = {per_session:<8}   # keep each session's client; a switch back reuses it\n\
          # lazy           = {lazy:<8}   # start every client at launch; true waits for each session's first visit\n\
          # revive         = {revive:<8}   # true starts again, once a dropped link is back, the clients it took\n\
-         # throttle       = {throttle:<8}   # true draws a session out of sight once a second, not as it changes\n\
+         # throttle       = {throttle:<8}   # a session out of sight is drawn once a second; false draws it as it changes\n\
          # predict        = {predict:<8}   # over ssh, scrolls show before Neovim answers; \"on\" over any slow link\n\
          # centre         = {centre:<8}   # on a wide terminal, each window's text in its middle: \"smart\" or \"fixed\"\n\
          # window_width   = {window_width:<8}   # with centre on, how many columns a window's text gets; 0 for no limit\n\
@@ -2585,13 +2585,13 @@ mod tests {
         }
     }
 
-    /// A session out of sight drawn as it changes unless told otherwise; a
-    /// frame a second is a line away.
+    /// A session out of sight drawn a frame a second unless told otherwise;
+    /// as it changes is a line away.
     #[test]
-    fn a_session_out_of_sight_is_drawn_as_it_changes_unless_told() {
-        assert!(!Settings::default().client.throttle);
-        let s: Settings = toml::from_str("[client]\nthrottle = true\n").expect("valid");
-        assert!(s.client.throttle);
+    fn a_session_out_of_sight_is_drawn_once_a_second_unless_told() {
+        assert!(Settings::default().client.throttle);
+        let s: Settings = toml::from_str("[client]\nthrottle = false\n").expect("valid");
+        assert!(!s.client.throttle);
         assert!(s.client.per_session, "the rest as it was");
     }
 
@@ -2636,13 +2636,13 @@ mod tests {
         assert!(!s.client.scroll_regions, "the rest as it was");
     }
 
-    /// A listing waits on a busy session as long as it ever did unless told
-    /// otherwise; a quarter of a second is a line away.
+    /// A listing waits a quarter of a second on a busy session unless told
+    /// otherwise; three seconds is a line away.
     #[test]
-    fn a_listing_waits_on_busy_sessions_unless_told() {
-        assert!(!Settings::default().session.quick_list);
-        let s: Settings = toml::from_str("[session]\nquick_list = true\n").expect("valid");
-        assert!(s.session.quick_list);
+    fn a_listing_waits_briefly_on_busy_sessions_unless_told() {
+        assert!(Settings::default().session.quick_list);
+        let s: Settings = toml::from_str("[session]\nquick_list = false\n").expect("valid");
+        assert!(!s.session.quick_list);
         assert_eq!(
             s.session.command,
             SessionSettings::default().command,
@@ -3116,7 +3116,7 @@ mod tests {
             "# per_session    = true",
             "# lazy           = false",
             "# revive         = false",
-            "# throttle       = false",
+            "# throttle       = true",
             "# ui             = \"nvmux\"",
             "# predict        = \"auto\"",
             "# centre         = \"off\"",
@@ -3124,7 +3124,7 @@ mod tests {
             "# lean_output    = true",
             "# scroll_regions = false",
             "# partial_frames = false",
-            "# quick_list = false",
+            "# quick_list = true",
             "# color = \"terminal\"",
             "# float = true ",
             "# enabled     = true",
