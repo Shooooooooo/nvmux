@@ -1043,11 +1043,12 @@ impl View for Animator {
     }
 
     fn over_windows(&self, frame: &mut Frame, model: &Model) {
+        let cursor = self.cursor_at(model);
         if let Some(t) = &self.transition {
-            t.paint(frame, model, &|grid| self.shift_of(grid));
+            t.paint(frame, model, &|grid| self.shift_of(grid), cursor);
         }
         for s in self.switches.values() {
-            s.paint(frame, model);
+            s.paint(frame, model, cursor);
         }
     }
 }
