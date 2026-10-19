@@ -39,6 +39,14 @@
 //! absolute again. Off, every jump of the cursor is absolute and every change
 //! of the pen a reset and the whole pen.
 //!
+//! # Rows moved
+//!
+//! With `[client] scroll_regions` on (see [`Screen::set_regions`]), the rows
+//! a frame moved — a window scrolling, a line opened — are moved by the
+//! terminal before a cell is written, and the frame is diffed against the
+//! screen as that leaves it (see [`super::region`]). Off, the default, every
+//! row a frame changed is written, moved or not.
+//!
 //! # Synchronized
 //!
 //! A frame goes out inside a synchronized update (`?2026`), so the terminal
@@ -55,6 +63,7 @@ use std::io::Write as _;
 
 use super::compose::{Frame, Out};
 use super::grid::Text;
+use super::region::Bands;
 use super::style::{Color, Style, Underline};
 use crate::fade::{SYNC_BEGIN, SYNC_END};
 use crate::palette::Rgb;
@@ -79,7 +88,7 @@ const LINK_END: &[u8] = b"\x1b]8;;\x1b\\";
 /// `DECSTBM` with no margins: the scroll region the whole screen again, so
 /// that an LF scrolls only at the screen's foot, and the cursor sent home.
 /// What a frame that moves down a row by LF starts with (see [`move_to`]).
-const WHOLE_SCROLL_REGION: &[u8] = b"\x1b[r";
+pub(super) const WHOLE_SCROLL_REGION: &[u8] = b"\x1b[r";
 
 /// What the terminal shows.
 #[derive(Debug)]
@@ -100,6 +109,9 @@ pub struct Screen {
     /// Each frame in as few bytes as it takes, as from the start: see
     /// [`Screen::set_lean`].
     lean: bool,
+    /// What finds the rows a frame moved, for the terminal to move them:
+    /// none unless asked for (see [`Screen::set_regions`]).
+    bands: Option<Bands>,
 }
 
 impl Default for Screen {
@@ -117,6 +129,7 @@ impl Screen {
             color: None,
             cursor: None,
             lean: true,
+            bands: None,
         }
     }
 
@@ -127,6 +140,15 @@ impl Screen {
     /// next is the first written the new way.
     pub fn set_lean(&mut self, lean: bool) {
         self.lean = lean;
+    }
+
+    /// Have the terminal move the rows a frame moved from here on, `on`,
+    /// rather than write them again (see [`super::region`]); off, as a
+    /// screen is until told otherwise. The screen is the same either way.
+    pub fn set_regions(&mut self, on: bool) {
+        if on != self.bands.is_some() {
+            self.bands = on.then(Bands::default);
+        }
     }
 
     /// A frame done with, to put the next together in its buffer (see
@@ -142,6 +164,9 @@ impl Screen {
     pub fn invalidate(&mut self) {
         if let Some(shown) = self.shown.take() {
             self.spare = Some(shown);
+        }
+        if let Some(bands) = self.bands.as_mut() {
+            bands.forget();
         }
         self.shape = None;
         self.color = None;
@@ -193,9 +218,24 @@ impl Screen {
         // of its first move, which is a CUP.
         let head = out.len();
         let shown = self.shown.take();
-        let old = shown
-            .as_ref()
-            .filter(|old| (old.width, old.height) == (frame.width, frame.height));
+        let fits = |old: &Frame| (old.width, old.height) == (frame.width, frame.height);
+        // The rows the frame moved, moved first, and what the terminal shows
+        // made what they leave it showing (see [`super::region`]); and with
+        // that, which rows it shows already.
+        let mut moved = false;
+        let mut known = false;
+        if let Some(bands) = self.bands.as_mut() {
+            match shown.as_ref().filter(|old| fits(old)) {
+                Some(old) => {
+                    moved = bands.moved(out, old, &frame);
+                    known = true;
+                }
+                None => bands.forget(),
+            }
+        }
+        drew |= moved;
+        let bands = self.bands.as_ref().filter(|_| known);
+        let old = shown.as_ref().filter(|old| fits(old));
         let mut pen: Option<Style> = None;
         let mut at: Option<(usize, usize)> = None;
         // Whether the terminal's cursor is surely where `at` says, so that a
@@ -215,16 +255,25 @@ impl Screen {
             // A row as it was is nothing to write, as none of its cells is:
             // told apart at once, as most rows of most frames are.
             let row = r * frame.width..(r + 1) * frame.width;
-            if old.is_some_and(|old| old.cells[row.clone()] == frame.cells[row]) {
+            // What the terminal shows where the row goes, where that is known.
+            let was = match bands {
+                Some(bands) => old.map(|old| bands.was(old, r)),
+                None => old.map(|old| &old.cells[row.clone()]),
+            };
+            let same = match bands {
+                Some(bands) => bands.same()[r],
+                None => was.is_some_and(|was| *was == frame.cells[row]),
+            };
+            if same {
                 continue;
             }
             let mut c = 0;
             while c < frame.width {
                 let cell = &frame.cells[r * frame.width + c];
                 let span = if cell.wide { 2 } else { 1 };
-                let same = old.is_some_and(|old| {
+                let same = was.is_some_and(|was| {
                     (c..(c + span).min(frame.width))
-                        .all(|k| old.cells[r * frame.width + k] == frame.cells[r * frame.width + k])
+                        .all(|k| was[k] == frame.cells[r * frame.width + k])
                 });
                 // A right half is drawn with its left; one on its own is
                 // nothing to draw.
@@ -238,7 +287,7 @@ impl Screen {
                         link = 0;
                     }
                     let from = at.filter(|_| sure);
-                    fed |= move_to(out, &frame, from, (r, c), pen.as_ref(), fed);
+                    fed |= move_to(out, &frame, from, (r, c), pen.as_ref(), fed || moved);
                     sure = self.lean;
                 }
                 // The link is no part of the pen: it is the OSC 8's below.
@@ -276,8 +325,14 @@ impl Screen {
                 sure &= c < frame.width && plain(cell);
             }
         }
-        if fed {
+        // Rows moved put the region back already, ahead of every move.
+        if fed && !moved {
             out.splice(head..head, WHOLE_SCROLL_REGION.iter().copied());
+        }
+        if known {
+            if let Some(bands) = self.bands.as_mut() {
+                bands.shown();
+            }
         }
         // Whatever the frame left the pen as is not what a cell of nvmux's own
         // — the hint row, the notice — should inherit, and nor is a link.
@@ -331,11 +386,13 @@ const REWRITE_AT_MOST: usize = 3;
 /// Says whether it moved down by LF. The LF is never asked of the last row,
 /// and the frame it is in resets the scroll region ([`WHOLE_SCROLL_REGION`])
 /// before anything else, so that it moves down within the screen and never
-/// scrolls it: nothing nvmux writes sets a region, but a session drawn by
-/// Neovim's own TUI sets one for every scroll it makes, and a switch can
-/// come between that and its reset. That reset comes with the first LF of a
-/// frame, `fed` says whether it has, and that LF has to save more than it
-/// costs.
+/// scrolls it: nothing nvmux writes leaves a region set — a frame that moves
+/// rows by one puts the whole screen back before it writes a cell (see
+/// [`super::region`]) — but a session drawn by Neovim's own TUI sets one for
+/// every scroll it makes, and a switch can come between that and its reset.
+/// That reset comes with the first LF of a frame, or with the rows it moved;
+/// `fed` says whether it has come, and an LF that brings it has to save more
+/// than it costs.
 fn move_to(
     out: &mut Vec<u8>,
     frame: &Frame,
@@ -455,7 +512,7 @@ fn digits(n: usize) -> usize {
 }
 
 /// `n` in decimal.
-fn push_dec(out: &mut Vec<u8>, mut n: usize) {
+pub(super) fn push_dec(out: &mut Vec<u8>, mut n: usize) {
     let mut buf = [0u8; 20];
     let mut at = buf.len();
     loop {

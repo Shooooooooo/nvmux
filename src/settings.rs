@@ -412,6 +412,13 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
             "write each frame in fewer bytes; the screen is the same",
             switch!(client.lean_output),
         )),
+        own(row(
+            "client",
+            "scroll_regions",
+            Tab::Client,
+            "the terminal moves the rows a scroll moved; the screen is the same",
+            switch!(client.scroll_regions),
+        )),
         row(
             "style",
             "color",
