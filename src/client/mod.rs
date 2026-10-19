@@ -1206,6 +1206,27 @@ pub struct App {
     /// The window grids this attach has looked at for a width another
     /// client asked for, each once: see [`App::narrow_windows`].
     looked: HashSet<u64>,
+    /// `[client] partial_frames`: what a frame put together from only the
+    /// rows that changed needs to know of the last (see [`App::frame`]).
+    partial: Option<Partial>,
+}
+
+/// What a frame put together from only the rows that changed needs to know
+/// of the frame before it (see [`App::frame`]).
+#[derive(Debug, Default)]
+struct Partial {
+    /// When the last frame was put together, by the grids' clock (see
+    /// [`grid::tick`]): what changed after it is the next frame's.
+    at: u64,
+    /// Whether the last frame was the editor's grids where the editor put
+    /// them and nothing more (see [`Animator::still`]), and no card over it.
+    still: bool,
+    /// The rows of this frame to put together.
+    rows: Vec<bool>,
+    /// How many frames have been put together from only the rows that
+    /// changed: for the tests to know it was done at all.
+    #[cfg(test)]
+    partly: usize,
 }
 
 impl App {
@@ -1262,6 +1283,7 @@ impl App {
             cut: HashMap::new(),
             wants: BTreeMap::new(),
             looked: HashSet::new(),
+            partial: None,
         }
     }
 
@@ -1292,6 +1314,22 @@ impl App {
     pub fn with_scroll_regions(mut self, on: bool) -> Self {
         self.screen.set_regions(on);
         self
+    }
+
+    /// This client, putting each frame together from only the rows that
+    /// changed where it can if `on` (see [`App::frame`]).
+    pub fn with_partial_frames(mut self, on: bool) -> Self {
+        self.set_partial(on);
+        self
+    }
+
+    /// Put frames together from only the rows that changed from here on,
+    /// `on`, or every row of each. The next frame is put together whole
+    /// either way: nothing is known yet of the one before it.
+    fn set_partial(&mut self, on: bool) {
+        if on != self.partial.is_some() {
+            self.partial = on.then(Partial::default);
+        }
     }
 
     /// Whether each window's text is centred, as it stands: not with no
@@ -1366,7 +1404,7 @@ impl App {
         }
         if let Some(l) = laststatus {
             if self.model.laststatus != Some(l) {
-                self.model.laststatus = Some(l);
+                self.model.set_laststatus(Some(l));
                 self.dirty = true;
             }
         }
@@ -1753,6 +1791,7 @@ impl App {
         self.anim.set_effects(effects);
         self.screen.set_lean(client.lean_output);
         self.screen.set_regions(client.scroll_regions);
+        self.set_partial(client.partial_frames);
         self.dirty = true;
         if predict != predicting {
             self.predict = predict.then(|| {
@@ -3128,37 +3167,115 @@ impl App {
 
     /// The next frame's bytes, with whatever was waiting to be said ahead of
     /// it.
+    ///
+    /// With `[client] partial_frames` on, a frame put together from only the
+    /// rows that changed where it can be (see [`App::changed_rows`]): over
+    /// the frame shown, the rows of the editor's grids drawn or scrolled
+    /// since are put together again, and compared with the terminal's alone.
     pub fn frame(&mut self, now: Instant) -> Vec<u8> {
         self.anim.advance(now);
         let (w, h) = self.size;
-        // Put together in the buffer of a frame done with; and mended once,
-        // last — and before what is painted over it too, where that reads
-        // the cells under it: a card, or the cursor's smear, sparks or blink.
         self.cards.expire(now);
-        let over = self.anim.paints_over() || !self.cards.is_empty();
-        let mut frame = self.screen.take_spare();
-        compose::compose_into(&mut frame, &self.model, &self.anim, w, h, over);
-        let cursor = self.anim.paint(&mut frame, &self.model, now);
-        // Last, over everything the editor has: see [`cards`].
-        if !self.cards.is_empty() {
-            let signs = cards::Signs::of(&self.model);
-            self.cards.paint(
-                &mut frame,
-                self.model.style(0),
-                &self.model.colors(),
-                &signs,
-                now,
-            );
-        }
-        frame.mend();
+        // The frame shown, to put the rows that changed together over, where
+        // they are all that can differ (see [`App::changed_rows`]).
+        let shown = if self.changed_rows(h) {
+            self.screen.take_like_shown(w, h)
+        } else {
+            None
+        };
+        let partly = shown.is_some();
+        let (frame, cursor) = match shown {
+            Some(mut frame) => {
+                let rows = self.partial.as_ref().map_or(&[][..], |p| &p.rows);
+                compose::compose_rows(&mut frame, &self.model, &self.anim, rows);
+                // Still: nothing is painted over it, and this is the cursor.
+                let cursor = self.anim.paint(&mut frame, &self.model, now);
+                (frame, cursor)
+            }
+            None => {
+                // Put together in the buffer of a frame done with; and
+                // mended once, last — and before what is painted over it
+                // too, where that reads the cells under it: a card, or the
+                // cursor's smear, sparks or blink.
+                let over = self.anim.paints_over() || !self.cards.is_empty();
+                let mut frame = self.screen.take_spare();
+                compose::compose_into(&mut frame, &self.model, &self.anim, w, h, over);
+                let cursor = self.anim.paint(&mut frame, &self.model, now);
+                // Last, over everything the editor has: see [`cards`].
+                if !self.cards.is_empty() {
+                    let signs = cards::Signs::of(&self.model);
+                    self.cards.paint(
+                        &mut frame,
+                        self.model.style(0),
+                        &self.model.colors(),
+                        &signs,
+                        now,
+                    );
+                }
+                frame.mend();
+                (frame, cursor)
+            }
+        };
         let sync = self.model.options.termsync;
         let mut out = std::mem::take(&mut self.say);
         out.reserve(4096);
-        self.screen
-            .draw_into(&mut out, frame, &cursor, sync, self.model.links());
+        let links = self.model.links();
+        match self.partial.as_ref().filter(|_| partly) {
+            Some(p) => self
+                .screen
+                .draw_rows_into(&mut out, frame, &cursor, sync, links, &p.rows),
+            None => self.screen.draw_into(&mut out, frame, &cursor, sync, links),
+        }
+        #[cfg(test)]
+        if let Some(p) = self.partial.as_mut().filter(|_| partly) {
+            p.partly += 1;
+        }
         self.dirty = false;
         self.frame_before = self.last_frame.replace(now);
         out
+    }
+
+    /// Whether this frame is to be put together from only the rows that
+    /// changed, which it marks in [`Partial::rows`]: with `[client]
+    /// partial_frames` on, where this frame and the last are the editor's
+    /// grids and nothing more — nothing moving, held or painted over either,
+    /// no card over either — and nothing has changed since the last but the
+    /// cells of rows of grids on show. A row of the frame is changed where a
+    /// row of a grid drawn there is. Notes this frame for the next either
+    /// way.
+    fn changed_rows(&mut self, height: usize) -> bool {
+        let Some(partial) = self.partial.as_mut() else {
+            return false;
+        };
+        let since = std::mem::replace(&mut partial.at, grid::tick());
+        let still = self.anim.still() && self.cards.is_empty();
+        let was_still = std::mem::replace(&mut partial.still, still);
+        if !(still && was_still && self.model.unchanged_since(since)) {
+            return false;
+        }
+        let rows = &mut partial.rows;
+        rows.clear();
+        rows.resize(height, false);
+        let shown = self
+            .model
+            .layout
+            .iter()
+            .filter(|(grid, p)| **grid != 1 && !p.hidden)
+            .map(|(grid, _)| (*grid, self.model.drawn_origin(*grid).0));
+        for (grid, top) in std::iter::once((1, 0)).chain(shown) {
+            let Some(g) = self.model.grids.get(&grid) else {
+                continue;
+            };
+            for r in g.changed_since(since) {
+                if let Some(row) = usize::try_from(top + r as i64)
+                    .ok()
+                    .and_then(|y| rows.get_mut(y))
+                {
+                    *row = true;
+                }
+            }
+        }
+        true
     }
 
     /// Bytes for the terminal that cannot wait for a frame — the keyboard
@@ -3211,7 +3328,8 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
             usize::from(settings.client.window_width),
         )
         .with_lean_output(settings.client.lean_output)
-        .with_scroll_regions(settings.client.scroll_regions);
+        .with_scroll_regions(settings.client.scroll_regions)
+        .with_partial_frames(settings.client.partial_frames);
     app.start();
     let mut inbox = Inbox::default();
     let stdin = std::io::stdin();
@@ -3988,6 +4106,540 @@ mod tests {
         a.reconfigure(&d, t0);
         let text = scrolled(&mut a, "line 7");
         assert!(!text.contains("\x1b[M"), "{text:?}");
+    }
+
+    /// Told to, a client puts the frame after a line drawn together from
+    /// that line's row alone, once it has two frames to go on: the frame
+    /// shown and one done with. A window placed has the next put together
+    /// whole; after that, a frame with nothing changed puts no row together,
+    /// and the frame after a line drawn in the window that line's row alone.
+    #[test]
+    fn a_frame_after_a_line_is_put_together_from_its_row_alone() {
+        let t0 = Instant::now();
+        let mut a = attached(false, t0);
+        let mut d = drawing();
+        d.client.partial_frames = true;
+        a.reconfigure(&d, t0);
+        let lines = (0..5).map(|r| line(1, r, &format!("line {r}"))).collect();
+        redraw(&mut a, lines, t0);
+        a.frame(t0);
+        a.frame(t0);
+        let partly = |a: &App| a.partial.as_ref().map_or(0, |p| p.partly);
+        let rows = |a: &App| a.partial.as_ref().map(|p| p.rows.clone());
+        assert_eq!(partly(&a), 0, "two frames whole");
+
+        redraw(&mut a, vec![line(1, 2, "typed")], t0);
+        let text = String::from_utf8_lossy(&a.frame(t0)).into_owned();
+        assert_eq!(partly(&a), 1, "{text:?}");
+        assert_eq!(
+            rows(&a),
+            Some(vec![false, false, true, false, false, false])
+        );
+        assert!(text.contains("typed"), "{text:?}");
+
+        redraw(
+            &mut a,
+            vec![resize(2, 20, 2), place(2, 1000, 0, 0, 20, 2)],
+            t0,
+        );
+        a.frame(t0);
+        assert_eq!(partly(&a), 1, "a window placed");
+        let t1 = t0 + Duration::from_secs(1);
+        a.frame(t1);
+        assert_eq!(partly(&a), 2, "nothing changed");
+        assert_eq!(rows(&a), Some(vec![false; 6]));
+        redraw(&mut a, vec![line(2, 0, "in the window")], t1);
+        a.frame(t1);
+        assert_eq!(partly(&a), 3);
+        assert_eq!(
+            rows(&a),
+            Some(vec![true, false, false, false, false, false])
+        );
+    }
+
+    /// A small random walk for the tests: xorshift, the same walk for the
+    /// same seed.
+    struct Walk(u64);
+
+    impl Walk {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// A client on a terminal 30 by 12, drawing with `effects`, attached with
+    /// windows of their own; having the terminal move the rows a frame moved
+    /// if `regions`, and putting frames together from only the rows that
+    /// changed if `partial`.
+    fn thirty_by_twelve(partial: bool, effects: Effects, regions: bool, t0: Instant) -> App {
+        let mut a = App::new(palette(), effects, false, (30, 12))
+            .with_scroll_regions(regions)
+            .with_partial_frames(partial);
+        a.start();
+        let sent = calls(&mut a);
+        answer(
+            &mut a,
+            request(&sent, "nvim_get_api_info", ""),
+            Value::Array(vec![7.into()]),
+            t0,
+        );
+        answer(&mut a, asks_uis(&sent), uis(false, false), t0);
+        calls(&mut a);
+        a
+    }
+
+    /// The effects a walk of `seed` is drawn with, by turns: windows moving
+    /// alone; scrolls sliding too; the cursor smeared as well; and a cursor
+    /// that blinks.
+    fn walk_effects(seed: u64) -> Effects {
+        let mut s = crate::config::Settings::default();
+        let turn = seed % 4;
+        s.effects.scroll.enabled = turn != 1;
+        s.effects.smear.enabled = turn == 3;
+        s.effects.blink.enabled = turn == 0;
+        Effects::from_settings(&s)
+    }
+
+    /// The grids of [`random_batch`]'s editor: grid 1, two windows, a float
+    /// and the message area, each as tall and wide as it starts.
+    const WALK_GRIDS: [(u64, u64, u64); 5] =
+        [(1, 30, 12), (2, 30, 5), (3, 30, 4), (4, 10, 3), (5, 30, 2)];
+
+    /// A `grid_line` of `text` in highlight `hl` from column `col`.
+    fn line_hl(grid: u64, row: u64, col: u64, text: &str, hl: u64) -> (&'static str, Vec<Value>) {
+        let cells = text
+            .chars()
+            .enumerate()
+            .map(|(i, ch)| {
+                let mut cell = vec![Value::from(ch.to_string())];
+                if i == 0 {
+                    cell.push(hl.into());
+                }
+                Value::Array(cell)
+            })
+            .collect();
+        (
+            "grid_line",
+            vec![
+                grid.into(),
+                row.into(),
+                col.into(),
+                Value::Array(cells),
+                false.into(),
+            ],
+        )
+    }
+
+    /// The editor of [`random_batch`] as it starts: every grid placed and
+    /// drawn whole, a few highlights, and a cursor that blinks in normal
+    /// mode, a bar in insert mode.
+    fn walk_start() -> Vec<(&'static str, Vec<Value>)> {
+        let mut events = Vec::new();
+        for id in 1..5u64 {
+            events.push(hl_define(id, 0x10_2030 * id, 0x30_2010 * id, id == 3, 0));
+        }
+        let mode = |name: &str, shape: &str| {
+            Value::Map(vec![
+                ("name".into(), name.into()),
+                ("cursor_shape".into(), shape.into()),
+                ("blinkwait".into(), 300.into()),
+                ("blinkon".into(), 200.into()),
+                ("blinkoff".into(), 150.into()),
+            ])
+        };
+        let modes = vec![mode("normal", "block"), mode("insert", "vertical")];
+        events.push(("mode_info_set", vec![true.into(), Value::Array(modes)]));
+        events.push(("mode_change", vec!["normal".into(), 0.into()]));
+        for &(grid, width, height) in &WALK_GRIDS {
+            events.push(resize(grid, width, height));
+        }
+        events.push(place(2, 1000, 0, 0, 30, 5));
+        events.push(place(3, 1001, 6, 0, 30, 4));
+        events.push(float_at(4, 2, 8, 50));
+        events.push(msg_at(5, 10, false));
+        for &(grid, width, height) in &WALK_GRIDS {
+            for r in 0..height {
+                let text: String = (0..width)
+                    .map(|c| ['a', 'b', ' ', '~'][((grid + r + c) % 4) as usize])
+                    .collect();
+                events.push(line_hl(grid, r, 0, &text, (grid + r) % 5));
+            }
+        }
+        events
+    }
+
+    fn hl_define(id: u64, fg: u64, bg: u64, bold: bool, blend: u64) -> (&'static str, Vec<Value>) {
+        let rgb = Value::Map(vec![
+            ("foreground".into(), fg.into()),
+            ("background".into(), bg.into()),
+            ("bold".into(), bold.into()),
+            ("blend".into(), blend.into()),
+        ]);
+        (
+            "hl_attr_define",
+            vec![id.into(), rgb, Value::Map(vec![]), Value::Array(vec![])],
+        )
+    }
+
+    fn float_at(grid: u64, row: i64, col: i64, zindex: i64) -> (&'static str, Vec<Value>) {
+        (
+            "win_float_pos",
+            vec![
+                grid.into(),
+                1002.into(),
+                "NW".into(),
+                1.into(),
+                row.into(),
+                col.into(),
+                true.into(),
+                zindex.into(),
+                1.into(),
+                row.into(),
+                col.into(),
+            ],
+        )
+    }
+
+    fn msg_at(grid: u64, row: u64, scrolled: bool) -> (&'static str, Vec<Value>) {
+        (
+            "msg_set_pos",
+            vec![
+                grid.into(),
+                row.into(),
+                scrolled.into(),
+                "-".into(),
+                200.into(),
+                2.into(),
+            ],
+        )
+    }
+
+    /// One batch of what an editor does, at random: lines drawn, regions
+    /// and windows scrolled, grids cleared, windows and floats moved or
+    /// hidden and placed again, highlights and the default colours defined,
+    /// the message area moved, the cursor and the mode moved, an option set.
+    fn random_batch(w: &mut Walk) -> Vec<(&'static str, Vec<Value>)> {
+        let mut events = Vec::new();
+        for _ in 0..1 + w.below(3) {
+            let (grid, width, height) = WALK_GRIDS[w.below(5) as usize];
+            match w.below(28) {
+                0..=1 if width > 2 => {
+                    // A character two cells wide, which a float's edge may
+                    // cut in two.
+                    let (row, col) = (w.below(height), w.below(width - 1));
+                    let cells = vec![
+                        Value::Array(vec!["中".into(), w.below(5).into()]),
+                        Value::Array(vec!["".into()]),
+                    ];
+                    events.push((
+                        "grid_line",
+                        vec![
+                            grid.into(),
+                            row.into(),
+                            col.into(),
+                            Value::Array(cells),
+                            false.into(),
+                        ],
+                    ));
+                }
+                0..=13 => {
+                    let row = w.below(height);
+                    let col = w.below(width);
+                    let n = 1 + w.below(8).min(width - col - 1);
+                    let text: String = (0..n)
+                        .map(|_| ['a', 'b', ' ', '~', 'z'][w.below(5) as usize])
+                        .collect();
+                    events.push(line_hl(grid, row, col, &text, w.below(5)));
+                }
+                14..=16 if height > 2 => {
+                    let top = w.below(height - 1);
+                    let bot = top + 2 + w.below(height - top - 1);
+                    let bot = bot.min(height);
+                    let rows = 1 + w.below(bot - top - 1);
+                    let rows = if w.below(2) == 0 {
+                        rows as i64
+                    } else {
+                        -(rows as i64)
+                    };
+                    events.push((
+                        "grid_scroll",
+                        vec![
+                            grid.into(),
+                            top.into(),
+                            bot.into(),
+                            0.into(),
+                            width.into(),
+                            rows.into(),
+                            0.into(),
+                        ],
+                    ));
+                    let fresh = if rows > 0 {
+                        bot - rows as u64..bot
+                    } else {
+                        top..top + rows.unsigned_abs()
+                    };
+                    for r in fresh {
+                        events.push(line_hl(grid, r, 0, &"x".repeat(width as usize), w.below(5)));
+                    }
+                }
+                17 => events.push(("grid_clear", vec![grid.into()])),
+                18 => {
+                    let row = w.below(7);
+                    events.push(place(2, 1000, row, 0, 30, 5));
+                }
+                // Now and then over the edge of grid 1, on a terminal
+                // wider than it.
+                19 => events.push(float_at(
+                    4,
+                    w.below(10) as i64,
+                    w.below(25) as i64,
+                    40 + w.below(20) as i64,
+                )),
+                20 => events.push(hl_define(
+                    1 + w.below(4),
+                    w.next() & 0xff_ffff,
+                    w.next() & 0xff_ffff,
+                    w.below(2) == 0,
+                    w.below(3) * 30,
+                )),
+                21 | 22 => events.push((
+                    "grid_cursor_goto",
+                    vec![grid.into(), w.below(height).into(), w.below(width).into()],
+                )),
+                23 => events.push((
+                    "mode_change",
+                    vec![
+                        ["normal", "insert"][w.below(2) as usize].into(),
+                        w.below(2).into(),
+                    ],
+                )),
+                24 => {
+                    if w.below(2) == 0 {
+                        events.push(("win_hide", vec![3.into()]));
+                    } else {
+                        events.push(place(3, 1001, 6, 0, 30, 4));
+                    }
+                }
+                25 if w.below(3) == 0 => events.push(msg_at(5, 9 + w.below(2), w.below(2) == 0)),
+                25 if w.below(2) == 0 => events.push((
+                    "option_set",
+                    vec!["termguicolors".into(), (w.below(2) == 0).into()],
+                )),
+                26 | 27 => {
+                    // A window scrolled as Neovim scrolls one: its view
+                    // moved, its rows with it, and the rows it scrolled to
+                    // drawn.
+                    let (grid, win, height) = [(2, 1000, 5), (3, 1001, 4)][w.below(2) as usize];
+                    let rows = 1 + w.below(height - 1) as i64;
+                    let rows = if w.below(2) == 0 { rows } else { -rows };
+                    let view = [10, 10 + height as i64, 10, 0, 100, rows];
+                    let mut args = vec![grid.into(), win.into()];
+                    args.extend(view.map(Value::from));
+                    events.push(("win_viewport", args));
+                    events.push((
+                        "grid_scroll",
+                        vec![
+                            grid.into(),
+                            0.into(),
+                            height.into(),
+                            0.into(),
+                            30.into(),
+                            rows.into(),
+                            0.into(),
+                        ],
+                    ));
+                    let fresh = if rows > 0 {
+                        height - rows as u64..height
+                    } else {
+                        0..rows.unsigned_abs()
+                    };
+                    for r in fresh {
+                        events.push(line_hl(grid, r, 0, &"y".repeat(30), w.below(5)));
+                    }
+                }
+                _ => events.push((
+                    "default_colors_set",
+                    vec![
+                        (w.next() & 0xff_ffff).into(),
+                        (w.next() & 0xff_ffff).into(),
+                        (-1).into(),
+                        0.into(),
+                        0.into(),
+                    ],
+                )),
+            }
+        }
+        events
+    }
+
+    /// Whatever the editor does, a client putting each frame together from
+    /// only the rows that changed writes what one putting every row together
+    /// writes, frame for frame: over a random walk of what an editor does
+    /// (see [`random_batch`]), with frames drawn as often as not between the
+    /// batches and time going on as unevenly — through windows moving,
+    /// scrolls sliding and the cursor smeared or blinking, and still between
+    /// — the terminal resized now and then, to sizes grid 1 covers and one
+    /// it does not, and cards coming and going over it; with the terminal
+    /// moving the rows a frame moved, and without. Hundreds of the frames
+    /// are put together in part, with each effect but the blink, which
+    /// paints over every frame.
+    #[test]
+    fn partial_frames_write_what_whole_frames_write() {
+        let mut partly = [0; 4];
+        for seed in 1..=8u64 {
+            let mut w = Walk(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let mut t = Instant::now();
+            let regions = seed > 4;
+            let mut whole = thirty_by_twelve(false, walk_effects(seed), regions, t);
+            let mut part = thirty_by_twelve(true, walk_effects(seed), regions, t);
+            redraw(&mut whole, walk_start(), t);
+            redraw(&mut part, walk_start(), t);
+            for step in 0..1000 {
+                let batch = random_batch(&mut w);
+                redraw(&mut whole, batch.clone(), t);
+                redraw(&mut part, batch, t);
+                if w.below(3) != 0 {
+                    let (a, b) = (whole.frame(t), part.frame(t));
+                    assert_eq!(
+                        String::from_utf8_lossy(&a),
+                        String::from_utf8_lossy(&b),
+                        "seed {seed}, step {step}"
+                    );
+                }
+                if w.below(40) == 0 {
+                    let size = [(30, 12), (28, 11), (32, 13)][w.below(3) as usize];
+                    whole.resized(size);
+                    part.resized(size);
+                }
+                if w.below(100) == 0 {
+                    // A card over the screen, for a moment. (One that leaves
+                    // its mark stays over every frame after, all of them put
+                    // together whole.)
+                    let card = crate::card::Card {
+                        life_ms: 600,
+                        fade_ms: 0,
+                        ..crate::card::Card::news(
+                            step,
+                            crate::card::Kind::Finished,
+                            "s",
+                            "done",
+                            3,
+                            "",
+                        )
+                    }
+                    .leaving(None);
+                    let show = crate::card::encode(&crate::card::Command::Show(card));
+                    whole.keys(&show, t);
+                    part.keys(&show, t);
+                }
+                t += Duration::from_millis(if w.below(10) == 0 {
+                    400
+                } else {
+                    5 + w.below(40)
+                });
+            }
+            partly[(seed % 4) as usize] += part.partial.as_ref().map_or(0, |p| p.partly);
+        }
+        assert!(
+            partly[1..].iter().all(|&n| n > 150),
+            "{partly:?} frames put together in part"
+        );
+    }
+
+    /// The same `events`, and then the same `keys`, to a client putting
+    /// every frame together whole and to one putting frames together from
+    /// only the rows that changed, and the same frame of each: how many of
+    /// the second's have been put together in part.
+    fn both(
+        whole: &mut App,
+        part: &mut App,
+        events: Vec<(&'static str, Vec<Value>)>,
+        keys: &[u8],
+        t: Instant,
+    ) -> usize {
+        for a in [&mut *whole, &mut *part] {
+            if !events.is_empty() {
+                redraw(a, events.clone(), t);
+            }
+            a.keys(keys, t);
+        }
+        let (a, b) = (whole.frame(t), part.frame(t));
+        assert_eq!(String::from_utf8_lossy(&a), String::from_utf8_lossy(&b));
+        part.partial.as_ref().map_or(0, |p| p.partly)
+    }
+
+    /// A view the client has moved ahead of Neovim, down or sideways, is not
+    /// the editor's grids where the editor put them, though nothing moves:
+    /// told to put frames together from only the rows that changed, a client
+    /// puts every frame together whole while it is ahead — and writes what
+    /// one putting every frame together whole writes — and in part again
+    /// once Neovim has caught up, or the view has gone back.
+    #[test]
+    fn frames_ahead_of_neovim_are_put_together_whole() {
+        let rtt = Duration::from_millis(200);
+        let mut whole = predicting(rtt);
+        let mut part = predicting(rtt).with_partial_frames(true);
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let ms = |n: u64| t1 + Duration::from_millis(n);
+        let status = |text: &str| vec![line(1, 5, text)];
+        both(&mut whole, &mut part, vec![], b"", t1);
+        both(&mut whole, &mut part, vec![], b"", t1);
+        assert_eq!(both(&mut whole, &mut part, status("one"), b"", ms(10)), 1);
+
+        // Down three, ahead of Neovim.
+        assert_eq!(
+            both(&mut whole, &mut part, vec![], b"\x1b[<65;3;2M", ms(20)),
+            1
+        );
+        assert_ne!(part.anim.ahead(2), (0, 0));
+        assert_eq!(top_row(&part), "line 3");
+        assert_eq!(both(&mut whole, &mut part, status("two"), b"", ms(30)), 1);
+        // Neovim's scroll, when it comes.
+        let mut events = vec![
+            (
+                "grid_scroll",
+                vec![
+                    2.into(),
+                    0.into(),
+                    5.into(),
+                    0.into(),
+                    20.into(),
+                    3.into(),
+                    0.into(),
+                ],
+            ),
+            at(3, 3, 3),
+        ];
+        events.extend((2..5).map(|r| line(2, r, &format!("line {}", r + 3))));
+        both(&mut whole, &mut part, events, b"", ms(220));
+        assert_eq!(part.anim.ahead(2), (0, 0));
+        assert_eq!(
+            both(&mut whole, &mut part, status("three"), b"", ms(230)),
+            2
+        );
+
+        // Sideways, ahead of Neovim.
+        assert_eq!(
+            both(&mut whole, &mut part, vec![], b"\x1b[<67;3;2M", ms(240)),
+            2
+        );
+        assert_eq!(part.anim.ahead(2), (0, 0));
+        assert!(part.anim.side_left(2).is_some());
+        assert_eq!(both(&mut whole, &mut part, status("four"), b"", ms(250)), 2);
+        // Neovim never moved it: the view goes back.
+        both(&mut whole, &mut part, vec![], b"", ms(5000));
+        assert_eq!(part.anim.side_left(2), None);
+        assert_eq!(
+            both(&mut whole, &mut part, status("five"), b"", ms(5010)),
+            3
+        );
     }
 
     /// Settings come in the card's way, in the client's input, and go to the

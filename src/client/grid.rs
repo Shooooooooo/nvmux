@@ -20,7 +20,20 @@
 //! with the rest of its row at the new width: it has no room for a character
 //! two cells wide in a row's last column.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use super::redraw::LineCell;
+
+/// The client's clock for changes: what each grid's rows, and the rest of
+/// the model, are stamped with as they change (see [`Grid::changed_since`]).
+static CLOCK: AtomicU64 = AtomicU64::new(1);
+
+/// A moment later than every one before it, in every grid and model: what a
+/// change is stamped with, and what a frame notes as the moment it was put
+/// together.
+pub fn tick() -> u64 {
+    CLOCK.fetch_add(1, Ordering::Relaxed)
+}
 
 /// What one cell shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,7 +96,7 @@ impl Default for Cell {
 }
 
 /// A grid of cells, row-major.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Grid {
     width: usize,
     height: usize,
@@ -96,17 +109,51 @@ pub struct Grid {
     /// another UI has drawn.
     drawn: Vec<bool>,
     undrawn: usize,
+    /// When each row last changed, by [`tick`]: what a frame put together
+    /// from the rows that changed alone reads (see `super::App::frame`).
+    stamps: Vec<u64>,
+    /// When the grid last changed size.
+    shaped: u64,
 }
+
+/// Grids are the same where their cells are: when each changed is no part
+/// of what they show.
+impl PartialEq for Grid {
+    fn eq(&self, other: &Self) -> bool {
+        (self.width, self.height, self.undrawn) == (other.width, other.height, other.undrawn)
+            && self.cells == other.cells
+            && self.drawn == other.drawn
+    }
+}
+
+impl Eq for Grid {}
 
 impl Grid {
     pub fn new(width: usize, height: usize) -> Self {
+        let now = tick();
         Self {
             width,
             height,
             cells: vec![Cell::default(); width * height],
             drawn: vec![false; width * height],
             undrawn: width * height,
+            stamps: vec![now; height],
+            shaped: now,
         }
+    }
+
+    /// The rows that have changed since the moment `since`, by [`tick`].
+    pub fn changed_since(&self, since: u64) -> impl Iterator<Item = usize> + '_ {
+        self.stamps
+            .iter()
+            .enumerate()
+            .filter(move |(_, stamp)| **stamp > since)
+            .map(|(r, _)| r)
+    }
+
+    /// Whether the grid has changed size since the moment `since`.
+    pub fn shaped_since(&self, since: u64) -> bool {
+        self.shaped > since
     }
 
     /// Whether Neovim has drawn every cell of it since the client made it.
@@ -150,6 +197,9 @@ impl Grid {
         self.cells = cells;
         self.undrawn = drawn.iter().filter(|d| !**d).count();
         self.drawn = drawn;
+        let now = tick();
+        self.stamps = vec![now; height];
+        self.shaped = now;
     }
 
     /// Every cell blank, in the default highlight.
@@ -157,6 +207,7 @@ impl Grid {
         self.cells.fill(Cell::default());
         self.drawn.fill(true);
         self.undrawn = 0;
+        self.stamps.fill(tick());
     }
 
     /// Row `r`, or nothing past the last.
@@ -186,6 +237,7 @@ impl Grid {
         if row >= self.height || col >= self.width {
             return;
         }
+        self.stamps[row] = tick();
         let base = row * self.width;
         let mut c = col;
         let mut hl = 0;
@@ -234,6 +286,7 @@ impl Grid {
         if n >= bot - top {
             return;
         }
+        self.stamps[top..bot].fill(tick());
         // Of a grid drawn whole, every cell is drawn wherever it goes.
         let marked = self.undrawn > 0;
         let mut copy_row = |to: usize, from: usize| {
@@ -580,5 +633,35 @@ mod tests {
             })
             .collect();
         assert_eq!(text, vec!["ef", "hi"]);
+    }
+
+    /// Each row is stamped as it changes, by a line, a scroll of the rows
+    /// it moves, a clear of every row, and a resize, which is a change of
+    /// shape besides; what does not change a row stamps nothing.
+    #[test]
+    fn rows_are_stamped_as_they_change() {
+        let mut g = Grid::new(4, 4);
+        let changed = |g: &Grid, since| g.changed_since(since).collect::<Vec<_>>();
+        let t = tick();
+        assert_eq!(changed(&g, t), Vec::<usize>::new());
+        g.put(2, 0, &[run("a", Some(1), 2)]);
+        assert_eq!(changed(&g, t), vec![2]);
+        g.put(9, 0, &[run("a", Some(1), 2)]);
+        assert_eq!(changed(&g, t), vec![2], "a line past the last row");
+        let t = tick();
+        g.scroll(1, 4, 0, 4, 1);
+        assert_eq!(changed(&g, t), vec![1, 2, 3]);
+        g.scroll(0, 1, 0, 4, 1);
+        assert_eq!(changed(&g, t), vec![1, 2, 3], "a scroll of nothing");
+        let t = tick();
+        g.clear();
+        assert_eq!(changed(&g, t), vec![0, 1, 2, 3]);
+        let t = tick();
+        g.resize(4, 4);
+        assert!(!g.shaped_since(t), "the same size");
+        assert_eq!(changed(&g, t), Vec::<usize>::new());
+        g.resize(3, 2);
+        assert!(g.shaped_since(t));
+        assert_eq!(changed(&g, t), vec![0, 1]);
     }
 }

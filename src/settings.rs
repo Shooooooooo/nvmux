@@ -419,6 +419,13 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
             "the terminal moves the rows a scroll moved; the screen is the same",
             switch!(client.scroll_regions),
         )),
+        own(row(
+            "client",
+            "partial_frames",
+            Tab::Client,
+            "put a frame together from the rows that changed alone; the screen is the same",
+            switch!(client.partial_frames),
+        )),
         row(
             "style",
             "color",

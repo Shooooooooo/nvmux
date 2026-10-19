@@ -92,6 +92,9 @@ pub struct Bands {
     /// Whether the terminal shows each row of the frame being drawn already,
     /// as the bands moved leave it.
     same: Vec<bool>,
+    /// Whether each row of the frame being drawn is the row of the frame
+    /// shown where it is, before any band moved.
+    equal: Vec<bool>,
     /// For each row of the screen, the row of the frame shown that the
     /// terminal shows there once the bands have moved: [`EMPTIED`] where a
     /// scroll emptied it.
@@ -118,8 +121,16 @@ impl Bands {
     /// terminal shows and of the same size, had them a few rows off: the
     /// bytes that move them onto the end of `out`. Says whether it moved any.
     /// After it, [`Bands::was`] says what the terminal shows in each row, and
-    /// [`Bands::same`] whether that is the row `new` has there already.
-    pub fn moved(&mut self, out: &mut Vec<u8>, old: &Frame, new: &Frame) -> bool {
+    /// [`Bands::same`] whether that is the row `new` has there already. Rows
+    /// `changed` says did not change are taken as `old`'s without a look,
+    /// where it says any.
+    pub fn moved(
+        &mut self,
+        out: &mut Vec<u8>,
+        old: &Frame,
+        new: &Frame,
+        changed: Option<&[bool]>,
+    ) -> bool {
         let h = new.height;
         self.map.clear();
         self.map.extend(0..h as u32);
@@ -127,7 +138,12 @@ impl Bands {
             self.blank = vec![Out::blank(Style::default()); new.width];
         }
         self.same.clear();
-        self.same.extend((0..h).map(|r| row(old, r) == row(new, r)));
+        self.same.extend(
+            (0..h)
+                .map(|r| changed.is_some_and(|changed| !changed[r]) || row(old, r) == row(new, r)),
+        );
+        self.equal.clear();
+        self.equal.extend_from_slice(&self.same);
         let changed = self.same.iter().filter(|same| !**same).count();
         if self.prints.len() != h {
             if changed < MIN_CHANGED {
@@ -174,6 +190,12 @@ impl Bands {
     /// terminal shows it already.
     pub fn same(&self) -> &[bool] {
         &self.same
+    }
+
+    /// For each row of the frame [`Bands::moved`] was last given, whether it
+    /// is the row of the frame shown where it is, as before any band moved.
+    pub fn equal(&self) -> &[bool] {
+        &self.equal
     }
 
     /// What the terminal shows in row `r`, once the bands [`Bands::moved`]
@@ -611,7 +633,7 @@ mod tests {
         up.extend([String::new(), String::new(), "message".to_string()]);
         let up = frame(&refs(&up));
         let mut bands = Bands::default();
-        assert!(bands.moved(&mut Vec::new(), &before, &up));
+        assert!(bands.moved(&mut Vec::new(), &before, &up, None));
         for r in 0..7 {
             assert_eq!(bands.was(&before, r), row(&before, r + 2), "row {r}");
         }
@@ -625,7 +647,7 @@ mod tests {
         down.push("message".to_string());
         let down = frame(&refs(&down));
         let mut bands = Bands::default();
-        assert!(bands.moved(&mut Vec::new(), &before, &down));
+        assert!(bands.moved(&mut Vec::new(), &before, &down, None));
         for r in 0..2 {
             assert!(bands.was(&before, r).iter().all(|c| *c == blank), "row {r}");
         }
