@@ -54,7 +54,7 @@ use crate::client::compose::{self, Frame, Out};
 use crate::client::grid::{Cell, Grid, Text};
 use crate::client::model::{Held, Model, Place};
 use crate::client::redraw::Event;
-use crate::client::style::Colors;
+use crate::client::style::{Colors, Underline};
 use crate::palette::Rgb;
 
 /// animate.nvim's resize runs at 30 frames a second and moves an edge by a
@@ -1210,8 +1210,15 @@ impl Transition {
     /// them.
     /// Draw the windows as they are this frame, each window's text `shift`
     /// columns from where it goes in it, on its way there (see
-    /// `super::Animator::insets`).
-    pub fn paint(&self, frame: &mut Frame, model: &Model, shift: &dyn Fn(u64) -> i64) {
+    /// `super::Animator::insets`); the cursor at `cursor` (see
+    /// [`fade_cell`]).
+    pub fn paint(
+        &self,
+        frame: &mut Frame,
+        model: &Model,
+        shift: &dyn Fn(u64) -> i64,
+        cursor: (i64, i64),
+    ) {
         let e = self.progress();
         let colors = model.colors();
         let now = self.frames_at(e);
@@ -1248,11 +1255,18 @@ impl Transition {
         if let Some((grid, bg)) = self.veil {
             if let Some((_, pane)) = self.wins.get(&grid) {
                 let to = colors.visual_bg(&model.style(bg));
-                fade(frame, &colors, pane.grid(now[&grid]), to, percent(e));
+                fade(
+                    frame,
+                    &colors,
+                    pane.grid(now[&grid]),
+                    to,
+                    percent(e),
+                    cursor,
+                );
             }
         }
         for (g, at) in &ghosts {
-            g.paint(frame, model, &colors, at, e);
+            g.paint(frame, model, &colors, at, e, cursor);
         }
     }
 }
@@ -1460,12 +1474,12 @@ fn longest_run(cells: &[Cell]) -> Option<(usize, usize)> {
 }
 
 /// Every cell of `area` moved towards `to`, keeping `keep` percent of its
-/// own colours.
-fn fade(frame: &mut Frame, colors: &Colors, area: Area, to: Rgb, keep: u8) {
+/// own colours; the cursor at `cursor` (see [`fade_cell`]).
+fn fade(frame: &mut Frame, colors: &Colors, area: Area, to: Rgb, keep: u8, cursor: (i64, i64)) {
     for r in area.top..area.bottom {
         for c in area.left..area.right {
             if let Some(cell) = frame.at(r, c) {
-                fade_cell(colors, cell, to, keep);
+                fade_cell(colors, cell, to, keep, (r, c) == cursor);
             }
         }
     }
@@ -1473,12 +1487,36 @@ fn fade(frame: &mut Frame, colors: &Colors, area: Area, to: Rgb, keep: u8) {
 
 /// A cell moved towards `to`, keeping `keep` percent of its colours — and
 /// with none of them kept, a blank in `to` rather than text nobody can see.
-pub(super) fn fade_cell(colors: &Colors, cell: &mut Out, to: Rgb, keep: u8) {
+///
+/// A blank already in `to` shows the same at every step of the way, and is
+/// left as it is: its text's colour is seen nowhere but in a line under,
+/// over or through it, or in a link's underline under the mouse. Moved
+/// towards `to` with the rest, it would be written again every frame for a
+/// colour nobody sees: a window's blanks, most of it. Not so the cell under
+/// the cursor (`cursor`), as a terminal may draw a block cursor in the
+/// colour of the text under it.
+pub(super) fn fade_cell(colors: &Colors, cell: &mut Out, to: Rgb, keep: u8, cursor: bool) {
+    if !cursor && unseen(colors, cell, to) {
+        return;
+    }
     compose::fade_to(colors, &mut cell.style, to, keep);
     if keep == 0 {
         cell.text = Text::Char(' ');
         cell.wide = false;
     }
+}
+
+/// Whether a fade towards `to` leaves nothing to see changed in `cell`: a
+/// blank whose background is `to` already, and whose text's colour shows
+/// nowhere (see [`fade_cell`]).
+fn unseen(colors: &Colors, cell: &Out, to: Rgb) -> bool {
+    let s = &cell.style;
+    cell.text == Text::Char(' ')
+        && s.underline == Underline::None
+        && !s.strikethrough
+        && !s.overline
+        && s.link == 0
+        && colors.visual_bg(s) == to
 }
 
 /// The ghosts of windows closed, and the layout as it was, which they fly
@@ -1631,8 +1669,17 @@ impl Ghosts {
 impl Ghost {
     /// Draw it where `at` has it at progress `e`: what the closed windows
     /// showed, its text dimmed that far into its background, and the line
-    /// along its edge at full strength.
-    fn paint(&self, frame: &mut Frame, model: &Model, colors: &Colors, at: &Spot, e: f32) {
+    /// along its edge at full strength; the cursor at `cursor` (see
+    /// [`fade_cell`]).
+    fn paint(
+        &self,
+        frame: &mut Frame,
+        model: &Model,
+        colors: &Colors,
+        at: &Spot,
+        e: f32,
+        cursor: (i64, i64),
+    ) {
         let keep = percent(1.0 - e);
         let out = |cell: &Cell, wide: bool| Out {
             text: cell.text.clone(),
@@ -1667,7 +1714,7 @@ impl Ghost {
                     Some((cell, next)) => {
                         *o = out(cell, next.is_some_and(|n| n.text == Text::Half));
                         let own = colors.visual_bg(&o.style);
-                        fade_cell(colors, o, own, keep);
+                        fade_cell(colors, o, own, keep, (r, c) == cursor);
                     }
                     None => *o = Out::blank(model.style(self.bg)),
                 }
@@ -1685,6 +1732,7 @@ mod tests {
     use crate::client::compose::View;
     use crate::client::model::Changes;
     use crate::client::redraw::LineCell;
+    use crate::client::style::{Color, Style};
     use crate::palette::Palette;
 
     fn area(top: i64, bottom: i64, left: i64, right: i64) -> Area {
@@ -2250,5 +2298,223 @@ mod tests {
         let events = (0..4).map(|r| line(2, r, 0, &"d".repeat(21))).collect();
         s.switched(events, &[2, 2, 2, 2]);
         assert!(s.anim.switches.is_empty());
+    }
+
+    /// Every cell a fade leaves alone looks as it would have moved towards
+    /// the colour with the rest — a blank already in it, a line nowhere
+    /// under, over or through it, no link — and every other cell is moved
+    /// as ever, the one under the cursor too: over every mix of text,
+    /// colours, reverse, lines and links, at every strength.
+    #[test]
+    fn a_fade_leaves_alone_only_blanks_it_would_change_nothing_seen_in() {
+        let colors = Colors {
+            rgb: true,
+            defaults: crate::client::style::DefaultColors {
+                rgb_fg: Some(0xffffff),
+                rgb_bg: Some(0x000000),
+                ..Default::default()
+            },
+            term: Palette {
+                fg: Rgb(255, 255, 255),
+                bg: Rgb(0, 0, 0),
+                ansi: [Rgb(0, 0, 0); 16],
+            },
+        };
+        let grey = Color::Rgb(Rgb(40, 40, 40));
+        // What a cell shows: its text and background, and where its text's
+        // colour can be seen, that and everything drawn in it.
+        let looks = |o: &Out| {
+            let s = &o.style;
+            let fg_shows = o.text != Text::Char(' ')
+                || s.underline != Underline::None
+                || s.strikethrough
+                || s.overline
+                || s.link != 0;
+            let fg = fg_shows.then(|| {
+                (
+                    colors.visual_fg(s),
+                    colors.visual_sp(s),
+                    s.underline,
+                    (s.bold, s.italic, s.dim, s.strikethrough, s.overline),
+                    s.link,
+                )
+            });
+            (o.text.clone(), o.wide, colors.visual_bg(s), fg)
+        };
+        // A blank and a letter, in every mix of colours, reverse, and what
+        // is drawn in the text's colour.
+        let mut styles = Vec::new();
+        for fg in [Color::Default, Color::Rgb(Rgb(10, 200, 30))] {
+            for bg in [Color::Default, Color::Rgb(Rgb(0, 0, 0)), grey] {
+                for reverse in [false, true] {
+                    for underline in [Underline::None, Underline::Line, Underline::Curl] {
+                        styles.push(Style {
+                            fg,
+                            bg,
+                            reverse,
+                            underline,
+                            ..Style::default()
+                        });
+                    }
+                    for (strikethrough, overline, link) in
+                        [(true, false, 0), (false, true, 0), (false, false, 1)]
+                    {
+                        styles.push(Style {
+                            fg,
+                            bg,
+                            reverse,
+                            strikethrough,
+                            overline,
+                            link,
+                            ..Style::default()
+                        });
+                    }
+                }
+            }
+        }
+        let cells = styles.iter().flat_map(|&style| {
+            [' ', 'x'].map(|c| Out {
+                text: Text::Char(c),
+                style,
+                wide: false,
+            })
+        });
+        let mut left_alone = 0;
+        for cell in cells {
+            for to in [Rgb(0, 0, 0), Rgb(40, 40, 40)] {
+                for keep in [0, 37, 100] {
+                    // As every cell was moved before.
+                    let mut was = cell.clone();
+                    compose::fade_to(&colors, &mut was.style, to, keep);
+                    if keep == 0 {
+                        was.text = Text::Char(' ');
+                    }
+                    for cursor in [false, true] {
+                        let mut now = cell.clone();
+                        fade_cell(&colors, &mut now, to, keep, cursor);
+                        let case = format!("{cell:?} to {to:?} keep {keep} cursor {cursor}");
+                        if !cursor && unseen(&colors, &cell, to) {
+                            left_alone += 1;
+                            assert_eq!(now, cell, "{case}: left as it was");
+                        } else {
+                            assert_eq!(now, was, "{case}: moved as ever");
+                        }
+                        assert_eq!(looks(&now), looks(&was), "{case}");
+                    }
+                }
+            }
+        }
+        assert!(left_alone > 0, "some blanks were left alone");
+    }
+
+    /// A window whose rows are `first` and then blanks, cursor on `cursor`,
+    /// switching to rows of `then`: the scene, settled before the switch.
+    fn switching(first: char, then: char, cursor: (usize, usize)) -> Scene {
+        let mut s = Scene::new(Options::default());
+        s.model.apply(
+            Event::DefaultColors(crate::client::style::DefaultColors {
+                rgb_fg: Some(0xffffff),
+                rgb_bg: Some(0x000000),
+                ..Default::default()
+            }),
+            &mut Changes::default(),
+        );
+        s.model.apply(
+            Event::OptionSet {
+                name: "termguicolors".into(),
+                value: crate::client::redraw::OptionValue::Bool(true),
+            },
+            &mut Changes::default(),
+        );
+        let rows = |c: char| (0..4).map(move |r| line(2, r, 0, &format!("{c}{:20}", "")));
+        let mut events: Vec<Event> = rows(first).collect();
+        events.push(Event::GridCursor {
+            grid: 2,
+            row: cursor.0,
+            col: cursor.1,
+        });
+        s.batch(events);
+        s.settle();
+        s.switched(rows(then).collect(), &[2]);
+        assert_eq!(s.anim.switches.len(), 1, "a switch fades");
+        s
+    }
+
+    /// A buffer switch leaves the window's blanks as they are throughout,
+    /// the frame after it included, but for the one the cursor is on.
+    #[test]
+    fn a_buffer_switch_leaves_the_blanks_as_they_are_but_the_cursors() {
+        let mut s = switching('a', 'c', (1, 5));
+        let frame = |s: &mut Scene, ms: u64| {
+            s.anim.advance(s.now + Duration::from_millis(ms));
+            compose::compose(&s.model, &s.anim, W, H)
+        };
+        let after = frame(&mut s, 1000);
+        assert!(s.anim.switches.is_empty(), "settled");
+        let mut s = switching('a', 'c', (1, 5));
+        for ms in (0..=200).step_by(10) {
+            let f = frame(&mut s, ms);
+            for r in 0..4 {
+                for c in 1..W {
+                    let (now, then) = (f.get(r, c), after.get(r, c));
+                    if (r, c) == (1, 5) {
+                        if (20..180).contains(&ms) {
+                            assert_ne!(now, then, "the cursor's blank fades at {ms} ms");
+                        }
+                    } else {
+                        assert_eq!(now, then, "row {r} column {c} at {ms} ms");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drawn on a terminal, a buffer switch's frames write the text that
+    /// fades and none of the blanks round it.
+    #[test]
+    fn a_buffer_switch_writes_no_blanks() {
+        use crate::client::screen::{Cursor, Screen};
+        let cursor = Cursor {
+            visible: false,
+            row: 0,
+            col: 0,
+            shape: 2,
+            color: None,
+        };
+        // What a terminal prints of `bytes`: everything but escapes.
+        let printed = |bytes: &[u8]| {
+            let mut text = Vec::new();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'[') {
+                    i += 2;
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                } else if bytes[i] >= b' ' {
+                    text.push(bytes[i]);
+                }
+                i += 1;
+            }
+            String::from_utf8_lossy(&text).into_owned()
+        };
+        let mut s = switching('a', 'c', (0, 0));
+        let mut screen = Screen::new();
+        // The window as it was, before the switch: what the terminal shows.
+        let before = {
+            let mut s = switching('a', 'a', (0, 0));
+            s.anim.switches.clear();
+            compose::compose(&s.model, &s.anim, W, H)
+        };
+        screen.draw(before, &cursor, false, &[]);
+        let mut wrote = String::new();
+        for ms in (0..=240).step_by(16) {
+            s.anim.advance(s.now + Duration::from_millis(ms));
+            let f = compose::compose(&s.model, &s.anim, W, H);
+            wrote += &printed(&screen.draw(f, &cursor, false, &[]));
+        }
+        assert!(s.anim.switches.is_empty(), "settled");
+        assert!(wrote.contains('a') && wrote.contains('c'), "{wrote:?}");
+        assert!(!wrote.contains(' '), "a blank written: {wrote:?}");
     }
 }

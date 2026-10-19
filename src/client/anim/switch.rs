@@ -115,8 +115,9 @@ impl Switch {
     }
 
     /// Draw the fade over the window as the compositor drew it: the old text
-    /// dimmed for the first half, the new one coming up for the second.
-    pub fn paint(&self, frame: &mut Frame, model: &Model) {
+    /// dimmed for the first half, the new one coming up for the second; the
+    /// cursor at `cursor` (see [`fade_cell`]).
+    pub fn paint(&self, frame: &mut Frame, model: &Model, cursor: (i64, i64)) {
         let e = Easing::InOutQuad.at(self.elapsed / self.duration);
         let colors = model.colors();
         let to = colors.visual_bg(&model.style(self.bg));
@@ -125,7 +126,8 @@ impl Switch {
             let keep = percent(1.0 - 2.0 * e);
             for (r, row) in self.was.rows.iter().enumerate() {
                 for (c, cell) in row.iter().enumerate() {
-                    let Some(o) = frame.at(top + r as i64, left + c as i64) else {
+                    let at = (top + r as i64, left + c as i64);
+                    let Some(o) = frame.at(at.0, at.1) else {
                         continue;
                     };
                     *o = Out {
@@ -133,7 +135,7 @@ impl Switch {
                         style: model.style(cell.hl),
                         wide: row.get(c + 1).is_some_and(|n| n.text == Text::Half),
                     };
-                    fade_cell(&colors, o, to, keep);
+                    fade_cell(&colors, o, to, keep, at == cursor);
                 }
             }
         } else {
@@ -141,8 +143,9 @@ impl Switch {
             let (w, h) = self.was.size;
             for r in 0..h as i64 {
                 for c in 0..w as i64 {
-                    if let Some(o) = frame.at(top + r, left + c) {
-                        fade_cell(&colors, o, to, keep);
+                    let at = (top + r, left + c);
+                    if let Some(o) = frame.at(at.0, at.1) {
+                        fade_cell(&colors, o, to, keep, at == cursor);
                     }
                 }
             }
