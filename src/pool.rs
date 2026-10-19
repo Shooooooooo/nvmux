@@ -109,7 +109,7 @@ impl Pool {
     }
 
     /// Hold a client started ahead somewhere else — on the thread that starts
-    /// again the clients a dropped link took (`[client] revive`) — in place
+    /// again the clients a dropped link took (`[client] lazy` off) — in place
     /// of one for the same session that has left. One there alive is the
     /// client the user has been to since, which has a screen to resume, and
     /// it stays: the newcomer comes back, for the caller to let go of.
@@ -125,7 +125,7 @@ impl Pool {
 
     /// Let go of every client that has left while held here, and say whose
     /// they were: after a dropped link, the sessions whose clients it took
-    /// with it (see `[client] revive`). The ones still there stay.
+    /// with it (see `[client] lazy`). The ones still there stay.
     pub fn take_left(&mut self) -> Vec<String> {
         let mut left = Vec::new();
         self.parked.retain(|p| {

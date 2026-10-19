@@ -354,15 +354,8 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
             "client",
             "lazy",
             Tab::Client,
-            "start a client on its first visit; off starts them all at launch",
+            "start a client on its visit; off starts all at launch and after a link drops",
             switch!(client.lazy),
-        ),
-        row(
-            "client",
-            "revive",
-            Tab::Client,
-            "start again the clients a dropped link took, once it is back",
-            switch!(client.revive),
         ),
         own(row(
             "client",

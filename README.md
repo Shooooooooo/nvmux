@@ -264,8 +264,7 @@ push_news  = true    # sessions say when they have news; false asks each one eve
 [client]
 ui             = "nvmux"  # who draws a session: nvmux's own client, animated; or "nvim"
 per_session    = true     # keep each session's client; a switch back reuses it
-lazy           = false    # start every client at launch; true waits for each session's first visit
-revive         = false    # true starts again, once a dropped link is back, the clients it took
+lazy           = false    # start every client at launch, and after a dropped link; true waits for visits
 throttle       = true     # a session out of sight is drawn once a second; false draws it as it changes
 predict        = "auto"   # over ssh, scrolls show before Neovim answers; "on" over any slow link
 centre         = "off"    # on a wide terminal, each window's text in its middle: "smart" or "fixed"

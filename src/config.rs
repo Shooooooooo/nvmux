@@ -196,11 +196,20 @@ pub struct ClientSettings {
     /// session created after nvmux started is started on its first visit
     /// either way, unless a change of `ui` comes first.
     ///
-    /// A change of `ui` on the settings screen retires every client there is,
-    /// for the next attach to start the new kind. Off, the client of every
-    /// other session in the listing is then started as the new kind, behind
-    /// that one once it has painted, as `revive` starts again the ones a
-    /// dropped link took; on, each is started on its next visit.
+    /// Clients are started again the same way. Each client kept for a session
+    /// not in front, parked or started ahead, rides the link to its session,
+    /// and leaves when the link does: over SSH, where there is a link to
+    /// drop, the session in front is attached again as the link comes back.
+    /// Off, the clients the link took are then started ahead again on a
+    /// thread of their own, once the session in front has painted, and the
+    /// next visit to each finds its client waiting. On, each is attached
+    /// afresh on its next visit: a fork, a forward, a probe and a first
+    /// paint, the last two each a round trip or more over the link that has
+    /// only just come back. A change of `ui` on the settings screen retires
+    /// every client there is, for the next attach to start the new kind. Off,
+    /// the client of every other session in the listing is then started as
+    /// the new kind, behind that one once it has painted; on, each is started
+    /// on its next visit.
     ///
     /// What off costs, and so the reasons to turn it on:
     ///
@@ -215,29 +224,19 @@ pub struct ClientSettings {
     /// - A client that writes more than [`crate::pty::AHEAD_MAX`] before its
     ///   first visit — a `:terminal` running something — is let go, and its
     ///   session is started on its first visit after all.
+    /// - In the moments after a dropped link comes back, a fork and an ssh
+    ///   forward per session it took a client of, and each one's screen sent
+    ///   over the link once more, while the session in front is in use. On a
+    ///   slow link its next frames share the link with those.
     ///
     /// With `per_session` off as well, a client started ahead is retired when
     /// it first leaves the front, like every other.
     pub lazy: bool,
-    /// Start again, once a dropped link is back, the clients out of sight it
-    /// took with it. Each client kept for a session not in front, parked or
-    /// started ahead, rides the link to its session, and leaves when the link
-    /// does. Over SSH only: a session on this machine has no link to lose.
-    ///
-    /// Off, the default, the session in front is attached again as the link
-    /// comes back, and every other is attached afresh on its next visit: a
-    /// fork, a forward, a probe and a first paint, the last two each a round
-    /// trip or more over the link that has only just come back. On, they are
-    /// started ahead again (see [`crate::pty::Attachment::start_ahead`]) on a
-    /// thread of their own, once the session in front has painted, and the
-    /// next visit to each finds its client waiting, as after nvmux's start
-    /// with `lazy` off.
-    ///
-    /// What on costs: in the moments after the link comes back, a fork and an
-    /// ssh forward per session, and each session's screen sent over the link
-    /// once more, while the session in front is in use. On a slow link its
-    /// next frames share the link with those.
-    pub revive: bool,
+    /// Once a switch of its own, whether the clients a dropped link took are
+    /// started again as it comes back: `lazy` says now. Still read, so that a
+    /// file that sets it loads, and never looked at.
+    #[serde(skip_serializing)]
+    pub revive: Retired,
     /// Draw a session nobody sees — its client kept out of sight, or started
     /// ahead of its first visit — at most once a second, with nothing in it
     /// animating, until it is back in front (see
@@ -357,13 +356,25 @@ pub struct ClientSettings {
     pub partial_frames: bool,
 }
 
+/// A switch nvmux had once and has no more. A file that still sets it loads
+/// as one that does not, rather than failing on a key nvmux does not know:
+/// it is read as the switch it was, and never looked at again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Retired;
+
+impl<'de> Deserialize<'de> for Retired {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        bool::deserialize(d).map(|_| Retired)
+    }
+}
+
 impl Default for ClientSettings {
     fn default() -> Self {
         Self {
             ui: Ui::Nvmux,
             per_session: true,
             lazy: false,
-            revive: false,
+            revive: Retired,
             throttle: true,
             predict: Predict::Auto,
             centre: Centre::Off,
@@ -1508,8 +1519,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          [client]\n\
          # ui             = {ui:<8}   # nvmux's own animated client, or \"nvim\" for Neovim's\n\
          # per_session    = {per_session:<8}   # keep each session's client; a switch back reuses it\n\
-         # lazy           = {lazy:<8}   # start every client at launch; true waits for each session's first visit\n\
-         # revive         = {revive:<8}   # true starts again, once a dropped link is back, the clients it took\n\
+         # lazy           = {lazy:<8}   # start every client at launch, and after a dropped link; true waits for visits\n\
          # throttle       = {throttle:<8}   # a session out of sight is drawn once a second; false draws it as it changes\n\
          # predict        = {predict:<8}   # over ssh, scrolls show before Neovim answers; \"on\" over any slow link\n\
          # centre         = {centre:<8}   # on a wide terminal, each window's text in its middle: \"smart\" or \"fixed\"\n\
@@ -1572,7 +1582,6 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
         push_news = s.push_news,
         per_session = c.per_session,
         lazy = c.lazy,
-        revive = c.revive,
         throttle = c.throttle,
         predict = quoted(c.predict.name()),
         centre = quoted(c.centre.name()),
@@ -2623,15 +2632,25 @@ mod tests {
         assert!(s.client.per_session, "the rest as it was");
     }
 
-    /// The clients out of sight a dropped link took are started on their next
-    /// visits unless told otherwise; started again as the link comes back is
-    /// a line away.
+    /// A file that still sets `revive`, which `lazy` decides now, loads as
+    /// one that does not, whatever it says; one that sets it to anything but
+    /// a switch is as wrong as ever. A client is not told it.
     #[test]
-    fn the_clients_a_dropped_link_took_wait_for_their_visits_unless_told() {
-        assert!(!Settings::default().client.revive);
-        let s: Settings = toml::from_str("[client]\nrevive = true\n").expect("valid");
-        assert!(s.client.revive);
-        assert!(!s.client.lazy, "the rest as it was");
+    fn a_file_that_still_sets_revive_loads_as_one_that_does_not() {
+        for (with, without) in [
+            ("[client]\nrevive = true\n", "[client]\n"),
+            ("[client]\nrevive = false\n", "[client]\n"),
+            (
+                "[client]\nrevive = true\nlazy = true\n",
+                "[client]\nlazy = true\n",
+            ),
+        ] {
+            let s: Settings = toml::from_str(with).expect("valid");
+            assert_eq!(s, toml::from_str(without).expect("valid"), "{with:?}");
+        }
+        assert!(toml::from_str::<Settings>("[client]\nrevive = 1\n").is_err());
+        let env = Settings::default().drawing().to_env();
+        assert!(!env.contains("revive"), "{env}");
     }
 
     /// Each frame written in as few bytes as it takes unless told otherwise;
@@ -3157,7 +3176,6 @@ mod tests {
         for line in [
             "# per_session    = true",
             "# lazy           = false",
-            "# revive         = false",
             "# throttle       = true",
             "# ui             = \"nvmux\"",
             "# predict        = \"auto\"",

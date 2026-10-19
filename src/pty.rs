@@ -2030,9 +2030,9 @@ impl Attachment {
     /// lets the receiver go, untold, rather than leave it for a later one.
     ///
     /// For what must not compete with that screen for the link it comes
-    /// over: the clients started again behind it — the ones a dropped link
-    /// took (see `[client] revive`), or every session's after a change of
-    /// `[client] ui` (see `[client] lazy`).
+    /// over: the clients started again behind it, with `[client] lazy` off —
+    /// the ones a dropped link took, or every session's after a change of
+    /// `[client] ui`.
     pub fn tell_when_painted(&mut self) -> mpsc::Receiver<()> {
         let (tx, rx) = mpsc::channel();
         self.painted = Some(tx);
