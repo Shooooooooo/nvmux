@@ -184,10 +184,9 @@ margin, and goes, leaving its sign there until you open that session.
 cargo test: exited with code 0
 ```
 
-Notes need nvmux's own client; with `ui = "nvim"` there are none. nvmux asks
-each session for its news every two seconds; set `push_news = true` under
-`[session]` to have each one say when it has some instead, and the note comes
-as it happens.
+Notes need nvmux's own client; with `ui = "nvim"` there are none. Each session
+says when it has news, and the note comes as it happens; set `push_news = false`
+under `[session]` to have nvmux ask each one every two seconds instead.
 
 > [!TIP]
 > If Claude Code's notifications never show, as on a remote host, set its
@@ -256,7 +255,7 @@ settings = ","       # change nvmux's settings while it runs
 [session]
 command = "nvim --headless --listen {sock}"   # {sock} is required
 quick_list = true    # a busy session holds a listing a quarter of a second; false waits three
-push_news  = false   # true has the sessions say when they have news, not be asked every two seconds
+push_news  = true    # sessions say when they have news; false asks each one every two seconds
 
 [client]
 ui             = "nvmux"  # who draws a session: nvmux's own client, animated; or "nvim"
