@@ -104,7 +104,9 @@
 //! put aside — parked, or started ahead of its session's first visit — is
 //! told so ([`crate::card::Command::Away`]), and until it is back in front it
 //! animates nothing and draws what changes at most once every
-//! [`AWAY_FRAME_GAP`], however busy its session is.
+//! [`AWAY_FRAME_GAP`], however busy its session is. With it off, such a
+//! client is told so all the same ([`crate::card::Command::Unseen`]), and
+//! draws as it would in front but for a blinking cursor, which it holds.
 
 pub mod anim;
 pub mod cards;
@@ -1714,9 +1716,10 @@ impl App {
     /// stops where it is going, and nothing starts to until the client is
     /// back in front. What is left to draw, or changes from here on, is drawn
     /// as [`AWAY_FRAME_GAP`] allows.
-    fn go_away(&mut self) {
+    fn go_away(&mut self, now: Instant) {
         self.away = true;
         self.anim.reset();
+        self.anim.hold_blink(true, now);
         self.dirty = true;
     }
 
@@ -2322,10 +2325,17 @@ impl App {
                     Some(crate::card::Command::Settings(drawing)) => {
                         self.reconfigure(&drawing, now);
                     }
-                    Some(crate::card::Command::Away) => self.go_away(),
+                    Some(crate::card::Command::Away) => self.go_away(now),
+                    Some(crate::card::Command::Unseen) => {
+                        self.anim.hold_blink(true, now);
+                        // Drawn once more with a blinking cursor whole, for
+                        // what nvmux keeps of the screen to switch back to.
+                        self.dirty |= self.anim.blinks(&self.model);
+                    }
                     Some(cmd) => {
                         if matches!(cmd, crate::card::Command::Clear) {
                             self.away = false;
+                            self.anim.hold_blink(false, now);
                         }
                         if self.cards.apply(cmd, now) {
                             self.dirty = true;
@@ -5659,5 +5669,169 @@ mod tests {
                 vec![n(4), n(0), n(0)],
             ]
         );
+    }
+
+    /// A client with a blinking block cursor, as `[effects.blink]` and a
+    /// `'guicursor'` of `block-blinkwait700-blinkoff400-blinkon250` make it,
+    /// drawn once and then left alone.
+    fn blinking(smear: bool, blink: bool, t0: Instant) -> App {
+        let mut s = crate::config::Settings::default();
+        s.effects.smear.enabled = smear;
+        s.effects.blink.enabled = blink;
+        s.effects.scroll.enabled = false;
+        s.effects.windows.enabled = false;
+        let mut a = App::new(palette(), Effects::from_settings(&s), false, (20, 6));
+        a.start();
+        let sent = calls(&mut a);
+        answer(
+            &mut a,
+            request(&sent, "nvim_get_api_info", ""),
+            Value::Array(vec![7.into()]),
+            t0,
+        );
+        let mode = Value::Map(vec![
+            ("name".into(), "normal".into()),
+            ("cursor_shape".into(), "block".into()),
+            ("blinkwait".into(), 700.into()),
+            ("blinkoff".into(), 400.into()),
+            ("blinkon".into(), 250.into()),
+        ]);
+        redraw(
+            &mut a,
+            vec![
+                resize(1, 20, 6),
+                ("mode_info_set", vec![true.into(), Value::Array(vec![mode])]),
+                ("mode_change", vec!["normal".into(), 0.into()]),
+                line(1, 0, "hello"),
+                goto(0, 0),
+            ],
+            t0,
+        );
+        calls(&mut a);
+        assert!(a.due(t0));
+        a.frame(t0);
+        a
+    }
+
+    /// `run`'s loop with nothing coming in, from `from` to `until`: wait for
+    /// [`App::wake_at`], rounded up to the millisecond as `run` rounds it,
+    /// and draw if [`App::due`]. How many times it woke, and how many frames
+    /// it drew.
+    fn left_alone(a: &mut App, from: Instant, until: Instant) -> (usize, usize) {
+        let (mut wakes, mut frames) = (0, 0);
+        let mut t = from;
+        loop {
+            if a.due(t) {
+                a.frame(t);
+                frames += 1;
+            }
+            let Some(at) = a.wake_at(t) else {
+                break;
+            };
+            let ms = at.saturating_duration_since(t).as_micros().div_ceil(1000);
+            t += Duration::from_millis(u64::try_from(ms).unwrap_or(u64::MAX).max(1));
+            if t >= until {
+                break;
+            }
+            wakes += 1;
+        }
+        (wakes, frames)
+    }
+
+    /// A blinking cursor left alone fades out and back in, a frame at a time
+    /// while it fades — every wake a frame, rather than wakes that find
+    /// nothing due — and holds without a wake in between.
+    #[test]
+    fn a_blinking_cursor_is_drawn_as_it_fades() {
+        let t0 = Instant::now();
+        let mut a = blinking(false, true, t0);
+        let (wakes, frames) = left_alone(&mut a, t0, t0 + Duration::from_secs(10));
+        // Fades are 40% of each half of a 650 ms blink: 15 or so frames a
+        // blink, 15 blinks after the wait.
+        assert!(frames >= 200, "{frames} frames for {wakes} wakes");
+        assert!(
+            frames * 10 >= wakes * 9,
+            "{frames} frames for {wakes} wakes"
+        );
+        let mut still = blinking(false, false, t0);
+        assert_eq!(
+            left_alone(&mut still, t0, t0 + Duration::from_secs(10)),
+            (0, 0),
+            "a cursor that does not blink sleeps"
+        );
+    }
+
+    /// A blinking cursor does not keep the animations' clock from starting
+    /// afresh: a smear after a quiet spell moves as it does with the blink
+    /// off, rather than all the way in its first step.
+    #[test]
+    fn a_smear_after_a_quiet_spell_moves_with_the_blink_on() {
+        let frames_after_jump = |blink: bool| {
+            let t0 = Instant::now();
+            let mut a = blinking(true, blink, t0);
+            let quiet = t0 + Duration::from_secs(2);
+            left_alone(&mut a, t0, quiet);
+            redraw(&mut a, vec![goto(5, 15)], quiet);
+            // Frames while the smear moves, before the blink's wait is over.
+            left_alone(&mut a, quiet, quiet + Duration::from_millis(300)).1
+        };
+        let still = frames_after_jump(false);
+        assert!(still > 3, "the smear moves over {still} frames");
+        assert_eq!(frames_after_jump(true), still);
+    }
+
+    /// Out of sight, a client whose cursor does not blink has nothing to
+    /// hold, and is not drawn again for it.
+    #[test]
+    fn a_client_out_of_sight_without_a_blink_is_left_alone() {
+        let t0 = Instant::now();
+        let mut a = blinking(false, false, t0);
+        told(&mut a, &crate::card::Command::Unseen, t0);
+        assert!(!a.due(t0));
+        let later = t0 + Duration::from_secs(5);
+        assert_eq!(left_alone(&mut a, t0, later), (0, 0));
+    }
+
+    /// Out of sight, a blinking cursor holds still and whole: the client is
+    /// drawn once more, with the cursor whole, and then sleeps. Back in
+    /// front, it blinks again, from the start of its wait.
+    #[test]
+    fn a_client_out_of_sight_holds_its_blink() {
+        let t0 = Instant::now();
+        let mut a = blinking(false, true, t0);
+        // In the middle of the first fade out.
+        let t1 = t0 + Duration::from_millis(760);
+        left_alone(&mut a, t0, t1);
+        told(&mut a, &crate::card::Command::Unseen, t1);
+        assert!(a.due(t1), "drawn once more");
+        let held = String::from_utf8_lossy(&a.frame(t1)).into_owned();
+        // The cursor's cell drawn as it is at the start, whole, rather than
+        // as it is at this moment if it goes on blinking, part faded: the SGR
+        // its `h` is written in.
+        let mut fresh = blinking(false, true, t0);
+        fresh.screen.invalidate();
+        let whole = String::from_utf8_lossy(&fresh.frame(t0)).into_owned();
+        let mut faded = blinking(false, true, t0);
+        left_alone(&mut faded, t0, t1);
+        faded.screen.invalidate();
+        let faded = String::from_utf8_lossy(&faded.frame(t1)).into_owned();
+        let cell = |f: &str| {
+            let end = f.find("mh")?;
+            f[..end].rfind("\x1b[").map(|at| f[at..end].to_string())
+        };
+        assert_eq!(
+            cell(&held),
+            cell(&whole),
+            "the cursor drawn whole: {held:?}"
+        );
+        assert_ne!(cell(&held), cell(&faded), "and not part faded");
+        let t2 = t1 + Duration::from_secs(10);
+        assert_eq!(left_alone(&mut a, t1, t2), (0, 0), "and then nothing");
+
+        told(&mut a, &crate::card::Command::Clear, t2);
+        let wait = t2 + Duration::from_millis(690);
+        assert_eq!(left_alone(&mut a, t2, wait), (0, 0), "whole for the wait");
+        let (_, frames) = left_alone(&mut a, wait, wait + Duration::from_secs(2));
+        assert!(frames > 20, "and blinking after it: {frames} frames");
     }
 }

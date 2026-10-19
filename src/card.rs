@@ -317,7 +317,7 @@ pub enum Command {
     Drop { id: u64 },
     /// Let them all go: this client has just come back to the front, and
     /// whatever it was showing when it left is old. Back from
-    /// [`Command::Away`], if it was there.
+    /// [`Command::Away`] or [`Command::Unseen`], if it was there.
     Clear,
     /// This client has gone to the back — parked, or started ahead of its
     /// session's first visit — and nothing it draws is seen until it is told
@@ -325,6 +325,12 @@ pub enum Command {
     /// once in a while, for what nvmux keeps of its screen meanwhile. Told
     /// only with `[client] throttle` on.
     Away,
+    /// This client has gone to the back as for [`Command::Away`], with
+    /// `[client] throttle` off: it draws as it would in front, for what nvmux
+    /// keeps of its screen, but for its cursor's blink, which holds still
+    /// and whole until it is told [`Command::Clear`]. A blink is frames for
+    /// an eye that is not there.
+    Unseen,
     /// The prefix is held, or it is not any more: while it is, the card the
     /// key acts on says so.
     Keys { held: bool },
@@ -813,6 +819,7 @@ mod tests {
             Command::Drop { id: 7 },
             Command::Clear,
             Command::Away,
+            Command::Unseen,
             Command::Keys { held: true },
         ] {
             let wire = encode(&cmd);
@@ -1015,6 +1022,7 @@ mod tests {
                 Command::Drop { id } => format!("drop {id}"),
                 Command::Clear => "clear".to_string(),
                 Command::Away => "away".to_string(),
+                Command::Unseen => "unseen".to_string(),
                 Command::Keys { held } => format!("keys {held}"),
                 Command::Settings(_) => "settings".to_string(),
             })

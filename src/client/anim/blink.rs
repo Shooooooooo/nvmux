@@ -56,9 +56,16 @@ impl Blink {
         }
     }
 
-    /// When the cursor will next look different, if it is going to: the next
-    /// frame while it fades, the start of the next fade while it holds.
-    pub fn next_change(&self, mode: &ModeInfo, now: Instant, frame: Duration) -> Option<Instant> {
+    /// When the cursor will next look different, if it is going to: a frame
+    /// on from the `last` one drawn while it fades, the start of the next fade
+    /// while it holds.
+    pub fn next_change(
+        &self,
+        mode: &ModeInfo,
+        now: Instant,
+        last: Option<Instant>,
+        frame: Duration,
+    ) -> Option<Instant> {
         if !mode.blinks() {
             return None;
         }
@@ -67,13 +74,24 @@ impl Blink {
             return Some(self.since + Duration::from_millis(mode.blinkwait));
         };
         let (fade_out, fade_in) = (off * FADE, on * FADE);
-        let wait = if t < fade_out || (off..off + fade_in).contains(&t) {
-            return Some(now + frame);
-        } else if t < off {
-            off - t
+        if t < fade_out || (off..off + fade_in).contains(&t) {
+            // From the last frame rather than from `now`: a frame counted from
+            // whenever it is asked for is a frame away again when that comes,
+            // and is never due at all.
+            return Some(last.map_or(now, |last| last + frame));
+        }
+        let (held, wait) = if t < off {
+            (t - fade_out, off - t)
         } else {
-            off + on - t
+            (t - (off + fade_in), off + on - t)
         };
+        // Drawn once more as the hold begins, if the last frame came before
+        // it: a fade's frames seldom land on its end, and the last of them
+        // would otherwise stand, a few percent short, for the whole hold.
+        let begun = now.checked_sub(Duration::from_secs_f32(held.max(0.0)));
+        if let Some(begun) = begun.filter(|&begun| last.is_none_or(|last| last < begun)) {
+            return Some(begun);
+        }
         // To the millisecond the cycle is counted in, so a hold ends on the
         // tick the fade starts on rather than a rounding error either side.
         Some(now + Duration::from_millis((wait * 1000.0).round() as u64))
@@ -137,7 +155,10 @@ mod tests {
         let b = Blink::new(t0);
         let still = ModeInfo::default();
         assert_eq!(b.opacity(&still, t0 + Duration::from_secs(5)), 1.0);
-        assert_eq!(b.next_change(&still, t0, Duration::from_millis(16)), None);
+        assert_eq!(
+            b.next_change(&still, t0, None, Duration::from_millis(16)),
+            None
+        );
     }
 
     /// Frames while it fades, and none while it holds: an idle cursor costs a
@@ -148,20 +169,68 @@ mod tests {
         let b = Blink::new(t0);
         let frame = Duration::from_millis(16);
         let at = |ms| t0 + Duration::from_millis(ms);
+        let last = Some(at(740));
         assert_eq!(
-            b.next_change(&mode(), at(100), frame),
+            b.next_change(&mode(), at(100), last, frame),
             Some(at(700)),
             "waiting, until the first fade"
         );
         assert_eq!(
-            b.next_change(&mode(), at(750), frame),
-            Some(at(750) + frame)
+            b.next_change(&mode(), at(750), last, frame),
+            Some(at(740) + frame),
+            "a frame on from the last"
         );
         assert_eq!(
-            b.next_change(&mode(), at(1000), frame),
-            Some(at(1100)),
-            "held off until the fade in"
+            b.next_change(&mode(), at(750), None, frame),
+            Some(at(750)),
+            "at once, with none drawn yet"
         );
+        let held = b.next_change(&mode(), at(1000), Some(at(870)), frame);
+        assert_eq!(held, Some(at(1100)), "held off until the fade in");
+    }
+
+    /// A hold whose fade's last frame came before its end is drawn once more,
+    /// as it begins: whole, or gone, rather than the last step short of it.
+    #[test]
+    fn a_hold_begins_with_the_fade_finished() {
+        let t0 = Instant::now();
+        let b = Blink::new(t0);
+        let frame = Duration::from_millis(16);
+        let at = |ms| t0 + Duration::from_millis(ms);
+        // The fade out ends at 860; its last frame came at 850.
+        let owed = b.next_change(&mode(), at(866), Some(at(850)), frame);
+        assert!(
+            owed.is_some_and(|due| due <= at(866) && due >= at(859)),
+            "{owed:?}"
+        );
+        assert_eq!(b.opacity(&mode(), at(866)), 0.0, "drawn gone");
+        // The fade in ends at 1200, 40% into the 250 ms it is back for.
+        let owed = b.next_change(&mode(), at(1206), Some(at(1190)), frame);
+        assert!(owed.is_some_and(|due| due <= at(1206)), "{owed:?}");
+        assert_eq!(b.opacity(&mode(), at(1206)), 1.0, "drawn whole");
+    }
+
+    /// A frame a fade asks for is due when it comes. Waited for as the
+    /// client's loop waits — drawn if due, slept until when it says if not —
+    /// the rest of a fade out, 100 ms of it, is drawn a frame at a time.
+    #[test]
+    fn a_fades_next_frame_comes_due() {
+        let t0 = Instant::now();
+        let b = Blink::new(t0);
+        let frame = Duration::from_millis(16);
+        let fade_end = t0 + Duration::from_millis(700 + 160);
+        let (mut now, mut last, mut drawn) = (t0 + Duration::from_millis(760), None, 0);
+        while now < fade_end {
+            match b.next_change(&mode(), now, last, frame) {
+                Some(at) if at <= now => {
+                    drawn += 1;
+                    last = Some(now);
+                }
+                Some(at) => now = at,
+                None => break,
+            }
+        }
+        assert!(drawn >= 6, "{drawn}");
     }
 
     #[test]

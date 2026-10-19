@@ -208,7 +208,9 @@ pub struct ClientSettings {
     /// [`crate::card::Command::Away`]). nvmux's own client only.
     ///
     /// Off, the default, such a client draws everything its session does as
-    /// if it were in front, into nvmux's copy of its screen. On, a session
+    /// if it were in front, into nvmux's copy of its screen — but for a
+    /// blinking cursor, which holds still out of sight either way. On, a
+    /// session
     /// that draws all the while out of sight — a `:terminal` running a build,
     /// a log — costs nvmux a third of the CPU it did, or less; and a client
     /// started ahead of one is kept to its first visit, rather than let go
@@ -829,7 +831,8 @@ pub struct WindowsSettings {
 pub struct BlinkSettings {
     /// This effect's own switch, under `[effects] enabled`. Off by default,
     /// as Neovide's is; and it does nothing for a cursor `'guicursor'` does
-    /// not make blink.
+    /// not make blink, nor for a session out of sight, whose cursor holds
+    /// still until it is back in front.
     pub enabled: bool,
 }
 
