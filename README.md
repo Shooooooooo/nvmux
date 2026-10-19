@@ -264,6 +264,7 @@ centre         = "off"    # on a wide terminal, each window's text in its middle
 window_width   = 120      # with centre on, how many columns a window's text gets; 0 for no limit
 lean_output    = true     # fewer bytes per frame, the same screen; false makes every move absolute
 scroll_regions = false    # true has the terminal move the rows a scroll moved; the same screen
+partial_frames = false    # true puts a frame together from the rows that changed alone; the same screen
 
 [style]
 color = "terminal"   # or "#rrggbb": nvmux's text and bars in that colour; dim text stays dim

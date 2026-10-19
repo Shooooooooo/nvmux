@@ -304,6 +304,20 @@ pub struct ClientSettings {
     /// rows the region no longer fits, until the repaint the new size brings,
     /// a moment later.
     pub scroll_regions: bool,
+    /// Put each frame together from only the rows Neovim drew or scrolled
+    /// since the last, rather than every row, where nothing else changed: a
+    /// key typed, the cursor moved. The rest of the frame is the last one's,
+    /// and only the rows put together are compared with what the terminal
+    /// shows. A window placed, a highlight defined, a resize, anything
+    /// moving or a card over the screen has the frame put together whole, as
+    /// ever. nvmux's own client only (see [`crate::client::App::frame`]).
+    ///
+    /// Off, the default, every frame is put together whole. On, the screen
+    /// is the same, for less of the client's CPU per key typed.
+    ///
+    /// What on risks: a row the editor changed in a way the client does not
+    /// count as a change would be left as it was, until it next changes.
+    pub partial_frames: bool,
 }
 
 impl Default for ClientSettings {
@@ -319,6 +333,7 @@ impl Default for ClientSettings {
             window_width: 120,
             lean_output: true,
             scroll_regions: false,
+            partial_frames: false,
         }
     }
 }
@@ -1460,6 +1475,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          # window_width   = {window_width:<8}   # with centre on, how many columns a window's text gets; 0 for no limit\n\
          # lean_output    = {lean_output:<8}   # fewer bytes per frame, the same screen; false makes every move absolute\n\
          # scroll_regions = {scroll_regions:<8}   # true has the terminal move the rows a scroll moved; the same screen\n\
+         # partial_frames = {partial_frames:<8}   # true puts a frame together from the rows that changed alone; the same screen\n\
          \n\
          [style]\n\
          # color = {style_color:<10}   # or \"#rrggbb\": nvmux's text and bars in that colour\n\
@@ -1520,6 +1536,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
         window_width = c.window_width,
         lean_output = c.lean_output,
         scroll_regions = c.scroll_regions,
+        partial_frames = c.partial_frames,
         style_color = quoted(&t.color.name()),
         style_float = t.float,
         fade_enabled = f.enabled,
@@ -2594,6 +2611,16 @@ mod tests {
         assert!(s.client.lean_output, "the rest as it was");
     }
 
+    /// Every frame put together whole unless told otherwise; from only the
+    /// rows that changed is a line away.
+    #[test]
+    fn frames_are_put_together_whole_unless_told() {
+        assert!(!Settings::default().client.partial_frames);
+        let s: Settings = toml::from_str("[client]\npartial_frames = true\n").expect("valid");
+        assert!(s.client.partial_frames);
+        assert!(!s.client.scroll_regions, "the rest as it was");
+    }
+
     /// nvmux's own client unless told otherwise; Neovim's is a line away.
     #[test]
     fn a_session_is_drawn_by_nvmuxs_client_unless_told() {
@@ -3067,6 +3094,7 @@ mod tests {
             "# window_width   = 120",
             "# lean_output    = true",
             "# scroll_regions = false",
+            "# partial_frames = false",
             "# color = \"terminal\"",
             "# float = true ",
             "# enabled     = true",

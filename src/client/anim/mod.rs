@@ -847,6 +847,15 @@ impl Animator {
             || !self.switches.is_empty()
     }
 
+    /// Whether a frame is the editor's grids where the editor put them and
+    /// nothing more: nothing moving, nothing held where a scroll is going,
+    /// and nothing painted over it. What a frame put together from only the
+    /// rows that changed needs of itself and of the frame before it (see
+    /// `crate::client::App::frame`).
+    pub fn still(&self) -> bool {
+        !self.moving() && self.scrolls.is_empty() && self.sides.is_empty() && !self.paints_over()
+    }
+
     /// Whether the cursor is one this blinks: a block `'guicursor'` makes
     /// blink, with the effect on.
     pub fn blinks(&self, model: &Model) -> bool {

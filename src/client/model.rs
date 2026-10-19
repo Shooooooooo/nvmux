@@ -418,6 +418,11 @@ pub struct Model {
     /// `n` (see [`Style::link`]) is `links[n - 1]`.
     links: Vec<Box<str>>,
     link_numbers: HashMap<Box<str>, u32>,
+    /// When anything a frame is put together from last changed but the cells
+    /// of a grid, which each grid stamps its rows with itself: a window
+    /// placed, a highlight defined, an option set. By the grids' clock (see
+    /// [`super::grid::tick`]).
+    changed: u64,
 }
 
 impl Model {
@@ -452,7 +457,15 @@ impl Model {
             term,
             links: Vec::new(),
             link_numbers: HashMap::new(),
+            changed: super::grid::tick(),
         }
+    }
+
+    /// Whether nothing a frame is put together from has changed since the
+    /// moment `since`, by the grids' clock, but the cells of rows each grid
+    /// says changed (see [`Grid::changed_since`]).
+    pub fn unchanged_since(&self, since: u64) -> bool {
+        self.changed <= since && self.grids.values().all(|g| !g.shaped_since(since))
     }
 
     /// What resolves a style's colours, as things stand.
@@ -495,6 +508,16 @@ impl Model {
     /// forms: see [`syntax_hl`].
     pub fn set_group(&mut self, group: u32, rgb: Attrs, cterm: Attrs) {
         self.highlights.groups.insert(group, (rgb, cterm));
+        self.changed = super::grid::tick();
+    }
+
+    /// `'laststatus'` is `laststatus`, as the editor's measure says it (see
+    /// [`Model::laststatus`]).
+    pub fn set_laststatus(&mut self, laststatus: Option<i64>) {
+        if laststatus != self.laststatus {
+            self.laststatus = laststatus;
+            self.changed = super::grid::tick();
+        }
     }
 
     /// Highlight `id` as Neovim defined it, in both its forms, by the
@@ -603,6 +626,31 @@ impl Model {
     /// Take one event into the picture, noting in `changes` what an animation
     /// might want to know.
     pub fn apply(&mut self, event: Event, changes: &mut Changes) {
+        // What changes the cells of a grid alone — which the grid stamps
+        // itself — or nothing a frame is put together from. Anything else
+        // is a change to all of it, an event not named here among them.
+        let cells_alone = matches!(
+            event,
+            Event::GridLine { .. }
+                | Event::GridScroll { .. }
+                | Event::GridClear { .. }
+                | Event::GridCursor { .. }
+                | Event::WinViewport { .. }
+                | Event::ModeChange { .. }
+                | Event::BusyStart
+                | Event::BusyStop
+                | Event::MouseOn
+                | Event::MouseOff
+                | Event::Bell
+                | Event::VisualBell
+                | Event::SetTitle(_)
+                | Event::UiSend(_)
+                | Event::ErrorExit(_)
+                | Event::Flush
+        );
+        if !cells_alone {
+            self.changed = super::grid::tick();
+        }
         match event {
             Event::GridResize {
                 grid,
@@ -1003,7 +1051,7 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::grid::Text;
+    use crate::client::grid::{tick, Text};
     use crate::client::redraw::LineCell;
     use crate::client::style::Color;
     use crate::palette::Rgb;
@@ -1022,6 +1070,104 @@ mod tests {
             m.apply(e, &mut changes);
         }
         changes
+    }
+
+    /// The cells of a grid change by its own rows alone; anything else a
+    /// frame is put together from — a window placed, a highlight defined,
+    /// `'laststatus'`, a highlight group, a grid resized — changes the
+    /// model, and an event the model does not know to be of cells alone
+    /// does too.
+    #[test]
+    fn only_a_grids_cells_change_without_changing_the_model() {
+        let mut m = model();
+        apply(
+            &mut m,
+            vec![Event::GridResize {
+                grid: 1,
+                width: 4,
+                height: 2,
+            }],
+        );
+        let cells_alone = [
+            Event::GridLine {
+                grid: 1,
+                row: 0,
+                col: 0,
+                cells: vec![LineCell {
+                    text: Text::Char('a'),
+                    hl: Some(0),
+                    repeat: 1,
+                }],
+            },
+            Event::GridScroll {
+                grid: 1,
+                top: 0,
+                bot: 2,
+                left: 0,
+                right: 4,
+                rows: 1,
+            },
+            Event::GridClear { grid: 1 },
+            Event::GridCursor {
+                grid: 1,
+                row: 1,
+                col: 1,
+            },
+            Event::ModeChange {
+                name: "insert".into(),
+                index: 1,
+            },
+            Event::BusyStart,
+            Event::Flush,
+        ];
+        for event in cells_alone {
+            let since = tick();
+            let name = format!("{event:?}");
+            apply(&mut m, vec![event]);
+            assert!(m.unchanged_since(since), "{name}");
+        }
+        let more = [
+            Event::WinPos {
+                grid: 2,
+                win: Some(1000),
+                row: 0,
+                col: 0,
+                width: 4,
+                height: 1,
+            },
+            Event::HlAttr {
+                id: 1,
+                rgb: Attrs::default(),
+                cterm: Attrs::default(),
+            },
+            Event::GridResize {
+                grid: 1,
+                width: 3,
+                height: 2,
+            },
+            Event::OptionSet {
+                name: "termguicolors".into(),
+                value: OptionValue::Bool(true),
+            },
+        ];
+        for event in more {
+            let since = tick();
+            let name = format!("{event:?}");
+            apply(&mut m, vec![event]);
+            assert!(!m.unchanged_since(since), "{name}");
+        }
+        let since = tick();
+        m.set_laststatus(Some(2));
+        assert!(!m.unchanged_since(since), "'laststatus'");
+        let since = tick();
+        m.set_laststatus(Some(2));
+        assert!(m.unchanged_since(since), "'laststatus' as it was");
+        let since = tick();
+        m.set_group(7, Attrs::default(), Attrs::default());
+        assert!(!m.unchanged_since(since), "a highlight group");
+        let since = tick();
+        m.grids.get_mut(&1).expect("grid 1").resize(2, 2);
+        assert!(!m.unchanged_since(since), "a grid the client cut");
     }
 
     /// What Neovim sends for a 22-row window over 30 lines, scrolled to

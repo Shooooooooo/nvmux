@@ -112,6 +112,10 @@ pub struct Screen {
     /// What finds the rows a frame moved, for the terminal to move them:
     /// none unless asked for (see [`Screen::set_regions`]).
     bands: Option<Bands>,
+    /// For each row of `shown`, whether it differs from the same row of
+    /// `spare`: what [`Screen::take_like_shown`] copies over. Empty where
+    /// that is not known.
+    differs: Vec<bool>,
 }
 
 impl Default for Screen {
@@ -130,6 +134,7 @@ impl Screen {
             cursor: None,
             lean: true,
             bands: None,
+            differs: Vec::new(),
         }
     }
 
@@ -159,6 +164,25 @@ impl Screen {
             .unwrap_or_else(|| Frame::new(0, 0, Style::default()))
     }
 
+    /// The frame done with (see [`Screen::take_spare`]) made the frame the
+    /// terminal shows, `width` by `height`, by the rows of it that differ
+    /// alone: what a frame of only the rows that changed is put together
+    /// over (see [`super::compose::compose_rows`]). None where there is no
+    /// such frame, or it is another size.
+    pub fn take_like_shown(&mut self, width: usize, height: usize) -> Option<Frame> {
+        let size = |f: &Frame| (f.width, f.height) == (width, height);
+        let shown = self.shown.as_ref().filter(|f| size(f))?;
+        if !self.spare.as_ref().is_some_and(size) || self.differs.len() != height {
+            return None;
+        }
+        let mut spare = self.spare.take()?;
+        for r in (0..height).filter(|&r| self.differs[r]) {
+            let row = r * width..(r + 1) * width;
+            spare.cells[row.clone()].clone_from_slice(&shown.cells[row]);
+        }
+        Some(spare)
+    }
+
     /// Forget what the terminal shows: the next frame paints every cell, and
     /// sets the cursor, its shape and its colour afresh.
     pub fn invalidate(&mut self) {
@@ -168,6 +192,7 @@ impl Screen {
         if let Some(bands) = self.bands.as_mut() {
             bands.forget();
         }
+        self.differs.clear();
         self.shape = None;
         self.color = None;
         self.cursor = None;
@@ -206,6 +231,35 @@ impl Screen {
         sync: bool,
         links: &[Box<str>],
     ) {
+        self.write(out, frame, cursor, sync, links, None);
+    }
+
+    /// [`Screen::draw_into`], for a frame that differs from the one the
+    /// terminal shows in the rows `rows` says alone: the rest are not looked
+    /// at (see [`Screen::take_like_shown`]).
+    pub fn draw_rows_into(
+        &mut self,
+        out: &mut Vec<u8>,
+        frame: Frame,
+        cursor: &Cursor,
+        sync: bool,
+        links: &[Box<str>],
+        rows: &[bool],
+    ) {
+        self.write(out, frame, cursor, sync, links, Some(rows));
+    }
+
+    /// What [`Screen::draw_into`] and [`Screen::draw_rows_into`] share: the
+    /// rows `changed` says alone looked at, where it says any.
+    fn write(
+        &mut self,
+        out: &mut Vec<u8>,
+        frame: Frame,
+        cursor: &Cursor,
+        sync: bool,
+        links: &[Box<str>],
+        changed: Option<&[bool]>,
+    ) {
         // Where this frame's bytes begin, for them to be taken back if they
         // change nothing.
         let start = out.len();
@@ -227,7 +281,7 @@ impl Screen {
         if let Some(bands) = self.bands.as_mut() {
             match shown.as_ref().filter(|old| fits(old)) {
                 Some(old) => {
-                    moved = bands.moved(out, old, &frame);
+                    moved = bands.moved(out, old, &frame, changed);
                     known = true;
                 }
                 None => bands.forget(),
@@ -236,6 +290,12 @@ impl Screen {
         drew |= moved;
         let bands = self.bands.as_ref().filter(|_| known);
         let old = shown.as_ref().filter(|old| fits(old));
+        // Which rows of the frame differ from the frame shown, row for row,
+        // for the next to be put together over (see [`Screen::take_like_shown`]):
+        // every one, of a frame that does not fit over it.
+        let mut differs = std::mem::take(&mut self.differs);
+        differs.clear();
+        differs.resize(frame.height, true);
         let mut pen: Option<Style> = None;
         let mut at: Option<(usize, usize)> = None;
         // Whether the terminal's cursor is surely where `at` says, so that a
@@ -261,8 +321,17 @@ impl Screen {
                 None => old.map(|old| &old.cells[row.clone()]),
             };
             let same = match bands {
-                Some(bands) => bands.same()[r],
-                None => was.is_some_and(|was| *was == frame.cells[row]),
+                Some(bands) => {
+                    differs[r] = !bands.equal()[r];
+                    bands.same()[r]
+                }
+                None => {
+                    let same = old.is_some()
+                        && (changed.is_some_and(|changed| !changed[r])
+                            || was.is_some_and(|was| *was == frame.cells[row]));
+                    differs[r] = !same;
+                    same
+                }
             };
             if same {
                 continue;
@@ -367,6 +436,7 @@ impl Screen {
         self.cursor = Some(*cursor);
         self.shown = Some(frame);
         self.spare = shown;
+        self.differs = differs;
     }
 }
 
@@ -665,6 +735,33 @@ mod tests {
         let mut both = first.clone();
         both.extend_from_slice(&second);
         assert_eq!(shown(&both, 2, 2), "ab\ncX");
+    }
+
+    /// The frame done with is made the frame shown, by the rows that differ
+    /// alone, for a frame of only the rows that changed to be put together
+    /// over; drawn so, only those rows are looked at and written. There is
+    /// none to make where nothing is shown, nothing is done with yet, or the
+    /// size is another.
+    #[test]
+    fn the_frame_done_with_is_made_the_one_shown() {
+        let mut s = Screen::new();
+        assert!(s.take_like_shown(2, 2).is_none(), "nothing shown");
+        let first = s.draw(frame(&["ab", "cd"]), &hidden(), true, &[]);
+        assert!(s.take_like_shown(2, 2).is_none(), "nothing done with yet");
+        let second = s.draw(frame(&["ab", "cX"]), &hidden(), true, &[]);
+        assert!(s.take_like_shown(3, 2).is_none(), "another size");
+        let mut like = s.take_like_shown(2, 2).expect("the frame done with");
+        assert_eq!(like, frame(&["ab", "cX"]));
+        like.cells[0].text = Text::Char('Y');
+        let mut third = Vec::new();
+        s.draw_rows_into(&mut third, like, &hidden(), true, &[], &[true, false]);
+        let text = String::from_utf8_lossy(&third);
+        assert!(text.contains("\x1b[1;1H\x1b[0mY"), "{text:?}");
+        assert!(!text.contains('X'), "the row said not to change: {text:?}");
+        let mut all = first;
+        all.extend_from_slice(&second);
+        all.extend_from_slice(&third);
+        assert_eq!(shown(&all, 2, 2), "Yb\ncX");
     }
 
     #[test]
