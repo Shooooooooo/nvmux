@@ -65,6 +65,10 @@ const CHILD_KEEP: &str = "NVMUX_TEST_RELAY_KEEP";
 /// parent to have made the server busy before the client comes back.
 const PARKED_FOR: Duration = Duration::from_secs(1);
 
+/// How long, in milliseconds, a keeping child leaves its client parked, where
+/// it is not [`PARKED_FOR`].
+const CHILD_PARKED_MS: &str = "NVMUX_TEST_RELAY_PARKED_MS";
+
 /// Set on a child whose client is started ahead of its first visit
 /// (`[client] lazy = false`): begun and handed to the pool, held there out of
 /// sight for [`AHEAD_FOR`], then taken back and relayed for the first time.
@@ -279,6 +283,10 @@ fn relay_child() {
             let _ = out.flush();
         });
     }
+    let parked_for = std::env::var(CHILD_PARKED_MS)
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map_or(PARKED_FOR, Duration::from_millis);
     let lands = std::env::var(CHILD_LANDS).ok();
     let steps = std::env::var_os(CHILD_STEPS).is_some();
     let mut landing = |_| {
@@ -307,7 +315,7 @@ fn relay_child() {
                 let mut out = std::io::stdout();
                 let _ = out.write_all(PARKED);
                 let _ = out.flush();
-                std::thread::sleep(PARKED_FOR);
+                std::thread::sleep(parked_for);
                 attachment = match pool.take(&id) {
                     nvmux::pool::Taken::Kept(back) => *back,
                     other => panic!("the parked client did not come back: {other:?}"),
@@ -417,6 +425,8 @@ struct Asks {
     ahead_ms: Option<u64>,
     /// [`CHILD_THROTTLE`].
     throttle: bool,
+    /// [`CHILD_PARKED_MS`].
+    parked_ms: Option<u64>,
     /// [`CHILD_LABEL`].
     label: Option<&'static str>,
     /// [`CHILD_FADE_MS`].
@@ -513,6 +523,7 @@ impl Terminal {
             ahead,
             ahead_ms,
             throttle,
+            parked_ms,
             label,
             fade_ms,
             own,
@@ -559,6 +570,9 @@ impl Terminal {
         }
         if throttle {
             cmd = cmd.env(CHILD_THROTTLE, "1");
+        }
+        if let Some(ms) = parked_ms {
+            cmd = cmd.env(CHILD_PARKED_MS, ms.to_string());
         }
         if let Some(ms) = fade_ms {
             cmd = cmd.env(CHILD_FADE_MS, ms.to_string());
@@ -2148,6 +2162,89 @@ fn a_detach_leaves_nothing_of_the_cards_behind() {
         .filter(|row| !row.trim().is_empty())
         .collect();
     assert!(left.is_empty(), "the detach left the shell this: {left:#?}");
+}
+
+/// With `[client] throttle` on, a kept client draws at a crawl while it is
+/// parked: a change its session makes just after it went waits a second to be
+/// drawn. Brought back sooner, with no card — as from the picker or the help
+/// full screen — it draws that change on its way back, and the relay waits
+/// for it: the screen dissolves in as the session is now, not as it was last
+/// drawn, to jump to the present once the fade is over.
+#[test]
+fn a_crawling_client_comes_back_as_its_session_is_now() {
+    require_nvim!();
+    let tag = "crawl-back";
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(
+            &common::unique(tag),
+            &common::launch_with("--clean"),
+            common::anywhere(),
+        )
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    let mut rpc = nvmux::rpc::Client::connect(&sock, Duration::from_secs(3)).expect("connect");
+    rpc.command("setlocal noswapfile | call setline(1, 'as it was')")
+        .expect("setline");
+
+    let mut term = Terminal::spawn_child(
+        &sock,
+        &session.id,
+        Protocol::Kitty,
+        Asks {
+            shadow: true,
+            keep: true,
+            throttle: true,
+            own: true,
+            fade_ms: Some(LONG_FADE_MS),
+            parked_ms: Some(500),
+            ..Asks::default()
+        },
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| {
+            row_on_screen(out, 0).contains("as it was")
+        }),
+        "the session never painted; the screen: {:#?}",
+        screen_rows(&term.output)
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| find(out, DA1).is_some()),
+        "the client never asked its DA1"
+    );
+    // Long enough since its last frame that the client draws the one it goes
+    // with at once, and then nothing for a second.
+    term.pump_until(Duration::from_millis(1500), |_| false);
+
+    let mark = term.output.len();
+    term.type_bytes(&[nvmux::keys::PREFIX, b' ']);
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| {
+            find(&out[mark.min(out.len())..], PARKED).is_some()
+        }),
+        "the child never parked its client"
+    );
+    rpc.command("call setline(1, 'as it is now')")
+        .expect("setline");
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| {
+            find(&out[mark.min(out.len())..], RESUMED).is_some()
+        }),
+        "the parked client never came back"
+    );
+    let after = mark + find(&term.output[mark..], RESUMED).expect("resumed") + RESUMED.len();
+    term.pump_until(Duration::from_millis(LONG_FADE_MS / 4), |_| false);
+    assert!(
+        find(&term.output[after..], b"\x1b[2J").is_none(),
+        "the fade in was over within a quarter of its length"
+    );
+    let row = row_on_screen(&term.output, 0);
+    assert!(
+        row.contains("as it is now"),
+        "a quarter into the fade in, the screen coming back is {row:?}"
+    );
+    assert_eq!(detach(&mut term), Some(0), "the child did not detach");
 }
 
 /// A kept client coming back has the card drawn before its screen dissolves

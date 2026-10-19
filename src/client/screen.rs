@@ -183,6 +183,13 @@ impl Screen {
         Some(spare)
     }
 
+    /// Forget where the cursor was left: the next frame puts it there again,
+    /// and so says something however little else it has to (see
+    /// [`Screen::draw_into`]).
+    pub fn forget_cursor(&mut self) {
+        self.cursor = None;
+    }
+
     /// Forget what the terminal shows: the next frame paints every cell, and
     /// sets the cursor, its shape and its colour afresh.
     pub fn invalidate(&mut self) {

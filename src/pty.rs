@@ -367,6 +367,10 @@ pub struct Attachment {
     /// The client has been told it is out of sight, and not yet that it is
     /// back in front (see [`Attachment::go_away`]).
     away: bool,
+    /// Of `away`, told to draw at a crawl (`[client] throttle`): what nvmux
+    /// keeps of its screen may be a second behind its session's, until it
+    /// draws on its way back to the front (see [`relay`]).
+    crawling: bool,
     /// The settings generation the client last heard (see
     /// [`crate::config::generation`]): the one it was started with, and then
     /// the one it was last told. A relay that finds it stale tells it the
@@ -604,9 +608,10 @@ const DA1_REPLY: &[u8] = b"\x1b[?1;2c";
 const FRAME_WAIT: Duration = Duration::from_millis(50);
 
 /// The longest a kept client being resumed is given to draw the card it was
-/// just asked to, before its backlog is read (see [`relay`]): it draws from
-/// what it has, so it takes a millisecond; this is only the bound on one that
-/// is busy with something else.
+/// just asked to, or — back from drawing at a crawl — what it had yet to,
+/// before its backlog is read (see [`relay`]): it draws from what it has, so
+/// it takes a millisecond; this is only the bound on one that is busy with
+/// something else.
 const CARD_WAIT: Duration = Duration::from_millis(30);
 
 /// The most a resume reads of a kept client's backlog before handing the rest
@@ -2002,6 +2007,7 @@ impl Attachment {
                 &card::Command::Unseen
             });
             self.away = true;
+            self.crawling = throttle;
         }
     }
 
@@ -3048,6 +3054,7 @@ fn spawn_client_with(
         probe: None,
         draws_cards,
         away: false,
+        crawling: false,
         // What its environment was given (see `own_client`), built on this
         // thread a moment ago with nothing changed since.
         heard: crate::config::generation(),
@@ -3335,8 +3342,14 @@ pub fn relay(
         // back — see [`Attachment::drain_unrelayed`]. With the frame it draws
         // the card on among it, which comes a moment after the card was asked
         // for: so the shadow has the card, and the fade in brings it in.
+        //
+        // And so for a client that drew at a crawl while it was away, card
+        // or none: the Clear the opening put in has it draw at once what it
+        // had yet to — up to a second of its session — and say something
+        // even where that is nothing, so the screen comes back as it is now
+        // rather than as it was last drawn, and then jumps.
         if attachment.is_kept() {
-            if landed {
+            if landed || attachment.crawling {
                 attachment.await_output(CARD_WAIT);
             }
             attachment.drain_unrelayed();
@@ -3440,6 +3453,7 @@ pub fn relay(
     // Back in front as far as the client knows: one started ahead was told
     // so above, and one resumed by the Clear the opening put in, above too.
     attachment.away = false;
+    attachment.crawling = false;
     if fresh && attachment.shadow.is_some() {
         attachment.hold = Some(Hold::new(Instant::now()));
     }
@@ -6601,9 +6615,10 @@ mod tests {
     /// A client put aside — parked, or started ahead — is told it has gone
     /// to the back, if it is one that draws cards: in its input, whole, as it
     /// goes. With `[client] throttle` on that it is away, to draw at a crawl
-    /// ([`card::Command::Away`]); with it off, the default, that it is out of
-    /// sight, to hold its cursor's blink ([`card::Command::Unseen`]). Neovim's
-    /// own client, which could not read either, is told nothing.
+    /// ([`card::Command::Away`]), which its return waits on it to catch up
+    /// from; with it off, the default, that it is out of sight, to hold its
+    /// cursor's blink ([`card::Command::Unseen`]). Neovim's own client, which
+    /// could not read either, is told nothing.
     #[test]
     fn a_client_put_aside_is_told_it_is_out_of_sight() {
         for (throttle, draws_cards) in [(true, true), (true, false), (false, true), (false, false)]
@@ -6636,6 +6651,7 @@ mod tests {
                 "parked, throttled: {throttle}, drawing cards: {draws_cards}"
             );
             assert_eq!(back.away, told);
+            assert_eq!(back.crawling, told && throttle);
 
             let mut a = kept(&script);
             a.draws_cards = draws_cards;
@@ -6652,6 +6668,7 @@ mod tests {
                 "started ahead, throttled: {throttle}, drawing cards: {draws_cards}"
             );
             assert_eq!(back.away, told);
+            assert_eq!(back.crawling, told && throttle);
         }
     }
 

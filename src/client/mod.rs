@@ -1769,6 +1769,19 @@ impl App {
         self.dirty = true;
     }
 
+    /// Back in front (see [`crate::card::Command::Clear`]). From away, a
+    /// frame at once — whatever changed since the last, up to a second's
+    /// worth, and the cursor put where it is even where nothing did — which
+    /// nvmux waits for, to bring the session back in as it is now and not as
+    /// it was last drawn (see `crate::pty::relay`).
+    fn come_back(&mut self, now: Instant) {
+        if std::mem::take(&mut self.away) {
+            self.screen.forget_cursor();
+            self.dirty = true;
+        }
+        self.anim.hold_blink(false, now);
+    }
+
     /// Draw with `drawing` from here on, as nvmux has changed its settings
     /// (see [`crate::card::Command::Settings`]).
     ///
@@ -2382,8 +2395,7 @@ impl App {
                     }
                     Some(cmd) => {
                         if matches!(cmd, crate::card::Command::Clear) {
-                            self.away = false;
-                            self.anim.hold_blink(false, now);
+                            self.come_back(now);
                         }
                         if self.cards.apply(cmd, now) {
                             self.dirty = true;
@@ -4801,6 +4813,58 @@ mod tests {
         let did = shown + Duration::from_micros(500);
         redraw(&mut a, vec![line(1, 5, "did")], did);
         assert!(a.due(did), "drawn as in front");
+    }
+
+    /// Back in front from away, a client draws at once, and says something
+    /// even where nothing has changed since its last frame — the cursor, put
+    /// where it is: a frame nvmux waits for, to bring the session back as it
+    /// is now (see `crate::pty::relay`). Back with what it had yet to draw,
+    /// it draws that. In front all along, or back from only being unseen, a
+    /// Clear with nothing to take down draws nothing.
+    #[test]
+    fn a_client_back_from_away_draws_at_once_whatever_changed() {
+        use crate::card::Command::{Away, Clear, Unseen};
+        let t0 = Instant::now();
+        let mut a = attached(true, t0);
+        redraw(&mut a, vec![line(1, 0, "here"), goto(0, 2)], t0);
+        a.frame(t0);
+        // Gone, and drawn as it went: nothing left to draw.
+        let gone = t0 + AWAY_FRAME_GAP;
+        told(&mut a, &Away, gone);
+        assert!(a.due(gone));
+        a.frame(gone);
+        assert!(!a.due(gone + 3 * AWAY_FRAME_GAP), "nothing to draw");
+
+        let front = gone + Duration::from_millis(200);
+        told(&mut a, &Clear, front);
+        assert!(a.due(front), "at once");
+        let text = String::from_utf8_lossy(&a.frame(front)).into_owned();
+        assert!(text.contains("\x1b[1;3H\x1b[?25h"), "{text:?}");
+        assert!(!text.contains("here"), "nothing else: {text:?}");
+
+        // Gone again, and the session drew on after the frame it went with:
+        // back sooner than the crawl would have drawn it, that is drawn.
+        let again = front + Duration::from_secs(5);
+        told(&mut a, &Away, again);
+        a.frame(again);
+        let drew = again + Duration::from_millis(100);
+        redraw(&mut a, vec![line(1, 1, "since")], drew);
+        let back = again + Duration::from_millis(300);
+        assert!(!a.due(back), "held at a crawl");
+        told(&mut a, &Clear, back);
+        assert!(a.due(back));
+        let text = String::from_utf8_lossy(&a.frame(back)).into_owned();
+        assert!(text.contains("since"), "{text:?}");
+
+        // In front, a Clear with no card to take down draws nothing; nor one
+        // back from being unseen, drawn all the while.
+        let later = back + Duration::from_secs(2);
+        told(&mut a, &Clear, later);
+        assert!(!a.due(later), "in front");
+        told(&mut a, &Unseen, later);
+        let unseen = later + Duration::from_secs(2);
+        told(&mut a, &Clear, unseen);
+        assert!(!a.due(unseen), "unseen");
     }
 
     /// A blinking cursor wakes the client on a clock of its own, a frame at

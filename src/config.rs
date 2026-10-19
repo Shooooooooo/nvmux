@@ -217,12 +217,10 @@ pub struct ClientSettings {
     /// for writing more than [`crate::pty::AHEAD_MAX`] before it.
     ///
     /// What on costs: nvmux's copy of a session out of sight is up to a
-    /// second old. A switch to it from another session waits for its client
-    /// to draw the card the switch lands with, and the client brings the rest
-    /// up to date in the same frame; but coming back to it with no card —
-    /// from a cancelled `<prefix> c`, or with `[style] float` off from the
-    /// picker, the help or the settings — fades it in from that copy, and the
-    /// screen jumps to the present after.
+    /// second old, and is brought up to date as the session comes back to
+    /// the front, before it is shown: the client draws what it had yet to,
+    /// and the return waits for that frame — a millisecond or so, and never
+    /// more than 30 for a client busy with something else — card or none.
     pub throttle: bool,
     /// Scroll ahead of a slow link: a key that scrolls — `<C-e>`, `<C-d>`,
     /// `<C-f>`, `zz`, `zl` and their kind, in Normal mode or Insert — or a
