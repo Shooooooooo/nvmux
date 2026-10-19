@@ -194,13 +194,13 @@ pub struct ClientSettings {
     /// client until it is first attached to — a fork, a probe, and a first
     /// paint to wait for, as on a switch to it with `per_session` off. A
     /// session created after nvmux started is started on its first visit
-    /// either way.
+    /// either way, unless a change of `ui` comes first.
     ///
     /// A change of `ui` on the settings screen retires every client there is,
-    /// for the next attach to start the new kind. Off, every other session's
-    /// is then started again as the new kind, behind that one once it has
-    /// painted, as `revive` starts the ones a dropped link took; on, each is
-    /// started on its next visit.
+    /// for the next attach to start the new kind. Off, the client of every
+    /// other session in the listing is then started as the new kind, behind
+    /// that one once it has painted, as `revive` starts again the ones a
+    /// dropped link took; on, each is started on its next visit.
     ///
     /// What off costs, and so the reasons to turn it on:
     ///
