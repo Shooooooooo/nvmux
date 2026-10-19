@@ -3062,6 +3062,41 @@ fn a_window_showing_a_terminal_keeps_its_width() {
     assert_eq!(term.hang_up(), Some(0), "the client's exit");
 }
 
+/// A float on a window whose text is centred goes in with the text, but no
+/// further than keeps it on the screen: a diagnostic's, opened at the end of
+/// a long line, which Neovim fits to the screen beside the window's grid, is
+/// drawn whole — its message and its border — not past the screen's edge.
+#[test]
+fn a_float_by_centred_text_stays_on_the_screen() {
+    require_nvim!();
+    let scratch = Scratch::new("client-centre-float");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-centre-float");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    rpc.command(
+        "lua vim.diagnostic.config({ signs = false, float = { border = 'single' } }) \
+         vim.api.nvim_buf_set_lines(0, 0, -1, false, { string.rep('x', 56) }) \
+         vim.diagnostic.set(vim.api.nvim_create_namespace('test'), 0, \
+           { { lnum = 0, col = 0, message = string.rep('m', 80) .. ' end' } }) \
+         vim.api.nvim_win_set_cursor(0, { 1, 55 })",
+    )
+    .expect("a diagnostic");
+    // Left open however the cursor moves, as the move above has it.
+    rpc.command("lua vim.diagnostic.open_float({ close_events = {} })")
+        .expect("its float");
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| s
+            .lines()
+            .any(|l| l.ends_with(" end│"))),
+        "the float is not on the screen whole:\n{}",
+        term.text()
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
 /// Wait for the editor to say `want` of itself (see [`widths`]), drawing
 /// what the client sends as it does.
 fn until_widths(

@@ -6,14 +6,15 @@
 //! that wide (`nvim_ui_try_resize_grid`, which only a UI with `ext_multigrid`
 //! can ask): Neovim draws its text to that width — wraps its lines there,
 //! ends its cursor line there — and the client puts it in the middle of the
-//! window ([`inset`]), a float anchored to it with it. The status line under
-//! it is still the window's width, as Neovim draws it, and has its words
-//! moved in to stand over the text ([`realign`]). A window showing a terminal
-//! wants the whole terminal, so it is not asked: its grid is as wide as
-//! Neovim tells the program in it its terminal is. A grid asked for is the
-//! window's for every UI of the session: as the client goes, it asks for each
-//! window's own width back, and waits a moment for Neovim to have done it
-//! ([`super::run`]).
+//! window ([`inset`]), a float anchored to it with it, as far as keeps the
+//! float on the screen (see [`super::model::Model::inset`]). The status line
+//! under it is still the window's width, as Neovim draws it, and has its
+//! words moved in to stand over the text ([`realign`]). A window showing a
+//! terminal wants the whole terminal, so it is not asked: its grid is as
+//! wide as Neovim tells the program in it its terminal is. A grid asked for
+//! is the window's for every UI of the session: as the client goes, it asks
+//! for each window's own width back, and waits a moment for Neovim to have
+//! done it ([`super::run`]).
 //!
 //! The client cuts its own copy of a grid to the width it asks for as it
 //! asks, as Neovim cuts its own once it has the ask: a window split off

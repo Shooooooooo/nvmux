@@ -572,8 +572,9 @@ impl Model {
 
     /// How far in from where the editor put it grid `grid` is drawn: a
     /// window's grid narrower than the window in the middle of it, and a
-    /// float anchored to that window as far in as its text (see
-    /// [`super::wide`]). Nought for anything else.
+    /// float anchored to that window as far in as its text, but no further
+    /// than keeps the float on the screen (see [`super::wide`]). Nought for
+    /// anything else.
     pub fn inset(&self, grid: u64) -> usize {
         let window = |grid: u64| match self.layout.get(&grid).map(|p| &p.place) {
             Some(Place::Window { width, .. }) => self
@@ -584,10 +585,21 @@ impl Model {
         };
         match self.layout.get(&grid).map(|p| &p.place) {
             Some(Place::Window { .. }) => window(grid),
+            // Neovim fitted the float to the screen where it put it, beside
+            // the window's grid as it has it, at the window's edge. As far
+            // in as the text, one near the right of the screen — a
+            // diagnostic's, hover's, the completion menu — would be past
+            // the screen's edge, its end and its border cut off.
             Some(Place::Float {
                 anchor: Some(anchor),
+                col,
                 ..
-            }) if *anchor != grid => window(*anchor),
+            }) if *anchor != grid => {
+                let screen = self.grids.get(&1).map_or(0, Grid::width) as i64;
+                let width = self.grids.get(&grid).map_or(0, Grid::width) as i64;
+                let room = usize::try_from(screen - col - width).unwrap_or(0);
+                window(*anchor).min(room)
+            }
             _ => 0,
         }
     }

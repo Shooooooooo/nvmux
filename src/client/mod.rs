@@ -6183,6 +6183,65 @@ mod tests {
         assert_eq!(shown(&mut a, t0)[0], "      text", "answered");
     }
 
+    /// A float anchored to a window whose text is centred goes in with the
+    /// text, but no further than keeps it on the screen: Neovim fitted it to
+    /// the screen where it put it, and one near the right of the screen
+    /// would otherwise be drawn past its edge.
+    #[test]
+    fn a_float_goes_in_with_the_text_no_further_than_the_screen() {
+        let t0 = Instant::now();
+        let (mut a, _) = wide_app(t0);
+        redraw(
+            &mut a,
+            vec![
+                resize(1, 20, 6),
+                resize(2, 20, 5),
+                place(2, 1000, 0, 0, 20, 5),
+                viewport(2, 1000),
+            ],
+            t0,
+        );
+        redraw(&mut a, vec![resize(2, 8, 5)], t0);
+        // Grid 3, a float 8 wide on the window's grid, at column `col`.
+        let float = |col: i64| -> (&'static str, Vec<Value>) {
+            let n = |v: i64| Value::from(v);
+            (
+                "win_float_pos",
+                vec![
+                    n(3),
+                    n(1001),
+                    "NW".into(),
+                    n(2),
+                    n(1),
+                    n(col),
+                    true.into(),
+                    n(50),
+                    n(1),
+                    n(1),
+                    n(col),
+                ],
+            )
+        };
+        redraw(
+            &mut a,
+            vec![resize(3, 8, 1), float(2), line(3, 0, "abcdefgh")],
+            t0,
+        );
+        let t1 = t0 + Duration::from_secs(1);
+        assert_eq!(
+            shown(&mut a, t1)[1],
+            "        abcdefgh",
+            "6 in, with the text"
+        );
+        redraw(&mut a, vec![float(10)], t1);
+        let t2 = t1 + Duration::from_secs(1);
+        assert_eq!(
+            shown(&mut a, t2)[1],
+            "            abcdefgh",
+            "2 in, to the screen's edge and not past it"
+        );
+    }
+
     /// Attaching again without `ext_multigrid` for a UI that keeps windows on
     /// grid 1, the client lets go of the windows it narrowed before it
     /// detaches, while Neovim still takes it of it: that UI is to see them
