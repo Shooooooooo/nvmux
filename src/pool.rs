@@ -204,7 +204,9 @@ impl Pool {
     }
 
     /// Retire every client held here: they are of the kind `[client] ui` no
-    /// longer names, and the next visit to each session starts the other.
+    /// longer names, and the other is started for each session — behind the
+    /// session in front with `[client] lazy` off, and otherwise on its next
+    /// visit (see `main`'s `Revival`).
     pub fn retire_all(&mut self) {
         for parked in &mut self.parked {
             parked.tell_to_retire();

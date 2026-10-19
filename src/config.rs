@@ -196,6 +196,12 @@ pub struct ClientSettings {
     /// session created after nvmux started is started on its first visit
     /// either way.
     ///
+    /// A change of `ui` on the settings screen retires every client there is,
+    /// for the next attach to start the new kind. Off, every other session's
+    /// is then started again as the new kind, behind that one once it has
+    /// painted, as `revive` starts the ones a dropped link took; on, each is
+    /// started on its next visit.
+    ///
     /// What off costs, and so the reasons to turn it on:
     ///
     /// - Every session has a client — a UI of its server, with all that
@@ -203,8 +209,9 @@ pub struct ClientSettings {
     ///   from its first visit.
     /// - nvmux's start pays a listing and, per session, a fork and an ssh
     ///   forward, before the picker is drawn.
-    /// - Every session is probed as nvmux starts, which ends a hit-enter
-    ///   prompt in each, as a visit would (see `pty::probe_on`).
+    /// - Every session is probed as nvmux starts, and again after a change of
+    ///   `ui`, which ends a hit-enter prompt in each, as a visit would (see
+    ///   `pty::probe_on`).
     /// - A client that writes more than [`crate::pty::AHEAD_MAX`] before its
     ///   first visit — a `:terminal` running something — is let go, and its
     ///   session is started on its first visit after all.
