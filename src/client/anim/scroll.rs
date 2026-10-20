@@ -251,6 +251,12 @@ impl Scroll {
         self.ahead.iter().any(|a| a.seq.is_some_and(|s| s <= k))
     }
 
+    /// The client's numbers for the inputs the scrolls ahead were made of,
+    /// where it numbers them.
+    pub fn seqs(&self) -> Vec<u64> {
+        self.ahead.iter().filter_map(|a| a.seq).collect()
+    }
+
     /// Whether there are scrolls ahead the view does not show yet.
     pub fn held(&self) -> bool {
         self.drawn < self.ahead.len()

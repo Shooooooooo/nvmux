@@ -677,19 +677,30 @@ impl Animator {
         }
     }
 
-    /// Whether window grid `grid` has a scroll ahead of Neovim made by input
-    /// `k` of the client's, or one before it, that Neovim has yet to make:
-    /// see [`Scroll::unmade`].
-    pub fn unmade(&self, grid: u64, k: u64) -> bool {
-        self.scrolls.get(&grid).is_some_and(|s| s.unmade(k))
+    /// The window grids with a scroll ahead of Neovim made by input `k` of
+    /// the client's, or one before it, that Neovim has yet to make: see
+    /// [`Scroll::unmade`].
+    pub fn unmade(&self, k: u64) -> Vec<u64> {
+        let mut grids: Vec<u64> = self
+            .scrolls
+            .iter()
+            .filter(|(_, s)| s.unmade(k))
+            .map(|(g, _)| *g)
+            .collect();
+        grids.sort_unstable();
+        grids
     }
 
     /// Stop scrolling window grid `grid` ahead of Neovim: it shows Neovim's
-    /// view again.
-    pub fn give_up(&mut self, grid: u64) {
-        if let Some(s) = self.scrolls.get_mut(&grid) {
-            s.give_up();
-        }
+    /// view again. Says the client's numbers for the inputs the scrolls it
+    /// gave up were made of, where it numbers them.
+    pub fn give_up(&mut self, grid: u64) -> Vec<u64> {
+        let Some(s) = self.scrolls.get_mut(&grid) else {
+            return Vec::new();
+        };
+        let seqs = s.seqs();
+        s.give_up();
+        seqs
     }
 
     /// Give up on no scroll made ahead of Neovim, up or down or sideways,

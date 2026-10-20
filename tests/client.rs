@@ -2123,6 +2123,121 @@ fn a_page_neovim_does_not_turn_is_given_up_in_time() {
     );
 }
 
+/// Pages typed faster than a slow link answers, by a client told to work
+/// out the motions as well, which goes by what the agent says Neovim made
+/// of each key: each is still on the screen before Neovim could have heard
+/// of it.
+#[test]
+fn pages_typed_faster_than_the_link_answers_keep_up_told_the_motions() {
+    require_nvim!();
+    let scratch = Scratch::new("client-burst-ack");
+    let (mut rpc, mut term, link) = drawn_slowly_with(
+        &scratch,
+        "client-burst-ack",
+        "call setline(1, map(range(1, 2000), '\"line \" . v:val'))",
+        "predict_keys = \"motions\"\n",
+    );
+    let run = pages(&mut rpc, &mut term, &link, Duration::from_millis(100), 10);
+    for (k, late) in run.late().iter().enumerate() {
+        assert!(
+            late.is_some_and(|l| l < SLOW),
+            "page {} waited: {late:?}\n{}",
+            k + 1,
+            run.timeline(k + 1)
+        );
+    }
+}
+
+/// The page Neovim does not turn of [`a_page_neovim_does_not_turn_is_given_up_in_time`],
+/// typed to a client told to work out the motions as well: the agent says
+/// which keys Neovim has taken with the frame that draws them, and the
+/// page is given up on with the first frame that should have turned it and
+/// did not — not two round trips and more after — the view back by that
+/// page alone, and the pages after it made again from there, on to where
+/// Neovim ends.
+#[test]
+fn a_page_neovim_does_not_turn_is_given_up_at_its_ack() {
+    require_nvim!();
+    let scratch = Scratch::new("client-unturn-ack");
+    const SCROLL: Duration = Duration::from_millis(30);
+    let (mut rpc, mut term, link) = drawn_slowly_with(
+        &scratch,
+        "client-unturn-ack",
+        &format!(
+            "call setline(1, map(range(1, 2000), '\"line \" . v:val')) | \
+             autocmd WinScrolled * lua vim.uv.sleep({})",
+            SCROLL.as_millis()
+        ),
+        "predict_keys = \"motions\"\n",
+    );
+    rpc.command(
+        "lua local n = 0 vim.on_key(function(key) \
+         if key == '\\6' then n = n + 1 if n == 5 then return '' end end end)",
+    )
+    .expect("on_key");
+    term.pump_until(4 * SLOW, |_| false);
+    // How many keys the agent had counted before the pages: the fifth is
+    // counted all the same, a key thrown away being a key taken.
+    let count = |a: &Vec<Value>| a.first().and_then(Value::as_u64).expect("a count");
+    let before = link
+        .trace
+        .acks()
+        .last()
+        .map(|(_, a)| count(a))
+        .expect("an ack");
+    let t0 = Instant::now();
+    let mut seen: Vec<(u32, Instant)> = Vec::new();
+    let mut watch = |term: &mut Terminal, until: Instant| loop {
+        let now = Instant::now();
+        let last = seen.last().map(|&(top, _)| top);
+        if let Some(top) = top_line(&term.text()).filter(|&top| Some(top) != last) {
+            seen.push((top, now));
+        }
+        if now >= until {
+            return;
+        }
+        let last = seen.last().map(|&(top, _)| top);
+        term.pump(until - now, |t| top_line(&t.text()) != last);
+    };
+    for k in 1..=28 {
+        term.type_bytes(b"\x06");
+        watch(&mut term, t0 + Duration::from_millis(10) * k);
+    }
+    let w0 = |rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>| {
+        rpc.eval("line('w0')").ok().and_then(|v| v.as_u64())
+    };
+    watch(&mut term, Instant::now() + 6 * SLOW);
+    assert!(
+        common::wait_until(Duration::from_secs(10), || w0(&mut rpc) == Some(541)),
+        "Neovim went elsewhere: {:?}",
+        w0(&mut rpc)
+    );
+    watch(&mut term, Instant::now() + 6 * SLOW);
+    let when: Vec<(u32, Duration)> = seen.iter().map(|&(top, at)| (top, at - t0)).collect();
+    let tops: Vec<u32> = seen.iter().map(|&(top, _)| top).collect();
+    let back: Vec<usize> = (1..seen.len()).filter(|&i| tops[i] < tops[i - 1]).collect();
+    assert_eq!(back.len(), 1, "back but once: {when:?}");
+    let i = back[0];
+    assert_eq!(tops[i - 1] - tops[i], 20, "by that page alone: {when:?}");
+    assert_eq!(tops.last(), Some(&541), "where Neovim ends: {when:?}");
+    // The first ack to cover the fifth page, and the frame with it: the
+    // view went back as that came, and no sooner.
+    let acked = link
+        .trace
+        .acks()
+        .into_iter()
+        .find(|(_, a)| count(a) >= before + 5)
+        .map(|(written, _)| written)
+        .expect("an ack covering the fifth page");
+    let gone = seen[i].1;
+    assert!(
+        gone >= acked && gone < acked + Duration::from_millis(100),
+        "back {:?} after the ack that covered it: {when:?}",
+        gone.checked_duration_since(acked)
+            .map_or_else(|| format!("-{:?}", acked - gone), |d| format!("{d:?}"))
+    );
+}
+
 /// A run of pages longer than the lines the client keeps lets go of those
 /// furthest behind rather than start again from two windows: every page of
 /// it is on the screen before Neovim could have heard of it. And edits after

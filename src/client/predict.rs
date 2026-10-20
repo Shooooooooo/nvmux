@@ -113,7 +113,16 @@
 //! it, key by key — and how long that word takes to come is how long a
 //! prediction is waited for ([`Predictor::deadline`]).
 //!
-//! Nothing is drawn of that yet. The client follows the keys that move the
+//! The scrolls go by it. A key the client predicts no longer leaves it
+//! unsure of the next, nor one it cannot follow of every key after it till
+//! Neovim has caught up with them all: from each ack it starts again where
+//! Neovim is, and makes what it can of the keys sent since — a scroll typed
+//! after a key it was blind to is made with that key's ack, a round trip
+//! after the key, not after the last typed ([`Typed`]). And a scroll made
+//! ahead of Neovim of a key an ack covers, which the frame for it did not
+//! make, is given up on with that frame, not at its deadline.
+//!
+//! Nothing else is drawn of it yet. The client follows the keys that move the
 //! cursor in Normal mode a character or a line at a time
 //! ([`super::moves`]), works out where those typed since Neovim's last word
 //! would have left the cursor and the view, and judges that against where
@@ -1697,6 +1706,20 @@ const MAX_COUNT: i64 = 9999;
 /// Neovim answers a request only once it has taken every key sent before it,
 /// and drawn what they did, so the answer to one is when the picture is
 /// Neovim's again.
+///
+/// # Where the agent says what Neovim made of each key
+///
+/// There is a better word than a fence's to go by (see [`Ack`]), and the
+/// client goes by it instead: what it makes of the keys is worked out from
+/// Neovim's last word on them, and the keys sent since ([`Typed::rebase`]).
+/// A key it predicts leaves it as sure as it was — that is the point of
+/// predicting it — and a key it cannot follow, or does not make what it
+/// makes of it, leaves it *blind* from that key on: nothing is predicted
+/// till an ack covers it. At each ack the client starts again from where it
+/// says Neovim is, and makes out the keys after it once more, making what
+/// it can of those it could not before (see `super::App`): a scroll typed
+/// after a key it was blind to is made once Neovim has said where that key
+/// left things, not once Neovim has caught up with every key typed.
 #[derive(Debug, Clone, Default)]
 pub struct Typed {
     state: State,
@@ -1714,6 +1737,15 @@ pub struct Typed {
     /// Every input sent, numbered as the agent counts the keys Neovim takes
     /// (see [`Sync`]): a key of `nvim_input` one, an `nvim_input_mouse` one.
     seq: u64,
+    /// Which keys the client works out ahead of Neovim: past the scrolls,
+    /// it goes by what the agent says Neovim made of each key, not by
+    /// fences.
+    keys: PredictKeys,
+    /// Where it does, whether an input since Neovim's last word is one it
+    /// does not know what Neovim makes of.
+    blind: bool,
+    /// Whether the input being made out is one the client cannot follow.
+    lost: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1734,6 +1766,30 @@ impl Typed {
     /// makes one the client can follow.
     pub fn key(&mut self, key: &str, mapped: impl Fn(bool, &str) -> bool) -> Option<Command> {
         self.seq += 1;
+        let command = self.step(key, mapped);
+        if self.lost {
+            self.sent += 1;
+        }
+        command
+    }
+
+    /// A key sent before, made out again from where an ack left the client
+    /// (see [`Typed::rebase`]) — or the first time, as [`Typed::key`] makes
+    /// out a key typed: the scroll it makes, if it makes one the client can
+    /// follow. Where it is not one, and the agent says what Neovim made of
+    /// each key, the client is blind from it on.
+    pub fn step(&mut self, key: &str, mapped: impl Fn(bool, &str) -> bool) -> Option<Command> {
+        self.lost = false;
+        let command = self.parse(key, mapped);
+        if self.lost {
+            self.blinded();
+        }
+        command
+    }
+
+    /// What a key typed makes, as far as the client can tell; a key it
+    /// cannot follow is [`Typed::lost`].
+    fn parse(&mut self, key: &str, mapped: impl Fn(bool, &str) -> bool) -> Option<Command> {
         if let State::Insert { x } = self.state {
             return self.insert_key(key, x, |k| mapped(true, k));
         }
@@ -1797,7 +1853,7 @@ impl Typed {
                         })
                     }
                     None => {
-                        self.sent += 1;
+                        self.lost = true;
                         self.whole = false;
                         self.state = State::Lost;
                         None
@@ -1838,7 +1894,7 @@ impl Typed {
         }
         // Text, or a key that moves the cursor, which the client does not
         // predict; or one that waits for another, which it cannot follow.
-        self.sent += 1;
+        self.lost = true;
         self.waits = !plain || INSERT_WAITS.contains(&key);
         self.whole = !self.waits;
         self.state = match key {
@@ -1868,7 +1924,7 @@ impl Typed {
 
     /// A key that moves things the client does not predict.
     fn moved(&mut self, key: &str, mapped: &impl Fn(&str) -> bool) {
-        self.sent += 1;
+        self.lost = true;
         self.waits = INSERT_WAITS.contains(&key);
         self.whole = (WHOLE.contains(&key) || SCROLLS.contains(&key)) && !mapped(key);
         self.state = match self.state {
@@ -1879,17 +1935,64 @@ impl Typed {
     }
 
     /// Something else that moves things — a click, a paste — or a scroll
-    /// the client made out but did not predict.
+    /// the client made out but did not predict: the client is blind from
+    /// here on, where it goes by acks.
     pub fn missed(&mut self) {
         self.sent += 1;
+        self.blinded();
     }
 
     /// A click or a paste, which may change the mode as well.
     pub fn other(&mut self) {
         self.sent += 1;
+        self.clicked();
+    }
+
+    /// A click, or one made out again (see [`Typed::step`]): where the
+    /// cursor goes, and what mode it leaves, nothing says.
+    pub fn clicked(&mut self) {
         self.whole = true;
         self.waits = false;
         self.state = State::Lost;
+        self.blinded();
+    }
+
+    /// Where the agent says what Neovim made of each key, the client does
+    /// not know what Neovim makes of the input made out last, and so of
+    /// none after it, till an ack covers it.
+    pub fn blinded(&mut self) {
+        if self.keys >= PredictKeys::Motions {
+            self.blind = true;
+        }
+    }
+
+    /// Neovim is where an ack says, resting as `rest` says: what the inputs
+    /// after the last it covers make is to be made out again from there,
+    /// each with [`Typed::step`], blind or not as it now finds them.
+    pub fn rebase(&mut self, rest: Rest) {
+        self.state = match rest {
+            Rest::Normal | Rest::Visual => State::Ready(None),
+            Rest::Insert => State::Insert { x: false },
+            Rest::Busy => State::Lost,
+        };
+        self.whole = true;
+        self.waits = false;
+        self.blind = false;
+    }
+
+    /// Whether what the inputs since Neovim's last word make can be followed
+    /// from it: none of them one the client does not know what Neovim makes
+    /// of, and nothing pending that it cannot make out.
+    pub fn followed(&self) -> bool {
+        !self.blind && self.state != State::Lost
+    }
+
+    /// Work out `keys` ahead of Neovim from here on: see [`Typed::keys`].
+    /// Blind or not, the client stays as it is: from the scrolls alone, it
+    /// is not; to them, it does not matter; and between the motions and
+    /// the typing, what it does not know of a key it still does not.
+    pub fn set_keys(&mut self, keys: PredictKeys) {
+        self.keys = keys;
     }
 
     /// A fresh attach: nothing is known of what is pending.
@@ -1949,8 +2052,13 @@ impl Typed {
     /// last leaving nothing pending, it is waiting for a fresh command, or
     /// for what is typed in insert mode. A fence can be answered before the
     /// frame that says which mode Neovim is in, which is why this is asked
-    /// again at every frame.
+    /// again at every frame. Where the agent says what Neovim made of each
+    /// key, its word settles that instead (see [`Typed::rebase`]): a frame
+    /// may be one Neovim drew part way through the keys.
     pub fn settle(&mut self, mode: Mode) {
+        if self.keys >= PredictKeys::Motions {
+            return;
+        }
         if self.drawn == self.sent && self.state == State::Lost {
             self.state = match mode {
                 Mode::Normal if self.whole => State::Ready(None),
@@ -2000,23 +2108,27 @@ impl Want {
 }
 
 /// What Neovim is doing, as far as predictions go: waiting in Normal mode
-/// for a command, waiting in Insert mode for what is typed, or anything else
-/// — an operator pending, Visual mode, the command line, completion, a key
-/// typed after Insert mode's `<C-o>`, Replace — which nothing is predicted
-/// from.
+/// for a command, in Visual mode for one, in Insert mode for what is typed,
+/// or anything else — an operator pending, the command line, completion, a
+/// key typed after Insert mode's `<C-o>`, Replace — which nothing is
+/// predicted from. Visual mode has its scrolls predicted, as Normal mode's
+/// are, and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rest {
     Normal,
+    Visual,
     Insert,
     Busy,
 }
 
 impl Rest {
-    /// By the mode `nvim_get_mode()` says, as the agent sends it: `n`, `i`,
-    /// or anything else — `no`, `niI`, `ic` and their kind.
+    /// By the mode `nvim_get_mode()` says, as the agent sends it: `n`, `v`,
+    /// `V` or `<C-v>`, `i`, or anything else — `no`, `niI`, `ic` and their
+    /// kind.
     pub fn of(mode: &str) -> Self {
         match mode {
             "n" => Rest::Normal,
+            "v" | "V" | "\x16" => Rest::Visual,
             "i" => Rest::Insert,
             _ => Rest::Busy,
         }
@@ -2027,6 +2139,7 @@ impl Rest {
     pub fn drawn(name: &str) -> Self {
         match name {
             "normal" => Rest::Normal,
+            "visual" => Rest::Visual,
             "insert" => Rest::Insert,
             _ => Rest::Busy,
         }
@@ -2399,12 +2512,36 @@ pub struct Base {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sent {
     pub seq: u64,
-    /// The key, `None` for a mouse report.
-    pub key: Option<Box<str>>,
+    pub input: Input,
     pub at: Instant,
+    /// Whether what the client made of it is made: a scroll ahead of
+    /// Neovim, or nothing to make — so not to be made again from an ack,
+    /// the scroll still ahead or made by Neovim since. A scroll given up on
+    /// at an ack, or one not made, is made again from it.
+    pub made: bool,
     /// Whether it left Neovim waiting for another key, as far as the client
     /// could tell (see [`Typed::pending`]).
     pub pending: bool,
+}
+
+/// An input sent, as the client made it out again from an ack (see
+/// [`Typed::rebase`]): a key of Neovim's notation, a turn of the wheel,
+/// which a scroll ahead may have been made of, or any other mouse report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Input {
+    Key(Box<str>),
+    Wheel,
+    Click,
+}
+
+impl Input {
+    /// The key, if it is one.
+    pub fn key(&self) -> Option<&str> {
+        match self {
+            Input::Key(key) => Some(key),
+            Input::Wheel | Input::Click => None,
+        }
+    }
 }
 
 /// The most inputs kept since Neovim's last word on them: more, and Neovim
@@ -2506,6 +2643,20 @@ impl Predictor {
     /// [`Predictor::keys`].
     pub fn acks(&self) -> bool {
         self.keys >= PredictKeys::Motions
+    }
+
+    /// Work out `keys` ahead of Neovim from here on, besides the scrolls.
+    pub fn set_keys(&mut self, keys: PredictKeys) {
+        self.keys = keys;
+        self.typed.set_keys(keys);
+    }
+
+    /// Whether what the inputs since Neovim's last word make can be worked
+    /// out from it, where the agent says what Neovim made of each key: the
+    /// counts tied, a word from Neovim to go by, and each input since one
+    /// the client follows (see [`Typed::followed`]).
+    pub fn known(&self) -> bool {
+        self.sync.synced() && self.base.is_some() && self.typed.followed()
     }
 
     /// Whether the link is slow enough to predict over.
@@ -2710,14 +2861,27 @@ impl Predictor {
             || (self.acks() && self.sync.wants_fence(self.typed.seq()) && !self.typed.fencing())
     }
 
-    /// Input `seq` sent at `now`: `key`, or a mouse report. Where the agent
-    /// says what Neovim made of each key, kept for its count to be checked
-    /// by; and for its acks to be judged by while it says them, which it
-    /// does not over a link too fast for predictions.
+    /// Input `seq` sent at `now`: `key`, or a mouse report other than a turn
+    /// of the wheel. Where the agent says what Neovim made of each key, kept
+    /// for its count to be checked by; and for its acks to be judged by
+    /// while it says them, which it does not over a link too fast for
+    /// predictions.
     pub fn sent(&mut self, seq: u64, key: Option<&str>, now: Instant) {
+        let input = key.map_or(Input::Click, |k| Input::Key(k.into()));
+        self.keep(seq, input, now);
+    }
+
+    /// Input `seq`, a turn of the wheel, sent at `now`: see
+    /// [`Predictor::sent`].
+    pub fn turned(&mut self, seq: u64, now: Instant) {
+        self.keep(seq, Input::Wheel, now);
+    }
+
+    fn keep(&mut self, seq: u64, input: Input, now: Instant) {
         if !self.acks() {
             return;
         }
+        let key = input.key();
         self.sync.sent(seq, key);
         if key.is_some_and(uncertain) {
             self.sync.doubt("a key Neovim may count as two");
@@ -2731,10 +2895,26 @@ impl Predictor {
         }
         self.queue.push_back(Sent {
             seq,
-            key: key.map(Into::into),
+            input,
             at: now,
             pending: self.typed.pending(),
+            made: false,
         });
+    }
+
+    /// What the client made of input `seq` is made: see [`Sent::made`].
+    pub fn made(&mut self, seq: u64) {
+        if let Some(s) = self.queue.iter_mut().find(|s| s.seq == seq) {
+            s.made = true;
+        }
+    }
+
+    /// The scrolls ahead made of inputs `seqs` are given up on: to be made
+    /// again from the next ack, where they can be.
+    pub fn given_up(&mut self, seqs: &[u64]) {
+        for s in self.queue.iter_mut().filter(|s| seqs.contains(&s.seq)) {
+            s.made = false;
+        }
     }
 
     /// An ack heard at `now`: the client's number for the last key it
@@ -2769,6 +2949,7 @@ impl Predictor {
         }
         let last = self.sync.last.as_ref();
         if let Some(ack) = last.filter(|a| i64::try_from(a.count) == Ok(taken)) {
+            self.typed.rebase(ack.pos.rest);
             self.base = Some(Base {
                 seq: at.seq,
                 ack: ack.clone(),
@@ -2801,7 +2982,7 @@ impl Predictor {
                 .queue
                 .iter()
                 .filter(|s| s.seq > base.seq && s.seq <= k)
-                .map(|s| s.key.as_deref())
+                .map(|s| s.input.key())
                 .collect();
             let keys = keys.filter(|keys| keys.len() as u64 == k - base.seq);
             let followed = keys
@@ -2828,6 +3009,7 @@ impl Predictor {
                 s.log();
             }
         }
+        self.typed.rebase(ack.pos.rest);
         self.base = Some(Base { seq: k, ack });
         self.queue.retain(|s| s.seq > k);
     }
@@ -2894,14 +3076,15 @@ impl Predictor {
     /// A key typed while window `win` has the cursor, as [`Typed::key`]
     /// takes it, with that window's mappings.
     pub fn key(&mut self, win: Option<i64>, key: &str) -> Option<Command> {
-        let shape = win.and_then(|w| self.shapes.get(&w));
-        let mapped = |insert: bool, k: &str| {
-            shape.is_some_and(|s| {
-                let list = if insert { &s.imapped } else { &s.mapped };
-                list.iter().any(|m| m == k)
-            })
-        };
+        let mapped = mapping(win.and_then(|w| self.shapes.get(&w)));
         self.typed.key(key, mapped)
+    }
+
+    /// A key sent while window `win` had the cursor, made out again from
+    /// Neovim's last word on the keys before it: see [`Typed::step`].
+    pub fn remake(&mut self, win: Option<i64>, key: &str) -> Option<Command> {
+        let mapped = mapping(win.and_then(|w| self.shapes.get(&w)));
+        self.typed.step(key, mapped)
     }
 
     /// A count given `<C-d>` or `<C-u>` is window `win`'s `'scroll'` from
@@ -2972,6 +3155,18 @@ impl Predictor {
             Some(self.coloured(win, lnum)?)
         };
         render(text, shape, lnum, width, look, cursor)
+    }
+}
+
+/// Whether something maps a key, as a window of `shape` has it, in Insert
+/// mode if asked about that (see [`Typed::key`]): nothing, for a window the
+/// agent has said nothing of.
+fn mapping(shape: Option<&Shape>) -> impl Fn(bool, &str) -> bool + '_ {
+    move |insert, k| {
+        shape.is_some_and(|s| {
+            let list = if insert { &s.imapped } else { &s.mapped };
+            list.iter().any(|m| m == k)
+        })
     }
 }
 
@@ -5067,7 +5262,19 @@ mod tests {
         assert_eq!(read(before), None, "a line before the first");
         assert_eq!(Rest::drawn("normal"), Rest::Normal);
         assert_eq!(Rest::drawn("insert"), Rest::Insert);
-        assert_eq!(Rest::drawn("visual"), Rest::Busy);
+        assert_eq!(Rest::drawn("operator"), Rest::Busy);
+    }
+
+    /// Visual mode, as an ack says it and as the editor draws it, is a rest
+    /// of its own: one that keys and the wheel scroll in as predicted, as in
+    /// Normal mode, and that no motion is drawn ahead in.
+    #[test]
+    fn visual_mode_is_a_rest_of_its_own() {
+        for mode in ["v", "V", "\x16"] {
+            assert_eq!(Rest::of(mode), Rest::Visual, "{mode:?}");
+        }
+        assert_eq!(Rest::drawn("visual"), Rest::Visual);
+        assert_eq!(Rest::of("vs"), Rest::Busy, "Visual by way of Select mode");
     }
 
     /// Each key the client sends is a key as the agent counts what Neovim's
@@ -5355,6 +5562,110 @@ mod tests {
         assert!(!s.synced());
         assert_eq!(s.answered(at, 0, 0), Answer::Tied);
         assert!(s.synced());
+    }
+
+    /// A [`Typed`] that goes by what the agent says Neovim made of each key,
+    /// rested in Normal mode by an ack covering input 0.
+    fn acked() -> Typed {
+        let mut t = Typed::default();
+        t.set_keys(PredictKeys::Motions);
+        t.rebase(Rest::Normal);
+        t
+    }
+
+    /// Where the agent says what Neovim made of each key, a key the client
+    /// predicts leaves it as sure of the next as it was: a held `<C-e>`
+    /// stays predicted, however far ahead of Neovim it gets, and no fence is
+    /// wanted for it. Told only to scroll, the client follows the keys as
+    /// ever.
+    #[test]
+    fn predicted_keys_never_make_the_client_unsure() {
+        let mut t = acked();
+        for _ in 0..30 {
+            assert_eq!(typed(&mut t, "<C-e>"), [Command::Lines(1)]);
+            assert!(t.followed());
+        }
+        assert!(!t.wants_fence());
+        let mut p = Predictor::default();
+        p.set_keys(PredictKeys::Motions);
+        p.sync = tied(0, 0);
+        p.base = Some(Base {
+            seq: 0,
+            ack: ack(0, ""),
+        });
+        p.typed.rebase(Rest::Normal);
+        for _ in 0..30 {
+            p.key(Some(1000), "<C-e>");
+            assert!(p.known());
+        }
+        let mut scrolls = Typed::default();
+        typed(&mut scrolls, "j");
+        assert!(!scrolls.followed(), "lost till a fence, as ever");
+    }
+
+    /// A key the client cannot follow leaves it blind from that key on —
+    /// a scroll after it is made out, but nothing is predicted — till an ack
+    /// covers it; and then the keys after it are made out again from where
+    /// the ack says Neovim is, blind again from the next it cannot follow.
+    #[test]
+    fn a_key_left_to_neovim_is_caught_up_with_at_its_own_ack() {
+        let mut t = acked();
+        typed(&mut t, "x");
+        assert!(!t.followed(), "blind from `x`");
+        assert_eq!(typed(&mut t, "<C-e>"), [Command::Lines(1)]);
+        assert!(!t.followed());
+        assert!(t.wants_fence(), "a fence after it, for counts and all");
+        // An ack covering an input before `x`: made out again, `x` blinds
+        // the client again, and the scroll is made out after it.
+        t.rebase(Rest::Normal);
+        assert!(t.followed());
+        assert_eq!(t.step("x", |_, _| false), None);
+        assert!(!t.followed());
+        assert_eq!(t.step("<C-e>", |_, _| false), Some(Command::Lines(1)));
+        // One covering `x` itself.
+        t.rebase(Rest::Normal);
+        assert!(t.followed());
+        assert_eq!(t.step("<C-e>", |_, _| false), Some(Command::Lines(1)));
+        assert!(t.followed(), "the scroll followed from there");
+        // Made out again, a key is not sent again: no more fences for it.
+        let at = t.fenced();
+        t.answered(at, Mode::Normal);
+        t.rebase(Rest::Normal);
+        t.step("x", |_, _| false);
+        assert!(!t.wants_fence());
+        // A scroll the client made out but did not make, and a click.
+        let mut t = acked();
+        typed(&mut t, "<C-e>");
+        t.missed();
+        assert!(!t.followed(), "a scroll not made");
+        t.rebase(Rest::Normal);
+        assert!(t.followed());
+        t.clicked();
+        assert!(!t.followed(), "a click");
+    }
+
+    /// An ack puts the client where it says Neovim rests: waiting for a
+    /// command in Normal or Visual mode, for what is typed in Insert mode,
+    /// or busy with something the client cannot make out — an operator
+    /// pending, the command line — from which nothing is followed.
+    #[test]
+    fn the_parser_rests_where_the_ack_says() {
+        let rest = |mode: &str| {
+            let mut t = acked();
+            t.rebase(Rest::of(mode));
+            let scroll = t.step("<C-e>", |_, _| false);
+            let page = t.step("<PageDown>", |_, _| false);
+            (scroll, page, t.followed())
+        };
+        let page = Command::Page {
+            down: true,
+            count: 1,
+        };
+        assert_eq!(rest("n"), (Some(Command::Lines(1)), Some(page), true));
+        assert_eq!(rest("V"), (Some(Command::Lines(1)), Some(page), true));
+        assert_eq!(rest("i"), (None, Some(page), false), "typed, in Insert");
+        assert_eq!(rest("no"), (None, None, false));
+        assert_eq!(rest("c"), (None, None, false));
     }
 
     /// Inputs are kept for judging the acks by only while acks come — the
