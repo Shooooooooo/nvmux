@@ -13,10 +13,11 @@
 //!   follow; one that cannot go at all leaves the column the cursor wants as
 //!   it was;
 //! - `0` to the line's first character, `^` to its first that is not a
-//!   blank, `$` and `<End>` to its last, `|` to the character over a display
-//!   column — and `<Home>` to the one over the first, as `1|` takes it, the
-//!   cursor wanting that column rather than the one it is drawn in, a tab's
-//!   last;
+//!   blank, `$` and `<End>` to its last, `g_` to its last that is not a
+//!   blank — or its first, for a line all blanks — `|` to the character
+//!   over a display column, and `<Home>` to the one over the first, as `1|`
+//!   takes it, the cursor wanting that column rather than the one it is
+//!   drawn in, a tab's last;
 //! - `j`, `k` and their kind a line down or up in the column the cursor
 //!   wants (Neovim's `curswant`), no further than the buffer goes;
 //! - `+`, `<CR>`, `-` and `_` a line down or up, or none for `_`, to its
@@ -27,9 +28,11 @@
 //! up or down past `'scrolloff'`, is not followed; one that would move a view
 //! that does not wrap sideways moves it as Neovim does ([`predict::showing`]).
 //!
-//! So far nothing of this is drawn: the client follows the keys it sends,
-//! and judges where it would have put the cursor against where Neovim says
-//! it did (see [`super::predict::Predictor::judge`]), for the log.
+//! The client follows the keys it sends by these, and judges where it put
+//! the cursor against where Neovim says it did (see `super::App`): those
+//! that keep the cursor on its line it draws at once (see
+//! `super::anim::chain`); the rest it judges without drawing, for the log
+//! (see [`super::predict::Predictor::judge`]).
 
 use super::predict::{self, Ch, Pos, Rest, Shape, Want};
 
@@ -53,6 +56,9 @@ pub enum Motion {
     /// `$`, `<End>`: its last, the cursor wanting the end of every line
     /// after it.
     End,
+    /// `g_`: its last that is not a blank — its first, for a line all
+    /// blanks.
+    LastNonBlank,
     /// `|`: the character over the display column counted, from one.
     Column,
     /// `<Home>`: `1|`, whatever the count, which Neovim reads and lets go.
@@ -65,8 +71,9 @@ pub enum Motion {
     },
 }
 
-/// The motion a key typed in Normal mode makes, if it is one followed here.
-fn motion(key: &str) -> Option<Motion> {
+/// The motion a key typed in Normal mode makes, if it is one followed here:
+/// `g_`, which takes two, is made out by whoever has the `g`.
+pub fn motion(key: &str) -> Option<Motion> {
     Some(match key {
         "h" => Motion::Left('h'),
         "<Left>" => Motion::Left('<'),
@@ -103,14 +110,28 @@ const MAX_COUNT: i64 = 999_999_999;
 /// The motions a run of keys typed in Normal mode with nothing pending
 /// makes, each with the count typed before it: `None` where any key of them
 /// is not a motion followed here, or `mapped` says something maps it — or
-/// starts a mapping with it — or the run ends in a count.
+/// starts a mapping with it — or the run ends in a count or a `g`.
 pub fn parse<'a>(
     keys: impl IntoIterator<Item = &'a str>,
     mapped: impl Fn(&str) -> bool,
 ) -> Option<Vec<(Motion, Option<i64>)>> {
     let mut out = Vec::new();
     let mut count: Option<i64> = None;
+    let mut g = false;
     for key in keys {
+        // `g`, and `_` after it, `g_` as a whole looked up: Neovim's own
+        // mappings of `g…` make a prefix of `g` alone.
+        if std::mem::take(&mut g) {
+            if key != "_" || mapped("g_") {
+                return None;
+            }
+            out.push((Motion::LastNonBlank, count.take()));
+            continue;
+        }
+        if key == "g" {
+            g = true;
+            continue;
+        }
         if mapped(key) {
             return None;
         }
@@ -129,7 +150,7 @@ pub fn parse<'a>(
         }
         out.push((motion(key)?, count.take()));
     }
-    count.is_none().then_some(out)
+    (count.is_none() && !g).then_some(out)
 }
 
 /// What a window and its lines are, for working out a motion in it.
@@ -141,11 +162,10 @@ pub struct Ctx<'a> {
     pub width: usize,
     /// The text of a line, from nought, where the client has it whole.
     pub text: &'a dyn Fn(i64) -> Option<&'a str>,
-    /// `'whichwrap'`, where the client knows it: not knowing it, a move
+    /// `'whichwrap'`, where the client knows it — the agent says it only
+    /// where it says what Neovim made of each key: not knowing it, a move
     /// sideways that would go past the end of its line is not followed,
-    /// whatever it would have done. The agent does not say it yet, so the
-    /// client never does know it: the rules for when it is known are kept,
-    /// as Neovim was found to follow them, for when the agent does.
+    /// whatever it would have done.
     pub whichwrap: Option<&'a str>,
 }
 
@@ -274,6 +294,13 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
         Motion::First => Some(sideways(first(&cs), None)),
         Motion::End if n > 1 => None,
         Motion::End => Some(sideways(cs.len().checked_sub(1), Some(Want::End))),
+        // With a count, lines down — or none, wanting the end of the line,
+        // where there are not as many.
+        Motion::LastNonBlank if n > 1 => None,
+        Motion::LastNonBlank => {
+            let last = cs.iter().rposition(|ch| !matches!(ch.c, ' ' | '\t'));
+            Some(sideways(last.or((!cs.is_empty()).then_some(0)), None))
+        }
         Motion::Column | Motion::Home => {
             let vcol = match m {
                 Motion::Home => 0,
@@ -299,6 +326,16 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
             down(line, &first, None)
         }
     }
+}
+
+/// The display column the cursor is drawn in, in Normal mode, at byte
+/// `byte` of a line of `text`: its character's first, or a tab's last (see
+/// [`Ch::at`]); nought on an empty line.
+pub fn drawn(text: &str, shape: &Shape, byte: usize) -> usize {
+    let cs = predict::chars(text, shape);
+    cs.iter()
+        .rfind(|ch| ch.byte <= byte)
+        .map_or(0, |ch| ch.at(shape))
 }
 
 #[cfg(test)]
@@ -334,6 +371,7 @@ mod tests {
             sidescrolloff: 0,
             sidescroll: 1,
             hor: 6,
+            stepping: None,
         }
     }
 
@@ -518,6 +556,22 @@ mod tests {
             ((6, 3, -1, 0, 0), "h", (6, 0, 0, 0, 0)),
             ((9, 0, 0, 0, 0), "$", (9, 24, -1, 0, 0)),
             ((11, 0, 0, 0, 0), "$", (11, 17, -1, 0, 0)),
+            // `g_`: the last that is not a blank, a tab's last column
+            // wanted; the first of a line all blanks.
+            ((0, 0, 0, 0, 0), "g_", (0, 10, 10, 0, 0)),
+            ((1, 0, 0, 0, 0), "g_", (1, 1, 1, 0, 0)),
+            ((2, 0, 0, 0, 0), "g_", (2, 0, 0, 0, 0)),
+            ((3, 0, 0, 0, 0), "g_", (3, 1, 8, 0, 0)),
+            ((4, 0, 0, 0, 0), "g_", (4, 2, 8, 0, 0)),
+            ((5, 0, 0, 0, 0), "g_", (5, 6, 4, 0, 0)),
+            ((6, 0, 0, 0, 0), "g_", (6, 3, 1, 0, 0)),
+            ((7, 0, 0, 0, 0), "g_", (7, 0, 0, 0, 0)),
+            ((8, 0, 0, 0, 0), "g_", (8, 14, 14, 0, 0)),
+            ((9, 0, 0, 0, 0), "g_", (9, 24, 16, 0, 0)),
+            ((11, 0, 0, 0, 0), "g_", (11, 17, 24, 0, 0)),
+            ((0, 3, 3, 0, 0), "g_", (0, 10, 10, 0, 0)),
+            ((0, 0, 0, 0, 0), "1g_", (0, 10, 10, 0, 0)),
+            ((0, 4, 4, 0, 0), "g_j", (1, 1, 10, 0, 0)),
         ];
         let s = shape();
         for &(from, keys, to) in cases {
@@ -591,6 +645,45 @@ mod tests {
         // of these lines, and no overflow working that out.
         let far = pos((0, 0, 0, i64::MAX - 1, 0));
         assert_eq!(moved(Motion::Down, None, &far, &cx), None);
+    }
+
+    /// `g_` past blanks at the end of a line, a tab among them, and onto a
+    /// character two cells wide; on a line of one tab, onto the tab, drawn
+    /// in its first column but wanting its last — as Neovim 0.12.6 was
+    /// found to.
+    #[test]
+    fn the_last_non_blank_is_found_as_neovim_finds_it() {
+        let lines = ["trail  \t ", "x\t", "\t", "ab日 "];
+        let text = |l: i64| usize::try_from(l).ok().and_then(|l| lines.get(l)).copied();
+        let s = shape();
+        let cx = Ctx {
+            shape: &s,
+            line_count: 4,
+            rows: 22,
+            width: 80,
+            text: &text,
+            whichwrap: Some("b,s"),
+        };
+        for (line, (byte, want, vcol)) in [(4, 4, 4), (0, 0, 0), (0, 7, 7), (2, 2, 2)]
+            .into_iter()
+            .enumerate()
+        {
+            let from = pos((line as i64, 0, 0, 0, 0));
+            let to = moved(Motion::LastNonBlank, None, &from, &cx).expect("followed");
+            assert_eq!(
+                (to.byte, to.want),
+                (byte, Want::Col(want)),
+                "{:?}",
+                lines[line]
+            );
+            assert_eq!(drawn(lines[line], &s, to.byte), vcol, "{:?}", lines[line]);
+        }
+        // With a count, lines down, which is not followed here.
+        let from = pos((0, 0, 0, 0, 0));
+        assert_eq!(moved(Motion::LastNonBlank, Some(2), &from, &cx), None);
+        assert_eq!(parse(["g", "_"], |k| k == "g_"), None, "something maps it");
+        assert_eq!(parse(["g", "j"], |_| false), None, "not `g_`");
+        assert_eq!(parse(["g"], |_| false), None, "pending");
     }
 
     /// A count is digits before a motion, `0` among them but not first.

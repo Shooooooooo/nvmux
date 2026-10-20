@@ -17,6 +17,7 @@
 //! to arrive at.
 
 pub mod blink;
+pub mod chain;
 pub mod glide;
 pub mod layout;
 pub mod motion;
@@ -32,6 +33,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use self::blink::Blink;
+use self::chain::{Chain, Step};
 use self::layout::{Change, Transition};
 use self::motion::Motion;
 use self::scroll::Scroll;
@@ -41,7 +43,7 @@ use self::smear::{Rect, Smear};
 use self::switch::Switch;
 use self::vfx::Vfx;
 use super::compose::{Frame, Scrolling, View};
-use super::grid::{Cell, Grid};
+use super::grid::{Cell, Grid, Text};
 use super::model::{Changes, Held, Margins, Model, Place};
 use super::redraw::{Event, ModeInfo, Shape};
 use super::screen::Cursor;
@@ -208,6 +210,12 @@ pub struct Animator {
     scrolls: HashMap<u64, Scroll>,
     /// Windows scrolled sideways ahead of Neovim, by grid.
     sides: HashMap<u64, Side>,
+    /// The cursor moved ahead of Neovim, by grid: see [`chain`].
+    chains: HashMap<u64, Chain>,
+    /// The client's numbers for the keys of the steps let go of here,
+    /// unjudged, for the client to know to make them again: see
+    /// [`Animator::take_dropped`].
+    dropped: Vec<u64>,
     motions: HashMap<u64, Motion>,
     /// Text on its way across its window to where it goes in it, by grid:
     /// moved in or out, its grid made narrower or wider, with the window
@@ -245,6 +253,8 @@ impl Animator {
             vfx: Vfx::default(),
             scrolls: HashMap::new(),
             sides: HashMap::new(),
+            chains: HashMap::new(),
+            dropped: Vec::new(),
             motions: HashMap::new(),
             shifts: HashMap::new(),
             seen: HashMap::new(),
@@ -283,6 +293,9 @@ impl Animator {
         self.vfx.clear();
         self.scrolls.clear();
         self.sides.clear();
+        for (_, chain) in self.chains.drain() {
+            self.dropped.extend(chain.seqs());
+        }
         self.motions.clear();
         self.shifts.clear();
         self.seen.clear();
@@ -524,6 +537,31 @@ impl Animator {
             _ => self.motions.clear(),
         }
 
+        // The cursor moved ahead in a window reshaped, hidden or showing
+        // another buffer, one whose buffer has another length now, or one
+        // whose view or line moved along Neovim has drawn otherwise: what
+        // the steps were worked out over is gone. The cursor goes back to
+        // Neovim's at once, not travelling there.
+        let gone: Vec<u64> = self
+            .chains
+            .iter()
+            .filter(|(grid, chain)| {
+                changes.reshaped.contains(grid)
+                    || before.switching.contains(grid)
+                    || model.layout.get(grid).is_none_or(|p| p.hidden)
+                    || model.viewports.get(grid).map(|v| v.line_count)
+                        != chain.head().map(|s| s.line_count)
+                    || line_drawn(model, **grid, chain.line) != chain.drawn
+            })
+            .map(|(grid, _)| *grid)
+            .collect();
+        let snap = !gone.is_empty();
+        for grid in gone {
+            if let Some(chain) = self.chains.remove(&grid) {
+                self.dropped.extend(chain.seqs());
+            }
+        }
+
         // Predictions a batch has made wrong: the window shows another
         // buffer, or its buffer has another length.
         for (grid, lines) in &before.predicted {
@@ -582,7 +620,7 @@ impl Animator {
 
         // The cursor. Windows setting off somewhere take it with them: it is
         // in its cell when they land, and does not travel there.
-        self.cursor_moved(model, drawn && !started, now);
+        self.cursor_moved(model, drawn && !started && !snap, now);
     }
 
     /// Set the cursor going to where it now is, if `allowed` to travel, or
@@ -644,6 +682,89 @@ impl Animator {
             self.cursor_moved(model, true, now);
         }
         went
+    }
+
+    /// Move the cursor in window grid `grid` ahead of Neovim as `step` says:
+    /// see [`chain`]. The first step in it, in window `win` of a gutter
+    /// `textoff` wide shown by Neovim from display column `left`, starts a
+    /// chain worked out with those, and with its line as the window shows
+    /// it now; the rest go on from it. The cursor travels to it, if
+    /// `travel`, as to where Neovim puts it; or is put there.
+    pub fn step(
+        &mut self,
+        model: &Model,
+        grid: u64,
+        (shown, travel): ((i64, usize, usize), bool),
+        step: Step,
+        now: Instant,
+    ) {
+        let line = step.pos.line;
+        self.chains
+            .entry(grid)
+            .or_insert_with(|| Chain::new(shown, line, line_drawn(model, grid, line)))
+            .push(step);
+        self.cursor_moved(model, travel, now);
+    }
+
+    /// The cursor moved ahead of Neovim in window grid `grid`, if it is.
+    pub fn chain(&self, grid: u64) -> Option<&Chain> {
+        self.chains.get(&grid)
+    }
+
+    /// Let go of the steps for the keys up to `seq` in window grid `grid`,
+    /// Neovim's frame for them having come.
+    pub fn drop_upto(&mut self, grid: u64, seq: u64) {
+        if let Some(chain) = self.chains.get_mut(&grid) {
+            chain.drop_upto(seq);
+            if chain.is_empty() {
+                self.chains.remove(&grid);
+            }
+        }
+    }
+
+    /// Let go of the cursor moved ahead of Neovim in window grid `grid`, if
+    /// it is: it goes to where Neovim has it at once, not travelling there.
+    /// Says the client's numbers for the keys of the steps let go of.
+    pub fn drop_chain(&mut self, model: &Model, grid: u64, now: Instant) -> Vec<u64> {
+        let Some(chain) = self.chains.remove(&grid) else {
+            return Vec::new();
+        };
+        self.cursor_moved(model, false, now);
+        chain.seqs()
+    }
+
+    /// The window grids the cursor has been moved ahead of Neovim in.
+    pub fn chained(&self) -> Vec<u64> {
+        let mut grids: Vec<u64> = self.chains.keys().copied().collect();
+        grids.sort_unstable();
+        grids
+    }
+
+    /// The chains whose oldest step Neovim has said nothing of by `now`, let
+    /// go of, the cursor where Neovim has it at once: each window grid, and
+    /// the client's numbers for the keys of its steps.
+    pub fn lapsed(&mut self, model: &Model, now: Instant) -> Vec<(u64, Vec<u64>)> {
+        let grids: Vec<u64> = self
+            .chains
+            .iter()
+            .filter(|(_, c)| c.until().is_some_and(|until| until <= now))
+            .map(|(g, _)| *g)
+            .collect();
+        let lapsed: Vec<(u64, Vec<u64>)> = grids
+            .into_iter()
+            .filter_map(|g| Some((g, self.chains.remove(&g)?.seqs())))
+            .collect();
+        if !lapsed.is_empty() {
+            self.cursor_moved(model, false, now);
+        }
+        lapsed
+    }
+
+    /// The client's numbers for the keys of the steps let go of here since
+    /// it last asked, unjudged: by a fresh start, or a window that changed
+    /// under them.
+    pub fn take_dropped(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.dropped)
     }
 
     /// The window grids scrolled ahead of Neovim further than they show: see
@@ -817,6 +938,9 @@ impl Animator {
         let c = model.cursor;
         // With its text, should that be on its way across its window.
         let col = col + self.shift_of(c.grid);
+        if let Some((r, k)) = self.stepped(model) {
+            return (row - c.row as i64 + r, col - c.col as i64 + k);
+        }
         if let Some((r, k)) = self.sides.get(&c.grid).and_then(Side::cursor) {
             return (row - c.row as i64 + r as i64, col - c.col as i64 + k as i64);
         }
@@ -849,6 +973,26 @@ impl Animator {
             .shown_col()
             .map_or(col, |(to, _)| col - c.col as i64 + to as i64);
         (row + at - (c.row as i64 - top as i64), col)
+    }
+
+    /// Where in its grid the cursor is drawn moved ahead of Neovim, in the
+    /// window that has it (see [`chain`]): on the step the screen shows, its
+    /// line in the view as it is drawn — scrolled ahead or not — and its
+    /// column in it. `None` where it is not, or is out of view.
+    fn stepped(&self, model: &Model) -> Option<(i64, i64)> {
+        let grid = model.cursor.grid;
+        let chain = self.chains.get(&grid)?;
+        if model.wins.get(&grid) != Some(&chain.win) {
+            return None;
+        }
+        let v = model.viewports.get(&grid)?;
+        let (top, bot, _, right) = text_rect(model, grid)?;
+        let shown = v.topline + self.scrolls.get(&grid).map_or(0, Scroll::shown_ahead);
+        let s = chain.shown(shown, chain.left)?;
+        let row = s.pos.line - shown;
+        let col = (chain.textoff + s.vcol).checked_sub(s.pos.left)?;
+        ((0..(bot - top) as i64).contains(&row) && col < right)
+            .then_some((top as i64 + row, col as i64))
     }
 
     /// Whether anything is moving: a frame is wanted, and the next is a step
@@ -908,6 +1052,7 @@ impl Animator {
             .values()
             .filter_map(Scroll::until)
             .chain(self.sides.values().filter_map(Side::until))
+            .chain(self.chains.values().filter_map(Chain::until))
             .min();
         [frame, self.blink_due(model, now), expiry]
             .into_iter()
@@ -1069,6 +1214,20 @@ impl View for Animator {
             s.paint(frame, model, cursor);
         }
     }
+}
+
+/// What window grid `grid` shows of buffer line `line` that a motion along
+/// it leaves as it is (see [`chain`]): the line its view is from, and the
+/// text of the row the line is on — `None` where it is not in view, or the
+/// window not one to one.
+fn line_drawn(model: &Model, grid: u64, line: i64) -> Option<(i64, Vec<Text>)> {
+    let (g, v) = (model.grids.get(&grid)?, model.viewports.get(&grid)?);
+    let (top, bot, left, right) = text_rect(model, grid)?;
+    let row = usize::try_from(line - v.topline)
+        .ok()
+        .filter(|r| *r < bot - top && v.one_to_one(bot - top))?;
+    let text = g.row(top + row).get(left..right)?;
+    Some((v.topline, text.iter().map(|c| c.text.clone()).collect()))
 }
 
 /// The rows and columns of window grid `grid` that scroll, as it is now.

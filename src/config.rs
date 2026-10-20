@@ -250,14 +250,16 @@ pub struct ClientSettings {
     /// out ahead of Neovim besides the scrolls: `"scrolls"`, the default,
     /// only those; `"motions"` the keys that move the cursor in Normal mode
     /// as well; `"typing"` what is typed in Insert mode, and the keys that go
-    /// in and out of it, as well. Each is to be drawn only where the client
-    /// can work out exactly what Neovim will make of it, and judged against
-    /// what Neovim says it did (see [`crate::client::predict::Sync`]).
+    /// in and out of it, as well. Each is drawn only where the client can
+    /// work out exactly what Neovim will make of it, and judged against what
+    /// Neovim says it did (see [`crate::client::predict::Sync`]): one Neovim
+    /// made otherwise goes back to Neovim's at once.
     ///
-    /// Not drawn yet: past `"scrolls"` the client follows the motions,
-    /// judges where it would have put the cursor against where Neovim did,
-    /// and keeps count of how often it was right, for the log. Which is why
-    /// the first-run template does not mention it.
+    /// Experimental, and so far less than that: past `"scrolls"`, the
+    /// motions along a line — `h`, `l`, `0`, `^`, `$`, `g_`, `|` and their
+    /// kind, with counts — are drawn, and the client follows the rest by
+    /// what Neovim says of each key rather than waiting for it to catch up
+    /// with them all; `"typing"` draws no more than that yet.
     ///
     /// What it costs: the agent says where each key left the cursor, about
     /// 40 bytes a key back over the link, and each fence the client asks
@@ -1509,12 +1511,13 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          # command = {command}   # {{sock}} is required\n\
          \n\
          [client]\n\
-         # ui             = {ui:<8}   # nvmux's own animated client, or \"nvim\" for Neovim's\n\
-         # per_session    = {per_session:<8}   # keep each session's client; a switch back reuses it\n\
-         # lazy           = {lazy:<8}   # start every client at launch, and after a dropped link; true waits for visits\n\
-         # predict        = {predict:<8}   # over ssh, scrolls show before Neovim answers; \"on\" over any slow link\n\
-         # centre         = {centre:<8}   # on a wide terminal, each window's text in its middle: \"smart\" or \"fixed\"\n\
-         # window_width   = {window_width:<8}   # with centre on, how many columns a window's text gets; 0 for no limit\n\
+         # ui             = {ui:<9}   # nvmux's own animated client, or \"nvim\" for Neovim's\n\
+         # per_session    = {per_session:<9}   # keep each session's client; a switch back reuses it\n\
+         # lazy           = {lazy:<9}   # start every client at launch, and after a dropped link; true waits for visits\n\
+         # predict        = {predict:<9}   # over ssh, scrolls show before Neovim answers; \"on\" over any slow link\n\
+         # predict_keys   = {predict_keys:<9}   # experimental: \"motions\" shows the cursor moved along a line before Neovim too\n\
+         # centre         = {centre:<9}   # on a wide terminal, each window's text in its middle: \"smart\" or \"fixed\"\n\
+         # window_width   = {window_width:<9}   # with centre on, how many columns a window's text gets; 0 for no limit\n\
          \n\
          [style]\n\
          # color = {style_color:<10}   # or \"#rrggbb\": nvmux's text and bars in that colour\n\
@@ -1569,6 +1572,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
         per_session = c.per_session,
         lazy = c.lazy,
         predict = quoted(c.predict.name()),
+        predict_keys = quoted(c.predict_keys.name()),
         centre = quoted(c.centre.name()),
         window_width = c.window_width,
         style_color = quoted(&t.color.name()),
@@ -3136,6 +3140,7 @@ mod tests {
             "# lazy           = false",
             "# ui             = \"nvmux\"",
             "# predict        = \"auto\"",
+            "# predict_keys   = \"scrolls\"",
             "# centre         = \"off\"",
             "# window_width   = 120",
             "# color = \"terminal\"",

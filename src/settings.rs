@@ -14,7 +14,8 @@
 use std::sync::LazyLock;
 
 use crate::config::{
-    Centre, ParticleMode, Predict, Settings, ThemeColor, Ui, MAX_FADE_MS, MAX_TIMEOUT_MS,
+    Centre, ParticleMode, Predict, PredictKeys, Settings, ThemeColor, Ui, MAX_FADE_MS,
+    MAX_TIMEOUT_MS,
 };
 use crate::keys::BINDINGS;
 
@@ -354,6 +355,21 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
                 set: |s, name| {
                     if let Some(way) = Predict::ALL.into_iter().find(|w| w.name() == name) {
                         s.client.predict = way;
+                    }
+                },
+            },
+        )),
+        own(row(
+            "client",
+            "predict_keys",
+            Tab::Client,
+            "experimental: motions show the cursor moved along a line before Neovim too",
+            Kind::Choice {
+                options: &["scrolls", "motions", "typing"],
+                get: |s| s.client.predict_keys.name(),
+                set: |s, name| {
+                    if let Some(keys) = PredictKeys::ALL.into_iter().find(|k| k.name() == name) {
+                        s.client.predict_keys = keys;
                     }
                 },
             },
