@@ -2003,10 +2003,10 @@ fn a_page_neovim_does_not_turn_is_given_up_in_time() {
     assert_eq!(w0, Ok(Some(541)), "Neovim went elsewhere");
     // No sooner than Neovim's frame, a way of the link after it caught up,
     // and as long after that as a page typed then would wait — two round
-    // trips and a quarter of a second, give or take — or twice that on a
-    // busy machine.
+    // trips, a quarter of a second and a segment lost on the way, give or
+    // take — or twice that on a busy machine.
     let at = seen.last().map(|&(_, at)| at).expect("seen");
-    let wait = 4 * SLOW + Duration::from_millis(250);
+    let wait = 4 * SLOW + Duration::from_millis(450);
     assert!(
         at > caught_up + SLOW && at < caught_up + SLOW + 2 * wait,
         "given up on {:?} after Neovim caught up at {caught:?}: {when:?}",

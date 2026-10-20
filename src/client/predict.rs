@@ -111,8 +111,16 @@ pub const ON: Duration = Duration::from_millis(30);
 pub const OFF: Duration = Duration::from_millis(20);
 
 /// How long past two round trips a prediction waits for Neovim to confirm
-/// it.
+/// it — or four times the round trip's variation, where that is longer.
 const GRACE: Duration = Duration::from_millis(250);
+
+/// And past that, how long a segment lost on the way takes to come again:
+/// TCP sends one again no sooner than its least retransmission timeout,
+/// 200 ms on Linux, and everything behind it on the stream waits for it. A
+/// prediction given up on just before Neovim's answer arrives is drawn back
+/// to where Neovim was and then on to where it is, which on a lossy link
+/// would be most of the predictions that waited out a lost segment.
+const LOSS: Duration = Duration::from_millis(200);
 
 /// How often the round trip is measured again while the user is at work.
 pub const PING_EVERY: Duration = Duration::from_secs(2);
@@ -1840,8 +1848,10 @@ fn scroll(key: &str, count: Option<i64>) -> Option<Command> {
 /// Everything the client keeps for its predictions.
 #[derive(Debug, Default)]
 pub struct Predictor {
-    /// The round trip to the server, smoothed as TCP smooths its own.
+    /// The round trip to the server, and how much it varies, smoothed as TCP
+    /// smooths its own (RFC 6298).
     srtt: Option<Duration>,
+    rttvar: Option<Duration>,
     /// Whether it is long enough to predict over: see [`ON`].
     on: bool,
     shapes: HashMap<i64, Shape>,
@@ -1858,11 +1868,12 @@ pub struct Predictor {
 impl Predictor {
     /// A round trip, as one request and its answer took.
     pub fn sample(&mut self, rtt: Duration) {
-        let srtt = match self.srtt {
-            None => rtt,
-            Some(s) => (s * 7 + rtt) / 8,
+        let (srtt, rttvar) = match (self.srtt, self.rttvar) {
+            (Some(s), Some(v)) => ((s * 7 + rtt) / 8, (v * 3 + s.abs_diff(rtt)) / 4),
+            _ => (rtt, rtt / 2),
         };
         self.srtt = Some(srtt);
+        self.rttvar = Some(rttvar);
         self.on = srtt >= if self.on { OFF } else { ON };
     }
 
@@ -1898,9 +1909,14 @@ impl Predictor {
 
     /// When a prediction made `now` is given up on, unconfirmed — and one
     /// made before, Neovim heard `now` still at work on the keys typed ahead
-    /// of it.
+    /// of it: two round trips, [`GRACE`] or the round trip's variation, and a
+    /// segment lost on the way ([`LOSS`]).
     pub fn deadline(&self, now: Instant) -> Instant {
-        now + self.srtt.unwrap_or_default() * 2 + GRACE
+        let (srtt, rttvar) = (
+            self.srtt.unwrap_or_default(),
+            self.rttvar.unwrap_or_default(),
+        );
+        now + srtt * 2 + GRACE.max(rttvar * 4) + LOSS
     }
 
     /// Whether to ask after the round trip again: the user has been at work
@@ -4083,5 +4099,42 @@ mod tests {
         let typed = t0 + Duration::from_millis(10);
         assert!(!p.wants_ping(typed, Some(typed)), "too soon");
         assert!(p.wants_ping(t0 + PING_EVERY, Some(typed)));
+    }
+
+    /// The round trip and how much it varies, as TCP measures its own: the
+    /// first sample is the round trip and half of it the variation, and each
+    /// after moves them an eighth and a quarter of the way.
+    #[test]
+    fn the_round_trip_varies_as_tcp_measures_it() {
+        let ms = Duration::from_millis;
+        let mut p = Predictor::default();
+        let seen = |p: &Predictor| (p.srtt.unwrap(), p.rttvar.unwrap());
+        p.sample(ms(100));
+        assert_eq!(seen(&p), (ms(100), ms(50)));
+        p.sample(ms(100));
+        assert_eq!(seen(&p), (ms(100), Duration::from_micros(37_500)));
+        p.sample(ms(300));
+        assert_eq!(seen(&p), (ms(125), Duration::from_micros(78_125)));
+    }
+
+    /// A prediction waits two round trips and a lost segment, and longer on
+    /// a link whose round trip varies by more than [`GRACE`] a quarter.
+    #[test]
+    fn a_prediction_waits_out_a_lost_segment() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut steady = Predictor::default();
+        for _ in 0..20 {
+            steady.sample(ms(150));
+        }
+        let wait = steady.deadline(t0) - t0;
+        assert!((ms(750)..ms(760)).contains(&wait), "{wait:?}");
+        let mut jumpy = Predictor::default();
+        for i in 0..20 {
+            jumpy.sample(ms(if i % 2 == 0 { 100 } else { 300 }));
+        }
+        let (srtt, rttvar) = (jumpy.srtt.unwrap(), jumpy.rttvar.unwrap());
+        assert!(rttvar * 4 > GRACE, "varies by more than the grace");
+        assert_eq!(jumpy.deadline(t0) - t0, srtt * 2 + rttvar * 4 + LOSS);
     }
 }
