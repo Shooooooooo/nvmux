@@ -119,6 +119,10 @@ pub struct Ahead {
     pub until: Instant,
     /// `'scrolloff'`: how near the window's edges Neovim lets the cursor be.
     pub scrolloff: usize,
+    /// The client's number for the key or the turn of the wheel that made
+    /// it, where the agent says what Neovim made of each (see
+    /// `crate::client::predict::Sync`).
+    pub seq: Option<u64>,
 }
 
 /// One rectangle scrolling — or scrolled ahead of Neovim, on the client's
@@ -239,6 +243,12 @@ impl Scroll {
     /// `'scrolloff'`, as the last prediction drawn found it.
     pub fn scrolloff(&self) -> usize {
         self.shows().next_back().map_or(0, |a| a.scrolloff)
+    }
+
+    /// Whether a scroll ahead made by input `k` of the client's, or one
+    /// before it, is still to be made by Neovim.
+    pub fn unmade(&self, k: u64) -> bool {
+        self.ahead.iter().any(|a| a.seq.is_some_and(|s| s <= k))
     }
 
     /// Whether there are scrolls ahead the view does not show yet.
@@ -757,6 +767,7 @@ mod tests {
             land: None,
             until: Instant::now() + std::time::Duration::from_secs(60),
             scrolloff: 0,
+            seq: None,
         }
     }
 

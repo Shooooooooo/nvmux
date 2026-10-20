@@ -246,6 +246,25 @@ pub struct ClientSettings {
     /// and those colours, as the view moves — more of them the slower the
     /// link.
     pub predict: Predict,
+    /// Which keys a client predicting over a slow link (see `predict`) works
+    /// out ahead of Neovim besides the scrolls: `"scrolls"`, the default,
+    /// only those; `"motions"` the keys that move the cursor in Normal mode
+    /// as well; `"typing"` what is typed in Insert mode, and the keys that go
+    /// in and out of it, as well. Each is to be drawn only where the client
+    /// can work out exactly what Neovim will make of it, and judged against
+    /// what Neovim says it did (see [`crate::client::predict::Sync`]).
+    ///
+    /// Not drawn yet: past `"scrolls"` the client follows the motions,
+    /// judges where it would have put the cursor against where Neovim did,
+    /// and keeps count of how often it was right, for the log. Which is why
+    /// the first-run template does not mention it.
+    ///
+    /// What it costs: the agent says where each key left the cursor, about
+    /// 40 bytes a key back over the link, and each fence the client asks
+    /// after its keys reads the agent's count, about 40 bytes more; and the
+    /// agent sends an edit with each key typed in Insert mode rather than at
+    /// a pause.
+    pub predict_keys: PredictKeys,
     /// On a terminal wider than a window's text needs, draw the text in the
     /// middle of the window: a window wider than its text wants has it that
     /// wide, its lines wrapping there and its status line's words standing
@@ -310,6 +329,7 @@ impl Default for ClientSettings {
             revive: Retired,
             throttle: Retired,
             predict: Predict::Auto,
+            predict_keys: PredictKeys::Scrolls,
             centre: Centre::Off,
             window_width: 120,
             lean_output: Retired,
@@ -358,6 +378,38 @@ impl Predict {
     }
 }
 
+/// `[client] predict_keys`: which keys a client predicting works out ahead
+/// of Neovim, each kind with those before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PredictKeys {
+    /// The scrolls alone, and the turns of the wheel.
+    #[default]
+    Scrolls,
+    /// The keys that move the cursor in Normal mode.
+    Motions,
+    /// What is typed in Insert mode, and the keys that go in and out of it.
+    Typing,
+}
+
+impl PredictKeys {
+    /// Every kind, from the fewest keys to the most.
+    pub const ALL: [PredictKeys; 3] = [
+        PredictKeys::Scrolls,
+        PredictKeys::Motions,
+        PredictKeys::Typing,
+    ];
+
+    /// The kind as the file spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            PredictKeys::Scrolls => "scrolls",
+            PredictKeys::Motions => "motions",
+            PredictKeys::Typing => "typing",
+        }
+    }
+}
+
 /// `[client] centre`: each window's text in the middle of a window wider
 /// than it needs, or not, and how wide it is there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
@@ -396,6 +448,15 @@ impl<'de> Deserialize<'de> for Predict {
         D: serde::Deserializer<'de>,
     {
         de_way(deserializer, &Predict::ALL, Predict::name)
+    }
+}
+
+impl<'de> Deserialize<'de> for PredictKeys {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        de_way(deserializer, &PredictKeys::ALL, PredictKeys::name)
     }
 }
 
@@ -2506,6 +2567,39 @@ mod tests {
                 .expect_err(&doc)
                 .to_string();
             assert!(msg.contains(r#"expected "auto", "on" or "off""#), "{msg}");
+        }
+    }
+
+    /// Only the scrolls are predicted unless told otherwise; the motions, or
+    /// the typing too, are a word away, each kind taking in those before it.
+    /// What a client is told comes back from its environment as it went, and
+    /// anything but the three words is an error that names them.
+    #[test]
+    fn predict_keys_reads_and_writes() {
+        let c = Settings::default().client;
+        assert_eq!(c.predict_keys, PredictKeys::Scrolls);
+        for keys in PredictKeys::ALL {
+            let doc = format!("[client]\npredict_keys = \"{}\"\n", keys.name());
+            let s: Settings = toml::from_str(&doc).expect("valid");
+            assert_eq!(s.client.predict_keys, keys);
+            assert_eq!(s.client.predict, Predict::Auto, "the rest as it was");
+            let drawing = Drawing {
+                remote: true,
+                ..s.drawing()
+            };
+            assert_eq!(Drawing::from_env(&drawing.to_env()), Some(drawing));
+        }
+        assert!(PredictKeys::Scrolls < PredictKeys::Motions);
+        assert!(PredictKeys::Motions < PredictKeys::Typing);
+        for wrong in ["\"keys\"", "true"] {
+            let doc = format!("[client]\npredict_keys = {wrong}\n");
+            let msg = toml::from_str::<Settings>(&doc)
+                .expect_err(&doc)
+                .to_string();
+            assert!(
+                msg.contains(r#"expected "scrolls", "motions" or "typing""#),
+                "{msg}"
+            );
         }
     }
 

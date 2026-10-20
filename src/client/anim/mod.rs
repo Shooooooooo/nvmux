@@ -677,6 +677,13 @@ impl Animator {
         }
     }
 
+    /// Whether window grid `grid` has a scroll ahead of Neovim made by input
+    /// `k` of the client's, or one before it, that Neovim has yet to make:
+    /// see [`Scroll::unmade`].
+    pub fn unmade(&self, grid: u64, k: u64) -> bool {
+        self.scrolls.get(&grid).is_some_and(|s| s.unmade(k))
+    }
+
     /// Stop scrolling window grid `grid` ahead of Neovim: it shows Neovim's
     /// view again.
     pub fn give_up(&mut self, grid: u64) {
@@ -1558,6 +1565,7 @@ mod tests {
             land: None,
             until,
             scrolloff: 2,
+            seq: None,
         };
         assert!(a.predict(&m, 2, go(3, until), (&mut fill, &mut |_, _| None), t0));
         assert_eq!(top(&a, &m), Some(Text::Char('3')));

@@ -1140,6 +1140,35 @@ impl Trace {
         (views, lines)
     }
 
+    /// What the agent said Neovim made of the keys (see
+    /// `nvmux::client::predict::Ack`), each with when the link wrote it on:
+    /// `[count, tail, mode, win, buf, tick, line_count, lnum, col, want, top,
+    /// left]`.
+    fn acks(&self) -> Vec<(Instant, Vec<Value>)> {
+        self.messages(true)
+            .into_iter()
+            .filter_map(|(_, written, v)| match notification(&v) {
+                Some(("nvmux_client", [kind, rest @ ..])) if kind.as_str() == Some("ack") => {
+                    Some((written, rest.to_vec()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// How many keys the client has sent the session, as Neovim's notation
+    /// counts them: a character, or a name in `<…>`.
+    fn inputs(&self) -> usize {
+        self.messages(false)
+            .iter()
+            .filter_map(|(_, _, v)| match notification(v) {
+                Some(("nvim_input", [keys])) => keys.as_str(),
+                _ => None,
+            })
+            .map(|keys| nvmux::client::predict::tokens(keys).count())
+            .sum()
+    }
+
     /// The most the link was late passing anything on, each way: to the
     /// session, and back from it.
     fn lateness(&self) -> (Duration, Duration) {
@@ -1302,12 +1331,26 @@ fn drawn_slowly(
     Terminal,
     Link,
 ) {
+    drawn_slowly_with(scratch, tag, setline, "")
+}
+
+/// [`drawn_slowly`], with `client` among the client's settings.
+fn drawn_slowly_with(
+    scratch: &Scratch,
+    tag: &str,
+    setline: &str,
+    client: &str,
+) -> (
+    nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    Terminal,
+    Link,
+) {
     let (sock, mut rpc, config) = session(scratch, tag);
     rpc.command(&format!("setlocal noswapfile | {setline}"))
         .expect("setline");
     std::fs::write(
         &config,
-        format!("{PREDICT_ON}\n[effects.scroll]\nenabled = false\n"),
+        format!("{PREDICT_ON}{client}\n[effects.scroll]\nenabled = false\n"),
     )
     .expect("config");
     let (slow, link) = counted_link(&scratch.0.join("link"), &sock, SLOW);
@@ -1451,6 +1494,72 @@ fn every_scroll_predicted_is_the_one_neovim_makes() {
     ] {
         predicted(&mut term, name, keys);
     }
+}
+
+/// Told to work out the motions as well, the client has the agent say,
+/// each time Neovim goes to wait for a key with every key typed taken, how
+/// many keys it has taken and where they left the cursor: digits as they are
+/// taken, the keys of a mapping as typed — and nothing while a key waits to
+/// be told from a mapping that starts with it. Where it says the cursor is,
+/// Neovim has it.
+#[test]
+fn the_agent_acks_each_key_neovim_takes() {
+    require_nvim!();
+    let scratch = Scratch::new("client-acks");
+    let (mut rpc, mut term, link) = drawn_slowly_with(
+        &scratch,
+        "client-acks",
+        "call setline(1, map(range(1, 200), '\"line \" . v:val'))",
+        "predict_keys = \"motions\"\n",
+    );
+    // Long enough a wait for a mapping that `j` is still waiting when `k`
+    // comes, over the link and back.
+    rpc.command("inoremap jk <Esc> | set timeoutlen=5000")
+        .expect("the mapping");
+    let count = |link: &Link| {
+        link.trace
+            .acks()
+            .last()
+            .and_then(|(_, a)| a.first().and_then(Value::as_u64))
+            .expect("an ack")
+    };
+    // Where the last ack has the cursor, and where Neovim has it.
+    let check = |rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>, link: &Link| {
+        let acks = link.trace.acks();
+        let (_, a) = acks.last().expect("an ack");
+        let at = (a[7].as_i64().expect("lnum"), a[8].as_i64().expect("col"));
+        let cursor = rpc
+            .call("nvim_win_get_cursor", vec![0.into()])
+            .expect("the cursor");
+        let cursor = cursor.as_array().expect("line and column");
+        let there = (
+            cursor[0].as_i64().expect("line") - 1,
+            cursor[1].as_i64().expect("column"),
+        );
+        assert_eq!(at, there, "the ack's cursor is Neovim's");
+        a[2].as_str().expect("mode").to_string()
+    };
+    let from = (count(&link), link.trace.inputs());
+    // The rest after this is counted from here: what the link has carried.
+    let mut taken = |term: &mut Terminal, keys: &[u8], by: u64, mode: &str| {
+        let was = count(&link);
+        typed(term, keys);
+        assert_eq!(count(&link), was + by, "{keys:?}");
+        assert_eq!(check(&mut rpc, &link), mode, "{keys:?}");
+    };
+    taken(&mut term, b"3jl", 3, "n");
+    taken(&mut term, b"i", 1, "i");
+    // `j` waits for a `k` to make `jk` of: Neovim has not taken it, and says
+    // nothing till it has.
+    let heard = link.trace.acks().len();
+    term.type_bytes(b"j");
+    term.pump_until(6 * SLOW, |_| false);
+    assert_eq!(link.trace.acks().len(), heard, "nothing while `j` waits");
+    taken(&mut term, b"k", 2, "n");
+    taken(&mut term, b"\x1b", 1, "n");
+    // As many keys taken as the client sent.
+    let to = (count(&link), link.trace.inputs());
+    assert_eq!(to.0 - from.0, (to.1 - from.1) as u64);
 }
 
 /// Lines long and short, and the cursor at the end of a short one, come to

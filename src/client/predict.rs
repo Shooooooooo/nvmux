@@ -94,15 +94,43 @@
 //! the last of them, though: it sends no frame before. So the agent says when
 //! Neovim moves a view working through them, and the predictions waiting for
 //! it are given as long again from then as one made then would be.
+//!
+//! # What Neovim says it made of each key
+//!
+//! Told to work out more than the scrolls (`[client] predict_keys`), the
+//! client has the agent count the keys Neovim takes, as it takes them, and
+//! say, each time Neovim goes to wait for a key with every key typed taken
+//! and nothing pending, how many it has taken, the last few of them, and
+//! where they left the cursor, the view and the mode ([`Ack`]) — just ahead
+//! of the frame that draws them, with which the client takes it. The client
+//! numbers the keys it sends the same way ([`Typed::seq`]) and ties the two
+//! counts where nothing can be in doubt: at a fence answered with nothing
+//! sent after it, which Neovim answers only once it has taken every key
+//! before it. It checks them at every ack and fence after, and what it
+//! cannot account for puts them in doubt till the next such fence
+//! ([`Sync`]). So each ack is Neovim's last word on the client's keys up to
+//! one of them — what the client would have made of them can be judged by
+//! it, key by key — and how long that word takes to come is how long a
+//! prediction is waited for ([`Predictor::deadline`]).
+//!
+//! Nothing is drawn of that yet. The client follows the keys that move the
+//! cursor in Normal mode a character or a line at a time
+//! ([`super::moves`]), works out where those typed since Neovim's last word
+//! would have left the cursor and the view, and judges that against where
+//! the ack for them says Neovim left them — counting the verdicts for the
+//! log ([`Shadow`]), which is to say how often it would have been right
+//! before any of it is.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use rmpv::ValueRef;
 use unicode_width::UnicodeWidthChar;
 
 use super::grid::{Cell, Text};
+use super::moves;
 use super::redraw;
+use crate::config::PredictKeys;
 
 /// Predictions start once the smoothed round trip reaches this, and stop
 /// once it falls back under [`OFF`]: the gap keeps a link that hovers about
@@ -1108,14 +1136,34 @@ pub fn outcome(command: Command, at: At, rows: i64, line_count: i64, shape: &Sha
     Some(to)
 }
 
-/// The display columns of a line's characters, as a window of `shape` lays
-/// them out from its first column: where each starts, how wide it is, and
-/// what it is. Combining marks take no column and are left out.
-fn columns(text: &str, shape: &Shape) -> Vec<(usize, usize, char)> {
+/// A character of a line as Neovim's cursor steps over it: where it starts,
+/// in bytes and in display columns, how wide it is, and what it is — a
+/// combining mark goes with the character before it, and is no step of its
+/// own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ch {
+    pub byte: usize,
+    pub vcol: usize,
+    pub width: usize,
+    pub c: char,
+}
+
+impl Ch {
+    /// The display column the cursor is drawn in on it in Normal mode, and
+    /// which it wants from then on: see [`sits`].
+    pub fn at(&self, shape: &Shape) -> usize {
+        sits(self.vcol, self.width, self.c, shape, false)
+    }
+}
+
+/// A line's characters, as a window of `shape` lays them out from its first
+/// column: see [`Ch`]. A combining mark at the very start of a line, with no
+/// character before it to go with, is left out with it.
+pub fn chars(text: &str, shape: &Shape) -> Vec<Ch> {
     let mut out = Vec::new();
     let mut vcol = 0;
-    for c in text.chars() {
-        let w = match c {
+    for (byte, c) in text.char_indices() {
+        let width = match c {
             '\t' if shape.list && shape.tab.is_empty() => 2,
             '\t' => shape.tabstop - vcol % shape.tabstop,
             '\0'..='\x1f' | '\x7f' => 2,
@@ -1125,10 +1173,64 @@ fn columns(text: &str, shape: &Shape) -> Vec<(usize, usize, char)> {
                 Some(w) => w,
             },
         };
-        out.push((vcol, w, c));
-        vcol += w;
+        out.push(Ch {
+            byte,
+            vcol,
+            width,
+            c,
+        });
+        vcol += width;
     }
     out
+}
+
+/// Whether Neovim 0.12 steps over a line's characters as [`chars`] does, as
+/// far as the client can tell: not where the line has anything Neovim joins
+/// into one character by rules the client does not follow — an emoji
+/// sequence (a zero-width joiner, a flag's pair, a skin tone, the selector
+/// that draws an emoji two cells wide) or a mark that takes a cell of its
+/// own in a script of South or South-East Asia — nor a character of no
+/// width that is not a combining mark, which Neovim shows as a cell or as
+/// its code (a soft hyphen, `<200b>`), nor a combining mark with nothing
+/// before it to go with.
+pub fn ordinary(text: &str) -> bool {
+    text.chars().enumerate().all(|(i, c)| {
+        let joined = matches!(c,
+            '\u{900}'..='\u{fff}'           // Devanagari to Tibetan
+            | '\u{1000}'..='\u{109f}'       // Myanmar
+            | '\u{1780}'..='\u{17ff}'       // Khmer
+            | '\u{1f1e6}'..='\u{1f1ff}'     // a flag's letters
+            | '\u{1f3fb}'..='\u{1f3ff}'     // skin tones
+        );
+        let mark = matches!(c,
+            '\u{300}'..='\u{36f}'
+            | '\u{1ab0}'..='\u{1aff}'
+            | '\u{1dc0}'..='\u{1dff}'
+            | '\u{20d0}'..='\u{20ff}'
+            | '\u{fe20}'..='\u{fe2f}'
+        );
+        !joined && (c.width() != Some(0) || (mark && i > 0))
+    })
+}
+
+/// The display columns of a line's characters, as a window of `shape` lays
+/// them out from its first column: where each starts, how wide it is, and
+/// what it is. Combining marks take no column and are left out.
+fn columns(text: &str, shape: &Shape) -> Vec<(usize, usize, char)> {
+    chars(text, shape)
+        .into_iter()
+        .map(|ch| (ch.vcol, ch.width, ch.c))
+        .collect()
+}
+
+/// Whether a line of `text` takes no more than a row of a window of `shape`
+/// `width` columns wide, its gutter and all: always, in one that does not
+/// wrap; in one that does, where its text — and where `'listchars'` shows
+/// it, its end — fits beside the gutter.
+pub fn fits(text: &str, shape: &Shape, width: usize) -> bool {
+    let eol = shape.list && shape.lcs.eol.is_some();
+    !shape.wrap
+        || end(&columns(text, shape)) + usize::from(eol) <= width.saturating_sub(shape.textoff)
 }
 
 /// Where in a line, in display columns, the cursor sits on a character: a
@@ -1609,6 +1711,9 @@ pub struct Typed {
     /// that, in insert mode, waits for another.
     whole: bool,
     waits: bool,
+    /// Every input sent, numbered as the agent counts the keys Neovim takes
+    /// (see [`Sync`]): a key of `nvim_input` one, an `nvim_input_mouse` one.
+    seq: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1628,6 +1733,7 @@ impl Typed {
     /// if asked about it — as Neovim will take it: the scroll it makes, if it
     /// makes one the client can follow.
     pub fn key(&mut self, key: &str, mapped: impl Fn(bool, &str) -> bool) -> Option<Command> {
+        self.seq += 1;
         if let State::Insert { x } = self.state {
             return self.insert_key(key, x, |k| mapped(true, k));
         }
@@ -1743,6 +1849,17 @@ impl Typed {
         None
     }
 
+    /// A mouse report sent: numbered as a key is, and says its number.
+    pub fn input(&mut self) -> u64 {
+        self.seq += 1;
+        self.seq
+    }
+
+    /// The number the last input sent was given, a key or a mouse report.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
     /// Whether the keys are being typed in insert mode, as far as the client
     /// can tell.
     pub fn inserting(&self) -> bool {
@@ -1796,6 +1913,25 @@ impl Typed {
         self.fence.is_none() && self.drawn < self.sent
     }
 
+    /// Whether the last key sent leaves Neovim waiting for another to finish
+    /// what it started, as far as the client can tell: a count, `z`, an
+    /// operator, a key something maps, or one of Insert mode's that waits —
+    /// or one it cannot follow, which may. What Neovim says of such a key
+    /// comes only once the user has typed the next, however long they took
+    /// to.
+    pub fn pending(&self) -> bool {
+        !self.whole
+            || matches!(
+                self.state,
+                State::Ready(Some(_)) | State::Z(_) | State::Insert { x: true }
+            )
+    }
+
+    /// Whether a fence is asked after and not yet answered.
+    pub fn fencing(&self) -> bool {
+        self.fence.is_some()
+    }
+
     /// A fence is asked after: says the count it is for.
     pub fn fenced(&mut self) -> u64 {
         self.fence = Some(self.sent);
@@ -1845,6 +1981,469 @@ fn scroll(key: &str, count: Option<i64>) -> Option<Command> {
     })
 }
 
+/// The display column the cursor wants, as Neovim keeps it (`curswant`):
+/// a column, or the end of whatever line it is on, as `$` leaves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Want {
+    Col(usize),
+    End,
+}
+
+impl Want {
+    /// As [`landing`] takes it: the end of a line is past any column of it.
+    pub fn col(self) -> usize {
+        match self {
+            Want::Col(c) => c,
+            Want::End => usize::MAX,
+        }
+    }
+}
+
+/// What Neovim is doing, as far as predictions go: waiting in Normal mode
+/// for a command, waiting in Insert mode for what is typed, or anything else
+/// — an operator pending, Visual mode, the command line, completion, a key
+/// typed after Insert mode's `<C-o>`, Replace — which nothing is predicted
+/// from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rest {
+    Normal,
+    Insert,
+    Busy,
+}
+
+impl Rest {
+    /// By the mode `nvim_get_mode()` says, as the agent sends it: `n`, `i`,
+    /// or anything else — `no`, `niI`, `ic` and their kind.
+    pub fn of(mode: &str) -> Self {
+        match mode {
+            "n" => Rest::Normal,
+            "i" => Rest::Insert,
+            _ => Rest::Busy,
+        }
+    }
+
+    /// By the name `mode_change` gives the mode Neovim last drew: which says
+    /// less, `<C-o>`'s Normal mode being `normal` and completion `insert`.
+    pub fn drawn(name: &str) -> Self {
+        match name {
+            "normal" => Rest::Normal,
+            "insert" => Rest::Insert,
+            _ => Rest::Busy,
+        }
+    }
+}
+
+/// Where the cursor is in a window, in the buffer's terms, and the view
+/// around it: as Neovim has it, by an ack, or as the client works it out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pos {
+    pub win: i64,
+    /// The cursor's line, from nought, and its column in bytes.
+    pub line: i64,
+    pub byte: usize,
+    pub want: Want,
+    /// The line at the top of the view, from nought, and the first display
+    /// column it shows of a window that does not wrap.
+    pub top: i64,
+    pub left: usize,
+    pub rest: Rest,
+}
+
+/// What the agent says each time Neovim goes to wait for a key with every
+/// key typed taken and nothing pending (`ack`, see `super::AGENT_LUA`): how
+/// many keys it has taken, the last few of them, and where they left the
+/// cursor, the view and the buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ack {
+    pub count: u64,
+    /// The last four keys taken, or fewer, as Neovim's `keytrans` writes
+    /// them: for the client to check its count by (see [`Sync::heard`]).
+    pub tail: Box<str>,
+    pub pos: Pos,
+    /// The window's buffer, its `b:changedtick` and how many lines it has.
+    pub buf: i64,
+    pub tick: i64,
+    pub line_count: i64,
+}
+
+impl Ack {
+    /// As the agent sends it: `[count, tail, mode, win, buf, tick,
+    /// line_count, lnum, col, want, top, left]`, lines from nought and the
+    /// column in bytes, `want` -1 for the end of the line. None of the counts
+    /// is below nought, the agent's own being Neovim's.
+    pub fn read(v: &[ValueRef<'_>]) -> Option<Self> {
+        let int = |i: usize| v.get(i).and_then(redraw::int);
+        let size = |i: usize| int(i).and_then(|n| usize::try_from(n).ok());
+        let line = |i: usize| int(i).filter(|n| *n >= 0);
+        let text = |i: usize| v.get(i).and_then(redraw::as_str);
+        let want = match int(9)? {
+            -1 => Want::End,
+            n => Want::Col(usize::try_from(n).ok()?),
+        };
+        Some(Self {
+            count: u64::try_from(int(0)?).ok()?,
+            tail: text(1)?.into(),
+            pos: Pos {
+                win: int(3)?,
+                line: line(7)?,
+                byte: size(8)?,
+                want,
+                top: line(10)?,
+                left: size(11)?,
+                rest: Rest::of(text(2)?),
+            },
+            buf: int(4)?,
+            tick: int(5)?,
+            line_count: line(6)?,
+        })
+    }
+}
+
+/// Whether Neovim may count as more than one a key the client sends as one:
+/// `<C-c>`, which interrupts as well and is counted twice, and a key with
+/// Alt, which Neovim takes as `<Esc>` and the key unless something maps it
+/// as it is. The counts are in doubt after one, until a fence ties them
+/// again (see [`Sync`]).
+pub fn uncertain(key: &str) -> bool {
+    let Some(inner) = key.strip_prefix('<').and_then(|k| k.strip_suffix('>')) else {
+        return false;
+    };
+    let mut rest = inner;
+    let mut mods = String::new();
+    while let Some((m, after)) = rest
+        .split_once('-')
+        .filter(|(m, a)| m.len() == 1 && !a.is_empty())
+    {
+        mods.push_str(m);
+        rest = after;
+    }
+    let mods = mods.to_ascii_uppercase();
+    mods.contains(['M', 'A']) || (mods == "C" && rest.eq_ignore_ascii_case("c"))
+}
+
+/// Whether a key the client sent and one Neovim's `keytrans` wrote are the
+/// same key: a mouse report (`None`) is whatever Neovim made of it, and a
+/// chord is not compared at all, each spelling its modifiers its own way
+/// (`<C-d>` and `<C-D>`, `<C-i>` and `<Tab>`). The rest are compared as
+/// Neovim reads them: a name in `<…>` in any case, and `<Space>`, `<lt>`,
+/// `<Bar>` and `<Bslash>` as the characters they stand for.
+fn alike(sent: Option<&str>, taken: &str) -> bool {
+    let Some(sent) = sent else {
+        return true;
+    };
+    let chord = |k: &str| k.len() > 2 && k.starts_with('<') && k[1..].contains('-');
+    let norm = |k: &str| -> String {
+        if !(k.len() > 2 && k.starts_with('<') && k.ends_with('>')) {
+            return k.to_string();
+        }
+        let name = k.to_ascii_uppercase();
+        match name.as_str() {
+            "<SPACE>" => " ".into(),
+            "<LT>" => "<".into(),
+            "<BAR>" => "|".into(),
+            "<BSLASH>" => "\\".into(),
+            _ => name,
+        }
+    };
+    chord(sent) || chord(taken) || norm(sent) == norm(taken)
+}
+
+/// How many inputs [`Sync`] keeps for checking the agent's count by.
+const RECENT: usize = 64;
+
+/// The client's inputs, numbered as its agent counts the keys Neovim takes
+/// ([`Typed::seq`]): one a key of `nvim_input`, one an `nvim_input_mouse`,
+/// none a paste or a change of focus. The two counts are tied by an offset,
+/// learnt only where nothing can be in doubt — a fence answered with nothing
+/// sent after it: Neovim answers one only once it has taken every key sent
+/// before it, so its count then is theirs — and checked at every ack and
+/// fence after, against what was sent and the last keys Neovim says it
+/// took. What it cannot account for puts the counts in doubt, and nothing
+/// the agent says is taken for a key of the client's till the next fence
+/// with nothing after it ties them again: keys of another UI's, or a
+/// plugin's typed for it, `<C-c>` and Alt (see [`uncertain`]), a paste on
+/// the command line, which Neovim takes as keys typed.
+///
+/// A key Neovim has taken is not always counted yet, though. One that a
+/// mapping makes nothing of — `<Nop>`, an `<expr>` that says `''` — reaches
+/// the agent only with the key after it, and Neovim answers a fence asked
+/// between the two with the count before it: tied there, the counts would
+/// be a key out. So a fence ties them only where the last key the agent
+/// says it counted, by the newest ack, is the last sent; where it is not,
+/// the next that can tie them is one asked after the next key.
+#[derive(Debug, Default)]
+pub struct Sync {
+    /// The client's number for a key is the agent's count, and this.
+    offset: Option<i64>,
+    doubt: bool,
+    /// The last inputs sent, by number, `None` for a mouse report: those
+    /// since the offset last moved, the ones before it numbered by another.
+    recent: VecDeque<(u64, Option<Box<str>>)>,
+    /// Pastes sent, counted.
+    pastes: u64,
+    /// How late a fence has to have been asked for its answer to be trusted,
+    /// where an earlier one's may not be: after the last paste — Neovim
+    /// takes one as no key, mostly, and a fence asked before it may be
+    /// answered after — and, where the paste is taken as keys, or the last
+    /// key sent is not counted yet, after the next key too: Neovim takes
+    /// such a paste's keys only after answering a fence asked with it, and
+    /// counts such a key only with the next.
+    barrier: Option<Fenced>,
+    /// The newest ack heard, judged or not: what a fence that ties the
+    /// counts finds Neovim's last word to be.
+    pub last: Option<Ack>,
+    /// The agent has been left, and counts: a fence asked now finds a count
+    /// to tie to — one asked before it was left, as the first after an
+    /// attach can be, finds none.
+    pub agent: bool,
+}
+
+/// A fence, as [`Sync`] needs to know it: asked once the inputs numbered to
+/// `seq` had been sent, and so many pastes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fenced {
+    pub seq: u64,
+    pastes: u64,
+}
+
+/// What a fence's answer made of the counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// No agent counted: none left yet, or one that does not.
+    NoAgent,
+    /// Nothing was sent after it: the counts are tied from here.
+    Tied,
+    /// They were tied, and still agree.
+    Checked,
+    /// They are not to be trusted: never tied, out of step, or the last key
+    /// sent not counted yet.
+    Doubted,
+}
+
+impl Sync {
+    /// Input `seq` sent: `key`, or a mouse report.
+    pub fn sent(&mut self, seq: u64, key: Option<&str>) {
+        if self.recent.len() == RECENT {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((seq, key.map(Into::into)));
+    }
+
+    /// A paste sent, the last input numbered `seq_now`: nothing the agent
+    /// says is taken for a key of the client's till a fence asked after it
+    /// has been answered — or, where Neovim may take it as keys typed, as it
+    /// does on its command line, one asked after the next key, and with the
+    /// counts in doubt till then.
+    pub fn pasted(&mut self, seq_now: u64, keys: bool) {
+        self.pastes += 1;
+        self.barrier = Some(Fenced {
+            seq: seq_now + u64::from(keys),
+            pastes: self.pastes,
+        });
+        if keys {
+            self.doubt("a paste Neovim may take as keys");
+        }
+    }
+
+    /// The counts are in doubt, for `why`.
+    pub fn doubt(&mut self, why: &'static str) {
+        if !self.doubt {
+            tracing::debug!(why, "client: the keys Neovim has taken are in doubt");
+        }
+        self.doubt = true;
+    }
+
+    /// A fresh attach, and with it a fresh agent, counting from nought.
+    pub fn attached(&mut self) {
+        *self = Self {
+            pastes: self.pastes,
+            ..Self::default()
+        };
+    }
+
+    /// Whether the agent's count can be taken for a number of the client's.
+    pub fn synced(&self) -> bool {
+        self.offset.is_some() && !self.doubt && self.barrier.is_none()
+    }
+
+    /// Whether a fence asked now, the last input sent numbered `seq_now`,
+    /// could tie counts that are not: there is an agent to count, and
+    /// nothing waits for a key yet to be sent.
+    pub fn wants_fence(&self, seq_now: u64) -> bool {
+        self.agent && !self.synced() && self.barrier.is_none_or(|b| b.seq <= seq_now)
+    }
+
+    /// A fence asked once the inputs numbered to `seq` were sent.
+    pub fn fenced(&self, seq: u64) -> Fenced {
+        Fenced {
+            seq,
+            pastes: self.pastes,
+        }
+    }
+
+    /// An ack heard, the last input sent numbered `seq_now`: the number of
+    /// the client's last key it covers, where the counts can be trusted.
+    /// Neovim cannot have taken more than was sent; and the keys it says it
+    /// took last, newest first, must be those sent under the same numbers,
+    /// as far back as the client remembers.
+    pub fn heard(&mut self, ack: &Ack, seq_now: u64) -> Option<u64> {
+        self.last = Some(ack.clone());
+        if !self.synced() {
+            return None;
+        }
+        let k = i64::try_from(ack.count)
+            .ok()
+            .zip(self.offset)
+            .and_then(|(count, offset)| count.checked_add(offset))
+            .and_then(|k| u64::try_from(k).ok())
+            .filter(|&k| k <= seq_now);
+        let Some(k) = k else {
+            self.doubt("more taken than sent");
+            return None;
+        };
+        let taken: Vec<&str> = tokens(&ack.tail).collect();
+        for (back, taken) in taken.iter().rev().enumerate() {
+            let Some(seq) = k.checked_sub(back as u64) else {
+                break;
+            };
+            let Some((_, sent)) = self.recent.iter().find(|(s, _)| *s == seq) else {
+                break;
+            };
+            if !alike(sent.as_deref(), taken) {
+                self.doubt("the last keys taken were not those sent");
+                return None;
+            }
+        }
+        Some(k)
+    }
+
+    /// Fence `at` answered, the agent having counted `taken` keys — -1 for
+    /// no agent — and the last input sent numbered `seq_now`. With nothing
+    /// sent after it, and asked late enough (see [`Sync::barrier`]), its
+    /// count is the client's: the two are tied there, the last key counted
+    /// being the last sent. With keys after it, Neovim may have taken some
+    /// of those before it; the count must be somewhere from the fence to
+    /// the last.
+    pub fn answered(&mut self, at: Fenced, seq_now: u64, taken: i64) -> Answer {
+        if taken < 0 {
+            self.agent = false;
+            return Answer::NoAgent;
+        }
+        if self
+            .barrier
+            .is_some_and(|b| at.seq >= b.seq && at.pastes >= b.pastes)
+        {
+            self.barrier = None;
+        }
+        if seq_now == at.seq && self.barrier.is_none() {
+            if !self.counted_last(taken) {
+                self.doubt("the last key sent not counted yet");
+                self.barrier = Some(Fenced {
+                    seq: seq_now + 1,
+                    pastes: self.pastes,
+                });
+                return Answer::Doubted;
+            }
+            let offset = at.seq as i64 - taken;
+            // Where the offset moves, the inputs before were numbered as it
+            // was: no check on the keys Neovim says it took from here.
+            if self.offset != Some(offset) {
+                self.recent.clear();
+            }
+            self.offset = Some(offset);
+            self.doubt = false;
+            return Answer::Tied;
+        }
+        let Some(offset) = self.offset else {
+            return Answer::Doubted;
+        };
+        let range = at.seq as i64..=seq_now as i64;
+        if !taken
+            .checked_add(offset)
+            .is_some_and(|k| range.contains(&k))
+        {
+            self.doubt("a fence out of step");
+        }
+        if self.doubt {
+            Answer::Doubted
+        } else {
+            Answer::Checked
+        }
+    }
+
+    /// Whether the last key the agent counted, having counted `taken`, is
+    /// the last input sent, as far as the newest ack says: where it says
+    /// nothing of that count, or of any key, there is nothing to tell by.
+    fn counted_last(&self, taken: i64) -> bool {
+        let last = self.last.as_ref();
+        let Some(ack) = last.filter(|a| i64::try_from(a.count) == Ok(taken)) else {
+            return true;
+        };
+        let (Some(took), Some((_, sent))) = (tokens(&ack.tail).last(), self.recent.back()) else {
+            return true;
+        };
+        alike(sent.as_deref(), took)
+    }
+}
+
+/// Neovim's last word on the keys: the client's number for the last key an
+/// ack covers, and the ack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Base {
+    pub seq: u64,
+    pub ack: Ack,
+}
+
+/// A key or a mouse report sent since Neovim's last word on them, numbered
+/// (see [`Typed::seq`]), and when it was sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sent {
+    pub seq: u64,
+    /// The key, `None` for a mouse report.
+    pub key: Option<Box<str>>,
+    pub at: Instant,
+    /// Whether it left Neovim waiting for another key, as far as the client
+    /// could tell (see [`Typed::pending`]).
+    pub pending: bool,
+}
+
+/// The most inputs kept since Neovim's last word on them: more, and Neovim
+/// is not keeping up with them, or not saying so.
+const QUEUE: usize = 512;
+
+/// How the motions the client followed without drawing them came out, each
+/// judged at the ack for its key (see [`Predictor::judge`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Shadow {
+    /// Where the client would have put the cursor and the view, Neovim put
+    /// them; or did not.
+    pub agree: u64,
+    pub disagree: u64,
+    /// Keys the client could not follow, or nothing to follow them from.
+    pub unknown: u64,
+    /// Acks that covered a scroll made ahead of Neovim which Neovim's frame
+    /// for them did not make: one that, judged by acks, would be given up
+    /// on then and not at its deadline.
+    pub unmade: u64,
+}
+
+impl Shadow {
+    /// The counts so far, in the log: every [`SHADOW_EVERY`] verdicts, and
+    /// as the client goes.
+    pub fn log(&self) {
+        tracing::debug!(
+            agree = self.agree,
+            disagree = self.disagree,
+            unknown = self.unknown,
+            unmade = self.unmade,
+            "client: the motions followed ahead of Neovim so far"
+        );
+    }
+}
+
+/// How often the counts of [`Shadow`] are logged, in verdicts.
+const SHADOW_EVERY: u64 = 100;
+
 /// Everything the client keeps for its predictions.
 #[derive(Debug, Default)]
 pub struct Predictor {
@@ -1863,18 +2462,50 @@ pub struct Predictor {
     pinged: Option<Instant>,
     /// What the client makes of the keys it sends.
     pub typed: Typed,
+    /// Which keys it works out ahead of Neovim besides the scrolls: past
+    /// those, the agent says what Neovim made of each key ([`Ack`]).
+    pub keys: PredictKeys,
+    /// The client's numbers for its inputs, tied to the agent's count.
+    pub sync: Sync,
+    /// Neovim's last word on the keys, and the inputs sent since, oldest
+    /// first: what the next ack is judged by.
+    pub base: Option<Base>,
+    pub queue: VecDeque<Sent>,
+    /// How long Neovim takes to say what it made of a key, from the key's
+    /// going, and how much that varies, smoothed as the round trip is: a
+    /// round trip, and Neovim's own time on the key and those before it —
+    /// timed only for a key that leaves nothing pending, Neovim's word on one
+    /// that does waiting on the user's next.
+    lag: Option<(Duration, Duration)>,
+    /// The last key that was timed so.
+    timed: u64,
+    /// How the motions followed came out: see [`Predictor::judge`].
+    pub shadow: Shadow,
+}
+
+/// A time smoothed as TCP smooths its round trip (RFC 6298), and how much it
+/// varies, after `r`: the first `r` itself and half of it, and each after
+/// moving them an eighth and a quarter of the way.
+fn smooth(was: Option<(Duration, Duration)>, r: Duration) -> (Duration, Duration) {
+    match was {
+        Some((s, v)) => ((s * 7 + r) / 8, (v * 3 + s.abs_diff(r)) / 4),
+        None => (r, r / 2),
+    }
 }
 
 impl Predictor {
     /// A round trip, as one request and its answer took.
     pub fn sample(&mut self, rtt: Duration) {
-        let (srtt, rttvar) = match (self.srtt, self.rttvar) {
-            (Some(s), Some(v)) => ((s * 7 + rtt) / 8, (v * 3 + s.abs_diff(rtt)) / 4),
-            _ => (rtt, rtt / 2),
-        };
+        let (srtt, rttvar) = smooth(self.srtt.zip(self.rttvar), rtt);
         self.srtt = Some(srtt);
         self.rttvar = Some(rttvar);
         self.on = srtt >= if self.on { OFF } else { ON };
+    }
+
+    /// Whether the agent says what Neovim made of each key: see
+    /// [`Predictor::keys`].
+    pub fn acks(&self) -> bool {
+        self.keys >= PredictKeys::Motions
     }
 
     /// Whether the link is slow enough to predict over.
@@ -1910,13 +2541,22 @@ impl Predictor {
     /// When a prediction made `now` is given up on, unconfirmed — and one
     /// made before, Neovim heard `now` still at work on the keys typed ahead
     /// of it: two round trips, [`GRACE`] or the round trip's variation, and a
-    /// segment lost on the way ([`LOSS`]).
+    /// segment lost on the way ([`LOSS`]). Or, where the agent says when
+    /// Neovim has taken each key, as long as a key has been taking to be
+    /// answered so ([`Predictor::heard`]), and the grace or how much that
+    /// varies, if that is longer: keys typed faster than Neovim takes them
+    /// wait in its typeahead, which no round trip measures. Told since not
+    /// to have it say so, the client waits as one never told.
     pub fn deadline(&self, now: Instant) -> Instant {
         let (srtt, rttvar) = (
             self.srtt.unwrap_or_default(),
             self.rttvar.unwrap_or_default(),
         );
-        now + srtt * 2 + GRACE.max(rttvar * 4) + LOSS
+        let taking = self
+            .lag
+            .filter(|_| self.acks())
+            .map_or(Duration::ZERO, |(s, v)| s + GRACE.max(v * 4));
+        now + (srtt * 2 + GRACE.max(rttvar * 4)).max(taking) + LOSS
     }
 
     /// Whether to ask after the round trip again: the user has been at work
@@ -2043,11 +2683,199 @@ impl Predictor {
         self.wants.remove(&win);
     }
 
-    /// A fresh attach: its agent will say everything again.
+    /// A fresh attach, or a link too fast to predict over: its agent will
+    /// say everything again — and of the keys, nothing till it does.
     pub fn reset(&mut self) {
         self.shapes.clear();
         self.lines.clear();
         self.wants.clear();
+        self.base = None;
+        self.queue.clear();
+    }
+
+    /// A fresh attach: nothing is known of what is pending, and a fresh
+    /// agent counts the keys from nought.
+    pub fn attached(&mut self) {
+        self.typed.attached();
+        self.sync.attached();
+    }
+
+    /// Whether to ask after a fence: for [`Typed`], or — where the agent says
+    /// what Neovim made of each key — for the counts, untied with an agent
+    /// there to tie them to (see [`Sync`]). Without, a fence asked before the
+    /// agent was left would leave them untied till the first pause after a
+    /// key the client does not predict.
+    pub fn wants_fence(&self) -> bool {
+        self.typed.wants_fence()
+            || (self.acks() && self.sync.wants_fence(self.typed.seq()) && !self.typed.fencing())
+    }
+
+    /// Input `seq` sent at `now`: `key`, or a mouse report. Where the agent
+    /// says what Neovim made of each key, kept for its count to be checked
+    /// by; and for its acks to be judged by while it says them, which it
+    /// does not over a link too fast for predictions.
+    pub fn sent(&mut self, seq: u64, key: Option<&str>, now: Instant) {
+        if !self.acks() {
+            return;
+        }
+        self.sync.sent(seq, key);
+        if key.is_some_and(uncertain) {
+            self.sync.doubt("a key Neovim may count as two");
+        }
+        if !self.on {
+            return;
+        }
+        if self.queue.len() == QUEUE {
+            self.sync.doubt("too many keys unanswered");
+            self.queue.clear();
+        }
+        self.queue.push_back(Sent {
+            seq,
+            key: key.map(Into::into),
+            at: now,
+            pending: self.typed.pending(),
+        });
+    }
+
+    /// An ack heard at `now`: the client's number for the last key it
+    /// covers, where the counts can be trusted (see [`Sync::heard`]) — that
+    /// key timed, from its going, for [`Predictor::deadline`], where it left
+    /// nothing pending: one that waits for the next key, an `f` or a prefix
+    /// of `'timeoutlen'`'s, is answered as late as the user, or the timeout,
+    /// lets it be, which is no time of Neovim's or the link's. The column
+    /// the cursor wants comes with every ack, as it came on its own without
+    /// them (see [`Predictor::want`]).
+    pub fn heard(&mut self, ack: &Ack, now: Instant) -> Option<u64> {
+        self.wants.insert(ack.pos.win, ack.pos.want.col());
+        let k = self.sync.heard(ack, self.typed.seq())?;
+        if k > self.timed {
+            if let Some(key) = self.queue.iter().find(|s| s.seq == k && !s.pending) {
+                self.timed = k;
+                self.lag = Some(smooth(self.lag, now.saturating_duration_since(key.at)));
+            }
+        }
+        Some(k)
+    }
+
+    /// Fence `at` answered, the agent having counted `taken` keys: see
+    /// [`Sync::answered`]. Where it ties the counts, Neovim's last word is
+    /// the last ack the agent sent, if it sent one after the last key: there
+    /// is nothing after it. How long it took is not timed: one asked after
+    /// a key that waits for another is answered only once the user has
+    /// typed that.
+    pub fn answered(&mut self, at: Fenced, taken: i64) {
+        if self.sync.answered(at, self.typed.seq(), taken) != Answer::Tied {
+            return;
+        }
+        let last = self.sync.last.as_ref();
+        if let Some(ack) = last.filter(|a| i64::try_from(a.count) == Ok(taken)) {
+            self.base = Some(Base {
+                seq: at.seq,
+                ack: ack.clone(),
+            });
+            self.queue.retain(|s| s.seq > at.seq);
+        }
+    }
+
+    /// Whether the lines kept of window `win` are buffer `buf`'s as it was at
+    /// `b:changedtick` `tick`. The agent sends the edits ahead of each ack,
+    /// so that they are the ack's.
+    pub fn fresh(&self, win: i64, buf: i64, tick: i64) -> bool {
+        self.lines
+            .get(&win)
+            .is_some_and(|l| l.buf == buf && l.tick == tick)
+    }
+
+    /// Judge `ack`, which covers the client's keys up to its `k`: where the
+    /// client would have put the cursor and the view for the keys since
+    /// Neovim's last word, had it drawn them, against where Neovim says it
+    /// put them — and take it for Neovim's last word from here. Nothing is
+    /// drawn of it yet: the verdicts are counted, and logged ([`Shadow`]).
+    /// `view` is the window's rows and columns, its gutter and all, as the
+    /// frame for the keys has them; `unmade`, whether that frame left a
+    /// scroll ahead of Neovim unmade whose key Neovim has taken.
+    pub fn judge(&mut self, k: u64, ack: Ack, view: Option<(i64, usize)>, unmade: bool) {
+        self.shadow.unmade += u64::from(unmade);
+        if let Some(base) = self.base.as_ref().filter(|b| b.seq < k) {
+            let keys: Option<Vec<&str>> = self
+                .queue
+                .iter()
+                .filter(|s| s.seq > base.seq && s.seq <= k)
+                .map(|s| s.key.as_deref())
+                .collect();
+            let keys = keys.filter(|keys| keys.len() as u64 == k - base.seq);
+            let followed = keys
+                .as_ref()
+                .and_then(|keys| self.followed(&base.ack, keys, &ack, view));
+            let shadow = &mut self.shadow;
+            match followed {
+                None => shadow.unknown += 1,
+                Some(to) if to == ack.pos => shadow.agree += 1,
+                Some(to) => {
+                    shadow.disagree += 1;
+                    tracing::info!(
+                        keys = ?keys.unwrap_or_default(),
+                        from = ?base.ack.pos,
+                        followed = ?to,
+                        neovim = ?ack.pos,
+                        line = ?self.text(ack.pos.win, ack.pos.line),
+                        "client: a motion followed ahead of Neovim was not the one it made"
+                    );
+                }
+            }
+            let s = self.shadow;
+            if (s.agree + s.disagree + s.unknown).is_multiple_of(SHADOW_EVERY) {
+                s.log();
+            }
+        }
+        self.base = Some(Base { seq: k, ack });
+        self.queue.retain(|s| s.seq > k);
+    }
+
+    /// Where the client would have put the cursor and the view for `keys`,
+    /// typed from where `from` says they were: `None` where it would not
+    /// have followed them — a key it does not, or something maps; lines it
+    /// does not have as they are, or whose characters it may not step over
+    /// as Neovim does ([`ordinary`]); an edit, or another window or buffer, by
+    /// the ack `to` for them.
+    fn followed(
+        &self,
+        from: &Ack,
+        keys: &[&str],
+        to: &Ack,
+        view: Option<(i64, usize)>,
+    ) -> Option<Pos> {
+        let win = from.pos.win;
+        let shape = self.shapes.get(&win)?;
+        let (rows, width) = view?;
+        let same = to.pos.win == win && to.buf == from.buf && to.tick == from.tick;
+        if !same
+            || shape.buf != from.buf
+            || !shape.predictable
+            || !self.fresh(win, from.buf, from.tick)
+        {
+            return None;
+        }
+        let motions = moves::parse(keys.iter().copied(), |key| {
+            shape.mapped.iter().any(|m| m == key)
+        })?;
+        let text = |l: i64| {
+            (!self.cut(win, l))
+                .then(|| self.text(win, l))
+                .flatten()
+                .filter(|t| ordinary(t))
+        };
+        let cx = moves::Ctx {
+            shape,
+            line_count: from.line_count,
+            rows,
+            width,
+            text: &text,
+            whichwrap: None,
+        };
+        motions
+            .into_iter()
+            .try_fold(from.pos, |at, (m, count)| moves::moved(m, count, &at, &cx))
     }
 
     /// The display column the cursor wants in window `win`, as Neovim keeps
@@ -4136,5 +4964,522 @@ mod tests {
         let (srtt, rttvar) = (jumpy.srtt.unwrap(), jumpy.rttvar.unwrap());
         assert!(rttvar * 4 > GRACE, "varies by more than the grace");
         assert_eq!(jumpy.deadline(t0) - t0, srtt * 2 + rttvar * 4 + LOSS);
+    }
+
+    /// Where the agent says it has the cursor and the view of window 1000,
+    /// in Normal mode at the first column of line 0, having taken `count`
+    /// keys, the last of them `tail`.
+    fn ack(count: u64, tail: &str) -> Ack {
+        Ack {
+            count,
+            tail: tail.into(),
+            pos: Pos {
+                win: 1000,
+                line: 0,
+                byte: 0,
+                want: Want::Col(0),
+                top: 0,
+                left: 0,
+                rest: Rest::Normal,
+            },
+            buf: 1,
+            tick: 5,
+            line_count: 100,
+        }
+    }
+
+    /// Send `keys` after input `seq`, each numbered on from it.
+    fn send(s: &mut Sync, seq: &mut u64, keys: &str) {
+        for key in tokens(keys) {
+            *seq += 1;
+            s.sent(*seq, Some(key));
+        }
+    }
+
+    /// Counts tied by a fence with nothing after it, at input `seq`, the
+    /// agent having counted `taken`.
+    fn tied(seq: u64, taken: i64) -> Sync {
+        let mut s = Sync::default();
+        assert_eq!(s.answered(s.fenced(seq), seq, taken), Answer::Tied);
+        s
+    }
+
+    /// An ack as the agent sends it, every field read: lines from nought,
+    /// the column in bytes, and -1 for the end of the line; the modes it
+    /// waits in told from those it is busy in.
+    #[test]
+    fn an_ack_is_read_as_the_agent_sends_it() {
+        let wire = |want: i64, mode: &str| -> Vec<Value> {
+            vec![
+                7.into(),
+                "jl".into(),
+                mode.into(),
+                1000.into(),
+                1.into(),
+                5.into(),
+                100.into(),
+                3.into(),
+                4.into(),
+                want.into(),
+                1.into(),
+                2.into(),
+            ]
+        };
+        let read = |v: Vec<Value>| {
+            let refs: Vec<ValueRef<'_>> = v.iter().map(Value::as_ref).collect();
+            Ack::read(&refs)
+        };
+        let want = Ack {
+            count: 7,
+            tail: "jl".into(),
+            pos: Pos {
+                win: 1000,
+                line: 3,
+                byte: 4,
+                want: Want::Col(9),
+                top: 1,
+                left: 2,
+                rest: Rest::Normal,
+            },
+            buf: 1,
+            tick: 5,
+            line_count: 100,
+        };
+        assert_eq!(read(wire(9, "n")), Some(want.clone()));
+        let end = read(wire(-1, "n")).expect("read");
+        assert_eq!((end.pos.want, end.pos.want.col()), (Want::End, usize::MAX));
+        for (mode, rest) in [
+            ("n", Rest::Normal),
+            ("i", Rest::Insert),
+            ("no", Rest::Busy),
+            ("niI", Rest::Busy),
+            ("ic", Rest::Busy),
+        ] {
+            assert_eq!(
+                read(wire(9, mode)).map(|a| a.pos.rest),
+                Some(rest),
+                "{mode}"
+            );
+        }
+        assert_eq!(read(wire(9, "n")[..11].to_vec()), None, "cut short");
+        let mut before = wire(9, "n");
+        before[7] = (-1).into();
+        assert_eq!(read(before), None, "a line before the first");
+        assert_eq!(Rest::drawn("normal"), Rest::Normal);
+        assert_eq!(Rest::drawn("insert"), Rest::Insert);
+        assert_eq!(Rest::drawn("visual"), Rest::Busy);
+    }
+
+    /// Each key the client sends is a key as the agent counts what Neovim's
+    /// `keytrans` writes of it, one for one, and the same key by the check
+    /// the tail is put to — as Neovim 0.12.6 was found to count them, an
+    /// `on_key` counting what `nvim_input` sent it.
+    #[test]
+    fn the_keys_count_as_the_agent_counts_them() {
+        for (sent, keytrans) in [
+            ("<lt>", "<lt>"),
+            ("é", "é"),
+            ("e\u{301}", "e\u{301}"),
+            ("<C-d>", "<C-D>"),
+            (" ", "<Space>"),
+            ("\\", "\\"),
+            ("|", "|"),
+            ("<Tab><CR><BS><Esc>", "<Tab><CR><BS><Esc>"),
+            ("<S-Up><PageDown>", "<S-Up><PageDown>"),
+        ] {
+            let ours: Vec<&str> = tokens(sent).collect();
+            let theirs: Vec<&str> = tokens(keytrans).collect();
+            assert_eq!(ours.len(), theirs.len(), "{sent:?} and {keytrans:?}");
+            assert!(
+                ours.iter().zip(&theirs).all(|(a, b)| alike(Some(a), b)),
+                "{sent:?} and {keytrans:?}"
+            );
+        }
+        assert!(!alike(Some("j"), "k"));
+        assert!(!alike(Some("<Esc>"), "<CR>"));
+    }
+
+    /// A fence answered with nothing sent after it ties the counts there:
+    /// the keys after it are numbered from the agent's count on.
+    #[test]
+    fn a_quiet_fence_ties_the_counts() {
+        let mut s = Sync::default();
+        let mut seq = 0;
+        send(&mut s, &mut seq, "abc");
+        assert_eq!(s.heard(&ack(1, "c"), seq), None, "not tied yet");
+        let at = s.fenced(seq);
+        assert_eq!(s.answered(at, seq, 1), Answer::Tied);
+        assert!(s.synced());
+        send(&mut s, &mut seq, "jl");
+        assert_eq!(s.heard(&ack(3, "cjl"), seq), Some(5));
+        assert_eq!(s.last, Some(ack(3, "cjl")), "heard, judged or not");
+    }
+
+    /// Keys sent after a fence may be taken before Neovim answers it: the
+    /// answer is checked, anywhere from the fence to the last key, and ties
+    /// nothing.
+    #[test]
+    fn a_fence_with_keys_after_it_checks_but_does_not_tie() {
+        let mut seq = 0;
+        let mut s = tied(0, 0);
+        send(&mut s, &mut seq, "jj");
+        let at = s.fenced(seq);
+        send(&mut s, &mut seq, "k");
+        assert_eq!(s.answered(at, seq, 2), Answer::Checked);
+        assert_eq!(s.answered(at, seq, 3), Answer::Checked);
+        assert!(s.synced());
+        let mut untied = Sync::default();
+        assert_eq!(untied.answered(at, seq, 2), Answer::Doubted);
+        assert!(!untied.synced());
+    }
+
+    /// A fence whose count is not between it and the last key sent puts the
+    /// counts in doubt, and the next fence with nothing after it ties them
+    /// again.
+    #[test]
+    fn a_fence_out_of_range_puts_the_count_in_doubt() {
+        let mut seq = 0;
+        let mut s = tied(0, 0);
+        send(&mut s, &mut seq, "jj");
+        let at = s.fenced(seq);
+        send(&mut s, &mut seq, "k");
+        assert_eq!(s.answered(at, seq, 1), Answer::Doubted, "a key dropped");
+        assert!(!s.synced());
+        assert_eq!(s.heard(&ack(3, "jjk"), seq), None);
+        let at = s.fenced(seq);
+        assert_eq!(s.answered(at, seq, 2), Answer::Tied);
+        assert!(s.synced());
+    }
+
+    /// Neovim cannot have taken more keys than were sent.
+    #[test]
+    fn an_ack_past_what_was_sent_is_doubted() {
+        let mut seq = 0;
+        let mut s = tied(0, 0);
+        send(&mut s, &mut seq, "j");
+        assert_eq!(s.heard(&ack(2, "jj"), seq), None);
+        assert!(!s.synced());
+    }
+
+    /// The last keys Neovim says it took must be the last sent under the
+    /// same numbers.
+    #[test]
+    fn a_tail_that_differs_is_doubted() {
+        let mut seq = 0;
+        let mut s = tied(0, 0);
+        send(&mut s, &mut seq, "jk");
+        assert_eq!(s.heard(&ack(2, "jj"), seq), None);
+        assert!(!s.synced());
+    }
+
+    /// A mouse report is whatever Neovim made of it.
+    #[test]
+    fn a_click_in_the_tail_matches_anything() {
+        let mut seq = 0;
+        let mut s = tied(0, 0);
+        seq += 1;
+        s.sent(seq, None);
+        send(&mut s, &mut seq, "j");
+        assert_eq!(s.heard(&ack(2, "<LeftMouse>j"), seq), Some(2));
+    }
+
+    /// A chord is spelt one way by the client and another by `keytrans`,
+    /// and the blanks and `<` by their names: none of it is a difference.
+    #[test]
+    fn modifiers_are_not_compared_by_spelling() {
+        let mut seq = 0;
+        let mut s = tied(0, 0);
+        send(&mut s, &mut seq, "<C-d> <lt><C-i>");
+        assert_eq!(s.heard(&ack(4, "<C-D><Space><lt><Tab>"), seq), Some(4));
+    }
+
+    /// `<C-c>`, which Neovim counts twice, and a key with Alt, which it may,
+    /// put the counts in doubt as they are sent — till a fence with nothing
+    /// after it ties them again.
+    #[test]
+    fn ctrl_c_puts_the_count_in_doubt_until_a_quiet_fence() {
+        let mut p = Predictor {
+            keys: PredictKeys::Motions,
+            sync: tied(0, 0),
+            ..Predictor::default()
+        };
+        p.sample(Duration::from_millis(100));
+        let t0 = Instant::now();
+        for key in ["j", "<C-c>"] {
+            p.typed.key(key, |_, _| false);
+            p.sent(p.typed.seq(), Some(key), t0);
+        }
+        assert!(!p.sync.synced());
+        assert_eq!(p.heard(&ack(3, "j<C-C><C-C>"), t0), None);
+        let at = p.sync.fenced(p.typed.seq());
+        assert_eq!(p.sync.answered(at, p.typed.seq(), 3), Answer::Tied);
+        assert!(p.sync.synced());
+        for (key, doubt) in [
+            ("<C-c>", true),
+            ("<C-C>", true),
+            ("<M-x>", true),
+            ("<A-j>", true),
+            ("<C-M-a>", true),
+            ("<M-->", true),
+            ("<M-lt>", true),
+            ("<C-d>", false),
+            ("<S-Up>", false),
+            ("<Esc>", false),
+            ("<lt>", false),
+            ("c", false),
+            ("-", false),
+        ] {
+            assert_eq!(uncertain(key), doubt, "{key}");
+        }
+    }
+
+    /// A paste is no key to Neovim in Normal, Visual or Insert mode: what
+    /// the agent says after one is not taken for a key of the client's till
+    /// a fence asked after the paste has been answered — nor is one asked
+    /// before it taken to tie the counts.
+    #[test]
+    fn a_paste_holds_acks_until_a_fence_after_it() {
+        let mut seq = 0;
+        let mut s = tied(0, 0);
+        send(&mut s, &mut seq, "j");
+        let before = s.fenced(seq);
+        s.pasted(seq, false);
+        assert_eq!(s.heard(&ack(1, "j"), seq), None);
+        assert_eq!(s.answered(before, seq, 1), Answer::Checked);
+        assert!(!s.synced(), "asked before the paste");
+        let after = s.fenced(seq);
+        assert_eq!(s.answered(after, seq, 1), Answer::Tied);
+        assert_eq!(s.heard(&ack(1, "j"), seq), Some(1));
+    }
+
+    /// On the command line Neovim takes a paste as keys typed, and takes
+    /// them only after answering a fence asked with the paste: the counts
+    /// are in doubt, and tied again by no fence but one asked after the next
+    /// key — none of which is asked for till then.
+    #[test]
+    fn a_paste_taken_as_keys_holds_acks_till_a_fence_after_the_next_key() {
+        let mut seq = 0;
+        let mut s = tied(0, 0);
+        s.agent = true;
+        send(&mut s, &mut seq, ":");
+        assert_eq!(s.heard(&ack(1, ":"), seq), Some(1));
+        s.pasted(seq, true);
+        assert!(!s.synced());
+        assert_eq!(s.answered(s.fenced(seq), seq, 1), Answer::Doubted);
+        assert!(!s.wants_fence(seq), "not till the next key");
+        assert_eq!(s.heard(&ack(5, "echo"), seq), None);
+        send(&mut s, &mut seq, "<CR>");
+        assert!(s.wants_fence(seq));
+        assert_eq!(s.heard(&ack(6, "cho<CR>"), seq), None);
+        assert_eq!(s.answered(s.fenced(seq), seq, 6), Answer::Tied);
+        send(&mut s, &mut seq, "j");
+        assert_eq!(s.heard(&ack(7, "ho<CR>j"), seq), Some(3));
+    }
+
+    /// A key that a mapping makes nothing of — `<Nop>` — reaches the agent
+    /// only with the key after it. A fence answered between the two finds
+    /// the count before it, the last key counted not the last sent: it ties
+    /// nothing, and none is asked for till a key after, with which the
+    /// counts are tied where they were.
+    #[test]
+    fn a_key_not_counted_yet_ties_nothing() {
+        let mut seq = 0;
+        let mut s = tied(0, 0);
+        s.agent = true;
+        send(&mut s, &mut seq, "j");
+        assert_eq!(s.heard(&ack(1, "j"), seq), Some(1));
+        send(&mut s, &mut seq, " ");
+        assert_eq!(s.answered(s.fenced(seq), seq, 1), Answer::Doubted);
+        assert!(!s.synced());
+        assert!(!s.wants_fence(seq), "not till the next key");
+        send(&mut s, &mut seq, "l");
+        assert!(s.wants_fence(seq));
+        assert_eq!(s.heard(&ack(3, "j<Space>l"), seq), None);
+        assert_eq!(s.answered(s.fenced(seq), seq, 3), Answer::Tied);
+        send(&mut s, &mut seq, "j");
+        assert_eq!(s.heard(&ack(4, "j<Space>lj"), seq), Some(4));
+    }
+
+    /// A tie that moves the offset — after `<C-c>`, counted twice, or a key
+    /// with Alt, taken as `<Esc>` and the key — leaves the keys sent before
+    /// it numbered as they were, and the last keys Neovim says it took are
+    /// checked against those sent after it only. One that leaves the offset
+    /// where it was leaves those before it to check by.
+    #[test]
+    fn a_tie_that_moves_the_offset_checks_no_key_before_it() {
+        for (sent, taken) in [("xk<C-c>", "xk<C-C><C-C>"), ("xk<M-j>", "xk<Esc>j")] {
+            let mut seq = 0;
+            let mut s = tied(0, 0);
+            send(&mut s, &mut seq, sent);
+            s.doubt("a key Neovim may count as two");
+            assert_eq!(s.heard(&ack(4, taken), seq), None);
+            assert_eq!(s.answered(s.fenced(seq), seq, 4), Answer::Tied);
+            send(&mut s, &mut seq, "l");
+            let tail: String = tokens(taken).skip(1).chain(["l"]).collect();
+            assert_eq!(s.heard(&ack(5, &tail), seq), Some(4), "{sent}");
+            assert!(s.synced());
+        }
+        let mut seq = 0;
+        let mut s = tied(0, 0);
+        send(&mut s, &mut seq, "jk");
+        assert_eq!(s.answered(s.fenced(seq), seq, 2), Answer::Tied);
+        send(&mut s, &mut seq, "l");
+        assert_eq!(s.heard(&ack(3, "jjl"), seq), None);
+    }
+
+    /// Counts past any reckoning — none an agent could send, but the wire
+    /// is the wire — put the counts in doubt, where adding them up would
+    /// overflow.
+    #[test]
+    fn counts_past_reckoning_are_doubted() {
+        let mut seq = 5;
+        let mut s = tied(5, 0);
+        send(&mut s, &mut seq, "j");
+        assert_eq!(s.heard(&ack(i64::MAX as u64, "j"), seq), None);
+        assert!(!s.synced());
+        let mut seq = 5;
+        let mut s = tied(5, 0);
+        send(&mut s, &mut seq, "j");
+        let at = s.fenced(seq);
+        send(&mut s, &mut seq, "k");
+        assert_eq!(s.answered(at, seq, i64::MAX), Answer::Doubted);
+    }
+
+    /// A fence that finds no count is asked before the agent is there; one
+    /// that finds nought, just after.
+    #[test]
+    fn minus_one_is_no_agent_and_nought_is_an_agent() {
+        let mut s = Sync::default();
+        let at = s.fenced(0);
+        assert_eq!(s.answered(at, 0, -1), Answer::NoAgent);
+        assert!(!s.synced());
+        assert_eq!(s.answered(at, 0, 0), Answer::Tied);
+        assert!(s.synced());
+    }
+
+    /// Inputs are kept for judging the acks by only while acks come — the
+    /// link slow enough — and no more of them than Neovim could be behind
+    /// on: past that, it is not keeping up, or not saying, and the counts
+    /// are in doubt.
+    #[test]
+    fn a_queue_neovim_never_answers_is_let_go() {
+        let t0 = Instant::now();
+        let mut p = Predictor {
+            keys: PredictKeys::Motions,
+            sync: tied(0, 0),
+            ..Predictor::default()
+        };
+        p.sent(1, Some("j"), t0);
+        assert!(p.queue.is_empty(), "a link too fast for acks");
+        p.sample(Duration::from_millis(100));
+        for seq in 2..2 + QUEUE as u64 {
+            p.sent(seq, Some("j"), t0);
+        }
+        assert_eq!(p.queue.len(), QUEUE);
+        assert!(p.sync.synced());
+        p.sent(2 + QUEUE as u64, Some("j"), t0);
+        assert_eq!(p.queue.len(), 1);
+        assert!(!p.sync.synced());
+        let mut scrolls = Predictor::default();
+        scrolls.sample(Duration::from_millis(100));
+        scrolls.sent(1, Some("j"), t0);
+        assert!(scrolls.queue.is_empty(), "no acks, nothing kept");
+    }
+
+    /// A key Neovim takes longer to answer than a round trip, its typeahead
+    /// held up behind others, keeps a scroll ahead waiting as long; timed
+    /// once, from its going, however often an ack says it again.
+    #[test]
+    fn a_scroll_waits_as_long_as_neovim_takes_to_answer_keys() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut p = Predictor {
+            keys: PredictKeys::Motions,
+            sync: tied(0, 0),
+            ..Predictor::default()
+        };
+        for _ in 0..20 {
+            p.sample(ms(100));
+        }
+        let round = p.deadline(t0) - t0;
+        p.typed.key("j", |_, _| false);
+        p.sent(1, Some("j"), t0);
+        assert_eq!(p.heard(&ack(1, "j"), t0 + ms(900)), Some(1));
+        assert_eq!(p.lag, Some((ms(900), ms(450))));
+        assert_eq!(p.deadline(t0) - t0, ms(900) + ms(450) * 4 + LOSS);
+        assert!(p.deadline(t0) - t0 > round);
+        p.heard(&ack(1, "j"), t0 + ms(5000));
+        assert_eq!(p.lag, Some((ms(900), ms(450))), "the same key, timed once");
+        assert_eq!(p.want(1000), Some(0), "and the column the cursor wants");
+        p.keys = PredictKeys::Scrolls;
+        assert_eq!(p.deadline(t0) - t0, round, "told not to count any more");
+    }
+
+    /// A key that leaves Neovim waiting for another — a prefix of something
+    /// mapped, which it may wait `'timeoutlen'` on, or `f`, which waits for
+    /// the user — is answered as late as that lets it be: it is not timed,
+    /// and the key that ends the wait is.
+    #[test]
+    fn a_key_that_waits_for_another_is_not_timed() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut p = Predictor {
+            keys: PredictKeys::Motions,
+            sync: tied(0, 0),
+            ..Predictor::default()
+        };
+        for _ in 0..20 {
+            p.sample(ms(100));
+        }
+        let round = p.deadline(t0) - t0;
+        fn send(p: &mut Predictor, key: &str, mapped: bool, at: Instant) {
+            p.typed.key(key, |_, k| mapped && k == key);
+            p.sent(p.typed.seq(), Some(key), at);
+        }
+        send(&mut p, "j", true, t0);
+        assert_eq!(p.heard(&ack(1, "j"), t0 + ms(1100)), Some(1));
+        assert_eq!(p.lag, None, "a prefix, waited on");
+        send(&mut p, "f", false, t0 + ms(2000));
+        send(&mut p, "x", false, t0 + ms(4000));
+        assert_eq!(p.heard(&ack(3, "jfx"), t0 + ms(4100)), Some(3));
+        assert_eq!(p.lag, Some((ms(100), ms(50))), "from the key that ended it");
+        assert_eq!(p.deadline(t0) - t0, round);
+    }
+
+    /// The lines whose characters Neovim 0.12.6 was found to step over
+    /// otherwise than [`chars`] does, or to show otherwise, are not
+    /// ordinary; those it steps over alike are.
+    #[test]
+    fn only_lines_stepped_over_as_neovim_does_are_ordinary() {
+        for text in [
+            "hello\tworld",
+            "e\u{301}x",
+            "a\u{20dd}b",
+            "日本語",
+            "\u{3000}x",
+            "😀x",
+            "✔x",
+            "a\u{80}b",
+            "\u{a0}x",
+        ] {
+            assert!(ordinary(text), "{text:?}");
+        }
+        for text in [
+            "\u{915}\u{93e}x",
+            "\u{e01}\u{e33}x",
+            "\u{ba8}\u{bbf}x",
+            "👨\u{200d}👩\u{200d}👧x",
+            "🇯🇵x",
+            "👍🏽x",
+            "❤\u{fe0f}x",
+            "a\u{200b}b",
+            "a\u{ad}b",
+            "a\u{200e}b",
+            "a\u{feff}b",
+            "a\u{61c}b",
+            "\u{301}x",
+        ] {
+            assert!(!ordinary(text), "{text:?}");
+        }
     }
 }
