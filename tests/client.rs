@@ -3020,7 +3020,8 @@ fn a_split_over_a_slow_link_is_centred_from_its_first_frame() {
 /// The window right of another closed, each window's text centred: the one
 /// left of it takes its place, and its text goes from the middle of where it
 /// was to the middle of the whole width as the closed window's ghost flies
-/// off it — never there at once, under the ghost.
+/// off it — never there at once, under the ghost — while the ghost's text
+/// flies off from where it was drawn, in the middle of its window.
 #[test]
 fn a_window_closed_beside_centred_text_takes_it_to_its_middle() {
     require_nvim!();
@@ -3088,6 +3089,10 @@ fn a_window_closed_beside_centred_text_takes_it_to_its_middle() {
     assert!(
         ghosted.iter().all(|s| s[0] < 50),
         "there at once, under the ghost: {seen:?}"
+    );
+    assert!(
+        ghosted.iter().all(|s| s[1] >= right),
+        "the closed window's text drawn left of where it was: {seen:?}"
     );
     let held: Vec<usize> = seen.iter().filter_map(|s| s.first().copied()).collect();
     assert_eq!(held.last(), Some(&50), "landed in its middle: {seen:?}");

@@ -505,22 +505,33 @@ pub fn inset(slot: usize, grid: usize) -> usize {
 /// the text is narrower than the window, which go either side of it, blank
 /// in the gap's colour. Left as it is where the gap is not that wide.
 pub fn realign(row: &mut [Out], inset: usize, text: usize) {
+    realign_by(row, inset, text, |o| {
+        (o.text == Text::Char(' ') && !o.wide).then_some(o.style)
+    });
+}
+
+/// [`realign`], of a row of cells of any kind: `blank` says whether a cell
+/// is a blank, and if so in what colour.
+pub fn realign_by<T: Clone, C: PartialEq>(
+    row: &mut [T],
+    inset: usize,
+    text: usize,
+    blank: impl Fn(&T) -> Option<C>,
+) {
     let w = row.len();
     let extra = w.saturating_sub(text);
     if extra == 0 || inset > extra {
         return;
     }
-    let blank = |o: &Out| o.text == Text::Char(' ') && !o.wide;
     let (mut at, mut longest) = (0, 0);
     let mut i = 0;
     while i < w {
-        if !blank(&row[i]) {
+        let Some(colour) = blank(&row[i]) else {
             i += 1;
             continue;
-        }
-        let style = row[i].style;
+        };
         let mut j = i;
-        while j < w && blank(&row[j]) && row[j].style == style {
+        while j < w && blank(&row[j]).as_ref() == Some(&colour) {
             j += 1;
         }
         if j - i > longest {
@@ -531,8 +542,8 @@ pub fn realign(row: &mut [Out], inset: usize, text: usize) {
     if longest < extra {
         return;
     }
-    let fill = Out::blank(row[at].style);
-    let words: Vec<Out> = row[..at]
+    let fill = row[at].clone();
+    let words: Vec<T> = row[..at]
         .iter()
         .chain(&row[at + extra..])
         .cloned()
