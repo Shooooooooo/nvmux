@@ -2496,6 +2496,129 @@ fn text_typed_while_a_new_line_is_on_its_way_appears_with_it() {
     assert_eq!(first.as_deref(), Some("ab"), "with the new line");
 }
 
+/// Text typed at the end of a line with virtual text after it, over a slow
+/// link to a real Neovim: virtual text at the line's end moves with it, as
+/// the client draws it ahead of Neovim; virtual text right-aligned, in a
+/// column of the window's, or inline and staying before what is typed after
+/// it — which Neovim draws where it is, or after it — has the line's typing
+/// and the `A` before it wait for Neovim.
+#[test]
+fn typing_beside_virtual_text_is_drawn_where_neovim_draws_it() {
+    require_nvim!();
+    let scratch = Scratch::new("client-echo-vt");
+    let setline = r#"call setline(1, ["eol", "right", "column", "inline", "line 1"])"#;
+    let (mut rpc, mut term, _) = drawn_slowly_with(&scratch, "client-echo-vt", setline, TYPING);
+    rpc.command(
+        "lua local ns, set = vim.api.nvim_create_namespace('t'), vim.api.nvim_buf_set_extmark \
+         set(0, ns, 0, 0, { virt_text = { { 'E1', 'Error' } } }) \
+         set(0, ns, 1, 0, { virt_text = { { 'RA', 'Error' } }, virt_text_pos = 'right_align' }) \
+         set(0, ns, 2, 0, { virt_text = { { 'W', 'Error' } }, virt_text_win_col = 20 }) \
+         set(0, ns, 3, 6, { virt_text = { { '<L>', 'Error' } }, virt_text_pos = 'inline', \
+           right_gravity = false })",
+    )
+    .expect("virtual text");
+    term.pump_until(4 * SLOW, |_| false);
+    predicted(&mut term, "A before virtual text at the end", b"A");
+    predicted(&mut term, "x", b"x");
+    predicted(&mut term, "y", b"y");
+    for line in ["right-aligned", "in a column", "inline"] {
+        typed(&mut term, b"\x1b");
+        typed(&mut term, b"j");
+        waited(&mut term, &format!("A, {line}"), b"A");
+        waited(&mut term, &format!("x, {line}"), b"x");
+    }
+}
+
+/// Options under which Neovim types otherwise than as typed, or lays a
+/// line out otherwise than the client does, over a slow link to a real
+/// Neovim: `'digraph'`, where a character, `<BS>` and another make one;
+/// `'vartabstop'`, whose tabs are not `'tabstop'` wide; and a prompt
+/// buffer, where text goes in after the prompt wherever Insert mode is
+/// entered. What is typed waits for Neovim under each, and is drawn at
+/// once again without it.
+#[test]
+fn keys_typed_where_neovim_types_otherwise_wait_for_it() {
+    require_nvim!();
+    let scratch = Scratch::new("client-otherwise");
+    let setline = r#"call setline(1, ["ab\tc", "line 1"])"#;
+    let (mut rpc, mut term, _) = drawn_slowly_with(&scratch, "client-otherwise", setline, TYPING);
+    let mut set = |term: &mut Terminal, option: &str| {
+        rpc.command(option).expect("set");
+        term.pump_until(4 * SLOW, |_| false);
+    };
+    typed(&mut term, b"A");
+    predicted(&mut term, "x", b"x");
+    set(&mut term, "set digraph");
+    waited(&mut term, "y with 'digraph'", b"y");
+    set(&mut term, "set nodigraph");
+    predicted(&mut term, "y without", b"y");
+    // Its first stop where `'tabstop'`'s is, so that the line is drawn as
+    // the client would lay it out, till the tab goes past it.
+    typed(&mut term, b"\x1b");
+    typed(&mut term, b"0l");
+    set(&mut term, "setlocal vartabstop=8,4");
+    waited(&mut term, "a with 'vartabstop'", b"a");
+    waited(&mut term, "z before a tab of 'vartabstop'", b"z");
+    typed(&mut term, b"\x1b");
+    set(&mut term, "setlocal vartabstop=");
+    predicted(&mut term, "a without", b"a");
+    predicted(&mut term, "z before a tab without", b"z");
+    typed(&mut term, b"\x1b");
+    set(
+        &mut term,
+        "setlocal buftype=prompt | call prompt_setprompt(bufnr(), '> ')",
+    );
+    waited(&mut term, "i in a prompt buffer", b"i");
+    waited(&mut term, "w in a prompt buffer", b"w");
+}
+
+/// Wait no longer than one way of the slow link for the client to have
+/// written, since `from` in what it wrote, one of `shapes`: the
+/// `DECSCUSR` for a cursor shape, steady or blinking.
+fn shaped_within(term: &mut Terminal, from: usize, shapes: [&[u8]; 2]) -> bool {
+    term.pump(SLOW, |t| {
+        shapes
+            .iter()
+            .any(|shape| find(&t.output[from..], shape).is_some())
+    })
+}
+
+/// `i` over a slow link to a real Neovim turns the terminal's cursor into
+/// Insert mode's bar before Neovim could have heard of it, and `<Esc>`
+/// turns it back into Normal mode's block; `a`, `A`, `I` and `<Esc>` put it
+/// where Neovim's own frame does, and so does what is typed between.
+#[test]
+fn the_cursor_takes_its_insert_shape_at_once() {
+    require_nvim!();
+    let scratch = Scratch::new("client-shape");
+    let setline = r#"call setline(1, ["  hello world", "line 1"])"#;
+    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, "client-shape", setline, TYPING);
+    let bar: [&[u8]; 2] = [b"\x1b[5 q", b"\x1b[6 q"];
+    let block: [&[u8]; 2] = [b"\x1b[1 q", b"\x1b[2 q"];
+    let from = term.output.len();
+    term.type_bytes(b"i");
+    assert!(shaped_within(&mut term, from, bar), "a bar at once");
+    term.pump_until(4 * SLOW, |_| false);
+    let from = term.output.len();
+    term.type_bytes(b"\x1b");
+    assert!(shaped_within(&mut term, from, block), "a block at once");
+    term.pump_until(4 * SLOW, |_| false);
+    for (name, keys) in [
+        ("$a", &b"$a"[..]),
+        ("x", b"x"),
+        ("<Esc> after x", b"\x1b"),
+        ("A", b"A"),
+        ("<Esc> after A", b"\x1b"),
+        ("I", b"I"),
+        ("y", b"y"),
+        ("<Esc> after y", b"\x1b"),
+        ("j0a", b"j0a"),
+        ("<Esc> after j0a", b"\x1b"),
+    ] {
+        predicted(&mut term, name, keys);
+    }
+}
+
 /// Type `keys`, which the client leaves to Neovim: nothing of the window
 /// changes before Neovim could have heard of them, and what Neovim draws of
 /// them comes.
@@ -2584,9 +2707,11 @@ fn a_character_typed_otherwise_after_the_proof_is_put_right_at_once() {
 
 /// Random text typed in Insert mode — letters, blanks, `,`, `.`, `(` and
 /// `<BS>` — in bursts over a slow link to a client that types it ahead of
-/// Neovim, with `'list'` drawing the blanks: every sight of the window it
-/// shows is one Neovim drew for the keys typed so far, in order, and it
-/// ends where Neovim does (see [`sights_are_neovims`]).
+/// Neovim, with `'list'` drawing the blanks, and now and then out of
+/// Insert mode with `<Esc>`, a motion, and back in with `i`, `a`, `A` or
+/// `I`: every sight of the window it shows is one Neovim drew for the keys
+/// typed so far, in order, and it ends where Neovim does (see
+/// [`sights_are_neovims`]).
 #[test]
 fn random_typing_shows_nothing_neovim_never_drew() {
     require_nvim!();
@@ -2600,12 +2725,27 @@ fn random_typing_shows_nothing_neovim_never_drew() {
     ];
     let setline =
         r#"set list listchars=tab:>-,trail:-,eol:$ | call setline(1, ["\tend", "line 1"])"#;
+    const OUT: &[(&[u8], &str)] = &[
+        (b"j", "j"),
+        (b"k", "k"),
+        (b"h", "h"),
+        (b"l", "l"),
+        (b"0", "0"),
+        (b"$", "$"),
+    ];
+    const IN: &[(&[u8], &str)] = &[(b"i", "i"), (b"a", "a"), (b"A", "A"), (b"I", "I")];
     let mut rng = Lcg(5);
     let mut keys: Vec<(Vec<u8>, String)> =
         vec![(b"0".to_vec(), "0".into()), (b"i".to_vec(), "i".into())];
     while keys.len() < 200 {
-        let (bytes, name) = match rng.below(3) {
-            0 => KEYS[rng.below(KEYS.len() as u64) as usize],
+        let (bytes, name) = match rng.below(12) {
+            0..=3 => KEYS[rng.below(KEYS.len() as u64) as usize],
+            4 => {
+                keys.push((b"\x1b".to_vec(), "<Esc>".into()));
+                let (bytes, name) = OUT[rng.below(OUT.len() as u64) as usize];
+                keys.push((bytes.to_vec(), name.into()));
+                IN[rng.below(IN.len() as u64) as usize]
+            }
             _ => {
                 let c = (b'a' + rng.below(26) as u8) as char;
                 keys.push((c.to_string().into_bytes(), c.to_string()));

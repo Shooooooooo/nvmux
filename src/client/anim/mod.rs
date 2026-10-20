@@ -45,6 +45,7 @@ use self::vfx::Vfx;
 use super::compose::{Frame, Patch, Scrolling, View};
 use super::grid::{Cell, Grid};
 use super::model::{Changes, Held, Margins, Model, Place};
+use super::predict::{Proof, Rest};
 use super::redraw::{Event, ModeInfo, Shape};
 use super::screen::Cursor;
 use super::style::{self, Color};
@@ -237,8 +238,8 @@ pub struct Animator {
     last: Option<Instant>,
     /// The cell the cursor was last in, which particles fly from.
     cell: Option<(i64, i64)>,
-    /// The mode it was last in: a change of mode starts the blink's wait
-    /// again.
+    /// The mode it was last drawn in (see [`Animator::mode_drawn`]): a
+    /// change of mode starts the blink's wait again.
     mode: usize,
     /// Whether the client scrolls ahead of Neovim over the link as it is:
     /// see [`Animator::set_predicting`].
@@ -546,13 +547,15 @@ impl Animator {
         // Neovim's at once, not travelling there. A line typed into ahead
         // is one Neovim draws otherwise as it hears of the keys, though: as
         // a step typed it, it is as they were worked out; and drawn with
-        // Neovim's word on one of their keys, it is for that word to judge
-        // (see `crate::client::App::judge_steps`).
+        // Neovim's word on one of their keys — or on one that goes into
+        // Insert mode or out of it, where an autocommand may edit it — it
+        // is for that word to judge (see `crate::client::App::judge_steps`).
         let gone: Vec<u64> = self
             .chains
             .iter()
             .filter(|(grid, chain)| {
-                let judged = judging.is_some_and(|k| chain.step_for(k).is_some());
+                let judged = judging.and_then(|k| chain.step_for(k));
+                let mode = judged.is_some_and(|s| matches!(s.proof, Proof::Enter | Proof::Leave));
                 changes.reshaped.contains(grid)
                     || before.switching.contains(grid)
                     || model.layout.get(grid).is_none_or(|p| p.hidden)
@@ -562,7 +565,7 @@ impl Animator {
                         let now = line_drawn(model, **grid, *line, chain.textoff);
                         now != *drawn
                             && !chain.typed(*line, &now)
-                            && !(judged && chain.types_into(*line))
+                            && !(mode || (judged.is_some() && chain.types_into(*line)))
                     })
             })
             .map(|(grid, _)| *grid)
@@ -639,7 +642,7 @@ impl Animator {
     /// put it there.
     fn cursor_moved(&mut self, model: &Model, allowed: bool, now: Instant) {
         let (row, col) = self.cursor_at(model);
-        let Some(target) = cursor_rect(model, (row, col)) else {
+        let Some(target) = cursor_rect(self.mode_info(model), (row, col)) else {
             return;
         };
         if self.smear.target() != Some(target) {
@@ -656,8 +659,9 @@ impl Animator {
             self.cell = Some((row, col));
             self.blink.reset(now);
         }
-        if model.mode != self.mode {
-            self.mode = model.mode;
+        let mode = self.mode_drawn(model);
+        if mode != self.mode {
+            self.mode = mode;
             self.blink.reset(now);
         }
     }
@@ -1070,9 +1074,40 @@ impl Animator {
 
     /// The mode whose cursor this blinks, if the cursor is one.
     fn blinking_mode<'a>(&self, model: &'a Model) -> Option<&'a ModeInfo> {
-        model
-            .mode_info()
+        self.mode_info(model)
             .filter(|m| self.effects.blink && m.blinks() && m.shape == Some(Shape::Block))
+    }
+
+    /// The mode whose cursor is drawn, by its place among the editor's
+    /// modes (see [`Model::modes`]): the one the step drawn in the window
+    /// that has the cursor leaves Neovim in, where that is not the mode
+    /// Neovim last drew — Insert mode's bar on `i`, before Neovim has heard
+    /// of it, and Normal mode's block on `<Esc>` (see [`chain`]) — and the
+    /// one Neovim drew otherwise.
+    fn mode_drawn(&self, model: &Model) -> usize {
+        let grid = model.cursor.grid;
+        let step = self
+            .chains
+            .get(&grid)
+            .filter(|c| model.wins.get(&grid) == Some(&c.win))
+            .and_then(|_| self.shown_step(model, grid));
+        let name = match step.map(|s| s.pos.rest) {
+            Some(rest) if rest == Rest::drawn(&model.mode_name) => return model.mode,
+            Some(Rest::Insert) => "insert",
+            Some(Rest::Normal) => "normal",
+            _ => return model.mode,
+        };
+        model
+            .modes
+            .iter()
+            .position(|m| m.name == name)
+            .unwrap_or(model.mode)
+    }
+
+    /// What `'guicursor'` says of the cursor of the mode drawn: see
+    /// [`Animator::mode_drawn`].
+    fn mode_info<'a>(&self, model: &'a Model) -> Option<&'a ModeInfo> {
+        model.modes.get(self.mode_drawn(model))
     }
 
     /// When a blink fading in or out wants its next frame: none while it is
@@ -1142,11 +1177,12 @@ impl Animator {
     /// how the terminal's own cursor is to be left.
     pub fn paint(&self, frame: &mut Frame, model: &Model, now: Instant) -> Cursor {
         let colors = model.colors();
-        let (color, text) = cursor_colors(model);
+        let mode = self.mode_info(model);
+        let (color, text) = cursor_colors(model, mode);
         if let (Some(s), true) = (self.effects.vfx, self.vfx.moving()) {
             self.vfx.paint(frame, &colors, color, &s);
         }
-        let mut cursor = hardware_cursor(model, frame, self.cursor_at(model));
+        let mut cursor = hardware_cursor(model, mode, frame, self.cursor_at(model));
         if !cursor.visible {
             return cursor;
         }
@@ -1335,22 +1371,22 @@ fn linegrid_scroll(model: &Model, batch: &[Event]) -> Option<Snap> {
     Some(Snap::take(1, model.grids.get(&1)?, rect, delta))
 }
 
-/// The cursor's rectangle on the screen at `(row, col)`, in its mode's
-/// shape.
-fn cursor_rect(model: &Model, (row, col): (i64, i64)) -> Option<Rect> {
-    let mode = model.mode_info();
+/// The cursor's rectangle on the screen at `(row, col)`, in the shape of
+/// `mode`, the mode drawn.
+fn cursor_rect(mode: Option<&ModeInfo>, (row, col): (i64, i64)) -> Option<Rect> {
     let shape = mode.and_then(|m| m.shape).unwrap_or(Shape::Block);
     let percent = mode.map_or(100, |m| m.percentage);
     Some(smear::shape_rect(row, col, shape, percent))
 }
 
-/// The cursor's colour, and the colour of a character it covers — from its
-/// mode's highlight, as Neovide takes them: the highlight's background (its
-/// foreground, reversed), or the editor's text colour where it has none.
-fn cursor_colors(model: &Model) -> (Rgb, Option<Rgb>) {
+/// The cursor's colour, and the colour of a character it covers — from the
+/// highlight of `mode`, the mode drawn, as Neovide takes them: the
+/// highlight's background (its foreground, reversed), or the editor's text
+/// colour where it has none.
+fn cursor_colors(model: &Model, mode: Option<&ModeInfo>) -> (Rgb, Option<Rgb>) {
     let colors = model.colors();
     let plain = colors.visual_fg(&model.style(0));
-    let Some(id) = model.mode_info().map(|m| m.attr_id).filter(|id| *id != 0) else {
+    let Some(id) = mode.map(|m| m.attr_id).filter(|id| *id != 0) else {
         return (plain, None);
     };
     let s = model.style(id);
@@ -1380,13 +1416,17 @@ fn cursor_colors(model: &Model) -> (Rgb, Option<Rgb>) {
 }
 
 /// How the terminal's own cursor is to be left: at `(row, col)`, where Neovim
-/// put it or a prediction moves it, in its mode's shape and colour — or
-/// hidden, while Neovim is busy, for a mode whose highlight blends it away,
-/// or with nowhere on the screen to be.
-fn hardware_cursor(model: &Model, frame: &Frame, (row, col): (i64, i64)) -> Cursor {
+/// put it or a prediction moves it, in the shape and colour of `mode`, the
+/// mode drawn — or hidden, while Neovim is busy, for a mode whose highlight
+/// blends it away, or with nowhere on the screen to be.
+fn hardware_cursor(
+    model: &Model,
+    mode: Option<&ModeInfo>,
+    frame: &Frame,
+    (row, col): (i64, i64),
+) -> Cursor {
     let on_screen =
         row >= 0 && col >= 0 && (row as usize) < frame.height && (col as usize) < frame.width;
-    let mode = model.mode_info();
     let attrs = mode
         .map(|m| m.attr_id)
         .filter(|id| *id != 0)
@@ -1929,10 +1969,13 @@ mod tests {
             m.apply(e, &mut changes);
         }
         m.refresh_styles();
-        assert_eq!(cursor_colors(&m), (Rgb(0, 255, 0), Some(Rgb(0, 0, 0x11))));
+        assert_eq!(
+            cursor_colors(&m, m.mode_info()),
+            (Rgb(0, 255, 0), Some(Rgb(0, 0, 0x11)))
+        );
         let frame = Frame::new(4, 4, Default::default());
         assert_eq!(
-            hardware_cursor(&m, &frame, m.cursor_on_screen()).color,
+            hardware_cursor(&m, m.mode_info(), &frame, m.cursor_on_screen()).color,
             Some(Rgb(0, 255, 0))
         );
         m.apply(
@@ -1945,9 +1988,9 @@ mod tests {
             },
             &mut changes,
         );
-        assert_eq!(cursor_colors(&m), (Rgb(255, 255, 255), None));
+        assert_eq!(cursor_colors(&m, m.mode_info()), (Rgb(255, 255, 255), None));
         assert_eq!(
-            hardware_cursor(&m, &frame, m.cursor_on_screen()).color,
+            hardware_cursor(&m, m.mode_info(), &frame, m.cursor_on_screen()).color,
             None
         );
     }

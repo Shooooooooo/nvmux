@@ -84,9 +84,11 @@ pub struct Facts {
     /// `'delcombine'`: `<BS>` takes out a character's last combining mark
     /// alone.
     pub delcombine: bool,
-    /// `'conceallevel'` hiding text in Insert mode, `'concealcursor'` having
-    /// `i`: the line is drawn otherwise than its text, typed or not.
-    pub conceals: bool,
+    /// The modes `'concealcursor'` hides text on the cursor's line in, by
+    /// their letters, where `'conceallevel'` hides any: `i`, the line typed
+    /// into drawn otherwise than its text; `n` and not `i`, or `i` and not
+    /// `n`, the line drawn otherwise as Insert mode is entered or left.
+    pub conceals: Box<str>,
     /// What `'iskeyword'` makes of each character under 256, by its code:
     /// see [`Facts::keyword`].
     pub classes: Vec<u8>,
@@ -96,9 +98,9 @@ impl Facts {
     /// As the agent sends them: `[buf, from_insert, firsts, abbrevs, unseen,
     /// tw, fo, indentkeys, smartindent, lisp, showmatch, matchpairs,
     /// autocomplete, editable, plain, bs, softtabs, smarttab, delcombine,
-    /// conceals, classes]` — `matchpairs` as the option has it,
-    /// and `classes` a character a code, `0` for a blank, `1` for one of
-    /// punctuation and `2` for one of a word. Says the buffer, and them.
+    /// conceals, classes]` — `matchpairs` and `conceals` as the options have
+    /// them, and `classes` a character a code, `0` for a blank, `1` for one
+    /// of punctuation and `2` for one of a word. Says the buffer, and them.
     pub fn read(v: &[ValueRef<'_>]) -> Option<(i64, Self)> {
         let int = |i: usize| v.get(i).and_then(redraw::int);
         let flag = |i: usize| matches!(v.get(i), Some(ValueRef::Boolean(true)));
@@ -129,7 +131,7 @@ impl Facts {
             softtabs: flag(16),
             smarttab: flag(17),
             delcombine: flag(18),
-            conceals: flag(19),
+            conceals: text(19)?.into(),
             classes: text(20)?.bytes().map(|b| b.saturating_sub(b'0')).collect(),
         };
         Some((int(0)?, facts))
@@ -331,6 +333,89 @@ impl Edit {
     }
 }
 
+/// How a key typed in Normal mode enters Insert mode, where it does nothing
+/// more: `i` before the cursor's character, `a` after it, `A` at the line's
+/// end, `I` before its first character other than a blank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Enter {
+    Before,
+    After,
+    End,
+    First,
+}
+
+impl Enter {
+    /// The way of entering Insert mode a key Neovim's notation writes as
+    /// `key` takes, if it is one of those.
+    pub fn of(key: &str) -> Option<Self> {
+        Some(match key {
+            "i" => Enter::Before,
+            "a" => Enter::After,
+            "A" => Enter::End,
+            "I" => Enter::First,
+            _ => return None,
+        })
+    }
+}
+
+/// Where Insert mode entered as `e` puts the cursor, from byte `byte` of a
+/// line of `text` in Normal mode, in a window of `shape`: its byte, and the
+/// display column it is drawn in and wants (see [`sits`]) — as Neovim 0.12.6
+/// was found to put it. `a` goes past the cursor's character and its
+/// combining marks, a tab or a character two cells wide whole, and nowhere
+/// on an empty line; `I` to the line's end on a line all blanks.
+pub fn entered(e: Enter, text: &str, shape: &Shape, byte: usize) -> (usize, usize) {
+    let cs = predict::chars(text, shape);
+    let at = match e {
+        Enter::Before => byte,
+        Enter::After => cs
+            .iter()
+            .find(|ch| ch.byte > byte)
+            .map_or(text.len(), |ch| ch.byte),
+        Enter::End => text.len(),
+        Enter::First => cs
+            .iter()
+            .find(|ch| !matches!(ch.c, ' ' | '\t'))
+            .map_or(text.len(), |ch| ch.byte),
+    };
+    (at, sits(text, shape, at))
+}
+
+/// Where `<Esc>` puts the cursor, leaving Insert mode at byte `byte` of a
+/// line of `text`, in a window of `shape`: back on the character before it
+/// — where the cursor is not at the line's start — its byte, and the
+/// display column it is drawn in there in Normal mode, and wants: a tab's
+/// last, as Neovim 0.12.6 was found to put it.
+pub fn left(text: &str, shape: &Shape, byte: usize) -> (usize, usize) {
+    let cs = predict::chars(text, shape);
+    let at = cs
+        .iter()
+        .rfind(|ch| ch.byte < byte)
+        .or(cs.first())
+        .map_or(0, |ch| ch.byte);
+    (at, super::moves::drawn(text, shape, at))
+}
+
+/// Why `<Esc>`, leaving Insert mode at byte `byte` of a line of `text`,
+/// might do more than put the cursor back a character, as the buffer's
+/// `facts` say: `None` where it will not. An abbreviation before the cursor
+/// is expanded; the blanks of an indent nothing was typed after, which
+/// `'autoindent'` and an untouched comment leader leave, are taken out —
+/// which the client cannot tell from blanks typed, and so takes for those.
+pub fn unleft(text: &str, byte: usize, facts: &Facts) -> Option<&'static str> {
+    let Some(before) = text.get(..byte) else {
+        return Some("the cursor inside a character");
+    };
+    let blank = |c: char| matches!(c, ' ' | '\t');
+    if (!text.is_empty() && text.chars().all(blank)) || before.ends_with(blank) {
+        return Some("blanks before the cursor it may take out");
+    }
+    if facts.abbrevs.iter().any(|a| before.ends_with(&**a)) {
+        return Some("it ends an abbreviation");
+    }
+    None
+}
+
 /// A key as a mapping's first is compared with it: a character as itself,
 /// whatever Neovim's notation writes it as; a name in `<…>` in any case.
 fn same_key(a: &str, b: &str) -> bool {
@@ -358,7 +443,7 @@ pub fn refused(
     if !f.from_insert {
         return Some("the buffer not yet entered in Insert mode");
     }
-    if !(f.editable && f.plain) || f.lisp || f.autocomplete || f.conceals {
+    if !(f.editable && f.plain) || f.lisp || f.autocomplete || f.conceals.contains('i') {
         return Some("text typed otherwise in the buffer");
     }
     if f.starts(key) {
@@ -833,7 +918,7 @@ mod tests {
             softtabs: false,
             smarttab: true,
             delcombine: false,
-            conceals: false,
+            conceals: "".into(),
             classes: (0u8..=255)
                 .map(|b| match b {
                     0 | b'\t' | b' ' | 0xa0 => 0,
@@ -1385,7 +1470,7 @@ mod tests {
                 ..facts()
             },
             Facts {
-                conceals: true,
+                conceals: "ni".into(),
                 ..facts()
             },
         ] {
@@ -1520,7 +1605,7 @@ mod tests {
             true.into(),
             false.into(),
             true.into(),
-            false.into(),
+            "".into(),
             classes.into(),
         ];
         let refs: Vec<ValueRef<'_>> = v.iter().map(Value::as_ref).collect();
@@ -1530,11 +1615,94 @@ mod tests {
         assert_eq!((f.tw, &*f.fo, &*f.bs), (72, "jtln", "2"));
         assert_eq!(f.matchpairs, [('(', ')'), ('<', '>')]);
         assert!(f.unseen && f.showmatch && f.softtabs && f.delcombine);
-        assert!(!f.smarttab && !f.conceals && f.editable && f.plain);
+        assert!(!f.smarttab && f.conceals.is_empty() && f.editable && f.plain);
         assert_eq!(f.classes, facts().classes);
         assert_eq!(
             (f.keyword('a'), f.keyword('.'), f.keyword('日')),
             (Some(true), Some(false), None)
         );
+    }
+
+    /// A window, a line's text, the byte the cursor is on in Normal mode, a
+    /// key that enters Insert mode, and where it puts the cursor and `<Esc>`
+    /// after it does, each a byte and a display column.
+    type Case<'a> = (
+        &'a Shape,
+        &'a str,
+        usize,
+        &'a str,
+        (usize, usize),
+        (usize, usize),
+    );
+
+    /// Where `i`, `a`, `A` and `I` put the cursor, and `<Esc>` after them,
+    /// as Neovim 0.12.6 was found to: by byte and display column, over a
+    /// tab, characters two cells wide, one with a combining mark, an empty
+    /// line and one all blanks — and with `'list'` drawing a tab, which has
+    /// the cursor on its first cell in Normal mode as well.
+    #[test]
+    fn insert_mode_is_entered_and_left_where_neovim_puts_the_cursor() {
+        let plain = shape(true);
+        let listed = listing(">-", None, None, None);
+        #[rustfmt::skip]
+        let cases: &[Case] = &[
+            (&plain, "\tfoo bar", 0, "i", (0, 0), (0, 7)),
+            (&plain, "\tfoo bar", 0, "a", (1, 8), (0, 7)),
+            (&plain, "\tfoo bar", 7, "a", (8, 15), (7, 14)),
+            (&plain, "\tfoo bar", 0, "A", (8, 15), (7, 14)),
+            (&plain, "\tfoo bar", 7, "I", (1, 8), (0, 7)),
+            (&plain, "日本語", 6, "i", (6, 4), (3, 2)),
+            (&plain, "日本語", 0, "a", (3, 2), (0, 0)),
+            (&plain, "日本語", 0, "A", (9, 6), (6, 4)),
+            (&plain, "", 0, "i", (0, 0), (0, 0)),
+            (&plain, "", 0, "a", (0, 0), (0, 0)),
+            (&plain, "", 0, "A", (0, 0), (0, 0)),
+            (&plain, "", 0, "I", (0, 0), (0, 0)),
+            (&plain, "    ", 0, "I", (4, 4), (3, 3)),
+            (&plain, "    ", 0, "A", (4, 4), (3, 3)),
+            (&plain, "    ", 1, "i", (1, 1), (0, 0)),
+            (&plain, "e\u{301}x", 0, "a", (3, 1), (0, 0)),
+            (&plain, "  ab", 3, "I", (2, 2), (1, 1)),
+            (&listed, "\tfoo bar", 0, "i", (0, 0), (0, 0)),
+            (&listed, "\tfoo bar", 0, "a", (1, 8), (0, 0)),
+        ];
+        for &(shape, text, byte, key, enter, leave) in cases {
+            let e = Enter::of(key).expect("a key that enters Insert mode");
+            let (at, vcol) = entered(e, text, shape, byte);
+            assert_eq!((at, vcol), enter, "{key} at {byte} of {text:?}");
+            assert_eq!(
+                left(text, shape, at),
+                leave,
+                "<Esc> after {key} at {byte} of {text:?}"
+            );
+        }
+    }
+
+    /// `<Esc>` after an abbreviation, which it expands, or after blanks —
+    /// an indent nothing was typed after, which it takes out, or a comment
+    /// leader's — is left to Neovim; anywhere else, it is not.
+    #[test]
+    fn esc_that_may_do_more_is_left_to_neovim() {
+        let f = Facts {
+            abbrevs: vec!["teh".into()],
+            ..facts()
+        };
+        for (text, byte, refused) in [
+            ("hello", 5, false),
+            ("hello", 2, false),
+            ("", 0, false),
+            ("    ", 4, true),
+            ("    ", 0, true),
+            ("-- ", 3, true),
+            ("hello ", 6, true),
+            ("teh", 3, true),
+            ("tehx", 4, false),
+        ] {
+            assert_eq!(
+                unleft(text, byte, &f).is_some(),
+                refused,
+                "{text:?} at {byte}"
+            );
+        }
     }
 }

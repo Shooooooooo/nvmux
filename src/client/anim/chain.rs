@@ -23,9 +23,12 @@
 //! So is a key typed in Insert mode (see `crate::client::typing`): a step
 //! that puts a character in the cursor's line, or takes one out, keeps the
 //! line's text as it leaves it, and its row as Neovim will draw it, which
-//! is drawn over Neovim's for as long as the step is the one drawn. Neovim
+//! is drawn over Neovim's for as long as the step is the one drawn — and so
+//! do the steps after it, which go on from the line as it typed it. Neovim
 //! has the last word on that as on the rest: on the line's text as its word
-//! on the key has it, and where it left the cursor.
+//! on the key has it, and where it left the cursor. A step that goes into
+//! Insert mode, or out of it, has the cursor drawn in the shape of the mode
+//! it leaves Neovim in (see `super::Animator`).
 //!
 //! A motion changes nothing of what the window shows but the cursor, and
 //! what the cursor's line decides — the numbers of `'relativenumber'`, the

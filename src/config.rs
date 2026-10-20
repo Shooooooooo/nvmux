@@ -265,11 +265,12 @@ pub struct ClientSettings {
     /// are left to Neovim. The client follows the rest by what Neovim says
     /// of each key rather than waiting for it to catch up with them all.
     /// `"typing"` draws what is typed in Insert mode as well — a character
-    /// put in, or taken out with `<BS>` — once Neovim is in Insert mode,
-    /// but not a key a mapping or an abbreviation may make more of, one past
-    /// `'textwidth'`, or one that indents the line again; nor, in a buffer
-    /// whose plugins act on what is typed there, till enough of it has been
-    /// found to go in as typed.
+    /// put in, or taken out with `<BS>` — and `i`, `a`, `A`, `I` and the
+    /// `<Esc>` after them, the cursor taking the shape of the mode it goes
+    /// into; but not a key a mapping or an abbreviation may make more of,
+    /// one past `'textwidth'`, or one that indents the line again; nor, in a
+    /// buffer whose plugins act on what is typed there, till enough of it
+    /// has been found to go in as typed.
     ///
     /// What it costs: the agent says where each key left the cursor, about
     /// 40 bytes a key back over the link, and each fence the client asks

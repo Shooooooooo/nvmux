@@ -146,6 +146,9 @@
 //! buffer's Insert mode has the key do more ([`typing`]); and each is judged
 //! by the line's text as Neovim's word on its key has it, which the agent
 //! sends the edits for ahead of the word, and by where it left the cursor.
+//! So do the keys that go in and out of Insert mode: `i`, `a`, `A` and `I`,
+//! and `<Esc>` after them, the cursor drawn in the shape of the mode they
+//! go into before Neovim has heard of them.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -1406,6 +1409,11 @@ pub enum Command {
     /// No scroll, but a key typed in Insert mode that edits the cursor's
     /// line: see [`typing`].
     Type(typing::Edit),
+    /// No scroll, but `i`, `a`, `A` or `I` entering Insert mode: see
+    /// [`typing::entered`].
+    Enter(typing::Enter),
+    /// No scroll, but `<Esc>` leaving Insert mode: see [`typing::left`].
+    Leave,
 }
 
 /// A scroll sideways, as Neovim makes it in a window that does not wrap.
@@ -1521,7 +1529,11 @@ pub fn outcome(command: Command, at: At, rows: i64, line_count: i64, shape: &Sha
                 },
             }
         }
-        Command::Side(_) | Command::Move { .. } | Command::Type(_) => return None,
+        Command::Side(_)
+        | Command::Move { .. }
+        | Command::Type(_)
+        | Command::Enter(_)
+        | Command::Leave => return None,
         Command::Line { to, line, .. } => {
             // A 'scrolloff' as tall as half the window keeps the cursor in
             // the middle by rules of its own.
@@ -2056,11 +2068,13 @@ const WHEEL: &[&str] = &[
 /// Every key, and `z` command, a mapping of which changes what the client
 /// makes of it: what the agent is asked to look up (see [`Shape::mapped`]).
 /// And, where the agent says what Neovim made of each key (`acks`), the
-/// motions the client follows that take more than a key: `g_`.
+/// motions the client follows that take more than a key, `g_`, and the
+/// keys that enter Insert mode it follows, which the agent looks up in
+/// Normal mode alone.
 pub fn keys(acks: bool) -> Vec<String> {
     let digits = (0..10).map(|d| d.to_string());
     let z = Z.iter().chain(Z_SIDE).map(|k| format!("z{k}"));
-    let g = acks.then(|| "g_".to_string());
+    let acked = ["g_", "i", "a", "A", "I"].into_iter().filter(|_| acks);
     WHOLE
         .iter()
         .chain(SCROLLS)
@@ -2068,7 +2082,7 @@ pub fn keys(acks: bool) -> Vec<String> {
         .map(|k| k.to_string())
         .chain(z)
         .chain(digits)
-        .chain(g)
+        .chain(acked.map(String::from))
         .collect()
 }
 
@@ -2158,7 +2172,8 @@ pub const MAX_COUNT: i64 = 9999;
 /// client goes by it instead: what it makes of the keys is worked out from
 /// Neovim's last word on them, and the keys sent since ([`Typed::rebase`]) —
 /// and, told to type ahead of Neovim, those typed in Insert mode as well,
-/// each a character to put in or `<BS>` (see [`typing`]).
+/// each a character to put in or `<BS>`, and those that go in and out of it
+/// (see [`typing`]).
 /// A key it predicts leaves it as sure as it was — that is the point of
 /// predicting it — and a key it cannot follow, or does not make what it
 /// makes of it, leaves it *blind* from that key on: nothing is predicted
@@ -2193,6 +2208,15 @@ pub struct Typed {
     blind: bool,
     /// Whether the input being made out is one the client cannot follow.
     lost: bool,
+    /// Whether Insert mode was last entered by `i`, `a`, `A` or `I` with no
+    /// count but one, from Normal mode, as far as the client can tell:
+    /// `<Esc>` leaves it with nothing typed again. An ack in Insert mode
+    /// says nothing of how it was entered, and the visual block's `I` and
+    /// `A` are the same keys: what the client had made of the keys up to
+    /// the last it covers says (see [`Sent::once`]), and an Insert mode
+    /// entered by a key whose step was not made — from Visual mode, say,
+    /// where the step is not — is not entered so (see [`Typed::unentered`]).
+    once: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2265,6 +2289,14 @@ impl Typed {
                     self.state = State::G(count);
                     return None;
                 }
+                let enter = typing::Enter::of(key)
+                    .filter(|_| self.keys >= PredictKeys::Typing && count.is_none_or(|n| n == 1));
+                if let Some(e) = enter.filter(|_| !mapped(key)) {
+                    self.state = State::Insert { x: false };
+                    self.whole = true;
+                    self.once = true;
+                    return Some(Command::Enter(e));
+                }
                 let command = scroll(key, count).or_else(|| {
                     let motion = moves::motion(key).filter(|_| motions)?;
                     Some(Command::Move {
@@ -2281,6 +2313,7 @@ impl Typed {
                     }
                     None => {
                         self.moved(key, &mapped);
+                        self.once = false;
                         None
                     }
                 }
@@ -2299,6 +2332,7 @@ impl Typed {
                 }
                 self.lost = true;
                 self.whole = false;
+                self.once = false;
                 self.state = State::Lost;
                 None
             }
@@ -2336,6 +2370,7 @@ impl Typed {
                     None => {
                         self.lost = true;
                         self.whole = false;
+                        self.once = false;
                         self.state = State::Lost;
                         None
                     }
@@ -2343,6 +2378,7 @@ impl Typed {
             }
             State::Lost | State::Insert { .. } => {
                 self.moved(key, &mapped);
+                self.once = false;
                 None
             }
         }
@@ -2376,12 +2412,21 @@ impl Typed {
         // Text typed, or taken out, where the client types ahead of Neovim:
         // whether a mapping, or anything else, makes it do more is for the
         // client to say as it makes it (see `typing::refused`).
-        let typed = typing::Edit::of(key).filter(|_| !x && self.keys >= PredictKeys::Typing);
-        if let Some(e) = typed {
+        let typing = !x && self.keys >= PredictKeys::Typing;
+        if let Some(e) = typing::Edit::of(key).filter(|_| typing) {
             self.state = State::Insert { x: false };
             self.whole = true;
             self.waits = false;
             return Some(Command::Type(e));
+        }
+        // `<Esc>`, leaving Insert mode entered with no count but one: with
+        // one, what was typed is typed again as many times over.
+        if typing && plain && self.once && matches!(key, "<Esc>" | "<C-[>") {
+            self.state = State::Ready(None);
+            self.whole = true;
+            self.waits = false;
+            self.once = false;
+            return Some(Command::Leave);
         }
         // Text, or a key that moves the cursor, which the client does not
         // predict; or one that waits for another, which it cannot follow.
@@ -2393,6 +2438,11 @@ impl Typed {
             _ if self.whole => State::Insert { x: false },
             _ => State::Lost,
         };
+        // Out of Insert mode, or in a command of Normal mode from it, which
+        // may enter it again otherwise.
+        if !matches!(self.state, State::Insert { .. }) {
+            self.once = false;
+        }
         None
     }
 
@@ -2451,6 +2501,7 @@ impl Typed {
     pub fn clicked(&mut self) {
         self.whole = true;
         self.waits = false;
+        self.once = false;
         self.state = State::Lost;
         self.blinded();
     }
@@ -2466,7 +2517,9 @@ impl Typed {
 
     /// Neovim is where an ack says, resting as `rest` says: what the inputs
     /// after the last it covers make is to be made out again from there,
-    /// each with [`Typed::step`], blind or not as it now finds them.
+    /// each with [`Typed::step`], blind or not as it now finds them. In an
+    /// Insert mode not known to have been entered with no count (see
+    /// [`Typed::once`]), till told otherwise.
     pub fn rebase(&mut self, rest: Rest) {
         self.state = match rest {
             Rest::Normal | Rest::Visual => State::Ready(None),
@@ -2476,6 +2529,14 @@ impl Typed {
         self.whole = true;
         self.waits = false;
         self.blind = false;
+        self.once = false;
+    }
+
+    /// The key that entered Insert mode last, as far as the client can
+    /// tell, did not have its step made: what `<Esc>` does there is left to
+    /// Neovim (see [`Typed::once`]).
+    pub fn unentered(&mut self) {
+        self.once = false;
     }
 
     /// Whether what the inputs since Neovim's last word make can be followed
@@ -2498,6 +2559,7 @@ impl Typed {
         self.sent += 1;
         self.whole = true;
         self.waits = false;
+        self.once = false;
         self.state = State::Lost;
     }
 
@@ -3080,6 +3142,10 @@ pub struct Sent {
     /// and leave its cursor and view as they were — close a fold, turn
     /// `'wrap'` off.
     pub lost: bool,
+    /// Whether, as the client last made it out, Insert mode was entered by
+    /// then as `<Esc>` leaves with nothing typed again (see [`Typed::once`]):
+    /// what an ack covering it rests the client in.
+    pub once: bool,
 }
 
 /// An input sent, as the client made it out again from an ack (see
@@ -3197,12 +3263,16 @@ pub enum Proof {
     Move,
     Char(char),
     Rub,
+    /// Insert mode entered, or left — where autocommands of `InsertEnter`
+    /// or `InsertLeave`, a plugin's, may move the cursor.
+    Enter,
+    Leave,
 }
 
 impl Proof {
-    /// Of what is typed: not a motion.
+    /// Of what is typed: a character, or `<BS>`.
     fn typed(self) -> bool {
-        self != Proof::Move
+        matches!(self, Proof::Char(_) | Proof::Rub)
     }
 }
 
@@ -3377,6 +3447,10 @@ pub struct Predictor {
     /// first: what the next ack is judged by.
     pub base: Option<Base>,
     pub queue: VecDeque<Sent>,
+    /// Whether the client had Insert mode entered as `<Esc>` leaves with
+    /// nothing typed again by the last key Neovim's last word covers (see
+    /// [`Sent::once`]).
+    based: bool,
     /// How long Neovim takes to say what it made of a key, from the key's
     /// going, and how much that varies, smoothed as the round trip is: a
     /// round trip, and Neovim's own time on the key and those before it —
@@ -3710,7 +3784,45 @@ impl Predictor {
             pending: self.typed.pending(),
             made: false,
             lost,
+            once: self.typed.once,
         });
+    }
+
+    /// Input `seq` made out again from Neovim's last word (see
+    /// [`Typed::step`]): how Insert mode was entered, as the client now has
+    /// it, kept with it.
+    pub fn remade(&mut self, seq: u64) {
+        let once = self.typed.once;
+        if let Some(s) = self.queue.iter_mut().find(|s| s.seq == seq) {
+            s.once = once;
+        }
+    }
+
+    /// The step for input `seq`, which entered Insert mode, was not made:
+    /// see [`Typed::unentered`].
+    pub fn unentered(&mut self, seq: u64) {
+        self.typed.unentered();
+        self.remade(seq);
+    }
+
+    /// Make out the inputs sent since Neovim's last word on them again from
+    /// it (see [`Typed::rebase`]), Insert mode entered as the client had it
+    /// by then: says whether there is a word to make them out from.
+    pub fn rebase(&mut self) -> bool {
+        let Some(base) = self.base.as_ref() else {
+            return false;
+        };
+        let rest = base.ack.pos.rest;
+        self.typed.rebase(rest);
+        self.typed.once = self.based && rest == Rest::Insert;
+        true
+    }
+
+    /// Whether the client had Insert mode entered as `<Esc>` leaves with
+    /// nothing typed again by input `seq`, as it last made it out: not for
+    /// one it no longer keeps.
+    fn once(&self, seq: u64) -> bool {
+        self.queue.iter().any(|s| s.seq == seq && s.once)
     }
 
     /// Whether the client made out what each input up to its `k` does, of
@@ -3776,11 +3888,12 @@ impl Predictor {
         }
         let last = self.sync.last.as_ref();
         if let Some(ack) = last.filter(|a| i64::try_from(a.count) == Ok(taken)) {
-            self.typed.rebase(ack.pos.rest);
+            self.based = self.once(at.seq);
             self.base = Some(Base {
                 seq: at.seq,
                 ack: ack.clone(),
             });
+            self.rebase();
             self.queue.retain(|s| s.seq > at.seq);
         }
         upto
@@ -3838,8 +3951,9 @@ impl Predictor {
                 s.log();
             }
         }
-        self.typed.rebase(ack.pos.rest);
+        self.based = self.once(k);
         self.base = Some(Base { seq: k, ack });
+        self.rebase();
         self.queue.retain(|s| s.seq > k);
     }
 
@@ -7147,7 +7261,7 @@ mod tests {
             false.into(),
             true.into(),
             false.into(),
-            false.into(),
+            "".into(),
             classes.into(),
         ];
         said(&mut p, "insert", facts);
@@ -7185,6 +7299,59 @@ mod tests {
         ] {
             assert!(!ordinary(text), "{text:?}");
         }
+    }
+
+    /// Typing ahead of Neovim, `i`, `a`, `A` and `I` with no count but one
+    /// enter Insert mode, and `<Esc>` leaves an Insert mode entered so. A
+    /// count above one has what is typed typed again on `<Esc>`, and Insert
+    /// mode entered by a key the client does not follow may have been
+    /// entered with one: `<Esc>` is followed after neither, and not after a
+    /// key that leaves Insert mode for a command, nor where the step for
+    /// the key that entered it was not made. Neovim's word in Insert mode
+    /// says nothing of how it was entered: an ack rests the client in an
+    /// Insert mode not known to be entered so, till told otherwise (see
+    /// `super::App`).
+    #[test]
+    fn insert_mode_is_entered_and_left_by_keys_with_no_count() {
+        let mut t = acked();
+        t.set_keys(PredictKeys::Typing);
+        use typing::Enter;
+        let cmds = typed(&mut t, "ifoo<Esc>1A<Esc>I<Esc>");
+        assert_eq!(
+            cmds,
+            [
+                Command::Enter(Enter::Before),
+                Command::Type(typing::Edit::Char('f')),
+                Command::Type(typing::Edit::Char('o')),
+                Command::Type(typing::Edit::Char('o')),
+                Command::Leave,
+                Command::Enter(Enter::End),
+                Command::Leave,
+                Command::Enter(Enter::First),
+                Command::Leave,
+            ]
+        );
+        assert_eq!(typed(&mut t, "3ix<Esc>"), [], "a count: blind");
+        t.rebase(Rest::Normal);
+        assert_eq!(typed(&mut t, "ox<Esc>"), [], "entered otherwise");
+        t.rebase(Rest::Normal);
+        assert_eq!(typed(&mut t, "a"), [Command::Enter(Enter::After)]);
+        t.unentered();
+        assert_eq!(typed(&mut t, "<Esc>"), [], "the `a` not made");
+        t.rebase(Rest::Normal);
+        assert_eq!(typed(&mut t, "a"), [Command::Enter(Enter::After)]);
+        t.rebase(Rest::Insert);
+        assert_eq!(typed(&mut t, "<Esc>"), [], "an ack says nothing of it");
+        t.rebase(Rest::Normal);
+        let cmds = typed(&mut t, "ix<C-o><Esc>");
+        assert_eq!(
+            cmds.len(),
+            2,
+            "not after a command from Insert mode: {cmds:?}"
+        );
+        t.set_keys(PredictKeys::Motions);
+        t.rebase(Rest::Normal);
+        assert_eq!(typed(&mut t, "i<Esc>"), [], "the motions alone");
     }
 
     /// The lines whose characters Neovim 0.12.6 was found to step over
