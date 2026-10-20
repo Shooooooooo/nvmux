@@ -31,7 +31,8 @@ pub struct SshTransport {
     ssh: Ssh,
     /// The shell on the host, over the master. Started once by [`Self::new`],
     /// with the login shell that costs, and replaced by [`Self::run_script`]
-    /// if it dies — which it does with the master it rides on.
+    /// if it dies — which it does with the master it rides on — or at once
+    /// over a master brought back (see [`Self::open_shell`]).
     shell: Mutex<Option<Shell>>,
     /// Short, stable, filename-safe token for this host. Namespaces the local
     /// end of every forward and the ControlPath, so two hosts holding sessions
@@ -259,10 +260,10 @@ impl SshTransport {
     /// where `ssh -O check` is a fork per attach. That shortcut is what makes
     /// this cheap enough to ask on every attach, and it holds only because a
     /// shell is never started except over a master that has just been seen —
-    /// by [`SshTransport::new`] for the first, by [`Self::run_script`] for
-    /// every one after it. Neither notices a master whose connection is wedged
-    /// rather
-    /// than gone; that is what the master's own `ServerAlive` options are for.
+    /// by [`SshTransport::new`] for the first, by [`Self::restore_master`] or
+    /// [`Self::run_script`] for every one after it. None of them notices a
+    /// master whose connection is wedged rather than gone; that is what the
+    /// master's own `ServerAlive` options are for.
     /// A dead shell is dropped here, so the next script starts a fresh one
     /// over whatever master [`Self::restore_master`] leaves.
     ///
@@ -321,7 +322,33 @@ impl SshTransport {
         self.forwarded.lock().map(|mut f| f.clear()).ok();
         self.ssh.ensure_master_within(connect_timeout)?;
         tracing::info!(host = %self.host(), "reconnected");
+        self.open_shell();
         Ok(Reconnect::Restored)
+    }
+
+    /// Start a shell over a master just brought back, rather than when the
+    /// next script wants one.
+    ///
+    /// A connection is told it carries interactive traffic only once, by the
+    /// first session opened on it — and `sshd` before 10.1 turns Nagle off on
+    /// its end then and not otherwise. A forward is not a session. So a master
+    /// that carried nothing but the forwards of the sessions resumed over it
+    /// had every frame Neovim wrote in more than one go held back at the far
+    /// end until the last of it was acknowledged: a round trip more for a
+    /// scroll, a page, anything drawn in two writes — and for as long as no
+    /// listing, create or kill came along to open a session on it. The shell
+    /// [`SshTransport::new`] starts is that session for the first master.
+    ///
+    /// A slot held is a script run under way: on this thread, it is
+    /// [`Self::run_script`] restoring the master it is about to start its own
+    /// shell over; on another, a run that will start one when it finds its
+    /// shell gone. Either way it is not this one's to start.
+    fn open_shell(&self) {
+        if let Ok(mut slot) = self.shell.try_lock() {
+            if slot.as_mut().is_none_or(|shell| !shell.is_alive()) {
+                *slot = self.ssh.start_shell().ok();
+            }
+        }
     }
 
     /// Point a session's local socket at its remote one — and if ssh says
