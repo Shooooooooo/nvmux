@@ -9,17 +9,22 @@
 //! - `h`, `<Left>`, `<BS>` and `<C-h>` a character back, `l`, `<Right>` and
 //!   `<Space>` one on — a character with combining marks one, a character two
 //!   cells wide one — stopping at the line's first or last, or going on past
-//!   it to the next line where `'whichwrap'` says, which the client does not
-//!   follow; one that cannot go at all leaves the column the cursor wants as
-//!   it was;
+//!   it to the next line, or the one before, where `'whichwrap'` says: the
+//!   line's end a step, an empty line a place to step onto (see
+//!   [`wrapped`]); one that cannot go at all leaves the column the cursor
+//!   wants as it was;
 //! - `0` to the line's first character, `^` to its first that is not a
 //!   blank, `$` and `<End>` to its last, `g_` to its last that is not a
-//!   blank — or its first, for a line all blanks — `|` to the character
-//!   over a display column, and `<Home>` to the one over the first, as `1|`
-//!   takes it, the cursor wanting that column rather than the one it is
-//!   drawn in, a tab's last;
+//!   blank — or its first, for a line all blanks — those two with a count
+//!   on the line one fewer than counted down, `|` to the character over a
+//!   display column, and `<Home>` to the one over the first, as `1|` takes
+//!   it, the cursor wanting that column rather than the one it is drawn in,
+//!   a tab's last;
 //! - `j`, `k` and their kind a line down or up in the column the cursor
-//!   wants (Neovim's `curswant`), no further than the buffer goes;
+//!   wants (Neovim's `curswant`), no further than the buffer goes: onto the
+//!   character over that column, a tab or a character two cells wide that
+//!   covers it, or a shorter line's last — the end of every line, after
+//!   `$` — the column wanted kept as it was;
 //! - `+`, `<CR>`, `-` and `_` a line down or up, or none for `_`, to its
 //!   first character that is not a blank;
 //!
@@ -28,11 +33,10 @@
 //! up or down past `'scrolloff'`, is not followed; one that would move a view
 //! that does not wrap sideways moves it as Neovim does ([`predict::showing`]).
 //!
-//! The client follows the keys it sends by these, and judges where it put
-//! the cursor against where Neovim says it did (see `super::App`): those
-//! that keep the cursor on its line it draws at once (see
-//! `super::anim::chain`); the rest it judges without drawing, for the log
-//! (see [`super::predict::Predictor::judge`]).
+//! The client follows the keys it sends by these, draws where they take the
+//! cursor at once (see `super::anim::chain`), and judges each against where
+//! Neovim says it put the cursor (see `super::App`; and, for the log, every
+//! motion followed, drawn or not, [`super::predict::Predictor::judge`]).
 
 use super::predict::{self, Ch, Pos, Rest, Shape, Want};
 
@@ -54,10 +58,10 @@ pub enum Motion {
     /// `^`: its first that is not a blank — its last, for a line all blank.
     First,
     /// `$`, `<End>`: its last, the cursor wanting the end of every line
-    /// after it.
+    /// after it — with a count, the last of the line one fewer down.
     End,
     /// `g_`: its last that is not a blank — its first, for a line all
-    /// blanks.
+    /// blanks — with a count, of the line one fewer down.
     LastNonBlank,
     /// `|`: the character over the display column counted, from one.
     Column,
@@ -165,7 +169,7 @@ pub struct Ctx<'a> {
     /// `'whichwrap'`, where the client knows it — the agent says it only
     /// where it says what Neovim made of each key: not knowing it, a move
     /// sideways that would go past the end of its line is not followed,
-    /// whatever it would have done.
+    /// wherever it would have gone.
     pub whichwrap: Option<&'a str>,
 }
 
@@ -258,6 +262,13 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
             .position(|ch| !matches!(ch.c, ' ' | '\t'))
             .or(cs.len().checked_sub(1))
     };
+    // `g_`'s: the last that is not a blank, or the first of a line all
+    // blanks.
+    let last_non_blank = |cs: &[Ch]| {
+        cs.iter()
+            .rposition(|ch| !matches!(ch.c, ' ' | '\t'))
+            .or((!cs.is_empty()).then_some(0))
+    };
     match m {
         Motion::Left(ww) | Motion::Right(ww) => {
             let left = matches!(m, Motion::Left(_));
@@ -268,7 +279,7 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
             };
             let n = usize::try_from(n).unwrap_or(usize::MAX);
             if n > room && cx.wraps(ww)? {
-                return None;
+                return wrapped(left, n, at, cx);
             }
             match n.min(room) {
                 // Nowhere to go: the column wanted as it was.
@@ -292,15 +303,25 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
         Motion::Start | Motion::First if count.is_some() => None,
         Motion::Start => Some(sideways(Some(0), None)),
         Motion::First => Some(sideways(first(&cs), None)),
-        Motion::End if n > 1 => None,
-        Motion::End => Some(sideways(cs.len().checked_sub(1), Some(Want::End))),
-        // With a count, lines down — or none, wanting the end of the line,
-        // where there are not as many.
-        Motion::LastNonBlank if n > 1 => None,
-        Motion::LastNonBlank => {
-            let last = cs.iter().rposition(|ch| !matches!(ch.c, ' ' | '\t'));
-            Some(sideways(last.or((!cs.is_empty()).then_some(0)), None))
+        // With a count, on the line one fewer than counted down, or the
+        // buffer's last — but from that, nowhere: the cursor stays on its
+        // character, wanting the end of the line all the same, as Neovim
+        // sets that before it finds it cannot go down.
+        Motion::End | Motion::LastNonBlank if n > 1 => {
+            if at.line == last {
+                return Some(Pos {
+                    want: Want::End,
+                    ..*at
+                });
+            }
+            let line = at.line.saturating_add(n - 1).min(last);
+            match m {
+                Motion::End => down(line, &|cs| cs.len().checked_sub(1), Some(Want::End)),
+                _ => down(line, &last_non_blank, None),
+            }
         }
+        Motion::End => Some(sideways(cs.len().checked_sub(1), Some(Want::End))),
+        Motion::LastNonBlank => Some(sideways(last_non_blank(&cs), None)),
         Motion::Column | Motion::Home => {
             let vcol = match m {
                 Motion::Home => 0,
@@ -326,6 +347,57 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
             down(line, &first, None)
         }
     }
+}
+
+/// Where a move sideways of `n` characters — back if `left` — takes the
+/// cursor from `at` where `'whichwrap'` lets it go on past the ends of its
+/// line, as Neovim's `nv_left` and `nv_right` take it: from a line's last
+/// character on to the next line's first, or from its first back to the
+/// line before's last, is a step as a character is, and an empty line a
+/// place of its own to step onto; the buffer's first line or last is as far
+/// as it goes. The cursor then wants the column it is drawn in — or, having
+/// gone nowhere at all, what it wanted. `None` where it would pass a line
+/// the client does not have whole, or out of the view (see [`Ctx::holds`]),
+/// which a count as long as the buffer would: so many lines walked are no
+/// more than the view has.
+fn wrapped(left: bool, n: usize, at: &Pos, cx: &Ctx) -> Option<Pos> {
+    let last = (cx.line_count - 1).max(0);
+    let mut line = at.line;
+    let mut cs = predict::chars((cx.text)(line)?, cx.shape);
+    let mut i = cs.iter().rposition(|ch| ch.byte <= at.byte).unwrap_or(0);
+    let mut steps = n;
+    loop {
+        let room = if left {
+            i
+        } else {
+            cs.len().saturating_sub(i + 1)
+        };
+        let go = steps.min(room);
+        i = if left { i - go } else { i + go };
+        steps -= go;
+        if steps == 0 || line == if left { 0 } else { last } {
+            break;
+        }
+        line = if left { line - 1 } else { line + 1 };
+        if !cx.holds(at.top, line) {
+            return None;
+        }
+        cs = predict::chars((cx.text)(line)?, cx.shape);
+        i = if left { cs.len().saturating_sub(1) } else { 0 };
+        steps -= 1;
+    }
+    let ch = cs.get(i);
+    let byte = ch.map_or(0, |ch| ch.byte);
+    if (line, byte) == (at.line, at.byte) {
+        return Some(*at);
+    }
+    Some(Pos {
+        line,
+        byte,
+        want: Want::Col(ch.map_or(0, |ch| ch.at(cx.shape))),
+        left: cx.left((cx.text)(line)?, ch, at.left),
+        ..*at
+    })
 }
 
 /// The display column the cursor is drawn in, in Normal mode, at byte
@@ -572,6 +644,88 @@ mod tests {
             ((0, 3, 3, 0, 0), "g_", (0, 10, 10, 0, 0)),
             ((0, 0, 0, 0, 0), "1g_", (0, 10, 10, 0, 0)),
             ((0, 4, 4, 0, 0), "g_j", (1, 1, 10, 0, 0)),
+            // Past a line's end, `<Space>` and `<BS>` go on to the next line,
+            // and to the one before: the end a step, an empty line a place;
+            // no further than the buffer's first line and its last.
+            ((0, 10, -1, 0, 0), " ", (1, 0, 0, 0, 0)),
+            ((0, 10, -1, 0, 0), "2 ", (1, 1, 1, 0, 0)),
+            ((0, 10, -1, 0, 0), "3 ", (2, 0, 0, 0, 0)),
+            ((1, 1, -1, 0, 0), "3 ", (3, 1, 8, 0, 0)),
+            ((2, 0, 0, 0, 0), "10 ", (6, 3, 1, 0, 0)),
+            ((2, 0, 0, 0, 0), " ", (3, 0, 7, 0, 0)),
+            ((1, 0, 0, 0, 0), "<BS>", (0, 10, 10, 0, 0)),
+            ((2, 0, 0, 0, 0), "<BS>", (1, 1, 1, 0, 0)),
+            ((3, 0, 0, 0, 0), "<BS>", (2, 0, 0, 0, 0)),
+            ((3, 0, 0, 0, 0), "2<BS>", (1, 1, 1, 0, 0)),
+            ((4, 0, 0, 0, 0), "<BS>", (3, 1, 8, 0, 0)),
+            ((4, 0, 0, 0, 0), "3<BS>", (2, 0, 0, 0, 0)),
+            ((4, 0, 0, 0, 0), "<C-h>", (3, 1, 8, 0, 0)),
+            ((12, 3, -1, 0, 0), " ", (12, 3, -1, 0, 0)),
+            ((12, 3, -1, 0, 0), "9 ", (12, 3, -1, 0, 0)),
+            ((0, 0, 0, 0, 0), "<BS>", (0, 0, 0, 0, 0)),
+            ((0, 0, 0, 0, 0), "5<BS>", (0, 0, 0, 0, 0)),
+            ((10, 24, -1, 0, 0), "40 ", (12, 3, 3, 0, 0)),
+            ((7, 0, 0, 0, 0), "<BS>", (6, 3, 1, 0, 0)),
+            ((6, 3, -1, 0, 0), " ", (7, 0, 0, 0, 0)),
+            ((8, 0, 0, 0, 0), "<BS>", (7, 2, 2, 0, 0)),
+            ((11, 0, 0, 0, 0), "<BS>", (10, 24, 24, 0, 0)),
+            ((12, 0, 0, 0, 0), "<BS>", (11, 17, 24, 0, 0)),
+            ((2, 0, 0, 0, 0), "2<BS>", (1, 0, 0, 0, 0)),
+            // `$` and `g_` counted: on the line one fewer down, or the last;
+            // from the last, nowhere, wanting the end of the line.
+            ((0, 0, 0, 0, 0), "2$", (1, 1, -1, 0, 0)),
+            ((0, 0, 0, 0, 0), "3$", (2, 0, -1, 0, 0)),
+            ((0, 0, 0, 0, 0), "4$", (3, 1, -1, 0, 0)),
+            ((0, 5, 5, 0, 0), "2<End>", (1, 1, -1, 0, 0)),
+            ((11, 0, 0, 0, 0), "2$", (12, 3, -1, 0, 0)),
+            ((12, 0, 0, 0, 0), "2$", (12, 0, -1, 0, 0)),
+            ((11, 0, 0, 0, 0), "5$", (12, 3, -1, 0, 0)),
+            ((12, 2, 2, 0, 0), "2$", (12, 2, -1, 0, 0)),
+            ((0, 0, 0, 0, 0), "1$", (0, 10, -1, 0, 0)),
+            ((1, 1, -1, 0, 0), "j", (2, 0, -1, 0, 0)),
+            ((0, 0, 0, 0, 0), "13$", (12, 3, -1, 0, 0)),
+            ((0, 0, 0, 0, 0), "14$", (12, 3, -1, 0, 0)),
+            ((0, 0, 0, 0, 0), "2g_", (1, 1, 1, 0, 0)),
+            ((0, 0, 0, 0, 0), "3g_", (2, 0, 0, 0, 0)),
+            ((11, 0, 0, 0, 0), "2g_", (12, 3, 3, 0, 0)),
+            ((12, 0, 0, 0, 0), "2g_", (12, 0, -1, 0, 0)),
+            ((12, 2, 2, 0, 0), "2g_", (12, 2, -1, 0, 0)),
+            ((11, 0, 0, 0, 0), "5g_", (12, 3, 3, 0, 0)),
+            // Down and up onto a tab, a character two cells wide, shorter
+            // lines and empty ones, the column wanted kept; the end of the
+            // line kept to after `$`; and after `<CR>`, `_` and `-`, the
+            // first non-blank's column wanted.
+            ((0, 4, 4, 0, 0), "jjj", (3, 0, 4, 0, 0)),
+            ((0, 4, 4, 0, 0), "jjjj", (4, 1, 4, 0, 0)),
+            ((0, 1, 1, 0, 0), "jjjjj", (5, 0, 1, 0, 0)),
+            ((0, 3, 3, 0, 0), "jjjjj", (5, 3, 3, 0, 0)),
+            ((0, 9, 9, 0, 0), "jjj", (3, 1, 9, 0, 0)),
+            ((0, 9, 9, 0, 0), "jjjj", (4, 2, 9, 0, 0)),
+            ((0, 2, 2, 0, 0), "jjjjj", (5, 3, 2, 0, 0)),
+            ((5, 6, -1, 0, 0), "k", (4, 2, -1, 0, 0)),
+            ((5, 6, -1, 0, 0), "j", (6, 3, -1, 0, 0)),
+            ((5, 0, 1, 0, 0), "j", (6, 3, 1, 0, 0)),
+            ((5, 0, 1, 0, 0), "k", (4, 1, 1, 0, 0)),
+            ((5, 3, 3, 0, 0), "jjjj", (9, 3, 3, 0, 0)),
+            ((9, 24, -1, 0, 0), "jj", (11, 17, -1, 0, 0)),
+            ((9, 6, 5, 0, 0), "k", (8, 5, 5, 0, 0)),
+            ((9, 6, 5, 0, 0), "kkk", (6, 3, 5, 0, 0)),
+            ((9, 0, 1, 0, 0), "4k", (5, 0, 1, 0, 0)),
+            ((1, 0, 0, 0, 0), "j", (2, 0, 0, 0, 0)),
+            ((8, 2, 2, 0, 0), "jj", (10, 2, 2, 0, 0)),
+            ((11, 3, 10, 0, 0), "k", (10, 10, 10, 0, 0)),
+            ((11, 3, 10, 0, 0), "kk", (9, 15, 10, 0, 0)),
+            ((11, 0, 7, 0, 0), "k", (10, 7, 7, 0, 0)),
+            ((11, 0, 7, 0, 0), "j", (12, 3, 7, 0, 0)),
+            ((0, 0, 0, 0, 0), "5j", (5, 0, 0, 0, 0)),
+            ((0, 0, 0, 0, 0), "12j", (12, 0, 0, 0, 0)),
+            ((0, 0, 0, 0, 0), "20j", (12, 0, 0, 0, 0)),
+            ((12, 0, 0, 0, 0), "20k", (0, 0, 0, 0, 0)),
+            ((12, 3, -1, 0, 0), "3k", (9, 24, -1, 0, 0)),
+            ((8, 0, 0, 0, 0), "_j", (9, 3, 2, 0, 0)),
+            ((6, 0, 0, 0, 0), "-k", (4, 0, 0, 0, 0)),
+            ((0, 0, 0, 0, 0), "<CR>j", (2, 0, 0, 0, 0)),
+            ((7, 0, 0, 0, 0), "<CR>jj", (10, 2, 2, 0, 0)),
         ];
         let s = shape();
         for &(from, keys, to) in cases {
@@ -583,23 +737,49 @@ mod tests {
         }
     }
 
-    /// Where `'whichwrap'` would take the cursor on to another line, or the
-    /// client does not know whether it would, the move is not followed; and
-    /// neither is one Neovim takes some other way than these, or that the
-    /// view would move for.
+    /// With `'whichwrap'` letting `h`, `l` and the arrows go on past a
+    /// line's ends too, each does as `<BS>` and `<Space>` do — and those,
+    /// left out of it, stop there — as Neovim 0.12.6 was found to.
+    #[test]
+    fn moves_past_a_lines_end_go_on_where_whichwrap_says() {
+        #[rustfmt::skip]
+        let cases: &[(State, &str, State)] = &[
+            ((1, 0, 0, 0, 0), "h", (0, 10, 10, 0, 0)),
+            ((1, 0, 0, 0, 0), "3h", (0, 8, 8, 0, 0)),
+            ((0, 10, -1, 0, 0), "l", (1, 0, 0, 0, 0)),
+            ((0, 10, -1, 0, 0), "2l", (1, 1, 1, 0, 0)),
+            ((2, 0, 0, 0, 0), "l", (3, 0, 7, 0, 0)),
+            ((2, 0, 0, 0, 0), "h", (1, 1, 1, 0, 0)),
+            ((1, 0, 0, 0, 0), "<Left>", (0, 10, 10, 0, 0)),
+            ((0, 10, -1, 0, 0), "<Right>", (1, 0, 0, 0, 0)),
+            ((0, 10, -1, 0, 0), " ", (0, 10, -1, 0, 0)),
+            ((1, 0, 0, 0, 0), "<BS>", (1, 0, 0, 0, 0)),
+            ((12, 3, -1, 0, 0), "l", (12, 3, -1, 0, 0)),
+            ((0, 0, 0, 0, 0), "h", (0, 0, 0, 0, 0)),
+        ];
+        let s = shape();
+        for &(from, keys, to) in cases {
+            assert_eq!(
+                run(keys, from, &s, Some("h,l,<,>")),
+                Some(pos(to)),
+                "{keys:?} from {from:?}"
+            );
+        }
+    }
+
+    /// Where the client does not know whether `'whichwrap'` would take the
+    /// cursor on to another line, the move is not followed; and neither is
+    /// one Neovim takes some other way than these, or that the view would
+    /// move for.
     #[test]
     fn what_cannot_be_followed_is_not() {
         let s = shape();
         let not = |keys: &str, from: State, ww: Option<&str>| {
             assert_eq!(run(keys, from, &s, ww), None, "{keys:?} from {from:?}");
         };
-        // Past the end of a line, `<Space>` and `<BS>` go on by default.
-        not(" ", (0, 10, -1, 0, 0), Some("b,s"));
-        not("<BS>", (1, 0, 0, 0, 0), Some("b,s"));
-        not("h", (0, 0, 0, 0, 0), Some("h,l"));
         not("100l", (0, 0, 0, 0, 0), None);
+        not(" ", (0, 10, -1, 0, 0), None);
         // Counted where Neovim takes a count otherwise, and pending.
-        not("3$", (0, 5, 5, 0, 0), Some("b,s"));
         not("3^", (0, 5, 5, 0, 0), Some("b,s"));
         not("3", (0, 5, 5, 0, 0), Some("b,s"));
         // A key that is not a motion, or that something maps.
@@ -637,6 +817,17 @@ mod tests {
         assert_eq!(moved(Motion::Down, None, &from, &kept), None);
         let lower = pos((4, 0, 0, 4, 0));
         assert_eq!(moved(Motion::Up, None, &lower, &short), None);
+        // On past a line's end, out of the view: a count as long as the
+        // buffer walks no further than the view.
+        assert_eq!(moved(Motion::Right('s'), Some(10), &from, &short), None);
+        assert_eq!(moved(Motion::Left('b'), Some(10), &lower, &short), None);
+        assert_eq!(
+            moved(Motion::Right('s'), Some(999_999_999), &from, &cx),
+            Some(pos((12, 3, 3, 0, 0))),
+            "to the buffer's last line, in view"
+        );
+        // A counted `$` to a line out of it.
+        assert_eq!(moved(Motion::End, Some(3), &from, &short), None);
         // A line too long for a window that wraps puts the rows out of step
         // with the lines.
         let narrow = Ctx { width: 5, ..cx };
@@ -678,9 +869,10 @@ mod tests {
             );
             assert_eq!(drawn(lines[line], &s, to.byte), vcol, "{:?}", lines[line]);
         }
-        // With a count, lines down, which is not followed here.
+        // With a count, on the line one fewer down.
         let from = pos((0, 0, 0, 0, 0));
-        assert_eq!(moved(Motion::LastNonBlank, Some(2), &from, &cx), None);
+        let to = moved(Motion::LastNonBlank, Some(2), &from, &cx).expect("followed");
+        assert_eq!((to.line, to.byte, to.want), (1, 0, Want::Col(0)));
         assert_eq!(parse(["g", "_"], |k| k == "g_"), None, "something maps it");
         assert_eq!(parse(["g", "j"], |_| false), None, "not `g_`");
         assert_eq!(parse(["g"], |_| false), None, "pending");

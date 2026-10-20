@@ -123,17 +123,20 @@
 //! make, is given up on with that frame, not at its deadline.
 //!
 //! And so do the motions. The client follows the keys that move the cursor
-//! in Normal mode a character or a line at a time ([`super::moves`]): those
-//! that keep it on its line it draws at once, a key at a time, where it can
-//! say exactly where Neovim will put the cursor and draw it — over lines it
-//! has as the buffer has them now, that Neovim draws as it would, in a
-//! window whose options it follows ([`Stepping`]) — and judges each against
-//! the ack for its key: one Neovim made otherwise goes back to Neovim's at
-//! once, and what it was made in proves itself before the client draws it
-//! again ([`Trust`]; see `super::anim::chain`). Those that go to another
-//! line it works out from Neovim's last word and judges by the next, without
-//! drawing them, counting the verdicts for the log ([`Shadow`]): how often
-//! it would have been right, before it is drawn.
+//! in Normal mode a character or a line at a time ([`super::moves`]), and
+//! draws them at once, a key at a time, where it can say exactly where
+//! Neovim will put the cursor and draw it — over lines it has as the buffer
+//! has them now, that Neovim draws as it would, in a window whose options
+//! it follows ([`Stepping`]), along the cursor's line or to another in the
+//! view as it is — and judges each against the ack for its key: one Neovim
+//! made otherwise goes back to Neovim's at once, and what it was made in
+//! proves itself before the client draws it again ([`Trust`]; see
+//! `super::anim::chain`). A motion to another line takes with it what the
+//! cursor's line decides of the gutter — the numbers of
+//! `'relativenumber'`, the groups of `'cursorline'`'s line — which the
+//! client draws as Neovim will ([`regutter`]); what it cannot draw so, it
+//! leaves to Neovim. And it counts how each motion followed, drawn or not,
+//! came out, for the log ([`Shadow`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -263,6 +266,109 @@ pub struct Stepping {
     /// client does: `'ambiwidth'` double, widths `setcellwidths()` set, or
     /// `'emoji'` off.
     pub widths: bool,
+    /// `'numberwidth'`: the fewest columns the number column takes, the
+    /// blank after the number among them (see [`number_width`]).
+    pub numberwidth: usize,
+    /// `'signcolumn'` `number`: a line's sign drawn over its number.
+    pub number_signs: bool,
+    /// What `'cursorline'` draws of the cursor's line.
+    pub cursorline: Cursorline,
+    /// How the keys of a move down or up are mapped, of those something
+    /// maps: see [`Idiom`].
+    pub idioms: Vec<Idiom>,
+    /// `'winhighlight'`, or a highlight namespace of the window's own: the
+    /// window drawn in groups other than the editor's, which `hl_group_set`
+    /// names (see `super::model::Model::groups`) and the client lays the
+    /// gutter and the bar of the cursor's line out in.
+    pub own_highlights: bool,
+    /// `'conceallevel'` hiding text that Neovim shows on the cursor's line —
+    /// `'concealcursor'` without `n` — so that a line the cursor leaves may
+    /// be drawn otherwise once it has.
+    pub conceals: bool,
+}
+
+/// What `'cursorline'` draws of the cursor's line, as `'cursorlineopt'` has
+/// it — none of it where it is off: its number in `CursorLineNr`, and its
+/// sign and fold columns in `CursorLineSign` and `CursorLineFold`
+/// (`number`); the bar of `CursorLine` across its text (`line`); or across
+/// the row of it the cursor is on alone (`screenline`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Cursorline {
+    pub number: bool,
+    pub line: bool,
+    pub screenline: bool,
+}
+
+impl Cursorline {
+    /// As the agent sends it: one for `number`, two for `line` and four for
+    /// `screenline`, added together.
+    fn read(flags: i64) -> Self {
+        Self {
+            number: flags & 1 != 0,
+            line: flags & 2 != 0,
+            screenline: flags & 4 != 0,
+        }
+    }
+}
+
+/// How a key that moves the cursor a line down or up — `j`, `k`, `<Down>`,
+/// `<Up>` — is mapped, where something maps it, as the agent looked it up:
+/// to what, whether that is an expression, whether what it maps to is not
+/// mapped again, and whether it is `alone`, no longer mapping starting with
+/// the key, so that Neovim takes it at once rather than waiting for the
+/// next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Idiom {
+    pub key: String,
+    pub rhs: String,
+    pub expr: bool,
+    pub noremap: bool,
+    pub alone: bool,
+}
+
+impl Idiom {
+    /// As the agent sends one: `[key, rhs, expr, noremap, alone]`.
+    fn read(v: &ValueRef<'_>) -> Option<Self> {
+        let a = v.as_array()?;
+        let text = |i: usize| a.get(i).and_then(redraw::as_str).map(String::from);
+        let flag = |i: usize| matches!(a.get(i), Some(ValueRef::Boolean(true)));
+        Some(Self {
+            key: text(0)?,
+            rhs: text(1)?,
+            expr: flag(2),
+            noremap: flag(3),
+            alone: flag(4),
+        })
+    }
+
+    /// Whether the mapping makes of its key what the key makes unmapped,
+    /// as far as a motion over lines a row each and in view goes: LazyVim's,
+    /// and those like it, that send the cursor a row of the screen down or
+    /// up (`gj`, `gk`) where no count is typed — or always — and the key's
+    /// own way with one. On a line that takes a row, a row is a line, and
+    /// `gj` goes where `j` goes — but in a window that wraps, for a column
+    /// wanted past the row's end, which it brings back into the row, and
+    /// for a tab over a column wanted in the row's right half and short of
+    /// the tab's end, which it steps back off onto the character before
+    /// (see `super::App::predict_move`): as Neovim 0.12.6 was found to,
+    /// over thousands of motions, and as its `nv_screengo` has it. Only
+    /// these exactly, to keys not mapped again, with no longer mapping to
+    /// wait for.
+    pub fn same(&self) -> bool {
+        let (key, screen) = match self.key.as_str() {
+            "j" | "<Down>" => ("j", "gj"),
+            "k" | "<Up>" => ("k", "gk"),
+            _ => return false,
+        };
+        let rhs = self.rhs.as_str();
+        let made = if self.expr {
+            rhs == format!("v:count == 0 ? '{screen}' : '{key}'")
+                || rhs == format!("v:count ? '{key}' : '{screen}'")
+        } else {
+            rhs == screen
+        };
+        made && self.noremap && self.alone
+    }
 }
 
 impl Stepping {
@@ -285,7 +391,11 @@ impl Shape {
     /// sidescrolloff, sidescroll, hor, lcs, checks]` — `lcs` as
     /// [`Listchars::read`] has it — and, where the agent says what Neovim
     /// made of each key, `[whichwrap, virtualedit, cursorcolumn, bound,
-    /// langmap, widths]` after them (see [`Stepping`]).
+    /// langmap, widths, numberwidth, number_signs, cursorline, idioms,
+    /// own_highlights, conceals]` after them (see [`Stepping`]):
+    /// `numberwidth` no more than Neovim lets it be, `cursorline` as
+    /// [`Cursorline::read`] has it, and `idioms` a list of
+    /// [`Idiom::read`]'s.
     fn read(v: &[ValueRef<'_>]) -> Option<Self> {
         let int = |i: usize| v.get(i).and_then(redraw::int);
         let size = |i: usize| int(i).and_then(|n| usize::try_from(n).ok());
@@ -327,6 +437,16 @@ impl Shape {
                 bound: flag(28),
                 langmap: flag(29),
                 widths: flag(30),
+                numberwidth: size(31).map_or(4, |n| n.min(MOST_NUMBERWIDTH)),
+                number_signs: flag(32),
+                cursorline: Cursorline::read(int(33).unwrap_or(0)),
+                idioms: v
+                    .get(34)
+                    .and_then(ValueRef::as_array)
+                    .map(|a| a.iter().filter_map(Idiom::read).collect())
+                    .unwrap_or_default(),
+                own_highlights: flag(35),
+                conceals: flag(36),
             }),
         })
     }
@@ -625,6 +745,9 @@ pub struct Look {
     /// [`line`]): `Whitespace`, or the text's highlight where the editor
     /// has not said.
     pub whitespace: u32,
+    /// How many rows of text the window has: what its number column is as
+    /// wide as for, with `'relativenumber'` alone (see [`number_width`]).
+    pub rows: i64,
 }
 
 impl Look {
@@ -666,6 +789,7 @@ impl Look {
             nontext: group("NonText").unwrap_or(text),
             specialkey: group("SpecialKey").unwrap_or(text),
             whitespace: group("Whitespace").unwrap_or(text),
+            rows: rows.len() as i64,
         }
     }
 }
@@ -718,19 +842,31 @@ pub fn render(
         })
         .collect();
     if shape.plain_gutter && (shape.number || shape.relativenumber) {
-        let n = if shape.relativenumber && lnum != cursor {
-            (lnum - cursor).abs()
+        // The number column is the last of the gutter's, laid out as Neovim
+        // lays it out (see [`numbers`]) where the client knows how wide it
+        // is — in the gutter's colours, as the rest of it.
+        let ids = Gutter::default();
+        let laid = numbers(lnum, cursor, shape, look.rows, &ids)
+            .and_then(|cells| Some((textoff.checked_sub(cells.len())?, cells)));
+        if let Some((start, cells)) = laid {
+            for (cell, number) in row[start..].iter_mut().zip(cells) {
+                cell.text = number.text;
+            }
         } else {
-            lnum + 1
-        };
-        // Right-aligned, a blank after it, at the end of the gutter: the
-        // number column is the last of the gutter's. The cursor's own line
-        // with both options set is aligned left, which only a prediction
-        // that moves the cursor onto a line it uncovers gets wrong.
-        let digits = n.to_string();
-        if let Some(start) = textoff.checked_sub(digits.len() + 1) {
-            for (i, d) in digits.chars().enumerate() {
-                row[start + i].text = Text::Char(d);
+            // Right-aligned, a blank after it, at the end of the gutter —
+            // which the cursor's own line with both options set is not,
+            // and a prediction that moves the cursor onto a line it
+            // uncovers draws so.
+            let n = if shape.relativenumber && lnum != cursor {
+                (lnum - cursor).abs()
+            } else {
+                lnum + 1
+            };
+            let digits = n.to_string();
+            if let Some(start) = textoff.checked_sub(digits.len() + 1) {
+                for (i, d) in digits.chars().enumerate() {
+                    row[start + i].text = Text::Char(d);
+                }
             }
         }
     }
@@ -747,6 +883,181 @@ pub fn render(
         },
     );
     Some(row)
+}
+
+/// The highlights a window's gutter is drawn in that the cursor's line
+/// decides, by the client's ids for them (see
+/// `super::model::Model::groups`): the number column's — `LineNr`, and with
+/// `'relativenumber'` `LineNrAbove` and `LineNrBelow` either side of the
+/// cursor's line, `CursorLineNr` on it where `'cursorline'` numbers it — and
+/// the sign and fold columns', which on that line too are drawn in groups of
+/// their own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Gutter {
+    pub line_nr: u32,
+    pub above: u32,
+    pub below: u32,
+    pub cursor_nr: u32,
+    pub sign: u32,
+    pub cursor_sign: u32,
+    pub fold: u32,
+    pub cursor_fold: u32,
+}
+
+impl Gutter {
+    /// Each as `group` says the editor's group of its name is: `None` where
+    /// it has not said one.
+    pub fn of(group: impl Fn(&str) -> Option<u32>) -> Option<Self> {
+        Some(Self {
+            line_nr: group("LineNr")?,
+            above: group("LineNrAbove")?,
+            below: group("LineNrBelow")?,
+            cursor_nr: group("CursorLineNr")?,
+            sign: group("SignColumn")?,
+            cursor_sign: group("CursorLineSign")?,
+            fold: group("FoldColumn")?,
+            cursor_fold: group("CursorLineFold")?,
+        })
+    }
+}
+
+/// The most `'numberwidth'` can be: Neovim refuses more. What an agent says
+/// past it is taken for it, so that no number column is laid out wider than
+/// Neovim ever draws one.
+const MOST_NUMBERWIDTH: usize = 20;
+
+/// How many columns a window of `shape`, `rows` rows of text tall, takes for
+/// its number column, the blank after the number among them, as Neovim's
+/// `number_width` has it: as many as the digits of the buffer's last line —
+/// with `'relativenumber'` alone, of the window's height — and no fewer
+/// than `'numberwidth'` less one, and one more. Nought for no number column;
+/// `None` where the client does not know `'numberwidth'`, which the agent
+/// says only where it says what Neovim made of each key.
+pub fn number_width(shape: &Shape, rows: i64) -> Option<usize> {
+    if !shape.number && !shape.relativenumber {
+        return Some(0);
+    }
+    let least = shape.stepping.as_ref()?.numberwidth.saturating_sub(1);
+    let n = if shape.relativenumber && !shape.number {
+        rows
+    } else {
+        shape.line_count
+    };
+    Some(n.max(0).to_string().len().max(least) + 1)
+}
+
+/// The number column of a window of `shape`, `rows` rows of text tall, on
+/// buffer line `lnum`, the cursor's line `cursor`: as Neovim's own gutter
+/// has it — right-aligned with a blank after, the cursor's own line
+/// left-aligned where 'number' and 'relativenumber' are both on, nought on
+/// it with 'relativenumber' alone — in the group its place takes:
+/// `LineNrAbove` or `LineNrBelow` either side of the cursor with
+/// 'relativenumber', `CursorLineNr` on it with 'cursorline' numbering it,
+/// `LineNr` otherwise. `None` for no number column, or one the client does
+/// not know the width of (see [`number_width`]).
+pub fn numbers(
+    lnum: i64,
+    cursor: i64,
+    shape: &Shape,
+    rows: i64,
+    ids: &Gutter,
+) -> Option<Vec<Cell>> {
+    let width = number_width(shape, rows)?.checked_sub(1)?;
+    let rnu = shape.relativenumber;
+    let away = (lnum - cursor).abs();
+    let text = match (rnu, shape.number) {
+        (true, _) if away > 0 => format!("{away:>width$} "),
+        (true, true) => format!("{:<width$} ", lnum + 1),
+        (true, false) => format!("{:>width$} ", 0),
+        (false, _) => format!("{:>width$} ", lnum + 1),
+    };
+    let numbered = shape.stepping.as_ref().is_some_and(|s| s.cursorline.number);
+    let hl = match lnum.cmp(&cursor) {
+        std::cmp::Ordering::Less if rnu => ids.above,
+        std::cmp::Ordering::Greater if rnu => ids.below,
+        std::cmp::Ordering::Equal if numbered => ids.cursor_nr,
+        _ => ids.line_nr,
+    };
+    Some(
+        text.chars()
+            .take(width + 1)
+            .map(|c| Cell {
+                text: Text::Char(c),
+                hl,
+            })
+            .collect(),
+    )
+}
+
+/// The gutter of a window of `shape`, `rows` rows of text tall, on buffer
+/// line `lnum` — `drawn` as Neovim drew it with the cursor on line `from` —
+/// as Neovim draws it with the cursor on line `to` instead: the number
+/// column as [`numbers`] lays it out; and where `'cursorline'` numbers the
+/// cursor's line, the sign and fold columns of the two lines the cursor
+/// leaves and goes to in their groups (see [`Gutter`]), whatever each cell
+/// shows.
+///
+/// A number Neovim drew in a highlight other than its rules give for `from`
+/// is a sign's `numhl`, which stays where the sign is: its text moves on,
+/// and its colours stay as they were. `None` where the client cannot say:
+/// a number column that is not laid out as the client lays it out; or a
+/// sign's colours on a line the cursor leaves or goes to with
+/// `'cursorline'` numbering it, where they are laid over that line's
+/// groups by Neovim, and the client has no id for what they make — in the
+/// number column, or in the sign column, where a sign's own are those of
+/// its `culhl` on the cursor's line and of its `texthl` off it, whichever
+/// groups the sign column is drawn in either way.
+pub fn regutter(
+    drawn: &[Cell],
+    lnum: i64,
+    (from, to): (i64, i64),
+    shape: &Shape,
+    rows: i64,
+    ids: &Gutter,
+) -> Option<Vec<Cell>> {
+    let numbered = shape.stepping.as_ref()?.cursorline.number;
+    let marks = drawn.len().checked_sub(number_width(shape, rows)?)?;
+    let at_cursor = lnum == from || lnum == to;
+    let mut out = drawn.to_vec();
+    if let (Some(was), Some(now)) = (
+        numbers(lnum, from, shape, rows, ids),
+        numbers(lnum, to, shape, rows, ids),
+    ) {
+        let cells = &mut out[marks..];
+        if cells.iter().zip(&was).any(|(a, b)| a.text != b.text) {
+            return None;
+        }
+        let ruled = cells.iter().zip(&was).all(|(a, b)| a.hl == b.hl);
+        if !ruled && at_cursor && numbered {
+            return None;
+        }
+        for (cell, n) in cells.iter_mut().zip(now) {
+            cell.text = n.text;
+            if ruled {
+                cell.hl = n.hl;
+            }
+        }
+    }
+    if numbered && at_cursor && from != to {
+        // To the plain groups on the line the cursor leaves, from them on
+        // the one it goes to — as they are, where those are the same; and
+        // nothing else, which is a sign's.
+        let pairs = [(ids.cursor_sign, ids.sign), (ids.cursor_fold, ids.fold)];
+        let swaps: Vec<(u32, u32)> = if lnum == from {
+            pairs.to_vec()
+        } else {
+            pairs.iter().map(|&(a, b)| (b, a)).collect()
+        };
+        for cell in &mut out[..marks] {
+            let mut onto = swaps.iter().filter(|(a, _)| *a == cell.hl).map(|(_, b)| *b);
+            let first = onto.next()?;
+            if onto.any(|b| b != first) {
+                return None;
+            }
+            cell.hl = first;
+        }
+    }
+    Some(out)
 }
 
 /// Append the cells of a line's text in the window's text highlight — or
@@ -1062,10 +1373,12 @@ pub enum Command {
     /// A scroll sideways, in a window that does not wrap: see [`across`].
     Side(Side),
     /// No scroll, but a motion of the cursor in Normal mode, as Neovim will
-    /// make it with `count`: see [`moves::moved`].
+    /// make it with `count`: see [`moves::moved`]. Made by a key mapped to
+    /// go a row of the screen down or up (see [`Idiom`]) where `screen`.
     Move {
         motion: moves::Motion,
         count: Option<i64>,
+        screen: bool,
     },
 }
 
@@ -1907,7 +2220,11 @@ impl Typed {
                 }
                 let command = scroll(key, count).or_else(|| {
                     let motion = moves::motion(key).filter(|_| motions)?;
-                    Some(Command::Move { motion, count })
+                    Some(Command::Move {
+                        motion,
+                        count,
+                        screen: false,
+                    })
                 });
                 match command.filter(|_| !mapped(key)) {
                     Some(command) => {
@@ -1930,6 +2247,7 @@ impl Typed {
                     return Some(Command::Move {
                         motion: moves::Motion::LastNonBlank,
                         count,
+                        screen: false,
                     });
                 }
                 self.lost = true;
@@ -2300,14 +2618,20 @@ pub struct Ack {
     /// line. `None` where the agent did not measure it, the line being
     /// longer than the client keeps of one (see [`Predictor::cut`]).
     pub width: Option<usize>,
+    /// The same of each line in view whose text ends in blanks, the
+    /// cursor's or another, by line from nought: among blanks, blank virtual
+    /// text shows nothing of itself on the screen. Those longer than the
+    /// client keeps of one are left out.
+    pub blanks: Vec<(i64, usize)>,
 }
 
 impl Ack {
     /// As the agent sends it: `[count, tail, mode, win, buf, tick,
-    /// line_count, lnum, col, want, top, left, width]`, lines from nought
-    /// and the column in bytes, `want` -1 for the end of the line, `width`
-    /// -1 for a line not measured. None of the counts is below nought, the
-    /// agent's own being Neovim's.
+    /// line_count, lnum, col, want, top, left, width, blanks]`, lines from
+    /// nought and the column in bytes, `want` -1 for the end of the line,
+    /// `width` -1 for a line not measured, `blanks` a list of `[line,
+    /// width]`. None of the counts is below nought, the agent's own being
+    /// Neovim's.
     pub fn read(v: &[ValueRef<'_>]) -> Option<Self> {
         let int = |i: usize| v.get(i).and_then(redraw::int);
         let size = |i: usize| int(i).and_then(|n| usize::try_from(n).ok());
@@ -2333,7 +2657,32 @@ impl Ack {
             tick: int(5)?,
             line_count: line(6)?,
             width: size(12),
+            blanks: v
+                .get(13)
+                .and_then(ValueRef::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|b| {
+                            let b = b.as_array()?;
+                            let n = |i: usize| b.get(i).and_then(redraw::int);
+                            Some((n(0)?, usize::try_from(n(1)?).ok()?))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
+    }
+
+    /// How wide Neovim lays line `line` out, where the agent measured it:
+    /// the cursor's line, or one in view that ends in blanks.
+    pub fn width_of(&self, line: i64) -> Option<usize> {
+        if line == self.pos.line {
+            return self.width;
+        }
+        self.blanks
+            .iter()
+            .find(|(l, _)| *l == line)
+            .map(|&(_, w)| w)
     }
 }
 
@@ -2661,6 +3010,12 @@ pub struct Sent {
     /// Whether it left Neovim waiting for another key, as far as the client
     /// could tell (see [`Typed::pending`]).
     pub pending: bool,
+    /// Whether the client could not make out what it does as it was sent: a
+    /// key it does not follow (see [`Typed::step`]), or a mouse report other
+    /// than a turn of the wheel. Such a one may change what a window shows
+    /// and leave its cursor and view as they were — close a fold, turn
+    /// `'wrap'` off.
+    pub lost: bool,
 }
 
 /// An input sent, as the client made it out again from an ack (see
@@ -3194,13 +3549,29 @@ impl Predictor {
             self.sync.doubt("too many keys unanswered");
             self.queue.clear();
         }
+        let lost = match input {
+            Input::Key(_) => self.typed.lost,
+            Input::Wheel => false,
+            Input::Click => true,
+        };
         self.queue.push_back(Sent {
             seq,
             input,
             at: now,
             pending: self.typed.pending(),
             made: false,
+            lost,
         });
+    }
+
+    /// Whether the client made out what each input up to its `k` does, of
+    /// those sent since Neovim's last word: none it could not as it was
+    /// sent (see [`Sent::lost`]) and has not made since.
+    pub fn made_out(&self, k: u64) -> bool {
+        self.queue
+            .iter()
+            .filter(|s| s.seq <= k)
+            .all(|s| s.made || !s.lost)
     }
 
     /// What the client made of input `seq` is made: see [`Sent::made`].
@@ -3277,10 +3648,10 @@ impl Predictor {
 
     /// Judge `ack`, which covers the client's keys up to its `k`: where the
     /// client would have put the cursor and the view for the keys since
-    /// Neovim's last word, drawn or not — those that go to another line are
-    /// not yet — against where Neovim says it put them, and take it for
-    /// Neovim's last word from here. The verdicts are counted, and logged
-    /// ([`Shadow`]); what was drawn is judged by `super::App`.
+    /// Neovim's last word, drawn or not, against where Neovim says it put
+    /// them, and take it for Neovim's last word from here. The verdicts are
+    /// counted, and logged ([`Shadow`]); what was drawn is judged by
+    /// `super::App`.
     /// `view` is the window's rows and columns, its gutter and all, as the
     /// frame for the keys has them; `unmade`, whether that frame left a
     /// scroll ahead of Neovim unmade whose key Neovim has taken.
@@ -3383,17 +3754,24 @@ impl Predictor {
     }
 
     /// A key typed while window `win` has the cursor, as [`Typed::key`]
-    /// takes it, with that window's mappings.
+    /// takes it, with that window's mappings: one mapped to make what it
+    /// makes unmapped (see [`Idiom`]) taken for the key itself, a row of the
+    /// screen at a time.
     pub fn key(&mut self, win: Option<i64>, key: &str) -> Option<Command> {
-        let mapped = mapping(win.and_then(|w| self.shapes.get(&w)));
-        self.typed.key(key, mapped)
+        let shape = win.and_then(|w| self.shapes.get(&w));
+        let same = idiomatic(shape, key);
+        let command = self.typed.key(key, mapping(shape, same.then_some(key)));
+        screened(command, same)
     }
 
     /// A key sent while window `win` had the cursor, made out again from
-    /// Neovim's last word on the keys before it: see [`Typed::step`].
+    /// Neovim's last word on the keys before it: see [`Typed::step`] and
+    /// [`Predictor::key`].
     pub fn remake(&mut self, win: Option<i64>, key: &str) -> Option<Command> {
-        let mapped = mapping(win.and_then(|w| self.shapes.get(&w)));
-        self.typed.step(key, mapped)
+        let shape = win.and_then(|w| self.shapes.get(&w));
+        let same = idiomatic(shape, key);
+        let command = self.typed.step(key, mapping(shape, same.then_some(key)));
+        screened(command, same)
     }
 
     /// A count given `<C-d>` or `<C-u>` is window `win`'s `'scroll'` from
@@ -3469,13 +3847,39 @@ impl Predictor {
 
 /// Whether something maps a key, as a window of `shape` has it, in Insert
 /// mode if asked about that (see [`Typed::key`]): nothing, for a window the
-/// agent has said nothing of.
-fn mapping(shape: Option<&Shape>) -> impl Fn(bool, &str) -> bool + '_ {
+/// agent has said nothing of — nor for `same` in Normal mode, mapped to make
+/// what it makes unmapped (see [`Idiom`]).
+fn mapping<'a>(
+    shape: Option<&'a Shape>,
+    same: Option<&'a str>,
+) -> impl Fn(bool, &str) -> bool + 'a {
     move |insert, k| {
-        shape.is_some_and(|s| {
-            let list = if insert { &s.imapped } else { &s.mapped };
-            list.iter().any(|m| m == k)
-        })
+        (insert || same != Some(k))
+            && shape.is_some_and(|s| {
+                let list = if insert { &s.imapped } else { &s.mapped };
+                list.iter().any(|m| m == k)
+            })
+    }
+}
+
+/// Whether something maps `key` in a window of `shape` to make of it what
+/// it makes unmapped, but a row of the screen at a time (see [`Idiom`]).
+fn idiomatic(shape: Option<&Shape>, key: &str) -> bool {
+    shape
+        .and_then(|s| s.stepping.as_ref())
+        .is_some_and(|s| s.idioms.iter().any(|i| i.key == key && i.same()))
+}
+
+/// `command`, made by a key mapped to go a row of the screen at a time if
+/// `screen`.
+fn screened(command: Option<Command>, screen: bool) -> Option<Command> {
+    match command {
+        Some(Command::Move { motion, count, .. }) => Some(Command::Move {
+            motion,
+            count,
+            screen,
+        }),
+        other => other,
     }
 }
 
@@ -3539,6 +3943,7 @@ mod tests {
             nontext: 19,
             specialkey: 20,
             whitespace: 21,
+            rows: 22,
         }
     }
 
@@ -3607,6 +4012,365 @@ mod tests {
         };
         let row = render(plain("x"), &s, 22, 8, &look(), 30).unwrap();
         assert_eq!(text(&row), "    x   ");
+    }
+
+    /// [`shape`]'s, as the agent says it where it says what Neovim made of
+    /// each key: `'number'` and `'relativenumber'` as `numbers` says,
+    /// `'numberwidth'` `nuw`, over `lines` lines, and `'cursorline'` as `cul`
+    /// has it.
+    fn numbering((nu, rnu): (bool, bool), nuw: usize, lines: i64, cul: i64) -> Shape {
+        Shape {
+            number: nu,
+            relativenumber: rnu,
+            line_count: lines,
+            stepping: Some(Stepping {
+                whichwrap: "b,s".into(),
+                virtualedit: String::new(),
+                cursorcolumn: false,
+                bound: false,
+                langmap: false,
+                widths: false,
+                numberwidth: nuw,
+                number_signs: false,
+                cursorline: Cursorline::read(cul),
+                idioms: Vec::new(),
+                own_highlights: false,
+                conceals: false,
+            }),
+            ..shape()
+        }
+    }
+
+    /// The groups of a gutter, by ids of these tests' own.
+    const IDS: Gutter = Gutter {
+        line_nr: 10,
+        above: 11,
+        below: 12,
+        cursor_nr: 13,
+        sign: 14,
+        cursor_sign: 15,
+        fold: 16,
+        cursor_fold: 17,
+    };
+
+    /// The number column on each of `lines` from nought, the cursor on line
+    /// `cursor`, in a window `rows` rows tall: its text, and the group of
+    /// its first cell.
+    fn numbered(
+        shape: &Shape,
+        cursor: i64,
+        rows: i64,
+        lines: std::ops::Range<i64>,
+    ) -> Vec<(String, u32)> {
+        lines
+            .map(|l| {
+                let cells = numbers(l, cursor, shape, rows, &IDS).expect("numbered");
+                (text(&cells), cells[0].hl)
+            })
+            .collect()
+    }
+
+    /// The number column, as Neovim 0.12.6 was found to draw it: as wide as
+    /// the buffer's last line takes, or the window's height with
+    /// `'relativenumber'` alone, and `'numberwidth'`; right-aligned, but for
+    /// the cursor's own line with both options set; and in the groups
+    /// either side of the cursor and on it.
+    #[test]
+    fn the_number_column_is_laid_out_as_neovim_lays_it_out() {
+        let n = |text: &str, hl: u32| (text.to_string(), hl);
+        let nu = numbering((true, false), 4, 30, 0);
+        assert_eq!(
+            numbered(&nu, 2, 6, 0..4),
+            [n("  1 ", 10), n("  2 ", 10), n("  3 ", 10), n("  4 ", 10)]
+        );
+        let rnu = numbering((false, true), 4, 30, 0);
+        assert_eq!(
+            numbered(&rnu, 2, 6, 0..4),
+            [n("  2 ", 11), n("  1 ", 11), n("  0 ", 10), n("  1 ", 12)]
+        );
+        let both = numbering((true, true), 4, 30, 0);
+        assert_eq!(
+            numbered(&both, 3, 6, 2..5),
+            [n("  1 ", 11), n("4   ", 10), n("  1 ", 12)]
+        );
+        let wide = numbering((true, true), 6, 30, 0);
+        assert_eq!(
+            numbered(&wide, 1, 6, 0..2),
+            [n("    1 ", 11), n("2     ", 10)]
+        );
+        // Wide as the last line's number, however few of them are in view;
+        // or with 'relativenumber' alone, as the window's height.
+        let many = numbering((true, false), 4, 1000, 0);
+        assert_eq!(numbered(&many, 2, 6, 0..1), [n("   1 ", 10)]);
+        let many = numbering((false, true), 4, 1000, 0);
+        assert_eq!(numbered(&many, 2, 6, 0..1), [n("  2 ", 11)]);
+        let few = numbering((true, true), 1, 9, 0);
+        assert_eq!(numbered(&few, 2, 6, 1..3), [n("1 ", 11), n("3 ", 10)]);
+        let few = numbering((false, true), 1, 9, 0);
+        assert_eq!(numbered(&few, 2, 6, 2..3), [n("0 ", 10)]);
+        let tall = numbering((false, true), 1, 9, 0);
+        assert_eq!(numbered(&tall, 0, 12, 8..9), [n(" 8 ", 12)]);
+        // 'cursorline' numbering the cursor's line, with 'relativenumber' or
+        // without; drawing only its bar numbers nothing.
+        let cul = numbering((true, true), 4, 30, 1);
+        assert_eq!(
+            numbered(&cul, 2, 6, 1..4),
+            [n("  1 ", 11), n("3   ", 13), n("  1 ", 12)]
+        );
+        let cul = numbering((true, false), 4, 30, 3);
+        assert_eq!(numbered(&cul, 2, 6, 1..3), [n("  2 ", 10), n("  3 ", 13)]);
+        let bar = numbering((true, false), 4, 30, 2);
+        assert_eq!(numbered(&bar, 2, 6, 2..3), [n("  3 ", 10)]);
+        // None without a number column, or where 'numberwidth' is not said.
+        let none = numbering((false, false), 4, 30, 0);
+        assert_eq!(numbers(0, 2, &none, 6, &IDS), None);
+        assert_eq!(
+            numbers(
+                0,
+                2,
+                &Shape {
+                    stepping: None,
+                    ..both
+                },
+                6,
+                &IDS
+            ),
+            None
+        );
+    }
+
+    /// A row drawn for a line a scroll uncovers numbers the cursor's own line
+    /// from the left with both `'number'` and `'relativenumber'` on, as
+    /// Neovim does — where the client knows how wide the column is, which
+    /// it does where the agent says what Neovim made of each key.
+    #[test]
+    fn the_cursors_own_line_is_numbered_from_the_left_with_both_on() {
+        let s = numbering((true, true), 4, 100, 0);
+        let row = render(plain("x"), &s, 30, 8, &look(), 30).unwrap();
+        assert_eq!(text(&row), "31  x   ");
+        let row = render(plain("x"), &s, 28, 8, &look(), 30).unwrap();
+        assert_eq!(text(&row), "  2 x   ");
+        let s = Shape {
+            stepping: None,
+            ..s
+        };
+        let row = render(plain("x"), &s, 30, 8, &look(), 30).unwrap();
+        assert_eq!(text(&row), " 31 x   ", "as it ever was");
+    }
+
+    /// A row of a gutter drawn as `text`, the fold, sign and number columns'
+    /// cells in the groups `hls` says, a run of each.
+    fn gutter_row(text: &str, hls: &[(u32, usize)]) -> Vec<Cell> {
+        let hls = hls.iter().flat_map(|&(hl, n)| std::iter::repeat_n(hl, n));
+        text.chars()
+            .zip(hls)
+            .map(|(c, hl)| Cell {
+                text: Text::Char(c),
+                hl,
+            })
+            .collect()
+    }
+
+    /// A gutter Neovim drew with the cursor on one line, as it draws it with
+    /// the cursor on another: as Neovim 0.12.6 was found to, a fold column,
+    /// two of signs and four of numbers. Its numbers renumbered in their
+    /// groups; a sign's number in its own colours, renumbered; and where
+    /// `'cursorline'` numbers the cursor's line, the sign and fold columns
+    /// of the lines left and gone to in their groups — or nothing said,
+    /// where either line has a sign's colours laid over its own, or a sign
+    /// at all, whose colours there may be its `culhl`'s, though the sign
+    /// column's groups be the same on the cursor's line and off it.
+    #[test]
+    fn a_gutter_is_drawn_again_for_the_cursor_moved() {
+        let both = Shape {
+            textoff: 7,
+            ..numbering((true, true), 4, 30, 0)
+        };
+        let plain = |n: &str, nr: u32| gutter_row(&format!("   {n}"), &[(16, 1), (14, 2), (nr, 4)]);
+        let again =
+            |row: &[Cell], lnum: i64, shape: &Shape| regutter(row, lnum, (2, 3), shape, 6, &IDS);
+        assert_eq!(again(&plain("  2 ", 11), 0, &both), Some(plain("  3 ", 11)));
+        assert_eq!(again(&plain("3   ", 10), 2, &both), Some(plain("  1 ", 11)));
+        assert_eq!(again(&plain("  1 ", 12), 3, &both), Some(plain("4   ", 10)));
+        // A sign's number, its colours its own.
+        let sign = gutter_row(" >>  1 ", &[(16, 1), (70, 2), (68, 4)]);
+        assert_eq!(
+            again(&sign, 1, &both),
+            Some(gutter_row(" >>  2 ", &[(16, 1), (70, 2), (68, 4)]))
+        );
+        assert_eq!(
+            again(
+                &gutter_row(" >>  1 ", &[(16, 1), (70, 2), (68, 4)]),
+                3,
+                &both
+            ),
+            Some(gutter_row(" >>4   ", &[(16, 1), (70, 2), (68, 4)]))
+        );
+        // Not laid out as the client lays it out.
+        assert_eq!(again(&plain(" 2  ", 11), 0, &both), None);
+        // 'cursorline' numbering the cursor's line: its sign and fold columns
+        // in their own groups on the line left and the one gone to.
+        let cul = Shape {
+            textoff: 7,
+            ..numbering((true, true), 4, 30, 1)
+        };
+        let left = gutter_row("   3   ", &[(17, 1), (15, 2), (13, 4)]);
+        assert_eq!(
+            again(&left, 2, &cul),
+            Some(gutter_row("     1 ", &[(16, 1), (14, 2), (11, 4)]))
+        );
+        assert_eq!(
+            again(&plain("  1 ", 12), 3, &cul),
+            Some(gutter_row("   4   ", &[(17, 1), (15, 2), (13, 4)]))
+        );
+        assert_eq!(
+            again(&sign, 1, &cul),
+            Some(gutter_row(" >>  2 ", &[(16, 1), (70, 2), (68, 4)]))
+        );
+        let onto = gutter_row(" >>  1 ", &[(16, 1), (70, 2), (12, 4)]);
+        assert_eq!(again(&onto, 3, &cul), None, "a sign's colours over its own");
+        assert_eq!(
+            again(
+                &gutter_row(" >>  1 ", &[(16, 1), (14, 2), (68, 4)]),
+                3,
+                &cul
+            ),
+            None,
+            "a sign's number on it"
+        );
+        // The same groups either way, as the default colour scheme has them:
+        // nothing to tell apart but a sign, which is the client's no more.
+        let same = Gutter {
+            cursor_sign: 14,
+            cursor_fold: 16,
+            ..IDS
+        };
+        assert_eq!(
+            regutter(&plain("  1 ", 12), 3, (2, 3), &cul, 6, &same),
+            Some(gutter_row("   4   ", &[(16, 1), (14, 2), (13, 4)]))
+        );
+        assert_eq!(regutter(&onto, 3, (2, 3), &cul, 6, &same), None, "a sign");
+        assert_eq!(
+            regutter(
+                &gutter_row(" >>  2 ", &[(16, 1), (70, 2), (12, 4)]),
+                4,
+                (2, 3),
+                &cul,
+                6,
+                &same
+            ),
+            Some(gutter_row(" >>  1 ", &[(16, 1), (70, 2), (12, 4)])),
+            "a sign on a line neither left nor gone to"
+        );
+        // 'number' alone: nothing moves.
+        let nu = Shape {
+            textoff: 7,
+            ..numbering((true, false), 4, 30, 0)
+        };
+        assert_eq!(again(&plain("  1 ", 10), 0, &nu), Some(plain("  1 ", 10)));
+    }
+
+    /// Only the mappings of `j`, `k`, `<Down>` and `<Up>` that make of the
+    /// key what it makes unmapped, as LazyVim's do, are taken for the key:
+    /// exactly as written, to keys not mapped again, with nothing longer to
+    /// wait for.
+    #[test]
+    fn a_key_mapped_the_lazyvim_way_is_known_exactly() {
+        let idiom = |key: &str, rhs: &str, expr: bool, noremap: bool, alone: bool| Idiom {
+            key: key.into(),
+            rhs: rhs.into(),
+            expr,
+            noremap,
+            alone,
+        };
+        let lazy = "v:count == 0 ? 'gj' : 'j'";
+        assert!(idiom("j", lazy, true, true, true).same());
+        assert!(idiom("<Down>", lazy, true, true, true).same());
+        assert!(idiom("k", "v:count == 0 ? 'gk' : 'k'", true, true, true).same());
+        assert!(idiom("<Up>", "v:count ? 'k' : 'gk'", true, true, true).same());
+        assert!(idiom("j", "v:count ? 'j' : 'gj'", true, true, true).same());
+        assert!(idiom("j", "gj", false, true, true).same());
+        assert!(idiom("k", "gk", false, true, true).same());
+        // A near miss, the other way's keys, or not as an expression.
+        assert!(!idiom("j", "v:count==0 ? 'gj' : 'j'", true, true, true).same());
+        assert!(!idiom("k", lazy, true, true, true).same());
+        assert!(!idiom("j", "gj", true, true, true).same());
+        assert!(!idiom("j", lazy, false, true, true).same());
+        assert!(!idiom("<C-n>", lazy, true, true, true).same());
+        // Mapped again, or waiting for a longer mapping.
+        assert!(!idiom("j", lazy, true, false, true).same());
+        assert!(!idiom("j", lazy, true, true, false).same());
+    }
+
+    /// What decides a motion's gutter, its bar and its mappings comes with
+    /// the shape where the agent says what Neovim made of each key; said by
+    /// an agent that says less, it is as Neovim has it by default. And a
+    /// `'numberwidth'` wider than Neovim lets it be is taken for the widest.
+    #[test]
+    fn the_gutters_options_come_with_the_shape() {
+        let mut p = Predictor::default();
+        let mut args = shape_args(10);
+        if let Some(Value::Array(v)) = args.get_mut(1) {
+            v.resize(25, Value::from(0));
+            v.extend([
+                "b,s".into(),
+                "".into(),
+                false.into(),
+                false.into(),
+                false.into(),
+                false.into(),
+            ]);
+        }
+        said(&mut p, "shape", args.clone());
+        let s = p
+            .shape(1000)
+            .and_then(|s| s.stepping.clone())
+            .expect("stepping");
+        assert_eq!(
+            (s.numberwidth, s.number_signs, s.cursorline, s.idioms),
+            (4, false, Cursorline::default(), vec![])
+        );
+        assert!(!s.own_highlights && !s.conceals);
+        if let Some(Value::Array(v)) = args.get_mut(1) {
+            let lazy = Value::Array(vec![
+                "j".into(),
+                "v:count == 0 ? 'gj' : 'j'".into(),
+                true.into(),
+                true.into(),
+                true.into(),
+            ]);
+            v.extend([
+                6.into(),
+                true.into(),
+                5.into(),
+                Value::Array(vec![lazy]),
+                true.into(),
+                true.into(),
+            ]);
+        }
+        said(&mut p, "shape", args.clone());
+        let s = p
+            .shape(1000)
+            .and_then(|s| s.stepping.clone())
+            .expect("stepping");
+        assert_eq!((s.numberwidth, s.number_signs), (6, true));
+        assert_eq!(
+            s.cursorline,
+            Cursorline {
+                number: true,
+                line: false,
+                screenline: true
+            }
+        );
+        assert!(s.idioms.len() == 1 && s.idioms[0].same());
+        assert!(s.own_highlights && s.conceals);
+        // A 'numberwidth' wider than Neovim lets it be: the widest.
+        if let Some(Value::Array(v)) = args.get_mut(1) {
+            v[31] = Value::from(i64::MAX);
+        }
+        said(&mut p, "shape", args);
+        let s = p.shape(1000).and_then(|s| s.stepping.clone());
+        assert_eq!(s.map(|s| s.numberwidth), Some(20));
     }
 
     /// Tabs to the next stop, controls as `^X`, a character two cells wide as
@@ -5491,6 +6255,7 @@ mod tests {
             tick: 5,
             line_count: 100,
             width: None,
+            blanks: Vec::new(),
         }
     }
 
@@ -5551,6 +6316,7 @@ mod tests {
             tick: 5,
             line_count: 100,
             width: None,
+            blanks: Vec::new(),
         };
         assert_eq!(read(wire(9, "n")), Some(want.clone()));
         let end = read(wire(-1, "n")).expect("read");
@@ -5594,6 +6360,24 @@ mod tests {
         assert_eq!(read(wire(12)), Some(Some(12)));
         assert_eq!(read(wire(0)), Some(Some(0)), "an empty line");
         assert_eq!(read(wire(-1)), Some(None), "too long to measure");
+    }
+
+    /// And how wide Neovim lays out each line in view that ends in blanks:
+    /// the client's measure of a line the agent says nothing of is its own,
+    /// that of the cursor's line the cursor's.
+    #[test]
+    fn an_ack_says_how_wide_neovim_lays_lines_ending_in_blanks_out() {
+        let mut v: Vec<Value> = vec![7.into(), "jl".into(), "n".into(), 1000.into()];
+        v.extend([1, 5, 100, 3, 4, 9, 1, 2, 12].map(Value::from));
+        let pair = |l: i64, w: i64| Value::Array(vec![l.into(), w.into()]);
+        v.push(Value::Array(vec![pair(5, 9), pair(3, 12), "x".into()]));
+        let refs: Vec<ValueRef<'_>> = v.iter().map(Value::as_ref).collect();
+        let ack = Ack::read(&refs).expect("read");
+        assert_eq!(ack.blanks, [(5, 9), (3, 12)]);
+        assert_eq!(
+            (ack.width_of(5), ack.width_of(3), ack.width_of(4)),
+            (Some(9), Some(12), None)
+        );
     }
 
     /// Visual mode, as an ack says it and as the editor draws it, is a rest

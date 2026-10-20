@@ -133,10 +133,10 @@ use anyhow::Context;
 use rmpv::ValueRef;
 
 use self::anim::{chain, Animator, Effects};
-use self::grid::Cell;
+use self::grid::{Cell, Text};
 use self::input::{Input, Mouse, Parser, Reply};
 use self::model::{Changes, Model, Place, Placement};
-use self::predict::{Command, Mode, Predictor, Rest, Side};
+use self::predict::{Command, Mode, Predictor, Rest, Side, Want};
 use self::redraw::Event;
 use self::screen::Screen;
 use self::wire::{Arg, Inbox, Outbox};
@@ -432,11 +432,16 @@ if predict then
     end, keyns)
   end
   -- The keys something maps, or starts a mapping with, in the window's
-  -- buffer: looked up again a second after they last were.
+  -- buffer: looked up again a second after they last were. And where the
+  -- client is told what Neovim made of each key, how a key that moves the
+  -- cursor a line down or up is mapped, for the client to know its own
+  -- (see predict::Idiom): to what, whether as an expression, whether what
+  -- it maps to is mapped again, and whether no longer mapping starts with
+  -- it, which Neovim would wait to tell apart.
   local function mapped(buf)
     local m = maps[buf]
     if m and vim.uv.now() - m.at < 1000 then
-      return m.keys, m.ikeys
+      return m.keys, m.ikeys, m.idioms
     end
     local function look(list, modes)
       local out = {}
@@ -451,8 +456,22 @@ if predict then
       end
       return out
     end
-    maps[buf] = { at = vim.uv.now(), keys = look(keys, { 'n', 'x' }), ikeys = look(ikeys, { 'i' }) }
-    return maps[buf].keys, maps[buf].ikeys
+    local idioms = {}
+    for _, key in ipairs(acks and { 'j', 'k', '<Down>', '<Up>' } or {}) do
+      local map = vim.fn.maparg(key, 'n', false, true)
+      if next(map) ~= nil then
+        local longer = false
+        for _, list in ipairs({ api.nvim_get_keymap('n'), api.nvim_buf_get_keymap(buf, 'n') }) do
+          for _, x in ipairs(list) do
+            longer = longer or (#x.lhs > #map.lhs and x.lhs:sub(1, #map.lhs) == map.lhs)
+          end
+        end
+        idioms[#idioms + 1] = { key, map.rhs or '', map.expr == 1, map.noremap == 1, not longer }
+      end
+    end
+    maps[buf] = { at = vim.uv.now(), keys = look(keys, { 'n', 'x' }), ikeys = look(ikeys, { 'i' }),
+      idioms = idioms }
+    return maps[buf].keys, maps[buf].ikeys, maps[buf].idioms
   end
   local function shape(buf, info)
     local ok = not vim.wo.diff and vim.bo[buf].buftype ~= 'terminal'
@@ -468,7 +487,7 @@ if predict then
     if siso < 0 then
       siso = vim.go.sidescrolloff
     end
-    local nmaps, imaps = mapped(buf)
+    local nmaps, imaps, idioms = mapped(buf)
     -- 'listchars' but its tab, as predict::Listchars::read has them; and
     -- whether Neovim looks at every character of a line for highlighting of
     -- its own, and so at its blanks (see predict::Blanks).
@@ -490,14 +509,46 @@ if predict then
       tonumber(vim.o.mousescroll:match('hor:(%d+)')) or 6, lcs,
       vim.wo.linebreak or vim.wo.spell or vim.b[buf].current_syntax ~= nil }
     -- Where the client is told what Neovim made of each key, what decides
-    -- where a motion takes the cursor besides (see predict::Stepping).
+    -- where a motion takes the cursor besides, and what it moves with it
+    -- (see predict::Stepping): 'cursorlineopt' as one for the number, two
+    -- for the line and four for the screen line; and whether the window has
+    -- highlights of its own, or conceals what the cursor's line shows.
     if acks then
       local widths = vim.o.ambiwidth == 'double' or #vim.fn.getcellwidths() > 0
         or not vim.o.emoji
+      local o = {}
+      for _, k in ipairs(vim.split(vim.wo.cursorlineopt, ',')) do
+        o[k] = true
+      end
+      local cul = not vim.wo.cursorline and 0
+        or ((o.number or o.both) and 1 or 0) + ((o.line or o.both) and 2 or 0)
+          + (o.screenline and 4 or 0)
+      local got, ns = pcall(api.nvim_get_hl_ns, { winid = info.winid })
       vim.list_extend(s, { vim.o.whichwrap, vim.o.virtualedit, vim.wo.cursorcolumn,
-        vim.wo.scrollbind or vim.wo.cursorbind, vim.o.langmap ~= '', widths })
+        vim.wo.scrollbind or vim.wo.cursorbind, vim.o.langmap ~= '', widths, vim.wo.numberwidth,
+        vim.wo.signcolumn:find('number') ~= nil, cul, idioms,
+        vim.wo.winhighlight ~= '' or not got or ns > 0,
+        vim.wo.conceallevel > 0 and not vim.wo.concealcursor:find('n') })
     end
     return s
+  end
+  -- What of a window's options decides how the cursor's line is drawn — its
+  -- numbers, its bar, what is concealed — as they were when its shape was
+  -- last said, where the client is told what Neovim made of each key. Set
+  -- by an autocommand of another event, as configurations turn
+  -- 'relativenumber' and 'cursorline' off in Insert mode and on again out
+  -- of it, they fire no OptionSet; nor does a highlight namespace given the
+  -- window. So they are read again as Neovim goes to wait for a key, and
+  -- the shapes said again ahead of the ack where they changed.
+  local looked = {}
+  local function looks(win)
+    local out = { pcall(api.nvim_get_hl_ns, { winid = win }) }
+    for _, name in ipairs({ 'number', 'relativenumber', 'cursorline', 'cursorlineopt',
+        'numberwidth', 'signcolumn', 'foldcolumn', 'statuscolumn', 'winhighlight', 'conceallevel',
+        'concealcursor', 'wrap', 'list' }) do
+      out[#out + 1] = api.nvim_get_option_value(name, { win = win })
+    end
+    return table.concat(vim.tbl_map(tostring, out), ',')
   end
   -- No more of a line than could be shown, and a cell over for the client
   -- to see it would not fit: a minified file is a line a megabyte long.
@@ -830,6 +881,9 @@ if predict then
       lo, hi = around(2)
     end
     local s = shape(buf, info)
+    if acks then
+      looked[win] = looks(win)
+    end
     if s[10] and vim.wo.foldenable then
       for l = lo + 1, hi do
         if vim.fn.foldclosed(l) ~= -1 then
@@ -846,7 +900,7 @@ if predict then
       .. '\\0' .. table.concat(s[19], ' ') .. '\\0' .. table.concat(s[20], ' ')
       .. '\\0' .. table.concat({ s[21], s[22], s[23] }, ',')
       .. '\\0' .. table.concat(s[24], '\\0') .. '\\0' .. tostring(s[25])
-      .. '\\0' .. table.concat(vim.tbl_map(tostring, { unpack(s, 26) }), '\\0')
+      .. '\\0' .. vim.json.encode({ unpack(s, 26) })
     if shapes[win] ~= key then
       shapes[win] = key
       send('shape', win, s)
@@ -983,17 +1037,20 @@ if predict then
   -- they made sent first, so that the client's lines are the buffer's as of
   -- the b:changedtick this says (see predict::Predictor::fresh); and how wide
   -- Neovim lays the cursor's line out, what it draws between the characters
-  -- and all, short of a line longer than the client keeps. A second after,
-  -- the keys mapped are looked up afresh: one mapped since, by a plugin or
-  -- by hand, has the window's shape said again.
+  -- and all, short of a line longer than the client keeps — and so each line
+  -- in view that ends in blanks, among which blank virtual text shows
+  -- nothing of itself on the screen. A second after, the keys mapped are
+  -- looked up afresh: one mapped since, by a plugin or by hand, has the
+  -- window's shape said again.
   local wanted, said, recheck
   local function remapped()
     recheck = false
     local buf = api.nvim_get_current_buf()
     local m = maps[buf]
     maps[buf] = nil
-    local nmaps, imaps = mapped(buf)
-    if m and not (vim.deep_equal(m.keys, nmaps) and vim.deep_equal(m.ikeys, imaps)) then
+    local nmaps, imaps, idioms = mapped(buf)
+    if m and not (vim.deep_equal(m.keys, nmaps) and vim.deep_equal(m.ikeys, imaps)
+        and vim.deep_equal(m.idioms, idioms)) then
       soon()
     end
   end
@@ -1014,16 +1071,26 @@ if predict then
       recheck = true
       vim.defer_fn(remapped, 1000)
     end
+    if looked[win] and looked[win] ~= looks(win) then
+      push_all()
+    end
     flush()
     local buf = api.nvim_get_current_buf()
+    local cap = 4 * (view.leftcol + api.nvim_win_get_width(win)) + 64
     local len, width = vim.fn.col({ view.lnum, '$' }) - 1, -1
-    if len <= 4 * (view.leftcol + api.nvim_win_get_width(win)) + 64 then
+    if len <= cap then
       width = len > 0 and vim.fn.virtcol({ view.lnum, len }) or 0
+    end
+    local blanks = {}
+    for i, l in ipairs(api.nvim_buf_get_lines(buf, view.topline - 1, vim.fn.line('w$'), false)) do
+      if #l <= cap and l:find('%s$') then
+        blanks[#blanks + 1] = { view.topline + i - 2, vim.fn.virtcol({ view.topline + i - 1, #l }) }
+      end
     end
     local a = { taken, api.nvim_get_mode().mode, win, buf, api.nvim_buf_get_changedtick(buf),
       api.nvim_buf_line_count(buf), view.lnum - 1, view.col,
       view.curswant >= 2147483647 and -1 or view.curswant, view.topline - 1, view.leftcol,
-      width }
+      width, blanks }
     if said and vim.deep_equal(said, a) then
       return
     end
@@ -1056,13 +1123,14 @@ if predict then
   end)
   if acks then
     au('OptionSet', { pattern = { 'whichwrap', 'virtualedit', 'cursorcolumn', 'scrollbind',
-      'cursorbind', 'langmap', 'ambiwidth', 'emoji' } }, function()
+      'cursorbind', 'langmap', 'ambiwidth', 'emoji', 'cursorline', 'cursorlineopt',
+      'winhighlight', 'conceallevel', 'concealcursor' } }, function()
       soon()
     end)
   end
   au('WinClosed', {}, function(ev)
     local win = tonumber(ev.match)
-    have[win], shapes[win] = nil, nil
+    have[win], shapes[win], looked[win] = nil, nil, nil
   end)
   -- How far the client may scroll ahead, again, as the round trip moves:
   -- and where it is told what Neovim made of the keys, told it afresh.
@@ -1171,6 +1239,17 @@ fn drawable(
             |l| p.cut(win, l),
             shown,
         )
+}
+
+/// A row of a window's gutter, as [`App::gutters`] finds it: the row of
+/// the window's grid, the cells Neovim's frame has there, and those Neovim
+/// draws there with the cursor on another line — `None` where the client
+/// cannot say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Regutter {
+    row: usize,
+    drawn: Vec<Cell>,
+    now: Option<Vec<Cell>>,
 }
 
 /// What the client has asked and not been answered.
@@ -2950,32 +3029,42 @@ impl App {
     fn make(&mut self, grid: u64, command: Command, cause: Cause, now: Instant) -> bool {
         match command {
             Command::Side(side) => self.predict_side(grid, side, cause, now),
-            Command::Move { motion, count } => self.predict_move(grid, motion, count, cause, now),
+            Command::Move {
+                motion,
+                count,
+                screen,
+            } => self.predict_move(grid, (motion, count, screen), cause, now),
             _ => self.predict_scroll(grid, command, cause, now),
         }
     }
 
     /// A motion of the cursor in Normal mode Neovim will make in window grid
-    /// `grid`, `motion` counted `count`, of key `cause`: drawn at once, where
-    /// the client can say exactly where Neovim will put the cursor and draw
-    /// it (see [`anim::chain`]) — so far, along its line, in the view as it
-    /// is. Says whether it was.
+    /// `grid`, `motion` counted `count` — made by a key mapped to go a row
+    /// of the screen at a time if `screen` (see [`predict::Idiom`]) — of key
+    /// `cause`: drawn at once, where the client can say exactly where Neovim
+    /// will put the cursor and draw it (see [`anim::chain`]) — along its
+    /// line, or to another in the view as it is — and what else of the
+    /// window the cursor's line decides (see [`App::repaint`]). Says
+    /// whether it was.
     ///
     /// Only from what Neovim last said of the keys and those followed since
     /// ([`Predictor::known`]); in a window whose rows and lines are one to
     /// one, nothing else ahead of Neovim in it, and its options all such
     /// as the client follows ([`predict::Stepping::plain`]); over lines it
     /// has as the buffer has them now, steps over as Neovim does, and finds
-    /// Neovim drawing (see [`App::explained`]) and measuring (see
-    /// [`predict::Ack::width`]) as it would; and not in a
-    /// buffer proving itself, nor a window left to Neovim, nor at all once
-    /// the client has drawn too many wrong (see [`predict::Trust`]) — where
-    /// it is worked out, judged and not drawn.
+    /// Neovim drawing (see [`App::explained`]) and, the line Neovim's word
+    /// was said on, measuring (see [`predict::Ack::width`]) as it would; to
+    /// another line only where the gutter is Neovim's own, laid out as the
+    /// client lays it out (see [`App::regutters`]) in the editor's groups,
+    /// and no bar of `'cursorline'` moves with the cursor, over rows not
+    /// sliding by, from a line Neovim draws as it is once the cursor has
+    /// left it; and not in a buffer proving itself, nor a window left to
+    /// Neovim, nor at all once the client has drawn too many wrong (see
+    /// [`predict::Trust`]) — where it is worked out, judged and not drawn.
     fn predict_move(
         &mut self,
         grid: u64,
-        motion: moves::Motion,
-        count: Option<i64>,
+        (motion, count, screen): (moves::Motion, Option<i64>, bool),
         cause: Cause,
         now: Instant,
     ) -> bool {
@@ -3070,18 +3159,59 @@ impl App {
         let Some(to) = moves::moved(motion, count, &from, &cx) else {
             return false;
         };
-        let Some(line) = text(from.line) else {
+        let Some(line) = text(to.line) else {
             return false;
         };
-        // Laid out as Neovim lays it out, by its own measure of the line its
-        // word was said on and on its screen: what the screen shows may not
-        // show what is between the characters, if blank, and Neovim's
-        // measure counts it.
+        // A row of the screen at a time, on lines a row each, is a line at a
+        // time — but in a window that wraps, Neovim's `nv_screengo` lands
+        // the cursor otherwise where the column it wants is past the row's
+        // end, which it brings back into the row; or in the row's right
+        // half, on a tab over it short of the tab's end, where the cursor is
+        // drawn — on the character before the tab, rather.
+        let text_width = width.saturating_sub(shape.textoff);
+        if let (true, true, Want::Col(c)) = (screen, shape.wrap, from.want) {
+            let sits = moves::drawn(line, shape, to.byte);
+            if c >= text_width || (to.byte > 0 && sits > c && c > text_width / 2) {
+                return false;
+            }
+        }
+        // Laid out as Neovim lays them out, by its own drawing of them, the
+        // lines moved from and to and, where a move goes on past a line's
+        // end, every one it passes; and by its own measure, the line its
+        // word was said on and those in view that end in blanks: what the
+        // screen shows may not show what is between the characters, if
+        // blank, and Neovim's measure counts it.
+        let passed = matches!(motion, moves::Motion::Left(_) | moves::Motion::Right(_));
+        let laid_out = |l: i64| {
+            text(l).is_some_and(|t| {
+                let width = ack.width_of(l);
+                let measured = width == Some(predict::width(t, shape));
+                (measured || (width.is_none() && l != ack.pos.line))
+                    && self.explained(grid, l, t, measured) == Some(true)
+            })
+        };
+        let mut lines = from.line.min(to.line)..=from.line.max(to.line);
+        if to.left != from.left
+            || !(laid_out(from.line) && laid_out(to.line))
+            || (passed && !lines.all(laid_out))
+        {
+            return false;
+        }
+        // Another line: the cursor's line in a gutter drawn as Neovim's
+        // rules have it, and no bar across the line moved off and onto. Not
+        // where what the cursor's line decides is drawn in groups of the
+        // window's own, which the client has no word of; nor over rows
+        // sliding by (see [`anim::Animator::gliding`]), which what is drawn
+        // over them by row would not follow; nor where the line left may be
+        // drawn concealed once it is, which the client cannot draw.
+        let cul = stepping.cursorline;
+        let decided = shape.relativenumber || cul.number || cul.line;
         if to.line != from.line
-            || to.left != from.left
-            || from.line != ack.pos.line
-            || ack.width != Some(predict::width(line, shape))
-            || self.explained(grid, from.line, line) != Some(true)
+            && (cul.line
+                || cul.screenline
+                || stepping.conceals
+                || (decided && (stepping.own_highlights || self.anim.gliding(grid)))
+                || !self.regutters(grid, to.line))
         {
             return false;
         }
@@ -3119,6 +3249,103 @@ impl App {
         true
     }
 
+    /// Draw over each window the cursor has been moved ahead of Neovim in
+    /// (see [`anim::chain`]) what Neovim will draw of its rows besides the
+    /// cursor, once it hears of the keys: where the cursor is drawn on
+    /// another line than Neovim's, the gutter as Neovim draws it with the
+    /// cursor there (see [`predict::regutter`]), each row of it worked out
+    /// again from what Neovim's last frame drew — and a row the client
+    /// cannot say of, as that frame drew it. Before every frame: Neovim's
+    /// frames, the steps and the view all move what is to be drawn.
+    fn repaint(&mut self) {
+        for grid in self.anim.chained() {
+            let patches = self.patches_of(grid).unwrap_or_default();
+            self.anim.patch(grid, patches);
+        }
+    }
+
+    /// What [`App::repaint`] draws over window grid `grid`'s rows, by row of
+    /// its grid: `None` for nothing.
+    fn patches_of(&self, grid: u64) -> Option<BTreeMap<usize, Vec<compose::Patch>>> {
+        let to = self.anim.shown_step(&self.model, grid)?.pos.line;
+        let view = self.model.viewports.get(&grid)?;
+        let (_, _, left, _) = anim::text_rect(&self.model, grid)?;
+        if to == view.curline {
+            return None;
+        }
+        let patches = self
+            .gutters(grid, to)?
+            .into_iter()
+            .filter_map(|r| {
+                let cells = r.now.filter(|cells| *cells != r.drawn)?;
+                Some((r.row, vec![compose::Patch { col: left, cells }]))
+            })
+            .collect();
+        Some(patches)
+    }
+
+    /// Whether Neovim's gutter in window grid `grid`, as its frame has it,
+    /// can be drawn as Neovim will draw it with the cursor on line `to` (see
+    /// [`predict::regutter`]): a gutter of Neovim's own — not the
+    /// `'statuscolumn'`'s, which may draw anything the cursor's line
+    /// decides — and, where the cursor's line decides any of it, laid out
+    /// row for row as the client lays it out, with no sign drawn over a
+    /// number.
+    fn regutters(&self, grid: u64, to: i64) -> bool {
+        let shape = self
+            .model
+            .wins
+            .get(&grid)
+            .and_then(|win| self.predict.as_ref()?.shape(*win));
+        let Some((shape, stepping)) = shape.and_then(|s| Some((s, s.stepping.as_ref()?))) else {
+            return false;
+        };
+        if !shape.relativenumber && !stepping.cursorline.number {
+            return shape.plain_gutter;
+        }
+        shape.plain_gutter
+            && !stepping.number_signs
+            && self
+                .gutters(grid, to)
+                .is_some_and(|rows| rows.iter().all(|r| r.now.is_some()))
+    }
+
+    /// Each row of window grid `grid`'s gutter that shows a line, as Neovim's
+    /// frame has it, and as Neovim draws it with the cursor on line `to`
+    /// instead (see [`predict::regutter`]), by row of its grid: `None` for
+    /// one the client cannot say of. `None` for a window whose gutter the
+    /// client has no shape or groups for, or that the `'statuscolumn'`
+    /// draws.
+    fn gutters(&self, grid: u64, to: i64) -> Option<Vec<Regutter>> {
+        let (win, view) = (
+            self.model.wins.get(&grid)?,
+            self.model.viewports.get(&grid)?,
+        );
+        let shape = self.predict.as_ref()?.shape(*win)?;
+        let ids = predict::Gutter::of(|name| self.model.groups.get(name).copied())?;
+        let (top, bot, left, _) = anim::text_rect(&self.model, grid)?;
+        let g = self.model.grids.get(&grid)?;
+        if !shape.plain_gutter {
+            return None;
+        }
+        let h = bot - top;
+        let cursor = (view.curline, to);
+        let rows = (0..h)
+            .map(|r| (r, view.topline + r as i64))
+            .take_while(|&(_, lnum)| lnum < view.line_count)
+            .filter_map(|(r, lnum)| {
+                let drawn = g.row(top + r).get(left..left + shape.textoff)?;
+                let now = predict::regutter(drawn, lnum, cursor, shape, h as i64, &ids);
+                Some(Regutter {
+                    row: top + r,
+                    drawn: drawn.to_vec(),
+                    now,
+                })
+            })
+            .collect();
+        Some(rows)
+    }
+
     /// Whether Neovim draws line `line` of window grid `grid`, whose text the
     /// client has as `text`, as the client would: the cells of its text, from
     /// the gutter to the line's end or the window's, being those the client
@@ -3128,7 +3355,13 @@ impl App {
     /// concealed, a character taken for another width. `None` for a line
     /// not in view, or one too long for a window that wraps. The text alone
     /// is compared, so the colours it is laid out in are none in particular.
-    fn explained(&self, grid: u64, line: i64, text: &str) -> Option<bool> {
+    ///
+    /// Blank virtual text among blanks shows nothing of itself: where
+    /// Neovim's own measure of the line is not known to agree with the
+    /// client's (see [`predict::Ack::blanks`]) — not `measured` — a line
+    /// whose last cell the client draws blank is not taken as drawn as the
+    /// client would. One with nothing to draw is.
+    fn explained(&self, grid: u64, line: i64, text: &str, measured: bool) -> Option<bool> {
         let p = self.predict.as_ref()?;
         let win = *self.model.wins.get(&grid)?;
         let view = self.model.viewports.get(&grid)?;
@@ -3144,11 +3377,15 @@ impl App {
         let from = shape.textoff.min(width);
         let end = (shape.textoff + predict::reach(text, shape).saturating_sub(shape.leftcol))
             .clamp(from, width);
+        let blank = ours[from..end]
+            .last()
+            .is_some_and(|c| c.text == Text::Char(' '));
         Some(
-            ours[from..end]
-                .iter()
-                .zip(&theirs[from..end])
-                .all(|(a, b)| a.text == b.text),
+            (measured || !blank)
+                && ours[from..end]
+                    .iter()
+                    .zip(&theirs[from..end])
+                    .all(|(a, b)| a.text == b.text),
         )
     }
 
@@ -3596,7 +3833,10 @@ impl App {
     /// on the screen, and under a loss on the link it comes as much as a
     /// lost segment's time after — or at once, where there is nothing left
     /// for a frame to draw: not where the keys changed the buffer, which
-    /// the frame draws, whatever they did to the cursor. The newest wins.
+    /// the frame draws, whatever they did to the cursor; nor where the
+    /// client could not make out what one of the keys does (see
+    /// [`predict::Sent::lost`]), which may have changed what a window shows
+    /// and left its cursor and view as they were. The newest wins.
     fn heard_ack(&mut self, params: &[ValueRef<'_>], now: Instant) {
         let Some(ack) = predict::Ack::read(params) else {
             return;
@@ -3612,7 +3852,7 @@ impl App {
             .base
             .as_ref()
             .is_some_and(|b| (b.ack.buf, b.ack.tick) != (ack.buf, ack.tick));
-        let shown = !edited && self.shows(&ack);
+        let shown = !edited && p.made_out(k) && self.shows(&ack);
         self.ack = Some((k, ack));
         if shown {
             self.take_acks(now);
@@ -4165,6 +4405,7 @@ impl App {
             self.forget(&seqs);
         }
         self.anim.advance(now);
+        self.repaint();
         let (w, h) = self.size;
         self.cards.expire(now);
         // The frame shown, to put the rows that changed together over, where
@@ -7275,6 +7516,7 @@ mod tests {
         assert_eq!(shadow(&a), (1, 1, 0), "not the line Neovim went to");
         a.keys(b"x", t1);
         ack(&mut a, 5, "x", "n", (4, 1, 1, 0), t1);
+        redraw(&mut a, cursor_to(4, 1), t1);
         assert_eq!(shadow(&a), (1, 1, 1));
     }
 
@@ -7459,6 +7701,586 @@ mod tests {
         stepping_with(rtt, &[])
     }
 
+    /// The shape the agent says of [`stepping`]'s window where it says what
+    /// Neovim made of each key: its gutter `textoff` wide, `'number'` and
+    /// `'relativenumber'` as `numbers` says, and the window drawn by
+    /// `'statuscolumn'` where not `plain`; `'wrap'`; `'cursorline'` as
+    /// `cul` has it (see [`predict::Cursorline`]); and `mapped` among the
+    /// keys something maps, `idioms` how (see [`predict::Idiom`]).
+    fn shaped(
+        textoff: i64,
+        (number, relative, plain): (bool, bool, bool),
+        (wrap, cul): (bool, i64),
+        mapped: &[&str],
+        idioms: Vec<Value>,
+    ) -> Vec<Value> {
+        vec![
+            1.into(),
+            50.into(),
+            textoff.into(),
+            8.into(),
+            number.into(),
+            relative.into(),
+            plain.into(),
+            wrap.into(),
+            0.into(),
+            true.into(),
+            0.into(),
+            3.into(),
+            "~".into(),
+            false.into(),
+            "".into(),
+            2.into(),
+            0.into(),
+            false.into(),
+            Value::Array(mapped.iter().map(|k| Value::from(*k)).collect()),
+            Value::Array(vec![]),
+            0.into(),
+            1.into(),
+            6.into(),
+            Value::Array(vec![]),
+            false.into(),
+            "b,s".into(),
+            "".into(),
+            false.into(),
+            false.into(),
+            false.into(),
+            false.into(),
+            4.into(),
+            false.into(),
+            cul.into(),
+            Value::Array(idioms),
+        ]
+    }
+
+    /// The agent says window 1000's shape is `shape`.
+    fn reshape(a: &mut App, shape: Vec<Value>, now: Instant) {
+        let params = vec!["shape".into(), 1000.into(), Value::Array(shape)];
+        notify(a, "nvmux_client", params, now);
+    }
+
+    /// The groups Neovim draws a gutter in, as `hl_group_set` names them
+    /// for these tests.
+    const GUTTER: [(&str, u64); 8] = [
+        ("LineNr", 10),
+        ("LineNrAbove", 11),
+        ("LineNrBelow", 12),
+        ("CursorLineNr", 13),
+        ("SignColumn", 14),
+        ("CursorLineSign", 15),
+        ("FoldColumn", 16),
+        ("CursorLineFold", 17),
+    ];
+
+    /// What Neovim draws of [`numbered`]'s window with the cursor on line
+    /// `cursor` at byte `byte`: each row's number, `'number'` and
+    /// `'relativenumber'` both on, in the group its place takes — the
+    /// cursor's in `CursorLineNr` if `cul` — but for the rows `numhl` says,
+    /// in a sign's colours, 20; the rows' text after it; the cursor, and
+    /// the view.
+    fn numbers_drawn(
+        (cursor, byte): (i64, i64),
+        cul: bool,
+        numhl: &[i64],
+    ) -> Vec<(&'static str, Vec<Value>)> {
+        let n = Value::from;
+        let mut events = Vec::new();
+        for r in 0..5i64 {
+            let (number, hl) = match r.cmp(&cursor) {
+                std::cmp::Ordering::Equal => (format!("{:<3} ", r + 1), if cul { 13 } else { 10 }),
+                std::cmp::Ordering::Less => (format!("{:>3} ", cursor - r), 11),
+                std::cmp::Ordering::Greater => (format!("{:>3} ", r - cursor), 12),
+            };
+            let hl = if numhl.contains(&r) { 20 } else { hl };
+            events.push(line_hl(2, r as u64, 0, &number, hl));
+            events.push(line_hl(
+                2,
+                r as u64,
+                4,
+                &format!("{:16}", format!("line {r}")),
+                0,
+            ));
+        }
+        events.push(("grid_cursor_goto", vec![n(2), n(cursor), n(4 + byte)]));
+        events.push((
+            "win_viewport",
+            vec![n(2), n(1000), n(0), n(6), n(cursor), n(byte), n(50), n(0)],
+        ));
+        events
+    }
+
+    /// [`stepping`]'s window with `'number'` and `'relativenumber'` on, its
+    /// gutter four columns wide, `'cursorline'` as `cul` has it, and rows
+    /// `numhl` with a sign's number in its colours: as Neovim draws it with
+    /// the cursor on line 0, the groups named.
+    fn numbered(rtt: Duration, cul: i64, numhl: &[i64]) -> App {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(rtt);
+        reshape(
+            &mut a,
+            shaped(4, (true, true, true), (false, cul), &[], vec![]),
+            t1,
+        );
+        let mut events: Vec<(&str, Vec<Value>)> = GUTTER
+            .iter()
+            .map(|(name, id)| ("hl_group_set", vec![(*name).into(), (*id).into()]))
+            .collect();
+        events.extend(numbers_drawn((0, 0), cul & 1 != 0, numhl));
+        redraw(&mut a, events, t1);
+        a
+    }
+
+    /// The rows of the screen as the next frame puts them together, a row to
+    /// a line.
+    fn composed(a: &mut App) -> Vec<String> {
+        a.repaint();
+        let (cols, rows) = a.size();
+        let f = compose::compose(&a.model, &a.anim, cols, rows);
+        f.text().lines().map(|l| l.trim_end().to_string()).collect()
+    }
+
+    /// The groups the gutter is drawn over in on each row of grid 2, as the
+    /// cursor moved ahead of Neovim has it: none for a row drawn as Neovim
+    /// drew it.
+    fn repainted(a: &mut App) -> Vec<Option<Vec<u32>>> {
+        a.repaint();
+        let patches = a
+            .anim
+            .chain(2)
+            .map(|c| c.patches.clone())
+            .unwrap_or_default();
+        (0..5)
+            .map(|r| {
+                patches.get(&r).map(|p| {
+                    p.iter()
+                        .flat_map(|p| p.cells.iter().map(|c| c.hl))
+                        .collect()
+                })
+            })
+            .collect()
+    }
+
+    /// `j` over a slow link moves the cursor a line down at once, and with
+    /// it every number of `'relativenumber'`, the cursor's line's now the
+    /// line's own, aligned left: each in the group Neovim draws it in. Its
+    /// frame, when it comes with the agent's word that it made it so, is
+    /// the same; and so for the rest of the motions to another line.
+    #[test]
+    fn j_moves_the_cursor_at_once_and_renumbers_the_gutter() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = numbered(Duration::from_millis(200), 0, &[]);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (1, 4), "before Neovim has heard of it");
+        let rows = [
+            "  1 line 0",
+            "2   line 1",
+            "  1 line 2",
+            "  2 line 3",
+            "  3 line 4",
+        ];
+        assert_eq!(composed(&mut a)[..5], rows);
+        let groups = repainted(&mut a);
+        assert_eq!(
+            groups,
+            [
+                Some(vec![11; 4]),
+                Some(vec![10; 4]),
+                Some(vec![12; 4]),
+                Some(vec![12; 4]),
+                Some(vec![12; 4]),
+            ]
+        );
+        ack(&mut a, 1, "j", "n", (1, 0, 0, 0), t1);
+        redraw(&mut a, numbers_drawn((1, 0), false, &[]), t1);
+        assert!(a.anim.chain(2).is_none(), "let go of");
+        assert_eq!(composed(&mut a)[..5], rows, "as Neovim draws it");
+        // Each of the motions to another line.
+        for (keys, at, second) in [
+            (&b"3j"[..], (3, 4), "  2 line 1"),
+            (b"jjk", (1, 4), "2   line 1"),
+            (b"4j2k", (2, 4), "  1 line 1"),
+            (b"+", (1, 4), "2   line 1"),
+            (b"\r\r", (2, 4), "  1 line 1"),
+            (b"jj-", (1, 4), "2   line 1"),
+            (b"3_", (2, 4), "  1 line 1"),
+            (b"2$", (1, 9), "2   line 1"),
+            (b"$ ", (1, 4), "2   line 1"),
+            (b"j\x7f", (0, 9), "  1 line 1"),
+        ] {
+            let mut a = numbered(Duration::from_millis(200), 0, &[]);
+            a.keys(keys, t1);
+            let name = String::from_utf8_lossy(keys);
+            assert_eq!(drawn(&a), at, "{name:?}");
+            assert_eq!(composed(&mut a)[1], second, "{name:?}");
+        }
+    }
+
+    /// A number Neovim draws in a sign's colours, not its own group's, is
+    /// the sign's to keep: the number on its row moves on, in its colours.
+    /// Where `'cursorline'` numbers the cursor's line, Neovim lays them over
+    /// that line's own, which the client has no id for: a move onto such a
+    /// line, or off it, is left to Neovim.
+    #[test]
+    fn a_numhl_number_is_kept() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = numbered(Duration::from_millis(200), 0, &[3]);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (1, 4));
+        assert_eq!(composed(&mut a)[3], "  2 line 3");
+        assert_eq!(repainted(&mut a)[3], Some(vec![20; 4]), "its colours");
+        let mut a = numbered(Duration::from_millis(200), 1, &[3]);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (1, 4), "another line's");
+        let groups = repainted(&mut a);
+        assert_eq!(
+            (groups[0].clone(), groups[1].clone(), groups[3].clone()),
+            (Some(vec![11; 4]), Some(vec![13; 4]), Some(vec![20; 4]))
+        );
+        let mut a = numbered(Duration::from_millis(200), 1, &[1]);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (0, 4), "onto it");
+    }
+
+    /// A frame of Neovim's that draws a line the cursor was moved onto
+    /// otherwise — between its characters — lets go of the steps; one that
+    /// draws another line, or numbers the gutter afresh, as Neovim's frames
+    /// for the keys before the last do, leaves them drawn.
+    #[test]
+    fn a_frame_lets_go_of_the_steps_only_where_it_draws_a_line_gone_onto_otherwise() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = numbered(Duration::from_millis(200), 0, &[]);
+        a.keys(b"jj", t1);
+        assert_eq!(drawn(&a), (2, 4));
+        redraw(&mut a, numbers_drawn((1, 0), false, &[]), t1);
+        assert_eq!(drawn(&a), (2, 4), "Neovim's frame for the first, unsaid");
+        assert_eq!(
+            composed(&mut a)[..3],
+            ["  2 line 0", "  1 line 1", "3   line 2"]
+        );
+        redraw(&mut a, vec![line_at(2, 4, 4, "lime 4")], t1);
+        assert_eq!(drawn(&a), (2, 4), "another line");
+        redraw(&mut a, vec![line_at(2, 1, 4, "li: ne 1")], t1);
+        assert!(a.anim.chain(2).is_none(), "a line gone onto");
+        assert_eq!(drawn(&a), (1, 4), "where Neovim has it");
+        assert_eq!(
+            composed(&mut a)[..3],
+            ["  1 line 0", "2   li: ne 1", "  1 line 2"]
+        );
+    }
+
+    /// `'cursorline'` drawing a bar across the cursor's line, which the
+    /// cursor moved to another line would leave behind, leaves the motions
+    /// to another line to Neovim; those along it are drawn. So does a
+    /// `'statuscolumn'`, which may draw anything the cursor's line decides.
+    #[test]
+    fn cursorline_refuses_line_changing_moves() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        for cul in [2, 3, 4] {
+            let mut a = numbered(Duration::from_millis(200), cul, &[]);
+            a.keys(b"j", t1);
+            assert_eq!(drawn(&a), (0, 4), "'cursorlineopt' {cul}");
+            let mut a = numbered(Duration::from_millis(200), cul, &[]);
+            a.keys(b"l", t1);
+            assert_eq!(drawn(&a), (0, 5), "along the line, {cul}");
+        }
+        let mut a = numbered(Duration::from_millis(200), 0, &[]);
+        reshape(
+            &mut a,
+            shaped(4, (true, true, false), (false, 0), &[], vec![]),
+            t1,
+        );
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (0, 4), "'statuscolumn'");
+    }
+
+    /// A motion that would take the cursor out of the view, which Neovim
+    /// scrolls to keep it in, is left to Neovim; one to the view's last row
+    /// is drawn.
+    #[test]
+    fn a_motion_that_would_scroll_the_view_is_left_to_neovim() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        for (keys, at) in [
+            (&b"5j"[..], (0, 0)),
+            (b"4j", (4, 0)),
+            (b"4jj", (4, 0)),
+            (b"k", (0, 0)),
+            (b"40 ", (0, 0)),
+            (b"6$", (0, 0)),
+        ] {
+            let mut a = stepping(Duration::from_millis(200));
+            a.keys(keys, t1);
+            assert_eq!(drawn(&a), at, "{:?}", String::from_utf8_lossy(keys));
+        }
+    }
+
+    /// `j` and `k` mapped as LazyVim maps them — to `gj` and `gk` with no
+    /// count, which on lines a row each go where `j` and `k` go — are
+    /// followed as the keys themselves; a mapping anything else is not, nor
+    /// is `gj` where the column the cursor wants is past the row's end,
+    /// which `gj` brings back into it.
+    #[test]
+    fn jk_mapped_the_lazyvim_way_are_followed_as_the_keys() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let lazy = |rhs: &str| -> Vec<Value> {
+            vec![Value::Array(vec![
+                "j".into(),
+                rhs.into(),
+                true.into(),
+                true.into(),
+                true.into(),
+            ])]
+        };
+        for (rhs, wrap, keys, at) in [
+            ("v:count == 0 ? 'gj' : 'j'", false, &b"j"[..], (1, 0)),
+            ("v:count == 0 ? 'gj' : 'j'", true, b"j", (1, 0)),
+            ("v:count == 0 ? 'gj' : 'j'", false, b"3j", (3, 0)),
+            ("v:count == 0 ? 'gj' : 'j'", false, b"30|j", (1, 5)),
+            ("v:count == 0 ? 'gj' : 'j'", true, b"30|j", (0, 5)),
+            ("v:count == 0 ? 'gj' : 'j'", true, b"$j", (1, 5)),
+            ("v:count==0 ? 'gj' : 'j'", false, b"j", (0, 0)),
+            ("v:count == 0 ? 'gj' : 'k'", false, b"j", (0, 0)),
+        ] {
+            let mut a = stepping(Duration::from_millis(200));
+            reshape(
+                &mut a,
+                shaped(0, (false, false, true), (wrap, 0), &["j"], lazy(rhs)),
+                t1,
+            );
+            a.keys(keys, t1);
+            let name = String::from_utf8_lossy(keys);
+            assert_eq!(drawn(&a), at, "{rhs:?}, wrap {wrap}, {name:?}");
+        }
+    }
+
+    /// The agent's lines of [`stepping`]'s window are `text`, and `line N`
+    /// after them, and Neovim draws the first five as `drawn` has them.
+    fn lined(a: &mut App, text: &[&str], drawn: &[&str], now: Instant) {
+        let lines: Vec<Value> = text
+            .iter()
+            .map(|t| t.to_string())
+            .chain((text.len()..20).map(|n| format!("line {n}")))
+            .map(Value::from)
+            .collect();
+        let params: Vec<Value> = vec![
+            "lines".into(),
+            1000.into(),
+            1.into(),
+            1.into(),
+            0.into(),
+            Value::Array(lines),
+            true.into(),
+        ];
+        notify(a, "nvmux_client", params, now);
+        let rows = drawn
+            .iter()
+            .enumerate()
+            .map(|(r, t)| line(2, r as u64, &format!("{t:20}")))
+            .collect();
+        redraw(a, rows, now);
+    }
+
+    /// `j` mapped the LazyVim way, onto a tab over the column the cursor
+    /// wants in the right half of a row that wraps, short of the tab's end
+    /// where `j` itself puts the cursor: `gj` steps back off it, onto the
+    /// character before, as Neovim's `nv_screengo` has it — left to Neovim.
+    /// In the row's left half, or `j` unmapped, it goes where `j` goes.
+    #[test]
+    fn gj_onto_a_tab_in_the_right_half_of_a_row_is_left_to_neovim() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let lazy = vec![Value::Array(vec![
+            "j".into(),
+            "v:count == 0 ? 'gj' : 'j'".into(),
+            true.into(),
+            true.into(),
+            true.into(),
+        ])];
+        let text = ["xxxxxxxxxxxxxxx", "yyyyyyyyyyy\tz", "yy\tz"];
+        let drawn_rows = ["xxxxxxxxxxxxxxx", "yyyyyyyyyyy     z", "yy      z"];
+        for (idioms, keys, at) in [
+            (lazy.clone(), &b"14|j"[..], (0, 13)),
+            (vec![], b"14|j", (1, 15)),
+            (lazy.clone(), b"5|jj", (2, 7)),
+        ] {
+            let mut a = stepping(Duration::from_millis(200));
+            let mapped: &[&str] = if idioms.is_empty() { &[] } else { &["j"] };
+            reshape(
+                &mut a,
+                shaped(0, (false, false, true), (true, 0), mapped, idioms),
+                t1,
+            );
+            lined(&mut a, &text, &drawn_rows, t1);
+            ack0(&mut a, 0, "", 0, (1, 15), t1);
+            a.keys(keys, t1);
+            assert_eq!(drawn(&a), at, "{:?}", String::from_utf8_lossy(keys));
+        }
+    }
+
+    /// A key the client cannot make out — `zc`, closing a fold — may change
+    /// what the window shows and leave its cursor and view as they were:
+    /// Neovim's word on it waits for the frame that shows what it did, and
+    /// the motion typed behind it is made out over that, not over the rows
+    /// as they were.
+    #[test]
+    fn a_word_on_a_key_the_client_cannot_make_out_waits_for_its_frame() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"zcj", t1);
+        assert_eq!(drawn(&a), (0, 0), "blind after `zc`");
+        ack(&mut a, 2, "zc", "n", (0, 0, 0, 0), t1);
+        assert!(a.anim.chain(2).is_none(), "not over the rows as they were");
+        // Lines 0 to 3 folded into the first row.
+        let mut fold = vec![line(2, 0, "+--  4 lines: line 0")];
+        fold.extend((1..5).map(|r| line(2, r, &format!("line {:<15}", r + 3))));
+        fold.extend(cursor_to(0, 0));
+        redraw(&mut a, fold, t1);
+        assert!(a.anim.chain(2).is_none(), "nor over the fold");
+        assert_eq!(drawn(&a), (0, 0));
+    }
+
+    /// A line the client draws ending in blanks may have blank virtual text
+    /// among them that nothing on the screen shows: a motion onto it, or
+    /// along it, is drawn where Neovim's own measure of it — which the
+    /// agent sends of each such line in view, as of the cursor's — agrees
+    /// with the client's, and left to Neovim where it measures it wider, or
+    /// has not measured it.
+    #[test]
+    fn a_line_ending_in_blanks_is_drawn_onto_as_neovim_measures_it() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let text = ["abcdefgh", "x     ", "abcdefgh"];
+        let rows = ["abcdefgh", "x", "abcdefgh"];
+        for (blanks, keys, at) in [
+            (&[(1, 6)][..], &b"j"[..], (1, 0)),
+            (&[(1, 6)], b"jl", (1, 1)),
+            (&[(1, 9)], b"j", (0, 0)),
+            (&[(1, 9)], b"2jk", (2, 0)),
+            (&[], b"j", (0, 0)),
+            (&[], b"2j", (2, 0)),
+        ] {
+            let mut a = stepping(Duration::from_millis(200));
+            lined(&mut a, &text, &rows, t1);
+            let blanks: Vec<Value> = blanks
+                .iter()
+                .map(|&(l, w): &(i64, i64)| Value::Array(vec![l.into(), w.into()]))
+                .collect();
+            let params: Vec<Value> = vec![
+                "ack".into(),
+                0.into(),
+                "".into(),
+                "n".into(),
+                1000.into(),
+                1.into(),
+                1.into(),
+                50.into(),
+                0.into(),
+                0.into(),
+                0.into(),
+                0.into(),
+                0.into(),
+                8.into(),
+                Value::Array(blanks),
+            ];
+            notify(&mut a, "nvmux_client", params, t1);
+            a.keys(keys, t1);
+            assert_eq!(drawn(&a), at, "{:?}", String::from_utf8_lossy(keys));
+        }
+    }
+
+    /// What the cursor's line decides of a window drawn in highlights of
+    /// its own — `'winhighlight'`, or a namespace of the window's — is
+    /// drawn in groups the client has no word of: the motions to another
+    /// line there are left to Neovim where the line decides any of it, and
+    /// drawn where it decides none.
+    #[test]
+    fn a_window_with_highlights_of_its_own_leaves_line_changing_moves_to_neovim() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = numbered(Duration::from_millis(200), 0, &[]);
+        let mut own = shaped(4, (true, true, true), (false, 0), &[], vec![]);
+        own.extend([true.into(), false.into()]);
+        reshape(&mut a, own, t1);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (0, 4), "'relativenumber'");
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 4), "blind after it");
+        let mut a = stepping(Duration::from_millis(200));
+        let mut own = shaped(0, (false, false, true), (false, 0), &[], vec![]);
+        own.extend([true.into(), false.into()]);
+        reshape(&mut a, own, t1);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (1, 0), "nothing the line decides");
+    }
+
+    /// Text concealed off the cursor's line and shown on it: the line the
+    /// cursor leaves is drawn concealed once it has, which the client
+    /// cannot draw — the motions to another line are left to Neovim, those
+    /// along it drawn.
+    #[test]
+    fn concealed_text_leaves_line_changing_moves_to_neovim() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        let mut conceals = shaped(0, (false, false, true), (false, 0), &[], vec![]);
+        conceals.extend([false.into(), true.into()]);
+        reshape(&mut a, conceals, t1);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (0, 0));
+        let mut a = stepping(Duration::from_millis(200));
+        let mut conceals = shaped(0, (false, false, true), (false, 0), &[], vec![]);
+        conceals.extend([false.into(), true.into()]);
+        reshape(&mut a, conceals, t1);
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 1));
+    }
+
+    /// A motion to another line while the window's rows slide by, a scroll
+    /// of Neovim's gliding, is left to Neovim: what is drawn over the rows
+    /// by row — the gutter renumbered, the bar — would not slide with them.
+    /// Once they have landed, it is drawn.
+    #[test]
+    fn a_motion_to_another_line_waits_for_the_rows_sliding_by_to_land() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        for (wait, onto) in [(Duration::ZERO, None), (Duration::from_secs(1), Some(3))] {
+            let mut a = numbered(Duration::from_millis(200), 0, &[]);
+            a.anim.set_effects(Effects {
+                scroll: Some((0.1, 100)),
+                ..Effects::none()
+            });
+            a.frame(t1);
+            // Neovim scrolls two lines, the cursor on the first in view.
+            let up = (
+                "grid_scroll",
+                vec![2, 0, 5, 0, 20, 2, 0]
+                    .into_iter()
+                    .map(Value::from)
+                    .collect(),
+            );
+            let mut events = vec![up];
+            for r in 0..5u64 {
+                let (number, hl) = if r == 0 {
+                    ("3   ".to_string(), 10)
+                } else {
+                    (format!("{r:>3} "), 12)
+                };
+                events.push(line_hl(2, r, 0, &number, hl));
+            }
+            for r in 3..5u64 {
+                events.push(line_hl(
+                    2,
+                    r,
+                    4,
+                    &format!("{:16}", format!("line {}", r + 2)),
+                    0,
+                ));
+            }
+            events.push(("grid_cursor_goto", vec![2.into(), 0.into(), 4.into()]));
+            events.push(at(2, 2, 2));
+            redraw(&mut a, events, t1);
+            ack(&mut a, 0, "", "n", (2, 0, 0, 2), t1);
+            a.frame(t1 + wait);
+            a.keys(b"j", t1 + wait);
+            let line = a.anim.chain(2).and_then(|c| c.head()).map(|s| s.pos.line);
+            assert_eq!(line, onto, "after {wait:?}");
+        }
+    }
+
     /// Where the client draws the cursor, in its window's grid: grid 2 is
     /// at the top left of the screen.
     fn drawn(a: &App) -> (i64, i64) {
@@ -7532,18 +8354,18 @@ mod tests {
     fn a_key_the_client_cannot_follow_is_caught_up_with_at_its_ack() {
         let t1 = Instant::now() + Duration::from_secs(1);
         let mut a = stepping(Duration::from_millis(200));
-        a.keys(b"ljll", t1);
-        assert_eq!(drawn(&a), (0, 1), "blind after `j`");
+        a.keys(b"lwhh", t1);
+        assert_eq!(drawn(&a), (0, 1), "blind after `w`");
         ack(&mut a, 1, "l", "n", (0, 1, 1, 0), t1);
         redraw(&mut a, cursor_to(0, 1), t1);
         assert_eq!(drawn(&a), (0, 1));
-        ack(&mut a, 2, "lj", "n", (1, 1, 1, 0), t1);
-        redraw(&mut a, cursor_to(1, 1), t1);
-        assert_eq!(drawn(&a), (1, 3), "the two after it at once");
-        ack(&mut a, 4, "ljll", "n", (1, 3, 3, 0), t1);
-        redraw(&mut a, cursor_to(1, 3), t1);
+        ack(&mut a, 2, "lw", "n", (0, 5, 5, 0), t1);
+        redraw(&mut a, cursor_to(0, 5), t1);
+        assert_eq!(drawn(&a), (0, 3), "the two after it at once");
+        ack(&mut a, 4, "lwhh", "n", (0, 3, 3, 0), t1);
+        redraw(&mut a, cursor_to(0, 3), t1);
         assert!(a.anim.chain(2).is_none());
-        assert_eq!(drawn(&a), (1, 3));
+        assert_eq!(drawn(&a), (0, 3));
     }
 
     /// A motion Neovim made otherwise sends the cursor to where Neovim has

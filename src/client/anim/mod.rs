@@ -29,7 +29,7 @@ pub mod spring;
 pub mod switch;
 pub mod vfx;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use self::blink::Blink;
@@ -42,8 +42,8 @@ use self::side::Side;
 use self::smear::{Rect, Smear};
 use self::switch::Switch;
 use self::vfx::Vfx;
-use super::compose::{Frame, Scrolling, View};
-use super::grid::{Cell, Grid, Text};
+use super::compose::{Frame, Patch, Scrolling, View};
+use super::grid::{Cell, Grid};
 use super::model::{Changes, Held, Margins, Model, Place};
 use super::redraw::{Event, ModeInfo, Shape};
 use super::screen::Cursor;
@@ -551,7 +551,9 @@ impl Animator {
                     || model.layout.get(grid).is_none_or(|p| p.hidden)
                     || model.viewports.get(grid).map(|v| v.line_count)
                         != chain.head().map(|s| s.line_count)
-                    || line_drawn(model, **grid, chain.line) != chain.drawn
+                    || chain.lines.iter().any(|(line, drawn)| {
+                        line_drawn(model, **grid, *line, chain.textoff) != *drawn
+                    })
             })
             .map(|(grid, _)| *grid)
             .collect();
@@ -687,9 +689,10 @@ impl Animator {
     /// Move the cursor in window grid `grid` ahead of Neovim as `step` says:
     /// see [`chain`]. The first step in it, in window `win` of a gutter
     /// `textoff` wide shown by Neovim from display column `left`, starts a
-    /// chain worked out with those, and with its line as the window shows
-    /// it now; the rest go on from it. The cursor travels to it, if
-    /// `travel`, as to where Neovim puts it; or is put there.
+    /// chain worked out with those; the rest go on from it. Each notes its
+    /// line as the window shows it now, if it is the first onto it. The
+    /// cursor travels to it, if `travel`, as to where Neovim puts it; or is
+    /// put there.
     pub fn step(
         &mut self,
         model: &Model,
@@ -699,11 +702,31 @@ impl Animator {
         now: Instant,
     ) {
         let line = step.pos.line;
+        let drawn = || line_drawn(model, grid, line, shown.1);
         self.chains
             .entry(grid)
-            .or_insert_with(|| Chain::new(shown, line, line_drawn(model, grid, line)))
+            .and_modify(|c| c.onto(line, drawn))
+            .or_insert_with(|| Chain::new(shown, line, drawn()))
             .push(step);
         self.cursor_moved(model, travel, now);
+    }
+
+    /// Draw `patches` over window grid `grid`'s rows, by row of its grid, for
+    /// as long as the cursor moved ahead of Neovim in it stays where it is
+    /// drawn (see [`Chain::patches`]): none, where it has not been.
+    pub fn patch(&mut self, grid: u64, patches: BTreeMap<usize, Vec<Patch>>) {
+        if let Some(chain) = self.chains.get_mut(&grid) {
+            chain.patches = patches;
+        }
+    }
+
+    /// The step drawn in window grid `grid`, the cursor moved ahead of Neovim
+    /// in it (see [`chain`]): the newest whose view is the screen's.
+    pub fn shown_step(&self, model: &Model, grid: u64) -> Option<&Step> {
+        let chain = self.chains.get(&grid)?;
+        let v = model.viewports.get(&grid)?;
+        let shown = v.topline + self.scrolls.get(&grid).map_or(0, Scroll::shown_ahead);
+        chain.shown(shown, chain.left)
     }
 
     /// The cursor moved ahead of Neovim in window grid `grid`, if it is.
@@ -849,6 +872,13 @@ impl Animator {
         self.scrolls.get(&grid).and_then(Scroll::col)
     }
 
+    /// Whether window grid `grid`'s view is sliding from where it was to
+    /// where it is (see [`Scroll`]): its rows show other lines than its
+    /// grid's meanwhile.
+    pub fn gliding(&self, grid: u64) -> bool {
+        self.scrolls.get(&grid).is_some_and(Scroll::moving)
+    }
+
     /// Whether window grid `grid` has been scrolled up or down ahead of
     /// Neovim, drawn or not.
     pub fn scrolled_ahead(&self, grid: u64) -> bool {
@@ -988,7 +1018,7 @@ impl Animator {
         let v = model.viewports.get(&grid)?;
         let (top, bot, _, right) = text_rect(model, grid)?;
         let shown = v.topline + self.scrolls.get(&grid).map_or(0, Scroll::shown_ahead);
-        let s = chain.shown(shown, chain.left)?;
+        let s = self.shown_step(model, grid)?;
         let row = s.pos.line - shown;
         let col = (chain.textoff + s.vcol).checked_sub(s.pos.left)?;
         ((0..(bot - top) as i64).contains(&row) && col < right)
@@ -1015,7 +1045,11 @@ impl Animator {
     /// rows that changed needs of itself and of the frame before it (see
     /// `crate::client::App::frame`).
     pub fn still(&self) -> bool {
-        !self.moving() && self.scrolls.is_empty() && self.sides.is_empty() && !self.paints_over()
+        !self.moving()
+            && self.scrolls.is_empty()
+            && self.sides.is_empty()
+            && self.chains.values().all(|c| c.patches.is_empty())
+            && !self.paints_over()
     }
 
     /// Whether the cursor is one this blinks: a block `'guicursor'` makes
@@ -1205,6 +1239,13 @@ impl View for Animator {
         self.shift_of(grid)
     }
 
+    fn patches(&self, grid: u64, r: usize) -> &[Patch] {
+        self.chains
+            .get(&grid)
+            .and_then(|c| c.patches.get(&r))
+            .map_or(&[], Vec::as_slice)
+    }
+
     fn over_windows(&self, frame: &mut Frame, model: &Model) {
         let cursor = self.cursor_at(model);
         if let Some(t) = &self.transition {
@@ -1216,17 +1257,17 @@ impl View for Animator {
     }
 }
 
-/// What window grid `grid` shows of buffer line `line` that a motion along
+/// What window grid `grid` shows of buffer line `line` that a motion onto
 /// it leaves as it is (see [`chain`]): the line its view is from, and the
-/// text of the row the line is on — `None` where it is not in view, or the
-/// window not one to one.
-fn line_drawn(model: &Model, grid: u64, line: i64) -> Option<(i64, Vec<Text>)> {
+/// text of the row the line is on past the gutter, `textoff` wide — `None`
+/// where it is not in view, or the window not one to one.
+fn line_drawn(model: &Model, grid: u64, line: i64, textoff: usize) -> chain::Drawn {
     let (g, v) = (model.grids.get(&grid)?, model.viewports.get(&grid)?);
     let (top, bot, left, right) = text_rect(model, grid)?;
     let row = usize::try_from(line - v.topline)
         .ok()
         .filter(|r| *r < bot - top && v.one_to_one(bot - top))?;
-    let text = g.row(top + row).get(left..right)?;
+    let text = g.row(top + row).get((left + textoff).min(right)..right)?;
     Some((v.topline, text.iter().map(|c| c.text.clone()).collect()))
 }
 

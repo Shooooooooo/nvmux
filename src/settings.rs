@@ -363,7 +363,7 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
             "client",
             "predict_keys",
             Tab::Client,
-            "experimental: motions show the cursor moved along a line before Neovim too",
+            "experimental: motions show the cursor moved in view before Neovim too",
             Kind::Choice {
                 options: &["scrolls", "motions", "typing"],
                 get: |s| s.client.predict_keys.name(),

@@ -1,15 +1,16 @@
 //! The cursor moved ahead of Neovim: see `crate::client::predict`.
 //!
-//! A key that moves the cursor along its line in Normal mode — `l`, `$`,
-//! `^` and their kind — moves it on the screen at once, before Neovim has
-//! heard of it, where the client can work out exactly where Neovim will
-//! put it (see `crate::client::moves`). What the client keeps of each such
-//! key is where it leaves the cursor in the buffer's terms — its line, its
-//! byte, the column it wants, the view — and not a cell of the screen: a
-//! view moved under it, ahead of Neovim or by Neovim, and a frame Neovim
-//! draws part way through the keys typed, would leave a cell wrong, and
-//! every key after it with it. The cursor is drawn where the newest of them
-//! the screen's view agrees with puts it.
+//! A key that moves the cursor in Normal mode — along its line, `l`, `$`,
+//! `^` and their kind, or to another in view, `j`, `+` and theirs — moves
+//! it on the screen at once, before Neovim has heard of it, where the
+//! client can work out exactly where Neovim will put it (see
+//! `crate::client::moves`). What the client keeps of each such key is where
+//! it leaves the cursor in the buffer's terms — its line, its byte, the
+//! column it wants, the view — and not a cell of the screen: a view moved
+//! under it, ahead of Neovim or by Neovim, and a frame Neovim draws part
+//! way through the keys typed, would leave a cell wrong, and every key
+//! after it with it. The cursor is drawn where the newest of them the
+//! screen's view agrees with puts it.
 //!
 //! Neovim has the last word on each: the agent says where each key it has
 //! taken left the cursor, and the client judges what it worked out against
@@ -19,20 +20,29 @@
 //! itself again, is never drawn, nor any after it (see
 //! `crate::client::predict::Trust`).
 //!
-//! A motion along a line changes nothing of what the window shows but the
-//! cursor. So a frame of Neovim's that moves the view, or changes the text
-//! of the row the line is drawn on — an edit the client has yet to hear of,
-//! virtual text put between its characters — is one the steps were not
-//! worked out over: the cursor drawn on a step in it could be a sight
-//! Neovim never drew, and they are all let go of. What it draws on the
-//! other rows — a plugin's virtual text, its signs, a diagnostic — leaves
-//! them as they are.
+//! A motion changes nothing of what the window shows but the cursor, and
+//! what the cursor's line decides — the numbers of `'relativenumber'`, the
+//! groups `'cursorline'` draws that line's gutter in — which is drawn over
+//! Neovim's rows for as long as the cursor is drawn on another line than
+//! Neovim's ([`Chain::patches`]). So a frame of Neovim's that moves the
+//! view, or changes the text of a row a line the steps go onto is drawn on
+//! — an edit the client has yet to hear of, virtual text put between its
+//! characters — is one the steps were not worked out over: the cursor drawn
+//! on a step in it could be a sight Neovim never drew, and they are all let
+//! go of. What it draws on the other rows — a plugin's virtual text, its
+//! signs, a diagnostic — and in any row's gutter leaves them as they are.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
+use crate::client::compose::Patch;
 use crate::client::grid::Text;
 use crate::client::predict::Pos;
+
+/// What Neovim had drawn of a line a step goes onto (see [`Chain::lines`]):
+/// the view's first line, and the text of the row the line was on, from
+/// the gutter on — `None` where it was not in view.
+pub type Drawn = Option<(i64, Vec<Text>)>;
 
 /// How many keys the cursor may be moved ahead of Neovim in a window: more,
 /// and Neovim is not keeping up, or not saying so.
@@ -49,11 +59,14 @@ pub struct Chain {
     pub win: i64,
     pub textoff: usize,
     pub left: usize,
-    /// The line the steps move the cursor along, and what Neovim had drawn
-    /// of it when the first was worked out: the view's first line, and the
-    /// text of the row the line was on.
-    pub line: i64,
-    pub drawn: Option<(i64, Vec<Text>)>,
+    /// The lines the steps move the cursor to, and what Neovim had drawn of
+    /// each when the first step onto it was worked out.
+    pub lines: Vec<(i64, Drawn)>,
+    /// What is drawn over the window's rows besides the cursor, by row of
+    /// its grid, while the cursor is drawn on another line than Neovim's:
+    /// what the cursor's line decides of them (see
+    /// `crate::client::App::repaint`).
+    pub patches: BTreeMap<usize, Vec<Patch>>,
     steps: VecDeque<Step>,
 }
 
@@ -81,23 +94,30 @@ pub struct Step {
 }
 
 impl Chain {
-    pub fn new(
-        (win, textoff, left): (i64, usize, usize),
-        line: i64,
-        drawn: Option<(i64, Vec<Text>)>,
-    ) -> Self {
+    /// A chain worked out in window `win`, of a gutter `textoff` wide shown
+    /// by Neovim from display column `left`, its first step onto `line`,
+    /// which Neovim draws as `drawn` says.
+    pub fn new((win, textoff, left): (i64, usize, usize), line: i64, drawn: Drawn) -> Self {
         Self {
             win,
             textoff,
             left,
-            line,
-            drawn,
+            lines: vec![(line, drawn)],
+            patches: BTreeMap::new(),
             steps: VecDeque::new(),
         }
     }
 
     pub fn push(&mut self, step: Step) {
         self.steps.push_back(step);
+    }
+
+    /// A step goes onto line `line`: as Neovim draws it now (`drawn`), if
+    /// it is the first to (see [`Chain::lines`]).
+    pub fn onto(&mut self, line: i64, drawn: impl FnOnce() -> Drawn) {
+        if !self.lines.iter().any(|(l, _)| *l == line) {
+            self.lines.push((line, drawn()));
+        }
     }
 
     pub fn len(&self) -> usize {
