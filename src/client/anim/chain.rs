@@ -22,15 +22,16 @@
 //!
 //! A motion changes nothing of what the window shows but the cursor, and
 //! what the cursor's line decides — the numbers of `'relativenumber'`, the
-//! groups `'cursorline'` draws that line's gutter in — which is drawn over
-//! Neovim's rows for as long as the cursor is drawn on another line than
-//! Neovim's ([`Chain::patches`]). So a frame of Neovim's that moves the
-//! view, or changes the text of a row a line the steps go onto is drawn on
-//! — an edit the client has yet to hear of, virtual text put between its
-//! characters — is one the steps were not worked out over: the cursor drawn
-//! on a step in it could be a sight Neovim never drew, and they are all let
-//! go of. What it draws on the other rows — a plugin's virtual text, its
-//! signs, a diagnostic — and in any row's gutter leaves them as they are.
+//! groups `'cursorline'` draws that line's gutter in, its bar across the
+//! line — which is drawn over Neovim's rows for as long as the cursor is
+//! drawn on another line than Neovim's ([`Chain::patches`]). So a frame of
+//! Neovim's that moves the view, or changes the text of a row a line the
+//! steps go onto is drawn on — an edit the client has yet to hear of,
+//! virtual text put between its characters — is one the steps were not
+//! worked out over: the cursor drawn on a step in it could be a sight
+//! Neovim never drew, and they are all let go of. What it draws on the
+//! other rows — a plugin's virtual text, its signs, a diagnostic — and in
+//! any row's gutter leaves them as they are.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;

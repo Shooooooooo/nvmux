@@ -259,12 +259,12 @@ pub struct ClientSettings {
     /// motions along a line — `h`, `l`, `0`, `^`, `$`, `g_`, `|` and their
     /// kind — and to another line in view — `j`, `k`, `+`, `-`, `_`,
     /// `<CR>` and theirs, and `j` and `k` mapped as LazyVim maps them — are
-    /// drawn, with counts, and with them the numbers of `'relativenumber'`;
-    /// but not those to another line in a window whose gutter a
-    /// `'statuscolumn'` draws, as LazyVim's is, which are left to Neovim.
-    /// The client follows the rest by what Neovim says of each key rather
-    /// than waiting for it to catch up with them all; `"typing"` draws no
-    /// more than that yet.
+    /// drawn, with counts, and with them the numbers of `'relativenumber'`
+    /// and the bar of `'cursorline'`; but not those to another line in a
+    /// window whose gutter a `'statuscolumn'` draws, as LazyVim's is, which
+    /// are left to Neovim. The client follows the rest by what Neovim says
+    /// of each key rather than waiting for it to catch up with them all;
+    /// `"typing"` draws no more than that yet.
     ///
     /// What it costs: the agent says where each key left the cursor, about
     /// 40 bytes a key back over the link, and each fence the client asks

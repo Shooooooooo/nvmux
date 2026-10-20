@@ -132,11 +132,12 @@
 //! made otherwise goes back to Neovim's at once, and what it was made in
 //! proves itself before the client draws it again ([`Trust`]; see
 //! `super::anim::chain`). A motion to another line takes with it what the
-//! cursor's line decides of the gutter — the numbers of
-//! `'relativenumber'`, the groups of `'cursorline'`'s line — which the
-//! client draws as Neovim will ([`regutter`]); what it cannot draw so, it
-//! leaves to Neovim. And it counts how each motion followed, drawn or not,
-//! came out, for the log ([`Shadow`]).
+//! cursor's line decides of the window — the numbers of
+//! `'relativenumber'`, the groups `'cursorline'` draws the line's gutter
+//! in ([`regutter`]), and its bar across the line (see
+//! `super::model::Derive`) — which the client draws as Neovim will; what
+//! it cannot draw so, it leaves to Neovim. And it counts how each motion
+//! followed, drawn or not, came out, for the log ([`Shadow`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};

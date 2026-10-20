@@ -3056,11 +3056,13 @@ impl App {
     /// was said on, measuring (see [`predict::Ack::width`]) as it would; to
     /// another line only where the gutter is Neovim's own, laid out as the
     /// client lays it out (see [`App::regutters`]) in the editor's groups,
-    /// and no bar of `'cursorline'` moves with the cursor, over rows not
-    /// sliding by, from a line Neovim draws as it is once the cursor has
-    /// left it; and not in a buffer proving itself, nor a window left to
-    /// Neovim, nor at all once the client has drawn too many wrong (see
-    /// [`predict::Trust`]) — where it is worked out, judged and not drawn.
+    /// and a bar of `'cursorline'` across the cursor's line one the client
+    /// can take off one line and lay under another as Neovim does (see
+    /// [`model::Model::bar_derivable`]), over rows not sliding by, from a
+    /// line Neovim draws as it is once the cursor has left it; and not in a
+    /// buffer proving itself, nor a window left to Neovim, nor at all once
+    /// the client has drawn too many wrong (see [`predict::Trust`]) — where
+    /// it is worked out, judged and not drawn.
     fn predict_move(
         &mut self,
         grid: u64,
@@ -3198,19 +3200,22 @@ impl App {
             return false;
         }
         // Another line: the cursor's line in a gutter drawn as Neovim's
-        // rules have it, and no bar across the line moved off and onto. Not
-        // where what the cursor's line decides is drawn in groups of the
-        // window's own, which the client has no word of; nor over rows
-        // sliding by (see [`anim::Animator::gliding`]), which what is drawn
-        // over them by row would not follow; nor where the line left may be
-        // drawn concealed once it is, which the client cannot draw.
+        // rules have it, and a bar across the line moved off and onto that
+        // the client can lay and take off as Neovim does — across the line,
+        // not `screenline`'s across the cursor's row of it, which is not
+        // followed. Not where what the cursor's line decides is drawn in
+        // groups of the window's own, which the client has no word of; nor
+        // over rows sliding by (see [`anim::Animator::gliding`]), which what
+        // is drawn over them by row would not follow; nor where the line
+        // left may be drawn concealed once it is, which the client cannot
+        // draw.
         let cul = stepping.cursorline;
         let decided = shape.relativenumber || cul.number || cul.line;
         if to.line != from.line
-            && (cul.line
-                || cul.screenline
+            && (cul.screenline
                 || stepping.conceals
                 || (decided && (stepping.own_highlights || self.anim.gliding(grid)))
+                || (cul.line && !self.model.bar_derivable())
                 || !self.regutters(grid, to.line))
         {
             return false;
@@ -3253,10 +3258,11 @@ impl App {
     /// (see [`anim::chain`]) what Neovim will draw of its rows besides the
     /// cursor, once it hears of the keys: where the cursor is drawn on
     /// another line than Neovim's, the gutter as Neovim draws it with the
-    /// cursor there (see [`predict::regutter`]), each row of it worked out
-    /// again from what Neovim's last frame drew — and a row the client
-    /// cannot say of, as that frame drew it. Before every frame: Neovim's
-    /// frames, the steps and the view all move what is to be drawn.
+    /// cursor there (see [`predict::regutter`]), and the bar of
+    /// `'cursorline'` moved with it, each row worked out again from what
+    /// Neovim's last frame drew — and a row the client cannot say of, as
+    /// that frame drew it. Before every frame: Neovim's frames, the steps
+    /// and the view all move what is to be drawn.
     fn repaint(&mut self) {
         for grid in self.anim.chained() {
             let patches = self.patches_of(grid).unwrap_or_default();
@@ -3266,21 +3272,73 @@ impl App {
 
     /// What [`App::repaint`] draws over window grid `grid`'s rows, by row of
     /// its grid: `None` for nothing.
-    fn patches_of(&self, grid: u64) -> Option<BTreeMap<usize, Vec<compose::Patch>>> {
+    ///
+    /// The gutter of each row the cursor's line decides any of; and where
+    /// `'cursorline'` draws a bar across the cursor's line, the text of the
+    /// rows of the line the cursor leaves and of the one it goes to, as
+    /// Neovim drew them, the bar taken off the one and laid under the
+    /// other (see [`model::Derive`]) — a row whose highlights can no longer
+    /// be made so left as Neovim drew it.
+    fn patches_of(&mut self, grid: u64) -> Option<BTreeMap<usize, Vec<compose::Patch>>> {
         let to = self.anim.shown_step(&self.model, grid)?.pos.line;
-        let view = self.model.viewports.get(&grid)?;
-        let (_, _, left, _) = anim::text_rect(&self.model, grid)?;
+        let view = *self.model.viewports.get(&grid)?;
+        let (top, bot, left, right) = anim::text_rect(&self.model, grid)?;
         if to == view.curline {
             return None;
         }
-        let patches = self
-            .gutters(grid, to)?
+        let mut patches: BTreeMap<usize, Vec<compose::Patch>> = self
+            .gutters(grid, to)
+            .unwrap_or_default()
             .into_iter()
             .filter_map(|r| {
                 let cells = r.now.filter(|cells| *cells != r.drawn)?;
                 Some((r.row, vec![compose::Patch { col: left, cells }]))
             })
             .collect();
+        let shape = self
+            .model
+            .wins
+            .get(&grid)
+            .and_then(|win| self.predict.as_ref()?.shape(*win));
+        let bar = shape.and_then(|s| {
+            let c = s.stepping.as_ref()?.cursorline;
+            (c.line && !c.screenline).then_some(s.textoff)
+        });
+        let Some(textoff) = bar else {
+            return Some(patches);
+        };
+        let rows = [
+            (view.curline, model::Derive::CursorLineOff),
+            (to, model::Derive::CursorLineOn),
+        ];
+        let text = (left + textoff).min(right);
+        for (line, d) in rows {
+            let Some(row) = usize::try_from(line - view.topline)
+                .ok()
+                .filter(|r| *r < bot - top)
+                .map(|r| top + r)
+            else {
+                continue;
+            };
+            let grid_row = self.model.grids.get(&grid).map(|g| g.row(row));
+            let Some(drawn) = grid_row
+                .and_then(|r| r.get(text..right))
+                .map(<[Cell]>::to_vec)
+            else {
+                continue;
+            };
+            let made: Option<Vec<Cell>> = drawn
+                .into_iter()
+                .map(|cell| {
+                    let hl = self.model.derived(cell.hl, d)?;
+                    Some(Cell { hl, ..cell })
+                })
+                .collect();
+            if let Some(cells) = made {
+                let patch = compose::Patch { col: text, cells };
+                patches.entry(row).or_default().push(patch);
+            }
+        }
         Some(patches)
     }
 
@@ -7833,10 +7891,15 @@ mod tests {
     /// The rows of the screen as the next frame puts them together, a row to
     /// a line.
     fn composed(a: &mut App) -> Vec<String> {
+        let f = composed_frame(a);
+        f.text().lines().map(|l| l.trim_end().to_string()).collect()
+    }
+
+    /// The frame the next frame puts together.
+    fn composed_frame(a: &mut App) -> compose::Frame {
         a.repaint();
         let (cols, rows) = a.size();
-        let f = compose::compose(&a.model, &a.anim, cols, rows);
-        f.text().lines().map(|l| l.trim_end().to_string()).collect()
+        compose::compose(&a.model, &a.anim, cols, rows)
     }
 
     /// The groups the gutter is drawn over in on each row of grid 2, as the
@@ -7968,21 +8031,105 @@ mod tests {
         );
     }
 
-    /// `'cursorline'` drawing a bar across the cursor's line, which the
-    /// cursor moved to another line would leave behind, leaves the motions
-    /// to another line to Neovim; those along it are drawn. So does a
-    /// `'statuscolumn'`, which may draw anything the cursor's line decides.
+    /// `CursorLine` as these tests have Neovim define it, its id `id`: a
+    /// background alone, or with a colour in front as well.
+    fn bar_defined(id: u64, front: bool) -> Vec<(&'static str, Vec<Value>)> {
+        let mut rgb = vec![("background".into(), 0x30_30_30.into())];
+        if front {
+            rgb.push(("foreground".into(), 0xff_ff_ff.into()));
+        }
+        vec![
+            (
+                "hl_attr_define",
+                vec![
+                    id.into(),
+                    Value::Map(rgb),
+                    Value::Map(vec![]),
+                    Value::Array(vec![]),
+                ],
+            ),
+            ("hl_group_set", vec!["CursorLine".into(), id.into()]),
+        ]
+    }
+
+    /// The text of row `row` of [`numbered`]'s window, `line N`, under
+    /// `'cursorline'`'s bar, `CursorLine` laid over nothing: id 21.
+    fn barred(row: u64) -> (&'static str, Vec<Value>) {
+        line_hl(2, row, 4, &format!("{:16}", format!("line {row}")), 21)
+    }
+
+    /// `'cursorline'` drawing a bar across the cursor's line, a background
+    /// alone, and numbering it: `j` takes the bar off the line the cursor
+    /// leaves and lays it under the one it goes to, each row's text as
+    /// Neovim drew it, and the cursor's number goes with it — every cell of
+    /// the window as Neovim's frame for the key has it, in its colours.
     #[test]
-    fn cursorline_refuses_line_changing_moves() {
+    fn the_bar_moves_with_the_cursor() {
         let t1 = Instant::now() + Duration::from_secs(1);
-        for cul in [2, 3, 4] {
+        for keys in [&b"j"[..], b"3j", b"jjk"] {
+            let mut a = numbered(Duration::from_millis(200), 3, &[]);
+            let mut bar = bar_defined(21, false);
+            bar.push(barred(0));
+            redraw(&mut a, bar, t1);
+            a.keys(keys, t1);
+            let line = drawn(&a).0;
+            assert_ne!(
+                line,
+                0,
+                "{:?} before Neovim has heard of it",
+                String::from_utf8_lossy(keys)
+            );
+            let predicted = composed_frame(&mut a);
+            let mut neovim = numbers_drawn((line, 0), true, &[]);
+            neovim.push(barred(line as u64));
+            ack(&mut a, keys.len() as u64, "", "n", (line, 0, 0, 0), t1);
+            redraw(&mut a, neovim, t1);
+            assert!(a.anim.chain(2).is_none(), "let go of");
+            let drawn_by_neovim = composed_frame(&mut a);
+            assert_eq!(predicted.text(), drawn_by_neovim.text());
+            for (i, (p, n)) in predicted
+                .cells
+                .iter()
+                .zip(&drawn_by_neovim.cells)
+                .enumerate()
+            {
+                assert_eq!(
+                    p.style,
+                    n.style,
+                    "{keys:?}: row {}, column {}",
+                    i / 20,
+                    i % 20
+                );
+            }
+        }
+    }
+
+    /// A bar the client cannot lay under a line and take off as Neovim
+    /// does — one with a colour in front of its own, which Neovim lays over
+    /// the line instead; one the editor has not named; one across the row
+    /// of the line the cursor is on alone — leaves the motions to another
+    /// line to Neovim; those along it are drawn. So does a `'statuscolumn'`,
+    /// which may draw anything the cursor's line decides.
+    #[test]
+    fn a_bar_the_client_cannot_lay_refuses_line_changing_moves() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        for (cul, front) in [(2, true), (3, true), (4, false)] {
             let mut a = numbered(Duration::from_millis(200), cul, &[]);
+            redraw(&mut a, bar_defined(21, front), t1);
             a.keys(b"j", t1);
             assert_eq!(drawn(&a), (0, 4), "'cursorlineopt' {cul}");
             let mut a = numbered(Duration::from_millis(200), cul, &[]);
+            redraw(&mut a, bar_defined(21, front), t1);
             a.keys(b"l", t1);
             assert_eq!(drawn(&a), (0, 5), "along the line, {cul}");
         }
+        let mut a = numbered(Duration::from_millis(200), 2, &[]);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (0, 4), "no CursorLine named");
+        let mut a = numbered(Duration::from_millis(200), 2, &[]);
+        redraw(&mut a, bar_defined(21, false), t1);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (1, 4), "a background alone");
         let mut a = numbered(Duration::from_millis(200), 0, &[]);
         reshape(
             &mut a,

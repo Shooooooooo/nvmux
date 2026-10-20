@@ -2926,6 +2926,50 @@ fn predicted_rows_wear_the_colours_neovim_gives_them() {
     step(&mut term, "<C-b> back over it", b"\x02");
 }
 
+/// With `'cursorline'` drawing its bar across the cursor's line and
+/// numbering it, the default colorscheme's, over lines the editor colours:
+/// a motion to another line typed over a slow link moves the bar and the
+/// number with the cursor at once — and when Neovim's own frame lands, not
+/// a cell of the window changes, text or colour.
+#[test]
+fn cursorline_moves_with_the_cursor() {
+    require_nvim!();
+    let scratch = Scratch::new("client-cursorline");
+    let (_rpc, mut term, _) = drawn_slowly_with(
+        &scratch,
+        "client-cursorline",
+        "call setline(1, map(range(1, 30), \
+         '\"local v\" . v:val . \" = \" . v:val . \" -- line \" . v:val')) | \
+         set termguicolors cursorline nu rnu | lua vim.treesitter.start(0, 'lua')",
+        MOTIONS,
+    );
+    term.pump_until(Duration::from_secs(2), |_| false);
+    for (name, keys) in [
+        ("j", &b"j"[..]),
+        ("k", b"k"),
+        ("3j", b"3j"),
+        ("2k", b"2k"),
+        ("+", b"+"),
+    ] {
+        let before = (window(&term), colours(&term));
+        term.type_bytes(keys);
+        assert!(
+            term.pump(SLOW, |t| window(t) != before.0),
+            "{name} waited for Neovim:\n{}",
+            term.text()
+        );
+        term.pump_until(Duration::from_millis(30), |_| false);
+        let predicted = (window(&term), colours(&term));
+        assert_ne!(predicted.1, before.1, "{name}: the bar moved");
+        term.pump_until(4 * SLOW, |_| false);
+        let landed = (window(&term), colours(&term));
+        assert_eq!(predicted.0, landed.0, "{name}: the text and the cursor");
+        for (r, (p, l)) in predicted.1.iter().zip(&landed.1).enumerate() {
+            assert_eq!(p, l, "{name}: row {r} changed colour when Neovim's landed");
+        }
+    }
+}
+
 /// A sight of the window, its colours and all: see [`sight`] and
 /// [`colours`].
 type Coloured = (Sight, Vec<Vec<(vt100::Color, vt100::Color, bool, bool)>>);
