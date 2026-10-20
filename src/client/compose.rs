@@ -162,7 +162,8 @@ pub trait View {
     /// Cells drawn over row `r` of grid `grid`, whatever it would otherwise
     /// show — its own or a scroll's: runs of them, each from a grid column.
     /// What Neovim will draw of a row once it hears of a key the client
-    /// has drawn the cursor moved for (see `super::anim::chain`).
+    /// has drawn the cursor moved for, or the line typed into (see
+    /// `super::anim::chain`).
     fn patches(&self, _grid: u64, _r: usize) -> &[Patch] {
         &[]
     }

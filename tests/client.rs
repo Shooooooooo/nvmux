@@ -2374,6 +2374,249 @@ fn jk_mapped_the_lazyvim_way_are_predicted() {
     }
 }
 
+/// The client told to type ahead of Neovim, as well as to work out the
+/// motions.
+const TYPING: &str = "predict_keys = \"typing\"\n";
+
+/// Text typed in Insert mode over a slow link to a real Neovim — letters,
+/// blanks, a character with an accent, two cells wide, a burst faster than
+/// the link answers, and `<BS>` — on the screen before Neovim could have
+/// heard of it, laid out as Neovim lays it out and where Neovim's own frame
+/// puts it: at a line's end, and before a tab.
+#[test]
+fn typed_text_is_echoed_as_neovim_draws_it() {
+    require_nvim!();
+    echoed_as_neovim_draws_it("client-echo", "set nolist");
+}
+
+/// [`typed_text_is_echoed_as_neovim_draws_it`], with `'list'` drawing the
+/// blanks, the tab and the line's end.
+#[test]
+fn typed_text_is_echoed_as_neovim_draws_it_with_listchars() {
+    require_nvim!();
+    echoed_as_neovim_draws_it(
+        "client-echo-list",
+        "set list listchars=tab:>-,trail:-,eol:$",
+    );
+}
+
+/// Text typed as [`typed_text_is_echoed_as_neovim_draws_it`] types it, in a
+/// session `setup` sets up, of its own: the two run side by side.
+fn echoed_as_neovim_draws_it(tag: &str, setup: &str) {
+    let scratch = Scratch::new(tag);
+    let setline = format!(r#"{setup} | call setline(1, ["first", "a\tb", "line 1"])"#);
+    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, tag, &setline, TYPING);
+    typed(&mut term, b"A");
+    for c in "hello wörld 日本 x".chars() {
+        let key = c.to_string();
+        predicted(&mut term, &format!("{tag}: {key}"), key.as_bytes());
+    }
+    predicted(&mut term, &format!("{tag}: a burst"), b"abc");
+    for _ in 0..3 {
+        predicted(&mut term, &format!("{tag}: <BS>"), b"\x7f");
+    }
+    // Before a tab, which grows smaller with each.
+    typed(&mut term, b"\x1b");
+    typed(&mut term, b"j0a");
+    for key in ["x", "y", " ", "z"] {
+        predicted(
+            &mut term,
+            &format!("{tag}: {key} before a tab"),
+            key.as_bytes(),
+        );
+    }
+}
+
+/// Text typed across the decorations Neovim draws of the cursor's line —
+/// the bar of `'cursorline'`, `'list'`'s `trail` and `eol` glyphs over it,
+/// a column `'colorcolumn'` colours — over a slow link to a real Neovim:
+/// on the screen before Neovim could have heard of it, and when Neovim's
+/// own frame lands, not a cell of the window changes, text or colour — the
+/// column staying where it is, a glyph new to the line in the bar.
+#[test]
+fn typed_text_wears_the_colours_neovim_draws_it_in() {
+    require_nvim!();
+    let scratch = Scratch::new("client-echo-colours");
+    let setline = "set termguicolors cursorline list listchars=trail:-,eol:$ colorcolumn=12 | \
+         hi Normal guifg=#dddddd guibg=#101010 | hi CursorLine guibg=#202060 | \
+         hi ColorColumn guibg=#550000 | hi Whitespace guifg=#aa00aa | hi NonText guifg=#00aa00 | \
+         call setline(1, ['foobar', 'line 1'])";
+    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, "client-echo-colours", setline, TYPING);
+    typed(&mut term, b"A");
+    for (name, key) in [
+        ("a blank, drawn as trail", &b" "[..]),
+        ("x after it", b"x"),
+        ("<BS>", b"\x7f"),
+        ("<BS> over the blank", b"\x7f"),
+        ("a", b"a"),
+        ("b", b"b"),
+        ("c", b"c"),
+        ("d, the line's end short of the column", b"d"),
+    ] {
+        let before = window(&term);
+        term.type_bytes(key);
+        assert!(
+            term.pump(SLOW, |t| window(t) != before),
+            "{name} waited for Neovim:\n{}",
+            term.text()
+        );
+        term.pump_until(Duration::from_millis(30), |_| false);
+        let predicted = (window(&term), colours(&term));
+        term.pump_until(4 * SLOW, |_| false);
+        assert_eq!(predicted.0, window(&term), "{name}: the text");
+        assert_eq!(predicted.1, colours(&term), "{name}: the colours");
+    }
+    waited(&mut term, "e, the line's end into the column", b"e");
+}
+
+/// Text typed while a new line, `<CR>`'s, is on its way over a slow link to
+/// a real Neovim — the line count it changes, and the window's shape with
+/// it, said ahead of Neovim's word on the key — appears on the screen
+/// together with the new line, at that word, rather than at the word on the
+/// first key typed after it.
+#[test]
+fn text_typed_while_a_new_line_is_on_its_way_appears_with_it() {
+    require_nvim!();
+    let scratch = Scratch::new("client-echo-cr");
+    let setline = r#"call setline(1, ["first", "line 1"])"#;
+    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, "client-echo-cr", setline, TYPING);
+    typed(&mut term, b"A");
+    for key in [&b"\r"[..], b"a", b"b"] {
+        term.type_bytes(key);
+        term.pump_until(Duration::from_millis(50), |_| false);
+    }
+    let mut first = None;
+    term.frames(4 * SLOW, |screen| {
+        let rows: Vec<String> = screen.rows(0, COLS).take(3).collect();
+        if first.is_none() && rows[2].trim_end() == "line 1" {
+            first = Some(rows[1].trim_end().to_string());
+        }
+        false
+    });
+    assert_eq!(first.as_deref(), Some("ab"), "with the new line");
+}
+
+/// Type `keys`, which the client leaves to Neovim: nothing of the window
+/// changes before Neovim could have heard of them, and what Neovim draws of
+/// them comes.
+fn waited(term: &mut Terminal, name: &str, keys: &[u8]) {
+    let before = window(term);
+    term.type_bytes(keys);
+    assert!(
+        !term.pump(SLOW, |t| window(t) != before),
+        "{name} was drawn before Neovim had heard of it:\n{}",
+        term.text()
+    );
+    term.pump_until(4 * SLOW, |_| false);
+    assert_ne!(window(term), before, "{name}: never drawn by Neovim");
+}
+
+/// Keys typed in Insert mode that Neovim does more with than put them in —
+/// an autopair's `(`, a blank after an abbreviation, a character past
+/// `'textwidth'` — wait for Neovim, over a slow link to a real Neovim; and
+/// those around them do not.
+#[test]
+fn refused_keys_wait_for_neovim() {
+    require_nvim!();
+    let scratch = Scratch::new("client-refused");
+    let setline = r#"inoremap ( ()<Left> | iabbrev teh the | setlocal tw=20 | call setline(1, ["one two three four", "line 1"])"#;
+    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, "client-refused", setline, TYPING);
+    typed(&mut term, b"A");
+    predicted(&mut term, "a blank short of 'textwidth'", b" ");
+    predicted(&mut term, "a character ending on it", b"f");
+    waited(&mut term, "a character past it", b"i");
+    waited(&mut term, "an autopair", b"(");
+    predicted(&mut term, "a character between the pair", b"x");
+    for key in ["t", "e", "h"] {
+        predicted(&mut term, key, key.as_bytes());
+    }
+    waited(&mut term, "a blank after an abbreviation", b" ");
+}
+
+/// A plugin's `InsertCharPre` that types `q` as `Q!`: what is typed in its
+/// buffer is worked out and judged, and not drawn, till it has proved
+/// itself; and `q`, found typed otherwise meanwhile, proves itself again
+/// before it is drawn — nothing on the screen is ever what Neovim did not
+/// draw. (A character such a plugin types otherwise for the first time once
+/// the buffer has proved itself is another matter: see
+/// [`a_character_typed_otherwise_after_the_proof_is_put_right_at_once`].)
+#[test]
+fn insert_char_pre_shows_nothing_wrong_till_typing_has_proved_itself() {
+    require_nvim!();
+    let setline = r#"call setline(1, ["x", "line 1"]) | exe "autocmd InsertCharPre * if v:char ==# 'q' | let v:char = 'Q!' | endif""#;
+    let mut keys: Vec<(Vec<u8>, String)> = vec![(b"A".to_vec(), "A".into())];
+    for word in ["aq", "bq", "cdefghij", "q", "klmnop", "q"] {
+        for c in word.chars() {
+            keys.push((c.to_string().into_bytes(), c.to_string()));
+        }
+        keys.push((b" ".to_vec(), "<Space>".into()));
+    }
+    sights_are_neovims("client-charpre", setline, TYPING, &keys, Lcg(11));
+}
+
+/// Once what is typed in a buffer with a plugin's `InsertCharPre` has
+/// proved itself, a character the plugin types otherwise for the first
+/// time — `q` as `Q!` — is drawn as typed, as the client cannot tell it
+/// from any other; and Neovim's word on it puts it right with its frame,
+/// within a round trip, and has it prove itself before it is drawn again.
+#[test]
+fn a_character_typed_otherwise_after_the_proof_is_put_right_at_once() {
+    require_nvim!();
+    let scratch = Scratch::new("client-charpre-late");
+    let setline = r#"call setline(1, ["x", "line 1"]) | exe "autocmd InsertCharPre * if v:char ==# 'q' | let v:char = 'Q!' | endif""#;
+    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, "client-charpre-late", setline, TYPING);
+    typed(&mut term, b"A");
+    for c in "abcdefghij".chars() {
+        typed(&mut term, c.to_string().as_bytes());
+    }
+    let before = window(&term);
+    term.type_bytes(b"q");
+    assert!(
+        term.pump(SLOW, |t| window(t) != before),
+        "q, proved, drawn ahead:\n{}",
+        term.text()
+    );
+    assert!(window(&term).0[0].starts_with("xabcdefghijq"));
+    term.pump_until(4 * SLOW, |_| false);
+    assert!(window(&term).0[0].starts_with("xabcdefghijQ!"), "put right");
+    waited(&mut term, "q, proving itself again", b"q");
+}
+
+/// Random text typed in Insert mode — letters, blanks, `,`, `.`, `(` and
+/// `<BS>` — in bursts over a slow link to a client that types it ahead of
+/// Neovim, with `'list'` drawing the blanks: every sight of the window it
+/// shows is one Neovim drew for the keys typed so far, in order, and it
+/// ends where Neovim does (see [`sights_are_neovims`]).
+#[test]
+fn random_typing_shows_nothing_neovim_never_drew() {
+    require_nvim!();
+    const KEYS: &[(&[u8], &str)] = &[
+        (b" ", "<Space>"),
+        (b",", ","),
+        (b".", "."),
+        (b"(", "("),
+        (b"\x7f", "<BS>"),
+        (b"\x7f", "<BS>"),
+    ];
+    let setline =
+        r#"set list listchars=tab:>-,trail:-,eol:$ | call setline(1, ["\tend", "line 1"])"#;
+    let mut rng = Lcg(5);
+    let mut keys: Vec<(Vec<u8>, String)> =
+        vec![(b"0".to_vec(), "0".into()), (b"i".to_vec(), "i".into())];
+    while keys.len() < 200 {
+        let (bytes, name) = match rng.below(3) {
+            0 => KEYS[rng.below(KEYS.len() as u64) as usize],
+            _ => {
+                let c = (b'a' + rng.below(26) as u8) as char;
+                keys.push((c.to_string().into_bytes(), c.to_string()));
+                continue;
+            }
+        };
+        keys.push((bytes.to_vec(), name.into()));
+    }
+    sights_are_neovims("client-tfuzz", setline, TYPING, &keys, rng);
+}
+
 /// Where the cursor is, in a terminal's own cells.
 fn cursor(screen: &vt100::Screen) -> (u16, u16) {
     screen.cursor_position()
@@ -2633,16 +2876,9 @@ fn random_motions_to_other_lines_show_nothing_neovim_never_drew() {
 /// of the time, and an `x` now and then, typed in bursts over a slow link
 /// to a client that draws them ahead of Neovim, its window set up by
 /// `setup` besides [`MOVING`]: every sight of the window it shows is one
-/// Neovim drew for the keys typed so far, in order — found by typing the
-/// same keys, one at a time, to another Neovim set up the same, drawn by a
-/// client with nothing to predict — and it ends where Neovim does.
+/// Neovim drew for the keys typed so far, in order — see
+/// [`sights_are_neovims`].
 fn random_motions(tag: &str, setup: &str, alphabet: &[(&[u8], &str)], counted: &[&str]) {
-    let scratch = Scratch::new(tag);
-    let setline = match setup {
-        "" => MOVING.to_string(),
-        setup => format!("{setup} | {MOVING}"),
-    };
-    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, tag, &setline, MOTIONS);
     let mut rng = Lcg(7);
     let mut keys: Vec<(Vec<u8>, String)> = Vec::new();
     while keys.len() < 200 {
@@ -2660,6 +2896,31 @@ fn random_motions(tag: &str, setup: &str, alphabet: &[(&[u8], &str)], counted: &
         b.extend_from_slice(bytes);
         keys.push((b, format!("{count}{name}")));
     }
+    let setline = match setup {
+        "" => MOVING.to_string(),
+        setup => format!("{setup} | {MOVING}"),
+    };
+    sights_are_neovims(tag, &setline, MOTIONS, &keys, rng);
+}
+
+/// `keys` — each as the terminal sends it and as Neovim names it — typed in
+/// bursts over a slow link to a client told `client`, its session set up
+/// by `setline`: every sight of the window it shows is one Neovim drew for
+/// the keys typed so far, in order — found by typing the same keys, one at
+/// a time, to another Neovim set up the same, drawn by a client with
+/// nothing to predict — and it ends where Neovim does. MatchParen lights up
+/// the brackets for the one and not the other: what it changes is colour,
+/// which is not compared. The bursts and the pauses between them are as
+/// `rng` has them.
+fn sights_are_neovims(
+    tag: &str,
+    setline: &str,
+    client: &str,
+    keys: &[(Vec<u8>, String)],
+    mut rng: Lcg,
+) {
+    let scratch = Scratch::new(tag);
+    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, tag, setline, client);
     // Typed in bursts of one to six keys 30 ms apart, a pause between.
     let mut seen: Vec<Sight> = vec![sight(term.parser.screen())];
     let mut at = 0;
@@ -2703,7 +2964,7 @@ fn random_motions(tag: &str, setup: &str, alphabet: &[(&[u8], &str)], counted: &
     std::fs::write(&config, "[client]\npredict = \"off\"\n").expect("config");
     let mut reference = Terminal::spawn(&sock, &config);
     assert!(
-        reference.pump_until(Duration::from_secs(20), |s| s.contains("one")),
+        reference.pump_until(Duration::from_secs(20), |s| s.contains("line 1")),
         "never drawn:\n{}",
         reference.text()
     );
@@ -2713,7 +2974,7 @@ fn random_motions(tag: &str, setup: &str, alphabet: &[(&[u8], &str)], counted: &
         Duration::from_secs(5),
     );
     let mut drew: Vec<Sight> = vec![sight(reference.parser.screen())];
-    for (_, name) in &keys {
+    for (_, name) in keys {
         rpc.call("nvim_input", vec![name.as_str().into()])
             .expect("input");
         // Answered once Neovim has taken the key, and flushed what it drew.

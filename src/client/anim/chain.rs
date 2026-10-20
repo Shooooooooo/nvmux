@@ -20,6 +20,13 @@
 //! itself again, is never drawn, nor any after it (see
 //! `crate::client::predict::Trust`).
 //!
+//! So is a key typed in Insert mode (see `crate::client::typing`): a step
+//! that puts a character in the cursor's line, or takes one out, keeps the
+//! line's text as it leaves it, and its row as Neovim will draw it, which
+//! is drawn over Neovim's for as long as the step is the one drawn. Neovim
+//! has the last word on that as on the rest: on the line's text as its word
+//! on the key has it, and where it left the cursor.
+//!
 //! A motion changes nothing of what the window shows but the cursor, and
 //! what the cursor's line decides — the numbers of `'relativenumber'`, the
 //! groups `'cursorline'` draws that line's gutter in, its bar across the
@@ -31,14 +38,16 @@
 //! worked out over: the cursor drawn on a step in it could be a sight
 //! Neovim never drew, and they are all let go of. What it draws on the
 //! other rows — a plugin's virtual text, its signs, a diagnostic — and in
-//! any row's gutter leaves them as they are.
+//! any row's gutter leaves them as they are; and so does a frame that draws
+//! a line typed into as a step typed it, as Neovim's frames for the keys
+//! typed ahead do, one by one.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
 use crate::client::compose::Patch;
-use crate::client::grid::Text;
-use crate::client::predict::Pos;
+use crate::client::grid::{Cell, Text};
+use crate::client::predict::{Pos, Proof};
 
 /// What Neovim had drawn of a line a step goes onto (see [`Chain::lines`]):
 /// the view's first line, and the text of the row the line was on, from
@@ -71,8 +80,9 @@ pub struct Chain {
     steps: VecDeque<Step>,
 }
 
-/// Where a key the client predicted leaves the cursor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where a key the client predicted leaves the cursor — and, where it or
+/// one before it typed into a line, the line.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
     /// The client's number for the key (see `crate::client::predict::Sync`).
     pub seq: u64,
@@ -81,17 +91,34 @@ pub struct Step {
     /// cursor is drawn in there.
     pub pos: Pos,
     pub vcol: usize,
-    /// Whether it moved the cursor, or left it where it was: one that did is
-    /// what proves a buffer (see `crate::client::predict::Trust`).
-    pub moved: bool,
-    /// The buffer it was worked out over, as it was: its `b:changedtick` and
-    /// how many lines it had.
+    /// The kind of prediction it is, and whether, made as Neovim makes it,
+    /// it counts towards a proof of its kind (see
+    /// `crate::client::predict::Trust`): a motion that moved the cursor, not
+    /// one that left it where it was; a character typed other than a blank;
+    /// a character taken out.
+    pub proof: Proof,
+    pub credited: bool,
+    /// The buffer it was worked out over, as it was: its `b:changedtick` —
+    /// what Neovim's word on it has, but where the steps typed into it,
+    /// which leave a `b:changedtick` the client cannot say — and how many
+    /// lines it has.
     pub tick: i64,
     pub line_count: i64,
+    /// The line the steps typed into, as they leave it.
+    pub echo: Option<Echo>,
     /// Worked out only to be judged: see the module docs.
     pub hidden: bool,
     /// When it is let go of, Neovim having said nothing of its key.
     pub until: Instant,
+}
+
+/// A line typed into ahead of Neovim (see `crate::client::typing`): its
+/// text, and the row Neovim will draw it as, past the gutter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Echo {
+    pub line: i64,
+    pub text: Box<str>,
+    pub cells: Vec<Cell>,
 }
 
 impl Chain {
@@ -119,6 +146,35 @@ impl Chain {
         if !self.lines.iter().any(|(l, _)| *l == line) {
             self.lines.push((line, drawn()));
         }
+    }
+
+    /// Whether `now`, what Neovim draws of line `line` (see
+    /// [`Chain::lines`]), is the line as a step typed it — Neovim's frame for
+    /// a key typed ahead, or one it drew part way through them — in the view
+    /// the steps were worked out in.
+    pub fn typed(&self, line: i64, now: &Drawn) -> bool {
+        let Some((top, texts)) = now else {
+            return false;
+        };
+        let worked_in = self
+            .lines
+            .iter()
+            .find(|(l, _)| *l == line)
+            .and_then(|(_, drawn)| drawn.as_ref())
+            .map(|(t, _)| *t);
+        worked_in == Some(*top)
+            && self
+                .steps
+                .iter()
+                .filter_map(|s| s.echo.as_ref())
+                .any(|e| e.line == line && e.cells.iter().map(|c| &c.text).eq(texts))
+    }
+
+    /// Whether a step types into line `line`.
+    pub fn types_into(&self, line: i64) -> bool {
+        self.steps
+            .iter()
+            .any(|s| s.echo.as_ref().is_some_and(|e| e.line == line))
     }
 
     pub fn len(&self) -> usize {
@@ -190,9 +246,11 @@ mod tests {
                 rest: Rest::Normal,
             },
             vcol: byte,
-            moved: true,
+            proof: Proof::Move,
+            credited: true,
             tick: 1,
             line_count: 10,
+            echo: None,
             hidden,
             until,
         }

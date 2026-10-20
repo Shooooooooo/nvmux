@@ -2040,8 +2040,14 @@ mod tests {
                 self.model.apply(e, &mut changes);
             }
             self.model.refresh_styles();
-            self.anim
-                .after(before, &self.model, &changes, true, self.drawn, self.now);
+            self.anim.after(
+                before,
+                &self.model,
+                &changes,
+                (true, self.drawn),
+                None,
+                self.now,
+            );
             self.drawn = true;
         }
 

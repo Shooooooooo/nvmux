@@ -138,8 +138,16 @@
 //! `super::model::Derive`) — which the client draws as Neovim will; what
 //! it cannot draw so, it leaves to Neovim. And it counts how each motion
 //! followed, drawn or not, came out, for the log ([`Shadow`]).
+//!
+//! And, told to type ahead of Neovim as well, so does what is typed in
+//! Insert mode: a character goes in where the cursor is, and `<BS>` takes
+//! the one before it out, at once — Neovim's own row for the line laid out
+//! afresh around what the key leaves — where nothing the agent says of the
+//! buffer's Insert mode has the key do more ([`typing`]); and each is judged
+//! by the line's text as Neovim's word on its key has it, which the agent
+//! sends the edits for ahead of the word, and by where it left the cursor.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use rmpv::ValueRef;
@@ -148,6 +156,7 @@ use unicode_width::UnicodeWidthChar;
 use super::grid::{Cell, Text};
 use super::moves;
 use super::redraw;
+use super::typing;
 use crate::config::PredictKeys;
 
 /// Predictions start once the smoothed round trip reaches this, and stop
@@ -286,6 +295,10 @@ pub struct Stepping {
     /// `'concealcursor'` without `n` — so that a line the cursor leaves may
     /// be drawn otherwise once it has.
     pub conceals: bool,
+    /// The display columns `'colorcolumn'` colours, from nought — those it
+    /// counts from `'textwidth'` among them, where that is set — whatever
+    /// the text in them: a window's columns, not a character's colours.
+    pub colorcolumn: Vec<usize>,
 }
 
 /// What `'cursorline'` draws of the cursor's line, as `'cursorlineopt'` has
@@ -393,7 +406,7 @@ impl Shape {
     /// [`Listchars::read`] has it — and, where the agent says what Neovim
     /// made of each key, `[whichwrap, virtualedit, cursorcolumn, bound,
     /// langmap, widths, numberwidth, number_signs, cursorline, idioms,
-    /// own_highlights, conceals]` after them (see [`Stepping`]):
+    /// own_highlights, conceals, colorcolumn]` after them (see [`Stepping`]):
     /// `numberwidth` no more than Neovim lets it be, `cursorline` as
     /// [`Cursorline::read`] has it, and `idioms` a list of
     /// [`Idiom::read`]'s.
@@ -448,6 +461,15 @@ impl Shape {
                     .unwrap_or_default(),
                 own_highlights: flag(35),
                 conceals: flag(36),
+                colorcolumn: v
+                    .get(37)
+                    .and_then(ValueRef::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|c| redraw::int(c).and_then(|c| usize::try_from(c).ok()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }),
         })
     }
@@ -1085,7 +1107,7 @@ pub fn regutter(
 /// `Normal` where it has one, and all but the `>`, `precedes` and `extends`
 /// over the character's own colours as well: highlights of its own making,
 /// which the client has no id for, and are left out.
-fn line(
+pub(super) fn line(
     text: &str,
     spans: &[Span],
     shape: &Shape,
@@ -1381,6 +1403,9 @@ pub enum Command {
         count: Option<i64>,
         screen: bool,
     },
+    /// No scroll, but a key typed in Insert mode that edits the cursor's
+    /// line: see [`typing`].
+    Type(typing::Edit),
 }
 
 /// A scroll sideways, as Neovim makes it in a window that does not wrap.
@@ -1496,7 +1521,7 @@ pub fn outcome(command: Command, at: At, rows: i64, line_count: i64, shape: &Sha
                 },
             }
         }
-        Command::Side(_) | Command::Move { .. } => return None,
+        Command::Side(_) | Command::Move { .. } | Command::Type(_) => return None,
         Command::Line { to, line, .. } => {
             // A 'scrolloff' as tall as half the window keeps the cursor in
             // the middle by rules of its own.
@@ -1571,7 +1596,10 @@ pub fn chars(text: &str, shape: &Shape) -> Vec<Ch> {
 /// into one character by rules the client does not follow — an emoji
 /// sequence (a zero-width joiner, a flag's pair, a skin tone, the selector
 /// that draws an emoji two cells wide) or a mark that takes a cell of its
-/// own in a script of South or South-East Asia — nor a character of no
+/// own in a script of South or South-East Asia, or of another whose marks
+/// Neovim 0.12.6 was found to join to the character before, the scripts
+/// whole — nor the anchors of an interlinear annotation, which it shows by
+/// their codes — nor a character of no
 /// width that is not a combining mark, which Neovim shows as a cell or as
 /// its code (a soft hyphen, `<200b>`), nor a combining mark with nothing
 /// before it to go with, or only a blank or a character Neovim shows as
@@ -1586,6 +1614,22 @@ pub fn ordinary(text: &str) -> bool {
             '\u{900}'..='\u{fff}'           // Devanagari to Tibetan
             | '\u{1000}'..='\u{109f}'       // Myanmar
             | '\u{1780}'..='\u{17ff}'       // Khmer
+            | '\u{1900}'..='\u{194f}'       // Limbu
+            | '\u{1a00}'..='\u{1aaf}'       // Buginese, Tai Tham
+            | '\u{1b00}'..='\u{1bff}'       // Balinese, Sundanese, Batak
+            | '\u{1c00}'..='\u{1c4f}'       // Lepcha
+            | '\u{1cd0}'..='\u{1cff}'       // Vedic
+            | '\u{2d7f}'                    // Tifinagh's joiner
+            | '\u{a800}'..='\u{a82f}'       // Syloti Nagri
+            | '\u{a880}'..='\u{a8df}'       // Saurashtra
+            | '\u{a930}'..='\u{a95f}'       // Rejang
+            | '\u{a980}'..='\u{a9df}'       // Javanese
+            | '\u{aa00}'..='\u{aa5f}'       // Cham
+            | '\u{aae0}'..='\u{aaff}'       // Meetei Mayek
+            | '\u{abc0}'..='\u{abff}'
+            | '\u{fff9}'..='\u{fffb}'       // interlinear annotation
+            | '\u{11000}'..='\u{11fff}'     // Brahmi to Kawi
+            | '\u{16f00}'..='\u{16f9f}'     // Miao
             | '\u{1f1e6}'..='\u{1f1ff}'     // a flag's letters
             | '\u{1f3fb}'..='\u{1f3ff}'     // skin tones
         );
@@ -2112,7 +2156,9 @@ pub const MAX_COUNT: i64 = 9999;
 ///
 /// There is a better word than a fence's to go by (see [`Ack`]), and the
 /// client goes by it instead: what it makes of the keys is worked out from
-/// Neovim's last word on them, and the keys sent since ([`Typed::rebase`]).
+/// Neovim's last word on them, and the keys sent since ([`Typed::rebase`]) —
+/// and, told to type ahead of Neovim, those typed in Insert mode as well,
+/// each a character to put in or `<BS>` (see [`typing`]).
 /// A key it predicts leaves it as sure as it was — that is the point of
 /// predicting it — and a key it cannot follow, or does not make what it
 /// makes of it, leaves it *blind* from that key on: nothing is predicted
@@ -2327,6 +2373,16 @@ impl Typed {
                 return None;
             }
         }
+        // Text typed, or taken out, where the client types ahead of Neovim:
+        // whether a mapping, or anything else, makes it do more is for the
+        // client to say as it makes it (see `typing::refused`).
+        let typed = typing::Edit::of(key).filter(|_| !x && self.keys >= PredictKeys::Typing);
+        if let Some(e) = typed {
+            self.state = State::Insert { x: false };
+            self.whole = true;
+            self.waits = false;
+            return Some(Command::Type(e));
+        }
         // Text, or a key that moves the cursor, which the client does not
         // predict; or one that waits for another, which it cannot follow.
         self.lost = true;
@@ -2338,6 +2394,13 @@ impl Typed {
             _ => State::Lost,
         };
         None
+    }
+
+    /// The key just made out may leave Neovim waiting for another, as one a
+    /// mapping starts does, as far as the client can tell: see
+    /// [`Typed::pending`].
+    pub fn may_wait(&mut self) {
+        self.whole = false;
     }
 
     /// A mouse report sent: numbered as a key is, and says its number.
@@ -3076,49 +3139,79 @@ impl Shadow {
 /// How often the counts of [`Shadow`] are logged, in verdicts.
 const SHADOW_EVERY: u64 = 100;
 
-/// How many motions in a row, each one that moved the cursor, Neovim must be
-/// found to make as the client works them out in a buffer where it drew one
-/// wrong, before it draws them there again.
+/// How many predictions in a row, each one that counts (see [`Proof`]),
+/// Neovim must be found to make as the client works them out where it drew
+/// one of their kind wrong, before it draws them there again; and in a
+/// buffer whose Insert mode has autocommands of plugins', what it types
+/// there first.
 const PROOF: u32 = 8;
 
-/// How many of the motions drawn the client looks back over for how often
-/// it drew them right; and how many tenths of them it must have, or it
-/// draws none for the rest of the attach.
+/// How many of the predictions drawn the client looks back over for how
+/// often it drew them right; and how many tenths of them it must have, or
+/// it draws none for the rest of the attach.
 const LOOKED_BACK: usize = 64;
 const FLOOR: usize = 9;
 
 /// How long a window where the cursor was found drawn elsewhere than Neovim
-/// draws it, on a motion worked out right, has its motions left to Neovim —
-/// or till the agent says its shape again.
+/// draws it, or a line typed into otherwise, on a prediction worked out
+/// right, has its predictions left to Neovim — or till the agent says its
+/// shape again.
 pub const DISTRUST: Duration = Duration::from_secs(2);
 
 /// What has to prove itself before it is drawn again, having been drawn
-/// wrong (see `super::App`): the motions in a buffer the client drew one
-/// wrong in are worked out and judged as ever, and drawn only once
-/// [`PROOF`] in a row that each moved the cursor have been judged right; a
-/// window where Neovim drew one the client worked out right somewhere else
-/// — a character as wide as the client did not take it for, say — is left
-/// to Neovim a while; and should fewer than nine in ten of the last
-/// [`LOOKED_BACK`] motions drawn have been right, none is drawn for the rest
-/// of the attach.
+/// wrong (see `super::App`): the predictions of a kind in a buffer the
+/// client drew one of them wrong in — the motions, a character typed, or
+/// `<BS>` — are worked out and judged as ever, and drawn only once [`PROOF`]
+/// in a row that each count have been judged right; so is what is typed in
+/// a buffer whose Insert mode has autocommands of a plugin's, which may do
+/// anything to it, till as many have been, once for the attach; a window
+/// where Neovim drew one the client worked out right somewhere else — a
+/// character as wide as the client did not take it for, say — is left to
+/// Neovim a while; and should fewer than nine in ten of the last
+/// [`LOOKED_BACK`] drawn have been right, none is drawn for the rest of the
+/// attach.
 #[derive(Debug, Default)]
 pub struct Trust {
-    /// The buffers proving themselves, and how many in a row each has.
-    proving: HashMap<i64, u32>,
+    /// The kinds of prediction proving themselves, by buffer, and how many
+    /// in a row each has.
+    proving: HashMap<(i64, Proof), u32>,
+    /// How many of what was typed each buffer has had judged right in a
+    /// row, and the buffers that have had [`PROOF`] (see [`Trust::proven`]).
+    typed: HashMap<i64, u32>,
+    proven: HashSet<i64>,
     /// The windows left to Neovim, and till when.
     distrust: HashMap<i64, Instant>,
-    /// Whether each of the last motions drawn was right, oldest first.
+    /// Whether each of the last predictions drawn was right, oldest first.
     recent: VecDeque<bool>,
     off: bool,
-    /// How the motions worked out came out, for the log.
+    /// How the predictions worked out came out, for the log.
     pub tally: Tally,
 }
 
-/// How the motions the client worked out came out, each judged at the ack
-/// for its key (see [`Trust`]).
+/// The kind of prediction a step drawn ahead of Neovim is, as what Neovim
+/// makes otherwise has to prove itself again (see [`Trust`]): a motion; a
+/// character typed, each its own — an autopair's `(` is no sign that `x`
+/// goes in otherwise — or `<BS>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Proof {
+    Move,
+    Char(char),
+    Rub,
+}
+
+impl Proof {
+    /// Of what is typed: not a motion.
+    fn typed(self) -> bool {
+        self != Proof::Move
+    }
+}
+
+/// How the predictions the client worked out came out — motions, and what
+/// is typed — each judged at the ack for its key (see [`Trust`]).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Tally {
-    /// Made as Neovim made them, and of those, how many moved the cursor.
+    /// Made as Neovim made them, and of those, how many were motions that
+    /// moved the cursor.
     pub made: u64,
     pub moved: u64,
     /// Made otherwise: drawn, or worked out while proving.
@@ -3138,7 +3231,7 @@ impl Tally {
             wrong = self.wrong,
             hidden_wrong = self.hidden_wrong,
             unjudged = self.unjudged,
-            "client: the motions drawn ahead of Neovim so far"
+            "client: the predictions drawn ahead of Neovim so far"
         );
     }
 
@@ -3155,38 +3248,57 @@ impl Tally {
 const TALLY_EVERY: u64 = 200;
 
 impl Trust {
-    /// Whether a motion in window `win` is to be left to Neovim `now`.
+    /// Whether a prediction in window `win` is to be left to Neovim `now`.
     pub fn refused(&self, win: i64, now: Instant) -> bool {
         self.off || self.distrust.get(&win).is_some_and(|&until| now < until)
     }
 
-    /// Whether a motion in buffer `buf` is to be worked out and judged, and
-    /// not drawn: the buffer is proving itself.
-    pub fn hidden(&self, buf: i64) -> bool {
-        self.proving.contains_key(&buf)
+    /// Whether a prediction of kind `proof` in buffer `buf` is to be worked
+    /// out and judged, and not drawn: its kind is proving itself there.
+    pub fn hidden(&self, buf: i64, proof: Proof) -> bool {
+        self.proving.contains_key(&(buf, proof))
     }
 
-    /// A motion in buffer `buf` made as Neovim made it, that `moved` the
-    /// cursor or not, drawn if `shown`.
-    pub fn made(&mut self, buf: i64, moved: bool, shown: bool) {
+    /// Whether what is typed in buffer `buf` has proved itself, whatever
+    /// the plugins' autocommands of its Insert mode do to it: [`PROOF`] in
+    /// a row of it, each that counts, judged right this attach.
+    pub fn proven(&self, buf: i64) -> bool {
+        self.proven.contains(&buf)
+    }
+
+    /// A prediction of kind `proof` in buffer `buf` made as Neovim made it,
+    /// that counts towards a proof or not (`credited`: see
+    /// `super::anim::chain::Step::credited`), drawn if `shown`.
+    pub fn made(&mut self, buf: i64, proof: Proof, credited: bool, shown: bool) {
         self.tally.count(|t| {
             t.made += 1;
-            t.moved += u64::from(moved);
+            t.moved += u64::from(credited && proof == Proof::Move);
         });
         if shown {
             self.judged(true);
         }
-        if let (true, Some(run)) = (moved, self.proving.get_mut(&buf)) {
+        if !credited {
+            return;
+        }
+        if let Some(run) = self.proving.get_mut(&(buf, proof)) {
             *run += 1;
             if *run >= PROOF {
-                self.proving.remove(&buf);
+                self.proving.remove(&(buf, proof));
+            }
+        }
+        if proof.typed() {
+            let run = self.typed.entry(buf).or_default();
+            *run += 1;
+            if *run >= PROOF {
+                self.proven.insert(buf);
             }
         }
     }
 
-    /// A motion in buffer `buf` that Neovim made otherwise, drawn if
-    /// `shown`: the buffer proves itself again from nought.
-    pub fn wrong(&mut self, buf: i64, shown: bool) {
+    /// A prediction of kind `proof` in buffer `buf` that Neovim made
+    /// otherwise, drawn if `shown`: its kind proves itself there again from
+    /// nought, and so, if it was typed, does what is typed there.
+    pub fn wrong(&mut self, buf: i64, proof: Proof, shown: bool) {
         self.tally.count(|t| {
             if shown {
                 t.wrong += 1;
@@ -3197,7 +3309,10 @@ impl Trust {
         if shown {
             self.judged(false);
         }
-        self.proving.insert(buf, 0);
+        self.proving.insert((buf, proof), 0);
+        if proof.typed() {
+            self.typed.insert(buf, 0);
+        }
     }
 
     /// Motions let go of unjudged: see [`Tally::unjudged`].
@@ -3229,7 +3344,7 @@ impl Trust {
             tracing::info!(
                 rights,
                 of = LOOKED_BACK,
-                "client: too few motions drawn ahead of Neovim right; none drawn from here"
+                "client: too few predictions drawn ahead of Neovim right; none drawn from here"
             );
         }
     }
@@ -3272,8 +3387,16 @@ pub struct Predictor {
     timed: u64,
     /// How the motions followed came out: see [`Predictor::judge`].
     pub shadow: Shadow,
-    /// What of the motions drawn has to prove itself first: see [`Trust`].
+    /// What of the predictions drawn has to prove itself first: see
+    /// [`Trust`].
     pub trust: Trust,
+    /// What the agent says of Insert mode in each buffer, by buffer: see
+    /// [`typing::Facts`].
+    facts: HashMap<i64, typing::Facts>,
+    /// The lines in view whose virtual text Neovim draws where the client
+    /// would not move it with their end, as the agent last said them, by
+    /// window: see [`Predictor::pinned`].
+    pinned: HashMap<i64, Vec<i64>>,
 }
 
 /// A time smoothed as TCP smooths its round trip (RFC 6298), and how much it
@@ -3299,6 +3422,12 @@ impl Predictor {
     /// [`Predictor::keys`].
     pub fn acks(&self) -> bool {
         self.keys >= PredictKeys::Motions
+    }
+
+    /// Whether the client types ahead of Neovim, and the agent says what
+    /// bears on it (see [`typing::Facts`]).
+    pub fn typing(&self) -> bool {
+        self.keys >= PredictKeys::Typing
     }
 
     /// Work out `keys` ahead of Neovim from here on, besides the scrolls.
@@ -3377,7 +3506,7 @@ impl Predictor {
     }
 
     /// What the agent says that is the predictions': `lines` and what goes
-    /// with them, `shape` and `want`. Says whether it was.
+    /// with them, `shape`, `want` and `insert`. Says whether it was.
     pub fn said(&mut self, what: &str, v: &[ValueRef<'_>]) -> bool {
         let int = |i: usize| v.get(i).and_then(redraw::int);
         match what {
@@ -3479,6 +3608,22 @@ impl Predictor {
                 }
                 true
             }
+            "insert" => {
+                if let Some((buf, facts)) = typing::Facts::read(v) {
+                    self.facts.insert(buf, facts);
+                }
+                true
+            }
+            "pinned" => {
+                let lines = v
+                    .get(1)
+                    .and_then(ValueRef::as_array)
+                    .map(|a| a.iter().filter_map(redraw::int).collect());
+                if let (Some(win), Some(lines)) = (int(0), lines) {
+                    self.pinned.insert(win, lines);
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -3488,6 +3633,7 @@ impl Predictor {
         self.shapes.remove(&win);
         self.lines.remove(&win);
         self.wants.remove(&win);
+        self.pinned.remove(&win);
     }
 
     /// A fresh attach, or a link too fast to predict over: its agent will
@@ -3496,6 +3642,8 @@ impl Predictor {
         self.shapes.clear();
         self.lines.clear();
         self.wants.clear();
+        self.facts.clear();
+        self.pinned.clear();
         self.base = None;
         self.queue.clear();
     }
@@ -3754,6 +3902,25 @@ impl Predictor {
         self.shapes.get(&win)
     }
 
+    /// What the agent last said of Insert mode in buffer `buf`.
+    pub fn facts(&self, buf: i64) -> Option<&typing::Facts> {
+        self.facts.get(&buf)
+    }
+
+    /// Whether buffer line `lnum` of window `win` has virtual text that does
+    /// not move with the line's end as text is typed there, or might not —
+    /// or the agent has said nothing of it: right-aligned, in a column of
+    /// the window's or over the text, as the agent last said of the lines in
+    /// view; or inline after the line's last character, put before what is
+    /// typed at the end, which goes after it. Past a line's end, the client
+    /// moves what Neovim drew there with the end (see [`typing::relayout`]),
+    /// as it moves virtual text after the end — not what Neovim draws in
+    /// such a column in a decoration provider of a plugin's, which no mark
+    /// shows.
+    pub fn pinned(&self, win: i64, lnum: i64) -> bool {
+        self.pinned.get(&win).is_none_or(|l| l.contains(&lnum))
+    }
+
     /// A key typed while window `win` has the cursor, as [`Typed::key`]
     /// takes it, with that window's mappings: one mapped to make what it
     /// makes unmapped (see [`Idiom`]) taken for the key itself, a row of the
@@ -3762,6 +3929,12 @@ impl Predictor {
         let shape = win.and_then(|w| self.shapes.get(&w));
         let same = idiomatic(shape, key);
         let command = self.typed.key(key, mapping(shape, same.then_some(key)));
+        // A key typed in Insert mode that a mapping there starts with may
+        // have Neovim wait for the next, as `inoremap jk <Esc>` has `j`.
+        let facts = shape.and_then(|s| self.facts.get(&s.buf));
+        if matches!(command, Some(Command::Type(_))) && facts.is_some_and(|f| f.starts(key)) {
+            self.typed.may_wait();
+        }
         screened(command, same)
     }
 
@@ -4037,6 +4210,7 @@ mod tests {
                 idioms: Vec::new(),
                 own_highlights: false,
                 conceals: false,
+                colorcolumn: Vec::new(),
             }),
             ..shape()
         }
@@ -6792,20 +6966,23 @@ mod tests {
     #[test]
     fn a_buffer_drawn_wrong_proves_itself() {
         let mut t = Trust::default();
-        assert!(!t.hidden(1));
-        t.wrong(1, true);
-        assert!(t.hidden(1) && !t.hidden(2));
+        assert!(!t.hidden(1, Proof::Move));
+        t.wrong(1, Proof::Move, true);
+        assert!(t.hidden(1, Proof::Move) && !t.hidden(2, Proof::Move));
         for _ in 1..PROOF {
-            t.made(1, true, false);
+            t.made(1, Proof::Move, true, false);
         }
-        t.made(1, false, false);
-        assert!(t.hidden(1), "one short, a move that moved nothing aside");
-        t.wrong(1, false);
+        t.made(1, Proof::Move, false, false);
+        assert!(
+            t.hidden(1, Proof::Move),
+            "one short, a move that moved nothing aside"
+        );
+        t.wrong(1, Proof::Move, false);
         for _ in 0..PROOF {
-            assert!(t.hidden(1));
-            t.made(1, true, false);
+            assert!(t.hidden(1, Proof::Move));
+            t.made(1, Proof::Move, true, false);
         }
-        assert!(!t.hidden(1), "proved");
+        assert!(!t.hidden(1, Proof::Move), "proved");
         assert_eq!((t.tally.wrong, t.tally.hidden_wrong), (1, 1));
     }
 
@@ -6832,9 +7009,9 @@ mod tests {
             let mut t = Trust::default();
             for i in 0..LOOKED_BACK {
                 if i < wrong {
-                    t.wrong(1, true);
+                    t.wrong(1, Proof::Move, true);
                 } else {
-                    t.made(1, true, true);
+                    t.made(1, Proof::Move, true, true);
                 }
             }
             t.refused(5, now)
@@ -6843,7 +7020,7 @@ mod tests {
         assert!(judged(7), "57 of 64");
         let mut t = Trust::default();
         for _ in 0..40 {
-            t.wrong(1, true);
+            t.wrong(1, Proof::Move, true);
         }
         assert!(
             !t.refused(5, now),
@@ -6938,6 +7115,76 @@ mod tests {
         assert_eq!(p.heard(&ack(3, "jfx"), t0 + ms(4100)), Some(3));
         assert_eq!(p.lag, Some((ms(100), ms(50))), "from the key that ended it");
         assert_eq!(p.deadline(t0) - t0, round);
+    }
+
+    /// Typing ahead of Neovim, a character typed in Insert mode is one to
+    /// type; and one a mapping of Insert mode starts with, as `inoremap jk
+    /// <Esc>` starts with `j`, may have Neovim wait for the next key.
+    /// Working out the motions alone, neither is.
+    #[test]
+    fn a_character_typed_is_typed_ahead_and_one_a_mapping_starts_may_wait() {
+        let mut p = Predictor::default();
+        p.set_keys(PredictKeys::Typing);
+        said(&mut p, "shape", shape_args(50));
+        let classes: String = (0..256).map(|_| '1').collect();
+        let facts: Vec<Value> = vec![
+            1.into(),
+            true.into(),
+            Value::Array(vec!["j".into()]),
+            Value::Array(vec![]),
+            false.into(),
+            0.into(),
+            "".into(),
+            "".into(),
+            false.into(),
+            false.into(),
+            false.into(),
+            "".into(),
+            false.into(),
+            true.into(),
+            true.into(),
+            "indent,eol,start".into(),
+            false.into(),
+            true.into(),
+            false.into(),
+            false.into(),
+            classes.into(),
+        ];
+        said(&mut p, "insert", facts);
+        p.typed.rebase(Rest::Insert);
+        let x = Some(Command::Type(typing::Edit::Char('x')));
+        assert_eq!(p.key(Some(1000), "x"), x);
+        assert!(!p.typed.pending());
+        assert_eq!(
+            p.key(Some(1000), "j"),
+            Some(Command::Type(typing::Edit::Char('j')))
+        );
+        assert!(p.typed.pending(), "`jk` may follow");
+        assert_eq!(
+            p.key(Some(1000), "<BS>"),
+            Some(Command::Type(typing::Edit::Rub))
+        );
+        p.set_keys(PredictKeys::Motions);
+        p.typed.rebase(Rest::Insert);
+        assert_eq!(p.key(Some(1000), "x"), None);
+    }
+
+    /// Lines with the marks that take a cell of their own, by
+    /// `unicode-width`'s measure, in scripts whose marks Neovim 0.12.6 joins
+    /// to the character before — of every one it was found to — and the
+    /// anchors of an interlinear annotation, are not ordinary.
+    #[test]
+    fn lines_neovim_joins_spacing_marks_on_are_not_ordinary() {
+        for text in [
+            "a\u{a98f}\u{a9b4}y",
+            "\u{1900}\u{1923}",
+            "\u{11013}\u{11000}",
+            "\u{16f00}\u{16f51}",
+            "x\u{2d7f}",
+            "a\u{fff9}b",
+        ] {
+            assert!(!ordinary(text), "{text:?}");
+        }
     }
 
     /// The lines whose characters Neovim 0.12.6 was found to step over

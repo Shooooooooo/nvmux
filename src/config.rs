@@ -263,14 +263,24 @@ pub struct ClientSettings {
     /// and the bar of `'cursorline'`; but not those to another line in a
     /// window whose gutter a `'statuscolumn'` draws, as LazyVim's is, which
     /// are left to Neovim. The client follows the rest by what Neovim says
-    /// of each key rather than waiting for it to catch up with them all;
-    /// `"typing"` draws no more than that yet.
+    /// of each key rather than waiting for it to catch up with them all.
+    /// `"typing"` draws what is typed in Insert mode as well — a character
+    /// put in, or taken out with `<BS>` — once Neovim is in Insert mode,
+    /// but not a key a mapping or an abbreviation may make more of, one past
+    /// `'textwidth'`, or one that indents the line again; nor, in a buffer
+    /// whose plugins act on what is typed there, till enough of it has been
+    /// found to go in as typed.
     ///
     /// What it costs: the agent says where each key left the cursor, about
     /// 40 bytes a key back over the link, and each fence the client asks
-    /// after its keys reads the agent's count, about 40 bytes more; and the
-    /// agent sends an edit with each key typed in Insert mode rather than at
-    /// a pause.
+    /// after its keys reads the agent's count, about 40 bytes more. With
+    /// `"typing"`, the agent sends an edit with each key typed in Insert
+    /// mode rather than at a pause, and the edit is the cursor's whole line:
+    /// about a hundred bytes a key on a short line, and as much as four
+    /// times the window's width on a long one — 800 bytes on a line of 800
+    /// characters, some 25 ms a key over a link of 256 kbit/s; and as a
+    /// buffer is entered, or Insert mode in it, a few hundred bytes of what
+    /// bears on typing there.
     pub predict_keys: PredictKeys,
     /// On a terminal wider than a window's text needs, draw the text in the
     /// middle of the window: a window wider than its text wants has it that
@@ -1520,7 +1530,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          # per_session    = {per_session:<9}   # keep each session's client; a switch back reuses it\n\
          # lazy           = {lazy:<9}   # start every client at launch, and after a dropped link; true waits for visits\n\
          # predict        = {predict:<9}   # over ssh, scrolls show before Neovim answers; \"on\" over any slow link\n\
-         # predict_keys   = {predict_keys:<9}   # experimental: \"motions\" shows the cursor moved in view before Neovim too\n\
+         # predict_keys   = {predict_keys:<9}   # experimental: \"motions\" shows the cursor moved, \"typing\" the text typed, before Neovim too\n\
          # centre         = {centre:<9}   # on a wide terminal, each window's text in its middle: \"smart\" or \"fixed\"\n\
          # window_width   = {window_width:<9}   # with centre on, how many columns a window's text gets; 0 for no limit\n\
          \n\

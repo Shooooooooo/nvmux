@@ -437,13 +437,15 @@ impl Animator {
 
     /// Start whatever the batch just applied set off: see the module docs.
     /// `first` is the editor's first frame, which nothing animates into.
+    /// `judging` is the client's number for the last key Neovim's word with
+    /// the batch covers, if one came: see [`chain`].
     pub fn after(
         &mut self,
         before: Before,
         model: &Model,
         changes: &Changes,
-        multigrid: bool,
-        drawn: bool,
+        (multigrid, drawn): (bool, bool),
+        judging: Option<u64>,
         now: Instant,
     ) {
         if !self.moving() {
@@ -541,18 +543,26 @@ impl Animator {
         // another buffer, one whose buffer has another length now, or one
         // whose view or line moved along Neovim has drawn otherwise: what
         // the steps were worked out over is gone. The cursor goes back to
-        // Neovim's at once, not travelling there.
+        // Neovim's at once, not travelling there. A line typed into ahead
+        // is one Neovim draws otherwise as it hears of the keys, though: as
+        // a step typed it, it is as they were worked out; and drawn with
+        // Neovim's word on one of their keys, it is for that word to judge
+        // (see `crate::client::App::judge_steps`).
         let gone: Vec<u64> = self
             .chains
             .iter()
             .filter(|(grid, chain)| {
+                let judged = judging.is_some_and(|k| chain.step_for(k).is_some());
                 changes.reshaped.contains(grid)
                     || before.switching.contains(grid)
                     || model.layout.get(grid).is_none_or(|p| p.hidden)
                     || model.viewports.get(grid).map(|v| v.line_count)
                         != chain.head().map(|s| s.line_count)
                     || chain.lines.iter().any(|(line, drawn)| {
-                        line_drawn(model, **grid, *line, chain.textoff) != *drawn
+                        let now = line_drawn(model, **grid, *line, chain.textoff);
+                        now != *drawn
+                            && !chain.typed(*line, &now)
+                            && !(judged && chain.types_into(*line))
                     })
             })
             .map(|(grid, _)| *grid)
@@ -1456,7 +1466,7 @@ mod tests {
             m.apply(e, &mut changes);
         }
         m.refresh_styles();
-        a.after(before, m, &changes, true, drawn, now);
+        a.after(before, m, &changes, (true, drawn), None, now);
     }
 
     fn window(grid: u64, row: usize, col: usize) -> Event {
