@@ -24,8 +24,10 @@
 //! The Escape key and the first byte of every sequence are the same byte, so
 //! an `ESC` at the end of what has arrived could be either. It is held, and
 //! [`Parser::waiting`] says so, until the rest comes or `'ttimeoutlen'`
-//! passes — Neovim's own TUI's rule, and the reason it has that option. A
-//! sequence cut short by the end of a read is held the same way.
+//! passes — Neovim's own TUI's rule, and the reason it has that option — and
+//! no longer than the relay's own wait, which it has been held for already
+//! (see `super::RELAYED_ESCAPE`). A sequence cut short by the end of a read
+//! is held the same way.
 //!
 //! An answer already known to be one — an OSC or a DCS string whose first
 //! bytes no key makes ([`Parser::in_reply`]) — is no key to be let go of

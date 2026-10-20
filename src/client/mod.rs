@@ -208,6 +208,16 @@ const HOLD_LIMIT: Duration = Duration::from_millis(500);
 /// of it to come, before what has come of it is dropped.
 const REPLY_WAIT: Duration = Duration::from_secs(1);
 
+/// The longest a lone `ESC` is held for the rest of a sequence, in
+/// milliseconds, whatever `'ttimeoutlen'` says (see [`input`]). The client
+/// runs under nvmux's relay, which has held it for as long already, for the
+/// same reason (`crate::pty`'s `SEQUENCE_TIMEOUT`): the bytes of one key are
+/// split only by a buffer boundary, which is machine time, not human time.
+/// Held for `'ttimeoutlen'` on top, in a terminal that sends the Escape key
+/// as a bare `ESC`, every `<Esc>` that leaves Insert mode would wait 60 ms by
+/// Neovim's default before Neovim heard of it.
+const RELAYED_ESCAPE: u64 = 10;
+
 /// How soon to ask who is attached again, having found a UI only passing
 /// through grid 1: another nvmux client's refresh, or one attaching again.
 const RECHECK: Duration = Duration::from_millis(30);
@@ -2414,15 +2424,20 @@ impl App {
     }
 
     /// When what the parser holds is to be taken as it is: `'ttimeoutlen'`
-    /// after the last of it came — or [`REPLY_WAIT`] for a terminal's answer
-    /// already part way through (see [`input`]).
+    /// after the last of it came, and no more than [`RELAYED_ESCAPE`] — or
+    /// [`REPLY_WAIT`] for a terminal's answer already part way through (see
+    /// [`input`]).
     fn escape_deadline(&self) -> Option<Instant> {
         let since = self.escape_since?;
         if self.parser.in_reply() {
             return Some(since + REPLY_WAIT);
         }
         let o = &self.model.options;
-        let wait = if o.ttimeout { o.ttimeoutlen } else { 0 };
+        let wait = if o.ttimeout {
+            o.ttimeoutlen.min(RELAYED_ESCAPE)
+        } else {
+            0
+        };
         Some(since + Duration::from_millis(wait.max(1)))
     }
 
@@ -6105,15 +6120,15 @@ mod tests {
             .any(|(_, m, _)| m == "nvim_ui_term_event"));
     }
 
-    /// An escape held is let go `'ttimeoutlen'` after it came, whatever else
-    /// wakes the loop in between.
+    /// An escape held is let go `'ttimeoutlen'` after it came, and no later
+    /// than the relay's own wait, whatever else wakes the loop in between.
     #[test]
     fn an_escape_is_let_go_on_time() {
         let t0 = Instant::now();
         let mut a = app(false);
         a.keys(b"\x1b", t0);
-        let at = t0 + Duration::from_millis(50);
-        assert_eq!(a.wake_at(t0 + Duration::from_millis(20)), Some(at));
+        let at = t0 + Duration::from_millis(RELAYED_ESCAPE);
+        assert_eq!(a.wake_at(t0 + Duration::from_millis(5)), Some(at));
         assert!(!a.escape_due(at - Duration::from_millis(1)));
         assert!(a.escape_due(at));
         a.escape_timeout(at);
@@ -6122,6 +6137,29 @@ mod tests {
             .iter()
             .any(|(_, m, args)| m == "nvim_input" && args[0] == Value::from("<Esc>")));
         assert_eq!(a.wake_at(at), None);
+    }
+
+    /// A `'ttimeoutlen'` shorter than the relay's wait is kept, and none at
+    /// all lets an escape go at once.
+    #[test]
+    fn a_shorter_ttimeoutlen_is_kept() {
+        let t0 = Instant::now();
+        let mut a = app(false);
+        redraw(
+            &mut a,
+            vec![("option_set", vec!["ttimeoutlen".into(), 5.into()])],
+            t0,
+        );
+        a.keys(b"\x1b", t0);
+        assert_eq!(a.wake_at(t0), Some(t0 + Duration::from_millis(5)));
+        a.escape_timeout(t0 + Duration::from_millis(5));
+        redraw(
+            &mut a,
+            vec![("option_set", vec!["ttimeout".into(), false.into()])],
+            t0,
+        );
+        a.keys(b"\x1b", t0);
+        assert_eq!(a.wake_at(t0), Some(t0 + Duration::from_millis(1)));
     }
 
     /// A terminal's answer part way through is waited for longer than an
