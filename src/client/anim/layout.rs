@@ -1207,11 +1207,10 @@ impl Transition {
     }
 
     /// Draw the windows as they are this frame, over where the compositor put
-    /// them.
-    /// Draw the windows as they are this frame, each window's text `shift`
-    /// columns from where it goes in it, on its way there (see
-    /// `super::Animator::insets`); the cursor at `cursor` (see
-    /// [`fade_cell`]).
+    /// them: each window's text `shift` columns from where it goes in it, on
+    /// its way there (see `super::Animator::insets`), and as far again as the
+    /// ghosts beside it say (see [`ghost_shift`]); the cursor at `cursor`
+    /// (see [`fade_cell`]).
     pub fn paint(
         &self,
         frame: &mut Frame,
@@ -1246,7 +1245,7 @@ impl Transition {
         let chrome = model.grids.get(&1);
         for (grid, (_, pane)) in &self.wins {
             let at = now[grid];
-            let shift = shift(*grid);
+            let shift = shift(*grid) + ghost_shift(model, *grid, pane.grid(at), &ghosts);
             draw_window(frame, model, *grid, pane, at, self.rows.get(grid), shift);
             if let Some(chrome) = chrome {
                 draw_lines(frame, model, chrome, *grid, pane, at, shift);
@@ -1269,6 +1268,28 @@ impl Transition {
             g.paint(frame, model, &colors, at, e, cursor);
         }
     }
+}
+
+/// How far from where it goes window `grid`'s text is drawn for the ghosts
+/// beside it, where it is narrower than the window and in its middle (see
+/// `crate::client::wide`): in the middle of what of `text`, its cells this
+/// frame, no ghost covers. A window holding the place of windows closed
+/// beside it has the whole of it at once, their ghost flying off over its
+/// far side (see [`close`]): its text goes from the middle of where it was
+/// to the middle of where it goes as the ghost does, as a window's growing
+/// to its place does, rather than being there at once, under the ghost.
+fn ghost_shift(model: &Model, grid: u64, text: Area, ghosts: &[(&Ghost, Spot)]) -> i64 {
+    if model.inset(grid) == 0 {
+        return 0;
+    }
+    let open = ghosts
+        .iter()
+        .filter(|(g, at)| g.kind == Kind::Row && at.f.overlaps(&text) && at.f.left > text.left)
+        .map(|(_, at)| at.f.left)
+        .fold(text.right, i64::min);
+    let cols = model.grids.get(&grid).map_or(0, Grid::width) as i64;
+    let pad = |width: i64| (width - cols).max(0) / 2;
+    pad(open - text.left) - pad(text.width())
 }
 
 /// Window `grid`'s text in the frame `at` has for it, from its top left.
@@ -2102,6 +2123,94 @@ mod tests {
         assert!(!s.moving());
         assert_eq!(last.lines().next(), Some("aaaaaaaaaaaaaaaaaaaaa"));
         assert_eq!(last.lines().nth(4), Some("a.txt==========1,1 Al"));
+    }
+
+    /// A window `width` wide at the top of the screen at `col`, its text
+    /// drawn `text` wide in its middle (see `crate::client::wide`): its grid
+    /// that wide, every row of it `fill`.
+    fn centred(grid: u64, col: usize, (width, text): (usize, usize), fill: char) -> Vec<Event> {
+        let mut events = window(grid, 0, col, (text, 4), fill);
+        if let Some(Event::WinPos { width: w, .. }) = events.last_mut() {
+            *w = width;
+        }
+        events
+    }
+
+    /// Two windows side by side, grid 2 and grid 4, 10 columns each and
+    /// their text 4 wide in their middles, each status line's words over
+    /// its text: settled, and the screen they make.
+    fn centred_split() -> (Scene, String) {
+        let mut s = Scene::new(Options {
+            splitright: true,
+            ..Options::default()
+        });
+        s.model.set_laststatus(Some(2));
+        let mut events = centred(2, 0, (10, 4), 'a');
+        events.extend(centred(4, 11, (10, 4), 'b'));
+        events.extend((0..4).map(|r| line(1, r, 10, "│")));
+        events.push(line(1, 4, 0, "x        y x        y"));
+        events.push(cursor(4));
+        s.batch(events);
+        let screen = s.settle();
+        let rows: Vec<&str> = screen.lines().collect();
+        assert_eq!(rows[0], "   aaaa   │   bbbb   ");
+        assert_eq!(rows[4], "   x  y       x  y   ");
+        (s, screen)
+    }
+
+    /// `:close` of one of [`centred_split`]'s windows, `gone`: the other,
+    /// `kept`, has the whole width, its text — rows of `fill` — still 4 wide
+    /// in its middle.
+    fn close_centred(gone: u64, kept: u64, fill: char) -> Vec<Event> {
+        let mut events = vec![
+            Event::WinClose { grid: gone },
+            Event::GridDestroy { grid: gone },
+        ];
+        events.extend(centred(kept, 0, (21, 4), fill));
+        events.push(line(1, 4, 0, "x                   y"));
+        events.push(cursor(kept));
+        events
+    }
+
+    /// The column character `c` is first in on `row`.
+    fn col_of(row: &str, c: char) -> Option<usize> {
+        row.chars().position(|k| k == c)
+    }
+
+    /// The window right of another closed, each with its text in its
+    /// middle: the one left of it takes its place at once, and its text and
+    /// its status line's words over it go from the middle of where it was
+    /// to the middle of where it goes, in the middle of what the ghost
+    /// flying off it leaves of it — not there at once.
+    #[test]
+    fn centred_text_left_of_a_window_closed_goes_to_its_middle() {
+        let (mut s, _) = centred_split();
+        s.batch(close_centred(4, 2, 'a'));
+        assert!(s.moving());
+        // Where the window's text starts each frame, and its status line's
+        // words.
+        let mut seen = Vec::new();
+        for ms in (0..=180).step_by(10) {
+            let rows = s.rows(ms);
+            seen.push((col_of(&rows[0], 'a'), col_of(&rows[4], 'x')));
+        }
+        assert_eq!(seen[0], (Some(3), Some(3)), "where it was: {seen:?}");
+        assert!(
+            seen.iter().all(|(text, words)| text == words),
+            "the words over the text: {seen:?}"
+        );
+        assert!(
+            seen.windows(2).all(|w| w[0].0 <= w[1].0),
+            "only ever right: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|(c, _)| c.is_some_and(|c| c > 3 && c < 8)),
+            "on its way: {seen:?}"
+        );
+        let rows: Vec<String> = s.settle().lines().map(String::from).collect();
+        assert!(!s.moving());
+        assert_eq!(rows[0], "        aaaa         ", "in the middle of it all");
+        assert_eq!(rows[4], "        x  y         ");
     }
 
     /// The first window closed: the one after it moves into its place, its

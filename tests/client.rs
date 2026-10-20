@@ -3017,6 +3017,87 @@ fn a_split_over_a_slow_link_is_centred_from_its_first_frame() {
     assert_eq!(term.hang_up(), Some(0), "the client's exit");
 }
 
+/// The window right of another closed, each window's text centred: the one
+/// left of it takes its place, and its text goes from the middle of where it
+/// was to the middle of the whole width as the closed window's ghost flies
+/// off it — never there at once, under the ghost.
+#[test]
+fn a_window_closed_beside_centred_text_takes_it_to_its_middle() {
+    require_nvim!();
+    let scratch = Scratch::new("client-centre-close");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-centre-close");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    rpc.command("set splitright | vsplit").expect("vsplit");
+    let own = rpc
+        .eval("map(nvim_tabpage_list_wins(0), 'nvim_win_get_width(v:val)')")
+        .expect("ask the editor");
+    let w: Vec<usize> = own
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_u64)
+                .map(|w| w as usize)
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(w.len(), 2, "no split: {own:?}");
+    let (left, right) = ((w[0] - 60) / 2, w[0] + 1 + (w[1] - 60) / 2);
+    // The column each window's text starts at on the first row.
+    let starts = |row: &str| -> Vec<usize> {
+        row.match_indices("the left window")
+            .map(|(at, _)| row[..at].chars().count())
+            .collect()
+    };
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| {
+            starts(s.lines().next().unwrap_or("")) == [left, right]
+        }),
+        "the text is not in the middle of each window ({w:?}):\n{}",
+        term.text()
+    );
+
+    // Nothing more of the split to come.
+    term.pump_until(Duration::from_millis(500), |_| false);
+
+    rpc.command("close").expect("close the right window");
+    // Where each window's text starts in every frame that moves it: the
+    // one left, and as long as it is seen, the closed one's ghost.
+    let mut seen: Vec<Vec<usize>> = Vec::new();
+    term.frames(Duration::from_secs(2), |screen| {
+        let row: String = (0..160)
+            .map(|col| match screen.cell(0, col) {
+                Some(cell) if cell.has_contents() => cell.contents(),
+                _ => " ",
+            })
+            .collect();
+        let now = starts(&row);
+        if seen.last() != Some(&now) {
+            seen.push(now);
+        }
+        false
+    });
+    let ghosted: Vec<&Vec<usize>> = seen.iter().filter(|s| s.len() == 2).collect();
+    assert!(
+        !ghosted.is_empty(),
+        "no ghost of the closed window: {seen:?}"
+    );
+    assert!(
+        ghosted.iter().all(|s| s[0] < 50),
+        "there at once, under the ghost: {seen:?}"
+    );
+    let held: Vec<usize> = seen.iter().filter_map(|s| s.first().copied()).collect();
+    assert_eq!(held.last(), Some(&50), "landed in its middle: {seen:?}");
+    assert!(
+        held.windows(2).all(|w| w[0] <= w[1]),
+        "moved back left on its way: {seen:?}"
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
 /// A UI that keeps every window on grid 1 sees the windows whole: the client
 /// attaching again without `ext_multigrid` lets go of the windows it had
 /// narrowed, and once that UI has gone and the client has windows of its own
