@@ -280,7 +280,12 @@ pub struct ClientSettings {
     /// into; but not a key a mapping or an abbreviation may make more of,
     /// one past `'textwidth'`, or one that indents the line again; nor, in a
     /// buffer whose plugins act on what is typed there, till enough of it
-    /// has been found to go in as typed.
+    /// has been found to go in as typed — or, whose plugins act as Insert
+    /// mode is entered or left there, the keys that do that, till enough of
+    /// them have been found to do no more than the key does: one that does
+    /// more after that — a trimmer of the blanks lines end in finding some
+    /// on another line — is drawn as the key alone does it, put right a
+    /// round trip later, and has its kind prove itself again.
     ///
     /// What it costs: the agent says where each key left the cursor, about
     /// 40 bytes a key back over the link, and as the view moves, which lines

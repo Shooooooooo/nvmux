@@ -3220,7 +3220,8 @@ const SHADOW_EVERY: u64 = 100;
 /// Neovim must be found to make as the client works them out where it drew
 /// one of their kind wrong, before it draws them there again; and in a
 /// buffer whose Insert mode has autocommands of plugins', what it types
-/// there first.
+/// there first — or, whose entering or leaving it has, the keys that do
+/// that (see [`Unseen`]).
 const PROOF: u32 = 8;
 
 /// How many of the predictions drawn the client looks back over for how
@@ -3241,21 +3242,23 @@ pub const DISTRUST: Duration = Duration::from_secs(2);
 /// `<BS>` — are worked out and judged as ever, and drawn only once [`PROOF`]
 /// in a row that each count have been judged right; so is what is typed in
 /// a buffer whose Insert mode has autocommands of a plugin's, which may do
-/// anything to it, till as many have been, once for the attach; a window
-/// where Neovim drew one the client worked out right somewhere else — a
-/// character as wide as the client did not take it for, say — is left to
-/// Neovim a while; and should fewer than nine in ten of the last
-/// [`LOOKED_BACK`] drawn have been right, none is drawn for the rest of the
-/// attach.
+/// anything to it, and a key into Insert mode or out of it in one whose
+/// entering or leaving the mode has, till as many have been, once for the
+/// attach (see [`Unseen`]); a window where Neovim drew one the client worked
+/// out right somewhere else — a character as wide as the client did not
+/// take it for, say — is left to Neovim a while; and should fewer than nine
+/// in ten of the last [`LOOKED_BACK`] drawn have been right, none is drawn
+/// for the rest of the attach.
 #[derive(Debug, Default)]
 pub struct Trust {
     /// The kinds of prediction proving themselves, by buffer, and how many
     /// in a row each has.
     proving: HashMap<(i64, Proof), u32>,
-    /// How many of what was typed each buffer has had judged right in a
-    /// row, and the buffers that have had [`PROOF`] (see [`Trust::proven`]).
-    typed: HashMap<i64, u32>,
-    proven: HashSet<i64>,
+    /// How many of what was typed, of the keys into Insert mode and of
+    /// those out of it each buffer has had judged right in a row, and those
+    /// that have had [`PROOF`] (see [`Trust::proven`]).
+    runs: HashMap<(i64, Unseen), u32>,
+    proven: HashSet<(i64, Unseen)>,
     /// The windows left to Neovim, and till when.
     distrust: HashMap<i64, Instant>,
     /// Whether each of the last predictions drawn was right, oldest first.
@@ -3281,10 +3284,33 @@ pub enum Proof {
 }
 
 impl Proof {
-    /// Of what is typed: a character, or `<BS>`.
-    fn typed(self) -> bool {
-        matches!(self, Proof::Char(_) | Proof::Rub)
+    /// What a plugin's autocommands may do otherwise than the client works
+    /// it out, a prediction of this kind is of: what is typed — a character,
+    /// or `<BS>` — Insert mode entered, or left; nothing, a motion.
+    fn unseen(self) -> Option<Unseen> {
+        match self {
+            Proof::Char(_) | Proof::Rub => Some(Unseen::Typed),
+            Proof::Enter => Some(Unseen::Entered),
+            Proof::Leave => Some(Unseen::Left),
+            Proof::Move => None,
+        }
     }
+}
+
+/// What, in a buffer, autocommands the agent says are a plugin's may do
+/// anything to, and so has to prove itself there before it is drawn, once
+/// for the attach (see [`Trust::proven`]): what is typed, where
+/// `InsertCharPre`, `TextChangedI` or `CursorMovedI` has one; a key into
+/// Insert mode, where `InsertEnter` or `ModeChanged` does, which may move
+/// the cursor or edit the buffer; a key out of it, where `InsertLeavePre`,
+/// `InsertLeave` or `ModeChanged` does — a trimmer of the blanks lines end
+/// in, say, whose `:%s` puts the cursor on the last line it trimmed (see
+/// `super::typing::Facts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Unseen {
+    Typed,
+    Entered,
+    Left,
 }
 
 /// How the predictions the client worked out came out — motions, and what
@@ -3340,11 +3366,12 @@ impl Trust {
         self.proving.contains_key(&(buf, proof))
     }
 
-    /// Whether what is typed in buffer `buf` has proved itself, whatever
-    /// the plugins' autocommands of its Insert mode do to it: [`PROOF`] in
-    /// a row of it, each that counts, judged right this attach.
-    pub fn proven(&self, buf: i64) -> bool {
-        self.proven.contains(&buf)
+    /// Whether what is typed in buffer `buf`, or the keys into Insert mode
+    /// or out of it there — `what` — has proved itself, whatever the
+    /// plugins' autocommands do to it: [`PROOF`] in a row of it, each that
+    /// counts, judged right this attach.
+    pub fn proven(&self, buf: i64, what: Unseen) -> bool {
+        self.proven.contains(&(buf, what))
     }
 
     /// A prediction of kind `proof` in buffer `buf` made as Neovim made it,
@@ -3367,18 +3394,19 @@ impl Trust {
                 self.proving.remove(&(buf, proof));
             }
         }
-        if proof.typed() {
-            let run = self.typed.entry(buf).or_default();
+        if let Some(what) = proof.unseen() {
+            let run = self.runs.entry((buf, what)).or_default();
             *run += 1;
             if *run >= PROOF {
-                self.proven.insert(buf);
+                self.proven.insert((buf, what));
             }
         }
     }
 
     /// A prediction of kind `proof` in buffer `buf` that Neovim made
     /// otherwise, drawn if `shown`: its kind proves itself there again from
-    /// nought, and so, if it was typed, does what is typed there.
+    /// nought, and so does what it is of that a plugin's autocommands may do
+    /// anything to (see [`Unseen`]).
     pub fn wrong(&mut self, buf: i64, proof: Proof, shown: bool) {
         self.tally.count(|t| {
             if shown {
@@ -3390,10 +3418,34 @@ impl Trust {
         if shown {
             self.judged(false);
         }
+        self.again(buf, proof);
+    }
+
+    /// A key into Insert mode or out of it, of kind `proof` in buffer
+    /// `buf`, that Neovim made as the client worked it out — the cursor
+    /// where it put it, the line typed into as typed — and that edited the
+    /// buffer besides: an autocommand of the mode, a plugin's, did more than
+    /// the key does, which the steps after it were not worked out over. Not
+    /// drawn wrong, nor counted so; but its kind proves itself there again
+    /// from nought, as after one that was.
+    pub fn edited(&mut self, buf: i64, proof: Proof) {
+        self.again(buf, proof);
+    }
+
+    fn again(&mut self, buf: i64, proof: Proof) {
         self.proving.insert((buf, proof), 0);
-        if proof.typed() {
-            self.typed.insert(buf, 0);
+        if let Some(what) = proof.unseen() {
+            self.runs.insert((buf, what), 0);
         }
+    }
+
+    /// An autocommand of a plugin's that may do anything to `what` in buffer
+    /// `buf`, where the agent said of none before: what of it was judged
+    /// right proves nothing of what the plugin does to it, and it proves
+    /// itself there from nought.
+    pub fn unproven(&mut self, buf: i64, what: Unseen) {
+        self.runs.remove(&(buf, what));
+        self.proven.remove(&(buf, what));
     }
 
     /// Motions let go of unjudged: see [`Tally::unjudged`].
@@ -3708,6 +3760,22 @@ impl Predictor {
             }
             "insert" => {
                 if let Some((buf, facts)) = typing::Facts::read(v) {
+                    // An autocommand of a plugin's the buffer had none of:
+                    // what it may do anything to has proved nothing of it.
+                    let was = self.facts.get(&buf);
+                    for (what, now, before) in [
+                        (Unseen::Typed, facts.unseen, was.map(|f| f.unseen)),
+                        (
+                            Unseen::Entered,
+                            facts.unseen_entered,
+                            was.map(|f| f.unseen_entered),
+                        ),
+                        (Unseen::Left, facts.unseen_left, was.map(|f| f.unseen_left)),
+                    ] {
+                        if now && before != Some(true) {
+                            self.trust.unproven(buf, what);
+                        }
+                    }
                     self.facts.insert(buf, facts);
                 }
                 true
@@ -7172,6 +7240,38 @@ mod tests {
         }
         assert!(!t.hidden(1, Proof::Move), "proved");
         assert_eq!((t.tally.wrong, t.tally.hidden_wrong), (1, 1));
+    }
+
+    /// What a plugin's autocommands may do anything to proves itself in a
+    /// buffer, each apart, once for the attach: what is typed by characters
+    /// and `<BS>` alike, the keys into Insert mode, and those out of it. A
+    /// key out of it that edited the buffer besides starts its proof again,
+    /// and has its kind prove itself again as one drawn wrong would, though
+    /// it is not counted so.
+    #[test]
+    fn what_plugins_may_do_anything_to_proves_itself_apart() {
+        let mut t = Trust::default();
+        for _ in 1..PROOF {
+            t.made(1, Proof::Leave, true, false);
+            t.made(1, Proof::Char('x'), true, false);
+            t.made(1, Proof::Enter, false, false);
+        }
+        assert!(!t.proven(1, Unseen::Left) && !t.proven(1, Unseen::Typed));
+        t.edited(1, Proof::Leave);
+        assert!(t.hidden(1, Proof::Leave) && !t.hidden(1, Proof::Enter));
+        t.made(1, Proof::Rub, true, false);
+        assert!(t.proven(1, Unseen::Typed), "a <BS> as good as a character");
+        for _ in 1..PROOF {
+            t.made(1, Proof::Leave, true, false);
+        }
+        assert!(!t.proven(1, Unseen::Left), "one short of it again");
+        t.made(1, Proof::Leave, true, false);
+        assert!(t.proven(1, Unseen::Left) && !t.hidden(1, Proof::Leave));
+        assert!(!t.proven(2, Unseen::Left) && !t.proven(1, Unseen::Entered));
+        t.wrong(1, Proof::Leave, true);
+        assert!(t.proven(1, Unseen::Left), "for the attach");
+        assert!(t.hidden(1, Proof::Leave), "but drawn wrong");
+        assert_eq!((t.tally.wrong, t.tally.hidden_wrong), (1, 0));
     }
 
     /// A window Neovim drew the cursor elsewhere in is left to Neovim a

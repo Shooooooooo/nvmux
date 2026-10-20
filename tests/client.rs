@@ -2981,6 +2981,85 @@ fn a_character_typed_otherwise_after_the_proof_is_put_right_at_once() {
     waited(&mut term, "q, proving itself again", b"q");
 }
 
+/// A plugin's `InsertLeave` that takes out the blanks lines end in, on any
+/// line — its `:%s` leaving the cursor on the last line it trimmed — has
+/// `<Esc>` do more than put the cursor back: in its buffer, `<Esc>` is
+/// worked out and judged, and not drawn, nor the keys after it, till it has
+/// proved itself — nothing on the screen is ever what Neovim did not draw.
+#[test]
+fn insert_leave_shows_nothing_wrong_till_leaving_has_proved_itself() {
+    require_nvim!();
+    let setline = r#"call setline(1, ["one", "two three   ", "four", "line 1"]) | autocmd InsertLeave * silent! keepjumps keeppatterns %s/\s\+$//e"#;
+    let mut keys: Vec<(Vec<u8>, String)> = Vec::new();
+    for _ in 0..6 {
+        for (bytes, name) in [
+            (&b"A"[..], "A"),
+            (b"x", "x"),
+            (b"\x1b", "<Esc>"),
+            (b"j", "j"),
+            (b"$", "$"),
+            (b"k", "k"),
+            (b"0", "0"),
+        ] {
+            keys.push((bytes.to_vec(), name.into()));
+        }
+    }
+    for seed in [3, 4, 5] {
+        sights_are_neovims(
+            &format!("client-trim-{seed}"),
+            setline,
+            TYPING,
+            &keys,
+            Lcg(seed),
+        );
+    }
+}
+
+/// `<Esc>` in a buffer with a plugin's `InsertLeave` that does nothing to
+/// the cursor or the buffer, over a slow link to a real Neovim: left to
+/// Neovim till eight have been judged right, each leaving the buffer as it
+/// was; drawn ahead of it from then on.
+#[test]
+fn esc_is_drawn_ahead_once_leaving_has_proved_itself() {
+    require_nvim!();
+    let scratch = Scratch::new("client-left");
+    let setline = r#"call setline(1, ["x", "line 1"]) | autocmd InsertLeave * let g:left = get(g:, 'left', 0) + 1"#;
+    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, "client-left", setline, TYPING);
+    for _ in 0..8 {
+        typed(&mut term, b"A");
+        waited(&mut term, "<Esc>, proving itself", b"\x1b");
+    }
+    typed(&mut term, b"A");
+    predicted(&mut term, "<Esc>, proved", b"\x1b");
+}
+
+/// A plugin's `InsertLeave` that takes out the blanks lines end in, made
+/// once `<Esc>` has been drawn ahead of Neovim nine times — by a plugin
+/// loaded late, or by hand — has the next `<Esc>` left to Neovim, proving
+/// itself as where the autocommand was there all along, though Insert mode
+/// has not been entered since: not drawn where its `:%s` puts the cursor
+/// otherwise, on the line it trimmed.
+#[test]
+fn an_insert_leave_made_late_has_esc_prove_itself() {
+    require_nvim!();
+    let scratch = Scratch::new("client-late-leave");
+    let setline = r#"call setline(1, ["one", "ab c", "line 1"])"#;
+    let (mut rpc, mut term, _) = drawn_slowly_with(&scratch, "client-late-leave", setline, TYPING);
+    for _ in 0..9 {
+        typed(&mut term, b"A");
+        predicted(&mut term, "<Esc>, with nothing to prove", b"\x1b");
+    }
+    rpc.command(r"autocmd InsertLeave * silent! keepjumps keeppatterns %s/\s\+$//e")
+        .expect("autocmd");
+    typed(&mut term, b"j$xk");
+    // `<Esc>` before Neovim has heard of the `A`, nor said anything more of
+    // Insert mode as it enters it.
+    term.type_bytes(b"A");
+    term.pump_until(Duration::from_millis(30), |_| false);
+    waited(&mut term, "<Esc>, proving itself", b"\x1b");
+    assert_eq!(cursor(term.parser.screen()).0, 1, "on the line trimmed");
+}
+
 /// Random text typed in Insert mode — letters, blanks, `,`, `.`, `(` and
 /// `<BS>` — in bursts over a slow link to a client that types it ahead of
 /// Neovim, with `'list'` drawing the blanks, and now and then out of

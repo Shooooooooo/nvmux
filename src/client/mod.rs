@@ -137,7 +137,7 @@ use self::anim::{chain, Animator, Effects};
 use self::grid::{Cell, Text};
 use self::input::{Input, Mouse, Parser, Reply};
 use self::model::{Changes, Model, Place, Placement};
-use self::predict::{Command, Mode, Pos, Predictor, Proof, Rest, Side, Want};
+use self::predict::{Command, Mode, Pos, Predictor, Proof, Rest, Side, Unseen, Want};
 use self::redraw::Event;
 use self::screen::Screen;
 use self::wire::{Arg, Inbox, Outbox};
@@ -1079,7 +1079,7 @@ if predict then
   -- nothing of itself on the screen. A second after, the keys mapped are
   -- looked up afresh: one mapped since, by a plugin or by hand, has the
   -- window's shape said again.
-  local wanted, said, fixed, decorated, recheck
+  local wanted, said, fixed, decorated, recheck, rehooked
   local function remapped()
     recheck = false
     local buf = api.nvim_get_current_buf()
@@ -1110,6 +1110,9 @@ if predict then
     end
     if looked[win] and looked[win] ~= looks(win) then
       push_all()
+    end
+    if rehooked then
+      rehooked()
     end
     flush()
     local buf = api.nvim_get_current_buf()
@@ -1248,16 +1251,31 @@ if predict then
   -- What would make a key typed in Insert mode in a buffer do other than
   -- what typing it plainly does (see typing::Facts), where the client types
   -- ahead of Neovim: the keys mappings start with, the abbreviations,
-  -- whether a plugin's autocommand may do anything to what is typed, and
-  -- the options that bear on it — said for the buffer in the window that
-  -- has the cursor as Insert mode is entered, once what that set off has
-  -- been, a plugin loaded on the way in and the mappings it makes among it;
-  -- as a buffer is entered, and an option among those is set; and only
-  -- where any of it changed. A prompt buffer's text goes in after its
-  -- prompt, wherever Insert mode is entered, and none of the prompt comes
-  -- out: none goes in as typed.
+  -- whether a plugin's autocommand may do anything to what is typed, or as
+  -- Insert mode is entered or left, and the options that bear on it — said
+  -- for the buffer in the window that has the cursor as Insert mode is
+  -- entered, once what that set off has been, a plugin loaded on the way
+  -- in and the mappings it makes among it; as a buffer is entered, and an
+  -- option among those is set; and only where any of it changed. A prompt
+  -- buffer's text goes in after its prompt, wherever Insert mode is
+  -- entered, and none of the prompt comes out: none goes in as typed.
   if typing then
     local factsof, entered, classesof = {}, {}, {}
+    local function unseen(buf, event)
+      for _, ac in ipairs(api.nvim_get_autocmds({ event = event })) do
+        local g = ac.group_name or ''
+        if g ~= 'matchparen' and not g:find('^nvmux_client_')
+            and (not ac.buflocal or ac.buffer == buf) then
+          return true
+        end
+      end
+      return false
+    end
+    local function hooks(buf)
+      return { unseen(buf, { 'InsertCharPre', 'TextChangedI', 'CursorMovedI' }),
+        unseen(buf, { 'InsertEnter', 'ModeChanged' }),
+        unseen(buf, { 'InsertLeavePre', 'InsertLeave', 'ModeChanged' }) }
+    end
     local function facts()
       if gone or reach <= 0 then
         return
@@ -1283,13 +1301,6 @@ if predict then
           abbrevs[#abbrevs + 1] = a.lhs
         end
       end
-      local unseen = false
-      for _, ac in ipairs(api.nvim_get_autocmds({
-          event = { 'InsertCharPre', 'TextChangedI', 'CursorMovedI' } })) do
-        local g = ac.group_name or ''
-        unseen = unseen or (g ~= 'matchparen' and not g:find('^nvmux_client_')
-          and (not ac.buflocal or ac.buffer == buf))
-      end
       -- Neovim's comp_textwidth: with 'wrapmargin', the window's width less
       -- it and the fold and sign columns, and eight for a number column
       -- whatever it takes; the whole gutter and eight here, if anything
@@ -1308,7 +1319,8 @@ if predict then
         end
         classesof[isk] = table.concat(t)
       end
-      local f = { buf, entered[buf] == true, firsts, abbrevs, unseen, tw,
+      local hooked = hooks(buf)
+      local f = { buf, entered[buf] == true, firsts, abbrevs, hooked[1], tw,
         bo.formatoptions, bo.indentexpr ~= '' and bo.indentkeys or (bo.cindent and bo.cinkeys or ''),
         bo.smartindent, bo.lisp, vim.o.showmatch, bo.matchpairs,
         vim.fn.exists('+autocomplete') == 1 and vim.o.autocomplete or false,
@@ -1316,10 +1328,21 @@ if predict then
         not (vim.o.revins or wo.rightleft or bo.iminsert == 2 or vim.o.paste or vim.o.digraph),
         vim.o.backspace,
         bo.softtabstop ~= 0 or bo.varsofttabstop ~= '', vim.o.smarttab, vim.o.delcombine,
-        wo.conceallevel > 0 and wo.concealcursor or '', classesof[isk] }
+        wo.conceallevel > 0 and wo.concealcursor or '', classesof[isk], hooked[2], hooked[3] }
       if not vim.deep_equal(factsof[buf], f) then
         factsof[buf] = f
         send('insert', unpack(f))
+      end
+    end
+    -- A plugin may make an autocommand of these at any time, loaded late or
+    -- set up by hand: whether one does is read again as Neovim goes to wait
+    -- for a key, and what is said of the buffer said again ahead of the ack
+    -- where it changed.
+    rehooked = function()
+      local buf = api.nvim_get_current_buf()
+      local f = factsof[buf]
+      if f and not vim.deep_equal({ f[5], f[22], f[23] }, hooks(buf)) then
+        facts()
       end
     end
     au('InsertEnter', {}, function(ev)
@@ -4007,7 +4030,7 @@ impl App {
         };
         let hidden = p.trust.hidden(ack.buf, proof)
             || head.is_some_and(|s| s.hidden)
-            || (facts.unseen && !p.trust.proven(ack.buf));
+            || (facts.unseen && !p.trust.proven(ack.buf, Unseen::Typed));
         let step = chain::Step {
             seq: cause.seq,
             pos: predict::Pos {
@@ -4179,6 +4202,19 @@ impl App {
                 (byte, vcol, Proof::Leave)
             }
         };
+        // Where a plugin's autocommand of the mode entered or left may move
+        // the cursor or edit the buffer — a trimmer of the blanks lines end
+        // in, whose `:%s` leaves the cursor on the last line it trimmed —
+        // worked out and judged, and not drawn, till enough have been judged
+        // right; as are the keys after it, which go on from it. Leaving it
+        // is taken for that, too, where what the agent says of the buffer
+        // was said before Insert mode was first entered in it, and a plugin
+        // loaded on the way in had yet to make its own.
+        let what = match proof {
+            Proof::Enter => Unseen::Entered,
+            _ => Unseen::Left,
+        };
+        let unseen = self.unseen(ack.buf, proof) && !p.trust.proven(ack.buf, what);
         // On the line's row: not past the end of a row its line fills, in a
         // window that wraps; and in one that does not, where the view shows
         // it as it is.
@@ -4207,7 +4243,7 @@ impl App {
             tick: ack.tick,
             line_count: ack.line_count,
             echo: echo.cloned(),
-            hidden: p.trust.hidden(ack.buf, proof) || head.is_some_and(|s| s.hidden),
+            hidden: unseen || p.trust.hidden(ack.buf, proof) || head.is_some_and(|s| s.hidden),
             until: p.deadline(cause.at),
         };
         let drawn = self.seen(grid, step.pos.line, None);
@@ -5254,15 +5290,19 @@ impl App {
     ///   agent sends the edits for ahead of it (see
     ///   [`Predictor::fresh`]); or, for a key that went into Insert mode or
     ///   out of it, over what an autocommand of the mode left of the buffer,
-    ///   the steps after it worked out again over that where it changed:
-    ///   *made*. It is let go of, and those before it, the cursor already
-    ///   where Neovim's frame has it; and that frame, its own, is checked to
-    ///   have drawn it in the cell the client did, and the line typed into
-    ///   as the client laid it out — where not, the client lays the line out
-    ///   otherwise than Neovim, and the window is left to Neovim a while. A
-    ///   line Neovim draws otherwise past its end only — virtual text there
-    ///   changed — has the steps after let go of, to be laid out again over
-    ///   it (see [`App::replay`]).
+    ///   the steps after it worked out again over that where it changed —
+    ///   or, where a plugin's may do anything and Neovim's word does not
+    ///   say, may have (see [`App::edited`]): *made*. One that changed it
+    ///   proves itself in the buffer before it is drawn there again, as one
+    ///   wrong would (see [`predict::Trust::edited`]). It is let go of, and
+    ///   those before it, the cursor already where Neovim's frame has it;
+    ///   and that frame, its own, is checked to have drawn it in the cell
+    ///   the client did, and the line typed into as the client laid it out
+    ///   — where not, the client lays the line out otherwise than Neovim,
+    ///   and the window is left to Neovim a while. A line Neovim draws
+    ///   otherwise past its end only — virtual text there changed — has the
+    ///   steps after let go of, to be laid out again over it (see
+    ///   [`App::replay`]).
     /// - The step for `k` is not: *wrong*. The cursor goes to where Neovim
     ///   has it at once, every step in the window let go of, and what it
     ///   was of proves itself in the buffer before it is drawn there again
@@ -5306,14 +5346,22 @@ impl App {
                 (Some(s), Some(true)) if s.pos == ack.pos && s.line_count == ack.line_count => {
                     self.anim.drop_upto(grid, k);
                     let at = (textoff, s.vcol);
+                    let moded = matches!(s.proof, Proof::Enter | Proof::Leave);
+                    let edited = moded.then(|| self.edited(k, &s, ack)).flatten();
+                    let unseen = moded && self.unseen(ack.buf, s.proof);
                     let Some(p) = self.predict.as_mut() else {
                         return;
                     };
-                    p.trust.made(ack.buf, s.proof, s.credited, !s.hidden);
+                    let credited = s.credited && (!moded || edited == Some(false));
+                    p.trust.made(ack.buf, s.proof, credited, !s.hidden);
+                    if edited == Some(true) {
+                        p.trust.edited(ack.buf, s.proof);
+                    }
                     // The buffer changed under the steps after it — by an
-                    // autocommand of the mode it went into: they are worked
-                    // out again over it.
-                    if s.echo.is_none() && s.tick != ack.tick {
+                    // autocommand of the mode it went into or out of — or,
+                    // where a plugin's may have and nothing says, may have:
+                    // they are worked out again over it.
+                    if moded && (edited == Some(true) || (edited.is_none() && unseen)) {
                         self.drop_steps(grid, now);
                         continue;
                     }
@@ -5370,6 +5418,37 @@ impl App {
                 _ => self.drop_steps(grid, now),
             }
         }
+    }
+
+    /// Whether key `k`, into Insert mode or out of it, found by Neovim's
+    /// word on it, `ack`, made as step `s` worked it out, edited the buffer
+    /// besides — which the key itself does not, but an autocommand of the
+    /// mode may: by the `b:changedtick` the step was worked out over; or,
+    /// after text typed ahead of Neovim, by its word on the key before, or
+    /// on any before with the buffer as it is now. `None` where nothing
+    /// says: Neovim's word on the text typed and the key at once.
+    fn edited(&self, k: u64, s: &chain::Step, ack: &predict::Ack) -> Option<bool> {
+        if s.echo.is_none() {
+            return Some(s.tick != ack.tick);
+        }
+        let base = self.predict.as_ref()?.base.as_ref()?;
+        let before = (base.seq < k && base.ack.buf == ack.buf).then_some(base.ack.tick)?;
+        if before == ack.tick {
+            Some(false)
+        } else {
+            (base.seq + 1 == k).then_some(true)
+        }
+    }
+
+    /// Whether, as the agent says of buffer `buf`, a plugin's autocommand
+    /// may do anything as a key of kind `proof` enters Insert mode, or
+    /// leaves it (see [`App::predict_mode`]).
+    fn unseen(&self, buf: i64, proof: Proof) -> bool {
+        let facts = self.predict.as_ref().and_then(|p| p.facts(buf));
+        facts.is_some_and(|f| match proof {
+            Proof::Enter => f.unseen_entered,
+            _ => f.unseen_left || !f.from_insert,
+        })
     }
 
     /// Whether Neovim's frame draws the line `e` typed into in window grid
@@ -11605,6 +11684,281 @@ mod tests {
         redraw(&mut a, events, t1);
         a.keys(b"i", t1);
         assert_eq!(terminal_cursor(&mut a), ((0, 1), 2), "proving itself");
+    }
+
+    /// [`moding`], the agent saying a plugin's autocommand may do anything
+    /// in the buffer as Insert mode is entered, if `entered`, and as it is
+    /// left, if `left`.
+    fn unseen_moding(entered: bool, left: bool, now: Instant) -> App {
+        let mut a = moding(Duration::from_millis(200));
+        facts(&mut a, |v| v.extend([entered.into(), left.into()]), now);
+        a
+    }
+
+    /// The last four of `keys`, as the agent says them with its word on
+    /// them.
+    fn tail(keys: &[&str]) -> String {
+        keys[keys.len().saturating_sub(4)..].concat()
+    }
+
+    /// Neovim's frame for [`moding`]'s window in Normal mode, the cursor at
+    /// byte `col` of line `line`.
+    fn normal_frame(line: i64, col: i64) -> Vec<(&'static str, Vec<Value>)> {
+        let mut events = vec![("mode_change", vec!["normal".into(), 0.into()])];
+        events.extend(cursor_to(line, col));
+        events
+    }
+
+    /// A plugin's `InsertLeave` — or `InsertLeavePre`, or `ModeChanged` —
+    /// may move the cursor or edit the buffer, as a trimmer of the blanks
+    /// lines end in does, its `:%s` leaving the cursor on the last line it
+    /// trimmed: in its buffer, `<Esc>` is worked out and judged, and not
+    /// drawn, nor the keys after it, which go on from it, till eight have
+    /// been judged right, each leaving the buffer as it was; from then on,
+    /// it is drawn. Entering Insert mode, which nothing of the plugin's sets
+    /// off, is drawn all along.
+    #[test]
+    fn insert_leave_hides_esc_until_proven() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = unseen_moding(false, true, t1);
+        a.keys(b"A", t1);
+        assert_eq!(terminal_cursor(&mut a), ((0, 6), 6), "A drawn");
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        a.keys(b"0", t1);
+        assert_eq!(
+            terminal_cursor(&mut a),
+            ((0, 6), 6),
+            "<Esc> and 0 worked out, and not drawn"
+        );
+        assert_eq!(a.anim.chain(2).map(chain::Chain::len), Some(3));
+        let mut keys = vec!["A"];
+        ack_i(&mut a, 1, &tail(&keys), 6, 1, t1);
+        redraw(&mut a, typed_frame("line 0", 6), t1);
+        keys.push("<Esc>");
+        ack0(&mut a, 2, &tail(&keys), 5, (1, 6), t1);
+        redraw(&mut a, normal_frame(0, 5), t1);
+        keys.push("0");
+        ack0(&mut a, 3, &tail(&keys), 0, (1, 6), t1);
+        redraw(&mut a, normal_frame(0, 0), t1);
+        assert!(a.anim.chain(2).is_none(), "made");
+        for n in 1..=8 {
+            a.keys(b"A", t1);
+            keys.push("A");
+            ack_i(&mut a, keys.len() as u64, &tail(&keys), 6, 1, t1);
+            redraw(&mut a, typed_frame("line 0", 6), t1);
+            a.keys(b"\x1b", t1);
+            a.escape_timeout(t1);
+            let drawn = terminal_cursor(&mut a);
+            if n < 8 {
+                assert_eq!(drawn, ((0, 6), 6), "{n} proved so far");
+            } else {
+                assert_eq!(drawn, ((0, 5), 2), "proved");
+            }
+            keys.push("<Esc>");
+            ack0(&mut a, keys.len() as u64, &tail(&keys), 5, (1, 6), t1);
+            redraw(&mut a, normal_frame(0, 5), t1);
+        }
+        let tally = a.predict.as_ref().expect("predicting").trust.tally;
+        assert_eq!((tally.wrong, tally.hidden_wrong), (0, 0), "{tally:?}");
+    }
+
+    /// A plugin's `InsertLeave` the agent says of only once `<Esc>` has been
+    /// drawn ahead eight times and more — made by hand, or by a plugin
+    /// loaded late — finds nothing proved of what it does: `<Esc>` is worked
+    /// out and judged, and not drawn, as where it was there all along.
+    #[test]
+    fn an_insert_leave_made_after_esc_was_drawn_has_it_prove_itself() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = unseen_moding(false, false, t1);
+        let mut keys = vec![];
+        for n in 0..9 {
+            a.keys(b"A", t1);
+            keys.push("A");
+            ack_i(&mut a, keys.len() as u64, &tail(&keys), 6, 1, t1);
+            redraw(&mut a, typed_frame("line 0", 6), t1);
+            a.keys(b"\x1b", t1);
+            a.escape_timeout(t1);
+            assert_eq!(
+                terminal_cursor(&mut a),
+                ((0, 5), 2),
+                "{n}: nothing to prove"
+            );
+            keys.push("<Esc>");
+            ack0(&mut a, keys.len() as u64, &tail(&keys), 5, (1, 6), t1);
+            redraw(&mut a, normal_frame(0, 5), t1);
+        }
+        facts(&mut a, |v| v.extend([false.into(), true.into()]), t1);
+        a.keys(b"A", t1);
+        keys.push("A");
+        ack_i(&mut a, keys.len() as u64, &tail(&keys), 6, 1, t1);
+        redraw(&mut a, typed_frame("line 0", 6), t1);
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        assert_eq!(terminal_cursor(&mut a), ((0, 6), 6), "proving itself");
+    }
+
+    /// The same of a plugin's `InsertEnter` — or `ModeChanged` — and the
+    /// keys that enter Insert mode: `i` is worked out and judged, and not
+    /// drawn, nor what is typed after it, till eight have been judged
+    /// right; `<Esc>`, which nothing of the plugin's sets off, is drawn all
+    /// along.
+    #[test]
+    fn insert_enter_hides_i_until_proven() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = unseen_moding(true, false, t1);
+        a.keys(b"ix", t1);
+        assert_eq!(terminal_cursor(&mut a), ((0, 0), 2), "a block still");
+        assert_eq!(composed(&mut a)[0], "line 0", "nothing typed");
+        ack_i(&mut a, 1, "i", 0, 1, t1);
+        redraw(&mut a, typed_frame("line 0", 0), t1);
+        splice0(&mut a, (1, 2), "xline 0", t1);
+        ack_i(&mut a, 2, "ix", 1, 2, t1);
+        redraw(&mut a, typed_frame("xline 0", 1), t1);
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        assert_eq!(terminal_cursor(&mut a), ((0, 0), 2), "<Esc> drawn");
+        let mut keys = vec!["i", "x", "<Esc>"];
+        ack0(&mut a, 3, &tail(&keys), 0, (2, 7), t1);
+        redraw(&mut a, normal_frame(0, 0), t1);
+        for n in 1..=8 {
+            a.keys(b"i", t1);
+            let drawn = terminal_cursor(&mut a);
+            if n < 8 {
+                assert_eq!(drawn, ((0, 0), 2), "{n} proved so far");
+            } else {
+                assert_eq!(drawn, ((0, 0), 6), "proved");
+            }
+            keys.push("i");
+            ack_i(&mut a, keys.len() as u64, &tail(&keys), 0, 2, t1);
+            redraw(&mut a, typed_frame("xline 0", 0), t1);
+            a.keys(b"\x1b", t1);
+            a.escape_timeout(t1);
+            keys.push("<Esc>");
+            ack0(&mut a, keys.len() as u64, &tail(&keys), 0, (2, 7), t1);
+            redraw(&mut a, normal_frame(0, 0), t1);
+        }
+    }
+
+    /// `<Esc>` drawn ahead of Neovim — in a buffer whose leaving Insert mode
+    /// the agent knows nothing to set off, or has proved itself — that
+    /// Neovim makes as drawn, the line typed into as typed, but with another
+    /// line edited besides, as Neovim's word on the key before it and on it
+    /// say: an autocommand of the mode, a plugin's, that the agent did not
+    /// know of or that had done nothing till then. The motion after it was
+    /// worked out over the buffer as it was, and is let go of, and worked
+    /// out again over it as it is; and `<Esc>` proves itself in the buffer
+    /// before it is drawn there again — though not drawn wrong, for that,
+    /// nor counted so.
+    #[test]
+    fn an_esc_that_edits_another_line_proves_itself_again() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = moding(Duration::from_millis(200));
+        a.keys(b"Ax", t1);
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        a.keys(b"j", t1);
+        assert_eq!(terminal_cursor(&mut a), ((1, 5), 2), "<Esc> and j drawn");
+        ack_i(&mut a, 1, "A", 6, 1, t1);
+        redraw(&mut a, typed_frame("line 0", 6), t1);
+        splice0(&mut a, (1, 2), "line 0x", t1);
+        ack_i(&mut a, 2, "Ax", 7, 2, t1);
+        redraw(&mut a, typed_frame("line 0x", 7), t1);
+        let trimmed: Vec<Value> = vec![
+            "splice".into(),
+            1000.into(),
+            1.into(),
+            2.into(),
+            3.into(),
+            1.into(),
+            2.into(),
+            1.into(),
+            Value::Array(vec!["line 1".into()]),
+        ];
+        notify(&mut a, "nvmux_client", trimmed, t1);
+        ack0(&mut a, 3, "Ax<Esc>", 6, (3, 7), t1);
+        redraw(&mut a, normal_frame(0, 6), t1);
+        let tally = a.predict.as_ref().expect("predicting").trust.tally;
+        assert_eq!(
+            (tally.made, tally.wrong, tally.unjudged),
+            (3, 0, 1),
+            "j let go of: {tally:?}"
+        );
+        assert_eq!(a.anim.chain(2).map(chain::Chain::len), Some(1));
+        assert_eq!(terminal_cursor(&mut a), ((1, 5), 2), "and worked out again");
+        let params: Vec<Value> = vec![
+            "ack".into(),
+            4.into(),
+            "Ax<Esc>j".into(),
+            "n".into(),
+            1000.into(),
+            1.into(),
+            3.into(),
+            50.into(),
+            1.into(),
+            5.into(),
+            6.into(),
+            0.into(),
+            0.into(),
+            6.into(),
+        ];
+        notify(&mut a, "nvmux_client", params, t1);
+        redraw(&mut a, normal_frame(1, 5), t1);
+        assert!(a.anim.chain(2).is_none(), "made");
+        a.keys(b"A", t1);
+        assert_eq!(terminal_cursor(&mut a), ((1, 6), 6), "A drawn");
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        assert_eq!(terminal_cursor(&mut a), ((1, 6), 6), "<Esc> proving itself");
+    }
+
+    /// Neovim's word on text typed and on the `<Esc>` after it at once says
+    /// nothing of what leaving Insert mode did to the buffer, which the text
+    /// changed as well: where a plugin's autocommand of it may do anything,
+    /// that `<Esc>` proves nothing, and the motion after it, worked out over
+    /// the buffer as it was, is worked out again over it as it is.
+    #[test]
+    fn esc_judged_with_the_text_before_it_proves_nothing() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = unseen_moding(false, true, t1);
+        a.keys(b"Ax", t1);
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        a.keys(b"0", t1);
+        ack_i(&mut a, 1, "A", 6, 1, t1);
+        redraw(&mut a, typed_frame("line 0", 6), t1);
+        splice0(&mut a, (1, 2), "line 0x", t1);
+        ack0(&mut a, 3, "Ax<Esc>", 6, (2, 7), t1);
+        let mut events = vec![line(2, 0, &format!("{:20}", "line 0x"))];
+        events.extend(normal_frame(0, 6));
+        redraw(&mut a, events, t1);
+        let tally = a.predict.as_ref().expect("predicting").trust.tally;
+        assert_eq!(tally.unjudged, 1, "0 let go of: {tally:?}");
+        assert_eq!(
+            a.anim.chain(2).map(chain::Chain::len),
+            Some(1),
+            "and remade"
+        );
+        let mut keys = vec!["A", "x", "<Esc>", "0"];
+        ack0(&mut a, 4, &tail(&keys), 0, (2, 7), t1);
+        redraw(&mut a, normal_frame(0, 0), t1);
+        for n in 1..=9 {
+            a.keys(b"A", t1);
+            keys.push("A");
+            ack_i(&mut a, keys.len() as u64, &tail(&keys), 7, 2, t1);
+            redraw(&mut a, typed_frame("line 0x", 7), t1);
+            a.keys(b"\x1b", t1);
+            a.escape_timeout(t1);
+            let drawn = terminal_cursor(&mut a);
+            if n <= 8 {
+                assert_eq!(drawn, ((0, 7), 6), "{} proved so far", n - 1);
+            } else {
+                assert_eq!(drawn, ((0, 6), 2), "proved");
+            }
+            keys.push("<Esc>");
+            ack0(&mut a, keys.len() as u64, &tail(&keys), 6, (2, 7), t1);
+            redraw(&mut a, normal_frame(0, 6), t1);
+        }
     }
 
     /// A count before `i` has `<Esc>` type the text again as many times

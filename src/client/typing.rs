@@ -14,10 +14,12 @@
 //! laid out afresh around the text the key leaves ([`relayout`]).
 //!
 //! What the agent cannot say is what a plugin's autocommand does as a key is
-//! typed — `InsertCharPre`, or `TextChangedI` and `CursorMovedI` of its own.
-//! It says only that there is one, and the client works out what it types in
-//! such a buffer without drawing it, till enough of it has been judged right
-//! (see `super::predict::Trust`).
+//! typed — `InsertCharPre`, or `TextChangedI` and `CursorMovedI` of its own —
+//! or as Insert mode is entered or left: `InsertEnter`, `InsertLeavePre`,
+//! `InsertLeave` and `ModeChanged`. It says only that there is one, and the
+//! client works out what it types in such a buffer, or the keys into Insert
+//! mode or out of it, without drawing them, till enough of them have been
+//! judged right (see `super::predict::Trust`).
 
 use rmpv::ValueRef;
 use unicode_width::UnicodeWidthChar;
@@ -47,6 +49,12 @@ pub struct Facts {
     /// nvmux's agents: what it does to a key typed, nothing says (see the
     /// module docs).
     pub unseen: bool,
+    /// The same of entering Insert mode, an autocommand of `InsertEnter` or
+    /// `ModeChanged`; and of leaving it, one of `InsertLeavePre`,
+    /// `InsertLeave` or `ModeChanged`: what it does — move the cursor, edit
+    /// the buffer — nothing says.
+    pub unseen_entered: bool,
+    pub unseen_left: bool,
     /// The column past which a character typed breaks the line, nought for
     /// none: `'textwidth'`, or the window's width less `'wrapmargin'` and
     /// its gutter, as Neovim's `comp_textwidth` works it out — or narrower.
@@ -98,9 +106,10 @@ impl Facts {
     /// As the agent sends them: `[buf, from_insert, firsts, abbrevs, unseen,
     /// tw, fo, indentkeys, smartindent, lisp, showmatch, matchpairs,
     /// autocomplete, editable, plain, bs, softtabs, smarttab, delcombine,
-    /// conceals, classes]` — `matchpairs` and `conceals` as the options have
-    /// them, and `classes` a character a code, `0` for a blank, `1` for one
-    /// of punctuation and `2` for one of a word. Says the buffer, and them.
+    /// conceals, classes, unseen_entered, unseen_left]` — `matchpairs` and
+    /// `conceals` as the options have them, and `classes` a character a
+    /// code, `0` for a blank, `1` for one of punctuation and `2` for one of
+    /// a word. Says the buffer, and them.
     pub fn read(v: &[ValueRef<'_>]) -> Option<(i64, Self)> {
         let int = |i: usize| v.get(i).and_then(redraw::int);
         let flag = |i: usize| matches!(v.get(i), Some(ValueRef::Boolean(true)));
@@ -133,6 +142,8 @@ impl Facts {
             delcombine: flag(18),
             conceals: text(19)?.into(),
             classes: text(20)?.bytes().map(|b| b.saturating_sub(b'0')).collect(),
+            unseen_entered: flag(21),
+            unseen_left: flag(22),
         };
         Some((int(0)?, facts))
     }
@@ -906,6 +917,8 @@ mod tests {
             firsts: Vec::new(),
             abbrevs: Vec::new(),
             unseen: false,
+            unseen_entered: false,
+            unseen_left: false,
             tw: 0,
             fo: "tcqj".into(),
             indentkeys: Indentkeys::default(),
@@ -1623,6 +1636,45 @@ mod tests {
             (f.keyword('a'), f.keyword('.'), f.keyword('日')),
             (Some(true), Some(false), None)
         );
+    }
+
+    /// The agent's word on autocommands of entering Insert mode and of
+    /// leaving it, last of all it says of a buffer's Insert mode.
+    #[test]
+    fn what_entering_and_leaving_insert_mode_set_off_is_read() {
+        use rmpv::Value;
+        let said = |entered: bool, left: bool| {
+            let mut v: Vec<Value> = vec![
+                7.into(),
+                true.into(),
+                Value::Array(vec![]),
+                Value::Array(vec![]),
+                false.into(),
+                0.into(),
+                "tcqj".into(),
+                "".into(),
+                false.into(),
+                false.into(),
+                false.into(),
+                "(:)".into(),
+                false.into(),
+                true.into(),
+                true.into(),
+                "indent,eol,start".into(),
+                false.into(),
+                true.into(),
+                false.into(),
+                "".into(),
+                "".into(),
+            ];
+            v.extend([Value::from(entered), Value::from(left)]);
+            let refs: Vec<ValueRef<'_>> = v.iter().map(Value::as_ref).collect();
+            let (_, f) = Facts::read(&refs).expect("read");
+            (f.unseen, f.unseen_entered, f.unseen_left)
+        };
+        assert_eq!(said(true, false), (false, true, false));
+        assert_eq!(said(false, true), (false, false, true));
+        assert_eq!(said(false, false), (false, false, false));
     }
 
     /// A window, a line's text, the byte the cursor is on in Normal mode, a
