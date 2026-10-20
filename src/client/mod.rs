@@ -3524,6 +3524,13 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
         } else if app.escape_due(now) {
             app.escape_timeout(now);
         }
+        // What the keys ask of Neovim goes now, ahead of the frame they may
+        // have predicted: composed first, that frame would hold them back by
+        // as long as it took — a millisecond a key, on its way to a link
+        // that is slow already, or no key would have been predicted.
+        if let Err(e) = app.outbox.send(&mut stream) {
+            break Err(anyhow::Error::from(e).context("writing to the session"));
+        }
         if app.due(now) {
             // Nothing at all, for a frame that changes nothing on the screen
             // and had nothing waiting to go ahead of it: see
