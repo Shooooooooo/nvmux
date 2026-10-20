@@ -257,13 +257,19 @@ pub struct ClientSettings {
     ///
     /// Experimental, and so far less than that: past `"scrolls"`, the
     /// motions along a line — `h`, `l`, `0`, `^`, `$`, `g_`, `|` and their
-    /// kind — and to another line in view — `j`, `k`, `+`, `-`, `_`,
-    /// `<CR>` and theirs, and `j` and `k` mapped as LazyVim maps them — are
-    /// drawn, with counts, and with them the numbers of `'relativenumber'`
-    /// and the bar of `'cursorline'`; but not those to another line in a
-    /// window whose gutter a `'statuscolumn'` draws, as LazyVim's is, which
-    /// are left to Neovim. The client follows the rest by what Neovim says
-    /// of each key rather than waiting for it to catch up with them all.
+    /// kind — and to another line — `j`, `k`, `+`, `-`, `_`, `<CR>` and
+    /// theirs, and `j` and `k` mapped as LazyVim maps them — are drawn, with
+    /// counts, and with them the numbers of `'relativenumber'` and the bar
+    /// of `'cursorline'`: in view, or past `'scrolloff'`, the view scrolled
+    /// as Neovim scrolls it, short of half the window, which Neovim centres
+    /// the cursor for instead — but not to bring into view a line Neovim
+    /// draws with virtual text or a sign, which the client would draw
+    /// without them. A key that scrolls, or a turn of the wheel, goes on
+    /// from where the motions before it left the cursor, and they from it.
+    /// But not those to another line in a window whose gutter a
+    /// `'statuscolumn'` draws, as LazyVim's is, which are left to Neovim.
+    /// The client follows the rest by what Neovim says of each key rather
+    /// than waiting for it to catch up with them all.
     /// `"typing"` draws what is typed in Insert mode as well — a character
     /// put in, or taken out with `<BS>` — and `i`, `a`, `A`, `I` and the
     /// `<Esc>` after them, the cursor taking the shape of the mode it goes
@@ -273,8 +279,12 @@ pub struct ClientSettings {
     /// has been found to go in as typed.
     ///
     /// What it costs: the agent says where each key left the cursor, about
-    /// 40 bytes a key back over the link, and each fence the client asks
-    /// after its keys reads the agent's count, about 40 bytes more. With
+    /// 40 bytes a key back over the link, and as the view moves, which lines
+    /// about it have virtual text or signs, a few bytes a run of them,
+    /// having looked them over as Neovim went to wait for the key — a
+    /// fraction of a millisecond where they are thick on every line; and
+    /// each fence the client asks after its keys reads the agent's count,
+    /// about 40 bytes more. With
     /// `"typing"`, the agent sends an edit with each key typed in Insert
     /// mode rather than at a pause, and the edit is the cursor's whole line:
     /// about a hundred bytes a key on a short line, and as much as four

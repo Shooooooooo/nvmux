@@ -34,28 +34,58 @@
 //! what the cursor's line decides — the numbers of `'relativenumber'`, the
 //! groups `'cursorline'` draws that line's gutter in, its bar across the
 //! line — which is drawn over Neovim's rows for as long as the cursor is
-//! drawn on another line than Neovim's ([`Chain::patches`]). So a frame of
-//! Neovim's that moves the view, or changes the text of a row a line the
-//! steps go onto is drawn on — an edit the client has yet to hear of,
-//! virtual text put between its characters — is one the steps were not
-//! worked out over: the cursor drawn on a step in it could be a sight
-//! Neovim never drew, and they are all let go of. What it draws on the
-//! other rows — a plugin's virtual text, its signs, a diagnostic — and in
-//! any row's gutter leaves them as they are; and so does a frame that draws
-//! a line typed into as a step typed it, as Neovim's frames for the keys
+//! drawn on another line than Neovim's (see `crate::client::App::repaint`)
+//! — but for one that takes the cursor past `'scrolloff'`, and a key that
+//! scrolls, which scroll the view ahead of Neovim as well (see
+//! `super::scroll`), the step the view as it leaves it ([`Chain::top`]).
+//! So a frame of Neovim's that moves the view otherwise than by the scrolls
+//! ahead it makes, or changes the text of a row a line the steps go onto is
+//! drawn on — an edit the client has yet to hear of, virtual text put
+//! between its characters — is one the steps were not worked out over: the
+//! cursor drawn on a step in it could be a sight Neovim never drew, and
+//! they are all let go of, and the scrolls ahead with them. A line a scroll
+//! ahead brought into view is one Neovim has yet to draw: the frame that
+//! does must draw it as the client laid it out. What it draws on the other
+//! rows — a plugin's virtual text, its signs, a diagnostic — and in any
+//! row's gutter leaves them as they are; and so does a frame that draws a
+//! line typed into as a step typed it, as Neovim's frames for the keys
 //! typed ahead do, one by one.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::time::Instant;
 
-use crate::client::compose::Patch;
 use crate::client::grid::{Cell, Text};
 use crate::client::predict::{Pos, Proof};
 
-/// What Neovim had drawn of a line a step goes onto (see [`Chain::lines`]):
-/// the view's first line, and the text of the row the line was on, from
-/// the gutter on — `None` where it was not in view.
-pub type Drawn = Option<(i64, Vec<Text>)>;
+/// What was drawn of a line a step goes onto when the first step onto it
+/// was worked out (see [`Chain::lines`]): `None` where nothing was.
+pub type Drawn = Option<Seen>;
+
+/// The text of a line a step goes onto, from the gutter on: the row Neovim
+/// drew it on (`whole`) — or, for a line out of Neovim's view that a scroll
+/// ahead of it brings in, as far as its text goes, as the client lays it
+/// out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seen {
+    pub text: Vec<Text>,
+    pub whole: bool,
+}
+
+impl Seen {
+    /// Whether Neovim's row for the line, `now` — `None` out of its view —
+    /// draws it as it was seen: the same row, or one that starts with the
+    /// text as the client laid it out. Out of view, there is nothing to
+    /// tell either way.
+    pub fn agrees(&self, now: Option<&[Text]>) -> bool {
+        now.is_none_or(|t| {
+            if self.whole {
+                t == self.text.as_slice()
+            } else {
+                t.starts_with(&self.text)
+            }
+        })
+    }
+}
 
 /// How many keys the cursor may be moved ahead of Neovim in a window: more,
 /// and Neovim is not keeping up, or not saying so.
@@ -72,14 +102,15 @@ pub struct Chain {
     pub win: i64,
     pub textoff: usize,
     pub left: usize,
-    /// The lines the steps move the cursor to, and what Neovim had drawn of
-    /// each when the first step onto it was worked out.
+    /// The lines the steps move the cursor to, and what was drawn of each
+    /// when the first step onto it was worked out.
     pub lines: Vec<(i64, Drawn)>,
-    /// What is drawn over the window's rows besides the cursor, by row of
-    /// its grid, while the cursor is drawn on another line than Neovim's:
-    /// what the cursor's line decides of them (see
-    /// `crate::client::App::repaint`).
-    pub patches: BTreeMap<usize, Vec<Patch>>,
+    /// The first line of the view the screen is to show once Neovim has
+    /// made what it has been sent: Neovim's view, scrolled as far as the
+    /// scrolls ahead of it go — those the steps made among them — as the
+    /// newest step left it. A view Neovim moved otherwise is one the steps
+    /// were not worked out over (see [`Chain::views`]).
+    pub top: i64,
     steps: VecDeque<Step>,
 }
 
@@ -134,7 +165,7 @@ impl Chain {
             textoff,
             left,
             lines: vec![(line, drawn)],
-            patches: BTreeMap::new(),
+            top: 0,
             steps: VecDeque::new(),
         }
     }
@@ -151,26 +182,17 @@ impl Chain {
         }
     }
 
-    /// Whether `now`, what Neovim draws of line `line` (see
-    /// [`Chain::lines`]), is the line as a step typed it — Neovim's frame for
-    /// a key typed ahead, or one it drew part way through them — in the view
-    /// the steps were worked out in.
-    pub fn typed(&self, line: i64, now: &Drawn) -> bool {
-        let Some((top, texts)) = now else {
+    /// Whether `now`, the text of the row Neovim draws line `line` on, past
+    /// the gutter, is the line as a step typed it — Neovim's frame for a key
+    /// typed ahead, or one it drew part way through them.
+    pub fn typed(&self, line: i64, now: Option<&[Text]>) -> bool {
+        let Some(texts) = now else {
             return false;
         };
-        let worked_in = self
-            .lines
+        self.steps
             .iter()
-            .find(|(l, _)| *l == line)
-            .and_then(|(_, drawn)| drawn.as_ref())
-            .map(|(t, _)| *t);
-        worked_in == Some(*top)
-            && self
-                .steps
-                .iter()
-                .filter_map(|s| s.echo.as_ref())
-                .any(|e| e.line == line && e.cells.iter().map(|c| &c.text).eq(texts))
+            .filter_map(|s| s.echo.as_ref())
+            .any(|e| e.line == line && e.cells.iter().map(|c| &c.text).eq(texts))
     }
 
     /// Whether a step types into line `line`.
@@ -206,15 +228,28 @@ impl Chain {
             .last()
     }
 
+    /// Whether a view from line `top`, Neovim's scrolled as far as the
+    /// scrolls ahead of it go, is one the steps were worked out over: the
+    /// one they leave ([`Chain::top`]); or one a step worked out only to be
+    /// judged leaves, which makes no scroll ahead of Neovim — its view
+    /// Neovim's to move, as its frame for the key does — and draws nothing.
+    pub fn views(&self, top: i64) -> bool {
+        top == self.top || self.steps.iter().any(|s| s.hidden && s.pos.top == top)
+    }
+
     /// The step for the client's key `seq`, if it made one.
     pub fn step_for(&self, seq: u64) -> Option<&Step> {
         self.steps.iter().find(|s| s.seq == seq)
     }
 
     /// Let go of the steps for the keys up to `seq`, Neovim's frame for
-    /// them having come.
+    /// them having come — and of the lines only they went onto, which are
+    /// nothing to the steps left.
     pub fn drop_upto(&mut self, seq: u64) {
         self.steps.retain(|s| s.seq > seq);
+        let steps = &self.steps;
+        self.lines
+            .retain(|(line, _)| steps.iter().any(|s| s.pos.line == *line));
     }
 
     /// The client's numbers for the keys of every step.
@@ -225,6 +260,14 @@ impl Chain {
     /// When the oldest step is let go of, unconfirmed.
     pub fn until(&self) -> Option<Instant> {
         self.steps.iter().map(|s| s.until).min()
+    }
+
+    /// Let go of no step before `until`: Neovim is still at work on the
+    /// keys, as it says while it scrolls (see `super::Animator::defer`).
+    pub fn defer(&mut self, until: Instant) {
+        for s in &mut self.steps {
+            s.until = s.until.max(until);
+        }
     }
 }
 

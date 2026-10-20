@@ -29,9 +29,12 @@
 //!   first character that is not a blank;
 //!
 //! — and after a move sideways the cursor wants the column it is drawn in:
-//! a character's first, or a tab's last. A motion that would move the view,
-//! up or down past `'scrolloff'`, is not followed; one that would move a view
-//! that does not wrap sideways moves it as Neovim does ([`predict::showing`]).
+//! a character's first, or a tab's last. A motion that takes the cursor up
+//! or down past `'scrolloff'` moves the view as Neovim's `update_topline`
+//! moves it for a short move, just far enough to keep `'scrolloff'` — and
+//! is not followed where it goes far enough for Neovim to centre the cursor
+//! instead (see [`keep_in_view`]); one that would move a view that does not
+//! wrap sideways moves it as Neovim does ([`predict::showing`]).
 //!
 //! The client follows the keys it sends by these, draws where they take the
 //! cursor at once (see `super::anim::chain`), and judges each against where
@@ -171,25 +174,33 @@ pub struct Ctx<'a> {
     /// sideways that would go past the end of its line is not followed,
     /// wherever it would have gone.
     pub whichwrap: Option<&'a str>,
+    /// `'scrolljump'`, where the client knows it, as `'whichwrap'`: not
+    /// knowing it, or it other than one — the view moved further than it
+    /// must, by a count of lines or a share of the window — a motion that
+    /// would move the view is not followed.
+    pub scrolljump: Option<i64>,
 }
 
 impl Ctx<'_> {
-    /// Whether the view from line `top` would still be there with the
-    /// cursor on line `line`: the window shows its lines one to a row, and
-    /// `'scrolloff'` is kept between the cursor and its edges but for the
-    /// buffer's own. A `'scrolloff'` as tall as half the window keeps the
-    /// cursor in its middle by rules of its own, which are not followed.
-    fn holds(&self, top: i64, line: i64) -> bool {
+    /// The line a view from line `top` shows first once the cursor goes to
+    /// line `line`: that line, where `'scrolloff'` is kept between the
+    /// cursor and its edges — but for the buffer's own — or one just far
+    /// enough to keep it, where Neovim scrolls no further (see
+    /// [`keep_in_view`]); where the window shows its lines one to a row.
+    /// `None` where the client cannot say: the view moved further, or by
+    /// a `'scrolljump'` other than one, or a line in it too long for a
+    /// row.
+    fn view(&self, top: i64, line: i64) -> Option<i64> {
         let (h, so) = (self.rows, self.shape.scrolloff as i64);
-        let bottom = top.saturating_add(h);
-        let shown = top..bottom.min(self.line_count);
-        2 * so < h - 1
-            && (line - top >= so || top == 0)
-            && (bottom - 1 - line >= so || bottom >= self.line_count)
-            && shown.contains(&line)
-            && shown
-                .clone()
-                .all(|l| (self.text)(l).is_some_and(|t| predict::fits(t, self.shape, self.width)))
+        let to = keep_in_view(top, line, h, so, self.line_count - 1)?;
+        if to != top && self.scrolljump != Some(1) {
+            return None;
+        }
+        let shown = to..to.saturating_add(h).min(self.line_count);
+        let one_to_one = shown
+            .clone()
+            .all(|l| (self.text)(l).is_some_and(|t| predict::fits(t, self.shape, self.width)));
+        (shown.contains(&line) && one_to_one).then_some(to)
     }
 
     /// Where a view that does not wrap shows a line from once the cursor is
@@ -209,11 +220,11 @@ impl Ctx<'_> {
 }
 
 /// Where `m`, counted `count`, takes the cursor from `at`, in the window
-/// and over the lines `cx` says, as Neovim 0.12 was found to take it: `None`
-/// where the client cannot say — or where the view would move up or down to
-/// show it, which is not followed.
+/// and over the lines `cx` says, as Neovim 0.12 was found to take it, and
+/// where the view goes with it, up or down (see [`Ctx::view`]): `None`
+/// where the client cannot say.
 pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
-    if at.rest != Rest::Normal || !cx.holds(at.top, at.line) {
+    if at.rest != Rest::Normal || cx.view(at.top, at.line) != Some(at.top) {
         return None;
     }
     let shape = cx.shape;
@@ -235,32 +246,9 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
         }
     };
     // To line `line`, onto the character `pick` finds there, wanting what
-    // the cursor is drawn in there, or `want`.
+    // the cursor is drawn in there, or `want`; the view moved with it.
     let down = |line: i64, pick: &dyn Fn(&[Ch]) -> Option<usize>, want: Option<Want>| {
-        if !cx.holds(at.top, line) {
-            return None;
-        }
-        let text = (cx.text)(line)?;
-        let cs = predict::chars(text, shape);
-        let ch = pick(&cs).and_then(|j| cs.get(j));
-        Some(Pos {
-            line,
-            byte: ch.map_or(0, |ch| ch.byte),
-            want: want.unwrap_or_else(|| Want::Col(ch.map_or(0, |ch| ch.at(shape)))),
-            left: cx.left(text, ch, at.left),
-            ..*at
-        })
-    };
-    // The character over display column `vcol`, or the last.
-    let over = |cs: &[Ch], vcol: usize| {
-        cs.iter()
-            .position(|ch| vcol < ch.vcol + ch.width)
-            .or(cs.len().checked_sub(1))
-    };
-    let first = |cs: &[Ch]| {
-        cs.iter()
-            .position(|ch| !matches!(ch.c, ' ' | '\t'))
-            .or(cs.len().checked_sub(1))
+        put(line, cx.view(at.top, line)?, pick, want, at, cx)
     };
     // `g_`'s: the last that is not a blank, or the first of a line all
     // blanks.
@@ -302,7 +290,7 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
         }
         Motion::Start | Motion::First if count.is_some() => None,
         Motion::Start => Some(sideways(Some(0), None)),
-        Motion::First => Some(sideways(first(&cs), None)),
+        Motion::First => Some(sideways(first_non_blank(&cs), None)),
         // With a count, on the line one fewer than counted down, or the
         // buffer's last — but from that, nowhere: the cursor stays on its
         // character, wanting the end of the line all the same, as Neovim
@@ -344,9 +332,82 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
             if by > 0 && line == at.line {
                 return Some(*at);
             }
-            down(line, &first, None)
+            down(line, &first_non_blank, None)
         }
     }
+}
+
+/// Where a scroll lands the cursor on the line it takes it to: see [`onto`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Landing {
+    /// Onto the character over the column it wants, as a motion down or up
+    /// lands it: what most scrolls do.
+    Want,
+    /// Onto the line's first character that is not a blank, wanting the
+    /// column it is drawn in: a page or half of one with `'startofline'`,
+    /// and `z<CR>`, `z.` and `z-`.
+    First,
+    /// Onto the character at the byte it was at, or the line's last before
+    /// it, wanting what it did: `zt`, `zz` and `zb` counted, which take it
+    /// to the line counted as `check_cursor_col` does.
+    Byte,
+}
+
+/// Where a scroll takes the cursor from `at`, the view going to line `top`
+/// and the cursor to line `line`, landing as `how` says — as Neovim 0.12.6
+/// was found to. `None` where the client does not have the line whole.
+pub fn onto(line: i64, how: Landing, top: i64, at: &Pos, cx: &Ctx) -> Option<Pos> {
+    match how {
+        Landing::Want => {
+            let want = at.want.col();
+            put(line, top, &|cs| over(cs, want), Some(at.want), at, cx)
+        }
+        Landing::First => put(line, top, &first_non_blank, None, at, cx),
+        Landing::Byte => {
+            let byte = at.byte;
+            let pick = |cs: &[Ch]| cs.iter().rposition(|ch| ch.byte <= byte);
+            put(line, top, &pick, Some(at.want), at, cx)
+        }
+    }
+}
+
+/// The cursor from `at` on line `line` of a view from line `top`, on the
+/// character `pick` finds there, wanting what it is drawn in there, or
+/// `want`; the view moved sideways to show it, where it does not wrap.
+fn put(
+    line: i64,
+    top: i64,
+    pick: &dyn Fn(&[Ch]) -> Option<usize>,
+    want: Option<Want>,
+    at: &Pos,
+    cx: &Ctx,
+) -> Option<Pos> {
+    let text = (cx.text)(line)?;
+    let cs = predict::chars(text, cx.shape);
+    let ch = pick(&cs).and_then(|j| cs.get(j));
+    Some(Pos {
+        line,
+        byte: ch.map_or(0, |ch| ch.byte),
+        want: want.unwrap_or_else(|| Want::Col(ch.map_or(0, |ch| ch.at(cx.shape)))),
+        top,
+        left: cx.left(text, ch, at.left),
+        ..*at
+    })
+}
+
+/// The character over display column `vcol`, or the last.
+fn over(cs: &[Ch], vcol: usize) -> Option<usize> {
+    cs.iter()
+        .position(|ch| vcol < ch.vcol + ch.width)
+        .or(cs.len().checked_sub(1))
+}
+
+/// The first character that is not a blank — the last, of a line all
+/// blanks.
+fn first_non_blank(cs: &[Ch]) -> Option<usize> {
+    cs.iter()
+        .position(|ch| !matches!(ch.c, ' ' | '\t'))
+        .or(cs.len().checked_sub(1))
 }
 
 /// Where a move sideways of `n` characters — back if `left` — takes the
@@ -357,9 +418,10 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
 /// place of its own to step onto; the buffer's first line or last is as far
 /// as it goes. The cursor then wants the column it is drawn in — or, having
 /// gone nowhere at all, what it wanted. `None` where it would pass a line
-/// the client does not have whole, or out of the view (see [`Ctx::holds`]),
-/// which a count as long as the buffer would: so many lines walked are no
-/// more than the view has.
+/// the client does not have whole, or out of the view's band — the lines
+/// `'scrolloff'` leaves the cursor, where the view stays (see
+/// [`Ctx::view`]) — which a count as long as the buffer would: so many
+/// lines walked are no more than the view has.
 fn wrapped(left: bool, n: usize, at: &Pos, cx: &Ctx) -> Option<Pos> {
     let last = (cx.line_count - 1).max(0);
     let mut line = at.line;
@@ -379,7 +441,7 @@ fn wrapped(left: bool, n: usize, at: &Pos, cx: &Ctx) -> Option<Pos> {
             break;
         }
         line = if left { line - 1 } else { line + 1 };
-        if !cx.holds(at.top, line) {
+        if cx.view(at.top, line) != Some(at.top) {
             return None;
         }
         cs = predict::chars((cx.text)(line)?, cx.shape);
@@ -398,6 +460,32 @@ fn wrapped(left: bool, n: usize, at: &Pos, cx: &Ctx) -> Option<Pos> {
         left: cx.left((cx.text)(line)?, ch, at.left),
         ..*at
     })
+}
+
+/// The line Neovim puts at the top of a view of `h` rows from line `top`
+/// once a motion takes the cursor to line `cursor`, of a buffer whose last
+/// is `last`, `'scrolloff'` `so`: where it was, if the cursor is `so` lines
+/// or more from its edges, or from the buffer's own; else just far enough
+/// to have it so, as Neovim's `scroll_cursor_top` and `scroll_cursor_bot`
+/// scroll for a short move — and `None` from as far on as `update_topline`
+/// would have `scroll_cursor_halfway` centre the cursor instead: up, from
+/// `halfheight`, half the window less one and never under two; down, from
+/// further than that, which is kept to the same. A `so` past half the
+/// window, which keeps the cursor in its middle by rules of its own, is
+/// `None` whatever the move. As Neovim 0.12.6 was found to, over every
+/// window from 4 rows to 60 (see `scripts/sweep-topline.lua`).
+pub fn keep_in_view(top: i64, cursor: i64, h: i64, so: i64, last: i64) -> Option<i64> {
+    if so > (h - 1) / 2 {
+        return None;
+    }
+    let to = if top > 0 && cursor < top + so {
+        (cursor - so).max(0)
+    } else if top.saturating_add(h - 1) < last && cursor > top + h - 1 - so {
+        ((cursor + so).min(last) - (h - 1)).max(top)
+    } else {
+        top
+    };
+    (to.abs_diff(top) < (h / 2 - 1).max(2).unsigned_abs()).then_some(to)
 }
 
 /// The display column the cursor is drawn in, in Normal mode, at byte
@@ -496,6 +584,7 @@ mod tests {
             width: 80,
             text: &text,
             whichwrap: ww,
+            scrolljump: Some(1),
         };
         let motions = parse(predict::tokens(keys), |_| false)?;
         motions
@@ -794,6 +883,7 @@ mod tests {
             width: 80,
             text: &text,
             whichwrap: Some("b,s"),
+            scrolljump: Some(1),
         };
         let busy = Pos {
             rest: Rest::Busy,
@@ -801,11 +891,12 @@ mod tests {
         };
         assert_eq!(moved(Motion::Down, None, &busy, &cx), None);
         // Down past the bottom of a view of four rows, or within
-        // 'scrolloff' of it; up past the top.
+        // 'scrolloff' of it, and up past the top, as far as Neovim centres
+        // the cursor rather than scroll just far enough: two rows of four.
         let short = Ctx { rows: 4, ..cx };
         let from = pos((2, 0, 0, 0, 0));
         assert!(moved(Motion::Down, None, &from, &short).is_some());
-        assert_eq!(moved(Motion::Down, Some(2), &from, &short), None);
+        assert_eq!(moved(Motion::Down, Some(3), &from, &short), None);
         let so = Shape {
             scrolloff: 1,
             ..s.clone()
@@ -814,9 +905,19 @@ mod tests {
             shape: &so,
             ..short
         };
-        assert_eq!(moved(Motion::Down, None, &from, &kept), None);
+        assert_eq!(moved(Motion::Down, Some(2), &from, &kept), None);
         let lower = pos((4, 0, 0, 4, 0));
-        assert_eq!(moved(Motion::Up, None, &lower, &short), None);
+        assert_eq!(moved(Motion::Up, Some(2), &lower, &short), None);
+        // Nor a row, by a 'scrolljump' the client does not know, or one
+        // that moves the view further than it must.
+        for jump in [None, Some(5), Some(-50)] {
+            let jumps = Ctx {
+                scrolljump: jump,
+                ..short
+            };
+            assert_eq!(moved(Motion::Down, Some(2), &from, &jumps), None);
+            assert!(moved(Motion::Down, None, &from, &jumps).is_some());
+        }
         // On past a line's end, out of the view: a count as long as the
         // buffer walks no further than the view.
         assert_eq!(moved(Motion::Right('s'), Some(10), &from, &short), None);
@@ -826,8 +927,8 @@ mod tests {
             Some(pos((12, 3, 3, 0, 0))),
             "to the buffer's last line, in view"
         );
-        // A counted `$` to a line out of it.
-        assert_eq!(moved(Motion::End, Some(3), &from, &short), None);
+        // A counted `$` to a line as far out of it.
+        assert_eq!(moved(Motion::End, Some(4), &from, &short), None);
         // A line too long for a window that wraps puts the rows out of step
         // with the lines.
         let narrow = Ctx { width: 5, ..cx };
@@ -854,6 +955,7 @@ mod tests {
             width: 80,
             text: &text,
             whichwrap: Some("b,s"),
+            scrolljump: Some(1),
         };
         for (line, (byte, want, vcol)) in [(4, 4, 4), (0, 0, 0), (0, 7, 7), (2, 2, 2)]
             .into_iter()
@@ -910,6 +1012,7 @@ mod tests {
             width: 10,
             text: &text,
             whichwrap: Some("b,s"),
+            scrolljump: Some(1),
         };
         #[rustfmt::skip]
         let cases: &[(State, &str, State)] = &[
@@ -930,4 +1033,488 @@ mod tests {
             assert_eq!(got, Some(pos(to)), "{keys:?} from {from:?}");
         }
     }
+
+    /// Past the edges of a view five rows tall, over [`LINES`]: a line or
+    /// two, `'scrolloff'` as each says, by `j`, `k` and their kind, the
+    /// view moved just far enough with the cursor — and, as far as Neovim
+    /// centres the cursor instead, not followed — as Neovim 0.12.6 was found
+    /// to move them.
+    #[test]
+    fn motions_past_the_edges_move_the_view_with_them() {
+        #[rustfmt::skip]
+        let cases: &[(usize, State, &str, Option<State>)] = &[
+            (0, (4, 0, 0, 0, 0), "j", Some((5, 0, 0, 1, 0))),
+            (0, (4, 0, 0, 0, 0), "2j", None),
+            (0, (4, 0, 0, 0, 0), "3j", None),
+            (0, (3, 0, 7, 0, 0), "jj", Some((5, 6, 7, 1, 0))),
+            (1, (3, 0, 7, 0, 0), "j", Some((4, 1, 7, 1, 0))),
+            (1, (3, 0, 7, 0, 0), "2j", None),
+            (0, (2, 0, 0, 2, 0), "k", Some((1, 0, 0, 1, 0))),
+            (0, (2, 0, 0, 2, 0), "2k", None),
+            (1, (5, 0, 0, 4, 0), "k", Some((4, 0, 0, 3, 0))),
+            (1, (5, 0, 0, 4, 0), "-", Some((4, 0, 0, 3, 0))),
+            (1, (5, 0, 0, 4, 0), "kj", Some((5, 0, 0, 3, 0))),
+            (0, (1, 1, -1, 1, 0), "k", Some((0, 10, -1, 0, 0))),
+            (0, (4, 0, 0, 0, 0), "jk", Some((4, 0, 0, 1, 0))),
+            (0, (4, 0, 0, 0, 0), "jjjj", Some((8, 0, 0, 4, 0))),
+            (0, (4, 0, 0, 0, 0), "+", Some((5, 0, 0, 1, 0))),
+            (0, (4, 0, 0, 0, 0), "<CR>", Some((5, 0, 0, 1, 0))),
+            (0, (4, 0, 0, 0, 0), "2_", Some((5, 0, 0, 1, 0))),
+            (0, (4, 0, 0, 0, 0), "2$", Some((5, 6, -1, 1, 0))),
+            (0, (9, 24, -1, 5, 0), "jj", Some((11, 17, -1, 7, 0))),
+            (0, (9, 6, 5, 8, 0), "kk", Some((7, 2, 5, 7, 0))),
+            // The buffer's last line in view: nothing to scroll.
+            (0, (11, 3, 10, 8, 0), "j", Some((12, 3, 10, 8, 0))),
+            (2, (10, 0, 0, 8, 0), "j", Some((11, 0, 0, 8, 0))),
+            (2, (10, 0, 0, 8, 0), "jj", Some((12, 0, 0, 8, 0))),
+            (0, (12, 0, 0, 8, 0), "j", Some((12, 0, 0, 8, 0))),
+        ];
+        for &(so, from, keys, to) in cases {
+            let s = Shape {
+                scrolloff: so,
+                ..shape()
+            };
+            let text = |l: i64| usize::try_from(l).ok().and_then(|l| LINES.get(l)).copied();
+            let cx = Ctx {
+                shape: &s,
+                line_count: LINES.len() as i64,
+                rows: 5,
+                width: 80,
+                text: &text,
+                whichwrap: Some("b,s"),
+                scrolljump: Some(1),
+            };
+            let got = parse(predict::tokens(keys), |_| false)
+                .expect("motions")
+                .into_iter()
+                .try_fold(pos(from), |at, (m, count)| moved(m, count, &at, &cx));
+            assert_eq!(got, to.map(pos), "{keys:?} from {from:?}, 'scrolloff' {so}");
+        }
+    }
+
+    /// Every top [`keep_in_view`] gives is the one Neovim gives, over every
+    /// window from 4 rows to 60, every `'scrolloff'` to half of it, and a
+    /// count of up to as many lines, down and up from the row nearest the
+    /// edge `'scrolloff'` lets the cursor be on: a short move, or none
+    /// (see [`TOPLINE`]). Up, Neovim scrolls just far enough for a count of
+    /// up to half the window less one, or two, whatever `'scrolloff'` is —
+    /// two rows, of four; nine, of 21; ten, of 22 and 23 — and down further;
+    /// `gj` and `gk` as `j` and `k`. Every move short of that is followed.
+    #[test]
+    fn motions_past_the_edges_scroll_as_neovim_does() {
+        let (top, last) = (400, 999);
+        let mut followed = 0;
+        for &(h, runs) in TOPLINE {
+            assert_eq!(runs[0], runs[1], "`gj` as `j`, {h} rows");
+            assert_eq!(runs[2], runs[3], "`gk` as `k`, {h} rows");
+            for (k, run) in runs.iter().enumerate() {
+                let up = k >= 2;
+                for (so, &just) in run.iter().enumerate() {
+                    let so = so as i64;
+                    let from = if up { top + so } else { top + h - 1 - so };
+                    let short = (h / 2 - 1).max(2);
+                    for n in 1..=h {
+                        let cursor = if up { from - n } else { from + n };
+                        let minimal = if up {
+                            cursor - so
+                        } else {
+                            cursor + so - (h - 1)
+                        };
+                        let got = keep_in_view(top, cursor, h, so, last);
+                        let at = format!(
+                            "{h} rows, 'scrolloff' {so}, {n} {}",
+                            ["j", "gj", "k", "gk"][k]
+                        );
+                        assert!(
+                            got.is_none() || (n <= just && got == Some(minimal)),
+                            "{at}: {got:?}"
+                        );
+                        if so <= (h - 1) / 2 && n < short {
+                            assert_eq!(got, Some(minimal), "{at}");
+                            followed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(followed > 10_000, "{followed}");
+        let up = |h: i64, n: i64| keep_in_view(400, 400 - n, h, 0, 999);
+        assert_eq!(up(21, 8), Some(392));
+        assert_eq!(up(21, 9), None);
+        assert_eq!(up(22, 9), Some(391));
+        assert_eq!(up(22, 10), None);
+    }
+
+    /// A `'scrolloff'` past half the window keeps the cursor in its middle
+    /// by rules of its own, which Neovim follows for every move: the view
+    /// it leaves is not worked out, however short the move — nor where it
+    /// would not move at all. Half the window less a row — ten of 22, the
+    /// cursor kept to the two rows between — scrolls just far enough, as
+    /// any less does.
+    #[test]
+    fn so_past_half_the_window_is_refused() {
+        for so in [11, 999] {
+            assert_eq!(keep_in_view(400, 412, 22, so, 999), None, "{so} down");
+            assert_eq!(keep_in_view(400, 410, 22, so, 999), None, "{so} up");
+            assert_eq!(
+                keep_in_view(400, 411, 22, so, 999),
+                None,
+                "{so} in the middle"
+            );
+        }
+        assert_eq!(keep_in_view(400, 412, 22, 10, 999), Some(401));
+        assert_eq!(keep_in_view(400, 409, 22, 10, 999), Some(399));
+        assert_eq!(keep_in_view(400, 411, 22, 10, 999), Some(400));
+    }
+
+    /// Generated by `scripts/sweep-topline.lua` with Neovim 0.12.6: for
+    /// each window height, and for `j`, `gj`, `k` and `gk` in turn, how far a
+    /// count goes, for each 'scrolloff' from nought to half the height, with
+    /// Neovim scrolling the view no further than it must — the count before the
+    /// first it scrolls further for, or the height where none is.
+    #[rustfmt::skip]
+    const TOPLINE: &[(i64, [&[i64]; 4])] = &[
+        (4, [
+            &[2, 4, 0],
+            &[2, 4, 0],
+            &[1, 4, 0],
+            &[1, 4, 0],
+        ]),
+        (5, [
+            &[3, 4, 5],
+            &[3, 4, 5],
+            &[1, 1, 5],
+            &[1, 1, 5],
+        ]),
+        (6, [
+            &[3, 4, 6, 0],
+            &[3, 4, 6, 0],
+            &[1, 1, 6, 0],
+            &[1, 1, 6, 0],
+        ]),
+        (7, [
+            &[4, 5, 6, 7],
+            &[4, 5, 6, 7],
+            &[1, 1, 1, 7],
+            &[1, 1, 1, 7],
+        ]),
+        (8, [
+            &[4, 5, 6, 8, 0],
+            &[4, 5, 6, 8, 0],
+            &[2, 2, 2, 8, 0],
+            &[2, 2, 2, 8, 0],
+        ]),
+        (9, [
+            &[5, 6, 7, 8, 9],
+            &[5, 6, 7, 8, 9],
+            &[2, 2, 2, 2, 9],
+            &[2, 2, 2, 2, 9],
+        ]),
+        (10, [
+            &[5, 6, 7, 8, 10, 0],
+            &[5, 6, 7, 8, 10, 0],
+            &[3, 3, 3, 3, 10, 0],
+            &[3, 3, 3, 3, 10, 0],
+        ]),
+        (11, [
+            &[6, 7, 8, 9, 10, 11],
+            &[6, 7, 8, 9, 10, 11],
+            &[3, 3, 3, 3, 3, 11],
+            &[3, 3, 3, 3, 3, 11],
+        ]),
+        (12, [
+            &[6, 7, 8, 9, 10, 12, 0],
+            &[6, 7, 8, 9, 10, 12, 0],
+            &[4, 4, 4, 4, 4, 12, 0],
+            &[4, 4, 4, 4, 4, 12, 0],
+        ]),
+        (13, [
+            &[7, 8, 9, 10, 11, 12, 13],
+            &[7, 8, 9, 10, 11, 12, 13],
+            &[4, 4, 4, 4, 4, 4, 13],
+            &[4, 4, 4, 4, 4, 4, 13],
+        ]),
+        (14, [
+            &[7, 8, 9, 10, 11, 12, 14, 0],
+            &[7, 8, 9, 10, 11, 12, 14, 0],
+            &[5, 5, 5, 5, 5, 5, 14, 0],
+            &[5, 5, 5, 5, 5, 5, 14, 0],
+        ]),
+        (15, [
+            &[8, 9, 10, 11, 12, 13, 14, 15],
+            &[8, 9, 10, 11, 12, 13, 14, 15],
+            &[5, 5, 5, 5, 5, 5, 5, 15],
+            &[5, 5, 5, 5, 5, 5, 5, 15],
+        ]),
+        (16, [
+            &[8, 9, 10, 11, 12, 13, 14, 16, 0],
+            &[8, 9, 10, 11, 12, 13, 14, 16, 0],
+            &[6, 6, 6, 6, 6, 6, 6, 16, 0],
+            &[6, 6, 6, 6, 6, 6, 6, 16, 0],
+        ]),
+        (17, [
+            &[9, 10, 11, 12, 13, 14, 15, 16, 17],
+            &[9, 10, 11, 12, 13, 14, 15, 16, 17],
+            &[6, 6, 6, 6, 6, 6, 6, 6, 17],
+            &[6, 6, 6, 6, 6, 6, 6, 6, 17],
+        ]),
+        (18, [
+            &[9, 10, 11, 12, 13, 14, 15, 16, 18, 0],
+            &[9, 10, 11, 12, 13, 14, 15, 16, 18, 0],
+            &[7, 7, 7, 7, 7, 7, 7, 7, 18, 0],
+            &[7, 7, 7, 7, 7, 7, 7, 7, 18, 0],
+        ]),
+        (19, [
+            &[10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+            &[10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+            &[7, 7, 7, 7, 7, 7, 7, 7, 7, 19],
+            &[7, 7, 7, 7, 7, 7, 7, 7, 7, 19],
+        ]),
+        (20, [
+            &[10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 0],
+            &[10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 0],
+            &[8, 8, 8, 8, 8, 8, 8, 8, 8, 20, 0],
+            &[8, 8, 8, 8, 8, 8, 8, 8, 8, 20, 0],
+        ]),
+        (21, [
+            &[11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+            &[11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+            &[8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 21],
+            &[8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 21],
+        ]),
+        (22, [
+            &[11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 0],
+            &[11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 0],
+            &[9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 22, 0],
+            &[9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 22, 0],
+        ]),
+        (23, [
+            &[12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
+            &[12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
+            &[9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 23],
+            &[9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 23],
+        ]),
+        (24, [
+            &[12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 24, 0],
+            &[12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 24, 0],
+            &[10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 24, 0],
+            &[10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 24, 0],
+        ]),
+        (25, [
+            &[13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25],
+            &[13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25],
+            &[10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 25],
+            &[10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 25],
+        ]),
+        (26, [
+            &[13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26, 0],
+            &[13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26, 0],
+            &[11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 26, 0],
+            &[11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 26, 0],
+        ]),
+        (27, [
+            &[14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27],
+            &[14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27],
+            &[11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 27],
+            &[11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 27],
+        ]),
+        (28, [
+            &[14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 28, 0],
+            &[14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 28, 0],
+            &[12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 28, 0],
+            &[12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 28, 0],
+        ]),
+        (29, [
+            &[15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29],
+            &[15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29],
+            &[12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 29],
+            &[12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 29],
+        ]),
+        (30, [
+            &[15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 30, 0],
+            &[15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 30, 0],
+            &[13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 30, 0],
+            &[13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 30, 0],
+        ]),
+        (31, [
+            &[16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
+            &[16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
+            &[13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 31],
+            &[13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 31],
+        ]),
+        (32, [
+            &[16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 32, 0],
+            &[16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 32, 0],
+            &[14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 32, 0],
+            &[14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 32, 0],
+        ]),
+        (33, [
+            &[17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33],
+            &[17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33],
+            &[14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 33],
+            &[14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 33],
+        ]),
+        (34, [
+            &[17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 34, 0],
+            &[17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 34, 0],
+            &[15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 34, 0],
+            &[15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 34, 0],
+        ]),
+        (35, [
+            &[18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35],
+            &[18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35],
+            &[15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 35],
+            &[15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 35],
+        ]),
+        (36, [
+            &[18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 36, 0],
+            &[18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 36, 0],
+            &[16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 36, 0],
+            &[16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 36, 0],
+        ]),
+        (37, [
+            &[19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37],
+            &[19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37],
+            &[16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 37],
+            &[16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 37],
+        ]),
+        (38, [
+            &[19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 38, 0],
+            &[19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 38, 0],
+            &[17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 38, 0],
+            &[17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 38, 0],
+        ]),
+        (39, [
+            &[20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39],
+            &[20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39],
+            &[17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 39],
+            &[17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 39],
+        ]),
+        (40, [
+            &[20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 40, 0],
+            &[20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 40, 0],
+            &[18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 40, 0],
+            &[18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 40, 0],
+        ]),
+        (41, [
+            &[21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41],
+            &[21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41],
+            &[18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 41],
+            &[18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 41],
+        ]),
+        (42, [
+            &[21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 42, 0],
+            &[21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 42, 0],
+            &[19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 42, 0],
+            &[19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 42, 0],
+        ]),
+        (43, [
+            &[22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43],
+            &[22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43],
+            &[19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 43],
+            &[19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 43],
+        ]),
+        (44, [
+            &[22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 0],
+            &[22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 0],
+            &[20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 44, 0],
+            &[20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 44, 0],
+        ]),
+        (45, [
+            &[23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45],
+            &[23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45],
+            &[20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 45],
+            &[20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 45],
+        ]),
+        (46, [
+            &[23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 46, 0],
+            &[23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 46, 0],
+            &[21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 46, 0],
+            &[21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 46, 0],
+        ]),
+        (47, [
+            &[24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47],
+            &[24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47],
+            &[21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 47],
+            &[21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 47],
+        ]),
+        (48, [
+            &[24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 48, 0],
+            &[24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 48, 0],
+            &[22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 48, 0],
+            &[22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 48, 0],
+        ]),
+        (49, [
+            &[25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49],
+            &[25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49],
+            &[22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 49],
+            &[22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 49],
+        ]),
+        (50, [
+            &[25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 50, 0],
+            &[25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 50, 0],
+            &[23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 50, 0],
+            &[23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 50, 0],
+        ]),
+        (51, [
+            &[26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51],
+            &[26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51],
+            &[23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 51],
+            &[23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 51],
+        ]),
+        (52, [
+            &[26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 52, 0],
+            &[26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 52, 0],
+            &[24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 52, 0],
+            &[24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 52, 0],
+        ]),
+        (53, [
+            &[27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53],
+            &[27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53],
+            &[24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 53],
+            &[24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 53],
+        ]),
+        (54, [
+            &[27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 54, 0],
+            &[27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 54, 0],
+            &[25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 54, 0],
+            &[25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 54, 0],
+        ]),
+        (55, [
+            &[28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55],
+            &[28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55],
+            &[25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 55],
+            &[25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 55],
+        ]),
+        (56, [
+            &[28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 56, 0],
+            &[28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 56, 0],
+            &[26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 56, 0],
+            &[26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 56, 0],
+        ]),
+        (57, [
+            &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57],
+            &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57],
+            &[26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 57],
+            &[26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 57],
+        ]),
+        (58, [
+            &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 58, 0],
+            &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 58, 0],
+            &[27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 58, 0],
+            &[27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 58, 0],
+        ]),
+        (59, [
+            &[30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59],
+            &[30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59],
+            &[27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 59],
+            &[27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 59],
+        ]),
+        (60, [
+            &[30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 60, 0],
+            &[30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 60, 0],
+            &[28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 60, 0],
+            &[28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 60, 0],
+        ]),
+    ];
 }

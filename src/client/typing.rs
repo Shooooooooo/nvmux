@@ -876,6 +876,8 @@ mod tests {
                 own_highlights: false,
                 conceals: false,
                 colorcolumn: Vec::new(),
+                scrolljump: 1,
+                concealing: false,
             }),
         }
     }

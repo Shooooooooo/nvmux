@@ -302,6 +302,14 @@ pub struct Stepping {
     /// counts from `'textwidth'` among them, where that is set — whatever
     /// the text in them: a window's columns, not a character's colours.
     pub colorcolumn: Vec<usize>,
+    /// `'scrolljump'`: how far a motion past `'scrolloff'` scrolls the view
+    /// at least, lines or, below nought, a share of the window (see
+    /// `super::moves::Ctx::scrolljump`).
+    pub scrolljump: i64,
+    /// `'conceallevel'` above nought: text a line not the cursor's may have
+    /// concealed, which a line a scroll brings into view is drawn without
+    /// by the client.
+    pub concealing: bool,
 }
 
 /// What `'cursorline'` draws of the cursor's line, as `'cursorlineopt'` has
@@ -409,7 +417,8 @@ impl Shape {
     /// [`Listchars::read`] has it — and, where the agent says what Neovim
     /// made of each key, `[whichwrap, virtualedit, cursorcolumn, bound,
     /// langmap, widths, numberwidth, number_signs, cursorline, idioms,
-    /// own_highlights, conceals, colorcolumn]` after them (see [`Stepping`]):
+    /// own_highlights, conceals, colorcolumn, scrolljump, concealing]` after
+    /// them (see [`Stepping`]):
     /// `numberwidth` no more than Neovim lets it be, `cursorline` as
     /// [`Cursorline::read`] has it, and `idioms` a list of
     /// [`Idiom::read`]'s.
@@ -473,6 +482,8 @@ impl Shape {
                             .collect()
                     })
                     .unwrap_or_default(),
+                scrolljump: int(38).unwrap_or(0),
+                concealing: flag(39),
             }),
         })
     }
@@ -3471,6 +3482,16 @@ pub struct Predictor {
     /// would not move it with their end, as the agent last said them, by
     /// window: see [`Predictor::pinned`].
     pinned: HashMap<i64, Vec<i64>>,
+    /// The runs of lines about the view Neovim draws with virtual text or
+    /// signs, and the lines the agent looked over for them, by window: see
+    /// [`Predictor::decorated`].
+    decorated: HashMap<i64, (std::ops::Range<i64>, Vec<std::ops::Range<i64>>)>,
+    /// The `'scroll'` a count given `<C-d>` or `<C-u>` set in a window, by
+    /// window, and the client's number for the key, till Neovim's word
+    /// covers it: a shape the agent said before Neovim took the key has
+    /// the `'scroll'` it had before, which it no longer has (see
+    /// [`Predictor::set_scroll`]).
+    scrolls_set: HashMap<i64, (u64, i64)>,
 }
 
 /// A time smoothed as TCP smooths its round trip (RFC 6298), and how much it
@@ -3671,7 +3692,10 @@ impl Predictor {
                     .get(1)
                     .and_then(ValueRef::as_array)
                     .and_then(|a| Shape::read(a));
-                if let (Some(win), Some(shape)) = (int(0), shape) {
+                if let (Some(win), Some(mut shape)) = (int(0), shape) {
+                    if let Some(&(_, scroll)) = self.scrolls_set.get(&win) {
+                        shape.scroll = scroll;
+                    }
                     self.shapes.insert(win, shape);
                 }
                 true
@@ -3698,6 +3722,18 @@ impl Predictor {
                 }
                 true
             }
+            "decorated" => {
+                let runs = v.get(3).and_then(ValueRef::as_array).map(|a| {
+                    let ends: Vec<i64> = a.iter().filter_map(redraw::int).collect();
+                    ends.as_chunks::<2>().0.iter().map(|&[a, b]| a..b).collect()
+                });
+                if let (Some(win), Some(from), Some(to), Some(runs)) =
+                    (int(0), int(1), int(2), runs)
+                {
+                    self.decorated.insert(win, (from..to, runs));
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -3708,6 +3744,8 @@ impl Predictor {
         self.lines.remove(&win);
         self.wants.remove(&win);
         self.pinned.remove(&win);
+        self.decorated.remove(&win);
+        self.scrolls_set.remove(&win);
     }
 
     /// A fresh attach, or a link too fast to predict over: its agent will
@@ -3718,6 +3756,8 @@ impl Predictor {
         self.wants.clear();
         self.facts.clear();
         self.pinned.clear();
+        self.decorated.clear();
+        self.scrolls_set.clear();
         self.base = None;
         self.queue.clear();
     }
@@ -3862,6 +3902,7 @@ impl Predictor {
     pub fn heard(&mut self, ack: &Ack, now: Instant) -> Option<u64> {
         self.wants.insert(ack.pos.win, ack.pos.want.col());
         let k = self.sync.heard(ack, self.typed.seq())?;
+        self.taken(k);
         if k > self.timed {
             if let Some(key) = self.queue.iter().find(|s| s.seq == k && !s.pending) {
                 self.timed = k;
@@ -3883,6 +3924,9 @@ impl Predictor {
         let upto = matches!(answer, Answer::Tied | Answer::Checked)
             .then(|| self.sync.number(taken))
             .flatten();
+        if let Some(k) = upto {
+            self.taken(k);
+        }
         if answer != Answer::Tied {
             return upto;
         }
@@ -3997,6 +4041,7 @@ impl Predictor {
             width,
             text: &text,
             whichwrap: shape.stepping.as_ref().map(|s| s.whichwrap.as_str()),
+            scrolljump: shape.stepping.as_ref().map(|s| s.scrolljump),
         };
         motions
             .into_iter()
@@ -4035,6 +4080,21 @@ impl Predictor {
         self.pinned.get(&win).is_none_or(|l| l.contains(&lnum))
     }
 
+    /// Whether Neovim may draw buffer line `lnum` of window `win` with more
+    /// than its text in its colours, which is all the client draws a line a
+    /// scroll ahead brings into view with (see [`Predictor::row`]): virtual
+    /// text — among its characters, which Neovim lays the line out around,
+    /// or after them, over them, at a column of the window's — or a sign, in
+    /// its column or over the number, or a sign's highlight across the line
+    /// or its number. As the agent last said of the lines about the view —
+    /// a window's height either side of it — or one it did not look over,
+    /// or has said nothing of (see `super::App::predict_move`).
+    pub fn decorated(&self, win: i64, lnum: i64) -> bool {
+        self.decorated.get(&win).is_none_or(|(over, runs)| {
+            !over.contains(&lnum) || runs.iter().any(|r| r.contains(&lnum))
+        })
+    }
+
     /// A key typed while window `win` has the cursor, as [`Typed::key`]
     /// takes it, with that window's mappings: one mapped to make what it
     /// makes unmapped (see [`Idiom`]) taken for the key itself, a row of the
@@ -4062,12 +4122,24 @@ impl Predictor {
         screened(command, same)
     }
 
-    /// A count given `<C-d>` or `<C-u>` is window `win`'s `'scroll'` from
-    /// then on.
-    pub fn set_scroll(&mut self, win: i64, scroll: i64) {
+    /// A count given `<C-d>` or `<C-u>`, key `seq`, is window `win`'s
+    /// `'scroll'` from then on — where the agent says what Neovim made of
+    /// each key, whatever a shape it said before Neovim took the key says,
+    /// till its word on the key (see [`Predictor::scrolls_set`]).
+    pub fn set_scroll(&mut self, win: i64, scroll: i64, seq: u64) {
         if let Some(s) = self.shapes.get_mut(&win) {
             s.scroll = scroll;
         }
+        if self.acks() {
+            self.scrolls_set.insert(win, (seq, scroll));
+        }
+    }
+
+    /// Neovim has taken the client's keys up to `k`: a `'scroll'` a count
+    /// set among them is Neovim's, in the shapes the agent says from here
+    /// on.
+    fn taken(&mut self, k: u64) {
+        self.scrolls_set.retain(|_, (seq, _)| *seq > k);
     }
 
     /// Neovim's view of window `win` now starts at display column `left`.
@@ -4325,6 +4397,8 @@ mod tests {
                 own_highlights: false,
                 conceals: false,
                 colorcolumn: Vec::new(),
+                scrolljump: 1,
+                concealing: false,
             }),
             ..shape()
         }

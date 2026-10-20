@@ -1345,14 +1345,26 @@ fn drawn_slowly_with(
     Terminal,
     Link,
 ) {
+    let settings = format!("{PREDICT_ON}{client}\n[effects.scroll]\nenabled = false\n");
+    drawn_slowly_as(scratch, tag, setline, &settings)
+}
+
+/// [`drawn_slowly`], the client's settings `settings`, whole: the scroll
+/// effect as they have it.
+fn drawn_slowly_as(
+    scratch: &Scratch,
+    tag: &str,
+    setline: &str,
+    settings: &str,
+) -> (
+    nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    Terminal,
+    Link,
+) {
     let (sock, mut rpc, config) = session(scratch, tag);
     rpc.command(&format!("setlocal noswapfile | {setline}"))
         .expect("setline");
-    std::fs::write(
-        &config,
-        format!("{PREDICT_ON}{client}\n[effects.scroll]\nenabled = false\n"),
-    )
-    .expect("config");
+    std::fs::write(&config, settings).expect("config");
     let (slow, link) = counted_link(&scratch.0.join("link"), &sock, SLOW);
 
     let mut term = Terminal::spawn(&slow, &config);
@@ -2374,6 +2386,223 @@ fn jk_mapped_the_lazyvim_way_are_predicted() {
     }
 }
 
+/// Lines enough to scroll over: `line 1` to `line 300`.
+const SCROLLING: &str = "call setline(1, map(range(1, 300), '\"line \" . v:val'))";
+
+/// The buffer line the cursor is on, from one, as the screen shows a window
+/// of [`SCROLLING`]'s lines: the first row's, and as many down as the
+/// cursor is.
+fn line_on(screen: &vt100::Screen) -> Option<u32> {
+    let top = top_line(&screen.contents())?;
+    Some(top + u32::from(screen.cursor_position().0))
+}
+
+/// `j` held down from the top of the window to well past its bottom, a key
+/// every 30 ms over a link slower each way than that: every one on the
+/// screen before Neovim could have heard of it — the cursor a line down,
+/// and once it is on the last row, the view a line on with it — a line at
+/// a time, never two at once, as Neovim's frames, coming in bursts behind
+/// the keys, would have it; and where Neovim's own frames leave it.
+#[test]
+fn holding_j_past_the_bottom_keeps_up() {
+    require_nvim!();
+    let scratch = Scratch::new("client-held-j");
+    let (mut rpc, mut term, _) = drawn_slowly_with(&scratch, "client-held-j", SCROLLING, MOTIONS);
+    let start = line_on(term.parser.screen()).expect("the first line");
+    let mut seen: Vec<(Instant, Option<u32>)> = vec![(Instant::now(), Some(start))];
+    let mut typed_at = Vec::new();
+    let mut note = |screen: &vt100::Screen| {
+        let on = line_on(screen);
+        if seen.last().map(|s| s.1) != Some(on) {
+            seen.push((Instant::now(), on));
+        }
+        false
+    };
+    for _ in 0..40 {
+        typed_at.push(Instant::now());
+        term.type_bytes(b"j");
+        term.frames(Duration::from_millis(30), &mut note);
+    }
+    term.frames(4 * SLOW, &mut note);
+    let when: Vec<(Duration, Option<u32>)> = seen
+        .iter()
+        .map(|(t, l)| (t.saturating_duration_since(typed_at[0]), *l))
+        .collect();
+    let lines: Vec<u32> = seen.iter().filter_map(|s| s.1).collect();
+    assert_eq!(lines.len(), seen.len(), "every sight a line: {when:?}");
+    assert!(
+        lines.windows(2).all(|w| w[1] == w[0] + 1),
+        "a line at a time: {when:?}"
+    );
+    for (k, at) in typed_at.iter().enumerate() {
+        let line = start + k as u32 + 1;
+        let drawn = seen.iter().find(|s| s.1 == Some(line)).map(|s| s.0);
+        assert!(
+            drawn.is_some_and(|d| d < *at + SLOW),
+            "the {}th `j` waited: {when:?}",
+            k + 1
+        );
+    }
+    let at = rpc
+        .call("nvim_win_get_cursor", vec![0.into()])
+        .expect("Neovim's cursor");
+    let line = at.as_array().and_then(|a| a[0].as_u64()).expect("its line");
+    assert_eq!(line, u64::from(start) + 40, "Neovim's");
+    assert_eq!(line_on(term.parser.screen()), Some(start + 40));
+    assert_eq!(top_line(&term.text()), Some(start + 40 - 21), "scrolled");
+}
+
+/// Type `keys`, which the client leaves to Neovim: nothing changes before
+/// Neovim could have heard of them; and once it has drawn them, the window
+/// is the one it drew.
+fn left_to_neovim(term: &mut Terminal, name: &str, keys: &[u8]) {
+    let before = window(term);
+    term.type_bytes(keys);
+    assert!(
+        !term.pump(SLOW, |t| window(t) != before),
+        "{name} drawn before Neovim could have heard of it:\n{}",
+        term.text()
+    );
+    term.pump_until(4 * SLOW, |_| false);
+    assert_ne!(window(term), before, "{name}: Neovim's frame");
+}
+
+/// `j` held past the bottom of a window with `'cursorline'`, its view
+/// sliding as the scroll effect has it by default: every frame has the bar
+/// under the row the cursor is drawn on, and under no other — the line a
+/// scroll ahead of Neovim brings into view shown at once, though the slide
+/// before it has yet to settle.
+#[test]
+fn holding_j_past_the_bottom_as_the_view_slides_keeps_the_bar_under_the_cursor() {
+    require_nvim!();
+    let scratch = Scratch::new("client-slide-j");
+    let setline = format!("set termguicolors cursorline | {SCROLLING}");
+    let settings = format!("{PREDICT_ON}{MOTIONS}");
+    let (_rpc, mut term, _) = drawn_slowly_as(&scratch, "client-slide-j", &setline, &settings);
+    typed(&mut term, b"L");
+    let screen = term.parser.screen();
+    let colours = colours_of(screen);
+    let bar = colours[usize::from(cursor(screen).0)][40].1;
+    assert_ne!(bar, colours[0][40].1, "a bar to be seen");
+    let mut wrong: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut check = |screen: &vt100::Screen| {
+        let colours = colours_of(screen);
+        let barred: Vec<usize> = (0..colours.len())
+            .filter(|&r| colours[r][40].1 == bar)
+            .collect();
+        let at = usize::from(cursor(screen).0);
+        if barred != [at] {
+            wrong.push((at, barred));
+        }
+        false
+    };
+    for _ in 0..30 {
+        term.type_bytes(b"j");
+        term.frames(Duration::from_millis(30), &mut check);
+    }
+    term.frames(4 * SLOW, &mut check);
+    assert!(
+        wrong.is_empty(),
+        "the cursor's row, and the bar's: {wrong:?}"
+    );
+}
+
+/// Turns of the wheel among motions to other lines and past the edges of
+/// the window, in bursts over a slow link: a turn after motions drawn ahead
+/// of Neovim goes on from where they left the cursor and the view, never
+/// from Neovim's own, which they have yet to move — nothing on the screen
+/// Neovim never drew.
+#[test]
+fn turns_of_the_wheel_among_motions_show_nothing_neovim_never_drew() {
+    require_nvim!();
+    const DOWN: (&[u8], &str) = (b"\x1b[<65;20;5M", "<ScrollWheelDown>");
+    const UP: (&[u8], &str) = (b"\x1b[<64;20;5M", "<ScrollWheelUp>");
+    let mut keys: Vec<(Vec<u8>, String)> = vec![(b"21j".to_vec(), "21j".into())];
+    for _ in 0..4 {
+        for (bytes, name) in [
+            (&b"j"[..], "j"),
+            (b"j", "j"),
+            (b"j", "j"),
+            DOWN,
+            (b"j", "j"),
+            DOWN,
+            DOWN,
+            (b"k", "k"),
+            (b"k", "k"),
+            UP,
+            (b"j", "j"),
+            (b"j", "j"),
+            UP,
+            (b"k", "k"),
+        ] {
+            keys.push((bytes.to_vec(), name.into()));
+        }
+    }
+    sights_are_neovims("client-wheel", SCROLLING, MOTIONS, &keys, Lcg(13));
+}
+
+/// Counted `j` and `k` past the edges of the window, which Neovim scrolls
+/// as it goes: as far as it scrolls the view just far enough — under half
+/// the window, nine rows of its 22 — drawn before Neovim could have heard
+/// of them, where its own frames put the cursor and the view; further,
+/// where it centres the cursor instead, or may, left to it, and drawn as it
+/// draws them.
+#[test]
+fn every_jump_predicted_lands_where_neovim_puts_it() {
+    require_nvim!();
+    let scratch = Scratch::new("client-jumps");
+    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, "client-jumps", SCROLLING, MOTIONS);
+    predicted(&mut term, "21j, to the last row", b"21j");
+    predicted(&mut term, "8j past it", b"8j");
+    predicted(&mut term, "9j", b"9j");
+    left_to_neovim(&mut term, "10j", b"10j");
+    left_to_neovim(&mut term, "15j", b"15j");
+    typed(&mut term, b"H");
+    predicted(&mut term, "8k past the first row", b"8k");
+    predicted(&mut term, "9k", b"9k");
+    left_to_neovim(&mut term, "10k", b"10k");
+    typed(&mut term, b"H");
+    left_to_neovim(&mut term, "15k", b"15k");
+    // With 'scrolloff', from the row it keeps the cursor off the edge.
+    typed(&mut term, b":set so=3\r");
+    typed(&mut term, b"L");
+    predicted(&mut term, "2j to 'scrolloff'", b"2j");
+    predicted(&mut term, "j with 'scrolloff'", b"j");
+    predicted(&mut term, "5+", b"5+");
+    left_to_neovim(&mut term, "12j", b"12j");
+}
+
+/// Scrolls and motions in the same window, in a run before Neovim has
+/// heard of any: each made from where the one before left the cursor and
+/// the view — a page from the line the motions took the cursor to, motions
+/// from the line a page took it to, the view as the scrolls left it —
+/// before Neovim could have heard of them, where its own frames put them;
+/// in a window numbered by 'number' and 'relativenumber', with
+/// 'scrolloff', its gutter as Neovim draws it.
+#[test]
+fn scrolls_and_motions_mixed_show_at_once() {
+    require_nvim!();
+    let scratch = Scratch::new("client-mixed");
+    let setline = format!("set nu rnu so=2 | {SCROLLING}");
+    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, "client-mixed", &setline, MOTIONS);
+    for (name, keys) in [
+        ("jjjj<C-d>", &b"jjjj\x04"[..]),
+        ("<C-d>jj", b"\x04jj"),
+        ("j<C-e>j", b"j\x05j"),
+        ("<C-e><C-e>k", b"\x05\x05k"),
+        ("k<C-y>", b"k\x19"),
+        ("<C-u>3k", b"\x153k"),
+        ("2<C-e>j", b"2\x05j"),
+        ("<C-f>j", b"\x06j"),
+        ("<C-b>k", b"\x02k"),
+        ("ztj", b"ztj"),
+        ("zzk", b"zzk"),
+        ("zbj", b"zbj"),
+    ] {
+        predicted(&mut term, name, keys);
+    }
+}
+
 /// The client told to type ahead of Neovim, as well as to work out the
 /// motions.
 const TYPING: &str = "predict_keys = \"typing\"\n";
@@ -3020,6 +3249,22 @@ fn random_motions_to_other_lines_show_nothing_neovim_never_drew() {
 /// [`sights_are_neovims`].
 fn random_motions(tag: &str, setup: &str, alphabet: &[(&[u8], &str)], counted: &[&str]) {
     let mut rng = Lcg(7);
+    let keys = random_keys(&mut rng, alphabet, counted);
+    let setline = match setup {
+        "" => MOVING.to_string(),
+        setup => format!("{setup} | {MOVING}"),
+    };
+    sights_are_neovims(tag, &setline, MOTIONS, &keys, rng);
+}
+
+/// Two hundred keys from `alphabet`, as `rng` picks them, those in
+/// `counted` with a count a third of the time, and an `x` now and then:
+/// each as the terminal sends it and as Neovim names it.
+fn random_keys(
+    rng: &mut Lcg,
+    alphabet: &[(&[u8], &str)],
+    counted: &[&str],
+) -> Vec<(Vec<u8>, String)> {
     let mut keys: Vec<(Vec<u8>, String)> = Vec::new();
     while keys.len() < 200 {
         if rng.below(15) == 0 {
@@ -3036,11 +3281,105 @@ fn random_motions(tag: &str, setup: &str, alphabet: &[(&[u8], &str)], counted: &
         b.extend_from_slice(bytes);
         keys.push((b, format!("{count}{name}")));
     }
+    keys
+}
+
+/// Lines to scroll over and move along: `line 1` and those like it, a word
+/// more and more of them, among tabs, text two cells wide, blank lines and
+/// empty ones.
+const SCROLLED: &str = r#"call setline(1, map(range(1, 200), 'v:val % 9 == 4 ? "\tint x" . v:val . " = 0;" : v:val % 11 == 5 ? "" : v:val % 13 == 6 ? "日本語のテキスト " . v:val : v:val % 17 == 7 ? "    " : "line " . v:val . repeat(" word", v:val % 8)'))"#;
+
+/// Random motions to other lines and along them, and scrolls by keys —
+/// `<C-e>`, `<C-y>`, `<C-d>`, `<C-u>` — counted too, typed in bursts over
+/// a slow link to a client that draws them ahead of Neovim, over lines
+/// enough to scroll (see [`SCROLLED`]), its window set up by `setup`: every
+/// sight of the window it shows is one Neovim drew for the keys typed so
+/// far, in order — the colours of each too, where `coloured` (see
+/// [`sights_compared`]).
+fn random_scrolls(tag: &str, setup: &str, coloured: bool) {
+    const KEYS: &[(&[u8], &str)] = &[
+        (b"l", "l"),
+        (b"h", "h"),
+        (b"$", "$"),
+        (b"0", "0"),
+        (b"j", "j"),
+        (b"k", "k"),
+        (b"j", "j"),
+        (b"k", "k"),
+        (b"j", "j"),
+        (b"+", "+"),
+        (b"-", "-"),
+        (b"\x05", "<C-e>"),
+        (b"\x19", "<C-y>"),
+        (b"\x04", "<C-d>"),
+        (b"\x15", "<C-u>"),
+    ];
+    const COUNTED: &[&str] = &["l", "h", "j", "k", "+", "-", "<C-e>", "<C-y>"];
+    let mut rng = Lcg(11);
+    let keys = random_keys(&mut rng, KEYS, COUNTED);
     let setline = match setup {
-        "" => MOVING.to_string(),
-        setup => format!("{setup} | {MOVING}"),
+        "" => SCROLLED.to_string(),
+        setup => format!("{setup} | {SCROLLED}"),
     };
-    sights_are_neovims(tag, &setline, MOTIONS, &keys, rng);
+    sights_compared(tag, &setline, MOTIONS, &keys, rng, coloured);
+}
+
+/// Motions past the edges of the window, which scroll it ahead of Neovim,
+/// and scrolls by keys among them: nothing on the screen Neovim never drew.
+#[test]
+fn random_scrolls_and_motions_show_nothing_neovim_never_drew() {
+    require_nvim!();
+    random_scrolls("fz-scroll", "", false);
+}
+
+/// [`random_scrolls_and_motions_show_nothing_neovim_never_drew`] in a
+/// window numbered by `'number'` and `'relativenumber'`: every row's number
+/// as Neovim draws it with the cursor where it is drawn, the rows a scroll
+/// ahead brings into view and all.
+#[test]
+fn random_scrolls_and_motions_number_the_rows_as_neovim_does() {
+    require_nvim!();
+    random_scrolls("fz-scroll-nu", "set nu rnu", false);
+}
+
+/// [`random_scrolls_and_motions_number_the_rows_as_neovim_does`] with
+/// `'cursorline'` drawing its bar and numbering the cursor's line, and
+/// `'scrolloff'` keeping three lines about the cursor: every sight's
+/// colours as Neovim draws them too, the bar under the line the cursor is
+/// drawn on, scrolled into view or not.
+#[test]
+fn random_scrolls_and_motions_draw_the_bar_as_neovim_does() {
+    require_nvim!();
+    random_scrolls(
+        "fz-scroll-cul",
+        "set termguicolors nu rnu cursorline scrolloff=3 | exe 'NoMatchParen'",
+        true,
+    );
+}
+
+/// `j` held past the bottom of the window, and `k` back past its top, over
+/// lines a plugin decorates — a sign on some, a diagnostic's virtual text
+/// after others, more over their text — in bursts over a slow link: a line
+/// that Neovim draws with any of it is never brought into view ahead of
+/// Neovim without it, nothing on the screen ever what Neovim did not draw.
+#[test]
+fn lines_with_signs_or_virtual_text_are_not_scrolled_into_view_without_them() {
+    require_nvim!();
+    let setline = format!(
+        "set signcolumn=yes | {SCROLLING} | \
+         exe 'lua local api, ns = vim.api, vim.api.nvim_create_namespace(\"t\") \
+         vim.fn.sign_define(\"S\", {{ text = \">>\" }}) \
+         for l = 24, 70, 5 do vim.fn.sign_place(0, \"g\", \"S\", \"%\", {{ lnum = l }}) end \
+         for l = 26, 70, 5 do api.nvim_buf_set_extmark(0, ns, l, 0, \
+         {{ virt_text = {{ {{ \"E: oops\", \"Error\" }} }} }}) end \
+         for l = 28, 70, 5 do api.nvim_buf_set_extmark(0, ns, l, 0, \
+         {{ virt_text = {{ {{ \"XX\", \"Error\" }} }}, virt_text_pos = \"overlay\" }}) end'"
+    );
+    let mut keys: Vec<(Vec<u8>, String)> = vec![(b"L".to_vec(), "L".into())];
+    keys.extend((0..40).map(|_| (b"j".to_vec(), "j".to_string())));
+    keys.push((b"H".to_vec(), "H".into()));
+    keys.extend((0..30).map(|_| (b"k".to_vec(), "k".to_string())));
+    sights_are_neovims("client-signs", &setline, MOTIONS, &keys, Lcg(9));
 }
 
 /// `keys` — each as the terminal sends it and as Neovim names it — typed in
@@ -3057,12 +3396,32 @@ fn sights_are_neovims(
     setline: &str,
     client: &str,
     keys: &[(Vec<u8>, String)],
-    mut rng: Lcg,
+    rng: Lcg,
 ) {
+    sights_compared(tag, setline, client, keys, rng, false);
+}
+
+/// [`sights_are_neovims`], each sight's colours compared as well where
+/// `coloured` — the brackets MatchParen lights up for the one and not the
+/// other then to be left unlit in both by `setline`.
+fn sights_compared(
+    tag: &str,
+    setline: &str,
+    client: &str,
+    keys: &[(Vec<u8>, String)],
+    mut rng: Lcg,
+    coloured: bool,
+) {
+    type Seen = (
+        Sight,
+        Option<Vec<Vec<(vt100::Color, vt100::Color, bool, bool)>>>,
+    );
+    let sight =
+        |screen: &vt100::Screen| -> Seen { (sight(screen), coloured.then(|| colours_of(screen))) };
     let scratch = Scratch::new(tag);
     let (_rpc, mut term, _) = drawn_slowly_with(&scratch, tag, setline, client);
     // Typed in bursts of one to six keys 30 ms apart, a pause between.
-    let mut seen: Vec<Sight> = vec![sight(term.parser.screen())];
+    let mut seen: Vec<Seen> = vec![sight(term.parser.screen())];
     let mut at = 0;
     while at < keys.len() {
         let burst = (1 + rng.below(6) as usize).min(keys.len() - at);
@@ -3113,7 +3472,7 @@ fn sights_are_neovims(
         Duration::from_millis(100),
         Duration::from_secs(5),
     );
-    let mut drew: Vec<Sight> = vec![sight(reference.parser.screen())];
+    let mut drew: Vec<Seen> = vec![sight(reference.parser.screen())];
     for (_, name) in keys {
         rpc.call("nvim_input", vec![name.as_str().into()])
             .expect("input");
@@ -3134,13 +3493,18 @@ fn sights_are_neovims(
             Some(k) => from += k,
             None => panic!(
                 "sight {i} of {} is none Neovim drew from key {from} on ({:?}): \
-                 cursor {:?}, rows\n{}\nNeovim's after that key: cursor {:?}, rows\n{}",
+                 cursor {:?}, rows\n{}\nNeovim's after that key: cursor {:?}, rows\n{}{}",
                 seen.len(),
                 keys.get(from).map(|k| &k.1),
-                s.1,
-                s.0.join("\n"),
-                drew[from].1,
-                drew[from].0.join("\n"),
+                s.0 .1,
+                s.0 .0.join("\n"),
+                drew[from].0 .1,
+                drew[from].0 .0.join("\n"),
+                if s.0 == drew[from].0 {
+                    "\n(in other colours)"
+                } else {
+                    ""
+                },
             ),
         }
     }
