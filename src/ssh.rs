@@ -149,7 +149,15 @@ fn unattended(ctl: &Path) -> Vec<String> {
 /// down drops packets rather than refusing them, so without a bound each
 /// attempt would hang for the minutes the kernel allows and the series would
 /// never get to its next try. See [`crate::reconnect`].
-fn master_args(host: &str, own: &Path, connect_timeout: Option<u64>) -> Vec<String> {
+///
+/// `ipqos` is what the master marks its packets with in place of what ssh
+/// would, where that wants changing: see [`master_ipqos`].
+fn master_args(
+    host: &str,
+    own: &Path,
+    connect_timeout: Option<u64>,
+    ipqos: Option<&str>,
+) -> Vec<String> {
     let mut args = vec![
         "-M".into(),
         "-N".into(),
@@ -171,9 +179,44 @@ fn master_args(host: &str, own: &Path, connect_timeout: Option<u64>) -> Vec<Stri
     if let Some(secs) = connect_timeout {
         args.extend(["-o".into(), format!("ConnectTimeout={secs}")]);
     }
+    if let Some(ipqos) = ipqos {
+        args.extend(["-o".into(), format!("IPQoS={ipqos}")]);
+    }
     args.extend(common(own));
     args.push(host.to_string());
     args
+}
+
+/// What upstream OpenSSH marks a connection's packets with unless told
+/// otherwise, from 7.8 until 10.1: `af21` for an interactive session, `cs1`
+/// for everything else.
+const UPSTREAM_IPQOS: &str = "af21 cs1";
+
+/// What a master marks them with instead, where ssh would have used
+/// [`UPSTREAM_IPQOS`].
+const MASTER_IPQOS: &str = "af21 cs0";
+
+/// The `IPQoS` a master is given in place of the one `ssh -G` says ssh would
+/// use (`config`, its output), if that one wants changing.
+///
+/// A master started with `-N` is not an interactive session, so ssh marks it
+/// with the second of the pair, and up to 10.0 that is `cs1` unless the user
+/// or the system's ssh says otherwise: the lowest class there is. Wi-Fi puts
+/// a packet so marked in its background queue, behind everything else on the
+/// air — and on nvmux's master that is every key typed and every frame
+/// Neovim draws. `cs0` is the class a packet nobody marked is in. The first
+/// of the pair is kept: a master never uses it.
+///
+/// Only ssh's own default is changed. Debian and Ubuntu build ssh with another
+/// pair, 10.1 and later have `cs0` there already, and a pair set in
+/// `~/.ssh/config` is the user's to have; and before 8.7 the config file wins
+/// over `-o` anyway. An `ssh` without `-G` (before 6.8) is left as it is.
+fn master_ipqos(config: &str) -> Option<&'static str> {
+    config
+        .lines()
+        .find_map(|line| line.strip_prefix("ipqos "))
+        .filter(|ipqos| ipqos.trim() == UPSTREAM_IPQOS)
+        .map(|_| MASTER_IPQOS)
 }
 
 /// Ask the master answering on `own` to exit.
@@ -384,6 +427,17 @@ impl Ssh {
             .output()
     }
 
+    /// The `IPQoS` a master to this host is to be given, if ssh's own wants
+    /// changing: see [`master_ipqos`]. `ssh -G` reads the configuration and
+    /// connects to nothing.
+    fn ipqos(&self) -> Option<&'static str> {
+        let out = self.run(&["-G".into(), self.host.clone()]).ok()?;
+        out.status
+            .success()
+            .then(|| master_ipqos(&String::from_utf8_lossy(&out.stdout)))
+            .flatten()
+    }
+
     /// Is a master connection up for this host?
     pub fn is_master_alive(&self) -> bool {
         self.run(&check_args(&self.host, &self.control_path))
@@ -435,10 +489,11 @@ impl Ssh {
             stderr: format!("naming a master connection to {}: {e}", self.host),
         })?;
         let own = paths::master_socket(&self.control_path, &nonce);
+        let ipqos = self.ipqos();
         // `-f` backgrounds ssh once authentication is done, so this blocks for
         // exactly as long as a key touch or passphrase takes.
         let out = self
-            .run(&master_args(&self.host, &own, connect_timeout))
+            .run(&master_args(&self.host, &own, connect_timeout, ipqos))
             .map_err(|e| spawn_error(e, &self.host))?;
         if !out.status.success() {
             return Err(classify(
@@ -761,7 +816,7 @@ mod tests {
 
     #[test]
     fn the_master_sets_stream_local_bind_unlink() {
-        let args = master_args("myhost", Path::new(CTL), None);
+        let args = master_args("myhost", Path::new(CTL), None, None);
         let s = joined(&args);
         // This one is load-bearing: without it `-O cancel` leaves the socket
         // file and the next forward fails rc 255, breaking re-attach.
@@ -779,14 +834,47 @@ mod tests {
     /// is bounded, and only then.
     #[test]
     fn a_connect_timeout_is_set_only_when_asked_for() {
-        let unbounded = joined(&master_args("myhost", Path::new(CTL), None));
+        let unbounded = joined(&master_args("myhost", Path::new(CTL), None, None));
         assert!(!unbounded.contains("ConnectTimeout"), "{unbounded}");
-        let bounded = joined(&master_args("myhost", Path::new(CTL), Some(10)));
+        let bounded = joined(&master_args("myhost", Path::new(CTL), Some(10), None));
         assert!(bounded.contains("ConnectTimeout=10"), "{bounded}");
         assert!(
             bounded.ends_with("myhost"),
             "the host is still last: {bounded}"
         );
+    }
+
+    /// Wi-Fi puts what upstream ssh marks a master's packets with in its
+    /// background queue: a master is moved out of it, and nothing else is.
+    #[test]
+    fn only_ssh_s_own_ipqos_is_moved_off_the_lowest_class() {
+        let config = |ipqos: &str| format!("user me\nipqos {ipqos}\nserveraliveinterval 0\n");
+        assert_eq!(
+            master_ipqos(&config("af21 cs1")),
+            Some("af21 cs0"),
+            "upstream's own pair, 7.8 to 10.0"
+        );
+        for kept in [
+            "lowdelay throughput",
+            "ef cs0",
+            "none none",
+            "af41 cs1",
+            "cs1 cs1",
+        ] {
+            assert_eq!(master_ipqos(&config(kept)), None, "{kept} is left alone");
+        }
+        assert_eq!(master_ipqos(""), None, "an ssh that cannot say");
+
+        let moved = joined(&master_args(
+            "myhost",
+            Path::new(CTL),
+            None,
+            Some("af21 cs0"),
+        ));
+        assert!(moved.contains("-o IPQoS=af21 cs0"), "{moved}");
+        assert!(moved.ends_with("myhost"), "the host is still last: {moved}");
+        let left = joined(&master_args("myhost", Path::new(CTL), None, None));
+        assert!(!left.contains("IPQoS"), "{left}");
     }
 
     /// Setting it on the forward client does nothing, because the master does
@@ -955,7 +1043,7 @@ mod tests {
             "1.2.3.4",
             "h-1_2.example",
         ] {
-            assert!(master_args(host, Path::new(CTL), None).contains(&host.to_string()));
+            assert!(master_args(host, Path::new(CTL), None, None).contains(&host.to_string()));
             assert!(check_args(host, Path::new(CTL)).contains(&host.to_string()));
         }
     }
