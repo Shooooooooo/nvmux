@@ -265,11 +265,15 @@ pub struct ClientSettings {
     /// the cursor for instead — but not to bring into view a line Neovim
     /// draws with virtual text or a sign, which the client would draw
     /// without them. A key that scrolls, or a turn of the wheel, goes on
-    /// from where the motions before it left the cursor, and they from it.
-    /// But not those to another line in a window whose gutter a
-    /// `'statuscolumn'` draws, as LazyVim's is, which are left to Neovim.
-    /// The client follows the rest by what Neovim says of each key rather
-    /// than waiting for it to catch up with them all.
+    /// from where the motions before it left the cursor, and they from it;
+    /// and a scroll that takes the cursor to another line, the wheel's among
+    /// them, has the numbers and the bar moved with it where the client can
+    /// draw them as Neovim does, and leaves them as Neovim drew them till
+    /// its next frame where not, as it always did. But not those to another
+    /// line in a window whose gutter a `'statuscolumn'` draws, as LazyVim's
+    /// is, which are left to Neovim. The client follows the rest by what
+    /// Neovim says of each key rather than waiting for it to catch up with
+    /// them all.
     /// `"typing"` draws what is typed in Insert mode as well — a character
     /// put in, or taken out with `<BS>` — and `i`, `a`, `A`, `I` and the
     /// `<Esc>` after them, the cursor taking the shape of the mode it goes

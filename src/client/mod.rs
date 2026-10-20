@@ -3672,6 +3672,30 @@ impl App {
                 || !self.regutters(grid, to))
     }
 
+    /// Whether what the cursor's line decides of window grid `grid` can be
+    /// drawn over its rows as Neovim draws it with the cursor on line `to`
+    /// rather than on Neovim's `from` (see [`App::repaint`]), where it shows
+    /// lines Neovim's view does not as well: as [`App::may_leave`] has it,
+    /// and where the cursor's line decides any of it, rows of the lines out
+    /// of Neovim's view the client can draw afresh (see [`App::afresh`]). A
+    /// window whose options the agent has said nothing of past the shape it
+    /// says of every window — what the cursor's line decides among them —
+    /// is one the client draws nothing over, as one it works out no motions
+    /// in.
+    fn redrawn_with(&self, grid: u64, (from, to): (i64, i64)) -> bool {
+        let shape = self
+            .model
+            .wins
+            .get(&grid)
+            .and_then(|win| self.predict.as_ref()?.shape(*win));
+        let Some((shape, stepping)) = shape.and_then(|s| Some((s, s.stepping.as_ref()?))) else {
+            return true;
+        };
+        let cul = stepping.cursorline;
+        let decided = shape.relativenumber || cul.number || cul.line;
+        to == from || (self.may_leave(grid, (from, to)) && (!decided || self.afresh(grid)))
+    }
+
     /// Move the cursor in window grid `grid` ahead of Neovim as `step`
     /// says, worked out `on` the window as it was (see [`App::onward`]),
     /// for key `cause`: the line it goes onto as `drawn` (see
@@ -4199,7 +4223,9 @@ impl App {
     }
 
     /// Draw over each window the cursor has been moved ahead of Neovim in
-    /// (see [`anim::chain`]) what Neovim will draw of its rows besides the
+    /// (see [`anim::chain`]) — and, where the client works out the motions,
+    /// each scrolled ahead of Neovim or sliding, the cursor drawn where the
+    /// scrolls take it — what Neovim will draw of its rows besides the
     /// cursor, once it hears of the keys: the line typed into, as typed;
     /// where the cursor is drawn on another line than Neovim's, the gutter
     /// as Neovim draws it with the cursor there (see [`predict::regutter`]),
@@ -4210,7 +4236,12 @@ impl App {
     /// the cursor where it is drawn. Before every frame: Neovim's frames,
     /// the steps, the view and its slide all move what is to be drawn.
     fn repaint(&mut self) {
-        let grids = self.anim.chained();
+        let mut grids = self.anim.chained();
+        if self.predict.as_ref().is_some_and(Predictor::acks) {
+            grids.extend(self.anim.scrolled());
+            grids.sort_unstable();
+            grids.dedup();
+        }
         for grid in self.anim.patched() {
             if !grids.contains(&grid) {
                 self.anim.patch(grid, BTreeMap::new());
@@ -4226,7 +4257,9 @@ impl App {
     /// its grid: `None` for nothing.
     ///
     /// Each row shows a line: the one its grid has, or another, the rows
-    /// scrolled ahead of Neovim or sliding (see [`anim::Animator::rows_shown`]).
+    /// scrolled ahead of Neovim or sliding (see [`anim::Animator::rows_shown`]);
+    /// and the cursor is drawn on one, as the steps or the scrolls ahead
+    /// have it (see [`anim::Animator::cursor_line`]).
     /// Of a row of a line Neovim drew — its grid's, or one its view has left
     /// that the window's scroll keeps (see [`anim::scroll::Kept`]) — Neovim's
     /// drawing is drawn over: the row of the line typed into ahead of
@@ -4241,15 +4274,22 @@ impl App {
     /// line the client brought into view ahead of Neovim, in a window where
     /// the cursor's line decides any of it, is drawn afresh, with its gutter
     /// and bar as Neovim draws them with the cursor where it is drawn (see
-    /// [`drawn_afresh`]).
+    /// [`drawn_afresh`]). What the cursor's line decides is drawn over no row
+    /// where the client cannot draw it as Neovim does (see
+    /// [`App::redrawn_with`]): it is left as Neovim drew it, for its next
+    /// frame to put right.
     fn patches_of(&mut self, grid: u64) -> Option<BTreeMap<usize, Vec<compose::Patch>>> {
         let view = *self.model.viewports.get(&grid)?;
         let win = *self.model.wins.get(&grid)?;
         let rect = anim::text_rect(&self.model, grid)?;
         let (top, bot, left, right) = rect;
         let (h, width) = (bot - top, right - left);
-        let shown = self.anim.shown_step(&self.model, grid)?;
-        let (to, echo) = (shown.pos.line, shown.echo.clone());
+        let to = self.anim.cursor_line(&self.model, grid, h as i64)?;
+        let echo = self
+            .anim
+            .shown_step(&self.model, grid)
+            .and_then(|s| s.echo.clone());
+        let redrawn = self.redrawn_with(grid, (view.curline, to));
         let ids = predict::Gutter::of(|name| self.model.groups.get(name).copied());
         // What the rows drawn afresh are drawn with, once for them all.
         let afresh = self
@@ -4264,8 +4304,8 @@ impl App {
         let textoff = shape.textoff;
         let text = (left + textoff).min(right);
         let cul = shape.stepping.as_ref().map(|s| s.cursorline);
-        let bars = cul.is_some_and(|c| c.line && !c.screenline);
-        let decided = shape.relativenumber || cul.is_some_and(|c| c.number || c.line);
+        let bars = redrawn && cul.is_some_and(|c| c.line && !c.screenline);
+        let decided = redrawn && (shape.relativenumber || cul.is_some_and(|c| c.number || c.line));
         let ahead = self.anim.rows_shown(grid);
         let mut patches: BTreeMap<usize, Vec<compose::Patch>> = BTreeMap::new();
         for r in 0..h {
@@ -9921,6 +9961,121 @@ mod tests {
         assert_eq!(a.anim.ahead(2).0, -1, "before Neovim has heard of them");
         assert_eq!(composed(&mut a)[..2], ["1   line 0", "  1 line 1"]);
         assert_eq!(repainted(&mut a)[0], Some(vec![10; 4]), "the gutter alone");
+    }
+
+    /// A turn of the wheel that scrolls the cursor's line out of view, which
+    /// Neovim moves the cursor down for, has the gutter renumbered with the
+    /// cursor where it is drawn: on Neovim's rows that stay in view and on
+    /// those the scroll brings in, each number in the group its place
+    /// takes.
+    #[test]
+    fn a_scroll_alone_renumbers_the_rows_with_the_cursor() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = numbered(Duration::from_millis(200), 0, &[]);
+        a.keys(b"\x1b[<65;3;2M", t1);
+        assert_eq!(a.anim.ahead(2), (3, 3), "before Neovim has heard of it");
+        assert!(a.anim.chain(2).is_none(), "a scroll alone");
+        assert_eq!(drawn(&a), (0, 4));
+        let rows = [
+            "4   line 3",
+            "  1 line 4",
+            "  2 line 5",
+            "  3 line 6",
+            "  4 line 7",
+        ];
+        assert_eq!(composed(&mut a)[..5], rows);
+        let groups: Vec<Option<Vec<u32>>> = repainted(&mut a)
+            .into_iter()
+            .map(|g| g.map(|g| g[..4].to_vec()))
+            .collect();
+        assert_eq!(
+            groups,
+            [
+                Some(vec![10; 4]),
+                Some(vec![12; 4]),
+                Some(vec![12; 4]),
+                Some(vec![12; 4]),
+                Some(vec![12; 4]),
+            ]
+        );
+    }
+
+    /// A scroll that draws the cursor on another line than Neovim's in a
+    /// window whose gutter the client cannot lay out as Neovim does — in
+    /// groups of the window's own, or a `'statuscolumn'`'s — or where the
+    /// line it leaves may be drawn concealed, is drawn all the same, as a
+    /// scroll was before the client drew what the cursor's line decides:
+    /// Neovim's rows numbered as Neovim numbered them, for its own frame to
+    /// put right. So is one that leaves the cursor on its line, which
+    /// changes nothing of that.
+    #[test]
+    fn a_scroll_alone_the_gutter_cannot_follow_leaves_it_as_neovim_drew_it() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let shape = |plain: bool, own: bool, conceals: bool| {
+            let mut s = shaped(4, (true, true, plain), (false, 0), &[], vec![]);
+            s.extend([own.into(), conceals.into()]);
+            s
+        };
+        for (name, shape) in [
+            ("groups of its own", shape(true, true, false)),
+            ("a 'statuscolumn'", shape(false, false, false)),
+            ("text concealed", shape(true, false, true)),
+        ] {
+            let mut a = numbered(Duration::from_millis(200), 0, &[]);
+            reshape(&mut a, shape, t1);
+            a.keys(b"\x1b[<65;3;2M", t1);
+            assert_eq!(a.anim.ahead(2), (3, 3), "{name}: the cursor pushed down");
+            assert_eq!(drawn(&a), (0, 4), "{name}");
+            let rows = composed(&mut a);
+            assert_eq!(rows[..2], ["  3 line 3", "  4 line 4"], "{name}");
+            assert!(repainted(&mut a).iter().all(Option::is_none), "{name}");
+        }
+        let mut a = numbered(Duration::from_millis(200), 0, &[]);
+        reshape(&mut a, shape(true, true, false), t1);
+        redraw(&mut a, numbers_drawn((4, 0), false, &[]), t1);
+        ack(&mut a, 0, "", "n", (4, 0, 0, 0), t1);
+        a.keys(b"\x1b[<65;3;2M", t1);
+        assert_eq!(a.anim.ahead(2), (3, 0), "the cursor on its line");
+        assert_eq!(composed(&mut a)[1], "5   line 4");
+    }
+
+    /// A row Neovim drew that its view has left, which a slide still shows,
+    /// is drawn as Neovim drew it — its virtual text and all, which the
+    /// client's own lines have nothing of — its gutter renumbered with the
+    /// cursor where it now is: from where Neovim had it as it drew the row.
+    #[test]
+    fn a_row_neovim_drew_that_a_slide_still_shows_is_renumbered_as_it_was() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = numbered(Duration::from_millis(200), 0, &[]);
+        let mut s = crate::config::Settings::default();
+        s.effects.scroll.enabled = true;
+        s.effects.windows.enabled = false;
+        a.anim.set_effects(Effects::from_settings(&s));
+        redraw(&mut a, vec![line_hl(2, 1, 11, "VT", 0)], t1);
+        // Neovim scrolls the view two lines down, the cursor to line 3.
+        let n = Value::from;
+        let mut events = vec![(
+            "grid_scroll",
+            vec![n(2), n(0), n(5), n(0), n(20), n(2), n(0)],
+        )];
+        for r in 0..5i64 {
+            let line = r + 2;
+            let number = match line.cmp(&3) {
+                std::cmp::Ordering::Equal => "4   ".to_string(),
+                _ => format!("{:>3} ", (line - 3).abs()),
+            };
+            events.push(line_hl(2, r as u64, 0, &number, 10));
+            let text = format!("{:16}", format!("line {line}"));
+            events.push(line_hl(2, r as u64, 4, &text, 0));
+        }
+        events.push(("grid_cursor_goto", vec![n(2), n(1), n(4)]));
+        events.push((
+            "win_viewport",
+            vec![n(2), n(1000), n(2), n(8), n(3), n(0), n(50), n(2)],
+        ));
+        redraw(&mut a, events, t1);
+        let rows = composed(&mut a);
+        assert_eq!(rows[..2], ["  2 line 1 VT", "  1 line 2"], "a row behind");
     }
 
     /// `j` and `k` mapped as LazyVim maps them — to `gj` and `gk` with no

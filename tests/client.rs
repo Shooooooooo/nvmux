@@ -2603,6 +2603,53 @@ fn scrolls_and_motions_mixed_show_at_once() {
     }
 }
 
+/// Type `keys`, a scroll or a motion the client draws ahead of Neovim, as
+/// [`predicted`] has it — and its colours as well: once Neovim's own frame
+/// lands, every cell of the window as the client drew it.
+fn predicted_in_colour(term: &mut Terminal, name: &str, keys: &[u8]) {
+    let before = window(term);
+    term.type_bytes(keys);
+    assert!(
+        term.pump(SLOW, |t| window(t) != before),
+        "{name} waited for Neovim:\n{}",
+        term.text()
+    );
+    term.pump_until(Duration::from_millis(30), |_| false);
+    let predicted = (window(term), colours(term));
+    term.pump_until(4 * SLOW, |_| false);
+    let landed = (window(term), colours(term));
+    assert_eq!(predicted.0, landed.0, "{name}: the text and the cursor");
+    for (r, (p, l)) in predicted.1.iter().zip(&landed.1).enumerate() {
+        assert_eq!(p, l, "{name}: row {r} changed colour when Neovim's landed");
+    }
+}
+
+/// Scrolls the client draws as scrolls alone, steps or none — the wheel,
+/// pages in Insert mode — in a window numbered by `'number'` and
+/// `'relativenumber'` with `'cursorline'`'s bar: where one takes the cursor
+/// to another line, every number and the bar drawn as Neovim draws them
+/// with the cursor there, on the rows that stay in view and on those it
+/// brings in, the colours and all.
+#[test]
+fn scrolls_alone_number_the_rows_and_lay_the_bar_as_neovim_does() {
+    require_nvim!();
+    let scratch = Scratch::new("client-alone");
+    let setline = format!("set termguicolors nu rnu cursorline | {SCROLLING}");
+    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, "client-alone", &setline, MOTIONS);
+    term.pump_until(Duration::from_secs(2), |_| false);
+    // The wheel down over the window, the cursor on its first line: three
+    // lines, the cursor pushed down with them; and up again, pushed up.
+    predicted_in_colour(&mut term, "the wheel down", b"\x1b[<65;20;5M");
+    predicted_in_colour(&mut term, "and again", b"\x1b[<65;20;5M");
+    typed(&mut term, b"L");
+    predicted_in_colour(&mut term, "the wheel up", b"\x1b[<64;20;5M");
+    // Pages in Insert mode.
+    typed(&mut term, b"i");
+    predicted_in_colour(&mut term, "<PageDown> in Insert mode", b"\x1b[6~");
+    predicted_in_colour(&mut term, "<PageUp> in Insert mode", b"\x1b[5~");
+    predicted_in_colour(&mut term, "<S-Down> in Insert mode", b"\x1b[1;2B");
+}
+
 /// The client told to type ahead of Neovim, as well as to work out the
 /// motions.
 const TYPING: &str = "predict_keys = \"typing\"\n";
