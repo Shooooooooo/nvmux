@@ -556,7 +556,9 @@ if predict then
     -- for the line and four for the screen line; whether the window has
     -- highlights of its own, or conceals what the cursor's line shows; the
     -- columns 'colorcolumn' colours; 'scrolljump'; whether it may conceal
-    -- text on any line; and what 'iskeyword' makes of each character.
+    -- text on any line; what 'iskeyword' makes of each character; and
+    -- whether :lmap mappings take the character typed after f and its kind
+    -- for another, 'iminsert' 1.
     if acks then
       local widths = vim.o.ambiwidth == 'double' or #vim.fn.getcellwidths() > 0
         or not vim.o.emoji
@@ -573,7 +575,8 @@ if predict then
         vim.wo.signcolumn:find('number') ~= nil, cul, idioms,
         vim.wo.winhighlight ~= '' or not got or ns > 0,
         vim.wo.conceallevel > 0 and not vim.wo.concealcursor:find('n'),
-        colorcolumn(info.winid), vim.o.scrolljump, vim.wo.conceallevel > 0, classes(buf) })
+        colorcolumn(info.winid), vim.o.scrolljump, vim.wo.conceallevel > 0, classes(buf),
+        vim.bo[buf].iminsert == 1 })
     end
     return s
   end
@@ -583,13 +586,14 @@ if predict then
   -- was last said, where the client is told what Neovim made of each key;
   -- how many lines its buffer has, which a key that adds or takes out lines
   -- changes, for the keys typed after it to be worked out from the shape
-  -- that goes with Neovim's word on it; and the buffer's 'iskeyword', which
-  -- a filetype's plugin sets as the buffer is loaded. Set by an autocommand
-  -- of another event, as configurations turn 'relativenumber' and
+  -- that goes with Neovim's word on it; the buffer's 'iskeyword', which a
+  -- filetype's plugin sets as the buffer is loaded; and its 'iminsert',
+  -- which Insert mode's <C-^> turns on and off. Set by an autocommand of
+  -- another event, as configurations turn 'relativenumber' and
   -- 'cursorline' off in Insert mode and on again out of it, they fire no
-  -- OptionSet; nor does a highlight namespace given the window. So they are
-  -- read again as Neovim goes to wait for a key, and the shapes said again
-  -- ahead of the ack where they changed.
+  -- OptionSet; nor does a highlight namespace given the window, nor <C-^>.
+  -- So they are read again as Neovim goes to wait for a key, and the shapes
+  -- said again ahead of the ack where they changed.
   local looked = {}
   local function looks(win)
     local out = { pcall(api.nvim_get_hl_ns, { winid = win }) }
@@ -600,8 +604,10 @@ if predict then
     end
     out[#out + 1] = vim.o.scrolljump
     out[#out + 1] = table.concat(colorcolumn(win), ' ')
-    out[#out + 1] = api.nvim_buf_line_count(api.nvim_win_get_buf(win))
-    out[#out + 1] = vim.bo[api.nvim_win_get_buf(win)].iskeyword
+    local buf = api.nvim_win_get_buf(win)
+    out[#out + 1] = api.nvim_buf_line_count(buf)
+    out[#out + 1] = vim.bo[buf].iskeyword
+    out[#out + 1] = vim.bo[buf].iminsert
     return table.concat(vim.tbl_map(tostring, out), ',')
   end
   -- No more of a line than could be shown, and a cell over for the client
@@ -1231,7 +1237,7 @@ if predict then
     au('OptionSet', { pattern = { 'whichwrap', 'virtualedit', 'cursorcolumn', 'scrollbind',
       'cursorbind', 'langmap', 'ambiwidth', 'emoji', 'cursorline', 'cursorlineopt',
       'winhighlight', 'conceallevel', 'concealcursor', 'colorcolumn', 'textwidth',
-      'vartabstop', 'scrolljump', 'iskeyword' } }, function()
+      'vartabstop', 'scrolljump', 'iskeyword', 'iminsert' } }, function()
       soon()
     end)
   end
@@ -3438,6 +3444,7 @@ impl App {
             whichwrap: Some(&stepping.whichwrap),
             scrolljump: Some(stepping.scrolljump),
             keyword: Some(&stepping.classes),
+            lmap: Some(stepping.lmap),
         };
         let Some(to) = moves::moved(motion, count, &from, &cx) else {
             return false;
@@ -4829,6 +4836,7 @@ impl App {
             whichwrap: Some(&stepping.whichwrap),
             scrolljump: Some(stepping.scrolljump),
             keyword: Some(&stepping.classes),
+            lmap: Some(stepping.lmap),
         };
         let pos = if how == moves::Landing::First || to.cursor != at.cursor {
             moves::onto(to.cursor, how, to.top, &from, &cx)?
@@ -10512,6 +10520,36 @@ mod tests {
             );
         }
         assert!(a.due(t1), "and drawn");
+    }
+
+    /// `f`, `t`, `F` and `T` over a slow link move the cursor at once,
+    /// before Neovim has heard of them, the cursor waiting for nothing but
+    /// the character typed after them; where the agent says `:lmap`
+    /// mappings may take that character for another, they wait for Neovim.
+    #[test]
+    fn motions_to_a_character_move_the_cursor_at_once() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"f", t1);
+        assert_eq!(drawn(&a), (0, 0), "waiting for the character");
+        a.keys(b"e", t1);
+        assert_eq!(drawn(&a), (0, 3), "fe before Neovim has heard of it");
+        for (keys, at) in [(&b"Fl"[..], (0, 0)), (b"t0", (0, 4)), (b"Ti", (0, 2))] {
+            a.keys(keys, t1);
+            assert_eq!(
+                drawn(&a),
+                at,
+                "{} before Neovim has heard of it",
+                String::from_utf8_lossy(keys)
+            );
+        }
+        assert!(a.due(t1), "and drawn");
+        let mut a = stepping(Duration::from_millis(200));
+        let mut lmapped = worded();
+        lmapped.push(true.into());
+        reshape(&mut a, lmapped, t1);
+        a.keys(b"fe", t1);
+        assert_eq!(drawn(&a), (0, 0), "with :lmap mappings on");
     }
 
     /// A motion along the line over a slow link moves the cursor at once,

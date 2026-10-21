@@ -890,6 +890,7 @@ mod tests {
                 scrolljump: 1,
                 concealing: false,
                 classes: Vec::new(),
+                lmap: false,
             }),
         }
     }

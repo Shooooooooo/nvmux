@@ -2383,6 +2383,71 @@ fn motions_by_words_show_at_once() {
     }
 }
 
+/// Every motion to a character the client draws ahead of Neovim — `f`,
+/// `t`, `F` and `T` — typed over a slow link to a real Neovim, with counts,
+/// looking for letters, a blank, a tab, characters two cells wide, an emoji
+/// and a letter that has a combining mark: on the screen before Neovim
+/// could have heard of it, and where Neovim's own frame puts the cursor.
+#[test]
+fn motions_to_a_character_show_at_once() {
+    require_nvim!();
+    let scratch = Scratch::new("client-finds-at");
+    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, "client-finds-at", MOVING, MOTIONS);
+    term.pump_until(Duration::from_secs(4), |s| s.contains("one"));
+    // `\tone\ttwo three`, from its tab.
+    for (name, keys) in [
+        ("fe", &b"fe"[..]),
+        ("fe", b"fe"),
+        ("Fo", b"Fo"),
+        ("T<Tab>", b"T\t"),
+        ("t<Space>", b"t "),
+        ("F<Tab>", b"F\t"),
+        ("2fe", b"2fe"),
+        ("2Fo", b"2Fo"),
+        ("th", b"th"),
+    ] {
+        predicted(&mut term, name, keys);
+    }
+    // The CJK, from its start.
+    typed(&mut term, b"j0");
+    for name in ["fテ", "Fの", "T日", "tト"] {
+        predicted(&mut term, name, name.as_bytes());
+    }
+    // An emoji among letters.
+    typed(&mut term, b"j0");
+    for name in ["f😀", "fe", "T😀", "Fe", "t😀", "2fe"] {
+        predicted(&mut term, name, name.as_bytes());
+    }
+    // `café au lait`, its `é` an `e` with a combining mark: found by `e`,
+    // and stopped on by `T`, which Neovim takes back to the character the
+    // byte after the `e` is in.
+    typed(&mut term, b"j0");
+    for name in ["fe", "2fa", "Te", "tl", "F "] {
+        predicted(&mut term, name, name.as_bytes());
+    }
+}
+
+/// `f` mapped — as plugins that jump to a character map it — is left to
+/// Neovim; and so is the character typed after `t` where `:lmap` mappings
+/// may take it for another, `'iminsert'` turned on with the client
+/// attached: here `f` made to look back, and `o` taken for `e`.
+#[test]
+fn a_motion_to_a_character_mapped_is_left_to_neovim() {
+    require_nvim!();
+    let scratch = Scratch::new("client-f-mapped");
+    let setline = format!("nnoremap f F| {MOVING}");
+    let (mut rpc, mut term, _) = drawn_slowly_with(&scratch, "client-f-mapped", &setline, MOTIONS);
+    term.pump_until(Duration::from_secs(4), |s| s.contains("one"));
+    typed(&mut term, b"$");
+    left_to_neovim(&mut term, "fo, mapped to Fo", b"fo");
+    predicted(&mut term, "te", b"te");
+    rpc.command("lmap o e| setlocal iminsert=1")
+        .expect("lmapped");
+    term.pump_until(Duration::from_secs(2), |_| false);
+    typed(&mut term, b"0");
+    left_to_neovim(&mut term, "to, o taken for e", b"to");
+}
+
 /// Every motion to another line in view the client draws ahead of Neovim,
 /// typed over a slow link to a real Neovim, with counts, in a window
 /// numbered by `'number'` and `'relativenumber'`: on the screen before
@@ -3451,6 +3516,46 @@ fn random_motions_by_words_past_the_edges_show_nothing_neovim_never_drew() {
     let keys = random_keys(&mut rng, WORD_KEYS, WORD_COUNTED);
     sights_compared("client-fuzz-ws", SCROLLED, MOTIONS, &keys, rng, false);
 }
+
+/// [`random_motions_by_words_show_nothing_neovim_never_drew`] by `f`, `t`,
+/// `F` and `T`, counted too, looking for characters found on some lines
+/// and not on others: some found fewer times than counted, which goes
+/// nowhere.
+#[test]
+fn random_motions_to_a_character_show_nothing_neovim_never_drew() {
+    require_nvim!();
+    random_motions("client-fuzz-f", "set nu rnu", FIND_KEYS, FIND_COUNTED);
+}
+
+/// `f`, `t`, `F` and `T`, each with a character to look for, as the
+/// terminal sends them and as Neovim names them — letters on several of
+/// [`MOVING`]'s lines, a blank, a tab, characters two cells wide, an emoji
+/// and a letter with an accent — and `j`, `k`, `0` and `$` between them.
+const FIND_KEYS: &[(&[u8], &str)] = &[
+    (b"fo", "fo"),
+    (b"to", "to"),
+    (b"Fo", "Fo"),
+    (b"To", "To"),
+    (b"fe", "fe"),
+    (b"te", "te"),
+    (b"Fe", "Fe"),
+    (b"Te", "Te"),
+    (b"f ", "f<Space>"),
+    (b"T ", "T<Space>"),
+    (b"f\t", "f<Tab>"),
+    (b"F\t", "F<Tab>"),
+    ("fの".as_bytes(), "fの"),
+    ("T日".as_bytes(), "T日"),
+    ("f😀".as_bytes(), "f😀"),
+    ("Té".as_bytes(), "Té"),
+    (b"j", "j"),
+    (b"k", "k"),
+    (b"0", "0"),
+    (b"$", "$"),
+];
+
+/// Of [`FIND_KEYS`], those typed with a count now and then.
+const FIND_COUNTED: &[&str] = &["fo", "to", "Fo", "To", "fe", "Fe", "f<Space>", "j", "k"];
 
 /// The keys of the motions by words, as the terminal sends them and as
 /// Neovim names them, and `j` and `k` and a few more between them.
@@ -5850,16 +5955,74 @@ const WORDS: &[&str] = &[
     "last word",
 ];
 
+/// Every character's first byte of `lines` — a combining mark goes with the
+/// one before — and an empty line's nought: `(line, byte)`, lines from
+/// nought.
+fn firsts(lines: &[&str]) -> Vec<(i64, usize)> {
+    lines
+        .iter()
+        .enumerate()
+        .flat_map(|(l, t)| {
+            let firsts: Vec<usize> = t
+                .char_indices()
+                .filter(|&(_, c)| !nvmux::client::predict::joins(c))
+                .map(|(b, _)| b)
+                .collect();
+            let firsts = if firsts.is_empty() { vec![0] } else { firsts };
+            firsts.into_iter().map(move |b| (l as i64, b))
+        })
+        .collect()
+}
+
+/// Where Neovim takes the cursor for each of `keys`, counted each of
+/// `counts`, from each of `starts`, over the lines of the current buffer:
+/// `(line, byte)` each, lines from nought, in that order (see
+/// [`MOTIONS_LUA`]).
+fn neovims_motions(
+    rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    starts: &[(i64, usize)],
+    keys: &[&str],
+    counts: &[i64],
+) -> Vec<(i64, usize)> {
+    let pair = |&(l, b): &(i64, usize)| Value::Array(vec![l.into(), (b as i64).into()]);
+    let args = Value::Array(vec![
+        Value::Array(starts.iter().map(pair).collect()),
+        Value::Array(keys.iter().map(|&k| Value::from(k)).collect()),
+        Value::Array(counts.iter().map(|&n| Value::from(n)).collect()),
+    ]);
+    let got = rpc
+        .call("nvim_exec_lua", vec![MOTIONS_LUA.into(), args])
+        .expect("Neovim's motions");
+    let got = got.as_array().expect("a list");
+    assert_eq!(
+        got.len(),
+        starts.len() * keys.len() * counts.len(),
+        "as many"
+    );
+    got.iter()
+        .map(|p| {
+            let p = p.as_array().expect("a pair");
+            (
+                p[0].as_i64().expect("line"),
+                p[1].as_i64().expect("byte") as usize,
+            )
+        })
+        .collect()
+}
+
 /// Where Neovim takes the cursor for each of `keys`, counted each of
 /// `counts`, from each of `starts` — `(line, byte)`, lines from nought —
 /// over the lines of the current buffer: `(line, byte)` each, in that order.
-const WORDS_LUA: &str = "local starts, keys, counts = ...
+/// The keys are fed as typed, unmapped — a blank at their end is one too —
+/// a character's bytes taken as its own, though one be the byte Neovim
+/// starts a special key with.
+const MOTIONS_LUA: &str = "local starts, keys, counts = ...
   local out = {}
   for _, s in ipairs(starts) do
     for _, k in ipairs(keys) do
       for _, n in ipairs(counts) do
         vim.api.nvim_win_set_cursor(0, { s[1] + 1, s[2] })
-        vim.cmd('normal! ' .. n .. k)
+        vim.api.nvim_feedkeys(n .. k, 'nx', true)
         local c = vim.api.nvim_win_get_cursor(0)
         out[#out + 1] = { c[1] - 1, c[2] }
       end
@@ -5919,36 +6082,9 @@ fn motions_by_words_go_where_neovim_takes_them() {
             .bytes()
             .map(|b| b - b'0')
             .collect();
-        // Every character's first byte, combining marks with the one before.
-        let starts: Vec<(i64, usize)> = lines
-            .iter()
-            .enumerate()
-            .flat_map(|(l, t)| {
-                let firsts: Vec<usize> = t
-                    .char_indices()
-                    .filter(|&(_, c)| !nvmux::client::predict::joins(c))
-                    .map(|(b, _)| b)
-                    .collect();
-                let firsts = if firsts.is_empty() { vec![0] } else { firsts };
-                firsts.into_iter().map(move |b| (l as i64, b))
-            })
-            .collect();
-        let pair = |(l, b): (i64, usize)| Value::Array(vec![l.into(), (b as i64).into()]);
-        let args = Value::Array(vec![
-            Value::Array(starts.iter().map(|&s| pair(s)).collect()),
-            Value::Array(keys.iter().map(|(k, ..)| Value::from(*k)).collect()),
-            Value::Array(counts.iter().map(|&n| Value::from(n)).collect()),
-        ]);
-        let got = rpc
-            .call("nvim_exec_lua", vec![WORDS_LUA.into(), args])
-            .expect("Neovim's motions");
-        let mut theirs = got.as_array().expect("a list").iter().map(|p| {
-            let p = p.as_array().expect("a pair");
-            (
-                p[0].as_i64().expect("line"),
-                p[1].as_i64().expect("byte") as usize,
-            )
-        });
+        let starts = firsts(&lines);
+        let names: Vec<&str> = keys.iter().map(|(k, ..)| *k).collect();
+        let mut theirs = neovims_motions(&mut rpc, &starts, &names, &counts).into_iter();
         let lines_of = words::Lines {
             text: &text,
             count: lines.len() as i64,
@@ -5966,6 +6102,72 @@ fn motions_by_words_go_where_neovim_takes_them() {
                     );
                     checked += 1;
                 }
+            }
+        }
+    }
+    assert!(checked > 5000, "{checked}");
+}
+
+/// Lines to look for characters along: letters found more than once and
+/// brackets, blanks and tabs, an empty line, a script of its own, emoji, a
+/// letter written with a combining mark and the same letter written whole,
+/// and a line of blanks alone.
+const FINDS: &[&str] = &[
+    "foo(bar, baz) -> foo.bar",
+    "\ta\tb  a\t",
+    "",
+    "日本語の本、日本",
+    "x 😀 y 😀 z",
+    "café e\u{301}te\u{301} e",
+    "aaaa",
+    "  ",
+];
+
+/// What the client makes of `f`, `t`, `F` and `T` is what a real Neovim
+/// makes of them, looking for each of a dozen characters — some on every
+/// line, some on a few, one on none — from every character of [`FINDS`],
+/// once, twice and three times: the character the cursor lands on, or
+/// where it was, where too few are found.
+#[test]
+fn motions_to_a_character_go_where_neovim_takes_them() {
+    use nvmux::client::moves;
+    require_nvim!();
+    let scratch = Scratch::new("client-finds");
+    let (_sock, mut rpc, _config) = session(&scratch, "client-finds");
+    let set = Value::Array(FINDS.iter().map(|&l| Value::from(l)).collect());
+    rpc.call(
+        "nvim_buf_set_lines",
+        vec![0.into(), 0.into(), (-1).into(), false.into(), set],
+    )
+    .expect("set the lines");
+    rpc.command("setlocal noswapfile").expect("noswapfile");
+    let sought = [
+        'o', 'a', 'b', ' ', '\t', '本', '😀', 'e', 'é', '(', '.', 'Z',
+    ];
+    let keys: Vec<(String, char, bool, bool)> = [("f", false, false), ("t", true, false)]
+        .into_iter()
+        .chain([("F", false, true), ("T", true, true)])
+        .flat_map(|(k, till, back)| sought.map(|c| (format!("{k}{c}"), c, till, back)))
+        .collect();
+    let counts = [1i64, 2, 3];
+    let starts = firsts(FINDS);
+    let names: Vec<&str> = keys.iter().map(|(k, ..)| k.as_str()).collect();
+    let mut theirs = neovims_motions(&mut rpc, &starts, &names, &counts).into_iter();
+    let mut checked = 0;
+    for &(line, byte) in &starts {
+        for (key, c, till, back) in &keys {
+            for &n in &counts {
+                let neovims = theirs.next().expect("as many");
+                let text = FINDS[line as usize];
+                let ours = moves::find(text, byte, *c, (*till, *back), n as usize)
+                    .map_or((line, byte), |b| (line, b));
+                assert_eq!(
+                    ours,
+                    neovims,
+                    "{n}{key:?} from {:?} on {text:?}",
+                    (line, byte)
+                );
+                checked += 1;
             }
         }
     }

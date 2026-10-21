@@ -311,6 +311,9 @@ pub struct Stepping {
     /// character of a word, as Neovim's `charclass()` has it there (see
     /// `super::words::class`). Empty where the agent does not say.
     pub classes: Vec<u8>,
+    /// The buffer's `'iminsert'` 1: `:lmap` mappings take the character
+    /// typed after `f` and its kind for another.
+    pub lmap: bool,
 }
 
 /// What `'cursorline'` draws of the cursor's line, as `'cursorlineopt'` has
@@ -419,7 +422,7 @@ impl Shape {
     /// made of each key, `[whichwrap, virtualedit, cursorcolumn, bound,
     /// langmap, widths, numberwidth, number_signs, cursorline, idioms,
     /// own_highlights, conceals, colorcolumn, scrolljump, concealing,
-    /// classes]` after them (see [`Stepping`]):
+    /// classes, lmap]` after them (see [`Stepping`]):
     /// `numberwidth` no more than Neovim lets it be, `cursorline` as
     /// [`Cursorline::read`] has it, and `idioms` a list of
     /// [`Idiom::read`]'s.
@@ -486,6 +489,7 @@ impl Shape {
                 scrolljump: int(38).unwrap_or(0),
                 concealing: flag(39),
                 classes: text(40).bytes().map(|b| b.saturating_sub(b'0')).collect(),
+                lmap: flag(41),
             }),
         })
     }
@@ -2095,12 +2099,12 @@ const WHEEL: &[&str] = &[
 /// makes of it: what the agent is asked to look up (see [`Shape::mapped`]).
 /// And, where the agent says what Neovim made of each key (`acks`), the
 /// motions the client follows that take more than a key, `g_`, `ge` and
-/// `gE`, and the keys that enter Insert mode it follows, which the agent
-/// looks up in Normal mode alone.
+/// `gE`, and `f`, `t`, `F` and `T`, and the keys that enter Insert mode it
+/// follows, which the agent looks up in Normal mode alone.
 pub fn keys(acks: bool) -> Vec<String> {
     let digits = (0..10).map(|d| d.to_string());
     let z = Z.iter().chain(Z_SIDE).map(|k| format!("z{k}"));
-    let acked = ["g_", "ge", "gE", "i", "a", "A", "I"]
+    let acked = ["g_", "ge", "gE", "f", "t", "F", "T", "i", "a", "A", "I"]
         .into_iter()
         .filter(|_| acks);
     WHOLE
@@ -2257,6 +2261,14 @@ enum State {
     /// A `g`, and the count before it: followed only where the agent says
     /// what Neovim made of each key, for `g_`.
     G(Option<i64>),
+    /// An `f`, `t`, `F` or `T` — stopping `till` the character, looking
+    /// `back` — and the count before it, waiting for the character to look
+    /// for: followed as `g` is.
+    Find {
+        till: bool,
+        back: bool,
+        count: Option<i64>,
+    },
     /// Insert or replace mode, after a `<C-x>` if `x`.
     Insert { x: bool },
     #[default]
@@ -2318,6 +2330,11 @@ impl Typed {
                     self.state = State::G(count);
                     return None;
                 }
+                let find = moves::finds(key).filter(|_| motions && !mapped(key));
+                if let Some((till, back)) = find {
+                    self.state = State::Find { till, back, count };
+                    return None;
+                }
                 let enter = typing::Enter::of(key)
                     .filter(|_| self.predictions.typing && count.is_none_or(|n| n == 1));
                 if let Some(e) = enter.filter(|_| !mapped(key)) {
@@ -2358,6 +2375,25 @@ impl Typed {
                     self.whole = true;
                     return Some(Command::Move {
                         motion,
+                        count,
+                        screen: false,
+                    });
+                }
+                self.lost = true;
+                self.whole = false;
+                self.once = false;
+                self.state = State::Lost;
+                None
+            }
+            // The character looked for, which no mapping takes for another
+            // but a language mapping: whether one may is for the client to
+            // say as it follows the motion (see `moves::Ctx::lmap`).
+            State::Find { till, back, count } => {
+                if let Some(c) = moves::sought(key) {
+                    self.state = State::Ready(None);
+                    self.whole = true;
+                    return Some(Command::Move {
+                        motion: moves::Motion::Find { c, till, back },
                         count,
                         screen: false,
                     });
@@ -2622,7 +2658,11 @@ impl Typed {
         !self.whole
             || matches!(
                 self.state,
-                State::Ready(Some(_)) | State::Z(_) | State::G(_) | State::Insert { x: true }
+                State::Ready(Some(_))
+                    | State::Z(_)
+                    | State::G(_)
+                    | State::Find { .. }
+                    | State::Insert { x: true }
             )
     }
 
@@ -4111,6 +4151,7 @@ impl Predictor {
             whichwrap: shape.stepping.as_ref().map(|s| s.whichwrap.as_str()),
             scrolljump: shape.stepping.as_ref().map(|s| s.scrolljump),
             keyword: shape.stepping.as_ref().map(|s| s.classes.as_slice()),
+            lmap: shape.stepping.as_ref().map(|s| s.lmap),
         };
         motions
             .into_iter()
@@ -4482,6 +4523,7 @@ mod tests {
                 scrolljump: 1,
                 concealing: false,
                 classes: Vec::new(),
+                lmap: false,
             }),
             ..shape()
         }
@@ -7622,6 +7664,72 @@ mod tests {
             assert!(made.is_empty(), "{keys}");
             assert!(t.blind, "{keys}");
         }
+    }
+
+    /// `f`, `t`, `F` and `T` wait for the character to look for, with the
+    /// count typed before them, and are followed once it comes — whatever
+    /// maps it, which Neovim does not look up for it; and left to Neovim,
+    /// the client blind to them, where something maps them, or what comes
+    /// after them is no character Neovim takes as typed.
+    #[test]
+    fn motions_to_a_character_are_followed() {
+        let find = |c, till, back, count| Command::Move {
+            motion: moves::Motion::Find { c, till, back },
+            count,
+            screen: false,
+        };
+        let mut t = Typed::default();
+        t.set_predictions(MOTIONS);
+        t.rebase(Rest::Normal);
+        assert_eq!(t.key("3", |_, _| false), None);
+        assert_eq!(t.key("f", |_, _| false), None);
+        assert!(t.pending(), "waiting for the character");
+        assert_eq!(
+            t.key("j", |_, key| key == "j"),
+            Some(find('j', false, false, Some(3)))
+        );
+        assert!(!t.pending());
+        assert_eq!(
+            typed(&mut t, "t<Tab>F<lt>T日"),
+            [
+                find('\t', true, false, None),
+                find('<', false, true, None),
+                find('日', true, true, None),
+            ]
+        );
+        assert!(!t.blind);
+        for (keys, mapped) in [
+            ("fx", "f"),
+            ("Tx", "T"),
+            ("f<Esc>", ""),
+            ("t<C-k>", ""),
+            ("F<Left>", ""),
+        ] {
+            let mut t = Typed::default();
+            t.set_predictions(MOTIONS);
+            t.rebase(Rest::Normal);
+            let made: Vec<Command> = tokens(keys)
+                .filter_map(|k| t.key(k, |_, key| key == mapped))
+                .collect();
+            assert!(made.is_empty(), "{keys}");
+            assert!(t.blind, "{keys}");
+        }
+        // The character looked for is no command of its own: here a `z`,
+        // and the `zt` after it the scroll.
+        let mut t = Typed::default();
+        t.set_predictions(MOTIONS);
+        t.rebase(Rest::Normal);
+        assert_eq!(
+            typed(&mut t, "fzzt"),
+            [
+                find('z', false, false, None),
+                Command::Line {
+                    to: Edge::Top,
+                    first: false,
+                    line: None
+                },
+            ]
+        );
     }
 
     /// The lines whose characters Neovim 0.12.6 was found to step over

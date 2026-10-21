@@ -27,9 +27,13 @@
 //!   `$` — the column wanted kept as it was;
 //! - `+`, `<CR>`, `-` and `_` a line down or up, or none for `_`, to its
 //!   first character that is not a blank;
-//! - and `w`, `b`, `e` and `ge`, and `W`, `B`, `E` and `gE`, and the arrows
+//! - `w`, `b`, `e` and `ge`, and `W`, `B`, `E` and `gE`, and the arrows
 //!   with Shift or Ctrl that make some of them, by words, from line to line
 //!   where they go on past one's end (see [`super::words`]);
+//! - and `f`, `t`, `F` and `T` along the line to the character typed after
+//!   them — the one counted of those, on or back — or till it, stopping on
+//!   the character before; one that finds too few goes nowhere, leaving
+//!   the column the cursor wants as it was;
 //!
 //! — and after a move sideways the cursor wants the column it is drawn in:
 //! a character's first, or a tab's last. A motion that takes the cursor up
@@ -45,6 +49,7 @@
 //! motion followed, drawn or not, [`super::predict::Predictor::judge`]).
 
 use super::predict::{self, Ch, Pos, Rest, Shape, Want};
+use super::typing;
 use super::words::{self, Way};
 
 /// A motion in Normal mode, as the client follows it: see [`moved`].
@@ -86,6 +91,14 @@ pub enum Motion {
     Word {
         way: Way,
         big: bool,
+    },
+    /// `f`, `t`, `F` and `T` and the character typed after them: on along
+    /// the line to the character counted that is `c`, or `back` to it —
+    /// or `till` it, onto the character before, or after.
+    Find {
+        c: char,
+        till: bool,
+        back: bool,
     },
 }
 
@@ -147,13 +160,41 @@ pub fn g_motion(key: &str) -> Option<Motion> {
     })
 }
 
+/// Whether `key` is `f`, `t`, `F` or `T`, which wait for a character to
+/// look for: whether it stops `till` the character, and looks `back`.
+pub fn finds(key: &str) -> Option<(bool, bool)> {
+    Some(match key {
+        "f" => (false, false),
+        "t" => (true, false),
+        "F" => (false, true),
+        "T" => (true, true),
+        _ => return None,
+    })
+}
+
+/// The character a key typed after `f`, `t`, `F` or `T` has them look for,
+/// as Neovim takes it, mappings aside: a character on its own other than a
+/// control character or a combining mark — or `<Space>`, `<lt>`, `<Bar>`,
+/// `<Bslash>` or `<Tab>` for one. `None` for any other, which Neovim may
+/// take otherwise: `<C-k>` for a digraph, `<Esc>` to give up.
+pub fn sought(key: &str) -> Option<char> {
+    if key.eq_ignore_ascii_case("<Tab>") {
+        return Some('\t');
+    }
+    match typing::Edit::of(key)? {
+        typing::Edit::Char(c) => (!predict::joins(c)).then_some(c),
+        typing::Edit::Rub => None,
+    }
+}
+
 /// The largest count Neovim keeps: a digit more leaves it as it is.
 const MAX_COUNT: i64 = 999_999_999;
 
 /// The motions a run of keys typed in Normal mode with nothing pending
 /// makes, each with the count typed before it: `None` where any key of them
 /// is not a motion followed here, or `mapped` says something maps it — or
-/// starts a mapping with it — or the run ends in a count or a `g`.
+/// starts a mapping with it — or the run ends in a count, a `g` or an `f`
+/// or its kind.
 pub fn parse<'a>(
     keys: impl IntoIterator<Item = &'a str>,
     mapped: impl Fn(&str) -> bool,
@@ -161,7 +202,15 @@ pub fn parse<'a>(
     let mut out = Vec::new();
     let mut count: Option<i64> = None;
     let mut g = false;
+    let mut find = None;
     for key in keys {
+        // The character `f` and its kind look for: no mapping but `:lmap`'s
+        // takes it for another (see [`Ctx::lmap`]).
+        if let Some((till, back)) = find.take() {
+            let c = sought(key)?;
+            out.push((Motion::Find { c, till, back }, count.take()));
+            continue;
+        }
         // `g`, and `_` or `e` after it, `g_` or `ge` as a whole looked up:
         // Neovim's own mappings of `g…` make a prefix of `g` alone.
         if std::mem::take(&mut g) {
@@ -178,6 +227,10 @@ pub fn parse<'a>(
         if mapped(key) {
             return None;
         }
+        if let Some(f) = finds(key) {
+            find = Some(f);
+            continue;
+        }
         let digit = key
             .parse::<i64>()
             .ok()
@@ -193,7 +246,7 @@ pub fn parse<'a>(
         }
         out.push((motion(key)?, count.take()));
     }
-    (count.is_none() && !g).then_some(out)
+    (count.is_none() && !g && find.is_none()).then_some(out)
 }
 
 /// What a window and its lines are, for working out a motion in it.
@@ -219,6 +272,11 @@ pub struct Ctx<'a> {
     /// buffer, as `'whichwrap'`: not knowing it, a motion by words is not
     /// followed (see [`words::class`]).
     pub keyword: Option<&'a [u8]>,
+    /// Whether `:lmap` mappings may take the character typed after `f` and
+    /// its kind for another — the buffer's `'iminsert'` 1 — as
+    /// `'whichwrap'`: where they may, or the client does not know, a motion
+    /// to a character is not followed.
+    pub lmap: Option<bool>,
 }
 
 impl Ctx<'_> {
@@ -387,7 +445,55 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
             }
             down(line, &on, None)
         }
+        Motion::Find { c, till, back } => {
+            if cx.lmap? {
+                return None;
+            }
+            let n = usize::try_from(n).unwrap_or(usize::MAX);
+            match find(text, at.byte, c, (till, back), n) {
+                // Not found as often as counted: nowhere, the column wanted
+                // as it was.
+                None => Some(*at),
+                Some(byte) => Some(sideways(cs.iter().position(|ch| ch.byte == byte), None)),
+            }
+        }
     }
+}
+
+/// Where `f` — `t`, `till` the character, and `F` and `T`, `back` —
+/// looking for `c`, counted `n`, takes the cursor from byte `byte` of a
+/// line of `text`, as Neovim's `searchc` takes it: the first byte of the
+/// character it lands on, or `None` where it finds fewer than counted. A
+/// character at a time, a combining mark with the one it goes with, each
+/// whose first is `c` is found.
+pub fn find(
+    text: &str,
+    byte: usize,
+    c: char,
+    (till, back): (bool, bool),
+    n: usize,
+) -> Option<usize> {
+    let cs: Vec<(usize, char)> = text
+        .char_indices()
+        .filter(|&(_, c)| !predict::joins(c))
+        .collect();
+    let i = cs.iter().rposition(|&(b, _)| b <= byte).unwrap_or(0);
+    let n = n.max(1);
+    let j = if back {
+        (0..i).rev().filter(|&j| cs[j].1 == c).nth(n - 1)
+    } else {
+        (i + 1..cs.len()).filter(|&j| cs[j].1 == c).nth(n - 1)
+    }?;
+    let j = match (till, back) {
+        (false, _) => j,
+        (true, false) => j - 1,
+        // To the byte after `c`: the next character's first — or, where a
+        // combining mark goes with `c`, the mark's, which Neovim takes back
+        // to the first of the character it is in.
+        (true, true) if cs[j].0 + c.len_utf8() < cs[j + 1].0 => j,
+        (true, true) => j + 1,
+    };
+    Some(cs[j].0)
 }
 
 /// Where a scroll lands the cursor on the line it takes it to: see [`onto`].
@@ -640,6 +746,7 @@ mod tests {
             whichwrap: ww,
             scrolljump: Some(1),
             keyword: Some(&keyword),
+            lmap: Some(false),
         };
         let motions = parse(predict::tokens(keys), |_| false)?;
         motions
@@ -940,6 +1047,7 @@ mod tests {
             whichwrap: Some("b,s"),
             scrolljump: Some(1),
             keyword: None,
+            lmap: None,
         };
         let busy = Pos {
             rest: Rest::Busy,
@@ -1013,6 +1121,7 @@ mod tests {
             whichwrap: Some("b,s"),
             scrolljump: Some(1),
             keyword: None,
+            lmap: None,
         };
         for (line, (byte, want, vcol)) in [(4, 4, 4), (0, 0, 0), (0, 7, 7), (2, 2, 2)]
             .into_iter()
@@ -1055,6 +1164,27 @@ mod tests {
             ])
         );
         assert_eq!(parse(predict::tokens("ge"), |k| k == "ge"), None, "mapped");
+        let find = |c, till, back| Motion::Find { c, till, back };
+        assert_eq!(
+            parse(predict::tokens("3fx2T<Tab>t0F f<lt>"), |_| false),
+            Some(vec![
+                (find('x', false, false), Some(3)),
+                (find('\t', true, true), Some(2)),
+                (find('0', true, false), None),
+                (find(' ', false, true), None),
+                (find('<', false, false), None),
+            ])
+        );
+        // What `f` is followed by is no key a mapping is looked up for.
+        assert_eq!(
+            parse(predict::tokens("fj"), |k| k == "j"),
+            Some(vec![(find('j', false, false), None)])
+        );
+        assert_eq!(parse(predict::tokens("fj"), |k| k == "f"), None, "mapped");
+        assert_eq!(parse(["f"], |_| false), None, "pending");
+        for keys in ["f<Esc>", "f<C-k>", "f<Left>", "f\u{301}", "f\u{7}"] {
+            assert_eq!(parse(predict::tokens(keys), |_| false), None, "{keys:?}");
+        }
         let huge = "9".repeat(20);
         assert_eq!(
             parse(predict::tokens(&format!("{huge}l")), |_| false),
@@ -1143,12 +1273,134 @@ mod tests {
             whichwrap: Some("b,s"),
             scrolljump: Some(1),
             keyword: None,
+            lmap: None,
         };
         let w = Motion::Word {
             way: Way::Next,
             big: false,
         };
         assert_eq!(moved(w, None, &pos((0, 0, 0, 0, 0)), &cx), None);
+    }
+
+    /// Each of `f`, `t`, `F` and `T` from where Neovim had the cursor to
+    /// where it took it, over [`LINES`], 8 columns to a tab, 22 rows and none
+    /// scrolled: to the character counted, or till it, over tabs, a blank,
+    /// characters two cells wide and one with a combining mark — which `T`
+    /// stops on, as Neovim does, rather than after — the cursor wanting the
+    /// column it is drawn in after each, even where it stays; but where
+    /// too few are found, going nowhere and wanting what it did.
+    #[test]
+    fn motions_to_a_character_go_where_neovim_takes_them() {
+        #[rustfmt::skip]
+        let cases: &[(State, &str, State)] = &[
+            ((0, 0, 0, 0, 0), "fo", (0, 4, 4, 0, 0)),
+            ((0, 0, 0, 0, 0), "2fo", (0, 7, 7, 0, 0)),
+            ((0, 0, 0, 0, 0), "3fo", (0, 0, 0, 0, 0)),
+            ((0, 0, 0, 0, 0), "to", (0, 3, 3, 0, 0)),
+            ((0, 0, 0, 0, 0), "2to", (0, 6, 6, 0, 0)),
+            ((0, 10, 10, 0, 0), "Fo", (0, 7, 7, 0, 0)),
+            ((0, 10, 10, 0, 0), "To", (0, 8, 8, 0, 0)),
+            ((0, 10, 10, 0, 0), "2Fo", (0, 4, 4, 0, 0)),
+            ((0, 10, 10, 0, 0), "2To", (0, 5, 5, 0, 0)),
+            ((0, 1, -1, 0, 0), "tl", (0, 1, 1, 0, 0)),
+            ((0, 1, -1, 0, 0), "fz", (0, 1, -1, 0, 0)),
+            ((0, 3, 3, 0, 0), "Tl", (0, 3, 3, 0, 0)),
+            ((0, 0, 0, 0, 0), "f ", (0, 5, 5, 0, 0)),
+            ((0, 0, 0, 0, 0), "f<Space>", (0, 5, 5, 0, 0)),
+            ((0, 0, 0, 0, 0), "fw", (0, 6, 6, 0, 0)),
+            ((0, 0, 0, 0, 0), "100fl", (0, 0, 0, 0, 0)),
+            ((0, 0, 0, 0, 0), "3fl", (0, 9, 9, 0, 0)),
+            ((1, 0, 0, 0, 0), "fb", (1, 1, 1, 0, 0)),
+            ((1, 0, 0, 0, 0), "tb", (1, 0, 0, 0, 0)),
+            ((2, 0, 0, 0, 0), "fx", (2, 0, 0, 0, 0)),
+            ((2, 0, 0, 0, 0), "Fx", (2, 0, 0, 0, 0)),
+            ((3, 0, 7, 0, 0), "fx", (3, 1, 8, 0, 0)),
+            ((3, 1, 8, 0, 0), "F<Tab>", (3, 0, 7, 0, 0)),
+            ((3, 1, 8, 0, 0), "T<Tab>", (3, 1, 8, 0, 0)),
+            ((4, 0, 0, 0, 0), "f<Tab>", (4, 1, 7, 0, 0)),
+            ((4, 0, 0, 0, 0), "t<Tab>", (4, 0, 0, 0, 0)),
+            ((4, 0, 0, 0, 0), "tb", (4, 1, 7, 0, 0)),
+            ((4, 2, 8, 0, 0), "Ta", (4, 1, 7, 0, 0)),
+            ((5, 0, 0, 0, 0), "f語", (5, 6, 4, 0, 0)),
+            ((5, 0, 0, 0, 0), "t語", (5, 3, 2, 0, 0)),
+            ((5, 6, 4, 0, 0), "T日", (5, 3, 2, 0, 0)),
+            ((5, 6, 4, 0, 0), "F本", (5, 3, 2, 0, 0)),
+            ((6, 0, 0, 0, 0), "fx", (6, 3, 1, 0, 0)),
+            ((6, 0, 0, 0, 0), "tx", (6, 0, 0, 0, 0)),
+            ((6, 3, 1, 0, 0), "Fe", (6, 0, 0, 0, 0)),
+            ((6, 3, 1, 0, 0), "Te", (6, 0, 0, 0, 0)),
+            ((6, 3, 1, 0, 0), "Fé", (6, 3, 1, 0, 0)),
+            ((9, 0, 0, 0, 0), "fコ", (9, 24, 16, 0, 0)),
+            ((9, 24, 16, 0, 0), "Tア", (9, 3, 2, 0, 0)),
+            ((10, 0, 0, 0, 0), "2fo", (10, 17, 17, 0, 0)),
+            ((10, 24, 24, 0, 0), "3F ", (10, 9, 9, 0, 0)),
+            ((10, 24, 24, 0, 0), "3T ", (10, 10, 10, 0, 0)),
+            ((11, 0, 7, 0, 0), "ft", (11, 3, 10, 0, 0)),
+            ((11, 3, 10, 0, 0), "F<Tab>", (11, 0, 7, 0, 0)),
+            ((11, 3, 10, 0, 0), "T<Tab>", (11, 1, 8, 0, 0)),
+            ((12, 0, 0, 0, 0), "fs", (12, 2, 2, 0, 0)),
+            ((12, 3, 3, 0, 0), "Fl", (12, 0, 0, 0, 0)),
+            ((8, 0, 0, 0, 0), "f<lt>", (8, 0, 0, 0, 0)),
+            ((10, 0, -1, 0, 0), "fq", (10, 4, 4, 0, 0)),
+            // From on a character looked for, the next.
+            ((0, 4, 4, 0, 0), "fo", (0, 7, 7, 0, 0)),
+            ((0, 3, 3, 0, 0), "tl", (0, 8, 8, 0, 0)),
+            ((0, 2, 2, 0, 0), "2fl", (0, 9, 9, 0, 0)),
+            ((0, 2, 2, 0, 0), "tl", (0, 2, 2, 0, 0)),
+        ];
+        let s = shape();
+        for &(from, keys, to) in cases {
+            assert_eq!(
+                run(keys, from, &s, None),
+                Some(pos(to)),
+                "{keys} from {from:?}"
+            );
+        }
+        // Where `:lmap` mappings may take the character typed for another,
+        // or the client does not know, it is not followed.
+        let text = |l: i64| usize::try_from(l).ok().and_then(|l| LINES.get(l)).copied();
+        for lmap in [Some(true), None] {
+            let cx = Ctx {
+                shape: &s,
+                line_count: LINES.len() as i64,
+                rows: 22,
+                width: 80,
+                text: &text,
+                whichwrap: None,
+                scrolljump: Some(1),
+                keyword: None,
+                lmap,
+            };
+            let f = Motion::Find {
+                c: 'o',
+                till: false,
+                back: false,
+            };
+            assert_eq!(moved(f, None, &pos((0, 0, 0, 0, 0)), &cx), None, "{lmap:?}");
+        }
+    }
+
+    /// A letter with a combining mark is one character to `f` and its kind,
+    /// found by the letter, as Neovim 0.12.6 was found to: on, back, and
+    /// till it — `T` onto it, the byte after the letter being the mark's.
+    #[test]
+    fn a_letter_with_a_combining_mark_is_one_character_to_look_for() {
+        let text = "ae\u{301}xe\u{301}";
+        for (byte, c, way, n, to) in [
+            (0, 'x', (true, false), 1, Some(1)),
+            (0, 'x', (false, false), 1, Some(4)),
+            (0, 'e', (false, false), 2, Some(5)),
+            (4, 'e', (false, true), 1, Some(1)),
+            (4, 'e', (true, true), 1, Some(1)),
+            (4, 'a', (true, true), 1, Some(1)),
+            (4, '\u{301}', (false, true), 1, None),
+        ] {
+            assert_eq!(
+                find(text, byte, c, way, n),
+                to,
+                "{c:?} {way:?} {n} from {byte}"
+            );
+        }
     }
 
     /// In a window that does not wrap, ten columns wide, a move out of view
@@ -1171,6 +1423,7 @@ mod tests {
             whichwrap: Some("b,s"),
             scrolljump: Some(1),
             keyword: None,
+            lmap: Some(false),
         };
         #[rustfmt::skip]
         let cases: &[(State, &str, State)] = &[
@@ -1182,6 +1435,11 @@ mod tests {
             ((0, 19, -1, 0, 14), "j", (1, 4, -1, 0, 0)),
             ((0, 19, -1, 0, 14), "h", (0, 18, 18, 0, 14)),
             ((0, 15, 15, 0, 10), "j", (1, 4, 15, 0, 0)),
+            ((0, 0, 0, 0, 0), "fj", (0, 19, 19, 0, 14)),
+            ((0, 0, 0, 0, 0), "fc", (0, 12, 12, 0, 3)),
+            ((0, 0, 0, 0, 0), "tc", (0, 11, 11, 0, 2)),
+            ((0, 19, -1, 0, 14), "F0", (0, 0, 0, 0, 0)),
+            ((0, 19, -1, 0, 14), "Fe", (0, 14, 14, 0, 14)),
         ];
         for &(from, keys, to) in cases {
             let motions = parse(predict::tokens(keys), |_| false).expect("motions");
@@ -1242,6 +1500,7 @@ mod tests {
                 whichwrap: Some("b,s"),
                 scrolljump: Some(1),
                 keyword: None,
+                lmap: None,
             };
             let got = parse(predict::tokens(keys), |_| false)
                 .expect("motions")
