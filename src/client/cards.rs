@@ -518,7 +518,7 @@ impl Cards {
             }
             // The client's, not the cards': see `App::reconfigure` and
             // `App::go_away`.
-            Command::Settings(_) | Command::Away | Command::Unseen => false,
+            Command::Settings(_) | Command::Away => false,
         }
     }
 

@@ -36,8 +36,8 @@ use crate::{ids, keys, rpc};
 const SETTLE: Duration = Duration::from_millis(30);
 
 /// How long a session that tells the notifier its news goes between reads all
-/// the same, with `[session] push_news` on: for what a push could miss, over
-/// a connection gone quiet without closing.
+/// the same: for what a push could miss, over a connection gone quiet without
+/// closing.
 const SAFETY: Duration = Duration::from_secs(30);
 
 /// The least time between two reads of a session that its pushes bring on: a
@@ -184,7 +184,7 @@ struct Watched {
     /// When it was last read: a read a push brings on comes no sooner than
     /// [`SPACING`] after.
     last: Option<Instant>,
-    /// The listener on it, with `[session] push_news` on.
+    /// The listener on it.
     ear: Option<Ear>,
     /// Whether its watcher tells the listener its news, by the last read, and
     /// has not been found to have missed any: read every [`SAFETY`] while it
@@ -254,8 +254,8 @@ impl Drop for Ear {
 /// a key — this runs for as long as nvmux does, and a session may wait for its
 /// key all night.
 ///
-/// With `[session] push_news` on, it listens to every session as well
-/// ([`notes::listen`]), each on a thread of its own, and reads one as soon as
+/// It listens to every session as well ([`notes::listen`]), each on a thread
+/// of its own, and reads one as soon as
 /// it says its news has changed, though no sooner than [`SPACING`] after the
 /// last read of it. A session whose watcher a read has found telling its
 /// listener is read every [`SAFETY`] besides, rather than every
@@ -418,19 +418,11 @@ fn run(inbox: &Receiver<Command>, ears: &Sender<Command>, settings: KeySettings)
     }
 }
 
-/// With `[session] push_news` on, a listener on every session without one,
-/// but for one whose listener stopped a moment ago; with it off, none. Each is
-/// numbered from `numbered`, and says what it hears on `ears`.
+/// A listener on every session without one, but for one whose listener
+/// stopped a moment ago. Each is numbered from `numbered`, and says what it
+/// hears on `ears`.
 fn listeners(watched: &mut [Watched], ears: &Sender<Command>, numbered: &mut u64, now: Instant) {
-    let push = crate::config::get().session.push_news;
     for w in watched {
-        if !push {
-            if w.ear.take().is_some() {
-                w.told = false;
-                w.next = w.next.min(now + notes::POLL);
-            }
-            continue;
-        }
         if w.ear.is_some() || w.relisten.is_some_and(|at| at > now) {
             continue;
         }

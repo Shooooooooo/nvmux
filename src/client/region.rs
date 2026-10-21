@@ -4,8 +4,8 @@
 //! writes every cell it changed: a scroll writes its window again, whole — a
 //! page of text a frame, for each of the frames a smooth scroll slides it
 //! through (see [`super::anim::scroll`]). Yet those rows are on the terminal
-//! already, a few rows from where the frame wants them. With `[client]
-//! scroll_regions` on, a frame has the terminal move them there itself, as
+//! already, a few rows from where the frame wants them. So a client's frame
+//! has the terminal move them there itself, as
 //! Neovim's own TUI scrolls: a scroll region set round them (`DECSTBM`), the
 //! rows deleted at its top or inserted there (`DL`, `IL`), and the region the
 //! whole screen again. Then it writes whatever is still not as it should be,

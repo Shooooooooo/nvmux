@@ -81,17 +81,19 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 /// The attach probe is the exception: it has no budget at all. There the user
 /// is watching a spinner and can give up whenever they like (see
 /// [`crate::pty::Probe`] and `ui::attaching`), and a session in the middle of
-/// a long `:!make` is one to wait for, not to refuse. This stays for the probes
-/// nobody is watching: the picker's liveness check, and the wait for a freshly
-/// created session to answer.
+/// a long `:!make` is one to wait for, not to refuse. A listing's probes have
+/// a quarter of a second ([`QUICK_PROBE_TIMEOUT`]). This stays for the probes
+/// nobody is watching besides: the wait for a freshly created session to
+/// answer.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The read timeout for a listing's probes with `[session] quick_list` on, in
-/// place of [`PROBE_TIMEOUT`]: an idle editor answers in a millisecond or two,
-/// many times over in this, and one that cannot answer — in a `:!make`, or in
-/// CPU-bound Lua — is busy at the end of it, as at the end of the longer one.
-/// Busy is never reaped, so the wait only ever decided whether a session that
-/// died during it was listed.
+/// The read timeout for a listing's probes, in place of [`PROBE_TIMEOUT`]: an
+/// idle editor answers in a millisecond or two, many times over in this, and
+/// one that cannot answer — in a `:!make`, or in CPU-bound Lua — is busy at
+/// the end of it, as at the end of the longer one, and is listed as one that
+/// answered is. Busy is never reaped, so the longer wait only ever decided
+/// whether a session that died during it was listed: one that dies in the
+/// three seconds is listed until the next listing.
 pub const QUICK_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// A connected RPC channel, generic over the byte stream so the same code serves

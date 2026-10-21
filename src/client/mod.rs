@@ -100,13 +100,11 @@
 //! as Neovim takes to draw for it, and has nothing to tell the loop: its work
 //! arrives on the client's own socket ([`refresh`]).
 //!
-//! Nor, with `[client] throttle` on, while nobody sees it: a client nvmux has
-//! put aside — parked, or started ahead of its session's first visit — is
-//! told so ([`crate::card::Command::Away`]), and until it is back in front it
+//! Nor while nobody sees it: a client nvmux has put aside — parked, or
+//! started ahead of its session's first visit — is told so
+//! ([`crate::card::Command::Away`]), and until it is back in front it
 //! animates nothing and draws what changes at most once every
-//! [`AWAY_FRAME_GAP`], however busy its session is. With it off, such a
-//! client is told so all the same ([`crate::card::Command::Unseen`]), and
-//! draws as it would in front but for a blinking cursor, which it holds.
+//! [`AWAY_FRAME_GAP`], however busy its session is.
 
 pub mod anim;
 pub mod cards;
@@ -1217,8 +1215,9 @@ pub struct App {
     /// The window grids this attach has looked at for a width another
     /// client asked for, each once: see [`App::narrow_windows`].
     looked: HashSet<u64>,
-    /// `[client] partial_frames`: what a frame put together from only the
-    /// rows that changed needs to know of the last (see [`App::frame`]).
+    /// What a frame put together from only the rows that changed needs to
+    /// know of the last (see [`App::frame`]): none only for a test's client,
+    /// made to put every frame together whole.
     partial: Option<Partial>,
 }
 
@@ -1246,7 +1245,7 @@ impl App {
     pub fn new(term: Palette, effects: Effects, predict: bool, size: (usize, usize)) -> Self {
         Self {
             model: Model::new(term),
-            screen: Screen::new(),
+            screen: Screen::moving_rows(),
             // A prediction is a window's: windows of their own are wanted.
             multigrid_wanted: effects.want_multigrid() || predict,
             tty: term::Tty::detect(),
@@ -1296,7 +1295,7 @@ impl App {
             tails: Vec::new(),
             tails_since: None,
             looked: HashSet::new(),
-            partial: None,
+            partial: Some(Partial::default()),
         }
     }
 
@@ -1315,34 +1314,25 @@ impl App {
         app
     }
 
-    /// This client, writing each frame in as few bytes as it takes if `lean`
-    /// (see [`screen`]).
-    pub fn with_lean_output(mut self, lean: bool) -> Self {
-        self.screen.set_lean(lean);
-        self
-    }
-
-    /// This client, having the terminal move the rows a frame moved if `on`
-    /// (see [`region`]).
+    /// This client, having the terminal move the rows a frame moved if `on`,
+    /// as every client does, or writing them again if not: for a test to
+    /// hold the one up against the other (see [`region`]).
+    #[cfg(test)]
     pub fn with_scroll_regions(mut self, on: bool) -> Self {
         self.screen.set_regions(on);
         self
     }
 
     /// This client, putting each frame together from only the rows that
-    /// changed where it can if `on` (see [`App::frame`]).
+    /// changed where it can if `on`, as every client does, or every row of
+    /// each if not: for a test to hold the one up against the other (see
+    /// [`App::frame`]).
+    #[cfg(test)]
     pub fn with_partial_frames(mut self, on: bool) -> Self {
-        self.set_partial(on);
-        self
-    }
-
-    /// Put frames together from only the rows that changed from here on,
-    /// `on`, or every row of each. The next frame is put together whole
-    /// either way: nothing is known yet of the one before it.
-    fn set_partial(&mut self, on: bool) {
         if on != self.partial.is_some() {
             self.partial = on.then(Partial::default);
         }
+        self
     }
 
     /// Whether each window's text is centred, as it stands: not with no
@@ -1819,8 +1809,7 @@ impl App {
     /// (see [`crate::card::Command::Settings`]).
     ///
     /// The effects change at once: what is moving moves on to its end, and
-    /// nothing turned off starts again. So does how a frame is written, from
-    /// the next on (see [`screen`]). The rest are things this attach has
+    /// nothing turned off starts again. The rest are things this attach has
     /// told Neovim, and are told it again: whether the windows have grids of
     /// their own, and what the agent left in the editor predicts, by
     /// attaching again — as the client does when the UIs attached change —
@@ -1835,9 +1824,6 @@ impl App {
         self.window_width = usize::from(client.window_width);
         let wanted = effects.want_multigrid() || predict || self.centring();
         self.anim.set_effects(effects);
-        self.screen.set_lean(client.lean_output);
-        self.screen.set_regions(client.scroll_regions);
-        self.set_partial(client.partial_frames);
         self.dirty = true;
         if predict != predicting {
             self.predict = predict.then(|| {
@@ -2423,12 +2409,6 @@ impl App {
                         self.reconfigure(&drawing, now);
                     }
                     Some(crate::card::Command::Away) => self.go_away(now),
-                    Some(crate::card::Command::Unseen) => {
-                        self.anim.hold_blink(true, now);
-                        // Drawn once more with a blinking cursor whole, for
-                        // what nvmux keeps of the screen to switch back to.
-                        self.dirty |= self.anim.blinks(&self.model);
-                    }
                     Some(cmd) => {
                         if matches!(cmd, crate::card::Command::Clear) {
                             self.come_back(now);
@@ -3241,8 +3221,8 @@ impl App {
     /// The next frame's bytes, with whatever was waiting to be said ahead of
     /// it.
     ///
-    /// With `[client] partial_frames` on, a frame put together from only the
-    /// rows that changed where it can be (see [`App::changed_rows`]): over
+    /// A frame is put together from only the rows that changed where it can
+    /// be (see [`App::changed_rows`]): over
     /// the frame shown, the rows of the editor's grids drawn or scrolled
     /// since are put together again, and compared with the terminal's alone.
     pub fn frame(&mut self, now: Instant) -> Vec<u8> {
@@ -3309,8 +3289,8 @@ impl App {
     }
 
     /// Whether this frame is to be put together from only the rows that
-    /// changed, which it marks in [`Partial::rows`]: with `[client]
-    /// partial_frames` on, where this frame and the last are the editor's
+    /// changed, which it marks in [`Partial::rows`]: where this frame and
+    /// the last are the editor's
     /// grids and nothing more — nothing moving, held or painted over either,
     /// no card over either — and nothing has changed since the last but the
     /// cells of rows of grids on show. A row of the frame is changed where a
@@ -3395,14 +3375,10 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
     crate::term::write_stdout(term::OPENING)?;
 
     let predict = settings.client.predicts(drawing.remote);
-    let mut app = App::new(term, effects, predict, term::size())
-        .with_centre(
-            settings.client.centre,
-            usize::from(settings.client.window_width),
-        )
-        .with_lean_output(settings.client.lean_output)
-        .with_scroll_regions(settings.client.scroll_regions)
-        .with_partial_frames(settings.client.partial_frames);
+    let mut app = App::new(term, effects, predict, term::size()).with_centre(
+        settings.client.centre,
+        usize::from(settings.client.window_width),
+    );
     app.start();
     let mut inbox = Inbox::default();
     let stdin = std::io::stdin();
@@ -4104,44 +4080,24 @@ mod tests {
         assert_eq!(attached_with_multigrid(&calls(&mut a)), Some(false));
     }
 
-    /// A client writes each frame lean until told not to, then each whole
-    /// from the next frame on, and lean again once told to: the next of two
-    /// rows changed one under the other reached by CR LF, then by a CUP, and
-    /// then by CR LF.
+    /// A client writes each frame lean: the next of two rows changed one
+    /// under the other reached by CR LF, not by a CUP.
     #[test]
-    fn a_client_writes_lean_frames_until_told_not_to() {
+    fn a_client_writes_lean_frames() {
         let t0 = Instant::now();
         let mut a = attached(false, t0);
         a.frame(t0);
-        let drawn = |a: &mut App, top: &str, under: &str| {
-            redraw(a, vec![line(1, 1, top), line(1, 2, under)], t0);
-            String::from_utf8_lossy(&a.frame(t0)).into_owned()
-        };
-        let text = drawn(&mut a, "ab", "cd");
+        redraw(&mut a, vec![line(1, 1, "ab"), line(1, 2, "cd")], t0);
+        let text = String::from_utf8_lossy(&a.frame(t0)).into_owned();
         assert!(text.contains("ab\r\ncd"), "{text:?}");
-
-        let mut d = drawing();
-        d.client.lean_output = false;
-        a.reconfigure(&d, t0);
-        let text = drawn(&mut a, "ef", "gh");
-        assert!(text.contains("ef\x1b[3;1Hgh"), "{text:?}");
-
-        d.client.lean_output = true;
-        a.reconfigure(&d, t0);
-        let text = drawn(&mut a, "ij", "kl");
-        assert!(text.contains("ij\r\nkl"), "{text:?}");
     }
 
-    /// A client told to has the terminal move the rows Neovim scrolled, and
-    /// writes only the line the scroll uncovered; told not to, it writes the
-    /// rows again — from the next frame on, either way.
+    /// A client has the terminal move the rows Neovim scrolled, and writes
+    /// only the line the scroll uncovered; one made to write them again, as
+    /// a test holds the one up against the other, writes the rows.
     #[test]
-    fn a_client_moves_the_rows_neovim_scrolled_once_told_to() {
+    fn a_client_moves_the_rows_neovim_scrolled() {
         let t0 = Instant::now();
-        let mut a = attached(false, t0);
-        let lines = (0..5).map(|r| line(1, r, &format!("line {r}"))).collect();
-        redraw(&mut a, lines, t0);
-        a.frame(t0);
         let scrolled = |a: &mut App, uncovered: &str| {
             let up = (
                 "grid_scroll",
@@ -4158,41 +4114,44 @@ mod tests {
             redraw(a, vec![up, line(1, 4, uncovered)], t0);
             String::from_utf8_lossy(&a.frame(t0)).into_owned()
         };
+        let drawn = |a: App| {
+            let mut a = a;
+            let lines = (0..5).map(|r| line(1, r, &format!("line {r}"))).collect();
+            redraw(&mut a, lines, t0);
+            a.frame(t0);
+            a
+        };
+        // Of the rows the scroll moved, how many are written again: each at
+        // the number that tells it from the row that was there.
+        let rewritten = |text: &str| {
+            (1..=4)
+                .filter(|r| text.contains(&format!("\x1b[{r};6H")))
+                .count()
+        };
+        let mut a = drawn(attached(false, t0));
         let text = scrolled(&mut a, "line 5");
-        assert!(!text.contains("\x1b[M"), "not until told: {text:?}");
-
-        let mut d = drawing();
-        d.client.scroll_regions = true;
-        a.reconfigure(&d, t0);
-        let text = scrolled(&mut a, "line 6");
         assert!(
             text.contains("\x1b[0m\x1b[1;5r\x1b[M\x1b[r\x1b[5;1H"),
             "{text:?}"
         );
-        assert!(text.contains("line 6"), "{text:?}");
-        assert!(
-            !text.contains("line 5"),
-            "a row moved is not written: {text:?}"
-        );
+        assert!(text.contains("line 5"), "{text:?}");
+        assert_eq!(rewritten(&text), 0, "a row moved is written: {text:?}");
 
-        d.client.scroll_regions = false;
-        a.reconfigure(&d, t0);
-        let text = scrolled(&mut a, "line 7");
+        let mut b = drawn(attached(false, t0).with_scroll_regions(false));
+        let text = scrolled(&mut b, "line 5");
         assert!(!text.contains("\x1b[M"), "{text:?}");
+        assert_eq!(rewritten(&text), 4, "{text:?}");
     }
 
-    /// Told to, a client puts the frame after a line drawn together from
-    /// that line's row alone, once it has two frames to go on: the frame
-    /// shown and one done with. A window placed has the next put together
-    /// whole; after that, a frame with nothing changed puts no row together,
-    /// and the frame after a line drawn in the window that line's row alone.
+    /// A client puts the frame after a line drawn together from that line's
+    /// row alone, once it has two frames to go on: the frame shown and one
+    /// done with. A window placed has the next put together whole; after
+    /// that, a frame with nothing changed puts no row together, and the frame
+    /// after a line drawn in the window that line's row alone.
     #[test]
     fn a_frame_after_a_line_is_put_together_from_its_row_alone() {
         let t0 = Instant::now();
         let mut a = attached(false, t0);
-        let mut d = drawing();
-        d.client.partial_frames = true;
-        a.reconfigure(&d, t0);
         let lines = (0..5).map(|r| line(1, r, &format!("line {r}"))).collect();
         redraw(&mut a, lines, t0);
         a.frame(t0);
@@ -4650,15 +4609,14 @@ mod tests {
 
     /// A view the client has moved ahead of Neovim, down or sideways, is not
     /// the editor's grids where the editor put them, though nothing moves:
-    /// told to put frames together from only the rows that changed, a client
-    /// puts every frame together whole while it is ahead — and writes what
-    /// one putting every frame together whole writes — and in part again
-    /// once Neovim has caught up, or the view has gone back.
+    /// a client puts every frame together whole while it is ahead — and
+    /// writes what one made to put every frame together whole writes — and
+    /// in part again once Neovim has caught up, or the view has gone back.
     #[test]
     fn frames_ahead_of_neovim_are_put_together_whole() {
         let rtt = Duration::from_millis(200);
-        let mut whole = predicting(rtt);
-        let mut part = predicting(rtt).with_partial_frames(true);
+        let mut whole = predicting(rtt).with_partial_frames(false);
+        let mut part = predicting(rtt);
         let t1 = Instant::now() + Duration::from_secs(1);
         let ms = |n: u64| t1 + Duration::from_millis(n);
         let status = |text: &str| vec![line(1, 5, text)];
@@ -4880,11 +4838,11 @@ mod tests {
     /// even where nothing has changed since its last frame — the cursor, put
     /// where it is: a frame nvmux waits for, to bring the session back as it
     /// is now (see `crate::pty::relay`). Back with what it had yet to draw,
-    /// it draws that. In front all along, or back from only being unseen, a
-    /// Clear with nothing to take down draws nothing.
+    /// it draws that. In front all along, a Clear with nothing to take down
+    /// draws nothing.
     #[test]
     fn a_client_back_from_away_draws_at_once_whatever_changed() {
-        use crate::card::Command::{Away, Clear, Unseen};
+        use crate::card::Command::{Away, Clear};
         let t0 = Instant::now();
         let mut a = attached(true, t0);
         redraw(&mut a, vec![line(1, 0, "here"), goto(0, 2)], t0);
@@ -4917,15 +4875,10 @@ mod tests {
         let text = String::from_utf8_lossy(&a.frame(back)).into_owned();
         assert!(text.contains("since"), "{text:?}");
 
-        // In front, a Clear with no card to take down draws nothing; nor one
-        // back from being unseen, drawn all the while.
+        // In front, a Clear with no card to take down draws nothing.
         let later = back + Duration::from_secs(2);
         told(&mut a, &Clear, later);
         assert!(!a.due(later), "in front");
-        told(&mut a, &Unseen, later);
-        let unseen = later + Duration::from_secs(2);
-        told(&mut a, &Clear, unseen);
-        assert!(!a.due(unseen), "unseen");
     }
 
     /// A blinking cursor wakes the client on a clock of its own, a frame at
@@ -6807,31 +6760,22 @@ mod tests {
         assert_eq!(frames_after_jump(true), still);
     }
 
-    /// Out of sight, a client whose cursor does not blink has nothing to
-    /// hold, and is not drawn again for it.
+    /// Away, a blinking cursor holds still and whole: the client is drawn
+    /// once more, as an away client draws, within [`AWAY_FRAME_GAP`] of its
+    /// last frame, with the cursor whole, and then sleeps. Back in front, it
+    /// draws at once, and blinks again from the start of its wait.
     #[test]
-    fn a_client_out_of_sight_without_a_blink_is_left_alone() {
-        let t0 = Instant::now();
-        let mut a = blinking(false, false, t0);
-        told(&mut a, &crate::card::Command::Unseen, t0);
-        assert!(!a.due(t0));
-        let later = t0 + Duration::from_secs(5);
-        assert_eq!(left_alone(&mut a, t0, later), (0, 0));
-    }
-
-    /// Out of sight, a blinking cursor holds still and whole: the client is
-    /// drawn once more, with the cursor whole, and then sleeps. Back in
-    /// front, it blinks again, from the start of its wait.
-    #[test]
-    fn a_client_out_of_sight_holds_its_blink() {
+    fn a_client_away_holds_its_blink_whole() {
         let t0 = Instant::now();
         let mut a = blinking(false, true, t0);
         // In the middle of the first fade out.
         let t1 = t0 + Duration::from_millis(760);
         left_alone(&mut a, t0, t1);
-        told(&mut a, &crate::card::Command::Unseen, t1);
-        assert!(a.due(t1), "drawn once more");
-        let held = String::from_utf8_lossy(&a.frame(t1)).into_owned();
+        told(&mut a, &crate::card::Command::Away, t1);
+        let once = a.wake_at(t1).expect("drawn once more");
+        assert!(once <= t1 + AWAY_FRAME_GAP, "drawn at {once:?}");
+        assert!(a.due(once));
+        let held = String::from_utf8_lossy(&a.frame(once)).into_owned();
         // The cursor's cell drawn as it is at the start, whole, rather than
         // as it is at this moment if it goes on blinking, part faded: the SGR
         // its `h` is written in.
@@ -6853,9 +6797,11 @@ mod tests {
         );
         assert_ne!(cell(&held), cell(&faded), "and not part faded");
         let t2 = t1 + Duration::from_secs(10);
-        assert_eq!(left_alone(&mut a, t1, t2), (0, 0), "and then nothing");
+        assert_eq!(left_alone(&mut a, once, t2), (0, 0), "and then nothing");
 
         told(&mut a, &crate::card::Command::Clear, t2);
+        assert!(a.due(t2), "back from away, at once");
+        a.frame(t2);
         let wait = t2 + Duration::from_millis(690);
         assert_eq!(left_alone(&mut a, t2, wait), (0, 0), "whole for the wait");
         let (_, frames) = left_alone(&mut a, wait, wait + Duration::from_secs(2));

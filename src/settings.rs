@@ -315,20 +315,6 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
             Kind::Command,
         ),
         row(
-            "session",
-            "quick_list",
-            Tab::Session,
-            "list sessions without waiting three seconds on a busy one",
-            switch!(session.quick_list),
-        ),
-        row(
-            "session",
-            "push_news",
-            Tab::Session,
-            "have sessions say when they have news, not be asked every two seconds",
-            switch!(session.push_news),
-        ),
-        row(
             "client",
             "ui",
             Tab::Client,
@@ -357,13 +343,6 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
             "start a client on its visit; off starts all at launch and after a link drops",
             switch!(client.lazy),
         ),
-        own(row(
-            "client",
-            "throttle",
-            Tab::Client,
-            "draw a session out of sight once a second, not as it changes",
-            switch!(client.throttle),
-        )),
         own(row(
             "client",
             "predict",
@@ -411,27 +390,6 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
                     zero: Some("no limit"),
                 },
             ),
-        )),
-        own(row(
-            "client",
-            "lean_output",
-            Tab::Client,
-            "write each frame in fewer bytes; the screen is the same",
-            switch!(client.lean_output),
-        )),
-        own(row(
-            "client",
-            "scroll_regions",
-            Tab::Client,
-            "the terminal moves the rows a scroll moved; the screen is the same",
-            switch!(client.scroll_regions),
-        )),
-        own(row(
-            "client",
-            "partial_frames",
-            Tab::Client,
-            "put a frame together from the rows that changed alone; the screen is the same",
-            switch!(client.partial_frames),
         )),
         row(
             "style",

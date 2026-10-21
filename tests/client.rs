@@ -683,18 +683,16 @@ fn settle(term: &mut Terminal, quiet: Duration, within: Duration) -> bool {
     false
 }
 
-/// With `[client] lean_output` on, a client draws a session as it changes —
-/// scrolled, typed into, in colours that change along the line, with
-/// characters two cells wide — into the very screen a client drawing it
-/// afresh with it off shows: every cell, with its colours and attributes.
-/// The terminal moves the rows a scroll moved, as `[client] scroll_regions`
-/// has it do by default; a cell it blanked doing so is as blank as a space
-/// written there.
+/// A client draws a session as it changes — scrolled, typed into, in colours
+/// that change along the line, with characters two cells wide — into the
+/// very screen a client drawing it afresh shows: every cell, with its colours
+/// and attributes. The terminal moves the rows a scroll moved; a cell it
+/// blanked doing so is as blank as a space written there.
 #[test]
-fn a_lean_client_draws_the_screen_a_fresh_one_does() {
+fn a_client_draws_the_screen_a_fresh_one_does() {
     require_nvim!();
-    let scratch = Scratch::new("client-lean");
-    let (sock, mut rpc, config) = session(&scratch, "client-lean");
+    let scratch = Scratch::new("client-afresh");
+    let (sock, mut rpc, config) = session(&scratch, "client-afresh");
     rpc.command(
         "setlocal noswapfile number cursorline | \
          call setline(1, map(range(1, 300), \
@@ -702,19 +700,18 @@ fn a_lean_client_draws_the_screen_a_fresh_one_does() {
          call matchadd('Error', 'ab')",
     )
     .expect("setline");
-    std::fs::write(&config, "[client]\nlean_output = true\n").expect("write the config");
 
-    let mut lean = Terminal::spawn(&sock, &config);
+    let mut first = Terminal::spawn(&sock, &config);
     assert!(
-        lean.pump_until(Duration::from_secs(15), |s| s.contains("é ─ ab cd")),
+        first.pump_until(Duration::from_secs(15), |s| s.contains("é ─ ab cd")),
         "never drawn:\n{}",
-        lean.text()
+        first.text()
     );
     for keys in [&b"\x04"[..], b"jjjj", b"A typed here\x1b", b"\x06", b"\x15"] {
-        lean.type_bytes(keys);
+        first.type_bytes(keys);
         assert!(
             settle(
-                &mut lean,
+                &mut first,
                 Duration::from_millis(400),
                 Duration::from_secs(10)
             ),
@@ -722,21 +719,20 @@ fn a_lean_client_draws_the_screen_a_fresh_one_does() {
         );
     }
     assert!(
-        find(&lean.output, b"\x1b[r").is_some(),
-        "no frame of the lean client's moved down by LF"
+        find(&first.output, b"\x1b[r").is_some(),
+        "no frame of the first client's moved down by LF"
     );
     assert!(
-        find(&lean.output, b"M\x1b[r").is_some(),
-        "no rows of the lean client's moved by the terminal"
+        find(&first.output, b"M\x1b[r").is_some(),
+        "no rows of the first client's moved by the terminal"
     );
-    let (drawn, text) = (lean.cells(), lean.text());
-    assert_eq!(lean.hang_up(), Some(0));
+    let (drawn, text) = (first.cells(), first.text());
+    assert_eq!(first.hang_up(), Some(0));
     assert!(
         common::wait_until(Duration::from_secs(5), || rpc.list_uis().ok() == Some(0)),
-        "the lean client stayed attached"
+        "the first client stayed attached"
     );
 
-    std::fs::write(&config, "[client]\nlean_output = false\n").expect("write the config");
     let mut fresh = Terminal::spawn(&sock, &config);
     assert!(
         fresh.pump_until(Duration::from_secs(15), |s| s.contains("é ─ ab cd")),
@@ -750,7 +746,7 @@ fn a_lean_client_draws_the_screen_a_fresh_one_does() {
     ));
     assert!(
         drawn == fresh.cells(),
-        "the lean client's screen:\n{text}\nis not the fresh one's:\n{}",
+        "the first client's screen:\n{text}\nis not the fresh one's:\n{}",
         fresh.text()
     );
 }

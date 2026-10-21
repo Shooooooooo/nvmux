@@ -1198,7 +1198,7 @@ impl Revival {
                     let Begun {
                         attachment, probe, ..
                     } = begin_attachment(transport.as_ref(), session)?;
-                    Ok(attachment.start_ahead(Some(probe), config::get().client.throttle))
+                    Ok(attachment.start_ahead(Some(probe)))
                 });
             });
         if let Err(e) = spawned {

@@ -66,8 +66,8 @@
 //!
 //! The cards that tell the session in front what the others say
 //! ([`crate::tell`]) are read for as long as nvmux runs, not just while the
-//! picker is up; with `[session] push_news` on, they are not asked for every
-//! two seconds but listened for ([`listen`]). A listener holds a connection to
+//! picker is up, and not asked for every two seconds but listened for
+//! ([`listen`]). A listener holds a connection to
 //! the session open, and the watcher sends a notification down it whenever
 //! what it keeps changes — news comes, or is seen — for the listener's nvmux
 //! to read. A read names the listener's channel ([`hear`]), which is what has

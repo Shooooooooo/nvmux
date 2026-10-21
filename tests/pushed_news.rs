@@ -1,9 +1,8 @@
-//! `[session] push_news`, end to end, against real `nvim --headless`
+//! Sessions saying their news, end to end, against real `nvim --headless`
 //! processes: the notifier listens to each session, a card comes as what it
 //! tells happens rather than at the next of the reads every two seconds, and
 //! those reads stop once the session is told. A binary of its own, because the
-//! setting is the whole process's (see `nvmux::config::init`), and so is the
-//! board the cards go on: its tests take turns.
+//! board the cards go on is the whole process's: its tests take turns.
 //!
 //! They skip, rather than fail, when there is no usable `nvim` on `$PATH` —
 //! unless `$NVMUX_TEST_REQUIRE` names `nvim`, as it does in CI.
@@ -21,20 +20,10 @@ use nvmux::notes::{self, Heard};
 use nvmux::rpc::Client;
 use nvmux::tell::Notifier;
 
-/// The tests' turns: the setting is the process's, and so is the board.
+/// The tests' turns: the board is the process's.
 fn one_at_a_time() -> MutexGuard<'static, ()> {
     static TURN: Mutex<()> = Mutex::new(());
     TURN.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Run on `[session] push_news = on` from now on, the rest the defaults.
-fn push_news(on: bool) {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| nvmux::config::init(nvmux::config::Settings::default()));
-    let mut settings = (*nvmux::config::get()).clone();
-    settings.session.push_news = on;
-    nvmux::config::apply(settings).expect("valid settings");
-    assert_eq!(nvmux::config::get().session.push_news, on);
 }
 
 /// Give the session the watcher, and have it count its reads from now on: the
@@ -99,17 +88,15 @@ fn forgotten(id: &str, since: Instant) -> Duration {
     took
 }
 
-/// With `[session] push_news` on, a session is read until its watcher is
-/// found telling the notifier's listener, and then left alone; and what it
-/// tells comes as a card as it happens, with one read for it. What it kept,
-/// seen, has its mark let go of at once; and so does a session that goes,
-/// which its listener hears as it goes. Turned off, the sessions are asked
-/// every two seconds again, and the listeners go.
+/// A session is read until its watcher is found telling the notifier's
+/// listener, and then left alone; and what it tells comes as a card as it
+/// happens, with one read for it. What it kept, seen, has its mark let go of
+/// at once; and so does a session that goes, which its listener hears as it
+/// goes.
 #[test]
 fn a_card_comes_as_its_news_happens_and_the_reads_stop() {
     require_nvim!();
     let _turn = one_at_a_time();
-    push_news(true);
     let scratch = Scratch::new("push-told");
     let (front, front_sock) = a_session(&scratch, "front");
     let (other, other_sock) = a_session(&scratch, "other");
@@ -246,34 +233,6 @@ end)"#,
     let took = forgotten(&doomed.id, started);
     eprintln!("the mark of a session that went let go of after {took:?}");
     assert!(took < Duration::from_secs(1), "let go of after {took:?}");
-
-    // Off: asked again, as soon as the notifier is next handed something.
-    push_news(false);
-    let (before, _) = reads(&other_sock);
-    notifier.watch(&other.id, "other", other_sock.clone());
-    assert!(
-        wait_until(notes::POLL + Duration::from_secs(1), || {
-            reads(&other_sock).0 > before
-        }),
-        "not asked again: {:?}",
-        reads(&other_sock)
-    );
-    let started = Instant::now();
-    a_job_that_exits(&other_sock, "exit 7", false);
-    let took = card_saying("sh: exited with code 7", started);
-    assert!(
-        took < notes::POLL + Duration::from_secs(1),
-        "the card took {took:?}"
-    );
-    assert_eq!(
-        lua(
-            &other_sock,
-            "return vim.tbl_count(package.loaded['nvmux.notes'].listeners)"
-        )
-        .as_u64(),
-        Some(0),
-        "a listener was left, or named again"
-    );
 }
 
 /// A session that cannot be listened to — waiting for a key when its listener
@@ -283,7 +242,6 @@ end)"#,
 fn a_session_not_listened_to_is_read_as_ever() {
     require_nvim!();
     let _turn = one_at_a_time();
-    push_news(true);
     let scratch = Scratch::new("push-unheard");
     let (front, front_sock) = a_session(&scratch, "front");
     let (waiting, waiting_sock) = a_session(&scratch, "waiting");
