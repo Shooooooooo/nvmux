@@ -27,6 +27,7 @@ use unicode_width::UnicodeWidthChar;
 use super::grid::{Cell, Text};
 use super::predict::{self, Look, Shape};
 use super::redraw;
+use super::words;
 
 /// What the agent says of Insert mode in a buffer, as it last said it: what
 /// would make a key typed there do other than what typing it plainly does —
@@ -100,13 +101,24 @@ pub struct Facts {
     /// What `'iskeyword'` makes of each character under 256, by its code:
     /// see [`Facts::keyword`].
     pub classes: Vec<u8>,
+    /// `'autoindent'`; and `'cindent'` or `'indentexpr'`, which Neovim
+    /// indents the line again with as `<C-u>` takes out what is past its
+    /// indent.
+    pub autoindent: bool,
+    pub cindent: bool,
+    /// Whether `<C-w>` and `<C-u>` are mapped as Neovim's own mappings have
+    /// them, typing `<C-g>u` first: from which they stop where Neovim's
+    /// `Insstart_orig` sticks (see `super::predict::Stop`).
+    pub word_undo: bool,
+    pub line_undo: bool,
 }
 
 impl Facts {
     /// As the agent sends them: `[buf, from_insert, firsts, abbrevs, unseen,
     /// tw, fo, indentkeys, smartindent, lisp, showmatch, matchpairs,
     /// autocomplete, editable, plain, bs, softtabs, smarttab, delcombine,
-    /// conceals, classes, unseen_entered, unseen_left]` — `matchpairs` and
+    /// conceals, classes, unseen_entered, unseen_left, autoindent, cindent,
+    /// word_undo, line_undo]` — `matchpairs` and
     /// `conceals` as the options have them, and `classes` a character a
     /// code, `0` for a blank, `1` for one of punctuation and `2` for one of
     /// a word. Says the buffer, and them.
@@ -144,8 +156,18 @@ impl Facts {
             classes: text(20)?.bytes().map(|b| b.saturating_sub(b'0')).collect(),
             unseen_entered: flag(21),
             unseen_left: flag(22),
+            autoindent: flag(23),
+            cindent: flag(24),
+            word_undo: flag(25),
+            line_undo: flag(26),
         };
         Some((int(0)?, facts))
+    }
+
+    /// Whether `'backspace'` has `<C-w>` and `<C-u>` go on past where Insert
+    /// mode began, rather than stop there once: `nostop`, or 3.
+    pub fn nostop(&self) -> bool {
+        self.bs.contains("nostop") || &*self.bs == "3"
     }
 
     /// Whether a mapping of Insert mode starts with `key`, as Neovim writes
@@ -316,18 +338,22 @@ impl Indentkeys {
 }
 
 /// What a key typed in Insert mode does, where it does only what typing it
-/// plainly does: a character goes in, or the one before the cursor comes out.
+/// plainly does: a character goes in, or the one before the cursor comes
+/// out — or, for `<C-w>`, the word before it, and for `<C-u>`, what was
+/// typed on the line, or the line before it (see [`rubbed`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Edit {
     Char(char),
     Rub,
+    Word,
+    Line,
 }
 
 impl Edit {
     /// The edit a key Neovim's notation writes as `key` makes: a character
     /// on its own, other than a control character — or `<Space>`, `<lt>`,
-    /// `<Bar>` or `<Bslash>` for one — or `<BS>` and `<C-h>`. `None` for any
-    /// other.
+    /// `<Bar>` or `<Bslash>` for one — or `<BS>` and `<C-h>`, `<C-w>` and
+    /// `<C-u>`. `None` for any other.
     pub fn of(key: &str) -> Option<Self> {
         let mut cs = key.chars();
         if let (Some(c), None) = (cs.next(), cs.next()) {
@@ -339,6 +365,8 @@ impl Edit {
             "<bar>" => Some(Edit::Char('|')),
             "<bslash>" => Some(Edit::Char('\\')),
             "<bs>" | "<c-h>" => Some(Edit::Rub),
+            "<c-w>" => Some(Edit::Word),
+            "<c-u>" => Some(Edit::Line),
             _ => None,
         }
     }
@@ -520,6 +548,27 @@ pub fn refused(
             }
             None
         }
+        Edit::Word | Edit::Line => {
+            if before.is_empty() {
+                return Some("it would join the line to the one before");
+            }
+            let bs = &f.bs;
+            if !(bs.contains("start") || bs.contains("nostop") || matches!(&**bs, "2" | "3")) {
+                return Some("'backspace' may not take out what was there before");
+            }
+            // Without `indent`, Neovim takes out nothing of an indent
+            // `'autoindent'` put in, which the client cannot tell.
+            if !(bs.contains("indent") || matches!(&**bs, "1" | "2" | "3")) {
+                return Some("'backspace' may not take out an indent");
+            }
+            if f.delcombine && before.chars().any(|c| c.width() == Some(0)) {
+                return Some("a combining mark may come out alone");
+            }
+            if e == Edit::Line && f.cindent {
+                return Some("it has the line indented again");
+            }
+            None
+        }
     }
 }
 
@@ -527,7 +576,8 @@ pub fn refused(
 /// line of `text`, and the line's text then: past a character typed, or
 /// back over the one taken out — a character with its combining marks, as
 /// Neovim takes it out without `'delcombine'`. `None` where there is no
-/// character before the cursor to take out.
+/// character before the cursor to take out, and for `<C-w>` and `<C-u>`,
+/// which take out more (see [`rubbed`]).
 pub fn edited(e: Edit, text: &str, byte: usize) -> Option<(String, usize)> {
     let (before, after) = (text.get(..byte)?, text.get(byte..)?);
     match e {
@@ -541,7 +591,70 @@ pub fn edited(e: Edit, text: &str, byte: usize) -> Option<(String, usize)> {
                 .map(|(i, _)| i)?;
             Some((format!("{}{after}", &before[..at]), at))
         }
+        Edit::Word | Edit::Line => None,
     }
+}
+
+/// Where `<C-w>` or `<C-u>`, `e`, typed at byte `byte` of a line of `text`
+/// takes the cursor in Insert mode, and the line's text then, as Neovim's
+/// `ins_bs` takes characters out — a character with its combining marks at
+/// a time: for `<C-w>`, back over blanks and then over characters of a
+/// word, or of none but not blanks, of one class (see
+/// [`super::words::class`], `classes` what `'iskeyword'` makes of those
+/// under 256); for `<C-u>`, back to the line's start — or, where it `keeps`
+/// the indent, with `'autoindent'`, `'cindent'` or `'indentexpr'`, to the
+/// line's first character that is not a blank, where the cursor is past
+/// that. Either stops where Insert mode began, `stop`, where it comes to it
+/// — once: from there, it goes on past it. `None` with nothing before the
+/// cursor to take out.
+pub fn rubbed(
+    e: Edit,
+    (text, byte): (&str, usize),
+    stop: Option<usize>,
+    classes: &[u8],
+    keeps: bool,
+) -> Option<(String, usize)> {
+    let (before, after) = (text.get(..byte)?, text.get(byte..)?);
+    let cs: Vec<(usize, char)> = before
+        .char_indices()
+        .filter(|&(_, c)| !predict::joins(c))
+        .collect();
+    let blank = |c: char| matches!(c, ' ' | '\t');
+    // Neovim's `ascii_isspace`.
+    let space = |c: char| matches!(c, ' ' | '\t'..='\r');
+    let class = |c: char| words::class(c, classes, false);
+    let indent = before.len() - before.trim_start_matches(blank).len();
+    let least = match e {
+        Edit::Line if keeps && indent < byte => indent,
+        _ => 0,
+    };
+    let mut i = cs.len();
+    // Of a word or not, the first character that is not a blank, and the
+    // class of the one before.
+    let mut word: Option<bool> = None;
+    let mut last = 0;
+    loop {
+        i = i.checked_sub(1)?;
+        let c = cs[i].1;
+        let now = class(c);
+        if e == Edit::Word {
+            match word {
+                None if !space(c) => word = Some(now >= 2),
+                Some(w) if space(c) || (now >= 2) != w || now != last => {
+                    i += 1;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        last = now;
+        let col = cs[i].0;
+        if col <= least || stop == Some(col) {
+            break;
+        }
+    }
+    let at = cs.get(i).map_or(byte, |&(b, _)| b);
+    Some((format!("{}{after}", &text[..at]), at))
 }
 
 /// Where the cursor is drawn in Insert mode at byte `byte` of a line of
@@ -842,7 +955,7 @@ fn colour(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::predict::{Cursorline, Listchars, Stepping};
+    use crate::client::predict::{Cursorline, Listchars, Stepping, Stop};
 
     /// A window 20 columns wide with no gutter, `'wrap'` as `wrap` says, a
     /// tab 8 wide, nothing that takes a character for another width.
@@ -945,6 +1058,10 @@ mod tests {
                     _ => 1,
                 })
                 .collect(),
+            autoindent: true,
+            cindent: false,
+            word_undo: true,
+            line_undo: true,
         }
     }
 
@@ -1019,7 +1136,7 @@ mod tests {
                 let (new, to) = edited(e, &text, byte)?;
                 let (at, gone, put) = match e {
                     Edit::Char(c) => (byte, 0, c.len_utf8()),
-                    Edit::Rub => (to, byte - to, 0),
+                    Edit::Rub | Edit::Word | Edit::Line => (to, byte - to, 0),
                 };
                 let cursor = sits(&new, shape, to);
                 let laid = relayout(
@@ -1142,7 +1259,7 @@ mod tests {
         let (new, to) = edited(e, text, byte)?;
         let (at, gone, put) = match e {
             Edit::Char(c) => (byte, 0, c.len_utf8()),
-            Edit::Rub => (to, byte - to, 0),
+            Edit::Rub | Edit::Word | Edit::Line => (to, byte - to, 0),
         };
         let cursor = sits(&new, shape, to);
         let cells = relayout(
@@ -1578,6 +1695,7 @@ mod tests {
         assert_eq!(edited(Edit::Rub, "a日b", 4), Some(("ab".into(), 1)));
         assert_eq!(edited(Edit::Rub, "e\u{301}x", 3), Some(("x".into(), 0)));
         assert_eq!(edited(Edit::Rub, "ab", 0), None);
+        assert_eq!(edited(Edit::Word, "ab", 2), None, "see `rubbed`");
         for (key, e) in [
             ("a", Some(Edit::Char('a'))),
             (" ", Some(Edit::Char(' '))),
@@ -1589,10 +1707,171 @@ mod tests {
             ("<C-h>", Some(Edit::Rub)),
             ("<CR>", None),
             ("<Tab>", None),
-            ("<C-w>", None),
+            ("<C-w>", Some(Edit::Word)),
+            ("<C-u>", Some(Edit::Line)),
+            ("<C-o>", None),
         ] {
             assert_eq!(Edit::of(key), e, "{key:?}");
         }
+    }
+
+    /// A line, and the byte the cursor is left on in it.
+    type Left<'a> = (&'a str, usize);
+
+    /// The line and the cursor's byte once `keys` are typed after `A` on a
+    /// line of `line`, `<C-w>` and `<C-u>` stopping as [`Stop`] has them —
+    /// mapped as Neovim's own mappings map them if `undo` — and `<C-u>`
+    /// keeping the indent if `keeps`.
+    fn typed_out(line: &str, keys: &str, keeps: bool, undo: bool) -> (String, usize) {
+        let classes = facts().classes;
+        let (mut text, mut byte) = (line.to_string(), line.len());
+        let mut stop = Stop {
+            line: 0,
+            byte: line.len(),
+            sticks: false,
+        };
+        for key in predict::tokens(keys) {
+            let e = Edit::of(key).expect("an edit");
+            (text, byte) = match e {
+                Edit::Word | Edit::Line => {
+                    rubbed(e, (&text, byte), Some(stop.byte), &classes, keeps)
+                }
+                _ => edited(e, &text, byte),
+            }
+            .expect("made");
+            stop = match e {
+                Edit::Char(_) => stop,
+                Edit::Rub => stop.rubbed((0, byte), false),
+                Edit::Word | Edit::Line => stop.rubbed((0, byte), undo),
+            };
+        }
+        (text, byte)
+    }
+
+    /// `<C-w>` and `<C-u>` typed after `A`, and keys before them, as Neovim
+    /// 0.12.6 was found to take them out, with `'autoindent'` and without:
+    /// a word, or a run of punctuation, after the blanks before it, a
+    /// script's characters a class of their own; what was typed, or the
+    /// line before the cursor — but its indent, with `'autoindent'` — each
+    /// stopping where Insert mode began, once, and going on past it from
+    /// there, or where the line was taken out back past it.
+    #[test]
+    fn words_and_lines_come_out_as_neovim_takes_them_out() {
+        #[rustfmt::skip]
+        let cases: &[(&str, &str, Left, Left)] = &[
+            ("hello world", "<C-w>", ("hello ", 6), ("hello ", 6)),
+            ("hello", "world<C-w>", ("hello", 5), ("hello", 5)),
+            ("hello", " world<C-w>", ("hello ", 6), ("hello ", 6)),
+            ("hello", " world<C-w><C-w>", ("hello", 5), ("hello", 5)),
+            ("hello", " world<C-w><C-w><C-w>", ("", 0), ("", 0)),
+            ("foo.bar", "<C-w>", ("foo.", 4), ("foo.", 4)),
+            ("foo...", "<C-w>", ("foo", 3), ("foo", 3)),
+            ("  indented", "<C-u>", ("  ", 2), ("", 0)),
+            ("abc", "def<C-u>", ("abc", 3), ("abc", 3)),
+            ("abc", "def<C-u><C-u>", ("", 0), ("", 0)),
+            ("日本語abc", "<C-w>", ("日本語", 9), ("日本語", 9)),
+            ("x  ", "<C-w>", ("", 0), ("", 0)),
+            ("a\t\tb", "<C-w>", ("a\t\t", 3), ("a\t\t", 3)),
+            ("a\t\tb", "<C-w><C-w>", ("", 0), ("", 0)),
+            ("  ab cd", "<C-u>", ("  ", 2), ("", 0)),
+            ("  ab", "cd<C-u><C-u>", ("  ", 2), ("", 0)),
+            ("café", "<C-w>", ("", 0), ("", 0)),
+            ("e\u{301}te\u{301}", "<C-w>", ("", 0), ("", 0)),
+            ("hello", "<BS><BS>xy<C-w>", ("", 0), ("", 0)),
+            ("hello", "<BS><BS><C-w>", ("", 0), ("", 0)),
+            ("abc", "<C-u>", ("", 0), ("", 0)),
+        ];
+        for &(line, keys, ai, noai) in cases {
+            for (keeps, (text, byte)) in [(true, ai), (false, noai)] {
+                assert_eq!(
+                    typed_out(line, keys, keeps, true),
+                    (text.to_string(), byte),
+                    "{line:?} + {keys:?}, the indent kept: {keeps}"
+                );
+            }
+        }
+        // Nothing before the cursor, nothing to take out.
+        let classes = facts().classes;
+        assert_eq!(rubbed(Edit::Word, ("abc", 0), None, &classes, true), None);
+    }
+
+    /// Where `<C-w>` and `<C-u>` stop once they have taken out what was
+    /// there before Insert mode began, as Neovim 0.12.6 was found to stop
+    /// them: mapped as its own mappings map them, at the line's start they
+    /// went back to, from then on; not so mapped, where Insert mode began,
+    /// again, a key taking out before it moving that only for itself.
+    #[test]
+    fn where_words_and_lines_stop_sticks_as_neovims_own_mappings_have_it() {
+        #[rustfmt::skip]
+        let cases: &[(&str, &str, Left, Left)] = &[
+            ("hello", "<C-w>abcdefg<C-w>", ("", 0), ("abcde", 5)),
+            ("hello", "<C-u>abc def<C-u>", ("", 0), ("abc d", 5)),
+            ("hello", "<C-w>abcdefg<BS><C-w>", ("", 0), ("abcde", 5)),
+            ("hello world", "<C-w>xyz<C-w>", ("hello ", 6), ("hello ", 6)),
+            ("hello", "xy<C-w>zz<C-w>", ("hello", 5), ("hello", 5)),
+            ("ab", "<BS><BS>cdef<C-w>", ("cd", 2), ("cd", 2)),
+            ("hello", "<C-w>", ("", 0), ("", 0)),
+        ];
+        for &(line, keys, own, plain) in cases {
+            for (undo, (text, byte)) in [(true, own), (false, plain)] {
+                assert_eq!(
+                    typed_out(line, keys, true, undo),
+                    (text.to_string(), byte),
+                    "{line:?} + {keys:?}, Neovim's own mappings: {undo}"
+                );
+            }
+        }
+    }
+
+    /// `<C-w>` and `<C-u>` are left to Neovim where they would join the line
+    /// to the one before, where `'backspace'` would not have them take out
+    /// what was there before Insert mode or an indent, where `'delcombine'`
+    /// may have them take out a mark alone, and `<C-u>` where the line may
+    /// be indented again; otherwise not.
+    #[test]
+    fn words_and_lines_are_refused_where_neovim_may_take_out_otherwise() {
+        let shape = shape(true);
+        let f = facts();
+        let refuses = |f: &Facts, key: &str, text: &str, byte: usize| {
+            let e = Edit::of(key).expect("an edit");
+            refused(key, e, (text, byte, byte), f, &shape).is_some()
+        };
+        for key in ["<C-w>", "<C-u>"] {
+            assert!(!refuses(&f, key, "ab cd", 5), "{key}");
+            assert!(refuses(&f, key, "ab cd", 0), "{key} at the line's start");
+            for bs in ["indent,eol", "eol,start", "1", "0"] {
+                let f = Facts {
+                    bs: bs.into(),
+                    ..facts()
+                };
+                assert!(refuses(&f, key, "ab cd", 5), "{key} with 'backspace' {bs}");
+            }
+            for bs in ["indent,eol,start", "indent,eol,nostop", "2", "3"] {
+                let f = Facts {
+                    bs: bs.into(),
+                    ..facts()
+                };
+                assert!(!refuses(&f, key, "ab cd", 5), "{key} with 'backspace' {bs}");
+            }
+            let f = Facts {
+                delcombine: true,
+                ..facts()
+            };
+            assert!(refuses(&f, key, "e\u{301}te", 5), "{key} with 'delcombine'");
+            assert!(
+                !refuses(&f, key, "ab cd", 5),
+                "{key} with 'delcombine', no mark"
+            );
+        }
+        let f = Facts {
+            cindent: true,
+            ..facts()
+        };
+        assert!(refuses(&f, "<C-u>", "  ab", 4) && !refuses(&f, "<C-w>", "  ab", 4));
+        assert_eq!(
+            [Edit::of("<C-w>"), Edit::of("<C-u>"), Edit::of("<c-W>")],
+            [Some(Edit::Word), Some(Edit::Line), Some(Edit::Word)]
+        );
     }
 
     /// The agent's word on a buffer's Insert mode, read.
@@ -1626,9 +1905,14 @@ mod tests {
             true.into(),
             "".into(),
             classes.into(),
+            false.into(),
+            false.into(),
+            true.into(),
+            true.into(),
         ];
         let refs: Vec<ValueRef<'_>> = v.iter().map(Value::as_ref).collect();
         let (buf, f) = Facts::read(&refs).expect("read");
+        assert!(f.autoindent && f.cindent);
         assert_eq!(buf, 7);
         assert_eq!(f.firsts, ["(".into(), "<Space>".into()] as [Box<str>; 2]);
         assert_eq!((f.tw, &*f.fo, &*f.bs), (72, "jtln", "2"));

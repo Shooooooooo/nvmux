@@ -408,6 +408,39 @@ if predict then
   -- that reads it before the first key is not taken for no agent at all;
   -- with the last few keys, for the client to check its count by.
   local taken, tail = 0, {}
+  -- Where <C-w> and <C-u> stop once in Insert mode, as Neovim has it, for
+  -- the client to stop them there too: Neovim's Insstart_orig (orig),
+  -- which goes back before each key to where Insert mode began, Insstart
+  -- (began) — the cursor as it is entered, or the line's start for o and O
+  -- — but stays put (sticks) from the <C-g>u that Neovim's own mappings of
+  -- <C-w> and <C-u> type on, where it began then, and from there goes back
+  -- only as a key takes out what is before it. Characters typed, <CR> and
+  -- <Tab> move neither; any other key typed there — an arrow, a click,
+  -- completion — and a line's break taken out, or its indent done again,
+  -- may, and they are not known again till Insert mode is entered again
+  -- (began false). With the key last taken in Normal mode, which entered
+  -- it; and what of the last key in Insert mode is seen only once Neovim
+  -- has taken it: whether it took characters out (rubbed), or was a
+  -- character typed past the line's indent (typed, the line and where its
+  -- indent ended), and whether it was the <C-g> of a pair.
+  local began, orig, sticks, entering = false, false, false, nil
+  local rubbed, typed_at, ctrl_g = false, nil, false
+  local function indent_of()
+    return #api.nvim_get_current_line():match('^[ \\t]*')
+  end
+  -- What the key before did, now that Neovim has taken it.
+  local function settle()
+    if not began then
+      return
+    end
+    local cur = api.nvim_win_get_cursor(0)
+    if typed_at and typed_at[1] == cur[1] - 1 and typed_at[2] ~= indent_of() then
+      began = false
+    elseif rubbed and cur[1] - 1 == orig[2] and cur[2] < orig[3] then
+      orig = { orig[1], orig[2], cur[2] }
+    end
+    rubbed, typed_at = false, nil
+  end
   if acks then
     local keyns = api.nvim_create_namespace('nvmux_client_keys_' .. chan)
     _G.nvmux_taken = _G.nvmux_taken or {}
@@ -416,8 +449,46 @@ if predict then
       vim.on_key(nil, keyns)
       _G.nvmux_taken[chan] = nil
     end
-    vim.on_key(function(_, typed)
-      if gone or typed == nil or typed == '' then
+    local still = {}
+    for k, rubs in pairs({ ['<BS>'] = true, ['<C-h>'] = true, ['<C-w>'] = true,
+        ['<C-u>'] = true, ['<CR>'] = false, ['<Tab>'] = false }) do
+      still[vim.keycode(k)] = rubs
+    end
+    vim.on_key(function(key, typed)
+      if gone then
+        return
+      end
+      local mode = api.nvim_get_mode().mode
+      if mode == 'n' then
+        entering = key
+      elseif mode == 'i' and began then
+        settle()
+        local cur = api.nvim_win_get_cursor(0)
+        local b, rubs = key:byte(1) or 0, still[key]
+        if ctrl_g then
+          ctrl_g = false
+          if key == 'u' then
+            began, sticks = { began[1], cur[1] - 1, cur[2] }, true
+          else
+            began = false
+          end
+        elseif began then
+          if not sticks then
+            orig = began
+          end
+          if key == '\\7' then
+            ctrl_g = true
+          elseif rubs then
+            rubbed = cur[2] > 0
+            began = rubbed and began
+          elseif rubs == nil and (b < 0x20 or b == 0x7f or b == 0x80) then
+            began = false
+          elseif rubs == nil and b ~= 0x20 and cur[2] >= indent_of() then
+            typed_at = { cur[1] - 1, indent_of() }
+          end
+        end
+      end
+      if typed == nil or typed == '' then
         return
       end
       local t, i = vim.fn.keytrans(typed), 1
@@ -1199,10 +1270,15 @@ if predict then
         send('pinned', win, pinned)
       end
     end
-    local a = { taken, api.nvim_get_mode().mode, win, buf, api.nvim_buf_get_changedtick(buf),
+    local mode = api.nvim_get_mode().mode
+    if mode == 'i' then
+      settle()
+    end
+    local at = mode == 'i' and began and began[1] == buf and (sticks and orig or began)
+    local a = { taken, mode, win, buf, api.nvim_buf_get_changedtick(buf),
       api.nvim_buf_line_count(buf), view.lnum - 1, view.col,
       view.curswant >= 2147483647 and -1 or view.curswant, view.topline - 1, view.leftcol,
-      width, blanks }
+      width, blanks, at and at[2] or -1, at and at[3] or -1, sticks }
     if said and vim.deep_equal(said, a) then
       return
     end
@@ -1293,13 +1369,21 @@ if predict then
       local buf, win = api.nvim_get_current_buf(), api.nvim_get_current_win()
       local bo, wo = vim.bo[buf], vim.wo[win]
       local firsts = {}
-      local function heads(list)
+      -- Neovim's own mappings of <C-W> and <C-U>, which have them break
+      -- the undo sequence first: followed as they are, not as mappings.
+      local undo = { ['<C-W>'] = false, ['<C-U>'] = false }
+      local function heads(list, own)
         for _, m in ipairs(list) do
           local lhs = vim.fn.keytrans(m.lhsraw or vim.keycode(m.lhs))
-          firsts[#firsts + 1] = lhs:match('^<[^<>]+>') or vim.fn.strcharpart(lhs, 0, 1)
+          if own and undo[lhs] ~= nil and m.rhs == '<C-G>u' .. lhs and m.noremap == 1
+              and m.expr == 0 then
+            undo[lhs] = true
+          else
+            firsts[#firsts + 1] = lhs:match('^<[^<>]+>') or vim.fn.strcharpart(lhs, 0, 1)
+          end
         end
       end
-      heads(api.nvim_get_keymap('i'))
+      heads(api.nvim_get_keymap('i'), true)
       heads(api.nvim_buf_get_keymap(buf, 'i'))
       if bo.iminsert == 1 then
         heads(api.nvim_get_keymap('l'))
@@ -1330,7 +1414,8 @@ if predict then
         not (vim.o.revins or wo.rightleft or bo.iminsert == 2 or vim.o.paste or vim.o.digraph),
         vim.o.backspace,
         bo.softtabstop ~= 0 or bo.varsofttabstop ~= '', vim.o.smarttab, vim.o.delcombine,
-        wo.conceallevel > 0 and wo.concealcursor or '', classes(buf), hooked[2], hooked[3] }
+        wo.conceallevel > 0 and wo.concealcursor or '', classes(buf), hooked[2], hooked[3],
+        bo.autoindent, bo.cindent or bo.indentexpr ~= '', undo['<C-W>'], undo['<C-U>'] }
       if not vim.deep_equal(factsof[buf], f) then
         factsof[buf] = f
         send('insert', unpack(f))
@@ -1349,6 +1434,9 @@ if predict then
     end
     au('InsertEnter', {}, function(ev)
       entered[ev.buf] = true
+      local c = api.nvim_win_get_cursor(0)
+      began = { ev.buf, c[1] - 1, (entering == 'o' or entering == 'O') and 0 or c[2] }
+      orig, sticks, entering, rubbed, typed_at, ctrl_g = began, false, nil, false, nil, false
       vim.schedule(facts)
     end)
     au('BufEnter', {}, function()
@@ -1358,7 +1446,7 @@ if predict then
       'indentkeys', 'cinkeys', 'indentexpr', 'cindent', 'smartindent', 'lisp', 'showmatch',
       'matchpairs', 'autocomplete', 'modifiable', 'readonly', 'buftype', 'revins', 'rightleft',
       'iminsert', 'paste', 'digraph', 'backspace', 'softtabstop', 'varsofttabstop', 'smarttab',
-      'delcombine', 'conceallevel', 'concealcursor' } }, function()
+      'delcombine', 'conceallevel', 'concealcursor', 'autoindent' } }, function()
       vim.schedule(facts)
     end)
     au('BufWipeout', {}, function(ev)
@@ -3510,6 +3598,7 @@ impl App {
             tick: ack.tick,
             line_count: ack.line_count,
             echo: echo.cloned(),
+            insstart: None,
             hidden: p.trust.hidden(ack.buf, Proof::Move) || head.is_some_and(|s| s.hidden),
             until: p.deadline(cause.at),
         };
@@ -3949,8 +4038,29 @@ impl App {
             tracing::debug!(key, why, "client: a key typed left to Neovim");
             return false;
         }
-        let Some((new, byte)) = typing::edited(e, text, from.byte).filter(|(t, _)| ordinary(t))
-        else {
+        // Where Insert mode began, which `<C-w>` and `<C-u>` stop at once,
+        // as the step before has it, or Neovim's word: not knowing it, they
+        // are left to Neovim.
+        let insstart = head.map_or(ack.insstart, |s| s.insstart);
+        let rubs = matches!(e, typing::Edit::Word | typing::Edit::Line);
+        if rubs && insstart.is_none() && !facts.nostop() {
+            tracing::debug!(
+                key,
+                "client: a key typed left to Neovim, not knowing where it stops"
+            );
+            return false;
+        }
+        let stop = insstart
+            .filter(|s| s.line == from.line && !facts.nostop())
+            .map(|s| s.byte);
+        let edit = match e {
+            typing::Edit::Word | typing::Edit::Line => {
+                let keeps = facts.autoindent || facts.cindent;
+                typing::rubbed(e, (text, from.byte), stop, &facts.classes, keeps)
+            }
+            _ => typing::edited(e, text, from.byte),
+        };
+        let Some((new, byte)) = edit.filter(|(t, _)| ordinary(t)) else {
             return false;
         };
         // The row as the steps before laid it out; or as Neovim draws it,
@@ -4001,7 +4111,9 @@ impl App {
         let to = typing::sits(&new, shape, byte);
         let (at, gone, put) = match e {
             typing::Edit::Char(c) => (from.byte, 0, c.len_utf8()),
-            typing::Edit::Rub => (byte, from.byte - byte, 0),
+            typing::Edit::Rub | typing::Edit::Word | typing::Edit::Line => {
+                (byte, from.byte - byte, 0)
+            }
         };
         let laid = typing::relayout(
             &cells,
@@ -4015,7 +4127,7 @@ impl App {
         };
         let proof = match e {
             typing::Edit::Char(c) => Proof::Char(c),
-            typing::Edit::Rub => Proof::Rub,
+            typing::Edit::Rub | typing::Edit::Word | typing::Edit::Line => Proof::Rub,
         };
         let hidden = p.trust.hidden(ack.buf, proof)
             || head.is_some_and(|s| s.hidden)
@@ -4036,6 +4148,12 @@ impl App {
                 line: from.line,
                 text: new.into(),
                 cells: laid,
+            }),
+            insstart: insstart.map(|s| match e {
+                typing::Edit::Char(_) => s,
+                typing::Edit::Rub => s.rubbed((from.line, byte), false),
+                typing::Edit::Word => s.rubbed((from.line, byte), facts.word_undo),
+                typing::Edit::Line => s.rubbed((from.line, byte), facts.line_undo),
             }),
             hidden,
             until: p.deadline(cause.at),
@@ -4228,6 +4346,11 @@ impl App {
             tick: ack.tick,
             line_count: ack.line_count,
             echo: echo.cloned(),
+            insstart: enter.map(|_| predict::Stop {
+                line: from.line,
+                byte,
+                sticks: false,
+            }),
             hidden: unseen || p.trust.hidden(ack.buf, proof) || head.is_some_and(|s| s.hidden),
             until: p.deadline(cause.at),
         };
@@ -4873,6 +4996,7 @@ impl App {
             tick: ack.tick,
             line_count: ack.line_count,
             echo: head.and_then(|s| s.echo.clone()),
+            insstart: None,
             hidden,
             until: p.deadline(cause.at),
         };

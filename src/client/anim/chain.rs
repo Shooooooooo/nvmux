@@ -140,6 +140,9 @@ pub struct Step {
     pub line_count: i64,
     /// The line the steps typed into, as they leave it.
     pub echo: Option<Echo>,
+    /// Where `<C-w>` and `<C-u>` stop once, in Insert mode, where the
+    /// client knows (see `crate::client::predict::Stop`).
+    pub insstart: Option<crate::client::predict::Stop>,
     /// Worked out only to be judged: see the module docs.
     pub hidden: bool,
     /// When it is let go of, Neovim having said nothing of its key.
@@ -297,6 +300,7 @@ mod tests {
             tick: 1,
             line_count: 10,
             echo: None,
+            insstart: None,
             hidden,
             until,
         }

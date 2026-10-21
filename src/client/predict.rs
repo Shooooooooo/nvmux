@@ -2840,15 +2840,47 @@ pub struct Ack {
     /// text shows nothing of itself on the screen. Those longer than the
     /// client keeps of one are left out.
     pub blanks: Vec<(i64, usize)>,
+    /// Where `<C-w>` and `<C-u>` stop once, in Insert mode, where the agent
+    /// knows: not after a key typed there that may move it, an arrow or a
+    /// click (see [`Stop`]).
+    pub insstart: Option<Stop>,
+}
+
+/// Where `<C-w>` and `<C-u>` stop once in Insert mode, the line and the
+/// byte, as Neovim's `Insstart_orig` has it before a key: where Insert mode
+/// began — and whether it `sticks` there from key to key, as it does from
+/// the `<C-g>u` Neovim's own mappings of them type on, going back only as a
+/// key takes out what is before it (see `super::typing::rubbed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stop {
+    pub line: i64,
+    pub byte: usize,
+    pub sticks: bool,
+}
+
+impl Stop {
+    /// Where it is once a key that takes characters out — `<C-g>u` typed
+    /// before it if `undo` — leaves the cursor at byte `byte` of line
+    /// `line`: where the cursor is, where that is before it, from then on
+    /// if it sticks.
+    pub fn rubbed(self, (line, byte): (i64, usize), undo: bool) -> Self {
+        let sticks = self.sticks || undo;
+        let back = sticks && line == self.line && byte < self.byte;
+        Self {
+            byte: if back { byte } else { self.byte },
+            sticks,
+            ..self
+        }
+    }
 }
 
 impl Ack {
     /// As the agent sends it: `[count, tail, mode, win, buf, tick,
-    /// line_count, lnum, col, want, top, left, width, blanks]`, lines from
-    /// nought and the column in bytes, `want` -1 for the end of the line,
-    /// `width` -1 for a line not measured, `blanks` a list of `[line,
-    /// width]`. None of the counts is below nought, the agent's own being
-    /// Neovim's.
+    /// line_count, lnum, col, want, top, left, width, blanks, stop_line,
+    /// stop_col, sticks]`, lines from nought and the columns in bytes, `want`
+    /// -1 for the end of the line, `width` -1 for a line not measured,
+    /// `blanks` a list of `[line, width]`, the [`Stop`] -1 where not known.
+    /// None of the counts is below nought, the agent's own being Neovim's.
     pub fn read(v: &[ValueRef<'_>]) -> Option<Self> {
         let int = |i: usize| v.get(i).and_then(redraw::int);
         let size = |i: usize| int(i).and_then(|n| usize::try_from(n).ok());
@@ -2887,6 +2919,11 @@ impl Ack {
                         .collect()
                 })
                 .unwrap_or_default(),
+            insstart: line(14).zip(size(15)).map(|(line, byte)| Stop {
+                line,
+                byte,
+                sticks: matches!(v.get(16), Some(ValueRef::Boolean(true))),
+            }),
         })
     }
 
@@ -6751,6 +6788,7 @@ mod tests {
             line_count: 100,
             width: None,
             blanks: Vec::new(),
+            insstart: None,
         }
     }
 
@@ -6812,6 +6850,7 @@ mod tests {
             line_count: 100,
             width: None,
             blanks: Vec::new(),
+            insstart: None,
         };
         assert_eq!(read(wire(9, "n")), Some(want.clone()));
         let end = read(wire(-1, "n")).expect("read");
@@ -6873,6 +6912,36 @@ mod tests {
             (ack.width_of(5), ack.width_of(3), ack.width_of(4)),
             (Some(9), Some(12), None)
         );
+    }
+
+    /// And, in Insert mode, where it began, where the agent knows: -1 where
+    /// it does not.
+    #[test]
+    fn an_ack_says_where_insert_mode_began() {
+        let wire = |line: i64, col: i64| -> Vec<Value> {
+            let mut v: Vec<Value> = vec![7.into(), "jl".into(), "i".into(), 1000.into()];
+            v.extend([1, 5, 100, 3, 4, 9, 1, 2, 12].map(Value::from));
+            v.push(Value::Array(vec![]));
+            v.extend([line, col].map(Value::from));
+            v
+        };
+        let read = |v: Vec<Value>| {
+            let refs: Vec<ValueRef<'_>> = v.iter().map(Value::as_ref).collect();
+            Ack::read(&refs).map(|a| a.insstart)
+        };
+        let stop = |sticks| {
+            Some(Some(Stop {
+                line: 3,
+                byte: 2,
+                sticks,
+            }))
+        };
+        assert_eq!(read(wire(3, 2)), stop(false));
+        let mut sticking = wire(3, 2);
+        sticking.push(true.into());
+        assert_eq!(read(sticking), stop(true));
+        assert_eq!(read(wire(-1, -1)), Some(None), "not known");
+        assert_eq!(read(wire(3, 2)[..14].to_vec()), Some(None), "not said");
     }
 
     /// Visual mode, as an ack says it and as the editor draws it, is a rest

@@ -191,7 +191,7 @@ pub fn sought(key: &str) -> Option<char> {
     }
     match typing::Edit::of(key)? {
         typing::Edit::Char(c) => (!predict::joins(c)).then_some(c),
-        typing::Edit::Rub => None,
+        _ => None,
     }
 }
 

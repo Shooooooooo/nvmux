@@ -2848,6 +2848,46 @@ fn echoed_as_neovim_draws_it(tag: &str, setup: &str) {
     }
 }
 
+/// `<C-w>` and `<C-u>` typed in Insert mode over a slow link to a real
+/// Neovim, mapped as its own mappings map them: on the screen before Neovim
+/// could have heard of them, and where Neovim's own frame puts the line and
+/// the cursor — a word after `A`, the blank before the next, the next,
+/// stopping where Insert mode began and going on past it from there, and
+/// stopping at the line's start from then on; what was typed, and with
+/// `'autoindent'` the rest but the indent; after `o`, which begins it at the
+/// line's start. After an arrow, which may move where it began, they wait
+/// for Neovim.
+#[test]
+fn words_and_lines_typed_out_show_at_once() {
+    require_nvim!();
+    let scratch = Scratch::new("client-rub");
+    let setline = r#"call setline(1, ["first", "  indented", "line 1"])"#;
+    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, "client-rub", setline, TYPING);
+    term.pump_until(Duration::from_secs(4), |s| s.contains("first"));
+    typed(&mut term, b"A");
+    predicted(&mut term, "typed", b" hello world");
+    for k in 0..4 {
+        predicted(&mut term, &format!("<C-w> {k}"), b"\x17");
+    }
+    // Neovim's own mapping of <C-w> stops it from then on at the line's
+    // start it went back to, not where Insert mode began.
+    predicted(&mut term, "typed again", b"abcdefg");
+    predicted(&mut term, "<C-w> where it stopped last", b"\x17");
+    predicted(&mut term, "typed once more", b"x y");
+    predicted(&mut term, "<C-u>", b"\x15");
+    typed(&mut term, b"\x1bjA");
+    predicted(&mut term, "typed after the indent", b" text");
+    predicted(&mut term, "<C-u> back to where it began", b"\x15");
+    predicted(&mut term, "<C-u> back to the indent", b"\x15");
+    typed(&mut term, b"\x1bo");
+    predicted(&mut term, "typed after o", b"one two");
+    predicted(&mut term, "<C-w> after o", b"\x17");
+    predicted(&mut term, "<C-u> after o", b"\x15");
+    predicted(&mut term, "typed after o again", b"three four");
+    typed(&mut term, b"\x1b[D");
+    left_to_neovim(&mut term, "<C-w> after an arrow", b"\x17");
+}
+
 /// Text typed across the decorations Neovim draws of the cursor's line —
 /// the bar of `'cursorline'`, `'list'`'s `trail` and `eol` glyphs over it,
 /// a column `'colorcolumn'` colours — over a slow link to a real Neovim:
@@ -6303,4 +6343,186 @@ fn motions_by_paragraphs_go_where_neovim_takes_them() {
         }
     }
     assert!(checked > 300, "{checked}");
+}
+
+/// Lines to take words and lines out of: words and punctuation, blanks and
+/// tabs, an indent, a script of its own beside another, an emoji, and
+/// letters with a combining mark and without.
+const RUBS: &[&str] = &[
+    "foo bar.baz  qux",
+    "  indented, (a) b",
+    "\tx = y;\t",
+    "日本語のabc テキスト",
+    "x 😀 y",
+    "café e\u{301}te\u{301}",
+];
+
+/// Where Neovim takes each of `keys`, typed in Insert mode on a line of its
+/// own, for each of `cases` — `[line, start, typed]`: the line short of what
+/// is typed, entered at byte `start`, and the text typed there first — as
+/// the line and the cursor's byte, each case and key in that order.
+const RUBS_LUA: &str = "local cases, keys = ...
+  local out, got = {}, nil
+  function _G.NvmuxRubbed()
+    got = { vim.api.nvim_get_current_line(), vim.api.nvim_win_get_cursor(0)[2] }
+    return ''
+  end
+  for _, c in ipairs(cases) do
+    for _, k in ipairs(keys) do
+      vim.api.nvim_buf_set_lines(0, 0, -1, false, { c[1] })
+      local enter = 'i'
+      if c[2] >= #c[1] and #c[1] > 0 then
+        enter = 'A'
+      else
+        vim.api.nvim_win_set_cursor(0, { 1, c[2] })
+      end
+      got = nil
+      local keys = enter .. c[3]:gsub('<', '<lt>') .. k .. '<C-r>=v:lua.NvmuxRubbed()<CR><Esc>'
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(keys, true, false, true), 'x', false)
+      out[#out + 1] = got
+    end
+  end
+  return out";
+
+/// What the client makes of `<C-w>` and `<C-u>` typed in Insert mode is
+/// what a real Neovim makes of them, Insert mode begun at every character
+/// of [`RUBS`] and each run of characters after it typed before them, with
+/// `'autoindent'` and without: the line, and where the cursor is on it.
+#[test]
+fn words_and_lines_come_out_as_neovim_takes_them_out() {
+    use nvmux::client::typing::{self, Edit};
+    require_nvim!();
+    let scratch = Scratch::new("client-rubs");
+    let (_sock, mut rpc, _config) = session(&scratch, "client-rubs");
+    rpc.command("setlocal noswapfile nosmarttab")
+        .expect("options");
+    let classes = rpc
+        .call(
+            "nvim_exec_lua",
+            vec![
+                "local t = {} for b = 0, 255 do \
+                   t[#t + 1] = math.min(vim.fn.charclass(vim.fn.nr2char(b)), 2) end \
+                 return table.concat(t)"
+                    .into(),
+                Value::Array(vec![]),
+            ],
+        )
+        .expect("the classes");
+    let classes: Vec<u8> = classes
+        .as_str()
+        .expect("a string")
+        .bytes()
+        .map(|b| b - b'0')
+        .collect();
+    let mut checked = 0;
+    for ai in [true, false] {
+        rpc.command(if ai {
+            "setlocal autoindent"
+        } else {
+            "setlocal noautoindent"
+        })
+        .expect("'autoindent'");
+        for line in RUBS {
+            let mut bounds: Vec<usize> = line
+                .char_indices()
+                .filter(|&(_, c)| !nvmux::client::predict::joins(c))
+                .map(|(b, _)| b)
+                .collect();
+            bounds.push(line.len());
+            // Begun at `start`, typed up to `end`: the line before it is
+            // typed, and where.
+            let cases: Vec<(usize, usize)> = bounds
+                .iter()
+                .flat_map(|&s| {
+                    bounds
+                        .iter()
+                        .filter(move |&&e| e >= s && e > 0)
+                        .map(move |&e| (s, e))
+                })
+                .collect();
+            let wire = Value::Array(
+                cases
+                    .iter()
+                    .map(|&(s, e)| {
+                        let short = format!("{}{}", &line[..s], &line[e..]);
+                        Value::Array(vec![short.into(), (s as i64).into(), line[s..e].into()])
+                    })
+                    .collect(),
+            );
+            let keys = Value::Array(vec!["<C-w>".into(), "<C-u>".into()]);
+            let got = rpc
+                .call(
+                    "nvim_exec_lua",
+                    vec![RUBS_LUA.into(), Value::Array(vec![wire, keys])],
+                )
+                .expect("Neovim's");
+            let mut theirs = got.as_array().expect("a list").iter().map(|p| {
+                let p = p.as_array().expect("a pair");
+                (
+                    p[0].as_str().expect("the line").to_string(),
+                    p[1].as_i64().expect("the byte") as usize,
+                )
+            });
+            for &(s, e) in &cases {
+                for key in [Edit::Word, Edit::Line] {
+                    let neovims = theirs.next().expect("as many");
+                    let ours = typing::rubbed(key, (line, e), Some(s), &classes, ai)
+                        .expect("something to take out");
+                    assert_eq!(
+                        ours, neovims,
+                        "{key:?} in {line:?}, begun at {s}, at {e}, 'autoindent' {ai}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 1500, "{checked}");
+}
+
+/// Random text typed in Insert mode, with `<C-w>` and `<C-u>` among it, and
+/// out of it and back in now and then, as
+/// [`random_typing_shows_nothing_neovim_never_drew`] types it: every sight
+/// of the window the client shows is one Neovim drew for the keys typed so
+/// far, in order.
+#[test]
+fn random_typing_and_taking_out_shows_nothing_neovim_never_drew() {
+    require_nvim!();
+    const KEYS: &[(&[u8], &str)] = &[
+        (b" ", "<Space>"),
+        (b".", "."),
+        (b"\x7f", "<BS>"),
+        (b"\x17", "<C-w>"),
+        (b"\x17", "<C-w>"),
+        (b"\x15", "<C-u>"),
+    ];
+    const OUT: &[(&[u8], &str)] = &[(b"j", "j"), (b"k", "k"), (b"0", "0"), (b"$", "$")];
+    const IN: &[(&[u8], &str)] = &[
+        (b"i", "i"),
+        (b"a", "a"),
+        (b"A", "A"),
+        (b"I", "I"),
+        (b"o", "o"),
+    ];
+    let setline = r#"call setline(1, ["  some words here", "line 1", "x.y z"])"#;
+    let mut rng = Lcg(23);
+    let mut keys: Vec<(Vec<u8>, String)> = vec![(b"A".to_vec(), "A".into())];
+    while keys.len() < 200 {
+        let (bytes, name) = match rng.below(12) {
+            0..=4 => KEYS[rng.below(KEYS.len() as u64) as usize],
+            5 => {
+                keys.push((b"\x1b".to_vec(), "<Esc>".into()));
+                let (bytes, name) = OUT[rng.below(OUT.len() as u64) as usize];
+                keys.push((bytes.to_vec(), name.into()));
+                IN[rng.below(IN.len() as u64) as usize]
+            }
+            _ => {
+                let c = (b'a' + rng.below(26) as u8) as char;
+                keys.push((c.to_string().into_bytes(), c.to_string()));
+                continue;
+            }
+        };
+        keys.push((bytes.to_vec(), name.into()));
+    }
+    sights_are_neovims("client-rfuzz", setline, TYPING, &keys, rng);
 }

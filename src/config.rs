@@ -292,10 +292,12 @@ pub struct ClientSettings {
     /// reads the agent's count, about 40 bytes more.
     pub predict_motions: Predict,
     /// Type ahead of a slow link: what is typed in Insert mode — a character
-    /// put in, or taken out with `<BS>` — and `i`, `a`, `A`, `I` and the
-    /// `<Esc>` after them are drawn as Neovim will draw them, the cursor taking
-    /// the shape of the mode it goes into — judged, as `predict_motions`'s are,
-    /// against what Neovim says it did.
+    /// put in, or taken out with `<BS>`, a word with `<C-w>` and what was typed
+    /// on the line with `<C-u>`, stopping where Insert mode began as Neovim
+    /// stops them — and `i`, `a`, `A`, `I` and the `<Esc>` after them are drawn
+    /// as Neovim will draw them, the cursor taking the shape of the mode it
+    /// goes into — judged, as `predict_motions`'s are, against what Neovim says
+    /// it did.
     ///
     /// `"auto"` by default, as `predict_scrolls` has it: on for a session over
     /// ssh, and with `"on"` for one on this machine as well; `"off"`, each key
