@@ -3287,6 +3287,154 @@ fn a_diagnostic_after_concealed_text_runs_on_from_where_neovim_drew_it() {
     assert_eq!(term.hang_up(), Some(0), "the client's exit");
 }
 
+/// Nothing after the end of a line in a closed fold runs on in the margin:
+/// Neovim draws none of it, the fold being a row of its own text. A line
+/// that ends where a fold's text starts — one character long, or empty — is
+/// not in one for that, and what runs past the grid's edge after it runs on
+/// as after any other.
+#[test]
+fn nothing_after_a_line_in_a_closed_fold_runs_on_in_the_margin() {
+    require_nvim!();
+    let scratch = Scratch::new("client-centre-fold");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-centre-fold");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    // Lines 4 to 6 in a closed fold, the last of them empty; the cursor
+    // after it.
+    rpc.command(
+        "lua vim.diagnostic.config({ virtual_text = true, signs = false }) \
+         vim.wo.foldmethod = 'manual' \
+         vim.api.nvim_buf_set_lines(0, 0, -1, false, \
+           { '}', '', 'before', 'folded ' .. string.rep('f', 49), 'folded', '', 'after' }) \
+         local ns = vim.api.nvim_create_namespace('test') \
+         local long = 'a message long enough to run on past the edge of the grid' \
+         vim.diagnostic.set(ns, 0, { \
+           { lnum = 0, col = 0, message = 'a brace, ' .. long }, \
+           { lnum = 1, col = 0, message = 'empty, ' .. long }, \
+           { lnum = 3, col = 0, message = 'folded, ' .. long }, \
+           { lnum = 5, col = 0, message = 'empty and folded, ' .. long } }) \
+         vim.cmd('4,6fold') \
+         vim.api.nvim_win_set_cursor(0, { 7, 0 })",
+    )
+    .expect("diagnostics, and a fold");
+    let long = "a message long enough to run on past the edge of the grid";
+    let brace = format!("{}}}     ■ a brace, {long}", " ".repeat(50));
+    let empty = format!("{}     ■ empty, {long}", " ".repeat(50));
+    let laid = |s: &str| {
+        let rows: Vec<&str> = s.lines().collect();
+        rows.len() > 4
+            && rows[0] == brace
+            && rows[1] == empty
+            && rows[3].starts_with(&format!("{}+--", " ".repeat(50)))
+            && rows[4].ends_with("after")
+    };
+    assert!(
+        term.pump_until(Duration::from_secs(5), laid),
+        "not as Neovim draws it:\n{}",
+        term.text()
+    );
+    // Long enough for anything run on to have come.
+    term.pump_until(Duration::from_millis(500), |_| false);
+    let text = term.text();
+    let fold = text.lines().nth(3).unwrap_or_default();
+    assert!(
+        !fold.contains('■') && fold.chars().count() <= 110,
+        "the fold ran on past the grid's edge:\n{text}"
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
+/// With `'autochdir'` set, a window beside one whose diagnostics run past
+/// its grid's edge, each window's text centred, scrolls ahead of Neovim over
+/// a slow link, and Neovim's own scroll lands it: the window never moves
+/// back. What tells the client what runs past the edge once made the other
+/// window the current one to ask of it, which with `'autochdir'` has Neovim
+/// draw the windows again, and hold back how far each scrolled till it has
+/// — at the end of every redraw, for good: the client gave up on what it
+/// had scrolled ahead, and the window moved back.
+#[test]
+fn a_scroll_beside_text_run_on_past_the_edge_lands_with_autochdir() {
+    require_nvim!();
+    let scratch = Scratch::new("client-centre-acd");
+    let (sock, mut rpc, config) = session(&scratch, "client-centre-acd");
+    std::fs::write(
+        &config,
+        format!(
+            "{PREDICT_ON}centre = \"smart\"\nwindow_width = 50\n\n\
+             [effects.scroll]\nenabled = false\n"
+        ),
+    )
+    .expect("write the config");
+    // A file's lines: 'autochdir' goes to the directory of the file the
+    // current window shows.
+    let file = scratch.0.join("text").join("lines.txt");
+    std::fs::create_dir_all(file.parent().expect("a directory")).expect("the directory");
+    rpc.command(&format!(
+        "setlocal noswapfile | set autochdir \
+         | call setline(1, map(range(1, 200), '\"line \" . v:val')) | write {}",
+        file.display()
+    ))
+    .expect("set the session up");
+    rpc.command(
+        "lua vim.diagnostic.config({ virtual_text = true, signs = false }) \
+         local ns = vim.api.nvim_create_namespace('test') \
+         local all = {} \
+         for i = 0, 199 do all[#all + 1] = { lnum = i, col = 0, \
+           message = 'a message long enough to run on past the edge of the grid' } end \
+         vim.diagnostic.set(ns, 0, all)",
+    )
+    .expect("diagnostics");
+    let slow = slow_link(&scratch.0.join("link"), &sock, SLOW);
+    let mut term = Terminal::spawn_sized(&slow, &config, DA1_REPLY, (160, 24));
+    assert!(
+        term.pump_until(Duration::from_secs(20), |s| s.contains("line 1 ")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    // The new window on the left, the current one, each window's text 50
+    // columns of its 80 or so; and the agent's lines.
+    rpc.command("vsplit").expect("vsplit");
+    term.pump_until(Duration::from_secs(4), |_| false);
+
+    // The number of the line at the top of the window on the left.
+    let top = |s: &vt100::Screen| -> Option<u32> {
+        let row: String = (0..80)
+            .map(|c| match s.cell(0, c) {
+                Some(cell) if cell.has_contents() => cell.contents(),
+                _ => " ",
+            })
+            .collect();
+        let at = row.find("line ")?;
+        row[at + 5..]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()
+    };
+    let mut seen: Vec<u32> = Vec::new();
+    for _ in 0..2 {
+        term.type_bytes(b"\x1b[<65;20;5M");
+        // Past when a scroll ahead Neovim had not landed would be given up.
+        term.frames(Duration::from_secs(2), |s| {
+            if let Some(n) = top(s).filter(|n| seen.last() != Some(n)) {
+                seen.push(n);
+            }
+            false
+        });
+    }
+    assert_eq!(
+        rpc.eval("line('w0')").expect("the window's top line"),
+        Value::from(7),
+        "Neovim scrolled elsewhere"
+    );
+    assert_eq!(seen.last(), Some(&7), "not landed: {seen:?}");
+    assert!(seen.windows(2).all(|w| w[0] < w[1]), "moved back: {seen:?}");
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
 /// A float on a window whose text is centred goes in with the text, but no
 /// further than keeps it on the screen: a diagnostic's, opened at the end of
 /// a long line, which Neovim fits to the screen beside the window's grid, is
