@@ -266,8 +266,9 @@ pub struct ClientSettings {
     /// and by words, along a line or to another — `w`, `b`, `e` and `ge`, and
     /// `W`, `B`, `E` and `gE`, as `'iskeyword'` makes words — to the character
     /// typed after `f`, `t`, `F` and `T`, unless something maps them, or
-    /// `'iminsert'` has `:lmap` mappings take that character for another — and
-    /// by paragraphs, `}` and `{` — are drawn, with counts, and with them the
+    /// `'iminsert'` has `:lmap` mappings take that character for another — by
+    /// paragraphs, `}` and `{` — and to the view's top, middle and bottom,
+    /// `H`, `M` and `L` — are drawn, with counts, and with them the
     /// numbers of `'relativenumber'` and the bar of `'cursorline'`: in view, or
     /// past `'scrolloff'`, the view scrolled as Neovim scrolls it, short of
     /// half the window, which Neovim centres the cursor for instead — but not

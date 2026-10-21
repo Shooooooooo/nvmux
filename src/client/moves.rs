@@ -34,9 +34,13 @@
 //!   them — the one counted of those, on or back — or till it, stopping on
 //!   the character before; one that finds too few goes nowhere, leaving
 //!   the column the cursor wants as it was;
-//! - and `}` and `{` by paragraphs, to the empty line after the next or
+//! - `}` and `{` by paragraphs, to the empty line after the next or
 //!   before the last, or the line `'paragraphs'` and `'sections'` start one
 //!   with (see [`paragraph`]);
+//! - and `H`, `M` and `L` to the line at the view's top, its middle or its
+//!   bottom, `'scrolloff'` in from them (see [`window`]), onto the column
+//!   the cursor wants as `j` and `k` land it, or with `'startofline'` the
+//!   first character that is not a blank;
 //!
 //! — and after a move sideways the cursor wants the column it is drawn in:
 //! a character's first, or a tab's last. A motion that takes the cursor up
@@ -51,7 +55,7 @@
 //! Neovim says it put the cursor (see `super::App`; and, for the log, every
 //! motion followed, drawn or not, [`super::predict::Predictor::judge`]).
 
-use super::predict::{self, Ch, Pos, Rest, Shape, Want};
+use super::predict::{self, Ch, Edge, Pos, Rest, Shape, Want};
 use super::typing;
 use super::words::{self, Way};
 
@@ -107,6 +111,10 @@ pub enum Motion {
     Paragraph {
         back: bool,
     },
+    /// `H`, `M` and `L`: to the line at the view's top, its middle or its
+    /// bottom — or, counted, that many in from the top or the bottom — see
+    /// [`window`].
+    Window(Edge),
 }
 
 /// The motion a key typed in Normal mode makes, if it is one followed here:
@@ -151,6 +159,9 @@ pub fn motion(key: &str) -> Option<Motion> {
             big: key == "E",
         },
         "}" | "{" => Motion::Paragraph { back: key == "{" },
+        "H" => Motion::Window(Edge::Top),
+        "M" => Motion::Window(Edge::Middle),
+        "L" => Motion::Window(Edge::Bottom),
         _ => return None,
     })
 }
@@ -483,6 +494,86 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
             }
             down(line, &on, None)
         }
+        // Onto the line's first character that is not a blank, with
+        // `'startofline'`; without, onto the column the cursor wants, as `j`
+        // and `k` land it.
+        Motion::Window(edge) => {
+            let so = shape.scrolloff as i64;
+            let line = window(edge, n, at.top, (cx.rows, so), cx.line_count);
+            if shape.startofline {
+                down(line, &first_non_blank, None)
+            } else {
+                let want = at.want.col();
+                down(line, &|cs| over(cs, want), Some(at.want))
+            }
+        }
+    }
+}
+
+/// The line `H`, `M` or `L` — at the view's `edge` — counted `n` takes the
+/// cursor to in a view from line `top`, `rows` tall, a line a row, over
+/// `count` lines, `'scrolloff'` `so`, as Neovim's `nv_scroll` and then its
+/// `cursor_correct` take it: `H` the line counted from the top, `L` from the
+/// bottom — or the buffer's first, counted past it — and `M` the line
+/// halfway down the lines shown; then as far in from the view's edges as
+/// `'scrolloff'` has it, but for the buffer's own, which the view is never
+/// moved for.
+pub fn window(edge: Edge, n: i64, top: i64, (rows, so): (i64, i64), count: i64) -> i64 {
+    let n = n.max(1);
+    // One past the last line shown.
+    let shown = (top + rows).min(count);
+    let line = match edge {
+        Edge::Top => top.saturating_add(n - 1).min(count - 1),
+        Edge::Bottom if n > shown => 0,
+        Edge::Bottom => shown - n,
+        Edge::Middle => {
+            let empty = (rows - (count - top)).max(0);
+            let half = (rows - empty + 1) / 2;
+            let (mut k, mut used) = (0, 0);
+            while top + 1 + k < count {
+                used += 1;
+                if used >= half {
+                    break;
+                }
+                k += 1;
+            }
+            top + k
+        }
+    };
+    // Neovim's `cursor_correct`: none of `'scrolloff'` wanted at the
+    // buffer's start, or its end, where the view shows it, and no more than
+    // half the view on the other side then.
+    let last_shown = top + rows >= count;
+    let mut above_wanted = if top == 0 { 0 } else { so };
+    let mut below_wanted = if top == 0 { so.min(rows / 2) } else { so };
+    if last_shown {
+        below_wanted = 0;
+        above_wanted = above_wanted.min((rows - 1) / 2);
+    }
+    if line >= top + above_wanted && line < shown - below_wanted {
+        return line;
+    }
+    let (mut t, mut b) = (top, shown - 1);
+    let (mut above, mut below) = (0, 0);
+    while (above < above_wanted || below < below_wanted) && t < b {
+        if below < below_wanted && (below <= above || above >= above_wanted) {
+            below += 1;
+            b -= 1;
+        } else {
+            above += 1;
+            t += 1;
+        }
+    }
+    if t == b || b < 0 {
+        t
+    } else if t > b {
+        b
+    } else if line < t && top > 0 {
+        t
+    } else if line > b && !last_shown {
+        b
+    } else {
+        line
     }
 }
 
@@ -1553,6 +1644,66 @@ mod tests {
                 Some(pos(to)),
                 "{keys} from {from:?}"
             );
+        }
+    }
+
+    /// Each `H`, `M` and `L` from where Neovim had the cursor to where it
+    /// took it, over [`LINES`], 22 rows and none scrolled: to the first line,
+    /// the one halfway down those shown — not down the window — and the
+    /// last; counted, that many in, or to the buffer's other end, counted
+    /// past it. Onto the column the cursor wants, as `j` and `k` land it, or
+    /// with `'startofline'` the first character not a blank.
+    #[test]
+    fn motions_to_the_window_edges_go_where_neovim_takes_them() {
+        #[rustfmt::skip]
+        let wanted: &[(State, &str, State)] = &[
+            ((5, 3, 2, 0, 0), "H", (0, 2, 2, 0, 0)),
+            ((5, 3, 2, 0, 0), "M", (6, 3, 2, 0, 0)),
+            ((5, 3, 2, 0, 0), "L", (12, 2, 2, 0, 0)),
+            ((0, 6, 6, 0, 0), "L", (12, 3, 6, 0, 0)),
+            ((0, 6, -1, 0, 0), "L", (12, 3, -1, 0, 0)),
+            ((12, 0, 0, 0, 0), "3H", (2, 0, 0, 0, 0)),
+            ((0, 0, 0, 0, 0), "3L", (10, 0, 0, 0, 0)),
+            ((0, 10, 10, 0, 0), "4H", (3, 1, 10, 0, 0)),
+            ((0, 10, 10, 0, 0), "M", (6, 3, 10, 0, 0)),
+            ((3, 1, 8, 0, 0), "9H", (8, 8, 8, 0, 0)),
+            ((2, 0, 0, 0, 0), "50H", (12, 0, 0, 0, 0)),
+            ((2, 0, 0, 0, 0), "50L", (0, 0, 0, 0, 0)),
+        ];
+        #[rustfmt::skip]
+        let sol: &[(State, &str, State)] = &[
+            ((5, 3, 2, 0, 0), "H", (0, 0, 0, 0, 0)),
+            ((5, 3, 2, 0, 0), "M", (6, 0, 0, 0, 0)),
+            ((5, 3, 2, 0, 0), "L", (12, 0, 0, 0, 0)),
+            ((0, 6, 6, 0, 0), "L", (12, 0, 0, 0, 0)),
+            ((0, 6, -1, 0, 0), "L", (12, 0, 0, 0, 0)),
+            ((12, 0, 0, 0, 0), "3H", (2, 0, 0, 0, 0)),
+            ((0, 0, 0, 0, 0), "3L", (10, 0, 0, 0, 0)),
+            ((0, 10, 10, 0, 0), "4H", (3, 1, 8, 0, 0)),
+            ((0, 10, 10, 0, 0), "M", (6, 0, 0, 0, 0)),
+            ((3, 1, 8, 0, 0), "9H", (8, 2, 2, 0, 0)),
+            ((2, 0, 0, 0, 0), "50H", (12, 0, 0, 0, 0)),
+            ((2, 0, 0, 0, 0), "50L", (0, 0, 0, 0, 0)),
+        ];
+        let tables = [
+            (shape(), wanted),
+            (
+                Shape {
+                    startofline: true,
+                    ..shape()
+                },
+                sol,
+            ),
+        ];
+        for (s, cases) in &tables {
+            for &(from, keys, to) in *cases {
+                assert_eq!(
+                    run(keys, from, s, None),
+                    Some(pos(to)),
+                    "{keys} from {from:?}, 'startofline' {}",
+                    s.startofline
+                );
+            }
         }
     }
 

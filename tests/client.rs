@@ -2443,6 +2443,39 @@ fn motions_by_paragraphs_show_at_once() {
     }
 }
 
+/// `H`, `M` and `L` typed over a slow link to a real Neovim, with counts —
+/// one past the lines shown, and one counting from the bottom up to the
+/// top — in a window numbered by `'number'` and `'relativenumber'`, onto
+/// the column the cursor wants and then, with `'startofline'`, onto each
+/// line's first character not a blank; and in a view scrolled, where
+/// `'scrolloff'` keeps them three lines in: on the screen before Neovim
+/// could have heard of them, the cursor and every number of the gutter
+/// where Neovim's own frame puts them.
+#[test]
+fn motions_to_the_window_edges_show_at_once() {
+    require_nvim!();
+    let scratch = Scratch::new("client-hml-at");
+    let setline = format!("set nu rnu | {MOVING}");
+    let (mut rpc, mut term, _) = drawn_slowly_with(&scratch, "client-hml-at", &setline, MOTIONS);
+    term.pump_until(Duration::from_secs(4), |s| s.contains("one"));
+    for name in [
+        "L", "H", "M", "3L", "$", "2H", "M", "50H", "50L", "Fo", "L", "M", "2L", "9L",
+    ] {
+        predicted(&mut term, name, name.as_bytes());
+    }
+    rpc.command("set startofline").expect("startofline");
+    term.pump_until(4 * SLOW, |_| false);
+    for name in ["L", "H", "M", "3H", "4L", "2H"] {
+        predicted(&mut term, name, name.as_bytes());
+    }
+    rpc.command(&format!("set nosol so=3 | {SCROLLED} | 60 | normal! zt"))
+        .expect("scrolled");
+    term.pump_until(4 * SLOW, |_| false);
+    for name in ["L", "H", "M", "5L", "2H", "M", "30L", "30H"] {
+        predicted(&mut term, name, name.as_bytes());
+    }
+}
+
 /// `f` mapped — as plugins that jump to a character map it — is left to
 /// Neovim; and so is the character typed after `t` where `:lmap` mappings
 /// may take it for another, `'iminsert'` turned on with the client
@@ -3605,6 +3638,35 @@ fn random_motions_by_paragraphs_show_nothing_neovim_never_drew() {
     let mut rng = Lcg(17);
     let keys = random_keys(&mut rng, KEYS, COUNTED);
     sights_compared("client-fuzz-p", SCROLLED, MOTIONS, &keys, rng, false);
+}
+
+/// [`random_scrolls_and_motions_number_the_rows_as_neovim_does`] with `H`,
+/// `M` and `L` among the motions and scrolls, counted too — `M`'s count
+/// for nothing — and `'scrolloff'` keeping three lines about the cursor,
+/// which they stop short of the view's edges for, but at the buffer's own.
+#[test]
+fn random_motions_to_the_window_edges_show_nothing_neovim_never_drew() {
+    require_nvim!();
+    const KEYS: &[(&[u8], &str)] = &[
+        (b"H", "H"),
+        (b"M", "M"),
+        (b"L", "L"),
+        (b"H", "H"),
+        (b"L", "L"),
+        (b"j", "j"),
+        (b"k", "k"),
+        (b"$", "$"),
+        (b"0", "0"),
+        (b"\x05", "<C-e>"),
+        (b"\x19", "<C-y>"),
+        (b"\x04", "<C-d>"),
+        (b"\x15", "<C-u>"),
+    ];
+    const COUNTED: &[&str] = &["H", "M", "L", "j", "k", "<C-e>", "<C-y>"];
+    let mut rng = Lcg(19);
+    let keys = random_keys(&mut rng, KEYS, COUNTED);
+    let setline = format!("set nu rnu so=3 | {SCROLLED}");
+    sights_compared("client-fuzz-hml", &setline, MOTIONS, &keys, rng, false);
 }
 
 /// `f`, `t`, `F` and `T`, each with a character to look for, as the
@@ -6525,4 +6587,109 @@ fn random_typing_and_taking_out_shows_nothing_neovim_never_drew() {
         keys.push((bytes.to_vec(), name.into()));
     }
     sights_are_neovims("client-rfuzz", setline, TYPING, &keys, rng);
+}
+
+/// Where Neovim takes the cursor for `H`, `M` and `L` in a window `rows`
+/// tall over `count` lines: for each of `sos` as `'scrolloff'`, each of
+/// `tops` the view's top line, each of `keys`, each of `counts` — the line
+/// the view was shown from, the cursor's line after, and the view's top
+/// after, lines from nought.
+const WINDOW_LUA: &str = "local rows, count, tops, sos, keys, counts = ...
+  vim.o.laststatus, vim.o.cmdheight, vim.o.lines = 0, 1, rows + 1
+  local lines = {}
+  for i = 1, count do
+    lines[i] = 'line ' .. i
+  end
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
+  local out = { vim.api.nvim_win_get_height(0) }
+  for _, so in ipairs(sos) do
+    vim.wo.scrolloff = so
+    for _, top in ipairs(tops) do
+      for _, k in ipairs(keys) do
+        for _, n in ipairs(counts) do
+          vim.fn.winrestview({ topline = top + 1,
+            lnum = math.min(top + 1 + math.floor(rows / 2), count) })
+          local was = vim.fn.line('w0') - 1
+          vim.api.nvim_feedkeys(n .. k, 'nx', false)
+          out[#out + 1] = { was, vim.fn.line('.') - 1, vim.fn.line('w0') - 1 }
+        end
+      end
+    end
+  end
+  return out";
+
+/// What the client makes of `H`, `M` and `L` is what a real Neovim makes of
+/// them, the view never moved: in windows short and tall over buffers that
+/// fill them and that do not, shown from their first line, their last and
+/// between, with `'scrolloff'` from none to half the window, and counts
+/// from one to past the window's height — the line the cursor lands on.
+#[test]
+fn window_motions_go_where_neovim_takes_them() {
+    use nvmux::client::moves;
+    use nvmux::client::predict::Edge;
+    require_nvim!();
+    let scratch = Scratch::new("client-hml");
+    let (_sock, mut rpc, _config) = session(&scratch, "client-hml");
+    rpc.command("setlocal noswapfile").expect("noswapfile");
+    let keys = [("H", Edge::Top), ("M", Edge::Middle), ("L", Edge::Bottom)];
+    let sos = [0i64, 1, 2, 3, 6, 30];
+    let counts = [1i64, 2, 3, 7, 50];
+    let mut checked = 0;
+    for (rows, count) in [
+        (4i64, 3i64),
+        (4, 8),
+        (5, 8),
+        (5, 40),
+        (9, 8),
+        (9, 40),
+        (22, 40),
+    ] {
+        let tops: Vec<i64> = (0..count)
+            .filter(|t| count < 10 || t % 4 == 0 || *t > count - 4)
+            .collect();
+        let list = |v: &[i64]| Value::Array(v.iter().map(|&n| Value::from(n)).collect());
+        let args = Value::Array(vec![
+            rows.into(),
+            count.into(),
+            list(&tops),
+            list(&sos),
+            Value::Array(keys.iter().map(|(k, _)| Value::from(*k)).collect()),
+            list(&counts),
+        ]);
+        let got = rpc
+            .call("nvim_exec_lua", vec![WINDOW_LUA.into(), args])
+            .expect("Neovim's");
+        let got = got.as_array().expect("a list");
+        assert_eq!(got[0].as_i64(), Some(rows), "the window's height");
+        let mut theirs = got[1..].iter().map(|v| {
+            let v = v.as_array().expect("three");
+            [0, 1, 2].map(|i| v[i].as_i64().expect("a line"))
+        });
+        for &so in &sos {
+            for _ in &tops {
+                for &(key, edge) in &keys {
+                    for &n in &counts {
+                        let [top, line, after] = theirs.next().expect("as many");
+                        // Past half the window, `'scrolloff'` keeps the
+                        // cursor by rules of its own, which the client
+                        // leaves every motion to Neovim for.
+                        if so > (rows - 1) / 2 {
+                            continue;
+                        }
+                        assert_eq!(
+                            after, top,
+                            "{n}{key}: the view moved, {rows} rows over {count} lines, 'scrolloff' {so}"
+                        );
+                        let ours = moves::window(edge, n, top, (rows, so), count);
+                        assert_eq!(
+                            ours, line,
+                            "{n}{key} from top {top}, {rows} rows over {count} lines, 'scrolloff' {so}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 2000, "{checked}");
 }
