@@ -3325,6 +3325,78 @@ fn a_diagnostic_slides_out_of_view_with_its_line() {
     );
 }
 
+/// A diagnostic's virtual line on the cursor's line goes with the cursor,
+/// so a scroll that takes the cursor off it leaves the lines the view moved
+/// past a row shorter than they were drawn — and Neovim's `scroll_delta`,
+/// worked out over them as they are by then, a row short of how far it
+/// moved the window's rows. The scroll slides as far as the rows went:
+/// every frame of it shows the lines in order, none left out at the seam.
+#[test]
+fn a_scroll_off_a_virtual_line_slides_as_far_as_the_rows_went() {
+    require_nvim!();
+    let scratch = Scratch::new("client-vline");
+    let (sock, mut rpc, config) = session(&scratch, "client-vline");
+    rpc.command(
+        "lua vim.diagnostic.config({ virtual_lines = { current_line = true }, \
+           virtual_text = false, signs = false, underline = false }) \
+         local lines = {} \
+         for n = 1, 100 do lines[n] = string.format('line %03d', n) end \
+         vim.api.nvim_buf_set_lines(0, 0, -1, false, lines) \
+         vim.diagnostic.set(vim.api.nvim_create_namespace('test'), 0, \
+           { { lnum = 4, col = 0, message = 'the fifth' } }) \
+         vim.api.nvim_win_set_cursor(0, { 5, 0 })",
+    )
+    .expect("a virtual line");
+
+    let mut term = Terminal::spawn(&sock, &config);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the fifth")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    settle(
+        &mut term,
+        Duration::from_millis(300),
+        Duration::from_secs(5),
+    );
+
+    // Half the window down, the cursor off line 5 and its virtual line gone.
+    term.type_bytes(b"\x04");
+    let (mut out_of_order, mut tops): (Vec<Vec<u32>>, Vec<u32>) = (Vec::new(), Vec::new());
+    term.frames(Duration::from_secs(2), |screen| {
+        let mut shown: Vec<u32> = Vec::new();
+        for r in 0..ROWS - 2 {
+            let row: String = (0..COLS)
+                .map(|c| match screen.cell(r, c) {
+                    Some(cell) if cell.has_contents() => cell.contents(),
+                    _ => " ",
+                })
+                .collect();
+            if let Some(n) = row
+                .trim()
+                .strip_prefix("line ")
+                .and_then(|n| n.parse().ok())
+            {
+                shown.push(n);
+            }
+        }
+        if shown.windows(2).any(|w| w[1] != w[0] + 1) {
+            out_of_order.push(shown.clone());
+        }
+        tops.extend(shown.first());
+        false
+    });
+    let landed = top_line(&term.text()).expect("landed on a line");
+    assert!(
+        tops.iter().any(|t| *t < landed),
+        "no frame slid to line {landed}: {tops:?}"
+    );
+    assert!(
+        out_of_order.is_empty(),
+        "lines out of order: {out_of_order:?}"
+    );
+}
+
 /// In a window that conceals text, a line's end is left of where the editor
 /// sees it: what runs past the grid's edge is drawn on from where the row
 /// has the message, not where the editor says.

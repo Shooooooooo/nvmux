@@ -400,6 +400,19 @@ impl Animator {
                         continue;
                     }
                     if let Some(rect) = inner(g, model.margins(grid)) {
+                        let delta = match moved(grid, rect, delta, batch) {
+                            Some(by) if by != delta => {
+                                tracing::debug!(
+                                    grid,
+                                    said = delta,
+                                    moved = by,
+                                    "client: a window's rows moved other than as far as \
+                                     Neovim said; sliding as far as they went"
+                                );
+                                by
+                            }
+                            _ => delta,
+                        };
                         scrolls.extend(Snap::take(model, grid, rect, delta));
                     }
                 }
@@ -1088,6 +1101,77 @@ fn inner(g: &Grid, m: Margins) -> Option<(usize, usize, usize, usize)> {
     (top < bot && left < right).then_some((top, bot, left, right))
 }
 
+/// How far Neovim moved the text in `rect`, in grid `grid`, over `batch`,
+/// where the batch shows it: as far as it scrolled the rows it then left
+/// as they were, the one nearest the edge a view `delta` rows on leaves
+/// saying — the top going down the buffer, the bottom going up. `None`
+/// where it never scrolled the whole rectangle, or drew every row of it
+/// again after.
+///
+/// `scroll_delta` is worked out once the redraw is done, over the lines the
+/// view moved past as they are by then. Where the same redraw made one of
+/// them taller or shorter — a virtual line the cursor takes with it, as a
+/// diagnostic's on `current_line` is — that is not how far the rows went,
+/// and a slide by it would be a row short or over at its seam. The rows
+/// Neovim moved and left are: it moved them as the view was.
+fn moved(
+    grid: u64,
+    rect: (usize, usize, usize, usize),
+    delta: i64,
+    batch: &[Event],
+) -> Option<i64> {
+    let (top, bot, left, right) = rect;
+    // The row of the rectangle as it was that each of its rows shows.
+    let mut from: Vec<Option<i64>> = (0..(bot - top) as i64).map(Some).collect();
+    let mut whole = false;
+    for e in batch {
+        match *e {
+            Event::GridScroll {
+                grid: g,
+                top: t,
+                bot: b,
+                left: l,
+                right: r,
+                rows,
+            } if g == grid => {
+                whole |= (t, b, l, r) == rect;
+                let (t, b) = (t.max(top) - top, b.min(bot).saturating_sub(top));
+                if t >= b {
+                    continue;
+                }
+                // A scroll across part of the rectangle's width leaves its
+                // rows neither what they were nor what they moved to.
+                let across = l <= left && r >= right;
+                let was = from.clone();
+                for (i, f) in from.iter_mut().enumerate().take(b).skip(t) {
+                    let src = i as i64 + rows;
+                    *f = (across && (t as i64..b as i64).contains(&src))
+                        .then(|| was[src as usize])
+                        .flatten();
+                }
+            }
+            Event::GridLine { grid: g, row, .. } if g == grid && (top..bot).contains(&row) => {
+                from[row - top] = None;
+            }
+            Event::GridClear { grid: g } if g == grid => from.fill(None),
+            _ => {}
+        }
+    }
+    if !whole {
+        return None;
+    }
+    let mut untouched = from
+        .iter()
+        .enumerate()
+        .filter_map(|(r, f)| Some(f.as_ref()? - r as i64));
+    let by = if delta > 0 {
+        untouched.next()
+    } else {
+        untouched.next_back()
+    };
+    by.filter(|by| *by != 0)
+}
+
 /// Without `ext_multigrid`, the one scroll there is to animate: a
 /// `grid_scroll` of grid 1 whose rows match the current window's
 /// `scroll_delta`, summed over the batch. Anything else — a region scrolled to
@@ -1465,6 +1549,59 @@ mod tests {
             frame.get(0, 0).map(|c| c.text.clone()),
             Some(Text::Char('3'))
         );
+    }
+
+    /// A batch that scrolls grid 2 whole by `rows`, then draws `drawn` —
+    /// Neovim saying the view moved `delta` — and what its first frame shows
+    /// down the window's first column, a row to a character.
+    fn first_frame(rows: i64, drawn: Vec<Event>, delta: i64) -> String {
+        let (mut a, mut m, t0) = (Animator::new(effects()), model(), Instant::now());
+        setup(&mut a, &mut m, t0);
+        let mut events = vec![Event::GridScroll {
+            grid: 2,
+            top: 0,
+            bot: 10,
+            left: 0,
+            right: 10,
+            rows,
+        }];
+        events.extend(drawn);
+        events.push(viewport(10 + delta, 10 + delta, delta));
+        batch(&mut a, &mut m, events, true, t0);
+        let frame = compose::compose(&m, &a, 30, 12);
+        (0..10)
+            .map(|r| match frame.get(r, 0).map(|c| c.text.clone()) {
+                Some(Text::Char(c)) => c,
+                _ => '?',
+            })
+            .collect()
+    }
+
+    /// A scroll slides as far as Neovim moved the rows it scrolled and left
+    /// as they were, not as far as its `scroll_delta` says, where the two
+    /// differ — a virtual line the cursor took with it leaves the lines the
+    /// view moved past a row shorter than they were drawn — and the lines
+    /// it slides through follow on from the window's own at the seam: going
+    /// down the buffer at the top, going up it at the bottom.
+    #[test]
+    fn a_scroll_slides_as_far_as_neovim_moved_the_rows() {
+        // Down three, said as two: rows 7 to 9 drawn anew.
+        let mut new = lines(2, 10, 3);
+        for (r, e) in new.iter_mut().enumerate() {
+            if let Event::GridLine { row, .. } = e {
+                *row = 7 + r;
+            }
+        }
+        assert_eq!(first_frame(3, new, 2), "1234567890");
+        // Up three, said as two: rows 0 to 2 drawn anew.
+        assert_eq!(first_frame(-3, lines(2, 7, 3), -2), "9012345678");
+    }
+
+    /// Where Neovim drew every row again after its scroll, nothing it moved
+    /// is left to say how far: the scroll slides as far as Neovim says.
+    #[test]
+    fn a_scroll_drawn_again_whole_slides_as_far_as_neovim_says() {
+        assert_eq!(first_frame(1, lines(2, 3, 10), 3), "1234567890");
     }
 
     /// Neovim's highlight `id`, its foreground `0xRRGGBB`.
