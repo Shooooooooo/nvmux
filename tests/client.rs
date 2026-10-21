@@ -4478,6 +4478,59 @@ fn auto_predicts_over_ssh_and_on_here_as_well() {
     }
 }
 
+/// Told `"on"`, a client on this machine scrolls before Neovim has taken
+/// the scroll, whatever the round trip: a turn of the wheel while Neovim is
+/// busy for a second and a half moves the view at once, and Neovim's own
+/// scroll, once it is done, lands where the client already is. Told
+/// `"auto"`, the same turn waits for Neovim.
+#[test]
+fn told_on_a_client_here_scrolls_before_neovim_answers() {
+    require_nvim!();
+    for (tag, client, ahead) in [
+        ("client-on-scroll", "predict_scrolls = \"on\"\n", true),
+        ("client-auto-scroll", "", false),
+    ] {
+        let scratch = Scratch::new(tag);
+        let (sock, mut rpc, config) = session(&scratch, tag);
+        let settings = format!("[client]\n{client}[effects.scroll]\nenabled = false\n");
+        std::fs::write(&config, settings).expect("write the config");
+        rpc.command(
+            "setlocal noswapfile | call setline(1, map(range(1, 200), '\"line \" . v:val'))",
+        )
+        .expect("setline");
+        let mut term = Terminal::spawn(&sock, &config);
+        assert!(
+            term.pump_until(Duration::from_secs(20), |s| top_line(s) == Some(1)),
+            "{tag}: never drawn:\n{}",
+            term.text()
+        );
+        // The agent's lines, a moment after the first paint.
+        term.pump_until(Duration::from_secs(2), |_| false);
+
+        // Neovim busy from before the turn of the wheel reaches it, which
+        // waits in its typeahead till then.
+        let busy = std::thread::spawn(move || rpc.command("lua vim.uv.sleep(1500)"));
+        term.pump_until(Duration::from_millis(200), |_| false);
+        term.type_bytes(b"\x1b[<65;10;5M");
+        let early = term.pump_until(Duration::from_millis(600), |s| top_line(s) == Some(4));
+        assert_eq!(
+            early,
+            ahead,
+            "{tag}: drawn ahead of Neovim\n{}",
+            term.text()
+        );
+        busy.join().expect("the busy call").expect("Neovim busy");
+        assert!(
+            term.pump_until(Duration::from_secs(5), |s| top_line(s) == Some(4)),
+            "{tag}: Neovim's scroll never drawn:\n{}",
+            term.text()
+        );
+        term.pump_until(Duration::from_secs(1), |_| false);
+        assert_eq!(top_line(&term.text()), Some(4), "{tag}:\n{}", term.text());
+        assert_eq!(term.hang_up(), Some(0), "{tag}: the client's exit");
+    }
+}
+
 /// A config for a wide terminal: every window's text centred, as wide as
 /// what it shows wants, or else 60 columns of it. A session in one window,
 /// its status line its own colour, and a terminal 160 columns wide.

@@ -141,7 +141,7 @@ use self::predict::{Command, Mode, Pos, Predictor, Proof, Rest, Side, Unseen, Wa
 use self::redraw::Event;
 use self::screen::Screen;
 use self::wire::{Arg, Inbox, Outbox};
-use crate::config::{Centre, Predictions};
+use crate::config::{Centre, Predict, Predictions};
 use crate::palette::{Palette, Rgb};
 
 /// The options that lay windows out, as the agent gives them: `'laststatus'`,
@@ -309,9 +309,10 @@ return out";
 /// argument says the client may scroll ahead, or a `User` autocommand
 /// `nvmux_client_reach_<chan>` says since, with the number as its data; two
 /// at first, the rest a moment later, no more than a few hundred lines at a
-/// time; and none at all while that number is 0, as it is while the link is
-/// too fast for predictions (see [`Predictor::agent_reach`]), what was sent
-/// let go of — and the view's own (`lines`, window, buffer, `b:changedtick`,
+/// time; and none at all while that number is 0, as it is while nothing is
+/// predicted — over a link too fast for what is told `"auto"`, with nothing
+/// told `"on"` (see [`Predictor::agent_reach`]) — what was sent let go of —
+/// and the view's own (`lines`, window, buffer, `b:changedtick`,
 /// first line, lines, whether they replace what the client has, the most
 /// bytes of a line sent), only those the client does not have, by the same
 /// rule as [`predict`] keeps them by, and each no longer than the window
@@ -2305,11 +2306,12 @@ impl App {
         if !self.agent || reach == self.reach {
             return;
         }
-        // None: the link too fast for predictions now, the agent sends
-        // nothing more and lets go of what it sent, and what the client
-        // keeps of it goes too — no edit reaches it from here on — till the
-        // agent sends it all afresh, with a slow link back; and no word of
-        // the keys, which the cursor moved ahead of Neovim would wait for.
+        // None: the link too fast for what is predicted, all of it told
+        // "auto": the agent sends nothing more and lets go of what it sent,
+        // and what the client keeps of it goes too — no edit reaches it from
+        // here on — till the agent sends it all afresh, with a slow link
+        // back; and no word of the keys, which the cursor moved ahead of
+        // Neovim would wait for.
         if reach == 0 {
             p.reset();
             for grid in self.anim.chained() {
@@ -2977,7 +2979,7 @@ impl App {
             self.done = true;
         }
         self.anim
-            .set_predicting(self.predict.as_ref().is_some_and(Predictor::active));
+            .set_predicting(self.predict.as_ref().is_some_and(Predictor::live));
         let judging = self.ack.as_ref().map(|(k, _)| *k);
         self.anim.after(
             before,
@@ -3183,7 +3185,7 @@ impl App {
     /// is an agent to count them.
     fn fence(&mut self) {
         let chan = self.chan;
-        if let Some(p) = self.predict.as_mut().filter(|p| p.active()) {
+        if let Some(p) = self.predict.as_mut().filter(|p| p.live()) {
             if p.wants_fence() {
                 let sent = p.typed.fenced();
                 let fenced = p.sync.fenced(p.typed.seq());
@@ -3303,7 +3305,7 @@ impl App {
         };
         // A turn of the wheel is a scroll, and left to Neovim with the rest
         // where the scrolls are not predicted.
-        let scrolls = p.predictions.scrolls;
+        let scrolls = p.predictions.scrolls != Predict::Off;
         let shape = self.model.wins.get(&grid).and_then(|w| p.shape(*w));
         let insert = Mode::of(&self.model.mode_name) == Mode::Insert;
         let (dir, sideways) = match way {
@@ -3433,7 +3435,10 @@ impl App {
         cause: Cause,
         now: Instant,
     ) -> bool {
-        if count.is_some_and(|n| n >= predict::MAX_COUNT) {
+        let motions = |p: &Predictor| p.active(p.predictions.motions);
+        if count.is_some_and(|n| n >= predict::MAX_COUNT)
+            || !self.predict.as_ref().is_some_and(motions)
+        {
             return false;
         }
         let Some(on) = self.onward(grid, now) else {
@@ -3545,10 +3550,7 @@ impl App {
     /// the next will say. And over the lines as the word has them — or as the
     /// steps typed them.
     fn onward(&self, grid: u64, now: Instant) -> Option<Onward> {
-        let p = self
-            .predict
-            .as_ref()
-            .filter(|p| p.active() && p.acks() && p.known())?;
+        let p = self.predict.as_ref().filter(|p| p.acks() && p.known())?;
         if !self.steps_in(grid, now) {
             return None;
         }
@@ -3876,7 +3878,7 @@ impl App {
         let Some(p) = self
             .predict
             .as_ref()
-            .filter(|p| p.active() && p.typing() && p.known())
+            .filter(|p| p.active(p.predictions.typing) && p.known())
         else {
             return false;
         };
@@ -4102,7 +4104,7 @@ impl App {
         let Some(p) = self
             .predict
             .as_ref()
-            .filter(|p| p.active() && p.typing() && p.known())
+            .filter(|p| p.active(p.predictions.typing) && p.known())
         else {
             return false;
         };
@@ -4587,7 +4589,10 @@ impl App {
         if let (Command::Half { count: Some(n), .. }, Some(p)) = (command, self.predict.as_mut()) {
             p.set_scroll(win, n.min(h), cause.seq);
         }
-        if !self.predict.as_ref().is_some_and(Predictor::active)
+        if !self
+            .predict
+            .as_ref()
+            .is_some_and(|p| p.active(p.predictions.scrolls))
             || !self.multigrid()
             || !self.flushed
             || self.holding(now)
@@ -5037,7 +5042,10 @@ impl App {
     /// turned `by`: made at once, where the client can say what Neovim will
     /// make of it. See [`predict_command`](Self::predict_command).
     fn predict_side(&mut self, grid: u64, side: Side, cause: Cause, now: Instant) -> bool {
-        if !self.predict.as_ref().is_some_and(Predictor::active)
+        if !self
+            .predict
+            .as_ref()
+            .is_some_and(|p| p.active(p.predictions.scrolls))
             || !self.multigrid()
             || !self.flushed
             || self.holding(now)
@@ -6381,22 +6389,21 @@ const FALLBACK: Palette = Palette {
 mod tests {
     use super::*;
     use crate::client::predict::PING_EVERY;
-    use crate::config::Predict;
     use rmpv::Value;
 
     type Call = (Option<u64>, String, Vec<Value>);
 
-    /// The motions as well as the scrolls, as `predict_typing = false` has
+    /// The motions as well as the scrolls, as `predict_typing = "off"` has
     /// them; and the typing as well, as `[client]` has it by default.
     const MOTIONS: Predictions = Predictions {
-        scrolls: true,
-        motions: true,
-        typing: false,
+        scrolls: Predict::Auto,
+        motions: Predict::Auto,
+        typing: Predict::Off,
     };
     const TYPING: Predictions = Predictions {
-        scrolls: true,
-        motions: true,
-        typing: true,
+        scrolls: Predict::Auto,
+        motions: Predict::Auto,
+        typing: Predict::Auto,
     };
 
     fn palette() -> Palette {
@@ -8608,7 +8615,7 @@ mod tests {
             answer(&mut a, ping, Value::Nil, t + Duration::from_millis(1));
         }
         let p = a.predict.as_ref().expect("predicting");
-        assert!(!p.active(), "a fast link now");
+        assert!(!p.live(), "a fast link now");
     }
 
     /// The agent keeps lines as far either side of a view as a key held down
@@ -8744,11 +8751,79 @@ mod tests {
         }
         assert!(!told.is_empty(), "the agent told");
         let p = a.predict.as_ref().expect("predicting");
-        assert!(!p.active(), "a fast link");
+        assert!(!p.live(), "a fast link");
         assert!(p.shape(1000).is_none(), "the window's shape let go of");
         // Nothing to predict from: a turn of the wheel goes to Neovim.
         a.keys(b"\x1b[<65;3;2M", t);
         assert_eq!(top_row(&a), "line 0");
+    }
+
+    /// Told `"on"`, each kind is drawn ahead over a link too fast for
+    /// `"auto"`, the agent keeping lines for it from the first: a turn of
+    /// the wheel scrolls the window at once, `l` moves the cursor, and what
+    /// is typed goes in. Told `"auto"` over the same link, a kind waits for
+    /// Neovim.
+    #[test]
+    fn told_on_each_kind_is_drawn_ahead_whatever_the_round_trip() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let (auto, on, off) = (Predict::Auto, Predict::On, Predict::Off);
+        let only = |scrolls, motions, typing| Predictions {
+            scrolls,
+            motions,
+            typing,
+        };
+        let reach = |p| predicting_as(p, Duration::ZERO).0.reach;
+        assert_eq!(reach(only(auto, off, off)), 0, "no lines kept, told auto");
+        assert_eq!(reach(only(on, off, off)), 2, "lines kept from the first");
+
+        let (mut a, _) = predicting_as(only(on, off, off), Duration::ZERO);
+        a.keys(b"\x1b[<65;3;2M", t1);
+        assert_eq!(top_row(&a), "line 3", "a turn of the wheel");
+
+        let mut a = stepping_as(only(off, on, off), Duration::ZERO, &[]);
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 1), "a motion");
+        let p = a.predict.as_mut().expect("predicting");
+        p.set_predictions(only(off, auto, off));
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 1), "told auto, the next waits for Neovim");
+
+        let mut a = stepping_as(only(off, off, on), Duration::ZERO, &[]);
+        facts(&mut a, |_| {}, t1);
+        ack_i(&mut a, 0, "", 0, 1, t1);
+        redraw(&mut a, typed_frame("line 0", 0), t1);
+        a.keys(b"abc", t1);
+        assert_eq!(composed(&mut a)[0], "abcline 0", "what is typed");
+    }
+
+    /// A link fast again stops nothing told `"on"`: the agent goes on
+    /// sending what the predictions are made from, as far as the link pages,
+    /// and the client keeps what it has.
+    #[test]
+    fn a_link_fast_again_keeps_what_is_told_on() {
+        let on = Predictions {
+            scrolls: Predict::On,
+            ..Predictions::default()
+        };
+        let (mut a, _) = predicting_as(on, Duration::from_millis(200));
+        let mut t = Instant::now() + Duration::from_secs(1);
+        for _ in 0..60 {
+            t += PING_EVERY;
+            a.keys(b"j", t);
+            a.tick(t);
+            let ping = request(&calls(&mut a), "nvim_get_mode", "");
+            answer(&mut a, ping, Value::Nil, t);
+            calls(&mut a);
+        }
+        let p = a.predict.as_ref().expect("predicting");
+        assert!(
+            a.reach > 0 && a.reach == p.reach(),
+            "as far as the link pages"
+        );
+        assert!(!p.active(Predict::Auto) && p.live(), "a fast link, told on");
+        assert!(p.shape(1000).is_some(), "the window's shape kept");
+        a.keys(b"\x1b[<65;3;2M", t);
+        assert_eq!(top_row(&a), "line 3");
     }
 
     /// [`predicting`], the agent telling the client what Neovim made of
@@ -8850,9 +8925,9 @@ mod tests {
             (TYPING, true, "luaeval('(_G.nvmux_taken or {})[7] or -1')"),
             (
                 Predictions {
-                    scrolls: false,
-                    motions: false,
-                    typing: true,
+                    scrolls: Predict::Off,
+                    motions: Predict::Off,
+                    typing: Predict::Auto,
                 },
                 true,
                 "luaeval('(_G.nvmux_taken or {})[7] or -1')",
@@ -9812,12 +9887,13 @@ mod tests {
     fn the_motions_and_the_scrolls_are_switched_apart() {
         let t1 = Instant::now() + Duration::from_secs(1);
         let apart = |scrolls: bool, motions: bool| {
+            let kind = |made: bool| if made { Predict::Auto } else { Predict::Off };
             let mut a = scrolling(Duration::from_millis(200));
             let p = a.predict.as_mut().expect("predicting");
             p.set_predictions(Predictions {
-                scrolls,
-                motions,
-                typing: !motions,
+                scrolls: kind(scrolls),
+                motions: kind(motions),
+                typing: kind(!motions),
             });
             assert!(p.acks());
             a

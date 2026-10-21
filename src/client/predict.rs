@@ -78,7 +78,8 @@
 //! where nothing maps the key or the wheel. And only once the link is slow
 //! enough to be worth it ([`ON`]): what a prediction costs is a few rows
 //! without their colours for as long as the link takes, which on a fast one
-//! is a flicker, and nothing gained.
+//! is a flicker, and nothing gained — unless told `"on"` (see `[client]
+//! predict_scrolls`), whatever the round trip.
 //!
 //! A key is a scroll only in the mode it scrolls in with nothing pending —
 //! Normal or Visual, or Insert for its own — and the client cannot see
@@ -161,11 +162,12 @@ use super::grid::{Cell, Text};
 use super::moves;
 use super::redraw;
 use super::typing;
-use crate::config::Predictions;
+use crate::config::{Predict, Predictions};
 
-/// Predictions start once the smoothed round trip reaches this, and stop
-/// once it falls back under [`OFF`]: the gap keeps a link that hovers about
-/// the one value from turning them on and off.
+/// Predictions told `"auto"` start once the smoothed round trip reaches
+/// this, and stop once it falls back under [`OFF`]: the gap keeps a link that
+/// hovers about the one value from turning them on and off. Those told
+/// `"on"` are made whatever the round trip.
 pub const ON: Duration = Duration::from_millis(30);
 pub const OFF: Duration = Duration::from_millis(20);
 
@@ -2296,20 +2298,21 @@ impl Typed {
                     self.state = State::Z(count);
                     return None;
                 }
-                let motions = self.predictions.motions;
+                let motions = self.predictions.motions != Predict::Off;
                 if motions && key == "g" {
                     self.state = State::G(count);
                     return None;
                 }
-                let enter = typing::Enter::of(key)
-                    .filter(|_| self.predictions.typing && count.is_none_or(|n| n == 1));
+                let enter = typing::Enter::of(key).filter(|_| {
+                    self.predictions.typing != Predict::Off && count.is_none_or(|n| n == 1)
+                });
                 if let Some(e) = enter.filter(|_| !mapped(key)) {
                     self.state = State::Insert { x: false };
                     self.whole = true;
                     self.once = true;
                     return Some(Command::Enter(e));
                 }
-                let scrolls = self.predictions.scrolls;
+                let scrolls = self.predictions.scrolls != Predict::Off;
                 let command = scroll(key, count).filter(|_| scrolls).or_else(|| {
                     let motion = moves::motion(key).filter(|_| motions)?;
                     Some(Command::Move {
@@ -2360,7 +2363,7 @@ impl Typed {
                     "e" => Some(Side::End),
                     _ => None,
                 };
-                let scrolls = self.predictions.scrolls;
+                let scrolls = self.predictions.scrolls != Predict::Off;
                 if let Some(side) = side.filter(|_| scrolls && !mapped(&format!("z{key}"))) {
                     self.state = State::Ready(None);
                     self.whole = true;
@@ -2401,7 +2404,7 @@ impl Typed {
     /// A key typed in insert mode, after a `<C-x>` if `x`.
     fn insert_key(&mut self, key: &str, x: bool, mapped: impl Fn(&str) -> bool) -> Option<Command> {
         let plain = !mapped(key);
-        let scrolls = self.predictions.scrolls;
+        let scrolls = self.predictions.scrolls != Predict::Off;
         if x && plain && scrolls {
             match key {
                 "<C-e>" => return Some(Command::Lines(1)),
@@ -2426,7 +2429,7 @@ impl Typed {
         // Text typed, or taken out, where the client types ahead of Neovim:
         // whether a mapping, or anything else, makes it do more is for the
         // client to say as it makes it (see `typing::refused`).
-        let typing = !x && self.predictions.typing;
+        let typing = !x && self.predictions.typing != Predict::Off;
         if let Some(e) = typing::Edit::of(key).filter(|_| typing) {
             self.state = State::Insert { x: false };
             self.whole = true;
@@ -3493,7 +3496,8 @@ pub struct Predictor {
     /// smooths its own (RFC 6298).
     srtt: Option<Duration>,
     rttvar: Option<Duration>,
-    /// Whether it is long enough to predict over: see [`ON`].
+    /// Whether it is long enough to predict over what is told `"auto"`:
+    /// see [`ON`].
     on: bool,
     shapes: HashMap<i64, Shape>,
     lines: HashMap<i64, Lines>,
@@ -3574,10 +3578,10 @@ impl Predictor {
         self.predictions.acks()
     }
 
-    /// Whether the client types ahead of Neovim, and the agent says what
-    /// bears on it (see [`typing::Facts`]).
+    /// Whether the client types ahead of Neovim, now or over a slower link,
+    /// and the agent says what bears on it (see [`typing::Facts`]).
     pub fn typing(&self) -> bool {
-        self.predictions.typing
+        self.predictions.typing != Predict::Off
     }
 
     /// Work out `predictions` ahead of Neovim from here on.
@@ -3594,9 +3598,24 @@ impl Predictor {
         self.sync.synced() && self.base.is_some() && self.typed.followed()
     }
 
-    /// Whether the link is slow enough to predict over.
-    pub fn active(&self) -> bool {
-        self.on
+    /// Whether what [`Predictor::predictions`] tells `kind` is drawn ahead
+    /// of Neovim now: told `"on"`, whatever the round trip; told `"auto"`,
+    /// while the link is slow enough to predict over (see [`ON`]).
+    pub fn active(&self, kind: Predict) -> bool {
+        match kind {
+            Predict::On => true,
+            Predict::Auto => self.on,
+            Predict::Off => false,
+        }
+    }
+
+    /// Whether anything is drawn ahead of Neovim now: see
+    /// [`Predictor::active`].
+    pub fn live(&self) -> bool {
+        let p = self.predictions;
+        [p.scrolls, p.motions, p.typing]
+            .into_iter()
+            .any(|kind| self.active(kind))
     }
 
     /// How many times as far as it is tall the agent is to keep the lines
@@ -3613,11 +3632,11 @@ impl Predictor {
     }
 
     /// How far the agent is to keep lines either side of a view: as far as
-    /// [`Predictor::reach`] says while the link is slow enough to predict
-    /// over, and not at all while it is not — no lines, colours or shapes
-    /// sent for predictions none are made from (see [`ON`]).
+    /// [`Predictor::reach`] says while anything is drawn ahead of Neovim (see
+    /// [`Predictor::live`]), and not at all while nothing is — no lines,
+    /// colours or shapes sent for predictions none are made from.
     pub fn agent_reach(&self) -> i64 {
-        if self.on {
+        if self.live() {
             self.reach()
         } else {
             0
@@ -3854,8 +3873,8 @@ impl Predictor {
     /// Input `seq` sent at `now`: `key`, or a mouse report other than a turn
     /// of the wheel. Where the agent says what Neovim made of each key, kept
     /// for its count to be checked by; and for its acks to be judged by
-    /// while it says them, which it does not over a link too fast for
-    /// predictions.
+    /// while it says them, which it does not while nothing is drawn ahead of
+    /// Neovim (see [`Predictor::agent_reach`]).
     pub fn sent(&mut self, seq: u64, key: Option<&str>, now: Instant) {
         let input = key.map_or(Input::Click, |k| Input::Key(k.into()));
         self.keep(seq, input, now);
@@ -3876,7 +3895,7 @@ impl Predictor {
         if key.is_some_and(uncertain) {
             self.sync.doubt("a key Neovim may count as two");
         }
-        if !self.on {
+        if !self.live() {
             return;
         }
         if self.queue.len() == QUEUE {
@@ -4329,17 +4348,17 @@ mod tests {
     use super::*;
     use rmpv::Value;
 
-    /// The motions as well as the scrolls, as `predict_typing = false` has
+    /// The motions as well as the scrolls, as `predict_typing = "off"` has
     /// them; and the typing as well, as `[client]` has it by default.
     const MOTIONS: Predictions = Predictions {
-        scrolls: true,
-        motions: true,
-        typing: false,
+        scrolls: Predict::Auto,
+        motions: Predict::Auto,
+        typing: Predict::Off,
     };
     const TYPING: Predictions = Predictions {
-        scrolls: true,
-        motions: true,
-        typing: true,
+        scrolls: Predict::Auto,
+        motions: Predict::Auto,
+        typing: Predict::Auto,
     };
 
     fn shape() -> Shape {
@@ -6618,23 +6637,39 @@ mod tests {
         assert_eq!(p.want(1001), None);
     }
 
-    /// Predictions start past [`ON`] and stop under [`OFF`], the round trip
-    /// smoothed.
+    /// Predictions told `"auto"` start past [`ON`] and stop under [`OFF`],
+    /// the round trip smoothed; those told `"on"` are made whatever it is,
+    /// before it is first measured as well, and those told `"off"` never.
     #[test]
-    fn a_slow_link_turns_predictions_on() {
+    fn a_slow_link_turns_predictions_told_auto_on() {
         let mut p = Predictor::default();
+        let (auto, on, off) = (Predict::Auto, Predict::On, Predict::Off);
+        assert!(
+            !p.active(auto) && p.active(on) && !p.active(off),
+            "unmeasured"
+        );
         p.sample(Duration::from_millis(5));
-        assert!(!p.active());
+        assert!(!p.active(auto) && p.active(on) && !p.active(off));
+        assert!(!p.live(), "the scrolls alone, told \"auto\"");
         p.sample(Duration::from_millis(400));
-        assert!(p.active(), "smoothed past 30 ms");
+        assert!(p.active(auto), "smoothed past 30 ms");
+        assert!(p.active(on) && !p.active(off));
+        assert!(p.live());
         for _ in 0..12 {
             p.sample(Duration::from_millis(25));
         }
-        assert!(p.active(), "between the two: still on");
+        assert!(p.active(auto), "between the two: still on");
         for _ in 0..40 {
             p.sample(Duration::from_millis(5));
         }
-        assert!(!p.active());
+        assert!(!p.active(auto) && p.active(on) && !p.active(off));
+        assert!(!p.live());
+        p.set_predictions(Predictions {
+            scrolls: off,
+            motions: on,
+            typing: auto,
+        });
+        assert!(p.live(), "the motions, told \"on\"");
         let t0 = Instant::now();
         assert!(!p.wants_ping(t0, None), "nobody at work");
         assert!(p.wants_ping(t0, Some(t0)));
@@ -7333,12 +7368,22 @@ mod tests {
     }
 
     /// Inputs are kept for judging the acks by only while acks come — the
-    /// link slow enough — and no more of them than Neovim could be behind
-    /// on: past that, it is not keeping up, or not saying, and the counts
-    /// are in doubt.
+    /// link slow enough, or the motions told `"on"` — and no more of them
+    /// than Neovim could be behind on: past that, it is not keeping up, or
+    /// not saying, and the counts are in doubt.
     #[test]
     fn a_queue_neovim_never_answers_is_let_go() {
         let t0 = Instant::now();
+        let mut on = Predictor {
+            predictions: Predictions {
+                motions: Predict::On,
+                ..MOTIONS
+            },
+            sync: tied(0, 0),
+            ..Predictor::default()
+        };
+        on.sent(1, Some("j"), t0);
+        assert_eq!(on.queue.len(), 1, "told on, over any link");
         let mut p = Predictor {
             predictions: MOTIONS,
             sync: tied(0, 0),
@@ -7544,17 +7589,18 @@ mod tests {
         assert_eq!(typed(&mut t, "i<Esc>"), [], "the motions alone");
     }
 
-    /// Each kind is made by a switch of its own, whichever of the others is
-    /// on: a key of a kind switched off is one the client is blind to, as
+    /// Each kind is made by a setting of its own, whichever of the others is
+    /// on: a key of a kind told `"off"` is one the client is blind to, as
     /// any other it does not follow.
     #[test]
-    fn each_kind_is_made_by_its_own_switch() {
+    fn each_kind_is_made_by_its_own_setting() {
         let only = |scrolls, motions, typing| {
+            let kind = |made: bool| if made { Predict::Auto } else { Predict::Off };
             let mut t = Typed::default();
             t.set_predictions(Predictions {
-                scrolls,
-                motions,
-                typing,
+                scrolls: kind(scrolls),
+                motions: kind(motions),
+                typing: kind(typing),
             });
             t.rebase(Rest::Normal);
             t
