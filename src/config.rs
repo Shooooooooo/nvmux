@@ -254,24 +254,25 @@ pub struct ClientSettings {
     /// (see [`crate::client::predict::Sync`]): one Neovim made otherwise goes
     /// back to Neovim's at once.
     ///
-    /// Experimental, and off by default. The motions along a line — `h`,
-    /// `l`, `0`, `^`, `$`, `g_`, `|` and their kind — and to another line —
-    /// `j`, `k`, `+`, `-`, `_`, `<CR>` and theirs, and `j` and `k` mapped as
-    /// LazyVim maps them — are drawn, with counts, and with them the numbers
-    /// of `'relativenumber'` and the bar of `'cursorline'`: in view, or past
+    /// Off by default. The motions along a line — `h`, `l`, `0`, `^`, `$`,
+    /// `g_`, `|` and their kind — and to another line — `j`, `k`, `+`, `-`,
+    /// `_`, `<CR>` and theirs, and `j` and `k` mapped as LazyVim maps
+    /// them — are drawn, with counts, and with them the numbers of
+    /// `'relativenumber'` and the bar of `'cursorline'`: in view, or past
     /// `'scrolloff'`, the view scrolled as Neovim scrolls it, short of half
     /// the window, which Neovim centres the cursor for instead — but not to
     /// bring into view a line Neovim draws with virtual text or a sign,
     /// which the client would draw without them. With `predict_scrolls` as
     /// well, a key that scrolls, or a turn of the wheel, goes on from where
-    /// the motions before it left the cursor, and they from it; and a scroll
-    /// that takes the cursor to another line, the wheel's among them, has
-    /// the numbers and the bar moved with it where the client can draw them
-    /// as Neovim does, and leaves them as Neovim drew them till its next
-    /// frame where not, as it always did. But not those to another line in a
-    /// window whose gutter a `'statuscolumn'` draws, as LazyVim's is, which
-    /// are left to Neovim. The client follows the rest by what Neovim says
-    /// of each key rather than waiting for it to catch up with them all.
+    /// the motions before it left the cursor, and they from it; and a
+    /// scroll that takes the cursor to another line, the wheel's among
+    /// them, has the numbers and the bar moved with it where the client can
+    /// draw them as Neovim does, and leaves them as Neovim drew them till
+    /// its next frame where not, as it always did. But not those to another
+    /// line in a window whose gutter a `'statuscolumn'` draws, as LazyVim's
+    /// is, which are left to Neovim. The client follows the rest by what
+    /// Neovim says of each key rather than waiting for it to catch up with
+    /// them all.
     ///
     /// What it costs, as `predict_typing` does too: the agent says where
     /// each key left the cursor, about 40 bytes a key back over the link,
@@ -288,16 +289,15 @@ pub struct ClientSettings {
     /// long enough, for sessions over ssh — judged, as `predict_motions`'s
     /// are, against what Neovim says it did.
     ///
-    /// Experimental, and off by default. Not a key a mapping or an
-    /// abbreviation may make more of, one past `'textwidth'`, or one that
-    /// indents the line again; nor, in a buffer whose plugins act on what is
-    /// typed there, till enough of it has been found to go in as typed — or,
-    /// whose plugins act as Insert mode is entered or left there, the keys
-    /// that do that, till enough of them have been found to do no more than
-    /// the key does: one that does more after that — a trimmer of the
-    /// blanks lines end in finding some on another line — is drawn as the
-    /// key alone does it, put right a round trip later, and has its kind
-    /// prove itself again.
+    /// Off by default. Not a key a mapping or an abbreviation may make more
+    /// of, one past `'textwidth'`, or one that indents the line again; nor,
+    /// in a buffer whose plugins act on what is typed there, till enough of
+    /// it has been found to go in as typed — or, whose plugins act as
+    /// Insert mode is entered or left there, the keys that do that, till
+    /// enough of them have been found to do no more than the key does: one
+    /// that does more after that — a trimmer of the blanks lines end in
+    /// finding some on another line — is drawn as the key alone does it,
+    /// put right a round trip later, and has its kind prove itself again.
     ///
     /// What it costs: what `predict_motions` does, and the agent sends an
     /// edit with each key typed in Insert mode rather than at a pause, and
@@ -1575,8 +1575,8 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          # per_session     = {per_session:<8}   # keep each session's client; a switch back reuses it\n\
          # lazy            = {lazy:<8}   # start every client at launch, and after a dropped link; true waits for visits\n\
          # predict_scrolls = {predict_scrolls:<8}   # over ssh, scrolls show before Neovim answers\n\
-         # predict_motions = {predict_motions:<8}   # experimental: over ssh, h, j, $ and their kind move the cursor before Neovim answers\n\
-         # predict_typing  = {predict_typing:<8}   # experimental: over ssh, what is typed in Insert mode shows before Neovim answers\n\
+         # predict_motions = {predict_motions:<8}   # over ssh, h, j, $ and their kind move the cursor before Neovim answers\n\
+         # predict_typing  = {predict_typing:<8}   # over ssh, what is typed in Insert mode shows before Neovim answers\n\
          # centre          = {centre:<8}   # on a wide terminal, each window's text in its middle: \"smart\" or \"fixed\"\n\
          # window_width    = {window_width:<8}   # with centre on, how many columns a window's text gets; 0 for no limit\n\
          \n\

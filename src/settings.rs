@@ -352,14 +352,14 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
             "client",
             "predict_motions",
             Tab::Client,
-            "experimental: over ssh, cursor motions show before Neovim answers",
+            "over ssh, cursor motions show before Neovim answers",
             switch!(client.predict_motions),
         )),
         own(row(
             "client",
             "predict_typing",
             Tab::Client,
-            "experimental: over ssh, what is typed shows before Neovim answers",
+            "over ssh, what is typed shows before Neovim answers",
             switch!(client.predict_typing),
         )),
         own(row(
