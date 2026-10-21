@@ -2259,15 +2259,18 @@ fn a_page_neovim_does_not_turn_is_given_up_at_its_ack() {
 }
 
 /// The client told to work out nothing ahead of Neovim.
-const NOTHING: &str = "predict_scrolls = false\npredict_motions = false\npredict_typing = false\n";
+const NOTHING: &str = "\
+    predict_scrolls = \"off\"\n\
+    predict_motions = \"off\"\n\
+    predict_typing = \"off\"\n";
 
 /// The client told to work out the scrolls alone: the motions and the
-/// typing, on by default, off.
-const SCROLLS: &str = "predict_motions = false\npredict_typing = false\n";
+/// typing, `"auto"` by default, off.
+const SCROLLS: &str = "predict_motions = \"off\"\npredict_typing = \"off\"\n";
 
 /// The client told to work out the motions as well as the scrolls, and not
 /// the typing.
-const MOTIONS: &str = "predict_motions = true\npredict_typing = false\n";
+const MOTIONS: &str = "predict_motions = \"auto\"\npredict_typing = \"off\"\n";
 
 /// Lines of tabs, CJK, an emoji, a letter with a combining mark, nothing,
 /// blanks only, and brackets for MatchParen to light up: what a motion
@@ -2668,7 +2671,7 @@ fn scrolls_alone_number_the_rows_and_lay_the_bar_as_neovim_does() {
 
 /// The client told to type ahead of Neovim, as well as to work out the
 /// motions.
-const TYPING: &str = "predict_motions = true\npredict_typing = true\n";
+const TYPING: &str = "predict_motions = \"auto\"\npredict_typing = \"auto\"\n";
 
 /// Text typed in Insert mode over a slow link to a real Neovim — letters,
 /// blanks, a character with an accent, two cells wide, a burst faster than
@@ -4430,20 +4433,21 @@ fn agent_autocmds(rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>) 
     (n(0), n(1))
 }
 
-/// Predictions are made for a session over ssh unless told otherwise. A
-/// client that nvmux says nothing to of where its session is — on this
-/// machine — leaves its agent in the editor with nothing to predict with,
-/// whatever its switches say; told its session is on another machine, it
-/// leaves it the means, unless every switch is off.
+/// Predictions are made for a session over ssh unless told otherwise, and
+/// for one on this machine only when told. A client that nvmux says
+/// nothing to of where its session is — on this machine — leaves its agent
+/// in the editor with nothing to predict with where its settings say
+/// `"auto"`, and the means where one says `"on"`; told its session is on
+/// another machine, it leaves it the means, unless every one says `"off"`.
 #[test]
-fn predictions_are_made_for_a_session_over_ssh_unless_told() {
+fn auto_predicts_over_ssh_and_on_here_as_well() {
     require_nvim!();
     let off = format!("[client]\n{NOTHING}");
-    let motions = format!("[client]\n{MOTIONS}");
+    let on = "[client]\npredict_motions = \"on\"\n";
     let (there, there_off) = (over_ssh(""), over_ssh(&off));
     for (tag, config, told, predicting) in [
         ("client-here", "", None, false),
-        ("client-motions-here", motions.as_str(), None, false),
+        ("client-on-here", on, None, true),
         ("client-there", "", Some(&there), true),
         ("client-off-there", off.as_str(), Some(&there_off), false),
     ] {

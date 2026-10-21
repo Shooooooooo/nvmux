@@ -228,6 +228,36 @@ What Neovim draws after the end of a line, such as a language server's
 diagnostic, runs on into the margin as far as the window goes, rather than
 stopping where the text does.
 
+### Over a slow link
+
+Over ssh, every key waits a round trip for Neovim to say what it did with it.
+nvmux's own client draws some keys at once instead, before Neovim has heard of
+them, much as [mosh](https://mosh.org) echoes what you type: scrolls (`<C-d>`,
+`<C-f>`, `zz`, the mouse wheel and their kind), cursor motions in Normal mode
+(`h`, `j`, `$` and their kind), and what you type in Insert mode. It draws
+each only where it can work out exactly what Neovim will do, and Neovim has the
+last word: anything it did otherwise is put back as Neovim drew it, a round
+trip later.
+
+Each kind has a setting of its own under `[client]` — `predict_scrolls`,
+`predict_motions` and `predict_typing` — set to one of:
+
+| Value | Means |
+|---|---|
+| `"auto"` | the default: on for a session on a remote host, off for one on this machine |
+| `"on"` | on for every session, this machine's too |
+| `"off"` | off: every key of its kind waits for Neovim |
+
+Even on, nothing is drawn ahead until the round trip is long enough to be
+worth it. The client times it as it attaches and every two seconds while you
+type, smoothing it as TCP smooths its own, and predicts from when it reaches
+30 ms until it falls back under 20 ms. This machine's round trip never comes
+near that, which is why `"auto"` leaves its sessions off.
+
+The motions and the typing have the editor say what it made of each key, about
+40 bytes a key back over the link; and the typing has it send the line you are
+typing on with each key, about a hundred bytes on a short line.
+
 ## Configuration
 
 nvmux needs no configuration. To change a setting, press `,` in the picker or
@@ -262,9 +292,9 @@ command = "nvim --headless --listen {sock}"   # {sock} is required
 ui              = "nvmux"  # who draws a session: nvmux's own client, animated; or "nvim"
 per_session     = true     # keep each session's client; a switch back reuses it
 lazy            = false    # start every client at launch, and after a dropped link; true waits for visits
-predict_scrolls = true     # over ssh, scrolls show before Neovim answers
-predict_motions = true     # over ssh, h, j, $ and their kind move the cursor before Neovim answers
-predict_typing  = true     # over ssh, what is typed in Insert mode shows before Neovim answers
+predict_scrolls = "auto"   # over ssh, scrolls show before Neovim answers; "on" everywhere, or "off"
+predict_motions = "auto"   # over ssh, h, j, $ and their kind move the cursor before Neovim answers
+predict_typing  = "auto"   # over ssh, what is typed in Insert mode shows before Neovim answers
 centre          = "off"    # on a wide terminal, each window's text in its middle: "smart" or "fixed"
 window_width    = 120      # with centre on, how many columns a window's text gets; 0 for no limit
 

@@ -13,7 +13,9 @@
 
 use std::sync::LazyLock;
 
-use crate::config::{Centre, ParticleMode, Settings, ThemeColor, Ui, MAX_FADE_MS, MAX_TIMEOUT_MS};
+use crate::config::{
+    Centre, ParticleMode, Predict, Settings, ThemeColor, Ui, MAX_FADE_MS, MAX_TIMEOUT_MS,
+};
 use crate::keys::BINDINGS;
 
 /// The screen's tabs. Each is a table of the file, but for the keys: their
@@ -229,6 +231,22 @@ macro_rules! switch {
     };
 }
 
+/// For which sessions a kind of key is drawn ahead of Neovim, by its field:
+/// `predict!(client.predict_scrolls)`.
+macro_rules! predict {
+    ($($field:ident).+) => {
+        Kind::Choice {
+            options: &["auto", "on", "off"],
+            get: |s| s.$($field).+.name(),
+            set: |s, name| {
+                if let Some(way) = Predict::ALL.into_iter().find(|w| w.name() == name) {
+                    s.$($field).+ = way;
+                }
+            },
+        }
+    };
+}
+
 /// A row with only what every row has; the few with more say so after.
 const fn row(
     table: &'static str,
@@ -345,22 +363,22 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
             "client",
             "predict_scrolls",
             Tab::Client,
-            "over ssh, scrolls show before Neovim answers",
-            switch!(client.predict_scrolls),
+            "scrolls show before Neovim answers: auto over ssh, on everywhere",
+            predict!(client.predict_scrolls),
         )),
         own(row(
             "client",
             "predict_motions",
             Tab::Client,
-            "over ssh, cursor motions show before Neovim answers",
-            switch!(client.predict_motions),
+            "cursor motions show before Neovim answers: auto over ssh, on everywhere",
+            predict!(client.predict_motions),
         )),
         own(row(
             "client",
             "predict_typing",
             Tab::Client,
-            "over ssh, what is typed shows before Neovim answers",
-            switch!(client.predict_typing),
+            "what is typed shows before Neovim answers: auto over ssh, on everywhere",
+            predict!(client.predict_typing),
         )),
         own(row(
             "client",

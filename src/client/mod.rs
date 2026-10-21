@@ -2506,7 +2506,7 @@ impl App {
             });
         }
         if let Some(p) = self.predict.as_mut() {
-            p.set_predictions(client.predictions());
+            p.set_predictions(client.predictions(drawing.remote));
         }
         let acks = self.predict.as_ref().is_some_and(Predictor::acks);
         let typing = self.predict.as_ref().is_some_and(Predictor::typing);
@@ -6062,7 +6062,7 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
             settings.client.centre,
             usize::from(settings.client.window_width),
         )
-        .with_predictions(settings.client.predictions());
+        .with_predictions(settings.client.predictions(drawing.remote));
     app.start();
     let mut inbox = Inbox::default();
     let stdin = std::io::stdin();
@@ -6381,6 +6381,7 @@ const FALLBACK: Palette = Palette {
 mod tests {
     use super::*;
     use crate::client::predict::PING_EVERY;
+    use crate::config::Predict;
     use rmpv::Value;
 
     type Call = (Option<u64>, String, Vec<Value>);
@@ -6607,9 +6608,9 @@ mod tests {
     /// windows animated, and nothing predicted or centred.
     fn drawing() -> crate::config::Drawing {
         let mut d = crate::config::Drawing::default();
-        d.client.predict_scrolls = false;
-        d.client.predict_motions = false;
-        d.client.predict_typing = false;
+        d.client.predict_scrolls = Predict::Off;
+        d.client.predict_motions = Predict::Off;
+        d.client.predict_typing = Predict::Off;
         d.effects.scroll.enabled = false;
         d
     }
@@ -6672,7 +6673,7 @@ mod tests {
         let t0 = Instant::now();
         let mut a = attached(false, t0);
         let mut d = drawing();
-        d.client.predict_scrolls = true;
+        d.client.predict_scrolls = Predict::Auto;
         d.remote = true;
         a.reconfigure(&d, t0);
         assert!(a.predict.is_some());
@@ -6684,14 +6685,15 @@ mod tests {
         );
     }
 
-    /// Told to predict, a client predicts for a session on another machine,
+    /// Told `"auto"`, a client predicts for a session on another machine,
     /// and attaches again for the agent; for a session on this one it
-    /// predicts nothing, and attaches as it was.
+    /// predicts nothing, and attaches as it was — unless told `"on"`, when
+    /// it predicts for that one too.
     #[test]
-    fn a_client_told_to_predict_predicts_only_over_ssh() {
+    fn auto_predicts_only_over_ssh_and_on_here_as_well() {
         let t0 = Instant::now();
         let mut d = drawing();
-        d.client.predict_scrolls = true;
+        d.client.predict_scrolls = Predict::Auto;
 
         let mut here = attached(false, t0);
         here.reconfigure(&d, t0);
@@ -6699,6 +6701,16 @@ mod tests {
         let sent = calls(&mut here);
         assert!(!sent.iter().any(|(_, m, _)| m == "nvim_ui_detach"));
 
+        d.client.predict_scrolls = Predict::On;
+        let mut on = attached(false, t0);
+        on.reconfigure(&d, t0);
+        assert!(
+            on.predict.is_some(),
+            "not predicting on this machine, told on"
+        );
+        request(&calls(&mut on), "nvim_ui_detach", "");
+
+        d.client.predict_scrolls = Predict::Auto;
         d.remote = true;
         let mut there = attached(false, t0);
         there.reconfigure(&d, t0);
@@ -7991,7 +8003,7 @@ mod tests {
         calls(&mut a);
         // Told to predict meanwhile, the client detaches to attach again.
         let mut d = drawing();
-        d.client.predict_scrolls = true;
+        d.client.predict_scrolls = Predict::Auto;
         d.remote = true;
         a.reconfigure(&d, t0 + Duration::from_millis(100));
         let sent = calls(&mut a);
@@ -8883,15 +8895,15 @@ mod tests {
         let mut a = acking(Duration::from_millis(200));
         let mut d = drawing();
         d.remote = true;
-        d.client.predict_scrolls = true;
-        d.client.predict_motions = true;
+        d.client.predict_scrolls = Predict::Auto;
+        d.client.predict_motions = Predict::Auto;
         a.reconfigure(&d, t1);
         let sent = calls(&mut a);
         assert!(
             !sent.iter().any(|(_, m, _)| m == "nvim_ui_detach"),
             "as it was"
         );
-        d.client.predict_motions = false;
+        d.client.predict_motions = Predict::Off;
         a.reconfigure(&d, t1);
         let detach = request(&calls(&mut a), "nvim_ui_detach", "");
         answer(&mut a, detach, Value::Nil, t1);
@@ -9108,8 +9120,8 @@ mod tests {
         a.keys(b"j", t1);
         let mut d = drawing();
         d.remote = true;
-        d.client.predict_scrolls = true;
-        d.client.predict_motions = true;
+        d.client.predict_scrolls = Predict::Auto;
+        d.client.predict_motions = Predict::Auto;
         a.reconfigure(&d, t1);
         a.keys(b"\x05", t1);
         assert_eq!(top_row(&a), "line 0", "blind after `j`");
