@@ -300,7 +300,7 @@ pub struct Stepping {
     pub colorcolumn: Vec<usize>,
     /// `'scrolljump'`: how far a motion past `'scrolloff'` scrolls the view
     /// at least, lines or, below nought, a share of the window (see
-    /// `super::moves::Ctx::scrolljump`).
+    /// `super::moves::Scrolling`).
     pub scrolljump: i64,
     /// `'conceallevel'` above nought: text a line not the cursor's may have
     /// concealed, which a line a scroll brings into view is drawn without
@@ -319,6 +319,9 @@ pub struct Stepping {
     /// say.
     pub sections: Option<String>,
     pub paragraphs: Option<String>,
+    /// `'smoothscroll'`, in a window that wraps: a view Neovim centres on
+    /// the cursor centred by rows (see `super::moves::Scrolling`).
+    pub smoothscroll: bool,
 }
 
 /// What `'cursorline'` draws of the cursor's line, as `'cursorlineopt'` has
@@ -424,6 +427,14 @@ impl Stepping {
             paragraphs: self.paragraphs.as_deref()?,
         })
     }
+
+    /// How Neovim scrolls the view to keep the cursor in it.
+    pub fn scrolling(&self) -> moves::Scrolling {
+        moves::Scrolling {
+            jump: self.scrolljump,
+            smooth: self.smoothscroll,
+        }
+    }
 }
 
 impl Shape {
@@ -435,7 +446,8 @@ impl Shape {
     /// made of each key, `[whichwrap, virtualedit, cursorcolumn, bound,
     /// langmap, widths, numberwidth, number_signs, cursorline, idioms,
     /// own_highlights, conceals, colorcolumn, scrolljump, concealing,
-    /// classes, lmap, sections, paragraphs]` after them (see [`Stepping`]):
+    /// classes, lmap, sections, paragraphs, smoothscroll]` after them (see
+    /// [`Stepping`]):
     /// `numberwidth` no more than Neovim lets it be, `cursorline` as
     /// [`Cursorline::read`] has it, and `idioms` a list of
     /// [`Idiom::read`]'s.
@@ -505,6 +517,7 @@ impl Shape {
                 lmap: flag(41),
                 sections: v.get(42).and_then(redraw::as_str).map(String::from),
                 paragraphs: v.get(43).and_then(redraw::as_str).map(String::from),
+                smoothscroll: flag(44),
             }),
         })
     }
@@ -2113,15 +2126,17 @@ const WHEEL: &[&str] = &[
 /// Every key, and `z` command, a mapping of which changes what the client
 /// makes of it: what the agent is asked to look up (see [`Shape::mapped`]).
 /// And, where the agent says what Neovim made of each key (`acks`), the
-/// motions the client follows that take more than a key, `g_`, `ge` and
-/// `gE`, and `f`, `t`, `F` and `T`, and the keys that enter Insert mode it
-/// follows, which the agent looks up in Normal mode alone.
+/// motions the client follows that take more than a key, `g_`, `ge`, `gE`
+/// and `gg`, and `f`, `t`, `F` and `T`, and the keys that enter Insert mode
+/// it follows, which the agent looks up in Normal mode alone.
 pub fn keys(acks: bool) -> Vec<String> {
     let digits = (0..10).map(|d| d.to_string());
     let z = Z.iter().chain(Z_SIDE).map(|k| format!("z{k}"));
-    let acked = ["g_", "ge", "gE", "f", "t", "F", "T", "i", "a", "A", "I"]
-        .into_iter()
-        .filter(|_| acks);
+    let acked = [
+        "g_", "ge", "gE", "gg", "f", "t", "F", "T", "i", "a", "A", "I",
+    ]
+    .into_iter()
+    .filter(|_| acks);
     WHOLE
         .iter()
         .chain(WORD_ARROWS)
@@ -2380,9 +2395,9 @@ impl Typed {
                     }
                 }
             }
-            // `g_`, `ge` and `gE`, looked up whole: Neovim's own mappings of
-            // `g…` make `g` alone a prefix, and nothing maps those but the
-            // user.
+            // `g_`, `ge`, `gE` and `gg`, looked up whole: Neovim's own
+            // mappings of `g…` make `g` alone a prefix, and nothing maps those
+            // but the user.
             State::G(count) => {
                 let motion = moves::g_motion(key).filter(|_| !mapped(&format!("g{key}")));
                 if let Some(motion) = motion {
@@ -4201,7 +4216,7 @@ impl Predictor {
             width,
             text: &text,
             whichwrap: shape.stepping.as_ref().map(|s| s.whichwrap.as_str()),
-            scrolljump: shape.stepping.as_ref().map(|s| s.scrolljump),
+            scrolling: shape.stepping.as_ref().map(Stepping::scrolling),
             keyword: shape.stepping.as_ref().map(|s| s.classes.as_slice()),
             lmap: shape.stepping.as_ref().map(|s| s.lmap),
             macros: shape.stepping.as_ref().and_then(Stepping::macros),
@@ -4250,8 +4265,8 @@ impl Predictor {
     /// or after them, over them, at a column of the window's — or a sign, in
     /// its column or over the number, or a sign's highlight across the line
     /// or its number. As the agent last said of the lines about the view —
-    /// a window's height either side of it — or one it did not look over,
-    /// or has said nothing of (see `super::App::predict_move`).
+    /// as far either side of it as the lines it sends go — or one it did not
+    /// look over, or has said nothing of (see `super::App::predict_move`).
     pub fn decorated(&self, win: i64, lnum: i64) -> bool {
         self.decorated.get(&win).is_none_or(|(over, runs)| {
             !over.contains(&lnum) || runs.iter().any(|r| r.contains(&lnum))
@@ -4579,6 +4594,7 @@ mod tests {
                 lmap: false,
                 sections: None,
                 paragraphs: None,
+                smoothscroll: false,
             }),
             ..shape()
         }
@@ -7742,6 +7758,41 @@ mod tests {
         );
         assert!(!t.blind);
         for (keys, mapped) in [("ge", "ge"), ("w", "w"), ("<S-Right>", "<S-Right>")] {
+            let mut t = Typed::default();
+            t.set_predictions(MOTIONS);
+            t.rebase(Rest::Normal);
+            let made: Vec<Command> = tokens(keys)
+                .filter_map(|k| t.key(k, |_, key| key == mapped))
+                .collect();
+            assert!(made.is_empty(), "{keys}");
+            assert!(t.blind, "{keys}");
+        }
+    }
+
+    /// `gg` and `G` are followed as the other motions are, with their
+    /// counts, and left to Neovim, the client blind to them, where something
+    /// maps them.
+    #[test]
+    fn motions_to_a_line_are_followed() {
+        let goto = |last, count| Command::Move {
+            motion: moves::Motion::Goto { last },
+            count,
+            screen: false,
+        };
+        let mut t = Typed::default();
+        t.set_predictions(MOTIONS);
+        t.rebase(Rest::Normal);
+        assert_eq!(
+            typed(&mut t, "ggG12gg30G"),
+            [
+                goto(false, None),
+                goto(true, None),
+                goto(false, Some(12)),
+                goto(true, Some(30)),
+            ]
+        );
+        assert!(!t.blind);
+        for (keys, mapped) in [("gg", "gg"), ("G", "G")] {
             let mut t = Typed::default();
             t.set_predictions(MOTIONS);
             t.rebase(Rest::Normal);

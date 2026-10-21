@@ -37,18 +37,20 @@
 //! - `}` and `{` by paragraphs, to the empty line after the next or
 //!   before the last, or the line `'paragraphs'` and `'sections'` start one
 //!   with (see [`paragraph`]);
-//! - and `H`, `M` and `L` to the line at the view's top, its middle or its
-//!   bottom, `'scrolloff'` in from them (see [`window`]), onto the column
-//!   the cursor wants as `j` and `k` land it, or with `'startofline'` the
-//!   first character that is not a blank;
+//! - `H`, `M` and `L` to the line at the view's top, its middle or its
+//!   bottom, `'scrolloff'` in from them (see [`window`]);
+//! - and `gg` and `G` to the buffer's first line or its last, or the line
+//!   counted — these and the three before onto the column the cursor wants
+//!   as `j` and `k` land it, or with `'startofline'` the first character
+//!   that is not a blank;
 //!
 //! — and after a move sideways the cursor wants the column it is drawn in:
 //! a character's first, or a tab's last. A motion that takes the cursor up
 //! or down past `'scrolloff'` moves the view as Neovim's `update_topline`
-//! moves it for a short move, just far enough to keep `'scrolloff'` — and
-//! is not followed where it goes far enough for Neovim to centre the cursor
-//! instead (see [`keep_in_view`]); one that would move a view that does not
-//! wrap sideways moves it as Neovim does ([`predict::showing`]).
+//! moves it: for a short move, just far enough to keep `'scrolloff'`, and
+//! for a longer one, far enough to centre the cursor in it (see
+//! [`keep_in_view`]); one that would move a view that does not wrap
+//! sideways moves it as Neovim does ([`predict::showing`]).
 //!
 //! The client follows the keys it sends by these, draws where they take the
 //! cursor at once (see `super::anim::chain`), and judges each against where
@@ -115,6 +117,11 @@ pub enum Motion {
     /// bottom — or, counted, that many in from the top or the bottom — see
     /// [`window`].
     Window(Edge),
+    /// `gg` and `G`: to the line counted, from one, or the buffer's first —
+    /// or its `last`.
+    Goto {
+        last: bool,
+    },
 }
 
 /// The motion a key typed in Normal mode makes, if it is one followed here:
@@ -162,15 +169,17 @@ pub fn motion(key: &str) -> Option<Motion> {
         "H" => Motion::Window(Edge::Top),
         "M" => Motion::Window(Edge::Middle),
         "L" => Motion::Window(Edge::Bottom),
+        "G" => Motion::Goto { last: true },
         _ => return None,
     })
 }
 
-/// The motion `g` and then `key` make, if it is one followed here: `g_`, and
-/// `ge` and `gE` back to a word's end.
+/// The motion `g` and then `key` make, if it is one followed here: `g_`,
+/// `ge` and `gE` back to a word's end, and `gg`.
 pub fn g_motion(key: &str) -> Option<Motion> {
     Some(match key {
         "_" => Motion::LastNonBlank,
+        "g" => Motion::Goto { last: false },
         "e" | "E" => Motion::Word {
             way: Way::BackEnd,
             big: key == "E",
@@ -282,11 +291,10 @@ pub struct Ctx<'a> {
     /// sideways that would go past the end of its line is not followed,
     /// wherever it would have gone.
     pub whichwrap: Option<&'a str>,
-    /// `'scrolljump'`, where the client knows it, as `'whichwrap'`: not
-    /// knowing it, or it other than one — the view moved further than it
-    /// must, by a count of lines or a share of the window — a motion that
-    /// would move the view is not followed.
-    pub scrolljump: Option<i64>,
+    /// `'scrolljump'` and `'smoothscroll'`, where the client knows them, as
+    /// `'whichwrap'`: not knowing them, a motion that would move the view is
+    /// not followed.
+    pub scrolling: Option<Scrolling>,
     /// What `'iskeyword'` makes of each character under 256 in the window's
     /// buffer, as `'whichwrap'`: not knowing it, a motion by words is not
     /// followed (see [`words::class`]).
@@ -305,22 +313,22 @@ impl Ctx<'_> {
     /// The line a view from line `top` shows first once the cursor goes to
     /// line `line`: that line, where `'scrolloff'` is kept between the
     /// cursor and its edges — but for the buffer's own — or one just far
-    /// enough to keep it, where Neovim scrolls no further (see
-    /// [`keep_in_view`]); where the window shows its lines one to a row.
-    /// `None` where the client cannot say: the view moved further, or by
-    /// a `'scrolljump'` other than one, or a line in it too long for a
-    /// row.
+    /// enough to keep it, or one that centres the cursor, as far as Neovim
+    /// scrolls (see [`keep_in_view`]); where the window shows its lines one
+    /// to a row. `None` where the client cannot say: the view moved, not
+    /// knowing how Neovim scrolls it, or a line in it, or one Neovim looks
+    /// at to work it out, too long for a row or not one the client has.
     fn view(&self, top: i64, line: i64) -> Option<i64> {
         let (h, so) = (self.rows, self.shape.scrolloff as i64);
-        let to = keep_in_view(top, line, h, so, self.line_count - 1)?;
-        if to != top && self.scrolljump != Some(1) {
+        let one_row =
+            |l: i64| (self.text)(l).is_some_and(|t| predict::fits(t, self.shape, self.width));
+        let how = self.scrolling.unwrap_or_default();
+        let to = keep_in_view((top, line), (h, self.line_count - 1), so, how, &one_row)?;
+        if to != top && self.scrolling.is_none() {
             return None;
         }
-        let shown = to..to.saturating_add(h).min(self.line_count);
-        let one_to_one = shown
-            .clone()
-            .all(|l| (self.text)(l).is_some_and(|t| predict::fits(t, self.shape, self.width)));
-        (shown.contains(&line) && one_to_one).then_some(to)
+        let mut shown = to..to.saturating_add(h).min(self.line_count);
+        (shown.contains(&line) && shown.all(one_row)).then_some(to)
     }
 
     /// Where a view that does not wrap shows a line from once the cursor is
@@ -369,6 +377,18 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
     // the cursor is drawn in there, or `want`; the view moved with it.
     let down = |line: i64, pick: &dyn Fn(&[Ch]) -> Option<usize>, want: Option<Want>| {
         put(line, cx.view(at.top, line)?, pick, want, at, cx)
+    };
+    // Neovim's `beginline(BL_SOL | BL_FIX)`, as `H` and `G` and their kind
+    // land on line `line`: onto its first character that is not a blank,
+    // with `'startofline'`; without, onto the column the cursor wants, as
+    // `j` and `k` land it.
+    let begin = |line: i64| {
+        if shape.startofline {
+            down(line, &first_non_blank, None)
+        } else {
+            let want = at.want.col();
+            down(line, &|cs| over(cs, want), Some(at.want))
+        }
     };
     // `g_`'s: the last that is not a blank, or the first of a line all
     // blanks.
@@ -494,19 +514,15 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
             }
             down(line, &on, None)
         }
-        // Onto the line's first character that is not a blank, with
-        // `'startofline'`; without, onto the column the cursor wants, as `j`
-        // and `k` land it.
         Motion::Window(edge) => {
             let so = shape.scrolloff as i64;
-            let line = window(edge, n, at.top, (cx.rows, so), cx.line_count);
-            if shape.startofline {
-                down(line, &first_non_blank, None)
-            } else {
-                let want = at.want.col();
-                down(line, &|cs| over(cs, want), Some(at.want))
-            }
+            begin(window(edge, n, at.top, (cx.rows, so), cx.line_count))
         }
+        Motion::Goto { last: to_last } => begin(match count {
+            Some(n) => (n - 1).clamp(0, last),
+            None if to_last => last,
+            None => 0,
+        }),
     }
 }
 
@@ -835,30 +851,365 @@ fn wrapped(left: bool, n: usize, at: &Pos, cx: &Ctx) -> Option<Pos> {
     })
 }
 
+/// How Neovim scrolls a window's view to keep the cursor in it, besides
+/// `'scrolloff'`: see [`keep_in_view`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scrolling {
+    /// `'scrolljump'`: how far a motion past `'scrolloff'` scrolls the view
+    /// at least — lines or, below nought, a share of the window.
+    pub jump: i64,
+    /// `'smoothscroll'`, in a window that wraps: the view centred on the
+    /// cursor by rows rather than by lines.
+    pub smooth: bool,
+}
+
+impl Default for Scrolling {
+    /// Neovim's own: `'scrolljump'` one, and no `'smoothscroll'`.
+    fn default() -> Self {
+        Self {
+            jump: 1,
+            smooth: false,
+        }
+    }
+}
+
 /// The line Neovim puts at the top of a view of `h` rows from line `top`
 /// once a motion takes the cursor to line `cursor`, of a buffer whose last
-/// is `last`, `'scrolloff'` `so`: where it was, if the cursor is `so` lines
-/// or more from its edges, or from the buffer's own; else just far enough
-/// to have it so, as Neovim's `scroll_cursor_top` and `scroll_cursor_bot`
-/// scroll for a short move — and `None` from as far on as `update_topline`
-/// would have `scroll_cursor_halfway` centre the cursor instead: up, from
-/// `halfheight`, half the window less one and never under two; down, from
-/// further than that, which is kept to the same. A `so` past half the
-/// window, which keeps the cursor in its middle by rules of its own, is
-/// `None` whatever the move. As Neovim 0.12.6 was found to, over every
-/// window from 4 rows to 60 (see `scripts/sweep-topline.lua`).
-pub fn keep_in_view(top: i64, cursor: i64, h: i64, so: i64, last: i64) -> Option<i64> {
-    if so > (h - 1) / 2 {
+/// is `last`, `'scrolloff'` `so`, scrolling as `how` has it — as Neovim
+/// 0.12.6's `update_topline` puts it: where it was, if the cursor is `so`
+/// lines or more from its edges, or from the buffer's own; else just far
+/// enough to have it so — at least `'scrolljump'` lines further — as its
+/// `scroll_cursor_top` and `scroll_cursor_bot` scroll for a short move; and
+/// for a longer one, wherever has the cursor in the view's middle, as its
+/// `scroll_cursor_halfway` centres it: up, from half the window less one
+/// and never under two; down, from where the lines from the view's bottom
+/// to the cursor would no longer fit in it with as many again below. Over
+/// lines a row each: `None` where one it looks at takes other than a row of
+/// its own, as `one_row` says; and for a `so` past half the window, which
+/// keeps the cursor in its middle by rules of its own, whatever the move. As
+/// Neovim 0.12.6 was found to, from every view of windows from 4 rows to 40
+/// over buffers short and long, with every `'scrolloff'` to half of them
+/// (see `tests/client.rs`'s `views_go_where_neovim_takes_them`).
+pub fn keep_in_view(
+    (top, cursor): (i64, i64),
+    (h, last): (i64, i64),
+    so: i64,
+    how: Scrolling,
+    one_row: &dyn Fn(i64) -> bool,
+) -> Option<i64> {
+    if so > (h - 1) / 2 || h < 1 || last < 0 {
         return None;
     }
-    let to = if top > 0 && cursor < top + so {
-        (cursor - so).max(0)
-    } else if top.saturating_add(h - 1) < last && cursor > top + h - 1 - so {
-        ((cursor + so).min(last) - (h - 1)).max(top)
+    let jump = if how.jump >= 0 {
+        how.jump
     } else {
-        top
+        h.saturating_mul(how.jump.saturating_neg()) / 100
     };
-    (to.abs_diff(top) < (h / 2 - 1).max(2).unsigned_abs()).then_some(to)
+    let view = Topline {
+        h,
+        n: last.checked_add(1)?,
+        so,
+        jump,
+        smooth: how.smooth,
+        one_row,
+    };
+    Some(view.update(top.checked_add(1)?, cursor.checked_add(1)?)? - 1)
+}
+
+/// A window as Neovim's `update_topline` and the functions it calls work
+/// out its view: `h` rows over `n` lines, its lines from one as Neovim
+/// numbers them, each a row (see [`keep_in_view`]); `'scrolloff'` `so`,
+/// and at least `jump` lines a scroll.
+struct Topline<'a> {
+    h: i64,
+    n: i64,
+    so: i64,
+    jump: i64,
+    smooth: bool,
+    one_row: &'a dyn Fn(i64) -> bool,
+}
+
+impl Topline<'_> {
+    /// A row, line `l`'s height: `None` where it takes other.
+    fn row(&self, l: i64) -> Option<()> {
+        (self.one_row)(l - 1).then_some(())
+    }
+
+    /// `w_botline`: the line after the last the view from line `t` shows.
+    fn botline(&self, t: i64) -> Option<i64> {
+        let b = t.saturating_add(self.h).min(self.n + 1);
+        (t..b).try_for_each(|l| self.row(l))?;
+        Some(b)
+    }
+
+    /// `update_topline`: the view from line `t` once the cursor is on line
+    /// `c`.
+    fn update(&self, t: i64, c: i64) -> Option<i64> {
+        let (h, so) = (self.h, self.so);
+        let mut t = t;
+        // Too near the top, or above it: `check_top_offset`, counting the
+        // lines in view above the cursor.
+        let mut check_topline = false;
+        if t > 1 {
+            if c < t {
+                check_topline = true;
+            } else if c < t.saturating_add(so) {
+                let (mut k, mut l) = (0, c);
+                while k < so {
+                    l -= 1;
+                    if l < t {
+                        break;
+                    }
+                    self.row(l)?;
+                    k += 1;
+                }
+                check_topline = k < so;
+            }
+        }
+        let mut check_botline = true;
+        if check_topline {
+            let halfheight = (h / 2 - 1).max(2);
+            if t.saturating_add(so) - c >= halfheight {
+                t = self.halfway(c, false)?;
+                check_botline = false;
+            } else {
+                t = self.top(t, c)?;
+            }
+        }
+        // Too near the bottom, or below it: the view showing more lines
+        // than there are below the cursor, short of `'scrolloff'`.
+        if check_botline {
+            let b = self.botline(t)?;
+            if b <= self.n {
+                let short = if c < b {
+                    c >= b - so && {
+                        let (mut k, mut l, mut height) = (0, c, 0);
+                        while l < b {
+                            k += height;
+                            if k >= so {
+                                break;
+                            }
+                            l += 1;
+                            if l < b {
+                                self.row(l)?;
+                            }
+                            height = 1;
+                        }
+                        k < so
+                    }
+                } else {
+                    true
+                };
+                if short {
+                    t = if c - b + 1 + so <= h + 1 {
+                        self.bot(t, c)?
+                    } else {
+                        self.halfway(c, false)?
+                    };
+                }
+            }
+        }
+        Some(t)
+    }
+
+    /// `scroll_cursor_top`: the view from line `t` moved up for the cursor
+    /// on line `c`, just far enough to show `'scrolloff'` lines above it —
+    /// and at least `'scrolljump'` lines — or centred on it where the lines
+    /// it would show either side of it fit no window.
+    fn top(&self, t: i64, c: i64) -> Option<i64> {
+        let (h, so, n) = (self.h, self.so, self.n);
+        self.row(c)?;
+        let mut used = 1;
+        let mut scrolled = if c < t { used } else { 0 };
+        let (mut top, mut bot) = (c - 1, c + 1);
+        let mut new_topline = top + 1;
+        let mut extra = 0;
+        while top > 0 {
+            self.row(top)?;
+            if top < t {
+                scrolled += 1;
+            }
+            if (new_topline >= t || scrolled > self.jump) && extra >= so {
+                break;
+            }
+            used += 1;
+            if extra < so && bot < n {
+                self.row(bot)?;
+                used += 1;
+            }
+            if used > h {
+                break;
+            }
+            extra += 1;
+            new_topline = top;
+            top -= 1;
+            bot += 1;
+        }
+        if used > h {
+            return self.halfway(c, false);
+        }
+        Some(t.min(new_topline).min(c))
+    }
+
+    /// `scroll_cursor_bot`: the view from line `t` moved down for the
+    /// cursor on line `c`, just far enough to show `'scrolloff'` lines below
+    /// it — and at least `'scrolljump'` lines — or centred on it, from as far
+    /// as the lines from the view's bottom to it, and as many below it, would
+    /// fill the window.
+    fn bot(&self, t: i64, c: i64) -> Option<i64> {
+        let (h, so, n) = (self.h, self.so, self.n);
+        let b = self.botline(t)?;
+        // `w_empty_rows`: the rows under the buffer's last line, where the
+        // view shows it.
+        let empty = if b > n { h - (n - t + 1) } else { 0 };
+        self.row(c)?;
+        let mut used = 1;
+        let mut scrolled = 0;
+        if c >= b {
+            scrolled = used;
+            if c == b {
+                scrolled -= empty;
+            }
+        }
+        let (mut above, mut below) = (c, c);
+        let mut extra = 0;
+        while above > 1 {
+            let enough = (scrolled <= 0 || scrolled >= self.jump) && extra >= so;
+            if (enough || below + 1 > n) && above <= b {
+                break;
+            }
+            let was = above;
+            above -= 1;
+            self.row(above)?;
+            used += 1;
+            if used > h {
+                break;
+            }
+            if above >= b {
+                scrolled += 1;
+                if above == b && was > b {
+                    scrolled -= empty;
+                }
+            }
+            if below < n {
+                let was = below;
+                below += 1;
+                self.row(below)?;
+                used += 1;
+                if used > h {
+                    break;
+                }
+                if extra < so || scrolled < self.jump {
+                    extra += 1;
+                    if below >= b {
+                        scrolled += 1;
+                        if was < b {
+                            scrolled -= empty;
+                        }
+                    }
+                }
+            }
+        }
+        // How many lines the view scrolls by: as many as the rows past its
+        // bottom, those it shows among them — or, past them all, as many as
+        // Neovim gives for more than it can count.
+        let lines = if scrolled <= 0 {
+            0
+        } else if used > h {
+            used
+        } else {
+            let (mut lines, mut l) = (0, t - 1);
+            while lines < scrolled && l < b {
+                l += 1;
+                self.row(l)?;
+                lines += 1;
+            }
+            if lines < scrolled {
+                9999
+            } else {
+                lines
+            }
+        };
+        if lines >= h && lines > self.jump {
+            return self.halfway(c, true);
+        }
+        // With `'smoothscroll'`, by the rows counted past the bottom rather
+        // than the lines they are on: as many, for lines a row each — but
+        // not as many as the lines counted where they overran the window.
+        let by = if self.smooth { scrolled } else { lines };
+        // Scrolled past the cursor — by a `'scrolljump'` more than the window
+        // shows — Neovim's `scrollup` puts the cursor on the view's top line,
+        // and goes on from there.
+        let to = t.saturating_add(by.max(0)).min(n);
+        (to <= c).then_some(to)
+    }
+
+    /// `scroll_cursor_halfway`: the view with the cursor on line `c` in its
+    /// middle, a line below it and one above in turn — above first where it
+    /// prefers that — till the window is full, but for what the buffer's
+    /// edges leave out; by rows, both at once, with `'smoothscroll'`.
+    fn halfway(&self, c: i64, prefer_above: bool) -> Option<i64> {
+        let (h, n) = (self.h, self.n);
+        self.row(c)?;
+        let mut used = 1;
+        let mut topline = c;
+        let mut below = c;
+        if self.smooth {
+            while topline > 1 {
+                let above = topline - 1;
+                self.row(above)?;
+                used += 1;
+                if below < n {
+                    below += 1;
+                    self.row(below)?;
+                    used += 1;
+                }
+                // Past the window: a line it would show part of, which a
+                // line a row never is.
+                if used > h {
+                    break;
+                }
+                topline = above;
+            }
+            return Some(topline);
+        }
+        while topline > 1 {
+            let (mut up, mut down) = (0, 0);
+            for round in 1..=2 {
+                let add_below = if prefer_above {
+                    round == 2 && down < up
+                } else {
+                    round == 1 && down <= up
+                };
+                if add_below {
+                    if below < n {
+                        below += 1;
+                        self.row(below)?;
+                        used += 1;
+                        if used > h {
+                            return Some(topline);
+                        }
+                    }
+                    down += 1;
+                }
+                let add_above = if prefer_above {
+                    round == 1 && down >= up
+                } else {
+                    round == 1 && down > up
+                };
+                if add_above {
+                    self.row(topline - 1)?;
+                    used += 1;
+                    if used > h {
+                        return Some(topline);
+                    }
+                    up += 1;
+                    topline -= 1;
+                }
+            }
+        }
+        Some(topline)
+    }
 }
 
 /// The display column the cursor is drawn in, in Normal mode, at byte
@@ -958,7 +1309,7 @@ mod tests {
             width: 80,
             text: &text,
             whichwrap: ww,
-            scrolljump: Some(1),
+            scrolling: Some(Scrolling::default()),
             keyword: Some(&keyword),
             lmap: Some(false),
             macros: Some(MACROS),
@@ -1260,7 +1611,7 @@ mod tests {
             width: 80,
             text: &text,
             whichwrap: Some("b,s"),
-            scrolljump: Some(1),
+            scrolling: Some(Scrolling::default()),
             keyword: None,
             lmap: None,
             macros: None,
@@ -1270,34 +1621,18 @@ mod tests {
             ..pos((0, 0, 0, 0, 0))
         };
         assert_eq!(moved(Motion::Down, None, &busy, &cx), None);
-        // Down past the bottom of a view of four rows, or within
-        // 'scrolloff' of it, and up past the top, as far as Neovim centres
-        // the cursor rather than scroll just far enough: two rows of four.
+        // Past the edge of a view of four rows, not knowing how Neovim
+        // scrolls it — but not past it, to its last row.
         let short = Ctx { rows: 4, ..cx };
         let from = pos((2, 0, 0, 0, 0));
-        assert!(moved(Motion::Down, None, &from, &short).is_some());
-        assert_eq!(moved(Motion::Down, Some(3), &from, &short), None);
-        let so = Shape {
-            scrolloff: 1,
-            ..s.clone()
-        };
-        let kept = Ctx {
-            shape: &so,
+        let blind = Ctx {
+            scrolling: None,
             ..short
         };
-        assert_eq!(moved(Motion::Down, Some(2), &from, &kept), None);
+        assert!(moved(Motion::Down, None, &from, &blind).is_some());
+        assert_eq!(moved(Motion::Down, Some(2), &from, &blind), None);
         let lower = pos((4, 0, 0, 4, 0));
-        assert_eq!(moved(Motion::Up, Some(2), &lower, &short), None);
-        // Nor a row, by a 'scrolljump' the client does not know, or one
-        // that moves the view further than it must.
-        for jump in [None, Some(5), Some(-50)] {
-            let jumps = Ctx {
-                scrolljump: jump,
-                ..short
-            };
-            assert_eq!(moved(Motion::Down, Some(2), &from, &jumps), None);
-            assert!(moved(Motion::Down, None, &from, &jumps).is_some());
-        }
+        assert_eq!(moved(Motion::Up, Some(1), &lower, &blind), None);
         // On past a line's end, out of the view: a count as long as the
         // buffer walks no further than the view.
         assert_eq!(moved(Motion::Right('s'), Some(10), &from, &short), None);
@@ -1307,8 +1642,8 @@ mod tests {
             Some(pos((12, 3, 3, 0, 0))),
             "to the buffer's last line, in view"
         );
-        // A counted `$` to a line as far out of it.
-        assert_eq!(moved(Motion::End, Some(4), &from, &short), None);
+        // A counted `$` to a line out of it, not knowing how it scrolls.
+        assert_eq!(moved(Motion::End, Some(4), &from, &blind), None);
         // A line too long for a window that wraps puts the rows out of step
         // with the lines.
         let narrow = Ctx { width: 5, ..cx };
@@ -1317,6 +1652,12 @@ mod tests {
         // of these lines, and no overflow working that out.
         let far = pos((0, 0, 0, i64::MAX - 1, 0));
         assert_eq!(moved(Motion::Down, None, &far, &cx), None);
+        let so = Shape {
+            scrolloff: 3,
+            ..s.clone()
+        };
+        let kept = Ctx { shape: &so, ..cx };
+        assert_eq!(moved(Motion::Down, None, &far, &kept), None);
     }
 
     /// `g_` past blanks at the end of a line, a tab among them, and onto a
@@ -1335,7 +1676,7 @@ mod tests {
             width: 80,
             text: &text,
             whichwrap: Some("b,s"),
-            scrolljump: Some(1),
+            scrolling: Some(Scrolling::default()),
             keyword: None,
             lmap: None,
             macros: None,
@@ -1488,7 +1829,7 @@ mod tests {
             width: 80,
             text: &text,
             whichwrap: Some("b,s"),
-            scrolljump: Some(1),
+            scrolling: Some(Scrolling::default()),
             keyword: None,
             lmap: None,
             macros: None,
@@ -1585,7 +1926,7 @@ mod tests {
                 width: 80,
                 text: &text,
                 whichwrap: None,
-                scrolljump: Some(1),
+                scrolling: Some(Scrolling::default()),
                 keyword: None,
                 lmap,
                 macros: None,
@@ -1707,6 +2048,68 @@ mod tests {
         }
     }
 
+    /// Each `gg` and `G` from where Neovim had the cursor to where it took
+    /// it, over [`LINES`], 22 rows and none scrolled: to the buffer's first
+    /// line and its last, or the line counted, from one — the last, counted
+    /// past it — and from the line the cursor is on, nowhere but the column
+    /// it wants. Onto that column, as `j` and `k` land it, or with
+    /// `'startofline'` the first character not a blank.
+    #[test]
+    fn motions_to_a_line_go_where_neovim_takes_them() {
+        #[rustfmt::skip]
+        let wanted: &[(State, &str, State)] = &[
+            ((5, 3, 2, 0, 0), "gg", (0, 2, 2, 0, 0)),
+            ((5, 3, 2, 0, 0), "G", (12, 2, 2, 0, 0)),
+            ((0, 6, 6, 0, 0), "G", (12, 3, 6, 0, 0)),
+            ((0, 6, -1, 0, 0), "G", (12, 3, -1, 0, 0)),
+            ((12, 0, 0, 0, 0), "3gg", (2, 0, 0, 0, 0)),
+            ((0, 0, 0, 0, 0), "3G", (2, 0, 0, 0, 0)),
+            ((0, 10, 10, 0, 0), "4G", (3, 1, 10, 0, 0)),
+            ((0, 10, 10, 0, 0), "9gg", (8, 10, 10, 0, 0)),
+            ((3, 1, 8, 0, 0), "9G", (8, 8, 8, 0, 0)),
+            ((2, 0, 0, 0, 0), "50G", (12, 0, 0, 0, 0)),
+            ((12, 3, 3, 0, 0), "50gg", (12, 3, 3, 0, 0)),
+            ((0, 4, 4, 0, 0), "gg", (0, 4, 4, 0, 0)),
+            ((0, 10, -1, 0, 0), "1G", (0, 10, -1, 0, 0)),
+        ];
+        #[rustfmt::skip]
+        let sol: &[(State, &str, State)] = &[
+            ((5, 3, 2, 0, 0), "gg", (0, 0, 0, 0, 0)),
+            ((5, 3, 2, 0, 0), "G", (12, 0, 0, 0, 0)),
+            ((0, 6, 6, 0, 0), "G", (12, 0, 0, 0, 0)),
+            ((0, 6, -1, 0, 0), "G", (12, 0, 0, 0, 0)),
+            ((12, 0, 0, 0, 0), "3gg", (2, 0, 0, 0, 0)),
+            ((0, 0, 0, 0, 0), "3G", (2, 0, 0, 0, 0)),
+            ((0, 10, 10, 0, 0), "4G", (3, 1, 8, 0, 0)),
+            ((0, 10, 10, 0, 0), "9gg", (8, 2, 2, 0, 0)),
+            ((3, 1, 8, 0, 0), "9G", (8, 2, 2, 0, 0)),
+            ((2, 0, 0, 0, 0), "50G", (12, 0, 0, 0, 0)),
+            ((12, 3, 3, 0, 0), "50gg", (12, 0, 0, 0, 0)),
+            ((0, 4, 4, 0, 0), "gg", (0, 0, 0, 0, 0)),
+            ((0, 10, -1, 0, 0), "1G", (0, 0, 0, 0, 0)),
+        ];
+        let tables = [
+            (shape(), wanted),
+            (
+                Shape {
+                    startofline: true,
+                    ..shape()
+                },
+                sol,
+            ),
+        ];
+        for (s, cases) in &tables {
+            for &(from, keys, to) in *cases {
+                assert_eq!(
+                    run(keys, from, s, None),
+                    Some(pos(to)),
+                    "{keys} from {from:?}, 'startofline' {}",
+                    s.startofline
+                );
+            }
+        }
+    }
+
     /// Paragraphs and sections that start as Neovim 0.12.6 was found to
     /// start them with its own `'sections'` and `'paragraphs'`: at a line
     /// that starts with `.` and a macro they name — `PP`, or `P` alone —
@@ -1738,7 +2141,7 @@ mod tests {
             width: 80,
             text: &text,
             whichwrap: None,
-            scrolljump: Some(1),
+            scrolling: Some(Scrolling::default()),
             keyword: None,
             lmap: None,
             macros,
@@ -1790,7 +2193,7 @@ mod tests {
             width: 80,
             text: &text,
             whichwrap: None,
-            scrolljump: Some(1),
+            scrolling: Some(Scrolling::default()),
             keyword: None,
             lmap: None,
             macros: Some(MACROS),
@@ -1854,7 +2257,7 @@ mod tests {
             width: 10,
             text: &text,
             whichwrap: Some("b,s"),
-            scrolljump: Some(1),
+            scrolling: Some(Scrolling::default()),
             keyword: None,
             lmap: Some(false),
             macros: None,
@@ -1885,39 +2288,41 @@ mod tests {
     }
 
     /// Past the edges of a view five rows tall, over [`LINES`]: a line or
-    /// two, `'scrolloff'` as each says, by `j`, `k` and their kind, the
-    /// view moved just far enough with the cursor — and, as far as Neovim
-    /// centres the cursor instead, not followed — as Neovim 0.12.6 was found
-    /// to move them.
+    /// more, `'scrolloff'` as each says, by `j`, `k` and their kind, the
+    /// view moved just far enough with the cursor, or as far as has the
+    /// buffer's last line at the bottom, or its first at the top, where
+    /// Neovim centres the cursor — as Neovim 0.12.6 was found to move them.
     #[test]
     fn motions_past_the_edges_move_the_view_with_them() {
         #[rustfmt::skip]
-        let cases: &[(usize, State, &str, Option<State>)] = &[
-            (0, (4, 0, 0, 0, 0), "j", Some((5, 0, 0, 1, 0))),
-            (0, (4, 0, 0, 0, 0), "2j", None),
-            (0, (4, 0, 0, 0, 0), "3j", None),
-            (0, (3, 0, 7, 0, 0), "jj", Some((5, 6, 7, 1, 0))),
-            (1, (3, 0, 7, 0, 0), "j", Some((4, 1, 7, 1, 0))),
-            (1, (3, 0, 7, 0, 0), "2j", None),
-            (0, (2, 0, 0, 2, 0), "k", Some((1, 0, 0, 1, 0))),
-            (0, (2, 0, 0, 2, 0), "2k", None),
-            (1, (5, 0, 0, 4, 0), "k", Some((4, 0, 0, 3, 0))),
-            (1, (5, 0, 0, 4, 0), "-", Some((4, 0, 0, 3, 0))),
-            (1, (5, 0, 0, 4, 0), "kj", Some((5, 0, 0, 3, 0))),
-            (0, (1, 1, -1, 1, 0), "k", Some((0, 10, -1, 0, 0))),
-            (0, (4, 0, 0, 0, 0), "jk", Some((4, 0, 0, 1, 0))),
-            (0, (4, 0, 0, 0, 0), "jjjj", Some((8, 0, 0, 4, 0))),
-            (0, (4, 0, 0, 0, 0), "+", Some((5, 0, 0, 1, 0))),
-            (0, (4, 0, 0, 0, 0), "<CR>", Some((5, 0, 0, 1, 0))),
-            (0, (4, 0, 0, 0, 0), "2_", Some((5, 0, 0, 1, 0))),
-            (0, (4, 0, 0, 0, 0), "2$", Some((5, 6, -1, 1, 0))),
-            (0, (9, 24, -1, 5, 0), "jj", Some((11, 17, -1, 7, 0))),
-            (0, (9, 6, 5, 8, 0), "kk", Some((7, 2, 5, 7, 0))),
+        let cases: &[(usize, State, &str, State)] = &[
+            (0, (4, 0, 0, 0, 0), "j", (5, 0, 0, 1, 0)),
+            (0, (4, 0, 0, 0, 0), "2j", (6, 0, 0, 2, 0)),
+            (0, (4, 0, 0, 0, 0), "3j", (7, 0, 0, 3, 0)),
+            (0, (4, 0, 0, 0, 0), "8j", (12, 0, 0, 8, 0)),
+            (0, (3, 0, 7, 0, 0), "jj", (5, 6, 7, 1, 0)),
+            (1, (3, 0, 7, 0, 0), "j", (4, 1, 7, 1, 0)),
+            (1, (3, 0, 7, 0, 0), "2j", (5, 6, 7, 2, 0)),
+            (0, (2, 0, 0, 2, 0), "k", (1, 0, 0, 1, 0)),
+            (0, (2, 0, 0, 2, 0), "2k", (0, 0, 0, 0, 0)),
+            (1, (9, 0, 0, 8, 0), "8k", (1, 0, 0, 0, 0)),
+            (1, (5, 0, 0, 4, 0), "k", (4, 0, 0, 3, 0)),
+            (1, (5, 0, 0, 4, 0), "-", (4, 0, 0, 3, 0)),
+            (1, (5, 0, 0, 4, 0), "kj", (5, 0, 0, 3, 0)),
+            (0, (1, 1, -1, 1, 0), "k", (0, 10, -1, 0, 0)),
+            (0, (4, 0, 0, 0, 0), "jk", (4, 0, 0, 1, 0)),
+            (0, (4, 0, 0, 0, 0), "jjjj", (8, 0, 0, 4, 0)),
+            (0, (4, 0, 0, 0, 0), "+", (5, 0, 0, 1, 0)),
+            (0, (4, 0, 0, 0, 0), "<CR>", (5, 0, 0, 1, 0)),
+            (0, (4, 0, 0, 0, 0), "2_", (5, 0, 0, 1, 0)),
+            (0, (4, 0, 0, 0, 0), "2$", (5, 6, -1, 1, 0)),
+            (0, (9, 24, -1, 5, 0), "jj", (11, 17, -1, 7, 0)),
+            (0, (9, 6, 5, 8, 0), "kk", (7, 2, 5, 7, 0)),
             // The buffer's last line in view: nothing to scroll.
-            (0, (11, 3, 10, 8, 0), "j", Some((12, 3, 10, 8, 0))),
-            (2, (10, 0, 0, 8, 0), "j", Some((11, 0, 0, 8, 0))),
-            (2, (10, 0, 0, 8, 0), "jj", Some((12, 0, 0, 8, 0))),
-            (0, (12, 0, 0, 8, 0), "j", Some((12, 0, 0, 8, 0))),
+            (0, (11, 3, 10, 8, 0), "j", (12, 3, 10, 8, 0)),
+            (2, (10, 0, 0, 8, 0), "j", (11, 0, 0, 8, 0)),
+            (2, (10, 0, 0, 8, 0), "jj", (12, 0, 0, 8, 0)),
+            (0, (12, 0, 0, 8, 0), "j", (12, 0, 0, 8, 0)),
         ];
         for &(so, from, keys, to) in cases {
             let s = Shape {
@@ -1932,7 +2337,7 @@ mod tests {
                 width: 80,
                 text: &text,
                 whichwrap: Some("b,s"),
-                scrolljump: Some(1),
+                scrolling: Some(Scrolling::default()),
                 keyword: None,
                 lmap: None,
                 macros: None,
@@ -1941,18 +2346,32 @@ mod tests {
                 .expect("motions")
                 .into_iter()
                 .try_fold(pos(from), |at, (m, count)| moved(m, count, &at, &cx));
-            assert_eq!(got, to.map(pos), "{keys:?} from {from:?}, 'scrolloff' {so}");
+            assert_eq!(
+                got,
+                Some(pos(to)),
+                "{keys:?} from {from:?}, 'scrolloff' {so}"
+            );
         }
     }
 
-    /// Every top [`keep_in_view`] gives is the one Neovim gives, over every
-    /// window from 4 rows to 60, every `'scrolloff'` to half of it, and a
-    /// count of up to as many lines, down and up from the row nearest the
-    /// edge `'scrolloff'` lets the cursor be on: a short move, or none
-    /// (see [`TOPLINE`]). Up, Neovim scrolls just far enough for a count of
-    /// up to half the window less one, or two, whatever `'scrolloff'` is —
-    /// two rows, of four; nine, of 21; ten, of 22 and 23 — and down further;
-    /// `gj` and `gk` as `j` and `k`. Every move short of that is followed.
+    /// [`keep_in_view`] over lines a row each, Neovim's `'scrolljump'` and
+    /// no `'smoothscroll'`.
+    fn kept(top: i64, cursor: i64, h: i64, so: i64, last: i64) -> Option<i64> {
+        keep_in_view((top, cursor), (h, last), so, Scrolling::default(), &|_| {
+            true
+        })
+    }
+
+    /// Every top [`keep_in_view`] gives is just far enough, or not, where
+    /// Neovim's is, over every window from 4 rows to 60, every `'scrolloff'`
+    /// to half of it, and a count of up to as many lines, down and up from
+    /// the row nearest the edge `'scrolloff'` lets the cursor be on (see
+    /// [`TOPLINE`]). Up, Neovim scrolls just far enough for a count of up to
+    /// half the window less one, or two, whatever `'scrolloff'` is — two
+    /// rows, of four; nine, of 21; ten, of 22 and 23 — and down further;
+    /// `gj` and `gk` as `j` and `k`. Further, it centres the cursor: nine
+    /// up in 21 rows, onto the middle row, and ten up in 22, the upper of
+    /// the two middle ones.
     #[test]
     fn motions_past_the_edges_scroll_as_neovim_does() {
         let (top, last) = (400, 999);
@@ -1973,29 +2392,31 @@ mod tests {
                         } else {
                             cursor + so - (h - 1)
                         };
-                        let got = keep_in_view(top, cursor, h, so, last);
+                        let got = kept(top, cursor, h, so, last);
                         let at = format!(
                             "{h} rows, 'scrolloff' {so}, {n} {}",
                             ["j", "gj", "k", "gk"][k]
                         );
-                        assert!(
-                            got.is_none() || (n <= just && got == Some(minimal)),
-                            "{at}: {got:?}"
-                        );
-                        if so <= (h - 1) / 2 && n < short {
-                            assert_eq!(got, Some(minimal), "{at}");
-                            followed += 1;
+                        if so > (h - 1) / 2 {
+                            assert_eq!(got, None, "{at}");
+                            continue;
                         }
+                        assert!(got.is_some(), "{at}");
+                        assert_eq!(got == Some(minimal), n <= just, "{at}: {got:?}");
+                        if n < short {
+                            assert_eq!(got, Some(minimal), "{at}");
+                        }
+                        followed += 1;
                     }
                 }
             }
         }
         assert!(followed > 10_000, "{followed}");
-        let up = |h: i64, n: i64| keep_in_view(400, 400 - n, h, 0, 999);
+        let up = |h: i64, n: i64| kept(400, 400 - n, h, 0, 999);
         assert_eq!(up(21, 8), Some(392));
-        assert_eq!(up(21, 9), None);
+        assert_eq!(up(21, 9), Some(381));
         assert_eq!(up(22, 9), Some(391));
-        assert_eq!(up(22, 10), None);
+        assert_eq!(up(22, 10), Some(380));
     }
 
     /// A `'scrolloff'` past half the window keeps the cursor in its middle
@@ -2007,17 +2428,13 @@ mod tests {
     #[test]
     fn so_past_half_the_window_is_refused() {
         for so in [11, 999] {
-            assert_eq!(keep_in_view(400, 412, 22, so, 999), None, "{so} down");
-            assert_eq!(keep_in_view(400, 410, 22, so, 999), None, "{so} up");
-            assert_eq!(
-                keep_in_view(400, 411, 22, so, 999),
-                None,
-                "{so} in the middle"
-            );
+            assert_eq!(kept(400, 412, 22, so, 999), None, "{so} down");
+            assert_eq!(kept(400, 410, 22, so, 999), None, "{so} up");
+            assert_eq!(kept(400, 411, 22, so, 999), None, "{so} in the middle");
         }
-        assert_eq!(keep_in_view(400, 412, 22, 10, 999), Some(401));
-        assert_eq!(keep_in_view(400, 409, 22, 10, 999), Some(399));
-        assert_eq!(keep_in_view(400, 411, 22, 10, 999), Some(400));
+        assert_eq!(kept(400, 412, 22, 10, 999), Some(401));
+        assert_eq!(kept(400, 409, 22, 10, 999), Some(399));
+        assert_eq!(kept(400, 411, 22, 10, 999), Some(400));
     }
 
     /// Generated by `scripts/sweep-topline.lua` with Neovim 0.12.6: for

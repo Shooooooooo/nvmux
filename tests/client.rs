@@ -2476,6 +2476,45 @@ fn motions_to_the_window_edges_show_at_once() {
     }
 }
 
+/// Motions that take the cursor further past the view's edges than
+/// Neovim scrolls just far enough for — `gg` and `G`, counted to a line,
+/// `j` and `k` counted past half the window, `}` and `{` — typed over a
+/// slow link to a real Neovim, in a window numbered by `'number'` and
+/// `'relativenumber'`, `'scrolloff'` keeping three lines about the cursor:
+/// the view centred on the cursor, or the buffer's first line at its top
+/// and its last at its bottom, on the screen before Neovim could have
+/// heard of them, every row and the cursor where Neovim's own frame puts
+/// them; and again with `'smoothscroll'`, which centres a view moved down
+/// a row higher, and `'scrolljump'` five.
+#[test]
+fn long_jumps_show_at_once() {
+    require_nvim!();
+    let scratch = Scratch::new("client-jumps-at");
+    let setline = format!("set nu rnu so=3 | {SCROLLED}");
+    let (mut rpc, mut term, _) = drawn_slowly_with(&scratch, "client-jumps-at", &setline, MOTIONS);
+    term.pump_until(Duration::from_secs(4), |s| s.contains("line 1"));
+    // Keys for the client to time the link by, and the agent to send it the
+    // lines as far either side of the view as that has it keep — every one
+    // of these (see `Predictor::reach`).
+    for _ in 0..3 {
+        typed(&mut term, b"j");
+        typed(&mut term, b"k");
+    }
+    term.pump_until(4 * SLOW, |_| false);
+    let jumps = [
+        "G", "gg", "100G", "50j", "30k", "G", "120gg", "40k", "15j", "15k", "}", "gg", "3}",
+        "150G", "20j", "4{", "1G",
+    ];
+    for name in jumps {
+        predicted(&mut term, name, name.as_bytes());
+    }
+    rpc.command("set smoothscroll scrolljump=5").expect("set");
+    term.pump_until(4 * SLOW, |_| false);
+    for name in jumps {
+        predicted(&mut term, name, name.as_bytes());
+    }
+}
+
 /// `f` mapped — as plugins that jump to a character map it — is left to
 /// Neovim; and so is the character typed after `t` where `:lmap` mappings
 /// may take it for another, `'iminsert'` turned on with the client
@@ -2721,10 +2760,9 @@ fn turns_of_the_wheel_among_motions_show_nothing_neovim_never_drew() {
 
 /// Counted `j` and `k` past the edges of the window, which Neovim scrolls
 /// as it goes: as far as it scrolls the view just far enough — under half
-/// the window, nine rows of its 22 — drawn before Neovim could have heard
-/// of them, where its own frames put the cursor and the view; further,
-/// where it centres the cursor instead, or may, left to it, and drawn as it
-/// draws them.
+/// the window, nine rows of its 22 up — and further, where it centres the
+/// cursor instead, drawn before Neovim could have heard of them, where its
+/// own frames put the cursor and the view.
 #[test]
 fn every_jump_predicted_lands_where_neovim_puts_it() {
     require_nvim!();
@@ -2733,21 +2771,21 @@ fn every_jump_predicted_lands_where_neovim_puts_it() {
     predicted(&mut term, "21j, to the last row", b"21j");
     predicted(&mut term, "8j past it", b"8j");
     predicted(&mut term, "9j", b"9j");
-    left_to_neovim(&mut term, "10j", b"10j");
-    left_to_neovim(&mut term, "15j", b"15j");
+    predicted(&mut term, "10j", b"10j");
+    predicted(&mut term, "15j", b"15j");
     typed(&mut term, b"H");
     predicted(&mut term, "8k past the first row", b"8k");
     predicted(&mut term, "9k", b"9k");
-    left_to_neovim(&mut term, "10k", b"10k");
+    predicted(&mut term, "10k", b"10k");
     typed(&mut term, b"H");
-    left_to_neovim(&mut term, "15k", b"15k");
+    predicted(&mut term, "15k", b"15k");
     // With 'scrolloff', from the row it keeps the cursor off the edge.
     typed(&mut term, b":set so=3\r");
     typed(&mut term, b"L");
     predicted(&mut term, "2j to 'scrolloff'", b"2j");
     predicted(&mut term, "j with 'scrolloff'", b"j");
     predicted(&mut term, "5+", b"5+");
-    left_to_neovim(&mut term, "12j", b"12j");
+    predicted(&mut term, "12j", b"12j");
 }
 
 /// Scrolls and motions in the same window, in a run before Neovim has
@@ -3667,6 +3705,40 @@ fn random_motions_to_the_window_edges_show_nothing_neovim_never_drew() {
     let keys = random_keys(&mut rng, KEYS, COUNTED);
     let setline = format!("set nu rnu so=3 | {SCROLLED}");
     sights_compared("client-fuzz-hml", &setline, MOTIONS, &keys, rng, false);
+}
+
+/// [`random_scrolls_and_motions_number_the_rows_as_neovim_does`] with
+/// motions further past the view's edges than Neovim scrolls just far
+/// enough for among them — `gg` and `G`, counted too, `j` and `k` counted
+/// past half the window, `}` and `{` — and `'scrolloff'` keeping three
+/// lines about the cursor: the view centred on the cursor, or the buffer's
+/// first line at its top or its last at its bottom.
+#[test]
+fn random_long_jumps_show_nothing_neovim_never_drew() {
+    require_nvim!();
+    const KEYS: &[(&[u8], &str)] = &[
+        (b"gg", "gg"),
+        (b"G", "G"),
+        (b"j", "j"),
+        (b"k", "k"),
+        (b"25j", "25j"),
+        (b"25k", "25k"),
+        (b"14j", "14j"),
+        (b"14k", "14k"),
+        (b"60j", "60j"),
+        (b"60k", "60k"),
+        (b"}", "}"),
+        (b"{", "{"),
+        (b"$", "$"),
+        (b"\x04", "<C-d>"),
+        (b"\x15", "<C-u>"),
+        (b"L", "L"),
+    ];
+    const COUNTED: &[&str] = &["gg", "G", "}", "{", "j", "k"];
+    let mut rng = Lcg(23);
+    let keys = random_keys(&mut rng, KEYS, COUNTED);
+    let setline = format!("set nu rnu so=3 | {SCROLLED}");
+    sights_compared("client-fuzz-jmp", &setline, MOTIONS, &keys, rng, false);
 }
 
 /// `f`, `t`, `F` and `T`, each with a character to look for, as the
@@ -6692,4 +6764,152 @@ fn window_motions_go_where_neovim_takes_them() {
         }
     }
     assert!(checked > 2000, "{checked}");
+}
+
+/// Where Neovim puts the view of a window `rows` tall over `count` lines,
+/// split from another for `'scrolljump'` to go past its height, once `G`
+/// takes the cursor to a line: for `'smoothscroll'` as `smooth`
+/// says, each of `sos` as `'scrolloff'`, each of `jumps` as `'scrolljump'`,
+/// each of `tops` the view's top line — the cursor on the first line
+/// `'scrolloff'` lets it be on there — and each of `targets` — the line the
+/// view was shown from, which Neovim may have moved from `top` to keep
+/// `'scrolloff'`, the one it is shown from after, and the cursor's line
+/// after, lines from nought.
+const VIEWS_LUA: &str = "local rows, count, smooth, sos, jumps, tops, targets = ...
+  vim.o.lines = 100
+  if #vim.api.nvim_tabpage_list_wins(0) == 1 then
+    vim.cmd('new')
+    vim.bo.swapfile = false
+  end
+  vim.api.nvim_win_set_height(0, rows)
+  local lines = {}
+  for i = 1, count do
+    lines[i] = 'line ' .. i
+  end
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
+  vim.wo.smoothscroll = smooth
+  local out = { vim.api.nvim_win_get_height(0) }
+  for _, so in ipairs(sos) do
+    vim.wo.scrolloff = so
+    for _, sj in ipairs(jumps) do
+      vim.o.scrolljump = sj
+      for _, top in ipairs(tops) do
+        for _, to in ipairs(targets) do
+          local start = math.min(top + (top > 0 and so or 0), count - 1)
+          vim.fn.winrestview({ topline = top + 1, lnum = start + 1, col = 0 })
+          local was = vim.fn.line('w0') - 1
+          vim.cmd('normal! ' .. (to + 1) .. 'G')
+          out[#out + 1] = { was, vim.fn.line('w0') - 1, vim.fn.line('.') - 1 }
+        end
+      end
+    end
+  end
+  return out";
+
+/// What the client makes of the view once a motion takes the cursor to
+/// another line is what a real Neovim makes of it: in windows short and
+/// tall, of an odd height and an even one, over buffers shorter than them
+/// and longer, from views of their first line, their last and between —
+/// some Neovim moves to keep `'scrolloff'` before the motion — to every line
+/// near and far, with every `'scrolloff'` up to half the window, a
+/// `'scrolljump'` of one and of more, and `'smoothscroll'`: the view kept,
+/// scrolled just far enough, or centred on the cursor.
+#[test]
+fn views_go_where_neovim_takes_them() {
+    use nvmux::client::moves::{self, Scrolling};
+    require_nvim!();
+    let scratch = Scratch::new("client-views");
+    let (_sock, mut rpc, _config) = session(&scratch, "client-views");
+    rpc.command("setlocal noswapfile").expect("noswapfile");
+    let mut checked = 0;
+    let mut cases = Vec::new();
+    for rows in [4i64, 5, 6, 7, 9, 12, 21, 22, 23, 40] {
+        let sos: Vec<i64> = if rows < 30 {
+            (0..=(rows - 1) / 2).collect()
+        } else {
+            vec![0, 1, 2, 3, 5, 8, 13, 19]
+        };
+        for count in [rows - 1, rows + 2, 2 * rows + 1, 300] {
+            let tops: Vec<i64> = if count < 100 {
+                (0..count).collect()
+            } else {
+                vec![0, 1, 3, 100, 150, count - rows, count - rows + 2, count - 3]
+            };
+            let targets = |top: i64| -> Vec<i64> {
+                if count < 100 {
+                    (0..count).collect()
+                } else {
+                    let mut t: Vec<i64> =
+                        ((top - 3 * rows).max(0)..(top + 4 * rows).min(count)).collect();
+                    t.extend([0, count - 1]);
+                    t
+                }
+            };
+            let mixed = matches!(rows, 7 | 22);
+            let jumps: Vec<i64> = if mixed {
+                vec![1, 0, 3, 40, -50]
+            } else {
+                vec![1]
+            };
+            for smooth in [false, true] {
+                if smooth && !mixed {
+                    continue;
+                }
+                for &top in &tops {
+                    cases.push((
+                        rows,
+                        count,
+                        smooth,
+                        sos.clone(),
+                        jumps.clone(),
+                        top,
+                        targets(top),
+                    ));
+                }
+            }
+        }
+    }
+    let list = |v: &[i64]| Value::Array(v.iter().map(|&n| Value::from(n)).collect());
+    for (rows, count, smooth, sos, jumps, top, targets) in cases {
+        let args = Value::Array(vec![
+            rows.into(),
+            count.into(),
+            smooth.into(),
+            list(&sos),
+            list(&jumps),
+            list(&[top]),
+            list(&targets),
+        ]);
+        let got = rpc
+            .call("nvim_exec_lua", vec![VIEWS_LUA.into(), args])
+            .expect("Neovim's");
+        let got = got.as_array().expect("a list");
+        assert_eq!(got[0].as_i64(), Some(rows), "the window's height");
+        let mut theirs = got[1..].iter().map(|v| {
+            let v = v.as_array().expect("three");
+            [0, 1, 2].map(|i| v[i].as_i64().expect("a line"))
+        });
+        for &so in &sos {
+            for &jump in &jumps {
+                for &to in &targets {
+                    let [was, after, cursor] = theirs.next().expect("as many");
+                    let how = Scrolling { jump, smooth };
+                    let ours =
+                        moves::keep_in_view((was, to), (rows, count - 1), so, how, &|l| l < count);
+                    // Scrolled past the cursor, by a 'scrolljump' more than
+                    // the window shows, Neovim puts it elsewhere: not
+                    // followed.
+                    let neovims = (cursor == to).then_some(after);
+                    assert_eq!(
+                        ours, neovims,
+                        "to {to} from top {was}, {rows} rows over {count} lines, \
+                         'scrolloff' {so}, 'scrolljump' {jump}, 'smoothscroll' {smooth}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(theirs.next().is_none(), "no more");
+    }
+    assert!(checked > 100_000, "{checked}");
 }

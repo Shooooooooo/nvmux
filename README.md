@@ -234,7 +234,7 @@ Over ssh, every key waits a round trip for Neovim to say what it did with it.
 nvmux's own client draws some keys at once instead, before Neovim has heard of
 them, much as [mosh](https://mosh.org) echoes what you type: scrolls (`<C-d>`,
 `<C-f>`, `zz`, the mouse wheel and their kind), cursor motions in Normal mode
-(`h`, `j`, `w`, `fx`, `}`, `H`, `$` and their kind), and what you type in Insert
+(`h`, `j`, `w`, `fx`, `}`, `G`, `$` and their kind), and what you type in Insert
 mode. It draws each only where it can work out exactly what Neovim will do, and
 Neovim has the last word: anything it did otherwise is put back as Neovim drew
 it, a round trip later.

@@ -629,7 +629,9 @@ if predict then
     -- columns 'colorcolumn' colours; 'scrolljump'; whether it may conceal
     -- text on any line; what 'iskeyword' makes of each character; whether
     -- :lmap mappings take the character typed after f and its kind for
-    -- another, 'iminsert' 1; and 'sections' and 'paragraphs'.
+    -- another, 'iminsert' 1; 'sections' and 'paragraphs'; and whether a view
+    -- Neovim centres on the cursor is centred by rows, 'smoothscroll' in a
+    -- window that wraps.
     if acks then
       local widths = vim.o.ambiwidth == 'double' or #vim.fn.getcellwidths() > 0
         or not vim.o.emoji
@@ -647,7 +649,8 @@ if predict then
         vim.wo.winhighlight ~= '' or not got or ns > 0,
         vim.wo.conceallevel > 0 and not vim.wo.concealcursor:find('n'),
         colorcolumn(info.winid), vim.o.scrolljump, vim.wo.conceallevel > 0, classes(buf),
-        vim.bo[buf].iminsert == 1, vim.o.sections, vim.o.paragraphs })
+        vim.bo[buf].iminsert == 1, vim.o.sections, vim.o.paragraphs,
+        vim.wo.wrap and vim.wo.smoothscroll })
     end
     return s
   end
@@ -1207,20 +1210,20 @@ if predict then
         blanks[#blanks + 1] = { view.topline + i - 2, vim.fn.virtcol({ view.topline + i - 1, #l }) }
       end
     end
-    -- The lines about the view, a window's height either side of it, that
-    -- Neovim draws with more than their text in its colours, which the
-    -- client draws a line a scroll ahead of Neovim brings into view in:
-    -- virtual text — among their characters, after them, over them, at a
-    -- column — or a sign, in its column or over the number, or a sign's
-    -- highlight across the line or its number. Such a line is left to
-    -- Neovim (see predict::Predictor::decorated). Said as runs of lines,
-    -- each from its first to the one after its last, and the lines looked
-    -- over for them: short of the band past as many marks of a kind as are
-    -- looked through, to the line of the last of them. Said ahead of the
-    -- ack, where they changed.
-    local height = api.nvim_win_get_height(win)
-    local from = math.max(view.topline - 1 - height, 0)
-    local to = math.min(vim.fn.line('w$') + height, api.nvim_buf_line_count(buf))
+    -- The lines about the view, as far either side of it as the lines sent
+    -- go (see around), that Neovim draws with more than their text in its
+    -- colours, which the client draws a line a scroll ahead of Neovim
+    -- brings into view in: virtual text — among their characters, after
+    -- them, over them, at a column — or a sign, in its column or over the
+    -- number, or a sign's highlight across the line or its number. Such a
+    -- line is left to Neovim (see predict::Predictor::decorated). Said as
+    -- runs of lines, each from its first to the one after its last, and the
+    -- lines looked over for them: short of the band past as many marks of a
+    -- kind as are looked through, to the line of the last of them. Said
+    -- ahead of the ack, where they changed.
+    local m = math.min(reach * api.nvim_win_get_height(win) + 10, 1000)
+    local from = math.max(view.topline - 1 - m, 0)
+    local to = math.min(vim.fn.line('w$') + m, api.nvim_buf_line_count(buf))
     local rows = {}
     for _, kind in ipairs({ 'virt_text', 'sign' }) do
       local marks = api.nvim_buf_get_extmarks(buf, -1, { from, 0 }, { math.max(to - 1, 0), -1 },
@@ -1314,7 +1317,7 @@ if predict then
       'cursorbind', 'langmap', 'ambiwidth', 'emoji', 'cursorline', 'cursorlineopt',
       'winhighlight', 'conceallevel', 'concealcursor', 'colorcolumn', 'textwidth',
       'vartabstop', 'scrolljump', 'iskeyword', 'iminsert', 'sections',
-      'paragraphs' } }, function()
+      'paragraphs', 'smoothscroll' } }, function()
       soon()
     end)
   end
@@ -3531,7 +3534,7 @@ impl App {
             width,
             text: &text,
             whichwrap: Some(&stepping.whichwrap),
-            scrolljump: Some(stepping.scrolljump),
+            scrolling: Some(stepping.scrolling()),
             keyword: Some(&stepping.classes),
             lmap: Some(stepping.lmap),
             macros: stepping.macros(),
@@ -4959,7 +4962,7 @@ impl App {
             width,
             text: &text,
             whichwrap: Some(&stepping.whichwrap),
-            scrolljump: Some(stepping.scrolljump),
+            scrolling: Some(stepping.scrolling()),
             keyword: Some(&stepping.classes),
             lmap: Some(stepping.lmap),
             macros: stepping.macros(),

@@ -267,13 +267,14 @@ pub struct ClientSettings {
     /// `W`, `B`, `E` and `gE`, as `'iskeyword'` makes words — to the character
     /// typed after `f`, `t`, `F` and `T`, unless something maps them, or
     /// `'iminsert'` has `:lmap` mappings take that character for another — by
-    /// paragraphs, `}` and `{` — and to the view's top, middle and bottom,
-    /// `H`, `M` and `L` — are drawn, with counts, and with them the
-    /// numbers of `'relativenumber'` and the bar of `'cursorline'`: in view, or
-    /// past `'scrolloff'`, the view scrolled as Neovim scrolls it, short of
-    /// half the window, which Neovim centres the cursor for instead — but not
-    /// to bring into view a line Neovim draws with virtual text or a sign,
-    /// which the client would draw without them. With `predict_scrolls` as
+    /// paragraphs, `}` and `{` — to the view's top, middle and bottom, `H`,
+    /// `M` and `L` — and to a line, `gg` and `G` — are drawn, with counts,
+    /// and with them the numbers of `'relativenumber'` and the bar of
+    /// `'cursorline'`: in view, or past `'scrolloff'`, the view scrolled as
+    /// Neovim scrolls it, just far enough or, further, to centre the cursor,
+    /// as far as the lines the agent keeps about the view go — but not to
+    /// bring into view a line Neovim draws with virtual text or a sign, which
+    /// the client would draw without them. With `predict_scrolls` as
     /// well, a key that scrolls, or a turn of the wheel, goes on from where the
     /// motions before it left the cursor, and they from it; and a scroll that
     /// takes the cursor to another line, the wheel's among them, has the
@@ -288,8 +289,10 @@ pub struct ClientSettings {
     /// each key left the cursor, about 40 bytes a key back over the link,
     /// and as the view moves, which lines about it have virtual text or
     /// signs, a few bytes a run of them, having looked them over as Neovim
-    /// went to wait for the key — a fraction of a millisecond where they are
-    /// thick on every line; and each fence the client asks after its keys
+    /// went to wait for the key — as far either side of the view as it keeps
+    /// lines, which the slower the link the further: a millisecond and a half
+    /// at most, where they are thick on every line, and a fraction of one
+    /// where they are not; and each fence the client asks after its keys
     /// reads the agent's count, about 40 bytes more.
     pub predict_motions: Predict,
     /// Type ahead of a slow link: what is typed in Insert mode — a character

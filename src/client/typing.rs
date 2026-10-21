@@ -1006,6 +1006,7 @@ mod tests {
                 lmap: false,
                 sections: None,
                 paragraphs: None,
+                smoothscroll: false,
             }),
         }
     }
