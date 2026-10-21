@@ -27,8 +27,7 @@
 //!
 //! # In as few bytes as it takes
 //!
-//! With `[client] lean_output` on, the default (see [`Screen::set_lean`]), a
-//! frame goes on from where its last cell left the cursor and the pen: every
+//! A frame goes on from where its last cell left the cursor and the pen: every
 //! move, and every change of colour, made by the shortest of the ways a
 //! terminal understands (see [`move_to`] and [`recolour`]), as Neovim's own TUI
 //! makes them. Each of those is the same screen as the absolute move and the
@@ -36,16 +35,17 @@
 //! the terminal cannot have put it anywhere else: after a character a terminal
 //! may take for wider or narrower than Neovim does, or one written to the last
 //! column, where terminals part ways on what comes next, the next move is
-//! absolute again. Off, every jump of the cursor is absolute and every change
-//! of the pen a reset and the whole pen.
+//! absolute again. A test can have every jump of the cursor absolute and
+//! every change of the pen a reset and the whole pen, to hold the one up
+//! against the other (see [`Screen::set_lean`]).
 //!
 //! # Rows moved
 //!
-//! With `[client] scroll_regions` on (see [`Screen::set_regions`]), the rows
-//! a frame moved — a window scrolling, a line opened — are moved by the
-//! terminal before a cell is written, and the frame is diffed against the
-//! screen as that leaves it (see [`super::region`]). Off, the default, every
-//! row a frame changed is written, moved or not.
+//! A client's screen ([`Screen::moving_rows`]) has the rows a frame moved — a
+//! window scrolling, a line opened — moved by the terminal before a cell is
+//! written, and the frame diffed against the screen as that leaves it (see
+//! [`super::region`]). A plain one ([`Screen::new`]) writes every row a frame
+//! changed, moved or not.
 //!
 //! # Synchronized
 //!
@@ -138,11 +138,21 @@ impl Screen {
         }
     }
 
+    /// A screen as a client draws one: moving the rows a frame moved with the
+    /// terminal's own scroll regions (see [`Screen::set_regions`]).
+    pub fn moving_rows() -> Self {
+        let mut screen = Self::new();
+        screen.set_regions(true);
+        screen
+    }
+
     /// Write each frame from here on in as few bytes as it takes, `lean` — as
     /// a screen does until told otherwise — or with every jump of the cursor
-    /// absolute and every change of the pen a reset (see the module docs).
-    /// The screen is the same either way; each frame stands alone, so the
-    /// next is the first written the new way.
+    /// absolute and every change of the pen a reset (see the module docs):
+    /// for a test to hold the one up against the other. The screen is the
+    /// same either way; each frame stands alone, so the next is the first
+    /// written the new way.
+    #[cfg(test)]
     pub fn set_lean(&mut self, lean: bool) {
         self.lean = lean;
     }

@@ -69,8 +69,8 @@ impl Pool {
 
     /// Take a client that has just left the front.
     ///
-    /// Kept clients are parked — to draw at a crawl while they are, if
-    /// `[client] throttle` says so as it stands now — and `None` comes back;
+    /// Kept clients are parked — to draw at a crawl while they are — and
+    /// `None` comes back;
     /// anything else comes back as it went in, for the caller to hold as it
     /// always has — which is
     /// also where a kept client goes that left the front before its startup
@@ -87,7 +87,7 @@ impl Pool {
         }
         let id = attachment.session_id.clone();
         self.retire(&id);
-        if let Some(parked) = attachment.park(crate::config::get().client.throttle) {
+        if let Some(parked) = attachment.park() {
             tracing::debug!(id = %id, parked = self.parked.len() + 1, "client parked");
             self.parked.push(parked);
         }
@@ -96,13 +96,13 @@ impl Pool {
 
     /// Hold a client started ahead of its session's first visit, with its
     /// attach probe if that has still to answer (see
-    /// [`Attachment::start_ahead`]), at a crawl if `[client] throttle` says so.
+    /// [`Attachment::start_ahead`]), at a crawl.
     /// Whether or not clients are kept: this one has not been in front yet,
     /// and `per_session` is about what happens when one leaves it.
     pub fn start_ahead(&mut self, attachment: Attachment, probe: Option<Probe>) {
         let id = attachment.session_id.clone();
         self.retire(&id);
-        if let Some(held) = attachment.start_ahead(probe, crate::config::get().client.throttle) {
+        if let Some(held) = attachment.start_ahead(probe) {
             tracing::debug!(id = %id, held = self.parked.len() + 1, "client started ahead");
             self.parked.push(held);
         }
@@ -413,7 +413,7 @@ mod tests {
         }
         let again = kept_standin("s1", "exec sleep 30");
         let again_pid = again.pid_for_test();
-        let held = again.start_ahead(None, false).expect("held");
+        let held = again.start_ahead(None).expect("held");
         assert!(
             pool.adopt(held).is_none(),
             "turned away in place of one that left"
@@ -430,7 +430,7 @@ mod tests {
         pool.set_aside(Some(visited));
         let late = kept_standin("s2", "exec sleep 30");
         let late_pid = late.pid_for_test();
-        let held = late.start_ahead(None, false).expect("held");
+        let held = late.start_ahead(None).expect("held");
         let turned_away = pool.adopt(held).expect("held in place of one alive");
         drop(turned_away);
         assert!(gone(late_pid), "the newcomer turned away lived on");

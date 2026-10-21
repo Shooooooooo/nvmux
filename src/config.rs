@@ -103,35 +103,16 @@ pub struct SessionSettings {
     /// The command line, with `{sock}` standing in for the session's socket.
     /// Parsed by [`crate::launch::Launch`], which is also what rejects a bad one.
     pub command: String,
-    /// List this machine's sessions without waiting more than a quarter of a
-    /// second on any one of them: for the picker, `<prefix> c` and a switch
-    /// (see [`crate::rpc::QUICK_PROBE_TIMEOUT`]).
-    ///
-    /// On, the default, a session busy in a `:!make` or in CPU-bound Lua,
-    /// which cannot answer, holds a listing a quarter of a second, and is
-    /// then listed as one that answered is. A session that dies within the
-    /// three seconds a listing waits without this is listed until the next
-    /// listing.
-    ///
-    /// Off, such a session holds every listing three seconds — the picker
-    /// comes up that much later, on a cleared screen — and one that dies in
-    /// them is found gone, and not listed.
-    pub quick_list: bool,
-    /// Have the sessions say when they have news for the cards in the margin,
-    /// rather than be asked for it every two seconds (see [`crate::tell`]).
-    ///
-    /// On, the default, nvmux holds a connection open to each session, and
-    /// the session says down it when it has news: the card comes as it
-    /// happens, and each session is read twice a minute besides, for anything
-    /// missed. That is a connection and a thread held for every session for
-    /// as long as nvmux runs, over ssh a forwarded connection; and news that a
-    /// connection gone quiet without closing, over a link that dropped, does
-    /// not bring is told up to thirty seconds late.
-    ///
-    /// Off, nvmux reads every session every two seconds for as long as you
-    /// are in one — a connection to each, and its editor woken, thirty times
-    /// a minute — and a card comes up to two seconds after what it tells.
-    pub push_news: bool,
+    /// Once a switch of its own, whether a listing waits a quarter of a
+    /// second on a session that cannot answer, rather than three: always so
+    /// now (see [`crate::rpc::QUICK_PROBE_TIMEOUT`]). Still read, so that a
+    /// file that sets it loads, and never looked at.
+    pub quick_list: Retired,
+    /// Once a switch of its own, whether the sessions say when they have news
+    /// rather than are asked for it every two seconds: always so now (see
+    /// [`crate::tell`]). Still read, so that a file that sets it loads, and
+    /// never looked at.
+    pub push_news: Retired,
 }
 
 /// The client that draws a session, on the pty nvmux relays (see
@@ -237,26 +218,12 @@ pub struct ClientSettings {
     /// file that sets it loads, and never looked at.
     #[serde(skip_serializing)]
     pub revive: Retired,
-    /// Draw a session nobody sees — its client kept out of sight, or started
-    /// ahead of its first visit — at most once a second, with nothing in it
-    /// animating, until it is back in front (see
-    /// [`crate::card::Command::Away`]). nvmux's own client only.
-    ///
-    /// On, the default, a session that draws all the while out of sight — a
-    /// `:terminal` running a build, a log — costs nvmux a third of the CPU it
-    /// would, or less; and a client started ahead of one is kept to its first
-    /// visit, rather than let go for writing more than
-    /// [`crate::pty::AHEAD_MAX`] before it. nvmux's copy of a session out of
-    /// sight is up to a second old, and is brought up to date as the session
-    /// comes back to the front, before it is shown: the client draws what it
-    /// had yet to, and the return waits for that frame — a millisecond or so,
-    /// and never more than 30 for a client busy with something else — card
-    /// or none.
-    ///
-    /// Off, such a client draws everything its session does as if it were in
-    /// front, into nvmux's copy of its screen — but for a blinking cursor,
-    /// which holds still out of sight either way.
-    pub throttle: bool,
+    /// Once a switch of its own, whether a session nobody sees is drawn at
+    /// most once a second: always so now (see
+    /// [`crate::card::Command::Away`]). Still read, so that a file that sets
+    /// it loads, and never looked at.
+    #[serde(skip_serializing)]
+    pub throttle: Retired,
     /// Scroll ahead of a slow link: a key that scrolls — `<C-e>`, `<C-d>`,
     /// `<C-f>`, `zz`, `zl` and their kind, in Normal mode or Insert — or a
     /// turn of the mouse wheel, either way, scrolls the window at once,
@@ -304,56 +271,22 @@ pub struct ClientSettings {
     /// `'textwidth'`, unless its long lines want more. 0 for no limit, which
     /// is `centre = "off"` whatever that says.
     pub window_width: u16,
-    /// Write each frame to the terminal in as few bytes as it takes, as
-    /// Neovim's own TUI does: the cursor moved on from where the last cell
-    /// left it — along a row by CUF, or by writing a few cells again, and to
-    /// the next row by CR LF — and a change of colours alone made by the
-    /// colours. nvmux's own client only (see [`crate::client::screen`]).
-    ///
-    /// On, the default, a move is made from where the cursor is only where
-    /// the terminal cannot have put it anywhere else, so the screen is the
-    /// one off draws, in a seventh to a third fewer bytes, and with a sixth
-    /// to a third less of what nvmux spends parsing them as it relays them.
-    /// Off, every run of cells has the cursor placed and the pen set from
-    /// nothing.
-    ///
-    /// What on risks: a frame written for the size the terminal had, landing
-    /// as it is made smaller, can scroll the screen where off would cut it
-    /// short, until the repaint the new size brings, a moment later.
-    pub lean_output: bool,
-    /// Have the terminal move the rows a frame moved, rather than write them
-    /// again: a window scrolling, by Neovim or by `[effects.scroll]`'s slide,
-    /// and a line opened or deleted with the rest of its window moving. A
-    /// scroll region is set round the rows (`DECSTBM`) and they are deleted
-    /// or inserted at its top (`DL`, `IL`), as Neovim's own TUI scrolls; the
-    /// rest of the frame is written as ever. nvmux's own client only (see
-    /// [`crate::client::region`]).
-    ///
-    /// On, the default, the screen is the one off draws, and a scroll is
-    /// written in a fraction of the bytes: what a link to a terminal far away
-    /// carries, and what the terminal and nvmux's relay each parse. Off,
-    /// every row a frame changed is written, moved or not.
-    ///
-    /// What on risks: a terminal that gets scroll regions wrong shows the
-    /// rows a scroll moved wrong, until each is next written. A frame written
-    /// for the size the terminal had, landing as it is made smaller, can move
-    /// rows the region no longer fits, until the repaint the new size brings,
-    /// a moment later.
-    pub scroll_regions: bool,
-    /// Put each frame together from only the rows Neovim drew or scrolled
-    /// since the last, rather than every row, where nothing else changed: a
-    /// key typed, the cursor moved. The rest of the frame is the last one's,
-    /// and only the rows put together are compared with what the terminal
-    /// shows. A window placed, a highlight defined, a resize, anything
-    /// moving or a card over the screen has the frame put together whole, as
-    /// ever. nvmux's own client only (see [`crate::client::App::frame`]).
-    ///
-    /// On, the default, the screen is the one off draws, for less of the
-    /// client's CPU per key typed. Off, every frame is put together whole.
-    ///
-    /// What on risks: a row the editor changed in a way the client does not
-    /// count as a change would be left as it was, until it next changes.
-    pub partial_frames: bool,
+    /// Once a switch of its own, whether each frame is written in as few
+    /// bytes as it takes: always so now (see [`crate::client::screen`]).
+    /// Still read, so that a file that sets it loads, and never looked at.
+    #[serde(skip_serializing)]
+    pub lean_output: Retired,
+    /// Once a switch of its own, whether the terminal moves the rows a frame
+    /// moved: always so now (see [`crate::client::region`]). Still read, so
+    /// that a file that sets it loads, and never looked at.
+    #[serde(skip_serializing)]
+    pub scroll_regions: Retired,
+    /// Once a switch of its own, whether a frame is put together from only
+    /// the rows that changed, where it can be: always so now (see
+    /// [`crate::client::App::frame`]). Still read, so that a file that sets
+    /// it loads, and never looked at.
+    #[serde(skip_serializing)]
+    pub partial_frames: Retired,
 }
 
 /// A switch nvmux had once and has no more. A file that still sets it loads
@@ -375,13 +308,13 @@ impl Default for ClientSettings {
             per_session: true,
             lazy: false,
             revive: Retired,
-            throttle: true,
+            throttle: Retired,
             predict: Predict::Auto,
             centre: Centre::Off,
             window_width: 120,
-            lean_output: true,
-            scroll_regions: true,
-            partial_frames: true,
+            lean_output: Retired,
+            scroll_regions: Retired,
+            partial_frames: Retired,
         }
     }
 }
@@ -1181,8 +1114,8 @@ impl Default for SessionSettings {
             // Not a literal, for the same reason as the prefix above: the
             // prompt shows this before any config has necessarily been read.
             command: crate::launch::DEFAULT.to_string(),
-            quick_list: true,
-            push_news: true,
+            quick_list: Retired,
+            push_news: Retired,
         }
     }
 }
@@ -1513,20 +1446,14 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          \n\
          [session]\n\
          # command = {command}   # {{sock}} is required\n\
-         # quick_list = {quick_list}   # a busy session holds a listing a quarter of a second; false waits three\n\
-         # push_news  = {push_news}   # sessions say when they have news; false asks each one every two seconds\n\
          \n\
          [client]\n\
          # ui             = {ui:<8}   # nvmux's own animated client, or \"nvim\" for Neovim's\n\
          # per_session    = {per_session:<8}   # keep each session's client; a switch back reuses it\n\
          # lazy           = {lazy:<8}   # start every client at launch, and after a dropped link; true waits for visits\n\
-         # throttle       = {throttle:<8}   # a session out of sight is drawn once a second; false draws it as it changes\n\
          # predict        = {predict:<8}   # over ssh, scrolls show before Neovim answers; \"on\" over any slow link\n\
          # centre         = {centre:<8}   # on a wide terminal, each window's text in its middle: \"smart\" or \"fixed\"\n\
          # window_width   = {window_width:<8}   # with centre on, how many columns a window's text gets; 0 for no limit\n\
-         # lean_output    = {lean_output:<8}   # fewer bytes per frame, the same screen; false makes every move absolute\n\
-         # scroll_regions = {scroll_regions:<8}   # the terminal moves the rows a scroll moved, the same screen; false writes them\n\
-         # partial_frames = {partial_frames:<8}   # frames from the rows that changed alone, the same screen; false, from every row\n\
          \n\
          [style]\n\
          # color = {style_color:<10}   # or \"#rrggbb\": nvmux's text and bars in that colour\n\
@@ -1578,17 +1505,11 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
         prefix = quoted(&crate::keys::prefix_label(prefix)),
         timeout = k.timeout_ms,
         command = quoted(&s.command),
-        quick_list = s.quick_list,
-        push_news = s.push_news,
         per_session = c.per_session,
         lazy = c.lazy,
-        throttle = c.throttle,
         predict = quoted(c.predict.name()),
         centre = quoted(c.centre.name()),
         window_width = c.window_width,
-        lean_output = c.lean_output,
-        scroll_regions = c.scroll_regions,
-        partial_frames = c.partial_frames,
         style_color = quoted(&t.color.name()),
         style_float = t.float,
         fade_enabled = f.enabled,
@@ -2622,93 +2543,36 @@ mod tests {
         }
     }
 
-    /// A session out of sight drawn a frame a second unless told otherwise;
-    /// as it changes is a line away.
+    /// A file that still sets a switch nvmux has retired — what each said is
+    /// what nvmux does now, or `lazy` says — loads as one that does not,
+    /// whatever it says; one that sets it to anything but a switch is as
+    /// wrong as ever. A client is not told them.
     #[test]
-    fn a_session_out_of_sight_is_drawn_once_a_second_unless_told() {
-        assert!(Settings::default().client.throttle);
-        let s: Settings = toml::from_str("[client]\nthrottle = false\n").expect("valid");
-        assert!(!s.client.throttle);
-        assert!(s.client.per_session, "the rest as it was");
-    }
-
-    /// A file that still sets `revive`, which `lazy` decides now, loads as
-    /// one that does not, whatever it says; one that sets it to anything but
-    /// a switch is as wrong as ever. A client is not told it.
-    #[test]
-    fn a_file_that_still_sets_revive_loads_as_one_that_does_not() {
-        for (with, without) in [
-            ("[client]\nrevive = true\n", "[client]\n"),
-            ("[client]\nrevive = false\n", "[client]\n"),
-            (
-                "[client]\nrevive = true\nlazy = true\n",
-                "[client]\nlazy = true\n",
-            ),
-        ] {
-            let s: Settings = toml::from_str(with).expect("valid");
-            assert_eq!(s, toml::from_str(without).expect("valid"), "{with:?}");
+    fn a_file_that_still_sets_a_retired_switch_loads_as_one_that_does_not() {
+        let retired = [
+            ("session", "quick_list"),
+            ("session", "push_news"),
+            ("client", "revive"),
+            ("client", "throttle"),
+            ("client", "lean_output"),
+            ("client", "scroll_regions"),
+            ("client", "partial_frames"),
+        ];
+        for (table, key) in retired {
+            for value in ["true", "false"] {
+                let with = format!("[{table}]\n{key} = {value}\n");
+                let s: Settings = toml::from_str(&with).expect("valid");
+                assert_eq!(s, Settings::default(), "{with:?}");
+            }
+            let wrong = format!("[{table}]\n{key} = 1\n");
+            assert!(toml::from_str::<Settings>(&wrong).is_err(), "{wrong:?}");
         }
-        assert!(toml::from_str::<Settings>("[client]\nrevive = 1\n").is_err());
+        let s: Settings = toml::from_str("[client]\nrevive = true\nlazy = true\n").expect("valid");
+        assert_eq!(s, toml::from_str("[client]\nlazy = true\n").expect("valid"));
         let env = Settings::default().drawing().to_env();
-        assert!(!env.contains("revive"), "{env}");
-    }
-
-    /// Each frame written in as few bytes as it takes unless told otherwise;
-    /// with every jump of the cursor absolute is a line away.
-    #[test]
-    fn frames_are_written_lean_unless_told() {
-        assert!(Settings::default().client.lean_output);
-        let s: Settings = toml::from_str("[client]\nlean_output = false\n").expect("valid");
-        assert!(!s.client.lean_output);
-        assert_eq!(s.client.window_width, 120, "the rest as it was");
-    }
-
-    /// The terminal moves the rows a scroll moved unless told otherwise;
-    /// every row a frame changed written, moved or not, is a line away.
-    #[test]
-    fn the_terminal_moves_the_rows_a_frame_moved_unless_told() {
-        assert!(Settings::default().client.scroll_regions);
-        let s: Settings = toml::from_str("[client]\nscroll_regions = false\n").expect("valid");
-        assert!(!s.client.scroll_regions);
-        assert!(s.client.partial_frames, "the rest as it was");
-    }
-
-    /// Frames put together from only the rows that changed unless told
-    /// otherwise; every frame whole is a line away.
-    #[test]
-    fn frames_are_put_together_from_the_rows_that_changed_unless_told() {
-        assert!(Settings::default().client.partial_frames);
-        let s: Settings = toml::from_str("[client]\npartial_frames = false\n").expect("valid");
-        assert!(!s.client.partial_frames);
-        assert!(s.client.scroll_regions, "the rest as it was");
-    }
-
-    /// A listing waits a quarter of a second on a busy session unless told
-    /// otherwise; three seconds is a line away.
-    #[test]
-    fn a_listing_waits_briefly_on_busy_sessions_unless_told() {
-        assert!(Settings::default().session.quick_list);
-        let s: Settings = toml::from_str("[session]\nquick_list = false\n").expect("valid");
-        assert!(!s.session.quick_list);
-        assert_eq!(
-            s.session.command,
-            SessionSettings::default().command,
-            "the rest as it was"
-        );
-    }
-
-    /// The sessions say when they have news unless told otherwise; asking
-    /// them for it every two seconds is a line away.
-    #[test]
-    fn the_sessions_say_when_they_have_news_unless_told() {
-        assert!(Settings::default().session.push_news);
-        let s: Settings = toml::from_str("[session]\npush_news = false\n").expect("valid");
-        assert!(!s.session.push_news);
-        assert_eq!(
-            s.session.quick_list,
-            SessionSettings::default().quick_list,
-            "the rest as it was"
-        );
+        for (_, key) in retired {
+            assert!(!env.contains(key), "{env}");
+        }
     }
 
     /// nvmux's own client unless told otherwise; Neovim's is a line away.
@@ -3176,16 +3040,10 @@ mod tests {
         for line in [
             "# per_session    = true",
             "# lazy           = false",
-            "# throttle       = true",
             "# ui             = \"nvmux\"",
             "# predict        = \"auto\"",
             "# centre         = \"off\"",
             "# window_width   = 120",
-            "# lean_output    = true",
-            "# scroll_regions = true",
-            "# partial_frames = true",
-            "# quick_list = true",
-            "# push_news  = true",
             "# color = \"terminal\"",
             "# float = true ",
             "# enabled     = true",

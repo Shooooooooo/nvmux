@@ -86,10 +86,6 @@ const AHEAD: &[u8] = b"\x1b]9999;ahead\x07";
 /// [`AHEAD_FOR`].
 const CHILD_AHEAD_MS: &str = "NVMUX_TEST_RELAY_AHEAD_MS";
 
-/// Set on a child whose clients, out of sight, draw at a crawl: `[client]
-/// throttle`, which is on by default, and which a child without this has off.
-const CHILD_THROTTLE: &str = "NVMUX_TEST_RELAY_THROTTLE";
-
 /// What the child's relay announces the session as — on a card nvmux's own
 /// client draws (see [`nvmux::card`]), and Neovim's draws none — on its first
 /// attach and, kept, on every return to the front: as a switch would. Unset,
@@ -198,7 +194,6 @@ fn relay_child() {
     }
     let keep = std::env::var_os(CHILD_KEEP).is_some();
     settings.client.per_session = keep;
-    settings.client.throttle = std::env::var_os(CHILD_THROTTLE).is_some();
     // The picker full screen, which ends the relay: where these tests park a
     // kept client, and what a moved picker key is seen to do. Floating, it
     // would stay in the relay, over the session.
@@ -423,8 +418,6 @@ struct Asks {
     ahead: bool,
     /// [`CHILD_AHEAD_MS`].
     ahead_ms: Option<u64>,
-    /// [`CHILD_THROTTLE`].
-    throttle: bool,
     /// [`CHILD_PARKED_MS`].
     parked_ms: Option<u64>,
     /// [`CHILD_LABEL`].
@@ -522,7 +515,6 @@ impl Terminal {
             in_band,
             ahead,
             ahead_ms,
-            throttle,
             parked_ms,
             label,
             fade_ms,
@@ -567,9 +559,6 @@ impl Terminal {
         }
         if let Some(ms) = ahead_ms {
             cmd = cmd.env(CHILD_AHEAD_MS, ms.to_string());
-        }
-        if throttle {
-            cmd = cmd.env(CHILD_THROTTLE, "1");
         }
         if let Some(ms) = parked_ms {
             cmd = cmd.env(CHILD_PARKED_MS, ms.to_string());
@@ -1858,7 +1847,7 @@ fn a_relay_says_when_its_session_has_painted_once_dissolved_in() {
     a_relay_says_when_its_session_has_painted("painted-fade", true);
 }
 
-/// With `[client] throttle` on, a client started ahead of a session that
+/// A client started ahead of a session that
 /// draws all the while — a build running in a `:terminal`, a log — is kept to
 /// its first visit. Away, it draws a frame a second rather than every change
 /// (see `nvmux::card::Command::Away`), and what it writes for the terminal
@@ -1899,7 +1888,6 @@ fn a_client_started_ahead_of_a_busy_session_is_kept_to_its_first_visit() {
         Asks {
             keep: true,
             ahead: true,
-            throttle: true,
             own: true,
             ..Asks::default()
         },
@@ -1948,8 +1936,8 @@ fn a_client_started_ahead_of_a_busy_session_is_kept_to_its_first_visit() {
     assert_eq!(detach(&mut term), Some(0), "the child did not detach");
 }
 
-/// A client started ahead, drawing at a crawl out of sight (`[client]
-/// throttle`), was sized for the terminal as it was then. Made shorter since,
+/// A client started ahead, drawing at a crawl out of sight, was sized for
+/// the terminal as it was then. Made shorter since,
 /// the terminal has the client resized on the first visit, and the paint that
 /// visit holds and dissolves in is drawn for the size it has now — not the old
 /// screen cut short. The client is told it is back in front before it is
@@ -2001,7 +1989,6 @@ fn a_client_started_ahead_is_dissolved_in_at_the_size_of_its_first_visit() {
             keep: true,
             ahead: true,
             ahead_ms: Some(2_500),
-            throttle: true,
             own: true,
             ..Asks::default()
         },
@@ -2164,7 +2151,7 @@ fn a_detach_leaves_nothing_of_the_cards_behind() {
     assert!(left.is_empty(), "the detach left the shell this: {left:#?}");
 }
 
-/// With `[client] throttle` on, a kept client draws at a crawl while it is
+/// A kept client draws at a crawl while it is
 /// parked: a change its session makes just after it went waits a second to be
 /// drawn. Brought back sooner, with no card — as from the picker or the help
 /// full screen — it draws that change on its way back, and the relay waits
@@ -2195,7 +2182,6 @@ fn a_crawling_client_comes_back_as_its_session_is_now() {
         Asks {
             shadow: true,
             keep: true,
-            throttle: true,
             own: true,
             fade_ms: Some(LONG_FADE_MS),
             parked_ms: Some(500),
