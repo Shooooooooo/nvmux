@@ -25,6 +25,7 @@
 use super::grid::{Cell, Grid, Text};
 use super::model::{Model, Place};
 use super::style::{self, Color, Style};
+use super::wide::Tail;
 use crate::palette::Rgb;
 
 /// One cell of a frame: what the terminal is to show there.
@@ -175,8 +176,19 @@ pub trait Scrolling {
     /// Which of the rectangle's own rows of the grid row `r` shows now, both
     /// counted from its top: `None` for one it shows a line of its own for,
     /// kept or drawn ahead of Neovim. What runs on past a row's end goes
-    /// with the grid's rows (see `super::wide`), and such a line has none.
+    /// with the grid's rows (see `super::wide`), and such a line has its
+    /// own (see [`Scrolling::kept_tail`]).
     fn own_row(&self, _r: usize) -> Option<usize> {
+        None
+    }
+
+    /// What runs on past the end of the line row `r` of the rectangle shows,
+    /// counted from its top, where it is a line of the scroll's own: what
+    /// the line's row of the grid ran on with as the scroll took it out of
+    /// view (see `super::wide`). `None` for a row the grid lends, whose own
+    /// row has it, and for a line without one — none ran on past its end,
+    /// or it was drawn ahead of Neovim.
+    fn kept_tail(&self, _r: usize) -> Option<&Tail> {
         None
     }
 }
@@ -427,10 +439,10 @@ fn draw(
     if lo >= hi {
         return;
     }
-    // What runs past the grid's right edge, on the window's place.
-    let tails = within
-        .place
-        .and_then(|place| Some((place, model.tails.get(&grid)?)));
+    // What runs past the grid's right edge, on the window's place: what its
+    // rows run on with, if any do, and what the lines a scroll keeps of its
+    // own ran on with.
+    let tails = within.place.map(|place| (place, model.tails.get(&grid)));
     // The last highlight resolved, and its style and blend.
     let mut last: Option<(u32, Style, u8)> = None;
     let (mut runs, mut cut) = (Vec::with_capacity(4), Vec::with_capacity(4));
@@ -520,21 +532,26 @@ fn draw(
         // The rest of what Neovim draws after the line's end, which it cut
         // at the grid's edge (see `super::wide`): the tail of the grid's
         // row this one shows — its own, or the one a scroll has brought
-        // here; none for a line a scroll keeps of its own.
+        // here — or, for a line a scroll keeps of its own, the tail it took
+        // out of view with it. A scroll across less than the grid's whole
+        // width moves no tails.
         let Some(((from, to), tails)) = tails else {
             continue;
         };
-        let shows = match scroll.map(|s| (s, s.rect())) {
-            Some((s, (top, bot, left, right))) if (top..bot).contains(&r) => (left == 0
-                && right >= g.width())
-            .then(|| s.own_row(r - top))
-            .flatten()
-            .map(|i| top + i),
-            _ => Some(r),
+        let shows = match (scroll, scrolled) {
+            (Some(s), Some((left, right, line))) => {
+                let top = s.rect().0;
+                if left > 0 || right < g.width() {
+                    None
+                } else if let Some(i) = s.own_row(r - top) {
+                    tails.and_then(|t| Some((g.row(top + i), t.get(&(top + i))?)))
+                } else {
+                    line.zip(s.kept_tail(r - top))
+                }
+            }
+            _ => tails.and_then(|t| Some((own, t.get(&r)?))),
         };
-        let Some((start, cells)) = shows
-            .and_then(|s| Some((s, tails.get(&s)?)))
-            .and_then(|(s, tail)| super::wide::past(g.row(s), tail))
+        let Some((start, cells)) = shows.and_then(|(line, tail)| super::wide::past(line, tail))
         else {
             continue;
         };

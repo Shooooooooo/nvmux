@@ -3246,6 +3246,85 @@ fn a_diagnostic_cut_at_the_grids_edge_runs_on_in_the_margin() {
     );
 }
 
+/// What runs on in the margin past the rows of a window whose text is
+/// centred goes with each row's line as a scroll slides it through the
+/// window: every frame of the slide draws each line's message whole, those
+/// of the lines leaving the view as much as those coming into it.
+#[test]
+fn a_diagnostic_slides_out_of_view_with_its_line() {
+    require_nvim!();
+    let scratch = Scratch::new("client-slide-tails");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-slide-tails");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    // Thirty lines, each leaving nothing of its message on the grid's 60
+    // columns but the blanks before it, and each message saying whose it is.
+    rpc.command(
+        "lua vim.diagnostic.config({ virtual_text = true, signs = false }) \
+         local lines, diags = {}, {} \
+         for n = 1, 30 do \
+           lines[n] = string.format('%02d', n) .. string.rep('x', 54) \
+           diags[n] = { lnum = n - 1, col = 0, message = 'the end of ' .. n } \
+         end \
+         vim.api.nvim_buf_set_lines(0, 0, -1, false, lines) \
+         vim.diagnostic.set(vim.api.nvim_create_namespace('test'), 0, diags)",
+    )
+    .expect("diagnostics");
+    let whole = |n: usize| {
+        format!(
+            "{}{n:02}{}     ■ the end of {n}",
+            " ".repeat(50),
+            "x".repeat(54)
+        )
+    };
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| s.lines().next()
+            == Some(whole(1).as_str())),
+        "not in the margin:\n{}",
+        term.text()
+    );
+    settle(
+        &mut term,
+        Duration::from_millis(300),
+        Duration::from_secs(5),
+    );
+
+    // Half the window's ten rows down: lines 2 to 5 slide out at the top as
+    // lines 11 to 15 come in at the bottom.
+    term.type_bytes(b"\x04");
+    let (mut cut, mut leaving) = (Vec::new(), false);
+    term.frames(Duration::from_secs(2), |screen| {
+        for r in 0..10 {
+            let row: String = (0..160)
+                .map(|c| match screen.cell(r, c) {
+                    Some(cell) if cell.has_contents() => cell.contents(),
+                    _ => " ",
+                })
+                .collect();
+            let row = row.trim_end();
+            let Some(n) = row.trim_start().get(..2).and_then(|n| n.parse().ok()) else {
+                continue;
+            };
+            leaving |= n < 6;
+            if row != whole(n) {
+                cut.push(row.to_string());
+            }
+        }
+        false
+    });
+    assert!(leaving, "no frame showed a line leaving the view");
+    assert!(cut.is_empty(), "drawn without all its message: {cut:#?}");
+    assert_eq!(
+        term.text().lines().next(),
+        Some(whole(6).as_str()),
+        "{}",
+        term.text()
+    );
+}
+
 /// In a window that conceals text, a line's end is left of where the editor
 /// sees it: what runs past the grid's edge is drawn on from where the row
 /// has the message, not where the editor says.

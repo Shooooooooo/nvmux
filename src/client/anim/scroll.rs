@@ -34,9 +34,27 @@ use super::glide::Glide;
 use crate::client::compose::Scrolling;
 use crate::client::grid::{Cell, Grid};
 use crate::client::model::Held;
+use crate::client::wide::Tail;
 
 /// A line of a scroll's rectangle, or `None` for one nothing is known of.
-type Line = Option<Vec<Cell>>;
+type Line = Option<Kept>;
+
+/// A line kept either side of a view: its cells, and what Neovim drew after
+/// its end that the grid had no room for, as the editor last said it of the
+/// row the line was on (see `crate::client::wide`). The rows in view have
+/// theirs from the grid's own; one going out of view takes its own with it,
+/// to be drawn with it as it slides away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kept {
+    pub cells: Vec<Cell>,
+    pub tail: Option<Tail>,
+}
+
+impl From<Vec<Cell>> for Kept {
+    fn from(cells: Vec<Cell>) -> Self {
+        Self { cells, tail: None }
+    }
+}
 
 /// The rows of `rect` a scroll of `delta` takes out of view, `top..bot` in
 /// its grid: the top ones scrolling down the buffer, the bottom ones up,
@@ -156,7 +174,7 @@ impl Scroll {
     /// the rows [`leaving`] names, as they were.
     pub fn new(
         rect: (usize, usize, usize, usize),
-        gone: Vec<Vec<Cell>>,
+        gone: Vec<Kept>,
         delta: i64,
         far: usize,
     ) -> Self {
@@ -195,7 +213,10 @@ impl Scroll {
     /// [`crate::client::model::Model::reclaim`].
     pub fn hold(&self, held: &mut Held) {
         for line in self.above.iter().chain(&self.below).flatten() {
-            held.cells(line);
+            held.cells(&line.cells);
+            if let Some(tail) = &line.tail {
+                held.cells(&tail.cells);
+            }
         }
     }
 
@@ -264,7 +285,7 @@ impl Scroll {
     /// `predicting` is whether the client scrolls ahead of Neovim over the
     /// link as it is (see [`crate::client::predict::Predictor::active`]):
     /// only then may a view come back over more lines than a slide shows.
-    pub fn scrolled(&mut self, gone: Vec<Vec<Cell>>, delta: i64, far: usize, predicting: bool) {
+    pub fn scrolled(&mut self, gone: Vec<Kept>, delta: i64, far: usize, predicting: bool) {
         if self
             .ahead
             .front()
@@ -393,12 +414,12 @@ impl Scroll {
         let h = self.height();
         for (k, line) in self.below.iter_mut().enumerate() {
             if line.is_none() {
-                *line = fill(h + k as i64);
+                *line = fill(h + k as i64).map(Kept::from);
             }
         }
         for (k, line) in self.above.iter_mut().enumerate() {
             if line.is_none() {
-                *line = fill(-1 - k as i64);
+                *line = fill(-1 - k as i64).map(Kept::from);
             }
         }
         self.reach(fill);
@@ -412,11 +433,11 @@ impl Scroll {
         let h = self.height();
         let (lo, hi) = self.extent();
         while (self.below.len() as i64) < hi {
-            let line = fill(h + self.below.len() as i64);
+            let line = fill(h + self.below.len() as i64).map(Kept::from);
             self.below.push_back(line);
         }
         while (self.above.len() as i64) < -lo {
-            let line = fill(-1 - self.above.len() as i64);
+            let line = fill(-1 - self.above.len() as i64).map(Kept::from);
             self.above.push_back(line);
         }
     }
@@ -499,15 +520,26 @@ impl Scroll {
     /// those kept either side, or `grid`'s own for one in view. `None` for
     /// one not known.
     fn line<'a>(&'a self, i: i64, grid: &'a Grid) -> Option<&'a [Cell]> {
-        let h = self.height();
-        if i < 0 {
-            self.above.get((-i - 1) as usize)?.as_deref()
-        } else if i >= h {
-            self.below.get((i - h) as usize)?.as_deref()
-        } else {
+        if (0..self.height()).contains(&i) {
             let (top, _, left, right) = self.rect;
             let row = grid.row(top + i as usize);
             row.get(left.min(row.len())..right.min(row.len()))
+        } else {
+            self.kept(i).map(|line| &line.cells[..])
+        }
+    }
+
+    /// The line `i` rows down from the rectangle's top as Neovim has it, of
+    /// those kept either side: `None` for one in view, which is the grid's
+    /// own, and for one not known.
+    fn kept(&self, i: i64) -> Option<&Kept> {
+        let h = self.height();
+        if i < 0 {
+            self.above.get((-i - 1) as usize)?.as_ref()
+        } else if i >= h {
+            self.below.get((i - h) as usize)?.as_ref()
+        } else {
+            None
         }
     }
 
@@ -573,6 +605,11 @@ impl Scrolling for Scroll {
         let i = r as i64 - self.shown + self.shown_ahead();
         (0..self.height()).contains(&i).then_some(i as usize)
     }
+
+    fn kept_tail(&self, r: usize) -> Option<&Tail> {
+        let i = r as i64 - self.shown + self.shown_ahead();
+        self.kept(i)?.tail.as_ref()
+    }
 }
 
 #[cfg(test)]
@@ -621,9 +658,13 @@ mod tests {
 
     /// What a scroll of `delta` over `rect` takes out of `view`, as the
     /// animator takes it from the grid: see [`leaving`].
-    fn gone(rect: (usize, usize, usize, usize), view: &[Vec<Cell>], delta: i64) -> Vec<Vec<Cell>> {
+    fn gone(rect: (usize, usize, usize, usize), view: &[Vec<Cell>], delta: i64) -> Vec<Kept> {
         let (top, bot) = leaving(rect, delta);
-        view[top - rect.0..bot - rect.0].to_vec()
+        view[top - rect.0..bot - rect.0]
+            .iter()
+            .cloned()
+            .map(Kept::from)
+            .collect()
     }
 
     /// Scrolled down three: at once the first row has gone — no frame shows
@@ -668,6 +709,40 @@ mod tests {
             if let Some(i) = s.own_row(r) {
                 assert_eq!(s.row(r, &g), Some(g.row(i)), "row {r}");
             }
+        }
+    }
+
+    /// A line a scroll takes out of view keeps what its row ran on with past
+    /// the grid's edge, through the scrolls after it, for as long as the
+    /// line is kept; a row the grid lends has none of its own, its grid
+    /// row's being the one drawn (see `crate::client::wide`).
+    #[test]
+    fn a_line_out_of_view_keeps_what_ran_past_its_end() {
+        let tail = Tail {
+            start: 1,
+            cells: lines(31..32).remove(0),
+            sure: true,
+        };
+        let rect = (0, 5, 0, 1);
+        let mut out = gone(rect, &lines(10..15), 3);
+        out[1].tail = Some(tail.clone());
+        let mut s = Scroll::new(rect, out, 3, 1);
+        // Which row shows line 11, and what each row keeps past its end.
+        let kept = |s: &Scroll, view: &[Vec<Cell>]| {
+            let at = shows(s, view).iter().position(|l| *l == Some(11));
+            let tails: Vec<Option<Tail>> = (0..5).map(|r| s.kept_tail(r).cloned()).collect();
+            (at, tails)
+        };
+        let (at, tails) = kept(&s, &lines(13..18));
+        assert_eq!(at, Some(0));
+        assert_eq!(tails, [Some(tail.clone()), None, None, None, None]);
+
+        // Two more down while it slides: further up, and still with it.
+        s.scrolled(gone(rect, &lines(13..18), 2), 2, 1, false);
+        let (at, tails) = kept(&s, &lines(15..20));
+        let at = at.expect("line 11 still in sight");
+        for (r, t) in tails.iter().enumerate() {
+            assert_eq!(*t, (r == at).then(|| tail.clone()), "row {r}");
         }
     }
 

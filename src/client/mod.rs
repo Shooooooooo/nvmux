@@ -6259,14 +6259,20 @@ mod tests {
     /// A `tails` notification for window 1000's row `row`: its tail, `text`
     /// from column `start`.
     fn tails_of(row: i64, start: i64, text: &str) -> Vec<Value> {
-        let piece = Value::Array(vec![text.into(), 0.into()]);
-        let row = Value::Array(vec![row.into(), start.into(), Value::Array(vec![piece])]);
-        vec![
-            "tails".into(),
-            1000.into(),
-            true.into(),
-            Value::Array(vec![row]),
-        ]
+        tails_in(&[(row, start, text)])
+    }
+
+    /// A `tails` notification for window 1000's `rows`, each a row and its
+    /// tail, the text from the column it says: none for no row with one.
+    fn tails_in(rows: &[(i64, i64, &str)]) -> Vec<Value> {
+        let rows = rows
+            .iter()
+            .map(|&(row, start, text)| {
+                let piece = Value::Array(vec![text.into(), 0.into()]);
+                Value::Array(vec![row.into(), start.into(), Value::Array(vec![piece])])
+            })
+            .collect();
+        vec!["tails".into(), 1000.into(), true.into(), Value::Array(rows)]
     }
 
     /// A window narrowed to 8 of its 20 columns, its text 6 in, with
@@ -6366,6 +6372,66 @@ mod tests {
         let landed = shows(&mut a, t1 + Duration::from_secs(1));
         assert_eq!(landed[1], "      line 3 ■ tail", "landed with it");
         assert_eq!(landed[2], "      line 4");
+    }
+
+    /// What runs past the end of a row a scroll takes out of view goes with
+    /// it, and is drawn with it as it slides away, till it has gone — even
+    /// where, with the same redraw, nothing in view runs past its end any
+    /// more.
+    #[test]
+    fn what_runs_past_a_grids_edge_slides_away_with_its_row() {
+        let t0 = Instant::now();
+        let mut a = narrowed_with("line 0", t0);
+        let mut rows: Vec<_> = (1..5).map(|r| line(2, r, &format!("line {r}"))).collect();
+        rows.push(line(2, 1, "line 1 ■"));
+        rows.push(line(2, 4, "line 4 ■"));
+        redraw(&mut a, rows, t0);
+        let both = tails_in(&[(1, 7, "■ tail"), (4, 7, "■ more")]);
+        notify(&mut a, "nvmux_client", both, t0);
+        redraw(&mut a, vec![], t0);
+        let t1 = t0 + Duration::from_secs(1);
+        a.anim.set_effects(Effects {
+            scroll: Some((0.1, 1)),
+            ..Effects::none()
+        });
+        let shows = |a: &mut App, now: Instant| -> Vec<String> {
+            a.frame(now);
+            let f = compose::compose(&a.model, &a.anim, 20, 6);
+            f.text().lines().map(|l| l.trim_end().to_string()).collect()
+        };
+        let shown = shows(&mut a, t1);
+        assert_eq!(shown[1], "      line 1 ■ tail");
+        assert_eq!(shown[4], "      line 4 ■ more");
+
+        // Two down, line 1 out of view, and line 4's mark gone with the same
+        // redraw: the editor says, ahead of the flush, that nothing in view
+        // runs past its end.
+        notify(&mut a, "nvmux_client", tails_in(&[]), t1);
+        let up = (
+            "grid_scroll",
+            vec![2, 0, 5, 0, 8, 2, 0]
+                .into_iter()
+                .map(Value::from)
+                .collect(),
+        );
+        redraw(
+            &mut a,
+            vec![
+                up,
+                at(2, 2, 2),
+                line(2, 2, "line 4  "),
+                line(2, 3, "line 5"),
+                line(2, 4, "line 6"),
+            ],
+            t1,
+        );
+        assert!(!a.model.tails.contains_key(&2), "none in view");
+        let sliding = shows(&mut a, t1);
+        assert_eq!(sliding[0], "      line 1 ■ tail", "taken out with its row");
+        assert_eq!(sliding[1], "      line 2");
+        assert_eq!(sliding[3], "      line 4", "gone from its row");
+        let landed = shows(&mut a, t1 + Duration::from_secs(1));
+        assert_eq!(landed[0], "      line 2", "gone with it");
     }
 
     /// A grid the client cuts narrower lets go of what its rows ran on with:

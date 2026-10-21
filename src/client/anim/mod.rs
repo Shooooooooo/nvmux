@@ -34,8 +34,8 @@ use std::time::{Duration, Instant};
 use self::blink::Blink;
 use self::layout::{Change, Transition};
 use self::motion::Motion;
-use self::scroll::Scroll;
 pub use self::scroll::{Ahead, Fill, Land, Lander};
+use self::scroll::{Kept, Scroll};
 use self::side::Side;
 use self::smear::{Rect, Smear};
 use self::switch::Switch;
@@ -170,22 +170,44 @@ pub struct Before {
 struct Snap {
     grid: u64,
     rect: (usize, usize, usize, usize),
-    /// The rows the scroll takes out of view, as they were: see
-    /// [`scroll::leaving`].
-    gone: Vec<Vec<Cell>>,
+    /// The rows the scroll takes out of view, as they were, each with what
+    /// it ran on with past the grid's edge: see [`scroll::leaving`].
+    gone: Vec<Kept>,
     delta: i64,
 }
 
 impl Snap {
-    /// Of a scroll of `delta` over `rect` in `g`, about to be applied.
-    fn take(grid: u64, g: &Grid, rect: (usize, usize, usize, usize), delta: i64) -> Self {
+    /// Of a scroll of `delta` over `rect` in grid `grid`, about to be
+    /// applied. A row takes what it ran on with past the grid's edge (see
+    /// [`Model::tails`]) out of a rectangle as wide as the grid alone, as
+    /// the grid's rows keep theirs only through a scroll that wide.
+    fn take(
+        model: &Model,
+        grid: u64,
+        rect: (usize, usize, usize, usize),
+        delta: i64,
+    ) -> Option<Self> {
+        let g = model.grids.get(&grid)?;
         let (top, bot) = scroll::leaving(rect, delta);
-        Self {
+        let tails = model
+            .tails
+            .get(&grid)
+            .filter(|_| rect.2 == 0 && rect.3 >= g.width());
+        let gone = g
+            .lines(top, bot, rect.2, rect.3)
+            .into_iter()
+            .zip(top..)
+            .map(|(cells, r)| Kept {
+                cells,
+                tail: tails.and_then(|t| t.get(&r)).cloned(),
+            })
+            .collect();
+        Some(Self {
             grid,
             rect,
-            gone: g.lines(top, bot, rect.2, rect.3),
+            gone,
             delta,
-        }
+        })
     }
 }
 
@@ -378,7 +400,7 @@ impl Animator {
                         continue;
                     }
                     if let Some(rect) = inner(g, model.margins(grid)) {
-                        scrolls.push(Snap::take(grid, g, rect, delta));
+                        scrolls.extend(Snap::take(model, grid, rect, delta));
                     }
                 }
             } else if let Some(snap) =
@@ -1104,7 +1126,7 @@ fn linegrid_scroll(model: &Model, batch: &[Event]) -> Option<Snap> {
         return None;
     }
     let (rect, _) = rects.into_iter().find(|(_, sum)| *sum == delta)?;
-    Some(Snap::take(1, model.grids.get(&1)?, rect, delta))
+    Snap::take(model, 1, rect, delta)
 }
 
 /// The cursor's rectangle on the screen at `(row, col)`, in its mode's
