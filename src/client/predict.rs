@@ -4329,8 +4329,8 @@ mod tests {
     use super::*;
     use rmpv::Value;
 
-    /// The motions as well as the scrolls, as `predict_motions = true` has
-    /// them; and the typing as well, with `predict_typing = true` too.
+    /// The motions as well as the scrolls, as `predict_typing = false` has
+    /// them; and the typing as well, as `[client]` has it by default.
     const MOTIONS: Predictions = Predictions {
         scrolls: true,
         motions: true,

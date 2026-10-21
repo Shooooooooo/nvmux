@@ -1028,7 +1028,7 @@ mod tests {
     fn settings_go_to_the_client_and_come_back_as_they_went() {
         let mut drawing = crate::config::Drawing::default();
         drawing.client.centre = crate::config::Centre::Fixed;
-        drawing.client.predict_motions = true;
+        drawing.client.predict_typing = false;
         drawing.client.window_width = 100;
         drawing.remote = true;
         drawing.effects.smear.enabled = true;

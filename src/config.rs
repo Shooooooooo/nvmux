@@ -254,25 +254,25 @@ pub struct ClientSettings {
     /// (see [`crate::client::predict::Sync`]): one Neovim made otherwise goes
     /// back to Neovim's at once.
     ///
-    /// Off by default. The motions along a line — `h`, `l`, `0`, `^`, `$`,
-    /// `g_`, `|` and their kind — and to another line — `j`, `k`, `+`, `-`,
-    /// `_`, `<CR>` and theirs, and `j` and `k` mapped as LazyVim maps
-    /// them — are drawn, with counts, and with them the numbers of
-    /// `'relativenumber'` and the bar of `'cursorline'`: in view, or past
-    /// `'scrolloff'`, the view scrolled as Neovim scrolls it, short of half
-    /// the window, which Neovim centres the cursor for instead — but not to
-    /// bring into view a line Neovim draws with virtual text or a sign,
-    /// which the client would draw without them. With `predict_scrolls` as
-    /// well, a key that scrolls, or a turn of the wheel, goes on from where
-    /// the motions before it left the cursor, and they from it; and a
-    /// scroll that takes the cursor to another line, the wheel's among
-    /// them, has the numbers and the bar moved with it where the client can
-    /// draw them as Neovim does, and leaves them as Neovim drew them till
-    /// its next frame where not, as it always did. But not those to another
-    /// line in a window whose gutter a `'statuscolumn'` draws, as LazyVim's
-    /// is, which are left to Neovim. The client follows the rest by what
-    /// Neovim says of each key rather than waiting for it to catch up with
-    /// them all.
+    /// On by default; off, each waits for Neovim. The motions along a
+    /// line — `h`, `l`, `0`, `^`, `$`, `g_`, `|` and their kind — and to
+    /// another line — `j`, `k`, `+`, `-`, `_`, `<CR>` and theirs, and `j`
+    /// and `k` mapped as LazyVim maps them — are drawn, with counts, and
+    /// with them the numbers of `'relativenumber'` and the bar of
+    /// `'cursorline'`: in view, or past `'scrolloff'`, the view scrolled as
+    /// Neovim scrolls it, short of half the window, which Neovim centres
+    /// the cursor for instead — but not to bring into view a line Neovim
+    /// draws with virtual text or a sign, which the client would draw
+    /// without them. With `predict_scrolls` as well, a key that scrolls, or
+    /// a turn of the wheel, goes on from where the motions before it left
+    /// the cursor, and they from it; and a scroll that takes the cursor to
+    /// another line, the wheel's among them, has the numbers and the bar
+    /// moved with it where the client can draw them as Neovim does, and
+    /// leaves them as Neovim drew them till its next frame where not, as it
+    /// always did. But not those to another line in a window whose gutter a
+    /// `'statuscolumn'` draws, as LazyVim's is, which are left to Neovim.
+    /// The client follows the rest by what Neovim says of each key rather
+    /// than waiting for it to catch up with them all.
     ///
     /// What it costs, as `predict_typing` does too: the agent says where
     /// each key left the cursor, about 40 bytes a key back over the link,
@@ -289,15 +289,16 @@ pub struct ClientSettings {
     /// long enough, for sessions over ssh — judged, as `predict_motions`'s
     /// are, against what Neovim says it did.
     ///
-    /// Off by default. Not a key a mapping or an abbreviation may make more
-    /// of, one past `'textwidth'`, or one that indents the line again; nor,
-    /// in a buffer whose plugins act on what is typed there, till enough of
-    /// it has been found to go in as typed — or, whose plugins act as
-    /// Insert mode is entered or left there, the keys that do that, till
-    /// enough of them have been found to do no more than the key does: one
-    /// that does more after that — a trimmer of the blanks lines end in
-    /// finding some on another line — is drawn as the key alone does it,
-    /// put right a round trip later, and has its kind prove itself again.
+    /// On by default; off, each waits for Neovim. Not a key a mapping or an
+    /// abbreviation may make more of, one past `'textwidth'`, or one that
+    /// indents the line again; nor, in a buffer whose plugins act on what
+    /// is typed there, till enough of it has been found to go in as typed —
+    /// or, whose plugins act as Insert mode is entered or left there, the
+    /// keys that do that, till enough of them have been found to do no more
+    /// than the key does: one that does more after that — a trimmer of the
+    /// blanks lines end in finding some on another line — is drawn as the
+    /// key alone does it, put right a round trip later, and has its kind
+    /// prove itself again.
     ///
     /// What it costs: what `predict_motions` does, and the agent sends an
     /// edit with each key typed in Insert mode rather than at a pause, and
@@ -379,8 +380,8 @@ impl Default for ClientSettings {
             revive: Retired,
             throttle: Retired,
             predict_scrolls: true,
-            predict_motions: false,
-            predict_typing: false,
+            predict_motions: true,
+            predict_typing: true,
             predict: Superseded,
             centre: Centre::Off,
             window_width: 120,
@@ -424,7 +425,9 @@ pub struct Predictions {
 }
 
 impl Default for Predictions {
-    /// The scrolls alone, as `[client]` has it by default.
+    /// The scrolls alone: what a client predicts till it is told what its
+    /// settings say (see `crate::client::App::with_predictions`), the agent
+    /// left to say no more than the scrolls need.
     fn default() -> Self {
         Self {
             scrolls: true,
@@ -453,8 +456,8 @@ impl Predictions {
 /// the file may still set it: see [`ClientSettings::predict`]. `"auto"` and
 /// `"on"` are read as nothing, and `"off"` is refused with the switches that
 /// would turn every prediction off — rather than read as nothing as well,
-/// which would turn the scrolls back on, or read as turning the switches
-/// off, which a file that sets one of them too could not say again: the
+/// which would turn them all back on, or read as turning the switches off,
+/// which a file that sets one of them too could not say again: the
 /// settings screen, saving a switch put back to its default, leaves it out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Superseded;
@@ -478,7 +481,7 @@ impl<'de> Deserialize<'de> for Superseded {
                     "auto" | "on" => Ok(Superseded),
                     "off" => Err(E::custom(
                         "predict is three switches now: predict_scrolls, predict_motions and \
-                         predict_typing, each true or false; for \"off\", set predict_scrolls = false",
+                         predict_typing, each true or false; for \"off\", set all three to false",
                     )),
                     _ => Err(E::invalid_value(serde::de::Unexpected::Str(word), &self)),
                 }
@@ -2430,8 +2433,8 @@ mod tests {
             per_session = true\n\
             lazy = false\n\
             predict_scrolls = true\n\
-            predict_motions = false\n\
-            predict_typing = false\n\
+            predict_motions = true\n\
+            predict_typing = true\n\
             centre = \"off\"\n\
             [style]\n\
             color = \"terminal\"\n\
@@ -2608,37 +2611,38 @@ mod tests {
         assert!(s.client.lazy && !s.client.per_session);
     }
 
-    /// Scrolls are predicted for sessions over ssh unless told otherwise, and
-    /// nothing for this machine's; the motions and the typing are each a
-    /// switch away, on their own or together, and the scrolls one more
-    /// switch off. What a client is told comes back from its environment as
-    /// it went, and a word for any of them is an error.
+    /// The scrolls, the motions and the typing are all predicted for
+    /// sessions over ssh unless told otherwise, and nothing for this
+    /// machine's; each is a switch away, on its own or with any other. What
+    /// a client is told comes back from its environment as it went, and a
+    /// word for any of them is an error.
     #[test]
-    fn scrolls_are_predicted_over_ssh_unless_told() {
+    fn everything_is_predicted_over_ssh_unless_told() {
         let c = Settings::default().client;
-        assert_eq!(c.predictions(), Predictions::default());
-        assert!(c.predictions().scrolls && !c.predictions().acks());
+        let p = c.predictions();
+        assert_eq!((p.scrolls, p.motions, p.typing), (true, true, true));
         assert!(c.predicts(true), "a session over ssh");
         assert!(!c.predicts(false), "a session on this machine");
         for (doc, scrolls, motions, typing) in [
-            ("predict_motions = true", true, true, false),
-            ("predict_typing = true", true, false, true),
             (
-                "predict_scrolls = false\npredict_motions = true",
+                "predict_motions = false\npredict_typing = false",
+                true,
+                false,
+                false,
+            ),
+            ("predict_typing = false", true, true, false),
+            ("predict_motions = false", true, false, true),
+            ("predict_scrolls = false", false, true, true),
+            (
+                "predict_scrolls = false\npredict_typing = false",
                 false,
                 true,
                 false,
             ),
             (
-                "predict_scrolls = false\npredict_typing = true",
+                "predict_scrolls = false\npredict_motions = false",
                 false,
                 false,
-                true,
-            ),
-            (
-                "predict_motions = true\npredict_typing = true",
-                true,
-                true,
                 true,
             ),
         ] {
@@ -2646,7 +2650,7 @@ mod tests {
             let s: Settings = toml::from_str(&doc).expect(&doc);
             let p = s.client.predictions();
             assert_eq!((p.scrolls, p.motions, p.typing), (scrolls, motions, typing));
-            assert!(p.acks(), "{doc}");
+            assert_eq!(p.acks(), motions || typing, "{doc}");
             assert!(s.client.predicts(true) && !s.client.predicts(false));
             assert!(s.client.per_session && !s.client.lazy, "the rest as it was");
             let drawing = Drawing {
@@ -2655,7 +2659,10 @@ mod tests {
             };
             assert_eq!(Drawing::from_env(&drawing.to_env()), Some(drawing));
         }
-        let none: Settings = toml::from_str("[client]\npredict_scrolls = false\n").expect("valid");
+        let none: Settings = toml::from_str(
+            "[client]\npredict_scrolls = false\npredict_motions = false\npredict_typing = false\n",
+        )
+        .expect("valid");
         assert!(!none.client.predictions().any());
         assert!(
             !none.client.predicts(true),
@@ -2671,8 +2678,8 @@ mod tests {
     /// clients predicted, loads as one that does not where it said those
     /// over ssh, or this machine's too — the round trip of neither ever
     /// long enough — and is refused where it said none, in words that name
-    /// the switch that says so now: read as nothing, it would turn the
-    /// scrolls back on. Its switches of before are as wrong as any other
+    /// the switches that say so now: read as nothing, it would turn every
+    /// prediction back on. Its switches of before are as wrong as any other
     /// word, and a client is not told it.
     #[test]
     fn a_file_that_still_sets_predict_says_what_it_says_now() {
@@ -2684,7 +2691,11 @@ mod tests {
         let msg = toml::from_str::<Settings>("[client]\npredict = \"off\"\n")
             .expect_err("off")
             .to_string();
-        assert!(msg.contains("predict_scrolls = false"), "{msg}");
+        assert!(
+            msg.contains("predict_scrolls, predict_motions and predict_typing")
+                && msg.contains("for \"off\", set all three to false"),
+            "{msg}"
+        );
         for wrong in ["\"yes\"", "true", "false"] {
             let doc = format!("[client]\npredict = {wrong}\n");
             let msg = toml::from_str::<Settings>(&doc)
@@ -3232,8 +3243,8 @@ mod tests {
             "# lazy            = false",
             "# ui              = \"nvmux\"",
             "# predict_scrolls = true",
-            "# predict_motions = false",
-            "# predict_typing  = false",
+            "# predict_motions = true",
+            "# predict_typing  = true",
             "# centre          = \"off\"",
             "# window_width    = 120",
             "# color = \"terminal\"",

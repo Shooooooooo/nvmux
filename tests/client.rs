@@ -1220,7 +1220,8 @@ fn a_turn_of_the_wheel_over_a_slow_link_scrolls_before_neovim_answers() {
     let delay = Duration::from_millis(500);
     let slow = slow_link(&scratch.0.join("link"), &sock, delay);
 
-    let mut term = Terminal::spawn_told(&slow, &config, &over_ssh(""));
+    let scrolls = format!("[client]\n{SCROLLS}");
+    let mut term = Terminal::spawn_told(&slow, &config, &over_ssh(&scrolls));
     assert!(
         term.pump_until(Duration::from_secs(20), |s| top_line(s) == Some(1)),
         "never drawn:\n{}",
@@ -1323,9 +1324,9 @@ fn over_ssh(settings: &str) -> nvmux::config::Drawing {
 }
 
 /// A session whose one window shows the text `setline` puts there, drawn by
-/// a client over a slow link, told to predict over it, scrolls jumping
-/// rather than sliding so that what a prediction shows can be read off the
-/// screen at once.
+/// a client over a slow link, told to predict the scrolls over it and
+/// nothing else (see [`SCROLLS`]), scrolls jumping rather than sliding so
+/// that what a prediction shows can be read off the screen at once.
 ///
 /// With it, the link (see [`Link`]).
 fn drawn_slowly(
@@ -1337,7 +1338,7 @@ fn drawn_slowly(
     Terminal,
     Link,
 ) {
-    drawn_slowly_with(scratch, tag, setline, "")
+    drawn_slowly_with(scratch, tag, setline, SCROLLS)
 }
 
 /// [`drawn_slowly`], with `client` among the client's settings.
@@ -2257,8 +2258,16 @@ fn a_page_neovim_does_not_turn_is_given_up_at_its_ack() {
     );
 }
 
-/// The client told to work out the motions as well as the scrolls.
-const MOTIONS: &str = "predict_motions = true\n";
+/// The client told to work out nothing ahead of Neovim.
+const NOTHING: &str = "predict_scrolls = false\npredict_motions = false\npredict_typing = false\n";
+
+/// The client told to work out the scrolls alone: the motions and the
+/// typing, on by default, off.
+const SCROLLS: &str = "predict_motions = false\npredict_typing = false\n";
+
+/// The client told to work out the motions as well as the scrolls, and not
+/// the typing.
+const MOTIONS: &str = "predict_motions = true\npredict_typing = false\n";
 
 /// Lines of tabs, CJK, an emoji, a letter with a combining mark, nothing,
 /// blanks only, and brackets for MatchParen to light up: what a motion
@@ -3593,7 +3602,7 @@ fn sights_compared(
     let (sock, mut rpc, config) = session(&other, &format!("{tag}-ref"));
     rpc.command(&format!("setlocal noswapfile | {setline} | NoMatchParen"))
         .expect("setline");
-    std::fs::write(&config, "[client]\npredict_scrolls = false\n").expect("config");
+    std::fs::write(&config, format!("[client]\n{NOTHING}")).expect("config");
     let mut reference = Terminal::spawn(&sock, &config);
     assert!(
         reference.pump_until(Duration::from_secs(20), |s| s.contains("line 1")),
@@ -4421,22 +4430,22 @@ fn agent_autocmds(rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>) 
     (n(0), n(1))
 }
 
-/// Scrolls are predicted for a session over ssh unless told otherwise. A
+/// Predictions are made for a session over ssh unless told otherwise. A
 /// client that nvmux says nothing to of where its session is — on this
 /// machine — leaves its agent in the editor with nothing to predict with,
 /// whatever its switches say; told its session is on another machine, it
 /// leaves it the means, unless every switch is off.
 #[test]
-fn scrolls_are_predicted_for_a_session_over_ssh_unless_told() {
+fn predictions_are_made_for_a_session_over_ssh_unless_told() {
     require_nvim!();
-    let off = "[client]\npredict_scrolls = false\n";
+    let off = format!("[client]\n{NOTHING}");
     let motions = format!("[client]\n{MOTIONS}");
-    let (there, there_off) = (over_ssh(""), over_ssh(off));
+    let (there, there_off) = (over_ssh(""), over_ssh(&off));
     for (tag, config, told, predicting) in [
         ("client-here", "", None, false),
         ("client-motions-here", motions.as_str(), None, false),
         ("client-there", "", Some(&there), true),
-        ("client-off-there", off, Some(&there_off), false),
+        ("client-off-there", off.as_str(), Some(&there_off), false),
     ] {
         let scratch = Scratch::new(tag);
         let (sock, mut rpc, path) = session(&scratch, tag);

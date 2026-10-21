@@ -6385,8 +6385,8 @@ mod tests {
 
     type Call = (Option<u64>, String, Vec<Value>);
 
-    /// The motions as well as the scrolls, as `predict_motions = true` has
-    /// them; and the typing as well, with `predict_typing = true` too.
+    /// The motions as well as the scrolls, as `predict_typing = false` has
+    /// them; and the typing as well, as `[client]` has it by default.
     const MOTIONS: Predictions = Predictions {
         scrolls: true,
         motions: true,
@@ -6608,6 +6608,8 @@ mod tests {
     fn drawing() -> crate::config::Drawing {
         let mut d = crate::config::Drawing::default();
         d.client.predict_scrolls = false;
+        d.client.predict_motions = false;
+        d.client.predict_typing = false;
         d.effects.scroll.enabled = false;
         d
     }

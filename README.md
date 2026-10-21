@@ -263,8 +263,8 @@ ui              = "nvmux"  # who draws a session: nvmux's own client, animated; 
 per_session     = true     # keep each session's client; a switch back reuses it
 lazy            = false    # start every client at launch, and after a dropped link; true waits for visits
 predict_scrolls = true     # over ssh, scrolls show before Neovim answers
-predict_motions = false    # over ssh, h, j, $ and their kind move the cursor before Neovim answers
-predict_typing  = false    # over ssh, what is typed in Insert mode shows before Neovim answers
+predict_motions = true     # over ssh, h, j, $ and their kind move the cursor before Neovim answers
+predict_typing  = true     # over ssh, what is typed in Insert mode shows before Neovim answers
 centre          = "off"    # on a wide terminal, each window's text in its middle: "smart" or "fixed"
 window_width    = 120      # with centre on, how many columns a window's text gets; 0 for no limit
 
