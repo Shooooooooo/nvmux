@@ -365,66 +365,84 @@ local function tails(win, fresh)
   local at = api.nvim_win_get_position(win)
   local ts = vim.bo[buf].tabstop
   local out = {}
-  api.nvim_win_call(win, function()
-    for r, l in pairs(lines) do
-      local line = #l.ends > 0 and api.nvim_buf_get_lines(buf, r, r + 1, false)[1]
-      -- What is put in at the line's end, which the text after it follows;
-      -- and as wide as the line could be, text and all.
-      local inline, most = 0, 0
-      if line then
-        for _, i in ipairs(l.inline) do
-          if i[1] >= #line then
-            inline = inline + wide(i[2])
-          end
-        end
-        most = info.textoff + vim.fn.strdisplaywidth(line) + inline - left + #l.ends
-        for _, e in ipairs(l.ends) do
-          most = most + wide(e[4])
-        end
-      end
-      if line and most > width and vim.fn.foldclosed(r + 1) == -1 then
-        -- The line's end is the cell after its last character, as far as
-        -- screenpos() sees, even past the window's edge where the line fills
-        -- it; the text after it starts a cell on, past any put in there.
-        local p = vim.fn.screenpos(win, r + 1, math.max(#line, 1))
-        local col = (line == '' and p.col - at[2] or p.endcol - at[2] + 1) + inline
-        if p.row > 0 then
-          table.sort(l.ends, function(x, y)
-            if x[1] ~= y[1] then
-              return x[1] < y[1]
-            elseif x[2] ~= y[2] then
-              return x[2] < y[2]
-            end
-            return x[3] < y[3]
-          end)
-          local start, pieces = col, {}
-          for k, e in ipairs(l.ends) do
-            if k > 1 then
-              pieces[#pieces + 1] = { ' ', 0 }
-              col = col + 1
-            end
-            for _, c in ipairs(e[4]) do
-              local hl = c[2]
-              if type(hl) == 'table' then
-                hl = hl[#hl]
-              end
-              local gid = hl and vim.fn.hlID(hl) or 0
-              if gid > 0 and not sent[gid] then
-                sent[gid] = true
-                fresh[#fresh + 1] = attrs(gid)
-              end
-              local text = untab(c[1], col, ts)
-              pieces[#pieces + 1] = { text, gid }
-              col = col + vim.fn.strdisplaywidth(text)
-            end
-          end
-          if col > width then
-            out[#out + 1] = { p.row - 1 - at[1], start, pieces }
-          end
-        end
+  -- Whether line lnum, at p as screenpos() has it, is in a closed fold, as
+  -- foldclosed() would say only of the current window. nvim_win_call() is
+  -- not to be had here: with 'autochdir' set it marks every status line and
+  -- winbar to be drawn again, and Neovim holds back win_viewport -- how far
+  -- a window scrolled, which a scroll slides by -- while a window has
+  -- anything to draw, so a call at the end of every redraw holds it back
+  -- for good. screenpos() puts every line of a closed fold in the fold's
+  -- row and the first column of its text, as it does a line of no more
+  -- than one cell; only a fold's lines share a row with the line before or
+  -- after them.
+  local count = api.nvim_buf_line_count(buf)
+  local function folded(lnum, p)
+    if p.endcol ~= p.col or p.col - at[2] - 1 ~= info.textoff then
+      return false
+    end
+    for _, n in ipairs({ lnum - 1, lnum + 1 }) do
+      if n >= 1 and n <= count and vim.fn.screenpos(win, n, 1).row == p.row then
+        return true
       end
     end
-  end)
+    return false
+  end
+  for r, l in pairs(lines) do
+    local line = #l.ends > 0 and api.nvim_buf_get_lines(buf, r, r + 1, false)[1]
+    -- What is put in at the line's end, which the text after it follows;
+    -- and as wide as the line could be, text and all.
+    local inline, most = 0, 0
+    if line then
+      for _, i in ipairs(l.inline) do
+        if i[1] >= #line then
+          inline = inline + wide(i[2])
+        end
+      end
+      most = info.textoff + vim.fn.virtcol({ r + 1, '$' }, false, win) - 1 + inline - left + #l.ends
+      for _, e in ipairs(l.ends) do
+        most = most + wide(e[4])
+      end
+    end
+    -- The line's end is the cell after its last character, as far as
+    -- screenpos() sees, even past the window's edge where the line fills
+    -- it; the text after it starts a cell on, past any put in there.
+    local p = line and most > width and vim.fn.screenpos(win, r + 1, math.max(#line, 1))
+    if p and p.row > 0 and not folded(r + 1, p) then
+      local col = (line == '' and p.col - at[2] or p.endcol - at[2] + 1) + inline
+      table.sort(l.ends, function(x, y)
+        if x[1] ~= y[1] then
+          return x[1] < y[1]
+        elseif x[2] ~= y[2] then
+          return x[2] < y[2]
+        end
+        return x[3] < y[3]
+      end)
+      local start, pieces = col, {}
+      for k, e in ipairs(l.ends) do
+        if k > 1 then
+          pieces[#pieces + 1] = { ' ', 0 }
+          col = col + 1
+        end
+        for _, c in ipairs(e[4]) do
+          local hl = c[2]
+          if type(hl) == 'table' then
+            hl = hl[#hl]
+          end
+          local gid = hl and vim.fn.hlID(hl) or 0
+          if gid > 0 and not sent[gid] then
+            sent[gid] = true
+            fresh[#fresh + 1] = attrs(gid)
+          end
+          local text = untab(c[1], col, ts)
+          pieces[#pieces + 1] = { text, gid }
+          col = col + vim.fn.strdisplaywidth(text)
+        end
+      end
+      if col > width then
+        out[#out + 1] = { p.row - 1 - at[1], start, pieces }
+      end
+    end
+  end
   return out
 end
 local function report()

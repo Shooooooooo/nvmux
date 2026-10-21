@@ -3287,6 +3287,114 @@ fn a_diagnostic_after_concealed_text_runs_on_from_where_neovim_drew_it() {
     assert_eq!(term.hang_up(), Some(0), "the client's exit");
 }
 
+/// What runs past the grid's edge is worked out without making each window
+/// the current one, which with 'autochdir' set has Neovim draw every status
+/// line again and hold back how far a window scrolled while it does: done
+/// at the end of every redraw, for a tail in the window beside the one
+/// scrolled, the scroll jumped. It slides, through the rows between.
+#[test]
+fn a_scroll_beside_a_tail_slides_with_autochdir_set() {
+    require_nvim!();
+    let scratch = Scratch::new("client-tails-acd");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-tails-acd");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    // Two windows of the same lines, each a tail on its first row; the
+    // left one in front, scrolled.
+    let file = scratch.0.join("text");
+    rpc.command(&format!(
+        "exe 'file ' .. fnameescape('{}') | set autochdir | \
+         call setline(1, map(range(1, 200), 'printf(\"row %d\", v:val)')) | \
+         call setline(1, repeat('x', 56)) | vsplit | \
+         lua vim.diagnostic.config({{ virtual_text = true, signs = false }}) \
+           vim.diagnostic.set(vim.api.nvim_create_namespace('test'), 0, \
+             {{ {{ lnum = 0, col = 0, message = 'end' }} }})",
+        file.display()
+    ))
+    .expect("two windows, a tail in each");
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| {
+            s.lines()
+                .next()
+                .is_some_and(|l| l.matches("x     ■ end").count() == 2)
+        }),
+        "no tail beside the window:\n{}",
+        term.text()
+    );
+    term.pump_until(Duration::from_millis(500), |_| false);
+
+    term.type_bytes(b"\x04");
+    // The row each frame has at the top of the left window.
+    let mut tops: Vec<String> = Vec::new();
+    term.frames(Duration::from_secs(2), |screen| {
+        let top: String = (0..80)
+            .map(|col| match screen.cell(0, col) {
+                Some(cell) if cell.has_contents() => cell.contents(),
+                _ => " ",
+            })
+            .collect::<String>()
+            .trim()
+            .to_string();
+        if tops.last() != Some(&top) {
+            tops.push(top);
+        }
+        false
+    });
+    assert_eq!(tops.last().map(String::as_str), Some("row 6"), "{tops:?}");
+    assert!(
+        tops.iter()
+            .any(|t| ["row 2", "row 3", "row 4", "row 5"].contains(&t.as_str())),
+        "jumped, through none of the rows between: {tops:?}"
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
+/// Of the lines of a window whose text is centred, one of a single cell —
+/// all screenpos() can tell from a line in a closed fold — has what runs
+/// past the grid's edge drawn on in the margin; a line in a closed fold,
+/// which the fold's row shows instead, has none.
+#[test]
+fn a_line_of_a_cell_has_its_tail_and_a_closed_folds_has_none() {
+    require_nvim!();
+    let scratch = Scratch::new("client-tails-fold");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-tails-fold");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    rpc.command(
+        "lua vim.diagnostic.config({ virtual_text = true, signs = false }) \
+         vim.api.nvim_buf_set_lines(0, 0, -1, false, \
+           { '}', '', 'fold a', string.rep('y', 56), 'fold c', '', 'here' }) \
+         vim.cmd('3,5fold') \
+         vim.api.nvim_win_set_cursor(0, { 7, 0 }) \
+         vim.diagnostic.set(vim.api.nvim_create_namespace('test'), 0, { \
+           { lnum = 0, col = 0, message = 'a message long enough to run past the edge of the grid' }, \
+           { lnum = 3, col = 0, message = 'the folded one' } })",
+    )
+    .expect("a diagnostic on a line of a cell, and one in a fold");
+    let whole = format!(
+        "{}}}     ■ a message long enough to run past the edge of the grid",
+        " ".repeat(50)
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| s.starts_with(&whole)),
+        "not in the margin:\n{}",
+        term.text()
+    );
+    term.pump_until(Duration::from_millis(300), |_| false);
+    assert!(
+        !term.text().contains("folded one"),
+        "a closed fold's tail drawn:\n{}",
+        term.text()
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
 /// A float on a window whose text is centred goes in with the text, but no
 /// further than keeps it on the screen: a diagnostic's, opened at the end of
 /// a long line, which Neovim fits to the screen beside the window's grid, is
