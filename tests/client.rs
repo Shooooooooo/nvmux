@@ -1213,7 +1213,6 @@ fn a_turn_of_the_wheel_over_a_slow_link_scrolls_before_neovim_answers() {
     require_nvim!();
     let scratch = Scratch::new("client-predict");
     let (sock, mut rpc, config) = session(&scratch, "client-predict");
-    std::fs::write(&config, PREDICT_ON).expect("write the config");
     rpc.command("setlocal noswapfile | call setline(1, map(range(1, 200), '\"line \" . v:val'))")
         .expect("setline");
     // A second each way and back: Neovim's answer to the wheel cannot be on
@@ -1221,7 +1220,7 @@ fn a_turn_of_the_wheel_over_a_slow_link_scrolls_before_neovim_answers() {
     let delay = Duration::from_millis(500);
     let slow = slow_link(&scratch.0.join("link"), &sock, delay);
 
-    let mut term = Terminal::spawn(&slow, &config);
+    let mut term = Terminal::spawn_told(&slow, &config, &over_ssh(""));
     assert!(
         term.pump_until(Duration::from_secs(20), |s| top_line(s) == Some(1)),
         "never drawn:\n{}",
@@ -1311,10 +1310,17 @@ fn window(term: &Terminal) -> (Vec<String>, (u16, u16)) {
 /// ahead of it.
 const SLOW: Duration = Duration::from_millis(250);
 
-/// A config that has a client predict wherever the link is slow enough, as
-/// it does over ssh unless told otherwise: the sessions of these tests are on
-/// this machine, and only a link of the test's own makes them slow.
-const PREDICT_ON: &str = "[client]\npredict = \"on\"\n";
+/// What nvmux tells a client of a session over ssh, the config `settings`
+/// its own: a client predicts only for such a session, and those of these
+/// tests are on this machine, only a link of the test's own making them
+/// slow. Told so, a client does not read its config file at all.
+fn over_ssh(settings: &str) -> nvmux::config::Drawing {
+    let settings: nvmux::config::Settings = toml::from_str(settings).expect("the settings");
+    nvmux::config::Drawing {
+        remote: true,
+        ..settings.drawing()
+    }
+}
 
 /// A session whose one window shows the text `setline` puts there, drawn by
 /// a client over a slow link, told to predict over it, scrolls jumping
@@ -1345,12 +1351,13 @@ fn drawn_slowly_with(
     Terminal,
     Link,
 ) {
-    let settings = format!("{PREDICT_ON}{client}\n[effects.scroll]\nenabled = false\n");
+    let settings = format!("[client]\n{client}\n[effects.scroll]\nenabled = false\n");
     drawn_slowly_as(scratch, tag, setline, &settings)
 }
 
 /// [`drawn_slowly`], the client's settings `settings`, whole: the scroll
-/// effect as they have it.
+/// effect as they have it, the client told its session is over ssh (see
+/// [`over_ssh`]).
 fn drawn_slowly_as(
     scratch: &Scratch,
     tag: &str,
@@ -1367,7 +1374,7 @@ fn drawn_slowly_as(
     std::fs::write(&config, settings).expect("config");
     let (slow, link) = counted_link(&scratch.0.join("link"), &sock, SLOW);
 
-    let mut term = Terminal::spawn(&slow, &config);
+    let mut term = Terminal::spawn_told(&slow, &config, &over_ssh(settings));
     assert!(
         term.pump_until(Duration::from_secs(20), |s| s.contains("line 1")),
         "never drawn:\n{}",
@@ -1522,7 +1529,7 @@ fn the_agent_acks_each_key_neovim_takes() {
         &scratch,
         "client-acks",
         "call setline(1, map(range(1, 200), '\"line \" . v:val'))",
-        "predict_keys = \"motions\"\n",
+        MOTIONS,
     );
     // Long enough a wait for a mapping that `j` is still waiting when `k`
     // comes, over the link and back.
@@ -2147,7 +2154,7 @@ fn pages_typed_faster_than_the_link_answers_keep_up_told_the_motions() {
         &scratch,
         "client-burst-ack",
         "call setline(1, map(range(1, 2000), '\"line \" . v:val'))",
-        "predict_keys = \"motions\"\n",
+        MOTIONS,
     );
     let run = pages(&mut rpc, &mut term, &link, Duration::from_millis(100), 10);
     for (k, late) in run.late().iter().enumerate() {
@@ -2180,7 +2187,7 @@ fn a_page_neovim_does_not_turn_is_given_up_at_its_ack() {
              autocmd WinScrolled * lua vim.uv.sleep({})",
             SCROLL.as_millis()
         ),
-        "predict_keys = \"motions\"\n",
+        MOTIONS,
     );
     rpc.command(
         "lua local n = 0 vim.on_key(function(key) \
@@ -2251,7 +2258,7 @@ fn a_page_neovim_does_not_turn_is_given_up_at_its_ack() {
 }
 
 /// The client told to work out the motions as well as the scrolls.
-const MOTIONS: &str = "predict_keys = \"motions\"\n";
+const MOTIONS: &str = "predict_motions = true\n";
 
 /// Lines of tabs, CJK, an emoji, a letter with a combining mark, nothing,
 /// blanks only, and brackets for MatchParen to light up: what a motion
@@ -2477,7 +2484,7 @@ fn holding_j_past_the_bottom_as_the_view_slides_keeps_the_bar_under_the_cursor()
     require_nvim!();
     let scratch = Scratch::new("client-slide-j");
     let setline = format!("set termguicolors cursorline | {SCROLLING}");
-    let settings = format!("{PREDICT_ON}{MOTIONS}");
+    let settings = format!("[client]\n{MOTIONS}");
     let (_rpc, mut term, _) = drawn_slowly_as(&scratch, "client-slide-j", &setline, &settings);
     typed(&mut term, b"L");
     let screen = term.parser.screen();
@@ -2652,7 +2659,7 @@ fn scrolls_alone_number_the_rows_and_lay_the_bar_as_neovim_does() {
 
 /// The client told to type ahead of Neovim, as well as to work out the
 /// motions.
-const TYPING: &str = "predict_keys = \"typing\"\n";
+const TYPING: &str = "predict_motions = true\npredict_typing = true\n";
 
 /// Text typed in Insert mode over a slow link to a real Neovim — letters,
 /// blanks, a character with an accent, two cells wide, a burst faster than
@@ -3586,7 +3593,7 @@ fn sights_compared(
     let (sock, mut rpc, config) = session(&other, &format!("{tag}-ref"));
     rpc.command(&format!("setlocal noswapfile | {setline} | NoMatchParen"))
         .expect("setline");
-    std::fs::write(&config, "[client]\npredict = \"off\"\n").expect("config");
+    std::fs::write(&config, "[client]\npredict_scrolls = false\n").expect("config");
     let mut reference = Terminal::spawn(&sock, &config);
     assert!(
         reference.pump_until(Duration::from_secs(20), |s| s.contains("line 1")),
@@ -4353,10 +4360,9 @@ fn only_a_link_slow_enough_to_predict_over_is_sent_lines() {
 
     let fast = Scratch::new("client-fastlines");
     let (sock, mut rpc, config) = session(&fast, "client-fastlines");
-    std::fs::write(&config, PREDICT_ON).expect("write the config");
     rpc.command(&format!("setlocal noswapfile | {setline}"))
         .expect("setline");
-    let mut term = Terminal::spawn(&sock, &config);
+    let mut term = Terminal::spawn_told(&sock, &config, &over_ssh(""));
     assert!(
         term.pump_until(Duration::from_secs(20), |s| s.contains("line 1")),
         "never drawn:\n{}",
@@ -4418,19 +4424,19 @@ fn agent_autocmds(rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>) 
 /// Scrolls are predicted for a session over ssh unless told otherwise. A
 /// client that nvmux says nothing to of where its session is — on this
 /// machine — leaves its agent in the editor with nothing to predict with,
-/// `predict` at its default; told `"on"`, it leaves it the means, as it does
-/// at the default for a session it is told is on another machine.
+/// whatever its switches say; told its session is on another machine, it
+/// leaves it the means, unless every switch is off.
 #[test]
 fn scrolls_are_predicted_for_a_session_over_ssh_unless_told() {
     require_nvim!();
-    let over_ssh = nvmux::config::Drawing {
-        remote: true,
-        ..nvmux::config::Settings::default().drawing()
-    };
+    let off = "[client]\npredict_scrolls = false\n";
+    let motions = format!("[client]\n{MOTIONS}");
+    let (there, there_off) = (over_ssh(""), over_ssh(off));
     for (tag, config, told, predicting) in [
-        ("client-auto-here", "", None, false),
-        ("client-on-here", PREDICT_ON, None, true),
-        ("client-auto-there", "", Some(&over_ssh), true),
+        ("client-here", "", None, false),
+        ("client-motions-here", motions.as_str(), None, false),
+        ("client-there", "", Some(&there), true),
+        ("client-off-there", off, Some(&there_off), false),
     ] {
         let scratch = Scratch::new(tag);
         let (sock, mut rpc, path) = session(&scratch, tag);
@@ -4763,18 +4769,15 @@ fn a_split_over_a_slow_link_is_centred_from_its_first_frame() {
     require_nvim!();
     let scratch = Scratch::new("client-centre-slow");
     let (sock, mut rpc, config) = session(&scratch, "client-centre-slow");
-    std::fs::write(
-        &config,
-        format!("{PREDICT_ON}centre = \"smart\"\nwindow_width = 60\n"),
-    )
-    .expect("write the config");
+    let settings = "[client]\ncentre = \"smart\"\nwindow_width = 60\n";
     rpc.command(
         "setlocal noswapfile | set splitright \
          | call setline(1, map(range(1, 10), '\"MARK \" . v:val'))",
     )
     .expect("set the session up");
     let slow = slow_link(&scratch.0.join("link"), &sock, Duration::from_millis(80));
-    let mut term = Terminal::spawn_sized(&slow, &config, DA1_REPLY, (160, 12));
+    let told = over_ssh(settings);
+    let mut term = Terminal::start(&slow, &config, Some(&told), DA1_REPLY, (160, 12));
     assert!(
         term.pump_until(Duration::from_secs(20), |s| s
             .starts_with(&format!("{}MARK 1", " ".repeat(50)))),
@@ -5162,14 +5165,8 @@ fn a_scroll_beside_text_run_on_past_the_edge_lands_with_autochdir() {
     require_nvim!();
     let scratch = Scratch::new("client-centre-acd");
     let (sock, mut rpc, config) = session(&scratch, "client-centre-acd");
-    std::fs::write(
-        &config,
-        format!(
-            "{PREDICT_ON}centre = \"smart\"\nwindow_width = 50\n\n\
-             [effects.scroll]\nenabled = false\n"
-        ),
-    )
-    .expect("write the config");
+    let settings = "[client]\ncentre = \"smart\"\nwindow_width = 50\n\n\
+                    [effects.scroll]\nenabled = false\n";
     // A file's lines: 'autochdir' goes to the directory of the file the
     // current window shows.
     let file = scratch.0.join("text").join("lines.txt");
@@ -5190,7 +5187,8 @@ fn a_scroll_beside_text_run_on_past_the_edge_lands_with_autochdir() {
     )
     .expect("diagnostics");
     let slow = slow_link(&scratch.0.join("link"), &sock, SLOW);
-    let mut term = Terminal::spawn_sized(&slow, &config, DA1_REPLY, (160, 24));
+    let told = over_ssh(settings);
+    let mut term = Terminal::start(&slow, &config, Some(&told), DA1_REPLY, (160, 24));
     assert!(
         term.pump_until(Duration::from_secs(20), |s| s.contains("line 1 ")),
         "never drawn:\n{}",

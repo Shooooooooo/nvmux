@@ -141,7 +141,7 @@ use self::predict::{Command, Mode, Pos, Predictor, Proof, Rest, Side, Unseen, Wa
 use self::redraw::Event;
 use self::screen::Screen;
 use self::wire::{Arg, Inbox, Outbox};
-use crate::config::{Centre, PredictKeys};
+use crate::config::{Centre, Predictions};
 use crate::palette::{Palette, Rgb};
 
 /// The options that lay windows out, as the agent gives them: `'laststatus'`,
@@ -1798,8 +1798,9 @@ struct Partial {
 }
 
 impl App {
-    /// A client drawing with `effects`, predicting scrolls if `predict`
-    /// (see [`predict`]), on a terminal of `size`.
+    /// A client drawing with `effects`, predicting if `predict` (see
+    /// [`predict`]) — the scrolls alone till told otherwise (see
+    /// [`App::with_predictions`]) — on a terminal of `size`.
     pub fn new(term: Palette, effects: Effects, predict: bool, size: (usize, usize)) -> Self {
         Self {
             model: Model::new(term),
@@ -1875,11 +1876,11 @@ impl App {
         app
     }
 
-    /// This client, working out `keys` ahead of Neovim besides the scrolls,
-    /// where it predicts at all (see [`crate::config::PredictKeys`]).
-    pub fn with_predict_keys(mut self, keys: PredictKeys) -> Self {
+    /// This client, working out `predictions` ahead of Neovim, where it
+    /// predicts at all (see [`crate::config::Predictions`]).
+    pub fn with_predictions(mut self, predictions: Predictions) -> Self {
         if let Some(p) = self.predict.as_mut() {
-            p.set_keys(keys);
+            p.set_predictions(predictions);
         }
         self
     }
@@ -2505,7 +2506,7 @@ impl App {
             });
         }
         if let Some(p) = self.predict.as_mut() {
-            p.set_keys(client.predict_keys);
+            p.set_predictions(client.predictions());
         }
         let acks = self.predict.as_ref().is_some_and(Predictor::acks);
         let typing = self.predict.as_ref().is_some_and(Predictor::typing);
@@ -3300,6 +3301,9 @@ impl App {
         let Some(p) = self.predict.as_mut() else {
             return;
         };
+        // A turn of the wheel is a scroll, and left to Neovim with the rest
+        // where the scrolls are not predicted.
+        let scrolls = p.predictions.scrolls;
         let shape = self.model.wins.get(&grid).and_then(|w| p.shape(*w));
         let insert = Mode::of(&self.model.mode_name) == Mode::Insert;
         let (dir, sideways) = match way {
@@ -3315,6 +3319,7 @@ impl App {
         };
         let width = self.model.grids.get(&grid).map_or(0, |g| g.width() as i64);
         let command = match (shape, mods) {
+            _ if !scrolls => None,
             (Some(s), _) if s.mapped.contains(&name) => None,
             (Some(s), "") if sideways => Some((Command::Side(Side::Wheel(dir * s.hor)), By::Wheel)),
             (Some(_), "S" | "C") if sideways => {
@@ -3849,7 +3854,7 @@ impl App {
     /// can say what it does, and how Neovim draws it. Says whether it was.
     ///
     /// Only where the client types ahead of Neovim at all
-    /// ([`PredictKeys::Typing`]), from Neovim's last word on the keys and
+    /// (`[client] predict_typing`), from Neovim's last word on the keys and
     /// those followed since ([`Predictor::known`]), Neovim resting in Insert
     /// mode itself — not completing, nor in Replace mode; in a window whose
     /// rows and lines are one to one, not sliding by (see
@@ -3871,7 +3876,7 @@ impl App {
         let Some(p) = self
             .predict
             .as_ref()
-            .filter(|p| p.active() && p.keys >= PredictKeys::Typing && p.known())
+            .filter(|p| p.active() && p.typing() && p.known())
         else {
             return false;
         };
@@ -4097,7 +4102,7 @@ impl App {
         let Some(p) = self
             .predict
             .as_ref()
-            .filter(|p| p.active() && p.keys >= PredictKeys::Typing && p.known())
+            .filter(|p| p.active() && p.typing() && p.known())
         else {
             return false;
         };
@@ -6057,7 +6062,7 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
             settings.client.centre,
             usize::from(settings.client.window_width),
         )
-        .with_predict_keys(settings.client.predict_keys);
+        .with_predictions(settings.client.predictions());
     app.start();
     let mut inbox = Inbox::default();
     let stdin = std::io::stdin();
@@ -6376,10 +6381,22 @@ const FALLBACK: Palette = Palette {
 mod tests {
     use super::*;
     use crate::client::predict::PING_EVERY;
-    use crate::config::Predict;
     use rmpv::Value;
 
     type Call = (Option<u64>, String, Vec<Value>);
+
+    /// The motions as well as the scrolls, as `predict_motions = true` has
+    /// them; and the typing as well, with `predict_typing = true` too.
+    const MOTIONS: Predictions = Predictions {
+        scrolls: true,
+        motions: true,
+        typing: false,
+    };
+    const TYPING: Predictions = Predictions {
+        scrolls: true,
+        motions: true,
+        typing: true,
+    };
 
     fn palette() -> Palette {
         Palette {
@@ -6590,7 +6607,7 @@ mod tests {
     /// windows animated, and nothing predicted or centred.
     fn drawing() -> crate::config::Drawing {
         let mut d = crate::config::Drawing::default();
-        d.client.predict = Predict::Off;
+        d.client.predict_scrolls = false;
         d.effects.scroll.enabled = false;
         d
     }
@@ -6653,7 +6670,8 @@ mod tests {
         let t0 = Instant::now();
         let mut a = attached(false, t0);
         let mut d = drawing();
-        d.client.predict = Predict::On;
+        d.client.predict_scrolls = true;
+        d.remote = true;
         a.reconfigure(&d, t0);
         assert!(a.predict.is_some());
         let sent = calls(&mut a);
@@ -6664,14 +6682,14 @@ mod tests {
         );
     }
 
-    /// Told to predict as `"auto"` has it, a client predicts for a session
-    /// on another machine, and attaches again for the agent; for a session
-    /// on this one it predicts nothing, and attaches as it was.
+    /// Told to predict, a client predicts for a session on another machine,
+    /// and attaches again for the agent; for a session on this one it
+    /// predicts nothing, and attaches as it was.
     #[test]
-    fn a_client_told_to_predict_automatically_predicts_only_over_ssh() {
+    fn a_client_told_to_predict_predicts_only_over_ssh() {
         let t0 = Instant::now();
         let mut d = drawing();
-        d.client.predict = Predict::Auto;
+        d.client.predict_scrolls = true;
 
         let mut here = attached(false, t0);
         here.reconfigure(&d, t0);
@@ -7971,7 +7989,8 @@ mod tests {
         calls(&mut a);
         // Told to predict meanwhile, the client detaches to attach again.
         let mut d = drawing();
-        d.client.predict = Predict::On;
+        d.client.predict_scrolls = true;
+        d.remote = true;
         a.reconfigure(&d, t0 + Duration::from_millis(100));
         let sent = calls(&mut a);
         let detach = request(&sent, "nvim_ui_detach", "");
@@ -8103,14 +8122,15 @@ mod tests {
     /// left: one window of 20 × 5 over a buffer of 50 lines, `line 0` at the
     /// top, the cursor on it, in normal mode with the mouse on.
     fn predicting(rtt: Duration) -> App {
-        predicting_as(PredictKeys::Scrolls, rtt).0
+        predicting_as(Predictions::default(), rtt).0
     }
 
-    /// [`predicting`], working out `keys` ahead of Neovim besides the
-    /// scrolls; with the agent's request, unanswered.
-    fn predicting_as(keys: PredictKeys, rtt: Duration) -> (App, u64) {
+    /// [`predicting`], working out `predictions` ahead of Neovim; with the
+    /// agent's request, unanswered.
+    fn predicting_as(predictions: Predictions, rtt: Duration) -> (App, u64) {
         let t0 = Instant::now();
-        let mut a = App::new(palette(), Effects::none(), true, (20, 6)).with_predict_keys(keys);
+        let mut a =
+            App::new(palette(), Effects::none(), true, (20, 6)).with_predictions(predictions);
         a.start();
         let sent = calls(&mut a);
         answer(
@@ -8722,13 +8742,13 @@ mod tests {
     /// answered with nothing after it, and its word on none of the keys
     /// taken — the cursor at the start of `line 0` — taken at once.
     fn acking(rtt: Duration) -> App {
-        acking_as(PredictKeys::Motions, rtt)
+        acking_as(MOTIONS, rtt)
     }
 
-    /// [`acking`], working out `keys` ahead of Neovim.
-    fn acking_as(keys: PredictKeys, rtt: Duration) -> App {
+    /// [`acking`], working out `predictions` ahead of Neovim.
+    fn acking_as(predictions: Predictions, rtt: Duration) -> App {
         let t1 = Instant::now() + Duration::from_secs(1);
-        let (mut a, agent) = predicting_as(keys, rtt);
+        let (mut a, agent) = predicting_as(predictions, rtt);
         let wins = Value::Array(vec![Value::Array(vec![1000.into(), 1.into()])]);
         let options = Value::Array(vec![2.into(), false.into(), false.into(), wins]);
         answer(&mut a, agent, options, t1);
@@ -8811,20 +8831,21 @@ mod tests {
     fn the_agent_counts_keys_only_when_asked() {
         let t1 = Instant::now() + Duration::from_secs(1);
         for (keys, acks, eval) in [
-            (PredictKeys::Scrolls, false, "0"),
+            (Predictions::default(), false, "0"),
+            (MOTIONS, true, "luaeval('(_G.nvmux_taken or {})[7] or -1')"),
+            (TYPING, true, "luaeval('(_G.nvmux_taken or {})[7] or -1')"),
             (
-                PredictKeys::Motions,
-                true,
-                "luaeval('(_G.nvmux_taken or {})[7] or -1')",
-            ),
-            (
-                PredictKeys::Typing,
+                Predictions {
+                    scrolls: false,
+                    motions: false,
+                    typing: true,
+                },
                 true,
                 "luaeval('(_G.nvmux_taken or {})[7] or -1')",
             ),
         ] {
             let t0 = Instant::now();
-            let mut a = App::new(palette(), Effects::none(), true, (20, 6)).with_predict_keys(keys);
+            let mut a = App::new(palette(), Effects::none(), true, (20, 6)).with_predictions(keys);
             a.start();
             let sent = calls(&mut a);
             let rtt = Duration::from_millis(200);
@@ -8859,15 +8880,16 @@ mod tests {
         let t1 = Instant::now() + Duration::from_secs(1);
         let mut a = acking(Duration::from_millis(200));
         let mut d = drawing();
-        d.client.predict = Predict::On;
-        d.client.predict_keys = PredictKeys::Motions;
+        d.remote = true;
+        d.client.predict_scrolls = true;
+        d.client.predict_motions = true;
         a.reconfigure(&d, t1);
         let sent = calls(&mut a);
         assert!(
             !sent.iter().any(|(_, m, _)| m == "nvim_ui_detach"),
             "as it was"
         );
-        d.client.predict_keys = PredictKeys::Scrolls;
+        d.client.predict_motions = false;
         a.reconfigure(&d, t1);
         let detach = request(&calls(&mut a), "nvim_ui_detach", "");
         answer(&mut a, detach, Value::Nil, t1);
@@ -8887,7 +8909,7 @@ mod tests {
     #[test]
     fn a_fence_asked_before_the_agent_is_asked_again_once_it_is_there() {
         let t1 = Instant::now() + Duration::from_secs(1);
-        let (mut a, agent) = predicting_as(PredictKeys::Motions, Duration::from_millis(200));
+        let (mut a, agent) = predicting_as(MOTIONS, Duration::from_millis(200));
         a.tick(t1);
         let fence = request(&calls(&mut a), "nvim_eval", "luaeval");
         answer(&mut a, fence, Value::from(-1), t1);
@@ -9083,8 +9105,9 @@ mod tests {
         let mut a = acking(Duration::from_millis(200));
         a.keys(b"j", t1);
         let mut d = drawing();
-        d.client.predict = Predict::On;
-        d.client.predict_keys = PredictKeys::Motions;
+        d.remote = true;
+        d.client.predict_scrolls = true;
+        d.client.predict_motions = true;
         a.reconfigure(&d, t1);
         a.keys(b"\x05", t1);
         assert_eq!(top_row(&a), "line 0", "blind after `j`");
@@ -9156,13 +9179,13 @@ mod tests {
     /// it says something maps: the cursor moved ahead of Neovim along its
     /// line, `line 0` of `line 0` to `line 19`.
     fn stepping_with(rtt: Duration, mapped: &[&str]) -> App {
-        stepping_as(PredictKeys::Motions, rtt, mapped)
+        stepping_as(MOTIONS, rtt, mapped)
     }
 
-    /// [`stepping_with`], working out `keys` ahead of Neovim.
-    fn stepping_as(keys: PredictKeys, rtt: Duration, mapped: &[&str]) -> App {
+    /// [`stepping_with`], working out `predictions` ahead of Neovim.
+    fn stepping_as(predictions: Predictions, rtt: Duration, mapped: &[&str]) -> App {
         let t1 = Instant::now() + Duration::from_secs(1);
-        let mut a = acking_as(keys, rtt);
+        let mut a = acking_as(predictions, rtt);
         let shape: Vec<Value> = vec![
             1.into(),
             50.into(),
@@ -9764,6 +9787,49 @@ mod tests {
         );
         assert!(a.anim.chain(2).is_none(), "made");
         assert_eq!((top_row(&a), drawn(&a)), ("line 2".into(), (2, 0)));
+    }
+
+    /// The motions without the scrolls: a motion is drawn at once, and a key
+    /// that scrolls, or a turn of the wheel, waits for Neovim, as any other
+    /// key the client does not follow. The scrolls without the motions —
+    /// the typing on, for the agent to say what Neovim made of each key —
+    /// the other way about.
+    #[test]
+    fn the_motions_and_the_scrolls_are_switched_apart() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let apart = |scrolls: bool, motions: bool| {
+            let mut a = scrolling(Duration::from_millis(200));
+            let p = a.predict.as_mut().expect("predicting");
+            p.set_predictions(Predictions {
+                scrolls,
+                motions,
+                typing: !motions,
+            });
+            assert!(p.acks());
+            a
+        };
+        let mut a = apart(false, true);
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 1), "a motion before Neovim has heard of it");
+        a.keys(b"\x05", t1);
+        assert_eq!((top_row(&a), a.anim.ahead(2)), ("line 0".into(), (0, 0)));
+        let mut a = apart(false, true);
+        a.keys(b"\x1b[<65;3;2M", t1);
+        assert_eq!((top_row(&a), a.anim.ahead(2)), ("line 0".into(), (0, 0)));
+        let mut a = apart(true, false);
+        a.keys(b"\x1b[<65;3;2M", t1);
+        assert_eq!(top_row(&a), "line 3", "the wheel with the scrolls");
+
+        let mut a = apart(true, false);
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 0), "a motion left to Neovim");
+        let mut a = apart(true, false);
+        a.keys(b"\x05", t1);
+        assert_eq!(
+            top_row(&a),
+            "line 1",
+            "a scroll before Neovim has heard of it"
+        );
     }
 
     /// A page past the lines the client has is made, and held till they
@@ -11124,7 +11190,7 @@ mod tests {
     /// nothing in the buffer's Insert mode to type otherwise.
     fn typing(rtt: Duration) -> App {
         let t1 = Instant::now() + Duration::from_secs(1);
-        let mut a = stepping_as(PredictKeys::Typing, rtt, &[]);
+        let mut a = stepping_as(TYPING, rtt, &[]);
         facts(&mut a, |_| {}, t1);
         ack_i(&mut a, 0, "", 0, 1, t1);
         redraw(&mut a, typed_frame("line 0", 0), t1);
@@ -11189,7 +11255,7 @@ mod tests {
     #[test]
     fn the_keys_typed_while_i_is_on_its_way_appear_at_its_ack() {
         let t1 = Instant::now() + Duration::from_secs(1);
-        let mut a = stepping_as(PredictKeys::Typing, Duration::from_millis(200), &[]);
+        let mut a = stepping_as(TYPING, Duration::from_millis(200), &[]);
         a.keys(b"iab", t1);
         assert_eq!(composed(&mut a)[0], "line 0", "blind after `i`");
         ack_i(&mut a, 1, "i", 0, 1, t1);
@@ -11339,7 +11405,7 @@ mod tests {
     #[test]
     fn a_glyph_new_to_a_barred_line_is_drawn_over_the_bar() {
         let t1 = Instant::now() + Duration::from_secs(1);
-        let mut a = stepping_as(PredictKeys::Typing, Duration::from_millis(200), &[]);
+        let mut a = stepping_as(TYPING, Duration::from_millis(200), &[]);
         let mut shape = shaped(0, (false, false, true), (false, 2), &[], vec![]);
         shape[13] = true.into();
         let mut lcs = vec![Value::from(""); 10];
@@ -11505,7 +11571,7 @@ mod tests {
     /// mode, as `'guicursor'` has them by default.
     fn moding(rtt: Duration) -> App {
         let t1 = Instant::now() + Duration::from_secs(1);
-        let mut a = stepping_as(PredictKeys::Typing, rtt, &[]);
+        let mut a = stepping_as(TYPING, rtt, &[]);
         facts(&mut a, |_| {}, t1);
         let mode = |name: &str, shape: &str| {
             Value::Map(vec![

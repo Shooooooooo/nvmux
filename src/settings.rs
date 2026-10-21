@@ -13,10 +13,7 @@
 
 use std::sync::LazyLock;
 
-use crate::config::{
-    Centre, ParticleMode, Predict, PredictKeys, Settings, ThemeColor, Ui, MAX_FADE_MS,
-    MAX_TIMEOUT_MS,
-};
+use crate::config::{Centre, ParticleMode, Settings, ThemeColor, Ui, MAX_FADE_MS, MAX_TIMEOUT_MS};
 use crate::keys::BINDINGS;
 
 /// The screen's tabs. Each is a table of the file, but for the keys: their
@@ -346,33 +343,24 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
         ),
         own(row(
             "client",
-            "predict",
+            "predict_scrolls",
             Tab::Client,
-            "over a slow link, scrolls show before Neovim answers; auto: over ssh",
-            Kind::Choice {
-                options: &["auto", "on", "off"],
-                get: |s| s.client.predict.name(),
-                set: |s, name| {
-                    if let Some(way) = Predict::ALL.into_iter().find(|w| w.name() == name) {
-                        s.client.predict = way;
-                    }
-                },
-            },
+            "over ssh, scrolls show before Neovim answers",
+            switch!(client.predict_scrolls),
         )),
         own(row(
             "client",
-            "predict_keys",
+            "predict_motions",
             Tab::Client,
-            "experimental: motions show the cursor moved, typing the text typed, before Neovim too",
-            Kind::Choice {
-                options: &["scrolls", "motions", "typing"],
-                get: |s| s.client.predict_keys.name(),
-                set: |s, name| {
-                    if let Some(keys) = PredictKeys::ALL.into_iter().find(|k| k.name() == name) {
-                        s.client.predict_keys = keys;
-                    }
-                },
-            },
+            "experimental: over ssh, cursor motions show before Neovim answers",
+            switch!(client.predict_motions),
+        )),
+        own(row(
+            "client",
+            "predict_typing",
+            Tab::Client,
+            "experimental: over ssh, what is typed shows before Neovim answers",
+            switch!(client.predict_typing),
         )),
         own(row(
             "client",

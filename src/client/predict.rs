@@ -97,21 +97,22 @@
 //!
 //! # What Neovim says it made of each key
 //!
-//! Told to work out more than the scrolls (`[client] predict_keys`), the
-//! client has the agent count the keys Neovim takes, as it takes them, and
-//! say, each time Neovim goes to wait for a key with every key typed taken
-//! and nothing pending, how many it has taken, the last few of them, and
-//! where they left the cursor, the view and the mode ([`Ack`]) — just ahead
-//! of the frame that draws them, with which the client takes it. The client
-//! numbers the keys it sends the same way ([`Typed::seq`]) and ties the two
-//! counts where nothing can be in doubt: at a fence answered with nothing
-//! sent after it, which Neovim answers only once it has taken every key
-//! before it. It checks them at every ack and fence after, and what it
-//! cannot account for puts them in doubt till the next such fence
-//! ([`Sync`]). So each ack is Neovim's last word on the client's keys up to
-//! one of them — what the client would have made of them can be judged by
-//! it, key by key — and how long that word takes to come is how long a
-//! prediction is waited for ([`Predictor::deadline`]).
+//! Told to work out the motions or the typing (`[client] predict_motions`
+//! and `predict_typing`), the client has the agent count the keys Neovim
+//! takes, as it takes them, and say, each time Neovim goes to wait for a
+//! key with every key typed taken and nothing pending, how many it has
+//! taken, the last few of them, and where they left the cursor, the view
+//! and the mode ([`Ack`]) — just ahead of the frame that draws them, with
+//! which the client takes it. The client numbers the keys it sends the same
+//! way ([`Typed::seq`]) and ties the two counts where nothing can be in
+//! doubt: at a fence answered with nothing sent after it, which Neovim
+//! answers only once it has taken every key before it. It checks them at
+//! every ack and fence after, and what it cannot account for puts them in
+//! doubt till the next such fence ([`Sync`]). So each ack is Neovim's last
+//! word on the client's keys up to one of them — what the client would have
+//! made of them can be judged by it, key by key — and how long that word
+//! takes to come is how long a prediction is waited for
+//! ([`Predictor::deadline`]).
 //!
 //! The scrolls go by it. A key the client predicts no longer leaves it
 //! unsure of the next, nor one it cannot follow of every key after it till
@@ -160,7 +161,7 @@ use super::grid::{Cell, Text};
 use super::moves;
 use super::redraw;
 use super::typing;
-use crate::config::PredictKeys;
+use crate::config::Predictions;
 
 /// Predictions start once the smoothed round trip reaches this, and stop
 /// once it falls back under [`OFF`]: the gap keeps a link that hovers about
@@ -2210,10 +2211,10 @@ pub struct Typed {
     /// Every input sent, numbered as the agent counts the keys Neovim takes
     /// (see [`Sync`]): a key of `nvim_input` one, an `nvim_input_mouse` one.
     seq: u64,
-    /// Which keys the client works out ahead of Neovim: past the scrolls,
-    /// it goes by what the agent says Neovim made of each key, not by
-    /// fences.
-    keys: PredictKeys,
+    /// What the client works out ahead of Neovim: with the motions or the
+    /// typing, it goes by what the agent says Neovim made of each key, not
+    /// by fences.
+    predictions: Predictions,
     /// Where it does, whether an input since Neovim's last word is one it
     /// does not know what Neovim makes of.
     blind: bool,
@@ -2295,20 +2296,21 @@ impl Typed {
                     self.state = State::Z(count);
                     return None;
                 }
-                let motions = self.keys >= PredictKeys::Motions;
+                let motions = self.predictions.motions;
                 if motions && key == "g" {
                     self.state = State::G(count);
                     return None;
                 }
                 let enter = typing::Enter::of(key)
-                    .filter(|_| self.keys >= PredictKeys::Typing && count.is_none_or(|n| n == 1));
+                    .filter(|_| self.predictions.typing && count.is_none_or(|n| n == 1));
                 if let Some(e) = enter.filter(|_| !mapped(key)) {
                     self.state = State::Insert { x: false };
                     self.whole = true;
                     self.once = true;
                     return Some(Command::Enter(e));
                 }
-                let command = scroll(key, count).or_else(|| {
+                let scrolls = self.predictions.scrolls;
+                let command = scroll(key, count).filter(|_| scrolls).or_else(|| {
                     let motion = moves::motion(key).filter(|_| motions)?;
                     Some(Command::Move {
                         motion,
@@ -2358,7 +2360,8 @@ impl Typed {
                     "e" => Some(Side::End),
                     _ => None,
                 };
-                if let Some(side) = side.filter(|_| !mapped(&format!("z{key}"))) {
+                let scrolls = self.predictions.scrolls;
+                if let Some(side) = side.filter(|_| scrolls && !mapped(&format!("z{key}"))) {
                     self.state = State::Ready(None);
                     self.whole = true;
                     return Some(Command::Side(side));
@@ -2366,7 +2369,7 @@ impl Typed {
                 let command = Z
                     .iter()
                     .position(|z| *z == key)
-                    .filter(|_| !mapped(&format!("z{key}")));
+                    .filter(|_| scrolls && !mapped(&format!("z{key}")));
                 match command {
                     Some(i) => {
                         self.state = State::Ready(None);
@@ -2398,7 +2401,8 @@ impl Typed {
     /// A key typed in insert mode, after a `<C-x>` if `x`.
     fn insert_key(&mut self, key: &str, x: bool, mapped: impl Fn(&str) -> bool) -> Option<Command> {
         let plain = !mapped(key);
-        if x && plain {
+        let scrolls = self.predictions.scrolls;
+        if x && plain && scrolls {
             match key {
                 "<C-e>" => return Some(Command::Lines(1)),
                 "<C-y>" => return Some(Command::Lines(-1)),
@@ -2406,8 +2410,7 @@ impl Typed {
             }
         }
         if plain {
-            if let Some(command) = INSERT_SCROLLS
-                .contains(&key)
+            if let Some(command) = (scrolls && INSERT_SCROLLS.contains(&key))
                 .then(|| scroll(key, None))
                 .flatten()
             {
@@ -2423,7 +2426,7 @@ impl Typed {
         // Text typed, or taken out, where the client types ahead of Neovim:
         // whether a mapping, or anything else, makes it do more is for the
         // client to say as it makes it (see `typing::refused`).
-        let typing = !x && self.keys >= PredictKeys::Typing;
+        let typing = !x && self.predictions.typing;
         if let Some(e) = typing::Edit::of(key).filter(|_| typing) {
             self.state = State::Insert { x: false };
             self.whole = true;
@@ -2521,7 +2524,7 @@ impl Typed {
     /// not know what Neovim makes of the input made out last, and so of
     /// none after it, till an ack covers it.
     pub fn blinded(&mut self) {
-        if self.keys >= PredictKeys::Motions {
+        if self.predictions.acks() {
             self.blind = true;
         }
     }
@@ -2557,12 +2560,12 @@ impl Typed {
         !self.blind && self.state != State::Lost
     }
 
-    /// Work out `keys` ahead of Neovim from here on: see [`Typed::keys`].
-    /// Blind or not, the client stays as it is: from the scrolls alone, it
-    /// is not; to them, it does not matter; and between the motions and
-    /// the typing, what it does not know of a key it still does not.
-    pub fn set_keys(&mut self, keys: PredictKeys) {
-        self.keys = keys;
+    /// Work out `predictions` ahead of Neovim from here on: see
+    /// [`Typed::predictions`]. Blind or not, the client stays as it is:
+    /// from the scrolls alone, it is not; to them, it does not matter; and
+    /// between any others, what it does not know of a key it still does not.
+    pub fn set_predictions(&mut self, predictions: Predictions) {
+        self.predictions = predictions;
     }
 
     /// A fresh attach: nothing is known of what is pending.
@@ -2627,7 +2630,7 @@ impl Typed {
     /// key, its word settles that instead (see [`Typed::rebase`]): a frame
     /// may be one Neovim drew part way through the keys.
     pub fn settle(&mut self, mode: Mode) {
-        if self.keys >= PredictKeys::Motions {
+        if self.predictions.acks() {
             return;
         }
         if self.drawn == self.sent && self.state == State::Lost {
@@ -3501,9 +3504,9 @@ pub struct Predictor {
     pinged: Option<Instant>,
     /// What the client makes of the keys it sends.
     pub typed: Typed,
-    /// Which keys it works out ahead of Neovim besides the scrolls: past
-    /// those, the agent says what Neovim made of each key ([`Ack`]).
-    pub keys: PredictKeys,
+    /// What it works out ahead of Neovim: with the motions or the typing,
+    /// the agent says what Neovim made of each key ([`Ack`]).
+    pub predictions: Predictions,
     /// The client's numbers for its inputs, tied to the agent's count.
     pub sync: Sync,
     /// Neovim's last word on the keys, and the inputs sent since, oldest
@@ -3566,21 +3569,21 @@ impl Predictor {
     }
 
     /// Whether the agent says what Neovim made of each key: see
-    /// [`Predictor::keys`].
+    /// [`Predictor::predictions`].
     pub fn acks(&self) -> bool {
-        self.keys >= PredictKeys::Motions
+        self.predictions.acks()
     }
 
     /// Whether the client types ahead of Neovim, and the agent says what
     /// bears on it (see [`typing::Facts`]).
     pub fn typing(&self) -> bool {
-        self.keys >= PredictKeys::Typing
+        self.predictions.typing
     }
 
-    /// Work out `keys` ahead of Neovim from here on, besides the scrolls.
-    pub fn set_keys(&mut self, keys: PredictKeys) {
-        self.keys = keys;
-        self.typed.set_keys(keys);
+    /// Work out `predictions` ahead of Neovim from here on.
+    pub fn set_predictions(&mut self, predictions: Predictions) {
+        self.predictions = predictions;
+        self.typed.set_predictions(predictions);
     }
 
     /// Whether what the inputs since Neovim's last word make can be worked
@@ -4325,6 +4328,19 @@ fn lossy(v: &ValueRef<'_>) -> String {
 mod tests {
     use super::*;
     use rmpv::Value;
+
+    /// The motions as well as the scrolls, as `predict_motions = true` has
+    /// them; and the typing as well, with `predict_typing = true` too.
+    const MOTIONS: Predictions = Predictions {
+        scrolls: true,
+        motions: true,
+        typing: false,
+    };
+    const TYPING: Predictions = Predictions {
+        scrolls: true,
+        motions: true,
+        typing: true,
+    };
 
     fn shape() -> Shape {
         Shape {
@@ -6952,7 +6968,7 @@ mod tests {
     #[test]
     fn ctrl_c_puts_the_count_in_doubt_until_a_quiet_fence() {
         let mut p = Predictor {
-            keys: PredictKeys::Motions,
+            predictions: MOTIONS,
             sync: tied(0, 0),
             ..Predictor::default()
         };
@@ -7114,7 +7130,7 @@ mod tests {
     /// rested in Normal mode by an ack covering input 0.
     fn acked() -> Typed {
         let mut t = Typed::default();
-        t.set_keys(PredictKeys::Motions);
+        t.set_predictions(MOTIONS);
         t.rebase(Rest::Normal);
         t
     }
@@ -7133,7 +7149,7 @@ mod tests {
         }
         assert!(!t.wants_fence());
         let mut p = Predictor::default();
-        p.set_keys(PredictKeys::Motions);
+        p.set_predictions(MOTIONS);
         p.sync = tied(0, 0);
         p.base = Some(Base {
             seq: 0,
@@ -7324,7 +7340,7 @@ mod tests {
     fn a_queue_neovim_never_answers_is_let_go() {
         let t0 = Instant::now();
         let mut p = Predictor {
-            keys: PredictKeys::Motions,
+            predictions: MOTIONS,
             sync: tied(0, 0),
             ..Predictor::default()
         };
@@ -7353,7 +7369,7 @@ mod tests {
         let ms = Duration::from_millis;
         let t0 = Instant::now();
         let mut p = Predictor {
-            keys: PredictKeys::Motions,
+            predictions: MOTIONS,
             sync: tied(0, 0),
             ..Predictor::default()
         };
@@ -7370,7 +7386,7 @@ mod tests {
         p.heard(&ack(1, "j"), t0 + ms(5000));
         assert_eq!(p.lag, Some((ms(900), ms(450))), "the same key, timed once");
         assert_eq!(p.want(1000), Some(0), "and the column the cursor wants");
-        p.keys = PredictKeys::Scrolls;
+        p.predictions = Predictions::default();
         assert_eq!(p.deadline(t0) - t0, round, "told not to count any more");
     }
 
@@ -7383,7 +7399,7 @@ mod tests {
         let ms = Duration::from_millis;
         let t0 = Instant::now();
         let mut p = Predictor {
-            keys: PredictKeys::Motions,
+            predictions: MOTIONS,
             sync: tied(0, 0),
             ..Predictor::default()
         };
@@ -7412,7 +7428,7 @@ mod tests {
     #[test]
     fn a_character_typed_is_typed_ahead_and_one_a_mapping_starts_may_wait() {
         let mut p = Predictor::default();
-        p.set_keys(PredictKeys::Typing);
+        p.set_predictions(TYPING);
         said(&mut p, "shape", shape_args(50));
         let classes: String = (0..256).map(|_| '1').collect();
         let facts: Vec<Value> = vec![
@@ -7452,7 +7468,7 @@ mod tests {
             p.key(Some(1000), "<BS>"),
             Some(Command::Type(typing::Edit::Rub))
         );
-        p.set_keys(PredictKeys::Motions);
+        p.set_predictions(MOTIONS);
         p.typed.rebase(Rest::Insert);
         assert_eq!(p.key(Some(1000), "x"), None);
     }
@@ -7488,7 +7504,7 @@ mod tests {
     #[test]
     fn insert_mode_is_entered_and_left_by_keys_with_no_count() {
         let mut t = acked();
-        t.set_keys(PredictKeys::Typing);
+        t.set_predictions(TYPING);
         use typing::Enter;
         let cmds = typed(&mut t, "ifoo<Esc>1A<Esc>I<Esc>");
         assert_eq!(
@@ -7523,9 +7539,62 @@ mod tests {
             2,
             "not after a command from Insert mode: {cmds:?}"
         );
-        t.set_keys(PredictKeys::Motions);
+        t.set_predictions(MOTIONS);
         t.rebase(Rest::Normal);
         assert_eq!(typed(&mut t, "i<Esc>"), [], "the motions alone");
+    }
+
+    /// Each kind is made by a switch of its own, whichever of the others is
+    /// on: a key of a kind switched off is one the client is blind to, as
+    /// any other it does not follow.
+    #[test]
+    fn each_kind_is_made_by_its_own_switch() {
+        let only = |scrolls, motions, typing| {
+            let mut t = Typed::default();
+            t.set_predictions(Predictions {
+                scrolls,
+                motions,
+                typing,
+            });
+            t.rebase(Rest::Normal);
+            t
+        };
+        let scroll = Command::Lines(1);
+        let down = Command::Move {
+            motion: moves::Motion::Down,
+            count: None,
+            screen: false,
+        };
+        // The motions alone: no scroll, by its own key, a `z` or in Insert
+        // mode.
+        let mut t = only(false, true, false);
+        assert_eq!(typed(&mut t, "j"), [down]);
+        assert!(!t.blind);
+        assert_eq!(typed(&mut t, "<C-e>"), []);
+        assert!(t.blind, "a scroll left to Neovim");
+        t.rebase(Rest::Normal);
+        assert_eq!(typed(&mut t, "zt"), []);
+        t.rebase(Rest::Insert);
+        assert_eq!(typed(&mut t, "<PageDown><C-x><C-e>"), []);
+        // The typing alone: what is typed, and the keys in and out of Insert
+        // mode, but neither a motion nor a scroll.
+        let mut t = only(false, false, true);
+        assert_eq!(typed(&mut t, "j"), []);
+        t.rebase(Rest::Normal);
+        assert_eq!(
+            typed(&mut t, "ix<PageDown>"),
+            [
+                Command::Enter(typing::Enter::Before),
+                Command::Type(typing::Edit::Char('x')),
+            ]
+        );
+        // The scrolls and the typing: a scroll still made, a motion not.
+        let mut t = only(true, false, true);
+        assert_eq!(typed(&mut t, "<C-e>j"), [scroll]);
+        // The scrolls and the motions: what is typed left to Neovim.
+        let mut t = only(true, true, false);
+        assert_eq!(typed(&mut t, "<C-e>j"), [scroll, down]);
+        assert_eq!(typed(&mut t, "ix"), []);
     }
 
     /// The lines whose characters Neovim 0.12.6 was found to step over

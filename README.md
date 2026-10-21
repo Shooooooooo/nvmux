@@ -259,13 +259,14 @@ settings = ","       # change nvmux's settings while it runs
 command = "nvim --headless --listen {sock}"   # {sock} is required
 
 [client]
-ui             = "nvmux"    # who draws a session: nvmux's own client, animated; or "nvim"
-per_session    = true       # keep each session's client; a switch back reuses it
-lazy           = false      # start every client at launch, and after a dropped link; true waits for visits
-predict        = "auto"     # over ssh, scrolls show before Neovim answers; "on" over any slow link
-predict_keys   = "scrolls"  # experimental: "motions" shows the cursor moved, "typing" the text typed, before Neovim too
-centre         = "off"      # on a wide terminal, each window's text in its middle: "smart" or "fixed"
-window_width   = 120        # with centre on, how many columns a window's text gets; 0 for no limit
+ui              = "nvmux"  # who draws a session: nvmux's own client, animated; or "nvim"
+per_session     = true     # keep each session's client; a switch back reuses it
+lazy            = false    # start every client at launch, and after a dropped link; true waits for visits
+predict_scrolls = true     # over ssh, scrolls show before Neovim answers
+predict_motions = false    # experimental: over ssh, h, j, $ and their kind move the cursor before Neovim answers
+predict_typing  = false    # experimental: over ssh, what is typed in Insert mode shows before Neovim answers
+centre          = "off"    # on a wide terminal, each window's text in its middle: "smart" or "fixed"
+window_width    = 120      # with centre on, how many columns a window's text gets; 0 for no limit
 
 [style]
 color = "terminal"   # or "#rrggbb": nvmux's text and bars in that colour; dim text stays dim
