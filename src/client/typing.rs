@@ -891,6 +891,8 @@ mod tests {
                 concealing: false,
                 classes: Vec::new(),
                 lmap: false,
+                sections: None,
+                paragraphs: None,
             }),
         }
     }

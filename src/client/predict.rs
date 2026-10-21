@@ -314,6 +314,11 @@ pub struct Stepping {
     /// The buffer's `'iminsert'` 1: `:lmap` mappings take the character
     /// typed after `f` and its kind for another.
     pub lmap: bool,
+    /// `'sections'` and `'paragraphs'`, the macros that start a section or
+    /// a paragraph on a line after a `.`: `None` where the agent does not
+    /// say.
+    pub sections: Option<String>,
+    pub paragraphs: Option<String>,
 }
 
 /// What `'cursorline'` draws of the cursor's line, as `'cursorlineopt'` has
@@ -411,6 +416,14 @@ impl Stepping {
             .any(|v| !matches!(v, "" | "block" | "none" | "NONE"));
         !virtual_edit && !self.cursorcolumn && !self.bound && !self.langmap
     }
+
+    /// What `'sections'` and `'paragraphs'` name, where the agent says.
+    pub fn macros(&self) -> Option<moves::Macros<'_>> {
+        Some(moves::Macros {
+            sections: self.sections.as_deref()?,
+            paragraphs: self.paragraphs.as_deref()?,
+        })
+    }
 }
 
 impl Shape {
@@ -422,7 +435,7 @@ impl Shape {
     /// made of each key, `[whichwrap, virtualedit, cursorcolumn, bound,
     /// langmap, widths, numberwidth, number_signs, cursorline, idioms,
     /// own_highlights, conceals, colorcolumn, scrolljump, concealing,
-    /// classes, lmap]` after them (see [`Stepping`]):
+    /// classes, lmap, sections, paragraphs]` after them (see [`Stepping`]):
     /// `numberwidth` no more than Neovim lets it be, `cursorline` as
     /// [`Cursorline::read`] has it, and `idioms` a list of
     /// [`Idiom::read`]'s.
@@ -490,6 +503,8 @@ impl Shape {
                 concealing: flag(39),
                 classes: text(40).bytes().map(|b| b.saturating_sub(b'0')).collect(),
                 lmap: flag(41),
+                sections: v.get(42).and_then(redraw::as_str).map(String::from),
+                paragraphs: v.get(43).and_then(redraw::as_str).map(String::from),
             }),
         })
     }
@@ -4152,6 +4167,7 @@ impl Predictor {
             scrolljump: shape.stepping.as_ref().map(|s| s.scrolljump),
             keyword: shape.stepping.as_ref().map(|s| s.classes.as_slice()),
             lmap: shape.stepping.as_ref().map(|s| s.lmap),
+            macros: shape.stepping.as_ref().and_then(Stepping::macros),
         };
         motions
             .into_iter()
@@ -4524,6 +4540,8 @@ mod tests {
                 concealing: false,
                 classes: Vec::new(),
                 lmap: false,
+                sections: None,
+                paragraphs: None,
             }),
             ..shape()
         }
@@ -7664,6 +7682,31 @@ mod tests {
             assert!(made.is_empty(), "{keys}");
             assert!(t.blind, "{keys}");
         }
+    }
+
+    /// `}` and `{` are followed as the other motions are, with their
+    /// counts, and left to Neovim, the client blind to them, where something
+    /// maps them.
+    #[test]
+    fn motions_by_paragraphs_are_followed() {
+        let para = |back, count| Command::Move {
+            motion: moves::Motion::Paragraph { back },
+            count,
+            screen: false,
+        };
+        let mut t = Typed::default();
+        t.set_predictions(MOTIONS);
+        t.rebase(Rest::Normal);
+        assert_eq!(
+            typed(&mut t, "}3{"),
+            [para(false, None), para(true, Some(3))]
+        );
+        assert!(!t.blind);
+        let mut t = Typed::default();
+        t.set_predictions(MOTIONS);
+        t.rebase(Rest::Normal);
+        assert_eq!(t.key("}", |_, key| key == "}"), None);
+        assert!(t.blind);
     }
 
     /// `f`, `t`, `F` and `T` wait for the character to look for, with the

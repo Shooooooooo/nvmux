@@ -556,9 +556,9 @@ if predict then
     -- for the line and four for the screen line; whether the window has
     -- highlights of its own, or conceals what the cursor's line shows; the
     -- columns 'colorcolumn' colours; 'scrolljump'; whether it may conceal
-    -- text on any line; what 'iskeyword' makes of each character; and
-    -- whether :lmap mappings take the character typed after f and its kind
-    -- for another, 'iminsert' 1.
+    -- text on any line; what 'iskeyword' makes of each character; whether
+    -- :lmap mappings take the character typed after f and its kind for
+    -- another, 'iminsert' 1; and 'sections' and 'paragraphs'.
     if acks then
       local widths = vim.o.ambiwidth == 'double' or #vim.fn.getcellwidths() > 0
         or not vim.o.emoji
@@ -576,7 +576,7 @@ if predict then
         vim.wo.winhighlight ~= '' or not got or ns > 0,
         vim.wo.conceallevel > 0 and not vim.wo.concealcursor:find('n'),
         colorcolumn(info.winid), vim.o.scrolljump, vim.wo.conceallevel > 0, classes(buf),
-        vim.bo[buf].iminsert == 1 })
+        vim.bo[buf].iminsert == 1, vim.o.sections, vim.o.paragraphs })
     end
     return s
   end
@@ -1237,7 +1237,8 @@ if predict then
     au('OptionSet', { pattern = { 'whichwrap', 'virtualedit', 'cursorcolumn', 'scrollbind',
       'cursorbind', 'langmap', 'ambiwidth', 'emoji', 'cursorline', 'cursorlineopt',
       'winhighlight', 'conceallevel', 'concealcursor', 'colorcolumn', 'textwidth',
-      'vartabstop', 'scrolljump', 'iskeyword', 'iminsert' } }, function()
+      'vartabstop', 'scrolljump', 'iskeyword', 'iminsert', 'sections',
+      'paragraphs' } }, function()
       soon()
     end)
   end
@@ -3445,6 +3446,7 @@ impl App {
             scrolljump: Some(stepping.scrolljump),
             keyword: Some(&stepping.classes),
             lmap: Some(stepping.lmap),
+            macros: stepping.macros(),
         };
         let Some(to) = moves::moved(motion, count, &from, &cx) else {
             return false;
@@ -4837,6 +4839,7 @@ impl App {
             scrolljump: Some(stepping.scrolljump),
             keyword: Some(&stepping.classes),
             lmap: Some(stepping.lmap),
+            macros: stepping.macros(),
         };
         let pos = if how == moves::Landing::First || to.cursor != at.cursor {
             moves::onto(to.cursor, how, to.top, &from, &cx)?

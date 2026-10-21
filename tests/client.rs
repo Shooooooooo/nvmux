@@ -2427,6 +2427,22 @@ fn motions_to_a_character_show_at_once() {
     }
 }
 
+/// `}` and `{` typed over a slow link to a real Neovim, with counts: on to
+/// the empty line that ends a paragraph and past the last to the buffer's
+/// last character, and back to the buffer's first line, onto its tab — on
+/// the screen before Neovim could have heard of them, and where Neovim's
+/// own frame puts the cursor.
+#[test]
+fn motions_by_paragraphs_show_at_once() {
+    require_nvim!();
+    let scratch = Scratch::new("client-paras-at");
+    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, "client-paras-at", MOVING, MOTIONS);
+    term.pump_until(Duration::from_secs(4), |s| s.contains("one"));
+    for name in ["}", "}", "{", "{", "2}", "2{"] {
+        predicted(&mut term, name, name.as_bytes());
+    }
+}
+
 /// `f` mapped — as plugins that jump to a character map it — is left to
 /// Neovim; and so is the character typed after `t` where `:lmap` mappings
 /// may take it for another, `'iminsert'` turned on with the client
@@ -3525,6 +3541,30 @@ fn random_motions_by_words_past_the_edges_show_nothing_neovim_never_drew() {
 fn random_motions_to_a_character_show_nothing_neovim_never_drew() {
     require_nvim!();
     random_motions("client-fuzz-f", "set nu rnu", FIND_KEYS, FIND_COUNTED);
+}
+
+/// [`random_motions_by_words_past_the_edges_show_nothing_neovim_never_drew`]
+/// by paragraphs, `}` and `{`, counted too, over lines whose paragraphs end
+/// in empty lines, and lines of blanks between, which end none: those that
+/// take the cursor past the window's edge scroll the view with it, as
+/// Neovim does.
+#[test]
+fn random_motions_by_paragraphs_show_nothing_neovim_never_drew() {
+    require_nvim!();
+    const KEYS: &[(&[u8], &str)] = &[
+        (b"}", "}"),
+        (b"{", "{"),
+        (b"}", "}"),
+        (b"{", "{"),
+        (b"j", "j"),
+        (b"k", "k"),
+        (b"$", "$"),
+        (b"0", "0"),
+    ];
+    const COUNTED: &[&str] = &["}", "{", "j", "k"];
+    let mut rng = Lcg(17);
+    let keys = random_keys(&mut rng, KEYS, COUNTED);
+    sights_compared("client-fuzz-p", SCROLLED, MOTIONS, &keys, rng, false);
 }
 
 /// `f`, `t`, `F` and `T`, each with a character to look for, as the
@@ -6172,4 +6212,95 @@ fn motions_to_a_character_go_where_neovim_takes_them() {
         }
     }
     assert!(checked > 5000, "{checked}");
+}
+
+/// Lines to go by paragraphs over: paragraphs a line long and longer, empty
+/// lines alone and in a run, a line of blanks alone, which is none, lines
+/// that start with `.` and a macro of `'paragraphs'` or `'sections'` — and
+/// with a `.` that starts none, as a stylesheet's do — and with a form
+/// feed.
+const PARAS: &[&str] = &[
+    "first paragraph",
+    "goes on here",
+    "",
+    "",
+    "   ",
+    "second, after blanks alone",
+    "\tand a tab",
+    ".PP",
+    "after a macro of 'paragraphs'",
+    ".SH a section",
+    ".container {",
+    "  color: red;",
+    "}",
+    ".pp-header {",
+    "\x0cform feed",
+    "x",
+    "",
+    ".P",
+    ".",
+    "last line",
+];
+
+/// What the client makes of `}` and `{` is what a real Neovim makes of
+/// them, from every line of [`PARAS`], with nothing after the last line
+/// and with an empty one, once, twice, three and seven times, with
+/// `'paragraphs'` and `'sections'` at their defaults, empty, and naming
+/// `co`: the line it lands on, and the character.
+#[test]
+fn motions_by_paragraphs_go_where_neovim_takes_them() {
+    use nvmux::client::moves;
+    require_nvim!();
+    let scratch = Scratch::new("client-paras");
+    let (_sock, mut rpc, _config) = session(&scratch, "client-paras");
+    let counts = [1i64, 2, 3, 7];
+    let mut checked = 0;
+    for (tail, (paragraphs, sections)) in [
+        (None, ("IPLPPPQPP TPHPLIPpLpItpplpipbp", "SHNHH HUnhsh")),
+        (Some(""), ("IPLPPPQPP TPHPLIPpLpItpplpipbp", "SHNHH HUnhsh")),
+        (None, ("", "")),
+        (None, ("co", "P")),
+    ] {
+        let lines: Vec<&str> = PARAS.iter().copied().chain(tail).collect();
+        let text = |l: i64| usize::try_from(l).ok().and_then(|l| lines.get(l)).copied();
+        let set = Value::Array(lines.iter().map(|&l| Value::from(l)).collect());
+        rpc.call(
+            "nvim_buf_set_lines",
+            vec![0.into(), 0.into(), (-1).into(), false.into(), set],
+        )
+        .expect("set the lines");
+        rpc.command("setlocal noswapfile").expect("noswapfile");
+        for (name, value) in [("paragraphs", paragraphs), ("sections", sections)] {
+            rpc.call(
+                "nvim_set_option_value",
+                vec![name.into(), value.into(), Value::Map(vec![])],
+            )
+            .expect("set the option");
+        }
+        let starts: Vec<(i64, usize)> = (0..lines.len() as i64).map(|l| (l, 0)).collect();
+        let keys = ["}", "{"];
+        let mut theirs = neovims_motions(&mut rpc, &starts, &keys, &counts).into_iter();
+        let macros = moves::Macros {
+            sections,
+            paragraphs,
+        };
+        for &(line, byte) in &starts {
+            for key in keys {
+                for &n in &counts {
+                    let neovims = theirs.next().expect("as many");
+                    let count = lines.len() as i64;
+                    let ours = moves::paragraph(key == "{", n, line, count, &text, macros)
+                        .expect("followed")
+                        .unwrap_or((line, byte));
+                    assert_eq!(
+                        ours, neovims,
+                        "{n}{key} from {line}, paragraphs={paragraphs:?} sections={sections:?}, \
+                         after the last {tail:?}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 300, "{checked}");
 }

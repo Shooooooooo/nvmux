@@ -30,10 +30,13 @@
 //! - `w`, `b`, `e` and `ge`, and `W`, `B`, `E` and `gE`, and the arrows
 //!   with Shift or Ctrl that make some of them, by words, from line to line
 //!   where they go on past one's end (see [`super::words`]);
-//! - and `f`, `t`, `F` and `T` along the line to the character typed after
+//! - `f`, `t`, `F` and `T` along the line to the character typed after
 //!   them — the one counted of those, on or back — or till it, stopping on
 //!   the character before; one that finds too few goes nowhere, leaving
 //!   the column the cursor wants as it was;
+//! - and `}` and `{` by paragraphs, to the empty line after the next or
+//!   before the last, or the line `'paragraphs'` and `'sections'` start one
+//!   with (see [`paragraph`]);
 //!
 //! — and after a move sideways the cursor wants the column it is drawn in:
 //! a character's first, or a tab's last. A motion that takes the cursor up
@@ -100,6 +103,10 @@ pub enum Motion {
         till: bool,
         back: bool,
     },
+    /// `}` on past a paragraph, `{` `back` past one: see [`paragraph`].
+    Paragraph {
+        back: bool,
+    },
 }
 
 /// The motion a key typed in Normal mode makes, if it is one followed here:
@@ -143,6 +150,7 @@ pub fn motion(key: &str) -> Option<Motion> {
             way: Way::End,
             big: key == "E",
         },
+        "}" | "{" => Motion::Paragraph { back: key == "{" },
         _ => return None,
     })
 }
@@ -277,6 +285,9 @@ pub struct Ctx<'a> {
     /// `'whichwrap'`: where they may, or the client does not know, a motion
     /// to a character is not followed.
     pub lmap: Option<bool>,
+    /// The macros `'sections'` and `'paragraphs'` name, as `'whichwrap'`:
+    /// not knowing them, a motion by paragraphs is not followed.
+    pub macros: Option<Macros<'a>>,
 }
 
 impl Ctx<'_> {
@@ -457,6 +468,21 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
                 Some(byte) => Some(sideways(cs.iter().position(|ch| ch.byte == byte), None)),
             }
         }
+        Motion::Paragraph { back } => {
+            let macros = cx.macros?;
+            let found = paragraph(back, n, at.line, cx.line_count, cx.text, macros)?;
+            // Run into the buffer's edge before the last count: nowhere —
+            // but the cursor wants the column it is drawn in all the same,
+            // as Neovim's `nv_findpar` has it want before it looks.
+            let Some((line, byte)) = found else {
+                return Some(sideways(Some(i), None));
+            };
+            let on = |cs: &[Ch]| Some(cs.iter().position(|ch| ch.byte == byte).unwrap_or(0));
+            if line == at.line {
+                return Some(sideways(on(&cs), None));
+            }
+            down(line, &on, None)
+        }
     }
 }
 
@@ -494,6 +520,103 @@ pub fn find(
         (true, true) => j + 1,
     };
     Some(cs[j].0)
+}
+
+/// What `'sections'` and `'paragraphs'` name: the nroff macros that start a
+/// section or a paragraph, on a line that starts with `.` and one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Macros<'a> {
+    pub sections: &'a str,
+    pub paragraphs: &'a str,
+}
+
+/// Where `}` — `{`, `back` — counted `n` takes the cursor from line `line`
+/// of `count` lines, `text` giving each, as Neovim's `findpar` takes it:
+/// past as many paragraphs, each ended by the first line after one that is
+/// not empty that starts one (see [`starts`]), to the line that ends the
+/// last — or to the buffer's last line or its first, where the last count
+/// runs into it — onto its first character, or the last of the buffer's
+/// last line, going on: `(line, byte)`. `Some(None)` where a count before
+/// the last runs into it, which goes nowhere; `None` where it passes a line
+/// the client does not have.
+pub fn paragraph<'a>(
+    back: bool,
+    n: i64,
+    line: i64,
+    count: i64,
+    text: &'a dyn Fn(i64) -> Option<&'a str>,
+    macros: Macros,
+) -> Option<Option<(i64, usize)>> {
+    let step = if back { -1 } else { 1 };
+    let mut at = line;
+    for left in (0..n.max(1)).rev() {
+        let mut skipped = false;
+        let mut first = true;
+        loop {
+            let t = text(at)?;
+            skipped |= !t.is_empty();
+            if !first && skipped && starts(t, macros)? {
+                break;
+            }
+            first = false;
+            at += step;
+            if !(0..count).contains(&at) {
+                if left > 0 {
+                    return Some(None);
+                }
+                at -= step;
+                break;
+            }
+        }
+    }
+    // The last character's first byte, a combining mark with the one it
+    // goes with.
+    let byte = if back || at < count - 1 {
+        0
+    } else {
+        text(at)?
+            .char_indices()
+            .rfind(|&(_, c)| !predict::joins(c))
+            .map_or(0, |(b, _)| b)
+    };
+    Some(Some((at, byte)))
+}
+
+/// Whether a line of `text` starts a paragraph or a section, as Neovim's
+/// `startPS` has it for `{` and `}`: an empty line, one that starts with a
+/// form feed, or with `.` and a macro `macros` names. `None` where Neovim
+/// reads past the line's end to say.
+fn starts(text: &str, macros: Macros) -> Option<bool> {
+    match text.as_bytes() {
+        [] | [b'\x0c', ..] => Some(true),
+        [b'.', rest @ ..] => Some(named(macros.sections, rest)? || named(macros.paragraphs, rest)?),
+        _ => Some(false),
+    }
+}
+
+/// Whether `s`, a line after its `.`, starts with a macro `opt` names, as
+/// Neovim's `inmacro` has it: two characters at a time, a blank in `opt`
+/// matching a blank or the line's end. `None` where Neovim reads past the
+/// end of a line of `.` alone to say.
+fn named(opt: &str, s: &[u8]) -> Option<bool> {
+    let (s0, s1) = (
+        s.first().copied().unwrap_or(0),
+        s.get(1).copied().unwrap_or(0),
+    );
+    for pair in opt.as_bytes().chunks(2) {
+        let (m0, m1) = (pair[0], pair.get(1).copied().unwrap_or(0));
+        if !(m0 == s0 || (m0 == b' ' && (s0 == 0 || s0 == b' '))) {
+            continue;
+        }
+        let ends = m1 == 0 || m1 == b' ';
+        if s0 == 0 && !ends {
+            return None;
+        }
+        if m1 == s1 || (ends && (s0 == 0 || s1 == 0 || s1 == b' ')) {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 /// Where a scroll lands the cursor on the line it takes it to: see [`onto`].
@@ -747,6 +870,7 @@ mod tests {
             scrolljump: Some(1),
             keyword: Some(&keyword),
             lmap: Some(false),
+            macros: Some(MACROS),
         };
         let motions = parse(predict::tokens(keys), |_| false)?;
         motions
@@ -1048,6 +1172,7 @@ mod tests {
             scrolljump: Some(1),
             keyword: None,
             lmap: None,
+            macros: None,
         };
         let busy = Pos {
             rest: Rest::Busy,
@@ -1122,6 +1247,7 @@ mod tests {
             scrolljump: Some(1),
             keyword: None,
             lmap: None,
+            macros: None,
         };
         for (line, (byte, want, vcol)) in [(4, 4, 4), (0, 0, 0), (0, 7, 7), (2, 2, 2)]
             .into_iter()
@@ -1274,6 +1400,7 @@ mod tests {
             scrolljump: Some(1),
             keyword: None,
             lmap: None,
+            macros: None,
         };
         let w = Motion::Word {
             way: Way::Next,
@@ -1370,6 +1497,7 @@ mod tests {
                 scrolljump: Some(1),
                 keyword: None,
                 lmap,
+                macros: None,
             };
             let f = Motion::Find {
                 c: 'o',
@@ -1377,6 +1505,160 @@ mod tests {
                 back: false,
             };
             assert_eq!(moved(f, None, &pos((0, 0, 0, 0, 0)), &cx), None, "{lmap:?}");
+        }
+    }
+
+    /// Neovim's own `'sections'` and `'paragraphs'`.
+    const MACROS: Macros = Macros {
+        sections: "SHNHH HUnhsh",
+        paragraphs: "IPLPPPQPP TPHPLIPpLpItpplpipbp",
+    };
+
+    /// Each `}` and `{` from where Neovim had the cursor to where it took
+    /// it, over [`LINES`], 22 rows and none scrolled: to the empty line that
+    /// ends a paragraph — not one of blanks — or on, past the last, to the
+    /// buffer's last character, or back to its first line; with counts, and
+    /// with a count that runs into the buffer's edge before it is done,
+    /// nowhere — the cursor wanting the column it is drawn in, though, as it
+    /// does after every other.
+    #[test]
+    fn motions_by_paragraphs_go_where_neovim_takes_them() {
+        #[rustfmt::skip]
+        let cases: &[(State, &str, State)] = &[
+            ((0, 0, 0, 0, 0), "}", (2, 0, 0, 0, 0)),
+            ((0, 6, 6, 0, 0), "}", (2, 0, 0, 0, 0)),
+            ((0, 0, -1, 0, 0), "}", (2, 0, 0, 0, 0)),
+            ((2, 0, 0, 0, 0), "}", (12, 3, 3, 0, 0)),
+            ((0, 0, 0, 0, 0), "2}", (12, 3, 3, 0, 0)),
+            ((0, 0, 0, 0, 0), "3}", (0, 0, 0, 0, 0)),
+            ((12, 0, 0, 0, 0), "{", (2, 0, 0, 0, 0)),
+            ((12, 3, 3, 0, 0), "{", (2, 0, 0, 0, 0)),
+            ((2, 0, 0, 0, 0), "{", (0, 0, 0, 0, 0)),
+            ((12, 0, 0, 0, 0), "2{", (0, 0, 0, 0, 0)),
+            ((12, 0, 0, 0, 0), "3{", (12, 0, 0, 0, 0)),
+            ((1, 1, 1, 0, 0), "{", (0, 0, 0, 0, 0)),
+            ((12, 0, 0, 0, 0), "}", (12, 3, 3, 0, 0)),
+            ((0, 0, 0, 0, 0), "{", (0, 0, 0, 0, 0)),
+            ((7, 1, 1, 0, 0), "}", (12, 3, 3, 0, 0)),
+            ((7, 1, 1, 0, 0), "{", (2, 0, 0, 0, 0)),
+            ((3, 1, 8, 0, 0), "{", (2, 0, 0, 0, 0)),
+            ((0, 6, -1, 0, 0), "3}", (0, 6, 6, 0, 0)),
+            ((12, 3, -1, 0, 0), "3{", (12, 3, 3, 0, 0)),
+            ((3, 1, 3, 0, 0), "9{", (3, 1, 8, 0, 0)),
+        ];
+        let s = shape();
+        for &(from, keys, to) in cases {
+            assert_eq!(
+                run(keys, from, &s, None),
+                Some(pos(to)),
+                "{keys} from {from:?}"
+            );
+        }
+    }
+
+    /// Paragraphs and sections that start as Neovim 0.12.6 was found to
+    /// start them with its own `'sections'` and `'paragraphs'`: at a line
+    /// that starts with `.` and a macro they name — `PP`, or `P` alone —
+    /// even right after an empty line, or with a form feed; not at a `.`
+    /// with none, alone or before a stylesheet's selector. The cursor on
+    /// the buffer's first line, on a tab, wants the tab's last column; and
+    /// not knowing the macros, the motion is not followed.
+    #[test]
+    fn paragraphs_start_where_neovim_starts_them() {
+        let lines = [
+            "\tfirst",
+            "x",
+            "",
+            ".PP",
+            "y",
+            "\x0cff",
+            "z",
+            ".",
+            ".P",
+            ".container {",
+            "end",
+        ];
+        let text = |l: i64| usize::try_from(l).ok().and_then(|l| lines.get(l)).copied();
+        let s = shape();
+        let cx = |macros| Ctx {
+            shape: &s,
+            line_count: lines.len() as i64,
+            rows: 22,
+            width: 80,
+            text: &text,
+            whichwrap: None,
+            scrolljump: Some(1),
+            keyword: None,
+            lmap: None,
+            macros,
+        };
+        #[rustfmt::skip]
+        let cases: &[(State, &str, State)] = &[
+            ((1, 0, 0, 0, 0), "{", (0, 0, 7, 0, 0)),
+            ((0, 0, 0, 0, 0), "}", (2, 0, 0, 0, 0)),
+            ((2, 0, 0, 0, 0), "}", (3, 0, 0, 0, 0)),
+            ((3, 0, 0, 0, 0), "}", (5, 0, 0, 0, 0)),
+            ((4, 0, 0, 0, 0), "}", (5, 0, 0, 0, 0)),
+            ((5, 0, 0, 0, 0), "}", (8, 0, 0, 0, 0)),
+            ((6, 0, 0, 0, 0), "}", (8, 0, 0, 0, 0)),
+            ((7, 0, 0, 0, 0), "}", (8, 0, 0, 0, 0)),
+            ((8, 0, 0, 0, 0), "}", (10, 2, 2, 0, 0)),
+            ((9, 0, 0, 0, 0), "}", (10, 2, 2, 0, 0)),
+            ((10, 0, 0, 0, 0), "{", (8, 0, 0, 0, 0)),
+            ((9, 0, 0, 0, 0), "{", (8, 0, 0, 0, 0)),
+            ((6, 0, 0, 0, 0), "{", (5, 0, 0, 0, 0)),
+            ((4, 0, 0, 0, 0), "{", (3, 0, 0, 0, 0)),
+            ((0, 0, 0, 0, 0), "3}", (5, 0, 0, 0, 0)),
+            ((10, 0, 0, 0, 0), "4{", (2, 0, 0, 0, 0)),
+        ];
+        for &(from, keys, to) in cases {
+            let got = parse(predict::tokens(keys), |_| false)
+                .expect("motions")
+                .into_iter()
+                .try_fold(pos(from), |at, (m, count)| {
+                    moved(m, count, &at, &cx(Some(MACROS)))
+                });
+            assert_eq!(got, Some(pos(to)), "{keys} from {from:?}");
+        }
+        let down = Motion::Paragraph { back: false };
+        assert_eq!(moved(down, None, &pos((0, 0, 0, 0, 0)), &cx(None)), None);
+    }
+
+    /// Empty lines in a run end one paragraph between them, as Neovim
+    /// 0.12.6 was found to have them: from one of them, `}` and `{` go on
+    /// past the rest to the next that ends one.
+    #[test]
+    fn empty_lines_in_a_run_end_one_paragraph() {
+        let lines = ["a", "", "", "b", "", "c"];
+        let text = |l: i64| usize::try_from(l).ok().and_then(|l| lines.get(l)).copied();
+        let s = shape();
+        let cx = Ctx {
+            shape: &s,
+            line_count: lines.len() as i64,
+            rows: 22,
+            width: 80,
+            text: &text,
+            whichwrap: None,
+            scrolljump: Some(1),
+            keyword: None,
+            lmap: None,
+            macros: Some(MACROS),
+        };
+        #[rustfmt::skip]
+        let cases: &[(State, &str, State)] = &[
+            ((1, 0, 0, 0, 0), "}", (4, 0, 0, 0, 0)),
+            ((2, 0, 0, 0, 0), "}", (4, 0, 0, 0, 0)),
+            ((4, 0, 0, 0, 0), "{", (2, 0, 0, 0, 0)),
+            ((3, 0, 0, 0, 0), "{", (2, 0, 0, 0, 0)),
+            ((0, 0, 0, 0, 0), "2}", (4, 0, 0, 0, 0)),
+            ((5, 0, 0, 0, 0), "2{", (2, 0, 0, 0, 0)),
+        ];
+        for &(from, keys, to) in cases {
+            let got = parse(predict::tokens(keys), |_| false)
+                .expect("motions")
+                .into_iter()
+                .try_fold(pos(from), |at, (m, count)| moved(m, count, &at, &cx));
+            assert_eq!(got, Some(pos(to)), "{keys} from {from:?}");
         }
     }
 
@@ -1424,6 +1706,7 @@ mod tests {
             scrolljump: Some(1),
             keyword: None,
             lmap: Some(false),
+            macros: None,
         };
         #[rustfmt::skip]
         let cases: &[(State, &str, State)] = &[
@@ -1501,6 +1784,7 @@ mod tests {
                 scrolljump: Some(1),
                 keyword: None,
                 lmap: None,
+                macros: None,
             };
             let got = parse(predict::tokens(keys), |_| false)
                 .expect("motions")
