@@ -124,12 +124,13 @@
 //! make, is given up on with that frame, not at its deadline.
 //!
 //! And so do the motions. The client follows the keys that move the cursor
-//! in Normal mode a character or a line at a time ([`super::moves`]), and
-//! draws them at once, a key at a time, where it can say exactly where
-//! Neovim will put the cursor and draw it — over lines it has as the buffer
-//! has them now, that Neovim draws as it would, in a window whose options
-//! it follows ([`Stepping`]), along the cursor's line or to another in the
-//! view as it is — and judges each against the ack for its key: one Neovim
+//! in Normal mode a character, a line or a word at a time
+//! ([`super::moves`], [`super::words`]), and draws them at once, a key at a
+//! time, where it can say exactly where Neovim will put the cursor and draw
+//! it — over lines it has as the buffer has them now, that Neovim draws as
+//! it would, in a window whose options it follows ([`Stepping`]), along the
+//! cursor's line or to another in the view as it is — and judges each
+//! against the ack for its key: one Neovim
 //! made otherwise goes back to Neovim's at once, and what it was made in
 //! proves itself before the client draws it again ([`Trust`]; see
 //! `super::anim::chain`). A motion to another line takes with it what the
@@ -305,6 +306,11 @@ pub struct Stepping {
     /// concealed, which a line a scroll brings into view is drawn without
     /// by the client.
     pub concealing: bool,
+    /// What `'iskeyword'` makes of each character under 256 in the window's
+    /// buffer, by its code: 0 for a blank, 1 for punctuation and 2 for a
+    /// character of a word, as Neovim's `charclass()` has it there (see
+    /// `super::words::class`). Empty where the agent does not say.
+    pub classes: Vec<u8>,
 }
 
 /// What `'cursorline'` draws of the cursor's line, as `'cursorlineopt'` has
@@ -412,8 +418,8 @@ impl Shape {
     /// [`Listchars::read`] has it — and, where the agent says what Neovim
     /// made of each key, `[whichwrap, virtualedit, cursorcolumn, bound,
     /// langmap, widths, numberwidth, number_signs, cursorline, idioms,
-    /// own_highlights, conceals, colorcolumn, scrolljump, concealing]` after
-    /// them (see [`Stepping`]):
+    /// own_highlights, conceals, colorcolumn, scrolljump, concealing,
+    /// classes]` after them (see [`Stepping`]):
     /// `numberwidth` no more than Neovim lets it be, `cursorline` as
     /// [`Cursorline::read`] has it, and `idioms` a list of
     /// [`Idiom::read`]'s.
@@ -479,6 +485,7 @@ impl Shape {
                     .unwrap_or_default(),
                 scrolljump: int(38).unwrap_or(0),
                 concealing: flag(39),
+                classes: text(40).bytes().map(|b| b.saturating_sub(b'0')).collect(),
             }),
         })
     }
@@ -1581,6 +1588,13 @@ impl Ch {
     }
 }
 
+/// Whether `c` goes with the character before it rather than being one of
+/// its own, as [`chars`] has it: a character of no width — a combining mark
+/// — that is neither a tab nor a control character.
+pub fn joins(c: char) -> bool {
+    !matches!(c, '\t' | '\0'..='\x1f' | '\x7f') && c.width() == Some(0)
+}
+
 /// A line's characters, as a window of `shape` lays them out from its first
 /// column: see [`Ch`]. A combining mark at the very start of a line, with no
 /// character before it to go with, is left out with it.
@@ -1588,13 +1602,15 @@ pub fn chars(text: &str, shape: &Shape) -> Vec<Ch> {
     let mut out = Vec::new();
     let mut vcol = 0;
     for (byte, c) in text.char_indices() {
+        if joins(c) {
+            continue;
+        }
         let width = match c {
             '\t' if shape.list && shape.tab.is_empty() => 2,
             '\t' => shape.tabstop - vcol % shape.tabstop,
             '\0'..='\x1f' | '\x7f' => 2,
             _ => match c.width() {
                 None => format!("<{:02x}>", c as u32).len(),
-                Some(0) => continue,
                 Some(w) => w,
             },
         };
@@ -2018,6 +2034,10 @@ const WHOLE: &[&str] = &[
     "<C-c>",
 ];
 
+/// The arrows with Shift or Ctrl, which go by words as `w`, `W`, `b` and
+/// `B` do (see [`super::words`]): whole, as the keys of [`WHOLE`] are.
+const WORD_ARROWS: &[&str] = &["<S-Right>", "<C-Right>", "<S-Left>", "<C-Left>"];
+
 /// The keys that scroll, by themselves.
 const SCROLLS: &[&str] = &[
     "<C-e>",
@@ -2074,15 +2094,18 @@ const WHEEL: &[&str] = &[
 /// Every key, and `z` command, a mapping of which changes what the client
 /// makes of it: what the agent is asked to look up (see [`Shape::mapped`]).
 /// And, where the agent says what Neovim made of each key (`acks`), the
-/// motions the client follows that take more than a key, `g_`, and the
-/// keys that enter Insert mode it follows, which the agent looks up in
-/// Normal mode alone.
+/// motions the client follows that take more than a key, `g_`, `ge` and
+/// `gE`, and the keys that enter Insert mode it follows, which the agent
+/// looks up in Normal mode alone.
 pub fn keys(acks: bool) -> Vec<String> {
     let digits = (0..10).map(|d| d.to_string());
     let z = Z.iter().chain(Z_SIDE).map(|k| format!("z{k}"));
-    let acked = ["g_", "i", "a", "A", "I"].into_iter().filter(|_| acks);
+    let acked = ["g_", "ge", "gE", "i", "a", "A", "I"]
+        .into_iter()
+        .filter(|_| acks);
     WHOLE
         .iter()
+        .chain(WORD_ARROWS)
         .chain(SCROLLS)
         .chain(WHEEL)
         .map(|k| k.to_string())
@@ -2325,14 +2348,16 @@ impl Typed {
                     }
                 }
             }
-            // `g_`, looked up whole: Neovim's own mappings of `g…` make `g`
-            // alone a prefix, and nothing maps `g_` but the user.
+            // `g_`, `ge` and `gE`, looked up whole: Neovim's own mappings of
+            // `g…` make `g` alone a prefix, and nothing maps those but the
+            // user.
             State::G(count) => {
-                if key == "_" && !mapped("g_") {
+                let motion = moves::g_motion(key).filter(|_| !mapped(&format!("g{key}")));
+                if let Some(motion) = motion {
                     self.state = State::Ready(None);
                     self.whole = true;
                     return Some(Command::Move {
-                        motion: moves::Motion::LastNonBlank,
+                        motion,
                         count,
                         screen: false,
                     });
@@ -2482,7 +2507,10 @@ impl Typed {
     fn moved(&mut self, key: &str, mapped: &impl Fn(&str) -> bool) {
         self.lost = true;
         self.waits = INSERT_WAITS.contains(&key);
-        self.whole = (WHOLE.contains(&key) || SCROLLS.contains(&key)) && !mapped(key);
+        let whole = [WHOLE, WORD_ARROWS, SCROLLS]
+            .iter()
+            .any(|keys| keys.contains(&key));
+        self.whole = whole && !mapped(key);
         self.state = match self.state {
             _ if self.whole && matches!(key, "<Esc>" | "<C-c>") => State::Ready(None),
             State::Ready(_) if self.whole => State::Ready(None),
@@ -4082,6 +4110,7 @@ impl Predictor {
             text: &text,
             whichwrap: shape.stepping.as_ref().map(|s| s.whichwrap.as_str()),
             scrolljump: shape.stepping.as_ref().map(|s| s.scrolljump),
+            keyword: shape.stepping.as_ref().map(|s| s.classes.as_slice()),
         };
         motions
             .into_iter()
@@ -4452,6 +4481,7 @@ mod tests {
                 colorcolumn: Vec::new(),
                 scrolljump: 1,
                 concealing: false,
+                classes: Vec::new(),
             }),
             ..shape()
         }
@@ -7552,6 +7582,46 @@ mod tests {
         let mut t = only(true, true, false);
         assert_eq!(typed(&mut t, "<C-e>j"), [scroll, down]);
         assert_eq!(typed(&mut t, "ix"), []);
+    }
+
+    /// The motions by words are followed as the other motions are, with
+    /// their counts — `ge` and `gE` after their `g`, and the arrows with
+    /// Shift or Ctrl that make `w`, `W`, `b` and `B` — and left to Neovim,
+    /// the client blind to them, where something maps them.
+    #[test]
+    fn motions_by_words_are_followed() {
+        use crate::client::words::Way;
+        let word = |way, big, count| Command::Move {
+            motion: moves::Motion::Word { way, big },
+            count,
+            screen: false,
+        };
+        let mut t = Typed::default();
+        t.set_predictions(MOTIONS);
+        t.rebase(Rest::Normal);
+        assert_eq!(
+            typed(&mut t, "w3bge2gEE<S-Right><C-Left>"),
+            [
+                word(Way::Next, false, None),
+                word(Way::Back, false, Some(3)),
+                word(Way::BackEnd, false, None),
+                word(Way::BackEnd, true, Some(2)),
+                word(Way::End, true, None),
+                word(Way::Next, false, None),
+                word(Way::Back, true, None),
+            ]
+        );
+        assert!(!t.blind);
+        for (keys, mapped) in [("ge", "ge"), ("w", "w"), ("<S-Right>", "<S-Right>")] {
+            let mut t = Typed::default();
+            t.set_predictions(MOTIONS);
+            t.rebase(Rest::Normal);
+            let made: Vec<Command> = tokens(keys)
+                .filter_map(|k| t.key(k, |_, key| key == mapped))
+                .collect();
+            assert!(made.is_empty(), "{keys}");
+            assert!(t.blind, "{keys}");
+        }
     }
 
     /// The lines whose characters Neovim 0.12.6 was found to step over

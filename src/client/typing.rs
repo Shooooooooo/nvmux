@@ -889,6 +889,7 @@ mod tests {
                 colorcolumn: Vec::new(),
                 scrolljump: 1,
                 concealing: false,
+                classes: Vec::new(),
             }),
         }
     }

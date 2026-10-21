@@ -2338,6 +2338,51 @@ fn horizontal_motions_typed_over_a_slow_link_show_at_once() {
     }
 }
 
+/// Every motion by words the client draws ahead of Neovim, typed over a
+/// slow link to a real Neovim, with counts, along a line and on to the next
+/// or back to the one before, over tabs, a script of its own, an emoji, a
+/// letter with its mark, brackets and empty lines: on the screen before
+/// Neovim could have heard of it, and where Neovim's own frame puts the
+/// cursor.
+#[test]
+fn motions_by_words_show_at_once() {
+    require_nvim!();
+    let scratch = Scratch::new("client-words-at");
+    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, "client-words-at", MOVING, MOTIONS);
+    term.pump_until(Duration::from_secs(4), |s| s.contains("one"));
+    for (name, keys) in [
+        ("w", &b"w"[..]),
+        ("w", b"w"),
+        ("e", b"e"),
+        ("b", b"b"),
+        ("ge", b"ge"),
+        ("3w", b"3w"),
+        ("2b", b"2b"),
+        ("W", b"W"),
+        ("E", b"E"),
+        ("B", b"B"),
+        ("gE", b"gE"),
+        ("<S-Right>", b"\x1b[1;2C"),
+        ("<C-Right>", b"\x1b[1;5C"),
+        ("<S-Left>", b"\x1b[1;2D"),
+        ("<C-Left>", b"\x1b[1;5D"),
+        ("5w", b"5w"),
+        ("4e", b"4e"),
+        ("w", b"w"),
+        ("2W", b"2W"),
+        ("3b", b"3b"),
+        ("6w", b"6w"),
+        ("w", b"w"),
+        ("w", b"w"),
+        ("2ge", b"2ge"),
+        ("8w", b"8w"),
+        ("3e", b"3e"),
+        ("4B", b"4B"),
+    ] {
+        predicted(&mut term, name, keys);
+    }
+}
+
 /// Every motion to another line in view the client draws ahead of Neovim,
 /// typed over a slow link to a real Neovim, with counts, in a window
 /// numbered by `'number'` and `'relativenumber'`: on the screen before
@@ -3385,6 +3430,54 @@ fn random_motions_to_other_lines_show_nothing_neovim_never_drew() {
     ];
     random_motions("client-fuzz-nu", "set nu rnu", KEYS, COUNTED);
 }
+
+/// [`random_motions_to_other_lines_show_nothing_neovim_never_drew`] by
+/// words — `w`, `b`, `e` and `ge`, `W`, `B`, `E` and `gE`, and the arrows
+/// with Shift or Ctrl that make some of them — counted too, over lines of
+/// words, punctuation and blanks, scripts of their own and empty lines.
+#[test]
+fn random_motions_by_words_show_nothing_neovim_never_drew() {
+    require_nvim!();
+    random_motions("client-fuzz-w", "set nu rnu", WORD_KEYS, WORD_COUNTED);
+}
+
+/// [`random_motions_by_words_show_nothing_neovim_never_drew`] over lines
+/// enough to scroll (see [`SCROLLED`]): motions by words that take the
+/// cursor past the window's edge scroll the view with it, as Neovim does.
+#[test]
+fn random_motions_by_words_past_the_edges_show_nothing_neovim_never_drew() {
+    require_nvim!();
+    let mut rng = Lcg(13);
+    let keys = random_keys(&mut rng, WORD_KEYS, WORD_COUNTED);
+    sights_compared("client-fuzz-ws", SCROLLED, MOTIONS, &keys, rng, false);
+}
+
+/// The keys of the motions by words, as the terminal sends them and as
+/// Neovim names them, and `j` and `k` and a few more between them.
+const WORD_KEYS: &[(&[u8], &str)] = &[
+    (b"w", "w"),
+    (b"w", "w"),
+    (b"b", "b"),
+    (b"b", "b"),
+    (b"e", "e"),
+    (b"ge", "ge"),
+    (b"W", "W"),
+    (b"B", "B"),
+    (b"E", "E"),
+    (b"gE", "gE"),
+    (b"\x1b[1;2C", "<S-Right>"),
+    (b"\x1b[1;5C", "<C-Right>"),
+    (b"\x1b[1;2D", "<S-Left>"),
+    (b"\x1b[1;5D", "<C-Left>"),
+    (b"j", "j"),
+    (b"k", "k"),
+    (b"l", "l"),
+    (b"$", "$"),
+    (b"0", "0"),
+];
+
+/// Of [`WORD_KEYS`], those typed with a count now and then.
+const WORD_COUNTED: &[&str] = &["w", "b", "e", "ge", "W", "B", "E", "gE", "j", "k"];
 
 /// Random motions from `alphabet`, those in `counted` with a count a third
 /// of the time, and an `x` now and then, typed in bursts over a slow link
@@ -5734,4 +5827,147 @@ fn a_terminal_that_fills_neovims_highlights_is_drawn_in_its_own_colours() {
         "only {} of the program's 250 frames were drawn: too few to fill Neovim's table twice",
         seen.len()
     );
+}
+
+/// Lines to move by words over: words, punctuation, blanks and tabs, a line
+/// of blanks alone, empty lines, a script of its own beside another, an
+/// emoji, a character with a combining mark, a no-break space, and `-`,
+/// which `'iskeyword'` may or may not have.
+const WORDS: &[&str] = &[
+    "fn main() {",
+    "    let x_1 = foo.bar(2, \"three\");",
+    "",
+    "\ta\tb  c",
+    "   ",
+    "",
+    "",
+    "日本語のテキストと、カタカナ漢字",
+    "smile 😀 here — there…",
+    "café e\u{301}tude naïve",
+    "no\u{a0}break --dash-ed-- end",
+    "x",
+    "  // trailing  ",
+    "last word",
+];
+
+/// Where Neovim takes the cursor for each of `keys`, counted each of
+/// `counts`, from each of `starts` — `(line, byte)`, lines from nought —
+/// over the lines of the current buffer: `(line, byte)` each, in that order.
+const WORDS_LUA: &str = "local starts, keys, counts = ...
+  local out = {}
+  for _, s in ipairs(starts) do
+    for _, k in ipairs(keys) do
+      for _, n in ipairs(counts) do
+        vim.api.nvim_win_set_cursor(0, { s[1] + 1, s[2] })
+        vim.cmd('normal! ' .. n .. k)
+        local c = vim.api.nvim_win_get_cursor(0)
+        out[#out + 1] = { c[1] - 1, c[2] }
+      end
+    end
+  end
+  return out";
+
+/// What the client makes of a motion by words — `w`, `b`, `e` and `ge`,
+/// and `W`, `B`, `E` and `gE` — is what a real Neovim makes of it, from
+/// every character of [`WORDS`] and with nothing after the last line and
+/// with an empty one, once, twice and five times, `'iskeyword'` at its
+/// default and with `-` added: the line it lands on, and the character.
+#[test]
+fn motions_by_words_go_where_neovim_takes_them() {
+    use nvmux::client::words::{self, Way};
+    require_nvim!();
+    let scratch = Scratch::new("client-words");
+    let (_sock, mut rpc, _config) = session(&scratch, "client-words");
+    let keys = [
+        ("w", Way::Next, false),
+        ("b", Way::Back, false),
+        ("e", Way::End, false),
+        ("ge", Way::BackEnd, false),
+        ("W", Way::Next, true),
+        ("B", Way::Back, true),
+        ("E", Way::End, true),
+        ("gE", Way::BackEnd, true),
+    ];
+    let counts = [1i64, 2, 5];
+    let mut checked = 0;
+    for (tail, isk) in [(None, ""), (Some(""), ""), (None, "-")] {
+        let lines: Vec<&str> = WORDS.iter().copied().chain(tail).collect();
+        let text = |l: i64| usize::try_from(l).ok().and_then(|l| lines.get(l)).copied();
+        let set = Value::Array(lines.iter().map(|&l| Value::from(l)).collect());
+        rpc.call(
+            "nvim_buf_set_lines",
+            vec![0.into(), 0.into(), (-1).into(), false.into(), set],
+        )
+        .expect("set the lines");
+        rpc.command(&format!("setlocal noswapfile iskeyword& iskeyword+={isk}"))
+            .expect("iskeyword");
+        let classes = rpc
+            .call(
+                "nvim_exec_lua",
+                vec![
+                    "local t = {} for b = 0, 255 do \
+                       t[#t + 1] = math.min(vim.fn.charclass(vim.fn.nr2char(b)), 2) end \
+                     return table.concat(t)"
+                        .into(),
+                    Value::Array(vec![]),
+                ],
+            )
+            .expect("the classes");
+        let keyword: Vec<u8> = classes
+            .as_str()
+            .expect("a string")
+            .bytes()
+            .map(|b| b - b'0')
+            .collect();
+        // Every character's first byte, combining marks with the one before.
+        let starts: Vec<(i64, usize)> = lines
+            .iter()
+            .enumerate()
+            .flat_map(|(l, t)| {
+                let firsts: Vec<usize> = t
+                    .char_indices()
+                    .filter(|&(_, c)| !nvmux::client::predict::joins(c))
+                    .map(|(b, _)| b)
+                    .collect();
+                let firsts = if firsts.is_empty() { vec![0] } else { firsts };
+                firsts.into_iter().map(move |b| (l as i64, b))
+            })
+            .collect();
+        let pair = |(l, b): (i64, usize)| Value::Array(vec![l.into(), (b as i64).into()]);
+        let args = Value::Array(vec![
+            Value::Array(starts.iter().map(|&s| pair(s)).collect()),
+            Value::Array(keys.iter().map(|(k, ..)| Value::from(*k)).collect()),
+            Value::Array(counts.iter().map(|&n| Value::from(n)).collect()),
+        ]);
+        let got = rpc
+            .call("nvim_exec_lua", vec![WORDS_LUA.into(), args])
+            .expect("Neovim's motions");
+        let mut theirs = got.as_array().expect("a list").iter().map(|p| {
+            let p = p.as_array().expect("a pair");
+            (
+                p[0].as_i64().expect("line"),
+                p[1].as_i64().expect("byte") as usize,
+            )
+        });
+        let lines_of = words::Lines {
+            text: &text,
+            count: lines.len() as i64,
+            keyword: &keyword,
+        };
+        for &from in &starts {
+            for &(key, way, big) in &keys {
+                for &n in &counts {
+                    let neovims = theirs.next().expect("as many");
+                    let ours = words::moved(way, big, n, from, &lines_of);
+                    assert_eq!(
+                        ours,
+                        Some(neovims),
+                        "{n}{key} from {from:?}, iskeyword+={isk:?}, after the last {tail:?}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 5000, "{checked}");
 }

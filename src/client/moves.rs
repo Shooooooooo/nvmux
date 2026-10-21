@@ -3,8 +3,8 @@
 //! sends, from where Neovim last said the cursor was (see
 //! [`super::predict::Ack`]).
 //!
-//! These are the motions that stay on a line or go a line at a time, each
-//! with a count:
+//! These are the motions that stay on a line, go a line at a time, or go
+//! by words, each with a count:
 //!
 //! - `h`, `<Left>`, `<BS>` and `<C-h>` a character back, `l`, `<Right>` and
 //!   `<Space>` one on — a character with combining marks one, a character two
@@ -27,6 +27,9 @@
 //!   `$` — the column wanted kept as it was;
 //! - `+`, `<CR>`, `-` and `_` a line down or up, or none for `_`, to its
 //!   first character that is not a blank;
+//! - and `w`, `b`, `e` and `ge`, and `W`, `B`, `E` and `gE`, and the arrows
+//!   with Shift or Ctrl that make some of them, by words, from line to line
+//!   where they go on past one's end (see [`super::words`]);
 //!
 //! — and after a move sideways the cursor wants the column it is drawn in:
 //! a character's first, or a tab's last. A motion that takes the cursor up
@@ -42,6 +45,7 @@
 //! motion followed, drawn or not, [`super::predict::Predictor::judge`]).
 
 use super::predict::{self, Ch, Pos, Rest, Shape, Want};
+use super::words::{self, Way};
 
 /// A motion in Normal mode, as the client follows it: see [`moved`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +80,13 @@ pub enum Motion {
         down: bool,
         here: bool,
     },
+    /// `w`, `<S-Right>`, `b`, `<S-Left>`, `e` and `ge` by words; and `W`,
+    /// `<C-Right>`, `B`, `<C-Left>`, `E` and `gE` by words only blanks part,
+    /// `big`.
+    Word {
+        way: Way,
+        big: bool,
+    },
 }
 
 /// The motion a key typed in Normal mode makes, if it is one followed here:
@@ -107,6 +118,31 @@ pub fn motion(key: &str) -> Option<Motion> {
             down: true,
             here: true,
         },
+        "w" | "<S-Right>" | "W" | "<C-Right>" => Motion::Word {
+            way: Way::Next,
+            big: matches!(key, "W" | "<C-Right>"),
+        },
+        "b" | "<S-Left>" | "B" | "<C-Left>" => Motion::Word {
+            way: Way::Back,
+            big: matches!(key, "B" | "<C-Left>"),
+        },
+        "e" | "E" => Motion::Word {
+            way: Way::End,
+            big: key == "E",
+        },
+        _ => return None,
+    })
+}
+
+/// The motion `g` and then `key` make, if it is one followed here: `g_`, and
+/// `ge` and `gE` back to a word's end.
+pub fn g_motion(key: &str) -> Option<Motion> {
+    Some(match key {
+        "_" => Motion::LastNonBlank,
+        "e" | "E" => Motion::Word {
+            way: Way::BackEnd,
+            big: key == "E",
+        },
         _ => return None,
     })
 }
@@ -126,13 +162,13 @@ pub fn parse<'a>(
     let mut count: Option<i64> = None;
     let mut g = false;
     for key in keys {
-        // `g`, and `_` after it, `g_` as a whole looked up: Neovim's own
-        // mappings of `g…` make a prefix of `g` alone.
+        // `g`, and `_` or `e` after it, `g_` or `ge` as a whole looked up:
+        // Neovim's own mappings of `g…` make a prefix of `g` alone.
         if std::mem::take(&mut g) {
-            if key != "_" || mapped("g_") {
+            if mapped(&format!("g{key}")) {
                 return None;
             }
-            out.push((Motion::LastNonBlank, count.take()));
+            out.push((g_motion(key)?, count.take()));
             continue;
         }
         if key == "g" {
@@ -179,6 +215,10 @@ pub struct Ctx<'a> {
     /// must, by a count of lines or a share of the window — a motion that
     /// would move the view is not followed.
     pub scrolljump: Option<i64>,
+    /// What `'iskeyword'` makes of each character under 256 in the window's
+    /// buffer, as `'whichwrap'`: not knowing it, a motion by words is not
+    /// followed (see [`words::class`]).
+    pub keyword: Option<&'a [u8]>,
 }
 
 impl Ctx<'_> {
@@ -333,6 +373,19 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
                 return Some(*at);
             }
             down(line, &first_non_blank, None)
+        }
+        Motion::Word { way, big } => {
+            let lines = words::Lines {
+                text: cx.text,
+                count: cx.line_count,
+                keyword: cx.keyword?,
+            };
+            let (line, byte) = words::moved(way, big, n, (at.line, at.byte), &lines)?;
+            let on = |cs: &[Ch]| cs.iter().position(|ch| ch.byte == byte);
+            if line == at.line {
+                return Some(sideways(on(&cs), None));
+            }
+            down(line, &on, None)
         }
     }
 }
@@ -577,6 +630,7 @@ mod tests {
     /// over [`LINES`], `'whichwrap'` as `ww` says.
     fn run(keys: &str, from: State, shape: &Shape, ww: Option<&str>) -> Option<Pos> {
         let text = |l: i64| usize::try_from(l).ok().and_then(|l| LINES.get(l)).copied();
+        let keyword = words::defaults();
         let cx = Ctx {
             shape,
             line_count: LINES.len() as i64,
@@ -585,6 +639,7 @@ mod tests {
             text: &text,
             whichwrap: ww,
             scrolljump: Some(1),
+            keyword: Some(&keyword),
         };
         let motions = parse(predict::tokens(keys), |_| false)?;
         motions
@@ -884,6 +939,7 @@ mod tests {
             text: &text,
             whichwrap: Some("b,s"),
             scrolljump: Some(1),
+            keyword: None,
         };
         let busy = Pos {
             rest: Rest::Busy,
@@ -956,6 +1012,7 @@ mod tests {
             text: &text,
             whichwrap: Some("b,s"),
             scrolljump: Some(1),
+            keyword: None,
         };
         for (line, (byte, want, vcol)) in [(4, 4, 4), (0, 0, 0), (0, 7, 7), (2, 2, 2)]
             .into_iter()
@@ -987,11 +1044,111 @@ mod tests {
             parse(predict::tokens("10j0"), |_| false),
             Some(vec![(Motion::Down, Some(10)), (Motion::Start, None)])
         );
+        let word = |way, big| Motion::Word { way, big };
+        assert_eq!(
+            parse(predict::tokens("3w2gEb<C-Left>"), |_| false),
+            Some(vec![
+                (word(Way::Next, false), Some(3)),
+                (word(Way::BackEnd, true), Some(2)),
+                (word(Way::Back, false), None),
+                (word(Way::Back, true), None),
+            ])
+        );
+        assert_eq!(parse(predict::tokens("ge"), |k| k == "ge"), None, "mapped");
         let huge = "9".repeat(20);
         assert_eq!(
             parse(predict::tokens(&format!("{huge}l")), |_| false),
             Some(vec![(Motion::Right('l'), Some(MAX_COUNT))])
         );
+    }
+
+    /// Each motion by words from where Neovim had the cursor to where it
+    /// took it, over [`LINES`] — `'iskeyword'` at its default, 8 columns to a
+    /// tab, 22 rows and none scrolled: along a line and on to the next, over
+    /// tabs, scripts of their own, a combining mark, blanks and an empty
+    /// line, into the buffer's start and its end, the cursor wanting the
+    /// column it is drawn in after each — a tab's last.
+    #[test]
+    fn motions_by_words_go_where_neovim_takes_them() {
+        #[rustfmt::skip]
+        let cases: &[(State, &str, State)] = &[
+            ((0, 0, 0, 0, 0), "w", (0, 6, 6, 0, 0)),
+            ((0, 0, 0, 0, 0), "2w", (1, 0, 0, 0, 0)),
+            ((0, 6, 6, 0, 0), "w", (1, 0, 0, 0, 0)),
+            ((0, 6, 6, 0, 0), "3w", (3, 1, 8, 0, 0)),
+            ((1, 0, 0, 0, 0), "w", (2, 0, 0, 0, 0)),
+            ((2, 0, 0, 0, 0), "w", (3, 1, 8, 0, 0)),
+            ((3, 0, 7, 0, 0), "w", (3, 1, 8, 0, 0)),
+            ((3, 1, 8, 0, 0), "w", (4, 0, 0, 0, 0)),
+            ((4, 0, 0, 0, 0), "w", (4, 2, 8, 0, 0)),
+            ((4, 0, 0, 0, 0), "e", (4, 2, 8, 0, 0)),
+            ((0, 0, 0, 0, 0), "e", (0, 4, 4, 0, 0)),
+            ((0, 4, 4, 0, 0), "e", (0, 10, 10, 0, 0)),
+            ((0, 10, 10, 0, 0), "e", (1, 1, 1, 0, 0)),
+            ((1, 1, 1, 0, 0), "e", (3, 1, 8, 0, 0)),
+            ((3, 1, 8, 0, 0), "b", (2, 0, 0, 0, 0)),
+            ((2, 0, 0, 0, 0), "b", (1, 0, 0, 0, 0)),
+            ((1, 0, 0, 0, 0), "b", (0, 6, 6, 0, 0)),
+            ((0, 6, 6, 0, 0), "b", (0, 0, 0, 0, 0)),
+            ((0, 0, 0, 0, 0), "b", (0, 0, 0, 0, 0)),
+            ((12, 3, 3, 0, 0), "w", (12, 3, 3, 0, 0)),
+            ((12, 0, 0, 0, 0), "w", (12, 3, 3, 0, 0)),
+            ((12, 0, 0, 0, 0), "e", (12, 3, 3, 0, 0)),
+            ((12, 3, 3, 0, 0), "e", (12, 3, 3, 0, 0)),
+            ((9, 0, 0, 0, 0), "w", (10, 0, 0, 0, 0)),
+            ((5, 0, 0, 0, 0), "w", (6, 0, 0, 0, 0)),
+            ((5, 0, 0, 0, 0), "e", (5, 6, 4, 0, 0)),
+            ((6, 0, 0, 0, 0), "w", (8, 2, 2, 0, 0)),
+            ((6, 0, 0, 0, 0), "e", (6, 3, 1, 0, 0)),
+            ((7, 0, 0, 0, 0), "w", (8, 2, 2, 0, 0)),
+            ((7, 1, 1, 0, 0), "b", (6, 0, 0, 0, 0)),
+            ((8, 0, 0, 0, 0), "w", (8, 2, 2, 0, 0)),
+            ((8, 2, 2, 0, 0), "ge", (6, 3, 1, 0, 0)),
+            ((4, 2, 8, 0, 0), "ge", (4, 0, 0, 0, 0)),
+            ((2, 0, 0, 0, 0), "ge", (1, 1, 1, 0, 0)),
+            ((0, 6, 6, 0, 0), "ge", (0, 4, 4, 0, 0)),
+            ((0, 0, 0, 0, 0), "ge", (0, 0, 0, 0, 0)),
+            ((10, 4, 4, 0, 0), "W", (10, 10, 10, 0, 0)),
+            ((10, 4, 4, 0, 0), "B", (10, 0, 0, 0, 0)),
+            ((10, 4, 4, 0, 0), "E", (10, 8, 8, 0, 0)),
+            ((10, 4, 4, 0, 0), "gE", (10, 2, 2, 0, 0)),
+            ((10, 0, 0, 0, 0), "10w", (12, 3, 3, 0, 0)),
+            ((11, 3, 10, 0, 0), "b", (10, 20, 20, 0, 0)),
+            ((11, 0, 7, 0, 0), "w", (11, 3, 10, 0, 0)),
+            ((0, 0, 0, 0, 0), "50w", (12, 3, 3, 0, 0)),
+            ((12, 0, 0, 0, 0), "50b", (0, 0, 0, 0, 0)),
+            ((0, 0, 0, 0, 0), "<S-Right>", (0, 6, 6, 0, 0)),
+            ((0, 6, 6, 0, 0), "<S-Left>", (0, 0, 0, 0, 0)),
+            ((10, 4, 4, 0, 0), "<C-Right>", (10, 10, 10, 0, 0)),
+            ((10, 4, 4, 0, 0), "<C-Left>", (10, 0, 0, 0, 0)),
+            ((0, 6, -1, 0, 0), "w", (1, 0, 0, 0, 0)),
+        ];
+        let s = shape();
+        for &(from, keys, to) in cases {
+            assert_eq!(
+                run(keys, from, &s, Some("b,s")),
+                Some(pos(to)),
+                "{keys} from {from:?}"
+            );
+        }
+        // Not knowing what `'iskeyword'` makes of the characters, a motion by
+        // words is not followed.
+        let text = |l: i64| usize::try_from(l).ok().and_then(|l| LINES.get(l)).copied();
+        let cx = Ctx {
+            shape: &s,
+            line_count: LINES.len() as i64,
+            rows: 22,
+            width: 80,
+            text: &text,
+            whichwrap: Some("b,s"),
+            scrolljump: Some(1),
+            keyword: None,
+        };
+        let w = Motion::Word {
+            way: Way::Next,
+            big: false,
+        };
+        assert_eq!(moved(w, None, &pos((0, 0, 0, 0, 0)), &cx), None);
     }
 
     /// In a window that does not wrap, ten columns wide, a move out of view
@@ -1013,6 +1170,7 @@ mod tests {
             text: &text,
             whichwrap: Some("b,s"),
             scrolljump: Some(1),
+            keyword: None,
         };
         #[rustfmt::skip]
         let cases: &[(State, &str, State)] = &[
@@ -1083,6 +1241,7 @@ mod tests {
                 text: &text,
                 whichwrap: Some("b,s"),
                 scrolljump: Some(1),
+                keyword: None,
             };
             let got = parse(predict::tokens(keys), |_| false)
                 .expect("motions")

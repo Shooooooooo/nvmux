@@ -122,6 +122,7 @@ pub mod term;
 pub mod typing;
 pub mod wide;
 pub mod wire;
+pub mod words;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
@@ -494,6 +495,23 @@ if predict then
     end
     return cc
   end
+  -- What 'iskeyword' makes of each character under 256 in a buffer, a
+  -- digit a character: 0 for a blank, 1 for punctuation and 2 for one of a
+  -- word, as charclass() has it there (see predict::Stepping::classes).
+  local classesof = {}
+  local function classes(buf)
+    local isk = vim.bo[buf].iskeyword
+    if not classesof[isk] then
+      local t = {}
+      api.nvim_buf_call(buf, function()
+        for b = 0, 255 do
+          t[b + 1] = math.min(vim.fn.charclass(vim.fn.nr2char(b)), 2)
+        end
+      end)
+      classesof[isk] = table.concat(t)
+    end
+    return classesof[isk]
+  end
   local function shape(buf, info)
     -- Where the client is told what Neovim made of each key, a window with
     -- 'vartabstop' is not followed: its tabs are not 'tabstop' wide.
@@ -537,8 +555,8 @@ if predict then
     -- (see predict::Stepping): 'cursorlineopt' as one for the number, two
     -- for the line and four for the screen line; whether the window has
     -- highlights of its own, or conceals what the cursor's line shows; the
-    -- columns 'colorcolumn' colours; 'scrolljump'; and whether it may
-    -- conceal text on any line.
+    -- columns 'colorcolumn' colours; 'scrolljump'; whether it may conceal
+    -- text on any line; and what 'iskeyword' makes of each character.
     if acks then
       local widths = vim.o.ambiwidth == 'double' or #vim.fn.getcellwidths() > 0
         or not vim.o.emoji
@@ -555,7 +573,7 @@ if predict then
         vim.wo.signcolumn:find('number') ~= nil, cul, idioms,
         vim.wo.winhighlight ~= '' or not got or ns > 0,
         vim.wo.conceallevel > 0 and not vim.wo.concealcursor:find('n'),
-        colorcolumn(info.winid), vim.o.scrolljump, vim.wo.conceallevel > 0 })
+        colorcolumn(info.winid), vim.o.scrolljump, vim.wo.conceallevel > 0, classes(buf) })
     end
     return s
   end
@@ -563,14 +581,15 @@ if predict then
   -- numbers, its bar, what is concealed, the columns coloured — and how far
   -- a motion past 'scrolloff' scrolls the view, as they were when its shape
   -- was last said, where the client is told what Neovim made of each key;
-  -- and how many lines its buffer has, which a key that adds or takes out
-  -- lines changes, for the keys typed after it to be worked out from the
-  -- shape that goes with Neovim's word on it. Set by an autocommand of
-  -- another event, as configurations turn 'relativenumber' and 'cursorline'
-  -- off in Insert mode and on again out of it, they fire no OptionSet; nor
-  -- does a highlight namespace given the window. So they are read again as
-  -- Neovim goes to wait for a key, and the shapes said again ahead of the
-  -- ack where they changed.
+  -- how many lines its buffer has, which a key that adds or takes out lines
+  -- changes, for the keys typed after it to be worked out from the shape
+  -- that goes with Neovim's word on it; and the buffer's 'iskeyword', which
+  -- a filetype's plugin sets as the buffer is loaded. Set by an autocommand
+  -- of another event, as configurations turn 'relativenumber' and
+  -- 'cursorline' off in Insert mode and on again out of it, they fire no
+  -- OptionSet; nor does a highlight namespace given the window. So they are
+  -- read again as Neovim goes to wait for a key, and the shapes said again
+  -- ahead of the ack where they changed.
   local looked = {}
   local function looks(win)
     local out = { pcall(api.nvim_get_hl_ns, { winid = win }) }
@@ -582,6 +601,7 @@ if predict then
     out[#out + 1] = vim.o.scrolljump
     out[#out + 1] = table.concat(colorcolumn(win), ' ')
     out[#out + 1] = api.nvim_buf_line_count(api.nvim_win_get_buf(win))
+    out[#out + 1] = vim.bo[api.nvim_win_get_buf(win)].iskeyword
     return table.concat(vim.tbl_map(tostring, out), ',')
   end
   -- No more of a line than could be shown, and a cell over for the client
@@ -1211,7 +1231,7 @@ if predict then
     au('OptionSet', { pattern = { 'whichwrap', 'virtualedit', 'cursorcolumn', 'scrollbind',
       'cursorbind', 'langmap', 'ambiwidth', 'emoji', 'cursorline', 'cursorlineopt',
       'winhighlight', 'conceallevel', 'concealcursor', 'colorcolumn', 'textwidth',
-      'vartabstop', 'scrolljump' } }, function()
+      'vartabstop', 'scrolljump', 'iskeyword' } }, function()
       soon()
     end)
   end
@@ -1243,7 +1263,7 @@ if predict then
   -- buffer's text goes in after its prompt, wherever Insert mode is
   -- entered, and none of the prompt comes out: none goes in as typed.
   if typing then
-    local factsof, entered, classesof = {}, {}, {}
+    local factsof, entered = {}, {}
     local function unseen(buf, event)
       for _, ac in ipairs(api.nvim_get_autocmds({ event = event })) do
         local g = ac.group_name or ''
@@ -1294,14 +1314,6 @@ if predict then
         local nu = (wo.number or wo.relativenumber) and 8 or 0
         tw = math.max(info.width - bo.wrapmargin - info.textoff - nu, 0)
       end
-      local isk = bo.iskeyword
-      if not classesof[isk] then
-        local t = {}
-        for b = 0, 255 do
-          t[b + 1] = math.min(vim.fn.charclass(vim.fn.nr2char(b)), 2)
-        end
-        classesof[isk] = table.concat(t)
-      end
       local hooked = hooks(buf)
       local f = { buf, entered[buf] == true, firsts, abbrevs, hooked[1], tw,
         bo.formatoptions, bo.indentexpr ~= '' and bo.indentkeys or (bo.cindent and bo.cinkeys or ''),
@@ -1311,7 +1323,7 @@ if predict then
         not (vim.o.revins or wo.rightleft or bo.iminsert == 2 or vim.o.paste or vim.o.digraph),
         vim.o.backspace,
         bo.softtabstop ~= 0 or bo.varsofttabstop ~= '', vim.o.smarttab, vim.o.delcombine,
-        wo.conceallevel > 0 and wo.concealcursor or '', classesof[isk], hooked[2], hooked[3] }
+        wo.conceallevel > 0 and wo.concealcursor or '', classes(buf), hooked[2], hooked[3] }
       if not vim.deep_equal(factsof[buf], f) then
         factsof[buf] = f
         send('insert', unpack(f))
@@ -3425,6 +3437,7 @@ impl App {
             text: &text,
             whichwrap: Some(&stepping.whichwrap),
             scrolljump: Some(stepping.scrolljump),
+            keyword: Some(&stepping.classes),
         };
         let Some(to) = moves::moved(motion, count, &from, &cx) else {
             return false;
@@ -3450,7 +3463,10 @@ impl App {
         // where a move goes on past a line's end, every one it passes (see
         // [`App::laid_out`]); and where the view moves, every line it brings
         // into view (see [`App::brought`]), which Neovim has yet to draw.
-        let passed = matches!(motion, moves::Motion::Left(_) | moves::Motion::Right(_));
+        let passed = matches!(
+            motion,
+            moves::Motion::Left(_) | moves::Motion::Right(_) | moves::Motion::Word { .. }
+        );
         let laid_out = |l| self.laid_out(grid, &on, l, &text);
         let mut lines = from.line.min(to.line)..=from.line.max(to.line);
         let mut shown = to.top..(to.top + h as i64).min(ack.line_count);
@@ -4812,6 +4828,7 @@ impl App {
             text: &text,
             whichwrap: Some(&stepping.whichwrap),
             scrolljump: Some(stepping.scrolljump),
+            keyword: Some(&stepping.classes),
         };
         let pos = if how == moves::Landing::First || to.cursor != at.cursor {
             moves::onto(to.cursor, how, to.top, &from, &cx)?
@@ -10442,6 +10459,59 @@ mod tests {
     /// at the top left of the screen.
     fn drawn(a: &App) -> (i64, i64) {
         a.anim.cursor_at(&a.model)
+    }
+
+    /// [`stepping`]'s window's shape, as [`shaped`] says it, with the rest of
+    /// what the agent says where it says what Neovim made of each key — and
+    /// what `'iskeyword'` at its default makes of each character under 256
+    /// (see [`predict::Stepping::classes`]).
+    fn worded() -> Vec<Value> {
+        let mut shape = shaped(0, (false, false, true), (false, 0), &[], Vec::new());
+        shape.extend([
+            false.into(),
+            false.into(),
+            Value::Array(vec![]),
+            1.into(),
+            false.into(),
+        ]);
+        let classes: String = words::defaults()
+            .iter()
+            .map(|&c| char::from(b'0' + c))
+            .collect();
+        shape.push(classes.into());
+        shape
+    }
+
+    /// The motions by words over a slow link move the cursor at once, before
+    /// Neovim has heard of them — along the line, on to the next and back,
+    /// with counts — where the agent says what `'iskeyword'` makes of the
+    /// characters; where it does not, they wait for Neovim.
+    #[test]
+    fn motions_by_words_move_the_cursor_at_once() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"w", t1);
+        assert_eq!(drawn(&a), (0, 0), "not knowing 'iskeyword'");
+        let mut a = stepping(Duration::from_millis(200));
+        reshape(&mut a, worded(), t1);
+        for (keys, at) in [
+            (&b"w"[..], (0, 5)),
+            (b"w", (1, 0)),
+            (b"e", (1, 3)),
+            (b"2b", (0, 5)),
+            (b"ge", (0, 3)),
+            (b"3W", (1, 5)),
+            (b"gE", (1, 3)),
+        ] {
+            a.keys(keys, t1);
+            assert_eq!(
+                drawn(&a),
+                at,
+                "{} before Neovim has heard of it",
+                String::from_utf8_lossy(keys)
+            );
+        }
+        assert!(a.due(t1), "and drawn");
     }
 
     /// A motion along the line over a slow link moves the cursor at once,

@@ -234,7 +234,7 @@ Over ssh, every key waits a round trip for Neovim to say what it did with it.
 nvmux's own client draws some keys at once instead, before Neovim has heard of
 them, much as [mosh](https://mosh.org) echoes what you type: scrolls (`<C-d>`,
 `<C-f>`, `zz`, the mouse wheel and their kind), cursor motions in Normal mode
-(`h`, `j`, `$` and their kind), and what you type in Insert mode. It draws
+(`h`, `j`, `w`, `$` and their kind), and what you type in Insert mode. It draws
 each only where it can work out exactly what Neovim will do, and Neovim has the
 last word: anything it did otherwise is put back as Neovim drew it, a round
 trip later.
@@ -292,7 +292,7 @@ ui              = "nvmux"  # who draws a session: nvmux's own client, animated; 
 per_session     = true     # keep each session's client; a switch back reuses it
 lazy            = false    # start every client at launch, and after a dropped link; true waits for visits
 predict_scrolls = "auto"   # over ssh, scrolls show ahead of Neovim; "on" everywhere, or "off"
-predict_motions = "auto"   # over ssh, h, j, $ and their kind move the cursor ahead of Neovim
+predict_motions = "auto"   # over ssh, h, j, w, $ and their kind move the cursor ahead of Neovim
 predict_typing  = "auto"   # over ssh, what is typed in Insert mode shows ahead of Neovim
 centre          = "off"    # on a wide terminal, each window's text in its middle: "smart" or "fixed"
 window_width    = 120      # with centre on, how many columns a window's text gets; 0 for no limit
