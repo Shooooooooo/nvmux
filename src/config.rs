@@ -231,22 +231,17 @@ pub struct ClientSettings {
     /// [`crate::client::predict`]).
     ///
     /// `"auto"` by default, as `predict_motions` and `predict_typing` have it
-    /// too: on for a session on another machine, over ssh, once the round trip
-    /// to it is long enough to be worth it, and off for one on this machine.
-    /// `"on"` is on for every session, whatever its round trip; `"off"`, every
+    /// too: on for a session on another machine, over ssh, and off for one on
+    /// this machine. `"on"` is on for this machine's as well; `"off"`, every
     /// scroll waits for Neovim, whatever `predict_motions` and `predict_typing`
     /// say of the rest.
     ///
-    /// Long enough is 30 ms: the client times a request and its answer as it
-    /// attaches, and again every two seconds while keys are typed, smooths what
-    /// it finds as TCP smooths its own round trip, and predicts from when that
-    /// comes to 30 ms till it falls back under 20 ms (see
-    /// [`crate::client::predict::ON`]). Over a faster link, Neovim's own frame
-    /// comes so soon after a prediction's that there is little to gain, and a
-    /// prediction put right is a flicker. This machine's round trip never is
-    /// that long, which is why `"auto"` leaves its sessions out: their clients
-    /// leave the editor nothing to predict with, and time none of its answers.
-    /// `"on"` predicts all the same, at what it costs.
+    /// On, a scroll is drawn ahead whatever the round trip: even one of 20 or
+    /// 30 ms is felt, a key held down or typed fast. This machine's is a
+    /// fraction of a millisecond, Neovim's own frame coming before a prediction
+    /// could be seen, which is why `"auto"` leaves its sessions out: their
+    /// clients leave the editor nothing to predict with, and time none of its
+    /// answers.
     ///
     /// What it costs: the rows a scroll uncovers are drawn without their
     /// signs or virtual text until Neovim's own arrive, a round trip later,
@@ -264,25 +259,25 @@ pub struct ClientSettings {
     /// to Neovim's at once.
     ///
     /// `"auto"` by default, as `predict_scrolls` has it: on for a session over
-    /// ssh once the round trip is long enough, and with `"on"` for every
-    /// session, whatever its round trip; `"off"`, each key waits for Neovim.
-    /// The motions along a line — `h`, `l`, `0`, `^`, `$`, `g_`, `|` and their
-    /// kind — and to another line — `j`, `k`, `+`, `-`, `_`, `<CR>` and theirs,
-    /// and `j` and `k` mapped as LazyVim maps them — are drawn, with counts,
-    /// and with them the numbers of `'relativenumber'` and the bar of
-    /// `'cursorline'`: in view, or past `'scrolloff'`, the view scrolled as
-    /// Neovim scrolls it, short of half the window, which Neovim centres the
-    /// cursor for instead — but not to bring into view a line Neovim draws with
-    /// virtual text or a sign, which the client would draw without them. With
-    /// `predict_scrolls` as well, a key that scrolls, or a turn of the wheel,
-    /// goes on from where the motions before it left the cursor, and they from
-    /// it; and a scroll that takes the cursor to another line, the wheel's
-    /// among them, has the numbers and the bar moved with it where the client
-    /// can draw them as Neovim does, and leaves them as Neovim drew them till
-    /// its next frame where not, as it always did. But not those to another
-    /// line in a window whose gutter a `'statuscolumn'` draws, as LazyVim's is,
-    /// which are left to Neovim. The client follows the rest by what Neovim
-    /// says of each key rather than waiting for it to catch up with them all.
+    /// ssh, and with `"on"` for one on this machine as well; `"off"`, each key
+    /// waits for Neovim. The motions along a line — `h`, `l`, `0`, `^`, `$`,
+    /// `g_`, `|` and their kind — and to another line — `j`, `k`, `+`, `-`,
+    /// `_`, `<CR>` and theirs, and `j` and `k` mapped as LazyVim maps them —
+    /// are drawn, with counts, and with them the numbers of `'relativenumber'`
+    /// and the bar of `'cursorline'`: in view, or past `'scrolloff'`, the view
+    /// scrolled as Neovim scrolls it, short of half the window, which Neovim
+    /// centres the cursor for instead — but not to bring into view a line
+    /// Neovim draws with virtual text or a sign, which the client would draw
+    /// without them. With `predict_scrolls` as well, a key that scrolls, or a
+    /// turn of the wheel, goes on from where the motions before it left the
+    /// cursor, and they from it; and a scroll that takes the cursor to another
+    /// line, the wheel's among them, has the numbers and the bar moved with it
+    /// where the client can draw them as Neovim does, and leaves them as Neovim
+    /// drew them till its next frame where not, as it always did. But not those
+    /// to another line in a window whose gutter a `'statuscolumn'` draws, as
+    /// LazyVim's is, which are left to Neovim. The client follows the rest by
+    /// what Neovim says of each key rather than waiting for it to catch up with
+    /// them all.
     ///
     /// What it costs, as `predict_typing` does too: the agent says where
     /// each key left the cursor, about 40 bytes a key back over the link,
@@ -299,12 +294,11 @@ pub struct ClientSettings {
     /// against what Neovim says it did.
     ///
     /// `"auto"` by default, as `predict_scrolls` has it: on for a session over
-    /// ssh once the round trip is long enough, and with `"on"` for every
-    /// session, whatever its round trip; `"off"`, each key waits for Neovim.
-    /// Not a key a mapping or an abbreviation may make more of, one past
-    /// `'textwidth'`, or one that indents the line again; nor, in a buffer
-    /// whose plugins act on what is typed there, till enough of it has been
-    /// found to go in as typed — or, whose plugins act as Insert mode is
+    /// ssh, and with `"on"` for one on this machine as well; `"off"`, each key
+    /// waits for Neovim. Not a key a mapping or an abbreviation may make more
+    /// of, one past `'textwidth'`, or one that indents the line again; nor, in
+    /// a buffer whose plugins act on what is typed there, till enough of it has
+    /// been found to go in as typed — or, whose plugins act as Insert mode is
     /// entered or left there, the keys that do that, till enough of them have
     /// been found to do no more than the key does: one that does more after
     /// that — a trimmer of the blanks lines end in finding some on another
@@ -405,61 +399,55 @@ impl Default for ClientSettings {
 }
 
 impl ClientSettings {
-    /// What a client predicts, and when, for a session on another machine
-    /// if `remote` and on this one if not, as `predict_scrolls`,
-    /// `predict_motions` and `predict_typing` say: each `"auto"` for the one
-    /// and `"off"` for the other.
+    /// What a client predicts, for a session on another machine if `remote`
+    /// and on this one if not, as `predict_scrolls`, `predict_motions` and
+    /// `predict_typing` say: each `"auto"` for the one and not the other.
     pub fn predictions(&self, remote: bool) -> Predictions {
-        let here = |p: Predict| if p.predicts(remote) { p } else { Predict::Off };
         Predictions {
-            scrolls: here(self.predict_scrolls),
-            motions: here(self.predict_motions),
-            typing: here(self.predict_typing),
+            scrolls: self.predict_scrolls.predicts(remote),
+            motions: self.predict_motions.predicts(remote),
+            typing: self.predict_typing.predicts(remote),
         }
     }
 
-    /// Whether a client predicts anything at all over a slow link, for a
-    /// session on another machine if `remote`, and on this one if not.
+    /// Whether a client predicts anything at all, for a session on another
+    /// machine if `remote`, and on this one if not.
     pub fn predicts(&self, remote: bool) -> bool {
         self.predictions(remote).any()
     }
 }
 
-/// What a client predicting draws ahead of Neovim, and when: as
-/// `[client]`'s `predict_scrolls`, `predict_motions` and `predict_typing`
+/// What a client predicting draws ahead of Neovim, whatever the round trip:
+/// as `[client]`'s `predict_scrolls`, `predict_motions` and `predict_typing`
 /// say, each on its own, for the session it draws (see
-/// [`ClientSettings::predictions`]) — `"off"` here where `"auto"` leaves the
-/// session out, so that `"auto"` is a link slow enough to predict over.
+/// [`ClientSettings::predictions`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Predictions {
     /// The keys that scroll, and the turns of the wheel.
-    pub scrolls: Predict,
+    pub scrolls: bool,
     /// The keys that move the cursor in Normal mode.
-    pub motions: Predict,
+    pub motions: bool,
     /// What is typed in Insert mode, and the keys that go in and out of it.
-    pub typing: Predict,
+    pub typing: bool,
 }
 
 impl Default for Predictions {
-    /// The scrolls alone, over a link slow enough: what a client predicts
-    /// till it is told what its settings say (see
-    /// `crate::client::App::with_predictions`), the agent left to say no more
-    /// than the scrolls need.
+    /// The scrolls alone: what a client predicts till it is told what its
+    /// settings say (see `crate::client::App::with_predictions`), the agent
+    /// left to say no more than the scrolls need.
     fn default() -> Self {
         Self {
-            scrolls: Predict::Auto,
-            motions: Predict::Off,
-            typing: Predict::Off,
+            scrolls: true,
+            motions: false,
+            typing: false,
         }
     }
 }
 
 impl Predictions {
-    /// Whether any is drawn ahead of Neovim, now or over a slower link.
+    /// Whether any is drawn ahead of Neovim.
     pub fn any(self) -> bool {
-        [self.scrolls, self.motions, self.typing]
-            .into_iter()
-            .any(|kind| kind != Predict::Off)
+        self.scrolls || self.motions || self.typing
     }
 
     /// Whether the client goes by what the agent says Neovim made of each
@@ -467,21 +455,19 @@ impl Predictions {
     /// typing, each of which goes on from where the one before it left the
     /// cursor. The scrolls alone wait for Neovim to catch up instead.
     pub fn acks(self) -> bool {
-        self.motions != Predict::Off || self.typing != Predict::Off
+        self.motions || self.typing
     }
 }
 
 /// `[client] predict_scrolls`, `predict_motions` and `predict_typing`: for
-/// which sessions a client draws its kind ahead of Neovim, and when.
+/// which sessions a client draws its kind ahead of Neovim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Predict {
-    /// For a session on another machine, over ssh, once the round trip to it
-    /// is long enough to be worth it (see `crate::client::predict::ON`); and
-    /// not for one on this machine.
+    /// For a session on another machine, over ssh, and not for one on this.
     #[default]
     Auto,
-    /// For every session, this machine's too, whatever its round trip.
+    /// For every session, this machine's too.
     On,
     /// For none: each key waits for Neovim.
     Off,
@@ -1650,9 +1636,9 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          # ui              = {ui:<8}   # nvmux's own animated client, or \"nvim\" for Neovim's\n\
          # per_session     = {per_session:<8}   # keep each session's client; a switch back reuses it\n\
          # lazy            = {lazy:<8}   # start every client at launch, and after a dropped link; true waits for visits\n\
-         # predict_scrolls = {predict_scrolls:<8}   # over a slow ssh link, scrolls show ahead of Neovim; \"on\" always, or \"off\"\n\
-         # predict_motions = {predict_motions:<8}   # over a slow ssh link, h, j, $ and their kind move the cursor ahead of Neovim\n\
-         # predict_typing  = {predict_typing:<8}   # over a slow ssh link, what is typed in Insert mode shows ahead of Neovim\n\
+         # predict_scrolls = {predict_scrolls:<8}   # over ssh, scrolls show ahead of Neovim; \"on\" everywhere, or \"off\"\n\
+         # predict_motions = {predict_motions:<8}   # over ssh, h, j, $ and their kind move the cursor ahead of Neovim\n\
+         # predict_typing  = {predict_typing:<8}   # over ssh, what is typed in Insert mode shows ahead of Neovim\n\
          # centre          = {centre:<8}   # on a wide terminal, each window's text in its middle: \"smart\" or \"fixed\"\n\
          # window_width    = {window_width:<8}   # with centre on, how many columns a window's text gets; 0 for no limit\n\
          \n\
@@ -2686,54 +2672,47 @@ mod tests {
 
     /// The scrolls, the motions and the typing are each `"auto"` unless told
     /// otherwise: predicted for a session over ssh, and not for one on this
-    /// machine. `"on"` predicts a kind for both, whatever the round trip, and
-    /// `"off"` for neither, each on its own or with any other. What a client is
-    /// told comes back from its environment as it went; and a switch, as each
-    /// was before it said which sessions, or any other word, is refused in
-    /// words that say which would do.
+    /// machine. `"on"` predicts a kind for both, and `"off"` for neither, each
+    /// on its own or with any other. What a client is told comes back from its
+    /// environment as it went; and a switch, as each was before it said which
+    /// sessions, or any other word, is refused in words that say which would
+    /// do.
     #[test]
     fn auto_predicts_over_ssh_and_not_here_unless_told() {
-        let (auto, on, off) = (Predict::Auto, Predict::On, Predict::Off);
+        let (auto, t, f) = (Predict::Auto, true, false);
         let c = Settings::default().client;
         assert_eq!(
             (c.predict_scrolls, c.predict_motions, c.predict_typing),
             (auto, auto, auto)
         );
         let there = c.predictions(true);
-        assert_eq!(
-            (there.scrolls, there.motions, there.typing),
-            (auto, auto, auto)
-        );
+        assert_eq!((there.scrolls, there.motions, there.typing), (t, t, t));
         assert!(!c.predictions(false).any(), "a session on this machine");
         assert!(c.predicts(true) && !c.predicts(false));
         // What each says, over ssh and on this machine: the scrolls, the
         // motions and the typing.
         for (doc, there, here) in [
-            (
-                "predict_typing = \"off\"",
-                (auto, auto, off),
-                (off, off, off),
-            ),
-            ("predict_motions = \"on\"", (auto, on, auto), (off, on, off)),
+            ("predict_typing = \"off\"", (t, t, f), (f, f, f)),
+            ("predict_motions = \"on\"", (t, t, t), (f, t, f)),
             (
                 "predict_scrolls = \"on\"\npredict_motions = \"off\"",
-                (on, off, auto),
-                (on, off, off),
+                (t, f, t),
+                (t, f, f),
             ),
             (
                 "predict_scrolls = \"off\"\npredict_typing = \"on\"",
-                (off, auto, on),
-                (off, off, on),
+                (f, t, t),
+                (f, f, t),
             ),
             (
                 "predict_scrolls = \"on\"\npredict_motions = \"on\"\npredict_typing = \"on\"",
-                (on, on, on),
-                (on, on, on),
+                (t, t, t),
+                (t, t, t),
             ),
             (
                 "predict_scrolls = \"off\"\npredict_motions = \"off\"\npredict_typing = \"off\"",
-                (off, off, off),
-                (off, off, off),
+                (f, f, f),
+                (f, f, f),
             ),
         ] {
             let doc = format!("[client]\n{doc}\n");
@@ -2745,7 +2724,7 @@ mod tests {
                     (scrolls, motions, typing),
                     "{doc} over ssh: {remote}"
                 );
-                assert_eq!(p.acks(), motions != off || typing != off, "{doc}");
+                assert_eq!(p.acks(), motions || typing, "{doc}");
                 assert_eq!(s.client.predicts(remote), p.any(), "{doc}");
             }
             assert!(s.client.per_session && !s.client.lazy, "the rest as it was");

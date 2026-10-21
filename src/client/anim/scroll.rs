@@ -326,9 +326,9 @@ impl Scroll {
     /// other way is a scroll the client did not see coming, and the view goes
     /// back to Neovim's before it moves on.
     ///
-    /// `predicting` is whether the client scrolls ahead of Neovim over the
-    /// link as it is (see [`crate::client::predict::Predictor::active`]):
-    /// only then may a view come back over more lines than a slide shows.
+    /// `predicting` is whether the client scrolls ahead of Neovim (see
+    /// [`crate::client::predict::Predictor`]): only then may a view come back
+    /// over more lines than a slide shows.
     pub fn scrolled(&mut self, gone: impl Into<Gone>, delta: i64, far: usize, predicting: bool) {
         let gone = gone.into();
         if self

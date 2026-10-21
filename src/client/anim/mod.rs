@@ -295,8 +295,8 @@ impl Animator {
         self.effects = effects;
     }
 
-    /// Whether the client draws ahead of Neovim now, scrolls among what it
-    /// may draw (see [`crate::client::predict::Predictor::live`]). The windows
+    /// Whether the client draws ahead of Neovim, scrolls among what it may
+    /// draw (see [`crate::client::predict::Predictor`]). The windows
     /// scrolling keep the lines they pass further than a slide shows them
     /// only while it does, for a scroll ahead to come back over (see
     /// [`Scroll::scrolled`]): many times a window's height, which on a large

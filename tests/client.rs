@@ -4354,55 +4354,53 @@ fn sent_by_kind(
 }
 
 /// What predictions are drawn from — the lines either side of a view, their
-/// colours, how a window scrolls — is sent only over a link slow enough to
-/// predict over. A session on this machine scrolled page by page is sent
-/// none of it, its client told to predict wherever the link is; the same
-/// over a slow link is.
+/// colours, how a window scrolls — is sent to the client of a session over
+/// ssh however fast the link, and none of it to one of a session on this
+/// machine, told `"auto"`, scrolled page by page all the same.
 #[test]
-fn only_a_link_slow_enough_to_predict_over_is_sent_lines() {
+fn a_session_over_ssh_is_sent_lines_however_fast_the_link() {
     require_nvim!();
     let setline =
         format!("call setline(1, map(range(1, 600), '\"line \" . v:val')) | {COUNT_SENT}");
-    let pages = |term: &mut Terminal| {
-        for _ in 0..3 {
-            typed(term, b"\x06");
-        }
-    };
-    let predictions = ["lines", "spans", "shape", "keep", "splice"];
-
-    let fast = Scratch::new("client-fastlines");
-    let (sock, mut rpc, config) = session(&fast, "client-fastlines");
-    rpc.command(&format!("setlocal noswapfile | {setline}"))
-        .expect("setline");
-    let mut term = Terminal::spawn_told(&sock, &config, &over_ssh(""));
-    assert!(
-        term.pump_until(Duration::from_secs(20), |s| s.contains("line 1")),
-        "never drawn:\n{}",
-        term.text()
-    );
-    pages(&mut term);
-    assert!(
-        top_line(&term.text()).is_some_and(|top| top > 40),
-        "not paged down:\n{}",
-        term.text()
-    );
-    let sent = sent_by_kind(&mut rpc);
-    for kind in predictions {
-        assert_eq!(
-            sent.get(kind),
-            None,
-            "a fast link was sent {kind}: {sent:?}"
+    let there = over_ssh("");
+    for (tag, told) in [
+        ("client-fastlines", Some(&there)),
+        ("client-herelines", None),
+    ] {
+        let scratch = Scratch::new(tag);
+        let (sock, mut rpc, config) = session(&scratch, tag);
+        rpc.command(&format!("setlocal noswapfile | {setline}"))
+            .expect("setline");
+        let mut term = match told {
+            Some(drawing) => Terminal::spawn_told(&sock, &config, drawing),
+            None => Terminal::spawn(&sock, &config),
+        };
+        assert!(
+            term.pump_until(Duration::from_secs(20), |s| s.contains("line 1")),
+            "{tag}: never drawn:\n{}",
+            term.text()
         );
+        for _ in 0..3 {
+            typed(&mut term, b"\x06");
+        }
+        assert!(
+            top_line(&term.text()).is_some_and(|top| top > 40),
+            "{tag}: not paged down:\n{}",
+            term.text()
+        );
+        let sent = sent_by_kind(&mut rpc);
+        if told.is_some() {
+            assert!(
+                sent.get("lines").is_some_and(|&n| n > 0)
+                    && sent.get("shape").is_some_and(|&n| n > 0),
+                "{tag}: a fast link over ssh was not sent its lines: {sent:?}"
+            );
+        } else {
+            for kind in ["lines", "spans", "shape", "keep", "splice"] {
+                assert_eq!(sent.get(kind), None, "{tag}: sent {kind}: {sent:?}");
+            }
+        }
     }
-
-    let slow = Scratch::new("client-slowlines");
-    let (mut rpc, mut term, _) = drawn_slowly(&slow, "client-slowlines", &setline);
-    pages(&mut term);
-    let sent = sent_by_kind(&mut rpc);
-    assert!(
-        sent.get("lines").is_some_and(|&n| n > 0) && sent.get("shape").is_some_and(|&n| n > 0),
-        "a slow link was not sent its lines: {sent:?}"
-    );
 }
 
 /// How many autocommands the client's agent has in the editor, and how many
@@ -4478,27 +4476,38 @@ fn auto_predicts_over_ssh_and_on_here_as_well() {
     }
 }
 
-/// Told `"on"`, a client on this machine scrolls before Neovim has taken
-/// the scroll, whatever the round trip: a turn of the wheel while Neovim is
-/// busy for a second and a half moves the view at once, and Neovim's own
-/// scroll, once it is done, lands where the client already is. Told
-/// `"auto"`, the same turn waits for Neovim.
+/// A client of a session over ssh scrolls before Neovim has taken the
+/// scroll, however fast the link, and so does one on this machine told
+/// `"on"`: a turn of the wheel while Neovim is busy for a second and a half
+/// moves the view at once, and Neovim's own scroll, once it is done, lands
+/// where the client already is. One on this machine told `"auto"` waits for
+/// Neovim.
 #[test]
-fn told_on_a_client_here_scrolls_before_neovim_answers() {
+fn a_scroll_is_drawn_before_neovim_takes_it_over_ssh_or_told_on() {
     require_nvim!();
-    for (tag, client, ahead) in [
-        ("client-on-scroll", "predict_scrolls = \"on\"\n", true),
-        ("client-auto-scroll", "", false),
+    for (tag, client, ssh, ahead) in [
+        ("client-ssh-scroll", "", true, true),
+        (
+            "client-on-scroll",
+            "predict_scrolls = \"on\"\n",
+            false,
+            true,
+        ),
+        ("client-auto-scroll", "", false, false),
     ] {
         let scratch = Scratch::new(tag);
         let (sock, mut rpc, config) = session(&scratch, tag);
         let settings = format!("[client]\n{client}[effects.scroll]\nenabled = false\n");
-        std::fs::write(&config, settings).expect("write the config");
+        std::fs::write(&config, &settings).expect("write the config");
         rpc.command(
             "setlocal noswapfile | call setline(1, map(range(1, 200), '\"line \" . v:val'))",
         )
         .expect("setline");
-        let mut term = Terminal::spawn(&sock, &config);
+        let mut term = if ssh {
+            Terminal::spawn_told(&sock, &config, &over_ssh(&settings))
+        } else {
+            Terminal::spawn(&sock, &config)
+        };
         assert!(
             term.pump_until(Duration::from_secs(20), |s| top_line(s) == Some(1)),
             "{tag}: never drawn:\n{}",

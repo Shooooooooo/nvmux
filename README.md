@@ -244,17 +244,14 @@ Each kind has a setting of its own under `[client]` — `predict_scrolls`,
 
 | Value | Means |
 |---|---|
-| `"auto"` | the default: on for a session on a remote host once its round trip is long enough to be worth it, off for one on this machine |
-| `"on"` | on for every session, this machine's too, whatever its round trip |
+| `"auto"` | the default: on for a session on a remote host, off for one on this machine |
+| `"on"` | on for every session, this machine's too |
 | `"off"` | off: every key of its kind waits for Neovim |
 
-Long enough is 30 ms. The client times the round trip as it attaches and every
-two seconds while you type, smoothing it as TCP smooths its own, and with
-`"auto"` predicts from when it reaches 30 ms until it falls back under 20 ms:
-over a faster link, Neovim answers so soon that there is little to gain, and a
-prediction put right is a flicker. This machine's round trip never comes near
-that, which is why `"auto"` leaves its sessions off. `"on"` predicts at once,
-whatever the round trip.
+On, keys are drawn ahead whatever the round trip: even 20 or 30 ms is felt, a
+key held down or typed fast. A session on this machine answers in a fraction
+of a millisecond, before anything drawn ahead could be seen, which is why
+`"auto"` leaves its sessions off.
 
 The motions and the typing have the editor say what it made of each key, about
 40 bytes a key back over the link; and the typing has it send the line you are
@@ -294,9 +291,9 @@ command = "nvim --headless --listen {sock}"   # {sock} is required
 ui              = "nvmux"  # who draws a session: nvmux's own client, animated; or "nvim"
 per_session     = true     # keep each session's client; a switch back reuses it
 lazy            = false    # start every client at launch, and after a dropped link; true waits for visits
-predict_scrolls = "auto"   # over a slow ssh link, scrolls show ahead of Neovim; "on" always, or "off"
-predict_motions = "auto"   # over a slow ssh link, h, j, $ and their kind move the cursor ahead of Neovim
-predict_typing  = "auto"   # over a slow ssh link, what is typed in Insert mode shows ahead of Neovim
+predict_scrolls = "auto"   # over ssh, scrolls show ahead of Neovim; "on" everywhere, or "off"
+predict_motions = "auto"   # over ssh, h, j, $ and their kind move the cursor ahead of Neovim
+predict_typing  = "auto"   # over ssh, what is typed in Insert mode shows ahead of Neovim
 centre          = "off"    # on a wide terminal, each window's text in its middle: "smart" or "fixed"
 window_width    = 120      # with centre on, how many columns a window's text gets; 0 for no limit
 
