@@ -2664,10 +2664,22 @@ fn holding_j_past_the_bottom_keeps_up() {
         }
         false
     };
-    for _ in 0..40 {
-        typed_at.push(Instant::now());
+    for k in 0..40 {
+        let at = Instant::now();
+        typed_at.push(at);
         term.type_bytes(b"j");
-        term.frames(Duration::from_millis(30), &mut note);
+        // Its line drawn before the next `j` goes, 30 ms on: a client held
+        // up past that, as on a busy machine, would read the two in one go
+        // and draw them as one frame, two lines on.
+        let line = start + k + 1;
+        term.frames(SLOW, |screen| {
+            note(screen);
+            line_on(screen) == Some(line)
+        });
+        term.frames(
+            Duration::from_millis(30).saturating_sub(at.elapsed()),
+            &mut note,
+        );
     }
     term.frames(4 * SLOW, &mut note);
     let when: Vec<(Duration, Option<u32>)> = seen
@@ -3327,9 +3339,9 @@ fn an_insert_leave_made_late_has_esc_prove_itself() {
         .expect("autocmd");
     typed(&mut term, b"j$xk");
     // `<Esc>` before Neovim has heard of the `A`, nor said anything more of
-    // Insert mode as it enters it.
-    term.type_bytes(b"A");
-    term.pump_until(Duration::from_millis(30), |_| false);
+    // Insert mode as it enters it — but after the `A` is drawn ahead, which
+    // a client held up does later than a fixed wait would allow for.
+    ahead(&mut term, "A", b"A");
     waited(&mut term, "<Esc>, proving itself", b"\x1b");
     assert_eq!(cursor(term.parser.screen()).0, 1, "on the line trimmed");
 }
@@ -3404,21 +3416,32 @@ fn motions_typed_faster_than_the_link_answers_keep_up() {
     let start = cursor(term.parser.screen());
     let mut seen: Vec<(Instant, (u16, u16))> = vec![(Instant::now(), start)];
     let mut typed_at = Vec::new();
-    for _ in 0..20 {
-        let at = Instant::now();
-        typed_at.push(at);
-        term.type_bytes(b"l");
-        term.frames(Duration::from_millis(30), |screen| {
-            if seen.last().map(|s| s.1) != Some(cursor(screen)) {
-                seen.push((Instant::now(), cursor(screen)));
-            }
-            false
-        });
-    }
-    term.frames(4 * SLOW, |screen| {
+    let mut note = |screen: &vt100::Screen| {
         if seen.last().map(|s| s.1) != Some(cursor(screen)) {
             seen.push((Instant::now(), cursor(screen)));
         }
+    };
+    for k in 0..20 {
+        let at = Instant::now();
+        typed_at.push(at);
+        term.type_bytes(b"l");
+        // Its column drawn before the next `l` goes, as for the `j`s of
+        // holding_j_past_the_bottom_keeps_up.
+        let col = start.1 + k + 1;
+        term.frames(SLOW, |screen| {
+            note(screen);
+            cursor(screen).1 == col
+        });
+        term.frames(
+            Duration::from_millis(30).saturating_sub(at.elapsed()),
+            |screen| {
+                note(screen);
+                false
+            },
+        );
+    }
+    term.frames(4 * SLOW, |screen| {
+        note(screen);
         false
     });
     let cols: Vec<i32> = seen.iter().map(|s| i32::from(s.1 .1)).collect();
