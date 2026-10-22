@@ -30,17 +30,22 @@ pub enum Did {
 pub enum Leave {
     /// To another session: `Enter` on its row.
     Switch(crate::ids::Id),
-    /// To set up a new session: `c`.
-    New,
+    /// To set up a new session, which goes after the session named, the row
+    /// the cursor was on, as the picker full screen puts one: `c`. `None`
+    /// where there are no rows. The picker comes back up over the session
+    /// where the prompt is cancelled.
+    New(Option<crate::ids::Id>),
     /// Out of nvmux, every session left running: `q`.
     Quit,
     /// To rename this session, which the picker does not do floating: `r`.
     /// The name is asked for on a screen of its own, and the picker comes
     /// back up over the session once it has been answered.
     Rename(crate::ids::Id),
-    /// The help, over the session in its place: `?`.
+    /// The help, over the session in its place: `?`. Taken down, it goes back
+    /// to the picker, as the help full screen does.
     Help,
-    /// The settings, over the session in its place: `,`.
+    /// The settings, over the session in its place: `,`. Taken down, they go
+    /// back to the picker, as the settings full screen do.
     Settings,
 }
 
@@ -72,13 +77,18 @@ pub trait Floating {
     /// Taken down.
     fn close(&self);
 
+    /// Up again where it was set aside rather than taken down: the picker,
+    /// back from the help or the settings it went across to.
+    fn back(&mut self) {}
+
     /// Where it goes once it is down, if not back to the session.
     fn leave(&self) -> Option<Leave> {
         None
     }
 
     /// Whether it has asked to be taken down with no key or gesture to say
-    /// so: the picker's half-typed number, settled by the clock.
+    /// so: the picker's half-typed number, settled by the clock, and the gap
+    /// `c` opens, once it is up.
     fn closing(&self) -> bool {
         false
     }

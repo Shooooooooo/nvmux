@@ -176,6 +176,12 @@ pub enum Outcome {
     /// `<prefix> c` — prompt for a name and create a new session. The child keeps
     /// running, so a cancelled prompt puts the user straight back.
     CreateNew,
+    /// `c` on the picker floating over the session — prompt for a name and
+    /// create a new session after the session named, the row the picker's
+    /// cursor was on, as the picker full screen places one; a cancelled
+    /// prompt comes back to this session with the picker floating over it
+    /// again (see [`Attachment::float_the_picker`]). The child keeps running.
+    CreateAfter(Option<crate::ids::Id>),
     /// `r` on the picker floating over the session — prompt for a new name
     /// for the session it names, which the picker does not do floating, and
     /// come back to this one with the picker floating over it again (see
@@ -213,18 +219,19 @@ impl Outcome {
     /// [`crate::ui`] screen in between to clear the outgoing frame on the way.
     ///
     /// Only a switch does — by number or by step. `ToPicker`, `CreateNew`,
-    /// `Rename`, `ShowHelp` and `ShowSettings` all open a screen, and a
-    /// screen clears as it opens; `Resettle` comes back to the session by the
-    /// session loop; the rest end the relay for good.
+    /// `CreateAfter`, `Rename`, `ShowHelp` and `ShowSettings` all open a
+    /// screen, and a screen clears as it opens; `Resettle` comes back to the
+    /// session by the session loop; the rest end the relay for good.
     fn leads_straight_into_another_relay(self) -> bool {
         matches!(self, Outcome::Switch(_))
     }
 
     /// The session this outcome names, for the caller that starts the next
     /// attachment while the outgoing one dissolves (see [`relay`]). `None` for
-    /// every other way a relay can end: the five that open a screen have
-    /// nothing to start yet — the rename prompt comes back to this session,
-    /// whichever it renames — and the three that end it have nowhere to go.
+    /// every other way a relay can end: the six that open a screen have
+    /// nothing to start yet — a prompt from the picker comes back to this
+    /// session, whichever session it names — and the three that end it have
+    /// nowhere to go.
     ///
     /// Its own accessor rather than a `matches!` at the call site, so the one
     /// rule it carries is pinned by a test — a new outcome that leads into
@@ -236,6 +243,7 @@ impl Outcome {
             Outcome::ToPicker
             | Outcome::Detached
             | Outcome::CreateNew
+            | Outcome::CreateAfter(_)
             | Outcome::Rename(_)
             | Outcome::ShowHelp
             | Outcome::ShowSettings
@@ -2088,8 +2096,9 @@ impl Attachment {
     /// Have the picker come up floating over the session on this client's
     /// next relay, as [`Attachment::float_the_settings`] has the settings, as
     /// `<prefix> Space` brings it: for the picker that went out with the
-    /// session to the rename prompt ([`Outcome::Rename`]), back once the
-    /// prompt has been answered.
+    /// session to a prompt — the rename prompt ([`Outcome::Rename`]), or the
+    /// create prompt, cancelled ([`Outcome::CreateAfter`]) — back once it has
+    /// been answered.
     pub fn float_the_picker(&mut self) {
         self.to_float = Some(Outcome::ToPicker);
     }
@@ -3534,7 +3543,7 @@ pub fn relay(
     attachment.painted = None;
     // Up over this relay's session, or not to come up at all: the settings
     // were asked to float over the session they were turned to float from,
-    // and the picker over the one it went to the rename prompt from.
+    // and the picker over the one it went to a prompt from.
     attachment.to_float = None;
     // From here on nothing the client writes reaches the terminal until it is
     // relayed again: what the ledger hears next is news to the terminal.
@@ -3567,6 +3576,7 @@ pub fn relay(
         Ok(
             held @ (Outcome::ToPicker
             | Outcome::CreateNew
+            | Outcome::CreateAfter(_)
             | Outcome::Rename(_)
             | Outcome::ShowHelp
             | Outcome::ShowSettings
@@ -3726,10 +3736,10 @@ fn pump(
 
     loop {
         // The settings, turned to float while they had the terminal to
-        // themselves, or the picker, back from the rename prompt: up over the
-        // session as soon as its screen is back, as `<prefix> ,` and `<prefix>
-        // Space` bring them, and before a key is read, so that what was typed
-        // as they went goes to them.
+        // themselves, or the picker, back from a prompt: up over the session
+        // as soon as its screen is back, as `<prefix> ,` and `<prefix> Space`
+        // bring them, and before a key is read, so that what was typed as
+        // they went goes to them.
         if let Some(outcome) = attachment.to_float.filter(|_| attachment.screen_is_back()) {
             if let Some(outcome) = float_over(attachment, master_fd, winch, outcome)? {
                 return Ok(outcome);
@@ -5756,6 +5766,8 @@ mod tests {
         for other in [
             Outcome::ToPicker,
             Outcome::CreateNew,
+            Outcome::CreateAfter(Some(id)),
+            Outcome::CreateAfter(None),
             Outcome::Rename(id),
             Outcome::ShowHelp,
             Outcome::ShowSettings,
@@ -5786,6 +5798,8 @@ mod tests {
         for other in [
             Outcome::ToPicker,
             Outcome::CreateNew,
+            Outcome::CreateAfter(Some(id)),
+            Outcome::CreateAfter(None),
             Outcome::Rename(id),
             Outcome::ShowHelp,
             Outcome::ShowSettings,

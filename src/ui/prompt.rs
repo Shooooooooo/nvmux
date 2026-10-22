@@ -2,10 +2,10 @@
 //! one is created.
 //!
 //! Three ways in: `<prefix> c` from an attached session, and `c` or `r` from the
-//! picker. [`run`] owns a terminal for the first — and for `c` on the picker
-//! floating over a session, which has none to lend, as [`rename`] does for its
-//! `r` — and `run_on` borrows the picker's full screen; a `Task` says whether a
-//! session is being invented or renamed.
+//! picker. [`run`] owns a terminal for the first, and [`create_after`] and
+//! [`rename`] for `c` and `r` on the picker floating over a session, which has
+//! none to lend; `run_on` borrows the picker's full screen. A `Task` says
+//! whether a session is being invented or renamed.
 //!
 //! It owns the whole screen rather than replacing a hint line, per the contract
 //! in the parent module. Three weights carry the three kinds of text — dim for
@@ -807,6 +807,42 @@ pub fn run(transport: &dyn Transport) -> Result<Outcome> {
             },
             Arrival::Dissolve,
         )
+    })
+}
+
+/// Ask for a new session as the picker full screen asks for one, owning the
+/// terminal while it does — for `c` on the picker floating over a session,
+/// which goes out with the session and leaves none to borrow (see
+/// [`super::picker`]). On `rows`, the picker's, with its cursor on `after`,
+/// the session is named and placed as the picker full screen names and
+/// places it, after that row (see [`super::settle`]): what comes back is the
+/// session and the rows it is among, or `None` where the prompt was
+/// cancelled.
+pub fn create_after(
+    transport: &dyn Transport,
+    rows: &[Session],
+    after: Option<&str>,
+) -> Result<Option<(Session, Vec<Session>)>> {
+    let mut picker = super::app::App::new(rows.to_vec());
+    if let Some(id) = after {
+        picker.select_session(id);
+    }
+    // Reached from a session that has just gone out to the background, so
+    // dissolve in, as for `<prefix> c`.
+    let outcome = super::owning_for_attach(Outcome::attaches, true, |terminal| {
+        run_on(
+            terminal,
+            transport,
+            Task::Create {
+                listed: Some(picker.sessions()),
+                number: Some(picker.new_number()),
+            },
+            Arrival::Dissolve,
+        )
+    })?;
+    Ok(match outcome {
+        Outcome::Created(session) => Some(super::settle(&picker, transport, session)),
+        Outcome::Renamed(_) | Outcome::Cancelled => None,
     })
 }
 

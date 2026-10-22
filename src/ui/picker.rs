@@ -9,7 +9,8 @@
 //! and so how much of its hint row there is room for ([`HINTS`]); and where a
 //! key that leads off it goes — another session, the create prompt, the
 //! rename prompt, the help, the settings, out of nvmux — which is the relay's
-//! to follow ([`Leave`]).
+//! to follow ([`Leave`]). The help and the settings come up in its place, and
+//! go back to it, as they do full screen.
 //!
 //! # Rows in hand
 //!
@@ -21,13 +22,17 @@
 //!
 //! # What it does not do floating
 //!
-//! A rename asks for the name on a screen of its own, as the picker full
-//! screen asks for it: the panel goes out with the session, the prompt comes
-//! up for the row `r` was pressed on, and once it has been answered the
-//! session comes back with the panel up over it again, the cursor on that row
-//! ([`Leave::Rename`]) — as the picker full screen is back once its prompt
-//! is. On a terminal with no room for the panel and the session round it,
-//! `<prefix> Space` has the picker full screen.
+//! The prompt that names a session is a screen of its own, as it is from the
+//! picker full screen. `c` opens the gap where the new session will go, after
+//! the row the cursor is on, as the picker full screen opens it; then the
+//! panel goes out with the session, the prompt comes up, and the session made
+//! is put in that place and attached to ([`Leave::New`]). `r` has the prompt
+//! come up for the row it was pressed on ([`Leave::Rename`]). A prompt
+//! answered with no session to go to — a rename, or a create cancelled —
+//! brings the session back with the panel up over it again, the cursor on the
+//! row it was on: as the picker full screen is back once its prompt is. On a
+//! terminal with no room for the panel and the session round it, `<prefix>
+//! Space` has the picker full screen.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -153,6 +158,9 @@ pub struct Panel {
     killing: Option<String>,
     /// A move put down, written once its landing is over.
     placing: Option<Vec<(String, u32)>>,
+    /// A session asked for with `c`, once the gap it opened is up: the row
+    /// it goes after, and when the gap opened.
+    creating: Option<(Option<Id>, Instant)>,
     /// When a half-typed number settles for the session it already names.
     deadline: Option<Instant>,
     /// Where it goes once it is down, if a key has said.
@@ -198,6 +206,7 @@ impl Panel {
             opened: now,
             killing: None,
             placing: None,
+            creating: None,
             deadline: None,
             leave: None,
             closing: false,
@@ -224,7 +233,19 @@ impl Panel {
                 Some(id) => self.go(Leave::Switch(id)),
                 None => Did::Stay,
             },
-            Request::NewSession => self.go(Leave::New),
+            // The gap where the session will go first, as the picker full
+            // screen opens it (see `super::make_room`): gone once it is up.
+            Request::NewSession => {
+                let after = self.cursor();
+                let number = Some(self.app.new_number());
+                let name = super::prompt::default_name(self.app.sessions(), number);
+                if self.app.make_room(&name) {
+                    self.creating = Some((after, self.ticked));
+                    Did::Stay
+                } else {
+                    self.go(Leave::New(after))
+                }
+            }
             Request::RenameSession(id) => match Id::new(&id) {
                 Some(id) => self.go(Leave::Rename(id)),
                 None => Did::Stay,
@@ -257,6 +278,13 @@ impl Panel {
     fn go(&mut self, to: Leave) -> Did {
         self.leave = Some(to);
         Did::Close
+    }
+
+    /// The session the cursor is on, if there are any.
+    fn cursor(&self) -> Option<Id> {
+        let rows = self.app.visible();
+        rows.get(self.app.selected_index())
+            .and_then(|s| Id::new(&s.id))
     }
 
     fn kill(&mut self, id: &str) {
@@ -332,13 +360,15 @@ impl Panel {
 
     /// Whether anything is under way that wants the panel woken soon: a
     /// listing, sessions still to be handed to the reader, its first answer,
-    /// a kill or a move waiting on what is passing over its row.
+    /// a kill or a move waiting on what is passing over its row, a new
+    /// session on the gap it opens.
     fn busy(&self) -> bool {
         self.listing.is_some()
             || !self.unread.is_empty()
             || (!self.heard && self.opened.elapsed() < crate::notes::POLL)
             || self.killing.is_some()
             || self.placing.is_some()
+            || self.creating.is_some()
     }
 
     /// The hint row's text at rest, as much of it as `width` takes.
@@ -372,9 +402,11 @@ impl Floating for Panel {
         ))
     }
 
-    /// A key, as the picker takes it; releases are no keys.
+    /// A key, as the picker takes it; releases are no keys, and nor is
+    /// anything while the gap `c` opened comes up, which the picker full
+    /// screen reads none over either.
     fn on_key(&mut self, key: KeyEvent, now: Instant) -> Did {
-        if key.kind == KeyEventKind::Release {
+        if key.kind == KeyEventKind::Release || self.creating.is_some() {
             return Did::Stay;
         }
         // Up to the key, so what it starts starts from nothing.
@@ -389,8 +421,12 @@ impl Floating for Panel {
     }
 
     /// A gesture, as the picker takes it, against the rows where they were
-    /// last drawn; a press outside the panel is the relay's.
+    /// last drawn; a press outside the panel is the relay's. None while the
+    /// gap `c` opened comes up, as no key is.
     fn on_mouse(&mut self, mouse: MouseEvent, now: Instant) -> Did {
+        if self.creating.is_some() {
+            return Did::Stay;
+        }
         let local = Rect::new(0, 0, self.drawn.width, self.drawn.height);
         let row = mouse
             .column
@@ -426,7 +462,8 @@ impl Floating for Panel {
     /// Moved on to `now`: the listing behind the rows taken up if it has come
     /// and the picker is at rest, the sessions handed to the reader of their
     /// notes and what they said taken up, a kill or a move made once what was
-    /// passing over its row is over, and a half-typed number settled once its
+    /// passing over its row is over, the panel taken down for a new session
+    /// once the gap it opened is up, and a half-typed number settled once its
     /// wait has run out.
     fn tick(&mut self, now: Instant) -> bool {
         self.move_on(now);
@@ -455,6 +492,17 @@ impl Floating for Panel {
         if self.placing.is_some() && self.app.landing().is_none() {
             if let Some(order) = self.placing.take() {
                 self.place(order);
+                changed = true;
+            }
+        }
+        // Up, and with no fade to close onto it, shown as long as the picker
+        // full screen shows it (see `super::make_room`).
+        if let Some((after, opened)) = self.creating {
+            let shown = crate::fade::enabled() || now >= opened + effects::ROOM_HELD;
+            if self.app.room().is_none() && shown {
+                self.creating = None;
+                self.leave = Some(Leave::New(after));
+                self.closing = true;
                 changed = true;
             }
         }
@@ -510,6 +558,15 @@ impl Floating for Panel {
 
     fn close(&self) {}
 
+    /// Back from the help or the settings, going nowhere as it was before
+    /// them, and with the effects as the settings left them, as the picker
+    /// full screen takes them up again (see [`App::reload_effects`]).
+    fn back(&mut self) {
+        self.leave = None;
+        self.closing = false;
+        self.app.reload_effects();
+    }
+
     fn leave(&self) -> Option<Leave> {
         self.leave
     }
@@ -547,7 +604,11 @@ mod tests {
     }
 
     fn press(panel: &mut Panel, c: char) -> Did {
-        let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        key(panel, KeyCode::Char(c))
+    }
+
+    fn key(panel: &mut Panel, code: KeyCode) -> Did {
+        let key = KeyEvent::new(code, KeyModifiers::NONE);
         panel.on_key(key, Instant::now())
     }
 
@@ -574,6 +635,53 @@ mod tests {
         let esc = back.app.came_from().map(|s| s.id.as_str());
         assert_eq!(esc, Some(behind), "Esc goes back to the session");
         assert_eq!(cursor(&Panel::open(behind)), behind);
+        hand(&[], None);
+    }
+
+    /// `c` opens the gap where the session will go, under the row the cursor
+    /// is on, as the picker full screen opens it, and takes no key while it
+    /// comes up; up, the panel goes, for the prompt to put the session after
+    /// that row.
+    #[test]
+    fn c_opens_the_gap_and_goes_to_put_the_session_after_the_row() {
+        let _turn = lock(&TURN);
+        let (one, two, behind) = ("aaaaaaaa", "bbbbbbbb", "cccccccc");
+        hand(&rows(&[one, two, behind]), None);
+        let mut panel = Panel::open(behind);
+        assert_eq!(press(&mut panel, 'k'), Did::Stay);
+        assert_eq!(press(&mut panel, 'c'), Did::Stay, "the gap first");
+        assert!(panel.app.has_room());
+        assert_eq!(press(&mut panel, 'j'), Did::Stay);
+        assert_eq!(cursor(&panel), two, "no key while the gap comes up");
+        assert!(!panel.closing());
+
+        let up = Instant::now() + effects::ROOM_HELD + Duration::from_millis(1);
+        assert!(panel.tick(up));
+        assert!(panel.closing());
+        let after = Id::new(two).expect("an id");
+        assert_eq!(panel.leave(), Some(Leave::New(Some(after))));
+        hand(&[], None);
+    }
+
+    /// Back from the help or the settings, the panel is as it was left, the
+    /// cursor where it was, and going nowhere: `Esc` goes back to the
+    /// session, not to the help again.
+    #[test]
+    fn back_from_the_help_the_panel_is_as_it_was_left() {
+        let _turn = lock(&TURN);
+        let (other, behind) = ("aaaaaaaa", "bbbbbbbb");
+        hand(&rows(&[other, behind]), None);
+        let mut panel = Panel::open(behind);
+        assert_eq!(press(&mut panel, 'k'), Did::Stay);
+        assert_eq!(press(&mut panel, '?'), Did::Close);
+        assert_eq!(panel.leave(), Some(Leave::Help));
+
+        panel.back();
+        assert_eq!(panel.leave(), None);
+        assert!(!panel.closing());
+        assert_eq!(cursor(&panel), other);
+        assert_eq!(key(&mut panel, KeyCode::Esc), Did::Close);
+        assert_eq!(panel.leave(), None, "Esc goes back to the session");
         hand(&[], None);
     }
 
