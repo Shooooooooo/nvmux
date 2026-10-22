@@ -776,7 +776,7 @@ mod tests {
     #[test]
     fn a_session_gone_with_its_socket_is_read_no_more() {
         let left = crate::test_support::scratch_sock("tell-left");
-        drop(std::os::unix::net::UnixListener::bind(&left).expect("bind"));
+        crate::test_support::dead_socket(&left);
         let now = Instant::now();
         let watched = |id: &str, sock| Watched::new(id.to_string(), id.to_string(), sock, now);
         let mut all = vec![

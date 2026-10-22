@@ -3,7 +3,7 @@
 //! overlay tests share. The screen tests have their own in
 //! [`crate::ui::test_support`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::palette::{Palette, Rgb};
@@ -36,6 +36,19 @@ pub(crate) fn scratch_dir(tag: &str) -> PathBuf {
 /// [`scratch_path`] for a socket: `<tag>.sock`, not bound to anything.
 pub(crate) fn scratch_sock(tag: &str) -> PathBuf {
     scratch_path(&format!("{tag}.sock"))
+}
+
+/// Leave a socket at `path` that nothing will ever accept a connection on, as
+/// a server that has gone leaves its own behind.
+///
+/// Not a listener bound and dropped: the tests alongside spawn processes, and
+/// a child forked while the listener is open holds it open too — until it
+/// execs, or for as long as it runs on macOS, where std cannot make a socket
+/// close-on-exec in the call that makes it — and a connect is taken into its
+/// backlog. A datagram socket never listens, and a stream connect to one is
+/// refused whoever holds it.
+pub(crate) fn dead_socket(path: &Path) {
+    drop(std::os::unix::net::UnixDatagram::bind(path).expect("bind"));
 }
 
 /// Wait up to `within` for `cond` to hold, polling gently. Returns whether it

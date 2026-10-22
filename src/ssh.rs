@@ -946,7 +946,7 @@ mod tests {
     fn a_control_path_nothing_answers_on_is_cleared() {
         let dir = crate::test_support::scratch_dir("ssh-refused");
         let ctl = dir.join("cm");
-        drop(std::os::unix::net::UnixListener::bind(&ctl).expect("bind"));
+        crate::test_support::dead_socket(&ctl);
         let ssh = Ssh::new("h".into(), ctl.clone());
 
         assert_eq!(probe(&ctl), Probe::Refused, "a socket nothing listens on");
