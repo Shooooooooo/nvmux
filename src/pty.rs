@@ -541,6 +541,42 @@ fn unsynced(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     without(bytes, fade::SYNC_END)
 }
 
+/// A first paint let out of its hold, as the release writes it: in one
+/// synchronized update, so that the terminal presents it as one frame (see
+/// [`Attachment::release_hold`]), up to where the client stopped — and what
+/// it was part way through after the update rather than inside it, for the
+/// client's next bytes to finish.
+///
+/// A hold is let go at a lull, or at the cap, and neither waits for the
+/// client to be between sequences: a client writing a screenful a pty's
+/// buffer at a time can stop for a moment in the middle of one. The
+/// update's close written there would land inside the client's sequence —
+/// a colour cut in two by nvmux's `CSI ? 2026 l` — and the terminal, made
+/// to give that sequence up, would print the rest of it as text.
+fn replay(paint: &[u8]) -> Vec<u8> {
+    let at = finished(paint);
+    let mut out = Vec::with_capacity(paint.len() + fade::SYNC_BEGIN.len() + fade::SYNC_END.len());
+    out.extend_from_slice(fade::SYNC_BEGIN);
+    out.extend_from_slice(&unsynced(&paint[..at]));
+    out.extend_from_slice(fade::SYNC_END);
+    out.extend_from_slice(&paint[at..]);
+    out
+}
+
+/// How much of `paint`, a first paint let out of its hold, the client has
+/// finished: all of it, or what is before the frame it is part way through
+/// — which then goes out in an update of the client's own, presented once
+/// the client closes it — or, with no frame of its own open, what is before
+/// the character or sequence it is part way through.
+fn finished(paint: &[u8]) -> usize {
+    if let Some(open) = memmem::rfind(paint, fade::SYNC_BEGIN) {
+        if memmem::find(&paint[open..], fade::SYNC_END).is_none() {
+            return open;
+        }
+    }
+    boundary::Boundary::new().relay_whole(paint).len()
+}
+
 /// `bytes` with every `needle` in them taken out and nothing else touched —
 /// the very bytes, borrowed, where there is none.
 fn without<'a>(bytes: &'a [u8], needle: &[u8]) -> std::borrow::Cow<'a, [u8]> {
@@ -1635,11 +1671,12 @@ impl Attachment {
         // One update, whatever the client wrote it in: a frame of its own
         // presented on its way through would show the screen as it was a
         // moment ago, over the dissolve's last frame, which has it as it is.
+        // Closed where the client stopped, which need not be between its
+        // sequences (see `replay`).
+        let mut paint = bytes[split..].to_vec();
+        paint.extend_from_slice(&later);
         let mut out = std::io::stdout().lock();
-        out.write_all(fade::SYNC_BEGIN)?;
-        out.write_all(&unsynced(&bytes[split..]))?;
-        out.write_all(&unsynced(&later))?;
-        out.write_all(fade::SYNC_END)?;
+        out.write_all(&replay(&paint))?;
         out.flush()?;
         drop(out);
         if let Some(shadow) = self.shadow.as_mut() {
@@ -5618,6 +5655,74 @@ mod tests {
             "nothing to take out"
         );
         assert_eq!(&*unsynced(b""), b"");
+    }
+
+    /// What a terminal shows of `bytes`: its first rows, a row to a line.
+    fn shown(bytes: &[u8]) -> Vec<String> {
+        let mut p = vt100::Parser::new(4, 40, 0);
+        p.process(bytes);
+        p.screen()
+            .contents()
+            .lines()
+            .map(|l| l.trim_end().to_string())
+            .collect()
+    }
+
+    /// A first paint the client finished is let through in one update, its
+    /// own frames' closes taken out of it, and nothing after the update's.
+    #[test]
+    fn a_finished_first_paint_is_let_through_in_one_update() {
+        let paint = b"\x1b[?2026h\x1b[1;1Hone\x1b[?2026l\x1b[?2026h\x1b[2;1Htwo\x1b[?2026l";
+        let out = replay(paint);
+        assert!(out.starts_with(fade::SYNC_BEGIN) && out.ends_with(fade::SYNC_END));
+        assert_eq!(memmem::find_iter(&out, fade::SYNC_END).count(), 1);
+        assert_eq!(shown(&out)[..2], ["one", "two"]);
+    }
+
+    /// A first paint let go part way through a frame of the client's — a
+    /// colour cut in two, as a hold let go at a lull catches a client writing
+    /// a screenful — has the update closed in front of that frame, which goes
+    /// after it, opened as the client opened it, for the client's next bytes
+    /// to finish: none of the colour is printed. Closed after it, the close
+    /// would cut the colour in two, and the terminal print the rest of it.
+    #[test]
+    fn a_first_paint_let_go_part_way_through_a_frame_is_closed_in_front_of_it() {
+        let done = b"\x1b[?2026h\x1b[1;1Hdrawn\x1b[?2026l";
+        let open = b"\x1b[?2026h\x1b[2;1H\x1b[38;2;207;2";
+        let rest = b"07;207mnext\x1b[?2026l";
+        let out = replay(&[&done[..], &open[..]].concat());
+        assert_eq!(
+            shown(&[&out[..], &rest[..]].concat())[..2],
+            ["drawn", "next"]
+        );
+        let close = memmem::find(&out, fade::SYNC_END).expect("closed");
+        assert_eq!(&out[close + fade::SYNC_END.len()..], &open[..]);
+    }
+
+    /// With no frame of the client's open, the update is closed in front of
+    /// the sequence, or the character, the client is part way through.
+    #[test]
+    fn a_first_paint_let_go_part_way_through_a_sequence_is_closed_in_front_of_it() {
+        for (paint, rest, row) in [
+            (
+                &b"\x1b[1;1Hdrawn \x1b[38;2;20"[..],
+                &b"7;0;0mon"[..],
+                "drawn on",
+            ),
+            (
+                &b"\x1b[1;1Hdrawn \xe2\x94"[..],
+                &b"\x82on"[..],
+                "drawn \u{2502}on",
+            ),
+        ] {
+            let out = replay(paint);
+            let close = memmem::find(&out, fade::SYNC_END).expect("closed");
+            assert!(
+                paint.ends_with(&out[close + fade::SYNC_END.len()..]),
+                "{row}: what follows the close is the client's unfinished tail"
+            );
+            assert_eq!(shown(&[&out[..], rest].concat())[0], row);
+        }
     }
 
     /// The one outcome with a session to begin before the screen goes. Every

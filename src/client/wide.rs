@@ -21,7 +21,12 @@
 //! another has its text in its middle from the first frame of its flying in,
 //! not a round trip later — over a slow link, once it had landed against the
 //! window's edge — and Neovim's grid of that width, when it comes, moves
-//! nothing, but for where long lines wrap. Text that moves in or out of a
+//! nothing, but for where long lines wrap. Nor does its answer to an ask
+//! asked again since for less, as a window split off another is — asked for
+//! `window_width` before the measure has said what it wants, and then for
+//! what it wants: Neovim drew nothing of its grid at the first width, and
+//! cuts it again on the next ask, so the client's copy keeps the narrower
+//! width through it (see `App::grid_resized`). Text that moves in or out of a
 //! window that stays where it is — the window's width judged again, or the
 //! window wanting the whole terminal — slides there rather than jumping (see
 //! [`super::anim::Animator::insets`]).
