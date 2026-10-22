@@ -679,10 +679,16 @@ impl Shot {
                 }
             }
         }
+        // A window on its way that shows what it showed in the middle of its
+        // frame (see [`middle`]) goes on from there.
+        let showed = |g: &u64| running.and_then(|t| t.showed(model, *g));
         let rows = layout
             .panes
             .keys()
             .filter_map(|g| {
+                if let Some(rows) = showed(g) {
+                    return Some((*g, rows.clone()));
+                }
                 let grid = model.grids.get(g)?;
                 Some((*g, grid.lines(0, grid.height(), 0, grid.width())))
             })
@@ -690,13 +696,14 @@ impl Shot {
         let insets = layout
             .panes
             .iter()
-            .filter(|(g, _)| model.inset(**g) > 0)
             .filter_map(|(g, p)| {
+                let width = match showed(g) {
+                    Some(rows) => rows.first().map_or(0, Vec::len),
+                    None if model.inset(*g) > 0 => model.grids.get(g)?.width(),
+                    None => return None,
+                };
                 let text = p.grid(p.frame).width().max(0) as usize;
-                Some((
-                    *g,
-                    crate::client::wide::inset(text, model.grids.get(g)?.width()),
-                ))
+                Some((*g, crate::client::wide::inset(text, width)))
             })
             .collect();
         Some(Shot {
@@ -1173,6 +1180,10 @@ pub struct Transition {
     /// What the windows showed before, by grid: what a frame bigger than a
     /// window's grid shows past it.
     rows: HashMap<u64, Vec<Vec<Cell>>>,
+    /// How far into its frame each window's text was drawn before, by grid,
+    /// where it was drawn narrower than the window, in its middle (see
+    /// `crate::client::wide`).
+    insets: HashMap<u64, usize>,
     /// A window opened, whose text fades in out of its background — that
     /// highlight's.
     veil: Option<(u64, u32)>,
@@ -1198,6 +1209,7 @@ impl Transition {
         Transition {
             wins,
             rows: old.rows,
+            insets: old.insets,
             veil: None,
             ghosts: None,
             elapsed: 0.0,
@@ -1222,6 +1234,19 @@ impl Transition {
     /// Whether window grid `grid` is one of those moving.
     pub fn involves(&self, grid: u64) -> bool {
         self.wins.contains_key(&grid)
+    }
+
+    /// What window `grid` draws in the middle of its frame (see [`middle`]).
+    fn middle_of(&self, model: &Model, grid: u64) -> Option<Middle> {
+        let was = self.insets.get(&grid).is_some_and(|&inset| inset > 0);
+        middle(model, grid, self.rows.get(&grid), was)
+    }
+
+    /// What window `grid` showed before, where it shows that in the middle
+    /// of its frame.
+    fn showed(&self, model: &Model, grid: u64) -> Option<&Vec<Vec<Cell>>> {
+        self.middle_of(model, grid).filter(|m| m.old)?;
+        self.rows.get(&grid)
     }
 
     /// What the windows showed before, the veil a window opened fades in
@@ -1295,9 +1320,11 @@ impl Transition {
         for (grid, (_, pane)) in &self.wins {
             let at = now[grid];
             let shift = shift(*grid) + ghost_shift(model, *grid, pane.grid(at), &ghosts);
-            draw_window(frame, model, *grid, pane, at, self.rows.get(grid), shift);
+            let middle = self.middle_of(model, *grid);
+            let old = self.rows.get(grid);
+            draw_window(frame, model, *grid, pane.grid(at), old, middle, shift);
             if let Some(chrome) = chrome {
-                draw_lines(frame, model, chrome, *grid, pane, at, shift);
+                draw_lines(frame, model, chrome, pane, at, middle, shift);
             }
         }
         if let Some((grid, bg)) = self.veil {
@@ -1341,7 +1368,37 @@ fn ghost_shift(model: &Model, grid: u64, text: Area, ghosts: &[(&Ghost, Spot)]) 
     pad(open - text.left) - pad(text.width())
 }
 
-/// Window `grid`'s text in the frame `at` has for it, from its top left.
+/// A window's text drawn in the middle of its frame on its way, narrower
+/// than the frame (see `crate::client::wide`).
+#[derive(Debug, Clone, Copy)]
+struct Middle {
+    /// How wide the text is.
+    width: usize,
+    /// It is what the window showed before rather than its grid.
+    old: bool,
+}
+
+/// What [`draw_window`] draws in the middle of window `grid`'s frame, if
+/// anything (see `crate::client::wide`): its grid, where the window has its
+/// text there where it goes; else what it showed, `old`, where it had that
+/// there before (`was`). Such a window was made narrower than its text —
+/// which Neovim lays out again for its width, once asked to — and is no
+/// bigger than it was: it shows what it showed, going from the middle of
+/// where it was to the frame's edge and then cut down to size, rather than
+/// its grid from the edge at once, with what it showed past the end of a
+/// grid laid out again.
+fn middle(model: &Model, grid: u64, old: Option<&Vec<Vec<Cell>>>, was: bool) -> Option<Middle> {
+    if model.inset(grid) > 0 {
+        let width = model.grids.get(&grid)?.width();
+        return Some(Middle { width, old: false });
+    }
+    let rows = old.filter(|_| was)?;
+    let width = rows.first().map_or(0, Vec::len);
+    Some(Middle { width, old: true })
+}
+
+/// Window `grid`'s text in `text`, the grid's part of the frame it has, from
+/// its top left.
 ///
 /// A window no bigger than it was shows what it showed, cut down to size:
 /// what Neovim drew for where it is going is laid out for there — its lines
@@ -1353,26 +1410,23 @@ fn draw_window(
     frame: &mut Frame,
     model: &Model,
     grid: u64,
-    pane: &Pane,
-    at: Area,
+    text: Area,
     old: Option<&Vec<Vec<Cell>>>,
+    middle: Option<Middle>,
     shift: i64,
 ) {
-    let text = pane.grid(at);
     let g = model.grids.get(&grid);
     let (height, width) = (text.height().max(0) as usize, text.width().max(0) as usize);
     let within =
         old.is_some_and(|rows| height <= rows.len() && width <= rows.first().map_or(0, Vec::len));
     // A window whose text is drawn narrower than it, in its middle (see
     // `crate::client::wide`), has it in the middle of its frame on the way
-    // there too: its grid, and nothing either side of it.
-    let pad = if model.inset(grid) > 0 {
-        width.saturating_sub(g.map_or(0, Grid::width)) / 2
-    } else {
-        0
-    };
+    // too, and nothing either side of it: its grid, or what it showed (see
+    // [`middle`]).
+    let pad = middle.map_or(0, |m| width.saturating_sub(m.width) / 2);
     // And `shift` from there, on its way across the window.
     let pad = (pad as i64 + shift).max(0) as usize;
+    let showed = middle.is_some_and(|m| m.old);
     for r in 0..height {
         for c in 0..width {
             let k = c.checked_sub(pad);
@@ -1380,15 +1434,17 @@ fn draw_window(
                 let k = k?;
                 g.and_then(|g| Some((g.cell(r, k)?, g.is_wide(r, k))))
             };
+            // What it showed, where it lines up: from the frame's edge, or
+            // in its middle as it was.
             let was = || {
-                let k = k.filter(|_| pad == 0)?;
+                let k = k.filter(|_| pad == 0 || showed)?;
                 let row = old?.get(r)?;
                 Some((
                     row.get(k)?,
                     row.get(k + 1).is_some_and(|n| n.text == Text::Half),
                 ))
             };
-            let cell = if within {
+            let cell = if within || showed {
                 was().or_else(own)
             } else {
                 own().or_else(was)
@@ -1425,14 +1481,16 @@ fn edge(g: Option<&Grid>, old: Option<&Vec<Vec<Cell>>>, r: usize, c: usize) -> u
 
 /// A window's separator and status line in the frame `at`, as Neovim drew
 /// them where the window ends up: the separator as long as the frame is
-/// deep, and the status line as wide as it is (see [`stretch`]).
+/// deep, and the status line as wide as it is (see [`stretch`]) — its words
+/// over the window's text, where that is in the middle of the frame,
+/// `middle`.
 fn draw_lines(
     frame: &mut Frame,
     model: &Model,
     chrome: &Grid,
-    grid: u64,
     pane: &Pane,
     at: Area,
+    middle: Option<Middle>,
     shift: i64,
 ) {
     let f = pane.frame;
@@ -1472,10 +1530,10 @@ fn draw_lines(
         }
         // A window whose text is centred in it (see `crate::client::wide`)
         // has its status line's words over its text on the way there too.
-        let text = model.grids.get(&grid).map_or(0, Grid::width);
+        let text = middle.map_or(0, |m| m.width);
         let body = (at.width() - i64::from(pane.vsep)).max(0) as usize;
         if let (true, Ok(row), Ok(left)) = (
-            model.inset(grid) > 0 && text > 0 && text < body,
+            text > 0 && text < body,
             usize::try_from(at.bottom - 1),
             usize::try_from(at.left),
         ) {
@@ -2301,6 +2359,141 @@ mod tests {
         assert_eq!(s.at(0), before, "the left one closed");
         let mid = s.rows(100);
         assert_eq!(col_of(&mid[0], 'a'), Some(3), "where it was: {mid:?}");
+    }
+
+    /// The window, its text 13 wide in its middle and its status line's
+    /// words over it, split with 'splitright' into two 10 wide: on the left
+    /// grid 2, narrower than its text, which Neovim keeps 13 wide until it
+    /// is asked again (see `crate::client::wide`); on the right grid 4, full
+    /// of `b`. On its way.
+    fn split_narrower_than_its_text() -> Scene {
+        let mut s = Scene::new(Options {
+            splitright: true,
+            ..Options::default()
+        });
+        s.model.set_laststatus(Some(2));
+        let mut events = centred(2, 0, (21, 13), 'a');
+        events.push(line(1, 4, 0, "x                   y"));
+        s.batch(events);
+        let rows: Vec<String> = s.settle().lines().map(String::from).collect();
+        assert_eq!(rows[0], "    aaaaaaaaaaaaa    ");
+        assert_eq!(rows[4], "    x           y    ");
+        let mut events = centred(2, 0, (10, 13), 'a');
+        events.extend(window(4, 0, 11, (10, 4), 'b'));
+        events.extend((0..4).map(|r| line(1, r, 10, "│")));
+        events.push(line(1, 4, 0, "x        y x        y"));
+        events.push(cursor(4));
+        s.batch(events);
+        assert!(s.moving());
+        s
+    }
+
+    /// A window whose text was drawn in its middle, split narrower than its
+    /// text: the text goes from the middle of where it was to the window's
+    /// left edge with the window, its status line's words over it — not
+    /// there at once.
+    #[test]
+    fn centred_text_of_a_window_split_narrower_than_it_goes_to_its_edge() {
+        let mut s = split_narrower_than_its_text();
+        let mut seen = Vec::new();
+        for ms in (0..=150).step_by(10) {
+            let rows = s.rows(ms);
+            seen.push((col_of(&rows[0], 'a'), col_of(&rows[4], 'x')));
+        }
+        assert_eq!(seen[0], (Some(3), Some(3)), "where it was: {seen:?}");
+        assert!(
+            seen.iter().all(|(text, words)| text == words),
+            "the words over the text: {seen:?}"
+        );
+        assert!(
+            seen.windows(2).all(|w| w[0].0 >= w[1].0),
+            "only ever left: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|(c, _)| c.is_some_and(|c| c > 0 && c < 3)),
+            "on its way: {seen:?}"
+        );
+        let rows: Vec<String> = s.settle().lines().map(String::from).collect();
+        assert!(!s.moving());
+        assert_eq!(col_of(&rows[0], 'a'), Some(0), "at its edge: {rows:?}");
+        assert_eq!(rows[4], "x        y x        y");
+    }
+
+    /// The same, the window drawn again and then the windows placed again
+    /// where they go before they land, as a refresh places them: the text
+    /// goes on from where it is to the window's edge, still what it showed
+    /// — not there at once, nor what was drawn since.
+    #[test]
+    fn centred_text_of_a_window_split_narrower_than_it_goes_on_when_placed_again() {
+        let mut s = split_narrower_than_its_text();
+        s.at(10);
+        s.now += Duration::from_millis(10);
+        s.batch((0..4).map(|r| line(2, r, 0, &"c".repeat(13))).collect());
+        let before = s.rows(10);
+        let from = col_of(&before[0], 'a').expect("what it showed");
+        assert!(from > 0, "{before:?}");
+        s.now += Duration::from_millis(10);
+        let place = |grid: u64, col: usize| Event::WinPos {
+            grid,
+            win: Some(1000 + grid as i64),
+            row: 0,
+            col,
+            width: 10,
+            height: 4,
+        };
+        s.batch(vec![place(2, 0), place(4, 11)]);
+        assert!(s.moving(), "still on its way");
+        let mut seen = Vec::new();
+        for ms in (0..=140).step_by(10) {
+            let rows = s.rows(ms);
+            assert!(!rows[0].contains('c'), "at {ms} ms: {rows:?}");
+            seen.push((col_of(&rows[0], 'a'), col_of(&rows[4], 'x')));
+        }
+        assert_eq!(seen[0], (Some(from), Some(from)), "where it was: {seen:?}");
+        assert!(
+            seen.iter().all(|(text, words)| text == words),
+            "the words over the text: {seen:?}"
+        );
+        assert!(
+            seen.windows(2).all(|w| w[0].0 >= w[1].0),
+            "only ever left: {seen:?}"
+        );
+        assert!(seen.contains(&(Some(0), Some(0))), "{seen:?}");
+        let rows: Vec<String> = s.settle().lines().map(String::from).collect();
+        assert!(!s.moving());
+        assert_eq!(col_of(&rows[0], 'c'), Some(0), "landed: {rows:?}");
+        assert_eq!(rows[4], "x        y x        y");
+    }
+
+    /// The same, Neovim laying the window's grid out again for its width
+    /// before it lands: on its way it shows what it showed, cut down to
+    /// size — not its new grid with what it showed past the grid's edge,
+    /// the two pieced together.
+    #[test]
+    fn a_window_split_narrower_than_its_text_shows_what_it_showed() {
+        let mut s = split_narrower_than_its_text();
+        s.at(10);
+        s.now += Duration::from_millis(10);
+        let mut events = vec![Event::GridResize {
+            grid: 2,
+            width: 10,
+            height: 4,
+        }];
+        events.extend((0..4).map(|r| line(2, r, 0, &"c".repeat(10))));
+        s.batch(events);
+        assert!(s.moving(), "still on its way");
+        for ms in (0..=130).step_by(10) {
+            let rows = s.rows(ms);
+            let left: String = rows[0].chars().take_while(|c| *c != '│').collect();
+            let text = left.trim_matches(' ');
+            assert!(
+                !text.is_empty() && text.chars().all(|c| c == 'a'),
+                "at {ms} ms: {rows:?}"
+            );
+        }
+        let rows: Vec<String> = s.settle().lines().map(String::from).collect();
+        assert!(!s.moving());
+        assert_eq!(rows[0], "cccccccccc│bbbbbbbbbb");
     }
 
     /// The first window closed: the one after it moves into its place, its
