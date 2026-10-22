@@ -499,7 +499,8 @@ pub fn a_job_that_exits(sock: &Path, script: &str, on_screen: bool) -> i64 {
         "local buf = vim.api.nvim_create_buf(true, false)"
     };
     // Given longer than the wait in it, so that a job slow to close, on a
-    // busy machine, is waited out by Neovim and not by the call.
+    // busy machine, is waited out by Neovim and not by the call; and one
+    // that never closes fails the call, saying so.
     lua_within(
         sock,
         &format!(
@@ -515,9 +516,11 @@ vim.api.nvim_create_autocmd('TermClose', {{
 vim.api.nvim_buf_call(buf, function()
   vim.fn.jobstart({{ 'sh', '-c', [=[{script}]=] }}, {{ term = true }})
 end)
-vim.wait(5000, function()
+if not vim.wait(10000, function()
   return closed
-end)
+end) then
+  error('the job never closed')
+end
 return buf"#
         ),
         Duration::from_secs(15),

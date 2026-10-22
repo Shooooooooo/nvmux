@@ -3298,13 +3298,20 @@ fn a_character_typed_otherwise_after_the_proof_is_put_right_at_once() {
         term.text()
     );
     let right = right.expect("put right");
-    let acked = link
-        .trace
-        .acks()
-        .into_iter()
-        .find(|(_, a)| count(a) > before)
-        .map(|(written, _)| written)
-        .expect("an ack covering the q");
+    // The link puts what it carried in its trace just after writing it on,
+    // which the client can be quicker to draw from than that.
+    let covering = || {
+        link.trace
+            .acks()
+            .into_iter()
+            .find(|(_, a)| count(a) > before)
+            .map(|(written, _)| written)
+    };
+    assert!(
+        common::wait_until(Duration::from_secs(1), || covering().is_some()),
+        "no ack covering the q"
+    );
+    let acked = covering().expect("an ack covering the q");
     assert!(
         right < acked + SLOW,
         "put right {:?} after the ack that covered the q",

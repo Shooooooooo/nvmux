@@ -48,9 +48,11 @@ pub(crate) fn quietly<T>(f: impl FnOnce() -> T) -> T {
     let _turn = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let out = f();
+    // The hook back however `f` ends: a panic that gets out of it is the
+    // test failing, and has to be said.
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     std::panic::set_hook(hook);
-    out
+    out.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 /// Leave a socket at `path` that nothing will ever accept a connection on, as
