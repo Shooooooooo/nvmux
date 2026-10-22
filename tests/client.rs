@@ -3265,22 +3265,52 @@ fn a_character_typed_otherwise_after_the_proof_is_put_right_at_once() {
     require_nvim!();
     let scratch = Scratch::new("client-charpre-late");
     let setline = r#"call setline(1, ["x", "line 1"]) | exe "autocmd InsertCharPre * if v:char ==# 'q' | let v:char = 'Q!' | endif""#;
-    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, "client-charpre-late", setline, TYPING);
+    let (_rpc, mut term, link) =
+        drawn_slowly_with(&scratch, "client-charpre-late", setline, TYPING);
     typed(&mut term, b"A");
     for c in "abcdefghij".chars() {
         typed(&mut term, c.to_string().as_bytes());
     }
+    // How many keys the agent had counted before the q.
+    let count = |a: &Vec<Value>| a.first().and_then(Value::as_u64).expect("a count");
+    let before = link
+        .trace
+        .acks()
+        .last()
+        .map(|(_, a)| count(a))
+        .expect("an ack");
     let drawn = ahead(&mut term, "q, proved", b"q");
     assert!(sight(&drawn).0[0].starts_with("xabcdefghijq"));
-    // Put right when Neovim's own frame lands, however late, and the frames
-    // after it in before the next key.
+    // Put right with Neovim's word on the q, however late a busy machine
+    // brings that: within a link's delay of the ack that covers it, and not
+    // as late as the client gives a prediction up without a word, twice the
+    // round trip and more.
+    let mut right = None;
     assert!(
         term.frames(Duration::from_secs(10), |screen| {
-            sight(screen).0[0].starts_with("xabcdefghijQ!")
+            let put = sight(screen).0[0].starts_with("xabcdefghijQ!");
+            if put {
+                right = Some(Instant::now());
+            }
+            put
         }),
         "put right:\n{}",
         term.text()
     );
+    let right = right.expect("put right");
+    let acked = link
+        .trace
+        .acks()
+        .into_iter()
+        .find(|(_, a)| count(a) > before)
+        .map(|(written, _)| written)
+        .expect("an ack covering the q");
+    assert!(
+        right < acked + SLOW,
+        "put right {:?} after the ack that covered the q",
+        right.saturating_duration_since(acked)
+    );
+    // The frames after it in before the next key.
     last_frame(&mut term, SLOW);
     waited(&mut term, "q, proving itself again", b"q");
 }
