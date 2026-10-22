@@ -66,8 +66,8 @@ fn run(cli: &Cli) -> Result<()> {
 
     let location = cli.location();
     let remote = matches!(location, transport::Location::Ssh(_));
-    // Before any client is started: each is told it with its settings, which
-    // is what `[client] predict = "auto"` goes by.
+    // Before any client is started: each is told it with its settings, and
+    // predicts for a session over ssh where they say "auto".
     config::set_remote(remote);
 
     // The local nvim, checked up front rather than surfacing later as an
