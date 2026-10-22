@@ -11,6 +11,12 @@ env:
   # be a silent no-op, so a missing nvim is a failure here. `ssh` is not
   # listed: the SSH tests need a host that answers, which a runner has not.
   NVMUX_TEST_REQUIRE: nvim
+  # The integration tests spend their time waiting — on Neovim, on links made
+  # slow on purpose, on frames — not computing: tests/client.rs adds up to
+  # the same 1,520 test-seconds run 4, 8 or 16 at a time, and is done in 394,
+  # 202 or 111. One per core, the default, is 4 on a Linux runner and 3 on a
+  # macOS one.
+  RUST_TEST_THREADS: 16
 
 jobs:
   test:
@@ -25,6 +31,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # The dependencies, built optimised in a debug build (see Cargo.toml),
+      # once for every change of toolchain or Cargo.lock rather than every
+      # run. Saved from main alone, which every branch can restore from, so
+      # that branches do not crowd main's out of the repository's cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install Neovim (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -56,4 +69,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --all-targets
