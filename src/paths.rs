@@ -701,11 +701,44 @@ mod tests {
             std::fs::remove_file(&d).ok();
         }
 
+        /// Set on the test binary [`survives_a_hostile_umask`] runs again, for
+        /// [`hostile_umask_child`] to do its work.
+        const HOSTILE_CHILD: &str = "NVMUX_TEST_HOSTILE_UMASK_CHILD";
+
         /// A hostile umask masks mkdir's mode argument, so the mode has to be
         /// forced afterwards.
+        ///
+        /// In a process of its own: the mask is the whole process's, and
+        /// umask_lock() keeps only the tests here out of its way. While it is
+        /// hostile, a file any other test in this binary makes is born with no
+        /// owner bits, and a shell any other starts inherits it — for as long
+        /// as a busy machine leaves this thread off its CPU half way through.
         #[test]
         fn survives_a_hostile_umask() {
-            let _guard = umask_lock();
+            let out = std::process::Command::new(std::env::current_exe().expect("the tests"))
+                .args([
+                    "--exact",
+                    "paths::tests::security::hostile_umask_child",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env(HOSTILE_CHILD, "1")
+                .output()
+                .expect("run the child");
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "the child failed: {said}");
+            assert!(said.contains("1 passed"), "the child did not run: {said}");
+        }
+
+        /// The child half of [`survives_a_hostile_umask`]. Ignored so that
+        /// `cargo test` does not run it on its own; without the environment it
+        /// does nothing, so a stray `--ignored` run is harmless.
+        #[test]
+        #[ignore = "the child half of survives_a_hostile_umask; run by it, not by hand"]
+        fn hostile_umask_child() {
+            if std::env::var_os(HOSTILE_CHILD).is_none() {
+                return;
+            }
             let previous = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o700));
             let d = scratch("umask");
             let result = ensure_dir_secure(&d);
