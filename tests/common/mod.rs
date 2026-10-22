@@ -136,22 +136,38 @@ impl Drop for Scratch {
         // in `<id>.json` was validated against its socket at spawn time. That
         // leaves a live session with no `<id>.json` out of reach, so a test
         // that makes one has to kill it itself.
+        //
+        // And only a process that is that session still, its socket on its
+        // command line: a session that has gone may have left its pid to
+        // another process by now — another test's, run alongside, or anything
+        // else of the user's — and a test may write a pid of its own making.
         if let Ok(entries) = std::fs::read_dir(&self.0) {
             for e in entries.flatten() {
                 let p = e.path();
                 if p.extension().is_none_or(|x| x != "json") {
                     continue;
                 }
-                let pid = std::fs::read_to_string(&p)
+                let Some(meta) = std::fs::read_to_string(&p)
                     .ok()
                     .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
-                    .and_then(|v| v.get("pid").and_then(serde_json::Value::as_i64))
+                else {
+                    continue;
+                };
+                let sock = meta
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|id| format!("{id}.sock"));
+                let pid = meta
+                    .get("pid")
+                    .and_then(serde_json::Value::as_i64)
                     .filter(|pid| *pid > 1);
-                if let Some(pid) = pid {
-                    let _ = nix::sys::signal::kill(
-                        nix::unistd::Pid::from_raw(pid as i32),
-                        nix::sys::signal::Signal::SIGKILL,
-                    );
+                if let (Some(sock), Some(pid)) = (sock, pid) {
+                    if command_line(pid as u32).contains(&sock) {
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(pid as i32),
+                            nix::sys::signal::Signal::SIGKILL,
+                        );
+                    }
                 }
             }
         }
