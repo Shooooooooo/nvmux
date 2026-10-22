@@ -2224,37 +2224,65 @@ fn a_crawling_client_comes_back_as_its_session_is_now() {
         term.pump_until(Duration::from_secs(5), |out| find(out, DA1).is_some()),
         "the client never asked its DA1"
     );
-    // Long enough since its last frame that the client draws the one it goes
-    // with at once, and then nothing for a second.
-    term.pump_until(Duration::from_millis(1500), |_| false);
+    // Parked, the line changed, and brought back, until the change comes in
+    // with the screen, six times at most. The relay gives the client
+    // `CARD_WAIT` to draw it (see `nvmux::pty`), no longer: a client too busy
+    // for that, as on a busy machine, has the screen come back as it was and
+    // jump once the fade is over, which says nothing of what is drawn in
+    // time. A relay that never waits has every return late, and fails.
+    let mut was = String::from("as it was");
+    let mut late = 0;
+    loop {
+        let now = format!("as it is now, {late}");
+        // Long enough since its last frame that the client draws the one it
+        // goes with at once, and then nothing for a second.
+        term.pump_until(Duration::from_millis(1500), |_| false);
 
-    let mark = term.output.len();
-    term.type_bytes(&[nvmux::keys::PREFIX, b' ']);
-    assert!(
-        term.pump_until(Duration::from_secs(5), |out| {
-            find(&out[mark.min(out.len())..], PARKED).is_some()
-        }),
-        "the child never parked its client"
-    );
-    rpc.command("call setline(1, 'as it is now')")
-        .expect("setline");
-    assert!(
-        term.pump_until(Duration::from_secs(5), |out| {
-            find(&out[mark.min(out.len())..], RESUMED).is_some()
-        }),
-        "the parked client never came back"
-    );
-    let after = mark + find(&term.output[mark..], RESUMED).expect("resumed") + RESUMED.len();
-    term.pump_until(Duration::from_millis(LONG_FADE_MS / 4), |_| false);
-    assert!(
-        find(&term.output[after..], b"\x1b[2J").is_none(),
-        "the fade in was over within a quarter of its length"
-    );
-    let row = row_on_screen(&term.output, 0);
-    assert!(
-        row.contains("as it is now"),
-        "a quarter into the fade in, the screen coming back is {row:?}"
-    );
+        let mark = term.output.len();
+        term.type_bytes(&[nvmux::keys::PREFIX, b' ']);
+        assert!(
+            term.pump_until(Duration::from_secs(5), |out| {
+                find(&out[mark.min(out.len())..], PARKED).is_some()
+            }),
+            "the child never parked its client"
+        );
+        rpc.command(&format!("call setline(1, '{now}')"))
+            .expect("setline");
+        assert!(
+            term.pump_until(Duration::from_secs(5), |out| {
+                find(&out[mark.min(out.len())..], RESUMED).is_some()
+            }),
+            "the parked client never came back"
+        );
+        let after = mark + find(&term.output[mark..], RESUMED).expect("resumed") + RESUMED.len();
+        term.pump_until(Duration::from_millis(LONG_FADE_MS / 4), |_| false);
+        assert!(
+            find(&term.output[after..], b"\x1b[2J").is_none(),
+            "the fade in was over within a quarter of its length"
+        );
+        let row = row_on_screen(&term.output, 0);
+        if row.contains(&now) {
+            break;
+        }
+        assert!(
+            row.contains(&was),
+            "a quarter into the fade in, the screen coming back is {row:?}"
+        );
+        late += 1;
+        assert!(
+            late < 6,
+            "the screen came back as it was, {late} times in a row"
+        );
+        // Drawn as it is now once the fade is over, before the next return.
+        assert!(
+            term.pump_until(Duration::from_secs(5), |out| {
+                row_on_screen(out, 0).contains(&now)
+            }),
+            "after the fade in, the screen is {:?}",
+            row_on_screen(&term.output, 0)
+        );
+        was = now;
+    }
     assert_eq!(detach(&mut term), Some(0), "the child did not detach");
 }
 
