@@ -679,10 +679,16 @@ impl Shot {
                 }
             }
         }
+        // A window on its way that shows what it showed in the middle of its
+        // frame (see [`middle`]) goes on from there.
+        let showed = |g: &u64| running.and_then(|t| t.showed(model, *g));
         let rows = layout
             .panes
             .keys()
             .filter_map(|g| {
+                if let Some(rows) = showed(g) {
+                    return Some((*g, rows.clone()));
+                }
                 let grid = model.grids.get(g)?;
                 Some((*g, grid.lines(0, grid.height(), 0, grid.width())))
             })
@@ -690,13 +696,14 @@ impl Shot {
         let insets = layout
             .panes
             .iter()
-            .filter(|(g, _)| model.inset(**g) > 0)
             .filter_map(|(g, p)| {
+                let width = match showed(g) {
+                    Some(rows) => rows.first().map_or(0, Vec::len),
+                    None if model.inset(*g) > 0 => model.grids.get(g)?.width(),
+                    None => return None,
+                };
                 let text = p.grid(p.frame).width().max(0) as usize;
-                Some((
-                    *g,
-                    crate::client::wide::inset(text, model.grids.get(g)?.width()),
-                ))
+                Some((*g, crate::client::wide::inset(text, width)))
             })
             .collect();
         Some(Shot {
@@ -1233,6 +1240,13 @@ impl Transition {
     fn middle_of(&self, model: &Model, grid: u64) -> Option<Middle> {
         let was = self.insets.get(&grid).is_some_and(|&inset| inset > 0);
         middle(model, grid, self.rows.get(&grid), was)
+    }
+
+    /// What window `grid` showed before, where it shows that in the middle
+    /// of its frame.
+    fn showed(&self, model: &Model, grid: u64) -> Option<&Vec<Vec<Cell>>> {
+        self.middle_of(model, grid).filter(|m| m.old)?;
+        self.rows.get(&grid)
     }
 
     /// What the windows showed before, the veil a window opened fades in
@@ -2396,6 +2410,52 @@ mod tests {
         let rows: Vec<String> = s.settle().lines().map(String::from).collect();
         assert!(!s.moving());
         assert_eq!(col_of(&rows[0], 'a'), Some(0), "at its edge: {rows:?}");
+        assert_eq!(rows[4], "x        y x        y");
+    }
+
+    /// The same, the window drawn again and then the windows placed again
+    /// where they go before they land, as a refresh places them: the text
+    /// goes on from where it is to the window's edge, still what it showed
+    /// — not there at once, nor what was drawn since.
+    #[test]
+    fn centred_text_of_a_window_split_narrower_than_it_goes_on_when_placed_again() {
+        let mut s = split_narrower_than_its_text();
+        s.at(10);
+        s.now += Duration::from_millis(10);
+        s.batch((0..4).map(|r| line(2, r, 0, &"c".repeat(13))).collect());
+        let before = s.rows(10);
+        let from = col_of(&before[0], 'a').expect("what it showed");
+        assert!(from > 0, "{before:?}");
+        s.now += Duration::from_millis(10);
+        let place = |grid: u64, col: usize| Event::WinPos {
+            grid,
+            win: Some(1000 + grid as i64),
+            row: 0,
+            col,
+            width: 10,
+            height: 4,
+        };
+        s.batch(vec![place(2, 0), place(4, 11)]);
+        assert!(s.moving(), "still on its way");
+        let mut seen = Vec::new();
+        for ms in (0..=140).step_by(10) {
+            let rows = s.rows(ms);
+            assert!(!rows[0].contains('c'), "at {ms} ms: {rows:?}");
+            seen.push((col_of(&rows[0], 'a'), col_of(&rows[4], 'x')));
+        }
+        assert_eq!(seen[0], (Some(from), Some(from)), "where it was: {seen:?}");
+        assert!(
+            seen.iter().all(|(text, words)| text == words),
+            "the words over the text: {seen:?}"
+        );
+        assert!(
+            seen.windows(2).all(|w| w[0].0 >= w[1].0),
+            "only ever left: {seen:?}"
+        );
+        assert!(seen.contains(&(Some(0), Some(0))), "{seen:?}");
+        let rows: Vec<String> = s.settle().lines().map(String::from).collect();
+        assert!(!s.moving());
+        assert_eq!(col_of(&rows[0], 'c'), Some(0), "landed: {rows:?}");
         assert_eq!(rows[4], "x        y x        y");
     }
 
