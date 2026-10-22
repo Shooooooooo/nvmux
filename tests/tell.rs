@@ -179,8 +179,20 @@ fn the_notifier_posts_cards_for_the_session_in_front() {
     notifier.watch(&front.id, "front", front_sock.clone());
     notifier.watch(&other.id, "other", other_sock.clone());
     notifier.front(Some(&front.id));
-    // The first round only finds out how far each session has got.
-    std::thread::sleep(Duration::from_millis(800));
+    // The first round only finds out how far each session has got, and puts
+    // its watcher in each: waited for, rather than slept for as long as that
+    // takes, which a busy machine makes longer.
+    let watched = |sock: &std::path::Path| {
+        lua(
+            sock,
+            "return pcall(vim.api.nvim_get_autocmds, { group = 'nvmux_notes' })",
+        ) == rmpv::Value::Boolean(true)
+    };
+    assert!(
+        wait_until(Duration::from_secs(10), || watched(&front_sock)
+            && watched(&other_sock)),
+        "the first round never watched both sessions"
+    );
     card::board().take();
 
     let within = Duration::from_secs(8);

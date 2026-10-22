@@ -125,10 +125,12 @@ fn a_card_comes_as_its_news_happens_and_the_reads_stop() {
         "read {before} times before it was left alone"
     );
 
-    let started = Instant::now();
+    // Timed from the job's end, which is the news: its start is a pty, a
+    // shell and its exit before that, which a busy machine makes longer.
     a_job_that_exits(&other_sock, "exit 0", false);
+    let started = Instant::now();
     let took = card_saying("sh: exited with code 0", started);
-    eprintln!("card {took:?} after the job was started");
+    eprintln!("card {took:?} after the job ended");
     assert!(took < Duration::from_secs(1), "the card took {took:?}");
     std::thread::sleep(notes::POLL + Duration::from_millis(500));
     assert_eq!(

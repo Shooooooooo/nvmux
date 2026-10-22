@@ -22,7 +22,12 @@ use rmpv::Value;
 /// Run Lua in the session, as a test's own stand-in for whatever a plugin or
 /// a terminal program would have done there.
 fn lua(sock: &Path, code: &str) -> Value {
-    let mut client = nvmux::rpc::Client::connect(sock, Duration::from_secs(5)).expect("connect");
+    lua_within(sock, code, Duration::from_secs(5))
+}
+
+/// [`lua`], given `budget` to answer in.
+fn lua_within(sock: &Path, code: &str, budget: Duration) -> Value {
+    let mut client = nvmux::rpc::Client::connect(sock, budget).expect("connect");
     client
         .call(
             "nvim_exec_lua",
@@ -48,7 +53,9 @@ end)"#
 /// A job in a hidden terminal buffer that runs `script` and exits, waited for
 /// until its `TermClose` has been, so that the watcher has seen it go.
 fn a_job_that_exits(sock: &Path, script: &str) {
-    lua(
+    // Given longer than the wait in it, so that a job slow to close, on a
+    // busy machine, is waited out by Neovim and not by the call.
+    lua_within(
         sock,
         &format!(
             r#"local closed = false
@@ -67,6 +74,7 @@ vim.wait(5000, function()
   return closed
 end)"#
         ),
+        Duration::from_secs(15),
     );
 }
 
@@ -103,6 +111,10 @@ fn a_session(scratch: &Scratch, name: &str) -> (nvmux::session::Session, std::pa
         .create_session(name, &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&s).expect("socket");
+    // Past its startup before a test asks it anything on a budget of a
+    // second, as the notes' reads do: Neovim takes a call that waits for its
+    // main loop only once it has started, which a busy machine makes later.
+    lua(&sock, "return 1");
     (s, sock)
 }
 
