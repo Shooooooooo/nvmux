@@ -2279,77 +2279,94 @@ fn a_kept_clients_return_is_announced_as_its_screen_comes_back() {
         "the client never asked its DA1"
     );
     // Its life, and three of the fade's one way to go: see `client::cards`.
-    term.pump_until(
-        nvmux::card::ARRIVAL_LIFE + Duration::from_millis(3 * LONG_FADE_MS / 2 + 500),
-        |_| false,
-    );
+    let gone = nvmux::card::ARRIVAL_LIFE + Duration::from_millis(3 * LONG_FADE_MS / 2 + 500);
+    term.pump_until(gone, |_| false);
     assert!(!carded(&term.output, label), "the first card never went");
 
-    let mark = term.output.len();
-    term.type_bytes(&[nvmux::keys::PREFIX, b' ']);
-    assert!(
-        term.pump_until(Duration::from_secs(5), |out| {
-            find(&out[mark.min(out.len())..], PARKED).is_some()
-        }),
-        "the child never parked its client"
-    );
-    assert!(
-        term.pump_until(Duration::from_secs(5), |out| {
-            find(&out[mark.min(out.len())..], RESUMED).is_some()
-        }),
-        "the parked client never came back"
-    );
-    let after = mark + find(&term.output[mark..], RESUMED).expect("resumed") + RESUMED.len();
-    // The screen from there on a frame at a time, as it came, rather than as
-    // it is at moments of the test's own: a test reading behind the fade, as
-    // one parsing the whole output again for every look does on a slow
-    // machine, sees the card further into its life, which the client times,
-    // than it means to look.
-    let mut frames = Frames::from(&term.output, after);
-    let until = Instant::now() + Duration::from_secs(5);
-    // From the fade's first frame the card is on the screen as it is, while
-    // the session comes in under it: a `~` far from it, say.
-    while !frames.row(1).ends_with(label) {
+    // Parked and brought back until the card comes in with the screen, three
+    // times at most. The relay gives the client `CARD_WAIT` to draw it before
+    // the screen dissolves in (see `nvmux::pty`), no longer: a client too busy
+    // for that, as on a busy machine, has the screen come in without it and
+    // the card after, which says nothing of how the card stands.
+    let mut late = 0;
+    while late < 3 {
+        let mark = term.output.len();
+        term.type_bytes(&[nvmux::keys::PREFIX, b' ']);
         assert!(
-            frames.next(&mut term, until),
-            "the fade in has no card; the screen: {:#?}",
+            term.pump_until(Duration::from_secs(5), |out| {
+                find(&out[mark.min(out.len())..], PARKED).is_some()
+            }),
+            "the child never parked its client"
+        );
+        assert!(
+            term.pump_until(Duration::from_secs(5), |out| {
+                find(&out[mark.min(out.len())..], RESUMED).is_some()
+            }),
+            "the parked client never came back"
+        );
+        let after = mark + find(&term.output[mark..], RESUMED).expect("resumed") + RESUMED.len();
+        // The screen from there on a frame at a time, as it came, rather than
+        // as it is at moments of the test's own: a test reading behind the
+        // fade, as one parsing the whole output again for every look does on a
+        // slow machine, sees the card further into its life, which the client
+        // times, than it means to look.
+        let mut frames = Frames::from(&term.output, after);
+        let until = Instant::now() + Duration::from_secs(5);
+        while !frames.row(1).ends_with(label) {
+            assert!(
+                frames.next(&mut term, until),
+                "the fade in has no card; the screen: {:#?}",
+                frames.rows()
+            );
+        }
+        let name = COLS - 2 - label.len() as u16;
+        let (card_first, tilde_first) = (frames.fg(1, name), frames.fg(2, 0));
+        // From the fade's first frame the card is on the screen as it is,
+        // while the session comes in under it: a `~` far from it, say, still
+        // dark. Gone before the client is parked again where it came after.
+        let dark =
+            matches!(tilde_first, vt100::Color::Rgb(..)) && bright(tilde_first) < PALETTE_FG / 2;
+        if !dark {
+            late += 1;
+            term.pump_until(gone, |_| false);
+            assert!(!carded(&term.output, label), "the card never went");
+            continue;
+        }
+        // Half way through the fade in, as the screen has it: the `~` half as
+        // bright as the text it comes up to — or the fade over before that.
+        let over = |frames: &Frames, term: &Terminal| {
+            find(&term.output[after..frames.read], b"\x1b[2J").is_some()
+        };
+        while bright(frames.fg(2, 0)) < PALETTE_FG / 2 && !over(&frames, &term) {
+            assert!(
+                frames.next(&mut term, until),
+                "the screen under the card never came in half way; the screen: {:#?}",
+                frames.rows()
+            );
+        }
+        assert!(
+            !over(&frames, &term),
+            "the fade in was over within half its length"
+        );
+        assert!(
+            frames.row(1).ends_with(label),
+            "half way through the fade in there is no card; the screen: {:#?}",
             frames.rows()
         );
-    }
-    let name = COLS - 2 - label.len() as u16;
-    let (card_first, tilde_first) = (frames.fg(1, name), frames.fg(2, 0));
-    // Half way through the fade in, as the screen has it: the `~` half as
-    // bright as the text it comes up to — or the fade over before that.
-    let over = |frames: &Frames, term: &Terminal| {
-        find(&term.output[after..frames.read], b"\x1b[2J").is_some()
-    };
-    while bright(frames.fg(2, 0)) < PALETTE_FG / 2 && !over(&frames, &term) {
-        assert!(
-            frames.next(&mut term, until),
-            "the screen under the card never came in half way; the screen: {:#?}",
-            frames.rows()
+        assert_eq!(
+            frames.fg(1, name),
+            card_first,
+            "the card came in with the screen"
         );
+        assert_ne!(
+            frames.fg(2, 0),
+            tilde_first,
+            "the screen under it did not come in"
+        );
+        assert_eq!(detach(&mut term), Some(0), "the child did not detach");
+        return;
     }
-    assert!(
-        !over(&frames, &term),
-        "the fade in was over within half its length"
-    );
-    assert!(
-        frames.row(1).ends_with(label),
-        "half way through the fade in there is no card; the screen: {:#?}",
-        frames.rows()
-    );
-    assert_eq!(
-        frames.fg(1, name),
-        card_first,
-        "the card came in with the screen"
-    );
-    assert_ne!(
-        frames.fg(2, 0),
-        tilde_first,
-        "the screen under it did not come in"
-    );
-    assert_eq!(detach(&mut term), Some(0), "the child did not detach");
+    panic!("the card came after the screen had come in, {late} times in a row");
 }
 
 /// A card posted for the session in front — the notifier's, here the child's
