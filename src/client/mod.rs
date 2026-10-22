@@ -1204,6 +1204,10 @@ pub struct App {
     /// Neovim has not resized since, and how wide Neovim last had each: see
     /// [`App::narrow_windows`].
     cut: HashMap<u64, usize>,
+    /// The widths asked of each window grid that Neovim has not resized it
+    /// to since, oldest first: what tells an answer to an ask asked again
+    /// since from the answer to the last (see [`App::grid_resized`]).
+    unanswered: HashMap<u64, Vec<usize>>,
     /// What each window of the tab page in front wants, by window, as the
     /// measure last said (see [`wide::MEASURE_LUA`]).
     wants: BTreeMap<i64, usize>,
@@ -1291,6 +1295,7 @@ impl App {
             measuring: false,
             narrowed: HashMap::new(),
             cut: HashMap::new(),
+            unanswered: HashMap::new(),
             wants: BTreeMap::new(),
             tails: Vec::new(),
             tails_since: None,
@@ -1502,11 +1507,7 @@ impl App {
             let Some(&before) = self.cut.get(&grid) else {
                 return true;
             };
-            let to = match self.model.layout.get(&grid).map(|p| &p.place) {
-                Some(Place::Window { width: whole, .. }) if width == 0 => *whole,
-                _ => width,
-            };
-            if to != before {
+            if self.asked_width(grid, width) != before {
                 return true;
             }
             match self.narrowed.get(&grid) {
@@ -1544,10 +1545,63 @@ impl App {
                 "nvim_ui_try_resize_grid",
                 &[Arg::Int(grid as i64), Arg::Int(width as i64), Arg::Int(0)],
             );
+            let to = self.asked_width(grid, width);
+            self.unanswered.entry(grid).or_default().push(to);
         }
         // Text that moved in or out of its window slides there.
         self.anim.insets(&self.model, now);
         asked
+    }
+
+    /// Neovim resizing `grid` to `width`, about to be taken into the model:
+    /// the grid is as wide as Neovim has it again, whatever the client cut
+    /// it to (see [`App::narrow_windows`]) — but for an answer to an ask the
+    /// client has asked again of it since, which would have the client's
+    /// copy wider than the client cut it, and is left as wide as it is.
+    ///
+    /// A window split off another is asked for `window_width` before the
+    /// measure has said what it wants, and asked again, for less, once it
+    /// has; taking the second ask after redrawing for the first, Neovim
+    /// answers both. It makes its grid of the first width from the one it
+    /// had, and draws nothing of what it kept again, while the client has
+    /// already cut its copy to the second width: taken whole, the copy would
+    /// be wider than it was ever drawn, and the client would wait on a
+    /// refresh for the columns between — holding its frames, and with them
+    /// the split's flying in — that Neovim's answer to the second ask cuts
+    /// off again.
+    fn grid_resized(&mut self, grid: u64, width: &mut usize) {
+        let asks = self.unanswered.remove(&grid).unwrap_or_default();
+        let later = asks
+            .iter()
+            .rposition(|w| w == width)
+            .map(|i| asks[i + 1..].to_vec())
+            .filter(|later| !later.is_empty());
+        let Some(later) = later else {
+            // The answer to the last ask, or Neovim's own resize.
+            self.cut.remove(&grid);
+            return;
+        };
+        self.unanswered.insert(grid, later);
+        match self.model.grids.get(&grid).map(|g| g.width()) {
+            Some(copy) if copy < *width => {
+                // As wide as Neovim has it now, for the asks that wait on
+                // Neovim's resizing a grid the client cut.
+                self.cut.insert(grid, *width);
+                *width = copy;
+            }
+            _ => {
+                self.cut.remove(&grid);
+            }
+        }
+    }
+
+    /// How wide asking `width` of the window on `grid` has Neovim make its
+    /// grid: nought is the window's own width.
+    fn asked_width(&self, grid: u64, width: usize) -> usize {
+        match self.model.layout.get(&grid).map(|p| &p.place) {
+            Some(Place::Window { width: whole, .. }) if width == 0 => *whole,
+            _ => width,
+        }
     }
 
     /// What the window on `grid` wants, as the measure last said; or
@@ -1568,6 +1622,7 @@ impl App {
         // Nothing waits on Neovim's resizing a grid the client cut: its own
         // copy no longer matters, and the windows are to be whole.
         self.cut.clear();
+        self.unanswered.clear();
         let window_width = std::mem::take(&mut self.window_width);
         let asked = self.narrow_windows(now);
         self.window_width = window_width;
@@ -1614,6 +1669,7 @@ impl App {
         // windows the last one had grids for.
         self.narrowed.clear();
         self.cut.clear();
+        self.unanswered.clear();
         self.looked.clear();
         let mut opts = vec![
             ("rgb", Arg::Bool(true)),
@@ -2235,14 +2291,18 @@ impl App {
     /// Take a batch into the model, and set off what it starts — if
     /// `animate`, or simply put everything where it now is. `switched` are
     /// the window grids the batch draws another buffer in.
-    fn apply(&mut self, batch: Vec<Event>, animate: bool, switched: &[u64], now: Instant) {
+    fn apply(&mut self, mut batch: Vec<Event>, animate: bool, switched: &[u64], now: Instant) {
         let multigrid = self.multigrid();
         let before = self.anim.before(&self.model, &batch, multigrid, switched);
-        // A grid Neovim resizes is as wide as Neovim has it again, whatever
-        // the client cut it to (see `narrow_windows`).
-        for event in &batch {
-            if let Event::GridResize { grid, .. } | Event::GridDestroy { grid } = event {
-                self.cut.remove(grid);
+        // What Neovim's resizes leave of the grids the client cut.
+        for event in &mut batch {
+            match event {
+                Event::GridResize { grid, width, .. } => self.grid_resized(*grid, width),
+                Event::GridDestroy { grid } => {
+                    self.cut.remove(grid);
+                    self.unanswered.remove(grid);
+                }
+                _ => {}
             }
         }
         let mut changes = Changes::default();
@@ -6540,6 +6600,184 @@ mod tests {
             (a.model.grids[&2].width(), a.model.inset(2)),
             (20, 0),
             "whole"
+        );
+    }
+
+    /// The measure's word on window 1000: it wants `width`.
+    fn wanting(width: i64) -> Vec<Value> {
+        let each = vec![Value::Array(vec![1000.into(), width.into()])];
+        vec!["measure".into(), 2.into(), Value::Array(each)]
+    }
+
+    /// [`wide_app`] with one window, the whole terminal wide and drawn on,
+    /// asked for `window_width` — the measure has said nothing of it — and
+    /// then, the measure having said it wants 6, for that: as a window split
+    /// off another is asked for. Neither ask answered yet.
+    fn asked_twice(t0: Instant) -> App {
+        let (mut a, _) = wide_app(t0);
+        let n = Value::from;
+        let mut events = vec![
+            resize(1, 20, 6),
+            resize(2, 20, 5),
+            place(2, 1000, 0, 0, 20, 5),
+            viewport(2, 1000),
+        ];
+        events.extend(whole(2, 20, 5, &["text"]));
+        redraw(&mut a, events, t0);
+        assert_eq!(grids_asked(&calls(&mut a)), [vec![n(2), n(8), n(0)]]);
+        notify(&mut a, "nvmux_client", wanting(6), t0);
+        assert_eq!(grids_asked(&calls(&mut a)), [vec![n(2), n(6), n(0)]]);
+        assert_eq!(a.model.grids[&2].width(), 6, "cut again");
+        a
+    }
+
+    /// Neovim's answer to an ask the client has asked again since, for less,
+    /// coming on its own: the client's copy stays as it cut it. Neovim made
+    /// its grid of that width from the one it had and draws none of it
+    /// again, so taken whole the copy would be wider than it was ever drawn,
+    /// and the client would hold its frames — a split's flying in with them
+    /// — on a refresh for the columns between, which Neovim's answer to the
+    /// second ask cuts off again.
+    #[test]
+    fn an_answer_to_an_ask_asked_again_for_less_is_not_taken_whole() {
+        let t0 = Instant::now();
+        let mut a = asked_twice(t0);
+        redraw(&mut a, vec![resize(2, 8, 5)], t0);
+        assert_eq!(a.model.grids[&2].width(), 6, "kept to the cut");
+        assert!(a.model.lacking().is_empty(), "nothing undrawn");
+        assert!(!a.take_refresh(), "so nothing refreshed");
+        assert!(!a.holding(t0), "and nothing held");
+        assert!(grids_asked(&calls(&mut a)).is_empty(), "nor asked again");
+
+        redraw(&mut a, vec![resize(2, 6, 5)], t0);
+        assert_eq!(a.model.grids[&2].width(), 6, "answered");
+        assert!(
+            a.cut.is_empty() && a.unanswered.is_empty(),
+            "nothing waits on Neovim"
+        );
+        assert!(!a.take_refresh());
+    }
+
+    /// Neovim's answer to the last ask is taken whatever was asked before
+    /// it: taking both asks before it redraws, Neovim answers only the last.
+    #[test]
+    fn the_answer_to_the_last_ask_is_taken_whole() {
+        let t0 = Instant::now();
+        let (mut a, _) = wide_app(t0);
+        let n = Value::from;
+        let mut events = vec![
+            resize(1, 20, 6),
+            resize(2, 20, 5),
+            place(2, 1000, 0, 0, 20, 5),
+            viewport(2, 1000),
+        ];
+        events.extend(whole(2, 20, 5, &["text"]));
+        redraw(&mut a, events, t0);
+        assert_eq!(grids_asked(&calls(&mut a)), [vec![n(2), n(8), n(0)]]);
+        assert_eq!(a.model.grids[&2].width(), 8, "cut");
+        notify(&mut a, "nvmux_client", wanting(12), t0);
+        assert_eq!(grids_asked(&calls(&mut a)), [vec![n(2), n(12), n(0)]]);
+        assert_eq!(
+            a.model.grids[&2].width(),
+            8,
+            "wider has to come from Neovim"
+        );
+
+        // What the resize adds Neovim draws.
+        let mut events = vec![resize(2, 12, 5)];
+        events.extend((0..5).map(|r| line_at(2, r, 8, "    ")));
+        redraw(&mut a, events, t0);
+        assert_eq!(a.model.grids[&2].width(), 12, "taken");
+        assert!(a.cut.is_empty() && a.unanswered.is_empty());
+        assert!(!a.take_refresh(), "drawn whole");
+    }
+
+    /// A window split off another, asked for `window_width` and then for
+    /// what the measure says it wants, flies in whatever order Neovim's
+    /// answers come in: its answer to the first ask coming on its own, and
+    /// then the windows placed again where they were going, the split is
+    /// still on its way — not held for a refresh, which would have it land
+    /// at once.
+    #[test]
+    fn a_split_flies_in_through_an_answer_to_an_ask_asked_again() {
+        let t0 = Instant::now();
+        let (mut a, _) = wide_app(t0);
+        let n = Value::from;
+        let measure = |each: &[(i64, i64)]| {
+            let each = each
+                .iter()
+                .map(|&(win, w)| Value::Array(vec![n(win), n(w)]))
+                .collect();
+            vec!["measure".into(), 2.into(), Value::Array(each)]
+        };
+        let mut events = vec![
+            resize(1, 20, 6),
+            resize(2, 20, 5),
+            place(2, 1000, 0, 0, 20, 5),
+            viewport(2, 1000),
+        ];
+        events.extend(whole(2, 20, 5, &["left"]));
+        redraw(&mut a, events, t0);
+        notify(&mut a, "nvmux_client", measure(&[(1000, 8)]), t0);
+        redraw(&mut a, vec![resize(2, 8, 5)], t0);
+        calls(&mut a);
+
+        // `:vsplit`: the window 10 wide, and one 9 wide right of it.
+        let t1 = t0 + Duration::from_secs(1);
+        let mut events = vec![
+            place(2, 1000, 0, 0, 10, 5),
+            resize(4, 9, 5),
+            place(4, 1001, 0, 11, 9, 5),
+            viewport(4, 1001),
+        ];
+        events.extend(whole(4, 9, 5, &["right"]));
+        events.extend((0..5).map(|r| line_at(1, r, 10, "\u{2502}")));
+        redraw(&mut a, events, t1);
+        assert_eq!(grids_asked(&calls(&mut a)), [vec![n(4), n(8), n(0)]]);
+        notify(&mut a, "nvmux_client", measure(&[(1000, 8), (1001, 6)]), t1);
+        assert_eq!(grids_asked(&calls(&mut a)), [vec![n(4), n(6), n(0)]]);
+
+        let ms = |m: u64| t1 + Duration::from_millis(m);
+        redraw(&mut a, vec![resize(4, 8, 5)], ms(5));
+        redraw(
+            &mut a,
+            vec![place(2, 1000, 0, 0, 10, 5), place(4, 1001, 0, 11, 9, 5)],
+            ms(10),
+        );
+        // Where the line between the two windows is on the top row.
+        let line = |a: &mut App, at| {
+            shown(a, at)[0]
+                .chars()
+                .position(|c| c == '\u{2502}')
+                .unwrap_or(0)
+        };
+        let flying = line(&mut a, ms(40));
+        assert!(flying > 10, "landed at once: the line at {flying}");
+        assert_eq!(line(&mut a, ms(1000)), 10, "landed");
+    }
+
+    /// An ask back to the width of an answer not taken waits for Neovim's
+    /// answer to the ask after it: Neovim has its grid that wide, and taking
+    /// both asks before it redraws would find it as wide as it was and say
+    /// nothing, leaving the client's copy cut, with what is past the cut
+    /// never sent again (see
+    /// [`a_grid_cut_is_asked_back_whole_once_neovim_has_cut_it`]).
+    #[test]
+    fn an_ask_back_to_an_answer_not_taken_waits_for_the_next() {
+        let t0 = Instant::now();
+        let n = Value::from;
+        let mut a = asked_twice(t0);
+        redraw(&mut a, vec![resize(2, 8, 5)], t0);
+        notify(&mut a, "nvmux_client", wanting(8), t0);
+        assert!(
+            grids_asked(&calls(&mut a)).is_empty(),
+            "asked before Neovim has cut it"
+        );
+        redraw(&mut a, vec![resize(2, 6, 5)], t0);
+        assert_eq!(
+            grids_asked(&calls(&mut a)),
+            [vec![n(2), n(8), n(0)]],
+            "not asked once it has"
         );
     }
 
