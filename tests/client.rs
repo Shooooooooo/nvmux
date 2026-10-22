@@ -1390,24 +1390,53 @@ fn drawn_slowly_as(
 /// Neovim could have heard of it, and when Neovim's own frame lands, every
 /// row of the window and the cursor are where the prediction had them.
 fn predicted(term: &mut Terminal, name: &str, keys: &[u8]) {
-    let before = window(term);
-    term.type_bytes(keys);
-    // Within one way of the link: Neovim has not even heard of it yet.
-    assert!(
-        term.pump(SLOW, |t| window(t) != before),
-        "{name} waited for Neovim:\n{}",
-        term.text()
-    );
-    // The rest of the frame, should it have come in two reads.
-    term.pump_until(Duration::from_millis(30), |_| false);
-    let predicted = window(term);
+    let predicted = sight(&ahead(term, name, keys));
     // Neovim's own, there and back.
-    term.pump_until(4 * SLOW, |_| false);
+    let landed = last_frame(term, 4 * SLOW);
     assert_eq!(
         predicted,
-        window(term),
+        sight(&landed),
         "{name}: predicted, then drawn by Neovim"
     );
+}
+
+/// Type `keys`, which the client draws ahead of Neovim, and say what it
+/// drew: the screen as the first frame to change the window left it, and any
+/// the client drew straight after. Within one way of the link: Neovim has not
+/// even heard of them yet.
+///
+/// Whole frames, not the screen as a read happens to leave it: a busy
+/// machine hands the test a frame in pieces, and the screen part way through
+/// one is half the old view and half the new.
+fn ahead(term: &mut Terminal, name: &str, keys: &[u8]) -> vt100::Screen {
+    let before = window(term);
+    term.type_bytes(keys);
+    let mut drawn = None;
+    term.frames(SLOW, |screen| {
+        if drawn.is_some() || sight(screen) != before {
+            drawn = Some(screen.clone());
+        }
+        drawn.is_some()
+    });
+    let Some(mut drawn) = drawn else {
+        panic!("{name} waited for Neovim:\n{}", term.text());
+    };
+    term.frames(Duration::from_millis(30), |screen| {
+        drawn = screen.clone();
+        false
+    });
+    drawn
+}
+
+/// Take what the client draws for `within`: the screen as the last whole
+/// frame of it left it, or as it was if none came.
+fn last_frame(term: &mut Terminal, within: Duration) -> vt100::Screen {
+    let mut last = term.parser.screen().clone();
+    term.frames(within, |screen| {
+        last = screen.clone();
+        false
+    });
+    last
 }
 
 /// Type `keys`, which the client leaves to Neovim, and wait for it to draw
@@ -2823,17 +2852,10 @@ fn scrolls_and_motions_mixed_show_at_once() {
 /// [`predicted`] has it — and its colours as well: once Neovim's own frame
 /// lands, every cell of the window as the client drew it.
 fn predicted_in_colour(term: &mut Terminal, name: &str, keys: &[u8]) {
-    let before = window(term);
-    term.type_bytes(keys);
-    assert!(
-        term.pump(SLOW, |t| window(t) != before),
-        "{name} waited for Neovim:\n{}",
-        term.text()
-    );
-    term.pump_until(Duration::from_millis(30), |_| false);
-    let predicted = (window(term), colours(term));
-    term.pump_until(4 * SLOW, |_| false);
-    let landed = (window(term), colours(term));
+    let drawn = ahead(term, name, keys);
+    let predicted = (sight(&drawn), colours_of(&drawn));
+    let landed = last_frame(term, 4 * SLOW);
+    let landed = (sight(&landed), colours_of(&landed));
     assert_eq!(predicted.0, landed.0, "{name}: the text and the cursor");
     for (r, (p, l)) in predicted.1.iter().zip(&landed.1).enumerate() {
         assert_eq!(p, l, "{name}: row {r} changed colour when Neovim's landed");
@@ -2985,18 +3007,14 @@ fn typed_text_wears_the_colours_neovim_draws_it_in() {
         ("c", b"c"),
         ("d, the line's end short of the column", b"d"),
     ] {
-        let before = window(&term);
-        term.type_bytes(key);
-        assert!(
-            term.pump(SLOW, |t| window(t) != before),
-            "{name} waited for Neovim:\n{}",
-            term.text()
+        let drawn = ahead(&mut term, name, key);
+        let landed = last_frame(&mut term, 4 * SLOW);
+        assert_eq!(sight(&drawn), sight(&landed), "{name}: the text");
+        assert_eq!(
+            colours_of(&drawn),
+            colours_of(&landed),
+            "{name}: the colours"
         );
-        term.pump_until(Duration::from_millis(30), |_| false);
-        let predicted = (window(&term), colours(&term));
-        term.pump_until(4 * SLOW, |_| false);
-        assert_eq!(predicted.0, window(&term), "{name}: the text");
-        assert_eq!(predicted.1, colours(&term), "{name}: the colours");
     }
     waited(&mut term, "e, the line's end into the column", b"e");
 }
@@ -4191,15 +4209,8 @@ fn predicted_rows_wear_the_colours_neovim_gives_them() {
          set termguicolors | lua vim.treesitter.start(0, 'lua')",
     );
     let step = |term: &mut Terminal, name: &str, keys: &[u8]| {
-        let before = window(term);
-        term.type_bytes(keys);
-        assert!(
-            term.pump(SLOW, |t| window(t) != before),
-            "{name} waited for Neovim:\n{}",
-            term.text()
-        );
-        term.pump_until(Duration::from_millis(30), |_| false);
-        let predicted = (window(term), colours(term));
+        let drawn = ahead(term, name, keys);
+        let predicted = (sight(&drawn), colours_of(&drawn));
         // Coloured, not plain: a keyword, a number and a comment apart, on
         // all but the lines edited whole into a comment or a string.
         let coloured = predicted
@@ -4216,8 +4227,8 @@ fn predicted_rows_wear_the_colours_neovim_gives_them() {
             })
             .count();
         assert!(coloured >= 19, "{name}: {coloured} rows of 22 coloured");
-        term.pump_until(4 * SLOW, |_| false);
-        let landed = (window(term), colours(term));
+        let landed = last_frame(term, 4 * SLOW);
+        let landed = (sight(&landed), colours_of(&landed));
         assert_eq!(predicted.0, landed.0, "{name}: the text moved");
         for (r, (p, l)) in predicted.1.iter().zip(&landed.1).enumerate() {
             assert_eq!(p, l, "{name}: row {r} changed colour when Neovim's landed");
@@ -4273,18 +4284,12 @@ fn cursorline_moves_with_the_cursor() {
         ("2k", b"2k"),
         ("+", b"+"),
     ] {
-        let before = (window(&term), colours(&term));
-        term.type_bytes(keys);
-        assert!(
-            term.pump(SLOW, |t| window(t) != before.0),
-            "{name} waited for Neovim:\n{}",
-            term.text()
-        );
-        term.pump_until(Duration::from_millis(30), |_| false);
-        let predicted = (window(&term), colours(&term));
-        assert_ne!(predicted.1, before.1, "{name}: the bar moved");
-        term.pump_until(4 * SLOW, |_| false);
-        let landed = (window(&term), colours(&term));
+        let before = colours(&term);
+        let drawn = ahead(&mut term, name, keys);
+        let predicted = (sight(&drawn), colours_of(&drawn));
+        assert_ne!(predicted.1, before, "{name}: the bar moved");
+        let landed = last_frame(&mut term, 4 * SLOW);
+        let landed = (sight(&landed), colours_of(&landed));
         assert_eq!(predicted.0, landed.0, "{name}: the text and the cursor");
         for (r, (p, l)) in predicted.1.iter().zip(&landed.1).enumerate() {
             assert_eq!(p, l, "{name}: row {r} changed colour when Neovim's landed");
@@ -4441,15 +4446,8 @@ fn predicted_rows_show_what_neovim_shows_as_something_else_in_its_colours() {
          set termguicolors list listchars=nbsp:+",
     );
     let step = |term: &mut Terminal, name: &str, keys: &[u8]| {
-        let before = window(term);
-        term.type_bytes(keys);
-        assert!(
-            term.pump(SLOW, |t| window(t) != before),
-            "{name} waited for Neovim:\n{}",
-            term.text()
-        );
-        term.pump_until(Duration::from_millis(30), |_| false);
-        let predicted = (window(term), colours(term));
+        let drawn = ahead(term, name, keys);
+        let predicted = (sight(&drawn), colours_of(&drawn));
         // Not one colour: `^A`, `^?` and `<80>` in another, on every row.
         let two = predicted
             .1
@@ -4461,8 +4459,8 @@ fn predicted_rows_show_what_neovim_shows_as_something_else_in_its_colours() {
             })
             .count();
         assert_eq!(two, 22, "{name}: {two} rows of 22 in more than one colour");
-        term.pump_until(4 * SLOW, |_| false);
-        let landed = (window(term), colours(term));
+        let landed = last_frame(term, 4 * SLOW);
+        let landed = (sight(&landed), colours_of(&landed));
         assert_eq!(predicted.0, landed.0, "{name}: the text moved");
         for (r, (p, l)) in predicted.1.iter().zip(&landed.1).enumerate() {
             assert_eq!(p, l, "{name}: row {r} changed colour when Neovim's landed");
@@ -4516,17 +4514,10 @@ fn predicted_rows_show_listchars_as_neovim_draws_them() {
     .expect("listchars");
     term.pump_until(4 * SLOW, |_| false);
     let step = |term: &mut Terminal, name: &str, keys: &[u8]| {
-        let before = window(term);
-        term.type_bytes(keys);
-        assert!(
-            term.pump(SLOW, |t| window(t) != before),
-            "{name} waited for Neovim:\n{}",
-            term.text()
-        );
-        term.pump_until(Duration::from_millis(30), |_| false);
-        let predicted = (window(term), colours(term));
-        term.pump_until(4 * SLOW, |_| false);
-        let landed = (window(term), colours(term));
+        let drawn = ahead(term, name, keys);
+        let predicted = (sight(&drawn), colours_of(&drawn));
+        let landed = last_frame(term, 4 * SLOW);
+        let landed = (sight(&landed), colours_of(&landed));
         assert_eq!(predicted.0, landed.0, "{name}: the text moved");
         for (r, (p, l)) in predicted.1.iter().zip(&landed.1).enumerate() {
             assert_eq!(p, l, "{name}: row {r} changed colour when Neovim's landed");
@@ -4718,17 +4709,10 @@ fn a_comment_typed_into_a_code_block_colours_the_rows_held_below_it() {
     }
     typed(&mut term, b"\x1b");
     term.pump_until(Duration::from_secs(2), |_| false);
-    let before = window(&term);
-    term.type_bytes(b"\x06");
-    assert!(
-        term.pump(SLOW, |t| window(t) != before),
-        "<C-f> waited for Neovim:\n{}",
-        term.text()
-    );
-    term.pump_until(Duration::from_millis(30), |_| false);
-    let predicted = (window(&term), colours(&term));
-    term.pump_until(4 * SLOW, |_| false);
-    let landed = (window(&term), colours(&term));
+    let drawn = ahead(&mut term, "<C-f>", b"\x06");
+    let predicted = (sight(&drawn), colours_of(&drawn));
+    let landed = last_frame(&mut term, 4 * SLOW);
+    let landed = (sight(&landed), colours_of(&landed));
     assert_eq!(predicted.0, landed.0, "the text moved");
     let mut wrong = Vec::new();
     for (r, (p, l)) in predicted.1.iter().zip(&landed.1).enumerate() {
