@@ -56,6 +56,9 @@ const CHILD_ID: &str = "NVMUX_TEST_RELAY_ID";
 /// and the fade on, and nothing here queries a real terminal, so the colours are
 /// handed to the child rather than asked for.
 const CHILD_PALETTE: &str = "NVMUX_TEST_RELAY_PALETTE";
+/// The grey that palette has for text: what a session's text and a card's
+/// come up to.
+const PALETTE_FG: u8 = 200;
 /// Set on a child that keeps its client (`[client] per_session`): where
 /// `<prefix> Space` would open the picker it parks the client instead, for
 /// [`PARKED_FOR`], and then takes it back and relays it again.
@@ -218,7 +221,7 @@ fn relay_child() {
     // else. The bar test needs the shadow, and says so.
     if std::env::var_os(CHILD_PALETTE).is_some() {
         nvmux::palette::init(Some(nvmux::palette::Palette {
-            fg: nvmux::palette::Rgb(200, 200, 200),
+            fg: nvmux::palette::Rgb(PALETTE_FG, PALETTE_FG, PALETTE_FG),
             bg: nvmux::palette::Rgb(0, 0, 0),
             ansi: [nvmux::palette::Rgb(0, 0, 0); 16],
         }));
@@ -2297,35 +2300,52 @@ fn a_kept_clients_return_is_announced_as_its_screen_comes_back() {
         "the parked client never came back"
     );
     let after = mark + find(&term.output[mark..], RESUMED).expect("resumed") + RESUMED.len();
+    // The screen from there on a frame at a time, as it came, rather than as
+    // it is at moments of the test's own: a test reading behind the fade, as
+    // one parsing the whole output again for every look does on a slow
+    // machine, sees the card further into its life, which the client times,
+    // than it means to look.
+    let mut frames = Frames::from(&term.output, after);
+    let until = Instant::now() + Duration::from_secs(5);
     // From the fade's first frame the card is on the screen as it is, while
     // the session comes in under it: a `~` far from it, say.
-    assert!(
-        term.pump_until(Duration::from_secs(5), |out| carded(out, label)),
-        "the fade in has no card; the screen: {:#?}",
-        screen_rows(&term.output)
-    );
+    while !frames.row(1).ends_with(label) {
+        assert!(
+            frames.next(&mut term, until),
+            "the fade in has no card; the screen: {:#?}",
+            frames.rows()
+        );
+    }
     let name = COLS - 2 - label.len() as u16;
-    let (card_first, tilde_first) = (
-        fg_on_screen(&term.output, 1, name),
-        fg_on_screen(&term.output, 2, 0),
-    );
-    term.pump_until(Duration::from_millis(LONG_FADE_MS / 4), |_| false);
+    let (card_first, tilde_first) = (frames.fg(1, name), frames.fg(2, 0));
+    // Half way through the fade in, as the screen has it: the `~` half as
+    // bright as the text it comes up to — or the fade over before that.
+    let over = |frames: &Frames, term: &Terminal| {
+        find(&term.output[after..frames.read], b"\x1b[2J").is_some()
+    };
+    while bright(frames.fg(2, 0)) < PALETTE_FG / 2 && !over(&frames, &term) {
+        assert!(
+            frames.next(&mut term, until),
+            "the screen under the card never came in half way; the screen: {:#?}",
+            frames.rows()
+        );
+    }
     assert!(
-        find(&term.output[after..], b"\x1b[2J").is_none(),
+        !over(&frames, &term),
         "the fade in was over within half its length"
     );
     assert!(
-        carded(&term.output, label),
+        frames.row(1).ends_with(label),
         "half way through the fade in there is no card; the screen: {:#?}",
-        screen_rows(&term.output)
+        frames.rows()
     );
     assert_eq!(
-        fg_on_screen(&term.output, 1, name),
+        frames.fg(1, name),
         card_first,
         "the card came in with the screen"
     );
     assert_ne!(
-        fg_on_screen(&term.output, 2, 0),
+        frames.fg(2, 0),
         tilde_first,
         "the screen under it did not come in"
     );
@@ -2450,6 +2470,71 @@ fn fg_on_screen(out: &[u8], row: u16, col: u16) -> vt100::Color {
         .screen()
         .cell(row, col)
         .map_or(vt100::Color::Default, vt100::Cell::fgcolor)
+}
+
+/// How bright a grey is, in the palette these tests hand the child (see
+/// [`PALETTE_FG`]), which draws in greys: nothing for one of the terminal's
+/// own colours.
+fn bright(color: vt100::Color) -> u8 {
+    match color {
+        vt100::Color::Rgb(r, _, _) => r,
+        _ => 0,
+    }
+}
+
+/// The screen a terminal's output makes, taken in a frame at a time as the
+/// output comes — to the end of each synchronized update, which is when a
+/// terminal shows it — and never parsed again from the start, as
+/// [`row_on_screen`] parses it: for a test that follows a fade frame by
+/// frame, wherever its own reading has got to.
+struct Frames {
+    parser: vt100::Parser,
+    /// How far into the output it has taken in.
+    read: usize,
+}
+
+impl Frames {
+    /// The screen as the output up to `from` leaves it.
+    fn from(out: &[u8], from: usize) -> Self {
+        let mut parser = vt100::Parser::new(ROWS, COLS, 0);
+        parser.process(&out[..from]);
+        Self { parser, read: from }
+    }
+
+    /// Take in `term`'s next frame, waiting until `until` for it to come.
+    /// Says whether one did.
+    fn next(&mut self, term: &mut Terminal, until: Instant) -> bool {
+        let end = nvmux::fade::SYNC_END;
+        loop {
+            if let Some(i) = find(&term.output[self.read..], end) {
+                let to = self.read + i + end.len();
+                self.parser.process(&term.output[self.read..to]);
+                self.read = to;
+                return true;
+            }
+            let had = term.output.len();
+            let left = until.saturating_duration_since(Instant::now());
+            if !term.pump_until(left, |out| out.len() > had) {
+                return false;
+            }
+        }
+    }
+
+    fn row(&self, row: u16) -> String {
+        row_of(self.parser.screen(), row)
+    }
+
+    fn rows(&self) -> Vec<String> {
+        (0..ROWS).map(|row| self.row(row)).collect()
+    }
+
+    /// The foreground the cell at (`row`, `col`) is drawn in.
+    fn fg(&self, row: u16, col: u16) -> vt100::Color {
+        self.parser
+            .screen()
+            .cell(row, col)
+            .map_or(vt100::Color::Default, vt100::Cell::fgcolor)
+    }
 }
 
 /// A switch lands with its card standing: the session's own client draws it
