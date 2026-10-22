@@ -42,7 +42,8 @@
 //! comes up out of the background. Going, the other way round. With the fade
 //! off it is at once. While it is up, whatever moves on it — the settings'
 //! bar, whose row it leaves fades back from it as the picker's does (see
-//! [`crate::ui::settings`]) — has frames at the fade's pace until it stops.
+//! [`crate::ui::settings`]) — has frames at the fade's pace until it stops;
+//! and a key or the mouse has its frame at once, as it does full screen.
 //!
 //! The picker can go two other ways ([`Leave`]). To another session, or to a
 //! screen of its own, it goes out with the session, the two into the
@@ -383,14 +384,8 @@ pub(super) fn float(
         // Frames at a frame's pace while anything moves: the panel coming or
         // going, or a row on it fading back from the bar.
         let lively = moving || panel.moving();
-        let frame_due = (lively || owed).then(|| {
-            let gap = if lively || !session_drew {
-                fade::FRAME
-            } else {
-                SESSION_FRAME
-            };
-            last_frame.map_or(now, |last| last + gap)
-        });
+        let frame_due = (lively || owed)
+            .then(|| last_frame.map_or(now, |last| last + gap(lively, session_drew)));
         let next = [frame_due, sequence_due, panel.wake_at()]
             .into_iter()
             .flatten()
@@ -466,6 +461,9 @@ pub(super) fn float(
         }
         // Whether the panel was taken down by what came in, or by the clock.
         let was_going = going;
+        // Whether a key or the mouse came in for the panel, which a frame
+        // answers at once (see `due`).
+        let mut asked = false;
         for input in inputs {
             match input {
                 Input::Client(bytes) => {
@@ -475,12 +473,14 @@ pub(super) fn float(
                 _ if going => {}
                 Input::Key(key) => {
                     owed = true;
+                    asked = true;
                     if panel.on_key(key, now) == Did::Close {
                         going = true;
                     }
                 }
                 Input::Mouse(mouse) => {
                     owed = true;
+                    asked = true;
                     let outside = !area.contains((mouse.column, mouse.row).into());
                     let press = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
                     // A press outside takes the panel down, as `Esc` does.
@@ -597,15 +597,7 @@ pub(super) fn float(
             return Ok(settle.then_some(Outcome::Resettle));
         }
         let lively = moving || panel.moving();
-        let due = last_frame.is_none_or(|last| {
-            let gap = if lively || !session_drew {
-                fade::FRAME
-            } else {
-                SESSION_FRAME
-            };
-            now >= last + gap
-        });
-        if (lively || owed) && due {
+        if (lively || owed) && due(now, last_frame, lively, session_drew, asked) {
             // A frame that could not go out is tried again a frame later.
             last_frame = Some(now);
             // Where the panel goes on the screen as it is now: the picker's
@@ -673,6 +665,30 @@ fn fade_length(look: Look) -> Duration {
         }
         Look::Dimmed(_) | Look::Faint => Duration::ZERO,
     }
+}
+
+/// How long after a frame the next may go out: a frame's pace while anything
+/// moves (`lively`), or while the session has drawn nothing; and while all
+/// there is to show is what the session drew, which is repainted under the
+/// panel whole, [`SESSION_FRAME`].
+fn gap(lively: bool, session_drew: bool) -> Duration {
+    if lively || !session_drew {
+        fade::FRAME
+    } else {
+        SESSION_FRAME
+    }
+}
+
+/// Whether a frame may go out at `now`, the last having gone at `last`: a
+/// [`gap`] after it — but at once for a key or the mouse (`asked`), as the
+/// picker full screen draws the moment it has taken one. Held to the frames'
+/// pace, a key that came just after a frame waited most of one for its own,
+/// with what it started — the row the cursor left fading back from the bar —
+/// part way gone before it was first seen; the more so the faster the keys
+/// came, and by a different amount every key with one held down, so the
+/// glow they left beat with the frames.
+fn due(now: Instant, last: Option<Instant>, lively: bool, session_drew: bool, asked: bool) -> bool {
+    asked || last.is_none_or(|last| now >= last + gap(lively, session_drew))
 }
 
 /// A client that draws cards hears the settings as they change, so what it
@@ -1174,5 +1190,30 @@ mod tests {
         let at_once = Coming::to(0.0, 1.0, Duration::ZERO, t0);
         assert_eq!(at_once.at(t0), 1.0);
         assert!(at_once.done(t0));
+    }
+
+    /// A key or the mouse has its frame at once, however soon after the last
+    /// one it comes; a row fading back from the bar has one a frame after the
+    /// last, and the session drawing on its own a slower pace than that.
+    #[test]
+    fn a_key_is_answered_at_once_and_the_rest_at_their_pace() {
+        let t0 = Instant::now();
+        let soon = t0 + Duration::from_millis(1);
+        assert!(
+            due(soon, Some(t0), true, false, true),
+            "a key, just after a frame"
+        );
+        assert!(
+            due(soon, Some(t0), false, true, true),
+            "or after the session drew"
+        );
+        assert!(!due(soon, Some(t0), true, false, false), "a fade waits");
+        assert!(due(t0 + fade::FRAME, Some(t0), true, false, false));
+        assert!(
+            !due(t0 + fade::FRAME, Some(t0), false, true, false),
+            "and the session longer"
+        );
+        assert!(due(t0 + SESSION_FRAME, Some(t0), false, true, false));
+        assert!(due(t0, None, false, false, false), "the first frame");
     }
 }
