@@ -2103,7 +2103,7 @@ fn a_page_neovim_does_not_turn_is_given_up_in_time() {
     // Neovim behind on pages typed every 10 ms, its frame past when the
     // first would be given up on, as in the test before.
     const SCROLL: Duration = Duration::from_millis(30);
-    let (mut rpc, mut term, _) = drawn_slowly(
+    let (mut rpc, mut term, link) = drawn_slowly(
         &scratch,
         "client-unturned",
         &format!(
@@ -2134,6 +2134,7 @@ fn a_page_neovim_does_not_turn_is_given_up_in_time() {
         }
         term.pump(until - now, |t| top_line(&t.text()) != last);
     };
+    let sent = link.trace.inputs();
     for k in 1..=28 {
         term.type_bytes(b"\x06");
         watch(&mut term, t0 + Duration::from_millis(10) * k);
@@ -2141,8 +2142,15 @@ fn a_page_neovim_does_not_turn_is_given_up_in_time() {
     // Neovim's view once it has taken them all, and when that was: asked once
     // they have all reached it, it answers only then, taking keys typed
     // before anything asked of it. On a busy machine that is later than its
-    // sleeps alone would make it, so it is not worked out from them.
-    watch(&mut term, Instant::now() + SLOW + Duration::from_millis(50));
+    // sleeps alone would make it, so it is not worked out from them. Reached
+    // it as the link says, which a client or a link held up makes later than
+    // a way of the link after they were typed.
+    let reached = Instant::now() + Duration::from_secs(10);
+    while link.trace.inputs() < sent + 28 && Instant::now() < reached {
+        watch(&mut term, Instant::now() + Duration::from_millis(10));
+        // Which returns at once, the view gone back.
+        std::thread::sleep(Duration::from_millis(1));
+    }
     let asked = std::thread::spawn(move || {
         let w0 = rpc.eval("line('w0')").map(|v| v.as_u64());
         (w0.map_err(|e| e.to_string()), Instant::now())
