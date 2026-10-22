@@ -34,8 +34,10 @@ pub enum Leave {
     New,
     /// Out of nvmux, every session left running: `q`.
     Quit,
-    /// To the picker full screen, for what it does not do floating: rename.
-    Picker,
+    /// To rename this session, which the picker does not do floating: `r`.
+    /// The name is asked for on a screen of its own, and the picker comes
+    /// back up over the session once it has been answered.
+    Rename(crate::ids::Id),
     /// The help, over the session in its place: `?`.
     Help,
     /// The settings, over the session in its place: `,`.

@@ -53,7 +53,8 @@
 //! And the settings can come the other way: from their screen full screen,
 //! turned to float, they come up over the session as the relay brings it
 //! back — with it, the two out of the background together, as the picker
-//! goes out to a screen of its own the other way round.
+//! goes out to a screen of its own the other way round. So does the picker,
+//! back from the rename prompt it went out to ([`Attachment::float_the_picker`]).
 //!
 //! # Where it does not float
 //!
@@ -187,6 +188,7 @@ impl What {
             Outcome::ToPicker => Some(What::Picker),
             Outcome::Detached
             | Outcome::CreateNew
+            | Outcome::Rename(_)
             | Outcome::Resettle
             | Outcome::Switch(_)
             | Outcome::ChildExited
@@ -229,7 +231,7 @@ impl Way {
     fn of(leave: Option<Leave>) -> Self {
         match leave {
             None | Some(Leave::Quit) => Way::Back,
-            Some(Leave::Switch(_) | Leave::New | Leave::Picker) => Way::Away,
+            Some(Leave::Switch(_) | Leave::New | Leave::Rename(_)) => Way::Away,
             Some(Leave::Help) => Way::Across(What::Help),
             Some(Leave::Settings) => Way::Across(What::Settings),
         }
@@ -237,14 +239,14 @@ impl Way {
 }
 
 /// What ends the relay once a panel that is going somewhere is down: the
-/// session to switch to, the create prompt, the picker full screen, or out.
+/// session to switch to, the create prompt, the rename prompt, or out.
 /// `None` for the ways that keep the relay: back to the session, or across
 /// to another panel.
 fn ends_in(leave: Leave) -> Option<Outcome> {
     match leave {
         Leave::Switch(id) => Some(Outcome::Switch(Target::Session(id))),
         Leave::New => Some(Outcome::CreateNew),
-        Leave::Picker => Some(Outcome::ToPicker),
+        Leave::Rename(id) => Some(Outcome::Rename(id)),
         Leave::Quit => Some(Outcome::Detached),
         Leave::Help | Leave::Settings => None,
     }
@@ -987,9 +989,11 @@ mod tests {
             assert_eq!(What::of(outcome, false), None, "{outcome:?}, off");
             assert_eq!(what.full_screen(), outcome);
         }
+        let id = crate::ids::Id::new("abcd2345").expect("an id");
         for outcome in [
             Outcome::Detached,
             Outcome::CreateNew,
+            Outcome::Rename(id),
             Outcome::Resettle,
             Outcome::ChildExited,
             Outcome::StdinClosed,
@@ -1056,15 +1060,16 @@ mod tests {
         assert_eq!(frame(way_in(false, whole, t0), t0), (0.0, 0.0, 0.0));
     }
 
-    /// Where the picker's keys lead: to another session, the prompt and the
-    /// picker full screen out with the session; to the help and the settings
-    /// across, over it; and out of nvmux, or nowhere, back to it first.
+    /// Where the picker's keys lead: to another session, and to the prompt to
+    /// create one or to rename one, out with the session; to the help and the
+    /// settings across, over it; and out of nvmux, or nowhere, back to it
+    /// first.
     #[test]
     fn the_pickers_ways_out() {
         let id = crate::ids::Id::new("abcd2345").expect("an id");
         assert_eq!(Way::of(None), Way::Back);
         assert_eq!(Way::of(Some(Leave::Quit)), Way::Back);
-        for leave in [Leave::Switch(id), Leave::New, Leave::Picker] {
+        for leave in [Leave::Switch(id), Leave::New, Leave::Rename(id)] {
             assert_eq!(Way::of(Some(leave)), Way::Away, "{leave:?}");
         }
         assert_eq!(Way::of(Some(Leave::Help)), Way::Across(What::Help));
@@ -1074,7 +1079,7 @@ mod tests {
             Some(Outcome::Switch(Target::Session(id)))
         );
         assert_eq!(ends_in(Leave::New), Some(Outcome::CreateNew));
-        assert_eq!(ends_in(Leave::Picker), Some(Outcome::ToPicker));
+        assert_eq!(ends_in(Leave::Rename(id)), Some(Outcome::Rename(id)));
         assert_eq!(ends_in(Leave::Quit), Some(Outcome::Detached));
         assert_eq!(ends_in(Leave::Help), None);
         assert_eq!(ends_in(Leave::Settings), None);

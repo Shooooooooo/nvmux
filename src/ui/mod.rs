@@ -708,7 +708,7 @@ fn run_loop(
                             crate::fade::fade_in(terminal, |f| draw::draw(f, &app))?;
                         }
                     }
-                    prompt::Outcome::Renamed => refresh(&mut app, transport, &mut behind)?,
+                    prompt::Outcome::Renamed(_) => refresh(&mut app, transport, &mut behind)?,
                 }
             }
 

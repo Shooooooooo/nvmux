@@ -279,6 +279,11 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
         // it left, for the card that says where it landed to move its row the
         // way it went. Set by the switch, and spent by the attach it leads to.
         let mut stepped: Option<(nvmux::keys::Direction, nvmux::session::Session)> = None;
+        // `r` on the picker floating over the session: the session it was
+        // pressed on, for the picker to come back up over this one with the
+        // cursor on, once the rename prompt has been answered. Set by the
+        // prompt, and spent by the attach it leads to.
+        let mut float_picker: Option<String> = None;
 
         loop {
             // Everything nvmux does between the keypress and a client ready to
@@ -443,11 +448,15 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
             notifier.watch(&current.id, &current.name, sock.clone());
             notifier.front(Some(&current.id));
 
-            // The rows the picker opens on if it floats over this session; what
-            // it left of them, if it changed them, is taken back below.
-            ui::picker::hand(&listing);
+            // The rows the picker opens on if it floats over this session, and
+            // the one it opens on back from the rename prompt; what it left of
+            // them, if it changed them, is taken back below.
+            ui::picker::hand(&listing, float_picker.as_deref());
             if std::mem::take(&mut float_settings) {
                 attachment.float_the_settings();
+            }
+            if float_picker.take().is_some() {
+                attachment.float_the_picker();
             }
 
             // The relay, with the chance to start the next client while this
@@ -538,6 +547,7 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                     seeing.wait_until(deadline);
                 }
                 pty::Outcome::CreateNew
+                | pty::Outcome::Rename(_)
                 | pty::Outcome::ShowHelp
                 | pty::Outcome::ShowSettings
                 | pty::Outcome::Resettle
@@ -623,6 +633,32 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                         listing.push(session.clone());
                         current = session;
                     }
+                    continue;
+                }
+                // `r` on the picker floating over the session, which asks for
+                // the name on a screen of its own as the picker full screen
+                // does: then back to the session, held as for `<prefix> c`,
+                // with the picker up over it again, the cursor on the row
+                // renamed — as the picker full screen is back after its prompt.
+                (pty::Outcome::Rename(id), held) => {
+                    attached = pool.set_aside(held);
+                    let named = listing.iter().find(|s| s.id == id.as_str()).cloned();
+                    if let Some(session) = named {
+                        if let ui::prompt::Outcome::Renamed(name) =
+                            ui::prompt::rename(transport, &session)?
+                        {
+                            // Put in the rows in hand rather than listed for:
+                            // a rename changes the name and nothing else, and
+                            // a listing would be a round trip over ssh on a
+                            // blank screen. The picker lists behind them.
+                            for s in listing.iter_mut().chain(std::iter::once(&mut current)) {
+                                if s.id == session.id {
+                                    s.name.clone_from(&name);
+                                }
+                            }
+                        }
+                    }
+                    float_picker = Some(id.as_str().to_string());
                     continue;
                 }
                 (pty::Outcome::ShowHelp, held) => {

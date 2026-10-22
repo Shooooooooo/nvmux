@@ -2,8 +2,10 @@
 //! one is created.
 //!
 //! Three ways in: `<prefix> c` from an attached session, and `c` or `r` from the
-//! picker. [`run`] owns a terminal for the first, `run_on` borrows one for the
-//! others; a `Task` says whether a session is being invented or renamed.
+//! picker. [`run`] owns a terminal for the first — and for `c` on the picker
+//! floating over a session, which has none to lend, as [`rename`] does for its
+//! `r` — and `run_on` borrows the picker's full screen; a `Task` says whether a
+//! session is being invented or renamed.
 //!
 //! It owns the whole screen rather than replacing a hint line, per the contract
 //! in the parent module. Three weights carry the three kinds of text — dim for
@@ -169,8 +171,9 @@ use crate::transport::Transport;
 pub enum Outcome {
     /// Created; the caller attaches to it.
     Created(Session),
-    /// Renamed; the caller relists.
-    Renamed,
+    /// Renamed, to this; the caller relists, or puts the name in the rows it
+    /// has — a rename changes nothing else.
+    Renamed(String),
     /// Backed out.
     Cancelled,
 }
@@ -807,6 +810,25 @@ pub fn run(transport: &dyn Transport) -> Result<Outcome> {
     })
 }
 
+/// Ask for a new name for `session`, owning the terminal while it does — for
+/// `r` on the picker floating over a session, which goes out with the session
+/// and leaves none to borrow (see [`super::picker`]).
+///
+/// Renamed or not, the same client comes back next, with the picker up over
+/// it again, so it takes the ordinary close, as a create cancelled does.
+pub fn rename(transport: &dyn Transport, session: &Session) -> Result<Outcome> {
+    // Reached from a session that has just gone out to the background, so
+    // dissolve in, and out again either way.
+    super::owning(|terminal| {
+        run_on(
+            terminal,
+            transport,
+            Task::Rename(session),
+            Arrival::Dissolve,
+        )
+    })
+}
+
 /// How the prompt comes up — and so whether it goes back out on a cancel, for
 /// whatever was behind it to come back up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -816,7 +838,8 @@ pub(super) enum Arrival {
     /// with. Cut away from on a cancel too, the picker simply coming back.
     Cut,
     /// Dissolved in, out of the background a session has just dissolved into:
-    /// `<prefix> c`. Dissolved out again on a cancel.
+    /// `<prefix> c`, and `c` or `r` on the picker floating over a session,
+    /// which goes out with it. Dissolved out again on a cancel.
     Dissolve,
     /// Opened out of the name field's row, the picker having closed in onto
     /// the gap it made for the session (see [`super::app::App::make_room`]):
@@ -950,7 +973,7 @@ pub(super) fn run_on(
             }
             Task::Rename(session) => transport
                 .rename_session(session, &submission.name)
-                .map(|_| Outcome::Renamed),
+                .map(|_| Outcome::Renamed(submission.name)),
         };
 
         match committed {
@@ -1462,7 +1485,7 @@ mod tests {
     fn only_a_created_session_hands_the_terminal_over() {
         let session = Session::new("id000000".into(), "a".into(), 100, 1);
         assert!(Outcome::Created(session).attaches());
-        assert!(!Outcome::Renamed.attaches());
+        assert!(!Outcome::Renamed("b".into()).attaches());
         assert!(!Outcome::Cancelled.attaches());
     }
 

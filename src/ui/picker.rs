@@ -7,8 +7,9 @@
 //! note under the list, the effects — into the panel rather than onto the
 //! terminal, on its own keys and the mouse. What changes is where it is drawn,
 //! and so how much of its hint row there is room for ([`HINTS`]); and where a
-//! key that leads off it goes — another session, the create prompt, the help,
-//! the settings, out of nvmux — which is the relay's to follow ([`Leave`]).
+//! key that leads off it goes — another session, the create prompt, the
+//! rename prompt, the help, the settings, out of nvmux — which is the relay's
+//! to follow ([`Leave`]).
 //!
 //! # Rows in hand
 //!
@@ -20,10 +21,13 @@
 //!
 //! # What it does not do floating
 //!
-//! A rename asks for the name on a screen of its own: the panel goes, and the
-//! picker comes up full screen, as `<prefix> Space` brings it with `[style]
-//! float` off ([`Leave::Picker`]). On a terminal with no room for the panel
-//! and the session round it, `<prefix> Space` has the picker full screen too.
+//! A rename asks for the name on a screen of its own, as the picker full
+//! screen asks for it: the panel goes out with the session, the prompt comes
+//! up for the row `r` was pressed on, and once it has been answered the
+//! session comes back with the panel up over it again, the cursor on that row
+//! ([`Leave::Rename`]) — as the picker full screen is back once its prompt
+//! is. On a terminal with no room for the panel and the session round it,
+//! `<prefix> Space` has the picker full screen.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -93,6 +97,11 @@ static TRANSPORT: OnceLock<Shared> = OnceLock::new();
 /// The rows the session loop has in hand as it starts each relay.
 static IN_HAND: Mutex<Vec<Session>> = Mutex::new(Vec::new());
 
+/// The session the next panel opens with the cursor on, where that is not the
+/// one it floats over: the one `r` was pressed on, as the panel comes back up
+/// after the rename prompt.
+static ON: Mutex<Option<String>> = Mutex::new(None);
+
 /// The rows as a panel left them, where it changed them, for the session loop
 /// to take back.
 static CHANGED: Mutex<Option<Vec<Session>>> = Mutex::new(None);
@@ -106,9 +115,12 @@ pub fn lend(transport: &Shared) {
     let _ = TRANSPORT.set(std::sync::Arc::clone(transport));
 }
 
-/// The rows the next panel opens on: the session loop's, as it starts a relay.
-pub fn hand(rows: &[Session]) {
+/// The rows the next panel opens on: the session loop's, as it starts a relay
+/// — and the session it opens with the cursor on, where that is not the one
+/// it floats over: back from the rename prompt, the one `r` was pressed on.
+pub fn hand(rows: &[Session], on: Option<&str>) {
     *lock(&IN_HAND) = rows.to_vec();
+    *lock(&ON) = on.map(str::to_string);
     lock(&CHANGED).take();
 }
 
@@ -159,16 +171,20 @@ pub struct Panel {
 
 impl Panel {
     /// The picker over session `behind`, on the rows in hand, the cursor on
-    /// that session — and a listing begun behind them.
+    /// the session handed with them or else on that one — and a listing
+    /// begun behind them.
     pub fn open(behind: &str) -> Self {
         let rows = lock(&IN_HAND).clone();
+        // Taken: the next panel over the session, `<prefix> Space`'s, opens
+        // on the session again.
+        let on = lock(&ON).take();
         let (rows, listing) = match TRANSPORT.get().map(|t| Listing::in_hand(rows.clone(), t)) {
             Some(Listing::InHand(rows, answer)) => (rows, Some(answer)),
             Some(Listing::Fresh(rows)) => (rows, None),
             Some(Listing::Ask) | None => (rows, None),
         };
         let mut app = App::new(rows);
-        app.select_session(behind);
+        app.select_session(on.as_deref().unwrap_or(behind));
         app.set_came_from(behind);
         let now = Instant::now();
         Self {
@@ -209,7 +225,10 @@ impl Panel {
                 None => Did::Stay,
             },
             Request::NewSession => self.go(Leave::New),
-            Request::RenameSession(_) => self.go(Leave::Picker),
+            Request::RenameSession(id) => match Id::new(&id) {
+                Some(id) => self.go(Leave::Rename(id)),
+                None => Did::Stay,
+            },
             Request::Help => self.go(Leave::Help),
             Request::Settings => self.go(Leave::Settings),
             Request::Quit | Request::SaveAndQuit { .. } => self.go(Leave::Quit),
@@ -503,7 +522,60 @@ impl Floating for Panel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
     use unicode_width::UnicodeWidthStr;
+
+    /// The panels opened here, one test at a time: each opens on what the
+    /// session loop last handed over, which they share.
+    static TURN: Mutex<()> = Mutex::new(());
+
+    /// Sessions of these ids, numbered in order, as a listing has them.
+    fn rows(ids: &[&str]) -> Vec<Session> {
+        ids.iter()
+            .zip(1..)
+            .map(|(id, num)| {
+                let mut s = Session::new(id.to_string(), format!("s{num}"), 100 + num, num);
+                s.state.num = num;
+                s
+            })
+            .collect()
+    }
+
+    /// The id of the session the panel's cursor is on.
+    fn cursor(panel: &Panel) -> String {
+        panel.app.visible()[panel.app.selected_index()].id.clone()
+    }
+
+    fn press(panel: &mut Panel, c: char) -> Did {
+        let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        panel.on_key(key, Instant::now())
+    }
+
+    /// `r` goes out to rename the row the cursor is on, not the session the
+    /// panel floats over; and the panel back over that session once the
+    /// prompt has been answered opens with the cursor on that row, `Esc`
+    /// still going back to the session. The panel after that one,
+    /// `<prefix> Space`'s, is on the session again.
+    #[test]
+    fn r_renames_the_row_it_is_on_and_the_panel_comes_back_on_it() {
+        let _turn = lock(&TURN);
+        let (other, behind) = ("aaaaaaaa", "bbbbbbbb");
+        hand(&rows(&[other, behind]), None);
+        let mut panel = Panel::open(behind);
+        assert_eq!(cursor(&panel), behind);
+        assert_eq!(press(&mut panel, 'k'), Did::Stay);
+        assert_eq!(press(&mut panel, 'r'), Did::Close);
+        let renamed = Id::new(other).expect("an id");
+        assert_eq!(panel.leave(), Some(Leave::Rename(renamed)));
+
+        hand(&rows(&[other, behind]), Some(other));
+        let back = Panel::open(behind);
+        assert_eq!(cursor(&back), other);
+        let esc = back.app.came_from().map(|s| s.id.as_str());
+        assert_eq!(esc, Some(behind), "Esc goes back to the session");
+        assert_eq!(cursor(&Panel::open(behind)), behind);
+        hand(&[], None);
+    }
 
     /// At its least width the panel keeps the eight hints that matter most, in
     /// the full screen's order, and `esc back` after them; given the room, all
@@ -523,6 +595,7 @@ mod tests {
     /// a wider one, the panel's hint row says how to reach the settings.
     #[test]
     fn the_panel_says_how_to_reach_the_settings() {
+        let _turn = lock(&TURN);
         let mut panel = Panel::open("abcd2345");
         for (width, height) in [(80, 24), (200, 50)] {
             let area = panel
