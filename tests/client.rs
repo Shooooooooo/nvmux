@@ -169,6 +169,8 @@ impl Terminal {
 
     fn pump(&mut self, within: Duration, done: impl Fn(&Self) -> bool) -> bool {
         let deadline = Instant::now() + within;
+        // What frames() left of a frame it did not see the end of.
+        self.feed();
         loop {
             if done(self) {
                 return true;
@@ -201,6 +203,10 @@ impl Terminal {
     /// as a terminal would, and hand `each` the screen as every frame leaves
     /// it — not as a read happens to, part way through one — until it says
     /// that is enough. Says whether it did.
+    ///
+    /// The screen is left as the last whole frame left it: what came of the
+    /// next, should a read have ended part way through it, waits for the next
+    /// look, so that the screen a test takes after this is never half of one.
     fn frames(&mut self, within: Duration, mut each: impl FnMut(&vt100::Screen) -> bool) -> bool {
         let deadline = Instant::now() + within;
         let enough = loop {
@@ -229,7 +235,6 @@ impl Terminal {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break false,
             }
         };
-        self.feed();
         enough
     }
 
