@@ -244,6 +244,10 @@ struct Highlights {
     /// The editor's highlight groups the client colours its own rows with,
     /// by group id, as the agent sends them: see [`syntax_hl`].
     groups: HashMap<u32, (Attrs, Attrs)>,
+    /// Highlights made of others (see [`Derive`]), by index, and the index
+    /// of each.
+    derived: Vec<(u32, Derive)>,
+    derivations: HashMap<(u32, Derive), u32>,
 }
 
 impl Highlights {
@@ -332,7 +336,8 @@ impl Held {
 /// Set in a cell's highlight id that is not Neovim's: a highlight group of
 /// the editor's laid over one of Neovim's, as the client draws the rows it
 /// draws itself (see `super::predict`) in the colours the editor's syntax
-/// highlighting gives them.
+/// highlighting gives them — or, with a group of nought, a highlight made
+/// of one of Neovim's (see [`Derive`]).
 const SYNTAX: u32 = 1 << 31;
 
 /// The highlight id of group `group` laid over Neovim's highlight `base`, as
@@ -344,6 +349,26 @@ pub fn syntax_hl(base: u32, group: u32) -> u32 {
     }
     SYNTAX | group << 16 | base
 }
+
+/// A highlight of Neovim's with `'cursorline'`'s bar laid under it, or
+/// taken off: what a cell of a row the client moves the cursor onto, or off,
+/// is drawn in till Neovim draws the row again (see `super::App::repaint`).
+/// Laid under, as Neovim lays a `CursorLine` with no colour in front of its
+/// own under a cell: the cell's own, and the bar's background where the
+/// cell has none. Taken off, the cell's own background let go where it is
+/// the bar's. Wrong, for as long as Neovim takes to draw the row, of a cell
+/// whose own background is the bar's, and of virtual text Neovim draws in
+/// its own colours alone (`hl_mode` `replace`, which diagnostics do not
+/// use) and leaves out of the bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Derive {
+    CursorLineOn,
+    CursorLineOff,
+}
+
+/// How many highlights [`Model::derived`] makes at most: as many as the low
+/// half of an id numbers.
+const DERIVED: usize = 1 << 16;
 
 /// `over` laid over `under`: its colours where it has them, and every
 /// attribute either has.
@@ -488,6 +513,9 @@ impl Model {
     /// cell holds it (see [`Highlights`]); an id never defined is the
     /// default.
     pub fn style(&self, id: u32) -> Style {
+        if id & SYNTAX != 0 && (id >> 16) & 0x7fff == 0 {
+            return self.derived_style(id & 0xffff);
+        }
         if id & SYNTAX != 0 {
             return self.syntax_style(id);
         }
@@ -509,6 +537,79 @@ impl Model {
         let (under_rgb, under_cterm) = self.attrs(base).unwrap_or(&plain);
         self.colors()
             .style(&laid(under_rgb, rgb), &laid(under_cterm, cterm))
+    }
+
+    /// The id of highlight `base` — the client's id for one of Neovim's,
+    /// as a cell of a grid holds it — made as `d` says (see [`Derive`]):
+    /// `SYNTAX` and an index under 2^16, a group of nought, which
+    /// [`syntax_hl`] never makes. `None` for a highlight not Neovim's, or
+    /// once [`DERIVED`] have been made.
+    pub fn derived(&mut self, base: u32, d: Derive) -> Option<u32> {
+        if base & SYNTAX != 0 {
+            return None;
+        }
+        let h = &mut self.highlights;
+        if let Some(&i) = h.derivations.get(&(base, d)) {
+            return Some(SYNTAX | i);
+        }
+        let i = u32::try_from(h.derived.len())
+            .ok()
+            .filter(|&i| (i as usize) < DERIVED)?;
+        h.derived.push((base, d));
+        h.derivations.insert((base, d), i);
+        Some(SYNTAX | i)
+    }
+
+    /// Whether `'cursorline'`'s bar, as the editor's `CursorLine` group is
+    /// (see `hl_group_set`), gives a cell no more than a background — no
+    /// colour in front, no attribute — which a [`Derive`] lays under a cell
+    /// and takes off as Neovim does: a `CursorLine` with a colour in front of
+    /// its own is laid over the cell instead. And whether highlights can
+    /// still be made of others. Not where the editor has not said the group.
+    pub fn bar_derivable(&self) -> bool {
+        let Some(&id) = self.groups.get("CursorLine") else {
+            return false;
+        };
+        let plain = |a: &Attrs| {
+            *a == Attrs {
+                bg: a.bg,
+                blend: a.blend,
+                ..Attrs::default()
+            }
+        };
+        self.highlights.derived.len() < DERIVED
+            && self
+                .attrs(id)
+                .is_none_or(|(rgb, cterm)| plain(rgb) && plain(cterm))
+    }
+
+    /// A highlight made of another (see [`Model::derived`]), by its index,
+    /// resolved for drawing: the default, for one never made.
+    fn derived_style(&self, i: u32) -> Style {
+        let Some(&(base, d)) = self.highlights.derived.get(i as usize) else {
+            return self.style(0);
+        };
+        let plain = (Attrs::default(), Attrs::default());
+        let (rgb, cterm) = self.attrs(base).unwrap_or(&plain);
+        let bar = self.groups.get("CursorLine").and_then(|&g| self.attrs(g));
+        let (bar_rgb, bar_cterm) = bar.unwrap_or(&plain);
+        let made = |own: &Attrs, bar: &Attrs| match d {
+            Derive::CursorLineOn => Attrs {
+                bg: own.bg.or(bar.bg),
+                ..own.clone()
+            },
+            Derive::CursorLineOff => Attrs {
+                bg: own.bg.filter(|bg| bar.bg != Some(*bg)),
+                ..own.clone()
+            },
+        };
+        let style = self
+            .colors()
+            .style(&made(rgb, bar_rgb), &made(cterm, bar_cterm));
+        Style {
+            link: self.style(base).link,
+            ..style
+        }
     }
 
     /// The editor's highlight group `group` has these attributes, in both
@@ -1650,6 +1751,91 @@ mod tests {
         assert!(s.bold && s.italic);
         assert_eq!(syntax_hl(1 << 20, 400), 1 << 20, "too big to fit");
         assert_eq!(syntax_hl(3, 0), 3, "no group");
+    }
+
+    /// `'cursorline'`'s bar, a background alone, laid under a highlight of
+    /// Neovim's — its colours, and the bar's background where it has none of
+    /// its own — and taken off one it was laid under, the cell's own
+    /// background kept where it differs from the bar's; in both forms. Ids
+    /// made once each, and none of a highlight not Neovim's.
+    #[test]
+    fn cursorline_laid_on_and_taken_off() {
+        use crate::client::style::Color;
+        let mut m = model();
+        let def = |id: u32, fg: Option<u32>, bg: Option<u32>| Event::HlAttr {
+            id,
+            rgb: Attrs {
+                fg,
+                bg,
+                ..Attrs::default()
+            },
+            cterm: Attrs {
+                fg: fg.map(|_| 1),
+                bg: bg.map(|b| b & 0xff),
+                ..Attrs::default()
+            },
+        };
+        apply(
+            &mut m,
+            vec![
+                def(3, Some(0x0a0b0c), None),
+                def(4, Some(0x0a0b0c), Some(0x303030)),
+                def(5, Some(0x0a0b0c), Some(0x550000)),
+                def(6, None, Some(0x303030)),
+                Event::HlGroup {
+                    name: "CursorLine".into(),
+                    id: 6,
+                },
+                Event::OptionSet {
+                    name: "termguicolors".into(),
+                    value: OptionValue::Bool(true),
+                },
+            ],
+        );
+        m.refresh_styles();
+        assert!(m.bar_derivable());
+        let rgb = |r: u8, g: u8, b: u8| Color::Rgb(Rgb(r, g, b));
+        let on = m.derived(3, Derive::CursorLineOn).expect("made");
+        assert_eq!(
+            (m.style(on).fg, m.style(on).bg),
+            (rgb(10, 11, 12), rgb(0x30, 0x30, 0x30))
+        );
+        assert_eq!(m.derived(3, Derive::CursorLineOn), Some(on), "made once");
+        let own = m.derived(5, Derive::CursorLineOn).expect("made");
+        assert_eq!(m.style(own).bg, rgb(0x55, 0, 0), "a background of its own");
+        let plain = m.derived(0, Derive::CursorLineOn).expect("made");
+        assert_eq!(m.style(plain), m.style(6), "the bar alone");
+        let off = m.derived(4, Derive::CursorLineOff).expect("made");
+        assert_eq!(m.style(off), m.style(3));
+        let kept = m.derived(5, Derive::CursorLineOff).expect("made");
+        assert_eq!(m.style(kept), m.style(5));
+        let bare = m.derived(6, Derive::CursorLineOff).expect("made");
+        assert_eq!(m.style(bare), m.style(0));
+        assert_eq!(m.derived(syntax_hl(3, 400), Derive::CursorLineOn), None);
+        // The cterm form alike.
+        apply(
+            &mut m,
+            vec![Event::OptionSet {
+                name: "termguicolors".into(),
+                value: OptionValue::Bool(false),
+            }],
+        );
+        m.refresh_styles();
+        assert_eq!(m.style(on).bg, Color::Index(0x30));
+        assert_eq!(m.style(off), m.style(3));
+        // A bar with a colour in front, or an attribute, is laid over the
+        // cell by Neovim, not under it.
+        apply(
+            &mut m,
+            vec![
+                def(7, Some(0xffffff), Some(0x303030)),
+                Event::HlGroup {
+                    name: "CursorLine".into(),
+                    id: 7,
+                },
+            ],
+        );
+        assert!(!m.bar_derivable());
     }
 
     /// Highlights resolve lazily, and `'termguicolors'` decides which form.

@@ -158,6 +158,23 @@ pub trait View {
     /// are: split windows on their way from one layout to another, a window
     /// fading from one buffer to the next.
     fn over_windows(&self, _frame: &mut Frame, _model: &Model) {}
+
+    /// Cells drawn over row `r` of grid `grid`, whatever it would otherwise
+    /// show — its own or a scroll's: runs of them, each from a grid column.
+    /// What Neovim will draw of a row once it hears of a key the client
+    /// has drawn the cursor moved for, or the line typed into (see
+    /// `super::anim::chain`).
+    fn patches(&self, _grid: u64, _r: usize) -> &[Patch] {
+        &[]
+    }
+}
+
+/// A run of cells drawn over a grid's row from column `col`: see
+/// [`View::patches`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Patch {
+    pub col: usize,
+    pub cells: Vec<Cell>,
 }
 
 /// A scroll part way through, as the compositor asks after it.
@@ -474,17 +491,26 @@ fn draw(
             std::mem::swap(&mut runs, &mut cut);
         }
         let row = &mut frame.cells[y * frame.width..(y + 1) * frame.width];
+        let patches = view.patches(grid, r);
         for &(s, e) in &runs {
             for c in s as usize..e as usize {
-                let (cell, wide) = match scrolled {
-                    Some((left, right, line)) if (left..right).contains(&c) => {
+                let patch = patches
+                    .iter()
+                    .find(|p| (p.col..p.col + p.cells.len()).contains(&c));
+                let (cell, wide) = match (patch, scrolled) {
+                    (Some(p), _) => {
+                        let i = c - p.col;
+                        let wide = p.cells.get(i + 1).is_some_and(|n| n.text == Text::Half);
+                        (&p.cells[i], wide)
+                    }
+                    (None, Some((left, right, line))) if (left..right).contains(&c) => {
                         let i = c - left;
                         let line = line.unwrap_or(&[]);
                         let cell = line.get(i).unwrap_or(&blank);
                         let wide = line.get(i + 1).is_some_and(|n| n.text == Text::Half);
                         (cell, wide)
                     }
-                    _ => (
+                    (None, _) => (
                         &own[c],
                         own.get(c + 1).is_some_and(|n| n.text == Text::Half),
                     ),

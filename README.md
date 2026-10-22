@@ -228,6 +228,35 @@ What Neovim draws after the end of a line, such as a language server's
 diagnostic, runs on into the margin as far as the window goes, rather than
 stopping where the text does.
 
+### Over a slow link
+
+Over ssh, every key waits a round trip for Neovim to say what it did with it.
+nvmux's own client draws some keys at once instead, before Neovim has heard of
+them, much as [mosh](https://mosh.org) echoes what you type: scrolls (`<C-d>`,
+`<C-f>`, `zz`, the mouse wheel and their kind), cursor motions in Normal mode
+(`h`, `j`, `w`, `fx`, `}`, `G`, `$` and their kind), and what you type in Insert
+mode. It draws each only where it can work out exactly what Neovim will do, and
+Neovim has the last word: anything it did otherwise is put back as Neovim drew
+it, a round trip later.
+
+Each kind has a setting of its own under `[client]` — `predict_scrolls`,
+`predict_motions` and `predict_typing` — set to one of:
+
+| Value | Means |
+|---|---|
+| `"auto"` | the default: on for a session on a remote host, off for one on this machine |
+| `"on"` | on for every session, this machine's too |
+| `"off"` | off: every key of its kind waits for Neovim |
+
+On, keys are drawn ahead whatever the round trip: even 20 or 30 ms is felt, a
+key held down or typed fast. A session on this machine answers in a fraction
+of a millisecond, before anything drawn ahead could be seen, which is why
+`"auto"` leaves its sessions off.
+
+The motions and the typing have the editor say what it made of each key, about
+40 bytes a key back over the link; and the typing has it send the line you are
+typing on with each key, about a hundred bytes on a short line.
+
 ## Configuration
 
 nvmux needs no configuration. To change a setting, press `,` in the picker or
@@ -259,12 +288,14 @@ settings = ","       # change nvmux's settings while it runs
 command = "nvim --headless --listen {sock}"   # {sock} is required
 
 [client]
-ui             = "nvmux"  # who draws a session: nvmux's own client, animated; or "nvim"
-per_session    = true     # keep each session's client; a switch back reuses it
-lazy           = false    # start every client at launch, and after a dropped link; true waits for visits
-predict        = "auto"   # over ssh, scrolls show before Neovim answers; "on" over any slow link
-centre         = "off"    # on a wide terminal, each window's text in its middle: "smart" or "fixed"
-window_width   = 120      # with centre on, how many columns a window's text gets; 0 for no limit
+ui              = "nvmux"  # who draws a session: nvmux's own client, animated; or "nvim"
+per_session     = true     # keep each session's client; a switch back reuses it
+lazy            = false    # start every client at launch, and after a dropped link; true waits for visits
+predict_scrolls = "auto"   # over ssh, scrolls show ahead of Neovim; "on" everywhere, or "off"
+predict_motions = "auto"   # over ssh, h, j, w, $ and their kind move the cursor ahead of Neovim
+predict_typing  = "auto"   # over ssh, what is typed in Insert mode shows ahead of Neovim
+centre          = "off"    # on a wide terminal, each window's text in its middle: "smart" or "fixed"
+window_width    = 120      # with centre on, how many columns a window's text gets; 0 for no limit
 
 [style]
 color = "terminal"   # or "#rrggbb": nvmux's text and bars in that colour; dim text stays dim

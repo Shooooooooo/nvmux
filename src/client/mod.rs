@@ -112,14 +112,17 @@ pub mod compose;
 pub mod grid;
 pub mod input;
 pub mod model;
+pub mod moves;
 pub mod predict;
 pub mod redraw;
 pub mod region;
 pub mod screen;
 pub mod style;
 pub mod term;
+pub mod typing;
 pub mod wide;
 pub mod wire;
+pub mod words;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
@@ -131,15 +134,15 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use rmpv::ValueRef;
 
-use self::anim::{Animator, Effects};
-use self::grid::Cell;
+use self::anim::{chain, Animator, Effects};
+use self::grid::{Cell, Text};
 use self::input::{Input, Mouse, Parser, Reply};
 use self::model::{Changes, Model, Place, Placement};
-use self::predict::{Command, Mode, Predictor, Side};
+use self::predict::{Command, Mode, Pos, Predictor, Proof, Rest, Side, Unseen, Want};
 use self::redraw::Event;
 use self::screen::Screen;
 use self::wire::{Arg, Inbox, Outbox};
-use crate::config::Centre;
+use crate::config::{Centre, Predictions};
 use crate::palette::{Palette, Rgb};
 
 /// The options that lay windows out, as the agent gives them: `'laststatus'`,
@@ -207,6 +210,16 @@ const HOLD_LIMIT: Duration = Duration::from_millis(500);
 /// How long a terminal's answer part way through is waited for, from the last
 /// of it to come, before what has come of it is dropped.
 const REPLY_WAIT: Duration = Duration::from_secs(1);
+
+/// The longest a lone `ESC` is held for the rest of a sequence, in
+/// milliseconds, whatever `'ttimeoutlen'` says (see [`input`]). The client
+/// runs under nvmux's relay, which has held it for as long already, for the
+/// same reason (`crate::pty`'s `SEQUENCE_TIMEOUT`): the bytes of one key are
+/// split only by a buffer boundary, which is machine time, not human time.
+/// Held for `'ttimeoutlen'` on top, in a terminal that sends the Escape key
+/// as a bare `ESC`, every `<Esc>` that leaves Insert mode would wait 60 ms by
+/// Neovim's default before Neovim heard of it.
+const RELAYED_ESCAPE: u64 = 10;
 
 /// How soon to ask who is attached again, having found a UI only passing
 /// through grid 1: another nvmux client's refresh, or one attaching again.
@@ -297,9 +310,7 @@ return out";
 /// argument says the client may scroll ahead, or a `User` autocommand
 /// `nvmux_client_reach_<chan>` says since, with the number as its data; two
 /// at first, the rest a moment later, no more than a few hundred lines at a
-/// time; and none at all while that number is 0, as it is while the link is
-/// too fast for predictions (see [`Predictor::agent_reach`]), what was sent
-/// let go of — and the view's own (`lines`, window, buffer, `b:changedtick`,
+/// time — and the view's own (`lines`, window, buffer, `b:changedtick`,
 /// first line, lines, whether they replace what the client has, the most
 /// bytes of a line sent), only those the client does not have, by the same
 /// rule as [`predict`] keeps them by, and each no longer than the window
@@ -323,22 +334,45 @@ return out";
 /// scrolls go, when that changes (`shape`, window, see [`predict::Shape`]) —
 /// among it, which of the keys the client follows, given it as the agent's
 /// third argument and those in insert mode as its fourth, something maps in
-/// the window's buffer; a view moved sideways, as Neovim moves it (`leftcol`,
-/// window, its first column); the display column the cursor wants in the
-/// window that has it, Neovim's `curswant`, when that or the window changes
-/// (`want`, window, column); and each time Neovim moves a view while it is
-/// behind on the keys typed (`behind`), which it sends no frame for till it
-/// has caught up — what the client scrolled ahead of it waits for it
-/// meanwhile (see [`Predictor::deadline`]).
-const AGENT_LUA: &str = "local chan, predict, keys, ikeys, reach = ...
+/// the window's buffer, and, told to say what Neovim made of each key, what
+/// decides where a motion takes the cursor besides — those mapped looked up
+/// again then a second after Neovim last went to wait for a key, for one
+/// mapped since; a view moved sideways,
+/// as Neovim moves it (`leftcol`, window, its first column); the display
+/// column the cursor wants in the window that has it, Neovim's `curswant`,
+/// when that or the window changes (`want`, window, column) — or, told by
+/// its sixth argument to say what Neovim made of each key, that with the
+/// rest of it, as Neovim goes to wait for a key with every key typed taken,
+/// when any of it changes (`ack`, the keys Neovim has taken, counted, the
+/// last of them, its mode, and the window, buffer, `b:changedtick`, line
+/// count, cursor, `curswant` and view they left, and how wide Neovim lays
+/// the cursor's line out: see [`predict::Ack`]), the edits they made sent
+/// first — and what would make a key typed in Insert mode in the buffer of
+/// the window that has the cursor do other than what typing it plainly
+/// does, as Insert mode is entered there, the buffer is, or an option that
+/// bears on it is set, where any of it changed (`insert`, see
+/// [`typing::Facts`]); and
+/// each time Neovim moves a view while it is behind on the keys typed
+/// (`behind`), which it sends no frame for till it has caught up — what the
+/// client scrolled ahead of it waits for it meanwhile (see
+/// [`Predictor::deadline`]). The keys are counted in `_G.nvmux_taken`, by
+/// channel, for a fence to read (see [`predict::Sync`]).
+const AGENT_LUA: &str = "local chan, predict, keys, ikeys, reach, acks, typing = ...
 local api = vim.api
 local group = api.nvim_create_augroup('nvmux_client_' .. chan, { clear = true })
--- Whether this client has gone: what is left of the agent stops.
-local gone = false
+-- Whether this client has gone: what is left of the agent stops. And what
+-- lets go of its count of the keys, where it keeps one.
+local gone, unkey = false, nil
+local function leave()
+  gone = true
+  if unkey then
+    unkey()
+  end
+  pcall(api.nvim_del_augroup_by_id, group)
+end
 local function send(...)
   if not pcall(vim.rpcnotify, chan, 'nvmux_client', ...) then
-    gone = true
-    pcall(api.nvim_del_augroup_by_id, group)
+    leave()
   end
 end
 local function au(event, opts, f)
@@ -360,24 +394,137 @@ au('OptionSet', { pattern = { 'laststatus', 'splitright', 'splitbelow' } }, func
 end)
 au('UILeave', {}, function()
   if vim.v.event.chan == chan then
-    gone = true
-    pcall(api.nvim_del_augroup_by_id, group)
+    leave()
   end
 end)
 if predict then
   local have, shapes, maps = {}, {}, {}
   local soon
+  -- The keys typed that Neovim has taken, counted as the client counts the
+  -- ones it sends (see predict::Sync): each key of Neovim's notation one, a
+  -- character or a name in <…>, as it comes off the typeahead before a
+  -- mapping makes anything else of it; a click or a turn of the wheel one;
+  -- a paste none. Nought from the moment the agent is left, so that a fence
+  -- that reads it before the first key is not taken for no agent at all;
+  -- with the last few keys, for the client to check its count by.
+  local taken, tail = 0, {}
+  -- Where <C-w> and <C-u> stop once in Insert mode, as Neovim has it, for
+  -- the client to stop them there too: Neovim's Insstart_orig (orig),
+  -- which goes back before each key to where Insert mode began, Insstart
+  -- (began) — the cursor as it is entered, or the line's start for o and O
+  -- — but stays put (sticks) from the <C-g>u that Neovim's own mappings of
+  -- <C-w> and <C-u> type on, where it began then, and from there goes back
+  -- only as a key takes out what is before it. Characters typed, <CR> and
+  -- <Tab> move neither; any other key typed there — an arrow, a click,
+  -- completion — and a line's break taken out, or its indent done again,
+  -- may, and they are not known again till Insert mode is entered again
+  -- (began false). With the key last taken in Normal mode, which entered
+  -- it; and what of the last key in Insert mode is seen only once Neovim
+  -- has taken it: whether it took characters out (rubbed), or was a
+  -- character typed past the line's indent (typed, the line and where its
+  -- indent ended), and whether it was the <C-g> of a pair.
+  local began, orig, sticks, entering = false, false, false, nil
+  local rubbed, typed_at, ctrl_g = false, nil, false
+  local function indent_of()
+    return #api.nvim_get_current_line():match('^[ \\t]*')
+  end
+  -- What the key before did, now that Neovim has taken it.
+  local function settle()
+    if not began then
+      return
+    end
+    local cur = api.nvim_win_get_cursor(0)
+    if typed_at and typed_at[1] == cur[1] - 1 and typed_at[2] ~= indent_of() then
+      began = false
+    elseif rubbed and cur[1] - 1 == orig[2] and cur[2] < orig[3] then
+      orig = { orig[1], orig[2], cur[2] }
+    end
+    rubbed, typed_at = false, nil
+  end
+  if acks then
+    local keyns = api.nvim_create_namespace('nvmux_client_keys_' .. chan)
+    _G.nvmux_taken = _G.nvmux_taken or {}
+    _G.nvmux_taken[chan] = 0
+    unkey = function()
+      vim.on_key(nil, keyns)
+      _G.nvmux_taken[chan] = nil
+    end
+    local still = {}
+    for k, rubs in pairs({ ['<BS>'] = true, ['<C-h>'] = true, ['<C-w>'] = true,
+        ['<C-u>'] = true, ['<CR>'] = false, ['<Tab>'] = false }) do
+      still[vim.keycode(k)] = rubs
+    end
+    vim.on_key(function(key, typed)
+      if gone then
+        return
+      end
+      local mode = api.nvim_get_mode().mode
+      if mode == 'n' then
+        entering = key
+      elseif mode == 'i' and began then
+        settle()
+        local cur = api.nvim_win_get_cursor(0)
+        local b, rubs = key:byte(1) or 0, still[key]
+        if ctrl_g then
+          ctrl_g = false
+          if key == 'u' then
+            began, sticks = { began[1], cur[1] - 1, cur[2] }, true
+          else
+            began = false
+          end
+        elseif began then
+          if not sticks then
+            orig = began
+          end
+          if key == '\\7' then
+            ctrl_g = true
+          elseif rubs then
+            rubbed = cur[2] > 0
+            began = rubbed and began
+          elseif rubs == nil and (b < 0x20 or b == 0x7f or b == 0x80) then
+            began = false
+          elseif rubs == nil and b ~= 0x20 and cur[2] >= indent_of() then
+            typed_at = { cur[1] - 1, indent_of() }
+          end
+        end
+      end
+      if typed == nil or typed == '' then
+        return
+      end
+      local t, i = vim.fn.keytrans(typed), 1
+      while i <= #t do
+        local j = t:sub(i, i) == '<' and t:find('>', i, true)
+        local key = j and t:sub(i, j) or t:sub(i, i + vim.str_utf_end(t, i))
+        i, taken = i + #key, taken + 1
+        tail[#tail + 1] = key
+        if #tail > 4 then
+          table.remove(tail, 1)
+        end
+      end
+      _G.nvmux_taken[chan] = taken
+      -- Nothing returned: a string, even an empty one, would change the key.
+    end, keyns)
+  end
   -- The keys something maps, or starts a mapping with, in the window's
-  -- buffer: looked up again a second after they last were.
+  -- buffer: looked up again a second after they last were. And where the
+  -- client is told what Neovim made of each key, how a key that moves the
+  -- cursor a line down or up is mapped, for the client to know its own
+  -- (see predict::Idiom): to what, whether as an expression, whether what
+  -- it maps to is mapped again, and whether no longer mapping starts with
+  -- it, which Neovim would wait to tell apart.
   local function mapped(buf)
     local m = maps[buf]
     if m and vim.uv.now() - m.at < 1000 then
-      return m.keys, m.ikeys
+      return m.keys, m.ikeys, m.idioms
     end
     local function look(list, modes)
       local out = {}
       for _, key in ipairs(list) do
-        local ms = key:find('ScrollWheel') and { 'n', 'x', 'i' } or modes
+        -- The keys that enter Insert mode are followed in Normal mode
+        -- alone: in Visual mode, i and a start text objects, which plugins
+        -- map there.
+        local ms = key:find('ScrollWheel') and { 'n', 'x', 'i' }
+          or (key:find('^[iaAI]$') and { 'n' }) or modes
         for _, mode in ipairs(ms) do
           if vim.fn.mapcheck(key, mode) ~= '' then
             out[#out + 1] = key
@@ -387,11 +534,60 @@ if predict then
       end
       return out
     end
-    maps[buf] = { at = vim.uv.now(), keys = look(keys, { 'n', 'x' }), ikeys = look(ikeys, { 'i' }) }
-    return maps[buf].keys, maps[buf].ikeys
+    local idioms = {}
+    for _, key in ipairs(acks and { 'j', 'k', '<Down>', '<Up>' } or {}) do
+      local map = vim.fn.maparg(key, 'n', false, true)
+      if next(map) ~= nil then
+        local longer = false
+        for _, list in ipairs({ api.nvim_get_keymap('n'), api.nvim_buf_get_keymap(buf, 'n') }) do
+          for _, x in ipairs(list) do
+            longer = longer or (#x.lhs > #map.lhs and x.lhs:sub(1, #map.lhs) == map.lhs)
+          end
+        end
+        idioms[#idioms + 1] = { key, map.rhs or '', map.expr == 1, map.noremap == 1, not longer }
+      end
+    end
+    maps[buf] = { at = vim.uv.now(), keys = look(keys, { 'n', 'x' }), ikeys = look(ikeys, { 'i' }),
+      idioms = idioms }
+    return maps[buf].keys, maps[buf].ikeys, maps[buf].idioms
+  end
+  -- The display columns 'colorcolumn' colours in a window, from nought: a
+  -- column counted from 'textwidth' only where that is set.
+  local function colorcolumn(win)
+    local cc, tw = {}, vim.bo[api.nvim_win_get_buf(win)].textwidth
+    for _, c in ipairs(vim.split(vim.wo[win].colorcolumn, ',', { trimempty = true })) do
+      local n = tonumber(c)
+      if n and c:find('^[+-]') then
+        n = tw > 0 and tw + n or nil
+      end
+      if n and n > 0 then
+        cc[#cc + 1] = n - 1
+      end
+    end
+    return cc
+  end
+  -- What 'iskeyword' makes of each character under 256 in a buffer, a
+  -- digit a character: 0 for a blank, 1 for punctuation and 2 for one of a
+  -- word, as charclass() has it there (see predict::Stepping::classes).
+  local classesof = {}
+  local function classes(buf)
+    local isk = vim.bo[buf].iskeyword
+    if not classesof[isk] then
+      local t = {}
+      api.nvim_buf_call(buf, function()
+        for b = 0, 255 do
+          t[b + 1] = math.min(vim.fn.charclass(vim.fn.nr2char(b)), 2)
+        end
+      end)
+      classesof[isk] = table.concat(t)
+    end
+    return classesof[isk]
   end
   local function shape(buf, info)
+    -- Where the client is told what Neovim made of each key, a window with
+    -- 'vartabstop' is not followed: its tabs are not 'tabstop' wide.
     local ok = not vim.wo.diff and vim.bo[buf].buftype ~= 'terminal'
+      and not (acks and vim.bo[buf].vartabstop ~= '')
     local page = 0
     if #api.nvim_tabpage_list_wins(0) == 1 and vim.o.window > 0
         and vim.o.window < vim.o.lines - 1 then
@@ -404,7 +600,7 @@ if predict then
     if siso < 0 then
       siso = vim.go.sidescrolloff
     end
-    local nmaps, imaps = mapped(buf)
+    local nmaps, imaps, idioms = mapped(buf)
     -- 'listchars' but its tab, as predict::Listchars::read has them; and
     -- whether Neovim looks at every character of a line for highlighting of
     -- its own, and so at its blanks (see predict::Blanks).
@@ -416,7 +612,7 @@ if predict then
         lcs[i] = l[k] or ''
       end
     end
-    return { buf, api.nvim_buf_line_count(buf), info.textoff, vim.bo[buf].tabstop,
+    local s = { buf, api.nvim_buf_line_count(buf), info.textoff, vim.bo[buf].tabstop,
       vim.wo.number, vim.wo.relativenumber, vim.wo.statuscolumn == '', vim.wo.wrap,
       vim.fn.winsaveview().leftcol, ok, so,
       tonumber(vim.o.mousescroll:match('ver:(%d+)')) or 3,
@@ -425,6 +621,68 @@ if predict then
       vim.o.startofline, nmaps, imaps, siso, vim.o.sidescroll,
       tonumber(vim.o.mousescroll:match('hor:(%d+)')) or 6, lcs,
       vim.wo.linebreak or vim.wo.spell or vim.b[buf].current_syntax ~= nil }
+    -- Where the client is told what Neovim made of each key, what decides
+    -- where a motion takes the cursor besides, and what it moves with it
+    -- (see predict::Stepping): 'cursorlineopt' as one for the number, two
+    -- for the line and four for the screen line; whether the window has
+    -- highlights of its own, or conceals what the cursor's line shows; the
+    -- columns 'colorcolumn' colours; 'scrolljump'; whether it may conceal
+    -- text on any line; what 'iskeyword' makes of each character; whether
+    -- :lmap mappings take the character typed after f and its kind for
+    -- another, 'iminsert' 1; 'sections' and 'paragraphs'; and whether a view
+    -- Neovim centres on the cursor is centred by rows, 'smoothscroll' in a
+    -- window that wraps.
+    if acks then
+      local widths = vim.o.ambiwidth == 'double' or #vim.fn.getcellwidths() > 0
+        or not vim.o.emoji
+      local o = {}
+      for _, k in ipairs(vim.split(vim.wo.cursorlineopt, ',')) do
+        o[k] = true
+      end
+      local cul = not vim.wo.cursorline and 0
+        or ((o.number or o.both) and 1 or 0) + ((o.line or o.both) and 2 or 0)
+          + (o.screenline and 4 or 0)
+      local got, ns = pcall(api.nvim_get_hl_ns, { winid = info.winid })
+      vim.list_extend(s, { vim.o.whichwrap, vim.o.virtualedit, vim.wo.cursorcolumn,
+        vim.wo.scrollbind or vim.wo.cursorbind, vim.o.langmap ~= '', widths, vim.wo.numberwidth,
+        vim.wo.signcolumn:find('number') ~= nil, cul, idioms,
+        vim.wo.winhighlight ~= '' or not got or ns > 0,
+        vim.wo.conceallevel > 0 and not vim.wo.concealcursor:find('n'),
+        colorcolumn(info.winid), vim.o.scrolljump, vim.wo.conceallevel > 0, classes(buf),
+        vim.bo[buf].iminsert == 1, vim.o.sections, vim.o.paragraphs,
+        vim.wo.wrap and vim.wo.smoothscroll })
+    end
+    return s
+  end
+  -- What of a window's options decides how the cursor's line is drawn — its
+  -- numbers, its bar, what is concealed, the columns coloured — and how far
+  -- a motion past 'scrolloff' scrolls the view, as they were when its shape
+  -- was last said, where the client is told what Neovim made of each key;
+  -- how many lines its buffer has, which a key that adds or takes out lines
+  -- changes, for the keys typed after it to be worked out from the shape
+  -- that goes with Neovim's word on it; the buffer's 'iskeyword', which a
+  -- filetype's plugin sets as the buffer is loaded; and its 'iminsert',
+  -- which Insert mode's <C-^> turns on and off. Set by an autocommand of
+  -- another event, as configurations turn 'relativenumber' and
+  -- 'cursorline' off in Insert mode and on again out of it, they fire no
+  -- OptionSet; nor does a highlight namespace given the window, nor <C-^>.
+  -- So they are read again as Neovim goes to wait for a key, and the shapes
+  -- said again ahead of the ack where they changed.
+  local looked = {}
+  local function looks(win)
+    local out = { pcall(api.nvim_get_hl_ns, { winid = win }) }
+    for _, name in ipairs({ 'number', 'relativenumber', 'cursorline', 'cursorlineopt',
+        'numberwidth', 'signcolumn', 'foldcolumn', 'statuscolumn', 'winhighlight', 'conceallevel',
+        'concealcursor', 'wrap', 'list' }) do
+      out[#out + 1] = api.nvim_get_option_value(name, { win = win })
+    end
+    out[#out + 1] = vim.o.scrolljump
+    out[#out + 1] = table.concat(colorcolumn(win), ' ')
+    local buf = api.nvim_win_get_buf(win)
+    out[#out + 1] = api.nvim_buf_line_count(buf)
+    out[#out + 1] = vim.bo[buf].iskeyword
+    out[#out + 1] = vim.bo[buf].iminsert
+    return table.concat(vim.tbl_map(tostring, out), ',')
   end
   -- No more of a line than could be shown, and a cell over for the client
   -- to see it would not fit: a minified file is a line a megabyte long.
@@ -757,6 +1015,9 @@ if predict then
       lo, hi = around(2)
     end
     local s = shape(buf, info)
+    if acks then
+      looked[win] = looks(win)
+    end
     if s[10] and vim.wo.foldenable then
       for l = lo + 1, hi do
         if vim.fn.foldclosed(l) ~= -1 then
@@ -773,6 +1034,7 @@ if predict then
       .. '\\0' .. table.concat(s[19], ' ') .. '\\0' .. table.concat(s[20], ' ')
       .. '\\0' .. table.concat({ s[21], s[22], s[23] }, ',')
       .. '\\0' .. table.concat(s[24], '\\0') .. '\\0' .. tostring(s[25])
+      .. '\\0' .. vim.json.encode({ unpack(s, 26) })
     if shapes[win] ~= key then
       shapes[win] = key
       send('shape', win, s)
@@ -827,13 +1089,6 @@ if predict then
   end
   local queued, scrolled = false, false
   local function push_all()
-    -- Nothing at all while the client keeps no lines, its link too fast for
-    -- predictions: what was sent is let go of, to be sent afresh should the
-    -- link slow. Before anything else, as a scroll pushes.
-    if reach <= 0 then
-      have, shapes, edits, stale = {}, {}, {}, {}
-      return
-    end
     if not pcall(api.nvim_get_autocmds, { group = group }) then
       return
     end
@@ -878,9 +1133,7 @@ if predict then
   -- with each scroll, that Neovim is still at work on them.
   au('WinScrolled', {}, function()
     if scrolled then
-      if reach > 0 then
-        send('behind')
-      end
+      send('behind')
       push_all()
     end
     scrolled = true
@@ -900,19 +1153,140 @@ if predict then
   -- curswant, which a scroll that takes the cursor to another line lands it
   -- on, wherever on its own line it is now. Said when it or the window
   -- changes, as Neovim goes to wait for a key — once it has taken those
-  -- typed ahead, and before the frame that shows what they did; not while
-  -- the link is too fast for predictions, and afresh after, as the lines.
-  local wanted
+  -- typed ahead, and before the frame that shows what they did.
+  -- Where the client is to be told what Neovim made of each key, it is said
+  -- with the rest of that instead: the keys taken, the last of them, and
+  -- where they left the cursor, the view and the mode, when any of it has
+  -- changed — Neovim says SafeState again after every request — the edits
+  -- they made sent first, so that the client's lines are the buffer's as of
+  -- the b:changedtick this says (see predict::Predictor::fresh); and how wide
+  -- Neovim lays the cursor's line out, what it draws between the characters
+  -- and all, short of a line longer than the client keeps — and so each line
+  -- in view that ends in blanks, among which blank virtual text shows
+  -- nothing of itself on the screen. A second after, the keys mapped are
+  -- looked up afresh: one mapped since, by a plugin or by hand, has the
+  -- window's shape said again.
+  local wanted, said, fixed, decorated, recheck, rehooked
+  local function remapped()
+    recheck = false
+    local buf = api.nvim_get_current_buf()
+    local m = maps[buf]
+    maps[buf] = nil
+    local nmaps, imaps, idioms = mapped(buf)
+    if m and not (vim.deep_equal(m.keys, nmaps) and vim.deep_equal(m.ikeys, imaps)
+        and vim.deep_equal(m.idioms, idioms)) then
+      soon()
+    end
+  end
   au('SafeState', {}, function()
-    if reach <= 0 then
-      wanted = nil
+    local win, view = api.nvim_get_current_win(), vim.fn.winsaveview()
+    if not acks then
+      if not wanted or wanted[1] ~= win or wanted[2] ~= view.curswant then
+        wanted = { win, view.curswant }
+        send('want', win, view.curswant)
+      end
       return
     end
-    local win, col = api.nvim_get_current_win(), vim.fn.winsaveview().curswant
-    if not wanted or wanted[1] ~= win or wanted[2] ~= col then
-      wanted = { win, col }
-      send('want', win, col)
+    if not recheck then
+      recheck = true
+      vim.defer_fn(remapped, 1000)
     end
+    if looked[win] and looked[win] ~= looks(win) then
+      push_all()
+    end
+    if rehooked then
+      rehooked()
+    end
+    flush()
+    local buf = api.nvim_get_current_buf()
+    local cap = 4 * (view.leftcol + api.nvim_win_get_width(win)) + 64
+    local len, width = vim.fn.col({ view.lnum, '$' }) - 1, -1
+    if len <= cap then
+      width = len > 0 and vim.fn.virtcol({ view.lnum, len }) or 0
+    end
+    local blanks = {}
+    for i, l in ipairs(api.nvim_buf_get_lines(buf, view.topline - 1, vim.fn.line('w$'), false)) do
+      if #l <= cap and l:find('%s$') then
+        blanks[#blanks + 1] = { view.topline + i - 2, vim.fn.virtcol({ view.topline + i - 1, #l }) }
+      end
+    end
+    -- The lines about the view, as far either side of it as the lines sent
+    -- go (see around), that Neovim draws with more than their text in its
+    -- colours, which the client draws a line a scroll ahead of Neovim
+    -- brings into view in: virtual text — among their characters, after
+    -- them, over them, at a column — or a sign, in its column or over the
+    -- number, or a sign's highlight across the line or its number. Such a
+    -- line is left to Neovim (see predict::Predictor::decorated). Said as
+    -- runs of lines, each from its first to the one after its last, and the
+    -- lines looked over for them: short of the band past as many marks of a
+    -- kind as are looked through, to the line of the last of them. Said
+    -- ahead of the ack, where they changed.
+    local m = math.min(reach * api.nvim_win_get_height(win) + 10, 1000)
+    local from = math.max(view.topline - 1 - m, 0)
+    local to = math.min(vim.fn.line('w$') + m, api.nvim_buf_line_count(buf))
+    local rows = {}
+    for _, kind in ipairs({ 'virt_text', 'sign' }) do
+      local marks = api.nvim_buf_get_extmarks(buf, -1, { from, 0 }, { math.max(to - 1, 0), -1 },
+        { type = kind, limit = 1000 })
+      if #marks >= 1000 then
+        to = math.min(to, marks[#marks][2] + 1)
+      end
+      for _, m in ipairs(marks) do
+        rows[#rows + 1] = m[2]
+      end
+    end
+    table.sort(rows)
+    local runs = {}
+    for _, r in ipairs(rows) do
+      if r < to and #runs > 0 and r <= runs[#runs] then
+        runs[#runs] = math.max(runs[#runs], r + 1)
+      elseif r < to then
+        runs[#runs + 1] = r
+        runs[#runs + 1] = r + 1
+      end
+    end
+    local over = from .. ',' .. to .. ',' .. table.concat(runs, ' ')
+    if not (decorated and decorated[1] == win and decorated[2] == over) then
+      decorated = { win, over }
+      send('decorated', win, from, to, runs)
+    end
+    -- Where the client types ahead of Neovim, the lines in view with virtual
+    -- text that Neovim draws in a column of the window's — right-aligned, at
+    -- a column given, over the text — or inline after the last character,
+    -- staying before what is typed there: what the client would otherwise
+    -- move with the line's end (see predict::Predictor::pinned). Said ahead
+    -- of the ack, where they changed.
+    if typing then
+      local pinned = {}
+      for _, m in ipairs(api.nvim_buf_get_extmarks(buf, -1, { view.topline - 1, 0 },
+          { vim.fn.line('w$') - 1, -1 }, { details = true, type = 'virt_text' })) do
+        local d, l = m[4], m[2]
+        local at_end = not d.right_gravity and m[3] >= #(api.nvim_buf_get_lines(buf, l, l + 1,
+          false)[1] or '')
+        if d.virt_text_pos ~= 'eol' and (d.virt_text_pos ~= 'inline' or at_end)
+            and pinned[#pinned] ~= l then
+          pinned[#pinned + 1] = l
+        end
+      end
+      if not (fixed and fixed[1] == win and vim.deep_equal(fixed[2], pinned)) then
+        fixed = { win, pinned }
+        send('pinned', win, pinned)
+      end
+    end
+    local mode = api.nvim_get_mode().mode
+    if mode == 'i' then
+      settle()
+    end
+    local at = mode == 'i' and began and began[1] == buf and (sticks and orig or began)
+    local a = { taken, mode, win, buf, api.nvim_buf_get_changedtick(buf),
+      api.nvim_buf_line_count(buf), view.lnum - 1, view.col,
+      view.curswant >= 2147483647 and -1 or view.curswant, view.topline - 1, view.leftcol,
+      width, blanks, at and at[2] or -1, at and at[3] or -1, sticks }
+    if said and vim.deep_equal(said, a) then
+      return
+    end
+    said = a
+    send('ack', a[1], table.concat(tail), unpack(a, 2))
   end)
   -- New colours for every group the client knows.
   au('ColorScheme', {}, function()
@@ -938,13 +1312,24 @@ if predict then
     'syntax' } }, function()
     soon()
   end)
+  if acks then
+    au('OptionSet', { pattern = { 'whichwrap', 'virtualedit', 'cursorcolumn', 'scrollbind',
+      'cursorbind', 'langmap', 'ambiwidth', 'emoji', 'cursorline', 'cursorlineopt',
+      'winhighlight', 'conceallevel', 'concealcursor', 'colorcolumn', 'textwidth',
+      'vartabstop', 'scrolljump', 'iskeyword', 'iminsert', 'sections',
+      'paragraphs', 'smoothscroll' } }, function()
+      soon()
+    end)
+  end
   au('WinClosed', {}, function(ev)
     local win = tonumber(ev.match)
-    have[win], shapes[win] = nil, nil
+    have[win], shapes[win], looked[win] = nil, nil, nil
   end)
-  -- How far the client may scroll ahead, again, as the round trip moves.
+  -- How far the client may scroll ahead, again, as the round trip moves:
+  -- and where it is told what Neovim made of the keys, told it afresh.
   au('User', { pattern = 'nvmux_client_reach_' .. chan }, function(ev)
     reach = tonumber(ev.data) or reach
+    said, fixed, decorated = nil, nil, nil
     soon()
   end)
   au('UILeave', {}, function()
@@ -952,6 +1337,126 @@ if predict then
       timer:close()
     end
   end)
+  -- What would make a key typed in Insert mode in a buffer do other than
+  -- what typing it plainly does (see typing::Facts), where the client types
+  -- ahead of Neovim: the keys mappings start with, the abbreviations,
+  -- whether a plugin's autocommand may do anything to what is typed, or as
+  -- Insert mode is entered or left, and the options that bear on it — said
+  -- for the buffer in the window that has the cursor as Insert mode is
+  -- entered, once what that set off has been, a plugin loaded on the way
+  -- in and the mappings it makes among it; as a buffer is entered, and an
+  -- option among those is set; and only where any of it changed. A prompt
+  -- buffer's text goes in after its prompt, wherever Insert mode is
+  -- entered, and none of the prompt comes out: none goes in as typed.
+  if typing then
+    local factsof, entered = {}, {}
+    local function unseen(buf, event)
+      for _, ac in ipairs(api.nvim_get_autocmds({ event = event })) do
+        local g = ac.group_name or ''
+        if g ~= 'matchparen' and not g:find('^nvmux_client_')
+            and (not ac.buflocal or ac.buffer == buf) then
+          return true
+        end
+      end
+      return false
+    end
+    local function hooks(buf)
+      return { unseen(buf, { 'InsertCharPre', 'TextChangedI', 'CursorMovedI' }),
+        unseen(buf, { 'InsertEnter', 'ModeChanged' }),
+        unseen(buf, { 'InsertLeavePre', 'InsertLeave', 'ModeChanged' }) }
+    end
+    local function facts()
+      if gone then
+        return
+      end
+      local buf, win = api.nvim_get_current_buf(), api.nvim_get_current_win()
+      local bo, wo = vim.bo[buf], vim.wo[win]
+      local firsts = {}
+      -- Neovim's own mappings of <C-W> and <C-U>, which have them break
+      -- the undo sequence first: followed as they are, not as mappings.
+      local undo = { ['<C-W>'] = false, ['<C-U>'] = false }
+      local function heads(list, own)
+        for _, m in ipairs(list) do
+          local lhs = vim.fn.keytrans(m.lhsraw or vim.keycode(m.lhs))
+          if own and undo[lhs] ~= nil and m.rhs == '<C-G>u' .. lhs and m.noremap == 1
+              and m.expr == 0 then
+            undo[lhs] = true
+          else
+            firsts[#firsts + 1] = lhs:match('^<[^<>]+>') or vim.fn.strcharpart(lhs, 0, 1)
+          end
+        end
+      end
+      heads(api.nvim_get_keymap('i'), true)
+      heads(api.nvim_buf_get_keymap(buf, 'i'))
+      if bo.iminsert == 1 then
+        heads(api.nvim_get_keymap('l'))
+        heads(api.nvim_buf_get_keymap(buf, 'l'))
+      end
+      local abbrevs = {}
+      for _, a in ipairs(vim.fn.maplist(true)) do
+        if a.mode:find('[i!]') then
+          abbrevs[#abbrevs + 1] = a.lhs
+        end
+      end
+      -- Neovim's comp_textwidth: with 'wrapmargin', the window's width less
+      -- it and the fold and sign columns, and eight for a number column
+      -- whatever it takes; the whole gutter and eight here, if anything
+      -- narrower.
+      local tw = bo.textwidth
+      if tw == 0 and bo.wrapmargin > 0 then
+        local info = vim.fn.getwininfo(win)[1]
+        local nu = (wo.number or wo.relativenumber) and 8 or 0
+        tw = math.max(info.width - bo.wrapmargin - info.textoff - nu, 0)
+      end
+      local hooked = hooks(buf)
+      local f = { buf, entered[buf] == true, firsts, abbrevs, hooked[1], tw,
+        bo.formatoptions, bo.indentexpr ~= '' and bo.indentkeys or (bo.cindent and bo.cinkeys or ''),
+        bo.smartindent, bo.lisp, vim.o.showmatch, bo.matchpairs,
+        vim.fn.exists('+autocomplete') == 1 and vim.o.autocomplete or false,
+        bo.modifiable and not (bo.readonly and not bo.modified) and bo.buftype ~= 'prompt',
+        not (vim.o.revins or wo.rightleft or bo.iminsert == 2 or vim.o.paste or vim.o.digraph),
+        vim.o.backspace,
+        bo.softtabstop ~= 0 or bo.varsofttabstop ~= '', vim.o.smarttab, vim.o.delcombine,
+        wo.conceallevel > 0 and wo.concealcursor or '', classes(buf), hooked[2], hooked[3],
+        bo.autoindent, bo.cindent or bo.indentexpr ~= '', undo['<C-W>'], undo['<C-U>'] }
+      if not vim.deep_equal(factsof[buf], f) then
+        factsof[buf] = f
+        send('insert', unpack(f))
+      end
+    end
+    -- A plugin may make an autocommand of these at any time, loaded late or
+    -- set up by hand: whether one does is read again as Neovim goes to wait
+    -- for a key, and what is said of the buffer said again ahead of the ack
+    -- where it changed.
+    rehooked = function()
+      local buf = api.nvim_get_current_buf()
+      local f = factsof[buf]
+      if f and not vim.deep_equal({ f[5], f[22], f[23] }, hooks(buf)) then
+        facts()
+      end
+    end
+    au('InsertEnter', {}, function(ev)
+      entered[ev.buf] = true
+      local c = api.nvim_win_get_cursor(0)
+      began = { ev.buf, c[1] - 1, (entering == 'o' or entering == 'O') and 0 or c[2] }
+      orig, sticks, entering, rubbed, typed_at, ctrl_g = began, false, nil, false, nil, false
+      vim.schedule(facts)
+    end)
+    au('BufEnter', {}, function()
+      vim.schedule(facts)
+    end)
+    au('OptionSet', { pattern = { 'iskeyword', 'textwidth', 'wrapmargin', 'formatoptions',
+      'indentkeys', 'cinkeys', 'indentexpr', 'cindent', 'smartindent', 'lisp', 'showmatch',
+      'matchpairs', 'autocomplete', 'modifiable', 'readonly', 'buftype', 'revins', 'rightleft',
+      'iminsert', 'paste', 'digraph', 'backspace', 'softtabstop', 'varsofttabstop', 'smarttab',
+      'delcombine', 'conceallevel', 'concealcursor', 'autoindent' } }, function()
+      vim.schedule(facts)
+    end)
+    au('BufWipeout', {}, function(ev)
+      factsof[ev.buf], entered[ev.buf] = nil, nil
+    end)
+    vim.schedule(facts)
+  end
   soon()
 end
 local wins = {}
@@ -1006,6 +1511,19 @@ fn landed(
     Some(Landed { vcol, want, left })
 }
 
+/// Whether a key that scrolls can be predicted from what the client has of
+/// the editor: from Neovim's last word on the keys, and those sent since,
+/// where the agent says what Neovim made of each (see
+/// [`Predictor::known`]); where not, once a fence asked after every key it
+/// could not follow has been answered (see [`predict::Typed::sure`]).
+fn sure(p: &Predictor) -> bool {
+    if p.acks() {
+        p.known()
+    } else {
+        p.typed.sure()
+    }
+}
+
 /// Whether the client has what it takes to draw window `win`'s view of
 /// lines `shown` from first display column `left`, `width` columns wide,
 /// the cursor on line `line`: every line, and those sent cut short reaching
@@ -1036,6 +1554,107 @@ fn drawable(
         )
 }
 
+/// Buffer line `line` of window `win`, which Neovim's view does not show,
+/// with the predictions `p`, drawn as the client draws a line a scroll ahead
+/// of Neovim brings into view (see [`Predictor::row`]) in the colours `look`
+/// has, the cursor drawn on line `cursor`, in a window `h` rows tall and
+/// `width` columns wide: its number as Neovim's gutter has it there, in the
+/// group its place takes of `ids` (see [`predict::numbers`]); its sign and
+/// fold columns, with `'cursorline'` numbering the cursor's line, in that
+/// line's groups on it; and the bar of `'cursorline'` laid under it if it
+/// is the cursor's, made in `model` (see [`model::Derive`]) — the whole row,
+/// from the window's first column. `None` where the client cannot draw it
+/// so: a line it has not, a bar it cannot lay. Only for a window whose
+/// gutter and bar the client can draw afresh at all (see [`App::afresh`]).
+fn drawn_afresh(
+    p: &Predictor,
+    model: &mut Model,
+    win: i64,
+    (line, cursor): (i64, i64),
+    (h, width): (i64, usize),
+    (look, ids): (&predict::Look, &predict::Gutter),
+) -> Option<Vec<Cell>> {
+    let shape = p.shape(win)?;
+    let cul = shape.stepping.as_ref()?.cursorline;
+    let mut row = p.row(win, line, width, look, cursor)?;
+    let textoff = shape.textoff.min(width);
+    let numbers = predict::numbers(line, cursor, shape, h, ids).unwrap_or_default();
+    let marks = textoff.checked_sub(numbers.len())?;
+    row.splice(marks..textoff, numbers);
+    if line != cursor {
+        return Some(row);
+    }
+    if cul.number {
+        for cell in &mut row[..marks] {
+            cell.hl = match cell.hl {
+                hl if hl == ids.sign => ids.cursor_sign,
+                hl if hl == ids.fold => ids.cursor_fold,
+                hl => hl,
+            };
+        }
+    }
+    if cul.line {
+        for cell in &mut row[textoff..] {
+            cell.hl = model.derived(cell.hl, model::Derive::CursorLineOn)?;
+        }
+    }
+    Some(row)
+}
+
+/// Where a step of the cursor moved ahead of Neovim in a window goes on
+/// from, as [`App::onward`] finds it: the window, its view as Neovim has
+/// it, its text rectangle in its grid, the window, gutter and first display
+/// column the steps are worked out with, where the cursor is, and the
+/// newest step.
+#[derive(Debug, Clone)]
+struct Onward {
+    win: i64,
+    view: model::Viewport,
+    rect: (usize, usize, usize, usize),
+    shown: (i64, usize, usize),
+    from: Pos,
+    head: Option<chain::Step>,
+}
+
+impl Onward {
+    /// Whether Neovim's view of the window shows buffer line `l`.
+    fn neovims(&self, l: i64) -> bool {
+        let h = (self.rect.1 - self.rect.0) as i64;
+        (self.view.topline..self.view.topline + h).contains(&l)
+    }
+
+    /// The text of buffer line `l` a step may go onto, with the window's
+    /// predictions `p`: as the steps typed it, or as the agent sent it,
+    /// whole; stepped over as Neovim does ([`predict::ordinary`]) and —
+    /// where Neovim may take a character for another width than the
+    /// client does (see `stepping`) — all ASCII.
+    fn text<'a>(
+        &'a self,
+        p: &'a Predictor,
+        stepping: &'a predict::Stepping,
+    ) -> impl Fn(i64) -> Option<&'a str> + 'a {
+        let echo = self.head.as_ref().and_then(|s| s.echo.as_ref());
+        move |l| {
+            match echo.filter(|e| e.line == l) {
+                Some(e) => Some(&*e.text),
+                None => (!p.cut(self.win, l)).then(|| p.text(self.win, l)).flatten(),
+            }
+            .filter(|t| predict::ordinary(t) && (!stepping.widths || t.is_ascii()))
+        }
+    }
+}
+
+/// A row of a window's gutter, as [`App::gutters`] finds it: the row of
+/// the window's grid, the cells Neovim's frame has there, and those Neovim
+/// draws there with the cursor on another line — `None` where the client
+/// cannot say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Regutter {
+    row: usize,
+    drawn: Vec<Cell>,
+    now: Option<Vec<Cell>>,
+}
+
 /// What the client has asked and not been answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ask {
@@ -1054,8 +1673,12 @@ enum Ask {
     Ping,
     /// A request asked after keys, whose answer says Neovim has taken them
     /// and drawn what they did: see [`predict::Typed`]. With the count of
-    /// inputs it was asked after.
-    Fence(u64),
+    /// inputs it was asked after, and the fence as [`predict::Sync`] knows
+    /// it.
+    Fence {
+        sent: u64,
+        fenced: predict::Fenced,
+    },
 }
 
 /// What a scroll the client predicts was made by: keys, which are predicted
@@ -1069,6 +1692,17 @@ enum By {
     InsertKeys,
     PageWheel,
     Wheel,
+}
+
+/// The input a scroll the client predicts is made of: typed or turned `by`,
+/// the client's number for it (see [`predict::Sync`]), and when it was
+/// sent — which is when the time Neovim is given to make it runs from (see
+/// [`Predictor::deadline`]), made out again from an ack or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cause {
+    by: By,
+    seq: u64,
+    at: Instant,
 }
 
 /// How the client is attached: see the module docs.
@@ -1167,6 +1801,10 @@ pub struct App {
     /// This attach has had its first flush: before it, nothing animates or
     /// is drawn.
     flushed: bool,
+    /// The steps being made are made again, a frame having let go of them
+    /// (see [`App::remake`]): they put the cursor back where it was drawn,
+    /// not travelling there.
+    remaking: bool,
     /// Put aside, and not back in front yet: see [`AWAY_FRAME_GAP`].
     away: bool,
     /// What to write to the terminal before the next frame — the bell, the
@@ -1177,6 +1815,10 @@ pub struct App {
     /// Scrolling ahead of a slow link, if the config has it: see
     /// [`predict`].
     predict: Option<Predictor>,
+    /// What the agent said Neovim made of the keys, for the frame it was
+    /// said ahead of: the client's number for the last key it covers, and
+    /// the ack (see [`App::heard_ack`]).
+    ack: Option<(u64, predict::Ack)>,
     /// When each question asked to measure the round trip by was asked.
     asked_at: HashMap<u32, Instant>,
     /// When the user last typed, turned the wheel or pasted: the round trip
@@ -1244,8 +1886,9 @@ struct Partial {
 }
 
 impl App {
-    /// A client drawing with `effects`, predicting scrolls if `predict`
-    /// (see [`predict`]), on a terminal of `size`.
+    /// A client drawing with `effects`, predicting if `predict` (see
+    /// [`predict`]) — the scrolls alone till told otherwise (see
+    /// [`App::with_predictions`]) — on a terminal of `size`.
     pub fn new(term: Palette, effects: Effects, predict: bool, size: (usize, usize)) -> Self {
         Self {
             model: Model::new(term),
@@ -1282,10 +1925,12 @@ impl App {
             last_frame: None,
             frame_before: None,
             flushed: false,
+            remaking: false,
             away: false,
             say: Vec::new(),
             done: false,
             predict: predict.then(Predictor::default),
+            ack: None,
             asked_at: HashMap::new(),
             typed: None,
             lefts: Vec::new(),
@@ -1317,6 +1962,15 @@ impl App {
         // own are wanted.
         app.multigrid_wanted |= app.centring();
         app
+    }
+
+    /// This client, working out `predictions` ahead of Neovim, where it
+    /// predicts at all (see [`crate::config::Predictions`]).
+    pub fn with_predictions(mut self, predictions: Predictions) -> Self {
+        if let Some(p) = self.predict.as_mut() {
+            p.set_predictions(predictions);
+        }
+        self
     }
 
     /// This client, having the terminal move the rows a frame moved if `on`,
@@ -1354,7 +2008,7 @@ impl App {
         // Answered at once, busy or not, so a measure of the link alone.
         self.asked_at.insert(id, Instant::now());
         if let Some(p) = self.predict.as_mut() {
-            p.typed.attached();
+            p.attached();
         }
         self.client_info();
         // Asked before anything an attach waits for, so its answer comes
@@ -1702,44 +2356,42 @@ impl App {
         if self.agent || !self.multigrid() || !(self.anim.wants_agent() || predict) {
             return;
         }
+        let acks = self.predict.as_ref().is_some_and(Predictor::acks);
+        let typing = self.predict.as_ref().is_some_and(Predictor::typing);
         self.agent = true;
-        self.reach = self.predict.as_ref().map_or(2, Predictor::agent_reach);
-        let (keys, ikeys) = (predict::keys(), predict::insert_keys());
+        self.reach = self.predict.as_ref().map_or(2, Predictor::reach);
+        let (keys, ikeys) = (predict::keys(acks), predict::insert_keys());
         fn list(keys: &[String]) -> Arg<'_> {
             Arg::Array(keys.iter().map(|k| Arg::str(k)).collect())
         }
-        let id = self.outbox.request(
-            "nvim_exec_lua",
-            &[
-                Arg::str(AGENT_LUA),
-                Arg::Array(vec![
-                    Arg::Int(chan as i64),
-                    Arg::Bool(predict),
-                    list(&keys),
-                    list(&ikeys),
-                    Arg::Int(self.reach),
-                ]),
-            ],
-        );
+        let mut args = vec![
+            Arg::Int(chan as i64),
+            Arg::Bool(predict),
+            list(&keys),
+            list(&ikeys),
+            Arg::Int(self.reach),
+            Arg::Bool(acks),
+        ];
+        // Told to type ahead of Neovim, it is to say what bears on that as
+        // well; not told, it is left as it was before there was any.
+        if typing {
+            args.push(Arg::Bool(true));
+        }
+        let id = self
+            .outbox
+            .request("nvim_exec_lua", &[Arg::str(AGENT_LUA), Arg::Array(args)]);
         self.asked.insert(id, Ask::Agent);
     }
 
     /// Tell the agent how far either side of a view to keep lines, should
-    /// the round trip have moved it: see [`Predictor::agent_reach`].
+    /// the round trip have moved it: see [`Predictor::reach`].
     fn tell_reach(&mut self) {
-        let (Some(chan), Some(p)) = (self.chan, self.predict.as_mut()) else {
+        let (Some(chan), Some(p)) = (self.chan, self.predict.as_ref()) else {
             return;
         };
-        let reach = p.agent_reach();
+        let reach = p.reach();
         if !self.agent || reach == self.reach {
             return;
-        }
-        // None: the link too fast for predictions now, the agent sends
-        // nothing more and lets go of what it sent, and what the client
-        // keeps of it goes too — no edit reaches it from here on — till the
-        // agent sends it all afresh, with a slow link back.
-        if reach == 0 {
-            p.reset();
         }
         self.reach = reach;
         let pattern = format!("nvmux_client_reach_{chan}");
@@ -1816,6 +2468,7 @@ impl App {
                     self.lefts.push((win, usize::try_from(left).unwrap_or(0)));
                 }
             }
+            Some("ack") => self.heard_ack(&params[1..], now),
             // Neovim is still at work on keys typed ahead of it, and will
             // send no frame till it has caught up: what it has yet to land
             // waits for it as long as a scroll made now would.
@@ -1828,12 +2481,50 @@ impl App {
                 if let Some(p) = self.predict.as_mut() {
                     p.said(what, &params[1..]);
                 }
+                if what == "shape" {
+                    if let Some(win) = int(1) {
+                        self.reshaped(win, now);
+                    }
+                }
+                // What may let the keys typed since Neovim's last word go in
+                // ahead of it, where they are typed into its buffer.
+                let base = self.predict.as_ref().and_then(|p| p.base.as_ref());
+                if what == "insert" && base.is_some_and(|b| Some(b.ack.buf) == int(1)) {
+                    self.remake(now);
+                }
                 // What a scroll ahead was waiting for, perhaps.
                 if matches!(what, "lines" | "splice") && self.flushed {
                     self.fill_in(now);
                 }
             }
             None => {}
+        }
+    }
+
+    /// The agent said window `win`'s shape again: a window left to Neovim
+    /// for drawing the cursor elsewhere may draw it as the client does now,
+    /// and the cursor moved ahead with a gutter of another width than it
+    /// has now is a column out.
+    fn reshaped(&mut self, win: i64, now: Instant) {
+        let Some(p) = self.predict.as_mut() else {
+            return;
+        };
+        p.trust.reshaped(win);
+        let textoff = p.shape(win).map(|s| s.textoff);
+        let grid = self
+            .model
+            .wins
+            .iter()
+            .find(|(_, w)| **w == win)
+            .map(|(g, _)| *g);
+        if let Some(grid) = grid {
+            if self
+                .anim
+                .chain(grid)
+                .is_some_and(|c| c.win == win && Some(c.textoff) != textoff)
+            {
+                self.drop_steps(grid, now);
+            }
         }
     }
 
@@ -1844,6 +2535,7 @@ impl App {
     fn go_away(&mut self, now: Instant) {
         self.away = true;
         self.anim.reset();
+        self.forget_dropped();
         self.anim.hold_blink(true, now);
         self.dirty = true;
     }
@@ -1875,6 +2567,8 @@ impl App {
         let client = drawing.client;
         let predict = client.predicts(drawing.remote);
         let predicting = self.predict.is_some();
+        let acking = self.predict.as_ref().is_some_and(Predictor::acks);
+        let typed_ahead = self.predict.as_ref().is_some_and(Predictor::typing);
         let centred = (self.centre, self.window_width);
         self.centre = client.centre;
         self.window_width = usize::from(client.window_width);
@@ -1884,10 +2578,15 @@ impl App {
         if predict != predicting {
             self.predict = predict.then(|| {
                 let mut p = Predictor::default();
-                p.typed.attached();
+                p.attached();
                 p
             });
         }
+        if let Some(p) = self.predict.as_mut() {
+            p.set_predictions(client.predictions(drawing.remote));
+        }
+        let acks = self.predict.as_ref().is_some_and(Predictor::acks);
+        let typing = self.predict.as_ref().is_some_and(Predictor::typing);
         let flipped = wanted != self.multigrid_wanted;
         self.multigrid_wanted = wanted;
         if flipped {
@@ -1903,8 +2602,11 @@ impl App {
                 false
             }
             // Not wanted any more; or the agent to be told it predicts, or
-            // that it does not.
-            Attach::Attached { multigrid: true } if !wanted || predict != predicting => {
+            // that it does not — or that it is to say what Neovim made of
+            // each key, or not, and what bears on typing ahead of it.
+            Attach::Attached { multigrid: true }
+                if !wanted || predict != predicting || acks != acking || typing != typed_ahead =>
+            {
                 self.leave(wanted, now);
                 true
             }
@@ -2033,6 +2735,9 @@ impl App {
                         self.leave_measure();
                     }
                     Some(Ask::Agent) => {
+                        if let Some(p) = self.predict.as_mut() {
+                            p.sync.agent = p.acks();
+                        }
                         let answer = result.and_then(ValueRef::as_array);
                         let answer = answer.map_or(&[][..], Vec::as_slice);
                         self.anim.set_options(options(answer));
@@ -2079,11 +2784,24 @@ impl App {
                             self.attach_as(multigrid);
                         }
                     }
-                    Some(Ask::Fence(at)) => {
+                    Some(Ask::Fence { sent, fenced }) => {
+                        // What the agent said ahead of a frame that never
+                        // came — a key that changed nothing on the screen —
+                        // before what the fence says after it.
+                        self.take_acks(now);
                         let mode = Mode::of(&self.model.mode_name);
+                        let mut upto = None;
                         if let Some(p) = self.predict.as_mut() {
-                            p.typed.answered(at, mode);
+                            p.typed.answered(sent, mode);
+                            if p.acks() {
+                                let taken = result.and_then(redraw::int).unwrap_or(-1);
+                                upto = p.answered(fenced, taken);
+                            }
                         }
+                        if let Some(upto) = upto {
+                            self.floor(upto, now);
+                        }
+                        self.forget_unsure(now);
                     }
                     Some(Ask::Ping) | None => {}
                 }
@@ -2230,6 +2948,7 @@ impl App {
         self.tails.clear();
         self.tails_since = None;
         self.anim.reset();
+        self.anim.take_dropped();
         self.flushed = false;
         self.unsettled = false;
         self.placing = 0;
@@ -2237,9 +2956,10 @@ impl App {
         self.refreshed.clear();
         self.hold_since = None;
         self.pressed = None;
+        self.ack = None;
         if let Some(p) = self.predict.as_mut() {
             p.reset();
-            p.typed.attached();
+            p.attached();
         }
     }
 
@@ -2275,8 +2995,9 @@ impl App {
             .collect();
         self.apply(batch, animate, &switched, now);
         self.flushed = true;
-        self.landed_sideways();
+        self.landed_sideways(now);
         self.take_tails();
+        self.take_acks(now);
         self.fill_in(now);
         if let Some(p) = self.predict.as_mut() {
             p.typed.settle(Mode::of(&self.model.mode_name));
@@ -2332,10 +3053,19 @@ impl App {
             tracing::info!(status, "client: the server says it is exiting");
             self.done = true;
         }
-        self.anim
-            .set_predicting(self.predict.as_ref().is_some_and(Predictor::active));
-        self.anim
-            .after(before, &self.model, &changes, multigrid, animate, now);
+        self.anim.set_predicting(self.predict.is_some());
+        let judging = self.ack.as_ref().map(|(k, _)| *k);
+        self.anim.after(
+            before,
+            &self.model,
+            &changes,
+            (multigrid, animate),
+            judging,
+            now,
+        );
+        if self.forget_dropped() {
+            self.remake(now);
+        }
         // After the animations have taken what they keep of the batch: what
         // was kept from before it is theirs now, or gone.
         if self.model.reclaiming() {
@@ -2414,15 +3144,20 @@ impl App {
     }
 
     /// When what the parser holds is to be taken as it is: `'ttimeoutlen'`
-    /// after the last of it came — or [`REPLY_WAIT`] for a terminal's answer
-    /// already part way through (see [`input`]).
+    /// after the last of it came, and no more than [`RELAYED_ESCAPE`] — or
+    /// [`REPLY_WAIT`] for a terminal's answer already part way through (see
+    /// [`input`]).
     fn escape_deadline(&self) -> Option<Instant> {
         let since = self.escape_since?;
         if self.parser.in_reply() {
             return Some(since + REPLY_WAIT);
         }
         let o = &self.model.options;
-        let wait = if o.ttimeout { o.ttimeoutlen } else { 0 };
+        let wait = if o.ttimeout {
+            o.ttimeoutlen.min(RELAYED_ESCAPE)
+        } else {
+            0
+        };
         Some(since + Duration::from_millis(wait.max(1)))
     }
 
@@ -2454,8 +3189,17 @@ impl App {
                 }
                 Input::Mouse(m) => self.mouse_input(m, now),
                 Input::Paste { phase, data } => {
+                    let mode = Mode::of(&self.model.mode_name);
                     if let Some(p) = self.predict.as_mut() {
+                        // Neovim takes a paste as keys typed on its command
+                        // line, and as none in Normal, Visual and Insert
+                        // mode: where the client cannot be sure it is in
+                        // one of those, it may be keys.
+                        let keys = mode == Mode::Other || !p.typed.sure();
                         p.typed.other();
+                        if p.acks() {
+                            p.sync.pasted(p.typed.seq(), keys);
+                        }
                     }
                     self.outbox.notify(
                         "nvim_paste",
@@ -2481,6 +3225,7 @@ impl App {
                 },
             }
         }
+        self.forget_unsure(now);
         self.fence();
     }
 
@@ -2493,26 +3238,39 @@ impl App {
             let Some(p) = self.predict.as_mut() else {
                 return;
             };
-            if let Some(command) = p.key(win, key) {
+            let command = p.key(win, key);
+            let seq = p.typed.seq();
+            p.sent(seq, Some(key), now);
+            if let Some(command) = command {
                 let by = if p.typed.inserting() {
                     By::InsertKeys
                 } else {
                     By::Keys
                 };
-                self.predict_command(grid, command, by, now);
+                self.predict_command(grid, command, Cause { by, seq, at: now }, now);
             }
         }
     }
 
     /// Ask after a fence, if the predictions want one: see
     /// [`predict::Typed`]. Queued after every key there is to queue, so
-    /// Neovim answers it once it has taken them all.
+    /// Neovim answers it once it has taken them all — with, where the agent
+    /// counts them, how many it has (see [`predict::Sync`]): -1 before there
+    /// is an agent to count them.
     fn fence(&mut self) {
-        if let Some(p) = self.predict.as_mut().filter(|p| p.active()) {
-            if p.typed.wants_fence() {
-                let at = p.typed.fenced();
-                let id = self.outbox.request("nvim_eval", &[Arg::str("0")]);
-                self.asked.insert(id, Ask::Fence(at));
+        let chan = self.chan;
+        if let Some(p) = self.predict.as_mut() {
+            if p.wants_fence() {
+                let sent = p.typed.fenced();
+                let fenced = p.sync.fenced(p.typed.seq());
+                let ask = match chan.filter(|_| p.acks()) {
+                    Some(chan) => {
+                        format!("luaeval('(_G.nvmux_taken or {{}})[{chan}] or -1')")
+                    }
+                    None => "0".to_string(),
+                };
+                let id = self.outbox.request("nvim_eval", &[Arg::str(&ask)]);
+                self.asked.insert(id, Ask::Fence { sent, fenced });
             }
         }
     }
@@ -2572,6 +3330,15 @@ impl App {
             };
             (grid, m.row as i64 - r0, col)
         };
+        // Numbered as the agent counts it, one key, before a scroll it makes
+        // ahead of Neovim is: see `predict::Sync`.
+        if let Some(p) = self.predict.as_mut() {
+            let seq = p.typed.input();
+            match m.button {
+                "wheel" => p.turned(seq, now),
+                _ => p.sent(seq, None, now),
+            }
+        }
         match m.action {
             "press" => self.pressed = Some(grid),
             "release" => self.pressed = None,
@@ -2610,6 +3377,9 @@ impl App {
         let Some(p) = self.predict.as_mut() else {
             return;
         };
+        // A turn of the wheel is a scroll, and left to Neovim with the rest
+        // where the scrolls are not predicted.
+        let scrolls = p.predictions.scrolls;
         let shape = self.model.wins.get(&grid).and_then(|w| p.shape(*w));
         let insert = Mode::of(&self.model.mode_name) == Mode::Insert;
         let (dir, sideways) = match way {
@@ -2625,6 +3395,7 @@ impl App {
         };
         let width = self.model.grids.get(&grid).map_or(0, |g| g.width() as i64);
         let command = match (shape, mods) {
+            _ if !scrolls => None,
             (Some(s), _) if s.mapped.contains(&name) => None,
             (Some(s), "") if sideways => Some((Command::Side(Side::Wheel(dir * s.hor)), By::Wheel)),
             (Some(_), "S" | "C") if sideways => {
@@ -2644,29 +3415,1272 @@ impl App {
         };
         match command {
             Some((command, by)) => {
-                self.predict_command(grid, command, by, now);
+                let seq = p.typed.seq();
+                self.predict_command(grid, command, Cause { by, seq, at: now }, now);
             }
             None => p.typed.missed(),
         }
     }
 
-    /// A scroll Neovim will make of window grid `grid`, typed or turned
-    /// `by`: made at once, where the client can say what Neovim will make of
-    /// it. Says whether the screen is as Neovim will have it — made, or
-    /// nothing to make; one that is not is one the predictions after it wait
-    /// for Neovim to have drawn. See [`predict`].
-    fn predict_command(&mut self, grid: u64, command: Command, by: By, now: Instant) -> bool {
-        let made = match command {
-            Command::Side(side) => self.predict_side(grid, side, by, now),
-            _ => self.predict_scroll(grid, command, by, now),
+    /// A scroll, or a motion of the cursor, Neovim will make in window grid
+    /// `grid` of input `cause`: made at once, where the client can say what
+    /// Neovim will make of it. One that is made — or that has nothing to
+    /// make — leaves the screen as Neovim will have it, and is not to be
+    /// made again (see [`predict::Sent::made`]); one that is not is one the
+    /// predictions after it wait for Neovim to have drawn. See [`predict`].
+    fn predict_command(&mut self, grid: u64, command: Command, cause: Cause, now: Instant) {
+        let entering = matches!(command, Command::Enter(_));
+        let made = self.make(grid, command, cause, now);
+        if let Some(p) = self.predict.as_mut() {
+            if made {
+                p.made(cause.seq);
+            } else {
+                if entering {
+                    p.unentered(cause.seq);
+                }
+                p.typed.missed();
+            }
+        }
+    }
+
+    /// [`App::predict_command`], and nothing more: says whether it was made.
+    fn make(&mut self, grid: u64, command: Command, cause: Cause, now: Instant) -> bool {
+        match command {
+            Command::Side(side) => self.predict_side(grid, side, cause, now),
+            Command::Move {
+                motion,
+                count,
+                screen,
+            } => self.predict_move(grid, (motion, count, screen), cause, now),
+            Command::Type(e) => self.predict_echo(grid, e, cause, now),
+            Command::Enter(e) => self.predict_mode(grid, Some(e), cause, now),
+            Command::Leave => self.predict_mode(grid, None, cause, now),
+            _ => self.predict_scroll(grid, command, cause, now),
+        }
+    }
+
+    /// Whether the cursor may be drawn ahead of Neovim in window grid `grid`
+    /// `now`, as far as what the client has drawn goes: attached with
+    /// windows of their own, drawn, not waiting for what an attach lacks,
+    /// and the grid a window shown that has the cursor.
+    fn steps_in(&self, grid: u64, now: Instant) -> bool {
+        self.multigrid()
+            && self.flushed
+            && !self.holding(now)
+            && self.model.cursor.grid == grid
+            && matches!(
+                self.model.layout.get(&grid),
+                Some(Placement {
+                    place: Place::Window { .. },
+                    hidden: false
+                })
+            )
+    }
+
+    /// A motion of the cursor in Normal mode Neovim will make in window grid
+    /// `grid`, `motion` counted `count` — made by a key mapped to go a row
+    /// of the screen at a time if `screen` (see [`predict::Idiom`]) — of key
+    /// `cause`: drawn at once, where the client can say exactly where Neovim
+    /// will put the cursor and draw it (see [`anim::chain`]) — along its
+    /// line, or to another in the view, or past `'scrolloff'`, the view
+    /// scrolled ahead of Neovim with it as far as Neovim scrolls it (see
+    /// [`moves::keep_in_view`], [`App::scroll_ahead`]) — and what else of the
+    /// window the cursor's line decides (see [`App::repaint`]). Says whether
+    /// it was.
+    ///
+    /// Only from what Neovim last said of the keys and those followed since,
+    /// in a window as [`App::onward`] has it; over lines it has as the
+    /// buffer has them now, steps over as Neovim does, and finds Neovim
+    /// drawing (see [`App::explained`]) and, the line Neovim's word was said
+    /// on, measuring (see [`predict::Ack::width`]) as it would — or, for a
+    /// line out of Neovim's view, one Neovim draws with nothing the client
+    /// does not draw: no virtual text nor sign, as the agent says (see
+    /// [`Predictor::decorated`]), nor text concealed (see
+    /// [`predict::Stepping::concealing`]); to another line only where what
+    /// the cursor's line decides can be drawn as Neovim draws it (see
+    /// [`App::may_leave`]); and not in a buffer proving itself, nor at all
+    /// once the client has drawn too many wrong (see [`predict::Trust`]) —
+    /// where it is worked out, judged and not drawn, and no scroll ahead
+    /// made of it.
+    fn predict_move(
+        &mut self,
+        grid: u64,
+        (motion, count, screen): (moves::Motion, Option<i64>, bool),
+        cause: Cause,
+        now: Instant,
+    ) -> bool {
+        if count.is_some_and(|n| n >= predict::MAX_COUNT) {
+            return false;
+        }
+        let Some(on) = self.onward(grid, now) else {
+            return false;
         };
-        if let (false, Some(p)) = (made, self.predict.as_mut()) {
-            p.typed.missed();
+        let Some((p, ack, shape, stepping)) = self.stepped_by(on.win) else {
+            return false;
+        };
+        let (top, bot, left, right) = on.rect;
+        let (h, width) = (bot - top, right - left);
+        let (from, head) = (on.from, on.head.as_ref());
+        // The line the steps typed into, as they typed it: the client's lines
+        // may have the edits for Neovim's word on one of their keys ahead of
+        // the word, and Neovim's rows are not yet what they will be.
+        let echo = head.and_then(|s| s.echo.as_ref());
+        let texts = on.text(p, stepping);
+        let text = |l: i64| texts(l);
+        let cx = moves::Ctx {
+            shape,
+            line_count: ack.line_count,
+            rows: h as i64,
+            width,
+            text: &text,
+            whichwrap: Some(&stepping.whichwrap),
+            scrolling: Some(stepping.scrolling()),
+            keyword: Some(&stepping.classes),
+            lmap: Some(stepping.lmap),
+            macros: stepping.macros(),
+        };
+        let Some(to) = moves::moved(motion, count, &from, &cx) else {
+            return false;
+        };
+        let Some(line) = text(to.line) else {
+            return false;
+        };
+        // A row of the screen at a time, on lines a row each, is a line at a
+        // time — but in a window that wraps, Neovim's `nv_screengo` lands
+        // the cursor otherwise where the column it wants is past the row's
+        // end, which it brings back into the row; or in the row's right
+        // half, on a tab over it short of the tab's end, where the cursor is
+        // drawn — on the character before the tab, rather. The view it
+        // scrolls is the one `j` and `k` scroll.
+        let text_width = width.saturating_sub(shape.textoff);
+        if let (true, true, Want::Col(c)) = (screen, shape.wrap, from.want) {
+            let sits = moves::drawn(line, shape, to.byte);
+            if c >= text_width || (to.byte > 0 && sits > c && c > text_width / 2) {
+                return false;
+            }
+        }
+        // Laid out as Neovim lays them out, the lines moved from and to and,
+        // where a move goes on past a line's end, every one it passes (see
+        // [`App::laid_out`]); and where the view moves, every line it brings
+        // into view (see [`App::brought`]), which Neovim has yet to draw.
+        let passed = matches!(
+            motion,
+            moves::Motion::Left(_) | moves::Motion::Right(_) | moves::Motion::Word { .. }
+        );
+        let laid_out = |l| self.laid_out(grid, &on, l, &text);
+        let mut lines = from.line.min(to.line)..=from.line.max(to.line);
+        let mut shown = to.top..(to.top + h as i64).min(ack.line_count);
+        if to.left != from.left
+            || !(laid_out(from.line) && laid_out(to.line))
+            || (passed && !lines.all(laid_out))
+            || (to.top != from.top && !shown.all(|l| self.brought(&on, l, &text)))
+            || !self.may_leave(grid, (from.line, to.line))
+        {
+            return false;
+        }
+        // A motion that leaves the cursor on the character it was on leaves
+        // it drawn where it was: Neovim works out where to draw it only once
+        // it moves, and on a tab may draw it as it was drawn in another mode
+        // — at the tab's start, as Visual mode leaves it — for as long as it
+        // does not.
+        let still = (to.line, to.byte) == (from.line, from.byte);
+        let vcol = match head {
+            _ if !still => moves::drawn(line, shape, to.byte),
+            Some(s) => s.vcol,
+            None => match self.drawn_on(grid, &on) {
+                Some(vcol) => vcol,
+                None => return false,
+            },
+        };
+        let step = chain::Step {
+            seq: cause.seq,
+            pos: to,
+            vcol,
+            proof: Proof::Move,
+            credited: !still,
+            tick: ack.tick,
+            line_count: ack.line_count,
+            echo: echo.cloned(),
+            insstart: None,
+            hidden: p.trust.hidden(ack.buf, Proof::Move) || head.is_some_and(|s| s.hidden),
+            until: p.deadline(cause.at),
+        };
+        let drawn = self.seen(grid, to.line, Some(line));
+        drop(texts);
+        self.step(grid, (&on, step, drawn), cause, now)
+    }
+
+    /// Where the next step of the cursor moved ahead of Neovim in window
+    /// grid `grid` goes on from `now` (see [`anim::chain`]), where it may
+    /// take one at all: where the cursor may be drawn ahead of Neovim (see
+    /// [`App::steps_in`]), from what Neovim last said of the keys and those
+    /// followed since ([`Predictor::known`]); in a window whose rows and
+    /// lines are one to one, its options all such as the client follows
+    /// ([`predict::Stepping::plain`]), nothing ahead of Neovim in it but
+    /// what the steps made — a view scrolled ahead otherwise, up or down or
+    /// sideways, lands the cursor where its scroll says — and not left to
+    /// Neovim a while (see [`predict::Trust`]); from the newest step, in
+    /// Normal mode, worked out with this window, gutter and view — one worked
+    /// out with others is let go of as the client hears of them, and nothing
+    /// goes on from it meanwhile — or, with none, from Neovim's word, in the
+    /// view the screen shows: one Neovim has moved since of its own accord
+    /// is not the view a step from that word would be drawn in, nor the one
+    /// the next will say. And over the lines as the word has them — or as the
+    /// steps typed them.
+    fn onward(&self, grid: u64, now: Instant) -> Option<Onward> {
+        let p = self.predict.as_ref().filter(|p| p.acks() && p.known())?;
+        if !self.steps_in(grid, now) {
+            return None;
+        }
+        let (win, view, rect) = (
+            *self.model.wins.get(&grid)?,
+            *self.model.viewports.get(&grid)?,
+            anim::text_rect(&self.model, grid)?,
+        );
+        let ack = &p.base.as_ref()?.ack;
+        let shape = p
+            .shape(win)
+            .filter(|s| s.predictable && s.line_count == view.line_count && s.buf == ack.buf)?;
+        shape.stepping.as_ref().filter(|s| s.plain())?;
+        let chain = self.anim.chain(grid);
+        let ahead = self.anim.ahead(grid);
+        let shown = (win, shape.textoff, shape.leftcol);
+        if !view.one_to_one(rect.1 - rect.0)
+            || self.anim.side_left(grid).is_some()
+            || p.trust.refused(win, now)
+            || chain.map_or(ahead != (0, 0), |c| !c.views(view.topline + ahead.0))
+            || chain
+                .is_some_and(|c| (c.win, c.textoff, c.left) != shown || c.len() >= chain::LONGEST)
+        {
+            return None;
+        }
+        let head = chain.and_then(|c| c.head()).cloned();
+        let from = head.as_ref().map_or(ack.pos, |s| s.pos);
+        let echo = head.as_ref().is_some_and(|s| s.echo.is_some());
+        let ok = from.win == win
+            && from.rest == Rest::Normal
+            && from.left == shape.leftcol
+            && (head.is_some() || from.top == view.topline)
+            && (echo || p.fresh(win, ack.buf, ack.tick));
+        ok.then_some(Onward {
+            win,
+            view,
+            rect,
+            shown,
+            from,
+            head,
+        })
+    }
+
+    /// Whether Neovim lays line `l` out, whose text the client has as `text`
+    /// has it, as the client lays it out, for a step worked out `on` window
+    /// grid `grid` (see [`App::onward`]) to go onto: as the steps typed it;
+    /// in Neovim's view, by its own drawing of it and, the line its word was
+    /// said on and those in view that end in blanks, by its own measure —
+    /// what the screen shows may not show what is between the characters,
+    /// if blank, and Neovim's measure counts it (see [`App::explained`]);
+    /// out of it, as [`App::brought`] has it.
+    fn laid_out<'a>(
+        &self,
+        grid: u64,
+        on: &Onward,
+        l: i64,
+        text: &dyn Fn(i64) -> Option<&'a str>,
+    ) -> bool {
+        let Some((t, (_, ack, shape, _))) = text(l).zip(self.stepped_by(on.win)) else {
+            return false;
+        };
+        let echo = on.head.as_ref().and_then(|s| s.echo.as_ref());
+        if echo.is_some_and(|e| e.line == l) {
+            return true;
+        }
+        if !on.neovims(l) {
+            return self.brought(on, l, text);
+        }
+        let width = ack.width_of(l);
+        let measured = width == Some(predict::width(t, shape));
+        (measured || (width.is_none() && l != ack.pos.line))
+            && self.explained(grid, l, t, measured) == Some(true)
+    }
+
+    /// Whether line `l` — whose text the client has as `text` has it — a
+    /// view scrolled ahead of Neovim shows, worked out `on` the window as
+    /// [`App::onward`] has it, is one the client lays out as Neovim does:
+    /// one in Neovim's view, Neovim's to draw; out of it, one the client has
+    /// whole, which Neovim draws with nothing the client does not draw — no
+    /// virtual text, among its characters or about them, nor sign, as the
+    /// agent says (see [`Predictor::decorated`]), nor text concealed (see
+    /// [`predict::Stepping::concealing`]).
+    fn brought<'a>(&self, on: &Onward, l: i64, text: &dyn Fn(i64) -> Option<&'a str>) -> bool {
+        let Some((p, _, _, stepping)) = self.stepped_by(on.win) else {
+            return false;
+        };
+        on.neovims(l) || (text(l).is_some() && !p.decorated(on.win, l) && !stepping.concealing)
+    }
+
+    /// What the steps in window `win` are worked out with: the predictions,
+    /// Neovim's last word on the keys, the window's shape and what decides
+    /// a motion in it.
+    fn stepped_by(
+        &self,
+        win: i64,
+    ) -> Option<(
+        &Predictor,
+        &predict::Ack,
+        &predict::Shape,
+        &predict::Stepping,
+    )> {
+        let p = self.predict.as_ref()?;
+        let shape = p.shape(win)?;
+        Some((p, &p.base.as_ref()?.ack, shape, shape.stepping.as_ref()?))
+    }
+
+    /// The display column the cursor is drawn in, in window grid `grid`,
+    /// where a step goes on from Neovim's word and leaves the cursor on the
+    /// character it was on: where Neovim draws it, where its frame has the
+    /// cursor where its word does.
+    fn drawn_on(&self, grid: u64, on: &Onward) -> Option<usize> {
+        let shape = self.predict.as_ref()?.shape(on.win)?;
+        let (v, from) = (&on.view, &on.from);
+        if (v.curline, v.curcol) != (from.line, from.byte as i64) {
+            return None;
+        }
+        let c = self.model.cursor;
+        let col = c.col.checked_sub(on.rect.2 + shape.textoff)?;
+        (c.grid == grid).then_some(col + shape.leftcol)
+    }
+
+    /// Whether the cursor may be drawn ahead of Neovim on line `to` of window
+    /// grid `grid` rather than on `from`, as far as what the cursor's line
+    /// decides of the window goes: the cursor's line in a gutter drawn as
+    /// Neovim's rules have it, and a bar across the line moved off and onto
+    /// that the client can lay and take off as Neovim does — across the
+    /// line, not `'screenline'`'s across the cursor's row of it, which is
+    /// not followed. Not where what the cursor's line decides is drawn in
+    /// groups of the window's own, which the client has no word of; nor
+    /// where the line left may be drawn concealed once it is, which the
+    /// client cannot draw. What is drawn over the rows (see
+    /// [`App::repaint`]) goes with them as they slide by.
+    fn may_leave(&self, grid: u64, (from, to): (i64, i64)) -> bool {
+        let shape = self
+            .model
+            .wins
+            .get(&grid)
+            .and_then(|win| self.predict.as_ref()?.shape(*win));
+        let Some(stepping) = shape.and_then(|s| s.stepping.as_ref()) else {
+            return false;
+        };
+        let cul = stepping.cursorline;
+        let decided = shape.is_some_and(|s| s.relativenumber) || cul.number || cul.line;
+        to == from
+            || !(cul.screenline
+                || stepping.conceals
+                || (decided && stepping.own_highlights)
+                || (cul.line && !self.model.bar_derivable())
+                || !self.regutters(grid, to))
+    }
+
+    /// Whether what the cursor's line decides of window grid `grid` can be
+    /// drawn over its rows as Neovim draws it with the cursor on line `to`
+    /// rather than on Neovim's `from` (see [`App::repaint`]), where it shows
+    /// lines Neovim's view does not as well: as [`App::may_leave`] has it,
+    /// and where the cursor's line decides any of it, rows of the lines out
+    /// of Neovim's view the client can draw afresh (see [`App::afresh`]). A
+    /// window whose options the agent has said nothing of past the shape it
+    /// says of every window — what the cursor's line decides among them —
+    /// is one the client draws nothing over, as one it works out no motions
+    /// in.
+    fn redrawn_with(&self, grid: u64, (from, to): (i64, i64)) -> bool {
+        let shape = self
+            .model
+            .wins
+            .get(&grid)
+            .and_then(|win| self.predict.as_ref()?.shape(*win));
+        let Some((shape, stepping)) = shape.and_then(|s| Some((s, s.stepping.as_ref()?))) else {
+            return true;
+        };
+        let cul = stepping.cursorline;
+        let decided = shape.relativenumber || cul.number || cul.line;
+        to == from || (self.may_leave(grid, (from, to)) && (!decided || self.afresh(grid)))
+    }
+
+    /// Move the cursor in window grid `grid` ahead of Neovim as `step`
+    /// says, worked out `on` the window as it was (see [`App::onward`]),
+    /// for key `cause`: the line it goes onto as `drawn` (see
+    /// [`chain::Seen`]); and where it moves the view, the view scrolled ahead
+    /// of Neovim with it (see [`App::scroll_ahead`]) — not for a step only
+    /// worked out to be judged, which draws nothing. Says whether it was.
+    fn step(
+        &mut self,
+        grid: u64,
+        (on, step, drawn): (&Onward, chain::Step, chain::Drawn),
+        cause: Cause,
+        now: Instant,
+    ) -> bool {
+        let (from, to) = (on.from, step.pos);
+        if to.top != from.top && !step.hidden {
+            let at = |p: Pos| predict::At {
+                top: p.top,
+                cursor: p.line,
+            };
+            // Where the cursor lands, where it goes to another line: as a
+            // scroll alone says it (see [`anim::Ahead::col`]).
+            let col = step
+                .vcol
+                .checked_sub(to.left)
+                .filter(|_| to.line != from.line)
+                .map(|c| (on.shown.1 + c, to.want.col()));
+            if !self.scroll_ahead(grid, (at(from), at(to)), col, cause, now) {
+                return false;
+            }
+        }
+        self.anim.step(
+            &self.model,
+            grid,
+            (on.shown, !self.remaking),
+            (step, move || drawn),
+            now,
+        );
+        self.dirty = true;
+        true
+    }
+
+    /// Scroll window grid `grid` ahead of Neovim from the view at `from` to
+    /// the one at `to`, for key `cause`, as a step of the cursor moved
+    /// ahead of Neovim says (see [`App::step`]): the rows it brings into view
+    /// drawn from the agent's lines (see [`anim::Animator::predict`]), at
+    /// once, the cursor drawn by the step — and landed, as far as the
+    /// scroll can say, in grid column and wanting display column `col`.
+    /// One that cannot be drawn at once, a line it brings in not to be had,
+    /// is let go of, and every scroll ahead in the window and every step
+    /// with it, to be made again from Neovim's next word. Says whether it
+    /// was made.
+    fn scroll_ahead(
+        &mut self,
+        grid: u64,
+        (from, to): (predict::At, predict::At),
+        col: Option<(usize, usize)>,
+        cause: Cause,
+        now: Instant,
+    ) -> bool {
+        let Some(p) = self.predict.as_ref() else {
+            return false;
+        };
+        let (Some(&win), Some(&view), Some(rect)) = (
+            self.model.wins.get(&grid),
+            self.model.viewports.get(&grid),
+            anim::text_rect(&self.model, grid),
+        ) else {
+            return false;
+        };
+        let Some(shape) = p.shape(win) else {
+            return false;
+        };
+        let Some(look) = self.look(grid, rect, &view, shape) else {
+            return false;
+        };
+        let width = rect.3 - rect.2;
+        let go = anim::Ahead {
+            rows: to.top - from.top,
+            cursor: to.cursor - from.cursor,
+            col,
+            land: None,
+            until: p.deadline(cause.at),
+            scrolloff: shape.scrolloff,
+            seq: Some(cause.seq),
+        };
+        let mut fill = |i: i64| p.row(win, view.topline + i, width, &look, to.cursor);
+        let mut land = |_: anim::Land, _: Option<usize>| Some(None);
+        // What a scroll before it could not have, first.
+        self.anim
+            .fill_in(&self.model, grid, (&mut fill, &mut land), now);
+        let made = self
+            .anim
+            .predict(&self.model, grid, go, (&mut fill, &mut land), now)
+            && !self.anim.held().contains(&grid);
+        if !made {
+            self.drop_steps(grid, now);
         }
         made
     }
 
-    fn predict_scroll(&mut self, grid: u64, command: Command, by: By, now: Instant) -> bool {
+    /// What a step onto buffer line `line` of window grid `grid` notes of
+    /// it (see [`chain::Seen`]): the row Neovim draws it on, past the
+    /// gutter; or, out of Neovim's view, a line a scroll ahead of it brings
+    /// in, its text `text` as far as it goes, as the client lays it out —
+    /// `None` where the client cannot.
+    fn seen(&self, grid: u64, line: i64, text: Option<&str>) -> chain::Drawn {
+        let shape = self.predict.as_ref()?.shape(*self.model.wins.get(&grid)?)?;
+        if let Some(text) = anim::line_drawn(&self.model, grid, line, shape.textoff) {
+            return Some(chain::Seen { text, whole: true });
+        }
+        let (_, _, left, right) = anim::text_rect(&self.model, grid)?;
+        let text = text?;
+        let look = predict::Look::default();
+        let row = predict::render(Some((text, &[])), shape, line, right - left, &look, line)?;
+        let from = shape.textoff.min(row.len());
+        let end = (shape.textoff + predict::reach(text, shape).saturating_sub(shape.leftcol))
+            .clamp(from, row.len());
+        Some(chain::Seen {
+            text: row[from..end].iter().map(|c| c.text.clone()).collect(),
+            whole: false,
+        })
+    }
+
+    /// A key typed in Insert mode that edits the cursor's line, `e`, of key
+    /// `cause`, Neovim will make in window grid `grid`: drawn at once —
+    /// Neovim's row for the line laid out afresh around the text it leaves,
+    /// and the cursor where it leaves it (see [`typing`]) — where the client
+    /// can say what it does, and how Neovim draws it. Says whether it was.
+    ///
+    /// Only where the client types ahead of Neovim at all
+    /// (`[client] predict_typing`), from Neovim's last word on the keys and
+    /// those followed since ([`Predictor::known`]), Neovim resting in Insert
+    /// mode itself — not completing, nor in Replace mode; in a window whose
+    /// rows and lines are one to one, not sliding by (see
+    /// [`anim::Animator::gliding`]), nothing else ahead of Neovim in it, and
+    /// its options all such as the client follows
+    /// ([`predict::Stepping::plain`]); where nothing the agent says of the
+    /// buffer's Insert mode bears on the key ([`typing::refused`]); over a
+    /// line the client has whole as the buffer has it — as Neovim's word
+    /// has it, or as the steps before typed it — that it steps over as
+    /// Neovim does, and that Neovim draws and measures as the client would
+    /// lay it out (see [`App::explained`]), with no virtual text that stays
+    /// where it is as the line's end moves (see [`Predictor::pinned`]), on
+    /// a row that is the line's alone: not one whose line, centred, runs on
+    /// past the grid's edge (see [`wide`]). And only where what it leaves is
+    /// drawn on that row as the line was (see [`typing::relayout`]). In a
+    /// buffer proving what is typed there, it is worked out, judged and not
+    /// drawn (see [`predict::Trust`]).
+    fn predict_echo(&mut self, grid: u64, e: typing::Edit, cause: Cause, now: Instant) -> bool {
+        let Some(p) = self.predict.as_ref().filter(|p| p.typing() && p.known()) else {
+            return false;
+        };
+        if !self.steps_in(grid, now) {
+            return false;
+        }
+        let (Some(&win), Some(&view), Some(rect), Some(base)) = (
+            self.model.wins.get(&grid),
+            self.model.viewports.get(&grid),
+            anim::text_rect(&self.model, grid),
+            p.base.as_ref(),
+        ) else {
+            return false;
+        };
+        let (top, bot, left, right) = rect;
+        let ack = &base.ack;
+        let Some(shape) = p
+            .shape(win)
+            .filter(|s| s.predictable && s.line_count == view.line_count && s.buf == ack.buf)
+        else {
+            return false;
+        };
+        let Some(stepping) = shape.stepping.as_ref().filter(|s| s.plain()) else {
+            return false;
+        };
+        // Nor over rows sliding by (see [`anim::Animator::gliding`]), which
+        // the line typed into, drawn over its row, would not slide with.
+        if !view.one_to_one(bot - top)
+            || self.anim.ahead(grid) != (0, 0)
+            || self.anim.side_left(grid).is_some()
+            || self.anim.gliding(grid)
+            || p.trust.refused(win, now)
+        {
+            return false;
+        }
+        let shown = (win, shape.textoff, shape.leftcol);
+        let chain = self.anim.chain(grid);
+        if chain.is_some_and(|c| (c.win, c.textoff, c.left) != shown || c.len() >= chain::LONGEST) {
+            return false;
+        }
+        let head = chain.and_then(|c| c.head());
+        let from = head.map_or(ack.pos, |s| s.pos);
+        let row = usize::try_from(from.line - view.topline)
+            .ok()
+            .filter(|r| *r < bot - top)
+            .map(|r| top + r);
+        let (Some(row), Some(facts)) = (row, p.facts(ack.buf)) else {
+            return false;
+        };
+        if from.win != win
+            || p.pinned(win, from.line)
+            || from.rest != Rest::Insert
+            || from.left != shape.leftcol
+            || from.top != view.topline
+            || self
+                .model
+                .tails
+                .get(&grid)
+                .is_some_and(|t| t.contains_key(&row))
+        {
+            return false;
+        }
+        let key = p
+            .queue
+            .iter()
+            .find(|s| s.seq == cause.seq)
+            .and_then(|s| s.input.key());
+        // The line as the steps before typed it; or as Neovim's word has it,
+        // where the client has the buffer as it was then — not where the
+        // edits for a word yet to be taken have come ahead of it — whole
+        // and stepped over as Neovim does.
+        let echo = head.and_then(|s| s.echo.as_ref());
+        let text = match echo {
+            Some(echo) if echo.line == from.line => Some(&*echo.text),
+            Some(_) => None,
+            None => (p.fresh(win, ack.buf, ack.tick) && !p.cut(win, from.line))
+                .then(|| p.text(win, from.line))
+                .flatten(),
+        };
+        let ordinary = |t: &str| predict::ordinary(t) && (!stepping.widths || t.is_ascii());
+        let (Some(key), Some(text)) = (key, text.filter(|t| ordinary(t))) else {
+            return false;
+        };
+        let vcol = typing::sits(text, shape, from.byte);
+        if let Some(why) = typing::refused(key, e, (text, from.byte, vcol), facts, shape) {
+            tracing::debug!(key, why, "client: a key typed left to Neovim");
+            return false;
+        }
+        // Where Insert mode began, which `<C-w>` and `<C-u>` stop at once,
+        // as the step before has it, or Neovim's word: not knowing it, they
+        // are left to Neovim.
+        let insstart = head.map_or(ack.insstart, |s| s.insstart);
+        let rubs = matches!(e, typing::Edit::Word | typing::Edit::Line);
+        if rubs && insstart.is_none() && !facts.nostop() {
+            tracing::debug!(
+                key,
+                "client: a key typed left to Neovim, not knowing where it stops"
+            );
+            return false;
+        }
+        let stop = insstart
+            .filter(|s| s.line == from.line && !facts.nostop())
+            .map(|s| s.byte);
+        let edit = match e {
+            typing::Edit::Word | typing::Edit::Line => {
+                let keeps = facts.autoindent || facts.cindent;
+                typing::rubbed(e, (text, from.byte), stop, &facts.classes, keeps)
+            }
+            _ => typing::edited(e, text, from.byte),
+        };
+        let Some((new, byte)) = edit.filter(|(t, _)| ordinary(t)) else {
+            return false;
+        };
+        // The row as the steps before laid it out; or as Neovim draws it,
+        // where it draws and measures the line as the client lays it out.
+        let cells = match echo {
+            Some(echo) => echo.cells.clone(),
+            None => {
+                let measured = ack.width_of(from.line) == Some(predict::width(text, shape));
+                let drawn = self.model.grids.get(&grid).map(|g| g.row(row));
+                let past = drawn.and_then(|r| r.get((left + shape.textoff).min(right)..right));
+                match past {
+                    Some(cells)
+                        if measured
+                            && self.explained(grid, from.line, text, true) == Some(true) =>
+                    {
+                        cells.to_vec()
+                    }
+                    _ => return false,
+                }
+            }
+        };
+        // A glyph of `'list'`'s new to the row in the colours Neovim draws
+        // one in on it: across the bar of `'cursorline'`, its group laid
+        // over the bar, as the client lays the bar under a cell — and none
+        // where it cannot (see [`model::Model::bar_derivable`]).
+        let cul = stepping.cursorline;
+        let bar = cul.line || cul.screenline;
+        if bar && shape.list && !self.model.bar_derivable() {
+            return false;
+        }
+        let mut glyph = |name: &str| {
+            let hl = self.model.groups.get(name).copied()?;
+            if bar {
+                self.model.derived(hl, model::Derive::CursorLineOn)
+            } else {
+                Some(hl)
+            }
+        };
+        let (whitespace, nontext, specialkey) =
+            (glyph("Whitespace"), glyph("NonText"), glyph("SpecialKey"));
+        let groups = |name: &str| match name {
+            "Whitespace" => whitespace,
+            "NonText" => nontext,
+            "SpecialKey" => specialkey,
+            _ => None,
+        };
+        let look = predict::Look::of(std::slice::from_ref(&cells), 1, 0, None, groups);
+        let to = typing::sits(&new, shape, byte);
+        let (at, gone, put) = match e {
+            typing::Edit::Char(c) => (from.byte, 0, c.len_utf8()),
+            typing::Edit::Rub | typing::Edit::Word | typing::Edit::Line => {
+                (byte, from.byte - byte, 0)
+            }
+        };
+        let laid = typing::relayout(
+            &cells,
+            (text, &new),
+            (at, gone, put),
+            to,
+            (shape, &look, facts),
+        );
+        let Some(laid) = laid else {
+            return false;
+        };
+        let proof = match e {
+            typing::Edit::Char(c) => Proof::Char(c),
+            typing::Edit::Rub | typing::Edit::Word | typing::Edit::Line => Proof::Rub,
+        };
+        let hidden = p.trust.hidden(ack.buf, proof)
+            || head.is_some_and(|s| s.hidden)
+            || (facts.unseen && !p.trust.proven(ack.buf, Unseen::Typed));
+        let step = chain::Step {
+            seq: cause.seq,
+            pos: predict::Pos {
+                byte,
+                want: Want::Col(to),
+                ..from
+            },
+            vcol: to,
+            proof,
+            credited: !matches!(e, typing::Edit::Char(c) if c.is_whitespace()),
+            tick: ack.tick,
+            line_count: ack.line_count,
+            echo: Some(chain::Echo {
+                line: from.line,
+                text: new.into(),
+                cells: laid,
+            }),
+            insstart: insstart.map(|s| match e {
+                typing::Edit::Char(_) => s,
+                typing::Edit::Rub => s.rubbed((from.line, byte), false),
+                typing::Edit::Word => s.rubbed((from.line, byte), facts.word_undo),
+                typing::Edit::Line => s.rubbed((from.line, byte), facts.line_undo),
+            }),
+            hidden,
+            until: p.deadline(cause.at),
+        };
+        let drawn = self.seen(grid, step.pos.line, None);
+        self.anim.step(
+            &self.model,
+            grid,
+            (shown, !self.remaking),
+            (step, move || drawn),
+            now,
+        );
+        self.dirty = true;
+        true
+    }
+
+    /// `i`, `a`, `A` or `I` entering Insert mode as `enter` says — or, where
+    /// `None`, `<Esc>` leaving it — of key `cause`, Neovim will make in
+    /// window grid `grid`: drawn at once, the cursor where it goes and in
+    /// the shape of the mode it goes into (see [`anim::Animator`]), where
+    /// the client can say where Neovim puts it (see [`typing::entered`] and
+    /// [`typing::left`]). Says whether it was. What Neovim draws of the
+    /// mode besides — `-- INSERT --` — is left as Neovim drew it.
+    ///
+    /// Only where the client types ahead of Neovim, from Neovim's last word
+    /// on the keys and those followed since ([`Predictor::known`]), in
+    /// Normal mode to enter Insert mode and in Insert mode itself to leave
+    /// it — not completing — in a window whose rows and lines are one to
+    /// one, nothing else ahead of Neovim in it, and its options all such
+    /// as the client follows ([`predict::Stepping::plain`]), and that does
+    /// not conceal text on the cursor's line in either mode; over a line the
+    /// client has whole as the buffer has it, that Neovim draws and measures
+    /// as the client lays it out (see [`App::explained`]) or the steps typed
+    /// it — and then not over rows sliding by (see [`App::predict_echo`]);
+    /// in a buffer the agent has said text can go in, to enter (see
+    /// [`typing::Facts::editable`]) — at the line's end, not past virtual
+    /// text that may stay before the cursor there (see
+    /// [`Predictor::pinned`]) — and where `<Esc>` does no more than put the
+    /// cursor back a character, to leave (see [`typing::unleft`]); and where
+    /// the cursor stays on its line's row, and the view where it is.
+    fn predict_mode(
+        &mut self,
+        grid: u64,
+        enter: Option<typing::Enter>,
+        cause: Cause,
+        now: Instant,
+    ) -> bool {
+        let Some(p) = self.predict.as_ref().filter(|p| p.typing() && p.known()) else {
+            return false;
+        };
+        if !self.steps_in(grid, now) {
+            return false;
+        }
+        let (Some(&win), Some(&view), Some(rect), Some(base)) = (
+            self.model.wins.get(&grid),
+            self.model.viewports.get(&grid),
+            anim::text_rect(&self.model, grid),
+            p.base.as_ref(),
+        ) else {
+            return false;
+        };
+        let (top, bot, left, right) = rect;
+        let ack = &base.ack;
+        let Some(shape) = p
+            .shape(win)
+            .filter(|s| s.predictable && s.line_count == view.line_count && s.buf == ack.buf)
+        else {
+            return false;
+        };
+        let (Some(stepping), Some(facts)) = (
+            shape.stepping.as_ref().filter(|s| s.plain()),
+            p.facts(ack.buf),
+        ) else {
+            return false;
+        };
+        if !view.one_to_one(bot - top)
+            || self.anim.ahead(grid) != (0, 0)
+            || self.anim.side_left(grid).is_some()
+            || p.trust.refused(win, now)
+            || facts.conceals.contains(['n', 'i'])
+        {
+            return false;
+        }
+        let shown = (win, shape.textoff, shape.leftcol);
+        let chain = self.anim.chain(grid);
+        if chain.is_some_and(|c| (c.win, c.textoff, c.left) != shown || c.len() >= chain::LONGEST) {
+            return false;
+        }
+        let head = chain.and_then(|c| c.head());
+        let from = head.map_or(ack.pos, |s| s.pos);
+        let rest = if enter.is_some() {
+            Rest::Normal
+        } else {
+            Rest::Insert
+        };
+        let in_view = (0..(bot - top) as i64).contains(&(from.line - view.topline));
+        if from.win != win
+            || from.rest != rest
+            || from.left != shape.leftcol
+            || from.top != view.topline
+            || !in_view
+        {
+            return false;
+        }
+        // The line as the steps typed it; or as Neovim's word has it, where
+        // the client has the buffer as it was then, and Neovim draws and
+        // measures it as the client lays it out.
+        let echo = head.and_then(|s| s.echo.as_ref());
+        let ordinary = |t: &str| predict::ordinary(t) && (!stepping.widths || t.is_ascii());
+        let text = match echo.filter(|e| e.line == from.line) {
+            Some(e) => Some(&*e.text).filter(|t| ordinary(t)),
+            None => {
+                let width = ack.width_of(from.line);
+                let text = (p.fresh(win, ack.buf, ack.tick) && !p.cut(win, from.line))
+                    .then(|| p.text(win, from.line))
+                    .flatten()
+                    .filter(|t| ordinary(t));
+                text.filter(|t| {
+                    let measured = width == Some(predict::width(t, shape));
+                    (measured || (width.is_none() && from.line != ack.pos.line))
+                        && self.explained(grid, from.line, t, measured) == Some(true)
+                })
+            }
+        };
+        // Not over rows sliding by, where the line typed into is drawn over
+        // its row (see [`App::predict_echo`]).
+        let Some(text) = text.filter(|_| echo.is_none() || !self.anim.gliding(grid)) else {
+            return false;
+        };
+        let (byte, vcol, proof) = match enter {
+            Some(e) => {
+                if !facts.editable {
+                    return false;
+                }
+                let (byte, vcol) = typing::entered(e, text, shape, from.byte);
+                // At the line's end, not where the cursor may go after
+                // virtual text there (see [`Predictor::pinned`]).
+                if byte == text.len() && p.pinned(win, from.line) {
+                    return false;
+                }
+                (byte, vcol, Proof::Enter)
+            }
+            None => {
+                if let Some(why) = typing::unleft(text, from.byte, facts) {
+                    tracing::debug!(why, "client: <Esc> left to Neovim");
+                    return false;
+                }
+                let (byte, vcol) = typing::left(text, shape, from.byte);
+                (byte, vcol, Proof::Leave)
+            }
+        };
+        // Where a plugin's autocommand of the mode entered or left may move
+        // the cursor or edit the buffer — a trimmer of the blanks lines end
+        // in, whose `:%s` leaves the cursor on the last line it trimmed —
+        // worked out and judged, and not drawn, till enough have been judged
+        // right; as are the keys after it, which go on from it. Leaving it
+        // is taken for that, too, where what the agent says of the buffer
+        // was said before Insert mode was first entered in it, and a plugin
+        // loaded on the way in had yet to make its own.
+        let what = match proof {
+            Proof::Enter => Unseen::Entered,
+            _ => Unseen::Left,
+        };
+        let unseen = self.unseen(ack.buf, proof) && !p.trust.proven(ack.buf, what);
+        // On the line's row: not past the end of a row its line fills, in a
+        // window that wraps; and in one that does not, where the view shows
+        // it as it is.
+        let width = right - left;
+        let room = width.saturating_sub(shape.textoff);
+        if (shape.wrap && (vcol >= room || predict::reach(text, shape) > room))
+            || predict::showing(text, shape, vcol, shape.leftcol, width) != shape.leftcol
+        {
+            return false;
+        }
+        let step = chain::Step {
+            seq: cause.seq,
+            pos: predict::Pos {
+                byte,
+                want: Want::Col(vcol),
+                rest: if enter.is_some() {
+                    Rest::Insert
+                } else {
+                    Rest::Normal
+                },
+                ..from
+            },
+            vcol,
+            proof,
+            credited: true,
+            tick: ack.tick,
+            line_count: ack.line_count,
+            echo: echo.cloned(),
+            insstart: enter.map(|_| predict::Stop {
+                line: from.line,
+                byte,
+                sticks: false,
+            }),
+            hidden: unseen || p.trust.hidden(ack.buf, proof) || head.is_some_and(|s| s.hidden),
+            until: p.deadline(cause.at),
+        };
+        let drawn = self.seen(grid, step.pos.line, None);
+        self.anim.step(
+            &self.model,
+            grid,
+            (shown, !self.remaking),
+            (step, move || drawn),
+            now,
+        );
+        self.dirty = true;
+        true
+    }
+
+    /// Draw over each window the cursor has been moved ahead of Neovim in
+    /// (see [`anim::chain`]) — and, where the client works out the motions,
+    /// each scrolled ahead of Neovim or sliding, the cursor drawn where the
+    /// scrolls take it — what Neovim will draw of its rows besides the
+    /// cursor, once it hears of the keys: the line typed into, as typed;
+    /// where the cursor is drawn on another line than Neovim's, the gutter
+    /// as Neovim draws it with the cursor there (see [`predict::regutter`]),
+    /// and the bar of `'cursorline'` moved with it, each row worked out
+    /// again from what Neovim's last frame drew — and a row the client
+    /// cannot say of, as that frame drew it. Rows a scroll ahead of Neovim,
+    /// or a slide, shows of lines Neovim's view does not, drawn afresh with
+    /// the cursor where it is drawn. Before every frame: Neovim's frames,
+    /// the steps, the view and its slide all move what is to be drawn.
+    fn repaint(&mut self) {
+        let mut grids = self.anim.chained();
+        if self.predict.as_ref().is_some_and(Predictor::acks) {
+            grids.extend(self.anim.scrolled());
+            grids.sort_unstable();
+            grids.dedup();
+        }
+        for grid in self.anim.patched() {
+            if !grids.contains(&grid) {
+                self.anim.patch(grid, BTreeMap::new());
+            }
+        }
+        for grid in grids {
+            let patches = self.patches_of(grid).unwrap_or_default();
+            self.anim.patch(grid, patches);
+        }
+    }
+
+    /// What [`App::repaint`] draws over window grid `grid`'s rows, by row of
+    /// its grid: `None` for nothing.
+    ///
+    /// Each row shows a line: the one its grid has, or another, the rows
+    /// scrolled ahead of Neovim or sliding (see [`anim::Animator::rows_shown`]);
+    /// and the cursor is drawn on one, as the steps or the scrolls ahead
+    /// have it (see [`anim::Animator::cursor_line`]).
+    /// Of a row of a line Neovim drew — its grid's, or one its view has left
+    /// that the window's scroll keeps (see [`anim::scroll::Kept`]) — Neovim's
+    /// drawing is drawn over: the row of the line typed into ahead of
+    /// Neovim, as the steps laid it out (see [`App::predict_echo`]); and
+    /// where the cursor is drawn on another line than Neovim's was as it drew
+    /// the row, the gutter, where the cursor's line decides any of it; and
+    /// where `'cursorline'` draws a bar across the cursor's line, the text of
+    /// the rows of the line the cursor was on and of the one it is drawn on
+    /// — as Neovim drew them, or as typed into — the bar taken off the one
+    /// and laid under the other (see [`model::Derive`]): a row whose
+    /// highlights can no longer be made so left as Neovim drew it. A row of a
+    /// line the client brought into view ahead of Neovim, in a window where
+    /// the cursor's line decides any of it, is drawn afresh, with its gutter
+    /// and bar as Neovim draws them with the cursor where it is drawn (see
+    /// [`drawn_afresh`]). What the cursor's line decides is drawn over no row
+    /// where the client cannot draw it as Neovim does (see
+    /// [`App::redrawn_with`]): it is left as Neovim drew it, for its next
+    /// frame to put right.
+    fn patches_of(&mut self, grid: u64) -> Option<BTreeMap<usize, Vec<compose::Patch>>> {
+        let view = *self.model.viewports.get(&grid)?;
+        let win = *self.model.wins.get(&grid)?;
+        let rect = anim::text_rect(&self.model, grid)?;
+        let (top, bot, left, right) = rect;
+        let (h, width) = (bot - top, right - left);
+        let to = self.anim.cursor_line(&self.model, grid, h as i64)?;
+        let echo = self
+            .anim
+            .shown_step(&self.model, grid)
+            .and_then(|s| s.echo.clone());
+        let redrawn = self.redrawn_with(grid, (view.curline, to));
+        let ids = predict::Gutter::of(|name| self.model.groups.get(name).copied());
+        // What the rows drawn afresh are drawn with, once for them all.
+        let afresh = self
+            .afresh(grid)
+            .then(|| {
+                let shape = self.predict.as_ref()?.shape(win)?;
+                self.look(grid, rect, &view, shape).zip(ids)
+            })
+            .flatten();
+        let p = self.predict.as_ref()?;
+        let shape = p.shape(win)?;
+        let textoff = shape.textoff;
+        let text = (left + textoff).min(right);
+        let cul = shape.stepping.as_ref().map(|s| s.cursorline);
+        let bars = redrawn && cul.is_some_and(|c| c.line && !c.screenline);
+        let decided = redrawn && (shape.relativenumber || cul.is_some_and(|c| c.number || c.line));
+        let ahead = self.anim.rows_shown(grid);
+        let mut patches: BTreeMap<usize, Vec<compose::Patch>> = BTreeMap::new();
+        for r in 0..h {
+            let i = r as i64 + ahead;
+            let line = view.topline + i;
+            if !(0..view.line_count).contains(&line) {
+                continue;
+            }
+            let row = top + r;
+            // Neovim's drawing of the line, from the window's first column,
+            // and the line its cursor was on as it drew it; or the client's.
+            let own = usize::try_from(i).ok().filter(|i| *i < h);
+            let (drawn, from): (&[Cell], i64) = match own {
+                Some(i) => {
+                    let g = self.model.grids.get(&grid)?;
+                    let Some(cells) = g.row(top + i).get(left..right) else {
+                        continue;
+                    };
+                    (cells, view.curline)
+                }
+                None => match self.anim.kept(grid, i) {
+                    Some(anim::scroll::Kept {
+                        cells,
+                        by: anim::scroll::Drawer::Neovim(Some(c)),
+                    }) => (cells.as_slice(), *c),
+                    Some(anim::scroll::Kept {
+                        by: anim::scroll::Drawer::Client,
+                        ..
+                    }) => {
+                        let made = afresh.as_ref().filter(|_| decided).and_then(|(look, ids)| {
+                            drawn_afresh(
+                                p,
+                                &mut self.model,
+                                win,
+                                (line, to),
+                                (h as i64, width),
+                                (look, ids),
+                            )
+                        });
+                        if let Some(cells) = made {
+                            let patch = compose::Patch { col: left, cells };
+                            patches.entry(row).or_default().push(patch);
+                        }
+                        continue;
+                    }
+                    _ => continue,
+                },
+            };
+            let typed = own.and(echo.as_ref()).filter(|e| e.line == line);
+            let barred = bars && from != to && (line == from || line == to);
+            let gutter = (decided && from != to)
+                .then(|| {
+                    let drawn = drawn.get(..textoff)?;
+                    let now = predict::regutter(drawn, line, (from, to), shape, h as i64, &ids?)?;
+                    (now != drawn).then_some(now)
+                })
+                .flatten();
+            let drawn = barred.then(|| match typed {
+                Some(e) => e.cells.clone(),
+                None => drawn
+                    .get(textoff.min(drawn.len())..)
+                    .unwrap_or_default()
+                    .to_vec(),
+            });
+            if let Some(cells) = gutter {
+                let patch = compose::Patch { col: left, cells };
+                patches.entry(row).or_default().push(patch);
+            }
+            if let Some(e) = typed.filter(|_| !barred) {
+                let patch = compose::Patch {
+                    col: text,
+                    cells: e.cells.clone(),
+                };
+                patches.entry(row).or_default().push(patch);
+            }
+            let Some(drawn) = drawn else {
+                continue;
+            };
+            let d = if line == to {
+                model::Derive::CursorLineOn
+            } else {
+                model::Derive::CursorLineOff
+            };
+            let made: Option<Vec<Cell>> = drawn
+                .into_iter()
+                .map(|cell| {
+                    let hl = self.model.derived(cell.hl, d)?;
+                    Some(Cell { hl, ..cell })
+                })
+                .collect();
+            if let Some(cells) = made {
+                let patch = compose::Patch { col: text, cells };
+                patches.entry(row).or_default().push(patch);
+            }
+        }
+        Some(patches)
+    }
+
+    /// Whether the client can draw a row of window grid `grid` afresh with
+    /// what the cursor's line decides of it as Neovim draws it (see
+    /// [`drawn_afresh`]): a gutter of Neovim's own, in the editor's
+    /// groups — not the window's own, nor with signs drawn over numbers —
+    /// all of them named, and a bar of `'cursorline'`, if any, across the
+    /// line, which the client can lay under it as Neovim does.
+    fn afresh(&self, grid: u64) -> bool {
+        let shape = self
+            .model
+            .wins
+            .get(&grid)
+            .and_then(|win| self.predict.as_ref()?.shape(*win));
+        let Some((shape, stepping)) = shape.and_then(|s| Some((s, s.stepping.as_ref()?))) else {
+            return false;
+        };
+        let cul = stepping.cursorline;
+        shape.plain_gutter
+            && !stepping.number_signs
+            && !stepping.own_highlights
+            && !cul.screenline
+            && (!cul.line || self.model.bar_derivable())
+            && predict::Gutter::of(|name| self.model.groups.get(name).copied()).is_some()
+    }
+
+    /// Whether Neovim's gutter in window grid `grid`, as its frame has it,
+    /// can be drawn as Neovim will draw it with the cursor on line `to` (see
+    /// [`predict::regutter`]): a gutter of Neovim's own — not the
+    /// `'statuscolumn'`'s, which may draw anything the cursor's line
+    /// decides — and, where the cursor's line decides any of it, laid out
+    /// row for row as the client lays it out, with no sign drawn over a
+    /// number.
+    fn regutters(&self, grid: u64, to: i64) -> bool {
+        let shape = self
+            .model
+            .wins
+            .get(&grid)
+            .and_then(|win| self.predict.as_ref()?.shape(*win));
+        let Some((shape, stepping)) = shape.and_then(|s| Some((s, s.stepping.as_ref()?))) else {
+            return false;
+        };
+        if !shape.relativenumber && !stepping.cursorline.number {
+            return shape.plain_gutter;
+        }
+        shape.plain_gutter
+            && !stepping.number_signs
+            && self
+                .gutters(grid, to)
+                .is_some_and(|rows| rows.iter().all(|r| r.now.is_some()))
+    }
+
+    /// Each row of window grid `grid`'s gutter that shows a line, as Neovim's
+    /// frame has it, and as Neovim draws it with the cursor on line `to`
+    /// instead (see [`predict::regutter`]), by row of its grid: `None` for
+    /// one the client cannot say of. `None` for a window whose gutter the
+    /// client has no shape or groups for, or that the `'statuscolumn'`
+    /// draws.
+    fn gutters(&self, grid: u64, to: i64) -> Option<Vec<Regutter>> {
+        let (win, view) = (
+            self.model.wins.get(&grid)?,
+            self.model.viewports.get(&grid)?,
+        );
+        let shape = self.predict.as_ref()?.shape(*win)?;
+        let ids = predict::Gutter::of(|name| self.model.groups.get(name).copied())?;
+        let (top, bot, left, _) = anim::text_rect(&self.model, grid)?;
+        let g = self.model.grids.get(&grid)?;
+        if !shape.plain_gutter {
+            return None;
+        }
+        let h = bot - top;
+        let cursor = (view.curline, to);
+        let rows = (0..h)
+            .map(|r| (r, view.topline + r as i64))
+            .take_while(|&(_, lnum)| lnum < view.line_count)
+            .filter_map(|(r, lnum)| {
+                let drawn = g.row(top + r).get(left..left + shape.textoff)?;
+                let now = predict::regutter(drawn, lnum, cursor, shape, h as i64, &ids);
+                Some(Regutter {
+                    row: top + r,
+                    drawn: drawn.to_vec(),
+                    now,
+                })
+            })
+            .collect();
+        Some(rows)
+    }
+
+    /// Whether Neovim draws line `line` of window grid `grid`, whose text the
+    /// client has as `text`, as the client would: the cells of its text, from
+    /// the gutter to the line's end or the window's, being those the client
+    /// lays it out in. Where they are not, the client's text is not Neovim's
+    /// — an edit it has yet to hear of — or Neovim draws something between
+    /// the characters the client does not know of: virtual text, text
+    /// concealed, a character taken for another width. `None` for a line
+    /// not in view, or one too long for a window that wraps. The text alone
+    /// is compared, so the colours it is laid out in are none in particular.
+    ///
+    /// Blank virtual text among blanks shows nothing of itself: where
+    /// Neovim's own measure of the line is not known to agree with the
+    /// client's (see [`predict::Ack::blanks`]) — not `measured` — a line
+    /// whose last cell the client draws blank is not taken as drawn as the
+    /// client would. One with nothing to draw is.
+    fn explained(&self, grid: u64, line: i64, text: &str, measured: bool) -> Option<bool> {
+        let p = self.predict.as_ref()?;
+        let win = *self.model.wins.get(&grid)?;
+        let view = self.model.viewports.get(&grid)?;
+        let shape = p.shape(win)?;
+        let (top, bot, left, right) = anim::text_rect(&self.model, grid)?;
+        let r = usize::try_from(line - view.topline)
+            .ok()
+            .filter(|r| *r < bot - top)?;
+        let width = right - left;
+        let look = predict::Look::default();
+        let ours = predict::render(Some((text, &[])), shape, line, width, &look, line)?;
+        let theirs = self.model.grids.get(&grid)?.row(top + r).get(left..right)?;
+        let from = shape.textoff.min(width);
+        let end = (shape.textoff + predict::reach(text, shape).saturating_sub(shape.leftcol))
+            .clamp(from, width);
+        let blank = ours[from..end]
+            .last()
+            .is_some_and(|c| c.text == Text::Char(' '));
+        Some(
+            (measured || !blank)
+                && ours[from..end]
+                    .iter()
+                    .zip(&theirs[from..end])
+                    .all(|(a, b)| a.text == b.text),
+        )
+    }
+
+    fn predict_scroll(&mut self, grid: u64, command: Command, cause: Cause, now: Instant) -> bool {
         let (Some(&win), Some(rect)) = (
             self.model.wins.get(&grid),
             anim::text_rect(&self.model, grid),
@@ -2677,23 +4691,54 @@ impl App {
         let h = (bot - top) as i64;
         // Neovim takes it as 'scroll' from now on, whatever is predicted.
         if let (Command::Half { count: Some(n), .. }, Some(p)) = (command, self.predict.as_mut()) {
-            p.set_scroll(win, n.min(h));
+            p.set_scroll(win, n.min(h), cause.seq);
         }
-        let Some(p) = self.predict.as_ref().filter(|p| p.active()) else {
+        if self.predict.is_none() || !self.multigrid() || !self.flushed || self.holding(now) {
+            return false;
+        }
+        // A page back from a view whose first line is the buffer's last, or
+        // the one before, keeps fewer of the lines the view showed than
+        // anywhere else — Neovim's `get_scroll_overlap` runs out of lines to
+        // reckon them over — which [`predict::outcome`] does not follow:
+        // where Neovim's word on each key judges what the client drew of
+        // it, it is left to Neovim. Under "scrolls" it is drawn as it was.
+        if let (Command::Page { down: false, .. }, Some(view), true) = (
+            command,
+            self.model.viewports.get(&grid),
+            self.predict.as_ref().is_some_and(Predictor::acks),
+        ) {
+            let top = match self.anim.chain(grid).and_then(chain::Chain::head) {
+                Some(s) => s.pos.top,
+                None => view.topline + self.anim.ahead(grid).0,
+            };
+            if top > 0 && top >= view.line_count - 2 {
+                return false;
+            }
+        }
+        // A key that scrolls in Normal mode, where the client works out the
+        // motions, or a turn of the wheel over steps of the cursor's: one of
+        // them, as far as the cursor goes.
+        if let Some(made) = self.scroll_step(grid, command, cause, now) {
+            return made;
+        }
+        // The cursor moved ahead of Neovim in the window: a scroll alone is
+        // worked out from where Neovim has it, which it is not, and waits for
+        // Neovim's word on the steps before it.
+        if self.anim.chain(grid).is_some() {
+            return false;
+        }
+        let Some(p) = self.predict.as_ref() else {
             return false;
         };
-        if !self.multigrid() || !self.flushed || self.holding(now) {
-            return false;
-        }
         // The modes a key or the wheel scrolls a window in as predicted:
         // keys and pages in normal and visual mode, lines in insert mode as
         // well.
         let mode = self.model.mode_name.as_str();
         let normal = matches!(mode, "normal" | "visual");
         let insert = matches!(mode, "insert" | "replace");
-        let ok = match by {
-            By::Keys => normal && p.typed.sure(),
-            By::InsertKeys => insert && p.typed.sure(),
+        let ok = match cause.by {
+            By::Keys => normal && sure(p),
+            By::InsertKeys => insert && sure(p),
             By::PageWheel => normal && self.model.mouse,
             By::Wheel => {
                 self.model.mouse
@@ -2750,7 +4795,13 @@ impl App {
         let first = match command {
             Command::Line { first, .. } => first,
             Command::Half { .. } | Command::Page { .. } => shape.startofline,
-            Command::Lines(_) | Command::Screen(_) | Command::Side(_) => false,
+            Command::Lines(_)
+            | Command::Screen(_)
+            | Command::Side(_)
+            | Command::Move { .. }
+            | Command::Type(_)
+            | Command::Enter(_)
+            | Command::Leave => false,
         };
         let land = (self.model.cursor.grid == grid
             && (normal || insert)
@@ -2768,8 +4819,9 @@ impl App {
             cursor: to.cursor - at.cursor,
             col: None,
             land,
-            until: p.deadline(now),
+            until: p.deadline(cause.at),
             scrolloff: shape.scrolloff,
+            seq: p.acks().then_some(cause.seq),
         };
         let mut fill = |i: i64| p.row(win, view.topline + i, width, &look, to.cursor);
         let wants = self.wants(win, shape);
@@ -2806,9 +4858,9 @@ impl App {
                 top + (to.cursor - to.top) as usize,
                 shape.textoff + vcol - left,
             );
-            let until = p.deadline(now);
+            let until = p.deadline(cause.at);
             let Some(rows) = self.side_rows(grid, left) else {
-                self.anim.give_up(grid);
+                self.give_up(grid);
                 return false;
             };
             // Under rows moved sideways, nothing slides.
@@ -2817,6 +4869,161 @@ impl App {
                 .side(&self.model, grid, rows, (left, until), Some(cursor), now);
         }
         true
+    }
+
+    /// A key that scrolls window grid `grid` in Normal mode, `command`, of
+    /// key `cause`, where the client works out where the motions take the
+    /// cursor: made as they are, a step of the cursor's (see
+    /// [`anim::chain`]) — from where the steps before it leave the cursor
+    /// and the view, or Neovim's word with none — with the view scrolled
+    /// ahead of Neovim as far as Neovim scrolls it (see [`predict::outcome`],
+    /// [`App::scroll_ahead`]): its landing worked out at once, as a motion
+    /// down or up lands (see [`moves::onto`]), and judged by Neovim's word
+    /// on the key as the motions are. So the motions after it go on from
+    /// it, and it from them. Says whether it was made: `None` where it is
+    /// made as a scroll alone, as it was before the client worked out
+    /// motions (see [`App::predict_scroll`]) — one it cannot make as a step,
+    /// or that would not be drawn, or makes nothing, where nothing but
+    /// scrolls alone are ahead of Neovim in the window (see
+    /// [`App::alone`]).
+    ///
+    /// So is a turn of the wheel over a window the cursor was moved ahead
+    /// in, which Neovim makes in Normal mode as it makes `<C-e>`, `<C-y>` or
+    /// a page: a scroll alone from Neovim's view and cursor would take the
+    /// view back over the steps' scrolls, and count the lines the cursor
+    /// goes again from where Neovim has it, as its frames for the steps
+    /// come. Where nothing ahead of Neovim in it but the cursor, a turn is a
+    /// scroll alone, as it always was.
+    fn scroll_step(
+        &mut self,
+        grid: u64,
+        command: Command,
+        cause: Cause,
+        now: Instant,
+    ) -> Option<bool> {
+        let stepped = match cause.by {
+            By::Keys => true,
+            By::Wheel | By::PageWheel => self.anim.chain(grid).is_some(),
+            By::InsertKeys => false,
+        };
+        if !stepped || !self.predict.as_ref().is_some_and(Predictor::acks) {
+            return None;
+        }
+        match self.scrolled_step(grid, command, cause, now) {
+            Some((on, step, drawn)) => Some(self.step(grid, (&on, step, drawn), cause, now)),
+            None => self.alone(grid, now),
+        }
+    }
+
+    /// The step a key that scrolls, `command`, of key `cause`, makes in
+    /// window grid `grid`, as [`App::scroll_step`] makes it — where the
+    /// client can make one: where a motion can go on (see [`App::onward`]);
+    /// onto a line the client lays out as Neovim does (see
+    /// [`App::laid_out`]), past whatever the cursor's line decides (see
+    /// [`App::may_leave`]); in a view whose lines out of Neovim's the client
+    /// has, lays out as Neovim does (see [`App::brought`]), and a line to
+    /// a row. With no step before it, not one only worked out to be judged,
+    /// nor one that makes nothing: those are for a scroll alone.
+    fn scrolled_step(
+        &self,
+        grid: u64,
+        command: Command,
+        cause: Cause,
+        now: Instant,
+    ) -> Option<(Onward, chain::Step, chain::Drawn)> {
+        let on = self.onward(grid, now)?;
+        let (p, ack, shape, stepping) = self.stepped_by(on.win)?;
+        let (top, bot, left, right) = on.rect;
+        let (h, width) = ((bot - top) as i64, right - left);
+        let (from, head) = (on.from, on.head.as_ref());
+        let hidden = p.trust.hidden(ack.buf, Proof::Move) || head.is_some_and(|s| s.hidden);
+        let at = predict::At {
+            top: from.top,
+            cursor: from.line,
+        };
+        let to = predict::outcome(command, at, h, ack.line_count, shape)?;
+        if head.is_none() && (hidden || to == at) {
+            return None;
+        }
+        let how = match command {
+            Command::Line { first: true, .. } => moves::Landing::First,
+            Command::Line { line: Some(_), .. } => moves::Landing::Byte,
+            Command::Half { .. } | Command::Page { .. } if shape.startofline => {
+                moves::Landing::First
+            }
+            _ => moves::Landing::Want,
+        };
+        let texts = on.text(p, stepping);
+        let text = |l: i64| texts(l);
+        let cx = moves::Ctx {
+            shape,
+            line_count: ack.line_count,
+            rows: h,
+            width,
+            text: &text,
+            whichwrap: Some(&stepping.whichwrap),
+            scrolling: Some(stepping.scrolling()),
+            keyword: Some(&stepping.classes),
+            lmap: Some(stepping.lmap),
+            macros: stepping.macros(),
+        };
+        let pos = if how == moves::Landing::First || to.cursor != at.cursor {
+            moves::onto(to.cursor, how, to.top, &from, &cx)?
+        } else {
+            Pos {
+                top: to.top,
+                ..from
+            }
+        };
+        let line = text(pos.line).filter(|_| pos.left == from.left)?;
+        let fits = |l: i64| text(l).is_some_and(|t| predict::fits(t, shape, width));
+        let mut shown = to.top..(to.top + h).min(ack.line_count);
+        let still = (pos.line, pos.byte) == (from.line, from.byte);
+        if !shown.all(|l| on.neovims(l) || (fits(l) && self.brought(&on, l, &text)))
+            || (!still && !self.laid_out(grid, &on, pos.line, &text))
+            || !self.may_leave(grid, (from.line, pos.line))
+        {
+            return None;
+        }
+        let vcol = match head {
+            _ if !still => moves::drawn(line, shape, pos.byte),
+            Some(s) => s.vcol,
+            None => self.drawn_on(grid, &on)?,
+        };
+        let step = chain::Step {
+            seq: cause.seq,
+            pos,
+            vcol,
+            proof: Proof::Move,
+            credited: !still,
+            tick: ack.tick,
+            line_count: ack.line_count,
+            echo: head.and_then(|s| s.echo.clone()),
+            insstart: None,
+            hidden,
+            until: p.deadline(cause.at),
+        };
+        let drawn = self.seen(grid, pos.line, Some(line));
+        drop(texts);
+        Some((on, step, drawn))
+    }
+
+    /// A key that scrolls window grid `grid`, which cannot be made as a
+    /// step of the cursor's (see [`App::scroll_step`]): made as a scroll
+    /// alone (`None`), as it was before the client worked out motions,
+    /// where nothing but scrolls are ahead of Neovim in the window — none
+    /// at all, or steps every one of which scrolled (see
+    /// [`anim::Animator::scrolls_alone`]), let go of as steps and kept as
+    /// the scrolls they made, which say as much of the cursor as a scroll
+    /// alone does; and left to Neovim where a motion is (`Some(false)`),
+    /// which a scroll alone would not go on from.
+    fn alone(&mut self, grid: u64, now: Instant) -> Option<bool> {
+        self.anim.chain(grid)?;
+        if !self.anim.scrolls_alone(grid) {
+            return Some(false);
+        }
+        self.anim.unchain(&self.model, grid, now);
+        None
     }
 
     /// The colours window grid `grid`'s rows are drawn in, read off those
@@ -2861,12 +5068,22 @@ impl App {
     fn fill_in(&mut self, now: Instant) {
         for grid in self.anim.held() {
             if !self.fill_in_grid(grid, now) {
-                self.anim.give_up(grid);
+                self.give_up(grid);
                 if let Some(p) = self.predict.as_mut() {
                     p.typed.missed();
                 }
             }
             self.dirty = true;
+        }
+    }
+
+    /// Stop scrolling window grid `grid` ahead of Neovim: it shows Neovim's
+    /// view again, and the inputs the scrolls were made of are to be made
+    /// again from the next ack (see [`App::replay`]).
+    fn give_up(&mut self, grid: u64) {
+        let seqs = self.anim.give_up(grid);
+        if let Some(p) = self.predict.as_mut() {
+            p.given_up(&seqs);
         }
     }
 
@@ -2925,16 +5142,22 @@ impl App {
     /// A scroll sideways Neovim will make of window grid `grid`, typed or
     /// turned `by`: made at once, where the client can say what Neovim will
     /// make of it. See [`predict_command`](Self::predict_command).
-    fn predict_side(&mut self, grid: u64, side: Side, by: By, now: Instant) -> bool {
-        let Some(p) = self.predict.as_ref().filter(|p| p.active()) else {
-            return false;
-        };
-        if !self.multigrid() || !self.flushed || self.holding(now) {
+    fn predict_side(&mut self, grid: u64, side: Side, cause: Cause, now: Instant) -> bool {
+        if self.predict.is_none() || !self.multigrid() || !self.flushed || self.holding(now) {
             return false;
         }
+        // As for a scroll up or down (see `App::predict_scroll`): the cursor
+        // moved ahead of Neovim is not where one from Neovim's word finds it,
+        // and no scroll sideways is a step of it.
+        if self.anim.chain(grid).is_some() {
+            return false;
+        }
+        let Some(p) = self.predict.as_ref() else {
+            return false;
+        };
         let mode = Mode::of(&self.model.mode_name);
-        let ok = match by {
-            By::Keys => mode == Mode::Normal && p.typed.sure(),
+        let ok = match cause.by {
+            By::Keys => mode == Mode::Normal && sure(p),
             By::Wheel => self.model.mouse && mode != Mode::Other,
             By::InsertKeys | By::PageWheel => false,
         };
@@ -3016,7 +5239,7 @@ impl App {
         let row = to.line - view.topline;
         let cursor = (here && (0..h as i64).contains(&row) && to.vcol >= to.left)
             .then(|| (top + row as usize, shape.textoff + to.vcol - to.left));
-        let until = p.deadline(now);
+        let until = p.deadline(cause.at);
         self.anim
             .side(&self.model, grid, rows, (to.left, until), cursor, now);
         self.dirty = true;
@@ -3065,15 +5288,508 @@ impl App {
         }
     }
 
+    /// What the agent says Neovim made of the keys (see [`predict::Ack`]),
+    /// where the counts can be trusted: said just ahead of the frame that
+    /// draws it, and taken with that frame — Neovim's frame is the last word
+    /// on the screen, and under a loss on the link it comes as much as a
+    /// lost segment's time after — or at once, where there is nothing left
+    /// for a frame to draw: not where the keys changed the buffer, which
+    /// the frame draws, whatever they did to the cursor; nor where the
+    /// client could not make out what one of the keys does (see
+    /// [`predict::Sent::lost`]), which may have changed what a window shows
+    /// and left its cursor and view as they were. The newest wins.
+    fn heard_ack(&mut self, params: &[ValueRef<'_>], now: Instant) {
+        let Some(ack) = predict::Ack::read(params) else {
+            return;
+        };
+        let Some(p) = self.predict.as_mut().filter(|p| p.acks()) else {
+            return;
+        };
+        let Some(k) = p.heard(&ack, now) else {
+            self.forget_unsure(now);
+            return;
+        };
+        let edited = p
+            .base
+            .as_ref()
+            .is_some_and(|b| (b.ack.buf, b.ack.tick) != (ack.buf, ack.tick));
+        let shown = !edited && p.made_out(k) && self.shows(&ack);
+        self.ack = Some((k, ack));
+        if shown {
+            self.take_acks(now);
+        }
+    }
+
+    /// Whether what Neovim has drawn shows what `ack` says already: the
+    /// cursor in its window, on its line and column, the view from its line
+    /// and column, in its mode. A key that leaves things as they were — `l`
+    /// at the end of a line — has an ack and no frame.
+    fn shows(&self, ack: &predict::Ack) -> bool {
+        let grid = self.model.cursor.grid;
+        let pos = &ack.pos;
+        let view = self.model.viewports.get(&grid);
+        let shape = self.predict.as_ref().and_then(|p| p.shape(pos.win));
+        self.model.wins.get(&grid) == Some(&pos.win)
+            && view.is_some_and(|v| {
+                (v.curline, v.curcol, v.topline) == (pos.line, pos.byte as i64, pos.top)
+            })
+            && shape.is_some_and(|s| s.leftcol == pos.left)
+            && Rest::drawn(&self.model.mode_name) == pos.rest
+    }
+
+    /// Take what the agent said Neovim made of the keys, once the frame it
+    /// was said ahead of has been, for Neovim's last word on them (see
+    /// [`Predictor::judge`]). A scroll made ahead of Neovim of a key it
+    /// covers that its frame did not make is one Neovim did not, or made
+    /// otherwise: the view goes back to Neovim's at once, rather than at the
+    /// scroll's deadline, which on a lossy link may be a lost segment's
+    /// time after the frame. And what the keys sent since make is made out
+    /// again from there (see [`App::replay`]).
+    fn take_acks(&mut self, now: Instant) {
+        let Some((k, ack)) = self.ack.take() else {
+            return;
+        };
+        let unmade = self.anim.unmade(k);
+        for &grid in &unmade {
+            tracing::debug!(
+                grid,
+                k,
+                "client: a scroll ahead its key's frame did not make, given up"
+            );
+            self.give_up(grid);
+            self.dirty = true;
+        }
+        // Neovim's frame for the keys, or one it drew after more of them,
+        // having gone on to those before it could flush: only from its own
+        // can a scroll be made of the keys after them.
+        let fresh = self.shows(&ack);
+        self.judge_steps(k, &ack, fresh, now);
+        // Steps that went on from a scroll given up: worked out over a view
+        // the screen no longer shows.
+        for &grid in &unmade {
+            if self.anim.chain(grid).is_some() {
+                self.drop_steps(grid, now);
+            }
+        }
+        let grid = self
+            .model
+            .wins
+            .iter()
+            .find(|(_, w)| **w == ack.pos.win)
+            .map(|(g, _)| *g);
+        let view = grid
+            .and_then(|g| anim::text_rect(&self.model, g))
+            .map(|(top, bot, left, right)| ((bot - top) as i64, right - left));
+        if let Some(p) = self.predict.as_mut() {
+            p.judge(k, ack, view, !unmade.is_empty());
+        }
+        self.replay(fresh, now);
+    }
+
+    /// Judge where the cursor was moved ahead of Neovim (see
+    /// [`anim::chain`]), and what was typed ahead of it, by `ack`, which
+    /// covers the client's keys up to `k`, Neovim's frame for them on the
+    /// screen if `fresh`.
+    ///
+    /// - The step for `k` is where Neovim says the key left the cursor and
+    ///   the view, over the same buffer as it was — or, where the steps typed
+    ///   into a line, with the line's text as Neovim's word has it, which the
+    ///   agent sends the edits for ahead of it (see
+    ///   [`Predictor::fresh`]); or, for a key that went into Insert mode or
+    ///   out of it, over what an autocommand of the mode left of the buffer,
+    ///   the steps after it worked out again over that where it changed —
+    ///   or, where a plugin's may do anything and Neovim's word does not
+    ///   say, may have (see [`App::edited`]): *made*. One that changed it
+    ///   proves itself in the buffer before it is drawn there again, as one
+    ///   wrong would (see [`predict::Trust::edited`]). It is let go of, and
+    ///   those before it, the cursor already where Neovim's frame has it;
+    ///   and that frame, its own, is checked to have drawn it in the cell
+    ///   the client did, and the line typed into as the client laid it out
+    ///   — where not, the client lays the line out otherwise than Neovim,
+    ///   and the window is left to Neovim a while. A line Neovim draws
+    ///   otherwise past its end only — virtual text there changed — has the
+    ///   steps after let go of, to be laid out again over it (see
+    ///   [`App::replay`]).
+    /// - The step for `k` is not: *wrong*. The cursor goes to where Neovim
+    ///   has it at once, every step in the window let go of, and what it
+    ///   was of proves itself in the buffer before it is drawn there again
+    ///   (see [`predict::Trust`]).
+    /// - There is no step for `k` — a key the client did not predict, or the
+    ///   agent saying something moved the cursor without a key — or the
+    ///   buffer changed under them, or the client has not the text the line
+    ///   typed into has: nothing to judge, and the steps are let go of.
+    ///
+    /// Either of the last two has the keys after `k` made out again from the
+    /// ack (see [`App::replay`]).
+    fn judge_steps(&mut self, k: u64, ack: &predict::Ack, fresh: bool, now: Instant) {
+        for grid in self.anim.chained() {
+            let Some(chain) = self.anim.chain(grid) else {
+                continue;
+            };
+            let (here, textoff) = (chain.win == ack.pos.win, chain.textoff);
+            // Over the buffer as it was worked out over — or, where the steps
+            // typed into it, or the key went into Insert mode or out of it,
+            // over what the key leaves of it: an autocommand of `InsertLeave`
+            // that takes out the blanks a line ends in, a plugin's, has the
+            // key do more than it does, and is for the judge to find.
+            let step = chain.step_for(k).cloned().filter(|s| {
+                let mode = matches!(s.proof, Proof::Enter | Proof::Leave);
+                here && (s.echo.is_some() || mode || s.tick == ack.tick)
+            });
+            let Some(p) = self.predict.as_ref() else {
+                return;
+            };
+            // The line typed into, as Neovim's word has it: `None` where the
+            // client has not that text.
+            let typed = step.as_ref().map(|s| match &s.echo {
+                None => Some(true),
+                Some(e) => {
+                    let win = ack.pos.win;
+                    let known = p.fresh(win, ack.buf, ack.tick) && !p.cut(win, e.line);
+                    known.then(|| p.text(win, e.line) == Some(&*e.text))
+                }
+            });
+            match (step, typed.flatten()) {
+                (Some(s), Some(true)) if s.pos == ack.pos && s.line_count == ack.line_count => {
+                    self.anim.drop_upto(grid, k);
+                    let at = (textoff, s.vcol);
+                    let moded = matches!(s.proof, Proof::Enter | Proof::Leave);
+                    let edited = moded.then(|| self.edited(k, &s, ack)).flatten();
+                    let unseen = moded && self.unseen(ack.buf, s.proof);
+                    let Some(p) = self.predict.as_mut() else {
+                        return;
+                    };
+                    let credited = s.credited && (!moded || edited == Some(false));
+                    p.trust.made(ack.buf, s.proof, credited, !s.hidden);
+                    if edited == Some(true) {
+                        p.trust.edited(ack.buf, s.proof);
+                    }
+                    // The buffer changed under the steps after it — by an
+                    // autocommand of the mode it went into or out of — or,
+                    // where a plugin's may have and nothing says, may have:
+                    // they are worked out again over it.
+                    if moded && (edited == Some(true) || (edited.is_none() && unseen)) {
+                        self.drop_steps(grid, now);
+                        continue;
+                    }
+                    if !fresh || s.hidden {
+                        continue;
+                    }
+                    let echoed = s.echo.as_ref().map(|e| self.echoed(grid, e));
+                    if !self.drawn_at(grid, &s, at) || echoed.is_some_and(|(text, _)| !text) {
+                        tracing::info!(
+                            k,
+                            step = ?s.pos,
+                            vcol = s.vcol,
+                            cursor = ?self.model.cursor,
+                            "client: Neovim drew the cursor elsewhere than the client did, or \
+                             the line typed into otherwise; leaving the window to it a while"
+                        );
+                        if let Some(p) = self.predict.as_mut() {
+                            p.trust.distrust(ack.pos.win, now + predict::DISTRUST);
+                        }
+                    }
+                    if echoed.is_some_and(|(text, row)| !(text && row)) {
+                        self.drop_steps(grid, now);
+                    }
+                }
+                (Some(s), Some(_)) => {
+                    if let Some(p) = self.predict.as_mut() {
+                        let keys: Vec<&str> = p
+                            .queue
+                            .iter()
+                            .filter(|q| q.seq <= k)
+                            .filter_map(|q| q.input.key())
+                            .collect();
+                        if !s.hidden {
+                            tracing::info!(
+                                k,
+                                ?keys,
+                                step = ?s.pos,
+                                neovim = ?ack.pos,
+                                line = ?p.text(ack.pos.win, ack.pos.line),
+                                typed = ?s.echo.as_ref().map(|e| &e.text),
+                                "client: a prediction drawn ahead of Neovim was not what it made"
+                            );
+                        }
+                        p.trust.wrong(ack.buf, s.proof, !s.hidden);
+                    }
+                    // The scrolls ahead with them: a hidden step made none,
+                    // nor any after it.
+                    self.give_up(grid);
+                    let seqs = self.anim.drop_chain(&self.model, grid, now);
+                    let rest: Vec<u64> = seqs.into_iter().filter(|&q| q != k).collect();
+                    self.forget(&rest);
+                    self.dirty = true;
+                }
+                _ => self.drop_steps(grid, now),
+            }
+        }
+    }
+
+    /// Whether key `k`, into Insert mode or out of it, found by Neovim's
+    /// word on it, `ack`, made as step `s` worked it out, edited the buffer
+    /// besides — which the key itself does not, but an autocommand of the
+    /// mode may: by the `b:changedtick` the step was worked out over; or,
+    /// after text typed ahead of Neovim, by its word on the key before, or
+    /// on any before with the buffer as it is now. `None` where nothing
+    /// says: Neovim's word on the text typed and the key at once.
+    fn edited(&self, k: u64, s: &chain::Step, ack: &predict::Ack) -> Option<bool> {
+        if s.echo.is_none() {
+            return Some(s.tick != ack.tick);
+        }
+        let base = self.predict.as_ref()?.base.as_ref()?;
+        let before = (base.seq < k && base.ack.buf == ack.buf).then_some(base.ack.tick)?;
+        if before == ack.tick {
+            Some(false)
+        } else {
+            (base.seq + 1 == k).then_some(true)
+        }
+    }
+
+    /// Whether, as the agent says of buffer `buf`, a plugin's autocommand
+    /// may do anything as a key of kind `proof` enters Insert mode, or
+    /// leaves it (see [`App::predict_mode`]).
+    fn unseen(&self, buf: i64, proof: Proof) -> bool {
+        let facts = self.predict.as_ref().and_then(|p| p.facts(buf));
+        facts.is_some_and(|f| match proof {
+            Proof::Enter => f.unseen_entered,
+            _ => f.unseen_left || !f.from_insert,
+        })
+    }
+
+    /// Whether Neovim's frame draws the line `e` typed into in window grid
+    /// `grid` as the client laid it out: its text, and the row whole, past
+    /// the line's end as well — `(false, false)` where it is not in view.
+    fn echoed(&self, grid: u64, e: &chain::Echo) -> (bool, bool) {
+        let drawn = (|| {
+            let view = self.model.viewports.get(&grid)?;
+            let (top, bot, left, right) = anim::text_rect(&self.model, grid)?;
+            let win = self.model.wins.get(&grid)?;
+            let shape = self.predict.as_ref()?.shape(*win)?;
+            let r = usize::try_from(e.line - view.topline)
+                .ok()
+                .filter(|r| *r < bot - top)?;
+            let row = self.model.grids.get(&grid)?.row(top + r);
+            let cells = row.get((left + shape.textoff).min(right)..right)?;
+            let end = predict::reach(&e.text, shape).min(cells.len());
+            let same = |a: &[Cell], b: &[Cell]| {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.text == y.text)
+            };
+            let text = e
+                .cells
+                .get(..end)
+                .is_some_and(|ours| same(ours, &cells[..end]));
+            Some((text, text && same(&e.cells, cells)))
+        })();
+        drawn.unwrap_or((false, false))
+    }
+
+    /// Whether Neovim's frame has the cursor where step `s` in window grid
+    /// `grid` drew it, its gutter `textoff` wide and the step drawn in
+    /// display column `vcol`: `at`.
+    fn drawn_at(&self, grid: u64, s: &chain::Step, (textoff, vcol): (usize, usize)) -> bool {
+        let c = self.model.cursor;
+        let (Some(view), Some((top, ..))) = (
+            self.model.viewports.get(&grid),
+            anim::text_rect(&self.model, grid),
+        ) else {
+            return false;
+        };
+        let row = usize::try_from(s.pos.line - view.topline).map(|r| top + r);
+        let col = (textoff + vcol).checked_sub(s.pos.left);
+        c.grid == grid && Ok(c.row) == row && Some(c.col) == col
+    }
+
+    /// Let go of the cursor moved ahead of Neovim in window grid `grid`,
+    /// unjudged: it goes to where Neovim has it, and the view with it — the
+    /// scrolls ahead of Neovim the steps made, which are all there are in a
+    /// window with steps (see [`App::onward`]) — and the keys of the steps
+    /// are to be made again from the next ack, the client blind from them
+    /// on till then (see [`predict::Typed::blinded`]).
+    fn drop_steps(&mut self, grid: u64, now: Instant) {
+        if self.anim.chain(grid).is_some() {
+            self.give_up(grid);
+        }
+        let seqs = self.anim.drop_chain(&self.model, grid, now);
+        self.forget(&seqs);
+        self.dirty = true;
+    }
+
+    /// The steps for the keys `seqs` were let go of unjudged: see
+    /// [`App::drop_steps`].
+    fn forget(&mut self, seqs: &[u64]) {
+        if let (Some(p), false) = (self.predict.as_mut(), seqs.is_empty()) {
+            p.given_up(seqs);
+            p.trust.unjudged(seqs.len() as u64);
+            p.typed.blinded();
+        }
+    }
+
+    /// Let go of every step the animations let go of on their own (see
+    /// [`anim::Animator::take_dropped`]), as [`App::drop_steps`] does: says
+    /// whether there were any.
+    fn forget_dropped(&mut self) -> bool {
+        let seqs = self.anim.take_dropped();
+        self.forget(&seqs);
+        !seqs.is_empty()
+    }
+
+    /// Work the steps a frame of Neovim's let go of out again at once (see
+    /// [`anim::chain`]), from Neovim's last word on the keys, over the
+    /// window as that frame left it (see [`App::replay`]): where what it
+    /// changed leaves the line laid out as before — the window a size
+    /// other than it was, something drawn after the line's end — the cursor
+    /// stays where it was drawn, rather than going back to Neovim's for a
+    /// round trip; where not, they wait for Neovim's next word.
+    fn remake(&mut self, now: Instant) {
+        let Some(p) = self.predict.as_mut() else {
+            return;
+        };
+        if p.rebase() {
+            self.remaking = true;
+            self.replay(false, now);
+            self.remaking = false;
+        }
+    }
+
+    /// Where the counts of the keys Neovim has taken are in doubt, no ack is
+    /// taken for a key of the client's (see [`predict::Sync`]), and no step
+    /// can be judged: every one is let go of. Not where a paste only holds
+    /// the acks back till a fence after it — Neovim taking it in Normal
+    /// mode as no key, the steps for the keys before it are where Neovim
+    /// puts the cursor still, till its frame for the paste says otherwise.
+    fn forget_unsure(&mut self, now: Instant) {
+        if self
+            .predict
+            .as_ref()
+            .is_some_and(|p| p.acks() && p.sync.doubted())
+        {
+            for grid in self.anim.chained() {
+                self.drop_steps(grid, now);
+            }
+        }
+    }
+
+    /// A fence answered, Neovim having taken the client's keys up to `upto`:
+    /// a step for one of them still drawn is one Neovim took without going
+    /// to wait for a key between — an operator pending, completion — and
+    /// said nothing of, its frame the last word. Every step is let go of,
+    /// and the client is blind from the first key after Neovim's last word
+    /// till it says another.
+    fn floor(&mut self, upto: u64, now: Instant) {
+        let taken = self.anim.chained().into_iter().any(|grid| {
+            self.anim
+                .chain(grid)
+                .is_some_and(|c| c.seqs().iter().any(|&s| s <= upto))
+        });
+        if !taken {
+            return;
+        }
+        for grid in self.anim.chained() {
+            self.drop_steps(grid, now);
+        }
+        if let Some(p) = self.predict.as_mut() {
+            p.typed.blinded();
+        }
+    }
+
+    /// Make out again the inputs sent since Neovim's last word on them,
+    /// from where it says Neovim is (see [`predict::Typed::rebase`]), and
+    /// make what the client can of those it has not made: a scroll typed
+    /// after a key it was blind to, or one it gave up on, a motion whose
+    /// step was let go of — once each, a scroll made already being ahead of
+    /// Neovim still, or made by Neovim since. A key that cannot be made, or
+    /// a click, leaves it blind from that input on, as it would typed now.
+    /// So does a scroll not made, where the frame the word came with is not
+    /// Neovim's for those keys but for more (`fresh`): Neovim, going on to
+    /// keys it had to hand, did not flush between them, and that frame may
+    /// have made it already. A motion is worked out from the ack, not the
+    /// frame, and is made all the same.
+    fn replay(&mut self, fresh: bool, now: Instant) {
+        let Some(p) = self.predict.as_ref() else {
+            return;
+        };
+        let queue: Vec<predict::Sent> = p.queue.iter().cloned().collect();
+        let grid = self.model.cursor.grid;
+        let win = self.model.wins.get(&grid).copied();
+        for sent in queue {
+            let Some(p) = self.predict.as_mut() else {
+                return;
+            };
+            let seq = sent.seq;
+            let command = match &sent.input {
+                predict::Input::Key(key) => p.remake(win, key),
+                predict::Input::Wheel => None,
+                predict::Input::Click => {
+                    p.typed.clicked();
+                    None
+                }
+            };
+            p.remade(seq);
+            // Insert mode entered by a key whose step is not made, nor ahead
+            // of Neovim still, is not known to be entered as the key alone
+            // enters it (see [`predict::Typed::unentered`]).
+            let entering = matches!(command, Some(Command::Enter(_)));
+            if sent.made || !p.typed.followed() {
+                if entering && !sent.made {
+                    p.unentered(seq);
+                }
+                continue;
+            }
+            let made = match (command, fresh) {
+                (Some(command), fresh)
+                    if fresh
+                        || matches!(
+                            command,
+                            Command::Move { .. }
+                                | Command::Type(_)
+                                | Command::Enter(_)
+                                | Command::Leave
+                        ) =>
+                {
+                    let by = if p.typed.inserting() {
+                        By::InsertKeys
+                    } else {
+                        By::Keys
+                    };
+                    let cause = Cause {
+                        by,
+                        seq,
+                        at: sent.at,
+                    };
+                    self.make(grid, command, cause, now)
+                }
+                // Nothing to make: a count, or the first key of a `z`.
+                (None, _) if matches!(sent.input, predict::Input::Key(_)) => continue,
+                _ => false,
+            };
+            if let Some(p) = self.predict.as_mut() {
+                if made {
+                    p.made(seq);
+                } else {
+                    if entering {
+                        p.unentered(seq);
+                    }
+                    p.typed.blinded();
+                }
+            }
+        }
+    }
+
     /// Neovim has drawn: a window it moved sideways lands the scrolls ahead
     /// up to it, and one still ahead is drawn again from Neovim's rows.
-    fn landed_sideways(&mut self) {
+    fn landed_sideways(&mut self, now: Instant) {
         for (win, left) in std::mem::take(&mut self.lefts) {
             if let Some(p) = self.predict.as_mut() {
                 p.set_leftcol(win, left);
             }
             if let Some((&grid, _)) = self.model.wins.iter().find(|(_, w)| **w == win) {
                 self.anim.landed(grid, left);
+                // The cursor moved ahead in a view Neovim has moved since.
+                if self.anim.chain(grid).is_some_and(|c| c.left != left) {
+                    self.drop_steps(grid, now);
+                }
             }
         }
         for grid in self.anim.sided() {
@@ -3150,6 +5866,7 @@ impl App {
         }
         self.screen.invalidate();
         self.anim.reset();
+        self.forget_dropped();
         self.dirty = true;
     }
 
@@ -3286,7 +6003,14 @@ impl App {
     /// the frame shown, the rows of the editor's grids drawn or scrolled
     /// since are put together again, and compared with the terminal's alone.
     pub fn frame(&mut self, now: Instant) -> Vec<u8> {
+        // Steps Neovim has said nothing of in time: let go of, as a scroll
+        // ahead is, and the client blind from them till it does.
+        for (grid, seqs) in self.anim.lapsed(&self.model, now) {
+            self.give_up(grid);
+            self.forget(&seqs);
+        }
         self.anim.advance(now);
+        self.repaint();
         let (w, h) = self.size;
         self.cards.expire(now);
         // The frame shown, to put the rows that changed together over, where
@@ -3435,10 +6159,12 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
     crate::term::write_stdout(term::OPENING)?;
 
     let predict = settings.client.predicts(drawing.remote);
-    let mut app = App::new(term, effects, predict, term::size()).with_centre(
-        settings.client.centre,
-        usize::from(settings.client.window_width),
-    );
+    let mut app = App::new(term, effects, predict, term::size())
+        .with_centre(
+            settings.client.centre,
+            usize::from(settings.client.window_width),
+        )
+        .with_predictions(settings.client.predictions(drawing.remote));
     app.start();
     let mut inbox = Inbox::default();
     let stdin = std::io::stdin();
@@ -3524,6 +6250,13 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
         } else if app.escape_due(now) {
             app.escape_timeout(now);
         }
+        // What the keys ask of Neovim goes now, ahead of the frame they may
+        // have predicted: composed first, that frame would hold them back by
+        // as long as it took — a millisecond a key, on its way to a link
+        // that is slow already, or no key would have been predicted.
+        if let Err(e) = app.outbox.send(&mut stream) {
+            break Err(anyhow::Error::from(e).context("writing to the session"));
+        }
         if app.due(now) {
             // Nothing at all, for a frame that changes nothing on the screen
             // and had nothing waiting to go ahead of it: see
@@ -3539,6 +6272,10 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
             break Ok(());
         }
     };
+    if let Some(p) = app.predict.as_ref().filter(|p| p.acks()) {
+        p.shadow.log();
+        p.trust.tally.log();
+    }
     // Whatever ended it, the terminal is handed back as it was — and the
     // windows their own width, for whoever else draws them.
     if app.let_windows_go(Instant::now()) {
@@ -3751,6 +6488,19 @@ mod tests {
 
     type Call = (Option<u64>, String, Vec<Value>);
 
+    /// The motions as well as the scrolls, as `predict_typing = "off"` has
+    /// them; and the typing as well, as `[client]` has it by default.
+    const MOTIONS: Predictions = Predictions {
+        scrolls: true,
+        motions: true,
+        typing: false,
+    };
+    const TYPING: Predictions = Predictions {
+        scrolls: true,
+        motions: true,
+        typing: true,
+    };
+
     fn palette() -> Palette {
         Palette {
             fg: Rgb(255, 255, 255),
@@ -3960,7 +6710,9 @@ mod tests {
     /// windows animated, and nothing predicted or centred.
     fn drawing() -> crate::config::Drawing {
         let mut d = crate::config::Drawing::default();
-        d.client.predict = Predict::Off;
+        d.client.predict_scrolls = Predict::Off;
+        d.client.predict_motions = Predict::Off;
+        d.client.predict_typing = Predict::Off;
         d.effects.scroll.enabled = false;
         d
     }
@@ -4023,7 +6775,8 @@ mod tests {
         let t0 = Instant::now();
         let mut a = attached(false, t0);
         let mut d = drawing();
-        d.client.predict = Predict::On;
+        d.client.predict_scrolls = Predict::Auto;
+        d.remote = true;
         a.reconfigure(&d, t0);
         assert!(a.predict.is_some());
         let sent = calls(&mut a);
@@ -4034,14 +6787,15 @@ mod tests {
         );
     }
 
-    /// Told to predict as `"auto"` has it, a client predicts for a session
-    /// on another machine, and attaches again for the agent; for a session
-    /// on this one it predicts nothing, and attaches as it was.
+    /// Told `"auto"`, a client predicts for a session on another machine,
+    /// and attaches again for the agent; for a session on this one it
+    /// predicts nothing, and attaches as it was — unless told `"on"`, when
+    /// it predicts for that one too.
     #[test]
-    fn a_client_told_to_predict_automatically_predicts_only_over_ssh() {
+    fn auto_predicts_only_over_ssh_and_on_here_as_well() {
         let t0 = Instant::now();
         let mut d = drawing();
-        d.client.predict = Predict::Auto;
+        d.client.predict_scrolls = Predict::Auto;
 
         let mut here = attached(false, t0);
         here.reconfigure(&d, t0);
@@ -4049,6 +6803,16 @@ mod tests {
         let sent = calls(&mut here);
         assert!(!sent.iter().any(|(_, m, _)| m == "nvim_ui_detach"));
 
+        d.client.predict_scrolls = Predict::On;
+        let mut on = attached(false, t0);
+        on.reconfigure(&d, t0);
+        assert!(
+            on.predict.is_some(),
+            "not predicting on this machine, told on"
+        );
+        request(&calls(&mut on), "nvim_ui_detach", "");
+
+        d.client.predict_scrolls = Predict::Auto;
         d.remote = true;
         let mut there = attached(false, t0);
         there.reconfigure(&d, t0);
@@ -5341,7 +8105,8 @@ mod tests {
         calls(&mut a);
         // Told to predict meanwhile, the client detaches to attach again.
         let mut d = drawing();
-        d.client.predict = Predict::On;
+        d.client.predict_scrolls = Predict::Auto;
+        d.remote = true;
         a.reconfigure(&d, t0 + Duration::from_millis(100));
         let sent = calls(&mut a);
         let detach = request(&sent, "nvim_ui_detach", "");
@@ -5473,8 +8238,15 @@ mod tests {
     /// left: one window of 20 × 5 over a buffer of 50 lines, `line 0` at the
     /// top, the cursor on it, in normal mode with the mouse on.
     fn predicting(rtt: Duration) -> App {
+        predicting_as(Predictions::default(), rtt).0
+    }
+
+    /// [`predicting`], working out `predictions` ahead of Neovim; with the
+    /// agent's request, unanswered.
+    fn predicting_as(predictions: Predictions, rtt: Duration) -> (App, u64) {
         let t0 = Instant::now();
-        let mut a = App::new(palette(), Effects::none(), true, (20, 6));
+        let mut a =
+            App::new(palette(), Effects::none(), true, (20, 6)).with_predictions(predictions);
         a.start();
         let sent = calls(&mut a);
         answer(
@@ -5564,7 +8336,7 @@ mod tests {
             ],
         );
         calls(&mut a);
-        a
+        (a, agent)
     }
 
     /// `win_viewport` for window grid 2 of [`predicting`]'s: a view of five
@@ -5842,18 +8614,11 @@ mod tests {
         assert_eq!(top_row(&a), "line 4", "a count");
     }
 
-    /// Over a fast link, or with a window the agent says is not to be
-    /// predicted, a turn of the wheel waits for Neovim.
+    /// With a window the agent says is not to be predicted, a turn of the
+    /// wheel waits for Neovim.
     #[test]
     fn a_turn_of_the_wheel_waits_where_it_cannot_be_predicted() {
-        let mut a = predicting(Duration::ZERO);
         let t1 = Instant::now() + Duration::from_secs(1);
-        a.keys(b"\x1b[<65;3;2M", t1);
-        assert_eq!(top_row(&a), "line 0", "a fast link");
-        assert!(calls(&mut a)
-            .iter()
-            .any(|(_, m, _)| m == "nvim_input_mouse"));
-
         let mut a = predicting(Duration::from_millis(200));
         let mut a2 = predicting(Duration::from_millis(200));
         // A view that is not a line to a row: a line wraps, say.
@@ -5938,7 +8703,7 @@ mod tests {
             answer(&mut a, ping, Value::Nil, t + Duration::from_millis(1));
         }
         let p = a.predict.as_ref().expect("predicting");
-        assert!(!p.active(), "a fast link now");
+        assert_eq!(p.reach(), 3, "a fast link now: a page each way, and two");
     }
 
     /// The agent keeps lines as far either side of a view as a key held down
@@ -5994,91 +8759,3520 @@ mod tests {
         assert!(measure(&mut a, rtt).is_empty(), "the same round trip");
         // A second, smoothed to 300 ms: fifteen pages.
         assert_eq!(measure(&mut a, Duration::from_secs(1)), [17]);
-        // Faster again, down to a link no page outruns, and on to one too
-        // fast to predict over: no lines at all.
+        // Faster again, down to a link no page outruns: the page in view, the
+        // next, and two over — never none, however fast.
         let mut told = Vec::new();
         for _ in 0..60 {
             told.extend(measure(&mut a, Duration::ZERO));
         }
-        assert_eq!(told.last(), Some(&0));
+        assert_eq!(told.last(), Some(&3));
         assert!(
             told.windows(2).all(|w| w[0] > w[1]),
             "only as it moved: {told:?}"
         );
     }
 
-    /// Over a link too fast to predict over, the agent keeps no lines: it
-    /// is left told to keep none, and told how far once the link slows.
+    /// Each kind is drawn ahead over a link as fast as it gets, the agent
+    /// keeping lines for it from the first: a turn of the wheel scrolls the
+    /// window at once, `l` moves the cursor, and what is typed goes in.
     #[test]
-    fn the_agent_keeps_no_lines_for_a_link_too_fast_to_predict_over() {
-        let t0 = Instant::now();
-        let mut a = App::new(palette(), Effects::none(), true, (20, 6));
-        a.start();
-        let sent = calls(&mut a);
-        let rtt = Duration::from_millis(1);
-        answer(
-            &mut a,
-            request(&sent, "nvim_get_api_info", ""),
-            Value::Array(vec![7.into()]),
-            t0 + rtt,
-        );
-        answer(&mut a, asks_uis(&sent), uis(false, false), t0 + rtt);
-        let sent = calls(&mut a);
-        let agent = request(&sent, "nvim_exec_lua", "local chan");
-        let (_, _, args) = sent
-            .iter()
-            .find(|(id, ..)| *id == Some(agent))
-            .expect("agent");
-        let args = args[1].as_array().expect("its arguments");
-        assert_eq!(args[1], true.into(), "left to predict");
-        assert_eq!(args[4], 0.into(), "but keeping no lines yet");
+    fn each_kind_is_drawn_ahead_however_fast_the_link() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let only = |scrolls, motions, typing| Predictions {
+            scrolls,
+            motions,
+            typing,
+        };
+        let (mut a, _) = predicting_as(only(true, false, false), Duration::ZERO);
+        assert_eq!(a.reach, 2, "lines kept from the first");
+        a.keys(b"\x1b[<65;3;2M", t1);
+        assert_eq!(top_row(&a), "line 3", "a turn of the wheel");
 
-        // The link slows: the agent is told how far, and sends them.
-        let t1 = t0 + Duration::from_secs(1);
-        a.keys(b"j", t1);
-        a.tick(t1 + PING_EVERY);
-        let ping = request(&calls(&mut a), "nvim_get_mode", "");
-        answer(
-            &mut a,
-            ping,
-            Value::Nil,
-            t1 + PING_EVERY + Duration::from_secs(1),
-        );
-        let told = calls(&mut a);
-        assert!(
-            told.iter().any(|(_, m, _)| m == "nvim_exec_autocmds"),
-            "told how far: {told:?}"
-        );
+        let mut a = stepping_as(only(false, true, false), Duration::ZERO, &[]);
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 1), "a motion");
+
+        let mut a = stepping_as(only(false, false, true), Duration::ZERO, &[]);
+        facts(&mut a, |_| {}, t1);
+        ack_i(&mut a, 0, "", 0, 1, t1);
+        redraw(&mut a, typed_frame("line 0", 0), t1);
+        a.keys(b"abc", t1);
+        assert_eq!(composed(&mut a)[0], "abcline 0", "what is typed");
     }
 
-    /// A link fast again stops the predictions, and the agent sending what
-    /// they are made from: what the client kept of it goes too, since no
-    /// edit reaches it from then on.
+    /// A link grown fast stops nothing: the agent goes on sending what the
+    /// predictions are made from, as far as the link pages, and the client
+    /// keeps what it has.
     #[test]
-    fn a_link_fast_again_lets_go_of_the_lines_kept() {
+    fn a_link_grown_fast_goes_on_predicting() {
         let mut a = predicting(Duration::from_millis(200));
-        assert!(a.predict.as_ref().is_some_and(|p| p.shape(1000).is_some()));
         let mut t = Instant::now() + Duration::from_secs(1);
-        let mut told = Vec::new();
         for _ in 0..60 {
             t += PING_EVERY;
             a.keys(b"j", t);
             a.tick(t);
             let ping = request(&calls(&mut a), "nvim_get_mode", "");
             answer(&mut a, ping, Value::Nil, t);
-            told.extend(
-                calls(&mut a)
+            calls(&mut a);
+        }
+        let p = a.predict.as_ref().expect("predicting");
+        assert_eq!(a.reach, 3, "as far as a fast link pages");
+        assert_eq!(p.reach(), 3);
+        assert!(p.shape(1000).is_some(), "the window's shape kept");
+        a.keys(b"\x1b[<65;3;2M", t);
+        assert_eq!(top_row(&a), "line 3");
+    }
+
+    /// [`predicting`], the agent telling the client what Neovim made of
+    /// each key: its request answered, the counts tied by the attach's fence
+    /// answered with nothing after it, and its word on none of the keys
+    /// taken — the cursor at the start of `line 0` — taken at once.
+    fn acking(rtt: Duration) -> App {
+        acking_as(MOTIONS, rtt)
+    }
+
+    /// [`acking`], working out `predictions` ahead of Neovim.
+    fn acking_as(predictions: Predictions, rtt: Duration) -> App {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let (mut a, agent) = predicting_as(predictions, rtt);
+        let wins = Value::Array(vec![Value::Array(vec![1000.into(), 1.into()])]);
+        let options = Value::Array(vec![2.into(), false.into(), false.into(), wins]);
+        answer(&mut a, agent, options, t1);
+        a.tick(t1);
+        let fence = request(&calls(&mut a), "nvim_eval", "luaeval");
+        answer(&mut a, fence, Value::from(0), t1);
+        ack(&mut a, 0, "", "n", (0, 0, 0, 0), t1);
+        assert_eq!(base(&a).map(|b| b.seq), Some(0), "the counts tied");
+        a
+    }
+
+    /// The agent's `ack` for [`predicting`]'s window, buffer 1 at
+    /// `b:changedtick` 1 and 50 lines long: `count` keys taken, the last of
+    /// them `tail`, Neovim in `mode`, and the cursor on `line`, from nought,
+    /// at byte `col` wanting display column `want` (-1 for the end of the
+    /// line), the view from line `top` — and that line as wide as the client
+    /// lays it out, where it has it, as Neovim lays out a line with nothing
+    /// drawn between its characters.
+    fn ack(
+        a: &mut App,
+        count: u64,
+        tail: &str,
+        mode: &str,
+        (line, col, want, top): (i64, i64, i64, i64),
+        now: Instant,
+    ) {
+        let width = a.predict.as_ref().and_then(|p| {
+            let width = predict::width(p.text(1000, line)?, p.shape(1000)?);
+            i64::try_from(width).ok()
+        });
+        let params: Vec<Value> = vec![
+            "ack".into(),
+            count.into(),
+            tail.into(),
+            mode.into(),
+            1000.into(),
+            1.into(),
+            1.into(),
+            50.into(),
+            line.into(),
+            col.into(),
+            want.into(),
+            top.into(),
+            0.into(),
+            width.unwrap_or(-1).into(),
+        ];
+        notify(a, "nvmux_client", params, now);
+    }
+
+    /// Neovim's frame for the cursor moved to `line` of [`predicting`]'s
+    /// window, from nought, at byte `col`, the view from line 0.
+    fn cursor_to(line: i64, col: i64) -> Vec<(&'static str, Vec<Value>)> {
+        let n = Value::from;
+        vec![
+            ("grid_cursor_goto", vec![2.into(), n(line), n(col)]),
+            (
+                "win_viewport",
+                vec![
+                    2.into(),
+                    1000.into(),
+                    n(0),
+                    n(6),
+                    n(line),
+                    n(col),
+                    n(50),
+                    n(0),
+                ],
+            ),
+        ]
+    }
+
+    fn base(a: &App) -> Option<&predict::Base> {
+        a.predict.as_ref().and_then(|p| p.base.as_ref())
+    }
+
+    /// The agent is left counting the keys Neovim takes, and a fence reads
+    /// the count, only where the client works out more than the scrolls:
+    /// otherwise it is left and asked as it ever was.
+    #[test]
+    fn the_agent_counts_keys_only_when_asked() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        for (keys, acks, eval) in [
+            (Predictions::default(), false, "0"),
+            (MOTIONS, true, "luaeval('(_G.nvmux_taken or {})[7] or -1')"),
+            (TYPING, true, "luaeval('(_G.nvmux_taken or {})[7] or -1')"),
+            (
+                Predictions {
+                    scrolls: false,
+                    motions: false,
+                    typing: true,
+                },
+                true,
+                "luaeval('(_G.nvmux_taken or {})[7] or -1')",
+            ),
+        ] {
+            let t0 = Instant::now();
+            let mut a = App::new(palette(), Effects::none(), true, (20, 6)).with_predictions(keys);
+            a.start();
+            let sent = calls(&mut a);
+            let rtt = Duration::from_millis(200);
+            let id = request(&sent, "nvim_get_api_info", "");
+            answer(&mut a, id, Value::Array(vec![7.into()]), t0 + rtt);
+            answer(&mut a, asks_uis(&sent), uis(false, false), t0 + rtt);
+            let sent = calls(&mut a);
+            let agent = request(&sent, "nvim_exec_lua", "local chan");
+            let (_, _, args) = sent
+                .iter()
+                .find(|(id, ..)| *id == Some(agent))
+                .expect("agent");
+            let args = args[1].as_array().expect("its arguments");
+            assert_eq!(args[5], acks.into(), "{keys:?}");
+            a.tick(t1);
+            let sent = calls(&mut a);
+            let fence = request(&sent, "nvim_eval", "");
+            let (_, _, args) = sent
+                .iter()
+                .find(|(id, ..)| *id == Some(fence))
+                .expect("fence");
+            assert_eq!(args[0], eval.into(), "{keys:?}");
+        }
+    }
+
+    /// Told to have the agent say what Neovim made of each key, or told not
+    /// to any more, a client predicting attaches again, for the agent it
+    /// leaves to count the keys or not; told what it was told before, it
+    /// stays as it is.
+    #[test]
+    fn a_client_told_to_count_the_keys_or_not_attaches_again_for_the_agent() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = acking(Duration::from_millis(200));
+        let mut d = drawing();
+        d.remote = true;
+        d.client.predict_scrolls = Predict::Auto;
+        d.client.predict_motions = Predict::Auto;
+        a.reconfigure(&d, t1);
+        let sent = calls(&mut a);
+        assert!(
+            !sent.iter().any(|(_, m, _)| m == "nvim_ui_detach"),
+            "as it was"
+        );
+        d.client.predict_motions = Predict::Off;
+        a.reconfigure(&d, t1);
+        let detach = request(&calls(&mut a), "nvim_ui_detach", "");
+        answer(&mut a, detach, Value::Nil, t1);
+        let sent = calls(&mut a);
+        let agent = request(&sent, "nvim_exec_lua", "local chan");
+        let (_, _, args) = sent
+            .iter()
+            .find(|(id, ..)| *id == Some(agent))
+            .expect("agent");
+        assert_eq!(args[1].as_array().expect("its arguments")[5], false.into());
+    }
+
+    /// A fence asked before the agent was left finds no count, and ties
+    /// nothing; the client asks again once the agent is there, rather than
+    /// leave the counts untied till the user pauses after a key it does not
+    /// predict.
+    #[test]
+    fn a_fence_asked_before_the_agent_is_asked_again_once_it_is_there() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let (mut a, agent) = predicting_as(MOTIONS, Duration::from_millis(200));
+        a.tick(t1);
+        let fence = request(&calls(&mut a), "nvim_eval", "luaeval");
+        answer(&mut a, fence, Value::from(-1), t1);
+        a.tick(t1);
+        assert!(
+            calls(&mut a).iter().all(|(_, m, _)| m != "nvim_eval"),
+            "no agent to ask"
+        );
+        let wins = Value::Array(vec![Value::Array(vec![1000.into(), 1.into()])]);
+        let options = Value::Array(vec![2.into(), false.into(), false.into(), wins]);
+        answer(&mut a, agent, options, t1);
+        a.tick(t1);
+        let fence = request(&calls(&mut a), "nvim_eval", "luaeval");
+        answer(&mut a, fence, Value::from(0), t1);
+        let p = a.predict.as_ref().expect("predicting");
+        assert!(p.sync.synced(), "tied");
+        a.tick(t1);
+        assert!(
+            calls(&mut a).iter().all(|(_, m, _)| m != "nvim_eval"),
+            "and asked no more"
+        );
+    }
+
+    /// What the agent says Neovim made of a key is said ahead of the frame
+    /// that draws it, and taken with that frame, not before: Neovim's
+    /// frame is the last word on the screen.
+    #[test]
+    fn an_ack_waits_for_the_frame_it_comes_ahead_of() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = acking(Duration::from_millis(200));
+        a.keys(b"j", t1);
+        ack(&mut a, 1, "j", "n", (1, 0, 0, 0), t1);
+        assert_eq!(base(&a).map(|b| b.seq), Some(0), "no frame yet");
+        redraw(&mut a, cursor_to(1, 0), t1);
+        let b = base(&a).expect("Neovim's word");
+        assert_eq!((b.seq, b.ack.pos.line), (1, 1));
+    }
+
+    /// A key that leaves the screen as it was has an ack and no frame: one
+    /// that says what Neovim has drawn already is taken as it comes.
+    #[test]
+    fn an_ack_that_changes_nothing_on_the_screen_is_taken_at_once() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = acking(Duration::from_millis(200));
+        a.keys(b"k", t1);
+        ack(&mut a, 1, "k", "n", (0, 0, 0, 0), t1);
+        assert_eq!(base(&a).map(|b| b.seq), Some(1));
+        // One that says Neovim is in another mode than it drew waits for
+        // the frame that draws it.
+        a.keys(b"v", t1);
+        ack(&mut a, 2, "v", "v", (0, 0, 0, 0), t1);
+        assert_eq!(base(&a).map(|b| b.seq), Some(1));
+    }
+
+    /// An ack whose frame never came is taken at the fence asked after its
+    /// key, before what the fence says.
+    #[test]
+    fn an_ack_is_taken_at_the_fence_asked_after_it() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = acking(Duration::from_millis(200));
+        a.keys(b"j", t1);
+        let fence = request(&calls(&mut a), "nvim_eval", "luaeval");
+        ack(&mut a, 1, "j", "n", (1, 0, 0, 0), t1);
+        a.keys(b"j", t1);
+        assert_eq!(base(&a).map(|b| b.seq), Some(0));
+        answer(&mut a, fence, Value::from(1), t1);
+        let b = base(&a).expect("Neovim's word");
+        assert_eq!((b.seq, b.ack.pos.line), (1, 1));
+        let p = a.predict.as_ref().expect("predicting");
+        assert!(p.sync.synced(), "a fence with a key after it, in step");
+    }
+
+    /// Where the agent says what Neovim made of each key, the column the
+    /// cursor wants comes with that, and a scroll that takes the cursor to
+    /// another line lands it there: the twin of
+    /// `a_scroll_lands_the_cursor_in_the_column_it_wants`.
+    #[test]
+    fn want_comes_with_the_ack() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let land = |want: i64| {
+            let mut a = acking(Duration::from_millis(200));
+            let text: Vec<String> = (0..20)
+                .map(|n| match n {
+                    0 => "line 0".to_string(),
+                    _ => format!("line {n} and on and on"),
+                })
+                .collect();
+            let lines = vec![
+                "lines".into(),
+                1000.into(),
+                1.into(),
+                1.into(),
+                0.into(),
+                Value::Array(text.iter().map(|t| Value::from(t.as_str())).collect()),
+                true.into(),
+            ];
+            notify(&mut a, "nvmux_client", lines, t1);
+            let mut events = whole(2, 20, 5, &text[..5]);
+            events.push(("grid_cursor_goto", vec![2.into(), 0.into(), 5.into()]));
+            redraw(&mut a, events, t1);
+            ack(&mut a, 0, "", "n", (0, 5, want, 0), t1);
+            a.keys(b"\x1b[<65;3;2M", t1);
+            assert_eq!(top_row(&a), "line 3 and on and on");
+            a.anim.cursor_at(&a.model)
+        };
+        assert_eq!(land(12), (0, 12), "where it wants to be");
+        assert_eq!(land(-1), (0, 19), "as `$` has it");
+    }
+
+    /// Where the client would have put the cursor for the motions typed,
+    /// had it drawn them, is judged against where Neovim says it put it:
+    /// `jjl` as Neovim made it, `j` that Neovim made otherwise, and a key the
+    /// client does not follow.
+    #[test]
+    fn the_shadow_judge_agrees_with_neovim() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = acking(Duration::from_millis(200));
+        let shadow = |a: &App| {
+            let s = a.predict.as_ref().expect("predicting").shadow;
+            (s.agree, s.disagree, s.unknown)
+        };
+        a.keys(b"jjl", t1);
+        ack(&mut a, 3, "jjl", "n", (2, 1, 1, 0), t1);
+        redraw(&mut a, cursor_to(2, 1), t1);
+        assert_eq!(shadow(&a), (1, 0, 0));
+        a.keys(b"j", t1);
+        ack(&mut a, 4, "j", "n", (4, 1, 1, 0), t1);
+        redraw(&mut a, cursor_to(4, 1), t1);
+        assert_eq!(shadow(&a), (1, 1, 0), "not the line Neovim went to");
+        a.keys(b"x", t1);
+        ack(&mut a, 5, "x", "n", (4, 1, 1, 0), t1);
+        redraw(&mut a, cursor_to(4, 1), t1);
+        assert_eq!(shadow(&a), (1, 1, 1));
+    }
+
+    /// An ack that covers a scroll made ahead of Neovim, with a frame that
+    /// does not make it, is Neovim's word that it did not: the view goes back
+    /// to Neovim's then and there, not at the scroll's deadline — and it is
+    /// counted.
+    #[test]
+    fn a_scroll_neovim_did_not_make_is_given_up_at_its_ack() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = acking(Duration::from_millis(200));
+        a.keys(b"\x1b[<65;3;2M", t1);
+        assert_eq!(a.anim.ahead(2), (3, 3));
+        ack(&mut a, 1, "<ScrollWheelDown>", "n", (0, 0, 0, 0), t1);
+        redraw(&mut a, cursor_to(0, 0), t1);
+        let p = a.predict.as_ref().expect("predicting");
+        assert_eq!(p.shadow.unmade, 1);
+        assert_eq!(a.anim.ahead(2), (0, 0), "given up");
+        assert_eq!(top_row(&a), "line 0");
+        // One its frame made only part of is not the one Neovim made.
+        a.keys(b"2\x05", t1);
+        assert_eq!(a.anim.ahead(2), (2, 2));
+        ack(&mut a, 3, "2<C-E>", "n", (1, 0, 0, 1), t1);
+        let mut events = vec![at(1, 1, 1)];
+        events.extend((0..5).map(|r| line(2, r, &format!("line {}", r + 1))));
+        redraw(&mut a, events, t1);
+        assert_eq!(a.anim.ahead(2), (0, 0), "a line of the two");
+        assert_eq!(top_row(&a), "line 1");
+    }
+
+    /// A scroll typed after a key the client does not follow is made once
+    /// the agent says where that key left the cursor — with the frame that
+    /// draws it — not once Neovim has caught up with every key typed.
+    #[test]
+    fn a_scroll_after_a_key_left_to_neovim_lands_with_its_ack() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = acking(Duration::from_millis(200));
+        a.keys(b"j\x05", t1);
+        assert_eq!(top_row(&a), "line 0", "blind after `j`");
+        ack(&mut a, 1, "j", "n", (1, 0, 0, 0), t1);
+        redraw(&mut a, cursor_to(1, 0), t1);
+        assert_eq!(top_row(&a), "line 1", "made with its ack");
+        assert_eq!(a.anim.ahead(2), (1, 0));
+        // And Neovim's own, when it comes, lands it.
+        ack(&mut a, 2, "j<C-E>", "n", (1, 0, 0, 1), t1);
+        let mut events = vec![at(1, 1, 1)];
+        events.extend((0..5).map(|r| line(2, r, &format!("line {}", r + 1))));
+        redraw(&mut a, events, t1);
+        assert_eq!(a.anim.ahead(2), (0, 0));
+        assert_eq!(top_row(&a), "line 1");
+    }
+
+    /// A settings card that leaves the keys the client works out as they
+    /// were — any change of the settings sends one — leaves it blind to a
+    /// key it could not follow, as it was: a scroll typed after that key
+    /// waits for its ack still, which made from Neovim's word before it
+    /// would scroll from the wrong line.
+    #[test]
+    fn a_settings_card_leaves_the_client_blind_as_it_was() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = acking(Duration::from_millis(200));
+        a.keys(b"j", t1);
+        let mut d = drawing();
+        d.remote = true;
+        d.client.predict_scrolls = Predict::Auto;
+        d.client.predict_motions = Predict::Auto;
+        a.reconfigure(&d, t1);
+        a.keys(b"\x05", t1);
+        assert_eq!(top_row(&a), "line 0", "blind after `j`");
+        ack(&mut a, 1, "j", "n", (1, 0, 0, 0), t1);
+        redraw(&mut a, cursor_to(1, 0), t1);
+        assert_eq!(top_row(&a), "line 1", "made with its ack");
+    }
+
+    /// Made out again from an ack, a scroll still ahead of Neovim is one
+    /// made already, and is not made a second time: here the agent says
+    /// something moved the cursor before Neovim took the key.
+    #[test]
+    fn a_scroll_already_made_is_not_made_again() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = acking(Duration::from_millis(200));
+        a.keys(b"\x05", t1);
+        assert_eq!(a.anim.ahead(2), (1, 1));
+        ack(&mut a, 0, "", "n", (0, 3, 3, 0), t1);
+        redraw(&mut a, cursor_to(0, 3), t1);
+        let b = base(&a).expect("Neovim's word");
+        assert_eq!((b.seq, b.ack.pos.byte), (0, 3));
+        assert_eq!(a.anim.ahead(2), (1, 1), "the one scroll");
+    }
+
+    /// An ack whose own frame never came — Neovim went on to the next key
+    /// before it flushed — is taken with the next frame, which draws more
+    /// than the ack covers: what that frame made already is not made again
+    /// on top of it, and the client is blind till an ack comes with its own.
+    #[test]
+    fn a_word_taken_with_a_later_frame_makes_nothing_again() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = acking(Duration::from_millis(200));
+        a.keys(b"j\x05", t1);
+        ack(&mut a, 1, "j", "n", (1, 0, 0, 0), t1);
+        let mut events = vec![
+            at(1, 1, 1),
+            ("grid_cursor_goto", vec![2.into(), 0.into(), 0.into()]),
+        ];
+        events.extend((0..5).map(|r| line(2, r, &format!("line {}", r + 1))));
+        redraw(&mut a, events, t1);
+        assert_eq!(base(&a).map(|b| b.seq), Some(1));
+        assert_eq!(a.anim.ahead(2), (0, 0), "not made again");
+        assert_eq!(top_row(&a), "line 1");
+        let p = a.predict.as_ref().expect("predicting");
+        assert!(!p.known(), "blind");
+        ack(&mut a, 2, "j<C-E>", "n", (1, 0, 0, 1), t1);
+        assert!(a.predict.as_ref().is_some_and(Predictor::known));
+    }
+
+    /// Where the agent says nothing of a key — the link stalled, or Neovim
+    /// at work on something else — a scroll made of it is given up at its
+    /// deadline, as it is without acks.
+    #[test]
+    fn a_scroll_no_ack_covers_is_given_up_at_its_deadline() {
+        let ms = Duration::from_millis;
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = acking(ms(200));
+        a.keys(b"\x1b[<65;3;2M", t1);
+        let made = a.predict.as_ref().expect("predicting").deadline(t1);
+        a.frame(made - ms(1));
+        assert_eq!(a.anim.ahead(2), (3, 3));
+        a.frame(made);
+        assert_eq!(a.anim.ahead(2), (0, 0), "not heard from");
+    }
+
+    /// [`acking`], the agent having said the window's shape as it does
+    /// where it says what Neovim made of each key — `'whichwrap'` and the
+    /// rest of [`predict::Stepping`] after the rest — `mapped` among the keys
+    /// it says something maps: the cursor moved ahead of Neovim along its
+    /// line, `line 0` of `line 0` to `line 19`.
+    fn stepping_with(rtt: Duration, mapped: &[&str]) -> App {
+        stepping_as(MOTIONS, rtt, mapped)
+    }
+
+    /// [`stepping_with`], working out `predictions` ahead of Neovim.
+    fn stepping_as(predictions: Predictions, rtt: Duration, mapped: &[&str]) -> App {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = acking_as(predictions, rtt);
+        let shape: Vec<Value> = vec![
+            1.into(),
+            50.into(),
+            0.into(),
+            8.into(),
+            false.into(),
+            false.into(),
+            true.into(),
+            false.into(),
+            0.into(),
+            true.into(),
+            0.into(),
+            3.into(),
+            "~".into(),
+            false.into(),
+            "".into(),
+            2.into(),
+            0.into(),
+            false.into(),
+            Value::Array(mapped.iter().map(|k| Value::from(*k)).collect()),
+            Value::Array(vec![]),
+            0.into(),
+            1.into(),
+            6.into(),
+            Value::Array(vec![]),
+            false.into(),
+            "b,s".into(),
+            "".into(),
+            false.into(),
+            false.into(),
+            false.into(),
+            false.into(),
+        ];
+        notify(
+            &mut a,
+            "nvmux_client",
+            vec!["shape".into(), 1000.into(), Value::Array(shape)],
+            t1,
+        );
+        a
+    }
+
+    fn stepping(rtt: Duration) -> App {
+        stepping_with(rtt, &[])
+    }
+
+    /// The shape the agent says of [`stepping`]'s window where it says what
+    /// Neovim made of each key: its gutter `textoff` wide, `'number'` and
+    /// `'relativenumber'` as `numbers` says, and the window drawn by
+    /// `'statuscolumn'` where not `plain`; `'wrap'`; `'cursorline'` as
+    /// `cul` has it (see [`predict::Cursorline`]); and `mapped` among the
+    /// keys something maps, `idioms` how (see [`predict::Idiom`]).
+    fn shaped(
+        textoff: i64,
+        (number, relative, plain): (bool, bool, bool),
+        (wrap, cul): (bool, i64),
+        mapped: &[&str],
+        idioms: Vec<Value>,
+    ) -> Vec<Value> {
+        vec![
+            1.into(),
+            50.into(),
+            textoff.into(),
+            8.into(),
+            number.into(),
+            relative.into(),
+            plain.into(),
+            wrap.into(),
+            0.into(),
+            true.into(),
+            0.into(),
+            3.into(),
+            "~".into(),
+            false.into(),
+            "".into(),
+            2.into(),
+            0.into(),
+            false.into(),
+            Value::Array(mapped.iter().map(|k| Value::from(*k)).collect()),
+            Value::Array(vec![]),
+            0.into(),
+            1.into(),
+            6.into(),
+            Value::Array(vec![]),
+            false.into(),
+            "b,s".into(),
+            "".into(),
+            false.into(),
+            false.into(),
+            false.into(),
+            false.into(),
+            4.into(),
+            false.into(),
+            cul.into(),
+            Value::Array(idioms),
+        ]
+    }
+
+    /// The agent says window 1000's shape is `shape`.
+    fn reshape(a: &mut App, shape: Vec<Value>, now: Instant) {
+        let params = vec!["shape".into(), 1000.into(), Value::Array(shape)];
+        notify(a, "nvmux_client", params, now);
+    }
+
+    /// The groups Neovim draws a gutter in, as `hl_group_set` names them
+    /// for these tests.
+    const GUTTER: [(&str, u64); 8] = [
+        ("LineNr", 10),
+        ("LineNrAbove", 11),
+        ("LineNrBelow", 12),
+        ("CursorLineNr", 13),
+        ("SignColumn", 14),
+        ("CursorLineSign", 15),
+        ("FoldColumn", 16),
+        ("CursorLineFold", 17),
+    ];
+
+    /// What Neovim draws of [`numbered`]'s window with the cursor on line
+    /// `cursor` at byte `byte`: each row's number, `'number'` and
+    /// `'relativenumber'` both on, in the group its place takes — the
+    /// cursor's in `CursorLineNr` if `cul` — but for the rows `numhl` says,
+    /// in a sign's colours, 20; the rows' text after it; the cursor, and
+    /// the view.
+    fn numbers_drawn(
+        (cursor, byte): (i64, i64),
+        cul: bool,
+        numhl: &[i64],
+    ) -> Vec<(&'static str, Vec<Value>)> {
+        let n = Value::from;
+        let mut events = Vec::new();
+        for r in 0..5i64 {
+            let (number, hl) = match r.cmp(&cursor) {
+                std::cmp::Ordering::Equal => (format!("{:<3} ", r + 1), if cul { 13 } else { 10 }),
+                std::cmp::Ordering::Less => (format!("{:>3} ", cursor - r), 11),
+                std::cmp::Ordering::Greater => (format!("{:>3} ", r - cursor), 12),
+            };
+            let hl = if numhl.contains(&r) { 20 } else { hl };
+            events.push(line_hl(2, r as u64, 0, &number, hl));
+            events.push(line_hl(
+                2,
+                r as u64,
+                4,
+                &format!("{:16}", format!("line {r}")),
+                0,
+            ));
+        }
+        events.push(("grid_cursor_goto", vec![n(2), n(cursor), n(4 + byte)]));
+        events.push((
+            "win_viewport",
+            vec![n(2), n(1000), n(0), n(6), n(cursor), n(byte), n(50), n(0)],
+        ));
+        events
+    }
+
+    /// [`stepping`]'s window with `'number'` and `'relativenumber'` on, its
+    /// gutter four columns wide, `'cursorline'` as `cul` has it, and rows
+    /// `numhl` with a sign's number in its colours: as Neovim draws it with
+    /// the cursor on line 0, the groups named.
+    fn numbered(rtt: Duration, cul: i64, numhl: &[i64]) -> App {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(rtt);
+        reshape(
+            &mut a,
+            shaped(4, (true, true, true), (false, cul), &[], vec![]),
+            t1,
+        );
+        let mut events: Vec<(&str, Vec<Value>)> = GUTTER
+            .iter()
+            .map(|(name, id)| ("hl_group_set", vec![(*name).into(), (*id).into()]))
+            .collect();
+        events.extend(numbers_drawn((0, 0), cul & 1 != 0, numhl));
+        redraw(&mut a, events, t1);
+        a
+    }
+
+    /// The rows of the screen as the next frame puts them together, a row to
+    /// a line.
+    fn composed(a: &mut App) -> Vec<String> {
+        let f = composed_frame(a);
+        f.text().lines().map(|l| l.trim_end().to_string()).collect()
+    }
+
+    /// The frame the next frame puts together.
+    fn composed_frame(a: &mut App) -> compose::Frame {
+        a.repaint();
+        let (cols, rows) = a.size();
+        compose::compose(&a.model, &a.anim, cols, rows)
+    }
+
+    /// The groups the gutter is drawn over in on each row of grid 2, as the
+    /// cursor moved ahead of Neovim has it: none for a row drawn as Neovim
+    /// drew it.
+    fn repainted(a: &mut App) -> Vec<Option<Vec<u32>>> {
+        a.repaint();
+        let patches = a.anim.patches(2).cloned().unwrap_or_default();
+        (0..5)
+            .map(|r| {
+                patches.get(&r).map(|p| {
+                    p.iter()
+                        .flat_map(|p| p.cells.iter().map(|c| c.hl))
+                        .collect()
+                })
+            })
+            .collect()
+    }
+
+    /// `j` over a slow link moves the cursor a line down at once, and with
+    /// it every number of `'relativenumber'`, the cursor's line's now the
+    /// line's own, aligned left: each in the group Neovim draws it in. Its
+    /// frame, when it comes with the agent's word that it made it so, is
+    /// the same; and so for the rest of the motions to another line.
+    #[test]
+    fn j_moves_the_cursor_at_once_and_renumbers_the_gutter() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = numbered(Duration::from_millis(200), 0, &[]);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (1, 4), "before Neovim has heard of it");
+        let rows = [
+            "  1 line 0",
+            "2   line 1",
+            "  1 line 2",
+            "  2 line 3",
+            "  3 line 4",
+        ];
+        assert_eq!(composed(&mut a)[..5], rows);
+        let groups = repainted(&mut a);
+        assert_eq!(
+            groups,
+            [
+                Some(vec![11; 4]),
+                Some(vec![10; 4]),
+                Some(vec![12; 4]),
+                Some(vec![12; 4]),
+                Some(vec![12; 4]),
+            ]
+        );
+        ack(&mut a, 1, "j", "n", (1, 0, 0, 0), t1);
+        redraw(&mut a, numbers_drawn((1, 0), false, &[]), t1);
+        assert!(a.anim.chain(2).is_none(), "let go of");
+        assert_eq!(composed(&mut a)[..5], rows, "as Neovim draws it");
+        // Each of the motions to another line.
+        for (keys, at, second) in [
+            (&b"3j"[..], (3, 4), "  2 line 1"),
+            (b"jjk", (1, 4), "2   line 1"),
+            (b"4j2k", (2, 4), "  1 line 1"),
+            (b"+", (1, 4), "2   line 1"),
+            (b"\r\r", (2, 4), "  1 line 1"),
+            (b"jj-", (1, 4), "2   line 1"),
+            (b"3_", (2, 4), "  1 line 1"),
+            (b"2$", (1, 9), "2   line 1"),
+            (b"$ ", (1, 4), "2   line 1"),
+            (b"j\x7f", (0, 9), "  1 line 1"),
+        ] {
+            let mut a = numbered(Duration::from_millis(200), 0, &[]);
+            a.keys(keys, t1);
+            let name = String::from_utf8_lossy(keys);
+            assert_eq!(drawn(&a), at, "{name:?}");
+            assert_eq!(composed(&mut a)[1], second, "{name:?}");
+        }
+    }
+
+    /// A number Neovim draws in a sign's colours, not its own group's, is
+    /// the sign's to keep: the number on its row moves on, in its colours.
+    /// Where `'cursorline'` numbers the cursor's line, Neovim lays them over
+    /// that line's own, which the client has no id for: a move onto such a
+    /// line, or off it, is left to Neovim.
+    #[test]
+    fn a_numhl_number_is_kept() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = numbered(Duration::from_millis(200), 0, &[3]);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (1, 4));
+        assert_eq!(composed(&mut a)[3], "  2 line 3");
+        assert_eq!(repainted(&mut a)[3], Some(vec![20; 4]), "its colours");
+        let mut a = numbered(Duration::from_millis(200), 1, &[3]);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (1, 4), "another line's");
+        let groups = repainted(&mut a);
+        assert_eq!(
+            (groups[0].clone(), groups[1].clone(), groups[3].clone()),
+            (Some(vec![11; 4]), Some(vec![13; 4]), Some(vec![20; 4]))
+        );
+        let mut a = numbered(Duration::from_millis(200), 1, &[1]);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (0, 4), "onto it");
+    }
+
+    /// A frame of Neovim's that draws a line the cursor was moved onto
+    /// otherwise — between its characters — lets go of the steps; one that
+    /// draws another line, or numbers the gutter afresh, as Neovim's frames
+    /// for the keys before the last do, leaves them drawn.
+    #[test]
+    fn a_frame_lets_go_of_the_steps_only_where_it_draws_a_line_gone_onto_otherwise() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = numbered(Duration::from_millis(200), 0, &[]);
+        a.keys(b"jj", t1);
+        assert_eq!(drawn(&a), (2, 4));
+        redraw(&mut a, numbers_drawn((1, 0), false, &[]), t1);
+        assert_eq!(drawn(&a), (2, 4), "Neovim's frame for the first, unsaid");
+        assert_eq!(
+            composed(&mut a)[..3],
+            ["  2 line 0", "  1 line 1", "3   line 2"]
+        );
+        redraw(&mut a, vec![line_at(2, 4, 4, "lime 4")], t1);
+        assert_eq!(drawn(&a), (2, 4), "another line");
+        redraw(&mut a, vec![line_at(2, 1, 4, "li: ne 1")], t1);
+        assert!(a.anim.chain(2).is_none(), "a line gone onto");
+        assert_eq!(drawn(&a), (1, 4), "where Neovim has it");
+        assert_eq!(
+            composed(&mut a)[..3],
+            ["  1 line 0", "2   li: ne 1", "  1 line 2"]
+        );
+    }
+
+    /// `CursorLine` as these tests have Neovim define it, its id `id`: a
+    /// background alone, or with a colour in front as well.
+    fn bar_defined(id: u64, front: bool) -> Vec<(&'static str, Vec<Value>)> {
+        let mut rgb = vec![("background".into(), 0x30_30_30.into())];
+        if front {
+            rgb.push(("foreground".into(), 0xff_ff_ff.into()));
+        }
+        vec![
+            (
+                "hl_attr_define",
+                vec![
+                    id.into(),
+                    Value::Map(rgb),
+                    Value::Map(vec![]),
+                    Value::Array(vec![]),
+                ],
+            ),
+            ("hl_group_set", vec!["CursorLine".into(), id.into()]),
+        ]
+    }
+
+    /// The text of row `row` of [`numbered`]'s window, `line N`, under
+    /// `'cursorline'`'s bar, `CursorLine` laid over nothing: id 21.
+    fn barred(row: u64) -> (&'static str, Vec<Value>) {
+        line_hl(2, row, 4, &format!("{:16}", format!("line {row}")), 21)
+    }
+
+    /// `'cursorline'` drawing a bar across the cursor's line, a background
+    /// alone, and numbering it: `j` takes the bar off the line the cursor
+    /// leaves and lays it under the one it goes to, each row's text as
+    /// Neovim drew it, and the cursor's number goes with it — every cell of
+    /// the window as Neovim's frame for the key has it, in its colours.
+    #[test]
+    fn the_bar_moves_with_the_cursor() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        for keys in [&b"j"[..], b"3j", b"jjk"] {
+            let mut a = numbered(Duration::from_millis(200), 3, &[]);
+            let mut bar = bar_defined(21, false);
+            bar.push(barred(0));
+            redraw(&mut a, bar, t1);
+            a.keys(keys, t1);
+            let line = drawn(&a).0;
+            assert_ne!(
+                line,
+                0,
+                "{:?} before Neovim has heard of it",
+                String::from_utf8_lossy(keys)
+            );
+            let predicted = composed_frame(&mut a);
+            let mut neovim = numbers_drawn((line, 0), true, &[]);
+            neovim.push(barred(line as u64));
+            ack(&mut a, keys.len() as u64, "", "n", (line, 0, 0, 0), t1);
+            redraw(&mut a, neovim, t1);
+            assert!(a.anim.chain(2).is_none(), "let go of");
+            let drawn_by_neovim = composed_frame(&mut a);
+            assert_eq!(predicted.text(), drawn_by_neovim.text());
+            for (i, (p, n)) in predicted
+                .cells
+                .iter()
+                .zip(&drawn_by_neovim.cells)
+                .enumerate()
+            {
+                assert_eq!(
+                    p.style,
+                    n.style,
+                    "{keys:?}: row {}, column {}",
+                    i / 20,
+                    i % 20
+                );
+            }
+        }
+    }
+
+    /// A bar the client cannot lay under a line and take off as Neovim
+    /// does — one with a colour in front of its own, which Neovim lays over
+    /// the line instead; one the editor has not named; one across the row
+    /// of the line the cursor is on alone — leaves the motions to another
+    /// line to Neovim; those along it are drawn. So does a `'statuscolumn'`,
+    /// which may draw anything the cursor's line decides.
+    #[test]
+    fn a_bar_the_client_cannot_lay_refuses_line_changing_moves() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        for (cul, front) in [(2, true), (3, true), (4, false)] {
+            let mut a = numbered(Duration::from_millis(200), cul, &[]);
+            redraw(&mut a, bar_defined(21, front), t1);
+            a.keys(b"j", t1);
+            assert_eq!(drawn(&a), (0, 4), "'cursorlineopt' {cul}");
+            let mut a = numbered(Duration::from_millis(200), cul, &[]);
+            redraw(&mut a, bar_defined(21, front), t1);
+            a.keys(b"l", t1);
+            assert_eq!(drawn(&a), (0, 5), "along the line, {cul}");
+        }
+        let mut a = numbered(Duration::from_millis(200), 2, &[]);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (0, 4), "no CursorLine named");
+        let mut a = numbered(Duration::from_millis(200), 2, &[]);
+        redraw(&mut a, bar_defined(21, false), t1);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (1, 4), "a background alone");
+        let mut a = numbered(Duration::from_millis(200), 0, &[]);
+        reshape(
+            &mut a,
+            shaped(4, (true, true, false), (false, 0), &[], vec![]),
+            t1,
+        );
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (0, 4), "'statuscolumn'");
+    }
+
+    /// A motion that would take the cursor out of the view, which Neovim
+    /// scrolls to keep it in, is left to Neovim where the agent has not said
+    /// how far `'scrolljump'` scrolls it (see [`scrolling`]); one to the
+    /// view's last row is drawn.
+    #[test]
+    fn a_motion_past_the_edge_is_left_to_neovim_without_scrolljump() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        for (keys, at) in [
+            (&b"5j"[..], (0, 0)),
+            (b"4j", (4, 0)),
+            (b"4jj", (4, 0)),
+            (b"k", (0, 0)),
+            (b"40 ", (0, 0)),
+            (b"6$", (0, 0)),
+        ] {
+            let mut a = stepping(Duration::from_millis(200));
+            a.keys(keys, t1);
+            assert_eq!(drawn(&a), at, "{:?}", String::from_utf8_lossy(keys));
+        }
+    }
+
+    /// [`stepping`], the agent having said all it says of the window where
+    /// it says what Neovim made of each key — `'scrolljump'` one, no text
+    /// concealed on any line — and that no line about the view has virtual
+    /// text among its characters: a motion past the edge of the view
+    /// scrolls it ahead of Neovim, and a key that scrolls is a step.
+    fn scrolling(rtt: Duration) -> App {
+        scrolling_as(
+            rtt,
+            shaped(0, (false, false, true), (false, 0), &[], vec![]),
+        )
+    }
+
+    /// [`scrolling`], the window shaped as `shape` says (see [`shaped`]).
+    fn scrolling_as(rtt: Duration, mut shape: Vec<Value>) -> App {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(rtt);
+        shape.extend([
+            false.into(),
+            false.into(),
+            Value::Array(vec![]),
+            1.into(),
+            false.into(),
+        ]);
+        reshape(&mut a, shape, t1);
+        decorated(&mut a, &[], t1);
+        a
+    }
+
+    /// The agent says of [`stepping`]'s window that of its lines from 0 to
+    /// 20, `lines` have virtual text or signs.
+    fn decorated(a: &mut App, lines: &[i64], now: Instant) {
+        let runs = lines
+            .iter()
+            .flat_map(|l| [Value::from(*l), Value::from(l + 1)]);
+        let params = vec![
+            "decorated".into(),
+            1000.into(),
+            0.into(),
+            20.into(),
+            Value::Array(runs.collect()),
+        ];
+        notify(a, "nvmux_client", params, now);
+    }
+
+    /// Neovim's frame for [`stepping`]'s view of `line N`s scrolled `by`
+    /// rows, fewer than five, from line `from`: the rows it brings in drawn,
+    /// the cursor on line `cursor` at byte `col`.
+    fn scrolled(from: i64, by: i64, (cursor, col): (i64, i64)) -> Vec<(&'static str, Vec<Value>)> {
+        let n = Value::from;
+        let to = from + by;
+        let mut events = vec![(
+            "grid_scroll",
+            vec![n(2), n(0), n(5), n(0), n(20), n(by), n(0)],
+        )];
+        let brought: Vec<i64> = if by > 0 {
+            (5 - by..5).collect()
+        } else {
+            (0..-by).collect()
+        };
+        for r in brought {
+            let text = format!("{:20}", format!("line {}", to + r));
+            events.push(line(2, r as u64, &text));
+        }
+        events.push(("grid_cursor_goto", vec![n(2), n(cursor - to), n(col)]));
+        events.push((
+            "win_viewport",
+            vec![
+                n(2),
+                n(1000),
+                n(to),
+                n(to + 6),
+                n(cursor),
+                n(col),
+                n(50),
+                n(by),
+            ],
+        ));
+        events
+    }
+
+    /// `j` on the view's last row scrolls the view a line ahead of Neovim
+    /// with the cursor: one scroll ahead, and one step, which goes on from
+    /// it. Neovim's frame for it, scrolled as far, with its word that it
+    /// left the cursor there, makes them both, and the screen stays as it
+    /// was drawn.
+    #[test]
+    fn j_at_the_bottom_scrolls_with_the_cursor() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = scrolling(Duration::from_millis(200));
+        a.keys(b"4j", t1);
+        assert_eq!((drawn(&a), a.anim.ahead(2)), ((4, 0), (0, 0)), "in view");
+        a.keys(b"j", t1);
+        assert_eq!(top_row(&a), "line 1", "before Neovim has heard of it");
+        assert_eq!(drawn(&a), (4, 0));
+        assert_eq!(a.anim.ahead(2), (1, 1));
+        let head = a.anim.chain(2).and_then(|c| c.head()).map(|s| s.pos);
+        assert_eq!(head.map(|p| (p.line, p.top)), Some((5, 1)));
+        let predicted = composed(&mut a);
+        ack(&mut a, 3, "j", "n", (5, 0, 0, 1), t1);
+        redraw(&mut a, scrolled(0, 1, (5, 0)), t1);
+        assert!(a.anim.chain(2).is_none(), "made");
+        assert_eq!(a.anim.ahead(2), (0, 0), "made");
+        assert_eq!(composed(&mut a), predicted);
+        assert_eq!(drawn(&a), (4, 0));
+        let p = a.predict.as_ref().expect("predicting");
+        assert_eq!(p.shadow.disagree, 0);
+    }
+
+    /// A page after motions goes from where they left the cursor, not from
+    /// Neovim's: the view half a window on from where it is, the cursor as
+    /// far down from the line the motions took it to. And Neovim's frames
+    /// for the motions, then for the page, make each in turn.
+    #[test]
+    fn pages_after_motions_start_where_they_left_the_cursor() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = scrolling(Duration::from_millis(200));
+        // `'scroll'` is 2.
+        a.keys(b"jjjj\x04", t1);
+        assert_eq!(top_row(&a), "line 2", "before Neovim has heard of it");
+        assert_eq!(drawn(&a), (4, 0), "on line 6");
+        assert_eq!(a.anim.ahead(2), (2, 2));
+        assert_eq!(a.anim.chain(2).map(chain::Chain::len), Some(5));
+        ack(&mut a, 4, "j", "n", (4, 0, 0, 0), t1);
+        redraw(&mut a, cursor_to(4, 0), t1);
+        assert_eq!(a.anim.chain(2).map(chain::Chain::len), Some(1));
+        assert_eq!((top_row(&a), drawn(&a)), ("line 2".into(), (4, 0)));
+        ack(&mut a, 5, "<C-D>", "n", (6, 0, 0, 2), t1);
+        redraw(&mut a, scrolled(0, 2, (6, 0)), t1);
+        assert!(a.anim.chain(2).is_none(), "made");
+        assert_eq!(a.anim.ahead(2), (0, 0));
+        assert_eq!((top_row(&a), drawn(&a)), ("line 2".into(), (4, 0)));
+    }
+
+    /// Motions after a page go on from where it left the cursor, in the
+    /// view it scrolled ahead of Neovim: as Neovim makes them once its
+    /// frame for the page has come, and with it.
+    #[test]
+    fn motions_after_a_page() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = scrolling(Duration::from_millis(200));
+        a.keys(b"\x04jj", t1);
+        assert_eq!(top_row(&a), "line 2", "before Neovim has heard of it");
+        assert_eq!(drawn(&a), (2, 0), "on line 4");
+        assert_eq!(a.anim.ahead(2), (2, 2));
+        ack(&mut a, 1, "<C-D>", "n", (2, 0, 0, 2), t1);
+        redraw(&mut a, scrolled(0, 2, (2, 0)), t1);
+        assert_eq!(a.anim.chain(2).map(chain::Chain::len), Some(2));
+        assert_eq!((top_row(&a), drawn(&a)), ("line 2".into(), (2, 0)));
+        ack(&mut a, 3, "j", "n", (4, 0, 0, 2), t1);
+        let n = Value::from;
+        redraw(
+            &mut a,
+            vec![("grid_cursor_goto", vec![n(2), n(2), n(0)]), at(2, 4, 0)],
+            t1,
+        );
+        assert!(a.anim.chain(2).is_none(), "made");
+        assert_eq!((top_row(&a), drawn(&a)), ("line 2".into(), (2, 0)));
+    }
+
+    /// The motions without the scrolls: a motion is drawn at once, and a key
+    /// that scrolls, or a turn of the wheel, waits for Neovim, as any other
+    /// key the client does not follow. The scrolls without the motions —
+    /// the typing on, for the agent to say what Neovim made of each key —
+    /// the other way about.
+    #[test]
+    fn the_motions_and_the_scrolls_are_switched_apart() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let apart = |scrolls: bool, motions: bool| {
+            let mut a = scrolling(Duration::from_millis(200));
+            let p = a.predict.as_mut().expect("predicting");
+            p.set_predictions(Predictions {
+                scrolls,
+                motions,
+                typing: !motions,
+            });
+            assert!(p.acks());
+            a
+        };
+        let mut a = apart(false, true);
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 1), "a motion before Neovim has heard of it");
+        a.keys(b"\x05", t1);
+        assert_eq!((top_row(&a), a.anim.ahead(2)), ("line 0".into(), (0, 0)));
+        let mut a = apart(false, true);
+        a.keys(b"\x1b[<65;3;2M", t1);
+        assert_eq!((top_row(&a), a.anim.ahead(2)), ("line 0".into(), (0, 0)));
+        let mut a = apart(true, false);
+        a.keys(b"\x1b[<65;3;2M", t1);
+        assert_eq!(top_row(&a), "line 3", "the wheel with the scrolls");
+
+        let mut a = apart(true, false);
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 0), "a motion left to Neovim");
+        let mut a = apart(true, false);
+        a.keys(b"\x05", t1);
+        assert_eq!(
+            top_row(&a),
+            "line 1",
+            "a scroll before Neovim has heard of it"
+        );
+    }
+
+    /// A page past the lines the client has is made, and held till they
+    /// come, as it always was: with no step before it, a scroll alone; after
+    /// pages made as steps, those let go of as steps and kept as the
+    /// scrolls they made, which go on drawing the cursor where they did. A
+    /// motion after it waits for Neovim.
+    #[test]
+    fn a_held_page_with_no_chain_still_waits_for_its_lines() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        // Of the lines up to 20 the client has, pages of three rows up to
+        // the 15th's are all there.
+        for (keys, made) in [
+            (&b"\x06\x06\x06\x06\x06\x06"[..], Some(5)),
+            (b"6\x06", None),
+        ] {
+            let mut a = scrolling(Duration::from_millis(200));
+            a.keys(&keys[..keys.len() - 1], t1);
+            assert_eq!(a.anim.chain(2).map(chain::Chain::len), made);
+            a.keys(&keys[keys.len() - 1..], t1);
+            assert_eq!(
+                top_row(&a),
+                if made.is_some() { "line 15" } else { "line 0" }
+            );
+            assert!(a.anim.chain(2).is_none(), "{keys:?}: a scroll alone");
+            assert_eq!(a.anim.ahead(2), (18, 18), "{keys:?}");
+            a.keys(b"j", t1);
+            assert!(a.anim.chain(2).is_none(), "{keys:?}: the motion waits");
+            let text: Vec<Value> = (20..40).map(|n| Value::from(format!("line {n}"))).collect();
+            let params = vec![
+                "lines".into(),
+                1000.into(),
+                1.into(),
+                1.into(),
+                20.into(),
+                Value::Array(text),
+                false.into(),
+            ];
+            notify(&mut a, "nvmux_client", params, t1);
+            assert_eq!(
+                top_row(&a),
+                "line 18",
+                "{keys:?}: drawn once its lines came"
+            );
+            assert_eq!(drawn(&a), (0, 0), "{keys:?}");
+        }
+    }
+
+    /// A count given `<C-d>` is the window's `'scroll'` from then on: a shape
+    /// the agent said before Neovim took the key, which has the `'scroll'`
+    /// Neovim had before it, does not undo that for the pages after it —
+    /// till Neovim's word on the key, from which the shapes are Neovim's.
+    #[test]
+    fn a_scroll_counted_outlives_a_shape_said_before_neovim_took_it() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let stale = || {
+            let mut shape = shaped(0, (false, false, true), (false, 0), &[], vec![]);
+            let rest: [Value; 5] = [
+                false.into(),
+                false.into(),
+                Value::Array(vec![]),
+                1.into(),
+                false.into(),
+            ];
+            shape.extend(rest);
+            shape
+        };
+        let mut a = scrolling(Duration::from_millis(200));
+        a.keys(b"3\x04", t1);
+        assert_eq!(a.anim.ahead(2), (3, 3));
+        reshape(&mut a, stale(), t1);
+        a.keys(b"\x04", t1);
+        assert_eq!(a.anim.ahead(2), (6, 6), "three more, not two");
+        ack(&mut a, 2, "3<C-D>", "n", (3, 0, 0, 3), t1);
+        redraw(&mut a, scrolled(0, 3, (3, 0)), t1);
+        ack(&mut a, 3, "3<C-D><C-D>", "n", (6, 0, 0, 6), t1);
+        redraw(&mut a, scrolled(3, 3, (6, 0)), t1);
+        assert!(a.anim.chain(2).is_none(), "made");
+        reshape(&mut a, stale(), t1);
+        a.keys(b"\x04", t1);
+        assert_eq!(a.anim.ahead(2), (2, 2), "as Neovim's word has it");
+    }
+
+    /// A page back from a view whose first line is the buffer's last, or the
+    /// one before — which Neovim pages back from further than from
+    /// elsewhere, keeping fewer of the lines it showed — is left to Neovim;
+    /// one from a line further up is made, as ever.
+    #[test]
+    fn a_page_back_from_the_end_of_the_buffer_is_left_to_neovim() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        for (top, made) in [(49, false), (48, false), (47, true)] {
+            let mut a = scrolling(Duration::from_millis(200));
+            let n = Value::from;
+            let events = vec![
+                ("grid_cursor_goto", vec![n(2), n(0), n(0)]),
+                (
+                    "win_viewport",
+                    vec![n(2), n(1000), n(top), n(51), n(top), n(0), n(50), n(0)],
+                ),
+            ];
+            redraw(&mut a, events, t1);
+            ack(&mut a, 0, "", "n", (top, 0, 0, top), t1);
+            a.keys(b"\x02", t1);
+            assert_eq!(a.anim.ahead(2) != (0, 0), made, "from line {top}");
+        }
+    }
+
+    /// A line the scroll ahead would bring into view that the agent says
+    /// has virtual text or a sign, which the client would draw without it,
+    /// leaves the motion to Neovim: the view stays as Neovim has it, and the
+    /// cursor on its last row.
+    #[test]
+    fn a_line_with_virtual_text_or_a_sign_is_not_scrolled_into_view() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = scrolling(Duration::from_millis(200));
+        decorated(&mut a, &[3, 5], t1);
+        a.keys(b"4jj", t1);
+        assert_eq!((top_row(&a), drawn(&a)), ("line 0".into(), (4, 0)));
+        assert_eq!(a.anim.ahead(2), (0, 0));
+        // Nor past the lines the agent looked over for it.
+        let mut a = scrolling(Duration::from_millis(200));
+        a.keys(b"4j", t1);
+        let params = vec![
+            "decorated".into(),
+            1000.into(),
+            0.into(),
+            5.into(),
+            Value::Array(vec![]),
+        ];
+        notify(&mut a, "nvmux_client", params, t1);
+        a.keys(b"j", t1);
+        assert_eq!((top_row(&a), drawn(&a)), ("line 0".into(), (4, 0)));
+    }
+
+    /// A frame of Neovim's that moves the view otherwise than the scroll
+    /// ahead of it the steps made — further — lets go of the steps and the
+    /// scroll: the view and the cursor are Neovim's at once.
+    #[test]
+    fn a_view_neovim_moves_otherwise_lets_go_of_the_steps_scrolled() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = scrolling(Duration::from_millis(200));
+        a.keys(b"4jj", t1);
+        assert_eq!(a.anim.ahead(2), (1, 1));
+        redraw(&mut a, scrolled(0, 2, (2, 0)), t1);
+        assert!(a.anim.chain(2).is_none(), "let go of");
+        assert_eq!(a.anim.ahead(2), (0, 0));
+        assert_eq!((top_row(&a), drawn(&a)), ("line 2".into(), (0, 0)));
+    }
+
+    /// Motions past the edge of the view worked out while the motions prove
+    /// themselves in the buffer — judged, and not drawn, nor any scroll made
+    /// ahead of Neovim — are judged by Neovim's word on each as those in
+    /// view are, its frame for the key having moved the view as the step
+    /// would: eight found right, and they are drawn again, the view
+    /// scrolled ahead with them.
+    #[test]
+    fn motions_past_the_edge_prove_themselves_as_those_in_view_do() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = scrolling(Duration::from_millis(200));
+        a.keys(b"4j", t1);
+        ack(&mut a, 2, "4j", "n", (4, 0, 0, 0), t1);
+        redraw(&mut a, cursor_to(4, 0), t1);
+        let p = a.predict.as_mut().expect("predicting");
+        p.trust.wrong(1, Proof::Move, false);
+        let mut sent = vec!["4", "j"];
+        for i in 0..8i64 {
+            a.keys(b"j", t1);
+            assert!(a.anim.chain(2).is_some(), "{i}: worked out");
+            assert_eq!(a.anim.ahead(2), (0, 0), "{i}: nothing scrolled ahead");
+            sent.push("j");
+            let tail: String = sent[sent.len().saturating_sub(4)..].concat();
+            let k = sent.len() as u64;
+            ack(&mut a, k, &tail, "n", (5 + i, 0, 0, 1 + i), t1);
+            redraw(&mut a, scrolled(i, 1, (5 + i, 0)), t1);
+            assert!(a.anim.chain(2).is_none(), "{i}: judged");
+        }
+        let p = a.predict.as_ref().expect("predicting");
+        assert!(!p.trust.hidden(1, Proof::Move), "proved");
+        assert_eq!(p.trust.tally.unjudged, 0);
+        a.keys(b"j", t1);
+        assert_eq!(a.anim.ahead(2), (1, 1), "drawn again");
+    }
+
+    /// With `'number'` and `'relativenumber'` on, `j` past the bottom of the
+    /// view numbers every row as Neovim will once it has scrolled: the rows
+    /// Neovim's view has renumbered, and the line brought into view drawn
+    /// with its own, the cursor's, in the groups their places take.
+    #[test]
+    fn a_line_scrolled_into_view_is_numbered_with_the_rest() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = scrolling_as(
+            Duration::from_millis(200),
+            shaped(4, (true, true, true), (false, 0), &[], vec![]),
+        );
+        let mut events: Vec<(&str, Vec<Value>)> = GUTTER
+            .iter()
+            .map(|(name, id)| ("hl_group_set", vec![(*name).into(), (*id).into()]))
+            .collect();
+        events.extend(numbers_drawn((4, 0), false, &[]));
+        redraw(&mut a, events, t1);
+        ack(&mut a, 0, "", "n", (4, 0, 0, 0), t1);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (4, 4), "before Neovim has heard of it");
+        let rows = [
+            "  4 line 1",
+            "  3 line 2",
+            "  2 line 3",
+            "  1 line 4",
+            "6   line 5",
+        ];
+        assert_eq!(composed(&mut a)[..5], rows);
+        let groups: Vec<Option<Vec<u32>>> = repainted(&mut a)
+            .into_iter()
+            .map(|g| g.map(|g| g[..4].to_vec()))
+            .collect();
+        assert_eq!(
+            groups,
+            [
+                Some(vec![11; 4]),
+                Some(vec![11; 4]),
+                Some(vec![11; 4]),
+                Some(vec![11; 4]),
+                Some(vec![10; 4]),
+            ]
+        );
+    }
+
+    /// A line Neovim scrolled out of view as it made a scroll ahead of it,
+    /// whose row the window's scroll keeps while another is ahead, brought
+    /// back into view by `k` past the top ahead of Neovim, is drawn as
+    /// Neovim drew it — in its own colours, which the client's lines have
+    /// nothing of — but for its gutter, renumbered with the cursor where
+    /// the steps draw it, from where Neovim had it then.
+    #[test]
+    fn a_line_neovim_drew_scrolled_back_into_view_is_renumbered_as_it_was() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = scrolling_as(
+            Duration::from_millis(200),
+            shaped(4, (true, true, true), (false, 0), &[], vec![]),
+        );
+        let mut events: Vec<(&str, Vec<Value>)> = GUTTER
+            .iter()
+            .map(|(name, id)| ("hl_group_set", vec![(*name).into(), (*id).into()]))
+            .collect();
+        events.extend(numbers_drawn((4, 0), false, &[]));
+        // Line 0 in colours of its own, as `:syntax` gives it.
+        events.push(line_hl(2, 0, 4, &format!("{:16}", "line 0"), 5));
+        redraw(&mut a, events, t1);
+        ack(&mut a, 0, "", "n", (4, 0, 0, 0), t1);
+        a.keys(b"jj", t1);
+        assert_eq!(a.anim.ahead(2), (2, 2));
+        // Neovim's frame for the first: line 0 out of its view.
+        let n = Value::from;
+        let mut events = vec![(
+            "grid_scroll",
+            vec![n(2), n(0), n(5), n(0), n(20), n(1), n(0)],
+        )];
+        for r in 0..5i64 {
+            let line = r + 1;
+            let number = match line {
+                5 => "6   ".to_string(),
+                _ => format!("{:>3} ", 5 - line),
+            };
+            events.push(line_hl(2, r as u64, 0, &number, 10));
+            let text = format!("{:16}", format!("line {line}"));
+            events.push(line_hl(2, r as u64, 4, &text, 0));
+        }
+        events.push(("grid_cursor_goto", vec![n(2), n(4), n(4)]));
+        events.push(at(1, 5, 1));
+        ack(&mut a, 1, "j", "n", (5, 0, 0, 1), t1);
+        redraw(&mut a, events, t1);
+        assert_eq!(a.anim.ahead(2), (1, 1), "the second still ahead");
+        a.keys(b"kkkkkk", t1);
+        assert_eq!(a.anim.ahead(2).0, -1, "before Neovim has heard of them");
+        assert_eq!(composed(&mut a)[..2], ["1   line 0", "  1 line 1"]);
+        assert_eq!(repainted(&mut a)[0], Some(vec![10; 4]), "the gutter alone");
+    }
+
+    /// A turn of the wheel that scrolls the cursor's line out of view, which
+    /// Neovim moves the cursor down for, has the gutter renumbered with the
+    /// cursor where it is drawn: on Neovim's rows that stay in view and on
+    /// those the scroll brings in, each number in the group its place
+    /// takes.
+    #[test]
+    fn a_scroll_alone_renumbers_the_rows_with_the_cursor() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = numbered(Duration::from_millis(200), 0, &[]);
+        a.keys(b"\x1b[<65;3;2M", t1);
+        assert_eq!(a.anim.ahead(2), (3, 3), "before Neovim has heard of it");
+        assert!(a.anim.chain(2).is_none(), "a scroll alone");
+        assert_eq!(drawn(&a), (0, 4));
+        let rows = [
+            "4   line 3",
+            "  1 line 4",
+            "  2 line 5",
+            "  3 line 6",
+            "  4 line 7",
+        ];
+        assert_eq!(composed(&mut a)[..5], rows);
+        let groups: Vec<Option<Vec<u32>>> = repainted(&mut a)
+            .into_iter()
+            .map(|g| g.map(|g| g[..4].to_vec()))
+            .collect();
+        assert_eq!(
+            groups,
+            [
+                Some(vec![10; 4]),
+                Some(vec![12; 4]),
+                Some(vec![12; 4]),
+                Some(vec![12; 4]),
+                Some(vec![12; 4]),
+            ]
+        );
+    }
+
+    /// A scroll that draws the cursor on another line than Neovim's in a
+    /// window whose gutter the client cannot lay out as Neovim does — in
+    /// groups of the window's own, or a `'statuscolumn'`'s — or where the
+    /// line it leaves may be drawn concealed, is drawn all the same, as a
+    /// scroll was before the client drew what the cursor's line decides:
+    /// Neovim's rows numbered as Neovim numbered them, for its own frame to
+    /// put right. So is one that leaves the cursor on its line, which
+    /// changes nothing of that.
+    #[test]
+    fn a_scroll_alone_the_gutter_cannot_follow_leaves_it_as_neovim_drew_it() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let shape = |plain: bool, own: bool, conceals: bool| {
+            let mut s = shaped(4, (true, true, plain), (false, 0), &[], vec![]);
+            s.extend([own.into(), conceals.into()]);
+            s
+        };
+        for (name, shape) in [
+            ("groups of its own", shape(true, true, false)),
+            ("a 'statuscolumn'", shape(false, false, false)),
+            ("text concealed", shape(true, false, true)),
+        ] {
+            let mut a = numbered(Duration::from_millis(200), 0, &[]);
+            reshape(&mut a, shape, t1);
+            a.keys(b"\x1b[<65;3;2M", t1);
+            assert_eq!(a.anim.ahead(2), (3, 3), "{name}: the cursor pushed down");
+            assert_eq!(drawn(&a), (0, 4), "{name}");
+            let rows = composed(&mut a);
+            assert_eq!(rows[..2], ["  3 line 3", "  4 line 4"], "{name}");
+            assert!(repainted(&mut a).iter().all(Option::is_none), "{name}");
+        }
+        let mut a = numbered(Duration::from_millis(200), 0, &[]);
+        reshape(&mut a, shape(true, true, false), t1);
+        redraw(&mut a, numbers_drawn((4, 0), false, &[]), t1);
+        ack(&mut a, 0, "", "n", (4, 0, 0, 0), t1);
+        a.keys(b"\x1b[<65;3;2M", t1);
+        assert_eq!(a.anim.ahead(2), (3, 0), "the cursor on its line");
+        assert_eq!(composed(&mut a)[1], "5   line 4");
+    }
+
+    /// A row Neovim drew that its view has left, which a slide still shows,
+    /// is drawn as Neovim drew it — its virtual text and all, which the
+    /// client's own lines have nothing of — its gutter renumbered with the
+    /// cursor where it now is: from where Neovim had it as it drew the row.
+    #[test]
+    fn a_row_neovim_drew_that_a_slide_still_shows_is_renumbered_as_it_was() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = numbered(Duration::from_millis(200), 0, &[]);
+        let mut s = crate::config::Settings::default();
+        s.effects.scroll.enabled = true;
+        s.effects.windows.enabled = false;
+        a.anim.set_effects(Effects::from_settings(&s));
+        redraw(&mut a, vec![line_hl(2, 1, 11, "VT", 0)], t1);
+        // Neovim scrolls the view two lines down, the cursor to line 3.
+        let n = Value::from;
+        let mut events = vec![(
+            "grid_scroll",
+            vec![n(2), n(0), n(5), n(0), n(20), n(2), n(0)],
+        )];
+        for r in 0..5i64 {
+            let line = r + 2;
+            let number = match line.cmp(&3) {
+                std::cmp::Ordering::Equal => "4   ".to_string(),
+                _ => format!("{:>3} ", (line - 3).abs()),
+            };
+            events.push(line_hl(2, r as u64, 0, &number, 10));
+            let text = format!("{:16}", format!("line {line}"));
+            events.push(line_hl(2, r as u64, 4, &text, 0));
+        }
+        events.push(("grid_cursor_goto", vec![n(2), n(1), n(4)]));
+        events.push((
+            "win_viewport",
+            vec![n(2), n(1000), n(2), n(8), n(3), n(0), n(50), n(2)],
+        ));
+        redraw(&mut a, events, t1);
+        let rows = composed(&mut a);
+        assert_eq!(rows[..2], ["  2 line 1 VT", "  1 line 2"], "a row behind");
+    }
+
+    /// `j` and `k` mapped as LazyVim maps them — to `gj` and `gk` with no
+    /// count, which on lines a row each go where `j` and `k` go — are
+    /// followed as the keys themselves; a mapping anything else is not, nor
+    /// is `gj` where the column the cursor wants is past the row's end,
+    /// which `gj` brings back into it.
+    #[test]
+    fn jk_mapped_the_lazyvim_way_are_followed_as_the_keys() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let lazy = |rhs: &str| -> Vec<Value> {
+            vec![Value::Array(vec![
+                "j".into(),
+                rhs.into(),
+                true.into(),
+                true.into(),
+                true.into(),
+            ])]
+        };
+        for (rhs, wrap, keys, at) in [
+            ("v:count == 0 ? 'gj' : 'j'", false, &b"j"[..], (1, 0)),
+            ("v:count == 0 ? 'gj' : 'j'", true, b"j", (1, 0)),
+            ("v:count == 0 ? 'gj' : 'j'", false, b"3j", (3, 0)),
+            ("v:count == 0 ? 'gj' : 'j'", false, b"30|j", (1, 5)),
+            ("v:count == 0 ? 'gj' : 'j'", true, b"30|j", (0, 5)),
+            ("v:count == 0 ? 'gj' : 'j'", true, b"$j", (1, 5)),
+            ("v:count==0 ? 'gj' : 'j'", false, b"j", (0, 0)),
+            ("v:count == 0 ? 'gj' : 'k'", false, b"j", (0, 0)),
+        ] {
+            let mut a = stepping(Duration::from_millis(200));
+            reshape(
+                &mut a,
+                shaped(0, (false, false, true), (wrap, 0), &["j"], lazy(rhs)),
+                t1,
+            );
+            a.keys(keys, t1);
+            let name = String::from_utf8_lossy(keys);
+            assert_eq!(drawn(&a), at, "{rhs:?}, wrap {wrap}, {name:?}");
+        }
+    }
+
+    /// The agent's lines of [`stepping`]'s window are `text`, and `line N`
+    /// after them, and Neovim draws the first five as `drawn` has them.
+    fn lined(a: &mut App, text: &[&str], drawn: &[&str], now: Instant) {
+        let lines: Vec<Value> = text
+            .iter()
+            .map(|t| t.to_string())
+            .chain((text.len()..20).map(|n| format!("line {n}")))
+            .map(Value::from)
+            .collect();
+        let params: Vec<Value> = vec![
+            "lines".into(),
+            1000.into(),
+            1.into(),
+            1.into(),
+            0.into(),
+            Value::Array(lines),
+            true.into(),
+        ];
+        notify(a, "nvmux_client", params, now);
+        let rows = drawn
+            .iter()
+            .enumerate()
+            .map(|(r, t)| line(2, r as u64, &format!("{t:20}")))
+            .collect();
+        redraw(a, rows, now);
+    }
+
+    /// `j` mapped the LazyVim way, onto a tab over the column the cursor
+    /// wants in the right half of a row that wraps, short of the tab's end
+    /// where `j` itself puts the cursor: `gj` steps back off it, onto the
+    /// character before, as Neovim's `nv_screengo` has it — left to Neovim.
+    /// In the row's left half, or `j` unmapped, it goes where `j` goes.
+    #[test]
+    fn gj_onto_a_tab_in_the_right_half_of_a_row_is_left_to_neovim() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let lazy = vec![Value::Array(vec![
+            "j".into(),
+            "v:count == 0 ? 'gj' : 'j'".into(),
+            true.into(),
+            true.into(),
+            true.into(),
+        ])];
+        let text = ["xxxxxxxxxxxxxxx", "yyyyyyyyyyy\tz", "yy\tz"];
+        let drawn_rows = ["xxxxxxxxxxxxxxx", "yyyyyyyyyyy     z", "yy      z"];
+        for (idioms, keys, at) in [
+            (lazy.clone(), &b"14|j"[..], (0, 13)),
+            (vec![], b"14|j", (1, 15)),
+            (lazy.clone(), b"5|jj", (2, 7)),
+        ] {
+            let mut a = stepping(Duration::from_millis(200));
+            let mapped: &[&str] = if idioms.is_empty() { &[] } else { &["j"] };
+            reshape(
+                &mut a,
+                shaped(0, (false, false, true), (true, 0), mapped, idioms),
+                t1,
+            );
+            lined(&mut a, &text, &drawn_rows, t1);
+            ack0(&mut a, 0, "", 0, (1, 15), t1);
+            a.keys(keys, t1);
+            assert_eq!(drawn(&a), at, "{:?}", String::from_utf8_lossy(keys));
+        }
+    }
+
+    /// A key the client cannot make out — `zc`, closing a fold — may change
+    /// what the window shows and leave its cursor and view as they were:
+    /// Neovim's word on it waits for the frame that shows what it did, and
+    /// the motion typed behind it is made out over that, not over the rows
+    /// as they were.
+    #[test]
+    fn a_word_on_a_key_the_client_cannot_make_out_waits_for_its_frame() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"zcj", t1);
+        assert_eq!(drawn(&a), (0, 0), "blind after `zc`");
+        ack(&mut a, 2, "zc", "n", (0, 0, 0, 0), t1);
+        assert!(a.anim.chain(2).is_none(), "not over the rows as they were");
+        // Lines 0 to 3 folded into the first row.
+        let mut fold = vec![line(2, 0, "+--  4 lines: line 0")];
+        fold.extend((1..5).map(|r| line(2, r, &format!("line {:<15}", r + 3))));
+        fold.extend(cursor_to(0, 0));
+        redraw(&mut a, fold, t1);
+        assert!(a.anim.chain(2).is_none(), "nor over the fold");
+        assert_eq!(drawn(&a), (0, 0));
+    }
+
+    /// A line the client draws ending in blanks may have blank virtual text
+    /// among them that nothing on the screen shows: a motion onto it, or
+    /// along it, is drawn where Neovim's own measure of it — which the
+    /// agent sends of each such line in view, as of the cursor's — agrees
+    /// with the client's, and left to Neovim where it measures it wider, or
+    /// has not measured it.
+    #[test]
+    fn a_line_ending_in_blanks_is_drawn_onto_as_neovim_measures_it() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let text = ["abcdefgh", "x     ", "abcdefgh"];
+        let rows = ["abcdefgh", "x", "abcdefgh"];
+        for (blanks, keys, at) in [
+            (&[(1, 6)][..], &b"j"[..], (1, 0)),
+            (&[(1, 6)], b"jl", (1, 1)),
+            (&[(1, 9)], b"j", (0, 0)),
+            (&[(1, 9)], b"2jk", (2, 0)),
+            (&[], b"j", (0, 0)),
+            (&[], b"2j", (2, 0)),
+        ] {
+            let mut a = stepping(Duration::from_millis(200));
+            lined(&mut a, &text, &rows, t1);
+            let blanks: Vec<Value> = blanks
+                .iter()
+                .map(|&(l, w): &(i64, i64)| Value::Array(vec![l.into(), w.into()]))
+                .collect();
+            let params: Vec<Value> = vec![
+                "ack".into(),
+                0.into(),
+                "".into(),
+                "n".into(),
+                1000.into(),
+                1.into(),
+                1.into(),
+                50.into(),
+                0.into(),
+                0.into(),
+                0.into(),
+                0.into(),
+                0.into(),
+                8.into(),
+                Value::Array(blanks),
+            ];
+            notify(&mut a, "nvmux_client", params, t1);
+            a.keys(keys, t1);
+            assert_eq!(drawn(&a), at, "{:?}", String::from_utf8_lossy(keys));
+        }
+    }
+
+    /// What the cursor's line decides of a window drawn in highlights of
+    /// its own — `'winhighlight'`, or a namespace of the window's — is
+    /// drawn in groups the client has no word of: the motions to another
+    /// line there are left to Neovim where the line decides any of it, and
+    /// drawn where it decides none.
+    #[test]
+    fn a_window_with_highlights_of_its_own_leaves_line_changing_moves_to_neovim() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = numbered(Duration::from_millis(200), 0, &[]);
+        let mut own = shaped(4, (true, true, true), (false, 0), &[], vec![]);
+        own.extend([true.into(), false.into()]);
+        reshape(&mut a, own, t1);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (0, 4), "'relativenumber'");
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 4), "blind after it");
+        let mut a = stepping(Duration::from_millis(200));
+        let mut own = shaped(0, (false, false, true), (false, 0), &[], vec![]);
+        own.extend([true.into(), false.into()]);
+        reshape(&mut a, own, t1);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (1, 0), "nothing the line decides");
+    }
+
+    /// Text concealed off the cursor's line and shown on it: the line the
+    /// cursor leaves is drawn concealed once it has, which the client
+    /// cannot draw — the motions to another line are left to Neovim, those
+    /// along it drawn.
+    #[test]
+    fn concealed_text_leaves_line_changing_moves_to_neovim() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        let mut conceals = shaped(0, (false, false, true), (false, 0), &[], vec![]);
+        conceals.extend([false.into(), true.into()]);
+        reshape(&mut a, conceals, t1);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (0, 0));
+        let mut a = stepping(Duration::from_millis(200));
+        let mut conceals = shaped(0, (false, false, true), (false, 0), &[], vec![]);
+        conceals.extend([false.into(), true.into()]);
+        reshape(&mut a, conceals, t1);
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 1));
+    }
+
+    /// A motion to another line while the window's rows slide by, a scroll
+    /// of Neovim's gliding, is drawn, and what is drawn over the rows — the
+    /// gutter renumbered — slides with them: the line the slide still shows
+    /// that Neovim's view no longer does drawn afresh, numbered as the rest.
+    /// Once they have landed, it is drawn as it always was.
+    #[test]
+    fn a_motion_to_another_line_is_drawn_over_the_rows_sliding_by() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let sliding = [
+            "  2 line 1",
+            "  1 line 2",
+            "4   line 3",
+            "  1 line 4",
+            "  2 line 5",
+        ];
+        let landed = [
+            "  1 line 2",
+            "4   line 3",
+            "  1 line 4",
+            "  2 line 5",
+            "  3 line 6",
+        ];
+        for (wait, rows) in [(Duration::ZERO, sliding), (Duration::from_secs(1), landed)] {
+            let mut a = numbered(Duration::from_millis(200), 0, &[]);
+            a.anim.set_effects(Effects {
+                scroll: Some((0.1, 100)),
+                ..Effects::none()
+            });
+            a.frame(t1);
+            // Neovim scrolls two lines, the cursor on the first in view.
+            let up = (
+                "grid_scroll",
+                vec![2, 0, 5, 0, 20, 2, 0]
                     .into_iter()
-                    .filter(|(_, m, _)| m == "nvim_exec_autocmds"),
+                    .map(Value::from)
+                    .collect(),
+            );
+            let mut events = vec![up];
+            for r in 0..5u64 {
+                let (number, hl) = if r == 0 {
+                    ("3   ".to_string(), 10)
+                } else {
+                    (format!("{r:>3} "), 12)
+                };
+                events.push(line_hl(2, r, 0, &number, hl));
+            }
+            for r in 3..5u64 {
+                events.push(line_hl(
+                    2,
+                    r,
+                    4,
+                    &format!("{:16}", format!("line {}", r + 2)),
+                    0,
+                ));
+            }
+            events.push(("grid_cursor_goto", vec![2.into(), 0.into(), 4.into()]));
+            events.push(at(2, 2, 2));
+            redraw(&mut a, events, t1);
+            ack(&mut a, 0, "", "n", (2, 0, 0, 2), t1);
+            a.frame(t1 + wait);
+            a.keys(b"j", t1 + wait);
+            let line = a.anim.chain(2).and_then(|c| c.head()).map(|s| s.pos.line);
+            assert_eq!(line, Some(3), "after {wait:?}");
+            assert_eq!(composed(&mut a)[..5], rows, "after {wait:?}");
+        }
+    }
+
+    /// Where the client draws the cursor, in its window's grid: grid 2 is
+    /// at the top left of the screen.
+    fn drawn(a: &App) -> (i64, i64) {
+        a.anim.cursor_at(&a.model)
+    }
+
+    /// [`stepping`]'s window's shape, as [`shaped`] says it, with the rest of
+    /// what the agent says where it says what Neovim made of each key — and
+    /// what `'iskeyword'` at its default makes of each character under 256
+    /// (see [`predict::Stepping::classes`]).
+    fn worded() -> Vec<Value> {
+        let mut shape = shaped(0, (false, false, true), (false, 0), &[], Vec::new());
+        shape.extend([
+            false.into(),
+            false.into(),
+            Value::Array(vec![]),
+            1.into(),
+            false.into(),
+        ]);
+        let classes: String = words::defaults()
+            .iter()
+            .map(|&c| char::from(b'0' + c))
+            .collect();
+        shape.push(classes.into());
+        shape
+    }
+
+    /// The motions by words over a slow link move the cursor at once, before
+    /// Neovim has heard of them — along the line, on to the next and back,
+    /// with counts — where the agent says what `'iskeyword'` makes of the
+    /// characters; where it does not, they wait for Neovim.
+    #[test]
+    fn motions_by_words_move_the_cursor_at_once() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"w", t1);
+        assert_eq!(drawn(&a), (0, 0), "not knowing 'iskeyword'");
+        let mut a = stepping(Duration::from_millis(200));
+        reshape(&mut a, worded(), t1);
+        for (keys, at) in [
+            (&b"w"[..], (0, 5)),
+            (b"w", (1, 0)),
+            (b"e", (1, 3)),
+            (b"2b", (0, 5)),
+            (b"ge", (0, 3)),
+            (b"3W", (1, 5)),
+            (b"gE", (1, 3)),
+        ] {
+            a.keys(keys, t1);
+            assert_eq!(
+                drawn(&a),
+                at,
+                "{} before Neovim has heard of it",
+                String::from_utf8_lossy(keys)
             );
         }
-        assert!(!told.is_empty(), "the agent told");
+        assert!(a.due(t1), "and drawn");
+    }
+
+    /// `f`, `t`, `F` and `T` over a slow link move the cursor at once,
+    /// before Neovim has heard of them, the cursor waiting for nothing but
+    /// the character typed after them; where the agent says `:lmap`
+    /// mappings may take that character for another, they wait for Neovim.
+    #[test]
+    fn motions_to_a_character_move_the_cursor_at_once() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"f", t1);
+        assert_eq!(drawn(&a), (0, 0), "waiting for the character");
+        a.keys(b"e", t1);
+        assert_eq!(drawn(&a), (0, 3), "fe before Neovim has heard of it");
+        for (keys, at) in [(&b"Fl"[..], (0, 0)), (b"t0", (0, 4)), (b"Ti", (0, 2))] {
+            a.keys(keys, t1);
+            assert_eq!(
+                drawn(&a),
+                at,
+                "{} before Neovim has heard of it",
+                String::from_utf8_lossy(keys)
+            );
+        }
+        assert!(a.due(t1), "and drawn");
+        let mut a = stepping(Duration::from_millis(200));
+        let mut lmapped = worded();
+        lmapped.push(true.into());
+        reshape(&mut a, lmapped, t1);
+        a.keys(b"fe", t1);
+        assert_eq!(drawn(&a), (0, 0), "with :lmap mappings on");
+    }
+
+    /// A motion along the line over a slow link moves the cursor at once,
+    /// before Neovim has heard of it; Neovim's frame, when it comes with the
+    /// agent's word that it made it so, lets go of it, and the cursor stays.
+    #[test]
+    fn motions_move_the_cursor_at_once() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 1), "before Neovim has heard of it");
+        assert!(a.due(t1), "and drawn");
+        assert!(calls(&mut a)
+            .iter()
+            .any(|(_, m, args)| m == "nvim_input" && args[0] == Value::from("l")));
+        ack(&mut a, 1, "l", "n", (0, 1, 1, 0), t1);
+        redraw(&mut a, cursor_to(0, 1), t1);
+        assert!(a.anim.chain(2).is_none(), "let go of");
+        assert_eq!(drawn(&a), (0, 1));
+        let tally = a.predict.as_ref().expect("predicting").trust.tally;
+        assert_eq!((tally.made, tally.moved, tally.wrong), (1, 1, 0));
+        // Each of the motions along the line.
+        for (keys, col) in [
+            (&b"$"[..], 5),
+            (b"$0", 0),
+            (b"$^", 0),
+            (b"3|", 2),
+            (b"\x1b[F", 5),
+            (b"$\x1b[H", 0),
+            (b"g_", 5),
+            (b"5l2h", 3),
+            (b"20l", 5),
+            (b"l ", 2),
+            (b"ll\x7f", 1),
+        ] {
+            let mut a = stepping(Duration::from_millis(200));
+            a.keys(keys, t1);
+            assert_eq!(drawn(&a), (0, col), "{:?}", String::from_utf8_lossy(keys));
+        }
+    }
+
+    /// Motions typed faster than the agent answers them stay drawn where the
+    /// last of them goes: Neovim's frames for the keys before it, and one
+    /// it draws part way through them with no word of where it is, move
+    /// nothing.
+    #[test]
+    fn motions_typed_faster_than_acks_stay_predicted() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"llll", t1);
+        assert_eq!(drawn(&a), (0, 4));
+        ack(&mut a, 1, "l", "n", (0, 1, 1, 0), t1);
+        redraw(&mut a, cursor_to(0, 1), t1);
+        assert_eq!(drawn(&a), (0, 4), "the frame for the first");
+        redraw(&mut a, cursor_to(0, 3), t1);
+        assert_eq!(drawn(&a), (0, 4), "one part way through, unsaid");
+        ack(&mut a, 4, "llll", "n", (0, 4, 4, 0), t1);
+        redraw(&mut a, cursor_to(0, 4), t1);
+        assert_eq!(drawn(&a), (0, 4));
+        assert!(a.anim.chain(2).is_none());
+    }
+
+    /// A key the client cannot follow leaves the motions after it to Neovim
+    /// till the agent says where that key left the cursor: then they are
+    /// worked out from there, and drawn at once.
+    #[test]
+    fn a_key_the_client_cannot_follow_is_caught_up_with_at_its_ack() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"lwhh", t1);
+        assert_eq!(drawn(&a), (0, 1), "blind after `w`");
+        ack(&mut a, 1, "l", "n", (0, 1, 1, 0), t1);
+        redraw(&mut a, cursor_to(0, 1), t1);
+        assert_eq!(drawn(&a), (0, 1));
+        ack(&mut a, 2, "lw", "n", (0, 5, 5, 0), t1);
+        redraw(&mut a, cursor_to(0, 5), t1);
+        assert_eq!(drawn(&a), (0, 3), "the two after it at once");
+        ack(&mut a, 4, "lwhh", "n", (0, 3, 3, 0), t1);
+        redraw(&mut a, cursor_to(0, 3), t1);
+        assert!(a.anim.chain(2).is_none());
+        assert_eq!(drawn(&a), (0, 3));
+    }
+
+    /// A motion Neovim made otherwise sends the cursor to where Neovim has
+    /// it at once; and the buffer proves itself before the client draws
+    /// another there: eight in a row worked out right, each moving the
+    /// cursor, judged and not drawn.
+    #[test]
+    fn a_wrong_move_goes_back_to_neovims_cursor_and_proves_itself() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"ll", t1);
+        assert_eq!(drawn(&a), (0, 2));
+        ack(&mut a, 2, "ll", "n", (0, 3, 3, 0), t1);
+        redraw(&mut a, cursor_to(0, 3), t1);
+        assert!(a.anim.chain(2).is_none());
+        assert_eq!(drawn(&a), (0, 3), "where Neovim has it");
+        let tally = |a: &App| a.predict.as_ref().expect("predicting").trust.tally;
+        assert_eq!(tally(&a).wrong, 1);
+        // Proving: worked out and judged, the cursor left where Neovim draws
+        // it — right, and then wrong again.
+        a.keys(b"l", t1);
+        assert!(a.anim.chain(2).is_some(), "worked out");
+        assert_eq!(drawn(&a), (0, 3), "not drawn");
+        ack(&mut a, 3, "lll", "n", (0, 4, 4, 0), t1);
+        redraw(&mut a, cursor_to(0, 4), t1);
+        assert_eq!(tally(&a).made, 1);
+        a.keys(b"l", t1);
+        ack(&mut a, 4, "llll", "n", (0, 6, 6, 0), t1);
+        redraw(&mut a, cursor_to(0, 6), t1);
+        assert_eq!((tally(&a).wrong, tally(&a).hidden_wrong), (1, 1));
+        assert_eq!(drawn(&a), (0, 6));
+    }
+
+    /// Eight motions that each move the cursor, judged right while hidden,
+    /// and the next is drawn.
+    #[test]
+    fn a_buffer_drawn_wrong_is_drawn_again_once_proved() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"l", t1);
+        ack(&mut a, 1, "l", "n", (0, 2, 2, 0), t1);
+        redraw(&mut a, cursor_to(0, 2), t1);
+        // Back and forth, each moving the cursor.
+        let mut col = 2;
+        for k in 2..=9u64 {
+            let (key, to) = if k % 2 == 0 {
+                (b"l", col + 1)
+            } else {
+                (b"h", col - 1)
+            };
+            a.keys(key, t1);
+            assert_eq!(drawn(&a), (0, col), "proving, step {k}");
+            let tail = if k % 2 == 0 { "l" } else { "h" };
+            ack(&mut a, k, tail, "n", (0, to, to, 0), t1);
+            redraw(&mut a, cursor_to(0, to), t1);
+            col = to;
+        }
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, col + 1), "proved");
+    }
+
+    /// Neovim drawing the cursor somewhere else than the client did, on a
+    /// motion it worked out right — a character it takes for another width,
+    /// say — leaves the window's motions to Neovim a while.
+    #[test]
+    fn a_self_check_mismatch_distrusts_the_window() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"l", t1);
+        ack(&mut a, 1, "l", "n", (0, 1, 1, 0), t1);
+        let mut events = cursor_to(0, 1);
+        events[0] = ("grid_cursor_goto", vec![2.into(), 0.into(), 2.into()]);
+        redraw(&mut a, events, t1);
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 2), "left to Neovim");
+        assert!(a.anim.chain(2).is_none());
+        // Once the while is over, drawn again.
+        let later = t1 + predict::DISTRUST;
+        ack(&mut a, 2, "ll", "n", (0, 2, 2, 0), later);
+        redraw(&mut a, cursor_to(0, 2), later);
+        a.keys(b"l", later);
+        assert_eq!(drawn(&a), (0, 3));
+    }
+
+    /// The agent sends the edits ahead of the ack that follows them: an ack
+    /// for a buffer as it is at a change the client's lines are not at
+    /// leaves the motions to Neovim.
+    #[test]
+    fn motions_wait_for_lines_after_an_edit() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"x", t1);
+        let mut params: Vec<Value> = vec![
+            "ack".into(),
+            1.into(),
+            "x".into(),
+            "n".into(),
+            1000.into(),
+            1.into(),
+            2.into(),
+            50.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+            5.into(),
+        ];
+        notify(&mut a, "nvmux_client", params.clone(), t1);
+        redraw(&mut a, vec![line(2, 0, "ine 0")], t1);
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 0), "lines a change behind");
+        // The edit, as the agent says it, and the next ack with it.
+        let splice: Vec<Value> = vec![
+            "splice".into(),
+            1000.into(),
+            1.into(),
+            1.into(),
+            2.into(),
+            0.into(),
+            1.into(),
+            1.into(),
+            Value::Array(vec!["ine 0".into()]),
+        ];
+        notify(&mut a, "nvmux_client", splice, t1);
+        params[1] = 2.into();
+        params[2] = "xl".into();
+        params[9] = 1.into();
+        params[10] = 1.into();
+        notify(&mut a, "nvmux_client", params, t1);
+        redraw(&mut a, cursor_to(0, 1), t1);
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 2), "the lines as the buffer has them");
+    }
+
+    /// Neovim saying nothing of a motion in time, the cursor goes back to
+    /// where Neovim has it, as a scroll ahead does, and the client waits
+    /// for its word before drawing another.
+    #[test]
+    fn no_ack_gives_up_at_the_deadline() {
+        let ms = Duration::from_millis;
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(ms(200));
+        a.keys(b"l", t1);
+        let until = a.predict.as_ref().expect("predicting").deadline(t1);
+        assert_eq!(a.wake_at(t1 + ms(1)).filter(|_| !a.dirty), None);
+        a.frame(t1);
+        assert_eq!(a.wake_at(t1 + ms(1)), Some(until), "woken for it");
+        a.frame(until - ms(1));
+        assert_eq!(drawn(&a), (0, 1));
+        a.frame(until);
+        assert_eq!(drawn(&a), (0, 0), "given up on");
+        a.keys(b"l", until);
+        assert_eq!(drawn(&a), (0, 0), "blind till Neovim says");
+    }
+
+    /// A motion something maps is the mapping's to make: Neovim's.
+    #[test]
+    fn mapped_motions_are_not_predicted() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping_with(Duration::from_millis(200), &["l", "g_"]);
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 0));
+        let mut a = stepping_with(Duration::from_millis(200), &["g_"]);
+        a.keys(b"g_", t1);
+        assert_eq!(drawn(&a), (0, 0));
+        a.keys(b"$", t1);
+        assert_eq!(drawn(&a), (0, 0), "and blind after it");
+    }
+
+    /// `g_`, its `g` a prefix of Neovim's own mappings, is followed whole.
+    #[test]
+    fn g_is_followed_past_a_g_prefix() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"g", t1);
+        assert_eq!(drawn(&a), (0, 0), "pending");
+        a.keys(b"_", t1);
+        assert_eq!(drawn(&a), (0, 5));
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"gjl", t1);
+        assert_eq!(
+            drawn(&a),
+            (0, 0),
+            "`gj` is not followed, nor what follows it"
+        );
+    }
+
+    /// A fence answered for keys Neovim took without a word of where they
+    /// left the cursor — an operator pending, say — has the client let go
+    /// of what it drew for them, and wait for Neovim's next word.
+    #[test]
+    fn the_fence_floor_lets_go_of_steps_neovim_took_without_saying() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 1));
+        calls(&mut a);
+        a.keys(b"d", t1);
+        let fence = request(&calls(&mut a), "nvim_eval", "luaeval");
+        answer(&mut a, fence, Value::from(2), t1);
+        assert!(a.anim.chain(2).is_none());
+        assert_eq!(drawn(&a), (0, 0));
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 0), "blind");
+    }
+
+    /// `<C-c>`, which Neovim counts twice, puts the counts in doubt: what
+    /// was drawn ahead goes, and nothing is till a fence ties the counts
+    /// again.
+    #[test]
+    fn ctrl_c_drops_the_chain_and_resyncs() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 1));
+        calls(&mut a);
+        a.keys(b"\x03", t1);
+        assert!(a.anim.chain(2).is_none());
+        assert_eq!(drawn(&a), (0, 0));
+        let asked = request(&calls(&mut a), "nvim_eval", "luaeval");
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 0), "the counts in doubt");
+        // Neovim's word, and the fence after `<C-c>`, a key typed since:
+        // nothing tied yet. The next, with nothing after it, ties them.
+        ack(&mut a, 4, "l<C-C><C-C>l", "n", (0, 2, 2, 0), t1);
+        redraw(&mut a, cursor_to(0, 2), t1);
+        answer(&mut a, asked, Value::from(3), t1);
+        a.tick(t1);
+        let fence = request(&calls(&mut a), "nvim_eval", "luaeval");
+        answer(&mut a, fence, Value::from(4), t1);
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 3), "tied again");
+    }
+
+    /// A frame of Neovim's that changes what the window shows elsewhere than
+    /// on the line the cursor moved along — a plugin's virtual text on
+    /// another, a diagnostic, a timer's redraw — leaves the steps drawn. One
+    /// that changes that line's row is not what they were worked out over:
+    /// they are let go of, and worked out again at once from Neovim's word,
+    /// where the line is laid out as before — something drawn after its end
+    /// — and left to Neovim where not, the cursor put back where Neovim has
+    /// it and not travelling there.
+    #[test]
+    fn a_frame_lets_go_of_the_steps_only_where_it_draws_their_line_otherwise() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 1));
+        redraw(&mut a, vec![line(2, 1, "lime 1")], t1);
+        let tally = |a: &App| a.predict.as_ref().expect("predicting").trust.tally;
+        assert_eq!(tally(&a).unjudged, 0, "another line");
+        assert_eq!(drawn(&a), (0, 1));
+        redraw(&mut a, vec![line(2, 0, "line 0  E")], t1);
+        assert_eq!(tally(&a).unjudged, 1);
+        assert_eq!(drawn(&a), (0, 1), "after its end: worked out again");
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 2));
+        redraw(&mut a, vec![line(2, 0, "li: ne 0")], t1);
+        assert!(a.anim.chain(2).is_none());
+        assert_eq!(drawn(&a), (0, 0), "between its characters");
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 0), "blind");
+        // Neovim's word, with the line as it draws it now: still laid out
+        // otherwise, and left to Neovim.
+        ack(&mut a, 3, "lll", "n", (0, 3, 5, 0), t1);
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 0));
+    }
+
+    /// A step that moves only the cursor leaves the frame the editor's
+    /// grids and nothing more: it is put together from the rows that
+    /// changed, which are none, and the cursor.
+    #[test]
+    fn a_cursor_only_step_draws_a_partial_frame() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200)).with_partial_frames(true);
+        a.frame(t1);
+        a.frame(t1);
+        let partly = |a: &App| a.partial.as_ref().map_or(0, |p| p.partly);
+        let before = partly(&a);
+        a.keys(b"l", t1);
+        assert!(a.anim.still());
+        let bytes = a.frame(t1);
+        assert_eq!(partly(&a), before + 1);
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("\x1b[1;2H"),
+            "the cursor to column 1: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    /// The agent's word on line 0 of [`stepping`]'s buffer edited, from
+    /// `b:changedtick` `from` to `to`: `text` for it.
+    fn splice0(a: &mut App, (from, to): (i64, i64), text: &str, now: Instant) {
+        let params: Vec<Value> = vec![
+            "splice".into(),
+            1000.into(),
+            1.into(),
+            from.into(),
+            to.into(),
+            0.into(),
+            1.into(),
+            1.into(),
+            Value::Array(vec![text.into()]),
+        ];
+        notify(a, "nvmux_client", params, now);
+    }
+
+    /// [`ack`] for line 0 of [`stepping`]'s buffer at `b:changedtick` `tick`,
+    /// in Normal mode, the cursor at byte `col` and the line laid out by
+    /// Neovim `width` columns wide.
+    fn ack0(
+        a: &mut App,
+        count: u64,
+        tail: &str,
+        col: i64,
+        (tick, width): (i64, i64),
+        now: Instant,
+    ) {
+        let params: Vec<Value> = vec![
+            "ack".into(),
+            count.into(),
+            tail.into(),
+            "n".into(),
+            1000.into(),
+            1.into(),
+            tick.into(),
+            50.into(),
+            0.into(),
+            col.into(),
+            col.into(),
+            0.into(),
+            0.into(),
+            width.into(),
+        ];
+        notify(a, "nvmux_client", params, now);
+    }
+
+    /// A line Neovim lays out wider than the client does — blank virtual
+    /// text between its characters, which nothing on the screen shows
+    /// before blanks — has its motions left to Neovim, by Neovim's own
+    /// measure of it.
+    #[test]
+    fn a_line_neovim_measures_otherwise_is_left_to_it() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        ack0(&mut a, 0, "", 0, (1, 9), t1);
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 0), "nine columns wide to Neovim, six to us");
+        let mut a = stepping(Duration::from_millis(200));
+        ack0(&mut a, 0, "", 0, (1, 6), t1);
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 1));
+    }
+
+    /// A motion that leaves the cursor on the character it was on leaves it
+    /// drawn where Neovim drew it, which on a tab may be the tab's start:
+    /// Neovim works out where to draw the cursor only once it moves, and
+    /// leaving Visual mode on a tab leaves it where Visual mode drew it.
+    #[test]
+    fn a_motion_that_moves_nothing_leaves_the_cursor_where_neovim_drew_it() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        let text: Vec<Value> = std::iter::once("\tfoo bar".to_string())
+            .chain((1..20).map(|n| format!("line {n}")))
+            .map(Value::from)
+            .collect();
+        let lines: Vec<Value> = vec![
+            "lines".into(),
+            1000.into(),
+            1.into(),
+            1.into(),
+            0.into(),
+            Value::Array(text),
+            true.into(),
+        ];
+        notify(&mut a, "nvmux_client", lines, t1);
+        redraw(&mut a, vec![line(2, 0, "        foo bar")], t1);
+        ack0(&mut a, 0, "", 0, (1, 15), t1);
+        a.keys(b"0", t1);
+        assert_eq!(drawn(&a), (0, 0), "where Neovim drew it, the tab's start");
+        a.keys(b"\x1b[H", t1);
+        assert_eq!(drawn(&a), (0, 0));
+        a.keys(b"lh", t1);
+        assert_eq!(drawn(&a), (0, 7), "moved: on the tab's end");
+        a.keys(b"0", t1);
+        assert_eq!(drawn(&a), (0, 7));
+        // Neovim's frame for a key that moved nothing is one it drew before
+        // that key: the cursor where it was.
+        let mut a = stepping(Duration::from_millis(200));
+        redraw(&mut a, cursor_to(0, 3), t1);
+        a.keys(b"0", t1);
+        assert_eq!(drawn(&a), (0, 3), "Neovim's word and its frame disagree");
+    }
+
+    /// An ack for a key that edited the line — `x` in a run of one
+    /// character, which leaves the cursor where it was — comes ahead of the
+    /// frame that draws the edit, as every ack does: the motions after it
+    /// are drawn with that frame, not over the line as it was before it.
+    #[test]
+    fn an_edit_is_drawn_before_the_motions_after_it() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        splice0(&mut a, (1, 2), "abbbb", t1);
+        let mut events = vec![line(2, 0, "abbbb ")];
+        events.extend(cursor_to(0, 2));
+        redraw(&mut a, events, t1);
+        ack0(&mut a, 0, "", 2, (2, 5), t1);
+        a.keys(b"x", t1);
+        splice0(&mut a, (2, 3), "abbb", t1);
+        ack0(&mut a, 1, "x", 2, (3, 4), t1);
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 2), "not over `abbbb`, Neovim's still");
+        let mut events = vec![line(2, 0, "abbb  ")];
+        events.extend(cursor_to(0, 2));
+        redraw(&mut a, events, t1);
+        assert_eq!(drawn(&a), (0, 3), "with the edit's frame");
+    }
+
+    /// A paste, in Normal mode no key to Neovim, holds the acks back till a
+    /// fence after it is answered, and leaves the client blind after it;
+    /// but the motions drawn before it are where Neovim puts the cursor
+    /// still, and stay drawn till its frame for the paste says otherwise.
+    #[test]
+    fn a_paste_leaves_the_motions_before_it_drawn() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"l", t1);
+        a.keys(b"\x1b[200~XY\x1b[201~", t1);
+        assert!(a.anim.chain(2).is_some());
+        assert_eq!(drawn(&a), (0, 1));
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 1), "blind after it");
+        let mut events = vec![line(2, 0, "lXYine 0")];
+        events.extend(cursor_to(0, 2));
+        redraw(&mut a, events, t1);
+        assert!(a.anim.chain(2).is_none());
+        assert_eq!(drawn(&a), (0, 2), "Neovim's frame for the paste");
+    }
+
+    /// A turn of the wheel over the window the cursor was moved ahead in is
+    /// drawn at once, as it is with no motion ahead — but from where the
+    /// motions leave the cursor, a step of its own after theirs: the view
+    /// scrolled ahead of Neovim, and the cursor pushed down from the line
+    /// they took it to, not from Neovim's. One that cannot be made so — a
+    /// line it brings into view the agent has said nothing of — waits for
+    /// Neovim, the motions drawn as they were and the client blind after
+    /// it; and a turn sideways always does.
+    #[test]
+    fn the_wheel_over_motions_drawn_ahead_goes_on_from_them() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = scrolling(Duration::from_millis(200));
+        a.keys(b"jl", t1);
+        assert_eq!(drawn(&a), (1, 1));
+        a.keys(b"\x1b[<65;3;2M", t1);
+        assert_eq!(a.anim.chain(2).map(chain::Chain::len), Some(3));
+        assert_eq!(a.anim.ahead(2), (3, 2), "scrolled ahead from the steps");
+        assert_eq!((top_row(&a), drawn(&a)), ("line 3".into(), (0, 1)));
+        assert!(a.predict.as_ref().is_some_and(Predictor::known));
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"l", t1);
+        assert!(a.anim.chain(2).is_some());
+        a.keys(b"\x1b[<65;3;2M", t1);
+        assert_eq!(a.anim.chain(2).map(chain::Chain::len), Some(1));
+        assert_eq!((a.anim.ahead(2), drawn(&a)), ((0, 0), (0, 1)));
+        assert!(!a.predict.as_ref().is_some_and(Predictor::known));
+        let mut a = scrolling(Duration::from_millis(200));
+        a.keys(b"l\x1b[<67;3;2M", t1);
+        assert_eq!(a.anim.chain(2).map(chain::Chain::len), Some(1));
+        assert!(a.anim.side_left(2).is_none(), "not sideways");
+        assert!(!a.predict.as_ref().is_some_and(Predictor::known));
+    }
+
+    /// Steps a frame lets go of put the cursor back where Neovim has it at
+    /// once, smear or no smear: travelling back, it would draw a move of its
+    /// own that no key made.
+    #[test]
+    fn steps_let_go_of_by_a_frame_put_the_cursor_back_at_once() {
+        let ms = Duration::from_millis;
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(ms(200));
+        let mut s = crate::config::Settings::default();
+        s.effects.smear.enabled = true;
+        s.effects.scroll.enabled = false;
+        s.effects.windows.enabled = false;
+        a.anim.set_effects(Effects::from_settings(&s));
+        a.keys(b"$", t1);
+        assert!(!a.anim.still(), "the smear travels to it");
+        let mut t2 = t1;
+        while !a.anim.still() && t2 < t1 + ms(400) {
+            t2 += ms(16);
+            a.frame(t2);
+        }
+        assert!(a.anim.still() && a.anim.chain(2).is_some());
+        assert_eq!(drawn(&a), (0, 5));
+        // Worked out again at once: neither back nor forth.
+        redraw(&mut a, vec![line(2, 0, "line 0  E")], t2);
+        assert_eq!(drawn(&a), (0, 5));
+        assert!(a.anim.still(), "not travelling back and forth");
+        redraw(&mut a, vec![line(2, 0, "li: ne 0")], t2);
+        assert_eq!(drawn(&a), (0, 0));
+        assert!(a.anim.still(), "not travelling back");
+    }
+
+    /// What `'iskeyword'` makes of the characters under 256 at its default,
+    /// as the agent sends it (see [`typing::Facts::classes`]).
+    fn classes() -> String {
+        (0u8..=255)
+            .map(|b| match b {
+                0 | b'\t' | b' ' | 0xa0 => '0',
+                b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'_' | 192..=255 => '2',
+                _ => '1',
+            })
+            .collect()
+    }
+
+    /// The agent's word on buffer 1's Insert mode, entered — nothing in it
+    /// to type otherwise, as Neovim's defaults have it — as `change` makes
+    /// it, by its place in the notification (see [`typing::Facts::read`]),
+    /// the method's name first; and that no line in view of its window has
+    /// virtual text that stays where it is as text is typed (see
+    /// [`Predictor::pinned`]).
+    fn facts(a: &mut App, change: impl FnOnce(&mut Vec<Value>), now: Instant) {
+        let pinned = vec!["pinned".into(), 1000.into(), Value::Array(vec![])];
+        notify(a, "nvmux_client", pinned, now);
+        let mut v: Vec<Value> = vec![
+            "insert".into(),
+            1.into(),
+            true.into(),
+            Value::Array(vec![]),
+            Value::Array(vec![]),
+            false.into(),
+            0.into(),
+            "tcqj".into(),
+            "".into(),
+            false.into(),
+            false.into(),
+            false.into(),
+            "(:),{:},[:]".into(),
+            false.into(),
+            true.into(),
+            true.into(),
+            "indent,eol,start".into(),
+            false.into(),
+            true.into(),
+            false.into(),
+            "".into(),
+            classes().into(),
+        ];
+        change(&mut v);
+        notify(a, "nvmux_client", v, now);
+    }
+
+    /// [`ack`] for line 0 of [`stepping`]'s buffer at `b:changedtick`
+    /// `tick`, in Insert mode, the cursor at byte `col` — as far into a line
+    /// of ASCII, and wanting as far — and the line laid out by Neovim as the
+    /// client lays out its text.
+    fn ack_i(a: &mut App, count: u64, tail: &str, col: i64, tick: i64, now: Instant) {
+        let width = a.predict.as_ref().and_then(|p| {
+            let width = predict::width(p.text(1000, 0)?, p.shape(1000)?);
+            i64::try_from(width).ok()
+        });
+        let params: Vec<Value> = vec![
+            "ack".into(),
+            count.into(),
+            tail.into(),
+            "i".into(),
+            1000.into(),
+            1.into(),
+            tick.into(),
+            50.into(),
+            0.into(),
+            col.into(),
+            col.into(),
+            0.into(),
+            0.into(),
+            width.unwrap_or(-1).into(),
+        ];
+        notify(a, "nvmux_client", params, now);
+    }
+
+    /// Neovim's frame for line 0 of [`stepping`]'s window as `text`, the
+    /// cursor at byte `col` of it in Insert mode.
+    fn typed_frame(text: &str, col: i64) -> Vec<(&'static str, Vec<Value>)> {
+        let mut events = vec![
+            ("mode_change", vec!["insert".into(), 1.into()]),
+            line(2, 0, &format!("{text:20}")),
+        ];
+        events.extend(cursor_to(0, col));
+        events
+    }
+
+    /// [`stepping`]'s window, typing ahead of Neovim as well, Neovim in
+    /// Insert mode at the start of `line 0` by its word and its frame, and
+    /// nothing in the buffer's Insert mode to type otherwise.
+    fn typing(rtt: Duration) -> App {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping_as(TYPING, rtt, &[]);
+        facts(&mut a, |_| {}, t1);
+        ack_i(&mut a, 0, "", 0, 1, t1);
+        redraw(&mut a, typed_frame("line 0", 0), t1);
+        a
+    }
+
+    /// Neovim's word on each of `keys` typed into `line 0` of [`typing`]'s
+    /// window from its start, after `from` typed before them, the line's
+    /// text `texts` after each, and its frame for it: the agent's edit, its
+    /// ack, the frame.
+    fn neovim_typed(a: &mut App, from: usize, keys: &[&str], texts: &[&str], now: Instant) {
+        let mut tail = String::new();
+        for (k, (key, text)) in keys.iter().zip(texts).enumerate() {
+            let k = (from + k) as i64 + 1;
+            tail.push_str(key);
+            let col = text.find("line").unwrap_or(text.len()) as i64;
+            splice0(a, (k, k + 1), text, now);
+            ack_i(a, k as u64, &tail, col, k + 1, now);
+            redraw(a, typed_frame(text, col), now);
+        }
+    }
+
+    /// Characters typed in Insert mode over a slow link go in at once, the
+    /// cursor going on past each — before Neovim has heard of them — and
+    /// Neovim's word on each, with its frame, finds them made and lets them
+    /// go, its own row the same.
+    #[test]
+    fn typing_is_echoed_then_confirmed() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = typing(Duration::from_millis(200));
+        a.keys(b"abc", t1);
+        assert_eq!(
+            composed(&mut a)[0],
+            "abcline 0",
+            "before Neovim has heard of them"
+        );
+        assert_eq!(drawn(&a), (0, 3));
+        assert!(a.due(t1), "and drawn");
+        neovim_typed(
+            &mut a,
+            0,
+            &["a", "b", "c"],
+            &["aline 0", "abline 0", "abcline 0"],
+            t1,
+        );
+        assert!(a.anim.chain(2).is_none(), "made, and let go of");
+        assert_eq!(composed(&mut a)[0], "abcline 0");
+        assert_eq!(drawn(&a), (0, 3));
+        let tally = a.predict.as_ref().expect("predicting").trust.tally;
+        assert_eq!((tally.made, tally.wrong), (3, 0));
+        // And taken out again.
+        a.keys(b"\x7f\x7f", t1);
+        assert_eq!(composed(&mut a)[0], "aline 0");
+        assert_eq!(drawn(&a), (0, 1));
+    }
+
+    /// Characters typed while an `i` the client leaves to Neovim is on its
+    /// way — in a buffer the agent has yet to say anything of, as before
+    /// Insert mode is first entered there — wait for Neovim's word on it,
+    /// and appear together once the agent has said what it does once
+    /// entered, which comes after that word.
+    #[test]
+    fn the_keys_typed_while_i_is_on_its_way_appear_at_its_ack() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping_as(TYPING, Duration::from_millis(200), &[]);
+        a.keys(b"iab", t1);
+        assert_eq!(composed(&mut a)[0], "line 0", "blind after `i`");
+        ack_i(&mut a, 1, "i", 0, 1, t1);
+        redraw(&mut a, typed_frame("line 0", 0), t1);
+        assert_eq!(composed(&mut a)[0], "line 0", "nothing said of the buffer");
+        facts(&mut a, |_| {}, t1);
+        assert_eq!(composed(&mut a)[0], "abline 0", "once it is");
+        assert_eq!(drawn(&a), (0, 2));
+    }
+
+    /// The edits for Neovim's word on a key come ahead of the word, and the
+    /// word ahead of its frame — each may come apart from the next over a
+    /// lossy link: a key typed in between goes on from what the keys before
+    /// it typed, not from the client's lines.
+    #[test]
+    fn the_edits_for_a_word_on_its_way_hold_up_nothing_typed_after() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = typing(Duration::from_millis(200));
+        a.keys(b"a", t1);
+        splice0(&mut a, (1, 2), "aline 0", t1);
+        a.keys(b"b", t1);
+        ack_i(&mut a, 1, "a", 1, 2, t1);
+        a.keys(b"c", t1);
+        assert_eq!(composed(&mut a)[0], "abcline 0");
+        assert_eq!(drawn(&a), (0, 3));
+        redraw(&mut a, typed_frame("aline 0", 1), t1);
+        assert_eq!(composed(&mut a)[0], "abcline 0", "Neovim's frame for `a`");
+        assert_eq!(drawn(&a), (0, 3));
+    }
+
+    /// Virtual text Neovim draws anew past the end of the line typed into —
+    /// a diagnostic, as it is typed — with its word on a key: the keys
+    /// after it are laid out again over Neovim's row as it now is, and what
+    /// it draws there goes with the end. Where it draws the typed text
+    /// itself otherwise than the client laid it out, the window is left to
+    /// it a while.
+    #[test]
+    fn a_row_drawn_anew_past_its_end_is_typed_into_as_it_is() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = typing(Duration::from_millis(200));
+        a.keys(b"ab", t1);
+        assert_eq!(composed(&mut a)[0], "abline 0");
+        splice0(&mut a, (1, 2), "aline 0", t1);
+        ack_i(&mut a, 1, "a", 1, 2, t1);
+        redraw(&mut a, typed_frame("aline 0  E", 1), t1);
+        assert_eq!(composed(&mut a)[0], "abline 0  E");
+        assert_eq!(drawn(&a), (0, 2));
         let p = a.predict.as_ref().expect("predicting");
-        assert!(!p.active(), "a fast link");
-        assert!(p.shape(1000).is_none(), "the window's shape let go of");
-        // Nothing to predict from: a turn of the wheel goes to Neovim.
-        a.keys(b"\x1b[<65;3;2M", t);
-        assert_eq!(top_row(&a), "line 0");
+        assert!(
+            !p.trust.refused(1000, t1),
+            "the text as the client laid it out"
+        );
+        // Drawn otherwise: a character as wide as the client did not take
+        // it for, say.
+        let mut a = typing(Duration::from_millis(200));
+        a.keys(b"ab", t1);
+        splice0(&mut a, (1, 2), "aline 0", t1);
+        ack_i(&mut a, 1, "a", 1, 2, t1);
+        redraw(&mut a, typed_frame("a line 0", 1), t1);
+        let p = a.predict.as_ref().expect("predicting");
+        assert!(p.trust.refused(1000, t1), "left to Neovim");
+        assert_eq!(composed(&mut a)[0], "a line 0");
+    }
+
+    /// Text typed while the window's rows slide by, a scroll of Neovim's
+    /// gliding, is left to Neovim: the line typed into, drawn over its row,
+    /// would not slide with them. Once they have landed, it is drawn.
+    #[test]
+    fn typing_waits_for_the_rows_sliding_by_to_land() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        for (wait, typed) in [(Duration::ZERO, None), (Duration::from_secs(1), Some(2))] {
+            let mut a = typing(Duration::from_millis(200));
+            a.anim.set_effects(Effects {
+                scroll: Some((0.1, 100)),
+                ..Effects::none()
+            });
+            a.frame(t1);
+            // Neovim scrolls two lines, the cursor on the first in view.
+            let up = (
+                "grid_scroll",
+                vec![2, 0, 5, 0, 20, 2, 0]
+                    .into_iter()
+                    .map(Value::from)
+                    .collect(),
+            );
+            let mut events = vec![up];
+            for r in 3..5u64 {
+                events.push(line(2, r, &format!("{:20}", format!("line {}", r + 2))));
+            }
+            events.push(("grid_cursor_goto", vec![2.into(), 0.into(), 0.into()]));
+            events.push(at(2, 2, 2));
+            redraw(&mut a, events, t1);
+            let params: Vec<Value> = vec![
+                "ack".into(),
+                0.into(),
+                "".into(),
+                "i".into(),
+                1000.into(),
+                1.into(),
+                1.into(),
+                50.into(),
+                2.into(),
+                0.into(),
+                0.into(),
+                2.into(),
+                0.into(),
+                6.into(),
+            ];
+            notify(&mut a, "nvmux_client", params, t1);
+            a.frame(t1 + wait);
+            a.keys(b"x", t1 + wait);
+            let line = a.anim.chain(2).and_then(|c| c.head()).map(|s| s.pos.line);
+            assert_eq!(line, typed, "after {wait:?}");
+        }
+    }
+
+    /// A line with virtual text Neovim draws where the client would not move
+    /// it with the line's end — right-aligned, in a column of the window's,
+    /// inline after the last character and staying before what is typed
+    /// there — as the agent says of the lines in view, is left to Neovim to
+    /// type into, and to enter Insert mode at the end of; elsewhere on it,
+    /// Insert mode is entered at once.
+    #[test]
+    fn a_line_with_virtual_text_that_stays_put_is_left_to_neovim() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let pinned = |a: &mut App| {
+            let params = vec!["pinned".into(), 1000.into(), Value::Array(vec![0.into()])];
+            notify(a, "nvmux_client", params, t1);
+        };
+        let mut a = typing(Duration::from_millis(200));
+        pinned(&mut a);
+        a.keys(b"x", t1);
+        assert!(a.anim.chain(2).is_none(), "typed into");
+        for (key, entered) in [(&b"A"[..], false), (b"$a", false), (b"i", true)] {
+            let mut a = moding(Duration::from_millis(200));
+            pinned(&mut a);
+            a.keys(key, t1);
+            let made = a.anim.chain(2).and_then(|c| c.head()).map(|s| s.pos.rest);
+            assert_eq!(made == Some(Rest::Insert), entered, "{key:?}");
+        }
+    }
+
+    /// A glyph of `'list'`'s new to the line typed into — `trail`, after a
+    /// blank typed at its end — across the bar of `'cursorline'` is drawn in
+    /// its group laid over the bar, as Neovim draws it, not in its group
+    /// alone, which would leave a hole in the bar.
+    #[test]
+    fn a_glyph_new_to_a_barred_line_is_drawn_over_the_bar() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping_as(TYPING, Duration::from_millis(200), &[]);
+        let mut shape = shaped(0, (false, false, true), (false, 2), &[], vec![]);
+        shape[13] = true.into();
+        let mut lcs = vec![Value::from(""); 10];
+        lcs[4] = "-".into();
+        shape[23] = Value::Array(lcs);
+        reshape(&mut a, shape, t1);
+        facts(&mut a, |_| {}, t1);
+        let define = |id: u64, rgb: Vec<(Value, Value)>| {
+            (
+                "hl_attr_define",
+                vec![
+                    id.into(),
+                    Value::Map(rgb),
+                    Value::Map(vec![]),
+                    Value::Array(vec![]),
+                ],
+            )
+        };
+        let mut events = vec![("option_set", vec!["termguicolors".into(), true.into()])];
+        events.extend(bar_defined(21, false));
+        events.push(define(22, vec![("foreground".into(), 0xaa_00_aa.into())]));
+        events.push(("hl_group_set", vec!["Whitespace".into(), 22.into()]));
+        events.push(define(
+            23,
+            vec![
+                ("foreground".into(), 0xaa_00_aa.into()),
+                ("background".into(), 0x30_30_30.into()),
+            ],
+        ));
+        events.push(("mode_change", vec!["insert".into(), 1.into()]));
+        events.push(line_hl(2, 0, 0, &format!("{:20}", "line 0"), 21));
+        events.extend(cursor_to(0, 6));
+        redraw(&mut a, events, t1);
+        ack_i(&mut a, 0, "", 6, 1, t1);
+        a.keys(b" ", t1);
+        let predicted = composed_frame(&mut a);
+        assert_eq!(composed(&mut a)[0], "line 0-");
+        let mut neovim = vec![line_hl(2, 0, 0, &format!("{:20}", "line 0"), 21)];
+        neovim.push(line_hl(2, 0, 6, "-", 23));
+        neovim.extend(cursor_to(0, 7));
+        redraw(&mut a, neovim, t1);
+        let drawn_by_neovim = composed_frame(&mut a);
+        assert_ne!(predicted.cells[6].style.bg, style::Color::Default);
+        assert_eq!(predicted.cells[6].style, drawn_by_neovim.cells[6].style);
+    }
+
+    /// Told to work out the motions alone, the client types nothing ahead
+    /// of Neovim.
+    #[test]
+    fn motions_alone_type_nothing_ahead() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        facts(&mut a, |_| {}, t1);
+        ack_i(&mut a, 0, "", 0, 1, t1);
+        redraw(&mut a, typed_frame("line 0", 0), t1);
+        a.keys(b"a", t1);
+        assert_eq!(composed(&mut a)[0], "line 0");
+        assert!(a.anim.chain(2).is_none());
+    }
+
+    /// A key a mapping in Insert mode starts with is left to Neovim, and
+    /// those after it with it, till Neovim says what it made of it.
+    #[test]
+    fn a_key_a_mapping_starts_with_waits_for_neovim() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = typing(Duration::from_millis(200));
+        facts(&mut a, |v| v[3] = Value::Array(vec!["(".into()]), t1);
+        a.keys(b"x(y", t1);
+        assert_eq!(
+            composed(&mut a)[0],
+            "xline 0",
+            "`x`, and not `(` nor what follows"
+        );
+        assert_eq!(drawn(&a), (0, 1));
+    }
+
+    /// An autopair Neovim's mappings did not have when the agent last said
+    /// them makes `(` into `()`: the `(` drawn ahead is judged wrong, and the
+    /// row and the cursor are Neovim's at once. What else is typed is drawn
+    /// as ever; `(` is worked out and judged, and not drawn, till it has
+    /// proved itself.
+    #[test]
+    fn an_autopair_defined_late_is_put_right_and_proven() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = typing(Duration::from_millis(200));
+        a.keys(b"(", t1);
+        assert_eq!(composed(&mut a)[0], "(line 0");
+        splice0(&mut a, (1, 2), "()line 0", t1);
+        ack_i(&mut a, 1, "(", 1, 2, t1);
+        redraw(&mut a, typed_frame("()line 0", 1), t1);
+        assert!(a.anim.chain(2).is_none(), "wrong");
+        assert_eq!(composed(&mut a)[0], "()line 0");
+        assert_eq!(drawn(&a), (0, 1));
+        let tally = |a: &App| a.predict.as_ref().expect("predicting").trust.tally;
+        assert_eq!(tally(&a).wrong, 1);
+        a.keys(b"x", t1);
+        assert_eq!(composed(&mut a)[0], "(x)line 0", "the rest drawn as ever");
+        assert_eq!(drawn(&a), (0, 2));
+        splice0(&mut a, (2, 3), "(x)line 0", t1);
+        ack_i(&mut a, 2, "(x", 2, 3, t1);
+        redraw(&mut a, typed_frame("(x)line 0", 2), t1);
+        assert_eq!(tally(&a).made, 1);
+        a.keys(b"(", t1);
+        assert!(a.anim.chain(2).is_some(), "worked out");
+        assert_eq!(composed(&mut a)[0], "(x)line 0", "and not drawn");
+        assert_eq!(drawn(&a), (0, 2));
+    }
+
+    /// In a buffer where a plugin's `InsertCharPre` — or `TextChangedI` —
+    /// may do anything to what is typed, it is worked out and judged, and
+    /// not drawn, till eight characters other than blanks have been judged
+    /// right: from then on, it is drawn.
+    #[test]
+    fn insert_char_pre_hides_echo_until_proven() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = typing(Duration::from_millis(200));
+        facts(&mut a, |v| v[5] = true.into(), t1);
+        a.keys(b"abcd efg", t1);
+        assert!(a.anim.chain(2).is_some(), "worked out");
+        assert_eq!(composed(&mut a)[0], "line 0", "and not drawn");
+        let keys = ["a", "b", "c", "d", "<Space>", "e", "f", "g", "h", "i"];
+        let texts: Vec<String> = (1..=10)
+            .map(|n| format!("{}line 0", &"abcd efghi"[..n]))
+            .collect();
+        let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+        neovim_typed(&mut a, 0, &keys[..8], &texts[..8], t1);
+        a.keys(b"h", t1);
+        assert_eq!(
+            composed(&mut a)[0],
+            "abcd efgline 0",
+            "seven so far, a blank aside"
+        );
+        neovim_typed(&mut a, 8, &keys[8..9], &texts[8..9], t1);
+        a.keys(b"i", t1);
+        assert_eq!(composed(&mut a)[0], "abcd efghiline 0", "proved");
+    }
+
+    /// A key Neovim takes without going to wait for another — `<C-n>`,
+    /// completing — and says nothing of: the fence asked after it finds
+    /// Neovim has taken the characters typed before it, and Neovim's frame
+    /// is the last word on them. What was typed ahead goes, and the keys
+    /// after wait for Neovim.
+    #[test]
+    fn completion_drops_the_echo_at_the_fence() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = typing(Duration::from_millis(200));
+        a.keys(b"ab", t1);
+        assert_eq!(composed(&mut a)[0], "abline 0");
+        calls(&mut a);
+        a.keys(b"\x0e", t1);
+        let fence = request(&calls(&mut a), "nvim_eval", "luaeval");
+        answer(&mut a, fence, Value::from(3), t1);
+        assert!(a.anim.chain(2).is_none());
+        assert_eq!(composed(&mut a)[0], "line 0");
+        assert_eq!(drawn(&a), (0, 0));
+        a.keys(b"c", t1);
+        assert_eq!(composed(&mut a)[0], "line 0", "blind");
+    }
+
+    /// [`stepping`]'s window, typing ahead of Neovim as well, in Normal mode
+    /// by Neovim's word, the buffer's Insert mode with nothing in it to type
+    /// otherwise, and the cursor a block in Normal mode and a bar in Insert
+    /// mode, as `'guicursor'` has them by default.
+    fn moding(rtt: Duration) -> App {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping_as(TYPING, rtt, &[]);
+        facts(&mut a, |_| {}, t1);
+        let mode = |name: &str, shape: &str| {
+            Value::Map(vec![
+                ("name".into(), name.into()),
+                ("cursor_shape".into(), shape.into()),
+                ("cell_percentage".into(), 25.into()),
+            ])
+        };
+        let modes = vec![mode("normal", "block"), mode("insert", "vertical")];
+        let events = vec![
+            ("mode_info_set", vec![true.into(), Value::Array(modes)]),
+            ("mode_change", vec!["normal".into(), 0.into()]),
+        ];
+        redraw(&mut a, events, t1);
+        a
+    }
+
+    /// The terminal's cursor as the next frame leaves it: where, and in what
+    /// shape, as `DECSCUSR` numbers them.
+    fn terminal_cursor(a: &mut App) -> ((usize, usize), u8) {
+        let mut frame = composed_frame(a);
+        let c = a.anim.paint(&mut frame, &a.model, Instant::now());
+        ((c.row, c.col), c.shape)
+    }
+
+    /// `i`, `a`, `A` and `I` over a slow link put the cursor where Neovim
+    /// puts it at once, and draw it as Insert mode draws it — a bar, where
+    /// Normal mode draws a block — before Neovim has heard of them; Neovim's
+    /// word on the key, with its frame, finds it made.
+    #[test]
+    fn i_draws_the_bar_at_once() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = moding(Duration::from_millis(200));
+        assert_eq!(terminal_cursor(&mut a), ((0, 0), 2), "a block");
+        a.keys(b"i", t1);
+        assert_eq!(terminal_cursor(&mut a), ((0, 0), 6), "a bar, at once");
+        ack_i(&mut a, 1, "i", 0, 1, t1);
+        redraw(&mut a, typed_frame("line 0", 0), t1);
+        assert!(a.anim.chain(2).is_none(), "made");
+        assert_eq!(terminal_cursor(&mut a), ((0, 0), 6), "Neovim's own");
+        for (keys, col) in [(&b"a"[..], 1), (b"A", 6), (b"$I", 0), (b"$a", 6)] {
+            let mut a = moding(Duration::from_millis(200));
+            a.keys(keys, t1);
+            assert_eq!(
+                terminal_cursor(&mut a),
+                ((0, col), 6),
+                "{:?}",
+                String::from_utf8_lossy(keys)
+            );
+        }
+    }
+
+    /// `<Esc>` after text typed ahead of Neovim puts the cursor back a
+    /// character, a block again, the text still drawn as typed — and the
+    /// motions after it go on from there, over the line as typed.
+    #[test]
+    fn esc_after_typing_goes_back_one_with_the_block() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = moding(Duration::from_millis(200));
+        a.keys(b"Afoo", t1);
+        assert_eq!(composed(&mut a)[0], "line 0foo");
+        assert_eq!(terminal_cursor(&mut a), ((0, 9), 6));
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        assert_eq!(composed(&mut a)[0], "line 0foo", "as typed");
+        assert_eq!(
+            terminal_cursor(&mut a),
+            ((0, 8), 2),
+            "back a character, a block"
+        );
+        a.keys(b"0", t1);
+        assert_eq!(terminal_cursor(&mut a), ((0, 0), 2));
+        a.keys(b"$", t1);
+        assert_eq!(terminal_cursor(&mut a), ((0, 8), 2), "the end as typed");
+        a.keys(b"j", t1);
+        assert_eq!(terminal_cursor(&mut a), ((1, 5), 2));
+        assert_eq!(composed(&mut a)[0], "line 0foo", "still as typed");
+    }
+
+    /// `<Esc>` on a line all blanks — an indent nothing was typed after,
+    /// which Neovim takes out — or after an abbreviation, which it expands,
+    /// waits for Neovim, the cursor a bar till then.
+    #[test]
+    fn esc_on_an_autoindented_blank_line_waits() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = moding(Duration::from_millis(200));
+        lined(&mut a, &["    "], &[""], t1);
+        ack0(&mut a, 0, "", 0, (1, 4), t1);
+        a.keys(b"A", t1);
+        assert_eq!(terminal_cursor(&mut a), ((0, 4), 6));
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        assert_eq!(terminal_cursor(&mut a), ((0, 4), 6), "left to Neovim");
+        let mut a = moding(Duration::from_millis(200));
+        facts(&mut a, |v| v[4] = Value::Array(vec!["teh".into()]), t1);
+        a.keys(b"Ateh", t1);
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        assert_eq!(terminal_cursor(&mut a), ((0, 9), 6), "an abbreviation");
+    }
+
+    /// A plugin's `InsertLeave` that takes out the blanks a line ends in
+    /// has `<Esc>` do more than put the cursor back: judged wrong by the
+    /// line's text as Neovim's word on it has it, the line is Neovim's at
+    /// once, and `<Esc>` proves itself in the buffer before it is drawn
+    /// there again.
+    #[test]
+    fn an_insert_leave_that_trims_the_line_is_put_right_and_proven() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = moding(Duration::from_millis(200));
+        lined(&mut a, &["ab  "], &["ab"], t1);
+        ack0(&mut a, 0, "", 0, (1, 4), t1);
+        a.keys(b"ix", t1);
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        assert_eq!(composed(&mut a)[0], "xab");
+        assert_eq!(terminal_cursor(&mut a), ((0, 0), 2), "back on the `x`");
+        splice0(&mut a, (1, 2), "xab  ", t1);
+        splice0(&mut a, (2, 3), "xab", t1);
+        let params: Vec<Value> = vec![
+            "ack".into(),
+            3.into(),
+            "ix<Esc>".into(),
+            "n".into(),
+            1000.into(),
+            1.into(),
+            3.into(),
+            50.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+            0.into(),
+            3.into(),
+        ];
+        notify(&mut a, "nvmux_client", params, t1);
+        let mut events = vec![line(2, 0, &format!("{:20}", "xab"))];
+        events.extend(cursor_to(0, 0));
+        redraw(&mut a, events, t1);
+        assert!(a.anim.chain(2).is_none());
+        let tally = a.predict.as_ref().expect("predicting").trust.tally;
+        assert_eq!(tally.wrong, 1, "{tally:?}");
+        a.keys(b"iy", t1);
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        assert_eq!(composed(&mut a)[0], "yxab", "typed as ever");
+        assert_eq!(
+            terminal_cursor(&mut a),
+            ((0, 1), 6),
+            "the <Esc> proving itself"
+        );
+    }
+
+    /// A plugin's `InsertEnter` that edits the line and moves the cursor:
+    /// the `i` drawn ahead is judged wrong by Neovim's word on it, whatever
+    /// the edit did to the buffer, and the cursor and its shape are
+    /// Neovim's at once; `i` proves itself in the buffer before it is drawn
+    /// there again.
+    #[test]
+    fn an_insert_enter_that_moves_the_cursor_is_put_right_and_proven() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = moding(Duration::from_millis(200));
+        a.keys(b"i", t1);
+        assert_eq!(terminal_cursor(&mut a), ((0, 0), 6));
+        splice0(&mut a, (1, 2), "> line 0", t1);
+        ack_i(&mut a, 1, "i", 2, 2, t1);
+        redraw(&mut a, typed_frame("> line 0", 2), t1);
+        let tally = a.predict.as_ref().expect("predicting").trust.tally;
+        assert_eq!(tally.wrong, 1, "{tally:?}");
+        assert_eq!(terminal_cursor(&mut a), ((0, 2), 6), "Neovim's");
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        ack0(&mut a, 2, "i<Esc>", 1, (2, 8), t1);
+        let mut events = vec![("mode_change", vec!["normal".into(), 0.into()])];
+        events.extend(cursor_to(0, 1));
+        redraw(&mut a, events, t1);
+        a.keys(b"i", t1);
+        assert_eq!(terminal_cursor(&mut a), ((0, 1), 2), "proving itself");
+    }
+
+    /// [`moding`], the agent saying a plugin's autocommand may do anything
+    /// in the buffer as Insert mode is entered, if `entered`, and as it is
+    /// left, if `left`.
+    fn unseen_moding(entered: bool, left: bool, now: Instant) -> App {
+        let mut a = moding(Duration::from_millis(200));
+        facts(&mut a, |v| v.extend([entered.into(), left.into()]), now);
+        a
+    }
+
+    /// The last four of `keys`, as the agent says them with its word on
+    /// them.
+    fn tail(keys: &[&str]) -> String {
+        keys[keys.len().saturating_sub(4)..].concat()
+    }
+
+    /// Neovim's frame for [`moding`]'s window in Normal mode, the cursor at
+    /// byte `col` of line `line`.
+    fn normal_frame(line: i64, col: i64) -> Vec<(&'static str, Vec<Value>)> {
+        let mut events = vec![("mode_change", vec!["normal".into(), 0.into()])];
+        events.extend(cursor_to(line, col));
+        events
+    }
+
+    /// A plugin's `InsertLeave` — or `InsertLeavePre`, or `ModeChanged` —
+    /// may move the cursor or edit the buffer, as a trimmer of the blanks
+    /// lines end in does, its `:%s` leaving the cursor on the last line it
+    /// trimmed: in its buffer, `<Esc>` is worked out and judged, and not
+    /// drawn, nor the keys after it, which go on from it, till eight have
+    /// been judged right, each leaving the buffer as it was; from then on,
+    /// it is drawn. Entering Insert mode, which nothing of the plugin's sets
+    /// off, is drawn all along.
+    #[test]
+    fn insert_leave_hides_esc_until_proven() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = unseen_moding(false, true, t1);
+        a.keys(b"A", t1);
+        assert_eq!(terminal_cursor(&mut a), ((0, 6), 6), "A drawn");
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        a.keys(b"0", t1);
+        assert_eq!(
+            terminal_cursor(&mut a),
+            ((0, 6), 6),
+            "<Esc> and 0 worked out, and not drawn"
+        );
+        assert_eq!(a.anim.chain(2).map(chain::Chain::len), Some(3));
+        let mut keys = vec!["A"];
+        ack_i(&mut a, 1, &tail(&keys), 6, 1, t1);
+        redraw(&mut a, typed_frame("line 0", 6), t1);
+        keys.push("<Esc>");
+        ack0(&mut a, 2, &tail(&keys), 5, (1, 6), t1);
+        redraw(&mut a, normal_frame(0, 5), t1);
+        keys.push("0");
+        ack0(&mut a, 3, &tail(&keys), 0, (1, 6), t1);
+        redraw(&mut a, normal_frame(0, 0), t1);
+        assert!(a.anim.chain(2).is_none(), "made");
+        for n in 1..=8 {
+            a.keys(b"A", t1);
+            keys.push("A");
+            ack_i(&mut a, keys.len() as u64, &tail(&keys), 6, 1, t1);
+            redraw(&mut a, typed_frame("line 0", 6), t1);
+            a.keys(b"\x1b", t1);
+            a.escape_timeout(t1);
+            let drawn = terminal_cursor(&mut a);
+            if n < 8 {
+                assert_eq!(drawn, ((0, 6), 6), "{n} proved so far");
+            } else {
+                assert_eq!(drawn, ((0, 5), 2), "proved");
+            }
+            keys.push("<Esc>");
+            ack0(&mut a, keys.len() as u64, &tail(&keys), 5, (1, 6), t1);
+            redraw(&mut a, normal_frame(0, 5), t1);
+        }
+        let tally = a.predict.as_ref().expect("predicting").trust.tally;
+        assert_eq!((tally.wrong, tally.hidden_wrong), (0, 0), "{tally:?}");
+    }
+
+    /// A plugin's `InsertLeave` the agent says of only once `<Esc>` has been
+    /// drawn ahead eight times and more — made by hand, or by a plugin
+    /// loaded late — finds nothing proved of what it does: `<Esc>` is worked
+    /// out and judged, and not drawn, as where it was there all along.
+    #[test]
+    fn an_insert_leave_made_after_esc_was_drawn_has_it_prove_itself() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = unseen_moding(false, false, t1);
+        let mut keys = vec![];
+        for n in 0..9 {
+            a.keys(b"A", t1);
+            keys.push("A");
+            ack_i(&mut a, keys.len() as u64, &tail(&keys), 6, 1, t1);
+            redraw(&mut a, typed_frame("line 0", 6), t1);
+            a.keys(b"\x1b", t1);
+            a.escape_timeout(t1);
+            assert_eq!(
+                terminal_cursor(&mut a),
+                ((0, 5), 2),
+                "{n}: nothing to prove"
+            );
+            keys.push("<Esc>");
+            ack0(&mut a, keys.len() as u64, &tail(&keys), 5, (1, 6), t1);
+            redraw(&mut a, normal_frame(0, 5), t1);
+        }
+        facts(&mut a, |v| v.extend([false.into(), true.into()]), t1);
+        a.keys(b"A", t1);
+        keys.push("A");
+        ack_i(&mut a, keys.len() as u64, &tail(&keys), 6, 1, t1);
+        redraw(&mut a, typed_frame("line 0", 6), t1);
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        assert_eq!(terminal_cursor(&mut a), ((0, 6), 6), "proving itself");
+    }
+
+    /// The same of a plugin's `InsertEnter` — or `ModeChanged` — and the
+    /// keys that enter Insert mode: `i` is worked out and judged, and not
+    /// drawn, nor what is typed after it, till eight have been judged
+    /// right; `<Esc>`, which nothing of the plugin's sets off, is drawn all
+    /// along.
+    #[test]
+    fn insert_enter_hides_i_until_proven() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = unseen_moding(true, false, t1);
+        a.keys(b"ix", t1);
+        assert_eq!(terminal_cursor(&mut a), ((0, 0), 2), "a block still");
+        assert_eq!(composed(&mut a)[0], "line 0", "nothing typed");
+        ack_i(&mut a, 1, "i", 0, 1, t1);
+        redraw(&mut a, typed_frame("line 0", 0), t1);
+        splice0(&mut a, (1, 2), "xline 0", t1);
+        ack_i(&mut a, 2, "ix", 1, 2, t1);
+        redraw(&mut a, typed_frame("xline 0", 1), t1);
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        assert_eq!(terminal_cursor(&mut a), ((0, 0), 2), "<Esc> drawn");
+        let mut keys = vec!["i", "x", "<Esc>"];
+        ack0(&mut a, 3, &tail(&keys), 0, (2, 7), t1);
+        redraw(&mut a, normal_frame(0, 0), t1);
+        for n in 1..=8 {
+            a.keys(b"i", t1);
+            let drawn = terminal_cursor(&mut a);
+            if n < 8 {
+                assert_eq!(drawn, ((0, 0), 2), "{n} proved so far");
+            } else {
+                assert_eq!(drawn, ((0, 0), 6), "proved");
+            }
+            keys.push("i");
+            ack_i(&mut a, keys.len() as u64, &tail(&keys), 0, 2, t1);
+            redraw(&mut a, typed_frame("xline 0", 0), t1);
+            a.keys(b"\x1b", t1);
+            a.escape_timeout(t1);
+            keys.push("<Esc>");
+            ack0(&mut a, keys.len() as u64, &tail(&keys), 0, (2, 7), t1);
+            redraw(&mut a, normal_frame(0, 0), t1);
+        }
+    }
+
+    /// `<Esc>` drawn ahead of Neovim — in a buffer whose leaving Insert mode
+    /// the agent knows nothing to set off, or has proved itself — that
+    /// Neovim makes as drawn, the line typed into as typed, but with another
+    /// line edited besides, as Neovim's word on the key before it and on it
+    /// say: an autocommand of the mode, a plugin's, that the agent did not
+    /// know of or that had done nothing till then. The motion after it was
+    /// worked out over the buffer as it was, and is let go of, and worked
+    /// out again over it as it is; and `<Esc>` proves itself in the buffer
+    /// before it is drawn there again — though not drawn wrong, for that,
+    /// nor counted so.
+    #[test]
+    fn an_esc_that_edits_another_line_proves_itself_again() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = moding(Duration::from_millis(200));
+        a.keys(b"Ax", t1);
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        a.keys(b"j", t1);
+        assert_eq!(terminal_cursor(&mut a), ((1, 5), 2), "<Esc> and j drawn");
+        ack_i(&mut a, 1, "A", 6, 1, t1);
+        redraw(&mut a, typed_frame("line 0", 6), t1);
+        splice0(&mut a, (1, 2), "line 0x", t1);
+        ack_i(&mut a, 2, "Ax", 7, 2, t1);
+        redraw(&mut a, typed_frame("line 0x", 7), t1);
+        let trimmed: Vec<Value> = vec![
+            "splice".into(),
+            1000.into(),
+            1.into(),
+            2.into(),
+            3.into(),
+            1.into(),
+            2.into(),
+            1.into(),
+            Value::Array(vec!["line 1".into()]),
+        ];
+        notify(&mut a, "nvmux_client", trimmed, t1);
+        ack0(&mut a, 3, "Ax<Esc>", 6, (3, 7), t1);
+        redraw(&mut a, normal_frame(0, 6), t1);
+        let tally = a.predict.as_ref().expect("predicting").trust.tally;
+        assert_eq!(
+            (tally.made, tally.wrong, tally.unjudged),
+            (3, 0, 1),
+            "j let go of: {tally:?}"
+        );
+        assert_eq!(a.anim.chain(2).map(chain::Chain::len), Some(1));
+        assert_eq!(terminal_cursor(&mut a), ((1, 5), 2), "and worked out again");
+        let params: Vec<Value> = vec![
+            "ack".into(),
+            4.into(),
+            "Ax<Esc>j".into(),
+            "n".into(),
+            1000.into(),
+            1.into(),
+            3.into(),
+            50.into(),
+            1.into(),
+            5.into(),
+            6.into(),
+            0.into(),
+            0.into(),
+            6.into(),
+        ];
+        notify(&mut a, "nvmux_client", params, t1);
+        redraw(&mut a, normal_frame(1, 5), t1);
+        assert!(a.anim.chain(2).is_none(), "made");
+        a.keys(b"A", t1);
+        assert_eq!(terminal_cursor(&mut a), ((1, 6), 6), "A drawn");
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        assert_eq!(terminal_cursor(&mut a), ((1, 6), 6), "<Esc> proving itself");
+    }
+
+    /// Neovim's word on text typed and on the `<Esc>` after it at once says
+    /// nothing of what leaving Insert mode did to the buffer, which the text
+    /// changed as well: where a plugin's autocommand of it may do anything,
+    /// that `<Esc>` proves nothing, and the motion after it, worked out over
+    /// the buffer as it was, is worked out again over it as it is.
+    #[test]
+    fn esc_judged_with_the_text_before_it_proves_nothing() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = unseen_moding(false, true, t1);
+        a.keys(b"Ax", t1);
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        a.keys(b"0", t1);
+        ack_i(&mut a, 1, "A", 6, 1, t1);
+        redraw(&mut a, typed_frame("line 0", 6), t1);
+        splice0(&mut a, (1, 2), "line 0x", t1);
+        ack0(&mut a, 3, "Ax<Esc>", 6, (2, 7), t1);
+        let mut events = vec![line(2, 0, &format!("{:20}", "line 0x"))];
+        events.extend(normal_frame(0, 6));
+        redraw(&mut a, events, t1);
+        let tally = a.predict.as_ref().expect("predicting").trust.tally;
+        assert_eq!(tally.unjudged, 1, "0 let go of: {tally:?}");
+        assert_eq!(
+            a.anim.chain(2).map(chain::Chain::len),
+            Some(1),
+            "and remade"
+        );
+        let mut keys = vec!["A", "x", "<Esc>", "0"];
+        ack0(&mut a, 4, &tail(&keys), 0, (2, 7), t1);
+        redraw(&mut a, normal_frame(0, 0), t1);
+        for n in 1..=9 {
+            a.keys(b"A", t1);
+            keys.push("A");
+            ack_i(&mut a, keys.len() as u64, &tail(&keys), 7, 2, t1);
+            redraw(&mut a, typed_frame("line 0x", 7), t1);
+            a.keys(b"\x1b", t1);
+            a.escape_timeout(t1);
+            let drawn = terminal_cursor(&mut a);
+            if n <= 8 {
+                assert_eq!(drawn, ((0, 7), 6), "{} proved so far", n - 1);
+            } else {
+                assert_eq!(drawn, ((0, 6), 2), "proved");
+            }
+            keys.push("<Esc>");
+            ack0(&mut a, keys.len() as u64, &tail(&keys), 6, (2, 7), t1);
+            redraw(&mut a, normal_frame(0, 6), t1);
+        }
+    }
+
+    /// A count before `i` has `<Esc>` type the text again as many times
+    /// over: the `i` and the `<Esc>` are left to Neovim, the text typed
+    /// between drawn once Neovim's word on the `i` has come.
+    #[test]
+    fn a_count_before_i_leaves_esc_to_neovim() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = moding(Duration::from_millis(200));
+        a.keys(b"2ix", t1);
+        assert_eq!(terminal_cursor(&mut a), ((0, 0), 2), "blind after `2i`");
+        ack_i(&mut a, 2, "2i", 0, 1, t1);
+        redraw(&mut a, typed_frame("line 0", 0), t1);
+        assert_eq!(composed(&mut a)[0], "xline 0");
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        assert_eq!(terminal_cursor(&mut a), ((0, 1), 6), "left to Neovim");
+    }
+
+    /// An Insert mode entered with a count, and another entered with none
+    /// after it, both before Neovim's word on the first: at that word, the
+    /// keys after it are made out again from there, its `<Esc>` — which
+    /// types the text again — left to Neovim, whatever was made of the
+    /// keys after it as they were typed.
+    #[test]
+    fn esc_after_a_count_waits_whatever_is_typed_after_it() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = moding(Duration::from_millis(200));
+        a.keys(b"3ix", t1);
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        a.keys(b"1ay", t1);
+        ack_i(&mut a, 2, "3i", 0, 1, t1);
+        redraw(&mut a, typed_frame("line 0", 0), t1);
+        assert_eq!(composed(&mut a)[0], "xline 0");
+        assert_eq!(
+            terminal_cursor(&mut a),
+            ((0, 1), 6),
+            "Insert mode still, till Neovim says"
+        );
+    }
+
+    /// `I` in Visual block mode inserts on every line of the block at
+    /// `<Esc>`, which puts the cursor where the block starts: the client
+    /// enters no Insert mode from Visual mode, and so leaves that `<Esc>`
+    /// to Neovim, though what is typed on the block's first line before it
+    /// is drawn.
+    #[test]
+    fn esc_after_a_visual_block_insert_waits_for_neovim() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = moding(Duration::from_millis(200));
+        a.keys(b"\x16jj", t1);
+        let visual: Vec<Value> = vec![
+            "ack".into(),
+            3.into(),
+            "<C-V>jj".into(),
+            "\x16".into(),
+            1000.into(),
+            1.into(),
+            1.into(),
+            50.into(),
+            2.into(),
+            2.into(),
+            2.into(),
+            0.into(),
+            0.into(),
+            6.into(),
+        ];
+        notify(&mut a, "nvmux_client", visual, t1);
+        let mut events = vec![("mode_change", vec!["visual".into(), 2.into()])];
+        events.extend(cursor_to(2, 2));
+        redraw(&mut a, events, t1);
+        a.keys(b"Ifoo", t1);
+        ack_i(&mut a, 4, "<C-V>jjI", 0, 1, t1);
+        redraw(&mut a, typed_frame("line 0", 0), t1);
+        assert_eq!(composed(&mut a)[0], "fooline 0");
+        a.keys(b"\x1b", t1);
+        a.escape_timeout(t1);
+        assert_eq!(terminal_cursor(&mut a), ((0, 3), 6), "left to Neovim");
     }
 
     /// The device attributes that close the kitty question are the client's
@@ -6098,15 +12292,15 @@ mod tests {
             .any(|(_, m, _)| m == "nvim_ui_term_event"));
     }
 
-    /// An escape held is let go `'ttimeoutlen'` after it came, whatever else
-    /// wakes the loop in between.
+    /// An escape held is let go `'ttimeoutlen'` after it came, and no later
+    /// than the relay's own wait, whatever else wakes the loop in between.
     #[test]
     fn an_escape_is_let_go_on_time() {
         let t0 = Instant::now();
         let mut a = app(false);
         a.keys(b"\x1b", t0);
-        let at = t0 + Duration::from_millis(50);
-        assert_eq!(a.wake_at(t0 + Duration::from_millis(20)), Some(at));
+        let at = t0 + Duration::from_millis(RELAYED_ESCAPE);
+        assert_eq!(a.wake_at(t0 + Duration::from_millis(5)), Some(at));
         assert!(!a.escape_due(at - Duration::from_millis(1)));
         assert!(a.escape_due(at));
         a.escape_timeout(at);
@@ -6115,6 +12309,29 @@ mod tests {
             .iter()
             .any(|(_, m, args)| m == "nvim_input" && args[0] == Value::from("<Esc>")));
         assert_eq!(a.wake_at(at), None);
+    }
+
+    /// A `'ttimeoutlen'` shorter than the relay's wait is kept, and none at
+    /// all lets an escape go at once.
+    #[test]
+    fn a_shorter_ttimeoutlen_is_kept() {
+        let t0 = Instant::now();
+        let mut a = app(false);
+        redraw(
+            &mut a,
+            vec![("option_set", vec!["ttimeoutlen".into(), 5.into()])],
+            t0,
+        );
+        a.keys(b"\x1b", t0);
+        assert_eq!(a.wake_at(t0), Some(t0 + Duration::from_millis(5)));
+        a.escape_timeout(t0 + Duration::from_millis(5));
+        redraw(
+            &mut a,
+            vec![("option_set", vec!["ttimeout".into(), false.into()])],
+            t0,
+        );
+        a.keys(b"\x1b", t0);
+        assert_eq!(a.wake_at(t0), Some(t0 + Duration::from_millis(1)));
     }
 
     /// A terminal's answer part way through is waited for longer than an
