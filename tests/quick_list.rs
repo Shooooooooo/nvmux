@@ -58,8 +58,10 @@ fn a_quick_listing_does_not_wait_on_a_busy_session() {
         !doomed_sock.exists(),
         "the stale socket should have been reaped"
     );
+    // Waiting on the busy session is waiting out a probe's budget, which a
+    // listing that does not leaves well short of, on a busy machine too.
     assert!(
-        took < Duration::from_secs(2),
+        took < nvmux::rpc::PROBE_TIMEOUT - Duration::from_millis(500),
         "the listing waited {took:?} on a busy session"
     );
 }

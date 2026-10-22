@@ -723,19 +723,18 @@ fn ten_listings_on_one_transport_agree() {
         .create_session("beta", &common::launch(), common::anywhere())
         .expect("create beta");
 
-    // Everything the picker draws and everything a switch resolves against.
-    let rows = |sessions: &[Session]| -> Vec<(String, String, u32, u32, Liveness)> {
+    // Everything the picker draws and everything a switch resolves against
+    // that the listing decides. Not whether a session is busy or idle, which
+    // a probe of a quarter of a second decides, each time, and a busy machine
+    // can have it say either of an idle one: that it is not dead.
+    let rows = |sessions: &[Session]| -> Vec<(String, String, u32, u32)> {
+        assert!(
+            sessions.iter().all(|s| s.state.liveness != Liveness::Dead),
+            "a live session listed as dead: {sessions:?}"
+        );
         sessions
             .iter()
-            .map(|s| {
-                (
-                    s.id.clone(),
-                    s.name.clone(),
-                    s.pid,
-                    s.state.num,
-                    s.state.liveness,
-                )
-            })
+            .map(|s| (s.id.clone(), s.name.clone(), s.pid, s.state.num))
             .collect()
     };
     let first = rows(&t.list_sessions().expect("list"));
@@ -1082,8 +1081,10 @@ fn a_session_at_a_hit_enter_prompt_is_listed_at_once_as_busy() {
     let listed = t.list_sessions().expect("list");
     let took = started.elapsed();
 
+    // A probe that waits on a deferred call again waits out its budget, which
+    // a listing that does not leaves well short of, on a busy machine too.
     assert!(
-        took < Duration::from_secs(1),
+        took < nvmux::rpc::PROBE_TIMEOUT - Duration::from_millis(500),
         "listing took {took:?}: the probe waited on a deferred call again"
     );
     let s = listed
