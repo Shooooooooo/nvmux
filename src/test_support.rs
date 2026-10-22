@@ -38,6 +38,21 @@ pub(crate) fn scratch_sock(tag: &str) -> PathBuf {
     scratch_path(&format!("{tag}.sock"))
 }
 
+/// Run `f`, which provokes a panic on purpose and catches it, with the panic
+/// hook quiet. The hook is the whole test binary's: two tests swapping it at
+/// once can each put back the other's quiet one, and leave every panic after
+/// them — a failing test's own message among them — unsaid. So they take
+/// turns.
+pub(crate) fn quietly<T>(f: impl FnOnce() -> T) -> T {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _turn = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let out = f();
+    std::panic::set_hook(hook);
+    out
+}
+
 /// Leave a socket at `path` that nothing will ever accept a connection on, as
 /// a server that has gone leaves its own behind.
 ///
