@@ -484,15 +484,22 @@ impl Floating for Panel {
         .min()
     }
 
-    /// Moved on to `now`: the listing behind the rows taken up if it has come
-    /// and the picker is at rest, the sessions handed to the reader of their
-    /// notes and what they said taken up, a kill or a move made once what was
-    /// passing over its row is over, the panel taken down for a new session
-    /// once the gap it opened is up, and a half-typed number settled once its
-    /// wait has run out.
+    /// Moved on to `now`: whatever was passing over the picker moved on with
+    /// it — the row the cursor left a little further back from the bar, say —
+    /// the listing behind the rows taken up if it has come and the picker is
+    /// at rest, the sessions handed to the reader of their notes and what
+    /// they said taken up, a kill or a move made once what was passing over
+    /// its row is over, the panel taken down for a new session once the gap
+    /// it opened is up, and a half-typed number settled once its wait has run
+    /// out.
+    ///
+    /// What was passing changes with the tick that ends it too, as the
+    /// settings' bar does: that is the frame that has the picker at rest
+    /// again, and without it the row the cursor left stays as the glow's last
+    /// frame had it, not quite back from the bar.
     fn tick(&mut self, now: Instant) -> bool {
+        let mut changed = self.app.animating();
         self.move_on(now);
-        let mut changed = false;
         if self.listing.is_some() {
             super::take_listing(&mut self.app, &mut self.listing);
             if self.listing.is_none() {
@@ -744,6 +751,30 @@ mod tests {
         panel.back();
         assert!(!panel.app.has_room(), "the gap closed");
         assert!(!panel.closing());
+        hand(&[], None);
+    }
+
+    /// The row the cursor leaves glows as the panel moves on, and the tick
+    /// that ends the glow is a change as much as the ticks on the way: it is
+    /// the frame that shows the row back at rest, for the relay to paint.
+    #[test]
+    fn the_tick_that_ends_the_glow_is_a_change() {
+        let _turn = lock(&crate::ui::test_support::PANELS);
+        let (other, behind) = ("aaaaaaaa", "bbbbbbbb");
+        hand(&rows(&[other, behind]), None);
+        let mut panel = Panel::open(behind);
+        panel.app.set_effects(true);
+        let now = Instant::now();
+        let up = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(panel.on_key(up, now), Did::Stay);
+        assert!(panel.moving(), "the row left glows");
+        assert!(panel.tick(now + effects::AFTERGLOW / 2), "on its way back");
+        assert!(panel.tick(now + effects::AFTERGLOW), "the last of the glow");
+        assert!(!panel.moving());
+        assert!(
+            !panel.tick(now + effects::AFTERGLOW * 2),
+            "and nothing after"
+        );
         hand(&[], None);
     }
 
