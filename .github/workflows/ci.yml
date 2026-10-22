@@ -61,7 +61,17 @@ jobs:
       - run: cargo fmt --check
         if: runner.os == 'Linux'
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      # Sixteen tests at once have between 256 and 384 files open at the most:
+      # under a soft limit of 256, a stock macOS shell's, tests/client.rs fails
+      # with EMFILE. Raised where it is lower, as it may be on macOS; a Linux
+      # runner allows 65536.
+      - name: cargo test
+        run: |
+          if [ "$(ulimit -n)" != unlimited ] && [ "$(ulimit -n)" -lt 4096 ]; then
+            ulimit -n 4096
+          fi
+          ulimit -n
+          cargo test
 
   msrv:
     name: rust-version check
