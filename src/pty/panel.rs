@@ -1,5 +1,6 @@
-//! The settings, the help and the picker, floating over the session:
-//! `<prefix> ,`, `<prefix> ?` and `<prefix> Space`.
+//! The settings, the help, the picker and the prompt that names a session,
+//! floating over the session: `<prefix> ,`, `<prefix> ?`, `<prefix> Space`
+//! and `<prefix> c`, and the picker's `c` and `r`.
 //!
 //! Each screen ([`crate::ui::settings`], [`crate::ui::help`]) used to take
 //! the terminal, the session dissolving out under it and back in after. Here
@@ -42,18 +43,24 @@
 //! comes up out of the background. Going, the other way round. With the fade
 //! off it is at once. While it is up, whatever moves on it — the settings'
 //! bar, whose row it leaves fades back from it as the picker's does (see
-//! [`crate::ui::settings`]) — has frames at the fade's pace until it stops.
+//! [`crate::ui::settings`]) — has frames at the fade's pace until it stops;
+//! and a key or the mouse has its frame at once, as it does full screen.
 //!
 //! The picker can go two other ways ([`Leave`]). To another session, or to a
 //! screen of its own, it goes out with the session, the two into the
 //! background together, and the relay has nothing left to dissolve. To the
-//! help or the settings, it goes out alone, and the other comes up in its
-//! place over the session as it stands, dimmed.
+//! help, the settings or the prompt, it goes out alone, and the other comes
+//! up in its place over the session as it stands, dimmed — set aside rather
+//! than taken down, and back the same way, as it was left, when that one is
+//! taken down, as the picker full screen is back after them. The prompt goes
+//! out with the session where it has made one, to it.
 //!
 //! And the settings can come the other way: from their screen full screen,
 //! turned to float, they come up over the session as the relay brings it
 //! back — with it, the two out of the background together, as the picker
-//! goes out to a screen of its own the other way round.
+//! goes out to a screen of its own the other way round. So does the picker,
+//! back from a prompt it went out to full screen, where the prompt could not
+//! float ([`Attachment::float_the_picker`]).
 //!
 //! # Where it does not float
 //!
@@ -65,7 +72,8 @@
 //! screen says how big a one it needs ([`Floating::area`]) — and for a
 //! session nvmux keeps no copy of, the screen takes the terminal as it always
 //! did ([`Outcome::ShowSettings`], [`Outcome::ShowHelp`],
-//! [`Outcome::ToPicker`]). With `[style] float` off, none of them floats:
+//! [`Outcome::ToPicker`], [`Outcome::CreateNew`], [`Outcome::CreateAfter`],
+//! [`Outcome::Rename`]). With `[style] float` off, none of them floats:
 //! each takes the terminal, wherever it could have floated. Turned off by the
 //! settings as they float, they go out with the session, as the picker goes
 //! to a screen of its own, and come up full screen in their place; and turned
@@ -91,6 +99,7 @@ use crate::palette::Palette;
 use crate::shadow::{Cursor, Laid, Shade, Shadow};
 use crate::term::{self, write_stdout, MouseReporting};
 use crate::ui::float::{Did, Floating, Leave};
+use crate::ui::prompt::{self, Place};
 use crate::ui::{help, picker, settings};
 use crate::{card, config, fade, falloff, winch};
 
@@ -172,6 +181,11 @@ pub(super) enum What {
     Help,
     /// `<prefix> Space`.
     Picker,
+    /// The prompt for a new session, to go at the place given: `<prefix> c`,
+    /// and the picker's `c`.
+    Create(Place),
+    /// The prompt for a session's new name: the picker's `r`.
+    Rename(crate::ids::Id),
 }
 
 impl What {
@@ -185,8 +199,11 @@ impl What {
             Outcome::ShowSettings => Some(What::Settings),
             Outcome::ShowHelp => Some(What::Help),
             Outcome::ToPicker => Some(What::Picker),
+            Outcome::CreateNew => Some(What::Create(Place::Last)),
+            // The picker's prompts full screen, where they could not float:
+            // they float from the picker, which no command ends a relay in.
+            Outcome::CreateAfter(_) | Outcome::Rename(_) => None,
             Outcome::Detached
-            | Outcome::CreateNew
             | Outcome::Resettle
             | Outcome::Switch(_)
             | Outcome::ChildExited
@@ -200,6 +217,8 @@ impl What {
             What::Settings => Box::new(settings::Panel::open()),
             What::Help => Box::new(help::Panel::open()),
             What::Picker => Box::new(picker::Panel::open(behind)),
+            What::Create(place) => Box::new(prompt::Panel::create(place)),
+            What::Rename(id) => Box::new(prompt::Panel::rename(id)),
         }
     }
 
@@ -209,6 +228,9 @@ impl What {
             What::Settings => Outcome::ShowSettings,
             What::Help => Outcome::ShowHelp,
             What::Picker => Outcome::ToPicker,
+            What::Create(Place::Last) => Outcome::CreateNew,
+            What::Create(Place::After(after)) => Outcome::CreateAfter(after),
+            What::Rename(id) => Outcome::Rename(id),
         }
     }
 }
@@ -229,24 +251,39 @@ impl Way {
     fn of(leave: Option<Leave>) -> Self {
         match leave {
             None | Some(Leave::Quit) => Way::Back,
-            Some(Leave::Switch(_) | Leave::New | Leave::Picker) => Way::Away,
+            Some(Leave::Switch(_)) => Way::Away,
             Some(Leave::Help) => Way::Across(What::Help),
             Some(Leave::Settings) => Way::Across(What::Settings),
+            Some(Leave::New(after)) => Way::Across(What::Create(Place::After(after))),
+            Some(Leave::Rename(id)) => Way::Across(What::Rename(id)),
+        }
+    }
+
+    /// How the panel up goes, now it is taken down: as `leave` says (see
+    /// [`Way::of`]) — but out with the session where `[style] float` was
+    /// turned off under it, and back across to the picker where that is set
+    /// aside under it, the help, the settings or the prompt it went across to
+    /// having nowhere else to go: the picker full screen is back after them.
+    fn going(leave: Option<Leave>, picker_under: bool, unfloated: bool) -> Self {
+        if unfloated {
+            return Way::Away;
+        }
+        match Way::of(leave) {
+            Way::Back if picker_under => Way::Across(What::Picker),
+            way => way,
         }
     }
 }
 
 /// What ends the relay once a panel that is going somewhere is down: the
-/// session to switch to, the create prompt, the picker full screen, or out.
+/// session to switch to — another, or one the prompt has just made — or out.
 /// `None` for the ways that keep the relay: back to the session, or across
 /// to another panel.
 fn ends_in(leave: Leave) -> Option<Outcome> {
     match leave {
         Leave::Switch(id) => Some(Outcome::Switch(Target::Session(id))),
-        Leave::New => Some(Outcome::CreateNew),
-        Leave::Picker => Some(Outcome::ToPicker),
         Leave::Quit => Some(Outcome::Detached),
-        Leave::Help | Leave::Settings => None,
+        Leave::Help | Leave::Settings | Leave::New(_) | Leave::Rename(_) => None,
     }
 }
 
@@ -299,6 +336,10 @@ pub(super) fn float(
 ) -> Result<Option<Outcome>> {
     let mut what = what;
     let mut panel = what.open(&a.session_id);
+    // The picker, set aside while the help or the settings it went across
+    // to are up in its place: they go back across to it, and it comes back
+    // as it was left.
+    let mut under: Option<Box<dyn Floating>> = None;
     let size = term::terminal_size();
     let mut screen = Rect::new(0, 0, size.cols, size.rows);
     let Some(mut area) = panel.area(screen) else {
@@ -359,14 +400,8 @@ pub(super) fn float(
         // Frames at a frame's pace while anything moves: the panel coming or
         // going, or a row on it fading back from the bar.
         let lively = moving || panel.moving();
-        let frame_due = (lively || owed).then(|| {
-            let gap = if lively || !session_drew {
-                fade::FRAME
-            } else {
-                SESSION_FRAME
-            };
-            last_frame.map_or(now, |last| last + gap)
-        });
+        let frame_due = (lively || owed)
+            .then(|| last_frame.map_or(now, |last| last + gap(lively, session_drew)));
         let next = [frame_due, sequence_due, panel.wake_at()]
             .into_iter()
             .flatten()
@@ -442,6 +477,9 @@ pub(super) fn float(
         }
         // Whether the panel was taken down by what came in, or by the clock.
         let was_going = going;
+        // Whether a key or the mouse came in for the panel, which a frame
+        // answers at once (see `due`).
+        let mut asked = false;
         for input in inputs {
             match input {
                 Input::Client(bytes) => {
@@ -451,12 +489,14 @@ pub(super) fn float(
                 _ if going => {}
                 Input::Key(key) => {
                     owed = true;
+                    asked = true;
                     if panel.on_key(key, now) == Did::Close {
                         going = true;
                     }
                 }
                 Input::Mouse(mouse) => {
                     owed = true;
+                    asked = true;
                     let outside = !area.contains((mouse.column, mouse.row).into());
                     let press = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
                     // A press outside takes the panel down, as `Esc` does.
@@ -479,11 +519,7 @@ pub(super) fn float(
         // Taken down just now: the way out the panel says, from wherever
         // the way in has got to.
         if going && !was_going {
-            way = if unfloated {
-                Way::Away
-            } else {
-                Way::of(panel.leave())
-            };
+            way = Way::going(panel.leave(), under.is_some(), unfloated);
             let there = coming.at(now);
             let length = fade_length(look);
             match way {
@@ -502,13 +538,33 @@ pub(super) fn float(
         let moving = !coming.done(now) || !away.done(now);
         // Gone the whole way out.
         if going && !moving {
-            panel.close();
+            // Taken down — but for the picker going across to the help or
+            // the settings, which is set aside to come back to.
+            let aside = what == What::Picker && matches!(way, Way::Across(_));
+            if !aside {
+                panel.close();
+            }
             match way {
                 // The next panel comes up in its place, out of the
-                // background, over the session as it stands, dimmed.
+                // background, over the session as it stands, dimmed: the
+                // picker as it was set aside, where it is the one.
                 Way::Across(next) => {
+                    let set_aside = match next {
+                        What::Picker => under.take(),
+                        What::Help | What::Settings | What::Create(_) | What::Rename(_) => None,
+                    };
+                    let up = match set_aside {
+                        Some(mut picker) => {
+                            picker.back();
+                            picker
+                        }
+                        None => next.open(&a.session_id),
+                    };
+                    let gone = std::mem::replace(&mut panel, up);
+                    if aside {
+                        under = Some(gone);
+                    }
                     what = next;
-                    panel = what.open(&a.session_id);
                     match panel.area(screen) {
                         Some(fits) => area = fits,
                         None => {
@@ -557,15 +613,7 @@ pub(super) fn float(
             return Ok(settle.then_some(Outcome::Resettle));
         }
         let lively = moving || panel.moving();
-        let due = last_frame.is_none_or(|last| {
-            let gap = if lively || !session_drew {
-                fade::FRAME
-            } else {
-                SESSION_FRAME
-            };
-            now >= last + gap
-        });
-        if (lively || owed) && due {
+        if (lively || owed) && due(now, last_frame, lively, session_drew, asked) {
             // A frame that could not go out is tried again a frame later.
             last_frame = Some(now);
             // Where the panel goes on the screen as it is now: the picker's
@@ -633,6 +681,30 @@ fn fade_length(look: Look) -> Duration {
         }
         Look::Dimmed(_) | Look::Faint => Duration::ZERO,
     }
+}
+
+/// How long after a frame the next may go out: a frame's pace while anything
+/// moves (`lively`), or while the session has drawn nothing; and while all
+/// there is to show is what the session drew, which is repainted under the
+/// panel whole, [`SESSION_FRAME`].
+fn gap(lively: bool, session_drew: bool) -> Duration {
+    if lively || !session_drew {
+        fade::FRAME
+    } else {
+        SESSION_FRAME
+    }
+}
+
+/// Whether a frame may go out at `now`, the last having gone at `last`: a
+/// [`gap`] after it — but at once for a key or the mouse (`asked`), as the
+/// picker full screen draws the moment it has taken one. Held to the frames'
+/// pace, a key that came just after a frame waited most of one for its own,
+/// with what it started — the row the cursor left fading back from the bar —
+/// part way gone before it was first seen; the more so the faster the keys
+/// came, and by a different amount every key with one held down, so the
+/// glow they left beat with the frames.
+fn due(now: Instant, last: Option<Instant>, lively: bool, session_drew: bool, asked: bool) -> bool {
+    asked || last.is_none_or(|last| now >= last + gap(lively, session_drew))
 }
 
 /// A client that draws cards hears the settings as they change, so what it
@@ -973,23 +1045,38 @@ mod tests {
         assert!(out.ends_with(&end), "{:?}", String::from_utf8_lossy(&out));
     }
 
-    /// The settings, the help and the picker float, each in place of its own
-    /// screen and full screen as itself where it cannot; nothing else floats.
-    /// With `[style] float` off, none of them does.
+    /// The settings, the help, the picker and the create prompt float, each in
+    /// place of its own screen and full screen as itself where it cannot;
+    /// nothing else floats. With `[style] float` off, none of them does. The
+    /// picker's prompts float from the picker, and full screen are
+    /// themselves too.
     #[test]
-    fn the_settings_the_help_and_the_picker_float_and_nothing_else() {
+    fn the_settings_the_help_the_picker_and_the_prompt_float_and_nothing_else() {
         for (outcome, what) in [
             (Outcome::ShowSettings, What::Settings),
             (Outcome::ShowHelp, What::Help),
             (Outcome::ToPicker, What::Picker),
+            (Outcome::CreateNew, What::Create(Place::Last)),
         ] {
             assert_eq!(What::of(outcome, true), Some(what));
             assert_eq!(What::of(outcome, false), None, "{outcome:?}, off");
             assert_eq!(what.full_screen(), outcome);
         }
+        let id = crate::ids::Id::new("abcd2345").expect("an id");
+        for (what, outcome) in [
+            (
+                What::Create(Place::After(Some(id))),
+                Outcome::CreateAfter(Some(id)),
+            ),
+            (What::Create(Place::After(None)), Outcome::CreateAfter(None)),
+            (What::Rename(id), Outcome::Rename(id)),
+        ] {
+            assert_eq!(what.full_screen(), outcome);
+        }
         for outcome in [
             Outcome::Detached,
-            Outcome::CreateNew,
+            Outcome::CreateAfter(Some(id)),
+            Outcome::Rename(id),
             Outcome::Resettle,
             Outcome::ChildExited,
             Outcome::StdinClosed,
@@ -1056,28 +1143,70 @@ mod tests {
         assert_eq!(frame(way_in(false, whole, t0), t0), (0.0, 0.0, 0.0));
     }
 
-    /// Where the picker's keys lead: to another session, the prompt and the
-    /// picker full screen out with the session; to the help and the settings
-    /// across, over it; and out of nvmux, or nowhere, back to it first.
+    /// Where the picker's keys lead: to another session, out with the
+    /// session — as a prompt that has made one leads there; to the help, the
+    /// settings and the prompts across, over it; and out of nvmux, or
+    /// nowhere, back to it first.
     #[test]
     fn the_pickers_ways_out() {
         let id = crate::ids::Id::new("abcd2345").expect("an id");
         assert_eq!(Way::of(None), Way::Back);
         assert_eq!(Way::of(Some(Leave::Quit)), Way::Back);
-        for leave in [Leave::Switch(id), Leave::New, Leave::Picker] {
-            assert_eq!(Way::of(Some(leave)), Way::Away, "{leave:?}");
-        }
+        assert_eq!(Way::of(Some(Leave::Switch(id))), Way::Away);
         assert_eq!(Way::of(Some(Leave::Help)), Way::Across(What::Help));
         assert_eq!(Way::of(Some(Leave::Settings)), Way::Across(What::Settings));
+        assert_eq!(
+            Way::of(Some(Leave::New(Some(id)))),
+            Way::Across(What::Create(Place::After(Some(id))))
+        );
+        assert_eq!(
+            Way::of(Some(Leave::New(None))),
+            Way::Across(What::Create(Place::After(None)))
+        );
+        assert_eq!(
+            Way::of(Some(Leave::Rename(id))),
+            Way::Across(What::Rename(id))
+        );
         assert_eq!(
             ends_in(Leave::Switch(id)),
             Some(Outcome::Switch(Target::Session(id)))
         );
-        assert_eq!(ends_in(Leave::New), Some(Outcome::CreateNew));
-        assert_eq!(ends_in(Leave::Picker), Some(Outcome::ToPicker));
         assert_eq!(ends_in(Leave::Quit), Some(Outcome::Detached));
-        assert_eq!(ends_in(Leave::Help), None);
-        assert_eq!(ends_in(Leave::Settings), None);
+        for leave in [
+            Leave::Help,
+            Leave::Settings,
+            Leave::New(Some(id)),
+            Leave::Rename(id),
+        ] {
+            assert_eq!(ends_in(leave), None, "{leave:?}");
+        }
+    }
+
+    /// The help, the settings and the prompts the picker went across to go
+    /// back across to it, however they are taken down, as they go back to the
+    /// picker full screen — unless a prompt made a session, which is gone
+    /// to; with no picker set aside under them, back to the session. With
+    /// `[style] float` turned off under them, out with the session either way.
+    /// The picker itself goes where its key says.
+    #[test]
+    fn the_help_the_settings_and_the_prompts_go_back_to_the_picker() {
+        assert_eq!(Way::going(None, true, false), Way::Across(What::Picker));
+        assert_eq!(Way::going(None, false, false), Way::Back);
+        assert_eq!(Way::going(None, true, true), Way::Away);
+        assert_eq!(Way::going(None, false, true), Way::Away);
+        let id = crate::ids::Id::new("abcd2345").expect("an id");
+        assert_eq!(
+            Way::going(Some(Leave::Switch(id)), true, false),
+            Way::Away,
+            "a prompt that made a session goes to it"
+        );
+        for leave in [Leave::Help, Leave::Settings, Leave::Switch(id), Leave::Quit] {
+            assert_eq!(
+                Way::going(Some(leave), false, false),
+                Way::of(Some(leave)),
+                "{leave:?}"
+            );
+        }
     }
 
     /// The way in takes as much of the fade as the way is long, and ends
@@ -1100,5 +1229,30 @@ mod tests {
         let at_once = Coming::to(0.0, 1.0, Duration::ZERO, t0);
         assert_eq!(at_once.at(t0), 1.0);
         assert!(at_once.done(t0));
+    }
+
+    /// A key or the mouse has its frame at once, however soon after the last
+    /// one it comes; a row fading back from the bar has one a frame after the
+    /// last, and the session drawing on its own a slower pace than that.
+    #[test]
+    fn a_key_is_answered_at_once_and_the_rest_at_their_pace() {
+        let t0 = Instant::now();
+        let soon = t0 + Duration::from_millis(1);
+        assert!(
+            due(soon, Some(t0), true, false, true),
+            "a key, just after a frame"
+        );
+        assert!(
+            due(soon, Some(t0), false, true, true),
+            "or after the session drew"
+        );
+        assert!(!due(soon, Some(t0), true, false, false), "a fade waits");
+        assert!(due(t0 + fade::FRAME, Some(t0), true, false, false));
+        assert!(
+            !due(t0 + fade::FRAME, Some(t0), false, true, false),
+            "and the session longer"
+        );
+        assert!(due(t0 + SESSION_FRAME, Some(t0), false, true, false));
+        assert!(due(t0, None, false, false, false), "the first frame");
     }
 }

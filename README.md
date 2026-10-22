@@ -106,9 +106,10 @@ under `[keys.bind]` — `detach = "x"` makes it `<prefix> x` — as
 | `help` | `<prefix>` `?` | show these keys, as you have them, over the session — `Esc` goes back |
 | `settings` | `<prefix>` `,` | change nvmux's settings while it runs, over the session — `Esc` goes back |
 
-The picker, the help and the settings float over the session, which goes on
-running behind them, dimmed; `float = false` under `[style]` has each take
-the whole screen instead. Flipped in the settings, it moves them at once.
+The picker, the help, the settings and the prompt that names a new session
+or a renamed one float over the session, which goes on running behind them,
+dimmed; `float = false` under `[style]` has each take the whole screen
+instead. Flipped in the settings, it moves them at once.
 
 Two keys after the prefix are not commands, and stay where they are: a number
 — `<prefix> 1`, `<prefix> 12` — switches straight to that session, and
@@ -231,31 +232,18 @@ stopping where the text does.
 ### Over a slow link
 
 Over ssh, every key waits a round trip for Neovim to say what it did with it.
-nvmux's own client draws some keys at once instead, before Neovim has heard of
-them, much as [mosh](https://mosh.org) echoes what you type: scrolls (`<C-d>`,
-`<C-f>`, `zz`, the mouse wheel and their kind), cursor motions in Normal mode
-(`h`, `j`, `w`, `fx`, `}`, `G`, `$` and their kind), and what you type in Insert
-mode. It draws each only where it can work out exactly what Neovim will do, and
-Neovim has the last word: anything it did otherwise is put back as Neovim drew
-it, a round trip later.
+nvmux's own client draws some keys at once instead, much as
+[mosh](https://mosh.org) echoes what you type: scrolls, cursor motions in
+Normal mode, and what you type in Insert mode. It does so only where it can
+work out exactly what Neovim will do, and anything Neovim did otherwise is put
+back a round trip later.
 
-Each kind has a setting of its own under `[client]` — `predict_scrolls`,
-`predict_motions` and `predict_typing` — set to one of:
-
-| Value | Means |
-|---|---|
-| `"auto"` | the default: on for a session on a remote host, off for one on this machine |
-| `"on"` | on for every session, this machine's too |
-| `"off"` | off: every key of its kind waits for Neovim |
-
-On, keys are drawn ahead whatever the round trip: even 20 or 30 ms is felt, a
-key held down or typed fast. A session on this machine answers in a fraction
-of a millisecond, before anything drawn ahead could be seen, which is why
-`"auto"` leaves its sessions off.
-
-The motions and the typing have the editor say what it made of each key, about
-40 bytes a key back over the link; and the typing has it send the line you are
-typing on with each key, about a hundred bytes on a short line.
+Each kind has a setting under `[client]` — `predict_scrolls`,
+`predict_motions` and `predict_typing` — that is `"auto"` by default: on for a
+session on a remote host, off for one on this machine, which answers before
+anything drawn ahead could be seen. `"on"` or `"off"` sets it for every
+session. The motions and the typing cost about 40 bytes a key back over the
+link, and the typing about a hundred more on a short line.
 
 ## Configuration
 
@@ -299,7 +287,7 @@ window_width    = 120      # with centre on, how many columns a window's text ge
 
 [style]
 color = "terminal"   # or "#rrggbb": nvmux's text and bars in that colour; dim text stays dim
-float = true         # the picker, settings and help over the session; false takes the screen
+float = true         # the picker, settings, help and prompts over the session; false takes the screen
 
 [effects]
 enabled = true   # master switch: false turns every effect below off

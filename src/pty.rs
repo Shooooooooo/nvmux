@@ -169,14 +169,28 @@ const WAITING: &str = " — press a key";
 pub enum Outcome {
     /// `<prefix> Space` with `[style] float` off, on a terminal too small for
     /// the picker to float over the session, or for a session nvmux keeps no
-    /// copy of; or a rename from the picker floating: show the picker full
-    /// screen. The child keeps running.
+    /// copy of: show the picker full screen. The child keeps running.
     ToPicker,
     /// `<prefix> d` — detach and exit, leaving the session running.
     Detached,
-    /// `<prefix> c` — prompt for a name and create a new session. The child keeps
-    /// running, so a cancelled prompt puts the user straight back.
+    /// `<prefix> c` with `[style] float` off, on a terminal too small for the
+    /// prompt to float over the session, or for a session nvmux keeps no copy
+    /// of — prompt for a name full screen and create a new session. The child
+    /// keeps running, so a cancelled prompt puts the user straight back.
     CreateNew,
+    /// `c` on the picker floating over the session, where the prompt cannot
+    /// float in its place: on a terminal too small for it — prompt for a name
+    /// full screen and create a new session after the session named, the row
+    /// the picker's cursor was on, as the picker full screen places one; a
+    /// cancelled prompt comes back to this session with the picker floating
+    /// over it again (see [`Attachment::float_the_picker`]). The child keeps
+    /// running.
+    CreateAfter(Option<crate::ids::Id>),
+    /// `r` on the picker floating over the session, where the prompt cannot
+    /// float in its place — prompt full screen for a new name for the session
+    /// it names, and come back to this one with the picker floating over it
+    /// again (see [`Attachment::float_the_picker`]). The child keeps running.
+    Rename(crate::ids::Id),
     /// `<prefix> ?` with `[style] float` off, on a terminal too small for the
     /// help to float over the session, or a session nvmux keeps no copy of:
     /// show the key bindings full screen. The child keeps running.
@@ -209,17 +223,19 @@ impl Outcome {
     /// [`crate::ui`] screen in between to clear the outgoing frame on the way.
     ///
     /// Only a switch does — by number or by step. `ToPicker`, `CreateNew`,
-    /// `ShowHelp` and `ShowSettings` all open a screen, and a screen clears as
-    /// it opens; `Resettle` comes back to the session by the session loop;
-    /// the rest end the relay for good.
+    /// `CreateAfter`, `Rename`, `ShowHelp` and `ShowSettings` all open a
+    /// screen, and a screen clears as it opens; `Resettle` comes back to the
+    /// session by the session loop; the rest end the relay for good.
     fn leads_straight_into_another_relay(self) -> bool {
         matches!(self, Outcome::Switch(_))
     }
 
     /// The session this outcome names, for the caller that starts the next
     /// attachment while the outgoing one dissolves (see [`relay`]). `None` for
-    /// every other way a relay can end: the four that open a screen have
-    /// nothing to start yet, and the three that end it have nowhere to go.
+    /// every other way a relay can end: the six that open a screen have
+    /// nothing to start yet — a prompt from the picker comes back to this
+    /// session, whichever session it names — and the three that end it have
+    /// nowhere to go.
     ///
     /// Its own accessor rather than a `matches!` at the call site, so the one
     /// rule it carries is pinned by a test — a new outcome that leads into
@@ -231,6 +247,8 @@ impl Outcome {
             Outcome::ToPicker
             | Outcome::Detached
             | Outcome::CreateNew
+            | Outcome::CreateAfter(_)
+            | Outcome::Rename(_)
             | Outcome::ShowHelp
             | Outcome::ShowSettings
             | Outcome::Resettle
@@ -407,18 +425,20 @@ pub struct Attachment {
     /// the picker's `Enter` on another session, say — taking the session out
     /// to the background with it (see `panel`): the relay's own fade out has
     /// nothing left to dissolve. And set by a resume that leaves it to the
-    /// settings, to float over the session at once, to bring the session in
-    /// with them (see [`Attachment::float_the_settings`]).
+    /// settings or the picker, to float over the session at once, to bring
+    /// the session in with them (see [`Attachment::float_the_settings`]).
     dark: bool,
     /// Who is waiting for the session to have painted in front, told on the
     /// first lull after the next relay has relayed anything — and let go,
     /// untold, by a relay that ends before then (see
     /// [`Attachment::tell_when_painted`]).
     painted: Option<mpsc::Sender<()>>,
-    /// The settings are to come up floating over the session as soon as the
-    /// next relay has the session's screen back, as `<prefix> ,` brings them
-    /// (see [`Attachment::float_the_settings`]).
-    float_settings: bool,
+    /// What is to come up floating over the session as soon as the next relay
+    /// has the session's screen back, as the command that ends a relay in it
+    /// brings it: the settings, as `<prefix> ,` does, or the picker, as
+    /// `<prefix> Space` does (see [`Attachment::float_the_settings`] and
+    /// [`Attachment::float_the_picker`]).
+    to_float: Option<Outcome>,
 }
 
 /// How many clients have had their exit sequences relayed to the terminal:
@@ -2074,18 +2094,28 @@ impl Attachment {
     /// `ui::settings::Outcome::Float`). A relay that ends before then, or
     /// where a command brings up something else first, forgets it.
     pub fn float_the_settings(&mut self) {
-        self.float_settings = true;
+        self.to_float = Some(Outcome::ShowSettings);
     }
 
-    /// Whether the session's screen is back for the settings to float over
-    /// (see [`Attachment::float_the_settings`]): nothing of a first paint held
-    /// back, and the client on the screen it draws on — the alternate screen,
-    /// which a resumed client was put back on as the relay began and a fresh
-    /// one enters as it starts, or for a client that draws on the primary
-    /// screen, something drawn there. Not before: frames drawn ahead of a
-    /// fresh client's entry would stay on the primary screen, which the shell
-    /// comes back to. A copy that cannot say has nothing to float over, and
-    /// the panel says so for itself.
+    /// Have the picker come up floating over the session on this client's
+    /// next relay, as [`Attachment::float_the_settings`] has the settings, as
+    /// `<prefix> Space` brings it: for the picker that went out with the
+    /// session to a prompt full screen, where the prompt could not float in its
+    /// place — the rename prompt ([`Outcome::Rename`]), or the create prompt,
+    /// cancelled ([`Outcome::CreateAfter`]) — back once it has been answered.
+    pub fn float_the_picker(&mut self) {
+        self.to_float = Some(Outcome::ToPicker);
+    }
+
+    /// Whether the session's screen is back for the settings or the picker to
+    /// float over (see [`Attachment::float_the_settings`]): nothing of a first
+    /// paint held back, and the client on the screen it draws on — the
+    /// alternate screen, which a resumed client was put back on as the relay
+    /// began and a fresh one enters as it starts, or for a client that draws
+    /// on the primary screen, something drawn there. Not before: frames drawn
+    /// ahead of a fresh client's entry would stay on the primary screen, which
+    /// the shell comes back to. A copy that cannot say has nothing to float
+    /// over, and the panel says so for itself.
     fn screen_is_back(&self) -> bool {
         if self.hold.is_some() {
             return false;
@@ -3096,7 +3126,7 @@ fn spawn_client_with(
         landed_since: None,
         dark: false,
         painted: None,
-        float_settings: false,
+        to_float: None,
     })
 }
 
@@ -3429,12 +3459,12 @@ pub fn relay(
         if early {
             erasing = kept_clients_repaint(&mut attachment);
         }
-        // Settings to float over the session as it comes back bring it in
-        // with them, out of the background (see `panel`), rather than have it
-        // dissolve in only to be dimmed again round them: the screen stays
-        // the background the erase made it, and the shadow as it is, for the
-        // panel to draw the session from.
-        attachment.dark = attachment.float_settings
+        // Settings or a picker to float over the session as it comes back
+        // bring it in with them, out of the background (see `panel`), rather
+        // than have it dissolve in only to be dimmed again round them: the
+        // screen stays the background the erase made it, and the shadow as it
+        // is, for the panel to draw the session from.
+        attachment.dark = attachment.to_float.is_some()
             && attachment.hand_off.is_none()
             && attachment
                 .shadow
@@ -3516,8 +3546,9 @@ pub fn relay(
     // not one the next relay of this client makes.
     attachment.painted = None;
     // Up over this relay's session, or not to come up at all: the settings
-    // were asked to float over the session they were turned to float from.
-    attachment.float_settings = false;
+    // were asked to float over the session they were turned to float from,
+    // and the picker over the one it went to a prompt from.
+    attachment.to_float = None;
     // From here on nothing the client writes reaches the terminal until it is
     // relayed again: what the ledger hears next is news to the terminal.
     if let Some(ledger) = attachment.ledger.as_mut() {
@@ -3549,6 +3580,8 @@ pub fn relay(
         Ok(
             held @ (Outcome::ToPicker
             | Outcome::CreateNew
+            | Outcome::CreateAfter(_)
+            | Outcome::Rename(_)
             | Outcome::ShowHelp
             | Outcome::ShowSettings
             | Outcome::Resettle
@@ -3707,12 +3740,12 @@ fn pump(
 
     loop {
         // The settings, turned to float while they had the terminal to
-        // themselves: up over the session as soon as its screen is back, as
-        // `<prefix> ,` brings them, and before a key is read, so that what was
-        // typed as they went goes to them.
-        if attachment.float_settings && attachment.screen_is_back() {
-            if let Some(outcome) = float_over(attachment, master_fd, winch, Outcome::ShowSettings)?
-            {
+        // themselves, or the picker, back from a prompt: up over the session
+        // as soon as its screen is back, as `<prefix> ,` and `<prefix> Space`
+        // bring them, and before a key is read, so that what was typed as
+        // they went goes to them.
+        if let Some(outcome) = attachment.to_float.filter(|_| attachment.screen_is_back()) {
+            if let Some(outcome) = float_over(attachment, master_fd, winch, outcome)? {
                 return Ok(outcome);
             }
             // What they may have changed, read again as after `<prefix> ,`
@@ -4349,11 +4382,12 @@ fn take_step(attachment: &mut Attachment, mut step: Step) -> Result<Option<Outco
 }
 
 /// What a command leads to, `outcome`, over the session where it is one of
-/// the screens that float there — the settings, the help or the picker — and
+/// the screens that float there — the settings, the help, the picker or the
+/// create prompt — and
 /// they are to (`[style] float`): `None` once it has been taken down and the
 /// relay goes on, and otherwise how the relay ends, which is `outcome` itself
-/// where nothing floats. Either way, settings that were to come up floating
-/// of their own accord have had their turn (see
+/// where nothing floats. Either way, settings or a picker that were to come up
+/// floating of their own accord have had their turn (see
 /// [`Attachment::float_the_settings`]).
 fn float_over(
     attachment: &mut Attachment,
@@ -4361,7 +4395,7 @@ fn float_over(
     winch: &winch::Winch,
     outcome: Outcome,
 ) -> Result<Option<Outcome>> {
-    attachment.float_settings = false;
+    attachment.to_float = None;
     match panel::What::of(outcome, config::get().style.float) {
         Some(what) => {
             let floated = panel::float(attachment, master_fd, winch, what);
@@ -5733,9 +5767,13 @@ mod tests {
         for target in [Target::Number(3), Target::Step(Direction::Next)] {
             assert_eq!(Outcome::Switch(target).switch_target(), Some(target));
         }
+        let id = crate::ids::Id::new("abcd2345").expect("an id");
         for other in [
             Outcome::ToPicker,
             Outcome::CreateNew,
+            Outcome::CreateAfter(Some(id)),
+            Outcome::CreateAfter(None),
+            Outcome::Rename(id),
             Outcome::ShowHelp,
             Outcome::ShowSettings,
             Outcome::Resettle,
@@ -5761,9 +5799,13 @@ mod tests {
         for target in [Target::Number(3), Target::Step(Direction::Next)] {
             assert!(Outcome::Switch(target).leads_straight_into_another_relay());
         }
+        let id = crate::ids::Id::new("abcd2345").expect("an id");
         for other in [
             Outcome::ToPicker,
             Outcome::CreateNew,
+            Outcome::CreateAfter(Some(id)),
+            Outcome::CreateAfter(None),
+            Outcome::Rename(id),
             Outcome::ShowHelp,
             Outcome::ShowSettings,
             Outcome::Resettle,

@@ -279,6 +279,12 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
         // it left, for the card that says where it landed to move its row the
         // way it went. Set by the switch, and spent by the attach it leads to.
         let mut stepped: Option<(nvmux::keys::Direction, nvmux::session::Session)> = None;
+        // A prompt from the picker floating over the session, full screen
+        // where it could not float in the picker's place, answered with no
+        // session to go to — `r`'s, or `c`'s cancelled: the row the cursor was
+        // on, for the picker to come back up over this session with the cursor
+        // there. Set by the prompt, and spent by the attach it leads to.
+        let mut float_picker: Option<String> = None;
 
         loop {
             // Everything nvmux does between the keypress and a client ready to
@@ -443,11 +449,15 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
             notifier.watch(&current.id, &current.name, sock.clone());
             notifier.front(Some(&current.id));
 
-            // The rows the picker opens on if it floats over this session; what
-            // it left of them, if it changed them, is taken back below.
-            ui::picker::hand(&listing);
+            // The rows the picker opens on if it floats over this session, and
+            // the one it opens on back from the rename prompt; what it left of
+            // them, if it changed them, is taken back below.
+            ui::picker::hand(&listing, float_picker.as_deref());
             if std::mem::take(&mut float_settings) {
                 attachment.float_the_settings();
+            }
+            if float_picker.take().is_some() {
+                attachment.float_the_picker();
             }
 
             // The relay, with the chance to start the next client while this
@@ -511,12 +521,18 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                 };
                 pty::relay(attachment, highest, &mut begin_next)?
             };
-            // The rows as a picker floating over the session left them: a kill,
-            // a move, a session another nvmux made.
+            // The rows as a picker floating over the session left them, or a
+            // prompt floating there: a kill, a move, a session made or
+            // renamed, a session another nvmux made. The session in front as
+            // they have it too — its name, renamed, and its number, moved —
+            // for what is said of it, and stepped from, from here on.
             if let Some(rows) = ui::picker::take_changed() {
                 listing = rows;
                 highest = ui::highest_num(&listing);
                 pool.keep_only(&listing);
+                if let Some(s) = listing.iter().find(|s| s.id == current.id) {
+                    current = s.clone();
+                }
             }
             // Out of the session: whatever comes next — the picker, the help,
             // the prompt, another session, or the shell — nobody is in front
@@ -538,6 +554,8 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                     seeing.wait_until(deadline);
                 }
                 pty::Outcome::CreateNew
+                | pty::Outcome::CreateAfter(_)
+                | pty::Outcome::Rename(_)
                 | pty::Outcome::ShowHelp
                 | pty::Outcome::ShowSettings
                 | pty::Outcome::Resettle
@@ -625,6 +643,57 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                     }
                     continue;
                 }
+                // `c` on the picker floating over the session, where the prompt
+                // could not float in its place — on a terminal too small for
+                // it: the session asked for full screen, and placed as the
+                // picker full screen does, after the row the cursor was on:
+                // then to it, as from there — or, the prompt cancelled, back to
+                // this session, held as for `<prefix> c`, with the picker up
+                // over it again on that row, as the picker full screen is back
+                // after a cancel.
+                (pty::Outcome::CreateAfter(after), held) => {
+                    attached = pool.set_aside(held);
+                    new_kind |= settle(&mut clients, &mut attached, &mut pool);
+                    let after = after.map(|id| id.as_str().to_string());
+                    match ui::prompt::create_after(transport, &listing, after.as_deref())? {
+                        Some((session, rows)) => {
+                            listing = rows;
+                            pool.keep_only(&listing);
+                            highest = ui::highest_num(&listing);
+                            current = session;
+                        }
+                        None => float_picker = Some(after.unwrap_or_else(|| current.id.clone())),
+                    }
+                    continue;
+                }
+                // `r` on the picker floating over the session, where the prompt
+                // could not float in its place: the name asked for full screen,
+                // as the picker full screen asks; then back to the session, held
+                // as for `<prefix> c`, with the picker up over it again, the
+                // cursor on the row renamed — as the picker full screen is back
+                // after its prompt.
+                (pty::Outcome::Rename(id), held) => {
+                    attached = pool.set_aside(held);
+                    new_kind |= settle(&mut clients, &mut attached, &mut pool);
+                    let named = listing.iter().find(|s| s.id == id.as_str()).cloned();
+                    if let Some(session) = named {
+                        if let ui::prompt::Outcome::Renamed(name) =
+                            ui::prompt::rename(transport, &session)?
+                        {
+                            // Put in the rows in hand rather than listed for:
+                            // a rename changes the name and nothing else, and
+                            // a listing would be a round trip over ssh on a
+                            // blank screen. The picker lists behind them.
+                            for s in listing.iter_mut().chain(std::iter::once(&mut current)) {
+                                if s.id == session.id {
+                                    s.name.clone_from(&name);
+                                }
+                            }
+                        }
+                    }
+                    float_picker = Some(id.as_str().to_string());
+                    continue;
+                }
                 (pty::Outcome::ShowHelp, held) => {
                     attached = pool.set_aside(held);
                     ui::help::run()?;
@@ -659,6 +728,12 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                     // or a cycle with nowhere to go — puts the user straight
                     // back where they were.
                     attached = pool.set_aside(held);
+                    // What the settings changed of the clients, where the
+                    // picker floating over the session went across to them
+                    // and back before it switched: settled on the way out of
+                    // the picker, as from the picker full screen. Nothing,
+                    // where nothing changed.
+                    new_kind |= settle(&mut clients, &mut attached, &mut pool);
                     stepped = match target {
                         pty::Target::Step(dir) => Some((dir, current.clone())),
                         pty::Target::Number(_) | pty::Target::Session(_) => None,
