@@ -173,19 +173,23 @@ pub enum Outcome {
     ToPicker,
     /// `<prefix> d` — detach and exit, leaving the session running.
     Detached,
-    /// `<prefix> c` — prompt for a name and create a new session. The child keeps
-    /// running, so a cancelled prompt puts the user straight back.
+    /// `<prefix> c` with `[style] float` off, on a terminal too small for the
+    /// prompt to float over the session, or for a session nvmux keeps no copy
+    /// of — prompt for a name full screen and create a new session. The child
+    /// keeps running, so a cancelled prompt puts the user straight back.
     CreateNew,
-    /// `c` on the picker floating over the session — prompt for a name and
-    /// create a new session after the session named, the row the picker's
-    /// cursor was on, as the picker full screen places one; a cancelled
-    /// prompt comes back to this session with the picker floating over it
-    /// again (see [`Attachment::float_the_picker`]). The child keeps running.
+    /// `c` on the picker floating over the session, where the prompt cannot
+    /// float in its place: on a terminal too small for it — prompt for a name
+    /// full screen and create a new session after the session named, the row
+    /// the picker's cursor was on, as the picker full screen places one; a
+    /// cancelled prompt comes back to this session with the picker floating
+    /// over it again (see [`Attachment::float_the_picker`]). The child keeps
+    /// running.
     CreateAfter(Option<crate::ids::Id>),
-    /// `r` on the picker floating over the session — prompt for a new name
-    /// for the session it names, which the picker does not do floating, and
-    /// come back to this one with the picker floating over it again (see
-    /// [`Attachment::float_the_picker`]). The child keeps running.
+    /// `r` on the picker floating over the session, where the prompt cannot
+    /// float in its place — prompt full screen for a new name for the session
+    /// it names, and come back to this one with the picker floating over it
+    /// again (see [`Attachment::float_the_picker`]). The child keeps running.
     Rename(crate::ids::Id),
     /// `<prefix> ?` with `[style] float` off, on a terminal too small for the
     /// help to float over the session, or a session nvmux keeps no copy of:
@@ -2096,9 +2100,9 @@ impl Attachment {
     /// Have the picker come up floating over the session on this client's
     /// next relay, as [`Attachment::float_the_settings`] has the settings, as
     /// `<prefix> Space` brings it: for the picker that went out with the
-    /// session to a prompt — the rename prompt ([`Outcome::Rename`]), or the
-    /// create prompt, cancelled ([`Outcome::CreateAfter`]) — back once it has
-    /// been answered.
+    /// session to a prompt full screen, where the prompt could not float in its
+    /// place — the rename prompt ([`Outcome::Rename`]), or the create prompt,
+    /// cancelled ([`Outcome::CreateAfter`]) — back once it has been answered.
     pub fn float_the_picker(&mut self) {
         self.to_float = Some(Outcome::ToPicker);
     }
@@ -4378,7 +4382,8 @@ fn take_step(attachment: &mut Attachment, mut step: Step) -> Result<Option<Outco
 }
 
 /// What a command leads to, `outcome`, over the session where it is one of
-/// the screens that float there — the settings, the help or the picker — and
+/// the screens that float there — the settings, the help, the picker or the
+/// create prompt — and
 /// they are to (`[style] float`): `None` once it has been taken down and the
 /// relay goes on, and otherwise how the relay ends, which is `outcome` itself
 /// where nothing floats. Either way, settings or a picker that were to come up

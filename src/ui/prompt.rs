@@ -149,22 +149,39 @@
 //! filtering when the matching became fuzzy, since a subsequence cannot be a glob
 //! — so a path costs about one round trip per `/` and everything in between is
 //! answered from memory.
+//!
+//! # Floating
+//!
+//! With `[style] float` on, as it is by default, the prompt floats over the
+//! session in a panel the relay draws ([`Panel`]), as the picker, the help and
+//! the settings do: `<prefix> c` over the session itself, and the picker's `c`
+//! and `r` in the picker's place, which comes back once the prompt has been
+//! answered with no session to go to. It is the same prompt, every rule of it;
+//! what changes is where it is drawn, and that it reads the keys the relay
+//! gives it. A session made is gone to, as from the prompt full screen.
 
+use std::time::Instant;
+
+use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use ratatui::crossterm::event::{KeyEvent, KeyEventKind, MouseEvent};
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
+use ratatui::{Frame, Terminal};
 use unicode_width::UnicodeWidthStr;
 
-use super::app::Key;
+use super::app::{App, Key};
 use super::complete;
 use super::draw;
+use super::float::{self, Did, Floating, Leave};
 use crate::error::Result;
+use crate::ids::Id;
 use crate::launch::Launch;
 use crate::session::Session;
 use crate::state;
-use crate::transport::Transport;
+use crate::transport::{Shared, Transport};
 
 /// What the prompt returned.
 #[derive(Debug)]
@@ -184,6 +201,17 @@ impl Outcome {
     fn attaches(&self) -> bool {
         matches!(self, Self::Created(_))
     }
+}
+
+/// Where a session made on the prompt goes in the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    /// At the end, where a session made from inside another goes: `<prefix>
+    /// c`.
+    Last,
+    /// After the row the picker's cursor was on, as the picker puts one: its
+    /// `c`. `None` where it had no rows: first.
+    After(Option<Id>),
 }
 
 /// Which question is being asked. The two differ in how many fields there are,
@@ -865,6 +893,329 @@ pub fn rename(transport: &dyn Transport, session: &Session) -> Result<Outcome> {
     })
 }
 
+/// The least of the session the floating prompt leaves showing round it:
+/// columns either side, and rows above and below. The picker's and the help's.
+const SESSION_COLS: u16 = 2;
+const SESSION_ROWS: u16 = 1;
+
+/// How much wider than its opening lines the floating prompt is, for what is
+/// typed past them; and the narrowest and the widest it is, the settings'
+/// width.
+const PANEL_ROOM: u16 = 24;
+const PANEL_NARROWEST: u16 = 48;
+const PANEL_WIDEST: u16 = 72;
+
+/// How tall the floating prompt is, the hint row and the panel's last row
+/// besides its body. A create's form, three fields and a message, is centred
+/// in the body as full screen, with its menu hanging under it: the body is as
+/// tall as the form and twice the menu, less the row centring puts above
+/// rather than below. A rename's is its line and its message, with three
+/// rows round them.
+const CREATE_ROWS: u16 = (3 + 1) + 2 * MENU_ROWS - 1 + 2;
+const RENAME_ROWS: u16 = (1 + 1) + 3 + 2;
+
+/// The prompt floating over a session (see the module docs and
+/// `crate::pty::panel`), on the relay's keys.
+pub struct Panel {
+    prompt: Prompt,
+    job: Job,
+    completer: Option<complete::Completer>,
+    /// What makes and renames sessions: lent once as nvmux starts (see
+    /// [`super::picker::lend`]), and so missing only where nothing lent it.
+    transport: Option<Shared>,
+    /// Where it goes once it is down: to the session made, if one was.
+    leave: Option<Leave>,
+    /// When it was last moved on: what the completer's answers are waited for
+    /// from.
+    ticked: Instant,
+}
+
+/// What the floating prompt is for.
+enum Job {
+    /// A new session, to go at `place` among the rows in hand, which the
+    /// picker holds, its cursor where it was: what the session is named and
+    /// placed by, as from the picker full screen (see [`super::settle`]).
+    Create { place: Place, picker: Box<App> },
+    /// A new name for this session, as the rows in hand have it — or `None`
+    /// where they no longer do.
+    Rename(Option<Session>),
+}
+
+impl Panel {
+    /// The create prompt, for a session to go at `place`, on the rows in hand.
+    pub fn create(place: Place) -> Self {
+        Self::create_on(place, super::picker::rows(), super::picker::transport())
+    }
+
+    /// The rename prompt, for session `id` as the rows in hand have it.
+    pub fn rename(id: Id) -> Self {
+        Self::rename_on(id, super::picker::rows(), super::picker::transport())
+    }
+
+    /// The create prompt on `rows`, offering the name the picker full screen
+    /// offers for the place the session will go — and asking the completer
+    /// about the default directory before a key is pressed, as full screen.
+    fn create_on(place: Place, rows: Vec<Session>, transport: Option<Shared>) -> Self {
+        let mut picker = App::new(rows);
+        let number = match place {
+            Place::Last => None,
+            Place::After(after) => {
+                if let Some(id) = after {
+                    picker.select_session(id.as_str());
+                }
+                Some(picker.new_number())
+            }
+        };
+        let name = default_name(picker.sessions(), number);
+        let (command, directory) = match transport.as_deref() {
+            Some(t) => (default_command(t), default_directory(t.home())),
+            None => (crate::config::get().session.command.clone(), String::new()),
+        };
+        let mut completer = transport
+            .as_deref()
+            .map(|t| complete::Completer::new(t.dir_source(), t.home()));
+        let mut prompt = Prompt::create(name, command, directory);
+        refresh(&mut prompt, completer.as_mut());
+        Self {
+            prompt,
+            job: Job::Create {
+                place,
+                picker: Box::new(picker),
+            },
+            completer,
+            transport,
+            leave: None,
+            ticked: Instant::now(),
+        }
+    }
+
+    /// The rename prompt on `rows`, for session `id`.
+    fn rename_on(id: Id, rows: Vec<Session>, transport: Option<Shared>) -> Self {
+        let session = rows.into_iter().find(|s| s.id == id.as_str());
+        let prompt = match &session {
+            Some(session) => Prompt::rename(session),
+            None => Prompt::rename(&Session::new(id.as_str().into(), id.as_str().into(), 0, 0)),
+        };
+        Self {
+            prompt,
+            job: Job::Rename(session),
+            completer: None,
+            transport,
+            leave: None,
+            ticked: Instant::now(),
+        }
+    }
+
+    /// The number a session made here will be given, which its name is
+    /// numbered after: the slot after the picker's row, or past every row's.
+    fn number(&self) -> Option<u32> {
+        match &self.job {
+            Job::Create {
+                place: Place::After(_),
+                picker,
+            } => Some(picker.new_number()),
+            Job::Create {
+                place: Place::Last, ..
+            }
+            | Job::Rename(_) => None,
+        }
+    }
+
+    /// What enter asked for, done, as the prompt full screen does it: a
+    /// session made is put in its place and gone to, a rename leaves the
+    /// rows renamed for the picker to come back on, and a refusal stays up,
+    /// saying why.
+    fn submit(&mut self, submission: Submission) -> Did {
+        let Some(transport) = self.transport.clone() else {
+            self.prompt.fail("nothing to make it with".into(), None);
+            return Did::Stay;
+        };
+        let transport = transport.as_ref();
+        let number = self.number();
+        let task = match &self.job {
+            Job::Create { picker, .. } => Task::Create {
+                listed: Some(picker.sessions()),
+                number,
+            },
+            Job::Rename(Some(session)) => Task::Rename(session),
+            Job::Rename(None) => {
+                self.prompt.fail("that session is gone".into(), None);
+                return Did::Stay;
+            }
+        };
+        match commit(transport, task, submission) {
+            Ok(Outcome::Created(session)) => self.made(transport, session),
+            Ok(Outcome::Renamed(name)) => self.renamed(transport, &name),
+            Ok(Outcome::Cancelled) => Did::Close,
+            Err(e) => {
+                // As full screen: what was just refused is the one thing the
+                // rows in hand cannot know about, so the name offered again
+                // is a listing's.
+                let refreshed = match self.job {
+                    Job::Create { .. } => next_free_name(transport, None, number).ok(),
+                    Job::Rename(_) => None,
+                };
+                self.prompt.fail(e.one_line(), refreshed);
+                Did::Stay
+            }
+        }
+    }
+
+    /// The session made, put where the picker full screen puts it — after
+    /// the picker's row, or at the end — and gone to: its rows left for the
+    /// session loop to take back, so the switch finds it.
+    fn made(&mut self, transport: &dyn Transport, session: Session) -> Did {
+        let (session, rows) = match &self.job {
+            Job::Create {
+                place: Place::After(_),
+                picker,
+            } => super::settle(picker, transport, session),
+            Job::Create {
+                place: Place::Last,
+                picker,
+            } => {
+                let mut rows = picker.sessions().to_vec();
+                rows.push(session.clone());
+                (session, rows)
+            }
+            Job::Rename(_) => return Did::Close,
+        };
+        super::picker::leave_rows(&rows);
+        self.leave = Id::new(&session.id).map(Leave::Switch);
+        Did::Close
+    }
+
+    /// Renamed, to `name`: the rows listed again, as the picker full screen
+    /// lists them after a rename — or, where that fails, the name put in the
+    /// rows in hand — and left for the picker to come back on.
+    fn renamed(&mut self, transport: &dyn Transport, name: &str) -> Did {
+        let rows = transport.list_sessions().unwrap_or_else(|e| {
+            tracing::debug!(error = %e, "could not list the sessions after a rename");
+            let mut rows = super::picker::rows();
+            if let Job::Rename(Some(renamed)) = &self.job {
+                for s in rows.iter_mut().filter(|s| s.id == renamed.id) {
+                    s.name = name.to_string();
+                }
+            }
+            rows
+        });
+        super::picker::leave_rows(&rows);
+        Did::Close
+    }
+}
+
+impl Floating for Panel {
+    /// In the middle: wide enough for its opening lines and what is typed
+    /// past them, and tall enough for the form, a create's menu under it, and
+    /// the hint row; nowhere where that leaves too little of the session
+    /// round it, which has the prompt full screen.
+    fn area(&self, screen: Rect) -> Option<Rect> {
+        let opening = self
+            .prompt
+            .fields
+            .iter()
+            .map(|f| f.label.width() + f.default.width())
+            .max()
+            .unwrap_or(0) as u16;
+        let width = (opening + PANEL_ROOM)
+            .clamp(PANEL_NARROWEST, PANEL_WIDEST)
+            .min(screen.width.saturating_sub(2 * SESSION_COLS));
+        let height = match self.job {
+            Job::Create { .. } => CREATE_ROWS,
+            Job::Rename(_) => RENAME_ROWS,
+        };
+        if width < PANEL_NARROWEST || screen.height < height + 2 * SESSION_ROWS {
+            return None;
+        }
+        Some(Rect::new(
+            screen.x + (screen.width - width) / 2,
+            screen.y + (screen.height - height) / 2,
+            width,
+            height,
+        ))
+    }
+
+    /// A key, as the prompt takes it full screen; releases are no keys.
+    fn on_key(&mut self, key: KeyEvent, now: Instant) -> Did {
+        if key.kind == KeyEventKind::Release {
+            return Did::Stay;
+        }
+        self.ticked = now;
+        let step = self.prompt.on_key(super::translate(key));
+        // After the key, not before, as full screen.
+        refresh(&mut self.prompt, self.completer.as_mut());
+        match step {
+            Step::None => Did::Stay,
+            Step::Cancel => Did::Close,
+            Step::Submit(submission) => self.submit(submission),
+        }
+    }
+
+    /// Nothing on it to point at, as full screen. A press outside takes it
+    /// down, which is the relay's to see.
+    fn on_mouse(&mut self, _mouse: MouseEvent, _now: Instant) -> Did {
+        Did::Stay
+    }
+
+    /// Soon, while an answer from the completer is outstanding, as full
+    /// screen; otherwise never on its own.
+    fn wake_at(&self) -> Option<Instant> {
+        self.completer
+            .as_ref()
+            .filter(|c| c.waiting())
+            .map(|_| self.ticked + super::BUSY_TICK)
+    }
+
+    /// What the completer has answered since, shown.
+    fn tick(&mut self, now: Instant) -> bool {
+        self.ticked = now;
+        if self
+            .completer
+            .as_mut()
+            .is_some_and(complete::Completer::poll)
+        {
+            show(&mut self.prompt, self.completer.as_mut());
+            return true;
+        }
+        false
+    }
+
+    fn moving(&self) -> bool {
+        false
+    }
+
+    /// The prompt drawn into `area`: as it draws itself on a terminal of the
+    /// panel's inside, in the theme's colour, and laid into a buffer of
+    /// `area`.
+    fn draw(&mut self, area: Rect) -> Buffer {
+        let mut buf = Buffer::empty(area);
+        let inside = float::inside(area);
+        if inside.width == 0 || inside.height == 0 {
+            return buf;
+        }
+        // A terminal of the inside's size, in memory, as the picker draws on.
+        let Ok(mut terminal) = Terminal::new(TestBackend::new(inside.width, inside.height));
+        let prompt = &self.prompt;
+        let Ok(_) = terminal.draw(|f| {
+            draw(f, prompt);
+            crate::theme::paint(f.buffer_mut());
+        });
+        let drawn = terminal.backend().buffer();
+        for y in 0..inside.height {
+            for x in 0..inside.width {
+                buf[(inside.x + x, inside.y + y)] = drawn[(x, y)].clone();
+            }
+        }
+        buf
+    }
+
+    fn close(&self) {}
+
+    fn leave(&self) -> Option<Leave> {
+        self.leave
+    }
+}
+
 /// How the prompt comes up — and so whether it goes back out on a cancel, for
 /// whatever was behind it to come back up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -980,39 +1331,7 @@ pub(super) fn run_on(
             Step::Submit(submission) => submission,
         };
 
-        // The name is not validated here: `session::validate_name` and the
-        // transport's duplicate check are the rule, and a UI copy would drift
-        // from them. The command is parsed here only because the transport
-        // takes a `Launch` and cannot be handed a line that is not one; the
-        // rules still live in `launch`.
-        let committed = match task {
-            Task::Create { .. } => {
-                let line = submission.command.unwrap_or_default();
-                let typed = submission.directory.unwrap_or_default();
-                Launch::parse(&line)
-                    .map_err(Into::into)
-                    .and_then(|launch| {
-                        // Absolute by here, with any leading `~` already
-                        // expanded against the *session host's* home — see
-                        // `session::validate_directory`. Whether it exists is
-                        // the spawn script's question.
-                        let directory =
-                            crate::session::validate_directory(&typed, transport.home())?;
-                        transport
-                            .create_session(&submission.name, &launch, &directory)
-                            // Only once a session has really started with it:
-                            // offering back a command that never worked would
-                            // make the same failure the default.
-                            .inspect(|_| state::remember(transport.location(), launch.line()))
-                    })
-                    .map(Outcome::Created)
-            }
-            Task::Rename(session) => transport
-                .rename_session(session, &submission.name)
-                .map(|_| Outcome::Renamed(submission.name)),
-        };
-
-        match committed {
+        match commit(transport, task, submission) {
             Ok(outcome) => {
                 // Out through the background on the way to a client spawn,
                 // whoever called; a rename only comes back to a picker that
@@ -1034,6 +1353,42 @@ pub(super) fn run_on(
                 prompt.fail(e.one_line(), refreshed);
             }
         }
+    }
+}
+
+/// What enter asked for, done: the session made, or renamed — or why not, in
+/// the transport's words.
+///
+/// The name is not validated here: `session::validate_name` and the
+/// transport's duplicate check are the rule, and a UI copy would drift from
+/// them. The command is parsed here only because the transport takes a
+/// `Launch` and cannot be handed a line that is not one; the rules still live
+/// in `launch`.
+fn commit(transport: &dyn Transport, task: Task, submission: Submission) -> Result<Outcome> {
+    match task {
+        Task::Create { .. } => {
+            let line = submission.command.unwrap_or_default();
+            let typed = submission.directory.unwrap_or_default();
+            Launch::parse(&line)
+                .map_err(Into::into)
+                .and_then(|launch| {
+                    // Absolute by here, with any leading `~` already expanded
+                    // against the *session host's* home — see
+                    // `session::validate_directory`. Whether it exists is the
+                    // spawn script's question.
+                    let directory = crate::session::validate_directory(&typed, transport.home())?;
+                    transport
+                        .create_session(&submission.name, &launch, &directory)
+                        // Only once a session has really started with it:
+                        // offering back a command that never worked would make
+                        // the same failure the default.
+                        .inspect(|_| state::remember(transport.location(), launch.line()))
+                })
+                .map(Outcome::Created)
+        }
+        Task::Rename(session) => transport
+            .rename_session(session, &submission.name)
+            .map(|_| Outcome::Renamed(submission.name)),
     }
 }
 
@@ -3123,6 +3478,267 @@ mod tests {
         assert_eq!(default_name(&[], None), "session 1");
         let listed = listing(&["session 1", "Session 2", "notes"]);
         assert_eq!(default_name(&listed, Some(2)), "session 3", "2 is taken");
+    }
+
+    // --- floating -----------------------------------------------------------
+
+    /// Sessions of these names, with ids such as nvmux gives them, numbered
+    /// from 1 as a listing resolves them.
+    fn hosted(names: &[&str]) -> Vec<Session> {
+        const IDS: [&str; 5] = ["aaaaaaaa", "bbbbbbbb", "cccccccc", "dddddddd", "eeeeeeee"];
+        names
+            .iter()
+            .zip(IDS)
+            .zip(1..)
+            .map(|((name, id), num)| {
+                let mut s = Session::new(id.to_string(), name.to_string(), 100, num);
+                s.state.num = num;
+                s
+            })
+            .collect()
+    }
+
+    fn id(id: &str) -> Id {
+        Id::new(id).expect("an id")
+    }
+
+    fn named(rows: &[Session]) -> Vec<String> {
+        rows.iter().map(|s| s.name.clone()).collect()
+    }
+
+    /// A host of sessions in memory, which renames, renumbers and lists them
+    /// as one on disk does.
+    struct Host {
+        location: crate::transport::Location,
+        rows: std::sync::Mutex<Vec<Session>>,
+    }
+
+    impl Host {
+        fn new(rows: Vec<Session>) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                location: crate::transport::Location::Local,
+                rows: std::sync::Mutex::new(rows),
+            })
+        }
+    }
+
+    impl Transport for Host {
+        fn location(&self) -> &crate::transport::Location {
+            &self.location
+        }
+        fn list_sessions(&self) -> Result<Vec<Session>> {
+            let mut rows = self.rows.lock().expect("rows").clone();
+            rows.sort_by_key(|s| s.state.num);
+            Ok(rows)
+        }
+        fn create_session(&self, _: &str, _: &Launch, _: &str) -> Result<Session> {
+            unimplemented!()
+        }
+        fn kill_session(&self, _: &Session) -> Result<()> {
+            unimplemented!()
+        }
+        fn rename_session(&self, s: &Session, name: &str) -> Result<()> {
+            let mut rows = self.rows.lock().expect("rows");
+            for row in rows.iter_mut().filter(|r| r.id == s.id) {
+                row.name = name.to_string();
+            }
+            Ok(())
+        }
+        fn renumber(&self, batch: &[Session]) -> Result<()> {
+            let mut rows = self.rows.lock().expect("rows");
+            for b in batch {
+                for row in rows.iter_mut().filter(|r| r.id == b.id) {
+                    row.num = b.num;
+                    row.state.num = b.num;
+                }
+            }
+            Ok(())
+        }
+        fn home(&self) -> &str {
+            "/home/you"
+        }
+        fn dir_source(&self) -> crate::dirs::DirSource {
+            crate::dirs::DirSource::Local
+        }
+        fn local_socket_for(&self, _: &Session) -> Result<std::path::PathBuf> {
+            unimplemented!()
+        }
+    }
+
+    fn key(panel: &mut Panel, code: ratatui::crossterm::event::KeyCode) -> Did {
+        let key = KeyEvent::new(code, ratatui::crossterm::event::KeyModifiers::NONE);
+        panel.on_key(key, Instant::now())
+    }
+
+    fn type_into(panel: &mut Panel, text: &str) {
+        for c in text.chars() {
+            assert_eq!(
+                key(panel, ratatui::crossterm::event::KeyCode::Char(c)),
+                Did::Stay
+            );
+        }
+    }
+
+    /// Floating, the create prompt offers the name the picker full screen
+    /// offers for where the session will go: after the picker's row from its
+    /// `c`, and at the end from `<prefix> c`.
+    #[test]
+    fn the_floating_create_prompt_offers_the_name_for_where_the_session_goes() {
+        let rows = hosted(&["one", "two", "three"]);
+        let after = Panel::create_on(Place::After(Some(id("aaaaaaaa"))), rows.clone(), None);
+        assert_eq!(after.prompt.fields[NAME].default, "session 2");
+        let last = Panel::create_on(Place::Last, rows, None);
+        assert_eq!(last.prompt.fields[NAME].default, "session 4");
+    }
+
+    /// It floats where there is room for it and a session round it, smaller
+    /// for a rename than for a create, and nowhere on a terminal too small,
+    /// where the prompt takes the screen instead.
+    #[test]
+    fn the_floating_prompt_fits_where_it_can() {
+        let rows = hosted(&["one", "two"]);
+        let create = Panel::create_on(Place::Last, rows.clone(), None);
+        let rename = Panel::rename_on(id("aaaaaaaa"), rows, None);
+        let screen = Rect::new(0, 0, 80, 24);
+        let c = create.area(screen).expect("room for a create");
+        let r = rename.area(screen).expect("room for a rename");
+        for a in [c, r] {
+            assert!(
+                a.x >= SESSION_COLS && a.right() + SESSION_COLS <= 80,
+                "{a:?}"
+            );
+            assert!(
+                a.y >= SESSION_ROWS && a.bottom() + SESSION_ROWS <= 24,
+                "{a:?}"
+            );
+        }
+        assert!(r.height < c.height && r.width <= c.width, "{r:?} {c:?}");
+        assert_eq!(create.area(Rect::new(0, 0, 50, 24)), None);
+        assert_eq!(create.area(Rect::new(0, 0, 80, 18)), None);
+    }
+
+    /// Drawn where it floats, the create prompt has its three fields and its
+    /// hint row, as full screen.
+    #[test]
+    fn the_floating_create_prompt_draws_its_form_and_its_hints() {
+        let mut panel = Panel::create_on(Place::Last, hosted(&["one"]), None);
+        let area = panel.area(Rect::new(0, 0, 80, 24)).expect("room");
+        let buf = panel.draw(area);
+        let rows: Vec<String> = (area.y..area.bottom())
+            .map(|y| {
+                (area.x..area.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+        for want in [
+            "new session name",
+            "nvim command",
+            "working directory",
+            "⏎ create",
+        ] {
+            assert!(rows.iter().any(|r| r.contains(want)), "{want}: {rows:#?}");
+        }
+    }
+
+    /// Keys go to the prompt as full screen, and `Esc` takes it down going
+    /// nowhere: back to the session, or to the picker it came from.
+    #[test]
+    fn the_floating_prompt_takes_keys_and_esc_takes_it_down() {
+        let mut panel = Panel::create_on(Place::Last, hosted(&["one"]), None);
+        type_into(&mut panel, "blog");
+        assert_eq!(panel.prompt.fields[NAME].input, "blog");
+        assert_eq!(
+            key(&mut panel, ratatui::crossterm::event::KeyCode::Esc),
+            Did::Close
+        );
+        assert_eq!(panel.leave(), None);
+    }
+
+    /// A session made floating goes where the picker full screen puts it —
+    /// after the picker's row — and is gone to: the panel goes out with the
+    /// session to switch to it, leaving the rows that have it for the session
+    /// loop to find it among.
+    #[test]
+    fn a_session_made_floating_goes_after_the_row_and_is_gone_to() {
+        let _turn = super::super::test_support::PANELS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rows = hosted(&["one", "two", "three"]);
+        let mut made = Session::new("dddddddd".into(), "blog".into(), 100, 4);
+        made.state.num = 4;
+        let host = Host::new(rows.clone());
+        host.rows.lock().expect("rows").push(made.clone());
+        let mut panel =
+            Panel::create_on(Place::After(Some(id("aaaaaaaa"))), rows, Some(host.clone()));
+        assert_eq!(panel.made(host.as_ref(), made), Did::Close);
+        assert_eq!(panel.leave(), Some(Leave::Switch(id("dddddddd"))));
+        let left = super::super::picker::take_changed().expect("rows left");
+        assert_eq!(named(&left), ["one", "blog", "two", "three"]);
+    }
+
+    /// From `<prefix> c`, the session goes at the end, nothing renumbered.
+    #[test]
+    fn a_session_made_floating_from_a_session_goes_at_the_end() {
+        let _turn = super::super::test_support::PANELS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rows = hosted(&["one", "two"]);
+        let mut made = Session::new("cccccccc".into(), "blog".into(), 100, 3);
+        made.state.num = 3;
+        let host = Host::new(rows.clone());
+        let mut panel = Panel::create_on(Place::Last, rows, Some(host.clone()));
+        assert_eq!(panel.made(host.as_ref(), made), Did::Close);
+        assert_eq!(panel.leave(), Some(Leave::Switch(id("cccccccc"))));
+        let left = super::super::picker::take_changed().expect("rows left");
+        assert_eq!(named(&left), ["one", "two", "blog"]);
+        let numbers: Vec<u32> = host
+            .list_sessions()
+            .expect("rows")
+            .iter()
+            .map(|s| s.num)
+            .collect();
+        assert_eq!(numbers, [1, 2], "nothing renumbered");
+    }
+
+    /// A rename floating renames, through the host, and leaves the rows
+    /// listed again for the picker to come back on; the panel goes nowhere.
+    #[test]
+    fn a_rename_floating_leaves_the_rows_renamed() {
+        let _turn = super::super::test_support::PANELS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rows = hosted(&["one", "two"]);
+        let host = Host::new(rows.clone());
+        let mut panel = Panel::rename_on(id("bbbbbbbb"), rows, Some(host.clone()));
+        for _ in "two".chars() {
+            key(&mut panel, ratatui::crossterm::event::KeyCode::Backspace);
+        }
+        type_into(&mut panel, "blog");
+        assert_eq!(
+            key(&mut panel, ratatui::crossterm::event::KeyCode::Enter),
+            Did::Close
+        );
+        assert_eq!(panel.leave(), None);
+        let left = super::super::picker::take_changed().expect("rows left");
+        assert_eq!(named(&left), ["one", "blog"]);
+    }
+
+    /// A session no longer among the rows is not renamed: enter says so, and
+    /// the prompt stays up.
+    #[test]
+    fn a_rename_of_a_session_gone_says_so() {
+        let rows = hosted(&["one"]);
+        let host = Host::new(rows.clone());
+        let mut panel = Panel::rename_on(id("cccccccc"), rows, Some(host));
+        assert_eq!(
+            key(&mut panel, ratatui::crossterm::event::KeyCode::Enter),
+            Did::Stay
+        );
+        assert_eq!(
+            panel.prompt.message.as_deref(),
+            Some("that session is gone")
+        );
     }
 
     /// The row the prompt opens out of is the one its name field is drawn on,

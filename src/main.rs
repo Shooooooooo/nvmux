@@ -279,10 +279,11 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
         // it left, for the card that says where it landed to move its row the
         // way it went. Set by the switch, and spent by the attach it leads to.
         let mut stepped: Option<(nvmux::keys::Direction, nvmux::session::Session)> = None;
-        // A prompt from the picker floating over the session, answered with
-        // no session to go to — `r`'s, or `c`'s cancelled: the row the cursor
-        // was on, for the picker to come back up over this session with the
-        // cursor there. Set by the prompt, and spent by the attach it leads to.
+        // A prompt from the picker floating over the session, full screen
+        // where it could not float in the picker's place, answered with no
+        // session to go to — `r`'s, or `c`'s cancelled: the row the cursor was
+        // on, for the picker to come back up over this session with the cursor
+        // there. Set by the prompt, and spent by the attach it leads to.
         let mut float_picker: Option<String> = None;
 
         loop {
@@ -520,12 +521,18 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                 };
                 pty::relay(attachment, highest, &mut begin_next)?
             };
-            // The rows as a picker floating over the session left them: a kill,
-            // a move, a session another nvmux made.
+            // The rows as a picker floating over the session left them, or a
+            // prompt floating there: a kill, a move, a session made or
+            // renamed, a session another nvmux made. The session in front as
+            // they have it too — its name, renamed, and its number, moved —
+            // for what is said of it, and stepped from, from here on.
             if let Some(rows) = ui::picker::take_changed() {
                 listing = rows;
                 highest = ui::highest_num(&listing);
                 pool.keep_only(&listing);
+                if let Some(s) = listing.iter().find(|s| s.id == current.id) {
+                    current = s.clone();
+                }
             }
             // Out of the session: whatever comes next — the picker, the help,
             // the prompt, another session, or the shell — nobody is in front
@@ -636,8 +643,9 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                     }
                     continue;
                 }
-                // `c` on the picker floating over the session, which asks for
-                // the session on a screen of its own and places it as the
+                // `c` on the picker floating over the session, where the prompt
+                // could not float in its place — on a terminal too small for
+                // it: the session asked for full screen, and placed as the
                 // picker full screen does, after the row the cursor was on:
                 // then to it, as from there — or, the prompt cancelled, back to
                 // this session, held as for `<prefix> c`, with the picker up
@@ -658,11 +666,12 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                     }
                     continue;
                 }
-                // `r` on the picker floating over the session, which asks for
-                // the name on a screen of its own as the picker full screen
-                // does: then back to the session, held as for `<prefix> c`,
-                // with the picker up over it again, the cursor on the row
-                // renamed — as the picker full screen is back after its prompt.
+                // `r` on the picker floating over the session, where the prompt
+                // could not float in its place: the name asked for full screen,
+                // as the picker full screen asks; then back to the session, held
+                // as for `<prefix> c`, with the picker up over it again, the
+                // cursor on the row renamed — as the picker full screen is back
+                // after its prompt.
                 (pty::Outcome::Rename(id), held) => {
                     attached = pool.set_aside(held);
                     new_kind |= settle(&mut clients, &mut attached, &mut pool);

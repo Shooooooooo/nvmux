@@ -32,14 +32,13 @@ pub enum Leave {
     Switch(crate::ids::Id),
     /// To set up a new session, which goes after the session named, the row
     /// the cursor was on, as the picker full screen puts one: `c`. `None`
-    /// where there are no rows. The picker comes back up over the session
-    /// where the prompt is cancelled.
+    /// where there are no rows. The prompt comes up in the picker's place,
+    /// which comes back where it is cancelled.
     New(Option<crate::ids::Id>),
     /// Out of nvmux, every session left running: `q`.
     Quit,
-    /// To rename this session, which the picker does not do floating: `r`.
-    /// The name is asked for on a screen of its own, and the picker comes
-    /// back up over the session once it has been answered.
+    /// To rename this session: `r`. The prompt comes up in the picker's place,
+    /// which comes back once it has been answered.
     Rename(crate::ids::Id),
     /// The help, over the session in its place: `?`. Taken down, it goes back
     /// to the picker, as the help full screen does.
