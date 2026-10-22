@@ -106,9 +106,10 @@ under `[keys.bind]` — `detach = "x"` makes it `<prefix> x` — as
 | `help` | `<prefix>` `?` | show these keys, as you have them, over the session — `Esc` goes back |
 | `settings` | `<prefix>` `,` | change nvmux's settings while it runs, over the session — `Esc` goes back |
 
-The picker, the help and the settings float over the session, which goes on
-running behind them, dimmed; `float = false` under `[style]` has each take
-the whole screen instead. Flipped in the settings, it moves them at once.
+The picker, the help, the settings and the prompt that names a new session
+or a renamed one float over the session, which goes on running behind them,
+dimmed; `float = false` under `[style]` has each take the whole screen
+instead. Flipped in the settings, it moves them at once.
 
 Two keys after the prefix are not commands, and stay where they are: a number
 — `<prefix> 1`, `<prefix> 12` — switches straight to that session, and
@@ -286,7 +287,7 @@ window_width    = 120      # with centre on, how many columns a window's text ge
 
 [style]
 color = "terminal"   # or "#rrggbb": nvmux's text and bars in that colour; dim text stays dim
-float = true         # the picker, settings and help over the session; false takes the screen
+float = true         # the picker, settings, help and prompts over the session; false takes the screen
 
 [effects]
 enabled = true   # master switch: false turns every effect below off

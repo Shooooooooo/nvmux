@@ -1654,7 +1654,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          \n\
          [style]\n\
          # color = {style_color:<10}   # or \"#rrggbb\": nvmux's text and bars in that colour\n\
-         # float = {style_float:<10}   # the picker, settings and help over the session; false takes the screen\n\
+         # float = {style_float:<10}   # the picker, settings, help and prompts over the session; false takes the screen\n\
          \n\
          [effects]\n\
          # enabled = {effects_enabled}   # master switch: false turns every effect below off\n\
@@ -2892,9 +2892,9 @@ mod tests {
         assert_eq!(s, Settings::default(), "the default, said out loud");
     }
 
-    /// The picker, the settings and the help float over the session unless
-    /// told otherwise; full screen is a line away, and leaves the colour as it
-    /// was.
+    /// The picker, the settings, the help and the prompts float over the
+    /// session unless told otherwise; full screen is a line away, and leaves
+    /// the colour as it was.
     #[test]
     fn the_screens_float_over_the_session_unless_told() {
         assert!(Settings::default().style.float);

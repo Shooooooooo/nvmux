@@ -424,7 +424,7 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
             "style",
             "float",
             Tab::Style,
-            "the picker, settings and help float over the session; off, full screen",
+            "the picker, settings, help and prompts float over it; off, full screen",
             switch!(style.float),
         ),
         row(

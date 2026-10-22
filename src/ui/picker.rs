@@ -9,8 +9,8 @@
 //! and so how much of its hint row there is room for ([`HINTS`]); and where a
 //! key that leads off it goes — another session, the create prompt, the
 //! rename prompt, the help, the settings, out of nvmux — which is the relay's
-//! to follow ([`Leave`]). The help and the settings come up in its place, and
-//! go back to it, as they do full screen.
+//! to follow ([`Leave`]). The help, the settings and the prompts come up in
+//! its place, and go back to it, as they do full screen.
 //!
 //! # Rows in hand
 //!
@@ -20,19 +20,22 @@
 //! session loop takes the rows that leaves back ([`take_changed`]), so a
 //! `<prefix>` switch afterwards names what is there.
 //!
-//! # What it does not do floating
+//! # The prompts
 //!
-//! The prompt that names a session is a screen of its own, as it is from the
-//! picker full screen. `c` opens the gap where the new session will go, after
-//! the row the cursor is on, as the picker full screen opens it; then the
-//! panel goes out with the session, the prompt comes up, and the session made
-//! is put in that place and attached to ([`Leave::New`]). `r` has the prompt
-//! come up for the row it was pressed on ([`Leave::Rename`]). A prompt
-//! answered with no session to go to — a rename, or a create cancelled —
-//! brings the session back with the panel up over it again, the cursor on the
-//! row it was on: as the picker full screen is back once its prompt is. On a
-//! terminal with no room for the panel and the session round it, `<prefix>
-//! Space` has the picker full screen.
+//! `c` opens the gap where the new session will go, after the row the cursor
+//! is on, as the picker full screen opens it; then the prompt comes up in the
+//! picker's place ([`Leave::New`], and see [`super::prompt::Panel`]), and
+//! the session made is put in that place and gone to. `r` has the prompt come
+//! up for the row it was pressed on ([`Leave::Rename`]). A prompt answered
+//! with no session to go to — a rename, or a create cancelled — brings the
+//! picker back as it was left, the gap closed and a new name in its row: as
+//! the picker full screen is back once its prompt is.
+//!
+//! On a terminal with no room for a prompt and the session round it, the
+//! panel goes out with the session and the prompt comes up full screen, and
+//! the picker floats over the session again once it has been answered (see
+//! `crate::pty::Attachment::float_the_picker`). On one with no room for the
+//! panel, `<prefix> Space` has the picker full screen.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -129,10 +132,32 @@ pub fn hand(rows: &[Session], on: Option<&str>) {
     lock(&CHANGED).take();
 }
 
-/// The rows a panel left, if it changed them — a kill, a move, or a listing
-/// that found something new — since the session loop last handed them over.
+/// The rows a panel left, if it changed them — a kill, a move, a session made
+/// or renamed, or a listing that found something new — since the session loop
+/// last handed them over.
 pub fn take_changed() -> Option<Vec<Session>> {
     lock(&CHANGED).take()
+}
+
+/// What makes and renames sessions, for the prompt floating in the picker's
+/// place or over the session (see [`super::prompt::Panel`]).
+pub(super) fn transport() -> Option<Shared> {
+    TRANSPORT.get().cloned()
+}
+
+/// The rows as they stand: as a panel left them, where one changed them, and
+/// otherwise as the session loop handed them over.
+pub(super) fn rows() -> Vec<Session> {
+    lock(&CHANGED)
+        .clone()
+        .unwrap_or_else(|| lock(&IN_HAND).clone())
+}
+
+/// The rows as the prompt leaves them, with a session made or renamed: for
+/// the session loop to take back, and the picker set aside under the prompt
+/// to come back on.
+pub(super) fn leave_rows(rows: &[Session]) {
+    *lock(&CHANGED) = Some(rows.to_vec());
 }
 
 /// The picker floating over a session (see the module docs).
@@ -558,13 +583,22 @@ impl Floating for Panel {
 
     fn close(&self) {}
 
-    /// Back from the help or the settings, going nowhere as it was before
-    /// them, and with the effects as the settings left them, as the picker
-    /// full screen takes them up again (see [`App::reload_effects`]).
+    /// Back from the help, the settings or a prompt, going nowhere as it was
+    /// before them: with the effects as the settings left them, the gap `c`
+    /// opened closed, and the rows as a prompt left them — a session renamed
+    /// — as the picker full screen takes them up again (see
+    /// [`App::reload_effects`] and [`App::close_room`]). The listing under
+    /// way behind the rows, if one is, is let go of with them: asked before
+    /// the prompt, it would put back what the prompt changed.
     fn back(&mut self) {
         self.leave = None;
         self.closing = false;
         self.app.reload_effects();
+        self.app.close_room();
+        if let Some(rows) = lock(&CHANGED).clone() {
+            self.listing = None;
+            self.app.set_sessions(rows);
+        }
     }
 
     fn leave(&self) -> Option<Leave> {
@@ -581,10 +615,6 @@ mod tests {
     use super::*;
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
     use unicode_width::UnicodeWidthStr;
-
-    /// The panels opened here, one test at a time: each opens on what the
-    /// session loop last handed over, which they share.
-    static TURN: Mutex<()> = Mutex::new(());
 
     /// Sessions of these ids, numbered in order, as a listing has them.
     fn rows(ids: &[&str]) -> Vec<Session> {
@@ -619,7 +649,7 @@ mod tests {
     /// `<prefix> Space`'s, is on the session again.
     #[test]
     fn r_renames_the_row_it_is_on_and_the_panel_comes_back_on_it() {
-        let _turn = lock(&TURN);
+        let _turn = lock(&crate::ui::test_support::PANELS);
         let (other, behind) = ("aaaaaaaa", "bbbbbbbb");
         hand(&rows(&[other, behind]), None);
         let mut panel = Panel::open(behind);
@@ -644,7 +674,7 @@ mod tests {
     /// that row.
     #[test]
     fn c_opens_the_gap_and_goes_to_put_the_session_after_the_row() {
-        let _turn = lock(&TURN);
+        let _turn = lock(&crate::ui::test_support::PANELS);
         let (one, two, behind) = ("aaaaaaaa", "bbbbbbbb", "cccccccc");
         hand(&rows(&[one, two, behind]), None);
         let mut panel = Panel::open(behind);
@@ -668,7 +698,7 @@ mod tests {
     /// session, not to the help again.
     #[test]
     fn back_from_the_help_the_panel_is_as_it_was_left() {
-        let _turn = lock(&TURN);
+        let _turn = lock(&crate::ui::test_support::PANELS);
         let (other, behind) = ("aaaaaaaa", "bbbbbbbb");
         hand(&rows(&[other, behind]), None);
         let mut panel = Panel::open(behind);
@@ -682,6 +712,38 @@ mod tests {
         assert_eq!(cursor(&panel), other);
         assert_eq!(key(&mut panel, KeyCode::Esc), Did::Close);
         assert_eq!(panel.leave(), None, "Esc goes back to the session");
+        hand(&[], None);
+    }
+
+    /// Back from a prompt, the panel takes up the rows the prompt left — a
+    /// session renamed — its cursor where it was; and a gap `c` opened is
+    /// closed, the prompt having gone back.
+    #[test]
+    fn back_from_a_prompt_the_panel_takes_up_what_it_left() {
+        let _turn = lock(&crate::ui::test_support::PANELS);
+        let (other, behind) = ("aaaaaaaa", "bbbbbbbb");
+        hand(&rows(&[other, behind]), None);
+        let mut panel = Panel::open(behind);
+        assert_eq!(press(&mut panel, 'k'), Did::Stay);
+        assert_eq!(press(&mut panel, 'r'), Did::Close);
+        let mut renamed = rows(&[other, behind]);
+        renamed[0].name = "blog".into();
+        leave_rows(&renamed);
+        panel.back();
+        assert_eq!(panel.leave(), None);
+        assert_eq!(panel.app.sessions()[0].name, "blog");
+        assert_eq!(cursor(&panel), other);
+
+        hand(&rows(&[other, behind]), None);
+        let mut panel = Panel::open(behind);
+        assert_eq!(press(&mut panel, 'c'), Did::Stay);
+        assert!(panel.app.has_room());
+        let up = Instant::now() + effects::ROOM_HELD + Duration::from_millis(1);
+        assert!(panel.tick(up));
+        assert!(panel.closing());
+        panel.back();
+        assert!(!panel.app.has_room(), "the gap closed");
+        assert!(!panel.closing());
         hand(&[], None);
     }
 
@@ -703,7 +765,7 @@ mod tests {
     /// a wider one, the panel's hint row says how to reach the settings.
     #[test]
     fn the_panel_says_how_to_reach_the_settings() {
-        let _turn = lock(&TURN);
+        let _turn = lock(&crate::ui::test_support::PANELS);
         let mut panel = Panel::open("abcd2345");
         for (width, height) in [(80, 24), (200, 50)] {
             let area = panel

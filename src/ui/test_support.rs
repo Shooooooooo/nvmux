@@ -17,6 +17,11 @@ use unicode_width::UnicodeWidthStr;
 use super::app::{App, Key};
 use crate::session::Session;
 
+/// The panels tests open, one test at a time: each opens on what the session
+/// loop last handed over, and leaves what it changed, which they share (see
+/// [`super::picker::hand`]).
+pub(crate) static PANELS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Render one frame to a `w` x `h` `TestBackend` and hand back the cell
 /// buffer, for the tests that need a cell's modifier rather than its text.
 pub(super) fn buffer(w: u16, h: u16, mut draw: impl FnMut(&mut Frame)) -> Buffer {
