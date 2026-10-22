@@ -2270,7 +2270,10 @@ fn a_page_neovim_does_not_turn_is_given_up_at_its_ack() {
     assert_eq!(tops[i - 1] - tops[i], 20, "by that page alone: {when:?}");
     assert_eq!(tops.last(), Some(&541), "where Neovim ends: {when:?}");
     // The first ack to cover the fifth page, and the frame with it: the
-    // view went back as that came, and no sooner.
+    // view went back as that came, and no sooner. As it came is within a
+    // link's delay of it, room for a busy machine and still well short of
+    // the time the client would have given the page up in without it,
+    // twice the round trip and more.
     let acked = link
         .trace
         .acks()
@@ -2280,7 +2283,7 @@ fn a_page_neovim_does_not_turn_is_given_up_at_its_ack() {
         .expect("an ack covering the fifth page");
     let gone = seen[i].1;
     assert!(
-        gone >= acked && gone < acked + Duration::from_millis(100),
+        gone >= acked && gone < acked + SLOW,
         "back {:?} after the ack that covered it: {when:?}",
         gone.checked_duration_since(acked)
             .map_or_else(|| format!("-{:?}", acked - gone), |d| format!("{d:?}"))
@@ -3254,16 +3257,18 @@ fn a_character_typed_otherwise_after_the_proof_is_put_right_at_once() {
     for c in "abcdefghij".chars() {
         typed(&mut term, c.to_string().as_bytes());
     }
-    let before = window(&term);
-    term.type_bytes(b"q");
+    let drawn = ahead(&mut term, "q, proved", b"q");
+    assert!(sight(&drawn).0[0].starts_with("xabcdefghijq"));
+    // Put right when Neovim's own frame lands, however late, and the frames
+    // after it in before the next key.
     assert!(
-        term.pump(SLOW, |t| window(t) != before),
-        "q, proved, drawn ahead:\n{}",
+        term.frames(Duration::from_secs(10), |screen| {
+            sight(screen).0[0].starts_with("xabcdefghijQ!")
+        }),
+        "put right:\n{}",
         term.text()
     );
-    assert!(window(&term).0[0].starts_with("xabcdefghijq"));
-    term.pump_until(4 * SLOW, |_| false);
-    assert!(window(&term).0[0].starts_with("xabcdefghijQ!"), "put right");
+    last_frame(&mut term, SLOW);
     waited(&mut term, "q, proving itself again", b"q");
 }
 
@@ -4666,21 +4671,25 @@ fn a_client_away_draws_a_busy_session_at_a_crawl() {
         back >= 10,
         "back in front, {back} frames in a second of ticks"
     );
+    // And it shows the session as it is now: the tick Neovim is at, or a
+    // later one, a whole frame of it, well within the second a client still
+    // at a crawl takes. Neovim asked first, and the screen watched for after,
+    // so that a test held up between the two is not counted against it.
     let ticks = rpc
         .eval("g:ticks")
         .ok()
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let shown: u64 = term
-        .text()
-        .lines()
-        .next()
-        .and_then(|l| l.strip_prefix("tick "))
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0);
+    let shown = |screen: &vt100::Screen| -> u64 {
+        sight(screen).0[0]
+            .strip_prefix("tick ")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0)
+    };
     assert!(
-        ticks.saturating_sub(shown) < 10,
-        "back in front, the screen says tick {shown} of {ticks}"
+        term.frames(Duration::from_millis(600), |screen| shown(screen) >= ticks),
+        "back in front, the screen says tick {} of {ticks}",
+        shown(term.parser.screen())
     );
 }
 
@@ -5069,10 +5078,12 @@ fn a_wide_window_has_its_text_centred_in_it() {
         "the text is not in the middle of each window ({w:?}):\n{}",
         term.text()
     );
-    assert_eq!(
-        widths(&mut rpc),
-        columns(160, &[60, 60]),
-        "the text 60 wide"
+    // As Neovim has them once it has the client's resize, which it may take
+    // after the test's question, on another socket.
+    assert!(
+        until_widths(&mut term, &mut rpc, &columns(160, &[60, 60])),
+        "the text not 60 wide: {:?}",
+        widths(&mut rpc)
     );
     let over = format!("{}[No Name]", " ".repeat(a));
     assert!(
@@ -5293,21 +5304,26 @@ fn a_split_over_a_slow_link_is_centred_from_its_first_frame() {
 
     rpc.command("vsplit").expect("vsplit");
     // The column the new window's text starts at on the first row, each
-    // time it moves, as it flies in and once it has landed.
-    let right = |t: &Terminal| -> Option<usize> {
-        let text = t.text();
-        let row = text.lines().next()?;
+    // time it moves, as it flies in and once it has landed: frame by frame,
+    // not part way through one, where the old copy of the left window's text
+    // can still be on the row beside its new one.
+    let right = |screen: &vt100::Screen| -> Option<usize> {
+        let row: String = (0..160)
+            .map(|c| match screen.cell(0, c) {
+                Some(cell) if cell.has_contents() => cell.contents(),
+                _ => " ",
+            })
+            .collect();
         let (at, _) = row.match_indices("MARK").nth(1)?;
         Some(row[..at].chars().count())
     };
     let mut seen: Vec<usize> = Vec::new();
-    let until = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < until {
-        term.pump_until(Duration::from_millis(5), |_| false);
-        if let Some(col) = right(&term).filter(|col| seen.last() != Some(col)) {
+    term.frames(Duration::from_secs(3), |screen| {
+        if let Some(col) = right(screen).filter(|col| seen.last() != Some(col)) {
             seen.push(col);
         }
-    }
+        false
+    });
     let goes = rpc
         .eval("[win_screenpos(2)[1] - 1, nvim_win_get_width(win_getid(2))]")
         .expect("where the new window is");
