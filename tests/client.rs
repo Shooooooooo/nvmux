@@ -4029,36 +4029,48 @@ fn sights_compared(
     });
 
     // The same keys, one at a time, to another Neovim, without MatchParen,
-    // drawn by a client over no link to speak of: what Neovim draws after
-    // each.
+    // drawn by a client over no link to speak of, its scrolls jumping as the
+    // other's do: what Neovim draws after each.
     let other = Scratch::new(&format!("{tag}-ref"));
     let (sock, mut rpc, config) = session(&other, &format!("{tag}-ref"));
     rpc.command(&format!("setlocal noswapfile | {setline} | NoMatchParen"))
         .expect("setline");
-    std::fs::write(&config, format!("[client]\n{NOTHING}")).expect("config");
+    std::fs::write(
+        &config,
+        format!("[client]\n{NOTHING}\n[effects.scroll]\nenabled = false\n"),
+    )
+    .expect("config");
     let mut reference = Terminal::spawn(&sock, &config);
     assert!(
         reference.pump_until(Duration::from_secs(20), |s| s.contains("line 1")),
         "never drawn:\n{}",
         reference.text()
     );
-    settle(
-        &mut reference,
-        Duration::from_millis(100),
-        Duration::from_secs(5),
-    );
-    let mut drew: Vec<Seen> = vec![sight(reference.parser.screen())];
-    for (_, name) in keys {
+    // What the client has drawn once Neovim has drawn everything up to now:
+    // the screen as of the frame that brings a mark Neovim is asked to put
+    // in the status line next, below the rows compared — not the command
+    // line, which Insert mode keeps for itself. Not the screen once the
+    // client has been quiet a while, which a busy machine can leave it before
+    // it has drawn anything at all.
+    let drawn = |reference: &mut Terminal, rpc: &mut nvmux::rpc::Client<_>, mark: &str| {
+        rpc.command(&format!("let &l:statusline = '{mark}'"))
+            .expect("mark");
+        let mut seen = None;
+        reference.frames(Duration::from_secs(10), |screen| {
+            let row = screen.contents_between(ROWS - 2, 0, ROWS - 2, COLS);
+            if row.contains(mark) {
+                seen = Some(sight(screen));
+            }
+            seen.is_some()
+        });
+        seen.unwrap_or_else(|| panic!("{mark} never drawn:\n{}", reference.text()))
+    };
+    let mut drew: Vec<Seen> = vec![drawn(&mut reference, &mut rpc, "drawn")];
+    for (k, (_, name)) in keys.iter().enumerate() {
         rpc.call("nvim_input", vec![name.as_str().into()])
             .expect("input");
-        // Answered once Neovim has taken the key, and flushed what it drew.
-        rpc.eval("1").expect("taken");
-        settle(
-            &mut reference,
-            Duration::from_millis(40),
-            Duration::from_secs(5),
-        );
-        drew.push(sight(reference.parser.screen()));
+        // Taken before Neovim answers the call after it.
+        drew.push(drawn(&mut reference, &mut rpc, &format!("key {k} taken")));
     }
 
     // Each sight, one Neovim drew, no earlier than the one before.
