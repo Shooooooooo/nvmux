@@ -1081,11 +1081,15 @@ fn a_session_at_a_hit_enter_prompt_is_listed_at_once_as_busy() {
     let listed = t.list_sessions().expect("list");
     let took = started.elapsed();
 
-    // A probe that waits on a deferred call again waits out its budget, which
-    // a listing that does not leaves well short of, on a busy machine too.
+    // Not held up by the session at its prompt for a probe's whole budget, as
+    // a listing that waited one out would be. A probe waiting on a deferred
+    // call again would cost a listing only its quick budget, a quarter of a
+    // second, too little to tell from a busy machine's listing:
+    // probe_is_busy_at_a_hit_enter_prompt_and_alive_after_it holds the probe
+    // itself to that.
     assert!(
         took < nvmux::rpc::PROBE_TIMEOUT - Duration::from_millis(500),
-        "listing took {took:?}: the probe waited on a deferred call again"
+        "listing took {took:?}: it waited out a probe's whole budget on the session at its prompt"
     );
     let s = listed
         .iter()
