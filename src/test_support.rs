@@ -1,7 +1,5 @@
-//! Helpers shared by the unit tests across modules: scratch paths, a bounded
-//! wait, byte-slice searches, and the PTY, palette and shadow fixtures the
-//! overlay tests share. The screen tests have their own in
-//! [`crate::ui::test_support`].
+//! Helpers shared by unit tests across modules. The screen tests have their
+//! own in [`crate::ui::test_support`].
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -10,15 +8,10 @@ use crate::palette::{Palette, Rgb};
 use crate::pty::PtySize;
 use crate::shadow::Shadow;
 
-/// A scratch path under the temp directory, with anything left there by an
-/// earlier run removed. Nothing is created: a test that wants the path absent
-/// — so a script can create it, say — takes this as it is.
-///
-/// Every unit test in the crate shares one pid and they run in parallel, so
-/// `tag` must be unique across the crate: callers qualify it with their module
-/// (`proc-listing`, `shell-listing`). The prefix is kept short because the
-/// socket tests must stay under [`crate::paths::MAX_SOCK_PATH`], and macOS's
-/// temp dir is not short.
+/// A scratch path under the temp dir, cleared but not created. Unit tests
+/// share one pid and run in parallel, so `tag` must be unique across the
+/// crate. The prefix is short so sockets stay under
+/// [`crate::paths::MAX_SOCK_PATH`] in macOS's long temp dir.
 pub(crate) fn scratch_path(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("nvmux-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
@@ -26,50 +19,40 @@ pub(crate) fn scratch_path(tag: &str) -> PathBuf {
     p
 }
 
-/// [`scratch_path`], created as an empty directory.
 pub(crate) fn scratch_dir(tag: &str) -> PathBuf {
     let p = scratch_path(tag);
     std::fs::create_dir_all(&p).expect("scratch dir");
     p
 }
 
-/// [`scratch_path`] for a socket: `<tag>.sock`, not bound to anything.
 pub(crate) fn scratch_sock(tag: &str) -> PathBuf {
     scratch_path(&format!("{tag}.sock"))
 }
 
-/// Run `f`, which provokes a panic on purpose and catches it, with the panic
-/// hook quiet. The hook is the whole test binary's: two tests swapping it at
-/// once can each put back the other's quiet one, and leave every panic after
-/// them — a failing test's own message among them — unsaid. So they take
-/// turns.
+/// Run `f`, which panics on purpose, with the panic hook silenced. Callers
+/// are serialized, as two tests swapping the global hook could leave it
+/// silenced for good.
 pub(crate) fn quietly<T>(f: impl FnOnce() -> T) -> T {
     static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _turn = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    // The hook back however `f` ends: a panic that gets out of it is the
-    // test failing, and has to be said.
+    // Restore the hook before re-raising, so a real failure is reported.
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     std::panic::set_hook(hook);
     out.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
-/// Leave a socket at `path` that nothing will ever accept a connection on, as
-/// a server that has gone leaves its own behind.
-///
-/// Not a listener bound and dropped: the tests alongside spawn processes, and
-/// a child forked while the listener is open holds it open too — until it
-/// execs, or for as long as it runs on macOS, where std cannot make a socket
-/// close-on-exec in the call that makes it — and a connect is taken into its
-/// backlog. A datagram socket never listens, and a stream connect to one is
-/// refused whoever holds it.
+/// Leave a socket at `path` that refuses every connection, like a dead
+/// server's. Not a bound-and-dropped listener: a child forked by a parallel
+/// test could inherit it (on macOS for its whole life, as std cannot create
+/// it close-on-exec atomically) and accept connects. A datagram socket never
+/// listens.
 pub(crate) fn dead_socket(path: &Path) {
     drop(std::os::unix::net::UnixDatagram::bind(path).expect("bind"));
 }
 
-/// Wait up to `within` for `cond` to hold, polling gently. Returns whether it
-/// did, so a caller can assert with its own message.
+/// Poll `cond` for up to `within`; returns whether it held.
 pub(crate) fn wait_until(within: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {
@@ -81,13 +64,11 @@ pub(crate) fn wait_until(within: Duration, mut cond: impl FnMut() -> bool) -> bo
     cond()
 }
 
-/// Whether `needle` occurs anywhere in `haystack`.
 pub(crate) fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Where `needle` starts in `haystack`, which is called `name` in the panic
-/// when it is not there at all.
+/// Where `needle` starts in `haystack`; panics naming `name` if absent.
 pub(crate) fn position(haystack: &[u8], needle: &[u8], name: &str) -> usize {
     haystack
         .windows(needle.len())
@@ -95,7 +76,6 @@ pub(crate) fn position(haystack: &[u8], needle: &[u8], name: &str) -> usize {
         .unwrap_or_else(|| panic!("{name} dropped {needle:?}"))
 }
 
-/// A terminal of this many columns and rows, with no pixel size.
 pub(crate) fn size(cols: u16, rows: u16) -> PtySize {
     PtySize {
         rows,
@@ -105,16 +85,13 @@ pub(crate) fn size(cols: u16, rows: u16) -> PtySize {
     }
 }
 
-/// A screen with room for a whole hint bar or attach notice, which most of
-/// the overlay tests want.
+/// Big enough for a whole hint bar or attach notice.
 pub(crate) fn big() -> PtySize {
     size(80, 24)
 }
 
-/// A terminal that said its text is light grey on black. No palette is ever
-/// installed under test, so this is the only way to reach the restoring and
-/// dissolving paths — which is why `hint::Bar::with_palette` and
-/// [`crate::fade::Dissolve`] take one.
+/// Light grey on black. No palette is installed under test, hence
+/// `hint::Bar::with_palette` and [`crate::fade::Dissolve`] take one.
 pub(crate) fn palette() -> Palette {
     Palette {
         fg: Rgb(200, 200, 200),
@@ -123,10 +100,8 @@ pub(crate) fn palette() -> Palette {
     }
 }
 
-/// A shadow with something on it to put back or dissolve into: every cell an
-/// `x`, which is in none of the bar's words, none of the box's glyphs and no
-/// session name the tests use, so a frame shows the screen exactly when it
-/// has one in it.
+/// A shadow with every cell `x`, a letter in no bar word, box glyph or test
+/// session name, so a frame shows the screen exactly when it contains one.
 pub(crate) fn screen(rows: u16, cols: u16) -> Shadow {
     let mut shadow = Shadow::new(rows, cols);
     for row in 1..=rows {
@@ -135,20 +110,12 @@ pub(crate) fn screen(rows: u16, cols: u16) -> Shadow {
     shadow
 }
 
-/// What a client might write, heavy on what [`crate::ledger::OscCap`] has to
-/// get right, and the sizes of the reads it comes in; `seed` decides both.
-///
-/// Text, narrow and wide and cut part way through a character; escape
-/// sequences the ledger keeps and some it does not; DCS and APC strings,
-/// some left open for whatever comes next to end; lone and doubled `ESC`s,
-/// and an `ESC` with a C0 control before its `]`, which vte still opens an
-/// OSC on. And OSCs of every kind the ledger keeps and some it does not —
-/// short, about [`crate::ledger::OSC_SHOWN`] and far past it, with `;`s, C0
-/// controls, C1 bytes and UTF-8 in them — ended every way vte ends one, by
-/// the `ESC` of another, or left open. Reads run from a byte to more than a
-/// whole OSC.
+/// Seeded client output aimed at [`crate::ledger::OscCap`], with read sizes:
+/// text, escapes, DCS/APC, stray `ESC`s, `ESC` + C0 + `]` (vte still opens
+/// an OSC), and OSCs around [`crate::ledger::OSC_SHOWN`] in length, ended
+/// every way vte accepts or left open.
 pub(crate) fn osc_noise(seed: u64) -> (Vec<u8>, Vec<usize>) {
-    // xorshift64*, as `ui::starfield` has it.
+    // xorshift64*, as in `ui::starfield`.
     let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
     let mut below = move |n: usize| {
         state ^= state >> 12;

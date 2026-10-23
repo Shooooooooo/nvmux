@@ -1,24 +1,17 @@
--- Where Neovim's view goes when a motion takes the cursor past the edge of
--- 'scrolloff': the table `src/client/moves.rs` checks its `keep_in_view`
--- against (`motions_past_the_edges_scroll_as_neovim_does`).
+-- Prints the Rust `const TOPLINE` table that `src/client/moves.rs` checks
+-- `keep_in_view` against (`motions_past_the_edges_scroll_as_neovim_does`).
+-- Run with Neovim 0.12.6:
 --
 --   nvim --clean -n --headless -c 'luafile scripts/sweep-topline.lua'
 --
--- prints it as the Rust `const TOPLINE` that test pastes in. Run with
--- Neovim 0.12.6.
---
--- For every window height h from 4 to 60 and every 'scrolloff' from nought
--- to h/2, the cursor is put on the last row 'scrolloff' lets it be on —
--- the bottom one, less 'scrolloff', for a motion down; the top one, plus
--- it, for a motion up — of a view from line 400 of a buffer 1000 lines
--- long, and moved N lines, N from 1 to h, by `Nj`, `Ngj`, `Nk` and `Ngk`.
--- What is said of each is how far N goes with Neovim scrolling the view
--- just far enough to keep 'scrolloff' between the cursor and the edge — no
--- further, as `scroll_cursor_top` and `scroll_cursor_bot` do for a small
--- move — before it first does otherwise, centring the cursor as
--- `scroll_cursor_halfway` does: the first N it does otherwise, less one,
--- or h where it never does. Up, that is half the window less one, and
--- never under two, whatever 'scrolloff' is; down, further.
+-- For each window height h in 4..60 and 'scrolloff' in 0..h/2, the cursor
+-- starts on the last row 'scrolloff' allows (bottom minus 'scrolloff' for a
+-- move down, top plus it for a move up) of a view from line 400 of a
+-- 1000-line buffer, and moves N lines (N in 1..h) by `Nj`, `Ngj`, `Nk` and
+-- `Ngk`. Each entry is the largest N for which Neovim scrolls just enough to
+-- keep 'scrolloff' (`scroll_cursor_top`/`scroll_cursor_bot`) instead of
+-- centring the cursor (`scroll_cursor_halfway`), or h if it never centres.
+-- Up, that is half the window less one, at least two; down, more.
 
 vim.o.lines = 100
 vim.o.laststatus = 0

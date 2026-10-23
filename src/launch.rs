@@ -1,54 +1,25 @@
-//! The command a session's Neovim is launched with.
+//! The command line a session's Neovim is launched with.
 //!
-//! One line, typed by the user or read from the config, that says how to start
-//! the editor a session *is*. The socket it must listen on is not known when the
-//! line is written, so the line carries a [`PLACEHOLDER`] which nvmux replaces
-//! with the real path at spawn time:
-//!
-//! ```text
-//! nvim --headless --listen {sock}
-//! └─ words, split here in Rust      └─ becomes /tmp/nvmux-501/abcdefgh.sock
-//! ```
-//!
-//! # Why the socket is mandatory
-//!
-//! `{sock}` is not decoration. Every later listing and every kill finds a
-//! session by looking for `--listen <sock>` in a process's command line
-//! (`scripts/_prelude.sh`, `scripts/kill.sh`), and `nvim --listen` is what binds
-//! the socket the picker attaches through. A line without it would start an
-//! editor nvmux could neither reach nor stop, so a missing placeholder is
-//! refused rather than quietly appended to.
-//!
-//! # Split, never evaluated
-//!
-//! The line is split into words *here* and travels to the session host as
-//! separate positional arguments, exactly like every other variable part — see
-//! [`crate::shell`], which explains why no command string is ever built by
-//! interpolation. Nothing is *expanded*: there are no globs, no `$VAR`, no `~`,
-//! and no `VAR=value` prefixes, because there is no shell in the path that would
-//! honour them. `env` covers the last of those and the errors say so.
+//! It must contain [`PLACEHOLDER`] exactly once: listings and kills find a
+//! session by `--listen <sock>` in its command line (`scripts/_prelude.sh`,
+//! `scripts/kill.sh`). The line is split here and passed as separate
+//! arguments (see [`crate::shell`]); no shell expands globs, `$VAR`, `~` or
+//! `VAR=value` prefixes.
 
 use crate::error::SessionError;
 
-/// Stands in for the session's socket path, which is not known until the
-/// session has an id.
+/// Replaced by the session's socket path, unknown until it has an id.
 pub const PLACEHOLDER: &str = "{sock}";
 
-/// What nvmux launches when nothing says otherwise. The one place this is
-/// written down; [`crate::config::SessionSettings`] defaults to it.
+/// Also the default of [`crate::config::SessionSettings`].
 pub const DEFAULT: &str = "nvim --headless --listen {sock}";
 
-/// A line is metadata, but it reaches a terminal, a log and a shell argument
-/// list, so it is bounded like a name is. Generous: a real one runs to about
-/// thirty characters.
+/// Bounded like a name: the line reaches the terminal, logs and argv. Real
+/// ones are about 30 characters.
 const MAX_LEN: usize = 512;
 
-/// A validated launch command: the line as it was written, and the words it
-/// splits into.
-///
-/// Holding both is the point. The line is what is shown, remembered and stored;
-/// the words are what is executed, and deriving them once means the split that
-/// was validated is the split that runs.
+/// The line as written (shown and stored) and its words (executed), split
+/// once so the validated split is what runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
     line: String,
@@ -56,8 +27,6 @@ pub struct Launch {
 }
 
 impl Launch {
-    /// Validate a line and split it. Every rejection names what is wrong with
-    /// it, because this is typed at a prompt and edited by hand in a config.
     pub fn parse(line: &str) -> Result<Self, SessionError> {
         let line = line.trim();
         let invalid = |reason| {
@@ -73,9 +42,8 @@ impl Launch {
         if line.len() > MAX_LEN {
             return invalid("must be 512 bytes or fewer");
         }
-        // The same rule session names live by, and for the same reasons: the
-        // line is drawn on the prompt and could otherwise smuggle escape
-        // sequences into the terminal.
+        // Same rule as session names: the line is drawn on the prompt and
+        // must not smuggle escape sequences.
         if line.chars().any(crate::session::is_unrenderable) {
             return invalid("must not contain control or invisible formatting characters");
         }
@@ -88,9 +56,8 @@ impl Launch {
         let Some(first) = words.first() else {
             return invalid("must not be empty");
         };
-        // There is no shell to honour an assignment, so `FOO=1 nvim` would look
-        // for a program called `FOO=1`. Caught here rather than as a baffling
-        // "not found" from the spawn script.
+        // With no shell, `FOO=1 nvim` would run a program named `FOO=1`;
+        // refuse it here instead of a confusing "not found" at spawn.
         if is_assignment(first) {
             return invalid(
                 "starts with a variable assignment, which nothing here expands — \
@@ -115,15 +82,11 @@ impl Launch {
         })
     }
 
-    /// The line as it was written — what is shown, remembered and stored.
     pub fn line(&self) -> &str {
         &self.line
     }
 
-    /// The words to run, with the placeholder replaced by a real socket path.
-    ///
-    /// `parse` has already established there is exactly one, so this cannot
-    /// silently produce a command line with none.
+    /// The words with [`PLACEHOLDER`] replaced by `sock`.
     pub fn argv_for(&self, sock: &str) -> Vec<String> {
         self.words
             .iter()
@@ -132,13 +95,9 @@ impl Launch {
     }
 }
 
-/// Split a line the way a POSIX shell splits words, and no further.
-///
-/// Quoting is honoured — `'…'` literally, `"…"` with `\"` and `\\` — so a path
-/// with a space in it is one word. Nothing is expanded. An unterminated quote or
-/// a trailing backslash is an error rather than a word that quietly loses its
-/// tail: the alternative is a session started with something the user did not
-/// write.
+/// Split into words like a POSIX shell, without expansion: `'…'` is literal,
+/// `"…"` escapes only `\"` and `\\`. An unclosed quote or trailing backslash
+/// is an error rather than a silently truncated word.
 fn split(line: &str) -> Result<Vec<String>, &'static str> {
     let mut words = Vec::new();
     let mut word = String::new();
@@ -176,8 +135,7 @@ fn split(line: &str) -> Result<Vec<String>, &'static str> {
                             closed = true;
                             break;
                         }
-                        // Only these two: a backslash before anything else is
-                        // literal inside double quotes, as in a real shell.
+                        // As in a shell, any other backslash is literal.
                         '\\' => match chars.next() {
                             Some(escaped @ ('"' | '\\')) => word.push(escaped),
                             Some(other) => {
@@ -213,7 +171,7 @@ fn split(line: &str) -> Result<Vec<String>, &'static str> {
     Ok(words)
 }
 
-/// `NAME=` at the start of a word, as a shell would read an assignment.
+/// Whether `word` starts with a shell assignment (`NAME=`).
 fn is_assignment(word: &str) -> bool {
     let Some((name, _)) = word.split_once('=') else {
         return false;
@@ -263,15 +221,12 @@ mod tests {
         );
     }
 
-    /// A tab is whitespace to a shell but a control character here, and the
-    /// second rule wins: this line is drawn on the prompt.
     #[test]
     fn a_tab_is_a_control_character_not_a_separator() {
         assert!(reason("nvim\t--listen {sock}").contains("control"));
     }
 
-    /// The line is stored as it was written, not as it was split — that is what
-    /// gets shown back as the next hint.
+    /// The stored line is shown back as the next hint.
     #[test]
     fn the_line_is_kept_verbatim_apart_from_the_edges() {
         let l = Launch::parse("  nvim  -u 'my init.lua' --listen {sock}  ").expect("parses");
@@ -286,7 +241,6 @@ mod tests {
         assert_eq!(words(r"/opt/my\ nvim/bin/nvim --listen {sock}"), want);
     }
 
-    /// Single quotes have no escapes at all in a POSIX shell, and neither here.
     #[test]
     fn single_quotes_are_literal() {
         assert_eq!(
@@ -295,9 +249,7 @@ mod tests {
         );
     }
 
-    /// Inside double quotes only `\"` and `\\` are escapes; anything else keeps
-    /// its backslash, which is what a shell does and what a Lua or Vim snippet
-    /// passed with `-c` depends on.
+    /// `-c` snippets rely on other backslashes being kept.
     #[test]
     fn double_quotes_escape_only_themselves_and_a_backslash() {
         assert_eq!(
@@ -335,8 +287,6 @@ mod tests {
         );
     }
 
-    /// A word that quietly loses its tail would start a session with something
-    /// the user did not write.
     #[test]
     fn an_unbalanced_quote_is_refused_rather_than_truncated() {
         assert!(reason("nvim -c 'unclosed {sock}").contains("unclosed '"));
@@ -345,12 +295,11 @@ mod tests {
         assert!(reason(r#"nvim {sock} "a\"#).contains("dangling backslash"));
     }
 
-    /// Without it nvmux starts an editor it can neither find nor kill.
     #[test]
     fn the_socket_placeholder_is_mandatory_and_singular() {
         assert!(reason("nvim --headless").contains("{sock}"));
         assert!(reason("nvim --listen {sock} --listen {sock}").contains("exactly once"));
-        // Quoted still counts: it is the word that is executed that matters.
+        // Quoting does not matter: the executed word is what counts.
         Launch::parse("nvim --listen '{sock}'").expect("a quoted placeholder is still one");
     }
 
@@ -363,8 +312,6 @@ mod tests {
         );
     }
 
-    /// The placeholder need not be a word of its own — a wrapper may want to
-    /// glue it to something.
     #[test]
     fn the_placeholder_may_be_part_of_a_larger_word() {
         assert_eq!(
@@ -373,8 +320,6 @@ mod tests {
         );
     }
 
-    /// There is no shell here, so `FOO=1 nvim` would look for a program called
-    /// `FOO=1`. Say what to do instead rather than letting the spawn fail.
     #[test]
     fn a_leading_assignment_is_refused_with_the_remedy() {
         let r = reason("NVIM_APPNAME=work nvim --listen {sock}");
@@ -407,8 +352,6 @@ mod tests {
         Launch::parse(&ok).expect("just inside the cap");
     }
 
-    /// Whatever a shell would have done with these, nvmux does not: they reach
-    /// the editor as the literal words they are.
     #[test]
     fn nothing_is_expanded() {
         assert_eq!(
@@ -423,7 +366,7 @@ mod tests {
             words("nvim -u *.lua {sock}"),
             ["nvim", "-u", "*.lua", "/tmp/s.sock"]
         );
-        // And nothing here is a shell operator either.
+        // No shell operators either.
         assert_eq!(
             words("nvim {sock} ; rm -rf /"),
             ["nvim", "/tmp/s.sock", ";", "rm", "-rf", "/"]

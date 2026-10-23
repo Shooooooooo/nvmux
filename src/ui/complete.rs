@@ -1,52 +1,21 @@
 //! Directory completion for the create prompt, off the keypress path.
 //!
-//! Typing a path must never wait for a directory to be listed. Locally that
-//! listing is a millisecond; over ssh it is a round trip, measured at ~230ms
-//! even to localhost (see `scripts/list.sh`), and a prompt that spent that on
-//! every keystroke would be unusable on the connection this feature exists for.
-//! So `Completer::ask` is what a keystroke calls, it answers from memory or
-//! sends a request, and it never does any I/O at all.
+//! A keystroke must never wait on a listing: over ssh each is a round trip
+//! (~230 ms even to localhost, see `scripts/list.sh`). `Completer::ask`
+//! answers from memory or posts a request to a worker thread; it does no I/O.
 //!
-//! # The first thread in this crate, and why
+//! A thread is safe despite [`crate::pty`]'s single-thread rule: it reads no
+//! terminal. The screens poll via crossterm's timeout-only `event::poll`, so
+//! no self-pipe is possible (as [`crate::winch`] uses); replies arrive on a
+//! channel drained each tick, which [`super::poll_key_for`] shortens while
+//! waiting. The thread is never joined, so a wedged ssh cannot hang the
+//! prompt; dropping the `Completer` ends its loop after the current listing.
 //!
-//! nvmux is otherwise one thread and one `libc::poll`, and [`crate::pty`] is
-//! emphatic about why: a second reader of the same stream splits it, and a
-//! thread parked in a blocking `read` cannot be cancelled. Neither applies here
-//! — this thread reads no terminal and owns nothing the UI needs back.
-//!
-//! What does apply is that the screens do not poll a set of file descriptors at
-//! all. They poll through crossterm's `event::poll`, which takes a timeout and
-//! nothing else, so there is no fd for a self-pipe to join — the mechanism
-//! [`crate::winch`] uses to keep SIGWINCH off a thread is simply not available
-//! here. A channel drained on the existing tick is what is left, and
-//! [`super::poll_key_for`] shortens that tick while an answer is outstanding so
-//! the wait is a frame rather than a quarter of a second.
-//!
-//! The thread is never joined. Dropping the `Completer` drops the sending end,
-//! which ends the worker's loop after its current listing returns — and a
-//! wedged ssh must not hang the prompt on the way out. What is left running
-//! holds a shell on the host and a dead channel; the loop ends, the shell goes
-//! with it (its stdin closes, and it gets a moment to leave before it is
-//! killed), and the thread exits on its own.
-//!
-//! # Three properties, and what each one is for
-//!
-//! **Coalescing.** The worker takes a request and then drains everything queued
-//! behind it, serving only the newest. Typing `projects` faster than a round
-//! trip costs one listing rather than eight.
-//!
-//! **Sequence numbers.** Only the answer to the question currently being asked
-//! is displayed. Without this a slow answer landing after a fast one would
-//! replace the right candidates with stale ones — the classic autocomplete bug,
-//! and one that gets *more* likely the better the cache works, because a cached
-//! answer is instant and an in-flight one is not.
-//!
-//! **A prefix-extension cache.** A listing of `/home/you` for `p` also answers
-//! `pr`, `pro` and `proj`, by filtering in memory. So a path costs about one
-//! round trip per `/` rather than one per keystroke, and backspacing inside a
-//! component is usually free. The exception is a truncated listing, which is
-//! only part of an answer and so can be shown but never narrowed: what it left
-//! out may be exactly what the longer prefix wanted.
+//! - Coalescing: the worker serves only the newest queued request.
+//! - Sequence numbers: only the answer to the current request is shown, so a
+//!   slow stale answer cannot replace a fresh (often cached) one.
+//! - Cache: a directory's listing answers every query typed inside it by
+//!   filtering in memory, so a path costs about one round trip per `/`.
 
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
@@ -56,19 +25,15 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 use crate::dirs::{self, DirSource, Lister};
 use crate::transport::protocol::Listing;
 
-/// How many directories to remember. A path is a handful of components and a
-/// user moves between a handful of trees; past that, re-asking costs one round
-/// trip and holding on costs memory for answers that have gone stale anyway.
+/// Directories to remember.
 const CACHE: usize = 16;
 
-/// What the prompt asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Request {
     seq: u64,
     dir: String,
 }
 
-/// What the host said, and which question it answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Reply {
     seq: u64,
@@ -76,15 +41,14 @@ struct Reply {
     listing: Listing,
 }
 
-/// A listing kept for later. Keyed by directory alone: it holds every child,
-/// so it answers every query anyone could type inside that directory.
+/// Keyed by directory alone: it holds every child, so it answers any query
+/// typed inside that directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Cached {
     dir: String,
     listing: Listing,
 }
 
-/// What is on screen right now.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Shown {
     dir: String,
@@ -92,49 +56,37 @@ struct Shown {
     truncated: bool,
 }
 
-/// Directory completion for one prompt.
 pub(super) struct Completer {
-    /// `None` only in tests, which drive the channels themselves. Dropping this
-    /// is what ends the worker.
+    /// `None` only in tests, which drive the channels themselves. Dropping it
+    /// ends the worker.
     tx: Option<Sender<Request>>,
     rx: Receiver<Reply>,
-    /// The question being asked. A reply carrying anything else is an answer to
-    /// a question that has moved on.
+    /// The current request; a reply with another `seq` is stale.
     seq: u64,
-    /// Set while a request is outstanding, so the prompt can poll faster and
-    /// say that it is waiting rather than that there is nothing.
+    /// A request is outstanding: the prompt polls faster and shows waiting.
     awaiting: bool,
     cache: Vec<Cached>,
     shown: Shown,
-    /// The session host's home, for the `~` in a typed path. Held here rather
-    /// than reached for per question because it is what [`DirSource`] is about
-    /// — the host — and because the expansion happens on this thread, before a
-    /// request is made, not in the worker.
+    /// The session host's home, for expanding `~` before a request is made.
     home: String,
-    /// Scratch buffers for the scorer, reused across queries. `Matcher` is
-    /// stateful for that reason and scoring takes `&mut`, which is why ranking
-    /// lives here beside the names rather than in the prompt.
+    /// Scorer scratch buffers, reused across queries. Scoring takes `&mut`,
+    /// which is why ranking lives here rather than in the prompt.
     matcher: Matcher,
 }
 
 impl Completer {
-    /// Start completing against `source`, which the worker takes with it.
-    ///
-    /// `home` is that same host's home directory, which is what a leading `~`
-    /// in the field means — see [`crate::session::expand_tilde`]. Empty is
-    /// allowed and means the host never said: a `~` is then left as the
-    /// literal text it is, and lists nothing.
+    /// `home` is the host's home for a leading `~` (see
+    /// [`crate::session::expand_tilde`]); empty means unknown, and `~` stays
+    /// literal.
     pub(super) fn new(source: DirSource, home: &str) -> Self {
         let (ask_tx, ask_rx) = mpsc::channel::<Request>();
         let (reply_tx, reply_rx) = mpsc::channel::<Reply>();
 
-        // Not joined, and nothing waits on it: see the module docs.
         std::thread::Builder::new()
             .name("nvmux-complete".into())
             .spawn(move || serve(source, &ask_rx, &reply_tx))
-            // A thread that will not start is not worth failing a prompt over.
-            // The sender is dropped with the closure, `ask` finds the channel
-            // closed, and the field is simply one you type into unaided.
+            // A failed spawn drops the closure, closing the channel; the field
+            // then works without completion.
             .map_err(|e| tracing::debug!(error = %e, "no completion worker; typing is unaided"))
             .ok();
 
@@ -150,32 +102,23 @@ impl Completer {
         }
     }
 
-    /// What has been typed has changed. Never blocks, never does I/O.
+    /// The typed text changed. Never blocks or does I/O.
     pub(super) fn ask(&mut self, input: &str) {
         let Some((dir, _query)) = dirs::split(input) else {
-            // Nothing to list: no `/` in what has been typed, and a working
-            // directory is absolute, so there is no relative one to resolve.
+            // No `/` typed: nothing to list, as working directories are
+            // absolute.
             self.shown = Shown::default();
             self.awaiting = false;
             return;
         };
-        // The `~` is expanded here, on the directory half and after the split,
-        // which is what keeps it to the one shape that has a directory in it.
-        // A bare `~` names the home but does not yet say "inside it", and it
-        // has no `/`, so `split` has already returned above and left it alone —
-        // exactly as `/home/shu` is left alone. Typing the `/` is what asks.
-        //
-        // The expansion is the same one `enter` will apply (see
-        // `session::validate_directory`), so the menu cannot offer what
-        // creating the session would not use. A `~` that will not expand —
-        // `~user`, or a host that reported no home — stays the literal text,
-        // and the host lists nothing for it: at a prompt `~r` is `~root` half
-        // typed, not an error to report.
+        // Expand `~` on the directory half only (a bare `~` returned above),
+        // as `enter` does (see `session::validate_directory`), so the menu
+        // lists where the session would be created. An unexpandable `~`
+        // stays literal and lists nothing: `~r` is `~root` half typed.
         let dir = crate::session::expand_tilde(dir, &self.home).unwrap_or_else(|_| dir.to_string());
         let dir = dir.as_str();
-        // Only the directory is a question for the host. Everything after the
-        // last `/` is a query, and this side answers those from what it already
-        // holds — which is why typing inside a directory costs nothing at all.
+        // Only the directory goes to the host; the query after the last `/`
+        // is answered from memory.
         if self.shown.dir == dir && !self.awaiting {
             return;
         }
@@ -193,8 +136,8 @@ impl Completer {
             seq: self.seq,
             dir: dir.to_string(),
         };
-        // An unbounded channel: this cannot block, and a closed one means the
-        // worker is gone, which costs completions and nothing else.
+        // Unbounded, so this never blocks. Closed means no worker, so no
+        // completions.
         if let Some(tx) = &self.tx {
             if tx.send(request).is_err() {
                 self.awaiting = false;
@@ -202,7 +145,7 @@ impl Completer {
         }
     }
 
-    /// Take whatever the worker has sent. Returns whether the screen changed.
+    /// Drain worker replies; returns whether the screen changed.
     pub(super) fn poll(&mut self) -> bool {
         let mut changed = false;
         loop {
@@ -219,9 +162,8 @@ impl Completer {
                         self.awaiting = false;
                         changed = true;
                     } else if self.awaiting {
-                        // An answer to a question that has moved on can still
-                        // settle the current one, when both are about the same
-                        // directory — which is now the only thing a question is.
+                        // A stale reply for the same directory still answers
+                        // the current request.
                         let dir = self.shown.dir.clone();
                         changed |= self.take_from_cache(&dir);
                     }
@@ -231,33 +173,19 @@ impl Completer {
         }
     }
 
-    /// Is an answer still outstanding? The prompt polls faster while it is, and
-    /// says it is waiting rather than saying there is nothing there.
     pub(super) fn waiting(&self) -> bool {
         self.awaiting
     }
 
-    /// Every child of the directory being completed, unranked and unfiltered,
-    /// in the host's order. What [`Completer::matches`] scores.
     #[cfg(test)]
     fn names(&self) -> &[String] {
         &self.shown.names
     }
 
-    /// The directories `query` could mean, best first.
-    ///
-    /// Fuzzy, so `nvmx` finds `nvmux-rs` — the whole reason the host stopped
-    /// filtering. An empty query is every child in the host's order, which is
-    /// what a freshly typed `/` shows.
-    ///
-    /// Dotted directories are hidden until the query asks for one. That rule
-    /// used to come free from the shell's globbing, where `*` skips a leading
-    /// dot and `.*` does not; it is spelled out here because there is no glob
-    /// left to carry it, and it is worth keeping because a home directory is
-    /// mostly dotted and none of it is what anyone is looking for.
-    ///
-    /// Ties are broken by the host's order rather than left to the sort, so a
-    /// list of equally good matches does not shuffle as the query grows.
+    /// The directories `query` fuzzily matches, best first; all children for
+    /// an empty query. Dot directories need a `.` in the query, since a home
+    /// is mostly dotfiles. Ties keep the host's order, so the list does not
+    /// shuffle as the query grows.
     pub(super) fn matches(&mut self, query: &str) -> Vec<String> {
         let wants_dotted = query.contains('.');
         let visible = |name: &String| wants_dotted || !name.starts_with('.');
@@ -286,9 +214,8 @@ impl Completer {
             })
             .collect();
 
-        // Best score first; the host's order within a score. Sorted explicitly
-        // rather than through `Pattern::match_list`, whose tie order is its own
-        // business and not something a screen should inherit.
+        // Best score first, then host order. Not `Pattern::match_list`, whose
+        // tie order is its own.
         scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         scored
             .into_iter()
@@ -296,13 +223,12 @@ impl Completer {
             .collect()
     }
 
-    /// The host stopped short of listing everything. Shown, so a row that is
-    /// missing entries does not read as one that is complete.
+    /// Whether the host listed only part of the directory.
     pub(super) fn truncated(&self) -> bool {
         self.shown.truncated
     }
 
-    /// Answer from a listing already in hand, if one covers this question.
+    /// Show the cached listing for `dir`; returns whether there was one.
     fn take_from_cache(&mut self, dir: &str) -> bool {
         let Some(cached) = self.cache.iter().find(|c| c.dir == dir) else {
             return false;
@@ -323,20 +249,18 @@ impl Completer {
     }
 }
 
-/// The worker: one listing at a time, always the newest question asked.
+/// The worker: one listing at a time, for the newest request.
 fn serve(source: DirSource, rx: &Receiver<Request>, tx: &Sender<Reply>) {
     let mut lister = Lister::new(source);
-    // Brought up now, while the user is still typing the first characters,
-    // rather than by the first question — which over ssh would otherwise pay
-    // for a login shell on the host.
+    // Warm up while the user types, so the first request does not pay for
+    // an ssh login shell.
     lister.warm();
     while let Ok(first) = rx.recv() {
         let request = newest(first, rx);
         let listing = match lister.children(&request.dir) {
             Ok(listing) => listing,
-            // A host that cannot answer costs completions, not a session. The
-            // empty listing is also the honest answer for the commonest cause:
-            // a directory half-typed and not there yet.
+            // A failure only costs completions. Empty is also right for the
+            // usual cause: a half-typed directory that does not exist yet.
             Err(e) => {
                 tracing::debug!(dir = %request.dir, error = %e, "could not list a directory");
                 Listing::default()
@@ -347,16 +271,13 @@ fn serve(source: DirSource, rx: &Receiver<Request>, tx: &Sender<Reply>) {
             dir: request.dir,
             listing,
         };
-        // A closed channel means the prompt is gone; so is the reason to keep
-        // listing.
         if tx.send(reply).is_err() {
             return;
         }
     }
 }
 
-/// The newest of a run of requests, discarding the ones overtaken while the
-/// previous listing was in flight. This is the coalescing.
+/// The newest of the queued requests, discarding older ones (coalescing).
 fn newest(first: Request, rx: &Receiver<Request>) -> Request {
     let mut latest = first;
     while let Ok(next) = rx.try_recv() {
@@ -376,15 +297,12 @@ mod tests {
         }
     }
 
-    /// A completer with no worker behind it: the test *is* the worker, so it can
-    /// answer late, out of order, or not at all, and can see exactly which
-    /// directories were asked about. No thread, no filesystem, no ssh.
+    /// A completer whose worker is the test.
     fn detached() -> (Completer, Receiver<Request>, Sender<Reply>) {
         detached_at("/home/you")
     }
 
-    /// The same, for a host whose home is `home` — which is what a `~` in the
-    /// field means, and the only thing the tilde tests need to vary.
+    /// [`detached`] for a host whose home is `home`.
     fn detached_at(home: &str) -> (Completer, Receiver<Request>, Sender<Reply>) {
         let (ask_tx, ask_rx) = mpsc::channel();
         let (reply_tx, reply_rx) = mpsc::channel();
@@ -409,7 +327,7 @@ mod tests {
         out
     }
 
-    /// Answer the question currently being asked, as a worker would.
+    /// Answer the current request, as a worker would.
     fn answer(c: &mut Completer, rx: &Receiver<Request>, tx: &Sender<Reply>, l: Listing) {
         while rx.try_recv().is_ok() {}
         assert!(c.waiting(), "nothing was outstanding to answer");
@@ -422,8 +340,7 @@ mod tests {
         c.poll();
     }
 
-    /// A completer already holding one directory's children, which is the state
-    /// every matching test below wants.
+    /// A completer already holding `dir`'s children.
     fn holding(dir: &str, names: &[&str]) -> Completer {
         let (mut c, ask_rx, reply_tx) = detached();
         c.ask(&format!("{dir}/"));
@@ -431,8 +348,6 @@ mod tests {
         c
     }
 
-    /// The whole point: a keystroke does no I/O and does not wait. All `ask` may
-    /// do is look in memory and post a question.
     #[test]
     fn asking_posts_a_question_and_shows_nothing_until_it_is_answered() {
         let (mut c, ask_rx, reply_tx) = detached();
@@ -451,9 +366,6 @@ mod tests {
         assert_eq!(c.names(), ["projects", "prototypes"]);
     }
 
-    /// The question is the *directory*, and nothing else. Everything after the
-    /// last `/` is a query this side answers from what it already holds, which
-    /// is what makes typing inside a directory free.
     #[test]
     fn typing_within_one_directory_never_asks_again() {
         let (mut c, ask_rx, reply_tx) = detached();
@@ -478,8 +390,6 @@ mod tests {
         }
     }
 
-    /// A new directory is a new question, however much is cached about the old
-    /// one.
     #[test]
     fn a_different_directory_is_always_asked_about() {
         let (mut c, ask_rx, reply_tx) = detached();
@@ -494,8 +404,6 @@ mod tests {
         );
     }
 
-    /// The classic autocomplete bug: a slow answer landing after a fast one and
-    /// replacing the right list with a stale one.
     #[test]
     fn a_stale_answer_never_overwrites_a_fresh_one() {
         let (mut c, ask_rx, reply_tx) = detached();
@@ -521,7 +429,7 @@ mod tests {
         assert!(c.poll());
         assert_eq!(c.names(), ["xbeta"]);
 
-        // ...and the first arrives late. It must be kept, and not shown.
+        // ...and the first arrives late: kept, but not shown.
         reply_tx
             .send(Reply {
                 seq: questions[0].seq,
@@ -532,7 +440,7 @@ mod tests {
         c.poll();
         assert_eq!(c.names(), ["xbeta"], "the stale answer must not win");
 
-        // Kept, though: going back to it costs nothing.
+        // Going back to it costs nothing.
         c.ask("/a/");
         assert!(
             asked(&ask_rx).is_empty(),
@@ -541,8 +449,6 @@ mod tests {
         assert_eq!(c.names(), ["xalpha"]);
     }
 
-    /// Coalescing: everything queued behind a request is discarded in favour of
-    /// the newest. Typing faster than a round trip must cost one listing.
     #[test]
     fn only_the_newest_of_a_run_of_questions_is_served() {
         let (tx, rx) = mpsc::channel();
@@ -563,8 +469,6 @@ mod tests {
         );
     }
 
-    /// Nothing to list, so nothing is asked: a working directory is absolute, so
-    /// there is no relative one to resolve a bare word against.
     #[test]
     fn a_path_with_no_slash_asks_nothing_and_shows_nothing() {
         let (mut c, ask_rx, reply_tx) = detached();
@@ -580,9 +484,7 @@ mod tests {
 
     // --- the tilde -----------------------------------------------------------
 
-    /// A `~` is the *session host's* home, so what gets listed is the home the
-    /// completer was built with — never this machine's `$HOME`, which over ssh
-    /// would be a different computer's path.
+    /// Never this machine's `$HOME`, which over ssh is another computer's.
     #[test]
     fn a_tilde_is_the_session_hosts_home_directory() {
         let (mut c, ask_rx, reply_tx) = detached_at("/home/them");
@@ -593,8 +495,6 @@ mod tests {
         assert_eq!(c.matches(""), ["src", "docs"]);
     }
 
-    /// The expansion is of the directory half, so it survives being deep in a
-    /// path rather than only working at the front of one.
     #[test]
     fn a_tilde_expands_anywhere_the_directory_half_starts_with_one() {
         let (mut c, ask_rx, _reply_tx) = detached_at("/home/them");
@@ -602,9 +502,8 @@ mod tests {
         assert_eq!(asked(&ask_rx), ["/home/them/src"]);
     }
 
-    /// A trailing slash on the host's home must not become a doubled one:
-    /// `//` is the prompt's "start again from the root", so `/home/them//src`
-    /// would be read as `/src` by everything downstream.
+    /// `//` restarts from the root at the prompt, so `/home/them//src` would
+    /// mean `/src`.
     #[test]
     fn a_home_with_a_trailing_slash_does_not_make_a_double_one() {
         let (mut c, ask_rx, _reply_tx) = detached_at("/home/them/");
@@ -612,9 +511,7 @@ mod tests {
         assert_eq!(asked(&ask_rx), ["/home/them/src"]);
     }
 
-    /// The same directory by two spellings is one question. Worth pinning
-    /// because the cache is keyed on the *expanded* path: walking to `~/src`
-    /// and then typing it out in full must not cost a second round trip.
+    /// The cache is keyed on the expanded path.
     #[test]
     fn a_tilde_path_and_the_spelled_out_one_share_a_listing() {
         let (mut c, ask_rx, reply_tx) = detached_at("/home/them");
@@ -629,10 +526,7 @@ mod tests {
         assert_eq!(c.names(), ["src"]);
     }
 
-    /// A bare `~` names the home but does not yet say "inside it", and it has
-    /// no `/`, so it is left alone exactly as `/home/them` is: the menu offers
-    /// what is *beside* it, and typing the `/` is what steps in. Pinned because
-    /// expanding it would make `accept` write `~/them` for a directory reached
+    /// Expanding it would make `accept` write `~/them` for a directory reached
     /// as `/home/them`.
     #[test]
     fn a_bare_tilde_is_left_alone_like_any_other_directory_name() {
@@ -643,25 +537,16 @@ mod tests {
         assert!(c.names().is_empty());
     }
 
-    /// `~user` is somebody else's home and only the host could resolve it.
-    /// `session::validate_directory` refuses it; here it is simply listed as
-    /// the literal text, which finds nothing — because at a prompt `~r` is
-    /// `~root` half typed, and a keystroke on the way somewhere must not be an
-    /// error.
     #[test]
     fn a_tilde_user_is_never_expanded_and_never_an_error() {
         let (mut c, ask_rx, reply_tx) = detached_at("/home/them");
         c.ask("~root/s");
         assert_eq!(asked(&ask_rx), ["~root"], "the literal text, not the home");
 
-        // And the host's honest answer for it is nothing at all.
         answer(&mut c, &ask_rx, &reply_tx, Listing::default());
         assert!(c.matches("s").is_empty());
     }
 
-    /// A host that never said where home is has no `~` to offer. The literal
-    /// text again, rather than a confident wrong guess at this machine's own
-    /// home — which is the whole reason the expansion takes a `home` at all.
     #[test]
     fn a_host_that_reported_no_home_expands_nothing() {
         let (mut c, ask_rx, _reply_tx) = detached_at("");
@@ -669,9 +554,7 @@ mod tests {
         assert_eq!(asked(&ask_rx), ["~"]);
     }
 
-    /// The menu and enter must not mean two different directories. This is the
-    /// claim that `session::validate_directory` and the completer share one
-    /// expansion, checked against the real thing rather than restated.
+    /// Checked against `session::validate_directory` itself, not restated.
     #[test]
     fn what_the_menu_lists_is_what_enter_would_create_in() {
         const HOME: &str = "/home/them";
@@ -689,8 +572,6 @@ mod tests {
         }
     }
 
-    /// The cache is bounded, or a long session at a prompt would hold every
-    /// directory it ever passed through.
     #[test]
     fn the_cache_holds_a_bounded_number_of_directories() {
         let (mut c, _ask_rx, _reply_tx) = detached();
@@ -705,8 +586,6 @@ mod tests {
         );
     }
 
-    /// Re-listing a directory replaces what was held rather than shadowing it,
-    /// so a stale answer cannot outlive a fresh one in the cache.
     #[test]
     fn remembering_a_directory_again_replaces_the_older_answer() {
         let (mut c, _ask_rx, _reply_tx) = detached();
@@ -718,8 +597,6 @@ mod tests {
 
     // --- ranking -------------------------------------------------------------
 
-    /// The whole reason the host stopped filtering: a query need not be a prefix
-    /// of the name, or even contiguous within it.
     #[test]
     fn a_query_matches_a_subsequence_not_just_a_prefix() {
         let mut c = holding("/src", &["nvmux-rs", "notes", "vendor"]);
@@ -728,8 +605,7 @@ mod tests {
         assert_eq!(c.matches("nts"), ["notes"]);
     }
 
-    /// The first row is what enter takes, so which one it is matters more than
-    /// anything else the scorer does.
+    /// The first row is what enter takes.
     #[test]
     fn the_best_match_is_first() {
         let mut c = holding("/d", &["a-long-name-with-src-inside", "src"]);
@@ -746,18 +622,13 @@ mod tests {
         );
     }
 
-    /// An empty query is the whole directory, in the host's order — what a
-    /// freshly typed `/` shows.
     #[test]
     fn an_empty_query_is_every_child_in_the_hosts_order() {
         let mut c = holding("/d", &["b", "a", "c"]);
         assert_eq!(c.matches(""), ["b", "a", "c"], "not re-sorted");
     }
 
-    /// The other half of that claim, and the one the prompt leans on: a lone
-    /// `/` is a question about the root, not a path with no directory in it. It
-    /// is what an emptied working directory field reaches the root by, so the
-    /// route is pinned here rather than left to follow from `dirs::split`.
+    /// How an emptied working-directory field reaches the root.
     #[test]
     fn a_lone_slash_asks_about_the_root() {
         let (mut c, ask_rx, reply_tx) = detached();
@@ -768,15 +639,11 @@ mod tests {
         assert_eq!(c.matches(""), ["etc", "usr", "var"]);
     }
 
-    /// A home directory is mostly dotted and none of it is what anyone is
-    /// looking for. The rule used to come free from the shell's globbing; it is
-    /// spelled out here because there is no glob left to carry it.
     #[test]
     fn dotted_directories_are_hidden_until_the_query_asks_for_one() {
         let mut c = holding("/home", &[".config", ".local", "src", "docs"]);
         assert_eq!(c.matches(""), ["src", "docs"], "hidden by default");
-        // `oc` is a subsequence of both `docs` and `.local`, so this is the
-        // dotted one being excluded rather than simply not matching.
+        // `oc` matches both `docs` and `.local`, so this tests the exclusion.
         assert_eq!(c.matches("oc"), ["docs"], "and hidden from a plain query");
         assert_eq!(c.matches(".co"), [".config"], "a dot asks for them");
         assert!(
@@ -786,18 +653,14 @@ mod tests {
         );
     }
 
-    /// A list of equally good matches must not shuffle as the query grows, so
-    /// the tiebreak is the host's order rather than whatever the sort does.
     #[test]
     fn equal_scores_keep_the_hosts_order() {
         let names = ["xa", "xb", "xc", "xd"];
         let mut c = holding("/d", &names);
-        // Every candidate scores identically on a query matching only the shared
-        // first character.
+        // All score the same on their shared first character.
         assert_eq!(c.matches("x"), names);
     }
 
-    /// A query nothing matches is an empty list, not every directory.
     #[test]
     fn a_query_that_matches_nothing_matches_nothing() {
         let mut c = holding("/d", &["alpha", "beta"]);
