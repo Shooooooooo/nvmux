@@ -1,30 +1,19 @@
-//! The cursor travelling: Neovide's animated cursor, in a terminal.
+//! Neovide-style animated cursor for a terminal.
 //!
-//! The cursor is a quadrilateral, its four corners each sprung towards the
-//! corner of the cell — or the bar, or the underline — it is going to. They
-//! do not move together. The two corners leading the way are quick and the
-//! two behind are slow ([`Settings::trail`]), so the quadrilateral
-//! stretches out along the way it is going and catches itself up at the end:
-//! a short hop is a nudge, a long jump a smear across the screen. A move of a
-//! cell or two along a line — typing — takes the short time instead, and no
-//! trail, as Neovide's `cursor_short_animation_length` does.
+//! The cursor is a quadrilateral whose four corners are each sprung towards
+//! the target cell (or bar/underline). The two leading corners are faster than
+//! the trailing two ([`Settings::trail`]), so it stretches along the move. A
+//! move of one or two cells along a line (typing) uses the short duration and
+//! no trail, like Neovide's `cursor_short_animation_length`.
 //!
-//! Drawn, while it moves, over the cells it covers ([`super::raster`]): a
-//! cell it covers whole takes the cursor's colour with its text kept, the way
-//! a block cursor shows the character under it; one it covers in part takes
-//! the block element nearest the part. The terminal's own cursor is hidden for
-//! as long as that lasts, and put back in the cell the moment it is over.
+//! While moving it is rasterised over the cells ([`super::raster`]): fully
+//! covered cells take the cursor colour and keep their text; partly covered
+//! ones get the nearest block element. The terminal cursor is hidden until it
+//! arrives. The colour fades towards the tail ([`Settings::gradient`]), mixed
+//! with the cells' colours; a `gradient` of 0 matches Neovide's solid trail.
 //!
-//! The colour fades along the way it is going ([`Settings::gradient`]):
-//! the cursor's own at the head, and less of it the further back a cell is
-//! towards the end of the trail, mixed with the cell's own colours — so the
-//! smear thins into what it is passing over rather than ending in a hard
-//! block of colour. Neovide's trail is the one colour all along, which a
-//! `gradient` of 0 draws.
-//!
-//! Its geometry is in cells, `x` along and `y` down, and "which way it is
-//! going" is reckoned with a row as tall as two columns are wide
-//! ([`ASPECT`]), which is what a terminal's cell looks like.
+//! Geometry is in cells (`x` right, `y` down); directions treat a row as
+//! [`ASPECT`] columns tall.
 
 use super::raster::{self, Fill, Point};
 use super::spring::Spring;
@@ -33,14 +22,14 @@ use crate::client::grid::Text;
 use crate::client::style::{self, Color, Colors};
 use crate::palette::Rgb;
 
-/// How much taller a cell is than wide.
+/// Cell height / width.
 pub const ASPECT: f32 = 2.0;
 
-/// How close every corner must be to call the cursor arrived: just under the
-/// sixteenth of a cell the rasteriser's samples are spaced at half of.
+/// Distance (cells) at which every corner counts as arrived: just under
+/// 1/16, half the rasteriser's sample spacing.
 const ARRIVED: f32 = 0.06;
 
-/// A cursor's shape in its cell, in cells.
+/// A cursor's shape, in cells.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
     pub x0: f32,
@@ -64,22 +53,20 @@ impl Rect {
     }
 }
 
-/// Which way each corner sits from the middle: top left, top right, bottom
-/// right, bottom left.
+/// Corner directions from the centre: TL, TR, BR, BL.
 const OUTWARD: [Point; 4] = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
 
-/// How the cursor travels: `[effects.smear]`.
+/// `[effects.smear]`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settings {
     /// Seconds for a move to settle.
     pub duration: f32,
-    /// Seconds for a cell or two along a line.
+    /// Seconds for a move of a cell or two along a line.
     pub short: f32,
-    /// How much of the way the leading corners are ahead: 0 none, 1 there at
-    /// once.
+    /// How far ahead the leading corners are: 0 not at all, 1 instant.
     pub trail: f32,
-    /// How much the colour fades towards the end of the trail: 0 not at all,
-    /// 1 to nothing of the cursor's at its very end.
+    /// Colour fade towards the tail: 0 none, 1 none of the cursor colour left
+    /// at the very end.
     pub gradient: f32,
 }
 
@@ -90,7 +77,6 @@ struct Corner {
     duration: f32,
 }
 
-/// The cursor's four corners, and where they are going.
 #[derive(Debug, Clone, Default)]
 pub struct Smear {
     corners: [Corner; 4],
@@ -98,19 +84,17 @@ pub struct Smear {
 }
 
 impl Smear {
-    /// Where the cursor is going, if anywhere has been said.
     pub fn target(&self) -> Option<Rect> {
         self.target
     }
 
-    /// Put the cursor at `rect` with no animation.
     pub fn snap(&mut self, rect: Rect) {
         self.target = Some(rect);
         self.corners = [Corner::default(); 4];
     }
 
-    /// Send the cursor to `rect` from wherever it is now, its corners at the
-    /// speeds the module docs describe.
+    /// Animate to `rect` from the current position; snaps if there is no
+    /// previous target.
     pub fn go(&mut self, rect: Rect, s: &Settings) {
         let Some(from) = self.target else {
             return self.snap(rect);
@@ -120,7 +104,7 @@ impl Smear {
         let (tx, ty) = rect.center();
         let travel = (tx - fx, (ty - fy) * ASPECT);
         let len = (travel.0 * travel.0 + travel.1 * travel.1).sqrt();
-        // A cell or two along the same line: typing.
+        // A cell or two along the same line (typing).
         let short = (rect.y0 - from.y0).abs() < 0.01 && (rect.x0 - from.x0).abs() <= 2.0;
         let mut order: Vec<(usize, f32)> = (0..4)
             .map(|i| {
@@ -152,12 +136,9 @@ impl Smear {
         self.target = Some(rect);
     }
 
-    /// Move on `dt` seconds. Says whether the cursor is still moving.
-    ///
-    /// Arrived once every corner is closer to its own than a block element
-    /// can draw — an eighth of a cell, less a little — which is well before a
-    /// spring is done with its last hundredth: the terminal's own cursor is
-    /// back the moment there is nothing left of the drawn one to see.
+    /// Advance `dt` seconds; returns whether still moving. Stops once every
+    /// corner is within `ARRIVED`, well before the springs settle, so the
+    /// terminal cursor returns as soon as nothing visible is left to draw.
     pub fn step(&mut self, dt: f32) -> bool {
         let mut moving = false;
         for c in &mut self.corners {
@@ -176,7 +157,6 @@ impl Smear {
         self.corners.iter().any(|c| c.x.moving() || c.y.moving())
     }
 
-    /// Where the four corners are now.
     pub fn quad(&self) -> [Point; 4] {
         let Some(t) = self.target else {
             return [(0.0, 0.0); 4];
@@ -190,11 +170,9 @@ impl Smear {
         })
     }
 
-    /// Draw the cursor where it is now over `frame`, in `color`, with the
-    /// text of a cell it covers whole in `text` — or in that cell's own
-    /// background when the cursor's highlight does not say — and both fading
-    /// towards the cell's own colours along the trail by `s.gradient` (see
-    /// the module docs).
+    /// Draw the cursor over `frame` in `color`. Fully covered cells get text
+    /// in `text`, or their own background if `None`. Both fade towards the
+    /// cell's colours along the trail by `s.gradient`.
     pub fn paint(
         &self,
         frame: &mut Frame,
@@ -244,17 +222,14 @@ impl Smear {
     }
 }
 
-/// How much of the cursor's colour a cell of the trail shows, as a percent:
-/// all of it at the head and ahead of it, falling evenly towards the end of
-/// the trail by the gradient. Measured along the way the cursor is going —
-/// from the middle of the quadrilateral to the middle of where it is going,
-/// with a row as tall as [`ASPECT`] columns — so a diagonal smear fades along
-/// its length rather than across it.
+/// Percent of the cursor colour a trail cell shows: 100 at and ahead of the
+/// head, falling linearly to the tail by the gradient. Measured along the
+/// line from the quad's centroid to the target centre (aspect-corrected), so
+/// a diagonal smear fades along its length.
 struct Shade {
-    /// The way it is going, of length one; `None` for a cursor with no
-    /// length to fade along, which is drawn the one colour.
+    /// Unit direction; `None` draws a single colour.
     axis: Option<Point>,
-    /// How far along that way the end of the trail and the head are.
+    /// Projections of the tail and head onto `axis`.
     tail: f32,
     head: f32,
     gradient: f32,
@@ -283,7 +258,7 @@ impl Shade {
         }
     }
 
-    /// The percent at the cell at `row`, `col`, by its middle.
+    /// Sampled at the cell centre.
     fn at(&self, row: i64, col: i64) -> u8 {
         let Some(a) = self.axis else {
             return 100;
@@ -294,22 +269,19 @@ impl Shade {
     }
 }
 
-/// How far point `p` is along the way `a` (of length one), with a row as
-/// tall as [`ASPECT`] columns.
+/// Projection of `p` onto unit vector `a`, aspect-corrected.
 fn along(p: Point, a: Point) -> f32 {
     p.0 * a.0 + p.1 * ASPECT * a.1
 }
 
-/// The middle of four points.
 fn centroid(q: &[Point; 4]) -> Point {
     let x = q.iter().map(|p| p.0).sum::<f32>() / 4.0;
     let y = q.iter().map(|p| p.1).sum::<f32>() / 4.0;
     (x, y)
 }
 
-/// A cursor's rectangle in the cell at `row`, `col`: the whole cell for a
-/// block, the left `percent` of it for a bar, the bottom `percent` for an
-/// underline.
+/// The whole cell for a block, the left `percent` for a bar, the bottom
+/// `percent` for an underline.
 pub fn shape_rect(row: i64, col: i64, shape: crate::client::redraw::Shape, percent: u8) -> Rect {
     use crate::client::redraw::Shape;
     let (x, y) = (col as f32, row as f32);
@@ -352,8 +324,6 @@ mod tests {
         shape_rect(row, col, Shape::Block, 0)
     }
 
-    /// The first place is taken at once; after that the cursor travels, and
-    /// arrives exactly.
     #[test]
     fn the_cursor_snaps_first_and_travels_after() {
         let mut s = Smear::default();
@@ -372,8 +342,6 @@ mod tests {
         );
     }
 
-    /// Going right, the right-hand corners lead and the left-hand ones trail:
-    /// part way there the quadrilateral is stretched along the way it goes.
     #[test]
     fn the_leading_edge_is_ahead_of_the_trailing_one() {
         let mut s = Smear::default();
@@ -395,7 +363,6 @@ mod tests {
         );
     }
 
-    /// A cell along the line — typing — is quick, and stretches nothing.
     #[test]
     fn a_short_hop_is_quick_and_does_not_stretch() {
         let mut s = Smear::default();
@@ -407,8 +374,6 @@ mod tests {
         assert!(!s.step(0.05), "settled within the short time");
     }
 
-    /// A move in the middle of a move starts from where the cursor is, not
-    /// from where it was going.
     #[test]
     fn a_new_target_starts_from_where_the_cursor_is() {
         let mut s = Smear::default();
@@ -424,8 +389,8 @@ mod tests {
         }
     }
 
-    /// The background of every cell of row `row` the smear painted, left to
-    /// right, as (column, red) — the cursor drawn pure red over black.
+    /// (column, red) of each painted cell in `row`, for a pure red cursor over
+    /// black.
     fn painted_reds(s: &Smear, settings: &Settings, row: usize) -> Vec<(usize, u8)> {
         use crate::client::compose::Frame;
         use crate::palette::Palette;
@@ -453,9 +418,6 @@ mod tests {
             .collect()
     }
 
-    /// Part way along a long move the trail is the cursor's colour at its
-    /// head and less of it the further back a cell is, down to what the
-    /// gradient leaves at its end; with no gradient it is the one colour.
     #[test]
     fn the_trail_fades_towards_its_end() {
         let mut s = Smear::default();
@@ -477,7 +439,6 @@ mod tests {
         assert!(reds.iter().all(|(_, r)| *r == 255), "{reds:?}");
     }
 
-    /// Arrived, the cursor is all the cursor's colour, whatever the gradient.
     #[test]
     fn a_cursor_at_rest_does_not_fade() {
         let mut s = Smear::default();

@@ -1,20 +1,17 @@
-//! Driving the `ssh` client.
+//! Drives the `ssh` client.
 //!
-//! A subprocess rather than a Rust SSH library, so that `~/.ssh/config`,
-//! `ProxyJump`, agent forwarding and hardware keys all work unmodified. The
-//! `openssh` crate does not cleanly expose `ssh -O forward`, which is the whole
-//! mechanism here.
+//! A subprocess rather than a Rust SSH library, so `~/.ssh/config`,
+//! `ProxyJump`, agent forwarding and hardware keys work unmodified; the
+//! `openssh` crate does not cleanly expose `ssh -O forward`.
 //!
-//! One `ControlMaster` per host, brought up by [`master_args`]; each session
-//! then adds a unix-socket forward onto that existing master with `-O forward`
-//! — the sessions wanted at once all in one — removed with `-O cancel`, tested
-//! with `-O check`.
+//! One `ControlMaster` per host ([`master_args`]). Each session adds a
+//! unix-socket forward on it with `-O forward` (batched when several are
+//! wanted at once), removed with `-O cancel`, tested with `-O check`.
 //!
-//! `ControlPath` is computed by nvmux rather than left to ssh's `%C`/`%h%p%r`
-//! tokens, which expand to unpredictable lengths — see [`crate::paths`]. It is
-//! also not where a master binds: each binds a socket of its own and is linked
-//! to the `ControlPath` once it is up, so that no master can ever remove
-//! another's — see [`Ssh::ensure_master_within`].
+//! nvmux computes `ControlPath` itself, since ssh's `%C`/`%h%p%r` tokens
+//! expand to unpredictable lengths (see [`crate::paths`]). Each master binds
+//! its own socket and is linked to the `ControlPath` once up, so no master can
+//! remove another's (see [`Ssh::ensure_master_within`]).
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -24,11 +21,8 @@ use crate::paths;
 use crate::proc;
 use crate::shell;
 
-/// The minimum `ssh` nvmux supports.
-///
-/// 6.7 is where unix-domain socket forwarding (`-L <local_sock>:<remote_sock>`)
-/// was added, which is the entire remote transport. `MIN_SSH` is the same
-/// version as a tuple; a test ties the two together.
+/// 6.7 added unix-socket forwarding (`-L <local_sock>:<remote_sock>`), which
+/// the remote transport relies on. `MIN_SSH` must match (tested).
 const MIN_SSH_VERSION: &str = "6.7";
 const MIN_SSH: (u64, u64) = (6, 7);
 
@@ -46,10 +40,8 @@ fn parse_ssh_version(banner: &str) -> Option<(u64, u64)> {
     Some((major, minor))
 }
 
-/// Ask the local `ssh` its version, to refuse early where it is missing or
-/// too old, so the error names the real problem rather than surfacing later
-/// as a failed forward. Asked now and judged by [`LocalCheck::verdict`]
-/// later: what is done meanwhile need not wait for it.
+/// Start `ssh -V` so a missing or too-old `ssh` is refused early with a clear
+/// error; judged later by [`LocalCheck::verdict`].
 pub fn check_local() -> LocalCheck {
     LocalCheck(
         Command::new("ssh")
@@ -61,11 +53,10 @@ pub fn check_local() -> LocalCheck {
     )
 }
 
-/// An `ssh -V` under way: see [`check_local`].
+/// An `ssh -V` in progress; see [`check_local`].
 pub struct LocalCheck(std::io::Result<std::process::Child>);
 
 impl LocalCheck {
-    /// Wait for the answer, and judge it.
     pub fn verdict(self) -> Result<(), SshError> {
         let out = self
             .0
@@ -88,40 +79,25 @@ fn judge_version(out: &std::process::Output) -> Result<(), SshError> {
             found: format!("{major}.{minor}"),
             min: MIN_SSH_VERSION,
         }),
-        // An unrecognised banner is not worth refusing over — plenty of forks
-        // exist, and the forward itself will fail clearly enough.
+        // Unknown banners (forks) are allowed; a forward would fail clearly.
         None => Ok(()),
     }
 }
 
-/// Options shared by every invocation. `BatchMode` is deliberately **not** set:
-/// a passphrase prompt, a hardware key touch or a 2FA challenge must still work.
+/// Options for every invocation. `BatchMode` is deliberately **not** set:
+/// passphrase prompts, hardware key touches and 2FA must still work.
 fn common(ctl: &Path) -> Vec<String> {
     vec!["-o".into(), format!("ControlPath={}", ctl.display())]
 }
 
-/// How long an unattended command waits to reach the host. Only a *connect*
-/// budget: a listing that is merely slow still lands, and nothing here bounds
-/// the host's own thinking time.
+/// Connect timeout for unattended commands. Bounds only the *connect*, not a
+/// slow command.
 const UNATTENDED_CONNECT_SECS: u64 = 5;
 
-/// Options for a command nvmux asked for rather than one the user did — so far
-/// only the create prompt's directory completion, which runs on a worker thread
-/// with nobody watching it.
-///
-/// This is where `BatchMode=yes` belongs, and it is the exact inverse of the
-/// reasoning above rather than a contradiction of it. A prompt the user can
-/// answer is right for a command they asked for; for a listing they did not ask
-/// for it is a disaster, because there is no terminal to answer it on — the
-/// screen belongs to ratatui — and the child would sit on a passphrase prompt
-/// forever, holding the worker thread with it. `ssh -O check` cannot be used to
-/// pre-empt that either: it asks the local multiplexing socket, so it answers
-/// yes for a master whose connection is wedged.
-///
-/// So: never ask, and give up on an unreachable host rather than hanging. The
-/// cost of being wrong is a suggestion the user did not get; the cost of the
-/// interactive options here would be a prompt that quietly stops completing and
-/// a thread that never ends.
+/// Options for commands nvmux runs on its own (so far only the create
+/// prompt's directory completion, on a worker thread). `BatchMode=yes`: no
+/// terminal can answer a prompt (ratatui owns it), so ssh would block forever.
+/// `ssh -O check` cannot pre-empt that; it says yes for a wedged master.
 fn unattended(ctl: &Path) -> Vec<String> {
     let mut args = common(ctl);
     args.extend([
@@ -133,25 +109,18 @@ fn unattended(ctl: &Path) -> Vec<String> {
     args
 }
 
-/// Arguments for bringing up a master connection, bound at `own`: its own
-/// socket, not the shared `ControlPath` — see [`Ssh::ensure_master_within`].
+/// Arguments to start a master bound at `own`, its own socket rather than the
+/// shared `ControlPath` (see [`Ssh::ensure_master_within`]).
 ///
-/// `StreamLocalBindUnlink=yes` belongs **here** and nowhere else: the master
-/// performs the bind, so setting it on an `-O forward` client does nothing.
-/// Without it, `-O cancel` leaves the local socket file on disk and the next
-/// forward onto that path fails with rc 255 and `mux_client_forward: forwarding
-/// request failed` — which breaks detach-then-reattach. Measured both ways.
+/// `StreamLocalBindUnlink=yes` belongs **here** only: the master does the
+/// bind, so it does nothing on an `-O forward` client. Without it `-O cancel`
+/// leaves the socket file and the next forward onto that path fails (rc 255,
+/// `mux_client_forward: forwarding request failed`), breaking reattach.
 ///
-/// `connect_timeout` bounds how long the connection attempt itself may take,
-/// in seconds; `None` leaves it to the system's TCP timeout, which is what the
-/// first connection wants — the user is watching it, and can stop it. A
-/// *re*connection is different: it is one of a series, and a link that is still
-/// down drops packets rather than refusing them, so without a bound each
-/// attempt would hang for the minutes the kernel allows and the series would
-/// never get to its next try. See [`crate::reconnect`].
-///
-/// `ipqos` is what the master marks its packets with in place of what ssh
-/// would, where that wants changing: see [`master_ipqos`].
+/// `connect_timeout` (seconds): `None` for the first connect, which the user
+/// watches. Reconnects need it: a down link drops packets rather than
+/// refusing, so each attempt would hang for minutes (see [`crate::reconnect`]).
+/// `ipqos`: see [`master_ipqos`].
 fn master_args(
     host: &str,
     own: &Path,
@@ -170,7 +139,7 @@ fn master_args(
         "ExitOnForwardFailure=yes".into(),
         "-o".into(),
         "StreamLocalBindUnlink=yes".into(),
-        // Notice a dead link rather than hanging on a half-open TCP connection.
+        // Detect a dead link instead of hanging on a half-open TCP connection.
         "-o".into(),
         "ServerAliveInterval=15".into(),
         "-o".into(),
@@ -187,30 +156,22 @@ fn master_args(
     args
 }
 
-/// What upstream OpenSSH marks a connection's packets with unless told
-/// otherwise, from 7.8 until 10.1: `af21` for an interactive session, `cs1`
-/// for everything else.
+/// Upstream OpenSSH's default from 7.8 until 10.1: `af21` for interactive
+/// sessions, `cs1` otherwise.
 const UPSTREAM_IPQOS: &str = "af21 cs1";
 
-/// What a master marks them with instead, where ssh would have used
-/// [`UPSTREAM_IPQOS`].
+/// Used instead of [`UPSTREAM_IPQOS`].
 const MASTER_IPQOS: &str = "af21 cs0";
 
-/// The `IPQoS` a master is given in place of the one `ssh -G` says ssh would
-/// use (`config`, its output), if that one wants changing.
+/// The `IPQoS` to give a master instead of what `ssh -G` (`config`) reports,
+/// if it needs changing. A `-N` master is non-interactive, so ssh uses the
+/// second value, by default `cs1` up to 10.0: Wi-Fi queues that behind all
+/// other traffic, and on the master it is every keystroke and frame. `cs0` is
+/// the unmarked class.
 ///
-/// A master started with `-N` is not an interactive session, so ssh marks it
-/// with the second of the pair, and up to 10.0 that is `cs1` unless the user
-/// or the system's ssh says otherwise: the lowest class there is. Wi-Fi puts
-/// a packet so marked in its background queue, behind everything else on the
-/// air — and on nvmux's master that is every key typed and every frame
-/// Neovim draws. `cs0` is the class a packet nobody marked is in. The first
-/// of the pair is kept: a master never uses it.
-///
-/// Only ssh's own default is changed. Debian and Ubuntu build ssh with another
-/// pair, 10.1 and later have `cs0` there already, and a pair set in
-/// `~/.ssh/config` is the user's to have; and before 8.7 the config file wins
-/// over `-o` anyway. An `ssh` without `-G` (before 6.8) is left as it is.
+/// Only ssh's own default is changed (Debian/Ubuntu ship another pair, 10.1+
+/// uses `cs0`, `~/.ssh/config` is the user's, and before 8.7 it wins over
+/// `-o` anyway). An `ssh` without `-G` (before 6.8) is left alone.
 fn master_ipqos(config: &str) -> Option<&'static str> {
     config
         .lines()
@@ -226,7 +187,6 @@ fn exit_args(host: &str, own: &Path) -> Vec<String> {
     args
 }
 
-/// Ask whether the master is alive.
 fn check_args(host: &str, ctl: &Path) -> Vec<String> {
     let mut args = common(ctl);
     args.extend(["-O".into(), "check".into(), host.to_string()]);
@@ -246,17 +206,16 @@ fn forward_op(op: &str, host: &str, ctl: &Path, local: &Path, remote: &Path) -> 
     args
 }
 
-/// Add a unix-socket forward to the existing master, without reconnecting.
+/// Add a forward to the running master, without reconnecting.
 fn forward_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<String> {
     forward_op("forward", host, ctl, local, remote)
 }
 
-/// Remove a forward.
 fn cancel_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<String> {
     forward_op("cancel", host, ctl, local, remote)
 }
 
-/// Add every one of these forwards to the existing master, in one command.
+/// Add all these forwards to the running master in one command.
 fn forward_all_args(host: &str, ctl: &Path, pairs: &[(PathBuf, PathBuf)]) -> Vec<String> {
     let mut args = common(ctl);
     args.extend(["-O".into(), "forward".into()]);
@@ -270,34 +229,28 @@ fn forward_all_args(host: &str, ctl: &Path, pairs: &[(PathBuf, PathBuf)]) -> Vec
     args
 }
 
-/// Arguments for starting the host's shell — the one `sh` that
-/// [`proc::Shell`] feeds every script nvmux runs there — through a **login**
-/// shell:
+/// Arguments to start the host's shell (the one `sh` [`proc::Shell`] feeds
+/// every script) through a **login** shell:
 ///
 /// ```text
 /// ssh -T <host> exec sh -c '... exec "${SHELL:-/bin/bash}" -l -c "exec sh -s" ...' nvmux
 /// ```
 ///
-/// A login shell because `ssh host cmd` does not read `.zprofile`, so `nvim` is
-/// off `$PATH` on most real setups. `$SHELL` expands on the *remote* side, in a
-/// POSIX `sh` rather than in the login shell sshd hands the command to, which
-/// may be fish or tcsh — [`shell::login_shell_wrapper`] is the one place that
-/// spells this, so the tested form and the shipped form are the same string. It
-/// is paid once per host: the scripts, and their arguments, travel down this
-/// shell's stdin.
+/// A login shell because `ssh host cmd` does not read `.zprofile`, so `nvim`
+/// is off `$PATH` on most setups. `$SHELL` expands on the *remote* side in a
+/// POSIX `sh`, not in sshd's login shell, which may be fish or tcsh;
+/// [`shell::login_shell_wrapper`] is the single, tested spelling of this. Paid
+/// once per host: scripts and arguments go down the shell's stdin.
 ///
-/// `-T`, because that stdin is the command stream: a host with `RequestTTY
-/// force` in its config would otherwise get a pty, and a pty echoes every
-/// script back into the output. `-n` must never be added: it puts `/dev/null`
-/// on stdin, and `sh -s` then reads nothing, prints nothing and exits 0 — an
-/// *empty* result, silently, rather than an error.
+/// `-T` because stdin is the command stream: with `RequestTTY force` a pty
+/// would echo every script into the output. Never add `-n`: it puts
+/// `/dev/null` on stdin, so `sh -s` silently exits 0 with *empty* output.
 fn shell_args(host: &str, ctl: &Path) -> Vec<String> {
     shell_args_with(common(ctl), host)
 }
 
-/// The same command, with the options an unattended shell needs — see
-/// [`unattended`]. Identical in every other respect, so what runs on the host is
-/// the same program reached the same way.
+/// [`shell_args`] with the [`unattended`] options; otherwise identical, so
+/// the same program runs on the host, reached the same way.
 fn unattended_shell_args(host: &str, ctl: &Path) -> Vec<String> {
     shell_args_with(unattended(ctl), host)
 }
@@ -308,17 +261,16 @@ fn shell_args_with(mut args: Vec<String>, host: &str) -> Vec<String> {
     args
 }
 
-/// What the login shell is told to run. `exec` at every step, so each shell is
-/// gone once the next is up: nothing of the login shell's own — a
-/// `.bash_logout`, say — runs when the stream closes, and nothing of it sits
-/// between ssh and the shell. `nvmux` is the `$0` of the `sh` that looks up
-/// `$SHELL`, which is how it shows up in a process listing.
+/// The login shell's command. `exec` at every step, so nothing of the login
+/// shell (e.g. `.bash_logout`) runs when the stream closes or sits between ssh
+/// and the shell. `nvmux` is the `$0` of the `sh` that reads `$SHELL`, as
+/// shown in process listings.
 fn remote_shell_command() -> String {
     format!("{} nvmux", shell::login_shell_wrapper("exec sh -s"))
 }
 
-/// Turn an ssh failure into something a caller can act on. ssh reports almost
-/// everything as exit 255, so stderr is the only signal available.
+/// Map an ssh failure to an actionable error. ssh exits 255 for almost
+/// everything, so stderr is the only signal.
 pub fn classify(host: &str, code: i32, stderr: &str) -> SshError {
     let lower = stderr.to_lowercase();
 
@@ -356,25 +308,23 @@ pub fn classify(host: &str, code: i32, stderr: &str) -> SshError {
     }
 }
 
-/// Whether ssh's words say there is no master behind the `ControlPath`:
-/// nothing there to connect to, or a socket whose master has gone.
+/// Whether ssh's stderr says no master is behind the `ControlPath`: no
+/// socket, or one whose master has gone.
 fn says_no_master(stderr: &str) -> bool {
     let lower = stderr.to_lowercase();
     lower.contains("control socket connect")
         || lower.contains("no such file or directory") && lower.contains("control")
 }
 
-/// What connecting to the `ControlPath` says — the question `ssh -O check`
-/// asks, without the fork, and so without an answer that has had
-/// milliseconds to go stale by the time it is read.
+/// Result of connecting to the `ControlPath`: what `ssh -O check` asks, but
+/// without a fork, so the answer is not stale by the time it is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Probe {
-    /// Something accepted: in a directory only we can write to, a master.
+    /// Something accepted; in a directory only we can write, a master.
     Answered,
-    /// Nothing is there.
     Absent,
-    /// Something is there and nothing accepted: a socket whose master has
-    /// gone, or not a socket at all.
+    /// Something is there but refused: a dead master's socket, or not a
+    /// socket.
     Refused,
 }
 
@@ -386,16 +336,15 @@ fn probe(path: &Path) -> Probe {
     }
 }
 
-/// What is on the `ControlPath` once anything dead there has been cleared.
+/// The `ControlPath` after clearing anything dead there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cleared {
-    /// Nothing: a master can be linked there.
+    /// A master can be linked there.
     Empty,
-    /// A master answered, so there is one to use and nothing to start.
+    /// A live master answered; use it.
     Taken,
 }
 
-/// A driver for one host's ssh connection.
 pub struct Ssh {
     host: String,
     control_path: PathBuf,
@@ -410,9 +359,8 @@ impl Ssh {
         &self.host
     }
 
-    /// The `ControlPath` of this host's master connection. Handed out so that a
-    /// second, `Send` driver onto the *same* master can be built without
-    /// recomputing it — see [`crate::dirs::DirSource`].
+    /// Exposed so a second, `Send` driver on the *same* master can be built
+    /// without recomputing it (see [`crate::dirs::DirSource`]).
     pub fn control_path(&self) -> &Path {
         &self.control_path
     }
@@ -427,9 +375,8 @@ impl Ssh {
             .output()
     }
 
-    /// The `IPQoS` a master to this host is to be given, if ssh's own wants
-    /// changing: see [`master_ipqos`]. `ssh -G` reads the configuration and
-    /// connects to nothing.
+    /// The `IPQoS` override for a master to this host, if any (see
+    /// [`master_ipqos`]). `ssh -G` only reads config; it connects to nothing.
     fn ipqos(&self) -> Option<&'static str> {
         let out = self.run(&["-G".into(), self.host.clone()]).ok()?;
         out.status
@@ -438,48 +385,30 @@ impl Ssh {
             .flatten()
     }
 
-    /// Is a master connection up for this host?
     pub fn is_master_alive(&self) -> bool {
         self.run(&check_args(&self.host, &self.control_path))
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
 
-    /// Bring up a master connection, or find the existing one. Reusing a live
-    /// master is what makes per-session forwards cheap.
+    /// Bring up a master connection, or reuse a live one.
     pub fn ensure_master(&self) -> Result<(), SshError> {
         self.ensure_master_within(None)
     }
 
-    /// The same, with the connection attempt bounded to `connect_timeout`
-    /// seconds — see [`master_args`] for when that is wanted.
+    /// [`Self::ensure_master`] with the connect bounded (see [`master_args`]).
     ///
-    /// A master binds a socket of its own, [`paths::master_socket`], and is
-    /// linked to the `ControlPath` once it is up rather than bound there. The
-    /// reason is what ssh does on its way out: it removes its `ControlPath` by
-    /// name, whoever's socket the name holds by then. Every nvmux talking to
-    /// one host shares that name, and a master that has lost it — to anything
-    /// that deletes the file — keeps running for as long as it has clients,
-    /// then takes the name from under whichever master was linked there since.
-    /// That master's shell is still up, so everything that asks it says the
-    /// link is fine, and every `-O forward` fails for want of a socket.
-    /// Verified. Bound at a name of its own, a master that leaves removes only
-    /// that.
+    /// A master binds its own socket ([`paths::master_socket`]) and is
+    /// hard-linked to the `ControlPath` once up, because on exit ssh removes
+    /// its `ControlPath` by name, whoever's socket it then holds. A master
+    /// whose file was deleted would later remove a newer master's name, whose
+    /// shell stays up while every `-O forward` fails. Verified.
     ///
-    /// The link is also what settles two nvmux bringing masters up at once:
-    /// the first to link wins, and the other master is told to exit. Bound at
-    /// the shared name, the second would have found it taken, which ssh
-    /// answers by switching multiplexing off and staying up regardless — an
-    /// idle connection nothing could reach, for as long as the network held.
-    ///
-    /// Which leaves every master's linked name behind when it exits: a socket
-    /// nothing listens on, cleared by [`Self::clear_control_path`] before the
-    /// next master is linked there.
-    ///
-    /// A master already there is found by [`Self::clear_control_path`], which
-    /// connects to the `ControlPath` before it clears anything: a socket that
-    /// accepts is a live master. Asking `ssh -O check` first would be a fork to
-    /// learn the same thing.
+    /// Linking also settles two nvmux starting masters at once: the first link
+    /// wins and the other exits. (Binding a taken shared name, ssh disables
+    /// multiplexing and stays up, unreachable.) Dead linked names are removed
+    /// by [`Self::clear_control_path`], which connects first, so a live master
+    /// is found without forking `ssh -O check`.
     pub fn ensure_master_within(&self, connect_timeout: Option<u64>) -> Result<(), SshError> {
         if self.clear_control_path()? == Cleared::Taken {
             return Ok(());
@@ -490,8 +419,8 @@ impl Ssh {
         })?;
         let own = paths::master_socket(&self.control_path, &nonce);
         let ipqos = self.ipqos();
-        // `-f` backgrounds ssh once authentication is done, so this blocks for
-        // exactly as long as a key touch or passphrase takes.
+        // `-f` backgrounds ssh once authenticated, so this blocks only for a
+        // key touch or passphrase.
         let out = self
             .run(&master_args(&self.host, &own, connect_timeout, ipqos))
             .map_err(|e| spawn_error(e, &self.host))?;
@@ -505,20 +434,14 @@ impl Ssh {
         self.publish(&own)
     }
 
-    /// Make way on the `ControlPath` for a new master — or find one there
-    /// already, to be used rather than joined by a second.
+    /// Make room on the `ControlPath` for a new master, or find a live one
+    /// there to use instead.
     ///
-    /// What a dead master leaves there, cleanly or killed outright, is a
-    /// socket nothing listens on, and a name taken is a name no new master can
-    /// be linked to. So a dead one is removed: only a socket, only ours, and
-    /// only once connecting to it has been refused — never on the word of
-    /// `-O check`, whose answer is a fork old by the time it is read. Another
-    /// nvmux can link its master in that gap, and removing that master's
-    /// socket on `-O check`'s say-so is how a master came to be running with
-    /// no name to be reached by — 11 times in 260 when a second nvmux began
-    /// its restart about as long after the first as a master takes to come
-    /// up. A socket that accepts is that master, and is used rather than
-    /// joined by a second.
+    /// A dead master's socket blocks linking, so it is removed: only a socket,
+    /// only ours, only after a refused connect. Never on `-O check`'s stale
+    /// word: another nvmux may link its master in the gap, which left a
+    /// master unreachable 11 times in 260 restarts staggered by about one
+    /// master start-up.
     fn clear_control_path(&self) -> Result<Cleared, SshError> {
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
         match probe(&self.control_path) {
@@ -546,18 +469,17 @@ impl Ssh {
         }
     }
 
-    /// Link the master answering on `own` to the `ControlPath`, where every
-    /// other ssh command finds it — unless another master got there first, in
-    /// which case that one serves and this one is told to go.
+    /// Link the master on `own` to the `ControlPath`, where other ssh commands
+    /// find it, unless another master got there first; then that one serves
+    /// and ours is retired.
     fn publish(&self, own: &Path) -> Result<(), SshError> {
-        // Round again only when the name is found dead, or gone, between the
-        // failed link and the look at what took it.
+        // Retry only if the name was dead or vanished between the failed link
+        // and the check.
         for _ in 0..3 {
             let taken = match std::fs::hard_link(own, &self.control_path) {
                 Ok(()) => return Ok(()),
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => self.clear_control_path(),
-                // The master went between `-f` returning and here, and took
-                // its socket with it.
+                // The master exited after `-f` returned, taking its socket.
                 Err(e) if e.kind() == ErrorKind::NotFound => {
                     return Err(SshError::MasterDied(self.host.clone()));
                 }
@@ -583,10 +505,9 @@ impl Ssh {
         ))
     }
 
-    /// Tell the master answering on `own` to exit. Nothing was ever linked to
-    /// it, so no client can be on it: this ends the connection it holds and
-    /// nothing else. Left alone it would still go, a minute later, by
-    /// `ControlPersist`.
+    /// Tell the master on `own` to exit. Nothing was linked to it, so it has
+    /// no clients; this only ends its connection (otherwise `ControlPersist`
+    /// would, a minute later).
     fn retire(&self, own: &Path) {
         match self.run(&exit_args(&self.host, own)) {
             Ok(out) if out.status.success() => {}
@@ -600,33 +521,23 @@ impl Ssh {
 
     /// Point a local socket at a remote one, idempotently.
     ///
-    /// Asked for outright first, which is one `ssh` whether the forward is new
-    /// or one the master holds already — a master outlives the nvmux that
-    /// brought it up by `ControlPersist`, forwards and all. But if the master
-    /// already believes it is forwarding this pair, `-O forward` is a **silent
-    /// no-op**: it exits 0 and does not recreate the socket file. So the
-    /// answer is only taken where the socket is there to show for it;
-    /// otherwise the forward is cancelled and made again, which is what makes
-    /// this idempotent. A local socket that went missing while the forward was
-    /// still registered would otherwise leave a forward that reports success
-    /// and cannot be connected to.
-    ///
-    /// No master to forward on is [`SshError::NoMaster`] rather than a failed
-    /// forward, because it is the one failure a caller can do something about:
-    /// bring a master back, and ask again.
+    /// If the master already forwards this pair (masters outlive their nvmux
+    /// by `ControlPersist`), `-O forward` is a **silent no-op** that does not
+    /// recreate the socket file. So success counts only if the local socket
+    /// exists; otherwise the forward is cancelled and redone. No master is
+    /// [`SshError::NoMaster`], which the caller can recover from.
     pub fn forward(&self, local: &Path, remote: &Path) -> Result<(), SshError> {
         match self.forward_once(local, remote) {
             Ok(()) if local.exists() => return Ok(()),
             Err(SshError::NoMaster(host)) => return Err(SshError::NoMaster(host)),
             _ => {}
         }
-        // Cancelling a forward that does not exist fails; that is the common
-        // case, not a problem.
+        // Usually fails (no such forward), which is fine.
         let _ = self.run(&cancel_args(&self.host, &self.control_path, local, remote));
 
         // `-O cancel` exits 0 without removing the file, and a forward onto an
-        // existing path fails hard. The master's `StreamLocalBindUnlink` covers
-        // this too, but an older nvmux's master might not have it.
+        // existing path fails. `StreamLocalBindUnlink` covers this, but an
+        // older nvmux's master may lack it.
         if let Err(e) = std::fs::remove_file(local) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(path = %local.display(), error = %e, "could not clear local socket");
@@ -635,7 +546,7 @@ impl Ssh {
         self.forward_once(local, remote)
     }
 
-    /// One `-O forward`, its failure classified: see [`Self::forward`].
+    /// One `-O forward`, its failure classified.
     fn forward_once(&self, local: &Path, remote: &Path) -> Result<(), SshError> {
         let out = self
             .run(&forward_args(&self.host, &self.control_path, local, remote))
@@ -655,12 +566,11 @@ impl Ssh {
         Ok(())
     }
 
-    /// Every pair forwarded by one `ssh -O forward`, rather than one each, and
-    /// whether ssh said they all were. Each local socket is still the caller's
-    /// to look for: a pair the master was already forwarding is the same
-    /// silent no-op as in [`Self::forward`]. And a pair the master refuses
-    /// fails the command without stopping it — every other pair is made, and
-    /// nothing says which was refused. Verified.
+    /// Forward every pair with one `ssh -O forward`; returns whether ssh
+    /// reported success. Callers must still check each local socket: an
+    /// already-forwarded pair is the same silent no-op as in
+    /// [`Self::forward`], and a refused pair fails the command without
+    /// stopping the others or saying which. Verified.
     pub fn forward_all(&self, pairs: &[(PathBuf, PathBuf)]) -> bool {
         if pairs.is_empty() {
             return true;
@@ -682,25 +592,22 @@ impl Ssh {
         }
     }
 
-    /// Remove a forward and the local socket it left behind.
+    /// Remove a forward and its local socket.
     pub fn cancel(&self, local: &Path, remote: &Path) {
         let _ = self.run(&cancel_args(&self.host, &self.control_path, local, remote));
         // `-O cancel` returns 0 without removing the file.
         let _ = std::fs::remove_file(local);
     }
 
-    /// Start this host's shell. Every script goes down its stdin from then on,
-    /// never interpolated into a command line — see [`shell_args`].
-    ///
-    /// Returns once `ssh` exists, not once the host has answered: the shell's
-    /// first run reads the handshake, so a host that turns out to be
-    /// unreachable is reported by that run, classified from ssh's stderr.
+    /// Start this host's shell (see [`shell_args`]). Returns once `ssh` is
+    /// spawned; the first run reads the handshake, so an unreachable host is
+    /// reported by that run, classified from ssh's stderr.
     pub fn start_shell(&self) -> Result<proc::Shell, SshError> {
         self.start(shell_args(&self.host, &self.control_path))
     }
 
-    /// The same, for scripts nvmux runs on its own account: this shell never
-    /// prompts and gives up on an unreachable host. See [`unattended`].
+    /// Like [`Self::start_shell`], for scripts nvmux runs on its own: never
+    /// prompts and gives up on an unreachable host (see [`unattended`]).
     pub fn start_unattended_shell(&self) -> Result<proc::Shell, SshError> {
         self.start(unattended_shell_args(&self.host, &self.control_path))
     }
@@ -714,7 +621,7 @@ impl Ssh {
     }
 }
 
-/// The `ControlPath` is occupied by something no master can be linked over.
+/// Something on the `ControlPath` that no master can be linked over.
 fn in_the_way(path: &Path, why: &str) -> SshError {
     SshError::Failed {
         code: -1,
@@ -737,8 +644,6 @@ fn spawn_error(e: std::io::Error, host: &str) -> SshError {
 mod tests {
     use super::*;
 
-    /// The advertised minimum and the one the check actually applies must be
-    /// the same version; they used to live in different modules.
     #[test]
     fn the_minimum_ssh_version_is_spelled_once() {
         assert_eq!(
@@ -766,12 +671,8 @@ mod tests {
         args.join(" ")
     }
 
-    /// The one difference between the shell the user's own commands run in and
-    /// the one that answers questions nvmux asked on its own account. Getting
-    /// this backwards either way is bad: `BatchMode` on the interactive path
-    /// breaks every key that needs a passphrase or a touch, and its absence on
-    /// the completion path leaves a worker thread sitting on a prompt no one
-    /// can see, let alone answer.
+    /// `BatchMode` on the interactive path breaks keys needing a passphrase or
+    /// touch; without it the completion worker blocks on an invisible prompt.
     #[test]
     fn only_an_unattended_shell_refuses_to_prompt() {
         let interactive = shell_args("myhost", Path::new(CTL));
@@ -794,10 +695,6 @@ mod tests {
         );
     }
 
-    /// Otherwise the two would drift, and a completion would end up running a
-    /// different program, or reaching it a different way, from every other
-    /// script — which is exactly the sort of difference that is only ever found
-    /// in the field.
     #[test]
     fn the_two_option_sets_differ_in_nothing_but_the_options() {
         let interactive = shell_args("myhost", Path::new(CTL));
@@ -818,8 +715,6 @@ mod tests {
     fn the_master_sets_stream_local_bind_unlink() {
         let args = master_args("myhost", Path::new(CTL), None, None);
         let s = joined(&args);
-        // This one is load-bearing: without it `-O cancel` leaves the socket
-        // file and the next forward fails rc 255, breaking re-attach.
         assert!(s.contains("StreamLocalBindUnlink=yes"), "missing in: {s}");
         assert!(s.contains("ControlMaster=yes"));
         assert!(s.contains("ControlPersist=60"));
@@ -830,8 +725,6 @@ mod tests {
         assert_eq!(args.last().expect("host"), "myhost");
     }
 
-    /// The first connection waits as long as the system does; a reconnection
-    /// is bounded, and only then.
     #[test]
     fn a_connect_timeout_is_set_only_when_asked_for() {
         let unbounded = joined(&master_args("myhost", Path::new(CTL), None, None));
@@ -844,8 +737,6 @@ mod tests {
         );
     }
 
-    /// Wi-Fi puts what upstream ssh marks a master's packets with in its
-    /// background queue: a master is moved out of it, and nothing else is.
     #[test]
     fn only_ssh_s_own_ipqos_is_moved_off_the_lowest_class() {
         let config = |ipqos: &str| format!("user me\nipqos {ipqos}\nserveraliveinterval 0\n");
@@ -877,8 +768,6 @@ mod tests {
         assert!(!left.contains("IPQoS"), "{left}");
     }
 
-    /// Setting it on the forward client does nothing, because the master does
-    /// the bind — so its absence there is correct, not an oversight.
     #[test]
     fn the_forward_client_does_not_repeat_master_only_options() {
         let s = joined(&forward_args(
@@ -896,8 +785,7 @@ mod tests {
         assert!(s.contains("-L /tmp/l.sock:/tmp/r.sock"));
     }
 
-    /// A master nothing was ever linked to can only be reached at the socket
-    /// it bound, so that is where it is told to go.
+    /// Nothing was linked to it, so only its own socket reaches it.
     #[test]
     fn a_master_is_retired_at_its_own_socket() {
         let own = format!("{CTL}.abcdefgh");
@@ -905,9 +793,6 @@ mod tests {
         assert_eq!(s, format!("-o ControlPath={own} -O exit myhost"));
     }
 
-    /// Both ways ssh says there is no master behind the `ControlPath` — no
-    /// socket, and a socket nothing listens on — and not the refusal a
-    /// working master gives a forward it cannot make.
     #[test]
     fn a_forward_with_no_master_is_told_from_one_the_master_refused() {
         assert!(says_no_master(
@@ -921,10 +806,8 @@ mod tests {
         ));
     }
 
-    /// The race this guards against, reduced to its end state: `-O check`
-    /// has already said nothing is there, and by the time the path is looked
-    /// at, another nvmux's master is. Removing it would leave that master
-    /// running with no name to be reached by.
+    /// End state of the race: `-O check` said nothing was there, but another
+    /// nvmux's master now is. Removing it would leave that master unreachable.
     #[test]
     fn a_control_path_something_answers_on_is_used_rather_than_cleared() {
         let dir = crate::test_support::scratch_dir("ssh-answered");
@@ -940,8 +823,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// What a master leaves behind — every one now, since only its own name
-    /// goes with it — is cleared, so the next can be linked in its place.
     #[test]
     fn a_control_path_nothing_answers_on_is_cleared() {
         let dir = crate::test_support::scratch_dir("ssh-refused");
@@ -961,9 +842,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Only a socket is ever removed: whatever else is there is reported
-    /// rather than deleted, before a connection is spent on a master that
-    /// could not be linked over it.
     #[test]
     fn a_control_path_that_is_not_a_socket_is_left_alone_and_reported() {
         let dir = crate::test_support::scratch_dir("ssh-not-a-socket");
@@ -977,9 +855,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// What the master is asked for in one command is what it would have been
-    /// asked for in one apiece: each pair its own `-L`, as a single forward
-    /// spells it.
     #[test]
     fn forwards_wanted_together_are_one_command_of_single_forwards() {
         let pairs = [
@@ -999,8 +874,8 @@ mod tests {
         );
     }
 
-    /// `ssh -V` is judged by its banner, wherever it printed it, and only a
-    /// banner it can read refuses anything. No `ssh` at all is its own error.
+    /// The banner may be on stdout or stderr; only a recognised one can be
+    /// refused.
     #[test]
     fn the_local_ssh_is_judged_by_what_it_says_its_version_is() {
         use std::os::unix::process::ExitStatusExt;
@@ -1057,9 +932,9 @@ mod tests {
             "scripts must arrive on stdin of a login shell, with that shell out of the way: {remote}"
         );
         assert!(remote.ends_with(" nvmux"), "the sh's $0: {remote}");
-        // $SHELL must expand remotely and in sh, which is what reads it: the
-        // login shell passes the single-quoted word along untouched. And it
-        // must be double-quoted there, or a value with a space word-splits.
+        // $SHELL must expand in the remote sh: the login shell passes the
+        // single-quoted word through untouched. Double-quoted, so a value with
+        // a space does not split.
         assert!(
             remote.starts_with("exec sh -c '"),
             "the login shell would expand $SHELL itself: {remote}"
@@ -1070,9 +945,8 @@ mod tests {
         );
     }
 
-    /// The command line carries nothing that varies per script: scripts and
-    /// their arguments go down the shell's stdin, so there is no second shell
-    /// layer for a value to be re-parsed by.
+    /// Scripts and arguments go down stdin, so no second shell layer re-parses
+    /// a value.
     #[test]
     fn the_command_line_carries_no_script_and_no_arguments() {
         let a = shell_args("myhost", Path::new(CTL));
@@ -1083,8 +957,6 @@ mod tests {
         );
     }
 
-    /// `-n` plus `sh -s` silently yields an empty result rather than an error,
-    /// and a pty would echo every script back into its own output.
     #[test]
     fn the_shell_is_started_without_dash_n_and_without_a_tty() {
         let args = shell_args("myhost", Path::new(CTL));
@@ -1101,7 +973,6 @@ mod tests {
         assert!(args.iter().any(|a| a == "-T"));
     }
 
-    /// The first `name` on `$PATH`.
     fn which(name: &str) -> Option<PathBuf> {
         std::env::var_os("PATH")
             .into_iter()
@@ -1110,17 +981,14 @@ mod tests {
             .find(|c| c.is_file())
     }
 
-    /// The whole chain, locally, under every login shell this machine has: the
-    /// command ssh would hand the remote login shell, run as sshd runs it —
-    /// `<login shell> -c <command>`, with `$SHELL` naming that shell — and fed
-    /// scripts and arguments exactly as the transport feeds them.
+    /// The whole chain under every login shell available: the remote command
+    /// run as sshd runs it (`<login shell> -c <command>`, `$SHELL` set to it)
+    /// and fed scripts as the transport does.
     ///
-    /// The login shell parses the outermost layer, and fish and tcsh reject
-    /// POSIX syntax there, so `/bin/sh` alone proves nothing. Each shell's own
-    /// login profile sets a variable the script reads back, which is what the
-    /// login shell is for: `nvim` on `$PATH`. The csh family cannot be a login
-    /// shell and run a command too, so for it that is `.cshrc`. A shell this
-    /// machine lacks is skipped.
+    /// fish and tcsh reject POSIX syntax in the outer layer, so `/bin/sh` alone
+    /// proves nothing. Each shell's login profile sets a variable the script
+    /// reads back; for the csh family, which cannot be a login shell and run a
+    /// command, that is `.cshrc`. Missing shells are skipped.
     #[test]
     fn scripts_run_under_every_login_shell() {
         let home = crate::test_support::scratch_dir("ssh-login-shells");
@@ -1201,8 +1069,8 @@ mod tests {
             ),
             SshError::Unreachable(_)
         ));
-        // What a machine that has just woken up says, on each platform and
-        // under the bounded connect a reconnection uses.
+        // A machine just woken up, per platform and under a reconnect's
+        // bounded connect.
         for words in [
             "ssh: connect to host h port 22: Operation timed out",
             "ssh: connect to host h port 22: Host is down",
@@ -1225,7 +1093,7 @@ mod tests {
             classify("h", 255, "client_loop: send disconnect: Broken pipe"),
             SshError::MasterDied(_)
         ));
-        // Anything unrecognised keeps its text rather than being guessed at.
+        // Unrecognised errors keep their text.
         match classify("h", 3, "something entirely new") {
             SshError::Failed { code, stderr } => {
                 assert_eq!(code, 3);
