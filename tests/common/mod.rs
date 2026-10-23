@@ -107,8 +107,19 @@ impl Scratch {
         // A plain counter, not `ThreadId`, whose Debug form is `ThreadId(2)`.
         // Parentheses are regex metacharacters, so a directory named that way
         // cannot be matched literally by anything pattern-based later.
+        //
+        // In base 36, which keeps it to two characters for 1,296 scratches a
+        // binary: tests/client.rs makes more than a hundred, and in decimal a
+        // third digit put a socket under a 19-byte tag one byte past the limit.
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(n < 36 * 36, "more scratches than two characters count");
+        let digit = |d: u32| char::from_digit(d, 36).expect("a base-36 digit");
+        let n: String = if n < 36 {
+            digit(n).into()
+        } else {
+            [digit(n / 36), digit(n % 36)].into_iter().collect()
+        };
         let dir = std::env::temp_dir().join(format!("nvmux-it-{}-{tag}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Self(dir)
