@@ -342,8 +342,10 @@ pub struct ClientSettings {
     /// window's text is to be by what it shows: its buffer's `'textwidth'`
     /// where it has one, and room for its long lines where they are not
     /// wrapped — all of them with `'wrap'` off, and with it on those of a
-    /// Markdown table or code block. `"fixed"` gives every window's text
-    /// `window_width`.
+    /// Markdown table or code block. Where more than one line in ten is too
+    /// long for the window, wrapped or not — a log's, say — the window's
+    /// text is not centred at all; a Markdown file's paragraphs, wrapped, do
+    /// not count. `"fixed"` gives every window's text `window_width`.
     ///
     /// Either way, a window showing a terminal keeps its whole width: the
     /// program in it is told its window's width. So does a window whose

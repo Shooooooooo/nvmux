@@ -82,7 +82,11 @@ use super::redraw;
 /// Markdown table or code block, where tree-sitter has a parser to say which
 /// those are. Enough room for nine in ten of them, the first few thousand
 /// saying as much as the rest; and the gutter as well — the line numbers,
-/// the signs and the folds.
+/// the signs and the folds. The rest of the lines it wraps get room as well
+/// where room for nine in ten of them would take the whole window, as a
+/// log's or a minified file's would: the window keeps its whole width then,
+/// where centred they would only wrap the more. All but a Markdown buffer's
+/// paragraphs, which are prose, and read best wrapped at the width given.
 ///
 /// Answered as `{ 'laststatus', windows }`, `windows` each window as
 /// `{ window, wanted }`: `'laststatus'` says which windows have a status line
@@ -165,8 +169,8 @@ local function long(win, buf)
   end
   local n = math.min(api.nvim_buf_line_count(buf), 4000)
   local rows = true
-  if wrap then
-    rows = vim.bo[buf].filetype == 'markdown' and blocked(buf, n)
+  if wrap and vim.bo[buf].filetype == 'markdown' then
+    rows = blocked(buf, n)
   end
   local widths = {}
   if rows then
@@ -198,7 +202,12 @@ local function of(win)
   local gutter = vim.fn.getwininfo(win)[1].textoff
   local tw = vim.bo[buf].textwidth
   local w = tw > 0 and tw + gutter or most
-  return math.max(w, long(win, buf) + gutter)
+  local room = long(win, buf) + gutter
+  if vim.wo[win].wrap and vim.bo[buf].filetype ~= 'markdown'
+      and room < api.nvim_win_get_width(win) then
+    return w
+  end
+  return math.max(w, room)
 end
 local function measure()
   local each = {}

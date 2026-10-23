@@ -6017,7 +6017,9 @@ fn until_widths(
 
 /// Judged by what it shows, a window's text is as wide as its buffer's
 /// `'textwidth'`; as wide as nine in ten of its lines where they are not
-/// wrapped, up to the whole window; and `window_width` where they are.
+/// wrapped, up to the whole window; and `window_width` where they are —
+/// unless they are too long for the whole window, which it keeps then,
+/// wrapped or not.
 #[test]
 fn a_windows_text_is_as_wide_as_what_it_shows_wants() {
     require_nvim!();
@@ -6038,7 +6040,14 @@ fn a_windows_text_is_as_wide_as_what_it_shows_wants() {
             "call setline(1, repeat([repeat('x', 200)], 10)) | setlocal nowrap",
             columns(160, &[160]),
         ),
-        ("setlocal wrap", columns(160, &[60])),
+        (
+            "call setline(1, repeat([repeat('x', 100)], 10)) | setlocal wrap",
+            columns(160, &[60]),
+        ),
+        (
+            "call setline(1, repeat([repeat('x', 200)], 10)) | setlocal wrap",
+            columns(160, &[160]),
+        ),
     ] {
         rpc.command(command).expect(command);
         assert!(
@@ -6112,8 +6121,10 @@ fn a_window_centred_already_keeps_its_width_judged_by_nothing() {
 
 /// Its width judged as a window's text always is, a Markdown window's is as
 /// wide as its tables and code blocks, which wrapping would break, and no
-/// wider for its paragraphs, which it does not — where this Neovim has its
-/// Markdown parser to say which lines are which.
+/// wider for its paragraphs, which it does not, however long: one too long
+/// for the whole window leaves it centred, as other lines that long would
+/// not — where this Neovim has its Markdown parser to say which lines are
+/// which.
 #[test]
 fn a_markdown_window_has_room_for_its_tables() {
     require_nvim!();
